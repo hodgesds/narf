@@ -87,23 +87,24 @@ impl Limits {
         device: u16,
     ) -> Result<Self, SlpcError> {
         let ip = GraphicsIp::read(mmio, platform).map_err(|_| SlpcError::Unavailable)?;
-        let (rpn_mhz, rpe_mhz, rp0_mhz) = if platform == GtPlatform::Alchemist {
-            let cap = stable(mmio, 0x145998)?;
-            let efficient = stable(mmio, 0x145ef0)?;
-            (
-                ((cap >> 16) & 255) * 50,
-                ((efficient >> 8) & 255) * 50,
-                (cap & 255) * 50,
-            )
-        } else {
-            let cap = stable(mmio, 0x138000)?;
-            let efficient = stable(mmio, 0x13800c)?;
-            (
-                decode((cap >> 16) & 511),
-                decode(efficient & 511),
-                decode(cap & 511),
-            )
-        };
+        let (rpn_mhz, rpe_mhz, rp0_mhz) =
+            if platform == GtPlatform::Alchemist || platform.is_gen12() {
+                let cap = stable(mmio, 0x145998)?;
+                let efficient = stable(mmio, 0x145ef0)?;
+                (
+                    ((cap >> 16) & 255) * 50,
+                    ((efficient >> 8) & 255) * 50,
+                    (cap & 255) * 50,
+                )
+            } else {
+                let cap = stable(mmio, 0x138000)?;
+                let efficient = stable(mmio, 0x13800c)?;
+                (
+                    decode((cap >> 16) & 511),
+                    decode(efficient & 511),
+                    decode(cap & 511),
+                )
+            };
         // xe_device_wa_oob.rules: Wa_14022085890, exactly BMG G21.
         let g21 = platform == GtPlatform::Battlemage
             && matches!(

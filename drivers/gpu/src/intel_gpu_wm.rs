@@ -360,6 +360,79 @@ pub fn compute_plane_watermarks(
     }
 }
 
+/// Uncompressed Tile4, XRGB8888 and display14: the `y_tiled` branch of
+/// Linux b90c984d skl_compute_wm_params/plane_wm/transition_wm. The caller
+/// owns the fixed no-SAGV DDB allocation and validates it before exposure.
+pub(crate) fn compute_tile4_watermarks(
+    params: &WmParams,
+    latencies: &[u16; NUM_WM_LEVELS],
+) -> PlaneWatermarks {
+    if params.cpp != 4
+        || params.width_px == 0
+        || params.width_px > 5120
+        || params.htotal <= params.width_px
+        || params.htotal > 8192
+        || !(1..=1_305_600).contains(&params.pixel_rate_khz)
+    {
+        return PlaneWatermarks::default();
+    }
+    // Four minimum scanlines; Tile4 uses 512-byte DBUF blocks. Keep the
+    // fractional blocks-per-line (quarters), rather than rounding each row.
+    let group = (u64::from(params.width_px) * u64::from(params.cpp) * 4)
+        .div_ceil(u64::from(DBUF_BLOCK_SIZE))
+        + 1;
+    let per_line = group * FX_ONE / 4;
+    let tile_minimum = per_line * 4;
+    let mut levels = [WmLevel::default(); NUM_WM_LEVELS];
+    let mut previous = WmLevel::default();
+    for (level, &latency) in latencies.iter().enumerate() {
+        if latency == 0 || params.htotal == 0 || per_line == 0 {
+            previous = WmLevel::default();
+            continue;
+        }
+        let method2 = (u64::from(latency) * u64::from(params.pixel_rate_khz))
+            .div_ceil(u64::from(params.htotal) * 1000)
+            * per_line;
+        let selected = method2.max(tile_minimum);
+        let blocks = (fx_ceil(selected) + 1)
+            .max(fx_ceil(per_line))
+            .max(u64::from(previous.blocks));
+        let lines = selected.div_ceil(per_line).max(u64::from(previous.lines));
+        let extra = if lines % 4 == 0 { 4 } else { 8 - lines % 4 };
+        let allocation = fx_ceil((lines + extra) * per_line).max(blocks) + 1;
+        if lines > 255 || blocks > 0x1fff || allocation > u64::from(u16::MAX) {
+            previous = WmLevel::default();
+            continue;
+        }
+        let wm = WmLevel {
+            enable: true,
+            blocks: blocks as u16,
+            lines: lines as u16,
+            min_ddb_alloc: allocation as u16,
+        };
+        levels[level] = wm;
+        previous = wm;
+    }
+    let mut trans = WmLevel::default();
+    if levels[0].enable {
+        let wm0 = levels[0];
+        let blocks = (u64::from(wm0.blocks - 1)).max(fx_ceil(2 * tile_minimum)) + 15;
+        if blocks < u64::from(u16::MAX) {
+            trans = WmLevel {
+                enable: true,
+                blocks: blocks as u16,
+                lines: 0,
+                min_ddb_alloc: wm0.min_ddb_alloc.max(blocks as u16 + 1),
+            };
+        }
+    }
+    PlaneWatermarks {
+        levels,
+        trans,
+        ..Default::default()
+    }
+}
+
 /// `skl_check_wm_level`: a level whose minimum DDB allocation
 /// exceeds the plane's allocation is disabled outright.
 fn check_level(level: &mut WmLevel, ddb_size: u16) {

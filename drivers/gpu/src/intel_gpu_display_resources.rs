@@ -79,7 +79,7 @@ fn idle(io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
     }
     Ok(())
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Profile {
     pub(crate) primary: PlaneWatermarks,
     pub(crate) cursor: PlaneWatermarks,
@@ -87,6 +87,13 @@ pub(crate) struct Profile {
 }
 impl Profile {
     fn compute(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+        Self::compute_for_layout(io, mode, false)
+    }
+    fn compute_for_layout(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        tile4: bool,
+    ) -> Result<Self, FsError> {
         if mode.pixel_clock_khz == 0
             || mode.pixel_clock_khz > 1_305_600
             || mode.h_active == 0
@@ -134,14 +141,15 @@ impl Profile {
             .unwrap_or(0)
             .max(32);
         let cursor_start = TOTAL.checked_sub(cursor_size).ok_or(FsError::Unsupported)?;
-        let mut primary = compute_plane_watermarks(
-            &WmParams {
-                width_px: u32::from(mode.h_active),
-                ..params
-            },
-            &lat,
-            0,
-        );
+        let primary_params = WmParams {
+            width_px: u32::from(mode.h_active),
+            ..params
+        };
+        let mut primary = if tile4 {
+            compute_tile4_watermarks(&primary_params, &lat)
+        } else {
+            compute_plane_watermarks(&primary_params, &lat, 0)
+        };
         validate_watermarks(&mut cursor, cursor_size);
         validate_watermarks(&mut primary, cursor_start);
         if !primary.levels[0].enable
@@ -197,6 +205,10 @@ impl Profile {
     }
     pub(crate) fn capture(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
         let profile = Self::capture_layout(io, mode)?;
+        Self::check_cdclk(io, mode)?;
+        Ok(profile)
+    }
+    fn check_cdclk(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<(), FsError> {
         let pll = read(io, 0x46070)?;
         let ctl = read(io, 0x46000)?;
         let squash = read(io, 0x46008)?;
@@ -224,9 +236,9 @@ impl Profile {
         if ((req0 >> 12) & 7) < voltage || ((req1 >> 20) & 2047) < actual.div_ceil(1000) {
             return Err(FsError::Unsupported);
         }
-        Ok(profile)
+        Ok(())
     }
-    fn capture_layout(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+    fn capture_globals(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
         let gmd = read(io, 0x510a0)?;
         if gmd >> 22 != 14 || (gmd >> 14) & 255 != 0 {
             return Err(FsError::Unsupported);
@@ -265,18 +277,151 @@ impl Profile {
                 return Err(FsError::Unsupported);
             }
         }
-        for (i, wm) in profile.primary.levels.iter().enumerate() {
-            if read(io, 0x70240 + i as u64 * 4)? != encode_wm_level(wm) {
-                return Err(FsError::Unsupported);
-            }
+        Ok(profile)
+    }
+    fn capture_layout(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+        let mut profile = Self::capture_globals(io, mode)?;
+        match read(io, 0x70180)? & (7 << 10) {
+            0 | 0x400 => {}
+            0x1400 => profile.primary = Self::compute_for_layout(io, mode, true)?.primary,
+            _ => return Err(FsError::Unsupported),
         }
-        if read(io, 0x70258)? != 0
-            || read(io, 0x7025c)? != 0
-            || read(io, 0x70268)? != encode_wm_level(&profile.primary.trans)
-        {
+        verify_primary(io, profile.primary)?;
+        Ok(profile)
+    }
+}
+
+fn primary_registers(wm: PlaneWatermarks) -> [(u64, u32); 9] {
+    let mut registers = [(0, 0); 9];
+    for (i, level) in wm.levels.iter().enumerate() {
+        registers[i] = (0x70240 + i as u64 * 4, encode_wm_level(level));
+    }
+    registers[6..].copy_from_slice(&[
+        (0x70258, 0),
+        (0x7025c, 0),
+        (0x70268, encode_wm_level(&wm.trans)),
+    ]);
+    registers
+}
+fn verify_primary(io: &(impl MmioWindow + ?Sized), wm: PlaneWatermarks) -> Result<(), FsError> {
+    for (r, value) in primary_registers(wm) {
+        if read(io, r)? != value {
             return Err(FsError::Unsupported);
         }
-        Ok(profile)
+    }
+    Ok(())
+}
+
+/// Retained primary watermark ownership. Only shadowed primary WM registers
+/// vary; the acknowledged PM demand, DBUF/MBUS and cursor partition never do.
+/// A pending image survives cancellation and partial writes until a verified
+/// original console latch. Neither GT reset nor command retirement alone
+/// authorizes forgetting it.
+#[derive(Debug)]
+pub(crate) struct Primary {
+    mode: Mode,
+    original: Profile,
+    tile4: PlaneWatermarks,
+    current_tile4: bool,
+    pending: Option<bool>,
+}
+impl Primary {
+    pub(crate) fn capture(
+        io: &(impl MmioWindow + ?Sized),
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> Result<Self, FsError> {
+        let mode = Mode {
+            pixel_clock_khz: timing.clock,
+            h_active: timing.width,
+            h_total: timing.htotal,
+            v_active: timing.height,
+            v_total: timing.vtotal,
+            ..Mode::VESA_1024X768_60
+        };
+        // A fresh resource journal must begin on our verified linear/X
+        // baseline, never adopt an unrelated inherited Tile4 allocation.
+        if !matches!(read(io, 0x70180)? & (7 << 10), 0 | 0x400) {
+            return Err(FsError::Unsupported);
+        }
+        if read(io, 0x7026c)? & (1 << 19) == 0 {
+            return Err(FsError::Unsupported);
+        }
+        let original = Profile::capture(io, &mode)?;
+        let tile4 = Profile::compute_for_layout(io, &mode, true)?.primary;
+        Ok(Self {
+            mode,
+            original,
+            tile4,
+            current_tile4: false,
+            pending: None,
+        })
+    }
+    pub(crate) fn check_globals(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
+        let profile = Profile::capture_globals(io, &self.mode)?;
+        Profile::check_cdclk(io, &self.mode)?;
+        if profile != self.original || read(io, 0x7026c)? & (1 << 19) == 0 {
+            return Err(FsError::Unsupported);
+        }
+        Ok(())
+    }
+    fn image(&self, tile4: bool) -> PlaneWatermarks {
+        if tile4 {
+            self.tile4
+        } else {
+            self.original.primary
+        }
+    }
+    pub(crate) fn check_current(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
+        self.check_globals(io)?;
+        if self.pending.is_none() {
+            let tiling = read(io, 0x70180)? & (7 << 10);
+            if if self.current_tile4 {
+                tiling != 0x1400
+            } else {
+                !matches!(tiling, 0 | 0x400)
+            } {
+                return Err(FsError::Unsupported);
+            }
+            verify_primary(io, self.image(self.current_tile4))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn stage(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        tile4: bool,
+    ) -> Result<alloc::vec::Vec<(u64, u32)>, FsError> {
+        if self.pending.is_some() {
+            return Err(FsError::Busy);
+        }
+        self.check_current(io)?;
+        self.pending = Some(tile4);
+        Ok(primary_registers(self.image(tile4)).to_vec())
+    }
+    pub(crate) fn rollback(&mut self) {
+        self.pending = None;
+    }
+    pub(crate) fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub(crate) fn complete(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
+        self.check_globals(io)?;
+        let target = self.pending.ok_or(FsError::Busy)?;
+        verify_primary(io, self.image(target))?;
+        self.current_tile4 = target;
+        self.pending = None;
+        Ok(())
+    }
+    /// Caller has independently retired all DSB streams and holds display
+    /// exclusion. These are shadow writes; only the following original
+    /// console SURF latch plus readback completes restoration.
+    pub(crate) fn restore(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<Profile, FsError> {
+        self.check_globals(io)?;
+        self.pending = Some(false); // retained before the first possible write
+        for (r, value) in primary_registers(self.original.primary) {
+            checked(io, r, value)?;
+        }
+        Ok(self.original)
     }
 }
 /// None is a strict, read-only refusal before writes: older boot modes may

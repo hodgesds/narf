@@ -4,7 +4,9 @@
 //! intel_display_irq.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
-use crate::intel_gpu_scanout::{Geometry, Layout, View, Viewport, X_TILED_MODIFIER};
+use crate::intel_gpu_scanout::{
+    Geometry, Layout, View, Viewport, TILE4_MODIFIER, X_TILED_MODIFIER,
+};
 use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
 
@@ -814,7 +816,8 @@ impl Plan {
                 if target.pitch != geometry.pitch
                     || target.format != PixelFormat::Xrgb8888
                     || (target.modifier != 0
-                        && (target.modifier != X_TILED_MODIFIER || !card.intel_x_tiled))
+                        && !(target.modifier == X_TILED_MODIFIER && card.intel_x_tiled
+                            || target.modifier == TILE4_MODIFIER && card.intel_tile4))
                     || target.offsets != [0, 0]
                     || target.chroma_pitch != 0
                     || !object.object.is_wc()
@@ -826,6 +829,8 @@ impl Plan {
                 }
                 if target.modifier == X_TILED_MODIFIER {
                     view.layout = Layout::X;
+                } else if target.modifier == TILE4_MODIFIER {
+                    view.layout = Layout::Tile4;
                 }
                 if viewport
                     .x

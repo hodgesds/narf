@@ -82,7 +82,16 @@ impl GuCFirmware {
         generation: Generation,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        Self::open_for_platform(GtPlatform::Integrated(generation), authority)
+        let platform = match generation {
+            Generation::TigerLake => {
+                GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
+            }
+            // ADL spans different firmware families; an ambiguous generation
+            // cannot choose ADL-P versus ADL-S/N's asset. Use PCI identity.
+            Generation::AlderLake => return Err(FirmwareError::Unsupported),
+            _ => GtPlatform::Integrated(generation),
+        };
+        Self::open_for_platform(platform, authority)
     }
 
     pub fn open_for_platform(

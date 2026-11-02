@@ -149,6 +149,10 @@ fn setup(
     });
     let info = DeviceInfo {
         device_id: match platform {
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake) => 0x9a49,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP) => 0x46a6,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS) => 0x4680,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,
             GtPlatform::Battlemage => 0xe20b,
             GtPlatform::Alchemist => 0x56a0,
             _ => 0x7d55,
@@ -273,9 +277,10 @@ fn smoke_xe_copy1_query_and_instance_platform_refusal() -> TestResult {
         }
         let before = arena.live_allocations();
         if platform != GtPlatform::Battlemage {
-            assert!(gt
-                .submit_ppgtt_probe_on(200, crate::intel_gpu_engine::Engine::Bcs8)
-                .is_err());
+            assert!(
+                gt.submit_ppgtt_probe_on(200, crate::intel_gpu_engine::Engine::Bcs8)
+                    .is_err()
+            );
             assert_eq!(arena.live_allocations(), before);
         }
         hardware_stop(&mut gt, &w, ack);
@@ -356,7 +361,7 @@ fn buffers(file: &RenderFile, info: &DeviceInfo, user: &Cpu, vm: u32) -> [u32; 2
     file.gem.object(code).unwrap().write(4096, &bytes).unwrap();
     *user.mapping.lock() = Some(file.gem.object(data).unwrap().backing(0, 4096).unwrap());
     let pat = match info.platform {
-        GtPlatform::Alchemist => 0,
+        GtPlatform::Alchemist | GtPlatform::Gen12(_) => 0,
         GtPlatform::Battlemage => 2,
         _ => 3,
     };
@@ -432,6 +437,22 @@ fn ready<F: Future + ?Sized>(mut future: core::pin::Pin<&mut F>) -> F::Output {
 fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
     // RENDER, then COPY: the same PPGTT batch and user fence on BCS0.
     for (platform, ack, class, logical) in [
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake),
+            0x130044,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP),
+            0x130044,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS),
+            0x130044,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN),
+            0x130044,
+        ),
         (GtPlatform::Battlemage, 0xdfc),
         (GtPlatform::Alchemist, 0x130044),
         (
@@ -461,6 +482,21 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         let (mailbox, info) = setup(&mut gt, &w, platform);
         let file = RenderFile::new();
         let user = Cpu::new();
+        if platform.is_gen12() && !platform.has_hwconfig() {
+            let mut query = [0; 40];
+            put32(&mut query, 8, 4);
+            put64(&mut query, 16, u64::MAX);
+            user.wire.store(64, &query);
+            assert_eq!(invoke(&file, &info, &user, xe::DEVICE_QUERY), Ok(0));
+            assert_eq!(u32_at(&user.wire.load(64, 40), 12), 0);
+            put32(&mut query, 12, 4);
+            user.wire.store(64, &query);
+            assert_eq!(
+                invoke(&file, &info, &user, xe::DEVICE_QUERY),
+                Err(FsError::InvalidData)
+            );
+        }
+        let origin = if platform.is_gen12() { 20_000_000 } else { 0 };
         let vm = create_vm(&file, &info, &user);
         // VIDEO_DECODE, VIDEO_ENHANCE, unknown classes, and COMPUTE when
         // CCS0 is fused off are not admitted engines.
@@ -492,20 +528,23 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
             ],
         );
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
-        let (_, fence) = mailbox.accept(&mut gt, 100);
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let (_, fence) = mailbox.accept(&mut gt, origin + 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Some(Ok(0)))
         );
         let payload = core.find_fence(9).unwrap();
         let exact: Arc<dyn narf_filesystem::DrmFence> = fence.clone();
-        assert!(so::to_drm_leaves(&payload)
-            .iter()
-            .any(|leaf| Arc::ptr_eq(leaf, &exact)));
+        assert!(
+            so::to_drm_leaves(&payload)
+                .iter()
+                .any(|leaf| Arc::ptr_eq(leaf, &exact))
+        );
         assert!(!payload.is_signalled());
         for handle in handles {
             assert_eq!(close(&file, &info, &user, abi::GEM_CLOSE, handle), Ok(0));
@@ -521,7 +560,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
         assert!(objects.iter().all(|object| object.upgrade().is_some()));
         let mut registered = BTreeMap::new();
-        for now in 101..120 {
+        for now in origin + 101..origin + 120 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
             service_contexts(&w, &mut registered, true);
             if user.read_u64_acquire(0x4090).unwrap() == value {
@@ -537,9 +576,11 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
             4 => 0x1a244,
             _ => 0x2244,
         };
-        assert!(registered
-            .values()
-            .all(|base| { w.0.borrow().memory[base].borrow()[1024 + 2] == engine_base }));
+        assert!(
+            registered
+                .values()
+                .all(|base| { w.0.borrow().memory[base].borrow()[1024 + 2] == engine_base })
+        );
         assert_eq!(
             fence.result(),
             None,
@@ -559,7 +600,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
             )),
             Some(Ok(0))
         );
-        finish(&mut gt, &w, &fence, &mut registered, 120);
+        finish(&mut gt, &w, &fence, &mut registered, origin + 120);
         assert!(registered.is_empty());
         assert!(payload.is_signalled());
         assert!(objects[0].upgrade().is_none());
@@ -668,10 +709,11 @@ fn smoke_xe_userptr_bind_exec_validation_and_retirement() -> TestResult {
         assert_eq!(bind_now(&file, &info, &user), Ok(0));
         exec_wire(&user, queue, true, &[]);
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (_, fence) = mailbox.accept(&mut gt, 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -840,10 +882,11 @@ fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
     exec_wire(&user, queue, true, &[]);
     let fence = {
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (_, fence) = mailbox.accept(&mut gt, 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -906,10 +949,11 @@ fn smoke_xe_hung_exec_bans_only_its_queue() -> TestResult {
     exec_wire(&user, queue, true, &[]);
     let hung = {
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (_, fence) = mailbox.accept(&mut gt, 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -983,10 +1027,11 @@ fn smoke_xe_hung_exec_bans_only_its_queue() -> TestResult {
     exec_wire(&user, other, true, &[]);
     let fence = {
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (_, fence) = mailbox.accept(&mut gt, late + 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -1113,10 +1158,11 @@ fn smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore() -> TestResul
     exec_wire(&user, queue, true, &[]);
     let fence = {
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (_, fence) = mailbox.accept(&mut gt, 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -1376,10 +1422,11 @@ fn smoke_xe_zero_batch_user_fence_and_wait_timeout() -> TestResult {
         &[sync(2, 0x2345_0000_0090, 0x1234_5678_0000_0001, true)],
     );
     let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-    assert!(call
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    assert!(
+        call.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     let (_, fence) = mailbox.accept(&mut gt, 100);
     assert_eq!(
         call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -1433,10 +1480,11 @@ fn smoke_xe_zero_batch_user_fence_and_wait_timeout() -> TestResult {
     let clock = core::cell::Cell::new(0u64);
     let waits = crate::intel_gpu_xe::XeFile::new();
     let mut wait = core::pin::pin!(waits.wait_user_clock(64, &user, || clock.get()));
-    assert!(wait
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     user.wire.store(104, &u64::MAX.to_le_bytes());
     clock.set(100_000);
     assert_eq!(ready(wait.as_mut()), Err(FsError::TimedOut));

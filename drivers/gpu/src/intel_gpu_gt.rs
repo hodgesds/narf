@@ -5,6 +5,12 @@
 
 use crate::intel_gpu::Generation;
 
+#[path = "intel_gpu_gen12_gt.rs"]
+pub(crate) mod gen12;
+
+#[path = "intel_gpu_gt_ownership.rs"]
+pub(crate) mod ownership;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GraphicsError {
     Unsupported,
@@ -25,6 +31,13 @@ impl GraphicsIp {
         platform: GtPlatform,
     ) -> Result<Self, GraphicsError> {
         platform.guc().ok_or(GraphicsError::Unsupported)?;
+        if platform.is_gen12() {
+            // xe_pci.c's pre-GMD descriptor; these GTs have no GMD_ID.
+            return Ok(Self {
+                version: 1200,
+                step: 0,
+            });
+        }
         if platform == GtPlatform::Alchemist {
             return Ok(Self {
                 version: 1255,
@@ -61,8 +74,19 @@ pub(crate) const GUC_GGTT_MIN: u32 = 8 * 1024 * 1024;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GtPlatform {
     Integrated(Generation),
+    Gen12(Gen12Platform),
     Alchemist,
     Battlemage,
+}
+
+/// Exact pre-GMD firmware families (xe_pci.c + xe_uc_fw.c). Raptor Lake
+/// inherits the corresponding ADL P/S descriptor, not a guessed firmware.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Gen12Platform {
+    TigerLake,
+    AlderLakeP,
+    AlderLakeS,
+    AlderLakeN,
 }
 
 // Exact source IDs, including mobile/embedded variants; no range matches.
@@ -92,7 +116,14 @@ impl GtPlatform {
             .iter()
             .find(|entry| entry.did == device)
         {
-            return Some(Self::Integrated(entry.generation));
+            let family = match entry.asic {
+                "tigerlake" => Some(Gen12Platform::TigerLake),
+                "alderlake-p" | "alderlake-m" | "raptorlake-p" => Some(Gen12Platform::AlderLakeP),
+                "alderlake-s" | "raptorlake-s" => Some(Gen12Platform::AlderLakeS),
+                "alderlake-n" => Some(Gen12Platform::AlderLakeN),
+                _ => None,
+            };
+            return Some(family.map_or(Self::Integrated(entry.generation), Self::Gen12));
         }
         if DG2_IDS.contains(&device) {
             Some(Self::Alchemist)
@@ -107,12 +138,30 @@ impl GtPlatform {
         matches!(self, Self::Alchemist | Self::Battlemage)
     }
 
+    pub const fn is_gen12(self) -> bool {
+        matches!(self, Self::Gen12(_))
+    }
+
+    pub(crate) const fn physical_bits(self) -> u32 {
+        if self.is_gen12() {
+            39
+        } else {
+            52
+        }
+    }
+
+    /// xe_guc_hwconfig.c: only ADL-P among pre-XeHP families supplies a
+    /// HWCONFIG table. Absence is a platform property, never a guessed table.
+    pub const fn has_hwconfig(self) -> bool {
+        !matches!(self, Self::Gen12(family) if !matches!(family, Gen12Platform::AlderLakeP))
+    }
+
     /// Graphics-GT forcewake ACK (xe_force_wake_init_gt / xe_gt_regs.h).
     /// Gfx 12.70+ moved the GT ACK; DG2 retains the earlier address.
     pub const fn guc_forcewake_ack(self) -> Option<u64> {
         match self {
             Self::Integrated(Generation::MeteorLake) | Self::Battlemage => Some(0xdfc),
-            Self::Alchemist => Some(0x130044),
+            Self::Alchemist | Self::Gen12(_) => Some(0x130044),
             _ => None,
         }
     }
@@ -120,6 +169,8 @@ impl GtPlatform {
     /// Supported GuC boot ABI, not permission to publish a display or engine.
     pub const fn guc(self) -> Option<GuCProfile> {
         let (firmware, minimum_version) = match self {
+            Self::Gen12(Gen12Platform::AlderLakeP) => ("i915/adlp_guc_70.bin", (70, 44, 1)),
+            Self::Gen12(_) => ("i915/tgl_guc_70.bin", (70, 44, 1)),
             Self::Integrated(Generation::MeteorLake) => ("i915/mtl_guc_70.bin", (70, 53, 0)),
             Self::Alchemist => ("i915/dg2_guc_70.bin", (70, 53, 0)),
             Self::Battlemage => ("xe/bmg_guc_70.bin", (70, 54, 0)),
@@ -139,6 +190,30 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
     fn smoke_gt_identity_and_firmware_profiles() -> TestResult {
         for (device, platform, name, version) in [
+            (
+                0x9a49,
+                GtPlatform::Gen12(Gen12Platform::TigerLake),
+                "i915/tgl_guc_70.bin",
+                (70, 44, 1),
+            ),
+            (
+                0x46a6,
+                GtPlatform::Gen12(Gen12Platform::AlderLakeP),
+                "i915/adlp_guc_70.bin",
+                (70, 44, 1),
+            ),
+            (
+                0x4680,
+                GtPlatform::Gen12(Gen12Platform::AlderLakeS),
+                "i915/tgl_guc_70.bin",
+                (70, 44, 1),
+            ),
+            (
+                0x46d0,
+                GtPlatform::Gen12(Gen12Platform::AlderLakeN),
+                "i915/tgl_guc_70.bin",
+                (70, 44, 1),
+            ),
             (
                 0x7d55,
                 GtPlatform::Integrated(Generation::MeteorLake),

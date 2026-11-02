@@ -83,6 +83,17 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     ) -> FsFuture<'_, Arc<CompletionFence>> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
+    /// Submit a trusted retained copy under this card's current GT/PM owner.
+    /// Err publishes no DMA; Ok transfers the private batch and both BOs to
+    /// the GT until terminal completion/reset, independently of caller Drop.
+    /// Callers exclude uncontrolled CPU aliases while the job is pending.
+    fn copy_objects(
+        &self,
+        _request: crate::intel_gpu_exec::copy::CopyRequest,
+        _epoch: u64,
+    ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     /// Nonblocking policy requests serviced only by the retained GT owner.
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         None

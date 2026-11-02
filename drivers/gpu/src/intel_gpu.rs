@@ -941,6 +941,10 @@ impl IntelGpu {
         self.chip
     }
 
+    pub(crate) fn function_addr(&self) -> narf_bus::BusAddr {
+        self.display_device.addr
+    }
+
     pub fn gmd_id(&self) -> u32 {
         self.gmd_id
     }
@@ -1287,7 +1291,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Power management (Q9, #1015) covers the Gen12 register
     // map only. Xe-LPG now has a region map and a display
     // engine (#1016); its separate GT owner handles system PM below.
-    // The legacy forcewake/RC6/DMC PM owner remains Gen12-only.
+    // A Gen12 function with an owned scanout uses the async GuC owner below.
+    // The legacy PM owner remains only on identity/inherited-scanout fallback.
     let pm_supported = matches!(
         dev.chip.generation.region_generation(),
         Some(RegionGeneration::Gen12)
@@ -1365,9 +1370,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
     // A retained firmware scanout has not granted us its GGTT reservation.
     // Start automatically only after this driver owns the integrated scanout.
-    if owns_scanout {
-        crate::intel_gpu_gt_runtime::install(card_index, gt_card, device, cap, gt_bar, panel_mode);
-    }
+    let guc_owned = if owns_scanout {
+        crate::intel_gpu_gt_runtime::install(card_index, gt_card, device, cap, gt_bar, panel_mode)
+    } else {
+        false
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),
@@ -1391,7 +1398,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // note the takeover mode for resume re-light, and register
     // the device-PM + suspend-hook pair. Last, so a failed
     // probe never leaves a registration behind.
-    if pm_supported {
+    if pm_supported && !guc_owned {
         crate::intel_gpu_pm::register_pm(device, cap, panel_mode);
     }
     Ok(())

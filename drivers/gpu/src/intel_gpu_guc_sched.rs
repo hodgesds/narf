@@ -109,6 +109,7 @@ pub(crate) struct EngineAds {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SchedulingAds {
     pub engines: [Option<EngineAds>; Engine::COUNT],
+    pub reset_policy: Option<crate::intel_gpu_reset_policy::ResetPolicy>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -299,6 +300,7 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     disable_wmtp: bool,
     /// Captured only on an actual failure, before disable can provoke reset.
     pending_error: Option<Report>,
+    reset_policy: Option<crate::intel_gpu_reset_policy::ResetPolicy>,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -384,6 +386,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             engines,
             disable_wmtp: false,
             pending_error: None,
+            reset_policy: None,
         })
     }
 
@@ -396,7 +399,26 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 hwsp: state.hwsp.ggtt_offset(),
             });
         }
-        SchedulingAds { engines }
+        SchedulingAds {
+            engines,
+            reset_policy: self.reset_policy,
+        }
+    }
+
+    /// Freeze the applied engine policy and nonterminated MCR steering before
+    /// any context runs. The exact physical inventory also owns the ADS saves.
+    pub(crate) fn set_reset_policy(
+        &mut self,
+        policy: crate::intel_gpu_reset_policy::ResetPolicy,
+    ) -> Result<(), SchedulingError> {
+        if !self.pristine || !self.resources.contexts.is_empty() || self.reset_policy.is_some() {
+            return Err(SchedulingError::State);
+        }
+        if !policy.matches(self.platform, self.engines) {
+            return Err(SchedulingError::Address);
+        }
+        self.reset_policy = Some(policy);
+        Ok(())
     }
 
     pub(crate) fn engines(&self) -> EngineSet {
@@ -998,7 +1020,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if words.len() % 2 != 0 {
             words.push(0);
         }
-        if words.len() > ring.size_pages() as usize * 1024 {
+        let command_limit = if self.platform.is_gen12() {
+            1024
+        } else {
+            ring.size_pages() as usize * 1024
+        };
+        if words.len() > command_limit {
             r.allocator.free(ring);
             r.allocator.free(image);
             return Err(SchedulingError::Full);
@@ -1008,6 +1035,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
             ring.write32(i as u64 * 4, word);
         }
         image.write32(REGS + 7 * 4, tail);
+        if self.platform.is_gen12() {
+            // Repatch after both golden and user state restoration: their
+            // saved ring/WA pointers name earlier retired allocations.
+            crate::intel_gpu_gt::gen12::restore_was(
+                &image,
+                &ring,
+                engine == Engine::Rcs0,
+                user.is_some(),
+            );
+        }
         let parallel = if width > 1 {
             match parallel::prepare(
                 r,
@@ -1370,6 +1407,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         } else {
                             0x19
                         };
+                    let descriptor_high = if self.platform.is_gen12() {
+                        context.engine.guc_class() << 29 | context.engine.physical_instance() << 16
+                    } else {
+                        0
+                    };
                     let mask = self
                         .engines
                         .logical_mask(context.placements)
@@ -1408,7 +1450,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                 0,
                                 0,
                                 descriptor,
-                                0,
+                                descriptor_high,
                             ],
                             Phase::Policy,
                         )
@@ -1717,6 +1759,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
             golden.write32(off, image.read32(off));
         }
         golden.write32(REGS + 3 * 4, 0x00090008);
+        if self.platform.is_gen12() {
+            golden.write32(REGS + 0x13 * 4, 0);
+            golden.write32(REGS + 0x15 * 4, 0);
+        }
         for slot in [5, 7, 9, 0x23] {
             golden.write32(REGS + slot * 4, 0);
         }
@@ -1844,12 +1890,18 @@ fn render_completion(
     seq: u32,
     words: &mut Vec<u32>,
 ) {
-    if platform != GtPlatform::Battlemage {
+    if !matches!(platform, GtPlatform::Battlemage | GtPlatform::Gen12(_)) {
         words.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
     words.extend_from_slice(&[
         0x7a000204,
-        if compute { 0x001000a0 } else { 0x101010a1 },
+        if compute {
+            0x001000a0
+        } else if platform.is_gen12() {
+            0x101030a1
+        } else {
+            0x101010a1
+        },
         0,
         0,
         0,
@@ -1870,6 +1922,38 @@ fn render_completion(
 }
 
 fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
+    if platform.is_gen12() {
+        // gen12_rcs_offsets: thirteen first-group registers, five NOOPs,
+        // then the common nine timestamp/PDP registers and RCS-only groups.
+        crate::intel_gpu_engine::xcs_image(Engine::Rcs0, image, platform, ring);
+        for (start, registers, posted) in [
+            (0x34, alloc::vec![0x1b0, 0x5a8, 0x5ac], true),
+            (0x41, alloc::vec![0x0c8], false),
+            (
+                0x51,
+                {
+                    let mut registers = alloc::vec![
+                        0x588, 0x588, 0x588, 0x588, 0x588, 0x588, 0x028, 0x09c, 0x0c0, 0x178,
+                        0x17c, 0x358, 0x170, 0x150, 0x154, 0x158, 0x41c,
+                    ];
+                    registers.extend((0x600..=0x67c).step_by(4));
+                    registers.extend([0x068, 0x084]);
+                    registers
+                },
+                true,
+            ),
+        ] {
+            image.write32(
+                REGS + start * 4,
+                0x11080000 | u32::from(posted) << 12 | (registers.len() as u32 * 2 - 1),
+            );
+            for (index, register) in registers.iter().enumerate() {
+                image.write32(REGS + (start + 1 + index as u64 * 2) * 4, 0x2000 + register);
+            }
+        }
+        image.write32(REGS + 0xb9 * 4, 0x05000001);
+        return;
+    }
     // Literal register groups from xe_lrc.c's DG2/MTL/Xe2 RCS tables;
     // lengths and command placement differ from the Gen12 execlists codec.
     let groups: &[&[u32]] = &[

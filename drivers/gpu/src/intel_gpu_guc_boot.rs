@@ -161,13 +161,17 @@ impl WopcmLayout {
     }
 
     fn plan(upload: u32, huc: u32) -> Result<Self, BootError> {
+        Self::plan_total(upload, huc, 0x400000)
+    }
+
+    fn plan_total(upload: u32, huc: u32, total: u32) -> Result<Self, BootError> {
         let base = huc.checked_add(0x7fff).ok_or(BootError::Wopcm)? & !0x3fff;
-        let size = 0x400000u32
+        let size = total
             .checked_sub(0x9000)
             .and_then(|top| top.checked_sub(base))
             .ok_or(BootError::Wopcm)?
             & !0xfff;
-        Self { base, size }.validate(0x400000, upload, huc)
+        Self { base, size }.validate(total, upload, huc)
     }
 }
 
@@ -294,7 +298,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::Cache);
         }
         let upload = u32::try_from(image.upload.len()).map_err(|_| BootError::Address)?;
-        WopcmLayout::plan(upload, config.huc_upload_bytes)?;
+        if platform.is_gen12() {
+            WopcmLayout::plan_total(upload, config.huc_upload_bytes, 0x200000)?;
+        } else {
+            WopcmLayout::plan(upload, config.huc_upload_bytes)?;
+        }
         let image_pages = (upload + 384).div_ceil(PAGE);
         let ads_pages = (ADS_PRIVATE + image.private_data_bytes).div_ceil(PAGE);
         let mut allocations: Vec<A::Backing> = Vec::new();
@@ -431,7 +439,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         A: Clone,
     {
         if self.state != BootState::Ready
-            || self.hwconfig.is_none()
+            || (self.platform.has_hwconfig() && self.hwconfig.is_none())
             || self.submission_version.0 != 1
         {
             return Err(BootError::Unsupported);
@@ -449,7 +457,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         ads: crate::intel_gpu_guc_sched::SchedulingAds,
         now: u64,
     ) -> Result<(), BootError> {
-        if self.state != BootState::Ready || self.hwconfig.is_none() || self.scheduling.is_some() {
+        if self.state != BootState::Ready
+            || (self.platform.has_hwconfig() && self.hwconfig.is_none())
+            || self.scheduling.is_some()
+        {
             return Err(BootError::State);
         }
         if self.submission_version.0 != 1 {
@@ -618,7 +629,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             }
             .validate(0x800000, self.upload, self.config.huc_upload_bytes);
         }
-        let layout = WopcmLayout::plan(self.upload, self.config.huc_upload_bytes)?;
+        let layout = if self.platform.is_gen12() {
+            WopcmLayout::plan_total(self.upload, self.config.huc_upload_bytes, 0x200000)?
+        } else {
+            WopcmLayout::plan(self.upload, self.config.huc_upload_bytes)?
+        };
         self.mmio.write32(0xc050, layout.size);
         if self.mmio.read32(0xc050) != layout.size | 1 {
             return Err(BootError::Wopcm);
@@ -787,10 +802,6 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         // register-state headers use physical instances.
                         // xe_guc_ads.c mapping/enable masks, golden LRCA with
                         // its post-register state size, and per-engine saves.
-                        // guc_policies_init: global_flags 0 lets GuC reset an
-                        // engine whose context fails to preempt in time; the
-                        // scheduler retires that context alone.
-                        ads.write32(POLICIES + 76, 0);
                         let engines = crate::intel_gpu_engine::EngineSet::from_bits(
                             config
                                 .engines
@@ -800,13 +811,38 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                                     bits | if state.is_some() { 1 << i } else { 0 }
                                 }),
                         );
-                        for engine in crate::intel_gpu_engine::Engine::ALL {
-                            let Some(state) = config.engines[engine.index()] else {
-                                continue;
-                            };
+                        let policy = config.reset_policy.ok_or(BootError::State)?;
+                        if !policy.matches(self.platform, engines)
+                            || policy.device_id() != self.config.device_id
+                        {
+                            return Poll::Ready(Err(BootError::Device));
+                        }
+                        // Precompute and bound every engine's complete save
+                        // list before changing any ADS header. The register
+                        // page ends at the separate firmware-WA KLV page.
+                        let mut regsets = Vec::new();
+                        regsets
+                            .try_reserve_exact(engines.iter().count())
+                            .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
+                        let mut next_save = 0x2000u64;
+                        for engine in engines.iter() {
+                            let registers = policy.registers(engine).ok_or(BootError::State)?;
+                            let end = next_save
+                                .checked_add(registers.len() as u64 * 16)
+                                .ok_or(BootError::Address)?;
+                            if end > WA_KLVS {
+                                return Poll::Ready(Err(BootError::Address));
+                            }
+                            regsets.push((engine, next_save, registers));
+                            next_save = end;
+                        }
+                        // guc_policies_init: allow firmware to reset an
+                        // engine whose context fails to preempt in time.
+                        ads.write32(POLICIES + 76, 0);
+                        for (engine, saves, registers) in regsets {
+                            let state = config.engines[engine.index()].ok_or(BootError::State)?;
                             let class = u64::from(engine.guc_class());
                             let base_reg = engine.base();
-                            let saves = 0x2000 + engine.index() as u64 * 48;
                             let logical = u64::from(
                                 engines.logical_instance(engine).expect("published engine"),
                             );
@@ -827,18 +863,22 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             }
                             let header = class * 256 + u64::from(physical) * 8;
                             ads.write32(header, base + saves as u32);
-                            ads.write32(header + 4, 3);
-                            for (i, (reg, value, flags)) in [
-                                (base_reg + 0x29c, 0, 1),
-                                (base_reg + 0x80, state.hwsp, 0),
-                                (base_reg + 0xa8, 0, 0),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            {
-                                ads.write32(saves + i as u64 * 16, reg);
-                                ads.write32(saves + i as u64 * 16 + 4, value);
-                                ads.write32(saves + i as u64 * 16 + 8, flags);
+                            ads.write32(header + 4, registers.len() as u32);
+                            for (i, register) in registers.iter().enumerate() {
+                                let entry = saves + i as u64 * 16;
+                                ads.write32(entry, register.offset);
+                                // The firmware owns value as save scratch;
+                                // retain the initial HWS value for the ring.
+                                ads.write32(
+                                    entry + 4,
+                                    if register.offset == base_reg + 0x80 {
+                                        state.hwsp
+                                    } else {
+                                        0
+                                    },
+                                );
+                                ads.write32(entry + 8, register.flags);
+                                ads.write32(entry + 12, 0);
                             }
                         }
                         self.state = BootState::Staged;
@@ -940,6 +980,7 @@ mod tests {
     }
     #[derive(Default)]
     struct Device {
+        profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,
         memory: BTreeMap<u32, Words>,
@@ -961,6 +1002,7 @@ mod tests {
         virtual_contexts: BTreeMap<u32, (u32, u32)>,
         virtual_pick: Option<u32>,
         virtual_restores: Vec<(u32, u32)>,
+        gen12_restores: Vec<(u32, u32, u32)>,
         parallel_contexts: BTreeMap<u32, ParallelContext>,
         parallel_lanes: Option<u8>,
         parallel_reply_child: bool,
@@ -996,6 +1038,22 @@ mod tests {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
             let actual = match offset {
+                0x209c | 0x2209c | 0x229c | 0x2229c
+                    if device.profile.is_some_and(GtPlatform::is_gen12) =>
+                {
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    let mut next = (old & !(value >> 16)) | (value & (value >> 16));
+                    if matches!(offset, 0x209c | 0x2209c) {
+                        // Stopping the otherwise idle modeled CS exposes its
+                        // read-only MODE_IDLE bit in MI_MODE, not RING_MODE.
+                        if next & 0x100 != 0 {
+                            next |= 0x200;
+                        } else {
+                            next &= !0x200;
+                        }
+                    }
+                    next
+                }
                 0x190008 | 0x190010 => {
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     (old & !value & 0x7fffffff) | (value & 0x80000000)
@@ -1017,7 +1075,8 @@ mod tests {
                 0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
                 | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050
                 | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 | 0x1c0d4
-                | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804 => {
+                | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804 | 0x20c4
+                | 0x220c4 | 0x3ee0c4 | 0x1a0c4 | 0x1c0c4 | 0x1e0c4 | 0x260c4 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
@@ -1167,6 +1226,7 @@ mod tests {
         bytes
     }
     fn stage(window: Window, arena: Arena, platform: GtPlatform) -> GuCBoot<Window, Arena> {
+        window.0.borrow_mut().profile = Some(platform);
         window
             .0
             .borrow_mut()
@@ -1178,6 +1238,10 @@ mod tests {
                 (12 << 22) | (70 << 14)
             });
         let device_id = match platform {
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake) => 0x9a49,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP) => 0x46a6,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS) => 0x4680,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,
             GtPlatform::Alchemist => 0x56a0,
             GtPlatform::Battlemage => 0xe20b,
             _ => 0x7d55,
@@ -1198,6 +1262,12 @@ mod tests {
     }
     fn reset_done(window: &Window) {
         let mut device = window.0.borrow_mut();
+        if device.profile.is_some_and(GtPlatform::is_gen12) && device.regs.get(&0x941c) == Some(&1)
+        {
+            for reg in [0x209c, 0x2209c, 0x229c, 0x2229c] {
+                device.regs.insert(reg, 0);
+            }
+        }
         device.regs.insert(0x941c, 0);
         device.regs.insert(0xc000, 1);
         device.regs.insert(0xc314, 0);

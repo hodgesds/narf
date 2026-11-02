@@ -239,6 +239,16 @@ pub enum GttError {
     InvalidPatIndex,
 }
 
+/// Display-only address policy. Gen12 integrated scanout shares the PCI
+/// function's39-bit DMA mask (xe_pci.c / xe_set_dma_info). The common codec
+/// stays wider for DG2 execution; this helper never admits Arc display.
+pub(crate) fn encode_display_pte(format: PteFormat, phys: u64, pat: u8) -> Result<u64, GttError> {
+    if format == PteFormat::Gen12 && phys >> 39 != 0 {
+        return Err(GttError::PhysOutOfRange);
+    }
+    format.encode_ggtt(phys, pat)
+}
+
 /// Gen12 system-memory GGTT entry. `pat` is ignored because this format
 /// has no PAT bits; use PteFormat::XeLpg for Meteor/Arrow Lake GGTT entries.
 pub fn encode_scanout_pte(phys: u64, _pat: PatSlot) -> Result<u64, GttError> {
@@ -534,9 +544,22 @@ pub fn alloc_contiguous_scanout_with_format(
     };
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
+    // Validate the entire contiguous extent before exposing its first PTE.
+    // On refusal the old console window remains unchanged.
+    let preflight = base
+        .checked_add((pages - 1) * GTT_PAGE_SIZE)
+        .ok_or(GttError::PhysOutOfRange)
+        .and_then(|last| {
+            encode_display_pte(format, base, pat_index)?;
+            encode_display_pte(format, last, pat_index)
+        });
+    if let Err(error) = preflight {
+        narf_memory::frame::free_pages(head, order);
+        return Err(error);
+    }
     for i in 0..pages {
         let phys = base + i * GTT_PAGE_SIZE;
-        let pte = match format.encode_ggtt(phys, pat_index) {
+        let pte = match encode_display_pte(format, phys, pat_index) {
             Ok(p) => p,
             Err(e) => {
                 narf_memory::frame::free_pages(head, order);
@@ -578,6 +601,34 @@ pub fn free_contiguous_scanout(alloc: &ContiguousScanout) {
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_gen12_display_dma_mask_is_independent_of_common_pte_width() -> TestResult {
+        assert_eq!(
+            encode_display_pte(PteFormat::Gen12, 0x7ffffff000, 0),
+            Ok(0x7ffffff001)
+        );
+        assert_eq!(
+            encode_display_pte(PteFormat::Gen12, 0x8000000000, 0),
+            Err(GttError::PhysOutOfRange)
+        );
+        assert_eq!(
+            encode_display_pte(PteFormat::Gen12, 0x7ffffff001, 0),
+            Err(GttError::UnalignedPhys)
+        );
+        assert_eq!(
+            PteFormat::Gen12.encode_ggtt(0x8000000000, 0),
+            Ok(0x8000000001)
+        );
+        assert_eq!(
+            encode_display_pte(PteFormat::XeLpg, 0x8000000000, 3),
+            Ok(0x0030008000000001)
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gtt",
+        smoke_gen12_display_dma_mask_is_independent_of_common_pte_width
+    );
 
     fn smoke_scanout_order_sizing() -> TestResult {
         if scanout_order_for(4096) != Some(0) {

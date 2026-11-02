@@ -108,9 +108,14 @@ pub(crate) struct HardwareInit {
     releasing: bool,
     ready: bool,
     quiesce: u8,
+    gen12_reset: Option<crate::intel_gpu_gt::gen12::reset::Reset>,
+    gen12_prepare_budget: bool,
 }
 
 impl HardwareInit {
+    pub(crate) fn take_gen12_reset(&mut self) -> Option<crate::intel_gpu_gt::gen12::reset::Reset> {
+        self.gen12_reset.take()
+    }
     pub(crate) fn ready(&self) -> bool {
         self.ready
     }
@@ -120,6 +125,14 @@ impl HardwareInit {
         now: u64,
     ) -> Result<(), HardwareError> {
         self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
+        if self.platform.is_gen12() {
+            self.quiesce = 0;
+            self.ready = false;
+            self.gen12_prepare_budget = false;
+            if let Some(reset) = &mut self.gen12_reset {
+                reset.restart(now)?;
+            }
+        }
         if self.requested {
             mmio.write32(0xa278, 0x00010001);
         }
@@ -134,6 +147,8 @@ impl HardwareInit {
             releasing: false,
             ready: false,
             quiesce: 0,
+            gen12_reset: None,
+            gen12_prepare_budget: false,
         })
     }
 
@@ -165,11 +180,23 @@ impl HardwareInit {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn poll(
         &mut self,
         mmio: &impl MmioWindow,
         now: u64,
     ) -> Poll<Result<CachePolicy, HardwareError>> {
+        self.poll_with_access(mmio, now, || true)
+    }
+    pub(crate) fn poll_with_access(
+        &mut self,
+        mmio: &impl MmioWindow,
+        now: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Poll<Result<CachePolicy, HardwareError>> {
+        if !current() {
+            return Poll::Ready(Err(HardwareError::Unavailable));
+        }
         if now >= self.deadline {
             return Poll::Ready(Err(HardwareError::Timeout));
         }
@@ -181,6 +208,23 @@ impl HardwareInit {
             return Poll::Pending;
         }
         self.awake(mmio)?;
+        if self
+            .gen12_reset
+            .as_ref()
+            .is_some_and(|reset| reset.releasing())
+        {
+            match self
+                .gen12_reset
+                .as_mut()
+                .expect("owned Gen12 media release")
+                .poll_release(mmio, now, &mut current)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result?,
+            }
+            self.quiesce = 3;
+            self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
+        }
         if self.quiesce != 3 {
             let reset = mmio.read32(0x941c);
             if reset == u32::MAX {
@@ -209,12 +253,63 @@ impl HardwareInit {
                 return Poll::Pending;
             }
             if self.quiesce == 1 {
+                if self.platform.is_gen12() {
+                    if !self.gen12_prepare_budget {
+                        // One encompassing bound for the independently timed
+                        // 50ms wake +100ms CS +5ms GPM phases and settles.
+                        self.deadline =
+                            now.checked_add(200_000_000).ok_or(HardwareError::Timeout)?;
+                        self.gen12_prepare_budget = true;
+                    }
+                    if self.gen12_reset.is_none() {
+                        self.gen12_reset =
+                            Some(crate::intel_gpu_gt::gen12::reset::Reset::new(now)?);
+                    }
+                    match self
+                        .gen12_reset
+                        .as_mut()
+                        .expect("owned Gen12 reset")
+                        .poll_prepare(mmio, now, &mut current)
+                    {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    }
+                }
                 mmio.write32(0x941c, 1);
                 self.quiesce = 2;
                 self.deadline = now.checked_add(5_000_000).ok_or(HardwareError::Timeout)?;
                 return Poll::Pending;
             }
+            if let Some(reset) = &mut self.gen12_reset {
+                if !reset.releasing() && !reset.released() {
+                    // SAFETY: inherited GuC reset/DMA idle and GRDOM_FULL
+                    // self-clear were freshly proven above. Retain both
+                    // base wake wells until every owned media ACK falls.
+                    unsafe {
+                        reset.begin_release_after_full_reset(mmio, now, &mut current)?;
+                    }
+                    self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
+                }
+                match reset.poll_release(mmio, now, &mut current) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result?,
+                }
+                self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
+            }
             self.quiesce = 3;
+        }
+        if self.platform.is_gen12() {
+            crate::intel_gpu_gt::gen12::cache(mmio)?;
+            self.ready = true;
+            let mask = mmio.read32(0x1900e8);
+            if mask == u32::MAX {
+                return Poll::Ready(Err(HardwareError::Unavailable));
+            }
+            mmio.write32(0x1900e8, mask | 0x80000000);
+            return Poll::Ready(Ok(CachePolicy {
+                platform: self.platform,
+                ggtt_pat: 0,
+            }));
         }
         let modern = self.platform != GtPlatform::Alchemist;
         if modern {
@@ -237,6 +332,7 @@ impl HardwareInit {
         }
         mmio.write32(selector, old | 0x80000000);
         let pat = match self.platform {
+            GtPlatform::Gen12(_) => unreachable!("separate pre-GMD cache policy"),
             GtPlatform::Integrated(_) => {
                 // Xe-LPG PAT3: WB L4, one-way coherent. PAT0, used by the
                 // inherited display, is deliberately not redefined.
@@ -310,6 +406,13 @@ impl HardwareInit {
         mmio: &impl MmioWindow,
         now: u64,
     ) -> Result<(), HardwareError> {
+        if self
+            .gen12_reset
+            .as_ref()
+            .is_some_and(|reset| !reset.released())
+        {
+            return Err(HardwareError::Busy);
+        }
         self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
         if self.requested {
             mmio.write32(0xa278, 0x00010000);

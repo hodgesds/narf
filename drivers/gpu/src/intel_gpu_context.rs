@@ -35,11 +35,11 @@ pub(crate) struct ContextSeed {
 }
 
 impl ContextSeed {
-    pub(crate) fn read(
+    pub(crate) fn read<'a>(
         mmio: &impl MmioWindow,
         platform: GtPlatform,
         topology: &GtTopology,
-        config: &HardwareConfig,
+        config: impl Into<Option<&'a HardwareConfig>>,
     ) -> Result<Self, ContextError> {
         platform.guc().ok_or(ContextError::Unsupported)?;
         if topology.platform() != platform || !topology.has_render() {
@@ -52,8 +52,41 @@ impl ContextSeed {
                 crate::intel_gpu_gt::GraphicsError::Unsupported => ContextError::Unsupported,
             })?;
         let (graphics, step) = (ip.version, ip.step);
-        let slices = config.lookup_u32(1).map_err(|_| ContextError::Hwconfig)?;
-        let subs = config.lookup_u32(70).map_err(|_| ContextError::Hwconfig)?;
+        let config = config.into();
+        let slices = config
+            .map(|c| c.lookup_u32(1))
+            .transpose()
+            .map_err(|_| ContextError::Hwconfig)?
+            .flatten();
+        let subs = config
+            .map(|c| c.lookup_u32(70))
+            .transpose()
+            .map_err(|_| ContextError::Hwconfig)?
+            .flatten();
+        if platform.is_gen12() {
+            let per_group = match (slices, subs) {
+                (Some(s), Some(d)) if s != 0 && d != 0 => d.div_ceil(s),
+                _ => 6,
+            };
+            if per_group == 0 || per_group > 8 {
+                return Err(ContextError::Hwconfig);
+            }
+            let first = topology.geometry_dss().trailing_zeros();
+            return Ok(Self {
+                platform,
+                dss: steering(first / per_group, first % per_group)?,
+                l3: 0,
+                disable_wmtp: true,
+                fuse4: 0,
+                graphics,
+                step,
+                mslice: 0,
+                per_group: per_group as u8,
+            });
+        }
+        if config.is_none() {
+            return Err(ContextError::Hwconfig);
+        }
         // xe_gt_mcr.c uses the physical layout maxima, not live DSS counts.
         let per_group = match (slices, subs) {
             (Some(s), Some(d)) if s != 0 && d != 0 => d.div_ceil(s),
@@ -103,6 +136,19 @@ impl ContextSeed {
 
     /// Direct privileged ring commands, only while priming owns RCS0.
     pub(crate) fn commands(self) -> Vec<u32> {
+        if self.platform.is_gen12() {
+            // xe_wa.c lrc_was for graphics1200: no XeHP SVG or L3SQCREG5.
+            let mut words = vec![
+                0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
+                0x02000200,
+            ];
+            // Wa16011163337/1604555607: nonmasked FF_MODE2, preserve low16.
+            rmw(&mut words, 0x6604, 0xffff0000, 0xe0040000, 0);
+            words.extend_from_slice(&[
+                0, 0x11080005, 0x600, 0, 0x608, 0, 0x610, 0, 0, 0x11000001, 0x20cc, 0,
+            ]);
+            return words;
+        }
         let mut masked = match self.platform {
             GtPlatform::Alchemist => vec![
                 (0x6208, 0x00200020), // TBIMR tuning
@@ -309,6 +355,8 @@ pub(crate) mod tests {
                     let masked = matches!(
                         reg,
                         0x2580
+                            | 0x7018
+                            | 0x7304
                             | 0x5588
                             | 0x6204
                             | 0x6208
@@ -454,6 +502,50 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_context",
         smoke_context_workaround_and_steering_vectors
+    );
+
+    fn smoke_gen12_context_hwconfig_absence_and_malformed_refusal() -> TestResult {
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        let mut w = window();
+        w.regs.insert(0x913c, 0x20);
+        w.regs.insert(0x9134, 0xfa);
+        w.regs.insert(0xd8c, u32::MAX);
+        w.regs.insert(0x9114, u32::MAX);
+        w.regs.insert(0x9118, u32::MAX);
+        let topo = GtTopology::read(&w, platform).unwrap();
+        let seed = ContextSeed::read(&w, platform, &topo, None).unwrap();
+        assert_eq!(
+            (seed.graphics, seed.per_group, seed.dss),
+            (1200, 6, 0x40050000)
+        );
+        // These tables are syntactically valid KLVs but the singleton values
+        // are malformed. They must never choose the absent-table fallback.
+        for words in [vec![1u32, 2, 4, 4], vec![70, 2, 6, 6]] {
+            let config =
+                HardwareConfig::parse(words.into_iter().flat_map(u32::to_le_bytes).collect())
+                    .unwrap();
+            assert_eq!(
+                ContextSeed::read(&w, platform, &topo, &config).unwrap_err(),
+                ContextError::Hwconfig
+            );
+        }
+        let mut regs = BTreeMap::from([(0x6604, 0xa5a55aa5)]);
+        let (svg, _) = execute(&seed.commands(), &mut regs);
+        assert!(svg.is_empty());
+        for (reg, value) in [
+            (0x2580, 2),
+            (0x7018, 0x2000),
+            (0x7300, 0x40),
+            (0x7304, 0x200),
+            (0x6604, 0xe0045aa5),
+        ] {
+            assert_eq!(regs[&reg], value);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_context",
+        smoke_gen12_context_hwconfig_absence_and_malformed_refusal
     );
 
     fn smoke_context_seed_refuses_bad_fuses_and_layout() -> TestResult {

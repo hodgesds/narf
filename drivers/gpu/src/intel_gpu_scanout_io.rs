@@ -383,7 +383,7 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
                 let current = self.read32(0x70180);
                 value == current & !(7 << 10)
                     && value & 0x9f000000 == 0x84000000
-                    && [0, 1 << 10].contains(&(current & (7 << 10)))
+                    && [0, 1 << 10, 5 << 10].contains(&(current & (7 << 10)))
             } else {
                 value != 0 && value <= 0xfff
             };

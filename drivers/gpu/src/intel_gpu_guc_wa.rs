@@ -16,6 +16,8 @@ impl GuCWorkarounds {
     /// add DUAL_QUEUE when admitted; a compute DSS fuse is not an engine mask.
     pub(crate) fn for_rcs(platform: GtPlatform, device: u16, ip: GraphicsIp) -> Self {
         let (flags, klvs): (_, &'static [u32]) = match platform {
+            // POLLCS + PRE_PARSER. No CCS, TSC or XeHP register-state WA.
+            GtPlatform::Gen12(_) => (0x44000, &[0x900b0000]),
             GtPlatform::Alchemist => {
                 let isolation = matches!(
                     device,

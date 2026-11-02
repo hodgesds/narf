@@ -10,7 +10,9 @@ use super::*;
 #[path = "intel_gpu_vram_clear_model.rs"]
 mod model;
 #[cfg(feature = "kernel-test")]
-pub(crate) use model::{execute_fixture, fixture_finish, fixture_seed, fixture_state};
+pub(crate) use model::{
+    execute_fixture, fixture_finish, fixture_metadata, fixture_seed, fixture_state,
+};
 
 const CODE: u64 = 0x1234_0000_0000;
 const ZERO: u64 = 0x1234_0010_0000;
@@ -25,51 +27,26 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
     }
     let gem = GemState::new();
     let code = gem.object(gem.create(PAGE, |_, _| Ok(()))?)?;
-    // One command copies at most 1024 blocks of 256 CCS bytes. All commands
-    // reuse this immutable zero source; no user namespace retains it.
-    let zero = gem.object(gem.create(CHUNK / 256, |_, _| Ok(()))?)?;
+    // The common trusted copy emitter initializes data and the CCS emitter
+    // initializes metadata from the same immutable private zero storage.
+    let zero = gem.object(gem.create(copy::COPY_CHUNK, |_, _| Ok(()))?)?;
     let mut words = Vec::new();
+    for offset in (0..size).step_by(copy::COPY_CHUNK as usize) {
+        copy::emit_data_copy(
+            &mut words,
+            GtPlatform::Alchemist,
+            ZERO,
+            TARGET + offset,
+            (size - offset).min(copy::COPY_CHUNK),
+        );
+    }
     for offset in (0..size).step_by(CHUNK as usize) {
         let bytes = (size - offset).min(CHUNK);
-        let blocks = bytes / 65536;
-        // xe_migrate.c::emit_clear_main_copy: Xe-HPG's sixteen-DW linear
-        // XY_FAST_COLOR_BLT, 32-bit zero color, UC MOCS1, 4096-byte pitch,
-        // local-memory destination. No CPU can reach this private target.
-        words.extend_from_slice(&[
-            0x5110_000e,
-            0x0040_0fff,
-            0,
-            ((bytes / 4096) as u32) << 16 | 1024,
-            (TARGET + offset) as u32,
-            ((TARGET + offset) >> 32) as u32,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ]);
-        // XY_CTRL_SURF_COPY_BLT, direct source bit21, indirect destination;
-        // CCS_SIZE[17:8] counts 256-byte metadata blocks minus one. UC MOCS1
-        // (xe_mocs.c DG2) is in bits31:26 of both upper address words.
-        words.extend_from_slice(&[
-            0x5200_0003 | (1 << 21) | ((blocks as u32 - 1) << 8),
-            ZERO as u32,
-            (ZERO >> 32) as u32 | (1 << 26),
-            (TARGET + offset) as u32,
-            ((TARGET + offset) >> 32) as u32 | (1 << 26),
-        ]);
+        copy::emit_ccs_copy(&mut words, ZERO, true, TARGET + offset, bytes);
     }
     // Publish auxiliary-surface writes before the ordinary copy-ring
     // breadcrumb. Linux xe_migrate_clear requests MI_FLUSH_DW_CCS for this.
-    words.extend_from_slice(&[0x1301_0003, 0, 0, 0, 0, 0x0500_0000]);
-    if words.len() % 2 != 0 {
-        words.push(0);
-    }
+    copy::finish(&mut words, true);
     for (i, word) in words.iter().enumerate() {
         code.write(i as u64 * 4, &word.to_le_bytes())?;
     }
@@ -90,7 +67,7 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
                 object: Some(zero),
                 va: ZERO,
                 offset: 0,
-                length: CHUNK / 256,
+                length: copy::COPY_CHUNK,
                 writable: false,
                 pat: 0,
             },

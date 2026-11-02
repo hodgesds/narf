@@ -4486,7 +4486,11 @@ fn intel_modifiers_cap(
     arg: u64,
     context: &dyn IoctlContext,
 ) -> Option<Result<u64, FsError>> {
-    if cmd != drm_uapi::DRM_IOCTL_GET_CAP || !mode.lock().intel_x_tiled {
+    let qualified = {
+        let card = mode.lock();
+        card.intel_x_tiled || card.intel_tile4
+    };
+    if cmd != drm_uapi::DRM_IOCTL_GET_CAP || !qualified {
         return None;
     }
     let result = (|| {
@@ -4521,15 +4525,31 @@ pub(crate) fn intel_get_modifiers_cap(
 }
 #[cfg(feature = "intel")]
 fn intel_primary_formats_blob(card: &crate::drm::card::Card, id: u32) -> Option<Vec<u8>> {
-    if id != INTEL_PRIMARY_FORMATS_BLOB || !card.intel_x_tiled {
+    if id != INTEL_PRIMARY_FORMATS_BLOB || !(card.intel_x_tiled || card.intel_tile4) {
         return None;
     }
-    // create_in_format_blob: XR24 alone, LINEAR and source-qualified X.
+    // create_in_format_blob: XR24 alone and only installed layout profiles.
+    let mut modifiers = alloc::vec![0];
+    if card.intel_x_tiled {
+        modifiers.push(crate::intel_gpu_scanout::X_TILED_MODIFIER);
+    }
+    if card.intel_tile4 {
+        modifiers.push(crate::intel_gpu_scanout::TILE4_MODIFIER);
+    }
     let mut bytes = Vec::new();
-    for word in [1u32, 0, 1, 24, 2, 32, DRM_FORMAT_XRGB8888, 0] {
+    for word in [
+        1u32,
+        0,
+        1,
+        24,
+        modifiers.len() as u32,
+        32,
+        DRM_FORMAT_XRGB8888,
+        0,
+    ] {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
-    for modifier in [0, crate::intel_gpu_scanout::X_TILED_MODIFIER] {
+    for modifier in modifiers {
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&modifier.to_le_bytes());
@@ -4657,7 +4677,7 @@ fn handle_obj_getproperties(
             #[cfg(any(feature = "amdgpu", feature = "intel"))]
             let (mut props, mut values) = (props, values);
             #[cfg(feature = "intel")]
-            if card.intel_x_tiled && obj_id == PLANE_ID_BASE {
+            if (card.intel_x_tiled || card.intel_tile4) && obj_id == PLANE_ID_BASE {
                 props.push(0x6e);
                 values.push(u64::from(INTEL_PRIMARY_FORMATS_BLOB));
             }

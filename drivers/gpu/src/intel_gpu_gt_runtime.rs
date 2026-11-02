@@ -98,6 +98,7 @@ struct Owner {
     pm: narf_power::runtime_pm_pci::PciRuntimeNode,
     /// Autosuspend has been configured and runtime PM allowed.
     autosuspend: AtomicBool,
+    runtime_power: Arc<crate::intel_gpu_power_controls::runtime::Control>,
     state: Mutex<State>,
     suspended: AtomicBool,
     user_epoch: Arc<AtomicU64>,
@@ -446,6 +447,54 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             result.map_err(|_| crate::intel_gpu_user::io_error())
         })
     }
+    fn copy_objects(
+        &self,
+        request: crate::intel_gpu_exec::copy::CopyRequest,
+        epoch: u64,
+    ) -> narf_filesystem::FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let awake = Awake::take(&owner).await?;
+            let mut state = owner.lock_running().await;
+            if state.phase != Phase::Running
+                || epoch == 0
+                || owner.user_epoch.load(Ordering::Acquire) != epoch
+                || owner.suspended.load(Ordering::Acquire)
+                || narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                    != Ok(Some(narf_bus::pci::PciPowerState::D0))
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let pool = crate::drm_registry::DrmCard::intel_vram(&*owner.pending.card);
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let result = gt.copy_objects(narf_time::monotonic_ns(), request, epoch, pool.as_ref());
+            if gt.state() == GtState::Lost {
+                owner.close_controls();
+                owner.user_epoch.store(0, Ordering::Release);
+            }
+            match result {
+                Ok(fence) => {
+                    // No await separates hardware ownership from the PM hold.
+                    awake.until(fence.clone());
+                    Ok(fence)
+                }
+                Err(GtError::Scheduling(
+                    crate::intel_gpu_guc_sched::SchedulingError::Residency(error),
+                )) => Err(error),
+                Err(GtError::Scheduling(
+                    crate::intel_gpu_guc_sched::SchedulingError::Busy
+                    | crate::intel_gpu_guc_sched::SchedulingError::Full,
+                )) => Err(narf_filesystem::FsError::WouldBlock),
+                Err(_) => Err(narf_filesystem::FsError::NoDevice),
+            }
+        })
+    }
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         Some(self.power_controls.clone())
     }
@@ -657,12 +706,19 @@ pub(crate) fn install(
     cap: Cap<BusDeviceCap, Write>,
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
-) {
+) -> bool {
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
         .is_none()
     {
-        return;
+        return false;
+    }
+    if crate::intel_gpu_gt::ownership::claim_guc(device.addr, bar).is_err() {
+        log(
+            index,
+            "GT already owned or conflicting BAR; GuC not installed",
+        );
+        return false;
     }
     PENDING.lock().push(Pending {
         index,
@@ -672,6 +728,7 @@ pub(crate) fn install(
         bar,
         mode,
     });
+    true
 }
 
 pub(crate) fn start_pending() {
@@ -703,10 +760,21 @@ pub(crate) fn start_pending() {
         );
         let ccs_control = crate::intel_gpu_ccs_control::Control::new(p.index);
         let coredump = crate::intel_gpu_error::coredump::arm(p.index);
+        let user_epoch = Arc::new(AtomicU64::new(0));
+        let auto_eligible = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
+            .is_some_and(GtPlatform::is_discrete)
+            && p.mode.is_none();
+        let runtime_power = crate::intel_gpu_power_controls::runtime::Control::register(
+            p.index,
+            pm.device.clone(),
+            user_epoch.clone(),
+            auto_eligible,
+        );
         let owner = Arc::new(Owner {
             pending: p,
             pm,
             autosuspend: AtomicBool::new(false),
+            runtime_power,
             state: Mutex::new(State {
                 coredump,
                 coredump_enabled: crate::intel_gpu_error::coredump::enabled(),
@@ -727,7 +795,7 @@ pub(crate) fn start_pending() {
                 ccs_mode: ccs_boot_mode(narf_boot::args()),
             }),
             suspended: AtomicBool::new(false),
-            user_epoch: Arc::new(AtomicU64::new(0)),
+            user_epoch,
             user_version: Arc::new(AtomicU32::new(0)),
             user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
@@ -1024,13 +1092,17 @@ impl Owner {
         };
         match (state.phase, current) {
             (Phase::Booting, GtState::Ready) => {
-                gt.begin_hwconfig(now).map_err(RuntimeError::Gt)?;
+                if gt.has_hwconfig() {
+                    gt.begin_hwconfig(now).map_err(RuntimeError::Gt)?;
+                }
                 state.phase = Phase::Discovering;
             }
             (Phase::Discovering, GtState::Ready) => {
-                match self.pending.card.publish_gt_hwconfig(gt) {
-                    Ok(()) | Err(GtError::Busy) => {}
-                    Err(e) => return Err(RuntimeError::Gt(e)),
+                if gt.has_hwconfig() {
+                    match self.pending.card.publish_gt_hwconfig(gt) {
+                        Ok(()) | Err(GtError::Busy) => {}
+                        Err(e) => return Err(RuntimeError::Gt(e)),
+                    }
                 }
                 self.pending
                     .card
@@ -1200,6 +1272,18 @@ impl Owner {
     async fn run(self: Arc<Self>) {
         let mut reconfiguration_power = None;
         loop {
+            // Policy changes may invoke PCI resume/GT park callbacks, so
+            // service the card-lifetime actor before acquiring the GT mutex.
+            self.runtime_power
+                .service(|| {
+                    !self.suspended.load(Ordering::Acquire)
+                        && self.user_epoch.load(Ordering::Acquire) != 0
+                        && matches!(
+                            narf_bus::pci::power_state(&self.pending.cap, &self.pending.device,),
+                            Ok(Some(_))
+                        )
+                })
+                .await;
             let mut reconfiguration_power_failed = false;
             // Runtime resume can acquire this same GT mutex. Never request
             // power while holding it, and retain the usage reference across
@@ -1368,6 +1452,7 @@ impl Owner {
                                 state.gt.as_ref().and_then(GuCGt::compute_configuration);
                             let mut publish = || {
                                 self.power_controls.activate(epoch);
+                                self.runtime_power.activate(epoch);
                                 if let Some(hwmon) = &self.hwmon {
                                     hwmon.activate(epoch);
                                 }
@@ -1487,6 +1572,7 @@ impl Owner {
         device.mark_last_busy();
         device.allow();
         let _ = device.put_autosuspend();
+        self.runtime_power.autosuspend_ready();
     }
 
     /// Runtime suspend: refuse unless the GT is running and provably idle,
@@ -1641,6 +1727,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             if let Some(control) = &self.ccs_control {
                 control.close();
             }
+            self.runtime_power.close();
             self.suspended.store(true, Ordering::Release);
             self.user_epoch.store(0, Ordering::Release);
             state.irq.take(); // mask/synchronize while the function is in D0

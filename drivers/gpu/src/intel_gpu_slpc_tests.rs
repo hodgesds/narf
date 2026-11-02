@@ -397,3 +397,67 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_slpc",
     smoke_slpc_buffer_remains_disjoint_from_later_contexts
 );
+
+fn smoke_gen12_slpc_uses_pre_gmd_frequency_fuses() -> TestResult {
+    use crate::intel_gpu_gt::Gen12Platform;
+    use crate::intel_gpu_slpc::Limits;
+    struct PreGmd {
+        cap: u32,
+        efficient: u32,
+    }
+    impl MmioWindow for PreGmd {
+        fn read32(&self, register: u64) -> u32 {
+            match register {
+                0x145998 => self.cap,
+                0x145ef0 => self.efficient,
+                _ => panic!("unexpected Gen12 frequency register {register:x}"),
+            }
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("frequency discovery wrote MMIO");
+        }
+    }
+    for family in [
+        Gen12Platform::TigerLake,
+        Gen12Platform::AlderLakeP,
+        Gen12Platform::AlderLakeS,
+        Gen12Platform::AlderLakeN,
+    ] {
+        let platform = GtPlatform::Gen12(family);
+        let limits = Limits::read(
+            &PreGmd {
+                cap: (6 << 16) | 30,
+                efficient: 18 << 8,
+            },
+            platform,
+            0x9a49,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                limits.rpn_mhz,
+                limits.rpe_mhz,
+                limits.rp0_mhz,
+                limits.min_mhz,
+                limits.max_mhz
+            ),
+            (300, 900, 1500, 300, 1500)
+        );
+        for cap in [u32::MAX, 30, (31 << 16) | 30] {
+            assert!(Limits::read(
+                &PreGmd {
+                    cap,
+                    efficient: 18 << 8
+                },
+                platform,
+                0x9a49
+            )
+            .is_err());
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_slpc",
+    smoke_gen12_slpc_uses_pre_gmd_frequency_fuses
+);

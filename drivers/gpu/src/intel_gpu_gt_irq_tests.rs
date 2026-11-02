@@ -21,6 +21,7 @@ struct Registers {
     enable_fail: bool,
     disable_fail: bool,
     reject: Option<u64>,
+    no_tile: bool,
 }
 #[derive(Clone)]
 struct Window(Arc<IrqSafeSpinLock<Registers>>);
@@ -61,6 +62,7 @@ impl Window {
             enable_fail: false,
             disable_fail: false,
             reject: None,
+            no_tile: false,
         })))
     }
     fn raise(&self, bits: u32) {
@@ -68,7 +70,9 @@ impl Window {
             let mut r = self.0.lock();
             *r.words.get_mut(&0x190018).unwrap() |= bits;
             *r.words.get_mut(&0x190010).unwrap() |= 1;
-            *r.words.get_mut(&0x190008).unwrap() |= 1;
+            if !r.no_tile {
+                *r.words.get_mut(&0x190008).unwrap() |= 1;
+            }
             r.vector
         };
         narf_interrupts::dispatch::on_irq(vector.expect("installed MSI route"));
@@ -77,6 +81,10 @@ impl Window {
 impl MmioWindow for Window {
     fn read32(&self, offset: u64) -> u32 {
         let r = self.0.lock();
+        assert!(
+            !(r.no_tile && offset == 0x190008),
+            "Gen12 has no tile interrupt register"
+        );
         if r.unavailable {
             return u32::MAX;
         }
@@ -87,6 +95,10 @@ impl MmioWindow for Window {
     }
     fn write32(&self, offset: u64, value: u32) {
         let mut r = self.0.lock();
+        assert!(
+            !(r.no_tile && offset == 0x190008),
+            "Gen12 has no tile interrupt register"
+        );
         r.writes.push((offset, value));
         if r.unavailable || r.reject == Some(offset) {
             return;
@@ -141,7 +153,10 @@ impl MessageRoute for Route {
         let mut r = self.0 .0.lock();
         let vector = r.vector.unwrap();
         assert!(narf_interrupts::dispatch::installed_handler_names(vector).contains(&"intel-gt"));
-        assert_eq!(r.words[&0x190008] & 0x80000000, 0);
+        assert_eq!(
+            r.words[&if r.no_tile { 0x190010 } else { 0x190008 }] & 0x80000000,
+            0
+        );
         r.events.push("enable");
         if r.enable_fail {
             Err(IrqError::Route)
@@ -153,7 +168,7 @@ impl MessageRoute for Route {
         let mut r = self.0 .0.lock();
         if !r.unavailable {
             assert_eq!(
-                r.words[&0x190008] & 0x80000000,
+                r.words[&if r.no_tile { 0x190010 } else { 0x190008 }] & 0x80000000,
                 0,
                 "MSI disabled before device mask"
             );
@@ -544,4 +559,124 @@ fn smoke_gt_irq_uncertain_teardown_keeps_vector_and_cookie() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gt_irq",
     smoke_gt_irq_uncertain_teardown_keeps_vector_and_cookie
+);
+
+// Xe-LP xelp_irq_handler has a graphics master and no master-tile register.
+// The model traps any tile access; real dispatch still owns the MSI cookie.
+fn gen12_window() -> Window {
+    let w = Window::new();
+    w.0.lock().no_tile = true;
+    w
+}
+fn gen12_irq(w: &Window) -> Delivery<Window, Route> {
+    Delivery::install_hierarchy(
+        w.clone(),
+        Route(w.clone()),
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]),
+        false,
+    )
+    .unwrap()
+}
+fn smoke_gen12_irq_real_dispatch_masks_graphics_until_all_identities_retire() -> TestResult {
+    let w = gen12_window();
+    let saved = w.0.lock().words.clone();
+    let irq = gen12_irq(&w);
+    let vector = irq.vector();
+    assert_eq!(irq.service(0), Ok(false));
+    w.raise(0x02008001);
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    assert_eq!(irq.service(10), Ok(true));
+    w.0.lock().delay = true;
+    assert_eq!(irq.service(20), Ok(true));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    w.0.lock().delay = false;
+    assert_eq!(irq.service(30), Ok(true));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    assert_eq!(irq.service(40), Ok(true));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    assert_eq!(irq.service(50), Ok(false));
+    assert_eq!(w.read32(0x190010), 0x80000000);
+    assert_eq!(w.read32(0x190018), 0);
+    drop(irq);
+    assert!(!narf_interrupts::dispatch::installed_handler_names(vector).contains(&"intel-gt"));
+    let r = w.0.lock();
+    for register in [
+        0x190010, 0x190030, 0x190090, 0x1900a0, 0x190038, 0x1900e8, 0x20a8, 0x220a8,
+    ] {
+        assert_eq!(r.words[&register], saved[&register]);
+    }
+    assert!(!r.writes.iter().any(|(reg, _)| *reg == 0x190008));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gen12_irq_real_dispatch_masks_graphics_until_all_identities_retire
+);
+
+fn smoke_gen12_irq_refuses_inherited_master_and_unowned_sources() -> TestResult {
+    for inherited in [0x80000000, 0x01000000] {
+        let w = gen12_window();
+        w.0.lock().words.insert(0x190010, inherited);
+        assert!(matches!(
+            Controller::with_hierarchy(
+                w.clone(),
+                EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]),
+                false
+            ),
+            Err(IrqError::Conflict)
+        ));
+        assert!(w.0.lock().writes.is_empty());
+    }
+    let w = gen12_window();
+    assert!(matches!(
+        Controller::with_hierarchy(
+            w.clone(),
+            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
+            false
+        ),
+        Err(IrqError::Identity)
+    ));
+    assert!(w.0.lock().writes.is_empty());
+    let irq = gen12_irq(&w);
+    assert_eq!(irq.service(0), Ok(false));
+    w.0.lock().words.insert(0x190010, 0x81000000);
+    assert_eq!(irq.service(1), Err(IrqError::Conflict));
+    assert_eq!(w.read32(0x190010), 0x01000000);
+    drop(irq);
+    let w = gen12_window();
+    let irq = gen12_irq(&w);
+    irq.service(0).unwrap();
+    w.raise(2);
+    assert_eq!(irq.service(1), Err(IrqError::Conflict));
+    assert_eq!(w.read32(0x190018), 2);
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gen12_irq_refuses_inherited_master_and_unowned_sources
+);
+
+fn smoke_gen12_irq_identity_deadline_and_rearm_failure_keep_master_masked() -> TestResult {
+    let w = gen12_window();
+    let irq = gen12_irq(&w);
+    irq.service(0).unwrap();
+    w.raise(1);
+    w.0.lock().delay = true;
+    assert_eq!(irq.service(10), Ok(true));
+    assert_eq!(irq.service(100009), Ok(true));
+    assert_eq!(irq.service(100010), Err(IrqError::Timeout));
+    assert_eq!(w.read32(0x190018), 1);
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    drop(irq);
+    let w = gen12_window();
+    let irq = gen12_irq(&w);
+    w.0.lock().reject = Some(0x190010);
+    assert_eq!(irq.service(0), Err(IrqError::Route));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gen12_irq_identity_deadline_and_rearm_failure_keep_master_masked
 );

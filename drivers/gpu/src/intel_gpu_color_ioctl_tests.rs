@@ -1472,3 +1472,6 @@ mod degamma {
 mod tiled {
     include!("intel_gpu_tiled_ioctl_tests.rs");
 }
+mod gen12 {
+    include!("intel_gpu_gen12_ioctl_tests.rs");
+}

@@ -104,6 +104,7 @@ impl EngineSet {
 /// infers CCSn from DSS in quadrant n; Xe2 reads XEHP_FUSE4 CCS_EN.
 pub(crate) fn compute_instances(platform: GtPlatform, dss: u32, fuse4: u32) -> u8 {
     match platform {
+        GtPlatform::Gen12(_) => 0,
         GtPlatform::Integrated(_) => 1,
         GtPlatform::Alchemist => {
             // get_num_dss_regs: one geometry and one compute register, so
@@ -237,7 +238,7 @@ impl Engine {
     }
     /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image.
     pub(crate) fn first_lri(self, platform: GtPlatform) -> u32 {
-        if self.is_copy() && platform != GtPlatform::Battlemage {
+        if platform.is_gen12() || self.is_copy() && platform != GtPlatform::Battlemage {
             0x11081019 // gen12_xcs_offsets: 13 registers, no PRT_BB_STATE
         } else {
             0x1108101d
@@ -275,6 +276,7 @@ pub(crate) fn enable_ring(
 
 pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
     match platform {
+        GtPlatform::Gen12(_) => 3,
         GtPlatform::Integrated(_) => 9,
         GtPlatform::Alchemist => 1,
         GtPlatform::Battlemage => 3,
@@ -426,7 +428,10 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
     image.write32(REGS + 3 * 4, 0x00090009); // inhibit restore and synchronous switch
     image.write32(REGS + 9 * 4, ring);
     image.write32(REGS + 11 * 4, 0x1001); // 8 KiB ring
-    image.write32(REGS + 0x71 * 4, 0x01000000); // reset_stop_ring, IP >= 12.50
+    image.write32(
+        REGS + if platform.is_gen12() { 0x61 } else { 0x71 } * 4,
+        0x01000000,
+    );
 }
 
 #[cfg(feature = "kernel-test")]

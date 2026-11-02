@@ -939,6 +939,9 @@ pub struct Card {
     /// Fixed display14 primary with owned no-DPT + linear-equivalent X WMs.
     #[cfg(feature = "intel")]
     pub(crate) intel_x_tiled: bool,
+    /// Fixed display14 Tile4 with retained primary WM/resource ownership.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_tile4: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
     /// A released master still owns hardware until serialized restoration.
@@ -1218,6 +1221,8 @@ impl Card {
             intel_ctm: false,
             #[cfg(feature = "intel")]
             intel_x_tiled: false,
+            #[cfg(feature = "intel")]
+            intel_tile4: false,
             #[cfg(feature = "intel")]
             intel_display: false,
             #[cfg(feature = "intel")]
@@ -2149,10 +2154,10 @@ impl Card {
 
     /// ADDFB2 naming one of open `owner`'s Intel GEM handles: drm core's
     /// framebuffer_check and Linux intel_framebuffer_init, in their order.
-    /// LINEAR and the qualified display14 no-DPT X profile are taken; plane0
+    /// LINEAR and qualified display14 no-DPT X/Tile4 are taken; plane0
     /// has no offset. Linear pitch is64-byte aligned (4KiB past the plane's
     /// 128 KiB native limit) and at most 256 KiB; the object holds every
-    /// line. X is XR24 only, pitch512-aligned, height padded to8 tile rows.
+    /// line. Tiling is XR24 only: X pitch512/rows8, Tile4 pitch128/rows32.
     /// On native Xe (`xe`), an object not created SCANOUT may not be
     /// VM-bound and becomes SCANOUT (intel_fb_bo_framebuffer_init).
     #[cfg(feature = "intel")]
@@ -2170,7 +2175,9 @@ impl Card {
         } else {
             0
         };
-        let tiled = modifier == crate::intel_gpu_scanout::X_TILED_MODIFIER && self.intel_x_tiled;
+        let x_tiled = modifier == crate::intel_gpu_scanout::X_TILED_MODIFIER && self.intel_x_tiled;
+        let tile4 = modifier == crate::intel_gpu_scanout::TILE4_MODIFIER && self.intel_tile4;
+        let tiled = x_tiled || tile4;
         if cmd.flags & !(FB_INTERLACED | FB_MODIFIERS) != 0
             || (modifier != 0 && !tiled)
             || (tiled && (cmd.flags & FB_INTERLACED != 0 || cmd.pixel_format != 0x3432_5258))
@@ -2212,7 +2219,9 @@ impl Card {
         let pitch = cmd.pitches[0];
         const MAX_STRIDE: u32 = 256 * 1024; // intel_fb_max_stride, remapped
         const PLANE_STRIDE: u32 = 128 * 1024; // adl_plane_max_stride bytes
-        let alignment = if tiled {
+        let alignment = if tile4 {
+            128
+        } else if tiled {
             512
         } else if pitch > PLANE_STRIDE {
             4096
@@ -2226,7 +2235,9 @@ impl Card {
         {
             return Err(CardError::InvalidDimensions);
         }
-        let height = if tiled {
+        let height = if tile4 {
+            cmd.height.div_ceil(32) * 32
+        } else if tiled {
             cmd.height.div_ceil(8) * 8
         } else {
             cmd.height

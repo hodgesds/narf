@@ -465,12 +465,9 @@ struct MediaState {
 static MEDIA_STATE: narf_lib::sync::IrqSafeSpinLock<Option<MediaState>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-fn attach_media() -> Result<(), MediaError> {
+fn attach_media(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(), MediaError> {
     let built = crate::intel_gpu::with_controller(|gpu| {
-        if !matches!(
-            gpu.chip_info().generation,
-            crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
-        ) {
+        if !lease.matches_function(gpu.function_addr(), gpu.gtt_mmadr) {
             return None;
         }
         let rg = gpu.chip_info().generation.region_generation()?;
@@ -507,6 +504,7 @@ fn attach_media() -> Result<(), MediaError> {
 /// engine of the probed Gen12 controller, attaching the media
 /// engines on first use. Returns the engine-wide request id;
 /// completion is observed through [`poll_media_completions`].
+/// A pending, failed or stopped GuC owner still excludes this legacy path.
 ///
 /// The submission runs inside the engine's forcewake
 /// sub-domain hold (the ELSP doorbell is rung inside the
@@ -516,13 +514,17 @@ fn attach_media() -> Result<(), MediaError> {
 /// released immediately after — the sub-domain hold nests
 /// inside the aggregate media well, as in i915.
 pub fn submit_media_dwords(engine: MediaEngineId, dwords: &[u32]) -> Result<u64, MediaError> {
+    let lease = crate::intel_gpu_rcs::legacy_submission_lease()?;
     let mut guard = MEDIA_STATE.lock();
     if guard.is_none() {
         drop(guard);
-        attach_media()?;
+        attach_media(&lease)?;
         guard = MEDIA_STATE.lock();
     }
     let state = guard.as_mut().expect("attached above");
+    if !state.window.matches_legacy(&lease) {
+        return Err(SubmitError::NoEngine.into());
+    }
     let spec = engine.spec();
     let domain = MediaFwDomain::of(&spec).ok_or(SubmitError::NoEngine)?;
     let idx = state

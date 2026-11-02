@@ -5,8 +5,9 @@
 //! regs/xe_oa_regs.h, and i915 intel_engine_apply_whitelist's unused-slot
 //! RING_NOPID fill. This initializes engine policy, not userspace submission
 //! or an OA stream; neither is admitted by installing these registers.
-//! BCS0 has no whitelist entry on these profiles (only PVC/MERT copy
-//! engines do), so every inherited BCS0 slot is cleared to its own NOPID.
+//! Modern RCS/CCS profiles carry OAG grants and COPY has none. Gen12 instead
+//! grants RCS PS_INVOCATION_COUNT RD, COMMON_SLICE_CHICKEN1/HIZ RW, and
+//! BCS CTX_TIMESTAMP RD. Every remaining inherited slot becomes its own NOPID.
 
 use crate::{
     intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform, intel_gpu_gt_registers::RegisterError,
@@ -40,6 +41,7 @@ impl Slots {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EnginePolicy {
     engines: crate::intel_gpu_engine::EngineSet,
+    gen12: bool,
 }
 
 impl EnginePolicy {
@@ -54,19 +56,34 @@ impl EnginePolicy {
             return Err(RegisterError::Identity);
         }
         match platform {
+            GtPlatform::Gen12(_) if engines.compute().next().is_none() => Ok(Self {
+                engines,
+                gen12: true,
+            }),
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
-            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
-                Ok(Self { engines })
-            }
+            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => Ok(Self {
+                engines,
+                gen12: false,
+            }),
             _ => Err(RegisterError::Identity),
         }
     }
 
     fn banks(self) -> impl Iterator<Item = Slots> {
-        self.engines.iter().map(|engine| Slots {
+        self.engines.iter().map(move |engine| Slots {
             base: engine.base(),
-            allowed: if engine.is_copy() { &[] } else { &ALLOWED },
+            allowed: if self.gen12 {
+                if engine.is_copy() {
+                    &[0x100223a8]
+                } else {
+                    &[0x10002349, 0x7010, 0x7018]
+                }
+            } else if engine.is_copy() {
+                &[]
+            } else {
+                &ALLOWED
+            },
         })
     }
 

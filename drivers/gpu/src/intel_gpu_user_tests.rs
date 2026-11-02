@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     intel_gpu_exec::PpgttProbeResult,
     intel_gpu_fence::{CompletionFence, JobError},
-    intel_gpu_render::{tests::User, DeviceInfo, RenderFile},
+    intel_gpu_render::{DeviceInfo, RenderFile, tests::User},
     intel_gpu_uapi::{self as abi, put32, put64, u32_at, u64_at},
     intel_gpu_user::{UserBackend, UserBatch, UserContext, UserStatus},
 };
@@ -23,9 +23,14 @@ mod vm_dump {
 fn prime(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
     hardware_discovery(gt, w, ack);
     hardware_scheduling(gt, w);
-    let fence = gt.begin_context_defaults(26).unwrap();
+    let origin = if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        10_000_000
+    } else {
+        0
+    };
+    let fence = gt.begin_context_defaults(origin + 26).unwrap();
     let mut registered = BTreeMap::new();
-    for now in 27..95 {
+    for now in origin + 27..origin + 95 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
         service_contexts(w, &mut registered, true);
         if fence.result().is_some() {
@@ -94,9 +99,10 @@ fn smoke_userspace_context_save_restore_and_isolation() -> TestResult {
         }
         let context = UserContext::new();
         let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
-        assert!(gt
-            .submit_user_batch(0, context.clone(), UserBatch(batch))
-            .is_err());
+        assert!(
+            gt.submit_user_batch(0, context.clone(), UserBatch(batch))
+                .is_err()
+        );
         assert!(!context.busy());
         prime(&mut gt, &w, ack);
         let baseline = arena.live_allocations();
@@ -145,9 +151,10 @@ fn smoke_userspace_cache_rollback_and_reset_ownership() -> TestResult {
         let baseline = arena.live_allocations();
         let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
         w.0.borrow_mut().fail_sync = true;
-        assert!(gt
-            .submit_user_batch(100, context.clone(), UserBatch(batch))
-            .is_err());
+        assert!(
+            gt.submit_user_batch(100, context.clone(), UserBatch(batch))
+                .is_err()
+        );
         assert!(!context.busy());
         assert_eq!(arena.live_allocations(), baseline);
         w.0.borrow_mut().fail_sync = false;
@@ -745,9 +752,10 @@ fn smoke_userspace_context_epoch_loss_refuses_replay() -> TestResult {
     assert_ne!(gt.user_epoch(), Some(epoch));
     let baseline = arena.live_allocations();
     let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
-    assert!(gt
-        .submit_user_batch(100, context.clone(), UserBatch(batch))
-        .is_err());
+    assert!(
+        gt.submit_user_batch(100, context.clone(), UserBatch(batch))
+            .is_err()
+    );
     assert_eq!(arena.live_allocations(), baseline);
     assert_eq!(context.reset_stats(), (0, 0));
     assert!(context.check_epoch(gt.user_epoch().unwrap()).is_err());
@@ -1008,9 +1016,10 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             assert_eq!(gt.user_epoch(), epoch);
             // The banned context refuses work; a fresh one runs.
             let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
-            assert!(gt
-                .submit_user_batch(HANG_TIMEOUT + 300, guilty.clone(), UserBatch(batch))
-                .is_err());
+            assert!(
+                gt.submit_user_batch(HANG_TIMEOUT + 300, guilty.clone(), UserBatch(batch))
+                    .is_err()
+            );
             let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
             let (_, later) = gt
                 .submit_user_batch(HANG_TIMEOUT + 300, UserContext::new(), UserBatch(batch))

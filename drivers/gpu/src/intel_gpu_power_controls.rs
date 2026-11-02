@@ -6,6 +6,9 @@
 //! matched firmware reply/readback publishes confirmed values. Fused bounds
 //! and BMG conservative constraints remain owned by intel_gpu_slpc.
 
+#[path = "intel_gpu_runtime_power.rs"]
+pub(crate) mod runtime;
+
 use alloc::{format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::{

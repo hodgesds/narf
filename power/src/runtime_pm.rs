@@ -201,6 +201,9 @@ struct Inner {
     waiters: Vec<Waker>,
     suspends: u64,
     resumes: u64,
+    accounting_at_ns: u64,
+    active_time_ns: u64,
+    suspended_time_ns: u64,
 }
 
 /// Snapshot of a device's runtime-PM fields, for diagnostics and tests.
@@ -220,6 +223,11 @@ pub struct RpmState {
     /// Completed runtime suspends and resumes (callback succeeded).
     pub suspends: u64,
     pub resumes: u64,
+    /// Enabled runtime-PM time, including transition time, in nanoseconds.
+    /// Mirrors Linux update_pm_runtime_accounting; counters saturate on overflow.
+    pub active_time_ns: u64,
+    /// Enabled time whose actual runtime status is Suspended.
+    pub suspended_time_ns: u64,
 }
 
 /// Linux `struct device`'s runtime-PM half.
@@ -285,6 +293,9 @@ impl RuntimePmDevice {
                 waiters: Vec::new(),
                 suspends: 0,
                 resumes: 0,
+                accounting_at_ns: 0,
+                active_time_ns: 0,
+                suspended_time_ns: 0,
             }),
         })
     }
@@ -297,7 +308,9 @@ impl RuntimePmDevice {
     }
 
     pub fn state(&self) -> RpmState {
-        let i = self.inner.lock();
+        let now = self.env.now_ns();
+        let mut i = self.inner.lock();
+        Self::account(&mut i, now);
         RpmState {
             status: i.status,
             usage_count: i.usage_count,
@@ -312,7 +325,33 @@ impl RuntimePmDevice {
             timer_expires_ns: i.timer_expires,
             suspends: i.suspends,
             resumes: i.resumes,
+            active_time_ns: i.active_time_ns,
+            suspended_time_ns: i.suspended_time_ns,
         }
+    }
+    /// MIT Linux b90c984d drivers/base/power/runtime.c:
+    /// update_pm_runtime_accounting / __update_runtime_status. Disabled time
+    /// is excluded; transitions and errors retain the actual status's class.
+    fn account(i: &mut Inner, now: u64) {
+        if i.disable_depth != 0 {
+            return;
+        }
+        let Some(delta) = now.checked_sub(i.accounting_at_ns) else {
+            // The timestamp was sampled before taking this lock. Another
+            // CPU may already have accounted a newer sample; never rewind
+            // its baseline and count that interval a second time.
+            return;
+        };
+        i.accounting_at_ns = now;
+        if i.status == RpmStatus::Suspended {
+            i.suspended_time_ns = i.suspended_time_ns.saturating_add(delta);
+        } else {
+            i.active_time_ns = i.active_time_ns.saturating_add(delta);
+        }
+    }
+    fn change_status(i: &mut Inner, status: RpmStatus, now: u64) {
+        Self::account(i, now);
+        i.status = status;
     }
     pub fn status(&self) -> RpmStatus {
         self.inner.lock().status
@@ -341,6 +380,7 @@ impl RuntimePmDevice {
         self.set_status(RpmStatus::Suspended)
     }
     fn set_status(&self, status: RpmStatus) -> Result<(), RpmError> {
+        let now = self.env.now_ns();
         let mut i = self.inner.lock();
         if i.disable_depth == 0 {
             return Err(RpmError::Again);
@@ -365,7 +405,7 @@ impl RuntimePmDevice {
             }
             i.counted_in_parent = false;
         }
-        i.status = status;
+        Self::change_status(&mut i, status, now);
         i.runtime_error = None;
         let wake = core::mem::take(&mut i.waiters);
         drop(i);
@@ -374,7 +414,11 @@ impl RuntimePmDevice {
     }
     /// `pm_runtime_enable`.
     pub fn enable(&self) {
+        let now = self.env.now_ns();
         let mut i = self.inner.lock();
+        if i.disable_depth == 1 {
+            i.accounting_at_ns = now;
+        }
         i.disable_depth = i.disable_depth.saturating_sub(1);
     }
     /// `pm_runtime_disable` (`__pm_runtime_disable(dev, true)`): waits for a
@@ -390,10 +434,18 @@ impl RuntimePmDevice {
                 let _ = self.rpm_resume(RpmFlags::NONE).await;
             }
             self.wait_transition().await;
+            let now = self.env.now_ns();
             let mut i = self.inner.lock();
-            if matches!(i.status, RpmStatus::Resuming | RpmStatus::Suspending) {
+            // Cancelled is installed only by the dropped transition guard:
+            // its callback future can never be polled again. Disabling does
+            // not certify hardware state; the PCI/driver owner must still
+            // prove reset/power state before set_active/set_suspended.
+            if matches!(i.status, RpmStatus::Resuming | RpmStatus::Suspending)
+                && i.runtime_error != Some(RpmError::Cancelled)
+            {
                 continue;
             }
+            Self::account(&mut i, now);
             i.disable_depth += 1;
             i.request_pending = false;
             i.request = Request::None;
@@ -924,7 +976,7 @@ impl RuntimePmDevice {
                                         Next::Wait
                                     }
                                 } else {
-                                    i.status = RpmStatus::Suspending;
+                                    Self::change_status(&mut i, RpmStatus::Suspending, now);
                                     Next::Callback(if i.no_callbacks {
                                         None
                                     } else {
@@ -953,9 +1005,10 @@ impl RuntimePmDevice {
                 match result {
                     Ok(()) => return self.suspended_ok().await,
                     Err(error) => {
+                        let now = self.env.now_ns();
                         let retry = {
                             let mut i = self.inner.lock();
-                            i.status = RpmStatus::Active;
+                            Self::change_status(&mut i, RpmStatus::Active, now);
                             i.deferred_resume = false;
                             if !error.is_transient() {
                                 i.runtime_error = Some(error);
@@ -982,9 +1035,10 @@ impl RuntimePmDevice {
     }
     /// The `no_callback:` tail of `rpm_suspend`.
     async fn suspended_ok(self: &Arc<Self>) -> Result<RpmOk, RpmError> {
+        let now = self.env.now_ns();
         let (deferred, parent) = {
             let mut i = self.inner.lock();
-            i.status = RpmStatus::Suspended;
+            Self::change_status(&mut i, RpmStatus::Suspended, now);
             i.suspends += 1;
             i.timer_expires = 0;
             let mut parent = None;
@@ -1030,6 +1084,7 @@ impl RuntimePmDevice {
                     ResumeParent(Arc<RuntimePmDevice>),
                     Callback(Option<Arc<dyn RuntimePmOps>>),
                 }
+                let now = self.env.now_ns();
                 let next = {
                     let mut i = self.inner.lock();
                     if i.runtime_error.is_some() {
@@ -1059,7 +1114,7 @@ impl RuntimePmDevice {
                             RpmStatus::Suspended => match (&self.parent, &parent_ref) {
                                 (Some(p), None) => Next::ResumeParent(p.clone()),
                                 _ => {
-                                    i.status = RpmStatus::Resuming;
+                                    Self::change_status(&mut i, RpmStatus::Resuming, now);
                                     Next::Callback(if i.no_callbacks {
                                         None
                                     } else {
@@ -1104,7 +1159,7 @@ impl RuntimePmDevice {
                     let mut i = self.inner.lock();
                     match result {
                         Ok(()) => {
-                            i.status = RpmStatus::Active;
+                            Self::change_status(&mut i, RpmStatus::Active, now);
                             i.resumes += 1;
                             i.last_busy_ns = now;
                             if let Some(p) = &parent_ref {
@@ -1113,7 +1168,7 @@ impl RuntimePmDevice {
                             }
                         }
                         Err(error) => {
-                            i.status = RpmStatus::Suspended;
+                            Self::change_status(&mut i, RpmStatus::Suspended, now);
                             if !error.is_transient() {
                                 i.runtime_error = Some(error);
                             }

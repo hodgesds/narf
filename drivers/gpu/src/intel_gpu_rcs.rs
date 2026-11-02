@@ -663,7 +663,8 @@ pub enum SubmitError {
     /// `wait_seqno` budget expired before the breadcrumb landed.
     Timeout,
     /// Production glue only: no Intel controller has been
-    /// probed, or it is not a Gen12 part.
+    /// probed, it is not a Gen12 part, or its PCI function/BAR
+    /// belongs to another GT submission owner.
     NoEngine,
     /// A PPGTT root physical address failed validation
     /// (unaligned, or outside the supported 46-bit address field) at
@@ -858,7 +859,12 @@ impl GgttArena {
         match self.policy {
             None => encode_scanout_pte(phys, PatSlot::Slot0),
             Some(policy) => {
-                let format = if policy.platform() == crate::intel_gpu_gt::GtPlatform::Alchemist {
+                if phys >> policy.platform().physical_bits() != 0 {
+                    return Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange);
+                }
+                let format = if policy.platform().is_gen12()
+                    || policy.platform() == crate::intel_gpu_gt::GtPlatform::Alchemist
+                {
                     crate::intel_gpu_gtt::PteFormat::Gen12
                 } else {
                     crate::intel_gpu_gtt::PteFormat::XeLpg
@@ -2183,6 +2189,13 @@ impl BarWindow {
     pub fn new(bar: narf_bus::bar::MmioRegion) -> Self {
         Self { bar }
     }
+
+    pub(crate) fn matches_legacy(
+        &self,
+        lease: &crate::intel_gpu_gt::ownership::LegacyLease,
+    ) -> bool {
+        lease.matches(self.bar)
+    }
 }
 
 impl core::fmt::Debug for BarWindow {
@@ -2273,12 +2286,26 @@ pub fn production_idle() -> bool {
     }
 }
 
-fn attach_default() -> Result<(), SubmitError> {
-    let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
+pub(crate) fn legacy_submission_lease(
+) -> Result<crate::intel_gpu_gt::ownership::LegacyLease, SubmitError> {
+    crate::intel_gpu::with_controller(|gpu| {
         if !matches!(
             gpu.chip_info().generation,
             crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
         ) {
+            return Err(SubmitError::NoEngine);
+        }
+        // Capture identity and reserve while the same controller guard is
+        // held. A GuC claim can never overtake legacy allocation or MMIO.
+        crate::intel_gpu_gt::ownership::claim_legacy(gpu.function_addr(), gpu.gtt_mmadr)
+            .map_err(|_| SubmitError::NoEngine)
+    })
+    .ok_or(SubmitError::NoEngine)?
+}
+
+fn attach_default(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(), SubmitError> {
+    let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
+        if !lease.matches_function(gpu.function_addr(), gpu.gtt_mmadr) {
             return None;
         }
         let arena = production_arena(gpu.gtt_mmadr);
@@ -2300,19 +2327,24 @@ fn attach_default() -> Result<(), SubmitError> {
 /// probed Gen12 controller, attaching the RCS0 engine on first
 /// use. Returns the engine-wide request id; completion is
 /// observed through [`poll_default_completions`].
+/// A pending, failed or stopped GuC owner still excludes this legacy path.
 pub fn submit_dwords(dwords: &[u32]) -> Result<u64, SubmitError> {
     // PM gate first: a gated submission must not attach the
     // engine or touch hardware on its way to refusal.
     if submissions_gated() {
         return Err(SubmitError::Suspended);
     }
+    let lease = legacy_submission_lease()?;
     let mut guard = RCS_STATE.lock();
     if guard.is_none() {
         drop(guard);
-        attach_default()?;
+        attach_default(&lease)?;
         guard = RCS_STATE.lock();
     }
     let (engine, default_ctx, fw, fw_window) = guard.as_mut().expect("attached above");
+    if !lease.matches(fw_window.bar) {
+        return Err(SubmitError::NoEngine);
+    }
     // The submission conversation programs RCS0 registers
     // (ELSP, ring registers) — render-domain registers gated
     // on forcewake. Take the hold for exactly the

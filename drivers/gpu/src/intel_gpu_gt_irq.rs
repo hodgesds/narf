@@ -73,6 +73,7 @@ struct State<M> {
     /// CCS0 is a published engine and owns its sources.
     compute: u8,
     copy8: bool,
+    tiled: bool,
     active: bool,
     pending: bool,
     bits: u32,
@@ -119,16 +120,28 @@ impl<M: MmioWindow> Controller<M> {
         Self::with_engines(mmio, engines)
     }
 
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn with_engines(mmio: M, engines: EngineSet) -> Result<Self, IrqError> {
+        Self::with_hierarchy(mmio, engines, true)
+    }
+
+    fn with_hierarchy(mmio: M, engines: EngineSet, tiled: bool) -> Result<Self, IrqError> {
         let compute = engines
             .compute()
             .fold(0u8, |mask, engine| mask | 1 << engine.physical_instance());
         let copy8 = engines.contains(Engine::Bcs8);
         // No other owner may have delivery enabled. Never commandeer firmware
         // MSI or enable a master with an unhandled display/media indication.
-        let tile = read(&mmio, TILE)?;
+        if !tiled && (compute != 0 || copy8) {
+            return Err(IrqError::Identity);
+        }
+        let tile = if tiled { read(&mmio, TILE)? } else { 0 };
         let master = read(&mmio, MASTER)?;
-        if tile & ENABLE != 0 || tile & !(ENABLE | 1) != 0 || master & !(ENABLE | 1) != 0 {
+        if tile & ENABLE != 0
+            || tile & !(ENABLE | 1) != 0
+            || master & !(ENABLE | 1) != 0
+            || (!tiled && master & ENABLE != 0)
+        {
             return Err(IrqError::Conflict);
         }
         let saved = Saved {
@@ -171,6 +184,7 @@ impl<M: MmioWindow> Controller<M> {
             saved,
             compute,
             copy8,
+            tiled,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
             bits: 0,
@@ -226,8 +240,9 @@ impl<M: MmioWindow> Controller<M> {
         if !s.active {
             return narf_interrupts::dispatch::IrqStatus::None;
         }
-        s.mmio.write32(TILE, 0);
-        let _ = s.mmio.read32(TILE); // posted mask before EOI
+        let outer = if s.tiled { TILE } else { MASTER };
+        s.mmio.write32(outer, 0);
+        let _ = s.mmio.read32(outer); // posted mask before EOI
         s.pending = true;
         narf_interrupts::dispatch::IrqStatus::Handled
     }
@@ -243,8 +258,9 @@ impl<M: MmioWindow> Controller<M> {
         if !s.pending {
             // The watchdog also drains a lost MSI edge. Mask before inspecting
             // the hierarchy, exactly as the hard handler would have done.
-            s.mmio.write32(TILE, 0);
-            let _ = read(&s.mmio, TILE)?;
+            let outer = if s.tiled { TILE } else { MASTER };
+            s.mmio.write32(outer, 0);
+            let _ = read(&s.mmio, outer)?;
             s.pending = true;
         }
         if s.selected != 0 {
@@ -277,7 +293,7 @@ impl<M: MmioWindow> Controller<M> {
             s.selected = 0;
         }
         if s.bits == 0 {
-            let tile = read(&s.mmio, TILE)?;
+            let tile = if s.tiled { read(&s.mmio, TILE)? } else { 0 };
             let master = read(&s.mmio, MASTER)?;
             if tile & !(ENABLE | 1) != 0 || master & !(ENABLE | 1) != 0 {
                 return Err(IrqError::Conflict);
@@ -292,7 +308,9 @@ impl<M: MmioWindow> Controller<M> {
                     return Err(IrqError::Conflict);
                 }
                 // GFX master is RW1C status plus its persistent enable bit.
-                s.mmio.write32(MASTER, ENABLE | 1);
+                // Xe-LP has no outer tile mask: keep its graphics master
+                // disabled until every identity has retired.
+                s.mmio.write32(MASTER, if s.tiled { ENABLE | 1 } else { 1 });
                 s.bits = bits;
             }
         }
@@ -305,8 +323,10 @@ impl<M: MmioWindow> Controller<M> {
         // Lower status is quiet; enabling the master generates a fresh edge
         // for any cause arriving between the final read and this write.
         s.mmio.write32(MASTER, ENABLE);
-        s.mmio.write32(TILE, ENABLE);
-        if read(&s.mmio, TILE)? & ENABLE == 0 || read(&s.mmio, MASTER)? & ENABLE == 0 {
+        if s.tiled {
+            s.mmio.write32(TILE, ENABLE);
+        }
+        if (s.tiled && read(&s.mmio, TILE)? & ENABLE == 0) || read(&s.mmio, MASTER)? & ENABLE == 0 {
             return Err(IrqError::Route);
         }
         s.pending = false;
@@ -318,8 +338,9 @@ impl<M: MmioWindow> Controller<M> {
         if !s.active {
             return true;
         }
-        s.mmio.write32(TILE, 0);
-        let quiet = read(&s.mmio, TILE).is_ok_and(|value| value & ENABLE == 0);
+        let outer = if s.tiled { TILE } else { MASTER };
+        s.mmio.write32(outer, 0);
+        let quiet = read(&s.mmio, outer).is_ok_and(|value| value & ENABLE == 0);
         s.active = false;
         // Restore only our source bits. The media GuC shares ENABLE but owns
         // its separate mask half; all unrelated masks/status stay untouched.
@@ -387,8 +408,18 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
         Self::install_with(mmio, route, EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]))
     }
 
-    fn install_with(mmio: M, mut route: R, engines: EngineSet) -> Result<Self, IrqError> {
-        let controller = Arc::new(Controller::with_engines(mmio, engines)?);
+    #[cfg(feature = "kernel-test")]
+    fn install_with(mmio: M, route: R, engines: EngineSet) -> Result<Self, IrqError> {
+        Self::install_hierarchy(mmio, route, engines, true)
+    }
+
+    fn install_hierarchy(
+        mmio: M,
+        mut route: R,
+        engines: EngineSet,
+        tiled: bool,
+    ) -> Result<Self, IrqError> {
+        let controller = Arc::new(Controller::with_hierarchy(mmio, engines, tiled)?);
         let vector = narf_interrupts::vector::alloc().map_err(|_| IrqError::Route)?;
         if let Err(error) = route.program(vector) {
             if route.disable() {
@@ -622,7 +653,16 @@ impl GtIrq {
         if !cfg!(target_arch = "x86_64") {
             return Err(IrqError::Route);
         }
-        Self::install_with(mmio, PciMsi::new(cap, device)?, engines)
+        let platform =
+            crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+                .filter(|platform| platform.guc().is_some())
+                .ok_or(IrqError::Identity)?;
+        Self::install_hierarchy(
+            mmio,
+            PciMsi::new(cap, device)?,
+            engines,
+            !platform.is_gen12(),
+        )
     }
 }
 

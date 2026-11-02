@@ -34,12 +34,20 @@ fn x_tiled_profile(
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
 ) -> Result<(), FsError> {
+    tiled_profile(io, geometry, timing, crate::intel_gpu_scanout::Layout::X)
+}
+fn tiled_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+    layout: crate::intel_gpu_scanout::Layout,
+) -> Result<(), FsError> {
     if !io.console_access_ok() {
         return Err(FsError::NoDevice);
     }
     crate::intel_gpu_scanout::View {
         origin: Default::default(),
-        layout: crate::intel_gpu_scanout::Layout::X,
+        layout,
     }
     .footprint(geometry)
     .map_err(scanout_error)?;
@@ -56,12 +64,32 @@ fn x_tiled_profile(
     }
     Ok(())
 }
+pub(crate) fn tile4_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+) -> Result<(), FsError> {
+    tiled_profile(
+        io,
+        geometry,
+        timing,
+        crate::intel_gpu_scanout::Layout::Tile4,
+    )?;
+    crate::intel_gpu_display_resources::Primary::capture(io, timing)?;
+    Ok(())
+}
 
 /// The production implementation retains PCI authority and a permanent UC
 /// BAR. Tests implement the same platform boundary with native register models.
 pub(crate) trait Platform:
     DisplayAccess + Clone + core::fmt::Debug + Send + Sync + 'static
 {
+    fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        None
+    }
+    fn internal_primary_claimed(&self) -> bool {
+        true
+    }
     fn takeover(&self, owned_cursor: bool) -> Result<(), FsError>;
     fn color_takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
         self.takeover(owned_cursor)
@@ -125,29 +153,45 @@ unsafe impl DisplayAccess for Physical {
     }
 }
 impl Platform for Physical {
+    fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        match crate::intel_gpu_gt::GtPlatform::from_pci(
+            self.device.id.vendor,
+            self.device.id.device,
+        ) {
+            Some(crate::intel_gpu_gt::GtPlatform::Gen12(family)) => Some(family),
+            _ => None,
+        }
+    }
+    fn internal_primary_claimed(&self) -> bool {
+        crate::intel_gpu_multipipe::pipe_owner(Pipe::A)
+            == Some(crate::intel_gpu_multipipe::PipeOwner {
+                ddi: crate::intel_gpu_ddi::Ddi::A,
+                used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+            })
+    }
     fn console_published(&self, geometry: Geometry) {
         if let Some(card) = crate::drm_registry::mode_state(self.index) {
             let mut card = card.lock();
-            card.intel_x_tiled = self.generation == Generation::MeteorLake
-                && card.crtcs.first().and_then(|c| c.mode).is_some_and(|mode| {
+            card.intel_x_tiled = false;
+            card.intel_tile4 = false;
+            if self.generation == Generation::MeteorLake {
+                if let Some(mode) = card.crtcs.first().and_then(|c| c.mode) {
                     if (mode.width, mode.height) != (geometry.width, geometry.height) {
-                        return false;
+                        return;
                     }
                     let wire = card.mode_wire(&mode);
-                    x_tiled_profile(
-                        self,
-                        geometry,
-                        crate::intel_gpu_dsb::Timing {
-                            clock: wire.clock,
-                            width: wire.hdisplay,
-                            height: wire.vdisplay,
-                            htotal: wire.htotal,
-                            vtotal: wire.vtotal,
-                            flags: wire.flags,
-                        },
-                    )
-                    .is_ok()
-                });
+                    let timing = crate::intel_gpu_dsb::Timing {
+                        clock: wire.clock,
+                        width: wire.hdisplay,
+                        height: wire.vdisplay,
+                        htotal: wire.htotal,
+                        vtotal: wire.vtotal,
+                        flags: wire.flags,
+                    };
+                    card.intel_x_tiled = x_tiled_profile(self, geometry, timing).is_ok();
+                    card.intel_tile4 = tile4_profile(self, geometry, timing).is_ok();
+                }
+            }
         }
     }
     fn takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
@@ -165,6 +209,9 @@ impl Platform for Physical {
         }
         fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
+            return Err(FsError::NoDevice);
+        }
+        if self.gen12_family().is_some() && !self.internal_primary_claimed() {
             return Err(FsError::NoDevice);
         }
         // Keep the same current-capability/reset checks during PSR and AUX
@@ -348,6 +395,8 @@ struct State<M: Platform> {
     dsb_update: Option<crate::intel_gpu_color::Update>,
     joint: Option<Joint>,
     cursor: Option<crate::intel_gpu_cursor::Owner<M>>,
+    primary_resources: Option<crate::intel_gpu_display_resources::Primary>,
+    gen12_primary: Option<gen12_primary::Owner>,
 }
 
 #[derive(Debug)]
@@ -570,6 +619,8 @@ impl<M: Platform> Device<M> {
                 dsb_update: None,
                 joint: None,
                 cursor: None,
+                primary_resources: None,
+                gen12_primary: None,
             }),
         }
     }
@@ -598,6 +649,10 @@ impl<M: Platform> Device<M> {
             state.dsb.as_ref().is_some_and(|dsb| dsb.exposed()),
             state.cursor.as_ref().is_some_and(|cursor| cursor.exposed()),
         )?;
+        if let Some(owner) = &state.gen12_primary {
+            owner.check(&fresh)?;
+            owner.check_console_mapping(&fresh, &state.console)?;
+        }
         if let Some(dsb) = state.dsb.as_mut() {
             dsb.recover_view(fresh.clone(), self.platform.now());
             while dsb.armed() && !dsb.poll(self.platform.now())? {
@@ -612,13 +667,24 @@ impl<M: Platform> Device<M> {
             dsb.recover_view(self.platform.clone(), self.platform.now());
         }
         state.dsb_update = None;
+        // DSB0/1 are independently retired before changing any shadow WM.
+        // A partial prior update cannot be adopted as a new resource baseline.
+        let restored_resources = if let Some(resources) = state.primary_resources.as_mut() {
+            Some(resources.restore(&fresh)?)
+        } else {
+            None
+        };
         if state.cursor.as_ref().is_some_and(|cursor| cursor.active()) {
             let cursor = state.cursor.as_mut().expect("cursor");
             cursor.replace_io(fresh.clone());
             cursor.begin_recovery_stop();
             let timing = cursor.timing;
-            let profile =
-                crate::intel_gpu_display_resources::Profile::capture_timing(&fresh, timing)?;
+            let profile = match restored_resources {
+                Some(profile) => profile,
+                None => {
+                    crate::intel_gpu_display_resources::Profile::capture_timing(&fresh, timing)?
+                }
+            };
             let regs = cursor.stage(profile, None, true, None)?;
             {
                 let dsb = state.dsb.as_mut().ok_or(FsError::NoDevice)?;
@@ -699,6 +765,9 @@ impl<M: Platform> Device<M> {
                 None => self.platform.tick().await,
             }
         }
+        if let Some(resources) = state.primary_resources.as_mut() {
+            resources.complete(&fresh)?;
+        }
         if let Some(color) = state.color.as_mut() {
             color.recover_original(&fresh, self.platform.now())?;
             loop {
@@ -721,6 +790,8 @@ impl<M: Platform> Device<M> {
             console.shutdown_restored_console().map_err(scanout_error)?;
         }
         state.presenter = None;
+        state.primary_resources = None;
+        state.gen12_primary = None;
         state.current = None;
         state.pending = None;
         state.joint = None;
@@ -798,6 +869,12 @@ impl<M: Platform> Guard<'_, M> {
         {
             return Err(FsError::NoDevice);
         }
+        if let Some(resources) = &self.state.primary_resources {
+            resources.check_current(&self.device.platform)?;
+        }
+        if let Some(owner) = &self.state.gen12_primary {
+            owner.check(&self.device.platform)?;
+        }
         Ok(())
     }
     pub(crate) fn console_geometry(&self) -> Geometry {
@@ -839,7 +916,8 @@ impl<M: Platform> Guard<'_, M> {
             return Err(FsError::Busy);
         }
         loop {
-            let Some(presenter) = self.state.presenter.as_mut() else {
+            let state = &mut *self.state;
+            let Some(presenter) = state.presenter.as_mut() else {
                 return Ok(None);
             };
             if !presenter.pending() {
@@ -848,21 +926,34 @@ impl<M: Platform> Guard<'_, M> {
             match presenter.poll(self.device.platform.now()) {
                 Ok(Some(completion)) => {
                     if self.device.platform.reset_lost() {
-                        self.state.failed = true;
+                        state.failed = true;
                         return Err(FsError::NoDevice);
+                    }
+                    if let Some(resources) = state.primary_resources.as_mut() {
+                        let result = if resources.pending() {
+                            resources.complete(&self.device.platform)
+                        } else {
+                            resources.check_current(&self.device.platform)
+                        };
+                        result.inspect_err(|_| state.failed = true)?;
+                    }
+                    if let Some(owner) = &state.gen12_primary {
+                        owner
+                            .check(&self.device.platform)
+                            .inspect_err(|_| state.failed = true)?;
                     }
                     if let Some(retired) = completion.retired {
                         if let Err(error) = presenter.release(retired) {
-                            self.state.failed = true;
+                            state.failed = true;
                             return Err(scanout_error(error));
                         }
                     }
-                    self.state.current = self.state.pending.take();
+                    state.current = state.pending.take();
                     return Ok(Some(completion.stamp));
                 }
                 Ok(None) => self.device.platform.tick().await,
                 Err(error) => {
-                    self.state.failed = true;
+                    state.failed = true;
                     return Err(scanout_error(error));
                 }
             }
@@ -894,6 +985,30 @@ impl<M: Platform> Guard<'_, M> {
                 self.state.paused = false;
             }
             return Err(error);
+        }
+        if matches!(
+            self.device.generation,
+            Generation::TigerLake | Generation::AlderLake
+        ) {
+            let family = self
+                .device
+                .platform
+                .gen12_family()
+                .ok_or(FsError::Unsupported)?;
+            if (self.device.generation == Generation::TigerLake)
+                != (family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
+            {
+                self.state.failed = true;
+                return Err(FsError::NoDevice);
+            }
+            let owner = gen12_primary::Owner::capture(
+                &self.device.platform,
+                &self.state.console,
+                family,
+                self.device.bar_len,
+            )
+            .inspect_err(|_| self.state.failed = true)?;
+            self.state.gen12_primary = Some(owner);
         }
         let platform = &self.device.platform;
         // The startup proof retired inherited engines, all other universal
@@ -1100,15 +1215,33 @@ impl<M: Platform> Guard<'_, M> {
             return Err(crate::intel_gpu_user::io_error());
         }
         self.finish_pending().await?;
-        if let Some(presenter) = self.state.presenter.as_ref() {
-            if !presenter.console_active() {
+        if self.state.presenter.is_some() {
+            if !self
+                .state
+                .presenter
+                .as_ref()
+                .expect("presenter")
+                .console_active()
+            {
+                if let Some(owner) = &self.state.gen12_primary {
+                    let checked = owner.check(&self.device.platform).and_then(|()| {
+                        owner.check_console_mapping(&self.device.platform, &self.state.console)
+                    });
+                    checked.inspect_err(|_| self.state.failed = true)?;
+                }
+                if let Some(resources) = self.state.primary_resources.as_mut() {
+                    resources
+                        .restore(&self.device.platform)
+                        .inspect_err(|_| self.state.failed = true)?;
+                }
                 let ticket = self.ticket()?;
                 self.state
                     .presenter
                     .as_mut()
                     .expect("presenter")
                     .arm_console(ticket, self.device.platform.now())
-                    .map_err(scanout_error)?;
+                    .map_err(scanout_error)
+                    .inspect_err(|_| self.state.failed = true)?;
                 self.state.pending = None;
                 self.finish_pending().await?;
             }
@@ -1119,6 +1252,8 @@ impl<M: Platform> Guard<'_, M> {
                 .shutdown_restored_console()
                 .map_err(scanout_error)?;
             self.state.presenter = None;
+            self.state.primary_resources = None;
+            self.state.gen12_primary = None;
             self.state.current = None;
             self.state.recovery_status = None;
         }
@@ -1355,6 +1490,13 @@ impl<M: Platform> Guard<'_, M> {
                     .inspect_err(|_| {
                         self.state.failed = true;
                     })?;
+                if let Some(resources) = self.state.primary_resources.as_mut() {
+                    if resources.pending() {
+                        resources
+                            .complete(&self.device.platform)
+                            .inspect_err(|_| self.state.failed = true)?;
+                    }
+                }
                 let state = &mut *self.state;
                 let update = state.dsb_update.as_ref().expect("DSB color image");
                 state
@@ -1457,10 +1599,17 @@ impl<M: Platform> Guard<'_, M> {
         if extent > object.size() {
             return Err(FsError::InvalidData);
         }
-        if view.layout == crate::intel_gpu_scanout::Layout::X {
-            // Linux's display>=10 X watermark equations equal linear. Reuse
-            // only the actual owned no-SAGV/DBUF/MBUS/DDB/WM reservation.
-            x_tiled_profile(&self.device.platform, geometry, timing)?;
+        if view.layout != crate::intel_gpu_scanout::Layout::Linear {
+            tiled_profile(&self.device.platform, geometry, timing, view.layout)?;
+            if view.layout == crate::intel_gpu_scanout::Layout::Tile4
+                && self.state.primary_resources.is_none()
+            {
+                // Prove target WM/min-DDB fit before any new GEM mapping.
+                crate::intel_gpu_display_resources::Primary::capture(
+                    &self.device.platform,
+                    timing,
+                )?;
+            }
         }
         self.color_transaction(
             coefficients,
@@ -1488,6 +1637,7 @@ impl<M: Platform> Guard<'_, M> {
         self.finish_pending().await?;
         let previously_owned = self.state.color_owned;
         let had_presenter = self.state.presenter.is_some();
+        let had_primary_resources = self.state.primary_resources.is_some();
         let previous_mixed = self.state.mixed_unpublished;
         if self.state.color.is_none() {
             let owner = crate::intel_gpu_color::Owner::capture(
@@ -1551,6 +1701,15 @@ impl<M: Platform> Guard<'_, M> {
                 }) = &primary
                 {
                     self.start().await?;
+                    if view.layout == crate::intel_gpu_scanout::Layout::Tile4
+                        && self.state.primary_resources.is_none()
+                    {
+                        self.state.primary_resources =
+                            Some(crate::intel_gpu_display_resources::Primary::capture(
+                                &self.device.platform,
+                                timing,
+                            )?);
+                    }
                     let id = self.prepare_surface(object.clone(), *geometry, *view)?;
                     let ticket = self.ticket()?;
                     self.state.pending = Some((object.clone(), id));
@@ -1559,7 +1718,7 @@ impl<M: Platform> Guard<'_, M> {
                         staged: false,
                         completion: None,
                     });
-                    let arm = self
+                    let mut arm = self
                         .state
                         .presenter
                         .as_mut()
@@ -1567,6 +1726,12 @@ impl<M: Platform> Guard<'_, M> {
                         .stage_dsb(id, ticket, self.device.platform.now())
                         .map_err(scanout_error)?;
                     self.state.joint.as_mut().expect("joint state").staged = true;
+                    if let Some(resources) = self.state.primary_resources.as_mut() {
+                        arm.extend(resources.stage(
+                            &self.device.platform,
+                            view.layout == crate::intel_gpu_scanout::Layout::Tile4,
+                        )?);
+                    }
                     Some(arm)
                 } else {
                     None
@@ -1622,6 +1787,12 @@ impl<M: Platform> Guard<'_, M> {
                 && self.state.dsb.as_ref().is_none_or(|dsb| !dsb.armed());
             if prewrite {
                 self.rollback_joint_before_arm()?;
+                if let Some(resources) = self.state.primary_resources.as_mut() {
+                    resources.rollback();
+                }
+                if !had_primary_resources {
+                    self.state.primary_resources = None;
+                }
                 self.state.mixed_unpublished = previous_mixed;
                 if self.state.dsb.as_ref().is_some_and(|dsb| !dsb.exposed()) {
                     self.state.dsb = None;
@@ -1732,6 +1903,9 @@ impl<M: Platform> Guard<'_, M> {
         }
     }
 }
+
+#[path = "intel_gpu_gen12_display.rs"]
+mod gen12_primary;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_kms_tests.rs"]

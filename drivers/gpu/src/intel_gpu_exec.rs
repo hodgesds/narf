@@ -25,6 +25,9 @@ const PAGE: u64 = 4096;
 pub(crate) mod vram_clear;
 pub(crate) use vram_clear::prepare_vram_clear;
 
+#[path = "intel_gpu_copy.rs"]
+pub mod copy;
+
 #[derive(Debug)]
 pub struct ExecObject {
     pub object: Arc<GemObject>,
@@ -64,7 +67,7 @@ impl ExecRequest {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
@@ -109,8 +112,12 @@ impl ExecRequest {
         {
             return Err(FsError::InvalidData);
         }
+        let space = self.address_space_inner(format, pat_index, table_pat)?;
+        if platform.is_some_and(|p| !space.within_dma_bits(p)) {
+            return Err(FsError::InvalidData);
+        }
         Ok(ResidentBatch {
-            space: self.address_space_inner(format, pat_index, table_pat)?,
+            space,
             format,
             platform,
             address: self.batch_va,
@@ -357,7 +364,7 @@ impl ResidentBatch {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
@@ -379,6 +386,9 @@ impl ResidentBatch {
                     .checked_add(m.length)
                     .is_none_or(|end| end > object.size())
                 {
+                    return Err(FsError::InvalidData);
+                }
+                if platform.is_gen12() && object.is_vram() {
                     return Err(FsError::InvalidData);
                 }
                 if object.is_vram()
@@ -501,6 +511,9 @@ impl ResidentBatch {
                         .map_err(map_error)?;
                 }
             }
+        }
+        if !space.within_dma_bits(platform) {
+            return Err(FsError::InvalidData);
         }
         Ok(Self {
             space,
@@ -742,6 +755,18 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    // The common PTE format admits more bits than the Gen12 PCI DMA mask.
+    // Validate the entire owned graph before publishing its root to GuC.
+    fn within_dma_bits(&self, platform: GtPlatform) -> bool {
+        let bits = platform.physical_bits();
+        self.memory
+            .diagnostic_tables()
+            .all(|phys| phys >> bits == 0)
+            && self.objects.iter().all(|(object, _)| {
+                (!platform.is_gen12() || !object.is_vram())
+                    && object.pages().all(|phys| phys >> bits == 0)
+            })
+    }
     pub fn root_phys(&self) -> u64 {
         self.tables.as_ref().expect("owned tables").root_phys()
     }

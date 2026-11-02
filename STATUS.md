@@ -1653,6 +1653,26 @@ diff and source-integrity checks pass. aarch64 QEMU is omitted under the
 maintainer's iteration policy. The ledger records 40 implemented rows and ten
 broad open workstreams; Intel silicon and Mesa acceptance remain unrun.
 
+The next Intel checkpoint adds source-qualified Gen12 GuC execution and fixed
+internal linear primary flips, MTL/Arrow Tile4 and integer X-tiled panning,
+retained DG2/BMG GPU range copies and PCI runtime-power policy/accounting.
+Full isolated-reset register saves preserve the applied engine policy and
+nonprivileged grants; persistent PCI/BAR claims exclude legacy/GuC overlap.
+Gen12 uses its actual firmware families, optional HWCONFIG, 39-bit DMA,
+non-tile MSI and owned pre-reset engine/media sequence. Display and copy
+cancellation retain potentially live DMA through native retirement or reset;
+copy support does not yet implement migration or CPU alias revocation.
+
+All 49 new fixtures pass. Selected Intel/DRM/framebuffer/backlight and
+runtime-power groups pass 1048 unique x86_64 tests, including all 31 shared
+backlight regressions, with zero failures or skips. Production boot and both
+btrfs postflights pass. GPU/fb/power target CI Clippy passes all three contexts
+on both architectures, and all four host GPU configurations pass all-target
+Clippy. Debug/release builds pass on both targets; formatting, diff and final
+source-integrity checks pass. aarch64 QEMU is omitted under the maintainer's
+iteration policy. The ledger records 45 implemented rows and ten broad open
+workstreams; Intel silicon and Mesa acceptance remain unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

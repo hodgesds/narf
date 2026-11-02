@@ -525,3 +525,31 @@ fn runtime_pm_pci_failures() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/runtime", runtime_pm_pci_failures);
+
+fn runtime_pm_accounting_stale_sample_cannot_recount_an_interval() -> TestResult {
+    struct Clock(core::sync::atomic::AtomicU64);
+    impl RpmEnv for Clock {
+        fn now_ns(&self) -> u64 {
+            self.0.load(Ordering::Acquire)
+        }
+        fn queue_work(&self, _: Arc<RuntimePmDevice>) {}
+        fn arm_timer(&self, _: Arc<RuntimePmDevice>, _: u64) {}
+    }
+    let clock = Arc::new(Clock(core::sync::atomic::AtomicU64::new(0)));
+    let device = RuntimePmDevice::new("accounting-order", None, None, clock.clone());
+    device.set_active().unwrap();
+    device.enable();
+    clock.0.store(101, Ordering::Release);
+    assert_eq!(device.state().active_time_ns, 101);
+    // Model a CPU that sampled before the newer CPU took the state lock.
+    clock.0.store(100, Ordering::Release);
+    assert_eq!(device.state().active_time_ns, 101);
+    clock.0.store(102, Ordering::Release);
+    let state = device.state();
+    assert_eq!((state.active_time_ns, state.suspended_time_ns), (102, 0));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/runtime",
+    runtime_pm_accounting_stale_sample_cannot_recount_an_interval
+);

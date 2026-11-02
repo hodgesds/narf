@@ -65,10 +65,15 @@ struct Hardware {
     poison_dsb_read: bool,
 }
 #[derive(Clone, Debug)]
-pub(crate) struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>, bool);
+pub(crate) struct MockPlatform(
+    Arc<IrqSafeSpinLock<Hardware>>,
+    Arc<AtomicBool>,
+    bool,
+    Option<crate::intel_gpu_gt::Gen12Platform>,
+);
 impl MockPlatform {
     pub(crate) fn new() -> Self {
-        Self(
+        let platform = Self(
             Arc::new(IrqSafeSpinLock::new(Hardware {
                 ggtt_key: NEXT_GGTT_KEY.fetch_add(1, Ordering::Relaxed),
                 regs: [
@@ -120,10 +125,48 @@ impl MockPlatform {
             })),
             Arc::new(AtomicBool::new(false)),
             false,
-        )
+            None,
+        );
+        platform.gen12_defaults();
+        platform
     }
     pub(crate) fn tiger(&self) -> Device<Self> {
-        Device::new(self.clone(), Generation::TigerLake, 0x1000000, console())
+        self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
+    }
+    pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
+        let mut platform = self.clone();
+        platform.3 = Some(family);
+        let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        Device::new(platform, generation, 0x1000000, console())
+    }
+    fn gen12_defaults(&self) {
+        for (r, value) in [
+            (0x70008, 0xc0000000),
+            (0x60400, 0x8a000006),
+            (0x64000, 0x80000006),
+            (0xc7200, 0x80000008),
+            (0xc7204, 1),
+            (0x6001c, 63 << 16 | 31),
+            (0x60000, 223 << 16 | 63),
+            (0x6000c, 76 << 16 | 31),
+            (0x46070, 0xc0000010),
+            (0x46000, 612),
+            (0x45008, 0xc0000000),
+            (0x44fe8, 0xc0000000),
+            (0x70240, 0x80004003),
+            (0x7027c, 2047 << 16),
+        ] {
+            self.set(r, value);
+        }
+        for page in 0..2 {
+            let r = GGTT_ARRAY_BASE + (u64::from(CONSOLE) / 4096 + page) * 8;
+            self.set(r, 0x100001 + page as u32 * 4096);
+            self.set(r + 4, 0);
+        }
     }
     pub(crate) fn meteor(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
@@ -610,6 +653,9 @@ unsafe impl DisplayAccess for MockPlatform {
     }
 }
 impl Platform for MockPlatform {
+    fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        self.3
+    }
     fn takeover(&self, _owned_cursor: bool) -> Result<(), FsError> {
         if self.reset_lost() {
             return Err(FsError::NoDevice);
@@ -646,7 +692,16 @@ impl Platform for MockPlatform {
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(&fresh, Generation::MeteorLake, owned_dsb, owned_cursor)?;
+        fetchers_with_cursor(
+            &fresh,
+            if self.3.is_some() {
+                Generation::TigerLake
+            } else {
+                Generation::MeteorLake
+            },
+            owned_dsb,
+            owned_cursor,
+        )?;
         Ok(fresh)
     }
     fn recovery_complete(&self) {
@@ -683,12 +738,7 @@ fn geometry() -> Geometry {
     }
 }
 fn device(platform: &MockPlatform) -> Device<MockPlatform> {
-    Device::new(
-        platform.clone(),
-        Generation::TigerLake,
-        0x1000000,
-        console(),
-    )
+    platform.tiger()
 }
 fn once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))

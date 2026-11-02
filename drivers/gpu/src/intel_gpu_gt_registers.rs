@@ -319,6 +319,7 @@ mod tests {
                 0xa5a55a5a | if release == 1 { 0x04002000 } else { 0x2000 }
             );
             assert_eq!(r[&0xe7cc], 0xa5a55a5a | 0x9000);
+            assert_eq!(r[&0xe48c], 0xa5a55a5a | 0x200);
             assert_eq!(r[&0x20d4], 0xa5a55a5a | 0xc080);
             assert_eq!(r[&0x3ee0d4], 0xa5a55a5a | 0xc080);
             assert_eq!(r[&0x3ee050], 0xa5a55a5a | 0x1000);
@@ -407,12 +408,21 @@ mod tests {
                 w.unavailable.set(0xe7cc);
             }
             if failure == 2 {
+                // The default sentinel already has DISABLE_TDL_PUSH bit9
+                // set. Require an actual change before rejecting the write.
+                w.regs.borrow_mut().insert(0xe48c, 0);
                 w.reject.set(0xe48c);
             }
             if failure == 3 {
                 w.reject.set(0xfd4);
             }
-            assert!(matches!(init.poll(&w, 11), Poll::Ready(Err(_))));
+            let error = match failure {
+                1 => RegisterError::Unavailable,
+                2 => RegisterError::Verify(0xe48c),
+                3 => RegisterError::Verify(0xfd4),
+                _ => unreachable!(),
+            };
+            assert_eq!(init.poll(&w, 11), Poll::Ready(Err(error)));
             assert_eq!(w.regs.borrow()[&0xfd4], 0x80000101);
             assert_eq!(w.writes.borrow().last(), Some(&(0xfd0, 1)));
             if failure == 1 {
@@ -473,12 +483,12 @@ impl RegisterInit {
         Self::with_ccs_mode(mmio, platform, device, topology, config, now, 1)
     }
 
-    pub(crate) fn with_ccs_mode(
+    pub(crate) fn with_ccs_mode<'a>(
         mmio: &impl MmioWindow,
         platform: GtPlatform,
         device: u16,
         topology: &GtTopology,
-        config: &HardwareConfig,
+        config: impl Into<Option<&'a HardwareConfig>>,
         now: u64,
         mode: u8,
     ) -> Result<Self, RegisterError> {
@@ -523,6 +533,18 @@ impl RegisterInit {
         })
     }
 
+    pub(crate) fn reset_policy(&self) -> Option<crate::intel_gpu_reset_policy::ResetPolicy> {
+        crate::intel_gpu_reset_policy::ResetPolicy::new(
+            self.platform,
+            self.device,
+            self.seed.graphics,
+            self.seed.dss,
+            self.compute,
+            self.engines(),
+            self.discontiguous,
+        )
+    }
+
     pub(crate) fn compute_configuration(&self) -> (u8, u8) {
         (self.compute, self.compute_mode)
     }
@@ -555,7 +577,7 @@ impl RegisterInit {
         if now >= self.deadline {
             return Poll::Ready(Err(RegisterError::Timeout));
         }
-        let modern = self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
         if modern {
             let semaphore = mmio.read32(0xfd0);
             if semaphore == u32::MAX {
@@ -587,7 +609,7 @@ impl RegisterInit {
         selector: u64,
         target: Target,
     ) -> Result<(), RegisterError> {
-        let modern = self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
         let (group, instance) = match target {
             Target::Direct | Target::Implicit => return Ok(()),
             Target::Dss => ((self.seed.dss >> 23) & 127, (self.seed.dss >> 16) & 127),
@@ -729,6 +751,24 @@ impl RegisterInit {
             add(0x14804, 0xfff, mode & 0xfff, true, Direct);
         }
         match self.platform {
+            GtPlatform::Gen12(family) => {
+                add(0x9550, 0x200, 0x200, false, Dss); // 14011059788
+                add(0x9424, 2, 0, false, Direct); // 14015795083
+                add(0xb004, 0x80, 0, false, Direct); // L3 hashing tuning
+                add(0x20a0, 0x80000, 0x80000, false, Direct);
+                add(0xe4f4, 0x4100, 0x4100, true, Dss);
+                add(0xe48c, 0x200, 0x200, true, Dss);
+                add(0x20ec, 2, 2, true, Direct);
+                add(0xe18c, 0x8001, 0x8001, true, Dss);
+                add(0x20e0, 0x4000, 0x4000, true, Direct);
+                if matches!(
+                    family,
+                    crate::intel_gpu_gt::Gen12Platform::TigerLake
+                        | crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                ) {
+                    add(0x2050, 0x1080, 0x1080, true, Direct);
+                }
+            }
             GtPlatform::Alchemist => {
                 add(0x9424, 2, 0, false, Direct); // 14015795083
                 if matches!(
@@ -814,7 +854,7 @@ impl RegisterInit {
                 }
                 add(0xb108, 0x10000000, 0x10000000, false, Instance0);
                 add(0x4148, 15, 0, false, Instance0);
-                add(0xe48c, 0x8000, 0x8000, true, Dss); // 18034896535
+                add(0xe48c, 0x200, 0x200, true, Dss); // 18034896535: DISABLE_TDL_PUSH bit9
                 add(0xe7cc, 0x9000, 0x9000, false, Dss); // 16018712365 + 14018471104
                 add(0xe4f0, 2, 2, true, Dss); // 16018737384
                 add(0xe49c, 0x4000, 0x4000, true, Dss); // 14020338487

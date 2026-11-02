@@ -22,6 +22,59 @@ mod tests {
     use core::cell::Cell;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    fn smoke_gen12_fuse_inversion_real_slice_and_legacy_topology() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        for family in [
+            Gen12Platform::TigerLake,
+            Gen12Platform::AlderLakeP,
+            Gen12Platform::AlderLakeS,
+            Gen12Platform::AlderLakeN,
+        ] {
+            let platform = GtPlatform::Gen12(family);
+            let window = Fuses::new([0x25, u32::MAX, 0xfa]);
+            let topology = GtTopology::read(&window, platform).unwrap();
+            assert_eq!(window.reads.get(), 4);
+            assert_eq!(
+                (
+                    topology.geometry_dss(),
+                    topology.compute_dss(),
+                    topology.eu_mask_per_dss(),
+                    topology.eu_count()
+                ),
+                (0x25, 0, 0x33, 12)
+            );
+            let mut expected = [0u8; 30];
+            expected[..18]
+                .copy_from_slice(&[0, 0, 1, 0, 6, 0, 16, 0, 1, 0, 1, 0, 2, 0, 2, 0, 1, 0x25]);
+            for i in [18, 22, 28] {
+                expected[i] = 0x33;
+            }
+            assert_eq!(topology.i915_bytes(false), expected);
+            assert_eq!(topology.i915_bytes(true), expected);
+            for values in [[0x40, 0, 0], [1, 0, 0x100]] {
+                assert_eq!(
+                    GtTopology::read(&Fuses::new(values), platform),
+                    Err(TopologyError::Unavailable)
+                );
+            }
+            assert_eq!(
+                GtTopology::read(&Fuses::new([1, 0, 0xff]), platform),
+                Err(TopologyError::Empty)
+            );
+            let mut changed = Fuses::new([1, 0, 0]);
+            changed.change = true;
+            assert_eq!(
+                GtTopology::read(&changed, platform),
+                Err(TopologyError::Unstable)
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_topology",
+        smoke_gen12_fuse_inversion_real_slice_and_legacy_topology
+    );
+
     struct Fuses {
         values: [u32; 3],
         reads: Cell<u32>,
@@ -41,7 +94,7 @@ mod tests {
             let count = self.reads.get();
             self.reads.set(count + 1);
             match offset {
-                0x913c if self.change && count >= 3 => self.values[0] ^ 1,
+                0x913c if self.change && count >= 2 => self.values[0] ^ 1,
                 0x913c => self.values[0],
                 0x9144 => self.values[1],
                 0x9134 => self.values[2],
@@ -192,7 +245,11 @@ impl GtTopology {
         let sample = || {
             [
                 mmio.read32(0x913c),
-                mmio.read32(0x9144),
+                if platform.is_gen12() {
+                    0
+                } else {
+                    mmio.read32(0x9144)
+                },
                 mmio.read32(0x9134),
             ]
         };
@@ -200,11 +257,17 @@ impl GtTopology {
         if first != sample() {
             return Err(TopologyError::Unstable);
         }
-        let [geometry, compute, raw_eu] = first;
+        let [geometry, compute, mut raw_eu] = first;
         // A fully populated 32-DSS mask legitimately reads all ones. The EU
         // register's reserved bits distinguish an unavailable BAR instead.
         if raw_eu & !0xff != 0 {
             return Err(TopologyError::Unavailable);
+        }
+        if platform.is_gen12() {
+            if geometry & !0x3f != 0 {
+                return Err(TopologyError::Unavailable);
+            }
+            raw_eu = !raw_eu & 0xff;
         }
         if geometry | compute == 0 || raw_eu == 0 {
             return Err(TopologyError::Empty);
@@ -268,18 +331,35 @@ impl GtTopology {
             16
         };
         let stride = usize::from(width / 8);
-        let mut bytes = alloc::vec![0; 21 + 32 * stride];
-        for (index, value) in [0u16, 1, 32, width, 1, 4, 5, stride as u16]
-            .into_iter()
-            .enumerate()
+        // i915 gen12_sseu_info_init: one real slice, six dual-subslices.
+        // The XeHP single software slice uses the full32-bit DSS register.
+        let (dss_count, subslice_stride) = if self.platform.is_gen12() {
+            (6usize, 1usize)
+        } else {
+            (32, 4)
+        };
+        let eu_start = 17 + subslice_stride;
+        let mut bytes = alloc::vec![0; eu_start + dss_count * stride];
+        for (index, value) in [
+            0u16,
+            1,
+            dss_count as u16,
+            width,
+            1,
+            subslice_stride as u16,
+            (1 + subslice_stride) as u16,
+            stride as u16,
+        ]
+        .into_iter()
+        .enumerate()
         {
             bytes[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
         }
         bytes[16] = u8::from(mask != 0);
-        bytes[17..21].copy_from_slice(&mask.to_le_bytes());
-        for dss in 0..32 {
+        bytes[17..eu_start].copy_from_slice(&mask.to_le_bytes()[..subslice_stride]);
+        for dss in 0..dss_count {
             if mask & (1 << dss) != 0 {
-                let start = 21 + dss * stride;
+                let start = eu_start + dss * stride;
                 bytes[start..start + stride].copy_from_slice(&self.eu_mask.to_le_bytes()[..stride]);
             }
         }

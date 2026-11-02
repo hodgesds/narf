@@ -67,17 +67,22 @@ pub(crate) struct Bind {
 /// PAT indices coherent with CPU caches that this driver programs.
 pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
     match platform {
-        GtPlatform::Alchemist => pat == 0,
+        GtPlatform::Alchemist | GtPlatform::Gen12(_) => pat == 0,
         GtPlatform::Battlemage => matches!(pat, 1 | 2 | 4 | 5 | 7),
         GtPlatform::Integrated(_) => matches!(pat, 3 | 4),
     }
 }
 
-/// Programmed XE_COH_NONE indices: Xe-LPG PAT1 (WT) and PAT2 (UC). Linux
+/// Programmed XE_COH_NONE indices: Gen12 PAT1/2/3 (WC/WT/UC), and
+/// Xe-LPG PAT1 (WT) and PAT2 (UC). Linux
 /// also admits PAT0, whose definition this driver leaves to firmware for the
 /// inherited display, so it stays refused.
 pub(crate) fn pat_noncoherent(platform: GtPlatform, pat: u16) -> bool {
-    matches!(platform, GtPlatform::Integrated(_)) && matches!(pat, 1 | 2)
+    match platform {
+        GtPlatform::Gen12(_) => matches!(pat, 1..=3),
+        GtPlatform::Integrated(_) => matches!(pat, 1 | 2),
+        _ => false,
+    }
 }
 
 impl Bind {

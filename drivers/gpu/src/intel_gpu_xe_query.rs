@@ -172,6 +172,9 @@ fn query_wire(
             reply[44..46].copy_from_slice(&u16::from(facts.graphics_step).to_le_bytes());
             reply
         }
+        // xe_query.c query_hwconfig: source-unsupported families negotiate
+        // a zero-length table, rather than inventing firmware records.
+        4 if !info.platform.has_hwconfig() => Vec::new(),
         4 => info
             .hwconfig
             .as_ref()

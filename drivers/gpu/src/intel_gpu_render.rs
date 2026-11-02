@@ -29,6 +29,7 @@ const MAX_EXTENSIONS: usize = 16;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SubmissionProfile {
     Gen12Execlists,
+    Gen12GuC,
     XeLpgGuC,
     Unsupported,
 }
@@ -36,7 +37,7 @@ pub enum SubmissionProfile {
 impl SubmissionProfile {
     pub const fn for_generation(generation: Generation) -> Self {
         match generation {
-            Generation::TigerLake | Generation::AlderLake => Self::Gen12Execlists,
+            Generation::TigerLake | Generation::AlderLake => Self::Gen12GuC,
             Generation::MeteorLake => Self::XeLpgGuC,
             Generation::PantherLake => Self::Unsupported,
         }
@@ -1302,6 +1303,14 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         // Only ENABLED: i915 priority configuration, busy stats, semaphore and
         // preemption capability bits require their own implemented contracts.
         41 => i32::from(info.submission_ready()),
+        46 | 47 if info.platform.is_gen12() => {
+            let topology = observed_topology(info)?;
+            if param == 46 {
+                1
+            } else {
+                i32::try_from(topology.geometry_dss()).map_err(|_| FsError::NoDevice)?
+            }
+        }
         46 | 47 => {
             // xehp_sseu_info_init's software slice is not a legacy power-gating
             // mask. Linux requires full topology queries from Xe_HP onward.
@@ -2182,9 +2191,7 @@ pub(crate) mod tests {
         check(|| {
             for entry in crate::intel_gpu::DEVICE_TABLE {
                 let expected = match entry.generation {
-                    Generation::TigerLake | Generation::AlderLake => {
-                        SubmissionProfile::Gen12Execlists
-                    }
+                    Generation::TigerLake | Generation::AlderLake => SubmissionProfile::Gen12GuC,
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
                     Generation::PantherLake => SubmissionProfile::Unsupported,
                 };

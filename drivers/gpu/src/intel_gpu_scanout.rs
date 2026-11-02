@@ -1,4 +1,4 @@
-//! Owned linear/no-DPT X-tiled GEM scanout and primary-surface latch tracking.
+//! Owned linear/no-DPT X/Tile4 GEM scanout and primary-surface latch tracking.
 //!
 //! References: MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! xe/display/xe_fb_pin.c, i915/display/{skl_universal_plane_regs.h,
@@ -38,6 +38,7 @@ const CTL_TILED_MASK: u32 = 7 << 10;
 const CTL_RGB_ORDER: u32 = 1 << 20;
 const CTL_XRGB8888: u32 = 8 << 23;
 pub(crate) const X_TILED_MODIFIER: u64 = 0x0100_0000_0000_0001;
+pub(crate) const TILE4_MODIFIER: u64 = 0x0100_0000_0000_0009;
 // ICL+ arbitration slots and the harmless trickle-feed/clear-color disable
 // controls may be inherited. All auxiliary/YUV/keying, compression, async,
 // horizontal-flip and rotation bits must be clear for this linear surface.
@@ -105,7 +106,7 @@ impl Geometry {
 
 /// Integer source origin; destination geometry and bandwidth stay unchanged.
 /// Linux intel_fb.c::intel_compute_aligned_offset splits a linear address
-/// into a 4-KiB-aligned TGL+ SURF and residual PLANE_OFFSET coordinates.
+/// or tile address into a 4-KiB-aligned TGL+ SURF and residual PLANE_OFFSET.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Viewport {
     pub x: u32,
@@ -140,13 +141,14 @@ impl Viewport {
     }
 }
 
-/// Fixed primary layout. X uses the source-qualified MTL no-DPT path;
+/// Fixed primary layout. X/Tile4 use the source-qualified MTL no-DPT path;
 /// neither auxiliary compression nor a display page-table pointer is accepted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Layout {
     #[default]
     Linear,
     X,
+    Tile4,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct View {
@@ -167,30 +169,59 @@ impl View {
             return self.origin.layout(geometry);
         }
         geometry.extent()?;
-        // intel_tile_width_bytes=512; intel_tile_height=4096/512=8.
-        // No remapped stride, rotation, source panning or offset is admitted.
-        if self.origin != Viewport::default()
-            || geometry.pitch % 512 != 0
+        let tile_width = if self.layout == Layout::X { 512 } else { 128 };
+        let tile_height = 4096 / tile_width;
+        let tile_pixels = tile_width / 4;
+        // intel_tile_width_bytes and intel_tile_height for plain X/Tile4.
+        // The no-DPT surface alignment is exactly one tile. Decompose the
+        // source as intel_compute_aligned_offset, without stride remapping.
+        if geometry.pitch % tile_width != 0
             || geometry.pitch > 128 * 1024
             || !(4..=5120).contains(&geometry.width)
             || geometry.height > 4320
         {
             return Err(ScanoutError::Unsupported);
         }
-        let bytes = u64::from(geometry.height.div_ceil(8) * 8) * u64::from(geometry.pitch);
+        if self.origin.x > 0xffff
+            || self.origin.y > 0xffff
+            || self
+                .origin
+                .x
+                .checked_add(geometry.width)
+                .is_none_or(|end| end > geometry.pitch / 4)
+        {
+            // In particular residualX+width cannot exceed the tile stride
+            // (skl_calc_main_surface_offset's X-tile overfetch restriction).
+            return Err(ScanoutError::Bounds);
+        }
+        let rows = (u64::from(self.origin.y) + u64::from(geometry.height))
+            .div_ceil(u64::from(tile_height))
+            * u64::from(tile_height);
+        let bytes = rows * u64::from(geometry.pitch);
         if bytes > GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START {
             return Err(ScanoutError::Bounds);
         }
-        Ok((0, 0, bytes))
+        let tile = u64::from(self.origin.y / tile_height) * u64::from(geometry.pitch / tile_width)
+            + u64::from(self.origin.x / tile_pixels);
+        Ok((
+            (tile * GTT_PAGE_SIZE) as u32,
+            (self.origin.y % tile_height) << 16 | (self.origin.x % tile_pixels),
+            bytes,
+        ))
     }
     fn stride(self, geometry: Geometry) -> u32 {
-        geometry.pitch / if self.layout == Layout::X { 512 } else { 64 }
+        geometry.pitch
+            / match self.layout {
+                Layout::Linear => 64,
+                Layout::X => 512,
+                Layout::Tile4 => 128,
+            }
     }
     fn tiled(self) -> u32 {
-        if self.layout == Layout::X {
-            1 << 10
-        } else {
-            0
+        match self.layout {
+            Layout::Linear => 0,
+            Layout::X => 1 << 10,
+            Layout::Tile4 => 5 << 10,
         }
     }
 }
@@ -419,13 +450,16 @@ impl<M: ScanoutIo> Presenter<M> {
         let ctl = owner.io().read32(owner.plane() + PLANE_CTL_OFFSET);
         if ctl & CTL_TILED_MASK == 1 << 10 {
             owner.expected_view.layout = Layout::X;
+        } else if ctl & CTL_TILED_MASK == 5 << 10 {
+            owner.expected_view.layout = Layout::Tile4;
         }
         let stride = owner.io().read32(owner.plane() + PLANE_STRIDE_OFFSET);
         // An interrupted owned arm may have changed STRIDE but not CTL (or
-        // vice versa). Only the two retained fixed pitches are admissible;
+        // vice versa). Only the retained fixed layout pitches are admissible;
         // neither mixed readback is accepted as completion/retirement.
         if !(stride == geometry.pitch / 64
-            || (geometry.pitch % 512 == 0 && stride == geometry.pitch / 512))
+            || (geometry.pitch % 512 == 0 && stride == geometry.pitch / 512)
+            || (geometry.pitch % 128 == 0 && stride == geometry.pitch / 128))
             || !owner.geometry_matches_stride(geometry, owner.expected_view, stride)
         {
             return Err(ScanoutError::Unsupported);
@@ -479,7 +513,7 @@ impl<M: ScanoutIo> Presenter<M> {
         geometry: Geometry,
         view: View,
     ) -> Result<SurfaceId, ScanoutError> {
-        if view.layout == Layout::X {
+        if view.layout != Layout::Linear {
             let chicken = self.io().read32(0x7026c);
             if chicken == u32::MAX {
                 return Err(ScanoutError::Unavailable);
@@ -526,7 +560,7 @@ impl<M: ScanoutIo> Presenter<M> {
         let ptes: Vec<u64> = object
             .pages()
             .take(pages as usize)
-            .map(|phys| self.format.encode_ggtt(phys, self.pat))
+            .map(|phys| crate::intel_gpu_gtt::encode_display_pte(self.format, phys, self.pat))
             .collect::<Result<_, _>>()
             .map_err(|_| ScanoutError::Bounds)?;
         if ptes.len() != pages as usize {
@@ -592,7 +626,7 @@ impl<M: ScanoutIo> Presenter<M> {
     fn geometry_matches_stride(&self, geometry: Geometry, view: View, stride: u32) -> bool {
         let ctl = self.io().read32(self.plane() + PLANE_CTL_OFFSET);
         let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
-        let chicken = if view.layout == Layout::X {
+        let chicken = if view.layout != Layout::Linear {
             self.io().read32(0x7026c)
         } else {
             0
@@ -602,7 +636,7 @@ impl<M: ScanoutIo> Presenter<M> {
             && ctl & (PLANE_CTL_ENABLE | CTL_FORMAT_MASK | CTL_TILED_MASK | CTL_RGB_ORDER)
                 == PLANE_CTL_ENABLE | CTL_XRGB8888 | view.tiled()
             && ctl == (self.console_ctl & !CTL_TILED_MASK) | view.tiled()
-            && (view.layout != Layout::X || (chicken != u32::MAX && chicken & (1 << 19) != 0))
+            && (view.layout == Layout::Linear || (chicken != u32::MAX && chicken & (1 << 19) != 0))
             && self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) == stride
             && self.io().read32(self.plane() + PLANE_SIZE_OFFSET)
                 == ((geometry.height - 1) << 16) | (geometry.width - 1)

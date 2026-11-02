@@ -379,7 +379,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             main.write(r, v);
         }
         // intel_atomic_dsb_finish: color arm precedes plane arm within the
-        // same evaded safe window. skl_plane_update_arm emits the linear
+        // same evaded safe window. skl_plane_update_arm emits the source
         // source OFFSET before SURF; it must not escape into the earlier
         // non-arming coefficient prefix when the viewport changes.
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x701a4) {

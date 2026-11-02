@@ -336,12 +336,15 @@ fn smoke_intel_x_tiled_layout_extent_metadata_test_only_and_arch_refusal() -> Te
     ] {
         assert!(view.footprint(bad).is_err());
     }
-    assert!(View {
-        origin: crate::intel_gpu_scanout::Viewport { x: 1, y: 0 },
-        ..view
-    }
-    .footprint(geometry())
-    .is_err());
+    assert_eq!(
+        View {
+            origin: crate::intel_gpu_scanout::Viewport { x: 1, y: 0 },
+            ..view
+        }
+        .footprint(geometry())
+        .unwrap(),
+        (0, 1, 16384)
+    );
     let queue = queue::Queue::new(mode.clone());
     let cpu = Cpu::new();
     let events = Events::new(IrqSafeSpinLock::new(Default::default()));
@@ -491,3 +494,10 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dsb",
     smoke_intel_x_tiled_cancel_partial_arm_reset_and_master_handoff_retain_owners
 );
+
+mod panning {
+    include!("intel_gpu_x_tiled_viewport_tests.rs");
+}
+mod tile4 {
+    include!("intel_gpu_tile4_ioctl_tests.rs");
+}
