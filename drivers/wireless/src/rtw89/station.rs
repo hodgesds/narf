@@ -12,6 +12,8 @@ use narf_wireless::{
     station_security::{self, RawFrame, Security},
 };
 use zeroize::Zeroizing;
+#[path = "station_tx_amsdu.rs"]
+mod tx_amsdu;
 
 /// Same retained cold/firmware/radio owner. Implementations must invoke
 /// current device and exact ordinary RF/response authority at publication;
@@ -56,6 +58,11 @@ pub(super) unsafe trait Io: Send {
     }
     /// Signed HT20 program (`Program::Ht`).
     fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// Distinct current expanded full-radio A-MSDU companion, not the old
+    /// A-MPDU flag or HT enumeration. Optional prior profiles keep false.
+    fn station_amsdu_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
     /// Signed originator BA / TX A-MPDU program (`Program::Ampdu`).
@@ -403,6 +410,10 @@ pub(super) struct State {
     he: bool,
     /// A current MACID0 RA report has ruled out legacy fallback.
     htc_rate: bool,
+    /// Latest matching native RC body ceiling; None is Linux's initial no clamp.
+    amsdu_rc: Option<usize>,
+    /// Actual RX prefix was drained to idle by the last retained worker pass.
+    rx_idle: bool,
     /// Data TXWD `DATA_ER` (Linux `er_cap`: HE operation allows ER SU).
     er: bool,
     /// Random scan address live in the address CAM during an active scan.
@@ -467,6 +478,8 @@ impl State {
             ht: false,
             he: false,
             htc_rate: false,
+            amsdu_rc: None,
+            rx_idle: false,
             er: false,
             scan: None,
             ba: core::array::from_fn(|_| None),
@@ -546,6 +559,8 @@ impl State {
         self.ht = false;
         self.he = false;
         self.htc_rate = false;
+        self.amsdu_rc = None;
+        self.rx_idle = false;
         self.er = false;
         self.scan = None;
         self.clear_block_ack();
@@ -585,6 +600,8 @@ impl State {
         self.ht = false;
         self.he = false;
         self.htc_rate = false;
+        self.amsdu_rc = None;
+        self.rx_idle = false;
         self.er = false;
         self.scan = None;
         self.clear_block_ack();
@@ -664,6 +681,16 @@ impl State {
             .find(|candidate| candidate.bss.bssid == bssid)
             .map(|candidate| candidate.bss.information_elements)
     }
+    /// Exact station admission, shared by pre-crypto and final native send.
+    /// The peer BA window can be smaller than the packet core's global limit.
+    fn transmit_room(&self, kind: Kind, agg: Option<super::packet_format::Agg>) -> bool {
+        let joins = agg.is_some_and(|agg| {
+            kind == Kind::Data
+                && self.pending.iter().all(|pending| pending.agg)
+                && self.pending.len() < (usize::from(agg.num) + 1).min(packet::AGG_WINDOW)
+        });
+        (self.pending.is_empty() || joins) && self.delivered_reply.is_none()
+    }
     fn transmit(&mut self, io: &mut impl Io, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
         self.transmit_with(io, bytes, kind, true, None)
     }
@@ -681,14 +708,7 @@ impl State {
         if self.admission.closed() {
             return Err(Error::State);
         }
-        // Only aggregated data joins other aggregated data in flight, within
-        // the session window (`agg.num` + 1) and the emitter window.
-        let joins = agg.is_some_and(|agg| {
-            kind == Kind::Data
-                && self.pending.iter().all(|pending| pending.agg)
-                && self.pending.len() < (usize::from(agg.num) + 1).min(packet::AGG_WINDOW)
-        });
-        if !self.pending.is_empty() && !joins || self.delivered_reply.is_some() {
+        if !self.transmit_room(kind, agg) {
             return Err(Error::Busy);
         }
         if assign && !matches!(kind, Kind::Security | Kind::Data) {
@@ -922,10 +942,10 @@ impl State {
                     status,
                     tid,
                     buf_size,
-                    ..
+                    amsdu,
                 } => {
-                    // ieee80211_process_addba_resp. `amsdu` only matters to
-                    // A-MSDU-in-A-MPDU, which this emitter never builds.
+                    // Sticky directional peer denial also constrains a
+                    // separately qualified expanded A-MSDU emitter.
                     if self.ampdu {
                         let requested = matches!(
                             self.originator.tids.get(usize::from(tid)).copied().flatten(),
@@ -933,7 +953,7 @@ impl State {
                         );
                         if self
                             .originator
-                            .response(token, status, tid, buf_size)
+                            .response(token, status, tid, buf_size, amsdu)
                             .is_some()
                         {
                             self.ba_ops.push_back(BaOp::TxOperational(tid));
@@ -1215,11 +1235,19 @@ impl State {
         io.station_allowed()?;
         let now = self.now()?;
         let mut idle = false;
+        self.rx_idle = false;
         for _ in 0..32 {
             let step = io.packet_poll()?;
             if self.phase == Phase::Open {
                 if let Some(allowed) = step.c2h.as_deref().and_then(super::he_htc::rate_allows) {
                     self.htc_rate = allowed;
+                }
+                if let Some(limit) = step
+                    .c2h
+                    .as_deref()
+                    .and_then(|bytes| super::tx_amsdu::rate_limit(bytes, self.he))
+                {
+                    self.amsdu_rc = Some(limit);
                 }
             }
             if let Some(rssi) = step.rssi {
@@ -1263,6 +1291,7 @@ impl State {
                 }
             }
         }
+        self.rx_idle = idle;
         // A CRC/report descriptor is consumed input, never an RX-idle fence.
         // Inspect all queued peer loss before committing an exact M4 receipt.
         if idle {
@@ -1850,6 +1879,42 @@ impl State {
         }
         result
     }
+    /// The originals remain in the host queue until one actual MPDU was
+    /// published. A refusal/Busy never consumes a later prefix member.
+    pub(super) fn send_prefix(
+        &mut self,
+        io: &mut impl Io,
+        frames: &[&[u8]],
+    ) -> Result<usize, Error> {
+        let first = *frames.first().ok_or(Error::Profile)?;
+        let admission = self.admission.clone();
+        let result = admission
+            .run(|| Ok(self.send_amsdu_inner(io, frames)))
+            .map_err(Error::Native)
+            .and_then(|result| result);
+        match result {
+            Ok(Some(count)) => {
+                for frame in &frames[..count] {
+                    if frame[0] & 1 == 0 {
+                        self.track.transmitted(frame.len());
+                    }
+                }
+                Ok(count)
+            }
+            Ok(None) => self.send(io, first).map(|()| 1),
+            Err(error) => {
+                if !self.admission.teardown_pending()
+                    && !matches!(
+                        error,
+                        Error::Busy | Error::Profile | Error::Transport(packet::Error::Busy)
+                    )
+                {
+                    self.fail(io);
+                }
+                Err(error)
+            }
+        }
+    }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         if !self.ready() {
             return Err(Error::Busy);
@@ -1876,8 +1941,9 @@ impl State {
         } else {
             None
         };
-        if agg.is_some() && !io.packet_ready_aggregate()
-            || agg.is_none() && (!self.pending.is_empty() || !io.packet_ready())
+        if !self.transmit_room(Kind::Data, agg)
+            || agg.is_some() && !io.packet_ready_aggregate()
+            || agg.is_none() && !io.packet_ready()
         {
             return Err(Error::Busy);
         }

@@ -5,6 +5,9 @@ use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
 const LENGTH: usize = 128;
+#[path = "amsdu_policy.rs"]
+mod amsdu;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
     Firmware(FirmwareError),
@@ -231,6 +234,9 @@ pub(super) struct Qualification {
     peaks_qdbm: [i16; 3],
     wmm: bool,
     flags: u8,
+    record_digest: [u8; 32],
+    record_signer: [u8; 32],
+    amsdu: Option<amsdu::Amsdu>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -257,9 +263,13 @@ impl Qualification {
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Authority)?;
         let cap = narf_firmware::open(&name, &loader).map_err(Error::Firmware)?;
-        let qualification = cap.invoke(Decode(board)).map_err(|_| Error::Authority)??;
+        let mut qualification = cap.invoke(Decode(board)).map_err(|_| Error::Authority)??;
         if qualification.wmm {
             narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
+        }
+        qualification.amsdu = amsdu::Amsdu::optional(&qualification)?;
+        if qualification.amsdu.is_some() {
+            qualification.current()?;
         }
         Ok(qualification)
     }
@@ -270,7 +280,7 @@ impl Qualification {
         authority: Cap<FirmwareBlob, Read>,
     ) -> Result<Self, Error> {
         authority.invoke(Current).map_err(|_| Error::Authority)?;
-        signer.ok_or(Error::Unsigned)?;
+        let record_signer = signer.ok_or(Error::Unsigned)?;
         if bytes.len() != LENGTH
             || &bytes[..4] != b"N52B"
             || bytes[4..8] != [2, 0, 128, 0]
@@ -299,9 +309,14 @@ impl Qualification {
         {
             return Err(Error::Format);
         }
+        let mut digest = narf_crypto::sha256::Sha256::new();
+        digest.update(bytes);
         Ok(Self {
             board,
             authority,
+            record_digest: digest.finalize(),
+            record_signer,
+            amsdu: None,
             antenna_qdb,
             ceiling_qdbm,
             peaks_qdbm,
@@ -321,6 +336,19 @@ impl Qualification {
         self.current()?;
         Ok(self.flags & program.bit() != 0)
     }
+    pub(super) fn amsdu_allowed(&self) -> Result<bool, Error> {
+        self.current()?;
+        Ok(self.amsdu.is_some())
+    }
+    fn invoke_amsdu<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::power::Error>,
+    ) -> Result<T, super::power::Error> {
+        match &self.amsdu {
+            Some(program) => program.invoke(operation),
+            None => operation(),
+        }
+    }
     pub(super) fn wmm_allowed(&self) -> Result<bool, Error> {
         self.current()?;
         Ok(self.wmm)
@@ -329,6 +357,9 @@ impl Qualification {
         self.authority
             .invoke(Current)
             .map_err(|_| Error::Authority)?;
+        if let Some(program) = &self.amsdu {
+            program.current()?;
+        }
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(domain) = self.model_domain.as_ref() {
             return self.check(domain);
@@ -365,7 +396,7 @@ impl Qualification {
                         self.qualification
                             .check(domain)
                             .map_err(|_| super::power::Error::Access)?;
-                        return (self.operation)();
+                        return self.qualification.invoke_amsdu(self.operation);
                     }
                     let domain = if self.qualification.wmm {
                         narf_wireless::reg::db::get_domain().ok_or(super::power::Error::Access)?
@@ -376,7 +407,7 @@ impl Qualification {
                     self.qualification
                         .check(&domain)
                         .map_err(|_| super::power::Error::Access)?;
-                    (self.operation)()
+                    self.qualification.invoke_amsdu(self.operation)
                 })())
             }
         }

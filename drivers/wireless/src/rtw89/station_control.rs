@@ -130,6 +130,15 @@ impl Peer {
         }
     }
     pub(super) fn admits(&self, frame: &[u8]) -> bool {
+        self.admits_profile(frame, false)
+    }
+    pub(super) fn admits_amsdu(&self, frame: &[u8]) -> bool {
+        super::packet_format::amsdu(frame)
+            && frame.get(16..22) == Some(self.peer.as_slice())
+            && frame.get(1).is_some_and(|fc| fc & 0x80 == 0)
+            && self.admits_profile(frame, true)
+    }
+    fn admits_profile(&self, frame: &[u8], amsdu: bool) -> bool {
         self.current().is_ok()
             && frame.len() >= 24
             && frame[4..10] == self.peer
@@ -142,7 +151,7 @@ impl Peer {
                 || self.qos.load(Ordering::Acquire)
                     && frame.get(25) == Some(&0)
                     && frame.get(24).is_some_and(|control| {
-                        control & 0xe8 == 0
+                        control & if amsdu { 0x68 } else { 0xe8 } == 0
                             && (control & 0x10 != 0) == (frame[1] & 0x80 != 0)
                             && self.tids.load(Ordering::Acquire) & (1 << (control & 7)) != 0
                     }))

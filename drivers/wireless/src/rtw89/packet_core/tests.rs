@@ -65,6 +65,8 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) authority: Cap<BusDeviceCap, Write>,
     inside: bool,
     pub(in crate::rtw89) allowed: bool,
+    pub(in crate::rtw89) amsdu: Option<usize>,
+    pub(in crate::rtw89) revoke_amsdu_on_allocate: bool,
     peer_live: bool,
     pub(in crate::rtw89) peer: Option<crate::rtw89::station_control::Peer>,
     deny_after_allocation: Option<bool>,
@@ -103,6 +105,8 @@ impl Model {
             authority,
             inside: false,
             allowed: true,
+            amsdu: None,
+            revoke_amsdu_on_allocate: false,
             peer_live: true,
             peer: None,
             deny_after_allocation: None,
@@ -311,7 +315,8 @@ impl Model {
             };
             if kind != expected
                 || body.get(25) != Some(&0)
-                || qc & 0xe8 != 0
+                || qc & if self.amsdu.is_some() { 0x68 } else { 0xe8 } != 0
+                || qc & 0x80 != 0 && (a_ctrl || body[16..22] != body[4..10])
                 || (qc & 0x10 != 0) != a_ctrl
                 || a_ctrl && body.get(26..30) != Some(&[0x1b, 0, 0, 0])
                 || (word(8) >> 23 & 1 == 1) != matches!(tid, 2 | 3 | 5 | 7)
@@ -506,10 +511,18 @@ unsafe impl Port for Model {
             Err(Error::Access)
         }
     }
+    fn amsdu_allowed(&mut self) -> Result<Option<usize>, Error> {
+        self.guard()?;
+        Ok(self.amsdu)
+    }
     fn peer_allowed(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.guard()?;
         if let Some(peer) = self.peer.as_ref() {
-            return if peer.admits(bytes) {
+            return if if format::amsdu(bytes) && self.amsdu.is_some() {
+                peer.admits_amsdu(bytes)
+            } else {
+                peer.admits(bytes)
+            } {
                 Ok(())
             } else {
                 Err(Error::Access)
@@ -539,6 +552,9 @@ unsafe impl Port for Model {
             length: memory.len(),
         });
         self.allocations += 1;
+        if self.revoke_amsdu_on_allocate {
+            self.amsdu = None;
+        }
         if self.allocations == 4 {
             match self.deny_after_allocation {
                 Some(true) => self.allowed = false,

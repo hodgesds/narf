@@ -52,6 +52,9 @@ pub(super) struct RxStep {
 /// `peer_allowed` validates the exact current station_control::Peer token and
 /// its own-TA/peer-RA admission before allocation and actual publication. RX
 /// polling and initial radio start must remain independent of that peer token.
+/// `amsdu_allowed` invokes the original current companion full-program cap
+/// bound to that exact installed base record; only its explicit body ceiling
+/// admits the expanded TX shape, at both actual publication checks.
 /// `start` repeats that check and opens only BE0/MGMT8/WPDMA and qualified CMAC
 /// TX, preserving CH12/RX/RPQ and all inherited DMA fencing ownership.
 /// `receive` consumes actual retained DMA after device acquire, never fabricated
@@ -64,6 +67,10 @@ pub(super) unsafe trait Port: power::Io {
     ) -> Result<T, Error>;
     fn ordinary_allowed(&mut self) -> Result<(), Error>;
     fn peer_allowed(&mut self, frame: &[u8]) -> Result<(), Error>;
+    /// Separate current full A-MSDU emitter. Default old profiles deny.
+    fn amsdu_allowed(&mut self) -> Result<Option<usize>, Error> {
+        Ok(None)
+    }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error>;
     fn receive(&mut self) -> Result<RxStep, Error>;
     /// Clear exactly the `open` DMA stop bits (BE/MGMT/WPDMA, plus BK/VI/VO
@@ -167,6 +174,7 @@ pub(super) struct Core {
     completions: VecDeque<Receipt>,
     /// Signed aggregate emitter granted (`Program::Ampdu`).
     aggregate: bool,
+    amsdu: Option<usize>,
     /// Last published A-Control form (`rtwvif_link->last_a_ctrl`).
     last_a_ctrl: bool,
 }
@@ -300,6 +308,7 @@ impl Core {
                 pending: Vec::new(),
                 completions: VecDeque::new(),
                 aggregate: false,
+                amsdu: None,
                 last_a_ctrl: false,
             };
             for ring in &mut owner.rings {
@@ -367,6 +376,18 @@ impl Core {
         self.scan = scan;
         Ok(())
     }
+    pub(super) fn enable_amsdu(&mut self, limit: usize) -> Result<(), Error> {
+        if self.phase != Phase::Prepared
+            || self.rx < RxPhy::Ht
+            || !self.aggregate
+            || limit == 0
+            || limit > super::tx_amsdu::MAX_BODY
+        {
+            return Err(Error::State);
+        }
+        self.amsdu = Some(limit);
+        Ok(())
+    }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_empty() && self.completions.is_empty()
     }
@@ -430,13 +451,17 @@ impl Core {
             Some(scan) if format::probe_request(bytes, scan) => scan,
             _ => self.own,
         };
-        let kind = format::classify(bytes, source)?;
+        let kind = format::classify_with(bytes, source, self.amsdu)?;
+        let amsdu = format::amsdu(bytes);
         let a_ctrl = bytes[1] & 0x80 != 0;
         let break_aggregation = a_ctrl != self.last_a_ctrl;
         let id = self.next_id;
         let next_id = id.checked_add(1).ok_or(Error::State)?;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
+            if amsdu && port.amsdu_allowed()? != self.amsdu {
+                return Err(Error::Access);
+            }
             // An active-scan probe request has no peer; everything else
             // needs the current peer token.
             if !format::probe_request(bytes, source) {
@@ -463,7 +488,7 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (mut header, actual) = format::transmit_agg(
+                let (mut header, actual) = format::transmit_profile(
                     bytes,
                     source,
                     self.mac_id,
@@ -472,6 +497,7 @@ impl Core {
                     radio_report,
                     rate,
                     agg,
+                    self.amsdu,
                 )?;
                 if actual != kind {
                     return Err(Error::Packet);
@@ -494,6 +520,9 @@ impl Core {
                 }
             };
             port.ordinary_allowed()?;
+            if amsdu && port.amsdu_allowed()? != self.amsdu {
+                return Err(Error::Access);
+            }
             if !format::probe_request(bytes, source) {
                 port.peer_allowed(bytes)?;
             }

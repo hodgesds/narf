@@ -130,6 +130,15 @@ impl<I: Io> Owner<I> {
             .ok_or(super::station::Error::State)?
             .send(&mut self.io, frame)
     }
+    pub(super) fn station_send_prefix(
+        &mut self,
+        frames: &[&[u8]],
+    ) -> Result<usize, super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .send_prefix(&mut self.io, frames)
+    }
     pub(super) fn station_stop(&mut self) -> Result<(), super::station::Error> {
         match self.station.as_mut() {
             Some(station) => station.stop(&mut self.io),

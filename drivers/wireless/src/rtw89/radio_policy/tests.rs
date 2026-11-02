@@ -635,3 +635,93 @@ kernel_test_in!(
     "drivers/wireless/rtw89/radio",
     smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity
 );
+
+fn smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_power() -> TestResult
+{
+    let base = board();
+    let flags = Program::Ampdu.flags();
+    let mut bytes = image(base.with_programs(flags));
+    bytes[57] = flags;
+    let base_cap = authority();
+    let mut qualified =
+        Qualification::from_verified(&bytes, Some([3; 32]), base, base_cap).unwrap();
+    qualified.model_domain = Some(domain());
+    if qualified.amsdu_allowed() != Ok(false) || qualified.allows(Program::Ampdu) != Ok(true) {
+        return TestResult::Fail("old A-MPDU record silently authorizes expanded A-MSDU");
+    }
+    let request = amsdu::AmsduRequest::new(&qualified).unwrap();
+    if request.name != "rtw89/rtw8852b-tx-amsdu-v1-020406080a0c.bin" {
+        return TestResult::Fail("actual companion provisioning name");
+    }
+    let mut expanded = [0; 128];
+    expanded[..4].copy_from_slice(b"N52A");
+    expanded[4..8].copy_from_slice(&[1, 0, 128, 0]);
+    expanded[8..12].copy_from_slice(&128u32.to_le_bytes());
+    expanded[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    expanded[14..16].copy_from_slice(&base.device.to_le_bytes());
+    expanded[16..48].copy_from_slice(&request.binding);
+    expanded[48..54].copy_from_slice(&base.mac);
+    expanded[54..58].copy_from_slice(&[1, 20, 1, 3]);
+    expanded[58..60].copy_from_slice(&5000u16.to_le_bytes());
+    expanded[60] = 8;
+    let cap = authority();
+    for signer in [None, Some([4; 32])] {
+        if amsdu::Amsdu::from_verified(&qualified, &request, &expanded, signer, cap).is_ok() {
+            return TestResult::Fail("unsigned/different signer expanded RF program");
+        }
+    }
+    for length in 0..128 {
+        if amsdu::Amsdu::from_verified(
+            &qualified,
+            &request,
+            &expanded[..length],
+            Some([3; 32]),
+            cap,
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("truncated expanded RF program");
+        }
+    }
+    for at in [0, 4, 8, 12, 14, 16, 48, 54, 55, 56, 57, 58, 60, 61, 127] {
+        let mut bad = expanded;
+        bad[at] ^= 1;
+        if amsdu::Amsdu::from_verified(&qualified, &request, &bad, Some([3; 32]), cap).is_ok() {
+            return TestResult::Fail("different identity/shape/reserved expanded RF program");
+        }
+    }
+    // Same board/program but a different actual measured power record must
+    // earn its own binding, even when both records remain individually valid.
+    let mut different = bytes;
+    different[62..64].copy_from_slice(&39i16.to_le_bytes());
+    let other = Qualification::from_verified(&different, Some([3; 32]), base, authority()).unwrap();
+    if amsdu::AmsduRequest::new(&other).unwrap().binding == request.binding {
+        return TestResult::Fail("companion identity omitted actual installed record digest");
+    }
+    let other_request = amsdu::AmsduRequest::new(&other).unwrap();
+    if amsdu::Amsdu::from_verified(&other, &other_request, &expanded, Some([3; 32]), cap).is_ok()
+        || amsdu::Amsdu::from_verified(&other, &request, &expanded, Some([3; 32]), cap).is_ok()
+    {
+        return TestResult::Fail("actual companion transplanted to another measured base record");
+    }
+    qualified.amsdu = Some(
+        amsdu::Amsdu::from_verified(&qualified, &request, &expanded, Some([3; 32]), cap).unwrap(),
+    );
+    if qualified.amsdu_allowed() != Ok(true) || qualified.with_current(|| Ok(7)) != Ok(7) {
+        return TestResult::Fail("genuine expanded program current base/power admission");
+    }
+    qualified.model_domain.as_mut().unwrap().rules[0].max_power_dbm = 1;
+    if qualified.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("expanded program bypassed tightened actual host power");
+    }
+    qualified.model_domain = Some(domain());
+    cap.revoke();
+    if qualified.amsdu_allowed().is_ok() || qualified.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("revoked actual companion remained ordinary emission authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/aggregation",
+    smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_power
+);

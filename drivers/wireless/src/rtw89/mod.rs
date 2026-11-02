@@ -134,6 +134,7 @@ pub(super) mod station_control;
 mod station_lifecycle;
 mod track;
 mod tssi;
+mod tx_amsdu;
 pub mod tx_transport;
 pub mod txrx;
 

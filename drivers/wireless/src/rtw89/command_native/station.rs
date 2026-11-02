@@ -87,10 +87,14 @@ impl Native {
         let he = self.station_he_allowed().unwrap_or(false);
         let rx = packet::RxPhy::from_programs(ht, he);
         let ampdu = ht && self.station_ampdu_allowed().unwrap_or(false);
+        let amsdu = ampdu && self.station_amsdu_allowed()?;
         let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all, rx)
             .and_then(|mut core| {
                 if ampdu {
                     core.enable_aggregation()?;
+                }
+                if amsdu {
+                    core.enable_amsdu(crate::rtw89::tx_amsdu::MAX_BODY)?;
                 }
                 Ok(core)
             });
@@ -402,11 +406,24 @@ unsafe impl packet::Port for Access<'_> {
             .station_runtime
             .peer
             .as_ref()
-            .is_some_and(|peer| peer.admits(bytes))
+            .is_some_and(|peer| {
+                if crate::rtw89::packet_format::amsdu(bytes) {
+                    peer.admits_amsdu(bytes)
+                } else {
+                    peer.admits(bytes)
+                }
+            })
         {
             Ok(())
         } else {
             Err(packet::Error::Packet)
+        }
+    }
+    fn amsdu_allowed(&mut self) -> Result<Option<usize>, packet::Error> {
+        if self.native.station_amsdu_allowed()? {
+            Ok(Some(crate::rtw89::tx_amsdu::MAX_BODY))
+        } else {
+            Ok(None)
         }
     }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, packet::Error> {

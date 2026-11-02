@@ -311,6 +311,34 @@ pub fn prepare_header(
     frame_dma: u64,
     frame: &[u8],
 ) -> Result<Vec<u8>, Error> {
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, false)
+}
+/// TX A-MSDU formatting only. The caller must prove the distinct actual
+/// native RF/peer/key/size program; no other chip or +HTC form is admitted.
+pub(super) fn prepare_header_amsdu(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if chip != ChipId::Rtl8852B
+        || frame.first() != Some(&0x88)
+        || frame.get(24).is_none_or(|q| q & 0x80 == 0)
+        || frame.get(1).is_some_and(|fc| fc & 0x80 != 0)
+    {
+        return Err(Error::BadFrame);
+    }
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, true)
+}
+fn prepare_header_profile(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+    amsdu: bool,
+) -> Result<Vec<u8>, Error> {
     if chip == ChipId::Rtl8922A {
         return Err(Error::BadQueue);
     }
@@ -359,7 +387,8 @@ pub fn prepare_header(
         // TID0..7, normal ack policy; EOSP belongs to the HE +HTC form.
         if chip != ChipId::Rtl8852B
             || frame.get(24).is_none_or(|control| {
-                control & 0xe8 != 0 || (control & 0x10 != 0) != (fc & 0x8000 != 0)
+                control & if amsdu { 0x68 } else { 0xe8 } != 0
+                    || (control & 0x10 != 0) != (fc & 0x8000 != 0)
             })
             || frame.get(25) != Some(&0)
         {

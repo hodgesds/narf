@@ -1076,7 +1076,7 @@ with `station_control::local_ht()`: Linux `rtw89_init_ht_cap` restricted to
 this TX-A/RX-AB 20MHz profile (SGI20, LDPC, RX STBC1, 64K A-MPDU factor,
 no density, RX MCS0..15, TX MCS0..7). HT40/DSSSCCK40/SGI40 belong to
 `wide_channels`; TX STBC needs a second TX path this profile lacks; the
-large A-MSDU bit belongs to `aggregation`. The negotiated HT facts feed the
+large receive A-MSDU bit remains unadvertised; TX aggregation does not expand that receive promise. The negotiated HT facts feed the
 firmware RA H2C exactly like `rtw89_phy_ra_sta_update`'s HT branch
 (`mode |= HT`, peer RX MCS bytes shifted to bits 12/24/36/48, masked to
 `RA_MASK_HT_1SS_RATES|SUBOFDM|SUBCCK` for one TX stream, SGI20/LDPC from the
@@ -1102,7 +1102,7 @@ SU in MU (compressed and non-compressed SIG-B) and 16us nominal padding;
 RX HE-MCS0..11 on two streams and TX HE-MCS0..11 on one. Linux bits that
 need 40MHz (`wide_channels`), a second TX path (STBC TX, DCM TX NSS2),
 buffer-status capability (`BSR`), power save (`OPS`), RX A-MSDU
-(`AMSDU_IN_AMPDU`; `aggregation`) or beamforming feedback
+(`AMSDU_IN_AMPDU`; unchanged receive-direction promise) or beamforming feedback
 (`rtw89_mac_bf_assoc` sounding: SU beamformee, NG16, codebook sizes,
 triggered SU feedback, MaxNc) are cleared.
 
@@ -1284,9 +1284,96 @@ Smokes:
   - failure: a declined response and a response timeout (DELBA 37);
   - program not granted: no ADDBA and no AGG_EN.
 
-TX A-MSDU (`IEEE80211_HW_TX_AMSDU`, `SUPPORTS_AMSDU_IN_AMPDU`) is not part
-of this emitter. The ADDBA Response A-MSDU bit is ignored, and the
-remaining `aggregation` work is listed in the open-row table.
+### TX A-MSDU and A-MSDU-in-A-MPDU (source complete; validation pending)
+
+The admitted RTL8852B station now implements both Linux TX directions
+(`IEEE80211_HW_TX_AMSDU` and `SUPPORTS_AMSDU_IN_AMPDU`). This extends the
+actual retained channel1/20MHz Open/WPA2 HT/HE owner, not another chip's
+unimplemented runtime. Software acceptance and physical qualification remain
+separate; the five new aggregation cases have not yet been executed.
+
+`interface::Rings` peeks at most8 original Ethernet frames from the selected
+AC's exact FIFO prefix. `State::send_prefix` holds the original publication
+admission, requires the actual HT/WMM/A-MPDU operating program and a distinct
+current A-MSDU companion, and stops at the first different effective TID,
+control/tunnel/VLAN-control frame, invalid source or size boundary. It never
+skips a later member to form a batch. The whole prefix is encoded and actual
+queue credit and exact retained peer BA in-flight window checked before
+consuming a sequence or CCMP PN. Both single and batched sends reuse that
+station-window predicate at the final send as well. A peer buffer1 held MPDU
+cannot repeatedly consume PN/SN merely because the native global window is
+larger. Fewer than2
+eligible frames use the unchanged single-frame emitter. A last native worker
+pass that did not reach actual RXQ/RPQ idle cannot form a new A-MSDU from
+unprocessed peer/RC facts.
+
+Directional TX body bounds are min(peer HT3839/7935, chip5000, latest actual
+MACID0 RC ceiling). Linux7.3-rc4 `rtw8852b.c` sets `max_amsdu_limit=5000`;
+`phy.c::get_max_amsdu_len` sets1 below550 (100kbps units) or possible legacy
+fallback (MCS<=2), then1200/2600/3500 below1800/4000/7000, otherwise the
+chip bound. The native AX OUTSRC/RA/STS report supplies actual MCS/NSS,
+20MHz bandwidth and GI/LTF; unsupported/malformed matching reports deny
+batching, and unrelated MACIDs/events do not replace this peer's ceiling.
+HT1SS/HE1SS20 native bitrate calculation follows `cfg80211_calculate_bitrate`;
+this admitted profile's valid high-rate reports reach the1200 ceiling.
+Before the first report there is no RC clamp, matching mac80211's initial
+`max_rc_amsdu_len=0`. A report supplies only a smaller queue-size fact,
+never RF/rate/peer authority.
+
+An actual peer ADDBA Response without its A-MSDU bit sets a sticky per-TID
+`IEEE80211_TXQ_NO_AMSDU` denial before dialog-token matching, as Linux's
+`agg-tx.c::ieee80211_process_addba_resp` does. DELBA, a new positive response
+and BA retries do not erase it for this physical peer; station destruction
+does. Nested A-MSDU requires the real operational originator BA owner and,
+for HE, the peer receive `MAC_CAP4_AMSDU_IN_AMPDU` bit. Our receive HT-large
+A-MSDU/HE-AMSDU-in-AMPDU bits stay unchanged and confer no additional RX
+promise. A standalone batch uses Normal Ack; a nested batch retains the
+actual BA buffer/density and native TXWD AGG_EN fields.
+
+Protected batches call `Security::transmit_amsdu_qos` with the negotiated
+peer size, emitting one real CCMP MPDU with one PN and QoS SN, BSSID A3 and
+no optional HT Control. Open batches likewise consume one host SN. The
+existing native BODY3_BK transition handles leaving an HE +HTC form.
+`packet_core` admits QoS bit7 and a dynamically sized body only under its
+explicit prepared expanded TX profile. Both real pre-allocation and final
+pre-doorbell checks invoke the original current full-radio/companion,
+power/device and sealed peer admission. Default classifiers/transports keep
+their old2304-byte/non-A-MSDU profile. RTL8852B uses its actual single PCI
+address-info element for the complete MPDU (the2044-byte splitting source
+belongs to a different chip format). One native ticket owns copied header
+and body DMA until both actual TXBD consumption and matching RPQ air terminal;
+there are no invented per-subframe completions. The host consumes all original
+prefix frames together only after successful native publication; Busy retains
+them unchanged and a fatal source/key/native failure closes the owner.
+
+A-MSDU does not alter the existing128-byte N52B v2 flags/fingerprints. Its
+optional separately signed expanded full-program companion is
+`rtw89/rtw8852b-tx-amsdu-v1-<actual-mac>.bin`. Only NotFound preserves the
+narrow old emitter; a present malformed/unsigned/wrong-signer/wrong-identity
+record refuses preflight. The128-byte N52A v1 record has magic0..4, header
+`[1,0,128,0]` at4, total length128 at8, vendor/device at12/14, binding at16,
+actual MAC at48, `[1,20,1,3]` at54 (channel/width/TXA/both TX forms), body
+limit5000 at58, prefix8 at60 and zero61..128. The binding is SHA256 of the
+fixed domain `NARF RTL8852B measured expanded full A-MSDU operating program v1`,
+the complete selected board/program identity, exact installed N52B bytes'
+SHA256, actual base signer and `amsdu_policy::recipe()` digest, in that order.
+The companion must have the same authenticated signer as that exact base.
+It attests that the base's worst-case measured peak/antenna/power envelope
+covers this expanded full operating program; it cannot reuse a narrower
+measurement just because the bytes encode. Current base and companion caps
+remain invoked across real publication, with current host power constraints.
+
+Native/model cases under `drivers/wireless/rtw89/aggregation` cover genuine
+Open/WPA2 and HT/HE CCMP/decrypted Ethernet, standalone and nested BA, one
+held MPDU/PN/descriptor/terminal for multiple originals, prefix8, peer3839 vs
+chip5000, actual RC C2H ceilings, absent companion, same-AC different-TID FIFO,
+sticky wrong-token denial and DELBA, and companion loss after native allocation.
+The signed-policy case covers exact record/signer/power identity, truncated and
+mutated records, transplantation, real cap revocation and tightened host power.
+Primary source pins are Linux7.3-rc4 `rtw89/{core.c,pci.c,phy.c,core.h,
+rtw8852b.c,txrx.h}`, `mac80211/{tx.c,agg-tx.c,ht.c}` and `wireless/util.c`.
+No build, native execution or physical acceptance is implied by this pending
+source contract.
 
 ### Protected management frames and WPA3-SAE
 
@@ -1691,7 +1778,7 @@ with its distinct BE generation. B now has signed-program HT20, HE20 (with
 firmware GI/LTF selection), all-AC/TID QoS, firmware RA, recipient
 BA/reorder, MSI delivery, live EDCA and active channel-1 scans (section 3);
 HE +HTC and originator TX A-MPDU are now implemented. It still needs wider
-widths, TX A-MSDU, other channels, tracking, runtime sleep/WoW and
+widths, other channels, tracking, runtime sleep/WoW and
 in-place SER L1 recovery. A/C/51 need complete chip-specific
 firmware/security, BB/RF/power/packet/station composition;8922A additionally
 needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
@@ -1710,7 +1797,7 @@ Each blocker below was re-checked against this tree.
 | Row | Concrete blocker |
 |---|---|
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
-| `aggregation` | TX A-MPDU now exists (section "Originator Block Ack and TX A-MPDU"). What is left is TX A-MSDU and A-MSDU-in-A-MPDU (Linux v7.2 `core.c::rtw89_core_register_hw` `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU`, mac80211 `tx.c::ieee80211_amsdu_aggregate`). `interface.rs` drains one Ethernet frame per `State::send`, with no per-TID txq batching to hand `Security::transmit_amsdu_qos` several frames. `packet_format::classify` refuses the QoS A-MSDU-present bit (`frame[24] & 0xf8`) and any MPDU above `MAX_MPDU` 2304, below the peer HT 3839/7935-byte A-MSDU limit. The ADDBA Response A-MSDU bit (`IEEE80211_TXQ_NO_AMSDU`) is parsed but unused. The aggregate program fingerprint excludes A-MSDU, so it needs its own measured `Program`. |
+| `aggregation` | Source complete for the admitted RTL8852B HT/HE20 owner; TX A-MSDU and A-MSDU-in-A-MPDU now use the separate current signed full-program companion, original FIFO prefix, peer/BA/current RC bounds and actual one-MPDU DMA/terminal ownership described in §3. Software/native/physical validation remains pending; other-chip runtimes stay on their separate chip rows. |
 
 | `he_htc` | Implemented in HE recipe revision2 above; six native/shared regressions pass on both architectures. Row closed2026-10-29. |
 

@@ -51,6 +51,35 @@ impl Rings {
             .iter()
             .find_map(|ac| self.backlog[*ac as usize].pop_front())
     }
+    /// Keep the exact FIFO prefix of the selected AC. The station applies
+    /// actual ACM/TID/peer/size rules without skipping an ineligible member.
+    fn prefix(&self, qos_all: bool) -> Vec<&[u8]> {
+        let Some(first) = self.pending.as_ref() else {
+            return Vec::new();
+        };
+        let ac = if qos_all {
+            super::qos::Ac::of(super::qos::classify(first.payload()))
+        } else {
+            super::qos::Ac::BestEffort
+        };
+        core::iter::once(first.payload())
+            .chain(self.backlog[ac as usize].iter().map(Frame::payload))
+            .take(super::tx_amsdu::PREFIX)
+            .collect()
+    }
+    fn consumed(&mut self, count: usize, qos_all: bool) {
+        let Some(first) = self.pending.take() else {
+            return;
+        };
+        let ac = if qos_all {
+            super::qos::Ac::of(super::qos::classify(first.payload()))
+        } else {
+            super::qos::Ac::BestEffort
+        };
+        for _ in 1..count {
+            self.backlog[ac as usize].pop_front();
+        }
+    }
     fn clear(&mut self) {
         self.pending = None;
         for queue in &mut self.backlog {
@@ -436,14 +465,13 @@ impl<I: Io + 'static> Device<I> {
             if rings.pending.is_none() {
                 rings.pending = rings.next(self.local, owner.station_qos_all());
             }
-            if owner.station_ready() {
-                if let Some(frame) = rings.pending.as_ref() {
-                    match owner.station_send(frame.payload()) {
-                        Ok(()) => rings.pending = None,
-                        Err(Error::Busy)
-                        | Err(Error::Transport(super::packet_core::Error::Busy)) => {}
-                        Err(error) => return Err(error),
-                    }
+            if owner.station_ready() && rings.pending.is_some() {
+                let qos_all = owner.station_qos_all();
+                let result = owner.station_send_prefix(&rings.prefix(qos_all));
+                match result {
+                    Ok(count) => rings.consumed(count, qos_all),
+                    Err(Error::Busy) | Err(Error::Transport(super::packet_core::Error::Busy)) => {}
+                    Err(error) => return Err(error),
                 }
             }
             self.link(owner.station_peer(), owner.station_ready());

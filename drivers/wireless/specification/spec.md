@@ -527,6 +527,20 @@ metadata and formatting pass; full release/native gates
 remain at25 completed rows. Counting unvalidated implementations,82 remain;
 physical firmware/board acceptance is separate.
 
+**2026-11-02 — admitted TX aggregation source recount.** The ledger now
+holds **69 `feature`**, **31 `chip`** and **0 `unknown`** rows. Thirteen
+source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8852B standalone TX A-MSDU
+and nested A-MSDU-in-A-MPDU use original same-TID FIFO/native owners, separate
+full-program qualification, peer/chip/current-RC limits and sticky BA denial.
+Both single and batched sends check the exact station BA window before
+consuming PN/SN; held one-frame windows retain originals until real native
+terminals. Existing v2 profiles and receive promises stay unchanged. Five
+source/native cases are written and unexecuted; scoped formatting and one
+release metadata context pass. Full release/native gates remain at25 completed
+rows. Counting unvalidated implementations,82 remain; real signed measured
+inputs and physical firmware/board acceptance remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -537,7 +551,7 @@ physical firmware/board acceptance is separate.
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
-| rtw89 | 12 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW and periodic RF tracking/runtime LPS; bounded independent live functions are implemented pending validation; other AX/BE chips are separate rows |
+| rtw89 | 11 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW and periodic RF tracking/runtime LPS; bounded independent live functions and separately qualified standalone/nested TX A-MSDU are implemented pending validation; other AX/BE chips are separate rows |
 | brcmfmac | 11 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation; bounded shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 

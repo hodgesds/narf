@@ -117,7 +117,38 @@ fn unicast(address: &[u8]) -> bool {
     address.len() == 6 && address != [0; 6] && address[0] & 1 == 0
 }
 pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
-    if !(24..=MAX_MPDU).contains(&frame.len())
+    classify_with(frame, own, None)
+}
+pub(super) fn amsdu(frame: &[u8]) -> bool {
+    frame.first() == Some(&0x88) && frame.get(24).is_some_and(|q| q & 0x80 != 0)
+}
+pub(super) fn classify_with(
+    frame: &[u8],
+    own: [u8; 6],
+    limit: Option<usize>,
+) -> Result<Queue, Error> {
+    let aggregate = amsdu(frame);
+    if limit.is_some_and(|body| body == 0 || body > super::tx_amsdu::MAX_BODY) {
+        return Err(Error::Frame);
+    }
+    let maximum = if aggregate {
+        limit.ok_or(Error::Frame)?
+            + 26
+            + if frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+                16
+            } else {
+                0
+            }
+    } else {
+        MAX_MPDU
+    };
+    let minimum = if aggregate {
+        26 + 46 + if frame[1] & 0x40 != 0 { 16 } else { 0 }
+    } else {
+        24
+    };
+    if !(minimum..=maximum).contains(&frame.len())
+        || aggregate && (frame[1] & 0x80 != 0 || frame[16..22] != frame[4..10])
         || !unicast(&own)
         || frame[10..16] != own
         || frame[0] & 3 != 0
@@ -143,9 +174,10 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         // QoS DATA: TID0..7, normal ack policy; HE +HTC carries EOSP.
         0x88 if frame[1] & 3 == 1
             && unicast(&frame[4..10])
-            && frame
-                .get(24)
-                .is_some_and(|b| b & 0xe8 == 0 && (b & 0x10 != 0) == (frame[1] & 128 != 0))
+            && frame.get(24).is_some_and(|b| {
+                b & if aggregate { 0x68 } else { 0xe8 } == 0
+                    && (b & 0x10 != 0) == (frame[1] & 128 != 0)
+            })
             && frame.get(25) == Some(&0)
             && (frame[1] & 128 == 0
                 || frame.get(26..30).is_some_and(|control| control[0] & 3 == 3)) =>
@@ -208,7 +240,23 @@ pub(super) fn transmit_agg(
     rate: u8,
     agg: Option<Agg>,
 ) -> Result<(Vec<u8>, Queue), Error> {
-    let queue = classify(frame, own)?;
+    transmit_profile(
+        frame, own, mac_id, sequence, address, report, rate, agg, None,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn transmit_profile(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+    agg: Option<Agg>,
+    limit: Option<usize>,
+) -> Result<(Vec<u8>, Queue), Error> {
+    let queue = classify_with(frame, own, limit)?;
     if agg.is_some_and(|agg| agg.density > 7 || qos_tid(frame).is_none() || rate & FIRMWARE_RA == 0)
     {
         return Err(Error::Metadata);
@@ -228,7 +276,12 @@ pub(super) fn transmit_agg(
         return Err(Error::Metadata);
     }
     extent(address, frame.len())?;
-    let baseline = tx_transport::prepare_header(
+    let prepare = if amsdu(frame) {
+        tx_transport::prepare_header_amsdu
+    } else {
+        tx_transport::prepare_header
+    };
+    let baseline = prepare(
         ChipId::Rtl8852B,
         TxwdInfo {
             channel: queue.channel(),

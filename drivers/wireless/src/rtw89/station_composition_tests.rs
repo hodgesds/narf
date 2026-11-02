@@ -1,5 +1,7 @@
 //! Actual source controller and native packet model through public Device/DHCP.
 //! This fixture grants no production full-RF receipt or physical readiness.
+#[path = "station_amsdu_tests.rs"]
+mod amsdu_tests;
 #[path = "station_htc_tests.rs"]
 mod htc_tests;
 #[path = "station_multi_tests.rs"]
@@ -125,6 +127,9 @@ pub(super) struct Peer {
     pub(super) probes: Vec<Vec<u8>>,
     /// Answer an ADDBA Request with (status, buffer size); `None` ignores it.
     pub(super) addba: Option<(u16, u16)>,
+    /// Independent AP receive opt-in; old peer bytes remain unchanged.
+    allow_amsdu: bool,
+    aggregates: Vec<usize>,
 }
 impl Peer {
     /// A peer around a caller-built AP (WPA3-SAE, PMF profiles).
@@ -174,6 +179,8 @@ impl Peer {
             actions: Vec::new(),
             probes: Vec::new(),
             addba: None,
+            allow_amsdu: false,
+            aggregates: Vec::new(),
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -225,7 +232,7 @@ impl Peer {
                 (self.addba, frame.get(24..29))
             {
                 let tid = (u16::from_le_bytes([c0, c1]) >> 2) & 0xf;
-                let capab = 1u16 << 1 | tid << 2 | buf << 6;
+                let capab = u16::from(self.allow_amsdu) | 1u16 << 1 | tid << 2 | buf << 6;
                 let mut response = vec![0xd0, 0, 0, 0];
                 response.extend_from_slice(&self.plan.station);
                 response.extend_from_slice(&AP);
@@ -295,13 +302,17 @@ impl Peer {
         {
             return Err("native AP data protection/direction");
         }
+        let aggregate = frame[0] == 0x88 && frame.get(24).is_some_and(|q| q & 0x80 != 0);
+        if aggregate && (!self.allow_amsdu || frame[16..22] != AP || frame[1] & 0x80 != 0) {
+            return Err("AP unadmitted A-MSDU");
+        }
         let mut priority = 0;
         let header = if self.qos {
             let tid = frame.get(24).copied().ok_or("AP QoS control")?;
             priority = tid & 15;
             let htc = frame[1] & 0x80 != 0;
             if frame.get(25) != Some(&0)
-                || tid & 0xe8 != 0
+                || tid & if aggregate { 0x68 } else { 0xe8 } != 0
                 || (!self.qos_all && priority != 0)
                 || (tid & 0x10 != 0) != htc
                 || htc && (!self.station_he || frame.get(26..30) != Some(&[0x1b, 0, 0, 0]))
@@ -330,6 +341,28 @@ impl Peer {
                 &mut body,
             )
             .map_err(|_| "AP uplink CCMP/MIC/replay")?;
+        }
+        if aggregate {
+            let ht = self.ht.as_deref().ok_or("AP aggregate without HT")?;
+            let limit =
+                narf_wireless::amsdu::Limit::from_ht_capability(u16::from_le_bytes([ht[2], ht[3]]));
+            if body.len() > 5000 {
+                return Err("AP chip A-MSDU limit");
+            }
+            let frames = narf_wireless::amsdu::decode_with_limit(&body, AP, AP, limit)
+                .map_err(|_| "AP aggregate body")?;
+            if frames.len() < 2 || frames.iter().any(|f| f[6..12] != self.plan.station) {
+                return Err("AP exact aggregate source/count");
+            }
+            self.aggregates.push(frames.len());
+            let mut replies = Vec::new();
+            for ethernet in frames {
+                self.uplink.push(ethernet.clone());
+                if let Some(reply) = self.server.receive(&ethernet) {
+                    replies.push(self.downlink(&reply)?);
+                }
+            }
+            return Ok((replies, self.hold_data));
         }
         if body.get(..6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0]) {
             return Err("native AP RFC1042 extent");
@@ -489,6 +522,14 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_he_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra && self.ht && self.he)
+    }
+    fn station_amsdu_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm
+            && self.firmware_ra
+            && self.ht
+            && self.ampdu
+            && self.packets.amsdu == Some(5000))
     }
     fn station_ampdu_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
@@ -651,6 +692,9 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         )?;
         if self.wmm && self.firmware_ra && self.ht && self.ampdu {
             core.enable_aggregation()?;
+            if self.packets.amsdu == Some(5000) {
+                core.enable_amsdu(5000)?;
+            }
         }
         self.core = Some(core);
         Ok(())
@@ -804,7 +848,7 @@ impl Harness {
         ht: bool,
         he: Option<(bool, &[u8])>,
     ) -> Self {
-        Self::build_full(protected, wmm, qos_all, rates, ht, he, false)
+        Self::build_full(protected, wmm, qos_all, rates, ht, he, (false, false))
     }
     /// `ampdu`: the signed aggregate program is granted.
     fn build_full(
@@ -814,11 +858,13 @@ impl Harness {
         rates: Option<&[u8]>,
         ht: bool,
         he: Option<(bool, &[u8])>,
-        ampdu: bool,
+        aggregation: (bool, bool),
     ) -> Self {
+        let (ampdu, amsdu) = aggregation;
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
         io.ampdu = ampdu;
+        io.packets.amsdu = amsdu.then_some(5000);
 
         io.wmm = wmm;
         io.qos_all = qos_all;
@@ -846,6 +892,7 @@ impl Harness {
             peer.lock().wmm = Some(WMM.to_vec());
             peer.lock().qos_all = qos_all;
         }
+        peer.lock().allow_amsdu = amsdu;
         let plan = peer.lock().plan;
         let actor = peer.clone();
         io.packets.reaction = Some(Arc::new(move |bytes| {
@@ -2472,7 +2519,15 @@ kernel_test_in!(
 
 fn ampdu_harness(granted: bool, addba: Option<(u16, u16)>) -> Harness {
     const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
-    let h = Harness::build_full(false, true, false, Some(&RATES), true, None, granted);
+    let h = Harness::build_full(
+        false,
+        true,
+        false,
+        Some(&RATES),
+        true,
+        None,
+        (granted, false),
+    );
     h.peer.lock().addba = addba;
     h
 }

@@ -238,6 +238,9 @@ pub(super) struct Originator {
     last_request: [u64; 8],
     /// `RTW89_TXQ_F_FORBID_BA` until this ms.
     forbid_until: [u64; 8],
+    /// Linux IEEE80211_TXQ_NO_AMSDU is denial-only and persists for this
+    /// peer's TXQ after DELBA; a later positive response does not clear it.
+    no_amsdu: [bool; 8],
 }
 impl Originator {
     /// `rtw89_core_txq_check_agg` + `ieee80211_start_tx_ba_session` gates:
@@ -276,8 +279,16 @@ impl Originator {
         status: u16,
         tid: u8,
         buf_size: u16,
+        amsdu: bool,
     ) -> Option<u16> {
         let t = usize::from(tid);
+        // Match mac80211's pre-dialog denial. Even an unsolicited response
+        // from the already-validated peer may restrict, never grant, its TXQ.
+        if !amsdu {
+            if let Some(denied) = self.no_amsdu.get_mut(t) {
+                *denied = true;
+            }
+        }
         match self.tids.get(t).copied().flatten() {
             Some(TxState::Requested { token: sent, .. }) if sent == token => {}
             _ => return None,
@@ -315,6 +326,14 @@ impl Originator {
             Some(TxState::Operational { buf }) => Some(buf),
             _ => None,
         }
+    }
+    /// Actual peer TXQ A-MSDU permission, independent of BA buffer size.
+    /// Initial standalone A-MSDU remains eligible; an observed denial is
+    /// sticky across session stop/retry until the physical peer is retired.
+    pub(super) fn amsdu_allowed(&self, tid: u8) -> bool {
+        self.no_amsdu
+            .get(usize::from(tid))
+            .is_some_and(|denied| !*denied)
     }
     /// A session is being set up (frames for the TID are held, like
     /// mac80211's `tid_tx->pending`).

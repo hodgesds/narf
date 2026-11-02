@@ -136,6 +136,10 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_he_allowed()
     }
+    fn station_amsdu_allowed(&mut self) -> Result<bool, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_amsdu_allowed()
+    }
     fn station_ampdu_allowed(&mut self) -> Result<bool, power::Error> {
         self.station_allowed()?;
         self.station_native()?.station_ampdu_allowed()
