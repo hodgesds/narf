@@ -1563,10 +1563,14 @@ pub mod tests {
             );
         }
         let writes = fake.writes.borrow();
+        // ENABLE is the stop request. The RMW may carry the previous
+        // read-only STATE bit; hardware/model owns its acknowledged value.
+        // The dispatcher must observe STATE clear before RGB bypass, while
+        // this write-order assertion checks the request precedes that setup.
         let disabled = writes
             .iter()
-            .position(|&(r, v)| r == PIPECONF_OFF && v & (3 << 30) == 0)
-            .unwrap();
+            .position(|&(r, v)| r == PIPECONF_OFF && v & (1 << 31) == 0)
+            .expect("CONF stop request before RGB bypass");
         let color = writes
             .iter()
             .position(|&(r, v)| r == 0x701cc && v == 1 << 13)
