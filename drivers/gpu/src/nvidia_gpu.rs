@@ -233,8 +233,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
+    // A wrong vendor behind the class backstop is an identity
+    // mismatch, not a broken device: decline with
+    // `NotForThisDriver` so `probe_all` falls through to the next
+    // candidate (bus spec §9.3). `BadDevice` below stays reserved
+    // for post-identity bring-up failures.
     if device.id.vendor != NVIDIA_VENDOR {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     narf_bus::pci::set_command(
         &cap,

@@ -178,8 +178,13 @@ static NEXT_CARD_INDEX: AtomicU32 = AtomicU32::new(0);
 /// Multi-card: every successful probe pushes a fresh card onto the
 /// global list.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    // A wrong vendor behind the class backstop is an identity
+    // mismatch, not a broken device: decline with
+    // `NotForThisDriver` so `probe_all` falls through to the next
+    // candidate (bus spec §9.3). `BadDevice` below stays reserved
+    // for post-identity bring-up failures.
     if device.id.vendor != NVIDIA_VENDOR {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     // Refuse duplicate enumeration of the same PCI function (the
     // bus layer can hit a vendor match and a class match for the

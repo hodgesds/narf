@@ -18,6 +18,7 @@ narf-kernel-test     = { path = "../../verification/kernel-test" }
 narf-driver-runtime  = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-drivers         = { path = ".." }
 narf-bus             = { path = "../../bus" }
+narf-memory          = { path = "../../memory" }
 narf-init            = { path = "../../init" }
 narf-edid            = { path = "../../edid" }
 narf-graphics        = { path = "../../graphics" }
