@@ -37,28 +37,23 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     }
     // `CLASS(fd, f)(fd)` is `fdget`, which does not see O_PATH descriptors:
     // an O_PATH fd is -EBADF here, as for read/write.
-    let arc_ops = fd::with_table(task, |t| {
-        t.get(fd)
-            .filter(|_| t.status_flags(fd).is_some_and(|f| f & crate::fd::O_PATH == 0))
-            .map(|e| e.ops.clone())
-    })
-    .flatten();
-    let arc_ops = match arc_ops {
-        Some(a) => a,
-        None => {
+    // A legacy park abandons these syscall frames with longjmp. Finish the
+    // attempt and drop its owned references before either waiting path.
+    let acquired = {
+        let Some(file) = copy_fd_endpoint(task, fd) else {
             ctx.set_return(errno_ret(EBADF));
             return;
-        }
+        };
+        let arc_ops = &file.ops;
+        let file_ptr = alloc::sync::Arc::as_ptr(arc_ops) as *const () as usize;
+        // The lock is owned by the open file description (`fl_file`), not the
+        // task: dup/fork aliases share one lock, and two independent opens in
+        // one process must conflict. Resolve operations and owner together,
+        // retaining the description through this attempt even on a close race.
+        let owner = file.description.lock_owner();
+        let (dev, ino) = (arc_ops.inode_attrs().dev, arc_ops.ino());
+        flock_try(file_ptr, op, owner, dev, ino).is_ok()
     };
-    let file_ptr = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    // The lock is owned by the open file description (`fl_file`), not the
-    // task: dup/fork aliases share one lock, and two independent opens in
-    // one process must conflict.
-    let Some(owner) = fd::with_table(task, |t| t.description_lock_owner(fd)).flatten() else {
-        ctx.set_return(errno_ret(EBADF));
-        return;
-    };
-    let (dev, ino) = (arc_ops.inode_attrs().dev, arc_ops.ino());
     let nonblock = op & LOCK_NB != 0;
     // The blocking path retries by parking via the yield hook and
     // re-executing the syscall on resume (a longjmp clippy can't see),
@@ -66,7 +61,7 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     // `never_loop`. The `loop` keeps the retry intent explicit.
     #[allow(clippy::never_loop)]
     loop {
-        if flock_try(file_ptr, op, owner, dev, ino).is_ok() {
+        if acquired {
             ctx.set_return(SyscallReturn::ok(0));
             return;
         }

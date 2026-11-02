@@ -557,6 +557,18 @@ the resolved filesystem path after applying the task root, so a mutation made
 through a chroot reaches a watch established through that same chroot.
 Connected
 stream receive operations honor `MSG_PEEK` without consuming queued bytes.
+Connected AF_UNIX ancillary sends use the same recorded-reader targeting and
+readiness-generation guard as ordinary data sends, with broadcast fallback
+when the reader is unknown. Durable per-ring observers retain their readiness
+notifications independently of that legacy wake target.
+Each ring operation publishes its readiness level and activity event together,
+notifying ordinary observers once and selecting at most one exclusive waiter
+per ready direction.
+Blocking connected AF_UNIX stream calls retain non-exclusive wait semantics.
+Ordinary poll observers retain their existing delivery. Terminal close wakes
+all waiters to observe EOF or `EPIPE`.
+State sampling and readiness publication are serialized per ring, so an older
+occupancy/close sample cannot replace a newer published level.
 Connected AF_UNIX `SOCK_SEQPACKET` and datagram socketpairs retain one record
 per send; receive consumes at most one record and reports truncation through
 the existing `MSG_TRUNC` result path. Per-record `SCM_RIGHTS` and
@@ -569,7 +581,9 @@ Invalid SCM_RIGHTS descriptors fail `sendmsg` with `EBADF` without sending the
 payload. A received descriptor retains the sender's file status flags, including
 `O_NONBLOCK`; sender fd-slot flags are not copied, and `FD_CLOEXEC` is set only
 when the receiver requests `MSG_CMSG_CLOEXEC`. Insufficient ancillary space
-reports `MSG_CTRUNC`. On byte-stream Unix
+reports `MSG_CTRUNC`. Inline message scratch storage and its heap fallback
+preserve the native iovec limits, complete descriptor-import validation, and
+ancillary truncation/rollback behavior. On byte-stream Unix
 sockets, rights are associated with the first byte of their `sendmsg`; they are
 delivered only by a receive that reaches that byte, and an ordinary
 `read`/`recv` consumes and discards them rather than exposing them to a later
@@ -589,10 +603,14 @@ Writers retain the per-table lock and publish slot replacement before releasing
 the previous file/description. A reader upgrades weak file and description
 references, revalidates both the directory and slot identity, and leaves its
 RCU read section before I/O or parking; the returned references own their
-lifetimes. Retired metadata contains only weak references, so grace periods
-do not postpone last-description close effects. Directory growth follows the
-table's geometric capacity; all RCU metadata allocations are fallible and
-allocation failure falls back to locked lookup. Close clears a slot without
+lifetimes. `flock` obtains its operations and owner from one slot and retains
+that description through each acquisition attempt even if a shared-table peer
+closes the descriptor concurrently. Owned references are released before a
+retry parks, including the legacy nonlocal-yield path. Retired metadata contains
+only weak references, so grace periods do not postpone last-description close
+effects. Directory growth follows the table's geometric capacity; all RCU
+metadata allocations are fallible and allocation failure falls back to locked
+lookup. Close clears a slot without
 allocating, and metadata allocation runs outside read sections.
 IRQ table access permanently selects that locked fallback without invoking
 RCU. Whole-table replacement also invalidates the read view. `FdTable::get_mut`
