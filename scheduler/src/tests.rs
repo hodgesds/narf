@@ -3252,6 +3252,56 @@ fn smoke_scheduler_quantum_unit_default_nanos() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_quantum_unit_default_nanos);
 
+// Unsupported instruction-policy installation must be atomic with respect to
+// both the active unit and policy publication. Runs even without the feature.
+fn smoke_scheduler_instruction_unit_availability() -> TestResult {
+    use crate::{
+        active_quantum_unit, current_scheduler_name, install_scheduler, ClassScheduler, CpuId,
+        QuantumUnit, RunQueue, SchedPolicy, Scheduler, SchedulerError, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    struct InstructionsPolicy;
+    impl Scheduler for InstructionsPolicy {
+        fn name(&self) -> &'static str {
+            "instructions-test"
+        }
+        fn quantum_unit(&self) -> QuantumUnit {
+            QuantumUnit::Instructions
+        }
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            queue.front()
+        }
+    }
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("could not install baseline policy");
+    }
+    #[cfg(feature = "instruction-quantum")]
+    let available = crate::instructions::available();
+    #[cfg(not(feature = "instruction-quantum"))]
+    let available = false;
+    let result = install_scheduler(&cap, InstructionsPolicy);
+    let passed = if available {
+        result.is_ok()
+            && active_quantum_unit() == QuantumUnit::Instructions
+            && current_scheduler_name() == Some("instructions-test")
+    } else {
+        result == Err(SchedulerError::InstructionModeUnavailable)
+            && active_quantum_unit() == QuantumUnit::Nanos
+            && current_scheduler_name() == Some("class")
+    };
+    let restored = install_scheduler(&cap, ClassScheduler).is_ok();
+    if !passed || !restored {
+        return TestResult::Fail("instruction mode availability/publication contract");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/instructions",
+    smoke_scheduler_instruction_unit_availability
+);
+
 // A policy declaring `QuantumUnit::Cycles` must be REFUSED at install while PMU
 // cycle scheduling has no backend (no `pmu` feature) — a truthful contract, not
 // a silent downgrade — and the refusal must leave the active unit AND the live

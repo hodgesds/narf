@@ -86,6 +86,9 @@ mod hrtick;
 #[cfg(feature = "pmu")]
 mod pmu;
 
+#[cfg(feature = "instruction-quantum")]
+mod instructions;
+
 mod tests;
 
 pub use accounting::{
@@ -2759,6 +2762,8 @@ pub fn init() {
         // call `__reset_queues_for_test` explicitly.
         panic!("narf_scheduler::init() called twice — would wipe spawned tasks; use __reset_queues_for_test in tests");
     }
+    #[cfg(feature = "instruction-quantum")]
+    instructions::init_current_cpu();
     for (cpu, q) in READY.iter().enumerate() {
         *q.lock() = Some(VecDeque::new());
         *PARKED[cpu].lock() = Some(ParkedTasks::new());
@@ -4135,6 +4140,10 @@ pub struct StackfulOptions {
     /// Per-task TSC slice in cycles. Default
     /// `stackful::DEFAULT_SLICE_CYCLES` (~10 ms on 3.3 GHz Zen2).
     pub slice_cycles: u64,
+    /// Retired instructions allowed per continuation entry when the installed
+    /// policy uses `QuantumUnit::Instructions`. `slice_cycles` remains an
+    /// independent time ceiling. Ignored by the other quantum units.
+    pub instruction_limit: u64,
     /// When true, the trap-handler hook skips preempting this
     /// task. Use for drivers that hold hardware locks across an
     /// `.await`-free region.
@@ -4154,6 +4163,7 @@ impl Default for StackfulOptions {
     fn default() -> Self {
         Self {
             slice_cycles: stackful::DEFAULT_SLICE_CYCLES,
+            instruction_limit: stackful::DEFAULT_SLICE_INSTRUCTIONS,
             no_preempt: false,
             user_preempt: false,
             stack_bytes: stackful::DEFAULT_KERNEL_STACK_BYTES,
@@ -7262,6 +7272,8 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
 }
 
 pub fn run_forever() -> ! {
+    #[cfg(feature = "instruction-quantum")]
+    instructions::init_current_cpu();
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
         cpu

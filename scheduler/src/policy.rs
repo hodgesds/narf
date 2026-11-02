@@ -64,6 +64,9 @@ pub enum SchedulerError {
     /// install (e.g. an un-virtualized-PMU VM). `Cycles` is refused rather than
     /// silently downgraded so `quantum_unit()` stays a truthful contract.
     CycleModeUnavailable,
+    /// Instruction quanta are not compiled in, or at least one online CPU
+    /// lacks a prepared, advancing, dedicated retired-instruction counter.
+    InstructionModeUnavailable,
 }
 
 impl From<CapError> for SchedulerError {
@@ -225,8 +228,8 @@ pub struct CpuSchedContext {
     pub elapsed: u64,
     /// The resolved [`QuantumUnit`] the core enforces the per-task SLICE in:
     /// `Nanos` compares TSC-elapsed against the slice, `Cycles` compares APERF
-    /// work-cycles. It is the unit a policy should size its per-task slice
-    /// magnitudes in (0.75 ms is a very different integer in ns vs PMU-cycles).
+    /// work-cycles. `Instructions` uses `StackfulOptions::instruction_limit`
+    /// alongside the independent TSC `slice_cycles` ceiling.
     /// NOTE: only slice expiry is unit-aware — `elapsed`, `vfloor`, and
     /// `current.vruntime`/`vdeadline` are always TSC cycles (the EEVDF virtual
     /// clock is TSC-based regardless of the quantum unit). Equals the installed
@@ -437,6 +440,13 @@ pub enum QuantumUnit {
     /// usable hardware source; otherwise install is refused with
     /// [`SchedulerError::CycleModeUnavailable`].
     Cycles = 1,
+    /// Dedicated retired-instruction allowance, sampled on timer ticks with
+    /// syscall rescheduling deferred to safe exit. Requires `instruction-quantum`
+    /// and a prepared counter on every online CPU. `instruction_limit` and
+    /// `slice_cycles` are separate: either exhausted boundary ends the slice
+    /// when another task is runnable. Virtual runtime and bandwidth caps remain
+    /// time-based. Unsupported explicit installs are refused.
+    Instructions = 2,
 }
 
 pub trait Scheduler: Any + Send + Sync + 'static {
@@ -1054,10 +1064,10 @@ fn store_active_quantum_unit(base: QuantumUnit) {
 /// The hot path selects its clock on this; policy hooks read it (also via
 /// `CpuSchedContext::quantum_unit`) to interpret the values they are handed.
 pub fn active_quantum_unit() -> QuantumUnit {
-    if ACTIVE_QUANTUM_UNIT.load(Ordering::Acquire) == QuantumUnit::Cycles as u8 {
-        QuantumUnit::Cycles
-    } else {
-        QuantumUnit::Nanos
+    match ACTIVE_QUANTUM_UNIT.load(Ordering::Acquire) {
+        1 => QuantumUnit::Cycles,
+        2 => QuantumUnit::Instructions,
+        _ => QuantumUnit::Nanos,
     }
 }
 
@@ -1091,6 +1101,13 @@ fn resolve_quantum_unit(base: QuantumUnit) -> Result<QuantumUnit, SchedulerError
             {
                 Err(SchedulerError::CycleModeUnavailable)
             }
+        }
+        QuantumUnit::Instructions => {
+            #[cfg(feature = "instruction-quantum")]
+            if crate::instructions::available() {
+                return Ok(QuantumUnit::Instructions);
+            }
+            Err(SchedulerError::InstructionModeUnavailable)
         }
     }
 }

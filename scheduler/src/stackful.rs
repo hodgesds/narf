@@ -72,6 +72,10 @@ use narf_arch::x86_64::trap_frame::TrapFrame;
 /// and is short enough that one busy-looping task can't hold the
 /// CPU long enough to be visible.
 pub const DEFAULT_SLICE_CYCLES: u64 = 33_000_000;
+/// Default work allowance for the opt-in instruction quantum. The independent
+/// time ceiling remains `DEFAULT_SLICE_CYCLES`; neither value is a conversion
+/// of the other or a claim about application-level progress.
+pub const DEFAULT_SLICE_INSTRUCTIONS: u64 = 1_000_000;
 
 /// Default vector the trap handler dispatches preemption on.
 /// Matches `narf_interrupts::VECTOR_TIMER` (32) — re-declared
@@ -523,7 +527,9 @@ pub fn set_user_perf_switch_hook(hook: fn(u64, bool)) {
 }
 
 #[inline]
-fn user_perf_switch(task: u64, running: bool) {
+fn user_perf_switch(task: u64, running: bool, _kernel_task: &KernelTask) {
+    #[cfg(feature = "instruction-quantum")]
+    instruction_switch(_kernel_task, running);
     // The userspace perf registry owns this global fast gate and toggles it on
     // the same 0<->1 live-event transitions that make the switch hook useful.
     // Keep ordinary task switches to one predictable load/branch rather than
@@ -1203,8 +1209,8 @@ unsafe fn try_direct_handoff(
         debug_assert!(old.is_null(), "nested direct target publication");
         direct_state.active.store(true, Ordering::Release);
 
-        user_perf_switch(source_cell.task, false);
-        user_perf_switch(target.id, true);
+        user_perf_switch(source_cell.task, false, source_ref);
+        user_perf_switch(target.id, true, target_ref);
         narf_arch::set_current_domain_byte(target_ref.domain_byte.load(Ordering::Relaxed));
         // SAFETY: target AS/TLS/stack state was validated and published above.
         unsafe { prepare_direct_arch_state(target_ref) };
@@ -1294,8 +1300,8 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
     drop(displaced);
     narf_arch::set_current_domain_byte(root_ref.domain_byte.load(Ordering::Relaxed));
     // SAFETY: same owned target-cell reference established above.
-    user_perf_switch(unsafe { (*target).task }, false);
-    user_perf_switch(root_cell.task, true);
+    user_perf_switch(unsafe { (*target).task }, false, current_ref);
+    user_perf_switch(root_cell.task, true, root_ref);
 }
 
 /// Return an active direct target to its exact runnable root task.
@@ -1651,6 +1657,24 @@ fn this_cpu() -> usize {
 fn stamp_slice_start(task: &KernelTask, cpu: usize) {
     let now = narf_time::now_cycles();
     task.tsc_started.store(now, Ordering::Release);
+    #[cfg(feature = "instruction-quantum")]
+    {
+        // Capture the mode with its baseline. A rolling policy replacement
+        // cannot make an in-flight slice interpret an old baseline in a new
+        // unit. Its next entry picks up the new mode and a fresh local sample.
+        task.instruction_slice_active
+            .store(false, Ordering::Release);
+        let start = if crate::active_quantum_unit() == crate::QuantumUnit::Instructions {
+            Some(crate::instructions::sample().expect("instruction quantum CPU is not prepared"))
+        } else {
+            None
+        };
+        let active = start.is_some();
+        task.instruction_used.store(0, Ordering::Relaxed);
+        *task.instruction_started.lock() = start;
+        task.instruction_slice_active
+            .store(active, Ordering::Release);
+    }
     // pmu: in Cycles mode also snapshot APERF, so the slice is measured in actual
     // (frequency-invariant) work-cycles consumed this slice rather than wall-time.
     #[cfg(feature = "pmu")]
@@ -1667,6 +1691,53 @@ fn stamp_slice_start(task: &KernelTask, cpu: usize) {
     let _ = cpu;
 }
 
+/// Attribute only this continuation's execution. Direct handoffs and nested
+/// stackful polls pause the source before entering a peer and resume it with
+/// its already-consumed allowance, so peer work never spends its quantum.
+#[cfg(feature = "instruction-quantum")]
+fn instruction_switch(task: &KernelTask, running: bool) {
+    instruction_switch_using(task, running, crate::instructions::sample);
+}
+
+#[cfg(feature = "instruction-quantum")]
+fn instruction_switch_using(
+    task: &KernelTask,
+    running: bool,
+    sample: impl FnOnce() -> Option<crate::instructions::Sample>,
+) {
+    if !task.instruction_slice_active.load(Ordering::Acquire) {
+        return;
+    }
+    let mut start = task.instruction_started.lock();
+    if running {
+        *start = sample();
+        if start.is_none() {
+            task.instruction_used.store(u64::MAX, Ordering::Release);
+        }
+    } else if let Some(previous) = start.take() {
+        let elapsed = sample()
+            .and_then(|now| now.elapsed_since(previous))
+            .unwrap_or(u64::MAX);
+        let used = task.instruction_used.load(Ordering::Relaxed);
+        task.instruction_used
+            .store(used.saturating_add(elapsed), Ordering::Release);
+    }
+}
+
+#[cfg(feature = "instruction-quantum")]
+fn instruction_elapsed_using(
+    task: &KernelTask,
+    sample: impl FnOnce() -> Option<crate::instructions::Sample>,
+) -> Option<u64> {
+    let start = task.instruction_started.lock();
+    let elapsed = sample()?.elapsed_since((*start)?)?;
+    Some(
+        task.instruction_used
+            .load(Ordering::Acquire)
+            .saturating_add(elapsed),
+    )
+}
+
 /// Whether the running task has exhausted its slice, honoring the active
 /// [`crate::QuantumUnit`]. Nanos (default): compare the TSC-elapsed cycles the
 /// caller already computed. Cycles (`pmu`): compare APERF work-cycles consumed
@@ -1675,6 +1746,24 @@ fn stamp_slice_start(task: &KernelTask, cpu: usize) {
 /// plain `tsc_elapsed >= slice` when `pmu` is off (byte-identical default).
 #[inline]
 fn slice_expired_unit_aware(task: &KernelTask, tsc_elapsed: u64, slice: u64) -> bool {
+    #[cfg(feature = "instruction-quantum")]
+    if task.instruction_slice_active.load(Ordering::Acquire) {
+        if tsc_elapsed >= slice {
+            return true;
+        }
+        // A mismatched CPU or unavailable clock cannot manufacture a huge
+        // credit: request a safe reschedule instead of subtracting counters
+        // from different CPUs. Every actual re-entry stamps its own baseline.
+        let elapsed = instruction_elapsed_using(task, crate::instructions::sample);
+        return elapsed.is_none_or(|instructions| {
+            crate::instructions::expired(
+                tsc_elapsed,
+                slice,
+                instructions,
+                task.instruction_limit.load(Ordering::Acquire),
+            )
+        });
+    }
     #[cfg(feature = "pmu")]
     if crate::active_quantum_unit() == crate::QuantumUnit::Cycles {
         let work_elapsed = crate::pmu::read_work_cycles()
@@ -1837,6 +1926,16 @@ pub struct KernelTask {
     /// when the active quantum unit is Cycles. Present only under `pmu`.
     #[cfg(feature = "pmu")]
     work_started: AtomicU64,
+    /// Captured instruction-mode slice and CPU-local accounting baseline.
+    /// Never read a newly installed mode against a previous slice's sample.
+    #[cfg(feature = "instruction-quantum")]
+    instruction_slice_active: AtomicBool,
+    #[cfg(feature = "instruction-quantum")]
+    instruction_started: narf_lib::sync::IrqSafeSpinLock<Option<crate::instructions::Sample>>,
+    #[cfg(feature = "instruction-quantum")]
+    instruction_used: AtomicU64,
+    #[cfg(feature = "instruction-quantum")]
+    instruction_limit: AtomicU64,
     /// Per-task time slice in TSC cycles. Default
     /// `DEFAULT_SLICE_CYCLES`. Set via `with_slice_cycles` at
     /// spawn time for drivers that need bigger slices.
@@ -2050,6 +2149,14 @@ impl KernelTask {
             tsc_started: AtomicU64::new(0),
             #[cfg(feature = "pmu")]
             work_started: AtomicU64::new(0),
+            #[cfg(feature = "instruction-quantum")]
+            instruction_slice_active: AtomicBool::new(false),
+            #[cfg(feature = "instruction-quantum")]
+            instruction_started: narf_lib::sync::IrqSafeSpinLock::new(None),
+            #[cfg(feature = "instruction-quantum")]
+            instruction_used: AtomicU64::new(0),
+            #[cfg(feature = "instruction-quantum")]
+            instruction_limit: AtomicU64::new(DEFAULT_SLICE_INSTRUCTIONS),
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
             need_resched: AtomicBool::new(false),
             no_preempt: AtomicBool::new(false),
@@ -2217,6 +2324,9 @@ impl KernelTask {
             // SAFETY: `saved_current` is the synchronously executing outer
             // task on this CPU and remains pinned across the nested poll.
             user_fpu_save_task(this_cpu(), unsafe { &*saved_current });
+            #[cfg(feature = "instruction-quantum")]
+            // SAFETY: the pinned outer continuation remains live across the nested poll.
+            instruction_switch(unsafe { &*saved_current }, false);
         }
         // SAFETY: ctx + exec_ctx both live for the duration of
         // this call; the task's stack was allocated by us and is
@@ -2332,7 +2442,7 @@ impl KernelTask {
         let prev_exec = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
         guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
         let perf_task = crate::current_task_id().raw();
-        user_perf_switch(perf_task, true);
+        user_perf_switch(perf_task, true, self);
         // SAFETY: Valid memory or trusted environment
         // The reported domain follows the task, the way the hardware
         // enforcement state already does inside `ctx`. Restored before the
@@ -2391,7 +2501,7 @@ impl KernelTask {
         // with attribution, before the scribbled heap is touched
         // further (see check_stack_canary).
         self.check_stack_canary();
-        user_perf_switch(perf_task, false);
+        user_perf_switch(perf_task, false, self);
         // Restore the EXEC_CTX slot contents that were live before this poll, so
         // a nested poll leaves the OUTER task's saved continuation intact (see
         // the snapshot comment above).
@@ -2417,6 +2527,9 @@ impl KernelTask {
                 // before the outer kernel continuation resumes.
                 // SAFETY: same pinned outer-task invariant as the save above.
                 user_fpu_restore_task(cpu, unsafe { &*saved_current });
+                #[cfg(feature = "instruction-quantum")]
+                // SAFETY: the same pinned outer continuation is resuming on this CPU.
+                instruction_switch(unsafe { &*saved_current }, true);
             }
         }
         self.exec_ctx
@@ -2475,6 +2588,9 @@ impl KernelTask {
             // SAFETY: `saved_current` is the synchronously executing outer
             // task on this CPU and remains pinned across the nested poll.
             user_fpu_save_task(cpu, unsafe { &*saved_current });
+            #[cfg(feature = "instruction-quantum")]
+            // SAFETY: the pinned outer continuation remains live across this nested poll.
+            instruction_switch(unsafe { &*saved_current }, false);
         }
         if self.user_tls_valid.load(Ordering::Acquire) {
             let tls_base = self.user_fs_base.load(Ordering::Relaxed);
@@ -2488,7 +2604,7 @@ impl KernelTask {
         let previous = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
         guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
         let perf_task = crate::current_task_id().raw();
-        user_perf_switch(perf_task, true);
+        user_perf_switch(perf_task, true, self);
         // SAFETY: both contexts and the task-owned stack remain live.
         // The reported domain follows the task, the way the hardware
         // enforcement state already does inside `ctx`. Restored before the
@@ -2539,13 +2655,16 @@ impl KernelTask {
             .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
         narf_arch::set_current_domain_byte(narf_lib::id::DomainId::FRAME.raw());
         self.check_stack_canary();
-        user_perf_switch(perf_task, false);
+        user_perf_switch(perf_task, false, self);
         // SAFETY: same exclusive per-CPU slot as above.
         unsafe { core::ptr::write(exec_ctx as *mut KernelContext, previous) };
         CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(saved_current, Ordering::Release);
         if !saved_current.is_null() {
             // SAFETY: same pinned outer-task invariant as the save above.
             user_fpu_restore_task(resumed_cpu, unsafe { &*saved_current });
+            #[cfg(feature = "instruction-quantum")]
+            // SAFETY: the same pinned outer continuation is resuming on this CPU.
+            instruction_switch(unsafe { &*saved_current }, true);
         }
         self.exec_ctx
             .store(core::ptr::null_mut(), Ordering::Release);
@@ -2579,6 +2698,12 @@ impl KernelTask {
     /// overhead at the cost of latency.
     pub fn set_slice_cycles(&self, cycles: u64) {
         self.slice_cycles.store(cycles, Ordering::Release);
+    }
+
+    /// Set the retired-instruction allowance independently of the time ceiling.
+    #[cfg(feature = "instruction-quantum")]
+    pub fn set_instruction_limit(&self, limit: u64) {
+        self.instruction_limit.store(limit, Ordering::Release);
     }
 
     /// Build a no-op `Waker` for tasks that don't have a real
@@ -4228,6 +4353,8 @@ impl StackfulAdapter {
         // Cache opts on the adapter for `apply_options` — keep
         // a simple atomic-set pattern; opts are tiny.
         me.inner.set_slice_cycles(opts.slice_cycles);
+        #[cfg(feature = "instruction-quantum")]
+        me.inner.set_instruction_limit(opts.instruction_limit);
         me.inner.set_no_preempt(opts.no_preempt);
         me.inner.set_user_preempt(opts.user_preempt);
         me
@@ -4305,6 +4432,36 @@ pub mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[cfg(feature = "instruction-quantum")]
+    fn smoke_instruction_slice_preserves_credit_across_peer_execution() -> TestResult {
+        use crate::instructions::Sample;
+        let task = KernelTask::new(async {});
+        task.instruction_slice_active.store(true, Ordering::Release);
+        *task.instruction_started.lock() = Some(Sample::for_test(100));
+        instruction_switch_using(&task, false, || Some(Sample::for_test(140)));
+        instruction_switch_using(&task, true, || Some(Sample::for_test(1140)));
+        if instruction_elapsed_using(&task, || Some(Sample::for_test(1160))) != Some(60) {
+            return TestResult::Fail(
+                "peer execution spent or refunded the source instruction allowance",
+            );
+        }
+        instruction_switch_using(&task, false, || None);
+        if task.instruction_used.load(Ordering::Acquire) != u64::MAX {
+            return TestResult::Fail("missing clock manufactured instruction credit");
+        }
+        task.instruction_slice_active
+            .store(false, Ordering::Release);
+        if slice_expired_unit_aware(&task, 0, 100) {
+            return TestResult::Fail("inactive instruction state changed a time-mode slice");
+        }
+        TestResult::Pass
+    }
+    #[cfg(feature = "instruction-quantum")]
+    kernel_test_in!(
+        "scheduler/instructions",
+        smoke_instruction_slice_preserves_credit_across_peer_execution
+    );
 
     fn smoke_preempt_disable_nests_and_unwinds() -> TestResult {
         let before = preempt_count();
@@ -6191,6 +6348,7 @@ pub mod tests {
         }
         let opts = crate::StackfulOptions {
             slice_cycles: 42_000_000,
+            instruction_limit: 123_456,
             no_preempt: true,
             user_preempt: true,
             stack_bytes: 32 * 1024,
@@ -6198,6 +6356,10 @@ pub mod tests {
         let adapter = StackfulAdapter::with_options(NoopPending, opts);
         if adapter.inner.slice_cycles.load(Ordering::Acquire) != 42_000_000 {
             return TestResult::Fail("slice_cycles not applied");
+        }
+        #[cfg(feature = "instruction-quantum")]
+        if adapter.inner.instruction_limit.load(Ordering::Acquire) != 123_456 {
+            return TestResult::Fail("instruction_limit not applied");
         }
         if !adapter.inner.no_preempt.load(Ordering::Acquire) {
             return TestResult::Fail("no_preempt not applied");
@@ -6218,6 +6380,9 @@ pub mod tests {
         let opts = crate::StackfulOptions::default();
         if opts.slice_cycles != DEFAULT_SLICE_CYCLES {
             return TestResult::Fail("default slice_cycles drifted");
+        }
+        if opts.instruction_limit != DEFAULT_SLICE_INSTRUCTIONS {
+            return TestResult::Fail("default instruction_limit drifted");
         }
         if opts.no_preempt {
             return TestResult::Fail("default no_preempt should be false");

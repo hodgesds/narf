@@ -337,6 +337,7 @@ the public interface below:
 ```rust
 pub trait Scheduler: Any + Send + Sync + 'static {
     fn name(&self) -> &'static str;
+    fn quantum_unit(&self) -> QuantumUnit { QuantumUnit::Nanos }
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>)
         -> Option<TaskHandle>;
     fn on_install(&self) { }
@@ -363,6 +364,7 @@ pub struct TaskMeta {
 
 pub enum WorkKind { UserThread, KernelThread, AsyncTask, SoftIrq, Idle }
 pub enum SchedClass { Idle, Batch, Default, Interactive, Realtime }
+pub enum QuantumUnit { Nanos, Cycles, Instructions }
 pub enum TaskEnqueueReason { Admitted, Requeued, Migrated, PolicyReplacement }
 pub enum TaskDequeueReason { Selected, Migrated, PolicyReplacement }
 pub enum TaskQueueEvent {
@@ -383,6 +385,48 @@ pub struct CpuIdleMeta {
     pub next_budget_replenishment: Option<u64>,
 }
 ```
+
+`QuantumUnit::Instructions` is an opt-in slice allowance under the
+`instruction-quantum` Cargo feature (forwarded by `narf-frame`).
+`StackfulOptions::instruction_limit` configures the work allowance independently
+of `slice_cycles`, which remains the TSC time ceiling. Defaults are 1,000,000
+retired instructions and the existing `DEFAULT_SLICE_CYCLES` time ceiling.
+Either boundary requests rescheduling when runnable competition exists;
+periodic CPU caps and virtual-runtime accounting remain time-based. This is
+instruction execution, not a measure of application-level useful work.
+
+The core samples a dedicated local counter at each continuation entry and
+checks its delta on timer ticks, deferring syscall rescheduling to a safe exit.
+Direct handoffs and nested stackful polls pause the source account before
+entering a peer and resume it without refunding its already-used allowance.
+AMD uses IRPERF
+(`CPUID.80000008H:EBX[1]`, MSR `C000_00E9`, HWCR bit 30), excluding the early
+Zen1 models affected by erratum 1054. Intel uses architectural perfmon v2+
+fixed counter 0 with OS+USR enabled, AnyThread/PMI disabled, and the enumerated
+counter width. Initial setup refuses an already enabled Intel fixed counter 0,
+preserves unrelated control bits, catches unavailable/locked MSRs, and verifies
+that counting advances. The counter remains reserved for the boot; userspace
+perf events continue to use their existing programmable counter allocations.
+The aarch64 backend is unavailable in this initial implementation.
+
+Each physical executor prepares its own counter before dispatch. Explicit
+installation returns `SchedulerError::InstructionModeUnavailable`, before
+publishing a policy, if the feature is absent or any physically started or
+logically online CPU is unprepared or unsupported. Logical CPU bring-up returns
+`HotPlugError::Busy` rather than
+admitting such a CPU while instruction mode is active. The counter is never
+probed remotely or from a timer/NMI. The task captures its instruction-mode
+baseline at entry so a rolling policy replacement cannot reinterpret a stale
+baseline. Migration gets a fresh local baseline; cross-CPU samples are rejected.
+
+Hardware counter deltas use width-masked wrapping subtraction. The existing
+hard-IRQ guards and an instruction-feature-only x86 NMI guard subtract measured
+interrupt work, including nested spans exactly once. Entry/exit instrumentation
+and context-switch boundary overhead remain part of the measured intervals;
+this is not an exact deterministic instruction boundary. Counter sampling uses
+no overflow interrupt and cannot preempt a non-preemptible continuation. Hrtick
+continues to arm only the separate TSC ceiling. `/sys/kernel/debug/sched/quantum_unit`
+reports `instructions` while that unit is active.
 
 `RunQueue` is a read-only, callback-scoped projection. It exposes queue length,
 the first opaque handle, and iteration over `(TaskHandle, TaskMeta)` snapshots;

@@ -93,6 +93,14 @@ pub fn cpu_bring_up(
     if id >= 64 {
         return Err(HotPlugError::OutOfRange);
     }
+    // The target must have prepared its own counter during physical bring-up.
+    // Never publish an unsupported CPU into an instruction-quantum policy.
+    #[cfg(feature = "instruction-quantum")]
+    if crate::active_quantum_unit() == crate::QuantumUnit::Instructions
+        && !crate::instructions::cpu_available(id as usize)
+    {
+        return Err(HotPlugError::Busy);
+    }
     let bit = 1u64 << id;
     let prev = ONLINE_MASK.fetch_or(bit, Ordering::AcqRel);
     if prev & bit != 0 {

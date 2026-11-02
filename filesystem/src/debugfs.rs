@@ -98,6 +98,7 @@ static SCHED_KNOBS: &[SchedKnob] = &[
             let base = match narf_scheduler::current_scheduler_quantum_unit() {
                 narf_scheduler::QuantumUnit::Nanos => "nanos\n",
                 narf_scheduler::QuantumUnit::Cycles => "cycles\n",
+                narf_scheduler::QuantumUnit::Instructions => "instructions\n",
             };
             String::from(base)
         },

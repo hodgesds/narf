@@ -43,6 +43,11 @@
 
 ## 3. Public interface
 
+The read-only scheduler debugfs `sched/quantum_unit` file reports `nanos`,
+`cycles`, or `instructions`, reflecting the scheduler's installed quantum
+unit. Instruction-mode admission and limits are defined in
+`scheduler/specification/spec.md` §3.1.1.
+
 `FileOps::hardware_clock()` optionally returns the retained precision-clock
 interface for a dynamic clock fd. `devfs_ptp` publishes registered `/dev/ptpN`
 nodes (0600), PHC capability ioctls and bounded system/device offset sampling
