@@ -9,8 +9,17 @@ use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, GpuBacking, SharedArena};
 use core::cell::{Cell, RefCell};
 use narf_capabilities::{Cap, Write};
 
+// ECAM retains permanent mappings. Reuse one permanently owned RAM page rather
+// than freeing a still-mapped frame or consuming one of its eight segment slots
+// for every fault scenario. A nonblocking lease serializes these sync fixtures;
+// no capability or register view from the previous owner remains current.
+static CONFIG_PAGE: narf_lib::mutex::Mutex<Option<narf_memory::frame::PhysFrame>> =
+    narf_lib::mutex::Mutex::new(None);
+
 struct Physical {
     cfg: narf_memory::frame::PhysFrame,
+    cfg_virt: u64,
+    _cfg_lease: narf_lib::mutex::MutexGuard<'static, Option<narf_memory::frame::PhysFrame>>,
     words: Vec<u32>,
     local_words: Vec<u32>,
     device: narf_bus::BusDevice,
@@ -30,10 +39,21 @@ struct Physical {
 }
 impl Physical {
     fn new(release: u32) -> Self {
-        let cfg = narf_memory::frame::alloc_frame().unwrap();
-        // SAFETY: exclusively owned fake PCI configuration page.
+        let mut cfg_lease = CONFIG_PAGE
+            .try_lock()
+            .expect("exclusive fake PCI config lease");
+        let cfg = *cfg_lease.get_or_insert_with(|| narf_memory::frame::alloc_frame().unwrap());
+        // SAFETY: this fixture holds the sole lease of the retained fake PCI
+        // configuration page. The actual ECAM registry must map cfg_phys before
+        // pci::read_config32/power_state and AuthorizedWindow can access it.
+        // Re-registering the same page is idempotent, including after a bus
+        // fixture has reset its mapping registry; the frame is never freed.
+        assert!(unsafe { narf_bus::ecam::map_segment(cfg.start_address(), 4096) });
+        let cfg_virt = narf_bus::ecam::va_for(cfg.start_address()).unwrap();
+        // SAFETY: the held lease owns every byte of this mapped RAM page.
+        // Both the fixture and real PCI helpers use the same mapped view.
         unsafe {
-            core::ptr::write_bytes(cfg.start_address().kernel_mut_ptr::<u8>(), 0, 4096);
+            core::ptr::write_bytes(cfg_virt as *mut u8, 0, 4096);
         }
         let mut words = alloc::vec![0u32; 4 * 1024 * 1024];
         let mut local_words = alloc::vec![0u32; BO as usize / 4];
@@ -54,12 +74,7 @@ impl Physical {
         let store_cfg = |offset: usize, value: u32| {
             // SAFETY: cfg owns this zeroed 4 KiB RAM configuration page;
             // every call below uses an aligned dword offset at most 0x44.
-            unsafe {
-                core::ptr::write_volatile(
-                    cfg.start_address().kernel_mut_ptr::<u32>().add(offset / 4),
-                    value,
-                )
-            }
+            unsafe { core::ptr::write_volatile((cfg_virt as *mut u32).add(offset / 4), value) }
         };
         store_cfg(0, 0xe20b8086);
         store_cfg(4, 0x00100006);
@@ -80,10 +95,22 @@ impl Physical {
         words[0xfd4 / 4] = 0x92340506;
         words[0x130030 / 4] = 0x91357731;
         let cap = Cap::<narf_bus::BusDeviceCap, Write>::bootstrap();
+        assert_eq!(
+            narf_bus::pci::read_config32(&cap, &device, 0),
+            Ok(0xe20b8086)
+        );
+        assert_eq!(narf_bus::pci::read_command(&cap, &device), Ok(6));
+        assert_eq!(
+            narf_bus::pci::power_state(&cap, &device),
+            Ok(Some(narf_bus::pci::PciPowerState::D0))
+        );
+        assert_eq!(narf_bus::pci::read_config32(&cap, &device, 0x100), Ok(0));
         let window = AuthorizedWindow::for_bmg_device(bar, cap, device, Some(local));
         assert!(window.current());
         Self {
             cfg,
+            cfg_virt,
+            _cfg_lease: cfg_lease,
             words,
             local_words,
             device,
@@ -104,15 +131,7 @@ impl Physical {
     }
     fn set_cfg(&self, offset: usize, value: u32) {
         // SAFETY: fake config page stays owned for this fixture lifetime.
-        unsafe {
-            core::ptr::write_volatile(
-                self.cfg
-                    .start_address()
-                    .kernel_mut_ptr::<u32>()
-                    .add(offset / 4),
-                value,
-            )
-        }
+        unsafe { core::ptr::write_volatile((self.cfg_virt as *mut u32).add(offset / 4), value) }
     }
     fn load(&self, reg: u64) -> u32 {
         assert!(reg & 3 == 0 && reg < self.bar.len);
@@ -225,9 +244,14 @@ impl MmioWindow for Physical {
 impl Drop for Physical {
     fn drop(&mut self) {
         // Fake RAM has never started an engine. Revoke the real wrapper before
-        // freeing config/MMIO storage so no surviving view can dereference it.
+        // dropping this config lease/MMIO storage so no surviving view remains
+        // current. ECAM mappings are permanent: CONFIG_PAGE retains the frame
+        // for subsequent fixture leases instead of freeing still-mapped RAM.
         self.cap.revoke();
-        narf_memory::frame::free_frame(self.cfg);
+        assert_eq!(
+            narf_bus::ecam::va_for(self.cfg.start_address()),
+            Some(self.cfg_virt)
+        );
         assert_eq!(self.local_words.len(), BO as usize / 4);
     }
 }

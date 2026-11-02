@@ -659,7 +659,7 @@ fn smoke_i915_capture_prime_async_cancel_and_exact_terminal_ownership() -> TestR
         "ASYNC lost mandatory terminal WRITE reservation"
     );
     assert_eq!(
-        objects[0].dma_buf.resv.fences(DmaResvUsage::Write).len(),
+        objects[0].dma_buf.resv.fences(DmaResvUsage::Read).len(),
         1,
         "normal code lost terminal READ reservation"
     );

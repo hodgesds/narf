@@ -46,6 +46,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(platform: GtPlatform, media: bool) -> Self {
+        Self::with_topology(platform, media, |_| {})
+    }
+
+    fn with_topology(platform: GtPlatform, media: bool, topology: impl FnOnce(&Window)) -> Self {
         let ack = platform.guc_forcewake_ack().unwrap();
         let (io, arena, mut gt) = hardware_model(platform, ack);
         if media {
@@ -54,6 +58,7 @@ impl Fixture {
                 .regs
                 .insert(0x9140, 0x000f00ff & !0x00040042);
         }
+        topology(&io); // physical fuse input precedes every discovery read
         let publication = Arc::new(Publication::new(platform));
         let epoch = Arc::new(AtomicU64::new(0));
         let worker = publication.worker(epoch.clone()).unwrap();
@@ -365,9 +370,14 @@ fn retire_bmg(fixture: &mut Fixture, start: u64, completion: &CompletionFence) {
 }
 
 fn replace_stopped(fixture: &mut Fixture) {
+    replace_stopped_with_topology(fixture, |_| {});
+}
+
+fn replace_stopped_with_topology(fixture: &mut Fixture, topology: impl FnOnce(&Window)) {
     assert_eq!(fixture.gt.state(), GtState::Stopped);
     let old_arena = fixture.arena.clone();
     let (io, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    topology(&io); // clean resume observes the same actual physical fuse input
     hardware_discovery(&mut gt, &io, 0xdfc);
     hardware_scheduling(&mut gt, &io);
     let mut clock = 20_000_000;
@@ -699,8 +709,18 @@ kernel_test_in!(
     smoke_i915_reset_watchdog_retained_cleanup_cold_and_requalification
 );
 
+fn two_ccs_bmg_topology(io: &Window) {
+    // Linux xe_gt_regs.h: XEHP_FUSE4 CCS_EN[19:16], CFEG_WMTP_DISABLE bit20,
+    // GT_L3_EXC[6:4]. Same physical sparse CCS1/3 input as discover(BMG,10).
+    // Mode1 initially selects one engine; the two physical slices permit mode2.
+    io.0.borrow_mut()
+        .regs
+        .insert(0x9114, 0x10 | (0b1010 << 16) | (1 << 20));
+}
+
 fn smoke_i915_reset_park_refusal_same_epoch_and_ccs_refusal_keep_ready() -> TestResult {
-    let mut fixture = Fixture::new(GtPlatform::Battlemage, false);
+    let mut fixture = Fixture::with_topology(GtPlatform::Battlemage, false, two_ccs_bmg_topology);
+    assert_eq!(fixture.gt.compute_configuration(), Some((0b1010, 1)));
     fixture.qualify();
     let epoch = fixture.publish();
     let (backend, info) = fixture.backend();
@@ -751,7 +771,7 @@ fn smoke_i915_reset_park_refusal_same_epoch_and_ccs_refusal_keep_ready() -> Test
     assert_eq!(raw_reset(&file, &info, &user), 0);
     hardware_stop(&mut fixture.gt, &fixture.io, 0xdfc);
     fixture.coordinator.cold();
-    replace_stopped(&mut fixture);
+    replace_stopped_with_topology(&mut fixture, two_ccs_bmg_topology);
     assert_eq!(raw_reset(&file, &info, &user), 0);
     fixture.qualify();
     assert_eq!(fixture.gt.compute_configuration(), Some(compute));
