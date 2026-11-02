@@ -252,6 +252,54 @@ mod scroll_tests;
 /// behind a coarse IRQ-safe lock so `console::write_str` can fan
 /// out to it without re-entry hazards.
 pub static GLOBAL_FB_CONSOLE: IrqSafeSpinLock<Option<FbConsole>> = IrqSafeSpinLock::new(None);
+/// Shared monotonic boot framebuffer publication gate. A closed gate never
+/// reopens, and withdrawal never erases its registration history.
+#[derive(Debug)]
+pub struct BootFramebufferAdmission {
+    ever: bool,
+    closed: bool,
+}
+impl BootFramebufferAdmission {
+    pub const fn new() -> Self {
+        Self {
+            ever: false,
+            closed: false,
+        }
+    }
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+    pub fn publish(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.ever = true;
+        true
+    }
+    pub fn close_if_never(&mut self, clear: bool) -> bool {
+        if self.closed {
+            return true;
+        }
+        if self.ever || !clear {
+            return false;
+        }
+        self.closed = true;
+        true
+    }
+}
+impl Default for BootFramebufferAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+static BOOT_CONSOLE_ADMISSION: IrqSafeSpinLock<BootFramebufferAdmission> =
+    IrqSafeSpinLock::new(BootFramebufferAdmission::new());
+/// One-way serial-boot exclusion, serialized with console publication. It
+/// succeeds only before any framebuffer console was ever installed.
+pub fn close_boot_framebuffer_console() -> bool {
+    let mut admission = BOOT_CONSOLE_ADMISSION.lock();
+    admission.close_if_never(GLOBAL_FB_CONSOLE.lock().is_none())
+}
 
 /// True iff a global FbConsole is currently installed. Used by
 /// `frame::bare_main`'s Late `fb-console-install` initcall to avoid
@@ -272,7 +320,13 @@ pub fn is_installed() -> bool {
 /// may signal the tty's foreground process group.
 pub fn install_fb_console(c: FbConsole) {
     let (cols, rows) = (c.cols(), c.rows());
-    *GLOBAL_FB_CONSOLE.lock() = Some(c);
+    {
+        let mut admission = BOOT_CONSOLE_ADMISSION.lock();
+        if !admission.publish() {
+            return;
+        }
+        *GLOBAL_FB_CONSOLE.lock() = Some(c);
+    }
     narf_console::set_text_grid(cols, rows);
 }
 

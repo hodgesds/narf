@@ -33,6 +33,7 @@ pub enum RuntimeError {
     Firmware(crate::intel_gpu_guc_firmware::FirmwareError),
     State,
     Configuration,
+    Takeover(crate::intel_gpu_gt::lnl::Error),
     Gt(GtError),
 }
 
@@ -40,6 +41,7 @@ pub enum RuntimeError {
 enum Phase {
     Cold,
     Powering,
+    Takeover,
     Booting,
     Discovering,
     Reloading,
@@ -82,6 +84,9 @@ struct State {
     /// Immutable boot choice initially; changed only by a client-free reset
     /// transaction. Clean runtime resume preserves this exact owner policy.
     ccs_mode: Result<u8, RuntimeError>,
+    lnl_flr: Option<crate::intel_gpu_gt::lnl::DriverFlr>,
+    lnl_receipt: Option<crate::intel_gpu_gt::lnl::Receipt>,
+    lnl_clients: Option<crate::intel_gpu_ccs_control::TakeoverClients>,
 }
 
 struct Pending {
@@ -104,7 +109,7 @@ struct Owner {
     user_epoch: Arc<AtomicU64>,
     log_publication: Arc<crate::intel_gpu_guc_log::stream::Publication>,
     user_version: Arc<AtomicU32>,
-    user_engines: Arc<core::sync::atomic::AtomicU8>,
+    user_engines: Arc<core::sync::atomic::AtomicU32>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     eu_info: IrqSafeSpinLock<Option<crate::intel_gpu_eu_stall::Info>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
@@ -117,7 +122,7 @@ struct Backend {
     owner: Weak<Owner>,
     epoch: Arc<AtomicU64>,
     version: Arc<AtomicU32>,
-    engines: Arc<core::sync::atomic::AtomicU8>,
+    engines: Arc<core::sync::atomic::AtomicU32>,
     platform: GtPlatform,
     facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
@@ -794,12 +799,15 @@ pub(crate) fn start_pending() {
                 parked_epoch: None,
                 slpc_reported: false,
                 ccs_mode: ccs_boot_mode(narf_boot::args()),
+                lnl_flr: None,
+                lnl_receipt: None,
+                lnl_clients: None,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
             log_publication: Arc::new(crate::intel_gpu_guc_log::stream::Publication::new()),
             user_version: Arc::new(AtomicU32::new(0)),
-            user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
+            user_engines: Arc::new(core::sync::atomic::AtomicU32::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             eu_info: IrqSafeSpinLock::new(None),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
@@ -855,6 +863,19 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
         narf_bus::pci::read_config32(&p.cap, &p.device, off).map_err(|_| RuntimeError::Authority)
     };
     let revision = pci_identity(read, p.device.id.vendor, p.device.id.device)?;
+    if GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
+        .is_some_and(|p| p.is_headless_integrated())
+    {
+        let command = read(4)?;
+        let low = read(0x10)?;
+        if command == u32::MAX || command & 6 != 6 || low == u32::MAX || low & 1 != 0 {
+            return Err(RuntimeError::Device);
+        }
+        let high = if low & 6 == 4 { read(0x14)? } else { 0 };
+        if (u64::from(high) << 32 | u64::from(low & !15)) != p.bar.phys.raw() {
+            return Err(RuntimeError::Device);
+        }
+    }
     let vf = mmio.read32(0x1901f8);
     if vf == u32::MAX || vf & 1 != 0 || p.bar.len < 16 * 1024 * 1024 {
         return Err(RuntimeError::Device);
@@ -984,7 +1005,7 @@ impl Owner {
         let platform =
             GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device)
                 .ok_or(RuntimeError::Device)?;
-        if mode != 1 && !platform.is_discrete() {
+        if mode != 1 && !platform.multiple_ccs() {
             return Err(RuntimeError::Configuration);
         }
         state.irq.take();
@@ -999,14 +1020,69 @@ impl Owner {
         }
         state.gt.take(); // only verified stopped owners can be replaced
         let p = &self.pending;
-        let mmio = AuthorizedWindow::new(p.bar, p.cap);
-        let revision = validate_pci(p, &mmio)?;
+        let mmio = AuthorizedWindow::for_device(p.bar, p.cap, p.device);
+        let mut revision = validate_pci(p, &mmio)?;
         let platform = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
             .ok_or(RuntimeError::Device)?;
         // Each verified restart needs a fresh policy proof. Reusing an arena
         // after S3 would publish new PTEs using the pre-suspend PAT/MOCS state
         // before hardware initialization has re-established that state.
-        let arena = SharedArena::new(GgttArena::for_gt(p.bar, p.cap, platform));
+        let arena = if platform.is_headless_integrated() {
+            if self.user_epoch.load(Ordering::Acquire) != 0
+                || p.mode.is_some()
+                || crate::intel_gpu_kms::display(p.index).is_some()
+                || !crate::intel_gpu::lnl_boot_scanout_excluded()
+            {
+                return Err(RuntimeError::Configuration);
+            }
+            if state.lnl_clients.is_none() {
+                state.lnl_clients = Some(
+                    crate::intel_gpu_ccs_control::takeover_clients(p.index)
+                        .map_err(|_| RuntimeError::Configuration)?,
+                );
+            }
+            if state.lnl_receipt.is_none() {
+                if state.lnl_flr.is_none() {
+                    state.lnl_flr = Some(
+                        crate::intel_gpu_gt::lnl::DriverFlr::new(
+                            p.device,
+                            p.bar,
+                            narf_time::monotonic_ns(),
+                        )
+                        .map_err(RuntimeError::Takeover)?,
+                    );
+                }
+                match state.lnl_flr.as_mut().expect("owned integrated FLR").poll(
+                    &mmio,
+                    narf_time::monotonic_ns(),
+                    || {
+                        validate_pci(p, &mmio).is_ok()
+                            && crate::intel_gpu::lnl_boot_scanout_excluded()
+                    },
+                ) {
+                    core::task::Poll::Pending => {
+                        state.phase = Phase::Takeover;
+                        return Ok(());
+                    }
+                    core::task::Poll::Ready(result) => {
+                        state.lnl_receipt = Some(result.map_err(RuntimeError::Takeover)?)
+                    }
+                }
+                // The reset invalidates every earlier sampled PCI/IP/wake fact.
+                revision = validate_pci(p, &mmio)?;
+            }
+            let arena = GgttArena::for_lnl_gt(
+                p.bar,
+                p.cap,
+                p.device,
+                state.lnl_receipt.take().expect("fresh integrated FLR"),
+            )
+            .map_err(|_| RuntimeError::State)?;
+            state.lnl_flr = None; // completed receipt was consumed by this fresh arena
+            SharedArena::new(arena)
+        } else {
+            SharedArena::new(GgttArena::for_gt(p.bar, p.cap, platform))
+        };
         if state.firmware.is_none() {
             let authority: Cap<narf_firmware::FirmwareRegistry, Read> =
                 narf_firmware::trusted_loader_authority()
@@ -1027,7 +1103,7 @@ impl Owner {
                     device_id: p.device.id.device,
                     revision,
                     huc_upload_bytes: 0,
-                    uncached_mocs: (platform == GtPlatform::Battlemage).then_some(3),
+                    uncached_mocs: platform.is_xe2().then_some(3),
                 },
             )
             .map_err(RuntimeError::Gt)?,
@@ -1089,6 +1165,9 @@ impl Owner {
                 state.phase = Phase::Powering;
                 return Ok(());
             }
+            return self.cold_start(state);
+        }
+        if state.phase == Phase::Takeover {
             return self.cold_start(state);
         }
         if state.phase == Phase::Powering {
@@ -1414,7 +1493,11 @@ impl Owner {
                             RuntimeError::Gt(_) => Reason::Recovery,
                             _ => Reason::State,
                         };
-                        let window = AuthorizedWindow::new(self.pending.bar, self.pending.cap);
+                        let window = AuthorizedWindow::for_device(
+                            self.pending.bar,
+                            self.pending.cap,
+                            self.pending.device,
+                        );
                         let report = gt.error_report(
                             reason,
                             self.user_epoch.load(Ordering::Acquire),
@@ -1519,6 +1602,9 @@ impl Owner {
                                 );
                                 state.parked_epoch = None;
                                 state.phase = Phase::Running;
+                                if let Some(clients) = state.lnl_clients.take() {
+                                    clients.release();
+                                }
                             };
                             let configured = match (&self.ccs_control, configuration) {
                                 (Some(control), Some(configuration)) => {
@@ -1557,7 +1643,11 @@ impl Owner {
                 }
                 if state.phase == Phase::Running {
                     if let Some(hwmon) = &self.hwmon {
-                        let mmio = AuthorizedWindow::new(self.pending.bar, self.pending.cap);
+                        let mmio = AuthorizedWindow::for_device(
+                            self.pending.bar,
+                            self.pending.cap,
+                            self.pending.device,
+                        );
                         hwmon.service_mmio(
                             self.user_epoch.load(Ordering::Acquire),
                             narf_time::monotonic_ns(),
@@ -1577,7 +1667,11 @@ impl Owner {
                         .and_then(GuCGt::engines)
                         .unwrap_or_default();
                     state.irq = crate::intel_gpu_gt_irq::GtIrq::for_device(
-                        AuthorizedWindow::new(self.pending.bar, self.pending.cap),
+                        AuthorizedWindow::for_device(
+                            self.pending.bar,
+                            self.pending.cap,
+                            self.pending.device,
+                        ),
                         self.pending.cap,
                         self.pending.device,
                         engines,
@@ -1701,6 +1795,8 @@ impl Owner {
         let mut state = self.state.lock().await;
         if state.phase == Phase::Parked {
             state.phase = Phase::Cold;
+            state.lnl_flr = None;
+            state.lnl_receipt = None;
             state.probe = None;
             state.probe_result = None;
         }
@@ -1873,6 +1969,8 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
                 crate::intel_gpu::relight_display(&mode).ok_or(E::DriverError)?;
             }
             state.phase = Phase::Cold;
+            state.lnl_flr = None;
+            state.lnl_receipt = None;
             state.probe = None;
             state.probe_result = None;
             state.saved = None;
@@ -1937,7 +2035,7 @@ pub(crate) fn probe_discrete(
 ) -> Result<(), narf_bus::ProbeError> {
     let platform = GtPlatform::from_pci(device.id.vendor, device.id.device)
         .ok_or(narf_bus::ProbeError::NotForThisDriver)?;
-    if !platform.is_discrete() {
+    if !platform.is_discrete() && !platform.is_headless_integrated() {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     if PENDING.lock().iter().any(|p| p.device.addr == device.addr)
@@ -1961,8 +2059,12 @@ pub(crate) fn probe_discrete(
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // LMEM BAR: write-combining for the prefetchable window. A failed or
     // conflicting mapping leaves VRAM unpublished rather than refusing the GT.
-    // SAFETY: the same exclusive probe ownership covers BAR2.
-    let lmem = unsafe { narf_bus::bar::map_bar(&device, 2) }.ok();
+    let lmem = if platform.is_discrete() {
+        // SAFETY: the same exclusive probe ownership covers BAR2.
+        unsafe { narf_bus::bar::map_bar(&device, 2) }.ok()
+    } else {
+        None
+    };
     let index = crate::drm_registry::count() as u32;
     let card = Arc::new(IntelGpuCard::new(
         alloc::format!("card{index}"),

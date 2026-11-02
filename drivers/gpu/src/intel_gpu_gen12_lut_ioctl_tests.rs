@@ -26,6 +26,13 @@ fn fixture(family: Gen12Platform) -> (MockPlatform, ModeState, queue::Queue, Wor
     let worker = Worker {
         device: Arc::new(p.gen12(family)),
     };
+    assert_eq!(
+        p.read32(0x70180),
+        match family {
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
+            _ => 0x84000000,
+        }
+    );
     (
         p,
         mode,

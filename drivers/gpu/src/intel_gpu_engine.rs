@@ -8,7 +8,8 @@
 //! regs/xe_engine_regs.h. CCS0–3 follow xe_gt_ccs_mode.c's immutable boot
 //! partition (default one engine), dense logical mapping and physical fuses. BMG's architecture-present BCS8 is ordinary COPY1 while
 //! USM is absent. A future USM owner must reserve/revoke that user engine.
-//! Media engines remain unadmitted.
+//! Gen12 media engines share this main GuC, with immutable physical fuses.
+//! Other platforms retain their existing graphics-only inventory.
 
 use crate::{intel_gpu_gt::GtPlatform, intel_gpu_rcs::GpuBacking};
 use alloc::vec::Vec;
@@ -28,11 +29,23 @@ pub enum Engine {
     Ccs1,
     Ccs2,
     Ccs3,
+    Vcs0,
+    Vcs1,
+    Vcs2,
+    Vcs3,
+    Vcs4,
+    Vcs5,
+    Vcs6,
+    Vcs7,
+    Vecs0,
+    Vecs1,
+    Vecs2,
+    Vecs3,
 }
 
 /// The engines a GT publishes, decided from fuses before scheduling starts.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub struct EngineSet(u8);
+pub struct EngineSet(u32);
 
 impl EngineSet {
     pub const fn of(engines: &[Engine]) -> Self {
@@ -44,16 +57,16 @@ impl EngineSet {
         }
         Self(bits)
     }
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u32 {
         self.0
     }
-    pub const fn from_bits(bits: u8) -> Self {
+    pub const fn from_bits(bits: u32) -> Self {
         Self(bits & ((1 << Engine::COUNT) - 1))
     }
     pub fn contains(self, engine: Engine) -> bool {
         self.0 & 1 << engine as u8 != 0
     }
-    /// Present engines in `Engine::ALL` (xe_hw_engine id) order.
+    /// Present engines in stable NARF slot order (the first seven predate media).
     pub fn iter(self) -> impl Iterator<Item = Engine> {
         Engine::ALL.into_iter().filter(move |e| self.contains(*e))
     }
@@ -102,8 +115,9 @@ impl EngineSet {
 /// Physically present compute instances (bit n = CCSn), from
 /// xe_hw_engine.c::read_compute_fuses. Xe-LPG has exactly one CCS; Xe-HPG
 /// infers CCSn from DSS in quadrant n; Xe2 reads XEHP_FUSE4 CCS_EN.
-pub(crate) fn compute_instances(platform: GtPlatform, dss: u32, fuse4: u32) -> u8 {
+pub(crate) fn compute_instances(platform: GtPlatform, dss: u128, fuse4: u32) -> u8 {
     match platform {
+        _ if platform.is_xe2() => ((fuse4 >> 16) & 0xf) as u8,
         GtPlatform::Gen12(_) => 0,
         GtPlatform::Integrated(_) => 1,
         GtPlatform::Alchemist => {
@@ -168,7 +182,17 @@ pub(crate) fn ccs_mode(instances: u8, engines: u8) -> Option<u32> {
 }
 
 impl Engine {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 19;
+    /// Stable original graphics slots; Gen12 media appends without renumbering.
+    pub const GRAPHICS: [Engine; 7] = [
+        Self::Rcs0,
+        Self::Bcs0,
+        Self::Bcs8,
+        Self::Ccs0,
+        Self::Ccs1,
+        Self::Ccs2,
+        Self::Ccs3,
+    ];
     pub const ALL: [Engine; Self::COUNT] = [
         Engine::Rcs0,
         Engine::Bcs0,
@@ -177,6 +201,18 @@ impl Engine {
         Engine::Ccs1,
         Engine::Ccs2,
         Engine::Ccs3,
+        Engine::Vcs0,
+        Engine::Vcs1,
+        Engine::Vcs2,
+        Engine::Vcs3,
+        Engine::Vcs4,
+        Engine::Vcs5,
+        Engine::Vcs6,
+        Engine::Vcs7,
+        Engine::Vecs0,
+        Engine::Vecs1,
+        Engine::Vecs2,
+        Engine::Vecs3,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -191,6 +227,18 @@ impl Engine {
             Engine::Ccs1 => 0x1c000,
             Engine::Ccs2 => 0x1e000,
             Engine::Ccs3 => 0x26000,
+            Self::Vcs0 => 0x1c0000,
+            Self::Vcs1 => 0x1c4000,
+            Self::Vcs2 => 0x1d0000,
+            Self::Vcs3 => 0x1d4000,
+            Self::Vcs4 => 0x1e0000,
+            Self::Vcs5 => 0x1e4000,
+            Self::Vcs6 => 0x1f0000,
+            Self::Vcs7 => 0x1f4000,
+            Self::Vecs0 => 0x1c8000,
+            Self::Vecs1 => 0x1d8000,
+            Self::Vecs2 => 0x1e8000,
+            Self::Vecs3 => 0x1f8000,
         }
     }
     /// GUC_RENDER_CLASS / GUC_BLITTER_CLASS / GUC_COMPUTE_CLASS.
@@ -199,6 +247,15 @@ impl Engine {
             Engine::Rcs0 => 0,
             Engine::Bcs0 | Engine::Bcs8 => 3,
             Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3 => 4,
+            Self::Vcs0
+            | Self::Vcs1
+            | Self::Vcs2
+            | Self::Vcs3
+            | Self::Vcs4
+            | Self::Vcs5
+            | Self::Vcs6
+            | Self::Vcs7 => 1,
+            Self::Vecs0 | Self::Vecs1 | Self::Vecs2 | Self::Vecs3 => 2,
         }
     }
     /// DRM_XE_ENGINE_CLASS_RENDER / _COPY / _COMPUTE (also i915 UABI).
@@ -207,19 +264,41 @@ impl Engine {
             Engine::Rcs0 => 0,
             Engine::Bcs0 | Engine::Bcs8 => 1,
             Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3 => 4,
+            Self::Vcs0
+            | Self::Vcs1
+            | Self::Vcs2
+            | Self::Vcs3
+            | Self::Vcs4
+            | Self::Vcs5
+            | Self::Vcs6
+            | Self::Vcs7 => 2,
+            Self::Vecs0 | Self::Vecs1 | Self::Vecs2 | Self::Vecs3 => 3,
         }
     }
     pub(crate) fn physical_instance(self) -> u32 {
         match self {
             Self::Bcs8 => 8,
-            Self::Ccs1 => 1,
-            Self::Ccs2 => 2,
-            Self::Ccs3 => 3,
+            Self::Ccs1 | Self::Vcs1 | Self::Vecs1 => 1,
+            Self::Ccs2 | Self::Vcs2 | Self::Vecs2 => 2,
+            Self::Ccs3 | Self::Vcs3 | Self::Vecs3 => 3,
+            Self::Vcs4 => 4,
+            Self::Vcs5 => 5,
+            Self::Vcs6 => 6,
+            Self::Vcs7 => 7,
             _ => 0,
         }
     }
     pub(crate) fn is_copy(self) -> bool {
         matches!(self, Self::Bcs0 | Self::Bcs8)
+    }
+    pub(crate) fn is_media(self) -> bool {
+        matches!(self.xe_class(), 2 | 3)
+    }
+    pub(crate) fn is_decode(self) -> bool {
+        self.xe_class() == 2
+    }
+    pub(crate) fn simple_ring(self) -> bool {
+        self.is_copy() || self.is_media()
     }
     pub fn is_compute(self) -> bool {
         matches!(self, Self::Ccs0 | Self::Ccs1 | Self::Ccs2 | Self::Ccs3)
@@ -227,18 +306,19 @@ impl Engine {
     /// xe_gt_lrc_size: PPHWSP plus the class's engine context image.
     pub(crate) fn lrc_pages(self, platform: GtPlatform) -> u32 {
         match (self, platform) {
-            (Engine::Rcs0, GtPlatform::Battlemage) => 4,
+            (Engine::Rcs0, _) if platform.is_xe2() => 4,
             (Engine::Rcs0, _) => 14,
             (Engine::Bcs0 | Engine::Bcs8, _) => 2,
-            (Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3, GtPlatform::Battlemage) => {
+            (Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3, _) if platform.is_xe2() => {
                 3
             }
             (Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3, _) => 14,
+            _ => 2,
         }
     }
     /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image.
     pub(crate) fn first_lri(self, platform: GtPlatform) -> u32 {
-        if platform.is_gen12() || self.is_copy() && platform != GtPlatform::Battlemage {
+        if platform.is_gen12() || self.is_copy() && !platform.is_xe2() {
             0x11081019 // gen12_xcs_offsets: 13 registers, no PRT_BB_STATE
         } else {
             0x1108101d
@@ -246,8 +326,9 @@ impl Engine {
     }
 }
 
-/// xe_hw_engine_enable_ring for the GuC-owned engine. Render-well and GT
-/// wake are held by the owner; MOCS defaults follow RING_CMD_CCTL.
+/// xe_hw_engine_enable_ring for the GuC-owned engine. GT/render wake and
+/// each present Gen12 media wake are retained by the same hardware owner;
+/// MOCS defaults follow RING_CMD_CCTL.
 pub(crate) fn enable_ring(
     mmio: &impl crate::intel_gpu_aux::MmioWindow,
     engine: Engine,
@@ -276,6 +357,7 @@ pub(crate) fn enable_ring(
 
 pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
     match platform {
+        _ if platform.is_headless_integrated() => 3,
         GtPlatform::Gen12(_) => 3,
         GtPlatform::Integrated(_) => 9,
         GtPlatform::Alchemist => 1,
@@ -288,7 +370,12 @@ pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
 pub(crate) fn copy_seed(engine: Engine, platform: GtPlatform) -> Vec<u32> {
     let uc = uncached_mocs(platform);
     let reg = engine.base() + 0x204;
-    alloc::vec![
+    let mut words = if platform.is_gen12() {
+        gen12_nonrender_seed()
+    } else {
+        Vec::new()
+    };
+    words.extend_from_slice(&[
         0x15080001,
         reg,
         0x600,
@@ -316,18 +403,62 @@ pub(crate) fn copy_seed(engine: Engine, platform: GtPlatform) -> Vec<u32> {
         0,
         0x610,
         0,
-    ]
+    ]);
+    words
 }
 
 /// Default CCS LRC state: xe_hw_engine_setup_default_lrc_state's only
 /// compute entry on these platforms, the Xe2 WMTP-disabled preemption level
 /// (CS_CHICKEN1 PREEMPT_GPGPU_THREAD_GROUP_LEVEL, masked). No 3D state.
 pub(crate) fn compute_seed(engine: Engine, platform: GtPlatform, disable_wmtp: bool) -> Vec<u32> {
-    if platform == GtPlatform::Battlemage && disable_wmtp {
+    if platform.is_xe2() && disable_wmtp {
         alloc::vec![0x11000001, engine.base() + 0x580, 0x00060002]
     } else {
         Vec::new()
     }
+}
+
+/// Source graphics1200 lrc_was shared by nonrender engines. Media has no
+/// BLIT_CCTL or render FF_MODE2/3D initialization.
+pub(crate) fn gen12_nonrender_seed() -> Vec<u32> {
+    alloc::vec![
+        0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
+        0x02000200
+    ]
+}
+
+/// xe_ring_ops::__emit_job_gen12_video. AUX invalidation is class-specific
+/// and precedes the start-stamp TLB flush while preparser is disabled.
+pub(crate) fn media_ring(
+    engine: Engine,
+    batch: Option<u64>,
+    user_fence: Option<(u64, u64)>,
+    image: u32,
+    seq: u32,
+) -> Vec<u32> {
+    let mut words = copy_ring(batch, user_fence, image, seq);
+    words.splice(
+        2..2,
+        [
+            0x11020001, // MMIO_REMAP_EN bit17; ADD_CS_MMIO_START bit19 is absent.
+            if engine.is_decode() { 0x4218 } else { 0x4238 },
+            1,
+            0,
+        ],
+    );
+    words
+}
+
+/// Inverted pre-XeHP fuse polarity: bits0..7 VDBOX,16..19 VEBOX.
+pub(crate) fn gen12_media(fuse: u32) -> EngineSet {
+    let mut bits = 0;
+    for engine in Engine::ALL.into_iter().filter(|engine| engine.is_media()) {
+        let bit = engine.physical_instance() + if engine.is_decode() { 0 } else { 16 };
+        if fuse & (1 << bit) == 0 {
+            bits |= 1 << engine.index();
+        }
+    }
+    EngineSet::from_bits(bits)
 }
 
 /// MI_FLUSH_DW post-sync GGTT store, then MI_USER_INTERRUPT. Tails stay
@@ -396,7 +527,7 @@ pub(crate) fn copy_image(image: &impl GpuBacking, platform: GtPlatform, ring: u3
 /// (graphics >= 12.55) and xe2_xcs. Only xe2_bcs has a third LRI group.
 pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
     let base = engine.base();
-    let xe2 = platform == GtPlatform::Battlemage;
+    let xe2 = platform.is_xe2();
     let mut first: Vec<u32> = alloc::vec![
         0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4,
     ];
@@ -461,7 +592,7 @@ pub(crate) mod tests {
 
     fn smoke_engine_identity_table() -> TestResult {
         assert_eq!(
-            Engine::ALL.map(|e| (e.base(), e.guc_class(), e.xe_class())),
+            Engine::GRAPHICS.map(|e| (e.base(), e.guc_class(), e.xe_class())),
             [
                 (0x2000, 0, 0),
                 (0x22000, 3, 1),
@@ -495,32 +626,38 @@ pub(crate) mod tests {
         assert_eq!(ccs_mode(0xf, 1), Some(0x0fff_0000));
         assert_eq!(ccs_mode(0b1010, 1), Some(0x0fff_0000 | 0b001_111_001_111));
         assert_eq!(
-            EngineSet::of(&Engine::ALL).from_class_instance(1, 0),
+            EngineSet::of(&Engine::GRAPHICS).from_class_instance(1, 0),
             Some(Engine::Bcs0)
         );
         assert_eq!(
-            EngineSet::of(&Engine::ALL).from_class_instance(4, 0),
+            EngineSet::of(&Engine::GRAPHICS).from_class_instance(4, 0),
             Some(Engine::Ccs0)
         );
-        assert_eq!(EngineSet::of(&Engine::ALL).from_class_instance(2, 0), None);
         assert_eq!(
-            EngineSet::of(&Engine::ALL).from_class_instance(1, 1),
+            EngineSet::of(&Engine::GRAPHICS).from_class_instance(2, 0),
+            None
+        );
+        assert_eq!(
+            EngineSet::of(&Engine::GRAPHICS).from_class_instance(1, 1),
             Some(Engine::Bcs8)
         );
-        assert_eq!(EngineSet::of(&Engine::ALL).from_class_instance(1, 8), None);
+        assert_eq!(
+            EngineSet::of(&Engine::GRAPHICS).from_class_instance(1, 8),
+            None
+        );
         assert_eq!(
             (
                 Engine::Bcs8.physical_instance(),
-                EngineSet::of(&Engine::ALL)
+                EngineSet::of(&Engine::GRAPHICS)
                     .logical_instance(Engine::Bcs8)
                     .unwrap(),
-                1u32 << EngineSet::of(&Engine::ALL)
+                1u32 << EngineSet::of(&Engine::GRAPHICS)
                     .logical_instance(Engine::Bcs8)
                     .unwrap()
             ),
             (8, 1, 2)
         );
-        assert_eq!(EngineSet::from_bits(0xff), EngineSet::of(&Engine::ALL));
+        assert_eq!(EngineSet::from_bits(0x7f), EngineSet::of(&Engine::GRAPHICS));
         for platform in [
             GtPlatform::Alchemist,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
@@ -641,4 +778,135 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_engine", smoke_copy_ring_vectors);
+    fn smoke_gen12_media_literal_identity_fuses_and_context() -> TestResult {
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        let physical = [
+            (Engine::Vcs0, 0x1c0000, 1, 2, 0),
+            (Engine::Vcs1, 0x1c4000, 1, 2, 1),
+            (Engine::Vcs2, 0x1d0000, 1, 2, 2),
+            (Engine::Vcs3, 0x1d4000, 1, 2, 3),
+            (Engine::Vcs4, 0x1e0000, 1, 2, 4),
+            (Engine::Vcs5, 0x1e4000, 1, 2, 5),
+            (Engine::Vcs6, 0x1f0000, 1, 2, 6),
+            (Engine::Vcs7, 0x1f4000, 1, 2, 7),
+            (Engine::Vecs0, 0x1c8000, 2, 3, 0),
+            (Engine::Vecs1, 0x1d8000, 2, 3, 1),
+            (Engine::Vecs2, 0x1e8000, 2, 3, 2),
+            (Engine::Vecs3, 0x1f8000, 2, 3, 3),
+        ];
+        assert_eq!(EngineSet::of(&Engine::GRAPHICS).bits(), 0x7f);
+        assert_eq!(EngineSet::from_bits(u32::MAX).iter().count(), 19);
+        assert_eq!(gen12_media(0x000f00ff).bits(), 0);
+        assert_eq!(gen12_media(0).iter().count(), 12);
+        for (index, (engine, base, guc, uapi, instance)) in physical.into_iter().enumerate() {
+            assert_eq!(
+                (
+                    engine.index(),
+                    engine.base(),
+                    engine.guc_class(),
+                    engine.xe_class(),
+                    engine.physical_instance()
+                ),
+                (7 + index, base, guc, uapi, instance)
+            );
+            assert_eq!(engine.lrc_pages(platform), 2);
+            let fuse = 0x000f00ff & !(1 << (instance + if guc == 1 { 0 } else { 16 }));
+            let set = gen12_media(fuse);
+            assert_eq!(set.iter().collect::<Vec<_>>(), [engine]);
+            assert_eq!(set.from_class_instance(uapi, 0), Some(engine));
+            assert_eq!(set.from_class_instance(uapi, 1), None);
+            let image = Image(RefCell::new(alloc::vec![0;2048]));
+            xcs_image(engine, &image, platform, 0x1200000);
+            let words = image.0.borrow();
+            let r = &words[1024..];
+            assert_eq!(
+                &r[..12],
+                &[
+                    0,
+                    0x11081019,
+                    base + 0x244,
+                    0x00090009,
+                    base + 0x34,
+                    0,
+                    base + 0x30,
+                    0,
+                    base + 0x38,
+                    0x1200000,
+                    base + 0x3c,
+                    0x1001
+                ]
+            );
+            assert_eq!(
+                (r[0x21], r[0x22], r[0x24], r[0x34], r[0x61]),
+                (
+                    0x11081011,
+                    base + 0x3a8,
+                    base + 0x28c,
+                    0x05000001,
+                    0x01000000
+                )
+            );
+        }
+        let sparse = gen12_media(0x000f00ff & !0x00050082);
+        assert_eq!(
+            sparse.iter().collect::<Vec<_>>(),
+            [Engine::Vcs1, Engine::Vcs7, Engine::Vecs0, Engine::Vecs2]
+        );
+        assert_eq!(sparse.from_class_instance(2, 1), Some(Engine::Vcs7));
+        assert_eq!(sparse.from_class_instance(3, 1), Some(Engine::Vecs2));
+        assert_eq!(sparse.decode_hardware_id(0x71), Some(Engine::Vcs7));
+        assert_eq!(sparse.decode_hardware_id(0x22), Some(Engine::Vecs2));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12",
+        smoke_gen12_media_literal_identity_fuses_and_context
+    );
+
+    fn smoke_gen12_nonrender_lrc_workarounds_and_video_ring_literals() -> TestResult {
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS);
+        let generic = [
+            0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
+            0x02000200,
+        ];
+        assert_eq!(gen12_nonrender_seed(), generic);
+        let bcs = copy_seed(Engine::Bcs0, platform);
+        assert_eq!(&bcs[..10], &generic);
+        assert_eq!(&bcs[10..13], &[0x15080001, 0x22204, 0x600]);
+        assert_eq!(bcs[17], 0x606);
+        assert!(!bcs.contains(&0x6604)); // RCS-only FF_MODE2 never reaches nonrender.
+        for (engine, aux) in [(Engine::Vcs7, 0x4218), (Engine::Vecs3, 0x4238)] {
+            let words = media_ring(
+                engine,
+                Some(0x1234_0000_0000),
+                Some((0x2345_0000_0090, 0x1122334455667788)),
+                0x1000000,
+                7,
+            );
+            assert_eq!(
+                &words[..15],
+                &[
+                    0x04000001, 0x02800101, 0x11020001, aux, 1, 0, 0x13044002, 0x100080c, 0, 7,
+                    0x02800100, 0x18800101, 0, 0x1234, 0x04000000
+                ]
+            );
+            assert_eq!(
+                &words[15..24],
+                &[0x13000002, 0, 0, 0, 0x10200003, 0x90, 0x2345, 0x55667788, 0x11223344]
+            );
+            assert_eq!(
+                &words[24..31],
+                &[0x13004002, 0x1000804, 0, 7, 0x01000000, 0x04000001, 0x02800000]
+            );
+            assert_ne!(words[2] & (1 << 17), 0);
+            assert_eq!(words[2] & (1 << 19), 0);
+            assert_eq!(words.len(), 32);
+            assert!(!words.contains(&0x7a000004));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12",
+        smoke_gen12_nonrender_lrc_workarounds_and_video_ring_literals
+    );
 }

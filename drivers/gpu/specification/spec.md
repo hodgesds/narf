@@ -86,8 +86,8 @@ fbdev mmap of rebased generic scanouts.
 `intel_gpu_modeset_xelpg::XeLpgModeset::modeset_fixed` program the
 caller's exact timing without replacing it with an EDID preferred mode.
 Probe takeover and `intel_gpu::relight_display` share generation dispatch:
-Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Panther
-Lake refuses programming with `ModesetError::UnsupportedGeneration`.
+Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Lunar Lake
+and Panther Lake refuse programming with `ModesetError::UnsupportedGeneration`.
 This dispatch does not enable Xe-LPG power management, which remains gated.
 `Generation::external_display_supported` admits only Gen12: external
 DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
@@ -163,10 +163,12 @@ list, raw HWCONFIG, topology masks, correlated engine cycles and GuC
 submission-interface version.
 It uses Xe's size-only/exact-size
 protocol; size-only calls never touch the payload pointer. Engine discovery
-publishes the live `EngineSet` in xe_hw_engine id order: RCS0, BCS0,
-BMG BCS8, then selected physical CCS0–3, or zero engines before readiness.
-Instances are dense within each class in that frozen set: BCS8 is COPY1,
-and sparse physical CCS engines map to COMPUTE0..N-1, all on GT0. Unavailable query
+publishes the live `EngineSet` in stable NARF slot order: RCS0, BCS0,
+BCS8, CCS0–3 retain bits0–6; qualified Gen12 VCS0–7 and VECS0–3 append
+bits7–18. Internal masks and cached publication are u32; existing wire fields
+already hold u32. Before readiness the set is empty. Instances are dense
+within each class: BCS8 is COPY1 and sparse compute/video/enhance engines
+retain their physical identities behind dense logical indices, all on GT0. Unavailable query
 types return EINVAL. DeviceFacts
 contains the actual PCI revision, validated graphics IP/step and the stable
 RPM_CONFIG0-derived timestamp clock. The GT owner samples it with current
@@ -179,7 +181,7 @@ engine pad is ignored; unadvertised class/instance pairs or GT1 return EINVAL.
 The live GT owner samples the selected engine's RING_TIMESTAMP (RCS0 at
 0x2358, BCS0 at 0x22358, BCS8 at 0x3ee358, CCS0 at 0x1a358) under its async reset mutex,
 PCI D0 and current render forcewake; loss clears admission.
-EngineCycles contains width (36 bits before BMG; 64 on BMG), the actual
+EngineCycles contains width (36 bits on Gen12/DG2/Xe-LPG; 64 on qualified Xe2), the actual
 RING_TIMESTAMP counter and CPU timestamp/delta around its lower-register read.
 At most three high/low/high observations handle rollover; unstable observations
 return EAGAIN and unavailable registers return an I/O error. CPU clocks are
@@ -203,8 +205,9 @@ VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
 per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
 queues returns EBUSY. Queue destruction removes the handle and refuses pending
 admission while retaining every submitted residency until terminal completion.
-Width-one RCS0, BCS0, BMG BCS8 and selected compute queues, plus software
-VM_BIND queues, are supported. A queue accepts 1..9 copied same-GT/same-class
+Width-one RCS0, BCS0, qualified Xe2 BCS8, selected compute and qualified
+Gen12 main-GuC VIDEO/ENHANCE queues, plus software VM_BIND queues, are
+supported. Width>1 media queues refuse. A queue accepts 1..9 copied same-GT/same-class
 placement entries, with duplicates collapsed. VM_BIND remains 1x1. Native
 GuC contexts use the complete dense logical placement mask, one class-compatible
 persistent LRC and firmware engine selection; the host does not pick a physical
@@ -680,12 +683,14 @@ uses `block_on_spin` for lock/IRQ callers outside executor polls. Neither wait
 owns or cancels the request's residency.
 
 `SubmissionProfile::for_generation` selects `Gen12GuC` for Tiger/Alder/
-Raptor Lake and the separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
-has no submission profile. Existing default RCS/media production attach paths
-admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
-The physical GuC path below starts owned RCS0 contexts on the exact Gen12
-firmware families described below, MTL/Arrow, DG2 and BMG. Other engine/media/cache inventory, accelerated PRIME/KMS
-integration and Mesa interoperability remain outstanding. Graphics APIs and shader/state
+Raptor Lake and the separate Xe-LPG GuC path for Meteor/Arrow Lake. This
+legacy generation-only selector refuses LNL/PTL; their native execution
+requires the exact PCI/GMD/firmware and headless owner described below.
+Existing default legacy RCS/media attach paths admit only Gen12 before MMIO.
+A display gate cannot admit a render engine. The physical GuC path starts
+owned contexts on exact Gen12, MTL/Arrow, DG2/BMG and qualified headless
+LNL/PTL profiles. Separate media GTs, broader storage/PRIME integration and
+Mesa acceptance remain outstanding. Graphics APIs and shader/state
 generation belong in userspace.
 
 `intel_gpu_gtt::PteFormat` distinguishes Gen12 and Xe-LPG GPU encodings:
@@ -954,12 +959,15 @@ default-context priming or resident batch admission. A failed verification
 returns `GtError::Registers` and enters Lost without repairing live policy or
 releasing DMA owners/reservations. GuC reset plus full-engine reset remains
 required before terminal reset fences or reclamation. The policy covers only
-the admitted Gen12, DG2, Xe-LPG12.70/12.71/12.74 and BMG20.01/20.02 engine
-profiles; legacy standalone execlists and media engines require their own tables.
+the admitted Gen12, DG2, Xe-LPG12.70/12.71/12.74, BMG20.01/20.02 and exact
+headless LNL/PTL engine profiles. Qualified main-GuC Gen12 VIDEO/ENHANCE
+uses the source timestamp-only policy described below; legacy standalone
+execlists and separate media GTs require their own tables.
 Installing OA register access alone does not open an OA stream or userspace queue.
 
 This covers the graphics GT and its admitted RCS0, BCS0, BMG BCS8 and fused
-compute engines; media engines require their own tables before admission. The
+compute engines, plus the fuse-present Gen12 main-GuC VIDEO/ENHANCE profile
+described below. Separate media GTs remain refused. The
 owner enables their rings under both wake holds and stops GuC before rewriting
 ADS. The reload enables RCS0 (GuC class 0), copy (class 3) and compute (class 4),
 installing their mapping/enable masks, per-engine HWS/register saves
@@ -1601,16 +1609,17 @@ asset. No synchronous bridge waits run inside executor polls. A failed cleanup
 is not retried forever.
 
 `intel_gpu_gt_irq` owns single-vector PCI MSI and the single-tile master
-hierarchy on the admitted MTL/Arrow, DG2 and BMG physical functions. Active
+hierarchy on the admitted physical GuC functions. Active
 firmware MSI/MSI-X, an enabled tile master, VMD shared routing, unavailable
 registers or unrelated master indications refuse takeover without writes.
 Graphics GuC GUC2HOST and RCS0/BCS0/BMG-BCS8 MI_USER/FLUSH sources (RENDER_COPY
 ENGINE1/ENGINE0 halves, RCS0/BCS RSVD masks and both ring IMRs) are enabled with masked
 updates and readback checks preserving other engine/media bits; all-ones
 mask registers are valid. Hard IRQ only masks/posts the tile
-master and records pending work; task context decodes bank-zero identities.
+master and records pending work; task context decodes bank-zero identities
+and the separately qualified Gen12 bank-one VIDEO/ENHANCE identities below.
 Identity VALID waits use 10 microsecond timer retries with a 100 microsecond
-deadline, never a register spin loop. Only exact RCS0/COPY0/COPY8/OTHER0 source classes,
+deadline, never a register spin loop. Only exact published engine/source classes,
 instances and admitted cause bits are acknowledged, identity before bank.
 Unrelated display/media/tile causes remain unacknowledged and close IRQ
 delivery. The worker snapshots the dispatch epoch before servicing causes,
@@ -1660,8 +1669,9 @@ is independent. Registry snapshots captured before publication remain absent.
 
 `DrmCard::intel_topology` defaults to absence. QUERY_TOPOLOGY returns the union
 of geometry/compute DSS; QUERY_GEOMETRY_SUBSLICES accepts only render class 0,
-instance 0 (item flags 0), and requires geometry DSS. XeHP-and-later wire data has one software
-slice and32 DSS slots without compaction; Gen12 has its real one-slice/six-DSS
+instance 0 (item flags 0), and requires geometry DSS. Admitted non-PTL
+XeHP-and-later wire data has one software slice and 32 DSS slots without
+compaction; PTL retains the 96-slot extension described below. Gen12 has its real one-slice/six-DSS
 layout. Both use EU strides of two bytes for paired
 SIMD8 or one for the admitted SIMD16 format, and zero EU masks for disabled
 DSS. Header fields are little endian; capacities may exceed the exact reply
@@ -1724,7 +1734,8 @@ MMIO and checks both the WOPCM exclusion window and GuC GGTT ceiling.
 `begin_enable` requires authenticated/ready firmware;
 MMIO SELF_CFG registers receive before send using 64-bit address KLVs and byte
 sizes, then CONTROL_CTB enables communication. `allocate_for_platform` admits
-only the explicit Gen12/MTL/DG2/BMG GuC profiles; DG2/BMG also require coherent backing.
+only the explicit Gen12/MTL/DG2/BMG/LNL/PTL GuC profiles; DG2/BMG and the
+headless LNL/PTL arena also require coherent backing.
 Each bounded mailbox poll
 advances one state; BUSY/RETRY cannot extend its deadline and retries are
 bounded. `wait_transition` uses timer awaits without an IRQ lock. Cancellation
@@ -1772,9 +1783,12 @@ HWCONFIG. TGL/S/N skip its action, expose a zero-length Xe table and use source
 six-DSS steering fallback; malformed present scalars still refuse. Static
 fuses and reference clock remain independently observed.
 
-The owner qualifies RCS0/BCS0 only. Source engine/LRC workarounds, the Gen12
-thirteen-pair register-image layout, upper descriptor class, fourteen/two-page
-contexts, exact first LRI and completion cache drains precede publication.
+The owner qualifies RCS0/BCS0 and only VCS/VECS present in two matching
+inverted-polarity0x9140 fuse samples. VIDEO/ENHANCE UAPI classes2/3 map to
+GuC classes1/2 with dense logical and retained sparse physical identities.
+Source engine/LRC workarounds, the Gen12 thirteen-pair register-image layout,
+upper descriptor class, fourteen-page RCS/two-page nonrender contexts,
+exact first LRI and completion cache drains precede publication.
 Every fresh private ring carries protected timestamp mid/post-restore batches
 in its unused second page, with a4 KiB command bound; copied golden/user images
 repatch to that new ring and preserve the class-specific restore offset.
@@ -1782,7 +1796,8 @@ User active markers follow the restore workarounds. ADS preserves source
 masked/MCR engine registers under cached nonterminated steering plus all32
 LNCF words across isolated reset. Nonprivileged RCS grants are only
 PS_INVOCATION_COUNT read and COMMON_SLICE_CHICKEN1/HIZ read-write; BCS has only
-CTX_TIMESTAMP read. All unused slots clear before any new grant.
+CTX_TIMESTAMP read, as do all qualified Gen12 nonrender engines for their
+own timestamp. All unused slots clear before any new grant.
 
 Before whole-engine reset, after GuC reset and firmware DMA idle, bounded
 Wa22011802037 acquires only present media forcewake domains using stable
@@ -1797,8 +1812,9 @@ the engines or erase installed cache/workaround policy.
 
 The fixed Gen12 internal Pipe-A primary retains the driver-established linear
 XR24 console route, PPS, timing, CDCLK, DBUF, DDB and watermark image. It
-requires exact unrotated/uncompressed plane control, zero auxiliary/cursor
-consumers, no other active pipe and the live per-function GuC owner. Native
+requires exact family-qualified unrotated/uncompressed plane control, zero
+foreign auxiliary/cursor consumers, no other active pipe and the live
+per-function GuC owner. A separately qualified retained cursor may coexist. Native
 WC SCANOUT flips preserve stride/visible bandwidth; each admission and latch
 publication rechecks that resource image. Restore/reset handback also verifies
 every original console PTE against retained physical backing before arming
@@ -1908,6 +1924,146 @@ The legacy Gen12 arena also checks its 39-bit physical-address limit before
 writing any GGTT entry. Legacy PPGTT attachment rejects roots outside that
 limit before patching its retained context image. A qualified DG2 arena keeps
 its distinct 46-bit DMA limit; the shared wire codec is not platform proof.
+
+### Intel headless LNL/PTL main-GT execution
+
+LNL accepts only PCI 6420/64a0/64b0, observed graphics 20.04/media 20.00 and
+`xe/lnl_guc_70.bin` 70.53.0+. PTL accepts only PCI
+b080/b081/b082/b083/b084/b085/b086/b087/b08f/b090/b0a0/b0b0,
+graphics 30.00/30.01, media 30.00 and `xe/ptl_guc_70.bin` 70.54.0+.
+These integrated profiles use DMA46, default 2 MiB WOPCM and source-selected
+five-level PPGTT root4 with a 48-bit VA ceiling. Existing constructors retain
+root3; explicit root4 requires the Xe2 encoding. Only programmed uncompressed
+PATs and source Xe2 MOCS/UC3 command policy are admitted. BMG discrete-memory
+and MERT assumptions do not apply. Every advertised RCS0/BCS0/BCS8/fused-CCS
+engine passes default-state and private-VM startup execution before publication.
+
+A fresh noncloneable driver-FLR receipt binds function, BAR extent and reset
+incarnation before the first arena PTE. This is the source whole-device
+GT/display driver reset, not PCIe FLR. The card ClientGate excludes DRM
+clients; install-once `install_lnl_boot_scanout_exclusion` defaults to refusal
+and permanently closes both boot-framebuffer and graphics-console publication
+before reset. Ever-published/paused/withdrawn boot graphics cannot pass this
+contract. Initial graphical boot and owned display handoff remain refused.
+Fresh PF/PCI command/D0/BAR, graphics/media identity, wake, GuC/DMA/full-reset
+and cache proofs replace every pre-reset observation. Secondary display-status
+checks are refusal probes, not substitutes for whole-display reset retirement.
+
+The retained media proof covers all arena mapping/invalidation writes. Source
+63-PTE media-GMD dummy-write ordering applies to LNL and pre-B0 media 30.00 PTL.
+`BootAllocator::retire_ggtt` defaults to refusal; successful sealing invalidates
+all tracked ranges before media wake release. Later backing drops issue no
+MMIO. Unknown or failed retirement retains pages, ranges and wake ownership.
+All LNL/PTL GPU MMIO reads first perform four raw literal-zero writes to
+root 0x130030 (Wa15015404425). Every raw operation independently checks current
+capability, function/class/BAR/PCI command/D0 and PF status. Only the bounded
+four-zero/VF_CAP bootstrap precedes recorded PF qualification. A bounded
+extended-cap walk allows missing SR-IOV and refuses malformed lists, active
+VFEnable/NumVFs or lost authority. Media execution is unowned, so no later
+B0 workaround-disable transition is assumed.
+
+Topology masks are immutable u128. Existing profiles preserve low 32 bits and
+4-byte Xe wire masks; PTL retains all 96 physical DSS positions and exactly
+12 wire bytes. HWCONFIG keys 1/70 determine physical grouping, and every
+live DSS must fit source four-bit selector fields. Missing/inconsistent layout
+refuses. PTL legacy 64-bit context SSEU is unavailable. Source IP/step selects
+PAT/LRC/grants/ADS/WAs; PTL SLPC requires separately acknowledged DCC enable4=0
+then disable5=1 before confirmed frequency query. Display, VRAM, compression,
+PXP/SR-IOV, HuC and separate-media-GT scheduling remain unadvertised.
+
+### Intel Gen12 media ownership and legacy selection
+
+All Gen12 nonrender defaults, including BCS, execute generic graphics 12.00
+masked LRC WAs at 0x2580/0x7018/0x7300/0x7304. BCS additionally performs
+BLIT_CCTL RMW; RCS-only commands stay excluded. Video rings use source AUX
+invalidation with LRI MMIO_REMAP bit17, preparser exclusion, TLB-invalidating
+MI_FLUSH_DW start, optional flushed user fence and terminal MI_FLUSH_DW.
+Actual seed/switch/cache-clean/save proof precedes each published default;
+virtual restore captures ENGINE_ID before the active sentinel.
+
+The initial reset owner retains the exact present-media wake requests through
+scheduling and GuC reload. Stop transfers that same owner back to bounded
+CS/GPM/full reset. Full-reset/DMA-idle and all owned ACK release precede graph
+or fence reclamation; failures and cancelled waits retain uncertain state.
+Even VIDEO engines also receive GT-lifetime WA14011060649 at base+0x3f10 bit22,
+outside engine ADS saves. Only Gen12 media moves KLV from ADS+0x3000 to +0x5000;
+complete saves start +0x2000 and end before KLV, with private data still +0x6000.
+All extents and golden/HWSP overlap exclusions validate before header writes.
+Present media IRQs use graphics-master bank 1 and source physical pair masks;
+identity validates/acks before its own bank status. Fused/foreign/malformed or
+timed-out identities keep delivery masked and never establish retirement.
+
+I915 HAS_BSD/HAS_BSD2/HAS_VEBOX derives from the current published Gen12 media
+inventory; HAS_BLT derives from published COPY0 on every existing profile.
+Lost, zero-epoch or wrong-platform status supplies no capability. Legacy BSD
+and VEBOX use dense logical engines with independent persistent per-context
+UserContexts covered by existing VM exclusion, reservations, throttle/reset
+accounting and terminal/full-reset ownership. Explicit engine maps ignore BSD
+selector bits14:13. Legacy non-BSD rejects them. Multiple VIDEO engines accept
+DEFAULT/RING1/RING2; RING1/2 mean logical0/1 and selector3 refuses. DEFAULT is
+stable per open across contexts; initial choices rotate without a randomness
+or fairness promise. A single VIDEO ignores selector bits, matching source.
+If no VIDEO engine is published, selection refuses before allocation/DMA.
+HuC/codec acceptance is separate.
+
+### Intel fixed Gen12 views and exact family selection
+
+Joint primary/CTM/native/legacy LUT atomic commits have a separate capability.
+Fixed internal PipeA/DDI-A SST XR24 views retain timing, visible geometry,
+pitch, clocks, PCODE/SAGV, DDB/WM and console mappings. Integer source origins
+and uncompressed X tiling use source512-byte/8-row tiles and stride units.
+All family/source/BO/overfetch bounds precede TEST_ONLY success. Linear CPU
+fallback refuses nonzero modifiers before console access. No scaling, rotation,
+CCS/Y/Tile4, asynchronous flip or new timing/output/plane is admitted here.
+
+Every direct/joint Gen12 SURF uses4KiB alignment on TGL/ADLS and16KiB on ADLP/N,
+including linear synchronous requests. Allocation preserves alignment fragments
+and residual OFFSET bounds. ADLP/N XR24 requires source ARB_SLOTS=1:
+linear/X controls0x94000000/0x94000400; TGL/ADLS/MTL retain0x84000000/
+0x84000400. Gen12 color and resource capture retain exact PCI family, never
+infer P/S/N from broad AlderLake or accept interchangeable controls. Display13
+global DPT disable0x42084bit30 is established only with every fetcher stopped
+and rechecked thereafter; MTL's per-plane witness is separate.
+
+CTL/STRIDE/OFFSET old/current/pending shadows stay distinct from immutable
+route/clock/resource proof. Staging precedes possible command exposure.
+Strict unexposed rollback proves the complete old image; partial programming
+stays quarantined. DSB source/leaf retirement, primary live/status proof and
+profile-specific color checks precede a final shared stable native-frame
+observation, publication and old-window reclamation. Display12 full inactive
+preload and dirty exclusive RAM/visible-bypass restoration keep their existing
+contract. Cursor DMA stays independently owned. Fresh recovery retires source
+before leaf, restores only exact retained original-family linear CTL/stride,
+checks every console PTE and proves a fresh console latch before handback.
+
+`MmioWindow::gen12_display_family()` carries optional immutable exact PCI-family
+metadata for its owned mapping; defaultNone refuses source-dependent external
+activation. Physical ModeWindow/DP/USB-C views retain table-derived family;
+metadata selects register policy and grants no current authority. Unknown or
+inconsistent exact Gen12 IDs refuse before MMIO; MTL/newer external admission
+is unchanged. DP/HDMI require family before link/SCDC/modeset effects and
+retain it for retrain/disconnect. Disconnect returnsbool and false retains
+session/pipe/backing/publication. `MstLink::connect` takes the MMIO view;
+add/remove retain its same family before payload/ledger effects.
+`disconnect` takes the view and returnsResult, refusing foreign family or live
+streams. Root glue retains refused drains and checkpoints completed removals.
+Current capability/wake/raw-view authority and actual teardown proof remain
+independent obligations; no broader external ownership guarantee is implied.
+
+### Intel CPU mapping lifetime
+
+Atomic GEM and same-card PRIME mmap backings return checked CPU physical
+frames plus an Intel CpuMap token. One live CpuBacking per immutable BO
+registers its whole CPU-frame set and retains the same BO/reservation. Local
+rows use CPU BAR addresses independently of GPU local addresses; WB/WC policy
+is unchanged. Primary/render/PRIME `mmap_published` clears the pending token
+only after leaves and owner exist; forwarding is idempotent and failed maps
+drop pending tokens. Physical-row aliases retain backing through unpublished
+fork metadata, including lazy/PROT_NONE metadata after all tokens/handles/PRIME
+fds close. Retirement requires no token or metadata alias, and retired backing
+cannot be reused. Permanent filesystem provider dispatch preserves AMD aliases.
+This does not move immutable BO storage or admit eviction, PREFETCH, USERPTR
+invalidation or asynchronous CPU revocation; GPU/PM/reset/S3 obligations stay.
 
 ### Intel copy, runtime policy and additional scanout layouts
 

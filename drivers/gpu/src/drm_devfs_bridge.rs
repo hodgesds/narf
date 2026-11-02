@@ -328,9 +328,11 @@ impl FileOps for DriCardFile {
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "intel")]
+        crate::intel_gpu_gem::cpu_mapping::published(lifetime);
         #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
-        #[cfg(not(feature = "amdgpu"))]
+        #[cfg(not(any(feature = "intel", feature = "amdgpu")))]
         let _ = lifetime;
     }
     /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
@@ -1034,6 +1036,9 @@ impl FileOps for IntelPrimeDmaBufFile {
     ) -> Result<narf_filesystem::MmapBacking, FsError> {
         self.object.backing(offset, len)
     }
+    fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        crate::intel_gpu_gem::cpu_mapping::published(lifetime);
+    }
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         Ok(self.object.backing(offset, len)?.frames)
     }
@@ -1524,9 +1529,11 @@ impl FileOps for DriRenderFile {
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "intel")]
+        crate::intel_gpu_gem::cpu_mapping::published(lifetime);
         #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
-        #[cfg(not(feature = "amdgpu"))]
+        #[cfg(not(any(feature = "intel", feature = "amdgpu")))]
         let _ = lifetime;
     }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {

@@ -9,8 +9,8 @@
 //! the rows and lease and marks the backing retired; a retired backing is
 //! never reused, so a stale `Weak` upgrade cannot resurrect old frames.
 //!
-//! This registry is the only device-alias provider: the filesystem's alias
-//! hooks are a singleton that refuses replacement by another provider.
+//! This registry is a permanent device-alias provider. The filesystem also
+//! dispatches other providers, whose owned physical frames must be disjoint.
 //!
 //! Lock order: object placement -> `BACKINGS` -> backing frames -> `FRAMES`;
 //! a backing's own placement slot is a leaf lock.

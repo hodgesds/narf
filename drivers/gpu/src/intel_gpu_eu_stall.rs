@@ -63,7 +63,9 @@ impl Info {
         };
         let info = Self {
             card,
-            dss: topology.geometry_dss() | topology.compute_dss(),
+            dss: (topology.geometry_dss() | topology.compute_dss())
+                .try_into()
+                .ok()?,
             per_group: u8::try_from(per_group).ok()?,
         };
         info.validate().ok()

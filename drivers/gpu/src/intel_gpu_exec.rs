@@ -38,8 +38,8 @@ pub struct ExecObject {
 #[derive(Debug)]
 pub struct ExecRequest {
     pub context_id: u32,
-    /// I915_EXEC_RING_MASK: a legacy ring or an index into the context's
-    /// engine map. Selection belongs to the context, as in eb_select_engine.
+    /// Legacy ring/index plus BSD selector bits. The context resolves its
+    /// engine-map index before interpreting legacy-only selector flags.
     pub ring: u32,
     pub batch_va: u64,
     pub batch_len: u64,
@@ -69,6 +69,7 @@ impl ExecRequest {
             }
             GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
         self.prepare_inner(format, pat, table_pat, Some(platform))
@@ -158,8 +159,11 @@ impl ExecRequest {
         let start = u32_at(request, 12) as u64;
         let length = u32_at(request, 16) as u64;
         let flags = u64_at(request, 40);
-        let mut supported =
-            0x3f | abi::EXEC_NO_RELOC | abi::EXEC_HANDLE_LUT | abi::EXEC_BATCH_FIRST;
+        let mut supported = 0x3f
+            | abi::EXEC_BSD_MASK
+            | abi::EXEC_NO_RELOC
+            | abi::EXEC_HANDLE_LUT
+            | abi::EXEC_BATCH_FIRST;
         if explicit {
             supported |= abi::EXEC_FENCE_IN
                 | abi::EXEC_FENCE_OUT
@@ -258,7 +262,7 @@ impl ExecRequest {
         }
         Ok(Self {
             context_id: u64_at(request, 48) as u32,
-            ring: (flags & 0x3f) as u32,
+            ring: (flags & (0x3f | abi::EXEC_BSD_MASK)) as u32,
             batch_va: batch.va + start,
             batch_len,
             objects,
@@ -279,7 +283,13 @@ impl ExecRequest {
         table_pat: u8,
     ) -> Result<AddressSpace, FsError> {
         let mut memory = FramePtMemory::new();
-        let tables = Ppgtt::with_table_pat(&mut memory, format, table_pat).map_err(map_error)?;
+        let tables = Ppgtt::with_root_level(
+            &mut memory,
+            format,
+            table_pat,
+            if format == PteFormat::Xe2 { 4 } else { 3 },
+        )
+        .map_err(map_error)?;
         let mut space = AddressSpace {
             tables: Some(tables),
             memory,
@@ -366,6 +376,7 @@ impl ResidentBatch {
             }
             GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
         if mappings.len() > 4096 {
@@ -388,7 +399,7 @@ impl ResidentBatch {
                 {
                     return Err(FsError::InvalidData);
                 }
-                if platform.is_gen12() && object.is_vram() {
+                if (platform.is_gen12() || platform.is_headless_integrated()) && object.is_vram() {
                     return Err(FsError::InvalidData);
                 }
                 if object.is_vram()
@@ -434,9 +445,20 @@ impl ResidentBatch {
         }
         let mut memory = FramePtMemory::new();
         let tables = if scratch {
-            Ppgtt::with_scratch(&mut memory, format, table_pat, leaf_pat)
+            Ppgtt::with_scratch_root_level(
+                &mut memory,
+                format,
+                table_pat,
+                leaf_pat,
+                platform.ppgtt_root_level(),
+            )
         } else {
-            Ppgtt::with_table_pat(&mut memory, format, table_pat)
+            Ppgtt::with_root_level(
+                &mut memory,
+                format,
+                table_pat,
+                if format == PteFormat::Xe2 { 4 } else { 3 },
+            )
         }
         .map_err(map_error)?;
         let mut space = AddressSpace {

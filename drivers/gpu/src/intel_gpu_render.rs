@@ -39,7 +39,7 @@ impl SubmissionProfile {
         match generation {
             Generation::TigerLake | Generation::AlderLake => Self::Gen12GuC,
             Generation::MeteorLake => Self::XeLpgGuC,
-            Generation::PantherLake => Self::Unsupported,
+            Generation::LunarLake | Generation::PantherLake => Self::Unsupported,
         }
     }
 }
@@ -109,6 +109,7 @@ type EngineMap = Vec<Option<crate::intel_gpu_engine::EngineSet>>;
 struct Context {
     user: Arc<crate::intel_gpu_user::UserContext>,
     copy: Arc<crate::intel_gpu_user::UserContext>,
+    media: BTreeMap<crate::intel_gpu_engine::Engine, Arc<crate::intel_gpu_user::UserContext>>,
     engines: Option<Vec<Option<Arc<crate::intel_gpu_user::UserContext>>>>,
     /// i915 GRAPHICS_VER 12 contexts stay proto-contexts until first lookup;
     /// only then is the engine map immutable.
@@ -126,6 +127,7 @@ impl Context {
         Self {
             user: crate::intel_gpu_user::UserContext::new(),
             copy: crate::intel_gpu_user::UserContext::for_engine(Engine::Bcs0),
+            media: BTreeMap::new(),
             engines: None,
             finalized,
             vm,
@@ -139,22 +141,35 @@ impl Context {
     fn users(&self) -> Vec<Arc<crate::intel_gpu_user::UserContext>> {
         let mut users = alloc::vec![self.user.clone(), self.copy.clone()];
         users.extend(self.engines.iter().flatten().flatten().cloned());
+        users.extend(self.media.values().cloned());
         users
     }
 
-    /// i915_gem_execbuffer.c::eb_select_engine. Legacy DEFAULT/RENDER select
-    /// RCS0 and BLT selects BCS0; BSD/VEBOX name absent engines (EINVAL).
-    fn select(&mut self, ring: u32) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
+    /// An indexed map uses only RING_MASK; legacy media is selected from the
+    /// current published dense class map before a context state is allocated.
+    fn select(
+        &mut self,
+        ring: u32,
+        media: Option<crate::intel_gpu_engine::Engine>,
+    ) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
         self.finalized = true;
         match &self.engines {
             Some(map) => map
-                .get(ring as usize)
+                .get((ring & 0x3f) as usize)
                 .cloned()
                 .flatten()
                 .ok_or(FsError::InvalidData),
-            None => match u64::from(ring) {
+            None => match u64::from(ring & 0x3f) {
                 0 | abi::EXEC_RENDER => Ok(self.user.clone()),
                 abi::EXEC_BLT => Ok(self.copy.clone()),
+                abi::EXEC_BSD | abi::EXEC_VEBOX => {
+                    let engine = media.ok_or(FsError::InvalidData)?;
+                    Ok(self
+                        .media
+                        .entry(engine)
+                        .or_insert_with(|| crate::intel_gpu_user::UserContext::for_engine(engine))
+                        .clone())
+                }
                 _ => Err(FsError::InvalidData),
             },
         }
@@ -251,6 +266,7 @@ struct Namespaces {
     next_vm: u32,
     contexts: BTreeMap<u32, Context>,
     vms: BTreeMap<u32, Arc<Vm>>,
+    bsd_default: Option<crate::intel_gpu_engine::Engine>,
 }
 
 impl Namespaces {
@@ -258,6 +274,73 @@ impl Namespaces {
         self.contexts
             .entry(0)
             .or_insert_with(|| Context::new(Arc::new(Vm { _identity: 0 }), true));
+    }
+
+    /// Pinned i915_gem_execbuffer.c::eb_select_legacy_ring: explicit maps
+    /// ignore BSD flags; legacy non-BSD rejects them. With one VIDEO engine,
+    /// Linux ignores BSD selector bits; with multiple, only DEFAULT/1/2 exist.
+    fn select(
+        &mut self,
+        id: u32,
+        ring: u32,
+        info: &DeviceInfo,
+    ) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
+        self.initialize();
+        let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
+        context.finalized = true;
+        if context.engines.is_some() {
+            return context.select(ring, None);
+        }
+        let selector = (u64::from(ring) & abi::EXEC_BSD_MASK) >> abi::EXEC_BSD_SHIFT;
+        let legacy = u64::from(ring & 0x3f);
+        if legacy != abi::EXEC_BSD && selector != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let media = if matches!(legacy, abi::EXEC_BSD | abi::EXEC_VEBOX) {
+            if !info.platform.is_gen12() {
+                return Err(FsError::InvalidData);
+            }
+            let present = info.user_status().ok_or(FsError::NoDevice)?.engines;
+            let class = if legacy == abi::EXEC_BSD { 2 } else { 3 };
+            let count = present.iter().filter(|e| e.xe_class() == class).count();
+            if count == 0 {
+                return Err(FsError::InvalidData);
+            }
+            Some(if legacy == abi::EXEC_BSD && count > 1 {
+                match selector {
+                    0 => {
+                        // Linux retains one default VIDEO per open. NARF's
+                        // bounded scheduling choice rotates between opens;
+                        // neither random balancing nor fairness is UAPI.
+                        static NEXT: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        let engine = *self.bsd_default.get_or_insert_with(|| {
+                            let logical = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                                as usize
+                                % count;
+                            present
+                                .from_class_instance(2, logical as u16)
+                                .expect("published VIDEO")
+                        });
+                        if !present.contains(engine) {
+                            return Err(FsError::NoDevice);
+                        }
+                        engine
+                    }
+                    1 | 2 => present
+                        .from_class_instance(2, selector as u16 - 1)
+                        .ok_or(FsError::InvalidData)?,
+                    _ => return Err(FsError::InvalidData),
+                }
+            } else {
+                present
+                    .from_class_instance(class, 0)
+                    .expect("nonempty class")
+            })
+        } else {
+            None
+        };
+        context.select(ring, media)
     }
 
     /// ENGINES may only be set once, on a proto-context.
@@ -398,6 +481,7 @@ impl RenderFile {
                 next_vm: 1,
                 contexts: BTreeMap::new(),
                 vms: BTreeMap::new(),
+                bsd_default: None,
             }),
         }
     }
@@ -530,11 +614,7 @@ impl RenderFile {
         let context = {
             let mut namespaces = self.namespaces.lock();
             namespaces.initialize();
-            namespaces
-                .contexts
-                .get_mut(&request.context_id)
-                .ok_or(FsError::NotFound)?
-                .select(request.ring)?
+            namespaces.select(request.context_id, request.ring, info)?
         };
         let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
         let _order = context.serial.lock().await;
@@ -585,10 +665,10 @@ impl RenderFile {
                 }
                 Err(OutputError::Io(error)) => return Err(error),
                 Err(OutputError::Install(narf_filesystem::InstallFdError::NoDescriptor)) => {
-                    return Ok((-24i64) as u64)
+                    return Ok((-24i64) as u64);
                 }
                 Err(OutputError::Install(narf_filesystem::InstallFdError::Report(error))) => {
-                    return Err(error)
+                    return Err(error);
                 }
             }
         }
@@ -789,6 +869,9 @@ impl RenderFile {
             _ => return Err(FsError::InvalidData),
         }
         let topology = observed_topology(info)?;
+        if info.platform.is_ptl() {
+            return Err(FsError::NoDevice);
+        }
         let eus = match topology.eu_type() {
             crate::intel_gpu_topology::EuType::Simd8 => 16u16,
             crate::intel_gpu_topology::EuType::Simd16 => 8,
@@ -799,7 +882,7 @@ impl RenderFile {
         put64(
             &mut wire,
             16,
-            u64::from((topology.geometry_dss() | topology.compute_dss()) & 0xff),
+            ((topology.geometry_dss() | topology.compute_dss()) & 0xff) as u64,
         );
         wire[24..26].copy_from_slice(&eus.to_le_bytes());
         wire[26..28].copy_from_slice(&eus.to_le_bytes());
@@ -945,10 +1028,10 @@ impl RenderFile {
                 }
                 match cmd {
                     abi::GEM_SET_TILING if u32_at(&request, 4) != 0 || u32_at(&request, 8) != 0 => {
-                        return Err(FsError::InvalidData)
+                        return Err(FsError::InvalidData);
                     }
                     abi::GEM_SET_CACHING if u32_at(&request, 4) != 1 => {
-                        return Err(FsError::InvalidData)
+                        return Err(FsError::InvalidData);
                     }
                     abi::GEM_GET_CACHING => put32(&mut request, 4, 1),
                     abi::GEM_GET_TILING | abi::GEM_SET_TILING => request[4..].fill(0),
@@ -1280,7 +1363,23 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         1..=3 | 14 => return Err(FsError::NoDevice),
         4 => info.device_id as i32,
         5 => 1, // GEM storage is available independently of acceleration.
-        9 | 11 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
+        9 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
+        // i915_getparam.c queries published logical engines, not raw fuse
+        // presence or a different native profile's unadmitted media GT.
+        10 | 11 | 22 | 31 => {
+            let (class, logical) = match param {
+                10 => (2, 0),
+                11 => (1, 0),
+                22 => (3, 0),
+                _ => (2, 1),
+            };
+            i32::from(
+                (param == 11 || info.platform.is_gen12())
+                    && info.user_status().is_some_and(|status| {
+                        status.engines.from_class_instance(class, logical).is_some()
+                    }),
+            )
+        }
         18 => {
             if info.submission_ready() {
                 3
@@ -1332,15 +1431,14 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             }
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
-        // Explicitly absent features; do not advertise media, perf, USERPTR,
+        // Explicitly absent features; do not advertise perf, USERPTR,
         // secure dispatch, CPU coherency or unimplemented scheduler controls.
         6..=8
-        | 10
         | 12..=13
         | 15..=17
-        | 20..=24
+        | 20..=21
+        | 23..=24
         | 27..=29
-        | 31
         | 35..=36
         | 38..=39
         | 42..=43
@@ -2193,7 +2291,9 @@ pub(crate) mod tests {
                 let expected = match entry.generation {
                     Generation::TigerLake | Generation::AlderLake => SubmissionProfile::Gen12GuC,
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
-                    Generation::PantherLake => SubmissionProfile::Unsupported,
+                    Generation::LunarLake | Generation::PantherLake => {
+                        SubmissionProfile::Unsupported
+                    }
                 };
                 if SubmissionProfile::for_generation(entry.generation) != expected {
                     return Err("submission generation dispatch");

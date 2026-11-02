@@ -68,7 +68,8 @@ pub(crate) struct Bind {
 pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
     match platform {
         GtPlatform::Alchemist | GtPlatform::Gen12(_) => pat == 0,
-        GtPlatform::Battlemage => matches!(pat, 1 | 2 | 4 | 5 | 7),
+        _ if platform.is_xe2() => matches!(pat, 1 | 2 | 4 | 5 | 7),
+        GtPlatform::Battlemage => unreachable!("Xe2 handled above"),
         GtPlatform::Integrated(_) => matches!(pat, 3 | 4),
     }
 }
@@ -80,6 +81,7 @@ pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
 pub(crate) fn pat_noncoherent(platform: GtPlatform, pat: u16) -> bool {
     match platform {
         GtPlatform::Gen12(_) => matches!(pat, 1..=3),
+        _ if platform.is_headless_integrated() => pat == 3, // noncompressed UC, xe_pat.c
         GtPlatform::Integrated(_) => matches!(pat, 1 | 2),
         _ => false,
     }

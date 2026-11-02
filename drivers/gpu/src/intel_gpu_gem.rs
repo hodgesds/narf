@@ -27,6 +27,9 @@ static NEXT_MMAP: AtomicU64 = AtomicU64::new(MMAP_BASE);
 // after it. Never retain the gate across an await or user-memory callback.
 static RESERVATIONS: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
+#[path = "intel_gpu_cpu_mapping.rs"]
+pub(crate) mod cpu_mapping;
+
 #[derive(Debug)]
 pub struct GemObject {
     frames: Vec<PhysFrame>,
@@ -350,33 +353,30 @@ impl GemObject {
 
     /// Relative mapping used by PRIME exports as well as GEM mmap offsets.
     pub fn backing(self: &Arc<Self>, offset: u64, len: usize) -> Result<MmapBacking, FsError> {
+        cpu_mapping::backing(self.clone(), offset, len)
+    }
+
+    /// CPU physical frames, including BAR addresses for LMEM. GPU `pages()`
+    /// deliberately uses device-local addresses instead and cannot supply
+    /// the CPU alias census. Storage is immutable in this ownership slice.
+    fn cpu_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         if len == 0 || offset % PAGE != 0 {
             return Err(FsError::InvalidData);
         }
         self.range(offset, len)?;
         let pages =
             (offset / PAGE) as usize..(offset / PAGE) as usize + len.div_ceil(PAGE as usize);
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(pages.len())
+            .map_err(|_| FsError::OutOfMemory)?;
         if let Some(vram) = &self.vram {
             // LMEM BAR frames, write-combining as Linux's VRAM mmap.
-            return Ok(MmapBacking {
-                frames: pages
-                    .map(|page| vram.cpu_address() + page as u64 * PAGE)
-                    .collect(),
-                lifetime: Some(self.clone()),
-                memory_type: narf_memory::MemoryType::WriteCombining,
-            });
+            frames.extend(pages.map(|page| vram.cpu_address() + page as u64 * PAGE));
+        } else {
+            frames.extend(self.pages().skip(pages.start).take(pages.len()));
         }
-        let frames = self.pages().skip(pages.start).take(pages.len()).collect();
-        Ok(MmapBacking {
-            frames,
-            lifetime: Some(self.clone()),
-            // memory/ maps retyped pages with their recorded WC type.
-            memory_type: if self.is_wc() {
-                narf_memory::MemoryType::WriteCombining
-            } else {
-                narf_memory::MemoryType::WriteBack
-            },
-        })
+        Ok(frames)
     }
 
     pub fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), FsError> {

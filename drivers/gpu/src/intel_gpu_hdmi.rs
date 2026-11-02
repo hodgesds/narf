@@ -679,6 +679,8 @@ pub struct HdmiSinkProbe {
 /// A live HDMI connection.
 #[derive(Clone, Debug)]
 pub struct HdmiConnection {
+    /// Exact source family retained through disconnect.
+    pub family: crate::intel_gpu_gt::Gen12Platform,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
     /// The mode being scanned out.
@@ -748,6 +750,9 @@ pub fn activate<M: MmioWindow + ?Sized>(
     probe: &HdmiSinkProbe,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
+    let family = mmio
+        .gen12_display_family()
+        .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let pin = pin_pair_for(probe.ddi).ok_or(DdcError::NoPinPair)?;
     let mut scrambling = false;
     if probe.scrambling_required {
@@ -755,6 +760,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
         scrambling = true;
     }
     let mut modeset = Modeset::new(mmio, probe.ddi);
+    modeset.set_gen12_family(family);
     let mode = modeset.modeset_hdmi(fb, &probe.mode, scrambling, scrambling)?;
 
     let frame = pack_avi_infoframe(&mode);
@@ -776,6 +782,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     }
 
     Ok(HdmiConnection {
+        family,
         ddi: probe.ddi,
         mode,
         audio_published,
@@ -791,6 +798,8 @@ pub fn connect<M: MmioWindow + ?Sized>(
     ddi: Ddi,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
+    mmio.gen12_display_family()
+        .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let probe = probe_sink(mmio, ddi)?;
     activate(mmio, &probe, fb)
 }
@@ -798,15 +807,21 @@ pub fn connect<M: MmioWindow + ?Sized>(
 /// Disconnect: silence audio (codec disable + sink clear) and
 /// stop the infoframes before the pipeline comes down — the
 /// DP session's ordering, for the same reason: no consumer
-/// may act on an ELD whose display is already gone.
-pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) {
+/// may act on an ELD whose display is already gone. False means the source
+/// family no longer matches; no side effects occur and the session is retained.
+pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bool {
+    if mmio.gen12_display_family() != Some(conn.family) {
+        return false;
+    }
     if conn.audio_published {
         intel_gpu_audio::hdmi_audio_codec_disable(mmio, Transcoder::A);
         clear_display_audio(sink_id_for(conn.ddi));
     }
     disable_infoframes(mmio, Transcoder::A);
     let mut modeset = Modeset::new(mmio, conn.ddi);
+    modeset.set_gen12_family(conn.family);
     modeset.teardown();
+    true
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1023,6 +1038,7 @@ pub mod tests {
 
     #[derive(Debug)]
     pub struct HdmiSinkMmio {
+        family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
         regs: RefCell<BTreeMap<u64, u32>>,
         pub writes: RefCell<Vec<(u64, u32)>>,
         sink: RefCell<GmbusSink>,
@@ -1037,6 +1053,7 @@ pub mod tests {
             let mut regs = BTreeMap::new();
             regs.insert(crate::intel_gpu_pll::DSSM, 1u32 << 29);
             Self {
+                family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
                 regs: RefCell::new(regs),
                 writes: RefCell::new(Vec::new()),
                 sink: RefCell::new(sink),
@@ -1063,6 +1080,9 @@ pub mod tests {
     }
 
     impl MmioWindow for HdmiSinkMmio {
+        fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+            *self.family.borrow()
+        }
         fn read32(&self, off: u64) -> u32 {
             if off == GMBUS2 {
                 return self.sink.borrow().gmbus2();
@@ -1640,5 +1660,71 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_disconnect_tears_down
+    );
+
+    fn smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        for (family, expected) in [
+            (Gen12Platform::TigerLake, 0x84000000),
+            (Gen12Platform::AlderLakeS, 0x84000000),
+            (Gen12Platform::AlderLakeP, 0x94000000),
+            (Gen12Platform::AlderLakeN, 0x94000000),
+        ] {
+            let mmio = HdmiSinkMmio::new(
+                Ddi::B,
+                GmbusSink::new(fixture_edid_hdmi(
+                    148_500,
+                    1920,
+                    280,
+                    1080,
+                    45,
+                    HfFixture::Scdc,
+                )),
+            );
+            *mmio.family.borrow_mut() = Some(family);
+            let conn = connect(&mmio, Ddi::B, &test_fb(8192)).unwrap();
+            assert_eq!(conn.family, family);
+            assert_eq!(mmio.writes_to(0x70180).last(), Some(&expected));
+            let before = mmio.writes.borrow().len();
+            *mmio.family.borrow_mut() = Some(if family == Gen12Platform::AlderLakeP {
+                Gen12Platform::AlderLakeN
+            } else {
+                Gen12Platform::AlderLakeP
+            });
+            assert!(!disconnect(&mmio, &conn));
+            *mmio.family.borrow_mut() = None;
+            assert!(!disconnect(&mmio, &conn));
+            assert_eq!(mmio.writes.borrow().len(), before);
+            *mmio.family.borrow_mut() = Some(family);
+            assert!(disconnect(&mmio, &conn));
+            assert_eq!(
+                mmio.writes_to(0x70180).last().unwrap() & 0x70000000,
+                expected & 0x70000000
+            );
+        }
+        let mmio = HdmiSinkMmio::new(
+            Ddi::B,
+            GmbusSink::new(fixture_edid_hdmi(
+                594_000,
+                3840,
+                560,
+                2160,
+                90,
+                HfFixture::Scdc,
+            )),
+        );
+        *mmio.family.borrow_mut() = None;
+        assert!(matches!(
+            connect(&mmio, Ddi::B, &test_fb(15360)),
+            Err(HdmiError::Modeset(ModesetError::UnsupportedGeneration))
+        ));
+        assert!(mmio.writes.borrow().is_empty());
+        assert!(mmio.sink.borrow().programs.is_empty());
+        assert!(mmio.sink.borrow().scdc_applied.is_empty());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal
     );
 }

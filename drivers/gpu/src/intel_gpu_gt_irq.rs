@@ -1,4 +1,4 @@
-//! Graphics GuC/render/copy/compute delivery for single-tile physical functions.
+//! Main GuC/render/copy/compute and qualified Gen12 media IRQ delivery.
 //! MIT Linux xe_irq.c and xe_guc.c, b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 //! The hard handler only masks the tile master. Identity waits and GuC work
 //! run in task context; IRQ notification never proves DMA retirement.
@@ -40,6 +40,54 @@ const CCS_ENABLE: u64 = 0x190048;
 const CCS_MASK: u64 = 0x190100;
 const CCS_MASKS: [u64; 2] = [CCS_MASK, 0x190104];
 const CCS_BASES: [u64; 4] = [0x1a000, 0x1c000, 0x1e000, 0x26000];
+const MEDIA_ENABLE: u64 = 0x190034;
+const MEDIA_MASKS: [u64; 6] = [0x1900a8, 0x1900ac, 0x1900b0, 0x1900b4, 0x1900d0, 0x1900d4];
+const MEDIA: [Engine; 12] = [
+    Engine::Vcs0,
+    Engine::Vcs1,
+    Engine::Vcs2,
+    Engine::Vcs3,
+    Engine::Vcs4,
+    Engine::Vcs5,
+    Engine::Vcs6,
+    Engine::Vcs7,
+    Engine::Vecs0,
+    Engine::Vecs1,
+    Engine::Vecs2,
+    Engine::Vecs3,
+];
+fn media_pair_mask(engines: EngineSet, pair: usize) -> u32 {
+    (if engines.contains(MEDIA[pair * 2]) {
+        RCS_EVENTS
+    } else {
+        0
+    }) | if engines.contains(MEDIA[pair * 2 + 1]) {
+        RCS
+    } else {
+        0
+    }
+}
+fn media_enable(engines: EngineSet) -> u32 {
+    (if engines.iter().any(|e| e.is_decode()) {
+        RCS_EVENTS
+    } else {
+        0
+    }) | if engines.iter().any(|e| e.xe_class() == 3) {
+        RCS
+    } else {
+        0
+    }
+}
+fn media_bits(engines: EngineSet) -> u32 {
+    engines.iter().fold(0, |bits, e| {
+        bits | (1
+            << if e.is_decode() {
+                e.physical_instance()
+            } else {
+                31 - e.physical_instance()
+            })
+    })
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum IrqError {
@@ -65,6 +113,9 @@ struct Saved {
     ccs_enable: u32,
     ccs: [u32; 2],
     ccs_ring: [u32; 4],
+    media_enable: u32,
+    media_masks: [u32; 6],
+    media_ring: [u32; 12],
 }
 
 struct State<M> {
@@ -73,10 +124,12 @@ struct State<M> {
     /// CCS0 is a published engine and owns its sources.
     compute: u8,
     copy8: bool,
+    media: EngineSet,
     tiled: bool,
     active: bool,
     pending: bool,
-    bits: u32,
+    bits: [u32; 2],
+    bank: usize,
     selected: u32,
     deadline: u64,
 }
@@ -130,6 +183,8 @@ impl<M: MmioWindow> Controller<M> {
             .compute()
             .fold(0u8, |mask, engine| mask | 1 << engine.physical_instance());
         let copy8 = engines.contains(Engine::Bcs8);
+        let media = EngineSet::of(&MEDIA).bits() & engines.bits();
+        let media = EngineSet::from_bits(media);
         // No other owner may have delivery enabled. Never commandeer firmware
         // MSI or enable a master with an unhandled display/media indication.
         if !tiled && (compute != 0 || copy8) {
@@ -139,7 +194,7 @@ impl<M: MmioWindow> Controller<M> {
         let master = read(&mmio, MASTER)?;
         if tile & ENABLE != 0
             || tile & !(ENABLE | 1) != 0
-            || master & !(ENABLE | 1) != 0
+            || master & !(ENABLE | 1 | if media_enable(media) != 0 { 2 } else { 0 }) != 0
             || (!tiled && master & ENABLE != 0)
         {
             return Err(IrqError::Conflict);
@@ -171,6 +226,25 @@ impl<M: MmioWindow> Controller<M> {
                     0
                 }
             }),
+            media_enable: if media_enable(media) != 0 {
+                read(&mmio, MEDIA_ENABLE)?
+            } else {
+                0
+            },
+            media_masks: core::array::from_fn(|pair| {
+                if media_pair_mask(media, pair) != 0 {
+                    mmio.read32(MEDIA_MASKS[pair])
+                } else {
+                    0
+                }
+            }),
+            media_ring: core::array::from_fn(|index| {
+                if media.contains(MEDIA[index]) {
+                    mmio.read32(u64::from(MEDIA[index].base()) + 0xa8)
+                } else {
+                    0
+                }
+            }),
             ccs_ring: core::array::from_fn(|i| {
                 if compute & (1 << i) != 0 {
                     mmio.read32(CCS_BASES[i] + 0xa8)
@@ -184,10 +258,12 @@ impl<M: MmioWindow> Controller<M> {
             saved,
             compute,
             copy8,
+            media,
             tiled,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
-            bits: 0,
+            bits: [0; 2],
+            bank: 0,
             selected: 0,
             deadline: 0,
         })))
@@ -218,6 +294,19 @@ impl<M: MmioWindow> Controller<M> {
                 if s.compute & (1 << i) != 0 {
                     routes.push((base + 0xa8, RCS, 0));
                 }
+            }
+        }
+        if media_enable(s.media) != 0 {
+            let enabled = media_enable(s.media);
+            routes.push((MEDIA_ENABLE, enabled, enabled));
+            for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+                let mask = media_pair_mask(s.media, pair);
+                if mask != 0 {
+                    routes.push((reg, mask, 0));
+                }
+            }
+            for engine in s.media.iter() {
+                routes.push((u64::from(engine.base()) + 0xa8, RCS, 0));
             }
         }
         if s.copy8 {
@@ -264,7 +353,7 @@ impl<M: MmioWindow> Controller<M> {
             s.pending = true;
         }
         if s.selected != 0 {
-            let identity = read(&s.mmio, IDENTITY)?;
+            let identity = read(&s.mmio, IDENTITY + s.bank as u64 * 4)?;
             if identity & ENABLE == 0 {
                 return if now >= s.deadline {
                     Err(IrqError::Timeout)
@@ -272,12 +361,21 @@ impl<M: MmioWindow> Controller<M> {
                     Ok(true)
                 };
             }
-            let (expected, class, instance) = match s.selected {
-                RCS0 => (RCS, 0, 0),
-                BCS0 => (RCS, 3, 0),
-                BCS8 => (RCS, 3, 8),
-                bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
-                _ => (0x8000, 4, 0),
+            let (expected, class, instance) = if s.bank == 1 {
+                let bit = s.selected.trailing_zeros();
+                if bit < 8 {
+                    (RCS, 1, bit)
+                } else {
+                    (RCS, 2, 31 - bit)
+                }
+            } else {
+                match s.selected {
+                    RCS0 => (RCS, 0, 0),
+                    BCS0 => (RCS, 3, 0),
+                    BCS8 => (RCS, 3, 8),
+                    bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
+                    _ => (0x8000, 4, 0),
+                }
             };
             if (identity >> 20) & 0x3f != instance
                 || (identity >> 16) & 7 != class
@@ -287,37 +385,51 @@ impl<M: MmioWindow> Controller<M> {
                 return Err(IrqError::Identity);
             }
             // Identity acknowledgement must precede the bank acknowledgement.
-            s.mmio.write32(IDENTITY, identity);
-            s.mmio.write32(DW, s.selected);
-            s.bits &= !s.selected;
+            s.mmio.write32(IDENTITY + s.bank as u64 * 4, identity);
+            s.mmio.write32(DW + s.bank as u64 * 4, s.selected);
+            let bank = s.bank;
+            let selected = s.selected;
+            s.bits[bank] &= !selected;
             s.selected = 0;
         }
-        if s.bits == 0 {
+        if s.bits == [0; 2] {
             let tile = if s.tiled { read(&s.mmio, TILE)? } else { 0 };
             let master = read(&s.mmio, MASTER)?;
-            if tile & !(ENABLE | 1) != 0 || master & !(ENABLE | 1) != 0 {
+            let banks = 1 | if media_enable(s.media) != 0 { 2 } else { 0 };
+            if tile & !(ENABLE | 1) != 0 || master & !(ENABLE | banks) != 0 {
                 return Err(IrqError::Conflict);
             }
             if tile & 1 != 0 {
                 s.mmio.write32(TILE, 1);
             }
-            if master & 1 != 0 {
-                let bits = read(&s.mmio, DW)?;
-                let owned = OWNED | (u32::from(s.compute) << 4) | if s.copy8 { BCS8 } else { 0 };
-                if bits & !owned != 0 {
-                    return Err(IrqError::Conflict);
+            for bank in 0..2 {
+                if master & (1 << bank) != 0 {
+                    let bits = read(&s.mmio, DW + bank as u64 * 4)?;
+                    let owned = if bank == 0 {
+                        OWNED | (u32::from(s.compute) << 4) | if s.copy8 { BCS8 } else { 0 }
+                    } else {
+                        media_bits(s.media)
+                    };
+                    if bits & !owned != 0 {
+                        return Err(IrqError::Conflict);
+                    }
+                    s.bits[bank] = bits;
                 }
-                // GFX master is RW1C status plus its persistent enable bit.
-                // Xe-LP has no outer tile mask: keep its graphics master
-                // disabled until every identity has retired.
-                s.mmio.write32(MASTER, if s.tiled { ENABLE | 1 } else { 1 });
-                s.bits = bits;
+            }
+            if master & banks != 0 {
+                // On Gen12 there is no outer tile mask. Keep the master
+                // disabled while identities in either bank are outstanding.
+                s.mmio.write32(
+                    MASTER,
+                    (if s.tiled { ENABLE } else { 0 }) | (master & banks),
+                );
             }
         }
-        if s.bits != 0 {
-            s.selected = 1 << s.bits.trailing_zeros();
+        if let Some(bank) = s.bits.iter().position(|bits| *bits != 0) {
+            s.bank = bank;
+            s.selected = 1 << s.bits[bank].trailing_zeros();
             s.deadline = now.checked_add(100_000).ok_or(IrqError::Timeout)?;
-            s.mmio.write32(SELECTOR, s.selected);
+            s.mmio.write32(SELECTOR + bank as u64 * 4, s.selected);
             return Ok(true);
         }
         // Lower status is quiet; enabling the master generates a fresh edge
@@ -367,6 +479,30 @@ impl<M: MmioWindow> Controller<M> {
                 }
             }
             restore_bits(&s.mmio, CCS_ENABLE, RCS_EVENTS, s.saved.ccs_enable);
+        }
+        if media_enable(s.media) != 0 {
+            for (index, engine) in MEDIA.into_iter().enumerate() {
+                if s.media.contains(engine) {
+                    restore_bits(
+                        &s.mmio,
+                        u64::from(engine.base()) + 0xa8,
+                        RCS,
+                        s.saved.media_ring[index],
+                    );
+                }
+            }
+            for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+                let mask = media_pair_mask(s.media, pair);
+                if mask != 0 {
+                    restore_bits(&s.mmio, reg, mask, s.saved.media_masks[pair]);
+                }
+            }
+            restore_bits(
+                &s.mmio,
+                MEDIA_ENABLE,
+                media_enable(s.media),
+                s.saved.media_enable,
+            );
         }
         if s.copy8 {
             restore_bits(&s.mmio, BCS8_RING_MASK, RCS, s.saved.bcs8_ring);

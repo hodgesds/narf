@@ -51,6 +51,10 @@ pub const QUERY_GUC_SUBMISSION_VERSION: u64 = 7;
 
 pub const EXEC_RENDER: u64 = 1;
 pub const EXEC_BLT: u64 = 3;
+pub const EXEC_BSD: u64 = 2;
+pub const EXEC_VEBOX: u64 = 4;
+pub const EXEC_BSD_SHIFT: u32 = 13;
+pub const EXEC_BSD_MASK: u64 = 3 << EXEC_BSD_SHIFT;
 pub const CONTEXT_PARAM_ENGINES: u64 = 0xa;
 pub const CONTEXT_ENGINES_EXT_LOAD_BALANCE: u32 = 0;
 /// I915_ENGINE_CLASS_INVALID with I915_ENGINE_CLASS_INVALID_NONE: an empty

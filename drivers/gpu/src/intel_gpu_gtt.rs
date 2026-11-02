@@ -139,6 +139,8 @@ pub const PTE_PAT1: u64 = 1 << 4;
 pub const PTE_PAT2: u64 = 1 << 7;
 /// PPGTT PAT index bit 3 (Meteor Lake / Xe-LPG).
 pub const PTE_PAT3: u64 = 1 << 62;
+/// Xe2 PPGTT PAT index bit 4 (MIT xe_gtt_defs.h: XELPG_PPGTT_PTE_PAT4).
+pub const PTE_PAT4: u64 = 1 << 61;
 /// Conservative common system-memory address field (bits 45:12).
 /// Source: MIT i915 gt/intel_gtt.h GEN12_GGTT_PTE_ADDR_MASK.
 pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
@@ -149,6 +151,8 @@ pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
 pub enum PteFormat {
     Gen12,
     XeLpg,
+    /// Xe2 five-bit PPGTT PAT; GGTT still has only two PAT bits.
+    Xe2,
 }
 
 impl PteFormat {
@@ -159,7 +163,9 @@ impl PteFormat {
         }
         let pat = match self {
             Self::Gen12 => 0, // Gen8/Gen12 GGTT has no PAT index fields.
-            Self::XeLpg => ((pat_index as u64 & 1) << 52) | ((pat_index as u64 & 2) << 52),
+            Self::XeLpg | Self::Xe2 => {
+                ((pat_index as u64 & 1) << 52) | ((pat_index as u64 & 2) << 52)
+            }
         };
         Ok(phys | PTE_PRESENT | pat)
     }
@@ -169,6 +175,7 @@ impl PteFormat {
         let max = match self {
             Self::Gen12 => 7,
             Self::XeLpg => 15,
+            Self::Xe2 => 31,
         };
         if pat_index > max {
             return Err(GttError::InvalidPatIndex);
@@ -176,7 +183,8 @@ impl PteFormat {
         let pat = ((pat_index as u64 & 1) << 3)
             | ((pat_index as u64 & 2) << 3)
             | ((pat_index as u64 & 4) << 5)
-            | ((pat_index as u64 & 8) << 59);
+            | ((pat_index as u64 & 8) << 59)
+            | ((pat_index as u64 & 16) << 57);
         Ok(phys | PTE_PRESENT | if writable { PTE_RW } else { 0 } | pat)
     }
 }

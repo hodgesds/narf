@@ -23,10 +23,10 @@ const REGISTERS: [u64; 12] = [
 const PLANE_COLOR_UNSUPPORTED: u32 =
     (1 << 21) | (1 << 20) | (7 << 17) | (1 << 15) | (1 << 14) | (3 << 4);
 
-fn pipeline(io: &impl MmioWindow) -> bool {
+fn pipeline(io: &impl MmioWindow, primary_control: u32) -> bool {
     let plane = io.read32(0x70180);
     let color = io.read32(0x701cc);
-    plane & 0x9f000000 == 0x84000000
+    plane & 0xff800000 == primary_control
         && color != u32::MAX
         && color & PLANE_COLOR_UNSUPPORTED == 0
         && color & (1 << 13) != 0
@@ -446,6 +446,10 @@ struct Pending {
 #[derive(Debug)]
 pub(crate) struct Owner {
     original: Image,
+    /// Immutable source-selected plane format and arbitration slots; a later
+    /// color/LUT qualification cannot reinterpret another display family.
+    primary_control: u32,
+    gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
     /// None admits common CTM only. Gen12 requires a retained internal-pipe
     /// resource witness before this profile may be qualified.
     profile: Option<Profile>,
@@ -464,15 +468,45 @@ pub(crate) struct Owner {
 }
 impl Owner {
     pub(crate) fn capture(io: &impl MmioWindow, generation: Generation) -> Result<Self, FsError> {
-        if !matches!(
-            generation,
-            Generation::TigerLake | Generation::AlderLake | Generation::MeteorLake
-        ) {
-            return Err(FsError::Unsupported);
+        match generation {
+            Generation::TigerLake => {
+                Self::capture_gen12(io, crate::intel_gpu_gt::Gen12Platform::TigerLake)
+            }
+            Generation::MeteorLake => Self::capture_control(io, generation, None, 0x84000000),
+            // AlderLake alone cannot distinguish display12 ADLS from
+            // display13 ADLP/N. Actual callers must supply the PCI family.
+            _ => Err(FsError::Unsupported),
         }
+    }
+    pub(crate) fn capture_gen12(
+        io: &impl MmioWindow,
+        family: crate::intel_gpu_gt::Gen12Platform,
+    ) -> Result<Self, FsError> {
+        let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        Self::capture_control(
+            io,
+            generation,
+            Some(family),
+            crate::intel_gpu_pipes::gen12_xrgb_control(family),
+        )
+    }
+    fn capture_control(
+        io: &impl MmioWindow,
+        generation: Generation,
+        gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
+        primary_control: u32,
+    ) -> Result<Self, FsError> {
         let mode = io.read32(MODE);
         let gamma = io.read32(GAMMA);
-        if mode != 0 || gamma == u32::MAX || gamma & (3 << 30) != 0 || !pipeline(io) {
+        if mode != 0
+            || gamma == u32::MAX
+            || gamma & (3 << 30) != 0
+            || !pipeline(io, primary_control)
+        {
             return Err(FsError::Unsupported);
         }
         let mut values = [0; 12];
@@ -485,6 +519,8 @@ impl Owner {
         let original = Image { values, mode };
         Ok(Self {
             original,
+            primary_control,
+            gen12_family,
             profile: (generation == Generation::MeteorLake).then_some(Profile::Mtl),
             gamma,
             expected: original,
@@ -501,7 +537,10 @@ impl Owner {
         })
     }
     pub(crate) fn qualify_gen12(&mut self, profile: Profile) -> Result<(), FsError> {
-        if profile == Profile::Mtl {
+        if self
+            .gen12_family
+            .is_none_or(|family| Profile::gen12(family) != profile)
+        {
             return Err(FsError::Unsupported);
         }
         if self.profile == Some(profile) {
@@ -586,7 +625,10 @@ impl Owner {
         {
             return Err(FsError::Unsupported);
         }
-        if !pipeline(io) || !self.expected.matches(io) || io.read32(GAMMA) != self.expected_gamma {
+        if !pipeline(io, self.primary_control)
+            || !self.expected.matches(io)
+            || io.read32(GAMMA) != self.expected_gamma
+        {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
@@ -680,7 +722,10 @@ impl Owner {
         if self.pending() {
             return Err(FsError::Busy);
         }
-        if !pipeline(io) || !self.expected.matches(io) || io.read32(GAMMA) != self.expected_gamma {
+        if !pipeline(io, self.primary_control)
+            || !self.expected.matches(io)
+            || io.read32(GAMMA) != self.expected_gamma
+        {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
@@ -743,6 +788,20 @@ impl Owner {
         self.palette_dirty |= update.write_lut && update.lut.is_some();
         self.pre_dirty |= update.write_degamma && update.degamma.is_some();
     }
+    /// Recheck only persistent visible arms after the complete profile-specific
+    /// LUT/DSB proof. RAM remains exclusively owned; display12 never attempts
+    /// architecturally unreliable fine/coarse data readback here or elsewhere.
+    pub(crate) fn check_visible(&self, io: &impl MmioWindow) -> Result<(), FsError> {
+        if self.failed
+            || self.external_pending
+            || !pipeline(io, self.primary_control)
+            || !self.expected.matches(io)
+            || io.read32(GAMMA) != self.expected_gamma
+        {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
     pub(crate) fn complete_dsb(
         &mut self,
         io: &impl MmioWindow,
@@ -752,7 +811,10 @@ impl Owner {
             return Err(FsError::NoDevice);
         }
         self.failed = true;
-        if !pipeline(io) || !update.image.matches(io) || io.read32(GAMMA) != update.gamma {
+        if !pipeline(io, self.primary_control)
+            || !update.image.matches(io)
+            || io.read32(GAMMA) != update.gamma
+        {
             return Err(FsError::NoDevice);
         }
         if let Some(lut) = &update.lut {
@@ -793,7 +855,7 @@ impl Owner {
         self.failed = false;
         self.pending = None;
         self.external_pending = false;
-        if !pipeline(io) {
+        if !pipeline(io, self.primary_control) {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
@@ -867,7 +929,10 @@ impl Owner {
         let Some(pending) = self.pending else {
             return Ok(None);
         };
-        if !pipeline(io) || !pending.image.matches(io) || io.read32(GAMMA) != pending.gamma {
+        if !pipeline(io, self.primary_control)
+            || !pending.image.matches(io)
+            || io.read32(GAMMA) != pending.gamma
+        {
             self.failed = true;
             return Err(FsError::NoDevice);
         }

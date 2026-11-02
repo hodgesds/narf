@@ -201,7 +201,15 @@ pub(super) fn prepare<A: BootAllocator>(
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
             let address = (!spec.resident.skip_batch()).then_some(addresses[index]);
-            let mut words = if lane.engine.is_copy() {
+            let mut words = if lane.engine.is_media() {
+                crate::intel_gpu_engine::media_ring(
+                    lane.engine,
+                    address,
+                    None,
+                    image.ggtt_offset(),
+                    spec.stamp,
+                )
+            } else if lane.engine.is_copy() {
                 crate::intel_gpu_engine::copy_ring(address, None, image.ggtt_offset(), spec.stamp)
             } else {
                 resident_ring(
@@ -310,7 +318,7 @@ fn append_join<B: GpuBacking>(
         ]);
     }
     words.push(0x04000000); // ARB_DISABLE only after every semaphore wait
-    let copy = group.children[0].engine.is_copy();
+    let copy = group.children[0].engine.simple_ring();
     if copy {
         words.extend_from_slice(&[0x13000002, 0, 0, 0]);
     }

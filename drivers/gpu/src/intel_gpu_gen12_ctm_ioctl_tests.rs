@@ -189,6 +189,13 @@ fn smoke_intel_gen12_ctm_raw_fifo_blob_pin_real_latch_and_original_clear() -> Te
         platform.set(COEFFICIENT, ORIGINAL);
         platform.set(0x4804, u32::MAX); // Gen12 never borrows MTL PAT authority.
         let device = Arc::new(platform.gen12(family));
+        assert_eq!(
+            platform.read32(0x70180),
+            match family {
+                Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
+                _ => 0x84000000,
+            }
+        );
         let mut worker = Worker {
             device: device.clone(),
         };
@@ -251,7 +258,7 @@ fn smoke_intel_gen12_ctm_raw_foreign_route_resources_and_color_refuse_before_arm
         (0x68180, 1 << 31),
         (0x4438c, 1 << 31),
         (CONSOLE_PTE, 0x100003),
-        (0x70180, 0x84008000),
+        (0x70180, 0x94008000),
         (0x701cc, 0),
         (0x701c8, 1 << 31),
         (CSC, 1 << 30),
@@ -346,6 +353,13 @@ fn smoke_intel_gen12_ctm_reset_requires_original_resource_and_complete_console_p
         let platform = MockPlatform::new();
         platform.set(COEFFICIENT, ORIGINAL);
         let device = Arc::new(platform.gen12(family));
+        assert_eq!(
+            platform.read32(0x70180),
+            match family {
+                Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
+                _ => 0x84000000,
+            }
+        );
         let mut worker = Worker {
             device: device.clone(),
         };

@@ -442,7 +442,7 @@ fn smoke_coredump_fixed_report_limits_and_truncation() -> TestResult {
     use super::super::{ContextInfo, ContextPhase, Contexts};
     let mut report = report();
     report.generation = u64::MAX;
-    report.capture.engines = EngineSet::of(&Engine::ALL);
+    report.capture.engines = EngineSet::of(&Engine::GRAPHICS);
     report.contexts = Contexts::new(64);
     for _ in 0..super::super::MAX_CONTEXTS {
         report.contexts.push(ContextInfo {

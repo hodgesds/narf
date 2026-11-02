@@ -282,15 +282,36 @@ fn engine_name(engine: Engine) -> &'static str {
         Engine::Ccs1 => "ccs1",
         Engine::Ccs2 => "ccs2",
         Engine::Ccs3 => "ccs3",
+        Engine::Vcs0 => "vcs0",
+        Engine::Vcs1 => "vcs1",
+        Engine::Vcs2 => "vcs2",
+        Engine::Vcs3 => "vcs3",
+        Engine::Vcs4 => "vcs4",
+        Engine::Vcs5 => "vcs5",
+        Engine::Vcs6 => "vcs6",
+        Engine::Vcs7 => "vcs7",
+        Engine::Vecs0 => "vecs0",
+        Engine::Vecs1 => "vecs1",
+        Engine::Vecs2 => "vecs2",
+        Engine::Vecs3 => "vecs3",
     }
 }
 impl Snapshot {
     fn write_text(&self, out: &mut impl Write) {
         let report = &self.report;
         let capture = report.capture;
-        let _ = writeln!(out, "narf-intel-error-v1\ngeneration={}\nreason={:?}\nepoch={}\nmonotonic_ns={}\nplatform={:?}\ngt_state={:?}\nregister_access={:?}\nsuppressed_errors={}",
-            report.generation(), capture.reason, capture.epoch, capture.now_ns, capture.platform,
-            capture.state, report.access, self.suppressed);
+        let _ = writeln!(
+            out,
+            "narf-intel-error-v1\ngeneration={}\nreason={:?}\nepoch={}\nmonotonic_ns={}\nplatform={:?}\ngt_state={:?}\nregister_access={:?}\nsuppressed_errors={}",
+            report.generation(),
+            capture.reason,
+            capture.epoch,
+            capture.now_ns,
+            capture.platform,
+            capture.state,
+            report.access,
+            self.suppressed
+        );
         let retained = report.contexts.entries().count();
         let _ = writeln!(
             out,

@@ -26,6 +26,7 @@ pub(crate) struct ResetPolicy {
     platform: GtPlatform,
     device: u16,
     graphics: u16,
+    step: u8,
     dss_flags: u32,
     compute: u8,
     engines: EngineSet,
@@ -33,10 +34,13 @@ pub(crate) struct ResetPolicy {
 }
 
 impl ResetPolicy {
+    // These facts are copied together from the qualified source snapshot.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         platform: GtPlatform,
         device: u16,
         graphics: u16,
+        step: u8,
         dss: u32,
         compute: u8,
         engines: EngineSet,
@@ -46,6 +50,7 @@ impl ResetPolicy {
         let instance = (dss >> 16) & 127;
         if GtPlatform::from_pci(0x8086, device) != Some(platform)
             || !engines.contains(Engine::Rcs0)
+            || (!platform.is_gen12() && engines.iter().any(|engine| engine.is_media()))
             || compute & !15 != 0
             || dss & !(0x40000000 | 127 << 23 | 127 << 16) != 0
             || dss & 0x40000000 == 0
@@ -63,6 +68,7 @@ impl ResetPolicy {
             platform,
             device,
             graphics,
+            step,
             dss_flags: 2 | group << 12 | instance << 20,
             compute,
             engines,
@@ -100,7 +106,7 @@ impl ResetPolicy {
         for slot in 0..12 {
             add(base + 0x4d0 + slot * 4, 0);
         }
-        if self.platform == GtPlatform::Battlemage {
+        if self.platform.is_xe2() {
             // Wa16021639441 + Priority_Mem_Read, and Wa16023105232,
             // use ENGINE_BASE for each physical RCS/CCS/COPY instance.
             add(base + 0xd4, 1);
@@ -157,6 +163,24 @@ impl ResetPolicy {
                         // the source ADS save (xe_wa.c:419-427).
                         add(0xe420, mcr | 1);
                     }
+                }
+                _ if self.platform.is_ptl() => {
+                    for offset in [0xe194, 0xe4c4, 0xe4f0, 0xe5f4] {
+                        add(offset, mcr | 1);
+                    }
+                    if self.graphics == 3000 && self.step < 4 {
+                        add(0xe18c, mcr | 1);
+                        add(0xe48c, mcr | 1);
+                    }
+                    add(0xe530, mcr);
+                }
+                _ if self.platform.is_lnl() => {
+                    add(0xe7c8, mcr);
+                    add(0xe7cc, mcr);
+                    for offset in [0xe49c, 0xe48c, 0xe4f0, 0xe4c4, 0xe194] {
+                        add(offset, mcr | 1);
+                    }
+                    add(0xe530, mcr);
                 }
                 GtPlatform::Integrated(_) => {
                     add(0xe49c, mcr | 1);

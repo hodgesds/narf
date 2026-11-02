@@ -51,7 +51,8 @@ use alloc::vec::Vec;
 
 use crate::intel_gpu_gtt::{
     encode_table_entry_with_pat, pte_phys, pte_present, GttError, PatSlot, PteFormat,
-    GTT_PAGE_SIZE, PTE_PAT0, PTE_PAT1, PTE_PAT2, PTE_PAT3, PTE_PHYS_MASK, PTE_PRESENT, PTE_RW,
+    GTT_PAGE_SIZE, PTE_PAT0, PTE_PAT1, PTE_PAT2, PTE_PAT3, PTE_PAT4, PTE_PHYS_MASK, PTE_PRESENT,
+    PTE_RW,
 };
 
 /// Virtual-address width of the Gen12 PPGTT (PRM Vol. 5).
@@ -101,6 +102,8 @@ pub enum PpgttError {
     OutOfMemory,
     /// PAT index is unavailable for this page-table format.
     InvalidPatIndex,
+    /// Only source-selected root levels 3 and 4 are supported.
+    InvalidRootLevel,
     /// An intermediate entry on the map path is present but not
     /// well-formed (see [`WalkOutcome::Corrupt`]); the walker
     /// will not overwrite foreign state silently. `level` is
@@ -280,7 +283,8 @@ pub struct Ppgtt {
     root: u64,
     tables: u32,
     mapped: u64,
-    scratch: [u64; 3],
+    scratch: [u64; 4],
+    leaf_level: u8,
     null_pat: u8,
     nulls: BTreeSet<u64>,
 }
@@ -303,6 +307,21 @@ impl Ppgtt {
         format: PteFormat,
         table_pat: u8,
     ) -> Result<Self, PpgttError> {
+        Self::with_root_level(mem, format, table_pat, 3)
+    }
+
+    /// Root level uses the xe numbering: 3 = four levels, 4 = five levels.
+    /// LNL's xe_pci descriptor selects level 4 even with its 48-bit VA limit.
+    /// Existing constructors deliberately retain their four-level contract.
+    pub fn with_root_level<M: PtMemory>(
+        mem: &mut M,
+        format: PteFormat,
+        table_pat: u8,
+        root_level: u8,
+    ) -> Result<Self, PpgttError> {
+        if !(3..=4).contains(&root_level) || (root_level == 4 && format != PteFormat::Xe2) {
+            return Err(PpgttError::InvalidRootLevel);
+        }
         if table_pat > 3 {
             return Err(PpgttError::InvalidPatIndex);
         }
@@ -317,7 +336,8 @@ impl Ppgtt {
             root,
             tables: 1,
             mapped: 0,
-            scratch: [0; 3],
+            scratch: [0; 4],
+            leaf_level: root_level,
             null_pat: 0,
             nulls: BTreeSet::new(),
         })
@@ -331,10 +351,20 @@ impl Ppgtt {
         table_pat: u8,
         leaf_pat: u8,
     ) -> Result<Self, PpgttError> {
+        Self::with_scratch_root_level(mem, format, table_pat, leaf_pat, 3)
+    }
+
+    pub fn with_scratch_root_level<M: PtMemory>(
+        mem: &mut M,
+        format: PteFormat,
+        table_pat: u8,
+        leaf_pat: u8,
+        root_level: u8,
+    ) -> Result<Self, PpgttError> {
         format.encode_ppgtt(0, leaf_pat, true)?;
-        let mut result = Self::with_table_pat(mem, format, table_pat)?;
+        let mut result = Self::with_root_level(mem, format, table_pat, root_level)?;
         result.null_pat = leaf_pat;
-        for level in (1..4).rev() {
+        for level in (1..=root_level).rev() {
             let table = match mem.alloc_table() {
                 Ok(table) => table,
                 Err(error) => {
@@ -347,7 +377,7 @@ impl Ppgtt {
                 result.teardown(mem);
                 return Err(error.into());
             }
-            let empty = if level == LEVEL_PT {
+            let empty = if level == result.leaf_level {
                 format
                     .encode_ppgtt(0, leaf_pat, true)
                     .expect("validated PAT")
@@ -368,8 +398,8 @@ impl Ppgtt {
     }
 
     fn empty(&self, level: u8) -> u64 {
-        if level == LEVEL_PT {
-            if self.scratch[2] == 0 {
+        if level == self.leaf_level {
+            if self.scratch[self.leaf_level as usize - 1] == 0 {
                 return 0;
             }
             self.format
@@ -389,6 +419,23 @@ impl Ppgtt {
     /// ([`crate::intel_gpu_rcs::RcsEngine::attach_ppgtt`]).
     pub fn root_phys(&self) -> u64 {
         self.root
+    }
+
+    /// Hardware root level, independent of the 48-bit userspace VA ceiling.
+    pub fn root_level(&self) -> u8 {
+        self.leaf_level
+    }
+
+    fn indices(&self, va: u64) -> [usize; 5] {
+        let mut result = [0; 5];
+        for (level, index) in result
+            .iter_mut()
+            .enumerate()
+            .take(self.leaf_level as usize + 1)
+        {
+            *index = ((va >> (12 + 9 * (self.leaf_level as usize - level))) & 511) as usize;
+        }
+        result
     }
 
     /// Encoded PDP0/PTBP, including PRESENT, RW and the non-leaf PAT bits.
@@ -415,12 +462,14 @@ impl Ppgtt {
         if !pte_present(entry) {
             return Err(WalkOutcome::NotMapped { level });
         }
-        let allowed = if level == LEVEL_PT {
+        let allowed = if level == self.leaf_level {
             LEAF_ENTRY_ALLOWED
                 | PTE_NULL
                 | PTE_DM
                 | PTE_PS64
-                | if self.format == PteFormat::XeLpg {
+                | if self.format == PteFormat::Xe2 {
+                    PTE_PAT3 | PTE_PAT4
+                } else if self.format == PteFormat::XeLpg {
                     PTE_PAT3
                 } else {
                     0
@@ -432,7 +481,7 @@ impl Ppgtt {
         if entry & !allowed != 0 {
             return Err(WalkOutcome::Corrupt { level });
         }
-        if level == LEVEL_PT && entry & PTE_NULL != 0 {
+        if level == self.leaf_level && entry & PTE_NULL != 0 {
             return Err(if phys == 0 && entry & (PTE_DM | PTE_PS64) == 0 {
                 WalkOutcome::Null
             } else {
@@ -576,9 +625,9 @@ impl Ppgtt {
         if va % GTT_PAGE_SIZE != 0 {
             return Err(PpgttError::Unaligned);
         }
-        let idx = va_indices(va);
+        let idx = self.indices(va);
         let mut table = self.root;
-        for (level, &index) in idx.iter().enumerate().take(LEVEL_PT as usize) {
+        for (level, &index) in idx.iter().enumerate().take(self.leaf_level as usize) {
             let entry = mem.read_entry(table, index);
             if pte_present(entry) && (self.scratch[level] == 0 || entry != self.empty(level as u8))
             {
@@ -612,11 +661,13 @@ impl Ppgtt {
                 table = new_table;
             }
         }
-        let existing = mem.read_entry(table, idx[LEVEL_PT as usize]);
-        if pte_present(existing) && (existing != self.empty(LEVEL_PT) || self.nulls.contains(&va)) {
+        let existing = mem.read_entry(table, idx[self.leaf_level as usize]);
+        if pte_present(existing)
+            && (existing != self.empty(self.leaf_level) || self.nulls.contains(&va))
+        {
             return Err(PpgttError::AlreadyMapped);
         }
-        mem.write_entry(table, idx[LEVEL_PT as usize], leaf);
+        mem.write_entry(table, idx[self.leaf_level as usize], leaf);
         self.mapped += 1;
         Ok(())
     }
@@ -631,11 +682,11 @@ impl Ppgtt {
         if va % GTT_PAGE_SIZE != 0 {
             return Err(PpgttError::Unaligned);
         }
-        let idx = va_indices(va);
+        let idx = self.indices(va);
         // Descend, recording the path for the pruning pass.
-        let mut tables = [0u64; LEVELS];
+        let mut tables = [0u64; 5];
         let mut table = self.root;
-        for level in 0..LEVEL_PT as usize {
+        for level in 0..self.leaf_level as usize {
             tables[level] = table;
             let entry = mem.read_entry(table, idx[level]);
             match self.follow(entry, level as u8) {
@@ -646,18 +697,23 @@ impl Ppgtt {
                 Err(_) => return Err(PpgttError::NotMapped),
             }
         }
-        tables[LEVEL_PT as usize] = table;
-        let leaf = mem.read_entry(table, idx[LEVEL_PT as usize]);
-        if !pte_present(leaf) || (leaf == self.empty(LEVEL_PT) && !self.nulls.contains(&va)) {
+        tables[self.leaf_level as usize] = table;
+        let leaf = mem.read_entry(table, idx[self.leaf_level as usize]);
+        if !pte_present(leaf) || (leaf == self.empty(self.leaf_level) && !self.nulls.contains(&va))
+        {
             return Err(PpgttError::NotMapped);
         }
         let phys = pte_phys(leaf);
         self.nulls.remove(&va);
-        mem.write_entry(table, idx[LEVEL_PT as usize], self.empty(LEVEL_PT));
+        mem.write_entry(
+            table,
+            idx[self.leaf_level as usize],
+            self.empty(self.leaf_level),
+        );
         self.mapped -= 1;
         // Prune empty tables bottom-up: a freed table's parent
         // entry is cleared, which may empty the parent in turn.
-        for level in (1..LEVELS).rev() {
+        for level in (1..=self.leaf_level as usize).rev() {
             let t = tables[level];
             let mut empty = true;
             for i in 0..ENTRIES_PER_TABLE {
@@ -687,17 +743,17 @@ impl Ppgtt {
         if va >= PPGTT_VA_SIZE {
             return Err(PpgttError::VaOutOfRange);
         }
-        let idx = va_indices(va);
+        let idx = self.indices(va);
         let mut table = self.root;
-        for (level, &index) in idx.iter().enumerate().take(LEVEL_PT as usize) {
+        for (level, &index) in idx.iter().enumerate().take(self.leaf_level as usize) {
             let entry = mem.read_entry(table, index);
             match self.follow(entry, level as u8) {
                 Ok(next) => table = next,
                 Err(outcome) => return Ok(outcome),
             }
         }
-        let leaf = mem.read_entry(table, idx[LEVEL_PT as usize]);
-        let first = idx[LEVEL_PT as usize] & !15;
+        let leaf = mem.read_entry(table, idx[self.leaf_level as usize]);
+        let first = idx[self.leaf_level as usize] & !15;
         // A corrupted queried leaf may have lost its hint while another
         // entry still identifies this as a contiguous 64 KiB group.
         if leaf & PTE_PS64 != 0
@@ -711,10 +767,12 @@ impl Ppgtt {
                     mem.read_entry(table, first + i) != ((base + i as u64 * GTT_PAGE_SIZE) | flags)
                 })
             {
-                return Ok(WalkOutcome::Corrupt { level: LEVEL_PT });
+                return Ok(WalkOutcome::Corrupt {
+                    level: self.leaf_level,
+                });
             }
         }
-        match self.follow(leaf, LEVEL_PT) {
+        match self.follow(leaf, self.leaf_level) {
             Ok(page) => Ok(WalkOutcome::Mapped(page | (va & 0xFFF))),
             Err(outcome) => Ok(outcome),
         }
@@ -724,7 +782,7 @@ impl Ppgtt {
     /// are abandoned, not unmapped one by one; leaf frames were
     /// never ours to free.
     pub fn teardown<M: PtMemory>(self, mem: &mut M) {
-        Self::free_subtree(mem, self.root, LEVEL_PML4, &self.scratch);
+        Self::free_subtree(mem, self.root, LEVEL_PML4, self.leaf_level, &self.scratch);
         for table in self.scratch {
             if table != 0 {
                 mem.free_table(table);
@@ -732,8 +790,14 @@ impl Ppgtt {
         }
     }
 
-    fn free_subtree<M: PtMemory>(mem: &mut M, table: u64, level: u8, scratch: &[u64; 3]) {
-        if level < LEVEL_PT {
+    fn free_subtree<M: PtMemory>(
+        mem: &mut M,
+        table: u64,
+        level: u8,
+        leaf_level: u8,
+        scratch: &[u64; 4],
+    ) {
+        if level < leaf_level {
             let mut children = Vec::new();
             for i in 0..ENTRIES_PER_TABLE {
                 let entry = mem.read_entry(table, i);
@@ -743,7 +807,7 @@ impl Ppgtt {
                 }
             }
             for child in children {
-                Self::free_subtree(mem, child, level + 1, scratch);
+                Self::free_subtree(mem, child, level + 1, leaf_level, scratch);
             }
         }
         mem.free_table(table);
@@ -814,6 +878,53 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_ppgtt",
         smoke_null_scratch_tree_isolation_and_reclamation
+    );
+
+    fn smoke_lnl_five_level_private_vm_and_xe2_pat_literals() -> TestResult {
+        let mut memory = FakePtMemory::new();
+        let mut vm = Ppgtt::with_scratch_root_level(&mut memory, PteFormat::Xe2, 2, 2, 4).unwrap();
+        assert_eq!((vm.root_level(), vm.table_pages()), (4, 5));
+        let va = 0x1234_5678_9000;
+        vm.map_with_pat(&mut memory, va, 0x1234_5000, 31, true)
+            .unwrap();
+        let mut table = vm.root_phys();
+        // Independent Linux level4 tree: VA48 still selects entry0 at shift48.
+        for shift in [48, 39, 30, 21] {
+            let entry = memory.raw_read(table, ((va >> shift) & 511) as usize);
+            assert_eq!(entry & 0xfff, 0x13);
+            table = entry & 0x00003ffffffff000;
+        }
+        let leaf = memory.raw_read(table, ((va >> 12) & 511) as usize);
+        assert_eq!(leaf, 0x600000001234509b);
+        assert_eq!(
+            vm.translate(&memory, va + 31),
+            Ok(WalkOutcome::Mapped(0x1234501f))
+        );
+        assert_eq!(vm.translate(&memory, va + 4096), Ok(WalkOutcome::Null));
+        memory.raw_write(table, ((va >> 12) & 511) as usize, leaf | (1 << 60));
+        assert_eq!(
+            vm.translate(&memory, va),
+            Ok(WalkOutcome::Corrupt { level: 4 })
+        );
+        memory.raw_write(table, ((va >> 12) & 511) as usize, leaf);
+        assert_eq!(vm.unmap(&mut memory, va), Ok(0x12345000));
+        assert_eq!(vm.table_pages(), 5);
+        vm.teardown(&mut memory);
+        assert_eq!(memory.live, 0);
+        let old = Ppgtt::with_format(&mut memory, PteFormat::XeLpg).unwrap();
+        assert_eq!(old.root_level(), 3);
+        old.teardown(&mut memory);
+        for limit in 1..5 {
+            let mut m = FakePtMemory::new();
+            m.limit = limit;
+            assert!(Ppgtt::with_scratch_root_level(&mut m, PteFormat::Xe2, 2, 2, 4).is_err());
+            assert_eq!(m.live, 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_ppgtt",
+        smoke_lnl_five_level_private_vm_and_xe2_pat_literals
     );
 
     struct FakePtMemory {

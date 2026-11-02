@@ -123,6 +123,7 @@ impl XeFile {
                 // SCANOUT (2) is admitted where a WC system object satisfies
                 // it: the iGPU. Arc display is not supported.
                 let supported_flags = match info.platform {
+                    _ if info.platform.is_headless_integrated() => 0, // no scanout/FlatCCS representation
                     crate::intel_gpu_gt::GtPlatform::Battlemage => {
                         8 | if info.vram.is_some() { 4 } else { 0 }
                     }

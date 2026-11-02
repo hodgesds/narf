@@ -329,11 +329,11 @@ fn smoke_gen12_hardware_inherited_reset_orders_stop_before_full_and_cache() -> T
     dev.set(0xd84, 0);
     let mut hardware = HardwareInit::new(GtPlatform::Gen12(Gen12Platform::TigerLake)).unwrap();
     hardware.begin(&dev, 0).unwrap();
-    let mut done = false;
+    let mut done = None;
     for step in 0..32 {
         match hardware.poll_with_access(&dev, step * 1000, || true) {
             Poll::Ready(Ok(_)) => {
-                done = true;
+                done = Some(step * 1000);
                 break;
             }
             Poll::Pending => {}
@@ -346,7 +346,7 @@ fn smoke_gen12_hardware_inherited_reset_orders_stop_before_full_and_cache() -> T
             dev.set(0xc314, 0);
         }
     }
-    assert!(done);
+    let now = done.expect("inherited reset must reach ready");
     let log = dev.log.borrow();
     let guc = log
         .iter()
@@ -365,7 +365,32 @@ fn smoke_gen12_hardware_inherited_reset_orders_stop_before_full_and_cache() -> T
         .position(|entry| *entry == (true, 0x4800, 3))
         .unwrap();
     assert!(guc < stop && stop < full && full < cache);
-    assert!(hardware.take_gen12_reset().unwrap().released());
+    drop(log);
+    // Startup transfers the prepared owner into Held, including the empty
+    // media fuse set. Scheduling must keep that owner and the render wake.
+    hardware.awake(&dev).unwrap();
+    assert_eq!(
+        hardware.begin_release(&dev, now + 1),
+        Err(HardwareError::Busy)
+    );
+    let mut reset = hardware.take_gen12_reset().unwrap();
+    assert!(!reset.released());
+    reset.held_current(&dev, || true).unwrap();
+    // Mirror GuCGt's stop handoff: fresh CS/GPM preparation, then an
+    // independently completed full reset, then terminal wake release.
+    reset.restart(now + 1).unwrap();
+    let now = dev.prepare(&mut reset, now + 1);
+    dev.write32(0x941c, 1);
+    assert_eq!(dev.read32(0x941c), 1);
+    dev.set(0x941c, 0);
+    dev.set(0xc000, 1);
+    dev.set(0xc314, 0);
+    dev.release(&mut reset, now + 1);
+    assert_eq!(dev.read32(0xa278) & 1, 1);
+    hardware.begin_release(&dev, now + 3).unwrap();
+    assert_eq!(hardware.poll_release(&dev, now + 4), Poll::Ready(Ok(())));
+    assert_eq!(dev.read32(0xa278) & 1, 0);
+    assert_eq!(dev.read32(0xa188) & 1, 1);
     TestResult::Pass
 }
 kernel_test_in!(

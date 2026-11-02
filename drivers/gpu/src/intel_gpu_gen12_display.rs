@@ -2,7 +2,8 @@
 //! gen8_ggtt_pte_encode/xelp_ggtt_pte_flags, intel_display_regs.h,
 //! intel_display_device.c XE_D_DISPLAY/XE_LPD_FEATURES and adlp_allowed_dbufs.
 //! This owner preserves a driver-established linear console resource image;
-//! it never creates a cursor/color/QGV/MBUS programming claim.
+//! The primary shadow journal admits only explicitly staged linear/X views;
+//! clocks, DBUF/DDB/WM, cursor and QGV/MBUS resources stay unchanged.
 use super::*;
 use crate::intel_gpu_gt::Gen12Platform;
 use crate::intel_gpu_gtt::PteFormat;
@@ -11,6 +12,9 @@ use crate::intel_gpu_gtt::PteFormat;
 pub(super) struct Owner {
     family: Gen12Platform,
     image: Vec<(u64, u32, u32)>,
+    geometry: Geometry,
+    plane: [u32; 3],
+    pending_plane: Option<[u32; 3]>,
 }
 fn read(io: &impl Platform, register: u64) -> Result<u32, FsError> {
     if !io.access_ok() {
@@ -34,11 +38,18 @@ impl Owner {
         let size = u64::from(geometry.pitch) * u64::from(geometry.height);
         crate::intel_gpu_gtt::check_console_scanout_range(bar_len, console.gtt_offset.into(), size)
             .map_err(|_| FsError::Unsupported)?;
-        if geometry.width == 0
+        let min_width = if crate::intel_gpu_scanout::gen12_alignment(family) == 16384 {
+            4
+        } else {
+            6
+        };
+        if !(min_width..=5120).contains(&geometry.width)
             || geometry.height == 0
+            || geometry.height > 4320
             || geometry.pitch % 64 != 0
             || geometry.pitch < geometry.width.saturating_mul(4)
             || geometry.pitch / 64 > 0xfff
+            || geometry.pitch > crate::intel_gpu_scanout::gen12_max_stride(family)
             || console.gtt_offset != 0x1000000
             || read(io, 0x7019c)? != console.gtt_offset
             || read(io, 0x701ac)? != console.gtt_offset
@@ -68,7 +79,7 @@ impl Owner {
             | 0xf1;
         // The owned Gen12 modeset writes exactly this linear XR24 control.
         // Do not adopt rotation, reflection, async or compressed fetch modes.
-        if plane != 0x84000000
+        if plane != crate::intel_gpu_pipes::gen12_xrgb_control(family)
             || read(io, 0x701c0)? != 0
             || read(io, 0x701c4)? != 0
             || read(io, 0x701c8)? != 0
@@ -92,9 +103,9 @@ impl Owner {
         let mut image = Vec::new();
         for register in [
             0x60400, 0x60000, 0x60004, 0x60008, 0x6000c, 0x60010, 0x60014, 0x6001c, 0x70008,
-            0x70180, 0x70188, 0x7018c, 0x70190, 0x701a4, 0x701c0, 0x701c4, 0x701c8, 0x701cc,
-            0x46000, 0x70240, 0x70244, 0x70248, 0x7024c, 0x70250, 0x70254, 0x70258, 0x7025c,
-            0x70268, 0x7027c, 0x45004, 0x7003c,
+            0x7018c, 0x70190, 0x701c0, 0x701c4, 0x701c8, 0x701cc, 0x46000, 0x70240, 0x70244,
+            0x70248, 0x7024c, 0x70250, 0x70254, 0x70258, 0x7025c, 0x70268, 0x7027c, 0x45004,
+            0x7003c,
         ] {
             image.push((register, u32::MAX, read(io, register)?));
         }
@@ -118,7 +129,19 @@ impl Owner {
         }
         image.push((0x64000, (1 << 31) | 14, port & ((1 << 31) | 14)));
         image.push((0x46070, 0xc00000ff, read(io, 0x46070)? & 0xc00000ff));
-        let owner = Self { family, image };
+        if matches!(
+            family,
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN
+        ) {
+            image.push((0x42084, 1 << 30, read(io, 0x42084)? & (1 << 30)));
+        }
+        let owner = Self {
+            family,
+            image,
+            geometry,
+            plane: [plane, geometry.pitch / 64, 0],
+            pending_plane: None,
+        };
         owner.check_console_mapping(io, console)?;
         owner.check(io)?;
         Ok(owner)
@@ -140,6 +163,7 @@ impl Owner {
                 return Err(FsError::NoDevice);
             }
         }
+        self.check_plane(io)?;
         // These independent DMA consumers cannot be adopted merely because
         // the primary's live SURF happens to match a driver-owned buffer.
         fetchers_with_cursor(io, Generation::TigerLake, owned_dsb, owned_cursor)?;
@@ -155,6 +179,69 @@ impl Owner {
         {
             return Err(FsError::NoDevice);
         }
+        Ok(())
+    }
+    fn check_plane(&self, io: &impl Platform) -> Result<(), FsError> {
+        for (i, r) in [0x70180, 0x70188, 0x701a4].into_iter().enumerate() {
+            let actual = read(io, r)?;
+            if actual != self.plane[i] && self.pending_plane.is_none_or(|p| actual != p[i]) {
+                return Err(FsError::NoDevice);
+            }
+        }
+        Ok(())
+    }
+    /// Journal only source-qualified shadow values before the first possible
+    /// DSB write. Mixed old/new fields after partial DMA remain OWNED, never a
+    /// new baseline; only Presenter latch proof can commit or retire them.
+    pub(super) fn stage_view(
+        &mut self,
+        io: &impl Platform,
+        view: crate::intel_gpu_scanout::View,
+    ) -> Result<(), FsError> {
+        if self.pending_plane.is_some() {
+            return Err(FsError::Busy);
+        }
+        self.check_plane(io)?;
+        if view.layout == crate::intel_gpu_scanout::Layout::Tile4 {
+            return Err(FsError::Unsupported);
+        }
+        if view.layout == crate::intel_gpu_scanout::Layout::X {
+            check_no_dpt(io, self.family)?;
+        }
+        let (_, offset, _) = view
+            .footprint_aligned(
+                self.geometry,
+                crate::intel_gpu_scanout::gen12_alignment(self.family),
+            )
+            .map_err(scanout_error)?;
+        self.pending_plane = Some([
+            crate::intel_gpu_pipes::gen12_xrgb_control(self.family) | view.tiled(),
+            view.stride(self.geometry),
+            offset,
+        ]);
+        Ok(())
+    }
+    /// Caller has the independent fresh primary latch and joint DSB proof.
+    pub(super) fn complete_view(&mut self, io: &impl Platform) -> Result<(), FsError> {
+        if let Some(target) = self.pending_plane {
+            for (r, v) in [0x70180, 0x70188, 0x701a4].into_iter().zip(target) {
+                if read(io, r)? != v {
+                    return Err(FsError::NoDevice);
+                }
+            }
+            self.plane = target;
+            self.pending_plane = None;
+        }
+        self.check_plane(io)
+    }
+    /// Only the caller's strict before-exposure rollback reaches this path.
+    pub(super) fn rollback_view(&mut self, io: &impl Platform) -> Result<(), FsError> {
+        for (r, v) in [0x70180, 0x70188, 0x701a4].into_iter().zip(self.plane) {
+            if read(io, r)? != v {
+                return Err(FsError::NoDevice);
+            }
+        }
+        self.pending_plane = None;
         Ok(())
     }
     pub(super) fn check_console_mapping(
@@ -182,4 +269,58 @@ impl Owner {
         }
         Ok(())
     }
+}
+
+fn check_no_dpt(io: &impl Platform, family: Gen12Platform) -> Result<(), FsError> {
+    // Display12 has no DPT. Display13's source global bit is NOT the
+    // display14 per-plane chicken at0x7026c bit19.
+    if matches!(
+        family,
+        Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN
+    ) && read(io, 0x42084)? & (1 << 30) == 0
+    {
+        return Err(FsError::Unsupported);
+    }
+    Ok(())
+}
+pub(super) fn view_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+    family: Gen12Platform,
+    layout: crate::intel_gpu_scanout::Layout,
+) -> Result<(), FsError> {
+    if !io.console_access_ok() {
+        return Err(FsError::NoDevice);
+    }
+    let min_width = if crate::intel_gpu_scanout::gen12_alignment(family) == 16384 {
+        4
+    } else {
+        6
+    };
+    if geometry.pitch > crate::intel_gpu_scanout::gen12_max_stride(family)
+        || !(min_width..=5120).contains(&geometry.width)
+        || geometry.height > 4320
+        || layout == crate::intel_gpu_scanout::Layout::Tile4
+    {
+        return Err(FsError::Unsupported);
+    }
+    crate::intel_gpu_scanout::View {
+        origin: Default::default(),
+        layout,
+    }
+    .footprint_aligned(geometry, crate::intel_gpu_scanout::gen12_alignment(family))
+    .map_err(scanout_error)?;
+    if layout == crate::intel_gpu_scanout::Layout::X {
+        check_no_dpt(io, family)?;
+    }
+    // Resource capture/check is separately retained by the KMS owner. Do not
+    // recapture an off-cursor baseline while its independent owner is live.
+    if !timing.valid()
+        || geometry.width != u32::from(timing.width)
+        || geometry.height != u32::from(timing.height)
+    {
+        return Err(FsError::Unsupported);
+    }
+    Ok(())
 }

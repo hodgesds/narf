@@ -40,6 +40,16 @@ impl GuCWorkarounds {
                     &[0x90020000, 0x900b0000],
                 )
             }
+            _ if platform.is_ptl() && ip.version == 3000 && ip.step < 4 => {
+                (0, &[0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000])
+            }
+            _ if platform.is_ptl() => (0, &[0x90080001, 0xc40, 0x90090000, 0x900b0000]),
+            _ if platform.is_lnl() => (
+                0,
+                &[
+                    0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000,
+                ],
+            ),
             GtPlatform::Integrated(_) => {
                 let hold = ip.version <= 1271 && ip.step < 4;
                 (

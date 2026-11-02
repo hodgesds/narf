@@ -156,6 +156,13 @@ impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
 /// `Bar0` type. Real callers wrap `narf_drivers_pci`'s mapped BAR
 /// in an adapter that implements this.
 pub trait MmioWindow {
+    /// Immutable source-family metadata for this exact owned PCI mapping.
+    /// Physical adapters derive it from the known PCI-ID table, never broad
+    /// Generation::AlderLake. None permits diagnostics, but source-dependent
+    /// external activation must refuse. This is not current MMIO authority.
+    fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        None
+    }
     /// Read a 32-bit register at byte offset `off` within the
     /// MMIO window.
     fn read32(&self, off: u64) -> u32;

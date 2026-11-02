@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.31** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.32** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -21,7 +21,9 @@
 > parallel GPU user-fence joins, legacy gamma, BMG PSYS controls, EU-stall sampling,
 > placement matrices, pre-CSC degamma, sampled read thresholds, execution coredumps,
 > Gen12 GuC/fixed primary, Tile4, retained copies and runtime-power controls,
-> Gen12 CTM/cursor/native LUTs and bounded loss-accounted GuC log fanout — see §20).
+> Gen12 CTM/cursor/native LUTs, bounded loss-accounted GuC log fanout,
+> joint primary/color and X/integer views, headless LNL/PTL main GT,
+> Gen12 main-GuC media and retained CPU aliases — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -217,14 +219,12 @@ table is announced on the console as an unsupported ASIC and the
 probe returns `NotForThisDriver` — it no longer collapses
 silently into the same `BadDevice` used for dead hardware.
 
-Display programming is gated to Gen12 (Tiger Lake / Alder Lake /
-Raptor Lake). Meteor Lake, Arrow Lake, and Panther Lake rows
-identify and announce only; their display engines are tracked
-in #1016. Because Arrow Lake shares the `MeteorLake`
-classification, it inherits whatever display disposition that
-generation carries — when #1016 opens Xe-LPG display for
-Meteor Lake, Arrow Lake takes the same path deliberately:
-Linux binds its display to the same `mtl_desc` descriptor.
+Internal display programming admits Gen12 (Tiger Lake / Alder Lake /
+Raptor Lake) and the separate Meteor/Arrow Lake Xe-LPG sequence.
+Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
+display descriptor. Lunar Lake and Panther Lake refuse display programming;
+their headless execution profiles do not qualify their display engines.
+External sessions and PWM retain their separate generation gates below.
 
 ## 6. Out of scope
 
@@ -294,7 +294,7 @@ surface and publishes no synthetic 1024×768 display. The owned scanout
 becomes active only after its primary-plane register program is armed.
 
 Takeover and relight share generation dispatch (Gen12 versus Xe-LPG),
-with Panther Lake refused before MMIO. Restore uses `modeset_fixed` on
+with Lunar Lake and Panther Lake refused before MMIO. Restore uses `modeset_fixed` on
 the selected orchestrator, preserving the saved timing used to size the
 new allocation even if EDID now advertises a different preferred mode.
 Plane geometry, pitch and the complete 32-bit GGTT surface extent are
@@ -746,12 +746,12 @@ interval 125000, hysteresis 25, `RING_MAX_IDLE` = 10 per
 present engine, RC sleep 0, threshold 50000, media/render
 PG hysteresis 60, then `GEN9_PG_ENABLE` = render + media
 + media-sampler coarse gating plus per-VCS VDN HCP/MFX
-bits — all under FORCEWAKE_ALL. NARF has no GuC, so the
-host owns RC6: the control value is
+bits — all under FORCEWAKE_ALL. This legacy helper uses
+host-owned RC6 without a GuC owner: the control value is
 `HW_ENABLE | RC6_ENABLE | EI_MODE(1)` = 0x8804_0000
 (i915's host-owned form). The one omitted write from
 i915's sequence is `GUC_MAX_IDLE_COUNT` — it programs
-the GuC's idle policy, there is no GuC to consume it, and
+the GuC's idle policy, which this helper does not own, and
 its offset could not be grounded from the sources
 consulted; the omission is deliberate, not an oversight.
 Park writes `RC6_ENABLE` alone plus target state 4
@@ -858,7 +858,7 @@ from storage is the platform's business, not this
 module's.
 
 Out of scope here: GuC-owned RC and `GUC_MAX_IDLE_COUNT`
-(no GuC in NARF); RC6p/RC6pp (absent on Gen12); runtime
+(separate retained GuC owner); RC6p/RC6pp (absent on Gen12); runtime
 event-handler reconfiguration (PSR/DCB routing belongs
 to the display pipeline); DC3CO/DC9 targets; ADL-P
 (display 13) pipe-DMC ranges; wiring park/unpark to GT
@@ -1395,10 +1395,10 @@ trusted.
 
 ### 10.4 Gates and named remainders
 
-- `display_supported()`: Gen12 + Meteor Lake. **Panther Lake
-  stays off** — Xe3-LPD is a different display IP generation
-  (widened clock-select fields, different PLL tables and DDI
-  arrangement); the MTL sequence must not claim it.
+- `display_supported()`: Gen12 + Meteor Lake. **Lunar Lake and Panther Lake
+  stay off** — their display IPs require independently qualified
+  clock-select fields, PLL tables and DDI arrangements; the MTL sequence
+  must not claim them.
 - `backlight_supported()`: Gen12 only. MTL's PWM path belongs
   to the backlight composition lane (PR #1037); the modeset
   shipping first must not claim a backlight it cannot drive.
@@ -2154,7 +2154,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Native gamma activation/bypass | 1024-entry Pipe-A LUT, owned copies/blobs, safe inactive preload, preserved flips and later-frame restoration | Implemented; native fixtures pass |
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
-| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode and long-running VMs, CPU address mirrors | Open; memory/VM dependency |
+| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/VM dependency |
 | Local-memory management | Small-BAR/unmapped VRAM; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; retained copy primitive implemented, binding/alias ownership remains |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
@@ -2199,8 +2199,15 @@ production feature. Unsupported functionality remains unadvertised.
 | Gen12 fixed hardware cursor | Source PCODE/DBUF watermark partition, private PAT-free DMA39 slots, generation-specific DSB and independent cursor/console retirement | Implemented; native fixtures pass |
 | Gen12 native and legacy LUTs | Exact display12/13 gamma/degamma profiles, bounded ABI/storage, canonical DSB writes, readable state witnesses and profile-specific original restoration | Implemented; native fixtures pass |
 | GuC loss-accounted log fanout | Four bounded reader FIFOs, transactional host loss accounting, observed firmware-overflow lower bounds and actual publication/incarnation-bound admission | Implemented; native fixtures pass |
-| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms, media power and writable fan/thermal controls | Open; mapping revocation and platform PM |
-| Additional platforms | Broader Gen12 display, Lunar Lake and Panther Lake profiles and their execution/display probes | Open; primary-source register/firmware contracts |
+| Gen12 joint primary/color | Fixed retained common DSB transactions, full inactive preload where required, independent primary/color retirement and shared native-frame publication | Implemented; debug native fixtures pass |
+| Gen12 X/integer primary views | Exact family SURF alignment/control, fixed source X/linear viewport bounds, old/pending journal and exact original-console recovery | Implemented; debug native fixtures pass |
+| Headless LNL main GT | Exact PCI/GMD/firmware profile, one-way boot exclusion, fresh whole-device reset/media arena, five-level private VM and all-engine probes | Implemented; debug native fixtures pass |
+| Headless PTL main GT | Exact Xe3-LPG IP/step/PAT/cache/context/SLPC, retained takeover, 96-DSS physical topology and all-engine private-VM probes | Implemented; debug native fixtures pass |
+| Gen12 main-GuC media | Fuse-present VCS/VECS defaults, source video commands, retained media wake/reset/ADS/IRQ and actual native Xe queues | Implemented; debug native fixtures pass |
+| Legacy i915 media selection | Live published BSD/VEBOX discovery, dense sparse-engine selectors and retained independent per-context state through real GuC execution | Implemented; debug native fixtures pass |
+| Intel CPU alias lifetime | Whole-BO physical census, pending publication tokens, retained unpublished-fork metadata and permanent mixed-vendor provider dispatch | Implemented; debug native fixtures pass |
+| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
+| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
 The first four workstreams form the initial integration checkpoint. They do
 not close the broader rows. Changes to memory/VM or other TCB members carry
@@ -2846,5 +2853,60 @@ and Mesa acceptance remain unrun.
 
 The following integration batch carries required source corrections for
 ADLP/N primary alignment/arbitration slots, Gen12 console-layout restoration
-and common Gen12 nonrender LRC workarounds. Those corrections and their
-qualification continue on this branch alongside the remaining features.
+and common Gen12 nonrender LRC workarounds. These corrections are included in the following native checkpoint;
+the remaining features continue on this branch.
+
+The next integration batch extends the same pinned source contract:
+
+- Fixed Gen12 primary/color DSB commits now share native-frame publication.
+  X tiling and integer panning keep timing/bandwidth unchanged. Required
+  ADLP/N 16 KiB SURF alignment and ARB_SLOTS=1 apply to every linear/X direct
+  and joint path. Exact original-family CTL/stride restores the console.
+  External DP/HDMI/MST/USB-C metadata now carries the exact PCI family;
+  missing/foreign metadata refuses before side effects and retains the session.
+- LNL 20.04 and PTL 30.00/30.01 main-GT execution uses exact PCI/firmware
+  profiles, five-level private address spaces and source cache/context/ADS
+  policies. Serial/headless startup permanently excludes boot publication
+  before an acknowledged whole-display driver reset. The retained media
+  proof covers all arena writes/invalidation and source 63-PTE ordering;
+  four raw zero writes precede every GPU MMIO read. Graphical boot, display,
+  HuC and separate media-GT execution stay unavailable on these profiles.
+  PTL preserves all 96 physical DSS positions and acknowledged DCC policy.
+- Fuse-present Gen12 VCS/VECS execute through the existing main GuC, using
+  source video AUX/MI_FLUSH commands, hardware-captured defaults, bank 1 IRQ
+  and the same retained media wake owner through scheduling/reset. Common
+  Gen12 nonrender LRC WAs also correct the existing BCS default path. Media
+  ADS/KLV extents validate before mutation. Native Xe and legacy i915 queue
+  selection use the real published engines and existing private-VM lifetimes.
+- Intel CPU mapping tokens and a whole-BO physical census preserve the same
+  object through pending publication, PROT_NONE/lazy and unpublished-fork
+  metadata, even after handles/tokens/PRIME close. The bounded permanent
+  registry preserves AMD aliases. This is a lifetime prerequisite; immutable
+  BO storage, eviction, PREFETCH and asynchronous CPU revocation are unchanged.
+
+All 58 new native fixtures pass in the debug kernel. The selected x86_64
+run passes 1,144 Intel/DRM/framebuffer/backlight tests and 670 shared
+filesystem/graphics/AMD tests, with no failures or duplicate names. All
+1,087 previous Intel checkpoint fixtures and all 31 shared backlight
+regressions remain covered. The shared group has one existing RNG-source
+registration skip. Host GPU/filesystem all-target Clippy, workspace format,
+diff and source-integrity checks pass. The full debug image needs a
+6.2 MB KASLR relocation table; its x86_64 reservation is now 8 MiB, with
+the existing image/slide/module-window assertions retained.
+
+The ledger now has 56 implemented checkpoint rows and ten broad open
+workstreams. Release native, production boot/btrfs and cross-target gates
+remain pending for the combined follow-on branch. This local checkpoint
+does not claim merge readiness or Intel silicon/Mesa acceptance.
+
+The remaining broad workstreams still need production ownership/protocols.
+Two source limits are not missing features of the admitted set: its pinned
+platform descriptors expose no CGP class mask, and Xe hwmon fan/temperature
+attributes are read-only (power/current are the writable controls). The next
+concrete scheduling slice is low-latency queue policy; sampling qualification,
+retained placement transitions, separate media GTs and MMU invalidation remain.
+
+The follow-on retained external-display patch is correcting exact-family
+plane inventory in stopped-resource and GT-bootstrap reads, with independent
+absent-register refusal fixtures. Its source review and validation remain
+separate from this native checkpoint.

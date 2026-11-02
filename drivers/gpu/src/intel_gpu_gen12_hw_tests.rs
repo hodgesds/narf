@@ -159,7 +159,7 @@ fn running(gt: &mut GuCGt<Window, Arena>, w: &Window, start: u64) -> (u32, BTree
 }
 fn execute_user(w: &Window, base: u32) {
     execute_gen12_restore(w, base, true);
-    if w.0.borrow().memory[&base].borrow()[1026] == 0x22244 {
+    if w.0.borrow().memory[&base].borrow()[1026] != 0x2244 {
         execute_copy(w, base);
         return;
     }
@@ -255,11 +255,10 @@ fn smoke_gen12_cache_refusal_and_cancel_reset_retain_every_dma_page() -> TestRes
         let (base, _) = running(&mut gt, &w, 30_000_001);
         {
             let mut wait = core::pin::pin!(fence.wait());
-            assert!(
-                wait.as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-            );
+            assert!(wait
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
         }
         context.request_ban();
         drop(result);
@@ -292,3 +291,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_gen12",
     smoke_gen12_cache_refusal_and_cancel_reset_retain_every_dma_page
 );
+
+mod media {
+    include!("intel_gpu_gen12_media_hw_tests.rs");
+}

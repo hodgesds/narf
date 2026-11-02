@@ -52,7 +52,10 @@ impl Window {
         .collect();
         Self(Arc::new(IrqSafeSpinLock::new(Registers {
             words,
-            writes: Vec::new(),
+            // The actual hard-IRQ dispatcher calls this register model.
+            // Reserve its bounded trace before interrupt context; recording
+            // the posted master-mask write must never grow a vector there.
+            writes: Vec::with_capacity(256),
             events: Vec::new(),
             vector: None,
             identity: 0,
@@ -88,7 +91,7 @@ impl MmioWindow for Window {
         if r.unavailable {
             return u32::MAX;
         }
-        if offset == 0x190060 {
+        if matches!(offset, 0x190060 | 0x190064) {
             return if r.delay { 0 } else { r.identity };
         }
         *r.words.get(&offset).unwrap_or(&0)
@@ -109,7 +112,7 @@ impl MmioWindow for Window {
                 r.words
                     .insert(offset, (old & !value & 0x7fffffff) | (value & 0x80000000));
             }
-            0x190018 => {
+            0x190018 | 0x19001c => {
                 assert!(r.identity == 0, "bank ack preceded identity ack");
                 let old = *r.words.get(&offset).unwrap_or(&0);
                 r.words.insert(offset, old & !value);
@@ -125,6 +128,18 @@ impl MmioWindow for Window {
                     0x80 => 0x80350001,       // valid COMPUTE0 MI_USER_INTERRUPT
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
                     _ => panic!("selected an unowned interrupt"),
+                };
+            }
+            0x190064 => {
+                assert_eq!(value, r.identity);
+                r.identity = 0;
+            }
+            0x190074 => {
+                r.identity = match value {
+                    2 => 0x80110001,
+                    0x40 => 0x80610010,
+                    0x20000000 => 0x80220001,
+                    _ => panic!("unowned media selector"),
                 };
             }
             0x190060 => {
@@ -308,7 +323,7 @@ kernel_test_in!(
 fn smoke_gt_irq_multi_compute_physical_masks_and_foreign_identity() -> TestResult {
     for engines in [
         EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs1, Engine::Ccs3]),
-        EngineSet::of(&Engine::ALL),
+        EngineSet::of(&Engine::GRAPHICS),
     ] {
         let w = Window::new();
         let saved = w.0.lock().words.clone();
@@ -679,4 +694,111 @@ fn smoke_gen12_irq_identity_deadline_and_rearm_failure_keep_master_masked() -> T
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gt_irq",
     smoke_gen12_irq_identity_deadline_and_rearm_failure_keep_master_masked
+);
+
+fn smoke_gen12_media_irq_bank_sparse_routes_and_owned_restore() -> TestResult {
+    let w = Window::new();
+    {
+        let mut r = w.0.lock();
+        r.no_tile = true;
+        r.words.insert(0x190034, 0x22224444);
+        for reg in [0x1900a8, 0x1900ac, 0x1900b0, 0x1900b4, 0x1900d0, 0x1900d4] {
+            r.words.insert(reg, 0xa5a55a5a);
+        }
+        for base in [0x1c4000, 0x1f0000, 0x1e8000] {
+            r.words.insert(base + 0xa8, 0xffffaaaa);
+        }
+    }
+    let before = w.0.lock().words.clone();
+    let set = EngineSet::of(&[
+        Engine::Rcs0,
+        Engine::Bcs0,
+        Engine::Vcs1,
+        Engine::Vcs6,
+        Engine::Vecs2,
+    ]);
+    let delivery = Delivery::install_hierarchy(w.clone(), Route(w.clone()), set, false).unwrap();
+    assert_eq!(w.read32(0x190034), 0x22334455);
+    assert_eq!(w.read32(0x1900a8), 0xa5a55a4a); // odd VCS1 low half
+    assert_eq!(w.read32(0x1900b4), 0xa5a45a5a); // even VCS6 high half
+    assert_eq!(w.read32(0x1900d4), 0xa5a45a5a); // even VECS2 high half
+    for reg in [0x1900ac, 0x1900b0, 0x1900d0] {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190018, 0x02000000);
+        r.words.insert(0x19001c, 0x20000042);
+        r.words.insert(0x190010, 3);
+    }
+    delivery.controller.hard_irq();
+    for now in 0..10 {
+        if !delivery.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(w.read32(0x19001c), 0);
+    assert_eq!(w.read32(0x190010), 0x80000000);
+    let writes = w.0.lock().writes.clone();
+    let media: Vec<_> = writes
+        .iter()
+        .copied()
+        .filter(|(reg, _)| matches!(*reg, 0x190074 | 0x190064 | 0x19001c))
+        .collect();
+    assert_eq!(
+        media,
+        [
+            (0x190074, 2),
+            (0x190064, 0x80110001),
+            (0x19001c, 2),
+            (0x190074, 0x40),
+            (0x190064, 0x80610010),
+            (0x19001c, 0x40),
+            (0x190074, 0x20000000),
+            (0x190064, 0x80220001),
+            (0x19001c, 0x20000000)
+        ]
+    );
+    drop(delivery);
+    for reg in [
+        0x190034, 0x1900a8, 0x1900b4, 0x1900d4, 0x1c40a8, 0x1f00a8, 0x1e80a8,
+    ] {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen12",
+    smoke_gen12_media_irq_bank_sparse_routes_and_owned_restore
+);
+
+fn smoke_gen12_media_irq_foreign_fused_source_and_identity_timeout_fail_closed() -> TestResult {
+    for timeout in [false, true] {
+        let w = Window::new();
+        w.0.lock().no_tile = true;
+        let set = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Vcs1]);
+        let delivery =
+            Delivery::install_hierarchy(w.clone(), Route(w.clone()), set, false).unwrap();
+        {
+            let mut r = w.0.lock();
+            r.words.insert(0x190010, 2);
+            r.words.insert(0x19001c, if timeout { 2 } else { 1 });
+            r.delay = timeout;
+        }
+        delivery.controller.hard_irq();
+        if timeout {
+            assert_eq!(delivery.service(0), Ok(true));
+            assert_eq!(delivery.service(100_000), Err(IrqError::Timeout));
+        } else {
+            assert_eq!(delivery.service(0), Err(IrqError::Conflict));
+        }
+        assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+        assert!(!w.0.lock().writes.iter().any(|(reg, _)| *reg == 0x19001c));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen12",
+    smoke_gen12_media_irq_foreign_fused_source_and_identity_timeout_fail_closed
 );

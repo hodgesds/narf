@@ -102,3 +102,45 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_cursor",
     smoke_gen12_cursor_resource_refusals_precede_partition_and_partial_writes_abort
 );
+
+fn smoke_gen12_no_dpt_global_disable_requires_all_fetchers_stopped_and_readback() -> TestResult {
+    for family in [
+        Gen12Platform::TigerLake,
+        Gen12Platform::AlderLakeS,
+        Gen12Platform::AlderLakeP,
+        Gen12Platform::AlderLakeN,
+    ] {
+        let io = stopped();
+        io.set(0x42084, 0x1234);
+        setup(&io, &mode(), family).unwrap().unwrap();
+        assert_eq!(
+            io.read32(0x42084),
+            if matches!(
+                family,
+                Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN
+            ) {
+                0x40001234
+            } else {
+                0x1234
+            }
+        );
+    }
+    let io = stopped();
+    io.set(0x71080, 0x27);
+    assert!(setup(&io, &mode(), Gen12Platform::AlderLakeP)
+        .unwrap()
+        .is_none());
+    assert_eq!(io.read32(0x42084), 0);
+    let io = stopped();
+    io.refuse_layout(0x42084);
+    assert_eq!(
+        setup(&io, &mode(), Gen12Platform::AlderLakeP).map(|p| p.is_some()),
+        Err(FsError::NoDevice)
+    );
+    assert_eq!(io.read32(0x70180), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_cursor",
+    smoke_gen12_no_dpt_global_disable_requires_all_fetchers_stopped_and_readback
+);

@@ -156,6 +156,13 @@ fn smoke_intel_gen12_fixed_primary_raw_fifo_native_latch_and_cache_format() -> T
         let mut worker = Worker {
             device: Arc::new(p.gen12(family)),
         };
+        assert_eq!(
+            p.read32(0x70180),
+            match family {
+                Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
+                _ => 0x84000000,
+            }
+        );
         // Gen12 system GGTT does not consume MTL's PAT register/index bits.
         p.set(0x4804, u32::MAX);
         request(&cpu, fb, NONBLOCK | TEST_ONLY);
@@ -214,9 +221,9 @@ fn smoke_intel_gen12_fixed_primary_refuses_foreign_route_resources_and_console_p
         (0x68180, 1 << 31),
         (0x4438c, 1 << 31),
         (CONSOLE_PTE, 0x100003),
-        (0x70180, 0x84000001),
-        (0x70180, 0x84008000),
-        (0x70180, 0x84800000),
+        (0x70180, 0x94000001),
+        (0x70180, 0x94008000),
+        (0x70180, 0x94800000),
         (0x701c8, 1 << 31),
     ] {
         let mode = mode();

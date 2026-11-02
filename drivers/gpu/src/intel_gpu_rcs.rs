@@ -841,6 +841,11 @@ pub struct GgttArena {
     policy: Option<crate::intel_gpu_gt_hw::CachePolicy>,
     authority: Option<crate::intel_gpu_gt_hw::AuthorizedWindow>,
     gt_platform: Option<crate::intel_gpu_gt::GtPlatform>,
+    lnl_receipt: Option<crate::intel_gpu_gt::lnl::Receipt>,
+    lnl_device: Option<narf_bus::BusDevice>,
+    lnl_pte_count: core::cell::Cell<u8>,
+    retired: bool,
+    live_ranges: alloc::collections::BTreeMap<u32, u32>,
     ggtt_ledger: Option<alloc::sync::Arc<crate::intel_gpu_ggtt_ranges::Ledger>>,
 }
 
@@ -869,13 +874,7 @@ impl GgttArena {
                 if phys >> policy.platform().physical_bits() != 0 {
                     return Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange);
                 }
-                let format = if policy.platform().is_gen12()
-                    || policy.platform() == crate::intel_gpu_gt::GtPlatform::Alchemist
-                {
-                    crate::intel_gpu_gtt::PteFormat::Gen12
-                } else {
-                    crate::intel_gpu_gtt::PteFormat::XeLpg
-                };
+                let format = policy.platform().pte_format();
                 format.encode_ggtt(phys, policy.ggtt_pat())
             }
         }
@@ -902,6 +901,11 @@ impl GgttArena {
             policy: None,
             authority: None,
             gt_platform: None,
+            lnl_receipt: None,
+            lnl_device: None,
+            lnl_pte_count: core::cell::Cell::new(0),
+            retired: false,
+            live_ranges: alloc::collections::BTreeMap::new(),
             ggtt_ledger: crate::intel_gpu_ggtt_ranges::Ledger::for_bar(bar.phys.raw(), bar.len)
                 .ok(),
         }
@@ -918,10 +922,61 @@ impl GgttArena {
         arena
     }
 
+    pub(crate) fn for_lnl_gt(
+        bar: narf_bus::bar::MmioRegion,
+        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        device: narf_bus::BusDevice,
+        receipt: crate::intel_gpu_gt::lnl::Receipt,
+    ) -> Result<Self, SubmitError> {
+        let platform =
+            crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+                .filter(|p| p.is_headless_integrated())
+                .ok_or(SubmitError::NoEngine)?;
+        let mut arena = Self::for_gt(bar, cap, platform);
+        arena.authority = Some(crate::intel_gpu_gt_hw::AuthorizedWindow::for_device(
+            bar, cap, device,
+        ));
+        arena.lnl_device = Some(device);
+        arena.lnl_receipt = Some(receipt);
+        if !arena.lnl_takeover_ready() {
+            return Err(SubmitError::NoEngine);
+        }
+        Ok(arena)
+    }
+
+    fn lnl_takeover_ready(&self) -> bool {
+        !self.retired
+            && self.authority.as_ref().is_some_and(|mmio| {
+                self.lnl_receipt.as_ref().is_some_and(|r| {
+                    self.lnl_device
+                        .is_some_and(|device| r.matches(device, self.bar, mmio))
+                })
+            })
+    }
+
     /// Write one GGTT PTE (or zero to invalidate) at `ggtt_off`.
-    fn write_pte(&self, ggtt_off: u32, pte: u64) {
+    fn write_pte(&self, ggtt_off: u32, pte: u64) -> Result<(), SubmitError> {
+        if self.retired {
+            return Err(SubmitError::NoEngine);
+        }
+        let lnl = self.gt_platform.is_some_and(|p| p.is_headless_integrated());
+        if lnl && !self.lnl_takeover_ready() {
+            return Err(SubmitError::NoEngine);
+        }
         let pte_byte = GGTT_ARRAY_BASE + (ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
         if let Some(window) = &self.authority {
+            let media = if lnl {
+                Some(
+                    self.policy
+                        .and_then(|p| p.media)
+                        .ok_or(SubmitError::NoEngine)?,
+                )
+            } else {
+                None
+            };
+            if let Some(proof) = media {
+                proof.current(window).map_err(|_| SubmitError::NoEngine)?;
+            }
             window.write32(pte_byte, pte as u32);
             window.write32(pte_byte + 4, (pte >> 32) as u32);
             // Wa_22019338487: RO GMD_ID write drains G-unit PTE writes.
@@ -929,7 +984,12 @@ impl GgttArena {
             if self.gt_platform == Some(crate::intel_gpu_gt::GtPlatform::Battlemage) {
                 window.write32(0xd8c, 0);
             }
-            return;
+            if let Some(proof) = media {
+                proof
+                    .after_pte(window, &self.lnl_pte_count)
+                    .map_err(|_| SubmitError::NoEngine)?;
+            }
+            return Ok(());
         }
         // SAFETY: `self.bar` is the probe-mapped BAR0 owned by
         // this driver; `pte_byte` is an 8-byte-aligned slot inside
@@ -941,6 +1001,7 @@ impl GgttArena {
             self.bar.write32(pte_byte, (pte & 0xFFFF_FFFF) as u32);
             self.bar.write32(pte_byte + 4, (pte >> 32) as u32);
         }
+        Ok(())
     }
 
     /// Posting flush for a burst of arena PTE writes: fence,
@@ -967,6 +1028,9 @@ impl GpuAllocator for GgttArena {
     type Backing = FrameBacking;
 
     fn alloc(&mut self, pages: u32) -> Result<FrameBacking, SubmitError> {
+        if self.retired {
+            return Err(SubmitError::NoEngine);
+        }
         if pages == 0 {
             return Err(SubmitError::OutOfMemory);
         }
@@ -1033,25 +1097,45 @@ impl GpuAllocator for GgttArena {
             coherent: self.policy.is_some() && cfg!(target_arch = "x86_64"),
             mapped: self.authority.is_none() || self.policy.is_some(),
         };
+        self.live_ranges.insert(off, pages);
+        self.live += 1;
+        self.live_pages += pages;
         if backing.mapped {
+            let mut failed = false;
             for (p, frame) in backing.frames.iter().enumerate() {
                 let pte = self
                     .encode_pte(frame.start_address().raw())
                     .expect("validated frame extent");
-                self.write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte);
+                if self
+                    .write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte)
+                    .is_err()
+                {
+                    // A partially published allocation remains retained and its
+                    // range reserved. Authority loss is not DMA retirement.
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                core::mem::forget(backing);
+                return Err(SubmitError::NoEngine);
             }
             self.flush_pte_writes(off + (pages - 1) * GTT_PAGE_SIZE as u32);
         }
         backing.zero_fill();
-        self.live += 1;
-        self.live_pages += pages;
         Ok(backing)
     }
 
     fn free(&mut self, backing: FrameBacking) {
-        if backing.mapped {
+        if backing.mapped && !self.retired {
             for p in 0..backing.pages {
-                self.write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0);
+                if self
+                    .write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0)
+                    .is_err()
+                {
+                    core::mem::forget(backing);
+                    return;
+                }
             }
             self.flush_pte_writes(backing.ggtt + (backing.pages - 1) * GTT_PAGE_SIZE as u32);
         }
@@ -1060,6 +1144,7 @@ impl GpuAllocator for GgttArena {
         }
         self.live -= 1;
         self.live_pages -= backing.pages;
+        self.live_ranges.remove(&backing.ggtt);
         // Reinsert and coalesce with neighbours.
         self.free_list.push((backing.ggtt, backing.pages));
         self.free_list.sort_by_key(|&(off, _)| off);
@@ -1111,6 +1196,29 @@ impl SharedArena {
         }
     }
 
+    pub(crate) fn lnl_takeover_ready(&self) -> bool {
+        self.inner.lock().lnl_takeover_ready()
+    }
+
+    pub(crate) fn retire_ggtt(&self) -> Result<(), SubmitError> {
+        let mut arena = self.inner.lock();
+        if !arena
+            .gt_platform
+            .is_some_and(|p| p.is_headless_integrated())
+            || arena.retired
+        {
+            return Ok(());
+        }
+        for (&offset, &pages) in &arena.live_ranges {
+            for page in 0..pages {
+                arena.write_pte(offset + page * 4096, 0)?;
+            }
+            arena.flush_pte_writes(offset + (pages - 1) * 4096);
+        }
+        arena.retired = true;
+        Ok(())
+    }
+
     pub(crate) fn configure_cache(
         &self,
         backing: &mut FrameBacking,
@@ -1128,12 +1236,19 @@ impl SharedArena {
         }) {
             return Err(SubmitError::NoEngine);
         }
+        if policy.platform().is_headless_integrated()
+            && (!arena.lnl_takeover_ready() || policy.media.is_none())
+        {
+            return Err(SubmitError::NoEngine);
+        }
         arena.policy = Some(policy);
+        // Retain the backing on every partially published failure path.
+        backing.mapped = true;
         for (i, frame) in backing.frames.iter().enumerate() {
             let pte = arena
                 .encode_pte(frame.start_address().raw())
                 .map_err(|_| SubmitError::OutOfMemory)?;
-            arena.write_pte(backing.ggtt + i as u32 * 4096, pte);
+            arena.write_pte(backing.ggtt + i as u32 * 4096, pte)?;
         }
         arena.flush_pte_writes(backing.ggtt + (backing.pages - 1) * 4096);
         // The hardware policy requests snooped system-memory access. The ARM
@@ -3637,6 +3752,7 @@ pub mod tests {
         arena.policy = Some(crate::intel_gpu_gt_hw::CachePolicy {
             platform: crate::intel_gpu_gt::GtPlatform::Alchemist,
             ggtt_pat: 0,
+            media: None,
         });
         let last_dg2_page = (1u64 << 46) - 4096;
         if arena.encode_pte(1u64 << 39) != Ok((1u64 << 39) | 1)

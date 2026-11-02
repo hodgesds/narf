@@ -14,6 +14,7 @@ fn expected_saves(
     platform: GtPlatform,
     device: u16,
     release: u32,
+    step: u8,
     engine: Engine,
 ) -> BTreeMap<u32, u32> {
     let base = engine.base();
@@ -28,7 +29,7 @@ fn expected_saves(
     for offset in (0x4d0..=0x4fc).step_by(4) {
         entries.insert(base + offset, 0);
     }
-    if platform == GtPlatform::Battlemage {
+    if platform.is_xe2() {
         entries.extend([(base + 0x50, 1), (base + 0xd4, 1)]);
     }
     if engine != Engine::Rcs0 {
@@ -37,11 +38,13 @@ fn expected_saves(
     entries.insert(0x14800, 1);
     // The fixture has two physical CCSs on both discrete profiles, including
     // sparse CCS1/CCS3. Their selected count and dense identities are separate.
-    if platform.is_discrete() {
+    if platform.multiple_ccs() {
         entries.insert(0x14804, 1);
     }
     // Sparse live DSS10 -> group2/instance2 for modern, DSS2 ->0/2 for Gen12.
-    let mcr = if platform.is_gen12() {
+    let mcr = if platform.is_ptl() {
+        0x0070b002
+    } else if platform.is_gen12() {
         0x00200002
     } else {
         0x00202002
@@ -63,6 +66,32 @@ fn expected_saves(
             (0xe48c, 1),
             (0xe4f4, 1),
             (0xe5f0, 1),
+            (0xe7c8, 0),
+            (0xe7cc, 0),
+        ],
+        _ if platform.is_ptl() && release == 0 && step < 4 => &[
+            (0xe18c, 1),
+            (0xe194, 1),
+            (0xe48c, 1),
+            (0xe4c4, 1),
+            (0xe4f0, 1),
+            (0xe530, 0),
+            (0xe5f4, 1),
+        ],
+        _ if platform.is_ptl() => &[
+            (0xe194, 1),
+            (0xe4c4, 1),
+            (0xe4f0, 1),
+            (0xe530, 0),
+            (0xe5f4, 1),
+        ],
+        _ if platform.is_lnl() => &[
+            (0xe194, 1),
+            (0xe48c, 1),
+            (0xe49c, 1),
+            (0xe4c4, 1),
+            (0xe4f0, 1),
+            (0xe530, 0),
             (0xe7c8, 0),
             (0xe7cc, 0),
         ],
@@ -102,7 +131,7 @@ fn expected_saves(
         GtPlatform::Alchemist if device == 0x56a5 => {
             entries.insert(0xe420, mcr | 1);
         }
-        GtPlatform::Integrated(_) if release <= 71 => {
+        GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) if release <= 71 => {
             entries.insert(0xe5f0, mcr | 1);
         }
         _ => {}
@@ -179,20 +208,38 @@ fn firmware_reset(w: &Window, engine: Engine, expected: &BTreeMap<u32, u32>) {
 fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
     use crate::intel_gpu::Generation;
     let lpg = GtPlatform::Integrated(Generation::MeteorLake);
-    for (platform, device, release) in [
-        (GtPlatform::Gen12(Gen12Platform::TigerLake), 0x9a49, 0),
-        (GtPlatform::Gen12(Gen12Platform::AlderLakeP), 0x46a6, 0),
-        (GtPlatform::Gen12(Gen12Platform::AlderLakeS), 0x4680, 0),
-        (GtPlatform::Gen12(Gen12Platform::AlderLakeN), 0x46d1, 0),
-        (GtPlatform::Alchemist, 0x56a0, 55),
-        (GtPlatform::Alchemist, 0x56a5, 55),
-        (GtPlatform::Alchemist, 0x56a3, 55),
-        (lpg, 0x7d55, 70),
-        (lpg, 0x7d55, 71),
-        (lpg, 0x7d55, 74),
-        (GtPlatform::Battlemage, 0xe20b, 1),
-        (GtPlatform::Battlemage, 0xe20b, 2),
+    let mut cases = [
+        (GtPlatform::Gen12(Gen12Platform::TigerLake), 0x9a49, 0, 0),
+        (GtPlatform::Gen12(Gen12Platform::AlderLakeP), 0x46a6, 0, 0),
+        (GtPlatform::Gen12(Gen12Platform::AlderLakeS), 0x4680, 0, 0),
+        (GtPlatform::Gen12(Gen12Platform::AlderLakeN), 0x46d1, 0, 0),
+        (GtPlatform::Alchemist, 0x56a0, 55, 0),
+        (GtPlatform::Alchemist, 0x56a5, 55, 0),
+        (GtPlatform::Alchemist, 0x56a3, 55, 0),
+        (lpg, 0x7d55, 70, 0),
+        (lpg, 0x7d55, 71, 0),
+        (lpg, 0x7d55, 74, 0),
+        (GtPlatform::Integrated(Generation::LunarLake), 0x6420, 4, 0),
+        (GtPlatform::Integrated(Generation::LunarLake), 0x64a0, 4, 0),
+        (GtPlatform::Integrated(Generation::LunarLake), 0x64b0, 4, 0),
+        (GtPlatform::Battlemage, 0xe20b, 1, 0),
+        (GtPlatform::Battlemage, 0xe20b, 2, 0),
+    ]
+    .to_vec();
+    for device in [
+        0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
+        0xb0b0,
     ] {
+        for (release, step) in [(0, 0), (0, 4), (1, 0)] {
+            cases.push((
+                GtPlatform::Integrated(Generation::PantherLake),
+                device,
+                release,
+                step,
+            ));
+        }
+    }
+    for (platform, device, release, step) in cases {
         let ack = platform.guc_forcewake_ack().unwrap();
         let (w, arena, mut gt) = hardware_model_with_identity(platform, ack, 1, Some(device));
         {
@@ -206,13 +253,32 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
                 },
             );
             d.regs.insert(0x9144, 0);
-            if platform == GtPlatform::Battlemage {
-                d.regs.insert(0x9114, 0x10 | 10 << 16);
+            if platform.is_ptl() {
+                d.regs.extend([
+                    (0x913c, 0),
+                    (0x9150, 0),
+                    (0x9154, 0x80000000),
+                    (0x9148, 0),
+                    (0x914c, 0),
+                    (0x380d8c, 30 << 22 | u32::from(step)),
+                ]);
+            }
+            if platform.is_xe2() {
+                d.regs.insert(
+                    0x9114,
+                    0x10 | (if platform.is_ptl() || (platform.is_lnl() && device == 0x6420) {
+                        15
+                    } else {
+                        10
+                    }) << 16,
+                );
             }
             if !platform.is_gen12() && platform != GtPlatform::Alchemist {
                 d.regs.insert(
                     0xd8c,
-                    if platform == GtPlatform::Battlemage {
+                    if platform.is_ptl() {
+                        30 << 22 | release << 14 | u32::from(step)
+                    } else if platform.is_xe2() {
                         20 << 22 | release << 14
                     } else {
                         12 << 22 | release << 14
@@ -221,7 +287,17 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
             }
         }
         hardware_discovery(&mut gt, &w, ack);
-        hardware_scheduling_reload_mode(&mut gt, &w, if platform.is_discrete() { 2 } else { 1 });
+        hardware_scheduling_reload_mode(
+            &mut gt,
+            &w,
+            if platform.is_ptl() || (platform.is_lnl() && device == 0x6420) {
+                4
+            } else if platform.multiple_ccs() {
+                2
+            } else {
+                1
+            },
+        );
         hardware_enable_ct(&mut gt, &w);
         let completion = gt.begin_context_defaults(10_000_000).unwrap();
         let mut registered = BTreeMap::new();
@@ -248,7 +324,7 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
                 service_contexts(&w, &mut registered, false);
             }
             assert!(registered.contains_key(&u32::from(id)) && fence.result().is_none());
-            let expected = expected_saves(platform, device, release, engine);
+            let expected = expected_saves(platform, device, release, step, engine);
             firmware_reset(&w, engine, &expected);
             let writes = w.0.borrow().writes.len();
             event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
@@ -265,11 +341,9 @@ fn smoke_guc_source_engine_saves_survive_actual_isolated_reset() -> TestResult {
             assert_eq!(gt.user_epoch(), epoch);
             // Isolated recovery cannot replay host workarounds or reset the
             // whole GT. A fresh private PPGTT job executes on the same engine.
-            assert!(
-                !w.0.borrow().writes[writes..]
-                    .iter()
-                    .any(|(r, _)| *r == 0x941c || expected.contains_key(&(*r as u32)))
-            );
+            assert!(!w.0.borrow().writes[writes..]
+                .iter()
+                .any(|(r, _)| *r == 0x941c || expected.contains_key(&(*r as u32))));
             let probe = gt.submit_ppgtt_probe_on(start + 200, engine).unwrap();
             for now in start + 201..start + 300 {
                 assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));

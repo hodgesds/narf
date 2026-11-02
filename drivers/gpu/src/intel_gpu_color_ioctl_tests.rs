@@ -1482,3 +1482,11 @@ mod gen12_ctm {
 mod gen12_luts {
     include!("intel_gpu_gen12_lut_ioctl_tests.rs");
 }
+
+mod gen12_joint {
+    include!("intel_gpu_gen12_joint_ioctl_tests.rs");
+}
+
+mod gen12_tiled {
+    include!("intel_gpu_gen12_tiled_ioctl_tests.rs");
+}

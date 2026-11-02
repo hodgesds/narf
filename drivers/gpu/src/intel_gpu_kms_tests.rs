@@ -51,6 +51,7 @@ struct Hardware {
     pending_cursor: Option<u32>,
     flips: bool,
     frames: bool,
+    tear_visible_frame: bool,
     now: u64,
     tick_ns: u64,
     deliveries: u32,
@@ -67,6 +68,7 @@ struct Hardware {
     dsb_writes: Vec<(u64, u32)>,
     poison_dsb_read: bool,
     gen12_display: bool,
+    display13: bool,
     pcode_latencies: [u8; 8],
     pcode_block_time: u32,
     pcode_status: u32,
@@ -119,6 +121,7 @@ impl MockPlatform {
                 pending_cursor: None,
                 flips: true,
                 frames: true,
+                tear_visible_frame: false,
                 now: 1000,
                 tick_ns: 250_000,
                 deliveries: 0,
@@ -135,6 +138,7 @@ impl MockPlatform {
                 dsb_writes: Vec::new(),
                 poison_dsb_read: false,
                 gen12_display: false,
+                display13: false,
                 pcode_latencies: [6, 8, 10, 12, 14, 16, 0, 0],
                 pcode_block_time: 10,
                 pcode_status: 0,
@@ -152,15 +156,72 @@ impl MockPlatform {
         self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
     }
     pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
+        // Select a literal source family when converting the initial generic
+        // linear fixture. Preserve deliberately corrupted non-baseline CTLs.
+        if self.read32(0x70180) == 0x84000000 {
+            self.set(
+                0x70180,
+                match family {
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                    | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => 0x94000000,
+                    _ => 0x84000000,
+                },
+            );
+        }
         let mut platform = self.clone();
         platform.3 = Some(family);
         self.0.lock().gen12_display = true;
+        self.0.lock().display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
         let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
             Generation::TigerLake
         } else {
             Generation::AlderLake
         };
         Device::new(platform, generation, 0x1000000, console())
+    }
+    pub(crate) fn gen12_pitch(
+        &self,
+        family: crate::intel_gpu_gt::Gen12Platform,
+        pitch: u32,
+    ) -> Device<Self> {
+        self.set(0x70188, pitch / 64);
+        for page in 0..(u64::from(pitch) * 32).div_ceil(4096) {
+            let r = GGTT_ARRAY_BASE + (u64::from(CONSOLE) / 4096 + page) * 8;
+            self.set(r, 0x100001 + page as u32 * 4096);
+            self.set(r + 4, 0);
+        }
+        // Select a literal source family when converting the initial generic
+        // linear fixture. Preserve deliberately corrupted non-baseline CTLs.
+        if self.read32(0x70180) == 0x84000000 {
+            self.set(
+                0x70180,
+                match family {
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                    | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => 0x94000000,
+                    _ => 0x84000000,
+                },
+            );
+        }
+        let mut platform = self.clone();
+        platform.3 = Some(family);
+        self.0.lock().display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
+        self.0.lock().gen12_display = true;
+        let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        let mut saved = console();
+        saved.stride_bytes = pitch;
+        Device::new(platform, generation, 0x1000000, saved)
     }
     fn gen12_defaults(&self) {
         for (r, value) in [
@@ -295,6 +356,11 @@ impl MockPlatform {
     ) -> crate::intel_gpu_dsb::Timing {
         let timing = self.dsb_timing();
         self.0.lock().gen12_display = true;
+        self.0.lock().display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
         self.set(0x70008, 0);
         self.set(0x70180, 0);
         let mode = crate::intel_gpu_modeset::Mode {
@@ -309,7 +375,14 @@ impl MockPlatform {
             .unwrap()
             .unwrap();
         self.set(0x70008, 3 << 30);
-        self.set(0x70180, 0x84000000);
+        self.set(
+            0x70180,
+            match family {
+                crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => 0x94000000,
+                _ => 0x84000000,
+            },
+        );
         timing
     }
     pub(crate) fn pcode_values(&self, latencies: [u8; 8], block_time: u32, status: u32) {
@@ -344,6 +417,16 @@ impl MockPlatform {
             .filter(|&(&r, _)| !(command..command + 4 * 8).contains(&r))
             .map(|(&r, &v)| (r, v))
             .collect()
+    }
+    pub(crate) fn advance_time(&self, ns: u64) {
+        let mut hw = self.0.lock();
+        hw.now = hw.now.saturating_add(ns);
+    }
+    pub(crate) fn allow_frames(&self, enabled: bool) {
+        self.0.lock().frames = enabled;
+    }
+    pub(crate) fn tear_visible_frame(&self, enabled: bool) {
+        self.0.lock().tear_visible_frame = enabled;
     }
     pub(crate) fn allow_flips(&self, enabled: bool) {
         self.0.lock().flips = enabled;
@@ -474,12 +557,25 @@ impl MmioWindow for MockPlatform {
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return u32::MAX;
         }
+        if hw.gen12_display && !hw.display13 && offset == 0x42084 {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
+        // Independently force the final visible-arm/primary observation to
+        // cross a real frame, after the source has armed a non-console target.
+        if offset == crate::intel_gpu_color::MODE
+            && hw.tear_visible_frame
+            && hw.regs.get(&SURF).copied().unwrap_or(CONSOLE) != CONSOLE
+        {
+            let count = hw.regs[&FRAME].wrapping_add(1);
+            hw.regs.insert(FRAME, count);
+        }
         // Gen12 has no MTL display PAT, MMIO latency or PM_DEMAND port.
         // Reads fail and are counted, even if the caller later falls back.
         if hw.gen12_display
             && matches!(
                 offset,
-                0x4804 | 0x45780 | 0x45784 | 0x45788 | 0x45230 | 0x45234
+                0x4804 | 0x45780 | 0x45784 | 0x45788 | 0x45230 | 0x45234 | 0x7026c
             )
         {
             hw.forbidden_display_reads += 1;

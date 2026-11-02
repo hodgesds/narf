@@ -78,11 +78,15 @@ pub(crate) struct PollIo<M: DisplayAccess> {
     mmio: M,
     bar_len: u64,
     format: PteFormat,
+    generation: Generation,
     status: u32,
     saved_ier: u32,
     saved_imr: u32,
     state: Cell<State>,
     last_pte: Cell<Option<(u64, u32)>>,
+    /// Exact original linear console layout, supplied from the retained
+    /// source-qualified KMS owner; reset never samples a new baseline.
+    console_layout: Option<(u32, u32)>,
 }
 
 impl<M: DisplayAccess> core::fmt::Debug for PollIo<M> {
@@ -116,7 +120,7 @@ impl<M: DisplayAccess> PollIo<M> {
         let format = match generation {
             Generation::TigerLake | Generation::AlderLake => PteFormat::Gen12,
             Generation::MeteorLake => PteFormat::XeLpg,
-            Generation::PantherLake => return Err(IoError::Unsupported),
+            Generation::LunarLake | Generation::PantherLake => return Err(IoError::Unsupported),
         };
         if pipe != Pipe::A {
             return Err(IoError::Unsupported);
@@ -149,11 +153,13 @@ impl<M: DisplayAccess> PollIo<M> {
             mmio,
             bar_len,
             format,
+            generation,
             status,
             saved_ier: 0,
             saved_imr: 0,
             state: Cell::new(State::Initializing),
             last_pte: Cell::new(None),
+            console_layout: None,
         };
         owner.present()?;
         let ier = owner.checked_read(IER)?;
@@ -186,6 +192,55 @@ impl<M: DisplayAccess> PollIo<M> {
         owner.present()?;
         owner.state.set(State::Active);
         Ok(owner)
+    }
+
+    /// Bind CPU console restoration before Presenter exposure. This grants
+    /// only the retained source-selected original CTL and pitch; client view
+    /// updates still require the owned DSB and a fresh final SURF latch.
+    pub(crate) fn qualify_console(
+        &mut self,
+        family: Option<crate::intel_gpu_gt::Gen12Platform>,
+        control: u32,
+        stride: u32,
+    ) -> Result<(), IoError> {
+        let expected = match (self.format, family) {
+            (PteFormat::Gen12, Some(family)) => {
+                if (self.generation == Generation::TigerLake)
+                    != (family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
+                {
+                    return Err(IoError::Unsupported);
+                }
+                if stride > crate::intel_gpu_scanout::gen12_max_stride(family) / 64 {
+                    return Err(IoError::Unsupported);
+                }
+                crate::intel_gpu_pipes::gen12_xrgb_control(family)
+            }
+            (PteFormat::XeLpg, None) => 0x84000000,
+            _ => return Err(IoError::Unsupported),
+        };
+        // Preserve already-admitted MTL's original harmless trickle/clear
+        // controls. Format and arbitration stay source-exact; Gen12's
+        // stronger primary owner admits only the exact family literal.
+        let harmless = if self.format == PteFormat::XeLpg {
+            (1 << 14) | (1 << 13)
+        } else {
+            0
+        };
+        if self.state.get() != State::Active
+            || stride == 0
+            || stride > 0xfff
+            || control & !harmless != expected
+        {
+            return Err(IoError::Unsupported);
+        }
+        if self
+            .console_layout
+            .is_some_and(|old| old != (control, stride))
+        {
+            return Err(IoError::Conflict);
+        }
+        self.console_layout = Some((control, stride));
+        Ok(())
     }
 
     pub(crate) fn format(&self) -> PteFormat {
@@ -377,16 +432,24 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
         // Only enabled linear XRGB may be restored by this adapter. Client
         // tiling/stride changes use DSB. The Presenter retains the exact
         // original CTL/pitch and later proves the console's SURF latch.
-        let console_layout = self.format == PteFormat::XeLpg
-            && matches!(offset, 0x70180 | 0x70188)
-            && if offset == 0x70180 {
-                let current = self.read32(0x70180);
-                value == current & !(7 << 10)
-                    && value & 0x9f000000 == 0x84000000
-                    && [0, 1 << 10, 5 << 10].contains(&(current & (7 << 10)))
-            } else {
-                value != 0 && value <= 0xfff
-            };
+        let console_layout = self.console_layout.is_some_and(|(control, stride)| {
+            if !matches!(offset, 0x70180 | 0x70188) {
+                return false;
+            }
+            let current_control = self.read32(0x70180);
+            let current_stride = self.read32(0x70188);
+            let tiling = current_control & (7 << 10);
+            let layout_owned = current_control & !(7 << 10) == control
+                && (tiling == 0
+                    || tiling == 1 << 10
+                    || (self.format == PteFormat::XeLpg && tiling == 5 << 10));
+            let pitch_owned = current_stride == stride
+                || (stride % 8 == 0 && current_stride == stride / 8)
+                || (self.format == PteFormat::XeLpg
+                    && stride % 2 == 0
+                    && current_stride == stride / 2);
+            layout_owned && pitch_owned && value == if offset == 0x70180 { control } else { stride }
+        });
         if self.state.get() != State::Active
             || !(pte || offset == surface || offset == IIR || console_origin || console_layout)
             || ((console_origin || console_layout) && self.owned_status_ready().is_err())

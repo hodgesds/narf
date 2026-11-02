@@ -800,8 +800,11 @@ impl Plan {
         color_primary |= panning || tiling;
         let mut view = View::from(viewport);
         if color.is_some() || gamma.is_some() || degamma.is_some() || panning || tiling {
+            let joint_qualified = card.intel_ctm
+                || (card.intel_gen12_joint
+                    && ((!panning && !tiling) || card.intel_gen12_views.is_some()));
             if !card.intel_ctm_supported(p.next.id)
-                || (color_primary && !card.intel_ctm)
+                || (color_primary && !joint_qualified)
                 || (!card.intel_color(p.next.id) && (gamma.is_some() || degamma.is_some()))
             {
                 return Err(FsError::Unsupported);
@@ -858,7 +861,17 @@ impl Plan {
                 {
                     return Err(FsError::NoSpace);
                 }
-                let (_, _, extent) = view.footprint(geometry).map_err(|_| FsError::InvalidData)?;
+                let alignment = card
+                    .intel_gen12_views
+                    .map_or(4096, crate::intel_gpu_scanout::gen12_alignment);
+                if card.intel_gen12_views.is_some_and(|family| {
+                    geometry.pitch > crate::intel_gpu_scanout::gen12_max_stride(family)
+                }) {
+                    return Err(FsError::Unsupported);
+                }
+                let (_, _, extent) = view
+                    .footprint_aligned(geometry, alignment)
+                    .map_err(|_| FsError::InvalidData)?;
                 if extent > object.object.size() {
                     return Err(FsError::InvalidData);
                 }
@@ -1242,7 +1255,10 @@ where
     Q: FnOnce() -> Option<crate::drm_fb_hook::ScanoutGeom> + Send,
     C: FnOnce() + Send,
 {
-    if !matches!(frame.format, PixelFormat::Xrgb8888 | PixelFormat::Argb8888)
+    // This fallback is a linear row copy. Native X/Tile4 presentation uses
+    // the owned DSB path; never reinterpret a tiled object as linear pixels.
+    if frame.modifier != 0
+        || !matches!(frame.format, PixelFormat::Xrgb8888 | PixelFormat::Argb8888)
         || frame.width < console.width
         || frame.height < console.height
         || console.bpp != 32

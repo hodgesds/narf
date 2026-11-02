@@ -358,7 +358,7 @@ impl<'a> ExecutionCapture<'a> {
                     | u32::from(info.reset) << 1
                     | u32::from(info.observed_runtime_ticks.is_some()) << 2,
             ),
-            (24, u32::from(info.placements.bits())),
+            (24, info.placements.bits()),
             (28, info.observed_runtime_ticks.unwrap_or(0)),
             (
                 32,

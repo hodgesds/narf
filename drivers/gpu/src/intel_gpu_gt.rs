@@ -11,6 +11,9 @@ pub(crate) mod gen12;
 #[path = "intel_gpu_gt_ownership.rs"]
 pub(crate) mod ownership;
 
+#[path = "intel_gpu_lnl_takeover.rs"]
+pub(crate) mod lnl;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GraphicsError {
     Unsupported,
@@ -55,6 +58,8 @@ impl GraphicsIp {
         let version = (a >> 22) * 100 + ((a >> 14) & 255);
         let supported = match platform {
             GtPlatform::Battlemage => matches!(version, 2001 | 2002),
+            GtPlatform::Integrated(Generation::LunarLake) => version == 2004,
+            GtPlatform::Integrated(Generation::PantherLake) => matches!(version, 3000 | 3001),
             _ => matches!(version, 1270 | 1271 | 1274),
         };
         if !supported {
@@ -90,6 +95,9 @@ pub enum Gen12Platform {
 }
 
 // Exact source IDs, including mobile/embedded variants; no range matches.
+pub(crate) const PTL_IDS: &[u16] = &[
+    0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0, 0xb0b0,
+];
 pub(crate) const DG2_IDS: &[u16] = &[
     0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5, 0x56a6, 0x56b0, 0x56b1,
     0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694, 0x5695, 0x56a3, 0x56a4, 0x56b2, 0x56b3, 0x5696,
@@ -116,6 +124,9 @@ impl GtPlatform {
             .iter()
             .find(|entry| entry.did == device)
         {
+            if entry.generation == Generation::PantherLake && !PTL_IDS.contains(&device) {
+                return None;
+            }
             let family = match entry.asic {
                 "tigerlake" => Some(Gen12Platform::TigerLake),
                 "alderlake-p" | "alderlake-m" | "raptorlake-p" => Some(Gen12Platform::AlderLakeP),
@@ -142,8 +153,45 @@ impl GtPlatform {
         matches!(self, Self::Gen12(_))
     }
 
+    /// Architecture properties are independent of discrete-memory ownership.
+    pub const fn is_lnl(self) -> bool {
+        matches!(self, Self::Integrated(Generation::LunarLake))
+    }
+    pub const fn is_ptl(self) -> bool {
+        matches!(self, Self::Integrated(Generation::PantherLake))
+    }
+    /// Integrated GT-only profiles with retained full-device takeover.
+    pub const fn is_headless_integrated(self) -> bool {
+        self.is_lnl() || self.is_ptl()
+    }
+    /// xe_pci.c graphics_xe2 descriptor, shared by qualified Xe2 and Xe3-LPG.
+    pub const fn is_xe2(self) -> bool {
+        self.is_headless_integrated() || matches!(self, Self::Battlemage)
+    }
+    pub const fn multiple_ccs(self) -> bool {
+        self.is_discrete() || self.is_headless_integrated()
+    }
+    pub(crate) const fn ppgtt_root_level(self) -> u8 {
+        if self.is_headless_integrated() {
+            4
+        } else {
+            3
+        }
+    }
+    pub(crate) const fn pte_format(self) -> crate::intel_gpu_gtt::PteFormat {
+        if self.is_headless_integrated() {
+            crate::intel_gpu_gtt::PteFormat::Xe2
+        } else if self.is_gen12() || matches!(self, Self::Alchemist) {
+            crate::intel_gpu_gtt::PteFormat::Gen12
+        } else {
+            crate::intel_gpu_gtt::PteFormat::XeLpg
+        }
+    }
+
     pub(crate) const fn physical_bits(self) -> u32 {
-        if self.is_gen12() {
+        if self.is_headless_integrated() {
+            46
+        } else if self.is_gen12() {
             39
         } else {
             52
@@ -160,7 +208,10 @@ impl GtPlatform {
     /// Gfx 12.70+ moved the GT ACK; DG2 retains the earlier address.
     pub const fn guc_forcewake_ack(self) -> Option<u64> {
         match self {
-            Self::Integrated(Generation::MeteorLake) | Self::Battlemage => Some(0xdfc),
+            Self::Integrated(
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake,
+            )
+            | Self::Battlemage => Some(0xdfc),
             Self::Alchemist | Self::Gen12(_) => Some(0x130044),
             _ => None,
         }
@@ -174,6 +225,8 @@ impl GtPlatform {
             Self::Integrated(Generation::MeteorLake) => ("i915/mtl_guc_70.bin", (70, 53, 0)),
             Self::Alchemist => ("i915/dg2_guc_70.bin", (70, 53, 0)),
             Self::Battlemage => ("xe/bmg_guc_70.bin", (70, 54, 0)),
+            Self::Integrated(Generation::LunarLake) => ("xe/lnl_guc_70.bin", (70, 53, 0)),
+            Self::Integrated(Generation::PantherLake) => ("xe/ptl_guc_70.bin", (70, 54, 0)),
             _ => return None,
         };
         Some(GuCProfile {
@@ -261,7 +314,7 @@ mod tests {
             || GtPlatform::from_pci(0x8086, 0x56a7).is_some()
             || GtPlatform::Integrated(Generation::PantherLake)
                 .guc()
-                .is_some()
+                .is_none()
             || DG2_IDS.len() != 25
             || BMG_IDS.len() != 13
         {

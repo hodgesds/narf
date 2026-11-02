@@ -27,7 +27,7 @@ fn capture(platform: GtPlatform, reason: Reason) -> Capture {
         now_ns: 9000,
         state: GtState::Lost,
         engines: if platform == GtPlatform::Battlemage {
-            EngineSet::of(&Engine::ALL)
+            EngineSet::of(&Engine::GRAPHICS)
         } else {
             EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0])
         },

@@ -117,7 +117,7 @@ mod tests {
             assert_eq!(window.reads.get(), 6);
             assert_eq!((topology.geometry_dss(), topology.compute_dss()), (5, 6));
             assert_eq!(topology.dss_count(), 3); // shared DSS counted only once
-            if platform == GtPlatform::Battlemage {
+            if platform.is_xe2() {
                 assert_eq!(topology.eu_type(), EuType::Simd16);
                 assert_eq!(topology.eu_mask_per_dss(), 5);
                 assert_eq!(topology.eu_count(), 6);
@@ -128,14 +128,7 @@ mod tests {
             }
             let full = GtTopology::read(&Fuses::new([0xffffffff, 0, 0xff]), platform).unwrap();
             assert_eq!(full.dss_count(), 32);
-            assert_eq!(
-                full.eu_count(),
-                if platform == GtPlatform::Battlemage {
-                    256
-                } else {
-                    512
-                }
-            );
+            assert_eq!(full.eu_count(), if platform.is_xe2() { 256 } else { 512 });
         }
         TestResult::Pass
     }
@@ -221,13 +214,13 @@ pub enum EuType {
     Simd16,
 }
 
-/// Immutable observed fuses for the main graphics GT. Media GTs and future
-/// multi-register DSS formats require their own discovery profile.
+/// Immutable observed main-GT fuses:32 DSS on existing profiles,96 on
+/// exact PTL graphics30.00/30.01. Media GTs remain unadmitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GtTopology {
     platform: GtPlatform,
-    geometry: u32,
-    compute: u32,
+    geometry: u128,
+    compute: u128,
     eu_mask: u16,
     eu_type: EuType,
 }
@@ -240,24 +233,28 @@ impl GtTopology {
         platform: GtPlatform,
     ) -> Result<Self, TopologyError> {
         platform.guc().ok_or(TopologyError::Unsupported)?;
-        // All three admitted profiles use one geometry and one compute fuse
-        // register. Xe2 version 20 does NOT use Xe3's three-register format.
+        // xe_gt_topology.c::get_num_dss_regs: graphics>20 has three
+        // words per mask. Preserve holes across all96 source fuse bits.
         let sample = || {
-            [
-                mmio.read32(0x913c),
-                if platform.is_gen12() {
-                    0
-                } else {
-                    mmio.read32(0x9144)
-                },
-                mmio.read32(0x9134),
-            ]
+            let mut geometry = u128::from(mmio.read32(0x913c));
+            let mut compute = if platform.is_gen12() {
+                0
+            } else {
+                u128::from(mmio.read32(0x9144))
+            };
+            if platform.is_ptl() {
+                geometry |= u128::from(mmio.read32(0x9150)) << 32;
+                geometry |= u128::from(mmio.read32(0x9154)) << 64;
+                compute |= u128::from(mmio.read32(0x9148)) << 32;
+                compute |= u128::from(mmio.read32(0x914c)) << 64;
+            }
+            (geometry, compute, mmio.read32(0x9134))
         };
         let first = sample();
         if first != sample() {
             return Err(TopologyError::Unstable);
         }
-        let [geometry, compute, mut raw_eu] = first;
+        let (geometry, compute, mut raw_eu) = first;
         // A fully populated 32-DSS mask legitimately reads all ones. The EU
         // register's reserved bits distinguish an unavailable BAR instead.
         if raw_eu & !0xff != 0 {
@@ -272,7 +269,7 @@ impl GtTopology {
         if geometry | compute == 0 || raw_eu == 0 {
             return Err(TopologyError::Empty);
         }
-        let (eu_type, eu_mask) = if platform == GtPlatform::Battlemage {
+        let (eu_type, eu_mask) = if platform.is_xe2() {
             (EuType::Simd16, raw_eu as u16)
         } else {
             let mut pairs = 0;
@@ -295,10 +292,10 @@ impl GtTopology {
     pub fn platform(&self) -> GtPlatform {
         self.platform
     }
-    pub fn geometry_dss(&self) -> u32 {
+    pub fn geometry_dss(&self) -> u128 {
         self.geometry
     }
-    pub fn compute_dss(&self) -> u32 {
+    pub fn compute_dss(&self) -> u128 {
         self.compute
     }
     pub fn eu_mask_per_dss(&self) -> u16 {
@@ -335,6 +332,8 @@ impl GtTopology {
         // The XeHP single software slice uses the full32-bit DSS register.
         let (dss_count, subslice_stride) = if self.platform.is_gen12() {
             (6usize, 1usize)
+        } else if self.platform.is_ptl() {
+            (96, 12)
         } else {
             (32, 4)
         };

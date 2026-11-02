@@ -15,62 +15,276 @@ use narf_capabilities::{Cap, CapOp, Write};
 pub struct AuthorizedWindow {
     bar: narf_bus::bar::MmioRegion,
     cap: Cap<narf_bus::BusDeviceCap, Write>,
+    headless: Option<alloc::sync::Arc<HeadlessAccess>>,
 }
 impl AuthorizedWindow {
     pub(crate) fn new(
         bar: narf_bus::bar::MmioRegion,
         cap: Cap<narf_bus::BusDeviceCap, Write>,
     ) -> Self {
-        Self { bar, cap }
+        Self {
+            bar,
+            cap,
+            headless: None,
+        }
+    }
+    /// Exact source-profile constructor. It performs only the Linux bootstrap
+    /// four-zero root writes + VF_CAP probe before recording PF permission.
+    /// Every raw access independently invokes current capability and validates
+    /// current PCI identity/BAR/command/D0 and inherited-VF exclusion.
+    pub(crate) fn for_device(
+        bar: narf_bus::bar::MmioRegion,
+        cap: Cap<narf_bus::BusDeviceCap, Write>,
+        device: narf_bus::BusDevice,
+    ) -> Self {
+        if !GtPlatform::from_pci(device.id.vendor, device.id.device)
+            .is_some_and(|p| p.is_headless_integrated())
+        {
+            return Self::new(bar, cap);
+        }
+        let this = Self {
+            bar,
+            cap,
+            headless: Some(alloc::sync::Arc::new(HeadlessAccess {
+                device,
+                pf: core::sync::atomic::AtomicBool::new(false),
+            })),
+        };
+        let _ = this.read32(0x1901f8);
+        this
+    }
+    fn raw(&self, offset: u64, write: Option<u32>, bootstrap: bool) -> Option<u32> {
+        let result = self
+            .cap
+            .invoke(Register {
+                bar: self.bar,
+                offset,
+                write,
+                headless: self.headless.as_deref(),
+                bootstrap,
+            })
+            .ok()
+            .flatten();
+        if result.is_none() {
+            if let Some(h) = &self.headless {
+                h.pf.store(false, core::sync::atomic::Ordering::Release);
+            }
+        }
+        result
     }
 }
-struct Register {
+
+const DUMMY_MMIO: u64 = 0x130030;
+const VF_CAP: u64 = 0x1901f8;
+
+/// No recursive MmioWindow access: each callback is one separately authorized
+/// raw operation. Stop immediately after a partial sequence loses authority.
+fn ordered_read(
+    offset: u64,
+    flush: bool,
+    mut raw: impl FnMut(u64, Option<u32>) -> Option<u32>,
+) -> u32 {
+    if flush {
+        for _ in 0..4 {
+            if raw(DUMMY_MMIO, Some(0)).is_none() {
+                return u32::MAX;
+            }
+        }
+    }
+    raw(offset, None).unwrap_or(u32::MAX)
+}
+fn bootstrap_access(offset: u64, write: Option<u32>) -> bool {
+    matches!((offset, write), (DUMMY_MMIO, Some(0)) | (VF_CAP, None))
+}
+
+fn profile_read(
+    offset: u64,
+    pf: Option<&core::sync::atomic::AtomicBool>,
+    mut raw: impl FnMut(u64, Option<u32>, bool) -> Option<u32>,
+) -> u32 {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    let bootstrap = pf.is_some_and(|p| !p.load(Acquire));
+    if bootstrap && offset != VF_CAP {
+        return u32::MAX;
+    }
+    let mut failed = false;
+    let value = ordered_read(offset, pf.is_some(), |r, w| {
+        let result = raw(r, w, bootstrap);
+        failed |= result.is_none();
+        result
+    });
+    if let Some(p) = pf {
+        if offset == VF_CAP || failed {
+            p.store(
+                value != u32::MAX && value & 1 == 0 && offset == VF_CAP,
+                Release,
+            );
+        }
+    }
+    value
+}
+fn access_allowed(pf: bool, bootstrap: bool, offset: u64, write: Option<u32>) -> bool {
+    if bootstrap {
+        bootstrap_access(offset, write)
+    } else {
+        pf
+    }
+}
+
+/// Bounded PCI extended-cap traversal: missing SR-IOV is permissible, malformed
+/// or cyclic walks are not. An inherited enabled VF can DMA independently of
+/// NARF's PF client gate, so both VFEnable and NumVFs must remain zero.
+fn no_inherited_vfs(mut read: impl FnMut(u16) -> Option<u32>) -> bool {
+    let mut offset = 0x100u16;
+    let mut seen = [0u64; 16];
+    let mut sriov = false;
+    let mut first = true;
+    loop {
+        if !(0x100..=0xffc).contains(&offset) || offset & 3 != 0 {
+            return false;
+        }
+        let bit = usize::from(offset / 4);
+        if seen[bit / 64] & (1u64 << (bit % 64)) != 0 {
+            return false;
+        }
+        seen[bit / 64] |= 1u64 << (bit % 64);
+        let Some(header) = read(offset).filter(|v| *v != u32::MAX) else {
+            return false;
+        };
+        if header == 0 {
+            return first;
+        } // missing only at the initial header
+        first = false;
+        if header & 0xffff == 0 || header & 0xf0000 == 0 {
+            return false;
+        }
+        if header & 0xffff == 0x10 {
+            if sriov || offset > 0xfec {
+                return false;
+            }
+            sriov = true;
+            let Some(control) = read(offset + 8).filter(|v| *v != u32::MAX) else {
+                return false;
+            };
+            let Some(count) = read(offset + 0x10).filter(|v| *v != u32::MAX) else {
+                return false;
+            };
+            if control & 1 != 0 || count & 0xffff != 0 {
+                return false;
+            }
+        }
+        let next = (header >> 20) as u16;
+        if next == 0 {
+            return true;
+        }
+        offset = next;
+    }
+}
+
+#[derive(Debug)]
+struct HeadlessAccess {
+    device: narf_bus::BusDevice,
+    pf: core::sync::atomic::AtomicBool,
+}
+impl HeadlessAccess {
+    fn current(
+        &self,
+        cap: &Cap<narf_bus::BusDeviceCap, Write>,
+        bar: narf_bus::bar::MmioRegion,
+    ) -> bool {
+        let read = |offset| {
+            narf_bus::pci::read_config32(cap, &self.device, offset)
+                .ok()
+                .filter(|v| *v != u32::MAX)
+        };
+        let expected = u32::from(self.device.id.device) << 16 | u32::from(self.device.id.vendor);
+        if read(0) != Some(expected)
+            || read(4).is_none_or(|v| v & 6 != 6)
+            || read(8).is_none_or(|v| v >> 8 != self.device.id.class)
+            || bar.len < 16 * 1024 * 1024
+            || narf_bus::pci::power_state(cap, &self.device).ok().flatten()
+                != Some(narf_bus::pci::PciPowerState::D0)
+        {
+            return false;
+        }
+        let Some(low) = read(0x10) else {
+            return false;
+        };
+        if low & 1 != 0 || !matches!(low & 6, 0 | 4) {
+            return false;
+        }
+        let high = if low & 6 == 4 {
+            let Some(high) = read(0x14) else {
+                return false;
+            };
+            high
+        } else {
+            0
+        };
+        if u64::from(high) << 32 | u64::from(low & !15) != bar.phys.raw() {
+            return false;
+        }
+        no_inherited_vfs(read)
+    }
+}
+struct Register<'a> {
     bar: narf_bus::bar::MmioRegion,
     offset: u64,
     write: Option<u32>,
+    headless: Option<&'a HeadlessAccess>,
+    bootstrap: bool,
 }
-impl CapOp<narf_bus::BusDeviceCap, Write> for Register {
-    type Output = u32;
+impl CapOp<narf_bus::BusDeviceCap, Write> for Register<'_> {
+    type Output = Option<u32>;
     fn execute(
         self,
-        _cap: &Cap<narf_bus::BusDeviceCap, Write>,
-    ) -> Result<u32, narf_capabilities::CapError> {
+        cap: &Cap<narf_bus::BusDeviceCap, Write>,
+    ) -> Result<Option<u32>, narf_capabilities::CapError> {
         if self.offset % 4 != 0
             || self
                 .offset
                 .checked_add(4)
                 .is_none_or(|end| end > self.bar.len)
         {
-            return Ok(u32::MAX);
+            return Ok(None);
+        }
+        if let Some(access) = self.headless {
+            let allowed = access_allowed(
+                access.pf.load(core::sync::atomic::Ordering::Acquire),
+                self.bootstrap,
+                self.offset,
+                self.write,
+            );
+            if !allowed || !access.current(cap, self.bar) {
+                access
+                    .pf
+                    .store(false, core::sync::atomic::Ordering::Release);
+                return Ok(None);
+            }
         }
         // SAFETY: the PCI probe owns this permanent mapping; the invocation
         // validated current authority and the aligned offset is inside BAR0.
-        Ok(unsafe {
+        Ok(Some(unsafe {
             if let Some(value) = self.write {
                 self.bar.write32(self.offset, value);
                 0
             } else {
                 self.bar.read32(self.offset)
             }
-        })
+        }))
     }
 }
 impl MmioWindow for AuthorizedWindow {
     fn read32(&self, offset: u64) -> u32 {
-        self.cap
-            .invoke(Register {
-                bar: self.bar,
-                offset,
-                write: None,
-            })
-            .unwrap_or(u32::MAX)
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.bar.len) {
+            return u32::MAX;
+        }
+        profile_read(offset, self.headless.as_ref().map(|h| &h.pf), |r, w, b| {
+            self.raw(r, w, b)
+        })
     }
     fn write32(&self, offset: u64, value: u32) {
-        let _ = self.cap.invoke(Register {
-            bar: self.bar,
-            offset,
-            write: Some(value),
-        });
+        let _ = self.raw(offset, Some(value), false);
     }
 }
 
@@ -89,6 +303,7 @@ pub enum HardwareError {
 pub struct CachePolicy {
     pub(crate) platform: GtPlatform,
     pub(crate) ggtt_pat: u8,
+    pub(crate) media: Option<crate::intel_gpu_gt::lnl::MediaProof>,
 }
 
 impl CachePolicy {
@@ -110,10 +325,13 @@ pub(crate) struct HardwareInit {
     quiesce: u8,
     gen12_reset: Option<crate::intel_gpu_gt::gen12::reset::Reset>,
     gen12_prepare_budget: bool,
+    lnl_media: Option<crate::intel_gpu_gt::lnl::MediaQuiesce>,
+    media_proof: Option<crate::intel_gpu_gt::lnl::MediaProof>,
 }
 
 impl HardwareInit {
     pub(crate) fn take_gen12_reset(&mut self) -> Option<crate::intel_gpu_gt::gen12::reset::Reset> {
+        self.ready = false;
         self.gen12_reset.take()
     }
     pub(crate) fn ready(&self) -> bool {
@@ -149,6 +367,10 @@ impl HardwareInit {
             quiesce: 0,
             gen12_reset: None,
             gen12_prepare_budget: false,
+            lnl_media: platform
+                .is_headless_integrated()
+                .then(|| crate::intel_gpu_gt::lnl::MediaQuiesce::for_platform(platform)),
+            media_proof: None,
         })
     }
 
@@ -174,8 +396,19 @@ impl HardwareInit {
         if request == u32::MAX || ack == u32::MAX {
             return Err(HardwareError::Unavailable);
         }
+        if self.ready {
+            if let Some(proof) = self.media_proof {
+                proof.current(mmio).map_err(|_| HardwareError::WakeLost)?;
+            }
+        }
         if !self.requested || request & 1 == 0 || ack & 1 == 0 {
             return Err(HardwareError::WakeLost);
+        }
+        if self.ready && self.platform.is_gen12() {
+            self.gen12_reset
+                .as_ref()
+                .ok_or(HardwareError::WakeLost)?
+                .held_current(mmio, || true)?;
         }
         Ok(())
     }
@@ -208,6 +441,20 @@ impl HardwareInit {
             return Poll::Pending;
         }
         self.awake(mmio)?;
+        if self.platform.is_headless_integrated() {
+            // The exact source graphics IP must match under current wake before
+            // cache setup can authorize even the first staged GGTT PTE.
+            crate::intel_gpu_gt::GraphicsIp::read(mmio, self.platform)
+                .map_err(|_| HardwareError::Unsupported)?;
+        }
+        if let Some(media) = &mut self.lnl_media {
+            match media.poll(mmio, now) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.media_proof = Some(result.map_err(|_| HardwareError::Unavailable)?)
+                }
+            }
+        }
         if self
             .gen12_reset
             .as_ref()
@@ -281,18 +528,11 @@ impl HardwareInit {
                 return Poll::Pending;
             }
             if let Some(reset) = &mut self.gen12_reset {
-                if !reset.releasing() && !reset.released() {
-                    // SAFETY: inherited GuC reset/DMA idle and GRDOM_FULL
-                    // self-clear were freshly proven above. Retain both
-                    // base wake wells until every owned media ACK falls.
-                    unsafe {
-                        reset.begin_release_after_full_reset(mmio, now, &mut current)?;
-                    }
-                    self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
-                }
-                match reset.poll_release(mmio, now, &mut current) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result?,
+                // SAFETY: inherited GuC reset/DMA idle and GRDOM_FULL
+                // self-clear were freshly proven above. Transfer these same
+                // wake holds into scheduling, then back into verified stop.
+                unsafe {
+                    reset.retain_after_full_reset(mmio, &mut current)?;
                 }
                 self.deadline = now.checked_add(50_000_000).ok_or(HardwareError::Timeout)?;
             }
@@ -309,6 +549,7 @@ impl HardwareInit {
             return Poll::Ready(Ok(CachePolicy {
                 platform: self.platform,
                 ggtt_pat: 0,
+                media: None,
             }));
         }
         let modern = self.platform != GtPlatform::Alchemist;
@@ -333,7 +574,7 @@ impl HardwareInit {
         mmio.write32(selector, old | 0x80000000);
         let pat = match self.platform {
             GtPlatform::Gen12(_) => unreachable!("separate pre-GMD cache policy"),
-            GtPlatform::Integrated(_) => {
+            GtPlatform::Integrated(_) if !self.platform.is_headless_integrated() => {
                 // Xe-LPG PAT3: WB L4, one-way coherent. PAT0, used by the
                 // inherited display, is deliberately not redefined.
                 mmio.write32(0x480c, 2);
@@ -370,8 +611,11 @@ impl HardwareInit {
                 }
                 0
             }
-            GtPlatform::Battlemage => {
+            GtPlatform::Battlemage | GtPlatform::Integrated(_) => {
                 mmio.write32(0x4804, 0xe); // Xe2 coherent PAT1,4,5,7
+                if self.platform.is_headless_integrated() {
+                    mmio.write32(0x480c, 0x3c);
+                } // Xe2 UC PAT3
                 mmio.write32(0x4808, 0xf); // Xe2 default WB PAT2: L3 WB, L4 UC, two-way coherent
                 mmio.write32(0x4810, 0x32);
                 mmio.write32(0x4814, 0x3e);
@@ -398,6 +642,7 @@ impl HardwareInit {
         Poll::Ready(Ok(CachePolicy {
             platform: self.platform,
             ggtt_pat: pat,
+            media: self.media_proof,
         }))
     }
 
@@ -430,6 +675,13 @@ impl HardwareInit {
         if !self.releasing {
             return Poll::Ready(Err(HardwareError::Busy));
         }
+        if let Some(media) = &mut self.lnl_media {
+            match media.release(mmio, now) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result.map_err(|_| HardwareError::Unavailable)?,
+            }
+            self.media_proof = None;
+        }
         let ack = mmio.read32(0xd84);
         if ack == u32::MAX {
             return Poll::Ready(Err(HardwareError::Unavailable));
@@ -444,4 +696,227 @@ impl HardwareInit {
         self.ready = false;
         Poll::Ready(Ok(()))
     }
+}
+
+#[cfg(feature = "kernel-test")]
+mod read_order_tests {
+    use super::*;
+    use alloc::{collections::BTreeMap, vec::Vec};
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_lnl_ptl_mmio_bootstrap_four_zero_order_current_loss_and_vf_exclusion() -> TestResult {
+        use crate::{intel_gpu::Generation, intel_gpu_gt::Gen12Platform};
+        // Actual production CapOp distinguishes refused access from a real
+        // all-ones scalar. This fake BAR is owned RAM, never hardware/ECAM.
+        {
+            let mut words = alloc::vec![0u32;1024];
+            words[4] = u32::MAX;
+            let bar = narf_bus::bar::MmioRegion {
+                phys: narf_memory::PhysAddr::new(0x10000000),
+                virt: words.as_mut_ptr() as u64,
+                len: 4096,
+                kind: narf_bus::bar::BarKind::Mmio64 {
+                    prefetchable: false,
+                },
+            };
+            let cap = Cap::<narf_bus::BusDeviceCap, Write>::bootstrap();
+            let window = AuthorizedWindow::new(bar, cap);
+            assert_eq!(window.raw(16, None, false), Some(u32::MAX));
+            assert_eq!(window.raw(4096, None, false), None);
+            let pf = AtomicBool::new(true);
+            assert_eq!(
+                profile_read(16, Some(&pf), |r, w, _| {
+                    if w.is_some() {
+                        Some(0)
+                    } else {
+                        window.raw(r, w, false)
+                    }
+                }),
+                u32::MAX
+            );
+            assert!(pf.load(Ordering::Acquire));
+            assert_eq!(
+                profile_read(4096, Some(&pf), |r, w, _| {
+                    if w.is_some() {
+                        Some(0)
+                    } else {
+                        window.raw(r, w, false)
+                    }
+                }),
+                u32::MAX
+            );
+            assert!(!pf.load(Ordering::Acquire));
+        }
+
+        for platform in [
+            GtPlatform::Gen12(Gen12Platform::TigerLake),
+            GtPlatform::Gen12(Gen12Platform::AlderLakeP),
+            GtPlatform::Gen12(Gen12Platform::AlderLakeS),
+            GtPlatform::Gen12(Gen12Platform::AlderLakeN),
+            GtPlatform::Integrated(Generation::MeteorLake),
+            GtPlatform::Alchemist,
+            GtPlatform::Battlemage,
+            GtPlatform::Integrated(Generation::LunarLake),
+            GtPlatform::Integrated(Generation::PantherLake),
+        ] {
+            let pf = AtomicBool::new(false);
+            let proof = platform.is_headless_integrated().then_some(&pf);
+            let mut ops = Vec::new();
+            // Before PF classification only the explicit bootstrap VF read is
+            // allowed. Normal reads and all unrelated writes stay forbidden.
+            if proof.is_some() {
+                assert_eq!(
+                    profile_read(0xc000, proof, |r, w, _| {
+                        ops.push((r, w));
+                        Some(9)
+                    }),
+                    u32::MAX
+                );
+                assert!(ops.is_empty());
+                assert!(!access_allowed(false, false, 0x101010, Some(0x80000000)));
+                assert!(!access_allowed(false, true, 0x380d8c, Some(0)));
+                assert!(!access_allowed(false, true, 0x130030, Some(1)));
+            }
+            assert_eq!(
+                profile_read(0x1901f8, proof, |r, w, bootstrap| {
+                    if proof.is_some() {
+                        assert!(access_allowed(pf.load(Ordering::Acquire), bootstrap, r, w));
+                    }
+                    ops.push((r, w));
+                    Some(0)
+                }),
+                0
+            );
+            if proof.is_some() {
+                assert!(pf.load(Ordering::Acquire));
+                assert_eq!(
+                    ops,
+                    [
+                        (0x130030, Some(0)),
+                        (0x130030, Some(0)),
+                        (0x130030, Some(0)),
+                        (0x130030, Some(0)),
+                        (0x1901f8, None)
+                    ]
+                );
+            } else {
+                assert_eq!(ops, [(0x1901f8, None)]);
+            }
+            ops.clear();
+            assert_eq!(
+                profile_read(0x380d8c, proof, |r, w, bootstrap| {
+                    assert!(!bootstrap);
+                    ops.push((r, w));
+                    Some(0x07800000)
+                }),
+                0x07800000
+            );
+            if proof.is_some() {
+                assert_eq!(
+                    ops,
+                    [
+                        (0x130030, Some(0)),
+                        (0x130030, Some(0)),
+                        (0x130030, Some(0)),
+                        (0x130030, Some(0)),
+                        (0x380d8c, None)
+                    ]
+                );
+                // Every loss position, including before the first write and
+                // after all four writes, prevents the actual target read.
+                for lost in 0..5 {
+                    pf.store(true, Ordering::Release);
+                    let mut attempt = 0;
+                    let mut partial = Vec::new();
+                    assert_eq!(
+                        profile_read(0x380d8c, proof, |r, w, _| {
+                            let current = attempt != lost;
+                            attempt += 1;
+                            if !current {
+                                return None;
+                            }
+                            partial.push((r, w));
+                            Some(0)
+                        }),
+                        u32::MAX
+                    );
+                    assert_eq!(attempt, lost + 1);
+                    assert_eq!(partial.len(), lost);
+                    assert!(partial.iter().all(|op| *op == (0x130030, Some(0))));
+                    assert!(!pf.load(Ordering::Acquire));
+                }
+                // RING_IMR legitimately reads all ones; that scalar is not
+                // evidence that the physical function changed role.
+                pf.store(true, Ordering::Release);
+                assert_eq!(
+                    profile_read(0x20a8, proof, |_, _, _| Some(u32::MAX)),
+                    u32::MAX
+                );
+                assert!(pf.load(Ordering::Acquire));
+                for vf in [1, u32::MAX] {
+                    pf.store(false, Ordering::Release);
+                    ops.clear();
+                    assert_eq!(
+                        profile_read(0x1901f8, proof, |r, w, _| {
+                            ops.push((r, w));
+                            Some(vf)
+                        }),
+                        vf
+                    );
+                    assert!(!pf.load(Ordering::Acquire));
+                    ops.clear();
+                    assert_eq!(
+                        profile_read(0xc000, proof, |r, w, _| {
+                            ops.push((r, w));
+                            Some(0)
+                        }),
+                        u32::MAX
+                    );
+                    assert!(ops.is_empty());
+                }
+            } else {
+                assert_eq!(ops, [(0x380d8c, None)]);
+            }
+        }
+        // PCI-only exclusion runs before any bootstrap dummy. Missing SR-IOV
+        // is allowed; present disabled PF, active VFs, malformed walks differ.
+        for (cfg, valid) in [
+            (BTreeMap::from([(0x100, 0)]), true),
+            (
+                BTreeMap::from([(0x100, 0x00010010), (0x108, 0), (0x110, 0)]),
+                true,
+            ),
+            (
+                BTreeMap::from([(0x100, 0x00010010), (0x108, 1), (0x110, 0)]),
+                false,
+            ),
+            (
+                BTreeMap::from([(0x100, 0x00010010), (0x108, 0), (0x110, 1)]),
+                false,
+            ),
+            (BTreeMap::from([(0x100, 0x10010001)]), false), // self-loop
+            (BTreeMap::from([(0x100, 0x10410001), (0x104, 0)]), false),
+            (BTreeMap::from([(0x100, 0x10210001)]), false), // unaligned
+            (BTreeMap::from([(0x100, u32::MAX)]), false),
+        ] {
+            assert_eq!(no_inherited_vfs(|r| cfg.get(&r).copied()), valid);
+            let pf = AtomicBool::new(false);
+            let mut ops = Vec::new();
+            let result = profile_read(0x1901f8, Some(&pf), |r, w, _| {
+                if !no_inherited_vfs(|offset| cfg.get(&offset).copied()) {
+                    return None;
+                }
+                ops.push((r, w));
+                Some(0)
+            });
+            assert_eq!(result, if valid { 0 } else { u32::MAX });
+            assert_eq!(ops.len(), if valid { 5 } else { 0 });
+            assert_eq!(pf.load(Ordering::Acquire), valid);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_lnl_ptl_mmio_bootstrap_four_zero_order_current_loss_and_vf_exclusion
+    );
 }

@@ -945,6 +945,12 @@ pub struct Card {
     /// Exact Gen12 native color profile; independent of cursor and joint DSB.
     #[cfg(feature = "intel")]
     pub(crate) intel_gen12_lut: Option<crate::intel_gpu_color::Profile>,
+    /// Qualified fixed linear Gen12 same-window primary/color DSB transaction.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_gen12_joint: bool,
+    /// Source-qualified bounded Gen12 panning; family also fixes SURF alignment.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_gen12_views: Option<crate::intel_gpu_gt::Gen12Platform>,
     #[cfg(feature = "intel")]
     intel_blob_copy_bytes: usize,
     /// Fixed display14 primary with owned no-DPT + linear-equivalent X WMs.
@@ -1236,6 +1242,10 @@ impl Card {
             intel_hw_cursor: false,
             #[cfg(feature = "intel")]
             intel_gen12_lut: None,
+            #[cfg(feature = "intel")]
+            intel_gen12_joint: false,
+            #[cfg(feature = "intel")]
+            intel_gen12_views: None,
             #[cfg(feature = "intel")]
             intel_blob_copy_bytes: 0,
             #[cfg(feature = "intel")]
@@ -2250,7 +2260,7 @@ impl Card {
 
     /// ADDFB2 naming one of open `owner`'s Intel GEM handles: drm core's
     /// framebuffer_check and Linux intel_framebuffer_init, in their order.
-    /// LINEAR and qualified display14 no-DPT X/Tile4 are taken; plane0
+    /// LINEAR and qualified Gen12/13/display14 no-DPT X (MTL Tile4) are taken; plane0
     /// has no offset. Linear pitch is64-byte aligned (4KiB past the plane's
     /// 128 KiB native limit) and at most 256 KiB; the object holds every
     /// line. Tiling is XR24 only: X pitch512/rows8, Tile4 pitch128/rows32.
@@ -2324,7 +2334,15 @@ impl Card {
         } else {
             64
         };
-        if pitch > (if tiled { PLANE_STRIDE } else { MAX_STRIDE })
+        let tiled_stride_limit = self
+            .intel_gen12_views
+            .map_or(PLANE_STRIDE, crate::intel_gpu_scanout::gen12_max_stride);
+        if pitch
+            > (if tiled {
+                tiled_stride_limit
+            } else {
+                MAX_STRIDE
+            })
             || cmd.offsets[0] != 0
             || pitch % alignment != 0
             || (tiled && (!(4..=5120).contains(&cmd.width) || cmd.height > 4320))

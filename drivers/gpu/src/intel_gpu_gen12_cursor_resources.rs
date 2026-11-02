@@ -281,6 +281,16 @@ pub(crate) fn setup(
         Err(FsError::Unsupported | FsError::Busy) => return Ok(None),
         Err(error) => return Err(error),
     };
+    // intel_dpt_common.c: display13 uses a global disable, not MTL's
+    // per-plane chicken. All pipes/fetchers are proven stopped above; retain
+    // disabled DPT for the lifetime of this fixed no-DPT pipeline.
+    if matches!(
+        family,
+        Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN
+    ) {
+        let value = read(io, 0x42084)?;
+        checked(io, 0x42084, value | (1 << 30))?;
+    }
     for (offset, level) in WM_OFFSETS.into_iter().zip(levels(profile.primary)) {
         checked(io, 0x70240 + offset, encode(level))?;
     }

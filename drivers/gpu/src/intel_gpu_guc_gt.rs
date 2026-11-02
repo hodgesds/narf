@@ -99,6 +99,7 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     released: bool,
     hardware: Option<HardwareInit>,
     registers: Option<RegisterInit>,
+    engine_policy: Option<EnginePolicy>,
     compute_configuration: Option<(u8, u8)>,
     /// Battlemage tile-0 local memory, probed under register steering. A
     /// malformed layout leaves VRAM unpublished, never guessed.
@@ -139,9 +140,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         firmware: &GuCFirmware,
         config: BootConfig,
     ) -> Result<Self, GtError> {
-        if firmware.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage
-            && config.uncached_mocs != Some(3)
-        {
+        if firmware.platform().is_headless_integrated() && !allocator.lnl_takeover_ready() {
+            return Err(GtError::Boot(BootError::State));
+        }
+        if firmware.platform().is_xe2() && config.uncached_mocs != Some(3) {
             return Err(GtError::Boot(BootError::Device));
         }
         Self::from_staged_hardware(
@@ -174,6 +176,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             released: false,
             hardware: None,
             registers: None,
+            engine_policy: None,
             compute_configuration: None,
             vram: None,
             log_stream: None,
@@ -663,7 +666,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         crate::intel_gpu_timestamp::sample(
             self.parts.boot.window(),
             engine,
-            if self.parts.boot.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage {
+            if self.parts.boot.platform().is_xe2() {
                 64
             } else {
                 36
@@ -834,7 +837,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 }
             }
         }
-        EnginePolicy::new(self.parts.boot.platform(), engines)
+        let policy = if self.parts.boot.platform().is_headless_integrated() {
+            self.engine_policy
+                .ok_or(GtError::State)
+                .map_err(|_| RegisterError::Identity)
+        } else {
+            EnginePolicy::new(self.parts.boot.platform(), engines)
+        };
+        policy
             .and_then(|policy| policy.verify(self.parts.boot.window()))
             .map_err(GtError::Registers)
     }
@@ -1011,6 +1021,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .map_err(GtError::Scheduling)?;
         self.parts.scheduler = Some(scheduler);
         self.compute_configuration = Some(registers.compute_configuration());
+        self.engine_policy = Some(registers.engine_policy().map_err(GtError::Registers)?);
         self.registers = Some(registers);
         self.state = GtState::PreparingScheduling;
         Ok(())
@@ -1437,6 +1448,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn release_wake(&mut self, now: u64) -> Result<(), GtError> {
+        if self.parts.boot.platform().is_headless_integrated() {
+            self.parts.boot.retire_ggtt().map_err(GtError::Boot)?;
+        }
         if self
             .gen12_reset
             .as_ref()
@@ -1472,14 +1486,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
 
     fn after_boot_stop(&mut self, now: u64) -> Result<(), GtError> {
         if self.parts.boot.platform().is_gen12() {
-            if self.gen12_reset.is_none() {
+            if self
+                .gen12_reset
+                .as_ref()
+                .is_none_or(|reset| reset.released())
+            {
                 // The inherited-reset attempt may already own media wake
                 // bits when boot never started. Transfer, never duplicate
                 // or forget that uncertain request ownership.
-                self.gen12_reset = self
+                if let Some(reset) = self
                     .hardware
                     .as_mut()
-                    .and_then(HardwareInit::take_gen12_reset);
+                    .and_then(HardwareInit::take_gen12_reset)
+                {
+                    self.gen12_reset = Some(reset);
+                }
             }
             if let Some(reset) = &mut self.gen12_reset {
                 reset.restart(now).map_err(GtError::Hardware)?;

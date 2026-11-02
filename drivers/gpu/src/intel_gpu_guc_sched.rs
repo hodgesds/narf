@@ -310,7 +310,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
         engines: EngineSet,
     ) -> Result<Self, SchedulingError> {
         if !engines.contains(Engine::Rcs0)
-            || (platform != GtPlatform::Battlemage && engines.contains(Engine::Bcs8))
+            || (!platform.is_xe2() && engines.contains(Engine::Bcs8))
+            || (!platform.is_gen12() && engines.iter().any(|engine| engine.is_media()))
         {
             return Err(SchedulingError::State);
         }
@@ -688,7 +689,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         r.slpc = Some(shared);
         self.slpc
-            .start(limits, now)
+            .start(limits, now, self.platform)
             .map_err(SchedulingError::Slpc)?;
         Ok(())
     }
@@ -942,7 +943,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let mut words: Vec<u32> = if let Some(prefix) = prefix {
             let mut words = alloc::vec![0x04000001];
             words.extend_from_slice(&prefix);
-            if engine.is_copy() {
+            if engine.simple_ring() {
                 crate::intel_gpu_engine::copy_completion(image.ggtt_offset(), stamp, &mut words);
             } else {
                 render_completion(
@@ -960,7 +961,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // slots are identical in the RCS and BCS register tables.
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
-            if engine.is_copy() {
+            if engine.is_media() {
+                crate::intel_gpu_engine::media_ring(
+                    engine,
+                    (!batch.skip_batch()).then_some(batch.address()),
+                    batch.user_fence().filter(|_| width == 1),
+                    image.ggtt_offset(),
+                    stamp,
+                )
+            } else if engine.is_copy() {
                 crate::intel_gpu_engine::copy_ring(
                     (!batch.skip_batch()).then_some(batch.address()),
                     batch.user_fence().filter(|_| width == 1),
@@ -1043,6 +1052,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 &ring,
                 engine == Engine::Rcs0,
                 user.is_some(),
+                placements.iter().count() > 1,
             );
         }
         let parallel = if width > 1 {
@@ -1175,6 +1185,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // with no render 3D state.
             let seed = if engine.is_copy() {
                 crate::intel_gpu_engine::copy_seed(engine, self.platform)
+            } else if engine.is_media() {
+                crate::intel_gpu_engine::gen12_nonrender_seed()
             } else {
                 crate::intel_gpu_engine::compute_seed(engine, self.platform, self.disable_wmtp)
             };
@@ -1867,7 +1879,7 @@ fn resident_ring(
         (0x7a000404, 0x20344c1c)
     };
     let mut words = alloc::vec![0x04000001, 0x02800101, header, flags, 0xd0, 0, 0, 0,];
-    if matches!(platform, GtPlatform::Integrated(_)) {
+    if matches!(platform, GtPlatform::Integrated(_)) && !platform.is_xe2() {
         words.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
     if let Some(batch) = batch {
@@ -1890,7 +1902,7 @@ fn render_completion(
     seq: u32,
     words: &mut Vec<u32>,
 ) {
-    if !matches!(platform, GtPlatform::Battlemage | GtPlatform::Gen12(_)) {
+    if !platform.is_xe2() && !platform.is_gen12() {
         words.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
     words.extend_from_slice(&[
@@ -1961,7 +1973,7 @@ fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
             0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180,
             0x2b4, 0x120, 0x124,
         ],
-        if platform == GtPlatform::Battlemage {
+        if platform.is_xe2() {
             &[
                 0x3a8, 0x3ac, 0x108, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270,
             ]

@@ -45,6 +45,9 @@ fn tiled_profile(
     if !io.console_access_ok() {
         return Err(FsError::NoDevice);
     }
+    if let Some(family) = io.gen12_family() {
+        return gen12_primary::view_profile(io, geometry, timing, family, layout);
+    }
     crate::intel_gpu_scanout::View {
         origin: Default::default(),
         layout,
@@ -176,7 +179,7 @@ impl Platform for Physical {
         let family = self.gen12_family();
         let ctm_only = family.is_some_and(|family| {
             gen12_primary::Owner::capture(self, console, family, self.bar.len).is_ok()
-                && crate::intel_gpu_color::Owner::capture(self, self.generation).is_ok()
+                && crate::intel_gpu_color::Owner::capture_gen12(self, family).is_ok()
         });
         let timing = crate::drm_registry::mode_state(self.index).and_then(|card| {
             let card = card.lock();
@@ -202,13 +205,39 @@ impl Platform for Physical {
                     )
                     .is_ok()
             });
+        let gen12_views = hw_cursor
+            && family.zip(timing).is_some_and(|(family, timing)| {
+                gen12_primary::view_profile(
+                    self,
+                    geometry,
+                    timing,
+                    family,
+                    crate::intel_gpu_scanout::Layout::Linear,
+                )
+                .is_ok()
+            });
+        let gen12_x = gen12_views
+            && family.zip(timing).is_some_and(|(family, timing)| {
+                gen12_primary::view_profile(
+                    self,
+                    geometry,
+                    timing,
+                    family,
+                    crate::intel_gpu_scanout::Layout::X,
+                )
+                .is_ok()
+            });
         if let Some(card) = crate::drm_registry::mode_state(self.index) {
             let mut card = card.lock();
-            if family.is_some() {
+            if let Some(family) = family {
                 card.intel_ctm_only = ctm_only;
                 card.intel_hw_cursor = hw_cursor;
-                card.intel_gen12_lut = hw_cursor
-                    .then(|| crate::intel_gpu_color::Profile::gen12(family.expect("Gen12 family")));
+                // The same retained fixed route/resource/bypass and Gen12 DSB
+                // proof qualifies only origin-zero linear joint commits.
+                card.intel_gen12_joint = hw_cursor;
+                card.intel_gen12_views = gen12_views.then_some(family);
+                card.intel_gen12_lut =
+                    hw_cursor.then(|| crate::intel_gpu_color::Profile::gen12(family));
                 if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
                     if ctm_only && card.crtc_color(crtc).is_none() {
                         card.crtc_color.push(crate::drm::card::CrtcColor::new(crtc));
@@ -220,7 +249,7 @@ impl Platform for Physical {
                     }
                 }
             }
-            card.intel_x_tiled = false;
+            card.intel_x_tiled = gen12_x;
             card.intel_tile4 = false;
             if self.generation == Generation::MeteorLake {
                 if let Some(mode) = card.crtcs.first().and_then(|c| c.mode) {
@@ -419,6 +448,8 @@ fn fetchers_with_cursor(
 struct Joint {
     staged: bool,
     completion: Option<crate::intel_gpu_scanout::Completion>,
+    color_complete: bool,
+    deadline: u64,
 }
 struct PrimaryTarget {
     object: Arc<GemObject>,
@@ -514,7 +545,7 @@ pub(crate) fn install(
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     console: ActiveScanout,
 ) {
-    if generation == Generation::PantherLake {
+    if matches!(generation, Generation::LunarLake | Generation::PantherLake) {
         return;
     }
     let platform = Physical {
@@ -802,10 +833,22 @@ impl<M: Platform> Device<M> {
         // SAFETY: the old owner remains retained and poisoned. The GT worker
         // owns D0 and verified PAT policy; this mutex excludes every display
         // transition. Only the fresh view can observe/arm hardware now.
-        let io = unsafe {
+        let mut io = unsafe {
             PollIo::after_reset(fresh.clone(), self.generation, Pipe::A, self.bar_len, saved)
         }
         .map_err(|_| crate::intel_gpu_user::io_error())?;
+        let family = fresh.gen12_family();
+        let control = state.presenter.as_ref().map_or_else(
+            || {
+                family.map_or_else(
+                    || fresh.read32(0x70180),
+                    crate::intel_gpu_pipes::gen12_xrgb_control,
+                )
+            },
+            |old| old.console_control(),
+        );
+        io.qualify_console(family, control, state.console.stride_bytes / 64)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
         let format = io.format();
         let pat = if self.generation == Generation::MeteorLake {
             1
@@ -1043,6 +1086,11 @@ impl<M: Platform> Guard<'_, M> {
                             )
                             .inspect_err(|_| state.failed = true)?;
                     }
+                    if let Some(owner) = state.gen12_primary.as_mut() {
+                        owner
+                            .complete_view(&self.device.platform)
+                            .inspect_err(|_| state.failed = true)?;
+                    }
                     if let Some(retired) = completion.retired {
                         if let Err(error) = presenter.release(retired) {
                             state.failed = true;
@@ -1148,7 +1196,7 @@ impl<M: Platform> Guard<'_, M> {
         // SAFETY: the per-card mutex owns the running internal plane and all
         // reserved PTEs. CPU epochs retired above; power/modeset/PSR cannot
         // transition before quiesce obtains this same mutex.
-        let io = unsafe {
+        let mut io = unsafe {
             PollIo::new(
                 platform.clone(),
                 self.device.generation,
@@ -1160,6 +1208,13 @@ impl<M: Platform> Guard<'_, M> {
             self.state.failed = true;
             crate::intel_gpu_user::io_error()
         })?;
+        let family = self.device.platform.gen12_family();
+        let control = family.map_or_else(
+            || platform.read32(0x70180),
+            crate::intel_gpu_pipes::gen12_xrgb_control,
+        );
+        io.qualify_console(family, control, self.state.console.stride_bytes / 64)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
         let format = io.format();
         let pat = if self.device.generation == Generation::MeteorLake {
             1
@@ -1168,7 +1223,7 @@ impl<M: Platform> Guard<'_, M> {
         };
         // SAFETY: startup owns the empty display-only arena and the original
         // console allocation remains retained by the registered IntelGpu.
-        let presenter = unsafe {
+        let mut presenter = unsafe {
             Presenter::new(
                 io,
                 self.device.bar_len,
@@ -1182,6 +1237,9 @@ impl<M: Platform> Guard<'_, M> {
             self.state.failed = true;
             scanout_error(error)
         })?;
+        if let Some(family) = self.device.platform.gen12_family() {
+            presenter.qualify_gen12(family).map_err(scanout_error)?;
+        }
         self.state.presenter = Some(presenter);
         Ok(())
     }
@@ -1224,6 +1282,11 @@ impl<M: Platform> Guard<'_, M> {
                 }
                 .map_err(scanout_error)
                 .inspect_err(|_| self.state.failed = true)?;
+            }
+            if let Some(owner) = self.state.gen12_primary.as_mut() {
+                owner
+                    .rollback_view(&self.device.platform)
+                    .inspect_err(|_| self.state.failed = true)?;
             }
             self.state.joint = None;
             let (_, id) = self.state.pending.take().expect("joint GEM owner");
@@ -1356,6 +1419,9 @@ impl<M: Platform> Guard<'_, M> {
                         .inspect_err(|_| self.state.failed = true)?;
                 }
                 let ticket = self.ticket()?;
+                if let Some(owner) = self.state.gen12_primary.as_mut() {
+                    owner.stage_view(&self.device.platform, Default::default())?;
+                }
                 self.state
                     .presenter
                     .as_mut()
@@ -1694,16 +1760,100 @@ impl<M: Platform> Guard<'_, M> {
                             .inspect_err(|_| self.state.failed = true)?;
                     }
                 }
-                let state = &mut *self.state;
-                let update = state.dsb_update.as_ref().expect("DSB color image");
-                state
-                    .color
-                    .as_mut()
-                    .expect("color owner")
-                    .complete_dsb(&self.device.platform, update)
-                    .inspect_err(|_| {
-                        state.failed = true;
-                    })?;
+                if self
+                    .state
+                    .joint
+                    .as_ref()
+                    .is_none_or(|joint| !joint.color_complete)
+                {
+                    let state = &mut *self.state;
+                    let update = state.dsb_update.as_ref().expect("DSB color image");
+                    state
+                        .color
+                        .as_mut()
+                        .expect("color owner")
+                        .complete_dsb(&self.device.platform, update)
+                        .inspect_err(|_| {
+                            state.failed = true;
+                        })?;
+                    if let Some(joint) = &mut state.joint {
+                        joint.color_complete = true;
+                    }
+                }
+                // The two independent completion records are retained before
+                // this final observation. Table verification may span frames;
+                // exclusive ownership preserves that image while we bracket
+                // primary live/control and visible color arms in ONE stable
+                // current hardware frame. Neither a DSB interrupt nor an old
+                // primary completion alone may publish the joint state.
+                let stamp = if self.device.platform.gen12_family().is_some()
+                    && self.state.joint.is_some()
+                {
+                    let owner = self.state.gen12_primary.as_ref().ok_or(FsError::NoDevice)?;
+                    let resources = owner
+                        .check_owned(
+                            &self.device.platform,
+                            self.state.dsb.as_ref().is_some_and(|d| d.exposed()),
+                            self.state.cursor.as_ref().is_some_and(|c| c.exposed()),
+                        )
+                        .and_then(|()| {
+                            owner.check_console_mapping(&self.device.platform, &self.state.console)
+                        });
+                    resources.inspect_err(|_| self.state.failed = true)?;
+                    let family = self
+                        .device
+                        .platform
+                        .gen12_family()
+                        .ok_or(FsError::NoDevice)?;
+                    self.state
+                        .gen12_cursor_profile
+                        .ok_or(FsError::NoDevice)?
+                        .check(&self.device.platform, family)
+                        .inspect_err(|_| self.state.failed = true)?;
+                    let joint = self.state.joint.as_ref().expect("joint state");
+                    let completion = joint.completion.expect("independent primary completion");
+                    let observed = self
+                        .state
+                        .presenter
+                        .as_ref()
+                        .expect("joint presenter")
+                        .observe_completed(&completion, self.device.platform.now())
+                        .map_err(scanout_error)
+                        .inspect_err(|_| self.state.failed = true)?;
+                    self.state
+                        .color
+                        .as_ref()
+                        .expect("color owner")
+                        .check_visible(&self.device.platform)
+                        .inspect_err(|_| self.state.failed = true)?;
+                    let after = self
+                        .state
+                        .dsb
+                        .as_ref()
+                        .expect("DSB owner")
+                        .stamp(self.device.platform.now())
+                        .inspect_err(|_| self.state.failed = true)?;
+                    if observed.is_none_or(|before| before.sequence != after.sequence) {
+                        if self.device.platform.now()
+                            >= self.state.joint.as_ref().expect("joint").deadline
+                        {
+                            self.state.failed = true;
+                            return Err(FsError::TimedOut);
+                        }
+                        self.device.platform.tick().await;
+                        continue;
+                    }
+                    after
+                } else {
+                    stamp
+                };
+                if self.state.joint.is_some() {
+                    if let Some(owner) = self.state.gen12_primary.as_mut() {
+                        owner
+                            .complete_view(&self.device.platform)
+                            .inspect_err(|_| self.state.failed = true)?;
+                    }
+                }
                 self.state
                     .dsb
                     .as_mut()
@@ -1725,7 +1875,11 @@ impl<M: Platform> Guard<'_, M> {
                             .inspect_err(|_| self.state.failed = true)?;
                     }
                     self.state.current = self.state.pending.take();
-                    completion.stamp
+                    if self.device.platform.gen12_family().is_some() {
+                        stamp
+                    } else {
+                        completion.stamp
+                    }
                 } else {
                     stamp
                 };
@@ -1792,7 +1946,19 @@ impl<M: Platform> Guard<'_, M> {
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(FsError::Unsupported);
         }
-        let (_, _, extent) = view.footprint(geometry).map_err(scanout_error)?;
+        let alignment = self
+            .device
+            .platform
+            .gen12_family()
+            .map_or(4096, crate::intel_gpu_scanout::gen12_alignment);
+        let (_, _, extent) = view
+            .footprint_aligned(geometry, alignment)
+            .map_err(scanout_error)?;
+        if let Some(family) = self.device.platform.gen12_family() {
+            if geometry.pitch > crate::intel_gpu_scanout::gen12_max_stride(family) {
+                return Err(FsError::Unsupported);
+            }
+        }
         if extent > object.size() {
             return Err(FsError::InvalidData);
         }
@@ -1829,11 +1995,14 @@ impl<M: Platform> Guard<'_, M> {
         dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
         primary: Option<PrimaryTarget>,
     ) -> Result<FlipStamp, FsError> {
-        // Native Gen12 LUTs and DSB/mixed commits have distinct qualification.
+        // Gen12 joint qualification is fixed linear/origin-zero only. The
+        // worker still acquires exact family, route, DDB/WM and console proofs;
+        // a Card capability alone cannot authorize a command or scanout write.
         if self.device.generation != Generation::MeteorLake
-            && (primary.is_some()
-                || ((lut.is_some() || degamma.is_some() || dsb_timing.is_some())
-                    && self.device.platform.gen12_family().is_none()))
+            && (self.device.platform.gen12_family().is_none()
+                || primary.as_ref().is_some_and(|target| {
+                    target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
+                }))
         {
             return Err(FsError::Unsupported);
         }
@@ -1845,10 +2014,14 @@ impl<M: Platform> Guard<'_, M> {
         let had_primary_resources = self.state.primary_resources.is_some();
         let previous_mixed = self.state.mixed_unpublished;
         if self.state.color.is_none() {
-            let owner = crate::intel_gpu_color::Owner::capture(
-                &self.device.platform,
-                self.device.generation,
-            )?;
+            let owner = if let Some(family) = self.device.platform.gen12_family() {
+                crate::intel_gpu_color::Owner::capture_gen12(&self.device.platform, family)?
+            } else {
+                crate::intel_gpu_color::Owner::capture(
+                    &self.device.platform,
+                    self.device.generation,
+                )?
+            };
             self.state.color = Some(owner);
         }
         if !self.state.color_owned {
@@ -2020,7 +2193,12 @@ impl<M: Platform> Guard<'_, M> {
                     self.state.joint = Some(Joint {
                         staged: false,
                         completion: None,
+                        color_complete: false,
+                        deadline: self.device.platform.now().saturating_add(1_000_000_000),
                     });
+                    if let Some(owner) = self.state.gen12_primary.as_mut() {
+                        owner.stage_view(&self.device.platform, *view)?;
+                    }
                     let mut arm = self
                         .state
                         .presenter

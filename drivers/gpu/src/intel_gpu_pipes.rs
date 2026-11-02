@@ -333,6 +333,18 @@ pub const PLANE_SURF_OFFSET: u64 = 0x001C;
 /// `PLANE_OFFSET` — pan-and-scan offset within `PLANE_SURF`.
 pub const PLANE_OFFSET_OFFSET: u64 = 0x0024;
 
+/// Exact uncompressed XR24 control for each admitted Gen12 family.
+/// Linux b90c984d skl_universal_plane.c::adlp_plane_ctl_arb_slots and
+/// skl_plane_ctl require Wa_22012358565 on display13: cpp4 selects
+/// PLANE_CTL[30:28]=1. Display12 keeps field value0.
+pub(crate) fn gen12_xrgb_control(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
+    use crate::intel_gpu_gt::Gen12Platform;
+    match family {
+        Gen12Platform::TigerLake | Gen12Platform::AlderLakeS => 0x84000000,
+        Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
+    }
+}
+
 /// `PLANE_CTL[31]` — plane enable.
 pub const PLANE_CTL_ENABLE: u32 = 1 << 31;
 

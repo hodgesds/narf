@@ -88,7 +88,14 @@ unsafe impl DisplayAccess for Access {
 fn adapter(access: Access, generation: Generation) -> PollIo<Access> {
     // SAFETY: isolated native bank; no GT users, UC posting semantics and no
     // other display client. The source profile's pipe A is powered/running.
-    unsafe { PollIo::new(access, generation, Pipe::A, 0x1000000) }.unwrap()
+    let mut io = unsafe { PollIo::new(access, generation, Pipe::A, 0x1000000) }.unwrap();
+    let family = match generation {
+        Generation::TigerLake => Some(crate::intel_gpu_gt::Gen12Platform::TigerLake),
+        Generation::AlderLake => Some(crate::intel_gpu_gt::Gen12Platform::AlderLakeS),
+        _ => None,
+    };
+    io.qualify_console(family, 0x84000000, 8).unwrap();
+    io
 }
 
 fn smoke_scanout_io_profile_latching_and_masked_delivery() -> TestResult {
@@ -345,4 +352,124 @@ fn smoke_scanout_io_reset_replacement_preserves_original_status_and_poison() -> 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout_io",
     smoke_scanout_io_reset_replacement_preserves_original_status_and_poison
+);
+
+fn smoke_scanout_io_gen12_console_layout_exact_family_and_fresh_reset_binding() -> TestResult {
+    use crate::intel_gpu_gt::Gen12Platform;
+    for (family, expected) in [
+        (Gen12Platform::TigerLake, 0x84000000),
+        (Gen12Platform::AlderLakeS, 0x84000000),
+        (Gen12Platform::AlderLakeP, 0x94000000),
+        (Gen12Platform::AlderLakeN, 0x94000000),
+    ] {
+        let generation = if family == Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        let access = Access::new();
+        let mut io =
+            // SAFETY: this fixture exclusively owns the simulated pipe/status access.
+            unsafe { PollIo::new(access.clone(), generation, Pipe::A, 0x1000000) }.unwrap();
+        assert_eq!(
+            io.qualify_console(Some(family), expected ^ 0x10000000, 8),
+            Err(IoError::Unsupported)
+        );
+        assert_eq!(
+            io.qualify_console(None, expected, 8),
+            Err(IoError::Unsupported)
+        );
+        let other_family = if family == Gen12Platform::TigerLake {
+            Gen12Platform::AlderLakeP
+        } else {
+            Gen12Platform::TigerLake
+        };
+        assert_eq!(
+            io.qualify_console(Some(other_family), expected, 8),
+            Err(IoError::Unsupported)
+        );
+        io.qualify_console(Some(family), expected, 8).unwrap();
+        // Source X stride is512-byte tile units, not the original64-byte
+        // linear units. These are the production adapter's actual writes.
+        access.0.borrow_mut().regs.insert(0x70180, expected | 0x400);
+        access.0.borrow_mut().regs.insert(0x70188, 1);
+        io.write32(0x70188, 8);
+        io.write32(0x70180, expected);
+        assert_eq!((io.read32(0x70180), io.read32(0x70188)), (expected, 8));
+        let saved = io.saved_status();
+        io.poison();
+        // Reset starts a new status observation but must retain the original
+        // console layout instead of sampling interrupted X shadow values.
+        access.0.borrow_mut().regs.insert(0x70180, expected | 0x400);
+        access.0.borrow_mut().regs.insert(0x70188, 1);
+        let mut fresh =
+            // SAFETY: this fixture exclusively owns the simulated pipe/status access.
+            unsafe { PollIo::after_reset(access.clone(), generation, Pipe::A, 0x1000000, saved) }
+                .unwrap();
+        fresh.qualify_console(Some(family), expected, 8).unwrap();
+        fresh.write32(0x70188, 8);
+        fresh.write32(0x70180, expected);
+        assert_eq!(
+            (fresh.read32(0x70180), fresh.read32(0x70188)),
+            (expected, 8)
+        );
+        assert_eq!(
+            fresh.qualify_console(Some(family), expected, 16),
+            Err(IoError::Conflict)
+        );
+        for bad in [
+            expected ^ 0x10000000,
+            expected | 0x20000000,
+            expected | 0x40000000,
+        ] {
+            let access = Access::new();
+            let mut refused =
+                // SAFETY: this fixture exclusively owns the simulated pipe/status access.
+                unsafe { PollIo::new(access.clone(), generation, Pipe::A, 0x1000000) }.unwrap();
+            refused.qualify_console(Some(family), expected, 8).unwrap();
+            access.0.borrow_mut().regs.insert(0x70180, bad | 0x400);
+            access.0.borrow_mut().regs.insert(0x70188, 1);
+            let writes = access.0.borrow().writes.len();
+            refused.write32(0x70188, 8);
+            assert_eq!(access.0.borrow().writes.len(), writes);
+            assert_eq!(refused.read32(0x70180), u32::MAX);
+        }
+    }
+    let mtl = Access::new();
+    let mut io =
+        // SAFETY: this fixture exclusively owns the simulated pipe/status access.
+        unsafe { PollIo::new(mtl.clone(), Generation::MeteorLake, Pipe::A, 0x1000000) }.unwrap();
+    assert_eq!(
+        io.qualify_console(None, 0x94000000, 8),
+        Err(IoError::Unsupported)
+    );
+    assert_eq!(
+        io.qualify_console(Some(Gen12Platform::AlderLakeP), 0x94000000, 8),
+        Err(IoError::Unsupported)
+    );
+    io.qualify_console(None, 0x84000000, 8).unwrap();
+    mtl.0.borrow_mut().regs.insert(0x70180, 0x84000400);
+    mtl.0.borrow_mut().regs.insert(0x70188, 1);
+    let writes = mtl.0.borrow().writes.len();
+    io.write32(0x70188, 16);
+    assert_eq!(
+        mtl.0.borrow().writes.len(),
+        writes,
+        "only retained original pitch is authorized"
+    );
+    let mtl = Access::new();
+    let mut io =
+        // SAFETY: this fixture exclusively owns the simulated pipe/status access.
+        unsafe { PollIo::new(mtl.clone(), Generation::MeteorLake, Pipe::A, 0x1000000) }.unwrap();
+    io.qualify_console(None, 0x84002000, 8).unwrap();
+    mtl.0.borrow_mut().regs.insert(0x70180, 0x84002400);
+    mtl.0.borrow_mut().regs.insert(0x70188, 1);
+    io.write32(0x70188, 8);
+    io.write32(0x70180, 0x84002000);
+    assert_eq!((io.read32(0x70180), io.read32(0x70188)), (0x84002000, 8));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout_io",
+    smoke_scanout_io_gen12_console_layout_exact_family_and_fresh_reset_binding
 );

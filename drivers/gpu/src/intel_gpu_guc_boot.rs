@@ -31,7 +31,7 @@ const WA_KLVS: u64 = 0x3000; // reserved ADS page, separate from register saves/
 
 fn invalidate_guc_tlb(mmio: &impl MmioWindow, platform: GtPlatform) {
     let _ = mmio.read32(0x1901f8);
-    if platform == GtPlatform::Battlemage {
+    if platform.is_xe2() {
         mmio.write32(0xcf80, 1 << 6);
         mmio.write32(0xcf7c, 1);
         let _ = mmio.read32(0xcf7c);
@@ -78,6 +78,16 @@ pub enum BootState {
 /// Memory publication must clean dirty CPU cache lines as well as order
 /// stores. Discrete GPUs cannot inherit an integrated-GPU LLC assumption.
 pub trait BootAllocator: GpuAllocator {
+    /// Physical LNL adapters require a fresh driver-FLR receipt before staging.
+    fn lnl_takeover_ready(&self) -> bool {
+        false
+    }
+    /// LNL seals and invalidates the whole arena before releasing media wake.
+    /// Other profiles retain their existing per-backing retirement contract.
+    fn retire_ggtt(&mut self) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
+
     fn configure_cache(
         &mut self,
         _backing: &mut Self::Backing,
@@ -96,6 +106,13 @@ pub trait BootAllocator: GpuAllocator {
 }
 
 impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
+    fn lnl_takeover_ready(&self) -> bool {
+        crate::intel_gpu_rcs::SharedArena::lnl_takeover_ready(self)
+    }
+    fn retire_ggtt(&mut self) -> Result<(), BootError> {
+        crate::intel_gpu_rcs::SharedArena::retire_ggtt(self).map_err(BootError::Allocation)
+    }
+
     fn configure_cache(
         &mut self,
         backing: &mut Self::Backing,
@@ -291,14 +308,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         {
             return Err(BootError::Device);
         }
-        if (platform == GtPlatform::Battlemage
-            && config.uncached_mocs.is_none_or(|index| index > 15))
-            || (platform != GtPlatform::Battlemage && config.uncached_mocs.is_some())
+        if (platform.is_xe2() && config.uncached_mocs.is_none_or(|index| index > 15))
+            || (!platform.is_xe2() && config.uncached_mocs.is_some())
         {
             return Err(BootError::Cache);
         }
         let upload = u32::try_from(image.upload.len()).map_err(|_| BootError::Address)?;
-        if platform.is_gen12() {
+        if platform.is_gen12() || platform.is_headless_integrated() {
             WopcmLayout::plan_total(upload, config.huc_upload_bytes, 0x200000)?;
         } else {
             WopcmLayout::plan(upload, config.huc_upload_bytes)?;
@@ -600,7 +616,16 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         }
         let ip = crate::intel_gpu_gt::GraphicsIp::read(&self.mmio, self.platform)
             .map_err(BootError::Graphics)?;
-        let workarounds = GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
+        let mut workarounds = GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
+        if self.platform.is_headless_integrated() {
+            let fuse = self.mmio.read32(0x9114);
+            if fuse == u32::MAX || fuse != self.mmio.read32(0x9114) {
+                return Err(BootError::Unavailable);
+            }
+            if fuse & 0x000f0000 != 0 {
+                workarounds.flags |= 0x00400000;
+            }
+        }
         if self.workarounds.is_some_and(|old| old != workarounds) {
             return Err(BootError::Device);
         }
@@ -629,7 +654,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             }
             .validate(0x800000, self.upload, self.config.huc_upload_bytes);
         }
-        let layout = if self.platform.is_gen12() {
+        let layout = if self.platform.is_gen12() || self.platform.is_headless_integrated() {
             WopcmLayout::plan_total(self.upload, self.config.huc_upload_bytes, 0x200000)?
         } else {
             WopcmLayout::plan(self.upload, self.config.huc_upload_bytes)?
@@ -650,7 +675,22 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Ok(layout)
     }
 
+    fn wa_offset(&self) -> u64 {
+        if self.platform.is_gen12()
+            && self.scheduling.is_some_and(|config| {
+                config.engines.iter().enumerate().any(|(index, state)| {
+                    state.is_some() && crate::intel_gpu_engine::Engine::ALL[index].is_media()
+                })
+            })
+        {
+            0x5000
+        } else {
+            WA_KLVS
+        }
+    }
+
     fn upload(&mut self, now: u64) -> Result<(), BootError> {
+        let wa_offset = self.wa_offset();
         self.layout()?;
         let power_mask = self.mmio.read32(0xa168);
         if power_mask == u32::MAX {
@@ -663,15 +703,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         // bytes as output from the firmware about to start.
         r.logs.zero_fill();
         self.incarnation = crate::intel_gpu_guc_log::next_incarnation();
-        // GuC is proven in reset. Publish bounded zero-length 16:16 KLVs,
+        if workarounds.klvs.len() > PAGE as usize / 4
+            || wa_offset + u64::from(PAGE) > u64::from(ADS_PRIVATE)
+        {
+            return Err(BootError::Address);
+        }
+        // GuC is proven in reset. Publish bounded 16:16 KLVs including source length-one payloads,
         // the complete 64-bit ADS pointer and its byte count before DMA.
         for i in 0..PAGE / 4 {
-            r.ads.write32(WA_KLVS + u64::from(i) * 4, 0);
+            r.ads.write32(wa_offset + u64::from(i) * 4, 0);
         }
         for (i, word) in workarounds.klvs.iter().copied().enumerate() {
-            r.ads.write32(WA_KLVS + i as u64 * 4, word);
+            r.ads.write32(wa_offset + i as u64 * 4, word);
         }
-        r.ads.write32(0x11a4, r.ads.ggtt_offset() + WA_KLVS as u32);
+        r.ads
+            .write32(0x11a4, r.ads.ggtt_offset() + wa_offset as u32);
         r.ads.write32(0x11a8, 0);
         r.ads.write32(0x11ac, workarounds.klvs.len() as u32 * 4);
         if !self.platform.is_discrete() {
@@ -795,6 +841,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                     if self.reload {
                         self.reload = false;
                         let config = self.scheduling.expect("scheduling reload");
+                        let wa_offset = self.wa_offset();
                         let ads = &self.resources.ads;
                         let base = ads.ggtt_offset();
                         // Populate only while GuC is proven stopped. Mapping
@@ -824,18 +871,66 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         regsets
                             .try_reserve_exact(engines.iter().count())
                             .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
+                        let protected = [
+                            &self.resources.ads,
+                            &self.resources.image,
+                            &self.resources.logs,
+                        ]
+                        .map(|backing| {
+                            let start = u64::from(backing.ggtt_offset());
+                            (
+                                start,
+                                start + u64::from(backing.size_pages()) * u64::from(PAGE),
+                            )
+                        });
+                        let mut state_ranges = Vec::new();
+                        state_ranges
+                            .try_reserve_exact(engines.iter().count() * 2)
+                            .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
                         let mut next_save = 0x2000u64;
                         for engine in engines.iter() {
                             let registers = policy.registers(engine).ok_or(BootError::State)?;
                             let end = next_save
                                 .checked_add(registers.len() as u64 * 16)
                                 .ok_or(BootError::Address)?;
-                            if end > WA_KLVS {
+                            let state = config.engines[engine.index()].ok_or(BootError::State)?;
+                            if end > wa_offset
+                                || wa_offset + u64::from(PAGE) > u64::from(ADS_PRIVATE)
+                                || u64::from(ADS_PRIVATE)
+                                    > u64::from(ads.size_pages()) * u64::from(PAGE)
+                                || state.bytes != engine.lrc_pages(self.platform) * PAGE
+                                || state.bytes < PAGE + 96 * 4
+                                || state.golden % PAGE != 0
+                                || state.hwsp % PAGE != 0
+                                || state.golden.checked_add(state.bytes).is_none()
+                            {
                                 return Poll::Ready(Err(BootError::Address));
+                            }
+                            // Golden images and HWSPs remain separately owned
+                            // DMA allocations, never ADS/private/KLV storage or
+                            // another engine's writable state. Check every
+                            // interval before publishing even the first header.
+                            for (start, bytes) in [(state.golden, state.bytes), (state.hwsp, PAGE)]
+                            {
+                                let start = u64::from(start);
+                                let end = start + u64::from(bytes);
+                                if start < u64::from(GUC_GGTT_MIN)
+                                    || end > 0xfee00000
+                                    || protected
+                                        .iter()
+                                        .chain(state_ranges.iter())
+                                        .any(|&(other, limit)| start < limit && other < end)
+                                {
+                                    return Poll::Ready(Err(BootError::Address));
+                                }
+                                state_ranges.push((start, end));
                             }
                             regsets.push((engine, next_save, registers));
                             next_save = end;
                         }
+                        // All class/physical headers and state pointers are now
+                        // bounded. Saves end before the KLV page; that full page
+                        // ends before firmware-private storage at 0x6000.
                         // guc_policies_init: allow firmware to reset an
                         // engine whose context fails to preempt in time.
                         ads.write32(POLICIES + 76, 0);
@@ -937,6 +1032,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         }
     }
 
+    pub(crate) fn retire_ggtt(&mut self) -> Result<(), BootError> {
+        if !matches!(self.state, BootState::Stopped | BootState::Staged) {
+            return Err(BootError::State);
+        }
+        self.resources.allocator.retire_ggtt()
+    }
+
     fn free(&mut self) {
         if self.released {
             return;
@@ -980,6 +1082,7 @@ mod tests {
     }
     #[derive(Default)]
     struct Device {
+        slpc_dcc: Vec<(u32, u32)>,
         profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,
@@ -1003,6 +1106,7 @@ mod tests {
         virtual_pick: Option<u32>,
         virtual_restores: Vec<(u32, u32)>,
         gen12_restores: Vec<(u32, u32, u32)>,
+        nonrender_seeds: Vec<(u32, [u32; 4])>,
         parallel_contexts: BTreeMap<u32, ParallelContext>,
         parallel_lanes: Option<u8>,
         parallel_reply_child: bool,
@@ -1037,7 +1141,43 @@ mod tests {
         fn write32(&self, offset: u64, value: u32) {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
+            let media = [
+                0x1c0000u64,
+                0x1c4000,
+                0x1d0000,
+                0x1d4000,
+                0x1e0000,
+                0x1e4000,
+                0x1f0000,
+                0x1f4000,
+                0x1c8000,
+                0x1d8000,
+                0x1e8000,
+                0x1f8000,
+            ]
+            .into_iter()
+            .find(|base| offset == base + 0x9c || offset == base + 0x29c || offset == base + 0xc4);
             let actual = match offset {
+                _ if device.profile.is_some_and(GtPlatform::is_gen12) && media.is_some() => {
+                    let base = media.unwrap_or_default();
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    let mut next = (old & !(value >> 16)) | (value & (value >> 16));
+                    if offset == base + 0x9c {
+                        if next & 0x100 != 0 {
+                            next |= 0x200;
+                        } else {
+                            next &= !0x200;
+                        }
+                    }
+                    next
+                }
+                _ if device.profile.is_some_and(GtPlatform::is_gen12)
+                    && ((0xa540..=0xa55c).contains(&offset)
+                        || (0xa560..=0xa56c).contains(&offset)) =>
+                {
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    (old & !(value >> 16)) | (value & (value >> 16))
+                }
                 0x209c | 0x2209c | 0x229c | 0x2229c
                     if device.profile.is_some_and(GtPlatform::is_gen12) =>
                 {
@@ -1070,13 +1210,13 @@ mod tests {
                     );
                     value
                 }
-                0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
+                0xd8c | 0x380d8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
-                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050
-                | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 | 0x1c0d4
-                | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804 | 0x20c4
-                | 0x220c4 | 0x3ee0c4 | 0x1a0c4 | 0x1c0c4 | 0x1e0c4 | 0x260c4 => {
+                0xc314 | 0xa188 | 0xa278 | 0x38a188 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c
+                | 0xe4f4 | 0xe5f0 | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4
+                | 0xe5f4 | 0x2050 | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050
+                | 0x1c0d4 | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804
+                | 0x20c4 | 0x220c4 | 0x3ee0c4 | 0x1a0c4 | 0x1c0c4 | 0x1e0c4 | 0x260c4 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
@@ -1163,6 +1303,10 @@ mod tests {
         }
     }
     impl BootAllocator for Arena {
+        fn retire_ggtt(&mut self) -> Result<(), BootError> {
+            Ok(())
+        } // model has no GGTT PTE window
+
         fn configure_cache(
             &mut self,
             _backing: &mut Backing,
@@ -1232,7 +1376,11 @@ mod tests {
             .borrow_mut()
             .regs
             .entry(0xd8c)
-            .or_insert(if platform == GtPlatform::Battlemage {
+            .or_insert(if platform.is_ptl() {
+                30 << 22
+            } else if platform.is_lnl() {
+                (20 << 22) | (4 << 14)
+            } else if platform == GtPlatform::Battlemage {
                 (20 << 22) | (1 << 14)
             } else {
                 (12 << 22) | (70 << 14)
@@ -1244,6 +1392,8 @@ mod tests {
             GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,
             GtPlatform::Alchemist => 0x56a0,
             GtPlatform::Battlemage => 0xe20b,
+            _ if platform.is_ptl() => 0xb080,
+            _ if platform.is_lnl() => 0x6420,
             _ => 0x7d55,
         };
         GuCBoot::stage_image(
@@ -1255,7 +1405,7 @@ mod tests {
                 device_id,
                 revision: 3,
                 huc_upload_bytes: 0,
-                uncached_mocs: (platform == GtPlatform::Battlemage).then_some(2),
+                uncached_mocs: platform.is_xe2().then_some(2),
             },
         )
         .unwrap()
@@ -1264,8 +1414,13 @@ mod tests {
         let mut device = window.0.borrow_mut();
         if device.profile.is_some_and(GtPlatform::is_gen12) && device.regs.get(&0x941c) == Some(&1)
         {
-            for reg in [0x209c, 0x2209c, 0x229c, 0x2229c] {
-                device.regs.insert(reg, 0);
+            for base in [
+                0x2000, 0x22000, 0x1c0000, 0x1c4000, 0x1d0000, 0x1d4000, 0x1e0000, 0x1e4000,
+                0x1f0000, 0x1f4000, 0x1c8000, 0x1d8000, 0x1e8000, 0x1f8000,
+            ] {
+                for offset in [0x9c, 0x29c] {
+                    device.regs.insert(base + offset, 0);
+                }
             }
         }
         device.regs.insert(0x941c, 0);
@@ -1286,6 +1441,55 @@ mod tests {
         reset_done(window);
         assert_eq!(boot.poll(101), Poll::Ready(Ok(BootState::Stopped)));
     }
+
+    fn smoke_gen12_media_ads_rejects_state_alias_before_any_header_write() -> TestResult {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        use crate::intel_gpu_guc_sched::{EngineAds, SchedulingAds};
+        use crate::intel_gpu_reset_policy::ResetPolicy;
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        for failure in 0..4 {
+            let (w, arena) = model();
+            let mut boot = stage(w.clone(), arena.clone(), platform);
+            ready(&mut boot, &w);
+            let engines = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Vcs1]);
+            let mut config = SchedulingAds {
+                engines: [None; Engine::COUNT],
+                reset_policy: ResetPolicy::new(
+                    platform, 0x9a49, 1200, 0, 0x40000000, 0, engines, false,
+                ),
+            };
+            for (index, engine) in engines.iter().enumerate() {
+                config.engines[engine.index()] = Some(EngineAds {
+                    golden: 0x30000000 + index as u32 * 0x10000,
+                    bytes: engine.lrc_pages(platform) * 4096,
+                    hwsp: 0x31000000 + index as u32 * 4096,
+                });
+            }
+            let ads = boot.resources.ads.ggtt_offset();
+            let state = config.engines[Engine::Vcs1.index()].as_mut().unwrap();
+            match failure {
+                0 => state.golden = ads + 0x5000, // future KLV page
+                1 => state.hwsp = ads + 0x6000,   // firmware-private page
+                2 => state.golden = 0x30010000,   // existing BCS golden
+                _ => state.bytes = 4096,          // under-sized class image
+            }
+            boot.begin_scheduling(config, 10).unwrap();
+            assert_eq!(boot.wa_offset(), 0x5000);
+            let before = w.0.borrow().memory[&ads].borrow().clone();
+            reset_done(&w);
+            assert_eq!(boot.poll(11), Poll::Ready(Err(BootError::Address)));
+            assert_eq!(*w.0.borrow().memory[&ads].borrow(), before);
+            assert!(boot.resources.ads.size_pages() >= 6);
+            stop(&mut boot, &w);
+            drop(boot);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12",
+        smoke_gen12_media_ads_rejects_state_alias_before_any_header_write
+    );
 
     fn smoke_boot_workaround_wire_profiles() -> TestResult {
         let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);

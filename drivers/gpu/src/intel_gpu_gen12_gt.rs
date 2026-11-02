@@ -77,6 +77,7 @@ pub(crate) fn restore_was(
     ring: &impl GpuBacking,
     render: bool,
     user: bool,
+    virtual_engine: bool,
 ) {
     timestamp(image, ring, 4096);
     let mut cursor = 4096 + 48;
@@ -92,6 +93,14 @@ pub(crate) fn restore_was(
             ring.write32(4224 + i * 4, 0);
         }
         image.write32(4096 + 0x15 * 4, (ring.ggtt_offset() + 4224) | 1);
+    }
+    if virtual_engine {
+        // xe_lrc.c::setup_utilization_wa: record the actual hardware class
+        // and physical instance after each GuC placement, before START.
+        for value in [0x12480002, 0x8c, image.ggtt_offset() + 0x818, 0] {
+            ring.write32(cursor, value);
+            cursor += 4;
+        }
     }
     if user {
         // setup_utilization_wa follows the timestamp workaround on every

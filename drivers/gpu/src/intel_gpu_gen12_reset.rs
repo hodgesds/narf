@@ -116,6 +116,7 @@ enum Stage {
     Power,
     Acknowledge,
     Prepared,
+    Held,
     Release,
     Done,
 }
@@ -156,6 +157,51 @@ impl Reset {
     }
     pub(crate) fn releasing(&self) -> bool {
         self.stage == Stage::Release
+    }
+    /// Keep the exact already-owned media requests through scheduling. No
+    /// release/reacquire gap and no second wake owner is introduced.
+    /// # Safety
+    /// The caller freshly proved GuC reset/DMA idle and GRDOM_FULL self-clear
+    /// after poll_prepare. It retains this owner until a complete stop.
+    pub(crate) unsafe fn retain_after_full_reset(
+        &mut self,
+        mmio: &impl MmioWindow,
+        mut current: impl FnMut() -> bool,
+    ) -> Result<(), HardwareError> {
+        if self.failed.is_some() || self.stage != Stage::Prepared {
+            return Err(HardwareError::Busy);
+        }
+        {
+            let mut io = Io::new(mmio, &mut current);
+            io.guc_stopped()?;
+            if io.read(0x941c)? != 0 {
+                return Err(HardwareError::Unavailable);
+            }
+        }
+        self.stage = Stage::Held;
+        self.held_current(mmio, &mut current)
+    }
+    pub(crate) fn held_current(
+        &self,
+        mmio: &impl MmioWindow,
+        current: impl FnMut() -> bool,
+    ) -> Result<(), HardwareError> {
+        if self.failed.is_some() || self.stage != Stage::Held {
+            return Err(HardwareError::WakeLost);
+        }
+        let mut io = Io::new(mmio, current);
+        io.awake()?;
+        let fuse = io.read(0x9140)?;
+        let present = 3 | (((!fuse & 255) as u16) << 2) | (((!fuse >> 16 & 15) as u16) << 10);
+        if self.present != Some(present) || self.owned != present & !3 {
+            return Err(HardwareError::WakeLost);
+        }
+        for (index, engine) in ENGINES.iter().enumerate().skip(2) {
+            if self.owned & (1 << index) != 0 {
+                io.media_awake(engine)?;
+            }
+        }
+        Ok(())
     }
     pub(crate) fn poll_prepare(
         &mut self,

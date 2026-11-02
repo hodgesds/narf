@@ -162,6 +162,8 @@ enum Command {
     Profile(PowerProfile),
     QueryFinal,
     Gucrc,
+    EnableDcc(bool),
+    DisableDcc(bool),
 }
 
 pub(crate) struct Slpc {
@@ -178,6 +180,7 @@ pub(crate) struct Slpc {
     acked: bool,
     deadline: u64,
     mert_range: Option<FrequencyRange>,
+    disable_dcc: bool,
 }
 
 impl Slpc {
@@ -196,6 +199,7 @@ impl Slpc {
             acked: false,
             deadline: 0,
             mert_range: None,
+            disable_dcc: false,
         }
     }
     pub(crate) fn state(&self) -> SlpcState {
@@ -208,9 +212,15 @@ impl Slpc {
             profile: self.profile,
         })
     }
-    pub(crate) fn start(&mut self, limits: Limits, now: u64) -> Result<(), SlpcError> {
+    pub(crate) fn start(
+        &mut self,
+        limits: Limits,
+        now: u64,
+        platform: GtPlatform,
+    ) -> Result<(), SlpcError> {
         self.deadline = now.checked_add(TIMEOUT).ok_or(SlpcError::Timeout)?;
         self.limits = Some(limits);
+        self.disable_dcc = platform.is_ptl();
         self.state = SlpcState::Resetting {
             deadline: self.deadline,
         };
@@ -346,6 +356,10 @@ impl Slpc {
             return Ok(());
         }
         if self.commands.is_empty() {
+            if self.disable_dcc {
+                self.commands
+                    .extend([Command::EnableDcc(false), Command::DisableDcc(true)]);
+            }
             self.commands.push(Command::QueryInitial);
         }
         if self.acked {
@@ -426,6 +440,8 @@ impl Slpc {
             Command::Min(value) => vec![0x602, 6, value],
             Command::Max(value) => vec![0x602, 7, value],
             Command::Profile(value) => vec![0x602, 27, value as u32],
+            Command::EnableDcc(value) => vec![0x602, 4, u32::from(value)],
+            Command::DisableDcc(value) => vec![0x602, 5, u32::from(value)],
             Command::Gucrc => unreachable!(),
         };
         match ct.send(self.next_fence, 0x3003, 0, &payload, false) {

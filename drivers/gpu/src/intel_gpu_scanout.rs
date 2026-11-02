@@ -49,6 +49,25 @@ const CUS_CTL_OFFSET: u64 = 0x48;
 const COLOR_CTL_OFFSET: u64 = 0x4c;
 const FLIP_TIMEOUT_NS: u64 = 1_000_000_000;
 
+pub(crate) fn gen12_alignment(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
+    if matches!(
+        family,
+        crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+            | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+    ) {
+        16384
+    } else {
+        4096
+    }
+}
+pub(crate) fn gen12_max_stride(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
+    if gen12_alignment(family) == 16384 {
+        128 * 1024
+    } else {
+        32 * 1024
+    }
+}
+
 /// MMIO and GGTT invalidation retained for as long as any scanout may fetch.
 ///
 /// # Safety
@@ -209,7 +228,43 @@ impl View {
             bytes,
         ))
     }
-    fn stride(self, geometry: Geometry) -> u32 {
+    /// Linux intel_compute_aligned_offset + intel_adjust_tile_offset. ADLP/N
+    /// use 16KiB SURF alignment even for synchronous linear/X replacements.
+    pub(crate) fn footprint_aligned(
+        self,
+        geometry: Geometry,
+        alignment: u32,
+    ) -> Result<(u32, u32, u64), ScanoutError> {
+        let (base, offset, bytes) = self.footprint(geometry)?;
+        if ![4096, 16384].contains(&alignment) {
+            return Err(ScanoutError::Unsupported);
+        }
+        let aligned = base & !(alignment - 1);
+        if self.layout == Layout::Linear {
+            let start =
+                u64::from(self.origin.y) * u64::from(geometry.pitch) + u64::from(self.origin.x) * 4;
+            let residual = start - u64::from(aligned);
+            let y = residual / u64::from(geometry.pitch);
+            let x = residual % u64::from(geometry.pitch) / 4;
+            if x > 0xffff || y > 0xffff {
+                return Err(ScanoutError::Bounds);
+            }
+            return Ok((aligned, (y as u32) << 16 | x as u32, bytes));
+        }
+        let tile_width = if self.layout == Layout::X { 128 } else { 32 };
+        let tile_height = if self.layout == Layout::X { 8 } else { 32 };
+        let pitch_tiles = geometry.pitch / (tile_width * 4);
+        let delta = (base - aligned) / 4096;
+        let mut y = (offset >> 16) + (delta / pitch_tiles) * tile_height;
+        let mut x = (offset & 0xffff) + (delta % pitch_tiles) * tile_width;
+        y += x / (pitch_tiles * tile_width) * tile_height;
+        x %= pitch_tiles * tile_width;
+        if x + geometry.width > geometry.pitch / 4 || x > 0xffff || y > 0xffff {
+            return Err(ScanoutError::Bounds);
+        }
+        Ok((aligned, y << 16 | x, bytes))
+    }
+    pub(crate) fn stride(self, geometry: Geometry) -> u32 {
         geometry.pitch
             / match self.layout {
                 Layout::Linear => 64,
@@ -217,7 +272,7 @@ impl View {
                 Layout::Tile4 => 128,
             }
     }
-    fn tiled(self) -> u32 {
+    pub(crate) fn tiled(self) -> u32 {
         match self.layout {
             Layout::Linear => 0,
             Layout::X => 1 << 10,
@@ -282,6 +337,8 @@ pub struct Presenter<M: ScanoutIo> {
     pipe: Pipe,
     format: PteFormat,
     pat: u8,
+    alignment: u32,
+    gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
     free: Vec<(u32, u32)>,
     surfaces: BTreeMap<SurfaceId, Surface>,
     next_id: u64,
@@ -356,6 +413,8 @@ impl<M: ScanoutIo> Presenter<M> {
             pipe,
             format,
             pat,
+            alignment: 4096,
+            gen12_family: None,
             free: alloc::vec![(
                 GEM_SCANOUT_GTT_START as u32,
                 ((GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START) / GTT_PAGE_SIZE) as u32,
@@ -400,6 +459,8 @@ impl<M: ScanoutIo> Presenter<M> {
     /// The caller retains every old current/pending allocation and the
     /// console allocation, exclusively owns this plane/arena, has restored
     /// and verified GT cache policy and supplies a new live status owner.
+    /// For Gen12 X, the caller also retains the exact family/no-DPT witness
+    /// before this temporary parser accepts an old owned tiled plane image.
     /// Only a successful fresh console latch permits reclaiming old pages.
     pub(crate) unsafe fn recover_console(
         io: M,
@@ -433,6 +494,8 @@ impl<M: ScanoutIo> Presenter<M> {
             pipe,
             format,
             pat,
+            alignment: 4096,
+            gen12_family: None,
             free: alloc::vec![],
             surfaces: BTreeMap::new(),
             next_id: 1,
@@ -478,6 +541,46 @@ impl<M: ScanoutIo> Presenter<M> {
         )?;
         Ok(owner)
     }
+    pub(crate) fn qualify_gen12(
+        &mut self,
+        family: crate::intel_gpu_gt::Gen12Platform,
+    ) -> Result<(), ScanoutError> {
+        if self.format != PteFormat::Gen12
+            || self.pending.is_some()
+            || !self.surfaces.is_empty()
+            || self.current.is_some()
+        {
+            return Err(ScanoutError::Busy);
+        }
+        if self.console_ctl != crate::intel_gpu_pipes::gen12_xrgb_control(family) {
+            return Err(ScanoutError::Unsupported);
+        }
+        self.alignment = gen12_alignment(family);
+        self.gen12_family = Some(family);
+        Ok(())
+    }
+    fn no_dpt(&self, layout: Layout) -> bool {
+        if layout == Layout::Linear {
+            return true;
+        }
+        if self.format == PteFormat::Gen12 {
+            if layout != Layout::X {
+                return false;
+            }
+            return self.gen12_family.is_none_or(|family| {
+                !matches!(
+                    family,
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                        | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+                ) || {
+                    let v = self.io().read32(0x42084);
+                    v != u32::MAX && v & (1 << 30) != 0
+                }
+            });
+        }
+        let v = self.io().read32(0x7026c);
+        v != u32::MAX && v & (1 << 19) != 0
+    }
     fn plane(&self) -> u64 {
         self.pipe.base() + PLANE_PRIMARY_OFFSET
     }
@@ -513,14 +616,11 @@ impl<M: ScanoutIo> Presenter<M> {
         geometry: Geometry,
         view: View,
     ) -> Result<SurfaceId, ScanoutError> {
-        if view.layout != Layout::Linear {
-            let chicken = self.io().read32(0x7026c);
-            if chicken == u32::MAX {
-                return Err(ScanoutError::Unavailable);
-            }
-            if self.format != PteFormat::XeLpg || chicken & (1 << 19) == 0 {
-                return Err(ScanoutError::Unsupported);
-            }
+        if view.layout != Layout::Linear
+            && (!self.no_dpt(view.layout)
+                || (self.format == PteFormat::Gen12 && self.gen12_family.is_none()))
+        {
+            return Err(ScanoutError::Unsupported);
         }
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(ScanoutError::Unsupported);
@@ -549,7 +649,7 @@ impl<M: ScanoutIo> Presenter<M> {
         view: View,
     ) -> Result<SurfaceId, ScanoutError> {
         self.ready()?;
-        let (_, _, extent) = view.footprint(geometry)?;
+        let (_, _, extent) = view.footprint_aligned(geometry, self.alignment)?;
         if extent > object.size() {
             return Err(ScanoutError::Bounds);
         }
@@ -566,22 +666,30 @@ impl<M: ScanoutIo> Presenter<M> {
         if ptes.len() != pages as usize {
             return Err(ScanoutError::Bounds);
         }
-        let slot = self
+        let (slot, offset, prefix) = self
             .free
             .iter()
-            .position(|&(_, n)| n >= pages)
+            .enumerate()
+            .find_map(|(slot, &(start, n))| {
+                let aligned = (start + self.alignment - 1) & !(self.alignment - 1);
+                let prefix = (aligned - start) / 4096;
+                (n >= pages + prefix).then_some((slot, aligned, prefix))
+            })
             .ok_or(ScanoutError::Busy)?;
         if !object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
         let id = SurfaceId(self.next_id);
         let next = self.next_id.checked_add(1).ok_or(ScanoutError::Busy)?;
-        let offset = self.free[slot].0;
-        self.free[slot].0 += pages * 4096;
-        self.free[slot].1 -= pages;
-        if self.free[slot].1 == 0 {
-            self.free.remove(slot);
+        let (start, available) = self.free.remove(slot);
+        if prefix != 0 {
+            self.free.push((start, prefix));
         }
+        if available > pages + prefix {
+            self.free
+                .push((offset + pages * 4096, available - pages - prefix));
+        }
+        self.free.sort_unstable_by_key(|&(base, _)| base);
         self.next_id = next;
         // Ownership precedes the first hardware-visible write, including on
         // unavailable/readback/invalidation failure.
@@ -626,17 +734,13 @@ impl<M: ScanoutIo> Presenter<M> {
     fn geometry_matches_stride(&self, geometry: Geometry, view: View, stride: u32) -> bool {
         let ctl = self.io().read32(self.plane() + PLANE_CTL_OFFSET);
         let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
-        let chicken = if view.layout != Layout::Linear {
-            self.io().read32(0x7026c)
-        } else {
-            0
-        };
+
         ctl != u32::MAX
             && ctl & !(ALLOWED_CTL | CTL_TILED_MASK) == 0
             && ctl & (PLANE_CTL_ENABLE | CTL_FORMAT_MASK | CTL_TILED_MASK | CTL_RGB_ORDER)
                 == PLANE_CTL_ENABLE | CTL_XRGB8888 | view.tiled()
             && ctl == (self.console_ctl & !CTL_TILED_MASK) | view.tiled()
-            && (view.layout == Layout::Linear || (chicken != u32::MAX && chicken & (1 << 19) != 0))
+            && self.no_dpt(view.layout)
             && self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) == stride
             && self.io().read32(self.plane() + PLANE_SIZE_OFFSET)
                 == ((geometry.height - 1) << 16) | (geometry.width - 1)
@@ -677,7 +781,9 @@ impl<M: ScanoutIo> Presenter<M> {
         if !surface.object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
-        let (base, plane_offset, _) = surface.view.footprint(surface.geometry)?;
+        let (base, plane_offset, _) = surface
+            .view
+            .footprint_aligned(surface.geometry, self.alignment)?;
         let (offset, geometry) = (surface.offset + base, surface.geometry);
         self.arm_target(
             id,
@@ -710,7 +816,9 @@ impl<M: ScanoutIo> Presenter<M> {
         if !surface.object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
-        let (base, plane_offset, _) = surface.view.footprint(surface.geometry)?;
+        let (base, plane_offset, _) = surface
+            .view
+            .footprint_aligned(surface.geometry, self.alignment)?;
         let view = surface.view;
         let (offset, geometry) = (surface.offset + base, surface.geometry);
         self.arm_target(
@@ -964,6 +1072,41 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Timeout);
         }
         Ok(None)
+    }
+
+    /// Reobserve an independently completed surface without consuming another
+    /// flip-done or releasing the old mapping. The KMS joint owner retains the
+    /// original Completion and brackets this with its color/DSB observation.
+    pub(crate) fn observe_completed(
+        &self,
+        completion: &Completion,
+        now: u64,
+    ) -> Result<Option<crate::drm::card::FlipStamp>, ScanoutError> {
+        self.ready()?;
+        if self.pending.is_some() || self.current != Some(completion.surface) {
+            return Err(ScanoutError::Busy);
+        }
+        let geometry = self.console_geometry.ok_or(ScanoutError::Unsupported)?;
+        let before = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
+        let live = self.io().read32(self.plane() + SURFLIVE_OFFSET);
+        let status = self.io().read32(self.iir());
+        if before == u32::MAX
+            || status & self.faults() != 0
+            || live != self.expected_surface
+            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
+            || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
+            || !self.geometry_matches(geometry, self.expected_view)
+        {
+            return Err(ScanoutError::Unavailable);
+        }
+        let after = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
+        if after == u32::MAX {
+            return Err(ScanoutError::Unavailable);
+        }
+        Ok((before == after).then_some(crate::drm::card::FlipStamp {
+            ns: now,
+            sequence: after,
+        }))
     }
 
     /// Unmap a prepared or retired surface. Current/pending buffers stay

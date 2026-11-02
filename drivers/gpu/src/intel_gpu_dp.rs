@@ -247,6 +247,8 @@ pub struct DpSinkProbe {
 /// bookkeeping disconnect/retrain need.
 #[derive(Clone, Debug)]
 pub struct DpConnection {
+    /// Exact source family retained through retrain/disconnect.
+    pub family: crate::intel_gpu_gt::Gen12Platform,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
     /// The pipe scanning this connection out, claimed from
@@ -350,11 +352,15 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     pipe: Pipe,
     dbuf_share: Option<(u16, u16)>,
 ) -> Result<DpConnection, DpError> {
+    let family = mmio
+        .gen12_display_family()
+        .ok_or(DpError::Modeset(ModesetError::UnsupportedGeneration))?;
     let plan = LinkPlan {
         rate: probe.negotiated.rate,
         lanes: probe.negotiated.lanes,
     };
     let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
+    modeset.set_gen12_family(family);
     if let Some((start, end)) = dbuf_share {
         modeset.set_dbuf_share(start, end);
     }
@@ -373,6 +379,7 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     }
 
     Ok(DpConnection {
+        family,
         ddi: probe.ddi,
         pipe,
         mode,
@@ -399,20 +406,28 @@ pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
     fb: &Framebuffer,
     pipe: Pipe,
 ) -> Result<DpConnection, DpError> {
+    mmio.gen12_display_family()
+        .ok_or(DpError::Modeset(ModesetError::UnsupportedGeneration))?;
     let probe = probe_sink(mmio, ddi)?;
     activate_on_pipe(mmio, &probe, fb, pipe, None)
 }
 
 /// Disconnect: silence audio (codec disable + sink clear)
 /// before the pipeline comes down, so no consumer can act on
-/// an ELD whose display is already gone.
-pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) {
+/// an ELD whose display is already gone. False means missing/foreign source
+/// metadata: no side effects occurred and the caller must retain the session.
+pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool {
+    if mmio.gen12_display_family() != Some(conn.family) {
+        return false;
+    }
     if conn.audio_published {
         intel_gpu_audio::audio_codec_disable(mmio, conn.pipe.transcoder());
         clear_display_audio(sink_id_for(conn.ddi));
     }
     let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
+    modeset.set_gen12_family(conn.family);
     modeset.teardown();
+    true
 }
 
 /// Respond to a short pulse (IRQ_HPD): re-read link status. If
@@ -426,6 +441,9 @@ pub fn retrain<M: MmioWindow + ?Sized>(
     conn: &DpConnection,
     fb: &Framebuffer,
 ) -> Result<DpConnection, DpError> {
+    if mmio.gen12_display_family() != Some(conn.family) {
+        return Err(DpError::Modeset(ModesetError::UnsupportedGeneration));
+    }
     let mut aux = IntelAux::new(mmio, conn.ddi);
     let mut status01 = [0u8; 1];
     let mut status23 = [0u8; 1];
@@ -723,6 +741,7 @@ pub mod tests {
 
     #[derive(Debug)]
     pub struct SinkMmio {
+        family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
         regs: RefCell<BTreeMap<u64, u32>>,
         pub writes: RefCell<Vec<(u64, u32)>>,
         sink: RefCell<DpSink>,
@@ -741,6 +760,7 @@ pub mod tests {
     impl SinkMmio {
         fn new(ddi: Ddi, sink: DpSink) -> Self {
             Self {
+                family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
                 regs: RefCell::new(BTreeMap::new()),
                 writes: RefCell::new(Vec::new()),
                 sink: RefCell::new(sink),
@@ -781,6 +801,9 @@ pub mod tests {
     }
 
     impl MmioWindow for SinkMmio {
+        fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+            *self.family.borrow()
+        }
         fn read32(&self, off: u64) -> u32 {
             if off == self.aux_ctl_off() {
                 return *self.aux_ctl_state.borrow();
@@ -1380,5 +1403,68 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dp",
         smoke_dp_nacking_sink_fails_clean
+    );
+
+    fn smoke_dp_source_family_arb_slots_and_missing_foreign_metadata_refusal() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        for (family, expected) in [
+            (Gen12Platform::TigerLake, 0x84000000),
+            (Gen12Platform::AlderLakeS, 0x84000000),
+            (Gen12Platform::AlderLakeP, 0x94000000),
+            (Gen12Platform::AlderLakeN, 0x94000000),
+        ] {
+            let mmio = SinkMmio::new(
+                Ddi::B,
+                DpSink::new(
+                    fixture_caps(BW_HBR2, 4),
+                    fixture_edid(148_500, 1920, 1080, b"FAMILY DP"),
+                ),
+            );
+            *mmio.family.borrow_mut() = Some(family);
+            let conn = connect_on_pipe(&mmio, Ddi::B, &test_fb(), Pipe::B).unwrap();
+            assert_eq!(conn.family, family);
+            assert_eq!(mmio.writes_to(0x71180).last(), Some(&expected));
+            let before = mmio.writes.borrow().len();
+            let other = if family == Gen12Platform::AlderLakeP {
+                Gen12Platform::AlderLakeN
+            } else {
+                Gen12Platform::AlderLakeP
+            };
+            *mmio.family.borrow_mut() = Some(other);
+            assert!(matches!(
+                retrain(&mmio, &conn, &test_fb()),
+                Err(DpError::Modeset(ModesetError::UnsupportedGeneration))
+            ));
+            assert!(!disconnect(&mmio, &conn));
+            assert_eq!(mmio.writes.borrow().len(), before);
+            *mmio.family.borrow_mut() = None;
+            assert!(!disconnect(&mmio, &conn));
+            assert_eq!(mmio.writes.borrow().len(), before);
+            *mmio.family.borrow_mut() = Some(family);
+            assert!(disconnect(&mmio, &conn));
+            assert_eq!(
+                mmio.writes_to(0x71180).last().unwrap() & 0x70000000,
+                expected & 0x70000000
+            );
+        }
+        let mmio = SinkMmio::new(
+            Ddi::B,
+            DpSink::new(
+                fixture_caps(BW_HBR2, 4),
+                fixture_edid(148_500, 1920, 1080, b"UNKNOWN DP"),
+            ),
+        );
+        *mmio.family.borrow_mut() = None;
+        assert!(matches!(
+            connect(&mmio, Ddi::B, &test_fb()),
+            Err(DpError::Modeset(ModesetError::UnsupportedGeneration))
+        ));
+        assert!(mmio.writes.borrow().is_empty());
+        assert!(mmio.sink.borrow().wire_log.is_empty());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_source_family_arb_slots_and_missing_foreign_metadata_refusal
     );
 }

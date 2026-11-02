@@ -1697,6 +1697,23 @@ integrity checks pass. aarch64 QEMU is omitted because no aarch64-specific
 production behavior changes. The ledger has 49 implemented checkpoint rows
 and ten broad open workstreams; Intel silicon and Mesa acceptance are unrun.
 
+The next Intel batch implements Gen12 joint primary/color, fixed X/integer
+views and mandatory ADLP/N alignment/arbitration plus exact console restore;
+exact-family external metadata; serial/headless LNL/PTL main-GT execution;
+fuse-present Gen12 main-GuC VIDEO/ENHANCE including legacy i915 selection;
+and mixed-vendor CPU-alias lifetime retention through unpublished fork state.
+All 58 new fixtures pass in the debug kernel: 1,144 selected Intel/DRM/fb/
+backlight tests and 670 shared filesystem/graphics/AMD tests pass, with
+one existing RNG-registration skip and no failures or duplicate names.
+All previous 1,087 Intel fixtures and 31 shared backlight regressions are
+preserved. Host all-target Clippy, format/diff and source hashes pass.
+The x86 debug relocation reserve grows to 8 MiB for the 6.2 MB table.
+The ledger has 56 implemented checkpoint rows and ten broad open workstreams.
+Release native, production boot/btrfs and cross-target gates remain pending
+for the combined follow-on branch; merge readiness is not claimed. Graphical
+LNL/PTL takeover, separate media GTs/HuC, full display resource transactions,
+placement migration and invalidate-aware USERPTR remain separate work.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

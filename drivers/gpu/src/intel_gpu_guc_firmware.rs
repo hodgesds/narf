@@ -131,7 +131,7 @@ mod tests {
             Err(FirmwareError::Revoked)
         ) || !matches!(
             GuCFirmware::open(Generation::PantherLake, &read),
-            Err(FirmwareError::Unsupported)
+            Err(FirmwareError::Revoked)
         ) {
             return TestResult::Fail("firmware acquisition bypassed authority or generation");
         }

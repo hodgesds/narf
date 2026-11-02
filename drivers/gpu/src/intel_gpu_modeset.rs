@@ -385,7 +385,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             ddi,
             pipe,
             dbuf_share: None,
-            gen12_family: None,
+            gen12_family: mmio.gen12_display_family(),
         }
     }
 
@@ -1190,7 +1190,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio
             .write32(base + PLANE_OFFSET_OFFSET, prog.plane_offset);
         // CTL with format + plane_enable; final flush via SURF.
-        self.mmio.write32(base + PLANE_CTL_OFFSET, prog.plane_ctl);
+        let control = self.gen12_family.map_or(prog.plane_ctl, |family| {
+            // This stopped modeset owns the exact PCI-selected display family.
+            // Wa_22012358565 selects bit28 for display13 uncompressed cpp4.
+            crate::intel_gpu_pipes::gen12_xrgb_control(family)
+        });
+        self.mmio.write32(base + PLANE_CTL_OFFSET, control);
         self.mmio.write32(base + PLANE_SURF_OFFSET, prog.plane_surf);
         compiler_fence(Ordering::SeqCst);
     }
@@ -1739,16 +1744,38 @@ pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
     modeset_display_family(mmio, generation, None, fb, mode)
 }
 
+/// Exact known PCI family; no P/S/N inference from the broad generation.
+pub(crate) fn gen12_family_for_chip(
+    chip: crate::intel_gpu::ChipInfo,
+) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+    use crate::intel_gpu::Generation;
+    match crate::intel_gpu_gt::GtPlatform::from_pci(chip.vid, chip.did) {
+        Some(crate::intel_gpu_gt::GtPlatform::Gen12(family))
+            if (chip.generation == Generation::TigerLake
+                && family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
+                || (chip.generation == Generation::AlderLake
+                    && family != crate::intel_gpu_gt::Gen12Platform::TigerLake) =>
+        {
+            Some(family)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
     mmio: &M,
     chip: crate::intel_gpu::ChipInfo,
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
-    let family = match crate::intel_gpu_gt::GtPlatform::from_pci(chip.vid, chip.did) {
-        Some(crate::intel_gpu_gt::GtPlatform::Gen12(family)) => Some(family),
-        _ => None,
-    };
+    let family = gen12_family_for_chip(chip);
+    if matches!(
+        chip.generation,
+        crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
+    ) && family.is_none()
+    {
+        return Err(ModesetError::UnsupportedGeneration);
+    }
     modeset_display_family(mmio, chip.generation, family, fb, mode)
 }
 
@@ -1781,7 +1808,7 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
-        Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
+        Generation::LunarLake | Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
     }
 }
 
@@ -3239,6 +3266,114 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_modeset_pcode_failure_falls_back_to_preboot
+    );
+    fn smoke_modeset_gen12_xrgb_arb_slots_are_exact_source_family_literals() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        for (family, expected) in [
+            (Gen12Platform::TigerLake, 0x84000000),
+            (Gen12Platform::AlderLakeS, 0x84000000),
+            (Gen12Platform::AlderLakeP, 0x94000000),
+            (Gen12Platform::AlderLakeN, 0x94000000),
+        ] {
+            let mmio = FakeMmio::new();
+            let mut ms = Modeset::new(&mmio, Ddi::A);
+            ms.set_gen12_family(family);
+            // Isolated stopped-plane bank: exercise the actual modeset
+            // formatter and final CTL-before-SURF MMIO ordering.
+            ms.program_plane(
+                &fb_1080p(),
+                &Mode {
+                    h_active: 1920,
+                    v_active: 1080,
+                    ..Mode::VESA_1024X768_60
+                },
+            );
+            assert_eq!(mmio.writes_to(0x70180), alloc::vec![expected]);
+            let writes = mmio.writes.borrow();
+            let ctl = writes.iter().position(|&(r, _)| r == 0x70180).unwrap();
+            let surf = writes.iter().position(|&(r, _)| r == 0x7019c).unwrap();
+            assert!(ctl < surf);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_gen12_xrgb_arb_slots_are_exact_source_family_literals
+    );
+    fn smoke_external_display_family_uses_exact_pci_ids_and_rejects_generation_aliases(
+    ) -> TestResult {
+        use crate::intel_gpu::{ChipInfo, Generation};
+        use crate::intel_gpu_gt::Gen12Platform;
+        for (did, generation, family) in [
+            (0x9a49, Generation::TigerLake, Gen12Platform::TigerLake),
+            (0x4680, Generation::AlderLake, Gen12Platform::AlderLakeS),
+            (0x46a6, Generation::AlderLake, Gen12Platform::AlderLakeP),
+            (0x46d0, Generation::AlderLake, Gen12Platform::AlderLakeN),
+        ] {
+            let chip = ChipInfo {
+                vid: 0x8086,
+                did,
+                generation,
+                asic: "literal native fixture",
+            };
+            assert_eq!(gen12_family_for_chip(chip), Some(family));
+            assert_eq!(
+                gen12_family_for_chip(ChipInfo {
+                    generation: Generation::MeteorLake,
+                    ..chip
+                }),
+                None
+            );
+            assert_eq!(
+                gen12_family_for_chip(ChipInfo {
+                    vid: 0x1002,
+                    ..chip
+                }),
+                None
+            );
+        }
+        for (did, generation) in [
+            (0x46ff, Generation::AlderLake),
+            (0x7d55, Generation::MeteorLake),
+        ] {
+            assert_eq!(
+                gen12_family_for_chip(ChipInfo {
+                    vid: 0x8086,
+                    did,
+                    generation,
+                    asic: "unsupported"
+                }),
+                None
+            );
+        }
+        struct NoIo;
+        impl MmioWindow for NoIo {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("unknown exact PCI family read MMIO")
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("unknown exact PCI family wrote MMIO")
+            }
+        }
+        assert_eq!(
+            modeset_display_for_chip(
+                &NoIo,
+                ChipInfo {
+                    vid: 0x8086,
+                    did: 0x46ff,
+                    generation: Generation::AlderLake,
+                    asic: "unknown"
+                },
+                &fb_1080p(),
+                Some(&Mode::VESA_1024X768_60)
+            ),
+            Err(ModesetError::UnsupportedGeneration)
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_external_display_family_uses_exact_pci_ids_and_rejects_generation_aliases
     );
 }
 

@@ -462,6 +462,8 @@ pub mod mmap_relocation {
     pub fn replace(hook: Option<RelocationHook>) -> Option<RelocationHook>; // tests
     pub fn relocate(old: &[u64], new: &[u64], aliases: fn(u64) -> usize,
                     commit: &mut dyn FnMut() -> Result<(), FsError>) -> Result<(), FsError>;
+    pub fn register_alias_hooks(retain: fn(u64) -> bool, release: fn(u64) -> bool)
+        -> Result<(), FsError>;
     pub fn install_alias_hooks(retain: fn(u64) -> bool, release: fn(u64) -> bool);
     pub fn retain_alias(phys: u64) -> bool;   // false: not a device alias
     pub fn release_alias(phys: u64) -> bool;
@@ -670,9 +672,17 @@ CPU alias of `old`, runs `commit`, then rebinds to `new` on success or restores
 `old` on error. Neither hook nor commit may await, and commit must not
 allocate. `aliases(phys)` must count every retained metadata alias of a device
 frame, including fork children not yet scheduler-visible; it runs with every
-affected region table locked and may take only leaf locks. The alias hooks are a
-single-provider registry (currently amdgpu); installing a different provider
-panics. `DmaResv::generation` counts fence additions without allocating or
+affected region table locked and may take only leaf locks. The alias registry
+admits eight permanent providers with disjoint physical frames. Registration
+before mapping publication is fallible: identical callback pairs are
+idempotent, a changed release partner returns InvalidData, and capacity
+exhaustion returns NoSpace. Providers cannot unregister or replace a pair and
+must retain claimed frames through the final metadata alias. Dispatch copies
+the fixed table under its short lock, then calls providers in permanent order
+after dropping that lock. AMD and Intel providers coexist. `install_alias_hooks`
+is the compatibility wrapper and panics on failed registration. The existing
+synchronous, allocation-free, no-await relocation contract is unchanged.
+`DmaResv::generation` counts fence additions without allocating or
 sampling driver fences, so a caller that saw no unsignalled fence can later
 prove none was added.
 

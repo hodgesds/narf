@@ -7,7 +7,7 @@
 //! or an OA stream; neither is admitted by installing these registers.
 //! Modern RCS/CCS profiles carry OAG grants and COPY has none. Gen12 instead
 //! grants RCS PS_INVOCATION_COUNT RD, COMMON_SLICE_CHICKEN1/HIZ RW, and
-//! BCS CTX_TIMESTAMP RD. Every remaining inherited slot becomes its own NOPID.
+//! every nonrender engine’s own CTX_TIMESTAMP RD. Every remaining inherited slot becomes its own NOPID.
 
 use crate::{
     intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform, intel_gpu_gt_registers::RegisterError,
@@ -17,12 +17,16 @@ const SLOTS: usize = 12;
 // Address-sorted, as xe_reg_whitelist's xarray traversal: status RD,
 // head/tail/buffer/control RD (four registers), MMIO trigger RW.
 const ALLOWED: [u32; 3] = [0x1000_dafc, 0x1000_db01, 0x0000_db1c];
+// xe_reg_whitelist.c Wa14019159160, graphics2004 before B0.
+const PTL_RCS: [u32; 5] = [0x00006210, 0x000062a8, 0x1000dafc, 0x1000db01, 0x0000db1c];
+const LNL_A0: [u32; 4] = [0x0000_23fc, 0x1000_dafc, 0x1000_db01, 0x0000_db1c];
 
 /// RING_FORCE_TO_NONPRIV(base, n) = base + 0x4d0 + 4n; RING_NOPID = base + 0x94.
 #[derive(Copy, Clone, Debug)]
 struct Slots {
     base: u32,
     allowed: &'static [u32],
+    timestamp: Option<u32>,
 }
 
 impl Slots {
@@ -33,7 +37,11 @@ impl Slots {
         self.base + 0x94
     }
     fn expected(self, slot: usize) -> u32 {
-        self.allowed.get(slot).copied().unwrap_or(self.nopid())
+        self.allowed
+            .get(slot)
+            .copied()
+            .or(if slot == 0 { self.timestamp } else { None })
+            .unwrap_or(self.nopid())
     }
 }
 
@@ -42,6 +50,8 @@ impl Slots {
 pub(crate) struct EnginePolicy {
     engines: crate::intel_gpu_engine::EngineSet,
     gen12: bool,
+    ptl: bool,
+    lnl_pre_b0: bool,
 }
 
 impl EnginePolicy {
@@ -49,9 +59,22 @@ impl EnginePolicy {
         platform: GtPlatform,
         engines: crate::intel_gpu_engine::EngineSet,
     ) -> Result<Self, RegisterError> {
+        // LNL policy requires the source GMD stepping, never a guessed A0.
+        if platform.is_lnl() {
+            return Err(RegisterError::Identity);
+        }
+        Self::for_step(platform, engines, 0)
+    }
+
+    pub(crate) fn for_step(
+        platform: GtPlatform,
+        engines: crate::intel_gpu_engine::EngineSet,
+        step: u8,
+    ) -> Result<Self, RegisterError> {
         use crate::intel_gpu_engine::Engine;
-        if (platform != GtPlatform::Battlemage && engines.contains(Engine::Bcs8))
-            || (!platform.is_discrete() && engines.compute().any(|e| e != Engine::Ccs0))
+        if (!platform.is_xe2() && engines.contains(Engine::Bcs8))
+            || (!platform.is_gen12() && engines.iter().any(|e| e.is_media()))
+            || (!platform.multiple_ccs() && engines.compute().any(|e| e != Engine::Ccs0))
         {
             return Err(RegisterError::Identity);
         }
@@ -59,12 +82,20 @@ impl EnginePolicy {
             GtPlatform::Gen12(_) if engines.compute().next().is_none() => Ok(Self {
                 engines,
                 gen12: true,
+                ptl: false,
+                lnl_pre_b0: false,
             }),
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
-            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => Ok(Self {
+            | GtPlatform::Integrated(
+                crate::intel_gpu::Generation::MeteorLake
+                | crate::intel_gpu::Generation::LunarLake
+                | crate::intel_gpu::Generation::PantherLake,
+            ) => Ok(Self {
                 engines,
                 gen12: false,
+                ptl: platform.is_ptl(),
+                lnl_pre_b0: platform.is_lnl() && step < 4,
             }),
             _ => Err(RegisterError::Identity),
         }
@@ -74,16 +105,22 @@ impl EnginePolicy {
         self.engines.iter().map(move |engine| Slots {
             base: engine.base(),
             allowed: if self.gen12 {
-                if engine.is_copy() {
-                    &[0x100223a8]
+                if engine.simple_ring() {
+                    &[]
                 } else {
                     &[0x10002349, 0x7010, 0x7018]
                 }
+            } else if self.ptl && engine == crate::intel_gpu_engine::Engine::Rcs0 {
+                &PTL_RCS
+            } else if self.lnl_pre_b0 && engine == crate::intel_gpu_engine::Engine::Rcs0 {
+                &LNL_A0
             } else if engine.is_copy() {
                 &[]
             } else {
                 &ALLOWED
             },
+            timestamp: (self.gen12 && engine.simple_ring())
+                .then_some(0x1000_0000 | (engine.base() + 0x3a8)),
         })
     }
 
@@ -107,8 +144,8 @@ impl EnginePolicy {
             verify_words(mmio, slots, |_| slots.nopid())?;
         }
         for slots in self.banks() {
-            for (slot, word) in slots.allowed.iter().enumerate() {
-                mmio.write32(slots.register(slot), *word);
+            for slot in 0..slots.allowed.len() + usize::from(slots.timestamp.is_some()) {
+                mmio.write32(slots.register(slot), slots.expected(slot));
             }
         }
         self.verify(mmio)
@@ -259,7 +296,6 @@ mod tests {
         for generation in [
             crate::intel_gpu::Generation::TigerLake,
             crate::intel_gpu::Generation::AlderLake,
-            crate::intel_gpu::Generation::PantherLake,
         ] {
             assert!(matches!(
                 EnginePolicy::new(GtPlatform::Integrated(generation), rcs_bcs()),

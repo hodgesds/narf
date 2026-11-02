@@ -134,7 +134,7 @@ fn query_wire(
                 u64::from(info.device_id) | u64::from(facts.revision) << 16,
             );
             let mut config_flags = 0;
-            if info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
+            if info.platform.is_xe2() && !info.platform.is_ptl() {
                 config_flags |= 8;
             }
             if info.vram.is_some() {
@@ -188,9 +188,13 @@ fn query_wire(
                 .filter(|t| t.platform() == info.platform)
                 .ok_or(FsError::NoDevice)?;
             let mut reply = Vec::new();
+            let width = if info.platform.is_ptl() { 12 } else { 4 };
             for (kind, mask) in [
-                (1u16, topology.geometry_dss().to_le_bytes().to_vec()),
-                (2, topology.compute_dss().to_le_bytes().to_vec()),
+                (
+                    1u16,
+                    topology.geometry_dss().to_le_bytes()[..width].to_vec(),
+                ),
+                (2, topology.compute_dss().to_le_bytes()[..width].to_vec()),
                 (
                     if topology.eu_type() == EuType::Simd16 {
                         5

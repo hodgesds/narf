@@ -499,7 +499,7 @@ fn smoke_parallel_matrix_untrusted_receipts_final_proof_and_close_require_reset(
                         (word(entry, 0), word(entry, 4), word(entry, 8)),
                         (id + lane as u32, id, lane as u32)
                     );
-                    assert_eq!(word(entry, 24), u32::from(placements.bits()));
+                    assert_eq!(word(entry, 24), placements.bits());
                     assert_eq!(word(entry, 40), if lane == 0 { 7 } else { 3 });
                     assert_eq!((word(entry, 48), word(entry, 56)), (3 * 4096, 2 * 4096));
                     assert_eq!(

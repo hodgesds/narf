@@ -109,6 +109,7 @@ fn smoke_xe_engine_cycles_live_owner_and_query_snapshot() -> TestResult {
                 Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3 => {
                     u64::from(upper ^ 2) << 32 | 0x0c0ffee0
                 }
+                _ => unreachable!("this fixture's platforms expose graphics engines"),
             };
             let mut payload = [0xa5; 40];
             payload[..6].fill(0);

@@ -770,7 +770,7 @@ fn smoke_i915_xe_exact_dispatch_discovery_sseu_and_wc_refusal() -> TestResult {
         assert_eq!(u64_at(&sseu, 8), 1);
         assert_eq!(
             u64_at(&sseu, 16),
-            u64::from((topology.geometry_dss() | topology.compute_dss()) & 255)
+            ((topology.geometry_dss() | topology.compute_dss()) & 255) as u64
         );
         let mut version = [0; 64];
         put64(&mut version, 16, 8);
@@ -911,3 +911,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_i915_balance",
     smoke_i915_native_vram_handle_keeps_placement_and_refuses_wb_compatibility
 );
+
+mod media {
+    include!("intel_gpu_i915_media_tests.rs");
+}
