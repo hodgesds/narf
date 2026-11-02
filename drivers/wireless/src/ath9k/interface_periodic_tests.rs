@@ -268,7 +268,10 @@ fn maintenance() -> Result<(), &'static str> {
     advance(&h, 30_000_000)?;
     let busy = h.model.registers.borrow()[&0x9860] & 2 != 0;
     check!(busy, "long calibration did not start actual NF measurement");
-    advance(&h, 30_000_100)?;
+    // Real PA calibration advances this same clock by37us before starting
+    // NF. Complete the actual measurement100us after that observed start,
+    // rather than63us later at a hardcoded absolute30_000_100 timestamp.
+    advance(&h, h.model.now.get() + 100)?;
     let control = h.model.registers.borrow()[&0x9864] & 511;
     let nf_idle = h.model.registers.borrow()[&0x9860] & 2 == 0;
     let trace = { h.model.periodic.borrow().trace.clone() };
@@ -283,13 +286,23 @@ fn maintenance() -> Result<(), &'static str> {
         "actual PA/median-load/maxCCA continuation incomplete"
     );
     advance(&h, 1_204_000_000)?;
-    advance(&h, 1_204_000_100)?;
+    advance(&h, h.model.now.get() + 100)?;
+    // The same deadline first retires IQ validity and runs the due long NF
+    // continuation. Its actual load receipt returns the owner toIdle; a
+    // subsequent real poll must start the newly invalid IQ list. Observe
+    // DO_CAL itself, without restoring redundant fixed full-drain loops.
+    for _ in 0..4 {
+        if h.model.registers.borrow()[&0x9920] & 0x10000 != 0 {
+            break;
+        }
+        h.device.drain();
+    }
     let restarted = h.model.registers.borrow()[&0x9920] & 0x10000 != 0;
     check!(
         restarted,
         "20-minute source validity reset did not start actual fresh IQ list"
     );
-    advance(&h, 1_204_000_200)?;
+    advance(&h, h.model.now.get() + 100)?;
     upload(
         &h,
         b"live station after periodic ANI PA NF and valid-list restart",

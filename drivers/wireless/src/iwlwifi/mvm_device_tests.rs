@@ -236,7 +236,9 @@ impl Actor {
             (1, 0x18) if b[17] == 2 => Some(5),
             (1, 0x18) if b[17] == 16 => Some(6),
             (1, 0x9f) if b[0] == 2 => Some(10),
-            (1, 0x9f) if b[0] == 0 => Some(11), // actual SET_LINK, not SET_DEVICE1
+            // AP uses SET_LINK0; active scan uses SET_DEVICE1. Both retain
+            // their actual distinct payloads and share the power-wait fault.
+            (1, 0x9f) if matches!(b[0], 0 | 1) => Some(11),
             (1, 0xd) => Some(12),
             (1, 0x91) => Some(15),
             (5, 0x16) if b[0] == 0 => Some(1),

@@ -110,7 +110,7 @@ mod tests {
         }
     }
     kernel_test_in!(
-        "drivers/wireless/iwlwifi/gen2",
+        "drivers/wireless/iwlwifi/gen2/ap",
         smoke_iwl_native_ap_api77_software_bip_has_real_mic_physical_owner_and_nonwrapping_ipn
     );
 }

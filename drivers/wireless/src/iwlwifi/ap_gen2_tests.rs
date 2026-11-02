@@ -260,6 +260,6 @@ fn smoke_iwl_native_ap_api77_closed_adapter_uses_status_phy_and_rfh48() -> TestR
     }
 }
 kernel_test_in!(
-    "drivers/wireless/iwlwifi/gen2",
+    "drivers/wireless/iwlwifi/gen2/ap",
     smoke_iwl_native_ap_api77_closed_adapter_uses_status_phy_and_rfh48
 );

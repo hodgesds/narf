@@ -195,14 +195,23 @@ impl Model {
                     reply[..2].copy_from_slice(&q.id.to_le_bytes());
                 }
             }
-            (5, 15) => require(
-                b.len() == 28
-                    && b[0] >= 2
-                    && self.peers.iter().any(|p| p.0 == b[0])
-                    && b[6] == 1
-                    && b[10..12] == [1, 0],
-                "API77 AP TLC4 exact client/legacy rate",
-            )?,
+            (5, 15) => {
+                require(b.len() == 28, "API77 AP TLC4 exact client/legacy rate")?;
+                let station = b[0];
+                // Actual NVM enables both TX antennas (mask3), independently
+                // of this non-HT peer's spatial streams. All four negotiated
+                // CCK rates1/2/5.5/11Mbps occupy non_ht_rates bits0..3;
+                // management TX chooses its own single rate separately.
+                let mut expected = [0; 28];
+                expected[0] = station;
+                expected[6] = 3;
+                expected[10] = 15;
+                expected[24..26].copy_from_slice(&4095u16.to_le_bytes());
+                require(
+                    station >= 2 && self.peers.iter().any(|p| p.0 == station) && b == expected,
+                    "API77 AP TLC4 exact client/legacy rate",
+                )?;
+            }
             (5, 0x18) => {
                 require(
                     b.len() == 80 && word(b, 4).count_ones() == 1,
@@ -1067,7 +1076,7 @@ fn smoke_iwl_native_ap_api77_original_netdev_power_peer_key_data_and_stop() -> T
     check(native)
 }
 kernel_test_in!(
-    "drivers/wireless/iwlwifi/gen2",
+    "drivers/wireless/iwlwifi/gen2/ap",
     smoke_iwl_native_ap_api77_original_netdev_power_peer_key_data_and_stop
 );
 fn smoke_iwl_native_ap_api77_held_power_original_source_policy_and_dropped_waiter_retire(
@@ -1075,6 +1084,6 @@ fn smoke_iwl_native_ap_api77_held_power_original_source_policy_and_dropped_waite
     check(held_source)
 }
 kernel_test_in!(
-    "drivers/wireless/iwlwifi/gen2",
+    "drivers/wireless/iwlwifi/gen2/ap",
     smoke_iwl_native_ap_api77_held_power_original_source_policy_and_dropped_waiter_retire
 );
