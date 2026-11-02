@@ -386,6 +386,7 @@ impl Grant {
     pub(super) fn ba_limit(&self) -> (i16, i16) {
         (self.antenna, self.ceiling)
     }
+    #[cfg(feature = "kernel-test")]
     pub(super) fn initial_calibration(&self) -> super::calibration::Report {
         self.wide
             .as_ref()
