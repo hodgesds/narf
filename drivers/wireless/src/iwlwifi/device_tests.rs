@@ -31,6 +31,7 @@ impl Fixture {
             mode: AtomicU32::new(2),
             mode_generation: AtomicU64::new(1),
             ap_capable: false,
+            go_capable: false,
             ap_host: ap::Host::new(),
             p2p: p2p::Host::new(),
             state: Mutex::new(State {

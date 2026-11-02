@@ -21,6 +21,7 @@ pub(super) struct Plan {
     pub rsn: Option<narf_wireless::rsn::RsnIe>,
     pub beacon: Vec<u8>,
     pub tim: usize,
+    pub go: Option<super::p2p_go::Identity>,
 }
 impl Plan {
     pub fn new(
@@ -47,6 +48,7 @@ impl Plan {
             || config.twt_responder
             || config.he_obss_pd.is_some()
             || config.he_bss_color.is_some()
+            || settings.p2p_go.is_some()
         {
             return Err("unsupported native AP geometry/optional service");
         }
@@ -230,7 +232,29 @@ impl Plan {
             rsn,
             beacon,
             tim,
+            go: None,
         })
+    }
+    /// GO is an actual P2P beacon/probe/rate contract, distinct from the
+    /// firmware GO8 value also used by ordinary AP3. This plan grants no RF.
+    pub fn new_go(
+        config: ApConfig,
+        settings: &ApStartSettings,
+        own: [u8; 6],
+    ) -> Result<Self, &'static str> {
+        let mut plan = Self::new(config, settings, own)?;
+        let identity = super::p2p_go::Identity::beacon(&plan.beacon[36..])?;
+        if !plan.secure() {
+            return Err("GO requires an actual protected group/key owner");
+        }
+        if plan.rates.supported & 15 != 0 || plan.rates.basic & 15 != 0 {
+            return Err("GO actual P2P beacon cannot advertise CCK rates");
+        }
+        if let Some(probe) = &plan.config.probe_resp {
+            identity.probe(&probe[36..])?;
+        }
+        plan.go = Some(identity);
+        Ok(plan)
     }
     pub fn secure(&self) -> bool {
         self.rsn.is_some()

@@ -44,6 +44,10 @@ pub(in crate::iwlwifi) enum Emission {
     /// Separate DEVICE discovery/negotiation: MAC1/PHY1/BCAST/TID16 and
     /// finite SESSION1, legacy20/no-CCK management, global SAR/device limit.
     P2pDevice,
+    /// Separate GO9 legacy20 OFDM program: current P2P DeviceID, physical
+    /// MAC/channel, autonomous beacon/TIM and native NoA/probe projection.
+    /// Ordinary tag7 AP and tag8 DEVICE qualifications cannot substitute.
+    P2pGo,
 }
 
 /// Emitting-feature bits of a tag5 program.
@@ -104,6 +108,7 @@ impl Emission {
             Emission::ActiveScan => 6,
             Emission::ApLegacy => 7,
             Emission::P2pDevice => 8,
+            Emission::P2pGo => 9,
         }
     }
     /// Feature bits granted by this program (tag3/4 imply their BA bits).
@@ -113,7 +118,8 @@ impl Emission {
             | Emission::Ht20
             | Emission::ActiveScan
             | Emission::ApLegacy
-            | Emission::P2pDevice => 0,
+            | Emission::P2pDevice
+            | Emission::P2pGo => 0,
             Emission::Ht20Ba => feature::BA,
             Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
             Emission::Features(bits) => bits,
@@ -211,6 +217,9 @@ impl Prepared {
     pub(in crate::iwlwifi) fn is_ap(&self) -> bool {
         self.emission == Emission::ApLegacy
     }
+    pub(in crate::iwlwifi) fn is_go(&self) -> bool {
+        self.emission == Emission::P2pGo
+    }
     pub(super) fn ap_source(
         &self,
     ) -> (
@@ -270,6 +279,7 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
         Emission::ActiveScan => "mvm-api77-active-scan-power-v6",
         Emission::ApLegacy => "mvm-api77-legacy20-ap-power-v7",
         Emission::P2pDevice => "mvm-api77-p2p-device-power-v8",
+        Emission::P2pGo => "mvm-api77-p2p-go-power-v9",
         Emission::Features(bits) => {
             features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
             &features
@@ -669,6 +679,9 @@ impl Owner {
             }
             Emission::P2pDevice => {
                 &b"NARF Intel MVM API77 qualified P2P DEVICE MAC1 PHY1 BCAST TID16 SESSION1 legacy20 OFDM6 management SET_CHAINS SET_DEVICE power v8"[..]
+            }
+            Emission::P2pGo => {
+                &b"NARF Intel MVM API77 qualified P2P GO9 MAC0 PHY0 OFDM-only legacy20 beacon TIM eight-client four-AC SME host-GTK-CCMP IGTK-CMAC exact-PN native-NoA probe program power v9"[..]
             }
         });
         if let Emission::Features(bits) = emission {

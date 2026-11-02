@@ -2421,6 +2421,18 @@ is the approved architecture (decision §8.3, 2026-10-23), not an interim
 step toward a userspace-daemon split; the daemon design described in
 earlier revisions of this specification is dropped.
 
+The optional `RadioControlAuthority::go_ap_control_for` view is limited to
+an actual original GO9 netdev, administrative UP and a retained reservation.
+An opted-in backend must serialize its AP and radio controls through the
+same actual native control domain. The view requires the original current
+receiver/admin/socket/registration and equal original radio/AP generations,
+then rechecks the AP view. It retains the same typed caps, source, target and
+reservation; it never rebinds an endpoint or captures fresh authority. Native
+GO FRAME/REGISTER_FRAME may delegate that view to the existing real AP owner,
+whose channel, role, key, callback-free emission and native TX/copy receipts
+remain mandatory. NO_CCK and matching IFINDEX/WDEV request forms keep their
+normal strict parser and original-source terminal checks.
+
 ## 4. Architecture: SoftMAC vs. FullMAC
 
 NARF supports both through the `WirelessIface` trait:

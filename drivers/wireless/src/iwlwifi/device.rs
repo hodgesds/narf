@@ -33,6 +33,7 @@ pub struct Device {
     mode: AtomicU32,
     mode_generation: AtomicU64,
     ap_capable: bool,
+    go_capable: bool,
     ap_host: ap::Host,
     p2p: p2p::Host,
     state: Mutex<State>,
@@ -277,6 +278,11 @@ impl Device {
         let irq_vector = hardware.irq_vector();
         let source = hardware.source_fence()?;
         let ap_capable = super::ap_session::supported(&hardware);
+        let go_capable = ap_capable
+            && matches!(
+                hardware.version(3, 0xfc).map(|version| version.1),
+                None | Some(1 | 99)
+            );
         Ok(Arc::new_cyclic(|me| Self {
             #[cfg(any(test, feature = "kernel-test"))]
             test_name: None,
@@ -286,6 +292,7 @@ impl Device {
             mode: AtomicU32::new(2),
             mode_generation: AtomicU64::new(1),
             ap_capable,
+            go_capable,
             ap_host: ap::Host::new(),
             p2p: p2p::Host::new(),
             state: Mutex::new(State {
@@ -530,7 +537,7 @@ impl Device {
             return Ok(());
         }
         self.p2p.stop_retained().await?;
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             let mut state = self.state.lock().await;
             self.stop_locked(&mut state).await;
             self.suspended.store(true, Ordering::Release);
@@ -1209,7 +1216,7 @@ impl Device {
             // callback, and drives physical beacon stop after revocation.
             let mut activity = super::iwl_msix::Activity::new(
                 self.irq_vector,
-                if self.current_iftype() == 3 || self.p2p.active() {
+                if matches!(self.current_iftype(), 3 | 9) || self.p2p.active() {
                     1
                 } else {
                     100
@@ -1456,7 +1463,14 @@ impl WirelessNetIface for Device {
         self.p2p_capable()
     }
     fn p2p_interface_types(&self) -> Vec<u32> {
-        alloc::vec![10]
+        let mut types = Vec::new();
+        if self.go_capable {
+            types.push(9);
+        }
+        if self.p2p_capable() {
+            types.push(10);
+        }
+        types
     }
     async fn new_control_interface_async(
         &self,
@@ -1494,6 +1508,18 @@ impl WirelessNetIface for Device {
     }
     fn supports_control_port_tx_status(&self) -> bool {
         self.ap_capable
+    }
+    fn supports_ap_key_sequence(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    async fn key_sequence_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        self.ap_key_sequence(authority, index, pairwise, peer)
     }
     fn supports_control_port_no_preauth(&self) -> bool {
         self.ap_capable
@@ -1659,8 +1685,40 @@ impl WirelessNetIface for Device {
     ) -> Result<(), WirelessError> {
         self.ap_register(authority, frame_type, prefix)
     }
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    fn async_p2p_netdev_management_rx_control(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        let original = authority.go_ap_control_for(self)?;
+        self.mgmt_tx_ap_async(&original, cookie, request).await
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        let original = authority.go_ap_control_for(self).map_err(|_| 1)?;
+        self.register_mgmt_frame_ap_async(&original, frame_type, prefix.to_vec())
+            .await
+            .map_err(|error| match error {
+                WirelessError::Busy => 16,
+                WirelessError::InvalidArgs => 22,
+                WirelessError::NotSupported => 95,
+                WirelessError::Denied => 1,
+                _ => 5,
+            })
+    }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             return core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire));
         }
         core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
@@ -1698,7 +1756,7 @@ impl WirelessNetIface for Device {
     }
 
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        if band_mhz == 6000 || self.current_iftype() == 3 {
+        if band_mhz == 6000 || matches!(self.current_iftype(), 3 | 9) {
             None
         } else {
             self.phy.capabilities(band_mhz)
@@ -1760,16 +1818,16 @@ impl WirelessNetIface for Device {
                 WirelessModes::STATION | WirelessModes::AP
             } else {
                 WirelessModes::STATION
-            }) | if self.p2p_capable() {
+            }) | if self.go_capable || self.p2p_capable() {
                 WirelessModes::P2P
             } else {
                 WirelessModes::empty()
             },
             hw_caps: HwCaps {
-                ht_supported: self.current_iftype() != 3 && self.phy.ht,
-                vht_supported: self.current_iftype() != 3 && self.phy.vht,
-                he_supported: self.current_iftype() != 3 && self.phy.he,
-                eht_supported: self.current_iftype() != 3 && self.phy.eht,
+                ht_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.ht,
+                vht_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.vht,
+                he_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.he,
+                eht_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.eht,
             },
         }
     }

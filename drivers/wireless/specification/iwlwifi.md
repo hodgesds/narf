@@ -2218,8 +2218,9 @@ describe the remaining native paths.
   Gen2/API77 MVM adapter is still required, so the literal family row stays
   open; P2P GO/discovery remains separately open.
 - **p2p.** §§3.73–3.75 implement a bounded actual control-device discovery
-  and unprotected management exchange for Sc/Bz/API89/API77. CLIENT/GO native
-  peer/key/data roles, NoA and public CTWindow/OPPPS remain open; this
+  and unprotected management exchange for Sc/Bz/API89/API77. §3.76 adds the
+  bounded GO9 peer/key/data and native NoA continuation with exact host group
+  PN reporting. CLIENT and native CTWindow/OPPPS remain open; this
   device-only continuation does not close the family row.
 - **wow.** There is no D3 firmware image, `D3_CONFIG_CMD` or WoWLAN key
   material path, although the shared `wowlan_support` exists.
@@ -4546,8 +4547,9 @@ START despite ACK, dropped waiters, wrong raw bands/links, reentrant source
 retirement, protected-frame rejection, original parent-role exclusion and
 host NO_IR. This bounded source remains pending coordinated release checking,
 native execution and review. §§3.74–3.75 supply the disjoint API89/API77
-SESSION adapters. CLIENT/GO native peer/key/data owners, NoA, CTWindow/OPPPS
-and remaining whole-family scope are still open; this continuation does not
+SESSION adapters. §3.76 adds the bounded native GO9/NoA/group-PN owner;
+CLIENT, native CTWindow/OPPPS and remaining whole-family scope are still open;
+this continuation does not
 close the literal P2P row.
 
 ### 3.74 API89 P2P SESSION2 physical adapter
@@ -4558,7 +4560,8 @@ fences from §3.73. Admission selects the loaded MAC2/LINK2/PHY4/RLC2/TX10,
 SESSION2/notification3 and capability54 contracts, factual station/link counts
 and actual API59 band-in-RFH support. API89 ROCv3 is Linux's hotspot path; it
 is never substituted for a P2P AUX grant. The disjoint API77 SESSION1 adapter
-is described in §3.75; CLIENT/GO and their power-save scope remain open.
+is described in §3.75. §3.76 adds bounded GO9; CLIENT and remaining native
+power-save scope stay separate.
 
 START creates actual MAC1/type6 and inactive FW-link1. Before each SESSION2
 ADD, current raw NVM/MCC/host ACTIVE permission, platform SAR and the actual
@@ -4608,7 +4611,8 @@ private concrete parent enum dispatches only to admitted Device/MvmDevice
 owners; no proxy netdev, invented IFINDEX/UP state, extra grant or unknown
 provider is introduced. Original parent/admin/daemon/socket/child capabilities
 and exact registration/role epochs remain independently current. The full
-P2P row stays open for CLIENT/GO, NoA, CTWindow and OPPPS.
+P2P row stays open. §3.76 supplies bounded GO9/NoA; CLIENT and applicable
+native CTWindow/OPPPS need separate source-complete owners.
 
 Admission retains actual capability54, MAC1/LINK1/SESSION1/notification2,
 legacy PHY1-or2/ADD_STA12/REMOVE_STA2/TX9/RX4/TVQM3/flush2 and sync1 facts,
@@ -4671,3 +4675,109 @@ produce SESSION, TX, READY or management delivery. RAM fixtures author native
 identity/SMBIOS through the existing parsers, create no physical qualification
 and retain uncertain model ownership on failure. This continuation is
 pending coordinated release compilation, native execution and review.
+
+
+### 3.76 Bounded native P2P GO9 and exact group transmit sequence
+
+The actual original netdev may select GO9 while administratively DOWN and
+without an active station, AP, scheduled scan or DEVICE activity. Existing
+AP3 and ordinary station identities retain their source/epoch contracts.
+The source-qualified AP consumer plus the actual fixed/v1 NoA notification
+consumer admits the GO subset; a firmware GO8 enum alone does not.
+Advertisement includes9 only for that implemented native owner and never
+adds CLIENT8. The independent DEVICE10 subset is still qualified by its
+own actual ROC/SESSION/resource facts. One active physical data role is
+supported; this continuation creates no proxy netdev or simultaneous GO/STA.
+GO remains a protected legacy20 group, with no CCK rates and no advertised
+HT/VHT/HE/EHT,6GHz,DFS/CSA or extra autonomous services in this role.
+
+START validates the actual P2P capability/GO bit and Device-ID in the beacon,
+and corresponding Device-Info in a supplied probe template, including bounded
+fragmented vendor attributes. The P2P Device Address may differ from the
+physical interface MAC; it never aliases native MAC0, FW-link0, physical
+station/key identities or DATA AAD. Current actual NVM/MCC ACTIVE/non-radar
+permissions, host initiation/power and NO_P2P prohibitions precede emission.
+The native GO software program retains a distinct own-MAC/P2P-Device-ID/
+channel/OFDM/NoA/host-group-crypto binding through every publication. Old AP
+proofs, cached channel numbers and enum/API discovery supply no GO authority.
+
+API77 additionally requires a distinct signed NIPW tag9 record. The
+`gen2_go_transmit_power_request(device_address, frequency_mhz)` metadata API
+retains original PCI/subsystem/RF, firmware, NVM antenna and SMBIOS facts,
+then binds the actual physical MAC, proposed P2P Device Address, channel and
+exact GO/NoA/host-CCMP/CMAC program. Tag7 ordinary-AP and tag8 DEVICE records
+cannot qualify it. The loader runs outside State and Work; native preparation
+reconstructs the same binding and checks the original current record/caps.
+Current chain/device power receipts and the supplied measured limits remain
+mandatory. Metadata produces no measurement, key, role or RF grant.
+
+After old MAC removal and a real closed all-owned-RFH prefix, preparation
+installs a fresh observational GO capture before publishing the new MAC ADD.
+Hardware retains that exact original object before draining RFH, so a native
+NoA copied before the MAC ADD acknowledgement is preserved. It grants no
+emission permission until complete MAC/PHY/link/internal-station preparation
+opens that same receive generation and marks the capture ready. Only a
+fallback0 PROBE_RESPONSE_DATA(03:fc) receipt naming physical MAC0 may replace
+its NoA; wrong MAC/ring copies never qualify. Notification version
+comes from the notification byte: core103 records99/1, while Linux MVM's
+fixed44-byte RX handler consumes v1 even when the older image omits its TLV.
+Unknown99 follows Linux's caller-provided v1 fallback. Both local Linux7.3-rc4
+and rc7 retain this layout. One/two actual descriptors are copied without the
+native alignment byte. A fresh START clears predecessor NoA. This control
+capture is independent of transient DATA/key receive epochs, so a peer/key
+prefix change cannot discard the still-current GO's scheduling receipt.
+
+The final ordinary and asynchronous AP send boundaries retain the original
+GO proof, bounded-drain the already-completed fallback prefix after any
+TX-credit wait, and then project a probe response. A moving prefix refuses
+publication. The physical header and validated protocol identity stay bound;
+host-supplied NoA attributes are removed and only the current native receipt
+is appended. A native clear removes the old NoA. Other management/DATA bytes
+keep their existing format. Actual DIRECT- wildcard P2P requests may use the
+configured probe template, with Device-ID filtering; source callbacks run
+after native locks are released. No host NoA bytes authorize a native schedule.
+
+Actual GO9 opts the two public native management directions in. FRAME and
+REGISTER_FRAME accept real IFINDEX and matching IFINDEX/WDEV forms, including
+NO_CCK FRAME. The original reserved Radio request is checked as GO9/UP with
+equal AP/radio generation and viewed by the existing AP owner without source
+rebinding; both frontends share their actual control serialization gate.
+Original source/role/registration, native queue/NoA/OFDM and final reply/copy
+checks remain in that retained owner. Unreserved views refuse.
+
+GO's installed GTK uses host CCMP and its IGTK uses host CMAC, preserving the
+actual native peer/port, native flush/RFH transition and key-history owner.
+No firmware group-key receipt is invented for these host keys. Native
+transmission explicitly disables firmware encryption, carries genuine
+protected CCMP or BIP bytes and retains the original physical queue/source.
+Checksum-PARTIAL is completed in software before group encryption. Counters
+reserve before publication and include consumed unsent PN/IPN; same-key
+reinstall preserves/raises the existing floor and deletion erases the key
+without allowing retired material to restart its nonce space.
+
+In actual GO9, `supports_ap_key_sequence` and `key_sequence_ap_async` implement
+the shared original-authority GET_KEY path for installed host GTK/IGTK.
+The result contains the exact48-bit transmit counter and cipher, with no key
+bytes or receive replay counter. Firmware-owned PTK sequence queries remain
+unsupported. The native getter checks the original concrete provider receipt,
+current device/firmware/power policy, role and exact installed key under State;
+full source checks and reply delivery occur outside State. Deleted-key,
+revoked/rebound source, DOWN/UP and role-generation changes cannot return an
+old key's sequence. Ordinary AP3 keeps its existing getter opt-out.
+
+Four unexecuted native cases cover Sc,API89 Ty/SoCdb/Ma and Bz FM/WH plus the
+original API77 owner: actual GO9/OFDM peer/key/data flow, repeated receive PN,
+initial NoA before the MAC ADD acknowledgement, more-than64 completed RFH
+records before an update, foreign-MAC/clear and host-NoA rejection, adjacent
+NO_P2P boundaries versus a true1MHz overlap, exact consumed-unsent GTK/IGTK
+counters, real independent
+CCMP/CMAC verification, UDP checksum completion, actual deferred GET_KEY with
+no key bytes, deleted/replaced-key floors and current source/NO_P2P refusal.
+Both native ABI paths exercise raw FRAME/REGISTER with NO_CCK and original
+IFINDEX-only/matching-WDEV selectors, plus unreserved-view denial.
+The API77 cases also reject the old tag7 record before native promotion.
+This milestone awaits coordinated release compilation and native execution;
+it does not close the full P2P row. CLIENT ownership remains separate. Native
+CTWindow/OPPPS controls stay unadvertised: admitted new MAC_CONFIG1/2/3 have no
+GO PS producer in the pinned Linux path, and legacy MAC_CONTEXT GO fields may
+not be transplanted into a new-MAC adapter.

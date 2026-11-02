@@ -43,9 +43,43 @@ impl Device {
         self.source.invoke(|| Ok(())).map_err(|_| 1)?;
         self.ap_host.stage_early(self, authority, operation)
     }
+    pub(super) fn ap_key_sequence(
+        &self,
+        authority: &ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        if self.current_iftype() != 9 || !authority.has_reservation() {
+            return Err(95);
+        }
+        let permit = authority.native_emission_for(self).map_err(|_| 95)?;
+        let result = {
+            let state = self.state.try_lock().ok_or(16)?;
+            if !permit.current() {
+                return Err(1);
+            }
+            let session = state.ap.as_ref().ok_or(2)?;
+            state
+                .hardware
+                .source_fence()
+                .map_err(|_| 1)?
+                .invoke(|| Ok(session.key_sequence(index, pairwise, peer)))
+                .map_err(|_| 1)?
+        };
+        authority.check_for(self).map_err(|_| 1)?;
+        result
+    }
     pub(super) fn ap_set_mode(&self, mode: u32) -> Result<(), WirelessError> {
-        if !matches!(mode, 2 | 3) || mode == 3 && !self.ap_capable {
+        if !matches!(mode, 2 | 3 | 9)
+            || mode == 3 && !self.ap_capable
+            || mode == 9 && !self.go_capable
+        {
             return Err(WirelessError::NotSupported);
+        }
+        if self.p2p.active() {
+            return Err(WirelessError::Busy);
         }
         let _lease = self.radio_control.try_reserve()?;
         // Full metadata/control queries stay outside the native State lock.
@@ -104,7 +138,7 @@ impl Device {
             let old = self.ap_host.waker.lock().replace(waker.clone());
             drop(old);
         }
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             self.prune_ap_early();
         }
         let owner = self.ap_host.active.lock().clone();
@@ -168,7 +202,7 @@ impl Device {
         prefix: Vec<u8>,
     ) -> Result<(), WirelessError> {
         authority.check_for(self)?;
-        if self.current_iftype() != 3
+        if !matches!(self.current_iftype(), 3 | 9)
             || !authority.has_reservation()
             || frame_type & !0x00f0 != 0
             || prefix.len() > 256
@@ -203,7 +237,10 @@ impl Device {
         operation: Operation,
     ) -> Result<bool, i32> {
         authority.check_for(self).map_err(|_| 1)?;
-        if self.current_iftype() != 3 || !self.ap_capable || !authority.has_reservation() {
+        if !matches!(self.current_iftype(), 3 | 9)
+            || !self.ap_capable
+            || !authority.has_reservation()
+        {
             return Err(95);
         }
         let mut operation = Some(operation);
@@ -232,16 +269,23 @@ impl Device {
             }))
         };
         let start = if let Operation::Start(config, settings) = &operation {
-            let plan =
+            let plan = if self.current_iftype() == 9 {
+                super::super::ap_wire::Plan::new_go(config.as_ref().clone(), settings, self.mac)
+            } else {
                 super::super::ap_wire::Plan::new(config.as_ref().clone(), settings, self.mac)
-                    .map_err(|_| 22)?;
+            }
+            .map_err(|_| 22)?;
             early.as_ref().unwrap().validate(&plan).map_err(|_| 22)?;
             if !self.channels.contains(&plan.channel.number) {
                 return Err(22);
             }
             let iface: Arc<dyn WirelessNetIface> = device.clone();
             let emission = request.as_ref().unwrap().authority.clone();
-            if !emission.matches_role(self, 3, self.ap_control_generation().ok_or(1)?) {
+            if !emission.matches_role(
+                self,
+                self.current_iftype(),
+                self.ap_control_generation().ok_or(1)?,
+            ) {
                 return Err(1);
             }
             let proof = super::super::ap_owner::Owner::new(

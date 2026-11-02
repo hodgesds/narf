@@ -366,6 +366,9 @@ impl Wire {
         }
         if let Some(ap) = &mut self.native_ap {
             if let Some(response) = ap.command(group, cmd, version, body)? {
+                if let Some(noa) = ap.take_initial_noa() {
+                    self.firmware.inject(0xfc, 3, 0x8000, &noa);
+                }
                 if ap.hold == Some((group, cmd)) {
                     ap.held = Some(response);
                     self.held = Some((cmd, if group == 1 { 0 } else { group }, sequence));
@@ -1843,6 +1846,11 @@ impl Guard {
         });
         let source = state.hardware.source_fence()?;
         let ap_capable = super::super::ap_session::supported(&state.hardware);
+        let go_capable = ap_capable
+            && matches!(
+                state.hardware.version(3, 0xfc).map(|version| version.1),
+                None | Some(1 | 99)
+            );
         let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
         policy_db.install(if six.is_some() {
             six_ghz_tests::policy()
@@ -1861,6 +1869,7 @@ impl Guard {
             mode: AtomicU32::new(2),
             mode_generation: AtomicU64::new(1),
             ap_capable,
+            go_capable,
             ap_host: ap::Host::new(),
             p2p: p2p::Host::new(),
             state: Mutex::new(state),

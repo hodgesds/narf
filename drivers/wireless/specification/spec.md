@@ -490,7 +490,7 @@ remain separate; operating reset, runtime sleep and system suspend stay open.
 
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE/SESSION1/SESSION2 is implemented pending validation; the family P2P row stays open |
+| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE/SESSION1/SESSION2 and legacy20 GO9/NoA are implemented pending validation; CLIENT and native PS keep the family P2P row open |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
 | ath10k | 8 | Contiguous VHT160, alternate calibration sources, hardware keys, AP/P2P, DFS, credential replay and wake offload; host-bus PM, bounded PFC, signed indoor admission and native Beacon hints are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
@@ -1324,16 +1324,23 @@ physical queue and terminal remains independently bound. Family §3 is normative
 
 Intel Sc/Bz exposes a bounded real control DEVICE with no IFINDEX, UP bit or
 fabricated data endpoint. Original parent, Write/Admin/daemon and native owner
-receipts govern its public ROC/management lifecycle. This partial milestone
-does not advertise unimplemented CLIENT/GO or P2P power-save roles. API89
-Ty/So/Ma uses actual PHY1/RLC/link1/broadcast-TID16 SESSION2 receipts. The
-original API77 MVM parent additionally uses separate physical MAC1/PHY1,
-legacy broadcast/TID16 and SESSION1, with distinct signed tag8 qualification
-for the actual child/channel/global-power program and retained PM cleanup.
-Both adapters check an already-completed RFH prefix and the original finite
-Frame Publication after credit waits before actual packet publication. Family
-§3.73–3.75 records the partial scope; nine cases are written, two newly added
-and unexecuted. Release metadata checks pass; full batch acceptance is pending.
+receipts govern its public ROC/management lifecycle. API89 Ty/So/Ma uses actual
+PHY1/RLC/link1/broadcast-TID16 SESSION2 receipts; original API77 uses its physical
+MAC1/PHY1, legacy broadcast/TID16 and SESSION1 with distinct signed tag8 purpose.
+Both check the completed RFH prefix and original finite Frame Publication after
+credit waits before actual packet publication.
+
+The bounded GO9 continuation uses the retained AP/peer/key/data owner with
+OFDM-only legacy20 rates and distinct native power/role receipts. API77 GO
+requires its separate tag9 qualification. The original preparing GO capture
+retains real NoA received during MAC ADD waits; probe projection requires the
+same completed native prefix and open epoch. Actual software GTK/IGTK counters
+supply sequence-only GET_KEY. Public FRAME/REGISTER retains the original GO
+radio request/reservation through the same native AP owner, including WDEV and
+NO_CCK forms. Family §3.73–3.76 records the partial scope. Thirteen native cases
+are written, four new GO cases unexecuted. One release metadata context and
+scoped formatting pass; full batch acceptance remains pending. CLIENT and
+applicable native P2P power-save controls remain open.
 
 ### 3.6 Native observations and thermal maintenance (validation pending)
 

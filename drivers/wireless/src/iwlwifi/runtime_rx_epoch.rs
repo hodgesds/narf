@@ -67,6 +67,16 @@ impl Hardware {
     pub(in crate::iwlwifi) fn receive_capture_epoch(&self) -> Option<u64> {
         self.rx_epoch.capture()
     }
+    /// A real completed prefix for this still-closed current generation.
+    /// This is denial metadata, never permission to open or publish copies.
+    pub(in crate::iwlwifi) fn closed_proved_receive_epoch(&self) -> Option<u64> {
+        self.rx_epoch.proved.filter(|epoch| {
+            !self.failed
+                && !self.rx_epoch.open.load(Ordering::Acquire)
+                && self.rx_epoch.pending.is_none()
+                && self.rx_epoch.generation.load(Ordering::Acquire) == *epoch
+        })
+    }
     pub(in crate::iwlwifi) fn receive_publication(&self) -> Option<Publication> {
         self.rx_epoch.capture().map(|epoch| Publication {
             generation: self.rx_epoch.generation.clone(),

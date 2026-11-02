@@ -44,6 +44,7 @@ pub(super) struct Session {
     sequence: u16,
     groups: Vec<Key>,
     bip: Vec<bip::Key>,
+    go_gtk: Vec<super::p2p_go_key::Gtk>,
     latest_gtk: Option<u8>,
     latest_igtk: Option<u8>,
     default_gtk: Option<u8>,
@@ -107,6 +108,11 @@ impl Session {
             hw.rf_policy_validity()?,
         )?
         .with_ap()?;
+        let program = if let Some(go) = plan.go {
+            program.with_go(go.binding(own, plan.channel))?
+        } else {
+            program
+        };
         hw.install_rf_policy(super::mld_policy::Authority::Station(
             policy.bind(program.clone())?,
         ))?;
@@ -143,6 +149,13 @@ impl Session {
         )
         .await?;
         command(hw, 3, 8, &super::station_api::mac(3, own, None)).await?;
+        if let Some(identity) = plan.go {
+            // This is a real old-role cutoff, not an empty software queue.
+            // Capture the exact pending GO before publishing its new MAC so
+            // NoA copied during the ADD ACK wait cannot be lost or backfilled.
+            retire_epoch(hw, &[], own, plan.channel).await?;
+            hw.begin_go_capture(identity, own, proof.clone())?;
+        }
         command(hw, 3, 8, &ap_wire::mac(1, own, false)).await?;
         command(
             hw,
@@ -174,6 +187,9 @@ impl Session {
         hw.ap_peer(&ap_wire::internal(ap_wire::BCAST, 1)).await?;
         let bcast = hw.allocate_tx(ap_wire::BCAST, 15).await?;
         open_epoch(hw, epoch, &[], own, plan.channel).await?;
+        if plan.go.is_some() {
+            hw.finish_go_capture()?;
+        }
         proof.check()?;
         hw.source_fence()?.invoke(|| Ok(()))?;
         Ok(Self {
@@ -191,6 +207,7 @@ impl Session {
             sequence: 0,
             groups: Vec::new(),
             bip: Vec::new(),
+            go_gtk: Vec::new(),
             latest_gtk: None,
             latest_igtk: None,
             default_gtk: None,
@@ -232,7 +249,14 @@ impl Session {
         if let Some(probe) = probe {
             config.probe_resp = Some(probe);
         }
-        let plan = Plan::new(config, &self.settings, self.own)?;
+        let plan = if self.plan.go.is_some() {
+            Plan::new_go(config, &self.settings, self.own)?
+        } else {
+            Plan::new(config, &self.settings, self.own)?
+        };
+        if plan.go != self.plan.go {
+            return Err("GO device identity change needs a fresh native role owner");
+        }
         if plan.rsn != self.plan.rsn
             || plan.channel != self.plan.channel
             || plan.rates.basic != self.plan.rates.basic
@@ -250,10 +274,22 @@ impl Session {
     pub fn current(&self) -> Result<(), &'static str> {
         self.proof.check()?;
         self.program.emission_ready()?;
+        if self.program.go_binding()
+            != self
+                .plan
+                .go
+                .map(|go| go.binding(self.own, self.plan.channel))
+        {
+            return Err("AP/GO native program differs from original physical role");
+        }
         // The retained actual record and native power receipt owner lives
         // with this Session; its current cap/host ceiling is in Program.
         if let Some(qualification) = &self.qualification {
-            if !qualification.is_ap() {
+            if if self.plan.go.is_some() {
+                !qualification.is_go()
+            } else {
+                !qualification.is_ap()
+            } {
                 return Err("AP session inherited another emitting qualification");
             }
         }
@@ -278,7 +314,9 @@ impl Session {
                     matches!(id, 4 | 5)
                         && (!key.software || self.bip.iter().any(|key| key.id() == id))
                 } else {
-                    id <= 3 && !key.software
+                    id <= 3
+                        && (!key.software
+                            || self.plan.go.is_some() && self.go_gtk.iter().any(|gtk| gtk.id == id))
                 }
         })
     }
@@ -528,6 +566,15 @@ impl Session {
                 .copied()
         });
         if old.is_some_and(|k| k.digest == digest) {
+            if self.plan.go.is_some() && peer.is_none() {
+                if igtk {
+                    if let Some(key) = self.bip.iter_mut().find(|key| key.id() == p.idx) {
+                        key.raise_floor(floor);
+                    }
+                } else if let Some(key) = self.go_gtk.iter_mut().find(|key| key.id == p.idx) {
+                    key.raise_floor(floor);
+                }
+            }
             if let Some(i) = peer {
                 for pn in &mut self.peers[i].pn {
                     *pn = (*pn).max(floor);
@@ -559,12 +606,27 @@ impl Session {
         let flags = u32::from_le_bytes(body[12..16].try_into().unwrap()) & !8; // AP group is TX, never station NO_TX.
         put32(&mut body[..], 12, flags);
         put64(&mut body[..], 72, 0);
-        let software = igtk && hw.ap_software_bip();
-        let bip = if software {
+        let host_gtk = self.plan.go.is_some() && peer.is_none() && !igtk;
+        let software = peer.is_none() && (self.plan.go.is_some() || igtk && hw.ap_software_bip());
+        let gtk = if host_gtk {
+            Some(super::p2p_go_key::Gtk::new(
+                p.idx, *material, self.own, floor,
+            )?)
+        } else {
+            None
+        };
+        let bip = if software && igtk {
             // Linux chooses host CMAC on this actual capability profile.
             // The exact native flush/RX/source prefix still owns transition;
             // no fabricated empty SEC_KEY receipt promotes a host IGTK.
-            Some(bip::Key::new(p.idx, *material)?)
+            let key = bip::Key::new(p.idx, *material)?;
+            Some(if self.plan.go.is_some() {
+                key.with_floor(floor)?
+            } else {
+                key
+            })
+        } else if host_gtk {
+            None
         } else {
             command(hw, 5, 0x18, &body[..]).await?;
             None
@@ -586,6 +648,10 @@ impl Session {
             self.peers[i].authorized = authorized;
         } else {
             self.bip.retain(|key| key.id() != p.idx);
+            self.go_gtk.retain(|key| key.id != p.idx);
+            if let Some(key) = gtk {
+                self.go_gtk.push(key);
+            }
             if let Some(key) = bip {
                 self.bip.push(key);
             }
@@ -649,6 +715,7 @@ impl Session {
             hw.ap_flush_station(key.station).await?;
             remove_key(hw, key).await?;
             self.bip.retain(|key| key.id() != id);
+            self.go_gtk.retain(|key| key.id != id);
             if self.default_gtk == Some(id) {
                 self.default_gtk = None;
             }
@@ -663,6 +730,67 @@ impl Session {
             }
         }
         open_epoch(hw, self.epoch, &self.peers, self.own, self.plan.channel).await
+    }
+    pub(in crate::iwlwifi) fn protect_go_group(
+        &mut self,
+        frame: &mut Vec<u8>,
+        header: usize,
+    ) -> Result<(), &'static str> {
+        self.current()?;
+        if self.plan.go.is_none()
+            || !self.peers.iter().any(|peer| peer.authorized)
+            || !self.default_installed(false)
+        {
+            return Err("GO host group has no current key/port owner");
+        }
+        let id = self.default_gtk.ok_or("GO host GTK default absent")?;
+        self.go_gtk
+            .iter_mut()
+            .find(|key| key.id == id)
+            .ok_or("GO host GTK owner absent")?
+            .protect(frame, header)
+    }
+    pub(in crate::iwlwifi) fn protect_host_bip(
+        &mut self,
+        frame: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        self.current()?;
+        if !self.default_installed(true) {
+            return Err("AP host IGTK default owner absent");
+        }
+        let id = self.default_igtk.ok_or("AP host IGTK default absent")?;
+        self.bip
+            .iter_mut()
+            .find(|key| key.id() == id)
+            .ok_or("AP host BIP key absent")?
+            .protect(frame, self.own)
+    }
+    pub fn key_sequence(
+        &self,
+        id: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        self.current().map_err(|_| 1)?;
+        if self.plan.go.is_none() || pairwise || peer.is_some() {
+            return Err(95);
+        }
+        if !self.groups.iter().any(|key| key.id == id && key.software) {
+            return Err(2);
+        }
+        if id <= 3 {
+            let gtk = self.go_gtk.iter().find(|key| key.id == id).ok_or(2)?;
+            Ok(narf_wireless::KeySequence {
+                cipher: narf_wireless::CIPHER_SUITE_CCMP,
+                seq: gtk.sequence(),
+            })
+        } else {
+            let igtk = self.bip.iter().find(|key| key.id() == id).ok_or(2)?;
+            Ok(narf_wireless::KeySequence {
+                cipher: narf_wireless::CIPHER_SUITE_AES_CMAC,
+                seq: igtk.sequence(),
+            })
+        }
     }
     pub fn default_key(
         &mut self,
@@ -778,6 +906,15 @@ async fn open_epoch(
     own: [u8; 6],
     channel: super::native_band::Channel,
 ) -> Result<(), &'static str> {
+    retire_epoch(hw, peers, own, channel).await?;
+    hw.commit_receive_epoch(epoch)
+}
+async fn retire_epoch(
+    hw: &mut Hardware,
+    peers: &[Peer],
+    own: [u8; 6],
+    channel: super::native_band::Channel,
+) -> Result<(), &'static str> {
     for packet in hw.synchronize_receive_epoch().await? {
         if packet.receive_queue != 0 || packet.header.group_id != 0 || packet.header.cmd != 0xc1 {
             continue;
@@ -830,7 +967,7 @@ async fn open_epoch(
             "AP authenticated peer loss crossed native key/port prefix; retire before publication",
         );
     }
-    hw.commit_receive_epoch(epoch)
+    Ok(())
 }
 
 #[path = "ap_packet.rs"]

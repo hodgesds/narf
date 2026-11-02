@@ -10,6 +10,19 @@ impl Key {
             .map(Self)
             .map_err(|_| "AP software BIP key ID invalid")
     }
+    pub fn with_floor(mut self, floor: u64) -> Result<Self, &'static str> {
+        if floor >= (1u64 << 48) {
+            return Err("AP host BIP initial IPN exceeds48bits");
+        }
+        self.0.tx_pn = floor;
+        Ok(self)
+    }
+    pub fn sequence(&self) -> [u8; 6] {
+        self.0.tx_pn.to_le_bytes()[..6].try_into().unwrap()
+    }
+    pub fn raise_floor(&mut self, floor: u64) {
+        self.0.tx_pn = self.0.tx_pn.max(floor);
+    }
     pub fn id(&self) -> u8 {
         self.0.key_id as u8
     }

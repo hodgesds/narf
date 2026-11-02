@@ -53,24 +53,32 @@ pub(super) struct Transaction {
 #[derive(Clone)]
 enum MvmPower {
     Ap(Arc<super::mvm_boot::ApPower>),
+    Go(Arc<super::mvm_boot::ApPower>),
     P2p(Arc<super::mvm_boot::P2pPower>),
 }
 impl MvmPower {
     fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
         match self {
-            Self::Ap(power) => power.check(domain),
+            Self::Ap(power) => {
+                power.check_role(false)?;
+                power.check(domain)
+            }
+            Self::Go(power) => {
+                power.check_role(true)?;
+                power.check(domain)
+            }
             Self::P2p(power) => power.check(domain),
         }
     }
     fn ready(&self) -> Result<(), &'static str> {
         match self {
-            Self::Ap(power) => power.ready(),
+            Self::Ap(power) | Self::Go(power) => power.ready(),
             Self::P2p(power) => power.ready(),
         }
     }
     fn radiated_dbm(&self) -> Result<i8, &'static str> {
         match self {
-            Self::Ap(power) => power.radiated_dbm(),
+            Self::Ap(power) | Self::Go(power) => power.radiated_dbm(),
             Self::P2p(power) => power.radiated_dbm(),
         }
     }
@@ -82,6 +90,15 @@ impl Transaction {
     ) -> Result<Self, &'static str> {
         power.check(&self.initial)?;
         self.mvm_ap = Some(MvmPower::Ap(power));
+        Ok(self)
+    }
+    pub fn with_mvm_go(
+        mut self,
+        power: Arc<super::mvm_boot::ApPower>,
+    ) -> Result<Self, &'static str> {
+        power.check_role(true)?;
+        power.check(&self.initial)?;
+        self.mvm_ap = Some(MvmPower::Go(power));
         Ok(self)
     }
     pub fn with_mvm_p2p(
@@ -228,6 +245,7 @@ pub(super) struct Program {
     band: super::native_band::Band,
     six: Option<(narf_wireless::reg::PowerType6Ghz, u32)>,
     ap: bool,
+    go: Option<Arc<[u8; 32]>>,
     mvm_ap: Option<(MvmPower, bool)>,
 }
 impl Program {
@@ -258,6 +276,7 @@ impl Program {
                 .band,
             six: None,
             ap: false,
+            go: None,
             mvm_ap: None,
         };
         program.check(domain)?;
@@ -287,6 +306,7 @@ impl Program {
             band: channel.band,
             six: Some((profile.power_type(), profile.nvm_flags)),
             ap: false,
+            go: None,
             mvm_ap: None,
         };
         program.check(domain)?;
@@ -300,6 +320,14 @@ impl Program {
         }
         self.ap = true;
         Ok(self)
+    }
+    pub fn with_go(mut self, binding: [u8; 32]) -> Result<Self, &'static str> {
+        self = self.with_ap()?;
+        self.go = Some(Arc::new(binding));
+        Ok(self)
+    }
+    pub fn go_binding(&self) -> Option<[u8; 32]> {
+        self.go.as_ref().map(|value| **value)
     }
     pub fn new_mvm_ap(
         domain: &RegulatoryDomain,
@@ -317,6 +345,27 @@ impl Program {
             ibss,
             validity,
         )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_mvm_go(
+        domain: &RegulatoryDomain,
+        firmware: super::mld_regulatory::Mcc,
+        primary: u8,
+        power: Arc<super::mvm_boot::ApPower>,
+        ibss: bool,
+        validity: Validity,
+        binding: [u8; 32],
+    ) -> Result<Self, &'static str> {
+        power.check_role(true)?;
+        Self::new_mvm_initiator(
+            domain,
+            firmware,
+            primary,
+            MvmPower::Go(power),
+            ibss,
+            validity,
+        )?
+        .with_go(binding)
     }
     pub fn new_mvm_p2p(
         domain: &RegulatoryDomain,
@@ -359,6 +408,7 @@ impl Program {
                 .band,
             six: None,
             ap: true,
+            go: None,
             mvm_ap: Some((power, ibss)),
         };
         program.check(domain)?;
@@ -397,6 +447,17 @@ impl Program {
         domain: &RegulatoryDomain,
         firmware: &super::mld_regulatory::Mcc,
     ) -> Option<i8> {
+        if self.go.is_some()
+            && !super::p2p_go::host_allows(
+                domain,
+                super::native_band::Channel {
+                    band: self.band,
+                    number: self.primary,
+                },
+            )
+        {
+            return None;
+        }
         if self.ap {
             if let Some((_, ibss)) = &self.mvm_ap {
                 let flags = *firmware

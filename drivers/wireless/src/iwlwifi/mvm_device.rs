@@ -171,6 +171,7 @@ pub(super) struct Device {
     mode: AtomicU32,
     mode_generation: AtomicU64,
     ap_capable: bool,
+    go_capable: bool,
     p2p_capable: bool,
     p2p: super::device::p2p::Host,
     ap_host: super::ap_host::Host,
@@ -259,6 +260,28 @@ impl Device {
                 .transmit_power_request_for(super::mvm_boot::PowerEmission::ApLegacy)
         })
     }
+    /// Exact proposed GO9 metadata; no native role or power receipt is made.
+    pub(super) async fn go_power_request(
+        &self,
+        device: [u8; 6],
+        frequency_mhz: u32,
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        if device == [0; 6] || device[0] & 1 != 0 {
+            return Err("GO P2P device address invalid");
+        }
+        let channel = (1..=196)
+            .filter_map(super::native_band::Channel::legacy)
+            .find(|channel| channel.frequency() == frequency_mhz)
+            .ok_or("GO native frequency absent")?;
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native owner absent")?
+                .go_power_request(super::p2p_go::Identity { device }, channel)
+        })
+    }
     pub(super) async fn ht20_power_request(
         &self,
     ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
@@ -332,6 +355,14 @@ impl Device {
         let schedule_profiles = owner.scheduled_profile()?.0 as u8;
         let ap_capable = owner.ap_capable();
         let p2p_capable = owner.p2p_capable();
+        let go_capable = ap_capable
+            && matches!(
+                owner
+                    .ap_hardware()
+                    .version(3, 0xfc)
+                    .map(|version| version.1),
+                None | Some(1 | 99)
+            );
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
         Ok(Arc::new_cyclic(|me| Self {
@@ -352,6 +383,7 @@ impl Device {
             mode: AtomicU32::new(2),
             mode_generation: AtomicU64::new(1),
             ap_capable,
+            go_capable,
             p2p_capable,
             p2p: super::device::p2p::Host::new(),
             ap_host: super::ap_host::Host::new(),
@@ -394,7 +426,7 @@ impl Device {
             let _publication = self.admission.lock();
             if authority.current() && !self.stopping.load(Ordering::Acquire) {
                 self.down_locked(true);
-                self.current_iftype() == 3
+                matches!(self.current_iftype(), 3 | 9)
             } else {
                 false
             }
@@ -430,7 +462,7 @@ impl Device {
         *self.fence.lock() = None;
         let was_up = self.up.swap(false, Ordering::AcqRel);
         narf_net::iface::set_link_metadata(self.name(), false, None, None);
-        if was_up && self.current_iftype() != 3 {
+        if was_up && !matches!(self.current_iftype(), 3 | 9) {
             narf_wireless::nl80211::notify_disconnect(self.name(), 1, false);
         }
     }
@@ -469,7 +501,7 @@ impl Device {
         if self.p2p.active() && !matches!(operation, Operation::Recover) {
             return Err("MVM control busy");
         }
-        if self.current_iftype() == 3
+        if matches!(self.current_iftype(), 3 | 9)
             && !matches!(
                 operation,
                 Operation::Recover | Operation::Suspend | Operation::Close
@@ -935,7 +967,7 @@ impl Device {
         }
     }
     fn request_close(&self) {
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             self.ap_request_stop();
             return;
         }
@@ -947,7 +979,7 @@ impl Device {
         let _ = self.begin(Operation::Close);
     }
     fn step(&self, cx: Option<&mut Context<'_>>) -> Vec<(Vec<u8>, Publication)> {
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             return self.ap_step(cx);
         }
         let mut cx = cx;
@@ -1122,7 +1154,7 @@ impl Device {
         progressed
     }
     fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-        let valid = if self.current_iftype() == 3 {
+        let valid = if matches!(self.current_iftype(), 3 | 9) {
             (14..=1514).contains(&bytes.len())
                 && bytes[6] & 1 == 0
                 && bytes[6..12] != [0; 6]
@@ -1235,7 +1267,7 @@ impl Device {
         loop {
             let mut activity = super::iwl_msix::Activity::new(
                 self.irq,
-                if self.current_iftype() == 3 || self.p2p.active() {
+                if matches!(self.current_iftype(), 3 | 9) || self.p2p.active() {
                     1
                 } else {
                     20
@@ -1296,7 +1328,14 @@ impl WirelessNetIface for Device {
         self.p2p_capable
     }
     fn p2p_interface_types(&self) -> Vec<u32> {
-        alloc::vec![10]
+        let mut types = Vec::new();
+        if self.go_capable {
+            types.push(9);
+        }
+        if self.p2p_capable {
+            types.push(10);
+        }
+        types
     }
     async fn new_control_interface_async(
         &self,
@@ -1334,6 +1373,18 @@ impl WirelessNetIface for Device {
     }
     fn supports_control_port_tx_status(&self) -> bool {
         self.ap_capable
+    }
+    fn supports_ap_key_sequence(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    async fn key_sequence_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        self.ap_key_sequence(authority, index, pairwise, peer)
     }
     fn supports_control_port_no_preauth(&self) -> bool {
         self.ap_capable
@@ -1499,8 +1550,40 @@ impl WirelessNetIface for Device {
     ) -> Result<(), WirelessError> {
         self.ap_register(authority, frame_type, prefix)
     }
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    fn async_p2p_netdev_management_rx_control(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        let original = authority.go_ap_control_for(self)?;
+        self.mgmt_tx_ap_async(&original, cookie, request).await
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        let original = authority.go_ap_control_for(self).map_err(|_| 1)?;
+        self.register_mgmt_frame_ap_async(&original, frame_type, prefix.to_vec())
+            .await
+            .map_err(|error| match error {
+                WirelessError::Busy => 16,
+                WirelessError::InvalidArgs => 22,
+                WirelessError::NotSupported => 95,
+                WirelessError::Denied => 1,
+                _ => 5,
+            })
+    }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             return self.ap_control_generation();
         }
         core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
@@ -1546,8 +1629,8 @@ impl WirelessNetIface for Device {
         true
     }
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        (self.current_iftype() != 3 && self.ht20 && matches!(band_mhz, 2400 | 5000)).then(|| {
-            narf_wireless::iface::PhyCapabilities {
+        (!matches!(self.current_iftype(), 3 | 9) && self.ht20 && matches!(band_mhz, 2400 | 5000))
+            .then(|| narf_wireless::iface::PhyCapabilities {
                 ht: if self.vht && band_mhz == 5000 {
                     super::mvm_boot::local_ht_for(super::mvm_boot::feature_bits::HT40)
                 } else {
@@ -1556,8 +1639,7 @@ impl WirelessNetIface for Device {
                 .capability_body(),
                 vht: (self.vht && band_mhz == 5000)
                     .then(|| super::mvm_boot::local_vht_for(0).capability_body()),
-            }
-        })
+            })
     }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         use narf_wireless::iface::*;
@@ -1581,15 +1663,15 @@ impl WirelessNetIface for Device {
                 WirelessModes::STATION | WirelessModes::AP
             } else {
                 WirelessModes::STATION
-            }) | if self.p2p_capable {
+            }) | if self.go_capable || self.p2p_capable {
                 WirelessModes::P2P
             } else {
                 WirelessModes::empty()
             },
             hw_caps: HwCaps {
-                ht_supported: self.current_iftype() != 3 && self.ht20,
-                vht_supported: self.current_iftype() != 3 && self.vht,
-                he_supported: self.current_iftype() != 3 && self.he,
+                ht_supported: !matches!(self.current_iftype(), 3 | 9) && self.ht20,
+                vht_supported: !matches!(self.current_iftype(), 3 | 9) && self.vht,
+                he_supported: !matches!(self.current_iftype(), 3 | 9) && self.he,
                 eht_supported: false,
             },
         }
@@ -1706,7 +1788,7 @@ impl WirelessNetIface for Device {
         if self.p2p.active() {
             return Err(WirelessError::Busy);
         }
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             return self
                 .stop_ap_retained()
                 .await
@@ -1732,7 +1814,7 @@ impl WirelessNetIface for Device {
         (v >> 56 != 0).then(|| core::array::from_fn(|i| (v >> (8 * i)) as u8))
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
-        if self.current_iftype() == 3 {
+        if matches!(self.current_iftype(), 3 | 9) {
             return Err(WirelessError::NotSupported);
         }
         if config.tx_power_dbm.is_some() || config.channel != 0 {

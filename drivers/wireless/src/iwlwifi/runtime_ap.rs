@@ -148,6 +148,8 @@ impl Hardware {
         if self.is_failed() {
             return Err("AP native transport failed");
         }
+        let projected = self.project_go_probe(frame)?;
+        let frame = projected.as_deref().unwrap_or(frame);
         let source = self.source_fence()?;
         self.check_six_tx_publication()?;
         let queue = self
@@ -161,5 +163,71 @@ impl Hardware {
         })?;
         self.count_protected(frame);
         Ok(())
+    }
+}
+
+impl Hardware {
+    /// A native GO NoA update may sit beyond the64-descriptor poll budget.
+    /// Hold the same owner across the actual completed fallback prefix and
+    /// rewrite only a probe response at the final native send boundary.
+    pub(in crate::iwlwifi) fn project_go_probe(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        if frame.first() != Some(&0x50) {
+            return Ok(None);
+        }
+        let Some(go) = self.p2p_go.clone() else {
+            return Ok(None);
+        };
+        go.current()?;
+        for _ in 0..=RX_DEPTH / 64 {
+            if !self.has_pending_rx() {
+                break;
+            }
+            self.poll()?;
+            go.current()?;
+        }
+        if self.has_pending_rx() {
+            return Err("GO NoA prefix kept moving before probe publication");
+        }
+        let mut frame = frame.to_vec();
+        go.project_probe(&mut frame)?;
+        Ok(Some(frame))
+    }
+    pub(in crate::iwlwifi) fn begin_go_capture(
+        &mut self,
+        identity: super::super::p2p_go::Identity,
+        own: [u8; 6],
+        owner: alloc::sync::Arc<super::super::ap_owner::Owner>,
+    ) -> Result<(), &'static str> {
+        // MVM's RX_HANDLER_GRP uses this fixed v1 struct without a TLV
+        // lookup. MLD records v1 explicitly; unknown99 follows Linux's
+        // caller-provided v1 fallback, never the command-version byte.
+        if !matches!(
+            self.version(3, 0xfc).map(|version| version.1),
+            None | Some(1 | 99)
+        ) {
+            return Err("GO actual NoA notification API absent");
+        }
+        self.source_fence()?.invoke(|| Ok(()))?;
+        let epoch = self
+            .closed_proved_receive_epoch()
+            .ok_or("GO preparing capture requires current retired closed prefix")?;
+        self.p2p_go = Some(super::super::p2p_go::Native::new(
+            identity, own, owner, epoch,
+        )?);
+        Ok(())
+    }
+    pub(in crate::iwlwifi) fn finish_go_capture(&self) -> Result<(), &'static str> {
+        let epoch = self
+            .receive_capture_epoch()
+            .ok_or("GO prepared RX prefix not open")?;
+        self.source_fence()?.invoke(|| {
+            self.p2p_go
+                .as_ref()
+                .ok_or("GO original preparing capture absent")?
+                .mark_ready(epoch)
+        })
     }
 }

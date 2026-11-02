@@ -138,7 +138,10 @@ impl Session {
                     let ssids: Vec<_> = wanted.iter().filter(|(id, _)| *id == 0).collect();
                     if ssids.len() == 1
                         && (ssids[0].1 == self.plan.config.ssid
-                            || ssids[0].1.is_empty() && self.plan.config.hidden_ssid == 0)
+                            || ssids[0].1.is_empty() && self.plan.config.hidden_ssid == 0
+                            || self.plan.go.is_some_and(|go| {
+                                ssids[0].1 == b"DIRECT-" && go.discovery_request(&delivered[24..])
+                            }))
                     {
                         let mut reply = template.clone();
                         reply[4..10].copy_from_slice(&f[10..16]);
@@ -293,7 +296,16 @@ impl Session {
         if !hw.transmit_space(queue)? {
             return Ok(false);
         }
-        let (frame, header) =
+        let host_group = multicast && encrypt && self.plan.go.is_some();
+        let completed = if host_group {
+            let mut plain = ethernet.to_vec();
+            super::super::csum::complete_prepared(&mut plain, assist)?;
+            Some(plain)
+        } else {
+            None
+        };
+        let ethernet = completed.as_deref().unwrap_or(ethernet);
+        let (mut frame, header) =
             ap_wire::ethernet_qos_from_ap(self.own, self.sequence, ethernet, encrypt, tid)
                 .ok_or("AP native Ethernet frame invalid")?;
         let rate = multicast.then(|| {
@@ -301,7 +313,17 @@ impl Session {
                 .rates
                 .management_rate(self.chains & self.chains.wrapping_neg())
         });
-        hw.enqueue_transmit_ap(queue, &frame, header, rate, encrypt, assist)?;
+        if host_group {
+            self.protect_go_group(&mut frame, header)?;
+        }
+        hw.enqueue_transmit_ap(
+            queue,
+            &frame,
+            header,
+            rate,
+            encrypt && !host_group,
+            if host_group { 0 } else { assist },
+        )?;
         self.sequence = self.sequence.wrapping_add(1);
         Ok(true)
     }
@@ -357,16 +379,9 @@ impl Session {
                 rates.basic = rates.supported;
             }
         }
-        let software_bip = protected && group && hw.ap_software_bip();
+        let software_bip = protected && group && (self.plan.go.is_some() || hw.ap_software_bip());
         if software_bip {
-            let id = self
-                .default_igtk
-                .ok_or("AP software BIP default owner absent")?;
-            self.bip
-                .iter_mut()
-                .find(|key| key.id() == id)
-                .ok_or("AP software BIP default has no actual host key owner")?
-                .protect(&mut frame, self.own)?;
+            self.protect_host_bip(&mut frame)?;
         }
         let rate = Some(rates.management_rate(self.chains & self.chains.wrapping_neg()));
         match hw

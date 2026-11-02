@@ -42,17 +42,20 @@ impl Owner {
         }
         let chains = nvm.tx_chains;
         let domain = policy.snapshot()?;
-        let actual = self.transmit_power_request_for(super::power::Emission::ApLegacy)?;
+        let go = plan.go;
+        let actual = if let Some(identity) = go {
+            self.go_power_request(identity, plan.channel)?
+        } else {
+            self.transmit_power_request_for(super::power::Emission::ApLegacy)?
+        };
         if actual.binding != binding {
             return Err("MVM AP supplied qualification binding is stale");
         }
-        let power = Box::new(super::ap_power::Plan::new(
-            source,
-            binding,
-            own,
-            plan.channel.number,
-            &domain,
-        )?);
+        let power = Box::new(if go.is_some() {
+            super::ap_power::Plan::new_go(source, binding, own, plan.channel.number, &domain)?
+        } else {
+            super::ap_power::Plan::new(source, binding, own, plan.channel.number, &domain)?
+        });
         self.validate_scan_profile()?;
         proof.check()?;
         request.check()?;
@@ -61,11 +64,15 @@ impl Owner {
             self.hardware.clear_rf_policy();
             self.hardware.ap_request(Some(request))?;
             self.hardware.install_ap_owner(proof.clone())?;
+            let transaction = policy.transaction(&domain)?;
+            let transaction = if go.is_some() {
+                transaction.with_mvm_go(power.fence.clone())?
+            } else {
+                transaction.with_mvm_ap(power.fence.clone())?
+            };
             self.hardware
                 .install_rf_policy(super::super::mld_policy::Authority::Transaction(
-                    policy
-                        .transaction(&domain)?
-                        .with_mvm_ap(power.fence.clone())?,
+                    transaction,
                 ))?;
             // Actual inactive MAC/link/DQA/awake setup, without SCAN_REQ.
             // It creates exactly the idle objects common AP preparation removes.
@@ -100,14 +107,27 @@ impl Owner {
                     true,
                 )
             };
-            let program = super::super::mld_policy::Program::new_mvm_ap(
-                &domain,
-                mcc,
-                plan.channel.number,
-                power.fence.clone(),
-                ibss,
-                self.hardware.rf_policy_validity()?,
-            )?;
+            let validity = self.hardware.rf_policy_validity()?;
+            let program = if let Some(identity) = go {
+                super::super::mld_policy::Program::new_mvm_go(
+                    &domain,
+                    mcc,
+                    plan.channel.number,
+                    power.fence.clone(),
+                    ibss,
+                    validity,
+                    identity.binding(own, plan.channel),
+                )?
+            } else {
+                super::super::mld_policy::Program::new_mvm_ap(
+                    &domain,
+                    mcc,
+                    plan.channel.number,
+                    power.fence.clone(),
+                    ibss,
+                    validity,
+                )?
+            };
             self.hardware
                 .install_rf_policy(super::super::mld_policy::Authority::Station(
                     policy.bind(program.clone())?,

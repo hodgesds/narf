@@ -410,6 +410,9 @@ impl Actor {
             }
             if let Some(ap) = &mut self.native_ap {
                 if let Some(body) = ap.command(g, c, b)? {
+                    if let Some(noa) = ap.take_initial_noa() {
+                        self.inject(0xfc, 3, 0x8000, &noa);
+                    }
                     if (g, c) == (5, 2) {
                         let mut marker = vec![8, 0, 0, 0, 0, 0, 1, 0];
                         marker.extend_from_slice(&b[16..20]);
@@ -1283,7 +1286,7 @@ impl Harness {
                 entry[2] = tlc_version;
             }
         }
-        if matches!(emission, 7 | 8) {
+        if matches!(emission, 7..=9) {
             ap_tests::profile(&mut image, &mut versions)?;
         }
         if emission == 8 {
@@ -1307,7 +1310,7 @@ impl Harness {
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
-        if matches!(emission, 7 | 8) {
+        if matches!(emission, 7..=9) {
             model::native_station_identity(&mut hardware, 0xa0f0, 0x351, 0x10c000)?;
         }
         model::firmware_profile(&mut hardware, &parsed)?;
@@ -1315,7 +1318,7 @@ impl Harness {
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
         security.ap = ap(protected)?;
         let mut actor = Actor {
-            native_ap: (emission == 7).then(|| Box::new(ap_tests::Model::new())),
+            native_ap: matches!(emission, 7 | 9).then(|| Box::new(ap_tests::Model::new())),
             native_p2p: (emission == 8).then(|| Box::new(p2p_tests::Model::new())),
             pno: pno.map(Box::new),
             multi_receive,
@@ -1426,12 +1429,12 @@ impl Harness {
                 asset("narf-test/mvm-interface/p2p-power", &bytes, true)
             }),
             ap_power: Arc::new(move |request| {
-                if emission != 7 || !ap_staged.load(Ordering::Acquire) {
+                if !matches!(emission, 7 | 9) || !ap_staged.load(Ordering::Acquire) {
                     return Err("fixture has no staged tag7 AP source");
                 }
                 let mut bytes = power();
                 bytes[8..40].copy_from_slice(&request.binding);
-                bytes[46] = 7;
+                bytes[46] = emission;
                 let signed = asset("narf-test/mvm-interface/ap-power", &bytes, true)?;
                 *ap_cap.lock() = Some(signed.cap);
                 Ok(signed)

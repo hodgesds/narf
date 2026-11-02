@@ -635,6 +635,7 @@ pub struct Hardware {
     /// gate is checked after native credit waits at every TX publication.
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
+    p2p_go: Option<alloc::sync::Arc<super::p2p_go::Native>>,
     ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
     p2p: p2p::State,
     ap_gen2: Option<super::ap_gen2_wire::Adapter>,
@@ -758,6 +759,7 @@ impl Hardware {
                 | (u8::from(parsed.api.has_capability(10)) << 1),
             six_tx_profile: None,
             ap_owner: None,
+            p2p_go: None,
             ap_request: None,
             p2p: p2p::State::new(&parsed.api),
             ap_gen2: None,
@@ -1199,6 +1201,7 @@ impl Hardware {
         }
         let capture = self.rx_epoch.capture();
         let p2p_capture = self.p2p.copy_grant();
+        let go_capture = self.p2p_go.clone();
         let mut copied = self.resources.rx.drain(&mut self.mmio)?;
         for queue in &mut self.resources.extra_rx {
             copied.extend(queue.drain(&mut self.mmio)?);
@@ -1215,6 +1218,11 @@ impl Hardware {
             }
             if self.p2p.observe(&packet, p2p_capture.as_ref())? {
                 continue;
+            }
+            if let Some(go) = &go_capture {
+                if go.receive(&packet)? {
+                    continue;
+                }
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
                 if let Some(policy) = &self.rf_policy {
@@ -1474,6 +1482,7 @@ impl Hardware {
     }
 
     pub(super) fn clear_rf_policy(&mut self) {
+        self.p2p_go = None;
         self.ap_request = None;
         if let Some(owner) = self.ap_owner.take() {
             owner.retire();
@@ -1848,6 +1857,12 @@ impl Hardware {
             return Err("MVM station closed before native packet publication");
         }
         self.check_p2p_tx_publication()?;
+        let projected = if encrypt.is_some() {
+            self.project_go_probe(frame)?
+        } else {
+            None
+        };
+        let frame = projected.as_deref().unwrap_or(frame);
         let sources = self.source_fence()?;
         self.check_six_tx_publication()?;
         let queue = self

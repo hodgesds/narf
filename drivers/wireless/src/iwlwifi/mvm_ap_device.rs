@@ -14,11 +14,42 @@ type Start = (
 );
 
 impl Device {
+    pub(super) fn ap_key_sequence(
+        &self,
+        authority: &ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        if self.current_iftype() != 9 || !authority.has_reservation() {
+            return Err(95);
+        }
+        let permit = authority.native_emission_for(self).map_err(|_| 95)?;
+        let result = {
+            let mut state = self.state.try_lock().ok_or(16)?;
+            if !permit.current() {
+                return Err(1);
+            }
+            let State { owner, ap, .. } = &mut *state;
+            let session = ap.as_ref().ok_or(2)?;
+            let hw = owner.as_mut().ok_or(19)?.ap_hardware();
+            hw.source_fence()
+                .map_err(|_| 1)?
+                .invoke(|| Ok(session.key_sequence(index, pairwise, peer)))
+                .map_err(|_| 1)?
+        };
+        authority.check_for(self).map_err(|_| 1)?;
+        result
+    }
     pub(super) fn ap_set_mode(&self, mode: u32) -> Result<(), WirelessError> {
         if self.p2p.active() {
             return Err(WirelessError::Busy);
         }
-        if !matches!(mode, 2 | 3) || mode == 3 && !self.ap_capable {
+        if !matches!(mode, 2 | 3 | 9)
+            || mode == 3 && !self.ap_capable
+            || mode == 9 && !self.go_capable
+        {
             return Err(WirelessError::NotSupported);
         }
         let _lease = self.radio_control.try_reserve()?;
@@ -236,7 +267,10 @@ impl Device {
         operation: Operation,
     ) -> Result<bool, i32> {
         authority.check_for(self).map_err(|_| 1)?;
-        if self.current_iftype() != 3 || !self.ap_capable || !authority.has_reservation() {
+        if !matches!(self.current_iftype(), 3 | 9)
+            || !self.ap_capable
+            || !authority.has_reservation()
+        {
             return Err(95);
         }
         let mut operation = Some(operation);
@@ -259,7 +293,22 @@ impl Device {
         // The actual provider runs outside State and the retained Work slot.
         // Its returned record is re-bound to original hardware before I/O.
         let power = if matches!(operation, Operation::Start(..)) {
-            let request = self.ap_power_request().await.map_err(|_| 5)?;
+            let request = if self.current_iftype() == 9 {
+                let Operation::Start(config, settings) = &operation else {
+                    return Err(22);
+                };
+                let plan = super::super::ap_wire::Plan::new_go(
+                    config.as_ref().clone(),
+                    settings,
+                    self.mac,
+                )
+                .map_err(|_| 22)?;
+                self.go_power_request(plan.go.ok_or(22)?.device, plan.channel.frequency())
+                    .await
+                    .map_err(|_| 5)?
+            } else {
+                self.ap_power_request().await.map_err(|_| 5)?
+            };
             let source = (self.environment.ap_power)(&request).map_err(|_| 95)?;
             Some((source, request.binding))
         } else {
@@ -282,9 +331,12 @@ impl Device {
             }))
         };
         let start = if let Operation::Start(config, settings) = &operation {
-            let plan =
+            let plan = if self.current_iftype() == 9 {
+                super::super::ap_wire::Plan::new_go(config.as_ref().clone(), settings, self.mac)
+            } else {
                 super::super::ap_wire::Plan::new(config.as_ref().clone(), settings, self.mac)
-                    .map_err(|_| 22)?;
+            }
+            .map_err(|_| 22)?;
             if !self.channels.contains(&plan.channel.number) {
                 return Err(22);
             }
@@ -302,7 +354,7 @@ impl Device {
             .map_err(|_| 1)?;
             if !request.as_ref().unwrap().authority.matches_role(
                 self,
-                3,
+                self.current_iftype(),
                 self.ap_control_generation().ok_or(1)?,
             ) {
                 return Err(1);
@@ -731,7 +783,7 @@ impl Device {
         prefix: Vec<u8>,
     ) -> Result<(), WirelessError> {
         authority.check_for(self)?;
-        if self.current_iftype() != 3
+        if !matches!(self.current_iftype(), 3 | 9)
             || !authority.has_reservation()
             || frame_type & !0x00f0 != 0
             || prefix.len() > 256

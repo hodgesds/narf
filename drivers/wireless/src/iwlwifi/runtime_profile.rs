@@ -157,6 +157,9 @@ impl Hardware {
         owner: alloc::sync::Arc<super::super::ap_owner::Owner>,
     ) -> Result<(), &'static str> {
         owner.check()?;
+        // A fresh AP/GO START cannot inherit a predecessor's native NoA.
+        // Caller still owes actual new receive-prefix and role receipts.
+        self.p2p_go = None;
         self.ap_owner = Some(owner);
         Ok(())
     }

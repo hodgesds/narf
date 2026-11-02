@@ -1,6 +1,8 @@
 //! Original API77 netdev AP conversations. The device side consumes only
 //! posted TFH bytes/RFH buffers; it never reads Session or key/port booleans.
 use super::*;
+#[path = "mvm_go_native_tests.rs"]
+mod go;
 use narf_capabilities::Invoke;
 use narf_net::netlink_generic::DeferredReplySink;
 use narf_wireless::ap_control::ApControlAuthority;
@@ -54,6 +56,10 @@ pub(super) struct Model {
     beacon: bool,
     tx: Vec<(u8, Vec<u8>, bool)>,
     mcc_flags: u32,
+    go: bool,
+    go_pn: u64,
+    initial_noa: bool,
+    pending_initial_noa: bool,
 }
 impl Model {
     pub(super) fn new() -> Self {
@@ -65,7 +71,20 @@ impl Model {
             beacon: false,
             tx: Vec::new(),
             mcc_flags: 0x109, // VALID | ACTIVE |20, deliberately NO IBSS
+            go: false,
+            go_pn: 0,
+            initial_noa: false,
+            pending_initial_noa: false,
         }
+    }
+    pub(super) fn arm_initial_noa(&mut self) {
+        self.initial_noa = true;
+    }
+    pub(super) fn take_initial_noa(&mut self) -> Option<Vec<u8>> {
+        if !core::mem::take(&mut self.pending_initial_noa) {
+            return None;
+        }
+        Some(crate::iwlwifi::p2p_go_fixture::notice(0, 5, true))
     }
     pub(super) fn command(
         &mut self,
@@ -88,6 +107,15 @@ impl Model {
             return Ok(None);
         }
         let mut reply = Vec::new();
+        if (group, command) == (3, 8)
+            && b.len() == 52
+            && word(b, 4) == 1
+            && word(b, 8) == 8
+            && self.initial_noa
+        {
+            self.initial_noa = false;
+            self.pending_initial_noa = true;
+        }
         match (group, command) {
             (3, 8) => require(
                 b.len() == 52
@@ -205,7 +233,8 @@ impl Model {
                 let mut expected = [0; 28];
                 expected[0] = station;
                 expected[6] = 3;
-                expected[10] = 15;
+                expected[10..12]
+                    .copy_from_slice(&(if self.go { 0x150u16 } else { 15u16 }).to_le_bytes());
                 expected[24..26].copy_from_slice(&4095u16.to_le_bytes());
                 require(
                     station >= 2 && self.peers.iter().any(|p| p.0 == station) && b == expected,
@@ -243,6 +272,12 @@ impl Model {
                         && word(b, 20) == 4,
                     "API77 AP actual beacon13 physical owner/TIM extent",
                 )?;
+                self.go = b
+                    .windows(8)
+                    .any(|raw| raw == [221, 18, 0x50, 0x6f, 0x9a, 9, 2, 2]);
+                if self.go {
+                    require(half(b, 2) == 0, "API77 GO beacon used CCK")?;
+                }
                 self.beacon = true;
             }
             (5, 2) => require(
@@ -317,6 +352,13 @@ impl Model {
             !encrypt || self.keys.iter().any(|k| k.0 == q.station),
             "API77 AP native encryption lacks actual station key receipt",
         )?;
+        if !encrypt && frame[1] & 0x40 != 0 {
+            require(
+                self.go && frame[0] & 12 == 8 && frame[4] & 1 != 0,
+                "API77 raw protected bypass lacks real GO group CCMP",
+            )?;
+            self.go_pn = crate::iwlwifi::p2p_go_fixture::open_group(&frame, OWN, GTK, self.go_pn)?;
+        }
         q.write = p.pointer;
         q.read = p.pointer;
         self.tx.push((q.station, frame, encrypt));
@@ -353,7 +395,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Result<Self, &'static str> {
-        let h = Harness::version_profile(false, false, 7, 4)?;
+        Self::new_emission(7)
+    }
+    fn new_emission(emission: u8) -> Result<Self, &'static str> {
+        let h = Harness::version_profile(false, false, emission, 4)?;
         require(
             h.device.supports_ap(),
             "API77 complete actual adapter did not expose AP",

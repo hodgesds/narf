@@ -98,6 +98,34 @@ impl RadioControlAuthority {
     pub fn has_reservation(&self) -> bool {
         self.guard.has_reservation()
     }
+    /// An explicitly opted-in GO backend may share one actual AP/radio
+    /// serialization domain. This view retains the original request, socket,
+    /// capabilities, exact netdev and reservation; it never rebinds a source.
+    /// Call outside native State, then let the AP owner capture its existing
+    /// callback-free guards and prove real GO/channel/key/TX receipts.
+    pub fn go_ap_control_for<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+    ) -> Result<ApControlAuthority, WirelessError> {
+        self.require_mode(9)?;
+        self.check_for(receiver)?;
+        self.require_link()?;
+        if !self.has_reservation()
+            || !matches!(self.guard.target, Target::Netdev { .. })
+            || !receiver.supports_ap_userspace_mlme()
+            || !(receiver.async_p2p_netdev_management_tx_control()
+                || receiver.async_p2p_netdev_management_rx_control())
+            || receiver.ap_control_generation() != Some(self.guard.generation)
+            || receiver.radio_control_generation() != Some(self.guard.generation)
+        {
+            return Err(WirelessError::NotSupported);
+        }
+        let mut control = self.guard.clone();
+        control.kind = ControlKind::Ap;
+        control.check_for(receiver)?;
+        control.require_up()?;
+        Ok(control)
+    }
     /// A P2P-device wdev has no administrative-UP netdev contract. Its
     /// actual START_P2P_DEVICE receipt is checked by the native owner; this
     /// identity observation cannot substitute for it or authorize RF use.

@@ -1,6 +1,8 @@
 //! Actual native AP MAC/LINK/peer/key/TVQM DMA conversations. The explicit
 //! inert firmware observes queue bindings and receipts, never driver state.
 use super::*;
+#[path = "ap_go_native_tests.rs"]
+mod go;
 use narf_capabilities::{Cap, Invoke};
 use narf_net::netlink_generic::DeferredReplySink;
 use narf_wireless::ap_control::ApControlAuthority;
@@ -27,6 +29,10 @@ pub(super) struct Model {
     malformed_flush: bool,
     tx: Vec<(u8, Vec<u8>, bool)>,
     beacon: bool,
+    go: bool,
+    go_pn: u64,
+    initial_noa: bool,
+    pending_initial_noa: bool,
 }
 impl Model {
     pub(super) fn new() -> Self {
@@ -40,7 +46,20 @@ impl Model {
             malformed_flush: false,
             tx: Vec::new(),
             beacon: false,
+            go: false,
+            go_pn: 0,
+            initial_noa: false,
+            pending_initial_noa: false,
         }
+    }
+    pub(super) fn arm_initial_noa(&mut self) {
+        self.initial_noa = true;
+    }
+    pub(super) fn take_initial_noa(&mut self) -> Option<Vec<u8>> {
+        if !core::mem::take(&mut self.pending_initial_noa) {
+            return None;
+        }
+        Some(crate::iwlwifi::p2p_go_fixture::notice(0, 5, true))
     }
     pub(super) fn command(
         &mut self,
@@ -56,6 +75,15 @@ impl Model {
             return Ok(None);
         }
         let mut reply = Vec::new();
+        if (group, cmd) == (3, 8)
+            && body.len() == 52
+            && word(body, 4) == 1
+            && word(body, 8) == 8
+            && self.initial_noa
+        {
+            self.initial_noa = false;
+            self.pending_initial_noa = true;
+        }
         match (group, cmd) {
             (3, 8) => require(
                 body.len() == 52
@@ -213,6 +241,12 @@ impl Model {
                         && word(body, 20) == if version < 14 { 4 } else { 0 },
                     "AP native TIM index/body length versus BTWT",
                 )?;
+                self.go = body
+                    .windows(8)
+                    .any(|raw| raw == [221, 18, 0x50, 0x6f, 0x9a, 9, 2, 2]);
+                if self.go {
+                    require(half(body, 2) == 0, "GO native beacon used CCK")?;
+                }
                 self.beacon = true;
             }
             (1, 0x1e) => {
@@ -288,6 +322,8 @@ impl Model {
                     "AP BIP must use IGTK despite clear Protected bit",
                 )?;
             }
+        } else if self.go && frame[0] & 12 == 8 && frame[1] & 0x40 != 0 && frame[4] & 1 != 0 {
+            self.go_pn = crate::iwlwifi::p2p_go_fixture::open_group(&frame, OWN, GTK, self.go_pn)?;
         } else {
             require(
                 frame[1] & 0x40 == 0,
