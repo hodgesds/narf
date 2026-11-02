@@ -21,6 +21,10 @@ const MAX_OBJECTS: usize = 4096;
 const VA_SIZE: u64 = 1 << 48;
 const PAGE: u64 = 4096;
 
+#[path = "intel_gpu_vram_clear.rs"]
+pub(crate) mod vram_clear;
+pub(crate) use vram_clear::prepare_vram_clear;
+
 #[derive(Debug)]
 pub struct ExecObject {
     pub object: Arc<GemObject>,
@@ -316,7 +320,7 @@ pub struct ResidentBatch {
     implicit_sync: bool,
     /// Width-two batches share this owned immutable VM graph. Lane zero
     /// retains the ordinary address; lane one is copied before any wait.
-    parallel: Option<u64>,
+    parallel: Option<Vec<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -362,6 +366,13 @@ impl ResidentBatch {
                 if m.offset
                     .checked_add(m.length)
                     .is_none_or(|end| end > object.size())
+                {
+                    return Err(FsError::InvalidData);
+                }
+                if object.is_vram()
+                    && object.vram_page_size() == 65536
+                    && (platform != GtPlatform::Alchemist
+                        || (m.va | m.offset | m.length) & 65535 != 0)
                 {
                     return Err(FsError::InvalidData);
                 }
@@ -430,7 +441,18 @@ impl ResidentBatch {
                 {
                     let tables = space.tables.as_mut().expect("owned tables");
                     let va = mapping.va + i as u64 * PAGE;
-                    if object.is_vram() {
+                    if object.is_vram() && object.vram_page_size() == 65536 {
+                        if i % 16 != 0 {
+                            continue;
+                        }
+                        tables.map_device_64k_with_pat(
+                            &mut space.memory,
+                            va,
+                            phys,
+                            mapping.pat,
+                            mapping.writable,
+                        )
+                    } else if object.is_vram() {
                         tables.map_device_with_pat(
                             &mut space.memory,
                             va,
@@ -476,27 +498,44 @@ impl ResidentBatch {
     pub(crate) fn from_vm_parallel(
         platform: GtPlatform,
         mappings: &[VmMapping],
-        addresses: Option<[u64; 2]>,
+        addresses: Option<&[u64]>,
+        width: usize,
         scratch: bool,
     ) -> Result<Self, FsError> {
+        if !(2..=crate::intel_gpu_user::MAX_PARALLEL_WIDTH).contains(&width)
+            || addresses.is_some_and(|a| a.len() != width)
+        {
+            return Err(FsError::InvalidData);
+        }
         if let Some(addresses) = addresses {
-            if addresses[1] & 7 != 0
-                || !mappings.iter().any(|m| {
-                    m.object.is_some()
-                        && addresses[1]
-                            .checked_sub(m.va)
-                            .is_some_and(|delta| delta < m.length)
-                })
-            {
-                return Err(FsError::InvalidData);
+            for &address in &addresses[1..] {
+                if address & 7 != 0
+                    || !mappings.iter().any(|m| {
+                        m.object.is_some()
+                            && address
+                                .checked_sub(m.va)
+                                .is_some_and(|delta| delta < m.length)
+                    })
+                {
+                    return Err(FsError::InvalidData);
+                }
             }
         }
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(width - 1)
+            .map_err(|_| FsError::OutOfMemory)?;
+        if let Some(addresses) = addresses {
+            children.extend_from_slice(&addresses[1..]);
+        } else {
+            children.resize(width - 1, 0);
+        }
         let mut batch = Self::from_vm(platform, mappings, addresses.map(|a| a[0]), scratch, None)?;
-        batch.parallel = Some(addresses.map_or(0, |a| a[1]));
+        batch.parallel = Some(children);
         Ok(batch)
     }
-    pub(crate) fn parallel(&self) -> Option<u64> {
-        self.parallel
+    pub(crate) fn parallel(&self) -> Option<&[u64]> {
+        self.parallel.as_deref()
     }
 
     pub(crate) fn user_fence(&self) -> Option<(u64, u64)> {

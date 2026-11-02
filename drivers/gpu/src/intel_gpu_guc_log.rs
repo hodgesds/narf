@@ -16,6 +16,10 @@ use narf_lib::mutex::Mutex;
 #[path = "intel_gpu_guc_lfd.rs"]
 mod lfd;
 
+#[path = "intel_gpu_guc_stream.rs"]
+pub(crate) mod stream;
+pub use stream::StreamSession;
+
 use crate::{intel_gpu_gt::GtPlatform, intel_gpu_rcs::GpuBacking, intel_gpu_user::UserBackend};
 
 /// Fixed allocation advertised to the admitted GuC firmware: state page,

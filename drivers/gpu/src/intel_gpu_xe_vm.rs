@@ -173,6 +173,13 @@ impl Bind {
                 return Err(FsError::InvalidData);
             }
             let object = gem.object(object)?;
+            if object.is_vram()
+                && object.vram_page_size() == 65536
+                && (platform != crate::intel_gpu_gt::GtPlatform::Alchemist
+                    || (address | offset | length) & 65535 != 0)
+            {
+                return Err(FsError::InvalidData);
+            }
             // xe_vm_bind_ioctl_validate_bo: XE_COH_NONE on a WB object would
             // let the GPU miss dirty CPU lines (or the CPU miss GPU writes).
             if (noncoherent && !object.is_wc())
@@ -269,6 +276,17 @@ impl State {
                         .is_some_and(|old| Arc::ptr_eq(old, object))
                 });
             } else {
+                if (bind.address | bind.length) & 65535 != 0
+                    && mappings.iter().any(|m| {
+                        m.va < bind.address + bind.length
+                            && bind.address < m.va + m.length
+                            && m.object
+                                .as_ref()
+                                .is_some_and(|o| o.is_vram() && o.vram_page_size() == 65536)
+                    })
+                {
+                    return Err(FsError::InvalidData);
+                }
                 remove(&mut mappings, bind.address, bind.length);
                 if let Some(mapping) = &bind.mapping {
                     mappings.push(mapping.clone());

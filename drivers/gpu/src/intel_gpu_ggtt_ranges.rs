@@ -63,6 +63,9 @@ impl Ledger {
                 .checked_add(bytes)
                 .is_some_and(|end| end <= high && end <= self.capacity)
     }
+    pub(crate) fn reserve_cursor(self: &Arc<Self>, bytes: u64) -> Result<Lease, FsError> {
+        self.reserve_dsb(bytes)
+    }
     pub(crate) fn reserve_dsb(self: &Arc<Self>, bytes: u64) -> Result<Lease, FsError> {
         if bytes == 0 || bytes % 4096 != 0 || bytes > DSB_END - DSB_START || DSB_END > self.capacity
         {

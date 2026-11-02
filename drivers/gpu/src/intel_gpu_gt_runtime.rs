@@ -161,6 +161,123 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 })
         })
     }
+    fn guc_log_stream(
+        &self,
+        session: Arc<crate::intel_gpu_guc_log::StreamSession>,
+    ) -> narf_filesystem::FsFuture<'_, ()> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            // Opening a diagnostic stream never wakes/reboots an idle GT.
+            let mut state = owner.state.lock().await;
+            let epoch = owner.user_epoch.load(Ordering::Acquire);
+            if session.index() != owner.pending.index
+                || state.phase != Phase::Running
+                || epoch == 0
+                || owner.suspended.load(Ordering::Acquire)
+                || narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                    != Ok(Some(narf_bus::pci::PciPowerState::D0))
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let digest = state
+                .firmware
+                .as_ref()
+                .ok_or(narf_filesystem::FsError::NoDevice)?
+                .digest;
+            state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?
+                .attach_log_stream(session, epoch, narf_time::monotonic_ns(), digest)
+        })
+    }
+    fn clear_vram(
+        &self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> narf_filesystem::FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let _awake = Awake::take(&owner).await?;
+            let mut state = owner.lock_running().await;
+            if state.phase != Phase::Running
+                || epoch == 0
+                || owner.user_epoch.load(Ordering::Acquire) != epoch
+                || owner.suspended.load(Ordering::Acquire)
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let pool = crate::drm_registry::DrmCard::intel_vram(&*owner.pending.card)
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            if !object.in_vram_pool(&pool) {
+                return Err(narf_filesystem::FsError::InvalidData);
+            }
+            if narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                != Ok(Some(narf_bus::pci::PciPowerState::D0))
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            if state
+                .gt
+                .as_ref()
+                .is_none_or(|gt| gt.vram_layout() != Some(pool.layout))
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            if !pool.requires_ccs_clear() {
+                let mut clear = object.begin_cpu_vram_clear()?;
+                loop {
+                    // An old caller must not close a recovered backend after
+                    // yielding across reset into a different user epoch.
+                    if owner.user_epoch.load(Ordering::Acquire) != epoch {
+                        return Err(narf_filesystem::FsError::NoDevice);
+                    }
+                    if state.phase != Phase::Running
+                        || owner.suspended.load(Ordering::Acquire)
+                        || narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                            != Ok(Some(narf_bus::pci::PciPowerState::D0))
+                        || !state.gt.as_ref().is_some_and(|gt| {
+                            gt.vram_cpu_access(epoch) && gt.vram_layout() == Some(pool.layout)
+                        })
+                    {
+                        owner.close_controls();
+                        owner.user_epoch.store(0, Ordering::Release);
+                        return Err(narf_filesystem::FsError::NoDevice);
+                    }
+                    if let Some(fence) = owner
+                        .pending
+                        .cap
+                        .invoke(ClearVramChunk(&mut clear))
+                        .map_err(|_| narf_filesystem::FsError::NoDevice)?
+                    {
+                        return Ok(fence);
+                    }
+                    // Keep the PM hold/private reservation, but let the GT
+                    // worker service jobs between bounded CPU chunks. A reset
+                    // or suspend during the yield fails the next fresh proof.
+                    drop(state);
+                    narf_scheduler::yield_now().await;
+                    state = owner.state.lock().await;
+                }
+            }
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let result = gt.clear_vram(narf_time::monotonic_ns(), object, epoch);
+            if gt.state() == GtState::Lost {
+                owner.close_controls();
+                owner.user_epoch.store(0, Ordering::Release);
+            }
+            result.map_err(|_| crate::intel_gpu_user::io_error())
+        })
+    }
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         Some(self.power_controls.clone())
     }
@@ -318,6 +435,21 @@ impl RuntimePmOps for PmOps {
 
 /// Linux xe's default autosuspend delay.
 const AUTOSUSPEND_MS: i32 = 1000;
+
+/// One bounded private BAR write under current PCI capability invocation.
+struct ClearVramChunk<'a>(&'a mut crate::intel_gpu_gem::CpuVramClear);
+impl narf_capabilities::CapOp<BusDeviceCap, Write> for ClearVramChunk<'_> {
+    type Output = Option<Arc<CompletionFence>>;
+    fn execute(
+        self,
+        _: &Cap<BusDeviceCap, Write>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        // SAFETY: private caller retains Awake and the GT reset mutex and
+        // rechecks D0/epoch/wake before every at-most64KiB chunk. invoke()
+        // validates the current PCI capability for the actual BAR stores.
+        Ok(unsafe { self.0.clear_next() })
+    }
+}
 
 /// A runtime-PM usage reference: the function stays in D0 until it drops.
 struct Awake(Arc<narf_power::runtime_pm::RuntimePmDevice>);
@@ -700,6 +832,16 @@ impl Owner {
             }
             crate::intel_gpu_error::record(self.pending.index, report);
         }
+        if matches!(
+            polled,
+            core::task::Poll::Ready(Ok(GtState::SchedulingReady))
+        ) {
+            gt.poll_log_stream(now, || {
+                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+            })
+            .map_err(RuntimeError::Gt)?;
+        }
         let current = match polled {
             core::task::Poll::Pending => return Ok(()),
             core::task::Poll::Ready(result) => result.map_err(RuntimeError::Gt)?,
@@ -787,7 +929,10 @@ impl Owner {
                     }
                     *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
                     // Before the epoch: discovery sees VRAM with the engines.
-                    self.pending.card.publish_gt_vram(gt);
+                    self.pending
+                        .card
+                        .publish_gt_vram(gt)
+                        .map_err(|_| RuntimeError::State)?;
                     state.phase = Phase::DisplayRecovery;
                     let (major, minor, patch) = gt.submission_version();
                     self.user_version.store(
@@ -1263,6 +1408,16 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
     fn prepare_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
+            // S3 may lose both data and flat CCS. Until VRAM preservation or
+            // migration is owned, retained objects/CPU BAR mappings prevent it.
+            if self
+                .pending
+                .card
+                .intel_vram_used()
+                .is_some_and(|used| used != 0)
+            {
+                return Err(E::Busy);
+            }
             // Retire display GEM fetch before closing the backend or taking
             // its reset mutex. KMS holds this same display mutex while a
             // transaction is armed, so suspend cannot overtake its latch.
@@ -1272,6 +1427,17 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             // Serialize closing admission with the worker's ready-epoch
             // activation. Display quiescence remains outside this lock.
             let mut state = self.state.lock().await;
+            if self
+                .pending
+                .card
+                .intel_vram_used()
+                .is_some_and(|used| used != 0)
+            {
+                drop(state);
+                // Failed prepare hooks are not resumed by the coordinator.
+                let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
+                return Err(E::Busy);
+            }
             self.close_controls();
             if let Some(control) = &self.ccs_control {
                 control.close();

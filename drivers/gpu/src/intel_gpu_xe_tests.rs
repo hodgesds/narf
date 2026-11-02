@@ -101,6 +101,27 @@ impl UserBackend for Native {
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
         Some(self.facts)
     }
+    fn clear_vram(
+        &self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async move {
+            if self.status().is_none_or(|status| {
+                status.epoch != epoch || status.platform != GtPlatform::Battlemage
+            }) {
+                return Err(FsError::NoDevice);
+            }
+            let mut clear = object.begin_cpu_vram_clear()?;
+            loop {
+                // SAFETY: this native fixture exclusively owns its fake
+                // LMEM RAM aperture, without PCI power transitions.
+                if let Some(fence) = unsafe { clear.clear_next() } {
+                    return Ok(fence);
+                }
+            }
+        })
+    }
     fn submit<'a>(
         &'a self,
         context: Arc<UserContext>,
@@ -718,7 +739,10 @@ fn create_placed(
     put32(&mut wire, 20, flags);
     wire[32..34].copy_from_slice(&caching.to_le_bytes());
     user.wire.store(64, &wire);
-    invoke(file, info, user, xe::GEM_CREATE).map(|_| u32_at(&user.wire.load(64, 56), 28))
+    let mut call = core::pin::pin!(file.dispatch_user(info, xe::GEM_CREATE, 64, user));
+    ready(call.as_mut())
+        .unwrap()
+        .map(|_| u32_at(&user.wire.load(64, 56), 28))
 }
 
 fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
@@ -1431,4 +1455,7 @@ mod waits {
 
 mod multi_ccs {
     include!("intel_gpu_multi_ccs_tests.rs");
+}
+mod dg2_vram {
+    include!("intel_gpu_dg2_vram_tests.rs");
 }

@@ -176,6 +176,7 @@ pub struct XeLpgTransport<M: MmioWindow, A: GpuAllocator> {
     resources: ManuallyDrop<CtResources<A>>,
     state: TransportState,
     released: bool,
+    log_sideband: crate::intel_gpu_guc_log::stream::Sideband,
 }
 
 struct CtResources<A: GpuAllocator> {
@@ -252,6 +253,7 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
             }),
             state: TransportState::Allocated,
             released: false,
+            log_sideband: crate::intel_gpu_guc_log::stream::Sideband::new(),
         })
     }
 
@@ -403,10 +405,31 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
         if self.state != TransportState::Enabled {
             return Err(TransportError::State);
         }
-        self.resources.receiver.receive().map_err(|error| {
-            self.state = TransportState::Lost;
-            TransportError::Ct(error)
-        })
+        // A bounded sideband drain preserves scheduler ownership of every
+        // other response. Flush notifications coalesce; command replies do not.
+        for _ in 0..8 {
+            let result = match self.resources.receiver.receive() {
+                Ok(Some(message)) => self.log_sideband.route(message),
+                Ok(None) => return Ok(None),
+                Err(error) => Err(TransportError::Ct(error)),
+            };
+            match result {
+                Ok(Some(message)) => return Ok(Some(message)),
+                Ok(None) => {
+                    // The peer may have more scheduler messages after a
+                    // consumed sideband event. One bounded retry is harmless.
+                }
+                Err(error) => {
+                    self.state = TransportState::Lost;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn log_sideband(&mut self) -> &mut crate::intel_gpu_guc_log::stream::Sideband {
+        &mut self.log_sideband
     }
 
     /// Return an unsafe-to-release owner intact to its GT reset path.

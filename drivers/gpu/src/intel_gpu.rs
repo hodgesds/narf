@@ -847,6 +847,8 @@ pub struct IntelGpu {
     pub chip: ChipInfo,
     /// `GMD_ID` value captured at probe time.
     pub gmd_id: u32,
+    display_device: BusDevice,
+    display_cap: Cap<BusDeviceCap, Write>,
     pub active_scanout: narf_lib::sync::IrqSafeSpinLock<Option<ActiveScanout>>,
     /// Owned scanout backing, set by probe when the allocation
     /// and plane programming succeed. `None` on PTL (display
@@ -885,7 +887,7 @@ impl IntelGpu {
     /// Caller owns BAR0 + BAR2 exclusively for the duration of probe.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, IntelGpuError> {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(IntelGpuError::UnknownAsic)?;
@@ -920,12 +922,17 @@ impl IntelGpu {
             gmadr,
             chip,
             gmd_id,
+            display_device: *device,
+            display_cap: *cap,
             active_scanout: narf_lib::sync::IrqSafeSpinLock::new(None),
             scanout: None,
             drm_card: None,
         })
     }
 
+    pub(crate) fn mode_window(&self) -> ModeWindow {
+        ModeWindow::new(self.gtt_mmadr, self.display_device, self.display_cap)
+    }
     pub fn current_mode(&self) -> Option<ActiveScanout> {
         self.active_scanout.lock().clone()
     }
@@ -1420,28 +1427,6 @@ pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveSc
 pub(crate) fn relight_display_locked(
     mode: &crate::intel_gpu_modeset::Mode,
 ) -> Option<ActiveScanout> {
-    use crate::intel_gpu_aux::MmioWindow;
-    use narf_bus::bar::MmioRegion;
-
-    struct BarWindow<'a>(&'a MmioRegion);
-
-    impl MmioWindow for BarWindow<'_> {
-        fn read32(&self, off: u64) -> u32 {
-            // SAFETY: BAR0 is mapped for the lifetime of the
-            // probed controller; `off` is a display register
-            // offset from the modeset code, and a 32-bit
-            // register read has no unwanted side effect.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { self.0.read32(off) }
-        }
-        fn write32(&self, off: u64, val: u32) {
-            // SAFETY: same BAR ownership as `read32`; `off`
-            // is a programmable display register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { self.0.write32(off, val) }
-        }
-    }
-
     let display = with_display_info(|display| *display)?;
     if !display.chip.generation.display_supported() {
         return None;
@@ -1461,7 +1446,7 @@ pub(crate) fn relight_display_locked(
         stride_bytes,
         format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
     };
-    let window = BarWindow(&display.gtt_mmadr);
+    let window = ModeWindow::new(display.gtt_mmadr, display.device, display.cap);
     let applied = crate::intel_gpu_modeset::modeset_display(
         &window,
         display.chip.generation,
@@ -1612,13 +1597,52 @@ pub(crate) struct DisplayInfo {
     pub gtt_mmadr: MmioRegion,
     pub chip: ChipInfo,
     pub gmd_id: u32,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
 }
 
+/// Current PCI authority and D0 checked window for owned modesets. Slow
+/// register programming never holds CONTROLLER or uses a prior grant alone.
+#[derive(Debug)]
+pub(crate) struct ModeWindow {
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    io: crate::intel_gpu_gt_hw::AuthorizedWindow,
+}
+impl ModeWindow {
+    fn new(bar: MmioRegion, device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Self {
+        Self {
+            device,
+            cap,
+            io: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
+        }
+    }
+    fn powered(&self) -> bool {
+        narf_bus::pci::power_state(&self.cap, &self.device)
+            == Ok(Some(narf_bus::pci::PciPowerState::D0))
+    }
+}
+impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
+    fn read32(&self, reg: u64) -> u32 {
+        if self.powered() {
+            self.io.read32(reg)
+        } else {
+            u32::MAX
+        }
+    }
+    fn write32(&self, reg: u64, value: u32) {
+        if self.powered() {
+            self.io.write32(reg, value)
+        }
+    }
+}
 pub(crate) fn with_display_info<R>(f: impl FnOnce(&DisplayInfo) -> R) -> Option<R> {
     let display = CONTROLLER.lock().as_ref().map(|gpu| DisplayInfo {
         gtt_mmadr: gpu.gtt_mmadr,
         chip: gpu.chip,
         gmd_id: gpu.gmd_id,
+        device: gpu.display_device,
+        cap: gpu.display_cap,
     })?;
     Some(f(&display))
 }

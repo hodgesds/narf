@@ -60,7 +60,7 @@ impl Identities {
         let id = (0..64)
             .map(|n| (self.next_id - 1 + n) % 64 + 1)
             .find(|id| {
-                (1..=2).contains(&width)
+                (1..=4).contains(&width)
                     && *id + width - 1 <= 64
                     && (0..width).all(|lane| self.used & (1u64 << (*id + lane - 1)) == 0)
             })
@@ -170,31 +170,40 @@ impl<B: GpuBacking> Context<B> {
             .into_iter()
             .chain(self.parallel.iter().flat_map(|group| group.backings()))
     }
+    fn width(&self) -> usize {
+        self.parallel.as_ref().map_or(1, parallel::Group::width)
+    }
     fn all_finished(&self) -> bool {
         self.image.read32(BREADCRUMB) == self.stamp
             && self.image.read32(REGS + 5 * 4) & 0x1ffffc == self.tail
             && self.parallel.as_ref().is_none_or(|group| {
-                group.child.image.read32(BREADCRUMB) == self.stamp
-                    && group.child.image.read32(REGS + 5 * 4) & 0x1ffffc == group.child.tail
+                group.children.iter().all(|lane| {
+                    lane.image.read32(BREADCRUMB) == self.stamp
+                        && lane.image.read32(REGS + 5 * 4) & 0x1ffffc == lane.tail
+                })
             })
     }
-    fn child_diagnostic(&self) -> Option<ContextInfo> {
-        let group = self.parallel.as_ref()?;
-        let mut info = self.diagnostic();
-        info.id = self.id + 1;
-        info.engine = Some(group.child.engine);
-        info.placements = EngineSet::of(&[group.child.engine]);
-        info.timed_out = self.timed_out && group.timeout_lanes & 2 != 0;
-        info.reset = self.reset && group.reset_lanes & 2 != 0;
-        info.observed_runtime_ticks = group.child.runtime.diagnostic_ticks();
-        Some(info)
+    fn child_diagnostics(&self) -> impl Iterator<Item = ContextInfo> + '_ {
+        let primary = self.diagnostic();
+        self.parallel.iter().flat_map(move |group| {
+            group.children.iter().enumerate().map(move |(index, lane)| {
+                let mut info = primary;
+                info.id = self.id + index as u16 + 1;
+                info.engine = Some(lane.engine);
+                info.placements = EngineSet::of(&[lane.engine]);
+                info.timed_out = self.timed_out && group.timeout_lanes & (1 << (index + 1)) != 0;
+                info.reset = self.reset && group.reset_lanes & (1 << (index + 1)) != 0;
+                info.observed_runtime_ticks = lane.runtime.diagnostic_ticks();
+                info
+            })
+        })
     }
     fn owns_engine(&self, engine: Engine) -> bool {
         self.placements.contains(engine)
             || self
                 .parallel
                 .as_ref()
-                .is_some_and(|group| group.child.engine == engine)
+                .is_some_and(|group| group.children.iter().any(|lane| lane.engine == engine))
     }
     fn diagnostic(&self) -> ContextInfo {
         ContextInfo {
@@ -384,13 +393,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
     }
 
     pub(crate) fn diagnostic_contexts(&self) -> Contexts {
-        let mut contexts = Contexts::new(
-            self.resources
-                .contexts
-                .iter()
-                .map(|c| 1 + usize::from(c.parallel.is_some()))
-                .sum(),
-        );
+        let mut contexts = Contexts::new(self.resources.contexts.iter().map(Context::width).sum());
         // Guilty/reset contexts precede innocent queued contexts if capped.
         for context in self
             .resources
@@ -406,7 +409,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .take(crate::intel_gpu_error::MAX_CONTEXTS)
         {
             contexts.push(context.diagnostic());
-            if let Some(child) = context.child_diagnostic() {
+            for child in context.child_diagnostics() {
                 contexts.push(child);
             }
         }
@@ -595,7 +598,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         let engine = context.engine();
         let placements = context.placements();
-        if context.parallel().is_some() != batch.0.parallel().is_some() {
+        if context.parallel().map(|lanes| lanes.len() - 1) != batch.0.parallel().map(<[_]>::len) {
             return Err(SchedulingError::State);
         }
         if let Some(lanes) = context.parallel() {
@@ -603,7 +606,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 .engines
                 .logical_instance(lanes[0])
                 .ok_or(SchedulingError::State)?;
-            if first.checked_add(1) != self.engines.logical_instance(lanes[1]) {
+            if lanes.iter().enumerate().any(|(index, engine)| {
+                first.checked_add(index as u16) != self.engines.logical_instance(*engine)
+            }) {
                 return Err(SchedulingError::State);
             }
         }
@@ -712,24 +717,22 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if self.resources.contexts.len() == MAX_CONTEXTS {
             return Err(SchedulingError::Full);
         }
-        let child = user
+        let width = user
             .as_ref()
             .and_then(|claim| claim.parallel())
-            .map(|lanes| lanes[1]);
+            .map_or(1, <[_]>::len);
         let placements = user.as_ref().map_or(EngineSet::of(&[engine]), |claim| {
-            if child.is_some() {
+            if width > 1 {
                 EngineSet::of(&[engine])
             } else {
                 claim.placements()
             }
         });
-        let (id, stamp) = if child.is_some() {
-            self.identities.candidate_width(2, |stamp| {
-                self.resources.contexts.iter().any(|c| c.stamp == stamp)
-            })?
+        let live = |stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp);
+        let (id, stamp) = if width == 1 {
+            self.identities.candidate(live)?
         } else {
-            self.identities
-                .candidate(|stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp))?
+            self.identities.candidate_width(width as u16, live)?
         };
         let deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
         let golden_ready = self.golden_ready(engine);
@@ -890,12 +893,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
             ring.write32(i as u64 * 4, word);
         }
         image.write32(REGS + 7 * 4, tail);
-        let parallel = if let Some(engine) = child {
+        let parallel = if width > 1 {
             match parallel::prepare(
                 r,
                 parallel::Spec {
                     platform: self.platform,
-                    engine,
                     parent: [&image, &ring],
                     parent_tail: tail,
                     id,
@@ -974,9 +976,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if mutating {
             self.pristine = false;
         }
-        self.identities.claim(id, stamp);
-        if child.is_some() {
-            self.identities.claim(id + 1, stamp);
+        for lane in 0..width {
+            self.identities.claim(id + lane as u16, stamp);
         }
         Ok((id, completion))
     }
@@ -1030,11 +1031,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
         }
         let resources = &mut *self.resources;
-        let diagnostic_total = resources
-            .contexts
-            .iter()
-            .map(|c| 1 + usize::from(c.parallel.is_some()))
-            .sum();
+        let diagnostic_total = resources.contexts.iter().map(Context::width).sum();
         for context in &mut resources.contexts {
             if context.phase == Phase::Running {
                 resources
@@ -1064,32 +1061,37 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 if let Some(group) = &mut context.parallel {
                     resources
                         .allocator
-                        .sync_for_cpu(&group.child.image)
-                        .map_err(|_| SchedulingError::Cache)?;
-                    resources
-                        .allocator
                         .sync_for_cpu(&group.scratch)
                         .map_err(|_| SchedulingError::Cache)?;
-                    fence(Ordering::Acquire);
                     if !group.valid_wq() {
                         return Err(SchedulingError::Protocol);
                     }
-                    let seq = group.child.image.read32(BREADCRUMB);
-                    if seq != 0 && seq != context.stamp {
-                        return Err(SchedulingError::Protocol);
-                    }
-                    if seq != 0 && !group.child.finished {
+                    for lane in &mut group.children {
                         resources
-                            .engines
-                            .iter_mut()
-                            .find(|e| e.engine == group.child.engine)
-                            .expect("scheduler engine")
-                            .last_progress = Some(now);
-                        group.child.finished = true;
+                            .allocator
+                            .sync_for_cpu(&lane.image)
+                            .map_err(|_| SchedulingError::Cache)?;
+                        fence(Ordering::Acquire);
+                        let seq = lane.image.read32(BREADCRUMB);
+                        if seq != 0 && seq != context.stamp {
+                            return Err(SchedulingError::Protocol);
+                        }
+                        if seq != 0 && !lane.finished {
+                            resources
+                                .engines
+                                .iter_mut()
+                                .find(|e| e.engine == lane.engine)
+                                .expect("scheduler engine")
+                                .last_progress = Some(now);
+                            lane.finished = true;
+                        }
                     }
                 }
                 if context.primary_finished
-                    && context.parallel.as_ref().is_none_or(|g| g.child.finished)
+                    && context
+                        .parallel
+                        .as_ref()
+                        .is_none_or(|g| g.children.iter().all(|lane| lane.finished))
                 {
                     context.phase = Phase::Disable;
                     // Each LRC must finish. A parent breadcrumb never retires
@@ -1142,23 +1144,26 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     if expired {
                         group.timeout_lanes |= 1;
                     }
-                    if !group.child.finished {
-                        let (child_expired, child_progressed) = group.child.runtime.expired(
-                            &group.child.image,
+                    for (index, lane) in group.children.iter_mut().enumerate() {
+                        if lane.finished {
+                            continue;
+                        }
+                        let (child_expired, child_progressed) = lane.runtime.expired(
+                            &lane.image,
                             context.stamp,
-                            group.child.engine,
+                            lane.engine,
                             ct.window(),
                         )?;
                         if child_progressed {
                             resources
                                 .engines
                                 .iter_mut()
-                                .find(|e| e.engine == group.child.engine)
+                                .find(|e| e.engine == lane.engine)
                                 .expect("scheduler engine")
                                 .last_progress = Some(now);
                         }
                         if child_expired {
-                            group.timeout_lanes |= 2;
+                            group.timeout_lanes |= 1 << (index + 1);
                             expired = true;
                         }
                     }
@@ -1171,7 +1176,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     if self.pending_error.is_none() {
                         let mut contexts = Contexts::new(diagnostic_total);
                         contexts.push(context.diagnostic());
-                        if let Some(child) = context.child_diagnostic() {
+                        for child in context.child_diagnostics() {
                             contexts.push(child);
                         }
                         self.pending_error = Some(Report::capture(
@@ -1234,26 +1239,24 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .expect("published placements");
                     if let Some(group) = &context.parallel {
                         let scratch = group.scratch.ggtt_offset();
-                        (
-                            0x4601,
-                            alloc::vec![
-                                1,
-                                id,
-                                context.engine.guc_class(),
-                                mask,
-                                scratch,
-                                0,
-                                scratch + 1024,
-                                0,
-                                1024,
-                                2,
-                                descriptor,
-                                0,
-                                group.child.image.ggtt_offset() | 0x119,
-                                0,
-                            ],
-                            Phase::Policy,
-                        )
+                        let mut payload = alloc::vec![
+                            1,
+                            id,
+                            context.engine.guc_class(),
+                            mask,
+                            scratch,
+                            0,
+                            scratch + 1024,
+                            0,
+                            1024,
+                            group.width() as u32,
+                            descriptor,
+                            0,
+                        ];
+                        for lane in &group.children {
+                            payload.extend_from_slice(&[lane.image.ggtt_offset() | 0x119, 0]);
+                        }
+                        (0x4601, payload, Phase::Policy)
                     } else {
                         (
                             0x4502,
@@ -1333,8 +1336,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     context
                         .parallel
                         .iter()
-                        .filter(|g| !g.child.finished)
-                        .map(|g| g.child.engine),
+                        .flat_map(|g| g.children.iter())
+                        .filter(|lane| !lane.finished)
+                        .map(|lane| lane.engine),
                 )
                 .filter_map(|engine| state_of(&resources.engines, engine).last_progress)
                 .max();
@@ -1382,17 +1386,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 if action == 0x7001 {
                     c.stamp == cookie & 0x7fffffff
                 } else {
-                    u32::from(c.id) == cookie
-                        || (c.parallel.is_some() && u32::from(c.id) + 1 == cookie)
+                    cookie >= u32::from(c.id) && cookie < u32::from(c.id) + c.width() as u32
                 }
             })
             .ok_or(SchedulingError::Protocol)?;
         let resources = &mut *self.resources;
-        let diagnostic_total = resources
-            .contexts
-            .iter()
-            .map(|c| 1 + usize::from(c.parallel.is_some()))
-            .sum();
+        let diagnostic_total = resources.contexts.iter().map(Context::width).sum();
         let c = &mut resources.contexts[index];
         if action == 0x4600 || (action == 0x7001 && c.phase == Phase::RetireInvalidating) {
             for backing in c.backings() {
@@ -1423,12 +1422,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     job_timeout::observed_engine(&c.image, c.stamp, c.placements)?
                         .ok_or(SchedulingError::Protocol)?;
                     if let Some(group) = &c.parallel {
-                        resources
-                            .allocator
-                            .sync_for_cpu(&group.child.image)
-                            .map_err(|_| SchedulingError::Cache)?;
                         user.capture_lanes(
-                            &[&c.image, &group.child.image],
+                            core::iter::once(&c.image)
+                                .chain(group.children.iter().map(|lane| &lane.image)),
                             c.engine.first_lri(self.platform),
                         )
                         .map_err(SchedulingError::Residency)?;
@@ -1438,11 +1434,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     }
                 }
                 let c = resources.contexts.remove(index);
+                let width = c.width();
                 let r = resources;
                 r.allocator.free(c.ring);
                 if let Some(group) = c.parallel {
                     group.free(&mut r.allocator);
-                    self.identities.retire(c.id + 1);
+                    for lane in 1..width {
+                        self.identities.retire(c.id + lane as u16);
+                    }
                 }
                 if self.defaults == Defaults::Seed(c.engine, c.id) {
                     r.seed_image = Some(c.image);
@@ -1516,7 +1515,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 if !c.timed_out && self.pending_error.is_none() {
                     let mut contexts = Contexts::new(diagnostic_total);
                     contexts.push(c.diagnostic());
-                    if let Some(child) = c.child_diagnostic() {
+                    for child in c.child_diagnostics() {
                         contexts.push(child);
                     }
                     // GuC's notification follows its engine reset. Preserve
@@ -1836,6 +1835,53 @@ mod identity_tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_parallel",
         smoke_parallel_identity_contiguous_blocks_fragmentation_and_reuse
+    );
+
+    fn smoke_parallel_wide_identity_contiguous_leases_and_fragmentation() -> TestResult {
+        for width in [3u16, 4] {
+            let mut ids = Identities::new();
+            let groups = 64 / width;
+            for group in 0..groups {
+                let expected = group * width + 1;
+                let (id, stamp) = ids.candidate_width(width, |_| false).unwrap();
+                assert_eq!(id, expected);
+                for lane in 0..width {
+                    ids.claim(id + lane, stamp);
+                }
+            }
+            assert_eq!(
+                ids.candidate_width(width, |_| false),
+                Err(SchedulingError::Full)
+            );
+            // Partial lane release is not a reusable group, even with a
+            // trailing free slot at the end of firmware ID space.
+            for lane in 0..width - 1 {
+                ids.retire(1 + lane);
+            }
+            assert_eq!(
+                ids.candidate_width(width, |_| false),
+                Err(SchedulingError::Full)
+            );
+            ids.retire(width);
+            ids.next_stamp = 0x7fffffff;
+            assert_eq!(
+                ids.candidate_width(width, |stamp| stamp == 0x7fffffff || stamp == 1),
+                Ok((1, 2))
+            );
+            let (id, stamp) = ids.candidate_width(width, |_| false).unwrap();
+            for lane in 0..width {
+                ids.claim(id + lane, stamp);
+            }
+            assert_eq!(
+                ids.candidate_width(width, |_| false),
+                Err(SchedulingError::Full)
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_parallel",
+        smoke_parallel_wide_identity_contiguous_leases_and_fragmentation
     );
 
     fn smoke_identity_pool_full_wrap_and_failed_preview() -> TestResult {

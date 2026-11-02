@@ -167,7 +167,7 @@ pub fn mtl_cdclk_for_pixel_clock(pixel_clock_khz: u32) -> Option<MtlCdclkEntry> 
 /// ratio + CDCLK_CTL divider + squash waveform — the readout
 /// path i915's `bxt_get_cdclk` implements. 0 when the CDCLK PLL
 /// is off.
-fn cdclk_current_khz<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
+pub(crate) fn cdclk_current_khz<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
     let pll = mmio.read32(CDCLK_PLL_ENABLE_REG);
     if pll & CDCLK_PLL_ENABLE == 0 {
         return 0;
@@ -352,6 +352,15 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         crate::intel_gpu_color::initialize_rgb_bypass(self.mmio)
             .map_err(|_| ModesetError::ColorPipelineUnavailable)?;
 
+        // A qualified display14.00 resource transaction owns no-SAGV,
+        // joined MBUS and a cursor DDB reservation before any plane enable.
+        // Unsupported preflight retains the historical inherited layout;
+        // every partial request/programming failure keeps this pipe off.
+        let current = cdclk_current_khz(self.mmio);
+        let target = mtl_cdclk_for_pixel_clock(mode.pixel_clock_khz)
+            .map_or(current, |entry| current.max(entry.cdclk_khz));
+        crate::intel_gpu_display_resources::initialize(self.mmio, &mode, target)
+            .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
         // Step 4: CDCLK floor for the mode's pixel clock.
         program_cdclk_floor(self.mmio, &mode)?;
 
@@ -742,7 +751,7 @@ fn validate_framebuffer(fb: &Framebuffer) -> Result<(), ModesetError> {
 /// surface registers (PIPECONF / PLANE_SURF / PLANE_STRIDE) sit
 /// at the same BAR0 offsets on Xe-LPG.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
-    let window = crate::intel_gpu_edp::BarWindow(&gpu.gtt_mmadr);
+    let window = gpu.mode_window();
     crate::intel_gpu_modeset::takeover_display_with(&window, gpu.chip.generation)
 }
 

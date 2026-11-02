@@ -66,8 +66,12 @@ fn accept(
         .is_pending());
     // Neither the placement row nor the batch-address vector remains a user
     // reference across the backend wait.
-    user.wire.store(512, &[0xff; 16]);
-    user.wire.store(768, &[0xff; 16]);
+    let width = usize::from(u16::from_le_bytes(
+        user.wire.load(64 + 32, 2).try_into().unwrap(),
+    ))
+    .max(2);
+    user.wire.store(512, &alloc::vec![0xff; width * 8]);
+    user.wire.store(768, &alloc::vec![0xff; width * 8]);
     let accepted = mailbox.accept(gt, now);
     assert_eq!(
         call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
@@ -99,9 +103,12 @@ fn dispatch(
     assert_eq!(actions, [0x7000, 0x4601, 0x100b, 0x1001, 0x1000]);
     let d = w.0.borrow();
     assert_eq!(d.parallel_contexts.len(), 1);
-    let (&id, &group) = d.parallel_contexts.iter().next().unwrap();
-    assert_eq!(registered.len(), 2);
-    assert_eq!([registered[&id], registered[&(id + 1)]], group.images);
+    let (&id, group) = d.parallel_contexts.iter().next().unwrap();
+    let group = group.clone();
+    assert_eq!(registered.len(), group.images.len());
+    for (index, base) in group.images.iter().enumerate() {
+        assert_eq!(registered[&(id + index as u32)], *base);
+    }
     assert_ne!(group.images[0], group.images[1]);
     (id, group)
 }
@@ -123,7 +130,7 @@ fn smoke_parallel_queue_matrix_copy_fault_and_join_store_refusal() -> TestResult
     let baseline = arena.live_allocations();
     for (width, count, lanes) in [
         (0, 1, alloc::vec![[4, 0, 0, 0]]),
-        (3, 1, alloc::vec![[4, 0, 0, 0], [4, 1, 0, 0], [4, 2, 0, 0]]),
+        (5, 1, alloc::vec![[4, 0, 0, 0]; 5]),
         (2, 2, alloc::vec![[4, 0, 0, 0]; 4]),
         (2, 1, alloc::vec![[0, 0, 0, 0]; 2]),
         (2, 1, alloc::vec![[5, 0, 0, 0]; 2]),
@@ -254,24 +261,29 @@ fn smoke_parallel_queue_real_copy_compute_wq_and_per_lane_saved_state() -> TestR
             assert_eq!(present.logical_instance(lanes[0]), Some(first));
             assert_eq!(present.logical_instance(lanes[1]), Some(first + 1));
             let d = w.0.borrow();
-            let roots = group.images.map(|base| {
-                let image = d.memory[&base].borrow();
-                assert_eq!(
-                    image[1026],
-                    lanes[usize::from(base == group.images[1])].base() + 0x244
-                );
-                if iteration != 0 {
+            let roots: Vec<_> = group
+                .images
+                .iter()
+                .copied()
+                .map(|base| {
+                    let image = d.memory[&base].borrow();
                     assert_eq!(
-                        image[0x1800 / 4],
-                        if base == group.images[0] {
-                            0xaabbccdd
-                        } else {
-                            0x55667788
-                        }
+                        image[1026],
+                        lanes[usize::from(base == group.images[1])].base() + 0x244
                     );
-                }
-                u64::from(image[1024 + 0x31]) << 32 | u64::from(image[1024 + 0x33])
-            });
+                    if iteration != 0 {
+                        assert_eq!(
+                            image[0x1800 / 4],
+                            if base == group.images[0] {
+                                0xaabbccdd
+                            } else {
+                                0x55667788
+                            }
+                        );
+                    }
+                    u64::from(image[1024 + 0x31]) << 32 | u64::from(image[1024 + 0x33])
+                })
+                .collect();
             assert_eq!(roots[0], roots[1]);
             assert_ne!(roots[0], 0);
             assert!(group
@@ -283,7 +295,7 @@ fn smoke_parallel_queue_real_copy_compute_wq_and_per_lane_saved_state() -> TestR
                 narf_filesystem::DrmFence::is_submit_ready(fence.as_ref())
                     && fence.result().is_none()
             );
-            for (lane, base) in group.images.into_iter().enumerate() {
+            for (lane, base) in group.images.iter().copied().enumerate() {
                 execute_parallel_lane(&w, id, base);
                 w.0.borrow().memory[&base].borrow_mut()[0x1800 / 4] =
                     [0xaabbccdd, 0x55667788][lane];
@@ -600,7 +612,8 @@ fn smoke_parallel_queue_malformed_lost_ack_and_cache_failure_keep_all_dma_until_
             }
             assert!(enabled);
             let d = w.0.borrow();
-            let (&id, &group) = d.parallel_contexts.iter().next().unwrap();
+            let (&id, group) = d.parallel_contexts.iter().next().unwrap();
+            let group = group.clone();
             (id, group)
         } else {
             dispatch(
@@ -773,7 +786,7 @@ fn smoke_parallel_queue_queued_gang_progress_and_finished_lane_exclusion() -> Te
         let (id, group) = dispatch(&mut gt, &w, &mut registered, 501, false);
         let retained = arena.live_allocations();
         let lanes = context.parallel().unwrap();
-        assert_eq!(lanes, [Engine::Ccs1, Engine::Ccs3]);
+        assert_eq!(lanes, &[Engine::Ccs1, Engine::Ccs3]);
         if parent_finished {
             execute_parallel_lane(&w, id, group.images[0]);
         }
@@ -853,3 +866,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_parallel",
     smoke_parallel_queue_queued_gang_progress_and_finished_lane_exclusion
 );
+
+mod wider {
+    include!("intel_gpu_parallel_wide_tests.rs");
+}

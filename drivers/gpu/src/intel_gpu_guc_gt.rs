@@ -7,6 +7,7 @@
 //! other reset/firmware users. No userspace submission is admitted here.
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_gt_hw::{HardwareError, HardwareInit};
 use crate::intel_gpu_gt_registers::{RegisterError, RegisterInit};
 use crate::intel_gpu_guc::GuCMessage;
@@ -16,6 +17,7 @@ use crate::intel_gpu_guc_sched::{GuCScheduler, SchedulingError};
 use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
 use crate::intel_gpu_hwconfig::HardwareConfig;
 use crate::intel_gpu_nonpriv::EnginePolicy;
+use crate::intel_gpu_rcs::GpuBacking;
 use crate::intel_gpu_topology::{GtTopology, TopologyError};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
@@ -87,6 +89,8 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     /// Battlemage tile-0 local memory, probed under register steering. A
     /// malformed layout leaves VRAM unpublished, never guessed.
     vram: Option<crate::intel_gpu_vram::VramLayout>,
+    log_stream: Option<crate::intel_gpu_guc_log::stream::Actor>,
+    log_fence: u16,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -154,6 +158,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             registers: None,
             compute_configuration: None,
             vram: None,
+            log_stream: None,
+            log_fence: crate::intel_gpu_guc_log::stream::FIRST_FENCE,
         }
     }
 
@@ -279,6 +285,147 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
 
     pub fn vram_layout(&self) -> Option<crate::intel_gpu_vram::VramLayout> {
         self.vram
+    }
+
+    pub(crate) fn vram_needs_ccs_clear(&self) -> bool {
+        self.parts.boot.platform() == GtPlatform::Alchemist
+    }
+
+    pub(crate) fn vram_cpu_access(&self, epoch: u64) -> bool {
+        self.state == GtState::SchedulingReady
+            && self.parts.boot.platform() == GtPlatform::Battlemage
+            && epoch != 0
+            && self.user_epoch() == Some(epoch)
+            && self.awake().is_ok()
+    }
+
+    pub(crate) fn attach_log_stream(
+        &mut self,
+        session: Arc<crate::intel_gpu_guc_log::StreamSession>,
+        epoch: u64,
+        now: u64,
+        digest: [u8; 32],
+    ) -> Result<(), narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        if self.state != GtState::SchedulingReady || epoch == 0 || self.user_epoch() != Some(epoch)
+        {
+            return Err(FsError::NoDevice);
+        }
+        if let Some(actor) = &self.log_stream {
+            return if actor.is(&session) {
+                Ok(())
+            } else {
+                Err(FsError::Busy)
+            };
+        }
+        self.awake().map_err(|_| FsError::NoDevice)?;
+        let log = self.parts.boot.live_log().ok_or(FsError::NoDevice)?;
+        if !log.backing.coherent_for_device() {
+            return Err(FsError::Unsupported);
+        }
+        if self
+            .log_fence
+            .checked_add(2)
+            .is_none_or(|last| last > crate::intel_gpu_guc_log::stream::LAST_FENCE)
+        {
+            return Err(FsError::Busy);
+        }
+        let identity = crate::intel_gpu_guc_log::Identity {
+            epoch,
+            incarnation: log.incarnation,
+            now_ns: now,
+            platform: self.parts.boot.platform(),
+            firmware_version: log.firmware_version,
+            firmware_digest: digest,
+        };
+        self.log_stream = Some(crate::intel_gpu_guc_log::stream::Actor::new(
+            session,
+            identity,
+            self.log_fence,
+        ));
+        self.log_fence += 3;
+        Ok(())
+    }
+
+    pub(crate) fn poll_log_stream(
+        &mut self,
+        now: u64,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<(), GtError> {
+        let Some(mut actor) = self.log_stream.take() else {
+            return Ok(());
+        };
+        if self.state != GtState::SchedulingReady || !access() || self.awake().is_err() {
+            actor.lost();
+            self.log_stream = Some(actor);
+            return Ok(());
+        }
+        let parts = &mut *self.parts;
+        let window = parts.boot.window();
+        let ack = parts
+            .boot
+            .platform()
+            .guc_forcewake_ack()
+            .ok_or(GtError::State)?;
+        let log = parts.boot.live_log().ok_or(GtError::State)?;
+        let hardware = self.hardware.as_ref().filter(|hw| hw.ready());
+        let live = || {
+            if !access() {
+                return false;
+            }
+            let request = window.read32(REQUEST);
+            let ack = window.read32(ack);
+            request != u32::MAX
+                && ack != u32::MAX
+                && request & 1 != 0
+                && ack & 1 != 0
+                && hardware.is_none_or(|hw| hw.awake(window).is_ok())
+        };
+        match actor.poll(
+            parts.ct.as_mut().ok_or(GtError::State)?,
+            log.backing,
+            now,
+            live,
+        ) {
+            Ok(true) => self.log_stream = Some(actor),
+            Ok(false) => {}
+            Err(error) => {
+                self.log_stream = Some(actor);
+                self.state = GtState::Lost;
+                return Err(GtError::Transport(error));
+            }
+        }
+        Ok(())
+    }
+
+    /// Caller has checked this unpublished allocation against this card's
+    /// retained VRAM pool. Only the trusted CCS-clear factory is executable.
+    pub(crate) fn clear_vram(
+        &mut self,
+        now: u64,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
+        if self.parts.boot.platform() != GtPlatform::Alchemist
+            || epoch == 0
+            || self.user_epoch() != Some(epoch)
+        {
+            return Err(GtError::State);
+        }
+        self.admit_scheduling()?;
+        let batch = crate::intel_gpu_exec::prepare_vram_clear(object)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        // SAFETY: factory retains all private mappings and zero source, emits
+        // only source-qualified BCS0 CCS clear/flush, and excludes user writes.
+        let (_, fence) = unsafe {
+            self.parts
+                .scheduler
+                .as_mut()
+                .ok_or(GtError::State)?
+                .submit_resident_on(now, crate::intel_gpu_engine::Engine::Bcs0, batch)
+                .map_err(GtError::Scheduling)?
+        };
+        Ok(fence)
     }
 
     pub fn topology(&self) -> Option<&GtTopology> {
@@ -583,6 +730,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             return Err(GtError::State);
         }
         // Close admission before any fallible reset/recovery operation.
+        self.log_stream.take();
         self.state = GtState::Lost;
         self.parts.boot.cancel_reload();
         if matches!(
@@ -782,6 +930,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// SchedulingReady with no registered, running or retiring context.
     pub fn idle(&self) -> bool {
         self.state == GtState::SchedulingReady
+            && self.log_stream.is_none()
             && self
                 .parts
                 .scheduler
@@ -973,6 +1122,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         let result = self.poll_inner(now);
         if matches!(result, Poll::Ready(Err(_))) && self.state != GtState::Staged {
             self.state = GtState::Lost;
+            if let Some(actor) = &mut self.log_stream {
+                actor.lost();
+            }
         }
         result
     }
@@ -1029,8 +1181,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => {
                         let registers = result.map_err(GtError::Registers)?;
-                        self.vram =
-                            registers.and_then(|r| crate::intel_gpu_vram::VramLayout::xe2(r).ok());
+                        self.vram = registers.and_then(|r| {
+                            crate::intel_gpu_vram::VramLayout::from_registers(r).ok()
+                        });
                     }
                 }
                 self.awake()?;

@@ -710,7 +710,11 @@ pub(crate) mod intel_gpu_color;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_context;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_cursor;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_display_resources;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dmc;
 #[cfg(feature = "intel")]

@@ -857,7 +857,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             let control_fence = (words[1024 + head as usize] >> 16) as u16;
             assert_eq!(
                 request[0] >> 28,
-                if request[0] as u16 == 0x3003 && request[1] != 2 {
+                if matches!(request[0] as u16, 0x40 | 0x302)
+                    || (request[0] as u16 == 0x3003 && request[1] != 2)
+                {
                     0
                 } else {
                     2
@@ -924,28 +926,31 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     .is_none());
             }
             0x4601 => {
-                // Independent MULTI_LRC wire vector: a contiguous two-ID
-                // group, first-lane logical mask, explicit descriptor+WQ.
-                assert_eq!(request.len(), 15);
+                // Independent width-parametric MULTI_LRC wire vector.
+                let width = request[10] as usize;
+                assert!((2..=4).contains(&width));
+                assert_eq!(request.len(), 11 + width * 2);
                 assert_eq!(request[1], 1);
                 assert!(matches!(request[3], 3 | 4));
                 assert_eq!(request[4].count_ones(), 1);
-                assert_eq!([request[6], request[8], request[12], request[14]], [0; 4]);
-                assert_eq!(
-                    [request[7], request[9], request[10]],
-                    [request[5] + 1024, 1024, 2]
-                );
-                assert_eq!([request[11] & 0xfff, request[13] & 0xfff], [0x119; 2]);
-                let images = [request[11] & !0xfff, request[13] & !0xfff];
+                assert_eq!([request[6], request[8]], [0; 2]);
+                assert_eq!([request[7], request[9]], [request[5] + 1024, 1024]);
+                let images: Vec<_> = request[11..]
+                    .chunks_exact(2)
+                    .map(|descriptor| {
+                        assert_eq!((descriptor[0] & 0xfff, descriptor[1]), (0x119, 0));
+                        descriptor[0] & !0xfff
+                    })
+                    .collect();
                 {
                     let d = w.0.borrow();
                     assert!(d.synced.contains(&request[5]));
                     let scratch = d.memory[&request[5]].borrow();
-                    assert_eq!(&scratch[..4], &[0, 20, 0, 1]);
+                    assert_eq!(&scratch[..4], &[0, (width as u32 + 3) * 4, 0, 1]);
                     assert!(scratch[4..256].iter().all(|word| *word == 0));
                     let ads = d.memory[&0x20001000].borrow();
                     let first_logical = request[4].trailing_zeros() as usize;
-                    for (lane, base) in images.into_iter().enumerate() {
+                    for (lane, base) in images.iter().copied().enumerate() {
                         let image = d.memory[&base].borrow();
                         let logical = first_logical + lane;
                         let physical = (ads
@@ -983,29 +988,32 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x1000 => {
                 assert_eq!(request.len(), 2);
                 let id = request[1];
-                let group = w.0.borrow().parallel_contexts[&id];
+                let group = w.0.borrow().parallel_contexts[&id].clone();
                 assert!(group.enabled);
+                let width = group.images.len();
                 let lanes = {
                     let d = w.0.borrow();
                     let scratch = d.memory[&group.scratch].borrow();
-                    assert_eq!(&scratch[..4], &[0, 20, 0, 1]);
+                    assert_eq!(&scratch[..4], &[0, (width as u32 + 3) * 4, 0, 1]);
                     let parent = d.memory[&group.images[0]].borrow();
-                    let child = d.memory[&group.images[1]].borrow();
                     assert_eq!(
-                        &scratch[256..261],
+                        &scratch[256..260],
                         &[
-                            0x00040005,
+                            ((width as u32 + 2) << 16) | 5,
                             group.images[0] | 0x119,
                             id | (parent[1024 + 7] / 8) << 18,
                             0,
-                            child[1024 + 7] / 8,
                         ]
                     );
-                    d.parallel_lanes.unwrap_or(3)
+                    for (index, base) in group.images.iter().enumerate().skip(1) {
+                        let child = d.memory[base].borrow();
+                        assert_eq!(scratch[259 + index], child[1024 + 7] / 8);
+                    }
+                    d.parallel_lanes.unwrap_or((1 << width) - 1)
                 };
-                w.0.borrow().memory[&group.scratch].borrow_mut()[0] = 20;
+                w.0.borrow().memory[&group.scratch].borrow_mut()[0] = (width as u32 + 3) * 4;
                 if execute {
-                    for (lane, base) in group.images.into_iter().enumerate() {
+                    for (lane, base) in group.images.iter().copied().enumerate() {
                         if lanes & (1 << lane) != 0 {
                             execute_parallel_lane(w, id, base);
                         }
@@ -1032,7 +1040,12 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         .unwrap()
                         .enabled = request[2] == 1;
                     // Linux aliases every group ID for scheduler replies.
-                    let reply = id + u32::from(w.0.borrow().parallel_reply_child);
+                    let d = w.0.borrow();
+                    let reply = id
+                        + d.parallel_reply_lane
+                            .unwrap_or(u32::from(d.parallel_reply_child));
+                    assert!(reply < id + d.parallel_contexts[&id].images.len() as u32);
+                    drop(d);
                     event(&memory, 0x1002, &[reply, request[2]]);
                     continue;
                 }
@@ -1127,13 +1140,23 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let base = registered.remove(&request[1]).expect("registered identity");
                 w.0.borrow_mut().virtual_contexts.remove(&base);
                 let group = w.0.borrow_mut().parallel_contexts.remove(&request[1]);
-                if let Some(group) = group {
+                if let Some(group) = &group {
                     assert!(!group.enabled);
-                    assert_eq!(registered.remove(&(request[1] + 1)), Some(group.images[1]));
+                    for (index, base) in group.images.iter().enumerate().skip(1) {
+                        assert_eq!(registered.remove(&(request[1] + index as u32)), Some(*base));
+                    }
                 }
-                let child = group.is_some() && w.0.borrow().parallel_reply_child;
-                event(&memory, 0x4600, &[request[1] + u32::from(child)]);
+                let d = w.0.borrow();
+                let lane = if group.is_some() {
+                    d.parallel_reply_lane
+                        .unwrap_or(u32::from(d.parallel_reply_child))
+                } else {
+                    0
+                };
+                drop(d);
+                event(&memory, 0x4600, &[request[1] + lane]);
             }
+            0x40 | 0x302 | 0x30 => bcs8::stream_hw::service(w, &memory, control_fence, &request),
             0x3003 => service_slpc(w, &memory, control_fence, &request),
             0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
             _ => panic!("unexpected action {action:x}"),
@@ -1386,14 +1409,16 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
     let mut i = 0;
     if words[0] == 0x18800101 {
         let batch = u64::from(words[1]) | u64::from(words[2]) << 32;
-        let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
-        // SAFETY: translated page is an owned resident batch BO.
-        let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
-        assert_eq!((cmd[0], cmd[4], cmd[5]), (0x10000002, 0x05000000, 0));
-        let dst = u64::from(cmd[1]) | u64::from(cmd[2]) << 32;
-        let target = narf_memory::PhysAddr::new(walk(dst)).kernel_mut_ptr::<u32>();
-        // SAFETY: the walk resolved one owned writable result dword.
-        unsafe { core::ptr::write_volatile(target, cmd[3]) };
+        if !crate::intel_gpu_exec::vram_clear::execute_fixture(root, batch) {
+            let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
+            // SAFETY: translated page is an owned resident batch BO.
+            let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
+            assert_eq!((cmd[0], cmd[4], cmd[5]), (0x10000002, 0x05000000, 0));
+            let dst = u64::from(cmd[1]) | u64::from(cmd[2]) << 32;
+            let target = narf_memory::PhysAddr::new(walk(dst)).kernel_mut_ptr::<u32>();
+            // SAFETY: the walk resolved one owned writable result dword.
+            unsafe { core::ptr::write_volatile(target, cmd[3]) };
+        }
         i = 3;
     }
     assert_eq!(words[i], 0x04000000);
@@ -1555,9 +1580,18 @@ fn execute_ppgtt_probe(
     if pat == 3 {
         expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
-    let has_batch = ring.windows(2).any(|w| w == [0x02800100, 0x18800101]);
-    if has_batch {
-        expected.extend_from_slice(&[0x02800100, 0x18800101, 0, 0x1234, 0x04000000]);
+    let batch = ring
+        .windows(4)
+        .find(|w| w[..2] == [0x02800100, 0x18800101])
+        .map(|w| u64::from(w[2]) | u64::from(w[3]) << 32);
+    if let Some(address) = batch {
+        expected.extend_from_slice(&[
+            0x02800100,
+            0x18800101,
+            address as u32,
+            (address >> 32) as u32,
+            0x04000000,
+        ]);
     }
     if pat == 0 || pat == 3 {
         expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
@@ -1592,19 +1626,19 @@ fn execute_ppgtt_probe(
     assert_eq!(image[1031] as usize, expected.len() * 4);
     assert_eq!(&ring[..expected.len()], expected.as_slice());
     // Literal batch from xe_mi_commands.h, independent of the producer's codec.
-    if has_batch {
-        let code = narf_memory::PhysAddr::new(walk(0x1234_0000_0000, false)).kernel_ptr::<u32>();
-        for (i, word) in [0x10000002, 0x80, 0x2345, 0x4e415246, 0x05000000, 0]
-            .into_iter()
-            .enumerate()
-        {
-            // SAFETY: translated page is owned by the resident fixture.
-            assert_eq!(unsafe { core::ptr::read_volatile(code.add(i)) }, word);
-        }
-        let target =
-            narf_memory::PhysAddr::new(walk(0x2345_0000_0080, true)).kernel_mut_ptr::<u32>();
-        // SAFETY: the validated writable leaf is an owned private result page.
-        unsafe { core::ptr::write_volatile(target, 0x4e415246) };
+    if let Some(address) = batch {
+        let code = narf_memory::PhysAddr::new(walk(address, false)).kernel_ptr::<u32>();
+        // SAFETY: each native fixture places this six-DW batch inside one
+        // resident code page. Fetch and decode independently of its producer.
+        let commands = unsafe { core::slice::from_raw_parts(code, 6) };
+        assert_eq!(
+            (commands[0], commands[4], commands[5]),
+            (0x10000002, 0x05000000, 0)
+        );
+        let destination = u64::from(commands[1]) | u64::from(commands[2]) << 32;
+        let target = narf_memory::PhysAddr::new(walk(destination, true)).kernel_mut_ptr::<u32>();
+        // SAFETY: the four-level walk proved a resident writable result dword.
+        unsafe { core::ptr::write_volatile(target, commands[3]) };
     }
     if let Some(store) = user_store {
         let address = u64::from(store[1]) | u64::from(store[2]) << 32;

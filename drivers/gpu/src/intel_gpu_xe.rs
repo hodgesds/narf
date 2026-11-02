@@ -117,7 +117,13 @@ impl XeFile {
                         8 | if info.vram.is_some() { 4 } else { 0 }
                     }
                     crate::intel_gpu_gt::GtPlatform::Integrated(_) => 2,
-                    crate::intel_gpu_gt::GtPlatform::Alchemist => 0,
+                    crate::intel_gpu_gt::GtPlatform::Alchemist => {
+                        if info.vram.is_some() {
+                            4
+                        } else {
+                            0
+                        }
+                    }
                 };
                 // xe_gem_create_ioctl's EINVAL classes, then refused features.
                 if size == 0
@@ -279,9 +285,9 @@ impl XeFile {
         let width = u16::from_le_bytes(wire[8..10].try_into().unwrap());
         let count = u16::from_le_bytes(wire[10..12].try_into().unwrap());
         // xe_exec_queue.c bounds the copied placement matrix to nine entries.
-        // Admit only one two-LRC row; wider/multi-placement parallel groups
-        // require additional firmware workqueue and migration ownership.
-        if !((width == 1 && (1..=9).contains(&count)) || (width == 2 && count == 1)) {
+        // At most four admitted same-class lanes and one parallel row.
+        // Multiple placement rows require additional migration ownership.
+        if !((width == 1 && (1..=9).contains(&count)) || ((2..=4).contains(&width) && count == 1)) {
             return Err(FsError::InvalidData);
         }
         let instances = read(
@@ -342,21 +348,23 @@ impl XeFile {
             }
             extensions = u64_at(&ext, 0);
         }
-        let context = if width == 2 {
+        let context = if width > 1 {
             if !matches!(class, 1 | 4) {
                 return Err(FsError::InvalidData);
             }
-            let first = present
-                .from_class_instance(class, logical)
-                .ok_or(FsError::InvalidData)?;
-            let second_logical = u16::from_le_bytes(instances[10..12].try_into().unwrap());
-            if logical.checked_add(1) != Some(second_logical) {
-                return Err(FsError::InvalidData);
+            let mut lanes = alloc::vec::Vec::new();
+            for (index, instance) in instances.chunks_exact(8).enumerate() {
+                let next = u16::from_le_bytes(instance[2..4].try_into().unwrap());
+                if logical.checked_add(index as u16) != Some(next) {
+                    return Err(FsError::InvalidData);
+                }
+                lanes.push(
+                    present
+                        .from_class_instance(class, next)
+                        .ok_or(FsError::InvalidData)?,
+                );
             }
-            let second = present
-                .from_class_instance(class, second_logical)
-                .ok_or(FsError::InvalidData)?;
-            UserContext::for_parallel([first, second])?
+            UserContext::for_parallel(lanes)?
         } else if class == 5 {
             UserContext::new()
         } else {
@@ -398,6 +406,9 @@ impl XeFile {
         syncobjs: &IrqSafeSpinLock<SyncObjTable>,
     ) -> Option<Result<u64, FsError>> {
         match cmd {
+            abi::GEM_CREATE if info.platform.is_discrete() && info.vram.is_some() => {
+                Some(self.create_vram(info, address, user, gem).await.map(|_| 0))
+            }
             abi::DEVICE_QUERY => Some(
                 crate::intel_gpu_xe_query::query_user(info, address, user)
                     .await
@@ -412,6 +423,104 @@ impl XeFile {
             abi::WAIT_USER_FENCE => Some(self.wait_user(address, user).await.map(|_| 0)),
             _ => self.dispatch(info, cmd, address, user, gem),
         }
+    }
+
+    async fn create_vram(
+        &self,
+        info: &DeviceInfo,
+        address: u64,
+        user: &dyn IoctlContext,
+        gem: &GemState,
+    ) -> Result<(), FsError> {
+        let mut wire = read(user, address, 56)?;
+        zero(&wire[..8])?;
+        zero(&wire[34..56])?;
+        let size = u64_at(&wire, 8);
+        let placement = u32_at(&wire, 16);
+        let flags = u32_at(&wire, 20);
+        let caching = u16::from_le_bytes(wire[32..34].try_into().unwrap());
+        let supported_flags = if info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
+            4 | 8
+        } else {
+            4
+        };
+        let pool = info.vram.as_ref().ok_or(FsError::NoDevice)?;
+        if size == 0 || size & 4095 != 0 || placement == 0 || placement & !3 != 0
+            || flags & !supported_flags != 0 || (flags & 4 != 0 && placement & 2 == 0)
+            || caching == 0 || caching > 2 || (placement & 2 != 0 && caching != 2)
+            // xe_bo_create_locked_range: user objects with NEED64K VRAM
+            // cannot be rounded behind the user's declared object extent.
+            || (placement & 2 != 0 && size & (pool.page_size() - 1) != 0)
+        {
+            return Err(FsError::InvalidData);
+        }
+        let vm_id = u32_at(&wire, 24);
+        let vm = if vm_id == 0 {
+            None
+        } else {
+            Some(self.vm(vm_id)?)
+        };
+        if let Some(vm) = &vm {
+            vm.check()?;
+        }
+        let owner = vm.as_ref().map(|vm| vm.identity);
+        if placement & 2 == 0 {
+            let names = self.names.lock();
+            if let Some(vm) = &vm {
+                vm.check()?;
+            }
+            gem.create_for_vm(size, owner, |handle, _| {
+                put32(&mut wire, 28, handle);
+                user.write(address, &wire)
+            })?;
+            drop(names);
+            return Ok(());
+        }
+        let pending = match gem.prepare_vram(size, owner, pool) {
+            Ok(pending) => pending,
+            Err(FsError::OutOfMemory) if placement & 1 != 0 => {
+                let names = self.names.lock();
+                if let Some(vm) = &vm {
+                    vm.check()?;
+                }
+                gem.create_for_vm(size, owner, |handle, _| {
+                    put32(&mut wire, 28, handle);
+                    user.write(address, &wire)
+                })?;
+                drop(names);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
+        let epoch = backend
+            .status()
+            .filter(|s| s.platform == info.platform && s.epoch != 0)
+            .ok_or(FsError::NoDevice)?
+            .epoch;
+        let fence = backend.clear_vram(pending.object(), epoch).await?;
+        fence
+            .wait()
+            .await
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+        if backend
+            .status()
+            .is_none_or(|s| s.platform != info.platform || s.epoch != epoch)
+        {
+            return Err(FsError::NoDevice);
+        }
+        // Nothing user-visible names this object before successful hardware
+        // retirement. VM destruction during the wait cannot publish an orphan.
+        let names = self.names.lock();
+        if let Some(vm) = &vm {
+            vm.check()?;
+        }
+        gem.publish_vram(pending, &fence, |handle, _| {
+            put32(&mut wire, 28, handle);
+            user.write(address, &wire)
+        })?;
+        drop(names);
+        Ok(())
     }
     async fn bind(
         &self,
@@ -498,7 +607,8 @@ impl XeFile {
         // the queue width, then reset status before any sync is parsed.
         let queue = self.queue(u32_at(&wire, 8))?;
         let parallel = queue.context.parallel();
-        if queue.bind || (count != 0 && count != if parallel.is_some() { 2 } else { 1 }) {
+        let width = parallel.map_or(1, <[_]>::len);
+        if queue.bind || (count != 0 && usize::from(count) != width) {
             return Err(FsError::InvalidData);
         }
         // A hung or reset queue is banned: -ECANCELED (reset_status).
@@ -517,8 +627,13 @@ impl XeFile {
             return Err(FsError::NotImplemented);
         }
         let addresses = if parallel.is_some() && count != 0 {
-            let vector = read(user, u64_at(&wire, 24), 16)?;
-            Some([u64_at(&vector, 0), u64_at(&vector, 8)])
+            let vector = read(user, u64_at(&wire, 24), width * 8)?;
+            Some(
+                vector
+                    .chunks_exact(8)
+                    .map(|word| u64_at(word, 0))
+                    .collect::<alloc::vec::Vec<_>>(),
+            )
         } else {
             None
         };
@@ -543,7 +658,8 @@ impl XeFile {
                 ResidentBatch::from_vm_parallel(
                     status.platform,
                     &state.mappings,
-                    addresses,
+                    addresses.as_deref(),
+                    width,
                     queue.vm.scratch,
                 )?
             } else {

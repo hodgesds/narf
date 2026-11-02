@@ -112,7 +112,7 @@ fn query_wire(
                 let used = vram.used();
                 reply[96..98].copy_from_slice(&1u16.to_le_bytes());
                 reply[98..100].copy_from_slice(&1u16.to_le_bytes());
-                put32(&mut reply, 100, 4096); // BMG has no NEED64K VRAM flag
+                put32(&mut reply, 100, vram.page_size() as u32);
                 put64(&mut reply, 104, vram.total());
                 put64(&mut reply, 112, used);
                 put64(&mut reply, 120, vram.visible());

@@ -665,6 +665,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.sync_for_device(&r.logs)?;
         let mut params = [0u32; 14];
         params[0] = r.logs.ggtt_offset() | 0x3f5;
+        if crate::intel_gpu_guc_log::stream::enabled() {
+            params[0] |= 1 << 1; // source half-full notifications; verbosity stays off
+        }
         params[1] = workarounds.flags;
         params[2] = if self.scheduling.is_some() {
             1 << 4
@@ -922,9 +925,9 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     type Words = Rc<RefCell<Vec<u32>>>;
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct ParallelContext {
-        images: [u32; 2],
+        images: Vec<u32>,
         scratch: u32,
         enabled: bool,
     }
@@ -954,12 +957,24 @@ mod tests {
         parallel_contexts: BTreeMap<u32, ParallelContext>,
         parallel_lanes: Option<u8>,
         parallel_reply_child: bool,
+        parallel_reply_lane: Option<u32>,
         parallel_starts: Vec<(u32, u32)>,
+        stream_controls: Vec<(u16, u16, u32)>,
+        stream_fences: BTreeSet<u16>,
+        stream_acks: usize,
+        stream_enabled: bool,
+        stream_drop: Option<(u16, u32)>,
+        stream_overwrite: bool,
+        mmio_reads: Cell<usize>,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
     impl MmioWindow for Window {
         fn read32(&self, offset: u64) -> u32 {
+            {
+                let d = self.0.borrow();
+                d.mmio_reads.set(d.mmio_reads.get() + 1);
+            }
             if offset == 0xd8c {
                 let mut device = self.0.borrow_mut();
                 let value = *device.regs.get(&offset).unwrap_or(&0);

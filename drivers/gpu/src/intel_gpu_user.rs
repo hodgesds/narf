@@ -18,6 +18,7 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 static STATE_BYTES: AtomicUsize = AtomicUsize::new(0);
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PARALLEL_WIDTH: usize = 4;
 
 pub(crate) fn next_epoch() -> u64 {
     NEXT_EPOCH
@@ -58,6 +59,18 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn device_facts(&self) -> Option<DeviceFacts> {
         None
     }
+    /// Initialize unpublished owned VRAM under this card's retained power/GT
+    /// owner: a trusted DG2 data/CCS BCS0 job, or bounded Xe2 WC CPU zeroing.
+    /// A GPU job retains the complete graph through terminal completion or
+    /// verified reset. The caller publishes no handle until the returned
+    /// fence succeeds in `epoch`.
+    fn clear_vram(
+        &self,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _epoch: u64,
+    ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     /// Nonblocking policy requests serviced only by the retained GT owner.
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         None
@@ -73,6 +86,13 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
         &self,
         _buffer: crate::intel_gpu_guc_log::CaptureBuffer,
     ) -> FsFuture<'_, crate::intel_gpu_guc_log::Snapshot> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// Attach one privileged stream under the real GT reset/power owner.
+    fn guc_log_stream(
+        &self,
+        _session: Arc<crate::intel_gpu_guc_log::StreamSession>,
+    ) -> FsFuture<'_, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
     /// Correlate a live engine counter with one supported CPU clock while the
@@ -168,7 +188,7 @@ pub struct UserContext {
     pub(crate) serial: Mutex<()>,
     engine: crate::intel_gpu_engine::Engine,
     placements: crate::intel_gpu_engine::EngineSet,
-    parallel: Option<[crate::intel_gpu_engine::Engine; 2]>,
+    parallel: Option<Vec<crate::intel_gpu_engine::Engine>>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -202,25 +222,33 @@ impl UserContext {
     }
 
     pub(crate) fn for_parallel(
-        lanes: [crate::intel_gpu_engine::Engine; 2],
+        lanes: impl AsRef<[crate::intel_gpu_engine::Engine]>,
     ) -> Result<Arc<Self>, FsError> {
-        if lanes[0] == lanes[1]
-            || lanes[0].xe_class() != lanes[1].xe_class()
+        let lanes = lanes.as_ref();
+        if !(2..=MAX_PARALLEL_WIDTH).contains(&lanes.len())
             || !(lanes[0].is_copy() || lanes[0].is_compute())
+            || lanes.iter().enumerate().any(|(i, engine)| {
+                engine.xe_class() != lanes[0].xe_class() || lanes[..i].contains(engine)
+            })
         {
             return Err(FsError::InvalidData);
         }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(lanes.len())
+            .map_err(|_| FsError::OutOfMemory)?;
+        owned.extend_from_slice(lanes);
         Ok(Self::with_placements(
             lanes[0],
-            crate::intel_gpu_engine::EngineSet::of(&lanes),
-            Some(lanes),
+            crate::intel_gpu_engine::EngineSet::of(lanes),
+            Some(owned),
         ))
     }
 
     fn with_placements(
         engine: crate::intel_gpu_engine::Engine,
         placements: crate::intel_gpu_engine::EngineSet,
-        parallel: Option<[crate::intel_gpu_engine::Engine; 2]>,
+        parallel: Option<Vec<crate::intel_gpu_engine::Engine>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
@@ -247,8 +275,8 @@ impl UserContext {
     pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
         self.placements
     }
-    pub(crate) fn parallel(&self) -> Option<[crate::intel_gpu_engine::Engine; 2]> {
-        self.parallel
+    pub(crate) fn parallel(&self) -> Option<&[crate::intel_gpu_engine::Engine]> {
+        self.parallel.as_deref()
     }
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
@@ -316,7 +344,7 @@ impl UserContext {
             .filter(|n| *n != 0 && *n <= 13)
             .ok_or(FsError::InvalidData)? as usize
             * 1024
-            * if self.parallel.is_some() { 2 } else { 1 };
+            * self.parallel().map_or(1, <[_]>::len);
         if state.image.is_empty() {
             let bytes = words * 4;
             STATE_BYTES
@@ -357,8 +385,8 @@ impl ContextClaim {
     pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
         self.context.placements
     }
-    pub(crate) fn parallel(&self) -> Option<[crate::intel_gpu_engine::Engine; 2]> {
-        self.context.parallel
+    pub(crate) fn parallel(&self) -> Option<&[crate::intel_gpu_engine::Engine]> {
+        self.context.parallel()
     }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);
@@ -366,12 +394,7 @@ impl ContextClaim {
     pub(crate) fn restore_lane(&self, image: &impl GpuBacking, lane: usize) {
         let state = self.context.state.lock();
         if state.valid {
-            let words = state.image.len()
-                / if self.context.parallel.is_some() {
-                    2
-                } else {
-                    1
-                };
+            let words = state.image.len() / self.context.parallel().map_or(1, <[_]>::len);
             for (i, word) in state.image[lane * words..(lane + 1) * words]
                 .iter()
                 .enumerate()
@@ -412,28 +435,24 @@ impl UserJob {
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.
     pub(crate) fn capture(&self, image: &impl GpuBacking, header: u32) -> Result<(), FsError> {
-        self.capture_lanes(&[image], header)
+        self.capture_lanes(core::iter::once(image), header)
     }
-    pub(crate) fn capture_lanes<B: GpuBacking>(
+    pub(crate) fn capture_lanes<'a, B: GpuBacking + 'a>(
         &self,
-        images: &[&B],
+        images: impl Iterator<Item = &'a B> + Clone,
         header: u32,
     ) -> Result<(), FsError> {
         let mut state = self.context.state.lock();
-        let count = if self.context.parallel.is_some() {
-            2
-        } else {
-            1
-        };
+        let count = self.context.parallel().map_or(1, <[_]>::len);
         if state.epoch != self.epoch
             || !state.busy
-            || images.len() != count
-            || images.iter().any(|image| image.read32(4100) != header)
+            || images.clone().count() != count
+            || images.clone().any(|image| image.read32(4100) != header)
         {
             return Err(io_error());
         }
         let words = state.image.len() / count;
-        for (lane, image) in images.iter().enumerate() {
+        for (lane, image) in images.enumerate() {
             for (i, word) in state.image[lane * words..(lane + 1) * words]
                 .iter_mut()
                 .enumerate()

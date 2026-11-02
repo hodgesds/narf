@@ -30,6 +30,21 @@ const FRAME: u64 = 0x70040;
 fn reg(id: usize, offset: u64) -> u64 {
     0x70b00 + id as u64 * 0x100 + offset
 }
+fn cursor_watermark(register: u64) -> bool {
+    matches!(
+        register,
+        0x70140
+            | 0x70144
+            | 0x70148
+            | 0x7014c
+            | 0x70150
+            | 0x70154
+            | 0x70158
+            | 0x7015c
+            | 0x70168
+            | 0x7017c
+    )
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Timing {
@@ -310,10 +325,13 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         self.tails[1] = self.heads[1] + (sub.0.len() * 4) as u32;
         let mut main = Commands(Vec::new());
         // Non-arming offsets/coefficients precede Linux's hardware evasion.
-        for &(r, v) in registers
-            .iter()
-            .filter(|&&(r, _)| !matches!(r, 0x49028 | 0x4a480 | 0x701a4 | 0x7019c))
-        {
+        for &(r, v) in registers.iter().filter(|&&(r, _)| {
+            !cursor_watermark(r)
+                && !matches!(
+                    r,
+                    0x49028 | 0x4a480 | 0x701a4 | 0x7019c | 0x70080 | 0x70088 | 0x70084
+                )
+        }) {
             main.write(r, v);
         }
         main.emit(0, 6 << 24); // PSR wake race: PIPEDSL must leave zero
@@ -337,6 +355,18 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         }
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x7019c) {
             main.write(r, v);
+        }
+        // intel_cursor.c::i9xx_cursor_update_arm writes WM/DDB immediately
+        // before CTL/POS/BASE. Keep all of them after the same evasion: zero
+        // watermarks must not latch before an old visible cursor is disabled.
+        for &(r, v) in registers.iter().filter(|&&(r, _)| cursor_watermark(r)) {
+            main.write(r, v);
+        }
+        // CTL may arm cursor enable; POS/BASE retain the source ordering.
+        for register in [0x70080, 0x70088, 0x70084] {
+            for &(r, v) in registers.iter().filter(|&&(r, _)| r == register) {
+                main.write(r, v);
+            }
         }
         if self.chain {
             main.write(reg(1, 8), ENABLE | (1 << 28));

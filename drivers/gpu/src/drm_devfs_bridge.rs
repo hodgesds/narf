@@ -638,6 +638,7 @@ impl FileOps for DriCardFile {
                 context,
                 Some(&self.events),
                 Some(&self.pending_out_fences),
+                &self.intel.gem,
             )
             .await
             {
@@ -1886,6 +1887,10 @@ pub struct DriDir;
 impl DirOps for DriDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         #[cfg(feature = "intel")]
+        if let Some(file) = crate::intel_gpu_guc_log::stream::lookup(name) {
+            return Some(file);
+        }
+        #[cfg(feature = "intel")]
         if let Some(file) = crate::intel_gpu_error::coredump::lookup(name) {
             return Some(file);
         }
@@ -1958,6 +1963,10 @@ impl DirOps for DriDir {
             #[cfg(feature = "intel")]
             if crate::intel_gpu_error::coredump::visible(idx) {
                 all.push((format!("devcoredump{idx}"), FileType::File));
+            }
+            #[cfg(feature = "intel")]
+            if crate::intel_gpu_guc_log::stream::visible(idx) {
+                all.push((format!("guc-log-stream{idx}"), FileType::Special));
             }
         }
         all.into_iter().skip(cursor).take(max).collect()
@@ -2263,25 +2272,41 @@ impl IntelGpuCard {
 
     /// Build the VRAM pool once from the GT's probed layout. The pool, and
     /// every allocation in it, outlives GT resets: local memory persists.
-    pub fn publish_gt_vram<M, A>(&self, gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>)
+    pub fn publish_gt_vram<M, A>(
+        &self,
+        gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>,
+    ) -> Result<(), FsError>
     where
         M: crate::intel_gpu_aux::MmioWindow,
         A: crate::intel_gpu_guc_boot::BootAllocator,
     {
+        let mut slot = self.vram.lock();
+        if slot.as_ref().is_some_and(|old| {
+            Some(old.layout) != gt.vram_layout()
+                || old.requires_ccs_clear() != gt.vram_needs_ccs_clear()
+        }) {
+            // Old GEM/VM objects can survive reset. Refuse the new execution
+            // epoch too: allocation-only refusal cannot protect their fetches.
+            return Err(FsError::NoDevice);
+        }
         let Some(layout) = gt.vram_layout() else {
-            return;
+            return Ok(());
         };
         let Some(bar) = *self.lmem_bar.lock() else {
-            return;
+            return Ok(());
         };
-        let mut slot = self.vram.lock();
-        if slot.as_ref().is_some_and(|old| old.layout != layout) {
-            return; // never re-derive ownership from a changed probe
-        }
         if slot.is_none() {
             // SAFETY: install_lmem_bar's ownership contract for this card.
-            *slot = unsafe { crate::intel_gpu_vram::Vram::new(bar, layout) }.ok();
+            *slot = unsafe {
+                if gt.vram_needs_ccs_clear() {
+                    crate::intel_gpu_vram::Vram::new_dg2(bar, layout)
+                } else {
+                    crate::intel_gpu_vram::Vram::new(bar, layout)
+                }
+            }
+            .ok();
         }
+        Ok(())
     }
 
     pub(crate) fn install_user_backend(

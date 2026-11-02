@@ -383,3 +383,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_error",
     smoke_coredump_live_gt_capture_stop_and_authority_loss
 );
+
+pub(super) mod stream_hw {
+    include!("intel_gpu_guc_stream_hw_tests.rs");
+}

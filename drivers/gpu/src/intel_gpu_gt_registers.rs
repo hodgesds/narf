@@ -186,6 +186,77 @@ mod tests {
         smoke_global_register_dg2_subplatform_vectors
     );
 
+    fn smoke_global_register_dg2_vram_requires_stable_owned_layout() -> TestResult {
+        struct Capture<'a> {
+            window: &'a Window,
+            unstable: bool,
+            reads: Cell<u32>,
+        }
+        impl MmioWindow for Capture<'_> {
+            fn read32(&self, reg: u64) -> u32 {
+                let value = self.window.read32(reg);
+                if reg == 0x4910 {
+                    let reads = self.reads.get();
+                    self.reads.set(reads + 1);
+                    if self.unstable && reads != 0 {
+                        return value ^ 0x100;
+                    }
+                }
+                value
+            }
+            fn write32(&self, reg: u64, value: u32) {
+                self.window.write32(reg, value);
+            }
+        }
+        // xe_vram.c: tile0 8 GiB, 64 MiB stolen tail, preceding 32 MiB CCS.
+        let gsm = (8u64 << 30) - (64 << 20);
+        let ccs = gsm - (32 << 20);
+        for failure in 0..3 {
+            let (window, init) = fixture(GtPlatform::Alchemist, 0x56a0, 55, 0, false, 1 << 18);
+            window.regs.borrow_mut().extend([
+                (0x1083a0, 8 << 8),
+                (0x4910, ((ccs / 65536) << 8) as u32),
+                (0x108104, (gsm >> 32) as u32),
+                (0x108100, gsm as u32),
+            ]);
+            if failure == 1 {
+                window.unavailable.set(0x4910);
+            }
+            let capture = Capture {
+                window: &window,
+                unstable: failure == 2,
+                reads: Cell::new(0),
+            };
+            let Poll::Ready(Ok(registers)) = init.poll(&capture, 11) else {
+                panic!("optional VRAM refusal must preserve qualified system execution");
+            };
+            assert_eq!(capture.reads.get(), 2);
+            if failure == 0 {
+                let registers = registers.expect("stable qualified tile0 capture");
+                assert!(matches!(
+                    registers,
+                    crate::intel_gpu_vram::VramRegisters::Dg2(_)
+                ));
+                assert_eq!(
+                    crate::intel_gpu_vram::VramLayout::from_registers(registers)
+                        .unwrap()
+                        .usable,
+                    ccs
+                );
+            } else {
+                assert_eq!(registers, None);
+            }
+            // The explicit selector has no bearing on GAM implicit capture,
+            // and its prior value remains restored after all workarounds.
+            assert_eq!(window.regs.borrow()[&0xfdc], 0x81000000);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_global_register_dg2_vram_requires_stable_owned_layout
+    );
+
     fn smoke_global_register_xelpg_stepping_vectors() -> TestResult {
         for (release, step, clock, atomic) in [
             (70, 0, true, true),
@@ -230,6 +301,9 @@ mod tests {
                 .contains(crate::intel_gpu_engine::Engine::Bcs8));
             let Poll::Ready(Ok(Some(vram))) = init.poll(&w, 11) else {
                 return TestResult::Fail("BMG did not capture local-memory registers");
+            };
+            let crate::intel_gpu_vram::VramRegisters::Xe2(vram) = vram else {
+                panic!("Xe2 register profile")
             };
             assert_eq!(vram.ccs_lower & 1 != 0, flat);
             let r = w.regs.borrow();
@@ -467,13 +541,13 @@ impl RegisterInit {
         engines
     }
 
-    /// Ready(Ok(Some)) also returns BMG's local-memory layout registers,
-    /// read under the same steering semaphore as the workaround writes.
+    /// Ready(Ok(Some)) also returns qualified DG2/Xe2 local-memory layout
+    /// registers under the workaround's current awake/steering ownership.
     pub(crate) fn poll(
         &self,
         mmio: &impl MmioWindow,
         now: u64,
-    ) -> Poll<Result<Option<crate::intel_gpu_vram::Xe2VramRegisters>, RegisterError>> {
+    ) -> Poll<Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError>> {
         if now >= self.deadline {
             return Poll::Ready(Err(RegisterError::Timeout));
         }
@@ -537,7 +611,7 @@ impl RegisterInit {
         &self,
         mmio: &impl MmioWindow,
         selector: u64,
-    ) -> Result<Option<crate::intel_gpu_vram::Xe2VramRegisters>, RegisterError> {
+    ) -> Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError> {
         if self.platform == GtPlatform::Alchemist {
             // DG2 SF/SQIDI implicit ranges use instance two. GAM ranges
             // retain their separate hardware-default instance-one selector.
@@ -548,6 +622,22 @@ impl RegisterInit {
             }
         }
         let mut vram = None;
+        if self.platform == GtPlatform::Alchemist {
+            // 0x4910 is in DG2's GAM implicit-steering range (xe_gt_mcr.c),
+            // independent of the explicit MCR selector. Read all layout
+            // words twice; an absent layout merely withholds VRAM while the
+            // already-qualified system-memory execution backend remains live.
+            let read = || crate::intel_gpu_vram::Dg2VramRegisters {
+                tile_range: mmio.read32(0x1083a0),
+                ccs_base: mmio.read32(0x4910),
+                gsm_base: u64::from(mmio.read32(0x108104)) << 32 | u64::from(mmio.read32(0x108100)),
+            };
+            let a = read();
+            let b = read();
+            if a == b && crate::intel_gpu_vram::VramLayout::dg2(a).is_ok() {
+                vram = Some(crate::intel_gpu_vram::VramRegisters::Dg2(a));
+            }
+        }
         let flat = if self.platform == GtPlatform::Battlemage {
             self.steer(mmio, selector, Target::Instance0)?;
             let a = mmio.read32(0x8800);
@@ -566,13 +656,15 @@ impl RegisterInit {
             if gsm_base != gsm() {
                 return Err(RegisterError::Verify(0x108100));
             }
-            vram = Some(crate::intel_gpu_vram::Xe2VramRegisters {
-                tile_range: mmio.read32(0x1083a0),
-                ccs_lower: a,
-                ccs_upper: upper,
-                fuse3: mmio.read32(0x9118),
-                gsm_base,
-            });
+            vram = Some(crate::intel_gpu_vram::VramRegisters::Xe2(
+                crate::intel_gpu_vram::Xe2VramRegisters {
+                    tile_range: mmio.read32(0x1083a0),
+                    ccs_lower: a,
+                    ccs_upper: upper,
+                    fuse3: mmio.read32(0x9118),
+                    gsm_base,
+                },
+            ));
             a & 1 != 0
         } else {
             false

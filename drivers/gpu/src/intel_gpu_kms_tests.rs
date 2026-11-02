@@ -41,6 +41,7 @@ struct Hardware {
     pause_blocked: bool,
     takeover_error: Option<FsError>,
     pending_surface: Option<u32>,
+    pending_cursor: Option<u32>,
     flips: bool,
     frames: bool,
     now: u64,
@@ -89,6 +90,7 @@ impl MockPlatform {
                 pause_blocked: false,
                 takeover_error: None,
                 pending_surface: None,
+                pending_cursor: None,
                 flips: true,
                 frames: true,
                 now: 1000,
@@ -165,6 +167,29 @@ impl MockPlatform {
         self.set(0x45788, 14 | (16 << 16));
         t
     }
+    pub(crate) fn cursor_resources(&self) -> crate::intel_gpu_dsb::Timing {
+        let timing = self.dsb_timing();
+        self.set(0x70008, 0);
+        self.set(0x70180, 0);
+        self.set(0x510a0, (14 << 22) | 8);
+        self.set(0x46070, 0xc0000010);
+        self.set(0x46000, 612);
+        self.set(0x46008, 0);
+        let mode = crate::intel_gpu_modeset::Mode {
+            pixel_clock_khz: timing.clock,
+            h_active: timing.width,
+            h_total: timing.htotal,
+            v_active: timing.height,
+            v_total: timing.vtotal,
+            ..crate::intel_gpu_modeset::Mode::VESA_1024X768_60
+        };
+        crate::intel_gpu_display_resources::initialize(self, &mode, 307200)
+            .unwrap()
+            .unwrap();
+        self.set(0x70008, 3 << 30);
+        self.set(0x70180, 0x84000000);
+        timing
+    }
     pub(crate) fn allow_flips(&self, enabled: bool) {
         self.0.lock().flips = enabled;
     }
@@ -193,6 +218,16 @@ impl MockPlatform {
     }
     pub(crate) fn dsb_writes(&self) -> Vec<(u64, u32)> {
         self.0.lock().dsb_writes.clone()
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn dsb_commands(&self) -> Vec<(u32, u32)> {
+        let hw = self.0.lock();
+        let head = hw.regs[&0x70b00];
+        let tail = hw.regs[&0x70b04];
+        (head..tail)
+            .step_by(8)
+            .map(|pc| (hw.dsb_word(pc).unwrap(), hw.dsb_word(pc + 4).unwrap()))
+            .collect()
     }
     pub(crate) fn dsb_mappings(&self) -> Vec<(u64, u32)> {
         let hw = self.0.lock();
@@ -247,6 +282,11 @@ impl MockPlatform {
                 hw.actions.push(Action::Latch(surface));
             }
         }
+        if hw.flips {
+            if let Some(base) = hw.pending_cursor.take() {
+                hw.regs.insert(0x700ac, base);
+            }
+        }
         hw.execute_dsb(0);
         hw.execute_dsb(1);
     }
@@ -287,6 +327,24 @@ impl MmioWindow for MockPlatform {
 }
 impl Hardware {
     fn write(&mut self, offset: u64, value: u32) {
+        if offset == 0x45234 {
+            self.regs.insert(offset, value & !(1 << 31));
+            return;
+        }
+        if [0x45008, 0x44fe8, 0x44300, 0x44304].contains(&offset) {
+            self.regs.insert(
+                offset,
+                if value & (1 << 31) != 0 {
+                    value | (1 << 30)
+                } else {
+                    value & !(1 << 30)
+                },
+            );
+            return;
+        }
+        if offset == 0x70084 {
+            self.pending_cursor = Some(value);
+        }
         if offset == crate::intel_gpu_color::MODE || offset == crate::intel_gpu_color::GAMMA {
             self.actions.push(Action::ColorArm(offset));
         }
@@ -497,7 +555,7 @@ unsafe impl DisplayAccess for MockPlatform {
     }
 }
 impl Platform for MockPlatform {
-    fn takeover(&self) -> Result<(), FsError> {
+    fn takeover(&self, _owned_cursor: bool) -> Result<(), FsError> {
         if self.reset_lost() {
             return Err(FsError::NoDevice);
         }
@@ -527,13 +585,13 @@ impl Platform for MockPlatform {
     fn reset_lost(&self) -> bool {
         self.1.load(Ordering::Acquire)
     }
-    fn recovery_platform(&self, owned_dsb: bool) -> Result<Self, FsError> {
+    fn recovery_platform(&self, owned_dsb: bool, owned_cursor: bool) -> Result<Self, FsError> {
         let mut fresh = self.clone();
         fresh.2 = true;
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_idle(&fresh, Generation::MeteorLake, owned_dsb)?;
+        fetchers_with_cursor(&fresh, Generation::MeteorLake, owned_dsb, owned_cursor)?;
         Ok(fresh)
     }
     fn recovery_complete(&self) {

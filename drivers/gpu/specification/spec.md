@@ -180,8 +180,8 @@ CLOCK_TAI and unadvertised engines are refused. Size-only queries need no
 payload pointer. Copyout touches only width/cycles/timestamp/delta, preserving
 the input fields even if userspace changes them while waiting. Sync kernel
 dispatch returns EAGAIN for a sample that needs the async owner.
-No usable VRAM, low-latency, protected execution or fault-mode capability is
-advertised. BMG accepts/reports NO_COMPRESSION because every admitted binding
+No low-latency, protected execution or fault-mode capability is advertised.
+Visible VRAM is advertised only after the platform-qualified pool is published. BMG accepts/reports NO_COMPRESSION because every admitted binding
 uses an uncompressed coherent policy.
 
 GEM_CREATE uses system placement bit0, aligned nonzero sizes, WB CPU mappings
@@ -209,21 +209,22 @@ while any allowed engine is making real progress. Diagnostics report an exact
 observed engine or unavailable, plus the placement set; the template engine
 is never substituted for physical evidence. Disable/deregister/final-TLB and
 full-reset ownership rules retain the whole virtual context and residency.
-Width-two single-placement parallel COPY/COMPUTE queues additionally retain
-two persistent lane states, a common context serial/epoch, an immutable shared
-VM graph and two copied batch addresses. Both published dense logical engine
-instances must be adjacent and in the same class. A separate coherent protected
-scratch page owns the source's fixed descriptor and single-use five-DWORD
-type5 workqueue item. A contiguous two-ID lease, REGISTER_CONTEXT_MULTI_LRC,
+Single-row width-two through width-four parallel COPY/COMPUTE queues retain
+one persistent image/ring per lane, a common context serial/epoch, an immutable
+shared VM graph and a copied batch address per lane. Published dense logical
+instances must be adjacent and same-class; actual engine availability bounds
+width (currently at most two COPY lanes). A protected coherent scratch page
+owns the source descriptor and a single-use `(width + 3)`-DWORD type5 workqueue
+item. A width-sized contiguous ID lease, REGISTER_CONTEXT_MULTI_LRC,
 release-before-tail publication and ENABLE followed by SCHED_CONTEXT dispatch
-the real firmware group. No live workqueue wrap/replay is admitted. Lane
-breadcrumbs, physical attribution, runtime accounting and saved heads remain
-independent; parent completion alone cannot retire child storage or signal
-group syncobj outputs. Shared disable/deregister and final TLB/reset proof
-retain every lane and the VM graph. Replies naming either leased ID resolve
-the same group; a child reset preserves actual lane attribution. Parallel GPU
-user-fence stores remain unsupported until an all-lane GPU join is owned.
-Width greater than two and multi-placement parallel matrices remain refused.
+the group. No live workqueue wrap/replay is admitted. Breadcrumbs, attribution,
+runtime accounting and saved heads remain independent; successful completion
+requires every lane. Shared disable/deregister and final TLB/reset proof retain
+all lane storage and the VM graph. Replies naming any leased child ID resolve
+the group. Partial allocation rolls back without publishing queue state or
+consuming IDs. Multi-row/multi-placement and render groups, width above four,
+and parallel GPU user-fence stores remain refused; the latter needs an owned
+all-lane GPU join.
 VIDEO classes, and COMPUTE on a GT
 without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
@@ -234,25 +235,50 @@ elevated priority requires authority this interface does not grant (EPERM).
 Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,
 instances and malformed reserved fields fail before publication.
 
-Battlemage local memory: `RegisterInit` captures SG_TILE_ADDR_RANGE(0), the
-Xe2 flat-CCS base range (steered) with MIRROR_FUSE3, and a stable 2x32
-GSMBASE. `intel_gpu_vram::VramLayout::xe2` derives usable VRAM up to the
-flat-CCS base (rejecting a hole before GSMBASE) or GSMBASE without flat CCS;
-a malformed layout publishes nothing. `IntelGpuCard::publish_gt_vram` builds
-one card-lifetime pool (the shared `amdgpu_vram::Pool`) over the
-write-combining LMEM BAR prefix that is both visible and usable, and protects
-any recorded boot framebuffer (`record_boot_framebuffer`). Allocations are
-zeroed through the BAR before publication and become reusable only when their
-GEM object, and so every VM snapshot, job and CPU mapping, is gone. GEM_CREATE
-admits placement bit 1 (VRAM) with xe_gem_create_ioctl's EINVAL classes:
-unknown regions, VRAM without WC caching, cpu_caching 0 or above 2, and
-NEEDS_VISIBLE_VRAM without VRAM. VRAM is tried before system memory; VRAM-only
-exhaustion is ENOMEM. MEM_REGIONS reports VRAM/1 (4 KiB pages, total, used,
-visible), CONFIG sets HAS_VRAM and GT_LIST reports near VRAM and far system
-memory. VRAM PPGTT leaves set XE_PPGTT_PTE_DM; mmap uses LMEM BAR frames as
-write-combining. PRIME export of VRAM objects and their use by the i915
-residency plan are refused. DG2 VRAM (64K pages, surface-state compression
-needing a CCS clear) and memory beyond a small BAR are not admitted.
+Visible local memory: `RegisterInit` captures stable SG_TILE_ADDR_RANGE(0),
+platform-specific flat-CCS base and GSMBASE. BMG uses the qualified Xe2 range
+and fuse policy; DG2 requires two matching steered 0x4910 captures, a valid
+flat-CCS tail of at least tile_size/256 and tile0. `VramLayout` excludes CCS
+and GSM; the `Vram` pool additionally excludes any recorded boot framebuffer
+and bounds allocations to the CPU-visible BAR prefix, including a BAR smaller
+than total VRAM.
+`IntelGpuCard::publish_gt_vram` installs one card-lifetime WC pool and refuses
+a changed/missing layout or changed clear policy on restart, closing the new
+execution epoch before old local-memory objects can submit again. Raw `Vram::allocate` only reserves
+storage and performs no BAR I/O. `GemState::prepare_vram` keeps it unpublished;
+`UserBackend::clear_vram(Arc<GemObject>, epoch)` returns the owned terminal
+fence (unsupported by default); asynchronous creation waits for it.
+`publish_vram` requires completed initialization, a successful terminal fence,
+the original current epoch and successful output copy before publishing a handle.
+
+DG2 allocations use 64 KiB pages. Each allocation and reuse executes a private
+trusted BCS0 batch: XY_FAST_COLOR_BLT zeros data, XY_CTRL_SURF_COPY_BLT copies
+an immutable system-zero source into indirect flat CCS, and MI_FLUSH_DW_CCS
+orders metadata before completion. The job retains all BOs and private PPGTT
+until terminal retirement or verified reset; cancelled creation cannot free
+in-flight storage. No user handle, CPU mmap or user VM bind precedes success.
+BMG uses a private CPU-clear token under the live GT's PM hold, current D0,
+wake and BusCap invocation. Each WC-drained chunk is at most 64 KiB; the async
+owner yields the reset mutex between chunks and rechecks epoch/layout/authority
+before further stores. An old operation never closes a newer recovered epoch.
+Synchronous VRAM creation refuses publication through the unguarded path.
+Runtime suspend and system S3 both refuse while any VRAM reservation remains;
+S3 data/CCS preservation or migration is not yet owned. The system prepare
+hook rechecks usage under the GT mutex before closing admission.
+
+GEM_CREATE admits placement bit1 only with WC caching; NEEDS_VISIBLE_VRAM
+requires VRAM. DG2 requires the original size to be a nonzero multiple of
+64 KiB, even when system fallback is allowed, and refuses NO_COMPRESSION.
+BMG accepts NO_COMPRESSION and keeps 4 KiB pages. Unknown regions/caching,
+unsupported flags and malformed VM association refuse before publication.
+VRAM precedes system placement; VRAM-only exhaustion returns ENOMEM.
+MEM_REGIONS reports the actual minimum page size/visible usage, CONFIG sets
+HAS_VRAM, and GT_LIST reports near VRAM/far system memory. WC mmap uses retained
+BAR frames. DG2 PPGTT uses sixteen contiguous DM|PS64 leaves per 64 KiB group,
+including valid device address zero; bind, split, replace and unmap preserve
+64 KiB boundaries. Translation rejects partial/corrupt groups and retains
+read-only/PAT checks. VRAM PRIME, i915 residency, nonvisible/unmapped memory,
+eviction/migration and dGPU scanout remain unsupported.
 
 VM_BIND supports vector or inline MAP, UNMAP, UNMAP_ALL and MAP_USERPTR,
 partial-object mappings, overlap replacement and split ranges with retained
@@ -839,8 +865,8 @@ fresh bring-up and every selected engine's startup proof. Only verified new
 epoch publication reopens clients. True loss/S3 close retires the prior epoch
 even without pending work; a stale callback cannot publish it again. Ordinary
 idle park retains the same partition/epoch contract. Width-one load balancing
-and bounded width-two parallel groups use that published partition; wider and
-multi-placement parallel queues remain separate work.
+and bounded single-row width-two through width-four groups use that published
+partition; multi-placement groups and GPU user-fence joins remain separate work.
 
 `intel_gpu_nonpriv::EnginePolicy` initializes each admitted engine's twelve
 FORCE_TO_NONPRIV slots while idle under the GT owner's forcewake holds.
@@ -1223,8 +1249,8 @@ release version and image SHA-256, plus informational header-valid/change
 masks. The actual nine-dword (36-byte) firmware headers are validated only
 for diagnostic metadata; no firmware-provided size/pointer controls a copy.
 Unknown/corrupt headers remain opaque captured data. Sequential observations
-do not claim an atomic or lossless image. Capture changes no log verbosity,
-notifications, cursors or CT flush protocol; streaming is separate work.
+do not claim an atomic or lossless image. Passive capture changes no log verbosity, notifications, cursors or CT flush
+protocol; the independent streaming endpoint below owns those controls.
 
 The same opt-in and capability policy also exposes `/dev/dri/guc-log-lfdN`.
 It retains the same immutable capture and two-per-card permit pool, and exports
@@ -1241,8 +1267,50 @@ The output is bounded to 0x15000 bytes with no second large allocation.
 Stat size is zero before capture, exact after capture, and hidden after
 capability revocation. Empty/EOF reads still recheck authority. Reset, partial
 reads, duplication and cancellation retain/release the same snapshot permits
-as raw captures. This adds source-format export, not the CT flush/ack protocol
-required for lossless log streaming.
+as raw captures. This adds passive source-format export; the independent streaming endpoint
+below owns the CT flush/ack protocol.
+
+`/dev/dri/guc-log-streamN` is an independent flush-coordinated event/crash
+stream. Exactly one `narf.intel.guc_stream=1` boot token enables it; opening
+and every read (including empty reads) require current CAP_SYSLOG and
+CAP_SYS_ADMIN. The first nonempty read lazily attaches to the already-awake
+Running GT under its reset mutex via `UserBackend::guc_log_stream`; the
+default backend refuses this operation. Reads never resume firmware. One session
+per card owns two preallocated frame buffers; dup shares the FIFO, and a
+retained file or quarantined actor holds its quota. The node is read-only,
+nonseekable and readiness-driven, with EAGAIN while no frame is ready.
+
+The actor enables source verbose-level0 logging, forces a flush and consumes
+0x8003 notifications. It validates coherent fixed backing, both nine-DWORD
+headers, sampled ranges, prior host cursors and observed overflow state. It
+copies each checked linear/wrapped event/crash range into private storage
+before publishing host read cursors/flush bits and queuing FAST flush ACK.
+Live source write pointers may advance; stable sampled/header fields may not.
+CT backpressure retains the private frame and retries without advancing twice;
+frames become readable only after ACK is queued. A full two-frame FIFO
+withholds consumption/ACK; timeout, observed overflow, mutation or access loss
+becomes an explicit terminal error after already-committed frames drain.
+Each copy chunk checks current D0/capability/wake, and loss is sticky.
+
+Each little-endian NARFGSTR v1 frame has a 192-byte header and at most 0x14000
+payload bytes: magic0, version8, header-size12, frame-size16, flags20,
+platform24, card28, sequence32, user-epoch40, firmware-incarnation48,
+host-copy-time56, packed firmware release64, event/crash offset+length72..88,
+the two source headers88..160 and actual firmware SHA-256 at160..192.
+Capture-region bytes are excluded. All offsets index fixed host bounds.
+Firmware's four-bit overflow counter and finite buffering prevent an
+unconditional losslessness claim; this contract detects observed loss and
+refuses ambiguous samples rather than silently emitting them.
+
+Enable/force/restore use distinct bounded CT fences 0x7f00..0x7ffc; the
+unanswered FAST ACK uses 0x7fff, disjoint from scheduler and SLPC replies.
+Fence leases never wrap within a firmware incarnation. Close/cancellation
+restores boot nonverbose policy with an acknowledged control operation before
+detachment. Lost access, an ambiguous restore or an unexpected ACK quarantines
+the actor and inhibits idle teardown until full reset; ordinary optional
+stream failure leaves execution scheduling available. Previously committed
+frames remain immutable across reset. This is separate from passive raw/LFD
+snapshots and automatic first-failure bundles.
 
 The independent, default-off `narf.intel.devcoredump=1` option arms automatic
 first-failure GuC diagnostic bundles. The exact single-token policy matches
@@ -1280,8 +1348,8 @@ only the opened generation cannot remove a replacement. Old readers retain
 their bytes. Preparation reserves identities before failure detection; stale
 prepared captures cannot resurrect an older acknowledged generation. At most
 two prepared/retained dump buffers per card bound clear/read/rearm lifetimes,
-independently of the passive-log snapshot pool. Full context/job/VM dumps and
-lossless streaming remain open.
+independently of the passive-log snapshot pool. Full context/job/VM dumps
+remain open; event/crash streaming uses the independent endpoint above.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.
@@ -7052,6 +7120,30 @@ arbitrary modesets and extra planes remain open. These contracts have native
 register/ownership tests; Intel hardware
 and Mesa rendering-to-scanout acceptance are separate gates.
 
+**Intel fixed hardware cursor.** Qualified display14.00 MTL/Arrow owned Pipe-A
+modes admit legacy CURSOR/CURSOR2 with linear 64x64 ARGB8888. This profile does
+not advertise universal cursor planes or HOTSPOT support. Pipe-off setup owns
+and verifies the PM_DEMAND acknowledgement (conservative bandwidth 0xffff,
+no SAGV, current CDCLK/voltage and DDI/PHY/PLL/scaler resource counts), four
+powered DBUF slices, joined MBUS/tracker/DBOX credits, IPC, and disjoint
+primary/cursor DDB allocations and source-latency watermarks. Partial setup
+failure aborts before pipe enable; unqualified modes retain cursor refusal.
+Runtime capture rechecks exact resources, fixed timing and every other pipe,
+including an active blank pipe, before using this ownership proof.
+
+One retained private WC32 KiB BO supplies two cursor slots through an exclusive
+GGTT lease. After exposure its BO/address are never rebound; ambiguous drop
+retains allocation/mapping/lease rather than freeing hardware-visible storage.
+The common KMS FIFO retains the source GEM object, waits for its writer fence,
+copies into a free private slot and arms DSB CTL/POS/BASE plus watermark state.
+Terminal DSB completion, a later stable vblank, CURSURFLIVE and control/position
+readbacks precede slot reuse or publication. Primary/color transactions permit
+only the same retained cursor owner. Changed timing, foreign resources,
+unsupported dimensions/format and pre-arm failures refuse without arming.
+Close and S3 stop the cursor before console handback. Reset independently
+stops DSB0/1 then proves cursor-off with a fresh owner; primary latch or GT
+reset alone cannot retire cursor fetch. Failed stop retains all DMA owners.
+
 **Intel fixed-mode color commits.** The MTL/Arrow Pipe-A owner advertises
 `CTM`, `GAMMA_LUT` and immutable `GAMMA_LUT_SIZE=1024`. CTM blobs contain nine
 S31.32 sign-magnitude coefficients (72 bytes). Native gamma blobs contain
@@ -7103,8 +7195,8 @@ The queue projects source x/y independently from visible mode dimensions and
 destination0; plane property readback reflects that distinction. Console
 restore and fresh reset recovery restore and verify OFFSET0 together with
 console SURF; abandoned/cancelled panning retains the same unpublished marker
-and DMA owners. Panning never falls back to a CPU copy. Hardware cursors and
-Gen12 direct admission still require their separate watermark/GT owners.
+and DMA owners. Panning never falls back to a CPU copy. Hardware cursors use the separately owned fixed profile above;
+Gen12 direct admission still requires its execution backend.
 
 The DSB0 command stream programs non-arming coefficients before hardware
 scanline evasion, jointly arms the color controls and starts DSB1 at vblank.

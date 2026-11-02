@@ -939,3 +939,6 @@ mod nonblock;
 
 #[path = "intel_gpu_color_ioctl_tests.rs"]
 mod color;
+
+#[path = "intel_gpu_cursor_ioctl_tests.rs"]
+mod cursor;

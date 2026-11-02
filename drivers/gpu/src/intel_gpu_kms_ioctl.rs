@@ -45,7 +45,7 @@ enum Request {
     DropMaster,
     SetMaster,
     Dirty(u32),
-    Cursor(Vec<u8>),
+    Cursor(Vec<u8>, Option<Arc<crate::intel_gpu_gem::GemObject>>, bool),
 }
 fn read(context: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, FsError> {
     let mut bytes = vec![0; size];
@@ -225,15 +225,19 @@ impl Request {
                 }
                 Self::Dirty(w[0])
             }
-            0xa3 | 0xbb => Self::Cursor(read(
-                context,
-                arg,
-                if drm_uapi::ioc_nr(cmd) == 0xbb {
-                    36
-                } else {
-                    28
-                },
-            )?),
+            0xa3 | 0xbb => Self::Cursor(
+                read(
+                    context,
+                    arg,
+                    if drm_uapi::ioc_nr(cmd) == 0xbb {
+                        36
+                    } else {
+                        28
+                    },
+                )?,
+                None,
+                false,
+            ),
             _ => return Err(FsError::Unsupported),
         })
     }
@@ -258,7 +262,12 @@ enum Action {
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         dsb: Option<crate::intel_gpu_dsb::Timing>,
     },
-    Cursor(Vec<u8>),
+    Cursor {
+        bytes: Vec<u8>,
+        object: Option<Arc<crate::intel_gpu_gem::GemObject>>,
+        hardware: bool,
+        timing: crate::intel_gpu_dsb::Timing,
+    },
     Noop,
 }
 struct Plan {
@@ -439,18 +448,50 @@ impl Plan {
                 }
                 return Ok(p);
             }
-            Request::Cursor(bytes) => {
-                if p.next.x != 0 || p.next.y != 0 {
+            Request::Cursor(bytes, object, hardware) => {
+                if !hardware && (p.next.x != 0 || p.next.y != 0) {
                     return Err(FsError::Unsupported);
                 }
                 let w = words(&bytes);
                 if w[0] == 0 || w[0] & !3 != 0 || w[1] != p.next.id {
                     return Err(FsError::InvalidData);
                 }
-                p.action = Action::Cursor(bytes);
-                if let Some(id) = fb {
-                    p.framebuffer =
-                        Some(card.framebuffer(id).map_err(|_| FsError::NotFound)?.clone());
+                if hardware
+                    && w[0] & 1 != 0
+                    && w[6] != 0
+                    && (w[4] != 64
+                        || w[5] != 64
+                        || object
+                            .as_ref()
+                            .is_none_or(|o| o.size() < 16384 || o.is_userptr() || o.is_vram()))
+                {
+                    return Err(FsError::Unsupported);
+                }
+                if hardware
+                    && w[0] & 2 != 0
+                    && ((w[2] as i32).unsigned_abs() > 32767
+                        || (w[3] as i32).unsigned_abs() > 32767)
+                {
+                    return Err(FsError::Unsupported);
+                }
+                p.action = Action::Cursor {
+                    bytes,
+                    object,
+                    hardware,
+                    timing: crate::intel_gpu_dsb::Timing {
+                        clock: wire.clock,
+                        width: wire.hdisplay,
+                        height: wire.vdisplay,
+                        htotal: wire.htotal,
+                        vtotal: wire.vtotal,
+                        flags: wire.flags,
+                    },
+                };
+                if !hardware {
+                    if let Some(id) = fb {
+                        p.framebuffer =
+                            Some(card.framebuffer(id).map_err(|_| FsError::NotFound)?.clone());
+                    }
                 }
                 return Ok(p);
             }
@@ -965,6 +1006,15 @@ trait Backend {
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
+    fn cursor(
+        &mut self,
+        _object: Option<Arc<crate::intel_gpu_gem::GemObject>>,
+        _replace: bool,
+        _position: Option<(i32, i32)>,
+        _timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp>;
     fn copy<'a>(&'a mut self, frame: &'a Framebuffer, mode: &'a ModeState) -> FsFuture<'a, ()> {
         alloc::boxed::Box::pin(copy_frame(frame, mode, self.console_fb()))
@@ -1018,6 +1068,15 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(self.present_color(object, geometry, viewport, coefficients, lut, timing))
+    }
+    fn cursor(
+        &mut self,
+        object: Option<Arc<crate::intel_gpu_gem::GemObject>>,
+        replace: bool,
+        position: Option<(i32, i32)>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.cursor(object, replace, position, timing))
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
@@ -1319,28 +1378,49 @@ async fn execute_plan<B: Backend>(
                 stamp = Some(backend.vblank().await?);
             }
         }
-        Action::Cursor(bytes) => {
-            backend.surface().await?;
-            if let Some(fb) = &plan.framebuffer {
-                backend.copy(fb, mode).await?;
-            }
+        Action::Cursor {
+            bytes,
+            object,
+            hardware,
+            timing,
+        } => {
             let w = words(bytes);
-            if w[0] & 1 != 0 {
-                if w[6] == 0 {
-                    narf_console::user_cursor_hide();
-                } else {
-                    narf_console::user_cursor_show();
+            if *hardware {
+                stamp = Some(
+                    backend
+                        .cursor(
+                            object.clone(),
+                            w[0] & 1 != 0,
+                            (w[0] & 2 != 0).then_some((w[2] as i32, w[3] as i32)),
+                            *timing,
+                        )
+                        .await?,
+                );
+            } else {
+                backend.surface().await?;
+                if let Some(fb) = &plan.framebuffer {
+                    backend.copy(fb, mode).await?;
                 }
-            }
-            if w[0] & 2 != 0 {
-                let (hx, hy) = if w.len() == 9 {
-                    (w[7] as i32, w[8] as i32)
-                } else {
-                    (0, 0)
-                };
-                let x = (i64::from(w[2] as i32) + i64::from(hx)).clamp(0, u32::MAX as i64) as u32;
-                let y = (i64::from(w[3] as i32) + i64::from(hy)).clamp(0, u32::MAX as i64) as u32;
-                narf_console::user_cursor_move(x, y);
+                let w = words(bytes);
+                if w[0] & 1 != 0 {
+                    if w[6] == 0 {
+                        narf_console::user_cursor_hide();
+                    } else {
+                        narf_console::user_cursor_show();
+                    }
+                }
+                if w[0] & 2 != 0 {
+                    let (hx, hy) = if w.len() == 9 {
+                        (w[7] as i32, w[8] as i32)
+                    } else {
+                        (0, 0)
+                    };
+                    let x =
+                        (i64::from(w[2] as i32) + i64::from(hx)).clamp(0, u32::MAX as i64) as u32;
+                    let y =
+                        (i64::from(w[3] as i32) + i64::from(hy)).clamp(0, u32::MAX as i64) as u32;
+                    narf_console::user_cursor_move(x, y);
+                }
             }
         }
     }
@@ -1366,7 +1446,7 @@ async fn execute_plan<B: Backend>(
                 }
                 Action::Noop
                 | Action::Observe
-                | Action::Cursor(_)
+                | Action::Cursor { .. }
                 | Action::SetMaster
                 | Action::Color { primary: false, .. } => {}
                 Action::Present | Action::Restore | Action::Color { primary: true, .. } => {
@@ -1410,6 +1490,14 @@ fn plan_dependencies(
     plan: &Plan,
     mode: &ModeState,
 ) -> Result<Vec<Arc<dyn narf_filesystem::DrmFence>>, FsError> {
+    if let Action::Cursor {
+        object: Some(object),
+        hardware: true,
+        ..
+    } = &plan.action
+    {
+        return Ok(object.dma_buf.resv.fences(DmaResvUsage::Write));
+    }
     let Some(fb) = &plan.framebuffer else {
         return Ok(Vec::new());
     };
@@ -1437,6 +1525,38 @@ fn direct_object(frame: &Framebuffer) -> Result<Arc<crate::intel_gpu_gem::GemObj
 /// Shared foreground boundary for the real dispatcher and native PCI models.
 /// All user copies/FD lookups finish before the owned job can reach the worker.
 #[allow(clippy::too_many_arguments)]
+async fn admit_with_gem(
+    queue: &queue::Queue,
+    open: u64,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+    events: Option<&Events>,
+    geometry: Geometry,
+    epoch: u64,
+    gem: Option<&crate::intel_gpu_gem::GemState>,
+) -> Result<queue::Submitted, queue::SubmitError> {
+    if drm_uapi::ioc_nr(cmd) != 0x1e && !queue.is_master(open) {
+        return Err(FsError::PermissionDenied.into());
+    }
+    let mut request = Request::copy(cmd, arg, context)?;
+    if let (Request::Cursor(bytes, object, hardware), Some(gem)) = (&mut request, gem) {
+        let w = words(bytes);
+        if w[0] == 0 || w[0] & !3 != 0 {
+            return Err(FsError::InvalidData.into());
+        }
+        if w[0] & 1 != 0 && w[6] != 0 {
+            *object = Some(gem.object(w[6])?);
+        }
+        *hardware = true;
+    }
+    queue
+        .submit(open, request, geometry, epoch, context, events)
+        .await
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[allow(clippy::too_many_arguments)]
 async fn admit(
     queue: &queue::Queue,
     open: u64,
@@ -1447,13 +1567,10 @@ async fn admit(
     geometry: Geometry,
     epoch: u64,
 ) -> Result<queue::Submitted, queue::SubmitError> {
-    if drm_uapi::ioc_nr(cmd) != 0x1e && !queue.is_master(open) {
-        return Err(FsError::PermissionDenied.into());
-    }
-    let request = Request::copy(cmd, arg, context)?;
-    queue
-        .submit(open, request, geometry, epoch, context, events)
-        .await
+    admit_with_gem(
+        queue, open, cmd, arg, context, events, geometry, epoch, None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1465,6 +1582,7 @@ pub(crate) async fn dispatch(
     context: &dyn IoctlContext,
     events: Option<&Events>,
     out: Option<&OutFences>,
+    gem: &crate::intel_gpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
     if !mutates(cmd) {
         return None;
@@ -1475,7 +1593,7 @@ pub(crate) async fn dispatch(
             let mode = crate::drm_registry::mode_state(index).ok_or(FsError::Unsupported)?;
             let queue = queue::for_card(index, mode.clone());
             let geometry = display.console_geometry();
-            let submitted = match admit(
+            let submitted = match admit_with_gem(
                 &queue,
                 open,
                 cmd,
@@ -1484,6 +1602,8 @@ pub(crate) async fn dispatch(
                 events,
                 geometry,
                 display.epoch(),
+                (crate::drm_registry::mode_state(index).is_some_and(|card| card.lock().intel_ctm))
+                    .then_some(gem),
             )
             .await
             {

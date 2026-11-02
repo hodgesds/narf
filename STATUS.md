@@ -1562,6 +1562,34 @@ omitted under the maintainer's policy for this architecture-neutral wave.
 The ledger records 25 implemented checkpoint rows and ten broad open
 workstreams, rather than a completion percentage.
 
+The eighth Intel checkpoint widens single-row native Xe COPY/COMPUTE groups
+to two through four lanes, preserving independent runtime/saved state,
+contiguous IDs and all-lane retirement. DG2 visible VRAM now uses 64 KiB
+placement and real BCS0 data/flat-CCS initialization before handle exposure;
+BMG clears use a live GT/PM/capability owner per bounded CPU chunk. Changed
+or missing reset layout blocks execution admission, and S3 refuses live VRAM
+until preservation/migration is owned. Qualified MTL/Arrow Pipe-A gains a
+64x64 legacy hardware cursor with owned PM_DEMAND/DBUF/MBUS/IPC/watermarks,
+private permanent slots, common KMS FIFO and independent cursor/DSB retirement.
+An independent admin/syslog-gated GuC stream copies checked event/crash frames
+before source cursor/flush acknowledgement, with bounded backpressure,
+observed-loss errors and acknowledged policy restoration or reset quarantine.
+The finite source overflow counter prevents an unconditional lossless claim.
+
+All 31 new native fixtures pass on x86_64. Selected Intel/DRM/framebuffer
+and backlight groups pass 924 unique tests, including 31 shared backlight
+regressions, with zero failures/skips. Production boot and both btrfs
+postflights pass. GPU/fb production target CI Clippy passes all three contexts
+on both architectures; all four host GPU configurations pass all-target Clippy.
+Debug/release compilation passes on both targets. The aarch64 fixture-only
+control-flow correction passes final target/host lint; x86 behavior is unchanged.
+Formatting, diff and final source-integrity checks pass. aarch64 QEMU remains
+omitted because this wave changes no aarch64-specific production behavior.
+The ledger records 28 implemented checkpoint rows and ten broad open
+workstreams, without a completion percentage. Multi-placement/GPU joins, general VM/memory, media,
+broader display/output/diagnostics/power services and additional platforms
+remain open. Intel silicon and Mesa acceptance remain unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
