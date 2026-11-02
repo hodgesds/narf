@@ -35,6 +35,29 @@ pub(super) unsafe trait Port {
     fn originator_ba_allowed(&self) -> bool {
         false
     }
+    fn originator_ba_tids(&self) -> u8 {
+        u8::from(self.originator_ba_allowed())
+    }
+    fn batch_allowed(&mut self, tid: u8, profile: format::DataProfile) -> Result<(), Error> {
+        if tid >= 6
+            || self.originator_ba_tids() & (1 << tid) == 0
+            || profile.tid_queue(tid).is_none()
+        {
+            return Err(Error::Access);
+        }
+        self.transmit_allowed()
+    }
+    fn batch_publication<T>(
+        &mut self,
+        profile: format::DataProfile,
+        operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error>
+    where
+        Self: Sized,
+    {
+        let _ = profile;
+        operation(self)
+    }
     fn recipient_ba_allowed(&self) -> bool {
         false
     }

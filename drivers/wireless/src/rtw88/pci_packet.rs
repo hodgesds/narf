@@ -179,6 +179,38 @@ unsafe impl Port for Native {
             .as_ref()
             .is_some_and(crate::rtw88::power_policy::Gate::allows_tx_ba)
     }
+    fn originator_ba_tids(&self) -> u8 {
+        self.packet_gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::tx_grant)
+            .map_or(0, |g| g.tids())
+    }
+    fn batch_allowed(
+        &mut self,
+        tid: u8,
+        profile: format::DataProfile,
+    ) -> Result<(), packet::Error> {
+        if tid >= 6
+            || self.originator_ba_tids() & (1 << tid) == 0
+            || self
+                .packet_gate
+                .as_ref()
+                .is_none_or(|g| !g.allows_profile(profile))
+            || profile.tid_queue(tid).is_none()
+        {
+            return Err(packet::Error::Access);
+        }
+        self.transmit_allowed()
+    }
+    fn batch_publication<T>(
+        &mut self,
+        profile: format::DataProfile,
+        operation: impl FnOnce(&mut Self) -> Result<T, packet::Error>,
+    ) -> Result<T, packet::Error> {
+        let gate = self.packet_gate.clone().ok_or(packet::Error::Access)?;
+        gate.invoke_batch(profile, || Ok(operation(self)))
+            .map_err(access_error)?
+    }
     fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, packet::Error> {
         match self.device.id.device {
             0xc821 => Ok(crate::rtw88::packet_phy::Chip::C21),

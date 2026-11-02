@@ -350,6 +350,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         ap_owner: None,
         ap_request: None,
         ap_gen2: None,
+        p2p: p2p::State::default(),
         mld_link: None,
         eht_source: None,
         bios_versions: Vec::new(),
@@ -414,6 +415,7 @@ pub(in crate::iwlwifi) fn firmware_profile(
     {
         return Err("model firmware metadata on a live/native station");
     }
+    hardware.p2p.metadata(&parsed.api)?;
     hardware.versions = parsed.api.commands.to_vec();
     hardware.band_in_rx = parsed.api.api_changes[1] & (1 << 27) != 0;
     hardware.scan_fixed_antenna = parsed.api.has_capability(111);

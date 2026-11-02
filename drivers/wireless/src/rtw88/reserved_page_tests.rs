@@ -355,6 +355,9 @@ unsafe impl Registers for Port {
         let mut m = self.0.lock();
         m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
         m.packet_model.originator_ba = true;
+        m.packet_model.originator_tids = gate.tx_grant().ok_or(Error::State)?.tids();
+        let burst_gate = gate.clone();
+        m.packet_model.batch_authority = Some(Arc::new(move |p| burst_gate.allows_profile(p)));
         m.station_gate = Some(gate);
         Ok(())
     }

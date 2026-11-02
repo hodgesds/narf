@@ -327,6 +327,9 @@ unsafe impl Io for RadioIo {
         let current = gate.clone();
         self.packets.authority = Some(Arc::new(move || current.current().is_ok()));
         self.packets.originator_ba = true;
+        self.packets.originator_tids = gate.tx_grant().ok_or(Error::State)?.tids();
+        let burst_gate = gate.clone();
+        self.packets.batch_authority = Some(Arc::new(move |p| burst_gate.allows_profile(p)));
         self.gate = Some(gate);
         Ok(())
     }

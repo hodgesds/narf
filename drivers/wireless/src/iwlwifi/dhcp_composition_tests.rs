@@ -145,6 +145,7 @@ enum ReceiveModel {
     NativeSc,
     Unsupported,
     Ap,
+    P2p,
 }
 impl From<bool> for ReceiveModel {
     fn from(enabled: bool) -> Self {
@@ -165,6 +166,10 @@ impl ReceiveModel {
             // Exact installed Sc core103 beacon14/flush2 contracts. These
             // additional commands neither invent RX capability nor a role.
             Self::Ap => versions.extend_from_slice(&[0x91, 1, 14, 0, 0x1e, 1, 2, 1]),
+            Self::P2p => versions.extend_from_slice(&[
+                0x0e, 3, 6, 0, 0xf8, 3, 99, 1, 0x1e, 1, 2, 1, 0x1c, 1, 11, 9, 0x1c, 0, 11, 9, 0xc1,
+                0, 99, 8,
+            ]),
         }
     }
     fn capability(self, image: &mut Vec<u8>) {
@@ -240,6 +245,7 @@ struct Wire {
     mld_m3: Option<Vec<u8>>,
     mld_tx: mlo_tests::TxState,
     native_ap: Option<ap_native_tests::Model>,
+    native_p2p: Option<p2p_tests::Model>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -340,6 +346,22 @@ impl Wire {
         )?;
         let body = &bytes[8..];
         self.commands.push((group, cmd, body.to_vec()));
+        if let Some(p2p) = &mut self.native_p2p {
+            if let Some(response) = p2p.command(group, cmd, version, body, &mut self.firmware)? {
+                if p2p.hold == Some((group, cmd)) {
+                    p2p.held = Some(response);
+                    self.held = Some((cmd, if group == 1 { 0 } else { group }, sequence));
+                } else {
+                    self.firmware.inject(
+                        cmd,
+                        if group == 1 { 0 } else { group },
+                        sequence,
+                        &response,
+                    );
+                }
+                return Ok(());
+            }
+        }
         if let Some(ap) = &mut self.native_ap {
             if let Some(response) = ap.command(group, cmd, version, body)? {
                 if ap.hold == Some((group, cmd)) {
@@ -960,6 +982,9 @@ impl Wire {
     }
 
     fn transmit(&mut self, p: Published) -> R {
+        if let Some(p2p) = &mut self.native_p2p {
+            return p2p.transmit(&p, &mut self.firmware);
+        }
         if let Some(ap) = &mut self.native_ap {
             return ap.transmit(&p, &mut self.firmware);
         }
@@ -1613,6 +1638,25 @@ impl Guard {
             tx_amsdu_tests::image(&versions, tx_model.as_ref())?
         };
         receive_model.capability(&mut authored);
+        if matches!(receive_model, ReceiveModel::P2p) {
+            // All pinned admitted core103 images carry actual API59: the
+            // RFH band/link copy is source-qualified, including low channels.
+            authored.extend_from_slice(&29u32.to_le_bytes());
+            authored.extend_from_slice(&8u32.to_le_bytes());
+            authored.extend_from_slice(&1u32.to_le_bytes());
+            authored.extend_from_slice(&(1u32 << 27).to_le_bytes());
+            // Actual admitted Sc/Bz TLV resource facts, retained through the
+            // same decoder as native startup; no production cache override.
+            for (tag, count) in [(0x100u32, 15u32), (0x101, 4)] {
+                authored.extend_from_slice(&tag.to_le_bytes());
+                authored.extend_from_slice(&4u32.to_le_bytes());
+                authored.extend_from_slice(&count.to_le_bytes());
+            }
+            // Preserve the complete table when appending ROCv6/flush2.
+            authored.extend_from_slice(&48u32.to_le_bytes());
+            authored.extend_from_slice(&(versions.len() as u32).to_le_bytes());
+            authored.extend_from_slice(&versions);
+        }
         if let Some(eht) = eht {
             if bz.is_none() && api89.is_none() {
                 model::native_station_identity(&mut hardware, 0xe340, 0x480, eht.radio())?;
@@ -1655,7 +1699,8 @@ impl Guard {
         // consumer enabled from that parsed fact, rather than mistaking
         // the AP role for the authored single-queue Sc fixture.
         let multi_receive = receive_model.enabled()
-            || matches!(receive_model, ReceiveModel::Ap) && parsed.api.has_capability(68);
+            || matches!(receive_model, ReceiveModel::Ap | ReceiveModel::P2p)
+                && parsed.api.has_capability(68);
         model::firmware_profile(&mut hardware, &parsed)?;
         if api89.is_some() || bz.is_some() {
             hardware.prepare_station_profile(&parsed)?;
@@ -1745,6 +1790,7 @@ impl Guard {
             mld_m3: None,
             mld_tx: mlo_tests::TxState::default(),
             native_ap: matches!(receive_model, ReceiveModel::Ap).then(ap_native_tests::Model::new),
+            native_p2p: matches!(receive_model, ReceiveModel::P2p).then(p2p_tests::Model::new),
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -1803,6 +1849,7 @@ impl Guard {
             mode_generation: AtomicU64::new(1),
             ap_capable,
             ap_host: ap::Host::new(),
+            p2p: p2p::Host::new(),
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),
@@ -1820,7 +1867,11 @@ impl Guard {
             six_channels: nvm.six_channels,
             tx_chains: nvm.tx_chains,
             phy: nvm.phy,
-            firmware: Vec::new(),
+            firmware: if matches!(receive_model, ReceiveModel::P2p) {
+                authored
+            } else {
+                Vec::new()
+            },
             pnvm: None,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
@@ -2790,5 +2841,7 @@ mod eht_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "sc_mlo_native_tests.rs"]
 mod mlo_tests;
+#[path = "p2p_native_tests.rs"]
+mod p2p_tests;
 #[path = "six_ghz_wide_tests.rs"]
 mod wide_six_tests;

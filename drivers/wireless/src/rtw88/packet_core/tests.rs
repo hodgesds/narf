@@ -29,6 +29,7 @@ struct Submission {
 }
 pub(in crate::rtw88) struct Controls {
     pub(in crate::rtw88) held: AtomicBool,
+    pub(in crate::rtw88) tx_doorbells: IrqSafeSpinLock<Vec<(u16, u16)>>,
     pub(in crate::rtw88) release: AtomicBool,
     pub(in crate::rtw88) corrupt_receipt: AtomicBool,
     pub(in crate::rtw88) fifo_stuck: AtomicBool,
@@ -41,6 +42,7 @@ impl Default for Controls {
     fn default() -> Self {
         Self {
             held: AtomicBool::new(false),
+            tx_doorbells: IrqSafeSpinLock::new(Vec::new()),
             release: AtomicBool::new(false),
             corrupt_receipt: AtomicBool::new(false),
             fifo_stuck: AtomicBool::new(false),
@@ -54,6 +56,9 @@ impl Default for Controls {
 pub(in crate::rtw88) struct Model {
     pub(in crate::rtw88) protection: Option<Arc<crate::rtw88::protection::Grant>>,
     pub(in crate::rtw88) originator_ba: bool,
+    pub(in crate::rtw88) originator_tids: u8,
+    pub(in crate::rtw88) batch_authority:
+        Option<Arc<dyn Fn(format::DataProfile) -> bool + Send + Sync>>,
     pub(in crate::rtw88) recipient_ba: bool,
     pub(in crate::rtw88) receive_chip: crate::rtw88::packet_phy::Chip,
     indices: [u32; 6],
@@ -90,6 +95,8 @@ impl Model {
             protection: None,
             recipient_ba: false,
             originator_ba: false,
+            originator_tids: 1,
+            batch_authority: None,
             receive_chip: crate::rtw88::packet_phy::Chip::C22,
             indices: [0; 6],
             now: 0,
@@ -291,6 +298,26 @@ unsafe impl Port for Model {
     fn originator_ba_allowed(&self) -> bool {
         self.originator_ba
     }
+    fn originator_ba_tids(&self) -> u8 {
+        if self.originator_ba {
+            self.originator_tids
+        } else {
+            0
+        }
+    }
+    fn batch_allowed(&mut self, tid: u8, profile: format::DataProfile) -> Result<(), Error> {
+        if tid >= 6
+            || self.originator_ba_tids() & (1 << tid) == 0
+            || profile.tid_queue(tid).is_none()
+            || self
+                .batch_authority
+                .as_ref()
+                .is_some_and(|check| !check(profile))
+        {
+            return Err(Error::Access);
+        }
+        self.transmit_allowed()
+    }
     fn recipient_ba_allowed(&self) -> bool {
         self.recipient_ba
     }
@@ -348,6 +375,7 @@ unsafe impl Port for Model {
         let index = Self::slot(reg)?;
         if index != 2 {
             self.tx_publications += 1;
+            self.controls.tx_doorbells.lock().push((reg, host));
         }
         self.indices[index] = self.indices[index] & 0xffff_0000 | u32::from(host);
         if let Some(reaction) = self.reaction.clone() {
@@ -911,4 +939,163 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/rtw88/tx_ba",
     smoke_rtw88_tx_ba_native_limits_authority_and_partial_publication
+);
+
+fn all_tid_ring_receipts() -> Result<(), &'static str> {
+    for tid in 0..6 {
+        let mut model = Model::new();
+        model.originator_ba = true;
+        model.originator_tids = 0x3f;
+        let mut core = batch_core(&mut model)?;
+        core.configure_data(format::DataProfile {
+            acs: 7,
+            ..core.data_profile
+        })
+        .map_err(|_| "T2 native all-AC profile")?;
+        let queue = match tid {
+            1 | 2 => Queue::Background,
+            4 | 5 => Queue::Video,
+            _ => Queue::Data,
+        };
+        let ring = queue_slot(queue);
+        let model_ring = Model::ring(queue);
+        let before = (queue.depth() - 2) as u16;
+        core.tx_host[ring] = before;
+        core.tx_device[ring] = before;
+        model.indices[model_ring] = u32::from(before) | (u32::from(before) << 16);
+        let mut frames = qos_frames();
+        for b in &mut frames {
+            b[24] = tid;
+        }
+        let ids = core
+            .submit_batch(&mut model, &frames)
+            .map_err(|_| "T2 native ring wrap submit")?;
+        if model.tx_publications != 1
+            || model.submissions.len() != 4
+            || model.indices[model_ring] & 0xffff != 2
+            || model.submissions.iter().any(|s| s.queue != queue)
+            || model.descriptors.iter().any(|d| d[5] & 31 != tid)
+        {
+            return Err("T2 QSEL/actual physical ring/depth/WP differs");
+        }
+        for (i, submission) in model.submissions.iter().enumerate() {
+            if model
+                .actual_body(*submission)
+                .map_err(|_| "T2 actual mapped immutable body")?
+                != frames[i]
+            {
+                return Err("T2 ring choice changed actual DMA original");
+            }
+        }
+        for sequence in [12, 8, 4] {
+            model.report(sequence, true);
+            if core
+                .poll(&mut model)
+                .map_err(|_| "T2 reverse CCX")?
+                .receipt
+                .is_some()
+            {
+                return Err("T2 CCX alone returned another ring's original");
+            }
+        }
+        model.indices[model_ring] = 2; // actual consumed prefix wraps at0
+        model.report(0, true);
+        for i in 0..2 {
+            let r = core
+                .poll(&mut model)
+                .map_err(|_| "T2 consumed prefix")?
+                .receipt
+                .ok_or("T2 prefix receipt absent")?;
+            if r.id != ids[i] || r.bytes != frames[i] {
+                return Err("T2 per-ring prefix order/body mismatch");
+            }
+        }
+        if core
+            .poll(&mut model)
+            .map_err(|_| "T2 unconsumed suffix")?
+            .receipt
+            .is_some()
+        {
+            return Err("T2 returned unconsumed ring suffix");
+        }
+        model.indices[model_ring] = 2 | (2 << 16);
+        for i in 2..4 {
+            let r = core
+                .poll(&mut model)
+                .map_err(|_| "T2 suffix receipt")?
+                .receipt
+                .ok_or("T2 suffix absent")?;
+            if r.id != ids[i] || r.bytes != frames[i] {
+                return Err("T2 suffix FIFO/body mismatch");
+            }
+        }
+        if !core.ready() {
+            return Err("T2 final exact native receipts failed to release credits");
+        }
+    }
+    Ok(())
+}
+fn all_tid_native_denials() -> Result<(), &'static str> {
+    for kind in 0..4 {
+        let mut model = Model::new();
+        model.originator_ba = true;
+        model.originator_tids = if kind == 0 { 1 } else { 0x3f };
+        let mut core = batch_core(&mut model)?;
+        core.configure_data(format::DataProfile {
+            acs: 7,
+            ..core.data_profile
+        })
+        .map_err(|_| "T2 negative current all-AC profile")?;
+        let mut frames = qos_frames();
+        for f in &mut frames {
+            f[24] = if kind == 2 { 6 } else { 5 };
+        }
+        if kind == 1 {
+            frames[2][24] = 4;
+        }
+        if kind == 3 {
+            let current = Arc::new(AtomicBool::new(true));
+            let revoke = current.clone();
+            model.batch_authority = Some(Arc::new(move |_| current.load(Ordering::Acquire)));
+            model.after_descriptor = Some(Arc::new(move || {
+                revoke.store(false, Ordering::Release);
+            }));
+        }
+        if core.submit_batch(&mut model, &frames).is_ok() || model.tx_publications != 0 {
+            return Err("T2 v1/mixed-TID/VO/current-cut negative rang a native WP");
+        }
+        if kind == 3 {
+            if core.ready()
+                || model.descriptors.len() != 1
+                || core.release().is_ok()
+                || core.batch_buffers.len() != 4
+                || core.batch_pending.is_empty()
+            {
+                return Err("T2 partial native publication was reconstructed/reclaimed");
+            }
+        } else if !model.descriptors.is_empty() || !core.ready() {
+            return Err("T2 preflight denial changed native ownership");
+        }
+    }
+    Ok(())
+}
+fn smoke_rtw88_tx_ba_all_tids_native_rings_wrap_and_independent_terminal_prefix() -> TestResult {
+    match all_tid_ring_receipts() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+fn smoke_rtw88_tx_ba_all_tids_native_v1_vo_mixed_and_partial_source_denials() -> TestResult {
+    match all_tid_native_denials() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids",
+    smoke_rtw88_tx_ba_all_tids_native_rings_wrap_and_independent_terminal_prefix
+);
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids",
+    smoke_rtw88_tx_ba_all_tids_native_v1_vo_mixed_and_partial_source_denials
 );

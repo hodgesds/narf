@@ -427,6 +427,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn tx_in_flight_ids(&self) -> Vec<u16> {
         self.data.as_ref().map_or(Vec::new(), |d| d.pending.ids())
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn expire_pending_tx_for_test(&mut self) {
+        if let Some(data) = &mut self.data {
+            data.pending.expire_for_test();
+        }
+    }
     pub(in crate::ath10k) fn data_permission(&self) -> Option<Permission> {
         self.station_link()?;
         Some(self.peer.as_ref()?.permission)
@@ -451,7 +457,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     /// Start the packet owner only after native association. Software CCMP is
     /// selected at WMI INIT, never retrofitted onto a native-WiFi/decapped RX
-    /// image. PFC requires a separate host queue/fetch owner and stays gated.
+    /// image. PFC additionally requires the real coherent queue-state owner.
     pub async fn start_station_data(
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -803,6 +809,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     )?;
                 }
             }
+            self.service_station_pfc()?;
             if idle {
                 let data = self.data.as_mut().ok_or(Error::Failed)?;
                 if !data.open() || self.coexistence.as_ref().is_some_and(|s| s.blocked()) {
@@ -898,7 +905,27 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         checked_policy(self.send_station_management(), validate).await?;
         self.send_station_wmm(validate).await?;
         validate()?;
+        self.service_station_pfc()?;
         Ok(idle)
+    }
+    fn service_station_pfc(&mut self) -> Result<(), Error> {
+        if !self.htt.pfc_active() {
+            return Ok(());
+        }
+        self.data_check()?;
+        let data = self.data.as_ref().ok_or(Error::Failed)?;
+        if data.failed {
+            return Err(Error::Failed);
+        }
+        // Ordinary queued DATA needs its still-open original key/port. The
+        // sole pending key reply instead has the exact Pipeline Reply owner;
+        // reply_admissible already drained all earlier DATA native terminals.
+        if !data.open() && !data.pending.reply_in_flight() {
+            return Ok(());
+        }
+        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        self.htt.service_pfc(peer.bssid, peer.pfc_ids())?;
+        Ok(())
     }
     fn data_check(&mut self) -> Result<(), Error> {
         if self.peer.as_ref().and_then(|p| p.associated).is_none()
@@ -1120,7 +1147,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
         }
-        while !data.pending.reply_in_flight()
+        // Keep the old current port/key while prior host entries await real
+        // fetch publication. Otherwise accepting M3/group1 could close that
+        // port before its queued originals drain. Native loss/UNMAP/beacon/
+        // management handling above is never deferred. The existing Pipeline
+        // then requires every old DATA air terminal before publishing M4.
+        while !self.htt.pfc_queued()
+            && !data.pending.reply_in_flight()
             && data
                 .security
                 .as_ref()

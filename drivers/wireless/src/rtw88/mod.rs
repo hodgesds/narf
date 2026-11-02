@@ -69,6 +69,8 @@ mod tx_ba;
 mod tx_ba_power;
 #[cfg(feature = "kernel-test")]
 mod tx_ba_tests;
+#[cfg(feature = "kernel-test")]
+mod tx_ba_tid_tests;
 pub use tx_ba_power::Request as TxBaRequest;
 #[cfg(feature = "kernel-test")]
 mod rx_ba_tests;

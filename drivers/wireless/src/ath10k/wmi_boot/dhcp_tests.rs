@@ -18,6 +18,8 @@ mod coexistence_conversation_tests;
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "indoor_conversation_tests.rs"]
+mod indoor_conversation_tests;
 #[path = "offchannel_conversation_tests.rs"]
 mod offchannel_conversation_tests;
 #[path = "pmf_conversation_tests.rs"]
@@ -1044,6 +1046,7 @@ fn composition_profile(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TestPhy {
     Legacy,
+    Indoor,
     Wmm,
     Ht,
     Ht40,
@@ -1060,7 +1063,7 @@ fn composition_radio(
     frequency: u16,
     phy: TestPhy,
 ) -> Result<(), &'static str> {
-    let qos = phy != TestPhy::Legacy;
+    let qos = !matches!(phy, TestPhy::Legacy | TestPhy::Indoor);
     let h = Harness::new_on_ht(
         version,
         dialect,
@@ -1076,6 +1079,9 @@ fn composition_radio(
             None
         },
     );
+    if phy == TestPhy::Indoor {
+        indoor_conversation_tests::install(&h);
+    }
     if qos {
         h.model(|model| {
             let f = model.data.as_mut().unwrap();

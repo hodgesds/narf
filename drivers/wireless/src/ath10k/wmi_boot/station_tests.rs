@@ -294,12 +294,18 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
         // Firmware IDs are sparse and need not be below resource peer count.
         let id = if m.station.as_ref().unwrap().bad_map {
             2048u16
+        } else if m.inner.config.pfc {
+            17u16
         } else {
             1800u16
         };
         for vdev in [1u8, 0] {
             let mut body = vec![3, vdev];
-            body.extend_from_slice(&id.to_le_bytes());
+            // PFC's real qstate has528 peers. Keep its foreign-vdev
+            // negative on a separate firmware ID instead of inventing two
+            // simultaneous native owners of the same flow-control ID.
+            let mapped = id + u16::from(m.inner.config.pfc && vdev == 1);
+            body.extend_from_slice(&mapped.to_le_bytes());
             body.extend_from_slice(&[2, 8, 9, 10, 11, 12, 0, 0]);
             m.inner
                 .inner

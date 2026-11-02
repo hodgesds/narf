@@ -53,7 +53,11 @@ impl Device {
             return Err(WirelessError::Busy);
         }
         let state = self.state.try_lock().ok_or(WirelessError::Busy)?;
-        if state.ap.is_some() || state.connection.is_some() || state.scheduled.is_some() {
+        if state.ap.is_some()
+            || state.connection.is_some()
+            || state.scheduled.is_some()
+            || state.hardware.p2p_started()
+        {
             return Err(WirelessError::Busy);
         }
         let _admission = self.admission.lock();
@@ -332,7 +336,11 @@ impl Device {
         let request = request.ok_or(1)?;
         request.check().map_err(|_| 1)?;
         if let Some((plan, proof, early)) = start {
-            if state.connection.is_some() || state.scheduled.is_some() || state.ap.is_some() {
+            if state.connection.is_some()
+                || state.scheduled.is_some()
+                || state.ap.is_some()
+                || state.hardware.p2p_started()
+            {
                 return Err(16);
             }
             if state.needs_reset || state.hardware.is_failed() {

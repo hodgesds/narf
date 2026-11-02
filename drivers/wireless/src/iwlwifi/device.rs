@@ -34,6 +34,7 @@ pub struct Device {
     mode_generation: AtomicU64,
     ap_capable: bool,
     ap_host: ap::Host,
+    p2p: p2p::Host,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
@@ -285,6 +286,7 @@ impl Device {
             mode_generation: AtomicU64::new(1),
             ap_capable,
             ap_host: ap::Host::new(),
+            p2p: p2p::Host::new(),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
@@ -437,7 +439,6 @@ impl Device {
         self.publish_with_registration(authority, |authority, interface| {
             narf_net::registry()
                 .register(authority, interface)
-                .map(|_| ())
                 .map_err(|_| "iwlwifi capability registry registration failed")
         })
     }
@@ -448,7 +449,10 @@ impl Device {
         register: impl FnOnce(
             &narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Grant>,
             RegisteredDevice,
-        ) -> Result<(), &'static str>,
+        ) -> Result<
+            narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>,
+            &'static str,
+        >,
     ) -> Result<(), &'static str> {
         // Claim before replacing any endpoint, checking global publication, or
         // obtaining a registry entry. A failed attempt requires a fresh owner.
@@ -480,7 +484,8 @@ impl Device {
         // This is the final fallible publication step. Failure leaves all
         // staged channels private and never exposes ACTIVE/netdev/workers.
         self.source.invoke(|| {
-            register(authority, RegisteredDevice(self.clone()))?;
+            let parent = register(authority, RegisteredDevice(self.clone()))?;
+            self.p2p.registered(*authority, parent);
             state.producer = Some(rx_producer);
             *self.rx.lock() = Some(rx_consumer);
             for (category, producer, consumer) in tx_channels {
@@ -879,10 +884,13 @@ impl Device {
         }
         let mut fallback = Context::from_waker(Waker::noop());
         let ap_lost = self.ap_currentness(cx.as_deref_mut().map(|cx| cx.waker()));
-        if self
+        let control_pending = self
             .poll_control(cx.as_deref_mut().unwrap_or(&mut fallback))
-            .is_pending()
-        {
+            .is_pending();
+        // Either retained future may own State while the other awaits it.
+        // Drive both slots before returning, including after waiter drops.
+        let p2p_busy = self.p2p.step(cx.as_deref_mut());
+        if control_pending || p2p_busy {
             return outcome;
         }
         let source_lost = self.source.invoke(|| Ok(())).is_err();
@@ -1197,7 +1205,11 @@ impl Device {
             // callback, and drives physical beacon stop after revocation.
             let mut activity = super::iwl_msix::Activity::new(
                 self.irq_vector,
-                if self.current_iftype() == 3 { 1 } else { 100 },
+                if self.current_iftype() == 3 || self.p2p.active() {
+                    1
+                } else {
+                    100
+                },
             );
             // Re-enter step on every wake, including IPC producer and retained
             // control wakes. Awaiting Activity alone would swallow those wakes
@@ -1333,6 +1345,9 @@ impl Device {
             return Err(WirelessError::Busy);
         }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        if state.hardware.p2p_started() {
+            return Err(WirelessError::Busy);
+        }
         if state.needs_reset
             || state.hardware.is_failed()
             || state
@@ -1430,6 +1445,24 @@ impl Device {
 
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn async_control_interfaces(&self) -> bool {
+        self.p2p_capable()
+    }
+    fn supports_virtual_interfaces(&self) -> bool {
+        self.p2p_capable()
+    }
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        alloc::vec![10]
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        self.new_p2p_control(authority, name, iftype, mac).await
+    }
     fn current_iftype(&self) -> u32 {
         self.mode.load(Ordering::Acquire)
     }
@@ -1719,10 +1752,14 @@ impl WirelessNetIface for Device {
                     },
                 })
                 .collect(),
-            modes: if self.ap_capable {
+            modes: (if self.ap_capable {
                 WirelessModes::STATION | WirelessModes::AP
             } else {
                 WirelessModes::STATION
+            }) | if self.p2p_capable() {
+                WirelessModes::P2P
+            } else {
+                WirelessModes::empty()
             },
             hw_caps: HwCaps {
                 ht_supported: self.current_iftype() != 3 && self.phy.ht,
@@ -1794,6 +1831,9 @@ impl WirelessNetIface for Device {
             return Err(WirelessError::Busy);
         }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        if state.hardware.p2p_started() {
+            return Err(WirelessError::Busy);
+        }
         if state.needs_reset
             || state.hardware.is_failed()
             || state
@@ -2379,5 +2419,7 @@ mod dhcp_composition;
 
 #[path = "ap_device.rs"]
 mod ap;
+#[path = "p2p_parent.rs"]
+mod p2p;
 #[path = "sc_scheduled.rs"]
 mod scheduled;

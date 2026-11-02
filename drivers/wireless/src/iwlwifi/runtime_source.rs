@@ -74,6 +74,7 @@ pub(in crate::iwlwifi) struct Fence {
     policy: Option<super::super::mld_policy::Authority>,
     ap: Option<alloc::sync::Arc<super::super::ap_owner::Owner>>,
     ap_request: Option<alloc::sync::Arc<super::super::ap_owner::Request>>,
+    p2p: Option<alloc::sync::Arc<super::super::p2p_owner::Gate>>,
 }
 impl Fence {
     pub(super) fn new(assets: Assets, pci: super::Authority) -> Self {
@@ -83,6 +84,7 @@ impl Fence {
             policy: None,
             ap: None,
             ap_request: None,
+            p2p: None,
         }
     }
     pub(in crate::iwlwifi) fn invoke<T>(
@@ -96,6 +98,9 @@ impl Fence {
                 }
                 if let Some(request) = &self.ap_request {
                     request.check()?;
+                }
+                if let Some(p2p) = &self.p2p {
+                    p2p.check()?;
                 }
                 if let Some(policy) = &self.policy {
                     policy.check()?;
@@ -140,6 +145,7 @@ impl super::Hardware {
         fence.policy = self.rf_policy.clone();
         fence.ap = self.ap_owner.clone();
         fence.ap_request = self.ap_request.clone();
+        fence.p2p = self.p2p.gate.clone();
         Ok(fence)
     }
 }

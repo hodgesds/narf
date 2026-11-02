@@ -51,6 +51,9 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Separate measured all-non-VO ring program; v1 identity stays unchanged.
+    pub all_tids_identity: [u8; 32],
+    pub all_tids_filename: String,
 }
 pub(super) fn request(base: &Base) -> Result<Request, Error> {
     base.invoke(|| Ok(()))?;
@@ -73,19 +76,31 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
     }
     hash.update(b"four independent parked-allocated DMA slots; immutable original QoS26/CCMP before native BD; one bounded BE WP batch; source W2 AGGEN12/DEN20; W3 MAXAGG3 factor0; noTXAMSDU; fixed qualified MCS/GI and nofallback; original per-TID SSN before crypto; actual ADDBA request CCX plus bound peer dialog/TID/window/timeout and RXidle; each MPDU actual requested CCX plus PCI; after acknowledged burst and MACquiet BAR20 at actual next QoS SN with native CCX; DELBA native control CCX; no invented BA bitmap or H2C ACK");
     hash.update(b"source coex MAC retry0808 and AMPDUtime20 exact writes/readbacks; BARretry0801; actual chip TXDMA_PQ_MAP and 16bit FIFO reserved/available proof plus PCI consumed prefix before next burst/key/control; max4MPDU/8191bytes/conservative HT symbol airtime<=4000us; full static thermal0..63/supply/antenna/BT/retry/transient/automatic-response envelope");
-    Ok(Request {
-        identity: hash.finalize(),
-        mac,
-        filename: format!(
-            "rtw88/rtw882{}ce-tx-ba-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+    let identity = hash.finalize();
+    let mut all = narf_crypto::sha256::Sha256::new();
+    all.update(b"NARF RTW88 originator all non-VO TIDs0..5 HT20 burst v2");
+    all.update(&identity);
+    all.update(b"independent actual per-TID SSN/dialog/window/TU/key retirement; globally unique nonwrapping dialog; actual QSEL=TID and BE/BK/VI rings depths256/128/128; no VO or EAPOL aggregation; actual N2xQ current profile before each BD and final WP; same-TID FIFO prefix before PN; same four immutable originals, per-ring consumed prefix and each positive CCX; map0xc5a0 VI6 BE8 BK10 MGMT12 and exact prioq reserved/available; all queues remain one serial physical DMA/control/key owner; every existing transient/retry/LGI/SGI/automatic response peak now maximum across BE/BK/VI including mixed-TID transition duty, full thermal0..63/supply/antenna/coexistence");
+    let all_tids_identity = all.finalize();
+    let filename = |version| {
+        format!(
+            "rtw88/rtw882{}ce-tx-ba-v{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             if did == 0xc821 { 1 } else { 2 },
+            version,
             mac[0],
             mac[1],
             mac[2],
             mac[3],
             mac[4],
             mac[5]
-        ),
+        )
+    };
+    Ok(Request {
+        identity,
+        all_tids_identity,
+        all_tids_filename: filename(2),
+        mac,
+        filename: filename(1),
     })
 }
 pub(super) enum Source {
@@ -109,6 +124,7 @@ pub(super) struct Grant {
     window: u8,
     bytes: u16,
     airtime: u16,
+    tids: u8,
 }
 impl Source {
     pub(super) fn load(self, base: Base) -> Result<Arc<Grant>, Error> {
@@ -131,8 +147,15 @@ impl Source {
                 let loader = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive::<Read>().ok())
                     .ok_or(Error::Access)?;
-                let cap =
-                    narf_firmware::open(&request.filename, &loader).map_err(Error::Firmware)?;
+                // A present malformed v2 never borrows the v1 permission.
+                // Missing optional v2 preserves the exact v1 registry path.
+                let cap = match narf_firmware::open(&request.all_tids_filename, &loader) {
+                    Ok(cap) => cap,
+                    Err(narf_firmware::FirmwareError::NotFound) => {
+                        narf_firmware::open(&request.filename, &loader).map_err(Error::Firmware)?
+                    }
+                    Err(error) => return Err(Error::Firmware(error)),
+                };
                 cap.invoke(Decode { base, request })
                     .map_err(|_| Error::Access)??
             }
@@ -164,20 +187,32 @@ impl Grant {
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| Error::Access)?;
         let did = base.ht().rx_ba_identity().2;
+        let version = *b.get(4).ok_or(Error::Prerequisite)?;
+        let all_tids = version == 2;
+        let identity = if all_tids {
+            request.all_tids_identity
+        } else {
+            request.identity
+        };
         if signer.is_none()
             || b.len() != 192
             || b[..4] != *if did == 0xc821 { b"N21T" } else { b"N22T" }
-            || b[4..8] != [1, 0, 192, 0]
+            || !matches!(version, 1 | 2)
+            || b[4..8] != [version, 0, 192, 0]
             || b[8..12] != 192u32.to_le_bytes()
             || b[12..14] != [0xec, 0x10]
             || b[14..16] != did.to_le_bytes()
-            || b[16..48] != request.identity
+            || b[16..48] != identity
             || b[48..54] != request.mac
             || b[54..56] != [1, 20]
             || b[68..70] != [0, 63]
             || !(2..=4).contains(&b[70])
             || !(1..=64).contains(&b[71])
-            || b[108..] != [0; 84]
+            || if all_tids {
+                b[108..110] != [0x3f, 3] || b[110..] != [0; 82]
+            } else {
+                b[108..] != [0; 84]
+            }
         {
             return Err(Error::Prerequisite);
         }
@@ -200,6 +235,7 @@ impl Grant {
             window: b[71],
             bytes: u16::from_le_bytes([b[72], b[73]]),
             airtime: u16::from_le_bytes([b[74], b[75]]),
+            tids: if all_tids { 0x3f } else { 1 },
         };
         if !(0..=128).contains(&g.antenna)
             || !(-512..=256).contains(&g.ceiling)
@@ -214,6 +250,9 @@ impl Grant {
     }
     pub(super) fn matches(&self, base: &Base) -> bool {
         self.base.same(base) && request(base).as_ref() == Ok(&self.request)
+    }
+    pub(super) fn tids(&self) -> u8 {
+        self.tids
     }
     pub(super) fn count(&self) -> usize {
         usize::from(self.count)

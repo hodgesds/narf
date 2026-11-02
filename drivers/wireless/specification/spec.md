@@ -434,16 +434,29 @@ checks pass for the combined source graph. This is implementation accounting;
 native execution and the next full release matrix remain pending. Physical
 board measurements, signed programs and deployment qualification remain separate.
 
+**Source implementation recount 2026-11-02** (PFC, indoor policy and non-VO sender BA):
+the remaining ledger holds **77 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Five source-complete implementations now await full batch acceptance in
+`research/implemented-pending-validation.tsv`. This addition implements bounded
+ath10k RAW/PFC, explicit signed indoor installation admission, and qualified
+RTW88 originator BA on every non-VO TID. Native Intel Sc/Bz P2P DEVICE is a
+partial family scope; SESSION, CLIENT/GO and P2P power-save roles remain open.
+Thirty-three additional cases are written. Combined quick release checks pass;
+native execution and the full batch matrix remain pending for these additions.
+The previous two power implementations passed72 focused cases on each architecture
+but still await that matrix. Counting unvalidated features,82 remain. Physical
+measurements, signed programs and per-device acceptance remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
+| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE is implemented pending validation; the family P2P row stays open |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
-| ath10k | 11 | Contiguous VHT160, PFC, alternate calibration sources, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay and wake offload; host-bus PM is implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
+| ath10k | 9 | Contiguous VHT160, alternate calibration sources, hardware keys, AP/P2P, DFS/beacon hints, credential replay and wake offload; host-bus PM, bounded PFC and signed indoor admission are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
+| rtw88 | 17 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA is implemented pending validation |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
@@ -1222,7 +1235,7 @@ key/PN, BA, copied-frame and terminal DMA ownership remain independent.
 Idle FULL_SLEEP and periodic calibration are separate implementations; the
 family §3.9 and `ar9285-station-power-save.md` specify the exact contract.
 
-### 3.3 Additional qualified native control owners (validation pending)
+### 3.3 Additional qualified native control owners
 
 Admitted Intel Sc/Bz/API89/API77 profiles expose the existing typed AP public
 controls through their original device owner, with actual power/beacon/peer/key
@@ -1256,6 +1269,22 @@ votes and retained MSI-driven quiet/grace ownership. ASPM restoration follows
 actual HIF and input admission. Deferred native polling cannot commit packet,
 key or copied-frame state, and non-MSI profiles keep the awake polling path.
 Family §3 specifies the original DMA/source/control and failure-cleanup rules.
+
+### 3.5 Additional queue and installation owners (validation pending)
+
+Ath10k admits the bounded coherent RAW/10.4 PFC profile only with its actual
+native qstate/peer/fetch/terminal owner. Its indoor-only channel continuation
+requires the current trusted deployment's explicit installation fact on every
+restrictive overlapping rule, preserving all original factory and host limits.
+RTW88 `TxBaRequest` additionally returns factual v2 identity/filename metadata
+for independently owned TIDs0–5; v1 remains unchanged. The public producer
+selects a current same-TID FIFO prefix before reserving PN/SN, and each native
+physical queue and terminal remains independently bound. Family §3 is normative.
+
+Intel Sc/Bz exposes a bounded real control DEVICE with no IFINDEX, UP bit or
+fabricated data endpoint. Original parent, Write/Admin/daemon and native owner
+receipts govern its public ROC/management lifecycle. This partial milestone
+does not advertise unimplemented SESSION or CLIENT/GO roles.
 
 ## 4. Interaction with `narf-wireless`
 

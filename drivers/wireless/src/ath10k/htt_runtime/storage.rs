@@ -9,10 +9,7 @@ pub(super) const RX_FILL: usize = RX_SLOTS / 2 - 1;
 pub(super) const RX_BUFFER: usize = 2048;
 pub(super) const RX_DESCRIPTOR: usize = 300;
 pub(super) const EXT_DESCRIPTOR: usize = 64;
-const QSTATE_PEERS: usize = 528;
-const QSTATE_TIDS: usize = 8;
-const QSTATE_BYTES: usize =
-    QSTATE_PEERS * QSTATE_TIDS + QSTATE_PEERS.div_ceil(32) * QSTATE_TIDS * 4 + 4;
+const QSTATE_BYTES: usize = super::pfc::STATE_BYTES;
 
 #[derive(Debug)]
 pub(in crate::ath10k) struct Storage<B> {
@@ -49,6 +46,35 @@ pub(super) fn write32(memory: &mut impl Memory, at: usize, value: u32) {
     }
 }
 impl<B: Memory> Storage<B> {
+    /// Same coherent DMA layout advertised by FRAG_DESC_BANK_CFG. All counts
+    /// and maps precede the firmware-visible sequence commit (Linux
+    /// __ath10k_htt_tx_txq_sync); this never allocates a replacement mapping.
+    pub fn publish_queue_state(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let memory = self.qstate.as_mut().ok_or(Error::Memory)?;
+        if bytes.len() != QSTATE_BYTES || memory.len() < QSTATE_BYTES {
+            return Err(Error::Memory);
+        }
+        let at = QSTATE_BYTES - 4;
+        let previous = memory.read32(at);
+        let next = u32::from_le_bytes(bytes[at..].try_into().unwrap());
+        if previous.checked_add(1) != Some(next) {
+            return Err(Error::Failed);
+        }
+        let maps = super::pfc::PEERS * super::pfc::TIDS;
+        for (at, byte) in bytes[..maps].iter().enumerate() {
+            memory.write(at, *byte);
+        }
+        for at in (maps..at).step_by(4) {
+            memory.write32(
+                at,
+                u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+            );
+        }
+        barrier();
+        memory.write32(at, next);
+        barrier();
+        Ok(())
+    }
     /// Nothing is advertised while this owner is being constructed. The
     /// physical transport installs it under fail-safe Drop before returning
     /// any address to an HTT command encoder.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One actual peer's BE/TID0 originator dialog. No peer response is inferred.
+//! Actual peer/TID originator dialogs over one serialized native control owner.
 use super::{
     firmware_transport::{Error, Io},
     station,
@@ -23,12 +23,20 @@ fn action(b: &[u8], own: [u8; 6], ap: [u8; 6]) -> bool {
         && b[22] & 15 == 0
         && b[24] == 3
 }
-pub(super) fn peer_delba(b: &[u8], own: [u8; 6], ap: [u8; 6]) -> bool {
-    b.len() == 30 && action(b, own, ap) && b[25] == 2 && b[26..28] == [0, 0]
+pub(super) fn peer_delba(b: &[u8], own: [u8; 6], ap: [u8; 6]) -> Option<u8> {
+    if b.len() != 30 || !action(b, own, ap) || b[25] != 2 {
+        return None;
+    }
+    let parameter = u16::from_le_bytes([b[26], b[27]]);
+    // Recipient-initiated, all reserved bits zero. This retires only that TID.
+    let tid = (parameter >> 12) as u8;
+    (parameter & 0x0fff == 0 && tid < 8).then_some(tid)
 }
-fn delba(own: [u8; 6], ap: [u8; 6]) -> Vec<u8> {
+fn delba(own: [u8; 6], ap: [u8; 6], tid: u8) -> Vec<u8> {
     let mut b = header(own, ap);
-    b.extend_from_slice(&[2, 0, 8, 39, 0]);
+    b.push(2);
+    b.extend_from_slice(&(0x0800 | u16::from(tid) << 12).to_le_bytes());
+    b.extend_from_slice(&[39, 0]);
     b
 }
 struct Control {
@@ -51,6 +59,7 @@ fn same_control(a: &[u8], b: &[u8]) -> bool {
         }
 }
 pub(super) struct Originator {
+    tid: u8,
     tried: bool,
     dialog: u8,
     control: Option<Control>,
@@ -58,8 +67,13 @@ pub(super) struct Originator {
     teardown: bool,
 }
 impl Originator {
+    #[cfg(feature = "kernel-test")]
     pub(super) fn new() -> Self {
+        Self::for_tid(0)
+    }
+    fn for_tid(tid: u8) -> Self {
         Self {
+            tid,
             tried: false,
             dialog: 0,
             control: None,
@@ -95,7 +109,7 @@ impl Originator {
         let mut b = header(own, ap);
         b.extend_from_slice(&[0, self.dialog]);
         // No TX A-MSDU producer is advertised by this dialog.
-        b.extend_from_slice(&(2 | u16::from(window) << 6).to_le_bytes());
+        b.extend_from_slice(&(2 | u16::from(self.tid) << 2 | u16::from(window) << 6).to_le_bytes());
         b.extend_from_slice(&[0, 0]);
         b.extend_from_slice(&(ssn << 4).to_le_bytes());
         self.control = Some(Control {
@@ -151,7 +165,7 @@ impl Originator {
         let window = p >> 6;
         if b[27..29] != [0, 0]
             || p & 2 == 0
-            || p & 0x3c != 0
+            || (p >> 2) & 15 != u16::from(self.tid)
             || window == 0
             || window > u16::from(c.window)
         {
@@ -224,7 +238,7 @@ impl Originator {
         }
         if self.control.is_none() {
             self.control = Some(Control {
-                bytes: delba(own, ap),
+                bytes: delba(own, ap, self.tid),
                 sent: false,
                 delivered: false,
                 request: false,
@@ -250,7 +264,7 @@ impl Originator {
         let mut b = vec![0x84, 0, 0, 0];
         b.extend_from_slice(&ap);
         b.extend_from_slice(&own);
-        b.extend_from_slice(&[4, 0]);
+        b.extend_from_slice(&(4 | u16::from(self.tid) << 12).to_le_bytes());
         b.extend_from_slice(&(ssn << 4).to_le_bytes());
         self.control = Some(Control {
             bytes: b,
@@ -306,14 +320,177 @@ impl Originator {
         Ok(true)
     }
 }
+/// Independent logical agreements share the same real management DMA slot.
+/// Dialog tokens are globally nonwrapping, so a response with a wrong TID can
+/// never be mistaken for a different simultaneously pending agreement.
+pub(super) struct Originators {
+    tids: [Originator; 8],
+    wanted: u8,
+    dialog: u8,
+    cursor: usize,
+}
+impl Originators {
+    pub(super) fn new() -> Self {
+        Self {
+            tids: core::array::from_fn(|tid| Originator::for_tid(tid as u8)),
+            wanted: 1,
+            dialog: 0,
+            cursor: 0,
+        }
+    }
+    pub(super) fn want(&mut self, tid: u8, allowed: u8) {
+        if tid < 6 && allowed & (1 << tid) != 0 {
+            self.wanted |= 1 << tid;
+        }
+    }
+    pub(super) fn active(&self, tid: u8) -> Option<u8> {
+        self.tids.get(usize::from(tid)).and_then(Originator::active)
+    }
+    pub(super) fn any_active(&self) -> bool {
+        self.tids.iter().any(|t| t.active().is_some())
+    }
+    pub(super) fn waiting(&self) -> bool {
+        self.tids.iter().any(Originator::waiting)
+    }
+    pub(super) fn settled(&self) -> bool {
+        self.tids
+            .iter()
+            .enumerate()
+            .all(|(i, t)| self.wanted & (1 << i) == 0 || t.settled())
+    }
+    pub(super) fn can_begin(&self, tid: u8) -> bool {
+        self.dialog != u8::MAX
+            && self.wanted & (1 << tid) != 0
+            && !self.waiting()
+            && self.tids[usize::from(tid)].can_begin()
+    }
+    pub(super) fn begin(
+        &mut self,
+        tid: u8,
+        own: [u8; 6],
+        ap: [u8; 6],
+        ssn: u16,
+        window: u8,
+        now: u64,
+    ) -> Result<(), station::Error> {
+        if tid >= 6 || !self.can_begin(tid) {
+            return Err(station::Error::State);
+        }
+        let token = self.dialog.checked_add(1).ok_or(station::Error::State)?;
+        let t = &mut self.tids[usize::from(tid)];
+        t.dialog = token - 1;
+        t.begin(own, ap, ssn, window, now)?;
+        self.dialog = token;
+        Ok(())
+    }
+    pub(super) fn idle(
+        &mut self,
+        tid: u8,
+        now: u64,
+        own: [u8; 6],
+        ap: [u8; 6],
+        ssn: u16,
+    ) -> Result<bool, station::Error> {
+        self.tids[usize::from(tid)].idle(now, own, ap, ssn)
+    }
+    pub(super) fn next(&self) -> Option<Vec<u8>> {
+        (0..8).find_map(|offset| self.tids[(self.cursor + offset) % 8].next())
+    }
+    fn control(&mut self, bytes: &[u8], delivered: bool) -> Result<(), station::Error> {
+        let i = self
+            .tids
+            .iter()
+            .position(|t| {
+                t.control
+                    .as_ref()
+                    .is_some_and(|c| same_control(bytes, &c.bytes))
+            })
+            .ok_or(station::Error::State)?;
+        if delivered {
+            self.tids[i].delivered(bytes)
+        } else {
+            self.tids[i].submitted(bytes)?;
+            self.cursor = (i + 1) % 8;
+            Ok(())
+        }
+    }
+    pub(super) fn submitted(&mut self, b: &[u8]) -> Result<(), station::Error> {
+        self.control(b, false)
+    }
+    pub(super) fn delivered(&mut self, b: &[u8]) -> Result<(), station::Error> {
+        self.control(b, true)
+    }
+    pub(super) fn response(&mut self, b: &[u8], own: [u8; 6], ap: [u8; 6]) -> bool {
+        if b.len() != 33 || !action(b, own, ap) || b[25] != 1 {
+            return false;
+        }
+        if let Some(t) = self
+            .tids
+            .iter_mut()
+            .find(|t| t.dialog == b[26] && t.control.as_ref().is_some_and(|c| c.request && c.sent))
+        {
+            t.response(b, own, ap);
+        }
+        true
+    }
+    pub(super) fn retire_tid(&mut self, tid: u8) {
+        if let Some(t) = self.tids.get_mut(usize::from(tid)) {
+            t.retire();
+        }
+    }
+    pub(super) fn stop(&mut self, own: [u8; 6], ap: [u8; 6], now: u64) {
+        for t in &mut self.tids {
+            t.stop(own, ap, now);
+        }
+    }
+    pub(super) fn after_key(&mut self) {
+        for t in &mut self.tids {
+            t.after_key();
+            if self.dialog == u8::MAX {
+                t.tried = true;
+            }
+        }
+    }
+    pub(super) fn terminal(&mut self) {
+        for t in &mut self.tids {
+            t.terminal();
+        }
+    }
+    pub(super) fn tick(&mut self, now: u64, own: [u8; 6], ap: [u8; 6]) {
+        for t in &mut self.tids {
+            t.tick(now, own, ap);
+        }
+    }
+    pub(super) fn note_tx(&mut self, tid: u8, now: u64) {
+        self.tids[usize::from(tid)].note_tx(now);
+    }
+    pub(super) fn queue_bar(
+        &mut self,
+        tid: u8,
+        own: [u8; 6],
+        ap: [u8; 6],
+        ssn: u16,
+        now: u64,
+    ) -> Result<(), station::Error> {
+        self.tids[usize::from(tid)].queue_bar(own, ap, ssn, now)
+    }
+}
 /// Source16-bit prioq counters, not a PCI-consumption or radio-ACK inference.
 pub(super) fn fifo_empty(io: &mut impl Io, c21: bool) -> Result<bool, Error> {
+    fifo_empty_tids(io, c21, 1)
+}
+pub(super) fn fifo_empty_tids(io: &mut impl Io, c21: bool, tids: u8) -> Result<bool, Error> {
     let map = io.read16(0x10c)?;
     if map != 0xc5a0 {
         return Err(Error::Prerequisite);
     }
     let mut empty = true;
-    for shift in [8, 12] {
+    let shifts: &[u8] = if tids & !1 == 0 {
+        &[8, 12]
+    } else {
+        &[6, 8, 10, 12]
+    };
+    for &shift in shifts {
         let reg = [0x23c, 0x234, 0x238, 0x230][usize::from((map >> shift) & 3)];
         let reserved = io.read16(reg)?;
         let expected = if c21 {

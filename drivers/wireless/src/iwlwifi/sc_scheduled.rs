@@ -186,7 +186,10 @@ impl Device {
     ) -> Result<(), i32> {
         authority.check_for(self).map_err(|_| 1)?;
         authority.require_link().map_err(|_| 1)?;
-        if self.closing.load(Ordering::Acquire) || state.scheduled.is_some() {
+        if self.closing.load(Ordering::Acquire)
+            || state.scheduled.is_some()
+            || state.hardware.p2p_started()
+        {
             return Err(16);
         }
         let associated = state.connection.is_some();

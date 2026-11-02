@@ -73,6 +73,17 @@ impl HostMemory for RadioModel {
     }
 }
 impl htt::HttMemory for RadioModel {
+    fn supports_htt_pfc(&self) -> bool {
+        self.inner.supports_htt_pfc()
+    }
+    fn publish_htt_queue_state(&mut self, bytes: &[u8]) -> Result<(), htt::Error> {
+        self.check_current().map_err(|_| htt::Error::Failed)?;
+        self.inner.publish_htt_queue_state(bytes)
+    }
+    fn pending_htt_tx(&self) -> Result<usize, htt::Error> {
+        self.check_current().map_err(|_| htt::Error::Failed)?;
+        self.inner.pending_htt_tx()
+    }
     fn prepare_wmi_management(&mut self, bytes: &[u8]) -> Result<(u32, u64), htt::Error> {
         if self.management_memory.is_none() {
             self.management_memory = Some(radio::management::Pool::new()?);
@@ -312,6 +323,9 @@ impl Hif for RadioModel {
         if offchannel_native::is_htt(self, bytes) {
             return offchannel_native::htt_send(self, bytes);
         }
+        if let Some(result) = data_tests::pfc_response(self, bytes) {
+            return result;
+        }
         data_tests::send_now(self, bytes)
     }
     fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
@@ -386,6 +400,11 @@ impl Hif for RadioModel {
         }
         if pipe == 4 && offchannel_native::is_htt(self, bytes) {
             return offchannel_native::htt_send(self, bytes);
+        }
+        if pipe == 4 {
+            if let Some(result) = data_tests::pfc_response(self, bytes) {
+                return result;
+            }
         }
         if pipe == 4 && self.data.is_some() {
             return data_tests::send(self, bytes).await;
@@ -670,7 +689,7 @@ fn radio_boot_source_version(
     } else {
         1
     };
-    let c = htt::Config::new(hardware, version, htt_dialect, 0).unwrap();
+    let c = htt::Config::new(hardware, version, htt_dialect, features & (1 << 13)).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
     if dialect == Dialect::TenFour && hardware == HwRev::Qca9888 {
         // Independent Linux resource words8/9: QCA9888 has two physical
@@ -733,7 +752,12 @@ fn radio_boot_source_version(
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
-    let mut wmi = Runtime::new(htc, dialect, hardware, if raw { 1 << 10 } else { 0 });
+    let mut wmi = Runtime::new(
+        htc,
+        dialect,
+        hardware,
+        if raw { 1 << 10 } else { 0 } | (features & (1 << 13)),
+    );
     assert!(matches!(once(wmi.start()), Poll::Ready(Ok(_))));
     let mut htt = htt::Runtime::new(wmi, c);
     assert!(matches!(once(htt.start()), Poll::Ready(Ok(_))));

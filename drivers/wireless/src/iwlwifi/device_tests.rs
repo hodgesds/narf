@@ -32,6 +32,7 @@ impl Fixture {
             mode_generation: AtomicU64::new(1),
             ap_capable: false,
             ap_host: ap::Host::new(),
+            p2p: p2p::Host::new(),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
@@ -344,7 +345,6 @@ fn smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints() -> T
         authority.revoke();
         narf_net::registry()
             .register(authority, interface)
-            .map(|_| ())
             .map_err(|_| "revoked during registry publication")
     });
     if result != Err("revoked during registry publication")

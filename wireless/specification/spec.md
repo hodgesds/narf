@@ -2322,6 +2322,20 @@ and 23). Bit 6, WMM_ETSI, attaches wireless-regdb's `wmmrule=ETSI` (ETSI EN
 301 893), the only WMM rule in `db.txt`. The 6 GHz bits are described with
 6 GHz band identity in §3.
 
+Bit 7, `DEPLOYMENT_INDOOR`, is an explicit assertion by the trusted policy
+installer that the current installation is indoors. It is valid only together
+with `INDOOR_ONLY`; an unpaired assertion is a format error. Parsing establishes
+no trust: the ordinary signed firmware bootstrap or the existing trusted
+installer must supply authority. An AP advertisement, country code or firmware
+capability does not create this fact. A driver may admit an indoor-only rule
+only while its current installation fact and all other limits remain valid;
+every overlapping indoor-only rule needs its own fact. Replacement or clear
+must remove stale transmit admission through the family's live-policy path.
+The installer must update policy when the installation changes. `GET_REG`
+continues reporting `INDOOR_ONLY` as Linux `NO_OUTDOOR`; this NARF deployment
+metadata is not mapped to a Linux restriction bit or an automatic netlink hint.
+Older NRGD readers reject bit7 rather than discard its installation semantics.
+
 **Regulatory WMM rule (`reg::{WmmRule, WmmAcRule}`).** `RegRule::wmm_rule()
 -> Option<WmmRule>` is cfg80211 `ieee80211_reg_rule.wmm_rule` with
 `has_wmm`. `RegulatoryDomain::rule_for(mhz)` (`freq_reg_info`) and

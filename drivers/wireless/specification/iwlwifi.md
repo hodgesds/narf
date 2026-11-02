@@ -4476,3 +4476,67 @@ One new unexecuted loader fixture covers absent counts, the actual15/4 and
 replacement (including a factual zero), while retaining unrelated executable
 API facts. The parser component remains pending coordinated compilation and
 native validation.
+
+### 3.73 Native P2P control-device owner (bounded implementation)
+
+The Sc/Bz core103 continuation creates one actual control-only DEVICE10
+through the source-bound NEW/DEL frontend. The physical publication retains
+the original registration Grant and returned parent Write receipt. Child
+registration invokes those exact capabilities, records the typed parent-child
+relationship and retains the newly delegated child Admin on the actual
+creating socket. It has an immutable namespace and distinct physical local
+MAC, real control WDEV, no IFINDEX, no Ethernet frame endpoints and no invented
+administrative-UP state. NEW may run while the physical parent is DOWN.
+Advertisement selects only DEVICE10; CLIENT8/GO9 remain unavailable here.
+
+START retains the original child/source/role proof and installs actual MAC1
+type6/filter2 and inactive FW-link1 contexts. Admission requires the loaded
+MAC3/LINK8/ROCv6/notification1/TX10-or11/TVQM3/flush2 contracts, factual station
+and link counts and API59-qualified RFH band identity. Original station0 and
+FW-link0 stay reserved. AUX uses its dedicated sixteen-byte command and the
+last factual station (15 slots yields14), with actual TID16 TVQM allocation.
+Metadata versions and counts alone cannot authorize any of these operations.
+
+The bounded native radio scope is idle-primary, non-radar 2.4/5GHz legacy20,
+excluding channel14 and6GHz. ROC requires current actual NVM/MCC/host ACTIVE
+permission, a current retained power program, applicable platform SAR and an
+acknowledged device-wide power ceiling before ROCv6 publication. AUX ROC has
+no serving-link power owner: SET_DEVICE conservatively bounds this idle radio
+instead of targeting station0 with SET_LINK. Linux's actual ROCv6 activity1/3
+and floor-TU duration contracts are retained. A correlated command ACK cannot
+open the grant; only the matching successful native START may do so. The
+grant's bounded native interval, original source and actual copied END/stop
+state are checked at final queue publication, including credit waits.
+
+REGISTER_FRAME retains its original control source without granting RF.
+Copied management requires fallback0, original band/channel/FW-link1, physical
+node identity and a grant captured before the actual RFH drain. START in that
+same drain cannot admit an older copy. Full event preparation and socket
+callbacks run outside native State and Work locks; current source, policy and
+the exact copy/grant epoch are checked again afterward. FRAME supports only
+unprotected probe requests and action frames, actual AUX/TID16 OFDM6/no-CCK
+TX and native ACK status. Protected frames require a separate peer/key role
+and refuse. A private management ROC retains native cleanup without emitting
+public READY/EXPIRED for its FRAME cookie.
+
+The physical worker retains every native Future after waiter cancellation.
+Provider watches use its single stable pump waker, with a bounded timer for
+generic capability revocation. STOP/source loss closes TX/copy epochs before
+synchronous REMOVE, all-owned RFH prefix synchronization, actual station flush,
+exact TVQM removal and AUX retirement. LINK/MAC removal precedes a terminal
+DEL receipt; the original mode generation stays unchanged through its final
+checked ACK. Non-emitting cleanup uses current device authority after the
+emitting source dies. Ambiguous queue allocation/removal uses the existing
+physical reset/BME-off owner and retains uncertain DMA. Retired request/sink
+owners leave State and Work before their final destruction. Parent scan,
+association, AP and periodic-scan admission cannot share this active owner.
+
+Five new unexecuted fixtures cover literal ROC/disjoint SESSION codecs and
+actual Sc/Bz posted-ring conversations: typed child creation, native START,
+ROC, filtered management copies, real ACK/failure, terminal STOP/DEL, missing
+START despite ACK, dropped waiters, wrong raw bands/links, reentrant source
+retirement, protected-frame rejection, original parent-role exclusion and
+host NO_IR. This bounded source remains pending coordinated release checking,
+native execution and review. API77/API89 SESSION adapters, CLIENT/GO native
+peer/key/data owners, NoA, CTWindow/OPPPS and remaining whole-family P2P scope
+are still open; this continuation does not close the literal P2P row.

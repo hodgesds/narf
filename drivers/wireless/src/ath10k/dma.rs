@@ -51,6 +51,11 @@ pub(super) trait Memory {
     fn read16(&self, offset: usize) -> u16 {
         u16::from_le_bytes([self.read(offset), self.read(offset + 1)])
     }
+    fn write32(&mut self, offset: usize, value: u32) {
+        for (at, byte) in value.to_le_bytes().iter().enumerate() {
+            self.write(offset + at, *byte);
+        }
+    }
 }
 
 impl Memory for narf_io::DmaBuffer {
@@ -69,6 +74,17 @@ impl Memory for narf_io::DmaBuffer {
         assert!(offset < self.len());
         // SAFETY: checked offset; ownership/CE completion controls access.
         unsafe { self.cpu_mut_ptr::<u8>().add(offset).write_volatile(value) }
+    }
+    fn write32(&mut self, offset: usize, value: u32) {
+        assert!(offset & 3 == 0 && offset + 4 <= self.len());
+        // SAFETY: aligned complete word in the retained coherent mapping;
+        // qstate map/sequence publication must be one native32-bit store.
+        unsafe {
+            self.cpu_mut_ptr::<u8>()
+                .add(offset)
+                .cast::<u32>()
+                .write_volatile(value.to_le());
+        }
     }
     fn read32(&self, offset: usize) -> u32 {
         assert!(offset & 3 == 0 && offset + 4 <= self.len());

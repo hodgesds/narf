@@ -26,6 +26,9 @@ impl Peer {
             .enumerate()
             .find_map(|(i, b)| (*b != 0).then(|| (i * 64 + b.trailing_zeros() as usize) as u16))
     }
+    pub(super) fn pfc_ids(&self) -> &[u64; 32] {
+        &self.ids
+    }
     fn record(&mut self, b: &[u8]) -> Result<bool, Error> {
         match b.first() {
             Some(3) => {

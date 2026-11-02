@@ -5,7 +5,9 @@ use crate::ath10k::{
     hw::HwRev,
     wmi_boot::{self, HostMemory},
 };
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+#[path = "htt_runtime/pfc.rs"]
+pub(super) mod pfc;
 #[path = "htt_runtime/rx.rs"]
 pub(super) mod rx;
 #[path = "htt_runtime/storage.rs"]
@@ -44,7 +46,7 @@ impl Config {
         }
         let continuous = matches!(hw, HwRev::Qca99x0 | HwRev::Qca9888 | HwRev::Qca9984);
         let pfc = features & (1 << 13) != 0;
-        if pfc && (!continuous || wmi != 6) {
+        if pfc && (!continuous || wmi != 6 || htt != 4) {
             return Err(Error::Unsupported);
         }
         let pending = match wmi {
@@ -79,6 +81,16 @@ pub(super) struct DmaConfig {
 /// Returned addresses must already be retained by the physical transport's
 /// mission-mode DMA owner; cancelled setup never returns them to an allocator.
 pub(super) trait HttMemory {
+    /// Real coherent qstate ownership; absence keeps RAW/PFC diagnostic-only.
+    fn supports_htt_pfc(&self) -> bool {
+        false
+    }
+    fn publish_htt_queue_state(&mut self, _bytes: &[u8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn pending_htt_tx(&self) -> Result<usize, Error> {
+        Err(Error::Unsupported)
+    }
     fn prepare_wmi_management(&mut self, _bytes: &[u8]) -> Result<(u32, u64), Error> {
         Err(Error::Unsupported)
     }
@@ -186,6 +198,7 @@ pub(super) struct Runtime<T> {
     pub early_htt: VecDeque<Vec<u8>>,
     pub wmi_events: VecDeque<Vec<u8>>,
     tx_receipts: VecDeque<TxReceipt>,
+    pfc: Option<Box<pfc::Owner>>,
     failed: bool,
 }
 impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
@@ -197,6 +210,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             early_htt: VecDeque::new(),
             wmi_events: VecDeque::new(),
             tx_receipts: VecDeque::new(),
+            pfc: config
+                .pfc
+                .then(|| Box::new(pfc::Owner::new(config.pending))),
             failed: false,
         }
     }
@@ -242,6 +258,16 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             self.failed = true;
             return Err(Error::Malformed);
         }
+        if let Some(owner) = &mut self.pfc {
+            self.failed = true;
+            let consumed = owner.observe(&bytes)?;
+            if consumed {
+                self.publish_pfc_state()?;
+                self.failed = false;
+                return Ok(Event::Progress);
+            }
+            self.failed = false;
+        }
         match bytes.first().copied() {
             Some(7) => self.complete_tx(&bytes).map(Event::Tx),
             Some(message) if message == if self.config.dialect == 2 { 0x13 } else { 0xe } => {
@@ -264,6 +290,96 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         }
         self.wmi.htc.htt_source_ready().map_err(Error::from)
     }
+    fn publish_pfc_state(&mut self) -> Result<(), Error> {
+        let bytes = self.pfc.as_mut().ok_or(Error::Failed)?.state()?;
+        self.wmi.htc.transport.publish_htt_queue_state(&bytes)
+    }
+    pub(super) fn pfc_queued(&self) -> bool {
+        self.pfc.as_ref().is_some_and(|owner| owner.pending() != 0)
+    }
+    pub(super) fn pfc_active(&self) -> bool {
+        self.pfc.is_some()
+    }
+    fn queue_pfc(&mut self, parameters: tx::Parameters, bytes: &[u8]) -> Result<u16, Error> {
+        self.failed = true;
+        if !self.wmi.htc.transport.supports_htt_pfc()
+            || parameters.vdev != 0
+            || bytes.len() < 24
+            || !matches!(bytes[0], 8 | 0x88)
+            || bytes[1] & 3 != 1
+            || bytes[4] & 1 != 0
+        {
+            return Err(Error::Unsupported);
+        }
+        // mac80211's non-QoS TXQ is host queue0; native ext-TID16 remains
+        // unchanged in TX_FRM. Do not alias management ext-TID17 to data.
+        let tid = if bytes[0] == 8 && parameters.tid == 16 {
+            0
+        } else if bytes[0] == 0x88
+            && bytes.len() >= 26
+            && parameters.tid < 8
+            && bytes[24] & 15 == parameters.tid
+        {
+            parameters.tid
+        } else {
+            return Err(Error::Malformed);
+        };
+        let mac = bytes[4..10].try_into().unwrap();
+        let key = self
+            .pfc
+            .as_ref()
+            .ok_or(Error::Failed)?
+            .key(parameters.vdev, mac, tid)?;
+        let (id, body) = self
+            .wmi
+            .htc
+            .transport
+            .prepare_htt_tx(self.config, parameters, bytes)?;
+        self.pfc
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .enqueue(key, id, bytes.len(), body)?;
+        self.publish_pfc_state()?;
+        self.failed = false;
+        Ok(id)
+    }
+    /// Only the live station packet path calls this after its current
+    /// association/policy/key/timeout checks. Generic scan/management polling
+    /// never publishes a retained data entry for a retired controlled port.
+    pub(super) fn service_pfc(&mut self, mac: [u8; 6], ids: &[u64; 32]) -> Result<bool, Error> {
+        if self.pfc.is_none() {
+            return Ok(false);
+        }
+        if self.failed || self.ready.is_none() {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        let mut progress = false;
+        for _ in 0..32 {
+            if !self.wmi.htc.htt_source_ready()? {
+                break;
+            }
+            // The pool also contains management and prepared host IDs. Count
+            // all actual native work, excluding only this owner's host queues.
+            let owner = self.pfc.as_mut().ok_or(Error::Failed)?;
+            let native = self
+                .wmi
+                .htc
+                .transport
+                .pending_htt_tx()?
+                .checked_sub(owner.pending())
+                .ok_or(Error::Failed)?;
+            let Some(work) = owner.next(mac, ids, native)? else {
+                break;
+            };
+            self.wmi.htc.begin_htt(work.bytes())?;
+            self.pfc.as_mut().ok_or(Error::Failed)?.published(work)?;
+            self.publish_pfc_state()?;
+            progress = true;
+        }
+        self.failed = false;
+        Ok(progress)
+    }
     pub fn begin_transmit(
         &mut self,
         parameters: tx::Parameters,
@@ -271,6 +387,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
     ) -> Result<u16, Error> {
         if !self.source_ready()? {
             return Err(Error::Busy);
+        }
+        if self.config.pfc && parameters.kind == tx::Kind::Raw {
+            return self.queue_pfc(parameters, bytes);
         }
         let (id, body) = self
             .wmi
@@ -310,6 +429,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
     ) -> Result<u16, Error> {
         if self.failed || self.ready.is_none() {
             return Err(Error::Failed);
+        }
+        if self.config.pfc && parameters.kind == tx::Kind::Raw {
+            return self.queue_pfc(parameters, bytes);
         }
         let (id, body) = self
             .wmi
@@ -382,10 +504,16 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         if self.tx_receipts.len() >= usize::from(self.config.pending) {
             return Err(Error::Busy);
         }
+        if let Some(owner) = &self.pfc {
+            owner.validate_receipts(&[id as u16])?;
+        }
         self.tx_receipts
             .try_reserve(1)
             .map_err(|_| Error::NoMemory)?;
         self.wmi.htc.transport.complete_htt_tx(&[id as u16], true)?;
+        if let Some(owner) = &mut self.pfc {
+            owner.complete(&[id as u16]);
+        }
         let status = match status {
             0 => 0,
             1 => 2,
@@ -404,6 +532,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         }
         self.failed = true;
         let (status, ids) = tx::completion(bytes)?;
+        if let Some(owner) = &self.pfc {
+            owner.validate_receipts(&ids)?;
+        }
         if self.tx_receipts.len() + ids.len() > usize::from(self.config.pending) {
             return Err(Error::Busy);
         }
@@ -411,6 +542,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             .try_reserve(ids.len())
             .map_err(|_| Error::NoMemory)?;
         self.wmi.htc.transport.complete_htt_tx(&ids, false)?;
+        if let Some(owner) = &mut self.pfc {
+            owner.complete(&ids);
+        }
         self.tx_receipts
             .extend(ids.into_iter().map(|id| TxReceipt { id, status }));
         self.failed = false;
@@ -466,7 +600,7 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         Ok(())
     }
     pub fn data_profile(&self) -> bool {
-        self.wmi.raw_mode() && !self.config.pfc
+        self.wmi.raw_mode() && (!self.config.pfc || self.wmi.htc.transport.supports_htt_pfc())
     }
     pub async fn start(&mut self) -> Result<Ready, Error> {
         if self.failed || self.ready.is_some() || self.wmi.ready.is_none() {

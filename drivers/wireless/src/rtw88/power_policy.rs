@@ -674,6 +674,26 @@ impl Gate {
         gate.ht = Some(g);
         Ok(gate)
     }
+    /// Keep the exact current all-AC continuation around the real immutable
+    /// batch publication; checking a cached profile before callbacks is not
+    /// authority to ring a later BK/VI doorbell.
+    pub(super) fn invoke_batch<T>(
+        &self,
+        profile: super::packet_format::DataProfile,
+        operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
+        if !self.allows_profile(profile) {
+            return Err(super::firmware_transport::Error::Prerequisite);
+        }
+        if profile.acs == 0 {
+            self.invoke(operation)
+        } else {
+            self.qos
+                .as_ref()
+                .ok_or(super::firmware_transport::Error::State)?
+                .invoke(self, operation)
+        }
+    }
     pub(super) fn c21_indices(&self) -> Option<[u8; 12]> {
         match &self.scope {
             Scope::C21(g) => Some(g.indices()),

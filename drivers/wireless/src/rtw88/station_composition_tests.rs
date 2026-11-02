@@ -86,7 +86,8 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) tx_ba_timeout: u16,
     pub(in crate::rtw88) tx_ba_override: Option<Vec<u8>>,
     pub(in crate::rtw88) hold_tx_ba: bool,
-    tx_next_sequence: Option<u16>,
+    tx_next_sequence: [Option<u16>; 8],
+    pub(in crate::rtw88) tx_sequences: Vec<(u8, u16, u64)>,
     pub(in crate::rtw88) hold_decline: bool,
     pub(in crate::rtw88) ap: FakeAp,
     pub(in crate::rtw88) plan: NetworkPlan,
@@ -139,7 +140,8 @@ impl Peer {
             tx_ba_timeout: 0,
             tx_ba_override: None,
             hold_tx_ba: false,
-            tx_next_sequence: None,
+            tx_next_sequence: [None; 8],
+            tx_sequences: Vec::new(),
             hold_decline: false,
             ap,
             plan,
@@ -216,11 +218,15 @@ impl Peer {
         }
         if frame.len() == 20 && frame[..2] == [0x84, 0] {
             let ssn = u16::from_le_bytes([frame[18], frame[19]]);
+            let control = u16::from_le_bytes([frame[16], frame[17]]);
+            let tid = (control >> 12) as usize;
             if frame[4..10] != AP
                 || frame[10..16] != self.plan.station
-                || frame[16..18] != [4, 0]
+                || control & 0x0fff != 4
+                || tid >= 6
+                || tid != 0 && !self.any_tid
                 || ssn & 15 != 0
-                || self.tx_next_sequence != Some(ssn >> 4)
+                || self.tx_next_sequence[tid] != Some(ssn >> 4)
             {
                 return Err("native BAR current source SSN/peer");
             }
@@ -228,7 +234,7 @@ impl Peer {
             let mut reply = vec![0x94, 0, 0, 0];
             reply.extend_from_slice(&self.plan.station);
             reply.extend_from_slice(&AP);
-            reply.extend_from_slice(&[4, 0]);
+            reply.extend_from_slice(&control.to_le_bytes());
             reply.extend_from_slice(&ssn.to_le_bytes());
             reply.extend_from_slice(&[0; 8]);
             return Ok((vec![reply], self.hold_tx_ba));
@@ -240,6 +246,7 @@ impl Peer {
             if frame.len() == 33 && frame[24..26] == [3, 0] {
                 let p = u16::from_le_bytes([frame[27], frame[28]]);
                 let window = p >> 6;
+                let tid = usize::from((p >> 2) & 15);
                 let ssn = u16::from_le_bytes([frame[31], frame[32]]);
                 let local = self
                     .tx_ba_window
@@ -247,7 +254,9 @@ impl Peer {
                 if self.ap.phase() != ApPhase::Authorized
                     || !self.qos
                     || self.ht.is_none()
-                    || p & 0x3f != 2
+                    || p & 3 != 2
+                    || tid >= 6
+                    || tid != 0 && !self.any_tid
                     || !(1..=64).contains(&window)
                     || ssn & 15 != 0
                 {
@@ -261,17 +270,24 @@ impl Peer {
                 response.extend_from_slice(&AP);
                 response.extend_from_slice(&[0, 0, 3, 1, frame[26]]);
                 response.extend_from_slice(&(if selected == 0 { 37u16 } else { 0 }).to_le_bytes());
-                response.extend_from_slice(&(2 | u16::from(selected) << 6).to_le_bytes());
+                response.extend_from_slice(
+                    &(2 | (tid as u16) << 2 | u16::from(selected) << 6).to_le_bytes(),
+                );
                 response.extend_from_slice(&self.tx_ba_timeout.to_le_bytes());
-                self.tx_next_sequence = (selected != 0).then_some(ssn >> 4);
+                self.tx_next_sequence[tid] = (selected != 0).then_some(ssn >> 4);
                 return Ok((
                     vec![self.tx_ba_override.clone().unwrap_or(response)],
                     self.hold_tx_ba,
                 ));
             }
-            if frame.len() == 30 && frame[24..30] == [3, 2, 0, 8, 39, 0] {
+            if frame.len() == 30 && frame[24..26] == [3, 2] && frame[28..30] == [39, 0] {
+                let parameter = u16::from_le_bytes([frame[26], frame[27]]);
+                let tid = usize::from(parameter >> 12);
+                if parameter & 0x0fff != 0x0800 || tid >= 6 || tid != 0 && !self.any_tid {
+                    return Err("native originator DELBA TID/reserved/initiator");
+                }
                 self.tx_ba_controls.push(frame.to_vec());
-                self.tx_next_sequence = None;
+                self.tx_next_sequence[tid] = None;
                 return Ok((Vec::new(), self.hold_tx_ba));
             }
             if frame.len() == 33 && frame[24..26] == [3, 1] && frame[27..29] == [0, 0] {
@@ -374,12 +390,13 @@ impl Peer {
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
         let header = if self.qos && frame[0] == 0x88 { 26 } else { 24 };
-        if header == 26 {
-            if let Some(expected) = self.tx_next_sequence {
+        if header == 26 && frame.len() >= 26 && frame[24] < 8 {
+            let tid = usize::from(frame[24]);
+            if let Some(expected) = self.tx_next_sequence[tid] {
                 if u16::from_le_bytes([frame[22], frame[23]]) >> 4 != expected {
                     return Err("actual negotiated originator SSN/sequence differs");
                 }
-                self.tx_next_sequence = Some((expected + 1) & 4095);
+                self.tx_next_sequence[tid] = Some((expected + 1) & 4095);
             }
         }
         if frame.len() < header
@@ -425,6 +442,18 @@ impl Peer {
         }
         if header == 26 {
             self.tids.push(frame[24]);
+            let pn = if self.ap.protected() && frame.len() >= 34 {
+                u64::from_le_bytes([
+                    frame[26], frame[27], frame[30], frame[31], frame[32], frame[33], 0, 0,
+                ])
+            } else {
+                0
+            };
+            self.tx_sequences.push((
+                frame[24],
+                u16::from_le_bytes([frame[22], frame[23]]) >> 4,
+                pn,
+            ));
         }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {

@@ -57,6 +57,7 @@ pub(super) struct Fixture {
     pub(super) automatic: bool,
     control_phase: u8,
     group_replies: usize,
+    pfc_responses: Vec<Vec<u8>>,
     server: DhcpServer,
     ap: FakeAp,
     ptk: Option<Ptk>,
@@ -200,6 +201,7 @@ impl Fixture {
             wmm_policy: None,
             qos_frames: 0,
             group_replies: 0,
+            pfc_responses: Vec::new(),
             server: DhcpServer::new(network()),
             ap,
             ptk: None,
@@ -861,6 +863,41 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
     }
     Ok(())
 }
+/// Independent native CE/HTC response observer. No response creates a DATA
+/// receipt or releases HTT DMA; those still come only from complete().
+pub(super) fn pfc_response(m: &mut RadioModel, bytes: &[u8]) -> Option<Result<(), BmiError>> {
+    if !m.inner.config.pfc || bytes.get(8).copied() != Some(11) {
+        return None;
+    }
+    Some((|| {
+        let body = &bytes[8..];
+        if bytes.len() > 256
+            || body.len() < 12
+            || bytes[0] != 1
+            || bytes[1] != 0
+            || bytes[5] != m.inner.sequence
+            || bytes[2..4] != (body.len() as u16).to_le_bytes()
+            || body[1..4] != [0; 3]
+            || body.len()
+                != 12 + usize::from(u16::from_le_bytes(body[6..8].try_into().unwrap())) * 8
+        {
+            return Err(BmiError::BadResponse);
+        }
+        if let Some(ce) = &m.ce {
+            let actual = ce.source_bytes(4);
+            if actual.get(..bytes.len()) != Some(bytes) {
+                return Err(BmiError::BadResponse);
+            }
+        }
+        m.data
+            .as_mut()
+            .ok_or(BmiError::BadResponse)?
+            .pfc_responses
+            .push(body.to_vec());
+        m.inner.sequence = m.inner.sequence.wrapping_add(1);
+        Ok(())
+    })())
+}
 pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
     if let Some(f) = &mut m.data {
         if f.protection_delay != 0 {
@@ -884,7 +921,10 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         }
         return Ok(());
     };
-    let peer = fixture.next_peer.take().unwrap_or(1800);
+    let peer = fixture
+        .next_peer
+        .take()
+        .unwrap_or(if m.inner.config.pfc { 17 } else { 1800 });
     let tid = fixture
         .next_tid
         .take()
@@ -969,7 +1009,36 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
     Ok(())
 }
 fn joined(version: u32, dialect: Dialect, secured: bool, raw: bool) -> radio::Radio<RadioModel> {
-    let mut r = mlme_tests::prepared_profile(version, dialect, secured, raw);
+    joined_features(version, dialect, secured, raw, 0)
+}
+fn joined_features(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    raw: bool,
+    extra: u64,
+) -> radio::Radio<RadioModel> {
+    let mut r = mlme_tests::prepared_profile_features(version, dialect, secured, raw, extra);
+    if extra & (1 << 13) != 0 {
+        r.htt.wmi.htc.transport.ce = Some(crate::ath10k::boot::CeFixture::new(HwRev::Qca9984));
+        // alloc_coherent_masked retains a power-of-two page extent: the
+        // 4772-byte native qstate therefore lives in8192 bytes. Exercise
+        // that physical shape before any handshake/queue publication, and
+        // retain a sentinel outside the exact advertised qstate span.
+        r.htt
+            .wmi
+            .htc
+            .transport
+            .inner
+            .storage
+            .as_mut()
+            .unwrap()
+            .qstate
+            .as_mut()
+            .unwrap()
+            .bytes
+            .resize(8192, 0xa5);
+    }
     let mode = if secured {
         narf_wireless::association::SecurityMode::Wpa2Psk
     } else {
@@ -1203,6 +1272,8 @@ kernel_test_in!(
 
 #[path = "dhcp_tests.rs"]
 mod dhcp_tests;
+#[path = "pfc_tests.rs"]
+mod pfc_tests;
 #[path = "tx_pipeline_tests.rs"]
 mod tx_pipeline_tests;
 

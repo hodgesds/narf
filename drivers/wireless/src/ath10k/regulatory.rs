@@ -171,10 +171,16 @@ impl Permission {
             // permissive rule cannot erase DFS, narrow bandwidth or power.
             if r.freq_start_mhz >= r.freq_end_mhz
                 || r.max_bandwidth_mhz < width
-                // This STA profile has no DFS/indoor qualification. NO_P2P
-                // does not restrict STA; unknown future restrictions are not
-                // silently promoted by a second permissive overlapping row.
-                || r.flags.bits() & !RegFlags::NO_P2P.bits() != 0
+                // An indoor-only rule additionally needs the current trusted
+                // deployment's explicit installation fact. Neither an AP nor
+                // a country hint supplies that fact. Every overlapping row
+                // must agree; NO_IR/DFS and unknown restrictions stay closed.
+                || r.flags.contains(RegFlags::INDOOR_ONLY)
+                    != r.flags.contains(RegFlags::DEPLOYMENT_INDOOR)
+                || r.flags.bits()
+                    & !(RegFlags::NO_P2P | RegFlags::INDOOR_ONLY | RegFlags::DEPLOYMENT_INDOOR)
+                        .bits()
+                    != 0
             {
                 return Err(Error::Unsupported);
             }

@@ -1,5 +1,74 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_ath10k_indoor_occupied_spans_need_each_current_installation_fact() -> TestResult {
+    use narf_wireless::reg::RegFlags;
+    let pair = RegFlags::INDOOR_ONLY | RegFlags::DEPLOYMENT_INDOOR;
+    let mut domain = us_domain(80);
+    for rule in &mut domain.rules {
+        rule.flags = pair;
+    }
+    for (secondary, eighty) in [(None, false), (Some(5200), false), (Some(5200), true)] {
+        let Ok(receipt) =
+            Permission::from_factory_width(us_factory(), &domain, 5180, secondary, eighty)
+        else {
+            return TestResult::Fail("qualified indoor20/40/80 span was refused");
+        };
+        if receipt.half_dbm != 46 || receipt.check(&domain).is_err() {
+            return TestResult::Fail("indoor permission raised source power or changed receipt");
+        }
+        for flags in [
+            RegFlags::INDOOR_ONLY,
+            RegFlags::DEPLOYMENT_INDOOR,
+            pair | RegFlags::NO_IR,
+            pair | RegFlags::DFS,
+            pair | RegFlags::from_bits_retain(1 << 31),
+        ] {
+            let mut changed = domain.clone();
+            changed.rules[0].flags = flags;
+            if receipt.check(&changed).is_ok()
+                || Permission::from_factory_width(us_factory(), &changed, 5180, secondary, eighty)
+                    .is_ok()
+            {
+                return TestResult::Fail(
+                    "indoor assertion erased missing fact or another restriction",
+                );
+            }
+        }
+        let mut overlap = domain.clone();
+        let mut unproven = overlap.rules[0].clone();
+        unproven.freq_start_mhz = 5179;
+        unproven.freq_end_mhz = 5181;
+        unproven.flags = RegFlags::INDOOR_ONLY;
+        overlap.rules.push(unproven);
+        if receipt.check(&overlap).is_ok() {
+            return TestResult::Fail(
+                "permissive indoor row erased unproven overlapping restriction",
+            );
+        }
+    }
+    // Installation facts do not resolve World factory5GHz or another country.
+    if Permission::from_factory_width(
+        Factory::from_eeprom(0x64).unwrap(),
+        &domain,
+        5180,
+        None,
+        false,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("indoor assertion replaced immutable World factory identity");
+    }
+    domain.country_code = *b"CA";
+    if Permission::from_factory_width(us_factory(), &domain, 5180, None, false).is_ok() {
+        return TestResult::Fail("indoor assertion replaced source country match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/regulatory/indoor",
+    smoke_ath10k_indoor_occupied_spans_need_each_current_installation_fact
+);
 fn smoke_ath10k_factory_regulatory_identity_matches_linux_all_u16() -> TestResult {
     // Frozen source-cited reference over every 16-bit EEPROM value, not
     // regenerated from the Rust resolver. The stored digest includes all

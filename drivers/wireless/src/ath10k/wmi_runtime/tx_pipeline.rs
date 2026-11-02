@@ -117,6 +117,12 @@ impl Pipeline {
     pub(super) fn expired(&self) -> bool {
         self.entries.iter().any(|e| e.deadline.expired())
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn expire_for_test(&mut self) {
+        for entry in &mut self.entries {
+            entry.deadline = narf_time::Deadline::after_cycles(0);
+        }
+    }
     /// Record a freshly published HTT ID. Admission was checked before the
     /// HTT publish; a duplicate ID means the DMA pool and this table diverged.
     pub(super) fn push(&mut self, id: u16, role: Role, length: usize) -> Result<(), Error> {

@@ -30,6 +30,10 @@
 > unexecuted; release compilation, native suites and physical acceptance are
 > pending. A released host wake vote is not a firmware-sleep acknowledgement.
 
+> The later bounded RAW/10.4 PFC station continuation is source complete.
+> Six new cases are written but unexecuted; coordinated release compilation,
+> native execution and physical firmware/board acceptance remain pending.
+
 ## 1. Purpose & scope
 
 PCIe Qualcomm/Atheros QCA988X, QCA9887, QCA6174/6164, QCA9377, QCA99X0,
@@ -82,7 +86,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   `htt_error` retains setup failure. `scan_ready` records submitted native
   station-vdev0 and passive channel setup, without claiming a firmware
   vdev-create acknowledgement; `scan_error` retains setup/scan failure.
-  These metadata alone register no netdev; raw/non-PFC admission below follows
+  These metadata alone register no netdev; the RAW station admission below follows
   successful scan-vdev setup.
 - `pci::scan_passive(frequencies_mhz)` serializes a receive-only scan over
   the retained physical HTC/WMI/HTT owner. It accepts only configured IEEE
@@ -919,7 +923,7 @@ actual-device RF/power/interoperability acceptance remain separate.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires
   firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a
-  non-PFC HTT profile. All six WMI resource layouts use their actual decap
+  non-PFC HTT profile or the bounded native PFC owner below. All six WMI resource layouts use their actual decap
   field; HTT disables transmit A-MSDU for Linux's raw-mode workaround. Other images
   retain native-WiFi RX and cannot enter this software-CCMP owner. Shared
   `station_security::Security` owns the supplicant, fallible nonce acquisition,
@@ -932,8 +936,62 @@ actual-device RF/power/interoperability acceptance remain separate.
   preauthorization IP is discarded. `StationLink { bssid, frequency, protected }`
   requires the live peer and current completed data authorization. Temporary GTK/PTK
   reply waits close the data port without flapping established physical carrier.
+- The bounded PFC continuation admits RAW-capable 10.4/HTT-dialect4 images on
+  QCA99X0, QCA9984 and QCA9888 only with the retained coherent qstate adapter.
+  Unknown transports default to unsupported. Every host queue is bound to a
+  delivered native `PEER_MAP`, vdev0/AP MAC and the current station's exact
+  peer bitmap. Queue IDs cover0–527 and TIDs0–7; non-QoS RAW retains native
+  ext-TID16 while using host queue0, following mac80211's non-WME priority0.
+  A foreign vdev, peer replacement, UNMAP or unsupported TID cannot alias a
+  queued original. The admitted station Pipeline remains bounded to32 IDs.
+  Its existing three-second native-operation deadline and bounded RX queues
+  continue while firmware provides no fetch; no unbounded key/RX stall is
+  introduced.
+- Actual 10.4 `TX_MODE_SWITCH_IND` selects PUSH/PUSH_PULL and global/per-TID
+  push limits. Complete native `TX_FETCH_IND` record lengths and bounds are
+  validated before any request-prefix ownership changes. Repeated peer/TID
+  records carry separate sequential budgets; repeated MODE records use the
+  last limit, with every later record validated before earlier limits change.
+  The MSDU limit is exact. Following Linux, a whole bounded frame is selected
+  only while the accumulated byte count is below the byte threshold. That final frame
+  may cross the threshold, and its complete actual length is reported with
+  checked accounting. Requiring it to fit a rounded-down qstate hint would
+  starve valid queues; a zero-byte request still sends nothing.
+  The retained CE4 command extent is256
+  bytes including HTC, so one complete `FETCH_RESP` admits at most29 records
+  (252 bytes including HTC);30 records close the owner before TX. Responses
+  are neither truncated nor split into an invented continuation protocol.
+  Token and sequence are opaque echoes, following Linux's `htt_rx.c` and
+  `htt_tx.c`: every delivered native event, including identical/lower/wrapped
+  echoes, owns a distinct nonwrapping private host operation and phase.
+  Polling the same owned phase cannot publish its native ID twice. No
+  cross-event cache or wire-scalar ordering/deduplication grants authority.
+  Constant response-ID0 and `FETCH_CONFIRM` are convenience metadata, never
+  packet, PN, controlled-port or DMA-completion credit.
+- PFC qstate is the actual advertised4772-byte layout:528×8 count bytes,
+  eight17-word native maps and a nonwrapping sequence. Byte-count encoding
+  follows Linux's128-byte coefficient, six-bit factor and two-bit exponent.
+  Counts and aligned32-bit map stores precede an outer-shareable DMA barrier
+  and one aligned32-bit sequence store. The physical allocation may be8192
+  bytes; only the exact advertised span is updated. Original executable,
+  board and PCI invocations enclose that coherent copy. Prepared host entries
+  and actually CE-published IDs remain distinct; an HTT terminal batch naming
+  any unpublished queued ID fails before releasing any payload. Only actual
+  native HTT TX terminal status ends an advertised payload/fragment owner.
+- A PFC entry is released only by the live DATA/handshake path after fresh
+  policy, native peer, source, timeout and key/port checks. Generic management
+  or scan credit progress cannot revive queued DATA. Retained DATA/EAPOL input
+  waits while prior host DATA entries still await native publication, keeping
+  their old security key/port current; native loss, UNMAP and management still
+  progress immediately. The existing Pipeline then drains every old DATA air
+  terminal before admitting the sole M2/M4/group reply. A key reply retains
+  its exact Reply owner while its port is closed, and key/port promotion still
+  requires its successful native air terminal. Cancellation, malformed fetch,
+  missed-fetch timeout and current-source loss retain uncertain native pool
+  mappings for the existing terminal-reset/CE-halt/BME-off/flush proof.
 - `pci::transmit_ethernet(bytes)` submits one admitted Ethernet frame through
-  this owner and returns its actual HTT publication ID. ToDS/RFC1042 and
+  this owner and returns its actual retained HTT ID; PFC may keep that original
+  in its host queue until a real push allowance or fetch arrives. ToDS/RFC1042 and
   optional software CCMP preserve packet identity; externally supplied EAPOL
   stays closed. `pci::poll_ethernet()` drives the same HTC/HTT owner and returns
   Ethernet only after receive quiescence with a still-owned peer. Native v1
@@ -949,13 +1007,13 @@ actual-device RF/power/interoperability acceptance remain separate.
   surface and the nonblocking network drain share the same packet parsing,
   peer events, terminal receipts and security state.
 - `interface::Device` implements the registered legacy/HT20/qualified HT40 profile after
-  calibrated boot, WMI/HTT/scan setup, RAW/non-PFC firmware admission, signed
+  calibrated boot, WMI/HTT/scan setup, RAW station-profile admission, signed
   regulatory bootstrap and current network-registry capability admission.
   `boot_task` publishes the retained `SESSION` and `scan_ready` immediately after
-  `initialize_radio`, then runs `interface::wait_publish` so RAW/non-PFC radios
+  `initialize_radio`, then runs `interface::wait_publish` so admitted RAW radios
   wait for missing `wireless-regulatory.bin`, loader authority or network
-  registry authority without blocking passive-scan diagnostics; non-RAW/PFC
-  images and invalid/unsigned regulatory policy fail immediately without waiting.
+  registry authority without blocking passive-scan diagnostics; non-RAW images,
+  unsupported PFC adapters and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
   The Device exposes passive/active scan and Open/WPA2-PSK/WPA2-PMF/WPA3-SAE
@@ -1105,7 +1163,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   Four shared cases cover exact IFINDEX/deferred status/registration and fixed
   Radio-kind prepared-event fences. All14 are written but unexecuted; no RF,
   timing or board qualification is claimed.
-- RAW/non-PFC images without firmware `NO_PS` expose an awake station
+- RAW station images without firmware `NO_PS` expose an awake station
   power-save default and `WirelessNetIface::set_power_save`. The synchronous
   setter records desired intent; the retained async worker submits native
   station-PS controls only after association. Enabling programs RX wake,
@@ -1408,6 +1466,19 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
+### 3.1 Explicit indoor installation policy
+
+Admitted station profiles can use an indoor-only host rule only when the
+current trusted deployment policy also carries `DEPLOYMENT_INDOOR`. Every
+overlapping indoor-only rule needs that fact; factory identity, full occupied
+span, original power ceiling, DFS/NO_IR and other restrictions remain active.
+The same permission checks cover native probes, association, terminal peer
+admission and packet/copy/control progress. Removing the fact while retaining
+the indoor-only restriction closes old admission; restoring it cannot revive
+a terminal old radio. See [the exact policy and native contract](ath10k-indoor-regulatory.md).
+Source and native cases are written; coordinated release/native acceptance
+remains pending. This adds no country inference or generic nl80211 indoor hint.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -1625,12 +1696,14 @@ as described in §3; seven new cases and its release/native validation are
 pending. This makes no additional per-chip physical RF or power claim.
 
 Across the reached rows, concrete remaining software packages are
-contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented); PFC fetch/queue ownership;
-AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
+contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented);
+AP-side U-APSD under the AP owner; DFS/beacon-hint
 qualification; hardware key offload;
 AP/P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.
+The signed indoor installation continuation is implemented in §3.1 and awaits
+coordinated release/native acceptance.
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
 are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or
@@ -1656,8 +1729,11 @@ Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
 scan, Open/WPA2 and actual DHCP/IP with a real AP, idle/beacon liveness, link loss,
 revocation and terminal teardown without DMA reuse. No such run is recorded.
-An image lacking RAW support, or requiring PFC, remains a diagnostic scan owner
-and must not be counted as a usable station under this profile.
+An image lacking RAW support or a PFC image outside the explicit native
+queue/peer/TID/request geometry above remains a diagnostic scan owner and must
+not be counted as a usable station under this profile. The bounded RAW/PFC
+continuation is source complete with six new cases written; release compilation,
+native execution and actual-device interoperability are still pending.
 
 The table and packages above remain open beyond the bounded R/H profiles. The
 family is not feature-complete or physically qualified after this checkpoint.

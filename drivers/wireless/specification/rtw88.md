@@ -1283,8 +1283,35 @@ scoped Wi-Fi totals, not RTW88-only counts. Production boots and both btrfs
 postflight checks also completed cleanly on each architecture. Debug/release
 builds and strict Clippy, including the exact CI feature contexts, passed. None of
 these software results establishes silicon or RF acceptance.
-Full AC/TID scheduling, TX A-MSDU, larger/native IRQ pipelines,
-wider PHY/channels, reset/rejoin and power management remain software work.
+TX A-MSDU, larger/native IRQ pipelines, wider PHY/channels, reset/rejoin and
+power management remain software work. All-AC routing uses N2xQ below;
+originator agreements beyond TID0 use the separate v2 program next.
+
+### C21/C22 qualified originator BA on every non-VO TID
+
+The separate N21T/N22T v2 program implements actual originator BA on admitted
+TIDs0..5 across BE/BK/VI, preserving the complete v1 record/identity and its
+BE/TID0-only permission. `TxBaRequest` adds `all_tids_identity` and
+`all_tids_filename` alongside its unchanged v1 fields. Each agreement has its
+own actual producer SSN, globally unique nonwrapping dialog, peer window/TU,
+current control/CCX state and key retirement. Other TIDs begin on real DATA
+demand; VO and EAPOL retain their source exclusions.
+
+Public IPC selects a same-TID FIFO prefix and complete length/airtime bounds
+before SN/PN. The four actual original mappings publish on that TID's physical
+BE/BK/VI ring with its own depth, consumed prefix and each positive CCX.
+Source RQPN FIFO quiet and actual RX-idle precede the matching TID BAR and any
+next burst/key/control. All agreements share the original serialized physical
+owner. Current N2xQ admission encloses native batch publication, with checks
+before each BD/final WP; stale or partially published work stays closed/pinned.
+
+[RTW88 originator BA on non-VO TIDs](rtw88-originator-all-tids.md) specifies
+its distinct v2 full-program qualification and exact Linux call chain. No real
+measured asset is supplied. Sixteen new native registrations are written,
+including real Open/WPA2/kernel DHCP for each chip, all-TID physical rings,
+mixed IPC prefix/SN/PN, v1 negatives, per-TID DELBA/TU/key, held native controls
+and callback source loss, plus actual ring-wrap/consumed-prefix Core cases.
+New release/native and physical acceptance remain pending.
 
 ### C21/C22 separately qualified native RTS threshold
 
@@ -1515,8 +1542,9 @@ qualified then steps further down; an unqualified BK falls back to
 BE/TID0. QoS Control carries the TID with normal ack and no
 EOSP/A-MSDU bit, and the descriptor QSEL is the TID. EDCA for all four
 ACs is already programmed from the bound AP parameters (`wmm.rs`). RX
-accepts QoS DATA on any TID while `acs` is set. Originator BA still
-aggregates only its TID0 agreement, so other TIDs use single-MPDU
+accepts QoS DATA on any TID while `acs` is set. The original T v1 still
+aggregates only its TID0 agreement; the separate T v2 program above admits
+independent non-VO agreements. Without T v2, other TIDs use single-MPDU
 publication. Revocation is checked on every send and every watchdog pass,
 like N2xC; it returns every frame to BE/TID0 without dropping the link.
 
@@ -1880,6 +1908,6 @@ changes. None is a physical blocker unless stated.
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
 | `system_suspend` | Linux `rtw_pci_suspend`/`resume` only toggle the CLKREQ pad (8822C RFE 6); the stack stops the radio through mac80211 (`rtw_ops_stop` → `rtw_core_stop`) and restarts it (`rtw_ops_start` → `rtw_core_start`: power-on, firmware download, MAC/PHY init). The DMA-stop proof now covers the stop half, but the resume half is exactly the missing generation reset, so this is blocked on `operating_reset`. |
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
-| `tx_ba_all_tids` | `tx_ba.rs::Originator` holds one TID0 dialog and builds TID0 ADDBA/BAR/DELBA; `station.rs` aggregates and assigns BA sequence numbers only for `tid == 0`; `packet_core/batch.rs` publishes bursts only on `Queue::Data` (BE, host index slot 1); and the signed N2xT identity in `tx_ba_power.rs` is bound to `"originator HT20 BE/TID0 BA/burst v1"`. Per-TID agreements need a per-TID originator table, BK/VI/VO burst publication, and a new or extended signed burst envelope covering those rings. |
+| `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
 | `wow` | No `rtw8822c` wowlan firmware swap (`wow_fw_name`) or `wow.c` pattern/RF-kill programming is ported. |

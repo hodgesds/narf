@@ -135,11 +135,11 @@ pub(super) struct State {
     scan_address: Option<[u8; 6]>,
     /// Bound N2xQ all-TID QoS routing (`qos`, tag `Q`) and its AC set.
     qos: Option<(Arc<super::qualification::Grant>, u8)>,
-    tx_ba: super::tx_ba::Originator,
+    tx_ba: super::tx_ba::Originators,
     tx_config: Option<super::packet_format::Aggregation>,
     data_pending: VecDeque<Pending>,
-    data_drain: Option<u64>,
-    qos_sequence: u16,
+    data_drain: Option<(u64, Option<u8>)>,
+    qos_sequence: [u16; 8],
     local_ht: Option<association::phy::LocalPhy>,
     decline: Option<Vec<u8>>,
     wmm_requested: bool,
@@ -232,11 +232,11 @@ impl State {
             fallback: None,
             qos: None,
             scan_address: None,
-            tx_ba: super::tx_ba::Originator::new(),
+            tx_ba: super::tx_ba::Originators::new(),
             tx_config: None,
             data_pending: VecDeque::new(),
             data_drain: None,
-            qos_sequence: 1,
+            qos_sequence: [1; 8],
             local_ht: None,
             decline: None,
             wmm_requested: false,
@@ -678,8 +678,8 @@ impl State {
                 }
                 if self.receive_open() && self.tx_ba_grant.is_some() {
                     let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
-                    if super::tx_ba::peer_delba(frame.bytes(), self.own, ap) {
-                        self.tx_ba.retire();
+                    if let Some(tid) = super::tx_ba::peer_delba(frame.bytes(), self.own, ap) {
+                        self.tx_ba.retire_tid(tid);
                         continue;
                     }
                     if self.tx_ba.response(frame.bytes(), self.own, ap) {
@@ -1560,13 +1560,16 @@ impl State {
         self.coding_live(io)?;
         self.qos_live(io)?;
         self.fallback_live(io)?;
+        if !admitted(frame, self.own) {
+            return Err(Error::Profile);
+        }
         self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
-        let acm = self
-            .wmm
-            .map_or([false; 4], |p| p.ac.map(|a| a.admission_control));
-        let tid = super::qos::tid_for(frame, acm, self.data_profile);
-        // Originator BA aggregates only the TID0 (BE) agreement.
-        if self.tx_ba.active().is_some() && tid == 0 {
+        let tid = self.data_tid(frame);
+        if let Some(g) = &self.tx_ba_grant {
+            // Linux starts originator BA only for actual non-VO DATA demand.
+            self.tx_ba.want(tid, g.tids());
+        }
+        if self.tx_ba.active(tid).is_some() {
             self.send_batch_inner(io, &[frame])?;
             return Ok(());
         }
@@ -1591,9 +1594,9 @@ impl State {
             bytes.extend_from_slice(&peer);
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
-            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos && tid == 0 {
-                let s = self.qos_sequence;
-                self.qos_sequence = (s + 1) & 4095;
+            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos {
+                let s = self.qos_sequence[usize::from(tid)];
+                self.qos_sequence[usize::from(tid)] = (s + 1) & 4095;
                 s
             } else {
                 let s = self.sequence;
@@ -1614,7 +1617,7 @@ impl State {
             .is_some_and(|g| native.len() as u64 > u64::from(g.threshold()));
         self.transmit(io, native, if rts { Kind::RtsData } else { Kind::Data })?;
         if rts {
-            self.data_drain = Some(self.now()?);
+            self.data_drain = Some((self.now()?, None));
         }
         Ok(())
     }

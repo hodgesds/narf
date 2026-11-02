@@ -636,6 +636,7 @@ pub struct Hardware {
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
     ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
+    p2p: p2p::State,
     ap_gen2: Option<super::ap_gen2_wire::Adapter>,
     mld_link: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
     eht_source: Option<super::sc_eht::Source>,
@@ -758,6 +759,7 @@ impl Hardware {
             six_tx_profile: None,
             ap_owner: None,
             ap_request: None,
+            p2p: p2p::State::new(&parsed.api),
             ap_gen2: None,
             mld_link: None,
             eht_source: None,
@@ -925,6 +927,7 @@ impl Hardware {
     }
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        self.p2p.metadata(&parsed.api)?;
         self.prepare_station_profile(parsed)?;
         use core::{
             future::{poll_fn, Future},
@@ -1195,6 +1198,7 @@ impl Hardware {
             }
         }
         let capture = self.rx_epoch.capture();
+        let p2p_capture = self.p2p.copy_grant();
         let mut copied = self.resources.rx.drain(&mut self.mmio)?;
         for queue in &mut self.resources.extra_rx {
             copied.extend(queue.drain(&mut self.mmio)?);
@@ -1207,6 +1211,9 @@ impl Hardware {
             {
                 // Command/control ownership belongs to fallback0. A payload
                 // copied from another physical ring cannot complete its DMA.
+                continue;
+            }
+            if self.p2p.observe(&packet, p2p_capture.as_ref())? {
                 continue;
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
@@ -1481,6 +1488,7 @@ impl Hardware {
     pub fn fail(&mut self) {
         self.failed = true;
         self.rx_epoch.deny();
+        self.p2p.deny();
     }
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -1561,6 +1569,7 @@ impl Hardware {
         // transport armed and every allocation pinned if that ACK was lost.
         stopped?;
         self.armed = false;
+        self.p2p.reset_after_dma_stop();
         self.notifications.clear();
         self.responses.clear();
         self.tx_completed.clear();
@@ -1610,6 +1619,7 @@ impl Hardware {
         self.shared_memory = smem::State::new(parsed);
         self.receive_queues = rx_multi::State::new(parsed);
         self.rx_epoch.reset_after_dma_stop();
+        self.p2p.reset_after_dma_stop();
         self.scan_mcc_watch = false;
         self.armed = false;
         self.failed = false;
@@ -2096,3 +2106,6 @@ mod bz_tests;
 
 #[path = "runtime_ap.rs"]
 mod ap;
+
+#[path = "runtime_p2p.rs"]
+pub(in crate::iwlwifi) mod p2p;

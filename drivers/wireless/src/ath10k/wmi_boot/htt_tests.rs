@@ -64,6 +64,23 @@ impl HostMemory for HttModel {
     }
 }
 impl htt::HttMemory for HttModel {
+    fn supports_htt_pfc(&self) -> bool {
+        self.storage.as_ref().is_some_and(|s| s.qstate.is_some())
+    }
+    fn publish_htt_queue_state(&mut self, bytes: &[u8]) -> Result<(), htt::Error> {
+        self.storage
+            .as_mut()
+            .ok_or(htt::Error::Memory)?
+            .publish_queue_state(bytes)
+    }
+    fn pending_htt_tx(&self) -> Result<usize, htt::Error> {
+        Ok(self
+            .storage
+            .as_ref()
+            .ok_or(htt::Error::Memory)?
+            .tx
+            .pending())
+    }
     fn prepare_htt_tx(
         &mut self,
         c: htt::Config,

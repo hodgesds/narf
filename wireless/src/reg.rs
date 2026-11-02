@@ -48,6 +48,11 @@ bitflags::bitflags! {
         /// The rule carries wireless-regdb's `wmmrule=ETSI` (ETSI EN 301 893
         /// channel-access limits): `RegRule::wmm_rule()`.
         const WMM_ETSI = 1 << 6;
+        /// The trusted deployment policy asserts that this installation is
+        /// indoors. Valid only alongside INDOOR_ONLY; parsing alone does not
+        /// authenticate the assertion. Drivers must retain current-policy
+        /// checks and every other factory, power and bandwidth restriction.
+        const DEPLOYMENT_INDOOR = 1 << 7;
     }
 }
 
@@ -196,6 +201,9 @@ pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
         let end = u32::from_le_bytes(raw[4..8].try_into().unwrap());
         let bandwidth = u32::from_le_bytes(raw[8..12].try_into().unwrap());
         let flags = RegFlags::from_bits(u32::from(raw[13])).ok_or("unknown regulatory flags")?;
+        if flags.contains(RegFlags::DEPLOYMENT_INDOOR) && !flags.contains(RegFlags::INDOOR_ONLY) {
+            return Err("indoor installation fact without indoor-only rule");
+        }
         if start < 2000
             || end > 71000
             || end <= start
@@ -361,7 +369,7 @@ mod tests {
         }
         bytes[25] = 0x80;
         if parse_policy(&bytes).is_ok() {
-            return TestResult::Fail("unknown rule flags accepted");
+            return TestResult::Fail("unpaired installation fact accepted");
         }
         bytes[25] = 0;
         bytes.pop();
