@@ -36,8 +36,8 @@ struct Staging {
 }
 pub(super) struct Host {
     pub(super) capable: AtomicBool,
-    mode: AtomicU8,
-    generation: Arc<AtomicU64>,
+    pub(super) mode: AtomicU8,
+    pub(super) generation: Arc<AtomicU64>,
     serial: AtomicU64,
     pub(super) control: Arc<ExclusiveControl>,
     wake: Arc<WakeOwner>,
@@ -67,7 +67,7 @@ impl Host {
             database: IrqSafeSpinLock::new(None),
         }
     }
-    fn policy(&self) -> Result<Policy, Error> {
+    pub(super) fn policy(&self) -> Result<Policy, Error> {
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(database) = self.database.lock().clone() {
             return Policy::scoped(database).map_err(|_| Error::Authority);
@@ -214,7 +214,10 @@ impl<R: Fullmac + 'static> Device<R> {
             .filter(|value| value.get() != u64::MAX)
     }
     pub(super) fn ap_set_mode(&self, mode: u32) -> Result<(), WirelessError> {
-        if !matches!(mode, 2 | 3) || mode == 3 && !self.ap_capable() {
+        if !matches!(mode, 2 | 3 | 6)
+            || mode == 3 && !self.ap_capable()
+            || mode == 6 && !self.monitor_capable()
+        {
             return Err(WirelessError::NotSupported);
         }
         let _lease = self.lifecycle.ap.control.try_reserve()?;
@@ -227,7 +230,7 @@ impl<R: Fullmac + 'static> Device<R> {
             return Err(WirelessError::Busy);
         }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
-        if state.ap.is_some() || state.station.ap_station_busy() {
+        if state.ap.is_some() || state.monitor.is_some() || state.station.ap_station_busy() {
             return Err(WirelessError::Busy);
         }
         if mode == 3 {
@@ -242,6 +245,15 @@ impl<R: Fullmac + 'static> Device<R> {
         if self.ap_mode() == mode {
             return Ok(());
         }
+        narf_net::iface::set_link_layer(
+            &self.name,
+            if mode == 6 {
+                narf_net::iface::LinkLayer::Ieee80211Radiotap
+            } else {
+                narf_net::iface::LinkLayer::Ethernet
+            },
+        )
+        .map_err(|_| WirelessError::Busy)?;
         let _publication = self.publication.lock();
         let next = self
             .lifecycle
@@ -253,6 +265,7 @@ impl<R: Fullmac + 'static> Device<R> {
             .ok_or(WirelessError::Denied)?;
         self.lifecycle.ap.generation.store(next, Ordering::Release);
         self.lifecycle.ap.mode.store(mode as u8, Ordering::Release);
+        self.lifecycle.monitor.clear_selection();
         *self.lifecycle.ap.staging.lock() = Staging::default();
         self.lifecycle.ap.events.lock().take();
         self.external_ops.lock().clear();

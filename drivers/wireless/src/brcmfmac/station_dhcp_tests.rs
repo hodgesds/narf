@@ -24,6 +24,8 @@ mod ht40_tests;
 mod ht_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
+#[path = "monitor_native_tests.rs"]
+mod monitor_native_tests;
 #[path = "optional_mfp_tests.rs"]
 mod optional_mfp_tests;
 #[path = "power_save_tests.rs"]
@@ -90,6 +92,7 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
             ap: None,
             ap_data_generation: 0,
             ap_epoch_changed: false,
+            monitor: None,
         }),
         name: name.clone(),
         mac: OWN,

@@ -20,6 +20,8 @@ use narf_wireless::{
 };
 #[path = "interface_ap.rs"]
 mod ap;
+#[path = "interface_monitor.rs"]
+mod monitor;
 
 struct State<R: Fullmac> {
     station: Station<R>,
@@ -30,6 +32,7 @@ struct State<R: Fullmac> {
     ap: Option<Box<crate::brcmfmac::ap::Session>>,
     ap_data_generation: u64,
     ap_epoch_changed: bool,
+    monitor: Option<Box<crate::brcmfmac::monitor::Session>>,
 }
 struct PendingTx {
     frame: Frame,
@@ -185,6 +188,7 @@ pub(crate) struct Lifecycle {
     /// are not retained: their keys live in userspace.
     request: IrqSafeSpinLock<Option<AssociateRequest>>,
     ap: ap::Host,
+    monitor: monitor::Host,
 }
 impl Default for Lifecycle {
     fn default() -> Self {
@@ -192,6 +196,7 @@ impl Default for Lifecycle {
             withdrawn: AtomicBool::new(false),
             request: IrqSafeSpinLock::new(None),
             ap: ap::Host::new(),
+            monitor: monitor::Host::new(),
         }
     }
 }
@@ -294,8 +299,14 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Unsupported)?;
     narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Authority)?;
-    let station =
+    let mut station =
         Station::initialize_live(runtime, clm, Arc::new(super::station::GlobalPolicy)).await?;
+    let monitor_capable =
+        match crate::brcmfmac::monitor_native::discovery(&mut station.runtime).await {
+            Ok(capable) => capable,
+            Err(Error::Unsupported | Error::Malformed | Error::Firmware(_)) => false,
+            Err(error) => return Err(error),
+        };
     let ap_capable = R::PRIMARY_AP
         && station
             .runtime
@@ -325,6 +336,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             ap: None,
             ap_data_generation: 0,
             ap_epoch_changed: false,
+            monitor: None,
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
@@ -372,6 +384,14 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         .ap
         .capable
         .store(ap_capable, Ordering::Release);
+    let monitor_bound = narf_net::iface::lookup(name).is_some_and(|receiver| {
+        narf_net::iface::set_open_stop_target(&receiver, device.monitor_target())
+    });
+    device
+        .lifecycle
+        .monitor
+        .capable
+        .store(monitor_capable && monitor_bound, Ordering::Release);
     narf_net::iface::set_link_state(name, false);
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
@@ -410,6 +430,7 @@ impl<R: Fullmac + 'static> Device<R> {
             return;
         }
         self.lifecycle.ap.retire();
+        self.lifecycle.monitor.close();
         self.close_host();
         {
             let mut active = active_slot(R::FAMILY).lock();
@@ -436,6 +457,9 @@ impl<R: Fullmac + 'static> Device<R> {
         state.clear_transmit();
         if let Some(ap) = state.ap.as_mut() {
             ap.fail();
+        }
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.retire();
         }
         state.station.bssid = None;
         let proof = state.station.runtime.stop_transport().await.is_ok();
@@ -494,14 +518,14 @@ impl<R: Fullmac + 'static> Device<R> {
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
             self.clear_rx();
-            if !self.roaming.load(Ordering::Acquire) {
+            if self.ap_mode() == 2 && !self.roaming.load(Ordering::Acquire) {
                 narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
             }
         }
     }
 
     fn step(&self) -> Vec<Received> {
-        if self.ap_mode() == 3 {
+        if matches!(self.ap_mode(), 3 | 6) {
             return Vec::new();
         }
         let Some(mut state) = self.state.try_lock() else {
@@ -845,7 +869,9 @@ impl<R: Fullmac + 'static> Device<R> {
                 wake = state.station.runtime.wake_source();
             }
             let seen = wake.as_ref().map(|(signal, _)| signal.count());
-            if self.ap_mode() == 3 {
+            if self.ap_mode() == 6 {
+                self.monitor_worker().await;
+            } else if self.ap_mode() == 3 {
                 self.ap_worker().await;
                 self.ap_drain();
             } else {
@@ -874,6 +900,9 @@ impl<R: Fullmac + 'static> Device<R> {
 }
 impl<R: Fullmac + 'static> Endpoint for Device<R> {
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
+        if self.ap_mode() == 6 {
+            return Err(());
+        }
         if !self.up.load(Ordering::Acquire)
             || if self.ap_mode() == 3 {
                 !ap::ethernet(bytes)
@@ -903,7 +932,9 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
             .map_err(|_| ())
     }
     fn drain(&self) -> bool {
-        if self.ap_mode() == 3 {
+        if self.ap_mode() == 6 {
+            self.monitor_drain()
+        } else if self.ap_mode() == 3 {
             self.ap_drain()
         } else {
             self.deliver_received(self.step())
@@ -911,6 +942,9 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
     }
     fn suspend(&self) -> PmFuture<'_> {
         alloc::boxed::Box::pin(async move {
+            if self.ap_mode() == 6 {
+                return self.monitor_suspend().await;
+            }
             if self.ap_mode() == 3 {
                 self.ap_carrier(false);
                 let mut state = self.state.lock().await;
@@ -1005,6 +1039,19 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         } else {
             0
         }
+    }
+    fn validate_monitor_flags(&self, flags: u32) -> Result<(), WirelessError> {
+        if self.monitor_capable() && flags == 0 {
+            Ok(())
+        } else {
+            Err(WirelessError::NotSupported)
+        }
+    }
+    fn set_monitor_channel(
+        &self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<(), WirelessError> {
+        self.monitor_channel(channel)
     }
     fn current_iftype(&self) -> u32 {
         self.ap_mode()
@@ -1353,10 +1400,14 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             base_name: self.name.clone(),
             base_mac: self.mac,
             bands,
-            modes: if self.ap_capable() {
+            modes: (if self.ap_capable() {
                 WirelessModes::STATION | WirelessModes::AP
             } else {
                 WirelessModes::STATION
+            }) | if self.monitor_capable() {
+                WirelessModes::MONITOR
+            } else {
+                WirelessModes::empty()
             },
             hw_caps: HwCaps {
                 ht_supported: self.ht_capabilities.iter().any(Option::is_some),
@@ -1558,6 +1609,7 @@ mod tests {
             ap: None,
             ap_data_generation: 0,
             ap_epoch_changed: false,
+            monitor: None,
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);

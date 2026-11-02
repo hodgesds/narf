@@ -594,6 +594,19 @@ metadata context pass. Full release/native gates remain at25 completed rows.
 Counting unvalidated implementations,78 remain; physical firmware/board and
 actual deployment qualification remain separate.
 
+**2026-11-02 — native FullMAC monitor source recount.** The ledger now holds
+**61 `feature`**, **31 `chip`** and **0 `unknown`** rows. Seventeen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. BCM43602 receive-only monitor now
+composes actual flagged-radiotap firmware/monitor/channel receipts, original
+native posted buffers and source/policy/admin/MAC/copy ownership through the
+public mode/channel frontend and AF_PACKET. Pending native control events
+cannot be bypassed by continuous raw traffic; cancellation and PM retain actual
+stop/terminal ownership. Seven cases are written and unexecuted; scoped format
+and one release metadata context pass. CYW43439 monitor remains open. Full
+release/native gates remain at25 completed rows. Counting unvalidated
+implementations,78 remain; physical firmware/board acceptance is separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -605,7 +618,7 @@ actual deployment qualification remain separate.
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
 | rtw89 | 9 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking and admitted clock-gated runtime LPS are implemented pending validation; other firmware and AX/BE chips are separate rows |
-| brcmfmac | 6 | Monitor/P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
+| brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
@@ -1545,6 +1558,22 @@ retire uncertain DMA. `OpenStopEvent::observe` supplies a nongrant observation
 of the exact current original registration, including preserved-UP replacement;
 old owners never follow a new registration. Family §3 is normative. Seven new
 cases are written and unexecuted; physical measurements remain external.
+
+### 3.12 Native receive-only FullMAC monitor (validation pending)
+
+The exact BCM43602 msgbuf adapter opts into the default-denied common
+`PRIMARY_MONITOR`/Prepared/Armed/raw-copy seam. Actual firmware `rtap` evidence,
+monitor/filter and channel readbacks precede activation; a pending raw-drain
+reservation is no capture receipt. Only actual frame-type2 posted completions
+with bounded native radiotap and an observed matching CHANNEL can reach the
+original AF_PACKET monitor token. Original firmware/PCI, policy Arc, admin/
+registration/MAC, mode and copy generations remain required at final publication.
+Copied raw bytes never enter Ethernet or infer missing PHY/decryption facts.
+A completed control prefix precedes publication while continuous raw traffic
+need not become globally idle. DOWN/source loss/PM closes old copy/token first;
+uncertain cleanup pins native mappings. Family §3 defines the exclusive20MHz
+receive-only profile; CYW43439 remains default unsupported. Seven new cases are
+written and unexecuted.
 
 ## 4. Interaction with `narf-wireless`
 

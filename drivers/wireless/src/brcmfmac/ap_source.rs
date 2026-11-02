@@ -57,6 +57,12 @@ impl Source {
     pub(super) fn belongs_to(&self, live: &Arc<AtomicBool>) -> bool {
         self.live.as_ref().is_some_and(|old| Arc::ptr_eq(old, live))
     }
+    pub(super) fn same_generation(&self, other: &Self) -> bool {
+        self.live
+            .as_ref()
+            .zip(other.live.as_ref())
+            .is_some_and(|(own, other)| Arc::ptr_eq(own, other))
+    }
     pub(crate) fn current(&self) -> Result<(), Error> {
         self.invoke(|| ())
     }

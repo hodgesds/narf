@@ -47,6 +47,9 @@ impl Epoch {
     pub(super) fn serial(&self) -> u64 {
         self.word.load(Ordering::Acquire)
     }
+    pub(super) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.word, &other.word) && self.value == other.value
+    }
 }
 /// A concrete immutable policy source, never an arbitrary PolicySource
 /// callback inside native State. Pointer identity is the original installed

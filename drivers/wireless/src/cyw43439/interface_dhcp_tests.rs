@@ -272,6 +272,7 @@ impl Harness {
                 ap: None,
                 ap_data_generation: 0,
                 ap_epoch_changed: false,
+                monitor: None,
             }),
             name: name.clone(),
             mac: OWN,

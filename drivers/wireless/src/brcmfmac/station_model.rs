@@ -6,6 +6,8 @@ use crate::brcmfmac::station_transport::Adapter;
 use narf_wifi_fixtures::{DhcpServer, NetworkPlan};
 #[path = "ap_model.rs"]
 pub(crate) mod ap_model;
+#[path = "monitor_model.rs"]
+pub(crate) mod monitor_model;
 
 pub(crate) const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 pub(crate) const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -41,6 +43,8 @@ struct Flow {
 }
 pub(super) struct Firmware {
     ap: Option<ap_model::Profile>,
+    monitor: Option<monitor_model::Profile>,
+    raw_downlink: VecDeque<(Vec<u8>, u16)>,
     secured: bool,
     keys_first: bool,
     hold_keys: bool,
@@ -93,6 +97,8 @@ impl Firmware {
     fn new(secured: bool) -> Self {
         Self {
             ap: None,
+            monitor: None,
+            raw_downlink: VecDeque::new(),
             secured,
             keys_first: false,
             hold_keys: false,
@@ -249,6 +255,11 @@ impl Firmware {
         ies
     }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
+        if let Some(monitor) = self.monitor.as_mut() {
+            if let Some(reply) = monitor.command(command, input, maximum) {
+                return reply;
+            }
+        }
         if let Some(ap) = self.ap.as_mut() {
             if let Some(reply) = ap.command(command, input, maximum) {
                 return reply;
@@ -605,6 +616,9 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
+        if let Some(monitor) = self.monitor.as_ref().filter(|monitor| monitor.handled) {
+            return monitor.status;
+        }
         if let Some(ap) = self.ap.as_ref().filter(|ap| ap.handled) {
             return ap.status;
         }
@@ -617,6 +631,13 @@ impl Firmware {
         }
     }
     pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        if self
+            .monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.hold(command, input))
+        {
+            return true;
+        }
         if let Some(ap) = &self.ap {
             if ap.hold(command, input) {
                 return true;
@@ -677,6 +698,9 @@ impl Firmware {
         self.events.push_back(bytes);
     }
     pub(super) fn step(&mut self, state: &mut State, control: &mut super::Firmware) {
+        if let Some(monitor) = self.monitor.as_mut() {
+            self.raw_downlink.extend(monitor.raw.drain(..));
+        }
         if let Some(ap) = self.ap.as_mut() {
             self.events.extend(ap.events.drain(..));
             self.downlink.extend(ap.downlink.drain(..));
@@ -767,8 +791,13 @@ impl Firmware {
                 self.statuses += 1;
             }
         }
-        while !self.downlink.is_empty() && !self.rx_posts.is_empty() {
-            let bytes = self.downlink.pop_front().unwrap();
+        while (!self.downlink.is_empty() || !self.raw_downlink.is_empty())
+            && !self.rx_posts.is_empty()
+        {
+            let (bytes, flags) = self
+                .raw_downlink
+                .pop_front()
+                .unwrap_or_else(|| (self.downlink.pop_front().unwrap(), 1));
             let (id, address) = self.rx_posts.pop_front().unwrap();
             let prefix = word(state, SHARED + 36) as usize;
             self.prefix_rx_fallback = prefix != 0 && !self.prefix_rx_fallback;
@@ -794,7 +823,7 @@ impl Firmware {
             entry[4..8].copy_from_slice(&id.to_le_bytes());
             entry[14..16].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
             entry[16..18].copy_from_slice(&(explicit_offset as u16).to_le_bytes());
-            entry[18..20].copy_from_slice(&1u16.to_le_bytes());
+            entry[18..20].copy_from_slice(&flags.to_le_bytes());
             self.rx_write = (self.rx_write + 1) % (word(state, RINGS + 4 * 16 + 4) as u16);
             put(state, D2HW + 8, &self.rx_write.to_le_bytes());
         }
@@ -862,6 +891,46 @@ fn scan_result(
 #[derive(Clone)]
 pub(crate) struct Handle(Rc<IrqSafeSpinLock<State>>);
 impl Handle {
+    pub(crate) fn enable_monitor(&self, profile: monitor_model::Profile) {
+        let mut state = self.0.lock();
+        state.ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));
+        state
+            .firmware
+            .as_mut()
+            .unwrap()
+            .station
+            .as_mut()
+            .unwrap()
+            .monitor = Some(profile);
+    }
+    pub(crate) fn monitor_change<T>(
+        &self,
+        change: impl FnOnce(&mut monitor_model::Profile) -> T,
+    ) -> T {
+        let mut state = self.0.lock();
+        let result = change(
+            state
+                .firmware
+                .as_mut()
+                .unwrap()
+                .station
+                .as_mut()
+                .unwrap()
+                .monitor
+                .as_mut()
+                .unwrap(),
+        );
+        firmware_step(&mut state);
+        result
+    }
+    pub(crate) fn monitor_control_prefix(&self, count: usize) {
+        self.change(|firmware| {
+            for _ in 0..count {
+                firmware.event(23, 0, 0, &[]);
+            }
+            firmware.event(63, 0, 0, &[]);
+        });
+    }
     pub(crate) fn enable_ap(&self) {
         let mut state = self.0.lock();
         state.ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));

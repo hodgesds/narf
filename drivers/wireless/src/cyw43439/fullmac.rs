@@ -48,6 +48,30 @@ pub trait Fullmac: Send {
     /// Actual primary-bsscfg AP transport owner. SDIO stays conservative
     /// until its own native AP lifecycle/terminal composition is qualified.
     const PRIMARY_AP: bool = false;
+    /// Actual primary native flagged-radiotap owner; SDIO keeps false until
+    /// its independent firmware/BCDC/host composition is qualified.
+    const PRIMARY_MONITOR: bool = false;
+    fn monitor_reserve(
+        &mut self,
+        _prepared: crate::brcmfmac::monitor_native::Prepared,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn monitor_arm(&mut self, _armed: crate::brcmfmac::monitor_native::Armed) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn monitor_leave(
+        &mut self,
+        _original: &crate::brcmfmac::monitor_scope::Capture,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn pop_monitor(&mut self) -> Option<crate::brcmfmac::monitor_scope::Received> {
+        None
+    }
+    fn monitor_control_idle(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
     fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
         None
     }

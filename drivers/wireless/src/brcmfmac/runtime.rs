@@ -174,6 +174,12 @@ struct Data<M: Memory> {
     received: VecDeque<Vec<u8>>,
     receipts: VecDeque<TxReceipt>,
     dropped: usize,
+    monitor: Option<alloc::boxed::Box<MonitorOwner>>,
+    monitored: VecDeque<super::monitor_scope::Received>,
+}
+struct MonitorOwner {
+    prepared: super::monitor_native::Prepared,
+    armed: Option<super::monitor_native::Armed>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pending {
@@ -507,6 +513,23 @@ impl<B: Bus> Runtime<B> {
                 }
             }
             Ok(true)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    pub(crate) fn monitor_control_idle(&mut self) -> Result<bool, Error> {
+        if self.failed || self.down {
+            return Err(Error::Failed);
+        }
+        let result = (|| {
+            let ring = &self.resources.as_ref().ok_or(Error::Failed)?.rings[2];
+            let producer = read16(&mut self.bus, ring.wptr)?;
+            if producer >= ring.depth {
+                return Err(Error::Protocol);
+            }
+            Ok(producer == ring.read)
         })();
         if result.is_err() {
             self.fail();
@@ -891,6 +914,8 @@ impl<B: Bus> Runtime<B> {
             received: VecDeque::new(),
             receipts: VecDeque::new(),
             dropped: 0,
+            monitor: None,
+            monitored: VecDeque::new(),
         });
         if let Err(e) = self.replenish_rx() {
             self.fail();
@@ -935,6 +960,9 @@ impl<B: Bus> Runtime<B> {
         destination: [u8; 6],
         priority: u8,
     ) -> Result<FlowToken, Error> {
+        if self.monitor_reserved() {
+            return Err(Error::Busy);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -1183,6 +1211,9 @@ impl<B: Bus> Runtime<B> {
         frame: &[u8],
         packet_priority: Option<u8>,
     ) -> Result<u32, Error> {
+        if self.monitor_reserved() {
+            return Err(Error::Busy);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -1301,7 +1332,7 @@ impl<B: Bus> Runtime<B> {
         if complete.hdr.ifidx != 0
             || complete.status != 0
             || complete.metadata_len != 0
-            || !matches!(complete.flags & 7, 0 | 1)
+            || !matches!(complete.flags & 7, 0..=2)
         {
             return Err(Error::Protocol);
         }
@@ -1325,20 +1356,46 @@ impl<B: Bus> Runtime<B> {
             self.rx_offset
         };
         let length = usize::from(complete.data_len);
-        if !(14..=1514).contains(&length)
-            || offset.checked_add(length).is_none_or(|end| end > RX_BYTES)
-        {
+        let raw = complete.flags & 7 == 2;
+        if raw && data.monitor.is_none() {
+            return Err(Error::Protocol);
+        }
+        let admitted_length = if raw {
+            (2..=RX_BYTES).contains(&length)
+        } else {
+            (14..=1514).contains(&length)
+        };
+        if !admitted_length || offset.checked_add(length).is_none_or(|end| end > RX_BYTES) {
             return Err(Error::Bounds);
         }
         let mut frame = vec![0; length];
         slot.memory.sync_from_device(offset, length);
         slot.memory.read(offset, &mut frame)?;
         slot.posted = false;
+        if raw {
+            let owner = data.monitor.as_ref().ok_or(Error::Protocol)?;
+            if let Some(armed) = owner.armed.as_ref() {
+                if let Some(frame) = armed.receive(&frame).map_err(|_| Error::Protocol)? {
+                    if data.monitored.len() == 32 {
+                        data.dropped += 1;
+                    } else {
+                        data.monitored.push_back(frame);
+                    }
+                }
+            }
+            // A source-qualified reservation can drain actual raw records
+            // arriving alongside SET_MONITOR3 without granting publication
+            // before matching native mode/channel readback and activation.
+            return Ok(());
+        }
         if u16::from_be_bytes([frame[12], frame[13]]) < 0x600
             || frame[6..12] == [0; 6]
             || frame[6] & 1 != 0
         {
             return Err(Error::Protocol);
+        }
+        if data.monitor.is_some() {
+            return Ok(());
         }
         if data.received.len() == 32 {
             data.dropped += 1;
@@ -1352,5 +1409,86 @@ impl<B: Bus> Runtime<B> {
     }
     pub fn pop_tx_receipt(&mut self) -> Option<TxReceipt> {
         self.resources.as_mut()?.data.as_mut()?.receipts.pop_front()
+    }
+    pub(crate) fn monitor_reserved(&self) -> bool {
+        self.resources
+            .as_ref()
+            .and_then(|resources| resources.data.as_ref())
+            .is_some_and(|data| data.monitor.is_some())
+    }
+    pub(crate) fn monitor_reserve(
+        &mut self,
+        prepared: super::monitor_native::Prepared,
+    ) -> Result<(), Error> {
+        if self.failed || self.down || self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        let native = self.ap_source().ok_or(Error::Access)?;
+        if !prepared.belongs_to(&native) || prepared.original().command_current().is_err() {
+            return Err(Error::Access);
+        }
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        if data.monitor.is_some()
+            || !data.tx.is_empty()
+            || !data.receipts.is_empty()
+            || !data.received.is_empty()
+            || data
+                .flows
+                .iter()
+                .any(|flow| flow.state != FlowState::Closed)
+        {
+            return Err(Error::Busy);
+        }
+        data.monitor = Some(alloc::boxed::Box::new(MonitorOwner {
+            prepared,
+            armed: None,
+        }));
+        Ok(())
+    }
+    pub(crate) fn monitor_arm(&mut self, armed: super::monitor_native::Armed) -> Result<(), Error> {
+        if self.failed || self.down || self.pending.is_some() || armed.original().current().is_err()
+        {
+            return Err(Error::Access);
+        }
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        let owner = data.monitor.as_mut().ok_or(Error::Protocol)?;
+        if owner.armed.is_some() || !owner.prepared.accepts(&armed) {
+            return Err(Error::Access);
+        }
+        owner.armed = Some(armed);
+        Ok(())
+    }
+    pub(crate) fn monitor_leave(
+        &mut self,
+        original: &super::monitor_scope::Capture,
+    ) -> Result<(), Error> {
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        let owner = data.monitor.as_ref().ok_or(Error::Protocol)?;
+        if !owner.prepared.original().same_owner(original) {
+            return Err(Error::Access);
+        }
+        data.monitored.clear();
+        data.monitor = None;
+        Ok(())
+    }
+    pub(crate) fn pop_monitor(&mut self) -> Option<super::monitor_scope::Received> {
+        self.resources
+            .as_mut()?
+            .data
+            .as_mut()?
+            .monitored
+            .pop_front()
     }
 }

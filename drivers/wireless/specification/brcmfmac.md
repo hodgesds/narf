@@ -882,6 +882,58 @@ physical RF/board interoperability are not claimed by the fixture. Sources
 are local Linux7.3-rc4 `brcmfmac/{cfg80211,core,msgbuf}.c`, `fwil.h` and
 `fwil_types.h`; the handoff saves file hashes and exact source excerpts.
 
+### Native flagged-radiotap monitor
+
+The BCM43602 msgbuf adapter implements an exclusive receive-only mode6 on
+its original registered interface. Discovery requires the actual native
+`cap` reply's exact `rtap` token, which Linux 7.3-rc4 maps to both
+`MONITOR_FLAG` and `MONITOR_FMT_RADIOTAP`. `monitor`, known firmware IDs and
+hardware-header formats alone remain unsupported. CYW43439 SDIO monitor
+is not enabled by this common frontend.
+
+While administratively DOWN, mode6 changes the netdev representation to
+IEEE802.11 radiotap and accepts only flags0 plus an actual inventory and
+signed-policy-qualified 20MHz receive channel. It keeps the original policy
+Arc, radio/firmware/PCI source, registration/MAC/namespace and nonreviving
+mode generation. An actual administrative UP event supplies the original
+sealed receiver observation; that observation and the AF_PACKET token
+supply no hardware capability. The native path requires GET_MONITOR107=0,
+no AP or associated peers, actual `chanspec` SET/readback, SET_MONITOR108=3,
+GET_MONITOR107=3, exact channel readback and current format evidence.
+Reserving native raw DMA drain before those receipts never activates RX
+publication. Linux uses a separate host-only `mon_if`; this bounded NARF
+profile uses the existing interface exclusively, with no concurrent station,
+AP, additional firmware bsscfg, packet injection or Ethernet ingress.
+
+Only a real msgbuf frame-type2 completion under that retained native owner
+can produce a capture. Original posted IDs, completion status, interface,
+DMA extents and explicit-versus-shared offset alternatives remain checked;
+bytes are copied before the matching native buffer is reposted. Native
+radiotap and MPDU bytes pass verbatim to AF_PACKET. The bounded radiotap
+header must contain an observed CHANNEL matching the original native RF
+owner; configured channel never supplies missing packet metadata. No
+signal/rate/FCS/decryption values, over-air ACK or key/replay proof are
+invented. A bounded drain must reach the actual completed control prefix
+before publishing a batch, while continuous raw RX need not become globally
+idle. Copied frames recheck original policy, source, interface, mode and
+capture epochs through final publication.
+
+DOWN, policy/source retirement, MAC or role replacement, native channel/loss
+events, suspend and removal deny old copies and tokens first. Native stop
+requires SET_MONITOR108=0, GET_MONITOR107=0, restoration/readback of the
+original chanspec and retirement of the completed prefix before leaving the
+reservation. These are filter/control receipts, not a firmware MAC/FIFO
+quiescence proof. Cancelled or uncertain commands use the existing physical
+whole-device stop and pin/quarantine mappings without fabricated completion.
+System resume requires a fresh original UP; it never replays the old token.
+
+Seven written native cases in `drivers/wireless/brcmfmac/monitor` compose
+actual CR4/msgbuf5/6/7, version7 prefixes1/4, public mode/channel/admin
+controls, literal native radiotap, original AF_PACKET delivery, policy/MAC
+retirement, invalid records, activation/cancel, control-prefix progress and
+system PM. Execution and software acceptance are pending; no physical RF or
+firmware qualification follows from these source fixtures.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a
@@ -952,8 +1004,8 @@ different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 Additional software outside that retained profile remains: descriptor
 prefixes exceeding the admitted shared7 slack, other CPU/RAM/chip/OTP selectors
 (including 160 MHz-capable
-chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
-metadata), AP, replayed
+chips), HE/EHT profiles, monitor formats outside the bounded native
+radiotap owner above, AP, replayed
 recovery/system PM, IOMMU-backed quiescence.
 These do not expand the initial retained-failure acceptance claim.
 WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
@@ -966,7 +1018,8 @@ Native802.11 receive is not a separate station feature: Linux
 (`core.c`), which strips or converts its metadata according to
 `BRCMF_FEAT_MONITOR_FMT_RADIOTAP`/`_HW_RX_HDR` after `BRCMF_C_SET_MONITOR`.
 Station firmware delivers802.3 frames. Native802.11 RX and RX metadata are
-therefore tracked under the monitor-mode feature.
+therefore provided only by the bounded native monitor owner above;
+ordinary station RX remains Ethernet.
 
 ## 7. Stage assignment
 

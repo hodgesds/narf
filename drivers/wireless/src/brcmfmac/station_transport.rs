@@ -168,10 +168,61 @@ where
     // This native adapter belongs to the admitted BCM43602 PCIe profile;
     // publication additionally requires its actual retained physical source.
     const PRIMARY_AP: bool = true;
+    const PRIMARY_MONITOR: bool = true;
     fn ap_source(&self) -> Option<super::ap_source::Source> {
         self.inner.as_ref()?.ap_source()
     }
+    fn monitor_reserve(&mut self, prepared: super::monitor_native::Prepared) -> Result<(), Error> {
+        if self.failed
+            || self.closing
+            || self.ap.is_some()
+            || self.peer.is_some()
+            || !self.flows.is_empty()
+            || !self.tx.is_empty()
+        {
+            return Err(Error::Busy);
+        }
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .monitor_reserve(prepared)
+            .map_err(map)
+    }
+    fn monitor_arm(&mut self, armed: super::monitor_native::Armed) -> Result<(), Error> {
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .monitor_arm(armed)
+            .map_err(map)
+    }
+    fn monitor_leave(&mut self, original: &super::monitor_scope::Capture) -> Result<(), Error> {
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .monitor_leave(original)
+            .map_err(map)
+    }
+    fn pop_monitor(&mut self) -> Option<super::monitor_scope::Received> {
+        self.inner.as_mut()?.pop_monitor()
+    }
+    fn monitor_control_idle(&mut self) -> Result<bool, Error> {
+        if !self.events.is_empty() {
+            return Ok(false);
+        }
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .monitor_control_idle()
+            .map_err(map)
+    }
     fn ap_enter(&mut self, original: super::ap_scope::Capture) -> Result<(), Error> {
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.monitor_reserved())
+        {
+            return Err(Error::Busy);
+        }
         if !original.lifecycle() {
             return Err(Error::Authority);
         }
@@ -539,7 +590,12 @@ where
         self.begin_data(frame, priority, None).map(|_| ())
     }
     fn set_link(&mut self, peer: Option<[u8; 6]>) {
-        if self.ap.is_some() {
+        if self.ap.is_some()
+            || self
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.monitor_reserved())
+        {
             // A station lifecycle can never open/retag an actual AP owner.
             if peer.is_some() {
                 self.fail();

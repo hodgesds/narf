@@ -23,7 +23,6 @@ ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wirele
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/cyw43439.md	532
 brcmfmac	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	529
 brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/cyw43439.md	527
-brcmfmac	monitor_mode	Monitor mode (incl. native 802.11 msgbuf RX with radiotap/HW RX-header metadata)	feature	drivers/wireless/specification/cyw43439.md	530
 brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	530
 brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	530
 brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	529
