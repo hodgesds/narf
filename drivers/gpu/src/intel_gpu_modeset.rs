@@ -290,6 +290,9 @@ pub enum ModesetError {
     DisplayResourceUnavailable,
     /// Local pipe/transcoder/DDI stop was not observed; retain all leases.
     PipelineStopUnavailable,
+    /// MTL source enable, primary image or a fresh common frame was not observed.
+    /// This is not evidence of complete sink training or visible pixels.
+    PipelineEnableUnavailable,
 }
 
 /// A negotiated link configuration handed to

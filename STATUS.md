@@ -1830,6 +1830,36 @@ registry/physical PCI power callbacks or S3 executions. Physical Intel, Mesa,
 codec and performance acceptance remain unrun. No silicon or full physical
 owner result is claimed; OA and all ten broad workstreams remain open.
 
+### MTL legacy modeset failure correction — validation pending
+
+This corrects false success in the existing MTL/Arrow legacy modeset path; it
+adds no feature row. The ledger remains at 65 rows with all ten broad workstreams
+open. Local stop/clock/current and final source/primary/fresh-frame failures now
+abort later programming. The inherited clock fast path uses the actual locked
+clock and programmed squash window; an unmet floor refuses. Already-on DDI
+ownership is required, and unqualified direct TC1/TC2 routes refuse before MMIO.
+No DDI-off initialization, new await, resource allocator, retirement receipt or
+scanout reclamation is added. Pre-stop fixed GGTT/cache/bootstrap, full source/
+sink training, inherited producer exclusion and general resource/clock ownership
+remain software work.
+
+Four fixtures are added. The existing misleading
+`smoke_mtl_modeset_tc1_full_run` is replaced, with no count increase, by
+`smoke_mtl_modeset_tc_ports_refuse_unqualified_route`. Expected inventories are
+1,912 selected tests (1,242 Intel/DRM/fb/backlight plus 670 shared), including all
+1,907 unchanged NEXT9 names and this exact replacement. The original baseline
+retains 1,086 names unchanged plus the replacement. All prior 152 cumulative new
+labels remain; four additions and one replacement make 157 new-or-replacement
+labels, not five added tests. Group 3 grows to 189; group 5 stays at 197.
+
+Four new fixture bodies and the exact replacement are registered. Debug/release native execution, production/btrfs, cross-target/host lint/build and format/source gates remain pending. Source review is not native acceptance.
+
+The fixtures use actual dispatch and an actual scheduler task over modeled
+hardware. Full physical RuntimeOwner, positive firmware registry, PCI power
+callbacks, S3 and controller/console publication remain manually traced rather
+than executed by these new fixtures. Silicon, visible-pixel, complete-link,
+Mesa, codec and performance acceptance remain unrun. No broad workstream closes.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

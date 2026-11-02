@@ -108,6 +108,23 @@ panel power alone cannot produce a synthetic active 1024×768 display.
 Native register-model smokes cover these paths; physical scanout and
 suspend/resume acceptance remain separate hardware work.
 
+The fixed MTL/Arrow legacy path retains its bounded synchronous hardware-only
+entry, including its existing executor caller. Before destructive plane/clock
+programming it requires acknowledged owned display/AUX wells and an already-on,
+non-idle source DDI. Failed local plane/CONF/PLL stop, lost or inaccessible
+register access, unacknowledged CDCLK or clock programming, an unavailable floor
+rung, or missing final source/primary shadow+LIVE/fresh-frame evidence returns an error before
+later programming and existing controller/console/backlight publication.
+Inherited CDCLK requires ENABLE+LOCK and source decoding of the programmed squash
+window, active high bits and nearest-integer division. A fully masked PM-demand
+IMR remains valid under current authority. `PipelineEnableUnavailable` identifies
+missing final source/primary/frame evidence. The path does not newly disable or
+initialize an off DDI; direct TC1/TC2 modesets refuse before MMIO until their route
+is qualified. These bounded acknowledgements do not establish complete sink
+training, visible pixels, a general resource/retirement receipt or permission to
+free scanout frames. Pre-stop fixed-window GGTT/cache bootstrap, inherited
+producer exclusion and a full retained async modeset owner remain unresolved.
+
 MTL/Arrow additionally installs the qualified `intel_aux_backlight` Raw
 candidate into the existing arbitrated backlight stack after actual video and
 owned-console publication. It requires a live owned Pipe-A/DDI-A internal

@@ -28,8 +28,10 @@
 //!   [`crate::intel_gpu_xelpg`].
 //! - **Transcoder clock select.** `TRANS_CLK_SEL` is programmed
 //!   with the PHY index (Gen12's path never writes it).
-//! - **Port enable.** There is no `DDI_BUF_CTL`. The port comes
-//!   up through the D2D link enable + `PORT_BUF_CTL1` width
+//! - **Port enable.** MTL retains DDI_CTL_DE at the historical
+//!   DDI_BUF_CTL address. This path requires it already enabled and
+//!   preserves it; a complete off/on transaction remains unqualified.
+//!   It programs the D2D link enable + `PORT_BUF_CTL1` width
 //!   programming in the link-retrain sequence, and the source
 //!   pattern generator is driven through `DP_TP_CTL`.
 //! - **Signal levels.** No `DDI_BUF_TRANS` register file: TX
@@ -54,6 +56,7 @@
 //! - **DVFS/pcode notifications** around CDCLK changes — the
 //!   Gen12 path omits them as well.
 
+use core::cell::Cell;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
@@ -63,6 +66,49 @@ use crate::intel_gpu_xelpg::{
     disable_port_pll, enable_d2d, enable_port_pll, program_port_buf_ctl, reprogram_pll_rate,
     set_signal_levels, Cx0Error, Cx0Phy, XeLpgPort,
 };
+
+/// Sticky current-access guard for this one synchronous modeset. No await or
+/// retained transaction is introduced. An inaccessible source register must
+/// not let a later void codec helper continue programming the device.
+struct CheckedWindow<'a, M: MmioWindow + ?Sized> {
+    raw: &'a M,
+    failed: Cell<bool>,
+}
+impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
+    fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        self.raw.gen12_display_family()
+    }
+    fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
+        self.raw.gen12_hpd_profile()
+    }
+    fn display_access_ok(&self) -> bool {
+        if self.failed.get() || !self.raw.display_access_ok() {
+            self.failed.set(true);
+            false
+        } else {
+            true
+        }
+    }
+    fn read32(&self, off: u64) -> u32 {
+        if !self.display_access_ok() {
+            return u32::MAX;
+        }
+        let value = self.raw.read32(off);
+        // PM-demand IMR permits an actually all-masked value. Current
+        // authority, rather than its value, qualifies this exception.
+        if !self.display_access_ok() || (value == u32::MAX && off != 0x44464) {
+            self.failed.set(true);
+            return u32::MAX;
+        }
+        value
+    }
+    fn write32(&self, off: u64, value: u32) {
+        if self.display_access_ok() {
+            self.raw.write32(off, value);
+            let _ = self.display_access_ok();
+        }
+    }
+}
 
 // ── Power wells (Xe-LPD) ─────────────────────────────────────────
 //
@@ -166,10 +212,12 @@ pub fn mtl_cdclk_for_pixel_clock(pixel_clock_khz: u32) -> Option<MtlCdclkEntry> 
 /// Decode the currently programmed CDCLK (kHz) from the PLL
 /// ratio + CDCLK_CTL divider + squash waveform — the readout
 /// path i915's `bxt_get_cdclk` implements. 0 when the CDCLK PLL
-/// is off.
+/// is off or unlocked.
 pub(crate) fn cdclk_current_khz<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
     let pll = mmio.read32(CDCLK_PLL_ENABLE_REG);
-    if pll & CDCLK_PLL_ENABLE == 0 {
+    if pll == u32::MAX
+        || pll & (CDCLK_PLL_ENABLE | CDCLK_PLL_LOCK) != CDCLK_PLL_ENABLE | CDCLK_PLL_LOCK
+    {
         return 0;
     }
     let vco = (pll & CDCLK_PLL_RATIO_MASK) * MTL_REFCLK_KHZ;
@@ -181,28 +229,51 @@ pub(crate) fn cdclk_current_khz<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
         2 => 4,
         _ => 8,
     };
-    let mut cdclk = vco / div2x;
     let squash = mmio.read32(CDCLK_SQUASH_CTL);
-    if squash & CDCLK_SQUASH_ENABLE != 0 {
-        let waveform = (squash & 0xFFFF) as u16;
-        cdclk = cdclk * waveform.count_ones() / 16;
+    let (numerator, divisor) = if squash & CDCLK_SQUASH_ENABLE != 0 {
+        // bxt_get_cdclk: only the active high bits belong to the
+        // programmed window. Firmware need not use our table's size16.
+        let size = ((squash >> 24) & 15) + 1;
+        let waveform = (squash as u16) >> (16 - size);
+        (vco * waveform.count_ones(), size * div2x)
+    } else {
+        (vco, div2x)
+    };
+    // Source DIV_ROUND_CLOSEST on the full product, not a truncated
+    // intermediate vco/divider. Maximum255*38400*16 fits in u32.
+    (numerator + divisor / 2) / divisor
+}
+
+// Unlike a zero/off readout, an enabled but unlocked clock cannot authorize
+// the fast path or subsequent resource/port programming. Source
+// bxt_de_pll_readout requires both ENABLE and LOCK before trusting the ratio.
+fn acknowledged_cdclk<M: MmioWindow + ?Sized>(mmio: &M) -> Result<u32, ModesetError> {
+    let current = cdclk_current_khz(mmio);
+    let pll = mmio.read32(CDCLK_PLL_ENABLE_REG);
+    let enabled = pll & CDCLK_PLL_ENABLE != 0;
+    if pll == u32::MAX
+        || !mmio.display_access_ok()
+        || (enabled && pll & CDCLK_PLL_LOCK == 0)
+        || enabled != (current != 0)
+    {
+        return Err(ModesetError::PllLockTimeout);
     }
-    cdclk
+    Ok(current)
 }
 
 /// Raise CDCLK to the floor `mode` needs, MTL-style. Only ever
-/// raises; a faster firmware CDCLK is left alone (and if the
-/// pixel clock is past the table, firmware's setting stands —
-/// the pipe simply runs at the best available clock, the same
-/// posture as the Gen12 ladder miss).
+/// raises; a faster acknowledged firmware CDCLK is left alone.
+/// Refuse if no table rung can meet the required floor; a table miss
+/// cannot authorize later programming below that floor.
 fn program_cdclk_floor<M: MmioWindow + ?Sized>(mmio: &M, mode: &Mode) -> Result<(), ModesetError> {
     let floor_khz = mode.pixel_clock_khz.div_ceil(2);
-    if floor_khz <= cdclk_current_khz(mmio) {
+    let current = acknowledged_cdclk(mmio)?;
+    if floor_khz <= current {
         return Ok(());
     }
     let entry = match mtl_cdclk_for_pixel_clock(mode.pixel_clock_khz) {
         Some(e) => e,
-        None => return Ok(()),
+        None => return Err(ModesetError::PllLockTimeout),
     };
     let pll = mmio.read32(CDCLK_PLL_ENABLE_REG);
     let pll_on = pll & CDCLK_PLL_ENABLE != 0;
@@ -219,6 +290,15 @@ fn program_cdclk_floor<M: MmioWindow + ?Sized>(mmio: &M, mode: &Mode) -> Result<
     if pll_on && cur_ratio != entry.ratio {
         mmio.write32(CDCLK_PLL_ENABLE_REG, 0);
         compiler_fence(Ordering::SeqCst);
+        if !wait_bit(
+            mmio,
+            CDCLK_PLL_ENABLE_REG,
+            CDCLK_PLL_ENABLE | CDCLK_PLL_LOCK,
+            false,
+            1_000_000,
+        ) {
+            return Err(ModesetError::PllLockTimeout);
+        }
     }
     if !pll_on || cur_ratio != entry.ratio {
         mmio.write32(CDCLK_PLL_ENABLE_REG, entry.ratio);
@@ -227,6 +307,14 @@ fn program_cdclk_floor<M: MmioWindow + ?Sized>(mmio: &M, mode: &Mode) -> Result<
         if !wait_bit(mmio, CDCLK_PLL_ENABLE_REG, CDCLK_PLL_LOCK, true, 1_000_000) {
             return Err(ModesetError::PllLockTimeout);
         }
+    }
+    let programmed = mmio.read32(CDCLK_PLL_ENABLE_REG);
+    if programmed == u32::MAX
+        || !mmio.display_access_ok()
+        || programmed & (CDCLK_PLL_ENABLE | CDCLK_PLL_LOCK | CDCLK_PLL_RATIO_MASK)
+            != CDCLK_PLL_ENABLE | CDCLK_PLL_LOCK | entry.ratio
+    {
+        return Err(ModesetError::PllLockTimeout);
     }
     // Squash waveform for the target rung (0 disables squash).
     let squash = if entry.waveform != 0 {
@@ -242,6 +330,12 @@ fn program_cdclk_floor<M: MmioWindow + ?Sized>(mmio: &M, mode: &Mode) -> Result<
     let decimal = (entry.cdclk_khz - 1000 + 250) / 500;
     mmio.write32(CDCLK_CTL, decimal & CDCLK_FREQ_DECIMAL_MASK);
     compiler_fence(Ordering::SeqCst);
+    if mmio.read32(CDCLK_SQUASH_CTL) != squash
+        || mmio.read32(CDCLK_CTL) != decimal & CDCLK_FREQ_DECIMAL_MASK
+        || !mmio.display_access_ok()
+    {
+        return Err(ModesetError::PllLockTimeout);
+    }
     Ok(())
 }
 
@@ -262,6 +356,18 @@ const DP_TP_CTL_ENHANCED_FRAME: u32 = 1 << 18;
 const DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
 const DP_TP_CTL_LINK_TRAIN_PAT1: u32 = 0 << 8;
 const DP_TP_CTL_LINK_TRAIN_NORMAL: u32 = 3 << 8;
+
+// Keep the narrow lane on the existing A/B source mapping. TC's inherited
+// TRANS_DDI selector uses a separate, unqualified enumeration; fixing that
+// full route is outside this immediate correction. Never derive DDI offsets
+// from that selector (Linux PORT_TC1/2 are3/4, not9/10).
+fn inherited_ddi_ctl(port: XeLpgPort) -> Option<u64> {
+    match port {
+        XeLpgPort::A => Some(0x64000),
+        XeLpgPort::B => Some(0x64100),
+        XeLpgPort::Tc1 | XeLpgPort::Tc2 => None,
+    }
+}
 
 // ── Orchestrator ─────────────────────────────────────────────────
 
@@ -313,6 +419,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     ) -> Result<Mode, ModesetError> {
         // Step 0: validate inputs that don't require touching HW.
         validate_framebuffer(primary_fb)?;
+        inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
 
         // Step 1: pick the mode (EDID over this port's AUX, or
         // the caller's fallback).
@@ -334,6 +441,29 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         mode: &Mode,
     ) -> Result<Mode, ModesetError> {
         crate::intel_gpu_modeset::validate_framebuffer_mode(primary_fb, mode)?;
+        inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
+        let checked = CheckedWindow {
+            raw: self.mmio,
+            failed: Cell::new(false),
+        };
+        let result = XeLpgModeset::new(&checked, self.port).modeset_checked(primary_fb, mode);
+        if !checked.display_access_ok() {
+            return Err(result
+                .err()
+                .unwrap_or(ModesetError::PipelineEnableUnavailable));
+        }
+        result
+    }
+
+    // Keep the existing synchronous entry and legacy lifetime: hardware-only
+    // polls may run inside resume's executor poll, without a block_on bridge
+    // or a new cancellation boundary. The GT mutex latency remains bounded
+    // legacy behavior, not a retained async display-owner implementation.
+    fn modeset_checked(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+    ) -> Result<Mode, ModesetError> {
         let mode = *mode;
 
         // Step 2: power wells — PW_1 (transcoder A / DDI A-B),
@@ -343,9 +473,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self.enable_power_well(PWR_WELL_CTL2, PW_A_IDX)?;
         self.enable_power_well(PWR_WELL_CTL_AUX2, self.port.aux_well_index())?;
 
-        // Step 3: disable the existing pipeline (plane → pipe →
-        // transcoder → port PLL request dropped).
-        self.disable_pipeline();
+        // This bounded correction preserves an already-enabled DDI. The
+        // existing PHY helper does not implement a complete DDI-off/on pair;
+        // do not destructively stop an off/unqualified inherited port.
+        self.require_enabled_ddi()?;
+        // Step 3: plane → the single pipe/transcoder CONF → PLL request.
+        // This is not a full DDI/PHY/link retirement receipt.
+        self.disable_pipeline()?;
         // This is a full owned modeset with the pipe off, not a KMS
         // inheritance path. Establish RGB bypass rather than depend on GOP
         // leaving its per-plane gamma/CSC controls in an admissible state.
@@ -356,7 +490,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // joined MBUS and a cursor DDB reservation before any plane enable.
         // Unsupported preflight retains the historical inherited layout;
         // every partial request/programming failure keeps this pipe off.
-        let current = cdclk_current_khz(self.mmio);
+        let current = acknowledged_cdclk(self.mmio)?;
         let target = mtl_cdclk_for_pixel_clock(mode.pixel_clock_khz)
             .map_or(current, |entry| current.max(entry.cdclk_khz));
         crate::intel_gpu_display_resources::initialize(self.mmio, &mode, target)
@@ -418,9 +552,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // Step 13: pattern generator to normal data, then the
         // final enables in PRM order (transcoder → pipe → plane).
         self.program_dp_tp_ctl(DP_TP_CTL_LINK_TRAIN_NORMAL);
-        self.enable_transcoder();
-        self.enable_pipe();
-        self.enable_plane();
+        let frame = self.mmio.read32(0x70040);
+        if frame == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineEnableUnavailable);
+        }
+        self.enable_transcoder()?;
+        self.observe_plane(primary_fb, &mode, trained_lanes, frame)?;
 
         Ok(mode)
     }
@@ -459,7 +596,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let cur = self.mmio.read32(reg);
         self.mmio.write32(reg, cur | pwr_well_req(idx));
         compiler_fence(Ordering::SeqCst);
-        if wait_bit(self.mmio, reg, pwr_well_state(idx), true, 1_000_000) {
+        if wait_bit(
+            self.mmio,
+            reg,
+            pwr_well_req(idx) | pwr_well_state(idx),
+            true,
+            1_000_000,
+        ) {
             Ok(())
         } else {
             Err(ModesetError::PowerWellTimeout)
@@ -468,13 +611,34 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
 
     // ── Pipeline disable ─────────────────────────────────────
 
-    /// Disable the existing pipeline: plane → pipe → transcoder
-    /// (the register block is shared with Gen12), then drop the
-    /// port PLL request — Xe-LPG has no DDI_BUF_CTL to idle.
-    fn disable_pipeline(&mut self) {
+    /// Source intel_ddi.c::intel_ddi_wait_for_buf_active selects MTL's
+    /// PORT_BUF_CTL1.PHY_IDLE, not the historical DDI_BUF_CTL idle bit.
+    /// PW1/PWA/AUX have actual owned REQUEST+STATE acknowledgements above.
+    fn require_enabled_ddi(&self) -> Result<(), ModesetError> {
+        let ddi = self
+            .mmio
+            .read32(inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?);
+        let buf = self.mmio.read32(self.port.buf_ctl1());
+        if ddi == u32::MAX
+            || buf == u32::MAX
+            || !self.mmio.display_access_ok()
+            || ddi & (1 << 31) == 0
+            || buf & (1 << 7) != 0
+            || buf & (1 << 24) == 0
+        {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(())
+    }
+
+    /// Observe the existing local stop before any color/resource/clock/PHY
+    /// programming. Pipe A and transcoder A alias the same 0x70008 CONF.
+    /// Do not clear DDI_CTL_DE here: full PHY/link stop and matching source
+    /// re-enable, producer exclusion and DMA retirement remain follow-on work.
+    fn disable_pipeline(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
-            PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, PLANE_CTL_ENABLE,
+            PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
         };
         let plane_base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
         let ctl = self.mmio.read32(plane_base + PLANE_CTL_OFFSET);
@@ -483,20 +647,39 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let surf = self.mmio.read32(plane_base + PLANE_SURF_OFFSET);
         self.mmio.write32(plane_base + PLANE_SURF_OFFSET, surf);
         compiler_fence(Ordering::SeqCst);
-
-        let pipe_off = PipeIdx::A.base() + PIPECONF_OFFSET;
-        let pconf = self.mmio.read32(pipe_off);
-        self.mmio.write32(pipe_off, pconf & !PIPECONF_ENABLE);
+        if !self.mmio.display_access_ok()
+            || self.mmio.read32(plane_base + PLANE_CTL_OFFSET) & PLANE_CTL_ENABLE != 0
+            || self.mmio.read32(plane_base + PLANE_SURF_OFFSET) != surf
+        {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        let off = PipeIdx::A.base() + PIPECONF_OFFSET;
+        let conf = self.mmio.read32(off);
+        self.mmio.write32(off, conf & !PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000);
-
-        let trans_off = Transcoder::A.conf_base() + PIPECONF_OFFSET;
-        let tconf = self.mmio.read32(trans_off);
-        self.mmio.write32(trans_off, tconf & !PIPECONF_ENABLE);
-        compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, trans_off, PIPECONF_STATE, false, 100_000_000);
-
-        let _ = disable_port_pll(self.mmio, self.port);
+        if !wait_bit(
+            self.mmio,
+            off,
+            PIPECONF_ENABLE | PIPECONF_STATE,
+            false,
+            100_000_000,
+        ) {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        disable_port_pll(self.mmio, self.port).map_err(map_cx0_err)?;
+        // The old helper polls ACK0 only. A refused write must not leave a
+        // lane1 request/ACK unnoticed. Keep its existing conservative 3.2ms
+        // bound; this still is not the source complete 20us PHY-off sequence.
+        if !wait_bit(
+            self.mmio,
+            self.port.port_clock_ctl(),
+            0xcc00_0000,
+            false,
+            3_200_000,
+        ) {
+            return Err(ModesetError::PllLockTimeout);
+        }
+        Ok(())
     }
 
     // ── Shared pipe/transcoder/plane programming ─────────────
@@ -641,7 +824,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
 
     // ── Final enables ────────────────────────────────────────
 
-    fn enable_transcoder(&mut self) {
+    fn enable_transcoder(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_pipes::{
             Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
         };
@@ -649,29 +832,94 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let cur = self.mmio.read32(off);
         self.mmio.write32(off, cur | PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, off, PIPECONF_STATE, true, 100_000_000);
-    }
-
-    fn enable_pipe(&mut self) {
-        use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
-        };
-        let off = PipeIdx::A.base() + PIPECONF_OFFSET;
-        let cur = self.mmio.read32(off);
-        self.mmio.write32(off, cur | PIPECONF_ENABLE);
-        compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, off, PIPECONF_STATE, true, 100_000_000);
-    }
-
-    fn enable_plane(&mut self) {
-        // Armed by program_plane's SURF write; spin one frame so
-        // the flip lands before returning (same posture as the
-        // Gen12 orchestrator's Stage-2 vblank barrier).
-        let budget = narf_time::wall::ns_to_cycles(20_000_000);
-        let start = narf_time::now_cycles();
-        while narf_time::now_cycles().wrapping_sub(start) < budget {
-            core::hint::spin_loop();
+        if !wait_bit(
+            self.mmio,
+            off,
+            PIPECONF_ENABLE | PIPECONF_STATE,
+            true,
+            100_000_000,
+        ) {
+            return Err(ModesetError::PipelineEnableUnavailable);
         }
+        Ok(())
+    }
+
+    /// A fresh common frame, current source enable and the actual primary
+    /// shadow/LIVE image replace the old unconditional 20ms delay. This is
+    /// bounded software evidence, not sink training/visible-pixel acceptance
+    /// or permission to reclaim an older scanout allocation.
+    fn observe_plane(
+        &self,
+        fb: &Framebuffer,
+        mode: &Mode,
+        lanes: u8,
+        start: u32,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_pipes::{
+            build_primary_plane, build_trans_ddi_func_ctl, PixelFormat as PipeFmt,
+            TRANS_DDI_MODE_DP_SST,
+        };
+        let plane = build_primary_plane(
+            mode.h_active,
+            mode.v_active,
+            fb.stride_bytes,
+            fb.phys_addr as u32,
+            PipeFmt::Argb8888,
+        )
+        .map_err(|_| ModesetError::InvalidFramebuffer)?;
+        let ddi_reg = inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
+        let route =
+            build_trans_ddi_func_ctl(self.port.func_ctl_index(), TRANS_DDI_MODE_DP_SST, lanes);
+        let mut refused = false;
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                let before = self.mmio.read32(0x70040);
+                let conf = self.mmio.read32(0x70008);
+                let ddi = self.mmio.read32(ddi_reg);
+                let buf = self.mmio.read32(self.port.buf_ctl1());
+                let source_route = self.mmio.read32(0x60400);
+                let source_clock = self.mmio.read32(TRANS_CLK_SEL_A);
+                let source_pattern = self.mmio.read32(0x60540);
+                let image = [
+                    (0x70180, plane.plane_ctl),
+                    (0x70188, plane.plane_stride),
+                    (0x70190, plane.plane_size),
+                    (0x701a4, plane.plane_offset),
+                    (0x7019c, plane.plane_surf),
+                    (0x701ac, plane.plane_surf),
+                ];
+                let matches = image
+                    .into_iter()
+                    .all(|(off, expected)| self.mmio.read32(off) == expected);
+                let after = self.mmio.read32(0x70040);
+                refused = !self.mmio.display_access_ok()
+                    || before == u32::MAX
+                    || after == u32::MAX
+                    || conf == u32::MAX
+                    || ddi == u32::MAX;
+                refused
+                    || (matches
+                        && source_route == route
+                        && source_clock == trans_clk_sel_port(self.port.phy_index())
+                        && source_pattern
+                            & (DP_TP_CTL_ENABLE
+                                | DP_TP_CTL_ENHANCED_FRAME
+                                | DP_TP_CTL_LINK_TRAIN_MASK)
+                            == DP_TP_CTL_ENABLE
+                                | DP_TP_CTL_ENHANCED_FRAME
+                                | DP_TP_CTL_LINK_TRAIN_NORMAL
+                        && conf & (3 << 30) == 3 << 30
+                        && ddi & (1 << 31) != 0
+                        && buf & ((1 << 24) | (1 << 7)) == 1 << 24
+                        && before != start
+                        && before == after)
+            },
+            narf_time::Deadline::after_ns(100_000_000),
+        );
+        if !done || refused {
+            return Err(ModesetError::PipelineEnableUnavailable);
+        }
+        Ok(())
     }
 }
 
@@ -711,8 +959,8 @@ fn mode_to_display_timing(mode: &Mode) -> crate::intel_gpu_pipes::DisplayTiming 
     }
 }
 
-/// Poll an MMIO register's `mask` bits (same helper shape as the
-/// Gen12 modeset's `wait_bit`).
+/// Hardware-only bounded polling, also valid inside the existing async
+/// resume poll. Never enter a block_on bridge or wait on another task here.
 fn wait_bit<M: MmioWindow + ?Sized>(
     mmio: &M,
     off: u64,
@@ -720,18 +968,20 @@ fn wait_bit<M: MmioWindow + ?Sized>(
     want_set: bool,
     timeout_ns: u64,
 ) -> bool {
-    let budget = narf_time::wall::ns_to_cycles(timeout_ns);
-    let start = narf_time::now_cycles();
-    loop {
-        let v = mmio.read32(off);
-        if (v & mask != 0) == want_set {
-            return true;
-        }
-        if narf_time::now_cycles().wrapping_sub(start) > budget {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
+    let mut refused = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            if !mmio.display_access_ok() {
+                refused = true;
+                return true;
+            }
+            let value = mmio.read32(off);
+            refused = value == u32::MAX || !mmio.display_access_ok();
+            refused || value & mask == if want_set { mask } else { 0 }
+        },
+        narf_time::Deadline::after_ns(timeout_ns),
+    );
+    done && !refused
 }
 
 fn validate_framebuffer(fb: &Framebuffer) -> Result<(), ModesetError> {
@@ -786,6 +1036,7 @@ pub mod tests {
         pub wells_dead: Cell<bool>,
         cdclk_pll: Cell<u32>,
         pipeconf: Cell<u32>,
+        frame_pending: Cell<bool>,
         aux_data: RefCell<[u32; 5]>,
         aux_ctl_read: Cell<u32>,
         aux_reply: RefCell<Vec<u8>>,
@@ -798,14 +1049,21 @@ pub mod tests {
 
     impl MtlFake {
         pub fn new(port: XeLpgPort) -> Self {
+            let phy = FakePhy::new(port);
+            // This legacy lane preserves an inherited enabled DDI; an off
+            // port needs a separately qualified complete enable sequence.
+            if let Some(ddi) = inherited_ddi_ctl(port) {
+                phy.write32(ddi, 1 << 31);
+            }
             Self {
-                phy: FakePhy::new(port),
+                phy,
                 port,
                 writes: RefCell::new(Vec::new()),
                 wells: RefCell::new(Vec::new()),
                 wells_dead: Cell::new(false),
                 cdclk_pll: Cell::new(0),
                 pipeconf: Cell::new(0),
+                frame_pending: Cell::new(false),
                 aux_data: RefCell::new([0; 5]),
                 aux_ctl_read: Cell::new(0),
                 aux_reply: RefCell::new(Vec::new()),
@@ -906,6 +1164,13 @@ pub mod tests {
                 let s = self.pipeconf.get();
                 return s | ((s & crate::intel_gpu_pipes::PIPECONF_ENABLE) >> 1);
             }
+            if off == 0x70040 && self.frame_pending.replace(false) {
+                let next = self.phy.read32(off).wrapping_add(1);
+                self.phy.write32(off, next);
+            }
+            if off == 0x701ac && self.pipeconf.get() & (1 << 31) != 0 {
+                return self.phy.read32(0x7019c);
+            }
             if off == self.port.aux_ctl() {
                 return self.aux_ctl_read.get();
             }
@@ -939,8 +1204,10 @@ pub mod tests {
             if off == PIPECONF_OFF {
                 // STATE is hardware-owned and follows ENABLE, including
                 // read-modify-writes which carry the prior read-only state.
+                let was_enabled = self.pipeconf.get() & (1 << 31) != 0;
                 self.pipeconf
                     .set(val & !crate::intel_gpu_pipes::PIPECONF_STATE);
+                self.frame_pending.set(val & (1 << 31) != 0 && !was_enabled);
                 return;
             }
             if off == self.port.aux_ctl() {
@@ -1064,53 +1331,32 @@ pub mod tests {
         smoke_mtl_modeset_ddi_a_full_run
     );
 
-    fn smoke_mtl_modeset_tc1_full_run() -> TestResult {
-        let fake = MtlFake::new(XeLpgPort::Tc1);
-        let mut ms = XeLpgModeset::new(&fake, XeLpgPort::Tc1);
-        if ms
-            .modeset(&test_fb(), Some(&Mode::VESA_1024X768_60))
-            .is_err()
-        {
-            return TestResult::Fail("MTL TC1 modeset must complete against the MTL fake");
+    fn smoke_mtl_modeset_tc_ports_refuse_unqualified_route() -> TestResult {
+        struct NoAccess;
+        impl MmioWindow for NoAccess {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("unqualified TC read");
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("unqualified TC write");
+            }
         }
-        // C20 message bus lives at the TC block offsets.
-        if fake.writes_to(0x16_F240).is_empty() {
-            return TestResult::Fail("no C20 message-bus traffic at TC1 offsets");
-        }
-        // No VALFREQ register exists on C20 ports.
-        if !fake.writes_to(0x6_4030).is_empty() || !fake.writes_to(0x6_4130).is_empty() {
-            return TestResult::Fail("VALFREQ written for a C20 port");
-        }
-        // Transcoder clock select routes PHY TC1 (index 2).
-        if fake.writes_to(TRANS_CLK_SEL_A) != [0x3000_0000u32] {
-            return TestResult::Fail("TRANS_CLK_SEL must route PHY TC1 (0x30000000)");
-        }
-        // TRANS_DDI_FUNC_CTL carries the TC1 select encoding
-        // (enum port 9, +1 in the field).
-        let func = fake.writes_to(0x6_0400);
-        match func.last() {
-            Some(v) if (v >> 27) & 0xF == 10 => {}
-            _ => return TestResult::Fail("TRANS_DDI_FUNC_CTL select must encode TC1 (10)"),
-        }
-        // AUX_USBC1 well (index 3) requested.
-        if !fake
-            .writes_to(PWR_WELL_CTL_AUX2)
-            .iter()
-            .any(|v| v & pwr_well_req(3) != 0)
-        {
-            return TestResult::Fail("AUX_USBC1 well not requested");
-        }
-        // The C20 PLL state landed in an SRAM context
-        // (C20_B_MPLLB_CNTX_CFG = 0xCB4E with the fake's
-        // toggle-clear start).
-        if fake.phy.sram_get(0xCB4E) == 0 {
-            return TestResult::Fail("C20 MPLLB context not programmed in SRAM");
+        for port in [XeLpgPort::Tc1, XeLpgPort::Tc2] {
+            let mut ms = XeLpgModeset::new(&NoAccess, port);
+            assert_eq!(
+                ms.modeset(&test_fb(), Some(&Mode::VESA_1024X768_60)),
+                Err(ModesetError::UnsupportedGeneration)
+            );
+            assert_eq!(
+                ms.modeset_fixed(&test_fb(), &Mode::VESA_1024X768_60),
+                Err(ModesetError::UnsupportedGeneration)
+            );
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
-        smoke_mtl_modeset_tc1_full_run
+        smoke_mtl_modeset_tc_ports_refuse_unqualified_route
     );
 
     fn smoke_generation_separation() -> TestResult {
@@ -1239,8 +1485,7 @@ pub mod tests {
         // by waveform 0xAD5A (popcount 9) -> 172800.
         let fake = MtlFake::new(XeLpgPort::A);
         fake.cdclk_pll.set(16 | CDCLK_PLL_ENABLE);
-        fake.phy
-            .write32(CDCLK_SQUASH_CTL, CDCLK_SQUASH_ENABLE | 0xAD5A);
+        fake.phy.write32(CDCLK_SQUASH_CTL, 0x8f00_ad5a); // enabled, window16
         if cdclk_current_khz(&fake) != 172_800 {
             return TestResult::Fail("CDCLK decode of ratio+squash must give 172800");
         }
@@ -1300,11 +1545,12 @@ pub mod tests {
                 100,
             )
             .unwrap();
-        fake.phy.write32(0x70040, 1);
+        let frame = fake.read32(0x70040);
+        fake.phy.write32(0x70040, frame.wrapping_add(1));
         assert!(owner.poll(&fake, 200).unwrap().is_some());
         // Restore CTM so control readback below also verifies baseline retention.
         owner.arm(&fake, None, 201).unwrap();
-        fake.phy.write32(0x70040, 2);
+        fake.phy.write32(0x70040, frame.wrapping_add(2));
         assert!(owner.poll(&fake, 202).unwrap().is_some());
         for (r, value) in CONTROLS {
             assert_eq!(fake.read32(r), value);
@@ -1392,4 +1638,5 @@ pub mod tests {
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_color_readback_failure_aborts_owned_modeset_before_reenable
     );
+    include!("intel_gpu_modeset_xelpg_failclosed_tests.rs");
 }
