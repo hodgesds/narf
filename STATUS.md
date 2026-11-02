@@ -1802,16 +1802,18 @@ exact-VM publication precede handles. Opted-in PM initially refuses and ordinary
 GT reset never repeats destructive FLR. Capture suppresses the entire new raw
 bundle before reads when any retained i915 policy protects it, preserving normal
 state saves and terminal ownership. Reset discovery adds no level2/3, manual
-reset or replay. The ledger has 62 previously validated rows plus three pending
+reset or replay. The ledger has 62 previously validated rows plus three debug-tested
 rows (65 total), with all ten broad workstreams open.
 
-Thirty new fixtures are registered: fifteen small-BAR (including three physical
-path fixtures), nine capture/protection and six reset-availability cases.
-Expected totals are 1,908 selected native tests: 1,238 Intel/DRM/fb/backlight
-plus all 670 shared filesystem/graphics/AMD fixtures, with 152 cumulative new
-names. These counts describe the registered test plan; new debug/release native
-execution, production/btrfs and cross-target gates remain pending. Source review
-and isolated preflight do not constitute native feature acceptance.
+All thirty new fixtures pass in the debug native kernel: fifteen small-BAR,
+nine capture/protection and six reset-availability cases. The profile passes
+1,908 selected tests: 1,238 Intel/DRM/fb/backlight plus all 670 shared
+filesystem/graphics/AMD fixtures. All 1,878 prior selected names, 1,087 original
+Intel names, 152 cumulative new names and 31 backlight regressions remain, with
+no failures or duplicate names, no Intel skips and the one existing shared
+RNG-registration skip. All frozen source/linker hashes match this execution.
+Release native, production/btrfs and cross-target validation remain pending;
+merge readiness is not claimed.
 
 The BO fixtures drive actual raw Xe/GT/CT/LRC/PPGTT, cache/MERT, copy, terminal
 and reset ownership; their publication transport substitutes for the physical
