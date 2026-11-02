@@ -919,3 +919,7 @@ mod media {
 mod object_async {
     include!("intel_gpu_i915_async_tests.rs");
 }
+
+mod low_latency {
+    include!("intel_gpu_i915_low_latency_tests.rs");
+}

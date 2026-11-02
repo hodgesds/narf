@@ -363,3 +363,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_i915_balance",
     smoke_i915_media_context_close_and_authority_loss_keep_vm_bo_and_state_until_reset
 );
+
+mod sseu {
+    include!("intel_gpu_i915_media_sseu_tests.rs");
+}

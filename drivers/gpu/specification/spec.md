@@ -643,8 +643,9 @@ remain NotImplemented; unknown extensions return EINVAL.
 Duplicate ENGINES create extensions are EINVAL
 before their copy; GETPARAM ENGINES is EINVAL. Each map slot is its own
 `UserContext`. Execbuffer's ring field indexes the map, or selects legacy
-DEFAULT/RENDER→RCS0 and BLT→BCS0; holes, out-of-range slots, BSD and VEBOX are
-EINVAL. Only normal priority is admitted, disabling banning
+DEFAULT/RENDER→RCS0 and BLT→BCS0. Source-qualified Gen12 main-GuC BSD/VEBOX
+use the published dense media selectors described below; absent/unowned engines,
+holes and out-of-range slots return EINVAL. Only normal priority is admitted, disabling banning
 is refused, and no privilege follows from context creation. Recovery is disabled;
 enabling it or disabling persistence returns NotImplemented. VM rebinding
 requires every engine state of the context to be unused with no concurrent
@@ -681,18 +682,76 @@ capability bits clear. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
 slice/subslice masks 46/47 return EINVAL on Xe_HP-and-later profiles, as in
 Linux; callers use full topology queries.
 
+#### i915 context frequency hints and creation publication
+
+The i915 compatibility HAS_CONTEXT_FREQ_HINT(59) writes signed1 only for the same
+cached qualified GuC profile, matching nonzero current epoch/platform, nonempty
+published engine set and submission ABI major1 used by native low-latency queues.
+Unsupported states return ioctl success with signed-22 as pinned i915 does; output
+faults return EFAULT. This passive query performs no GT wake or MMIO and does not
+promise that a later submission will still be admitted.
+
+CONTEXT_PARAM_LOW_LATENCY0xe enables immutable per-context intent through
+CREATE_EXT SETPARAM on every admitted current profile. A standalone SETPARAM can
+enable only an unfinalized graphics-major12 proto-context: qualified TGL/ADL/RPL,
+DG2 and MTL/ARL. BMG/LNL/PTL require the create extension. GET, default/finalized
+context mutation and unsupported submission return EINVAL; a missing context
+returns ENOENT. The pinned enable operation ignores size/value (even value0
+turns it on), reads no value payload, and offers no disable or live toggle.
+Repeated enabled proto SET is idempotent. Existing later-generation engine-map
+compatibility behavior is unchanged; it does not grant late frequency mutation.
+
+Intent is retained by every legacy RCS/BCS, indexed physical/virtual and lazily
+selected admitted Gen12 media context. Engine-map creation and enabling preflight
+are namespace serialized before claim, and invalid creation/copyout discards the
+unpublished context. CREATE reserves a private nonce-bound name charged against the
+context limit, configures its copied proto state and retained selected VM references
+privately, and calls faultable copyout without the namespace IRQ lock. Only successful
+copyout permits an identity-checked publication. Pending names return ENOENT to
+lookup/mutation/destroy/EXEC; they cannot be claimed. Failure rolls back only that
+reservation and destroys private graphs outside the lock. Serial failed-tail IDs
+remain reusable; concurrent successful creators can leave opaque ID gaps.
+Each actual registration/re-registration retains the existing
+GuC policy request: action0x100b, SLPM_GT_FREQUENCY key0x2005/length1, bit28 for the
+hint and zero ordinarily. The fast request is ordered before normal ENABLE/ACK;
+there is no policy-specific ACK. Existing acknowledged global frequency/power
+limits and mandatory CPU/table/leaf/LRC/ring publication are unchanged.
+
+The hint can request more aggressive firmware frequency strategy and may affect
+power use. It grants no new engines, storage/VM/CPU-alias rights or ASYNC policy,
+and no measured latency/frequency result is promised. Cancel/close, missing ACK,
+loss, reset and S3 use the same retained GPU graph and terminal/full-reset receipts;
+old claimed epochs cannot replay. No new hardware actor or automatic live policy
+mutation is introduced.
+
+#### Immutable legacy SSEU defaults
+
 CONTEXT_PARAM_SSEU GET follows the 32-byte Linux context wire structure.
 Size zero returns 32 without accessing the payload; a short size is EINVAL.
 Lookup finalizes proto-contexts even for size queries. Legacy RENDER0/COPY0
-selectors and indexed engine maps (including holes and bounds checks) are
-validated before copying the immutable full-device default. Flags/reserved
-fields are checked; indexed lookup ignores engine_class as Linux does.
+selectors remain available. Nonindexed VIDEO/VIDEO_ENHANCE additionally resolve
+only actually published Gen12 main-GuC engines by dense logical class/instance,
+including sparse physical fuses. Indexed maps retain holes/bounds and ignore
+engine_class as Linux does. All successful lookups copy the same immutable
+whole-device default; they do not invent a per-media/codec SSEU allocation.
+Flags and reserved fields are checked.
 The old context ABI exposes only the low eight DSS bits and architecture EU
 maximum (16 SIMD8 or eight SIMD16 units), not a reconfiguration or the full
 fuse mask. Query blobs remain the full-width discovery interface. Copy faults
 return EFAULT without publishing a new size; no namespace IRQ lock spans
 faultable copies. SSEU SET is ENODEV on these >=Gen12 profiles (EINVAL for a
 short structure), matching Linux's Gen11-only configuration support.
+
+The private legacy-media lookup inventory is captured once per context from a
+matching nonzero current Gen12 publication at an SSEU GET (including size-only)
+or actual legacy media selection. Its host-only platform/EngineSet snapshot
+survives stop/loss/reset without MMIO, wake acquisition, GPU allocation or an
+execution grant. Creation alone does not capture it. A context that never
+observed a qualified inventory returns ENODEV for media lookup while unavailable;
+a known absent logical engine returns EINVAL. Later valid publication may seed
+an absent snapshot. Existing RENDER0/COPY0 and retained indexed lookups remain
+usable while stopped. Fresh submissions still independently require current
+live admission and never use the query snapshot.
 
 `drm_registry::driver_name` recognizes `intel-gpu` so both primary and render
 nodes reach Intel dispatch and retain their GEM mmap/PRIME namespaces.

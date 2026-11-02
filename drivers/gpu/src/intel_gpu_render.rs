@@ -117,12 +117,17 @@ struct Context {
     user: Arc<crate::intel_gpu_user::UserContext>,
     copy: Arc<crate::intel_gpu_user::UserContext>,
     media: BTreeMap<crate::intel_gpu_engine::Engine, Arc<crate::intel_gpu_user::UserContext>>,
+    /// Host-only legacy SSEU lookup inventory observed from this context's
+    /// matching live Gen12 publication. It never admits execution after stop.
+    sseu_media: Option<(GtPlatform, crate::intel_gpu_engine::EngineSet)>,
     engines: Option<Vec<Option<Arc<crate::intel_gpu_user::UserContext>>>>,
     /// i915 GRAPHICS_VER 12 contexts stay proto-contexts until first lookup;
     /// only then is the engine map immutable.
     finalized: bool,
     vm: Arc<Vm>,
     no_error_capture: bool,
+    /// Proto/create-only intent, inherited by every retained engine context.
+    low_latency: bool,
     bannable: bool,
     recoverable: bool,
     persistence: bool,
@@ -135,10 +140,12 @@ impl Context {
             user: crate::intel_gpu_user::UserContext::new(),
             copy: crate::intel_gpu_user::UserContext::for_engine(Engine::Bcs0),
             media: BTreeMap::new(),
+            sseu_media: None,
             engines: None,
             finalized,
             vm,
             no_error_capture: false,
+            low_latency: false,
             bannable: true,
             recoverable: false,
             persistence: true,
@@ -150,6 +157,17 @@ impl Context {
         users.extend(self.engines.iter().flatten().flatten().cloned());
         users.extend(self.media.values().cloned());
         users
+    }
+
+    fn retain_sseu_media(&mut self, info: &DeviceInfo) {
+        if self.sseu_media.is_none() && info.platform.is_gen12() {
+            // user_status verifies the nonzero epoch and matching platform;
+            // this is an already-published engine set, never raw fuse guesses.
+            self.sseu_media = info
+                .user_status()
+                .filter(|status| status.engines.bits() != 0)
+                .map(|status| (status.platform, status.engines));
+        }
     }
 
     /// An indexed map uses only RING_MASK; legacy media is selected from the
@@ -171,11 +189,15 @@ impl Context {
                 abi::EXEC_BLT => Ok(self.copy.clone()),
                 abi::EXEC_BSD | abi::EXEC_VEBOX => {
                     let engine = media.ok_or(FsError::InvalidData)?;
-                    Ok(self
-                        .media
-                        .entry(engine)
-                        .or_insert_with(|| crate::intel_gpu_user::UserContext::for_engine(engine))
-                        .clone())
+                    if let Some(user) = self.media.get(&engine) {
+                        return Ok(user.clone());
+                    }
+                    let user = crate::intel_gpu_user::UserContext::for_engine(engine);
+                    if self.low_latency {
+                        user.configure_low_latency()?;
+                    }
+                    self.media.insert(engine, user.clone());
+                    Ok(user)
                 }
                 _ => Err(FsError::InvalidData),
             },
@@ -270,6 +292,9 @@ fn read_engines(
 #[derive(Debug)]
 struct Namespaces {
     next_context: u32,
+    next_context_nonce: u64,
+    /// Reserved names are capacity charged but absent from the visible map.
+    pending_contexts: BTreeMap<u32, u64>,
     next_vm: u32,
     contexts: BTreeMap<u32, Context>,
     vms: BTreeMap<u32, Arc<Vm>>,
@@ -277,6 +302,49 @@ struct Namespaces {
 }
 
 impl Namespaces {
+    const fn new() -> Self {
+        Self {
+            next_context: 1,
+            next_context_nonce: 1,
+            pending_contexts: BTreeMap::new(),
+            next_vm: 1,
+            contexts: BTreeMap::new(),
+            vms: BTreeMap::new(),
+            bsd_default: None,
+        }
+    }
+
+    fn reserve_context(&mut self) -> Result<(u32, u64), FsError> {
+        // Context0 counts even before its lazy initialization. Every pending
+        // copyout consumes exactly one additional slot, excluding overcommit.
+        let occupied = self.contexts.len()
+            + self.pending_contexts.len()
+            + usize::from(!self.contexts.contains_key(&0));
+        if occupied >= MAX_CONTEXTS {
+            return Err(FsError::OutOfMemory);
+        }
+        let id = self.next_context;
+        let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
+        let nonce = self.next_context_nonce;
+        let next_nonce = nonce.checked_add(1).ok_or(FsError::OutOfMemory)?;
+        self.pending_contexts.insert(id, nonce);
+        self.next_context = next;
+        self.next_context_nonce = next_nonce;
+        Ok((id, nonce))
+    }
+
+    fn cancel_context(&mut self, id: u32, nonce: u64) {
+        if self.pending_contexts.get(&id) != Some(&nonce) {
+            return;
+        }
+        self.pending_contexts.remove(&id);
+        // Preserve the ordinary failed-create ID behavior when no later
+        // reservation exists. Concurrent successes may leave opaque ID gaps.
+        if id.checked_add(1) == Some(self.next_context) {
+            self.next_context = id;
+        }
+    }
+
     fn initialize(&mut self) {
         self.contexts
             .entry(0)
@@ -308,6 +376,7 @@ impl Namespaces {
                 return Err(FsError::InvalidData);
             }
             let present = info.user_status().ok_or(FsError::NoDevice)?.engines;
+            context.retain_sseu_media(info);
             let class = if legacy == abi::EXEC_BSD { 2 } else { 3 };
             let count = present.iter().filter(|e| e.xe_class() == class).count();
             if count == 0 {
@@ -365,11 +434,43 @@ impl Namespaces {
         bytes: &mut [u8],
         set: bool,
         engines: Option<EngineMap>,
+        low_latency_admitted: bool,
     ) -> Result<(), FsError> {
         let id = u32_at(bytes, 0);
         let size = u32_at(bytes, 4);
         let param = u64_at(bytes, 8);
         let value = u64_at(bytes, 16);
+        if param == abi::CONTEXT_PARAM_LOW_LATENCY {
+            self.initialize();
+            let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
+            if !set {
+                // Source lookup finalizes even though LOW_LATENCY has no GET.
+                context.finalized = true;
+                return Err(FsError::InvalidData);
+            }
+            if context.finalized || !low_latency_admitted {
+                return Err(FsError::InvalidData);
+            }
+            // Pinned set_proto_ctx_param ignores size/value for this one-way
+            // enable: even value 0 enables it, with no payload dereference.
+            if context.low_latency {
+                return Ok(());
+            }
+            let users = context.users();
+            if users.iter().any(|user| !user.can_rebind()) {
+                return Err(FsError::Busy);
+            }
+            // No claim-capable UserContext escapes before finalization.
+            // Internal SSEU SET clones immediately refuse without a claim.
+            // This context is either namespace serialized or an unpublished
+            // private proto, so no claim can race the complete preflight and
+            // none of these enables can fail midway.
+            for user in users {
+                user.configure_low_latency()?;
+            }
+            context.low_latency = true;
+            return Ok(());
+        }
         if (param, set) == (abi::CONTEXT_PARAM_ENGINES, true) {
             self.engines_settable(id)?;
             let map = engines.ok_or(FsError::InvalidData)?;
@@ -377,8 +478,15 @@ impl Namespaces {
             context.engines = Some(
                 map.into_iter()
                     .map(|slot| {
-                        slot.map(crate::intel_gpu_user::UserContext::for_placements)
-                            .transpose()
+                        slot.map(|placements| {
+                            let user =
+                                crate::intel_gpu_user::UserContext::for_placements(placements)?;
+                            if context.low_latency {
+                                user.configure_low_latency()?;
+                            }
+                            Ok::<_, FsError>(user)
+                        })
+                        .transpose()
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
@@ -463,6 +571,58 @@ impl Namespaces {
     }
 }
 
+/// A private, non-Copy reservation. Only this exact nonce may publish or
+/// roll back its slot; a pending name is never in the claimable context map.
+struct PendingContext<'a> {
+    namespaces: &'a IrqSafeSpinLock<Namespaces>,
+    id: u32,
+    nonce: u64,
+}
+
+impl PendingContext<'_> {
+    fn publish(self, context: Context, default: Context) -> Result<(), FsError> {
+        let mut context = Some(context);
+        let mut default = Some(default);
+        let published = {
+            let mut namespaces = self.namespaces.lock();
+            if namespaces.pending_contexts.get(&self.id) != Some(&self.nonce)
+                || namespaces.contexts.contains_key(&self.id)
+            {
+                false
+            } else {
+                // Vacant entries do not replace/drop any other owned graph.
+                if let alloc::collections::btree_map::Entry::Vacant(slot) =
+                    namespaces.contexts.entry(0)
+                {
+                    slot.insert(default.take().expect("owned context0"));
+                }
+                if let alloc::collections::btree_map::Entry::Vacant(slot) =
+                    namespaces.contexts.entry(self.id)
+                {
+                    slot.insert(context.take().expect("owned proto"));
+                }
+                namespaces.pending_contexts.remove(&self.id);
+                true
+            }
+        };
+        // Unused default/proto references are destroyed after the IRQ guard.
+        drop(context);
+        drop(default);
+        if published {
+            Ok(())
+        } else {
+            Err(FsError::NoDevice)
+        }
+    }
+}
+
+impl Drop for PendingContext<'_> {
+    fn drop(&mut self) {
+        // Metadata only: never remove/drop a published Context or VM graph.
+        self.namespaces.lock().cancel_context(self.id, self.nonce);
+    }
+}
+
 #[derive(Debug)]
 pub struct RenderFile {
     pub gem: GemState,
@@ -483,13 +643,7 @@ impl RenderFile {
             gem: GemState::new(),
             xe: crate::intel_gpu_xe::XeFile::new(),
             syncobjs: IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
-            namespaces: IrqSafeSpinLock::new(Namespaces {
-                next_context: 1,
-                next_vm: 1,
-                contexts: BTreeMap::new(),
-                vms: BTreeMap::new(),
-                bsd_default: None,
-            }),
+            namespaces: IrqSafeSpinLock::new(Namespaces::new()),
         }
     }
 
@@ -850,6 +1004,7 @@ impl RenderFile {
                 .ok_or(FsError::NotFound)?;
             if !set {
                 context.finalized = true;
+                context.retain_sseu_media(info);
             }
             context.clone()
         };
@@ -883,6 +1038,19 @@ impl RenderFile {
                     .ok_or(FsError::InvalidData)?;
             }
             None if flags == 0 && matches!((class, instance), (0 | 1, 0)) => {}
+            None if flags == 0 && matches!(class, 2 | 3) && info.platform.is_gen12() => {
+                // Linux lookup_user_engine uses the published class/instance
+                // map; every engine inherits whole-device default SSEU. Keep
+                // this immutable host query usable after stop only if this
+                // context actually observed a qualified publication earlier.
+                let (platform, present) = context.sseu_media.ok_or(FsError::NoDevice)?;
+                if platform != info.platform {
+                    return Err(FsError::NoDevice);
+                }
+                present
+                    .from_class_instance(class, instance)
+                    .ok_or(FsError::InvalidData)?;
+            }
             _ => return Err(FsError::InvalidData),
         }
         let topology = observed_topology(info)?;
@@ -1112,9 +1280,21 @@ impl RenderFile {
                 } else {
                     None
                 };
-                self.namespaces
-                    .lock()
-                    .parameter(&mut request, set, engines)?;
+                // GRAPHICS_VER >12 finalizes at create in pinned i915. DG2
+                // 12.55 and MTL/ARL 12.70/12.74 still permit late proto SET.
+                // Keep backend callbacks outside the namespace IRQ lock.
+                let low_latency_admitted = matches!(
+                    info.platform,
+                    GtPlatform::Gen12(_)
+                        | GtPlatform::Alchemist
+                        | GtPlatform::Integrated(Generation::MeteorLake)
+                ) && crate::intel_gpu_xe::low_latency_supported(info);
+                self.namespaces.lock().parameter(
+                    &mut request,
+                    set,
+                    engines,
+                    low_latency_admitted,
+                )?;
                 user.write(arg, &request)
             }
             abi::GEM_VM_CREATE | abi::GEM_VM_DESTROY => {
@@ -1234,30 +1414,54 @@ impl RenderFile {
                 Ok(())
             })?;
         }
-        let mut namespaces = self.namespaces.lock();
-        namespaces.initialize();
-        if namespaces.contexts.len() >= MAX_CONTEXTS {
-            return Err(FsError::OutOfMemory);
-        }
-        let id = namespaces.next_context;
-        let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
-        namespaces
+        // CREATE_EXT applies proto parameters before source finalization on
+        // every admitted generation. Sample cached admission before locking.
+        let low_latency_admitted = crate::intel_gpu_xe::low_latency_supported(info);
+        // Retain exactly the referenced existing VMs under the namespace
+        // guard. The bounded vectors allocate before the guard, and all
+        // private contexts/maps/configuration and Arc drops occur outside it.
+        let vm_ids: Vec<_> = params
+            .iter()
+            .filter(|(param, _)| u64_at(param, 8) == 9)
+            .filter_map(|(param, _)| u32::try_from(u64_at(param, 16)).ok())
+            .collect();
+        let mut vms = Vec::with_capacity(vm_ids.len());
+        let pending = {
+            let mut namespaces = self.namespaces.lock();
+            let (id, nonce) = namespaces.reserve_context()?;
+            for vm_id in vm_ids {
+                if let Some(vm) = namespaces.vms.get(&vm_id) {
+                    vms.push((vm_id, vm.clone()));
+                }
+            }
+            PendingContext {
+                namespaces: &self.namespaces,
+                id,
+                nonce,
+            }
+        };
+        let id = pending.id;
+        // Reuse the exact proto handler on an unshared host-only container,
+        // never on the visible namespace. Even reentrant copyout cannot find
+        // or finalize/claim either of these private context graphs.
+        let mut proto = Namespaces::new();
+        proto.initialize();
+        proto
             .contexts
             .insert(id, Context::new(Arc::new(Vm { _identity: id }), false));
-        let result = (|| {
-            for (mut param, engines) in params {
-                put32(&mut param, 0, id);
-                namespaces.parameter(&mut param, true, engines)?;
-            }
-            put32(&mut request, 0, id);
-            user.write(arg, &request)
-        })();
-        if result.is_err() {
-            namespaces.contexts.remove(&id);
-        } else {
-            namespaces.next_context = next;
+        for (vm_id, vm) in vms {
+            proto.vms.insert(vm_id, vm);
         }
-        result
+        for (mut param, engines) in params {
+            put32(&mut param, 0, id);
+            proto.parameter(&mut param, true, engines, low_latency_admitted)?;
+        }
+        let context = proto.contexts.remove(&id).expect("owned private proto");
+        let default = proto.contexts.remove(&0).expect("private context0");
+        drop(proto);
+        put32(&mut request, 0, id);
+        user.write(arg, &request)?;
+        pending.publish(context, default)
     }
 }
 
@@ -1417,6 +1621,15 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         34 => i32::try_from(observed_topology(info)?.eu_count()).map_err(|_| FsError::NoDevice)?,
         40 => 4, // MMAP_OFFSET
         43 => i32::from(info.object_async_ready()),
+        // i915_getparam.c writes value=-EINVAL (not an ioctl error) when
+        // GuC submission is unavailable, then uses the common put_user path.
+        59 => {
+            if crate::intel_gpu_xe::low_latency_supported(info) {
+                1
+            } else {
+                -22
+            }
+        }
         // Only ENABLED: i915 priority configuration, busy stats, semaphore and
         // preemption capability bits require their own implemented contracts.
         41 => i32::from(info.submission_ready()),
@@ -1463,7 +1676,7 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         | 45
         | 52
         | 54
-        | 56..=59 => 0,
+        | 56..=58 => 0,
         _ => return Err(FsError::InvalidData),
     })
 }
@@ -1616,6 +1829,12 @@ pub(crate) mod tests {
         }
         pub(crate) fn load(&self, address: u64, len: usize) -> Vec<u8> {
             read(self, address, len).expect("fixture load")
+        }
+        pub(crate) fn fault_read_at(&self, address: Option<u64>) {
+            *self.fail_read.lock() = address;
+        }
+        pub(crate) fn fault_write_at(&self, address: Option<u64>) {
+            *self.fail_write.lock() = address;
         }
     }
     impl IoctlContext for User {

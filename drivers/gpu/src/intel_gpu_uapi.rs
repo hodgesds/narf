@@ -56,6 +56,7 @@ pub const EXEC_VEBOX: u64 = 4;
 pub const EXEC_BSD_SHIFT: u32 = 13;
 pub const EXEC_BSD_MASK: u64 = 3 << EXEC_BSD_SHIFT;
 pub const CONTEXT_PARAM_ENGINES: u64 = 0xa;
+pub const CONTEXT_PARAM_LOW_LATENCY: u64 = 0xe;
 pub const CONTEXT_ENGINES_EXT_LOAD_BALANCE: u32 = 0;
 /// I915_ENGINE_CLASS_INVALID with I915_ENGINE_CLASS_INVALID_NONE: an empty
 /// engine-map slot.
