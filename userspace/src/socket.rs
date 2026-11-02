@@ -4213,6 +4213,27 @@ impl FileOps for SocketFile {
         })
     }
 
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        let connected_stream = self.domain == AF_UNIX
+            && self.kind == SOCK_STREAM
+            && matches!(&*self.state.lock(), SocketState::UnixConnected { .. });
+        if connected_stream {
+            // Retain non-exclusive wake delivery: a selected reader interrupted
+            // before consuming data must never strand another blocked reader.
+            // Only the blocking syscall's task waker carries CPU-bounded wake
+            // preference; ordinary poll/epoll observers retain their own waker.
+            let blocking = narf_scheduler::blocking_io_waker(waker, task_id);
+            self.arm_readiness(task_id, interest, &blocking)
+        } else {
+            self.arm_readiness(task_id, interest, waker)
+        }
+    }
+
     /// Persistent arm (Linux `eppoll_entry`): register each cell's waiter WITHOUT
     /// consuming it on readiness, so epoll's per-fd ready-list waker stays live
     /// for the fd's whole membership and fires on every future event. Returns the

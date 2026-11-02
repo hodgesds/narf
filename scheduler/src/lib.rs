@@ -68,6 +68,7 @@ extern crate alloc;
 pub mod accounting;
 pub mod admission;
 pub mod affinity;
+mod blocking;
 pub mod budget;
 #[cfg(feature = "cgroup")]
 pub mod cgroup;
@@ -96,6 +97,7 @@ pub use accounting::{
 };
 pub use admission::{realtime_bandwidth, AdmissionError, RealtimeBandwidth, RT_CPU_LIMIT_PPM};
 pub use affinity::{Affinity, CpuId, CpuSet};
+pub use blocking::blocking_io_waker;
 pub use budget::{
     BudgetAccount, BudgetEligibility, BudgetView, ChargeOutcome, CpuBudget, ExhaustionPolicy,
     OverrunPolicy, PeriodBudget, ResourceBudget,
@@ -120,9 +122,9 @@ pub(crate) use policy::policy_wants_tick;
 pub use policy::{
     active_quantum_unit, cpu_state, current_scheduler_name, current_scheduler_quantum_unit,
     install_scheduler, set_default_policy, ClassScheduler, CpuIdleMeta, CpuLoad, CpuSchedContext,
-    CpuState, CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, QuantumUnit, RunQueue,
-    SchedPolicy, SchedRow, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
-    TaskHandle, TaskMeta, TaskQueueEvent,
+    CpuState, CpuStateChange, CurrentTask, DispatchReason, FifoScheduler, PriorityScheduler,
+    QuantumUnit, RunQueue, SchedPolicy, SchedRow, Scheduler, SchedulerError, TaskDequeueReason,
+    TaskEnqueueReason, TaskHandle, TaskMeta, TaskQueueEvent, TaskRuntime, WakeReason,
 };
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
@@ -1088,6 +1090,8 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 /// the reschedule-IPI target so a cross-core wake un-halts an idle owner
 /// immediately instead of leaving it to wake at its next timer tick.
 pub(crate) struct WakeCell {
+    /// Advisory provider wake reason, consumed when a dispatch begins.
+    blocking_wake: AtomicBool,
     flag: AtomicBool,
     cpu: AtomicU32,
     /// Packed `(parked slot index, cpu)`, or NOT_PARKED while runnable/running.
@@ -1260,6 +1264,7 @@ fn claim_direct_handoff_slot(cpu: usize, slot: &TaskSlot) -> Option<DirectHandof
     // it even if another wake races the direct continuation.
     slot.awake.direct_claimed.store(true, Ordering::Release);
     slot.awake.flag.store(false, Ordering::Release);
+    slot.awake.blocking_wake.store(false, Ordering::Release);
     publish_current_sched(cpu, slot);
     Some(DirectHandoffTarget {
         task,
@@ -1400,6 +1405,7 @@ pub(crate) fn activate_direct_task(
 
 fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
     Arc::new(WakeCell {
+        blocking_wake: AtomicBool::new(false),
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(cpu),
         parked_location: AtomicUsize::new(NOT_PARKED),
@@ -2437,6 +2443,8 @@ fn send_resched_ipi(target_cpu: u32) {
 }
 
 pub(crate) struct TaskSlot {
+    /// Why the policy selected this dispatch; copied into its runtime event.
+    pub(crate) dispatch_reason: policy::DispatchReason,
     task: BoxedTask,
     // Per-task wake state. The slot owns one `Arc<WakeCell>`; each
     // handed-out `Waker` owns another clone, so it outlives the slot if
@@ -2765,6 +2773,7 @@ pub fn init() {
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
     for (cpu, q) in READY.iter().enumerate() {
+        blocking::reset(cpu);
         *q.lock() = Some(VecDeque::new());
         *PARKED[cpu].lock() = Some(ParkedTasks::new());
         RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
@@ -2799,6 +2808,7 @@ pub fn init() {
 #[doc(hidden)]
 pub fn __reset_queues_for_test() {
     for (cpu, q) in READY.iter().enumerate() {
+        blocking::reset(cpu);
         if let Some(d) = q.lock().as_mut() {
             d.clear();
         }
@@ -3820,6 +3830,12 @@ fn park_slot(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) -> O
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
 fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason) {
+    // A selection that requeues before execution has spent no CPU credit.
+    // Executed picks have already consumed this marker at their charge site.
+    slot.dispatch_reason = policy::DispatchReason::Policy;
+    if slot.awake.blocking_wake.load(Ordering::Acquire) {
+        blocking::mark_possible(cpu);
+    }
     // EEVDF-lite: place a NEWLY ADMITTED task at the target CPU's virtual-time
     // floor so it neither starts with unbounded credit (vruntime 0 would look
     // infinitely starved) nor jumps ahead of resident work. Requeue/Migrate keep
@@ -4030,6 +4046,7 @@ where
     let affinity_generation = register_task_affinity(id, spec.affinity, false);
     let awake = new_wake_cell(id, 0, false);
     let slot = TaskSlot {
+        dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(f),
         awake,
         id,
@@ -4087,6 +4104,7 @@ where
     let affinity_generation = register_task_affinity(id, spec.affinity, true);
     let awake = new_wake_cell(id, cpu as u32, false);
     let slot = TaskSlot {
+        dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
         awake,
         id,
@@ -4337,6 +4355,7 @@ where
     addr_space.scheduler_attach_user_task();
     register_live_user_address_space(id, &addr_space);
     let slot = TaskSlot {
+        dispatch_reason: policy::DispatchReason::Policy,
         task,
         awake,
         id,
@@ -4817,6 +4836,11 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                 if let Some(d) = ready.iter().find(|s| s.id == donor_id) {
                     (
                         crate::policy::TaskMeta {
+                            wake_reason: d
+                                .awake
+                                .blocking_wake
+                                .load(Ordering::Acquire)
+                                .then_some(policy::WakeReason::BlockingIo),
                             id: d.id,
                             work_kind: d.spec.work_kind,
                             priority: d.spec.priority,
@@ -4835,6 +4859,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                 } else {
                     (
                         crate::policy::TaskMeta {
+                            wake_reason: None,
                             id: donor_id,
                             work_kind: crate::priority::WorkKind::AsyncTask,
                             priority: crate::priority::Priority::NORMAL,
@@ -4857,6 +4882,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             } else {
                 (
                     crate::policy::TaskMeta {
+                        wake_reason: None,
                         id: TaskId::NONE,
                         work_kind: crate::priority::WorkKind::AsyncTask,
                         priority: crate::priority::Priority::NORMAL,
@@ -5098,7 +5124,7 @@ unsafe fn wake_raw(data: *const ()) {
     wake_place_and_kick(Arc::as_ptr(&arc), home, arc.task);
 }
 
-unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
+unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
     let ptr = data as *const WakeCell;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
@@ -5165,6 +5191,7 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         // Stealing is NOT used on the wake path (it stays the periodic balancer).
         wake_place_and_kick(ptr, dispatch_home, task);
     }
+    !prev_awake
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -5552,6 +5579,7 @@ pub fn poll_one_round() -> usize {
             enqueue_after_poll(cpu, slot);
             continue;
         }
+        slot.awake.blocking_wake.store(false, Ordering::Release);
         // Running on this CPU now — aim future wakes' reschedule IPI here
         // (the slot may have been work-stolen since it was enqueued).
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
@@ -5601,6 +5629,7 @@ pub fn poll_one_round() -> usize {
             .cycles_since(start)
             .saturating_sub(interrupt_elapsed)
             .saturating_sub(stackful::take_direct_foreign_cycles());
+        policy::account_task_runtime(cpu, slot.id, elapsed, slot.dispatch_reason);
         let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
         // EEVDF-lite: charge the cycles this dispatch ran to the task's virtual
         // runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`, one add.
@@ -6100,6 +6129,7 @@ pub fn run_until_empty() {
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
+            slot.awake.blocking_wake.store(false, Ordering::Release);
             // Instrument: measure this wake→run gap + whether a HLT intervened.
             wake_race_dispatch(&slot.awake, cpu);
             // This is the first point at which idle has become execution:
@@ -6198,6 +6228,7 @@ pub fn run_until_empty() {
                 .cycles_since(start)
                 .saturating_sub(interrupt_elapsed)
                 .saturating_sub(stackful::take_direct_foreign_cycles());
+            policy::account_task_runtime(cpu, slot.id, elapsed, slot.dispatch_reason);
             let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
             // EEVDF-lite: charge the cycles this dispatch ran to the task's
             // virtual runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`.
@@ -7684,6 +7715,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     // SAFETY: Valid memory or trusted environment
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
     let awake = Arc::new(WakeCell {
+        blocking_wake: AtomicBool::new(false),
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
         parked_location: AtomicUsize::new(NOT_PARKED),

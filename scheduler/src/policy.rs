@@ -36,6 +36,8 @@ use crate::budget::{BudgetAccount, BudgetEligibility, BudgetView, ResourceBudget
 use crate::priority::{Priority, SchedClass, WorkKind};
 use crate::TaskId;
 
+mod blocking;
+
 /// Authority to install a scheduler policy. Cap-gated via
 /// `install_scheduler`; revocation is observed lazily on the next
 /// install attempt.
@@ -102,6 +104,7 @@ impl TaskHandle {
 /// scheduling-relevant slice of `TaskSpec` plus the slot's `id`.
 #[derive(Copy, Clone, Debug)]
 pub struct TaskMeta {
+    pub wake_reason: Option<WakeReason>,
     pub id: TaskId,
     /// What kind of execution this slot represents. The core copies this from
     /// admitted task metadata; it is not an accounting identity or authority.
@@ -154,6 +157,11 @@ impl TaskMeta {
     /// which is more consistent than staggering it across the walk.
     pub(crate) fn from_slot_at(slot: &crate::TaskSlot, now: u64) -> Self {
         Self {
+            wake_reason: slot
+                .awake
+                .blocking_wake
+                .load(Ordering::Acquire)
+                .then_some(WakeReason::BlockingIo),
             id: slot.id,
             work_kind: slot.spec.work_kind,
             priority: slot.spec.priority,
@@ -245,6 +253,7 @@ pub struct CpuSchedContext {
 /// budget/account copy. `Copy`, so a scan never allocates.
 #[derive(Copy, Clone, Debug)]
 pub struct SchedRow {
+    pub wake_reason: Option<WakeReason>,
     pub handle: TaskHandle,
     pub class: SchedClass,
     pub priority: Priority,
@@ -287,6 +296,26 @@ pub enum TaskQueueEvent {
         task: TaskMeta,
         reason: TaskDequeueReason,
     },
+}
+
+/// Provider-supplied wake metadata, without a queue node or continuation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WakeReason {
+    BlockingIo,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatchReason {
+    Policy,
+    Wakeup,
+}
+
+/// Actual core-charged execution, excluding IRQ and direct-peer execution.
+#[derive(Copy, Clone, Debug)]
+pub struct TaskRuntime {
+    pub task: TaskHandle,
+    pub cycles: u64,
+    pub reason: DispatchReason,
 }
 
 /// Copied scheduler-core state supplied on a CPU's transition to idle.
@@ -397,6 +426,11 @@ impl<'a> RunQueue<'a> {
     pub fn iter_sched(&self) -> impl Iterator<Item = SchedRow> + '_ {
         let now = narf_time::now_cycles();
         self.inner.iter().map(move |slot| SchedRow {
+            wake_reason: slot
+                .awake
+                .blocking_wake
+                .load(Ordering::Acquire)
+                .then_some(WakeReason::BlockingIo),
             handle: TaskHandle::from_id(slot.id),
             class: slot.spec.class,
             priority: slot.spec.priority,
@@ -496,6 +530,22 @@ pub trait Scheduler: Any + Send + Sync + 'static {
     /// the highest available eligibility tier; policy code cannot strand
     /// core-owned work or override throttling.
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle>;
+
+    /// Optional preference among provider-identified wakees in TaskMeta. Default None uses
+    /// ordinary pick_next ordering. The result undergoes the same core budget
+    /// validation; ClassScheduler additionally retains class/priority ordering.
+    /// Runs under the CPU policy and ready-queue locks, with pick_next's
+    /// allocation-free/non-reentrant contract. Returning None leaves the wake
+    /// metadata pending until the task actually begins another dispatch.
+    fn pick_wakeup(&self, _cpu: CpuId, _queue: &RunQueue<'_>) -> Option<TaskHandle> {
+        None
+    }
+
+    /// Observe charged execution at an executor boundary, with no READY lock
+    /// held. The currently installed policy receives the event; execution may
+    /// have begun under a prior policy during replacement. This never changes
+    /// core budget charging. Must not allocate, block or re-enter scheduling.
+    fn on_task_runtime(&self, _cpu: CpuId, _runtime: TaskRuntime) {}
 
     /// Decide whether the task currently running on `cpu` (`current`) should
     /// cede at its next cooperative preemption point because a wake just made a
@@ -704,6 +754,18 @@ pub(crate) fn select_idle_sibling(
 }
 
 impl Scheduler for ClassScheduler {
+    fn on_cpu_attach(&self, cpu: CpuId) {
+        blocking::reset(cpu.0 as usize);
+    }
+
+    fn pick_wakeup(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+        blocking::pick(cpu, queue)
+    }
+
+    fn on_task_runtime(&self, cpu: CpuId, runtime: TaskRuntime) {
+        blocking::charge(cpu.0 as usize, runtime);
+    }
+
     fn select_task_rq(
         &self,
         prev_cpu: CpuId,
@@ -805,6 +867,9 @@ const CLASS_BALANCE_INTERVAL: u32 = 8;
 /// [`crate::__reset_queues_for_test`].
 #[doc(hidden)]
 pub(crate) fn __reset_balance_state_for_test() {
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        blocking::reset(cpu);
+    }
     for cell in CLASS_BALANCE_TICKS.iter() {
         cell.store(0, Ordering::Relaxed);
     }
@@ -1339,11 +1404,24 @@ pub fn __try_with_scheduler_contention_probe(cpu: CpuId) -> (bool, bool) {
     (skipped_while_held, ran_when_free)
 }
 
-/// Executor entry: pop the policy's pick from the per-CPU queue.
-/// Returns the detached `TaskSlot` plus the handle the policy
-/// reported. None when the policy declined (queue empty / no
-/// candidate). Defaults to `FifoScheduler` when nothing is installed
-/// (very early boot / smoke teardown).
+/// Deliver an already-computed execution span to the current CPU policy.
+pub(crate) fn account_task_runtime(cpu: usize, task: TaskId, cycles: u64, reason: DispatchReason) {
+    let cpu = CpuId(cpu as u32);
+    with_scheduler(cpu, |scheduler| {
+        if let Some(scheduler) = scheduler {
+            scheduler.on_task_runtime(
+                cpu,
+                TaskRuntime {
+                    task: TaskHandle::from_id(task),
+                    cycles,
+                    reason,
+                },
+            );
+        }
+    });
+}
+
+/// Pop a validated policy selection from the CPU's ready queue.
 pub(crate) fn pick_next_slot(
     scheduler: Option<&dyn Scheduler>,
     cpu: CpuId,
@@ -1394,6 +1472,15 @@ pub(crate) fn pick_next_slot(
         }
     }
 
+    // Providers identify a wakee; the installed policy decides whether that
+    // information changes its selection. The usual validation scan below
+    // retains authority over eligibility, class and priority.
+    let wake_request = if urgent_id == 0 && crate::blocking::possible(cpu.0 as usize) {
+        scheduler.and_then(|policy| policy.pick_wakeup(cpu, &RunQueue::projected(q)))
+    } else {
+        None
+    };
+
     // Consume the one-shot buddy before considering the FIFO shortcut. An
     // outstanding buddy must retain its normal precedence even when every
     // resident task otherwise has identical scheduling metadata. When an
@@ -1406,6 +1493,7 @@ pub(crate) fn pick_next_slot(
 
     let class_fifo_fast = builtin_class
         && wake_next_id == 0
+        && wake_request.is_none()
         && crate::class_fifo_uniform(cpu.0 as usize)
         && q.front().is_some_and(|slot| slot.awake.executor_runnable());
 
@@ -1478,6 +1566,7 @@ pub(crate) fn pick_next_slot(
     let mut best_pos: Option<usize> = None;
     let mut requested_hit: Option<(usize, u8)> = None;
     let mut wake_next_hit: Option<(usize, u8)> = None;
+    let mut wake_request_hit: Option<(usize, u8)> = None;
     let mut dispatchable_count = 0usize;
     let mut class_pick: Option<(usize, u8, SchedClass, Priority, Option<u64>)> = None;
     // Clear before scanning. A wake that races after this store raises the
@@ -1499,6 +1588,9 @@ pub(crate) fn pick_next_slot(
         }
         if requested_id == Some(slot.id) {
             requested_hit = Some((index, tier));
+        }
+        if wake_request.is_some_and(|request| request.task_id() == slot.id) {
+            wake_request_hit = Some((index, tier));
         }
         if wake_next_id != 0 && wake_next_id == slot.id.raw() {
             wake_next_hit = Some((index, tier));
@@ -1577,7 +1669,9 @@ pub(crate) fn pick_next_slot(
                     && (class != SchedClass::Realtime || wake.budget.deadline_cycles == deadline)
             })
     };
-    let pos = match wake_next_hit {
+    let preferred =
+        wake_request_hit.filter(|(pos, tier)| *tier == best_tier && wake_next_class_ok(*pos));
+    let ordinary_pos = match wake_next_hit {
         Some((wake_pos, wake_tier)) if wake_tier == best_tier && wake_next_class_ok(wake_pos) => {
             wake_pos
         }
@@ -1586,7 +1680,13 @@ pub(crate) fn pick_next_slot(
             _ => best_pos.expect("best_tier > 0 guarantees a top-tier position"),
         },
     };
-    let slot = q.remove(pos)?;
+    let pos = preferred.map_or(ordinary_pos, |(pos, _)| pos);
+    let mut slot = q.remove(pos)?;
+    // Charge every granted dispatch, including an ordinary-order winner, so
+    // repeated wake/selection pairs cannot obtain unaccounted preference.
+    if preferred.is_some() {
+        slot.dispatch_reason = DispatchReason::Wakeup;
+    }
     let handle = TaskHandle::from_id(slot.id);
     if let Some(scheduler) = scheduler.filter(|policy| observes_queue_events(*policy)) {
         scheduler.on_task_queue_event(

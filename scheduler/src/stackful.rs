@@ -3054,7 +3054,11 @@ fn defer_user_resched_from_tick(task: &KernelTask, now: u64) {
     let elapsed = now.saturating_sub(started);
     let current = crate::current_task_id().raw();
     let slice_expired = slice_expired_unit_aware(task, elapsed, slice);
-    let tick_required = crate::tick_preemption_required(current, now, slice_expired);
+    // A remote wake or policy request is authoritative even when this tick
+    // interrupted a syscall. Honor it at the same safe exit as slice expiry,
+    // instead of waiting for a later user-mode tick or the fair-share floor.
+    let requested = crate::need_resched_pending(this_cpu());
+    let tick_required = crate::tick_preemption_required(current, now, slice_expired || requested);
     // `tick_preemption_required` already probes runnable work for an expired
     // ordinary slice. Probe separately only for the earlier fair quantum.
     let fair_sibling = !tick_required
@@ -3063,6 +3067,7 @@ fn defer_user_resched_from_tick(task: &KernelTask, now: u64) {
         && crate::has_other_runnable_work(current);
     if deferred_user_resched_decision(started, slice, elapsed, tick_required, fair_sibling) {
         task.need_resched.store(true, Ordering::Release);
+        crate::clear_need_resched(this_cpu());
     }
 }
 
@@ -6210,6 +6215,27 @@ pub mod tests {
     /// task-local request after a core slice/budget decision or after the fair
     /// quantum with a sibling. Syscall exit then treats that bit, backpressure,
     /// and either wake-preemption result as independent reasons to cede.
+    fn smoke_kernel_tick_honors_reschedule_request() -> TestResult {
+        crate::__reset_queues_for_test();
+        let cpu = this_cpu();
+        crate::clear_budget_window(cpu);
+        crate::spawn(core::future::pending::<()>());
+        let task = KernelTask::new(core::future::pending::<()>());
+        task.set_user_preempt(true);
+        task.set_slice_cycles(u64::MAX / 2);
+        stamp_slice_start(&task, cpu);
+        crate::resched_current();
+        defer_user_resched_from_tick(&task, narf_time::now_cycles());
+        let requested = task.need_resched.load(Ordering::Acquire);
+        let consumed = !crate::need_resched_pending(cpu);
+        crate::clear_need_resched(cpu);
+        crate::__reset_queues_for_test();
+        if !requested || !consumed {
+            return TestResult::Fail("kernel-mode tick did not defer the core reschedule request");
+        }
+        TestResult::Pass
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn smoke_syscall_exit_fair_yield_policy() -> TestResult {
         use super::{
@@ -8966,6 +8992,10 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_syscall_exit_fair_yield_policy);
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_kernel_tick_honors_reschedule_request
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_syscall_exit_hint_is_one_shot);
     #[cfg(target_arch = "x86_64")]

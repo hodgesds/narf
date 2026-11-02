@@ -95,6 +95,9 @@ pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 pub fn note_urgent_wake_preempt(woken: u64);
 /// Consume one exact waiter's waker; preserve ordinary remote placement.
 pub fn wake_preempt_task(waker: core::task::Waker, expected_task: u64);
+/// Alias a native task waker with advisory blocking-I/O wake metadata.
+pub fn blocking_io_waker(waker: &core::task::Waker, expected_task: u64)
+    -> core::task::Waker;
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool);
 pub fn dbg_slot_state(task: u64)
     -> Option<(bool, u32, usize, u64, u32, bool)>;
@@ -349,6 +352,9 @@ pub trait Scheduler: Any + Send + Sync + 'static {
     fn quantum_unit(&self) -> QuantumUnit { QuantumUnit::Nanos }
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>)
         -> Option<TaskHandle>;
+    fn pick_wakeup(&self, cpu: CpuId, queue: &RunQueue<'_>)
+        -> Option<TaskHandle> { None }
+    fn on_task_runtime(&self, cpu: CpuId, runtime: TaskRuntime) { }
     fn on_install(&self) { }
     fn on_cpu_attach(&self, cpu: CpuId) { }
     fn on_cpu_detach(&self, cpu: CpuId) { }
@@ -358,6 +364,7 @@ pub trait Scheduler: Any + Send + Sync + 'static {
 }
 
 pub struct TaskMeta {
+    pub wake_reason: Option<WakeReason>,
     pub id: TaskId,
     pub work_kind: WorkKind,
     pub class: SchedClass,
@@ -372,6 +379,13 @@ pub struct TaskMeta {
 }
 
 pub enum WorkKind { UserThread, KernelThread, AsyncTask, SoftIrq, Idle }
+pub enum WakeReason { BlockingIo }
+pub enum DispatchReason { Policy, Wakeup }
+pub struct TaskRuntime {
+    pub task: TaskHandle,
+    pub cycles: u64,
+    pub reason: DispatchReason,
+}
 pub enum SchedClass { Idle, Batch, Default, Interactive, Realtime }
 pub enum QuantumUnit { Nanos, Cycles, Instructions }
 pub enum TaskEnqueueReason { Admitted, Requeued, Migrated, PolicyReplacement }
@@ -454,6 +468,32 @@ shared `Arc` reference-count write; it touches only the CPU-local policy slot
 and run queue. `pick_next` executes with both local locks held and therefore
 must not allocate, sleep, re-enter the scheduler, or acquire an IRQ-contended
 lock.
+
+`pick_wakeup` is an optional policy decision over per-task provider wake
+metadata. Its default preserves ordinary `pick_next` ordering. The core
+validates any returned handle at the highest eligibility tier and retains
+ClassScheduler's class/priority ordering. The ordinary policy request remains
+observable and supplies the fallback. Wake metadata is advisory, retained
+independently for every task until execution begins; it neither transfers a
+continuation nor changes affinity, budget authority or wake delivery.
+
+`on_task_runtime` receives the core's already-computed charged TSC cycles,
+excluding IRQ and direct-peer execution, after each poll and before the next
+selection. It runs under the CPU policy lock without a READY lock. The current
+policy receives the event even when execution began before replacement; it
+must tolerate unknown task handles and must not allocate or re-enter scheduling.
+`DispatchReason::Wakeup` means the policy granted a preferred dispatch. It is
+charged even when the wakee is first in ordinary order, so repeated
+wake/selection pairs cannot obtain unaccounted preference.
+
+ClassScheduler owns a CPU-local blocking-I/O credit policy: one fair-share
+quantum (a quarter of a default task slice) of credit, charged by actual
+preferred runtime, repaid by ordinary runtime, capped at one fair-share quantum. Overshoot remains debt. Repeated wakes and
+short polls do not refill it. The core owns wake metadata, runtime measurement,
+validation and context transfer; it does not implement this credit decision.
+Other schedulers inherit the no-preference/no-op defaults or implement their
+own behavior through the same hooks. Connected AF_UNIX stream blockers use
+the tagged waker; persistent poll/epoll observers keep their normal wakers.
 
 `on_task_queue_event` is the task-control lifecycle boundary. `Enqueued` means
 the copied task is now in that CPU policy's selectable set; `Dequeued` means it

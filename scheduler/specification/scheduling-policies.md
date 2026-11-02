@@ -26,6 +26,9 @@ The executor is deliberately factored so that **mechanism** lives in the core
 - **Policy owns** the *decisions*: which runnable slot to run next
   (`pick_next`), and whether a wake should preempt the running task
   (`wakeup_preempt`). Policies are pure readers of core-published metadata.
+  `pick_wakeup` optionally changes selection using `TaskMeta::wake_reason`.
+  `on_task_runtime` supplies charged execution for policy-private state; the
+  common clock, virtual-runtime and bandwidth accounting remain core-owned.
 
 **Rule of thumb (do not add hacks):** if a policy needs information or a
 decision point the trait does not expose, **add a method or a `TaskMeta` field
@@ -39,6 +42,8 @@ special-case in the core. The trait is the contract; grow it deliberately.
 pub trait Scheduler: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle>;
+    fn pick_wakeup(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> { None }
+    fn on_task_runtime(&self, cpu: CpuId, runtime: TaskRuntime) { }
     fn wakeup_preempt(&self, cpu: CpuId, current: &CurrentTask, queue: &RunQueue<'_>) -> bool { false }
     // lifecycle (all defaulted): on_install, on_cpu_attach, on_cpu_detach,
     //                            on_task_queue_event, on_cpu_state_change, on_uninstall
@@ -99,6 +104,19 @@ consulted once per wake at the waker's syscall-exit (the sticky per-CPU
 its cost is paid only when a wake actually happened.
 
 ### Lifecycle hooks — defaulted
+The default ClassScheduler uses per-task blocking-I/O wake metadata with a
+CPU-time credit ledger, owned by its implementation in `policy/blocking.rs`.
+It spends preferred execution, retains overshoot debt and repays it with
+ordinary execution, capped at one fair-share quantum. The core validates the preferred
+handle and reports the charged span and whether preference was granted.
+Every granted dispatch spends credit, even when already first in ordinary
+queue order. The burst cap is one fair-share quantum (a quarter of a default
+task slice). A delegating policy must
+forward runtime and lifecycle hooks along with `pick_wakeup` to preserve ClassScheduler's credit accounting.
+`pick_wakeup` preserves ordinary policy fallback, class/priority and throttle
+checks. Per-task metadata retains simultaneous wakes; no single next-buddy id
+can overwrite another receiver. Other policies retain their defaults.
+
 `on_install`/`on_uninstall`, `on_cpu_attach`/`on_cpu_detach`,
 `on_task_queue_event`, `on_cpu_state_change`. Serialized with `pick_next` on
 their CPU. Observational: must not allocate, block, or re-enter policy

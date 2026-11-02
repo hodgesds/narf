@@ -573,7 +573,12 @@ Each ring operation publishes its readiness level and activity event together,
 notifying ordinary observers once and selecting at most one exclusive waiter
 per ready direction.
 Blocking connected AF_UNIX stream calls retain non-exclusive wait semantics.
-Ordinary poll observers retain their existing delivery. Terminal close wakes
+Their native task wakers carry advisory `BlockingIo` wake metadata to the
+scheduler policy. ClassScheduler may prefer those receivers within its charged
+CPU-time credit; other policies keep their own ordering. Simultaneous wakes
+remain per-task, and cancellation cannot strand another reader by consuming
+an exclusive wake. Poll/epoll observers retain their original wakers and
+delivery. Terminal close wakes
 all waiters to observe EOF or `EPIPE`.
 State sampling and readiness publication are serialized per ring, so an older
 occupancy/close sample cannot replace a newer published level.

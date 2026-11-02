@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "e5c3b9d25e8508b336f97cf5ca3f4076ec8d6427ec96bf65af06b9bee504db7d"
+prompt_hash = "d2aecedd6fab203ceee2504006b71d7b678527dc3d441a730886e1a83c8377d0"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -2105,3 +2105,15 @@ argument = "The UNIX-socket latency fix moves existing target-CPU wake-inbox act
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Pending wake activation runs on the owning CPU before policy and READY locks are acquired, through the existing drain that validates the parked owner token and task id, excludes directly claimed continuations, and pairs policy queue notifications. Policy selection still enforces class, priority, affinity and periodic-budget eligibility. The initial round length bounds dispatch attempts. Core charge/debt accounting and task address-space, TLS, FP/SIMD and saved PKRS/TCF transitions are unchanged. The empty-inbox guard uses the existing acquire publication check; a racing wake retains its inbox reference and is serviced at the next boundary or idle check."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "UNIX wake preference stays inside the existing scheduler TCB. The core exposes advisory per-task wake reason and charged-runtime events through defaulted Scheduler hooks; ClassScheduler owns the bounded CPU-credit decision. The core still validates returned handles, eligibility and native class/priority ordering. No task domain, mapping, capability, counter reservation or raw continuation is exposed by the new interface. Other policies retain their own pick_next ordering and default wake behavior."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The blocking-I/O waker aliases a WakeCell only after checking the native vtable and task id while the input waker pins the Arc. Each clone owns one strong reference; by-reference wakes drop no allocation, and owned wake/drop consume one reference. It uses the ordinary durable wake/placement path and preserves non-exclusive socket waiter delivery, cancellation, close wake-all and observer wakers. Wake metadata is independently stored per task and cleared at execution entry, including direct claims; its CPU-local possible flag is conservative and grants no eligibility. Class credit is charged from core-computed elapsed execution, keeps overshoot as debt, caps repayment, and is not replenished by wake count. Core bandwidth accounting remains authoritative."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Kernel-mode timer handling propagates an existing core reschedule request into the current own-stack user's sticky syscall-exit bit, consuming the core request after publication. It does not switch from an unaudited kernel frame. Existing no_preempt, preempt-disable, frame bounds, address-space, TLS, FPU/SIMD and saved PKRS/TCF switch paths remain in force. Runtime events use copied handles and an already-computed cycle span under the current CPU policy lock without a READY lock; callbacks must tolerate policy replacement and may not allocate or re-enter scheduling."
