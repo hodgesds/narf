@@ -2217,10 +2217,10 @@ describe the remaining native paths.
   Compilation/native acceptance is pending for that slice. The applicable
   Gen2/API77 MVM adapter is still required, so the literal family row stays
   open; P2P GO/discovery remains separately open.
-- **p2p.** §§3.73–3.74 implement a bounded actual control-device discovery
-  and unprotected management exchange for Sc/Bz and API89. The API77 SESSION1
-  adapter, CLIENT/GO native peer/key/data roles, NoA and public CTWindow/OPPPS
-  remain open; this device-only continuation does not close the family row.
+- **p2p.** §§3.73–3.75 implement a bounded actual control-device discovery
+  and unprotected management exchange for Sc/Bz/API89/API77. CLIENT/GO native
+  peer/key/data roles, NoA and public CTWindow/OPPPS remain open; this
+  device-only continuation does not close the family row.
 - **wow.** There is no D3 firmware image, `D3_CONFIG_CMD` or WoWLAN key
   material path, although the shared `wowlan_support` exists.
 - **ml_baid** is implemented for source-advertised API77
@@ -4545,9 +4545,10 @@ ROC, filtered management copies, real ACK/failure, terminal STOP/DEL, missing
 START despite ACK, dropped waiters, wrong raw bands/links, reentrant source
 retirement, protected-frame rejection, original parent-role exclusion and
 host NO_IR. This bounded source remains pending coordinated release checking,
-native execution and review. API77/API89 SESSION adapters, CLIENT/GO native
-peer/key/data owners, NoA, CTWindow/OPPPS and remaining whole-family P2P scope
-are still open; this continuation does not close the literal P2P row.
+native execution and review. §§3.74–3.75 supply the disjoint API89/API77
+SESSION adapters. CLIENT/GO native peer/key/data owners, NoA, CTWindow/OPPPS
+and remaining whole-family scope are still open; this continuation does not
+close the literal P2P row.
 
 ### 3.74 API89 P2P SESSION2 physical adapter
 
@@ -4556,7 +4557,8 @@ actual DEVICE10 child, retained physical worker and callback-free request/copy
 fences from §3.73. Admission selects the loaded MAC2/LINK2/PHY4/RLC2/TX10,
 SESSION2/notification3 and capability54 contracts, factual station/link counts
 and actual API59 band-in-RFH support. API89 ROCv3 is Linux's hotspot path; it
-is never substituted for a P2P AUX grant. API77 SESSION1 remains unavailable.
+is never substituted for a P2P AUX grant. The disjoint API77 SESSION1 adapter
+is described in §3.75; CLIENT/GO and their power-save scope remain open.
 
 START creates actual MAC1/type6 and inactive FW-link1. Before each SESSION2
 ADD, current raw NVM/MCC/host ACTIVE permission, platform SAR and the actual
@@ -4594,5 +4596,78 @@ native TX, explicit STOP and natural END followed by fresh grant reuse. Held
 PHY/RLC/LINK/SESSION receipts cover original source loss and waiter cancellation
 without READY, data publication or copied-event transfer. This continuation
 remains pending coordinated release compilation, native execution and review.
-CLIENT/GO, NoA, CTWindow/OPPPS and API77 are separate unfinished native scope;
-the literal P2P row remains open.
+§3.75 supplies the separate API77 adapter. CLIENT/GO, NoA and CTWindow/OPPPS
+remain unfinished native scope; the literal P2P row remains open.
+
+### 3.75 API77 P2P SESSION1 original-device continuation
+
+The API77 continuation parents the common actual DEVICE10 child from the
+original `MvmDevice`. Physical publication retains its actual registration
+Grant and returned parent Write receipt before any arbitrary callback. A
+private concrete parent enum dispatches only to admitted Device/MvmDevice
+owners; no proxy netdev, invented IFINDEX/UP state, extra grant or unknown
+provider is introduced. Original parent/admin/daemon/socket/child capabilities
+and exact registration/role epochs remain independently current. The full
+P2P row stays open for CLIENT/GO, NoA, CTWindow and OPPPS.
+
+Admission retains actual capability54, MAC1/LINK1/SESSION1/notification2,
+legacy PHY1-or2/ADD_STA12/REMOVE_STA2/TX9/RX4/TVQM3/flush2 and sync1 facts,
+factual station/link counts and the original correlated NVM RX/TX antenna
+masks. Original station0/MAC0/FW-link0/PHY0 remain reserved. A separate PHY1
+uses the actual capability48 channel-field extent and applicable per-PHY
+RLC2; firmware-offloaded RLC is not synthesized. Inactive LINK1 binding and
+ACTIVE/rates receipts precede the actual legacy BCAST_MGMT ADD_STA and TID16
+queue. ADD_STA v12's `mac_id_n_color` remains MAC1/color0 for BCAST_MGMT; only
+AUX_ACTIVITY has Linux's LMAC overload. The station is the last factual slot,
+with all-FF address and no invented legacy station MFP flag.
+
+SESSION1 explicitly selects MAC1, independently of its separate FW-link1
+binding. Qu48/API4's raw band and low MAC nibble must match that physical
+owner before management delivery; neither becomes an MLD FW-link or AP
+spec-link identity. Native START alone opens the finite grant. Native
+END/failure or explicit original MAC/config REMOVE closes it, followed by
+all-owned RFH EMPTY/sync1 prefix retirement, actual station flush and exact
+TVQM/BCAST removal, then LINK inactive/unbound, PHY1 removal and final
+LINK1/MAC1 removal. Ordinary ownerless Qu station/BAID synchronization keeps
+its refusal; only the retained closing SESSION1 adapter may retire its own
+physical prefix after emitting authority dies.
+
+`gen2_p2p_transmit_power_request(own, frequency_mhz)` returns the exact native
+radio/platform, proposed control MAC and legacy20 channel binding for the
+separate NIPW tag8 program. The base hash retains actual PCI/subsystem/RF,
+NVM antennas, firmware and SMBIOS identity; the child MAC and channel further
+bind that hash and asset name. Tag1 station, tag6 scan and tag7 AP records
+cannot authorize DEVICE emission. The existing signed record supplies actual
+per-chain limits, conducted ceiling and antenna gain. Current raw NVM/MCC
+VALID/ACTIVE/20MHz/non-radar facts and host initiation/power policy remain
+independent. NonLAR additionally retains Linux's IBSS-to-NO_IR mapping; a
+correlated LAR MCC does not invent an IBSS requirement. Actual acknowledged
+SET_CHAINS then SET_DEVICE v5 precede PHY/session emission. The signed record
+and current host ceiling stay bound at every native send/credit boundary.
+
+Power loading and full source/socket callbacks run outside both State and
+the native Work slot. The retained native future reconstructs the exact
+original child/channel binding after the load; an expired endpoint is never
+recaptured as a fresh source. Private parent dispatch boxes each native
+future in a separate constructor so the control worker retains only its
+owned future pointer and original proof. Normal station/AP/scan work cannot
+share the active physical DEVICE owner. Native Source/FRAME publication
+uses the bounded completed-RX-prefix fence from §3.73 on every adapter.
+
+System suspend requests retained child retirement before transport stop. It
+retires the old private role lifetime, wakes/drives an in-flight wait, and
+keeps non-emitting STOP/reset work with the physical worker after a borrowed
+PM future is dropped. A fresh private role lifetime appears only after
+terminal native retirement; old filter requests and copied publications
+remain retired. Original socket/admin/capability proofs are still required
+for another START. Ambiguous native ownership retains DMA and denies reuse.
+
+Two additional unexecuted native registrations use the actual API77 physical
+publication and control WDEV: source-qualified MAC/PHY/LINK/BCAST/TID16 and
+SESSION1 receipts, Qu48 raw-MAC rejection, real TX9/OFDM6 status, actual
+parent-AP exclusion, terminal STOP/DEL and suspend closure. A held actual
+SET_DEVICE receipt plus original source loss and a dropped ROC waiter cannot
+produce SESSION, TX, READY or management delivery. RAM fixtures author native
+identity/SMBIOS through the existing parsers, create no physical qualification
+and retain uncertain model ownership on failure. This continuation is
+pending coordinated release compilation, native execution and review.

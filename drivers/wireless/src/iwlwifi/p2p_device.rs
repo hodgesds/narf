@@ -5,9 +5,9 @@ use alloc::string::String;
 use core::num::NonZeroU64;
 use narf_wireless::ap_control::RadioControlRetirement;
 
-pub(in crate::iwlwifi::device) struct Child {
+pub(in crate::iwlwifi) struct Child {
     me: Weak<Self>,
-    parent: Arc<Device>,
+    parent: Parent,
     name: String,
     own: [u8; 6],
     namespace: u64,
@@ -17,6 +17,7 @@ pub(in crate::iwlwifi::device) struct Child {
     metadata: IrqSafeSpinLock<Option<Metadata>>,
     released: AtomicBool,
     engaged: AtomicBool,
+    stop_requested: AtomicBool,
     work: Mutex<Option<Work>>,
     finished: IrqSafeSpinLock<Vec<Finished>>,
     filters: IrqSafeSpinLock<Vec<Arc<Filter>>>,
@@ -65,8 +66,8 @@ impl core::fmt::Debug for Child {
     }
 }
 impl Child {
-    pub(super) fn create(
-        parent: Arc<Device>,
+    pub(in crate::iwlwifi) fn create(
+        parent: Parent,
         authority: &RadioControlAuthority,
         registration: Registration,
         name: &str,
@@ -85,6 +86,7 @@ impl Child {
             metadata: IrqSafeSpinLock::new(None),
             released: AtomicBool::new(false),
             engaged: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
             work: Mutex::new(None),
             finished: IrqSafeSpinLock::new(Vec::new()),
             filters: IrqSafeSpinLock::new(Vec::new()),
@@ -95,7 +97,6 @@ impl Child {
         // a typed child. Neither a registry/name lookup nor source callback
         // may manufacture or replace either capability.
         let cap = parent
-            .source
             .invoke(|| {
                 narf_net::registry()
                     .register_control_child(
@@ -106,7 +107,7 @@ impl Child {
                     .map_err(|_| "Intel P2P original parent registration retired")
             })
             .map_err(|_| WirelessError::Denied)?;
-        let physical: Arc<dyn WirelessNetIface> = parent.clone();
+        let physical = parent.iface();
         let iface: Arc<dyn WirelessNetIface> = child.clone();
         let wdev = match narf_wireless::registry::register_control(&physical, iface.clone()) {
             Ok(wdev) => wdev,
@@ -119,7 +120,7 @@ impl Child {
         // This can call the actual creating socket. All native State/work
         // guards are absent, and callbacks cannot create a START/RF owner.
         if authority.retain_control_child(&iface, &cap).is_err()
-            || authority.check_for(parent.as_ref()).is_err()
+            || authority.check_for(parent.iface_ref()).is_err()
             || !wdev.current_for(child.as_ref())
             || child.released.load(Ordering::Acquire)
         {
@@ -138,10 +139,14 @@ impl Child {
     }
     pub(super) fn active(&self) -> bool {
         self.engaged.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
             || self.work.try_lock().is_none_or(|work| work.is_some())
     }
     fn request(&self, authority: &RadioControlAuthority) -> Result<Arc<Request>, WirelessError> {
-        if !authority.has_reservation() || !self.parent.p2p_source_current() {
+        if self.stop_requested.load(Ordering::Acquire)
+            || !authority.has_reservation()
+            || !self.parent.p2p_source_current()
+        {
             return Err(WirelessError::Denied);
         }
         authority.check_for(self)?;
@@ -155,7 +160,7 @@ impl Child {
             self.registration,
             self.generation.clone(),
             role,
-            self.parent.p2p.waker(),
+            self.parent.waker(),
         )
         .map_err(|_| WirelessError::Denied)?;
         if !request.watch() {
@@ -169,6 +174,7 @@ impl Child {
         authority: Option<RadioControlAuthority>,
         request: Option<Arc<Request>>,
         reply: Option<Arc<IrqSafeSpinLock<Reply>>>,
+        power: Option<PowerSource>,
     ) -> Result<(), WirelessError> {
         let mut slot = self.work.try_lock().ok_or(WirelessError::Busy)?;
         if slot.is_some() {
@@ -197,6 +203,7 @@ impl Child {
                         frequency,
                         duration,
                         RocActivity::Discover,
+                        power,
                     )
                     .await
                 {
@@ -213,7 +220,7 @@ impl Child {
                 },
                 Operation::Frame(cookie, frame) => match child
                     .parent
-                    .p2p_frame_request(request.as_ref().unwrap().clone(), cookie, frame)
+                    .p2p_frame_request(request.as_ref().unwrap().clone(), cookie, frame, power)
                     .await
                 {
                     Ok((acked, events)) => (Ok(acked), events),
@@ -224,13 +231,7 @@ impl Child {
                     Err(error) => (Err(error), Vec::new()),
                 },
             };
-            let (engaged, retired) = {
-                let mut state = child.parent.state.lock().await;
-                (
-                    state.hardware.p2p_started(),
-                    state.hardware.p2p_take_retired(),
-                )
-            };
+            let (engaged, retired) = child.parent.finished().await;
             child.engaged.store(engaged, Ordering::Release);
             child.finished.lock().push(Finished {
                 authority,
@@ -242,7 +243,7 @@ impl Child {
             });
         }));
         drop(slot);
-        self.parent.p2p.waker().wake();
+        self.parent.waker().wake();
         Ok(())
     }
     /// One retained physical worker drives every command/retirement, including
@@ -251,9 +252,30 @@ impl Child {
     pub(super) fn step(self: &Arc<Self>, cx: &mut Context<'_>) -> bool {
         let _ = super::super::super::progress::poll_work(&self.work, cx);
         self.complete();
+        if self.stop_requested.load(Ordering::Acquire) {
+            let idle = self.work.try_lock().is_some_and(|slot| slot.is_none());
+            if idle && !self.engaged.load(Ordering::Acquire) {
+                // Only completed native retirement/reset permits a fresh
+                // local role lifetime. This grants no socket/admin/child
+                // authority; all old requests and filters stay retired.
+                *self.role.lock() = narf_net::native_emission::ProviderLifetime::new();
+                self.stop_requested.store(false, Ordering::Release);
+            } else if idle
+                && !self.parent.quarantined()
+                && self
+                    .enqueue(Operation::Stop, None, None, None, None)
+                    .is_ok()
+            {
+                let _ = super::super::super::progress::poll_work(&self.work, cx);
+                self.complete();
+            }
+            return self.active();
+        }
         if self.engaged.load(Ordering::Acquire)
-            && !self.parent.quarantined.load(Ordering::Acquire)
-            && self.enqueue(Operation::Service, None, None, None).is_ok()
+            && !self.parent.quarantined()
+            && self
+                .enqueue(Operation::Service, None, None, None, None)
+                .is_ok()
         {
             // Ordinary receive/service leaves the request slot empty. Only
             // an actual awaited cleanup may occupy it, so public controls
@@ -262,6 +284,30 @@ impl Child {
             self.complete();
         }
         self.active()
+    }
+    pub(in crate::iwlwifi) async fn stop_retained(self: &Arc<Self>) -> Result<(), WirelessError> {
+        if !self.active() {
+            return Ok(());
+        }
+        if !self.stop_requested.swap(true, Ordering::AcqRel) {
+            let retired = { self.role.lock().retire() };
+            retired.notify();
+        }
+        poll_fn(|cx| {
+            self.parent.poll_control(cx);
+            self.step(cx);
+            if !self.active() {
+                Poll::Ready(Ok(()))
+            } else if self.parent.quarantined()
+                && self.work.try_lock().is_some_and(|slot| slot.is_none())
+            {
+                Poll::Ready(Err(WirelessError::HardwareError))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await
     }
     fn complete(&self) {
         let completed = { core::mem::take(&mut *self.finished.lock()) };
@@ -323,16 +369,37 @@ impl Child {
             waker: None,
         }));
         let child = self.me.upgrade().ok_or(WirelessError::Denied)?;
+        // A concrete API77 power loader can call arbitrary platform code.
+        // Prepare only metadata/asset outside BOTH State and the Work slot;
+        // the retained native future reconstructs the exact binding later.
+        let power = match &operation {
+            Operation::Roc(_, frequency, _) => {
+                self.parent
+                    .prepare_power(original.as_ref().unwrap().clone(), *frequency, false)
+                    .await?
+            }
+            Operation::Frame(_, frame) => {
+                self.parent
+                    .prepare_power(
+                        original.as_ref().unwrap().clone(),
+                        frame.frequency_mhz,
+                        true,
+                    )
+                    .await?
+            }
+            _ => None,
+        };
         child.enqueue(
             operation,
             Some(authority.clone()),
             request,
             Some(reply.clone()),
+            power,
         )?;
         let result = poll_fn(|cx| {
             // Service the root's existing native slot first: a station/AP
             // command already holding State must be allowed to finish.
-            let _ = self.parent.poll_control(cx);
+            self.parent.poll_control(cx);
             child.step(cx);
             let mut reply = reply.lock();
             if let Some(result) = reply.result.take() {
@@ -417,7 +484,7 @@ impl Child {
             if !self.parent.p2p_event_current(&event) || receiver.check().is_err() {
                 continue;
             }
-            let _ = self.parent.source.invoke(|| {
+            let _ = self.parent.invoke(|| {
                 if let Some(policy) = &event.policy {
                     policy.check()?
                 }
@@ -465,7 +532,7 @@ impl Interface for Child {
 #[async_trait::async_trait]
 impl WirelessNetIface for Child {
     fn wiphy_id(&self) -> u64 {
-        self.parent.wiphy_id()
+        self.parent.iface_ref().wiphy_id()
     }
     fn current_iftype(&self) -> u32 {
         10
@@ -481,7 +548,7 @@ impl WirelessNetIface for Child {
         &self,
     ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
     {
-        self.parent.radio_control.try_reserve().map(Some)
+        self.parent.reserve().map(Some)
     }
     fn async_control_interfaces(&self) -> bool {
         true
@@ -615,7 +682,7 @@ impl WirelessNetIface for Child {
         retired.notify();
     }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
-        let mut info = self.parent.get_wireless_info();
+        let mut info = self.parent.iface_ref().get_wireless_info();
         info.base_name = self.name.clone();
         info.base_mac = self.own;
         info.modes = narf_wireless::iface::WirelessModes::P2P;

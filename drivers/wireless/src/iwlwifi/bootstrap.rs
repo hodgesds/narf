@@ -504,6 +504,25 @@ pub async fn gen2_ap_transmit_power_request(
         .ok_or("native Intel binding is not Gen2")?;
     device.ap_power_request().await
 }
+/// Exact native radio/platform, proposed control MAC and channel binding
+/// for tag8. This returns metadata and grants no child, RF or measurement.
+pub async fn gen2_p2p_transmit_power_request(
+    own: [u8; 6],
+    frequency_mhz: u32,
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.p2p_power_request(own, frequency_mhz).await
+}
 /// Metadata for the distinct legacy-management + WMM/HT20/SISO emitting
 /// program. The returned binding and filename do not supply measured limits.
 pub async fn gen2_ht20_transmit_power_request(

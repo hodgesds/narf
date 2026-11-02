@@ -43,6 +43,7 @@ struct Environment {
     power: Power,
     scan_power: ScanPower,
     ap_power: ApPower,
+    p2p_power: ApPower,
     ap_policy: super::mld_policy::Source,
 }
 impl Environment {
@@ -60,6 +61,13 @@ impl Environment {
                     .ok_or("MVM AP power loader authority unavailable")?;
                 crate::firmware_asset::load(&authority, &request.name, 64, true)
                     .map_err(|_| "MVM signed AP tag7 program unavailable")
+            }),
+            p2p_power: Arc::new(|request| {
+                let authority = narf_firmware::trusted_loader_authority()
+                    .and_then(|cap| cap.derive().ok())
+                    .ok_or("MVM P2P power loader authority unavailable")?;
+                crate::firmware_asset::load(&authority, &request.name, 64, true)
+                    .map_err(|_| "MVM original signed P2P tag8 program unavailable")
             }),
             scan_power: Arc::new(|owner, channels| {
                 let request = owner.scan_power_request(channels)?;
@@ -163,6 +171,8 @@ pub(super) struct Device {
     mode: AtomicU32,
     mode_generation: AtomicU64,
     ap_capable: bool,
+    p2p_capable: bool,
+    p2p: super::device::p2p::Host,
     ap_host: super::ap_host::Host,
     ap_stopped: AtomicBool,
     ap_cleanup: AtomicBool,
@@ -321,6 +331,7 @@ impl Device {
         let he = owner.supports_native_he_contract();
         let schedule_profiles = owner.scheduled_profile()?.0 as u8;
         let ap_capable = owner.ap_capable();
+        let p2p_capable = owner.p2p_capable();
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
         Ok(Arc::new_cyclic(|me| Self {
@@ -341,6 +352,8 @@ impl Device {
             mode: AtomicU32::new(2),
             mode_generation: AtomicU64::new(1),
             ap_capable,
+            p2p_capable,
+            p2p: super::device::p2p::Host::new(),
             ap_host: super::ap_host::Host::new(),
             ap_stopped: AtomicBool::new(true),
             ap_cleanup: AtomicBool::new(false),
@@ -453,6 +466,9 @@ impl Device {
         })
     }
     fn begin(&self, operation: Operation) -> Result<Reply, &'static str> {
+        if self.p2p.active() && !matches!(operation, Operation::Recover) {
+            return Err("MVM control busy");
+        }
         if self.current_iftype() == 3
             && !matches!(
                 operation,
@@ -680,6 +696,10 @@ impl Device {
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.p2p
+            .stop_retained()
+            .await
+            .map_err(|_| "MVM suspend could not retire P2P native owner")?;
         if !self.terminal.load(Ordering::Acquire) {
             WirelessNetIface::disassociate(self)
                 .await
@@ -930,8 +950,15 @@ impl Device {
         if self.current_iftype() == 3 {
             return self.ap_step(cx);
         }
+        let mut cx = cx;
         let mut fallback = Context::from_waker(Waker::noop());
-        if progress::poll_work(&self.control, cx.unwrap_or(&mut fallback)).is_pending() {
+        let root_pending =
+            progress::poll_work(&self.control, cx.as_deref_mut().unwrap_or(&mut fallback))
+                .is_pending();
+        // Either retained owner can hold State while the other awaits it.
+        // Both must progress before any early return or ordinary idle RX.
+        let p2p_busy = self.p2p.step(cx);
+        if root_pending || p2p_busy {
             return Vec::new();
         }
         if self.terminal.load(Ordering::Acquire) {
@@ -1168,10 +1195,10 @@ impl Device {
         let (rxp, rxc) = narf_ipc::channel::<Frame, RX_RING_N>();
         let (txp, txc) = narf_ipc::channel::<Frame, TX_RING_N>();
         self.source.invoke(|| {
-            narf_net::registry()
+            let original = narf_net::registry()
                 .register(authority, Registered(self.clone()))
-                .map(|_| ())
                 .map_err(|_| "MVM net capability registration failed")?;
+            self.p2p.registered(*authority, original);
             state.receive = Some(rxp);
             state.transmit = Some(txc);
             *self.rx.lock() = Some(rxc);
@@ -1208,7 +1235,11 @@ impl Device {
         loop {
             let mut activity = super::iwl_msix::Activity::new(
                 self.irq,
-                if self.current_iftype() == 3 { 1 } else { 20 },
+                if self.current_iftype() == 3 || self.p2p.active() {
+                    1
+                } else {
+                    20
+                },
             );
             let frames = poll_fn(|cx| {
                 let frames = self.step(Some(cx));
@@ -1258,6 +1289,24 @@ fn error(error: &'static str) -> WirelessError {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn supports_virtual_interfaces(&self) -> bool {
+        self.p2p_capable
+    }
+    fn async_control_interfaces(&self) -> bool {
+        self.p2p_capable
+    }
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        alloc::vec![10]
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        mode: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        self.new_p2p_control(authority, name, mode, mac).await
+    }
     fn current_iftype(&self) -> u32 {
         self.mode.load(Ordering::Acquire)
     }
@@ -1528,10 +1577,14 @@ impl WirelessNetIface for Device {
                         .collect(),
                 })
                 .collect(),
-            modes: if self.ap_capable {
+            modes: (if self.ap_capable {
                 WirelessModes::STATION | WirelessModes::AP
             } else {
                 WirelessModes::STATION
+            }) | if self.p2p_capable {
+                WirelessModes::P2P
+            } else {
+                WirelessModes::empty()
             },
             hw_caps: HwCaps {
                 ht_supported: self.current_iftype() != 3 && self.ht20,
@@ -1650,6 +1703,9 @@ impl WirelessNetIface for Device {
         self.wait(reply).await.map_err(error).map(|_| ())
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        if self.p2p.active() {
+            return Err(WirelessError::Busy);
+        }
         if self.current_iftype() == 3 {
             return self
                 .stop_ap_retained()
@@ -1765,3 +1821,5 @@ mod scheduled;
 
 #[path = "mvm_ap_device.rs"]
 mod ap;
+#[path = "mvm_p2p_device.rs"]
+mod p2p;

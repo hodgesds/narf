@@ -1,6 +1,6 @@
 //! Concrete Sc/Bz physical-State adapter. No provider/interface callback may
 //! run while State is held. The child retains public work independently.
-use super::super::p2p_host::Registration;
+use super::super::p2p_host::{PowerSource, Registration};
 use super::super::{
     native_band::Channel,
     p2p_host::Request,
@@ -13,11 +13,14 @@ use narf_wireless::ap_control::RadioControlAuthority;
 
 #[path = "p2p_device.rs"]
 mod child;
-pub(super) use child::Child;
+#[path = "p2p_parent_kind.rs"]
+mod kind;
+pub(in crate::iwlwifi) use child::Child;
+pub(in crate::iwlwifi) use kind::Parent;
 
 /// Only successful physical registry publication may fill this cell. It
 /// retains the actual grant and returned Write receipt, never a name lookup.
-pub(super) struct Host {
+pub(in crate::iwlwifi) struct Host {
     registration: IrqSafeSpinLock<Option<Registration>>,
     child: IrqSafeSpinLock<Weak<Child>>,
     signal: Arc<Signal>,
@@ -35,32 +38,45 @@ impl alloc::task::Wake for Signal {
     }
 }
 impl Host {
-    pub(super) fn new() -> Self {
+    pub(in crate::iwlwifi) fn new() -> Self {
         Self {
             registration: IrqSafeSpinLock::new(None),
             child: IrqSafeSpinLock::new(Weak::new()),
             signal: Arc::new(Signal(IrqSafeSpinLock::new(None))),
         }
     }
-    pub(super) fn registered(
+    pub(in crate::iwlwifi) fn registered(
         &self,
         grant: Cap<narf_net::NetIface, RegisterGrant>,
         parent: Cap<narf_net::NetIface, Write>,
     ) {
         *self.registration.lock() = Some(Registration { grant, parent });
     }
-    fn child(&self) -> Option<Arc<Child>> {
+    pub(in crate::iwlwifi) fn registration(&self) -> Option<Registration> {
+        *self.registration.lock()
+    }
+    pub(in crate::iwlwifi) fn attach(&self, child: &Arc<Child>) {
+        *self.child.lock() = Arc::downgrade(child);
+    }
+    pub(in crate::iwlwifi) fn child(&self) -> Option<Arc<Child>> {
         self.child.lock().upgrade()
     }
-    fn waker(&self) -> Waker {
+    pub(in crate::iwlwifi) fn waker(&self) -> Waker {
         // Every request watches the same retained physical owner, rather
         // than consuming an unbounded provider slot for each netlink task.
         Waker::from(self.signal.clone())
     }
-    pub(super) fn active(&self) -> bool {
+    pub(in crate::iwlwifi) fn active(&self) -> bool {
         self.child().is_some_and(|child| child.active())
     }
-    pub(super) fn step(&self, cx: Option<&mut Context<'_>>) -> bool {
+    pub(in crate::iwlwifi) async fn stop_retained(&self) -> Result<(), WirelessError> {
+        if let Some(child) = self.child() {
+            child.stop_retained().await
+        } else {
+            Ok(())
+        }
+    }
+    pub(in crate::iwlwifi) fn step(&self, cx: Option<&mut Context<'_>>) -> bool {
         let mut fallback = Context::from_waker(Waker::noop());
         if let Some(cx) = cx.as_ref() {
             let old = self.signal.0.lock().replace(cx.waker().clone());
@@ -133,7 +149,14 @@ impl Device {
         let namespace = narf_net::iface::lookup(self.name())
             .map(|metadata| metadata.net_ns_id)
             .ok_or(WirelessError::Denied)?;
-        let child = Child::create(parent, authority, registration, name, own, namespace)?;
+        let child = Child::create(
+            Parent::Mld(parent),
+            authority,
+            registration,
+            name,
+            own,
+            namespace,
+        )?;
         *self.p2p.child.lock() = Arc::downgrade(&child);
         Ok(child)
     }
@@ -255,6 +278,7 @@ impl Device {
                 channel,
                 &self.channels,
                 self.rx_chains,
+                None,
                 cookie,
                 duration,
                 activity,
@@ -349,6 +373,7 @@ impl Device {
                     channel,
                     &self.channels,
                     self.rx_chains,
+                    None,
                     cookie,
                     frame.duration,
                     RocActivity::Negotiate,

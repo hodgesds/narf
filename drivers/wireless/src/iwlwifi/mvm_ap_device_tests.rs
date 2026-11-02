@@ -570,9 +570,9 @@ fn station(authorized: bool, secure: bool) -> narf_wireless::StationConfig {
 }
 // Parse explicit firmware structures through the real SMBIOS parser. Physical
 // owners are excluded by check(); restore boot tables after this RAM owner dies.
-struct Platform;
+pub(super) struct Platform;
 impl Platform {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut b = vec![0; 18];
         b[1] = 18;
         b[4] = 1;

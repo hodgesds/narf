@@ -41,6 +41,9 @@ pub(in crate::iwlwifi) enum Emission {
     /// up to8 external clients, four ACs and separately admitted SME/key TX.
     /// An existing station/active-scan program never qualifies this role.
     ApLegacy,
+    /// Separate DEVICE discovery/negotiation: MAC1/PHY1/BCAST/TID16 and
+    /// finite SESSION1, legacy20/no-CCK management, global SAR/device limit.
+    P2pDevice,
 }
 
 /// Emitting-feature bits of a tag5 program.
@@ -100,12 +103,17 @@ impl Emission {
             Emission::Features(_) => 5,
             Emission::ActiveScan => 6,
             Emission::ApLegacy => 7,
+            Emission::P2pDevice => 8,
         }
     }
     /// Feature bits granted by this program (tag3/4 imply their BA bits).
     pub(in crate::iwlwifi) fn features(self) -> u16 {
         match self {
-            Emission::Legacy | Emission::Ht20 | Emission::ActiveScan | Emission::ApLegacy => 0,
+            Emission::Legacy
+            | Emission::Ht20
+            | Emission::ActiveScan
+            | Emission::ApLegacy
+            | Emission::P2pDevice => 0,
             Emission::Ht20Ba => feature::BA,
             Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
             Emission::Features(bits) => bits,
@@ -261,6 +269,7 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
         Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
         Emission::ActiveScan => "mvm-api77-active-scan-power-v6",
         Emission::ApLegacy => "mvm-api77-legacy20-ap-power-v7",
+        Emission::P2pDevice => "mvm-api77-p2p-device-power-v8",
         Emission::Features(bits) => {
             features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
             &features
@@ -657,6 +666,9 @@ impl Owner {
             }
             Emission::ApLegacy => {
                 &b"NARF Intel MVM API77 qualified legacy20 AP beacon-TIM two-internal eight-client four-AC SME-CCMP-PMF source-fenced program power v7"[..]
+            }
+            Emission::P2pDevice => {
+                &b"NARF Intel MVM API77 qualified P2P DEVICE MAC1 PHY1 BCAST TID16 SESSION1 legacy20 OFDM6 management SET_CHAINS SET_DEVICE power v8"[..]
             }
         });
         if let Emission::Features(bits) = emission {

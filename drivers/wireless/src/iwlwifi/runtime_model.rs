@@ -398,6 +398,7 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.ap_owner);
         core::ptr::drop_in_place(&mut hardware.ap_request);
         core::ptr::drop_in_place(&mut hardware.ap_gen2);
+        core::ptr::drop_in_place(&mut hardware.p2p);
     };
 }
 

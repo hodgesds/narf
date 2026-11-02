@@ -13,6 +13,7 @@ use narf_wireless::{
     ap_control::{RadioControlAuthority, RadioEmissionAuthority, RadioEventAuthority},
     WirelessNetIface,
 };
+pub(super) type PowerSource = (crate::firmware_asset::Asset, [u8; 32]);
 
 /// Original successful physical publication receipts. Re-invocation adds
 /// current registrar/parent authority to the independent original child

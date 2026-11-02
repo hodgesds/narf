@@ -12,6 +12,8 @@ mod active_scan_tests;
 mod ap_tests;
 #[path = "mvm_he_tests.rs"]
 mod he_tests;
+#[path = "mvm_p2p_device_tests.rs"]
+mod p2p_tests;
 #[path = "mvm_rx_multi_tests.rs"]
 mod rx_multi_tests;
 #[path = "mvm_scheduled_tests.rs"]
@@ -149,6 +151,7 @@ fn ht_ies() -> Vec<u8> {
 }
 struct Actor {
     native_ap: Option<Box<ap_tests::Model>>,
+    native_p2p: Option<Box<p2p_tests::Model>>,
     pno: Option<Box<scheduled_tests::Model>>,
     multi_receive: bool,
     rx_configuration: Vec<rx_multi_tests::Receipt>,
@@ -399,6 +402,12 @@ impl Actor {
             let s = u16::from_le_bytes([p.bytes[2], p.bytes[3]]);
             let b = &p.bytes[8..];
             self.commands.push((g, c, b.to_vec()));
+            if let Some(p2p) = &mut self.native_p2p {
+                if let Some(body) = p2p.command(g, c, b, &mut self.firmware)? {
+                    self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
+                    return Ok(());
+                }
+            }
             if let Some(ap) = &mut self.native_ap {
                 if let Some(body) = ap.command(g, c, b)? {
                     if (g, c) == (5, 2) {
@@ -460,7 +469,7 @@ impl Actor {
                         return Err("MVM configure NVM body");
                     }
                     let mut nvm = nvm();
-                    if self.native_ap.is_some() {
+                    if self.native_ap.is_some() || self.native_p2p.is_some() {
                         nvm[20] = 1; // actual NVM LAR, not an AP-role boolean
                     }
                     if self.ht {
@@ -833,6 +842,9 @@ impl Actor {
         }
         if let Some(ap) = &mut self.native_ap {
             return ap.transmit(&p, &mut self.firmware);
+        }
+        if let Some(p2p) = &mut self.native_p2p {
+            return p2p.transmit(&p, &mut self.firmware);
         }
         if !(matches!(p.queue, 23 | 24) || self.qos_tids && (25..32).contains(&p.queue))
             || p.bytes.len() < 48
@@ -1271,8 +1283,11 @@ impl Harness {
                 entry[2] = tlc_version;
             }
         }
-        if emission == 7 {
+        if matches!(emission, 7 | 8) {
             ap_tests::profile(&mut image, &mut versions)?;
+        }
+        if emission == 8 {
+            p2p_tests::profile(&mut image, &mut versions)?;
         }
         tlv(&mut image, 48, &versions);
         if let Some(model) = &pno {
@@ -1292,7 +1307,7 @@ impl Harness {
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
-        if emission == 7 {
+        if matches!(emission, 7 | 8) {
             model::native_station_identity(&mut hardware, 0xa0f0, 0x351, 0x10c000)?;
         }
         model::firmware_profile(&mut hardware, &parsed)?;
@@ -1301,6 +1316,7 @@ impl Harness {
         security.ap = ap(protected)?;
         let mut actor = Actor {
             native_ap: (emission == 7).then(|| Box::new(ap_tests::Model::new())),
+            native_p2p: (emission == 8).then(|| Box::new(p2p_tests::Model::new())),
             pno: pno.map(Box::new),
             multi_receive,
             rx_configuration: Vec::new(),
@@ -1399,6 +1415,16 @@ impl Harness {
         let ap_cap = ap_power.clone();
         let ap_staged = available.clone();
         let environment = Environment {
+            p2p_power: Arc::new(move |request| {
+                if emission != 8 {
+                    return Err("fixture has no staged tag8 P2P source");
+                }
+                let mut bytes = power();
+                bytes[8..40].copy_from_slice(&request.binding);
+                bytes[40..46].copy_from_slice(&p2p_tests::NODE);
+                bytes[46] = 8;
+                asset("narf-test/mvm-interface/p2p-power", &bytes, true)
+            }),
             ap_power: Arc::new(move |request| {
                 if emission != 7 || !ap_staged.load(Ordering::Acquire) {
                     return Err("fixture has no staged tag7 AP source");
@@ -1468,14 +1494,20 @@ impl Harness {
             *device.rx.lock() = Some(rxc);
             *device.tx.lock() = Some(txp);
         }
-        device.publication.store(true, Ordering::Release);
         let actor = Arc::new(IrqSafeSpinLock::new(actor));
         *CURRENT.lock() = Some((device.clone(), actor.clone()));
-        narf_net::iface::register(name, OWN, send);
-        narf_net::iface::set_link_state(name, true);
-        narf_net::iface::set_link_metadata(name, false, None, None);
-        narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
-        narf_net::iface::install_rx_drain(drain);
+        if emission == 8 {
+            // This path uses the actual publication frontend and retains
+            // its exact returned parent Write before any callbacks.
+            device.publish(&narf_net::bootstrap_authority(), false)?;
+        } else {
+            device.publication.store(true, Ordering::Release);
+            narf_net::iface::register(name, OWN, send);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_link_metadata(name, false, None, None);
+            narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
+            narf_net::iface::install_rx_drain(drain);
+        }
         Ok(Self {
             device,
             actor,
@@ -1555,6 +1587,26 @@ impl Harness {
 }
 impl Drop for Harness {
     fn drop(&mut self) {
+        if self.device.p2p_capable && self.device.p2p.active() {
+            // A failed new control-child fixture retains its actual worker,
+            // posted buffers and inert peer. Never destroy Hardware while
+            // a native command/uncertain DMA owner can still reference it.
+            return;
+        }
+        if self.device.p2p_capable {
+            let old = {
+                let mut active = ACTIVE.lock();
+                if active
+                    .as_ref()
+                    .is_some_and(|device| Arc::ptr_eq(device, &self.device))
+                {
+                    active.take()
+                } else {
+                    None
+                }
+            };
+            drop(old);
+        }
         self.device.down(true);
         CURRENT.lock().take();
         narf_net::iface::unregister(self.device.name());

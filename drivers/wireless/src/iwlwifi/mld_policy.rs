@@ -46,7 +46,34 @@ pub(super) struct Transaction {
     source: Source,
     initial: Arc<RegulatoryDomain>,
     validity: Validity,
-    mvm_ap: Option<Arc<super::mvm_boot::ApPower>>,
+    mvm_ap: Option<MvmPower>,
+}
+/// Concrete native initiating roles retain distinct signed emission
+/// programs. This dispatch grants no role and accepts no provider callback.
+#[derive(Clone)]
+enum MvmPower {
+    Ap(Arc<super::mvm_boot::ApPower>),
+    P2p(Arc<super::mvm_boot::P2pPower>),
+}
+impl MvmPower {
+    fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
+        match self {
+            Self::Ap(power) => power.check(domain),
+            Self::P2p(power) => power.check(domain),
+        }
+    }
+    fn ready(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Ap(power) => power.ready(),
+            Self::P2p(power) => power.ready(),
+        }
+    }
+    fn radiated_dbm(&self) -> Result<i8, &'static str> {
+        match self {
+            Self::Ap(power) => power.radiated_dbm(),
+            Self::P2p(power) => power.radiated_dbm(),
+        }
+    }
 }
 impl Transaction {
     pub fn with_mvm_ap(
@@ -54,7 +81,15 @@ impl Transaction {
         power: Arc<super::mvm_boot::ApPower>,
     ) -> Result<Self, &'static str> {
         power.check(&self.initial)?;
-        self.mvm_ap = Some(power);
+        self.mvm_ap = Some(MvmPower::Ap(power));
+        Ok(self)
+    }
+    pub fn with_mvm_p2p(
+        mut self,
+        power: Arc<super::mvm_boot::P2pPower>,
+    ) -> Result<Self, &'static str> {
+        power.check(&self.initial)?;
+        self.mvm_ap = Some(MvmPower::P2p(power));
         Ok(self)
     }
     pub fn invalidate(&self) {
@@ -193,7 +228,7 @@ pub(super) struct Program {
     band: super::native_band::Band,
     six: Option<(narf_wireless::reg::PowerType6Ghz, u32)>,
     ap: bool,
-    mvm_ap: Option<(Arc<super::mvm_boot::ApPower>, bool)>,
+    mvm_ap: Option<(MvmPower, bool)>,
 }
 impl Program {
     #[allow(clippy::too_many_arguments)]
@@ -271,6 +306,40 @@ impl Program {
         firmware: super::mld_regulatory::Mcc,
         primary: u8,
         power: Arc<super::mvm_boot::ApPower>,
+        ibss: bool,
+        validity: Validity,
+    ) -> Result<Self, &'static str> {
+        Self::new_mvm_initiator(
+            domain,
+            firmware,
+            primary,
+            MvmPower::Ap(power),
+            ibss,
+            validity,
+        )
+    }
+    pub fn new_mvm_p2p(
+        domain: &RegulatoryDomain,
+        firmware: super::mld_regulatory::Mcc,
+        primary: u8,
+        power: Arc<super::mvm_boot::P2pPower>,
+        ibss: bool,
+        validity: Validity,
+    ) -> Result<Self, &'static str> {
+        Self::new_mvm_initiator(
+            domain,
+            firmware,
+            primary,
+            MvmPower::P2p(power),
+            ibss,
+            validity,
+        )
+    }
+    fn new_mvm_initiator(
+        domain: &RegulatoryDomain,
+        firmware: super::mld_regulatory::Mcc,
+        primary: u8,
+        power: MvmPower,
         ibss: bool,
         validity: Validity,
     ) -> Result<Self, &'static str> {

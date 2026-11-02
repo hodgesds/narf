@@ -1,9 +1,9 @@
 //! P2P grant wire contracts from Linux7.3-rc7 fw/api/time-event.h.
 //! ABI selection is metadata only. The native owner must separately retain
 //! the actual admitted device/source, MAC/link/STA allocation, current PHY,
-//! NVM/MCC/host power and request authority. The API89 SESSION2 consumer
-//! requires actual PHY/active-link/BCAST receipts; SESSION1's MAC selector
-//! stays test-only until its API77 native adapter is implemented.
+//! NVM/MCC/host power and request authority. SESSION1 selects actual MAC1;
+//! SESSION2 selects active FW-link1. Both native adapters require separate
+//! actual PHY/broadcast-STA receipts and cannot inherit an AUX ROC grant.
 use super::{firmware_api::FirmwareApi, native_band::Channel};
 
 pub(super) const GROUP: u8 = 3;
@@ -41,7 +41,6 @@ impl Activity {
 /// Neither an observed interface number nor the AP's spec link ID belongs here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Target {
-    #[cfg(any(test, feature = "kernel-test"))]
     Mac(u8),
     Link(u8),
 }
@@ -153,7 +152,6 @@ impl Abi {
     }
     fn target(self, target: Target) -> Result<u32, &'static str> {
         match (self, target) {
-            #[cfg(any(test, feature = "kernel-test"))]
             (Self::Session1, Target::Mac(id)) => Ok(u32::from(id)),
             (Self::Session2, Target::Link(id)) => Ok(u32::from(id)),
             _ => Err("P2P session MAC/FW-link identity mismatched"),

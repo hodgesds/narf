@@ -15,6 +15,9 @@ type Start = (
 
 impl Device {
     pub(super) fn ap_set_mode(&self, mode: u32) -> Result<(), WirelessError> {
+        if self.p2p.active() {
+            return Err(WirelessError::Busy);
+        }
         if !matches!(mode, 2 | 3) || mode == 3 && !self.ap_capable {
             return Err(WirelessError::NotSupported);
         }

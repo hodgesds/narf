@@ -529,6 +529,7 @@ impl Device {
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.p2p.stop_retained().await?;
         if self.current_iftype() == 3 {
             let mut state = self.state.lock().await;
             self.stop_locked(&mut state).await;
@@ -2423,6 +2424,6 @@ mod dhcp_composition;
 #[path = "ap_device.rs"]
 mod ap;
 #[path = "p2p_parent.rs"]
-mod p2p;
+pub(in crate::iwlwifi) mod p2p;
 #[path = "sc_scheduled.rs"]
 mod scheduled;

@@ -156,8 +156,13 @@ impl Hardware {
                 .ap_owner
                 .as_ref()
                 .is_some_and(|owner| owner.check().is_ok());
+        // A retained, closing SESSION1 lease may retire its own physical
+        // prefix after the emitting source dies. This complete adapter's
+        // actual original DMA/session owner is separate from ordinary Qu
+        // station/BAID service, which keeps its original refusal below.
+        let legacy_p2p = baid.is_none() && self.p2p_gen2_prefix();
         if self.failed
-            || (self.format == rx_rfh::CompletionFormat::Qu && !legacy_ap)
+            || (self.format == rx_rfh::CompletionFormat::Qu && !legacy_ap && !legacy_p2p)
             || !matches!(self.version(5, 2).map(|v| v.0), None | Some(1 | 99))
         {
             return Err("unsupported/failed native MLD RX epoch contract");
@@ -182,7 +187,7 @@ impl Hardware {
     ) -> Result<Vec<Packet>, &'static str> {
         let mut body = vec![0; if baid.is_some() { 24 } else { 20 }];
         let queues = self.receive_queue_count();
-        let mvm_sync = self.is_mvm89() || self.ap_legacy_selected();
+        let mvm_sync = self.is_mvm89() || self.ap_legacy_selected() || self.p2p_gen2_prefix();
         let mut prefix = if mvm_sync {
             super::super::rx_multi::Prefix::gen2(queues, cookie, baid)?
         } else {
