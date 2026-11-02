@@ -568,6 +568,19 @@ release metadata context pass. Full release/native gates remain at25 completed
 rows. Counting unvalidated implementations,82 remain; physical firmware/board,
 RF and deployment acceptance remain separate.
 
+**2026-11-02 — FullMAC family applicability correction.** The ledger now
+holds **63 `feature`**, **31 `chip`** and **0 `unknown`** rows, with the same
+fifteen source-complete implementations awaiting full batch acceptance.
+Four brcmfmac entries for confirmed stop, transport reset, post-reset station
+rejoin and system resume duplicated CYW43439-only residuals. BCM43602 already
+owns those native PCIe paths; the existing stop, reset/rejoin and hot/cold-resume
+cases passed both architectures at the accepted `6813a24c6` checkpoint. The
+matching four CYW43439 SDIO rows remain open, as does the genuine BCM43602
+IOMMU-quiescence gap. This correction adds no implementation, test or batch
+credit. Counting unvalidated implementations,78 remain after removing the four
+wrong-family duplicates. Full release/native validation still waits for25
+completed rows; physical firmware/board and deployment acceptance are separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -579,7 +592,7 @@ RF and deployment acceptance remain separate.
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
 | rtw89 | 10 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW and runtime LPS; bounded independent live functions, separately qualified standalone/nested TX A-MSDU and actual periodic DPK RF tracking are implemented pending validation; other AX/BE chips are separate rows |
-| brcmfmac | 10 | Monitor/P2P/virtual roles, WoW/rekey, IOMMU quiescence and shared SDIO stop/reset/rejoin/resume dependencies; other chip/CPU/RAM/OTP profiles are separate chip rows; bounded BCM43602 primary-bsscfg firmware-SME AP and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
+| brcmfmac | 6 | Monitor/P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
