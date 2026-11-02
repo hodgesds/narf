@@ -173,16 +173,52 @@ impl Queue {
     pub(super) fn is_master(&self, open: u64) -> bool {
         self.mode.lock().is_master(open)
     }
+    pub(super) fn check_legacy_gamma(&self, crtc: u32, size: usize) -> Result<(), FsError> {
+        legacy_gamma_store(&self.mode, crtc, size).map(|_| ())
+    }
     pub(super) async fn submit(
         &self,
         open: u64,
-        request: Request,
+        mut request: Request,
         geometry: Geometry,
         epoch: u64,
         context: &dyn IoctlContext,
         events: Option<&Events>,
     ) -> Result<Submitted, SubmitError> {
         let _admission = self.admission.lock().await;
+        // The internal blob has no user reference. Pin it across staging and
+        // queue admission; the admitted color job takes its own independent
+        // pin before this temporary reference is released on every exit.
+        let _legacy_blob = if let Request::LegacyGamma { crtc, store, blob } = &mut request {
+            self.check_legacy_gamma(*crtc, crate::drm::card::LEGACY_GAMMA_SIZE)?;
+            if store.len() != 3 * crate::drm::card::LEGACY_GAMMA_SIZE {
+                return Err(FsError::InvalidData.into());
+            }
+            let size = crate::drm::card::LEGACY_GAMMA_SIZE;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(size * 8)
+                .map_err(|_| FsError::OutOfMemory)?;
+            for i in 0..size {
+                for value in [store[i], store[size + i], store[2 * size + i], 0] {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            let mut card = self.mode.lock();
+            *blob = card
+                .create_property_blob(bytes)
+                .map_err(|_| FsError::OutOfMemory)?;
+            if !card.intel_retain_blob(*blob) {
+                return Err(FsError::NotFound.into());
+            }
+            card.destroy_property_blob(*blob);
+            Some(BlobPin {
+                mode: self.mode.clone(),
+                id: *blob,
+            })
+        } else {
+            None
+        };
         let (previous, previous_ctm, predecessor) = {
             let state = self.state.lock();
             match &state.projected {

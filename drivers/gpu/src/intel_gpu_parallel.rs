@@ -4,6 +4,11 @@
 //! leaving private PPHWSP breadcrumbs/restore batches undisturbed.
 use super::*;
 
+/// The ABI reserves a cache line for the driver's go semaphore immediately
+/// after the128-byte WQ descriptor. This single-use owner instead publishes
+/// a final GPU join witness there; GuC never consumes the go/join semaphores.
+const JOIN_DONE: u64 = 128;
+
 pub(super) struct Lane<B: GpuBacking> {
     pub engine: Engine,
     pub image: B,
@@ -19,6 +24,8 @@ pub(super) struct Group<B: GpuBacking> {
     /// later reset messages must not rewrite earlier timeout attribution.
     pub timeout_lanes: u8,
     pub reset_lanes: u8,
+    joined: bool,
+    join_deadline: Option<u64>,
 }
 impl<B: GpuBacking> Group<B> {
     pub fn width(&self) -> usize {
@@ -48,12 +55,38 @@ impl<B: GpuBacking> Group<B> {
             // every lane's saved head/breadcrumb proves actual completion.
             && (self.scratch.read32(0) == 0 || self.scratch.read32(0) == tail)
     }
+    pub fn join_complete(&self, stamp: u32) -> Result<bool, SchedulingError> {
+        if !self.joined {
+            return Ok(true);
+        }
+        match self.scratch.read32(JOIN_DONE) {
+            0 => Ok(false),
+            value if value == stamp => Ok(true),
+            _ => Err(SchedulingError::Protocol),
+        }
+    }
+    /// All payloads may have completed while the parent is still switching
+    /// back in to publish its GPU fence. Bound that final hardware phase,
+    /// without charging a parent semaphore wait as guilty execution time.
+    pub fn waiting_for_join(&mut self, now: u64, stamp: u32) -> Result<bool, SchedulingError> {
+        if self.join_complete(stamp)? {
+            return Ok(false);
+        }
+        let deadline = *self
+            .join_deadline
+            .get_or_insert(now.saturating_add(TIMEOUT));
+        if now >= deadline {
+            return Err(SchedulingError::Timeout);
+        }
+        Ok(true)
+    }
 }
 
 pub(super) struct Spec<'a, B: GpuBacking> {
     pub platform: GtPlatform,
     pub parent: [&'a B; 2],
     pub parent_tail: u32,
+    pub parent_words: &'a mut Vec<u32>,
     pub id: u16,
     pub stamp: u32,
     pub resident: &'a ResidentBatch,
@@ -61,7 +94,7 @@ pub(super) struct Spec<'a, B: GpuBacking> {
 }
 pub(super) fn prepare<A: BootAllocator>(
     r: &mut Resources<A>,
-    spec: Spec<'_, A::Backing>,
+    mut spec: Spec<'_, A::Backing>,
 ) -> Result<Group<A::Backing>, SchedulingError> {
     let engines = spec.user.parallel().ok_or(SchedulingError::State)?;
     let addresses = spec.resident.parallel().ok_or(SchedulingError::State)?;
@@ -82,6 +115,8 @@ pub(super) fn prepare<A: BootAllocator>(
         scratch,
         timeout_lanes: 0,
         reset_lanes: 0,
+        joined: spec.resident.user_fence().is_some(),
+        join_deadline: None,
     };
     let result = (|| {
         for &engine in &engines[1..] {
@@ -190,14 +225,28 @@ pub(super) fn prepare<A: BootAllocator>(
                 return Err(SchedulingError::Cache);
             }
         }
-        //128B descriptor; go/join cachelines remain zero. WQ_OFFSET1024,
+        let parent_tail = if let Some(user_fence) = spec.resident.user_fence() {
+            append_join(&group, &mut spec, user_fence)?;
+            let tail = spec.parent_words.len() as u32 * 4;
+            if tail > spec.parent[1].size_pages() * 4096 {
+                return Err(SchedulingError::Address);
+            }
+            for (i, word) in spec.parent_words.iter().copied().enumerate() {
+                spec.parent[1].write32(i as u64 * 4, word);
+            }
+            spec.parent[0].write32(REGS + 7 * 4, tail);
+            tail
+        } else {
+            spec.parent_tail
+        };
+        //128B descriptor; go/join cachelines start zero. WQ_OFFSET1024,
         // WQ_SIZE1024. Source WQI has width+3 DW, length excludes its header.
         group.scratch.write32(12, 1);
         let header = ((group.width() as u32 + 2) << 16) | 5;
         let item = [
             header,
             spec.parent[0].ggtt_offset() | 0x119,
-            u32::from(spec.id) | (spec.parent_tail / 8) << 18,
+            u32::from(spec.id) | (parent_tail / 8) << 18,
             0,
         ];
         for (i, word) in item.into_iter().enumerate() {
@@ -225,4 +274,54 @@ pub(super) fn prepare<A: BootAllocator>(
             Err(e)
         }
     }
+}
+
+/// Pinned i915 intel_guc_submission.c's GGTT EQ/poll semaphore waits supply
+/// the GPU join primitive; xe_ring_ops.c supplies the posted PPGTT qword
+/// store and class completion flush. Every lane's ordinary breadcrumb is
+/// already a cache-flushed payload witness, outside all user page tables.
+/// The parent emits exactly one user store after every child witness. Its
+/// second private completion distinguishes payload completion from join.
+fn append_join<B: GpuBacking>(
+    group: &Group<B>,
+    spec: &mut Spec<'_, B>,
+    fence: (u64, u64),
+) -> Result<(), SchedulingError> {
+    let words = &mut *spec.parent_words;
+    words
+        .try_reserve(group.children.len() * 4 + 32)
+        .map_err(|_| SchedulingError::Full)?;
+    for child in &group.children {
+        words.extend_from_slice(&[
+            0x0e40c002,
+            spec.stamp,
+            child.image.ggtt_offset() + BREADCRUMB as u32,
+            0,
+        ]);
+    }
+    words.push(0x04000000); // ARB_DISABLE only after every semaphore wait
+    let copy = group.children[0].engine.is_copy();
+    if copy {
+        words.extend_from_slice(&[0x13000002, 0, 0, 0]);
+    }
+    let (address, value) = fence;
+    words.extend_from_slice(&[
+        0x10200003,
+        address as u32,
+        (address >> 32) as u32,
+        value as u32,
+        (value >> 32) as u32,
+    ]);
+    let done = group.scratch.ggtt_offset() + JOIN_DONE as u32;
+    if copy {
+        words.extend_from_slice(&[0x13004002, done | 4, 0, spec.stamp]);
+    } else {
+        words.push(0); // qword-store alignment
+        words.extend_from_slice(&[0x7a000004, 0x01104080, done, 0, spec.stamp, 0]);
+    }
+    words.extend_from_slice(&[0x01000000, 0x04000001, 0x02800000]);
+    if words.len() % 2 != 0 {
+        words.push(0);
+    }
+    Ok(())
 }

@@ -52,6 +52,18 @@ pub struct DeviceFacts {
 
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
+    /// Cached physical BMG main-GT layout; no read-triggered hardware access.
+    fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
+        None
+    }
+    /// The GT owner serializes observation DMA with reset, power and MCR.
+    fn eu_stall_control(
+        &self,
+        _session: Arc<crate::intel_gpu_eu_stall::Session>,
+        _operation: crate::intel_gpu_eu_stall::Operation,
+    ) -> FsFuture<'_, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     /// Stable ABI selection for this card, independent of temporary readiness.
     fn native_xe(&self) -> bool {
         false

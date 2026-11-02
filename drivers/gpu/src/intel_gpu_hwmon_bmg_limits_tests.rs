@@ -11,7 +11,7 @@ fn prepare(card: u32, defaults: [u32; 2]) -> (Published, Firmware, u64) {
     fw.defaults.set(defaults);
     fw.i1.set(Some(0x8000_3200));
     let mut now = narf_time::monotonic_ns().saturating_sub(2_000_000);
-    for _ in 0..8 {
+    for _ in 0..10 {
         fw.step(&f.monitor, 7, &mut now);
     }
     assert_eq!(f.show("i1_status"), "ready\n");
@@ -58,7 +58,7 @@ fn smoke_hwmon_bmg_pl2_real_sysfs_defaults_units_and_verified_pair() -> TestResu
     assert_eq!(f.show("power2_max"), "200000000\n");
     assert_eq!(f.show("power2_cap_default"), "309375000\n");
     assert_eq!(
-        fw.commands.borrow()[4..]
+        fw.commands.borrow()[5..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -243,10 +243,11 @@ fn smoke_hwmon_bmg_pl2_clamp_sibling_change_and_write_status_never_claim_applied
     let _admin = Admin::allow();
     for case in 0..3 {
         let (f, fw, mut now) = prepare(1126, FW);
+        let start = fw.commands.borrow().len();
         match case {
             0 => fw.change_pl2.set(true),
             1 => fw.clamp.set(true),
-            _ => fw.error.set(Some((5, 6))),
+            _ => fw.error.set(Some((start + 1, 6))),
         }
         apply(&f, &fw, &mut now, "power2_cap", b"250000000");
         let expected = if case == 2 {
@@ -261,9 +262,16 @@ fn smoke_hwmon_bmg_pl2_clamp_sibling_change_and_write_status_never_claim_applied
             f.store("power2_max_interval", b"1000"),
             Err(FsError::Unsupported)
         );
-        if case == 2 {
-            assert_eq!(fw.commands.borrow().len(), 6, "error queued verification");
-        }
+        let expected_commands: &[u32] = if case == 2 {
+            &[READ_FW, WRITE]
+        } else {
+            &[READ_FW, WRITE, READ]
+        };
+        assert_eq!(
+            fw.package_commands_since(start),
+            expected_commands,
+            "package verification must follow successful write status only"
+        );
         assert_eq!(
             f.show("i1_status"),
             "ready\n",
@@ -298,7 +306,7 @@ fn smoke_hwmon_bmg_pl2_interval_cancel_each_stage_retains_both_ceilings_without_
         f.monitor
             .service_mmio(7, now, &fw, || panic!("old package epoch accessed PCI"));
         fw.defaults.set([0x5a2e_8320, 0x2468_8640]);
-        for _ in 0..8 {
+        for _ in 0..10 {
             fw.step(&f.monitor, 8, &mut now);
         }
         assert_eq!(
@@ -398,7 +406,7 @@ fn smoke_hwmon_bmg_pl2_and_interval_clients_yield_fairly_to_queued_i1() -> TestR
     assert_eq!(f.show("power2_max_interval"), "1000\n");
     assert_eq!(f.show("power2_cap"), "250000000\n");
     assert_eq!(
-        fw.commands.borrow()[4..]
+        fw.commands.borrow()[5..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),

@@ -102,6 +102,7 @@ struct Owner {
     user_version: Arc<AtomicU32>,
     user_engines: Arc<core::sync::atomic::AtomicU8>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
+    eu_info: IrqSafeSpinLock<Option<crate::intel_gpu_eu_stall::Info>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
     hwmon: Option<Arc<crate::intel_gpu_hwmon::Monitor>>,
     ccs_control: Option<Arc<crate::intel_gpu_ccs_control::Control>>,
@@ -120,6 +121,61 @@ struct Backend {
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
+    fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
+        if self.platform != GtPlatform::Battlemage || self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        let info = *owner.eu_info.lock();
+        info
+    }
+    fn eu_stall_control(
+        &self,
+        session: Arc<crate::intel_gpu_eu_stall::Session>,
+        operation: crate::intel_gpu_eu_stall::Operation,
+    ) -> narf_filesystem::FsFuture<'_, ()> {
+        Box::pin(async move {
+            use narf_filesystem::FsError;
+            let owner = self.owner.upgrade().ok_or(FsError::NoDevice)?;
+            let _awake = Awake::take(&owner).await?;
+            let epoch = owner.user_epoch.load(Ordering::Acquire);
+            let deadline = narf_time::monotonic_ns().saturating_add(50_000_000);
+            loop {
+                let mut state = owner.lock_running().await;
+                if !crate::intel_gpu_eu_stall::capable() {
+                    session.fail(FsError::OperationNotPermitted);
+                    return Err(FsError::OperationNotPermitted);
+                }
+                if epoch == 0
+                    || epoch != owner.user_epoch.load(Ordering::Acquire)
+                    || state.phase != Phase::Running
+                    || owner.suspended.load(Ordering::Acquire)
+                    || session.info().card != owner.pending.index
+                {
+                    return Err(FsError::NoDevice);
+                }
+                let result = state
+                    .gt
+                    .as_mut()
+                    .ok_or(FsError::NoDevice)?
+                    .control_eu_stall(session.clone(), operation, || {
+                        crate::intel_gpu_eu_stall::capable()
+                            && narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                                == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                    });
+                if result != Err(FsError::WouldBlock) {
+                    return result;
+                }
+                drop(state);
+                if narf_time::monotonic_ns() >= deadline {
+                    session.fail(FsError::Busy);
+                    return Err(FsError::Busy);
+                }
+                narf_scheduler::yield_now().await;
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+            }
+        })
+    }
     fn ccs_control(&self) -> Option<Arc<crate::intel_gpu_ccs_control::Control>> {
         self.ccs_control.clone()
     }
@@ -563,6 +619,7 @@ pub(crate) fn start_pending() {
             user_version: Arc::new(AtomicU32::new(0)),
             user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
+            eu_info: IrqSafeSpinLock::new(None),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
             hwmon,
             ccs_control,
@@ -841,6 +898,10 @@ impl Owner {
                     == Ok(Some(narf_bus::pci::PciPowerState::D0))
             })
             .map_err(RuntimeError::Gt)?;
+            gt.poll_eu_stall(now, || {
+                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+            });
         }
         let current = match polled {
             core::task::Poll::Pending => return Ok(()),
@@ -860,6 +921,11 @@ impl Owner {
                     .card
                     .publish_gt_topology(gt)
                     .map_err(RuntimeError::Gt)?;
+                if crate::intel_gpu_eu_stall::enabled() {
+                    // Optional allocation precedes every heavy startup GGTT
+                    // invalidate. No observation address is rebound while live.
+                    let _ = gt.prepare_eu_stall(self.pending.index);
+                }
                 gt.begin_scheduling_with_ccs_mode(now, state.ccs_mode?)
                     .map_err(RuntimeError::Gt)?;
                 state.phase = Phase::Reloading;
@@ -928,6 +994,7 @@ impl Owner {
                         gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
                     }
                     *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
+                    *self.eu_info.lock() = gt.eu_stall_info();
                     // Before the epoch: discovery sees VRAM with the engines.
                     self.pending
                         .card

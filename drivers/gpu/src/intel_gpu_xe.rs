@@ -421,6 +421,10 @@ impl XeFile {
             ),
             abi::EXEC => Some(self.exec(info, address, user, syncobjs).await.map(|_| 0)),
             abi::WAIT_USER_FENCE => Some(self.wait_user(address, user).await.map(|_| 0)),
+            abi::OBSERVATION => Some(match info.backend.clone() {
+                Some(backend) => crate::intel_gpu_eu_stall::open(backend, address, user).await,
+                None => Err(FsError::NoDevice),
+            }),
             _ => self.dispatch(info, cmd, address, user, gem),
         }
     }
@@ -623,9 +627,6 @@ impl XeFile {
             return Err(FsError::Canceled);
         }
         let sync = Sync::read(user, u64_at(&wire, 16), u32_at(&wire, 12), table)?;
-        if parallel.is_some() && sync.user_fence.is_some() {
-            return Err(FsError::NotImplemented);
-        }
         let addresses = if parallel.is_some() && count != 0 {
             let vector = read(user, u64_at(&wire, 24), width * 8)?;
             Some(
@@ -661,6 +662,7 @@ impl XeFile {
                     addresses.as_deref(),
                     width,
                     queue.vm.scratch,
+                    sync.user_fence,
                 )?
             } else {
                 ResidentBatch::from_vm(

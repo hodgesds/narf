@@ -21,6 +21,9 @@ struct Firmware {
     i1: Cell<Option<u32>>,
     i1_clamp: Cell<bool>,
     i1_mode_flip: Cell<bool>,
+    card_defaults: Cell<Option<[u32; 2]>>,
+    card_current: Cell<[u32; 2]>,
+    card_clamp: Cell<bool>,
 }
 impl Firmware {
     fn new() -> Self {
@@ -36,6 +39,9 @@ impl Firmware {
             i1: Cell::new(None),
             i1_clamp: Cell::new(false),
             i1_mode_flip: Cell::new(false),
+            card_defaults: Cell::new(None),
+            card_current: Cell::new([0; 2]),
+            card_clamp: Cell::new(false),
         }
     }
     fn tick(&self) {
@@ -90,6 +96,22 @@ impl Firmware {
                 self.current.set(pair);
                 [0; 2]
             }
+            0x01067c => match self.card_defaults.get() {
+                Some(pair) => pair,
+                None => {
+                    self.hw.complete(1, 0, 0);
+                    return;
+                }
+            },
+            0x067c => self.card_current.get(),
+            0x077c => {
+                let mut pair = input;
+                if self.card_clamp.get() {
+                    pair[0] += 1;
+                }
+                self.card_current.set(pair);
+                [0; 2]
+            }
             _ => panic!("non-whitelisted BMG command {command:x}"),
         };
         self.hw.complete(0, output[0], output[1]); // source ABI: status only, no echo
@@ -113,7 +135,7 @@ impl Firmware {
         *now += 10_000;
     }
     fn defaults_ready(&self, monitor: &Monitor, epoch: u64, now: &mut u64) {
-        for _ in 0..8 {
+        for _ in 0..10 {
             self.step(monitor, epoch, now);
         }
         assert_eq!(monitor.show("power2_max_status", *now), "default-only\n");
@@ -129,6 +151,14 @@ impl Firmware {
             .borrow()
             .iter()
             .filter_map(|&(cmd, data)| (cmd == WRITE).then_some(data))
+            .collect()
+    }
+    fn package_commands_since(&self, start: usize) -> Vec<u32> {
+        self.commands.borrow()[start..]
+            .iter()
+            .filter_map(|&(command, _)| {
+                matches!(command, READ_FW | READ | WRITE).then_some(command)
+            })
             .collect()
     }
 }
@@ -163,7 +193,7 @@ fn smoke_hwmon_bmg_passive_defaults_and_periodic_reads_never_switch_source() -> 
     fw.defaults_ready(&monitor, 7, &mut now);
     assert_eq!(
         fw.commands.borrow().iter().map(|c| c.0).collect::<Vec<_>>(),
-        [0x047d, 0x25, 0x01087c, 0x047c]
+        [0x047d, 0x25, 0x01087c, 0x047c, 0x01067c]
     );
     for (name, value) in [
         ("power2_max_default", "200000000\n"),
@@ -180,7 +210,7 @@ fn smoke_hwmon_bmg_passive_defaults_and_periodic_reads_never_switch_source() -> 
     fw.step(&monitor, 7, &mut now);
     assert_eq!(
         fw.commands.borrow().len(),
-        4,
+        5,
         "package period fired a nanosecond early"
     );
     assert!(fw.pending.get().is_none());
@@ -188,7 +218,7 @@ fn smoke_hwmon_bmg_passive_defaults_and_periodic_reads_never_switch_source() -> 
     fw.step(&monitor, 7, &mut now);
     assert_eq!(
         fw.commands.borrow().len(),
-        5,
+        6,
         "eligible refresh was never posted"
     );
     assert_eq!(fw.pending.get(), Some((READ_FW, [0; 2])));
@@ -233,7 +263,7 @@ fn smoke_hwmon_bmg_admin_pl1_pair_preservation_and_status_then_exact_readback() 
     assert_eq!(monitor.show("power2_rated_max", now), "100125000\n");
     assert_eq!(monitor.show("power2_max_default", now), "200000000\n");
     assert_eq!(
-        &fw.commands.borrow()[4..]
+        &fw.commands.borrow()[5..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -241,7 +271,7 @@ fn smoke_hwmon_bmg_admin_pl1_pair_preservation_and_status_then_exact_readback() 
     );
     fw.apply(&monitor, &mut now, b"125000000");
     assert_eq!(
-        &fw.commands.borrow()[7..]
+        &fw.commands.borrow()[8..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -318,13 +348,13 @@ fn smoke_hwmon_bmg_shared_mailbox_serializes_discovery_background_and_control() 
     assert_eq!(fw.commands.borrow().len(), 1);
     monitor.service_mmio(7, now, &fw, || true); // still busy before timeout
     assert_eq!(fw.commands.borrow().len(), 1);
-    for _ in 0..7 {
+    for _ in 0..9 {
         fw.step(&monitor, 7, &mut now);
     }
     assert_eq!(monitor.show("power2_max_status", now), "default-only\n");
     now += SECOND; // first package post followed fan/thermal discovery
     fw.step(&monitor, 7, &mut now); // passive metadata refresh owns port
-    assert_eq!(fw.commands.borrow().len(), 5);
+    assert_eq!(fw.commands.borrow().len(), 6);
     assert_eq!(fw.pending.get(), Some((READ_FW, [0; 2])));
     assert_eq!(
         monitor.bmg_power.store(b"100000000", now),
@@ -348,7 +378,7 @@ fn smoke_hwmon_bmg_error_statuses_and_failed_rmw_reads_never_write() -> TestResu
         let fw = Firmware::new();
         let mut now = 0;
         fw.defaults_ready(&monitor, 7, &mut now);
-        fw.error.set(Some((4, status))); // fresh admin RMW read, not the metadata read
+        fw.error.set(Some((5, status))); // fresh admin RMW read, not the metadata read
         monitor.bmg_power.store(b"100000000", now).unwrap();
         fw.step(&monitor, 7, &mut now);
         fw.tick();
@@ -393,9 +423,8 @@ fn smoke_hwmon_bmg_clamp_or_changed_pl2_readback_refuses_without_false_ack() -> 
         let count = fw.commands.borrow().len();
         now = SECOND;
         fw.step(&monitor, 7, &mut now);
-        assert_eq!(
-            fw.commands.borrow().len(),
-            count,
+        assert!(
+            fw.package_commands_since(count).is_empty(),
             "ambiguous write retried itself"
         );
     }
@@ -525,7 +554,7 @@ fn smoke_hwmon_bmg_reset_discards_pending_source_and_retains_firmware_boot_ceili
     for _ in 0..6 {
         fw.step(&monitor, 8, &mut now);
     }
-    assert_eq!(fw.commands.borrow()[count + 4].0, READ_FW);
+    assert_eq!(fw.commands.borrow()[count + 5].0, READ_FW);
     assert_eq!(monitor.show("power2_max", now), "200000000\n");
     TestResult::Pass
 }
@@ -552,7 +581,8 @@ fn smoke_hwmon_bmg_disabled_invalid_metadata_and_write_error_are_explicit() -> T
     let fw = Firmware::new();
     let mut now = 0;
     fw.defaults_ready(&monitor, 7, &mut now);
-    fw.error.set(Some((5, 6))); // firmware Locked on the actual write
+    let start = fw.commands.borrow().len();
+    fw.error.set(Some((start + 1, 6))); // firmware Locked on the actual write
     fw.apply(&monitor, &mut now, b"100000000");
     assert_eq!(
         monitor.show("power2_max_status", now),
@@ -560,8 +590,8 @@ fn smoke_hwmon_bmg_disabled_invalid_metadata_and_write_error_are_explicit() -> T
     );
     assert!(monitor.show("power2_max", now).is_empty());
     assert_eq!(
-        fw.commands.borrow().len(),
-        6,
+        fw.package_commands_since(start),
+        [READ_FW, WRITE],
         "write error incorrectly queued a verify/source switch"
     );
     TestResult::Pass
@@ -620,3 +650,6 @@ kernel_test_in!(
 
 #[path = "intel_gpu_hwmon_threshold_tests.rs"]
 mod threshold_tests;
+
+#[path = "intel_gpu_hwmon_psys_tests.rs"]
+mod psys_tests;

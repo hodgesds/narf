@@ -1,4 +1,4 @@
-//! BMG package PL1/PL2 and interval actor. MIT Linux
+//! BMG card/package PL1/PL2 and interval actors. MIT Linux
 //! b90c984d615e8ce2af96f5b1411a962d83fed2ad
 //! xe_hwmon.c::{xe_hwmon_pcode_read_power_limit,xe_hwmon_pcode_rmw_power_limit,
 //! xe_hwmon_get_preregistration_info,xe_hwmon_power_max_write,
@@ -16,9 +16,37 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
 
-const READ: u32 = 0x087c;
-const READ_FW: u32 = 0x01087c;
-const WRITE: u32 = 0x097c;
+#[derive(Clone, Copy, Debug)]
+enum Channel {
+    Package,
+    Card,
+}
+impl Channel {
+    fn read(self) -> u32 {
+        match self {
+            Self::Package => 0x087c,
+            Self::Card => 0x067c,
+        }
+    }
+    fn write(self) -> u32 {
+        match self {
+            Self::Package => 0x097c,
+            Self::Card => 0x077c,
+        }
+    }
+    fn client(self) -> Client {
+        match self {
+            Self::Package => Client::Power,
+            Self::Card => Client::CardPower,
+        }
+    }
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Package => "power2",
+            Self::Card => "power1",
+        }
+    }
+}
 // PWR_LIM_VAL[14:0], PWR_LIM_EN[15], PWR_LIM[15:0]. BMG PWR_UNIT=3.
 const VALUE: u32 = 0x7fff;
 const ENABLE: u32 = 1 << 15;
@@ -137,12 +165,20 @@ struct State {
 }
 #[derive(Debug)]
 pub(super) struct Power {
+    channel: Channel,
     admission: AtomicU64,
     state: IrqSafeSpinLock<State>,
 }
 impl Power {
     pub(super) fn new() -> Self {
+        Self::with_channel(Channel::Package)
+    }
+    pub(super) fn card() -> Self {
+        Self::with_channel(Channel::Card)
+    }
+    fn with_channel(channel: Channel) -> Self {
         Self {
+            channel,
             admission: AtomicU64::new(0),
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
@@ -223,20 +259,24 @@ impl Power {
                     state.outcome = Outcome::Applying(request.id);
                     state.observed = None;
                 }
-                (if current { READ } else { READ_FW }, [0; 2], Reply::Two)
+                (
+                    self.channel.read() | if current { 0 } else { 1 << 16 },
+                    [0; 2],
+                    Reply::Two,
+                )
             }
             Phase::NeedWrite(request, pair) => {
                 state.phase = Phase::Writing(request, pair);
-                (WRITE, pair, Reply::None)
+                (self.channel.write(), pair, Reply::None)
             }
             Phase::NeedVerify(request, pair) => {
                 state.phase = Phase::Verifying(request, pair);
-                (READ, [0; 2], Reply::Two)
+                (self.channel.read(), [0; 2], Reply::Two)
             }
             _ => return None,
         };
         Some(Command {
-            client: Client::Power,
+            client: self.channel.client(),
             word,
             input,
             reply,
@@ -336,11 +376,11 @@ impl Power {
             return Err(FsError::OperationNotPermitted);
         }
         let value = super::decimal(bytes)?;
-        let (index, window) = match attribute {
-            "power2_max" => (0, false),
-            "power2_cap" => (1, false),
-            "power2_max_interval" => (0, true),
-            "power2_cap_interval" => (1, true),
+        let (index, window) = match attribute.strip_prefix(self.channel.prefix()) {
+            Some("_max") => (0, false),
+            Some("_cap") => (1, false),
+            Some("_max_interval") => (0, true),
+            Some("_cap_interval") => (1, true),
             _ => return Err(FsError::Unsupported),
         };
         let mut state = self.state.lock();
@@ -381,8 +421,11 @@ impl Power {
         Ok(())
     }
     pub(super) fn show(&self, attribute: &str, now: u64) -> String {
+        let Some(attribute) = attribute.strip_prefix(self.channel.prefix()) else {
+            return String::new();
+        };
         let state = self.state.lock();
-        if matches!(attribute, "power2_max_status" | "power2_cap_status") {
+        if matches!(attribute, "_max_status" | "_cap_status") {
             return match state.outcome {
                 Outcome::Unavailable => "unavailable\n".into(),
                 Outcome::DefaultOnly => "default-only\n".into(),
@@ -403,11 +446,11 @@ impl Power {
         else {
             return String::new();
         };
-        let (index, suffix) = if let Some(suffix) = attribute.strip_prefix("power2_max") {
+        let (index, suffix) = if let Some(suffix) = attribute.strip_prefix("_max") {
             (0, suffix)
-        } else if let Some(suffix) = attribute.strip_prefix("power2_cap") {
+        } else if let Some(suffix) = attribute.strip_prefix("_cap") {
             (1, suffix)
-        } else if attribute == "power2_rated_max" {
+        } else if attribute == "_rated_max" {
             (0, "")
         } else {
             return String::new();

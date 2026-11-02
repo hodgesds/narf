@@ -204,6 +204,12 @@ fn query_wire(
             }
             reply
         }
+        10 => crate::intel_gpu_eu_stall::query(
+            info.backend
+                .as_ref()
+                .and_then(|backend| backend.eu_stall_info())
+                .ok_or(FsError::NoDevice)?,
+        )?,
         6 => {
             if u32_at(wire, 12) != 0 {
                 if u32_at(wire, 12) != 40 {

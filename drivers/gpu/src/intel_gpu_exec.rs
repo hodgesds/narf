@@ -318,8 +318,8 @@ pub struct ResidentBatch {
     user_fence: Option<(u64, u64)>,
     skip_batch: bool,
     implicit_sync: bool,
-    /// Width-two batches share this owned immutable VM graph. Lane zero
-    /// retains the ordinary address; lane one is copied before any wait.
+    /// All lanes share this owned immutable VM graph. Lane zero retains
+    /// the ordinary address; children are copied before any wait.
     parallel: Option<Vec<u64>>,
 }
 
@@ -501,6 +501,7 @@ impl ResidentBatch {
         addresses: Option<&[u64]>,
         width: usize,
         scratch: bool,
+        user_fence: Option<(u64, u64)>,
     ) -> Result<Self, FsError> {
         if !(2..=crate::intel_gpu_user::MAX_PARALLEL_WIDTH).contains(&width)
             || addresses.is_some_and(|a| a.len() != width)
@@ -530,7 +531,13 @@ impl ResidentBatch {
         } else {
             children.resize(width - 1, 0);
         }
-        let mut batch = Self::from_vm(platform, mappings, addresses.map(|a| a[0]), scratch, None)?;
+        let mut batch = Self::from_vm(
+            platform,
+            mappings,
+            addresses.map(|a| a[0]),
+            scratch,
+            user_fence,
+        )?;
         batch.parallel = Some(children);
         Ok(batch)
     }

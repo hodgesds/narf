@@ -222,9 +222,16 @@ runtime accounting and saved heads remain independent; successful completion
 requires every lane. Shared disable/deregister and final TLB/reset proof retain
 all lane storage and the VM graph. Replies naming any leased child ID resolve
 the group. Partial allocation rolls back without publishing queue state or
-consuming IDs. Multi-row/multi-placement and render groups, width above four,
-and parallel GPU user-fence stores remain refused; the latter needs an owned
-all-lane GPU join.
+consuming IDs. With a GPU user fence, the parent additionally waits on every
+child's protected payload breadcrumb using GGTT MI_SEMAPHORE_WAIT, performs
+exactly one PPGTT qword store and flushes a separate private JOIN_DONE marker.
+Host completion, capture and reclamation require JOIN_DONE, every payload
+breadcrumb and saved head, then the existing deregistration/TLB proofs.
+A parent waiting after its own payload is no longer charged payload runtime;
+unfinished children retain independent budgets and the final join has its own
+five-second bound. Groups without a user fence retain their existing ring
+protocol. Multi-row/multi-placement and render groups and width above four
+remain refused.
 VIDEO classes, and COMPUTE on a GT
 without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
@@ -335,9 +342,36 @@ without changing the request or publishing GPU work; the syscall bridge handles
 signal delivery and SA_RESTART. Completed/failed waits never request a park.
 Finite waits retain their original future/deadline instead of restarting a
 relative timeout on each repoll. Kernel callers without the hook await timers.
-Long-running/fault VMs, broader parallel queues, observation and additional
+Long-running/fault VMs, broader parallel queues, OA observation and additional
 native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented.
+
+**BMG EU-stall observation.** The exact boot opt-in
+`narf.intel.eu_stall=1` permits preallocation on qualified physical BMG main
+GTs before scheduling startup's acknowledged heavy GGTT invalidations. Query 10
+is available only after that owner and the execution epoch are published.
+Xe OBSERVATION type 1/open 0 returns a disabled sampling description; current
+CAP_PERFMON or CAP_SYS_ADMIN is required at open and every read/control, including
+after an awaited operation. GT_ID 0 is required. Sample periods use source
+251-cycle multipliers 1..7; WAIT_NUM_REPORTS currently supports only 1. Other
+valid thresholds return Unsupported because the shared read interface cannot
+express Linux's blocking/nonblocking threshold distinction.
+
+One description per card owns a bounded 64 KiB host FIFO of opaque 64-byte
+records. Read returns complete records, at most 4096 bytes, or WouldBlock;
+enable/disable use source ioctls 0x6900/0x6901. The retained GT collector owns
+coherent 512 KiB sub-buffers indexed by physical DSS, including fuse holes,
+through checked GGTT/MCR addressing. Current D0/wake authority is checked before
+each MMIO access; a lost steering transaction performs no restoration writes.
+Polling copies before acknowledging source cursors, applies host backpressure,
+and reports observed drops or copy races explicitly. Malformed occupancy,
+readback or access loss terminates the description and retains DMA storage.
+Disable/reopen reuses the same mapping; no live rebinding occurs. Active or
+poisoned collectors block idle admission. Close requests a verified sampler
+stop; full GT reset invalidates old descriptions and releases exposed storage
+only after the existing GuC-reset, DMA-idle and GRDOM_FULL proofs. A busy or
+lost MCR owner cannot prevent escalation to that reset. This profile does not
+advertise OA, media-GT sampling or additional platform support.
 
 #### i915 compatibility profile
 
@@ -1157,8 +1191,8 @@ discards pending/source ownership without writes or policy replay; a later
 activation starts with passive firmware-source observations again. Errors
 disable the power actor until activation; ambiguous port ownership additionally
 quarantines every mailbox client. Known authority loss clears matching cached
-observations immediately between sampling ticks. Disabling limits, card power
-controls and instantaneous watt telemetry remain open.
+observations immediately between sampling ticks. Disabling limits and
+instantaneous watt telemetry remain open.
 
 BMG additionally exposes the source-defined package PL2 `power2_cap` in
 microWatts, PL1 `power2_max_interval` and PL2 `power2_cap_interval` in
@@ -1186,6 +1220,18 @@ disables the package actor until activation. Close discards every request and
 source claim without replay, retains both ceilings, and restarts with passive
 firmware-source discovery. Shared PCODE fairness and per-service bounds are
 unchanged; dynamic MERT/L2-flush coordination remains separate work.
+
+BMG whole-card PSYS adds `power1_max`, `power1_cap` and their `_interval`
+attributes, with the same microWatt/millisecond units, per-limit retained
+ceilings, default/min/max/status metadata and 1..256000 ms interval bounds.
+`power1_label` is `card`. Card source 1 discovery uses PCODE 0x01067c;
+source 0 reads use 0x067c and paired writes 0x077c. Current values remain empty
+until an explicit admin transaction confirms the entire source0 pair.
+Card, package and I1 actors share one fair mailbox owner, with transaction
+ownership retained through fresh RMW, write and exact readback. Unsupported
+optional PSYS discovery preserves package/I1; ambiguous mailbox or current
+authority loss invalidates all clients. Close/reset discards requests and
+source claims without replay, retaining independent first-firmware ceilings.
 
 User-job timeout accounting follows `xe_lrc_timestamp` and `check_timeout`:
 a trusted per-context restore batch marks the saved CTX_TIMESTAMP active, and
@@ -1366,6 +1412,9 @@ precedes graphics-GT sleep ACK. A failed stop retains the complete owner.
 
 `intel_gpu_gt_runtime` binds persistent owners to the actual registered card,
 PCI function, current authority, immutable firmware and dedicated arena. The
+GT reserves 32 MiB of GGTT space starting at 256 MiB; this virtual reservation
+accommodates the optional sparse-DSS sampler alongside firmware and contexts.
+Physical sampler pages are allocated only with its boot opt-in. The
 Late service validates exact live PCI identity, D0, readable PF registers and
 a bounded acyclic extended-capability chain; enabled SR-IOV VFs are refused.
 Each restart creates a fresh arena/cache-policy proof. MTL/Arrow starts only
@@ -7148,8 +7197,17 @@ reset alone cannot retire cursor fetch. Failed stop retains all DMA owners.
 `CTM`, `GAMMA_LUT` and immutable `GAMMA_LUT_SIZE=1024`. CTM blobs contain nine
 S31.32 sign-magnitude coefficients (72 bytes). Native gamma blobs contain
 1024 independent RGB `drm_color_lut` entries (8192 bytes); reserved words are
-ignored and nonmonotonic channels remain valid. Legacy gamma size remains
-zero/unsupported; AMD's native 4096-entry and legacy 256-entry interfaces
+ignored and nonmonotonic channels remain valid. Qualified Intel GETCRTC reports
+legacy gamma_size 256, and GAMMA_GET/GAMMA_SET use three 256-entry ramps.
+GAMMA_SET copies each ramp once, resets CTM and submits a retained private
+256-entry LUT through the same owned KMS FIFO. Successful hardware latch and
+Card publication update the legacy gamma store; failed or cancelled writes
+retain the last confirmed store. Native atomic changes do not rewrite it.
+The actual 8-bit legacy palette mode is distinct from native 10-bit precision;
+active DSB legacy loads use duplicate posted writes per entry, as required by
+the source anti-collision sequence. Inactive capture/restoration retains both
+palette views. The synchronous path without an owned Intel display refuses
+SET before copying ramps. AMD's native 4096-entry and legacy 256-entry interfaces
 retain their existing contracts. Admission copies all color data and retains
 both resulting blob identities through queued/projected state and native
 completion; destroying blobs cannot substitute data under an admitted job.

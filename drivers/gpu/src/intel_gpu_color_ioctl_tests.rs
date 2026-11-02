@@ -572,7 +572,7 @@ kernel_test_in!(
 fn smoke_intel_gamma_native_advertisement_sizes_and_inherited_refusal() -> TestResult {
     let mode = color_mode();
     assert_eq!(crtc_color_properties(&mode.lock(), 1).1, vec![0, 0, 1024]);
-    for entries in [256, 1023, 1025, 4096] {
+    for entries in [255, 257, 1023, 1025, 4096] {
         let id = mode
             .lock()
             .create_property_blob(vec![0; entries * 8])

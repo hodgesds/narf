@@ -23,6 +23,12 @@ use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::task::Poll;
 
+fn observation_awake(io: &impl MmioWindow) -> bool {
+    [0xa188, 0xdfc, 0xa278, 0xd84].into_iter().all(|reg| {
+        let value = io.read32(reg);
+        value != u32::MAX && value & 1 != 0
+    })
+}
 const REQUEST: u64 = 0xa188;
 const WAKE_NS: u64 = 50_000_000;
 
@@ -72,6 +78,7 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
     discovery_mailbox: Option<Mailbox<M>>,
     scheduler: Option<GuCScheduler<A>>,
     topology: Option<Arc<GtTopology>>,
+    eu_stall: Option<crate::intel_gpu_eu_stall::Collector<A>>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -149,6 +156,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 discovery_mailbox: None,
                 scheduler: None,
                 topology: None,
+                eu_stall: None,
             }),
             state: GtState::Staged,
             deadline: 0,
@@ -396,6 +404,83 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
         }
         Ok(())
+    }
+
+    /// Preallocate before scheduling starts. Subsequent startup contexts issue
+    /// acknowledged heavy GGTT invalidations before the runtime publishes an
+    /// epoch; sampling never adds or rebinds live GGTT mappings afterward.
+    pub(crate) fn prepare_eu_stall(&mut self, card: u32) -> Result<(), narf_filesystem::FsError>
+    where
+        A: Clone,
+    {
+        use narf_filesystem::FsError;
+        if self.state != GtState::Ready
+            || self.parts.scheduler.is_some()
+            || self.parts.eu_stall.is_some()
+        {
+            return Err(FsError::Unsupported);
+        }
+        self.awake().map_err(|_| FsError::NoDevice)?;
+        let info = crate::intel_gpu_eu_stall::Info::from_tables(
+            card,
+            self.parts.boot.platform(),
+            self.topology().ok_or(FsError::NoDevice)?,
+            self.hwconfig().ok_or(FsError::NoDevice)?,
+        )
+        .ok_or(FsError::Unsupported)?;
+        let collector = crate::intel_gpu_eu_stall::Collector::new(
+            self.parts.boot.diagnostic_allocator(),
+            info,
+        )?;
+        self.parts.eu_stall = Some(collector);
+        Ok(())
+    }
+    pub(crate) fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
+        self.parts.eu_stall.as_ref().map(|c| c.info())
+    }
+    pub(crate) fn control_eu_stall(
+        &mut self,
+        session: Arc<crate::intel_gpu_eu_stall::Session>,
+        operation: crate::intel_gpu_eu_stall::Operation,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<(), narf_filesystem::FsError> {
+        use crate::intel_gpu_eu_stall::Operation;
+        if !access() {
+            if let Some(collector) = self.parts.eu_stall.as_mut() {
+                collector.lost();
+            }
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        self.admit_scheduling()
+            .map_err(|_| narf_filesystem::FsError::NoDevice)?;
+        let parts = &mut *self.parts;
+        let collector = parts
+            .eu_stall
+            .as_mut()
+            .ok_or(narf_filesystem::FsError::NoDevice)?;
+        if operation == Operation::Attach {
+            return collector.attach(session);
+        }
+        let window = parts.boot.window();
+        collector.control(window, &session, operation == Operation::Enable, || {
+            access() && observation_awake(window)
+        })
+    }
+    pub(crate) fn poll_eu_stall(&mut self, now: u64, mut access: impl FnMut() -> bool) {
+        if self.parts.eu_stall.is_none() {
+            return;
+        }
+        if !access() || self.awake().is_err() {
+            if let Some(c) = self.parts.eu_stall.as_mut() {
+                c.lost();
+            }
+            return;
+        }
+        let parts = &mut *self.parts;
+        if let Some(collector) = parts.eu_stall.as_mut() {
+            let window = parts.boot.window();
+            let _ = collector.poll(window, now, || access() && observation_awake(window));
+        }
     }
 
     /// Caller has checked this unpublished allocation against this card's
@@ -705,6 +790,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn start_reset(&mut self, now: u64) -> Result<(), GtError> {
+        // Stop observation first; a busy MCR semaphore is retried by poll,
+        // with all DMA owners retained and wake still held.
+        if self.parts.eu_stall.is_some() && self.parts.boot.state() != BootState::Stopping {
+            self.deadline = now.saturating_add(WAKE_NS);
+            self.state = GtState::Stopping;
+            return Ok(());
+        }
         if self.parts.boot.state() != BootState::Stopping {
             self.parts.boot.begin_stop(now).map_err(GtError::Boot)?;
         }
@@ -731,6 +823,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         // Close admission before any fallible reset/recovery operation.
         self.log_stream.take();
+        if let Some(collector) = self.parts.eu_stall.as_mut() {
+            collector.invalidate();
+        }
         self.state = GtState::Lost;
         self.parts.boot.cancel_reload();
         if matches!(
@@ -933,6 +1028,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             && self.log_stream.is_none()
             && self
                 .parts
+                .eu_stall
+                .as_ref()
+                .is_none_or(|collector| collector.idle())
+            && self
+                .parts
                 .scheduler
                 .as_ref()
                 .is_some_and(GuCScheduler::idle)
@@ -1125,6 +1225,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             if let Some(actor) = &mut self.log_stream {
                 actor.lost();
             }
+            if let Some(collector) = self.parts.eu_stall.as_mut() {
+                collector.lost();
+            }
         }
         result
     }
@@ -1266,6 +1369,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 if status & 1 == 0 || dma & 1 != 0 {
                     return Poll::Pending;
                 }
+                if let Some(collector) = self.parts.eu_stall.take() {
+                    // SAFETY: GuC reset/DMA idle and GRDOM_FULL self-clear
+                    // precede release of all observation GGTT storage.
+                    unsafe { collector.release_after_reset() };
+                }
                 if let Some(scheduler) = self.parts.scheduler.take() {
                     // SAFETY: GuC reset/DMA idle preceded GRDOM_FULL self-clear.
                     // Admission is closed and no child scheduler escapes.
@@ -1341,15 +1449,34 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     _ => return Poll::Ready(Err(GtError::State)),
                 }
             }
-            GtState::Stopping => match self.parts.boot.poll(now) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Boot(error))),
-                Poll::Ready(Ok(BootState::Stopped)) => {
-                    self.after_boot_stop(now)?;
-                    return Poll::Pending;
+            GtState::Stopping => {
+                if self.parts.boot.state() != BootState::Stopping {
+                    let parts = &mut *self.parts;
+                    if let Some(collector) = parts.eu_stall.as_mut() {
+                        let window = parts.boot.window();
+                        match collector.disable(window, || observation_awake(window)) {
+                            Err(narf_filesystem::FsError::WouldBlock) if now < self.deadline => {
+                                return Poll::Pending
+                            }
+                            Err(_) => collector.lost(),
+                            Ok(()) => {}
+                        }
+                    }
+                    // A lost/stuck steering owner cannot prevent whole-GT
+                    // reset escalation. Storage stays retained through GuC
+                    // stop, GRDOM_FULL and the existing DMA-idle proofs.
+                    self.parts.boot.begin_stop(now).map_err(GtError::Boot)?;
                 }
-                _ => return Poll::Ready(Err(GtError::State)),
-            },
+                match self.parts.boot.poll(now) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Boot(error))),
+                    Poll::Ready(Ok(BootState::Stopped)) => {
+                        self.after_boot_stop(now)?;
+                        return Poll::Pending;
+                    }
+                    _ => return Poll::Ready(Err(GtError::State)),
+                }
+            }
             GtState::Ready | GtState::CtReady => {}
             GtState::SchedulingReady => {
                 let parts = &mut *self.parts;
@@ -1426,8 +1553,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             boot,
             ct,
             scheduler,
+            eu_stall,
             ..
         } = unsafe { ManuallyDrop::take(&mut self.parts) };
+        if let Some(collector) = eu_stall {
+            // SAFETY: the caller's full graphics-GT/DMA reset proof covers it.
+            unsafe { collector.release_after_reset() };
+        }
         if let Some(scheduler) = scheduler {
             // SAFETY: the external full-reset proof covers HWS and engines too.
             unsafe { scheduler.release_after_reset() };

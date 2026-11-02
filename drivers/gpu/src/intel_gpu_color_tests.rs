@@ -176,7 +176,7 @@ fn smoke_intel_gamma_native_size_rounding_channels_and_reserved_word() -> TestRe
     bytes[0..8].copy_from_slice(&[0, 128, 32, 0, 224, 255, 0, 0]);
     let lut = Lut::decode(&bytes).unwrap();
     assert_eq!(lut.entries[0], (512 << 20) | 1023);
-    for size in [0, 256 * 8, 1023 * 8, 1024 * 8 + 1, 1025 * 8] {
+    for size in [0, 255 * 8, 257 * 8, 1023 * 8, 1024 * 8 + 1, 1025 * 8] {
         assert!(matches!(
             Lut::decode(&alloc::vec![0; size]),
             Err(FsError::InvalidData)

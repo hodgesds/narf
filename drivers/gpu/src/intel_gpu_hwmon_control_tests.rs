@@ -89,7 +89,7 @@ impl MmioWindow for Hardware {
         // The legacy discovery model has no package-power firmware support.
         // Its first passive package read completes Illegal Command, rather
         // than pretending the new power client owns a working endpoint.
-        if offset == pcode::MAILBOX && value == 0x8001_087c {
+        if offset == pcode::MAILBOX && matches!(value, 0x8001_087c | 0x8001_067c) {
             self.set(offset, 1);
         }
         if offset == pcode::MAILBOX && value == 0x8000_047c {
@@ -391,6 +391,8 @@ fn smoke_hwmon_bmg_owned_mailbox_fans_and_thermal_limit_wire_cases() -> TestResu
     // authority budget below; a mailbox post itself needs four accesses.
     monitor.service_mmio(7, 2 * SECOND + 1, &hw, || true);
     monitor.service_mmio(7, 2 * SECOND + 2, &hw, || true);
+    monitor.service_mmio(7, 2 * SECOND + 3, &hw, || true);
+    monitor.service_mmio(7, 2 * SECOND + 4, &hw, || true);
     assert!(monitor.show("temp2_crit", 4 * SECOND + 1).is_empty());
     hw.reads.borrow_mut().clear();
     let mut checks = 0;

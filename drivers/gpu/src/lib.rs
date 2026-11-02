@@ -730,6 +730,8 @@ pub mod intel_gpu_engine;
 #[cfg(feature = "intel")]
 mod intel_gpu_error;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_eu_stall;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
 mod intel_gpu_exec_sync;

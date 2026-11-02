@@ -428,8 +428,8 @@ pub(crate) struct PropertyBlob {
     pub(crate) user: bool,
 }
 
-/// `drm_crtc::gamma_size` of every color-managed CRTC: amdgpu_dm's
-/// `drm_mode_crtc_set_gamma_size(MAX_COLOR_LEGACY_LUT_ENTRIES)`.
+/// `drm_crtc::gamma_size` of every color-managed CRTC: Intel and AMD both
+/// initialize the legacy store with 256 entries, independently of native LUT size.
 pub const LEGACY_GAMMA_SIZE: usize = 256;
 
 /// A CRTC's color management as amdgpu_dm attaches it on DCN 4.0.1
@@ -930,7 +930,7 @@ pub struct Card {
     /// and of native_atomic, which other DRM vendors also use.
     #[cfg(feature = "intel")]
     pub(crate) intel_display: bool,
-    /// Installed fixed-mode Intel color owner (native CTM and gamma1024).
+    /// Installed fixed-mode Intel color owner (native CTM, gamma1024/legacy256).
     #[cfg(feature = "intel")]
     pub(crate) intel_ctm: bool,
     #[cfg(feature = "intel")]

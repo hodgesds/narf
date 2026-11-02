@@ -171,12 +171,9 @@ fn smoke_parallel_queue_matrix_copy_fault_and_join_store_refusal() -> TestResult
         &user,
         queue,
         [0x1234_0000_0000; 2],
-        &[sync(2, 0x2345_0000_0090, 7, true)],
+        &[sync(2, 0x2345_0000_1000, 7, true)],
     );
-    assert_eq!(
-        exec_refusal(&file, &info, &user),
-        Err(FsError::NotImplemented)
-    );
+    assert_eq!(exec_refusal(&file, &info, &user), Err(FsError::InvalidData));
     assert_eq!(user.read_u64_acquire(0x4090), Ok(0));
     exec_parallel(&user, queue, [0x1234_0000_0000; 2], &[]);
     let mut fault = user.wire.load(64, 56);

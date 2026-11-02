@@ -187,7 +187,7 @@ fn smoke_hwmon_i1_owned_read_write_verify_status_is_not_readback() -> TestResult
     assert_eq!(f.show("i1_status"), "applied 1\n");
     assert_eq!(f.show("power1_crit"), "100000000\n");
     assert_eq!(
-        fw.commands.borrow()[4..]
+        fw.commands.borrow()[5..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -237,7 +237,7 @@ fn smoke_hwmon_i1_fresh_mode_and_cross_epoch_boot_identity_refuse_writes() -> Te
     assert!(i1_writes(&fw).is_empty());
     f.monitor.close();
     f.monitor.activate(8);
-    for _ in 0..8 {
+    for _ in 0..10 {
         fw.step(&f.monitor, 8, &mut now);
     }
     assert_eq!(f.show("i1_status"), "failed 0 Mode\n");
@@ -268,7 +268,7 @@ fn smoke_hwmon_i1_close_at_every_stage_discards_requests_and_retains_original_ce
         f.monitor.activate(8);
         f.monitor
             .service_mmio(7, now, &fw, || panic!("old epoch touched hardware"));
-        for _ in 0..8 {
+        for _ in 0..10 {
             fw.step(&f.monitor, 8, &mut now);
         }
         assert_eq!(
@@ -430,7 +430,7 @@ fn smoke_hwmon_i1_shared_port_serializes_admin_clients_and_quarantines_both() ->
     assert_eq!(f.show("power1_crit"), "100000000\n");
     assert_eq!(f.show("power2_max"), "125000000\n");
     assert_eq!(
-        fw.commands.borrow()[4..]
+        fw.commands.borrow()[5..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -476,7 +476,7 @@ fn smoke_hwmon_i1_queued_peer_wins_over_requeued_pl1_at_transaction_boundary() -
     assert_eq!(f.show("power1_crit"), "100000000\n");
     assert_eq!(f.show("power2_max_status"), "queued 2\n");
     assert_eq!(
-        fw.commands.borrow()[4..]
+        fw.commands.borrow()[5..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -511,7 +511,7 @@ fn smoke_hwmon_i1_status_zero_allones_and_passive_interval_have_no_false_measure
     let (f, fw, mut now) = ready(1111, 0x8000_3200);
     let posted = fw.commands.borrow()[3];
     assert_eq!(posted.0, 0x047c);
-    let baseline = now - 20_000; // READ_I1 was posted two model steps ago
+    let baseline = now - 40_000; // READ_I1 preceded the final card-power probe.
     now = baseline + SECOND - 20_000;
     fw.step(&f.monitor, 7, &mut now); // power refresh wins first
     fw.step(&f.monitor, 7, &mut now);

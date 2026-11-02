@@ -942,3 +942,6 @@ mod color;
 
 #[path = "intel_gpu_cursor_ioctl_tests.rs"]
 mod cursor;
+
+#[path = "intel_gpu_legacy_gamma_tests.rs"]
+mod legacy_gamma;

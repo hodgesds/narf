@@ -402,6 +402,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.config.revision
     }
 
+    pub(crate) fn diagnostic_allocator(&self) -> A
+    where
+        A: Clone,
+    {
+        self.resources.allocator.clone()
+    }
+
     pub(crate) fn configure_cache(
         &mut self,
         policy: crate::intel_gpu_gt_hw::CachePolicy,
@@ -959,6 +966,8 @@ mod tests {
         parallel_reply_child: bool,
         parallel_reply_lane: Option<u32>,
         parallel_starts: Vec<(u32, u32)>,
+        parallel_join_hold: bool,
+        parallel_join_stores: Vec<(u32, u64, u64)>,
         stream_controls: Vec<(u16, u16, u32)>,
         stream_fences: BTreeSet<u16>,
         stream_acks: usize,

@@ -35,6 +35,8 @@ struct Hardware {
     actions: Vec<Action>,
     palette: [u32; 1024],
     palette_writes: usize,
+    legacy_collisions: bool,
+    legacy_posted: usize,
     refuse_palette: bool,
     allowed: bool,
     powered: bool,
@@ -84,6 +86,8 @@ impl MockPlatform {
                 actions: Vec::new(),
                 palette: core::array::from_fn(|i| i as u32),
                 palette_writes: 0,
+                legacy_collisions: false,
+                legacy_posted: 0,
                 refuse_palette: false,
                 allowed: true,
                 powered: true,
@@ -144,6 +148,12 @@ impl MockPlatform {
     }
     pub(crate) fn refuse_palette(&self, refuse: bool) {
         self.0.lock().refuse_palette = refuse;
+    }
+    pub(crate) fn legacy_collisions(&self, enabled: bool) {
+        self.0.lock().legacy_collisions = enabled;
+    }
+    pub(crate) fn legacy_posted(&self) -> usize {
+        self.0.lock().legacy_posted
     }
     pub(crate) fn poison(&self) {
         self.1.store(true, Ordering::Release);
@@ -221,9 +231,13 @@ impl MockPlatform {
     }
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn dsb_commands(&self) -> Vec<(u32, u32)> {
+        self.dsb_stream(0)
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn dsb_stream(&self, id: u64) -> Vec<(u32, u32)> {
         let hw = self.0.lock();
-        let head = hw.regs[&0x70b00];
-        let tail = hw.regs[&0x70b04];
+        let head = hw.regs[&(0x70b00 + id * 0x100)];
+        let tail = hw.regs[&(0x70b04 + id * 0x100)];
         (head..tail)
             .step_by(8)
             .map(|pc| (hw.dsb_word(pc).unwrap(), hw.dsb_word(pc + 4).unwrap()))
@@ -327,6 +341,17 @@ impl MmioWindow for MockPlatform {
 }
 impl Hardware {
     fn write(&mut self, offset: u64, value: u32) {
+        if (0x4a000..0x4a400).contains(&offset) {
+            if self.refuse_palette {
+                return;
+            }
+            if self.legacy_collisions && self.regs.get(&0x70c08).copied().unwrap_or(0) & 1 != 0 {
+                self.legacy_posted += 1;
+                if self.legacy_posted % 2 != 0 {
+                    return;
+                }
+            }
+        }
         if offset == 0x45234 {
             self.regs.insert(offset, value & !(1 << 31));
             return;

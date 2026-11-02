@@ -465,6 +465,7 @@ impl RenderFile {
                     | crate::intel_gpu_xe_uapi::VM_BIND
                     | crate::intel_gpu_xe_uapi::EXEC
                     | crate::intel_gpu_xe_uapi::WAIT_USER_FENCE
+                    | crate::intel_gpu_xe_uapi::OBSERVATION
             ) {
                 return self
                     .xe

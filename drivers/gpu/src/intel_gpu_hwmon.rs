@@ -149,6 +149,7 @@ pub(crate) struct Monitor {
     state: IrqSafeSpinLock<State>,
     power: power::Power,
     bmg_power: bmg_power::Power,
+    card_power: bmg_power::Power,
     i1: i1::I1,
 }
 impl Monitor {
@@ -179,6 +180,7 @@ impl Monitor {
             }),
             power: power::Power::new(),
             bmg_power: bmg_power::Power::new(),
+            card_power: bmg_power::Power::card(),
             i1: i1::I1::new(),
         })
     }
@@ -208,6 +210,7 @@ impl Monitor {
         state.fan_rpm = [None; 3];
         self.power.activate(epoch);
         self.bmg_power.activate(epoch);
+        self.card_power.activate(epoch);
         self.i1.activate(epoch);
         self.admission.store(epoch, Ordering::Release);
     }
@@ -232,6 +235,7 @@ impl Monitor {
         state.fan_rpm = [None; 3];
         self.power.close();
         self.bmg_power.close();
+        self.card_power.close();
         self.i1.close();
     }
 
@@ -287,6 +291,7 @@ impl Monitor {
         if self.platform == GtPlatform::Battlemage {
             state.mailbox.access_lost();
             self.bmg_power.access_lost(epoch);
+            self.card_power.access_lost(epoch);
             self.i1.access_lost(epoch);
         }
     }
@@ -317,6 +322,7 @@ impl Monitor {
             if let Some((client, result)) = mailbox.step(next, now, io) {
                 match client {
                     pcode::Client::Power => self.bmg_power.complete(epoch, now, result),
+                    pcode::Client::CardPower => self.card_power.complete(epoch, now, result),
                     pcode::Client::I1 => self.i1.complete(epoch, now, result),
                     _ => discovery.complete(client, result),
                 }
@@ -325,6 +331,7 @@ impl Monitor {
                 // A shared hardware port with ambiguous ownership cannot
                 // accept requests or retain measurements for either actor.
                 self.bmg_power.port_lost(epoch, fault);
+                self.card_power.port_lost(epoch, fault);
                 self.i1.port_lost(epoch, fault);
             }
             let mut state = self.state.lock();
@@ -351,21 +358,21 @@ impl Monitor {
         next: &mut pcode::Client,
     ) -> Option<pcode::Command> {
         use pcode::Client;
-        let other = |client| {
-            if client == Client::Power {
-                Client::I1
-            } else {
-                Client::Power
-            }
+        let successor = |client| match client {
+            Client::Power => Client::I1,
+            Client::I1 => Client::CardPower,
+            _ => Client::Power,
         };
         let active = |client| match client {
             Client::Power => self.bmg_power.in_transaction(epoch),
             Client::I1 => self.i1.in_transaction(epoch),
+            Client::CardPower => self.card_power.in_transaction(epoch),
             _ => false,
         };
         let command = |client| match client {
             Client::Power => self.bmg_power.command(epoch, now),
             Client::I1 => self.i1.command(epoch, now),
+            Client::CardPower => self.card_power.command(epoch, now),
             _ => None,
         };
         // A read/write/verify sequence retains ownership. Once terminal, a
@@ -375,15 +382,15 @@ impl Monitor {
                 return command(client);
             }
             *owner = None;
-            *next = other(client);
+            *next = successor(client);
         }
-        for client in [*next, other(*next)] {
+        for client in [*next, successor(*next), successor(successor(*next))] {
             if let Some(command) = command(client) {
                 if active(client) {
                     *owner = Some(client);
                 } else {
                     // Passive reads consist of one transfer only.
-                    *next = other(client);
+                    *next = successor(client);
                 }
                 return Some(command);
             }
@@ -571,12 +578,18 @@ impl Monitor {
     }
 
     fn show(&self, attribute: &str, now: u64) -> String {
+        if self.platform == GtPlatform::Battlemage && attribute == "power1_label" {
+            return "card\n".into();
+        }
         if self.platform == GtPlatform::Battlemage
-            && (attribute.starts_with("power1_")
+            && (attribute.starts_with("power1_crit")
                 || attribute.starts_with("curr2_")
                 || attribute == "i1_status")
         {
             return self.i1.show(attribute, now);
+        }
+        if self.platform == GtPlatform::Battlemage && attribute.starts_with("power1_") {
+            return self.card_power.show(attribute, now);
         }
         if self.platform == GtPlatform::Battlemage {
             let index = match attribute {
@@ -776,6 +789,46 @@ impl Monitor {
                 move |bytes| store.power.store_interval(bytes, narf_time::monotonic_ns()),
             );
         } else {
+            for attribute in [
+                "power1_max_default",
+                "power1_max_min",
+                "power1_max_max",
+                "power1_max_status",
+                "power1_cap_default",
+                "power1_cap_min",
+                "power1_cap_max",
+                "power1_cap_status",
+                "power1_max_interval_min",
+                "power1_max_interval_max",
+                "power1_cap_interval_min",
+                "power1_cap_interval_max",
+            ] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+            for attribute in [
+                "power1_max",
+                "power1_cap",
+                "power1_max_interval",
+                "power1_cap_interval",
+            ] {
+                let show = self.clone();
+                let store = self.clone();
+                kobject_add_writable_attr(
+                    &node,
+                    attribute,
+                    move || show.show(attribute, narf_time::monotonic_ns()),
+                    move |bytes| {
+                        store.card_power.store_attribute(
+                            attribute,
+                            bytes,
+                            narf_time::monotonic_ns(),
+                        )
+                    },
+                );
+            }
             for attribute in [
                 "power2_cap_default",
                 "power2_cap_min",

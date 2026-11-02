@@ -147,13 +147,10 @@ fn smoke_parallel_wide_matrix_vector_ownership_and_join_refusal() -> TestResult 
             &user,
             queue,
             &addresses,
-            &[sync(2, 0x2345_0000_0090, 5, true)],
+            &[sync(2, 0x2345_0000_1000, 5, true)],
             false,
         );
-        assert_eq!(
-            exec_refusal(&file, &info, &user),
-            Err(FsError::NotImplemented)
-        );
+        assert_eq!(exec_refusal(&file, &info, &user), Err(FsError::InvalidData));
         assert_eq!(user.read_u64_acquire(0x4090), Ok(0));
         assert!(mailbox.pending.lock().is_empty());
         assert_eq!(
@@ -569,3 +566,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_parallel",
     smoke_parallel_wide_partial_allocation_rollback_preserves_queue_and_slots
 );
+
+mod joins {
+    include!("intel_gpu_parallel_join_tests.rs");
+}

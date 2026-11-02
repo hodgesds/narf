@@ -2923,7 +2923,6 @@ fn handle_getcrtc(
         // drm_crtc::gamma_size: the legacy LUT's, on CRTCs that have one.
         let gamma_size = card
             .crtc_color(crtc_id)
-            .filter(|_| !card.intel_color(crtc_id))
             .map_or(0, |_| crate::drm::card::LEGACY_GAMMA_SIZE as u32);
         out[28..32].copy_from_slice(&gamma_size.to_le_bytes());
         let mode_valid: u32 = crtc.mode.is_some() as u32;
@@ -3696,7 +3695,7 @@ fn crtc_color_property(
             .property_blob(id)
             .map_or(0, |b| b.len() / COLOR_LUT_ENTRY_SIZE);
         let valid = if card.intel_color(crtc) {
-            entries == 1024
+            entries == 1024 || entries == crate::drm::card::LEGACY_GAMMA_SIZE
         } else {
             entries == GAMMA_LUT_SIZE as usize || entries == crate::drm::card::LEGACY_GAMMA_SIZE
         };
@@ -4359,10 +4358,13 @@ fn handle_gamma(
     let (red, green, blue) = (ptr(8), ptr(16), ptr(24));
     let card = mode_state.lock();
     card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
-    let Some(color) = card
-        .crtc_color(crtc_id)
-        .filter(|_| !card.intel_color(crtc_id))
-    else {
+    if set && card.intel_color(crtc_id) {
+        // Intel SET must traverse its async owned color FIFO. A missing
+        // display owner or synchronous caller cannot publish software-only
+        // success through the AMD legacy helper below.
+        return Err(FsError::Unsupported);
+    }
+    let Some(color) = card.crtc_color(crtc_id) else {
         // drm_crtc_supports_legacy_gamma is false (gamma_size 0).
         return if set {
             Err(FsError::NotImplemented) // ENOSYS

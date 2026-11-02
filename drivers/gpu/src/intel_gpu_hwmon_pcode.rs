@@ -1,4 +1,4 @@
-//! One BMG PCODE port owner for discovery, paired package limits and I1.
+//! One BMG PCODE port owner for discovery, paired card/package limits and I1.
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad xe_pcode.c,
 //! xe_pcode_api.h and xe_hwmon.c. One bounded post OR poll per service.
 //!
@@ -30,6 +30,7 @@ pub(super) enum Client {
     Thermal,
     Power,
     I1,
+    CardPower,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Reply {

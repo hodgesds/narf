@@ -124,6 +124,8 @@ impl Image {
 /// MTL/Arrow's native post-CSC LUT: 1024 RGB entries, ten bits/channel.
 /// This profile has no monotonic/equal-channel restriction (XE_LPDP_FEATURES).
 pub(crate) const LUT_SIZE: usize = 1024;
+pub(crate) const LEGACY_LUT_SIZE: usize = 256;
+const LEGACY_BASE: u64 = 0x4a000;
 const INDEX: u64 = 0x4a400;
 const DATA: u64 = 0x4a404;
 const POST_ENABLE: u32 = 1 << 30;
@@ -134,28 +136,75 @@ pub(crate) struct Lut {
 }
 impl Lut {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Arc<Self>, FsError> {
-        if bytes.len() != LUT_SIZE * 8 {
+        let size = bytes.len() / 8;
+        if bytes.len() % 8 != 0 || ![LEGACY_LUT_SIZE, LUT_SIZE].contains(&size) {
             return Err(FsError::InvalidData);
         }
         let mut entries = Vec::new();
         entries
-            .try_reserve_exact(LUT_SIZE)
+            .try_reserve_exact(size)
             .map_err(|_| FsError::OutOfMemory)?;
         for bytes in bytes.chunks_exact(8) {
-            // drm_color_lut_extract(16 -> 10) rounds, not truncates. The UAPI
+            // drm_color_lut_extract(16 -> 8/10) rounds, not truncates. The UAPI
             // reserved word is ignored, exactly as Linux's ilk_lut_10 does.
             let channel = |at| {
                 let v = u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-                (v * 1023 + 32767) / 65535
+                (v * if size == LEGACY_LUT_SIZE { 255 } else { 1023 } + 32767) / 65535
             };
-            entries.push(channel(0) << 20 | channel(2) << 10 | channel(4));
+            entries.push(if size == LEGACY_LUT_SIZE {
+                channel(0) << 16 | channel(2) << 8 | channel(4)
+            } else {
+                channel(0) << 20 | channel(2) << 10 | channel(4)
+            });
         }
         Ok(Arc::new(Self { entries }))
     }
+    fn mode(&self) -> u32 {
+        u32::from(self.entries.len() != LEGACY_LUT_SIZE)
+    }
+    fn write(&self, io: &impl MmioWindow) -> Result<(), FsError> {
+        if self.entries.len() == LEGACY_LUT_SIZE {
+            legacy_write(io, &self.entries)
+        } else {
+            Palette::write(io, &self.entries, [1 << 16; 6])
+        }
+    }
+    fn matches(&self, io: &impl MmioWindow) -> bool {
+        if self.entries.len() == LEGACY_LUT_SIZE {
+            io.write32(INDEX, 0);
+            self.entries
+                .iter()
+                .enumerate()
+                .all(|(i, &value)| io.read32(LEGACY_BASE + i as u64 * 4) == value)
+        } else {
+            let mut matches = true;
+            for (i, &value) in self.entries.iter().enumerate() {
+                io.write32(INDEX, i as u32);
+                matches &= io.read32(DATA) == value;
+            }
+            io.write32(INDEX, 0);
+            matches && MAX_REGS.into_iter().all(|r| io.read32(r) == 1 << 16)
+        }
+    }
+}
+fn legacy_write(io: &impl MmioWindow, entries: &[u32]) -> Result<(), FsError> {
+    io.write32(INDEX, 0);
+    for (i, &value) in entries.iter().enumerate() {
+        io.write32(LEGACY_BASE + i as u64 * 4, value);
+    }
+    if entries
+        .iter()
+        .enumerate()
+        .any(|(i, &value)| io.read32(LEGACY_BASE + i as u64 * 4) != value)
+    {
+        return Err(FsError::NoDevice);
+    }
+    Ok(())
 }
 #[derive(Debug)]
 struct Palette {
     entries: Vec<u32>,
+    legacy: Vec<u32>,
     maxima: [u32; 6],
 }
 impl Palette {
@@ -174,11 +223,42 @@ impl Palette {
             entries.push(value);
         }
         io.write32(INDEX, 0);
+        let mut legacy = Vec::new();
+        legacy
+            .try_reserve_exact(LEGACY_LUT_SIZE)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for i in 0..LEGACY_LUT_SIZE {
+            let value = io.read32(LEGACY_BASE + i as u64 * 4);
+            if value == u32::MAX {
+                return Err(FsError::NoDevice);
+            }
+            legacy.push(value);
+        }
         let maxima = MAX_REGS.map(|r| io.read32(r));
         if maxima.contains(&u32::MAX) {
             return Err(FsError::NoDevice);
         }
-        Ok(Self { entries, maxima })
+        Ok(Self {
+            entries,
+            legacy,
+            maxima,
+        })
+    }
+    fn restore(&self, io: &impl MmioWindow) -> Result<(), FsError> {
+        // Both access paths were captured while gamma was inactive. Restore
+        // legacy first, precision last, then verify both views in case they
+        // alias shared palette RAM. The original mode remains gated off.
+        legacy_write(io, &self.legacy)?;
+        Self::write(io, &self.entries, self.maxima)?;
+        if self
+            .legacy
+            .iter()
+            .enumerate()
+            .any(|(i, &value)| io.read32(LEGACY_BASE + i as u64 * 4) != value)
+        {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
     }
     fn write(io: &impl MmioWindow, entries: &[u32], maxima: [u32; 6]) -> Result<(), FsError> {
         // bdw_load_lut_10: reset index before enabling auto increment, then
@@ -321,11 +401,11 @@ impl Owner {
             }
             // Retain original and uncertain ownership before the first write.
             self.failed = true;
-            Palette::write(io, &lut.entries, [1 << 16; 6])?;
+            lut.write(io)?;
             self.failed = false;
         }
-        let gamma = if lut.is_some() {
-            (self.gamma & !3) | POST_ENABLE | 1
+        let gamma = if let Some(lut) = &lut {
+            (self.gamma & !3) | POST_ENABLE | lut.mode()
         } else {
             self.gamma
         };
@@ -363,8 +443,8 @@ impl Owner {
             self.original_palette = Some(Palette::capture(io)?);
         }
         let image = coefficients.map_or(self.original, Image::ctm);
-        let gamma = if lut.is_some() {
-            (self.gamma & !3) | POST_ENABLE | 1
+        let gamma = if let Some(lut) = &lut {
+            (self.gamma & !3) | POST_ENABLE | lut.mode()
         } else {
             self.gamma
         };
@@ -399,19 +479,13 @@ impl Owner {
             return Err(FsError::NoDevice);
         }
         if let Some(lut) = &update.lut {
-            let mut matches = true;
-            for (i, &value) in lut.entries.iter().enumerate() {
-                io.write32(INDEX, i as u32);
-                matches &= io.read32(DATA) == value;
-            }
-            io.write32(INDEX, 0);
-            if !matches || MAX_REGS.into_iter().any(|r| io.read32(r) != 1 << 16) {
+            if !lut.matches(io) {
                 return Err(FsError::NoDevice);
             }
         }
         if update.restore_palette {
             let original = self.original_palette.as_ref().expect("original palette");
-            Palette::write(io, &original.entries, original.maxima)?;
+            original.restore(io)?;
         }
         self.expected = update.image;
         self.expected_gamma = update.gamma;
@@ -508,7 +582,7 @@ impl Owner {
                 // No in-place active restoration is hidden behind this path.
                 let original = self.original_palette.as_ref().expect("saved palette");
                 self.failed = true;
-                Palette::write(io, &original.entries, original.maxima)?;
+                original.restore(io)?;
                 self.failed = false;
             }
             self.expected = pending.image;

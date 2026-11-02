@@ -19,7 +19,7 @@ const ALLOW_MODESET: u32 = 0x400;
 pub(super) fn mutates(cmd: u32) -> bool {
     matches!(
         drm_uapi::ioc_nr(cmd),
-        0x1e | 0x1f | 0xa2 | 0xa3 | 0xab | 0xaf | 0xb0 | 0xb1 | 0xb7 | 0xba | 0xbb | 0xbc
+        0x1e | 0x1f | 0xa2 | 0xa3 | 0xa5 | 0xab | 0xaf | 0xb0 | 0xb1 | 0xb7 | 0xba | 0xbb | 0xbc
     )
 }
 
@@ -46,6 +46,11 @@ enum Request {
     SetMaster,
     Dirty(u32),
     Cursor(Vec<u8>, Option<Arc<crate::intel_gpu_gem::GemObject>>, bool),
+    LegacyGamma {
+        crtc: u32,
+        store: Vec<u16>,
+        blob: u32,
+    },
 }
 fn read(context: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, FsError> {
     let mut bytes = vec![0; size];
@@ -286,6 +291,7 @@ struct Plan {
     next_ctm: u32,
     previous_gamma: u32,
     next_gamma: u32,
+    legacy_store: Option<Vec<u16>>,
 }
 
 fn same_timing(
@@ -353,7 +359,23 @@ impl Plan {
         previous: Option<Crtc>,
         previous_color: Option<(u32, u32)>,
     ) -> Result<Self, FsError> {
+        let mut legacy_store = None;
         let request = match request {
+            Request::LegacyGamma { crtc, store, blob } => {
+                if !card.intel_color(crtc) || store.len() != 3 * crate::drm::card::LEGACY_GAMMA_SIZE
+                {
+                    return Err(FsError::InvalidData);
+                }
+                legacy_store = Some(store);
+                Request::Atomic(OwnedAtomic {
+                    flags: 0,
+                    cookie: 0,
+                    objects: vec![crtc],
+                    counts: vec![2],
+                    props: vec![CRTC_CTM_PROP_ID, CRTC_GAMMA_LUT_PROP_ID],
+                    values: vec![0, u64::from(blob)],
+                })
+            }
             Request::Property {
                 object,
                 kind,
@@ -406,6 +428,7 @@ impl Plan {
             fence: None,
             test: false,
             nonblock: false,
+            legacy_store,
         };
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
@@ -425,7 +448,9 @@ impl Plan {
             geometry.height,
         ];
         match request {
-            Request::Property { .. } => unreachable!("property request normalized before staging"),
+            Request::Property { .. } | Request::LegacyGamma { .. } => {
+                unreachable!("property request normalized before staging")
+            }
             Request::SetMaster => {
                 p.action = Action::SetMaster;
                 return Ok(p);
@@ -646,7 +671,7 @@ impl Plan {
                                     if id != 0 {
                                         let bytes =
                                             card.property_blob(id).ok_or(FsError::NotFound)?;
-                                        if bytes.len() != crate::intel_gpu_color::LUT_SIZE * 8 {
+                                        if ![256 * 8, 1024 * 8].contains(&bytes.len()) {
                                             return Err(FsError::InvalidData);
                                         }
                                     }
@@ -1457,6 +1482,9 @@ async fn execute_plan<B: Backend>(
             if let Some(color) = card.crtc_color.iter_mut().find(|c| c.crtc == plan.next.id) {
                 color.ctm = plan.next_ctm;
                 color.gamma_lut = plan.next_gamma;
+                if let Some(store) = &plan.legacy_store {
+                    color.gamma_store = store.clone();
+                }
             }
             card.collect_blobs();
             if matches!(plan.action, Action::Color { .. }) {
@@ -1522,6 +1550,42 @@ fn direct_object(frame: &Framebuffer) -> Result<Arc<crate::intel_gpu_gem::GemObj
         .ok_or(FsError::Unsupported)
 }
 
+fn legacy_gamma_store(mode: &ModeState, crtc: u32, size: usize) -> Result<Vec<u16>, FsError> {
+    let card = mode.lock();
+    card.crtc(crtc).map_err(|_| FsError::NotFound)?;
+    if !card.intel_color(crtc) {
+        return Err(FsError::NotImplemented);
+    }
+    if size != crate::drm::card::LEGACY_GAMMA_SIZE {
+        return Err(FsError::InvalidData);
+    }
+    Ok(card
+        .crtc_color(crtc)
+        .expect("validated color")
+        .gamma_store
+        .clone())
+}
+
+fn get_legacy_gamma(
+    mode: &ModeState,
+    arg: u64,
+    context: &dyn IoctlContext,
+) -> Result<u64, FsError> {
+    let bytes = read(context, arg, 32)?;
+    let w = words(&bytes);
+    let size = w[1] as usize;
+    let store = legacy_gamma_store(mode, w[0], size)?;
+    for (channel, at) in [8, 16, 24].into_iter().enumerate() {
+        let pointer = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let values: Vec<u8> = store[channel * size..(channel + 1) * size]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        context.write(pointer, &values)?;
+    }
+    Ok(0)
+}
+
 /// Shared foreground boundary for the real dispatcher and native PCI models.
 /// All user copies/FD lookups finish before the owned job can reach the worker.
 #[allow(clippy::too_many_arguments)]
@@ -1539,7 +1603,31 @@ async fn admit_with_gem(
     if drm_uapi::ioc_nr(cmd) != 0x1e && !queue.is_master(open) {
         return Err(FsError::PermissionDenied.into());
     }
-    let mut request = Request::copy(cmd, arg, context)?;
+    let mut request = if drm_uapi::ioc_nr(cmd) == 0xa5 {
+        let bytes = read(context, arg, 32)?;
+        let w = words(&bytes);
+        let (crtc, size) = (w[0], w[1] as usize);
+        queue.check_legacy_gamma(crtc, size)?;
+        let mut store = Vec::new();
+        store
+            .try_reserve_exact(3 * size)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for at in [8, 16, 24] {
+            let pointer = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let ramp = read(context, pointer, size * 2)?;
+            store.extend(
+                ramp.chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]])),
+            );
+        }
+        Request::LegacyGamma {
+            crtc,
+            store,
+            blob: 0,
+        }
+    } else {
+        Request::copy(cmd, arg, context)?
+    };
     if let (Request::Cursor(bytes, object, hardware), Some(gem)) = (&mut request, gem) {
         let w = words(bytes);
         if w[0] == 0 || w[0] & !3 != 0 {
@@ -1584,6 +1672,12 @@ pub(crate) async fn dispatch(
     out: Option<&OutFences>,
     gem: &crate::intel_gpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
+    if drm_uapi::ioc_nr(cmd) == 0xa4 {
+        let mode = crate::drm_registry::mode_state(index)?;
+        if mode.lock().intel_ctm {
+            return Some(get_legacy_gamma(&mode, arg, context));
+        }
+    }
     if !mutates(cmd) {
         return None;
     }

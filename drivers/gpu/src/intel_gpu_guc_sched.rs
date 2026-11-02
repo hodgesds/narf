@@ -177,10 +177,11 @@ impl<B: GpuBacking> Context<B> {
         self.image.read32(BREADCRUMB) == self.stamp
             && self.image.read32(REGS + 5 * 4) & 0x1ffffc == self.tail
             && self.parallel.as_ref().is_none_or(|group| {
-                group.children.iter().all(|lane| {
-                    lane.image.read32(BREADCRUMB) == self.stamp
-                        && lane.image.read32(REGS + 5 * 4) & 0x1ffffc == lane.tail
-                })
+                group.join_complete(self.stamp) == Ok(true)
+                    && group.children.iter().all(|lane| {
+                        lane.image.read32(BREADCRUMB) == self.stamp
+                            && lane.image.read32(REGS + 5 * 4) & 0x1ffffc == lane.tail
+                    })
             })
     }
     fn child_diagnostics(&self) -> impl Iterator<Item = ContextInfo> + '_ {
@@ -826,7 +827,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             if engine.is_copy() {
                 crate::intel_gpu_engine::copy_ring(
                     (!batch.skip_batch()).then_some(batch.address()),
-                    batch.user_fence(),
+                    batch.user_fence().filter(|_| width == 1),
                     image.ggtt_offset(),
                     stamp,
                 )
@@ -838,7 +839,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     image.ggtt_offset(),
                     stamp,
                 );
-                if let Some((address, value)) = batch.user_fence() {
+                if let Some((address, value)) = batch.user_fence().filter(|_| width == 1) {
                     // MIT xe_ring_ops.c::emit_store_imm_ppgtt_posted: qword
                     // PPGTT store after the render-cache flush, before the owned
                     // GGTT breadcrumb. ResidentBatch validated writable residency.
@@ -889,7 +890,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::Full);
         }
         let tail = words.len() as u32 * 4;
-        for (i, word) in words.into_iter().enumerate() {
+        for (i, word) in words.iter().copied().enumerate() {
             ring.write32(i as u64 * 4, word);
         }
         image.write32(REGS + 7 * 4, tail);
@@ -900,6 +901,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     platform: self.platform,
                     parent: [&image, &ring],
                     parent_tail: tail,
+                    parent_words: &mut words,
                     id,
                     stamp,
                     resident: resident.as_ref().expect("parallel resident"),
@@ -916,6 +918,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         } else {
             None
         };
+        let tail = image.read32(REGS + 7 * 4);
         let completion = Arc::new(CompletionFence::new());
         if let Some(batch) = &resident {
             if let Err(error) = batch.reserve(&completion) {
@@ -1066,6 +1069,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     if !group.valid_wq() {
                         return Err(SchedulingError::Protocol);
                     }
+                    group.join_complete(context.stamp)?;
                     for lane in &mut group.children {
                         resources
                             .allocator
@@ -1093,10 +1097,17 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .as_ref()
                         .is_none_or(|g| g.children.iter().all(|lane| lane.finished))
                 {
-                    context.phase = Phase::Disable;
-                    // Each LRC must finish. A parent breadcrumb never retires
-                    // an outstanding child, its WQ, or shared PPGTT graph.
-                    context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                    let joining = match &mut context.parallel {
+                        Some(group) => group.waiting_for_join(now, context.stamp)?,
+                        None => false,
+                    };
+                    if !joining {
+                        context.phase = Phase::Disable;
+                        // Each LRC and any GPU join must finish. A payload
+                        // breadcrumb never retires a child or pending join.
+                        context.deadline =
+                            now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                    }
                 }
             }
             if now >= context.deadline {

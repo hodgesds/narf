@@ -749,8 +749,9 @@ pub trait GpuAllocator {
 /// the 4 GiB LRCA ceiling, and large enough for every context,
 /// ring and batch this driver will hold at once.
 pub const GGTT_ARENA_BASE: u32 = 0x1000_0000;
-/// Arena size: 16 MiB of GGTT (4096 pages).
-pub const GGTT_ARENA_PAGES: u32 = 4096;
+/// Arena size: 32 MiB. Sparse BMG EU-stall buffers consume up to 16 MiB;
+/// firmware, CT and private execution objects share the remaining capacity.
+pub const GGTT_ARENA_PAGES: u32 = 8192;
 
 /// A production allocation: host frames the CPU reaches through
 /// the kernel direct map and the GPU reaches through the GGTT.

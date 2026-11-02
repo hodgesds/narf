@@ -294,7 +294,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             return Err(FsError::NoDevice);
         }
         let dewake = timing_check?;
-        if lut.is_some_and(|lut| lut.len() != 1024) {
+        if lut.is_some_and(|lut| ![256, 1024].contains(&lut.len())) {
             return Err(FsError::InvalidData);
         }
         for id in 0..2 {
@@ -311,12 +311,22 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         let mut sub = Commands(Vec::new());
         if let Some(lut) = lut {
             sub.write(0x4a400, 0);
-            sub.write(0x4a400, 1 << 15);
-            sub.emit(lut.len() as u32, (9 << 24) | 0x4a404);
-            sub.0.extend_from_slice(lut);
-            sub.write(0x4a400, 0);
-            for r in [0x4a420, 0x4a424, 0x4a428, 0x4a430, 0x4a434, 0x4a438] {
-                sub.write(r, 1 << 16);
+            if lut.len() == 256 {
+                // intel_color.c::ilk_load_lut_8: palette anti-collision may
+                // drop a posted write, so issue each LGC_PALETTE write twice.
+                // Non-posted accesses would stall competing CPU MMIO instead.
+                for (i, &value) in lut.iter().enumerate() {
+                    sub.write(0x4a000 + i as u64 * 4, value);
+                    sub.write(0x4a000 + i as u64 * 4, value);
+                }
+            } else {
+                sub.write(0x4a400, 1 << 15);
+                sub.emit(lut.len() as u32, (9 << 24) | 0x4a404);
+                sub.0.extend_from_slice(lut);
+                sub.write(0x4a400, 0);
+                for r in [0x4a420, 0x4a424, 0x4a428, 0x4a430, 0x4a434, 0x4a438] {
+                    sub.write(r, 1 << 16);
+                }
             }
             sub.emit(1, 2 << 24); // +1us, mode's delayed-vblank interval is zero
             sub.emit(0, 7 << 24);

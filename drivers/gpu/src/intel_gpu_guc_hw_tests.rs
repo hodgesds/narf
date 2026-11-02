@@ -6,6 +6,267 @@ mod userspace {
     include!("intel_gpu_user_tests.rs");
 }
 
+// Observation-only MCR bank around the unchanged GuC/GT model. All other
+// hardware transitions still pass through the real boot/scheduler helpers.
+#[derive(Default)]
+struct EuStallRegisters {
+    values: BTreeMap<(usize, u64), u32>,
+    lost: bool,
+}
+#[derive(Clone)]
+struct EuStallWindow {
+    inner: Window,
+    samplers: Rc<RefCell<EuStallRegisters>>,
+}
+impl MmioWindow for EuStallWindow {
+    fn read32(&self, offset: u64) -> u32 {
+        if matches!(offset, 0xe520 | 0xe524 | 0xe528 | 0xe52c | 0xe53c) {
+            let selector = self.inner.read32(0xfd4);
+            let dss = ((selector >> 8) & 15) as usize * 4 + (selector & 15) as usize;
+            let bank = self.samplers.borrow();
+            return if bank.lost {
+                u32::MAX
+            } else {
+                *bank.values.get(&(dss, offset)).unwrap_or(&0)
+            };
+        }
+        self.inner.read32(offset)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        if matches!(offset, 0xe520 | 0xe524 | 0xe528 | 0xe52c | 0xe53c) {
+            let selector = self.inner.read32(0xfd4);
+            assert_eq!(selector & 0x80000000, 0);
+            let dss = ((selector >> 8) & 15) as usize * 4 + (selector & 15) as usize;
+            let mut bank = self.samplers.borrow_mut();
+            let old = *bank.values.get(&(dss, offset)).unwrap_or(&0);
+            let next = if matches!(offset, 0xe528 | 0xe52c | 0xe53c) {
+                let mask = value >> 16;
+                (old & !mask) | (value & mask)
+            } else {
+                value
+            };
+            bank.values.insert((dss, offset), next);
+        }
+        self.inner.write32(offset, value);
+    }
+}
+fn eu_stall_gt() -> (EuStallWindow, Arena, GuCGt<EuStallWindow, Arena>, u32) {
+    let (inner, arena) = model();
+    inner.0.borrow_mut().regs.extend([
+        (0xdfc, 0),
+        (0xa188, 2),
+        (0xa278, 2),
+        (0xd84, 0),
+        (0xfd0, 1),
+        (0x913c, 5),
+        (0x9144, 6),
+        (0x9134, 5),
+        (0x9114, 0x10),
+        (0x9118, 1),
+        (0x138000, (18 << 16) | 180),
+        (0x13800c, 90),
+        (0x145998, (6 << 16) | 60),
+        (0x145ef0, 30 << 8),
+        (0xd8c, (20 << 22) | (1 << 14)),
+    ]);
+    let io = EuStallWindow {
+        inner,
+        samplers: Rc::new(RefCell::new(EuStallRegisters::default())),
+    };
+    let boot = GuCBoot::stage_image(
+        io.clone(),
+        arena.clone(),
+        GtPlatform::Battlemage,
+        CssImage::parse(&image(), 70).unwrap(),
+        BootConfig {
+            device_id: 0xe20b,
+            revision: 3,
+            huc_upload_bytes: 0,
+            uncached_mocs: Some(3),
+        },
+    )
+    .unwrap();
+    let mut gt = GuCGt::from_staged_hardware(boot).unwrap();
+    assert!(gt.eu_stall_info().is_none() && gt.user_epoch().is_none());
+    let initial = arena.live_allocations();
+    assert_eq!(
+        gt.prepare_eu_stall(60),
+        Err(narf_filesystem::FsError::Unsupported)
+    );
+    assert_eq!(arena.live_allocations(), initial);
+    hardware_discovery(&mut gt, &io.inner, 0xdfc);
+    let before: BTreeSet<_> = io.inner.0.borrow().memory.keys().copied().collect();
+    gt.prepare_eu_stall(60).unwrap();
+    let base = *io
+        .inner
+        .0
+        .borrow()
+        .memory
+        .keys()
+        .find(|base| !before.contains(*base))
+        .unwrap();
+    assert_eq!(
+        io.inner.0.borrow().memory[&base].borrow().len() * 4,
+        3 * 512 * 1024
+    );
+    let info = gt.eu_stall_info().unwrap();
+    assert_eq!((info.card, info.dss, info.per_group), (60, 7, 4));
+    assert!(gt.user_epoch().is_none());
+    hardware_scheduling(&mut gt, &io.inner);
+    assert!(
+        gt.user_epoch().is_none(),
+        "CT startup is not a verified execution epoch"
+    );
+    let completion = gt.begin_context_defaults(26).unwrap();
+    let mut registered = BTreeMap::new();
+    let mut invalidations = 0;
+    for now in 27..300 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        assert!(io.inner.0.borrow().memory.contains_key(&base));
+        if completion.result().is_some() {
+            break;
+        }
+        assert!(gt.user_epoch().is_none());
+        invalidations += service_contexts(&io.inner, &mut registered, true)
+            .iter()
+            .filter(|action| **action == 0x7000)
+            .count();
+    }
+    assert_eq!(completion.result(), Some(Ok(())));
+    assert!(invalidations >= 2 && registered.is_empty());
+    assert!(gt.user_epoch().is_some() && gt.idle());
+    assert!(!io
+        .inner
+        .0
+        .borrow()
+        .writes
+        .iter()
+        .any(|(reg, _)| *reg == 0xe520));
+    (io, arena, gt, base)
+}
+
+fn eu_stall_finish_stop(
+    gt: &mut GuCGt<EuStallWindow, Arena>,
+    io: &EuStallWindow,
+    base: u32,
+    now: u64,
+) {
+    // GuC reset and idle alone cannot retire an exposed sampler BO.
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    reset_done(&io.inner);
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(gt.state(), GtState::ResettingEngines);
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    assert_eq!(io.inner.0.borrow().regs[&0x941c], 1);
+    assert!(gt.poll(now + 1).is_pending());
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    reset_done(&io.inner); // independent GRDOM_FULL self-clear + DMA idle
+    assert!(gt.poll(now + 2).is_pending());
+    assert!(!io.inner.0.borrow().memory.contains_key(&base));
+    assert!(gt.eu_stall_info().is_none());
+    io.inner.0.borrow_mut().regs.insert(0xd84, 0);
+    assert!(gt.poll(now + 3).is_pending());
+    io.inner.0.borrow_mut().regs.insert(0xdfc, 0);
+    assert_eq!(gt.poll(now + 4), Poll::Ready(Ok(GtState::Stopped)));
+}
+
+fn smoke_hardware_eu_stall_preallocation_epoch_and_full_reset_retirement() -> TestResult {
+    use crate::intel_gpu_eu_stall::{Config, Operation, Session};
+    let (io, arena, mut gt, base) = eu_stall_gt();
+    let session = Session::new(gt.eu_stall_info().unwrap(), Config { rate: 4, wait: 1 }).unwrap();
+    gt.control_eu_stall(session.clone(), Operation::Attach, || true)
+        .unwrap();
+    gt.control_eu_stall(session.clone(), Operation::Enable, || true)
+        .unwrap();
+    assert!(!gt.idle());
+    for dss in 0..3 {
+        assert_eq!(io.samplers.borrow().values[&(dss, 0xe520)], base | 0x12);
+    }
+    let memory = io.inner.0.borrow().memory[&base].clone();
+    memory.borrow_mut()[..16].copy_from_slice(&[0x4e415246; 16]);
+    io.samplers.borrow_mut().values.insert((0, 0xe528), 4); //one64-byte record
+    gt.poll_eu_stall(500, || true);
+    let mut bytes = [0; 64];
+    assert_eq!(session.read_for_test(&mut bytes), Ok(64));
+    assert!(bytes
+        .chunks_exact(4)
+        .all(|word| word == 0x4e415246u32.to_le_bytes()));
+    let retained = arena.live_allocations();
+    gt.begin_stop(600).unwrap();
+    assert!(gt.user_epoch().is_none());
+    assert_eq!(
+        session.read_for_test(&mut bytes),
+        Err(narf_filesystem::FsError::NoDevice)
+    );
+    assert_eq!(arena.live_allocations(), retained);
+    assert!(gt.poll(601).is_pending());
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    eu_stall_finish_stop(&mut gt, &io, base, 602);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_eu_stall_preallocation_epoch_and_full_reset_retirement
+);
+
+fn smoke_hardware_eu_stall_busy_mcr_and_authority_loss_escalate_with_dma_retained() -> TestResult {
+    use crate::intel_gpu_eu_stall::{Config, Operation, Session};
+    for failure in 0..3 {
+        let (io, arena, mut gt, base) = eu_stall_gt();
+        let session =
+            Session::new(gt.eu_stall_info().unwrap(), Config { rate: 4, wait: 1 }).unwrap();
+        gt.control_eu_stall(session.clone(), Operation::Attach, || true)
+            .unwrap();
+        gt.control_eu_stall(session.clone(), Operation::Enable, || true)
+            .unwrap();
+        if failure == 0 {
+            io.inner.0.borrow_mut().regs.insert(0xfd0, 0);
+        } else if failure == 1 {
+            io.samplers.borrow_mut().lost = true;
+        } else {
+            let reads = io.inner.0.borrow().mmio_reads.get();
+            gt.poll_eu_stall(550, || false);
+            assert_eq!(
+                io.inner.0.borrow().mmio_reads.get(),
+                reads,
+                "denied authority performed wake MMIO"
+            );
+            assert_eq!(
+                gt.control_eu_stall(session.clone(), Operation::Enable, || false),
+                Err(narf_filesystem::FsError::NoDevice)
+            );
+            assert_eq!(io.inner.0.borrow().mmio_reads.get(), reads);
+            assert!(!gt.idle());
+        }
+        let retained = arena.live_allocations();
+        gt.begin_stop(600).unwrap();
+        assert_eq!(
+            session.read_for_test(&mut [0; 64]),
+            Err(narf_filesystem::FsError::NoDevice)
+        );
+        assert!(gt.poll(601).is_pending());
+        if failure == 0 {
+            // A busy steering semaphore gets its bounded retry window; it
+            // cannot postpone the independent whole-GT reset indefinitely.
+            assert_eq!(io.inner.0.borrow().regs[&0xc000], 0x8000f000);
+            assert_eq!(arena.live_allocations(), retained);
+            assert!(gt.poll(50_000_601).is_pending());
+        }
+        assert!(io.inner.0.borrow().memory.contains_key(&base));
+        let reset_at = if failure == 0 { 50_000_602 } else { 602 };
+        eu_stall_finish_stop(&mut gt, &io, base, reset_at);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_eu_stall_busy_mcr_and_authority_loss_escalate_with_dma_retained
+);
+
 fn smoke_hardware_irq_notification_requires_actual_retirement() -> TestResult {
     for (platform, ack) in [
         (
@@ -203,7 +464,7 @@ fn hardware_model_with_interface(
     (window, arena, gt)
 }
 
-fn hardware_discovery(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
+fn hardware_discovery<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window, ack: u64) {
     gt.begin(0).unwrap();
     assert!(gt.poll(1).is_pending());
     w.0.borrow_mut().regs.insert(ack, 1);
@@ -402,10 +663,14 @@ kernel_test_in!(
     smoke_hardware_fuse_admission_before_dma_and_scheduling
 );
 
-fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+fn hardware_scheduling_reload<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window) {
     hardware_scheduling_reload_mode(gt, w, 1);
 }
-fn hardware_scheduling_reload_mode(gt: &mut GuCGt<Window, Arena>, w: &Window, mode: u8) {
+fn hardware_scheduling_reload_mode<M: MmioWindow + Clone>(
+    gt: &mut GuCGt<M, Arena>,
+    w: &Window,
+    mode: u8,
+) {
     // Firmware's old incarnation left bytes in this exact retained log BO.
     // Scheduling reload must clear them only after proving GuC reset.
     let logs = {
@@ -449,7 +714,7 @@ fn hardware_scheduling_reload_mode(gt: &mut GuCGt<Window, Arena>, w: &Window, mo
     }
 }
 
-fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+fn hardware_scheduling<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window) {
     hardware_scheduling_reload(gt, w);
     gt.begin_ct(18).unwrap();
     for now in 19..25 {
@@ -1168,13 +1433,122 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
 // Hardware executes each private lane independently after GuC consumes the
 // shared WQ. Tests may withhold one lane without forging parent completion.
 fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
-    let first = w.0.borrow().memory[&base].borrow()[1026];
-    w.0.borrow_mut().parallel_starts.push((id, base));
-    if matches!(first, 0x22244 | 0x3ee244) {
-        execute_copy(w, base);
-    } else {
-        execute_compute(w, base);
+    let group = w.0.borrow().parallel_contexts[&id].clone();
+    let image = w.0.borrow().memory[&base].clone();
+    let (first, tail, ring) = {
+        let words = image.borrow();
+        (
+            words[1026],
+            words[1031],
+            w.0.borrow().memory[&words[1033]].clone(),
+        )
+    };
+    let split = ring.borrow()[..tail as usize / 4]
+        .iter()
+        .position(|word| *word == 0x0e40c002);
+    if image.borrow()[0x800 / 4] == 0 {
+        // Hardware can stop at a semaphore, after executing the complete
+        // payload and its first flush/breadcrumb. Decode that prefix through
+        // the unchanged class model; no child completion is synthesized.
+        if let Some(split) = split {
+            assert_eq!(base, group.images[0]);
+            image.borrow_mut()[1031] = split as u32 * 4;
+        }
+        w.0.borrow_mut().parallel_starts.push((id, base));
+        if matches!(first, 0x22244 | 0x3ee244) {
+            execute_copy(w, base);
+        } else {
+            execute_compute(w, base);
+        }
+        image.borrow_mut()[1031] = tail;
     }
+    execute_parallel_join(w, id);
+}
+
+fn execute_parallel_join(w: &Window, id: u32) {
+    let d = w.0.borrow();
+    let group = d.parallel_contexts[&id].clone();
+    let image = d.memory[&group.images[0]].clone();
+    let image_words = image.borrow();
+    let tail = image_words[1031];
+    let ring = d.memory[&image_words[1033]].borrow();
+    let words = &ring[..tail as usize / 4];
+    let Some(start) = words.iter().position(|word| *word == 0x0e40c002) else {
+        return;
+    };
+    let scratch = d.memory[&group.scratch].clone();
+    if scratch.borrow()[128 / 4] != 0 || image_words[0x800 / 4] == 0 {
+        return;
+    }
+    let stamp = image_words[0x800 / 4];
+    let mut i = start;
+    for child in &group.images[1..] {
+        assert_eq!(&words[i..i + 4], &[0x0e40c002, stamp, child + 0x800, 0]);
+        if d.memory[child].borrow()[0x800 / 4] != stamp {
+            drop(image_words);
+            image.borrow_mut()[1029] = i as u32 * 4;
+            return;
+        }
+        i += 4;
+    }
+    if d.parallel_join_hold {
+        return;
+    }
+    assert_eq!(words[i], 0x04000000);
+    i += 1;
+    let copy = matches!(image_words[1026], 0x22244 | 0x3ee244);
+    if copy {
+        assert_eq!(&words[i..i + 4], &[0x13000002, 0, 0, 0]);
+        i += 4;
+    }
+    assert_eq!(words[i], 0x10200003);
+    let address = u64::from(words[i + 1]) | u64::from(words[i + 2]) << 32;
+    let value = u64::from(words[i + 3]) | u64::from(words[i + 4]) << 32;
+    let root = u64::from(image_words[1073]) << 32 | u64::from(image_words[1075]);
+    i += 5;
+    if copy {
+        assert_eq!(
+            &words[i..i + 4],
+            &[0x13004002, (group.scratch + 128) | 4, 0, stamp]
+        );
+        i += 4;
+    } else {
+        assert_eq!(
+            &words[i..i + 7],
+            &[0, 0x7a000004, 0x01104080, group.scratch + 128, 0, stamp, 0]
+        );
+        i += 7;
+    }
+    assert_eq!(&words[i..i + 3], &[0x01000000, 0x04000001, 0x02800000]);
+    assert!(words[i + 3..].iter().all(|word| *word == 0));
+    let mut page = root & 0x0000_3fff_ffff_f000;
+    assert_eq!(address & 7, 0);
+    for shift in [39, 30, 21, 12] {
+        let table = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
+        // SAFETY: real resident production PPGTT pages remain owned by the
+        // group; this independent decoder never dereferences user pointers.
+        let entry =
+            unsafe { core::ptr::read_volatile(table.add(((address >> shift) & 511) as usize)) };
+        assert_eq!(entry & 3, 3, "user fence requires a present writable leaf");
+        page = entry & 0x0000_3fff_ffff_f000;
+        if shift == 12 && entry & (1 << 11) != 0 {
+            let cpu = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+            assert_ne!(cpu, 0);
+            page += cpu;
+        }
+    }
+    let target = narf_memory::PhysAddr::new(page | (address & 4095)).kernel_mut_ptr::<u64>();
+    // SAFETY: the walk above proved one aligned owned writable qword. The
+    // single GPU store follows every independently fetched child semaphore.
+    unsafe { core::ptr::write_volatile(target, value) };
+    scratch.borrow_mut()[128 / 4] = stamp;
+    drop(image_words);
+    image.borrow_mut()[1029] = tail;
+    drop(ring);
+    drop(d);
+    w.0.borrow_mut()
+        .parallel_join_stores
+        .push((id, address, value));
 }
 
 // Independent GuC choice plus hardware restore execution. The production
@@ -1494,7 +1868,14 @@ fn execute_compute(w: &Window, base: u32) {
     };
     if root != 0 {
         let regs = d.regs.clone();
-        execute_ppgtt_probe(&regs, &image.borrow(), &ring, stamp, base, true);
+        execute_ppgtt_probe(
+            &regs,
+            &image.borrow(),
+            &ring[..tail as usize / 4],
+            stamp,
+            base,
+            true,
+        );
     } else if tail != 32 {
         // ARB_ON, then the optional Xe2 WMTP level, then the compute flush.
         let seed = &words[1..];

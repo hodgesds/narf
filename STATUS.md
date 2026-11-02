@@ -1590,6 +1590,27 @@ workstreams, without a completion percentage. Multi-placement/GPU joins, general
 broader display/output/diagnostics/power services and additional platforms
 remain open. Intel silicon and Mesa acceptance remain unrun.
 
+The ninth Intel checkpoint adds all-lane GPU user-fence joins to native
+single-row COPY/COMPUTE groups, with one parent qword store and a separate
+private final marker/watchdog. Qualified MTL/Arrow legacy gamma now uses the
+actual 256-entry palette through the common KMS FIFO, publishing its legacy
+store only after confirmed hardware completion. BMG PSYS card PL1/PL2 and
+intervals share the existing fair PCODE owner, retained firmware ceilings and
+whole-pair readback. Default-off privileged BMG EU-stall observation owns real
+sparse-DSS buffers and a bounded host FIFO; copy-before-ack, explicit observed
+loss, current authority and full-reset DMA retirement bound the profile.
+WAIT_NUM_REPORTS=1 is supported; OA and broader thresholds remain open.
+
+All 25 new native fixtures pass; selected Intel/DRM/framebuffer and backlight
+groups pass 949 unique x86_64 tests, including 31 shared backlight regressions,
+with zero failures/skips. Production boot and both btrfs postflights pass.
+GPU/fb target CI Clippy passes all three contexts on both architectures; all
+four host GPU configurations pass all-target Clippy, and debug/release builds
+pass on both targets. Formatting, diff and final source-integrity checks pass.
+aarch64 QEMU is omitted under the maintainer's iteration policy. The ledger
+records 32 implemented checkpoint rows and ten broad open workstreams;
+hardware and Mesa acceptance remain separate, unrun gates.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
