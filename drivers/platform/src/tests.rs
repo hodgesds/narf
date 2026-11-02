@@ -896,6 +896,158 @@ fn smoke_ec_synthetic_gpe_block_walk() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("drivers/platform/ec", smoke_ec_synthetic_gpe_block_walk);
 
+/// Simulated-EC port conversation feeding the thermal loop (#915
+/// remainder). The platform/power harnesses had no simulated EC
+/// to drive: `narf_aml::ec::FakeEcIo` existed but shortcut the
+/// port conversation (direct memory access, no IBF/OBF phasing).
+/// This smoke drives the full ACPI 6.5 §12.3 conversation through
+/// the fake's phased methods — RD_EC/WR_EC/QR_EC with IBF/OBF
+/// transitions asserted at each step — then feeds the EC-read
+/// temperature into the thermal registry and asserts the
+/// governor classification. It pins the harness, not production:
+/// production EC reads still go through real port I/O; what this
+/// proves is that a simulated EC can drive the thermal decision
+/// path end to end in tests. The fake's temperature encoding
+/// (one EC byte = one degree C) is a fixture choice, not a claim
+/// about any real EC's register layout.
+fn smoke_simulated_ec_conversation_feeds_thermal() -> TestResult {
+    use narf_aml::ec::{
+        FakeEcIo, CMD_QR_EC, CMD_RD_EC, CMD_WR_EC, STATUS_IBF, STATUS_OBF, STATUS_SCI_EVT,
+    };
+    use narf_power::thermal::ThermalState;
+
+    // (1) Seed: EC temperature register 0x60 reads 75.
+    let mut fake = FakeEcIo::new();
+    fake.set_mem(0x60, 75);
+
+    // (2) RD_EC conversation, mirroring the driver's wait
+    // sequence: IBF clear → write cmd → drain → IBF clear →
+    // write addr → drain → OBF set → read data.
+    if fake.read_status() & STATUS_IBF != 0 {
+        return TestResult::Fail("fresh fake must start with IBF clear");
+    }
+    if !fake.write_cmd(CMD_RD_EC) {
+        return TestResult::Fail("RD_EC command rejected");
+    }
+    if fake.read_status() & STATUS_IBF == 0 {
+        return TestResult::Fail("command write must set IBF");
+    }
+    if !fake.drain_input() {
+        return TestResult::Fail("command drain rejected");
+    }
+    if fake.read_status() & STATUS_IBF != 0 {
+        return TestResult::Fail("drain must clear IBF");
+    }
+    if !fake.write_data(0x60) {
+        return TestResult::Fail("address write rejected");
+    }
+    if !fake.drain_input() {
+        return TestResult::Fail("address drain rejected");
+    }
+    if fake.read_status() & STATUS_OBF == 0 {
+        return TestResult::Fail("address drain must set OBF");
+    }
+    match fake.read_data() {
+        Some(75) => {}
+        _ => return TestResult::Fail("RD_EC conversation read wrong temperature"),
+    }
+
+    // (3) WR_EC conversation: store a fan-duty byte, read it
+    // back through a fresh RD_EC conversation.
+    if !fake.write_cmd(CMD_WR_EC) || !fake.drain_input() {
+        return TestResult::Fail("WR_EC command rejected");
+    }
+    if !fake.write_data(0x61) || !fake.drain_input() {
+        return TestResult::Fail("WR_EC address rejected");
+    }
+    if !fake.write_data(0x2A) || !fake.drain_input() {
+        return TestResult::Fail("WR_EC value rejected");
+    }
+    if !fake.write_cmd(CMD_RD_EC) || !fake.drain_input() {
+        return TestResult::Fail("read-back command rejected");
+    }
+    if !fake.write_data(0x61) || !fake.drain_input() {
+        return TestResult::Fail("read-back address rejected");
+    }
+    match fake.read_data() {
+        Some(0x2A) => {}
+        _ => return TestResult::Fail("WR_EC value did not land in EC memory"),
+    }
+
+    // (4) QR_EC conversation: two queued queries, SCI set until
+    // the queue drains, then an empty-queue query reads 0.
+    fake.queue_query(0x08);
+    fake.queue_query(0xA0);
+    if fake.read_status() & STATUS_SCI_EVT == 0 {
+        return TestResult::Fail("queued queries must set SCI_EVT");
+    }
+    for want in [0x08u8, 0xA0] {
+        if !fake.write_cmd(CMD_QR_EC) || !fake.drain_input() {
+            return TestResult::Fail("QR_EC command rejected");
+        }
+        match fake.read_data() {
+            Some(q) if q == want => {}
+            _ => return TestResult::Fail("QR_EC delivered wrong query byte"),
+        }
+    }
+    if fake.read_status() & STATUS_SCI_EVT != 0 {
+        return TestResult::Fail("SCI_EVT must clear once the queue drains");
+    }
+    if !fake.write_cmd(CMD_QR_EC) || !fake.drain_input() {
+        return TestResult::Fail("empty-queue QR_EC rejected");
+    }
+    match fake.read_data() {
+        Some(0) => {}
+        _ => return TestResult::Fail("empty-queue QR_EC must read 0"),
+    }
+
+    // (5) Protocol violations are rejected, each isolated on a
+    // fresh fake so one violation cannot mask another.
+    let mut bad = FakeEcIo::new();
+    if bad.read_data().is_some() {
+        return TestResult::Fail("read with OBF clear must return None");
+    }
+    if bad.write_data(0x00) {
+        return TestResult::Fail("data write with no transaction must fail");
+    }
+    if !bad.write_cmd(CMD_RD_EC) {
+        return TestResult::Fail("violation-probe command rejected");
+    }
+    if bad.write_cmd(CMD_RD_EC) {
+        return TestResult::Fail("command write while IBF set must fail");
+    }
+    let mut bad2 = FakeEcIo::new();
+    if bad2.write_cmd(0xFF) {
+        return TestResult::Fail("unknown command must fail");
+    }
+
+    // (6) Thermal tail: the EC-read 75 C drives the registry
+    // classification, the same path record_temp feeds in the
+    // vendor-fan smokes.
+    ensure_thermal_registry();
+    let cap = narf_power::bootstrap_thermal_authority();
+    if narf_power::thermal::install_active_cooling(&cap, narf_power::thermal::StepPolicy).is_err() {
+        return TestResult::Fail("install_active_cooling rejected a live cap");
+    }
+    let zone = match narf_power::thermal::register_zone(&cap, "TZEC", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+    match narf_power::thermal::record_temp(zone, 40_000) {
+        Ok(ThermalState::Normal) => {}
+        _ => return TestResult::Fail("40 C did not classify Normal"),
+    }
+    match narf_power::thermal::record_temp(zone, 75_000) {
+        Ok(ThermalState::Warm) => {}
+        _ => return TestResult::Fail("EC-read 75 C did not classify Warm"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/ec",
+    smoke_simulated_ec_conversation_feeds_thermal
+);
+
 fn smoke_lid_subscriber_install_and_reset() -> TestResult {
     use crate::lid;
     use alloc::sync::Arc;

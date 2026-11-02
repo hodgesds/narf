@@ -443,6 +443,15 @@ pub fn register_initcalls() {
 /// and assert against its post-state. The state-machine fidelity
 /// here is what makes the dispatcher test meaningful: a misbehaving
 /// implementation would set SCI but never drain.
+///
+/// The phased methods ([`FakeEcIo::write_cmd`],
+/// [`FakeEcIo::write_data`], [`FakeEcIo::drain_input`],
+/// [`FakeEcIo::read_data`]) model the full ACPI 6.5 §12.3 port
+/// conversation — command/address/data phases with IBF/OBF
+/// transitions — for harnesses that need to drive the EC
+/// conversation itself, not just its post-state. Phased methods
+/// and direct flag pokes (`set_obf`/`set_ibf`) are separate
+/// usage modes; do not mix them in one test.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct FakeEcIo {
@@ -456,6 +465,52 @@ pub struct FakeEcIo {
     pub obf: bool,
     /// Whether IBF is asserted (mock host write not yet drained).
     pub ibf: bool,
+    /// Conversation phase for the phased port model. Private:
+    /// tests drive the conversation through methods, never by
+    /// poking phase.
+    phase: FakeEcPhase,
+    /// Command latched by the last `write_cmd`, awaiting drain.
+    pending_cmd: u8,
+    /// Address latched by `write_data` in the address phase.
+    pending_addr: u8,
+    /// Value latched by `write_data` in the value phase of a
+    /// WR_EC transaction, stored on drain.
+    pending_value: u8,
+    /// Byte staged for the host to read once OBF is set.
+    data_reg: u8,
+    /// Whether burst mode is active (BE_EC seen, BD_EC not yet).
+    burst: bool,
+}
+
+/// Phase of the [`FakeEcIo`] port conversation. Models the
+/// ACPI 6.5 §12.3 host/EC handshake at the granularity a test
+/// can observe: the host writes a byte (IBF sets), the EC
+/// consumes it ([`FakeEcIo::drain_input`], IBF clears), and the
+/// EC answers by setting OBF with a staged byte. Each host
+/// write latches a `*Pending` phase; drain advances it, so a
+/// test observes IBF set after every write and clear after
+/// every drain, exactly as the driver waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FakeEcPhase {
+    /// No transaction in flight.
+    Idle,
+    /// A command byte was written and IBF is set; drain
+    /// consumes it and moves to the command's next phase.
+    CmdPending,
+    /// A RD_EC/WR_EC command was consumed; the next data byte
+    /// is the EC memory address.
+    AwaitAddr,
+    /// An address byte was written and IBF is set; drain
+    /// consumes it (RD_EC stages data, WR_EC moves to value).
+    AddrPending,
+    /// A WR_EC address was consumed; the next data byte is the
+    /// value to store.
+    AwaitValue,
+    /// A value byte was written and IBF is set; drain stores it.
+    ValuePending,
+    /// A byte is staged in `data_reg` with OBF set, awaiting
+    /// [`FakeEcIo::read_data`].
+    DataReady,
 }
 
 impl FakeEcIo {
@@ -467,6 +522,12 @@ impl FakeEcIo {
             sci: false,
             obf: false,
             ibf: false,
+            phase: FakeEcPhase::Idle,
+            pending_cmd: 0,
+            pending_addr: 0,
+            pending_value: 0,
+            data_reg: 0,
+            burst: false,
         }
     }
 
@@ -508,6 +569,11 @@ impl FakeEcIo {
         if self.ibf {
             s |= STATUS_IBF;
         }
+        // Status-bit layout per the EC status documentation
+        // (0 = OBF, 1 = IBF, 4 = BURST, 5 = SCI_EVT, 6 = SMI_EVT).
+        if self.burst {
+            s |= 1 << 4;
+        }
         s
     }
 
@@ -535,6 +601,139 @@ impl FakeEcIo {
             self.sci = false;
             0
         }
+    }
+
+    /// Write a byte to the command port, starting a transaction.
+    /// Mirrors the driver's `outb(cmd_port, cmd)`: IBF sets, and
+    /// the EC consumes the byte on [`FakeEcIo::drain_input`].
+    /// Accepts only the commands the in-tree driver issues
+    /// (RD_EC, WR_EC, BE_EC, BD_EC, QR_EC); anything else, a
+    /// write while IBF is set, or a write mid-transaction is a
+    /// protocol violation and returns `false` with state
+    /// unchanged.
+    pub fn write_cmd(&mut self, cmd: u8) -> bool {
+        if self.ibf || self.phase != FakeEcPhase::Idle {
+            return false;
+        }
+        match cmd {
+            CMD_RD_EC | CMD_WR_EC | CMD_QR_EC | CMD_BE_EC | CMD_BD_EC => {}
+            _ => return false,
+        }
+        self.pending_cmd = cmd;
+        self.phase = FakeEcPhase::CmdPending;
+        self.ibf = true;
+        true
+    }
+
+    /// Write a byte to the data port. Only valid in the address
+    /// phase (the byte is the EC memory address) or the value
+    /// phase of a WR_EC transaction (the byte is latched and
+    /// stored on drain). Sets IBF; the EC consumes the byte on
+    /// [`FakeEcIo::drain_input`]. Returns `false` on any
+    /// protocol violation, state unchanged.
+    pub fn write_data(&mut self, byte: u8) -> bool {
+        if self.ibf {
+            return false;
+        }
+        match self.phase {
+            FakeEcPhase::AwaitAddr => {
+                self.pending_addr = byte;
+                self.phase = FakeEcPhase::AddrPending;
+                self.ibf = true;
+                true
+            }
+            FakeEcPhase::AwaitValue => {
+                self.pending_value = byte;
+                self.phase = FakeEcPhase::ValuePending;
+                self.ibf = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Model the EC consuming a host-written byte: clears IBF and
+    /// advances the transaction. Command drain moves RD_EC/WR_EC
+    /// to the address phase, QR_EC delivers the next queued query
+    /// (or 0) with OBF set and clears SCI_EVT once the queue is
+    /// empty, BE_EC sets burst mode and stages the 0x90
+    /// acknowledgement with OBF set (per the `burst_enable`
+    /// documentation: the EC writes 0x90 and the next read
+    /// drains it), and BD_EC clears burst mode. Address drain
+    /// stages the addressed byte with OBF set for RD_EC, or
+    /// moves WR_EC to the value phase; value drain stores it.
+    /// Returns `false` when IBF is clear (nothing to drain),
+    /// state unchanged. IBF set outside a latched write (e.g.
+    /// after a direct `set_ibf` poke) is simply cleared.
+    pub fn drain_input(&mut self) -> bool {
+        if !self.ibf {
+            return false;
+        }
+        self.ibf = false;
+        match self.phase {
+            FakeEcPhase::CmdPending => match self.pending_cmd {
+                CMD_RD_EC | CMD_WR_EC => {
+                    self.phase = FakeEcPhase::AwaitAddr;
+                }
+                CMD_QR_EC => {
+                    self.data_reg = if self.query_queue.is_empty() {
+                        0
+                    } else {
+                        self.query_queue.remove(0)
+                    };
+                    if self.query_queue.is_empty() {
+                        self.sci = false;
+                    }
+                    self.obf = true;
+                    self.phase = FakeEcPhase::DataReady;
+                }
+                CMD_BE_EC => {
+                    self.burst = true;
+                    self.data_reg = 0x90;
+                    self.obf = true;
+                    self.phase = FakeEcPhase::DataReady;
+                }
+                CMD_BD_EC => {
+                    self.burst = false;
+                    self.phase = FakeEcPhase::Idle;
+                }
+                _ => {
+                    // Unreachable: write_cmd validates the command.
+                    self.phase = FakeEcPhase::Idle;
+                }
+            },
+            FakeEcPhase::AddrPending => {
+                if self.pending_cmd == CMD_RD_EC {
+                    self.data_reg = self.memory[self.pending_addr as usize];
+                    self.obf = true;
+                    self.phase = FakeEcPhase::DataReady;
+                } else {
+                    // WR_EC: address consumed, value follows.
+                    self.phase = FakeEcPhase::AwaitValue;
+                }
+            }
+            FakeEcPhase::ValuePending => {
+                self.memory[self.pending_addr as usize] = self.pending_value;
+                self.phase = FakeEcPhase::Idle;
+            }
+            FakeEcPhase::Idle
+            | FakeEcPhase::AwaitAddr
+            | FakeEcPhase::AwaitValue
+            | FakeEcPhase::DataReady => {}
+        }
+        true
+    }
+
+    /// Read the data port. Only valid once OBF is set; returns
+    /// the staged byte and clears OBF. Returns `None` when OBF
+    /// is clear (a host read with no data ready).
+    pub fn read_data(&mut self) -> Option<u8> {
+        if !self.obf {
+            return None;
+        }
+        self.obf = false;
+        self.phase = FakeEcPhase::Idle;
+        Some(self.data_reg)
     }
 }
 
