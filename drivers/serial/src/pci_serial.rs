@@ -298,18 +298,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
-    // The shared registry describes ports by I/O base. A
-    // memory-mapped port has no meaningful `io_base`, so only
-    // I/O-space ports are published there; MMIO ones stay visible
-    // through `ports()`.
-    if let UartBase::Io(io_base) = port.base {
-        registry::register(UartInfo {
-            io_base,
-            irq: None,
-            name: "pci-serial",
-            baud: DEFAULT_BAUD,
-        });
-    }
+    // The registry carries the port's real base (I/O or MMIO), so
+    // every probed PCI port is published there — including MMIO ones,
+    // which the old I/O-base-only registry could not describe. The
+    // bring-up above programs byte stride for MMIO ports, matching
+    // Linux's `pbn_default`.
+    registry::register(UartInfo {
+        base: port.base,
+        reg_shift: 0,
+        clock_hz: crate::uart_8250::UART_CLOCK_HZ,
+        irq: None,
+        name: "pci-serial",
+        baud: DEFAULT_BAUD,
+    });
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("pci-serial"),

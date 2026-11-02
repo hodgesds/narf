@@ -823,6 +823,52 @@ uses this note to identify kernel samples in persisted `perf.data`.
 `/proc/buddyinfo` reports live per-order free-block counts, while
 `/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
 
+### 3.3.3 Probed-UART ttys (`/dev/ttyS<N>`, N >= 1)
+
+The serial registry (`drivers/serial/src/registry.rs`) is consumed by
+the tty layer: every probed UART beyond the console UART gets one
+`/dev/ttyS<N>` node reusing the existing `TtyPort` termios, line
+discipline and foreground-group machinery (`filesystem/src/console_tty.rs`).
+
+- **Numbering.** `ttyS0` is always the console-UART singleton and is
+  never duplicated: the registry entry at the console UART's I/O base
+  (COM1 `0x3F8` on x86_64) is skipped. Remaining entries number
+  `ttyS(1+k)` in registry order, so with COM1 registered first,
+  COM2→`ttyS1`, COM3→`ttyS2`, COM4→`ttyS3`, then PCI and Intel LPSS
+  ports in probe order. At most 64 extra ports are published
+  (`ttyS1`..`ttyS64`); further entries are ignored.
+- **Ids and nodes.** `ttyS<n>` has tty id `TTY_ID_SERIAL0 - n` (a
+  descending block below `ttyS0`, disjoint from `/dev/pts` indices)
+  and device number char 4:64+n, as on Linux. `is_console_tty_id`
+  covers the whole block, so a `ttyS1` fd takes the console path for
+  `/dev/tty` opens, PTY job-control filtering and console-reader
+  accounting exactly like `ttyS0`. Devfs resolves `ttyS<n>` on open
+  (same pattern as the `ttyN` fallback); a name with no such port is
+  ENOENT, never an alias of another port. Nodes resolve on open but
+  are not enumerated in readdir.
+- **Backend.** A probed-UART tty's backend is a polled 8250 handle
+  rebuilt from its registry entry (real base — I/O or MMIO — plus
+  register stride and clock), not the console UART's IRQ-fed byte
+  ring: writes poll THRE per byte, reads poll DR, readability peeks
+  at LSR without consuming. The `ttyS0` path is byte-identical and
+  untouched. The VT/KD ioctl guard applies to probed-UART ttys as it
+  does to `ttyS0` (they answer -ENOTTY).
+- **Console split (explicit).** Probed-UART ttys are data ttys, not
+  registered consoles: `console=` still accepts only `ttyS0` (plus
+  the VTs), `/dev/console` never selects a `ttyS1+` port, and
+  `/sys/class/tty/console/active` never lists one. Selecting a
+  `ttyS1+` port as the kernel console is a follow-up.
+- **Documented limitations.** (1) The port table is built lazily from
+  a registry snapshot and then frozen; later PCI hotplug does not
+  appear. (2) Blocking reads on a polled port have no IRQ wake: a
+  parked reader is served only while a read is actively polling.
+  (3) The legacy probe never reports absence on x86_64, so a phantom
+  COM port gets a tty whose reads return a perpetual `0xFF` stream
+  (an absent UART reads LSR as `0xFF`); no `0xFF` filter is added,
+  since `0xFF` is a valid data byte. (4) On aarch64 the 8250
+  accessors are stubs and PL011 registers nothing, so the table is
+  empty there in practice.
+
 ### 3.4 Directory operations
 
 ```rust

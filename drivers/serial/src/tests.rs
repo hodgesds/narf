@@ -174,7 +174,9 @@ kernel_test_in!("drivers/serial/8250", smoke_8250_new_state);
 fn smoke_serial_registry() -> TestResult {
     let before = crate::registry::count();
     crate::registry::register(crate::registry::UartInfo {
-        io_base: 0x3F8,
+        base: UartBase::Io(0x3F8),
+        reg_shift: 0,
+        clock_hz: crate::uart_8250::UART_CLOCK_HZ,
         irq: Some(4),
         name: "test-COM1",
         baud: 115_200,
@@ -186,6 +188,42 @@ fn smoke_serial_registry() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/serial/registry", smoke_serial_registry);
+
+/// Registry: an MMIO entry round-trips its real base, stride and
+/// clock — the fields a tty backend rebuilds its handle from. The
+/// old I/O-shim registry could not represent this entry at all.
+fn smoke_serial_registry_mmio_entry_is_truthful() -> TestResult {
+    use narf_memory::PhysAddr;
+    let phys = PhysAddr::new(0xFE00_1000);
+    crate::registry::register(crate::registry::UartInfo {
+        base: UartBase::Mmio(phys),
+        reg_shift: 2,
+        clock_hz: 100_000_000,
+        irq: Some(12),
+        name: "test-LPSS",
+        baud: 115_200,
+    });
+    let found = crate::registry::uarts()
+        .into_iter()
+        .find(|u| u.name == "test-LPSS");
+    let Some(u) = found else {
+        return TestResult::Fail("MMIO registry entry not found in snapshot");
+    };
+    if u.base != UartBase::Mmio(phys) {
+        return TestResult::Fail("MMIO base did not round-trip");
+    }
+    if u.reg_shift != 2 {
+        return TestResult::Fail("MMIO reg_shift did not round-trip");
+    }
+    if u.clock_hz != 100_000_000 {
+        return TestResult::Fail("MMIO clock_hz did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/serial/registry",
+    smoke_serial_registry_mmio_entry_is_truthful
+);
 
 /// LPSS UART: new_mmio constructor.
 fn smoke_lpss_uart_constructor() -> TestResult {

@@ -208,7 +208,14 @@ pub enum UartType {
 }
 
 /// A 8250/16550 UART port.
-#[derive(Debug)]
+///
+/// `PartialEq` is derived so the filesystem crate's `PortKind` (which
+/// holds a `&'static Uart8250` per probed-UART tty) can stay
+/// `PartialEq`: comparing references compares pointees.
+/// The handle is stateless apart from its base/shift/clock — probe
+/// programs the hardware, then the handle may be dropped and rebuilt
+/// from the registry entry, as the PCI and LPSS probes already do.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Uart8250 {
     /// Register base address.
     pub base: UartBase,
@@ -442,7 +449,9 @@ pub fn register_legacy_uarts() {
             utype
         );
         registry::register(registry::UartInfo {
-            io_base: base,
+            base: UartBase::Io(base),
+            reg_shift: 0,
+            clock_hz: UART_CLOCK_HZ,
             irq: Some(irq),
             name,
             baud: 115_200,

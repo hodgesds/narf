@@ -2637,6 +2637,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-crypto",
+ "narf-drivers-serial",
  "narf-efi",
  "narf-init",
  "narf-input",
