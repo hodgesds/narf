@@ -837,9 +837,10 @@ Before prepared/associated publication, the source awake predicates require
 `LDM.EN_32K` clear and MACID0's firmware power-state nibble (`0xca0c & 0xe`)
 clear under the current transaction. `station_control::awake()` exposes those
 two reads to the actual packet adapter without taking another admission lock.
-The fresh FLR/cold-WCPU profile never requests LPS, RPWM power transitions or
-WoW keepalive; an observed sleeping state terminalizes instead of synthesizing
-a wake receipt. Initial and post-join negative models cover every source PS
+The unchanged fresh FLR/cold-WCPU program never requests LPS/RPWM or WoW;
+an observed sleeping state terminalizes instead of synthesizing a wake
+receipt. The separately qualified clock-gated LPS owner below supplies the
+actual sleep/wake continuation; it leaves this ordinary awake gate intact. Initial and post-join negative models cover every source PS
 bit and distinguish unrelated power/MACID bits.
 
 AXB address CAM v0 carries the actual source/peer addresses, exact hashes,
@@ -1793,6 +1794,154 @@ the suspend rows of
 and `smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity`.
 WoW (`wow`) remains open.
 
+### RTL8852B runtime sleep/LPS (implemented; validation pending)
+
+The actual retained `Startup`/verified WCPU, source controller peer and
+`Native` now implement clock-gated LPS for the existing live B station.
+`lps_wire::Profile::from_assets` uses the selected verified inner firmware's
+full W1 version tuple. The admitted WLAN-only coexistence ABI is
+`0.29.29.0 <= version < 0.29.122.0`; those actual images select
+`NO_LPS_PG`, clock-gated RPWM state5, and the old leave DONE_ACK. Installed
+CE images `0.29.29.15` are in this scope. The old normal `0.27.32.1` image,
+newer C2H-register leave ACK (`>=0.29.127`) and beacon-level producer
+(`>=0.29.128`) are outside the current full-radio/coexistence adapter; their
+parser/enum presence grants no native support. B's low-power HCI-mode
+bitmap is zero, so this path retains its actual PCI ring geometry. B also
+returns immediately from BE-only RF_PS, ML_CMN and TRX_PROTECT producers.
+Other AX/BE chips retain their explicit unimplemented chip rows.
+
+The existing N52B awake recipe and N52A/N52T record formats, fingerprints and
+receive promises remain unchanged. Optional signed `N52P` v1 is a128-byte
+expanded **joint** operating record at
+`rtw89/rtw8852b-lps-v1-<mac>.bin`. Offsets0..57 use the companion header,
+vendor/device, source identity, physical MAC and ch1/20MHz/TX-A1/RX-AB
+layout;58..61 contain the exact firmware version and62..127 must be zero.
+The identity binds the installed base record digest/board/full program and
+signer, each actually installed N52A/N52T raw digest, selected image, exact
+LPS/template/restore/coexistence recipe, and the complete joint autonomous
+NULL/PS-Poll/beacon-response plus awake/tracking/aggregation peak envelope.
+It must use the base signer and its existing antenna/current host-power
+limits. A changed tracking window changes this digest. Missing N52P keeps
+awake behavior and no PS opt-in; invalid-present records refuse admission.
+This is measured deployment qualification, not invented board data. No
+physical measurement or native test acceptance is claimed here.
+
+`Device::power_save_default/set_power_save` expose only the actual loaded
+native-program opt-in. The setter stores a persistent preference and wakes
+the retained worker; successful metadata storage is no sleep/wake receipt.
+An original weak `OpenStopTarget` is bound once to the actual netdev
+registration. Before native State locks, its UP event captures the concrete
+`OpenStopEvent::native_identity` weak lifetime and arms the original pump
+waker. A rebind can retain actual administrative UP without a transition:
+after target installation and outside native/provider locks,
+`OpenStopEvent::observe` validates that exact sealed current registration
+snapshot and feeds only its observed UP to the new captured target. No DOWN/
+UP is fabricated; an old owner's token remains dead. A source MAC differing
+from the physical device is refused. This fixed observation only denies: it supplies no administrative,
+device, firmware, RF or wake grant. Synchronous DOWN/MAC/namespace/rebind
+retirement closes the original token before callbacks; later UP with the
+same name/index/MAC cannot revive an old sleeping owner. No source is
+recaptured through a name lookup after a wait.
+
+The same WCPU namespace reserves three distinct packet IDs0..254 before
+any awaited ADD and never reuses them in that firmware epoch, including
+uncertain/cancelled ADD/DEL. Exhaustion requires a fresh physical generation.
+RPWM/CPWM counters also belong to that namespace and do not reset on an
+association or preference change. The actual completed controller commit
+supplies physical own/AP/AID and negotiated WMM: PS-Poll is16 bytes with
+AID|0xc000; NULL is24 bytes; WMM QoS-NULL is26 bytes/QC7, with the Linux
+plain-NULL fallback when no WMM. Actual MAC1/FW_OFFLOAD9/PACKET1 carries
+RECV+DONE and requires the independently copied C2H MAC1/OFLD1/function2
+matching that original ID/op and nonzero length; length is not an invented
+echo requirement, including DEL. GENERAL_PKT then needs its exact native
+DONE. Actual completed RX prefixes precede requests, and original peer,
+firmware, interface lifetime, admission, joint program, capability and
+power scopes enclose actual H2C/doorbell/MMIO and are rechecked after waits.
+Templates are plaintext control/null frames without a DATA payload or host
+key offload. They consume neither host DATA CCMP PN nor DATA QoS SN.
+
+Entry requires the actual host/security/native ownership to be idle:
+no pending packet/terminal reply, incoming/received/management work,
+EDCA/BA setup, reorder hole, originator setup, scan or active key handshake,
+and a completed RX prefix. The existing WPA2/SAE old-key-open rekey is also
+busy. Actual native Core/command queues and RX assembly are independently
+checked. The transition is closed before the first command. Source
+WLAN-only scoreboard FWCTRL/ON updates, fixed PTA/CMAC grant readbacks and
+exact OFF_BT DONE preserve the original no-independent-BT/PTA program;
+no adaptive BT or unmeasured RF alternative is introduced. LPS H2C precedes
+RPWM; proposal metadata grants no hardware readiness. Awaited coexistence and
+command-credit work cannot reuse a stale idle check: a new completed prefix
+is required after OFF_DONE and the native ENTER path checks HCI/backlog again
+inside its actual final publication scope, after allocation and credit waits.
+`power::Error::Busy` here proves no descriptor/doorbell publication occurred;
+it restores only nonemitting coexistence state and defers to the original
+host controller. Current device/binding/joint-program scopes enclose both
+the final guard and the subsequent queue issue/publication. A denied final
+guard leaves the queue pristine and ring/doorbell unchanged; after queue
+issue, an ambiguous error keeps its actual mappings and terminalizes. An ambiguous command/publication still terminalizes. RPWM toggles from the
+actual register with the original next request; only nondeep requests set
+ACK. Deep requires actual LDM32K. Wake captures one CPWM16 observation and
+checks exact original request/next-response/state together; failed polls
+consume no response counter. Three bounded15ms attempts preserve the
+source10us enter/150us leave poll periods.
+
+Ordinary packet/control publication and every BB track read/write remain
+closed through actual CPWM Active, source PHY environment/PHYSTS restoration,
+leave DONE_ACK and MACID0 `0xca0c & 0xe == 0`, then coexistence restoration.
+A transient firmware-clear LDM bit alone cannot open them. Synchronous drain
+skips a sleeping/uncertain owner; it cannot perform an implicit wake or RF
+tracking. The retained async worker wakes for original MSI/TX kicks,
+actual HCI RX producer/backlog observations even in polled mode, host queued
+DATA/control, BA deadlines and due periodic/enhanced tracking. Its100ms
+sleep backstop checks fixed current sources/HCI without reading BB or
+wake-spinning every millisecond. The shared Line is a scheduling hint, not
+an unconditional RF-wake request. The retained native path masks/recognizes/
+acknowledges/rearms actual IRQ causes and checks concrete HCI/backlog work;
+consumed own transition DONE interrupts with no pending work stay asleep.
+After transition receipts, the worker samples the Line counter and then
+rechecks original source/native/host work before waiting: earlier real work
+is found by that check and later raises remain newer than the wait baseline.
+Fatal/stuck/unavailable native causes take terminal cleanup. New RX received during entry is serviced
+after the wake; the existing ordinary RX-prefix admission still precedes
+host DATA/security publication. Queued originals survive and are protected
+only after actual wake and ordinary admission. Neither DATA PN/SN nor an
+old installed key is reconstructed on resume.
+
+A wake/leave can emit an installed NULL, so dead interface/peer/device/RF
+sources never borrow cleanup permission to wake. Deep/interrupted ordinary
+stop instead retains mappings and closes the producer. Actual still-current
+device authority can retire the same owner via a nonemitting retained PCI
+FLR, with IRQ release **before** its quarantine. `Reset` is stored before
+await; ordinary, packet/control cleanup, fail/drop and analog shutdown cannot
+access config/MMIO while it is retained. Only its sealed successful
+same-function temporal fence can release the old DMA. Cancellation or a
+missing device capability retains uncertain mappings. No BME-off, metadata
+bool or proposed reset frees them. The original generation's asynchronous
+shutdown uses this path for removal/system suspend; retirement is sampled
+after the awaited physical proof before existing fresh-generation restart.
+A replacement still needs its independent repeated-lifecycle qualification;
+old namespaces/programs are never reopened.
+
+Seven new source cases cover actual controller peer/template envelopes,
+independent ACK/C2H and non-echo DEL, signed joint artifact/window binding,
+RPWM/atomic CPWM/retry/restore, original source loss at waits, dropped ADD and
+RPWM owners/IDs, public WPA2/CCMP DATA PN/SN continuity, actual polled RX wake,
+DOWN/UP denial with no NULL leave, consumed-DONE worker stability, and actual
+raw deauth arriving during OFF_DONE/credit waits without ENTER publication.
+An existing LPS registration also executes the actual retained
+`Native`/`NativeIo` and command queue against inert MMIO/DMA and authenticated
+record/controller boundaries, including late final-producer Busy without
+queue/ring/doorbell change, original current program/peer/UP refusal, closed
+BB tracking and actual sealed FLR binding/failure. These boundaries grant no
+real attach/calibration or physical measurement. Preserved-UP generation
+rebind is covered without an administrative toggle. Existing cases/
+registrations remain.
+They have not run; release metadata/native two-arch/physical gates remain
+pending. Primary reference: local Linux7.3-rc4
+`rtw89/{ps.c,mac.c,fw.c,fw.h,phy.c,coex.c,rtw8852b.c,rtw8852be.c}` and
+`mac80211/{tx.c,rx.c}`. Source hashes and exact selected-image evidence are
+preserved with the source handoff.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -1850,8 +1999,8 @@ with its distinct BE generation. B now has signed-program HT20, HE20 (with
 firmware GI/LTF selection), all-AC/TID QoS, firmware RA, recipient
 BA/reorder, MSI delivery, live EDCA and active channel-1 scans (section 3);
 HE +HTC and originator TX A-MPDU are now implemented. It still needs wider
-widths, other channels, runtime sleep/WoW and
-in-place SER L1 recovery. A/C/51 need complete chip-specific
+widths, other channels, WoW and in-place SER L1 recovery. The admitted B
+runtime-sleep source path below is implemented pending validation. A/C/51 need complete chip-specific
 firmware/security, BB/RF/power/packet/station composition;8922A additionally
 needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
 masks make6GHz inapplicable to A/B/51, not to C/8922A. These are remaining
@@ -1922,7 +2071,7 @@ triage above remains separate from implementation.
 | `fragmentation` | Native packet admission still refuses nonzero fragment numbers/More-Fragments. Host split/reassembly, per-fragment PN and terminal receipt ownership, bounded reassembly lifetimes and matching signed emission programs must be added; the shared fragmentation-threshold control API alone does not implement them. |
 | `monitor_mode` | The retained station facade has no native monitor transition or raw/radiotap publication owner. It needs original MPDUs plus actual PHY-status/PPDU metadata and generation-fenced capture under the shared monitor/AF_PACKET API, with station/key/queue teardown before mode changes. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
-| `runtime_sleep` | The fresh-FLR operating recipe remains continuously awake and never requests LPS/RPWM transitions. Runtime sleep needs firmware power-mode commands, current wake/use-count ownership and exact resumed packet/radio state; system suspend/reset is a different implemented lifecycle. |
+| `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only; there is no retained AP peer/queue/beacon/service-period owner. |
 | `wow` | No native WoW firmware/context/pattern/GTK/wake-source owner exists. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |

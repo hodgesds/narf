@@ -11,6 +11,10 @@ struct TrackingPort<'a> {
 }
 impl rf_tracking::Hw for TrackingPort<'_> {
     fn current(&mut self) -> Result<(), power::Error> {
+        if self.native.sleep_blocked {
+            return Err(power::Error::Terminal);
+        }
+        crate::rtw89::station_control::awake(&mut self.native.io)?;
         self.admission.check()?;
         self.native.ordinary_current()?;
         if self
@@ -66,6 +70,9 @@ impl Native {
         &mut self,
         admission: &Admission,
     ) -> Result<(), power::Error> {
+        if self.sleep_blocked {
+            return Err(power::Error::Terminal);
+        }
         admission.check()?;
         self.ordinary_current()?;
         let Some(window) = self

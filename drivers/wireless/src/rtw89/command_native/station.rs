@@ -8,8 +8,8 @@ use alloc::collections::VecDeque;
 #[derive(Default)]
 pub(super) struct Runtime {
     pub(super) core: Option<packet::Core>,
-    peer: Option<control::Peer>,
-    backlog: VecDeque<rx_packet::Event>,
+    pub(super) peer: Option<control::Peer>,
+    pub(super) backlog: VecDeque<rx_packet::Event>,
     started: bool,
     pub(super) rf_tracking: Option<crate::rtw89::rf_tracking::Tracker>,
 }
@@ -59,7 +59,10 @@ impl Native {
         self.station_runtime.peer = Some(peer);
         Ok(())
     }
-    fn rx_hardware_step(&mut self, budget: usize) -> Result<rx_dma::Batch, rx_dma::Error> {
+    pub(super) fn rx_hardware_step(
+        &mut self,
+        budget: usize,
+    ) -> Result<rx_dma::Batch, rx_dma::Error> {
         let cap = self.authority;
         crate::rtw88::pci_park::invoke(&cap, || {
             if self.state != State::Active {
@@ -76,7 +79,7 @@ impl Native {
         })
         .map_err(|_| rx_dma::Error::Register(power::Error::Access))?
     }
-    fn retain_event(&mut self, event: rx_packet::Event) -> Result<(), power::Error> {
+    pub(super) fn retain_event(&mut self, event: rx_packet::Event) -> Result<(), power::Error> {
         if self.station_runtime.backlog.len() >= 256 {
             return Err(power::Error::Terminal);
         }
@@ -146,6 +149,7 @@ impl Native {
     }
     pub(in crate::rtw89) fn packets_ready(&self) -> bool {
         self.state == State::Active
+            && !self.sleep_blocked
             && self
                 .station_runtime
                 .core
@@ -154,6 +158,7 @@ impl Native {
     }
     pub(in crate::rtw89) fn packets_ready_aggregate(&self) -> bool {
         self.state == State::Active
+            && !self.sleep_blocked
             && self
                 .station_runtime
                 .core
@@ -260,6 +265,13 @@ impl Native {
         self.packet_operation(|core, port| core.poll(port))
     }
     pub(in crate::rtw89) fn stop_packets(&mut self) -> Result<(), packet::Error> {
+        if self.sleep_reset.is_some() {
+            return Err(packet::Error::State);
+        }
+        if self.sleep_blocked {
+            self.fail();
+            return Err(packet::Error::State);
+        }
         let result = if let Some(mut core) = self.station_runtime.core.take() {
             let result = core.stop(&mut self.station_cleanup());
             self.station_runtime.core = Some(core);
@@ -284,18 +296,33 @@ impl Native {
 }
 impl power::Io for Access<'_> {
     fn read8(&mut self, a: u32) -> Result<u8, power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         self.native.io.read8(a)
     }
     fn read16(&mut self, a: u32) -> Result<u16, power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         self.native.io.read16(a)
     }
     fn read32(&mut self, a: u32) -> Result<u32, power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         self.native.io.read32(a)
     }
     fn write8(&mut self, a: u32, v: u8) -> Result<(), power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         self.native.io.write8(a, v)
     }
     fn write16(&mut self, a: u32, v: u16) -> Result<(), power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         let rings = addr_set_for_chip(ChipId::Rtl8852B).tx;
         if u64::from(a) == rings[0].idx || u64::from(a) == rings[8].idx {
             self.native.with_ordinary_current(|native| {
@@ -313,6 +340,9 @@ impl power::Io for Access<'_> {
         }
     }
     fn write32(&mut self, a: u32, v: u32) -> Result<(), power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         self.native.io.write32(a, v)
     }
     fn now_us(&self) -> u64 {
@@ -337,6 +367,9 @@ impl control::Interface for Access<'_> {
             // available for cleanup ACKs after power qualification is lost.
             packet::Port::stop(self).map_err(|_| power::Error::Access)?;
         } else {
+            if self.native.sleep_blocked {
+                return Err(power::Error::Terminal);
+            }
             self.native.ordinary_current()?;
         }
         Ok(())
@@ -345,6 +378,9 @@ impl control::Interface for Access<'_> {
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, power::Error>,
     ) -> Result<T, power::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(power::Error::Terminal);
+        }
         let cap = self.native.authority;
         if self.cleanup {
             // Teardown remains possible after the emission grant is revoked.
@@ -406,6 +442,9 @@ unsafe impl packet::Port for Access<'_> {
             .map_err(|_| packet::Error::Access)?
     }
     fn ordinary_allowed(&mut self) -> Result<(), packet::Error> {
+        if self.native.sleep_blocked {
+            return Err(packet::Error::Busy);
+        }
         self.native
             .with_ordinary_current(|native| control::awake(&mut native.io))
             .map_err(Into::into)
@@ -496,6 +535,9 @@ unsafe impl packet::Port for Access<'_> {
             .map_err(Into::into)
     }
     fn stop(&mut self) -> Result<(), packet::Error> {
+        if self.native.sleep_reset.is_some() {
+            return Err(packet::Error::State);
+        }
         // Cleanup does not require a still-valid power grant. Always attempt
         // both independent closes under current device authority.
         let functions = self.native.io.read32(0xc000);
@@ -532,11 +574,16 @@ pub(super) enum Permit<'a> {
     Legacy,
     Station(&'a control::Admission),
     Cleanup,
+    Sleep(&'a crate::rtw89::lps::Binding),
+    SleepEnter(&'a crate::rtw89::lps::Binding),
 }
 impl Native {
     fn command_permitted(&mut self, permit: Permit<'_>) -> Result<(), Error> {
         if self.state != State::Active {
             return Err(Error::Terminal);
+        }
+        if self.sleep_blocked && matches!(permit, Permit::Legacy | Permit::Station(_)) {
+            return Err(Error::Busy);
         }
         match permit {
             Permit::Legacy => self.command_admission(),
@@ -545,6 +592,9 @@ impl Native {
                 self.ordinary_current().map_err(|_| Error::Access)
             }
             Permit::Cleanup => self.authority.check_live().map_err(|_| Error::Access),
+            Permit::Sleep(binding) | Permit::SleepEnter(binding) => {
+                self.sleep_current(binding).map_err(|_| Error::Access)
+            }
         }
     }
     pub(super) async fn send_permit(
@@ -554,6 +604,15 @@ impl Native {
         permit: Permit<'_>,
     ) -> Result<(), Error> {
         self.command_permitted(permit)?;
+        if let Permit::SleepEnter(binding) = permit {
+            if !self
+                .sleep_prefix(binding)
+                .map_err(|_| Error::Access)?
+                .unwrap_or(false)
+            {
+                return Err(Error::Busy);
+            }
+        }
         self.poll()?;
         let start = self.io.now_us();
         while self.queue.is_full() {
@@ -566,6 +625,15 @@ impl Native {
             self.poll()?;
         }
         self.command_permitted(permit)?;
+        if let Permit::SleepEnter(binding) = permit {
+            if !self
+                .sleep_prefix(binding)
+                .map_err(|_| Error::Access)?
+                .unwrap_or(false)
+            {
+                return Err(Error::Busy);
+            }
+        }
         let header = command_queue::descriptor(self.chip, kind, bytes.len())?;
         let packet = alloc_coherent_masked(
             header.len() + bytes.len(),
@@ -578,68 +646,104 @@ impl Native {
         let calibration = &self.calibration;
         let full = self.full_radio_scope();
         let ordinary = &self.ordinary;
+        let sleep_enter = matches!(permit, Permit::SleepEnter(_));
+        let receive = &self.receive;
+        let backlog_pending = !self.station_runtime.backlog.is_empty();
         let authority = self.authority;
         let io = &mut self.io;
         let idx = self.regs.idx as u32;
-        let result = self.queue.submit(packet, |slot, next, packet| {
-            crate::rtw88::pci_park::invoke(&authority, || {
-                let mut publish = || -> Result<(), Error> {
-                    // SAFETY: exact owned packet/ring extents; all CPU DMA,
-                    // cache maintenance and actual doorbell are inside this
-                    // current invocation and the station publication guard.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            header.as_ptr(),
-                            packet.as_mut_ptr(),
-                            header.len(),
-                        );
-                        core::ptr::copy_nonoverlapping(
-                            bytes.as_ptr(),
-                            packet.as_mut_ptr().add(header.len()),
-                            bytes.len(),
-                        );
-                        core::ptr::copy_nonoverlapping(
-                            bd.as_ptr(),
-                            ring.as_mut_ptr().add(usize::from(slot) * 8),
-                            8,
-                        );
-                    }
-                    packet.sync(0, header.len() + bytes.len());
-                    ring.sync(usize::from(slot) * 8, 8);
-                    barrier();
-                    io.write16(idx, next).map_err(|_| Error::Access)
-                };
-                match permit {
-                    Permit::Station(admission) => admission
-                        .run(|| {
-                            let grant = ordinary.as_ref().ok_or(power::Error::Unsupported)?;
-                            grant
-                                .qualification
-                                .with_current(|| publish().map_err(|_| power::Error::Access))
-                        })
-                        .map_err(|_| Error::Access),
-                    Permit::Legacy => {
-                        if let Some(full) = full.as_ref() {
-                            full.with_current(|| publish().map_err(|_| power::Error::Access))
-                                .map_err(|_| Error::Access)
-                        } else if let Some(calibration) = calibration {
-                            calibration
-                                .with_current(|| publish().map_err(|_| power::Error::Access))
-                                .map_err(|_| Error::Access)
-                        } else {
-                            publish()
-                        }
-                    }
-                    Permit::Cleanup => publish(),
+        let queue = &mut self.queue;
+        let mut packet = Some(packet);
+        let mut publication = || -> Result<(), Error> {
+            // This strict denial occurs INSIDE all original current scopes,
+            // but BEFORE CommandQueue marks issued or touches descriptors.
+            // Busy here is genuinely unpublished and preserves queue state.
+            if sleep_enter && (backlog_pending || receive.pending(io).map_err(|_| Error::Access)?) {
+                return Err(Error::Busy);
+            }
+            let packet = packet.take().ok_or(Error::Terminal)?;
+            match queue.submit(packet, |slot, next, packet| {
+                // SAFETY: original current scopes enclose the whole queue
+                // issue/descriptor/cache/doorbell transaction. Once issued,
+                // an ambiguous error stays terminal with storage retained.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        header.as_ptr(),
+                        packet.as_mut_ptr(),
+                        header.len(),
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        packet.as_mut_ptr().add(header.len()),
+                        bytes.len(),
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        bd.as_ptr(),
+                        ring.as_mut_ptr().add(usize::from(slot) * 8),
+                        8,
+                    );
                 }
-            })
-            .map_err(|_| Error::Access)?
-        });
+                packet.sync(0, header.len() + bytes.len());
+                ring.sync(usize::from(slot) * 8, 8);
+                barrier();
+                io.write16(idx, next).map_err(|_| Error::Access)
+            }) {
+                Ok(_) => Ok(()),
+                Err((error, unpublished)) => {
+                    drop(unpublished);
+                    Err(error)
+                }
+            }
+        };
+        let result = crate::rtw88::pci_park::invoke(&authority, || {
+            match permit {
+                Permit::Station(admission) => admission
+                    .run(|| {
+                        let grant = ordinary.as_ref().ok_or(power::Error::Unsupported)?;
+                        grant.qualification.with_current(|| Ok(publication()))
+                    })
+                    .map_err(|_| Error::Access)?,
+                Permit::Legacy => {
+                    if let Some(full) = full.as_ref() {
+                        full.with_current(|| Ok(publication()))
+                            .map_err(|_| Error::Access)?
+                    } else if let Some(calibration) = calibration {
+                        calibration
+                            .with_current(|| Ok(publication()))
+                            .map_err(|_| Error::Access)?
+                    } else {
+                        publication()
+                    }
+                }
+                Permit::Cleanup => publication(),
+                Permit::Sleep(binding) | Permit::SleepEnter(binding) => binding
+                    .run(|| {
+                        let grant = ordinary.as_ref().ok_or(power::Error::Access)?;
+                        if grant
+                            .qualification
+                            .sleep_profile()
+                            .map_err(|_| power::Error::Access)?
+                            .is_none()
+                        {
+                            return Err(power::Error::Unsupported);
+                        }
+                        // Preserve the inner publication error separately from
+                        // cap/source failure: an actual unpublished Busy defers.
+                        grant.qualification.with_current(|| Ok(publication()))
+                    })
+                    .map_err(|_| Error::Access)?,
+            }
+        })
+        .map_err(|_| Error::Access)
+        .and_then(|result| result);
+        // Only a guard refusal leaves this owned, unpublished allocation.
+        drop(packet);
         match result {
-            Ok(_) => Ok(()),
-            Err((error, unpublished)) => {
-                drop(unpublished);
-                self.state = State::Terminal;
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !matches!(permit, Permit::SleepEnter(_)) || error != Error::Busy {
+                    self.state = State::Terminal;
+                }
                 Err(error)
             }
         }
@@ -660,7 +764,7 @@ impl Native {
         }
         let sequence = self.runtime_sequence as u8;
         self.runtime_sequence += 1;
-        let receive_ack = (category, class, function) == (1, 9, 8) || sequence % 4 == 0;
+        let receive_ack = matches!((category, class, function), (1, 9, 1 | 8)) || sequence % 4 == 0;
         let mut packet = alloc::vec![0; 8 + bytes.len()];
         super::super::txrx::encode_h2c_header(
             category,
@@ -676,8 +780,19 @@ impl Native {
         packet[8..].copy_from_slice(bytes);
         self.send_permit(Kind::Header, &packet, permit)
             .await
-            .map_err(|_| power::Error::Access)?;
+            .map_err(|error| {
+                if error == Error::Busy
+                    && matches!(permit, Permit::SleepEnter(_))
+                    && self.state == State::Active
+                {
+                    power::Error::Busy
+                } else {
+                    power::Error::Access
+                }
+            })?;
         let start = self.io.now_us();
+        let require_receive = (category, class, function) == (1, 9, 1)
+            && matches!(permit, Permit::Sleep(_) | Permit::SleepEnter(_));
         let mut completed = !done;
         let mut received = false;
         loop {
@@ -712,7 +827,7 @@ impl Native {
             }
             // RECV_ACK is not execution. The source pause continuation also
             // verifies the actual MACID pause register before proceeding.
-            if completed && self.queue.pending() == 0 {
+            if completed && (!require_receive || received) && self.queue.pending() == 0 {
                 self.command_permitted(permit)
                     .map_err(|_| power::Error::Access)?;
                 return Ok(());

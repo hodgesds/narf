@@ -7,6 +7,12 @@ use crate::rtw89::{endpoints, interface};
 const SECOND: [u8; 6] = [2, 4, 6, 8, 10, 14];
 impl Harness {
     fn function(own: [u8; 6], kept: Option<&str>) -> Self {
+        Self::function_mode(own, kept, true)
+    }
+    pub(super) fn preserved_up_function(own: [u8; 6], kept: Option<&str>) -> Self {
+        Self::function_mode(own, kept, false)
+    }
+    fn function_mode(own: [u8; 6], kept: Option<&str>, set_up: bool) -> Self {
         let mut io = DriverModel::for_station(own);
         io.packets.consume = true;
         io.packets.release = true;
@@ -29,7 +35,9 @@ impl Harness {
             .unwrap_or_else(|| narf_net::iface::reserve_name("r89-multi%d"));
         let device = Arc::new(Device::new(name, own, lifecycle.clone(), env.clone()));
         interface::publish(device.clone()).unwrap();
-        narf_net::iface::set_link_state(name, true);
+        if set_up {
+            narf_net::iface::set_link_state(name, true);
+        }
         device.admit_for_test();
         complete(device.activate()).unwrap();
         lifecycle

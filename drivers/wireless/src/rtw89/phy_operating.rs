@@ -194,3 +194,52 @@ impl Operating {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "phy_operating/tests.rs"]
 mod tests;
+
+/// Source phy_dm_reinit PHYSTS half, after actual CPWM Active and before
+/// ordinary publication. Native encloses this whole bounded transaction in
+/// original current device and full joint LPS program scopes.
+pub(super) fn restore_physts(io: &mut impl Io) -> Result<(), power::Error> {
+    fn modify(io: &mut impl Io, address: u32, mask: u32, value: u32) -> Result<(), power::Error> {
+        let old = io.read32(address)?;
+        if old == u32::MAX {
+            return Err(power::Error::Gone);
+        }
+        io.write32(address, old & !mask | value & mask)?;
+        if io.read32(address)? & mask != value & mask {
+            return Err(power::Error::Access);
+        }
+        Ok(())
+    }
+    modify(
+        io,
+        0x10000 + R_PLCP_HISTOGRAM,
+        B_STS_DIS_TRIG_BY_FAIL | B_STS_DIS_TRIG_BY_BRK,
+        B_STS_DIS_TRIG_BY_FAIL | B_STS_DIS_TRIG_BY_BRK,
+    )?;
+    for page in 0..16 {
+        if page == 9 {
+            continue;
+        }
+        let address =
+            0x10000 + R_PHY_STS_BITMAP_ADDR_START + (if page > 9 { page - 1 } else { page }) * 4;
+        let mut value = io.read32(address)?;
+        if value == u32::MAX {
+            return Err(power::Error::Gone);
+        }
+        match page {
+            6 | 7 => value |= 1 << 13,
+            10 => value |= 1 << 13 | 1 << 1,
+            11..=15 => {
+                value &= !0xf0;
+                if page == 11 {
+                    value |= 1 << 1;
+                } else if page >= 13 {
+                    value |= 1 << 20;
+                }
+            }
+            _ => {}
+        }
+        modify(io, address, u32::MAX, value)?;
+    }
+    Ok(())
+}

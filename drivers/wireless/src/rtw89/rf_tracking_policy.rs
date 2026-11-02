@@ -6,6 +6,7 @@ use super::*;
 
 pub(super) struct Tracking {
     authority: Cap<FirmwareBlob, Read>,
+    digest: [u8; 32],
     window: Window,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,7 +115,16 @@ impl Tracking {
         if !window.valid() {
             return Err(Error::Format);
         }
-        Ok(Self { authority, window })
+        let mut digest = narf_crypto::sha256::Sha256::new();
+        digest.update(bytes);
+        Ok(Self {
+            authority,
+            digest: digest.finalize(),
+            window,
+        })
+    }
+    pub(super) fn digest(&self) -> [u8; 32] {
+        self.digest
     }
     pub(super) fn window(&self) -> Result<Window, Error> {
         self.current()?;

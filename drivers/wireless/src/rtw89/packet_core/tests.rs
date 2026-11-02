@@ -85,6 +85,9 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) controls: Arc<Controls>,
 }
 impl Model {
+    pub(in crate::rtw89) fn pending_receive(&self) -> bool {
+        !self.incoming.is_empty() || !self.controls.incoming.lock().is_empty()
+    }
     pub(in crate::rtw89) fn new() -> Self {
         let (index, generation) = object_table::register(CapKind::BusDevice);
         // SAFETY: private fresh fixture object has exact BusDevice/Write type.

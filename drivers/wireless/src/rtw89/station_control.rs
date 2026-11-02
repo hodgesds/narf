@@ -112,6 +112,12 @@ pub(super) struct Peer {
     tids: Arc<core::sync::atomic::AtomicU8>,
 }
 impl Peer {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.valid, &other.valid) && self.own == other.own && self.peer == other.peer
+    }
+    pub(super) fn qos_ready(&self) -> bool {
+        self.qos.load(Ordering::Acquire)
+    }
     pub(super) fn own(&self) -> [u8; 6] {
         self.own
     }

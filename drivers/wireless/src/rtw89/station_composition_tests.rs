@@ -379,6 +379,7 @@ impl Peer {
     }
 }
 
+static NEXT_SLEEP: AtomicBool = AtomicBool::new(false);
 struct DriverModel {
     controller: crate::rtw89::station_control::Controller,
     control: crate::rtw89::station_control::tests::Model,
@@ -398,6 +399,10 @@ struct DriverModel {
     /// HCI DMA stop/busy block behind `dma_stop::stop`.
     dma: crate::rtw89::dma_stop::tests::Model,
     reclaimed: Option<usize>,
+    sleep: Option<(
+        crate::rtw89::lps::Manager,
+        crate::rtw89::lps::tests::Firmware,
+    )>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
 /// `irq::Mask` programs the native binding runs.
@@ -452,6 +457,15 @@ impl DriverModel {
             irq: None,
             dma: crate::rtw89::dma_stop::tests::Model::new(),
             reclaimed: None,
+            sleep: NEXT_SLEEP.swap(false, Ordering::AcqRel).then(|| {
+                (
+                    crate::rtw89::lps::Manager::after_firmware(
+                        crate::rtw89::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap(),
+                    )
+                    .unwrap(),
+                    crate::rtw89::lps::tests::Firmware::new(),
+                )
+            }),
         }
     }
     fn packet<T>(
@@ -479,6 +493,46 @@ impl DriverModel {
 // Native OrdinaryGrant remains unconstructible by this fixture. Both adapters
 // invoke their actual typed fixture capability around published operations.
 unsafe impl crate::rtw89::station::Io for DriverModel {
+    fn station_sleep_capable(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        Ok(self.sleep.is_some())
+    }
+    fn station_sleep_blocked(&self) -> bool {
+        self.sleep.as_ref().is_some_and(|(_, fw)| fw.blocked)
+    }
+    async fn station_sleep_service(
+        &mut self,
+        identity: Option<narf_net::native_emission::Lifetime>,
+        enabled: bool,
+        idle: bool,
+        force: bool,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(bool, bool), crate::rtw89::power::Error> {
+        let Some((manager, firmware)) = self.sleep.as_mut() else {
+            return Ok((false, false));
+        };
+        firmware.clock = self.clock.load(Ordering::Acquire) * 1000;
+        firmware.pending_native = self.packets.pending_receive();
+        firmware.idle = self
+            .core
+            .as_ref()
+            .is_some_and(crate::rtw89::packet_core::Core::ready);
+        let result = manager
+            .service(
+                firmware,
+                self.controller.peer(),
+                admission,
+                crate::rtw89::lps::Intent {
+                    identity,
+                    enabled,
+                    idle,
+                    force,
+                },
+            )
+            .await;
+        self.clock
+            .store(firmware.clock.div_ceil(1000), Ordering::Release);
+        result
+    }
     fn station_allowed(&mut self) -> Result<(), crate::rtw89::power::Error> {
         if self.stopped {
             return Err(crate::rtw89::power::Error::Terminal);
@@ -664,7 +718,11 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     ) -> Result<(), crate::rtw89::power::Error> {
         self.controller
             .commit_peer(&mut self.control, peer, aid, short, admission)
-            .await
+            .await?;
+        if let Some((manager, _)) = self.sleep.as_mut() {
+            manager.committed(aid)?;
+        }
+        Ok(())
     }
     async fn station_disconnect(
         &mut self,
@@ -901,11 +959,25 @@ impl Harness {
                 .react(bytes)
                 .map_err(|_| crate::rtw89::packet_core::Error::Packet)
         }));
+        let sleep = io.sleep.is_some();
         let lifecycle = Arc::new(Lifecycle::new(io));
         let name = narf_net::iface::reserve_name("r89-source%d");
         let device = Arc::new(Device::new(name, OWN, lifecycle.clone(), env.clone()));
+        if sleep {
+            let mut retained = lifecycle.retained.try_lock().unwrap();
+            let io = &mut retained.as_mut().unwrap().io;
+            if let Some((_, firmware)) = io.sleep.as_mut() {
+                firmware.line = Some(device.line().clone());
+                let controls = io.packets.controls.clone();
+                firmware.pending_probe =
+                    Some(Arc::new(move || !controls.incoming.lock().is_empty()));
+            }
+        }
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::register(name, OWN, send);
+        if sleep {
+            assert!(Device::bind_sleep_target(&device));
+        }
         narf_net::iface::set_link_state(name, true); // operator IFF_UP, not PHY state
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
@@ -2878,3 +2950,6 @@ kernel_test_in!(
     "drivers/wireless/rtw89/pmf",
     smoke_rtw8852b_pmf_wpa2_sa_query_bip_and_wpa3_sae
 );
+
+#[path = "station_lps_tests.rs"]
+mod lps_tests;

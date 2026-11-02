@@ -155,6 +155,10 @@ impl Native {
     /// the listed CCX/DIG/EDCCA/PPDU-status registers, on the prepared
     /// operating PHY and current ordinary authority.
     fn track_port(&mut self, address: u32) -> Result<Port<'_>, power::Error> {
+        if self.sleep_blocked {
+            return Err(power::Error::Terminal);
+        }
+        crate::rtw89::station_control::awake(&mut self.io)?;
         if !crate::rtw89::track::REGISTERS.contains(&address) {
             return Err(power::Error::Access);
         }
@@ -179,6 +183,9 @@ impl Native {
     pub(in crate::rtw89) fn station_track_profile(
         &self,
     ) -> Result<crate::rtw89::track::Profile, power::Error> {
+        if self.sleep_blocked {
+            return Err(power::Error::Terminal);
+        }
         self.operating_current()?;
         let working = self
             .operating
@@ -309,7 +316,8 @@ impl Native {
                 self.firmware_phycap().ok_or(power::Error::Unsupported)?,
             )
             .map_err(denied)?;
-            let qualification = radio_policy::Qualification::load(board).map_err(denied)?;
+            let mut qualification = radio_policy::Qualification::load(board).map_err(denied)?;
+            qualification.load_sleep(assets).map_err(denied)?;
             qualification.current().map_err(denied)?;
             Ok(RadioPreflight {
                 board,

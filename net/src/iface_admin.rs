@@ -17,6 +17,28 @@ pub struct OpenStopEvent {
     snapshot: NetIfaceSnapshot,
 }
 impl OpenStopEvent {
+    /// Observe only this exact registration's existing administrative state.
+    /// A rebind may preserve UP without a new transition. No callback runs,
+    /// no receiver is recaptured by name, and the observation grants nothing.
+    pub fn observe(expected: &NetIfaceSnapshot) -> Option<Self> {
+        let guard = IFACES.lock();
+        let entry = guard.as_ref()?.iter().find(|entry| {
+            expected.registration_epoch != 0
+                && expected.ownership_epoch != 0
+                && entry.name == expected.name
+                && entry.registration_epoch == expected.registration_epoch
+                && entry.ownership_epoch == expected.ownership_epoch
+                && entry.ifindex == expected.ifindex
+                && entry.net_ns_id == expected.net_ns_id
+                && entry.mac == expected.mac
+                && entry.link_layer == expected.link_layer
+                && entry.packet_generation == expected.packet_generation
+                && entry.link_up == expected.link_up
+        })?;
+        Some(Self {
+            snapshot: snapshot(entry),
+        })
+    }
     pub fn name(&self) -> &str {
         &self.snapshot.name
     }

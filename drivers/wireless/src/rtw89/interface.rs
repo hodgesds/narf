@@ -115,6 +115,47 @@ pub(super) struct Device<I: Io> {
     /// MSI deliveries and TX kicks wake the drain worker through this line.
     line: Arc<super::irq::Line>,
     interrupts: AtomicBool,
+    sleep_capable: AtomicBool,
+    sleep_enabled: AtomicBool,
+    sleep_identity: IrqSafeSpinLock<Option<narf_net::native_emission::Lifetime>>,
+}
+struct SleepWake(Arc<super::irq::Line>);
+impl alloc::task::Wake for SleepWake {
+    fn wake(self: Arc<Self>) {
+        self.0.raise();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.raise();
+    }
+}
+struct SleepTarget<I: Io>(alloc::sync::Weak<Device<I>>);
+impl<I: Io> core::fmt::Debug for SleepTarget<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Rtw89SleepOriginalTarget")
+    }
+}
+impl<I: Io + 'static> narf_net::iface::OpenStopTarget for SleepTarget<I> {
+    fn transition(&self, event: narf_net::iface::OpenStopEvent) {
+        // Capture current original registration before native locks. This
+        // weak denial observation grants no RF/wake/admin operation.
+        let identity = event.native_identity();
+        let Some(device) = self.0.upgrade() else {
+            return;
+        };
+        if event.name() != device.name
+            || event.original_snapshot().mac != device.local
+            || !event.current()
+        {
+            return;
+        }
+        let identity = identity.filter(|token| {
+            token.watch(core::task::Waker::from(Arc::new(SleepWake(
+                device.line.clone(),
+            ))))
+        });
+        *device.sleep_identity.lock() = identity;
+        device.line.raise();
+    }
 }
 /// Polled-mode worker period (no MSI binding).
 const POLL_MS: u64 = 1;
@@ -219,6 +260,27 @@ impl<I: Io + 'static> Device<I> {
             })
             .collect())
     }
+    pub(super) fn bind_sleep_target(this: &Arc<Self>) -> bool {
+        let Some(snapshot) = narf_net::iface::snapshot_all()
+            .into_iter()
+            .find(|entry| entry.name == this.name)
+        else {
+            return false;
+        };
+        let target = Arc::new(SleepTarget(Arc::downgrade(this)));
+        if !narf_net::iface::set_open_stop_target(&snapshot, target.clone()) {
+            return false;
+        }
+        // Rebind may preserve an existing administrative UP without an event.
+        // Observe only that same sealed registration, after installation and
+        // outside native/provider locks; never toggle/rebind an old owner.
+        if snapshot.link_up {
+            if let Some(event) = narf_net::iface::OpenStopEvent::observe(&snapshot) {
+                narf_net::iface::OpenStopTarget::transition(target.as_ref(), event);
+            }
+        }
+        true
+    }
     pub(super) fn new(
         name: &str,
         local: [u8; 6],
@@ -253,6 +315,9 @@ impl<I: Io + 'static> Device<I> {
             tx: IrqSafeSpinLock::new(Some(producer)),
             line: super::irq::Line::new(),
             interrupts: AtomicBool::new(false),
+            sleep_capable: AtomicBool::new(false),
+            sleep_enabled: AtomicBool::new(false),
+            sleep_identity: IrqSafeSpinLock::new(None),
         }
     }
     /// Bind MSI delivery to this shell's worker after the station started.
@@ -300,16 +365,60 @@ impl<I: Io + 'static> Device<I> {
     /// One worker period: drain, then sleep until an MSI/TX kick or the
     /// mode's fallback period.
     pub(super) async fn service_once(&self) {
+        // Line movement is a scheduling hint. Actual original source/native
+        // work decides whether RF wake is necessary; own consumed DONE MSIs
+        // must not force a wake/enter cycle.
+        let sleeping = self.sleep_service(false, false).await;
+        if !sleeping {
+            self.drain();
+            self.apply_edca().await;
+        }
+        let mut sleeping = self.sleep_service(true, false).await;
+        // Receipt baseline follows own awaited transition work, then a final
+        // actual IRQ/HCI/host/source check. Work before the sample is caught
+        // by that check; raises after it remain newer than this wait.
         let seen = self.line.raised();
-        self.drain();
-        self.apply_edca().await;
-        let period = if self.interrupts() {
+        if sleeping {
+            sleeping = self.sleep_service(false, false).await;
+        }
+        let period = if sleeping {
+            100
+        } else if self.interrupts() {
             IRQ_FALLBACK_MS
         } else {
             POLL_MS
         };
         let _ =
             narf_time::timeout(narf_time::Deadline::after_ms(period), self.line.wait(seen)).await;
+    }
+    pub(super) async fn sleep_service(&self, allow_enter: bool, kicked: bool) -> bool {
+        if !self.sleep_capable.load(Ordering::Acquire) {
+            return false;
+        }
+        let identity = self.sleep_identity.lock().clone();
+        let mut storage = self.lifecycle.retained.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return false;
+        };
+        let queued = self.rings.try_lock().is_none_or(|mut rings| {
+            if rings.pending.is_none() {
+                rings.pending = rings.next(self.local, owner.station_qos_all());
+            }
+            rings.pending.is_some() || rings.backlog.iter().any(|q| !q.is_empty())
+        });
+        let enabled = self.sleep_enabled.load(Ordering::Acquire) && !self.closed();
+        let force = kicked || queued || owner.station_edca_pending() || !enabled;
+        let idle = !queued && (allow_enter || owner.station_sleep_blocked());
+        match owner
+            .station_sleep_service(identity, enabled, idle, force, &self.admission)
+            .await
+        {
+            Ok(sleeping) => sleeping,
+            Err(_) => {
+                self.close();
+                false
+            }
+        }
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
@@ -331,6 +440,15 @@ impl<I: Io + 'static> Device<I> {
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
+        let sleep_capable = self
+            .lifecycle
+            .retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .station_sleep_capable()?;
+        self.sleep_capable.store(sleep_capable, Ordering::Release);
         self.admission.run(|| {
             self.admitted.store(true, Ordering::Release);
             Ok(())
@@ -449,6 +567,9 @@ impl<I: Io + 'static> Device<I> {
             return Vec::new();
         }
         if !self.admitted.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        if owner.station_sleep_blocked() {
             return Vec::new();
         }
         let result = (|| -> Result<Vec<Vec<u8>>, Error> {
@@ -670,6 +791,19 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             },
         }
     }
+    fn power_save_default(&self) -> Option<bool> {
+        self.sleep_capable
+            .load(Ordering::Acquire)
+            .then(|| self.sleep_enabled.load(Ordering::Acquire))
+    }
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        if !self.sleep_capable.load(Ordering::Acquire) {
+            return Err(-95);
+        }
+        self.sleep_enabled.store(enabled, Ordering::Release);
+        self.line.raise();
+        Ok(())
+    }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         self.scan_flagged(request, narf_wireless::scan::ScanFlags::default())
             .await
@@ -840,6 +974,13 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
         cookie,
         super::endpoints::send,
     );
+    let bound = Device::bind_sleep_target(&device);
+    if !bound {
+        super::endpoints::remove(Arc::as_ptr(&device) as *const ());
+        narf_net::iface::unregister(&device.name);
+        narf_net::registry().unregister(&device.name);
+        return Err(Error::State);
+    }
     narf_net::iface::set_driver_info(&device.name, "rtw8852b", None, String::new());
     narf_net::iface::set_offloads(&device.name, narf_net::OffloadCapabilities::default());
     device.link(None, false);

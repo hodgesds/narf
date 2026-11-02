@@ -863,3 +863,106 @@ kernel_test_in!(
     "drivers/wireless/rtw89/aggregation",
     smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_power
 );
+
+fn smoke_rtw8852b_lps_joint_artifact_binds_all_current_optional_programs() -> TestResult {
+    let profile = super::super::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap();
+    for version in [
+        [0, 27, 32, 1],
+        [0, 29, 28, 255],
+        [0, 29, 122, 0],
+        [0, 29, 127, 0],
+        [0, 29, 128, 0],
+    ] {
+        if super::super::lps_wire::Profile::for_version(version).is_some() {
+            return TestResult::Fail("unadmitted B full-radio firmware gained LPS producer");
+        }
+    }
+    let window = super::super::rf_tracking::Window {
+        low: 0x30,
+        high: 0xc0,
+    };
+    let (mut base, _, tracking_cap) = rf_tracking_model(window, true);
+    if base.sleep_profile() != Ok(None) {
+        return TestResult::Fail("old expanded radio silently entered LPS");
+    }
+    let request = lps::Request::new(&base, profile).unwrap();
+    let mut record = expanded_record(&base, b"N52P", request.binding);
+    record[58..62].copy_from_slice(&profile.version);
+    let cap = authority();
+    for signer in [None, Some([4; 32])] {
+        if lps::Sleep::from_verified(&base, &request, profile, &record, signer, cap).is_ok() {
+            return TestResult::Fail("unsigned/wrong signer joint LPS accepted");
+        }
+    }
+    for at in [0, 4, 8, 12, 14, 16, 48, 54, 58, 61, 62, 127] {
+        let mut bad = record;
+        bad[at] ^= 1;
+        if lps::Sleep::from_verified(&base, &request, profile, &bad, Some([3; 32]), cap).is_ok() {
+            return TestResult::Fail("malformed/source-mismatched LPS joint record accepted");
+        }
+    }
+    let (other, _, _) = rf_tracking_model(window, false);
+    if lps::Request::new(&other, profile).unwrap().binding == request.binding {
+        return TestResult::Fail("LPS erased actual installed A-MSDU companion binding");
+    }
+    let old_digest = base.rf_tracking.as_ref().unwrap().digest();
+    let (narrow, _, _) = rf_tracking_model(
+        super::super::rf_tracking::Window {
+            low: 0x40,
+            high: 0x80,
+        },
+        true,
+    );
+    if narrow.rf_tracking.as_ref().unwrap().digest() == old_digest
+        || lps::Request::new(&narrow, profile).unwrap().binding == request.binding
+    {
+        return TestResult::Fail("LPS erased actual tracking window/raw-record binding");
+    }
+    base.lps = Some(
+        lps::Sleep::from_verified(&base, &request, profile, &record, Some([3; 32]), cap).unwrap(),
+    );
+    if base.sleep_profile() != Ok(Some(profile)) || base.with_current(|| Ok(9)) != Ok(9) {
+        return TestResult::Fail("exact joint LPS current scopes rejected");
+    }
+    cap.revoke();
+    if base.sleep_profile().is_ok() || base.with_current(|| Ok(9)).is_ok() {
+        return TestResult::Fail("revoked LPS companion retained native permission");
+    }
+    tracking_cap.revoke();
+    if base.current().is_ok() {
+        return TestResult::Fail("joint LPS bypassed revoked original tracking source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/runtime_sleep",
+    smoke_rtw8852b_lps_joint_artifact_binds_all_current_optional_programs
+);
+
+/// Explicit authenticated-record boundary for actual inert Native/NativeIo
+/// tests, like rf_tracking_model; no real attach/RFK or measurement is minted.
+pub(in crate::rtw89) fn lps_model(
+    effect: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+) {
+    let (mut base, base_cap, _) = rf_tracking_model(
+        super::super::rf_tracking::Window {
+            low: 100,
+            high: 140,
+        },
+        false,
+    );
+    let profile = super::super::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap();
+    let request = lps::Request::new(&base, profile).unwrap();
+    let mut record = expanded_record(&base, b"N52P", request.binding);
+    record[58..62].copy_from_slice(&profile.version);
+    let cap = authority();
+    base.lps = Some(
+        lps::Sleep::from_verified(&base, &request, profile, &record, Some([3; 32]), cap).unwrap(),
+    );
+    base.model_native_before_publication = effect;
+    (base, base_cap, cap)
+}

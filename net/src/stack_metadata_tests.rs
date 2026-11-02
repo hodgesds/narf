@@ -187,6 +187,11 @@ fn event_native_identity() -> Result<(), &'static str> {
     let down = Arc::new(AtomicBool::new(false));
     let registration =
         crate::iface::lookup(&f.name).ok_or("original event identity registration")?;
+    let initial = crate::iface::OpenStopEvent::observe(&registration)
+        .ok_or("exact initial administrative observation")?;
+    if initial.up() || !initial.current() || initial.native_identity().is_some() {
+        return Err("initial DOWN observation invented UP or native authority");
+    }
     let target = Arc::new(IdentityTarget {
         events: events.clone(),
         previous,
@@ -198,12 +203,17 @@ fn event_native_identity() -> Result<(), &'static str> {
     f.admin.set_link(true).map_err(|_| "actual original UP")?;
     let first = events.lock().last().cloned().ok_or("original UP event")?;
     let original = first.original_snapshot();
+    let observed =
+        crate::iface::OpenStopEvent::observe(&original).ok_or("exact existing UP observation")?;
     if original.name != registration.name
         || original.ownership_epoch != registration.ownership_epoch
         || original.ifindex != registration.ifindex
         || original.mac != registration.mac
         || !original.link_up
         || !crate::iface::set_open_stop_target(&original, target.clone())
+        || !observed.up()
+        || !observed.current()
+        || crate::iface::OpenStopEvent::observe(&registration).is_some()
     {
         return Err("event did not retain its original complete transition snapshot");
     }
@@ -322,8 +332,25 @@ fn event_native_identity() -> Result<(), &'static str> {
         || stopped.native_identity().is_some()
         || crate::iface::set_open_stop_target(&first.original_snapshot(), target)
         || first.original_snapshot().ownership_epoch != original.ownership_epoch
+        || crate::iface::OpenStopEvent::observe(&original).is_some()
+        || crate::iface::OpenStopEvent::observe(&fourth.original_snapshot()).is_some()
     {
         return Err("same-name/index/MAC successor revived original event identity");
+    }
+    // Rebind preserves actual IFF_UP, without a new UP callback or a toggle.
+    // A fresh receiver may observe only that new exact registration; the old
+    // event and its lifetime remain permanently retired.
+    let successor = crate::iface::lookup(&f.name).ok_or("preserved-UP successor metadata")?;
+    let observed = crate::iface::OpenStopEvent::observe(&successor)
+        .ok_or("exact preserved-UP successor observation")?;
+    if !successor.link_up
+        || !observed.up()
+        || !observed.current()
+        || observed.native_identity().is_none()
+        || fourth_identity.current()
+        || fourth.current()
+    {
+        return Err("preserved-UP observation rebound old identity or invented a transition");
     }
     Ok(())
 }

@@ -600,3 +600,15 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_reclaim_releases_both_rings_once_and_stays_terminal
 );
+
+/// Actual prepare/allocation/descriptor owner using the same inert source IO
+/// model; caller retains/fences every allocation before fixture destruction.
+pub(in crate::rtw89) fn native_fixture() -> Rx {
+    let mut rx = Rx::default();
+    let mut model = Model::new();
+    // SAFETY: exclusive private RAM/config/DMA model, no hardware/prefetch;
+    // the returned owner is reclaimed only by the caller's inert fence.
+    let prepared = unsafe { rx.prepare(&mut model, 4) };
+    assert!(matches!(ready(prepared), Some(Ok(()))));
+    rx
+}

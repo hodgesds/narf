@@ -95,6 +95,8 @@ impl Fixture {
             radio: super::super::rf_access::Rf::default(),
             runtime_sequence: 0,
             station_runtime: station::Runtime::default(),
+            sleep_blocked: false,
+            sleep_reset: None,
             calibration: None,
             coex_ready: false,
             nctl_ready: false,
@@ -992,3 +994,7 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof
 );
+
+#[cfg(feature = "kernel-test")]
+#[path = "command_native_lps_tests.rs"]
+pub(in crate::rtw89) mod lps_tests;

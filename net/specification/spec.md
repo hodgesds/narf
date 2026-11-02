@@ -330,6 +330,17 @@ trusted driver binding and current original capabilities remain independent
 requirements at every native operation. A retired DOWN can still clean up
 only the captured original receiver through its own current device authority.
 
+`OpenStopEvent::observe(expected_snapshot)` observes existing administrative
+state for that exact sealed registration, ownership, name, namespace, IFINDEX,
+MAC, link representation, packet generation and UP state. A mismatch refuses;
+the method neither dispatches a callback nor follows a same-name replacement.
+This lets a newly bound original receiver explicitly capture an actual UP
+state preserved across a driver rebind, without fabricating DOWN/UP transitions.
+The returned observation grants nothing. A driver may feed it to its captured
+target only after installation and after releasing metadata/provider locks;
+all original currentness and native device/RF requirements remain independent.
+Existing hook installation keeps its transition-only callback behavior.
+
 The legacy `fn(name, up)` hook retains its original-device binding precondition;
 a check immediately before that function does not make a fresh name lookup safe
 against concurrent replacement.

@@ -95,6 +95,25 @@ pub(super) unsafe trait Io: Send {
     }
     /// Track-work register read (`track::REGISTERS` only). `Unsupported`
     /// disables tracking, as `disabled_dm_bitmap` does.
+    /// Native opt-in comes only from the actual signed expanded LPS program.
+    fn station_sleep_capable(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// True includes an interrupted/uncertain transition; synchronous drain
+    /// may not read ordinary RX/BB until the retained async owner restores it.
+    fn station_sleep_blocked(&self) -> bool {
+        false
+    }
+    async fn station_sleep_service(
+        &mut self,
+        _: Option<narf_net::native_emission::Lifetime>,
+        _: bool,
+        _: bool,
+        _: bool,
+        _: &Admission,
+    ) -> Result<(bool, bool), power::Error> {
+        Ok((false, false))
+    }
     fn station_rf_tracking(&mut self, _: &Admission) -> Result<(), power::Error> {
         Ok(())
     }
@@ -517,6 +536,32 @@ impl State {
         } else {
             None
         }
+    }
+    pub(super) fn sleep_idle(&self) -> bool {
+        self.phase == Phase::Open
+            && self.ready()
+            && self.pending.is_empty()
+            && self.delivered_reply.is_none()
+            && self.incoming.is_empty()
+            && self.received.is_empty()
+            && self.mgmt_out.is_empty()
+            && self.ba_ops.is_empty()
+            && self.edca_pending.is_none()
+            && !self.scanning
+            && self.scan.is_none()
+            && self.rx_idle
+            && self
+                .ba
+                .iter()
+                .flatten()
+                .all(|session| session.reorder.buffered() == 0)
+            && (0..8).all(|tid| !self.originator.holding(tid))
+            && !self.sleep_timer_due()
+            && self.security.as_ref().is_none_or(|s| !s.handshake_active())
+            && !self.track.due(self.environment.now_ms())
+    }
+    pub(super) fn sleep_restored(&mut self) {
+        self.track.restored();
     }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
@@ -1074,8 +1119,18 @@ impl State {
             .fold(0, |m, (tid, s)| if s.is_some() { m | 1 << tid } else { m })
     }
     /// Work that needs awaited firmware receipts (EDCA, BA CAM).
+    fn sleep_timer_due(&self) -> bool {
+        let now = self.environment.now_ms();
+        self.originator.expired(now).next().is_some()
+            || self.ba.iter().flatten().any(|session| {
+                session.timeout_tu != 0
+                    && now.saturating_sub(session.last_ms)
+                        > (u64::from(session.timeout_tu) * 1024).div_ceil(1000)
+            })
+    }
     pub(super) fn async_pending(&self) -> bool {
         self.edca_pending()
+            || self.sleep_timer_due()
             || self.phase == Phase::Open && !self.ba_ops.is_empty()
             || !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped)
                 && self.track.due(self.environment.now_ms())

@@ -7,6 +7,8 @@ use narf_firmware::{FirmwareBlob, FirmwareError};
 const LENGTH: usize = 128;
 #[path = "amsdu_policy.rs"]
 mod amsdu;
+#[path = "lps_policy.rs"]
+mod lps;
 #[path = "rf_tracking_policy.rs"]
 mod rf_tracking;
 
@@ -240,10 +242,13 @@ pub(super) struct Qualification {
     record_signer: [u8; 32],
     amsdu: Option<amsdu::Amsdu>,
     rf_tracking: Option<rf_tracking::Tracking>,
+    lps: Option<lps::Sleep>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_revoke_before_publication: bool,
+    #[cfg(any(test, feature = "kernel-test"))]
+    model_native_before_publication: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 struct Decode(Board);
 impl CapOp<FirmwareBlob, Read> for Decode {
@@ -322,6 +327,7 @@ impl Qualification {
             record_signer,
             amsdu: None,
             rf_tracking: None,
+            lps: None,
             antenna_qdb,
             ceiling_qdbm,
             peaks_qdbm,
@@ -331,6 +337,8 @@ impl Qualification {
             model_domain: None,
             #[cfg(any(test, feature = "kernel-test"))]
             model_revoke_before_publication: false,
+            #[cfg(any(test, feature = "kernel-test"))]
+            model_native_before_publication: None,
         })
     }
     pub fn matches(&self, board: Board) -> bool {
@@ -345,10 +353,23 @@ impl Qualification {
         self.current()?;
         Ok(self.amsdu.is_some())
     }
+    pub(super) fn load_sleep(&mut self, assets: &Assets) -> Result<(), Error> {
+        let profile = super::lps_wire::Profile::from_assets(assets).ok_or(Error::Identity)?;
+        self.lps = lps::Sleep::optional(self, profile)?;
+        self.current()
+    }
+    pub(super) fn sleep_profile(&self) -> Result<Option<super::lps_wire::Profile>, Error> {
+        self.current()?;
+        Ok(self.lps.as_ref().map(lps::Sleep::profile))
+    }
     fn invoke_programs<T>(
         &self,
         operation: impl FnOnce() -> Result<T, super::power::Error>,
     ) -> Result<T, super::power::Error> {
+        let operation = || match &self.lps {
+            Some(program) => program.invoke(operation),
+            None => operation(),
+        };
         let operation = || match &self.rf_tracking {
             Some(program) => program.invoke(operation),
             None => operation(),
@@ -379,6 +400,9 @@ impl Qualification {
         if let Some(program) = &self.rf_tracking {
             program.current()?;
         }
+        if let Some(program) = &self.lps {
+            program.current()?;
+        }
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(domain) = self.model_domain.as_ref() {
             return self.check(domain);
@@ -401,6 +425,10 @@ impl Qualification {
         #[cfg(any(test, feature = "kernel-test"))]
         if self.model_revoke_before_publication {
             self.authority.revoke();
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(effect) = self.model_native_before_publication.as_ref() {
+            effect();
         }
         struct Invoke<'a, F> {
             qualification: &'a Qualification,

@@ -581,6 +581,19 @@ credit. Counting unvalidated implementations,78 remain after removing the four
 wrong-family duplicates. Full release/native validation still waits for25
 completed rows; physical firmware/board and deployment acceptance are separate.
 
+**2026-11-02 — admitted runtime LPS source recount.** The ledger now holds
+**62 `feature`**, **31 `chip`** and **0 `unknown`** rows. Sixteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8852B clock-gated LPS now
+composes original admin-UP/device/peer authority, actual WCPU template and
+RPWM/CPWM receipts, closed wake/PHY/leave/coexistence restoration and native
+queue/prefix ownership. A separate full joint measured program is mandatory;
+source loss uses nonemitting device-authorized same-function FLR retirement.
+Seven cases are written and unexecuted; scoped formatting and one release
+metadata context pass. Full release/native gates remain at25 completed rows.
+Counting unvalidated implementations,78 remain; physical firmware/board and
+actual deployment qualification remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -591,7 +604,7 @@ completed rows; physical firmware/board and deployment acceptance are separate.
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
-| rtw89 | 10 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW and runtime LPS; bounded independent live functions, separately qualified standalone/nested TX A-MSDU and actual periodic DPK RF tracking are implemented pending validation; other AX/BE chips are separate rows |
+| rtw89 | 9 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking and admitted clock-gated runtime LPS are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 6 | Monitor/P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
@@ -1515,6 +1528,23 @@ supply native packet/ACK/PN credit. Failure/cancellation drives retained origina
 physical teardown and pins uncertain mappings. Family `brcmfmac.md` §3 defines
 the bounded legacy20 Open/WPA2 CCMP profile and explicit unsupported features;
 CYW43439 keeps its independent AP row open. Nine native cases are unexecuted.
+
+### 3.11 Original-owner runtime LPS (validation pending)
+
+The admitted RTL8852B station exposes power-save preference only when its
+current signed N52P joint operating program is loaded. The retained worker
+owns actual verified firmware template IDs, controller peer, native command/
+packet queues and RPWM/CPWM/restore receipts. Original source, peer, power and
+admin-UP identity remain required at publication and after waits. A completed
+native prefix and final HCI/backlog guard precede queue issue; unpublished Busy
+retains ordinary ownership, while ambiguous publication pins mappings.
+Ordinary DATA/control and BB tracking stay closed until actual wake restoration.
+A dead RF/interface source cannot authorize a NULL-emitting wake; only current
+original device authority and the sealed same-function temporal FLR receipt can
+retire uncertain DMA. `OpenStopEvent::observe` supplies a nongrant observation
+of the exact current original registration, including preserved-UP replacement;
+old owners never follow a new registration. Family §3 is normative. Seven new
+cases are written and unexecuted; physical measurements remain external.
 
 ## 4. Interaction with `narf-wireless`
 

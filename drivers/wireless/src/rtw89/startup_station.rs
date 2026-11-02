@@ -32,12 +32,23 @@ impl Startup {
         if self.phase != Phase::Terminal {
             return Err(power::Error::Terminal);
         }
-        self.firmware
+        let native = self
+            .firmware
             .as_mut()
             .ok_or(power::Error::Terminal)?
-            .transport_mut()
-            .finish_radio_shutdown()
-            .await
+            .transport_mut();
+        if native.sleeping()
+            && self
+                .sleep
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_owner())
+        {
+            if native.dma_reclaimed() {
+                return Ok(());
+            }
+            return native.sleep_reset_terminal().await;
+        }
+        native.finish_radio_shutdown().await
     }
 }
 #[async_trait::async_trait]
@@ -114,6 +125,25 @@ unsafe impl Io for Startup {
             .as_mut()
             .ok_or(power::Error::Terminal)?
             .scan_address(&mut native.station_access(), address, admission)
+            .await
+    }
+    fn station_sleep_capable(&mut self) -> Result<bool, power::Error> {
+        self.sleep_prepare()
+    }
+    fn station_sleep_blocked(&self) -> bool {
+        self.firmware
+            .as_ref()
+            .is_some_and(|firmware| firmware.transport().sleeping())
+    }
+    async fn station_sleep_service(
+        &mut self,
+        identity: Option<narf_net::native_emission::Lifetime>,
+        enabled: bool,
+        idle: bool,
+        force: bool,
+        admission: &control::Admission,
+    ) -> Result<(bool, bool), power::Error> {
+        self.sleep_service(identity, enabled, idle, force, admission)
             .await
     }
     fn station_rf_tracking(&mut self, admission: &control::Admission) -> Result<(), power::Error> {
@@ -329,7 +359,11 @@ unsafe impl Io for Startup {
                 short_slot,
                 admission,
             )
-            .await
+            .await?;
+        if let Some(sleep) = self.sleep.as_mut() {
+            sleep.committed(aid)?;
+        }
+        Ok(())
     }
     async fn station_disconnect(
         &mut self,
@@ -340,6 +374,19 @@ unsafe impl Io for Startup {
             return Err(power::Error::Terminal);
         }
         self.station_binding = None;
+        if self
+            .sleep
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_owner())
+        {
+            self.firmware
+                .as_mut()
+                .ok_or(power::Error::Terminal)?
+                .transport_mut()
+                .sleep_reset_terminal()
+                .await?;
+            return Ok(());
+        }
         let native = self
             .firmware
             .as_mut()

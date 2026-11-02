@@ -163,6 +163,26 @@ impl Default for Rx {
     }
 }
 impl Rx {
+    /// Observe only current HCI producer indices. B keeps this geometry live
+    /// during clock gating; no RX memory/BB is read or returned to DMA here.
+    pub(super) fn pending(&self, io: &mut impl Io) -> Result<bool, Error> {
+        if self.state != State::Polling {
+            return Err(Error::Terminal);
+        }
+        let rings = self.rings.as_ref().ok_or(Error::Terminal)?;
+        for ring in rings {
+            let index = read(io, ring.regs.idx as u32)?;
+            if available(ring.buffers.len() as u16, ring.wp, index)? != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(self.assembling())
+    }
+    pub(super) fn assembling(&self) -> bool {
+        self.rings
+            .as_ref()
+            .is_some_and(|rings| rings.iter().any(|ring| ring.assembler.assembling()))
+    }
     pub fn state(&self) -> State {
         self.state
     }
@@ -405,4 +425,4 @@ fn ltr(io: &mut impl Io) -> Result<(), power::Error> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "rx_dma/tests.rs"]
-mod tests;
+pub(super) mod tests;

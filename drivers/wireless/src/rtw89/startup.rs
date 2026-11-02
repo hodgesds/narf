@@ -64,6 +64,7 @@ pub struct Startup {
     full_radio: super::radio_full::Radio,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
+    sleep: Option<runtime_sleep::Runtime>,
     pub(super) lifecycle: super::radio_policy::Lifecycle,
 }
 impl core::fmt::Debug for Startup {
@@ -136,6 +137,7 @@ impl Startup {
             full_radio: super::radio_full::Radio::default(),
             station_controller: None,
             station_binding: None,
+            sleep: None,
             lifecycle: super::radio_policy::Lifecycle::Initial,
         })
     }
@@ -470,6 +472,8 @@ impl Drop for Startup {
         self.fail();
     }
 }
+#[path = "startup_lps.rs"]
+mod runtime_sleep;
 #[path = "startup_station.rs"]
 mod station;
 

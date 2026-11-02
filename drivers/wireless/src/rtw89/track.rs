@@ -629,6 +629,9 @@ impl Tracker {
     pub(super) fn due(&self, now_ms: u64) -> bool {
         !self.disabled && (now_ms >= self.next_ms || self.cfo.timer && now_ms >= self.cfo_next_ms)
     }
+    pub(super) fn restored(&mut self) {
+        self.env = Env::default();
+    }
     pub(super) fn disable(&mut self) {
         self.disabled = true;
     }
@@ -718,3 +721,9 @@ impl Tracker {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "track/tests.rs"]
 mod tests;
+
+/// Source phy_dm_reinit environment half. Actual native awake and original
+/// joint source proof must enclose the complete call before BB tracking.
+pub(super) fn restore_environment(hw: &mut impl Hw) -> Result<(), power::Error> {
+    Env::default().init(hw)
+}

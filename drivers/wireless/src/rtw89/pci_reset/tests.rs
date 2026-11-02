@@ -509,3 +509,36 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_flr_pending_and_quiet_timing_matches_frozen_references
 );
+
+/// Actual sealed temporal-FLR/current-cap boundary consumed by the LPS
+/// native fixture; this never constructs a production fence from a bool.
+pub(in crate::rtw89) fn lps_fence_boundary() -> Result<(), &'static str> {
+    let mut reset = Model::new().reset();
+    let authority = reset.io.authority;
+    let fence = complete(reset.run())
+        .ok_or("LPS actual FLR fixture pending")?
+        .map_err(|_| "LPS actual FLR fixture failure")?;
+    let original = device();
+    if !fence.matches_function(&original, &authority)
+        || reset.phase() != Phase::Ready
+        || reset.io.quiet_violation
+    {
+        return Err("LPS sealed FLR lost original function/quiet proof");
+    }
+    let mut wrong = original;
+    wrong.id.subsystem_id ^= 1;
+    if fence.matches_function(&wrong, &authority)
+        || fence.matches_function(&original, &super::tests::authority())
+    {
+        return Err("LPS temporal fence rebound function/capability");
+    }
+    let mut denied = Model::new().reset();
+    denied.io.authority.revoke();
+    if complete(denied.run()).is_none_or(|result| result.is_ok())
+        || denied.io.triggers != 0
+        || !denied.io.log.is_empty()
+    {
+        return Err("LPS missing actual reset cap fabricated a temporal fence/access");
+    }
+    Ok(())
+}

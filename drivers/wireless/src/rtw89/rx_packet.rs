@@ -245,6 +245,9 @@ pub(super) struct Assembler {
     partial: Option<Partial>,
 }
 impl Assembler {
+    pub(super) fn assembling(&self) -> bool {
+        self.partial.is_some()
+    }
     pub fn segment(&mut self, bytes: &[u8], reports: bool) -> Result<Option<Event>, Error> {
         let info = word(bytes, 0)?;
         let fs = info & (1 << 15) != 0;

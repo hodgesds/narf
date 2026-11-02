@@ -293,7 +293,10 @@ impl Bootstrap {
             Some(owner) => {
                 let reclaimed = owner.retire();
                 let _ = owner.io.finish_station_shutdown().await;
-                reclaimed
+                // A deep/uncertain LPS owner retains DMA until its awaited
+                // actual FLR fence. Re-sample that terminal retirement after
+                // cleanup instead of permanently pinning a proven generation.
+                reclaimed || owner.io.retire_published_dma()
             }
             None => !self.pinned.load(Ordering::Acquire),
         };

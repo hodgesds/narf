@@ -22,6 +22,8 @@ mod radio;
 #[path = "command_native/rf_tracking.rs"]
 mod rf_tracking;
 pub(super) use radio::{QualificationRequest, RadioPreflight};
+#[path = "command_native/lps.rs"]
+mod lps;
 #[path = "command_native/station.rs"]
 mod station;
 
@@ -83,6 +85,8 @@ pub struct Native {
     radio: super::rf_access::Rf,
     runtime_sequence: u16,
     station_runtime: station::Runtime,
+    sleep_blocked: bool,
+    sleep_reset: Option<super::pci_reset::Reset<super::pci_reset::Native>>,
     calibration: Option<super::calibration_policy::Calibration>,
     coex_ready: bool,
     nctl_ready: bool,
@@ -256,6 +260,8 @@ impl Native {
             radio: super::rf_access::Rf::default(),
             runtime_sequence: 0,
             station_runtime: station::Runtime::default(),
+            sleep_blocked: false,
+            sleep_reset: None,
             calibration: None,
             coex_ready: false,
             nctl_ready: false,
@@ -741,9 +747,18 @@ impl Native {
     /// register stop/BME-off alone does not prove posted transactions drained.
     pub(super) fn fail(&mut self) {
         self.state = State::Terminal;
-        // rtw89_pci_ops_stop + free_irq: HIMR and MSI off before BME clears.
+        if self.sleep_reset.is_some() {
+            return;
+        } // Never access during/after FLR quarantine.
+          // rtw89_pci_ops_stop + free_irq: HIMR and MSI off before BME clears.
         self.irq_release();
         self.receive.fail();
+        if self.sleep_blocked {
+            // Clock-gated or interrupted PS work cannot borrow an ordinary
+            // register stop as a wake/firmware-autonomy retirement proof.
+            // Retained async cleanup takes the actual nonemitting FLR path.
+            return;
+        }
         // Autonomous ACK/CTS does not depend on a packet DMA doorbell.
         if let Ok(value) = self.io.read32(0xc000) {
             if !matches!(value, u32::MAX | 0xeaea_eaea) {
@@ -809,7 +824,10 @@ impl Native {
     /// Complete source RF00S/RF10S disable after immediate terminal closure.
     /// This never reopens the owner or grants DMA reclamation/reset authority.
     pub(super) async fn finish_radio_shutdown(&mut self) -> Result<(), super::power::Error> {
-        if self.state != State::Terminal || self.chip != ChipId::Rtl8852B {
+        if self.sleep_reset.is_some()
+            || self.state != State::Terminal
+            || self.chip != ChipId::Rtl8852B
+        {
             return Err(super::power::Error::Terminal);
         }
         self.fail();
@@ -1065,6 +1083,28 @@ impl Native {
     }
     /// Consume the verified proof and free every published allocation.
     fn release_proven(&mut self, _proof: super::dma_stop::Idle) -> usize {
+        // SAFETY: the consumed sealed current DMA idle proof covers this owner.
+        unsafe { self.release_all_fenced() }
+    }
+    fn release_reset_fenced(
+        &mut self,
+        proof: super::pci_reset::Fence,
+    ) -> Result<usize, super::power::Error> {
+        if self.state != State::Terminal
+            || self.irq.is_some()
+            || self.sleep_reset.is_none()
+            || !proof.matches_function(&self.device, &self.authority)
+        {
+            return Err(super::power::Error::Terminal);
+        }
+        // SAFETY: exact sealed successful temporal FLR fence, exclusive original
+        // function, IRQ closed before quarantine, and no producer may restart.
+        Ok(unsafe { self.release_all_fenced() })
+    }
+    /// # Safety
+    /// A consumed actual same-function DMA idle or successful temporal FLR
+    /// fence proves all published descriptor/prefetch references are gone.
+    unsafe fn release_all_fenced(&mut self) -> usize {
         let mut released = 0;
         if let Some(core) = self.station_runtime.core.as_mut() {
             // SAFETY: proof above covers every TX channel and BME-off.
@@ -1302,4 +1342,4 @@ impl super::rfk::Interface for Native {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "command_native_tests.rs"]
-mod tests;
+pub(super) mod tests;

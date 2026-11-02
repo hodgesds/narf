@@ -72,6 +72,17 @@ pub(super) struct Fence {
     bars: [u32; 6],
     rom: u32,
 }
+impl Fence {
+    /// Identity check on an actual successful temporal FLR receipt. No config
+    /// access, RF grant, reset initiation or replacement lifecycle is minted.
+    pub(super) fn matches_function(
+        &self,
+        device: &BusDevice,
+        authority: &Cap<BusDeviceCap, Write>,
+    ) -> bool {
+        Binding::new(device, authority) == Ok(self.binding)
+    }
+}
 /// # Safety
 /// The function is exclusively reserved throughout this retained owner. Each
 /// config read/write invokes the exact current BusDevice capability around the
@@ -525,4 +536,4 @@ impl super::startup::Startup {
 
 #[cfg(feature = "kernel-test")]
 #[path = "pci_reset/tests.rs"]
-mod tests;
+pub(super) mod tests;

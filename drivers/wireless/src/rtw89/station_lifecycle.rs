@@ -78,6 +78,9 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_poll(
         &mut self,
     ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
+        if self.io.station_sleep_blocked() {
+            return Ok(alloc::vec::Vec::new());
+        }
         let station = self.station.as_mut().ok_or(super::station::Error::State)?;
         let events = self
             .io
@@ -89,6 +92,39 @@ impl<I: Io> Owner<I> {
         let frames = station.poll(&mut self.io)?;
         self.io.irq_rearm().map_err(super::station::Error::Native)?;
         Ok(frames)
+    }
+    pub(super) fn station_sleep_blocked(&self) -> bool {
+        self.io.station_sleep_blocked()
+    }
+    pub(super) async fn station_sleep_service(
+        &mut self,
+        identity: Option<narf_net::native_emission::Lifetime>,
+        enabled: bool,
+        host_idle: bool,
+        force: bool,
+        admission: &Admission,
+    ) -> Result<bool, station::Error> {
+        let idle = host_idle
+            && self
+                .station
+                .as_ref()
+                .is_some_and(station::State::sleep_idle);
+        let (sleeping, restored) = self
+            .io
+            .station_sleep_service(identity, enabled, idle, force, admission)
+            .await
+            .map_err(station::Error::Native)?;
+        if restored {
+            if let Some(station) = self.station.as_mut() {
+                station.sleep_restored();
+            }
+        }
+        Ok(sleeping)
+    }
+    pub(super) fn station_sleep_capable(&mut self) -> Result<bool, station::Error> {
+        self.io
+            .station_sleep_capable()
+            .map_err(station::Error::Native)
     }
     pub(super) fn station_qos_all(&self) -> bool {
         self.station
