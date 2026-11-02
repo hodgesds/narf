@@ -5734,6 +5734,47 @@ mod kernel_test_split_tests {
         assert_eq!(partial.in_flight, None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn completed_filtered_boot_retains_failure_names() {
+        use std::os::unix::process::ExitStatusExt;
+        let serial = "\
+── kernel_test (filtered: 1) ──\r
+  [run] drivers/usb / broken_detach\r
+  [FAIL] drivers/usb / broken_detach: provider still published\r
+  [run] drivers/net / broken_resume\r
+  [FAIL] drivers/net / broken_resume: queue not restored\r
+── summary: 0 pass, 2 fail, 0 skip ──\r
+";
+        let outcome = interpret_boot(
+            "drivers",
+            BootOutcome::Exited {
+                status: std::process::ExitStatus::from_raw(3 << 8),
+                serial: serial.as_bytes().to_vec(),
+            },
+            Arch::X86_64,
+            900,
+            1,
+        );
+        assert_eq!(outcome.verdict, GroupVerdict::Failed);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(
+            outcome.failing,
+            vec![
+                (
+                    "drivers/usb".into(),
+                    "broken_detach".into(),
+                    "provider still published".into()
+                ),
+                (
+                    "drivers/net".into(),
+                    "broken_resume".into(),
+                    "queue not restored".into()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn killed_boot_charges_the_in_flight_test_as_a_timeout_failure() {
         let serial = "\
@@ -6198,7 +6239,13 @@ fn interpret_boot(
             let text = String::from_utf8_lossy(&serial);
             match kernel_test_summary(&text) {
                 Some(summary) => {
-                    let failing = parse_failing_list(&text);
+                    let mut failing = parse_failing_list(&text);
+                    // Filtered boots print inline FAIL records without a
+                    // trailing failure list. Keep their identities even when
+                    // emit_serial_tail omits the earlier part of the stream.
+                    if failing.is_empty() && summary.fail != 0 {
+                        failing = parse_partial_boot_results(&text).failing;
+                    }
                     let mut out = GroupOutcome {
                         passed: summary.pass,
                         failed: summary.fail,
