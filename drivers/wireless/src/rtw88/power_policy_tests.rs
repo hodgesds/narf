@@ -10,8 +10,11 @@ use narf_capabilities::{Cap, Read};
 use narf_firmware::FirmwareBlob;
 use narf_kernel_test::{kernel_test_in, TestResult};
 pub(super) fn make_factory(rfe: u8, base: u8) -> Factory {
+    make_factory_with_mac(rfe, base, [2, 4, 6, 8, 10, 12])
+}
+pub(super) fn make_factory_with_mac(rfe: u8, base: u8, own: [u8; 6]) -> Factory {
     let mut raw = [255; 768];
-    raw[0x120..0x126].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+    raw[0x120..0x126].copy_from_slice(&own);
     raw[0xb9] = 0x33;
     raw[0xc1] = 0;
     raw[0xca] = rfe;

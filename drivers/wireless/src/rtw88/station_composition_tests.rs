@@ -14,6 +14,8 @@ use narf_net::{Interface, TxMeta};
 use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIface};
+#[path = "station_multi_tests.rs"]
+mod multi_tests;
 #[path = "wmm_station_tests.rs"]
 mod wmm_tests;
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
@@ -113,8 +115,11 @@ pub(in crate::rtw88) struct Peer {
 }
 impl Peer {
     pub(in crate::rtw88) fn new(protected: bool) -> Self {
+        Self::for_station(protected, OWN)
+    }
+    fn for_station(protected: bool, own: [u8; 6]) -> Self {
         let plan = NetworkPlan {
-            station: OWN,
+            station: own,
             bssid: AP,
             server_ip: [10, 88, 1, 1],
             lease_ip: [10, 88, 1, 42],
@@ -525,16 +530,22 @@ struct Harness {
     env: Arc<Env>,
     plan: NetworkPlan,
     calibration: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    native_dispatch: bool,
 }
 impl Harness {
     fn new(protected: bool) -> Self {
-        assert!(ACTIVE_TEST.lock().is_none());
-        let mut io = RadioIo::new();
+        Self::build(protected, OWN, false)
+    }
+    fn build(protected: bool, own: [u8; 6], native_dispatch: bool) -> Self {
+        if !native_dispatch {
+            assert!(ACTIVE_TEST.lock().is_none());
+        }
+        let mut io = RadioIo::for_station(own);
         let env = Arc::new(Env {
             clock: io.clock.clone(),
             entropy: AtomicBool::new(true),
         });
-        let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+        let peer = Arc::new(IrqSafeSpinLock::new(Peer::for_station(protected, own)));
         let plan = peer.lock().plan;
         let actor = peer.clone();
         io.packets.reaction = Some(Arc::new(move |bytes| {
@@ -545,19 +556,23 @@ impl Harness {
         }));
         let lifecycle = Arc::new(Lifecycle::new(0xc822));
         let name = narf_net::iface::reserve_name("r88-native%d");
-        let device = Arc::new(Device::new(name, OWN, lifecycle.clone(), env.clone()));
-        *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::register(name, OWN, send);
+        let device = Arc::new(Device::new(name, own, lifecycle.clone(), env.clone()));
+        if native_dispatch {
+            crate::rtw88::interface::publish(device.clone()).unwrap();
+        } else {
+            *ACTIVE_TEST.lock() = Some(device.clone());
+            narf_net::iface::register(name, own, send);
+            device.admit_for_test();
+        }
         narf_net::iface::set_link_state(name, true); // operator IFF_UP, not PHY state
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
-        device.admit_for_test();
         // This exact lifecycle retains the one firmware/radio owner before
         // its first simulated firmware publication and all real packet DMA.
         complete(lifecycle.initialize_bytes(move || Ok(io), super::mac_tests::firmware())).unwrap();
         complete(lifecycle.prepare_mac()).unwrap();
-        let factory = super::power_policy_tests::make_factory(0, 60);
+        let factory = super::power_policy_tests::make_factory_with_mac(0, 60, own);
         complete(lifecycle.prepare_phy_tables(&factory)).unwrap();
         let board = {
             let retained = lifecycle.retained.try_lock().unwrap();
@@ -604,6 +619,7 @@ impl Harness {
             env,
             plan,
             calibration,
+            native_dispatch,
         }
     }
     fn request(&self) -> AssociateRequest {
@@ -674,8 +690,18 @@ impl Harness {
 }
 impl Drop for Harness {
     fn drop(&mut self) {
-        *ACTIVE_TEST.lock() = None;
-        narf_net::iface::unregister(self.device.name());
+        if self.native_dispatch {
+            self.device.withdraw();
+        } else {
+            narf_net::iface::unregister(self.device.name());
+        }
+        let mut active = ACTIVE_TEST.lock();
+        if active
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &self.device))
+        {
+            *active = None;
+        }
     }
 }
 fn composition(protected: bool) -> TestResult {

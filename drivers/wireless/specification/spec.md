@@ -475,6 +475,19 @@ one release metadata check pass; full release/native gates remain at the next
 25-feature checkpoint. Counting unvalidated implementations,82 remain. Physical
 multi-board acceptance and genuine measured qualifications stay separate.
 
+**Source implementation recount 2026-11-02** (independent RTW88 PCI functions):
+the remaining ledger holds **73 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Nine source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTW88 now retains up to four
+exact-function controllers and selects provisioning explicitly by BDF when
+multiple radios are live. Original firmware/qualification/key/native-DMA
+owners remain separate, and old ingress retains its name until callback return
+before removal. Three new cases are written and unexecuted. Scoped formatting
+and one release metadata check pass; full release/native validation remains
+scheduled at25 completed features. Counting unvalidated implementations,82
+remain. Measured board qualifications and physical multi-board acceptance
+remain separate; operating reset, runtime sleep and system suspend stay open.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE/SESSION1/SESSION2 is implemented pending validation; the family P2P row stays open |
@@ -484,7 +497,7 @@ multi-board acceptance and genuine measured qualifications stay separate.
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 16 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA and C21 RF power tracking are implemented pending validation |
+| rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
 | rtw89 | 12 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW and periodic RF tracking/runtime LPS; bounded independent live functions are implemented pending validation; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
@@ -1346,6 +1359,13 @@ holds its name through callback return before removal or rebind; system PM
 blocks new probes and visits every original owner with rollback on failed or
 cancelled preparation. Family §3 defines the original reclamation and native
 receipt requirements; the feature grants no new chip or physical qualification.
+
+RTW88 additionally exposes `provision_function(BusAddr)` and
+`pci::with_controller_at(BusAddr, callback)` for an exact retained function.
+Implicit `provision`/`with_controller` refuse ambiguous live radios. Each
+original controller owns its provisioning mutex and worker; a nonwrapping
+endpoint cookie and ingress-quiescent removal retain the original source,
+key/PN, copied-frame and DMA-reclamation proofs. Family §3 is normative.
 
 ## 4. Interaction with `narf-wireless`
 

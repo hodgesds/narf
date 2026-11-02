@@ -18,6 +18,7 @@ mod retained_backend_tests;
 include!("golden.rs");
 pub(super) struct RadioIo {
     base: Model,
+    expected_own: [u8; 6],
     radio: bool,
     commands: Vec<[u8; 32]>,
     pending: bool,
@@ -59,11 +60,15 @@ pub(super) struct RadioIo {
 }
 impl RadioIo {
     pub(super) fn new() -> Self {
+        Self::for_station([2, 4, 6, 8, 10, 12])
+    }
+    pub(super) fn for_station(own: [u8; 6]) -> Self {
         let mut base = Model::new(0, 3);
         base.regs[0x1208..0x120c].fill(0);
         base.regs[0x80..0x84].fill(0);
         Self {
             base,
+            expected_own: own,
             radio: false,
             commands: Vec::new(),
             pending: false,
@@ -550,7 +555,7 @@ unsafe impl Io for RadioIo {
         Ok(true)
     }
     fn finish_radio(&mut self, gate: crate::rtw88::power_policy::Gate) -> Result<(), Error> {
-        if self.pending || self.commands.len() != 3 || gate.own() != [2, 4, 6, 8, 10, 12] {
+        if self.pending || self.commands.len() != 3 || gate.own() != self.expected_own {
             return Err(Error::State);
         }
         self.base.regs[0x100] = 0x30;

@@ -33,8 +33,7 @@ use super::power;
 use super::regs::*;
 
 /// One bound RTW88 device. Holds the BAR2 register mapping + the EFUSE-
-/// derived MAC. Single-instance for the baseline (every laptop ships
-/// at most one of these); multi-radio comes with the follow-up.
+/// derived MAC. Every live function keeps its own lifecycle and name.
 pub struct Rtw88Device {
     /// Retained bus identity; a repeat probe must not park the active owner.
     pub(crate) bus_addr: narf_bus::BusAddr,
@@ -49,11 +48,9 @@ pub struct Rtw88Device {
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    pub(super) diagnostic_name: &'static str,
+    pub(super) provisioning: narf_lib::mutex::Mutex<()>,
 }
-
-/// This device's interface name, `wlan%d` as Linux `dev_alloc_name` picks
-/// it; set when the interface registers.
-static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl Rtw88Device {
     /// Exact H/R/T native RTS emission-program measurement metadata. No grant.
@@ -231,7 +228,7 @@ impl Interface for Rtw88Device {
     fn name(&self) -> &str {
         self.interface
             .as_ref()
-            .map_or(*IFNAME.lock(), |device| device.name())
+            .map_or(self.diagnostic_name, |device| device.name())
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -367,14 +364,6 @@ pub enum ProbeError {
     Efuse(efuse::EfuseError),
 }
 
-/// Single-instance live device. The baseline only supports one bound
-/// RTW88; the follow-up will switch to a `Vec` keyed by domain id.
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw88Device>>> = IrqSafeSpinLock::new(None);
-static PROBING: AtomicBool = AtomicBool::new(false);
-/// A removed function whose DMA could not be proven idle: its published
-/// mappings stay pinned, so the address is never re-initialized.
-static QUARANTINE: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
-
 /// PCI driver match registration. One entry per supported device id —
 /// mirrors the `rtw88/pci.c::rtw_pci_id_table` shape.
 pub fn register_pci_driver() {
@@ -396,28 +385,13 @@ pub fn register_pci_driver() {
 /// the retained owner is dropped. Unproven mappings stay pinned and the
 /// address is quarantined against re-initialization.
 fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
-    let owner = {
-        let mut controller = CONTROLLER.lock();
-        if controller
-            .as_ref()
-            .is_some_and(|owner| owner.bus_addr == device.addr)
-        {
-            controller.take()
-        } else {
-            None
-        }
-    };
-    let Some(owner) = owner else {
+    let Some(owner) = super::functions::begin_remove(device.addr) else {
         return;
     };
-    *QUARANTINE.lock() = Some(device.addr);
     narf_scheduler::spawn(async move {
         let reclaimed = remove_owner(&owner).await;
         if reclaimed {
-            let mut quarantine = QUARANTINE.lock();
-            if *quarantine == Some(device.addr) {
-                *quarantine = None;
-            }
+            super::functions::reclaimed(&owner);
         }
         narf_console::klog!(
             "rtw88: removed; DMA {}\n",
@@ -431,9 +405,12 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
 }
 async fn remove_owner(owner: &Rtw88Device) -> bool {
     match &owner.interface {
-        Some(interface) => interface.withdraw(),
+        Some(interface) => {
+            interface.withdraw();
+            interface.wait_withdrawn().await;
+        }
         None => {
-            let name = *IFNAME.lock();
+            let name = owner.diagnostic_name;
             narf_wireless::registry::unregister(name);
             narf_net::iface::unregister(name);
         }
@@ -452,32 +429,9 @@ async fn remove_owner(owner: &Rtw88Device) -> bool {
 /// Probe entry called by `narf-bus::driver_match` when a Realtek
 /// vendor/device pair we registered for surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    super::probe_guard::run(&PROBING, || probe_exclusive(device, cap))
-        .unwrap_or(Err(narf_bus::ProbeError::BadDevice))
-}
-
-fn probe_exclusive(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    // Skip if a device is already bound. Real laptops only ship one
-    // RTW88; a second probe is a re-enumeration race.
-    if *QUARANTINE.lock() == Some(device.addr) {
-        // Pinned DMA from a removed generation: never power-cycle it again.
-        return Err(narf_bus::ProbeError::BadDevice);
-    }
-    let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
-    match crate::rtw88::pci_park::admission(bound, device.addr) {
-        crate::rtw88::pci_park::Admission::Bound => return Ok(()),
-        crate::rtw88::pci_park::Admission::ParkExtra => {
-            super::pci_park::invoke(&cap, || super::pci_park::park(&device, &cap))
-                .map_err(|_| narf_bus::ProbeError::BadDevice)?
-                .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-            return Ok(());
-        }
-        crate::rtw88::pci_park::Admission::Initialize => {}
-    }
-
+    let Some(claim) = super::functions::Claim::acquire(device.addr)? else {
+        return Ok(());
+    };
     // SAFETY: caller (the bus dispatch layer) hands us exclusive
     // BusDeviceCap authority for this device's cfg + BARs.
     // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -487,7 +441,7 @@ fn probe_exclusive(
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
-    let dev = Arc::new(dev);
+    let mut dev = dev;
     let mac = dev.mac;
     let did = dev.device_id;
     let firmware = dev.firmware.clone();
@@ -500,10 +454,13 @@ fn probe_exclusive(
         super::interface::publish(interface.clone())
             .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     } else {
-        *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
+        dev.diagnostic_name = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
+    }
+    let dev = Arc::new(dev);
+    if interface.is_none() {
         narf_wireless::registry::register(dev.clone());
     }
-    *CONTROLLER.lock() = Some(dev);
+    claim.publish(dev.clone());
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(did)),
@@ -513,65 +470,21 @@ fn probe_exclusive(
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    if firmware.is_some() && interface.is_some() {
-        // Boot and public staged provisioning share the same admission lock
-        // and phase-aware retained-owner continuation.
+    if (firmware.is_some() || sibling.is_some()) && interface.is_some() {
+        let owner = dev.clone();
         narf_scheduler::spawn(async move {
-            if let Err(error) = drive_scheduled(
+            let result = drive_scheduled(
                 120,
+                || retryable(&owner),
                 || {
-                    with_controller(|dev| {
-                        dev.firmware.as_ref().is_some_and(|fw| {
-                            matches!(
-                                fw.status().stage,
-                                super::firmware_lifecycle::Stage::Detected
-                                    | super::firmware_lifecycle::Stage::PhyTablesPrepared
-                                    | super::firmware_lifecycle::Stage::Calibration8821cPrepared
-                                    | super::firmware_lifecycle::Stage::Operating8821cPrepared
-                            )
-                        }) && dev.interface.as_ref().is_some_and(|iface| !iface.closed())
-                    })
-                    .unwrap_or(false)
+                    let owner = owner.clone();
+                    async move { provision_owner(&owner).await }
                 },
-                provision,
                 || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
             )
-            .await
-            {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "rtw88-8822ce provisioning: {:?}",
-                    error
-                );
-            }
-        });
-    }
-    if sibling.is_some() {
-        narf_scheduler::spawn(async {
-            if let Err(error) = drive_scheduled(
-                120,
-                || {
-                    with_controller(|dev| {
-                        dev.sibling.as_ref().is_some_and(|owner| {
-                            matches!(
-                                owner.status().stage,
-                                super::firmware_lifecycle::Stage::Detected
-                                    | super::firmware_lifecycle::Stage::PhyTablesPrepared
-                            )
-                        })
-                    })
-                    .unwrap_or(false)
-                },
-                provision,
-                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
-            )
-            .await
-            {
-                narf_console::klog!(
-                    "rtw88-8821ce retained calibration provisioning: {:?}\n",
-                    error
-                );
+            .await;
+            if let Err(error) = result {
+                narf_console::klog!("rtw88 provisioning: {:?}\n", error);
             }
         });
     }
@@ -712,6 +625,8 @@ pub unsafe fn bring_up(
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(rx_ring),
         tx_ring: IrqSafeSpinLock::new(tx_ring),
+        diagnostic_name: "",
+        provisioning: narf_lib::mutex::Mutex::new(()),
     })
 }
 
@@ -736,12 +651,13 @@ pub const fn name_for(did: u16) -> &'static str {
 
 /// Test helper — `true` if the static slot has a bound device.
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    super::functions::any()
 }
 
 /// Borrow the bound controller. Returns `None` if probe hasn't run.
 pub fn with_controller<R>(f: impl FnOnce(&Rtw88Device) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|owner| f(owner))
+    let owner = super::functions::sole()?;
+    Some(f(&owner))
 }
 
 struct Provisioning {
@@ -785,7 +701,6 @@ fn provisioning(controller: Option<&Rtw88Device>) -> Result<Provisioning, super:
         interface: interface.clone(),
     })
 }
-static PROVISIONING: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
 async fn provision_with(
     control: &narf_lib::mutex::Mutex<()>,
     binding: impl FnOnce() -> Result<Provisioning, super::FirmwareError>,
@@ -856,18 +771,48 @@ where
 /// Detected or completed parked checkpoints resume; started/failed/cancelled
 /// work is never reconstructed, reset or replayed. Existing station is a no-op.
 pub async fn provision() -> Result<(), super::FirmwareError> {
-    let sibling = {
-        CONTROLLER
-            .lock()
+    let owner = super::functions::sole().ok_or(super::FirmwareError::State)?;
+    provision_owner(&owner).await
+}
+/// Continue only the exact retained PCI function selected by the caller.
+/// Retained firmware/device/source invocations still authorize all access.
+pub async fn provision_function(addr: narf_bus::BusAddr) -> Result<(), super::FirmwareError> {
+    let owner = super::functions::get(addr).ok_or(super::FirmwareError::State)?;
+    provision_owner(&owner).await
+}
+pub fn with_controller_at<R>(
+    addr: narf_bus::BusAddr,
+    f: impl FnOnce(&Rtw88Device) -> R,
+) -> Option<R> {
+    let owner = super::functions::get(addr)?;
+    Some(f(&owner))
+}
+fn retryable(owner: &Rtw88Device) -> bool {
+    use super::firmware_lifecycle::Stage;
+    let stage = owner
+        .firmware
+        .as_ref()
+        .map(|fw| fw.status().stage)
+        .or_else(|| owner.sibling.as_ref().map(|fw| fw.status().stage));
+    matches!(
+        stage,
+        Some(
+            Stage::Detected
+                | Stage::PhyTablesPrepared
+                | Stage::Calibration8821cPrepared
+                | Stage::Operating8821cPrepared
+        )
+    ) && owner
+        .interface
+        .as_ref()
+        .is_some_and(|iface| !iface.closed())
+}
+async fn provision_owner(controller: &Rtw88Device) -> Result<(), super::FirmwareError> {
+    if let Some(owner) = &controller.sibling {
+        let _admission = controller.provisioning.lock().await;
+        let interface = controller
+            .interface
             .as_ref()
-            .and_then(|dev| dev.sibling.clone())
-    };
-    if let Some(owner) = sibling {
-        let _admission = PROVISIONING.lock().await;
-        let interface = CONTROLLER
-            .lock()
-            .as_ref()
-            .and_then(|dev| dev.interface.clone())
             .ok_or(super::FirmwareError::State)?;
         if interface.closed() {
             return Err(super::FirmwareError::Cancelled);
@@ -884,11 +829,7 @@ pub async fn provision() -> Result<(), super::FirmwareError> {
         }
         return Ok(());
     }
-    provision_with(&PROVISIONING, || {
-        let controller = CONTROLLER.lock();
-        provisioning(controller.as_deref())
-    })
-    .await
+    provision_with(&controller.provisioning, || provisioning(Some(controller))).await
 }
 
 /// Test-only reset of the bound slot. Avoids cross-test leak when the
@@ -896,7 +837,7 @@ pub async fn provision() -> Result<(), super::FirmwareError> {
 /// drops from production binaries.
 #[cfg(any(test, feature = "kernel-test"))]
 pub fn __reset_for_test() {
-    *CONTROLLER.lock() = None;
+    super::functions::reset_for_test();
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -959,6 +900,8 @@ mod provision_tests {
             link_up: AtomicBool::new(false),
             rx_ring: IrqSafeSpinLock::new(None),
             tx_ring: IrqSafeSpinLock::new(None),
+            diagnostic_name: "rtw88-provision-fixture",
+            provisioning: narf_lib::mutex::Mutex::new(()),
         }
     }
     fn smoke_rtw8822ce_public_provision_retains_bindings_and_cancels_before_admission() -> TestResult
@@ -1039,5 +982,96 @@ mod provision_tests {
     kernel_test_in!(
         "drivers/wireless/rtw88",
         smoke_rtw8822ce_public_provision_retains_bindings_and_cancels_before_admission
+    );
+    fn smoke_rtw88_multiple_function_selection_serialization_and_quarantine() -> TestResult {
+        use super::super::functions;
+        if functions::any() {
+            return TestResult::Skip("physical RTW88 functions present");
+        }
+        struct Cleanup(Vec<Arc<Rtw88Device>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for owner in &self.0 {
+                    functions::reclaimed(owner);
+                }
+            }
+        }
+        let first = Arc::new(fixture());
+        let mut other = fixture();
+        other.bus_addr = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0xfffd, 0xfc, 0x19, 0));
+        let second = Arc::new(other);
+        let mut cleanup = Cleanup(alloc::vec![first.clone(), second.clone()]);
+        let Some(claim) = functions::Claim::acquire(first.bus_addr).ok().flatten() else {
+            return TestResult::Fail("first exact-function reservation refused");
+        };
+        if functions::Claim::acquire(first.bus_addr).is_ok() {
+            return TestResult::Fail("pending function claim admitted another native producer");
+        }
+        claim.publish(first.clone());
+        functions::Claim::acquire(second.bus_addr)
+            .unwrap()
+            .unwrap()
+            .publish(second.clone());
+        if with_controller(|_| ()).is_some()
+            || functions::sole().is_some()
+            || with_controller_at(second.bus_addr, |owner| {
+                core::ptr::eq(owner, second.as_ref())
+            }) != Some(true)
+        {
+            return TestResult::Fail("implicit provisioning selected an arbitrary function");
+        }
+        let mut implicit = Box::pin(provision());
+        if implicit
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            != core::task::Poll::Ready(Err(super::super::FirmwareError::State))
+        {
+            return TestResult::Fail("ambiguous public provisioning touched a retained owner");
+        }
+        let held = first.provisioning.try_lock().unwrap();
+        let mut first_wait = Box::pin(provision_with(&first.provisioning, || {
+            Err(super::super::FirmwareError::State)
+        }));
+        let mut second_step = Box::pin(provision_with(&second.provisioning, || {
+            Err(super::super::FirmwareError::Unsupported)
+        }));
+        if !first_wait
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+            || second_step
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                != core::task::Poll::Ready(Err(super::super::FirmwareError::Unsupported))
+        {
+            return TestResult::Fail("provisioning mutex crossed native function lifetimes");
+        }
+        drop(first_wait);
+        drop(second_step);
+        drop(held);
+        let removed = functions::begin_remove(first.bus_addr).unwrap();
+        if !Arc::ptr_eq(&removed, &first)
+            || functions::get(first.bus_addr).is_some()
+            || functions::Claim::acquire(first.bus_addr).is_ok()
+            || functions::get(second.bus_addr).is_none_or(|owner| !Arc::ptr_eq(&owner, &second))
+        {
+            return TestResult::Fail("quarantine escaped its original BDF");
+        }
+        functions::reclaimed(&first);
+        let fresh = Arc::new(fixture());
+        functions::Claim::acquire(fresh.bus_addr)
+            .unwrap()
+            .unwrap()
+            .publish(fresh.clone());
+        cleanup.0.push(fresh.clone());
+        functions::reclaimed(&first);
+        if functions::get(fresh.bus_addr).is_none_or(|owner| !Arc::ptr_eq(&owner, &fresh)) {
+            return TestResult::Fail("stale removal released a new function owner");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw88/multiple",
+        smoke_rtw88_multiple_function_selection_serialization_and_quarantine
     );
 }

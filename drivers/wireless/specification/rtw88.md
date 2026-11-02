@@ -53,14 +53,12 @@ DMA. `pci_park::invoke` places the actual parking, BAR mapping, power and
 EFUSE operations inside the current PCI capability invocation. The shared
 helper is also used by rtlwifi firmware MMIO; a real revoked-cap regression
 proves the register callback is not entered after revocation.
-A non-spinning atomic/RAII reservation covers the complete synchronous
-probe transaction from admission through power, retained controller/interface
-publication and spawn. Overlapping same-function or additional-function
-probes return `BadDevice` without PCI/MMIO access or parking an initializing
-function; they never report an uninitialized overlapping function bound.
-A repeat probe of the retained bus address returns without configuration
-access; a distinct additional singleton match parks only its own PCI
-function. The RTL8822CE firmware owner may later enable BME only after retaining
+A non-spinning RAII reservation for each exact BDF covers the complete
+synchronous probe transaction from admission through power, retained
+controller/interface publication and spawn. Overlapping same-function probes
+return `BadDevice` without PCI/MMIO access; a repeat fully retained function
+is observational. Additional functions acquire independent reservations before
+hardware access, bounded to four retained BDFs including DMA quarantine. The RTL8822CE firmware owner may later enable BME only after retaining
 and checking every host ring, with firmware-only beacon DMA runnable.
 
 `Rtw88Device::registers` holds the single mandatory BAR2 control mapping;
@@ -272,12 +270,54 @@ C21 native profile exposes passive channel1 scan and legacy Open/WPA2 station;
 That calibration-only stage advertises no HT/VHT, QoS or additional bands. Physical firmware/board
 acceptance remains unrecorded.
 
+### Multiple live retained functions
+
+Up to four RTW88 PCI functions retain independent controllers, exact firmware/
+factory/calibration/source identities, power-policy providers, native ring
+owners, station keys/PNs, interface names and provisioning mutexes. The native
+station applicability remains RTL8821CE/RTL8822CE; additional chip IDs keep
+their existing diagnostic behavior. Linux
+[`pci.c::rtw_pci_probe`/`rtw_pci_remove`](https://codebrowser.dev/linux/linux/drivers/net/wireless/realtek/rtw88/pci.c.html)
+uses per-`pci_dev` hardware ownership; NARF retains a bounded BDF registry.
+A pending claim and a removed function with unproven DMA reclamation retain
+only their own BDF. Removal holds the original Arc through native teardown;
+only proven reclamation releases that entry, and stale cleanup cannot release
+a fresh owner or a different function.
+
+Every native shell uses `net::iface::register_with_context` with a nonwrapping,
+never-reused boot dispatch cookie. RX drain snapshots all endpoints and
+services each after releasing its registry lock. A held native TX terminal,
+revoked original qualification, firmware wait or disconnect cannot select or
+stall another retained function. Background provisioning captures its original
+owner, and explicit continuation requires the BDF when more than one is live.
+
+Withdrawal closes only the old admission, permanently fences carrier metadata,
+and retains its name/dispatch reservation until an old stack ingress callback
+returns. The async remove path waits for delivery quiescence before the original
+DMA-stop teardown and BDF release. No driver lock spans a stack callback.
+Repeated old removal or drain work cannot modify a fresh shell. Existing
+current-source receive/copy proofs and the exact native stop/reclamation rules
+remain in force. This implements independent device lifetimes; operating reset,
+safe reassociation, runtime sleep and system suspend remain separate rows.
+
+Three new cases under `drivers/wireless/rtw88/multiple` cover real retained
+firmware/radio/native-packet models with distinct factory MACs and CCMP keys,
+original qualification loss, independent TX terminal waits, production context
+routing, ingress-delayed removal, stale callbacks, explicit BDF selection,
+per-function provisioning serialization and quarantine. They await batch
+validation; no physical multi-board acceptance is claimed.
+
 ### RTL8822CE retained station provisioning
 
 `pci::provision()` (also re-exported as `rtw88::provision`) is the public
-staged-asset continuation for the already registered RTL8822CE. Probe's worker
-calls this same function. A single async admission mutex serializes boot and
-operator calls; no IRQ-disabling lock crosses an await. Admission snapshots the
+staged-asset continuation when exactly one live retained function exists.
+With multiple functions it returns `State`, without choosing a radio. Explicit
+`pci::provision_function(BusAddr)` (also re-exported from `rtw88`) selects the
+original live function; `pci::with_controller_at(BusAddr, callback)` borrows
+that exact controller. The legacy `with_controller` also requires one live
+function. Probe's worker captures its original controller Arc and uses the
+same owner-specific continuation; its async admission mutex serializes boot
+and operator calls for that function alone; no IRQ-disabling lock crosses an await. Admission snapshots the
 exact firmware/interface Arcs, verifies their shared lifecycle and factory MAC,
 and rejects absent controllers, diagnostic siblings, closed interfaces and
 in-progress/failed stages. Only `Detected`, completed firmware/MAC/PHY-table/
@@ -1932,7 +1972,6 @@ changes. None is a physical blocker unless stated.
 | `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
 | `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
-| `multi_device` | Not attempted. Each `Rtw88Device` owns one retained lifecycle, and there is no multi-instance composition test. |
 | `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
 | `operating_reset` | No `rtw_core_stop`/`rtw_core_start` generation reset over a retained owner. `dma_stop.rs` now proves a stopped owner idle and releases it, and `Lifecycle::remove` tears one down, but the lifecycle is one-shot. Its `started` latch, the `pci_firmware::allocate` cold-power precondition (`power::power_on` card-disable to enable runs only in `pci::bring_up`) and the interface `Admission`, which never reopens after `close`, all forbid re-running power-on, firmware download, MAC/PHY/radio and station start on the same function and shell. Needs a generation counter across `Lifecycle`/`Firmware`/`Sibling`/`interface::Device`, a re-entrant cold-power path and admission reopen, plus re-qualification of every continuation against the new generation (patterns: ath9k `reset_owner`, iwlwifi `Owner::recover`). |
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One registered RTL8821CE/RTL8822CE shell and retained owner for control and packet
+//! Per-function RTL8821CE/RTL8822CE shells and retained owners for control and packet
 //! progress. Synchronous stack drains never wait for another executor task.
 use super::{
     firmware_lifecycle::Lifecycle,
@@ -8,7 +8,7 @@ use super::{
     station_control::Admission,
 };
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -46,6 +46,9 @@ pub(super) struct Device<I: Io> {
     local: [u8; 6],
     published: AtomicBool,
     withdrawn: AtomicBool,
+    metadata_retired: AtomicBool,
+    deliveries: AtomicUsize,
+    withdrawal: AtomicU8,
     activating: AtomicBool,
     admitted: AtomicBool,
     up: AtomicBool,
@@ -121,6 +124,9 @@ impl<I: Io + 'static> Device<I> {
             local,
             published: AtomicBool::new(false),
             withdrawn: AtomicBool::new(false),
+            metadata_retired: AtomicBool::new(false),
+            deliveries: AtomicUsize::new(0),
+            withdrawal: AtomicU8::new(0),
             activating: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
@@ -153,20 +159,41 @@ impl<I: Io + 'static> Device<I> {
         if !self.published.swap(false, Ordering::AcqRel) {
             return;
         }
-        {
-            let mut active = ACTIVE.lock();
-            let this = Arc::as_ptr(self) as *const ();
-            if active
-                .as_ref()
-                .is_some_and(|a| Arc::as_ptr(a) as *const () == this)
-            {
-                *active = None;
-            }
-        }
+        self.link_inner(None, false, true);
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
+        self.withdrawal.store(1, Ordering::Release);
+        self.finish_withdrawal();
+    }
+    fn finish_withdrawal(&self) {
+        if self.deliveries.load(Ordering::Acquire) != 0
+            || self
+                .withdrawal
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
         narf_net::iface::unregister(&self.name);
-        CLAIMED.store(false, Ordering::Release);
+        super::endpoints::remove(self as *const Self as *const ());
+        self.withdrawal.store(3, Ordering::Release);
+    }
+    pub(super) async fn wait_withdrawn(&self) {
+        while matches!(self.withdrawal.load(Ordering::Acquire), 1 | 2) {
+            self.environment.pause().await;
+        }
+    }
+    fn begin_delivery(&self) -> Option<Delivery<'_, I>> {
+        let _metadata = self.metadata.lock();
+        if self.withdrawn() || self.closed() {
+            return None;
+        }
+        self.deliveries.fetch_add(1, Ordering::AcqRel);
+        Some(Delivery(self))
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn delivery_for_test(&self) -> impl Drop + '_ {
+        self.begin_delivery().expect("live fixture ingress")
     }
     pub(super) fn withdrawn(&self) -> bool {
         self.withdrawn.load(Ordering::Acquire)
@@ -218,7 +245,16 @@ impl<I: Io + 'static> Device<I> {
         Ok(())
     }
     fn link(&self, peer: Option<[u8; 6]>, port: bool) {
+        self.link_inner(peer, port, false);
+    }
+    fn link_inner(&self, peer: Option<[u8; 6]>, port: bool, retire: bool) {
         let _metadata = self.metadata.lock();
+        if self.metadata_retired.load(Ordering::Acquire) {
+            return;
+        }
+        if retire {
+            self.metadata_retired.store(true, Ordering::Release);
+        }
         if peer.is_none() {
             self.rts_capable.store(false, Ordering::Release);
         }
@@ -500,6 +536,9 @@ impl<I: Io + 'static> Device<I> {
             if !ready || !authority.current() {
                 continue;
             }
+            let Some(_delivery) = self.begin_delivery() else {
+                break;
+            };
             if authority
                 .invoke(|| {
                     if self.closed() || !self.port.load(Ordering::Acquire) || !authority.current() {
@@ -796,11 +835,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
 }
 pub(super) type Native = Device<super::pci_firmware::Transport>;
-trait Endpoint: Send + Sync {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
-    fn drain(&self) -> bool;
-}
-impl<I: Io + 'static> Endpoint for Device<I> {
+impl<I: Io + 'static> super::endpoints::Endpoint for Device<I> {
     fn send(&self, b: &[u8], m: narf_net::TxMeta) -> Result<(), ()> {
         self.enqueue(b, m)
     }
@@ -808,17 +843,18 @@ impl<I: Io + 'static> Endpoint for Device<I> {
         Device::drain(self)
     }
 }
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let device = ACTIVE.lock().clone().ok_or(())?;
-    device.send(bytes, meta)
+struct Delivery<'a, I: Io + 'static>(&'a Device<I>);
+impl<I: Io + 'static> Drop for Delivery<'_, I> {
+    fn drop(&mut self) {
+        if self.0.deliveries.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finish_withdrawal();
+        }
+    }
 }
-fn drain() -> bool {
-    let device = ACTIVE.lock().clone();
-    device.is_some_and(|d| d.drain())
-}
-pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
+pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Error> {
+    if device.withdrawn() || device.published.load(Ordering::Acquire) {
+        return Err(Error::State);
+    }
     let driver = match device.lifecycle.device_id() {
         0xc821 => "rtw8821ce",
         0xc822 => "rtw8822ce",
@@ -827,18 +863,25 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
-    CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::State)?;
-    narf_net::registry()
+    let cookie =
+        super::endpoints::insert(&device.name, device.clone()).map_err(|_| Error::State)?;
+    if narf_net::registry()
         .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Profile)?;
-    narf_net::iface::register(&device.name, device.local, send);
+        .is_err()
+    {
+        super::endpoints::remove(Arc::as_ptr(&device) as *const ());
+        return Err(Error::Profile);
+    }
+    narf_net::iface::register_with_context(
+        &device.name,
+        device.local,
+        cookie,
+        super::endpoints::send,
+    );
     narf_net::iface::set_driver_info(&device.name, driver, None, String::new());
     narf_net::iface::set_offloads(&device.name, narf_net::OffloadCapabilities::default());
     device.link(None, false);
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::install_rx_drain(drain);
+    narf_net::iface::install_rx_drain(super::endpoints::drain);
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
@@ -855,8 +898,8 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     });
     Ok(())
 }
-struct Registered(Arc<Native>);
-impl Interface for Registered {
+struct Registered<I: Io>(Arc<Device<I>>);
+impl<I: Io + 'static> Interface for Registered<I> {
     fn name(&self) -> &str {
         self.0.name()
     }
