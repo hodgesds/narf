@@ -1,6 +1,8 @@
 //! Actual native AP MAC/LINK/peer/key/TVQM DMA conversations. The explicit
 //! inert firmware observes queue bindings and receipts, never driver state.
 use super::*;
+#[path = "ap_client_native_tests.rs"]
+mod client;
 #[path = "ap_go_native_tests.rs"]
 mod go;
 use narf_capabilities::{Cap, Invoke};
@@ -409,14 +411,25 @@ impl Fixture {
         api89: Option<gen3_station_tests::Case>,
         bz: Option<super::super::super::bz_fixture::Case>,
     ) -> R<Self> {
+        Self::new_role(api89, bz, false)
+    }
+    fn new_role(
+        api89: Option<gen3_station_tests::Case>,
+        bz: Option<super::super::super::bz_fixture::Case>,
+        client: bool,
+    ) -> R<Self> {
         let guard = Box::new(Guard::build_native_profile(
-            false,
+            client,
             Fault::None,
             None,
             None,
             None,
             NativeModel {
-                receive_model: ReceiveModel::Ap,
+                receive_model: if client {
+                    ReceiveModel::Client
+                } else {
+                    ReceiveModel::Ap
+                },
                 tx_model: None,
                 api89,
                 bz,
@@ -425,7 +438,9 @@ impl Fixture {
         )?);
         let device = guard.device();
         narf_net::iface::set_link_state(device.name(), false);
-        device.set_iftype(3).map_err(|_| "AP actual mode switch")?;
+        device
+            .set_iftype(if client { 8 } else { 3 })
+            .map_err(|_| "AP/client actual mode switch")?;
         let iface = narf_net::registry()
             .register(
                 &narf_net::bootstrap_authority(),

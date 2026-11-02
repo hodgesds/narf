@@ -423,6 +423,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         )?;
         let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
         let contention = wmm
+            .or_else(|| {
+                self.ap_dirty_wmm
+                    .then(|| wmm::legacy_defaults(peer.frequency, plan.legacy_rates().0))
+            })
             .map(|p| wmm::command(self.wire.dialect, p))
             .transpose()?;
         // Existing failed state precedes both publications and stays retained
@@ -430,6 +434,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         for command in contention.iter().chain([&command, &up]) {
             self.send_station_command(command, validate).await?;
         }
+        self.ap_dirty_wmm = false;
         // Consume maps/unmaps/completions already received with the command
         // receipts before reporting the configured peer; never revive a lost
         // peer. Flood/cancellation keeps this same owner closed.

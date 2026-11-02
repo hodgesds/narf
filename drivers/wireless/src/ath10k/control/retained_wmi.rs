@@ -5,6 +5,9 @@
 use super::*;
 
 impl<T: Hif> Session<T> {
+    pub(in crate::ath10k) fn wmi_max_payload(&self) -> usize {
+        usize::from(self.endpoints[self.wmi as usize].maximum)
+    }
     fn retained_wmi_ready(&mut self) -> Result<bool, Error> {
         self.transport.check_current()?;
         if !self.started || self.failed {
@@ -77,6 +80,16 @@ impl<T: Hif> Session<T> {
         .map_err(|_| Error::Transport(BmiError::DeviceGone))??;
         self.failed = false;
         Ok(true)
+    }
+
+    /// Nonblocking family publication boundary. The caller must consume its
+    /// original completed native prefix before trying, retain ownership if
+    /// this returns false, and wait_wmi_source after an actual publication.
+    pub(in crate::ath10k) fn try_begin_wmi_retained(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<bool, Error> {
+        self.begin_retained_wmi(payload)
     }
 
     /// Caller keeps Radio's scan ID/failed state retained across every await.

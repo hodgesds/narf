@@ -11,6 +11,7 @@ use narf_wireless::wmm::Parameters;
 
 #[derive(Default)]
 pub(super) struct Context {
+    pub client: bool,
     pub offered: Option<Parameters>,
     pub negotiated: Option<Profile>,
     pub actions: VecDeque<Vec<u8>>,
@@ -95,6 +96,9 @@ impl Context {
         })
     }
     pub fn emission(&self) -> Emission {
+        if self.client {
+            return Emission::P2pClient;
+        }
         if self.features != 0 {
             let mut bits = self.features;
             if self.ba.selected {
@@ -801,7 +805,8 @@ impl super::Owner {
             information_elements: b.information_elements.clone(),
         };
         let wmm = parameters(&bss.information_elements)?;
-        let selected = wmm.is_some() && channel != 14 && self.supports_native_ht20();
+        let client = self.hardware.p2p_client_native().is_some();
+        let selected = !client && wmm.is_some() && channel != 14 && self.supports_native_ht20();
         self.station_plan(&bss, ssid, mode, elements, selected)?;
         let ba = selected
             && narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
@@ -854,6 +859,7 @@ impl super::Owner {
             }
         }
         self.power.phy = Context {
+            client,
             offered: if selected { wmm } else { None },
             available,
             secondary,
@@ -1038,7 +1044,16 @@ impl super::Owner {
     pub(in crate::iwlwifi) fn station_power_request(
         &mut self,
     ) -> Result<super::PowerRequest, &'static str> {
-        self.transmit_power_request_for(self.power.phy.emission())
+        let emission = self.power.phy.emission();
+        if emission == Emission::P2pClient {
+            let native = self
+                .hardware
+                .p2p_client_native()
+                .ok_or("MVM client original plan absent")?;
+            self.client_power_request(&native.plan)
+        } else {
+            self.transmit_power_request_for(emission)
+        }
     }
     pub(in crate::iwlwifi) fn nested_ba_offer(&self) -> bool {
         self.power.phy.ba.selected && self.supports_native_ba()

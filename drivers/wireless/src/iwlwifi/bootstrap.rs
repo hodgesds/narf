@@ -523,6 +523,29 @@ pub async fn gen2_go_transmit_power_request(
         .ok_or("native Intel binding is not Gen2")?;
     owner.go_power_request(device, frequency_mhz).await
 }
+/// Exact tag10 physical/RF/firmware/NVM/platform and observed GO/client IE
+/// program proposal. Metadata creates no measurement, role or packet grant.
+pub async fn gen2_client_transmit_power_request(
+    bssid: [u8; 6],
+    ssid: &[u8],
+    frequency_mhz: u32,
+    request_ies: &[u8],
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device
+        .client_power_request(bssid, ssid, frequency_mhz, request_ies)
+        .await
+}
 /// Exact native radio/platform, proposed control MAC and channel binding
 /// for tag8. This returns metadata and grants no child, RF or measurement.
 pub async fn gen2_p2p_transmit_power_request(

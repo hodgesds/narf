@@ -1340,6 +1340,7 @@ impl Device {
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), WirelessError> {
         use super::connection::AuthMethod;
+        let client_role = (self.current_iftype() == 8).then(|| self.ap_host.role.lock().observe());
         let auth = match request.security {
             narf_wireless::SecurityConfig::Open => AuthMethod::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
@@ -1393,6 +1394,13 @@ impl Device {
             })
             .cloned()
             .ok_or(WirelessError::InvalidArgs)?;
+        let client = client_role
+            .map(|role| {
+                super::p2p_client::Plan::new(self.mac, &beacon, &request.ie)
+                    .map(|plan| (plan, role))
+            })
+            .transpose()
+            .map_err(|_| WirelessError::InvalidArgs)?;
         // Cancellation leaves this set. The pump fails closed rather
         // than driving partially configured station/queue state.
         state.needs_reset = true;
@@ -1406,7 +1414,7 @@ impl Device {
             ))
             .map_err(|_| WirelessError::HardwareError)?;
         let bssid = request.bssid;
-        match Connection::associate_in_domain(
+        match Connection::associate_client_in_domain(
             &mut state.hardware,
             self.mac,
             beacon,
@@ -1415,6 +1423,7 @@ impl Device {
             self.phy,
             None,
             domain,
+            client,
         )
         .await
         {
@@ -1465,6 +1474,7 @@ impl WirelessNetIface for Device {
     fn p2p_interface_types(&self) -> Vec<u32> {
         let mut types = Vec::new();
         if self.go_capable {
+            types.push(8);
             types.push(9);
         }
         if self.p2p_capable() {
@@ -1718,7 +1728,7 @@ impl WirelessNetIface for Device {
             })
     }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
-        if matches!(self.current_iftype(), 3 | 9) {
+        if matches!(self.current_iftype(), 3 | 8 | 9) {
             return core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire));
         }
         core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
@@ -1756,7 +1766,7 @@ impl WirelessNetIface for Device {
     }
 
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        if band_mhz == 6000 || matches!(self.current_iftype(), 3 | 9) {
+        if band_mhz == 6000 || matches!(self.current_iftype(), 3 | 8 | 9) {
             None
         } else {
             self.phy.capabilities(band_mhz)
@@ -1824,16 +1834,16 @@ impl WirelessNetIface for Device {
                 WirelessModes::empty()
             },
             hw_caps: HwCaps {
-                ht_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.ht,
-                vht_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.vht,
-                he_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.he,
-                eht_supported: !matches!(self.current_iftype(), 3 | 9) && self.phy.eht,
+                ht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.phy.ht,
+                vht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.phy.vht,
+                he_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.phy.he,
+                eht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.phy.eht,
             },
         }
     }
 
     async fn scan(&self, mut request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        if self.current_iftype() != 2 {
+        if !matches!(self.current_iftype(), 2 | 8) {
             return Err(WirelessError::Busy);
         }
         if request.ssids.len() > 20 || request.ssids.iter().any(|ssid| ssid.len() > 32) {
@@ -2195,7 +2205,7 @@ impl WirelessNetIface for Device {
     }
 
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
-        if self.current_iftype() != 2 {
+        if !matches!(self.current_iftype(), 2 | 8) {
             return Err(WirelessError::Busy);
         }
         let domain =

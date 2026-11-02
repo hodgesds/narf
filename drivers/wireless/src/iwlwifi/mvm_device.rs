@@ -145,6 +145,7 @@ enum Operation {
     QuerySharedMemory,
 }
 struct Join {
+    client_role: Option<narf_net::native_emission::Lifetime>,
     bssid: [u8; 6],
     ssid: Vec<u8>,
     channel: u8,
@@ -280,6 +281,22 @@ impl Device {
                 .as_mut()
                 .ok_or("MVM native owner absent")?
                 .go_power_request(super::p2p_go::Identity { device }, channel)
+        })
+    }
+    pub(super) async fn client_power_request(
+        &self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        frequency: u32,
+        elements: &[u8],
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native client metadata owner absent")?
+                .client_power_request_for_bss(bssid, ssid, frequency, elements)
         })
     }
     pub(super) async fn ht20_power_request(
@@ -833,6 +850,15 @@ impl Device {
                 }) {
                     return Err("MVM scan observation expired");
                 }
+                if let Some(role) = request.client_role {
+                    owner.select_client(
+                        request.bssid,
+                        &request.ssid,
+                        request.channel,
+                        &request.elements,
+                        role,
+                    )?;
+                }
                 owner.select_station_offer(
                     request.bssid,
                     &request.ssid,
@@ -1330,6 +1356,7 @@ impl WirelessNetIface for Device {
     fn p2p_interface_types(&self) -> Vec<u32> {
         let mut types = Vec::new();
         if self.go_capable {
+            types.push(8);
             types.push(9);
         }
         if self.p2p_capable {
@@ -1583,7 +1610,7 @@ impl WirelessNetIface for Device {
             })
     }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
-        if matches!(self.current_iftype(), 3 | 9) {
+        if matches!(self.current_iftype(), 3 | 8 | 9) {
             return self.ap_control_generation();
         }
         core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
@@ -1619,27 +1646,29 @@ impl WirelessNetIface for Device {
         self.scheduled_control(authority, None).await
     }
     fn supports_handshake_offload(&self) -> bool {
-        self.current_iftype() == 2 && self.wpa2
+        matches!(self.current_iftype(), 2 | 8) && self.wpa2
     }
     /// Host SAE plus the native PMF key owner (§3.33).
     fn supports_sae_offload(&self) -> bool {
-        self.current_iftype() == 2 && self.sae
+        matches!(self.current_iftype(), 2 | 8) && self.sae
     }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        (!matches!(self.current_iftype(), 3 | 9) && self.ht20 && matches!(band_mhz, 2400 | 5000))
-            .then(|| narf_wireless::iface::PhyCapabilities {
-                ht: if self.vht && band_mhz == 5000 {
-                    super::mvm_boot::local_ht_for(super::mvm_boot::feature_bits::HT40)
-                } else {
-                    super::mvm_boot::local_ht()
-                }
-                .capability_body(),
-                vht: (self.vht && band_mhz == 5000)
-                    .then(|| super::mvm_boot::local_vht_for(0).capability_body()),
-            })
+        (!matches!(self.current_iftype(), 3 | 8 | 9)
+            && self.ht20
+            && matches!(band_mhz, 2400 | 5000))
+        .then(|| narf_wireless::iface::PhyCapabilities {
+            ht: if self.vht && band_mhz == 5000 {
+                super::mvm_boot::local_ht_for(super::mvm_boot::feature_bits::HT40)
+            } else {
+                super::mvm_boot::local_ht()
+            }
+            .capability_body(),
+            vht: (self.vht && band_mhz == 5000)
+                .then(|| super::mvm_boot::local_vht_for(0).capability_body()),
+        })
     }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         use narf_wireless::iface::*;
@@ -1669,9 +1698,9 @@ impl WirelessNetIface for Device {
                 WirelessModes::empty()
             },
             hw_caps: HwCaps {
-                ht_supported: !matches!(self.current_iftype(), 3 | 9) && self.ht20,
-                vht_supported: !matches!(self.current_iftype(), 3 | 9) && self.vht,
-                he_supported: !matches!(self.current_iftype(), 3 | 9) && self.he,
+                ht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.ht20,
+                vht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.vht,
+                he_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.he,
                 eht_supported: false,
             },
         }
@@ -1684,7 +1713,7 @@ impl WirelessNetIface for Device {
             .station_information(bssid)
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        if self.current_iftype() != 2 {
+        if !matches!(self.current_iftype(), 2 | 8) {
             return Err(WirelessError::Busy);
         }
         if request.random_mac.is_some()
@@ -1745,7 +1774,7 @@ impl WirelessNetIface for Device {
         }
     }
     async fn associate(&self, mut request: AssociateRequest) -> Result<(), WirelessError> {
-        if self.current_iftype() != 2 {
+        if !matches!(self.current_iftype(), 2 | 8) {
             return Err(WirelessError::Busy);
         }
         let channel = u8::try_from(request.channel).map_err(|_| WirelessError::InvalidArgs)?;
@@ -1774,6 +1803,7 @@ impl WirelessNetIface for Device {
             _ => return Err(WirelessError::NotSupported),
         };
         let join = Join {
+            client_role: (self.current_iftype() == 8).then(|| self.ap_host.role.lock().observe()),
             bssid: request.bssid,
             ssid: request.ssid,
             channel,

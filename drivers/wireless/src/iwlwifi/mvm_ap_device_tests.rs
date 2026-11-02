@@ -1,6 +1,8 @@
 //! Original API77 netdev AP conversations. The device side consumes only
 //! posted TFH bytes/RFH buffers; it never reads Session or key/port booleans.
 use super::*;
+#[path = "mvm_client_native_tests.rs"]
+mod client;
 #[path = "mvm_go_native_tests.rs"]
 mod go;
 use narf_capabilities::Invoke;
@@ -398,15 +400,15 @@ impl Fixture {
         Self::new_emission(7)
     }
     fn new_emission(emission: u8) -> Result<Self, &'static str> {
-        let h = Harness::version_profile(false, false, emission, 4)?;
+        let h = Harness::version_profile(emission == 10, false, emission, 4)?;
         require(
             h.device.supports_ap(),
             "API77 complete actual adapter did not expose AP",
         )?;
         narf_net::iface::set_link_state(h.device.name(), false);
         h.device
-            .set_iftype(3)
-            .map_err(|_| "API77 original netdev AP mode")?;
+            .set_iftype(if emission == 10 { 8 } else { 3 })
+            .map_err(|_| "API77 original netdev AP/client mode")?;
         let iface = narf_net::registry()
             .register(
                 &narf_net::bootstrap_authority(),

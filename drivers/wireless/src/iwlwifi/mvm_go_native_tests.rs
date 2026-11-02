@@ -140,7 +140,7 @@ fn native_go() -> Result<(), &'static str> {
         f.h.device.current_iftype() == 9
             && f.h.device.link_up()
             && f.h.device.p2p_interface_types().contains(&9)
-            && !f.h.device.p2p_interface_types().contains(&8),
+            && f.h.device.p2p_interface_types().contains(&8),
         "API77 GO source scope/role",
     )?;
     keys(&f)?;

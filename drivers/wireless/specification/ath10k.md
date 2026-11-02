@@ -1526,6 +1526,123 @@ cases and four native CE/HTT/Open/WPA2/DHCP/IP, false-observation, host/span
 and policy-wait/copied-DATA cases are written; coordinated release/native
 validation and actual-device qualification remain pending.
 
+### 3.3 Native legacy AP and userspace authenticator
+
+The family AP owner uses a distinct native vdev role, not a station alias.
+Admission requires the actual TLV dialect, negotiated HTT3 major3 or later,
+RAW/nohwcrypt, nonblocking retained CE transport, non-PFC/non-continuous
+storage, beacon-offload service0, synchronous-delete service92 and completed
+INIT/READY resources for at least one vdev and nine peers. The admitted
+profile is one legacy20 AP with at most eight clients, Open or WPA2 CCMP
+(AKM1/2/6), on the existing current factory/host-permitted inventory. The
+original signed policy Arc, including the paired indoor limits and any
+original native World Beacon receipt, remains bound to the AP. Equal-valued
+policy replacement cannot revive its old native or copied work.
+
+`SET_INTERFACE` selects STA2 or AP3 only while administratively down and
+without a station, scan, ROC, AP or admitted control owner. The nonwrapping
+mode generation binds both shared Radio and AP controls; existing station
+and ROC paths refuse AP mode. PFC AP, continuous RX, GO/CLIENT, HT/VHT/HE/EHT
+APs, SAE/PMF/IGTK/BIGTK, DFS/CAC, CSA, ERP protection, extra virtual vdevs and
+optional discovery roles remain unadvertised or explicitly refused. A real
+AP may still bridge ordinary external Ethernet source addresses; it does
+not turn those addresses into native peer or key identities.
+
+START drains the original completed native prefix, deletes the inactive STA
+vdev with its actual response, creates AP vdev0, obtains its DEFAULT self
+peer MAP, programs current factory/power, legacy width/NSS/basic management
+and multicast rates, disables intra-BSS firmware forwarding, and programs
+actual WMM when present. On a 2.4 GHz OFDM BSS, non-ERP clients are refused
+before native peer/port/PN/DMA mutation because their mandatory ERP/CTS
+protection is outside this profile; pure11b and genuine ERP/5GHz peers keep
+their source-backed admission. A short-slot/preamble beacon likewise refuses
+clients lacking those advertised facts rather than silently missing a
+required protection transition. It requires the matching START response, copied
+firmware-owned BCN_TMPL/PRB_TMPL, AP UP with AID0, an ordered ECHO barrier and
+actual beacon-offload TX status before carrier. Beacon/DTIM/SSID, rate,
+security, optional-probe and complete-IE validation precedes RF transitions.
+The firmware owns TIM/DTIM bitmap/count updates and AP power-save buffering;
+there is no invented per-beacon DMA completion. ECHO proves command
+processing, never beacon air ACK or DATA/key installation. Live template
+replacement closes the old native/copy epoch before publication.
+
+NEW/SET/DEL_STATION retains exact peer MAC/AID, original control source,
+actual sparse HTT peer IDs and separate associated/authorized state.
+PEER_ASSOC and ordered ECHO are not fabricated firmware peer-association
+confirmation layouts. Source-backed AP U-APSD is advertised only with actual
+service6: WMM admission and per-client queue/max-SP validation precede native
+AP_PS_PEER UAPSD delivery/trigger bits, MAX_SP and ten-second AGEOUT. WMM
+VO/VI/BK/BE bits map to actual native AC3/2/1/0. The current ordinary egress
+maps Ethernet traffic to best effort; no host priority or no-ACK feature is
+invented. Packet handoff first consumes a genuine bounded native Idle prefix;
+queued loss beyond one drain budget defers without spending PN/native IDs.
+MAP, START, STOPPED and delete response windows open only after the actual
+synchronous CE handoff, not while waiting for command credit. Station dumps
+report actual mapped/associated presence and leave unmeasured statistics
+absent.
+
+Keys use the admitted real software CCMP owner because RAW/nohwcrypt disables
+firmware key offload. Pre-START group NEW_KEY/default ACKs are zeroizing
+software metadata under their original source/role, without installed key,
+PN, port or RF authority. START promotes them only after real AP/self-peer
+receipts and native DATA quiescence; a stale source is erased, not
+recaptured. Pairwise/group keys install or replace only after every original
+published packet has its real air terminal. Per-key receive PN commits only
+after physical ToDS peer/descriptor, MIC, complete LLC/control-port and port
+validation. Transmit uses physical FromDS addresses and actual retained
+nonwrapping 48-bit PN owners. Exact current-key retries preserve counters;
+a bounded history rejects retired/cross-peer/cross-role reuse of the same TK
+within this retained Radio. History exhaustion fails closed. Recovery does
+not replay credentials or claim continuity of old key counters.
+
+The typed native AP API implements start/stop/beacon, peer controls, key
+add/delete/default, installed transmit-sequence-only GET_KEY, control-port
+TX/RX, management registration/FRAME and native Ethernet rings. GET_KEY
+returns only the installed CCMP cipher and real allocated six-byte TX PN,
+including consumed unsent PNs; it exports no key bytes or RX replay counter.
+The userspace SME owns Open authentication/association and real EAPOL/RSN
+handshakes. Configured EAPOL can reach that exact source before DATA opens;
+ordinary preauthentication still requires current DATA authorization.
+
+Every request captures shared callback-free emission guards and watches one
+stable physical pump waker outside Radio. Native awaits use only those
+original guards, signed snapshot, role and physical source capabilities.
+After all arbitrary event/source callbacks, publication re-invokes the
+original physical sources and checks native/copy, peer, key, DATA and source
+proofs before fixed typed event delivery or either Ethernet endpoint.
+Known-peer management copies retain that peer's post-event denial/native
+fence: genuine loss management can deliver immediately, while delete/re-add
+or later authorization cannot rebind an old copy. Management remains
+independent of DATA authorization.
+
+Actual HTT and by-reference WMI management terminals alone release packet
+IDs and supply ACK status; CE credits and ECHO do neither. Multicast success
+does not invent an ACK. Cancellation/source loss closes host copies first
+and retains the same vdev, peers, keys and uncertain DMA for the physical
+worker. Teardown requires DOWN, all original packet terminals, peer
+UNMAP/synchronous-delete responses, STOPPED and vdev delete, then recreates
+the inactive STA inventory with its actual original VDEV NSS and explicit
+DCF queue programming. A subsequent non-WMM station selects fresh defaults
+for its real band/rates; old AP EDCA cannot silently leak into it. The
+production-used cleanup step keeps the physical worker alive after proven
+AP cleanup, and closes ordinary terminal station/scan paths as before.
+Only proven cleanup permits a fresh control
+generation on the same current physical device; missing receipts retain DMA
+for existing PCI reset/quarantine. No abandoned endpoint or old copied
+packet becomes a replacement BSS.
+
+Primary command/event/rate/descriptor sources are the local Linux7.3-rc4
+`ath10k/{mac.c,wmi.c,wmi.h,wmi-tlv.c,wmi-tlv.h,htt_tx.c,htt_rx.c,htt.h,hw.h,
+rx_desc.h}`. The earlier pinned7.2 files remain separately recorded where
+identical. Ten independent native cases are written for actual CE/HTT/AP
+start/peer/teardown, TIM/DTIM/templates, staging and PN continuity, terminal
+hold/cancel, known-peer copy replacement, long queued-loss prefixes,
+prepublication MAP and malformed-message denial, source/policy retirement,
+real AES-CCMP port/MIC/replay and copied-data fences, U-APSD native words and
+userspace M1–M4 with real MIC/AES wrap before native keys/port/DATA.
+Compilation, native execution and actual firmware/board/RF interoperability
+acceptance are pending; these cases are not physical evidence.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -1744,8 +1861,8 @@ pending. This makes no additional per-chip physical RF or power claim.
 
 Across the reached rows, concrete remaining software packages are
 contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented);
-AP-side U-APSD under the AP owner; DFS qualification; hardware key offload;
-AP/P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
+DFS qualification; hardware key offload;
+P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.
 The signed indoor installation continuation is implemented in §3.1 and awaits
@@ -1753,6 +1870,12 @@ coordinated release/native acceptance.
 The native World-layer Beacon continuation is implemented in §3.2 and awaits
 coordinated release/native acceptance; host and physical qualification remain
 separate.
+The bounded TLV legacy AP and source-qualified AP-side U-APSD owner is
+implemented in §3.3, with ten new native cases written and unexecuted.
+Coordinated release compilation, native suites and physical firmware/RF/board
+acceptance remain pending. Other dialects/PFC/optional AP PHY and security
+roles are refused rather than inferred from an AP-capable PCI identity.
+
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
 are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or

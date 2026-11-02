@@ -349,6 +349,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         six_tx_profile: None,
         ap_owner: None,
         p2p_go: None,
+        p2p_client: None,
         ap_request: None,
         ap_gen2: None,
         p2p: p2p::State::default(),
@@ -398,6 +399,7 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.receive_queues);
         core::ptr::drop_in_place(&mut hardware.ap_owner);
         core::ptr::drop_in_place(&mut hardware.p2p_go);
+        core::ptr::drop_in_place(&mut hardware.p2p_client);
         core::ptr::drop_in_place(&mut hardware.ap_request);
         core::ptr::drop_in_place(&mut hardware.ap_gen2);
         core::ptr::drop_in_place(&mut hardware.p2p);

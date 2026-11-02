@@ -555,6 +555,7 @@ pub(super) struct Runtime<T> {
     /// Selected from actual SERVICE_READY chains and the submitted INIT's
     /// resource masks; not yet a runtime PDEV chainmask submission receipt.
     pub initialized_chain_mask: Option<u8>,
+    initialized_resources: Option<(u32, u32)>,
     early_htt: VecDeque<Vec<u8>>,
     failed: bool,
 }
@@ -575,6 +576,14 @@ impl<T: Hif + HostMemory> Runtime<T> {
             _ => None,
         }
     }
+    /// Counts from the exact INIT followed by this runtime's real READY.
+    pub(in crate::ath10k) fn ap_resources(&self) -> Option<(u32, u32)> {
+        if self.failed || self.ready.is_none() {
+            None
+        } else {
+            self.initialized_resources
+        }
+    }
     pub fn raw_mode(&self) -> bool {
         self.ready.is_some() && self.features & (1 << 10) != 0
     }
@@ -587,6 +596,7 @@ impl<T: Hif + HostMemory> Runtime<T> {
             caps: None,
             ready: None,
             initialized_chain_mask: None,
+            initialized_resources: None,
             early_htt: VecDeque::new(),
             failed: false,
         }
@@ -662,6 +672,7 @@ impl<T: Hif + HostMemory> Runtime<T> {
         let ready = ready(self.dialect, &self.event(self.dialect.ready_event()).await?)?;
         self.ready = Some(ready);
         self.initialized_chain_mask = Some(initialized_chain_mask as u8);
+        self.initialized_resources = Some((config.vdevs, config.peers));
         self.failed = false;
         Ok(ready)
     }

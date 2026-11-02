@@ -72,9 +72,9 @@ impl Device {
         result
     }
     pub(super) fn ap_set_mode(&self, mode: u32) -> Result<(), WirelessError> {
-        if !matches!(mode, 2 | 3 | 9)
+        if !matches!(mode, 2 | 3 | 8 | 9)
             || mode == 3 && !self.ap_capable
-            || mode == 9 && !self.go_capable
+            || matches!(mode, 8 | 9) && !self.go_capable
         {
             return Err(WirelessError::NotSupported);
         }

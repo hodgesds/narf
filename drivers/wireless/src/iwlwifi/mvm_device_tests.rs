@@ -150,6 +150,8 @@ fn ht_ies() -> Vec<u8> {
     out
 }
 struct Actor {
+    client: bool,
+    client_mac: u8,
     native_ap: Option<Box<ap_tests::Model>>,
     native_p2p: Option<Box<p2p_tests::Model>>,
     pno: Option<Box<scheduled_tests::Model>>,
@@ -540,6 +542,10 @@ impl Actor {
                     if b.len() != 52 {
                         return Err("MVM native MAC extent");
                     }
+                    if self.client {
+                        self.client_mac =
+                            crate::iwlwifi::p2p_client_fixture::mac(self.client_mac, b)?;
+                    }
                     vec![]
                 }
                 (1, 0xd2) => {
@@ -607,6 +613,9 @@ impl Actor {
                         }
                     }
                     let mut beacon = self.security.ap.beacon();
+                    if self.client {
+                        beacon = crate::iwlwifi::p2p_client_fixture::beacon(beacon, 1, Some(0xa0));
+                    }
                     if self.ht {
                         beacon.extend_from_slice(self.beacon_ies.as_ref().unwrap_or(&ht_ies()));
                     }
@@ -804,7 +813,8 @@ impl Actor {
                             } else {
                                 1
                             }
-                        || self.channel <= 14 && b[10..12] != [1, 0]
+                        || self.channel <= 14
+                            && b[10..12] != if self.client { [0x50, 1] } else { [1, 0] }
                     {
                         return Err("MVM native response-bound TLC profile");
                     }
@@ -856,6 +866,9 @@ impl Actor {
         }
         let frame = &p.bytes[24..];
         if p.queue == 23 && matches!(frame[0], 0 | 0xb0) {
+            if self.client {
+                crate::iwlwifi::p2p_client_fixture::check_request(frame)?;
+            }
             let replies = self
                 .security
                 .ap
@@ -863,6 +876,9 @@ impl Actor {
                 .map_err(|_| "independent AP rejected actual native MLME")?;
             self.firmware.tx_complete(23, p.pointer);
             for mut reply in replies {
+                if self.client {
+                    crate::iwlwifi::p2p_client_fixture::response(&mut reply);
+                }
                 if reply.first() == Some(&8) {
                     self.security.m1 = reply;
                 } else {
@@ -1286,7 +1302,7 @@ impl Harness {
                 entry[2] = tlc_version;
             }
         }
-        if matches!(emission, 7..=9) {
+        if matches!(emission, 7..=10) {
             ap_tests::profile(&mut image, &mut versions)?;
         }
         if emission == 8 {
@@ -1310,14 +1326,22 @@ impl Harness {
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
-        if matches!(emission, 7..=9) {
+        if matches!(emission, 7..=10) {
             model::native_station_identity(&mut hardware, 0xa0f0, 0x351, 0x10c000)?;
         }
         model::firmware_profile(&mut hardware, &parsed)?;
         let mut owner = Owner::model_after_alive(hardware, &executable.bytes);
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
-        security.ap = ap(protected)?;
+        security.ap = if emission == 10 {
+            ap(protected)?
+                .with_legacy_rates(&[0x8c, 0x98, 0xb0])
+                .map_err(|_| "MVM P2P client GO OFDM rates")?
+        } else {
+            ap(protected)?
+        };
         let mut actor = Actor {
+            client: emission == 10,
+            client_mac: 0,
             native_ap: matches!(emission, 7 | 9).then(|| Box::new(ap_tests::Model::new())),
             native_p2p: (emission == 8).then(|| Box::new(p2p_tests::Model::new())),
             pno: pno.map(Box::new),
@@ -1469,6 +1493,15 @@ impl Harness {
             power: Arc::new(move |owner| {
                 if !staged.load(Ordering::Acquire) {
                     return Err("fixture measured power asset not staged");
+                }
+                if emission == 10 {
+                    let request = owner.station_power_request()?;
+                    let mut record = bytes.to_vec();
+                    record[8..40].copy_from_slice(&request.binding);
+                    return Ok((
+                        asset("narf-test/mvm-client/power-tag10", &record, true)?,
+                        request.binding,
+                    ));
                 }
                 let asset = Asset {
                     bytes: bytes.clone(),

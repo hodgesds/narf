@@ -128,7 +128,8 @@ impl Native {
             || self.retired.load(Ordering::Acquire)
             || !owner.emission.matches_role(
                 self,
-                core::num::NonZeroU64::new(self.generation).ok_or(WirelessError::Denied)?,
+                core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire))
+                    .ok_or(WirelessError::Denied)?,
             );
         let result = radio
             .service_roc(

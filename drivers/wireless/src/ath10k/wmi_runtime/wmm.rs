@@ -63,6 +63,27 @@ pub(super) fn information() -> &'static [u8] {
     &INFORMATION
 }
 
+/// Linux7.3 util.c::ieee80211_set_wmm_default(enable_qos=false): all
+/// four ACs use DCF AIFS2/CWmax1023/TXOP0, CWmin31 on11b, otherwise15.
+/// Used only to retire AP-global contention and prepare a later non-WMM STA.
+pub(super) fn legacy_defaults(frequency: u16, rates: u16) -> Parameters {
+    Parameters {
+        parameter_set_count: 0,
+        uapsd: false,
+        ac: [narf_wireless::wmm::Ac {
+            aifsn: 2,
+            ecw_min: if frequency < 3000 && rates & !15 == 0 {
+                5
+            } else {
+                4
+            },
+            ecw_max: 10,
+            txop: 0,
+            admission_control: false,
+        }; 4],
+    }
+}
+
 pub(super) fn command(dialect: Dialect, parameters: Parameters) -> Result<Vec<u8>, Error> {
     let parameters = admit(parameters)?;
     let tlv = dialect == Dialect::Tlv;

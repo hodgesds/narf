@@ -75,6 +75,7 @@ pub struct Connection {
     eht: Option<alloc::sync::Arc<super::sc_eht::Profile>>,
     six: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     mld: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
+    client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
     amsdu_memory: Option<super::Gen2SharedMemory>,
@@ -186,6 +187,7 @@ impl Connection {
             eht: None,
             six: None,
             mld: None,
+            client: None,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
@@ -288,10 +290,36 @@ impl Connection {
         beacon: Beacon,
         auth: AuthMethod,
         tx_chains: u32,
-        mut local_phy: super::ht_vht::Local,
+        local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Self, &'static str> {
+        Self::associate_client_in_domain(
+            hw, local, beacon, auth, tx_chains, local_phy, roam_from, domain, None,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn associate_client_in_domain(
+        hw: &mut Hardware,
+        local: [u8; 6],
+        beacon: Beacon,
+        auth: AuthMethod,
+        tx_chains: u32,
+        mut local_phy: super::ht_vht::Local,
+        roam_from: Option<[u8; 6]>,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        client: Option<(super::p2p_client::Plan, narf_net::native_emission::Lifetime)>,
+    ) -> Result<Self, &'static str> {
+        if let Some((plan, _)) = &client {
+            if !super::p2p_go::host_allows(domain, plan.channel) {
+                return Err("P2P client current host NO_P2P prohibits association");
+            }
+            if roam_from.is_some() || matches!(auth, AuthMethod::Open) {
+                return Err("P2P client requires a fresh protected owner");
+            }
+            local_phy = super::ht_vht::Local::from_nvm(0, 1, 1);
+        }
         //6GHz admission precedes even receive-queue I/O. MVM API59 and
         // AP-power API1 are source facts, never inferred from the channel.
         local_phy.eht &= hw.eht_supported();
@@ -312,6 +340,9 @@ impl Connection {
         // Reserve before any native await. Neither old notifications nor
         // descriptors copied while this port is closed belong to the new key.
         let receive_epoch = hw.close_receive_epoch()?;
+        let client = client
+            .map(|(plan, role)| hw.install_p2p_client(plan, role))
+            .transpose()?;
         hw.prepare_receive_queues().await?;
         let secure = !matches!(auth, AuthMethod::Open);
         let (mut profile, mut six) = match six_preflight {
@@ -415,7 +446,7 @@ impl Connection {
             local_phy.he = false;
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
-        let rates = if six.is_some() {
+        let mut rates = if six.is_some() {
             super::rates::Rates::parse_six_eht(
                 &beacon.information_elements,
                 true,
@@ -431,6 +462,10 @@ impl Connection {
                 he_offer.is_some_and(|offer| offer.eht().is_some()),
             )?
         };
+        if client.is_some() {
+            rates.supported &= !15;
+            rates.basic &= !15;
+        }
         let max_power = if let Some(six) = &six {
             six.rule(domain, Some(&permissions))
                 .filter(|rule| rule.allows_6ghz_client(six.power_type()))
@@ -489,6 +524,11 @@ impl Connection {
                 hw.rf_policy_validity()?,
             )?
         };
+        let regulatory = if let Some(client) = &client {
+            regulatory.with_client(client.plan.binding())?
+        } else {
+            regulatory
+        };
         let mld = profile
             .mld
             .as_deref()
@@ -508,6 +548,9 @@ impl Connection {
             return Err("native MLD current EHT/PMF source absent");
         }
         hw.ensure_platform_power().await?;
+        if client.is_some() {
+            hw.prepare_p2p_client().await?;
+        }
         if let Some(mld) = &mld {
             let mut mac = station_api::mac(2, local, None);
             mld.apply_mac(&mut mac);
@@ -654,6 +697,7 @@ impl Connection {
             eht: None,
             six,
             mld,
+            client,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
@@ -752,6 +796,9 @@ impl Connection {
             request.extend_from_slice(mld.request_element());
             mld.project_management(&mut request);
         }
+        if let Some(client) = &this.client {
+            request.extend_from_slice(&client.plan.elements);
+        }
         this.sequence = this.sequence.wrapping_add(1);
         this.check_six_pending(hw)?;
         hw.transmit(management_queue, &request, 24, this.rate())
@@ -763,6 +810,9 @@ impl Connection {
             return Err("AP rejected association");
         }
         profile.check_response(&reply[6..])?;
+        if let Some(client) = &this.client {
+            client.plan.response(&reply[6..])?;
+        }
         if this.qos.is_some() {
             // Association response may refine contention parameters from
             // the beacon. Only use QoS if the AP confirms WMM support.
@@ -960,7 +1010,10 @@ impl Connection {
             mld.apply_peer(&mut peer);
         }
         hw.station_peer(&peer).await?;
-        let mut mac = station_api::mac(2, local, Some(response.aid));
+        let mut mac = match &this.client {
+            Some(client) => client.mac(2, Some(response.aid), client.desired())?,
+            None => station_api::mac(2, local, Some(response.aid)),
+        };
         if let Some(he) = this.he {
             he.apply_mac(&mut mac);
         }
@@ -971,6 +1024,10 @@ impl Connection {
             mld.apply_mac(&mut mac);
         }
         hw.command(3, 8, &mac).await?;
+        if let Some(client) = &this.client {
+            client.associated(response.aid)?;
+            client.commit_window(u32::from_le_bytes(mac[48..52].try_into().unwrap()))?;
+        }
         let mut tlc = this.rates.tlc(
             if hw.is_mvm89() {
                 6
@@ -1370,7 +1427,9 @@ impl Connection {
             return Ok(false);
         }
         match hw.enqueue_transmit_assisted(queue, &frame, header, None, assist) {
-            Err(super::six_ghz_station::UPDATE_REQUIRED) => return Ok(false),
+            Err(super::six_ghz_station::UPDATE_REQUIRED | super::p2p_client::UPDATE_REQUIRED) => {
+                return Ok(false)
+            }
             result => result?,
         }
         self.sequence = self.sequence.wrapping_add(1);
@@ -1419,6 +1478,7 @@ impl Connection {
     pub(super) fn maintenance_pending(&self) -> bool {
         self.power_pending
             || self.six.as_ref().is_some_and(|six| six.pending())
+            || self.client.as_ref().is_some_and(|client| client.pending())
             || self.amsdu_memory_pending()
             || !self.actions.is_empty()
             || (0..super::aggregation::MAX_TIDS)
@@ -1749,6 +1809,7 @@ impl Connection {
     }
 
     async fn service_power(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        hw.service_p2p_client().await?;
         self.check_six_pending(hw)?;
         hw.service_six_power().await?;
         if !self.power_pending {
@@ -2390,8 +2451,11 @@ impl Connection {
         let _ = hw
             .transmit(self.management_queue, &frame, 24, self.rate())
             .await;
-        hw.command(3, 8, &station_api::mac(2, self.local, None))
-            .await?;
+        let mac = match &self.client {
+            Some(client) => client.mac(2, None, client.desired())?,
+            None => station_api::mac(2, self.local, None),
+        };
+        hw.command(3, 8, &mac).await?;
         hw.remove_tx(self.management_queue, 0, 15).await?;
         for (index, queue) in self.data_queues.iter().enumerate() {
             if let Some(queue) = queue {
@@ -2443,6 +2507,9 @@ impl Connection {
             self.beacon.channel,
         )
         .await?;
+        if self.client.is_some() {
+            hw.restore_p2p_client_default().await?;
+        }
         if self.mld.is_some() {
             // Restore the ordinary inactive default only after every
             // station/queue and PHY owner reached its terminal removal.

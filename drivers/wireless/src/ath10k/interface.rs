@@ -17,6 +17,10 @@ use narf_wireless::{
 };
 type Error = wmi_runtime::Error;
 use wmi_runtime::receive_permission;
+#[path = "interface_ap.rs"]
+mod ap;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(in crate::ath10k) use ap::Operation as ApOperation;
 #[path = "interface_offchannel.rs"]
 mod offchannel;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -39,6 +43,7 @@ struct State {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    pending_ap: Option<wmi_runtime::ap::Capture>,
 }
 struct ReceiveBatch {
     permission: super::regulatory::Permission,
@@ -58,6 +63,8 @@ type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 #[derive(Clone, Copy)]
 pub(super) struct RadioFeatures {
     power_save: bool,
+    ap: bool,
+    ap_uapsd: bool,
     ht: Option<[u8; 26]>,
     ht40: Option<[u8; 26]>,
     vht: Option<[u8; 12]>,
@@ -67,6 +74,8 @@ impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
         Self {
             power_save: radio.power_save_supported(),
+            ap: radio.ap_supported(),
+            ap_uapsd: radio.ap_uapsd(),
             offchannel_tx: radio.offchannel_action_supported(),
             ht: radio.ht_capabilities(),
             ht40: radio.ht40_capabilities(),
@@ -77,6 +86,7 @@ impl RadioFeatures {
 impl State {
     fn clear(&mut self) {
         self.pending = None;
+        self.pending_ap = None;
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -90,6 +100,12 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     name: String,
     generation: u64,
     ps_supported: bool,
+    ap_capable: bool,
+    ap_uapsd: bool,
+    mode: AtomicU8,
+    mode_generation: AtomicU64,
+    ap_host: ap::Host,
+
     offchannel_tx: bool,
     radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
     management_subscriptions: Arc<wmi_runtime::offchannel::Subscriptions>,
@@ -169,6 +185,8 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .map(|radio| RadioFeatures::observed(&radio))
             .unwrap_or(RadioFeatures {
                 power_save: false,
+                ap: false,
+                ap_uapsd: false,
                 offchannel_tx: false,
                 ht: None,
                 ht40: None,
@@ -203,9 +221,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 rx,
                 tx,
                 pending: None,
+                pending_ap: None,
             }),
             name: name.into(),
             ps_supported: features.power_save,
+            ap_capable: features.ap,
+            ap_uapsd: features.ap_uapsd,
+            mode: AtomicU8::new(2),
+            mode_generation: AtomicU64::new(1),
+            ap_host: ap::Host::new(),
+
             offchannel_tx: features.offchannel_tx,
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
             management_subscriptions: Arc::new(wmi_runtime::offchannel::Subscriptions::new()),
@@ -267,6 +292,33 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.retired.load(Ordering::Acquire) {
             return Ok(false);
         }
+        radio.ap_prune_staging();
+        if radio.ap_exists() {
+            if !self.closed.load(Ordering::Acquire) && !radio.ap_abandoned() {
+                return Ok(false);
+            }
+            self.close();
+            self.state.lock().await.clear();
+            radio
+                .ap_cleanup(&|| {
+                    if self.retired.load(Ordering::Acquire) {
+                        Err(Error::Failed)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await?;
+            self.ap_cleanup_complete()?;
+            drop(radio);
+            self.ap_retire_metadata();
+            // The same physical worker services a later explicitly admitted
+            // BSS. Its old control generation and copied native owner stay
+            // retired; failed/uncertain terminal cleanup takes PCI recovery.
+            return Ok(false);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            radio.ap_retire_staging();
+        }
         if !radio.scan_in_progress() {
             if radio.failed_station_pending() {
                 self.close();
@@ -296,6 +348,12 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .await?;
         Ok(true)
     }
+    /// One production-used cleanup decision. Only a proven AP teardown may
+    /// reopen this same physical worker; old station/scan closure terminates.
+    pub(in crate::ath10k) async fn cleanup_worker_step(&self) -> Result<bool, Error> {
+        let terminal = self.cleanup_failed_scan().await?;
+        Ok(terminal || self.closed.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire))
+    }
     fn link(&self, peer: Option<[u8; 6]>) {
         let _publication = self.publication.lock();
         self.publish_link(peer);
@@ -319,14 +377,18 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         // Physical carrier preserves operator-controlled IFF_UP and never
         // invokes an administrative open/stop hook under retained locks.
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
-        if was && !up {
+        if was && !up && self.mode.load(Ordering::Acquire) == 2 {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
     pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         if self.closed.load(Ordering::Acquire)
             || !self.up.load(Ordering::Acquire)
-            || !admitted(bytes, self.mac)
+            || !(if self.mode.load(Ordering::Acquire) == 3 {
+                ap::ethernet(bytes)
+            } else {
+                admitted(bytes, self.mac)
+            })
             || meta.csum_l4.is_some()
             || meta.tso_mss.is_some()
             || meta.vlan_tag.is_some()
@@ -362,6 +424,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         &self,
         band: u32,
     ) -> Option<narf_wireless::iface::PhyCapabilities> {
+        if self.mode.load(Ordering::Acquire) == 3 {
+            return None;
+        }
         if !self
             .frequencies
             .iter()
@@ -393,7 +458,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.closed.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
             None
         } else {
-            core::num::NonZeroU64::new(self.generation)
+            core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire))
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -429,6 +494,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         &self.name
     }
     pub(super) fn request_power_save(&self, enabled: bool) -> Result<(), i32> {
+        if self.mode.load(Ordering::Acquire) == 3 {
+            return Err(-95);
+        }
         if !self.ps_supported {
             return Err(-95);
         }
@@ -443,6 +511,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     /// Send a queued protected SA Query Response (PMF) produced by the
     /// synchronous drain; a failure closes the link like other data faults.
     pub(super) async fn flush_management(&self) -> Result<(), WirelessError> {
+        if self.mode.load(Ordering::Acquire) == 3 {
+            return Ok(());
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
@@ -480,6 +551,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         Ok(())
     }
     pub(super) async fn apply_power_save(&self) -> Result<(), WirelessError> {
+        if self.mode.load(Ordering::Acquire) == 3 {
+            return Ok(());
+        }
         let request = self.ps_request.load(Ordering::Acquire);
         if request == 0 {
             return Ok(());
@@ -654,6 +728,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
     }
     pub(super) fn drain(&self) -> bool {
+        if self.mode.load(Ordering::Acquire) == 3 {
+            return self.ap_drain();
+        }
         let Some(batch) = self.progress() else {
             return false;
         };
@@ -710,6 +787,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         &self,
         mut request: ScanRequest,
     ) -> Result<Vec<BssInfo>, WirelessError> {
+        if self.mode.load(Ordering::Acquire) != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
@@ -896,6 +976,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         request: AssociateRequest,
         nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<(), WirelessError> {
+        if self.mode.load(Ordering::Acquire) != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
@@ -1048,6 +1131,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         Ok(())
     }
     pub(super) async fn disassociate(&self) -> Result<(), WirelessError> {
+        if self.mode.load(Ordering::Acquire) != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         self.close();
         let mut radio = self.radio.lock().await;
         self.state.lock().await.clear();
@@ -1249,6 +1335,7 @@ fn publish_with_mac(
         narf_wireless::registry::register(device.clone());
         let (signal, delivered) = wake;
         *device.wake.lock() = Some(signal.clone());
+        *device.ap_host.wake.signal.lock() = Some(signal.clone());
         let worker = device.clone();
         // NAPI-equivalent service: wait for a CE/firmware vector, a host TX
         // or power-save kick, or the bounded backstop; re-run at once while
@@ -1259,13 +1346,7 @@ fn publish_with_mac(
                     super::pci::scan_cleanup_failed(worker.radio.clone());
                     break;
                 }
-                if worker.closed.load(Ordering::Acquire) {
-                    if worker.cleanup_failed_scan().await.is_err() {
-                        super::pci::scan_cleanup_failed(worker.radio.clone());
-                    }
-                    break;
-                }
-                match worker.cleanup_failed_scan().await {
+                match worker.cleanup_worker_step().await {
                     Ok(false) => {}
                     Ok(true) => break,
                     Err(_) => {
@@ -1369,11 +1450,220 @@ pub(super) async fn wait_publish(
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
+    fn ap_station_macs(&self) -> Vec<[u8; 6]> {
+        if self.closed.load(Ordering::Acquire) || self.mode.load(Ordering::Acquire) != 3 {
+            return Vec::new();
+        }
+        let Some(radio) = self.radio.try_lock() else {
+            return Vec::new();
+        };
+        let source = radio.htt.wmi.htc.transport.current_sources();
+        super::firmware_source::invoke(source.as_ref(), || radio.ap_clients())
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    }
+    fn ap_station_info(&self, peer: [u8; 6]) -> Option<narf_wireless::StationInfo> {
+        self.ap_station_macs()
+            .contains(&peer)
+            .then_some(narf_wireless::StationInfo::default())
+    }
+    fn supports_ap(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_uapsd(&self) -> bool {
+        self.ap_capable && self.ap_uapsd
+    }
+    fn max_ap_assoc_sta(&self) -> u32 {
+        if self.ap_capable {
+            8
+        } else {
+            0
+        }
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_key_sequence(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        self.ap_capable
+    }
+    fn current_iftype(&self) -> u32 {
+        self.ap_mode()
+    }
+    fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        self.ap_set_mode(mode)
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.reserve_control()
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(
+            authority,
+            ap::Operation::Start(Box::new(config), Box::new(settings)),
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn start_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), WirelessError> {
+        self.start_ap_with_settings_async(
+            authority,
+            config,
+            narf_wireless::ApStartSettings::default(),
+        )
+        .await
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Stop)
+            .await
+            .map(|_| ())
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Beacon(head, tail, probe))
+            .await
+            .map(|_| ())
+    }
+    async fn add_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Add(station))
+            .await
+            .map(|_| ())
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Set(station))
+            .await
+            .map(|_| ())
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        _reason: u16,
+    ) -> Result<(), WirelessError> {
+        // DEL_STATION removes native ownership. A reason-bearing on-air
+        // deauthentication is separately submitted through actual FRAME TX.
+        self.ap_control(authority, ap::Operation::Delete(peer))
+            .await
+            .map(|_| ())
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::Key(key))
+            .await
+            .map(|_| ())
+            .map_err(ap::errno)
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::DeleteKey(index, pairwise, peer))
+            .await
+            .map(|_| ())
+            .map_err(ap::errno)
+    }
+    async fn key_sequence_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        self.ap_sequence(authority, index, pairwise, peer).await
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_control(
+            authority,
+            ap::Operation::DefaultKey(index, (unicast, multicast, management, beacon)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(ap::errno)
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control(authority, ap::Operation::Control(request))
+            .await
+            .map_err(ap::errno)
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.ap_control(authority, ap::Operation::Management(request))
+            .await
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        frame_type: u16,
+        prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        self.ap_register(authority, frame_type, prefix).await
+    }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
         if self.closed.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
             None
         } else {
-            core::num::NonZeroU64::new(self.generation)
+            core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire))
         }
     }
     fn reserve_radio_control(
@@ -1435,7 +1725,7 @@ impl WirelessNetIface for Native {
         Device::phy_capabilities(self, band)
     }
     fn power_save_default(&self) -> Option<bool> {
-        self.ps_supported.then_some(false)
+        (self.ps_supported && self.mode.load(Ordering::Acquire) == 2).then_some(false)
     }
     fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
         self.request_power_save(enabled)
@@ -1453,7 +1743,7 @@ impl WirelessNetIface for Native {
         true
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.mode.load(Ordering::Acquire) != 2 {
             return None;
         }
         let b = self.bssid.load(Ordering::Acquire).to_le_bytes();
@@ -1492,10 +1782,17 @@ impl WirelessNetIface for Native {
                     })
                 })
                 .collect(),
-            modes: WirelessModes::STATION,
+            modes: WirelessModes::STATION
+                | if self.ap_capable {
+                    WirelessModes::AP
+                } else {
+                    WirelessModes::empty()
+                },
             hw_caps: HwCaps {
-                ht_supported: self.ht_capabilities.is_some(),
-                vht_supported: self.vht_capabilities.is_some(),
+                ht_supported: self.mode.load(Ordering::Acquire) == 2
+                    && self.ht_capabilities.is_some(),
+                vht_supported: self.mode.load(Ordering::Acquire) == 2
+                    && self.vht_capabilities.is_some(),
                 he_supported: false,
                 eht_supported: false,
             },

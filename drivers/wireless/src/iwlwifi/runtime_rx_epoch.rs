@@ -171,8 +171,17 @@ impl Hardware {
         // actual original DMA/session owner is separate from ordinary Qu
         // station/BAID service, which keeps its original refusal below.
         let legacy_p2p = baid.is_none() && self.p2p_gen2_prefix();
+        let legacy_client = baid.is_none()
+            && self.ap_legacy_selected()
+            && self
+                .p2p_client
+                .as_ref()
+                .is_some_and(|client| client.current().is_ok());
         if self.failed
-            || (self.format == rx_rfh::CompletionFormat::Qu && !legacy_ap && !legacy_p2p)
+            || (self.format == rx_rfh::CompletionFormat::Qu
+                && !legacy_ap
+                && !legacy_p2p
+                && !legacy_client)
             || !matches!(self.version(5, 2).map(|v| v.0), None | Some(1 | 99))
         {
             return Err("unsupported/failed native MLD RX epoch contract");

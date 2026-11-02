@@ -61,6 +61,7 @@ pub mod boot_context;
 mod bootstrap;
 pub use bootstrap::gen2_ap_transmit_power_request;
 pub use bootstrap::gen2_ba_transmit_power_request;
+pub use bootstrap::gen2_client_transmit_power_request;
 pub use bootstrap::gen2_go_transmit_power_request;
 pub use bootstrap::gen2_ht20_transmit_power_request;
 pub use bootstrap::gen2_nested_ba_transmit_power_request;
@@ -104,6 +105,9 @@ mod mvm_boot;
 mod mvm_device;
 mod mvm_publication;
 mod native_band;
+mod p2p_client;
+#[cfg(feature = "kernel-test")]
+mod p2p_client_fixture;
 mod p2p_gen2_wire;
 mod p2p_go;
 #[cfg(feature = "kernel-test")]

@@ -15,6 +15,17 @@ pub use management::{
     Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
 };
 mod active_scan;
+pub(in crate::ath10k) mod ap;
+mod ap_beacon;
+mod ap_control;
+mod ap_key;
+mod ap_keys;
+mod ap_native;
+mod ap_packet;
+mod ap_staging;
+mod ap_stop;
+mod ap_tx;
+mod ap_wire;
 mod associated_scan;
 mod dwell_scan;
 pub(in crate::ath10k) use active_scan::checked as checked_policy;
@@ -101,6 +112,11 @@ pub(super) struct Radio<T> {
     management_done: VecDeque<ManagementCompletion>,
     peer: Option<station::Peer>,
     data: Option<data::State>,
+    ap: Option<alloc::boxed::Box<ap::Session>>,
+    ap_staging: Option<alloc::boxed::Box<ap::Staging>>,
+    ap_history: Option<alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<ap_key::History>>>,
+    ap_sequence: u32,
+    ap_dirty_wmm: bool,
     pub htt: htt::Runtime<T>,
     wire: wire::Wire,
     features: u64,
@@ -137,6 +153,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub fn new(htt: htt::Runtime<T>, dialect: Dialect, features: u64) -> Self {
         Self {
+            ap: None,
+            ap_staging: None,
+            ap_history: None,
+            ap_sequence: 0,
+            ap_dirty_wmm: false,
             htt,
             wire: wire::Wire::new(dialect),
             features,

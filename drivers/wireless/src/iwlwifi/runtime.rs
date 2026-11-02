@@ -636,6 +636,7 @@ pub struct Hardware {
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
     p2p_go: Option<alloc::sync::Arc<super::p2p_go::Native>>,
+    p2p_client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
     p2p: p2p::State,
     ap_gen2: Option<super::ap_gen2_wire::Adapter>,
@@ -760,6 +761,7 @@ impl Hardware {
             six_tx_profile: None,
             ap_owner: None,
             p2p_go: None,
+            p2p_client: None,
             ap_request: None,
             p2p: p2p::State::new(&parsed.api),
             ap_gen2: None,
@@ -1202,6 +1204,7 @@ impl Hardware {
         let capture = self.rx_epoch.capture();
         let p2p_capture = self.p2p.copy_grant();
         let go_capture = self.p2p_go.clone();
+        let client_capture = self.p2p_client.clone();
         let mut copied = self.resources.rx.drain(&mut self.mmio)?;
         for queue in &mut self.resources.extra_rx {
             copied.extend(queue.drain(&mut self.mmio)?);
@@ -1222,6 +1225,16 @@ impl Hardware {
             if let Some(go) = &go_capture {
                 if go.receive(&packet)? {
                     continue;
+                }
+            }
+            if let Some(client) = &client_capture {
+                if packet.receive_queue == 0
+                    && packet.header.group_id == 0
+                    && packet.header.cmd == 0xc1
+                {
+                    if let Some(mpdu) = self.ap_mpdu(&packet.payload) {
+                        client.receive(&mpdu, self.band_in_rx_supported())?;
+                    }
                 }
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
@@ -1483,6 +1496,9 @@ impl Hardware {
 
     pub(super) fn clear_rf_policy(&mut self) {
         self.p2p_go = None;
+        if let Some(client) = self.p2p_client.take() {
+            client.retire();
+        }
         self.ap_request = None;
         if let Some(owner) = self.ap_owner.take() {
             owner.retire();
@@ -1498,6 +1514,9 @@ impl Hardware {
         self.failed = true;
         self.rx_epoch.deny();
         self.p2p.deny();
+        if let Some(client) = &self.p2p_client {
+            client.retire();
+        }
     }
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -1714,6 +1733,7 @@ impl Hardware {
             return Err("Wi-Fi transport failed");
         }
         self.check_p2p_tx_publication()?;
+        self.check_client_tx_publication()?;
         let sources = self.source_fence()?;
         self.check_six_tx_publication()?;
         let queue = self
@@ -1857,6 +1877,7 @@ impl Hardware {
             return Err("MVM station closed before native packet publication");
         }
         self.check_p2p_tx_publication()?;
+        self.service_p2p_client().await?;
         let projected = if encrypt.is_some() {
             self.project_go_probe(frame)?
         } else {
@@ -2126,3 +2147,5 @@ mod ap;
 
 #[path = "runtime_p2p.rs"]
 pub(in crate::iwlwifi) mod p2p;
+#[path = "runtime_p2p_client.rs"]
+mod p2p_client_native;

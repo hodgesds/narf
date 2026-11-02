@@ -488,12 +488,24 @@ scheduled at25 completed features. Counting unvalidated implementations,82
 remain. Measured board qualifications and physical multi-board acceptance
 remain separate; operating reset, runtime sleep and system suspend stay open.
 
+**Source implementation recount 2026-11-02** (native TLV AP and client association):
+the remaining ledger holds **72 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Ten source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. Ath10k now owns bounded legacy20
+AP peer/key/port/data, native beacon/template/TIM receipts, applicable U-APSD and
+terminal restoration. Intel CLIENT8 association/data adds actual MAC7 and original
+NoA/CTWindow ownership as partial P2P scope; its public management worker remains
+open. Fourteen new cases are written and unexecuted. Scoped formatting and one
+combined release metadata context pass; full release/native validation remains
+at25 completed feature rows. Counting unvalidated implementations,82 remain.
+Physical firmware/board, RF/power and deployment qualification remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE/SESSION1/SESSION2 and legacy20 GO9/NoA are implemented pending validation; CLIENT and native PS keep the family P2P row open |
+| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded DEVICE/SESSION1/SESSION2, legacy20 GO9/NoA and CLIENT8 association/data are implemented pending validation; the CLIENT management worker and native PS keep the family P2P row open |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
-| ath10k | 8 | Contiguous VHT160, alternate calibration sources, hardware keys, AP/P2P, DFS, credential replay and wake offload; host-bus PM, bounded PFC, signed indoor admission and native Beacon hints are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
+| ath10k | 7 | Contiguous VHT160, alternate calibration sources, hardware keys, P2P, DFS, credential replay and wake offload; bounded legacy20 AP/U-APSD, host-bus PM, PFC, signed indoor admission and native Beacon hints are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
@@ -1342,6 +1354,14 @@ are written, four new GO cases unexecuted. One release metadata context and
 scoped formatting pass; full batch acceptance remains pending. CLIENT and
 applicable native P2P power-save controls remain open.
 
+CLIENT8 association/data uses actual MAC7 with a protected OFDM-only legacy20
+program, original role/physical identity and bound P2P/WPS request/peer response.
+Queued native broadcast Beacon NoA changes require the actual CTWindow command
+receipt before packet publication after credit waits. API77 uses distinct tag10
+qualification and restores inactive MAC5 only after terminal peer/queue/PHY
+retirement. Four cases are written and unexecuted; family §3.77 defines this
+partial scope. The retained public CLIENT FRAME/REGISTER worker stays separate.
+
 ### 3.6 Native observations and thermal maintenance (validation pending)
 
 Admitted C21 exposes factual `rtl8821c_power_tracking_request()` metadata for
@@ -1373,6 +1393,20 @@ Implicit `provision`/`with_controller` refuse ambiguous live radios. Each
 original controller owns its provisioning mutex and worker; a nonwrapping
 endpoint cookie and ingress-quiescent removal retain the original source,
 key/PN, copied-frame and DMA-reclamation proofs. Family §3 is normative.
+
+### 3.8 Native TLV AP control and packet owner (validation pending)
+
+Ath10k's admitted RAW/HTT3 TLV owner uses the shared typed AP controls for
+legacy20 Open/WPA2 and actual service-qualified U-APSD. Start/key-before-start,
+peer/authorization, control/management, sequence-only GET_KEY and both packet
+endpoints retain the original source, policy Arc, role and native/copy epochs.
+Only actual synchronous native publication opens response windows; copied DATA
+and management retain original peer fences, and queued loss is drained before
+packet handoff without recapturing authority. Terminal cancellation cleanup
+retains native DMA until real receipts, restores NSS/DCF and continues the
+physical worker for a later explicitly admitted BSS. Unsupported protection,
+PHY/security/P2P profiles stay refused before native mutation. Family §3.3 is
+normative; ten native cases are written and unexecuted.
 
 ## 4. Interaction with `narf-wireless`
 

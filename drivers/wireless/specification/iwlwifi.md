@@ -4684,8 +4684,8 @@ without an active station, AP, scheduled scan or DEVICE activity. Existing
 AP3 and ordinary station identities retain their source/epoch contracts.
 The source-qualified AP consumer plus the actual fixed/v1 NoA notification
 consumer admits the GO subset; a firmware GO8 enum alone does not.
-Advertisement includes9 only for that implemented native owner and never
-adds CLIENT8. The independent DEVICE10 subset is still qualified by its
+Advertisement includes9 only for that implemented native owner. §3.77 adds
+the separate actual CLIENT8 association/data owner. The independent DEVICE10 subset is still qualified by its
 own actual ROC/SESSION/resource facts. One active physical data role is
 supported; this continuation creates no proxy netdev or simultaneous GO/STA.
 GO remains a protected legacy20 group, with no CCK rates and no advertised
@@ -4781,3 +4781,74 @@ it does not close the full P2P row. CLIENT ownership remains separate. Native
 CTWindow/OPPPS controls stay unadvertised: admitted new MAC_CONFIG1/2/3 have no
 GO PS producer in the pinned Linux path, and legacy MAC_CONTEXT GO fields may
 not be transplanted into a new-MAC adapter.
+
+
+### 3.77 Native P2P CLIENT8 station7 and peer CTWindow owner
+
+The original physical netdev may select CLIENT8 only while administratively
+DOWN with no actual active data role, scan, AP or DEVICE work. Its native
+consumer is a distinct MAC0 P2P-STA7, not a software type alias for BSS-STA5.
+All admitted Sc/Bz/API89 and original API77 consumers use protected legacy20
+OFDM here; richer ordinary-station PHY modes, six-GHz, roaming and concurrent
+data roles are not advertised by this client owner. The existing actual
+station authentication, RSNA/PMF, key/PN/reorder, port and IPC retirement
+owners remain responsible for security and data. The independent DEVICE10
+retains negotiation/discovery on its own original control-WDEV source.
+
+Association retains the selected current physical BSSID/channel, peer GO's
+actual P2P capability and Device-ID and the caller's bounded P2P/WPS vendor
+IEs. The client's Device-Info address and GO Device-ID remain protocol facts;
+neither replaces the physical local/BSSID key or DATA address. Callers cannot
+replace station-owned SSID/security/PHY elements. The generated association
+request appends those exact vendor IEs and requires a successful P2P Status
+from the matching response. Missing/duplicate/truncated identities, CCK basic
+rates, Open security or an unrelated native role refuse before MAC7 or RF.
+
+The original mode lifetime binds every hardware source fence. A real closed
+all-RFH prefix follows old MAC removal and precedes the new station7 ADD;
+only then may that exact retained client capture peer beacons. New MAC/link
+receipts precede packet eligibility. Current NVM/MCC and host power/channel
+facts remain mandatory; NO_P2P is checked over the actual occupied20MHz span.
+Already-copied sources cannot survive native retirement or lend their role to
+a later client, even with identical addresses and the same software mode.
+
+Actual bound fallback0 beacons retain peer NoA index/descriptors separately
+from physical key/port ownership. The generic Linux four-descriptor limit is
+used here, distinct from GO's two-descriptor firmware notification. The
+CTWindow is the actual lower7 bits, including zero/absence clearing, as in
+Linux's MVM P2P station producer. The admitted MAC_CONFIG layouts define the
+client CTWindow at byte48; new native commands preserve the actual station7,
+association ID and profile-specific filter bytes. Peer Device-ID changes
+require reassociation. Foreign MAC/link/channel/band copies confer no update.
+
+Every real station packet boundary drains a bounded already-completed native
+receive prefix after credit waits. Pending CTWindow blocks synchronous DATA;
+the retained maintenance owner sends a source-current MAC7 update and waits
+for its real receipt before DATA resumes. Asynchronous authentication/EAPOL/
+management/data sends perform that same service after their credit waits.
+A moving prefix, changed role/source, bad receipt or repeatedly changing NoA
+keeps publication closed. A command ACK never substitutes for RSNA keys or
+port authorization. Healthy terminal station/queue/PHY removal restores the
+inactive physical MAC5/link default and retires the old client capture;
+failed cleanup retains uncertain DMA under the original device stop owner.
+
+API77 uses a distinct signed NIPW tag10 and exact physical/RF/firmware/NVM/
+SMBIOS plus peer/device/request/channel program binding. Ordinary tag1, GO9
+and DEVICE8 records cannot qualify it. The metadata-only
+`gen2_client_transmit_power_request(bssid, ssid, frequency_mhz, request_ies)`
+uses an actual observed GO and returns that proposal without creating a
+measurement, role or RF grant. The native join reconstructs the same binding
+before PHY/peer/queue I/O, retains the real signed source and requires its
+actual existing SAR/link power transaction. Host policy and copied data fences
+retain the original client lifetime as well as current qualification.
+
+Four new unexecuted cases cover actual Sc/API89/Bz and API77 protected
+association/vendor IEs, native station7/OFDM/CTWindow bytes, more-than64 queued
+foreign records before a matching NoA update, native clear, real key/data RX
+and TX, terminal restoration and original-copy retirement. Request/security
+replacement, Open/GO-capability confusion, missing measured input and current
+NO_P2P refusal have explicit negative assertions. These source changes await
+coordinated release compilation and native execution. CLIENT's public native
+FRAME/REGISTER_FRAME worker is still a separate continuation; its management
+opt-in stays false. Native GO PS controls retain §3.76's actual producer
+limitations. The whole P2P row remains open.

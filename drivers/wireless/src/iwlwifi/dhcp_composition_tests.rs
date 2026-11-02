@@ -145,6 +145,7 @@ enum ReceiveModel {
     NativeSc,
     Unsupported,
     Ap,
+    Client,
     P2p,
 }
 impl From<bool> for ReceiveModel {
@@ -165,7 +166,7 @@ impl ReceiveModel {
             Self::Unsupported => versions.extend_from_slice(&[0x0d, 5, 3, 0]),
             // Exact installed Sc core103 beacon14/flush2 contracts. These
             // additional commands neither invent RX capability nor a role.
-            Self::Ap => versions.extend_from_slice(&[0x91, 1, 14, 0, 0x1e, 1, 2, 1]),
+            Self::Ap | Self::Client => versions.extend_from_slice(&[0x91, 1, 14, 0, 0x1e, 1, 2, 1]),
             Self::P2p => versions.extend_from_slice(&[
                 // The actual Sc AP contract is needed to exercise native
                 // parent-AP exclusion, rather than an unsupported role.
@@ -195,6 +196,8 @@ struct TxModel {
     memory: Vec<u8>,
 }
 struct Wire {
+    client: bool,
+    client_mac: u8,
     firmware: model::Firmware,
     trace: TxTrace,
     versions: Vec<u8>,
@@ -694,7 +697,13 @@ impl Wire {
                     "Sc all-owned-RFH epoch native contract",
                 )?;
             }
-            (3, 8) => require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?,
+            (3, 8) => {
+                require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?;
+                if self.client {
+                    self.client_mac =
+                        crate::iwlwifi::p2p_client_fixture::mac(self.client_mac, body)?;
+                }
+            }
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
             (3, 10) => {
                 require(
@@ -894,6 +903,9 @@ impl Wire {
                 return Ok(());
             }
             let mut beacon = self.ap.beacon();
+            if self.client {
+                beacon = crate::iwlwifi::p2p_client_fixture::beacon(beacon, 1, Some(0xa0));
+            }
             let mut six_job = true;
             if let Some(six) = self.six {
                 six_job = body[48..48 + usize::from(body[45]) * 8]
@@ -1156,6 +1168,9 @@ impl Wire {
                 )?;
             } else {
                 let phase = self.ap.phase();
+                if self.client {
+                    crate::iwlwifi::p2p_client_fixture::check_request(&frame)?;
+                }
                 let responses = self
                     .ap
                     .receive(radio.as_deref().unwrap_or(&frame))
@@ -1205,6 +1220,9 @@ impl Wire {
                     }
                 }
                 for mut response in responses {
+                    if self.client {
+                        crate::iwlwifi::p2p_client_fixture::response(&mut response);
+                    }
                     if self.mld.is_some() && phase == ApPhase::Message2 {
                         self.mld_m3 = Some(response.clone());
                     }
@@ -1294,7 +1312,13 @@ impl Wire {
         self.mpdu_at(
             frame,
             protected,
-            if self.six.is_some() { 2 } else { 0 },
+            if self.six.is_some() {
+                2
+            } else if self.client && self.channel() <= 14 {
+                1
+            } else {
+                0
+            },
             self.channel(),
         );
     }
@@ -1709,8 +1733,10 @@ impl Guard {
         // consumer enabled from that parsed fact, rather than mistaking
         // the AP role for the authored single-queue Sc fixture.
         let multi_receive = receive_model.enabled()
-            || matches!(receive_model, ReceiveModel::Ap | ReceiveModel::P2p)
-                && parsed.api.has_capability(68);
+            || matches!(
+                receive_model,
+                ReceiveModel::Ap | ReceiveModel::Client | ReceiveModel::P2p
+            ) && parsed.api.has_capability(68);
         model::firmware_profile(&mut hardware, &parsed)?;
         if api89.is_some() || bz.is_some() {
             hardware.prepare_station_profile(&parsed)?;
@@ -1740,7 +1766,9 @@ impl Guard {
             FakeAp::open(NETWORK, SSID, legacy, 7)
         }
         .and_then(|ap| {
-            if six.is_some() {
+            if matches!(receive_model, ReceiveModel::Client) {
+                ap.with_legacy_rates(&[0x8c, 0x98, 0xb0])
+            } else if six.is_some() {
                 ap.with_six_ghz_channel(channel)
             } else {
                 Ok(ap)
@@ -1748,6 +1776,8 @@ impl Guard {
         })
         .map_err(|_| "shared Sc AP configuration")?;
         let mut wire = Box::new(Wire {
+            client: matches!(receive_model, ReceiveModel::Client),
+            client_mac: 0,
             firmware,
             trace,
             versions,

@@ -12,6 +12,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let eligible = !self.failed
             && self.ready.is_some()
+            && self.ap.is_none()
             && self.peer.is_none()
             && self.data.is_none()
             && self.scan_pending.is_none()

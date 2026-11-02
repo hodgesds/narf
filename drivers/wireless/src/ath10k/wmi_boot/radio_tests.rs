@@ -1,6 +1,8 @@
 use super::*;
 use crate::ath10k::{bmi::BmiError, wmi_runtime as radio};
 include!("radio_golden.rs");
+#[path = "ap_native_tests.rs"]
+mod ap_native_tests;
 #[path = "host_power_tests.rs"]
 mod host_power_tests;
 
@@ -54,6 +56,7 @@ struct RadioModel {
     coexistence: Option<coexistence_native::Fixture>,
     host_power: HostPowerFixture,
     beacon_hint: BeaconHintFixture,
+    ap: Option<ap_native_tests::Fixture>,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BeaconHintFixture {
@@ -327,6 +330,12 @@ impl Hif for RadioModel {
             self.ce = Some(ce);
             return result;
         }
+        if pipe == 4 && self.ap.is_some() {
+            if let Some(ce) = &mut self.ce {
+                ce.begin_send(pipe, bytes)?;
+            }
+            return ap_native_tests::transmit(self, bytes);
+        }
         if pipe != 4 || self.data.is_none() {
             return Err(BmiError::Unsupported);
         }
@@ -352,6 +361,7 @@ impl Hif for RadioModel {
             return Ok(None);
         }
         self.host_power.polls += 1;
+        ap_native_tests::poll(self);
         if let Some(ce) = &mut self.ce {
             ce.poll_now()?;
         }
@@ -366,6 +376,7 @@ impl Hif for RadioModel {
         }
     }
     async fn poll(&mut self, b: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        ap_native_tests::poll(self);
         offchannel_native::poll(self)?;
         data_tests::poll(self)?;
         if self.mismatch_rx && self.inner.inner.rx.is_empty() {
@@ -437,6 +448,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.ap.is_some() {
+            return ap_native_tests::command(self, bytes);
+        }
         if let Some(stage) = chains_tests::stage(self.inner.inner.dialect, &bytes[8..]) {
             return chains_tests::send(self, bytes, stage).await;
         }
@@ -705,6 +719,26 @@ fn radio_boot_source_version(
     ht: Option<u32>,
     source: RadioSource,
 ) -> radio::Radio<RadioModel> {
+    radio_boot_source_ap(
+        version,
+        dialect,
+        features,
+        htt_version,
+        factory,
+        ht,
+        (source, false),
+    )
+}
+fn radio_boot_source_ap(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    htt_version: (u8, u8),
+    factory: u32,
+    ht: Option<u32>,
+    profile: (RadioSource, bool),
+) -> radio::Radio<RadioModel> {
+    let (source, ap_services) = profile;
     let RadioSource {
         hardware,
         rf_chains,
@@ -726,6 +760,7 @@ fn radio_boot_source_version(
         u32at(&mut inner.inner.expected, 4 + 9 * 4, 3);
     }
     inner.inner.factory = factory;
+    inner.inner.ap_services = ap_services;
     inner.inner.ht = ht;
     inner.inner.rf_chains = Some(rf_chains);
     inner.inner.vht = vht;
@@ -778,6 +813,7 @@ fn radio_boot_source_version(
         offchannel: None,
         host_power: HostPowerFixture::default(),
         beacon_hint: BeaconHintFixture::Off,
+        ap: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));

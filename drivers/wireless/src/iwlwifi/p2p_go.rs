@@ -75,7 +75,7 @@ fn unicast(mac: [u8; 6]) -> bool {
 
 /// Concatenate fragmented P2P vendor payloads before decoding LE16 attrs,
 /// matching the actual hostap group producer's251-byte fragmentation.
-fn attributes(ies: &[u8]) -> Result<Vec<u8>, &'static str> {
+pub(super) fn attributes(ies: &[u8]) -> Result<Vec<u8>, &'static str> {
     let mut out = Vec::new();
     for (id, body) in super::ap_wire::elements_iter(ies)? {
         if id == 221 && body.starts_with(&OUI) {
@@ -100,7 +100,7 @@ fn validate_attributes(mut raw: &[u8]) -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn unique(raw: &[u8], id: u8) -> Result<Option<&[u8]>, &'static str> {
+pub(super) fn unique(raw: &[u8], id: u8) -> Result<Option<&[u8]>, &'static str> {
     let mut raw = raw;
     let mut found = None;
     while !raw.is_empty() {

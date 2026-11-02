@@ -246,6 +246,7 @@ pub(super) struct Program {
     six: Option<(narf_wireless::reg::PowerType6Ghz, u32)>,
     ap: bool,
     go: Option<Arc<[u8; 32]>>,
+    client: Option<Arc<[u8; 32]>>,
     mvm_ap: Option<(MvmPower, bool)>,
 }
 impl Program {
@@ -277,6 +278,7 @@ impl Program {
             six: None,
             ap: false,
             go: None,
+            client: None,
             mvm_ap: None,
         };
         program.check(domain)?;
@@ -307,6 +309,7 @@ impl Program {
             six: Some((profile.power_type(), profile.nvm_flags)),
             ap: false,
             go: None,
+            client: None,
             mvm_ap: None,
         };
         program.check(domain)?;
@@ -324,6 +327,13 @@ impl Program {
     pub fn with_go(mut self, binding: [u8; 32]) -> Result<Self, &'static str> {
         self = self.with_ap()?;
         self.go = Some(Arc::new(binding));
+        Ok(self)
+    }
+    pub fn with_client(mut self, binding: [u8; 32]) -> Result<Self, &'static str> {
+        if self.ap || self.band == super::native_band::Band::Six || self.width != 0 {
+            return Err("P2P client requires its actual station legacy20 program");
+        }
+        self.client = Some(Arc::new(binding));
         Ok(self)
     }
     pub fn go_binding(&self) -> Option<[u8; 32]> {
@@ -409,6 +419,7 @@ impl Program {
             six: None,
             ap: true,
             go: None,
+            client: None,
             mvm_ap: Some((power, ibss)),
         };
         program.check(domain)?;
@@ -447,7 +458,7 @@ impl Program {
         domain: &RegulatoryDomain,
         firmware: &super::mld_regulatory::Mcc,
     ) -> Option<i8> {
-        if self.go.is_some()
+        if (self.go.is_some() || self.client.is_some())
             && !super::p2p_go::host_allows(
                 domain,
                 super::native_band::Channel {

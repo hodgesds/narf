@@ -5,8 +5,8 @@ use crate::iwlwifi::p2p_go_fixture as wire;
 fn into_go(f: &Fixture) -> R {
     require(
         f.device().p2p_interface_types().contains(&9)
-            && !f.device().p2p_interface_types().contains(&8),
-        "GO advertised an unimplemented CLIENT",
+            && f.device().p2p_interface_types().contains(&8),
+        "GO/CLIENT implemented subset absent",
     )?;
     f.admin.set_link(false).map_err(|_| "GO original DOWN")?;
     f.device()
@@ -379,7 +379,7 @@ fn source_denials() -> R {
             _ => {
                 require(
                     f.device().set_iftype(3) == Err(WirelessError::Busy)
-                        && f.device().set_iftype(8) == Err(WirelessError::NotSupported)
+                        && f.device().set_iftype(8) == Err(WirelessError::Busy)
                         && !f.device().supports_p2p_go_power_save(),
                     "GO active role allowed retype or invented CLIENT/GO PS contract",
                 )?;

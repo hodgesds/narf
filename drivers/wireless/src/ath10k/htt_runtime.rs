@@ -599,6 +599,16 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         self.failed = false;
         Ok(())
     }
+    /// The AP owner uses the actual negotiated legacy RAW descriptor path.
+    /// A continuous/PFC profile needs separate AP ownership and stays refused.
+    pub(in crate::ath10k) fn ap_protocol(&self) -> bool {
+        !self.failed
+            && self.config.dialect == 3
+            && !self.config.continuous
+            && !self.config.pfc
+            && self.ready.is_some_and(|ready| ready.major >= 3)
+            && self.data_profile()
+    }
     pub fn data_profile(&self) -> bool {
         self.wmi.raw_mode() && (!self.config.pfc || self.wmi.htc.transport.supports_htt_pfc())
     }
