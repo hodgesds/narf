@@ -4379,6 +4379,101 @@ impl narf_power::thermal::CoolingDevice for FakeFan916 {
     }
 }
 
+/// Fake cooling device modelling AcpiFan's cached on/off flag
+/// (#1223): `_ON` is issued only on an off→on transition of the
+/// driver's cache, while firmware powering the fan off across S3
+/// changes hardware state only — the cache still says on until
+/// the resume path resets it. The fixture below fails on the
+/// unfixed tree (resume re-asserts the level but never
+/// re-issues `_ON`) and passes with the reset in place. The
+/// reset implementation mirrors AcpiFan's override line for line;
+/// the production code under test is the resume wiring itself
+/// (reset fan-out before re-assert), which runs through the
+/// real `thermal_pm` handler and `power::thermal` registry.
+#[derive(Debug)]
+struct FakeFan1223 {
+    /// Driver's cached on/off belief (mirrors AcpiFan's `on`).
+    cached_on: core::sync::atomic::AtomicBool,
+    /// Hardware power state (mirrors firmware's fan power).
+    hw_on: core::sync::atomic::AtomicBool,
+    /// Count of `_ON` edges issued.
+    on_calls: core::sync::atomic::AtomicU8,
+    /// Count of `_FSL` re-evaluations (level drives while on).
+    fsl_calls: core::sync::atomic::AtomicU8,
+    level: core::sync::atomic::AtomicU8,
+}
+
+impl FakeFan1223 {
+    fn new() -> Self {
+        Self {
+            cached_on: core::sync::atomic::AtomicBool::new(false),
+            hw_on: core::sync::atomic::AtomicBool::new(false),
+            on_calls: core::sync::atomic::AtomicU8::new(0),
+            fsl_calls: core::sync::atomic::AtomicU8::new(0),
+            level: core::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    fn on_calls(&self) -> u8 {
+        self.on_calls.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn fsl_calls(&self) -> u8 {
+        self.fsl_calls.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn hw_on(&self) -> bool {
+        self.hw_on.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn level(&self) -> u8 {
+        self.level.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Model firmware powering the fan off across S3: hardware
+    /// state goes off, the driver's cache is untouched.
+    fn lose_power(&self) {
+        self.hw_on
+            .store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl narf_power::thermal::CoolingDevice for FakeFan1223 {
+    fn name(&self) -> &'static str {
+        "fake-fan-1223"
+    }
+
+    fn set_level(&self, level: u8) {
+        // Mirror AcpiFan::set_level's transition-only power edge
+        // plus per-drive _FSL re-evaluation.
+        self.level
+            .store(level, core::sync::atomic::Ordering::SeqCst);
+        let want_on = level > 0;
+        let was_on = self
+            .cached_on
+            .swap(want_on, core::sync::atomic::Ordering::SeqCst);
+        if want_on && !was_on {
+            self.on_calls
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            self.hw_on.store(true, core::sync::atomic::Ordering::SeqCst);
+        } else if !want_on && was_on {
+            self.hw_on
+                .store(false, core::sync::atomic::Ordering::SeqCst);
+        }
+        if want_on {
+            self.fsl_calls
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn reset_cached_power(&self) {
+        // Mirror AcpiFan's override: drop the cache so the next
+        // set_level > 0 re-issues _ON.
+        self.cached_on
+            .store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Snapshot/restore wrapper for the #916 smokes: the `device_pm`
 /// registry is probe-owned global state (same reason the
 /// power-state-freeze smoke snapshots it), and the thermal
@@ -4498,4 +4593,99 @@ fn smoke_thermal_pm_resume_without_level_is_quiet() -> TestResult {
 kernel_test_in!(
     "drivers/platform/thermal-pm",
     smoke_thermal_pm_resume_without_level_is_quiet
+);
+
+fn smoke_thermal_pm_resume_reissues_fan_on_body() -> TestResult {
+    use alloc::sync::Arc;
+    narf_power::thermal::__test_reset();
+    narf_power::thermal::init();
+    let cap = narf_power::bootstrap_thermal_authority();
+    let fan = Arc::new(FakeFan1223::new());
+    if narf_power::thermal::register_cooling_device(&cap, fan.clone()).is_err() {
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+    let zone = match narf_power::thermal::register_zone(&cap, "TZ0", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+    narf_power::device_pm::__reset_for_test();
+    crate::thermal_pm::register();
+    // Warm crossing drives 128: one _ON edge, one _FSL evaluation.
+    let _ = narf_power::thermal::record_temp(zone, 75_000);
+    if fan.level() != 128 || fan.on_calls() != 1 || fan.fsl_calls() != 1 || !fan.hw_on() {
+        return TestResult::Fail("governor Warm crossing did not drive fan on at 128");
+    }
+    // Suspend fan-out, then model firmware powering the fan off
+    // across S3 while the driver's cache still says on.
+    let _ = narf_power::device_pm::suspend_all_devices();
+    fan.lose_power();
+    if fan.hw_on() {
+        return TestResult::Fail("lose_power model broken: hardware fan still on");
+    }
+    // Resume must reset the cache and re-assert: a second _ON edge
+    // plus a second _FSL evaluation. On the unfixed tree the
+    // re-assert sees the cache still on, so _ON stays at 1 while
+    // the hardware fan stays off.
+    let report = narf_power::device_pm::resume_all_devices();
+    if !report.ok() {
+        return TestResult::Fail("resume fan-out reported failures");
+    }
+    if fan.on_calls() != 2 {
+        return TestResult::Fail("resume did not re-issue _ON after S3 power-off");
+    }
+    if fan.fsl_calls() != 2 || fan.level() != 128 || !fan.hw_on() {
+        return TestResult::Fail("resume did not re-assert level 128 with fan on");
+    }
+    TestResult::Pass
+}
+
+fn smoke_thermal_pm_resume_reissues_fan_on() -> TestResult {
+    smoke_thermal_pm_isolated(smoke_thermal_pm_resume_reissues_fan_on_body)
+}
+kernel_test_in!(
+    "drivers/platform/thermal-pm",
+    smoke_thermal_pm_resume_reissues_fan_on
+);
+
+fn smoke_thermal_pm_resume_level_zero_issues_no_on_body() -> TestResult {
+    use alloc::sync::Arc;
+    narf_power::thermal::__test_reset();
+    narf_power::thermal::init();
+    let cap = narf_power::bootstrap_thermal_authority();
+    let fan = Arc::new(FakeFan1223::new());
+    if narf_power::thermal::register_cooling_device(&cap, fan.clone()).is_err() {
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+    let zone = match narf_power::thermal::register_zone(&cap, "TZ0", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+    narf_power::device_pm::__reset_for_test();
+    crate::thermal_pm::register();
+    // Warm then Normal: the fan goes on (one _ON edge) and back
+    // off, leaving last driven level 0.
+    let _ = narf_power::thermal::record_temp(zone, 75_000);
+    let _ = narf_power::thermal::record_temp(zone, 60_000);
+    if fan.level() != 0 || fan.on_calls() != 1 || fan.hw_on() {
+        return TestResult::Fail("Warm→Normal did not drive fan back off");
+    }
+    // Suspend + resume with last level 0: the reset must not
+    // conjure an _ON edge — set_level(0) stays quiet.
+    let _ = narf_power::device_pm::suspend_all_devices();
+    let report = narf_power::device_pm::resume_all_devices();
+    if !report.ok() {
+        return TestResult::Fail("resume fan-out reported failures");
+    }
+    if fan.on_calls() != 1 || fan.level() != 0 || fan.hw_on() {
+        return TestResult::Fail("resume with level 0 issued a spurious fan power edge");
+    }
+    TestResult::Pass
+}
+
+fn smoke_thermal_pm_resume_level_zero_issues_no_on() -> TestResult {
+    smoke_thermal_pm_isolated(smoke_thermal_pm_resume_level_zero_issues_no_on_body)
+}
+kernel_test_in!(
+    "drivers/platform/thermal-pm",
+    smoke_thermal_pm_resume_level_zero_issues_no_on
 );
