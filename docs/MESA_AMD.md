@@ -484,6 +484,27 @@ also exercise requested synchronization on each engine through VM
 translation and final fence completion. Whether the stalled native job
 requested these flags is not established by the saved log.
 
+Boot `c361e996-b179-479e-b012-fe4a04307caa` verifies that the installed
+`9a0ec98c4` kernel contains both the framebuffer-entry and IB-flag fixes.
+Native queue/IB proofs pass at about 36.15 seconds, followed by 4K HDMI setup
+at 37.49. PlasmaLogin starts at 89.75 and its unit reports started at 94.94;
+the persistent journal ends there, before any KWin execution, framebuffer
+attempt or client-compute timeout is recorded. This capture therefore does
+not test either correction through desktop presentation.
+
+The startup audit also reproduced a collector observer effect on the same
+kernel in a disposable Arch/Btrfs VM. The previous shell collector made
+byte-at-a-time pipe reads and many small Btrfs writes; bulk reads alone left
+the small-write problem. A bounded userspace helper now batches both sides,
+including process samples, while map copies use `cat`. Host regressions and
+NARF guest checks cover byte preservation, partial flush, normal stop and
+retained logs after a clean reboot. See
+[native graphical capture setup](BOOTING_ON_CACHYOS.md#capturing-a-native-graphical-boot).
+The corrected collector's effect on physical startup and Plasma remains
+unverified. The journal-flush unit's 11.21-second elapsed interval in this
+physical capture must not be described as pure disk-flush time: journald
+reports 1.46 seconds for its own flush operation.
+
 ### Linux Navi22 initialization comparison
 
 Reference checkout: `~/git/linux` at `ecd997b0189a`. This is a mapping of

@@ -1356,6 +1356,57 @@ mounted writable unless the command line says `ro`.
   console. Log in with your normal user or root password (PAM, from the
   installed `/etc/shadow`). The USB keyboard is the input.
 
+### Capturing a native graphical boot
+
+The maintained collector lives in `verification/data/host-capture/`. It runs
+only with `narf.disks=root-rw` and preserves independent kernel, journal,
+service, seat and process streams under `/narf-diagnostics/plasma-<boot-id>`.
+Build its userspace stream helper on the target distribution:
+
+```sh
+mkdir -p target/host-capture
+cc -O2 -std=c11 -Wall -Wextra -Werror \
+  verification/data/host-capture/narf-capture-stream.c \
+  -o target/host-capture/narf-capture-stream
+python3 verification/data/host-capture/test_batch_stream.py
+bash -n verification/data/host-capture/narf-plasma-capture
+```
+
+For a host that already has `narf-plasma-capture.service` enabled, update
+both executables together; `install -b` retains the previous files:
+
+```sh
+sudo install -b -m 0755 target/host-capture/narf-capture-stream \
+  verification/data/host-capture/narf-plasma-capture /usr/local/libexec/
+```
+
+For a first installation, also install and enable the service:
+
+```sh
+sudo install -m 0644 verification/data/host-capture/narf-plasma-capture.service \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable narf-plasma-capture.service
+```
+
+Version `10-buffered-stream-helper` corrects a diagnostic observer effect.
+The previous shell stream reader issued roughly one read per byte, and
+shell `printf` split buffered samples into many small writes. The helper
+batches both reads and writes in 16 KiB blocks, flushes partial blocks after
+two seconds, and preserves accepted partial data on EOF or SIGTERM/SIGINT.
+Process-map copies also use bulk reads and writes. Host regressions check
+exact bytes, syscall counts, timed partial flush and normal-stop flush.
+Disposable NARF/Btrfs boots reproduced the old collector's startup delay;
+changing only its reads was insufficient. The corrected collector passed
+boot, byte-preservation and stop-flush checks, and its capture survived a
+clean guest reboot. These are diagnostic reproductions, not statistical
+performance measurements or physical Plasma acceptance.
+
+This collector update does not require a kernel rebuild. Keep the kernel
+revision and collector version separately recorded when assessing a boot.
+An abrupt reset can lose the last buffered fragment and unsynced filesystem
+data; retained logs alone do not establish exactly when the machine stopped.
+
 ### What fails, and why that is harmless
 
 The QEMU acceptance run (`cargo xtask cachyos-root-smoke`, below) boots a
