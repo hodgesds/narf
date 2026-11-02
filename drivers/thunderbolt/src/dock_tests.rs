@@ -440,48 +440,23 @@ impl DockModel {
         ]
     }
 
-    /// Walk the composed PCIe tunnel's forward hop chain:
-    /// PCIe-DOWN adapter (fixed endpoint HopID 8) → allocated
-    /// lane hop on the host's dock link → allocated lane hop on
-    /// the dock's upstream link → PCIe-UP adapter (fixed HopID
-    /// 8). Lane HopIDs are allocated first-free from 8 (USB4
-    /// path setup), so with three tunnels composed they are not
-    /// 8 — the chain is followed by its Next-HopID fields
-    /// instead of pinning the IDs. The invariant fields are
-    /// pinned: valid bits, the PCIe protocol/counter encoding in
-    /// word 1's low half, and the buffer-allocation credit (2,
-    /// from the Switch-space allocation table) in the lane hops'
-    /// credit field.
+    /// Follow each direction independently. A source protocol adapter's
+    /// Next-HopID addresses the *peer router's* ingress lane, not its own
+    /// egress lane. The peer lane forwards to protocol adapter HopID 8.
+    /// Lane HopIDs are allocated first-free from 8, independently in each
+    /// direction. Pin all other fields to the USB4 path layout: out-port,
+    /// enable, credit 2, priority 2, weight 1, and ingress/egress FC.
     fn pcie_chain_ok(&self) -> bool {
-        let down = self.hop(0, 7, 8);
-        if down[0] & (1 << 31) == 0 || down[1] != 0x0200_0201 {
-            return false;
-        }
-        let n1 = (down[0] & 0x7ff) as u16;
-        if n1 < 8 {
-            return false;
-        }
-        let lane_host = self.hop(0, 1, n1);
-        if lane_host[0] & (1 << 31) == 0
-            || lane_host[1] & 0xffff != 0x0201
-            || (lane_host[0] >> 17) & 127 != 2
-        {
-            return false;
-        }
-        let n2 = (lane_host[0] & 0x7ff) as u16;
-        if n2 < 8 {
-            return false;
-        }
-        let lane_dock = self.hop(DOCK_ROUTE, 1, n2);
-        if lane_dock[0] & (1 << 31) == 0
-            || lane_dock[1] & 0xffff != 0x0201
-            || (lane_dock[0] >> 17) & 127 != 2
-            || lane_dock[0] & 0x7ff != 8
-        {
-            return false;
-        }
-        let up = self.hop(DOCK_ROUTE, 7, 8);
-        up[0] & (1 << 31) != 0 && up[1] == 0x0200_0201
+        [(0, DOCK_ROUTE), (DOCK_ROUTE, 0)]
+            .into_iter()
+            .all(|(src, dst)| {
+                let adapter = self.hop(src, 7, 8);
+                let next = (adapter[0] & 0x7ff) as u16;
+                next >= 8
+                    && adapter[0] & !0x7ff == 0x8000_0800
+                    && adapter[1] == 0x0200_0201
+                    && self.hop(dst, 1, next) == [0x8004_3808, 0x0100_0201]
+            })
     }
 }
 
@@ -1126,6 +1101,9 @@ fn usb4_dock_composed_end_to_end() -> TestResult {
     use super::tunnel::{displays, pcie_tunnels, usb3_tunnels, Endpoint, Protocol};
     use narf_power::device_pm::{suspend_all_devices, DeviceSuspendError};
 
+    // Every veto fan-out still visits all registered devices. Exercise only
+    // the synthetic CM; the final Busy verdict must not suspend real HBAs.
+    let _pm_registry = narf_power::device_pm::__test_isolate_registry();
     reset_world();
 
     // ── Stage P: the PD contract that trains the link ────────

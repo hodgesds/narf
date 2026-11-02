@@ -629,7 +629,9 @@ fn keepalive_idle(id: u32) {
         t.keepalive_intvl_ns = 1_000_000_000;
         t.keepalive_cnt = 3;
         let window = narf_scheduler::narf_time::ns_to_cycles(10_000_000_000);
-        t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().saturating_sub(window);
+        // Timer elapsed time uses wrapping subtraction. Match it even when
+        // this split-suite boot has not yet been up for the idle window.
+        t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().wrapping_sub(window);
     });
 }
 
@@ -678,7 +680,7 @@ fn smoke_keepalive_answered_probe_keeps_connection() -> TestResult {
     for _ in 0..4 {
         let _ = __with_tcb_mut(id, |t| {
             let window = narf_scheduler::narf_time::ns_to_cycles(10_000_000_000);
-            t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().saturating_sub(window);
+            t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().wrapping_sub(window);
         });
         tick(id);
     }

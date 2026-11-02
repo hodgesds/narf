@@ -3233,6 +3233,7 @@ mod tests {
                 perms: narf_memory::RegionPerms::READ
                     | narf_memory::RegionPerms::WRITE
                     | narf_memory::RegionPerms::SHARED
+                    | narf_memory::RegionPerms::EXTERNAL_REFS
                     | narf_memory::RegionPerms::FILE_DEMAND,
                 phys: alloc::vec![].into(),
             })

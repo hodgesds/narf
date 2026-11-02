@@ -2095,7 +2095,7 @@ pub mod tests {
 
     fn smoke_pm_hook_through_service() -> TestResult {
         __reset_hooks_for_test();
-        narf_power::device_pm::__reset_for_test();
+        let _pm_registry = narf_power::device_pm::__test_isolate_registry();
         __reset_pm_for_test();
         __seed_suspended_for_test(fixture_snapshot(7));
         register_suspend_state_hook(Arc::new(IntelGpuSuspendHook));

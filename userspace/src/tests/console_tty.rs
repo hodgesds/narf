@@ -577,20 +577,17 @@ kernel_test_in!("userspace", smoke_tty_background_read_raises_sigttin);
 // anywhere along the way is caught by a single failing test.
 //
 // Steps:
-//   1. Pre-load "echo hello world\n" into the BYTE_RING (simulates QEMU
-//      `-serial stdio` typing).
+//   1. Pre-load keyboard events for "echo hello world\n" into the key ring.
 //   2. sys_read on fd 0 — must drain the full line into a buffer.
 //   3. Parse the line shell-style: split on first space, take "hello world"
 //      as `rest`. Mirror userspace/shell/src/main.rs:1560-1564's built-in
 //      echo (write rest, write NEWLINE).
-//   4. sys_write each segment on fd 1 — routes through ConsoleFile::write
-//      → narf_console::Writer → write_str → klog::record.
-//   5. the kernel log must hold a "hello world" record logged after step 4.
+//   4. sys_write each segment on fd 1 through ConsoleFile and tty OPOST.
+//   5. Capture the VT's device output and require "hello world\r\n";
+//      userspace tty output must not create a kernel log record.
 //
-// We can't observe the real UART backend in a kernel-test (no QEMU stdio
-// hooked to the SUT's COM1 in test mode), but klog is fed unconditionally
-// upstream of the backend, so it's a faithful proxy for "the bytes left
-// the userspace task and reached the platform console layer."
+// Select the VT so its existing framebuffer hook observes the actual output
+// sink without conflating terminal output with printk.
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_echo_hello_world_end_to_end() -> TestResult {
@@ -600,6 +597,33 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
     // so the scoped opt-in is what keeps the fixture working without weakening
     // the production predicate. See `handlers::kernel_buffers_guard`.
     let _kbuf = crate::handlers::kernel_buffers_guard();
+    use narf_filesystem::console_tty::{self, ConsoleConfig};
+    static OUTPUT: IrqSafeSpinLock<alloc::vec::Vec<u8>> =
+        IrqSafeSpinLock::new(alloc::vec::Vec::new());
+    fn capture(bytes: &[u8]) {
+        OUTPUT.lock().extend_from_slice(bytes);
+    }
+    struct OutputGuard {
+        config: Option<ConsoleConfig>,
+        fb_hook: usize,
+        termios: [u8; 60],
+    }
+    impl Drop for OutputGuard {
+        fn drop(&mut self) {
+            console_tty::VT.set_termios(self.termios);
+            let _ = console_tty::__test_swap_config(self.config.take());
+            narf_console::restore_fb_hook(self.fb_hook);
+            OUTPUT.lock().clear();
+        }
+    }
+    let _output = OutputGuard {
+        config: console_tty::__test_swap_config(Some(console_tty::parse_console_config(
+            "console=tty0",
+        ))),
+        fb_hook: narf_console::take_fb_hook(),
+        termios: console_tty::VT.termios(),
+    };
+    narf_console::set_fb_hook(capture);
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -626,12 +650,33 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Step 1: stuff "echo hello world\n" into the global ASCII byte ring,
-    // exactly as the IRQ-4 serial RX handler would on real bytes typed
-    // into `qemu -serial stdio`.
+    // Step 1: keyboard events enter the same ring as the keyboard driver.
     const LINE: &[u8] = b"echo hello world\n";
-    for &b in LINE {
-        narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+    use narf_input::KeyCode as K;
+    for code in [
+        K::E,
+        K::C,
+        K::H,
+        K::O,
+        K::Space,
+        K::H,
+        K::E,
+        K::L,
+        K::L,
+        K::O,
+        K::Space,
+        K::W,
+        K::O,
+        K::R,
+        K::L,
+        K::D,
+        K::Enter,
+    ] {
+        narf_input::push_global(narf_input::InputEvent::Key(narf_input::KeyEvent {
+            code,
+            pressed: true,
+            modifiers: narf_input::Modifiers::from_bits_truncate(0),
+        }));
     }
 
     // Force the per-task fd table to materialise with fd 0/1/2 wired
@@ -709,8 +754,8 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
         return TestResult::Fail("parse: cmd != echo");
     }
 
-    // Note the log's next record *before* we write so we can find the new
-    // records after (sequence numbers survive eviction; byte offsets don't).
+    // Discard input echo; observe only the shell's two output writes.
+    OUTPUT.lock().clear();
     let pre_seq = narf_console::klog::next_seq();
 
     // Step 4: sys_write on fd 1 — the body, then a newline. Two calls
@@ -754,20 +799,23 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
         }
     }
 
-    // Step 5: the two writes must have produced ONE "hello world" record
-    // (the fragment waits for its newline) among the records logged since.
+    // Step 5: tty OPOST expands the newline at the device sink, while the
+    // kernel log remains independent of userspace terminal output.
+    let output = OUTPUT.lock().clone();
     let post = narf_console::klog::text_since(pre_seq);
     let needle: &[u8] = b"hello world\n";
-    let found = post.windows(needle.len()).any(|w| w == needle);
+    let logged = post.windows(needle.len()).any(|w| w == needle);
 
     fd::__test_reset();
     __test_clear_global();
 
-    if found {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("klog did not contain \"hello world\\n\" after sys_write on fd 1")
+    if output != b"hello world\r\n" {
+        return TestResult::Fail("console output did not contain the two echo writes after OPOST");
     }
+    if logged {
+        return TestResult::Fail("userspace echo output leaked into the kernel log");
+    }
+    TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_echo_hello_world_end_to_end);

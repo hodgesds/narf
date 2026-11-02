@@ -49,6 +49,11 @@ Already-snapshotted callbacks retain their own references; drivers must reject
 removed hardware. IGC uses the existing device callbacks for S3/runtime PM and
 restores configured wake/PHY/clock/queue state across its transitions.
 
+Synchronous kernel fixtures isolate fan-outs with
+`device_pm::__test_isolate_registry() -> TestRegistryGuard`. The guard retains
+probe-owned registrations and restores them in order on drop, including early
+failure returns; synthetic callbacks cannot replace later hardware-test state.
+
 
 ### 3.1 Idle
 
