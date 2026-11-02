@@ -21,6 +21,7 @@ struct Flow {
 struct Tx {
     id: u32,
     deadline: narf_time::Deadline,
+    ap_terminal: Option<alloc::sync::Weak<super::ap_tx::Terminal>>,
 }
 /// Retained firmware authority of one function: downloads and attaches a
 /// fresh generation on a reset, halted bus (signed selection and assets are
@@ -42,6 +43,7 @@ pub struct Adapter<B: Bus> {
     reboot: Option<alloc::boxed::Box<dyn Reboot<B>>>,
     /// A reset bus whose last download was refused, kept for a retry.
     parked: Option<B>,
+    ap: Option<alloc::boxed::Box<super::ap_tx::Owner>>,
 }
 impl<B: Bus> core::fmt::Debug for Adapter<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -71,6 +73,7 @@ where
             failed: false,
             reboot: None,
             parked: None,
+            ap: None,
         })
     }
     /// Retain the firmware authority that a transport reset reboots with.
@@ -107,7 +110,10 @@ where
                 .iter()
                 .position(|tx| tx.id == receipt.id)
                 .ok_or(Error::Malformed)?;
-            self.tx.remove(index);
+            let tx = self.tx.remove(index);
+            if let Some(terminal) = tx.ap_terminal.and_then(|weak| weak.upgrade()) {
+                terminal.complete(receipt);
+            }
         }
         if self.tx.iter().any(|tx| tx.deadline.expired()) {
             return Err(Error::Timeout);
@@ -142,7 +148,7 @@ where
                 self.closing = false;
             }
         }
-        if self.peer.is_none() || self.closing {
+        if self.peer.is_none() && self.ap.is_none() || self.closing {
             while inner.pop_received().is_some() {}
         }
         Ok(count)
@@ -159,6 +165,160 @@ where
     const EXTERNAL_CLM: bool = false;
     const BAND_5GHZ: bool = true;
     const VHT80: bool = true;
+    // This native adapter belongs to the admitted BCM43602 PCIe profile;
+    // publication additionally requires its actual retained physical source.
+    const PRIMARY_AP: bool = true;
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        self.inner.as_ref()?.ap_source()
+    }
+    fn ap_enter(&mut self, original: super::ap_scope::Capture) -> Result<(), Error> {
+        if !original.lifecycle() {
+            return Err(Error::Authority);
+        }
+        if self.failed
+            || self.peer.is_some()
+            || self.ap.is_some()
+            || self.closing
+            || !self.tx.is_empty()
+            || !self.flows.is_empty()
+        {
+            return Err(Error::Busy);
+        }
+        let inner = self.inner.as_ref().ok_or(Error::Failed)?;
+        if !inner.ap_owns(&original.native) {
+            return Err(Error::Authority);
+        }
+        original.current().map_err(|_| Error::Authority)?;
+        self.ap = Some(alloc::boxed::Box::new(super::ap_tx::Owner { original }));
+        Ok(())
+    }
+    fn ap_send(
+        &mut self,
+        bytes: &[u8],
+        priority: u8,
+        original: &super::ap_scope::Capture,
+    ) -> Result<super::ap_tx::Ticket, Error> {
+        if !original.transmit(bytes) {
+            return Err(Error::Authority);
+        }
+        if self.failed || self.closing {
+            return Err(Error::Failed);
+        }
+        self.ap
+            .as_ref()
+            .ok_or(Error::Unsupported)?
+            .admits(original)?;
+        if !self
+            .inner
+            .as_ref()
+            .ok_or(Error::Failed)?
+            .ap_owns(&original.native)
+        {
+            return Err(Error::Authority);
+        }
+        // Retain this exact original before consuming native input. An
+        // actual event must be applied by the AP owner before any flow/TX
+        // publication; it cannot be hidden behind a positive poll budget.
+        // A bounded unfinished prefix defers, never invents an Idle receipt.
+        let mut idle = false;
+        for _ in 0..4 {
+            if !self.events.is_empty() {
+                return Err(Error::Busy);
+            }
+            let progress = self.progress()?;
+            if !self.events.is_empty() {
+                return Err(Error::Busy);
+            }
+            if progress == 0
+                && self
+                    .inner
+                    .as_mut()
+                    .ok_or(Error::Failed)?
+                    .ap_completed_idle()
+                    .map_err(map)?
+            {
+                idle = true;
+                break;
+            }
+        }
+        if !idle {
+            return Err(Error::Busy);
+        }
+        self.ap.as_ref().ok_or(Error::Failed)?.admits(original)?;
+        let id = self.begin_data(bytes, priority, Some(original))?;
+        let (ticket, terminal) = super::ap_tx::Ticket::new(id, original.clone());
+        self.tx
+            .iter_mut()
+            .find(|tx| tx.id == id)
+            .ok_or(Error::Failed)?
+            .ap_terminal = Some(terminal);
+        Ok(ticket)
+    }
+    fn ap_leave(&mut self) -> Result<bool, Error> {
+        if self.ap.is_none() {
+            return Ok(true);
+        }
+        self.closing = true;
+        self.progress()?;
+        if self.closing || !self.tx.is_empty() || !self.flows.is_empty() {
+            return Ok(false);
+        }
+        self.ap = None;
+        Ok(true)
+    }
+    fn ap_completed_prefix(&mut self) -> Result<bool, Error> {
+        if !self.events.is_empty() {
+            return Ok(false);
+        }
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .ap_completed_idle()
+            .map_err(map)
+    }
+    fn ap_quiet(&mut self) -> Result<bool, Error> {
+        if self.ap.is_none() {
+            return Err(Error::Unsupported);
+        }
+        self.progress()?;
+        if !self.events.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.tx.is_empty()
+            && self
+                .inner
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .ap_completed_idle()
+                .map_err(map)?)
+    }
+    fn ap_retire_peer(&mut self, peer: [u8; 6]) -> Result<bool, Error> {
+        if self.ap.is_none() || !super::ap_wire::unicast(peer) {
+            return Err(Error::Unsupported);
+        }
+        self.progress()?;
+        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
+        let mut pending = false;
+        for flow in self.flows.iter().filter(|flow| flow.destination == peer) {
+            match inner.flow_state(flow.token).map_err(map)? {
+                FlowState::Open => {
+                    pending = true;
+                    match inner.close_flow(flow.token) {
+                        Ok(()) | Err(runtime::Error::Busy) => {}
+                        Err(error) => return Err(map(error)),
+                    }
+                }
+                FlowState::Creating | FlowState::Deleting => pending = true,
+                FlowState::Closed => {}
+            }
+        }
+        // The retained flow cache removes Closed only after its correlated
+        // native completion. Refused DELETE now fail-stops rather than
+        // granting a false success/reuse fence (independent baseline repair).
+        Ok(!pending
+            && !self.flows.iter().any(|flow| flow.destination == peer)
+            && inner.ap_completed_idle().map_err(map)?)
+    }
     async fn command<'a>(
         &'a mut self,
         direction: Direction,
@@ -333,6 +493,7 @@ where
             failed: false,
             reboot: self.reboot.take(),
             parked: None,
+            ap: None,
         })
     }
     fn transport_failed(&self) -> bool {
@@ -366,15 +527,44 @@ where
         self.events.pop_front()
     }
     fn pop_data(&mut self) -> Option<Vec<u8>> {
-        if self.peer.is_none() || self.closing {
+        if self.peer.is_none() && self.ap.is_none() || self.closing {
             return None;
         }
         self.inner.as_mut()?.pop_received()
     }
     fn send_data(&mut self, frame: &[u8], priority: u8) -> Result<(), Error> {
-        if self.failed || self.peer.is_none() {
+        if self.failed || self.peer.is_none() || self.ap.is_some() {
             return Err(Error::Failed);
         }
+        self.begin_data(frame, priority, None).map(|_| ())
+    }
+    fn set_link(&mut self, peer: Option<[u8; 6]>) {
+        if self.ap.is_some() {
+            // A station lifecycle can never open/retag an actual AP owner.
+            if peer.is_some() {
+                self.fail();
+            }
+            return;
+        }
+        if self.peer == peer {
+            return;
+        }
+        if self.peer.is_some() {
+            self.closing = true;
+        }
+        self.peer = peer;
+    }
+}
+impl<B: Bus + Send> Adapter<B>
+where
+    B::Memory: Send,
+{
+    fn begin_data(
+        &mut self,
+        frame: &[u8],
+        priority: u8,
+        original: Option<&super::ap_scope::Capture>,
+    ) -> Result<u32, Error> {
         if self.closing {
             return Err(Error::Busy);
         }
@@ -382,6 +572,9 @@ where
             return Err(Error::Malformed);
         }
         let inner = self.inner.as_mut().ok_or(Error::Failed)?;
+        if let Some(original) = original {
+            original.current().map_err(|_| Error::Authority)?;
+        }
         let source = frame[6..12].try_into().unwrap();
         let destination = frame[..6].try_into().unwrap();
         let token = if let Some(flow) = self.flows.iter().find(|f| {
@@ -393,7 +586,14 @@ where
         }) {
             flow.token
         } else {
-            let token = match inner.open_flow(source, destination, priority) {
+            let opened = if let Some(original) = original {
+                original
+                    .publish(|| inner.open_flow(source, destination, priority))
+                    .map_err(|_| Error::Authority)?
+            } else {
+                inner.open_flow(source, destination, priority)
+            };
+            let token = match opened {
                 Ok(token) => token,
                 Err(runtime::Error::Exhausted) => {
                     // A bounded cache may evict an idle destination, but
@@ -420,23 +620,20 @@ where
             });
             return Err(Error::Busy);
         };
-        let id = inner
-            .send_with_priority(token, frame, priority)
-            .map_err(map)?;
+        let published = if let Some(original) = original {
+            original
+                .publish(|| inner.send_with_priority(token, frame, priority))
+                .map_err(|_| Error::Authority)?
+        } else {
+            inner.send_with_priority(token, frame, priority)
+        };
+        let id = published.map_err(map)?;
         self.tx.push(Tx {
             id,
             deadline: narf_time::Deadline::after_ms(2000),
+            ap_terminal: None,
         });
-        Ok(())
-    }
-    fn set_link(&mut self, peer: Option<[u8; 6]>) {
-        if self.peer == peer {
-            return;
-        }
-        if self.peer.is_some() {
-            self.closing = true;
-        }
-        self.peer = peer;
+        Ok(id)
     }
 }
 fn map(error: runtime::Error) -> Error {

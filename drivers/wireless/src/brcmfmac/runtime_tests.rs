@@ -31,6 +31,7 @@ struct Firmware {
 }
 #[derive(Default)]
 struct State {
+    ap_authority: Option<Rc<core::sync::atomic::AtomicBool>>,
     registers: BTreeMap<u32, u32>,
     tcm: BTreeMap<u32, u8>,
     dma: BTreeMap<u64, Vec<u8>>,
@@ -194,6 +195,13 @@ impl boot::Bus for Model {
 }
 impl runtime::Bus for Model {
     type Memory = Mem;
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        self.0
+            .lock()
+            .ap_authority
+            .clone()
+            .map(super::ap_source::Source::fixture)
+    }
     fn allocate(&mut self, len: usize) -> Result<Mem, runtime::Error> {
         let mut s = self.0.lock();
         if s.fail_allocate == Some(s.allocated) {

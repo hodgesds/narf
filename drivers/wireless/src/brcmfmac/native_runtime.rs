@@ -585,6 +585,14 @@ impl boot::Bus for PcieBackplane {
     }
 }
 impl runtime::Bus for PcieBackplane {
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        self.qualified().ok()?;
+        Some(super::ap_source::Source::pci(
+            self.cap,
+            self.proof.clone(),
+            self.device,
+        ))
+    }
     type Memory = narf_io::DmaBuffer;
     fn allocate(&mut self, length: usize) -> Result<Self::Memory, runtime::Error> {
         self.qualified().map_err(|_| runtime::Error::Access)?;

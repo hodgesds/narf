@@ -18,6 +18,8 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
+#[path = "interface_ap.rs"]
+mod ap;
 
 struct State<R: Fullmac> {
     station: Station<R>,
@@ -25,10 +27,14 @@ struct State<R: Fullmac> {
     tx: Consumer<Frame, TX_RING_N>,
     pending: Option<PendingTx>,
     telemetry: Arc<super::telemetry::Counters>,
+    ap: Option<Box<crate::brcmfmac::ap::Session>>,
+    ap_data_generation: u64,
+    ap_epoch_changed: bool,
 }
 struct PendingTx {
     frame: Frame,
     deadline: narf_time::Deadline,
+    original: Option<crate::brcmfmac::ap_scope::Capture>,
 }
 struct Received {
     epoch: u64,
@@ -74,6 +80,7 @@ impl<R: Fullmac> State<R> {
         self.pending = Some(PendingTx {
             frame,
             deadline: narf_time::Deadline::after_ms(2000),
+            original: None,
         });
     }
     fn drop_frame(&self, frame: &Frame) {
@@ -84,6 +91,9 @@ impl<R: Fullmac> State<R> {
     /// One synchronous progress step, shared by the timer and kernel
     /// network drains. Waiting for credits never retains the async mutex.
     fn progress(&mut self) -> Result<(), Error> {
+        if self.ap.is_some() {
+            return self.ap_progress();
+        }
         if let Err(error) = self.station.poll() {
             self.clear_transmit();
             return Err(error);
@@ -100,6 +110,7 @@ impl<R: Fullmac> State<R> {
                     self.pending = Some(PendingTx {
                         frame,
                         deadline: narf_time::Deadline::after_ms(2000),
+                        original: None,
                     });
                 }
             }
@@ -173,12 +184,14 @@ pub(crate) struct Lifecycle {
     /// Cleared by a disconnect. Host-supplicant (`External`) associations
     /// are not retained: their keys live in userspace.
     request: IrqSafeSpinLock<Option<AssociateRequest>>,
+    ap: ap::Host,
 }
 impl Default for Lifecycle {
     fn default() -> Self {
         Self {
             withdrawn: AtomicBool::new(false),
             request: IrqSafeSpinLock::new(None),
+            ap: ap::Host::new(),
         }
     }
 }
@@ -283,6 +296,11 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
     narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Authority)?;
     let station =
         Station::initialize_live(runtime, clm, Arc::new(super::station::GlobalPolicy)).await?;
+    let ap_capable = R::PRIMARY_AP
+        && station
+            .runtime
+            .ap_source()
+            .is_some_and(|source| source.current().is_ok());
     let telemetry = Arc::new(super::telemetry::Counters::default());
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
@@ -304,6 +322,9 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             tx: tx_consumer,
             pending: None,
             telemetry,
+            ap: None,
+            ap_data_generation: 0,
+            ap_epoch_changed: false,
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
@@ -345,6 +366,12 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         Family::Pcie => send_pcie,
     };
     narf_net::iface::register(name, device.mac, send);
+    *device.lifecycle.ap.identity.lock() = narf_net::iface::lookup(name);
+    device
+        .lifecycle
+        .ap
+        .capable
+        .store(ap_capable, Ordering::Release);
     narf_net::iface::set_link_state(name, false);
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
@@ -382,6 +409,7 @@ impl<R: Fullmac + 'static> Device<R> {
         if self.lifecycle.withdrawn.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.lifecycle.ap.retire();
         self.close_host();
         {
             let mut active = active_slot(R::FAMILY).lock();
@@ -406,6 +434,9 @@ impl<R: Fullmac + 'static> Device<R> {
         self.withdraw();
         let mut state = self.state.lock().await;
         state.clear_transmit();
+        if let Some(ap) = state.ap.as_mut() {
+            ap.fail();
+        }
         state.station.bssid = None;
         let proof = state.station.runtime.stop_transport().await.is_ok();
         let released = state.station.runtime.release_transport();
@@ -470,6 +501,9 @@ impl<R: Fullmac + 'static> Device<R> {
     }
 
     fn step(&self) -> Vec<Received> {
+        if self.ap_mode() == 3 {
+            return Vec::new();
+        }
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
@@ -790,6 +824,9 @@ impl<R: Fullmac + 'static> Device<R> {
     /// Platform roaming policy (Linux brcmfmac `roamoff`): enable or
     /// disable the firmware roaming engine while disconnected.
     pub async fn set_firmware_roaming(&self, enabled: bool) -> Result<(), WirelessError> {
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         let mut state = self.state.lock().await;
         state
             .station
@@ -808,11 +845,16 @@ impl<R: Fullmac + 'static> Device<R> {
                 wake = state.station.runtime.wake_source();
             }
             let seen = wake.as_ref().map(|(signal, _)| signal.count());
-            self.deliver_received(self.step());
-            self.apply_roam().await;
-            self.apply_external().await;
-            self.apply_power_save().await;
-            self.apply_pmksa().await;
+            if self.ap_mode() == 3 {
+                self.ap_worker().await;
+                self.ap_drain();
+            } else {
+                self.deliver_received(self.step());
+                self.apply_roam().await;
+                self.apply_external().await;
+                self.apply_power_save().await;
+                self.apply_pmksa().await;
+            }
             match (&wake, seen) {
                 (Some((signal, delivered)), Some(seen)) => {
                     // brcmf_pcie_isr_thread wakes msgbuf service; the timer
@@ -832,7 +874,13 @@ impl<R: Fullmac + 'static> Device<R> {
 }
 impl<R: Fullmac + 'static> Endpoint for Device<R> {
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
-        if !self.up.load(Ordering::Acquire) || !transmit_admitted(bytes, self.mac) {
+        if !self.up.load(Ordering::Acquire)
+            || if self.ap_mode() == 3 {
+                !ap::ethernet(bytes)
+            } else {
+                !transmit_admitted(bytes, self.mac)
+            }
+        {
             return Err(());
         }
         let epoch = self.epoch.load(Ordering::Acquire);
@@ -855,10 +903,30 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
             .map_err(|_| ())
     }
     fn drain(&self) -> bool {
-        self.deliver_received(self.step())
+        if self.ap_mode() == 3 {
+            self.ap_drain()
+        } else {
+            self.deliver_received(self.step())
+        }
     }
     fn suspend(&self) -> PmFuture<'_> {
         alloc::boxed::Box::pin(async move {
+            if self.ap_mode() == 3 {
+                self.ap_carrier(false);
+                let mut state = self.state.lock().await;
+                state.clear_transmit();
+                let State { station, ap, .. } = &mut *state;
+                if let Some(session) = ap.as_mut() {
+                    if let Err(error) = session.stop(station).await {
+                        station.runtime.fail();
+                        let _ = station.runtime.stop_transport().await;
+                        return Err(error);
+                    }
+                }
+                *ap = None;
+                self.ap_retire_staging();
+                return station.runtime.suspend_transport().await;
+            }
             let connected = self.state.lock().await.station.bssid.is_some();
             if connected {
                 let _ = WirelessNetIface::disassociate(self).await;
@@ -919,6 +987,154 @@ impl<R: Fullmac + 'static> Interface for Device<R> {
 }
 #[async_trait::async_trait]
 impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
+    fn supports_ap(&self) -> bool {
+        self.ap_capable()
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        false
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        self.ap_capable()
+    }
+    fn ap_sme_capabilities(&self) -> Option<u32> {
+        self.ap_capable().then_some(0)
+    }
+    fn max_ap_assoc_sta(&self) -> u32 {
+        if self.ap_capable() {
+            8
+        } else {
+            0
+        }
+    }
+    fn current_iftype(&self) -> u32 {
+        self.ap_mode()
+    }
+    fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        self.ap_set_mode(mode)
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        if !self.ap_capable() {
+            return Err(WirelessError::NotSupported);
+        }
+        self.lifecycle.ap.control.try_reserve().map(Some)
+    }
+    async fn start_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), WirelessError> {
+        self.start_ap_with_settings_async(
+            authority,
+            config,
+            narf_wireless::ApStartSettings::default(),
+        )
+        .await
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(
+            authority,
+            ap::Operation::Start(Box::new(config), Box::new(settings)),
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Stop)
+            .await
+            .map(|_| ())
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Beacon(head, tail, probe))
+            .await
+            .map(|_| ())
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Set(station))
+            .await
+            .map(|_| ())
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Delete(peer, reason))
+            .await
+            .map(|_| ())
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::Key(key))
+            .await
+            .map(|_| ())
+            .map_err(ap::errno)
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::DeleteKey(index, pairwise, peer))
+            .await
+            .map(|_| ())
+            .map_err(ap::errno)
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_control(
+            authority,
+            ap::Operation::DefaultKey(index, (unicast, multicast, management, beacon)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(ap::errno)
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control(authority, ap::Operation::Control(request))
+            .await
+            .map_err(ap::errno)
+    }
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         if !self
             .channels
@@ -949,6 +1165,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     }
 
     fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         // The synchronous control plane accepts a desired policy, like the
         // ath11k control worker. Coalesce changes while an IOCTL is in flight;
         // never overwrite terminal failure with a new request.
@@ -980,6 +1199,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         true
     }
     fn add_key(&self, key: narf_wireless::KeyParams) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         // brcmf_cfg80211_add_key: index < BRCMF_MAX_DEFAULT_KEYS; this
         // profile installs CCMP-128 only.
         if key.idx >= super::station::external::MAX_DEFAULT_KEYS
@@ -997,6 +1219,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         Ok(())
     }
     fn del_key(&self, idx: u8, _pairwise: bool, _peer: Option<[u8; 6]>) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         if idx >= super::station::external::MAX_DEFAULT_KEYS {
             return Err(22);
         }
@@ -1007,6 +1232,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         Ok(())
     }
     fn set_port_authorized(&self, peer: [u8; 6], authorized: bool) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         if self.connected_bssid() != Some(peer) {
             return Err(if authorized { 22 } else { 2 });
         }
@@ -1022,6 +1250,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         frame: Vec<u8>,
         _no_encrypt: bool,
     ) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         // EAPOL (and RSN pre-authentication) to the associated AP only.
         if !matches!(proto, 0x888e | 0x88c7) || frame.len() > 1500 {
             return Err(22);
@@ -1057,6 +1288,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         })
     }
     fn set_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         // Linux v1 list rows are {bssid, pmkid}; FILS/SSID-only caching is
         // not a profile here. Full list or missing BSSID is -EINVAL.
         let (Some(bssid), Some(pmkid)) = (entry.bssid, entry.pmkid) else {
@@ -1072,10 +1306,16 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             .map_err(|_| 22)
     }
     fn del_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         let bssid = entry.bssid.ok_or(22)?;
         self.pmksa.lock().delete(bssid).map_err(|_| 22)
     }
     fn flush_pmksa(&self) -> Result<(), i32> {
+        if self.ap_mode() != 2 {
+            return Err(95);
+        }
         self.pmksa.lock().flush();
         Ok(())
     }
@@ -1113,7 +1353,11 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             base_name: self.name.clone(),
             base_mac: self.mac,
             bands,
-            modes: WirelessModes::STATION,
+            modes: if self.ap_capable() {
+                WirelessModes::STATION | WirelessModes::AP
+            } else {
+                WirelessModes::STATION
+            },
             hw_caps: HwCaps {
                 ht_supported: self.ht_capabilities.iter().any(Option::is_some),
                 vht_supported: self.vht_capabilities.iter().any(Option::is_some),
@@ -1123,16 +1367,23 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         }
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        self.state
-            .lock()
-            .await
-            .station
-            .scan(request)
-            .await
-            .map_err(wireless_error)
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        let mut state = self.state.lock().await;
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        state.station.scan(request).await.map_err(wireless_error)
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         let mut state = self.state.lock().await;
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         if state.station.bssid.is_some() {
             return Err(WirelessError::Busy);
         }
@@ -1172,9 +1423,15 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         result.map_err(wireless_error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         self.lifecycle.request.lock().take();
         self.close_host();
         let mut state = self.state.lock().await;
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         // Close again under the same lock as association/progress publication:
         // an earlier owner may have published up while disconnect waited.
         self.close_host();
@@ -1298,6 +1555,9 @@ mod tests {
             tx,
             pending: None,
             telemetry: Default::default(),
+            ap: None,
+            ap_data_generation: 0,
+            ap_epoch_changed: false,
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);

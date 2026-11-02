@@ -968,6 +968,8 @@ impl<R: Fullmac> Station<R> {
 #[path = "station_policy.rs"]
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
+#[path = "station_ap.rs"]
+pub(crate) mod ap;
 
 #[path = "station_external.rs"]
 pub mod external;

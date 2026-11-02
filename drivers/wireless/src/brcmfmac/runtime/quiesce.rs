@@ -67,6 +67,7 @@ impl<B: Bus> Runtime<B> {
             return Err(Error::Busy);
         }
         // brcmf_bus_change_state(BRCMF_BUS_DOWN): no further H2D posts.
+        self.ap_live.store(false, Ordering::Release);
         self.down = true;
         if let Some(mailbox) = self.mailbox.as_mut() {
             mailbox.d3_acked = false;
@@ -82,6 +83,7 @@ impl<B: Bus> Runtime<B> {
                 if !self.failed {
                     // Timeout: Linux returns the bus to UP and fails suspend.
                     self.down = false;
+                    self.ap_live = Arc::new(AtomicBool::new(true));
                     let _ = self.intr_enable();
                 }
                 Err(error)
@@ -128,6 +130,7 @@ impl<B: Bus> Runtime<B> {
             return Err(Error::Failed);
         }
         self.down = false;
+        self.ap_live = Arc::new(AtomicBool::new(true));
         self.intr_enable()?;
         let db1 = self.hostrdy_db1;
         self.bus.host_ready(db1)?;

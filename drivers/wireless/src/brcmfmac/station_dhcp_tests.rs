@@ -14,6 +14,8 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::udp_ipv4;
 
+#[path = "ap_native_tests.rs"]
+mod ap_native_tests;
 #[path = "channel_station_tests.rs"]
 mod channel_station_tests;
 #[path = "ht40_tests.rs"]
@@ -85,6 +87,9 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
             tx,
             pending: None,
             telemetry: telemetry.clone(),
+            ap: None,
+            ap_data_generation: 0,
+            ap_epoch_changed: false,
         }),
         name: name.clone(),
         mac: OWN,

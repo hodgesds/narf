@@ -786,6 +786,102 @@ before returning — plus a `PerDomain` `alloc_coherent` that maps into that
 device's domain. Today `IommuDomain::detach`/`unmap` only adjust counters
 and `PerDomain` map/unmap return `NotMapped`.
 
+### Primary-bsscfg firmware-SME AP
+
+The exact retained BCM43602 PCIe adapter opts into `Fullmac::PRIMARY_AP`.
+`interface::Device<Adapter>` exposes mode3 only after native initialization
+and an actual original PCI/firmware source are available. Mode changes require
+an administratively down, disconnected, operation-free physical owner. A
+nonwrapping mode generation and exclusive native-control reservation bind
+each asynchronous public AP request. No virtual bsscfg, P2P or station-BSSID
+alias is created. The common CYW43439 SDIO implementation keeps the default
+false; this PCIe composition does not qualify CYW43439 AP support.
+
+`ap::Session` implements primary interface0/bsscfg0 legacy20 on admitted
+2.4/5GHz channels. It retains the original signed-domain Arc, native channel
+inventory, occupied-span transmit permission, and original source/role guards.
+An equal-byte policy replacement invalidates the old owner. START validates
+the entire request before mutation, disables native HT/VHT/WMM and unsupported
+ARP/ND offloads, performs the real DOWN/INFRA/AP/chanspec/UP/security/SSID
+transactions, and checks actual native AP/rate/BSS109/beacon-period/DTIM
+readbacks. These observations establish native BSS configuration, not an
+independent over-air beacon receipt. Standard beacon/TIM/DTIM generation is
+firmware-owned. SET_BEACON supports validated native vendor-IE replacement;
+standard rate/security/geometry changes are refused before publication.
+Optional offload GET/SET `BCME_UNSUPPORTED` is handled explicitly: no invented
+saved zero or restoration value. A supported write-only disable remains
+disabled on restoration; an observed enabled but undisablable engine refuses
+AP admission. Missing native evidence never becomes an affirmative receipt.
+
+Firmware is the AP SME. Actual ASSOC_IND/REASSOC_IND payload IEs and matching
+native `sta_info` authentication/association/rate/MAC observations establish
+one of at most8 peers. The frontend advertises `DEVICE_AP_SME` value0 and uses
+prepared NEW/DEL_STATION events; it does not synthesize raw AUTH/ASSOC frames
+or advertise userspace MLME. Open BSS ports require actual native AUTHORIZE;
+WPA2 CCMP AKM1/2 uses userspace EAPOL plus actual `wsec_key` and AUTHORIZE
+receipts. HT/VHT, WMM/UAPSD, PMF/IGTK, WPA1, P2P, extra interfaces, CSA and
+DFS/CAC are unsupported by this bounded AP profile and remain unadvertised.
+
+Pre-START group keys/default choices are zeroizing software staging under
+their original sources. START promotes them only through matching native ADD
+receipts. PRIMARY ADD supplies native CCMP GTK transmit selection; Linux's
+SET_DEFAULT_KEY does not select a different CCMP slot. A software default
+choice can enable group DATA only for that actual most recent native GTK.
+Pairwise index0 and group indices1..3 are admitted; native PN/IPN is neither
+reconstructed nor exported. A physical-owner lifetime fingerprint history
+records material before the first native attempt. An exact current retry
+retains its original receipt/source without reinstalling; retired material
+cannot be reinstalled after delete/readd or BSS replacement. Pairwise DEL_KEY
+uses actual SCB removal, native absence and matching flow/TX retirement,
+because Linux supplies no peer-selective OFF encoding. Group OFF uses the
+documented PRIMARY slot record. Genuine DEL_STATION follows real native loss;
+software port denial alone emits no invented removal event.
+
+Per-destination msgbuf flows preserve original peer/key/port authority across
+bounded completed-input drains, native flow creation and TX publication.
+Existing native IDs retire only on matching request/flow TX_STATUS. Neither
+flow creation nor IOCTL completion supplies packet credit. TX_STATUS here is
+a DMA terminal, not a source-backed independent ACK bit: control-port TX status
+and GET_KEY sequence capability stay false. Forced-clear control TX after a
+PTK install is refused without a native per-frame no-encrypt contract.
+EAPOL can arrive in the same native drain as its outgoing M1/M3 terminal;
+ordinary DATA serialization does not discard that SME response. Ordinary
+0x88c7 preauthentication retains the full original DATA authorization/key
+actors on TX and RX. The unsupported no-preauth endpoint option is refused.
+
+Host receive claims only consumed native descriptor/event plus retained
+BSS/peer/key/port/copy generations. Firmware owns CCMP/replay/SCB internals;
+Ethernet does not disclose hardware key index, PN or SCB generation. The absent
+NO_ENCRYPT event flag supplies no reconstructed encryption assertion. A
+completed-prefix drain is not firmware MAC/FIFO RX-key quiescence. Known-peer
+copies retain counted leases and original epochs across arbitrary prepared
+event callbacks; final native/source/policy/role checks run afterward without
+recapturing an endpoint. Native DATA transitions retire queued host originals
+and in-flight enqueue epochs. Ring and stack publication are independently
+checked. Same-MAC successors require actual native SCB absence, original
+flow/TX retirement and a fresh completed-prefix boundary.
+
+STOP/cancellation closes copies/ports first, performs native BSS withdrawal,
+requires SCB absence plus actual flow/TX terminals, restores known native
+configuration and clears supported key/template slots. A poisoned command
+path escalates to the existing original-owner whole-device stop. Unproved
+stop/DMA ownership remains pinned or quarantined; no timer, dropped waiter,
+card-power assumption or software flag frees it. System suspend stops the AP
+before the existing actual D3 handshake; resume does not replay its BSS/keys.
+Only a fresh START can create a new owner. Source-safe teardown/recovery keeps
+the existing confirmed-stop reclamation rules.
+
+Nine native AP cases are written, unexecuted pending coordinated validation.
+They compose actual CR4/common-ring IOCTL/event/flow/TX/RX records through the
+public `Device` frontend: Open lifecycle and successor, staged keys/ports and
+SCB removal, real MIC/AES-wrapped userspace RSN with same-drain M2/M4, atomic
+admission/optional offloads, more than64 pending events before loss/TX, copied
+SME peer replacement, independent preauth actors, cancelled native key input,
+and policy replacement/system PM. Firmware-internal DATA CCMP/replay and
+physical RF/board interoperability are not claimed by the fixture. Sources
+are local Linux7.3-rc4 `brcmfmac/{cfg80211,core,msgbuf}.c`, `fwil.h` and
+`fwil_types.h`; the handoff saves file hashes and exact source excerpts.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a

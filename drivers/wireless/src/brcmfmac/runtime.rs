@@ -9,6 +9,7 @@ use super::{
     shared::{RingInfo, RINGINFO_SIZE},
 };
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "runtime/mailbox.rs"]
 pub mod mailbox;
@@ -67,6 +68,11 @@ pub trait Bus: BootBus {
     fn park_dma(&mut self) -> Result<(), Error>;
     fn doorbell(&mut self) -> Result<(), Error>;
     fn host_ready(&mut self, db1: bool) -> Result<(), Error>;
+    /// Retain only this actual physical source; unsupported backends cannot
+    /// opt into native AP. The runtime supplies its original live generation.
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        None
+    }
     /// PCIe2-core mailbox registers (Linux `devinfo->reginfo`). `None`
     /// when no PCIe2 core is known: the owner then only services rings.
     fn mailbox(&self) -> Option<mailbox::Reginfo> {
@@ -187,6 +193,7 @@ pub struct Runtime<B: Bus> {
     resources: Option<Resources<B::Memory>>,
     published: bool,
     failed: bool,
+    ap_live: Arc<AtomicBool>,
     next_buffer: u32,
     next_transaction: u16,
     pending: Option<Pending>,
@@ -219,6 +226,7 @@ impl<B: Bus> core::fmt::Debug for Runtime<B> {
 }
 impl<B: Bus> Drop for Runtime<B> {
     fn drop(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
         if self.published && !self.reclaimable {
             self.stop_interrupts();
             let _ = self.bus.park_dma();
@@ -358,6 +366,7 @@ impl<B: Bus> Runtime<B> {
             }),
             published: false,
             failed: false,
+            ap_live: Arc::new(AtomicBool::new(true)),
             next_buffer: 1,
             next_transaction: 0,
             pending: None,
@@ -468,7 +477,44 @@ impl<B: Bus> Runtime<B> {
     pub fn is_failed(&self) -> bool {
         self.failed
     }
+    pub(crate) fn ap_source(&self) -> Option<super::ap_source::Source> {
+        if self.failed || self.down {
+            return None;
+        }
+        self.bus
+            .ap_source()
+            .map(|source| source.retain(&self.ap_live))
+    }
+    pub(crate) fn ap_owns(&self, source: &super::ap_source::Source) -> bool {
+        !self.failed && !self.down && source.belongs_to(&self.ap_live)
+    }
+    /// AP publication rechecks actual producer indices after any RX/event
+    /// repost doorbells. A zero processed count alone could precede a
+    /// completion that those reposts made publishable in this same step.
+    pub(crate) fn ap_completed_idle(&mut self) -> Result<bool, Error> {
+        if self.failed || self.down {
+            return Err(Error::Failed);
+        }
+        let result = (|| {
+            let resources = self.resources.as_ref().ok_or(Error::Failed)?;
+            for ring in &resources.rings[2..5] {
+                let peer = read16(&mut self.bus, ring.wptr)?;
+                if peer >= ring.depth {
+                    return Err(Error::Protocol);
+                }
+                if peer != ring.read {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     pub fn fail(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
         self.failed = true;
         let _ = self.bus.park_dma();
     }

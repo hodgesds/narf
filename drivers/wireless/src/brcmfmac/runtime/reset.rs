@@ -72,6 +72,7 @@ impl<B: Bus> Runtime<B> {
     /// `CPUHALT`, D11 cores disabled) read back from its wrapper. The
     /// caller must have released the IRQ and cleared BME.
     pub async fn reset_device(&mut self) -> Result<u32, Error> {
+        self.ap_live.store(false, Ordering::Release);
         let common = self.core_of(chip::CORE_CHIPCOMMON)?;
         let pcie = self.core_of(chip::CORE_PCIE2)?;
         let arm = self.core_of(chip::CORE_ARM_CR4)?;
@@ -127,6 +128,7 @@ impl<B: Bus> Runtime<B> {
         if !self.reclaimable {
             return Err(alloc::boxed::Box::new(self));
         }
+        self.ap_live.store(false, Ordering::Release);
         // The device can no longer master any of these.
         drop(self.resources.take());
         let mut this = core::mem::ManuallyDrop::new(self);
@@ -140,6 +142,7 @@ impl<B: Bus> Runtime<B> {
             core::ptr::drop_in_place(&mut this.response);
             core::ptr::drop_in_place(&mut this.events);
             core::ptr::drop_in_place(&mut this.signal);
+            core::ptr::drop_in_place(&mut this.ap_live);
             core::ptr::drop_in_place(&mut this.cores);
             Ok(bus)
         }
@@ -148,6 +151,7 @@ impl<B: Bus> Runtime<B> {
     /// lost power, a timed-out or terminal owner). On success all
     /// published memory is reclaimable; any failure keeps it pinned.
     pub async fn stop_dead(&mut self) -> Result<DeadStop, Error> {
+        self.ap_live.store(false, Ordering::Release);
         if self.reclaimable {
             return Err(Error::Busy);
         }

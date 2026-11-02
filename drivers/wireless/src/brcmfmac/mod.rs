@@ -41,6 +41,21 @@
 
 extern crate alloc;
 
+pub(crate) mod ap;
+pub(crate) mod ap_beacon;
+pub(crate) mod ap_key;
+pub(crate) mod ap_keys;
+pub(crate) mod ap_native;
+pub(crate) mod ap_operation;
+pub(crate) mod ap_packet;
+pub(crate) mod ap_peer;
+pub(crate) mod ap_plan;
+pub mod ap_scope;
+pub mod ap_source;
+pub(crate) mod ap_station;
+pub(crate) mod ap_stop;
+pub mod ap_tx;
+pub(crate) mod ap_wire;
 pub mod boot;
 pub mod bus;
 pub mod cfg80211;

@@ -45,6 +45,41 @@ pub trait Fullmac: Send {
     /// Exact attached native family can qualify VHT80 from its firmware.
     /// CYW43439 has no such PHY, regardless of malformed capability replies.
     const VHT80: bool = false;
+    /// Actual primary-bsscfg AP transport owner. SDIO stays conservative
+    /// until its own native AP lifecycle/terminal composition is qualified.
+    const PRIMARY_AP: bool = false;
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        None
+    }
+    fn ap_enter(&mut self, _original: crate::brcmfmac::ap_scope::Capture) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// An actual transport publication returns an owned native terminal
+    /// waiter. Dropping it requests no fabricated DMA release or ACK.
+    fn ap_send(
+        &mut self,
+        _bytes: &[u8],
+        _priority: u8,
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Err(Error::Unsupported)
+    }
+    /// Start actual flow retirement after the concrete AP closed host DATA.
+    /// False means old native IDs/delete receipts are still owned.
+    fn ap_leave(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_completed_prefix(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    /// All actual host TX IDs have matching native terminals. This is not
+    /// an assertion about the firmware's private MAC/RX-key FIFO state.
+    fn ap_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_retire_peer(&mut self, _peer: [u8; 6]) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
     fn command<'a>(
         &'a mut self,
         direction: Direction,

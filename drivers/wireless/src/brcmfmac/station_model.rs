@@ -4,6 +4,8 @@
 use super::*;
 use crate::brcmfmac::station_transport::Adapter;
 use narf_wifi_fixtures::{DhcpServer, NetworkPlan};
+#[path = "ap_model.rs"]
+pub(crate) mod ap_model;
 
 pub(crate) const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 pub(crate) const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -38,6 +40,7 @@ struct Flow {
     depth: u16,
 }
 pub(super) struct Firmware {
+    ap: Option<ap_model::Profile>,
     secured: bool,
     keys_first: bool,
     hold_keys: bool,
@@ -89,6 +92,7 @@ pub(super) struct Firmware {
 impl Firmware {
     fn new(secured: bool) -> Self {
         Self {
+            ap: None,
             secured,
             keys_first: false,
             hold_keys: false,
@@ -163,7 +167,12 @@ impl Firmware {
     pub(super) fn flow(&mut self, descriptor: &[u8]) {
         if descriptor[0] == 3 {
             let id = u16::from_le_bytes(descriptor[22..24].try_into().unwrap());
-            assert_eq!(&descriptor[14..20], &OWN);
+            if self.ap.is_none() {
+                assert_eq!(&descriptor[14..20], &OWN);
+            } else {
+                assert_ne!(&descriptor[14..20], &[0; 6]);
+                assert_eq!(descriptor[14] & 1, 0);
+            }
             assert_eq!(
                 u16::from_le_bytes(descriptor[30..32].try_into().unwrap()),
                 48
@@ -240,6 +249,11 @@ impl Firmware {
         ies
     }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
+        if let Some(ap) = self.ap.as_mut() {
+            if let Some(reply) = ap.command(command, input, maximum) {
+                return reply;
+            }
+        }
         if self
             .policy_clear
             .as_ref()
@@ -591,6 +605,9 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
+        if let Some(ap) = self.ap.as_ref().filter(|ap| ap.handled) {
+            return ap.status;
+        }
         if self.mfp_missing {
             -23
         } else if command == 52 && self.fail_disconnect || self.last_power_save_error {
@@ -600,6 +617,11 @@ impl Firmware {
         }
     }
     pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        if let Some(ap) = &self.ap {
+            if ap.hold(command, input) {
+                return true;
+            }
+        }
         if let Some(p) = &self.mfp_conversation {
             use crate::cyw43439::mfp_fixture::Hold;
             if command == 262
@@ -655,6 +677,10 @@ impl Firmware {
         self.events.push_back(bytes);
     }
     pub(super) fn step(&mut self, state: &mut State, control: &mut super::Firmware) {
+        if let Some(ap) = self.ap.as_mut() {
+            self.events.extend(ap.events.drain(..));
+            self.downlink.extend(ap.downlink.drain(..));
+        }
         while !self.events.is_empty() && !self.event_posts.is_empty() {
             let event = self.events.pop_front().unwrap();
             let (id, address) = self.event_posts.pop_front().unwrap();
@@ -705,7 +731,9 @@ impl Firmware {
                 ethernet.extend_from_slice(&state.dma[&body][..length]);
                 self.uplink.push(ethernet.clone());
                 self.tx_priorities.push((id, tx[22] >> 5));
-                if let Some(reply) = self.server.receive(&ethernet) {
+                if let Some(ap) = self.ap.as_mut() {
+                    ap.transmit(&ethernet);
+                } else if let Some(reply) = self.server.receive(&ethernet) {
                     self.downlink.push_back(reply);
                 }
                 self.tx_history.push((request, body));
@@ -713,6 +741,11 @@ impl Firmware {
                 flow.read = (flow.read + 1) % flow.depth;
             }
             put(state, H2DR + u32::from(id) * 4, &flow.read.to_le_bytes());
+        }
+        // An actual radio peer may answer M1/M3 before the native TX-status
+        // waiter returns. Write its actual RX descriptor in this SAME drain.
+        if let Some(ap) = self.ap.as_mut() {
+            self.downlink.extend(ap.downlink.drain(..));
         }
         if !self.hold_tx {
             while let Some((id, flow)) = self.completions.pop_front() {
@@ -829,6 +862,40 @@ fn scan_result(
 #[derive(Clone)]
 pub(crate) struct Handle(Rc<IrqSafeSpinLock<State>>);
 impl Handle {
+    pub(crate) fn enable_ap(&self) {
+        let mut state = self.0.lock();
+        state.ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));
+        state
+            .firmware
+            .as_mut()
+            .unwrap()
+            .station
+            .as_mut()
+            .unwrap()
+            .ap = Some(ap_model::Profile::default());
+    }
+    pub(crate) fn ap_change<T>(&self, change: impl FnOnce(&mut ap_model::Profile) -> T) -> T {
+        let mut state = self.0.lock();
+        let result = change(
+            state
+                .firmware
+                .as_mut()
+                .unwrap()
+                .station
+                .as_mut()
+                .unwrap()
+                .ap
+                .as_mut()
+                .unwrap(),
+        );
+        firmware_step(&mut state);
+        result
+    }
+    pub(crate) fn ap_revoke(&self) {
+        if let Some(present) = self.0.lock().ap_authority.as_ref() {
+            present.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
     pub(crate) fn prefix_observations(&self) -> ([usize; 3], [usize; 2]) {
         let state = self.0.lock();
         (state.prefixed_completions, state.prefixed_rx_offsets)

@@ -555,6 +555,19 @@ and one release metadata context pass. Full release/native gates remain at25
 completed rows. Counting unvalidated implementations,82 remain; signed actual
 measurements and physical firmware/board acceptance remain separate.
 
+**2026-11-02 — bounded FullMAC AP source recount.** The ledger now holds
+**67 `feature`**, **31 `chip`** and **0 `unknown`** rows. Fifteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. BCM43602 primary-bsscfg AP now
+composes actual firmware-SME, native BSS/TIM/DTIM configuration, per-peer
+key/port/flow/TX terminals and original source/policy/copy/queue ownership through
+the public common Device frontend. Cancelled native commands retain cleanup and
+uncertain DMA. CYW43439 AP remains open and receives no credit from this PCIe
+composition. Nine cases are written and unexecuted; scoped formatting and one
+release metadata context pass. Full release/native gates remain at25 completed
+rows. Counting unvalidated implementations,82 remain; physical firmware/board,
+RF and deployment acceptance remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -566,7 +579,7 @@ measurements and physical firmware/board acceptance remain separate.
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
 | rtw89 | 10 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW and runtime LPS; bounded independent live functions, separately qualified standalone/nested TX A-MSDU and actual periodic DPK RF tracking are implemented pending validation; other AX/BE chips are separate rows |
-| brcmfmac | 11 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation; bounded shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
+| brcmfmac | 10 | Monitor/P2P/virtual roles, WoW/rekey, IOMMU quiescence and shared SDIO stop/reset/rejoin/resume dependencies; other chip/CPU/RAM/OTP profiles are separate chip rows; bounded BCM43602 primary-bsscfg firmware-SME AP and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
@@ -1474,6 +1487,21 @@ shared fallback, with checked original-buffer bounds. Original firmware/PCI,
 posted identities, transaction correlation, key/port and actual matching
 terminal proofs remain mandatory. Family §3 defines the bounded profile;
 six new native cases are written and unexecuted.
+
+### 3.10 Native primary-bsscfg FullMAC AP (validation pending)
+
+The exact BCM43602 PCIe `Fullmac` adapter exposes the common async AP frontend
+only with its retained native source. `PRIMARY_AP` and opaque original
+`ap_enter`/`ap_send`/`ap_leave`, completed-prefix and peer-retirement contracts
+default to unsupported for SDIO. Firmware owns AP SME and standard beacon/TIM/
+DTIM generation; userspace owns WPA2 authentication through actual key/SCB
+receipts. Prepared station/control events, DATA ring/stack copies and queued
+TX retain original source, policy Arc, role, peer/key/port and native epochs
+through final callbacks. Host staging, IOCTL completion or dropped waiters never
+supply native packet/ACK/PN credit. Failure/cancellation drives retained original
+physical teardown and pins uncertain mappings. Family `brcmfmac.md` §3 defines
+the bounded legacy20 Open/WPA2 CCMP profile and explicit unsupported features;
+CYW43439 keeps its independent AP row open. Nine native cases are unexecuted.
 
 ## 4. Interaction with `narf-wireless`
 
