@@ -27,8 +27,8 @@
 > and exact LNL EU-stall observation; reviewed retained combo-B SST stop,
 > per-object BMG i915 ASYNC and default-off exact-TGL HuC upload/auth/query
 > pass debug and release native model gates; i915 context-frequency intent,
-> private context publication and published-media SSEU defaults are implemented
-> pass debug native gates; release/cross-target validation is pending — see §20).
+> private context publication and published-media SSEU defaults
+> pass debug and release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2236,7 +2236,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Retained Gen12 external SST stop | Current observed combo-B HPD, fresh status incarnation, checked retained local-stop/publication/PM gate and exact implemented-plane inventory | Implemented; native fixtures pass |
 | Per-object i915 ASYNC | Live BMG ordinary WB softpin and same-card WB imports, truthful GETPARAM43, selective prior GPU waits, atomic mixed admission and retained terminal/CPU ordering | Implemented; native fixtures pass |
 | Exact-TGL HuC upload/auth/query | Default-off actual firmware/BO/WOPCM, both-pass DMA, typed zero-result CT plus fresh status, current Xe query7/type1 and full-reset reclamation | Implemented; native fixtures pass |
-| i915 context frequency hint | Cached exact GETPARAM59 ABI, proto/create-only immutable intent, retained real GuC policy and private nonce-bound context publication | Implemented; debug native fixtures pass |
+| i915 context frequency hint | Cached exact GETPARAM59 ABI, proto/create-only immutable intent, retained real GuC policy and private nonce-bound context publication | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -3045,11 +3045,11 @@ xe_pat.c for BMG PAT2; xe_uc.c, xe_huc.c, xe_guc.c, xe_uc_fw.c, xe_wopcm.c,
 xe_guc_ct.c, xe_query.c and the corresponding HuC/GuC register/action headers
 for the exact TGL transaction. Public contracts are in spec.md §3.
 
-### i915 context frequency and media SSEU — debug native validation complete
+### i915 context frequency and media SSEU checkpoint
 
-The next batch adds one bounded context-frequency checkpoint and extends the
-existing legacy media query contract. The ledger retains its 61 fully validated
-rows plus one debug-tested row (62 total), with ten broad workstreams open.
+This batch adds one bounded context-frequency checkpoint and extends the
+existing legacy media query contract. The ledger contains 62 implemented
+checkpoint rows, with ten broad workstreams open.
 
 HAS_CONTEXT_FREQ_HINT59 passively writes 1 only for current qualified GuC ABI1
 admission; unsupported state writes signed -22 while the ioctl succeeds.
@@ -3073,15 +3073,17 @@ holes/ignored-class, size/fault/finalization, eight-bit and PTL limits remain.
 A public witness context checks exact retained VM identity after original VM
 name deletion and replacement during reentrant context copyout.
 
-All seventeen new fixtures pass in the debug native kernel: eleven frequency/
-publication and six media SSEU cases. The profile passes 1,878 selected tests:
+All seventeen new fixtures pass: eleven frequency/publication and six
+media SSEU cases. Debug and release each pass 1,878 selected native tests:
 1,208 Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD cases.
 All 1,087 prior Intel names, 122 cumulative new names and 31 backlight
 regressions remain covered, with no failures or duplicate names, no Intel
-skips and one existing shared RNG-registration skip. Host Intel all-target
-Clippy, workspace formatting, diff checks and all 105 frozen source/linker
-hashes pass. Release native, production/btrfs and cross-target gates are running
-on the same frozen source; merge readiness is not claimed. The reset fixtures
-use fresh GuCGt owners, not an actual RuntimeOwner/PCI/S3 coordinator.
-No physical Intel, Mesa, codec or frequency/performance result is claimed.
-Local-memory takeover/allocation and OA remain separate work.
+skips and one existing shared RNG-registration skip. Release production boot
+and both btrfs postflights pass. Target CI Clippy passes all three feature
+contexts on both architectures; all four host GPU vendor configurations pass
+all-target Clippy. Changed-package debug/release builds pass on both targets;
+workspace formatting, diff checks and all 105 frozen source/linker hashes pass.
+aarch64 QEMU is omitted because no aarch64-specific production behavior changes.
+The reset fixtures use fresh GuCGt owners, not an actual RuntimeOwner/PCI/S3
+coordinator. No physical Intel, Mesa, codec or frequency/performance result
+is claimed. Local-memory takeover/allocation and OA remain separate work.

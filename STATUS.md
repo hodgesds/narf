@@ -1778,17 +1778,19 @@ preserves its signed -22 unsupported value; LOW_LATENCY enables by presence
 with the source proto/create phase distinction. Current execution, global
 SLPC, cache publication and terminal/reset lifetimes remain owned by the
 existing backend. All seventeen new fixtures (eleven frequency/publication
-and six SSEU) pass in the debug native kernel. The profile passes 1,878 selected
-tests: 1,208 Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD
-cases. All 1,087 prior Intel names, 122 cumulative new names and 31 backlight
+and six SSEU) pass. Debug and release each pass 1,878 selected native tests:
+1,208 Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD cases.
+All 1,087 prior Intel names, 122 cumulative new names and 31 backlight
 regressions remain covered, with no failures or duplicate names, no Intel
-skips and one existing shared RNG-registration skip. Host Intel all-target
-Clippy, workspace formatting, diff checks and all 105 frozen source/linker
-hashes pass. Release native, production/btrfs and cross-target gates are running
-on the same frozen source; merge readiness is not claimed. The ledger has 61
-fully validated rows plus one debug-tested row (62 total), with ten broad open
-workstreams. Physical Intel/Mesa/codec and actual RuntimeOwner/PCI/S3 acceptance
-remain unrun. Small-BAR GPU-only allocation and OA are separate isolated work.
+skips and one existing shared RNG-registration skip. Release production boot
+and both btrfs postflights pass. Both-target CI Clippy passes all three feature
+contexts; all four host GPU vendor configurations pass all-target Clippy.
+Both-target changed-package debug/release builds, workspace formatting, diff
+checks and all 105 frozen source/linker hashes pass. aarch64 QEMU is omitted
+because no aarch64-specific production behavior changes. The ledger contains
+62 implemented checkpoint rows and ten broad open workstreams. Physical Intel/
+Mesa/codec and actual RuntimeOwner/PCI/S3 acceptance remain unrun. Small-BAR
+GPU-only allocation and OA are separate isolated work.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
