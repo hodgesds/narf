@@ -225,6 +225,32 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   or an Attribute Not Found terminator. Out of scope here: MTU
   exchange (default ATT MTU 23 governs), Read Blob / long reads,
   Prepare / Execute writes, and ATT over BR/EDR.
+  HOGP wiring (issue #1314): the pump's GATT server mounts the HID
+  service (0x1812) as a boot keyboard on every controller —
+  `services::mount_hid_service` publishes HID Information
+  (bcdHID 1.11, country 0, NORMALLY_CONNECTABLE only, no remote
+  wake claim), the HID 1.11 Appendix B.1 boot keyboard Report Map,
+  HID Control Point, Protocol Mode (default Report), and boot
+  keyboard input/output characteristics — always-mounted like
+  GAP/GATT/DIS/Battery, but mount alone does not advertise, and
+  the server cannot emit notifications yet, so a central can read
+  the map and flip Protocol Mode but receives no input reports
+  from this mount. The central half is `hogp_client::HogpClient`,
+  built by `pump::hogp_attach` from GATT discovery records:
+  `pump::hogp_note_last_read` feeds HID Information / Report Map /
+  Report Reference reads, `pump::hogp_protocol_mode_write` (+
+  `hogp_note_boot_mode`) selects boot protocol when Protocol Mode
+  exists, `pump::hogp_subscribe_targets` yields the CCCD targets
+  (NOTIFY wins over INDICATE), and `pump::hogp_route_drained`
+  drains the client notification queue into the `narf_input`
+  global rings — boot keyboard reports diffed (modifier byte, then
+  six-keycode array, rollover suppressed, usages 0x00–0x03 and
+  0xE0–0xE7 filtered) via `push_key`, boot mouse reports via
+  PointerEvent + ButtonEvent. Report-protocol input Reports are
+  staged undecoded (`pump::hogp_take_undecoded`); the Report Map is
+  not parsed, evdev DeviceNode registration is not done, and HID
+  Control Point / boot output reports are not driven — all
+  follow-up.
 
 ## Scope
 
@@ -237,7 +263,7 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 - **HCI pump** (`pump`): supervised per-controller event/ACL pump task
   composing the layers below into a running system — connection table,
   ACL flow control, raw-socket event fan-out, per-connection L2CAP
-  dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery
+  dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery/HID
   services, SMP → Just-Works responder, LE + BR/EDR signalling
   answers). Production `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment

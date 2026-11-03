@@ -57,6 +57,7 @@ pub mod hci_sock;
 pub mod hfp;
 pub mod hid_profile;
 pub mod hogp;
+pub mod hogp_client;
 pub mod l2cap;
 pub mod mesh;
 pub mod mgmt;
