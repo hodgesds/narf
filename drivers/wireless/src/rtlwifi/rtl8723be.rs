@@ -56,6 +56,7 @@
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod btc;
 pub mod c2h;
 pub mod channel;
 pub mod dm;
