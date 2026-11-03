@@ -952,11 +952,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let budget = narf_time::wall::ns_to_cycles(1_000_000);
         let start = narf_time::now_cycles();
         loop {
+            // read_poll_timeout: sample expiry before the read, so the read
+            // that ends a timed-out wait follows the deadline.
+            let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
             let s = self.mmio.read32(PWR_WELL_CTL2);
             if s & state != 0 {
                 return Ok(());
             }
-            if narf_time::now_cycles().wrapping_sub(start) > budget {
+            if expired {
                 return Err(ModesetError::PowerWellTimeout);
             }
             core::hint::spin_loop();
@@ -1753,6 +1756,9 @@ fn wait_bit<M: MmioWindow + ?Sized>(
     let budget = narf_time::wall::ns_to_cycles(timeout_ns);
     let start = narf_time::now_cycles();
     loop {
+        // read_poll_timeout: sample expiry before the read, so the read
+        // that ends a timed-out wait follows the deadline.
+        let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
         let v = mmio.read32(off);
         if v == u32::MAX {
             return false;
@@ -1761,7 +1767,7 @@ fn wait_bit<M: MmioWindow + ?Sized>(
         if asserted == want_set {
             return true;
         }
-        if narf_time::now_cycles().wrapping_sub(start) > budget {
+        if expired {
             return false;
         }
         core::hint::spin_loop();

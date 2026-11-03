@@ -428,11 +428,14 @@ fn wait_for<M: MmioWindow + ?Sized>(
     let budget = narf_time::wall::ns_to_cycles(timeout_ns);
     let start = narf_time::now_cycles();
     loop {
+        // read_poll_timeout: sample expiry before the read, so the read
+        // that ends a timed-out wait follows the deadline.
+        let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
         let v = mmio.read32(off);
         if (v & mask != 0) == want_set {
             return true;
         }
-        if narf_time::now_cycles().wrapping_sub(start) > budget {
+        if expired {
             return false;
         }
         core::hint::spin_loop();
@@ -514,11 +517,14 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
         let budget = narf_time::wall::ns_to_cycles(MSGBUS_TIMEOUT_NS);
         let start = narf_time::now_cycles();
         let val = loop {
+            // read_poll_timeout: an ACK posted before the deadline is read
+            // after expiry is sampled, never discarded by a bus reset.
+            let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
             let v = self.mmio.read32(status_off);
             if v & P2M_RESPONSE_READY != 0 {
                 break v;
             }
-            if narf_time::now_cycles().wrapping_sub(start) > budget {
+            if expired {
                 self.bus_reset(lane);
                 return Err(Cx0Error::Timeout);
             }
@@ -2809,5 +2815,45 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg",
         smoke_xelpg_d2d_disable_and_buffer_status_waits
+    );
+
+    /// A wait whose first read stalls past the whole budget (as if the
+    /// task were preempted there) and still sees the bit clear; the bit is
+    /// set by the time of the next read.
+    struct StalledRead {
+        reads: Cell<u32>,
+    }
+    impl MmioWindow for StalledRead {
+        fn read32(&self, _off: u64) -> u32 {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            if n > 0 {
+                return 1;
+            }
+            let stall = narf_time::wall::ns_to_cycles(4_000_000);
+            let start = narf_time::now_cycles();
+            while narf_time::now_cycles().wrapping_sub(start) <= stall {
+                core::hint::spin_loop();
+            }
+            0
+        }
+        fn write32(&self, _off: u64, _val: u32) {}
+    }
+
+    fn smoke_xelpg_wait_reads_once_more_after_its_deadline() -> TestResult {
+        // read_poll_timeout (iopoll.h) samples expiry before each read and
+        // xe_mmio_wait32 reads once more after its loop: a bit set before
+        // the post-deadline read is success, not a timeout.
+        let stalled = StalledRead {
+            reads: Cell::new(0),
+        };
+        if !wait_for(&stalled, 0x1234, 1, true, 2_000_000) || stalled.reads.get() != 2 {
+            return TestResult::Fail("a bit set before the post-deadline read must be observed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_xelpg_wait_reads_once_more_after_its_deadline
     );
 }

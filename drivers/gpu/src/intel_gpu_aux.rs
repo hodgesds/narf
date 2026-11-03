@@ -357,11 +357,15 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         let start = narf_time::now_cycles();
         let mut ctl = ctl_initial;
         while ctl & AUX_CTL_SEND_BUSY != 0 {
-            if narf_time::now_cycles().wrapping_sub(start) > budget {
-                break;
-            }
+            // read_poll_timeout: sample expiry before the read, so the read
+            // that ends a timed-out wait follows the deadline. A transfer
+            // done by then is returned, not reported as still busy.
+            let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
             core::hint::spin_loop();
             ctl = self.mmio.read32(self.aux_ctl_off());
+            if expired {
+                break;
+            }
         }
         ctl
     }

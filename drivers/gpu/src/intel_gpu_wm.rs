@@ -523,10 +523,13 @@ pub fn request_dbuf_slice<M: MmioWindow + ?Sized>(mmio: &M, slice: u32) -> Resul
     let budget = narf_time::wall::ns_to_cycles(20_000_000);
     let start = narf_time::now_cycles();
     loop {
+        // read_poll_timeout: sample expiry before the read, so the read
+        // that ends a timed-out wait follows the deadline.
+        let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
         if mmio.read32(off) & DBUF_POWER_STATE != 0 {
             return Ok(());
         }
-        if narf_time::now_cycles().wrapping_sub(start) > budget {
+        if expired {
             return Err(DbufError::PowerTimeout);
         }
         core::hint::spin_loop();
