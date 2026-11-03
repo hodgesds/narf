@@ -333,6 +333,14 @@ pub(super) unsafe trait Registers: Send {
     fn dma_reclaimable(&self) -> bool {
         false
     }
+    /// `pci.c::rtw_pci_stop`: reversible ring reset of a quiet packet owner.
+    fn hci_stop(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// `pci.c::rtw_pci_setup` + `rtw_pci_start` after [`Registers::hci_stop`].
+    fn hci_restart(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
@@ -887,6 +895,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         self.io.packet_stop()
+    }
+    fn hci_stop(&mut self) -> Result<(), Error> {
+        self.io.hci_stop()
+    }
+    fn hci_restart(&mut self) -> Result<(), Error> {
+        self.io.hci_restart()
     }
     async fn quiesce_dma(&mut self) -> Result<(), Error> {
         // The beacon page must have completed (fresh BCN_VALID) or been

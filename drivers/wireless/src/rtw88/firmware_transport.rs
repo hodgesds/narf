@@ -572,6 +572,14 @@ pub(super) unsafe trait Io: Send {
     fn claim_swap(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    /// `rtw_hci_stop` (PCI `rtw_pci_stop`): reversible host ring reset.
+    fn hci_stop(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// `rtw_hci_setup` + `rtw_hci_start` after [`Io::hci_stop`].
+    fn hci_restart(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 #[derive(Debug)]
 struct Backup {

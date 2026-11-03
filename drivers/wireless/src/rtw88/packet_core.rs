@@ -84,6 +84,9 @@ pub(super) unsafe trait Port {
 enum Phase {
     Prepared,
     Running,
+    /// `pci.c::rtw_pci_stop` for WoW: rings were reset to index zero with
+    /// every mapping retained; reversible only through [`Core::restart`].
+    Halted,
     Stopped,
     Failed,
 }
@@ -601,6 +604,69 @@ impl Core {
         self.rx_idle = false;
         // BME-off/stop bits do not release published allocations.
         port.stop()
+    }
+}
+impl Core {
+    /// `pci.c::rtw_pci_stop` -> `rtw_pci_dma_release`: only a running core
+    /// with no pending TX and every TX ring retired to the host's index may
+    /// be halted. Unreaped RX frames are dropped by the ring reset exactly
+    /// as Linux drops them. The caller then resets the native ring pointers
+    /// (`rtw_pci_reset_buf_desc`); host indices follow to zero. Unlike
+    /// [`Core::stop`], published buffers stay owned and reusable.
+    pub(super) fn halt(
+        &mut self,
+        index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<(), Error> {
+        if !self.transmit_quiet(index)? {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Halted;
+        self.rx_idle = false;
+        Ok(())
+    }
+    /// The native owner has reset every ring pointer (`rtw_pci_setup`:
+    /// `rtw_pci_reset_buf_desc` + `rtw_pci_dma_reset`, which also zeroes
+    /// `rx_tag`) and re-armed every RX descriptor; mirror the zero indices.
+    pub(super) fn reset_indices(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Halted {
+            return Err(Error::State);
+        }
+        self.tx_host = [0; 5];
+        self.tx_device = [0; 5];
+        self.rx = 0;
+        self.tag = 0;
+        self.rx_idle = false;
+        Ok(())
+    }
+    /// `rtw_pci_start` after [`Core::reset_indices`].
+    pub(super) fn restart(
+        &mut self,
+        mut index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Halted || self.tx_host != [0; 5] || self.rx != 0 || self.tag != 0 {
+            return Err(Error::State);
+        }
+        for q in [
+            Queue::Management,
+            Queue::Data,
+            Queue::Background,
+            Queue::Video,
+            Queue::Voice,
+        ] {
+            if index(q.index())? & 0x0fff_0fff != 0 {
+                self.phase = Phase::Failed;
+                return Err(Error::State);
+            }
+        }
+        if index(0x3b4)? & 0x0fff_0fff != 0 {
+            self.phase = Phase::Failed;
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(super) fn halted(&self) -> bool {
+        self.phase == Phase::Halted
     }
 }
 impl Core {

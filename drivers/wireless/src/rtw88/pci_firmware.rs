@@ -11,6 +11,8 @@ use narf_io::{alloc_coherent_masked, DmaBuffer};
 use narf_lib::id::DomainId;
 #[path = "pci_packet.rs"]
 mod packet;
+#[path = "pci_swap.rs"]
+mod swap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Allocated,
@@ -25,6 +27,9 @@ enum State {
     Commands,
     Calibrated,
     Packets,
+    /// `rtw_hci_stop`: ring pointers reset, BME/CR/mappings retained;
+    /// only `restart_packets` leaves it (or a failure -> Terminal).
+    Halted,
     Terminal,
 }
 struct Tx {
@@ -72,6 +77,8 @@ pub(super) struct Native {
     /// The N2xB 40MHz program is committed (`station_retune_finish` after
     /// widening); HT readbacks then expect the HT40 selection.
     wide: bool,
+    /// State `halt_packets` left; `restart_packets` returns to it.
+    halted_from: Option<State>,
     /// Committed operating primary and completed retune programs.
     channel: u8,
     channel_epoch: u64,
@@ -182,6 +189,7 @@ impl Native {
             retune: None,
             widening: false,
             wide: false,
+            halted_from: None,
             channel: 1,
             channel_epoch: 1,
         };
@@ -267,10 +275,14 @@ impl Native {
                 | State::Commands
                 | State::Calibrated
                 | State::Packets
+                | State::Halted
         ) {
             return Err(Error::State);
         }
-        let active = matches!(self.state, State::Active | State::Commands | State::Packets);
+        let active = matches!(
+            self.state,
+            State::Active | State::Commands | State::Packets | State::Halted
+        );
         let gate = self.packet_gate.clone().map(|g| {
             if self.tracking_maintenance {
                 g.without_power_tracking()
@@ -1638,6 +1650,12 @@ unsafe impl Registers for Native {
     }
     async fn quiesce_dma(&mut self) -> Result<(), Error> {
         self.quiesce().await
+    }
+    fn hci_stop(&mut self) -> Result<(), Error> {
+        self.halt_packets()
+    }
+    fn hci_restart(&mut self) -> Result<(), Error> {
+        self.restart_packets()
     }
     fn dma_reclaimable(&self) -> bool {
         !self.published

@@ -2282,6 +2282,27 @@ either (no `rtw_wow_get_aoac_rpt` in rtw88), so frames the firmware consumed
 while asleep do not raise the host replay floor — identical to Linux.
 Unexecuted case: `smoke_rtw88_wow_security_cam_install_and_clear`.
 
+**Reversible host-DMA stop (`pci_swap.rs`).** `Registers::hci_stop` /
+`hci_restart` (forwarded by `reserved_page::Backend` and
+`firmware_transport::Io`) mirror `pci.c::rtw_pci_stop` and
+`rtw_pci_setup` + `rtw_pci_start`. Stop requires `State::Packets`, no
+pending H2C/mailbox command, no retune or tracking maintenance and a
+transmit-quiet packet core (`packet_core::Core::halt`: every TX ring
+retired to the host index; unreaped RX is dropped as Linux drops it), then
+rewrites the zero HIMRs and runs `rtw_pci_reset_buf_desc` (0x303 |= 0xf7,
+beacon/H2C/BK/BE/VO/VI/MGMT/HI0/RX bases and counts reprogrammed and read
+back, `RWPTR_CLR` 0x39c, `H2CQ_CSR` 0x1330 bits 16|8, every index proved
+zero, host H2C producer back to zero) into the new `State::Halted`. Unlike
+`Port::stop`/`quiesce` it keeps PCI BME, `REG_CR` and every published
+mapping; the halted owner refuses packet work (`transmit_allowed`).
+Restart re-arms all 512 RX descriptors under the packet gate, repeats the
+ring reset, sets `BIT_RST_TRXDMA_INTF | BIT_RX_TAG_EN` (`rtw_pci_dma_reset`),
+zeroes the core's host/device/tag indices (`Core::reset_indices`) and
+proves zero device indices before returning to the halted-from state. NARF
+has no IRQ line, so `rtw_pci_enable_interrupt` is not mirrored (HIMRs stay
+zero). Any failure is `State::Terminal`. Unexecuted case:
+`smoke_rtw88_wow_packet_core_halt_restart_from_zero`.
+
 **Not wired (why the row stays open).** No native backend implements
 `wow::Io` or `firmware_transport::Io::claim_swap` (default `Unsupported`):
 the native reserved-page channel is single-use (`claim_pristine`), plus a

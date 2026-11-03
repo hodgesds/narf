@@ -231,6 +231,11 @@ unsafe impl Port for Native {
             .is_some_and(crate::rtw88::power_policy::Gate::allows_rx_ba)
     }
     fn transmit_allowed(&mut self) -> Result<(), packet::Error> {
+        // A halted owner (`rtw_hci_stop`) admits no packet work until
+        // `restart_packets` re-arms the rings.
+        if self.state == State::Halted {
+            return Err(packet::Error::State);
+        }
         self.check_packet_permission().map_err(access_error)
     }
     fn memory<T>(
@@ -510,6 +515,7 @@ fn smoke_rtw8822ce_native_packet_revocation_precedes_cpu_dma_config_and_mmio(
         retune: None,
         widening: false,
         wide: false,
+        halted_from: None,
         channel: 1,
         channel_epoch: 1,
     };

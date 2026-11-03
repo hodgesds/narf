@@ -1214,3 +1214,48 @@ kernel_test_in!(
     "drivers/wireless/rtw88/tx_ba_all_tids",
     smoke_rtw88_tx_ba_all_tids_native_v1_vo_mixed_and_partial_source_denials
 );
+
+/// `pci.c::rtw_pci_stop` / `rtw_pci_setup` + `rtw_pci_start` on the core:
+/// halt only when TX is retired, refuse packet work while halted, mirror
+/// the native ring reset to index zero and run again from slot zero.
+fn halt_and_restart_from_zero() -> Result<(), &'static str> {
+    let mut model = Model::new();
+    let mut core = Core::prepare(&mut model, OWN, 0).map_err(|_| "prepare")?;
+    core.start(&mut model).map_err(|_| "start")?;
+    let bytes = frame();
+    core.submit(&mut model, &bytes, false)
+        .map_err(|_| "submit")?;
+    if core.halt(|r| model.index(r)).is_ok() {
+        return Err("halted with a pending TX");
+    }
+    model.consumed(Queue::Data);
+    core.poll(&mut model).map_err(|_| "retire")?;
+    core.halt(|r| model.index(r)).map_err(|_| "quiet halt")?;
+    if !core.halted() || core.ready() || core.poll(&mut model).is_ok() {
+        return Err("halted core admitted packet work");
+    }
+    if core.restart(|r| model.index(r)).is_ok() {
+        return Err("restart before the index reset");
+    }
+    // Native `rtw_pci_reset_buf_desc`: RWPTR_CLR zeroes every index.
+    model.indices = [0; 6];
+    model.tag = 0;
+    core.reset_indices().map_err(|_| "reset indices")?;
+    core.restart(|r| model.index(r)).map_err(|_| "restart")?;
+    core.submit(&mut model, &bytes, false)
+        .map_err(|_| "submit after restart")?;
+    if model.raw_index(0x3a8).map(|v| v & 0xfff) != Some(1) {
+        return Err("restarted ring did not publish slot zero");
+    }
+    Ok(())
+}
+fn smoke_rtw88_wow_packet_core_halt_restart_from_zero() -> TestResult {
+    match halt_and_restart_from_zero() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/wow",
+    smoke_rtw88_wow_packet_core_halt_restart_from_zero
+);
