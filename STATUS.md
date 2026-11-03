@@ -2194,6 +2194,32 @@ btrfs postflights pass. GT0 still has no L3 bank entry; a queued unit adds
 it. The debug group pass is deferred to the end of this integration wave.
 None of this has run on physical Intel hardware.
 
+### Shared-GGTT GuC TLB invalidation on both GTs — release gates recorded
+
+NARF now invalidates every GuC's GGTT TLB after each GGTT update, as Linux's
+`xe_ggtt_invalidate` does. Before this, nothing invalidated GT0's GuC TLB, so
+a freed and reused range could leave the GuC holding a stale translation. This
+changes behaviour on every GuC platform:
+- Before CT is up, GT0's arena now writes its invalidation register on every
+  PTE update. That is 0xcee8 on MTL, DG2 and Gen12. On BMG, LNL and PTL it is
+  0xcf80 then 0xcf7c, after the VF_CAP barrier read.
+- Once scheduling is ready, each GuC's scheduler sends a CT TLB_INVALIDATION
+  {seqno, 0x80000003}. Only one request per GuC is in flight, and it completes
+  only on the matching DONE seqno.
+- A freed GGTT range keeps its frames until every GuC has invalidated past
+  the clear. This is stricter than Linux, which reuses the range before
+  invalidating and frees the backing afterwards. Under heavy churn, freed
+  memory can therefore wait one extra GuC round trip.
+- A 2.25 s timeout or a stray DONE loses the GT, which goes through the normal
+  reset, and the ranges stay retained. Linux signals -ETIME and frees them.
+
+All eight release groups pass 2,129 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. One Clippy naming fix was needed. No existing test
+relied on a freed range being reused at once. The debug group pass is deferred
+to the end of this integration wave. None of this has run on physical Intel
+hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

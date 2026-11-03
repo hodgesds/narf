@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.50** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.51** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -38,9 +38,10 @@
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
 > VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
-> queries and the media-GuC HuC, display-14 PSR on hardware inputs,
-> and MTL external outputs on Pipes B–D beside the lit panel pass
-> release native model gates — see §20).
+> queries and the media-GuC HuC, shared-GGTT GuC TLB invalidation on
+> both GTs, display-14 PSR on hardware inputs, and MTL external outputs
+> on Pipes B–D beside the lit panel pass release native model gates —
+> see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -4834,3 +4835,29 @@ Under `drivers/gpu/intel_gpu_media_gt`,
 `smoke_ggtt_tlb_media_gt_ct_invalidation_and_proven_stop` runs GT1 through
 MediaGuc. These are native models, not physical Intel evidence. Silicon
 confirmation of the GuC-type invalidation round trip on each platform remains.
+
+Integration: this unit applied on top of the media HuC unit without a code
+conflict. All eight release groups pass 2,129 tests with no failures and no
+Intel skips; the only skip is the existing shared RNG-registration skip. Group
+7 now also selects `drivers/gpu/intel_gpu_ggtt_tlb`. One integration fix
+named a fixture tuple type for Clippy. No existing fixture or production path
+assumed immediate reuse of a freed range: the whole suite, including every
+GuC, HuC, media and recovery fixture, passes with retention.
+
+Review against Linux b90c984d agreed on the following:
+- Register selection matches `send_tlb_inval_ggtt`: DESC1 BIT6 then DESC0
+  BIT0 for GRAPHICS_VER >= 20, otherwise GUC_TLB_INV_CR BIT0, after
+  `xe_ggtt_invalidate`'s VF_CAP_REG read.
+- The action encodes as `MAKE_INVAL_OP(XE_GUC_TLB_INVAL_GUC)` = 0x80000003.
+- Seqnos match `xe_tlb_inval_fence_prep`.
+- Queuing insert invalidations without waiting is sound. In Linux only
+  objects flagged `XE_BO_FLAG_GGTT_INVALIDATE` wait on insert, and those are
+  the GuC CT, ADS, log, PC, hwconfig, HWSP and the queue-group CGP, which NARF
+  allocates before CT, where its MMIO invalidation is synchronous. Linux's
+  runtime LRC inserts do not invalidate at all. A reused range can only be
+  cached if a GuC touched it before its removal, and removal retention covers
+  that. A range never handed to a GuC is not cached by it.
+- The scheduler reads the pending generation and reports completion through
+  short arena calls, and sends the H2G with no arena lock held.
+
+The debug group pass is deferred to the end of the current integration wave.
