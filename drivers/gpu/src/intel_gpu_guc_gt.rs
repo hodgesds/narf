@@ -1943,12 +1943,15 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             GtState::Lost => return Poll::Ready(Err(GtError::Poisoned)),
             GtState::Stopped => return Poll::Ready(Ok(self.state)),
             GtState::Waking | GtState::Recovering | GtState::Releasing => {
-                let ack = self.read_ack()?;
-                if now >= self.deadline {
-                    return Poll::Ready(Err(GtError::WakeTimeout));
-                }
-                if ack != u32::from(self.requested) {
-                    return Poll::Pending;
+                // i915 __wait_for / xe_mmio_wait32: the ACK is evaluated
+                // before the deadline, so a late poll that finds it already
+                // settled progresses instead of reporting WakeTimeout.
+                if self.read_ack()? != u32::from(self.requested) {
+                    return if now >= self.deadline {
+                        Poll::Ready(Err(GtError::WakeTimeout))
+                    } else {
+                        Poll::Pending
+                    };
                 }
                 if self.state == GtState::Releasing {
                     self.state = GtState::Stopped;
@@ -2069,15 +2072,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     let _ = self.parts.boot.window().read32(0x941c);
                     return Poll::Pending;
                 }
+                // xe_mmio_wait32(GDRST, GRDOM_FULL, 0, 5000): the register
+                // is read before the deadline is enforced, so a late poll
+                // that finds the reset complete still succeeds. The same
+                // bound covers the GuC-reset and DMA-idle proofs below.
                 let reset = self.parts.boot.window().read32(0x941c);
                 if reset == u32::MAX {
                     return Poll::Ready(Err(GtError::Unavailable));
                 }
-                if now >= self.deadline {
-                    return Poll::Ready(Err(GtError::Boot(BootError::Timeout)));
-                }
                 if reset & 1 != 0 {
-                    return Poll::Pending;
+                    return if now >= self.deadline {
+                        Poll::Ready(Err(GtError::Boot(BootError::Timeout)))
+                    } else {
+                        Poll::Pending
+                    };
                 }
                 // do_gt_reset: xe_gsc_wa_14015076503(gt, false) once
                 // GRDOM_FULL has self-cleared.
@@ -2088,7 +2096,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     return Poll::Ready(Err(GtError::Unavailable));
                 }
                 if status & 1 == 0 || dma & 1 != 0 {
-                    return Poll::Pending;
+                    return if now >= self.deadline {
+                        Poll::Ready(Err(GtError::Boot(BootError::Timeout)))
+                    } else {
+                        Poll::Pending
+                    };
                 }
                 if let Some(reset) = &mut self.gen12_reset {
                     // SAFETY: GRDOM_FULL self-clear, GuC reset and firmware

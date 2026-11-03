@@ -2697,6 +2697,64 @@ mod tests {
         smoke_gt_wake_admission_and_timeouts
     );
 
+    fn smoke_gt_late_poll_after_settled_ack_is_not_a_timeout() -> TestResult {
+        // i915 __wait_for, xe_mmio_wait32's final read and read_poll_timeout
+        // all check the condition once more after the timeout: a poll that
+        // arrives past the 50 ms bound with the ACK already settled is
+        // progress, never WakeTimeout. A true timeout still fails.
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        gt.begin(0).unwrap();
+        window.0.borrow_mut().regs.insert(0xdfc, 1);
+        let late = 50_000_000 + 7;
+        assert!(gt.poll(late).is_pending());
+        assert_eq!(gt.state(), GtState::Booting);
+        reset_done(&window);
+        assert!(gt.poll(late + 1).is_pending());
+        window.0.borrow_mut().regs.insert(0xc314, 0x10);
+        assert!(gt.poll(late + 2).is_pending());
+        window.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+        assert_eq!(gt.poll(late + 3), Poll::Ready(Ok(GtState::Ready)));
+        // The release ACK clears before a poll delayed past its own bound.
+        let stop = late + 100;
+        gt.begin_stop(stop).unwrap();
+        assert!(gt.poll(stop + 1).is_pending());
+        reset_done(&window);
+        assert!(gt.poll(stop + 2).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        window.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(
+            gt.poll(stop + 2 + 50_000_000 + 9),
+            Poll::Ready(Ok(GtState::Stopped))
+        );
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        // A release ACK that never clears still times out at the same bound.
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        gt_ready(&mut gt, &window, 0xdfc);
+        gt.begin_stop(100).unwrap();
+        assert!(gt.poll(101).is_pending());
+        reset_done(&window);
+        assert!(gt.poll(102).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        assert!(gt.poll(102 + 50_000_000 - 1).is_pending());
+        assert_eq!(
+            gt.poll(102 + 50_000_000),
+            Poll::Ready(Err(GtError::WakeTimeout))
+        );
+        assert_eq!(gt.state(), GtState::Lost);
+        // Recovery re-requests the release; only a cleared ACK retires DMA.
+        gt.begin_stop(50_000_200).unwrap();
+        window.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(gt.poll(50_000_201), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_late_poll_after_settled_ack_is_not_a_timeout
+    );
+
     fn smoke_gt_loss_recovery_retains_dma() -> TestResult {
         for failure in 0..5 {
             let (window, arena, mut gt) = gt_model(GtPlatform::Alchemist, 0x130044);

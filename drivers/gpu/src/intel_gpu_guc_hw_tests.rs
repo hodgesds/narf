@@ -1187,6 +1187,57 @@ kernel_test_in!(
     smoke_hardware_register_initialization_gates_scheduling
 );
 
+fn smoke_hardware_grdom_full_cleared_before_late_poll_is_not_a_timeout() -> TestResult {
+    // xe_mmio_wait32(GDRST, GRDOM_FULL, 0, 5000) reads once more after its
+    // deadline: a self-cleared GRDOM_FULL first observed by a poll delayed
+    // past 5 ms is success. One that never clears still fails at the bound.
+    for late in [true, false] {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling(&mut gt, &w);
+        gt.begin_stop(10_000_000_000).unwrap();
+        assert!(gt.poll(10_000_000_001).is_pending());
+        reset_done(&w);
+        w.0.borrow_mut().regs.insert(0xc314, 0);
+        assert!(gt.poll(10_000_000_002).is_pending());
+        assert_eq!(gt.state(), GtState::ResettingEngines);
+        assert_eq!(w.0.borrow().regs.get(&0x941c), Some(&1));
+        let mut now = 10_000_000_002 + 5_000_000;
+        if late {
+            reset_done(&w);
+            now += 3;
+            assert!(gt.poll(now).is_pending());
+        } else {
+            assert!(gt.poll(now - 1).is_pending());
+            assert_eq!(
+                gt.poll(now),
+                Poll::Ready(Err(GtError::Boot(BootError::Timeout)))
+            );
+            assert_eq!(gt.state(), GtState::Lost);
+            // Recovery re-asserts GRDOM_FULL; only its proof retires DMA.
+            now += 100;
+            gt.begin_stop(now).unwrap();
+            assert_eq!(gt.state(), GtState::ResettingEngines);
+            reset_done(&w);
+            now += 1;
+            assert!(gt.poll(now).is_pending());
+        }
+        assert_eq!(gt.state(), GtState::ReleasingRender);
+        assert!(gt.poll(now + 1).is_pending());
+        w.0.borrow_mut().regs.insert(0xd84, 0);
+        assert!(gt.poll(now + 2).is_pending());
+        w.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(gt.poll(now + 3), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_grdom_full_cleared_before_late_poll_is_not_a_timeout
+);
+
 fn smoke_hardware_workaround_ip_change_blocks_reload() -> TestResult {
     let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
     hardware_discovery(&mut gt, &w, 0xdfc);
