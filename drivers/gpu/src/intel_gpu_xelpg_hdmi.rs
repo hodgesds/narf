@@ -20,7 +20,11 @@
 //!   PORT_BUF_CTL1 width, DDI_CTL_DE with the lane width — display 14
 //!   fills it for TMDS), `intel_ddi_post_disable_hdmi` (infoframes off,
 //!   `intel_ddi_buf_disable`, transcoder clock off, PLL off).
-//! - `intel_hdmi.c::icl_encoder_to_ddc_pin` / `intel_gmbus.c`
+//! - `intel_hdmi.c` (`intel_hdmi_compute_config` scrambling,
+//!   `intel_hdmi_handle_sink_scrambling`, `intel_hdmi_default_ddc_pin`),
+//!   `intel_ddi.c::intel_ddi_disable_hdmi`, `drm_scdc_helper.c`
+//!   (`drm_scdc_set_high_tmds_clock_ratio`, `drm_scdc_set_scrambling`)
+//!   and `drm_edid.c::drm_parse_hdmi_forum_scds`; `intel_gmbus.c`
 //!   `gmbus_pins_mtp`: DDI B's DDC is GMBUS pin 2 ("dpb").
 //! - `drm_edid.c::drm_do_probe_ddc_edid` over `intel_gmbus.c::gmbus_xfer`:
 //!   each EDID block is an offset write + read at slave 0x50, an
@@ -34,15 +38,28 @@
 //!
 //! ## Qualified profile and refusals
 //!
-//! TMDS clocks up to 340 MHz from the source tables, 8 bpc RGB, AVI
-//! infoframe. Refused with typed errors: clocks above 340 MHz (they need
-//! SCDC scrambling, not owned here), FRL and the FRL-ambiguous TMDS
-//! clocks 300/600 MHz (`intel_hdmi_is_frl` would select FRL clocking),
-//! clocks without a source table (the SNPS C10 and computed C20
-//! algorithms are not implemented; the latter also needs the MTL-U /
-//! ARL-S `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy
-//! port), a busy pipe A or an active DDI. Audio, deep color, YCbCr and
-//! HDMI 2.1 FRL remain out of scope.
+//! TMDS clocks from the source tables, 8 bpc RGB, AVI infoframe. Above
+//! 340 MHz (C10 497.75/592/593.407/594 MHz, C20 594 MHz) HDMI 2.0
+//! scrambling runs as `intel_hdmi_compute_config` decides it from the
+//! sink's HF-VSDB/HF-SCDB (`drm_parse_hdmi_forum_scds`, [`parse_sink_scdc`],
+//! [`tmds_link`]): `TRANS_DDI_HDMI_SCRAMBLING` +
+//! `TRANS_DDI_HIGH_TMDS_CHAR_RATE` in the function control, and the sink's
+//! SCDC TMDS_CONFIG (1/40 ratio, 1 ms, then scrambling;
+//! `intel_hdmi_handle_sink_scrambling`) after the transcoder and before
+//! the DDI buffer, reset before the transcoder stops. A sink with
+//! LTE_340Mcsc_Scramble is scrambled at lower clocks too; any
+//! scrambling-capable sink gets its SCDC written (cleared) on every
+//! enable, as in Linux. Refused with typed errors: a clock above 340 MHz
+//! the sink declares no scrambling for or above its declared maximum,
+//! FRL and the FRL-ambiguous TMDS clocks 300/600 MHz (`intel_hdmi_is_frl`
+//! would select FRL clocking), clocks above the 600 MHz source maximum
+//! or without a source table (the SNPS C10 and computed C20 algorithms
+//! are not implemented; the latter also needs the MTL-U / ARL-S
+//! `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy port), a
+//! busy pipe A or an active DDI. Linux only logs an SCDC failure; here a
+//! stream that needs the sink scrambling fails activation instead (and
+//! is locally stopped). Audio, deep color, YCbCr and HDMI 2.1 FRL remain
+//! out of scope.
 //!
 //! DDC pins come from the corrected GMBUS numbering
 //! ([`crate::intel_gpu_gmbus::PinPair`], `gmbus_pins_mtp`): DDI B is pin 2
@@ -72,7 +89,8 @@ use crate::intel_gpu_xelpg_tc::{
 
 include!("intel_gpu_xelpg_hdmi_tables.rs");
 
-/// Highest TMDS character clock this slice drives without scrambling.
+/// Highest TMDS character clock driven without the 1/40 clock ratio
+/// (HDMI 2.0 scrambling threshold, `intel_hdmi_compute_config`).
 pub const MAX_TMDS_KHZ_UNSCRAMBLED: u32 = 340_000;
 /// Lowest HDMI TMDS clock (`intel_c20_get_hdmi_rate` range floor).
 pub const MIN_TMDS_KHZ: u32 = 25_000;
@@ -105,8 +123,18 @@ pub enum HdmiError {
     UnsupportedClock(u32),
     /// The clock is an FRL rate or FRL-ambiguous.
     FrlClock(u32),
-    /// The clock needs TMDS scrambling (> 340 MHz).
+    /// The clock is above 340 MHz and the sink declares no scrambling
+    /// (no SCDC or no Max_TMDS_Character_Rate in its HF-VSDB/HF-SCDB).
     ScramblingRequired(u32),
+    /// The clock is above the sink's declared `max_tmds_clock`.
+    SinkClockLimit {
+        /// The mode's TMDS clock in kHz.
+        clock_khz: u32,
+        /// The sink's limit in kHz (0: none declared above 340 MHz).
+        max_khz: u32,
+    },
+    /// An SCDC transfer the stream depends on failed.
+    Scdc(crate::intel_gpu_hdmi::DdcError),
     /// The port's DDC is not reachable through the shared GMBUS encoder.
     DdcUnavailable,
     /// DDC transfer failed.
@@ -138,6 +166,182 @@ fn phy_err(e: Cx0Error) -> HdmiError {
     }))
 }
 
+// ── Sink scrambling capability (HF-VSDB / HF-SCDB) ───────────────────
+
+/// `intel_hdmi_source_max_tmds_clock` for display 13 and later (no VBT
+/// `max_tmds_clock` cap without a VBT).
+pub const SOURCE_MAX_TMDS_KHZ: u32 = 600_000;
+/// `HDMI_FORUM_IEEE_OUI` 0xc45dd8 as stored in a vendor block (LSB first).
+const HDMI_FORUM_OUI: [u8; 3] = [0xD8, 0x5D, 0xC4];
+/// `CEA_EXT`.
+const CEA_EXT: u8 = 0x02;
+/// `CTA_DB_VENDOR` and `CTA_DB_EXTENDED_TAG`.
+const CTA_DB_VENDOR: u8 = 3;
+const CTA_DB_EXTENDED_TAG: u8 = 7;
+/// `CTA_EXT_DB_HF_SCDB`.
+const CTA_EXT_DB_HF_SCDB: u8 = 0x79;
+
+/// The sink's SCDC and scrambling capability as
+/// `drm_edid.c::drm_parse_hdmi_forum_scds` records it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SinkScdc {
+    /// `hdmi.scdc.supported` (SCDC_Present, flags bit 7).
+    pub scdc: bool,
+    /// `hdmi.scdc.scrambling.supported`: SCDC present and a non-zero
+    /// Max_TMDS_Character_Rate.
+    pub scrambling: bool,
+    /// `hdmi.scdc.scrambling.low_rates` (LTE_340Mcsc_Scramble, bit 3).
+    pub low_rates: bool,
+    /// `display_info.max_tmds_clock` when the block raised it above
+    /// 340 MHz (rate byte × 5000 kHz), else 0.
+    pub max_tmds_clock_khz: u32,
+}
+
+/// Parse the HDMI Forum blocks of `edid`'s CTA extensions. A block is the
+/// HF-VSDB (`cea_db_is_hdmi_forum_vsdb`: vendor tag, HDMI Forum OUI) or
+/// the HF-SCDB (`cea_db_is_hdmi_forum_scdb`: extended tag 0x79), each
+/// with a payload of at least 7 bytes; both share the `hf_scds` layout
+/// (byte 5 the rate, byte 6 the flags). Only revision 3+ CTA extensions
+/// with a valid checksum are walked, over the data block collection
+/// `cea_db_collection_size` bounds (bytes 4..d, d in 4..=127).
+pub fn parse_sink_scdc(edid: &[u8]) -> SinkScdc {
+    let mut out = SinkScdc::default();
+    for ext in edid.chunks_exact(128).skip(1) {
+        let sum = ext.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        if ext[0] != CEA_EXT || ext[1] < 3 || sum != 0 {
+            continue;
+        }
+        let end = ext[2] as usize;
+        if !(4..=127).contains(&end) {
+            continue;
+        }
+        let mut index = 4usize;
+        while index < end {
+            let tag = ext[index] >> 5;
+            let len = (ext[index] & 0x1F) as usize;
+            if index + 1 + len > end {
+                break;
+            }
+            let hf = &ext[index..index + 1 + len];
+            let forum = len >= 7
+                && ((tag == CTA_DB_VENDOR && hf[1..4] == HDMI_FORUM_OUI)
+                    || (tag == CTA_DB_EXTENDED_TAG && hf[1] == CTA_EXT_DB_HF_SCDB));
+            if forum {
+                if hf[6] & 0x80 != 0 {
+                    out.scdc = true;
+                }
+                if hf[5] != 0 {
+                    let max = u32::from(hf[5]) * 5_000;
+                    if max > MAX_TMDS_KHZ_UNSCRAMBLED {
+                        out.max_tmds_clock_khz = max;
+                    }
+                    if out.scdc {
+                        out.scrambling = true;
+                        if hf[6] & 0x08 != 0 {
+                            out.low_rates = true;
+                        }
+                    }
+                }
+            }
+            index += 1 + len;
+        }
+    }
+    out
+}
+
+/// The TMDS link state the source drives: `crtc_state->hdmi_scrambling`
+/// and `hdmi_high_tmds_clock_ratio`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TmdsLink {
+    /// `TRANS_DDI_HDMI_SCRAMBLING` and SCDC scrambling enable.
+    pub scrambling: bool,
+    /// `TRANS_DDI_HIGH_TMDS_CHAR_RATE` and the SCDC 1/40 clock ratio.
+    pub high_tmds_clock_ratio: bool,
+}
+
+/// `intel_hdmi_compute_config`'s scrambling decision for `clock_khz`
+/// against `sink` (`source_supports_scrambling` holds: the source maximum
+/// is 600 MHz): scramble when the sink supports it and either it accepts
+/// low-rate scrambling or the clock is above 340 MHz, and use the 1/40
+/// ratio above 340 MHz. A clock above 340 MHz is refused when the sink
+/// declares no scrambling or a lower `max_tmds_clock`
+/// (`hdmi_port_clock_limit` with downstream limits).
+pub fn tmds_link(clock_khz: u32, sink: &SinkScdc) -> Result<TmdsLink, HdmiError> {
+    let high = clock_khz > MAX_TMDS_KHZ_UNSCRAMBLED;
+    if high && !sink.scrambling {
+        return Err(HdmiError::ScramblingRequired(clock_khz));
+    }
+    if high && clock_khz > sink.max_tmds_clock_khz {
+        return Err(HdmiError::SinkClockLimit {
+            clock_khz,
+            max_khz: sink.max_tmds_clock_khz,
+        });
+    }
+    Ok(TmdsLink {
+        scrambling: sink.scrambling && (sink.low_rates || high),
+        high_tmds_clock_ratio: sink.scrambling && high,
+    })
+}
+
+// ── SCDC (drm_scdc_helper.c over the GMBUS transport) ─────────────────
+
+/// `SCDC_I2C_SLAVE_ADDRESS`.
+pub const SCDC_I2C_SLAVE_ADDRESS: u8 = 0x54;
+/// `SCDC_TMDS_CONFIG`.
+pub const SCDC_TMDS_CONFIG: u8 = 0x20;
+/// `SCDC_TMDS_BIT_CLOCK_RATIO_BY_40`.
+pub const SCDC_TMDS_BIT_CLOCK_RATIO_BY_40: u8 = 1 << 1;
+/// `SCDC_SCRAMBLING_ENABLE`.
+pub const SCDC_SCRAMBLING_ENABLE: u8 = 1 << 0;
+
+/// `drm_scdc_readb`: an offset write then a one-byte read, which
+/// `gmbus_xfer` runs as one INDEX-cycle transfer.
+fn scdc_readb<M: MmioWindow + ?Sized>(bus: &GmbusBus<'_, M>, offset: u8) -> Result<u8, HdmiError> {
+    let mut value = [0u8; 1];
+    bus.read_indexed(SCDC_I2C_SLAVE_ADDRESS, offset, &mut value)
+        .map_err(|e| HdmiError::Scdc(e.into()))?;
+    Ok(value[0])
+}
+
+/// `drm_scdc_writeb`: one write message `[offset, value]`.
+fn scdc_writeb<M: MmioWindow + ?Sized>(
+    bus: &GmbusBus<'_, M>,
+    offset: u8,
+    value: u8,
+) -> Result<(), HdmiError> {
+    bus.write(SCDC_I2C_SLAVE_ADDRESS, &[offset, value])
+        .map_err(|e| HdmiError::Scdc(e.into()))
+}
+
+/// `intel_hdmi_handle_sink_scrambling` for a sink whose scrambling is
+/// supported: `drm_scdc_set_high_tmds_clock_ratio` (read-modify-write of
+/// TMDS_CONFIG bit 1, then at least 1 ms before the sink is relied on),
+/// then `drm_scdc_set_scrambling` (read-modify-write of bit 0).
+pub fn sink_scrambling<M: MmioWindow + ?Sized>(
+    io: &M,
+    pin: PinPair,
+    high_tmds_clock_ratio: bool,
+    scrambling: bool,
+) -> Result<(), HdmiError> {
+    let bus = GmbusBus::new(io, pin);
+    let config = scdc_readb(&bus, SCDC_TMDS_CONFIG)?;
+    let config = if high_tmds_clock_ratio {
+        config | SCDC_TMDS_BIT_CLOCK_RATIO_BY_40
+    } else {
+        config & !SCDC_TMDS_BIT_CLOCK_RATIO_BY_40
+    };
+    scdc_writeb(&bus, SCDC_TMDS_CONFIG, config)?;
+    let _ =
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ns(1_000_000));
+    let config = scdc_readb(&bus, SCDC_TMDS_CONFIG)?;
+    let config = if scrambling {
+        config | SCDC_SCRAMBLING_ENABLE
+    } else {
+        config & !SCDC_SCRAMBLING_ENABLE
+    };
+    scdc_writeb(&bus, SCDC_TMDS_CONFIG, config)
+}
+
 /// Resolve the HDMI TMDS PLL request for `port` at `clock_khz`
 /// (`intel_c10pll_calc_state` / `intel_c20pll_calc_state`, table path).
 pub fn hdmi_pll_request(
@@ -151,8 +355,8 @@ pub fn hdmi_pll_request(
     if clock_khz < MIN_TMDS_KHZ {
         return Err(HdmiError::UnsupportedClock(clock_khz));
     }
-    if clock_khz > MAX_TMDS_KHZ_UNSCRAMBLED {
-        return Err(HdmiError::ScramblingRequired(clock_khz));
+    if clock_khz > SOURCE_MAX_TMDS_KHZ {
+        return Err(HdmiError::UnsupportedClock(clock_khz));
     }
     let state = match port.phy() {
         PhyKind::C10 => {
@@ -218,6 +422,10 @@ pub struct MtlHdmiProbe {
     pub mode: Mode,
     /// The resolved PLL request for the mode's TMDS clock.
     pub pll: PllRequest,
+    /// The sink's SCDC/scrambling capability.
+    pub sink: SinkScdc,
+    /// The scrambling state the source drives for the mode.
+    pub link: TmdsLink,
     /// EDID bytes (`edid_len` valid).
     pub edid: [u8; crate::intel_gpu_hdmi::EDID_CAPACITY],
     /// Valid EDID length.
@@ -289,6 +497,8 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
         .map_err(|_| rollback(HdmiError::Edid))?;
     let pll = hdmi_pll_request(port, mode.pixel_clock_khz, type_c).map_err(rollback)?;
+    let sink = parse_sink_scdc(&edid[..edid_len]);
+    let link = tmds_link(mode.pixel_clock_khz, &sink).map_err(rollback)?;
     if !io.display_access_ok() {
         return Err(rollback(ExternalError::AccessLost.into()));
     }
@@ -297,6 +507,8 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
         tc,
         mode,
         pll,
+        sink,
+        link,
         edid,
         edid_len,
     })
@@ -423,8 +635,12 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Result<
     );
     ms.program_plane(&route.fb, &mode);
     // intel_ddi_enable: transcoder function, then the transcoder.
-    let func =
-        crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(port.func_ctl_index(), false, false);
+    let link = route.probe.link;
+    let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(
+        port.func_ctl_index(),
+        link.scrambling,
+        link.high_tmds_clock_ratio,
+    );
     wr(io, TRANS_DDI_FUNC_CTL_A, func)?;
     let start = rd(io, PIPE_FRMCOUNT_A)?;
     let conf = rd(io, PIPECONF_A)?;
@@ -432,8 +648,18 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Result<
     if !wait_bit(io, PIPECONF_A, ENABLE | STATE, true, 100_000_000) {
         return Err(ExternalError::Modeset(ModesetError::PipelineEnableUnavailable).into());
     }
-    // intel_ddi_enable_hdmi (display 14): D2D, levels, PORT_BUF_CTL1
-    // width, DDI_CTL_DE with the TMDS lane width, buffer active.
+    // intel_ddi_enable_hdmi (display 14): sink scrambling/ratio over
+    // SCDC (only for a scrambling-capable sink), D2D, levels,
+    // PORT_BUF_CTL1 width, DDI_CTL_DE with the TMDS lane width, buffer
+    // active. Linux only logs an SCDC failure; a stream that needs the
+    // sink scrambling cannot work without it, so that failure stops here.
+    if route.probe.sink.scrambling {
+        let pin = ddc_pin(port).ok_or(HdmiError::DdcUnavailable)?;
+        let scdc = sink_scrambling(io, pin, link.high_tmds_clock_ratio, link.scrambling);
+        if scdc.is_err() && (link.scrambling || link.high_tmds_clock_ratio) {
+            return scdc;
+        }
+    }
     enable_d2d(io, port).map_err(phy_err)?;
     set_signal_levels_hdmi(&Cx0Phy::new(io, port)).map_err(phy_err)?;
     let buf = rd(io, port.buf_ctl1())?;
@@ -509,6 +735,14 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Resu
     wr(io, PLANE_CTL_1_A, ctl & !ENABLE)?;
     let surf = rd(io, PLANE_SURF_1_A)?;
     wr(io, PLANE_SURF_1_A, surf)?;
+    // intel_ddi_disable_hdmi (encoder disable, before the transcoder):
+    // reset sink scrambling and the 1/10 ratio, best effort as in Linux
+    // (an SCDC NACK never replaces the local stop proof).
+    if route.probe.sink.scrambling {
+        if let Some(pin) = ddc_pin(port) {
+            let _ = sink_scrambling(io, pin, false, false);
+        }
+    }
     let conf = rd(io, PIPECONF_A)?;
     wr(io, PIPECONF_A, conf & !ENABLE)?;
     if !wait_bit(io, PIPECONF_A, ENABLE | STATE, false, 100_000_000) {

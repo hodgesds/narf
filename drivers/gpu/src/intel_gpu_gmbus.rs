@@ -1170,9 +1170,12 @@ pub mod tests {
                     }
                 }
                 SCDC_ADDR => {
-                    if self.sink.len() >= 2 {
+                    // Only the programmed byte count reaches the slave;
+                    // the rest of the last GMBUS3 dword is padding.
+                    let n = self.sink_expected.min(self.sink.len());
+                    if n >= 2 {
                         let base = self.sink[0] as usize;
-                        for (i, v) in self.sink[1..].iter().enumerate() {
+                        for (i, v) in self.sink[1..n].iter().enumerate() {
                             self.scdc[(base + i) & 0xFF] = *v;
                         }
                     }
