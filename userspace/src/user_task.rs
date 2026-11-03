@@ -4061,7 +4061,7 @@ fn prepare_user_process(
     future: impl FnOnce(crate::UserProcess, alloc::sync::Arc<crate::task::Task>) -> UserTaskFuture,
     spec: narf_scheduler::TaskSpec,
 ) -> PendingUserProcess {
-    let id = narf_scheduler::alloc_task_id();
+    let id = narf_scheduler::alloc_user_task_id();
     let addr_space = process.address_space.clone();
     let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
     PendingUserProcess {

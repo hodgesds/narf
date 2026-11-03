@@ -222,9 +222,15 @@ rolling generation-ordered cutover.
   ordinary validated selection path.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.
-- Realtime class metadata is demoted on generic spawn paths. Only
-  `spawn_realtime*` can attach a live reservation, after atomically checking
-  per-CPU, system, and capability-domain ceilings.
+- Realtime class metadata is demoted on generic spawn paths. Native
+  `spawn_realtime*` attaches a live reservation after atomically checking
+  per-CPU, system, and capability-domain ceilings. The Linux user-control
+  path requires explicit boot-delegated CPU grants and spends a shared strict
+  95% pool minus those native reservations (scheduler spec §3). Its FIFO order
+  and RR CPU quantum survive preemption, and pending policy generations
+  prohibit direct handoff. RT IRQ return checks run after EOI/accounting;
+  CPL0 user work defers to syscall exit. The RT watchdog is sampled on both
+  CPL0 and CPL3 ticks, with signals delivered only at safe user returns.
 - `preempt_disable()` is nestable and CPU-local; its guard is `!Send`.
 - Hard-IRQ residency is accumulated outside task runtime and subtracted from
   poll budget charging. Deferred `SoftIrq` work remains a normal task.

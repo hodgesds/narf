@@ -4,14 +4,9 @@
 // `sched_reset_on_fork`, the `dl` reservation and the fair-class
 // `se.slice` — as a sparse per-TaskId side table.
 //
-// The cooperative executor does not route on it: real placement is the
-// cap-gated CpuBudget / `SchedClass` surface. What this table buys is the
-// ABI. Every `sched_*` syscall validates against it in the order
-// `__sched_setscheduler` does, so a Linux program sees the same answers —
-// and above all the same errnos — it would on Linux. Before it existed,
-// `sched_getscheduler` hard-coded SCHED_OTHER, `sched_setscheduler`
-// accepted a NULL param and never checked a priority, and `sched_getattr`
-// replayed whatever bytes `sched_setattr` last stored.
+// Each accepted policy update is published to the scheduler's user-thread
+// control before this ABI record is committed. Credential checks stay here;
+// execution, queue position and bounded RT CPU time belong to the scheduler.
 //
 // Nice is deliberately NOT here. It stays in NICE_TABLE (per task, like
 // Linux's `static_prio`), which getpriority/setpriority own; `sched_setattr`
@@ -26,6 +21,54 @@
 //                              `sched_rr_get_interval` rounding sees it.
 //   * One root domain spanning every online CPU, default DL bandwidth
 //     (`sched_rt_runtime_us` 950000 / `sched_rt_period_us` 1000000).
+
+static SCHED_UPDATES: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
+static USER_SCHEDULING_AUTHORITY: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<narf_scheduler::UserSchedulingAuthority>>> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Trusted boot delegates existing CPU grants explicitly to the compatibility
+/// service. The setter never creates a capability or replaces these grants.
+pub fn install_user_scheduling_authority(authority: alloc::sync::Arc<narf_scheduler::UserSchedulingAuthority>) {
+    let mut installed = USER_SCHEDULING_AUTHORITY.lock();
+    assert!(installed.is_none(), "user scheduling authority installed twice");
+    *installed = Some(authority);
+}
+
+fn apply_user_scheduling(task: u64, state: &SchedState, nice: i32) -> Result<(), i64> {
+    apply_user_scheduling_from(task, state, nice, None)
+}
+
+fn apply_user_scheduling_from(task: u64, state: &SchedState, nice: i32, parent: Option<u64>) -> Result<(), i64> {
+    use narf_scheduler::{TaskId, UserPolicy, UserScheduling, UserSchedulingError};
+    let id = TaskId(task);
+    if narf_scheduler::user_scheduling(id).is_none() {
+        // ABI fixtures use synthetic identities without executable slots. Live
+        // execution tests register real scheduler controls and take the full path.
+        #[cfg(feature = "kernel-test")]
+        return Ok(());
+        #[cfg(not(feature = "kernel-test"))]
+        return Err(ESRCH);
+    }
+    let policy = match state.policy {
+        SCHED_OTHER => UserPolicy::Normal,
+        SCHED_BATCH => UserPolicy::Batch,
+        SCHED_IDLE => UserPolicy::Idle,
+        SCHED_FIFO => UserPolicy::Fifo,
+        SCHED_RR => UserPolicy::RoundRobin,
+        _ => return Err(EOPNOTSUPP),
+    };
+    let slice = if state.policy == SCHED_RR { SCHED_RR_TIMESLICE_NS } else { state.custom_slice };
+    let config = UserScheduling { policy, nice: nice.clamp(-20, 19) as i8,
+        rt_priority: state.rt_priority as u8, slice_cycles: narf_time::ns_to_cycles(slice) };
+    let authority = USER_SCHEDULING_AUTHORITY.lock().clone();
+    let result = if let Some(parent) = parent {
+        narf_scheduler::inherit_user_scheduling(TaskId(parent), id, config)
+    } else { narf_scheduler::set_user_scheduling(id, config, authority) };
+    result.map_err(|error| match error {
+        UserSchedulingError::TaskNotFound => ESRCH,
+        UserSchedulingError::InvalidParameters | UserSchedulingError::NoOnlineCpu => EINVAL,
+        UserSchedulingError::AuthorityRequired | UserSchedulingError::AuthorityRevoked => EPERM,
+    })
+}
 
 const SCHED_OTHER: i32 = 0;
 const SCHED_FIFO: i32 = 1;
@@ -183,6 +226,8 @@ fn write_sched_state(task: u64, state: SchedState) {
 
 /// Exit-time teardown, called from `release_task_tables`.
 fn sched_state_release(task: u64) {
+    let _update = SCHED_UPDATES.lock();
+    narf_scheduler::release_user_scheduling(narf_scheduler::TaskId(task));
     if SCHED_STATE_ROWS.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -579,6 +624,11 @@ fn sched_user_check(
 /// its `reset_on_fork`), which is how `sched_setparam` and
 /// `SCHED_FLAG_KEEP_POLICY` arrive here.
 fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
+    let _update = SCHED_UPDATES.lock();
+    sched_setscheduler_locked(task, attr)
+}
+
+fn sched_setscheduler_locked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
     let state = read_sched_state(task);
     let (policy, reset_on_fork) = if attr.policy < 0 {
         (state.policy, state.reset_on_fork)
@@ -625,6 +675,7 @@ fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
             false
         };
         if !changed {
+            apply_user_scheduling(task, &state, read_nice(task))?;
             write_sched_state(
                 task,
                 SchedState {
@@ -649,6 +700,8 @@ fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
         return Err(EBUSY);
     }
 
+    if dl_policy(policy) { return Err(EOPNOTSUPP); }
+
     // `__setscheduler_params`.
     let mut next = SchedState {
         policy,
@@ -671,7 +724,6 @@ fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
         next.dl_period = 0;
         next.dl_flags = 0;
         if fair_policy(policy) {
-            let _ = write_nice(task, attr.nice);
             next.custom_slice = if attr.runtime != 0 {
                 // NSEC_PER_MSEC/10 ..= NSEC_PER_MSEC*100.
                 attr.runtime.clamp(100_000, 100_000_000)
@@ -680,6 +732,9 @@ fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
             };
         }
     }
+    let nice = if fair_policy(policy) { attr.nice } else { read_nice(task) };
+    apply_user_scheduling(task, &next, nice)?;
+    if fair_policy(policy) { let _ = write_nice_raw(task, nice); }
     write_sched_state(task, next);
     Ok(())
 }
@@ -736,8 +791,9 @@ fn do_sched_setscheduler(pid: i32, policy: i32, param: u64) -> Result<(), i64> {
         return Err(EFAULT);
     }
     let task = find_process_by_pid(pid).ok_or(ESRCH)?;
+    let _update = SCHED_UPDATES.lock();
     let attr = sched_param_attr(task, policy, i32::from_ne_bytes(buf));
-    sched_setscheduler_checked(task, &attr)
+    sched_setscheduler_locked(task, &attr)
 }
 
 /// `sched_fork`'s refusal: a SCHED_DEADLINE task may not fork unless it
@@ -759,6 +815,7 @@ fn sched_fork_denied(parent: u64) -> bool {
 /// Nice is per-thread (NICE_TABLE is keyed by task), so this applies to
 /// CLONE_THREAD children exactly as to new processes.
 fn sched_fork(parent: u64, child: u64) {
+    let _update = SCHED_UPDATES.lock();
     let mut nice = read_nice(parent);
     let mut st = read_sched_state(parent);
     if st.reset_on_fork {
@@ -771,10 +828,10 @@ fn sched_fork(parent: u64, child: u64) {
         st.custom_slice = 0;
         st.reset_on_fork = false;
     }
-    if st != SchedState::DEFAULT {
-        write_sched_state(child, st);
-    }
-    if nice != 0 {
-        let _ = write_nice(child, nice);
-    }
+    // Parent permission was already established; the child spends the same
+    // explicitly delegated per-CPU grants and inherits before it can run.
+    apply_user_scheduling_from(child, &st, nice, Some(parent))
+        .expect("registered fork child must inherit its parent's scheduling grant");
+    if st != SchedState::DEFAULT { write_sched_state(child, st); }
+    if nice != 0 { let _ = write_nice_raw(child, nice); }
 }

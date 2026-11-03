@@ -1918,7 +1918,6 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_arg_errors);
 // ─────────────────────────────────────────────────────────────────────
 
 const SCHED_RESET_ON_FORK_W: u64 = 0x4000_0000;
-const SCHED_FLAG_RESET_ON_FORK_W: u64 = 0x01;
 const SCHED_FLAG_KEEP_POLICY_W: u64 = 0x08;
 const SCHED_FLAG_KEEP_PARAMS_W: u64 = 0x10;
 const SCHED_FLAG_UTIL_CLAMP_MIN_W: u64 = 0x20;
@@ -2565,7 +2564,7 @@ fn smoke_abi_sched_deadline_checkparam() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_deadline_checkparam);
 
-fn smoke_abi_sched_deadline_admitted_and_reported() -> TestResult {
+fn smoke_abi_sched_deadline_explicitly_unsupported() -> TestResult {
     with_setup(|| {
         let attr = sched_attr(
             SCHED_DEADLINE as u32,
@@ -2576,59 +2575,18 @@ fn smoke_abi_sched_deadline_admitted_and_reported() -> TestResult {
             DL_DEADLINE,
             DL_PERIOD,
         );
-        if setattr(0, &attr) != Some(0) {
-            return Err("a valid privileged SCHED_DEADLINE request should be admitted");
+        if setattr(0, &attr) != Some(EOPNOTSUPP) {
+            return Err("valid DEADLINE must not claim EDF/CBS service");
         }
-        if getscheduler(0) != Some(SCHED_DEADLINE as i64) {
-            return Err("sched_getscheduler did not report SCHED_DEADLINE");
-        }
-        let a = getattr(0)?;
-        if attr_u32(&a, 4) != SCHED_DEADLINE as u32
-            || attr_u64(&a, 24) != DL_RUNTIME
-            || attr_u64(&a, 32) != DL_DEADLINE
-            || attr_u64(&a, 40) != DL_PERIOD
-        {
-            return Err("sched_getattr did not report the deadline reservation");
-        }
-        // A deadline task has no RT priority and no RR quantum.
-        if getparam(0) != Some(0) || rr_interval_ns(0) != Some(0) {
-            return Err("SCHED_DEADLINE must report priority 0 and a 0 interval");
-        }
-        // sched_fork: `if (dl_prio(p->prio)) return -EAGAIN;`.
-        if !crate::handlers::__test_sched_fork_denied(FAKE_TASK) {
-            return Err("fork of a SCHED_DEADLINE task must be refused");
-        }
-        #[cfg(target_arch = "x86_64")]
-        if call(Syscall::Fork.raw(), a0(0)) != Some(EAGAIN) {
-            return Err("fork(2) from a SCHED_DEADLINE task must be -EAGAIN");
-        }
-        // With reset_on_fork the child restarts as SCHED_NORMAL, so fork is
-        // allowed again.
-        let with_reset = sched_attr(
-            SCHED_DEADLINE as u32,
-            SCHED_FLAG_RESET_ON_FORK_W,
-            0,
-            0,
-            DL_RUNTIME,
-            DL_DEADLINE,
-            DL_PERIOD,
-        );
-        if setattr(0, &with_reset) != Some(0) {
-            return Err("adding reset_on_fork to a DL task should succeed");
-        }
-        if crate::handlers::__test_sched_fork_denied(FAKE_TASK) {
-            return Err("a reset_on_fork DL task must be allowed to fork");
-        }
-        // Leaving SCHED_DEADLINE always succeeds.
-        if setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK_W, 0) != Some(0) {
-            return Err("leaving SCHED_DEADLINE should succeed");
+        if getscheduler(0) != Some(SCHED_OTHER as i64) || getparam(0) != Some(0) {
+            return Err("unsupported policy changed existing scheduling state");
         }
         Ok(())
     })
 }
 kernel_test_in!(
     "syscall_abi",
-    smoke_abi_sched_deadline_admitted_and_reported
+    smoke_abi_sched_deadline_explicitly_unsupported
 );
 
 fn smoke_abi_sched_deadline_is_always_privileged() -> TestResult {
@@ -2652,78 +2610,27 @@ fn smoke_abi_sched_deadline_is_always_privileged() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_deadline_is_always_privileged);
 
-fn smoke_abi_sched_deadline_bandwidth_admission_is_ebusy() -> TestResult {
+fn smoke_abi_sched_deadline_bandwidth_validation_precedes_unsupported() -> TestResult {
     with_setup(|| {
-        // Fill the root domain to 90% per CPU with seeded reservations, then
-        // ask for 99% more: `__dl_overflow` against the default 95% cap.
         let cpus = u64::from(online_cpus());
-        let dl = SCHED_DEADLINE as u32;
-        const SEED_BASE: u64 = 0xD1_0000;
-        let fill = sched_attr(dl, 0, 0, 0, 90_000_000, 100_000_000, 100_000_000);
-        let mut seeded = alloc::vec::Vec::new();
-        for i in 0..cpus {
-            let t = SEED_BASE + i;
-            register_foreign(t);
-            seeded.push(t);
-            if setattr(t, &fill) != Some(0) {
-                for t in seeded {
-                    crate::task::release_task(t);
-                }
-                return Err("seeding a 90% reservation should be admitted");
-            }
+        let runtime = 99_000_000u64.saturating_mul(cpus);
+        // At one CPU this is a valid shape but exceeds 95% admission. On
+        // SMP the same check is per root-domain bandwidth.
+        let big = sched_attr(SCHED_DEADLINE as u32, 0, 0, 0, runtime, runtime, runtime);
+        let expected = if cpus == 1 { EBUSY } else { EOPNOTSUPP };
+        if setattr(0, &big) != Some(expected) {
+            return Err("valid unavailable policy must be explicitly unsupported");
         }
-        let big = sched_attr(dl, 0, 0, 0, 99_000_000, 100_000_000, 100_000_000);
-        let got = setattr(0, &big);
-        // A small request still fits in the remaining 5% per CPU.
-        let small = sched_attr(dl, 0, 0, 0, 1_000_000, 100_000_000, 100_000_000);
-        let got_small = setattr(0, &small);
-        for t in seeded {
-            crate::task::release_task(t);
-        }
-        if got != Some(EBUSY) {
-            return Err("a reservation past the root domain's bandwidth must be -EBUSY");
-        }
-        if got_small != Some(0) {
-            return Err("a reservation within the remaining bandwidth must be admitted");
+        if getscheduler(0) != Some(SCHED_OTHER as i64) {
+            return Err("rejected DEADLINE request changed current policy");
         }
         Ok(())
     })
 }
 kernel_test_in!(
     "syscall_abi",
-    smoke_abi_sched_deadline_bandwidth_admission_is_ebusy
+    smoke_abi_sched_deadline_bandwidth_validation_precedes_unsupported
 );
-
-fn smoke_abi_sched_deadline_pins_affinity() -> TestResult {
-    with_setup(|| {
-        let attr = sched_attr(
-            SCHED_DEADLINE as u32,
-            0,
-            0,
-            0,
-            DL_RUNTIME,
-            DL_DEADLINE,
-            DL_PERIOD,
-        );
-        if setattr(0, &attr) != Some(0) {
-            return Err("setup: SCHED_DEADLINE");
-        }
-        // `dl_task_check_affinity`: a DL task may not narrow below its root
-        // domain — -EBUSY, ahead of the empty-mask -EINVAL.
-        let empty = [0u8; 8];
-        match call(
-            Syscall::SchedSetaffinity.raw(),
-            a2(0, 8, empty.as_ptr() as u64),
-        ) {
-            Some(v) if v == EBUSY => Ok(()),
-            Some(v) if v == EINVAL => {
-                Err("a DL task's affinity check ran after the empty-mask check")
-            }
-            _ => Err("narrowing a SCHED_DEADLINE task's affinity must be -EBUSY"),
-        }
-    })
-}
-kernel_test_in!("syscall_abi", smoke_abi_sched_deadline_pins_affinity);
 
 // ── fork inheritance (sched_fork) ───────────────────────────────────
 

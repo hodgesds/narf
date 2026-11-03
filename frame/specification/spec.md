@@ -122,6 +122,13 @@ to the console threshold before emitting the normal boot banner. This affects
 only physical console emission: the bounded klog remains complete, and panic
 plus fatal-trap sinks remain unconditional.
 
+The BSP calls `scheduler::init()` once before AP bring-up, then explicitly
+creates CPU-budget grants and delegates `UserSchedulingAuthority` to the Linux
+compatibility service before any user task can run. Scheduling syscalls never
+bootstrap capabilities. Both architectures' IRQ tails finish EOI and interrupt
+accounting before an RT event can request an own-stack user switch; kernel-mode
+user continuations carry a sticky request to completed syscall exit.
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.

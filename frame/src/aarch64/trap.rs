@@ -22,7 +22,7 @@ pub use narf_arch::aarch64::trap_frame::TrapFrame;
 /// (GICv3) or memory-mapped `GICC_IAR` / `GICC_EOIR` (GICv2; a TTBR1
 /// Device mapping, untagged, so reachable from FRAME in every task).
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
+pub extern "C" fn rust_aarch64_irq(frame: &mut TrapFrame) {
     let hardirq_account =
         narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::HardIrq);
     // SAFETY: we are in the IRQ handler by the vector-table contract, and
@@ -94,11 +94,26 @@ pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
         narf_interrupts::aarch64::eoi_for(iar);
     }
     drop(hardirq_account);
-    if intid == narf_interrupts::aarch64::TIMER_PPI {
+    let tick = intid == narf_interrupts::aarch64::TIMER_PPI;
+    if tick {
+        narf_userspace::handlers::realtime_watchdog_tick();
+        if frame.spsr & 0xF == 0 {
+            narf_userspace::handlers::timer_tick_raise_due_signals();
+        }
+    }
+    // An EL0 CPU-bound RT thread must receive its watchdog signal even without
+    // making another syscall. EOI and interrupt accounting completed above.
+    if frame.spsr & 0xF == 0 {
+        let mut ctx = Aarch64TrapContext::from_svc(frame);
+        if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+        }
+    }
+    if tick || narf_scheduler::stackful::realtime_irq_pending() {
         // SAFETY: this is the live vector frame, and EOI/accounting completed
         // above before a switch can strand the trap continuation.
         unsafe {
-            narf_scheduler::stackful::try_preempt_aarch64(frame);
+            narf_scheduler::stackful::try_preempt_aarch64_irq(frame, tick);
         }
     }
 }

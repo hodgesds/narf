@@ -364,6 +364,7 @@ pub trait Scheduler: Any + Send + Sync + 'static {
 }
 
 pub struct TaskMeta {
+    pub rt_order: i64, // stable FIFO/RR position across involuntary preemption
     pub wake_reason: Option<WakeReason>,
     pub id: TaskId,
     pub work_kind: WorkKind,
@@ -820,6 +821,66 @@ reports runnable work-kind counts, RT reservation, next deadline, state, and
 cumulative hard-IRQ/NMI cycles. It is a governor input, never a frequency
 control callback.
 
+### Live Linux user-thread policies
+
+```rust
+pub enum UserPolicy { Normal, Batch, Idle, Fifo, RoundRobin }
+pub struct UserScheduling {
+    pub policy: UserPolicy,
+    pub nice: i8,
+    pub rt_priority: u8,       // 1..=99 for FIFO/RR; zero otherwise
+    pub slice_cycles: u64,    // RR CPU quantum; zero = default fair slice
+}
+pub struct UserSchedulingAuthority { /* explicit per-CPU Cap<CpuBudget, Spend> grants */ }
+pub fn UserSchedulingAuthority::new(budgets: [Cap<CpuBudget, Spend>; MAX_CPUS]) -> Self;
+pub fn inheritable_task_affinity(id: TaskId) -> Option<CpuSet>;
+pub fn alloc_user_task_id() -> TaskId;
+pub fn user_scheduling(id: TaskId) -> Option<UserScheduling>;
+pub fn set_user_scheduling(id: TaskId, config: UserScheduling,
+    authority: Option<Arc<UserSchedulingAuthority>>) -> Result<(), UserSchedulingError>;
+pub fn inherit_user_scheduling(parent: TaskId, child: TaskId, config: UserScheduling)
+    -> Result<(), UserSchedulingError>;
+pub fn yield_user_scheduling(id: TaskId);
+pub fn release_user_scheduling(id: TaskId);
+pub fn stackful::current_realtime_runtime_ns() -> u64;
+pub fn stackful::realtime_irq_pending() -> bool;
+```
+
+The Linux ABI owns credentials, rlimits, policy numbers and error ordering.
+The core owns safe publication to running/ready/parked threads, FIFO position,
+RR remaining CPU time, runtime charging and revocable bandwidth authority.
+Ordinary policy selection remains pluggable. Every installed policy must
+respect live RT priority/position and the core's shared eligibility checks.
+Pending updates prohibit claiming the affected continuation as a direct
+handoff target until applied.
+
+FIFO has no fair-share quantum. Higher RT priorities preempt; an equal
+priority retains FIFO order across involuntary switches. Actual wake and
+`sched_yield` join the tail; lowering RT priority joins the head of its new
+priority queue. RR rotates on exhaustion of its 100 ms CPU-time quantum,
+retains unused credit across preemption/blocking, and does not refill on yield.
+IRQ residency is excluded. RT bypasses optional instruction/APERF slice units.
+Timer/deferred wakes still visit the executor even when FIFO never expires;
+RT IRQ returns may switch only after EOI/accounting, with existing own-stack,
+privilege and preemption guards. Kernel-mode user continuations defer to a safe
+completed syscall exit.
+
+Linux FIFO/RR threads share one strict per-CPU 1 s runtime pool. Its capacity
+is 95% minus native admitted RT reservations on that CPU. Pools survive thread
+exit and policy changes, retain overshoot debt, and never accumulate unused
+credit. Migration spends the destination pool and its delegated CPU grant.
+Revocation is checked at dispatch and parked maintenance; inherited grants
+retain revocation state. Any original per-task budget capability remains an
+additional revocation gate across policy changes, including RT promotion.
+Native admitted RT tasks retain their existing pinned reservation contract.
+The frame delegates grants at boot; a scheduling setter cannot mint one.
+Explicit affinity requests and their descendants inherit the requested mask.
+Native boot-init/getty/shell placement pins stay per-task and do not restrict
+their workload descendants to the BSP.
+`SCHED_DEADLINE` requires separate EDF/CBS implementation and is unsupported.
+Linux PI-futex ownership/wakeup support still lacks priority boosting (the
+existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
+
 ## 4. Invariants & safety properties
 
 - A task always polls inside the domain it was spawned with.
@@ -1071,8 +1132,9 @@ enforced by the core. `spawn_realtime` requires a live
 against CPU, online-system, and capability-object-domain ceilings before the
 task becomes visible. The admitted task is CPU-pinned and retains an RAII
 reservation until its slot is destroyed. A label supplied through a generic
-spawn path is demoted to `Default`; only successful admission establishes RT
-service. This provides bounded fixed-priority periodic service, but does not
+spawn path is demoted to `Default`; native service requires successful
+admission. Linux FIFO/RR uses the separately delegated shared-pool interface
+in §3, with its own migration and queue-position rules. This provides bounded fixed-priority periodic service, but does not
 yet promise Linux `SCHED_DEADLINE`-style deadline-miss guarantees or
 transactional RT migration.
 

@@ -306,6 +306,9 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // until all fork inheritance below is complete.  The child may otherwise
     // run on another CPU before `fd::fork` installs its table.
     let mut child_spec = narf_scheduler::TaskSpec::user_task();
+    if let Some(allowed) = narf_scheduler::inheritable_task_affinity(narf_scheduler::TaskId(parent_pid)) {
+        child_spec.affinity.allowed = allowed;
+    }
     if let Some(cpu) = fork_cpu(child_spec.affinity.allowed) {
         child_spec.affinity.preferred = Some(cpu);
     }
@@ -320,6 +323,9 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
         None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
+    // Inherit policy before publishing the PID/TID. A remote setter must
+    // not have an accepted update overwritten by late fork inheritance.
+    sched_fork(parent_pid, child_tid.raw());
     // Initialize inherited limits before any PID lookup can expose the child
     // to a remote prlimit update. The child is not runnable yet.
     rlimit_fork(parent_pid, child_tid.raw());
@@ -335,9 +341,6 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     crate::handlers::proc_identity_fork(parent_pid, child_tid.raw());
     // fork(2) copies (never shares) a pre-existing io_context.
     ioprio_fork(parent_pid, child_tid.raw(), false);
-    // `sched_fork`: policy, RT priority and nice are inherited, subject to
-    // SCHED_RESET_ON_FORK.
-    sched_fork(parent_pid, child_tid.raw());
     // POSIX inheritance — fd / cwd / brk / sigaction handlers are
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).

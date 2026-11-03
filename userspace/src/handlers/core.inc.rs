@@ -12133,6 +12133,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // execute its first `execveat(AT_EMPTY_PATH)` immediately, so publishing
     // it before `fd::fork` is an SMP-visible ENOENT race.
     let mut child_spec = narf_scheduler::TaskSpec::user_task();
+    if let Some(allowed) = narf_scheduler::inheritable_task_affinity(narf_scheduler::TaskId(parent_pid)) {
+        child_spec.affinity.allowed = allowed;
+    }
     if share_thread {
         // `CLONE_THREAD` shares the parent's mm and usually its hottest data.
         // Keep Linux's clone wake-affinity shape: start the sibling on the
@@ -12166,6 +12169,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
+    // Inherit policy before publishing the PID/TID. A remote setter must
+    // not have an accepted update overwritten by late fork inheritance.
+    sched_fork(parent_pid, child_tid.raw());
     // Copy before publishing the child's PID, so a cross-task prlimit cannot
     // update default limits only to have inheritance overwrite that update.
     // CLONE_THREAD already shares its constructor-selected process object.
@@ -12250,9 +12256,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // otherwise a present context is copied. This includes ioprio state.
     const CLONE_IO: u64 = 0x8000_0000;
     ioprio_fork(parent_pid, child_tid.raw(), flags & CLONE_IO != 0);
-    // `sched_fork`: policy, RT priority and nice are inherited, subject to
-    // SCHED_RESET_ON_FORK.
-    sched_fork(parent_pid, child_tid.raw());
 
     // fd table: CLONE_FILES (every pthread) SHARES one table with the parent —
     // an fd opened by any thread is visible to all, and close/dup affect all
@@ -18048,6 +18051,26 @@ pub(crate) fn coredump_limit(task: u64) -> u64 {
 /// process that wants the warning has to handle or block it.
 const SIGXCPU: u32 = 24;
 
+/// Linux RT watchdog: microseconds of CPU service since an actual block.
+/// Preemption and sched_yield do not reset it. Limits belong to the process;
+/// service belongs to the calling thread. Re-arm soft warnings every second.
+pub fn realtime_watchdog_tick() {
+    let runtime = narf_scheduler::stackful::current_realtime_runtime_ns() / 1_000;
+    if runtime == 0 { return; }
+    let task = current_task_id();
+    let Some(limits) = read_rlimit(task, 15) else { return; };
+    if limits.cur == RLIM_INFINITY { return; }
+    let Some(pid) = task_to_pid_raw(task) else { return; };
+    if limits.max != RLIM_INFINITY && runtime >= limits.max {
+        kill_process(pid, 9);
+    } else if runtime >= limits.cur {
+        kill_process(pid, SIGXCPU);
+        let _ = update_rlimit_atomic(task, None, 15,
+            Some(RLimitPair { cur: limits.cur.saturating_add(1_000_000).min(limits.max), max: limits.max }), true);
+    }
+}
+
+
 /// `kernel/time/posix-cpu-timers.c::check_process_timers`, RLIMIT_CPU arm:
 ///
 /// ```text
@@ -18811,6 +18834,13 @@ fn read_current_nice() -> i32 {
     read_nice(current_task_id())
 }
 fn write_nice(task: u64, prio: i32) -> bool {
+    let _update = SCHED_UPDATES.lock();
+    let state = read_sched_state(task);
+    if apply_user_scheduling(task, &state, prio).is_err() { return false; }
+    write_nice_raw(task, prio)
+}
+
+fn write_nice_raw(task: u64, prio: i32) -> bool {
     let mut g = NICE_TABLE.lock();
     let Some(m) = g.as_mut() else {
         return false;

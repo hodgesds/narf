@@ -80,6 +80,7 @@ pub mod policy;
 pub mod priority;
 pub mod stackful;
 pub mod steal;
+mod user_policy;
 
 #[cfg(feature = "hrtick")]
 mod hrtick;
@@ -131,6 +132,11 @@ pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
 pub use steal::{
     current_steal_strategy_name, install_steal_strategy, NumaAwareSteal, RandomSteal, Steal,
     StealError, StealStrategy,
+};
+pub use user_policy::{
+    alloc_user_task_id, inherit_user_scheduling, release_user_scheduling, set_user_scheduling,
+    user_scheduling, yield_user_scheduling, UserPolicy, UserScheduling, UserSchedulingAuthority,
+    UserSchedulingError,
 };
 
 // re-export the Invoke rights marker for callers who need to type a
@@ -453,7 +459,7 @@ pub fn cpu_demand(cpu: CpuId) -> CpuDemand {
         if !slot.awake.executor_runnable() {
             continue;
         }
-        let view = slot.account.view(now, &slot.spec.budget);
+        let view = user_policy::budget_view(slot, now);
         if view.eligibility == BudgetEligibility::Throttled {
             sample.next_deadline_cycles =
                 min_deadline(sample.next_deadline_cycles, view.replenish_at_cycles);
@@ -572,6 +578,9 @@ impl Drop for TaskSlot {
             address_space.scheduler_detach_user_task();
         }
         unregister_task_affinity(self.id);
+        if self.user_scheduling.is_some() {
+            user_policy::release_user_scheduling(self.id);
+        }
     }
 }
 
@@ -1047,6 +1056,17 @@ fn publish_budget_window(cpu: usize, started: u64, view: BudgetView, budget: &Re
     );
 }
 
+fn publish_user_rt_window(cpu: usize, started: u64, view: BudgetView) {
+    let end = started
+        .saturating_add(view.remaining_cycles)
+        .min(view.replenish_at_cycles.unwrap_or(u64::MAX));
+    let native = CURRENT_BUDGET_HARD_END[cpu].load(Ordering::Acquire);
+    let end = if native == 0 { end } else { end.min(native) };
+    CURRENT_BUDGET_SOFT_END[cpu].store(end, Ordering::Release);
+    CURRENT_BUDGET_HARD_END[cpu].store(end, Ordering::Release);
+    arm_scheduler_deadline(end);
+}
+
 fn clear_budget_window(cpu: usize) -> bool {
     CURRENT_BUDGET_SOFT_END[cpu].store(0, Ordering::Release);
     CURRENT_BUDGET_HARD_END[cpu].store(0, Ordering::Release);
@@ -1059,6 +1079,9 @@ fn clear_budget_window(cpu: usize) -> bool {
 /// appears or its bounded hard limit is reached.
 pub(crate) fn tick_preemption_required(current: u64, now: u64, slice_expired: bool) -> bool {
     let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    if user_policy::request_pending(cpu) {
+        return true;
+    }
     let soft_end = CURRENT_BUDGET_SOFT_END[cpu].load(Ordering::Acquire);
     let hard_end = CURRENT_BUDGET_HARD_END[cpu].load(Ordering::Acquire);
     if hard_end != 0 && now >= hard_end {
@@ -1119,6 +1142,7 @@ pub(crate) struct WakeCell {
     /// This task satisfies the deliberately narrow direct-handoff contract:
     /// built-in default class, no capability/budget gate, and stackful state.
     direct_eligible: AtomicBool,
+    user_rt: AtomicBool,
     /// Excludes executor dispatch/work stealing while another task is directly
     /// running this continuation. Protected by the home run-queue lock when it
     /// transitions false->true; cleared before control returns to the executor.
@@ -1153,7 +1177,8 @@ pub(crate) struct DirectHandoffTarget {
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn direct_handoff_slot_eligible(slot: &TaskSlot, destination: CpuId) -> bool {
-    slot.awake.executor_runnable()
+    user_policy::up_to_date(slot)
+        && slot.awake.executor_runnable()
         && slot.spec.affinity.allowed.contains(destination)
         && slot.spec.class == SchedClass::Default
         && slot.spec.priority == Priority::NORMAL
@@ -1357,6 +1382,7 @@ pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
         }
         let home = cell.cpu.load(Ordering::Acquire);
         note_runnable_peer(home, cell.task);
+        user_policy::note_rt_wake(cell, home);
         resched_remote(home);
     }
 }
@@ -1415,6 +1441,7 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
+        user_rt: AtomicBool::new(false),
         direct_eligible: AtomicBool::new(direct_eligible),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
@@ -2443,6 +2470,7 @@ fn send_resched_ipi(target_cpu: u32) {
 }
 
 pub(crate) struct TaskSlot {
+    user_scheduling: Option<user_policy::UserSlot>,
     /// Why the policy selected this dispatch; copied into its runtime event.
     pub(crate) dispatch_reason: policy::DispatchReason,
     task: BoxedTask,
@@ -2854,6 +2882,7 @@ pub fn __reset_queues_for_test() {
         MIGRATE_PENDING[cpu].store(false, Ordering::Release);
     }
     policy::__reset_balance_state_for_test();
+    user_policy::reset_for_test();
 }
 
 /// Authoritative affinity for every live scheduler task.
@@ -2868,6 +2897,7 @@ struct TaskAffinityEntry {
     id: TaskId,
     affinity: Affinity,
     realtime_pinned: bool,
+    inherit_request: bool,
 }
 
 const NEW_TASK_AFFINITY_SHARD: IrqSafeSpinLock<alloc::vec::Vec<TaskAffinityEntry>> =
@@ -2883,6 +2913,15 @@ fn task_affinity_shard(id: TaskId) -> usize {
 }
 
 fn register_task_affinity(id: TaskId, affinity: Affinity, realtime_pinned: bool) -> u64 {
+    register_task_affinity_with_inheritance(id, affinity, realtime_pinned, false)
+}
+
+fn register_task_affinity_with_inheritance(
+    id: TaskId,
+    affinity: Affinity,
+    realtime_pinned: bool,
+    inherit_request: bool,
+) -> u64 {
     let shard = task_affinity_shard(id);
     let mut entries = TASK_AFFINITY[shard].lock();
     entries.retain(|entry| entry.id != id);
@@ -2890,6 +2929,7 @@ fn register_task_affinity(id: TaskId, affinity: Affinity, realtime_pinned: bool)
         id,
         affinity,
         realtime_pinned,
+        inherit_request,
     });
     TASK_AFFINITY_GENERATION[shard]
         .fetch_add(1, Ordering::Release)
@@ -2997,6 +3037,16 @@ pub fn task_affinity(id: TaskId) -> Option<CpuSet> {
         .map(|entry| entry.affinity.allowed)
 }
 
+/// Explicit affinity requests inherited by Linux fork/clone descendants.
+/// Native placement pins (notably boot init/getty/shell) are per-task only.
+pub fn inheritable_task_affinity(id: TaskId) -> Option<CpuSet> {
+    TASK_AFFINITY[task_affinity_shard(id)]
+        .lock()
+        .iter()
+        .find(|entry| entry.id == id && entry.inherit_request)
+        .map(|entry| entry.affinity.allowed)
+}
+
 /// Failure from [`set_task_affinity`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SetAffinityError {
@@ -3034,6 +3084,7 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
             return Err(SetAffinityError::RealtimePinned);
         }
         entry.affinity = affinity;
+        entry.inherit_request = true;
         TASK_AFFINITY_GENERATION[shard]
             .fetch_add(1, Ordering::Release)
             .wrapping_add(1)
@@ -3739,12 +3790,7 @@ fn reap_revoked_parked(cpu: usize) {
             let index = slots.capped.iter().copied().find(|index| {
                 slots.slots[*index].task.as_ref().is_some_and(|entry| {
                     !entry.slot.awake.direct_claimed.load(Ordering::Acquire)
-                        && entry
-                            .slot
-                            .spec
-                            .budget_cap
-                            .as_ref()
-                            .is_some_and(|cap| cap.check_live().is_err())
+                        && !user_policy::authority_live(&entry.slot)
                 })
             });
             index.and_then(|index| {
@@ -3830,6 +3876,7 @@ fn park_slot(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) -> O
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
 fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason) {
+    user_policy::refresh(&mut slot, cpu);
     // A selection that requeues before execution has spent no CPU credit.
     // Executed picks have already consumed this marker at their charge site.
     slot.dispatch_reason = policy::DispatchReason::Policy;
@@ -3947,7 +3994,7 @@ fn slot_is_dispatchable(slot: &TaskSlot, now: u64) -> bool {
     if !slot.awake.executor_runnable() {
         return false;
     }
-    slot.account.view(now, &slot.spec.budget).eligibility != BudgetEligibility::Throttled
+    user_policy::budget_view(slot, now).eligibility != BudgetEligibility::Throttled
 }
 
 fn next_budget_replenishment(cpu: usize, now: u64) -> Option<u64> {
@@ -3956,7 +4003,7 @@ fn next_budget_replenishment(cpu: usize, now: u64) -> Option<u64> {
             .iter()
             .filter(|slot| slot.awake.executor_runnable())
             .filter_map(|slot| {
-                let view = slot.account.view(now, &slot.spec.budget);
+                let view = user_policy::budget_view(slot, now);
                 (view.eligibility == BudgetEligibility::Throttled)
                     .then_some(view.replenish_at_cycles)
                     .flatten()
@@ -3979,7 +4026,7 @@ fn notify_cpu_idle(cpu: usize) {
             if !slot.awake.executor_runnable() {
                 continue;
             }
-            let view = slot.account.view(now, &slot.spec.budget);
+            let view = user_policy::budget_view(slot, now);
             match view.eligibility {
                 BudgetEligibility::Eligible => {}
                 BudgetEligibility::Borrowable => borrowable += 1,
@@ -4046,6 +4093,7 @@ where
     let affinity_generation = register_task_affinity(id, spec.affinity, false);
     let awake = new_wake_cell(id, 0, false);
     let slot = TaskSlot {
+        user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(f),
         awake,
@@ -4104,6 +4152,7 @@ where
     let affinity_generation = register_task_affinity(id, spec.affinity, true);
     let awake = new_wake_cell(id, cpu as u32, false);
     let slot = TaskSlot {
+        user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
         awake,
@@ -4320,19 +4369,29 @@ where
     // otherwise a suspended syscall can strand a lock needed by every sibling
     // in its shared address space. Both supported architectures use the same
     // executor-private continuation model.
+    let user_scheduling = user_policy::attach(id, spec.budget_cap);
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    let task: BoxedTask = Box::pin(stackful::StackfulAdapter::with_options(
+    let task: BoxedTask = Box::pin(stackful::StackfulAdapter::with_user_scheduling(
         f,
         crate::StackfulOptions {
             no_preempt: true,
             user_preempt: true,
             ..Default::default()
         },
+        user_scheduling.control.clone(),
     ));
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let task: BoxedTask = Box::pin(f);
     let cpu = target_cpu(&spec);
-    let affinity_generation = register_task_affinity(id, spec.affinity, false);
+    let affinity_generation = register_task_affinity_with_inheritance(
+        id,
+        spec.affinity,
+        false,
+        user_scheduling
+            .control
+            .inherited_affinity
+            .load(Ordering::Acquire),
+    );
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let direct_eligible = spec.class == SchedClass::Default
         && spec.priority == Priority::NORMAL
@@ -4341,6 +4400,7 @@ where
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let direct_eligible = false;
     let awake = new_wake_cell(id, 0, direct_eligible);
+    user_policy::bind(&user_scheduling, &awake);
     // Preserve the load-aware admission decision through the child's first
     // dispatch. Without this short locality window, an idle CPU can steal a
     // freshly admitted remote child while the forking parent is still filling
@@ -4355,6 +4415,7 @@ where
     addr_space.scheduler_attach_user_task();
     register_live_user_address_space(id, &addr_space);
     let slot = TaskSlot {
+        user_scheduling: Some(user_scheduling),
         dispatch_reason: policy::DispatchReason::Policy,
         task,
         awake,
@@ -4836,6 +4897,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                 if let Some(d) = ready.iter().find(|s| s.id == donor_id) {
                     (
                         crate::policy::TaskMeta {
+                            rt_order: user_policy::order(d),
                             wake_reason: d
                                 .awake
                                 .blocking_wake
@@ -4848,7 +4910,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                             deadline_cycles: d.spec.budget.deadline_cycles,
                             budget: d.spec.budget,
                             account: d.account,
-                            budget_state: d.account.view(narf_time::now_cycles(), &d.spec.budget),
+                            budget_state: user_policy::budget_view(d, narf_time::now_cycles()),
                             runnable: d.awake.executor_runnable(),
                             affinity: d.spec.affinity,
                             addr_space: d.addr_space.is_some(),
@@ -4859,6 +4921,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                 } else {
                     (
                         crate::policy::TaskMeta {
+                            rt_order: 0,
                             wake_reason: None,
                             id: donor_id,
                             work_kind: crate::priority::WorkKind::AsyncTask,
@@ -4882,6 +4945,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             } else {
                 (
                     crate::policy::TaskMeta {
+                        rt_order: 0,
                         wake_reason: None,
                         id: TaskId::NONE,
                         work_kind: crate::priority::WorkKind::AsyncTask,
@@ -5107,6 +5171,7 @@ fn publish_owned_wake(cell: &WakeCell) -> u32 {
     if !prev_awake {
         wake_race_stamp(cell, home);
         note_runnable_peer(home, cell.task);
+        user_policy::note_rt_wake(cell, home);
     }
     home
 }
@@ -5148,6 +5213,8 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
         // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
         unsafe { wake_race_stamp(&*ptr, home) };
         note_runnable_peer(home, task);
+        // SAFETY: the native waker pins this WakeCell.
+        user_policy::note_rt_wake(unsafe { &*ptr }, home);
         // Backlog gauge for wake-time placement (see WAKE_PRESSURE): one
         // fresh wake toward `home` since its last dispatch round. Re-wakes
         // of an already-awake slot add no queue load and are skipped by the
@@ -5557,20 +5624,13 @@ pub fn poll_one_round() -> usize {
         // drop. A revoked donation cap rolls back both sides; the
         // donee still polls (donation never happened semantics).
         settle_donation(&mut slot);
-        if let Some(ref cap) = slot.spec.budget_cap {
-            if cap.check_live().is_err() {
-                // Abnormal drop (not the task's own Ready) — let the
-                // task-lifetime layer run exit teardown for the slot.
-                notify_slot_reaped(slot.id);
-                continue;
-            }
+        if !user_policy::authority_live(&slot) {
+            // Abnormal drop: retain userspace exit/observer teardown.
+            notify_slot_reaped(slot.id);
+            continue;
         }
-        if slot.spec.budget.period.is_some()
-            && slot
-                .account
-                .view(narf_time::now_cycles(), &slot.spec.budget)
-                .eligibility
-                == BudgetEligibility::Throttled
+        if user_policy::budget_view(&slot, narf_time::now_cycles()).eligibility
+            == BudgetEligibility::Throttled
         {
             enqueue_after_poll(cpu, slot);
             continue;
@@ -5600,6 +5660,10 @@ pub fn poll_one_round() -> usize {
             publish_budget_window(cpu, start.as_cycles(), view, &slot.spec.budget);
             view
         });
+        let user_budget = user_policy::begin(&slot, cpu, start.as_cycles());
+        if let Some(view) = user_budget {
+            publish_user_rt_window(cpu, start.as_cycles(), view);
+        }
         // Save + restore identity around the inner poll. We're
         // running INSIDE another task's poll (the user-mode
         // syscall handler that called sleep_pumps); a blunt
@@ -5618,6 +5682,9 @@ pub fn poll_one_round() -> usize {
         let borrowed = budget_dispatch.is_some_and(|view| {
             clear_budget_window(cpu) || view.eligibility == BudgetEligibility::Borrowable
         });
+        if user_budget.is_some() {
+            clear_budget_window(cpu);
+        }
         current_task_slot().store(outer_task, Ordering::Release);
         *active_user_as_slot().lock() = outer_as;
         let interrupt_elapsed = accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
@@ -5629,6 +5696,7 @@ pub fn poll_one_round() -> usize {
             .cycles_since(start)
             .saturating_sub(interrupt_elapsed)
             .saturating_sub(stackful::take_direct_foreign_cycles());
+        user_policy::charge(&slot, cpu, elapsed);
         policy::account_task_runtime(cpu, slot.id, elapsed, slot.dispatch_reason);
         let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
         // EEVDF-lite: charge the cycles this dispatch ran to the task's virtual
@@ -6102,22 +6170,15 @@ pub fn run_until_empty() {
 
             // Budget cap check — a revoked Cap<CpuBudget, Spend>
             // drops the task O(1). No cap attached → skip the check.
-            if let Some(ref cap) = slot.spec.budget_cap {
-                if cap.check_live().is_err() {
-                    // Task is off the scheduler: drop the slot. Abnormal
-                    // drop — run the task-lifetime exit teardown so a user
-                    // task can't bypass observers/registry cleanup.
-                    notify_slot_reaped(slot.id);
-                    continue;
-                }
+            if !user_policy::authority_live(&slot) {
+                // The native and delegated RT grants are both revocable.
+                // Preserve observers/registry cleanup on abnormal exit.
+                notify_slot_reaped(slot.id);
+                continue;
             }
 
-            if slot.spec.budget.period.is_some()
-                && slot
-                    .account
-                    .view(narf_time::now_cycles(), &slot.spec.budget)
-                    .eligibility
-                    == BudgetEligibility::Throttled
+            if user_policy::budget_view(&slot, narf_time::now_cycles()).eligibility
+                == BudgetEligibility::Throttled
             {
                 enqueue_after_poll(cpu, slot);
                 continue;
@@ -6174,6 +6235,10 @@ pub fn run_until_empty() {
                 publish_budget_window(cpu, start.as_cycles(), view, &slot.spec.budget);
                 view
             });
+            let user_budget = user_policy::begin(&slot, cpu, start.as_cycles());
+            if let Some(view) = user_budget {
+                publish_user_rt_window(cpu, start.as_cycles(), view);
+            }
             // Publish this slot's id + AS as the currently-polling
             // task so syscall handlers + introspection can identify
             // the caller and resolve its mappings. Cleared after the
@@ -6202,6 +6267,9 @@ pub fn run_until_empty() {
             let borrowed = budget_dispatch.is_some_and(|view| {
                 clear_budget_window(cpu) || view.eligibility == BudgetEligibility::Borrowable
             });
+            if user_budget.is_some() {
+                clear_budget_window(cpu);
+            }
             current_task_slot().store(0, Ordering::Release);
             // Keep the poll body's final AS alive while reconciling it with
             // the root installed by the outer handoff. An inline execve may
@@ -6228,6 +6296,7 @@ pub fn run_until_empty() {
                 .cycles_since(start)
                 .saturating_sub(interrupt_elapsed)
                 .saturating_sub(stackful::take_direct_foreign_cycles());
+            user_policy::charge(&slot, cpu, elapsed);
             policy::account_task_runtime(cpu, slot.id, elapsed, slot.dispatch_reason);
             let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
             // EEVDF-lite: charge the cycles this dispatch ran to the task's
@@ -7726,6 +7795,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
+        user_rt: AtomicBool::new(false),
         direct_eligible: AtomicBool::new(false),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
