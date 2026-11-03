@@ -119,9 +119,10 @@ pub(super) struct Device<I: Io> {
     sleep_enabled: AtomicBool,
     sleep_identity: IrqSafeSpinLock<Option<narf_net::native_emission::Lifetime>>,
     monitor_capable: AtomicBool,
-    /// Bit n set: 2.4GHz/20MHz primary n has a current signed full program
-    /// (channel1 = base N52B; 2..=13 = N52C). Sampled at activation.
-    channels: core::sync::atomic::AtomicU16,
+    /// `operating_channel::slot` mask (2.4GHz primary n = bit n, 5GHz from
+    /// bit 16) of 20MHz primaries with a current signed full program
+    /// (channel1 = base N52B; others N52C). Sampled at activation.
+    channels: core::sync::atomic::AtomicU64,
     fragments_capable: AtomicBool,
     desired: Arc<super::monitor::Desired>,
     selection: super::monitor::Selection,
@@ -269,10 +270,10 @@ impl<I: Io + 'static> Device<I> {
                         .any(|s| s.is_empty() || *s == c.bss.ssid)
             })
             .map(|c| BssInfo {
+                frequency_mhz: c.bss.frequency_mhz().unwrap_or(0),
                 bssid: c.bss.bssid,
                 ssid: c.bss.ssid,
                 channel: u32::from(c.bss.channel),
-                frequency_mhz: 2407 + 5 * u32::from(c.bss.channel),
                 rssi: i8::MIN,
                 security: if c.ap_rsne.is_some() {
                     narf_wireless::scan::BssSecurity::Wpa2
@@ -344,7 +345,7 @@ impl<I: Io + 'static> Device<I> {
             sleep_enabled: AtomicBool::new(false),
             sleep_identity: IrqSafeSpinLock::new(None),
             monitor_capable: AtomicBool::new(false),
-            channels: core::sync::atomic::AtomicU16::new(CHANNEL1),
+            channels: core::sync::atomic::AtomicU64::new(CHANNEL1),
             fragments_capable: AtomicBool::new(false),
             desired: super::monitor::Desired::new(),
             selection: super::monitor::Selection {
@@ -879,7 +880,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         // Only a signed-admitted primary (the advertised set) is accepted;
         // the fresh monitor generation retunes to it before any capture.
         let primary = super::monitor_wire::channel(channel)
-            .filter(|primary| self.channels.load(Ordering::Acquire) & (1 << primary) != 0)
+            .filter(|primary| {
+                station::channel_admitted(self.channels.load(Ordering::Acquire), *primary)
+            })
             .ok_or(WirelessError::NotSupported)?;
         let before = self.desired.snapshot();
         let selected = self
@@ -987,8 +990,11 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             base_mac: self.local,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: (1..=13u32)
-                    .filter(|channel| self.channels.load(Ordering::Acquire) & (1 << channel) != 0)
+                channels: (1..=13u8)
+                    .filter(|channel| {
+                        station::channel_admitted(self.channels.load(Ordering::Acquire), *channel)
+                    })
+                    .map(u32::from)
                     .collect(),
             }],
             modes: WirelessModes::STATION
@@ -1031,9 +1037,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
-        if !(1..=13).contains(&request.channel)
-            || self.channels.load(Ordering::Acquire) & (1 << request.channel) == 0
-            || request.frequency_mhz != 2407 + 5 * request.channel
+        let primary = u8::try_from(request.channel).map_err(|_| WirelessError::NotSupported)?;
+        if !station::channel_admitted(self.channels.load(Ordering::Acquire), primary)
+            || Some(request.frequency_mhz) != primary_frequency(primary)
         {
             return Err(WirelessError::NotSupported);
         }
@@ -1139,24 +1145,47 @@ fn random_scan_address(
     }
     Ok(bytes)
 }
-const CHANNEL1: u16 = 1 << 1;
-/// Requested 2.4GHz/20MHz primaries (channels plus frequencies, ascending,
-/// deduplicated); empty means every admitted primary like cfg80211's
-/// all-channels default. Every one must have a current signed program, so
-/// an unadmitted channel is refused before any retune or transmission.
-fn scan_channels(request: &ScanRequest, admitted: u16) -> Result<Vec<u8>, WirelessError> {
-    let mut mask = 0u16;
+const CHANNEL1: u64 = 1 << 1;
+/// cfg80211 `ieee80211_channel_to_freq_khz` for a typed 2.4GHz (1..=13) or
+/// 5GHz 20MHz primary.
+fn primary_frequency(primary: u8) -> Option<u32> {
+    if (1..=13).contains(&primary) {
+        Some(2407 + 5 * u32::from(primary))
+    } else if station::ghz5(primary) {
+        Some(5000 + 5 * u32::from(primary))
+    } else {
+        None
+    }
+}
+/// cfg80211 `ieee80211_freq_khz_to_channel` restricted to typed primaries.
+fn frequency_primary(frequency: u32) -> Option<u8> {
+    let channel = match frequency {
+        2412..=2472 => (frequency - 2407) / 5,
+        5180..=5885 => (frequency - 5000) / 5,
+        _ => return None,
+    };
+    let primary = u8::try_from(channel).ok()?;
+    (primary_frequency(primary) == Some(frequency)).then_some(primary)
+}
+/// Requested 20MHz primaries (channels plus frequencies, 2.4GHz then 5GHz
+/// ascending, deduplicated); empty means every admitted primary like
+/// cfg80211's all-channels default. Every one must have a current signed
+/// program, so an unadmitted channel is refused before any retune or
+/// transmission.
+fn scan_channels(request: &ScanRequest, admitted: u64) -> Result<Vec<u8>, WirelessError> {
+    let slot = |primary: u8| {
+        super::operating_channel::slot(primary)
+            .filter(|_| primary_frequency(primary).is_some())
+            .map(|bit| 1u64 << bit)
+            .ok_or(WirelessError::NotSupported)
+    };
+    let mut mask = 0u64;
     for &channel in &request.channels {
-        if !(1..=13).contains(&channel) {
-            return Err(WirelessError::NotSupported);
-        }
-        mask |= 1 << channel;
+        let primary = u8::try_from(channel).map_err(|_| WirelessError::NotSupported)?;
+        mask |= slot(primary)?;
     }
     for &frequency in &request.frequencies_mhz {
-        if !(2412..=2472).contains(&frequency) || (frequency - 2407) % 5 != 0 {
-            return Err(WirelessError::NotSupported);
-        }
-        mask |= 1 << ((frequency - 2407) / 5);
+        mask |= slot(frequency_primary(frequency).ok_or(WirelessError::NotSupported)?)?;
     }
     if mask == 0 {
         mask = admitted | CHANNEL1;
@@ -1164,9 +1193,7 @@ fn scan_channels(request: &ScanRequest, admitted: u16) -> Result<Vec<u8>, Wirele
     if mask & !(admitted | CHANNEL1) != 0 {
         return Err(WirelessError::NotSupported);
     }
-    Ok((1..=13u8)
-        .filter(|channel| mask & (1 << channel) != 0)
-        .collect())
+    Ok(super::operating_channel::primaries(mask).collect())
 }
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
     // cfg80211 `nl80211_parse_random_mac`: the mask must keep the group bit

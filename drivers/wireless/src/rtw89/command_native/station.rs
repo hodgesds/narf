@@ -191,6 +191,7 @@ impl Native {
             .core
             .take()
             .ok_or(packet::Error::State)?;
+        let rate = self.lowest_rate();
         let result = core.submit_fragment(
             &mut Access {
                 native: self,
@@ -199,6 +200,7 @@ impl Native {
             },
             part,
             report,
+            rate,
         );
         self.station_runtime.core = Some(core);
         if result.is_err() && result != Err(packet::Error::Busy) {
@@ -211,7 +213,22 @@ impl Native {
         bytes: &[u8],
         report: bool,
     ) -> Result<u64, packet::Error> {
+        if self.lowest_rate() != 0 {
+            return Err(packet::Error::Access);
+        }
         self.packet_operation(|core, port| core.submit(port, bytes, report))
+    }
+    /// core.c `rtw89_core_get_mgmt_rate` band floor of the current typed
+    /// primary: `RTW89_HW_RATE_CCK1` on 2.4GHz, `RTW89_HW_RATE_OFDM6` on 5GHz.
+    pub(in crate::rtw89) fn lowest_rate(&self) -> u8 {
+        if self
+            .operating_channel()
+            .is_some_and(|(primary, _)| primary > 14)
+        {
+            crate::rtw89::packet_format::OFDM6
+        } else {
+            0
+        }
     }
     pub(in crate::rtw89) fn submit_packet_rate(
         &mut self,
@@ -219,7 +236,16 @@ impl Native {
         report: bool,
         rate: u8,
     ) -> Result<u64, packet::Error> {
-        if rate != 0 && !self.station_wmm_allowed()? {
+        let lowest = self.lowest_rate();
+        // A fixed CCK rate is never published on 5GHz; the band's lowest
+        // rate (core.c `rtw89_core_get_mgmt_rate`: CCK1 / OFDM6) is the
+        // management/EAPOL rate and needs no WMM program.
+        let fixed = rate
+            & !(crate::rtw89::packet_format::FIRMWARE_RA | crate::rtw89::packet_format::DATA_ER);
+        if rate & crate::rtw89::packet_format::FIRMWARE_RA == 0 && fixed < lowest {
+            return Err(packet::Error::Access);
+        }
+        if rate != lowest && !self.station_wmm_allowed()? {
             return Err(packet::Error::Access);
         }
         if rate & crate::rtw89::packet_format::FIRMWARE_RA != 0
@@ -409,6 +435,11 @@ impl power::Io for Access<'_> {
 }
 #[async_trait::async_trait]
 impl control::Interface for Access<'_> {
+    fn ghz5(&mut self) -> bool {
+        self.native
+            .operating_channel()
+            .is_some_and(|(primary, _)| primary > 14)
+    }
     fn preflight(&mut self, indirect: bool) -> Result<(), power::Error> {
         if self.native.state != State::Active || self.native.chip != ChipId::Rtl8852B {
             return Err(power::Error::Terminal);

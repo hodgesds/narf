@@ -465,13 +465,14 @@ impl Core {
         port: &mut impl Port,
         part: &super::command_native::FragmentPart,
         radio_report: bool,
+        rate: u8,
     ) -> Result<u64, Error> {
         self.submit_inner(
             port,
             Submission {
                 bytes: part.bytes(),
                 radio_report,
-                rate: 0,
+                rate,
                 agg: None,
                 fragment: Some(part),
             },
@@ -570,6 +571,7 @@ impl Core {
                         ticket.sequence,
                         packet.body.dma_addr().raw(),
                         radio_report,
+                        rate,
                     )?
                 } else {
                     format::transmit_profile(

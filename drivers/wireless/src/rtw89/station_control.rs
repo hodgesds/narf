@@ -84,6 +84,11 @@ pub(super) trait Interface: Io + Send {
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error>;
+    /// The retained radio's current typed primary is a 5GHz channel (the
+    /// band-dependent CMAC lowest rate, SIFS and slot). Default 2.4GHz.
+    fn ghz5(&mut self) -> bool {
+        false
+    }
     async fn command(
         &mut self,
         category: u8,
@@ -284,7 +289,8 @@ impl Controller {
         )
         .await?;
         command(io, 5, 2, &codec::default_cctl(), true, Some(admission)).await?;
-        command(io, 5, 2, &codec::fixed_cctl(), true, Some(admission)).await?;
+        let ghz5 = io.ghz5();
+        command(io, 5, 2, &codec::fixed_cctl(ghz5), true, Some(admission)).await?;
         edca(io, false, Some(admission)).await?;
         checked(io, Some(admission), awake)?;
         admission.run(|| {
@@ -408,7 +414,8 @@ impl Controller {
             peer: self.peer.clone(),
             armed: true,
         };
-        command(io, 5, 2, &codec::fixed_cctl(), true, Some(admission)).await?;
+        let ghz5 = io.ghz5();
+        command(io, 5, 2, &codec::fixed_cctl(ghz5), true, Some(admission)).await?;
         command(io, 8, 0, &codec::join(true), true, Some(admission)).await?;
         command(
             io,
@@ -439,7 +446,7 @@ impl Controller {
         short: bool,
         admission: &Admission,
     ) -> Result<(), Error> {
-        let rows = codec::wmm_edca(p, short).ok_or(Error::Unsupported)?;
+        let rows = codec::wmm_edca(p, short, io.ghz5()).ok_or(Error::Unsupported)?;
         if self.phase() != Phase::Associated
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
         {
@@ -619,7 +626,7 @@ impl Controller {
         short: bool,
         admission: &Admission,
     ) -> Result<(), Error> {
-        let rows = codec::wmm_edca(p, short).ok_or(Error::Unsupported)?;
+        let rows = codec::wmm_edca(p, short, io.ghz5()).ok_or(Error::Unsupported)?;
         if self.phase() != Phase::Associated
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
         {
@@ -806,8 +813,17 @@ async fn edca(
     short: bool,
     admission: Option<&Admission>,
 ) -> Result<(), Error> {
+    let ghz5 = io.ghz5();
     for category in 0..4 {
-        command(io, 9, 15, &codec::edca(category, short), true, admission).await?;
+        command(
+            io,
+            9,
+            15,
+            &codec::edca(category, short, ghz5),
+            true,
+            admission,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -822,9 +838,9 @@ pub(super) fn profile_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
     hash.update(b"NARF RTL8852B MAC0 PHY0 STA MACID0 TX-A RX-AB legacy1 softwarecrypto v1");
     hash.update(&codec::default_cctl());
-    hash.update(&codec::fixed_cctl());
-    hash.update(&codec::edca(0, false));
-    hash.update(&codec::edca(0, true));
+    hash.update(&codec::fixed_cctl(false));
+    hash.update(&codec::edca(0, false, false));
+    hash.update(&codec::edca(0, true, false));
     hash.update(b"SEC_ENG_CTRL[4:0]=0 SEC_MPDU_PROC[1:0]=0 no security CAM keys");
     hash.finalize()
 }
@@ -883,7 +899,7 @@ pub(super) fn local_he() -> Option<narf_wireless::association::he::LocalHe> {
         0x80, // HT_VHT_TRIG_FRAME_RX
     ];
     const PHY: [u8; 11] = [
-        0x00, // 20MHz only in 2.4GHz
+        0x00, // 20MHz only (no 40MHz-in-2.4GHz / 40-80MHz-in-5GHz bit)
         0x70, // DEVICE_CLASS_A | LDPC_CODING_IN_PAYLOAD | HE_LTF_AND_GI_0_8US
         0x1a, // NDP_4x_LTF_AND_3_2US | STBC_RX_UNDER_80MHZ | DOPPLER_TX
         0x1b, // DCM_MAX_CONST_RX_16_QAM | DCM_MAX_CONST_TX_16_QAM (NSS1)
@@ -919,8 +935,12 @@ pub(super) fn qos_all_fingerprint() -> [u8; 32] {
     hash.update(&[0, 1, 1, 0, 2, 2, 3, 3]);
     hash.finalize()
 }
-pub(super) fn wmm_admit(p: narf_wireless::wmm::Parameters, short: bool) -> Result<(), Error> {
-    codec::wmm_edca(p, short)
+pub(super) fn wmm_admit(
+    p: narf_wireless::wmm::Parameters,
+    short: bool,
+    ghz5: bool,
+) -> Result<(), Error> {
+    codec::wmm_edca(p, short, ghz5)
         .map(|_| ())
         .ok_or(Error::Unsupported)
 }

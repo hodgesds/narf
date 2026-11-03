@@ -156,12 +156,11 @@ unsafe impl Io for Startup {
             .scan_address(&mut native.station_access(), address, admission)
             .await
     }
-    fn station_channels(&mut self) -> Result<u16, power::Error> {
+    fn station_channels(&mut self) -> Result<u64, power::Error> {
         self.station_allowed()?;
-        // The station (probe/basic-rate/TX-rate/RA/CSA paths) is still
-        // 2.4GHz-only: expose only the 2.4GHz bits of the admission mask.
-        // 5GHz primaries are admitted for the native retune owner only.
-        Ok((self.station_native()?.admitted_channels()? & 0x3ffe) as u16)
+        // The whole 2.4GHz + 5GHz slot mask: probe/basic-rate/TX-rate/RA/
+        // CMAC/EDCA/CSA paths are band-aware (`station::ghz5`).
+        self.station_native()?.admitted_channels()
     }
     async fn station_retune(
         &mut self,

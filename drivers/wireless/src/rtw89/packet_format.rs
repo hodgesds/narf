@@ -82,6 +82,9 @@ pub(super) const FIRMWARE_RA: u8 = 0x80;
 /// With `FIRMWARE_RA`: `RTW89_TXWD_INFO0_DATA_ER` (Linux `desc_info->er_cap`
 /// for an HE peer whose HE operation leaves ER SU enabled).
 pub(super) const DATA_ER: u8 = 0x40;
+/// `RTW89_HW_RATE_OFDM6`: the 5GHz management/fixed-rate floor (core.c
+/// `rtw89_core_get_mgmt_rate`); `RTW89_HW_RATE_CCK1` is 0.
+pub(super) const OFDM6: u8 = 4;
 /// `B_AX_STOP_WPDMA`.
 pub(super) const STOP_WPDMA: u32 = 1 << 19;
 /// Every ordinary TX stop bit this station can open (ACH0..3, CH8, WPDMA).
@@ -299,7 +302,12 @@ pub(super) fn transmit_fragment(
     sequence: u16,
     address: u64,
     report: bool,
+    rate: u8,
 ) -> Result<(Vec<u8>, Queue), Error> {
+    // Fixed band floor only: CCK1 (2.4GHz) or OFDM6 (5GHz).
+    if !matches!(rate, 0 | OFDM6) {
+        return Err(Error::Metadata);
+    }
     transmit_profile_inner(Tx {
         frame,
         own,
@@ -307,7 +315,7 @@ pub(super) fn transmit_fragment(
         sequence,
         address,
         report,
-        rate: 0,
+        rate,
         agg: None,
         limit: None,
         fragments: true,
@@ -353,7 +361,7 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
         || sequence >= IDENTITIES
         || index > 11
         || er && !adaptive
-        || queue == Queue::Management && rate != 0
+        || queue == Queue::Management && !matches!(rate, 0 | OFDM6)
     {
         return Err(Error::Metadata);
     }

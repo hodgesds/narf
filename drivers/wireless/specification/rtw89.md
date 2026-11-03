@@ -2290,7 +2290,7 @@ two-arch execution and physical validation. Unexecuted new cases:
 `smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon`,
 `smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux`.
 
-### RTL8852B 5GHz 20MHz channel program and admission (partial; station 2.4GHz-only)
+### RTL8852B 5GHz 20MHz channel program and admission (partial)
 
 **Typed profile.** `operating_channel::Profile` covers 2.4GHz 1..=14 and the
 Linux core.c `rtw89_channels_5ghz` 20MHz primaries (`GHZ5`: 36..64, 100..144,
@@ -2349,14 +2349,39 @@ u64 slot mask over 2.4GHz and 5GHz; `preflight_full_radio` loads N52C for
 typed primary (cross-band included). Without provisioned signed records only
 channel1 is admitted, exactly as before.
 
-Remaining before `five_ghz_operation` is whole (no row credit): the station
-is still 2.4GHz-only (`Startup::station_channels` exposes only the 2.4GHz
-bits): probe/rates IEs and basic-rate checks (`basic_rates & 1`), OFDM-only
-management TX rate, RA/CMAC mode masks, HT/HE 5GHz capability IEs, scan and
-association over 5GHz, ECSA classes 115..=130 / same-band CSA, 5GHz monitor
+**Station 5GHz path.** `station::Io::station_channels` is the whole u64
+slot mask (`Startup` returns `Native::admitted_channels`); scan, retune,
+association and CSA admit any typed 2.4GHz or 5GHz primary in it
+(`station::channel_admitted`). Per band, following Linux 7.3-rc4:
+probe requests (mac80211 `ieee80211_build_preq_ies_band`) carry the eight
+OFDM Supported Rates and neither Extended Supported Rates nor DS Parameter
+Set on 5GHz; the cached/associable BSS must have the band floor as a basic
+rate (1Mbps on 2.4GHz; 6Mbps and no CCK basic rate on 5GHz) because the
+fixed management/EAPOL/probe rate is core.c `rtw89_core_get_mgmt_rate`'s
+band floor (CCK1 / `RTW89_HW_RATE_OFDM6`, `packet_format::OFDM6`), also used
+for fragments. `Native::submit_packet*` refuse any fixed CCK rate on 5GHz
+and accept the band floor without the WMM program. Firmware RA follows phy.c
+`rtw89_phy_ra_sta_update` (`supp_rates[5GHz] << 4`, OFDM mode only). The
+CMAC table (fw.c `rtw89_fw_h2c_assoc_cmac_tbl`) uses OFDM6 for
+`RTS_RTY_LOWEST_RATE` and the fixed DATARATE on 5GHz (`codec::fixed_cctl`),
+and EDCA uses mac80211.c `rtw89_conf_tx_aifs` SIFS16 with the always-short
+5GHz slot (non-QoS default CWmin15, mac80211 `ieee80211_set_wmm_default`).
+The 2.4GHz bytes and the signed profile fingerprints are unchanged
+(`control::Interface::ghz5`, from the native operating primary). HT/HE
+capability IEs come from the shared band-aware `JoinPlan` with the same
+20MHz local profile (HE PHY cap0 width set 0 in both bands); as in mac80211
+HE on 5GHz additionally requires VHT, which this profile does not offer, so
+5GHz links are HT20 at most. CSA/ECSA follow `ieee80211_parse_ch_switch_ie`
+/ `ieee80211_operating_class_to_band` (81..=84 2.4GHz, 112/115..=130 5GHz;
+unknown class falls back to the CSA element in the current band); a
+cross-band switch updates the peer's band. Scan requests accept 5GHz
+channel numbers and frequencies (5180..=5885).
+
+Remaining before `five_ghz_operation` is whole (no row credit): 5GHz monitor
 chandef/observation (`0x1c00 | primary` readback is 2.4GHz-only), interface
 band advertisement, coex switch-band, DFS passive scanning, and all native
-two-arch plus physical validation. New unexecuted cases:
+two-arch plus physical validation. New unexecuted case:
+`smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`. New unexecuted cases:
 `smoke_rtw89_b_operating_profile_5ghz_matches_linux_indices_and_groups`,
 `smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx`,
 `smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary`,

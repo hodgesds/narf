@@ -383,7 +383,7 @@ impl Peer {
 
 static NEXT_SLEEP: AtomicBool = AtomicBool::new(false);
 /// Signed-admitted primaries for the next DriverModel (0: channel1 only).
-static NEXT_CHANNELS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+static NEXT_CHANNELS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 struct DriverModel {
     controller: crate::rtw89::station_control::Controller,
     control: crate::rtw89::station_control::tests::Model,
@@ -409,7 +409,7 @@ struct DriverModel {
         crate::rtw89::lps::tests::Firmware,
     )>,
     /// Admitted primaries mask and every native retune actually requested.
-    channels: u16,
+    channels: u64,
     retunes: Vec<u8>,
     /// Associated (CSA) channel switches requested of the native owner.
     switches: Vec<u8>,
@@ -507,7 +507,7 @@ impl DriverModel {
 // Native OrdinaryGrant remains unconstructible by this fixture. Both adapters
 // invoke their actual typed fixture capability around published operations.
 unsafe impl crate::rtw89::station::Io for DriverModel {
-    fn station_channels(&mut self) -> Result<u16, crate::rtw89::power::Error> {
+    fn station_channels(&mut self) -> Result<u64, crate::rtw89::power::Error> {
         Ok(self.channels)
     }
     /// Native retune owner model: refused (nothing published) unless the
@@ -518,7 +518,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         admission: &crate::rtw89::station_control::Admission,
     ) -> Result<u32, crate::rtw89::power::Error> {
         admission.check()?;
-        if self.channels & (1 << primary) == 0 {
+        if !crate::rtw89::station::channel_admitted(self.channels, primary) {
             return Err(crate::rtw89::power::Error::Unsupported);
         }
         if self.core.as_ref().is_some_and(|core| !core.ready()) {
@@ -535,7 +535,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         admission: &crate::rtw89::station_control::Admission,
     ) -> Result<u32, crate::rtw89::power::Error> {
         admission.check()?;
-        if self.channels & (1 << primary) == 0 {
+        if !crate::rtw89::station::channel_admitted(self.channels, primary) {
             return Err(crate::rtw89::power::Error::Unsupported);
         }
         if self.core.as_ref().is_none_or(|core| !core.ready()) {
@@ -853,7 +853,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         part: &crate::rtw89::command_native::FragmentPart,
         report: bool,
     ) -> Result<u64, crate::rtw89::packet_core::Error> {
-        self.packet(|c, p| c.submit_fragment(p, part, report))
+        self.packet(|c, p| c.submit_fragment(p, part, report, 0))
     }
     fn packet_submit(
         &mut self,
@@ -3214,20 +3214,29 @@ kernel_test_in!(
     smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon
 );
 
-/// `ieee80211_parse_ch_switch_ie`: ECSA precedes CSA; only 2.4GHz classes
-/// 81..=84 and primaries 1..=13 are usable; monitor chandef/RF readback
-/// follow the actual primary (rtw8852b_rfk.c `_ch_setting`).
+/// `ieee80211_parse_ch_switch_ie`: ECSA precedes CSA when its class is
+/// understood (`ieee80211_operating_class_to_band`: 81..=84 2.4GHz, 112 and
+/// 115..=130 5GHz); CSA targets the current band; monitor chandef/RF
+/// readback follow the actual primary (rtw8852b_rfk.c `_ch_setting`).
 fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
     use crate::rtw89::{monitor_wire, station::channel_switch};
-    let csa = channel_switch(&[0, 1, b'x', 37, 3, 1, 11, 4]);
-    let ecsa = channel_switch(&[37, 3, 0, 11, 4, 60, 4, 0, 81, 6, 2]);
-    let five = channel_switch(&[60, 4, 1, 115, 36, 3]);
+    let csa = channel_switch(&[0, 1, b'x', 37, 3, 1, 11, 4], 6);
+    let ecsa = channel_switch(&[37, 3, 0, 11, 4, 60, 4, 0, 81, 6, 2], 1);
+    let five = channel_switch(&[60, 4, 1, 115, 36, 3], 6);
     if csa.map(|a| (a.mode, a.primary, a.count)) != Some((true, Some(11), 4))
         || ecsa.map(|a| (a.mode, a.primary, a.count)) != Some((false, Some(6), 2))
-        || five.map(|a| a.primary) != Some(None)
-        || channel_switch(&[37, 3, 0, 14, 1]).map(|a| a.primary) != Some(None)
-        || channel_switch(&[37, 2, 0, 6]).is_some()
-        || channel_switch(&[37, 9, 0, 6, 1]).is_some()
+        || five.map(|a| (a.mode, a.primary, a.count)) != Some((true, Some(36), 3))
+        || channel_switch(&[60, 4, 0, 125, 149, 1], 36).map(|a| a.primary) != Some(Some(149))
+        || channel_switch(&[60, 4, 0, 112, 6, 1], 36).map(|a| a.primary) != Some(None)
+        || channel_switch(&[60, 4, 0, 131, 37, 1], 36).map(|a| a.primary) != Some(None)
+        // Unknown class: fall back to CSA in the current band, or nothing.
+        || channel_switch(&[37, 3, 0, 44, 1, 60, 4, 0, 99, 6, 1], 36).map(|a| a.primary)
+            != Some(Some(44))
+        || channel_switch(&[60, 4, 0, 99, 6, 1], 1).is_some()
+        || channel_switch(&[37, 3, 0, 36, 1], 6).map(|a| a.primary) != Some(None)
+        || channel_switch(&[37, 3, 0, 14, 1], 1).map(|a| a.primary) != Some(None)
+        || channel_switch(&[37, 2, 0, 6], 1).is_some()
+        || channel_switch(&[37, 9, 0, 6, 1], 1).is_some()
     {
         return TestResult::Fail("CSA/ECSA parse differs from mac80211");
     }
@@ -3254,4 +3263,40 @@ fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux
+);
+
+/// 5GHz station facts: mac80211 `ieee80211_build_preq_ies_band` probe
+/// content (OFDM Supported Rates only, no Extended Rates/DS Parameter Set),
+/// the slot admission mask, and the band-floor basic-rate requirement.
+fn smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux() -> TestResult {
+    use crate::rtw89::station::{channel_admitted as admitted, ghz5, probe_request};
+    let own = [2, 0, 0, 0, 0, 1];
+    let two = probe_request(own, b"x", &[], 6);
+    let five = probe_request(own, b"x", &[221, 1, 7], 36);
+    if two[24..]
+        != [
+            0, 1, b'x', 1, 8, 2, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108, 3, 1, 6,
+        ]
+        || five[24..] != [0, 1, b'x', 1, 8, 12, 18, 24, 36, 48, 72, 96, 108, 221, 1, 7]
+    {
+        return TestResult::Fail("probe request IEs differ per band");
+    }
+    // 2.4GHz primary n = bit n; 5GHz from bit 16 in GHZ5 order.
+    let mask = 1u64 << 1 | 1 << 16 | 1 << 36;
+    if !admitted(mask, 1)
+        || !admitted(mask, 36)
+        || !admitted(mask, 149)
+        || admitted(mask, 40)
+        || admitted(mask, 14)
+        || admitted(1 << 16, 16)
+        || !ghz5(165)
+        || ghz5(13)
+    {
+        return TestResult::Fail("5GHz slot admission mask differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux
 );

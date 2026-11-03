@@ -160,8 +160,8 @@ pub(super) unsafe trait Io: Send {
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
-    /// Retune the Ready radio to `primary` (2.4GHz/20MHz, signed N52C record
-    /// required for 2..=13) and return the new retune epoch. `Busy` is a
+    /// Retune the Ready radio to `primary` (2.4GHz or 5GHz 20MHz, signed
+    /// N52C record required except channel1) and return the new retune epoch. `Busy` is a
     /// proven-unpublished refusal while TX/RX work is still pending.
     async fn station_retune(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
@@ -172,9 +172,10 @@ pub(super) unsafe trait Io: Send {
     async fn station_switch_channel(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
     }
-    /// Bit n set: primary n has a current signed full program (channel1 is
+    /// `operating_channel::slot` mask (2.4GHz primary n = bit n, 5GHz from
+    /// bit 16) of primaries with a current signed full program (channel1 is
     /// the base record). Default: channel1 only.
-    fn station_channels(&mut self) -> Result<u16, power::Error> {
+    fn station_channels(&mut self) -> Result<u64, power::Error> {
         Ok(1 << 1)
     }
     /// `rtw89_core_scan_start`/`_complete` address CAM update: a random scan
@@ -406,10 +407,13 @@ pub(super) struct Probe {
     /// (`IEEE80211_TX_CTRL_NO_SEQNO`).
     pub(super) random_sn: bool,
 }
-/// mac80211 `ieee80211_build_probe_req` for this 2.4GHz/20MHz profile:
-/// SSID, Supported Rates (1,2,5.5,11,6,9,12,18), Extended Supported Rates
-/// (24,36,48,54), DS Parameter Set (the retained radio's actual primary,
-/// `ieee80211_put_ds_params`), then the caller's extra IEs.
+/// mac80211 `ieee80211_build_probe_req` (`ieee80211_build_preq_ies_band`)
+/// for this 20MHz profile. 2.4GHz: SSID, Supported Rates
+/// (1,2,5.5,11,6,9,12,18), Extended Supported Rates (24,36,48,54), DS
+/// Parameter Set (the retained radio's actual primary). 5GHz: SSID and the
+/// eight OFDM Supported Rates (6..54) only; no Extended Supported Rates
+/// (nothing left over) and no DS Parameter Set (2.4GHz only). Then the
+/// caller's extra IEs.
 pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8], channel: u8) -> Vec<u8> {
     let mut frame = vec![0x40, 0, 0, 0];
     frame.extend_from_slice(&[0xff; 6]);
@@ -418,11 +422,38 @@ pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8], channel: u8) 
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&[0, ssid.len() as u8]);
     frame.extend_from_slice(ssid);
-    frame.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
-    frame.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
-    frame.extend_from_slice(&[3, 1, channel]);
+    if ghz5(channel) {
+        frame.extend_from_slice(&[1, 8, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c]);
+    } else {
+        frame.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
+        frame.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
+        frame.extend_from_slice(&[3, 1, channel]);
+    }
     frame.extend_from_slice(ies);
     frame
+}
+/// A typed 5GHz primary (`operating_channel::GHZ5`).
+pub(super) fn ghz5(primary: u8) -> bool {
+    super::operating_channel::GHZ5.contains(&primary)
+}
+/// A typed 20MHz primary this station may tune: 2.4GHz 1..=13 or 5GHz.
+fn typed(primary: u8) -> bool {
+    (1..=13).contains(&primary) || ghz5(primary)
+}
+/// `primary` is set in an `operating_channel::slot` admission mask.
+pub(super) fn channel_admitted(mask: u64, primary: u8) -> bool {
+    typed(primary)
+        && super::operating_channel::slot(primary).is_some_and(|bit| mask & (1u64 << bit) != 0)
+}
+/// The station's own fixed management rate on `primary` (core.c
+/// `rtw89_core_get_mgmt_rate` band floor) must be a BSS basic rate:
+/// 1Mbps on 2.4GHz, 6Mbps on 5GHz, where no CCK rate may be basic.
+fn basic_ok(primary: u8, basic: u16) -> bool {
+    if ghz5(primary) {
+        basic & 0x10 != 0 && basic & 0xf == 0
+    } else {
+        basic & 1 != 0
+    }
 }
 enum BaOp {
     Start(super::block_ack::Request, u16),
@@ -539,16 +570,19 @@ pub(super) struct Switch {
     pub switched: bool,
 }
 /// Parsed CSA/ECSA element of a beacon (`ieee80211_parse_ch_switch_ie`):
-/// ECSA (60) takes precedence over CSA (37). `None` primary is a target
-/// outside 2.4GHz (ECSA operating class not 81..=84) or channel 14/out of
-/// range, which this 2.4GHz/20MHz station cannot use.
+/// ECSA (60) takes precedence over CSA (37) when its operating class is
+/// understood (`ieee80211_operating_class_to_band`: 81..=84 2.4GHz, 112 and
+/// 115..=130 5GHz, 131..=135/137 6GHz, 180 60GHz); otherwise the CSA element
+/// is used in the current band. `None` primary is a target this 20MHz
+/// station has no typed channel for (another band, channel 14, or a channel
+/// outside the band's primaries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Announcement {
     pub mode: bool,
     pub primary: Option<u8>,
     pub count: u8,
 }
-pub(super) fn channel_switch(ies: &[u8]) -> Option<Announcement> {
+pub(super) fn channel_switch(ies: &[u8], current: u8) -> Option<Announcement> {
     let mut csa = None;
     let mut ecsa = None;
     let mut rest = ies;
@@ -558,9 +592,7 @@ pub(super) fn channel_switch(ies: &[u8]) -> Option<Announcement> {
             break;
         };
         match (*id, body) {
-            (37, [mode, channel, count]) if csa.is_none() => {
-                csa = Some((*mode, None, *channel, *count))
-            }
+            (37, [mode, channel, count]) if csa.is_none() => csa = Some((*mode, *channel, *count)),
             (60, [mode, class, channel, count]) if ecsa.is_none() => {
                 ecsa = Some((*mode, Some(*class), *channel, *count))
             }
@@ -568,12 +600,31 @@ pub(super) fn channel_switch(ies: &[u8]) -> Option<Announcement> {
         }
         rest = &tail[len..];
     }
-    let (mode, class, channel, count) = ecsa.or(csa)?;
-    // ieee80211_operating_class_to_band: 81..=84 are the 2.4GHz classes.
-    let band2 = class.is_none_or(|class| (81..=84).contains(&class));
+    // 0: 2.4GHz, 1: 5GHz, 2: a band without typed channels here.
+    let class_band = |class: u8| match class {
+        81..=84 => Some(0),
+        112 | 115..=130 => Some(1),
+        131..=135 | 137 | 180 => Some(2),
+        _ => None,
+    };
+    let current_band = u8::from(ghz5(current));
+    let (mode, band, channel, count) = match ecsa {
+        Some((mode, Some(class), channel, count)) if class_band(class).is_some() => {
+            (mode, class_band(class)?, channel, count)
+        }
+        _ => {
+            let (mode, channel, count) = csa?;
+            (mode, current_band, channel, count)
+        }
+    };
+    let primary = match band {
+        0 => (1..=13).contains(&channel),
+        1 => ghz5(channel),
+        _ => false,
+    };
     Some(Announcement {
         mode: mode == 1,
-        primary: (band2 && (1..=13).contains(&channel)).then_some(channel),
+        primary: primary.then_some(channel),
         count,
     })
 }
@@ -946,7 +997,12 @@ impl State {
                 .find(|rate| rates & (1 << rate) != 0)
                 .ok_or(Error::Profile)?
         } else {
-            0
+            // rtw89_core_get_mgmt_rate: CCK1 on 2.4GHz, OFDM6 on 5GHz.
+            if ghz5(self.channel) {
+                super::packet_format::OFDM6
+            } else {
+                0
+            }
         };
         let id = match agg {
             Some(agg) => io.packet_submit_agg(&bytes, false, rate, agg)?,
@@ -978,7 +1034,7 @@ impl State {
         let Ok(candidate) = association::observe(frame, self.channel, own, signal) else {
             return;
         };
-        if candidate.basic_rates & 1 == 0 {
+        if !basic_ok(self.channel, candidate.basic_rates) {
             return;
         }
         if self
@@ -1057,7 +1113,8 @@ impl State {
         }
         if self.phase != Phase::Open
             || offered.uapsd != current.uapsd
-            || super::station_control::wmm_admit(offered, self.short_slot).is_err()
+            || super::station_control::wmm_admit(offered, self.short_slot, ghz5(self.channel))
+                .is_err()
         {
             return Err(Error::PeerLost);
         }
@@ -1087,7 +1144,7 @@ impl State {
         else {
             return Ok(());
         };
-        let announced = channel_switch(&candidate.bss.information_elements);
+        let announced = channel_switch(&candidate.bss.information_elements, self.channel);
         if let Some(active) = self.csa {
             if active.switched {
                 self.csa = None;
@@ -1107,7 +1164,7 @@ impl State {
         if primary == self.channel {
             return Ok(());
         }
-        if io.station_channels()? & (1 << primary) == 0 {
+        if !channel_admitted(io.station_channels()?, primary) {
             return Err(Error::PeerLost);
         }
         // csa_time_tu = (max(count, 1) - 1) * beacon_int.
@@ -1148,7 +1205,7 @@ impl State {
         let Some(csa) = self.csa.filter(|csa| !csa.switched) else {
             return Ok(());
         };
-        if self.phase != Phase::Open || !(1..=13).contains(&csa.primary) {
+        if self.phase != Phase::Open || !typed(csa.primary) {
             return Err(Error::State);
         }
         let now = self.now()?;
@@ -1167,7 +1224,9 @@ impl State {
                 self.channel = csa.primary;
                 self.epoch = Some(epoch);
                 if let Some(peer) = self.peer.as_mut() {
+                    // An ECSA may move the link to the other band.
                     peer.bss.channel = csa.primary;
+                    peer.bss.band = association::channel::band(csa.primary);
                 }
                 // rtw89_track_work statistics belong to the old primary.
                 self.track = super::track::Tracker::default();
@@ -1726,14 +1785,16 @@ impl State {
                         let peer = self.peer.as_ref().ok_or(Error::State)?;
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
-                        let short = peer.bss.capability & response_cap & 0x400 != 0;
+                        // mac80211: 5GHz always uses the short slot time.
+                        let short =
+                            ghz5(self.channel) || peer.bss.capability & response_cap & 0x400 != 0;
                         if self.wmm.is_some() {
                             let p = narf_wireless::wmm::Parameters::parse(
                                 frame.bytes().get(30..).ok_or(Error::Profile)?,
                             )
                             .map_err(|_| Error::Profile)?
                             .ok_or(Error::Profile)?;
-                            super::station_control::wmm_admit(p, short)?;
+                            super::station_control::wmm_admit(p, short, ghz5(self.channel))?;
                             self.wmm = Some(p);
                         }
                         self.peer_commit = Some((aid, short));
@@ -2022,7 +2083,7 @@ impl State {
     /// refusal (RX/H2C backlog) is retried after polling, bounded. Cached
     /// candidates keep their own observed channel.
     pub(super) async fn retune(&mut self, io: &mut impl Io, primary: u8) -> Result<(), Error> {
-        if !(1..=13).contains(&primary) {
+        if !typed(primary) {
             return Err(Error::Profile);
         }
         if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
@@ -2055,7 +2116,7 @@ impl State {
     }
     /// mac80211 software scan (`ieee80211_scan_state_set_channel`,
     /// `ieee80211_scan_state_send_probe`, then the dwell) over each listed
-    /// 2.4GHz primary in order, each retuned by the native owner. Results
+    /// 2.4GHz or 5GHz primary in order (probe content per band), each retuned by the native owner. Results
     /// from every channel accumulate in the shared candidate cache.
     pub(super) async fn scan_channels(
         &mut self,
@@ -2065,8 +2126,8 @@ impl State {
         probe: impl Fn() -> Option<Probe>,
     ) -> Result<Vec<ObservedBss>, Error> {
         if channels.is_empty()
-            || channels.len() > 13
-            || channels.iter().any(|channel| !(1..=13).contains(channel))
+            || channels.len() > 13 + super::operating_channel::GHZ5.len()
+            || channels.iter().any(|channel| !typed(*channel))
         {
             return Err(Error::Profile);
         }
@@ -2140,7 +2201,8 @@ impl State {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if !(1..=13).contains(&candidate.bss.channel) || candidate.basic_rates & 1 == 0 {
+        if !typed(candidate.bss.channel) || !basic_ok(candidate.bss.channel, candidate.basic_rates)
+        {
             return Err(Error::Profile);
         }
         // mac80211 ieee80211_prep_channel: the station joins on the BSS's
@@ -2255,7 +2317,12 @@ impl State {
             None
         };
         if let Some(p) = self.wmm {
-            super::station_control::wmm_admit(p, candidate.bss.capability & 0x400 != 0)?;
+            let band5 = ghz5(candidate.bss.channel);
+            super::station_control::wmm_admit(
+                p,
+                band5 || candidate.bss.capability & 0x400 != 0,
+                band5,
+            )?;
         }
         self.qos_all = self.wmm.is_some() && io.station_qos_all_allowed()?;
         self.firmware_ra = self.wmm.is_some() && io.station_firmware_ra_allowed()?;
@@ -2283,7 +2350,10 @@ impl State {
                     io.station_configure_wmm(p, short, &self.admission).await?;
                     if self.firmware_ra {
                         let plan = self.plan.as_ref().ok_or(Error::State)?;
-                        let rates = plan.legacy_rates().0;
+                        // phy.c rtw89_phy_ra_sta_update: a 5GHz peer's
+                        // supp_rates[5GHz] << 4 is OFDM-only (no RA CCK mode).
+                        let rates =
+                            plan.legacy_rates().0 & if ghz5(self.channel) { 0xff0 } else { 0xfff };
                         let ht = plan.negotiated_phy().map(|phy| {
                             let ht = phy.ht();
                             let m = ht.peer_rx_mcs();

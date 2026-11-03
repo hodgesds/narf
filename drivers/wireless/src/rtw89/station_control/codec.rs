@@ -102,12 +102,16 @@ pub(super) fn default_cctl() -> [u8; 68] {
     field(&mut bytes, 7, 0x0f00_0000, 0);
     bytes
 }
-pub(super) fn fixed_cctl() -> [u8; 68] {
+/// `ghz5`: fw.c `rtw89_fw_h2c_assoc_cmac_tbl` lowest rate is OFDM6 off
+/// 2.4GHz (`RTS_RTY_LOWEST_RATE`), and the fixed legacy DATARATE follows
+/// core.c `rtw89_core_get_mgmt_rate` (OFDM6 on 5GHz).
+pub(super) fn fixed_cctl(ghz5: bool) -> [u8; 68] {
+    let lowest = if ghz5 { 4 } else { 0 }; // RTW89_HW_RATE_OFDM6 / CCK1
     let mut bytes = [0; 68];
     word(&mut bytes, 0, 1 << 7);
     field(&mut bytes, 1, 1 << 25, 1); // source disable RTS fallback
     field(&mut bytes, 1, 1 << 26, 1); // source disable data fallback
-    field(&mut bytes, 2, 0xf000_0000, 0); // source RTS retry lowest CCK1
+    field(&mut bytes, 2, 0xf000_0000, lowest); // source RTS retry lowest CCK1/OFDM6
     field(&mut bytes, 2, 1 << 11, 0); // source retry-limit select
     field(&mut bytes, 3, 1 << 6, 0);
     field(&mut bytes, 7, 1 << 17, 1); // source STA ULDL
@@ -117,15 +121,22 @@ pub(super) fn fixed_cctl() -> [u8; 68] {
     }
     field(&mut bytes, 8, 3 << 28, 0); // source non-HE160 padding
                                       // Explicit source setters for the fixed legacy/raw software-crypto path.
-    field(&mut bytes, 1, 0x1ff, 0); // CCK1
+    field(&mut bytes, 1, 0x1ff, lowest); // CCK1 (2.4GHz) / OFDM6 (5GHz)
     field(&mut bytes, 1, 3 << 10, 0); //20MHz
     field(&mut bytes, 1, 1 << 27, 0); // no trial rate
     field(&mut bytes, 4, 0xf000_0000, 0); // no hardware security type
     bytes
 }
-pub(super) fn edca(ac: u8, short: bool) -> [u8; 12] {
+pub(super) fn edca(ac: u8, short: bool, ghz5: bool) -> [u8; 12] {
     let mut bytes = [0; 12];
     word(&mut bytes, 0, u32::from(ac) << 5);
+    if ghz5 {
+        // mac80211 `ieee80211_set_wmm_default` non-QoS 5GHz (OFDM, not
+        // 11b): CWmin15/CWmax1023/AIFSN2/TXOP0; 5GHz is always short slot
+        // and mac80211.c `rtw89_conf_tx_aifs` uses SIFS16: 2*9+16.
+        word(&mut bytes, 1, (10 << 12) | (4 << 8) | 34);
+        return bytes;
+    }
     // Non-QoS legacy-b CWmin31/CWmax1023/AIFSN2/TXOP0, 2.4GHz SIFS10.
     word(
         &mut bytes,
@@ -304,7 +315,20 @@ pub(super) fn ra_ht(rates: u16, ht: Option<HtRa>) -> Option<[u8; 16]> {
     word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
     Some(bytes)
 }
-pub(super) fn wmm_edca(p: narf_wireless::wmm::Parameters, short: bool) -> Option<[[u8; 12]; 4]> {
+/// `ghz5`: mac80211.c `rtw89_conf_tx_aifs` SIFS16 (10 on 2.4GHz), and
+/// 5GHz always uses the short slot.
+pub(super) fn wmm_edca(
+    p: narf_wireless::wmm::Parameters,
+    short: bool,
+    ghz5: bool,
+) -> Option<[[u8; 12]; 4]> {
+    let (slot, sifs) = if ghz5 {
+        (9, 16)
+    } else if short {
+        (9, 10)
+    } else {
+        (20, 10)
+    };
     if p.ac[0].admission_control
         || p.ac.iter().any(|a| {
             a.ecw_min == 0
@@ -319,9 +343,7 @@ pub(super) fn wmm_edca(p: narf_wireless::wmm::Parameters, short: bool) -> Option
     }
     let mut commands = [[0; 12]; 4];
     for (i, a) in p.ac.iter().enumerate() {
-        let aifs = u32::from(if i == 0 { a.aifsn.max(3) } else { a.aifsn })
-            * if short { 9 } else { 20 }
-            + 10;
+        let aifs = u32::from(if i == 0 { a.aifsn.max(3) } else { a.aifsn }) * slot + sifs;
         if aifs > 255 {
             return None;
         }
