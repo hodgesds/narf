@@ -2377,8 +2377,15 @@ unknown class falls back to the CSA element in the current band); a
 cross-band switch updates the peer's band. Scan requests accept 5GHz
 channel numbers and frequencies (5180..=5885).
 
-Remaining before `five_ghz_operation` is whole (no row credit): 5GHz monitor
-chandef/observation (`0x1c00 | primary` readback is 2.4GHz-only), interface
+**5GHz monitor.** `monitor_wire::channel` accepts an exact NOHT/HT20
+chandef on any typed 5GHz primary (5180..=5885MHz, still signed-admission
+gated), `frequency` is cfg80211 `ieee80211_channel_to_freq_khz`, and
+`observed_channel` expects rtw8852b_rfk.c `_ch_setting` on 5GHz:
+`0x1c00 | CFGCH_BAND1_5G<<16 | CFGCH_BAND0_5G<<8 | primary` on all four
+DAV/DDV words. Capture metadata carries the observed 5GHz frequency (the
+shared radiotap encoder is band-aware).
+
+Remaining before `five_ghz_operation` is whole (no row credit): interface
 band advertisement, coex switch-band, DFS passive scanning, and all native
 two-arch plus physical validation. New unexecuted case:
 `smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`. New unexecuted cases:

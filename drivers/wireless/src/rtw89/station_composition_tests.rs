@@ -3250,7 +3250,15 @@ fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
         || monitor_wire::channel(chandef(2472, 0)) != Some(13)
         || monitor_wire::channel(chandef(2484, 1)).is_some()
         || monitor_wire::channel(chandef(2437, 2)).is_some()
-        || monitor_wire::channel(chandef(5180, 1)).is_some()
+        || monitor_wire::channel(chandef(5180, 1)) != Some(36)
+        || monitor_wire::channel(chandef(5825, 0)) != Some(165)
+        || monitor_wire::channel(chandef(5190, 1)).is_some()
+        || monitor_wire::channel(chandef(5180, 2)).is_some()
+        || monitor_wire::channel(chandef(5000 + 5 * 34, 1)).is_some()
+        || monitor_wire::frequency(36) != 5180
+        || !monitor_wire::observed_channel([0x11d24; 4], 36)
+        || monitor_wire::observed_channel([0x1c24; 4], 36)
+        || monitor_wire::observed_channel([0x11d06; 4], 6)
         || monitor_wire::frequency(6) != 2437
         || !monitor_wire::observed_channel([0x1c06; 4], 6)
         || monitor_wire::observed_channel([0x1c01; 4], 6)

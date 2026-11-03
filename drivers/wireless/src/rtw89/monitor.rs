@@ -9,7 +9,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub(super) struct Selection {
     pub mode: u32,
     pub generation: u64,
-    /// Requested 2.4GHz/20MHz monitor primary (mac80211 monitor chandef).
+    /// Requested 2.4GHz or 5GHz 20MHz monitor primary (mac80211 monitor
+    /// chandef).
     /// Part of the selection: a change invalidates every older role/source.
     pub primary: u8,
 }

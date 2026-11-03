@@ -14,23 +14,35 @@ pub(super) const TO_HOST: u32 = 0x55555555;
 pub(super) fn flags(value: u32) -> bool {
     value & !((1 << 3) | (1 << 4)) == 0
 }
-/// 2.4GHz/20MHz primary (1..=13) of an exact NOHT/HT20 monitor chandef.
-/// Wider channels/other bands have their separate native/qualification
-/// rows; never narrow a request. The caller still requires the primary to
-/// be signed-admitted (`Native::admitted_channels`).
+/// Typed 20MHz primary (2.4GHz 1..=13 or a 5GHz `operating_channel::GHZ5`
+/// primary) of an exact NOHT/HT20 monitor chandef. Wider channels/other
+/// bands have their separate native/qualification rows; never narrow a
+/// request. The caller still requires the primary to be signed-admitted
+/// (`Native::admitted_channels`).
 pub(super) fn channel(value: Channel) -> Option<u8> {
-    let offset = value.frequency_mhz.checked_sub(2407)?;
+    let (base, primaries) = match value.frequency_mhz {
+        2412..=2472 => (2407, 1..=13),
+        5180..=5885 => (5000, 36..=177),
+        _ => return None,
+    };
+    let offset = value.frequency_mhz - base;
     let primary = u8::try_from(offset / 5).ok()?;
     (offset % 5 == 0
-        && (1..=13).contains(&primary)
+        && primaries.contains(&primary)
+        && (primary <= 13 || super::operating_channel::GHZ5.contains(&primary))
         && matches!(value.width, 0 | 1)
         && value.center1_mhz == value.frequency_mhz
         && value.center2_mhz == 0)
         .then_some(primary)
 }
-/// Center frequency of a 2.4GHz primary 1..=13.
+/// Center frequency of a typed 2.4GHz (1..=13) or 5GHz primary (cfg80211
+/// `ieee80211_channel_to_freq_khz`).
 pub(super) const fn frequency(primary: u8) -> u32 {
-    2407 + 5 * primary as u32
+    if primary <= 14 {
+        2407 + 5 * primary as u32
+    } else {
+        5000 + 5 * primary as u32
+    }
 }
 /// Actual firmware role MONITOR7, SELF_ROLE_NONE0, MACID0/MAC0/port0.
 /// This is an exact payload; no enum can install a native role by itself.
@@ -90,10 +102,17 @@ pub(super) fn physts(page: u8, old: u32) -> Option<u32> {
 /// receipt may be constructed only after these reads and current PHY/MAC
 /// source proof; this pure predicate itself grants no capture/retune/RF.
 /// Expected value is rtw8852b_rfk.c `_ch_setting`/`_bw_setting` for this
-/// actual primary: CFGCH CH=primary, BW=20M(3), BW2, band 2.4GHz.
+/// actual primary: CFGCH CH=primary, BW=20M(3), BW2, and on 5GHz
+/// `CFGCH_BAND1_5G` (bit16) | `CFGCH_BAND0_5G` (bit8); 2.4GHz band bits 0.
 pub(super) fn observed_channel(words: [u32; 4], primary: u8) -> bool {
-    (1..=13).contains(&primary)
-        && words
-            .into_iter()
-            .all(|word| word <= 0xfffff && word & 0x3ffff == 0x1c00 | u32::from(primary))
+    let band = if (1..=13).contains(&primary) {
+        0
+    } else if super::operating_channel::GHZ5.contains(&primary) {
+        0x10100
+    } else {
+        return false;
+    };
+    words
+        .into_iter()
+        .all(|word| word <= 0xfffff && word & 0x3ffff == 0x1c00 | band | u32::from(primary))
 }
