@@ -23,7 +23,9 @@
 //! full PLL relock), live FBC/DSB activity, and a DDB order with no
 //! non-overlapping step. Pipes that are not lit are programmed directly;
 //! the caller turns a removed pipe off before, and enables an added pipe
-//! after, this transaction.
+//! after, this transaction. Its production caller is
+//! [`crate::intel_gpu_xelpg_pipes`], itself awaiting the port owner.
+#![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use alloc::vec::Vec;
 
@@ -630,4 +632,4 @@ pub(crate) fn commit_live(
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xelpg_live_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -75,7 +75,7 @@ fn display14(io: &(impl MmioWindow + ?Sized)) -> Result<bool, FsError> {
 }
 /// The owned modeset's pipe-A configuration: one full-screen XRGB8888
 /// primary, the budgeted hidden cursor and the combo PHY of DDI A/B.
-fn request(mode: &Mode, tiling: Tiling, min_cdclk_khz: u32) -> res::Request {
+pub(crate) fn request(mode: &Mode, tiling: Tiling, min_cdclk_khz: u32) -> res::Request {
     let mut pipes = [None; res::PIPES];
     let mut planes = [None; res::PLANES];
     planes[0] = Some(res::PlaneRequest {

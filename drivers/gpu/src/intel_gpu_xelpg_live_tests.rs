@@ -10,42 +10,42 @@ use core::cell::{Cell, RefCell};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[derive(Debug, Default)]
-struct Live {
+pub(crate) struct Live {
     regs: RefCell<BTreeMap<u64, u32>>,
-    writes: RefCell<Vec<(u64, u32)>>,
-    drop_write: Cell<u64>,
+    pub(crate) writes: RefCell<Vec<(u64, u32)>>,
+    pub(crate) drop_write: Cell<u64>,
 }
 
 impl Live {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let hw = Self::default();
         hw.drop_write.set(u64::MAX);
         hw
     }
-    fn set(&self, r: u64, v: u32) {
+    pub(crate) fn set(&self, r: u64, v: u32) {
         self.regs.borrow_mut().insert(r, v);
     }
-    fn get(&self, r: u64) -> u32 {
+    pub(crate) fn get(&self, r: u64) -> u32 {
         *self.regs.borrow().get(&r).unwrap_or(&0)
     }
-    fn first(&self, r: u64) -> usize {
+    pub(crate) fn first(&self, r: u64) -> usize {
         self.writes
             .borrow()
             .iter()
             .position(|(o, _)| *o == r)
             .expect("register written")
     }
-    fn last(&self, r: u64) -> usize {
+    pub(crate) fn last(&self, r: u64) -> usize {
         self.writes
             .borrow()
             .iter()
             .rposition(|(o, _)| *o == r)
             .expect("register written")
     }
-    fn wrote(&self, r: u64) -> bool {
+    pub(crate) fn wrote(&self, r: u64) -> bool {
         self.writes.borrow().iter().any(|(o, _)| *o == r)
     }
-    fn light(&self, pipe: u64) {
+    pub(crate) fn light(&self, pipe: u64) {
         self.set(0x70008 + pipe * 0x1000, 0xc000_0000);
         self.set(0x70180 + pipe * 0x1000, 0x8000_0000);
         self.set(0x7019c + pipe * 0x1000, 0x0100_0000);
@@ -91,11 +91,19 @@ impl MmioWindow for Live {
         if r == 0x46070 {
             stored &= !((1 << 30) | (1 << 22));
         }
+        if (0x70000..0x74000).contains(&r) && r & 0xfff == 0x008 {
+            // TRANSCONF STATE follows ENABLE.
+            stored = (v & !(1 << 30)) | ((v >> 1) & (1 << 30));
+        }
+        if (0x70000..0x74000).contains(&r) && r & 0xfff == 0x19c {
+            // PLANE_SURFLIVE latches the armed surface.
+            self.set(r + 0x10, v);
+        }
         self.set(r, stored);
     }
 }
 
-fn latency() -> Latency {
+pub(crate) fn latency() -> Latency {
     Latency::adjust([6, 8, 10, 12, 14, 16], 0)
 }
 
@@ -146,7 +154,7 @@ fn state(pipes: &[(usize, PipeRequest)]) -> State {
 }
 
 /// Program `old` with every pipe off, then light the `lit` pipes.
-fn programmed(old: &State, lit: &[u64]) -> Live {
+pub(crate) fn programmed(old: &State, lit: &[u64]) -> Live {
     let hw = Live::new();
     commit(&hw, old).unwrap();
     for &p in lit {

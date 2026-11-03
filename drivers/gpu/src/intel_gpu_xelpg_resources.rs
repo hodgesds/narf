@@ -84,7 +84,9 @@ pub(crate) struct State {
     pub(crate) pmdemand: Params,
     pub(crate) cursor_visible: [bool; PIPES],
     /// The request each active pipe was computed from; a live pipe must
-    /// keep exactly this configuration across a repartition.
+    /// keep exactly this configuration across a repartition. Read by the
+    /// live/pipe owners, whose production caller is the port owner.
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     pub(crate) requests: [Option<PipeRequest>; PIPES],
 }
 
@@ -111,12 +113,20 @@ pub(crate) enum ResourceError {
     Clock(CdclkError),
     /// No lit pipe can take its new DDB without overlapping another
     /// pipe's current allocation.
+    // Constructed by the live/pipe owners (see `intel_gpu_xelpg_pipes`).
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     DdbOrdering,
     /// A lit pipe's configuration would change; that needs its modeset.
+    // Constructed by the live/pipe owners (see `intel_gpu_xelpg_pipes`).
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     LivePipeChanged,
     /// The transition needs every pipe off (unknown firmware CDCLK).
+    // Constructed by the live/pipe owners (see `intel_gpu_xelpg_pipes`).
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     RequiresPipesOff,
     /// The hardware no longer holds the programmed resource state.
+    // Constructed by the live/pipe owners (see `intel_gpu_xelpg_pipes`).
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     Diverged,
 }
 
