@@ -71,9 +71,11 @@ const TRANSCONF_WAIT_MS: u64 = 100;
 /// `PIPE_MISC` relative to the pipe block.
 const PIPE_MISC_OFFSET: u64 = 0x30;
 /// `bdw_set_pipe_misc` for an 8 bpc RGB pipe without dithering on display
-/// 14: `PIPE_MISC_BPC_8` (0) | `PIPE_MISC_PIXEL_ROUNDING_TRUNC` (display
-/// >= 12).
-pub(crate) const PIPE_MISC: u32 = 1 << 8;
+/// 14: `PIPE_MISC_BPC_8` (0) | `PIPE_MISC_PIXEL_ROUNDING_TRUNC` (bit 8,
+/// display >= 12) | `PIPE_MISC_HDR_MODE_PRECISION` (bit 23, display >= 11
+/// when `is_hdr_mode`: no plane but `PLANE_1`..`PLANE_3` and the cursor is
+/// active, always true for a Pipe B-D that scans out its primary only).
+pub(crate) const PIPE_MISC: u32 = (1 << 23) | (1 << 8);
 /// `PIPE_CHICKEN` relative to the pipe block (`_PIPEA_CHICKEN`).
 const PIPE_CHICKEN_OFFSET: u64 = 0x38;
 /// `icl_set_pipe_chicken` on display 14: `PER_PIXEL_ALPHA_BYPASS_EN`

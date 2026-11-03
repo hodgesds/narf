@@ -535,7 +535,9 @@ fn smoke_xelpg_pipes_crtc_enable_programs_linetime_chicken_and_frame_start() -> 
             return TestResult::Fail("the external pipe must be reserved and programmed");
         }
         let values = [
-            (pbase + 0x30, 1 << 8),
+            // bdw_set_pipe_misc: HDR_MODE_PRECISION (primary only) and
+            // PIXEL_ROUNDING_TRUNC.
+            (pbase + 0x30, (1 << 23) | (1 << 8)),
             (trans + 0x7c, 0),
             (trans + 0x28, 0),
             (trans + 0x420, 0),
