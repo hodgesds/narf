@@ -82,7 +82,7 @@ const COUNT_MASK: u32 = 0x7fff; // linux: OTG0_OTG_STATUS_POSITION__OTG_VERT_COU
 pub(crate) const FRAME_MASK: u32 = 0x00ff_ffff;
 /// HUBP surface addresses are 48-bit and start on a 256-byte request.
 const ADDRESS_BITS: u32 = 48; // linux: n/a (48-bit HUBP surface address space)
-const ADDRESS_ALIGN: u64 = 256; // linux: n/a (NARF validation: 256-byte request alignment)
+pub(crate) const ADDRESS_ALIGN: u64 = 256; // linux: n/a (NARF validation: 256-byte request alignment)
 
 pub(crate) trait Io: Send {
     fn read(&mut self, reg: u64) -> u32;

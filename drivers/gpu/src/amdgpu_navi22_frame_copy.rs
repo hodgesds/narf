@@ -1,5 +1,7 @@
-//! DCN30's linear primary: a retained GEM placement or a dumb buffer,
-//! copied into the native back buffer before its VUPDATE flip.
+//! DCN30's linear primary: a pinned GEM framebuffer the HUBP scans out in
+//! place (amdgpu_dm's flip to the client BO address), or a retained GEM
+//! placement or dumb buffer copied into the native back buffer before its
+//! VUPDATE flip.
 use super::{Frame, ScanError};
 use crate::amdgpu_present_damage as damage;
 use crate::{amdgpu_gem::GemPlacement, amdgpu_navi48_platform::PlaneFrame};
@@ -42,6 +44,72 @@ impl Frame {
     }
 }
 
+/// Why a GEM frame cannot be scanned out in place (it is then copied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ineligible {
+    /// A dumb buffer (no GEM pin to fetch from).
+    NotGem,
+    /// The pitch differs from the one the HUBP was programmed with.
+    Pitch,
+    /// The frame does not cover the active mode exactly.
+    Size,
+    /// The first pixel is not on a 256-byte request boundary.
+    Alignment,
+}
+impl Ineligible {
+    pub(super) const ALL: [Self; 4] = [Self::NotGem, Self::Pitch, Self::Size, Self::Alignment];
+}
+
+/// `amdgpu_dm_plane_helper_prepare_fb` + `fill_plane_buffer_attributes`
+/// for the lit primary: the GPU address the HUBP fetches `frame` from,
+/// when it can be scanned out in place on a pipe showing `front` (the
+/// owned surface the modeset programmed: its pitch and size). `from_plane`
+/// already restricted frames to linear XR24/AR24 and the extent to the
+/// pinned (VRAM, contiguous) placement.
+pub(super) fn direct(
+    frame: &Frame,
+    front: &narf_graphics_driver::generic::GenericFb,
+) -> Result<u64, Ineligible> {
+    let pin = frame.bo.as_ref().ok_or(Ineligible::NotGem)?;
+    if frame.pitch != front.pitch {
+        return Err(Ineligible::Pitch);
+    }
+    if (frame.width, frame.height) != (front.width, front.height) {
+        return Err(Ineligible::Size);
+    }
+    let address = pin
+        .address()
+        .checked_add(frame.offset)
+        .ok_or(Ineligible::Alignment)?;
+    if address == 0 || address % crate::amdgpu_dcn30_flip::ADDRESS_ALIGN != 0 {
+        return Err(Ineligible::Alignment);
+    }
+    Ok(address)
+}
+
+/// The client framebuffer pin the HUBP may still fetch (amdgpu_dm keeps
+/// the old fb pinned until `cleanup_fb` after the next flip). A flip only
+/// completes once SURFACE_EARLIEST_INUSE names its new surface, so a pin
+/// is released as soon as a later flip latches; a failed flip keeps it.
+#[derive(Debug, Default)]
+pub(super) struct ShownPin(Option<Arc<crate::amdgpu_gem::ScanoutPin>>);
+impl ShownPin {
+    pub(super) const fn new() -> Self {
+        Self(None)
+    }
+    /// A flip to `pin` latched; returns the pin it replaced, now unfetched.
+    pub(super) fn latched_external(
+        &mut self,
+        pin: Arc<crate::amdgpu_gem::ScanoutPin>,
+    ) -> Option<Arc<crate::amdgpu_gem::ScanoutPin>> {
+        self.0.replace(pin)
+    }
+    /// A flip to an owned surface latched (or the pipe was relit on one).
+    pub(super) fn latched_owned(&mut self) -> Option<Arc<crate::amdgpu_gem::ScanoutPin>> {
+        self.0.take()
+    }
+}
+
 /// The dumb buffer `frame` copies from, for damage tracking (None: a GEM
 /// frame).
 pub(super) fn damage_source(frame: &Frame) -> Option<damage::Source> {
@@ -73,27 +141,38 @@ fn error(e: narf_filesystem::FsError) -> ScanError {
     }
 }
 
-/// No platform owner or IRQ spinlock may be held here: both rendering
-/// and the SDMA readback worker must be able to take the owner lock.
-pub(super) async fn source(frame: &Frame) -> Result<Option<Arc<GemPlacement>>, ScanError> {
-    let Some(pin) = frame.bo.as_ref() else {
-        return Ok(None);
-    };
-    let deadline = narf_time::Deadline::after_ms(5_000);
+/// `drm_atomic_helper_wait_for_fences` for the frame's implicit WRITE
+/// fences, bounded at 5 s. Woken by any Navi22 fence interrupt
+/// (`amdgpu_fence_navi22::wait_change`, sequence taken before sampling so
+/// no completion is missed), and re-sampled at least every millisecond
+/// since polling stays the mandatory completion path.
+pub(super) async fn wait_rendered(pin: &crate::amdgpu_gem::ScanoutPin) -> Result<(), ScanError> {
+    let deadline = narf_time::monotonic_ns().saturating_add(5_000_000_000);
     loop {
+        let observed = crate::amdgpu_fence_navi22::change_sequence();
         let fences = pin
             .object()
             .dma_buf()
             .resv
             .fences(narf_filesystem::dma_buf::DmaResvUsage::Write);
         if fences.iter().all(|f| f.is_signalled()) {
-            break;
+            return Ok(());
         }
-        if deadline.expired() {
+        let now = narf_time::monotonic_ns();
+        if now >= deadline {
             return Err(ScanError::Timeout);
         }
-        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+        crate::amdgpu_fence_navi22::wait_change(observed, deadline.min(now + 1_000_000)).await;
     }
+}
+
+/// No platform owner or IRQ spinlock may be held here: both rendering
+/// and the SDMA readback worker must be able to take the owner lock.
+pub(super) async fn source(frame: &Frame) -> Result<Option<Arc<GemPlacement>>, ScanError> {
+    let Some(pin) = frame.bo.as_ref() else {
+        return Ok(None);
+    };
+    wait_rendered(pin).await?;
     let placement = pin.placement();
     if placement.cpu_visible() {
         return Ok(Some(placement.clone()));
@@ -162,7 +241,7 @@ mod tests {
     const CARD: u32 = 0xfe22_0510;
     impl Fixture {
         fn new() -> Self {
-            let mut bytes = vec![0u8; 3 * 4096];
+            let mut bytes = vec![0u8; 6 * 4096];
             let map = narf_bus::MmioRegion {
                 phys: narf_memory::PhysAddr::new(0xc800_0000),
                 virt: bytes.as_mut_ptr() as u64,
@@ -306,6 +385,88 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_linear_gem_copy_waits_for_render_fence_without_owner
+    );
+
+    /// Direct scanout takes a pinned client framebuffer only when the
+    /// HUBP can fetch it as programmed: same pitch and size as the lit
+    /// surface, first pixel on a 256-byte boundary. Everything else copies.
+    fn navi22_direct_scanout_eligibility() -> TestResult {
+        use narf_graphics_driver::generic::GenericFb;
+        let fixture = Fixture::new();
+        let object = fixture.object();
+        let pin = Arc::new(object.pin_scanout().unwrap());
+        let front = GenericFb::new(0xe000_0000, 8, 2, 256, 32);
+        let gem = |pitch: u32, width: u32, height: u32, offset: u32| {
+            let mut plane = PlaneFrame::linear(0, pitch, width, height, 0x3432_5258);
+            plane.bo = Some(pin.clone());
+            plane.offsets[0] = offset;
+            Frame::from_plane(plane, None).unwrap()
+        };
+        if direct(&gem(256, 8, 2, 0), &front) != Ok(pin.address()) {
+            return TestResult::Fail("matching pinned frame was not scanned out in place");
+        }
+        if direct(&gem(256, 8, 2, 512), &front) != Ok(pin.address() + 512) {
+            return TestResult::Fail("aligned offset not added to the pin address");
+        }
+        let dumb = Frame::from_plane(
+            PlaneFrame::linear(0x8000_0000, 256, 8, 2, 0x3432_5258),
+            None,
+        )
+        .unwrap();
+        for (frame, want, what) in [
+            (dumb, Ineligible::NotGem, "dumb buffer"),
+            (gem(512, 8, 2, 0), Ineligible::Pitch, "pitch"),
+            (gem(256, 4, 2, 0), Ineligible::Size, "width"),
+            (gem(256, 8, 1, 0), Ineligible::Size, "height"),
+            (
+                gem(256, 8, 2, 16),
+                Ineligible::Alignment,
+                "offset alignment",
+            ),
+        ] {
+            if direct(&frame, &front) != Err(want) {
+                return TestResult::Fail(what);
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_direct_scanout_eligibility
+    );
+
+    /// cleanup_fb after the next flip: a scanned-out client framebuffer
+    /// stays pinned until a later flip (client or owned) latches.
+    fn navi22_direct_scanout_pins_retire_after_the_next_flip() -> TestResult {
+        let fixture = Fixture::new();
+        let first = fixture.object();
+        let second = fixture.object();
+        let mut shown = ShownPin::new();
+        if shown
+            .latched_external(Arc::new(first.pin_scanout().unwrap()))
+            .is_some()
+            || !first.pinned()
+        {
+            return TestResult::Fail("first scanned-out framebuffer not kept pinned");
+        }
+        let replaced = shown.latched_external(Arc::new(second.pin_scanout().unwrap()));
+        if !first.pinned() || replaced.is_none() {
+            return TestResult::Fail("replaced pin not handed back for release");
+        }
+        drop(replaced);
+        if first.pinned() || !second.pinned() {
+            return TestResult::Fail("pins after a client-to-client flip");
+        }
+        let released = shown.latched_owned();
+        drop(released);
+        if second.pinned() || shown.latched_owned().is_some() {
+            return TestResult::Fail("owned flip kept the client pin");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_direct_scanout_pins_retire_after_the_next_flip
     );
 
     fn navi22_replaced_dirty_frame_keeps_its_damage() -> TestResult {

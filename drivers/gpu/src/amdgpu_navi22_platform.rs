@@ -837,6 +837,7 @@ fn publish_console(boot: &boot::ColdBoot) {
 async fn withdraw(boot: &boot::ColdBoot) {
     PRESENT.native.store(false, Ordering::Release);
     PRESENT.damage.lock().forget();
+    *PRESENT.geometry.lock() = None;
     if let Some(s) = boot.display_scanout_ref() {
         let ours = |addr| {
             [Some(s.front()), s.back()]
@@ -959,6 +960,11 @@ async unsafe fn light(
     // copies onto the visible front.
     let back = boot.prepare_display_back_buffer().await;
     PRESENT.damage.lock().forget();
+    // The new pipeline fetches its owned activation surface.
+    let released = PRESENT.shown.lock().latched_owned();
+    // Unpinned outside the IRQ-safe lock.
+    drop(released);
+    *PRESENT.geometry.lock() = boot.display_scanout_ref().map(|s| s.front().fb);
     PRESENT.native.store(back.is_ok(), Ordering::Release);
     restart_vblank();
     publish_console(boot);
@@ -973,6 +979,12 @@ async unsafe fn unlight(boot: &mut boot::ColdBoot) -> Result<(), boot::Error> {
     withdraw(boot).await;
     // SAFETY: the publication is withdrawn and every CPU view retired.
     let result = unsafe { boot.stop_display() }.await;
+    if result.is_ok() {
+        // The stopped HUBP fetches nothing.
+        let released = PRESENT.shown.lock().latched_owned();
+        // Unpinned outside the IRQ-safe lock.
+        drop(released);
+    }
     crate::amdgpu_navi22_kms::KMS.lock().crtc.shown = None;
     crate::amdgpu_navi22_kms::publish();
     result
@@ -1691,6 +1703,9 @@ pub async unsafe fn flip_display() -> Result<crate::amdgpu_navi22_scanout::FlipD
     let boot = owner.as_mut().ok_or(ScanError::Busy)?;
     let before = boot.display_scanout()?.front().fb;
     let done = boot.flip_display().await?;
+    // An owned surface is shown: a client framebuffer it left is unfetched.
+    let released = PRESENT.shown.lock().latched_owned();
+    drop(released);
     follow_flip(before, boot.display_scanout()?.front().fb).await;
     Ok(done)
 }
@@ -1807,13 +1822,113 @@ struct PresentSlot {
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
     /// What the scanout buffers hold, for damaged (DIRTYFB) frames.
     damage: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_present_damage::Damage>,
+    /// The lit pipe's owned front (pitch and size the HUBP was programmed
+    /// with), for choosing in-place scanout before taking OWNER.
+    geometry: narf_lib::sync::IrqSafeSpinLock<Option<GenericFb>>,
+    /// The client framebuffer the pipe may still fetch.
+    shown: narf_lib::sync::IrqSafeSpinLock<frame_copy::ShownPin>,
+    /// Trace counters: frames scanned out in place, frames copied, and
+    /// their summed present time.
+    direct: AtomicU64,
+    copied: AtomicU64,
+    present_ns: AtomicU64,
+    /// Ineligibility reasons already logged (bit per `Ineligible`).
+    logged: AtomicU64,
 }
 static PRESENT: PresentSlot = PresentSlot {
     native: AtomicBool::new(false),
     presenting: AtomicBool::new(false),
     next: narf_lib::sync::IrqSafeSpinLock::new(None),
     damage: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_present_damage::Damage::new()),
+    geometry: narf_lib::sync::IrqSafeSpinLock::new(None),
+    shown: narf_lib::sync::IrqSafeSpinLock::new(frame_copy::ShownPin::new()),
+    direct: AtomicU64::new(0),
+    copied: AtomicU64::new(0),
+    present_ns: AtomicU64::new(0),
+    logged: AtomicU64::new(0),
 };
+
+/// Low-volume hardware trace of the present path: the first in-place
+/// scanout, the first copy per reason, and totals every 512 presents.
+fn trace_present(direct: Option<u64>, reason: Option<frame_copy::Ineligible>, pitch: u32, ns: u64) {
+    use core::fmt::Write;
+    let total_ns = PRESENT.present_ns.fetch_add(ns, Ordering::Relaxed) + ns;
+    let (d, c) = match direct {
+        Some(_) => (
+            PRESENT.direct.fetch_add(1, Ordering::Relaxed) + 1,
+            PRESENT.copied.load(Ordering::Relaxed),
+        ),
+        None => (
+            PRESENT.direct.load(Ordering::Relaxed),
+            PRESENT.copied.fetch_add(1, Ordering::Relaxed) + 1,
+        ),
+    };
+    if let (Some(address), 1) = (direct, d) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 present: direct addr={address:#x} pitch={pitch} (frame #{})",
+            d + c
+        );
+    }
+    if let Some(reason) = reason {
+        let bit = 1u64
+            << frame_copy::Ineligible::ALL
+                .iter()
+                .position(|r| *r == reason)
+                .unwrap_or(0);
+        if PRESENT.logged.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 present: copy (reason={reason:?})"
+            );
+        }
+    }
+    let n = d + c;
+    if n % 512 == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 present: {n} frames, direct {d}, copied {c}, avg {} us",
+            total_ns / n / 1000
+        );
+    }
+}
+
+/// Take the lit pipe off a client framebuffer and back onto its owned
+/// front, then release the client's pin (Navi48's `release_client_scanout`,
+/// amdgpu_dm's restore commit on lastclose). The console comes back on the
+/// owned front when no client owns the framebuffer. False when the pipe
+/// could not let go (the pin is then kept).
+/// # Safety
+/// The caller holds OWNER and excludes other display writers.
+async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
+    let external = boot
+        .display_scanout_ref()
+        .is_some_and(|s| s.external_front().is_some());
+    if external {
+        let Ok(Some(_)) = boot.return_display_to_owned().await else {
+            return false;
+        };
+    }
+    let released = PRESENT.shown.lock().latched_owned();
+    // Unpinned outside the IRQ-safe lock.
+    drop(released);
+    if crate::amdgpu_dcn_display::active_scanout().is_none() && !narf_console::fb_user_owned() {
+        publish_console(boot);
+    }
+    true
+}
+
+/// drm_fb_helper's restore on lastclose: take the pipe off the closed
+/// client's framebuffer (its pin goes after that flip latches).
+pub fn release_client_scanout_async() {
+    narf_scheduler::spawn(async {
+        let mut owner = OWNER.lock().await;
+        if let Some(boot) = owner.as_mut() {
+            // SAFETY: OWNER serializes display writers.
+            let _ = unsafe { release_client_scanout(boot) }.await;
+        }
+    });
+}
 #[derive(Clone, Debug)]
 struct Frame {
     phys: u64,
@@ -1946,7 +2061,30 @@ async fn presenter() {
             complete_flip(0, frame.ticket, None);
             continue;
         }
+        let started = narf_time::monotonic_ns();
+        // In place when the pinned client framebuffer matches the lit
+        // pipe's surface (amdgpu_dm never copies a client framebuffer).
+        let plan = match PRESENT.geometry.lock().as_ref() {
+            Some(front) => frame_copy::direct(&frame, front),
+            None => Err(frame_copy::Ineligible::Size),
+        };
         let result = async {
+            if let (Ok(_), Some(pin)) = (plan, frame.bo.as_ref()) {
+                // Rendering must finish before the HUBP fetches it; wait
+                // without OWNER (the producer may need it).
+                frame_copy::wait_rendered(pin).await?;
+                let mut owner = OWNER.lock().await;
+                let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+                // SAFETY: OWNER serializes display/reset; the frame retains
+                // its pin, which `shown` keeps after the flip.
+                let Some(before) = unsafe { present_direct(boot, &frame, pin) }.await? else {
+                    // The mode changed under the frame: drop it, keep going.
+                    return Ok(None);
+                };
+                let latched = read_vblank(boot);
+                follow_external(before).await;
+                return Ok(latched);
+            }
             // Wait on rendering and perform hidden-VRAM SDMA readback
             // before taking OWNER: the producer/transfer also needs it.
             let source = frame_copy::source(&frame).await?;
@@ -1958,6 +2096,11 @@ async fn presenter() {
                     // and source readback completed outside this lock.
                     match unsafe { present_native(boot, &frame, source.as_deref()) }.await {
                         Ok((before, after)) => {
+                            // An owned surface is shown: the client
+                            // framebuffer the pipe left is unfetched.
+                            let released = PRESENT.shown.lock().latched_owned();
+                            // Unpinned outside the IRQ-safe lock.
+                            drop(released);
                             let latched = read_vblank(boot);
                             follow_flip(before, after).await;
                             Ok(latched)
@@ -1969,6 +2112,14 @@ async fn presenter() {
             }
         }
         .await;
+        if result.is_ok() {
+            trace_present(
+                plan.ok(),
+                plan.err(),
+                frame.pitch,
+                narf_time::monotonic_ns().saturating_sub(started),
+            );
+        }
         match result {
             Ok(latched) => complete_flip(0, frame.ticket, latched),
             Err(e) => {
@@ -1983,6 +2134,51 @@ async fn presenter() {
             }
         }
     }
+}
+
+/// Flip the lit pipe to `frame`'s pinned client framebuffer in place and
+/// keep that pin until a later flip latches. Returns the owned front the
+/// console may be published on; None (nothing flipped) when the frame no
+/// longer matches the lit mode.
+/// # Safety
+/// The caller holds the owner lock; `pin` is `frame`'s and rendering into
+/// it completed.
+async unsafe fn present_direct(
+    boot: &mut boot::ColdBoot,
+    frame: &Frame,
+    pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
+) -> Result<Option<GenericFb>, ScanError> {
+    // A cancelled presenter may have left the old front's views draining.
+    crate::scanout_access::wait_retired().await;
+    let front = boot.display_scanout()?.front().fb;
+    // The mode can change between choosing and taking OWNER.
+    let Ok(address) = frame_copy::direct(frame, &front) else {
+        return Ok(None);
+    };
+    // HDP: client GPU writes are complete (fences); flush the read cache
+    // path as the copy does before sampling.
+    boot.client_fence_reader()
+        .ok_or(ScanError::Busy)?
+        .completed(0)
+        .map_err(|_| ScanError::DeviceGone)?;
+    boot.flip_display_external(address).await?;
+    // The previous client framebuffer (if any) is no longer fetched.
+    let released = PRESENT.shown.lock().latched_external(pin.clone());
+    // Unpinned outside the IRQ-safe lock.
+    drop(released);
+    // Owned surfaces are both stale now; DIRTYFB damage restarts.
+    PRESENT.damage.lock().forget();
+    Ok(Some(front))
+}
+
+/// The pipe now fetches a client framebuffer: withdraw a console published
+/// on the owned front (Navi48's `follow_flip(None)`), and let retired CPU
+/// views of the owned surfaces drain before either is written again.
+async fn follow_external(before: GenericFb) {
+    if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
+        crate::amdgpu_dcn_display::publish_external(None, None);
+    }
+    crate::scanout_access::wait_retired().await;
 }
 
 /// Copy `frame` into the back buffer, then flip to it. Returns the front

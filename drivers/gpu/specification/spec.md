@@ -11867,17 +11867,35 @@ no placement and publishes no state. Atomic, SETCRTC and PAGE_FLIP preserve
 the pinned GEM source through the presentation handoff.
 
 The DCN30 presenter waits for implicit WRITE fences before taking the GPU
-owner. CPU-visible placements are copied by bounded rows, honoring pitch and
-offset; hidden VRAM uses the existing SDMA transfer into private system
-staging, also outside the owner. The frame retains its `ScanoutPin` through
-queueing, readback, copying and the completed native back-buffer flip.
-Unsupported format/extent checks precede queueing. GEM sources never fall
-through to a raw physical pointer. This is a copy presenter, not direct
-scanout of client buffers; secondary CRTCs still cannot present.
+owner (`frame_copy::wait_rendered`: woken by any Navi22 fence interrupt via
+`amdgpu_fence_navi22::wait_change`, re-sampled at least every millisecond,
+5 s bound). A pinned GEM framebuffer whose pitch and size equal the lit
+surface's and whose first pixel is 256-byte aligned (`frame_copy::direct`,
+reasons `Ineligible::{NotGem, Pitch, Size, Alignment}`) is scanned out in
+place, as amdgpu_dm flips to the client BO address:
+`ColdBoot::flip_display_external(address)` → `Scanout::flip_external`
+programs it into the HUBP and completes when SURFACE_EARLIEST_INUSE names
+it. The flip event completes at that latch. The pin is kept
+(`frame_copy::ShownPin`) until a later flip latches (client, copied frame,
+`return_to_owned`) or the pipe is stopped or relit; a failed flip keeps it.
+While a client framebuffer is shown (`Scanout::external_front`) the
+console's publication on the owned front is withdrawn; lastclose
+(`amdgpu_native_kms::restore_displays` →
+`amdgpu_navi22_platform::release_client_scanout_async`) flips back to the
+owned front (`ColdBoot::return_display_to_owned`), releases the pin and
+republishes the console. Other frames are copied: CPU-visible placements by
+bounded rows, honoring pitch and offset; hidden VRAM through the existing
+SDMA transfer into private system staging, also outside the owner. The
+frame retains its `ScanoutPin` through queueing, readback, copying and the
+completed native back-buffer flip. Unsupported format/extent checks precede
+queueing. GEM sources never fall through to a raw physical pointer. The
+console logs the first direct flip, the first copy per reason, and totals
+every 512 presents. Secondary CRTCs still cannot present.
 
 `ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
 display_scanout(), display_admitted(), display_output(),
-prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
+prepare_display_back_buffer(), flip_display(), flip_display_external(address),
+return_display_to_owned(), set_display_cursor()}` own
 these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.
 

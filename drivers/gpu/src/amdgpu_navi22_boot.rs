@@ -2606,6 +2606,21 @@ impl ColdBoot {
         let (scanout, _, flush) = self.presentation()?;
         scanout.flip(flush).await
     }
+    /// Scan a pinned client framebuffer at `address` out in place.
+    pub async fn flip_display_external(
+        &mut self,
+        address: u64,
+    ) -> Result<crate::amdgpu_navi22_scanout::FlipDone, crate::amdgpu_dcn_clk::Error> {
+        let (scanout, _, flush) = self.presentation()?;
+        scanout.flip_external(address, flush).await
+    }
+    /// Put the lit pipe back on its owned front (None: it already is).
+    pub async fn return_display_to_owned(
+        &mut self,
+    ) -> Result<Option<crate::amdgpu_navi22_scanout::FlipDone>, crate::amdgpu_dcn_clk::Error> {
+        let (scanout, _, flush) = self.presentation()?;
+        scanout.return_to_owned(flush).await
+    }
     /// Show (upload once) a premultiplied ARGB cursor image on the lit pipe.
     pub fn set_display_cursor(
         &mut self,

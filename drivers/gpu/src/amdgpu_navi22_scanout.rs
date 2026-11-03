@@ -46,17 +46,22 @@ pub struct Surface {
     pub fb: GenericFb,
 }
 
-/// Which of the two buffers is shown; pure bookkeeping, tested alone.
+/// Which buffer is shown; pure bookkeeping, tested alone. `front` is the
+/// owned surface last shown (the console's); while `external` names a
+/// client framebuffer scanned out in place (amdgpu_dm's flip to the
+/// client BO address), neither owned surface is fetched.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Buffers {
     pub(crate) surfaces: [Option<Surface>; 2],
     pub(crate) front: usize,
+    pub(crate) external: Option<u64>,
 }
 impl Buffers {
     pub(crate) fn new(front: Surface) -> Self {
         Self {
             surfaces: [Some(front), None],
             front: 0,
+            external: None,
         }
     }
     pub(crate) fn front(&self) -> Surface {
@@ -65,11 +70,28 @@ impl Buffers {
     pub(crate) fn back(&self) -> Option<Surface> {
         self.surfaces[1 - self.front]
     }
+    /// The address the HUBP fetches.
+    pub(crate) fn shown(&self) -> u64 {
+        self.external.unwrap_or(self.front().address)
+    }
     /// The flip to the back buffer latched: roles swap.
     pub(crate) fn swap(&mut self) -> Result<(), Error> {
         self.back().ok_or(Error::Invalid)?;
         self.front = 1 - self.front;
+        self.external = None;
         Ok(())
+    }
+    /// A flip to a client framebuffer latched. Returns what it replaced.
+    pub(crate) fn show_external(&mut self, address: u64) -> u64 {
+        let previous = self.shown();
+        self.external = Some(address);
+        previous
+    }
+    /// A flip back to the owned front latched. Returns what it replaced.
+    pub(crate) fn show_owned_front(&mut self) -> u64 {
+        let previous = self.shown();
+        self.external = None;
+        previous
     }
 }
 
@@ -337,14 +359,69 @@ impl Scanout {
     /// fails: both buffers stay reserved.
     pub async fn flip(
         &mut self,
-        mut flush: impl FnMut() -> Result<(), Error>,
+        flush: impl FnMut() -> Result<(), Error>,
     ) -> Result<FlipDone, Error> {
         self.running()?;
         let back = self.buffers.back().ok_or(Error::Invalid)?;
-        let front = self.buffers.front();
+        let frame = self.flip_to(back.address, flush).await?;
+        let previous = self.buffers.shown();
+        self.buffers.swap()?;
+        Ok(FlipDone {
+            front: back.address,
+            back: previous,
+            frame,
+        })
+    }
+    /// Scan out a client framebuffer in place at the next VUPDATE
+    /// (`hubp3_program_surface_flip_and_addr` with the client BO's
+    /// address, as amdgpu_dm flips to `afb->address`). On success both
+    /// owned surfaces are free and `FlipDone::back` is the address that
+    /// stopped being fetched; the caller keeps the client's buffer pinned
+    /// until a later flip replaces it. Failure is terminal as for `flip`.
+    pub async fn flip_external(
+        &mut self,
+        address: u64,
+        flush: impl FnMut() -> Result<(), Error>,
+    ) -> Result<FlipDone, Error> {
+        self.running()?;
+        let frame = self.flip_to(address, flush).await?;
+        let back = self.buffers.show_external(address);
+        Ok(FlipDone {
+            front: address,
+            back,
+            frame,
+        })
+    }
+    /// Take the pipe off a client framebuffer and back onto the owned
+    /// front (amdgpu_dm's restore commit on lastclose). None when no client
+    /// framebuffer is shown.
+    pub async fn return_to_owned(
+        &mut self,
+        flush: impl FnMut() -> Result<(), Error>,
+    ) -> Result<Option<FlipDone>, Error> {
+        if self.buffers.external.is_none() {
+            return Ok(None);
+        }
+        self.running()?;
+        let front = self.buffers.front().address;
+        let frame = self.flip_to(front, flush).await?;
+        let back = self.buffers.show_owned_front();
+        Ok(Some(FlipDone { front, back, frame }))
+    }
+    /// The client framebuffer the pipe scans out, if any.
+    pub fn external_front(&self) -> Option<u64> {
+        self.buffers.external
+    }
+    /// Arm `address` at the next VUPDATE and wait until it is the earliest
+    /// surface in use (so the previous one is no longer fetched).
+    async fn flip_to(
+        &mut self,
+        address: u64,
+        mut flush: impl FnMut() -> Result<(), Error>,
+    ) -> Result<u32, Error> {
         // The producer's CPU writes must reach VRAM before the latch.
         flush()?;
-        self.flip.program(back.address)?;
+        self.flip.program(address)?;
         self.state = State::Flipping;
         if self.vrr.is_some() {
             if let Err(error) = self.flip.manual_trigger() {
@@ -352,18 +429,11 @@ impl Scanout {
                 return Err(error);
             }
         }
-        let result = self.wait_latched().await;
-        match result {
+        match self.wait_latched().await {
             Ok(()) => {
-                self.buffers.swap()?;
                 self.state = State::Running;
                 self.flips += 1;
-                let frame = self.flip.position().map(|p| p.frame).unwrap_or(0);
-                Ok(FlipDone {
-                    front: back.address,
-                    back: front.address,
-                    frame,
-                })
+                Ok(self.flip.position().map(|p| p.frame).unwrap_or(0))
             }
             Err(error) => {
                 self.state = State::Failed(error);

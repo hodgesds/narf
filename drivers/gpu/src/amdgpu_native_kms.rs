@@ -70,6 +70,7 @@ pub fn request_broadcast_rgb(value: u8) {
 }
 pub fn restore_displays() {
     if navi22() {
+        crate::amdgpu_navi22_platform::release_client_scanout_async();
         crate::amdgpu_navi22_kms::restore_displays()
     } else {
         crate::amdgpu_navi48_platform::restore_displays()
