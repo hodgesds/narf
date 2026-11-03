@@ -160,6 +160,11 @@ mod usb_firmware_tests;
 mod usb_packet;
 #[cfg(feature = "kernel-test")]
 mod usb_packet_tests;
+/// RTL8821CU USB reset, rejoin, IPS and system sleep (Linux rtw88 core
+/// restart over usb.c).
+pub mod usb_recovery;
+#[cfg(feature = "kernel-test")]
+mod usb_recovery_tests;
 #[cfg(feature = "kernel-test")]
 mod usb_tests;
 mod wmm;

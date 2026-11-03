@@ -3372,6 +3372,64 @@ unprovisioned RTL8821CU (no signed
 `rtw8821cu-*` N21Q record) stops at `PhyTablesPrepared` and is never
 admitted: no station, band or TX grant is published. Written, unexecuted:
 `smoke_rtw88_usb_driver_id_table_and_endpoint_contexts`.
+
+Recovery, idle and system sleep (`usb_recovery.rs`). Linux rtw88 recovers
+USB and PCI through the same HCI-agnostic core: `main.c::rtw_fw_recovery_work`
+(`__fw_recovery_work` resets keys/stations/vifs, then `ps.c::rtw_enter_ips`
+-> `rtw_core_stop` + `rtw_power_off`) and `ieee80211_restart_hw` ->
+`rtw_ops_start` -> `rtw_core_start` (`rtw_power_on`, firmware, MAC/PHY);
+IPS (`rtw_enter_ips`/`rtw_leave_ips` -> `rtw_ips_pwr_up`) is the same
+stop/power-off/start pair. `usb.c::rtw_usb_disconnect`'s
+`usb_reset_device` is removal-only and is not used on these paths.
+`usb_driver.rs` keeps per slot the `Origin` learned at the first attach
+(endpoints, speed, factory MAC) and a provisioning mutex
+(`Rtw88Device::provisioning`); a `Generation` is one lifecycle + published
+shell, published before it is installed as the slot's current generation
+(a slot unbound meanwhile gets it withdrawn). `usb_recovery::park` (under
+that mutex) withdraws the current shell for rebind (name/ifindex kept),
+retires its owner with the actual bulk-receipt stop
+(`operating_reset::retire`), checks the slot is still current and powers
+the card off over EP0 (`usb::Registers::power_off` = `rtw_power_off`:
+empty `rtw_usb_stop`, `rtw_coex_power_off_setting` REG_WIFI_BT_INFO =
+BIT_BT_INT_EN, `rtw_mac_power_off`, plus a CR 0xea / SYS_STATUS1+1 bit0
+readback). `unpark` builds a fresh backend over the original pipes (xHCI
+contexts stay configured; Linux keeps the interface bound), runs
+`rtw_mac_power_on` + REG_C2HEVT + a fresh EFUSE map whose MAC must equal
+the original (`Identity` otherwise, as `pci.rs::bring_up_mode` re-reads
+it), and publishes a fresh `Generation` under the kept name; every stage is
+then earned again through the host-keyed `rtw8821cu-*` records. Entry
+points (`pub` in `rtw88::usb_recovery`, keyed by USB slot):
+`reset_usb` = `operating_reset::reset_function` (operating station only;
+fresh generation provisioned in the background, `pci.rs::schedule_owner`
+retries); `rejoin_usb` = `rejoin::rejoin_function` (reset, one provisioning
+attempt, then `rejoin::associate_fresh` with the caller's fresh Open/WPA2
+credentials, `Pending` zeroizes on cancellation); `idle_usb` =
+`runtime_idle::idle_function` (`Interface::idle_claim`: the actual
+unassociated passive station only; a durable `system_pm_worker` owns the
+parked receipts and the returned `RuntimeIdle`'s `resume`/drop powers a fresh
+generation on and provisions it). No old key, peer, station or calibration
+receipt is replayed. System sleep: `rtw_8821cu_driver` has no
+`.suspend`/`.resume`, so the Linux USB core
+(`usb/core/driver.c::usb_suspend` -> `unbind_no_pm_drivers_interfaces` ->
+`usb_forced_unbind_intf`) unbinds it before the device suspends and
+`usb_resume_complete` -> `rebind_marked_interfaces` probes it fresh. Here
+`system_pm::SystemPm::prepare` adds one `usb_recovery` worker per bound
+slot to the same session: prepare parks any stage (a slot with no live
+generation parks nothing), resume unparks and provisions once; a station
+that was not operating keeps the scheduled retries rather than inventing
+records, an operating one that fails is withdrawn
+(`system_pm_native::resume_cold`). WoWLAN: Linux sets `wiphy->wowlan` from
+`chip->wowlan_stub` for every HCI (`main.c::rtw_register_hw`), so
+`rtw_ops_suspend` may arm the 8821C WoW firmware, but the USB core's forced
+unbind then runs `rtw_usb_disconnect` -> `usb_reset_device`, so no armed WoW
+state survives a USB system suspend. This tree advertises no C21 WoW on
+either HCI (`wow::support` is C22-only; PCI 8821CE system sleep is the cold
+path), so the USB station never arms one and matches PCI 8821CE scope. The
+USB core's port/host-controller suspend is not claimed here. A failed park
+or unpark leaves the slot bound with its shell withdrawn (fail closed);
+unbind or replug starts over. Written, unexecuted:
+`smoke_rtw88_usb_power_off_sequence`,
+`smoke_rtw88_usb_recovery_unbound_slot_refuses`.
 Former blockers, verified against the tree:
 
 1. Register contract (resolved: asynchronous `Io`). `firmware_transport::Io`

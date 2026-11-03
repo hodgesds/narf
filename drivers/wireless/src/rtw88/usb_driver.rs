@@ -39,7 +39,7 @@ use narf_drivers_usb::{
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
-type Backend = usb_firmware::Backend<UsbControl, UsbIo>;
+pub(super) type Backend = usb_firmware::Backend<UsbControl, UsbIo>;
 type Station = interface::Device<Backend>;
 
 /// USB 2.0 §9.4.7 SET_CONFIGURATION.
@@ -74,6 +74,28 @@ struct Bound {
     device: Arc<USBDevice>,
     station: Option<Arc<Station>>,
     lifecycle: Option<Arc<Lifecycle<Backend>>>,
+    /// Fixed by the first attach; every restart generation reuses it.
+    origin: Option<Origin>,
+    /// `pci.rs::Rtw88Device::provisioning` for this slot: one provisioning
+    /// attempt, reset, rejoin or PM park/unpark at a time.
+    provisioning: Arc<narf_lib::mutex::Mutex<()>>,
+}
+
+/// What `rtw_usb_probe` learned once (`rtw_usb_intf_init`, the bus speed
+/// and the factory MAC); `usb_recovery.rs` restarts over it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Origin {
+    pub(super) endpoints: Endpoints,
+    pub(super) speed: Speed,
+    pub(super) mac: [u8; 6],
+}
+
+/// The current generation of one bound slot.
+pub(super) struct Current {
+    pub(super) device: Arc<USBDevice>,
+    pub(super) station: Arc<Station>,
+    pub(super) lifecycle: Arc<Lifecycle<Backend>>,
+    pub(super) origin: Origin,
 }
 static BOUND: IrqSafeSpinLock<Vec<Bound>> = IrqSafeSpinLock::new(Vec::new());
 
@@ -106,6 +128,8 @@ pub(super) fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
             device: device.clone(),
             station: None,
             lifecycle: None,
+            origin: None,
+            provisioning: Arc::new(narf_lib::mutex::Mutex::new(())),
         });
     }
     narf_scheduler::spawn(async move {
@@ -152,8 +176,47 @@ pub(super) fn station(slot_id: u8) -> Option<Arc<Station>> {
         .and_then(|b| b.station.clone())
 }
 
-fn current(device: &Arc<USBDevice>) -> bool {
-    BOUND.lock().iter().any(|b| Arc::ptr_eq(&b.device, device))
+/// True while `device` is still bound and `station` is its generation.
+pub(super) fn is_current(device: &Arc<USBDevice>, station: &Arc<Station>) -> bool {
+    BOUND.lock().iter().any(|b| {
+        Arc::ptr_eq(&b.device, device)
+            && b.station.as_ref().is_some_and(|s| Arc::ptr_eq(s, station))
+    })
+}
+
+/// The slot's current generation, once attach published one.
+pub(super) fn current(slot_id: u8) -> Option<Current> {
+    BOUND
+        .lock()
+        .iter()
+        .find(|b| b.device.slot_id() == slot_id)
+        .and_then(|b| {
+            Some(Current {
+                device: b.device.clone(),
+                station: b.station.clone()?,
+                lifecycle: b.lifecycle.clone()?,
+                origin: b.origin?,
+            })
+        })
+}
+
+/// The slot's provisioning lock (`Rtw88Device::provisioning`).
+pub(super) fn provisioning(slot_id: u8) -> Option<Arc<narf_lib::mutex::Mutex<()>>> {
+    BOUND
+        .lock()
+        .iter()
+        .find(|b| b.device.slot_id() == slot_id)
+        .map(|b| b.provisioning.clone())
+}
+
+/// Every bound slot with a published generation (system PM fan-out).
+pub(super) fn slots() -> Vec<u8> {
+    BOUND
+        .lock()
+        .iter()
+        .filter(|b| b.station.is_some())
+        .map(|b| b.device.slot_id())
+        .collect()
 }
 
 /// xHCI endpoint contexts for the pipes rtw88 submits on: the bulk-IN pipe
@@ -246,26 +309,21 @@ async fn attach(device: Arc<USBDevice>) -> Result<(), Error> {
         speed,
     )?;
     let factory = power_and_factory(&mut backend).await?;
-    let (vendor, product) = (device.vendor_id(), device.product_id());
-    let lifecycle: Arc<Lifecycle<Backend>> =
-        Arc::new(Lifecycle::new(0xc821).on(super::phy8821c::Interface::Usb { vendor, product }));
-    let name = narf_net::iface::reserve_name("wlan%d");
-    let station = Arc::new(Station::new(
-        name,
-        factory.mac(),
-        lifecycle.clone(),
-        Arc::new(super::station::NativeEnvironment),
-    ));
+    let origin = Origin {
+        endpoints,
+        speed,
+        mac: factory.mac(),
+    };
     {
         let mut all = BOUND.lock();
         let entry = all
             .iter_mut()
             .find(|b| Arc::ptr_eq(&b.device, &device))
             .ok_or(Error::Cancelled)?;
-        entry.station = Some(station.clone());
-        entry.lifecycle = Some(lifecycle.clone());
+        entry.origin = Some(origin);
     }
-    interface::publish(station.clone()).map_err(|_| Error::State)?;
+    let name = narf_net::iface::reserve_name("wlan%d");
+    let generation = Generation::publish(&device, None, name, factory, backend)?;
     // `pci.rs::probe`'s bound-driver record (no PCI IDs on USB).
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("rtw88-8821cu"),
@@ -276,22 +334,140 @@ async fn attach(device: Arc<USBDevice>) -> Result<(), Error> {
     });
     narf_console::klog!(
         "rtw8821cu {:04x}:{:04x} {} {:?} {} bulk-out\n",
-        vendor,
-        product,
+        device.vendor_id(),
+        device.product_id(),
         name,
         speed,
         endpoints.out_count
     );
-    // The backend moves into the lifecycle on the first attempt whose
-    // firmware image is registered; until then it stays here, unclaimed.
-    let pending = IrqSafeSpinLock::new(Some(backend));
-    super::pci::drive_scheduled(
-        ATTEMPTS,
-        || retryable(&lifecycle, &station) && current(&device),
-        || provision(&lifecycle, &station, &factory, &pending),
-        || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+    generation.drive().await
+}
+
+/// One generation of the slot's station: fresh lifecycle and published
+/// shell over a powered backend whose factory map was just read. Restarts
+/// (`usb_recovery.rs`) replace the whole generation, as `pci.rs::bring_up`
+/// does for a reset function; nothing of the old owner is reused.
+pub(super) struct Generation {
+    device: Arc<USBDevice>,
+    pub(super) lifecycle: Arc<Lifecycle<Backend>>,
+    pub(super) station: Arc<Station>,
+    factory: Factory8821c,
+    /// The backend moves into the lifecycle on the first attempt whose
+    /// firmware image is registered; until then it stays here, unclaimed.
+    pending: IrqSafeSpinLock<Option<Backend>>,
+}
+impl Generation {
+    /// Publish the fresh shell (`rtw_register_hw`) under `name`, then make it
+    /// the slot's generation iff the slot is still bound to `old`'s
+    /// generation (`None`: the first attach). A slot unbound meanwhile gets
+    /// the fresh shell withdrawn again.
+    pub(super) fn publish(
+        device: &Arc<USBDevice>,
+        old: Option<&Arc<Station>>,
+        name: &'static str,
+        factory: Factory8821c,
+        backend: Backend,
+    ) -> Result<Self, Error> {
+        let (vendor, product) = (device.vendor_id(), device.product_id());
+        let lifecycle: Arc<Lifecycle<Backend>> = Arc::new(
+            Lifecycle::new(0xc821).on(super::phy8821c::Interface::Usb { vendor, product }),
+        );
+        let station = Arc::new(Station::new(
+            name,
+            factory.mac(),
+            lifecycle.clone(),
+            Arc::new(super::station::NativeEnvironment),
+        ));
+        interface::publish(station.clone()).map_err(|_| Error::State)?;
+        let installed = {
+            let mut all = BOUND.lock();
+            match all.iter_mut().find(|b| Arc::ptr_eq(&b.device, device)) {
+                Some(entry)
+                    if match (old, entry.station.as_ref()) {
+                        (None, None) => true,
+                        (Some(old), Some(current)) => Arc::ptr_eq(old, current),
+                        _ => false,
+                    } =>
+                {
+                    entry.station = Some(station.clone());
+                    entry.lifecycle = Some(lifecycle.clone());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !installed {
+            station.withdraw();
+            return Err(Error::Cancelled);
+        }
+        Ok(Self {
+            device: device.clone(),
+            lifecycle,
+            station,
+            factory,
+            pending: IrqSafeSpinLock::new(Some(backend)),
+        })
+    }
+    /// This generation is still the slot's current one.
+    pub(super) fn current(&self) -> bool {
+        is_current(&self.device, &self.station)
+    }
+    /// Whether a failed attempt may be retried (`pci.rs::retryable`).
+    pub(super) fn retryable(&self) -> bool {
+        retryable(&self.lifecycle, &self.station) && self.current()
+    }
+    /// One provisioning attempt under the slot's provisioning lock.
+    pub(super) async fn provision_once(&self) -> Result<(), Error> {
+        let lock = provisioning(self.device.slot_id()).ok_or(Error::Cancelled)?;
+        let _provision = lock.lock().await;
+        if !self.current() {
+            return Err(Error::Cancelled);
+        }
+        provision(&self.lifecycle, &self.station, &self.factory, &self.pending).await
+    }
+    /// `pci.rs::schedule_owner`: retry while the firmware image or the signed
+    /// records are not registered yet.
+    pub(super) async fn drive(&self) -> Result<(), Error> {
+        super::pci::drive_scheduled(
+            ATTEMPTS,
+            || self.retryable(),
+            || self.provision_once(),
+            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+        )
+        .await
+    }
+    /// A fresh generation that cannot continue: withdraw it and retire its
+    /// owner. The slot stays bound (unbind/replug starts over).
+    pub(super) async fn abort(&self) {
+        self.station.withdraw();
+        let _ = self.lifecycle.remove().await;
+    }
+}
+
+/// `main.c::rtw_core_start` -> `rtw_power_on` for a restart generation:
+/// a fresh backend over the original pipes (the xHCI endpoint contexts stay
+/// configured, as Linux keeps the interface bound), `rtw_mac_power_on`,
+/// REG_C2HEVT and a fresh factory map whose MAC must equal the original
+/// (`pci.rs::bring_up_mode`'s identity re-read).
+pub(super) async fn power_up(
+    device: &Arc<USBDevice>,
+    origin: &Origin,
+) -> Result<(Backend, Factory8821c), super::operating_reset::Error> {
+    use super::operating_reset::Error as Reset;
+    let mut backend = Backend::new(
+        UsbControl::new(device.clone()),
+        UsbIo::new(device.clone()),
+        origin.endpoints,
+        origin.speed,
     )
-    .await
+    .map_err(|_| Reset::Unsupported)?;
+    let factory = power_and_factory(&mut backend)
+        .await
+        .map_err(|_| Reset::Power)?;
+    if factory.mac() != origin.mac {
+        return Err(Reset::Identity);
+    }
+    Ok((backend, factory))
 }
 
 /// `pci.rs::retryable` for the USB owner.

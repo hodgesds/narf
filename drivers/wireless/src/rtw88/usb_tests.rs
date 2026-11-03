@@ -451,3 +451,43 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_driver_id_table_and_endpoint_contexts
 );
+
+fn smoke_rtw88_usb_power_off_sequence() -> TestResult {
+    // Powered on (CR 0x00), cut B, PMU ready.
+    let regs = Registers::new(Fake::with(&[(0xf1, 0x10), (0x100, 0x00), (0x06, 0x02)]));
+    if complete(regs.power_off()).is_err() {
+        return TestResult::Fail("USB rtw_power_off refused");
+    }
+    {
+        let ops = regs.control().ops.lock();
+        let coex = ops
+            .iter()
+            .position(|(w, a, d)| *w && *a == 0xaa && d[..] == [0x00, 0x80]);
+        let carddis = ops
+            .iter()
+            .position(|(w, a, d)| *w && *a == 0x07 && d[..] == [0x20]);
+        // rtw_coex_power_off_setting precedes rtw_mac_power_off.
+        if !matches!((coex, carddis), (Some(c), Some(d)) if c < d) {
+            return TestResult::Fail(
+                "coex BT_INT_EN / card-disable order differs from rtw_power_off",
+            );
+        }
+    }
+    if regs.control().reg(0x100) != 0xea {
+        return TestResult::Fail("card-off state did not read back");
+    }
+    // rtw_ips_pwr_up -> rtw_core_start -> rtw_power_on over the parked card.
+    if complete(regs.power_on()).is_err() || regs.control().reg(0x03) & 0xd8 != 0xd8 {
+        return TestResult::Fail("fresh power-on after USB card-off refused");
+    }
+    // Already off: -EALREADY is ignored, no second card-disable is issued.
+    let off = Registers::new(Fake::with(&[(0xf1, 0x10), (0x100, 0xea)]));
+    if complete(off.power_off()).is_err() || off.control().wrote(0x07) {
+        return TestResult::Fail("already-off USB card re-ran the disable flow");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_power_off_sequence
+);

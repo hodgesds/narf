@@ -63,6 +63,7 @@ const REG_MCUFW_CTRL: u16 = 0x80;
 const REG_WLRF1: u16 = 0xec;
 const REG_SYS_CFG1: u16 = 0xf0;
 const REG_SYS_STATUS1: u16 = 0xf4;
+const REG_WIFI_BT_INFO: u16 = 0xaa;
 const REG_CR: u16 = 0x100;
 const REG_TXDMA_PQ_MAP: u16 = 0x10c;
 const REG_AUTO_LLT_V1: u16 = 0x208;
@@ -829,6 +830,24 @@ impl<C: ControlIo> Registers<C> {
             self.update32(REG_GPIO_MUXCFG, 1 << 19, 0).await?;
         }
         Ok(())
+    }
+
+    /// `main.c::rtw_power_off` on USB: `rtw_hci_stop` (`usb.c::rtw_usb_stop`
+    /// is empty), `coex.c::rtw_coex_power_off_setting` (REG_WIFI_BT_INFO =
+    /// BIT_BT_INT_EN) and `mac.c::rtw_mac_power_off`. Linux ignores the
+    /// switch result; here the card-off state must read back (the same
+    /// CR 0xea / REG_SYS_STATUS1+1 bit0 test as [`Self::power_switch`]).
+    pub(super) async fn power_off(&self) -> Result<(), Error> {
+        self.write16(REG_WIFI_BT_INFO, 1 << 15).await?;
+        match self.power_switch(false).await {
+            Ok(()) | Err(Error::Already) => {}
+            Err(error) => return Err(error),
+        }
+        if self.read8(REG_CR).await? == 0xea || self.read8(REG_SYS_STATUS1 + 1).await? & 1 != 0 {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
     }
 
     /// `usb.c::rtw_usb_interface_cfg` -> `rtw_usb_init_burst_pkt_len`.

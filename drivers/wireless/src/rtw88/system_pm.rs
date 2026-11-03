@@ -96,7 +96,11 @@ impl SystemPm {
             return Err(DevicePmError::Busy);
         }
         let barrier = Barrier::begin().map_err(|_| DevicePmError::Busy)?;
-        let controls: Vec<_> = barrier.owners().iter().map(|_| Control::new()).collect();
+        // Bound RTL8821CU USB slots join the same session (`usb_recovery.rs`:
+        // the USB core's forced unbind/rebind of a driver without PM ops).
+        let usb = super::usb_driver::slots();
+        let pci = barrier.owners().len();
+        let controls: Vec<_> = (0..pci + usb.len()).map(|_| Control::new()).collect();
         let session = Arc::new(Session {
             controls,
             _barrier: barrier.clone(),
@@ -110,6 +114,10 @@ impl SystemPm {
         }
         for (owner, control) in barrier.owners().iter().zip(&session.controls) {
             let backend = super::system_pm_native::Native::new(owner.clone(), barrier.clone());
+            narf_scheduler::spawn(system_pm_worker::run(backend, control.clone()));
+        }
+        for (slot, control) in usb.iter().zip(&session.controls[pci..]) {
+            let backend = super::usb_recovery::system(*slot);
             narf_scheduler::spawn(system_pm_worker::run(backend, control.clone()));
         }
         let mut attempt = Attempt {
