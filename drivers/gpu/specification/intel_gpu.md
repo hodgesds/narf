@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.42** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.43** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -34,8 +34,9 @@
 > MTL/Arrow standalone media GT lifecycle owner, display-14 DMC,
 > DC_off and lit-panel DC5/DC6 services, and display14 resource
 > transactions with live repartitioning and SAGV, and MTL external
-> DP/HDMI outputs with Type-C ownership, owned hotplug and DC_off join,
-> and display-14 FBC pass release native model gates — see §20).
+> DP/HDMI outputs with Type-C ownership, owned hotplug, DC_off join,
+> HDMI 2.0 scrambling and VBT port policy, and display-14 FBC pass
+> release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3804,7 +3805,7 @@ stop, and that a failed exit touches no route register. On Gen12,
 contend for the service's `try_lock`. The Gen12 hook paths otherwise return
 before any register access.
 
-### MTL external outputs: HDMI selection, GMBUS pin correction and HDMI 2.0 scrambling
+### MTL external outputs: HDMI selection, GMBUS pin correction and HDMI 2.0 scrambling — release gates recorded
 
 This slice continues the Output support row for display version 14. Sources
 are Linux b90c984d `intel_ddi.c` (`intel_ddi_init`, `intel_ddi_enable_hdmi`,
@@ -3878,7 +3879,7 @@ were intentionally corrected: `smoke_pin_pair_round_trip`,
 (ADL-S has no DDI B), `smoke_mtl_hdmi_pll_tables_and_typed_refusals` and
 `smoke_mtl_hdmi_probe_refusals_before_mmio`.
 
-### VBT parser, its first consumers and the Gen12 DDC corrections
+### VBT parser, its first consumers and the Gen12 DDC corrections — release gates recorded
 
 This slice continues the Output support row. Sources are Linux b90c984d
 `intel_bios.c`, `intel_vbt_defs.h`, `intel_opregion.c`, `intel_rom.c`,
@@ -3971,3 +3972,15 @@ before the pin renumbering. On the Gen12 side,
 `smoke_hdmi_edid_segment_pointer` checks the chained segment write.
 `smoke_hdmi_scdc_verify_failure` became
 `smoke_hdmi_scdc_status_sampled_after_stream`.
+
+Integration of the HDMI-selection, GMBUS and VBT slices: both ride the
+DC-state join, so every HDMI hotplug, probe and activation pass holds the
+`DcUser::External` reference through `with_dc_off`. A refused DC exit
+reports a DP route error carrying `ExternalError::DisplayPower`. The new
+`MtlRoute::release`, like the protocol release methods, allows
+`clippy::result_large_err`. All eight release groups pass 2,052 unique tests
+with no failures and no Intel skips; the only skip is the existing shared
+RNG-registration skip. Group 7 now also selects `drivers/gpu/intel_gpu_vbt`.
+The four GMBUS transport fixtures that failed after the pin renumbering alone
+pass with the `do_gmbus_xfer` rewrite. The debug group pass is deferred to the
+end of the current integration wave.

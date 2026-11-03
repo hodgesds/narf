@@ -2000,6 +2000,33 @@ this integration wave. The first eligible flip scans the GGTT aperture once,
 about 10^5 register reads; that one-time cost runs on the present path. None of
 this has run on physical Intel hardware.
 
+### MTL HDMI 2.0, GMBUS pins and the VBT parser — release gates recorded
+
+The MTL hotplug service now picks HDMI when a port has no DP sink and publishes
+HDMI routes. HDMI TMDS runs up to 594 MHz with source and sink scrambling over
+SCDC. NARF stops the activation if an SCDC write fails, where Linux only logs it.
+A bounds-checked VBT parser reads the board's VBT read-only from the ACPI
+OpRegion and supplies the MTL port policy, legacy Type-C ports, HDMI DDC pins
+and the SSC preference.
+
+Real behaviour changes, including on Gen12 (Tiger Lake and Alder Lake):
+- HDMI DDC pins now follow Linux. The old encoding (DDI A..F as GMBUS pins
+  2..7) drove the wrong wires: DDI B used "dpc". ADL-S has no DDI B or C pin.
+- Gen12 HDMI DDC now uses the shared GMBUS transport, which follows Linux's
+  `do_gmbus_xfer`: repeated START, a single STOP, and E-DDC segments.
+- A GMBUS transport bug that issued INDEX without WAIT is fixed. It would have
+  timed out MTL HDMI EDID and SCDC reads on silicon.
+- DP spread-spectrum clocking is on only when the VBT allows it and the sink
+  advertises 0.5% downspread (DP_MAX_DOWNSPREAD bit 0), per Linux. Sinks
+  without downspread no longer get SSC, even when there is no VBT.
+
+All eight release groups pass 2,052 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Remaining: VBT panel consumers (PPS, eDP link, PSR,
+backlight), VBT AUX remap and lane reversal, HDMI 2.1 FRL, and computed HDMI
+PLLs. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
