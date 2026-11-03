@@ -461,6 +461,7 @@ pub(crate) mod tests {
         let pdos = [SourcePdo::Fixed {
             voltage_mv: 5000,
             max_current_ma: 3000,
+            epr_mode_capable: false,
         }];
         let h = Header::data(
             DataMsg::SourceCapabilities,

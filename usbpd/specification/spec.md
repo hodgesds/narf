@@ -14,7 +14,9 @@ point.**
 - **USB Power Delivery Specification, Revision 3.1, Version 1.8**
   (USB-IF). §6.2.1 (message header), §6.4.1 (Power Data Objects),
   §6.4.2 (Request Data Object), §6.4.4 (Vendor Defined Messages),
-  §8.3.3 (sink Policy Engine state machine).
+  §6.4.9 (EPR_Request Message), §6.4.10 (EPR_Mode Message, EPR
+  Mode entry/exit, operation in EPR Mode), §8.3.3 (sink Policy
+  Engine state machine).
 - **USB Type-C Cable and Connector Specification, Revision 2.2**
   (USB-IF). §4 (CC pin meanings, Rd/Rp termination), §4.5 (port
   attach/detach behaviour).
@@ -34,7 +36,13 @@ point.**
 ### Landed today
 - **`message`** — Header encode/decode + CtrlMsg/DataMsg enums, Power
   Data Object codec (Fixed/Variable/Battery/Augmented per §6.4.1)
-  and Request Data Object codec (§6.4.2).
+  and Request Data Object codec (§6.4.2). EPR wire types: EPR AVS
+  APDO (sub-type 01b, §6.4.1.2.5.2 tables 6.14/6.21), AVS RDO
+  (table 6.27), EPR_Mode/EPRMDO (table 6.51) with Enter/Enter
+  Acknowledged/Enter Succeeded/Enter Failed/Exit actions, EPR
+  Request (0x09) and EPR_Mode (0x0A) data message types, EPR Mode
+  Capable bits (Fixed PDO bit 23, RDO bit 22), and 4-bit RDO object
+  positions (SPR 1..=7, EPR 8..=11 per §6.4.2.1).
 - **`tcpc`** — `Tcpc` trait: `set_role`, `cc_status`, `transmit`,
   `receive`, `hard_reset`. CcState/PortRole enums.
 - **`tcpm`** — Sink-role policy-engine state machine

@@ -26,7 +26,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use narf_usbpd::message::{FixedRdo, ProgrammableRdo, SourcePdo};
+use narf_usbpd::message::{
+    AvsRdo, EprEnterFailedReason, EprModeAction, EprModeDataObject, FixedRdo, ProgrammableRdo,
+    SourcePdo,
+};
 
 /// What a Sink Policy hands back from `evaluate_caps`. The Policy
 /// Engine maps this to the actual outgoing Request RDO.
@@ -48,17 +51,25 @@ pub struct SinkSelection {
     /// Policy Engine must build a Programmable RDO instead of a
     /// Fixed RDO.
     pub is_pps: bool,
+    /// True when the selected PDO is an EPR AVS APDO — the Policy
+    /// Engine must build an AVS RDO (inside an EPR_Request) instead
+    /// of a Fixed RDO.
+    pub is_avs: bool,
+    /// EPR Mode Capable (§6.4.2.7 bit 22) to set in the outgoing RDO.
+    /// Mirrors the sink's `epr_capable` policy flag; EPR Mode entry
+    /// (§6.4.10.1) requires it set in the sink's last Request RDO.
+    pub epr_mode_capable: bool,
 }
 
 impl SinkSelection {
     /// Cast a Fixed selection into a Fixed RDO. Defaults to sensible
     /// flags for a modern host (USB-Comms capable, no USB suspend).
-    /// Panics in debug builds if called on a PPS selection — use
-    /// [`Self::to_programmable_rdo`] instead.
+    /// Panics in debug builds if called on a PPS or AVS selection —
+    /// use [`Self::to_programmable_rdo`] / [`Self::to_avs_rdo`] instead.
     pub fn to_rdo(self) -> FixedRdo {
         debug_assert!(
-            !self.is_pps,
-            "to_rdo on PPS selection — use to_programmable_rdo"
+            !self.is_pps && !self.is_avs,
+            "to_rdo on PPS/AVS selection — use to_programmable_rdo/to_avs_rdo"
         );
         FixedRdo {
             object_position: self.object_position,
@@ -68,6 +79,7 @@ impl SinkSelection {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: self.cap_mismatch,
+            epr_mode_capable: self.epr_mode_capable,
         }
     }
 
@@ -82,6 +94,23 @@ impl SinkSelection {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: self.cap_mismatch,
+            epr_mode_capable: self.epr_mode_capable,
+        }
+    }
+
+    /// Cast an EPR AVS selection into an AVS RDO (table 6.27).
+    /// Voltage is quantised by the encoder to the 100 mV AVS step;
+    /// current to 50 mA. AVS sources do not current-limit, so there
+    /// is no max-current field.
+    pub fn to_avs_rdo(self) -> AvsRdo {
+        AvsRdo {
+            object_position: self.object_position,
+            voltage_mv: self.voltage_mv,
+            op_current_ma: self.op_current_ma,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: self.cap_mismatch,
+            epr_mode_capable: self.epr_mode_capable,
         }
     }
 }
@@ -126,6 +155,19 @@ pub struct SinkPolicy {
     /// pick-time to the PDO's advertised [min..=max] range and
     /// quantised to the 20 mV PPS step.
     pub pps_voltage_mv: u32,
+    /// `true` when this sink can operate in EPR Mode. Sets the
+    /// EPR Mode Capable bit (§6.4.2.7 bit 22) in every outgoing RDO
+    /// and gates `evaluate_epr`: a non-EPR sink never selects an EPR
+    /// PDO. Default off — EPR is opt-in per port.
+    pub epr_capable: bool,
+    /// `true` to prefer an EPR AVS APDO over an EPR Fixed PDO when
+    /// evaluating EPR-mode capabilities — the AVS branch picks the
+    /// programmable voltage exactly. Default off.
+    pub prefer_epr_avs: bool,
+    /// Voltage to ask for when picking an EPR AVS APDO, in mV.
+    /// Clamped at pick-time to the APDO's advertised [min..=max]
+    /// range and quantised to the 100 mV AVS step.
+    pub epr_avs_voltage_mv: u32,
 }
 
 impl Default for SinkPolicy {
@@ -140,6 +182,9 @@ impl Default for SinkPolicy {
             accept_vconn_swap: false,
             prefer_pps: false,
             pps_voltage_mv: 5000,
+            epr_capable: false,
+            prefer_epr_avs: false,
+            epr_avs_voltage_mv: 28000,
         }
     }
 }
@@ -174,6 +219,8 @@ impl SinkPolicy {
                             op_current_ma: self.op_current_ma.min(max_current_ma),
                             cap_mismatch: false,
                             is_pps: true,
+                            is_avs: false,
+                            epr_mode_capable: self.epr_capable,
                         });
                     }
                 }
@@ -187,6 +234,7 @@ impl SinkPolicy {
             let SourcePdo::Fixed {
                 voltage_mv,
                 max_current_ma,
+                ..
             } = *pdo
             else {
                 continue;
@@ -220,6 +268,7 @@ impl SinkPolicy {
             if let SourcePdo::Fixed {
                 voltage_mv,
                 max_current_ma,
+                ..
             } = caps[0]
             {
                 return Some(SinkSelection {
@@ -228,6 +277,8 @@ impl SinkPolicy {
                     op_current_ma: self.op_current_ma.min(max_current_ma),
                     cap_mismatch: true,
                     is_pps: false,
+                    is_avs: false,
+                    epr_mode_capable: self.epr_capable,
                 });
             }
             // Source advertised no Fixed PDOs at all — shouldn't be
@@ -241,6 +292,108 @@ impl SinkPolicy {
             op_current_ma: self.op_current_ma.min(max_current_ma),
             cap_mismatch: false,
             is_pps: false,
+            is_avs: false,
+            epr_mode_capable: self.epr_capable,
+        })
+    }
+
+    /// Pick a PDO position from an EPR-mode capability list — the
+    /// contents of an EPR_Source_Capabilities Message, where SPR
+    /// PDOs occupy positions 1..=7 and EPR PDOs positions 8..=11
+    /// (§6.4.2.1). Returns `None` when the sink is not EPR capable,
+    /// the list is empty, or no EPR PDO can serve us.
+    ///
+    /// Only EPR-mode PDO kinds are considered: Fixed and EPR AVS.
+    /// EPR Mode uses only Fixed and AVS PDOs — Variable, Battery and
+    /// SPR PPS entries are skipped even if a peer lists them. There
+    /// is no cap-mismatch fallback here (unlike SPR `evaluate`): when
+    /// no EPR PDO serves us, the caller keeps its SPR contract
+    /// instead of requesting an under-powered EPR contract.
+    pub fn evaluate_epr(&self, caps: &[SourcePdo]) -> Option<SinkSelection> {
+        if !self.epr_capable || caps.is_empty() {
+            return None;
+        }
+        // EPR positions are 8..=11, i.e. indices 7 and up.
+        let epr_caps = caps.iter().enumerate().skip(7);
+        // AVS-preferred path: first APDO whose range covers our
+        // wanted voltage and whose PDP covers the requested power.
+        // The PDP check is policy, not a spec reject rule: the PDP
+        // is the port's design power, so requesting more than it
+        // from an AVS APDO is asking for power the port cannot
+        // sustain.
+        if self.prefer_epr_avs {
+            for (i, pdo) in epr_caps.clone() {
+                if let SourcePdo::EprAvs {
+                    max_voltage_mv,
+                    min_voltage_mv,
+                    pdp_w,
+                    ..
+                } = *pdo
+                {
+                    if self.epr_avs_voltage_mv >= min_voltage_mv
+                        && self.epr_avs_voltage_mv <= max_voltage_mv
+                    {
+                        let want_mw = self.epr_avs_voltage_mv * self.op_current_ma / 1000;
+                        if pdp_w * 1000 >= want_mw {
+                            // Quantise to the AVS 100 mV step.
+                            let v = (self.epr_avs_voltage_mv / 100) * 100;
+                            return Some(SinkSelection {
+                                object_position: (i + 1) as u8,
+                                voltage_mv: v,
+                                op_current_ma: self.op_current_ma,
+                                cap_mismatch: false,
+                                is_pps: false,
+                                is_avs: true,
+                                epr_mode_capable: self.epr_capable,
+                            });
+                        }
+                    }
+                }
+            }
+            // Fall through to Fixed selection if no AVS APDO serves
+            // us — same stay-running shape as the SPR PPS path.
+        }
+        // Walk the EPR Fixed PDOs collecting candidates.
+        let mut best: Option<(u8, u32, u32)> = None; // (pos, voltage, current)
+        for (i, pdo) in epr_caps {
+            let SourcePdo::Fixed {
+                voltage_mv,
+                max_current_ma,
+                ..
+            } = *pdo
+            else {
+                continue;
+            };
+            if voltage_mv < self.min_voltage_mv {
+                continue;
+            }
+            let pos = (i + 1) as u8;
+            best = Some(match best {
+                None => (pos, voltage_mv, max_current_ma),
+                Some((p, v, c)) => {
+                    if self.prefer_high_voltage {
+                        if voltage_mv > v {
+                            (pos, voltage_mv, max_current_ma)
+                        } else {
+                            (p, v, c)
+                        }
+                    } else if voltage_mv < v {
+                        (pos, voltage_mv, max_current_ma)
+                    } else {
+                        (p, v, c)
+                    }
+                }
+            });
+        }
+        let (pos, voltage_mv, max_current_ma) = best?;
+        Some(SinkSelection {
+            object_position: pos,
+            voltage_mv,
+            op_current_ma: self.op_current_ma.min(max_current_ma),
+            cap_mismatch: false,
+            is_pps: false,
+            is_avs: false,
+            epr_mode_capable: self.epr_capable,
         })
     }
 }
@@ -276,6 +429,19 @@ pub struct SourcePolicy {
     /// `true` to Accept inbound VConn_Swap requests. Default off —
     /// only enabled for ports that can drive VConn (active cables).
     pub accept_vconn_swap: bool,
+    /// `true` when this source can operate in EPR Mode. Sets the
+    /// EPR Mode Capable bit (§6.4.1.2.2.7 bit 23) on the advertised
+    /// Fixed 5 V PDO and gates EPR Mode entry. Default off — EPR is
+    /// opt-in per port, and advertising it commits the port to the
+    /// >100 W EPR behaviour.
+    pub epr_capable: bool,
+    /// EPR-mode PDOs, in EPR_Source_Capabilities order: positions
+    /// 8..=11 of the EPR-mode list. Positions 1..=7 resolve against
+    /// `pdos` (the SPR list); positions 8..=11 resolve here, so the
+    /// SPR PDOs are not duplicated. Empty by default — an
+    /// EPR-capable source fills this with its EPR Fixed and EPR AVS
+    /// PDOs. EPR Mode uses only Fixed and AVS PDOs.
+    pub epr_pdos: Vec<SourcePdo>,
 }
 
 impl Default for SourcePolicy {
@@ -286,10 +452,13 @@ impl Default for SourcePolicy {
             pdos: alloc::vec![SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             }],
             accept_pr_swap: false,
             accept_dr_swap: false,
             accept_vconn_swap: false,
+            epr_capable: false,
+            epr_pdos: Vec::new(),
         }
     }
 }
@@ -312,6 +481,37 @@ impl SourcePolicy {
             accept_pr_swap: false,
             accept_dr_swap: false,
             accept_vconn_swap: false,
+            epr_capable: false,
+            epr_pdos: Vec::new(),
+        }
+    }
+
+    /// PDOs to actually put on the wire in Source_Capabilities: the
+    /// SPR list with the EPR Mode Capable bit set on PDO #1 when
+    /// this source is EPR capable. Table 6.9 restricts bits 29…23
+    /// to the vSafe5V PDO, so only position 1 is touched — every
+    /// other PDO is advertised exactly as listed.
+    pub fn advertised_pdos(&self) -> Vec<SourcePdo> {
+        let mut pdos = self.pdos.clone();
+        if self.epr_capable {
+            if let Some(SourcePdo::Fixed {
+                epr_mode_capable, ..
+            }) = pdos.first_mut()
+            {
+                *epr_mode_capable = true;
+            }
+        }
+        pdos
+    }
+
+    /// Resolve an EPR-mode object position to its PDO: positions
+    /// 1..=7 come from the SPR list, positions 8..=11 from
+    /// `epr_pdos` (§6.4.2.1). Anything else is unresolvable.
+    pub(crate) fn epr_position_pdo(&self, position: u8) -> Option<SourcePdo> {
+        match position {
+            1..=7 => self.pdos.get((position - 1) as usize).copied(),
+            8..=11 => self.epr_pdos.get((position - 8) as usize).copied(),
+            _ => None,
         }
     }
 
@@ -331,6 +531,10 @@ impl SourcePolicy {
             // Battery PDOs advertise power, not current; reject for
             // now — battery sourcing belongs to a later stage.
             SourcePdo::Battery { .. } => return RequestDecision::Reject,
+            // EPR AVS is negotiated via EPR_Request only, never via
+            // a plain Request; an EprAvs at an SPR position is a
+            // misplaced PDO — fail closed.
+            SourcePdo::EprAvs { .. } => return RequestDecision::Reject,
         };
         if rdo.op_current_ma > max_advertised {
             // Capability mismatch path: the sink is asking for more
@@ -381,6 +585,347 @@ impl SourcePolicy {
     }
 }
 
+/// One EPR_Request Message's RDO, by kind. An EPR_Request (§6.4.9)
+/// carries an RDO plus a copy of the PDO it targets; the source
+/// verifies the copy exactly matches its latest advertised PDO at
+/// that position before evaluating the request itself.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EprRequestKind {
+    Fixed(FixedRdo),
+    Programmable(ProgrammableRdo),
+    Avs(AvsRdo),
+}
+
+impl EprRequestKind {
+    fn object_position(&self) -> u8 {
+        match *self {
+            EprRequestKind::Fixed(r) => r.object_position,
+            EprRequestKind::Programmable(r) => r.object_position,
+            EprRequestKind::Avs(r) => r.object_position,
+        }
+    }
+}
+
+impl SourcePolicy {
+    /// Decide how to react to an incoming EPR_Request (EPR Mode
+    /// only). `pdo_copy` is the second data object of the message.
+    /// Rules, all fail-closed to Reject:
+    /// - the position must resolve (§6.4.2.1: 1..=7 SPR, 8..=11 EPR);
+    /// - the PDO copy must encode byte-identically to the resolved
+    ///   PDO (§6.4.9 — a mismatch is a Hard Reset offence on the
+    ///   wire; policy reports Reject and the engine escalates);
+    /// - Fixed: current ≤ PDO max, or cap_mismatch Accept (mirrors
+    ///   `evaluate_request`);
+    /// - Programmable: position must be an SPR PPS APDO (1..=7),
+    ///   voltage in [min..=max], current rule as
+    ///   `evaluate_programmable_request`;
+    /// - AVS: position must be an EPR AVS APDO (8..=11), voltage in
+    ///   [min..=max] with the table 6.27 low-bits-zero rule
+    ///   (voltage must be 100 mV aligned, else Reject). Current is
+    ///   NOT checked: an AVS source does not current-limit, the sink
+    ///   is responsible for not exceeding what it requested.
+    ///
+    /// This never returns Wait: a sink receiving Wait to an
+    /// EPR_Request initiates a Hard Reset (§6.4.9), so the source
+    /// answers Accept or Reject only.
+    pub fn evaluate_epr_request(&self, kind: &EprRequestKind, pdo_copy: u32) -> RequestDecision {
+        let position = kind.object_position();
+        let pdo = match self.epr_position_pdo(position) {
+            Some(p) => p,
+            None => return RequestDecision::Reject,
+        };
+        if pdo_copy != pdo.encode() {
+            return RequestDecision::Reject;
+        }
+        match *kind {
+            EprRequestKind::Fixed(rdo) => match pdo {
+                SourcePdo::Fixed { max_current_ma, .. } => {
+                    if rdo.op_current_ma > max_current_ma {
+                        if rdo.cap_mismatch {
+                            RequestDecision::Accept
+                        } else {
+                            RequestDecision::Reject
+                        }
+                    } else {
+                        RequestDecision::Accept
+                    }
+                }
+                _ => RequestDecision::Reject,
+            },
+            EprRequestKind::Programmable(rdo) => {
+                // SPR PPS lives at positions 1..=7; an Augmented PDO
+                // at an EPR position is a policy construction bug —
+                // fail closed rather than accepting it.
+                if position > 7 {
+                    return RequestDecision::Reject;
+                }
+                match pdo {
+                    SourcePdo::Augmented {
+                        max_voltage_mv,
+                        min_voltage_mv,
+                        max_current_ma,
+                    } => {
+                        if rdo.voltage_mv < min_voltage_mv || rdo.voltage_mv > max_voltage_mv {
+                            return RequestDecision::Reject;
+                        }
+                        if rdo.op_current_ma > max_current_ma {
+                            if rdo.cap_mismatch {
+                                RequestDecision::Accept
+                            } else {
+                                RequestDecision::Reject
+                            }
+                        } else {
+                            RequestDecision::Accept
+                        }
+                    }
+                    _ => RequestDecision::Reject,
+                }
+            }
+            EprRequestKind::Avs(rdo) => {
+                // EPR AVS APDOs live at positions 8..=11.
+                if position < 8 {
+                    return RequestDecision::Reject;
+                }
+                match pdo {
+                    SourcePdo::EprAvs {
+                        max_voltage_mv,
+                        min_voltage_mv,
+                        ..
+                    } => {
+                        if rdo.voltage_mv % 100 != 0 {
+                            return RequestDecision::Reject;
+                        }
+                        if rdo.voltage_mv < min_voltage_mv || rdo.voltage_mv > max_voltage_mv {
+                            return RequestDecision::Reject;
+                        }
+                        RequestDecision::Accept
+                    }
+                    _ => RequestDecision::Reject,
+                }
+            }
+        }
+    }
+}
+
+// ── EPR Mode entry (§6.4.10.1) ────────────────────────────────────
+//
+// Pure, I/O-free state machines for the EPR Mode entry sequence.
+// The source engine drives `SourceEprEntry`; the sink engine (once
+// it is policy-driven) drives `SinkEprEntry`. Cable capability and
+// VCONN-supplier state arrive as inputs — this module never probes
+// hardware — so SOP' cable discovery (#1215) can feed them later
+// without changing the sequence logic.
+//
+// Entry preconditions (§6.4.10.1): sink requests entry; source
+// verifies the cable is EPR capable; no CT-VPD in the path; an SPR
+// Explicit Contract is in place; the EPR Mode Capable bit is set in
+// the Fixed 5 V PDO and in the sink's last RDO. Timers (tEnterEPR,
+// keepalives) are NOT modelled here: the engines are step-driven
+// with no clock, and the timer values are follow-up work.
+
+/// Source side of EPR Mode entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SourceEprEntry {
+    /// True once Enter Succeeded has been sent.
+    epr_mode: bool,
+    /// True between Enter Acknowledged and the Succeeded/Failed
+    /// verdict, while cable capability resolves.
+    awaiting_cable: bool,
+}
+
+impl Default for SourceEprEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SourceEprEntry {
+    pub fn new() -> Self {
+        Self {
+            epr_mode: false,
+            awaiting_cable: false,
+        }
+    }
+
+    pub fn is_epr_mode(&self) -> bool {
+        self.epr_mode
+    }
+
+    /// Handle an inbound EPR_Mode Enter (step 2 of §6.4.10.1).
+    /// Checks run in spec order: RDO bit, then PDO bit, then
+    /// still-able. On the first failure the machine answers Enter
+    /// Failed with the matching reason and stays out of EPR Mode;
+    /// on success it answers Enter Acknowledged and waits for cable
+    /// resolution. Calling this while already in EPR Mode or
+    /// awaiting cable is a caller bug — it answers Unable rather
+    /// than corrupting state.
+    pub fn on_enter(
+        &mut self,
+        rdo_epr_bit: bool,
+        pdo_epr_bit: bool,
+        still_able: bool,
+    ) -> EprModeDataObject {
+        if self.epr_mode || self.awaiting_cable {
+            return EprModeDataObject::enter_failed(EprEnterFailedReason::UnableAtThisTime);
+        }
+        if !rdo_epr_bit {
+            return EprModeDataObject::enter_failed(EprEnterFailedReason::RdoBitNotSet);
+        }
+        if !pdo_epr_bit {
+            return EprModeDataObject::enter_failed(EprEnterFailedReason::PdoBitNotSet);
+        }
+        if !still_able {
+            return EprModeDataObject::enter_failed(EprEnterFailedReason::UnableAtThisTime);
+        }
+        self.awaiting_cable = true;
+        EprModeDataObject::enter_acknowledged()
+    }
+
+    /// Resolve the pending entry once cable capability is known
+    /// (steps 4–7). `known = false` means discovery is still in
+    /// flight — returns `None` and stays pending. When the source
+    /// is not the VCONN supplier, entry fails with NotVconnSource:
+    /// this machine does not perform a VCONN Swap mid-entry (that
+    /// wiring is follow-up work); a source that is not the supplier
+    /// must not claim success.
+    pub fn on_cable_resolved(
+        &mut self,
+        known: bool,
+        capable: bool,
+        vconn_supplier: bool,
+    ) -> Option<EprModeDataObject> {
+        if !self.awaiting_cable {
+            return None;
+        }
+        if !known {
+            return None;
+        }
+        self.awaiting_cable = false;
+        if !vconn_supplier {
+            return Some(EprModeDataObject::enter_failed(
+                EprEnterFailedReason::NotVconnSource,
+            ));
+        }
+        if !capable {
+            return Some(EprModeDataObject::enter_failed(
+                EprEnterFailedReason::CableNotEprCapable,
+            ));
+        }
+        self.epr_mode = true;
+        Some(EprModeDataObject::enter_succeeded())
+    }
+
+    /// An EPR_Mode Exit was received while in EPR Mode: leave it.
+    /// The engine decides the follow-up (re-advertise SPR caps when
+    /// the live contract is SPR, Hard Reset when it is EPR).
+    pub fn on_exit(&mut self) {
+        self.epr_mode = false;
+        self.awaiting_cable = false;
+    }
+}
+
+/// Outcome of feeding an EPR_Mode message to the sink entry machine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SinkEprEntryOutcome {
+    /// Enter Acknowledged received; still waiting for Succeeded.
+    AwaitingSucceeded,
+    /// Enter Succeeded received — now in EPR Mode.
+    Entered,
+    /// Enter Failed received, with the source's reason. The engine
+    /// maps this to a Soft Reset, as with any entry abort.
+    Failed(EprEnterFailedReason),
+    /// Anything other than the expected message (step 3 / step 8):
+    /// the sink initiates a Soft Reset.
+    AbortSoftReset,
+}
+
+/// Sink side of EPR Mode entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SinkEprEntry {
+    /// True once Enter has been sent and Acknowledged is awaited.
+    enter_sent: bool,
+    /// True once Acknowledged has arrived and Succeeded is awaited.
+    ack_received: bool,
+    /// True once Succeeded has arrived.
+    epr_mode: bool,
+}
+
+impl Default for SinkEprEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SinkEprEntry {
+    pub fn new() -> Self {
+        Self {
+            enter_sent: false,
+            ack_received: false,
+            epr_mode: false,
+        }
+    }
+
+    pub fn is_epr_mode(&self) -> bool {
+        self.epr_mode
+    }
+
+    /// Build the Enter message (step 1) and arm the machine. Data
+    /// is the sink's Operational PDP in watts.
+    pub fn send_enter(&mut self, operational_pdp_w: u8) -> EprModeDataObject {
+        self.enter_sent = true;
+        self.ack_received = false;
+        self.epr_mode = false;
+        EprModeDataObject::enter(operational_pdp_w)
+    }
+
+    /// Feed an inbound EPR_Mode message into the machine.
+    pub fn on_message(&mut self, mdo: &EprModeDataObject) -> SinkEprEntryOutcome {
+        if self.ack_received {
+            // Step 8: only Succeeded enters EPR Mode.
+            if mdo.action == EprModeAction::EnterSucceeded {
+                self.ack_received = false;
+                self.enter_sent = false;
+                self.epr_mode = true;
+                return SinkEprEntryOutcome::Entered;
+            }
+            if mdo.action == EprModeAction::EnterFailed {
+                let reason = mdo.failed_reason().unwrap_or(EprEnterFailedReason::Unknown);
+                self.ack_received = false;
+                self.enter_sent = false;
+                return SinkEprEntryOutcome::Failed(reason);
+            }
+            // Abort: reset so a later Succeeded cannot resurrect a
+            // dead entry sequence.
+            self.ack_received = false;
+            self.enter_sent = false;
+            return SinkEprEntryOutcome::AbortSoftReset;
+        }
+        if self.enter_sent {
+            // Step 3: only Acknowledged continues the sequence.
+            if mdo.action == EprModeAction::EnterAcknowledged {
+                self.ack_received = true;
+                return SinkEprEntryOutcome::AwaitingSucceeded;
+            }
+            if mdo.action == EprModeAction::EnterFailed {
+                let reason = mdo.failed_reason().unwrap_or(EprEnterFailedReason::Unknown);
+                self.enter_sent = false;
+                return SinkEprEntryOutcome::Failed(reason);
+            }
+            self.enter_sent = false;
+            return SinkEprEntryOutcome::AbortSoftReset;
+        }
+        SinkEprEntryOutcome::AbortSoftReset
+    }
+
+    /// An EPR_Mode Exit was sent or received while in EPR Mode:
+    /// leave it.
+    pub fn on_exit(&mut self) {
+        self.epr_mode = false;
+        self.enter_sent = false;
+        self.ack_received = false;
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests {
     use super::*;
@@ -393,14 +938,17 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Fixed {
                 voltage_mv: 9000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Fixed {
                 voltage_mv: 15000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
         ];
         let sel = match policy.evaluate(&caps) {
@@ -431,14 +979,17 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Fixed {
                 voltage_mv: 9000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Fixed {
                 voltage_mv: 15000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
         ];
         let sel = policy.evaluate(&caps).expect("policy returned None");
@@ -464,6 +1015,7 @@ pub(crate) mod tests {
         let caps = [SourcePdo::Fixed {
             voltage_mv: 5000,
             max_current_ma: 3000,
+            epr_mode_capable: false,
         }];
         let sel = policy.evaluate(&caps).expect("evaluate");
         if !sel.cap_mismatch {
@@ -492,6 +1044,7 @@ pub(crate) mod tests {
         let caps = [SourcePdo::Fixed {
             voltage_mv: 5000,
             max_current_ma: 1500, // source only offers 1.5 A
+            epr_mode_capable: false,
         }];
         let sel = policy.evaluate(&caps).expect("evaluate");
         if sel.op_current_ma != 1500 {
@@ -523,6 +1076,8 @@ pub(crate) mod tests {
             op_current_ma: 2500,
             cap_mismatch: true,
             is_pps: false,
+            is_avs: false,
+            epr_mode_capable: true,
         };
         let rdo = sel.to_rdo();
         if rdo.object_position != 2 {
@@ -536,6 +1091,9 @@ pub(crate) mod tests {
         }
         if !rdo.usb_comms || !rdo.no_usb_suspend {
             return TestResult::Fail("modern-host flags should default on");
+        }
+        if !rdo.epr_mode_capable {
+            return TestResult::Fail("epr_mode_capable did not propagate to RDO");
         }
         TestResult::Pass
     }
@@ -553,6 +1111,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                ..
             } => TestResult::Pass,
             _ => TestResult::Fail("default PDO #1 should be Fixed 5V/3A"),
         }
@@ -572,6 +1131,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         match p.evaluate_request(&rdo) {
             RequestDecision::Accept => TestResult::Pass,
@@ -593,6 +1153,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         match p.evaluate_request(&rdo) {
             RequestDecision::Reject => TestResult::Pass,
@@ -616,6 +1177,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: true,
+            epr_mode_capable: false,
         };
         match p.evaluate_request(&rdo) {
             RequestDecision::Accept => TestResult::Pass,
@@ -637,6 +1199,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         match p.evaluate_request(&rdo) {
             RequestDecision::Reject => TestResult::Pass,
@@ -699,6 +1262,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Augmented {
                 max_voltage_mv: 11000,
@@ -755,6 +1319,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Augmented {
                 max_voltage_mv: 11000,
@@ -783,6 +1348,8 @@ pub(crate) mod tests {
             op_current_ma: 2000,
             cap_mismatch: false,
             is_pps: true,
+            is_avs: false,
+            epr_mode_capable: false,
         };
         let rdo = sel.to_programmable_rdo();
         if rdo.object_position != 2 {
@@ -808,6 +1375,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Augmented {
                 max_voltage_mv: 11000,
@@ -822,6 +1390,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         match p.evaluate_programmable_request(&rdo) {
             RequestDecision::Accept => TestResult::Pass,
@@ -838,6 +1407,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Augmented {
                 max_voltage_mv: 11000,
@@ -852,6 +1422,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         match p.evaluate_programmable_request(&rdo) {
             RequestDecision::Reject => TestResult::Pass,
@@ -872,6 +1443,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         match p.evaluate_programmable_request(&rdo) {
             RequestDecision::Reject => TestResult::Pass,
@@ -881,5 +1453,569 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usbpd/policy",
         smoke_source_policy_rejects_programmable_against_fixed_position
+    );
+
+    // ── EPR ────────────────────────────────────────────────────────
+
+    /// EPR-mode capability list: SPR PDOs at 1..=7, EPR PDOs at 8..=11.
+    fn epr_caps_fixture() -> [SourcePdo; 11] {
+        [
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+                epr_mode_capable: true,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 9000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 15000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 20000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 21000,
+                min_voltage_mv: 3300,
+                max_current_ma: 5000,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 1500,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 1500,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 28000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 36000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 48000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::EprAvs {
+                max_voltage_mv: 48000,
+                min_voltage_mv: 15000,
+                pdp_w: 240,
+                peak_current: 0,
+            },
+        ]
+    }
+
+    fn smoke_sink_policy_epr_disabled_returns_none() -> TestResult {
+        // Default sink is not EPR capable: no EPR selection, even
+        // with EPR PDOs on offer.
+        let policy = SinkPolicy::default();
+        if policy.evaluate_epr(&epr_caps_fixture()).is_some() {
+            return TestResult::Fail("non-EPR sink should not select EPR PDOs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_epr_disabled_returns_none
+    );
+
+    fn smoke_sink_policy_epr_picks_lowest_epr_fixed() -> TestResult {
+        let policy = SinkPolicy {
+            epr_capable: true,
+            min_voltage_mv: 5000,
+            ..SinkPolicy::default()
+        };
+        let sel = match policy.evaluate_epr(&epr_caps_fixture()) {
+            Some(s) => s,
+            None => return TestResult::Fail("EPR sink returned None on valid caps"),
+        };
+        // Lowest EPR Fixed is 28 V at position 8; SPR entries at
+        // 1..=7 must not win, and the AVS APDO at 11 must not win
+        // without prefer_epr_avs.
+        if sel.object_position != 8 || sel.voltage_mv != 28000 || sel.is_avs {
+            return TestResult::Fail("EPR evaluation did not pick 28V Fixed at position 8");
+        }
+        if !sel.epr_mode_capable {
+            return TestResult::Fail("EPR selection should carry the EPR bit");
+        }
+        let rdo = sel.to_rdo();
+        if rdo.object_position != 8 || !rdo.epr_mode_capable {
+            return TestResult::Fail("EPR Fixed selection RDO drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_epr_picks_lowest_epr_fixed
+    );
+
+    fn smoke_sink_policy_epr_high_voltage_picks_48v() -> TestResult {
+        let policy = SinkPolicy {
+            epr_capable: true,
+            prefer_high_voltage: true,
+            ..SinkPolicy::default()
+        };
+        let sel = policy.evaluate_epr(&epr_caps_fixture()).expect("evaluate");
+        if sel.object_position != 10 || sel.voltage_mv != 48000 {
+            return TestResult::Fail("prefer_high_voltage should pick 48V Fixed at position 10");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_epr_high_voltage_picks_48v
+    );
+
+    fn smoke_sink_policy_epr_avs_preferred_when_in_range() -> TestResult {
+        let policy = SinkPolicy {
+            epr_capable: true,
+            prefer_epr_avs: true,
+            epr_avs_voltage_mv: 28000,
+            op_current_ma: 3000, // 28 V × 3 A = 84 W ≤ 240 W PDP
+            ..SinkPolicy::default()
+        };
+        let sel = policy.evaluate_epr(&epr_caps_fixture()).expect("evaluate");
+        if !sel.is_avs || sel.object_position != 11 || sel.voltage_mv != 28000 {
+            return TestResult::Fail("AVS-preferred EPR evaluation did not pick the APDO");
+        }
+        let rdo = sel.to_avs_rdo();
+        if rdo.object_position != 11 || rdo.voltage_mv != 28000 || rdo.op_current_ma != 3000 {
+            return TestResult::Fail("AVS selection RDO drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_epr_avs_preferred_when_in_range
+    );
+
+    fn smoke_sink_policy_epr_avs_skipped_when_pdp_too_small() -> TestResult {
+        // 48 V × 5 A = 240 W wanted; the APDO's PDP is 240 W, so it
+        // passes — but ask for 48 V at 5 A with a 140 W PDP fixture
+        // instead: the AVS branch must skip to Fixed.
+        let mut caps = epr_caps_fixture();
+        caps[10] = SourcePdo::EprAvs {
+            max_voltage_mv: 48000,
+            min_voltage_mv: 15000,
+            pdp_w: 140,
+            peak_current: 0,
+        };
+        let policy = SinkPolicy {
+            epr_capable: true,
+            prefer_epr_avs: true,
+            prefer_high_voltage: true,
+            epr_avs_voltage_mv: 48000,
+            op_current_ma: 5000, // 48 V × 5 A = 240 W > 140 W PDP
+            ..SinkPolicy::default()
+        };
+        let sel = policy.evaluate_epr(&caps).expect("evaluate");
+        if sel.is_avs {
+            return TestResult::Fail("AVS APDO with too-small PDP should be skipped");
+        }
+        if sel.object_position != 10 || sel.voltage_mv != 48000 {
+            return TestResult::Fail("PDP-skip should fall through to 48V Fixed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_epr_avs_skipped_when_pdp_too_small
+    );
+
+    fn smoke_sink_policy_epr_ignores_spr_pps_and_variable() -> TestResult {
+        // EPR evaluation must not select SPR kinds even at EPR
+        // positions: replace the 28 V Fixed with an SPR PPS APDO and
+        // expect the next EPR Fixed (36 V) to win.
+        let mut caps = epr_caps_fixture();
+        caps[7] = SourcePdo::Augmented {
+            max_voltage_mv: 48000,
+            min_voltage_mv: 15000,
+            max_current_ma: 5000,
+        };
+        let policy = SinkPolicy {
+            epr_capable: true,
+            ..SinkPolicy::default()
+        };
+        let sel = policy.evaluate_epr(&caps).expect("evaluate");
+        if sel.object_position != 9 || sel.voltage_mv != 36000 {
+            return TestResult::Fail("EPR evaluation selected a non-Fixed/AVS PDO");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_epr_ignores_spr_pps_and_variable
+    );
+
+    fn smoke_source_policy_advertised_pdos_sets_epr_bit_on_5v_only() -> TestResult {
+        let mut p = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 20000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+        ]);
+        p.epr_capable = true;
+        let adv = p.advertised_pdos();
+        match adv[0] {
+            SourcePdo::Fixed {
+                epr_mode_capable: true,
+                ..
+            } => {}
+            _ => return TestResult::Fail("advertised PDO #1 should carry the EPR bit"),
+        }
+        match adv[1] {
+            SourcePdo::Fixed {
+                epr_mode_capable: false,
+                ..
+            } => {}
+            _ => return TestResult::Fail("table 6.9 restricts bits 29..23 to the 5V PDO"),
+        }
+        // Disabled: advertisement is exactly the listed PDOs.
+        p.epr_capable = false;
+        let adv = p.advertised_pdos();
+        match adv[0] {
+            SourcePdo::Fixed {
+                epr_mode_capable: false,
+                ..
+            } => TestResult::Pass,
+            _ => TestResult::Fail("EPR-disabled advertisement should not set the bit"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_advertised_pdos_sets_epr_bit_on_5v_only
+    );
+
+    fn epr_source_policy_fixture() -> SourcePolicy {
+        let mut p = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 20000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+        ]);
+        p.epr_capable = true;
+        p.epr_pdos = alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 28000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 48000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::EprAvs {
+                max_voltage_mv: 48000,
+                min_voltage_mv: 15000,
+                pdp_w: 240,
+                peak_current: 0,
+            },
+        ];
+        p
+    }
+
+    fn smoke_source_policy_accepts_epr_fixed_request_with_matching_copy() -> TestResult {
+        let p = epr_source_policy_fixture();
+        // Position 8 = 28 V Fixed; copy must match exactly.
+        let target = p.epr_pdos[0].encode();
+        let rdo = FixedRdo {
+            object_position: 8,
+            op_current_ma: 5000,
+            max_op_current_ma: 5000,
+            give_back: false,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Fixed(rdo), target) {
+            RequestDecision::Accept => TestResult::Pass,
+            _ => TestResult::Fail("matching EPR Fixed request should be Accepted"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_accepts_epr_fixed_request_with_matching_copy
+    );
+
+    fn smoke_source_policy_rejects_epr_request_on_copy_mismatch() -> TestResult {
+        let p = epr_source_policy_fixture();
+        // Copy claims 36 V while position 8 advertises 28 V.
+        let wrong = SourcePdo::Fixed {
+            voltage_mv: 36000,
+            max_current_ma: 5000,
+            epr_mode_capable: false,
+        }
+        .encode();
+        let rdo = FixedRdo {
+            object_position: 8,
+            op_current_ma: 5000,
+            max_op_current_ma: 5000,
+            give_back: false,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Fixed(rdo), wrong) {
+            RequestDecision::Reject => TestResult::Pass,
+            _ => TestResult::Fail("PDO-copy mismatch must be Rejected (§6.4.9)"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_rejects_epr_request_on_copy_mismatch
+    );
+
+    fn smoke_source_policy_epr_avs_request_rules() -> TestResult {
+        let p = epr_source_policy_fixture();
+        // Position 10 = EPR AVS APDO (15–48 V, 240 W).
+        let target = p.epr_pdos[2].encode();
+        let good = AvsRdo {
+            object_position: 10,
+            voltage_mv: 28000,
+            op_current_ma: 5000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Avs(good), target) {
+            RequestDecision::Accept => {}
+            _ => return TestResult::Fail("in-range AVS request should be Accepted"),
+        }
+        // Out-of-range voltage.
+        let high = AvsRdo {
+            voltage_mv: 49000,
+            ..good
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Avs(high), target) {
+            RequestDecision::Reject => {}
+            _ => return TestResult::Fail("out-of-range AVS voltage should be Rejected"),
+        }
+        // Non-100 mV-aligned voltage violates the table 6.27 note.
+        let unaligned = AvsRdo {
+            voltage_mv: 28025,
+            ..good
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Avs(unaligned), target) {
+            RequestDecision::Reject => {}
+            _ => return TestResult::Fail("unaligned AVS voltage should be Rejected"),
+        }
+        // AVS against a Fixed position.
+        let against_fixed = AvsRdo {
+            object_position: 8,
+            ..good
+        };
+        let fixed_copy = p.epr_pdos[0].encode();
+        match p.evaluate_epr_request(&EprRequestKind::Avs(against_fixed), fixed_copy) {
+            RequestDecision::Reject => TestResult::Pass,
+            _ => TestResult::Fail("AVS RDO on a Fixed PDO should be Rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_epr_avs_request_rules
+    );
+
+    fn smoke_source_policy_epr_request_for_spr_position() -> TestResult {
+        // EPR_Request may target an SPR PDO (§6.4.10.2): position 2
+        // = 20 V Fixed, copy matching.
+        let p = epr_source_policy_fixture();
+        let target = p.pdos[1].encode();
+        let rdo = FixedRdo {
+            object_position: 2,
+            op_current_ma: 3000,
+            max_op_current_ma: 3000,
+            give_back: false,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Fixed(rdo), target) {
+            RequestDecision::Accept => TestResult::Pass,
+            _ => TestResult::Fail("EPR_Request for an SPR PDO should be Accepted"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_epr_request_for_spr_position
+    );
+
+    fn smoke_source_policy_epr_request_position_kind_binding() -> TestResult {
+        // Position-kind binding (§6.4.2.1 + EPR uses only Fixed and
+        // AVS): a Programmable RDO at an EPR position and an AVS
+        // RDO at an SPR position are both Rejected even when the
+        // PDO copy matches — the variant must live at its own
+        // positions. Both fixtures use deliberately misplaced PDOs
+        // (a policy construction bug) to isolate the binding check
+        // from the variant check.
+        let mut p = epr_source_policy_fixture();
+        p.epr_pdos[0] = SourcePdo::Augmented {
+            max_voltage_mv: 21000,
+            min_voltage_mv: 3300,
+            max_current_ma: 5000,
+        };
+        let prdo = ProgrammableRdo {
+            object_position: 8,
+            voltage_mv: 9000,
+            op_current_ma: 2000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Programmable(prdo), p.epr_pdos[0].encode()) {
+            RequestDecision::Reject => {}
+            _ => return TestResult::Fail("Programmable RDO at position 8 should be Rejected"),
+        }
+        let mut p = epr_source_policy_fixture();
+        p.pdos[1] = SourcePdo::EprAvs {
+            max_voltage_mv: 48000,
+            min_voltage_mv: 15000,
+            pdp_w: 240,
+            peak_current: 0,
+        };
+        let ardo = AvsRdo {
+            object_position: 2,
+            voltage_mv: 28000,
+            op_current_ma: 5000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        match p.evaluate_epr_request(&EprRequestKind::Avs(ardo), p.pdos[1].encode()) {
+            RequestDecision::Reject => TestResult::Pass,
+            _ => TestResult::Fail("AVS RDO at position 2 should be Rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_epr_request_position_kind_binding
+    );
+
+    fn smoke_epr_entry_source_happy_path() -> TestResult {
+        let mut m = SourceEprEntry::new();
+        let ack = m.on_enter(true, true, true);
+        if ack.action != EprModeAction::EnterAcknowledged {
+            return TestResult::Fail("happy-path Enter should be Acknowledged");
+        }
+        // Cable still unknown: stays pending, no verdict.
+        if m.on_cable_resolved(false, false, true).is_some() {
+            return TestResult::Fail("unknown cable should stay pending");
+        }
+        let done = m.on_cable_resolved(true, true, true).expect("verdict");
+        if done.action != EprModeAction::EnterSucceeded || !m.is_epr_mode() {
+            return TestResult::Fail("capable cable should yield Enter Succeeded");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usbpd/policy", smoke_epr_entry_source_happy_path);
+
+    fn smoke_epr_entry_source_reject_reasons_in_spec_order() -> TestResult {
+        // RDO bit checked before PDO bit before still-able (§6.4.10.1
+        // step 2 order a, b, c).
+        let mut m = SourceEprEntry::new();
+        let r = m.on_enter(false, false, false);
+        if r.failed_reason() != Some(EprEnterFailedReason::RdoBitNotSet) {
+            return TestResult::Fail("RDO-bit failure should come first");
+        }
+        let mut m = SourceEprEntry::new();
+        let r = m.on_enter(true, false, false);
+        if r.failed_reason() != Some(EprEnterFailedReason::PdoBitNotSet) {
+            return TestResult::Fail("PDO-bit failure should come second");
+        }
+        let mut m = SourceEprEntry::new();
+        let r = m.on_enter(true, true, false);
+        if r.failed_reason() != Some(EprEnterFailedReason::UnableAtThisTime) {
+            return TestResult::Fail("still-able failure should come third");
+        }
+        // Cable failures after Ack.
+        let mut m = SourceEprEntry::new();
+        let _ = m.on_enter(true, true, true);
+        let r = m.on_cable_resolved(true, false, true).expect("verdict");
+        if r.failed_reason() != Some(EprEnterFailedReason::CableNotEprCapable) {
+            return TestResult::Fail("incapable cable should fail with reason 0x01");
+        }
+        let mut m = SourceEprEntry::new();
+        let _ = m.on_enter(true, true, true);
+        let r = m.on_cable_resolved(true, true, false).expect("verdict");
+        if r.failed_reason() != Some(EprEnterFailedReason::NotVconnSource) {
+            return TestResult::Fail("non-VCONN source should fail with reason 0x02");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_epr_entry_source_reject_reasons_in_spec_order
+    );
+
+    fn smoke_epr_entry_sink_sequence_and_aborts() -> TestResult {
+        let mut m = SinkEprEntry::new();
+        let enter = m.send_enter(240);
+        if enter.action != EprModeAction::Enter || enter.operational_pdp_w() != Some(240) {
+            return TestResult::Fail("send_enter should emit Enter with the PDP");
+        }
+        // Anything but Ack after Enter → Soft Reset (step 3).
+        match m.on_message(&EprModeDataObject::enter_succeeded()) {
+            SinkEprEntryOutcome::AbortSoftReset => {}
+            _ => return TestResult::Fail("Succeeded before Ack should abort"),
+        }
+        let mut m = SinkEprEntry::new();
+        let _ = m.send_enter(240);
+        match m.on_message(&EprModeDataObject::enter_acknowledged()) {
+            SinkEprEntryOutcome::AwaitingSucceeded => {}
+            _ => return TestResult::Fail("Ack should advance to awaiting-Succeeded"),
+        }
+        match m.on_message(&EprModeDataObject::enter_succeeded()) {
+            SinkEprEntryOutcome::Entered => {}
+            _ => return TestResult::Fail("Succeeded after Ack should enter EPR Mode"),
+        }
+        if !m.is_epr_mode() {
+            return TestResult::Fail("machine should report EPR mode after Succeeded");
+        }
+        // Failed carries the source's reason through.
+        let mut m = SinkEprEntry::new();
+        let _ = m.send_enter(240);
+        match m.on_message(&EprModeDataObject::enter_failed(
+            EprEnterFailedReason::CableNotEprCapable,
+        )) {
+            SinkEprEntryOutcome::Failed(EprEnterFailedReason::CableNotEprCapable) => {}
+            _ => return TestResult::Fail("Enter Failed reason should propagate"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_epr_entry_sink_sequence_and_aborts
     );
 }
