@@ -1798,8 +1798,8 @@ and WoWLAN paths are described below.
   - Station power base: the station re-derives the channel grant from the
     `NAPC` envelope (`station_power::Base`/`Grant`) at every publication and
     wait, as it does from `NEPC` for 88EE.
-  - ERP: an AP announcing Use_Protection is admitted on 8821AE (88EE
-    still needs the NERT grant); the beacon-tracked ERP flag drives the
+  - ERP: an AP announcing Use_Protection is admitted on 8821AE (and
+    8192EE, below; 88EE still needs the NERT grant); the beacon-tracked ERP flag drives the
     per-frame protection mode.
   - Fresh-generation recovery rebuild (`rebuild_native.rs`,
     `power_runtime::{disable,enable}_rtl8821ae`). After the shared
@@ -2478,10 +2478,46 @@ unprovisioned board stays unadmitted.
   `_rtl_get_highest_n_rate` (MCS15 for a peer naming `rx_mask[1]`, else
   MCS7; 11M B / 54M G) and names RATE_ID from `mac->mode`
   (`_rtl_txrate_selectmode` with `dm.useramask`, no NEW_RATEID: NGB 0 /
-  GB 4 / B 6), MACID 0; every other frame keeps the forced rate with
-  USE_RATE + DISFB and `RATR_INX_WIRELESS_MC` (deliberate: Linux also
-  hands Null/EAPOL DATA to the firmware). The forced/initial rate must be
-  in the permission's `admitted_rates`. `bw_40`: a unicast packet above
+  GB 4 / B 6), MACID 0. Special data (`rtl_is_special_data`: EAPOL,
+  ARP, IPv4 UDP BOOTP 67/68, `packet_owner::special_data`) sets
+  `ra.is_special_data`, so `rtl92ee_tx_fill_desc` keeps USE_RATE and
+  forces `DESC_RATE11M` (DISFB, `RATR_INX_WIRELESS_MC` from rix 0); Linux
+  classifies before software encryption, this driver receives the
+  station's protected frames, so a protected frame is never special. A
+  (QoS) Null DATA frame (`rtl_get_tcb_desc` nullfunc: DISFB +
+  `RATR_INX_WIRELESS_MC`) has USE_RATE cleared by `tx_fill_desc`, so the
+  firmware RA of MACID 0 picks the rate — only once the RA mask (bounded
+  by `admitted_rates`) is installed; before it the Null keeps the driver
+  rate. Every other frame keeps the forced rate with USE_RATE + DISFB and
+  `RATR_INX_WIRELESS_MC` (Linux clears USE_RATE for all non-management
+  frames; ordinary DATA leaves the driver rate only with an installed
+  mask). The forced/initial rate must be in the permission's
+  `admitted_rates`.
+- ERP / RTS-threshold protection (`station.rs::native_protection`,
+  `ee92_submit`). An AP announcing ERP Use_Protection, or a configured RTS
+  threshold, is admitted under the `N92E` permission (no 88EE `NERT`
+  grant): join, beacon tracking and SET_WIPHY accept it when the AP offers
+  24M. `protection::select` (mac80211 `use_cts_prot` /
+  `IEEE80211_TX_RC_USE_RTS_CTS` per MPDU+FCS length) feeds
+  `_rtl_query_protection_mode` into `rtl92ee_tx_fill_desc`: RTS/CTS sets
+  RTS_EN, CTS-to-self CTS2SELF (RTS_EN cleared, as `rts && !cts`), both
+  `RTS_RATE = DESC_RATE24M`, RTS_SC 0, HW_RTS 0, RTS_SHORT 0
+  (`rts_use_shortpreamble` false). Protection is independent of the RA
+  (Linux fills both), so protected ordinary DATA keeps USE_RATE/DISFB
+  clear. `ee92_submit` refuses (`Power(Policy)`) a protected frame whose
+  `DESC_RATE24M` is not in `admitted_rates`. Short preamble / slot follow
+  `ieee80211_handle_bss_capability` (`rtl8192ee::station::erp_timing`:
+  with an ERP element the preamble is short unless Barker bit 2, else the
+  capability 0x20; slot from capability 0x400), programmed at association
+  through `configure_rates` (the BSS ERP octet; the authentication-time
+  `prepare_station_peer` uses the capability alone, as mac80211 has no
+  ERP state yet) and, when a tracked beacon changes either flag,
+  `BSS_CHANGED_ERP_PREAMBLE` (`HW_VAR_ACK_PREAMBLE`) /
+  `BSS_CHANGED_ERP_SLOT` (`HW_VAR_SLOT_TIME`, `REG_SLOT` 9/20; its
+  `HW_VAR_AC_PARAM` loop writes nothing) inside the station publication
+  (`track_rtl8192ee_erp`, `erp_changed`). Test
+  `smoke_rtl8192ee_erp_protection_special_and_null_tx`
+  (`packet_owner_tests.rs`, written, unexecuted). `bw_40`: a unicast packet above
   54M on an HT link is 40 MHz (`data_bw` 1, SC 3), every other packet
   names `cur_40_prime_sc`. AGG_EN + `max_agg_num 0x14` for an
   operational BA TID with the peer's density (QoS DATA only). Linux
@@ -2518,8 +2554,8 @@ unprovisioned board stays unadmitted.
   `power_on_with` entry, asynchronously), re-verifies the factory
   identity and re-provisions a fresh `Owner(0x818b)`. As 8821AE, a
   failed first provisioning is not retried (`provisioning` retries only
-  88EE). Not composed: BT coexistence, ASPM, WoWLAN, protection
-  (ERP/RTS stay refused without the 88EE grant), LDPC/STBC.
+  88EE). Not composed: BT coexistence, ASPM, WoWLAN, LDPC/STBC
+  (ERP/RTS protection is composed, above).
 
 Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb`,

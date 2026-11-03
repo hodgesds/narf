@@ -124,6 +124,9 @@ pub(in super::super) struct State {
     pub(in super::super) link: Option<(h2c::Peer, bool, u8)>,
     /// `rtlpci->receive_config` cache (`HW_VAR_RCR`).
     pub(in super::super) receive: hw::ReceiveConfig,
+    /// `bss_conf->use_short_preamble` / `use_short_slot` as last programmed
+    /// at join (`hw::erp_timing`), for beacon `BSS_CHANGED_ERP_*` updates.
+    pub(in super::super) erp_timing: Option<(bool, bool)>,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -139,6 +142,7 @@ impl State {
             ratr_state: 0,
             link: None,
             receive: hw::ReceiveConfig::default(),
+            erp_timing: None,
         }
     }
     /// `rtl_c2h_content_parsing` for the packets this profile consumes.
@@ -167,6 +171,50 @@ const TX_EMPTY_POLLS: usize = 5000;
 /// `_rtl8192ee_reset_pcie_interface_dma` step 2).
 const REG_RXDMA_CONTROL: u16 = 0x0286;
 const RXDMA_PAUSE: u8 = 1 << 2;
+
+/// `rtl_is_special_data(is_tx, is_enc = false)` (as `_rtl_rc_get_rate`
+/// calls it): a DATA frame whose ethertype at `ieee80211_get_hdrlen +
+/// SNAP_SIZE` is EAPOL, ARP or IPv4 UDP with BOOTP ports (the low port
+/// bytes 67/68, as Linux compares them). Linux classifies before software
+/// encryption; this driver receives the station's already protected
+/// frames, so a protected frame (whose payload is ciphertext) is never
+/// special here.
+pub(in super::super) fn special_data(frame: &[u8]) -> bool {
+    if frame.len() < 24 || frame[0] & 0x0c != 0x08 || frame[1] & 0x40 != 0 {
+        return false;
+    }
+    let mut header = 24;
+    if frame[0] & 0x80 != 0 {
+        header += 2;
+        if frame[1] & 0x80 != 0 {
+            header += 4;
+        }
+    }
+    if frame[1] & 0x03 == 0x03 {
+        header += 6;
+    }
+    let Some(ether) = frame.get(header + 6..header + 8) else {
+        return false;
+    };
+    match u16::from_be_bytes([ether[0], ether[1]]) {
+        0x888e | 0x0806 => true,
+        0x0800 => {
+            let ip = header + 8;
+            let Some(&[version_ihl]) = frame.get(ip..ip + 1) else {
+                return false;
+            };
+            if frame.get(ip + 9) != Some(&17) {
+                return false;
+            }
+            let udp = ip + (usize::from(version_ihl & 0x0f) << 2);
+            match (frame.get(udp + 1), frame.get(udp + 3)) {
+                (Some(&src), Some(&dst)) => src == 68 && dst == 67 || src == 67 && dst == 68,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
 
 fn write_words(ring: &mut impl Memory, offset: usize, words: &[u32]) -> Result<(), Error> {
     for (word, value) in words.iter().copied().enumerate() {
@@ -456,7 +504,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .map_or(0, |c| c.prime_sc);
         self.phase = Phase::Failed;
         hw::set_bssid(&self.io, peer)?;
-        hw::configure_rates(&self.io, rates, basic, capability, false, prime_sc)?;
+        hw::configure_rates(&self.io, rates, basic, capability, None, false, prime_sc)?;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -550,6 +598,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.packet.ee92.link = None;
         self.packet.ee92.ra_report = None;
+        self.packet.ee92.erp_timing = None;
         hw::network_type_station(
             &self.io,
             &mut self.packet.ee92.receive,
@@ -576,10 +625,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// else MCS7) or 11M (B) / 54M. Its RATE_ID is `_rtl_txrate_selectmode`
     /// with `dm.useramask` (`rtl92ee_dm_init_rate_adaptive_mask`, BYDRIVER)
     /// and no `RTL_SPEC_NEW_RATEID`: from `mac->mode` NGB (HT) / GB (G) / B
-    /// (B), MACID 0. Every other frame keeps the forced `rate` with USE_RATE,
-    /// DISFB and `RATR_INX_WIRELESS_MC` (deliberate: Linux also clears
-    /// USE_RATE for Null/EAPOL DATA; here only the caller-selected adaptive
-    /// frames leave the driver rate). On a `bw_40` link a packet
+    /// (B), MACID 0. Special data ([`special_data`]: EAPOL, DHCP, ARP)
+    /// is forced to `DESC_RATE11M` (`ra.is_special_data`). A (QoS) Null
+    /// DATA frame with an installed RA mask clears USE_RATE with DISFB and
+    /// `RATR_INX_WIRELESS_MC`, so the firmware RA picks its rate. Every
+    /// other frame keeps the forced `rate` with USE_RATE, DISFB and
+    /// `RATR_INX_WIRELESS_MC` (Linux clears USE_RATE for all non-management
+    /// frames; here ordinary DATA leaves the driver rate only when the
+    /// caller marks it adaptive, i.e. with an installed mask). The selected
+    /// protection mode (`_rtl_query_protection_mode`) sets RTS_EN or
+    /// CTS2SELF with `RTS_RATE = DESC_RATE24M`, independent of the RA; the
+    /// RTS rate must be admitted too. On a `bw_40` link a packet
     /// above 54M to a unicast HT peer is a 40 MHz packet (`data_bw` 1, SC 3,
     /// `_rtl_query_bandwidth_mode`); every other packet names
     /// `cur_40_prime_sc`. `aggregate = (ampdu_density, operational)` sets
@@ -610,11 +666,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             || aggregate.is_some_and(|(density, _)| density > 7)
             || aggregate.is_some() && frame.first() != Some(&0x88)
             || rate > highest
-            || self.packet.protection != super::super::super::protection::Mode::None
         {
             return Err(Error::Packet);
         }
         let multicast_ra = frame.get(4).is_none_or(|b| b & 1 != 0);
+        // `rtl_is_special_data` (EAPOL / DHCP / ARP) sets
+        // `ra.is_special_data`, so `rtl92ee_tx_fill_desc` keeps USE_RATE
+        // and forces `DESC_RATE11M`; `rtl_get_tcb_desc` gave it rix 0, so
+        // DISFB and `RATR_INX_WIRELESS_MC` with it.
+        let special = special_data(frame);
+        let adaptive = adaptive && !special;
         let link = match self.packet.ee92.link {
             Some((peer, _, _)) if adaptive => {
                 if multicast_ra || frame[0] & 0x0c != 0x08 || frame[0] & 0x40 != 0 {
@@ -632,10 +693,32 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 None if peer.legacy <= 0xf => trx::DESC_RATE11M,
                 None => trx::DESC_RATE54M,
             },
+            None if special => trx::DESC_RATE11M,
             None => rate,
         };
+        // `rtl_get_tcb_desc` for a (QoS) Null DATA frame: use_driver_rate,
+        // DISFB and `RATR_INX_WIRELESS_MC`; `rtl92ee_tx_fill_desc` then
+        // clears USE_RATE (not special data), so the firmware RA of MACID 0
+        // picks the rate. Only with an installed RA mask, which
+        // `ee92_install_rate_mask` bounds by the admitted rates; before it
+        // the frame keeps the driver rate.
+        let null_ra = !special
+            && self.packet.ee92.link.is_some()
+            && !multicast_ra
+            && frame[0] & 0x0c == 0x08
+            && matches!(frame[0] & 0xf0, 0x40 | 0xc0);
+        // `_rtl_query_protection_mode`: RTS/CTS or CTS-to-self, both at
+        // `RTL_RC_OFDM_RATE24M` with long preamble (`rts_use_shortpreamble`
+        // false, so RTS_SHORT stays clear), RTS_SC 0, HW_RTS clear.
+        let protection = match self.packet.protection {
+            super::super::super::protection::Mode::None => 0,
+            super::super::super::protection::Mode::RtsCts => 1,
+            super::super::super::protection::Mode::CtsToSelf => 2,
+        };
         let permission = self.rtl8192ee_power.ok_or(Error::State)?;
-        if permission.admitted_rates() & (1u64 << hw_rate) == 0 {
+        if permission.admitted_rates() & (1u64 << hw_rate) == 0
+            || protection != 0 && permission.admitted_rates() & (1u64 << trx::DESC_RATE24M) == 0
+        {
             return Err(Error::Power(
                 super::super::super::channel_power::Error::Policy,
             ));
@@ -699,7 +782,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             macid: 0,
             rate_id,
             hw_rate,
-            use_driver_rate: link.is_none(),
+            use_driver_rate: link.is_none() && !null_ra,
             disable_fallback: link.is_none(),
             data_bw: u8::from(wide),
             sub_carrier: match (bw40, wide) {
@@ -712,8 +795,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             sec_type: 0,
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
             multicast,
-            protection: 0,
-            rts_rate: 0,
+            protection,
+            rts_rate: if protection != 0 {
+                trx::DESC_RATE24M
+            } else {
+                0
+            },
             tx_report,
             buffer_addr: address,
         });

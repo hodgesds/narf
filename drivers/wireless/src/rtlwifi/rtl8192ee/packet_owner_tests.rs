@@ -765,3 +765,157 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192ee_station_peer_join_lps_and_leave
 );
+
+/// `_rtl_query_protection_mode` on 8192EE: RTS/CTS (RTS_EN) and
+/// CTS-to-self (CTS2SELF) at `DESC_RATE24M`, long preamble, kept with the
+/// firmware RA (USE_RATE/DISFB clear); `rtl_is_special_data` EAPOL forced
+/// to `DESC_RATE11M` with USE_RATE + DISFB; a Null DATA frame with an
+/// installed RA mask clears USE_RATE (DISFB, `RATR_INX_WIRELESS_MC`); and
+/// the mac80211 ERP preamble/slot derivation with its
+/// `BSS_CHANGED_ERP_*` register writes.
+pub(crate) fn smoke_rtl8192ee_erp_protection_special_and_null_tx() -> TestResult {
+    use super::super::super::super::protection::Mode;
+    use super::super::super::super::rtl8192ee::{h2c, station as hw};
+    let local = [2, 0, 0, 0, 0, 1];
+    let ap = [2, 0, 0, 0, 0, 9];
+    let peer = h2c::Peer {
+        legacy: 0xfff,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+    };
+    let admitted = permission20().admitted_rates() as u32;
+    // Descriptor words 1/3/4 of the single pending frame.
+    let words = |owner: &Prepared<Bus, Block>| {
+        let pending = owner.packet.pending.as_ref().unwrap();
+        let desc = &owner.tx[7 + pending.queue];
+        let base = pending.slot * trx::TX_DESC_SIZE;
+        (
+            word(desc, base + 4),
+            word(desc, base + 12),
+            word(desc, base + 16),
+        )
+    };
+    let mut data = vec![0u8; 40];
+    data[0] = 0x08;
+    data[1] = 0x01;
+    data[4..10].copy_from_slice(&ap);
+    data[10..16].copy_from_slice(&local);
+    data[16..22].copy_from_slice(&ap);
+    for (mode, rts, cts) in [(Mode::RtsCts, 1u32, 0u32), (Mode::CtsToSelf, 0, 1)] {
+        let bus = Bus::new();
+        let mut owner = running(&bus, local);
+        if narf_scheduler::block_on(owner.ee92_install_rate_mask(peer, false, 0, admitted)).is_err()
+        {
+            return TestResult::Fail("RA mask install");
+        }
+        owner.packet.protection = mode;
+        if owner
+            .submit_aggregate(&data, trx::DESC_RATE54M, None, true, false)
+            .is_err()
+        {
+            return TestResult::Fail("protected adaptive DATA refused");
+        }
+        let (_, dw3, dw4) = words(&owner);
+        if (dw3 >> 12) & 1 != rts
+            || (dw3 >> 11) & 1 != cts
+            || dw3 & (1 << 13) != 0
+            || (dw4 >> 24) & 0x1f != u32::from(trx::DESC_RATE24M)
+            || dw3 & (1 << 8 | 1 << 10) != 0
+        {
+            return TestResult::Fail("RTS/CTS-to-self descriptor with firmware RA");
+        }
+    }
+    // EAPOL (unprotected, LLC/SNAP 0x888e): special data at 11M.
+    let mut eapol = data.clone();
+    eapol[24..30].copy_from_slice(&[0xaa, 0xaa, 0x03, 0, 0, 0]);
+    eapol[30..32].copy_from_slice(&[0x88, 0x8e]);
+    let mut dhcp = vec![0u8; 24 + 8 + 28];
+    dhcp[..24].copy_from_slice(&data[..24]);
+    dhcp[30..32].copy_from_slice(&[0x08, 0x00]);
+    dhcp[32] = 0x45;
+    dhcp[41] = 17;
+    dhcp[53] = 68;
+    dhcp[55] = 67;
+    let mut protected = eapol.clone();
+    protected[1] |= 0x40;
+    if !super::special_data(&eapol)
+        || !super::special_data(&dhcp)
+        || super::special_data(&protected)
+        || super::special_data(&data)
+    {
+        return TestResult::Fail("rtl_is_special_data classification");
+    }
+    {
+        let bus = Bus::new();
+        let mut owner = running(&bus, local);
+        if narf_scheduler::block_on(owner.ee92_install_rate_mask(peer, false, 0, admitted)).is_err()
+            || owner
+                .submit_aggregate(&eapol, trx::DESC_RATE1M, None, true, false)
+                .is_err()
+        {
+            return TestResult::Fail("EAPOL submit");
+        }
+        let (dw1, dw3, dw4) = words(&owner);
+        if dw4 & 0x7f != u32::from(trx::DESC_RATE11M)
+            || dw3 & (1 << 8) == 0
+            || dw3 & (1 << 10) == 0
+            || (dw1 >> 16) & 0x1f != 7
+        {
+            return TestResult::Fail("special data forced DESC_RATE11M");
+        }
+    }
+    // Null DATA: driver rate before the RA mask, firmware RA after it.
+    let mut null = data[..24].to_vec();
+    null[0] = 0x48;
+    for installed in [false, true] {
+        let bus = Bus::new();
+        let mut owner = running(&bus, local);
+        if installed
+            && narf_scheduler::block_on(owner.ee92_install_rate_mask(peer, false, 0, admitted))
+                .is_err()
+        {
+            return TestResult::Fail("RA mask install");
+        }
+        if owner
+            .submit_aggregate(&null, trx::DESC_RATE1M, None, false, false)
+            .is_err()
+        {
+            return TestResult::Fail("Null submit");
+        }
+        let (dw1, dw3, _) = words(&owner);
+        if (dw3 & (1 << 8) != 0) == installed || dw3 & (1 << 10) == 0 || (dw1 >> 16) & 0x1f != 7 {
+            return TestResult::Fail("Null DATA USE_RATE / DISFB / RATE_ID");
+        }
+    }
+    // ieee80211_handle_bss_capability: ERP Barker bit wins over the
+    // capability; no ERP element falls back to it.
+    if hw::erp_timing(0x0420, Some(0x04)) != (false, true)
+        || hw::erp_timing(0x0020, Some(0x03)) != (true, false)
+        || hw::erp_timing(0x0020, None) != (true, false)
+        || hw::erp_timing(0x0400, None) != (false, true)
+        || hw::erp_octet(&[42, 1, 0x07]) != Ok(Some(0x07))
+        || hw::erp_octet(&[42, 2, 0, 0]).is_ok()
+        || hw::erp_octet(&[42, 1, 0, 42, 1, 0]).is_ok()
+    {
+        return TestResult::Fail("ERP preamble / slot derivation");
+    }
+    let bus = Bus::new();
+    if hw::erp_changed(&bus, (true, true), (false, false), 1).is_err()
+        || !bus.traced((8, 0x442, 0x20))
+        || !bus.traced((8, 0x51b, 20))
+    {
+        return TestResult::Fail("BSS_CHANGED_ERP_PREAMBLE / _SLOT writes");
+    }
+    let unchanged = Bus::new();
+    if hw::erp_changed(&unchanged, (true, false), (true, false), 0).is_err()
+        || unchanged.0.lock().trace.iter().any(|row| row.0 == 8)
+    {
+        return TestResult::Fail("unchanged ERP flags rewritten");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_erp_protection_special_and_null_tx
+);

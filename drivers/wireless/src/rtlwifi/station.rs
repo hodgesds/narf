@@ -1067,6 +1067,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             domain,
         )
     }
+    /// ERP / RTS-threshold protection admitted by the chip's own envelope
+    /// rather than the 88EE `NERT` grant: 8821AE (`NAPC`) and 8192EE
+    /// (`N92E`), whose descriptor paths check the `DESC_RATE24M` control
+    /// rate against the current permission per frame.
+    pub(crate) fn native_protection(&self) -> bool {
+        matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee)
+    }
     /// RTL8821AE: the current `NAPC` permission admits the HT station
     /// (every MCS0-7 rate the Linux RA mask names holds a measured index).
     pub(crate) fn rtl8821ae_ht(&self) -> bool {
@@ -1343,6 +1350,31 @@ impl<I: Io, M: Memory> Prepared<I, M> {
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// SET_WIPHY changes policy, never authority. A live peer must already
     /// carry the exact current protection record and OFDM24 control support.
+    /// RTL8192EE beacon `ieee80211_handle_bss_capability`: a changed
+    /// short-preamble or short-slot flag (beacon capability and ERP
+    /// element) is `BSS_CHANGED_ERP_PREAMBLE` / `_SLOT`, programmed inside
+    /// the station publication (`rtl8192ee::station::erp_changed`).
+    fn track_rtl8192ee_erp(
+        &mut self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        let Some(old) = self.packet.ee92.erp_timing else {
+            return Ok(());
+        };
+        let erp = super::super::rtl8192ee::station::erp_octet(&candidate.bss.information_elements)?;
+        let new = super::super::rtl8192ee::station::erp_timing(candidate.bss.capability, erp);
+        if new == old {
+            return Ok(());
+        }
+        let prime_sc = self.rtl8192ee_prime_sc();
+        self.station_publication(environment, || {
+            super::super::rtl8192ee::station::erp_changed(&self.io, old, new, prime_sc)
+                .map_err(|_| RadioError::State)
+        })?;
+        self.packet.ee92.erp_timing = Some(new);
+        Ok(())
+    }
     pub(crate) fn admit_station_rts_threshold(
         &self,
         enabled: bool,
@@ -1352,7 +1384,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.check_station_policy(environment)?;
             // RTL8821AE: NAPC admits OFDM24, the RTS/CTS control rate.
             if enabled
-                && (self.station.protection.is_none() && self.chip != super::Chip::Rtl8821ae
+                && (self.station.protection.is_none() && !self.native_protection()
                     || self
                         .station
                         .plan
@@ -1708,7 +1740,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             super::super::protection::Mode::None
         };
         if protection != super::super::protection::Mode::None
-            && (self.station.protection.is_none() && self.chip != super::Chip::Rtl8821ae
+            && (self.station.protection.is_none() && !self.native_protection()
                 || self
                     .station
                     .plan
@@ -1723,8 +1755,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // RTL8821AE: rtl_get_tcb_desc firmware RA for ordinary DATA once the
         // mask is installed; the NAPC permission admits every station rate.
         // RTL8192EE: the same, inside the installed `rtl92ee_update_hal_
-        // rate_mask` (a subset of the `N92E` admitted rates).
-        let fallback = if matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee) {
+        // rate_mask` (a subset of the `N92E` admitted rates); there
+        // `rtl_get_tcb_desc` fills protection and the firmware RA
+        // independently (`rtl92ee_tx_fill_desc` clears USE_RATE for every
+        // non-management frame), so a protected frame keeps the RA.
+        let protected_ra = self.chip == super::Chip::Rtl8192ee;
+        let fallback = if self.chip == super::Chip::Rtl8192ee {
+            matches!(kind, Kind::Data) && self.rate_mask().is_some()
+        } else if self.chip == super::Chip::Rtl8821ae {
             matches!(kind, Kind::Data)
                 && protection == super::super::protection::Mode::None
                 && self.rate_mask().is_some()
@@ -1742,8 +1780,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && self.station.fallback_current()
         };
         let protection_source = self.station.protection.clone();
-        let protection_admitted =
-            protection_source.is_some() || !(self.chip != super::Chip::Rtl8821ae);
+        let protection_admitted = protection_source.is_some() || self.native_protection();
         let tracking_source = self.station.tracking.as_ref().map(|s| s.grant.clone());
         let antenna_source = self.station.antenna.as_ref().map(|s| s.grant.clone());
         let mut publish = || {
@@ -1777,7 +1814,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         &bytes,
                         rate,
                         aggregate,
-                        fallback && current == super::super::protection::Mode::None,
+                        fallback
+                            && (protected_ra || current == super::super::protection::Mode::None),
                         short_gi,
                     )
                 };
@@ -1966,8 +2004,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .information_elements,
             )?;
             if (self.station.erp || environment.rts_threshold().is_some())
-                && (protection.is_none() && self.chip != super::Chip::Rtl8821ae
-                    || rates & (1 << 8) == 0)
+                && (protection.is_none() && !self.native_protection() || rates & (1 << 8) == 0)
             {
                 return Err(Error::Profile);
             }
@@ -2025,6 +2062,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .as_ref()
                         .ok_or(Error::State)?
                         .legacy_rates();
+                    // RTL8192EE: mac80211 derives the ERP preamble from the
+                    // BSS ERP element (`ieee80211_handle_bss_capability`).
+                    let erp92 = if self.chip == super::Chip::Rtl8192ee {
+                        super::super::rtl8192ee::station::erp_octet(
+                            &self
+                                .station
+                                .candidate
+                                .as_ref()
+                                .ok_or(Error::State)?
+                                .bss
+                                .information_elements,
+                        )?
+                    } else {
+                        None
+                    };
                     self.station_publication(environment, || {
                         if self.chip == super::Chip::Rtl8821ae {
                             return super::super::rtl8821ae::station::configure_rates(
@@ -2042,6 +2094,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 rates,
                                 basic,
                                 self.station.capability,
+                                erp92,
                                 self.station.ht_profile.is_some(),
                                 self.rtl8192ee_prime_sc(),
                             );
@@ -2053,6 +2106,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             self.station.capability,
                         )
                     })?;
+                    if self.chip == super::Chip::Rtl8192ee {
+                        self.packet.ee92.erp_timing =
+                            Some(super::super::rtl8192ee::station::erp_timing(
+                                self.station.capability,
+                                erp92,
+                            ));
+                    }
                     if let Some(p) = self.station.wmm {
                         self.program_station_edca(p)?;
                         self.check_station_policy(environment)?;
@@ -2369,13 +2429,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.cache_candidate(candidate, now);
                 } else if Some(candidate.bss.bssid) == peer {
                     let erp = super::super::protection::erp(&candidate.bss.information_elements)?;
-                    if erp
-                        && self.station.protection.is_none()
-                        && self.chip != super::Chip::Rtl8821ae
-                    {
+                    if erp && self.station.protection.is_none() && !self.native_protection() {
                         return Err(Error::Profile);
                     }
                     self.station.erp = erp;
+                    if self.chip == super::Chip::Rtl8192ee {
+                        self.track_rtl8192ee_erp(&candidate, environment)?;
+                    }
                     let old = self.station.candidate.as_ref().ok_or(Error::State)?;
                     if candidate.bss.ssid != old.bss.ssid
                         || candidate.rsne != old.rsne

@@ -154,19 +154,69 @@ pub fn ack_preamble(io: &impl Io, prime_sc: u8, short: bool) -> Result<(), Error
     Ok(())
 }
 
+/// The ERP element's single octet (`WLAN_EID_ERP_INFO`), or `None`
+/// without one; a malformed or repeated element is refused.
+pub fn erp_octet(mut ies: &[u8]) -> Result<Option<u8>, Error> {
+    let mut erp = None;
+    while !ies.is_empty() {
+        let head = ies.get(..2).ok_or(Error::Packet)?;
+        let end = 2 + usize::from(head[1]);
+        let body = ies.get(2..end).ok_or(Error::Packet)?;
+        if head[0] == 42 && (body.len() != 1 || erp.replace(body[0]).is_some()) {
+            return Err(Error::Packet);
+        }
+        ies = &ies[end..];
+    }
+    Ok(erp)
+}
+
+/// mac80211 `ieee80211_handle_bss_capability` on 2.4 GHz:
+/// `(use_short_preamble, use_short_slot)`. With a valid ERP element the
+/// preamble is short unless `WLAN_ERP_BARKER_PREAMBLE` (bit 2) is set;
+/// without one it follows `WLAN_CAPABILITY_SHORT_PREAMBLE` (0x20). The
+/// slot follows `WLAN_CAPABILITY_SHORT_SLOT_TIME` (0x400).
+pub fn erp_timing(capability: u16, erp: Option<u8>) -> (bool, bool) {
+    let short_preamble = match erp {
+        Some(octet) => octet & 0x04 == 0,
+        None => capability & 0x20 != 0,
+    };
+    (short_preamble, capability & 0x400 != 0)
+}
+
+/// `rtl_op_bss_info_changed` `BSS_CHANGED_ERP_SLOT` (`HW_VAR_SLOT_TIME`:
+/// `RTL_SLOT_TIME_9`/`_20` to `REG_SLOT`; its `HW_VAR_AC_PARAM` loop
+/// writes nothing, module note) and `BSS_CHANGED_ERP_PREAMBLE`
+/// (`HW_VAR_ACK_PREAMBLE`) for the changed flags only.
+pub fn erp_changed(
+    io: &impl Io,
+    old: (bool, bool),
+    new: (bool, bool),
+    prime_sc: u8,
+) -> Result<(), Error> {
+    if old.0 != new.0 {
+        ack_preamble(io, prime_sc, new.0)?;
+    }
+    if old.1 != new.1 {
+        io.write8(REG_SLOT, if new.1 { 9 } else { 20 })?;
+    }
+    Ok(())
+}
+
 /// Authentication-time `BSS_CHANGED_BSSID` / `BASIC_RATES` / ERP and the
 /// `conf_tx` rows for a 2.4 GHz legacy-or-HT station: BSSID, RRSR
 /// ([`basic_rate`] of `rates` — Linux passes `sta->supp_rates[0]`, the
-/// peer's supported set, not the BSS basic set), slot (9 us with the
-/// short-slot capability bit 0x400, else 20), SIFS (`ht` = `ht_enable`),
-/// the fixed `set_qos` rows and the ACK preamble (capability 0x20) at the
-/// programmed `prime_sc`. `basic` must name 1 Mb/s (the 2.4 GHz
-/// `rate_control_send_low` rate) and only rates the RRSR mask keeps.
+/// peer's supported set, not the BSS basic set), slot and ACK preamble
+/// from [`erp_timing`] of `capability` and the BSS ERP octet `erp` (9 us
+/// slot with the short-slot capability, else 20), SIFS (`ht` =
+/// `ht_enable`), the fixed `set_qos` rows, at the programmed `prime_sc`.
+/// `basic` must name 1 Mb/s (the 2.4 GHz `rate_control_send_low` rate)
+/// and only rates the RRSR mask keeps.
 pub fn configure_rates(
     io: &impl Io,
     rates: u16,
     basic: u16,
     capability: u16,
+    erp: Option<u8>,
     ht: bool,
     prime_sc: u8,
 ) -> Result<(), Error> {
@@ -176,8 +226,8 @@ pub fn configure_rates(
     let [lo, hi] = basic_rate(rates).to_le_bytes();
     io.write8(REG_RRSR, lo)?;
     io.write8(REG_RRSR + 1, hi)?;
-    let slot = if capability & 0x400 != 0 { 9 } else { 20 };
-    channel_access(io, slot, ht)?;
+    let (short_preamble, short_slot) = erp_timing(capability, erp);
+    channel_access(io, if short_slot { 9 } else { 20 }, ht)?;
     set_qos_all(io)?;
-    ack_preamble(io, prime_sc, capability & 0x20 != 0)
+    ack_preamble(io, prime_sc, short_preamble)
 }
