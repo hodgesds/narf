@@ -239,19 +239,21 @@ fn smoke_media_gt_gsccs_schedules_primes_and_executes_gsc_jobs() -> TestResult {
         .is_err());
     assert!(guc.engine_cycles(now, Engine::Gsccs0, 1).is_err());
     // A command stream the queue does not admit allocates nothing.
-    let mut queue = GscQueue::new(&mut guc, now);
-    assert!(queue.holds_wake());
-    assert_eq!(queue.submit(&[0x0500_0000]), Err(LoadError::Invalid));
-    assert_eq!(queue.finished(), None);
-    drop(queue);
+    {
+        let mut queue = GscQueue::new(&mut guc, now);
+        assert!(queue.holds_wake());
+        assert_eq!(queue.submit(&[0x0500_0000]), Err(LoadError::Invalid));
+        assert_eq!(queue.finished(), None);
+    }
     assert_eq!(arena.live_allocations(), live);
     // GSC_FW_LOAD, then a GSC_HECI_CMD_PKT, each inline on GSCCS0.
     let load = crate::intel_gpu_gt::media::gsc::fw_load(0x0100_0000, 4 << 20);
-    let mut queue = GscQueue::new(&mut guc, now + 1);
-    queue.submit(&load).unwrap();
-    // One job at a time: the worker never queues behind an unretired job.
-    assert_eq!(queue.submit(&load), Err(LoadError::Queue));
-    drop(queue);
+    {
+        let mut queue = GscQueue::new(&mut guc, now + 1);
+        queue.submit(&load).unwrap();
+        // One job at a time: the worker never queues behind an unretired job.
+        assert_eq!(queue.submit(&load), Err(LoadError::Queue));
+    }
     let (now, result) = finish_gsc_job(&mut guc, &w, &mut hw, now + 2);
     assert_eq!(result, Ok(()));
     let packet =

@@ -539,7 +539,10 @@ enum Claim {
 static CLAIMS: IrqSafeSpinLock<Vec<(u64, Claims)>> = IrqSafeSpinLock::new(Vec::new());
 
 /// A snapshot: (generation, GSC claim, recent CFB claims).
-fn claims(layout: Layout) -> (u64, Option<(u64, u64)>, Vec<(u64, u64)>) {
+type ClaimSnapshot = (u64, Option<(u64, u64)>, Vec<(u64, u64)>);
+
+/// The current [`ClaimSnapshot`] for `layout`'s DSM.
+fn claims(layout: Layout) -> ClaimSnapshot {
     CLAIMS
         .lock()
         .iter()
