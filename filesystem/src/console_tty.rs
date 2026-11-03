@@ -7,8 +7,20 @@
 //! read the keyboard. Neither sees the other's input or output; only the
 //! kernel log (printk) goes to every registered console. NARF models the VTs
 //! with one shared tty (one physical screen, one keyboard; see `vt.rs`), so
-//! there are exactly two console ttys here, [`VT`] and [`SERIAL`], each a
-//! [`TtyPort`].
+//! there are exactly two registered console ttys here, [`VT`] and
+//! [`SERIAL`], each a [`TtyPort`].
+//!
+//! Probed UARTs beyond the console UART get data ttys on the same
+//! machinery: one `/dev/ttyS<N>` (N >= 1, char 4:64+N) per probed
+//! non-console UART in the serial registry (see [`serial_port_by_index`]).
+//! Each has its own termios, line discipline and foreground group, and
+//! its backend is a polled 8250 handle rebuilt from the registry entry
+//! — not the console UART's IRQ-fed byte ring. These are data ttys,
+//! not registered consoles: `console=` still accepts only `ttyS0`
+//! (plus the VTs), `/dev/console` never selects a `ttyS1+` port, and
+//! `/sys/class/tty/console/active` never lists one. Selecting a
+//! `ttyS1+` port as the kernel console is a follow-up, not part of
+//! this change.
 //!
 //! `/dev/console` (5:1) is whichever of them the kernel command line names
 //! last with `console=` ([`console`]), and `/sys/class/tty/console/active`
@@ -36,9 +48,11 @@
 
 use crate::devfs_pty::{Termios, WinSize};
 use crate::ntty::{self, LineState, OutputState};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use narf_drivers_serial::uart_8250::Uart8250;
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Which device a [`TtyPort`] drives.
@@ -48,6 +62,20 @@ pub enum PortKind {
     Vt,
     /// `ttyS0`: UART in, UART out.
     Serial,
+    /// `/dev/ttyS<n>` (n >= 1): a probed non-console UART, driven by a
+    /// polled 8250 handle rebuilt from its registry entry. The handle
+    /// is `&'static` (leaked at table build) so `PortKind` stays `Copy`
+    /// and every `TtyPort` consumer keeps working unchanged.
+    SerialPort(&'static Uart8250, u32),
+}
+
+impl PortKind {
+    /// True for any UART-backed port (`ttyS0` or a probed-UART tty).
+    /// The VT/KD ioctl guard in devfs uses this: a UART answers those
+    /// ioctls -ENOTTY, whichever UART it is.
+    pub fn is_serial(self) -> bool {
+        matches!(self, PortKind::Serial | PortKind::SerialPort(..))
+    }
 }
 
 /// One console tty: its termios, window size, line discipline, output
@@ -108,15 +136,18 @@ impl TtyPort {
         match self.kind {
             PortKind::Vt => crate::TTY_ID_CONSOLE,
             PortKind::Serial => crate::TTY_ID_SERIAL0,
+            PortKind::SerialPort(_, n) => crate::tty_id_serial(n),
         }
     }
 
     /// Linux `dev_t` of the port's own node (`/dev/tty1` for the VT tty, as
-    /// a VT session's `tty_nr`; `/dev/ttyS0` for the UART).
+    /// a VT session's `tty_nr`; `/dev/ttyS0` for the UART; `/dev/ttyS<n>`
+    /// is char 4:64+n, as on Linux).
     pub fn rdev(&self) -> u64 {
         match self.kind {
             PortKind::Vt => (4 << 8) | 1,
             PortKind::Serial => (4 << 8) | 64,
+            PortKind::SerialPort(_, n) => (4 << 8) | (64 + n as u64),
         }
     }
 
@@ -212,6 +243,15 @@ impl TtyPort {
         drop(out);
         match self.kind {
             PortKind::Serial => narf_console::write_uart_raw(&processed),
+            // A probed-UART tty writes its own port directly, polled:
+            // `Uart8250::write_byte` spins on THRE, the same semantics
+            // as the driver's own write path. It never touches the
+            // console UART, so a `ttyS1` write cannot leak into `ttyS0`.
+            PortKind::SerialPort(uart, _) => {
+                for &b in &processed {
+                    uart.write_byte(b);
+                }
+            }
             PortKind::Vt => narf_console::write_fb_raw(&processed),
         }
     }
@@ -252,10 +292,17 @@ impl TtyPort {
     }
 
     /// Pull the device's next input byte: the UART's received bytes for
-    /// `ttyS0`, translated key presses for the VT. `None` when dry.
+    /// `ttyS0`, translated key presses for the VT, a polled read of
+    /// the port's own UART for a probed-UART tty. `None` when dry.
+    ///
+    /// The polled read has no IRQ wake: unlike `ttyS0`'s IRQ-fed ring,
+    /// a reader parked on a `ttyS1+` port is served only while a read
+    /// is actively polling. Polling readers (getty, a debugger) work;
+    /// wakeup semantics are weaker than `ttyS0`'s, by construction.
     fn next_input_byte(&self) -> Option<u8> {
         match self.kind {
             PortKind::Serial => narf_input::pop_ascii_byte(),
+            PortKind::SerialPort(uart, _) => uart.read_byte(),
             PortKind::Vt => {
                 // Drain key events until one yields a byte (key-ups and
                 // modifier presses translate to None and are skipped).
@@ -273,7 +320,9 @@ impl TtyPort {
 
     /// Unthrottle serial receive: bytes the RX interrupt left in the UART
     /// because the byte ring was full are pulled in now that the reader is
-    /// consuming (see `narf_input::refill_byte_ring`).
+    /// consuming (see `narf_input::refill_byte_ring`). This is `ttyS0`
+    /// only: a probed-UART tty has no ring — its reads poll the UART
+    /// directly — so there is nothing to refill.
     fn refill(&self) {
         if self.kind == PortKind::Serial {
             narf_input::refill_byte_ring(narf_console::try_read_byte);
@@ -399,6 +448,16 @@ impl TtyPort {
         let queued = match self.kind {
             PortKind::Serial => narf_input::pending_bytes(),
             PortKind::Vt => narf_input::pending_keys(),
+            // A polled port reports at most one byte queued: DR set
+            // means a read would return at once. This peeks at LSR
+            // without consuming the byte.
+            PortKind::SerialPort(uart, _) => {
+                if uart.read_lsr() & narf_drivers_serial::uart_8250::LSR_DR != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
         };
         self.discipline.lock().readable() + queued
     }
@@ -443,8 +502,100 @@ pub fn port_by_id(id: u32) -> Option<&'static TtyPort> {
     match id {
         crate::TTY_ID_CONSOLE => Some(&VT),
         crate::TTY_ID_SERIAL0 => Some(&SERIAL),
+        id if crate::is_console_tty_id(id) => serial_port_by_index(crate::TTY_ID_SERIAL0 - id),
         _ => None,
     }
+}
+
+// ── Probed-UART ttys (`/dev/ttyS<N>`, N >= 1) ─────────────────────────
+
+/// Assign `/dev/ttyS` numbers to registry entries, in registry order.
+/// Pure (no globals, no hardware): the fixture pins this mapping
+/// directly, and [`serial_port_by_index`] builds its table from it.
+///
+/// Rules, each pinned by the fixture:
+/// - `ttyS0` is always the [`SERIAL`] singleton, never a table entry:
+///   the entry at the console UART's I/O base (COM1 `0x3F8` on
+///   x86_64) maps to `None` and is skipped, whether or not that UART
+///   is physically present (the console backend drops bytes when the
+///   UART is absent, and `ttyS0` exists regardless).
+/// - Every other entry maps to `ttyS(1+k)` in registry order, so with
+///   COM1 present and registered first, COM2→`ttyS1`, COM3→`ttyS2`,
+///   COM4→`ttyS3`, then PCI/LPSS ports in probe order — Linux's
+///   numbering for the legacy block.
+/// - Entries past [`crate::MAX_EXTRA_SERIAL_TTYS`] map to `None`.
+pub fn serial_numbers_for(entries: &[narf_drivers_serial::registry::UartInfo]) -> Vec<Option<u32>> {
+    use narf_drivers_serial::uart_8250::{UartBase, COM1_BASE};
+    let mut out: Vec<Option<u32>> = Vec::with_capacity(entries.len());
+    let mut next: u32 = 1;
+    for entry in entries {
+        if entry.base == UartBase::Io(COM1_BASE) || next > crate::MAX_EXTRA_SERIAL_TTYS {
+            out.push(None);
+        } else {
+            out.push(Some(next));
+            next += 1;
+        }
+    }
+    out
+}
+
+/// The probed-UART tty for `/dev/ttyS<n>` (n >= 1), or `None` when no
+/// such port exists (no registry entry, or past the cap).
+///
+/// The table is built lazily on first lookup from a snapshot of the
+/// serial registry, and then frozen: serial initcalls (Stage::Subsys)
+/// run before userspace opens nodes, so every probed UART is in the
+/// snapshot, and a later PCI hotplug would not appear — a documented
+/// limitation, not a silent gap (the node simply does not exist).
+/// Each port's 8250 handle is rebuilt from its registry entry: the
+/// probe already programmed the hardware (baud, FIFO, MCR), and the
+/// handle itself is stateless apart from base/shift/clock, so the
+/// rebuilt handle's `uart_type` (`NotDetected`) and `baud` (0) are
+/// never consulted — the backend uses only polled byte I/O. I/O-space
+/// handles use the standard 1.8432 MHz clock, the only clock the
+/// legacy/PCI I/O producers use; MMIO handles use the entry's clock.
+///
+/// Limitations inherited from the probe, documented here rather than
+/// papered over: (1) the legacy `detect()` never reports absence on
+/// x86_64, so a phantom COM port registers and gets a tty whose
+/// reads return a perpetual `0xFF` stream (an absent UART reads LSR
+/// as `0xFF`, so DR looks set). No `0xFF` filter is added: `0xFF` is
+/// a valid data byte, and filtering would invent tty semantics.
+/// (2) On aarch64 the 8250 accessors are stubs (writes dropped, reads
+/// `None`); the registry is effectively empty there today because
+/// PL011 registers nothing, so the table is empty in practice.
+pub fn serial_port_by_index(n: u32) -> Option<&'static TtyPort> {
+    if n == 0 || n > crate::MAX_EXTRA_SERIAL_TTYS {
+        return None;
+    }
+    let ports = *SERIAL_PORTS.lock().get_or_insert_with(build_serial_ports);
+    ports.get((n - 1) as usize).copied()
+}
+
+static SERIAL_PORTS: IrqSafeSpinLock<Option<&'static [&'static TtyPort]>> =
+    IrqSafeSpinLock::new(None);
+
+fn build_serial_ports() -> &'static [&'static TtyPort] {
+    use narf_drivers_serial::registry;
+    use narf_drivers_serial::uart_8250::UartBase;
+    let entries = registry::uarts();
+    let numbers = serial_numbers_for(&entries);
+    let mut ports: Vec<&'static TtyPort> = Vec::new();
+    for (entry, number) in entries.iter().zip(numbers) {
+        let Some(index) = number else {
+            continue;
+        };
+        let handle: &'static Uart8250 = Box::leak(Box::new(match entry.base {
+            UartBase::Io(port) => Uart8250::new(port, entry.irq),
+            UartBase::Mmio(addr) => {
+                Uart8250::new_mmio(addr, entry.irq, entry.reg_shift, entry.clock_hz)
+            }
+        }));
+        ports.push(Box::leak(Box::new(TtyPort::new(PortKind::SerialPort(
+            handle, index,
+        )))));
+    }
+    Box::leak(ports.into_boxed_slice())
 }
 
 // ── console= : which tty /dev/console is ────────────────────────────────────
@@ -487,8 +638,10 @@ pub struct ConsoleConfig {
 /// Linux `console_setup`: every `console=<name>[,options]` registers that
 /// console, and the LAST one becomes the preferred console `/dev/console`
 /// opens (`add_preferred_console` sets `preferred_console` to it, also when
-/// the name repeats an earlier one). Names NARF has no device for are
-/// skipped (`ttyS1`, `hvc0`, `ttyUSB0`, a VT above 63).
+/// the name repeats an earlier one). Names that are not registered
+/// consoles are skipped: `ttyS1+` exist as data ttys but are not console
+/// candidates (see the module docs), and NARF has no device for `hvc0`,
+/// `ttyUSB0`, or a VT above 63.
 ///
 /// With no usable `console=`, NARF registers both consoles and prefers
 /// `ttyS0`, as `console=tty0 console=ttyS0` would. Linux falls back to the
@@ -966,7 +1119,8 @@ fn smoke_console_cmdline_selects_dev_console() -> narf_kernel_test::TestResult {
     }
     let unknown = c("console=hvc0 console=ttyS1 console=tty1");
     if unknown.preferred != ConsoleName::Vt(1) || unknown.registered != [ConsoleName::Vt(1)] {
-        return TestResult::Fail("console names without a device must be skipped");
+        // ttyS1 is a data tty, not a console candidate; hvc0 has no device.
+        return TestResult::Fail("non-console names must be skipped");
     }
     let default = c("root=UUID=x");
     if default.preferred != ConsoleName::Serial(0) || default.registered.len() != 2 {
@@ -1041,3 +1195,95 @@ pub fn clear_redirect_to_tty(tty_id: u32) -> Option<alloc::sync::Arc<dyn crate::
         None
     }
 }
+
+// ── Probed-UART ttys: fixtures ────────────────────────────────────────
+
+/// Numbering rule, pinned without touching hardware or the global
+/// registry: the console-UART entry is skipped (it is `ttyS0`), the
+/// rest number sequentially from `ttyS1` in registry order, and the
+/// cap drops the tail. A synthetic LPSS MMIO entry numbers exactly
+/// like a legacy COM entry — the registry's base kind is irrelevant
+/// to numbering, only to the backend the port later rebuilds.
+fn smoke_serial_numbers_skip_console_and_cap() -> narf_kernel_test::TestResult {
+    use narf_drivers_serial::registry::UartInfo;
+    use narf_drivers_serial::uart_8250::{UartBase, COM1_BASE, COM2_BASE, UART_CLOCK_HZ};
+    use narf_memory::PhysAddr;
+    let entry = |base: UartBase, shift: u8, clock: u32| UartInfo {
+        base,
+        reg_shift: shift,
+        clock_hz: clock,
+        irq: None,
+        name: "test",
+        baud: 115_200,
+    };
+    let entries = alloc::vec![
+        entry(UartBase::Io(COM1_BASE), 0, UART_CLOCK_HZ),
+        entry(UartBase::Io(COM2_BASE), 0, UART_CLOCK_HZ),
+        entry(UartBase::Mmio(PhysAddr::new(0xFE00_0000)), 2, 100_000_000),
+    ];
+    let numbers = serial_numbers_for(&entries);
+    if numbers != alloc::vec![None, Some(1u32), Some(2u32)] {
+        return narf_kernel_test::TestResult::Fail(
+            "COM1 must be skipped and COM2/LPSS must number ttyS1/ttyS2",
+        );
+    }
+    // Cap: 64 extras, then None — build one past the cap.
+    let mut many: Vec<UartInfo> = Vec::new();
+    for i in 0..(crate::MAX_EXTRA_SERIAL_TTYS + 1) {
+        many.push(entry(UartBase::Io(0x1000 + i as u16), 0, UART_CLOCK_HZ));
+    }
+    let capped = serial_numbers_for(&many);
+    if capped.len() != many.len()
+        || capped[crate::MAX_EXTRA_SERIAL_TTYS as usize - 1] != Some(crate::MAX_EXTRA_SERIAL_TTYS)
+        || capped[crate::MAX_EXTRA_SERIAL_TTYS as usize].is_some()
+    {
+        return narf_kernel_test::TestResult::Fail("numbering must cap at 64 extra ports");
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/console",
+    smoke_serial_numbers_skip_console_and_cap
+);
+
+/// A probed-UART port is its own tty: its tty id and rdev follow the
+/// Linux 4:64+n scheme, its termios and foreground group are
+/// independent of `ttyS0` and the VT, and it counts as a console tty
+/// id (so `/dev/tty` opens and PTY job-control filtering treat it
+/// like `ttyS0`) without being a registered console. No hardware I/O
+/// happens here: only identity, termios and pgrp state are touched —
+/// a `write_user`/`read` on a fixture port would poke real ports, so
+/// fixtures never call them.
+fn smoke_serial_port_is_its_own_tty() -> narf_kernel_test::TestResult {
+    use narf_drivers_serial::uart_8250::Uart8250;
+    let handle: &'static Uart8250 = Box::leak(Box::new(Uart8250::new(0x2F8, Some(3))));
+    let port = TtyPort::new(PortKind::SerialPort(handle, 1));
+    if port.tty_id() != crate::tty_id_serial(1) || port.tty_id() != 0xFFFF_FFFC {
+        return narf_kernel_test::TestResult::Fail("ttyS1 tty_id must be 0xFFFF_FFFC");
+    }
+    if port.rdev() != (4 << 8) | 65 {
+        return narf_kernel_test::TestResult::Fail("ttyS1 rdev must be char 4:65");
+    }
+    if !port.kind().is_serial() || port.kind() == PortKind::Serial {
+        return narf_kernel_test::TestResult::Fail("ttyS1 kind must be serial but not ttyS0");
+    }
+    if !crate::is_console_tty_id(port.tty_id()) {
+        return narf_kernel_test::TestResult::Fail("ttyS1 must count as a console tty id");
+    }
+    if crate::is_console_tty_id(crate::tty_id_serial(crate::MAX_EXTRA_SERIAL_TTYS + 1)) {
+        return narf_kernel_test::TestResult::Fail("ids past the cap must not be console ids");
+    }
+    port.set_fg_pgrp(43);
+    let mut t = port.termios();
+    t[0] ^= 0x40;
+    port.set_termios(t);
+    if SERIAL.fg_pgrp() == 43 || VT.fg_pgrp() == 43 || SERIAL.termios() == port.termios() {
+        return narf_kernel_test::TestResult::Fail("ttyS1 shares state with ttyS0 or the VT");
+    }
+    // Deliberately no `port_by_id`/`serial_port_by_index` assertion
+    // here: those read the global registry, whose contents depend on
+    // which probe smokes ran before this one. Identity and state
+    // independence above are the fixture's whole claim.
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("filesystem/console", smoke_serial_port_is_its_own_tty);

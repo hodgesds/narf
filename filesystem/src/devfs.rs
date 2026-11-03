@@ -1165,8 +1165,10 @@ enum ConsoleNodeKind {
     Console,
     CurrentTty,
     Virtual(u32),
-    /// `/dev/ttyS<n>` (char 4:64+n): the 8250 UART's own tty
-    /// ([`crate::console_tty::SERIAL`]), separate from the VTs. Writes go to
+    /// `/dev/ttyS<n>` (char 4:64+n): an 8250 UART's own tty, separate
+    /// from the VTs. `Serial(0)` is [`crate::console_tty::SERIAL`];
+    /// `Serial(n)` for n >= 1 is the probed-UART tty of the same name
+    /// (see [`crate::console_tty::serial_port_by_index`]). Writes go to
     /// the UART and are not subject to a TIOCCONS redirect, which applies to
     /// `/dev/console` only.
     Serial(u32),
@@ -1179,23 +1181,35 @@ struct DevConsole {
 impl DevConsole {
     /// The tty this node opens: `/dev/console` (and `/dev/tty` reached
     /// without a controlling-terminal lookup) is the preferred `console=`;
-    /// `/dev/tty0` and `/dev/ttyN` are the VT tty; `/dev/ttyS0` the UART's.
+    /// `/dev/tty0` and `/dev/ttyN` are the VT tty; `/dev/ttyS0` the UART's;
+    /// `/dev/ttyS<n>` (n >= 1) the probed-UART tty of the same name.
     fn port(&self) -> &'static crate::console_tty::TtyPort {
         match self.kind {
             ConsoleNodeKind::Console | ConsoleNodeKind::CurrentTty => crate::console_tty::console(),
             ConsoleNodeKind::Virtual(_) => &crate::console_tty::VT,
-            ConsoleNodeKind::Serial(_) => &crate::console_tty::SERIAL,
+            ConsoleNodeKind::Serial(0) => &crate::console_tty::SERIAL,
+            // Lookup and `console_tty_node` only build a `Serial(n)`
+            // node when the port exists, and the port table never
+            // shrinks, so this cannot miss in practice.
+            ConsoleNodeKind::Serial(n) => crate::console_tty::serial_port_by_index(n)
+                .expect("ttyS node without a registered port"),
         }
     }
 }
 
 /// The devfs node of a console tty id (`/dev/tty1` for the VT tty,
-/// `/dev/ttyS0` for the UART's): what `/dev/tty` opens for a process whose
-/// controlling terminal is that tty.
+/// `/dev/ttyS0` for the UART's, `/dev/ttyS<n>` for a probed UART's):
+/// what `/dev/tty` opens for a process whose controlling terminal is
+/// that tty.
 pub fn console_tty_node(id: u32) -> Option<Arc<dyn FileOps>> {
     let kind = match id {
         crate::TTY_ID_CONSOLE => ConsoleNodeKind::Virtual(1),
         crate::TTY_ID_SERIAL0 => ConsoleNodeKind::Serial(0),
+        id if crate::is_console_tty_id(id) => {
+            let n = crate::TTY_ID_SERIAL0 - id;
+            crate::console_tty::serial_port_by_index(n)?;
+            ConsoleNodeKind::Serial(n)
+        }
         _ => return None,
     };
     Some(Arc::new(DevConsole { kind }))
@@ -1456,8 +1470,9 @@ impl FileOps for DevConsole {
         };
         // The VT and KD ioctls are `vt_ioctl`'s, installed on VT ttys only; a
         // UART answers them -ENOTTY (`tty_ioctl` -> `-ENOIOCTLCMD`), also
-        // through `/dev/console` when the console is `ttyS0`.
-        if self.port().kind() == crate::console_tty::PortKind::Serial
+        // through `/dev/console` when the console is `ttyS0`, and on a
+        // probed-UART tty exactly as on `ttyS0`.
+        if self.port().kind().is_serial()
             && matches!(
                 cmd,
                 KDGETMODE
@@ -2020,7 +2035,11 @@ fn static_entry_type(name: &str) -> Option<FileType> {
     entries::find(name)
         .map(|entry| entry.file_type)
         .or_else(|| {
-            if crate::devfs_vt::parse_vcs(name).is_some() || vt_number(name).is_some() {
+            if crate::devfs_vt::parse_vcs(name).is_some()
+                || vt_number(name).is_some()
+                || serial_number(name)
+                    .is_some_and(|n| crate::console_tty::serial_port_by_index(n).is_some())
+            {
                 Some(FileType::Special)
             } else {
                 None
@@ -2037,6 +2056,19 @@ fn vt_number(name: &str) -> Option<u32> {
         .parse()
         .ok()
         .filter(|v| (2..=crate::vt::MAX_VT).contains(v))
+}
+
+/// The `ttyS<n>` number of a probed-UART node name (`ttyS1`, `ttyS2`,
+/// …), or `None` for anything else — including `ttyS0`, which is the
+/// static entry and always wins on lookup before this fallback runs.
+/// Same shape as [`vt_number`]: a name-level parse only; whether the
+/// port exists is the caller's check, via `serial_port_by_index`.
+fn serial_number(name: &str) -> Option<u32> {
+    let value = name.strip_prefix("ttyS")?;
+    if value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok().filter(|&n| n >= 1)
 }
 
 /// `DevFs` root directory. Static device paths have precedence, while the
@@ -2093,6 +2125,17 @@ impl DirOps for DevDir {
             return Some(Arc::new(DevConsole {
                 kind: ConsoleNodeKind::Virtual(vt),
             }));
+        }
+        // Probed-UART ttys: only when the port exists, so opening a
+        // `ttyS<n>` with no such UART is ENOENT, never an alias of
+        // another port. (Like the `vt_number` fallback, these names
+        // resolve on open but are not enumerated in readdir.)
+        if let Some(n) = serial_number(name) {
+            if crate::console_tty::serial_port_by_index(n).is_some() {
+                return Some(Arc::new(DevConsole {
+                    kind: ConsoleNodeKind::Serial(n),
+                }));
+            }
         }
         if let Some((kind, vt)) = crate::devfs_vt::parse_vcs(name) {
             return Some(Arc::new(crate::devfs_vt::DevVcs { kind, vt }));

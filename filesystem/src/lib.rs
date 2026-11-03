@@ -2262,10 +2262,28 @@ pub const TTY_ID_CONSOLE: u32 = 0xFFFF_FFFE;
 /// the VTs: own termios, input, session and foreground group, as on Linux.
 pub const TTY_ID_SERIAL0: u32 = 0xFFFF_FFFD;
 
-/// True for the kernel console ttys (the VT tty and the UART's tty), as
-/// opposed to PTYs.
+/// How many probed-UART ttys beyond `ttyS0` the tty layer publishes:
+/// `/dev/ttyS1`..`/dev/ttyS64`. Registry entries past the cap are
+/// ignored (see [`console_tty::serial_port_by_index`]); the cap keeps
+/// the descending id block below disjoint from any other reserved id.
+pub const MAX_EXTRA_SERIAL_TTYS: u32 = 64;
+
+/// Stable [`FileOps::tty_id`] for `/dev/ttyS<n>`: the descending block
+/// below `TTY_ID_SERIAL0`, so `ttyS1` is `0xFFFF_FFFC`, `ttyS2`
+/// `0xFFFF_FFFB`, and so on. Descending (rather than ascending from
+/// 0) so the block can never collide with `/dev/pts/<N>` indices.
+pub const fn tty_id_serial(n: u32) -> u32 {
+    TTY_ID_SERIAL0 - n
+}
+
+/// True for the kernel console ttys (the VT tty and the UART's tty),
+/// as opposed to PTYs. This covers the probed-UART ttys too: a
+/// `ttyS1` fd must take the console path in `/dev/tty` opens, PTY
+/// job-control filtering and console-reader accounting, exactly like
+/// `ttyS0` — it is a console tty, just not a registered `console=`
+/// console (see [`console_tty`] docs).
 pub const fn is_console_tty_id(id: u32) -> bool {
-    id == TTY_ID_CONSOLE || id == TTY_ID_SERIAL0
+    id == TTY_ID_CONSOLE || (id <= TTY_ID_SERIAL0 && id >= TTY_ID_SERIAL0 - MAX_EXTRA_SERIAL_TTYS)
 }
 
 // ── POSIX poll(2) event bits ────────────────────────────────────

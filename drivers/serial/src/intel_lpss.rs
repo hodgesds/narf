@@ -156,11 +156,15 @@ fn probe_one(path: &str) -> Option<()> {
         utype
     );
 
-    // Register in global registry.
+    // Register in global registry with the port's real MMIO base:
+    // the old low-16-bits I/O shim named an address that is not this
+    // port, so no tty backend may ever be built from it.
     // Leak the path string for the static registry.
     let static_name: &'static str = Box::leak(path.to_string().into_boxed_str());
     crate::registry::register(crate::registry::UartInfo {
-        io_base: (base & 0xFFFF) as u16, // Compatibility shim for old registry
+        base: crate::uart_8250::UartBase::Mmio(PhysAddr::new(base)),
+        reg_shift: 2,
+        clock_hz: 100_000_000,
         irq: irq_vec,
         name: static_name,
         baud: 115_200,
