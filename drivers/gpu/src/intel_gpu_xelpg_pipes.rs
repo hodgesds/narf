@@ -663,10 +663,11 @@ impl Pipes {
     /// Step 6c: after the caller stopped its port and PLL, the last step of
     /// the crtc disable (`intel_dmc_disable_pipe`), then the post-plane
     /// repartition without the pipe while the remaining lit pipes stay
-    /// lit. Releasing the last programmed pipe forgets the state instead:
-    /// every pipe is off, nothing fetches, and the next reservation is the
-    /// all-off commit (Linux's post-plane update would also lower CDCLK and
-    /// PM demand here; this owner leaves them raised until then).
+    /// lit. Releasing the last programmed pipe forgets the state instead
+    /// and, with every pipe off, runs the all-off post-plane steps
+    /// ([`res::settle_all_off`]: WM/DDB cleared, DBUF to S1, CDCLK and PM
+    /// demand lowered, as Linux's post-plane update does); the next
+    /// reservation is the all-off commit.
     pub(crate) fn release(
         &mut self,
         io: &(impl MmioWindow + ?Sized),
@@ -682,7 +683,15 @@ impl Pipes {
         dmc.disable_pipe(p as u32);
         let request = self.request_with(|r| r.pipes[p] = None);
         if request.pipes.iter().all(Option::is_none) {
+            // Every pipe is off: the post-plane steps of that commit lower
+            // DBUF, CDCLK and PM demand to the all-off minimum. Best effort:
+            // a refusal or failure leaves them raised (never under-covered,
+            // see settle_all_off) and the next reservation is the all-off
+            // commit either way.
             self.state = None;
+            if let Ok(latency) = crate::intel_gpu_xelpg_wm::Latency::read(io) {
+                let _ = res::settle_all_off(io, &latency);
+            }
         } else {
             let new = Self::compute(io, &request)?;
             self.transition(io, new)?;

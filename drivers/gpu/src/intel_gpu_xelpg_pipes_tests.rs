@@ -302,7 +302,8 @@ kernel_test_in!(
 fn smoke_xelpg_pipes_release_of_last_pipe_forgets_state() -> TestResult {
     // No panel: the reservation is the all-off commit; releasing the only
     // pipe leaves every pipe off and forgets the state, so the next
-    // reservation is the all-off commit again (no empty computation).
+    // reservation is the all-off commit again (no empty computation). The
+    // release's only writes are the all-off post-plane steps.
     let hw = Live::new();
     hw.set(0x45780, 6 | (8 << 16));
     hw.set(0x45784, 10 | (12 << 16));
@@ -319,11 +320,15 @@ fn smoke_xelpg_pipes_release_of_last_pipe_forgets_state() -> TestResult {
         return TestResult::Fail("a lone Pipe B must run on the all-off commit");
     }
     let before = hw.writes.borrow().len();
-    if pipes.release(&hw, Pipe::B, &NoPipeDmc).is_err()
-        || pipes.state().is_some()
-        || hw.writes.borrow().len() != before
-    {
-        return TestResult::Fail("releasing the last pipe must forget the state, no writes");
+    if pipes.release(&hw, Pipe::B, &NoPipeDmc).is_err() || pipes.state().is_some() {
+        return TestResult::Fail("releasing the last pipe must forget the state");
+    }
+    let settled = hw.writes.borrow()[before..].iter().all(|&(r, _)| {
+        (0x70000..0x74000).contains(&r)
+            || [0x45008, 0x44fe8, 0x44300, 0x44304, 0x45230, 0x45234].contains(&r)
+    });
+    if !settled || hw.get(0x7127c) != 0 || hw.get(0x4_5008) & (1 << 30) == 0 {
+        return TestResult::Fail("the release must write only the all-off settle");
     }
     if pipes.reserve(&hw, &ext, &NoPipeDmc).is_err()
         || pipes.state().map(|s| s.dbuf.active_pipes) != Some(0x2)
@@ -335,6 +340,98 @@ fn smoke_xelpg_pipes_release_of_last_pipe_forgets_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_pipes",
     smoke_xelpg_pipes_release_of_last_pipe_forgets_state
+);
+
+fn smoke_xelpg_pipes_last_release_lowers_cdclk_and_pm_demand() -> TestResult {
+    // A 4K60 external alone needs CDCLK 307.2 MHz (594 MHz / 2 pixels per
+    // clock) and HBR3's voltage level 1. Releasing it with no panel runs
+    // the all-off post-plane steps of intel_atomic_commit_tail: WM/DDB
+    // cleared, DBUF down to S1, CDCLK down to bxt_calc_cdclk(0) = 172.8 MHz
+    // (intel_set_cdclk_post_plane_update), then PM demand down to the
+    // no-pipe request (intel_pmdemand_post_plane_update), each covered.
+    let hw = Live::new();
+    hw.set(0x45780, 6 | (8 << 16));
+    hw.set(0x45784, 10 | (12 << 16));
+    hw.set(0x45788, 14 | (16 << 16));
+    let mut ext = external(Pipe::B);
+    ext.mode = Mode {
+        pixel_clock_khz: 594_000,
+        h_active: 3840,
+        h_total: 4400,
+        h_sync_start: 4016,
+        h_sync_end: 4104,
+        v_active: 2160,
+        v_total: 2250,
+        v_sync_start: 2168,
+        v_sync_end: 2178,
+        ..Mode::VESA_1024X768_60
+    };
+    ext.stride_bytes = 3840 * 4;
+    ext.port_clock_khz = 810_000;
+    let mut pipes = Pipes::adopt(None, 0);
+    let ok = pipes.reserve(&hw, &ext, &NoPipeDmc).is_ok()
+        && pipes.program_timings(&hw, Pipe::B).is_ok()
+        && pipes.enable(&hw, Pipe::B).is_ok()
+        && pipes.arm_primary(&hw, Pipe::B).is_ok();
+    if !ok || crate::intel_gpu_modeset_xelpg::cdclk_current_khz(&hw) != 307_200 {
+        return TestResult::Fail("the 4K external must run at CDCLK 307.2 MHz");
+    }
+    let raised = crate::intel_gpu_pmdemand::Params::decode(hw.get(0x45230), hw.get(0x45234));
+    if raised.active_pipes != 1 || raised.voltage_index != 1 || raised.cdclk_freq_mhz != 308 {
+        return TestResult::Fail("the external's PM demand must be raised");
+    }
+    // A pipe still on refuses the settle before any write.
+    let off = pipes.disable_primary(&hw, Pipe::B).is_ok() && pipes.disable(&hw, Pipe::B).is_ok();
+    hw.set(0x72008, 0xc000_0000);
+    let before = hw.writes.borrow().len();
+    let latency = crate::intel_gpu_xelpg_wm::Latency::read(&hw).unwrap();
+    if !off
+        || res::settle_all_off(&hw, &latency) != Err(ResourceError::Busy)
+        || hw.writes.borrow().len() != before
+    {
+        return TestResult::Fail("a lit pipe must refuse the all-off settle before any write");
+    }
+    hw.set(0x72008, 0);
+    if pipes.release(&hw, Pipe::B, &NoPipeDmc).is_err() || pipes.state().is_some() {
+        return TestResult::Fail("the last release must forget the state");
+    }
+    let Some(low) = crate::intel_gpu_xelpg_cdclk::calc_cdclk(0) else {
+        return TestResult::Fail("the lowest CDCLK rung must exist");
+    };
+    let want = res::all_off_pmdemand(&latency, low);
+    let held = crate::intel_gpu_pmdemand::Params::decode(hw.get(0x45230), hw.get(0x45234));
+    if crate::intel_gpu_modeset_xelpg::cdclk_current_khz(&hw) != 172_800
+        || held != want
+        || held.active_pipes != 0
+        || held.active_dbufs != 1
+        || held.voltage_index != 0
+        || held.ddiclk_max != 0
+        || held.cdclk_freq_mhz != 173
+    {
+        return TestResult::Fail("CDCLK and PM demand must drop to the all-off minimum");
+    }
+    let slices = [0x45008, 0x44fe8, 0x44300, 0x44304].map(|r| hw.get(r) & (3 << 30));
+    if slices != [3 << 30, 0, 0, 0] || hw.uncovered.get() != 0 {
+        return TestResult::Fail("DBUF must drop to S1 with every clock covered");
+    }
+    // The panel-only state has Pipe B inactive: its image is the cleared one.
+    for (r, v) in panel_state().pipe_registers(1, false).unwrap() {
+        if hw.get(r) != v {
+            return TestResult::Fail("Pipe B's WM/DDB must be cleared");
+        }
+    }
+    // Post-plane order: DBUF, then CDCLK, then the PM demand request.
+    let dbuf = hw.last(0x44fe8);
+    let clock = hw.last(0x46000);
+    let demand = hw.last(0x45234);
+    if !(dbuf < clock && clock < demand) {
+        return TestResult::Fail("DBUF, CDCLK and PM demand must lower in post-plane order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_pipes",
+    smoke_xelpg_pipes_last_release_lowers_cdclk_and_pm_demand
 );
 
 fn smoke_xelpg_pipes_publish_layout_and_follow_a_tile4_panel_flip() -> TestResult {

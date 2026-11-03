@@ -743,6 +743,87 @@ pub(crate) fn commit(io: &(impl MmioWindow + ?Sized), state: &State) -> Result<(
     }
 }
 
+/// The PM demand of a display with every pipe off, at `cdclk`
+/// (`intel_pmdemand_atomic_check` with no active pipe: S1 the only DBUF
+/// slice, `intel_dbuf_enabled_slices`; the actual CDCLK and its voltage
+/// level; no port clock or PHY; and the QGV point `mtl_find_qgv_points`
+/// picks for no plane when SAGV is controllable, nothing rejecting it).
+pub(crate) fn all_off_pmdemand(latency: &Latency, cdclk: Rung) -> Params {
+    Demand {
+        qgv_peak_bw: latency
+            .qgv
+            .as_ref()
+            .and_then(|q| crate::intel_gpu_xelpg_bw::qgv_peak_bw(q, 0, 0)),
+        enabled_slices: 1,
+        active_pipes: 0,
+        voltage_level: cdclk::voltage_level(cdclk.cdclk_khz),
+        cdclk_khz: cdclk.cdclk_khz,
+        max_port_clock_khz: 0,
+        combo_phys: 0,
+    }
+    .params()
+}
+
+/// The post-plane half of the commit that turns the last pipe off
+/// (`intel_atomic_commit_tail` with every pipe disabled): every plane and
+/// cursor WM/DDB cleared, `intel_dbuf_post_plane_update` down to S1 (the
+/// minimum trackers keep the current join state),
+/// `intel_set_cdclk_post_plane_update` to `bxt_modeset_calc_cdclk`'s
+/// no-active-pipe clock (`bxt_calc_cdclk(force_min_cdclk)`, the lowest rung
+/// without a forced minimum), and `intel_pmdemand_post_plane_update` to
+/// [`all_off_pmdemand`]. Refused (`Busy`) before any write unless every
+/// pipe, plane, cursor, DSB and FBC is off. A failure after the first write
+/// re-requests the original PM demand once the clock it may have left is
+/// covered by it, so the demand never under-covers the hardware.
+pub(crate) fn settle_all_off(
+    io: &(impl MmioWindow + ?Sized),
+    latency: &Latency,
+) -> Result<(), ResourceError> {
+    require_idle(io)?;
+    let target = cdclk::calc_cdclk(0).ok_or(ResourceError::Unsupported)?;
+    let new = all_off_pmdemand(latency, target);
+    let old = pmdemand::current(io)?;
+    let clock = cdclk::Current::read(io)?;
+    let joined = read(io, dbuf::MBUS_CTL)? & (1 << 31) != 0;
+    let result = (|| {
+        for pipe in 0..PIPES {
+            for plane in 0..PLANES {
+                for (r, v) in plane_wm_image(pipe, plane, &PlaneWm::default())
+                    .ok_or(ResourceError::Unsupported)?
+                {
+                    checked(io, r, v)?;
+                }
+                checked(io, plane_buf_cfg(pipe, plane), 0)?;
+            }
+            for (r, v) in
+                cursor_wm_image(pipe, &PlaneWm::default()).ok_or(ResourceError::Unsupported)?
+            {
+                checked(io, r, v)?;
+            }
+            checked(io, cursor_buf_cfg(pipe), 0)?;
+        }
+        for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
+            let value = dbuf::dbuf_ctl_value(slice, read(io, r)?, 1, joined);
+            io.write32(r, value);
+            let want = if slice == 0 {
+                dbuf::DBUF_POWER_STATE
+            } else {
+                0
+            };
+            wait(io, r, dbuf::DBUF_POWER_STATE, want)?;
+        }
+        if clock.known != Some(target) {
+            cdclk::program(io, &clock, target)?;
+        }
+        pmdemand::program(io, &new, None)?;
+        Ok(())
+    })();
+    if result.is_err() && io.display_access_ok() {
+        let _ = pmdemand::program(io, &old, Some(&new));
+    }
+    result
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xelpg_resources_tests.rs"]
 mod tests;

@@ -16,7 +16,7 @@ pub(crate) struct Live {
     pub(crate) drop_write: Cell<u64>,
     nth: Cell<(u64, u32)>,
     seen: Cell<u32>,
-    uncovered: Cell<u32>,
+    pub(crate) uncovered: Cell<u32>,
     /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
     /// primary `PLANE_CTL` / `PLANE_SURF` / `CURBASE` write.
     pub(crate) irq_log: RefCell<Vec<(u64, bool)>>,
