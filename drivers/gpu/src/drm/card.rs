@@ -959,6 +959,9 @@ pub struct Card {
     /// Fixed display14 Tile4 with retained primary WM/resource ownership.
     #[cfg(feature = "intel")]
     pub(crate) intel_tile4: bool,
+    /// Fixed MTL/Arrow opaque XR30 LINEAR native input; no output-depth claim.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_xr30: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
     /// A released master still owns hardware until serialized restoration.
@@ -1252,6 +1255,8 @@ impl Card {
             intel_x_tiled: false,
             #[cfg(feature = "intel")]
             intel_tile4: false,
+            #[cfg(feature = "intel")]
+            intel_xr30: false,
             #[cfg(feature = "intel")]
             intel_display: false,
             #[cfg(feature = "intel")]
@@ -2258,6 +2263,12 @@ impl Card {
         Ok(id)
     }
 
+    /// Native Intel discovery is separate from the generic legacy-copy formats.
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_primary_formats(&self) -> Option<&'static [u32]> {
+        self.intel_xr30.then_some(&[0x34325258, 0x30335258])
+    }
+
     /// ADDFB2 naming one of open `owner`'s Intel GEM handles: drm core's
     /// framebuffer_check and Linux intel_framebuffer_init, in their order.
     /// LINEAR and qualified Gen12/13/display14 no-DPT X (MTL Tile4) are taken; plane0
@@ -2291,8 +2302,19 @@ impl Card {
             return Err(CardError::UnknownFormat);
         }
         let legacy = matches!(cmd.pixel_format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
+        let xr30 = cmd.pixel_format == 0x30335258;
+        if xr30
+            && (!self.intel_xr30
+                || modifier != 0
+                || cmd.flags & FB_INTERLACED != 0
+                || !object.is_wc()
+                || object.is_userptr()
+                || object.is_vram())
+        {
+            return Err(CardError::UnknownFormat);
+        }
         let format = PixelFormat::from_fourcc(cmd.pixel_format)
-            .filter(|_| legacy)
+            .filter(|_| legacy || xr30)
             .ok_or(CardError::UnknownFormat)?;
         if cmd.width == 0 || cmd.height == 0 {
             return Err(CardError::InvalidDimensions);
@@ -2316,7 +2338,7 @@ impl Card {
         if object.is_vram() {
             return Err(CardError::InvalidDimensions);
         }
-        if xe && !object.scanout() {
+        if xe && !xr30 && !object.scanout() {
             if object.vm_bound() {
                 return Err(CardError::InvalidDimensions);
             }
@@ -2361,6 +2383,13 @@ impl Card {
         }
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);
+        }
+        // XR30 refusals precede even the Xe framebuffer storage attribute.
+        if xr30 && !object.scanout() {
+            if !xe || object.vm_bound() {
+                return Err(CardError::InvalidDimensions);
+            }
+            object.mark_scanout();
         }
         let id = self.next_fb_id;
         self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);

@@ -310,6 +310,7 @@ fn smoke_intel_x_tiled_layout_extent_metadata_test_only_and_arch_refusal() -> Te
     let view = View {
         layout: Layout::X,
         origin: Default::default(),
+        input: Default::default(),
     };
     assert_eq!(
         view.footprint(Geometry {

@@ -1800,6 +1800,9 @@ impl Owner {
     }
 
     async fn run(self: Arc<Self>) {
+        // Read-only display format discovery is refreshed after successful GT
+        // publication, outside this owner's mutex and without waiting for KMS.
+        let mut display_formats_pending = None;
         // The future owns availability. Cancellation closes cached admission,
         // while this card-lifetime Owner continues retaining any DMA graph.
         let Ok(_worker) = self.reset_publication.worker(self.user_epoch.clone()) else {
@@ -2005,6 +2008,7 @@ impl Owner {
                                     return;
                                 }
                                 reset_published = true;
+                                display_formats_pending = Some(epoch);
                                 self.power_controls.activate(epoch);
                                 self.runtime_power.activate(epoch);
                                 if let Some(hwmon) = &self.hwmon {
@@ -2093,6 +2097,12 @@ impl Owner {
                             "MSI unavailable; using timer completion",
                         );
                     }
+                }
+            }
+            if let Some(epoch) = display_formats_pending {
+                if crate::intel_gpu_kms::refresh_formats_after_publication(&self.pending.bar, epoch)
+                {
+                    display_formats_pending = None;
                 }
             }
             self.arm_autosuspend().await;

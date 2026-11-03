@@ -87,6 +87,8 @@ pub(crate) struct PollIo<M: DisplayAccess> {
     /// Exact original linear console layout, supplied from the retained
     /// source-qualified KMS owner; reset never samples a new baseline.
     console_layout: Option<(u32, u32)>,
+    xr30_qualified: Cell<bool>,
+    primary_controls: Cell<Option<(u32, Option<u32>)>>,
 }
 
 impl<M: DisplayAccess> core::fmt::Debug for PollIo<M> {
@@ -160,6 +162,8 @@ impl<M: DisplayAccess> PollIo<M> {
             state: Cell::new(State::Initializing),
             last_pte: Cell::new(None),
             console_layout: None,
+            xr30_qualified: Cell::new(false),
+            primary_controls: Cell::new(None),
         };
         owner.present()?;
         let ier = owner.checked_read(IER)?;
@@ -240,6 +244,20 @@ impl<M: DisplayAccess> PollIo<M> {
             return Err(IoError::Conflict);
         }
         self.console_layout = Some((control, stride));
+        Ok(())
+    }
+
+    /// The KMS owner has verified the exact physical display14 fixed resource
+    /// and timing profile. This never reinterprets a readable XR30 as ownership.
+    pub(crate) fn qualify_xr30(&self) -> Result<(), IoError> {
+        if self.format != PteFormat::XeLpg
+            || self.generation != Generation::MeteorLake
+            || self.console_layout.is_none()
+        {
+            return Err(IoError::Unsupported);
+        }
+        self.owned_status_ready()?;
+        self.xr30_qualified.set(true);
         Ok(())
     }
 
@@ -439,10 +457,11 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
             let current_control = self.read32(0x70180);
             let current_stride = self.read32(0x70188);
             let tiling = current_control & (7 << 10);
-            let layout_owned = current_control & !(7 << 10) == control
+            let layout_owned = (current_control & !(7 << 10) == control
                 && (tiling == 0
                     || tiling == 1 << 10
-                    || (self.format == PteFormat::XeLpg && tiling == 5 << 10));
+                    || (self.format == PteFormat::XeLpg && tiling == 5 << 10)))
+                || (self.supports_xr30() && self.retained_primary_control(current_control));
             let pitch_owned = current_stride == stride
                 || (stride % 8 == 0 && current_stride == stride / 8)
                 || (self.format == PteFormat::XeLpg
@@ -473,6 +492,40 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
 // because the arena is unreachable by those clients; posted reads plus the
 // hardware barrier order PTE writes before plane arm and address reuse.
 unsafe impl<M: DisplayAccess> ScanoutIo for PollIo<M> {
+    fn supports_xr30(&self) -> bool {
+        self.xr30_qualified.get()
+            && self.format == PteFormat::XeLpg
+            && self.owned_status_ready().is_ok()
+    }
+    fn retain_primary_controls(&self, original: u32, current: u32, pending: Option<u32>) -> bool {
+        let Some((console, _)) = self.console_layout else {
+            return false;
+        };
+        let legal = |control: u32| {
+            let rest = control & !((0x1f << 23) | (7 << 10));
+            let format = control & (0x1f << 23);
+            let tiling = control & (7 << 10);
+            rest == console & !((0x1f << 23) | (7 << 10))
+                && ((format == 0x04000000 && matches!(tiling, 0 | 0x400 | 0x1400))
+                    || (format == 0x02000000 && tiling == 0))
+        };
+        if !self.supports_xr30()
+            || original != console
+            || !legal(current)
+            || pending.is_some_and(|control| !legal(control))
+        {
+            return false;
+        }
+        self.primary_controls.set(Some((current, pending)));
+        true
+    }
+    fn retained_primary_control(&self, control: u32) -> bool {
+        self.supports_xr30()
+            && self
+                .primary_controls
+                .get()
+                .is_some_and(|(old, pending)| control == old || pending == Some(control))
+    }
     fn invalidate_ggtt(&self) -> bool {
         if self.owned_status_ready().is_err() {
             return false;

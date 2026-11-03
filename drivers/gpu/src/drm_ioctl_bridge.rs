@@ -2105,7 +2105,7 @@ pub(crate) fn dispatch_card_for_file(
     // 3. Look up the per-cmd handler.
     let nr = drm_uapi::ioc_nr(cmd);
     #[cfg(feature = "intel")]
-    if crate::intel_gpu_kms::available(card_index) {
+    if crate::intel_gpu_kms::available(card_index) || mode_state.lock().intel_xr30 {
         if intel_kms::mutates(cmd) {
             return Err(if mode_state.lock().intel_transaction_busy() {
                 FsError::Busy
@@ -3247,7 +3247,15 @@ fn handle_getplane(
         {
             Some((_, crtc_idx)) => (
                 1u32 << crtc_idx,
-                card.plane_formats.unwrap_or(&[DRM_FORMAT_XRGB8888]),
+                {
+                    #[cfg(feature = "intel")]
+                    let native = card.intel_primary_formats();
+                    #[cfg(not(feature = "intel"))]
+                    let native: Option<&'static [u32]> = None;
+                    native
+                        .or(card.plane_formats)
+                        .unwrap_or(&[DRM_FORMAT_XRGB8888])
+                },
                 (0, 0),
             ),
             // amdgpu_dm's overlays: possible on every CRTC (0xff), with
@@ -4518,7 +4526,7 @@ fn intel_modifiers_cap(
 ) -> Option<Result<u64, FsError>> {
     let qualified = {
         let card = mode.lock();
-        card.intel_x_tiled || card.intel_tile4
+        card.intel_x_tiled || card.intel_tile4 || card.intel_xr30
     };
     if cmd != drm_uapi::DRM_IOCTL_GET_CAP || !qualified {
         return None;
@@ -4555,10 +4563,12 @@ pub(crate) fn intel_get_modifiers_cap(
 }
 #[cfg(feature = "intel")]
 fn intel_primary_formats_blob(card: &crate::drm::card::Card, id: u32) -> Option<Vec<u8>> {
-    if id != INTEL_PRIMARY_FORMATS_BLOB || !(card.intel_x_tiled || card.intel_tile4) {
+    if id != INTEL_PRIMARY_FORMATS_BLOB
+        || !(card.intel_x_tiled || card.intel_tile4 || card.intel_xr30)
+    {
         return None;
     }
-    // create_in_format_blob: XR24 alone and only installed layout profiles.
+    // LINEAR supports both opaque inputs; existing tiled rows remain XR24.
     let mut modifiers = alloc::vec![0];
     if card.intel_x_tiled {
         modifiers.push(crate::intel_gpu_scanout::X_TILED_MODIFIER);
@@ -4566,21 +4576,32 @@ fn intel_primary_formats_blob(card: &crate::drm::card::Card, id: u32) -> Option<
     if card.intel_tile4 {
         modifiers.push(crate::intel_gpu_scanout::TILE4_MODIFIER);
     }
+    let formats = card
+        .intel_primary_formats()
+        .unwrap_or(&[DRM_FORMAT_XRGB8888]);
+    let modifier_offset = (24 + formats.len() * 4 + 7) & !7;
     let mut bytes = Vec::new();
     for word in [
         1u32,
         0,
-        1,
+        formats.len() as u32,
         24,
         modifiers.len() as u32,
-        32,
-        DRM_FORMAT_XRGB8888,
-        0,
+        modifier_offset as u32,
     ] {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
+    for format in formats {
+        bytes.extend_from_slice(&format.to_le_bytes());
+    }
+    bytes.resize(modifier_offset, 0);
     for modifier in modifiers {
-        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let mask: u64 = if modifier == 0 && card.intel_xr30 {
+            3
+        } else {
+            1
+        };
+        bytes.extend_from_slice(&mask.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&modifier.to_le_bytes());
     }
@@ -4721,7 +4742,9 @@ fn handle_obj_getproperties(
             #[cfg(any(feature = "amdgpu", feature = "intel"))]
             let (mut props, mut values) = (props, values);
             #[cfg(feature = "intel")]
-            if (card.intel_x_tiled || card.intel_tile4) && obj_id == PLANE_ID_BASE {
+            if (card.intel_x_tiled || card.intel_tile4 || card.intel_xr30)
+                && obj_id == PLANE_ID_BASE
+            {
                 props.push(0x6e);
                 values.push(u64::from(INTEL_PRIMARY_FORMATS_BLOB));
             }
@@ -8356,6 +8379,7 @@ pub fn intel_addfb2_bo(
 #[cfg(feature = "intel")]
 #[derive(Clone)]
 struct IntelFrame {
+    format: crate::drm::card::PixelFormat,
     object: Arc<crate::intel_gpu_gem::GemObject>,
     pitch: u32,
     width: u32,
@@ -8369,6 +8393,7 @@ struct IntelFrame(core::convert::Infallible);
 #[cfg(feature = "intel")]
 fn intel_frame(fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
     fb.intel.as_ref().map(|intel| IntelFrame {
+        format: fb.format,
         object: intel.object.clone(),
         pitch: fb.pitch,
         width: fb.width,
@@ -8388,6 +8413,10 @@ fn intel_frame(_fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
 /// the object's scattered pages. Only 32-bpp frames match the scanout.
 #[cfg(feature = "intel")]
 fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
+    // Native-only input: refuse before fence waits, CPU sync or console copy.
+    if frame.format == crate::drm::card::PixelFormat::Xrgb2101010 {
+        return Err(FsError::Unsupported);
+    }
     const GPU_FENCE_TIMEOUT_MS: u64 = 15_000;
     let object = &frame.object;
     for fence in object.dma_buf.resv.fences(DmaResvUsage::Write) {

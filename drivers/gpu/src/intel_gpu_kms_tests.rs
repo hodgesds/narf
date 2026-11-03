@@ -75,6 +75,9 @@ struct Hardware {
     pcode_status: u32,
     forbidden_display_reads: usize,
     writes: Vec<(u64, u32)>,
+    xr30_pci: Option<u16>,
+    xr30_epoch: u64,
+    xr30_epoch_on_read: Option<(u64, u64)>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct MockPlatform(
@@ -146,6 +149,9 @@ impl MockPlatform {
                 pcode_status: 0,
                 forbidden_display_reads: 0,
                 writes: Vec::new(),
+                xr30_pci: None,
+                xr30_epoch: 0,
+                xr30_epoch_on_read: None,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -268,6 +274,31 @@ impl MockPlatform {
         let mut saved = console();
         saved.stride_bytes = pitch;
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, saved)
+    }
+    pub(crate) fn xr30_source(&self, device: Option<u16>) {
+        self.0.lock().xr30_pci = device;
+        self.0.lock().xr30_epoch = if device.is_some() { 1 } else { 0 };
+        for (register, value) in [
+            (0x60400, 0x8a000006),
+            (0x46140, 0x10000000),
+            (0x60540, 0x80040300),
+            (0x64000, 0x80000006),
+            (0x64004, 0x31000006),
+        ] {
+            self.set(register, value);
+        }
+    }
+    pub(crate) fn xr30_change_epoch_on_read(&self, register: u64, epoch: u64) {
+        self.0.lock().xr30_epoch_on_read = Some((register, epoch));
+    }
+    pub(crate) fn all_writes(&self) -> Vec<(u64, u32)> {
+        self.0.lock().writes.clone()
+    }
+    pub(crate) fn block_pause(&self, blocked: bool) {
+        self.0.lock().pause_blocked = blocked;
+    }
+    pub(crate) fn xr30_epoch(&self, epoch: u64) {
+        self.0.lock().xr30_epoch = epoch;
     }
     pub(crate) fn primary_updates(&self) -> Vec<(u64, u32)> {
         self.0
@@ -579,6 +610,13 @@ impl MockPlatform {
 impl MmioWindow for MockPlatform {
     fn read32(&self, offset: u64) -> u32 {
         let mut hw = self.0.lock();
+        if let Some((register, epoch)) = hw.xr30_epoch_on_read {
+            if offset == register {
+                hw.xr30_epoch = epoch;
+                hw.xr30_epoch_on_read = None;
+            }
+        }
+
         if offset == 0x70b08 && hw.poison_dsb_read {
             hw.poison_dsb_read = false;
             self.1.store(true, Ordering::Release);
@@ -949,6 +987,28 @@ unsafe impl DisplayAccess for MockPlatform {
     }
 }
 impl Platform for MockPlatform {
+    fn published_epoch(&self) -> Option<u64> {
+        let epoch = self.0.lock().xr30_epoch;
+        (epoch != 0).then_some(epoch)
+    }
+    fn xr30_device(&self) -> bool {
+        self.3.is_none()
+            && matches!(
+                self.0.lock().xr30_pci,
+                Some(
+                    0x7d40
+                        | 0x7d45
+                        | 0x7d55
+                        | 0x7d60
+                        | 0x7dd5
+                        | 0x7d41
+                        | 0x7d51
+                        | 0x7d67
+                        | 0x7dd1
+                        | 0xb640
+                )
+            )
+    }
     fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         self.3
     }

@@ -1860,6 +1860,27 @@ callbacks, S3 and controller/console publication remain manually traced rather
 than executed by these new fixtures. Silicon, visible-pixel, complete-link,
 Mesa, codec and performance acceptance remain unrun. No broad workstream closes.
 
+### Fixed opaque XR30 input — validation pending
+
+The bounded opaque XR30 slice adds LINEAR four-byte XRGB2101010 input to the existing exact fixed MTL/Arrow internal profile, with integer panning, real projected FIFO state and retained joint primary/color restoration. Current backend epoch publication and explicit reconciliation preserve owner authority. Output depth/HDR, other formats/platforms, global bandwidth policy and broader display work remain outside this slice. The ten broad workstreams remain Open.
+
+The expected selection is 1,918 tests: 1,248 Intel/DRM/framebuffer/backlight plus 670 shared. All 1,912 NEXT10 names remain unchanged; six new registrations bring the cumulative new-or-replacement labels from 157 to 163. All 31 backlight regressions remain. The six additions belong to the existing intel_gpu_dsb namespace in group0 (369); group4 remains135 and group5 remains197.
+
+Six fixture bodies are registered but this checkpoint has no native acceptance yet. Both seven-group profiles, production boot/two btrfs postflights, nine target/host/build gates, formatting, diff and exact125 source checks remain pending. The baseline stays v0.36 with65 implemented rows; no new feature row is counted.
+
+The new fixtures exercise shared GETPLANE/IN_FORMATS/GET_CAP query helpers,
+real Card::addfb2_intel and raw atomic/PAGE_FLIP/DIRTYFB/cursor/master FIFO
+conversations through actual Device/Guard/Presenter/PollIo/color/DSB owners and
+PTE-decoded command backing. They do not execute the full DriCardFile/registry
+user-copy GETPLANE/ADDFB entry or physical backend-publication refresh. Their
+held-Device Pending seam exercises the shared owner directly; it does not
+execute the physical scanout_access drain. Actual RuntimeOwner/ECAM, positive
+firmware registry, physical startup/full system-PM coordinator, sink training,
+visible pixels, Mesa/codec and performance acceptance remain unexecuted by these
+fixtures. Supported WC backing is required for positive DMA conversations;
+unsupported architectures retain conservative source/metadata/WB refusal.
+Native register/CT models are not physical Intel or ARM-native acceptance.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

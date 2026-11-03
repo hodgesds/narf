@@ -5,7 +5,7 @@
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
 use crate::intel_gpu_scanout::{
-    Geometry, Layout, View, Viewport, TILE4_MODIFIER, X_TILED_MODIFIER,
+    Geometry, InputFormat, Layout, View, Viewport, TILE4_MODIFIER, X_TILED_MODIFIER,
 };
 use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
@@ -797,9 +797,25 @@ impl Plan {
                 .into_iter()
                 .flatten()
                 .any(|id| card.framebuffer(id).is_ok_and(|f| f.modifier != 0));
-        color_primary |= panning || tiling;
+        let format_activity = p.next.enabled
+            && fb.is_some()
+            && route.is_some()
+            && [p.previous.primary_fb, fb].into_iter().flatten().any(|id| {
+                card.framebuffer(id)
+                    .is_ok_and(|f| f.format == PixelFormat::Xrgb2101010)
+            });
+        if format_activity && (!card.intel_xr30 || tiling) {
+            return Err(FsError::Unsupported);
+        }
+        color_primary |= panning || tiling || format_activity;
         let mut view = View::from(viewport);
-        if color.is_some() || gamma.is_some() || degamma.is_some() || panning || tiling {
+        if color.is_some()
+            || gamma.is_some()
+            || degamma.is_some()
+            || panning
+            || tiling
+            || format_activity
+        {
             let joint_qualified = card.intel_ctm
                 || (card.intel_gen12_joint
                     && ((!panning && !tiling) || card.intel_gen12_views.is_some()));
@@ -832,7 +848,10 @@ impl Plan {
                 let target = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
                 if target.pitch != geometry.pitch
-                    || target.format != PixelFormat::Xrgb8888
+                    || !(target.format == PixelFormat::Xrgb8888
+                        || (target.format == PixelFormat::Xrgb2101010
+                            && card.intel_xr30
+                            && target.modifier == 0))
                     || (target.modifier != 0
                         && !(target.modifier == X_TILED_MODIFIER && card.intel_x_tiled
                             || target.modifier == TILE4_MODIFIER && card.intel_tile4))
@@ -845,6 +864,11 @@ impl Plan {
                 {
                     return Err(FsError::Unsupported);
                 }
+                view.input = if target.format == PixelFormat::Xrgb2101010 {
+                    InputFormat::Xrgb2101010
+                } else {
+                    InputFormat::Xrgb8888
+                };
                 if target.modifier == X_TILED_MODIFIER {
                     view.layout = Layout::X;
                 } else if target.modifier == TILE4_MODIFIER {

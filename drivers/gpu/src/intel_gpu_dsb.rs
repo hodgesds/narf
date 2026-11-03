@@ -46,7 +46,7 @@ fn cursor_watermark(register: u64) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Timing {
     pub(crate) clock: u32,
     pub(crate) width: u16,
@@ -72,7 +72,7 @@ impl Timing {
     fn hw(self, line: u32) -> u32 {
         (line + u32::from(self.vtotal) - 1) % u32::from(self.vtotal)
     }
-    fn check(
+    pub(crate) fn check(
         self,
         io: &impl MmioWindow,
         gen12_latencies: Option<[u16; 6]>,

@@ -125,6 +125,40 @@ training, visible pixels, a general resource/retirement receipt or permission to
 free scanout frames. Pre-stop fixed-window GGTT/cache bootstrap, inherited
 producer exclusion and a full retained async modeset owner remain unresolved.
 
+### Fixed opaque XR30 primary input
+
+The owned fixed MTL/Arrow display14.00 internal Pipe-A/DDI-A profile accepts
+opaque XRGB2101010 (XR30) LINEAR WC system SCANOUT GEM input at its existing
+visible geometry, pitch and bounded integer linear viewport. This is four-byte
+input storage; it does not select HDR, output10bpc or new output colorimetry.
+Installed source-qualified per-card metadata reports LINEAR XR24/XR30 with mask3,
+and existing X/Tile4 XR24 with mask1. Generic formats and legacy format enums
+retain their existing behavior. Discovery stays false until the exact installed
+backend publishes its tested nonzero matching epoch/platform. The GT worker
+requests a nonblocking KMS refresh outside its mutex and retries busy KMS;
+queries do no hardware work. Current timing qualification belongs to that epoch.
+
+Actual admission independently rechecks PCI/display/timing/route/resource/cache
+and current owner authority. Unsupported XR30 refuses before new PTE, command
+or Card effects. Neither CPU console-copy path accepts XR30; legacy PAGE_FLIP
+still requires identical fourcc. Driver-local current/pending/projected views
+retain exact input. Old/new XR30 primary arms use the existing common DSB;
+independent primary and source/leaf DMA retirement, target input/color and a
+stable common frame precede publication and release. Original/family color
+remains immutable; all-None color cannot erase XR30 restoration obligations.
+
+Fresh recovery uses its explicitly owned prepublication proof at epochzero;
+actual publication refreshes capability. A proved return to XR24 LINEAR retires
+the XR30-only lease and permits existing XR24 tiling. A dropped direct future
+performs no cleanup MMIO. A later explicit admission/restoration may reconcile
+only unexposed tentative intent under the same live epoch and a fresh exact
+XR24/original-console proof, with no current/pending/partial XR30 or armed
+transport/color obligation. Full return still requires primary/DSB/common-frame
+retirement. Ordinary/fresh-reset ordering, quarantine, PM and synchronization
+contracts remain; elapsed time and GT reset alone retire nothing. Arbitrary CPU
+aliases are not revoked. No broader format/platform/output/resource policy or
+new permission to free console/scanout storage is established.
+
 MTL/Arrow additionally installs the qualified `intel_aux_backlight` Raw
 candidate into the existing arbitrated backlight stack after actual video and
 owned-console publication. It requires a live owned Pipe-A/DDI-A internal

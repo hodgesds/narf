@@ -1490,3 +1490,7 @@ mod gen12_joint {
 mod gen12_tiled {
     include!("intel_gpu_gen12_tiled_ioctl_tests.rs");
 }
+
+mod xr30 {
+    include!("intel_gpu_xr30_ioctl_tests.rs");
+}

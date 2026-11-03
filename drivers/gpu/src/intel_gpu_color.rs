@@ -408,6 +408,7 @@ impl Palette {
 /// Retained desired image for an independently owned DSB DMA transaction.
 #[derive(Debug)]
 pub(crate) struct Update {
+    primary_control: u32,
     image: Image,
     gamma: u32,
     lut: Option<Arc<Lut>>,
@@ -446,8 +447,9 @@ struct Pending {
 #[derive(Debug)]
 pub(crate) struct Owner {
     original: Image,
-    /// Immutable source-selected plane format and arbitration slots; a later
-    /// color/LUT qualification cannot reinterpret another display family.
+    /// Source-selected immutable original and transactional current input.
+    /// Arbitration/family is never inferred from a later readable format.
+    original_primary_control: u32,
     primary_control: u32,
     gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
     /// None admits common CTM only. Gen12 requires a retained internal-pipe
@@ -519,6 +521,7 @@ impl Owner {
         let original = Image { values, mode };
         Ok(Self {
             original,
+            original_primary_control: primary_control,
             primary_control,
             gen12_family,
             profile: (generation == Generation::MeteorLake).then_some(Profile::Mtl),
@@ -767,6 +770,7 @@ impl Owner {
         let write_degamma = self.degamma != degamma;
         let restore_pre = both_off && self.pre_dirty;
         Ok(Update {
+            primary_control: self.primary_control,
             image,
             gamma,
             lut,
@@ -777,6 +781,50 @@ impl Owner {
             restore_pre,
             registers,
         })
+    }
+    /// Bind only the qualified opaque input of the already prepared joint
+    /// primary transaction. The old image was checked by prepare_stages.
+    pub(crate) fn target_input(
+        &self,
+        update: &mut Update,
+        input: crate::intel_gpu_scanout::InputFormat,
+    ) -> Result<(), FsError> {
+        if self.profile != Some(Profile::Mtl)
+            || self.gen12_family.is_some()
+            || self.original_primary_control != 0x84000000
+        {
+            return Err(FsError::Unsupported);
+        }
+        update.primary_control = (self.original_primary_control & !(0x1f << 23)) | input.control();
+        Ok(())
+    }
+    /// A separately completed fresh console arm has restored the immutable
+    /// original input. Keep any still-owned color image exactly as observed.
+    pub(crate) fn console_restored(&mut self, io: &impl MmioWindow) -> Result<(), FsError> {
+        if self.pending()
+            || self.failed
+            || !pipeline(io, self.original_primary_control)
+            || !self.expected.matches(io)
+            || io.read32(GAMMA) != self.expected_gamma
+        {
+            return Err(FsError::NoDevice);
+        }
+        self.primary_control = self.original_primary_control;
+        Ok(())
+    }
+    /// Read-only reconciliation of an unexposed format intent. Active color
+    /// may remain owned, but the input must still be the immutable original.
+    pub(crate) fn original_input_visible(&self, io: &impl MmioWindow) -> bool {
+        self.primary_control == self.original_primary_control && self.check_visible(io).is_ok()
+    }
+    pub(crate) fn original_visible(&self) -> bool {
+        self.expected == self.original
+            && self.expected_gamma == self.gamma
+            && self.lut.is_none()
+            && self.degamma.is_none()
+            && !self.palette_dirty
+            && !self.pre_dirty
+            && !self.pending()
     }
     pub(crate) fn cancel_dsb_before_arm(&mut self) {
         self.external_pending = false;
@@ -811,7 +859,7 @@ impl Owner {
             return Err(FsError::NoDevice);
         }
         self.failed = true;
-        if !pipeline(io, self.primary_control)
+        if !pipeline(io, update.primary_control)
             || !update.image.matches(io)
             || io.read32(GAMMA) != update.gamma
         {
@@ -836,6 +884,7 @@ impl Owner {
             PrePalette::write(io, &self.original_pre.as_ref().expect("original pre").0)?;
             self.pre_dirty = false;
         }
+        self.primary_control = update.primary_control;
         self.expected = update.image;
         self.expected_gamma = update.gamma;
         self.lut = update.lut.clone();
@@ -855,10 +904,11 @@ impl Owner {
         self.failed = false;
         self.pending = None;
         self.external_pending = false;
-        if !pipeline(io, self.primary_control) {
+        if !pipeline(io, self.original_primary_control) {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
+        self.primary_control = self.original_primary_control;
         self.lut = None;
         self.degamma = None;
         // Fresh recovery revalidates all retained original RAM, including

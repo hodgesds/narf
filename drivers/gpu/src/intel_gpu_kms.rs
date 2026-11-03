@@ -51,6 +51,7 @@ fn tiled_profile(
     crate::intel_gpu_scanout::View {
         origin: Default::default(),
         layout,
+        input: Default::default(),
     }
     .footprint(geometry)
     .map_err(scanout_error)?;
@@ -82,11 +83,102 @@ pub(crate) fn tile4_profile(
     Ok(())
 }
 
+/// Read-only fixed opaque cpp4 input qualification. Timing, WM/DDB/PM,
+/// active route and output depth remain the pre-existing resource contract.
+fn xr30_resource_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+) -> Result<(), FsError> {
+    if !io.xr30_device()
+        || io.gen12_family().is_some()
+        || !io.internal_primary_claimed()
+        || !io.console_access_ok()
+        || !io.access_ok()
+        || (u32::from(timing.width), u32::from(timing.height)) != (geometry.width, geometry.height)
+    {
+        return Err(FsError::Unsupported);
+    }
+    crate::intel_gpu_scanout::View::default()
+        .footprint(geometry)
+        .map_err(scanout_error)?;
+    crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
+    timing.check(io, None)?;
+    if io.read32(0x70188) != geometry.pitch / 64
+        || io.read32(0x70190) != ((geometry.height - 1) << 16) | (geometry.width - 1)
+    {
+        return Err(FsError::Unsupported);
+    }
+    // The existing fixed internal route remains A/SST/8bpc with its source
+    // clock and normal transport pattern. This observes; it never retrains or
+    // changes output BPC in response to the framebuffer's input precision.
+    let route = io.read32(0x60400);
+    let width = route & 7;
+    let ddi = io.read32(0x64000);
+    let buf = io.read32(0x64004);
+    if !matches!(width, 0 | 2 | 6)
+        || route & !7 != 0x8a000000
+        || io.read32(0x46140) != 0x10000000
+        || io.read32(0x60540) & 0x80040700 != 0x80040300
+        || ddi == u32::MAX
+        || ddi & (1 << 31) == 0
+        || buf == u32::MAX
+        || buf & 0x31000080 != 0x31000000
+        || buf & 0xe != width
+    {
+        return Err(FsError::Unsupported);
+    }
+    if !io.console_access_ok() {
+        return Err(FsError::NoDevice);
+    }
+    Ok(())
+}
+
+/// Normal admission requires this exact function's live, proved backend
+/// incarnation in addition to resources. Reset recovery uses the explicitly
+/// fresh resource-only contract while admission is still epoch zero.
+fn xr30_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+) -> Result<u64, FsError> {
+    let epoch = io
+        .published_epoch()
+        .filter(|e| *e != 0)
+        .ok_or(FsError::NoDevice)?;
+    xr30_resource_profile(io, geometry, timing)?;
+    if io.published_epoch() != Some(epoch) {
+        return Err(FsError::NoDevice);
+    }
+    Ok(epoch)
+}
+
+/// Initial install/console-replacement discovery shares the live fixed-profile
+/// checks but additionally requires the original XR24 RGB bypass. Queries only
+/// read the cached result; this read-only helper never acquires DMA or writes.
+pub(crate) fn xr30_discovery_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+) -> bool {
+    let Ok(epoch) = xr30_profile(io, geometry, timing) else {
+        return false;
+    };
+    crate::intel_gpu_color::Owner::capture(io, Generation::MeteorLake).is_ok()
+        && io.published_epoch() == Some(epoch)
+}
+
 /// The production implementation retains PCI authority and a permanent UC
 /// BAR. Tests implement the same platform boundary with native register models.
 pub(crate) trait Platform:
     DisplayAccess + Clone + core::fmt::Debug + Send + Sync + 'static
 {
+    fn published_epoch(&self) -> Option<u64> {
+        None
+    }
+    fn xr30_device(&self) -> bool {
+        false
+    }
     fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         None
     }
@@ -155,24 +247,11 @@ unsafe impl DisplayAccess for Physical {
             && (self.generation != Generation::MeteorLake || self.read32(0x4804) == 4)
     }
 }
-impl Platform for Physical {
-    fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
-        match crate::intel_gpu_gt::GtPlatform::from_pci(
-            self.device.id.vendor,
-            self.device.id.device,
-        ) {
-            Some(crate::intel_gpu_gt::GtPlatform::Gen12(family)) => Some(family),
-            _ => None,
+impl Physical {
+    fn publish_console_formats(&self, console: &ActiveScanout, required_epoch: Option<u64>) {
+        if required_epoch.is_some_and(|epoch| self.published_epoch() != Some(epoch)) {
+            return;
         }
-    }
-    fn internal_primary_claimed(&self) -> bool {
-        crate::intel_gpu_multipipe::pipe_owner(Pipe::A)
-            == Some(crate::intel_gpu_multipipe::PipeOwner {
-                ddi: crate::intel_gpu_ddi::Ddi::A,
-                used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
-            })
-    }
-    fn console_published(&self, console: &ActiveScanout) {
         let geometry = scanout_geometry(console);
         // No Card spinlock spans console PTE/resource validation. Qualification
         // grants CTM only; display12 and13 have different native LUT layouts.
@@ -227,8 +306,34 @@ impl Platform for Physical {
                 )
                 .is_ok()
             });
+        let backend =
+            crate::drm_registry::card(self.index).and_then(|card| card.intel_user_backend());
+        let epoch = self.published_epoch();
+        let xr30 = timing.is_some_and(|timing| xr30_discovery_profile(self, geometry, timing));
         if let Some(card) = crate::drm_registry::mode_state(self.index) {
             let mut card = card.lock();
+            if required_epoch.is_some_and(|required| {
+                epoch != Some(required)
+                    || backend
+                        .as_ref()
+                        .and_then(|b| b.status())
+                        .is_none_or(|current| current.epoch != required)
+            }) {
+                return;
+            }
+            card.intel_xr30 = xr30
+                && epoch.is_some()
+                && backend
+                    .as_ref()
+                    .and_then(|b| b.status())
+                    .is_some_and(|current| {
+                        Some(current.epoch) == epoch
+                            && Some(current.platform)
+                                == crate::intel_gpu_gt::GtPlatform::from_pci(
+                                    self.device.id.vendor,
+                                    self.device.id.device,
+                                )
+                    });
             if let Some(family) = family {
                 card.intel_ctm_only = ctm_only;
                 card.intel_hw_cursor = hw_cursor;
@@ -270,6 +375,56 @@ impl Platform for Physical {
                 }
             }
         }
+    }
+}
+impl Platform for Physical {
+    fn published_epoch(&self) -> Option<u64> {
+        let backend = crate::drm_registry::card(self.index)?.intel_user_backend()?;
+        let status = backend.status()?;
+        (status.epoch != 0
+            && Some(status.platform)
+                == crate::intel_gpu_gt::GtPlatform::from_pci(
+                    self.device.id.vendor,
+                    self.device.id.device,
+                )
+            && status.engines.bits() != 0)
+            .then_some(status.epoch)
+    }
+    fn xr30_device(&self) -> bool {
+        self.generation == Generation::MeteorLake
+            && self.device.id.vendor == 0x8086
+            && matches!(
+                self.device.id.device,
+                0x7d40
+                    | 0x7d45
+                    | 0x7d55
+                    | 0x7d60
+                    | 0x7dd5
+                    | 0x7d41
+                    | 0x7d51
+                    | 0x7d67
+                    | 0x7dd1
+                    | 0xb640
+            )
+    }
+    fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        match crate::intel_gpu_gt::GtPlatform::from_pci(
+            self.device.id.vendor,
+            self.device.id.device,
+        ) {
+            Some(crate::intel_gpu_gt::GtPlatform::Gen12(family)) => Some(family),
+            _ => None,
+        }
+    }
+    fn internal_primary_claimed(&self) -> bool {
+        crate::intel_gpu_multipipe::pipe_owner(Pipe::A)
+            == Some(crate::intel_gpu_multipipe::PipeOwner {
+                ddi: crate::intel_gpu_ddi::Ddi::A,
+                used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+            })
+    }
+    fn console_published(&self, console: &ActiveScanout) {
+        self.publish_console_formats(console, None);
     }
     fn takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
         // Only an execution-tested backend has retired inherited GT owners
@@ -471,6 +626,8 @@ struct State<M: Platform> {
     recovery_status: Option<SavedStatus>,
     color: Option<crate::intel_gpu_color::Owner>,
     color_owned: bool,
+    xr30_timing: Option<crate::intel_gpu_dsb::Timing>,
+    xr30_epoch: Option<u64>,
     color_unpublished: bool,
     // DMA completion alone cannot publish a cancelled mixed framebuffer.
     mixed_unpublished: bool,
@@ -598,6 +755,37 @@ pub(crate) fn display_for_bar(bar: &narf_bus::MmioRegion) -> Option<Arc<Display>
         .find(|d| d.platform.bar.phys == bar.phys)
         .cloned()
 }
+/// Called by the existing GT service only after successful epoch publication,
+/// outside its state guard. Busy KMS is retried on a later service iteration;
+/// no await, resource transfer or new worker is introduced.
+pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoch: u64) -> bool {
+    let Some(display) = display_for_bar(bar) else {
+        return true;
+    };
+    if display.generation != Generation::MeteorLake
+        || display.platform.published_epoch() != Some(epoch)
+    {
+        return true;
+    }
+    let Some(state) = display.state.try_lock() else {
+        return false;
+    };
+    if state.failed
+        || state.blocked
+        || state.paused
+        || display.platform.reset_lost()
+        || state.presenter.is_some()
+        || state.color.is_some()
+        || state.cursor.as_ref().is_some_and(|c| c.active())
+    {
+        return false;
+    }
+    display
+        .platform
+        .publish_console_formats(&state.console, Some(epoch));
+    true
+}
+
 pub(crate) fn available(index: u32) -> bool {
     display(index).is_some()
 }
@@ -700,6 +888,8 @@ impl<M: Platform> Device<M> {
                 recovery_status: None,
                 color: None,
                 color_owned: false,
+                xr30_timing: None,
+                xr30_epoch: None,
                 color_unpublished: false,
                 mixed_unpublished: false,
                 dsb: None,
@@ -852,6 +1042,17 @@ impl<M: Platform> Device<M> {
         );
         io.qualify_console(family, control, state.console.stride_bytes / 64)
             .map_err(|_| crate::intel_gpu_user::io_error())?;
+        if let Some(old) = state.presenter.as_ref().filter(|p| p.tracks_xr30()) {
+            let timing = state.xr30_timing.ok_or(FsError::NoDevice)?;
+            xr30_resource_profile(&fresh, scanout_geometry(&state.console), timing)?;
+            io.qualify_xr30().map_err(|_| FsError::NoDevice)?;
+            let (original, current, pending) = old.retained_primary_controls();
+            if !crate::intel_gpu_scanout::ScanoutIo::retain_primary_controls(
+                &io, original, current, pending,
+            ) {
+                return Err(FsError::NoDevice);
+            }
+        }
         let format = io.format();
         let pat = if self.generation == Generation::MeteorLake {
             1
@@ -911,6 +1112,8 @@ impl<M: Platform> Device<M> {
             console.shutdown_restored_console().map_err(scanout_error)?;
         }
         state.presenter = None;
+        state.xr30_timing = None;
+        state.xr30_epoch = None;
         state.primary_resources = None;
         state.gen12_primary = None;
         state.gen12_cursor_profile = None;
@@ -923,6 +1126,7 @@ impl<M: Platform> Device<M> {
         drop(console);
         state.mixed_unpublished = false;
         self.platform.recovery_complete();
+        self.platform.console_published(&state.console);
         state.failed = false;
         state.blocked = false;
         self.platform.resume_console();
@@ -995,6 +1199,55 @@ fn scanout_error(error: ScanoutError) -> FsError {
     }
 }
 impl<M: Platform> Guard<'_, M> {
+    /// Dropping an owner future while console pause is pending leaves only a
+    /// retained *intent*, not an exposed XR30 image. Reconcile on a later call,
+    /// never in Drop: every current/pending/partial transport obligation and
+    /// failed/reset/epoch-lost proof keeps the lease. This frees no resource.
+    fn reconcile_unexposed_xr30(&mut self) {
+        let Some(epoch) = self.state.xr30_epoch else {
+            return;
+        };
+        if self.state.failed
+            || self.device.platform.reset_lost()
+            || self.device.platform.published_epoch() != Some(epoch)
+            || self.state.pending.is_some()
+            || self.state.joint.is_some()
+            || self.state.dsb.as_ref().is_some_and(|d| d.armed())
+            || self.state.color.as_ref().is_some_and(|c| c.pending())
+            || self
+                .state
+                .presenter
+                .as_ref()
+                .is_some_and(|p| p.tracks_xr30())
+        {
+            return;
+        }
+        let original_input = if let Some(presenter) = &self.state.presenter {
+            presenter.check_current(self.console_geometry()).is_ok()
+        } else {
+            let platform = &self.device.platform;
+            let control = platform.read32(0x70180);
+            control & !((1 << 14) | (1 << 13)) == 0x84000000
+                && platform.read32(0x7019c) == self.state.console.gtt_offset
+                && platform.read32(0x701ac) == self.state.console.gtt_offset
+                && platform.read32(0x701a4) == 0
+                && self.state.xr30_timing.is_some_and(|t| {
+                    xr30_resource_profile(platform, self.console_geometry(), t).is_ok()
+                })
+                && self.state.color.as_ref().map_or_else(
+                    || {
+                        crate::intel_gpu_color::Owner::capture(platform, Generation::MeteorLake)
+                            .is_ok()
+                    },
+                    |c| c.original_input_visible(platform),
+                )
+        };
+        if original_input && self.device.platform.published_epoch() == Some(epoch) {
+            self.state.xr30_timing = None;
+            self.state.xr30_epoch = None;
+        }
+    }
+
     /// Recheck before publishing a hardware transaction. The synchronous GT
     /// loss path can poison a busy session without acquiring this mutex.
     pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
@@ -1004,6 +1257,16 @@ impl<M: Platform> Guard<'_, M> {
             || !self.device.platform.console_access_ok()
         {
             return Err(FsError::NoDevice);
+        }
+        if let Some(timing) = self.state.xr30_timing {
+            if Some(xr30_profile(
+                &self.device.platform,
+                self.console_geometry(),
+                timing,
+            )?) != self.state.xr30_epoch
+            {
+                return Err(FsError::NoDevice);
+            }
         }
         if let Some(resources) = &self.state.primary_resources {
             resources.check_current(&self.device.platform)?;
@@ -1160,7 +1423,14 @@ impl<M: Platform> Guard<'_, M> {
         Ok(())
     }
     async fn start(&mut self) -> Result<(), FsError> {
-        if self.state.presenter.is_some() {
+        if let Some(presenter) = &self.state.presenter {
+            if let Some(timing) = self.state.xr30_timing {
+                xr30_profile(&self.device.platform, self.console_geometry(), timing)?;
+                presenter
+                    .retained_io()
+                    .qualify_xr30()
+                    .map_err(|_| FsError::NoDevice)?;
+            }
             return Ok(());
         }
         check_ggtt_range(
@@ -1229,6 +1499,10 @@ impl<M: Platform> Guard<'_, M> {
         );
         io.qualify_console(family, control, self.state.console.stride_bytes / 64)
             .map_err(|_| crate::intel_gpu_user::io_error())?;
+        if let Some(timing) = self.state.xr30_timing {
+            xr30_profile(platform, self.console_geometry(), timing)?;
+            io.qualify_xr30().map_err(|_| FsError::NoDevice)?;
+        }
         let format = io.format();
         let pat = if self.device.generation == Generation::MeteorLake {
             1
@@ -1326,6 +1600,7 @@ impl<M: Platform> Guard<'_, M> {
         object: Arc<GemObject>,
         geometry: Geometry,
     ) -> Result<FlipStamp, FsError> {
+        self.reconcile_unexposed_xr30();
         self.check(geometry)?;
         if self.state.color_unpublished || self.state.mixed_unpublished {
             return Err(FsError::Busy);
@@ -1392,11 +1667,18 @@ impl<M: Platform> Guard<'_, M> {
         self.restore_surface_inner().await
     }
     async fn restore_surface_inner(&mut self) -> Result<(), FsError> {
+        self.reconcile_unexposed_xr30();
         self.finish_color().await?;
         if self.state.color_unpublished {
             return Err(FsError::Busy);
         }
-        if !self.state.color_owned {
+        if !self.state.color_owned
+            && !self
+                .state
+                .presenter
+                .as_ref()
+                .is_some_and(|p| p.tracks_xr30())
+        {
             self.state.color = None;
         }
         if self.device.platform.reset_lost() {
@@ -1446,6 +1728,20 @@ impl<M: Platform> Guard<'_, M> {
                 self.state.pending = None;
                 self.finish_pending().await?;
             }
+            if self.state.xr30_timing.is_some() {
+                let restored = if let Some(color) = self.state.color.as_mut() {
+                    color
+                        .console_restored(&self.device.platform)
+                        .map(|()| color.original_visible())
+                } else {
+                    Ok(false)
+                };
+                let original = restored.inspect_err(|_| self.state.failed = true)?;
+                if original {
+                    self.state.color = None;
+                    self.state.color_owned = false;
+                }
+            }
             self.state
                 .presenter
                 .as_mut()
@@ -1453,6 +1749,8 @@ impl<M: Platform> Guard<'_, M> {
                 .shutdown_restored_console()
                 .map_err(scanout_error)?;
             self.state.presenter = None;
+            self.state.xr30_timing = None;
+            self.state.xr30_epoch = None;
             self.state.primary_resources = None;
             if !self.state.color_owned && !self.state.cursor.as_ref().is_some_and(|c| c.active()) {
                 self.state.gen12_primary = None;
@@ -1800,30 +2098,35 @@ impl<M: Platform> Guard<'_, M> {
                 // primary live/control and visible color arms in ONE stable
                 // current hardware frame. Neither a DSB interrupt nor an old
                 // primary completion alone may publish the joint state.
-                let stamp = if self.device.platform.gen12_family().is_some()
+                let stamp = if (self.device.platform.gen12_family().is_some()
+                    || self.state.xr30_timing.is_some())
                     && self.state.joint.is_some()
                 {
-                    let owner = self.state.gen12_primary.as_ref().ok_or(FsError::NoDevice)?;
-                    let resources = owner
-                        .check_owned(
-                            &self.device.platform,
-                            self.state.dsb.as_ref().is_some_and(|d| d.exposed()),
-                            self.state.cursor.as_ref().is_some_and(|c| c.exposed()),
-                        )
-                        .and_then(|()| {
-                            owner.check_console_mapping(&self.device.platform, &self.state.console)
-                        });
-                    resources.inspect_err(|_| self.state.failed = true)?;
-                    let family = self
-                        .device
-                        .platform
-                        .gen12_family()
-                        .ok_or(FsError::NoDevice)?;
-                    self.state
-                        .gen12_cursor_profile
-                        .ok_or(FsError::NoDevice)?
-                        .check(&self.device.platform, family)
-                        .inspect_err(|_| self.state.failed = true)?;
+                    if let Some(timing) = self.state.xr30_timing {
+                        xr30_profile(&self.device.platform, self.console_geometry(), timing)
+                            .inspect_err(|_| self.state.failed = true)?;
+                    }
+                    if let Some(family) = self.device.platform.gen12_family() {
+                        let owner = self.state.gen12_primary.as_ref().ok_or(FsError::NoDevice)?;
+                        let resources = owner
+                            .check_owned(
+                                &self.device.platform,
+                                self.state.dsb.as_ref().is_some_and(|d| d.exposed()),
+                                self.state.cursor.as_ref().is_some_and(|c| c.exposed()),
+                            )
+                            .and_then(|()| {
+                                owner.check_console_mapping(
+                                    &self.device.platform,
+                                    &self.state.console,
+                                )
+                            });
+                        resources.inspect_err(|_| self.state.failed = true)?;
+                        self.state
+                            .gen12_cursor_profile
+                            .ok_or(FsError::NoDevice)?
+                            .check(&self.device.platform, family)
+                            .inspect_err(|_| self.state.failed = true)?;
+                    }
                     let joint = self.state.joint.as_ref().expect("joint state");
                     let completion = joint.completion.expect("independent primary completion");
                     let observed = self
@@ -1889,7 +2192,9 @@ impl<M: Platform> Guard<'_, M> {
                             .inspect_err(|_| self.state.failed = true)?;
                     }
                     self.state.current = self.state.pending.take();
-                    if self.device.platform.gen12_family().is_some() {
+                    if self.device.platform.gen12_family().is_some()
+                        || self.state.xr30_timing.is_some()
+                    {
                         stamp
                     } else {
                         completion.stamp
@@ -1897,6 +2202,18 @@ impl<M: Platform> Guard<'_, M> {
                 } else {
                     stamp
                 };
+                // Both independent completions, exact target and final common
+                // frame precede retirement of the XR30-only qualification.
+                // The existing XR24 X/Tile4 lane is then unconstrained again.
+                if self
+                    .state
+                    .presenter
+                    .as_ref()
+                    .is_some_and(|p| !p.tracks_xr30())
+                {
+                    self.state.xr30_timing = None;
+                    self.state.xr30_epoch = None;
+                }
                 return Ok(Some(stamp));
             }
 
@@ -1938,6 +2255,7 @@ impl<M: Platform> Guard<'_, M> {
         degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
     ) -> Result<FlipStamp, FsError> {
+        self.reconcile_unexposed_xr30();
         if self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
@@ -1953,12 +2271,44 @@ impl<M: Platform> Guard<'_, M> {
         luts: crate::intel_gpu_color::Luts,
         timing: crate::intel_gpu_dsb::Timing,
     ) -> Result<FlipStamp, FsError> {
+        self.reconcile_unexposed_xr30();
         self.check(geometry)?;
         if self.state.color_unpublished || self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(FsError::Unsupported);
+        }
+        let xr30 = view.input == crate::intel_gpu_scanout::InputFormat::Xrgb2101010
+            || self
+                .state
+                .presenter
+                .as_ref()
+                .is_some_and(|p| p.tracks_xr30());
+        if xr30 {
+            if self.device.generation != Generation::MeteorLake
+                || view.layout != crate::intel_gpu_scanout::Layout::Linear
+                || self.state.current.as_ref().is_some_and(|(_, id)| {
+                    !self
+                        .state
+                        .presenter
+                        .as_ref()
+                        .expect("presenter")
+                        .linear_surface(*id)
+                })
+            {
+                return Err(FsError::Unsupported);
+            }
+            xr30_profile(&self.device.platform, geometry, timing)?;
+            if let Some(presenter) = &self.state.presenter {
+                presenter.check_current(geometry).map_err(scanout_error)?;
+            }
+            if let Some(color) = &self.state.color {
+                color.check_visible(&self.device.platform)?;
+            }
+            if self.state.xr30_timing.is_some_and(|old| old != timing) {
+                return Err(FsError::Unsupported);
+            }
         }
         let alignment = self
             .device
@@ -1988,18 +2338,47 @@ impl<M: Platform> Guard<'_, M> {
                 )?;
             }
         }
-        self.color_transaction(
-            coefficients,
-            luts.post,
-            luts.pre,
-            Some(timing),
-            Some(PrimaryTarget {
-                object,
-                geometry,
-                view,
-            }),
-        )
-        .await
+        let previous_timing = self.state.xr30_timing;
+        let previous_epoch = self.state.xr30_epoch;
+        if xr30 {
+            let epoch = xr30_profile(&self.device.platform, geometry, timing)?;
+            if previous_epoch.is_some_and(|old| old != epoch) {
+                return Err(FsError::NoDevice);
+            }
+            self.state.xr30_timing = Some(timing);
+            self.state.xr30_epoch = Some(epoch);
+        }
+        let result = self
+            .color_transaction(
+                coefficients,
+                luts.post,
+                luts.pre,
+                Some(timing),
+                Some(PrimaryTarget {
+                    object,
+                    geometry,
+                    view,
+                }),
+            )
+            .await;
+        // A strict unexposed refusal has already rolled back its new mapping
+        // and pending state. Never leave an XR30-only constraint on the old
+        // supported XR24 tiling lane. Failure/cancellation uncertainty keeps it.
+        if result.is_err()
+            && !self.state.failed
+            && !self.state.mixed_unpublished
+            && self.state.joint.is_none()
+            && self.state.pending.is_none()
+            && !self
+                .state
+                .presenter
+                .as_ref()
+                .is_some_and(|p| p.tracks_xr30())
+        {
+            self.state.xr30_timing = previous_timing;
+            self.state.xr30_epoch = previous_epoch;
+        }
+        result
     }
     async fn color_transaction(
         &mut self,
@@ -2016,6 +2395,7 @@ impl<M: Platform> Guard<'_, M> {
             && (self.device.platform.gen12_family().is_none()
                 || primary.as_ref().is_some_and(|target| {
                     target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
+                        || target.view.input != crate::intel_gpu_scanout::InputFormat::Xrgb8888
                 }))
         {
             return Err(FsError::Unsupported);
@@ -2242,6 +2622,15 @@ impl<M: Platform> Guard<'_, M> {
                         lut.clone(),
                         degamma.clone(),
                     )?;
+                if self.device.generation == Generation::MeteorLake {
+                    if let Some(target) = &primary {
+                        self.state
+                            .color
+                            .as_ref()
+                            .expect("color owner")
+                            .target_input(&mut update, target.view.input)?;
+                    }
+                }
                 if let Some(surface) = surface {
                     update.registers.extend(surface);
                 }
@@ -2336,7 +2725,15 @@ impl<M: Platform> Guard<'_, M> {
             return Err(error);
         }
         let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
-        if coefficients.is_none() && lut.is_none() && degamma.is_none() {
+        if coefficients.is_none()
+            && lut.is_none()
+            && degamma.is_none()
+            && !self
+                .state
+                .presenter
+                .as_ref()
+                .is_some_and(|p| p.tracks_xr30())
+        {
             self.state.color = None;
             self.state.color_owned = false;
             if self.state.presenter.is_none()
@@ -2370,6 +2767,7 @@ impl<M: Platform> Guard<'_, M> {
         self.state.mixed_unpublished = false;
     }
     async fn restore_color(&mut self) -> Result<(), FsError> {
+        self.reconcile_unexposed_xr30();
         self.finish_color().await?;
         if self.state.color.is_some() {
             // Internal full restoration may clear color while keeping the

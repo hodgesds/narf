@@ -208,6 +208,7 @@ fn smoke_intel_x_viewport_literal_bounds_and_foreground_test_only() -> TestResul
     let x = |x, y| View {
         layout: Layout::X,
         origin: Viewport { x, y },
+        input: Default::default(),
     };
     // Literal tile-column/row, residual-coordinate and selected-prefix vectors.
     for (view, expected) in [
