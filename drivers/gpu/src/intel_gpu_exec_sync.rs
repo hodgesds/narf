@@ -5,7 +5,7 @@ use crate::{
     intel_gpu_fence::CompletionFence,
     intel_gpu_uapi::{self as abi, u32_at, u64_at},
 };
-use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use narf_filesystem::{DrmFence, FsError, IoctlContext};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -88,20 +88,19 @@ impl SyncRequest {
             result.array(user, pointer, count, None)?;
         }
         if extensions {
-            let mut address = pointer;
-            let mut seen = BTreeSet::new();
-            while address != 0 {
-                if seen.len() == 16 || !seen.insert(address) {
+            // parse_execbuf2_extensions: i915_user_extensions over
+            // execbuf_extensions[], whose only entry is
+            // DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES (0).
+            abi::user_extensions(user, pointer, |address, name| {
+                if name != 0 {
                     return Err(FsError::InvalidData);
                 }
+                // parse_timeline_fences copies the whole 56-byte
+                // drm_i915_gem_execbuffer_ext_timeline_fences.
                 let ext = read(user, address, 56)?;
-                if u32_at(&ext, 8) != 0 || ext[12..32].iter().any(|b| *b != 0) {
-                    return Err(FsError::InvalidData);
-                }
                 let count = usize::try_from(u64_at(&ext, 32)).map_err(|_| FsError::InvalidData)?;
-                result.array(user, u64_at(&ext, 40), count, Some(u64_at(&ext, 48)))?;
-                address = u64_at(&ext, 0);
-            }
+                result.array(user, u64_at(&ext, 40), count, Some(u64_at(&ext, 48)))
+            })?;
         }
         Ok(result)
     }

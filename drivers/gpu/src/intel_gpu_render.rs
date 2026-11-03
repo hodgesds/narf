@@ -23,7 +23,6 @@ const MAX_COPY: usize = 1024 * 1024;
 const MAX_QUERIES: usize = 64;
 const MAX_CONTEXTS: usize = 64;
 const MAX_VMS: usize = 64;
-const MAX_EXTENSIONS: usize = 16;
 
 /// A submission profile, deliberately separate from display generation gates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -246,7 +245,7 @@ fn read_engines(
         map.push(Some(crate::intel_gpu_engine::EngineSet::of(&[engine])));
     }
     let extensions_at = u64_at(&read(user, value, 8)?, 0);
-    extensions(user, extensions_at, |address, name| match name {
+    abi::user_extensions(user, extensions_at, |address, name| match name {
         abi::CONTEXT_ENGINES_EXT_LOAD_BALANCE => {
             // i915_gem_context.c::set_proto_ctx_engines_balance checks the
             // destination slot before reading sibling count, flags or data.
@@ -259,9 +258,18 @@ fn read_engines(
             }
             let count = read(user, at.checked_add(2).ok_or(FsError::BadAddress)?, 2)?;
             let count = u16::from_le_bytes(count[..].try_into().unwrap());
-            let reserved = read(user, at.checked_add(4).ok_or(FsError::BadAddress)?, 12)?;
-            if reserved.iter().any(|byte| *byte != 0) {
-                return Err(FsError::InvalidData);
+            // check_user_mbz(&ext->flags), then check_user_mbz(&ext->mbz64):
+            // two get_users, so a nonzero flags word is -EINVAL even when
+            // mbz64 is unreadable.
+            for (offset, size) in [(4, 4), (8, 8)] {
+                let field = read(
+                    user,
+                    at.checked_add(offset).ok_or(FsError::BadAddress)?,
+                    size,
+                )?;
+                if field.iter().any(|byte| *byte != 0) {
+                    return Err(FsError::InvalidData);
+                }
             }
             if count == 0 {
                 return Ok(());
@@ -1414,7 +1422,7 @@ impl RenderFile {
         let mut params = Vec::new();
         if cmd == abi::GEM_CONTEXT_CREATE_EXT && flags & 1 != 0 {
             let mut engines_set = false;
-            extensions(user, u64_at(&request, 8), |address, name| {
+            abi::user_extensions(user, u64_at(&request, 8), |address, name| {
                 if name != 0 {
                     return Err(FsError::InvalidData);
                 }
@@ -1557,31 +1565,8 @@ fn read(user: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, F
     Ok(bytes)
 }
 
-fn extensions(
-    user: &dyn IoctlContext,
-    mut address: u64,
-    mut consume: impl FnMut(u64, u32) -> Result<(), FsError>,
-) -> Result<(), FsError> {
-    let mut seen = [0; MAX_EXTENSIONS];
-    let mut count = 0;
-    while address != 0 {
-        if count == MAX_EXTENSIONS || seen[..count].contains(&address) {
-            return Err(FsError::InvalidData);
-        }
-        seen[count] = address;
-        count += 1;
-        let extension = read(user, address, 32)?;
-        if extension[12..].iter().any(|byte| *byte != 0) {
-            return Err(FsError::InvalidData);
-        }
-        consume(address, u32_at(&extension, 8))?;
-        address = u64_at(&extension, 0);
-    }
-    Ok(())
-}
-
 fn create_extensions(user: &dyn IoctlContext, address: u64) -> Result<(), FsError> {
-    extensions(user, address, |address, name| {
+    abi::user_extensions(user, address, |address, name| {
         if name != 0 {
             return Err(FsError::InvalidData);
         }
@@ -2543,7 +2528,11 @@ pub(crate) mod tests {
             put64(&mut extension, 48, 1);
             user.store(64, &request);
             user.store(256, &extension);
-            if invoke(&file, &user, abi::GEM_CONTEXT_CREATE_EXT) != Err(FsError::InvalidData) {
+            // i915_user_extensions keeps no visited set: the self-referencing
+            // SETPARAM is applied 512 times and the 513th link is -E2BIG.
+            if invoke(&file, &user, abi::GEM_CONTEXT_CREATE_EXT)
+                != Err(FsError::ArgumentListTooLong)
+            {
                 return Err("cyclic context extension");
             }
             if file.namespaces.lock().next_context != 1 {

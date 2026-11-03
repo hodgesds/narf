@@ -357,13 +357,25 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
     put32(&mut wire, 28, 0);
     put64(&mut wire, 40, abi::EXEC_USE_EXTENSIONS);
     put64(&mut wire, 32, 1536);
+    // parse_execbuf2_extensions walks i915_user_extensions, which keeps no
+    // visited set: a self-referencing empty TIMELINE_FENCES is parsed 512
+    // times and the 513th link is -E2BIG (this pinned -EINVAL).
     let mut extension = [0; 56];
     put64(&mut extension, 0, 1536);
     user.user.store(1536, &extension);
     assert!(matches!(
         SyncRequest::read(&user, &wire),
+        Err(FsError::ArgumentListTooLong)
+    ));
+    // Only DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES (0) is in the table.
+    put64(&mut extension, 0, 0);
+    put32(&mut extension, 8, 1);
+    user.user.store(1536, &extension);
+    assert!(matches!(
+        SyncRequest::read(&user, &wire),
         Err(FsError::InvalidData)
     ));
+    put32(&mut extension, 8, 0);
     put64(&mut extension, 0, 0);
     put64(&mut extension, 32, 1);
     put64(&mut extension, 40, 1024);

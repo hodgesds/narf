@@ -898,6 +898,14 @@ Broader accelerated presentation profiles remain separate work.
 
 Context/VM create, destroy and scalar GET/SETPARAM have per-open namespaces,
 bounded extension chains and retained VM identity after VM-handle destruction.
+Every i915 extension chain (context create, ENGINES, GEM_CREATE_EXT and
+execbuffer timeline fences) is walked by `intel_gpu_uapi::user_extensions`,
+i915_user_extensions in its order: 512 links, the 513th E2BIG; flags then each
+rsvd word copied and checked singly (EFAULT, then EINVAL); the name copied and
+dispatched (EINVAL outside the caller's table); next_extension copied only
+after the handler ran. There is no visited set: a cycle is applied again until
+E2BIG or until its handler refuses (a LOAD_BALANCE that revisits its slot is
+EEXIST).
 Context zero is implicit and, like i915 GRAPHICS_VER 12, finalized at open;
 created contexts stay proto-contexts until execbuffer, GETPARAM or reset-stats
 lookup. Each context owns legacy RCS0 and BCS0 states; an explicit engine map
@@ -908,7 +916,7 @@ after finalization), 8-byte header plus 4-byte class/instance entries (at most
 before later faults, then a bounded extension chain. LOAD_BALANCE fills an
 INVALID hole with copied same-class, published dense logical siblings;
 duplicate siblings, mixed/unpublished engines and malformed reserved fields
-refuse before proto-map publication. An existing/out-of-range destination is
+(flags, then mbz64, each copied singly) refuse before proto-map publication. An existing/out-of-range destination is
 checked before sibling-body copies. Zero siblings leave a hole. Each virtual
 slot uses the existing persistent GuC placement context, private physical-engine
 receipt and migration-aware retirement/watchdog ownership. Bonding/parallel
@@ -1148,9 +1156,10 @@ binary/timeline create/destroy/wait/signal/fd/query/transfer ioctls to it.
 Binary arrays use num_cliprects entries of {handle:u32, flags:u32}; WAIT=1,
 SIGNAL=2. Timeline extensions use the 32-byte i915 base, count:u64,
 handles_ptr:u64 and values_ptr:u64. Arrays and extensions are mutually
-exclusive; flags, reserved fields, unknown extensions, cycles and same-point
-timeline WAIT|SIGNAL fail before publication. Limits are 16 extension links
-and 4096 entries/dependencies per request. Existing timeline payloads preserve
+exclusive; flags, reserved fields, unknown extensions and same-point
+timeline WAIT|SIGNAL fail before publication. A cycle is walked to the 513th
+link (E2BIG), as is any longer chain. Limits are 512 extension links and 4096
+entries/dependencies per request. Existing timeline payloads preserve
 ordering, including when a SIGNAL point has not yet been submitted.
 Explicit waits use timer awaits without holding IRQ-safe locks or restarting
 a copied ioctl. After admission, output syncobjs reference the exact terminal
