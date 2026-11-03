@@ -2319,11 +2319,28 @@ diagnostic (`pci::bring_up` does not retain it).
   QoS-Null 6, BT-QoS-Null 7; sha256 `7182a1ec…7ff043` recorded; Linux's
   pages 6/7 are all zero and still get A1/A2/A3) and the
   `rtl92ee_set_fw_rsvdpagepkt(false)` substitutions (beacon A2/A3, PS-Poll
-  AID `| 0xc000`/BSSID/TA, Null/probe/QoS-Null/BT-QoS-Null A1/A2/A3). The
-  `_rtl92ee_download_rsvd_page` upload (CR+1 BIT0, BCN_CTRL BIT3/BIT4,
-  0x422 BIT6, up to five uploads through the beacon BD with the
-  `REG_MGQ_TXBD_NUM + 3` BIT(4) and `REG_DWBCN0_CTRL + 2` BCN_VALID polls)
-  belongs to the station branch and is not composed yet.
+  AID `| 0xc000`/BSSID/TA, Null/probe/QoS-Null/BT-QoS-Null A1/A2/A3).
+  `ee92_join_report` is `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)`:
+  `HW_VAR_AID` (`REG_BCN_PSR_RPT` word `& 0xC000 | aid`), then
+  `_rtl92ee_download_rsvd_page` (`ee92_download_rsvd_page`): `REG_CR + 1`
+  BIT(0), BCN_CTRL `(0, BIT3)`/`(BIT4, 0)` on the cached
+  `reg_bcn_ctrl_val` (`0x1d`), `0x422` BIT(6) cleared; up to five uploads,
+  each clearing BCN_VALID (`REG_DWBCN0_CTRL + 2` BIT(0)), writing
+  BEACON_QUEUE descriptor 0 (`rtl92ee_tx_fill_cmddesc`) and beacon BD 0,
+  sending `H2C_92E_RSVDPAGE`, waiting `REG_MGQ_TXBD_NUM + 3` BIT(4) clear
+  (20 × 10 us) and setting it, then BCN_VALID (20 × 50 us, acknowledged
+  with BIT(0)); BCN_CTRL `(BIT3, 0)`/`(0, BIT4)`, `0x422` restored when it
+  had BIT(6), `REG_CR + 1` BIT(0) cleared; then MSRRPT connect. Deliberate:
+  Linux's `rtl_cmd_send_packet` writes only `ring->desc[0]` on the new
+  TRX flow (`rtl92ee_tx_polling` is empty) and never the beacon BD the
+  engine fetches from `REG_BCNQ_DESA`; here BD 0 is filled as Linux's own
+  beacon path does (`_rtl_pci_prepare_bcn_tasklet`:
+  `rtl92ee_pre_fill_tx_bd_desc` + `HW_DESC_OWN` on `BEACON_QUEUE`). A
+  stale BD OWN without an earlier proven upload is refused, the 1024-byte
+  body stays owned by the claim (`packet.reserved`) until quiescence, and
+  a BCN_VALID that never sets is a terminal `CommandTimeout` (Linux logs
+  and continues). Test `smoke_rtl8192ee_rsvd_page_download_through_beacon_bd`
+  (`packet_owner_tests.rs`, written, unexecuted).
   Tests (`rtl8192ee/h2c_tests.rs`, written, unexecuted):
   `smoke_rtl8192ee_rsvd_page_template_and_substitution`,
   `smoke_rtl8192ee_h2c_box_order_rotation_and_ps_gate`,

@@ -47,7 +47,7 @@
 //! (`rtl8192ee/h2c.rs`) and a stopped owner's DMA is released only after
 //! the card-disable retirement proof (`ee92_quiesce`). The owner cannot reach `MacConfigured` until the 8192EE
 //! PHY/RF/channel steps exist, so none of this is reachable from probe.
-use super::super::super::rtl8192ee::{c2h, h2c, mac, trx};
+use super::super::super::rtl8192ee::{c2h, h2c, mac, rsvd_page, trx};
 use super::{
     extent, queue, Delivery, Error, Io, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep,
     RX_BASE, RX_BUFFER, TX_BASES,
@@ -111,6 +111,8 @@ pub(in super::super) struct State {
     /// Pending C2H RA report `(rate, collision)` for the DM step's
     /// `rtl92ee_dm_dynamic_arfb_select` (Linux: `c2hcmd_wq`).
     pub(in super::super) ra_report: Option<(u8, bool)>,
+    /// `rtlpci->reg_bcn_ctrl_val` (`_rtl92ee_hw_configure` leaves `0x1d`).
+    pub(in super::super) bcn_ctrl: u8,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -122,6 +124,7 @@ impl State {
             reports: c2h::TxReportState::default(),
             tx_report: None,
             ra_report: None,
+            bcn_ctrl: 0x1d,
         }
     }
     /// `rtl_c2h_content_parsing` for the packets this profile consumes.
@@ -790,6 +793,190 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Take the latest C2H TX report `(sn, acked, retry)`.
     pub(super) fn ee92_take_tx_report(&mut self) -> Option<(u16, bool, u8)> {
         self.packet.ee92.tx_report.take()
+    }
+
+    /// `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)` for 8192EE
+    /// (`rtl92ee_set_hw_reg`): `HW_VAR_AID`, `_rtl92ee_download_rsvd_page`
+    /// over the [`rsvd_page::pages`] body, then the MSRRPT connect report.
+    /// The body stays owned by the claim (`packet.reserved`) until a
+    /// quiescence proof: the beacon BD naming it may keep its OWN bit.
+    /// Linux logs and continues when BCN_VALID never sets; here that is a
+    /// terminal `CommandTimeout`.
+    pub(super) async fn ee92_join_report(
+        &mut self,
+        peer: [u8; 6],
+        aid: u16,
+        admission: Option<&super::super::station::Admission>,
+        policy: &impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        let local = self.packet.local.ok_or(Error::State)?;
+        let pages = rsvd_page::pages(local, peer, aid).ok_or(Error::Packet)?;
+        let mut buffer = self.io.allocate_packet(pages.len())?;
+        let address = extent(&buffer, pages.len(), 4)?;
+        let end = u64::from(address) + pages.len() as u64;
+        if self
+            .tx
+            .iter()
+            .chain(self.receive.iter())
+            .chain(self.buffers.iter())
+            .any(|other| {
+                u64::from(address) < other.address() + other.len() as u64 && other.address() < end
+            })
+        {
+            return Err(Error::Address);
+        }
+        self.io.authority(true, || {
+            buffer.write_bytes(0, &pages)?;
+            buffer.sync();
+            Ok(())
+        })?;
+        self.packet.reserved = Some(buffer);
+        self.phase = Phase::Failed;
+        let previous = u16::from_le_bytes([
+            self.io.read8(rsvd_page::REG_BCN_PSR_RPT)?,
+            self.io.read8(rsvd_page::REG_BCN_PSR_RPT + 1)?,
+        ]);
+        self.io.write16(
+            rsvd_page::REG_BCN_PSR_RPT,
+            rsvd_page::psr_with_aid(previous, aid),
+        )?;
+        self.ee92_download_rsvd_page(address, pages.len() as u16, admission, policy)
+            .await?;
+        if admission.is_some_and(|c| c.closed.load(core::sync::atomic::Ordering::Acquire)) {
+            return Err(Error::State);
+        }
+        policy(self)?;
+        self.packet
+            .ee92
+            .mailbox
+            .fill(&self.io, h2c::H2C_MSRRPT, &h2c::media_status(true))
+            .await?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `_rtl92ee_download_rsvd_page`: `REG_CR + 1` BIT(0), BCN_CTRL
+    /// `(0, BIT(3))` / `(BIT(4), 0)`, `0x422` BIT(6) cleared; then up to five
+    /// uploads, each clearing BCN_VALID, `rtl92ee_set_fw_rsvdpagepkt`
+    /// (`rtl_cmd_send_packet` on BEACON_QUEUE descriptor 0 with
+    /// `rtl92ee_tx_fill_cmddesc`, then the `H2C_92E_RSVDPAGE` location),
+    /// waiting `REG_MGQ_TXBD_NUM + 3` BIT(4) clear (20 × 10 us) before
+    /// setting it, and BCN_VALID (20 × 50 us; acknowledged with BIT(0)). The
+    /// beacon controls, `0x422` (when it had BIT(6)) and `REG_CR + 1` are
+    /// restored after.
+    ///
+    /// Deliberate difference: on the new TRX flow Linux's
+    /// `rtl_cmd_send_packet` writes only `ring->desc[0]` (and
+    /// `rtl92ee_tx_polling` is empty), leaving the beacon buffer descriptor
+    /// the hardware fetches from `REG_BCNQ_DESA` untouched. Here beacon BD 0
+    /// is filled the way Linux's own beacon path does
+    /// (`_rtl_pci_prepare_bcn_tasklet`: `rtl92ee_pre_fill_tx_bd_desc` naming
+    /// descriptor 0 and the body, `HW_DESC_OWN` on `BEACON_QUEUE` setting
+    /// the BD OWN bit), so the upload is well defined.
+    async fn ee92_download_rsvd_page(
+        &mut self,
+        address: u32,
+        length: u16,
+        admission: Option<&super::super::station::Admission>,
+        policy: &impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let closed = |a: Option<&super::super::station::Admission>| {
+            a.is_some_and(|c| c.closed.load(core::sync::atomic::Ordering::Acquire))
+        };
+        let cr = self.io.read8(rsvd_page::REG_CR_1)?;
+        self.io.write8(rsvd_page::REG_CR_1, cr | 1)?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ee92.bcn_ctrl, 0, 1 << 3)?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ee92.bcn_ctrl, 1 << 4, 0)?;
+        let txq = self.io.read8(rsvd_page::REG_FWHW_TXQ_CTRL_2)?;
+        self.io.write8(
+            rsvd_page::REG_FWHW_TXQ_CTRL_2,
+            txq & !rsvd_page::TXQ_REAL_BEACON,
+        )?;
+        let descriptor = trx::TxDesc::command(length, address);
+        let desc_addr = extent(&self.tx[7], entries(0) * trx::TX_DESC_SIZE, 256)?;
+        let mut bd = trx::TxBufferDesc::fill(desc_addr, address, length);
+        bd.set_own();
+        // A rejoin reuses beacon BD 0, whose earlier upload BCN_VALID proved;
+        // within one download Linux overwrites descriptor 0 too.
+        let mut proven = !self.packet.retired.is_empty();
+        let mut valid = false;
+        for _ in 0..rsvd_page::ATTEMPTS {
+            let status = self.io.read8(rsvd_page::REG_BCN_VALID)?;
+            if status == 0xff {
+                return Err(Error::Access(super::super::AccessError::Gone));
+            }
+            self.io.write8(rsvd_page::REG_BCN_VALID, status | 1)?;
+            {
+                let _publication = admission.map(|control| control.publication.lock());
+                if closed(admission) {
+                    return Err(Error::State);
+                }
+                policy(self)?;
+                let (bds, descs) = self.tx.split_at_mut(7);
+                let (bds, descs) = (&mut bds[0], &mut descs[0]);
+                self.io.authority(true, || {
+                    bds.sync();
+                    if bds.read32(0)? & (1 << 31) != 0 && !proven {
+                        return Err(Error::Descriptor);
+                    }
+                    write_words(descs, 0, &descriptor.dw)?;
+                    descs.sync();
+                    write_words(bds, 4, &bd.dw[1..])?;
+                    bds.sync();
+                    bds.write32(0, bd.dw[0])?;
+                    bds.sync();
+                    Ok(())
+                })?;
+            }
+            proven = true;
+            self.packet
+                .ee92
+                .mailbox
+                .fill(&self.io, h2c::H2C_RSVDPAGE, &h2c::RSVDPAGE_LOCATION)
+                .await?;
+            let mut kick = self.io.read8(rsvd_page::REG_BCNQ_KICK)?;
+            let mut count = 0;
+            while kick & rsvd_page::BCNQ_KICK != 0 && count < rsvd_page::KICK_POLLS {
+                count += 1;
+                self.io.delay_us(rsvd_page::KICK_DELAY_US).await;
+                kick = self.io.read8(rsvd_page::REG_BCNQ_KICK)?;
+            }
+            if kick == 0xff {
+                return Err(Error::Access(super::super::AccessError::Gone));
+            }
+            self.io
+                .write8(rsvd_page::REG_BCNQ_KICK, kick | rsvd_page::BCNQ_KICK)?;
+            let mut status = self.io.read8(rsvd_page::REG_BCN_VALID)?;
+            let mut count = 0;
+            while status & 1 == 0 && count < rsvd_page::VALID_POLLS {
+                count += 1;
+                self.io.delay_us(rsvd_page::VALID_DELAY_US).await;
+                status = self.io.read8(rsvd_page::REG_BCN_VALID)?;
+            }
+            if status == 0xff {
+                return Err(Error::Access(super::super::AccessError::Gone));
+            }
+            if status & 1 != 0 {
+                self.io.write8(rsvd_page::REG_BCN_VALID, 1)?;
+                valid = true;
+                break;
+            }
+        }
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ee92.bcn_ctrl, 1 << 3, 0)?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ee92.bcn_ctrl, 0, 1 << 4)?;
+        if txq & rsvd_page::TXQ_REAL_BEACON != 0 {
+            self.io.write8(rsvd_page::REG_FWHW_TXQ_CTRL_2, txq)?;
+        }
+        let cr = self.io.read8(rsvd_page::REG_CR_1)?;
+        self.io.write8(rsvd_page::REG_CR_1, cr & !1)?;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::CommandTimeout)
+        }
     }
 }
 

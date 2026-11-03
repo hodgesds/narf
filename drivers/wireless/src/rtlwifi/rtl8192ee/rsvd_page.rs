@@ -116,3 +116,32 @@ pub fn pages(own: [u8; 6], bssid: [u8; 6], aid: u16) -> Option<[u8; LEN]> {
     }
     Some(bytes)
 }
+
+// ── `hw.c::_rtl92ee_download_rsvd_page` ────────────────────────────────────
+
+/// `REG_CR + 1` BIT(0): beacon DMA by software.
+pub const REG_CR_1: u16 = 0x0101;
+/// `REG_DWBCN0_CTRL + 2` BIT(0): BCN_VALID (written 1 to clear).
+pub const REG_BCN_VALID: u16 = 0x0208 + 2;
+/// `REG_FWHW_TXQ_CTRL + 2` BIT(6): the beacon-queue packet is a real beacon.
+pub const REG_FWHW_TXQ_CTRL_2: u16 = 0x0420 + 2;
+pub const TXQ_REAL_BEACON: u8 = 1 << 6;
+/// `REG_MGQ_TXBD_NUM + 3` BIT(4): Linux waits while it is set, then sets
+/// it (the beacon-queue BD fetch).
+pub const REG_BCNQ_KICK: u16 = 0x0380 + 3;
+pub const BCNQ_KICK: u8 = 1 << 4;
+/// `REG_BCN_PSR_RPT` (`HW_VAR_AID`: `& 0xC000 | assoc_id`).
+pub const REG_BCN_PSR_RPT: u16 = 0x06a8;
+/// Upload attempts (`dlbcn_count < 5`).
+pub const ATTEMPTS: usize = 5;
+/// `REG_BCNQ_KICK` wait: 20 × 10 us.
+pub const KICK_POLLS: usize = 20;
+pub const KICK_DELAY_US: u64 = 10;
+/// BCN_VALID wait: 20 × 50 us.
+pub const VALID_POLLS: usize = 20;
+pub const VALID_DELAY_US: u64 = 50;
+
+/// `HW_VAR_AID` (`rtl_write_word(REG_BCN_PSR_RPT, (old & 0xC000) | aid)`).
+pub fn psr_with_aid(previous: u16, aid: u16) -> u16 {
+    (previous & 0xc000) | aid
+}

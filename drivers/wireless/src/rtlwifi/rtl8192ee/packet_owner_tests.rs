@@ -355,3 +355,105 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack
 );
+
+fn running(bus: &Bus, local: [u8; 6]) -> Prepared<Bus, Block> {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut owner = allocated(bus, &drops).unwrap();
+    narf_scheduler::block_on(owner.prepare()).unwrap();
+    owner.phase = Phase::MacConfigured;
+    owner.packet.local = Some(local);
+    owner.packet.ee92.channel = Some(1);
+    owner.start_packets().unwrap();
+    owner
+}
+
+pub(crate) fn smoke_rtl8192ee_rsvd_page_download_through_beacon_bd() -> TestResult {
+    use super::super::super::super::rtl8192ee::rsvd_page as rp;
+    let bus = Bus::new();
+    let local = [2, 0, 0, 0, 0, 1];
+    let bssid = [2, 0, 0, 0, 0, 9];
+    let mut owner = running(&bus, local);
+    bus.0.lock().regs[0x422] = 0x40;
+    bus.0.lock().regs[0x6a9] = 0xc0;
+    let policy = |_: &Prepared<Bus, Block>| Ok(());
+    if narf_scheduler::block_on(owner.ee92_join_report(bssid, 0, None, &policy))
+        != Err(Error::Packet)
+    {
+        return TestResult::Fail("AID 0 accepted");
+    }
+    if narf_scheduler::block_on(owner.ee92_join_report(bssid, 5, None, &policy)).is_err()
+        || owner.phase() != Phase::Running
+    {
+        return TestResult::Fail("8192EE join report / rsvd page download");
+    }
+    let Some(body) = owner.packet.reserved.as_ref() else {
+        return TestResult::Fail("reserved body not retained");
+    };
+    let address = body.address as u32;
+    if body.bytes[..] != rp::pages(local, bssid, 5).unwrap()[..] {
+        return TestResult::Fail("reserved body bytes");
+    }
+    let desc = &owner.tx[7];
+    let bd = &owner.tx[0];
+    if word(bd, 0) != 40 | 5 << 16 | 1 << 31
+        || word(bd, 4) != desc.address as u32
+        || word(bd, 16) != 1024
+        || word(bd, 20) != address
+        || word(desc, 40) != address
+        || word(desc, 0) != 1024 | 40 << 16 | 1 << 26 | 1 << 27 | 1 << 31
+        || word(desc, 12) != 1 << 8
+    {
+        return TestResult::Fail("beacon BD 0 / tx_fill_cmddesc descriptor 0");
+    }
+    let order: Vec<(u8, u16, u32)> = bus
+        .0
+        .lock()
+        .trace
+        .iter()
+        .copied()
+        .filter(|(_, reg, _)| {
+            matches!(
+                *reg,
+                0x101 | 0x20a | 0x383 | 0x422 | 0x550 | 0x6a8 | 0x1d0 | 0x1d4
+            )
+        })
+        .collect();
+    let expected: [(u8, u16, u32); 14] = [
+        (16, 0x6a8, 0xc005),
+        (8, 0x101, 0x03),
+        (8, 0x550, 0x15),
+        (8, 0x550, 0x15),
+        (8, 0x422, 0x00),
+        (8, 0x20a, 0x01),
+        (8, 0x1d0, 0x00),
+        (8, 0x383, 0x10),
+        (8, 0x20a, 0x01),
+        (8, 0x550, 0x1d),
+        (8, 0x550, 0x0d),
+        (8, 0x422, 0x40),
+        (8, 0x101, 0x02),
+        (8, 0x1d4, 0x01),
+    ];
+    if order != expected {
+        return TestResult::Fail("download order / BCN_VALID acknowledgement / MSRRPT");
+    }
+    if narf_scheduler::block_on(owner.ee92_join_report(bssid, 5, None, &policy))
+        != Err(Error::State)
+    {
+        return TestResult::Fail("second body while one is retained");
+    }
+    // A stale beacon BD OWN without an earlier proven upload is refused.
+    let stale = Bus::new();
+    let mut owner = running(&stale, local);
+    owner.tx[0].bytes[3] = 0x80;
+    if narf_scheduler::block_on(owner.ee92_join_report(bssid, 5, None, &policy))
+        != Err(Error::Descriptor)
+    {
+        return TestResult::Fail("stale beacon BD OWN overwritten");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_rsvd_page_download_through_beacon_bd
+);
