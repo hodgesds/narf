@@ -131,6 +131,10 @@ pub(super) struct Device<I: Io> {
     /// bit 16) of 20MHz primaries with a current signed full program
     /// (channel1 = base N52B; others N52C). Sampled at activation.
     channels: core::sync::atomic::AtomicU64,
+    /// Bands with a signed-admitted 40/80MHz operating channel the station
+    /// may offer its wide capability on (bit0 2.4GHz, bit1 5GHz; requires
+    /// the HT program). Sampled at activation; 0 advertises no width.
+    wide: core::sync::atomic::AtomicU8,
     fragments_capable: AtomicBool,
     desired: Arc<super::monitor::Desired>,
     selection: super::monitor::Selection,
@@ -365,6 +369,7 @@ impl<I: Io + 'static> Device<I> {
             sleep_identity: IrqSafeSpinLock::new(None),
             monitor_capable: AtomicBool::new(false),
             channels: core::sync::atomic::AtomicU64::new(CHANNEL1),
+            wide: core::sync::atomic::AtomicU8::new(0),
             fragments_capable: AtomicBool::new(false),
             desired: super::monitor::Desired::new(),
             selection: super::monitor::Selection {
@@ -660,6 +665,24 @@ impl<I: Io + 'static> Device<I> {
             .station_channels()
             .unwrap_or(CHANNEL1);
         self.channels.store(channels | CHANNEL1, Ordering::Release);
+        // Wide bands: an admitted 40/80MHz record under the HT/WMM programs
+        // (`station::associate` offers the wide capability only then); a
+        // failed sample advertises none.
+        let wide = {
+            let mut retained = self.lifecycle.retained.lock().await;
+            let io = &mut retained.as_mut().ok_or(Error::State)?.io;
+            let programs = io.station_wmm_allowed().unwrap_or(false)
+                && io.station_ht_allowed().unwrap_or(false);
+            let profiles = if programs {
+                io.station_wide_channels().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            profiles.iter().fold(0u8, |mask, profile| {
+                mask | if profile.is_5ghz() { 2 } else { 1 }
+            })
+        };
+        self.wide.store(wide, Ordering::Release);
         if self.monitor_selected() {
             if !monitor_capable {
                 return Err(Error::State);
@@ -1164,6 +1187,23 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             .as_ref()?
             .station_information_elements(bssid)
     }
+    /// The wide station capability (`station_control::local_ht40`, and on
+    /// 5GHz `local_vht80`) of a band with an admitted 40/80MHz operating
+    /// channel: core.c `rtw89_init_ht_cap`/`rtw89_init_vht_cap` as restricted
+    /// for this profile. Bands without one advertise nothing (no width is
+    /// promised that no signed record can program).
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        let wide = self.wide.load(Ordering::Acquire);
+        let ht = super::station_control::local_ht40()?.capability_body();
+        match band {
+            2400 if wide & 1 != 0 => Some(narf_wireless::iface::PhyCapabilities { ht, vht: None }),
+            5000 if wide & 2 != 0 => Some(narf_wireless::iface::PhyCapabilities {
+                ht,
+                vht: Some(super::station_control::local_vht80()?.capability_body()),
+            }),
+            _ => None,
+        }
+    }
     fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
         use narf_wireless::iface::*;
         WirelessIfaceInfo {
@@ -1207,9 +1247,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
                 } else {
                     WirelessModes::empty()
                 },
+            // HT/VHT only with an advertised wide body (`phy_capabilities`).
             hw_caps: HwCaps {
-                ht_supported: false,
-                vht_supported: false,
+                ht_supported: self.wide.load(Ordering::Acquire) != 0,
+                vht_supported: self.wide.load(Ordering::Acquire) & 2 != 0,
                 he_supported: false,
                 eht_supported: false,
             },

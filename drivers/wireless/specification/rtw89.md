@@ -2693,7 +2693,7 @@ cases: `smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span`
 `smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck`,
 `smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan`.
 
-### RTL8852B 40/80MHz operating channels (partial: radio/record layers; no station caller)
+### RTL8852B 40/80MHz operating channels
 
 Scope (`wide_channels`): rtw8852b.c `support_bandwidths` is 20/40/80MHz, so
 the admitted AX chip RTL8852B implements HT40/HE40 (2.4/5GHz) and VHT80/HE80
@@ -2748,17 +2748,68 @@ drain/withhold/select/republish contract as the 20MHz owner. No board value
 is invented: without provisioned wide records nothing wide is admitted.
 Case: `smoke_rtw89_b_wide_channel_record_binds_width_center_and_whole_span`.
 
-Remaining before `wide_channels` is whole (no row credit): station HT40
-(SUP_WIDTH_20_40, SGI40, DSSSCCK40 as `rtw89_init_ht_cap`), VHT80 on 5GHz
-(`rtw89_init_vht_cap` restricted to this TX-A profile) and HE PHY cap0
-40/80 bits, offered only when the AP's chandef maps to an admitted wide
-profile; association retune to that profile before authentication (via
-`retune_full_radio_to`) and back to 20MHz on disconnect; RA H2C `bw_cap` /
-SGI40/80 and VHT mask per `rtw89_phy_ra_sta_update`; RX admission of
-`bandwidth <= operating width` and VHT rates (today `rx_packet`/`packet_core`
-drop any nonzero RX bandwidth). Data TXWD BW/SC stay 0 exactly as Linux
-(only injection sets `data_bw`; firmware RA chooses the bandwidth). Native
-two-arch and physical validation remain.
+**Station capability (`station_control`).** `local_ht40` is `local_ht`
+plus core.c `rtw89_init_ht_cap` `SUP_WIDTH_20_40 | DSSSCCK40 | SGI_40`
+(every other field unchanged). `local_vht80` is `rtw89_init_vht_cap`
+restricted to the TX-A/RX-AB profile: VHT-MCS0..9 RX on two streams and TX
+on one (`0xfffa`/`0xfffe`), `SHORT_GI_80`, `RXLDPC`, `RXSTBC_1`; TXSTBC,
+SU/MU beamformee/STS, HTC_VHT, the large `max_vht_mpdu_cap` and 160MHz are
+cleared like the HT/HE profiles. `local_he_wide` is `local_he` with HE PHY
+cap0 `CHANNEL_WIDTH_SET_40MHZ_IN_2G` (2.4GHz) or
+`CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G` (5GHz). `wide_phy` mirrors mac80211
+`ieee80211_determine_ap_chan`: it tries VHT80 (5GHz) then HT40 and uses a
+candidate only when its selected chandef (`Offer::from_elements`) is exactly
+a profile in `Native::admitted_wide`; otherwise the unchanged 20MHz HT/HE20
+join is used. Wide is offered only under the signed WMM/HT programs
+(HE-wide additionally under `He`), and never when any subchannel of the span
+is passive-only (no beacon witness covers a wide span). Every wide record
+identity binds `station_control::wide_fingerprint` (the exact HT40/VHT80/
+HE-wide bodies and the wide RA recipe). Case:
+`smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef`.
+
+**Association.** `Station::associate` retunes to the selected profile through
+`Io::station_retune_wide` (`Startup::retune_wide` ->
+`Native::retune_full_radio_to`, RTL8852B only) before authentication
+(mac80211 `ieee80211_prep_channel`); the plan's own offered chandef must
+equal the tuned profile. A disconnect or failure makes the owner terminal
+(`packet_stop`), so the radio never emits again on the wide program and the
+next owner starts from the channel1 20MHz program; a still-passive station
+retuning to a 20MHz primary programs the narrow profile (`Station::wide`
+defeats the same-primary shortcut). A CSA on a wide link fails the link
+(mac80211 connection loss when the new chandef cannot be used) instead of
+narrowing silently: the native CSA owner retunes 20MHz profiles only.
+
+**RA.** `codec::ra_wide` keeps `rtw89_phy_ra_sta_update`'s HE > VHT > HT
+precedence; `BW_CAP[7:6]` is the tuned width (`RTW89_CHANNEL_WIDTH_40/80`,
+checked against the negotiated chandef), SGI is HT `SGI_40` (40MHz) or VHT
+`SHORT_GI_80` (80MHz) from the negotiation, and the VHT branch is
+`mode = VHT|OFDM`, `get_mcs_ra_mask(map, 9, 1)` masked to
+`RA_MASK_VHT_1SS_RATES | SUBOFDM`, LDPC from the peer RXLDPC, STBC0, SS1.
+The 20MHz RA path is untouched (`Io::station_configure_ra_wide` is used only
+on a wide link). Cases:
+`smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux`,
+`smoke_rtw8852b_ht40_admitted_chandef_advertised_retuned_and_ra_bw40`.
+
+**RX.** The RTL8852B assembler surfaces RX bandwidth up to
+`RTW89_CHANNEL_WIDTH_80` and VHT NSS1/NSS2 MCS0..9
+(`RTW89_HW_RATE_VHT_NSS1_MCS0`); the packet owner admits a PPDU only up to
+the width `Native::retune_full_radio_to` last programmed
+(`Core::set_operating_width`) and VHT rates only on a 5GHz wide channel under
+the HT program, dropping anything else without closing the station. RTL8852C
+keeps its 20MHz/no-VHT assembler rule (C lane). Data TXWD BW/SC stay 0
+exactly as Linux (only injection sets `data_bw`; firmware RA chooses the
+bandwidth). Cases:
+`smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner`,
+`smoke_rtw89_b_packet_rx_width_follows_programmed_channel`.
+
+**Advertisement.** `phy_capabilities(2400/5000)` returns the wide HT body
+(plus VHT80 on 5GHz) and `hw_caps.ht/vht_supported` are set only for a band
+with an admitted wide profile under the WMM/HT programs (sampled at
+activation); otherwise nothing is advertised, as before.
+
+Known gaps: the AP and monitor roles stay 20MHz; a wide link does not follow
+a CSA; passive-only (DFS/NO_IR) spans join at 20MHz. Every case above is
+written and unexecuted; native two-arch and physical validation remain.
 
 ### RTL8852B AP groundwork: host PS/U-APSD owner and AP H2C wire (partial; no native caller)
 
@@ -3808,7 +3859,7 @@ triage above remains separate from implementation.
 |---|---|
 | `additional_operating_channels` | Source implemented for RTL8852B 2.4GHz/20MHz primaries 2..=13 (N52C per-channel signed record, native drain/retune owner, multi-channel scan and noninitial association; §3 "Signed per-channel program"). Native execution, N52C provisioning and physical validation remain; channel14, CSA and noninitial monitor stay refused. |
 | `five_ghz_operation` | RTL8852B supports5GHz, but the retained radio/power recipe and station admission select the channel1 2.4GHz program. Native5GHz RF/BB/power setup, permitted scan/retune and exact signed operating programs remain missing; discovery of the band alone grants no station profile. |
-| `wide_channels` | RTL8852B (20/40/80MHz) MAC/BB/RF/RFK/power width programming, per-width signed N52C records and whole-span admission are implemented (§3 "RTL8852B 40/80MHz operating channels"). Station HT40/VHT80/HE-wide capabilities, association retune, RA bandwidth and wide RX admission remain. RTL8852C 160MHz is the RTL8852C lane; RTL8851B/8852A/8922A are their own chip rows. |
+| `wide_channels` | RTL8852B (20/40/80MHz) MAC/BB/RF/RFK/power width programming, per-width signed N52C records and whole-span admission are implemented (§3 "RTL8852B 40/80MHz operating channels"). Station HT40/VHT80/HE-wide capability on the admitted chandef, retune before authentication, RA `bw_cap`/SGI/VHT branch, wide RX admission and width advertisement are implemented too; native validation pending. RTL8852C 160MHz is the RTL8852C lane; RTL8851B/8852A/8922A are their own chip rows. |
 | `fragmentation` | The admitted RTL8852B native/host/public owner is now implemented in §3 above, including the separate signed full-joint emitter, per-fragment PN and actual terminal ownership, bounded original-source RX cache and threshold control. Source review, release compilation and native/physical acceptance are pending. Other chip/width profiles remain their explicit separate rows. |
 | `monitor_mode` | The admitted RTL8852B receive-only role/native/raw-radiotap owner is implemented in §3 with original source/registration/role/capture epochs, actual RF channel/PHYSTS program and fresh physical transitions. Four source cases and software/native/physical acceptance are pending; no active/injection or other chip/channel/width profile is claimed. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |

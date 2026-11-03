@@ -384,6 +384,11 @@ impl Peer {
 static NEXT_SLEEP: AtomicBool = AtomicBool::new(false);
 /// Signed-admitted primaries for the next DriverModel (0: channel1 only).
 static NEXT_CHANNELS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Signed-admitted 40/80MHz profiles for the next DriverModel (none).
+static NEXT_WIDE: IrqSafeSpinLock<Vec<crate::rtw89::operating_channel::Profile>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// HT elements the next HT harness AP advertises instead of `HT_IES`.
+static NEXT_HT: IrqSafeSpinLock<Option<Vec<u8>>> = IrqSafeSpinLock::new(None);
 struct DriverModel {
     controller: crate::rtw89::station_control::Controller,
     control: crate::rtw89::station_control::tests::Model,
@@ -411,6 +416,9 @@ struct DriverModel {
     /// Admitted primaries mask and every native retune actually requested.
     channels: u64,
     retunes: Vec<u8>,
+    /// Admitted wide profiles and every wide retune actually requested.
+    wide: Vec<crate::rtw89::operating_channel::Profile>,
+    wide_retunes: Vec<crate::rtw89::operating_channel::Profile>,
     /// Associated (CSA) channel switches requested of the native owner.
     switches: Vec<u8>,
     /// Host policy snapshot reported to the station (passive-only channels).
@@ -476,6 +484,8 @@ impl DriverModel {
             reclaimed: None,
             channels: NEXT_CHANNELS.swap(0, Ordering::AcqRel) | (1 << 1),
             retunes: Vec::new(),
+            wide: core::mem::take(&mut *NEXT_WIDE.lock()),
+            wide_retunes: Vec::new(),
             switches: Vec::new(),
             regulatory: NEXT_REGULATORY.lock().take(),
             passive_grants: Vec::new(),
@@ -546,6 +556,31 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         }
         self.retunes.push(primary);
         Ok(self.retunes.len() as u32 + 1)
+    }
+    fn station_wide_channels(
+        &mut self,
+    ) -> Result<Vec<crate::rtw89::operating_channel::Profile>, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wide.clone())
+    }
+    async fn station_retune_wide(
+        &mut self,
+        profile: crate::rtw89::operating_channel::Profile,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if !self.wide.contains(&profile) {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_some_and(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        // As `Native::retune_full_radio_to`: RX follows the programmed width.
+        if let Some(core) = self.core.as_mut() {
+            core.set_operating_width(profile.width() as u8, profile.is_5ghz());
+        }
+        self.wide_retunes.push(profile);
+        Ok(self.wide_retunes.len() as u32 + 1000)
     }
     /// Associated channel switch model: same refusals as the native owner
     /// (`retune_full_radio(.., linked = true)`), peer retained.
@@ -723,6 +758,24 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         }
         self.controller
             .configure_ra(&mut self.control, rates, ht, he, admission)
+            .await
+    }
+    async fn station_configure_ra_wide(
+        &mut self,
+        rates: u16,
+        ht: crate::rtw89::station_control::HtRa,
+        he: Option<crate::rtw89::station_control::HeRa>,
+        wide: crate::rtw89::station_control::WideRa,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        if !self.station_firmware_ra_allowed()?
+            || !self.ht
+            || he.is_some() && !self.station_he_allowed()?
+        {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .configure_ra_wide(&mut self.control, rates, ht, he, wide, admission)
             .await
     }
     fn station_qos_all_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
@@ -1100,8 +1153,9 @@ impl Harness {
                 beacon.extend_from_slice(&WMM);
             }
             if ht {
-                beacon.extend_from_slice(&HT_IES);
-                peer.lock().ht = Some(HT_IES.to_vec());
+                let ies = NEXT_HT.lock().take().unwrap_or_else(|| HT_IES.to_vec());
+                beacon.extend_from_slice(&ies);
+                peer.lock().ht = Some(ies);
             }
             if let Some((_, ies)) = he {
                 beacon.extend_from_slice(ies);
@@ -3447,4 +3501,62 @@ fn smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux() -> TestR
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux
+);
+
+fn smoke_rtw8852b_ht40_admitted_chandef_advertised_retuned_and_ra_bw40() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    let Some(plus) = crate::rtw89::operating_channel::Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("HT40+ profile missing");
+    };
+    // AP: HT_IES widened to 20/40MHz with SGI40 and secondary above.
+    let mut ht40 = HT_IES.to_vec();
+    ht40[2] |= 0x42;
+    ht40[31] = 0x05;
+    // Without an admitted wide record: 20MHz join, no width advertised.
+    *NEXT_HT.lock() = Some(ht40.clone());
+    let h = Harness::build(false, true, false, Some(&RATES), true);
+    if h.device.phy_capabilities(2400).is_some()
+        || h.device.get_wireless_info().hw_caps.ht_supported
+        || h.join().is_err()
+        || !h.model(|io| io.wide_retunes.is_empty())
+    {
+        return TestResult::Fail("wide capability without an admitted wide record");
+    }
+    drop(h);
+    // Admitted HT40+: advertised, retuned before authentication, RA bw 40.
+    *NEXT_WIDE.lock() = vec![plus];
+    *NEXT_HT.lock() = Some(ht40);
+    let h = Harness::build(false, true, false, Some(&RATES), true);
+    let ht = crate::rtw89::station_control::local_ht40().map(|ht| ht.capability_body());
+    if h.device.phy_capabilities(2400).map(|caps| caps.ht) != ht
+        || h.device.phy_capabilities(5000).is_some()
+        || !h.device.get_wireless_info().hw_caps.ht_supported
+        || h.device.get_wireless_info().hw_caps.vht_supported
+    {
+        return TestResult::Fail("2.4GHz HT40 capability not advertised exactly");
+    }
+    if h.join().is_err() {
+        return TestResult::Fail("HT40 association failed");
+    }
+    if h.model(|io| io.wide_retunes.clone()) != vec![plus] {
+        return TestResult::Fail("station did not retune to the admitted HT40+ chandef");
+    }
+    // CCK|OFDM|HT, BW_CAP 40, SGI40 and LDPC; mask as HT20.
+    let mut expected = [0u8; 16];
+    expected[..4].copy_from_slice(&0x0070_004eu32.to_le_bytes());
+    expected[4..8].copy_from_slice(&0x000f_f015u32.to_le_bytes());
+    let commands = h.model(|io| io.control.packets().to_vec());
+    if commands
+        .iter()
+        .filter(|p| p.len() == 24 && p[8..] == expected)
+        .count()
+        != 1
+    {
+        return TestResult::Fail("HT40 RA_MACIDCFG H2C missing or differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/rates",
+    smoke_rtw8852b_ht40_admitted_chandef_advertised_retuned_and_ra_bw40
 );
