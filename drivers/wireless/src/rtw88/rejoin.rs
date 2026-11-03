@@ -30,7 +30,7 @@ impl Pending {
             _ => return Err(Error::Wireless(WirelessError::NotSupported)),
         };
         // The rebound interface admits only signed per-channel primaries.
-        if super::channel_policy::frequency(request.channel.min(255) as u8).map(u32::from)
+        if super::channel_policy::any_frequency(request.channel.min(255) as u8).map(u32::from)
             != Some(request.frequency_mhz)
             || request.ssid.is_empty()
             || request.ssid.len() > 32

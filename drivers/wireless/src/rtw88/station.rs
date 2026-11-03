@@ -593,7 +593,12 @@ impl State {
         self.decline = None;
         self.wmm = None;
         self.wmm_requested = false;
-        self.data_profile = super::packet_format::DataProfile::LEGACY;
+        // The base profile of the band the station is tuned to.
+        self.data_profile = if super::band5::primary(self.channel) {
+            super::packet_format::DataProfile::LEGACY5
+        } else {
+            super::packet_format::DataProfile::LEGACY
+        };
         self.coding = None;
         self.coding_restore = false;
         self.fallback = None;
@@ -723,7 +728,7 @@ impl State {
         let Ok(candidate) = observed else {
             return;
         };
-        if candidate.basic_rates & 1 == 0 {
+        if !super::channel_policy::base_rate_ok(self.channel, candidate.basic_rates) {
             return;
         }
         if self
@@ -1402,10 +1407,9 @@ impl State {
     ) -> Result<Vec<ObservedBss>, Error> {
         if !(1..=1024).contains(&dwell_ms)
             || probes.len() > 4
-            || channels.len() > usize::from(super::channel_policy::LAST)
-            || channels
-                .iter()
-                .any(|c| super::channel_policy::group(*c).is_none())
+            || channels.len()
+                > usize::from(super::channel_policy::LAST) + super::channel_policy::PRIMARIES5.len()
+            || channels.iter().any(|c| !super::channel_policy::tunable(*c))
         {
             return Err(Error::Profile);
         }
@@ -1461,6 +1465,15 @@ impl State {
     ) -> Result<Vec<ObservedBss>, Error> {
         let home = self.channel;
         if channels.is_empty() || channels == [home] {
+            if super::band5::primary(home) {
+                // The 5GHz preq carries the OFDM rate set and no DS element.
+                let mut tuned = Vec::new();
+                for probe in probes {
+                    tuned
+                        .push(super::channel_policy::probe_for(probe, home).ok_or(Error::Profile)?);
+                }
+                return self.scan_inner(io, dwell_ms, &tuned).await;
+            }
             return self.scan_inner(io, dwell_ms, probes).await;
         }
         let mut result = Ok(Vec::new());
@@ -1638,7 +1651,7 @@ impl State {
             && self.power_tracking.is_none()
             && self.ht40.is_none();
         let channel = ie.channel.ok_or(Error::PeerLost)?;
-        if !carried || super::channel_policy::group(channel).is_none() {
+        if !carried || !super::channel_policy::tunable(channel) {
             return Err(Error::PeerLost);
         }
         let grant = if channel == 1 {
@@ -1721,8 +1734,8 @@ impl State {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if super::channel_policy::group(candidate.bss.channel).is_none()
-            || candidate.basic_rates & 1 == 0
+        if !super::channel_policy::tunable(candidate.bss.channel)
+            || !super::channel_policy::base_rate_ok(candidate.bss.channel, candidate.basic_rates)
         {
             return Err(Error::Profile);
         }
@@ -1760,7 +1773,13 @@ impl State {
         };
         let extension = io
             .station_extension()?
-            .filter(|g| candidate.basic_rates & !g.rates() == 0 && g.channel() == self.channel);
+            // On 5GHz only the base OFDM6 profile is admitted: every
+            // continuation program is qualified over a CCK1 base.
+            .filter(|g| {
+                !super::band5::primary(self.channel)
+                    && candidate.basic_rates & !g.rates() == 0
+                    && g.channel() == self.channel
+            });
         let proposed = match &extension {
             Some(g)
                 if g.wmm()

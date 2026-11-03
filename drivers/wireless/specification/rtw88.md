@@ -2567,9 +2567,24 @@ runs the full cross-band `set_channel20` and restores RRSR 0x1f.
 (`LEGACY5`/`LEGACY`) when the band changes. Written, unexecuted:
 `smoke_rtw8821ce_channel5_ofdm_txagc_and_rrsr`.
 
-Remaining for the row: station scan/association/BSS cache/CSA on 5GHz,
-5GHz HT, and DFS (DFS rules stay refused: no shared beacon-hint/DFS owner
-has landed).
+Station band handling: admitted primaries are published as a 64-bit mask
+(bit N = 2.4GHz channel N, bit 16+i = `PRIMARIES5[i]`) and reported as a
+2400 and (when nonempty) a 5000 `WirelessBand`. `scan::plan` accepts 5GHz
+primary frequencies/numbers; `channel_policy::probe_for` rebuilds a preq
+for a 5GHz channel like `ieee80211_put_preq_ies_band` (OFDM Supported
+Rates, no Extended Supported Rates, no DS Parameter Set), also for a
+home-channel 5GHz scan. BSS cache and association require the band's base
+rate as basic (`base_rate_ok`: CCK1 on 2.4GHz; OFDM6 and no CCK on 5GHz).
+BssInfo, associate and rejoin map frequencies with `any_frequency`. ECSA
+follows the 20MHz global classes 81, 115, 124 and 125 only. On 5GHz no
+continuation program (extension/WMM/HT/BA/...) is bound: they are all
+qualified over a CCK1 base, so the station runs the OFDM6 base profile;
+`Gate::allows_profile` refuses a profile whose band differs from the
+committed primary. PHY-status channel bytes are compared by number on both
+bands. Written, unexecuted: `smoke_rtw88_band5_station_scan_csa_and_probe`.
+
+Remaining for the row: 5GHz HT20/HT40 (needs 5GHz-qualified continuation
+records), and DFS primaries (refused by `plain_rule`).
 
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station

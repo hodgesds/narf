@@ -809,6 +809,10 @@ impl Gate {
         }
     }
     pub(super) fn allows_profile(&self, p: super::packet_format::DataProfile) -> bool {
+        // The profile's band is the committed primary's band.
+        if p.band5 != super::band5::primary(self.channel()) {
+            return false;
+        }
         if (p.ldpc || p.stbc)
             && !self.coding.as_ref().is_some_and(|g| {
                 super::coding::bounds(self.did(), g.payload())

@@ -661,3 +661,55 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8821ce_channel5_ofdm_txagc_and_rrsr
 );
+
+fn smoke_rtw88_band5_station_scan_csa_and_probe() -> TestResult {
+    // ieee80211_put_preq_ies_band: 5GHz OFDM rates, no ESR, no DS element.
+    let mut probe = vec![0x40, 0, 0, 0];
+    probe.extend_from_slice(&[255; 6]);
+    probe.extend_from_slice(&[2, 1, 2, 3, 4, 5]);
+    probe.extend_from_slice(&[255; 6]);
+    probe.extend_from_slice(&[
+        0, 0, 0, 1, b'x', 1, 2, 0x02, 0x04, 50, 1, 0x6c, 3, 1, 1, 221, 3, 1, 2, 3,
+    ]);
+    let five = channel_policy::probe_for(&probe, 36);
+    let mut expect = probe[..27].to_vec();
+    expect.extend_from_slice(&[
+        1, 8, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c, 221, 3, 1, 2, 3,
+    ]);
+    if five.as_deref() != Some(&expect[..])
+        || channel_policy::probe_for(&probe, 6).map(|p| p[p.len() - 6]) != Some(6)
+        || channel_policy::probe_for(&probe, 38).is_some()
+    {
+        return TestResult::Fail("5GHz preq not rebuilt for the band");
+    }
+    // ECSA 20MHz classes 81/115/124/125; DFS classes 118/121 are not followed.
+    for (class, ch, ok) in [
+        (81, 6, true),
+        (115, 44, true),
+        (124, 161, true),
+        (125, 177, true),
+        (124, 165, false),
+        (115, 52, false),
+        (118, 52, false),
+        (121, 100, false),
+    ] {
+        let ie = channel_policy::switch_ie(&[60, 4, 1, class, ch, 5]);
+        if ie.map(|i| i.channel) != Some(ok.then_some(ch)) {
+            return TestResult::Fail("ECSA operating class mapping differs");
+        }
+    }
+    if channel_policy::any_frequency(149) != Some(5745)
+        || channel_policy::any_frequency(14).is_some()
+        || !channel_policy::base_rate_ok(36, 0x150)
+        || channel_policy::base_rate_ok(36, 0x151)
+        || channel_policy::base_rate_ok(36, 0x140)
+        || !channel_policy::base_rate_ok(1, 0x0f)
+    {
+        return TestResult::Fail("band-aware frequency/base-rate admission differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_band5_station_scan_csa_and_probe
+);

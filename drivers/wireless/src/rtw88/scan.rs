@@ -32,7 +32,7 @@ pub(super) struct Plan {
     pub probes: Vec<Vec<u8>>,
     /// Random scan SA for an active request (`rtw_core_scan_start`).
     pub address: Option<[u8; 6]>,
-    /// Requested 2.4GHz primaries in request order, deduplicated. Empty
+    /// Requested 2.4GHz/5GHz primaries in request order, deduplicated. Empty
     /// means every admitted primary. Admission against the signed
     /// per-channel records happens at the interface.
     pub channels: Vec<u8>,
@@ -92,8 +92,20 @@ pub(super) fn probe(own: [u8; 6], ssid: &[u8], extra: &[u8]) -> Result<Vec<u8>, 
     Ok(frame)
 }
 
-/// Admit one 2.4GHz/20MHz scan request (channels 1..=13; frequencies are
-/// authoritative). Passive requests keep the original receive-only
+/// Channel number of an authoritative 20MHz primary frequency on either
+/// band (2412..=2472 or a 5GHz `band5::primary`).
+fn channel_of(frequency: u32) -> Option<u8> {
+    let channel = match frequency {
+        2412..=2472 if (frequency - 2407) % 5 == 0 => (frequency - 2407) / 5,
+        5005..=6275 if frequency % 5 == 0 => (frequency - 5000) / 5,
+        _ => return None,
+    } as u8;
+    super::channel_policy::tunable(channel).then_some(channel)
+}
+
+/// Admit one 20MHz scan request (2.4GHz channels 1..=13 or 5GHz primaries;
+/// frequencies are authoritative). 5GHz probes are rebuilt for the band by
+/// `channel_policy::probe_for` at each channel. Passive requests keep the original receive-only
 /// behaviour; active requests add the software-scan probes.
 pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, WirelessError> {
     if request
@@ -105,8 +117,11 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
         || request
             .frequencies_mhz
             .iter()
-            .any(|f| !(2412..=2472).contains(f) || (f - 2407) % 5 != 0)
-        || request.channels.iter().any(|ch| !(1..=13).contains(ch))
+            .any(|f| channel_of(*f).is_none())
+        || request
+            .channels
+            .iter()
+            .any(|ch| u8::try_from(*ch).map_or(true, |c| !super::channel_policy::tunable(c)))
         || request.active && request.ssids.len() > usize::from(MAX_SSIDS)
         || request.ssids.len() > 32
         || request.ssids.iter().any(|s| s.len() > 32)
@@ -123,7 +138,7 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
     for channel in request
         .frequencies_mhz
         .iter()
-        .map(|f| ((f - 2407) / 5) as u8)
+        .filter_map(|f| channel_of(*f))
         .chain(request.channels.iter().map(|c| *c as u8))
     {
         if !channels.contains(&channel) {

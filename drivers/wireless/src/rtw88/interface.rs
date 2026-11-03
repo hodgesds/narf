@@ -59,9 +59,10 @@ pub(super) struct Device<I: Io> {
     rts: AtomicU32,
     bssid: AtomicU64,
     ht_capability: IrqSafeSpinLock<Option<[u8; 26]>>,
-    /// Admitted 2.4GHz primaries (bit N = channel N): channel 1 plus every
-    /// channel with a provisioned signed N2xO record over the current base.
-    channels: core::sync::atomic::AtomicU16,
+    /// Admitted primaries: bit N = 2.4GHz channel N (channel 1 plus every
+    /// channel with a provisioned signed N2xO record over the current base),
+    /// bit 16 + i = 5GHz `channel_policy::PRIMARIES5[i]` with such a record.
+    channels: AtomicU64,
     receive_generation: AtomicU64,
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
@@ -149,7 +150,7 @@ impl<I: Io + 'static> Device<I> {
             rts: AtomicU32::new(u32::MAX),
             bssid: AtomicU64::new(0),
             ht_capability: IrqSafeSpinLock::new(None),
-            channels: core::sync::atomic::AtomicU16::new(1 << 1),
+            channels: AtomicU64::new(1 << 1),
             receive_generation: AtomicU64::new(0),
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
@@ -402,10 +403,19 @@ impl<I: Io + 'static> Device<I> {
         attempt.armed = false;
         Ok(())
     }
+    /// Admitted primaries, 2.4GHz first then 5GHz (channel numbers do not
+    /// overlap between the two bands).
     fn admitted_channels(&self) -> Vec<u32> {
         let mask = self.channels.load(Ordering::Acquire);
         (1..=u32::from(super::channel_policy::LAST))
             .filter(|c| mask & (1 << c) != 0)
+            .chain(
+                super::channel_policy::PRIMARIES5
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << (16 + i)) != 0)
+                    .map(|(_, c)| u32::from(c)),
+            )
             .collect()
     }
     fn link(&self, peer: Option<[u8; 6]>, port: bool) {
@@ -854,10 +864,23 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.local,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: self.admitted_channels(),
-            }],
+            bands: {
+                let (two, five): (Vec<u32>, Vec<u32>) = self
+                    .admitted_channels()
+                    .into_iter()
+                    .partition(|c| *c <= u32::from(super::channel_policy::LAST));
+                let mut bands = vec![WirelessBand {
+                    freq_mhz: 2400,
+                    channels: two,
+                }];
+                if !five.is_empty() {
+                    bands.push(WirelessBand {
+                        freq_mhz: 5000,
+                        channels: five,
+                    });
+                }
+                bands
+            },
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht_capability.lock().is_some(),
@@ -927,7 +950,8 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             })
             .map(|c| BssInfo {
                 bssid: c.bss.bssid,
-                frequency_mhz: super::channel_policy::frequency(c.bss.channel).map_or(0, u32::from),
+                frequency_mhz: super::channel_policy::any_frequency(c.bss.channel)
+                    .map_or(0, u32::from),
                 channel: u32::from(c.bss.channel),
                 ssid: c.bss.ssid,
                 rssi: i8::MIN,
@@ -944,7 +968,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
         if !self.admitted_channels().contains(&request.channel)
-            || super::channel_policy::frequency(request.channel as u8).map(u32::from)
+            || super::channel_policy::any_frequency(request.channel as u8).map(u32::from)
                 != Some(request.frequency_mhz)
         {
             return Err(WirelessError::NotSupported);

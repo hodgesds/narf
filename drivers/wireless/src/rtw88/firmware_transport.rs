@@ -857,13 +857,19 @@ impl<I: Io> Owner<I> {
             .await
     }
     /// Noninitial primaries admitted by a provisioned signed N2xO record
-    /// over the current base (bit N = channel N; bit 1 always set).
-    pub(super) fn station_admitted_channels(&mut self) -> u16 {
+    /// over the current base: bit N = 2.4GHz channel N (bit 1 always set),
+    /// bit 16 + i = 5GHz primary `channel_policy::PRIMARIES5[i]`.
+    pub(super) fn station_admitted_channels(&mut self) -> u64 {
         let mut mask = 1 << 1;
         if self.station.is_some() {
             for channel in 2..=super::channel_policy::LAST {
                 if matches!(self.io.station_channel_grant(channel), Ok(Some(_))) {
                     mask |= 1 << channel;
+                }
+            }
+            for (i, channel) in super::channel_policy::PRIMARIES5.into_iter().enumerate() {
+                if matches!(self.io.station_channel_grant(channel), Ok(Some(_))) {
+                    mask |= 1 << (16 + i);
                 }
             }
         }

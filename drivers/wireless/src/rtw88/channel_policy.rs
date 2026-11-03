@@ -75,6 +75,32 @@ pub(super) const fn frequency(channel: u8) -> Option<u16> {
     }
 }
 
+/// Center frequency of an admissible 20MHz primary on either band
+/// (2.4GHz 1..=13 or a 5GHz `band5::primary`).
+pub(super) fn any_frequency(channel: u8) -> Option<u16> {
+    frequency(channel).or_else(|| {
+        super::band5::primary(channel)
+            .then(|| super::band5::frequency(channel))
+            .flatten()
+    })
+}
+
+/// A 20MHz primary this owner can retune to (2.4GHz 1..=13 or 5GHz).
+pub(super) fn tunable(channel: u8) -> bool {
+    any_frequency(channel).is_some()
+}
+
+/// Base-rate admission of a BSS on `channel`: the band's lowest mandatory
+/// rate (CCK1 on 2.4GHz, OFDM6 on 5GHz with no CCK) is a basic rate, since
+/// management frames go out at that fixed rate (`rtw_tx_pkt_info_update_rate`).
+pub(super) fn base_rate_ok(channel: u8, basic: u16) -> bool {
+    if super::band5::primary(channel) {
+        basic & 15 == 0 && basic & (1 << 4) != 0
+    } else {
+        basic & 1 != 0
+    }
+}
+
 /// `rtw8822c_set_channel_bb` REG_SCOTRK (0xc30[11:0]) for a 2.4GHz primary.
 pub(super) const fn scotrk(channel: u8) -> u32 {
     match channel {
@@ -439,9 +465,10 @@ pub(super) struct Switch {
     pub(super) block: bool,
 }
 
-/// Parsed Channel Switch Announcement for a 2.4GHz/20MHz BSS. `channel` is
-/// None when the ECSA operating class is not 2.4GHz 20MHz (class 81), which
-/// mac80211 treats as a switch this station cannot follow.
+/// Parsed Channel Switch Announcement for a 20MHz BSS. `channel` is None
+/// when the ECSA operating class is not a non-DFS 20MHz class this owner
+/// follows (81: 2.4GHz 1..=13; 115: 36..=48; 124: 149..=161; 125:
+/// 149..=177, IEEE 802.11 Annex E Table E-4), or the channel is not in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SwitchIe {
     pub(super) block: bool,
@@ -469,7 +496,7 @@ pub(super) fn switch_ie(ies: &[u8]) -> Option<SwitchIe> {
             (60, [mode, class, channel, count]) => {
                 ecsa = Some(SwitchIe {
                     block: *mode != 0,
-                    channel: (*class == 81).then_some(*channel),
+                    channel: class_channel(*class, *channel),
                     count: *count,
                 })
             }
@@ -480,9 +507,48 @@ pub(super) fn switch_ie(ies: &[u8]) -> Option<SwitchIe> {
     ecsa.or(csa)
 }
 
-/// Rewrite the DS Parameter Set of one software-scan Probe Request for
-/// `channel` (`ieee80211_build_preq_ies` uses the scanned channel).
+/// Primary `channel` of a 20MHz global operating class this owner follows.
+fn class_channel(class: u8, channel: u8) -> Option<u8> {
+    let ok = match class {
+        81 => (1..=13).contains(&channel),
+        115 => matches!(channel, 36 | 40 | 44 | 48),
+        124 => matches!(channel, 149 | 153 | 157 | 161),
+        125 => matches!(channel, 149 | 153 | 157 | 161 | 165 | 169 | 173 | 177),
+        _ => false,
+    };
+    ok.then_some(channel)
+}
+
+/// mac80211 `ieee80211_put_srates_elem` for the 5GHz band in a preq: the
+/// eight OFDM rates, no basic flags, no Extended Supported Rates.
+const RATES5: [u8; 8] = [0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
+
+/// Rewrite one software-scan Probe Request for `channel`
+/// (`ieee80211_put_preq_ies_band` builds it for the scanned band): on
+/// 2.4GHz the DS Parameter Set names the channel; on 5GHz the Supported
+/// Rates are the OFDM set, and Extended Supported Rates and the DS
+/// Parameter Set (2.4GHz only) are dropped. Other elements keep their order.
 pub(super) fn probe_for(probe: &[u8], channel: u8) -> Option<alloc::vec::Vec<u8>> {
+    if super::band5::primary(channel) {
+        let mut out = probe.get(..24)?.to_vec();
+        let mut at = 24;
+        let mut rates = false;
+        while at < probe.len() {
+            let len = usize::from(*probe.get(at + 1)?);
+            let element = probe.get(at..at + 2 + len)?;
+            match element[0] {
+                1 => {
+                    out.extend_from_slice(&[1, RATES5.len() as u8]);
+                    out.extend_from_slice(&RATES5);
+                    rates = true;
+                }
+                3 | 50 => {}
+                _ => out.extend_from_slice(element),
+            }
+            at += 2 + len;
+        }
+        return rates.then_some(out);
+    }
     frequency(channel)?;
     let mut out = probe.to_vec();
     let mut at = 24;
