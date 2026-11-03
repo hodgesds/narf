@@ -9,6 +9,7 @@ use narf_bus::{BusAddr, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
+mod admission;
 mod calibration;
 mod chips;
 mod channel_width;

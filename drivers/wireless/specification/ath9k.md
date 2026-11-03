@@ -1331,9 +1331,34 @@ middle/last descriptors are untouched, masks outside 1..=3 are refused and
 a one-chain mask leaves the AR9285 encoding byte-identical. Smoke (written,
 not executed): `smoke_ath9k_two_chain_descriptor_chain_selection`.
 
-Still missing before `0x002d`/`0x002e` can be matched: applying
-`select_chains` in the packet owner, signed board records naming the AR9287
-devices, and the probe/station wiring. No AR9287 device is matched.
+`admission.rs` defines the AR9287 signed board admission record `N87A` v1
+(format only; no record or board value is supplied or inferred). `Facts`
+binds vendor/device (`0x002d`/`0x002e`), subsystem IDs, EEPROM version,
+`AR_SREV` version/revision, RX/TX chain masks, MAC, the complete 726-byte
+factory map, the INI write count, the 20 MHz primary and the factory
+open-loop power plan at the 40 half-dB maximum into a SHA-256 request
+identity, named `ath9k/ar9287-admit-v1-ch<N>-<mac>.bin`. A 128-byte record
+must be signer-verified and carry `N87A`, version 1, length 128, the PCI
+vendor/device, that identity, MAC, `[channel, 20, rx mask, tx mask]`, the
+measured antenna gain (half-dBi, at least the factory
+`max(antennaGainCh[0], antennaGainCh[1])`, at most 128) and the qualified
+`powerLimit` ceiling (half-dBm, at most 40), with every reserved byte zero.
+`Grant::ceiling` removes the measured antenna gain above the factory value
+from the host limit and bounds it by the record ceiling; `Grant::invoke`
+re-proves the record capability before each use. A missing, unsigned,
+foreign or out-of-envelope record leaves the device unadmitted. Smokes
+(written, not executed):
+`smoke_ath9k_ar9287_admission_record_binds_device_map_and_envelope`,
+`smoke_ath9k_ar9287_unprovisioned_or_foreign_record_stays_unadmitted`.
+
+Still missing before `0x002d`/`0x002e` can be matched: the probe
+(`identify_chip` → `phy::ar9287::prepare` → `admission::Source::Registered`
+→ `calibration::ar9287` under `Grant::ceiling`), and the native station
+wiring — the MAC/packet/station/interface owners are typed on the 4k map
+and the AR9285 calibration `Report`, so they need a chip-generic profile
+(AR9287 `Clock::AsyncFifo`/`async_fifo_pcu`/`dma_txbuf(0x700)`,
+`select_chains`, two-chain factory MAC/mask checks). No AR9287 device is
+matched.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
