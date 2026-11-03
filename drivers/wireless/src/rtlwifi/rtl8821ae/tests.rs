@@ -1025,3 +1025,122 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_band_channel_bw20_txagc_order
 );
+
+// ── Path-A IQK (`_rtl8821ae_phy_iq_calibrate`) ───────────────────────────
+
+fn iqk_model(d00: u32) -> RegFake {
+    let mut regs = vec![0u8; 0x1000];
+    for (i, at) in iqk::MACBB_REGS
+        .iter()
+        .chain(iqk::AFE_REGS.iter())
+        .enumerate()
+    {
+        let at = usize::from(*at);
+        regs[at..at + 4].copy_from_slice(&(0x5a00_0000u32 | i as u32).to_le_bytes());
+    }
+    regs[0xd00..0xd04].copy_from_slice(&d00.to_le_bytes());
+    RegFake(IrqSafeSpinLock::new((regs, Vec::new())))
+}
+
+fn smoke_rtl8821ae_iqk_fill_and_full_restore() -> TestResult {
+    // Every one-shot reports result 0x7f0 (= -16 as signed 11 bits), RX ok.
+    let io = iqk_model(0x7f0 << 16);
+    let report = match narf_scheduler::block_on(iqk::calibrate(&io, false)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IQK failed on model"),
+    };
+    if report.tx_rounds != 10
+        || report.rx_rounds != 10
+        || report.tx != (iqk::Fill::Matched { x: -16, y: -16 })
+        || report.rx != (iqk::Fill::Matched { x: -16, y: -16 })
+    {
+        return TestResult::Fail("IQK rounds/averages");
+    }
+    let g = io.0.lock();
+    let (r, trace) = (&g.0, &g.1);
+    let r32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+    for (i, at) in iqk::MACBB_REGS
+        .iter()
+        .chain(iqk::AFE_REGS.iter())
+        .enumerate()
+    {
+        if r32(usize::from(*at)) != 0x5a00_0000 | i as u32 {
+            return TestResult::Fail("backed-up MAC/BB/AFE register not restored");
+        }
+    }
+    if !trace.contains(&(4, 0x82c, 0x5a00_000a)) {
+        return TestResult::Fail("0x82c (11th MAC/BB entry) not restored");
+    }
+    if trace.iter().any(|w| w.1 == 0) {
+        return TestResult::Fail("register 0 must never be written");
+    }
+    if !trace.contains(&(1, 0x522, 0x3f)) || !trace.contains(&(1, 0x808, 0)) {
+        return TestResult::Fail("configure_mac TX pause / RX antenna off");
+    }
+    if r32(0xcd4) & 0x7ff != 0x7f0 || r32(0xccc) & 0x7ff != 0x7f0 {
+        return TestResult::Fail("TX IQC fill");
+    }
+    if r32(0xc10) & 0x3ff != 0x3f8 || (r32(0xc10) >> 16) & 0x3ff != 0x3f8 {
+        return TestResult::Fail("RX IQC fill (x>>1, y>>1)");
+    }
+    // LOK + TX + RX-mode TXK + RX one-shot per round: 4 x 2 writes x 10.
+    if trace.iter().filter(|w| w.1 == 0x980).count() != 80 {
+        return TestResult::Fail("one-shot count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_iqk_fill_and_full_restore
+);
+
+fn smoke_rtl8821ae_iqk_rx_fail_retries_and_untouched() -> TestResult {
+    let io = iqk_model(1 << 11 | 0x10 << 16);
+    let report = match narf_scheduler::block_on(iqk::calibrate(&io, false)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IQK failed on model"),
+    };
+    if report.rx_rounds != 0
+        || report.rx != iqk::Fill::Untouched
+        || report.tx != (iqk::Fill::Matched { x: 0x10, y: 0x10 })
+    {
+        return TestResult::Fail("RX failure must leave RX IQC untouched");
+    }
+    let g = io.0.lock();
+    // 10 rounds x (LOK + TX + RXK1 + 10 RX retries).
+    if g.1.iter().filter(|w| w.1 == 0x980).count() != 10 * 13 * 2 {
+        return TestResult::Fail("RX retry count");
+    }
+    let c10 = u32::from_le_bytes(g.0[0xc10..0xc14].try_into().unwrap());
+    if c10 & 0x3ff != 0x100 || (c10 >> 16) & 0x3ff != 0 {
+        return TestResult::Fail("RX failure identity write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_iqk_rx_fail_retries_and_untouched
+);
+
+fn smoke_rtl8821ae_iqk_linked_interval_and_agreement() -> TestResult {
+    let mut li = iqk::LinkedInterval::default();
+    let fired: Vec<bool> = [true, true, true, true, false, true, true]
+        .iter()
+        .map(|l| li.tick(*l))
+        .collect();
+    if fired != [false, true, false, false, false, false, true] {
+        return TestResult::Fail("IQK must fire on the second linked period only");
+    }
+    if iqk::agree(&[(0, 0), (10, 10), (12, 8)], 3) != Some((11, 9))
+        || iqk::agree(&[(0, 0), (3, 0)], 3).is_some()
+        || iqk::agree(&[(0, 0), (3, 0)], 4) != Some((1, 0))
+        || iqk::agree(&[(-5, 0), (-6, 0)], 3) != Some((-5, 0))
+    {
+        return TestResult::Fail("pairwise agreement / truncating average");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_iqk_linked_interval_and_agreement
+);

@@ -31,6 +31,8 @@
 //!   power-by-rate, regulatory-limit and TX power index arithmetic, the
 //!   signed per-board measured envelope that admits each programmed TXAGC
 //!   index, and band/channel/20 MHz/TXAGC register programming.
+//! - [`iqk`] — path-A IQ calibration (`_rtl8821ae_phy_iq_calibrate`) and
+//!   the DM linked-interval trigger (`rtl8821ae_dm_iq_calibrate`).
 //! - [`c2h`] — C2H packet parsing (`rtl_c2h_content_parsing`): TX reports
 //!   (`rtl_tx_report_handler` V1) and RA reports
 //!   (`rtl8821ae_c2h_ra_report_handler`).
@@ -42,6 +44,7 @@ pub mod channel;
 pub mod envelope;
 pub mod fw;
 pub mod headerfile;
+pub mod iqk;
 pub mod llt;
 pub mod mac;
 pub mod phy;

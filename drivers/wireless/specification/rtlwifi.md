@@ -1533,8 +1533,40 @@ chain below is composed.
   path-B RF bandwidth write. LCK: `rtl8821ae_phy_lc_calibrate` is empty in
   Linux and `hw_init` comments it out, so there is no 8821AE LCK effect.
 
-Remaining for the `rtl8821ae` chip row: IQK (`rtl8821ae_phy_iq_calibrate`,
-run by Linux DM two watchdog periods after link), H2C (media status, RA
+- `iqk` — path-A IQ calibration, `Prepared::calibrate_rtl8821ae_iqk`
+  (ChannelConfigured, MacConfigured or Running, admitted permission held):
+  `phy.c::_rtl8821ae_phy_iq_calibrate` — MAC/BB, AFE and RF-A backups,
+  `_rtl8821ae_iqk_configure_mac` (`0x522 = 0x3f` TX pause, `0x550[11,3]`,
+  RX antenna off, CCA off), ten `_rtl8821ae_iqk_tx` rounds (LOK with
+  RF `0x58` load, TX IQK, RX-mode TXK, RX IQK with up to ten retries on
+  `0xd00[11]`), the first pairwise-agreeing average (TX ±3, RX ±4,
+  sign-extended 11-bit samples, C truncating division) filled through
+  `_rtl8821ae_iqk_{tx,rx}_fill_iqc` (identity `0x200,0` when no pair
+  agrees; RX left untouched when no RX round passed), then RF/AFE/MACBB
+  restore — also attempted when a round fails with an I/O error, which
+  fails the owner. `iqk::LinkedInterval::tick` is
+  `dm.c::rtl8821ae_dm_iq_calibrate`: IQK fires once, on the second DM
+  watchdog period with `link_state >= LINKED`; losing the link re-arms it.
+  Divergences from Linux, deliberate: (1) backup sets are the full intended
+  lists — all 11 MAC/BB registers including `0x82c` and the 12 listed AFE
+  registers; the helper-scope `MACBB_REG_NUM 10`/`AFE_REG_NUM 14` defines
+  are never applied to these lists and no register-0 access is made
+  (restoring more state than a short count would is safe); (2) Linux's
+  never-used path-B RF backup read is omitted on this 1T1R chip; (3) Linux
+  gates TX one-shots with `~iqk_ready`/`~tx_fail` on 0/1 values, which is
+  always true, so every TX shot is accepted on its first attempt — kept as
+  the hardware-validated behaviour (status reads still issued); the RX
+  `rx_fail == 0` check is real; (4) Linux indexes RX samples by round but
+  averages `0..rx_average`, reading uninitialised slots after a failed RX
+  round — here only successful RX samples, in round order, are compared.
+  Only the 20 MHz branch exists (the owner never programs 40/80 MHz), so
+  the 80 MHz VDF branch is not implemented. Tests
+  `smoke_rtl8821ae_iqk_fill_and_full_restore`,
+  `smoke_rtl8821ae_iqk_rx_fail_retries_and_untouched`,
+  `smoke_rtl8821ae_iqk_linked_interval_and_agreement` (written, unexecuted).
+
+Remaining for the `rtl8821ae` chip row: calling IQK from the station owner
+on `LinkedInterval` (the owner does not exist yet), H2C (media status, RA
 mask, PS), interrupt delivery, the native packet/station owner and probe
 wiring. Tests in `rtl8821ae/tests.rs` are written and unexecuted.
 

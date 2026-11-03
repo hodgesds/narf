@@ -376,6 +376,29 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.phase = Phase::ChannelConfigured;
         Ok(())
     }
+    /// `rtl8821ae_phy_iq_calibrate` on the admitted 20 MHz channel of this
+    /// retained 8821AE owner (`rtl8821ae/iqk.rs`). The station owner calls it
+    /// when [`super::rtl8821ae::iqk::LinkedInterval::tick`] fires, as Linux DM
+    /// does. All backed-up MAC/BB/AFE/RF state is restored before return; an
+    /// I/O failure fails the owner.
+    pub async fn calibrate_rtl8821ae_iqk(
+        &mut self,
+    ) -> Result<super::rtl8821ae::iqk::Report, Error> {
+        if self.chip != Chip::Rtl8821ae
+            || self.rtl8821ae_power.is_none()
+            || !matches!(
+                self.phase,
+                Phase::ChannelConfigured | Phase::MacConfigured | Phase::Running
+            )
+        {
+            return Err(Error::State);
+        }
+        let report = super::rtl8821ae::iqk::calibrate(&self.io, false).await;
+        if report.is_err() {
+            self.phase = Phase::Failed;
+        }
+        report
+    }
     /// Prepare internal SRAM and masked, inactive native rings. The native
     /// Io validates current PCI authority/BME at each actual access. No helper
     /// here can enable PCI bus mastering or release host/MAC packet gates.
