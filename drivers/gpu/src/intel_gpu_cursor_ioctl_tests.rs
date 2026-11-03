@@ -32,13 +32,19 @@ impl queue::Worker for Worker {
     }
 }
 fn run<F: Future>(future: F) -> F::Output {
+    // Queue::wait_dependencies re-checks fences after a real-time 100us
+    // SleepUntil, so a fixed poll count finishes before that sleep expires on
+    // a fast KVM host. Bound the noop-waker loop by elapsed time instead.
+    let deadline = narf_time::monotonic_ns().saturating_add(1_000_000_000);
     let mut f = Box::pin(future);
-    for _ in 0..256 {
+    loop {
         if let Poll::Ready(r) = f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             return r;
         }
+        if narf_time::monotonic_ns() >= deadline {
+            panic!("cursor worker did not finish")
+        }
     }
-    panic!("cursor worker did not finish")
 }
 #[cfg(target_arch = "x86_64")]
 fn poll_cursor_armed<F: Future>(p: &MockPlatform, mut task: core::pin::Pin<&mut F>) {
