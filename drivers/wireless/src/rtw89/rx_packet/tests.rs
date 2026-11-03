@@ -281,6 +281,7 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
     if phy_status(
         &Descriptor::parse(&ppdu_packet(&short, true, 0)).unwrap(),
         &short,
+        false,
     )
     .is_some()
     {
@@ -291,6 +292,7 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
     if phy_status(
         &Descriptor::parse(&ppdu_packet(&overrun, true, 0)).unwrap(),
         &overrun,
+        false,
     )
     .is_some()
     {
@@ -354,4 +356,30 @@ fn smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux
+);
+fn smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo() -> TestResult {
+    // IE01 w1: FD_CFO [19:8] = -3, PREMB_CFO [31:20] = -5 (S(12,2)).
+    let mut body = vec![0u8; 24];
+    body[0..4].copy_from_slice(&1u32.to_le_bytes());
+    body[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+    let w0 = 11 | (1 << 7) | (5 << 8) | (120 << 24);
+    let mut status = vec![0u8; 40];
+    status[0..4].copy_from_slice(&(w0 as u32).to_le_bytes());
+    status[8..12].copy_from_slice(&1u32.to_le_bytes());
+    status[12..16].copy_from_slice(&((0xffdu32 << 8) | (0xffbu32 << 20)).to_le_bytes());
+    body.extend_from_slice(&status);
+    let mut ofdm = ppdu_packet(&body, true, 0);
+    ofdm[8..12].copy_from_slice(&(4u32 << 16).to_le_bytes()); // OFDM6
+    let descriptor = Descriptor::parse(&ofdm).unwrap();
+    // core.c rtw89_core_parse_phy_status_ie01: cfo_src_fd (B) vs not (C).
+    if phy_status(&descriptor, &body, false) != Some((120, Some(-3)))
+        || phy_status(&descriptor, &body, true) != Some((120, Some(-5)))
+    {
+        return TestResult::Fail("IE01 CFO source does not follow cfo_src_fd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo
 );

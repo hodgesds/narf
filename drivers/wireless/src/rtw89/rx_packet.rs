@@ -174,7 +174,14 @@ const CCK_PKT: u32 = 11;
 /// PHY status header (`rtw89_core_rx_process_phy_ppdu`) and its IE walk
 /// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG` only when
 /// every step Linux checks succeeds, since Linux updates `avg_rssi` only then.
-pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<(u8, Option<i16>)> {
+///
+/// `premb_cfo` selects IE01 `PREMB_CFO` [31:20] instead of `FD_CFO` [19:8]
+/// (core.c `rtw89_core_parse_phy_status_ie01`: RTL8852C `cfo_src_fd` false).
+pub(super) fn phy_status(
+    descriptor: &Descriptor,
+    bytes: &[u8],
+    premb_cfo: bool,
+) -> Option<(u8, Option<i16>)> {
     let mut start = 0;
     if descriptor.mac_info {
         let w0 = word(bytes, 0).ok()?;
@@ -212,10 +219,12 @@ pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<(u8, O
             return None;
         }
         // rtw89_core_parse_phy_status_ie01: OFDM-or-faster PPDUs addressed
-        // to this station carry FD_CFO (cfo_src_fd on B), S(12,2).
+        // to this station carry FD_CFO (cfo_src_fd on B) or PREMB_CFO (C),
+        // S(12,2).
         if kind == 1 && descriptor.rate >= OFDM6 && descriptor.to_self {
             let w1 = word(status, position + 4).ok()?;
-            cfo = Some((((w1 >> 8) & 0xfff) as i16) << 4 >> 4);
+            let shift = if premb_cfo { 20 } else { 8 };
+            cfo = Some((((w1 >> shift) & 0xfff) as i16) << 4 >> 4);
         }
         position += length;
     }
@@ -250,7 +259,8 @@ struct Partial {
 #[derive(Default)]
 pub(super) struct Assembler {
     partial: Option<Partial>,
-    /// RTL8852C RX descriptor bandwidth layout (`AX_RXD_BW_v1_MASK`).
+    /// RTL8852C RX descriptor bandwidth layout (`AX_RXD_BW_v1_MASK`); also
+    /// selects the C IE01 `PREMB_CFO` source (`cfo_src_fd` false).
     bw_v1: bool,
 }
 impl Assembler {
@@ -366,7 +376,7 @@ impl Assembler {
                     Event::Wifi(descriptor, bytes)
                 }
             }
-            1 => match phy_status(&descriptor, &bytes) {
+            1 => match phy_status(&descriptor, &bytes, self.bw_v1) {
                 Some((rssi, cfo)) if descriptor.to_self => Event::PhyStatus(PhyStatus {
                     mac_id: descriptor.mac_id,
                     rssi,

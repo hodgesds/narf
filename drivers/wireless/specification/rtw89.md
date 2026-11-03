@@ -3431,8 +3431,8 @@ non-BE format, ROLE_MAINTAIN, EDCA, MACID_PAUSE without
 `R_AX_PPWRBIT_SETTING`). `ORDINARY_STOP`/`tx_stop_all` use HAXI_DMA_STOP1
 bits that match B (ACH0/CH8/WPDMA; the C `dma_stop` layout). Every B
 companion allowance (`station_{ht,he,ampdu,firmware_ra,amsdu,qos_all,wmm}_allowed`)
-is `Ok(false)` on C, RF tracking is a no-op and track work reports
-`Unsupported` (disabling it). `admitted_channels` on C is the 20MHz profile
+is `Ok(false)` on C and RF tracking is a no-op (track work: see "C track
+work" below). `admitted_channels` on C is the 20MHz profile
 of every 2.4GHz 1..=13 and 5GHz primary with a loaded record that
 `radio_policy_c::Qualification::channel_active` admits (host rule passes
 and no DFS/NO_IR rule over the span), and station retune/CSA go through
@@ -3442,8 +3442,8 @@ and no DFS/NO_IR rule over the span), and station retune/CSA go through
 Known gaps for the `rtl8852c` row: native execution on hardware (no C
 board record exists, so actual admission needs a provisioned board);
 HT/VHT/HE, A-MPDU/BA (C `bacam_num` 8 dynamic BA CAM), firmware RA, WMM,
-LPS, WoW, monitor, AP and C DIG/CFO track work are not implemented for C.
-The C station uses 20MHz only (wide C profiles are reachable
+LPS, WoW, monitor and AP are not implemented for C (C track work covers
+DIG/CFO/EDCCA/IFS-CLM, not `rtw8852c_rfk_track`). The C station uses 20MHz only (wide C profiles are reachable
 only through `retune_channel_c`, not from the station). Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
@@ -3464,6 +3464,30 @@ bytes read back with BIT 0 clear as the disable proof; the rest of
 receipt is not RF/DMA idle or reset authority. B bytes are unchanged.
 Unexecuted case:
 `smoke_rtw8852c_terminal_shutdown_is_disable_bb_rf_then_rf00_rf10_masked_off`.
+
+**C track work (`track::LAYOUT_C`, `Native::station_track_layout`).** The
+station's 2 s `rtw89_track_work` subset now runs on C with the same AX
+algorithms as B (`track.rs`) over the C registers: `rtw8852c_dig_regs`
+(`R_SEG0R_PD` 0x481c with `B_SEG0R_PD_SPATIAL_REUSE_EN_MSK` BIT 29, the
+`_V1` PAGCUGC 0x4c24/0x4c28/0x4ce8/0x4cec), `rtw8852c_edcca_regs`
+(`R_SEG0R_EDCCA_LVL` 0x4840) and `rtw8852c_dcfo_comp`
+(`R_DCFO_COMP_S0_V1` 0x4a40 [13:0], `dcfo_comp_sft` 12); the CCX/IFS-CLM,
+PPDU-status, `R_DCFO` and B-mode CCK-PD registers are common AX, and
+`support_cckpd` is true on every C cut. `track::REGISTERS_C` is the C
+allowlist `track_port` enforces. DIG takes `fa_th_5g` when a link comes up
+on a 5 GHz profile (phy.c `rtw89_phy_dig_update_para`; B passes 2.4 GHz).
+The CFO sample comes from IE01 `PREMB_CFO` [31:20] on C (core.c
+`rtw89_core_parse_phy_status_ie01`, `cfo_src_fd` false; `rx_packet::phy_status`
+`premb_cfo`), and the crystal capacitor uses the same XTAL-SI SC_XO/SC_XI
+writes as B. The C prerequisites are `Native::track_operating_current`: the
+C factory/PHY-capability receipt, the current C ordinary grant and the
+`phy_operating::Operating::prepare_c` owner (which already ran the C DIG/CFO/
+EDCCA sub-inits incl. `rtw89_dcfo_comp_init` with `cfo_hw_comp` false).
+Linux's `rtw8852c_rfk_track` (TSSI/DPK/thermal tracking) is not part of
+this; `station_rf_tracking` stays a no-op on C. B registers and bytes are
+unchanged. Unexecuted cases:
+`smoke_rtw8852c_track_uses_c_dig_edcca_dcfo_layout_and_5g_fa_thresholds`,
+`smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo`.
 
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 

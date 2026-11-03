@@ -7,6 +7,13 @@
 //! 250 ms `cfo_track_work`) and dynamic EDCCA (`rtw89_phy_edcca_track`), in
 //! Linux's order, plus the TX throughput statistics CFO tracking consumes.
 //! The scope is the native 2.4 GHz, 20 MHz, single-link profile.
+//!
+//! RTL8852C runs the same AX algorithms over its own `rtw8852c_dig_regs`
+//! (`R_SEG0R_PD` 0x481c with spatial reuse BIT 29, the `_V1` PAGCUGC
+//! registers), `rtw8852c_edcca_regs` (`R_SEG0R_EDCCA_LVL` 0x4840) and
+//! `rtw8852c_dcfo_comp` (`R_DCFO_COMP_S0_V1` 0x4a40 [13:0],
+//! `dcfo_comp_sft` 12) on its admitted 2.4/5 GHz 20 MHz station profiles;
+//! DIG takes `fa_th_5g` on a 5 GHz link (`rtw89_phy_dig_update_para`).
 use super::power;
 
 /// `RTW89_TRACK_WORK_PERIOD` (2 s).
@@ -66,6 +73,68 @@ const B_DCFO: u32 = 0xff;
 const R_DCFO_COMP_S0: u32 = BB + 0x448c;
 const B_DCFO_COMP_S0_MSK: u32 = 0xfff;
 
+/// Chip register layout for DIG/EDCCA/DCFO (`rtw89_chip_info` dig_regs,
+/// edcca_regs, dcfo_comp, dcfo_comp_sft).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Layout {
+    pd: u32,
+    pd_spatial_reuse: u32,
+    pagcugc: [u32; 4],
+    edcca: u32,
+    dcfo_comp: u32,
+    dcfo_comp_mask: u32,
+    dcfo_comp_sft: u32,
+}
+/// `rtw8852b_dig_regs` / `rtw8852b_edcca_regs` / `rtw8852b_dcfo_comp`.
+pub(super) const LAYOUT_B: Layout = Layout {
+    pd: R_SEG0R_PD_V1,
+    pd_spatial_reuse: B_SEG0R_PD_SPATIAL_REUSE_EN_MSK_V1,
+    pagcugc: R_PAGCUGC,
+    edcca: R_SEG0R_EDCCA_LVL_V1,
+    dcfo_comp: R_DCFO_COMP_S0,
+    dcfo_comp_mask: B_DCFO_COMP_S0_MSK,
+    dcfo_comp_sft: DCFO_COMP_SFT,
+};
+// rtw8852c_dig_regs / rtw8852c_edcca_regs / rtw8852c_dcfo_comp (reg.h).
+const R_SEG0R_PD: u32 = BB + 0x481c;
+const B_SEG0R_PD_SPATIAL_REUSE_EN_MSK: u32 = 1 << 29;
+const R_PAGCUGC_V1: [u32; 4] = [BB + 0x4c24, BB + 0x4c28, BB + 0x4ce8, BB + 0x4cec];
+const R_SEG0R_EDCCA_LVL: u32 = BB + 0x4840;
+const R_DCFO_COMP_S0_V1: u32 = BB + 0x4a40;
+const B_DCFO_COMP_S0_V1_MSK: u32 = 0x3fff;
+/// `rtw8852c_chip_info` (`cfo_hw_comp` false, `cfo_src_fd` false).
+pub(super) const LAYOUT_C: Layout = Layout {
+    pd: R_SEG0R_PD,
+    pd_spatial_reuse: B_SEG0R_PD_SPATIAL_REUSE_EN_MSK,
+    pagcugc: R_PAGCUGC_V1,
+    edcca: R_SEG0R_EDCCA_LVL,
+    dcfo_comp: R_DCFO_COMP_S0_V1,
+    dcfo_comp_mask: B_DCFO_COMP_S0_V1_MSK,
+    dcfo_comp_sft: 12,
+};
+/// RTL8852C counterpart of [`REGISTERS`].
+pub(super) const REGISTERS_C: [u32; 20] = [
+    R_CCX,
+    R_IFS_COUNTER,
+    R_IFS_T[0],
+    R_IFS_T[1],
+    R_IFS_T[2],
+    R_IFS_T[3],
+    R_IFS_CLM_FA,
+    R_IFSCNT,
+    R_SEG0R_PD,
+    R_BMODE_PDTH_EN_V1,
+    R_BMODE_PDTH_V1,
+    R_PAGCUGC_V1[0],
+    R_PAGCUGC_V1[1],
+    R_PAGCUGC_V1[2],
+    R_PAGCUGC_V1[3],
+    R_SEG0R_EDCCA_LVL,
+    R_AX_PPDU_STAT,
+    R_AX_HW_RPT_FWD,
+    R_DCFO,
+    R_DCFO_COMP_S0_V1,
+];
 /// Every register track work may touch; the native owner refuses others.
 pub(super) const REGISTERS: [u32; 20] = [
     R_CCX,
@@ -110,6 +179,11 @@ pub(super) trait Hw {
     fn read(&mut self, address: u32) -> Result<u32, power::Error>;
     fn write(&mut self, address: u32, value: u32) -> Result<(), power::Error>;
     fn profile(&mut self) -> Result<Profile, power::Error>;
+    /// Chip register layout and whether the operating channel is 5 GHz.
+    /// Defaults to the B layout on 2.4 GHz.
+    fn layout(&mut self) -> Result<(Layout, bool), power::Error> {
+        Ok((LAYOUT_B, false))
+    }
     /// `rtw89_phy_cfo_set_crystal_cap` on B: XTAL SI SC_XO then SC_XI (full
     /// byte masks), then read both back; returns the SC_XI readback.
     async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error>;
@@ -288,6 +362,7 @@ impl Env {
 // DIG constants (phy.c / phy.h).
 const RSSI_NOLINK: u8 = 22;
 const FA_TH_2G: [u32; 4] = [22, 44, 66, 88];
+const FA_TH_5G: [u32; 4] = [4, 8, 12, 16];
 const FA_TH_NOLINK: [u32; 4] = [196, 352, 440, 528];
 const IGI_OFFSET_MAX: u8 = 25;
 const IGI_OFFSET_MUL: u8 = 2;
@@ -329,13 +404,18 @@ impl Default for Dig {
     }
 }
 impl Dig {
-    /// `__rtw89_phy_dig` decisions for one period (pure).
-    pub(super) fn step(&mut self, rssi_min: Option<u8>, fa_permil: u32) -> DigOutput {
+    /// `__rtw89_phy_dig` decisions for one period (pure). `ghz5` is the
+    /// operating band `rtw89_phy_dig_update_para` reads at a link change.
+    pub(super) fn step(&mut self, rssi_min: Option<u8>, fa_permil: u32, ghz5: bool) -> DigOutput {
         let linked = rssi_min.is_some();
         // rtw89_phy_dig_update_rssi_info
         let igi_rssi = rssi_min.map_or(RSSI_NOLINK, |rssi| rssi >> 1);
         if linked != self.linked_pre {
-            self.fa_th = if linked { FA_TH_2G } else { FA_TH_NOLINK };
+            self.fa_th = match (linked, ghz5) {
+                (false, _) => FA_TH_NOLINK,
+                (true, false) => FA_TH_2G,
+                (true, true) => FA_TH_5G,
+            };
             self.igi_fa_rssi = igi_rssi;
         }
         self.linked_pre = linked;
@@ -374,9 +454,14 @@ impl Dig {
             sdagc_follow_pagc: self.igi_fa_rssi > igi_rssi,
         }
     }
-    fn program(hw: &mut impl Hw, output: DigOutput, cck_pd: bool) -> Result<(), power::Error> {
-        set(hw, R_SEG0R_PD_V1, B_SEG0R_PD_LOWER_BOUND_MSK, output.pd)?;
-        set(hw, R_SEG0R_PD_V1, B_SEG0R_PD_SPATIAL_REUSE_EN_MSK_V1, 1)?;
+    fn program(
+        hw: &mut impl Hw,
+        layout: &Layout,
+        output: DigOutput,
+        cck_pd: bool,
+    ) -> Result<(), power::Error> {
+        set(hw, layout.pd, B_SEG0R_PD_LOWER_BOUND_MSK, output.pd)?;
+        set(hw, layout.pd, layout.pd_spatial_reuse, 1)?;
         if cck_pd {
             set(hw, R_BMODE_PDTH_EN_V1, B_BMODE_PDTH_LIMIT_EN_MSK_V1, 1)?;
             set(
@@ -386,7 +471,7 @@ impl Dig {
                 output.cck_pd,
             )?;
         }
-        for address in R_PAGCUGC {
+        for address in layout.pagcugc {
             set(
                 hw,
                 address,
@@ -509,6 +594,8 @@ impl Cfo {
     }
     /// `rtw89_phy_cfo_dm` for one linked station (`total_sta_assoc == 1`).
     pub(super) async fn dm(&mut self, hw: &mut impl Hw, linked: bool) -> Result<(), power::Error> {
+        let (layout, _) = hw.layout()?;
+        let sft = layout.dcfo_comp_sft;
         if !linked {
             return self.reset(hw).await;
         }
@@ -517,7 +604,7 @@ impl Cfo {
         }
         // rtw89_phy_average_cfo_calc
         let cfo = phy_div(self.tail, self.count);
-        let mut dcfo = phy_div(self.tail.wrapping_shl(DCFO_COMP_SFT), self.count);
+        let mut dcfo = phy_div(self.tail.wrapping_shl(sft), self.count);
         if self.lock {
             self.lock_cnt += 1;
             if self.lock_cnt > CFO_PERIOD_CNT {
@@ -535,14 +622,14 @@ impl Cfo {
         let previous = self.cap;
         self.adjust(hw, cfo).await?;
         if self.cap != previous {
-            let fine = CFO_SW_COMP_FINE_TUNE << DCFO_COMP_SFT;
+            let fine = CFO_SW_COMP_FINE_TUNE << sft;
             dcfo += if dcfo > 0 { -fine } else { fine };
         }
         // rtw89_dcfo_comp (linked)
         if dcfo != 0 {
             let current = read(hw, R_DCFO, B_DCFO)? as i32;
             let value = dcfo / 625 + dcfo.signum() * current;
-            set(hw, R_DCFO_COMP_S0, B_DCFO_COMP_S0_MSK, value as u32)?;
+            set(hw, layout.dcfo_comp, layout.dcfo_comp_mask, value as u32)?;
         }
         // rtw89_phy_cfo_statistics_reset
         self.tail = 0;
@@ -686,6 +773,7 @@ impl Tracker {
         peer: Option<[u8; 6]>,
     ) -> Result<(), power::Error> {
         let profile = hw.profile()?;
+        let (layout, ghz5) = hw.layout()?;
         if !self.initialized {
             set(hw, R_AX_PPDU_STAT, u32::MAX, PPDU_STAT_ENABLE)?;
             set(
@@ -701,8 +789,8 @@ impl Tracker {
         self.throughput();
         let rssi_min = peer.map(|_| self.rssi.read());
         self.env.track(hw)?;
-        let output = self.dig.step(rssi_min, self.env.fa_permil());
-        Dig::program(hw, output, profile.cck_pd)?;
+        let output = self.dig.step(rssi_min, self.env.fa_permil(), ghz5);
+        Dig::program(hw, &layout, output, profile.cck_pd)?;
         hw.rfk()?;
         if self.cfo.track(self.tx_throughput()) {
             self.cfo.dm(hw, peer.is_some()).await?;
@@ -710,7 +798,7 @@ impl Tracker {
         let threshold = edcca_threshold(rssi_min);
         if self.threshold != Some(threshold) {
             for mask in B_EDCCA_LVL_MSK {
-                set(hw, R_SEG0R_EDCCA_LVL_V1, mask, threshold.into())?;
+                set(hw, layout.edcca, mask, threshold.into())?;
             }
             self.threshold = Some(threshold);
         }

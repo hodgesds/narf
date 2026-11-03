@@ -207,18 +207,68 @@ impl Native {
     /// the listed CCX/DIG/EDCCA/PPDU-status registers, on the prepared
     /// operating PHY and current ordinary authority.
     fn track_port(&mut self, address: u32) -> Result<Port<'_>, power::Error> {
-        if self.chip == ChipId::Rtl8852C {
-            return Err(power::Error::Unsupported);
-        }
         if self.sleep_blocked {
             return Err(power::Error::Terminal);
         }
         crate::rtw89::station_control::awake(&mut self.io)?;
-        if !crate::rtw89::track::REGISTERS.contains(&address) {
+        let registers: &[u32] = if self.chip == ChipId::Rtl8852C {
+            &crate::rtw89::track::REGISTERS_C
+        } else {
+            &crate::rtw89::track::REGISTERS
+        };
+        if !registers.contains(&address) {
             return Err(power::Error::Access);
         }
-        self.operating_current()?;
+        self.track_operating_current()?;
         self.radio_io()
+    }
+    /// Chip dispatch of `operating_current` for track work. C: the current
+    /// C ordinary grant, the C factory/PHY-capability receipt and the C
+    /// operating owner `phy_operating::Operating::prepare_c` prepared from
+    /// the same identity (`support_cckpd` true on every C cut).
+    fn track_operating_current(&self) -> Result<(), power::Error> {
+        if self.chip != ChipId::Rtl8852C {
+            return self.operating_current();
+        }
+        self.radio_profile_current()?;
+        if !self.c_ordinary()? {
+            return Err(power::Error::Unsupported);
+        }
+        let actual = self
+            .factory
+            .as_ref()
+            .and_then(|f| f.identity())
+            .ok_or(power::Error::Unsupported)?;
+        let owner = self.operating.as_ref().ok_or(power::Error::Terminal)?;
+        let working = owner.working().ok_or(power::Error::Unsupported)?;
+        if owner.state() != crate::rtw89::phy_operating::State::Prepared
+            || working.cut != actual.cut()
+            || working.rfe != actual.calibration().rfe_type
+            || working.crystal_cap != actual.xtal() & 0x7f
+            || !working.cck_pd
+        {
+            return Err(power::Error::Unsupported);
+        }
+        Ok(())
+    }
+    /// Track-work chip layout and whether the active channel is 5 GHz
+    /// (B: its 2.4 GHz channel-1 profile; C: the active signed profile).
+    pub(in crate::rtw89) fn station_track_layout(
+        &self,
+    ) -> Result<(crate::rtw89::track::Layout, bool), power::Error> {
+        if self.chip != ChipId::Rtl8852C {
+            return Ok((crate::rtw89::track::LAYOUT_B, false));
+        }
+        self.track_operating_current()?;
+        let active = self
+            .qualification_c
+            .as_ref()
+            .ok_or(power::Error::Unsupported)?
+            .active();
+        Ok((
+            crate::rtw89::track::LAYOUT_C,
+            active.band() == operating_channel_c::Band::Ghz5,
+        ))
     }
     pub(in crate::rtw89) fn station_track_read(
         &mut self,
@@ -238,14 +288,10 @@ impl Native {
     pub(in crate::rtw89) fn station_track_profile(
         &self,
     ) -> Result<crate::rtw89::track::Profile, power::Error> {
-        // RTL8852C: no track-work owner; `Unsupported` disables track work.
-        if self.chip == ChipId::Rtl8852C {
-            return Err(power::Error::Unsupported);
-        }
         if self.sleep_blocked {
             return Err(power::Error::Terminal);
         }
-        self.operating_current()?;
+        self.track_operating_current()?;
         let working = self
             .operating
             .as_ref()
@@ -258,8 +304,9 @@ impl Native {
             crystal_upper: working.crystal_upper,
         })
     }
-    /// `rtw89_phy_cfo_set_crystal_cap` (B: `xtal_info` NULL): XTAL SI SC_XO
-    /// (0x05) then SC_XI (0x04), full byte masks, then read both back.
+    /// `rtw89_phy_cfo_set_crystal_cap` (B and C: `xtal_info` NULL, the
+    /// non-8852A/8851B branch): XTAL SI SC_XO (0x05) then SC_XI (0x04),
+    /// full byte masks, then read both back.
     pub(in crate::rtw89) async fn station_track_crystal(
         &mut self,
         cap: u8,

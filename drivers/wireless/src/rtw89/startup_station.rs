@@ -269,6 +269,12 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_track_profile()
     }
+    fn station_track_layout(
+        &mut self,
+    ) -> Result<(crate::rtw89::track::Layout, bool), power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_track_layout()
+    }
     async fn station_track_crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
         self.station_allowed()?;
         self.station_native()?.station_track_crystal(cap).await

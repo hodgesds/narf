@@ -180,6 +180,10 @@ pub(super) unsafe trait Io: Send {
     fn station_track_profile(&mut self) -> Result<super::track::Profile, power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Track-work chip register layout and 5 GHz operating band.
+    fn station_track_layout(&mut self) -> Result<(super::track::Layout, bool), power::Error> {
+        Ok((super::track::LAYOUT_B, false))
+    }
     /// CFO crystal-capacitor write through XTAL SI; returns the SC_XI readback.
     async fn station_track_crystal(&mut self, _: u8) -> Result<u8, power::Error> {
         Err(power::Error::Unsupported)
@@ -1064,6 +1068,9 @@ impl State {
             }
             fn profile(&mut self) -> Result<super::track::Profile, power::Error> {
                 self.0.station_track_profile()
+            }
+            fn layout(&mut self) -> Result<(super::track::Layout, bool), power::Error> {
+                self.0.station_track_layout()
             }
             async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
                 self.0.station_track_crystal(cap).await
