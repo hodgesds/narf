@@ -17,6 +17,8 @@ use super::rtl8192e_init::{Queues, Vendor};
 use super::rtl8192e_tests::physical_stream;
 use super::rtl8723b_init::{parse_efuse, parse_identity, reserved_pages};
 
+const REG_HMBOX_0: u16 = 0x01d0;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Op {
     Read(u16, usize),
@@ -77,6 +79,12 @@ impl Fake {
         regs[0xfe67] = 0x01; // SIE: low
         regs[0x68] = 1 << 2; // MULTI_WIFI_FUNC_EN
         regs[0x6a] = 1 << 2; // MULTI_BT_FUNC_EN (bit 18)
+                             // Passing path-A IQK readbacks (8723b.c pass windows): TX
+                             // e94 0x100 / e9c 5, RX ea4 0x100 / eac 4.
+        regs[0xe94..0xe98].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+        regs[0xe9c..0xea0].copy_from_slice(&0x0005_0000u32.to_le_bytes());
+        regs[0xea4..0xea8].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+        regs[0xeac..0xeb0].copy_from_slice(&0x0004_0000u32.to_le_bytes());
         Self(Arc::new(IrqSafeSpinLock::new(Model {
             regs,
             ops: Vec::new(),
@@ -131,6 +139,12 @@ impl ControlIo for Fake {
         }
         if addr == 0x224 && out.len() == 4 {
             g.regs[0x226] &= !1; // auto-LLT completes
+        }
+        if addr == REG_HMTFR {
+            g.regs[a] = 0; // firmware consumed every mailbox
+        }
+        if addr == 0x0670 && out.len() == 4 {
+            g.regs[0x673] &= 0x7f; // CAM invalidate completes
         }
         out.copy_from_slice(&g.regs[a..a + out.len()]);
         Ok(out.len())
@@ -234,8 +248,8 @@ fn smoke_rtl8723bu_power_and_firmware() -> TestResult {
     if narf_scheduler::block_on(owner.initialize(&image(payload))).is_err() {
         return TestResult::Fail("8723bu lifecycle failed");
     }
-    if owner.status().stage != Stage::TablesReady || owner.status().error.is_some() {
-        return TestResult::Fail("8723bu did not stop at TablesReady");
+    if owner.status().stage != Stage::RadioReady || owner.status().error.is_some() {
+        return TestResult::Fail("8723bu did not reach RadioReady");
     }
     let factory = match owner.factory_8723b() {
         Some(f) => f,
@@ -269,7 +283,7 @@ fn smoke_rtl8723bu_power_and_firmware() -> TestResult {
         // rtl8723bu_init_phy_bb clears the S0S1 switch again.
         || io.writes(0x0765) != vec![vec![0x18]; 2]
         || io.writes(0x076e) != vec![vec![0x04]; 2]
-        || io.writes(REG_S0S1_PATH_SWITCH) != vec![vec![0, 0, 0, 0]; 2]
+        || io.writes(REG_S0S1_PATH_SWITCH)[..2] != [vec![0, 0, 0, 0], vec![0, 0, 0, 0]]
         || io.writes(0xfe08) != vec![vec![0x01]]
     {
         return TestResult::Fail("8723bu BT-coex power-on settings");
@@ -342,9 +356,9 @@ fn smoke_rtl8723bu_tables_antenna_and_lck() -> TestResult {
     let io = Fake::new();
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
     if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
-        || owner.status().stage != Stage::TablesReady
+        || owner.status().stage != Stage::RadioReady
     {
-        return TestResult::Fail("8723bu did not reach TablesReady");
+        return TestResult::Fail("8723bu did not reach RadioReady");
     }
     let rfe = io.writes(0x0930);
     if rfe.len() != 1 || word(&rfe[0]) & 0xff != 0x77 {
@@ -360,8 +374,8 @@ fn smoke_rtl8723bu_tables_antenna_and_lck() -> TestResult {
         0x18 << 20 | 0x8c01,
         0xb0 << 20 | 0xdffe0,
     ];
-    // + the PHY table's own 0x840 row.
-    if lssi.len() != rf_rows + 4 || lssi[lssi.len() - 3..] != tail {
+    // + the PHY table's own 0x840 row; LC/IQ calibration follows.
+    if lssi.len() <= rf_rows + 4 || lssi[rf_rows + 1..rf_rows + 4] != tail {
         return TestResult::Fail("8723bu RF table + PHY LCK writes");
     }
     if io.writes(0x0860).last().map(|v| word(v)) != Some(0x66f6_0210)
@@ -399,3 +413,125 @@ fn smoke_rtl8723bu_tx_power() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtl8xxxu/8723bu", smoke_rtl8723bu_tx_power);
+
+fn smoke_rtl8723bu_post_tables_and_calibration() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
+    if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
+        || owner.status().stage != Stage::RadioReady
+    {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    }
+    // rtl8xxxu_init_burst with the 8723bu fops values.
+    if io.writes(0x04ca) != vec![0x0c14u16.to_le_bytes().to_vec()]
+        || io.writes(0x0456) != vec![vec![0x5e]]
+        || io.writes(0x055c) != vec![vec![0x50]]
+        || io.writes(0x0638) != vec![vec![0x50]]
+        || io.writes(0x0290).last().map(|v| v[0] & 0x3e) != Some(0x1e)
+        || io.writes(0x04c7).last().map(|v| v[0] & 0x80) != Some(0x80)
+        || io.writes(0x001c).last().map(|v| v[0] & 0x60) != Some(0x60)
+    {
+        return TestResult::Fail("8723bu init_burst");
+    }
+    // rtl8723bu_init_aggregation clears RX aggregation.
+    if io.writes(0x010c).last().map(|v| v[0] & 0x04) != Some(0)
+        || io.writes(0x0280).last().map(|v| word(v) & 0x8000_ff0f) != Some(0)
+    {
+        return TestResult::Fail("8723bu init_aggregation");
+    }
+    // DPDT handover to the 8051 and init_statistics.
+    if io.writes(0x004e).last().map(|v| v[0] & 0x80) != Some(0x80)
+        || io.writes(0x0896) != vec![0x2710u16.to_le_bytes().to_vec()]
+        || io.writes(0x0898) != vec![0xffff_ff52u32.to_le_bytes().to_vec()]
+        || io.writes(0x0460) != vec![vec![0, 0]]
+    {
+        return TestResult::Fail("8723bu DPDT / statistics");
+    }
+    // prepare_calibrate(1) then (0) in consecutive mailboxes.
+    if io.writes(REG_HMBOX_0) != vec![vec![0x6d, 1, 0, 0]]
+        || io.writes(REG_HMBOX_0 + 4) != vec![vec![0x6d, 0, 0, 0]]
+    {
+        return TestResult::Fail("8723bu BT/WLAN calibration H2C");
+    }
+    // BT grant 0x800 during IQK, the saved BT_CONTROL (0x765 = 0x18) last.
+    let bt = io.writes(0x0764);
+    if !bt.iter().any(|v| word(v) == 0x800) || bt.last().map(|v| word(v)) != Some(0x1800) {
+        return TestResult::Fail("8723bu IQK BT control");
+    }
+    // LC calibration: packet-TX case pauses all queues first.
+    let pause = io.writes(0x0522);
+    if pause.len() < 2 || pause[0] != vec![0xff] || pause[1] != vec![0x00] {
+        return TestResult::Fail("8723bu LC calibration TXPAUSE");
+    }
+    let lssi: Vec<u32> = io.writes(0x0840).iter().map(|v| word(v)).collect();
+    let s0s1 = [0xb0 << 20 | 0xdfbe0, 0xb0 << 20 | 0xdffe0];
+    if lssi.iter().filter(|&&v| v == s0s1[0]).count() != 2
+        || lssi.iter().filter(|&&v| v == s0s1[1]).count() != 2
+        || lssi.last() != Some(&(0x42 << 20 | 0x37cf8))
+        || !lssi.contains(&(0x43 << 20 | 0x300bd))
+    {
+        return TestResult::Fail("8723bu LCK / IQK restore / thermal RF writes");
+    }
+    let radio = match owner.radio_8723b() {
+        Some(r) => r,
+        None => return TestResult::Fail("8723bu radio state not retained"),
+    };
+    if radio.iqk.candidate != 0 || radio.iqk.row[..4] != [0x100, 5, 0x100, 4] {
+        return TestResult::Fail("8723bu IQK candidate/row");
+    }
+    if io.writes(0x0652) != vec![vec![235]] {
+        return TestResult::Fail("8723bu NAV upper");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_post_tables_and_calibration
+);
+
+fn smoke_rtl8723bu_iqk_failure_is_terminal() -> TestResult {
+    use super::rtl8723b_iqk::{choose, rx_ok, tx_ok};
+    if !tx_ok(0, 0x0100_0000, 0x0005_0000)
+        || tx_ok(1 << 28, 0x0100_0000, 0)
+        || tx_ok(0, 0x0142_0000, 0)
+        || tx_ok(0, 0x0110_0000, 0)
+        || tx_ok(0, 0x0100_0000, 0x03f0_0000) // |-16| >= 0xf
+        || !tx_ok(0, 0x0100_0000, 0x03fa_0000) // |-6| < 0xf
+        || !rx_ok(0x0004_0000, 0x0100_0000)
+        || rx_ok(1 << 27, 0x0100_0000)
+        || rx_ok(0, 0x0132_0000)
+    {
+        return TestResult::Fail("8723bu IQK pass windows");
+    }
+    // Three dissimilar runs with an empty result[3]: Linux candidate -1.
+    let mut result = [[0u32; 8]; 4];
+    result[0][0] = 0x100;
+    result[1][0] = 0x120;
+    result[2][0] = 0x140;
+    result[0][1] = 1;
+    result[1][1] = 0x20;
+    result[2][1] = 0x40;
+    if choose(&mut result, 0).is_some() || choose(&mut result, 1).is_some() {
+        return TestResult::Fail("8723bu IQK stopped early");
+    }
+    if choose(&mut result, 2) != Some(None) {
+        return TestResult::Fail("8723bu IQK candidate -1");
+    }
+    let io = Fake::new();
+    io.0.lock().regs[0xe94..0xe98].fill(0);
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
+    if narf_scheduler::block_on(owner.initialize(&image(256))) != Err(Error::Calibration)
+        || owner.radio_8723b().is_some()
+    {
+        return TestResult::Fail("8723bu failed IQK not terminal");
+    }
+    // Linux's post-IQK restore still ran: calibration-done H2C sent.
+    if io.writes(REG_HMBOX_0 + 4) != vec![vec![0x6d, 0, 0, 0]] {
+        return TestResult::Fail("8723bu IQK restore skipped on failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_iqk_failure_is_terminal
+);

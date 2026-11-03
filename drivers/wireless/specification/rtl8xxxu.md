@@ -1364,18 +1364,54 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   with diff index 0's `.b` member, written to the path-A AGC registers
   (CCK1/CCK2-11, OFDM 6..54, MCS0..7); `u8 += s8` wraps.
 
-The owner currently stops at `TablesReady`; the post-table MAC stage,
-`rtl8723bu_init_aggregation`/`init_statistics`/`init_burst`, LCK/IQK,
-the post-calibration tail, `rtl8723b_enable_rf`, power-off, packet codec,
-RA, BT coexistence, signed records and the station are not implemented, and the production probe does not
-start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
+- Post-table MAC (`rtl8723b_radio::post_tables`, `rtl8xxxu_init_device`
+  from the WMAC settings through `init_statistics`): RCR `0x7000600e`, MAR
+  all-ones (no `init_reg_rxfltmap`), RRSR CCK-1M, spec SIFS/retry, MAC/CCK/
+  OFDM SIFS, EDCA, DARFRC/RARFRC, AMPDU retry, ACK timeout, beacon/TBTT/
+  early-int/DMA time/TCFG, `rtl8xxxu_init_burst` (RXDMA_PRO burst 1/3 +
+  DMA mode, single-AMPDU, `MAX_AGGR_NUM = 0x0c14`, `AMPDU_MAX_TIME = 0x5e`,
+  AGGLEN all-ones, RX_PKT_LIMIT 0x18, PIFS 0, USTIME TSF/EDCA 0x50, RSV_CTRL
+  WLOCK_1C|DIS_PRST), `rtl8723bu_init_aggregation` (RX aggregation off), no
+  packet lifetime, CCK+OFDM blocks, CAM invalidate (polled; `CamTimeout`),
+  `set_tx_power(1, HT20)`, `REG_LEDCFG2` DPDT select (antenna to the 8051),
+  HWSEQ, BAR mode, `FAST_EDCA_CTRL = 0`, `rtl8723bu_init_statistics` (NHM
+  timer/thresholds, TH8, CCK, `OFDM0_FA_RSTC[7]`). No `QUEUE_CTRL`,
+  `ACLK_MON`, GPIO mux or `USB_HRPWM` writes (not for RTL8723B in Linux).
+- Calibration (`rtl8723b_iqk`): `rtl8723a_phy_lc_calibrate` with
+  `has_s0s1` (RF `0xb0 = 0xdfbe0` / `0xdffe0` around `MODE_AG[15]` and
+  100 ms; TXPAUSE bracket, or path-A standby in continuous TX), then
+  `rtl8723bu_phy_iq_calibrate`: `H2C_8723B_BT_WLAN_CALIBRATION(1)`, saved
+  `REG_BT_CONTROL_8723BU`, up to three `rtl8723bu_phy_iqcalibrate` runs
+  (ADDA `0x01c00014`, MAC calibration, BB setup with `XCD_RF_SW_CTRL =
+  0x22204000`, the D-cut RF PA table, two retries each of
+  `rtl8723bu_iqk_path_a`/`rtl8723bu_rx_iqk_path_a` with S0S1 `0x280` and BT
+  grant `0x800` around each one-shot; `RTL8723BU_BT` is undefined so no
+  `GNT_BT` writes; the 8723B pass windows incl. `0xf0 < e94 < 0x110` and
+  `|e9c| < 0xf`), run ≥ 1 restores ADDA/MAC/BB (BB list ends in
+  `FPGA0_RF_MODE`) and XA AGC, `rtl8xxxu_gen2_simularity_compare` (bound 4),
+  candidate 0/1/3 or Linux's `-1` when `result[3]` is empty,
+  `fill_iqk_matrix_a`, the recovery snapshot, BT control restore, the final
+  RF PA table/`0xed`/`0x43 = 0x300bd` and `BT_WLAN_CALIBRATION(0)`.
+  Deviation: no candidate, or a candidate without a path-A TX result, is
+  `Error::Calibration` after that restore tail (Linux keeps the power-on
+  matrix). The zero-valued IQK/LC skeleton in `rtl8723b.rs` is removed.
+- Post-calibration (`rtl8723b_radio::post_calibration`): gen2 thermal meter
+  (`RF_A 0x42 = 0x37cf8`), `NAV_UPPER`, mgmt ACK, `0xa9c[17]` and
+  `0xd2c[11]` retained. The outcome is `Owner::radio_8723b()` and the owner
+  reaches `RadioReady` (not packet readiness).
+
+`rtl8723b_enable_rf`, power-off, channel configuration, packet codec, RA,
+BT coexistence, signed records and the station are not implemented, and
+the production probe does not start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
 `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
 (`drivers/wireless/rtl8xxxu/8723bu`): identity/EFUSE/page budget,
-power + firmware + tables lifecycle against a register model, no-SIE
-fallback and test-silicon refusal, table/antenna/PHY-LCK/post-RF state,
-and TX power indices.
+power + firmware + tables + calibration lifecycle against a register
+model, no-SIE fallback and test-silicon refusal, table/antenna/PHY-LCK/
+post-RF state, TX power indices, post-table burst/aggregation/DPDT/
+statistics, LCK/IQK H2C/BT-grant/RF sequence and candidate, and a failed
+IQK being terminal after Linux's restore tail.
 
 ## 4. Invariants
 

@@ -688,30 +688,6 @@ fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
         return TestResult::Fail("8723b is 1T1R");
     }
 
-    // IQK shape — gen2 has 10 steps.
-    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8723b::IQK_PATH_A_STEP_COUNT];
-    if rtl8723b::build_iqk_path_a_sequence(&mut iqk) != 10 {
-        return TestResult::Fail("8723b IQK step count != 10");
-    }
-
-    // LC-cal sequence: pre, mid, post writes (3 entries).
-    let lc = rtl8723b::lc_calibrate_sequence_8723b();
-    if lc.len() != 3 {
-        return TestResult::Fail("8723b LC cal != 3 writes");
-    }
-    if lc[0].0 != 0xB0 || lc[2].0 != 0xB0 {
-        return TestResult::Fail("8723b LC cal pre/post should target RF reg 0xB0");
-    }
-    if rtl8723b::LC_CAL_HOLD_MS != 200 {
-        return TestResult::Fail("8723b LC cal hold should be 200 ms");
-    }
-    if rtl8723b::LC_CAL_INIT_VAL != 0xDFBE0 {
-        return TestResult::Fail("8723b LC init val mismatch");
-    }
-    if rtl8723b::LC_CAL_FINAL_VAL != 0xDFFE0 {
-        return TestResult::Fail("8723b LC final val mismatch");
-    }
-
     // 2.4 GHz only.
     if !rtl8723b::channel_valid(6) {
         return TestResult::Fail("8723b ch 6 valid");

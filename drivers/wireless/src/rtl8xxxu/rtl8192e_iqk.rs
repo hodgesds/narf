@@ -138,7 +138,7 @@ const BB_REGS: [u16; 9] = [
     REG_CCK0_AFE_SETTING,
 ];
 /// `rtl8xxxu_iqk_phy_iq_bb_reg[]` (saved as `bb_recovery_backup`).
-const PHY_IQ_BB_REGS: [u16; 9] = [
+pub(super) const PHY_IQ_BB_REGS: [u16; 9] = [
     REG_OFDM0_XA_RX_IQ_IMBALANCE,
     REG_OFDM0_XB_RX_IQ_IMBALANCE,
     REG_OFDM0_ENERGY_CCA_THRES,
@@ -644,15 +644,15 @@ async fn iqcalibrate<I: ControlIo>(
 
 /// One path of `rtl8xxxu_fill_iqk_matrix_{a,b}`. Arithmetic is Linux's u32
 /// arithmetic, including the unmasked OR of `tx_a` into `[9:0]`.
-struct MatrixRegs {
-    tx_iq: u16,
-    tx_afe: u16,
-    rx_iq: u16,
-    cca_x_bit: u32,
-    cca_y_bit: u32,
+pub(super) struct MatrixRegs {
+    pub(super) tx_iq: u16,
+    pub(super) tx_afe: u16,
+    pub(super) rx_iq: u16,
+    pub(super) cca_x_bit: u32,
+    pub(super) cca_y_bit: u32,
 }
 
-async fn fill_matrix<I: ControlIo>(
+pub(super) async fn fill_matrix<I: ControlIo>(
     o: &Owner<I>,
     regs: &MatrixRegs,
     vals: [u32; 4],

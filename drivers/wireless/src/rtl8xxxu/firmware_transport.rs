@@ -109,6 +109,13 @@ pub struct Radio8192e {
     pub post: super::rtl8192e_radio::PostCalibration,
 }
 
+/// RTL8723BU radio state retained at RadioReady.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Radio8723b {
+    pub iqk: super::rtl8723b_iqk::Iqk,
+    pub post: super::rtl8723b_radio::PostCalibration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalibrationInfo {
     pub tx_x: u16,
@@ -227,6 +234,7 @@ pub struct Owner<I: ControlIo> {
     // RTL8723BU factory/queue facts (`rtl8723b_init`).
     factory_8723b: IrqSafeSpinLock<Option<super::rtl8723b_init::Factory>>,
     queues_8723b: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
+    radio_8723b: IrqSafeSpinLock<Option<Radio8723b>>,
     h2c_next: AtomicU8,
     h2c_busy: AtomicBool,
 }
@@ -337,6 +345,7 @@ impl<I: ControlIo> Owner<I> {
             radio_8192e: IrqSafeSpinLock::new(None),
             factory_8723b: IrqSafeSpinLock::new(None),
             queues_8723b: IrqSafeSpinLock::new(None),
+            radio_8723b: IrqSafeSpinLock::new(None),
             h2c_next: AtomicU8::new(0),
             h2c_busy: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
@@ -490,6 +499,11 @@ impl<I: ControlIo> Owner<I> {
     /// RTL8723BU identity/EFUSE facts once `FactoryReady` was reached.
     pub fn factory_8723b(&self) -> Option<super::rtl8723b_init::Factory> {
         *self.factory_8723b.lock()
+    }
+
+    /// RTL8723BU IQK outcome and post-calibration state once RadioReady.
+    pub fn radio_8723b(&self) -> Option<Radio8723b> {
+        *self.radio_8723b.lock()
     }
 
     /// RTL8723BU TX queue to bulk-OUT endpoint map installed before firmware.
@@ -698,8 +712,10 @@ impl<I: ControlIo> Owner<I> {
     /// RTL8723BU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
     /// through power-on, reserved pages/queue priority/RX boundary, firmware
     /// download/start, the `init_reg_hmtfr` H2C init, antenna selection and
-    /// the MAC/BB/RF tables through HIMR. The owner stops at TablesReady:
-    /// post-table MAC, calibration and the radio tail are not implemented.
+    /// the MAC/BB/RF tables through HIMR, the post-table MAC stage (burst,
+    /// aggregation, DPDT handover, statistics), LC + path-A IQ calibration and
+    /// the post-calibration tail, in Linux order. RadioReady is not packet
+    /// readiness.
     async fn run_device_8723b(
         &self,
         payload: &[u8],
@@ -717,7 +733,14 @@ impl<I: ControlIo> Owner<I> {
         self.download(payload).await?;
         self.stage(Stage::InitializingTables);
         super::rtl8723b_phy::mac_bb_rf(self, &factory).await?;
+        super::rtl8723b_radio::post_tables(self, &factory).await?;
         self.stage(Stage::TablesReady);
+        self.stage(Stage::Calibrating);
+        super::rtl8723b_iqk::lc_calibrate(self).await?;
+        let iqk = super::rtl8723b_iqk::iq_calibrate(self).await?;
+        let post = super::rtl8723b_radio::post_calibration(self).await?;
+        *self.radio_8723b.lock() = Some(Radio8723b { iqk, post });
+        self.stage(Stage::RadioReady);
         Ok(info)
     }
 
