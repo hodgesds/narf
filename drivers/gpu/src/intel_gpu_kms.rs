@@ -104,7 +104,7 @@ fn xr30_resource_profile(
         .footprint(geometry)
         .map_err(scanout_error)?;
     crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
-    timing.check(io, None)?;
+    timing.check(io, None, false)?;
     if io.read32(0x70188) != geometry.pitch / 64
         || io.read32(0x70190) != ((geometry.height - 1) << 16) | (geometry.width - 1)
     {
@@ -167,6 +167,16 @@ pub(crate) fn xr30_discovery_profile(
     };
     crate::intel_gpu_color::Owner::capture(io, Generation::MeteorLake).is_ok()
         && io.published_epoch() == Some(epoch)
+}
+
+/// Display 13 (ADL-P, ADL-N): the Gen12 orchestrator writes
+/// `TRANS_VBLANK` without its start field there.
+fn gen12_display13(io: &impl Platform) -> bool {
+    use crate::intel_gpu_gt::Gen12Platform;
+    matches!(
+        io.gen12_family(),
+        Some(Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN)
+    )
 }
 
 /// The production implementation retains PCI authority and a permanent UC
@@ -2993,6 +3003,7 @@ impl<M: Platform> Guard<'_, M> {
                     self.device.platform.clone(),
                     self.device.bar_len,
                     profile.latencies,
+                    gen12_display13(&self.device.platform),
                 )
             } else {
                 crate::intel_gpu_dsb::Owner::reserve(
@@ -3537,6 +3548,7 @@ impl<M: Platform> Guard<'_, M> {
                             self.device.platform.clone(),
                             self.device.bar_len,
                             resources.latencies,
+                            gen12_display13(&self.device.platform),
                         )
                     } else {
                         crate::intel_gpu_dsb::Owner::reserve(

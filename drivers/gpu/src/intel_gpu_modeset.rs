@@ -1179,11 +1179,20 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Err(_) => return, // bad timing; downstream poll will time out
         };
         let base = self.transcoder().base();
+        // intel_set_transcoder_timings: display 13 (ADL-P and ADL-N,
+        // xe_lpd_display) clears VBLANK_START (crtc_vblank_start = 1, the
+        // hardware ignores it); display 12 (TGL and ADL-S, XE_D_DISPLAY)
+        // keeps vactive - 1 + SCL. An unknown family keeps display 12's.
+        use crate::intel_gpu_gt::Gen12Platform;
+        let vblank = match self.gen12_family {
+            Some(Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN) => prog.vblank_display13(),
+            _ => prog.vblank,
+        };
         self.mmio.write32(base + TRANS_HTOTAL_OFFSET, prog.htotal);
         self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);
         self.mmio.write32(base + TRANS_HSYNC_OFFSET, prog.hsync);
         self.mmio.write32(base + TRANS_VTOTAL_OFFSET, prog.vtotal);
-        self.mmio.write32(base + TRANS_VBLANK_OFFSET, prog.vblank);
+        self.mmio.write32(base + TRANS_VBLANK_OFFSET, vblank);
         self.mmio.write32(base + TRANS_VSYNC_OFFSET, prog.vsync);
         compiler_fence(Ordering::SeqCst);
     }
@@ -2385,6 +2394,42 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_transcoder_writes_six_regs
+    );
+
+    fn smoke_program_transcoder_vblank_start_follows_display_version() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        use crate::intel_gpu_pipes::{Transcoder, TRANS_VBLANK_OFFSET, TRANS_VTOTAL_OFFSET};
+        // intel_set_transcoder_timings for 1024x768 (vtotal 806): display 12
+        // (TGL, ADL-S) writes VBLANK_START vactive - 1 = 767 with
+        // VBLANK_END 805; display 13 (ADL-P, ADL-N) writes VBLANK_END only.
+        let reg = Transcoder::A.base() + TRANS_VBLANK_OFFSET;
+        for (family, expected) in [
+            (None, (805 << 16) | 767),
+            (Some(Gen12Platform::TigerLake), (805 << 16) | 767),
+            (Some(Gen12Platform::AlderLakeS), (805 << 16) | 767),
+            (Some(Gen12Platform::AlderLakeP), 805 << 16),
+            (Some(Gen12Platform::AlderLakeN), 805 << 16),
+        ] {
+            let mmio = FakeMmio::new();
+            let mut ms = Modeset::new(&mmio, Ddi::A);
+            if let Some(family) = family {
+                ms.set_gen12_family(family);
+            }
+            ms.program_transcoder(&Mode::VESA_1024X768_60);
+            if mmio.writes_to(reg) != alloc::vec![expected] {
+                return TestResult::Fail("TRANS_VBLANK must follow the display version");
+            }
+            if mmio.writes_to(Transcoder::A.base() + TRANS_VTOTAL_OFFSET)
+                != alloc::vec![(805 << 16) | 767]
+            {
+                return TestResult::Fail("TRANS_VTOTAL keeps its active field");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_transcoder_vblank_start_follows_display_version
     );
 
     fn smoke_program_pipe_writes_srcsz() -> TestResult {

@@ -72,23 +72,22 @@ impl Timing {
     fn hw(self, line: u32) -> u32 {
         (line + u32::from(self.vtotal) - 1) % u32::from(self.vtotal)
     }
+    /// The timing proof. `vblank_start` proves `TRANS_VBLANK`'s start
+    /// field too: only display 12 (TGL, ADL-S) writes it. Display 13
+    /// (ADL-P, ADL-N) and 14 write it 0 (`intel_set_transcoder_timings`
+    /// clears it on display 13+, where the hardware ignores it), so only
+    /// VBLANK_END is proved there.
     pub(crate) fn check(
         self,
         io: &impl MmioWindow,
         gen12_latencies: Option<[u16; 6]>,
+        vblank_start: bool,
     ) -> Result<u32, FsError> {
         if !self.valid() {
             return Err(FsError::Unsupported);
         }
         let packed = |high: u16, low: u16| (u32::from(high) - 1) << 16 | (u32::from(low) - 1);
-        // Display 14 (no Gen12 table) writes TRANS_VBLANK's start field 0:
-        // intel_set_transcoder_timings clears it on display 13+, where the
-        // hardware ignores it. Only VBLANK_END is proved there.
-        let vblank_mask = if gen12_latencies.is_some() {
-            u32::MAX
-        } else {
-            0xFFFF_0000
-        };
+        let vblank_mask = if vblank_start { u32::MAX } else { 0xFFFF_0000 };
         if io.read32(0x60000) != packed(self.htotal, self.width)
             || io.read32(0x6000c) != packed(self.vtotal, self.height)
             || io.read32(0x60010) & vblank_mask != packed(self.vtotal, self.height) & vblank_mask
@@ -188,24 +187,34 @@ pub(crate) struct Owner<M: DisplayAccess + Clone> {
     deadline: u64,
     complete: bool,
     gen12_latencies: Option<[u16; 6]>,
+    /// The timing proof covers `TRANS_VBLANK`'s start field (display 12).
+    vblank_start: bool,
     ints: u32,
     errors: u32,
     gen12_color: Option<crate::intel_gpu_color::Profile>,
 }
 impl<M: DisplayAccess + Clone> Owner<M> {
     pub(crate) fn reserve(io: M, bar_len: u64) -> Result<Self, FsError> {
-        Self::reserve_profile(io, bar_len, None)
+        Self::reserve_profile(io, bar_len, None, false)
     }
-    pub(crate) fn reserve_gen12(io: M, bar_len: u64, latencies: [u16; 6]) -> Result<Self, FsError> {
+    /// A Gen12 owner; `display13` (ADL-P, ADL-N) proves `TRANS_VBLANK`
+    /// without its start field.
+    pub(crate) fn reserve_gen12(
+        io: M,
+        bar_len: u64,
+        latencies: [u16; 6],
+        display13: bool,
+    ) -> Result<Self, FsError> {
         if latencies[0] == 0 {
             return Err(FsError::Unsupported);
         }
-        Self::reserve_profile(io, bar_len, Some(latencies))
+        Self::reserve_profile(io, bar_len, Some(latencies), !display13)
     }
     fn reserve_profile(
         io: M,
         bar_len: u64,
         gen12_latencies: Option<[u16; 6]>,
+        vblank_start: bool,
     ) -> Result<Self, FsError> {
         if !io.access_ok() || (gen12_latencies.is_none() && io.read32(0x4804) != 4) {
             return Err(FsError::NoDevice);
@@ -278,6 +287,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             deadline: 0,
             complete: false,
             gen12_latencies,
+            vblank_start,
             gen12_color: None,
             ints: if gen12_latencies.is_some() {
                 0x0f
@@ -368,7 +378,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if !self.io.access_ok() {
             return Err(FsError::NoDevice);
         }
-        let timing_check = timing.check(&self.io, self.gen12_latencies);
+        let timing_check = timing.check(&self.io, self.gen12_latencies, self.vblank_start);
         // An unavailable read is a hard authority/power failure, even when
         // its all-ones value also resembles unsupported live timing flags.
         if !self.io.access_ok() {

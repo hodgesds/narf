@@ -210,7 +210,8 @@ fn smoke_gen12_dsb_native_timing_w1c_mask_pat_free_and_same_va_retention() -> Te
     p.set(IER, 8 | (1 << 5));
     p.set(IMR, u32::MAX & !8);
     p.set(IIR, 8 | (1 << 7));
-    let mut owner = match Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16]) {
+    let mut owner = match Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16], false)
+    {
         Ok(owner) => owner,
         Err(FsError::NotImplemented) => {
             assert!(cfg!(target_arch = "aarch64"));
@@ -220,9 +221,9 @@ fn smoke_gen12_dsb_native_timing_w1c_mask_pat_free_and_same_va_retention() -> Te
     };
     assert_eq!(owner.ints, 0x0f);
     assert_eq!(owner.errors, 0x0e);
-    assert_eq!(timing.check(&p, Some([6, 8, 10, 12, 14, 16])), Ok(31));
+    assert_eq!(timing.check(&p, Some([6, 8, 10, 12, 14, 16]), true), Ok(31));
     assert_eq!(
-        timing.check(&p, Some([65535; 6])),
+        timing.check(&p, Some([65535; 6]), true),
         Err(FsError::Unsupported)
     );
     assert_eq!(
@@ -284,7 +285,7 @@ fn smoke_gen12_dsb_reserved_ats_state_and_unsafe_timing_refuse_before_dma() -> T
         let p = MockPlatform::new();
         p.set(r, v);
         assert!(matches!(
-            Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16]),
+            Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16], false),
             Err(FsError::Unsupported)
         ));
         assert!(p.dsb_mappings().is_empty());
@@ -298,11 +299,12 @@ fn smoke_gen12_dsb_reserved_ats_state_and_unsafe_timing_refuse_before_dma() -> T
     ] {
         let p = MockPlatform::new();
         let timing = p.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::TigerLake);
-        let mut owner = match Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16]) {
-            Ok(owner) => owner,
-            Err(FsError::NotImplemented) => return TestResult::Pass,
-            Err(e) => panic!("{e:?}"),
-        };
+        let mut owner =
+            match Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16], false) {
+                Ok(owner) => owner,
+                Err(FsError::NotImplemented) => return TestResult::Pass,
+                Err(e) => panic!("{e:?}"),
+            };
         p.set(r, v);
         assert!(owner.arm(timing, &[], None, p.now()).is_err());
         assert!(!owner.exposed());
@@ -320,30 +322,30 @@ kernel_test_in!(
 fn smoke_dsb_display14_timing_proves_vblank_end_only() -> TestResult {
     // intel_set_transcoder_timings clears TRANS_VBLANK's start field on
     // display 13+ (the hardware ignores it), so the display-14 proof (no
-    // Gen12 latency table) compares VBLANK_END alone. The Gen12 proof keeps
-    // the full value the Gen12 orchestrator writes.
+    // Gen12 latency table) compares VBLANK_END alone. The display-12 Gen12
+    // proof keeps the full value the Gen12 orchestrator writes there.
     let p = MockPlatform::new();
     let t = p.dsb_timing();
-    let inherited = t.check(&p, None);
+    let inherited = t.check(&p, None, false);
     if inherited.is_err() {
         return TestResult::Fail("the inherited display-14 timing must prove");
     }
     p.set(0x60010, 76 << 16);
-    if t.check(&p, None) != inherited {
+    if t.check(&p, None, false) != inherited {
         return TestResult::Fail("a cleared VBLANK_START must prove on display 14");
     }
     p.set(0x60010, 75 << 16);
-    if t.check(&p, None) != Err(FsError::Unsupported) {
+    if t.check(&p, None, false) != Err(FsError::Unsupported) {
         return TestResult::Fail("a moved VBLANK_END must still refuse on display 14");
     }
     let lat = [6, 8, 10, 12, 14, 16];
     let g = MockPlatform::new();
     let timing = g.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::AlderLakeP);
-    if timing.check(&g, Some(lat)) != Ok(31) {
+    if timing.check(&g, Some(lat), true) != Ok(31) {
         return TestResult::Fail("the Gen12 timing must prove");
     }
     g.set(0x60010, 76 << 16);
-    if timing.check(&g, Some(lat)) != Err(FsError::Unsupported) {
+    if timing.check(&g, Some(lat), true) != Err(FsError::Unsupported) {
         return TestResult::Fail("Gen12 keeps proving VBLANK_START");
     }
     TestResult::Pass
@@ -351,4 +353,38 @@ fn smoke_dsb_display14_timing_proves_vblank_end_only() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_dsb",
     smoke_dsb_display14_timing_proves_vblank_end_only
+);
+
+fn smoke_dsb_display13_gen12_timing_proves_vblank_end_only() -> TestResult {
+    // The Gen12 orchestrator writes TRANS_VBLANK without its start field on
+    // display 13 (ADL-P, ADL-N), as intel_set_transcoder_timings does; that
+    // owner's proof compares VBLANK_END alone, and TGL's keeps the start.
+    let lat = [6, 8, 10, 12, 14, 16];
+    let g = MockPlatform::new();
+    let timing = g.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::AlderLakeP);
+    if timing.check(&g, Some(lat), false) != Ok(31) {
+        return TestResult::Fail("the display-13 timing must prove");
+    }
+    g.set(0x60010, 76 << 16);
+    if timing.check(&g, Some(lat), false) != Ok(31) {
+        return TestResult::Fail("a cleared VBLANK_START must prove on display 13");
+    }
+    g.set(0x60010, 75 << 16);
+    if timing.check(&g, Some(lat), false) != Err(FsError::Unsupported) {
+        return TestResult::Fail("a moved VBLANK_END must refuse on display 13");
+    }
+    for (display13, start) in [(true, false), (false, true)] {
+        let p = MockPlatform::new();
+        p.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::AlderLakeP);
+        match Owner::reserve_gen12(p.clone(), 0x1000000, lat, display13) {
+            Ok(owner) if owner.vblank_start == start => {}
+            Err(FsError::NotImplemented) => return TestResult::Pass,
+            _ => return TestResult::Fail("the owner must keep the display version's proof"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dsb",
+    smoke_dsb_display13_gen12_timing_proves_vblank_end_only
 );
