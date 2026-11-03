@@ -7116,11 +7116,11 @@ old pins. A job submitted before an unmap returns may still finish against
 the retained old frames afterwards. Only the binder's own address space can
 re-collect: another process's EXEC on a shared VM is ENOSYS, where Linux
 pins through the binder's mm. An address + length overflow stays EFAULT
-(Linux: -EOVERFLOW). The memory/ swap-out batch and lazy-free discard
-primitives do not refuse a pinned page, and multi-owner compaction
-(`migrate_frame_multi`) repoints a COW-shared pinned page; Linux refuses
-pinned folios on all three paths. The notifier now makes EXEC re-collect
-after those changes, but the paths themselves are unchanged.
+(Linux: -EOVERFLOW). The memory/ swap-out batch, lazy-free discard and
+multi-owner compaction (`migrate_frame_multi`) used to move or drop a pinned
+page while the GPU still wrote through the pin. They now refuse pinned
+pages as Linux does (`folio_maybe_dma_pinned`); see the follow-up subsection
+below.
 
 **VRAM CPU-mapping revocation** (revoke a device-frame set, then refault after
 runtime resume) is not part of this slice. Autosuspend with live VRAM
@@ -7144,3 +7144,39 @@ Fixtures, all new and unexecuted in this slice:
   munmap, mprotect and MADV_DONTNEED on it fire the production notifier
   path. The existing `smoke_xe_userptr_bind_exec_validation_and_retirement`
   keeps its expectations.
+
+### Pinned USERPTR pages survive reclaim — native fixtures added
+
+Sources are Linux b90c984d: `mm/vmscan.c::shrink_folio_list` (the two
+`folio_maybe_dma_pinned` tests), `mm/rmap.c::try_to_unmap_one` (the MADV_FREE
+reference test and the anon-exclusive `folio_try_share_anon_rmap_pte`
+back-off), `mm/rmap.c::try_to_migrate_one`, `mm/migrate.c` and
+`mm/gup.c::follow_page_pte` (`FOLL_TOUCH` dirtying at a `FOLL_WRITE` pin).
+This is TCB-class memory/ work (`memory/specification/spec.md` §3 and §4,
+`safety-argument.toml`).
+
+The frames behind an Xe MAP_USERPTR (or any other `UserPagePin`) were never
+freed under the GPU, because the pin holds a reference. Their contents could
+still diverge from the mapping: swap-out wrote a snapshot and repointed the
+VA at a swap entry, lazy-free discard dropped a page the GPU had written
+(device writes never set the PTE's DIRTY bit), and multi-owner compaction
+repointed both COW owners at a copy. Each path now refuses a pinned page,
+deciding under the region lock that pins are taken under:
+
+- Swap-out skips pinned pages at selection and swaps the rest of the batch.
+  A pin that lands after the PTE commit refuses that victim at publication.
+  Its leaf is restored exactly, its slot is released and no `Clear` fires
+  for it. The reclaim scan never offers a pinned page.
+- `MADV_FREE` does not mark a pinned page, pinning drops an existing mark,
+  and discard keeps a pinned page and clears its mark. Linux relies on the
+  pinner dirtying the folio instead; NARF pins carry no dirty bit.
+- `migrate_frame` reports the new `MigrateError::Pinned` for a pinned frame,
+  and each owner's repoint rechecks the pin before it moves.
+
+The paths are x86_64-only (aarch64 has no swap PTEs, and its `MADV_FREE` is
+eager). Fixtures, new and unexecuted in this slice:
+`memory::smoke_dma_pin_swap_out_skips_pinned_page`,
+`smoke_dma_pin_swap_commit_refuses_racing_pin` (a kernel-test seam lands the
+pin between commit and publication),
+`smoke_dma_pin_lazyfree_never_discards_pinned_page` and
+`memory/migrate::smoke_migrate_frame_multi_refuses_pinned`.

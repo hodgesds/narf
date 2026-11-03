@@ -31,8 +31,10 @@
 //! its leaf), NUMA hint protection (the frame is unchanged and restoring or
 //! migrating it goes through the migration row), growth, and mapping new
 //! pages. Shared-frame replacement (`replace_shared_frame`,
-//! `with_revoked_shared_frames`) and single-owner migration refuse pinned
-//! frames, so a consumer's pinned view is never moved by them.
+//! `with_revoked_shared_frames`), single- and multi-owner migration,
+//! swap-out and lazy-free discard all refuse pinned frames, so a consumer's
+//! pinned view is never moved or dropped by them (the `Clear`/`Migrate`
+//! rows then fire only for the unpinned pages they do change).
 //!
 //! # Locking and the callback contract
 //!

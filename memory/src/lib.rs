@@ -74,6 +74,7 @@ pub mod vmalloc;
 pub mod wx;
 pub mod zpool;
 
+mod dma_pin_tests;
 mod guard_tests;
 mod memtype_tests;
 mod mmu_notifier_tests;

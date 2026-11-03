@@ -2177,3 +2177,28 @@ argument = "No new denial-of-service lever. Each registration costs one Arc<MmuI
 ref = "security-model/specification/spec.md#L147"
 agent = "Claude Opus 5.5"
 argument = "Untrusted processes reach interval registration only through driver ioctls (Xe MAP_USERPTR) that register on the caller's own address space, with ranges validated as non-empty, non-overflowing and below USER_HALF_END (InvalidRange, reported as EFAULT like the pin over that range). The mm operations they can trigger (munmap, MAP_FIXED, mremap, mprotect, madvise, fork, exit) keep their argument validation, errnos and results; notification cannot fail them. Fork copies no interval into the child and a child's operations never reach the parent's intervals (smoke_mmu_notifier_fork_cow_break_and_child_isolation)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Claude Opus 5.5"
+argument = "Reclaim and migration refuse pages pinned for device access (Linux folio_maybe_dma_pinned). The change stays inside memory/, already in the TCB set: swap.rs (swap_out_batch_owned skips pinned victims at resolution and lets its owner refuse a committed victim, whose recorded leaf restore_swap_out_leaves puts back), address_space.rs (swap_out_private_batch, collect_anon_reclaim_candidates, madvise_free, discard_lazyfree_pages, pin_user_page, relocate_page_inner, repoint_shared_page), x86_64/paging.rs (a predicate on the two lazy-free walkers and lazyfree_cancel_4kb) and migrate.rs (MigrateError::Pinned). No TCB member, capability, domain, mapping authority or lock is added. The pin-marker read (cow::is_pinned, whose spill-table lock is a leaf) runs only under a region lock, as fork already does, never under the sharded page-table root lock: the lazy-free walkers take a 64-slot mask gathered beforehand, and pin_user_page drops the LAZYFREE mark before it takes the pin marker."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Claude Opus 5.5"
+argument = "No permission, PKS key field, W^X classification, capability check or domain transition changes. A refused swap victim gets back the exact raw leaf the commit's validation pass read under the same root lock (same frame, same attributes), and only while that leaf still holds the batch's own swap entry and the owner's Evicting record excludes every other mutator. The new unsafe atomics (lazyfree_cancel_4kb, the discard pass's refusal) clear only software bit 9 (LAZYFREE) of a present leaf with fetch_and under the root walk lock, so hardware A/D updates are kept and no translation or permission changes; bit 9 is ignored by the MMU, so no TLB entry goes stale."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L165"
+agent = "Claude Opus 5.5"
+argument = "Translation retirement before frame reuse is unchanged: every path frees strictly fewer frames than before and never one a refused page still maps. A refused swap victim's frame is excluded from the post-shootdown free loop and keeps its Region slot and rmap owner; swapped victims still clear their slots and are freed only after the batch shootdown. Lazy-free never retires a pinned leaf. Multi-owner migration refuses before copying, and an owner whose repoint is refused keeps the source while the moved owners' references are released as before. The device's frame is the frame the mapping shows, so a GPU writing through a USERPTR pin cannot write data the process has stopped seeing. Pins are taken under the region lock, and each refusal decides under it (swap publication, lazy-free mark, pin and discard, per-owner repoint). Smokes smoke_dma_pin_swap_out_skips_pinned_page, smoke_dma_pin_swap_commit_refuses_racing_pin, smoke_dma_pin_lazyfree_never_discards_pinned_page and smoke_migrate_frame_multi_refuses_pinned write through the pin and read the bytes back through the mapping."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L171"
+agent = "Claude Opus 5.5"
+argument = "No new denial-of-service lever. Swapping or discarding a pinned page never released memory, because the pin's reference kept the frame allocated; refusing it saves the swap slot and the backend write it used to waste. The checks are O(1) per page (a flat pin-counter load, or a leaf-locked spill lookup) inside scans that are already bounded. The refusal path in swap_out_batch_owned is allocation-free under the owner's transition record (the keep vector is allocated before the commit), and MADV_FREE, swap and compaction keep their result types; the reclaim plan simply reports fewer pages."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L147"
+agent = "Claude Opus 5.5"
+argument = "Untrusted processes reach these paths only through existing triggers (MADV_FREE, driver ioctls that pin their own pages, memory pressure). Their argument validation, errnos and return values are unchanged: MADV_FREE still succeeds and simply leaves a pinned page unmarked, and pinning still returns the same pins. A process can pin only pages of its own address space, so it cannot make another process's memory unreclaimable."

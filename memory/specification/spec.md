@@ -438,6 +438,25 @@ impl UserPagePin {
 /// (the CVE-2020-29374 class), even across a later mprotect(PROT_WRITE).
 /// Physical migration to another node rejects pinned backing with
 /// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
+/// Reclaim and compaction never move or drop a pinned base page (Linux
+/// folio_maybe_dma_pinned; NARF's pin count is exact, `cow::is_pinned`):
+///   - swap_out_private_batch skips it and swaps the rest of the batch; the
+///     collect_anon_reclaim_candidates scan never offers it. A pin landing
+///     between the PTE commit and publication refuses that victim under the
+///     region lock: its exact leaf is restored, its slot discarded and
+///     uncharged, its frame kept, no Clear fires for it, and the count
+///     excludes it (try_to_unmap_one's anon-exclusive back-off).
+///   - madvise_free does not mark it; pin_user_page drops an existing
+///     LAZYFREE mark (follow_page_pte's FOLL_TOUCH folio_mark_dirty); and
+///     discard_lazyfree_pages keeps a pinned page and clears its mark
+///     (try_to_unmap_one's MADV_FREE reference test). Device writes never
+///     set DIRTY and pins carry no dirty mark, so a marked page is never
+///     pinned under the region lock.
+///   - migrate::migrate_frame returns MigrateError::Pinned for a pinned
+///     frame, single- or multi-owner, and repoint_shared_page refuses a
+///     pinned source under the owner's region lock.
+/// These reclaim paths are x86_64-only; aarch64 MADV_FREE is eager
+/// MADV_DONTNEED.
 
 // ── Interval notifiers over user ranges (`mmu_notifier`) ─────────────────
 // Linux mm/mmu_notifier.c interval API for device mirrors of user memory.
@@ -1532,6 +1551,17 @@ x86_64 is rejected at runtime.
   `UserPagePin`s collected inside a section, so a frame the device can reach
   is never freed or reused before the consumer drops its pins. When no
   interval is registered every site costs one atomic load.
+- **Reclaim never moves or drops a pinned page.** A frame with a
+  `UserPagePin` (`cow::is_pinned`) keeps its translation and backing through
+  swap-out, lazy-free discard and every migration path, so the frame a
+  device writes through its pin is always the frame the mapping shows
+  (Linux `folio_maybe_dma_pinned`). Pins are taken under the region lock,
+  and each path decides under that lock: swap at selection and again at
+  publication (a late pin restores the committed leaf and frees no frame),
+  lazy-free at mark, pin and discard time (no pinned page carries an
+  unconsumed `LAZYFREE` mark), and multi-owner migration per owner before
+  its repoint. The frame itself was already safe (the pin holds a
+  reference); this invariant keeps the device's writes visible.
 - A private fork preserves each VMA's logical POSIX WRITE bit and marks it
   COW. Hardware leaves remain read-only while their backing-frame refcount is
   greater than one. Pinned writable private pages are instead copied for the
@@ -2005,7 +2035,10 @@ x86_64 is rejected at runtime.
   vector write, validates every same-root leaf before publishing any swap PTE,
   and retires stale translations once before returning any victim frame to the
   allocator. Failure before PTE publication leaves every mapping resident and
-  releases the complete slot run.
+  releases the complete slot run. A victim its owner refuses at publication
+  (a pin arrived) gets its recorded leaf back under the root lock while its
+  transition record still excludes every other mutator, and only its slot
+  is released; the rest of the batch completes.
 - A swap-in batch validates and reads every requested slot into unpublished
   frames before atomically replacing the same-root swap leaves. Failure leaves
   all PTEs and slots unchanged. Backend I/O runs without the global swap-device

@@ -2029,6 +2029,20 @@ impl Drop for UserPagePin {
     }
 }
 
+/// Pin markers of up to 64 consecutive backing slots (bit `i` for
+/// `slots[i]`), gathered under the region lock before a page-table walk:
+/// the walk's predicate runs under the root lock, where reading a spill pin
+/// marker (behind its own lock) is not allowed.
+#[cfg(target_arch = "x86_64")]
+fn pinned_slots_mask(slots: &[PhysAddr]) -> u64 {
+    debug_assert!(slots.len() <= 64);
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, phys)| phys.raw() != 0 && crate::frame::cow::is_pinned(**phys))
+        .fold(0, |mask, (index, _)| mask | 1 << index)
+}
+
 /// Non-owning NUMA residency summary for one registered virtual region.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NumaRegionSnapshot {
@@ -9437,8 +9451,12 @@ impl AddressSpace {
                         let va = rb + (i as u64) * 4096;
                         next_cursor = va.saturating_add(4096);
                         // Skip holes (unbacked) and pages mid-swap-transition — no
-                        // agable PTE there.
-                        if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&va) {
+                        // agable PTE there — and pinned pages, which the swap
+                        // executor keeps resident (folio_maybe_dma_pinned).
+                        if region.phys[i].raw() == 0
+                            || table.swap_pages.contains_key(&va)
+                            || crate::frame::cow::is_pinned(region.phys[i])
+                        {
                             i += 1;
                             continue;
                         }
@@ -9460,7 +9478,10 @@ impl AddressSpace {
                         i += 1;
                         while i < last && collected + run_len < max_pages {
                             let cva = rb + (i as u64) * 4096;
-                            if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&cva) {
+                            if region.phys[i].raw() == 0
+                                || table.swap_pages.contains_key(&cva)
+                                || crate::frame::cow::is_pinned(region.phys[i])
+                            {
                                 break;
                             }
                             next_cursor = cva.saturating_add(4096);
@@ -9521,7 +9542,11 @@ impl AddressSpace {
     /// commit the swap layer calls back before invalidation/free, allowing this
     /// method to clear authoritative `Region::phys` ownership and publish
     /// `Swapped` atomically under the region lock. Shared, COW, file-backed,
-    /// locked, lazy, and already-transitioning pages are rejected.
+    /// locked, lazy, and already-transitioning pages are rejected. A page
+    /// pinned for device or kernel access is skipped and stays resident with
+    /// its leaf, whether the pin predates the batch or arrives before its
+    /// commit (Linux `folio_maybe_dma_pinned`); the count returned excludes
+    /// it.
     ///
     /// # Safety
     ///
@@ -9567,6 +9592,15 @@ impl AddressSpace {
                 if phys.raw() == 0 {
                     return Err(SwapError::InvalidBatch);
                 }
+                // Linux shrink_folio_list: a folio_maybe_dma_pinned folio is
+                // kept resident (`keep_locked`) and the rest of the batch
+                // proceeds. A pinned frame's later device writes would never
+                // reach the swapped copy. Pins are taken under this lock, so
+                // the test is exact here; the commit callback below rechecks
+                // for a pin that arrives while the batch is in flight.
+                if crate::frame::cow::is_pinned(phys) {
+                    continue;
+                }
                 victims.push((
                     SwapVictim {
                         pml4_phys: self.root,
@@ -9581,6 +9615,9 @@ impl AddressSpace {
                     .insert(victim.virt.as_u64(), SwapPageState::Evicting(*phys));
             }
         }
+        if victims.is_empty() {
+            return Ok(0);
+        }
 
         let bare_victims: Vec<SwapVictim> = victims.iter().map(|(victim, _)| *victim).collect();
         // SAFETY: the transition table above pins metadata ownership. The
@@ -9589,26 +9626,38 @@ impl AddressSpace {
             crate::swap::swap_out_batch_owned(
                 &bare_victims,
                 Some(self.translation_tag()),
-                |resolved| {
+                |resolved, keep| {
                     let mut table = self.regions.lock();
+                    // Linux try_to_unmap_one backs off after the PTE is
+                    // cleared when folio_try_share_anon_rmap_pte finds a DMA
+                    // pin. A pin is taken under this lock from the Region
+                    // slot, which still names the frame while it is Evicting,
+                    // so this is the last point one can arrive; after the
+                    // slot is cleared below no pin can reach the frame. A
+                    // refused victim keeps its slot, rmap owner and frame,
+                    // and the swap layer restores its leaf.
+                    for ((_, phys), keep) in resolved.iter().zip(keep.iter_mut()) {
+                        *keep = crate::frame::cow::is_pinned(*phys);
+                    }
+                    let swapped = || {
+                        resolved
+                            .iter()
+                            .zip(keep.iter())
+                            .filter(|(_, keep)| !**keep)
+                            .map(|((victim, _), _)| victim.virt.as_u64())
+                    };
                     // Before the slots are cleared below and before the swap
                     // primitive frees any victim frame.
-                    let lo = resolved
-                        .iter()
-                        .map(|(victim, _)| victim.virt.as_u64())
-                        .min();
-                    let hi = resolved
-                        .iter()
-                        .map(|(victim, _)| victim.virt.as_u64())
-                        .max();
-                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                    if let (Some(lo), Some(hi)) = (swapped().min(), swapped().max()) {
                         self.notify_invalidate(
                             lo,
                             hi.saturating_add(4096),
                             crate::mmu_notifier::MmuNotifierEvent::Clear,
                         );
                     }
-                    for (victim, phys) in resolved {
+                    for ((victim, phys), _) in
+                        resolved.iter().zip(keep.iter()).filter(|(_, keep)| !**keep)
+                    {
                         let va = victim.virt.as_u64();
                         assert_eq!(
                             table.swap_pages.get(&va),
@@ -12165,18 +12214,28 @@ impl AddressSpace {
                         if self.root.as_u64() == 0 {
                             break;
                         }
-                        let backed_v = rb + first as u64 * 4096;
-                        // SAFETY: identity-mapped; the run lies in a bookkept
-                        // region of this AS and the region lock keeps it
-                        // stable through the batched walk.
-                        marked += unsafe {
-                            crate::x86_64::paging::lazyfree_mark_4kb_local_range(
-                                self.root,
-                                VirtAddr::new(backed_v),
-                                slots.len() as u64,
-                            )
+                        for (window, run) in slots.chunks(64).enumerate() {
+                            let backed_v = rb + (first + window * 64) as u64 * 4096;
+                            // A pinned page is not marked: a device may write
+                            // it after this call without setting DIRTY, and
+                            // the pin carries no dirty mark for its release
+                            // (Linux's unpinner marks the folio dirty
+                            // instead). Pins are taken under the region lock
+                            // held here.
+                            let pinned = pinned_slots_mask(run);
+                            // SAFETY: identity-mapped; the run lies in a
+                            // bookkept region of this AS and the region lock
+                            // keeps it stable through the batched walk.
+                            marked += unsafe {
+                                crate::x86_64::paging::lazyfree_mark_4kb_local_range(
+                                    self.root,
+                                    VirtAddr::new(backed_v),
+                                    run.len() as u64,
+                                    |page| pinned & (1 << page) == 0,
+                                )
+                            }
+                            .unwrap_or(0);
                         }
-                        .unwrap_or(0);
                     }
                 });
             }
@@ -12199,8 +12258,10 @@ impl AddressSpace {
     /// space's private anonymous regions and retires every leaf whose
     /// `LAZYFREE` bit survives with DIRTY still clear (see
     /// `lazyfree_take_clean_4kb_range` for the walker-race contract);
-    /// rewritten pages lose the mark and stay resident. Returns the number
-    /// of pages freed, stopping once `max_pages` have been collected.
+    /// rewritten pages lose the mark and stay resident, and so do pages
+    /// pinned for device or kernel access, which a device may have written
+    /// without setting DIRTY. Returns the number of pages freed, stopping
+    /// once `max_pages` have been collected.
     #[cfg(target_arch = "x86_64")]
     pub fn discard_lazyfree_pages(&self, max_pages: usize) -> usize {
         if self.root.as_u64() == 0 || max_pages == 0 {
@@ -12234,16 +12295,24 @@ impl AddressSpace {
                     return;
                 }
                 for (first, slots) in r.phys.chunks(0, r.phys.len()) {
-                    // SAFETY: identity-mapped; this allocated backing block
-                    // stays stable under the region lock.
-                    let _ = unsafe {
-                        crate::x86_64::paging::lazyfree_take_clean_4kb_range(
-                            root,
-                            VirtAddr::new(rb + first as u64 * 4096),
-                            slots.len() as u64,
-                            |phys, va| taken.push((phys, va.as_u64())),
-                        )
-                    };
+                    for (window, run) in slots.chunks(64).enumerate() {
+                        // Never discard a page pinned for device access
+                        // (Linux try_to_unmap_one: an extra reference
+                        // restores the PTE). Pins are taken under the region
+                        // lock held here, so the mask is exact.
+                        let pinned = pinned_slots_mask(run);
+                        // SAFETY: identity-mapped; this allocated backing
+                        // block stays stable under the region lock.
+                        let _ = unsafe {
+                            crate::x86_64::paging::lazyfree_take_clean_4kb_range(
+                                root,
+                                VirtAddr::new(rb + (first + window * 64) as u64 * 4096),
+                                run.len() as u64,
+                                |page| pinned & (1 << page) == 0,
+                                |phys, va| taken.push((phys, va.as_u64())),
+                            )
+                        };
+                    }
                 }
                 // The discarded pages leave this region's translation in the
                 // same lock hold that zeroes their slots; their frames are
@@ -13925,6 +13994,11 @@ impl AddressSpace {
                 return Err(AddressSpaceError::Unmapped);
             }
         }
+        // A pinned frame stays put (its pin reference would also fail the
+        // single-owner test below; name the reason).
+        if crate::frame::cow::is_pinned(old_phys) {
+            return Err(AddressSpaceError::Pinned);
+        }
         // A COW-shared frame has other owners; relocating it here would leave
         // their PTEs pointing at the freed source. Refuse — multi-owner
         // migration (rmap-walk every owner) is a follow-up.
@@ -13977,7 +14051,8 @@ impl AddressSpace {
     /// pre-copied, shared `dst` frame — one step of multi-owner
     /// [`crate::migrate::migrate_frame`]. Under the region lock: verifies the
     /// page still maps `expected_src` (else the owner raced — COW-split or
-    /// unmapped — and `Err(())` is returned so the caller drops this owner),
+    /// unmapped — and `Err(())` is returned so the caller drops this owner)
+    /// and that `expected_src` is not pinned (same `Err(())`),
     /// installs a READ-ONLY leaf for `dst` (so a later write still faults into a
     /// proper COW split against `dst`'s shared refcount), repoints `Region.phys`
     /// and the reverse map, and flushes. Does NOT copy, allocate, free, or touch
@@ -14005,6 +14080,13 @@ impl AddressSpace {
             let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
             if region.phys.get(page_idx).copied() != Some(expected_src) {
                 return Err(()); // raced: no longer maps the source
+            }
+            // A pin taken through this space since the caller's check: this
+            // owner keeps the pinned frame (Linux try_to_migrate_one backs
+            // off a folio_maybe_dma_pinned page). Pins are taken under this
+            // lock, so none can arrive before the repoint commits.
+            if crate::frame::cow::is_pinned(expected_src) {
+                return Err(());
             }
             (page_idx, region.perms)
         };
@@ -14638,6 +14720,22 @@ impl AddressSpace {
             let phys = *region.phys.get(index)?;
             if phys.raw() == 0 {
                 return None;
+            }
+            // A pinned page is never a clean MADV_FREE page: the device may
+            // write it without setting the leaf's DIRTY bit, so drop the
+            // mark now, under the lock lazy-free discard also holds (Linux
+            // marks the folio dirty at a FOLL_WRITE pin). Only private
+            // regions are ever marked.
+            #[cfg(target_arch = "x86_64")]
+            if self.root.raw() != 0 && !region.perms.contains(RegionPerms::SHARED) {
+                // SAFETY: this live root owns the region found above and the
+                // region lock keeps its leaf-table path stable.
+                unsafe {
+                    crate::x86_64::paging::lazyfree_cancel_4kb(
+                        self.root,
+                        VirtAddr::new(address & !0xFFF),
+                    )
+                };
             }
             // Shared-memory/file owners also retire RAM via free_frame. Hold
             // the physical allocation itself, independent of their mapping
