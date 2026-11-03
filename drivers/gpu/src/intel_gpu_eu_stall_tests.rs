@@ -1140,15 +1140,16 @@ fn smoke_eu_stall_large_threshold_fifo_capacity_and_unacknowledged_backpressure(
     )
     .unwrap();
     assert_eq!(session.room(), 16 * 1024 * 1024);
+    let above = Config {
+        rate: 7,
+        wait: 262145,
+    };
+    // xe_eu_stall_stream_open_locked refuses an open stream with -EBUSY
+    // before xe_eu_stall_stream_init checks the wait range.
+    assert_eq!(Session::new(maximum, above).unwrap_err(), FsError::Busy);
+    drop(session);
     assert_eq!(
-        Session::new(
-            maximum,
-            Config {
-                rate: 7,
-                wait: 262145
-            }
-        )
-        .unwrap_err(),
+        Session::new(maximum, above).unwrap_err(),
         FsError::InvalidData
     );
     TestResult::Pass
