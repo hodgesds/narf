@@ -27,8 +27,10 @@
 //! N2xV 80 MHz), the in-retune IQK H2C, passive-primary TX grants and the
 //! HT-program quiet proof follow `pci_firmware.rs` over EP0/bulk; the C21
 //! RF/BB stages run unchanged over the asynchronous register `Io`.
-//! Power-tracking maintenance, the PS RX quiet proof and TX A-MPDU
-//! aggregation keep the trait's `Unsupported` defaults.
+//! TX A-MPDU binds the N21T record as PCI does; bursts are queued by
+//! `usb_packet::Owner::submit_batch` inside the gate's `invoke_batch`.
+//! Power-tracking maintenance and the PS RX quiet proof keep the trait's
+//! `Unsupported` defaults.
 use super::firmware_transport::{self, Error};
 use super::packet_core::{self, Step};
 use super::usb::{self, Endpoints, Registers, Speed};
@@ -778,11 +780,10 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         &mut self,
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
         self.station_allowed()?;
-        // TX A-MPDU (`packet_aggregation`/`packet_submit_batch`) is not
-        // ported to `usb_packet::Owner`: a provisioned N21T record stays
-        // unbound rather than admitting an originator BA the TX path cannot
-        // aggregate.
-        Ok(None)
+        // `pci_firmware.rs`: the N21T record over the gate's TX base; the
+        // burst runs through `usb_packet::Owner::submit_batch`.
+        let base = self.gate_ref()?.tx_base().ok_or(Error::State)?;
+        Ok(super::tx_ba_power::Source::Registered.load(base).ok())
     }
     fn station_bind_tx_ba(
         &mut self,
@@ -1248,6 +1249,71 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             .as_mut()
             .ok_or(packet_core::Error::State)
             .and_then(|owner| owner.submit(frame, report));
+        self.packet_fail(result)
+    }
+    fn packet_aggregation(
+        &mut self,
+        cfg: Option<super::packet_format::Aggregation>,
+    ) -> Result<(), Error> {
+        // `pci_firmware.rs::packet_aggregation`: an envelope only within the
+        // bound N21T grant.
+        self.station_allowed()?;
+        if cfg.is_some_and(|c| {
+            self.gate
+                .as_ref()
+                .and_then(super::power_policy::Gate::tx_grant)
+                .is_none_or(|g| !g.allows(c))
+        }) {
+            return Err(Error::Prerequisite);
+        }
+        self.packets
+            .as_mut()
+            .ok_or(Error::State)?
+            .aggregation(cfg)
+            .map_err(|_| Error::State)
+    }
+    fn packet_submit_batch(
+        &mut self,
+        b: &[alloc::vec::Vec<u8>],
+    ) -> Result<alloc::vec::Vec<u64>, packet_core::Error> {
+        if self.state != State::Packets || !self.opened() || self.retune.is_some() {
+            return Err(packet_core::Error::State);
+        }
+        if self.gate_current().is_err() || self.passive_tx_allowed().is_err() {
+            return Err(packet_core::Error::Access);
+        }
+        // `Port::originator_ba_allowed` + `batch_allowed`: a bound N21T
+        // grant naming this TID (< 6) and admitting the DATA profile.
+        let gate = self
+            .gate_ref()
+            .map_err(|_| packet_core::Error::Access)?
+            .clone();
+        let owner = self.packets.as_mut().ok_or(packet_core::Error::State)?;
+        let profile = owner.data_profile();
+        let tid = usb_packet::Owner::<P>::batch_tid(b)?;
+        if tid >= 6
+            || gate.tx_grant().is_none_or(|g| g.tids() & (1 << tid) == 0)
+            || !gate.allows_profile(profile)
+            || profile.tid_queue(tid).is_none()
+        {
+            return Err(packet_core::Error::Access);
+        }
+        // `batch_publication`: the burst is queued (and its first URB
+        // begun) inside the current signed gate and all-AC continuation.
+        let result = gate
+            .invoke_batch(profile, || Ok(owner.submit_batch(b)))
+            .map_err(|_| packet_core::Error::Access)
+            .and_then(|r| r);
+        // A refusal before anything was queued (PCI `Core` returns those
+        // without failing) leaves the owner running; a failed URB begin
+        // fails it, and with it the backend.
+        if self
+            .packets
+            .as_ref()
+            .is_some_and(usb_packet::Owner::running)
+        {
+            return result;
+        }
         self.packet_fail(result)
     }
     fn packet_scan_address(&mut self, address: Option<[u8; 6]>) -> Result<(), packet_core::Error> {

@@ -60,6 +60,8 @@ struct Awaiting {
     sequence: u8,
     bytes: Vec<u8>,
     started: u64,
+    /// Its CCX ACK arrived; released once every earlier frame is too.
+    acknowledged: bool,
 }
 /// Everything one [`Owner::poll`] observed.
 #[derive(Default, Debug)]
@@ -134,8 +136,62 @@ pub(super) fn transmit_packet(
     profile: format::DataProfile,
     rts_threshold: Option<u32>,
 ) -> Result<(Vec<u8>, u8), Error> {
+    build(
+        frame,
+        source,
+        mac_id,
+        sequence,
+        profile,
+        rts_threshold,
+        None,
+    )
+    .map(|(packet, qsel, _)| (packet, qsel))
+}
+
+/// [`transmit_packet`] for one MPDU of an A-MPDU burst
+/// (`tx.c::rtw_tx_pkt_info_update_rate`/`rtw_tx_fill_tx_desc` with
+/// `pkt_info->ampdu_en`): the `packet_core` batch descriptor (W2 AGG_EN,
+/// AMPDU_DENSITY; W3 MAX_AGG_NUM) before RTS protection, then the USB qsel
+/// and checksum. Returns the packet, its qsel and the descriptor queue.
+pub(super) fn ampdu_packet(
+    frame: &[u8],
+    source: [u8; 6],
+    mac_id: u8,
+    sequence: u8,
+    profile: format::DataProfile,
+    rts_threshold: Option<u32>,
+    density: u8,
+) -> Result<(Vec<u8>, u8, format::Queue), Error> {
+    build(
+        frame,
+        source,
+        mac_id,
+        Some(sequence),
+        profile,
+        rts_threshold,
+        Some(density),
+    )
+}
+
+fn build(
+    frame: &[u8],
+    source: [u8; 6],
+    mac_id: u8,
+    sequence: Option<u8>,
+    profile: format::DataProfile,
+    rts_threshold: Option<u32>,
+    density: Option<u8>,
+) -> Result<(Vec<u8>, u8, format::Queue), Error> {
     let (mut descriptor, queue) =
         format::transmit_profile(frame, source, mac_id, sequence, profile)?;
+    if let Some(density) = density {
+        let word2 = u32::from_le_bytes(descriptor[8..12].try_into().unwrap())
+            | (1 << 12)
+            | u32::from(density) << 20;
+        let word3 = u32::from_le_bytes(descriptor[12..16].try_into().unwrap()) | 3 << 17;
+        descriptor[8..12].copy_from_slice(&word2.to_le_bytes());
+        descriptor[12..16].copy_from_slice(&word3.to_le_bytes());
+    }
     if queue.data() && (sequence.is_none() || frame[0] == 0x88) {
         super::protection::descriptor(&mut descriptor, frame.len(), rts_threshold);
     }
@@ -152,7 +208,7 @@ pub(super) fn transmit_packet(
         .map_err(|_| Error::Memory)?;
     packet.extend_from_slice(&descriptor);
     packet.extend_from_slice(frame);
-    Ok((packet, qsel))
+    Ok((packet, qsel, queue))
 }
 
 /// Persistent RTL8821CU packet owner over one claimed vendor interface.
@@ -168,6 +224,8 @@ pub(super) struct Owner<I: Io> {
     operating_channel: u8,
     operating_width: u8,
     rts_threshold: Option<u32>,
+    /// Committed N21T A-MPDU envelope (`packet_core::Core::aggregation`).
+    aggregation: Option<format::Aggregation>,
     /// `rtwusb->tx_queue[]`, indexed like `out_ep[]`.
     queues: [VecDeque<Queued>; EP_MAX],
     /// One URB in flight per bulk-OUT pipe.
@@ -212,6 +270,7 @@ impl<I: Io> Owner<I> {
             operating_channel: 1,
             operating_width: 0,
             rts_threshold: None,
+            aggregation: None,
             queues: Default::default(),
             inflight: Default::default(),
             awaiting: VecDeque::new(),
@@ -373,6 +432,122 @@ impl<I: Io> Owner<I> {
         self.kick()?;
         Ok(id)
     }
+    /// `packet_core::Core::aggregation`: install or clear the N21T envelope
+    /// while nothing is queued, in flight or awaiting a report.
+    pub(super) fn aggregation(&mut self, cfg: Option<format::Aggregation>) -> Result<(), Error> {
+        if !self.ready() || cfg.is_some_and(|c| !c.valid()) {
+            return Err(Error::State);
+        }
+        self.aggregation = cfg;
+        Ok(())
+    }
+    /// The QoS TID (A-MSDU-present bit cleared) every frame of a batch must
+    /// carry (`packet_core::Core::submit_batch`).
+    pub(super) fn batch_tid(frames: &[Vec<u8>]) -> Result<u8, Error> {
+        Ok(frames
+            .first()
+            .and_then(|f| f.get(24))
+            .ok_or(Error::Packet)?
+            & 0x7f)
+    }
+    /// `packet_core::Core::submit_batch` over the USB queues (Linux
+    /// `rtw_usb_tx_write` per MPDU of a mac80211 A-MPDU session, then
+    /// `rtw_usb_tx_handler`'s `rtw_usb_tx_agg_skb` URB packing): one
+    /// same-TID burst admitted by the committed envelope, fixed-rate without
+    /// fallback, each MPDU with AGG_EN/density and its own CCX report, all on
+    /// the TID's pipe. Only from an idle owner, so the burst's report
+    /// sequences are distinct and no other frame interleaves in the queue.
+    /// The caller proves the signed gate (`Port::batch_allowed` /
+    /// `batch_publication`).
+    pub(super) fn submit_batch(&mut self, frames: &[Vec<u8>]) -> Result<Vec<u64>, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if !self.ready() {
+            return Err(Error::Busy);
+        }
+        let cfg = self.aggregation.ok_or(Error::State)?;
+        if !cfg.admits(self.data_profile, frames) || frames.len() > MAX_QUEUED {
+            return Err(Error::Access);
+        }
+        let tid = Self::batch_tid(frames)?;
+        let queue = self.data_profile.tid_queue(tid).ok_or(Error::Packet)?;
+        let profile = format::DataProfile {
+            fallback: false,
+            ..self.data_profile
+        };
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(frames.len())
+            .map_err(|_| Error::Memory)?;
+        let mut pipe = None;
+        let start = self.next_sequence;
+        for frame in frames {
+            if frame.len() < 26 || frame[0] != 0x88 || frame[24] & 0x7f != tid || frame[25] != 0 {
+                self.next_sequence = start;
+                return Err(Error::Packet);
+            }
+            // Idle owner: consecutive allocations are distinct (count <= 4).
+            let sequence = self.allocate_sequence()?;
+            let built = ampdu_packet(
+                frame,
+                self.own,
+                self.mac_id,
+                sequence,
+                profile,
+                self.rts_threshold,
+                cfg.density,
+            );
+            let (packet, qsel, actual) = match built {
+                Ok(built) => built,
+                Err(error) => {
+                    self.next_sequence = start;
+                    return Err(error);
+                }
+            };
+            let ep = self
+                .endpoints
+                .qsel_to_ep
+                .get(usize::from(qsel))
+                .copied()
+                .flatten()
+                .map(usize::from);
+            if actual != queue
+                || !queue.data()
+                || queue == format::Queue::Voice
+                || ep.is_none_or(|ep| ep >= usize::from(self.endpoints.out_count))
+                || pipe.is_some_and(|p| Some(p) != ep)
+            {
+                self.next_sequence = start;
+                return Err(Error::Packet);
+            }
+            pipe = ep;
+            prepared.push((packet, sequence));
+        }
+        let pipe = pipe.ok_or(Error::Packet)?;
+        let first = self.next_id;
+        let next_id = first
+            .checked_add(prepared.len() as u64)
+            .ok_or(Error::State)?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(prepared.len())
+            .map_err(|_| Error::Memory)?;
+        self.queues[pipe]
+            .try_reserve(prepared.len())
+            .map_err(|_| Error::Memory)?;
+        for (slot, (packet, sequence)) in prepared.into_iter().enumerate() {
+            let id = first + slot as u64;
+            self.queues[pipe].push_back(Queued {
+                id,
+                packet,
+                sequence: Some(sequence),
+            });
+            ids.push(id);
+        }
+        self.next_id = next_id;
+        self.kick()?;
+        Ok(ids)
+    }
     /// `rtw_usb_tx_handler`: from the highest pipe down, every idle pipe
     /// sends one `rtw_usb_tx_agg_skb` aggregate of its queue head.
     fn kick(&mut self) -> Result<(), Error> {
@@ -438,6 +613,7 @@ impl<I: Io> Owner<I> {
                         sequence,
                         bytes,
                         started: now_us,
+                        acknowledged: false,
                     }),
                     None => step.receipts.push(Receipt {
                         id: queued.id,
@@ -493,28 +669,34 @@ impl<I: Io> Owner<I> {
         }
         Ok(step)
     }
-    /// `rtw_tx_report_handle`: a CCX report retires the frame holding its
-    /// sequence. A NACK is terminal for the owner, as on PCI.
+    /// `rtw_tx_report_handle`: a CCX report acknowledges the frame holding
+    /// its sequence. A NACK is terminal for the owner, as on PCI. Reports
+    /// of an A-MPDU burst may arrive out of order; receipts are released in
+    /// submission order only (`packet_core::Core::complete_batch`), because
+    /// the station retires its pending DATA FIFO.
     fn report(&mut self, body: &[u8], step: &mut Step) -> Result<(), Error> {
         let Some(report) = format::report(body)? else {
             return Ok(());
         };
-        let Some(at) = self
+        let Some(awaiting) = self
             .awaiting
-            .iter()
-            .position(|a| a.sequence == report.sequence)
+            .iter_mut()
+            .find(|a| a.sequence == report.sequence && !a.acknowledged)
         else {
             return Ok(());
         };
         if !report.acknowledged {
             return Err(Error::Packet);
         }
-        let awaiting = self.awaiting.remove(at).ok_or(Error::State)?;
-        step.receipts.push(Receipt {
-            id: awaiting.id,
-            bytes: awaiting.bytes,
-            radio_acknowledged: true,
-        });
+        awaiting.acknowledged = true;
+        while self.awaiting.front().is_some_and(|a| a.acknowledged) {
+            let awaiting = self.awaiting.pop_front().ok_or(Error::State)?;
+            step.receipts.push(Receipt {
+                id: awaiting.id,
+                bytes: awaiting.bytes,
+                radio_acknowledged: true,
+            });
+        }
         Ok(())
     }
     /// `rtw_usb_cancel_rx_bufs` + `rtw_usb_tx_queue_purge`: stop every

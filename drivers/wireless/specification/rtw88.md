@@ -3321,7 +3321,7 @@ Former blockers, verified against the tree:
    - Completion (`rtw_usb_write_port_tx_complete`): a frame that requested a
      report (SPE_RPT, six-bit `sn << 2` not held by any queued, in-flight or
      awaiting frame) waits for its CCX C2H (1 s deadline, NACK terminal, as
-     on PCI); every other frame completes on the exact-length USB completion
+     on PCI; acknowledged frames are released in completion order); every other frame completes on the exact-length USB completion
      with `radio_acknowledged = false`. Linux's `IEEE80211_TX_STAT_ACK` for
      those is mac80211 bookkeeping, not radio evidence.
    - RX: one persistent 32 KiB bulk-IN receipt; a completed URB is copied,
@@ -3443,11 +3443,29 @@ Former blockers, verified against the tree:
    the same signed host-keyed (`rtw8821cu-*`) 2.4/5 GHz N2xO and
    N2xB/N2xV records as PCI. `station_passive_tx` and the passive-primary
    TX rule (`passive_tx_allowed`) and `station_ht_program_quiet` follow
-   PCI too. Still `Unsupported` on USB: `station_power_tracking_*`
-   (W continuation maintenance), `station_ps_rx_quiet` (LPS page) and
-   `packet_aggregation`/`packet_submit_batch` (TX A-MPDU; the USB
-   `station_tx_ba_extension` therefore returns `None`, so a provisioned
-   N21T record is never bound); power tracking's W continuation is
+   PCI too. TX A-MPDU (landed; Linux rtw88 runs mac80211
+   `IEEE80211_AMPDU_TX_START` on USB with the same `rtw_tx_fill_tx_desc`
+   AGG_EN/density/MAX_AGG_NUM descriptor, packed by `rtw_usb_tx_agg_skb`):
+   `station_tx_ba_extension` loads the host-keyed N21T record over the
+   gate's TX base as PCI does; `packet_aggregation` installs an envelope
+   only within the bound grant (`usb_packet::Owner::aggregation`, idle
+   owner); `packet_submit_batch` requires the open, non-retuning, current
+   gate, the passive TX rule, a grant TID (< 6) and an admitted profile
+   (`Port::originator_ba_allowed`/`batch_allowed`), then runs
+   `usb_packet::Owner::submit_batch` inside `Gate::invoke_batch`
+   (`batch_publication`). The owner mirrors `packet_core::Core::submit_batch`:
+   idle owner only (`Busy` otherwise), envelope `admits`, one QoS TID,
+   fixed rate without fallback, each MPDU with W2 AGG_EN | density << 20,
+   W3 MAX_AGG_NUM 3 << 17 before RTS protection, its own CCX sequence,
+   then the USB qsel and checksum, all queued on the TID's pipe and kicked
+   (URB packing as for any queue). CCX reports may arrive out of order;
+   report-awaiting frames are released strictly in completion order
+   (`Core::complete_batch` FIFO), which the station's FIFO DATA retirement
+   needs. A refusal before queueing leaves the owner running; a failed URB
+   begin fails it and the backend. Written, unexecuted:
+   `smoke_rtw88_usb_packet_ampdu_batch`. Still `Unsupported` on USB:
+   `station_power_tracking_*` (W continuation maintenance) and
+   `station_ps_rx_quiet` (LPS page); power tracking's W continuation is
    likewise absent (`station_power_tracking_extension` default `None`).
    Written, unexecuted: `smoke_rtw88_usb_station_retune_preconditions`. Written, unexecuted:
    `smoke_rtw88_usb_firmware_reserved_page_sequence`,
@@ -3461,7 +3479,7 @@ Former blockers, verified against the tree:
    `Factory8821c::on_usb` (MAC at 0x107). Each poll is an EP0 transfer, so
    nothing spins; the PCI `EfuseIo` path is unchanged. Written, unexecuted:
    `smoke_rtw88_usb_efuse_factory_async`.
-   Remaining: USB power tracking and TX A-MPDU (above).
+   Remaining: USB power tracking and the LPS page quiet proof (above).
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,

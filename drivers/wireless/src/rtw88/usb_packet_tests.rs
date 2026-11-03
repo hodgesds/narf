@@ -353,3 +353,116 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_packet_timeout_stop_and_descriptor
 );
+
+/// To-DS QoS DATA, TID 0 (BE, qsel 0 -> LOW -> pipe 2 with three pipes).
+fn qos(sequence: u16) -> Vec<u8> {
+    let mut f = vec![0x88, 0x01, 0, 0];
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&OWN);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&(sequence << 4).to_le_bytes());
+    f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(&[0xaa; 40]);
+    f
+}
+fn ccx(sequence: u8) -> Vec<u8> {
+    vec![0x03, 0, 0, 0, 0, 0, 0, 0, sequence, 0, 0, 0]
+}
+
+/// TX A-MPDU over USB (`packet_core::Core::submit_batch` semantics on the
+/// USB queues): refused without an envelope or while busy; one same-TID
+/// burst on the TID pipe, each MPDU with AGG_EN/density/MAX_AGG_NUM and its
+/// own CCX report, packed into one `rtw_usb_tx_agg_skb` URB; out-of-order
+/// reports release receipts only in submission order.
+fn smoke_rtw88_usb_packet_ampdu_batch() -> TestResult {
+    use super::packet_format::{Aggregation, DataProfile};
+    let fake = Fake::default();
+    let mut owner = owner(&fake);
+    let profile = DataProfile {
+        rates: 0xfff,
+        qos: true,
+        mcs: 255,
+        rx_mcs: 0xff,
+        sgi: true,
+        ldpc: false,
+        stbc: false,
+        acs: 0,
+        fallback: false,
+        bw40: false,
+        band5: false,
+        vht: None,
+    };
+    if owner.configure_data(profile).is_err() {
+        return TestResult::Fail("HT QoS profile");
+    }
+    let frames = vec![qos(10), qos(11), qos(12)];
+    if owner.submit_batch(&frames) != Err(Error::State) {
+        return TestResult::Fail("batch admitted without an N21T envelope");
+    }
+    let envelope = Aggregation {
+        density: 4,
+        count: 4,
+        bytes: 8191,
+        airtime: 4000,
+    };
+    if owner.aggregation(Some(envelope)).is_err() {
+        return TestResult::Fail("envelope refused while idle");
+    }
+    let ids = match owner.submit_batch(&frames) {
+        Ok(ids) if ids.len() == 3 => ids,
+        _ => return TestResult::Fail("burst refused"),
+    };
+    if owner.submit_batch(&frames) != Err(Error::Busy) || owner.aggregation(None).is_ok() {
+        return TestResult::Fail("second burst or envelope change while busy");
+    }
+    {
+        let m = fake.0.lock();
+        let [(8, urb)] = m.sent.as_slice() else {
+            return TestResult::Fail("burst not one URB on the LOW pipe (DCI 8)");
+        };
+        if word(urb, 28) >> 24 != 3 || !checksum_ok(&urb[..TX_DESC]) {
+            return TestResult::Fail("URB aggregate count or checksum");
+        }
+        let mut offset = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let d = &urb[offset..offset + TX_DESC];
+            if word(d, 8) & 0x0078_1000 != 0x0048_1000
+                || word(d, 8) & (1 << 19) == 0
+                || word(d, 12) >> 17 & 31 != 3
+                || word(d, 24) as u8 != (i as u8) << 2
+                || (word(d, 4) >> 8) & 0x1f != 0
+                || urb[offset + TX_DESC..offset + TX_DESC + frame.len()] != frame[..]
+            {
+                return TestResult::Fail("AMPDU descriptor or body");
+            }
+            offset = (offset + TX_DESC + frame.len()).next_multiple_of(8);
+        }
+    }
+    fake.complete_tx(8);
+    if !owner.poll(0).expect("poll").receipts.is_empty() {
+        return TestResult::Fail("burst retired on USB completion alone");
+    }
+    fake.0.lock().rx_result = Some(urb(&[rx_record(&ccx(8), true), rx_record(&ccx(4), true)]));
+    if !owner.poll(1).expect("poll").receipts.is_empty() {
+        return TestResult::Fail("later reports released before the first");
+    }
+    fake.0.lock().rx_result = Some(urb(&[rx_record(&ccx(0), true)]));
+    let step = owner.poll(2).expect("poll");
+    let got: Vec<u64> = step.receipts.iter().map(|r| r.id).collect();
+    if got != ids
+        || step.receipts.iter().any(|r| !r.radio_acknowledged)
+        || step
+            .receipts
+            .iter()
+            .zip(&frames)
+            .any(|(r, f)| &r.bytes != f)
+        || !owner.ready()
+    {
+        return TestResult::Fail("burst receipts not FIFO with radio ACK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_packet_ampdu_batch
+);
