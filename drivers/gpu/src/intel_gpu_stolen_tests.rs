@@ -136,8 +136,9 @@ fn smoke_stolen_cfb_avoids_boot_fb_wopcm_and_gsc() -> TestResult {
         return TestResult::Fail("a CFB reaching the GSC/WOPCM carve-outs must refuse");
     }
     // Page-allocator exclusivity: a candidate containing a system-RAM page
-    // is refused and nothing is recorded.
-    let ram_page = l.base_phys + 10 * MIB;
+    // is refused and nothing is recorded. First fit puts a 2 MiB request
+    // in the 4..6 MiB gap below the stray page, so mark a page there.
+    let ram_page = l.base_phys + 4 * MIB + PAGE;
     let before = dsm.placed().len();
     if dsm.place(2 * MIB, PAGE, CFB_BASE_MAX, |p| p == ram_page)
         != Err(StolenError::SystemRam(ram_page))
