@@ -598,6 +598,10 @@ fn smoke_media_huc_option_staging_refusals_and_lost_status() -> TestResult {
     ));
     assert_eq!(arena.live_allocations(), 0);
     assert!(w.0.borrow().writes.is_empty());
+    // The refused start freed its image, ADS and log: like the real arena,
+    // the next start reuses that GGTT range, where the CT model expects the
+    // ADS.
+    reclaimed(&w, &arena);
     let auths = AUTHS.load(Ordering::Relaxed);
     let mut guc = start(&w, &arena, None);
     let mut hw = Hw::default();
