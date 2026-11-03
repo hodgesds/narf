@@ -3870,6 +3870,89 @@ recipient path is reached under the signed C HT program (above).
 B bytes are unchanged. Unexecuted case:
 `smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c`.
 
+### RTL8851B retained runtime (partial; no native caller)
+
+Chip row `rtl8851b`. These owners are the chip-specific RTL8851B
+(`10ec:b851`, 1T1R AX, 2.4/5GHz, 20/40/80MHz) pieces under the retained
+B architecture, following the RTL8852C pattern above. No native caller
+composes them yet and no RTL8851B station is admitted; RTL8852B and RTL8852C
+bytes are unchanged.
+
+**Secure policy.** `Blacklist::upstream(Rtl8851B)` is Linux's exact policy:
+`rtw8851b_chip_info.fw_blacklist` is NULL, so fw.c
+`__check_secure_blacklist` returns -ENOENT and `__parse_security_section`
+only `WARN_ONCE`s. NARF therefore enforces no host chip list for RTL8851B
+(`has_chip_list() == false`) while still requiring the fuse-selected MSS
+signature (`MissingSignature` otherwise); a missing policy owner stays
+`UnknownBlacklist` and an authenticated board list is still enforced.
+Unexecuted case: `smoke_rtw89_n51_secure_policy_is_linux_null_chip_blacklist`.
+
+**Factory inputs.** `Factory::read` on RTL8851B reads the complete Linux
+PHY-cap window (`phycap_addr` 0x580, `phycap_size` 128) once and takes the
+power-k/ECV/secure bytes from it; `n51_phycap()` is separate from the B
+window so no B owner consumes it. `factory_51::Calibration::from_factory`
+mirrors rtw8851b.c `rtw8851b_efuse_parsing_tssi` (path A only: CCK 6, MCS
+2G 5 + 5G 14 at 0x210), `rtw8851b_efuse_parsing_gain_offset` (five
+`RTW89_GAIN_OFFSET_*` bands, high nibble only, at 0x2d4..0x2dc),
+`rtw8851b_read_phycap` (TSSI trim 0x5d6 down, thermal trim 0x5df, PA-bias
+0x5de, gain comp `{0x5bb, 0x5ba, 0, 0x5b9, 0x5b8}` low nibble, `adc_td` =
+0x5af [4:0]) with Linux's erased-trim zeroing after the whole read;
+`thermal_setting` is the literal 8851B `__thm_setting`
+`((v & 1) << 3) | ((v & 0x1f) >> 1)`. Unexecuted case:
+`smoke_rtw89_n51_phycap_and_efuse_match_linux_rtw8851b_layout`.
+
+**PHY tables.** `radio_assets::Assets` accepts RTL8851B containers only with
+all four BB/GAIN/RADIO_A/NCTL elements; RADIO_A must be `reg2.idx` 0
+(`rtw8851b_chip_info.rf_table = {radioa}`) and any RADIO_B element is
+refused. The shipped `rtw89/rtw8851b_fw-1.bin` carries exactly that set plus
+TXPWR (ids 9..17), TXPWR_TRK (18) and id 20 elements, which are retained
+verbatim. NARF carries no static rtw8851b_table.c copy, so the legacy
+element-less `rtw8851b_fw.bin` yields `Error::Element`. `bind` skips the
+absent path-B program. Unexecuted case:
+`smoke_rtw89_n51_radio_assets_follow_linux_single_radioa_slot`.
+
+**Table/power/reset preparation.** `radio_init::Qualified::from_factory_51`
+qualifies an actual valid RTL8851B factory (RFE != 255). `Init::prepare`
+refuses an assets/qualification chip mismatch before any write, decodes the
+gain table with the AX generation decoder, writes BB, then
+`rtw8851b_init_txpwr_unit(PHY_0)` (the same UL/coex CRs and
+`rtw8851b_set_txpwr_ul_tb_offset(0)` UL_TB enable/1T/2T values as B) and
+`rtw8851b_bb_reset(PHY_0)` (TXPW_RSTB MANON|TSSI 1, TSSI_TRK EN set,
+`rtw8851b_bb_reset_all` with only the S0 HW-SI trigger, MANON|TSSI 3,
+TSSI_TRK EN clear), each read back, then the single path-A RF table write and
+page. Unexecuted case:
+`smoke_rtw89_n51_table_power_reset_and_single_rf_path_follow_rtw8851b`.
+
+**bb_sethw and NCTL.** `radio_init::controls_51` is `rtw8851b_bb_sethw`:
+R_P0_EN_SOUND_WO_NDP clear, MACID power-limit table zero,
+`rtw8851b_bb_gpio_init` (path A TRSW_A/X/SO_A2, SEL0/SEL32 bases, A2 RFE
+words, the eight `rtw8851b_bb_gpio_trsw` fields), R_AX_PWR_NORM_FORCE1
+FORCE_NTX_VALUE clear / FORCE_NTX_EN set, all read back, returning the
+`offset_base` (R_P0_RPL1) and `rssi_base` (R_P1_RPL1) [7:0] bytes.
+`radio_init::nctl_51` is phy.c `rtw89_phy_preinit_rf_nctl_ax` without
+`R_P1_PATH_RST` and without the B/BT second `R_IOQ_IQK_DPK`, the 0x8080
+poll, the firmware NCTL table, then `rtw8851b_nctl_post_defs`
+(rtw8851b_rfk_table.c, 17 WM rows verbatim including the path-B literals)
+read back. Unexecuted case:
+`smoke_rtw89_n51_bb_sethw_gpio_and_nctl_post_follow_rtw8851b`.
+
+**Channel geometry.** No separate RTL8851B chandef type: rtw8851b.c
+`rtw8851b_sco_barker_threshold`/`rtw8851b_sco_cck_threshold` and
+`rtw8851b_sco_mapping`, and rtw8851b_rfk.c `_tssi_get_{cck,ofdm,trim}_group`,
+are textually identical to rtw8852b_common.c / rtw8852b_rfk.c, and
+`support_bands`/`support_bandwidths` (2.4/5GHz, 20/40/80MHz, UNII-4) match
+the B constructors, so the RTL8851B channel program reuses
+`operating_channel::Profile` (160MHz stays refused by the B constructors).
+
+**Remaining for the row.** Channel MAC/BB/RF programming
+(`rtw8851b_set_channel_{mac,bb,rf}`, `rtw8851b_ctrl_bw` with `adc_td`),
+RFK (`rtw8851b_rfk_init` LCK/AACK/RCK/DACK/RX DCK; channel RX DCK/IQK/TSSI/
+DPK), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
+the one-path antenna-diversity tracker (`hal->ant_diversity` from
+`rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)
+remain; the row is not complete.
+
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 
 `Startup` now retains an `ApController` beside the same `Firmware<Native>`

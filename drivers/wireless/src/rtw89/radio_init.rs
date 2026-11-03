@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! One retained actual B or C BB/gain/power/reset/RF-table preparation attempt.
+//! One retained actual B, C or 8851B BB/gain/power/reset/RF-table preparation
+//! attempt.
 use super::{
     factory::Factory,
+    factory_51,
     factory_b::Calibration,
     factory_c,
     mac::ChipId,
@@ -42,6 +44,7 @@ pub(super) trait Interface: Io {
 enum Inputs {
     B(Calibration),
     C(factory_c::Calibration),
+    N51(factory_51::Calibration),
 }
 #[derive(Clone, Copy)]
 pub(super) struct Qualified {
@@ -54,7 +57,23 @@ impl Qualified {
         match self.inputs {
             Inputs::B(_) => ChipId::Rtl8852B,
             Inputs::C(_) => ChipId::Rtl8852C,
+            Inputs::N51(_) => ChipId::Rtl8851B,
         }
+    }
+    /// RTL8851B: the same actual-factory qualification, from
+    /// `rtw8851b_read_efuse`/`rtw8851b_read_phycap` inputs.
+    pub fn from_factory_51(factory: &Factory) -> Option<Self> {
+        let identity = factory.identity()?;
+        let calibration = identity.calibration();
+        if identity.chip() != ChipId::Rtl8851B || !calibration.valid || calibration.rfe_type == 255
+        {
+            return None;
+        }
+        Some(Self {
+            rfe: calibration.rfe_type,
+            cut: identity.cut(),
+            inputs: Inputs::N51(factory_51::Calibration::from_factory(factory)?),
+        })
     }
     /// RTL8852C: the same actual-factory qualification as B, from
     /// `rtw8852c_read_efuse`/`rtw8852c_read_phycap` inputs.
@@ -98,6 +117,7 @@ pub(super) struct Init {
     gain: Option<Gain>,
     calibration: Option<Calibration>,
     calibration_c: Option<factory_c::Calibration>,
+    calibration_51: Option<factory_51::Calibration>,
 }
 impl Init {
     pub fn state(&self) -> State {
@@ -118,6 +138,11 @@ impl Init {
             .then_some(self.calibration_c.as_ref())
             .flatten()
     }
+    pub fn calibration_51(&self) -> Option<&factory_51::Calibration> {
+        (self.state == State::TablesLoaded)
+            .then_some(self.calibration_51.as_ref())
+            .flatten()
+    }
     /// # Safety
     /// Same actual B factory/MAC/RX Native, full PHY aperture, current authority
     /// and exclusive radio/reset/power ownership. Outer Startup terminalizes
@@ -132,8 +157,17 @@ impl Init {
             return Err(Error::Terminal);
         }
         self.state = State::Preparing;
+        let n51 = matches!(qualified.inputs, Inputs::N51(_));
+        if n51 != (assets.chip() == ChipId::Rtl8851B) {
+            return Err(Error::Profile);
+        }
+        // RTL8851B has one RF path (`rf_table = {radioa}`): its path-B
+        // program is empty and never written or paged.
         let programs = (0..5)
             .map(|i| {
+                if n51 && i == 3 {
+                    return Ok(Vec::new());
+                }
                 radio_table::program(
                     assets.table(i).ok_or(Error::Profile)?,
                     qualified.rfe,
@@ -157,11 +191,17 @@ impl Init {
         match qualified.inputs {
             Inputs::B(calibration) => self.calibration = Some(calibration),
             Inputs::C(calibration) => self.calibration_c = Some(calibration),
+            Inputs::N51(calibration) => self.calibration_51 = Some(calibration),
         }
         bb(io, &programs[0]).await?;
         if c {
             power_units_c(io)?;
             reset_c(io).await?;
+        } else if n51 {
+            // rtw8851b_init_txpwr_unit writes the same SCC MAC0 values and
+            // UL_TB 1T/2T offsets as rtw8852b; only bb_reset differs.
+            power_units(io)?;
+            reset_51(io).await?;
         } else {
             power_units(io)?;
             reset(io).await?;
@@ -169,8 +209,14 @@ impl Init {
         // phy.c `rtw89_phy_init_rf_reg` walks `chip->rf_table[]` in order:
         // B `{radioa, radiob}`, C `{radiob, radioa}`; each table keeps its
         // own RF path for writes and the H2C page `rf_path`.
-        let order: [usize; 2] = if c { [1, 0] } else { [0, 1] };
-        for path in order {
+        let order: &[usize] = if c {
+            &[1, 0]
+        } else if n51 {
+            &[0]
+        } else {
+            &[0, 1]
+        };
+        for &path in order {
             let program = programs[2 + path].as_slice();
             for &Pair(address, value) in program {
                 if address == 0xfe {
@@ -390,6 +436,33 @@ fn power_units(io: &mut impl Io) -> Result<(), Error> {
     }
     Ok(())
 }
+/// rtw8851b.c `rtw8851b_bb_reset(PHY_0)`: R_P0_TXPW_RSTB MANON|TSSI = 1 and
+/// R_P0_TSSI_TRK EN set, `rtw8851b_bb_reset_all` (S0 HW-SI trigger only, no
+/// S1), then MANON|TSSI = 3 and TSSI_TRK EN cleared. Every final field is
+/// read back.
+async fn reset_51(io: &mut impl Io) -> Result<(), Error> {
+    modify(io, 0x158dc, 0xc000_0000, 1)?;
+    modify(io, 0x15818, 1 << 30, 1)?;
+    modify(io, 0x11200, 0x7000_0000, 7)?;
+    io.delay_us(1).await;
+    modify(io, 0x10704, 2, 1)?;
+    modify(io, 0x10704, 2, 0)?;
+    modify(io, 0x11200, 0x7000_0000, 0)?;
+    modify(io, 0x10704, 2, 1)?;
+    modify(io, 0x158dc, 0xc000_0000, 3)?;
+    modify(io, 0x15818, 1 << 30, 0)?;
+    for (a, m, v) in [
+        (0x10704, 2, 2),
+        (0x11200, 0x7000_0000, 0),
+        (0x158dc, 0xc000_0000, 0xc000_0000),
+        (0x15818, 1 << 30, 0),
+    ] {
+        if read(io, a)? & m != v {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
+}
 async fn reset(io: &mut impl Io) -> Result<(), Error> {
     for a in [0x58dc, 0x5818, 0x78dc, 0x7818] {
         modify(io, 0x10000 + a, 1 << 30, 1)?;
@@ -467,7 +540,13 @@ pub(super) fn controls_c(io: &mut impl Io) -> Result<[i8; 2], Error> {
         }
     }
     for (address, mask, value) in GPIO_C_STATE {
-        if read(io, address)? & mask != value {
+        // R_RFE_E_A2 legitimately reads all-ones; `read` would call it Gone.
+        let actual = if value == u32::MAX {
+            io.read32(address)?
+        } else {
+            read(io, address)?
+        };
+        if actual & mask != value {
             return Err(power::Error::Access.into());
         }
     }
@@ -476,6 +555,90 @@ pub(super) fn controls_c(io: &mut impl Io) -> Result<[i8; 2], Error> {
         read(io, 0x16df0)? as u8 as i8,
     ])
 }
+/// rtw8851b.c `rtw8851b_bb_sethw`: R_P0_EN_SOUND_WO_NDP clear (path 0 only),
+/// `rtw8851b_bb_macid_ctrl_init(PHY_0)`, `rtw8851b_bb_gpio_init` (path A
+/// only), R_AX_PWR_NORM_FORCE1 FORCE_NTX_VALUE clear / FORCE_NTX_EN set,
+/// all read back, then the post-table `efuse_gain.offset_base`
+/// (R_P0_RPL1 0x49b0 [7:0]) and `rssi_base` (R_P1_RPL1 0x4a00 [7:0]).
+pub(super) fn controls_51(io: &mut impl Io) -> Result<[i8; 2], Error> {
+    modify(io, 0x10d7c, 2, 0)?;
+    for address in (0xd36c..=0xd568).step_by(4) {
+        io.write32(address, 0)?;
+    }
+    gpio_51(io)?;
+    modify(io, 0xd260, 1 << 5, 0)?;
+    modify(io, 0xd260, 1 << 6, 1)?;
+    if read(io, 0x10d7c)? & 2 != 0 || read(io, 0xd260)? & 0x60 != 0x40 {
+        return Err(power::Error::Access.into());
+    }
+    for address in (0xd36c..=0xd568).step_by(4) {
+        if read(io, address)? != 0 {
+            return Err(power::Error::Access.into());
+        }
+    }
+    for (address, mask, value) in GPIO_51_STATE {
+        // R_RFE_E_A2 legitimately reads all-ones; `read` would call it Gone.
+        let actual = if value == u32::MAX {
+            io.read32(address)?
+        } else {
+            read(io, address)?
+        };
+        if actual & mask != value {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok([
+        read(io, 0x149b0)? as u8 as i8,
+        read(io, 0x14a00)? as u8 as i8,
+    ])
+}
+/// The register state `rtw8851b_bb_gpio_init` leaves behind (R_P0_TRSW
+/// 0x5868 TRSW_A set, TRSW_X/TRSW_SO_A2 clear, the eight path-A
+/// `rtw8851b_bb_gpio_trsw` fields at [31:16] = 0xa9a9; SEL0/SEL32 bases and
+/// the A2 RFE words).
+const GPIO_51_STATE: [(u32, u32, u32); 7] = [
+    (0x15868, 0xffff_00e6, 0xa9a9_0002),
+    (0x15880, u32::MAX, 0x7777_7777),
+    (0x15884, u32::MAX, 0x7777_7777),
+    (0x10334, u32::MAX, u32::MAX),
+    (0x10338, u32::MAX, 0),
+    (0x1033c, u32::MAX, 0),
+    (0x10340, u32::MAX, 0),
+];
+/// rtw8851b.c `rtw8851b_bb_gpio_init` in Linux write order.
+fn gpio_51(io: &mut impl Io) -> Result<(), Error> {
+    let address = 0x15868;
+    let value = read(io, address)?;
+    io.write32(address, value | 2)?;
+    let value = read(io, address)?;
+    io.write32(address, value & !4)?;
+    let value = read(io, address)?;
+    io.write32(address, value & !0xe0)?;
+    io.write32(0x15880, 0x7777_7777)?;
+    io.write32(0x15884, 0x7777_7777)?;
+    io.write32(0x10334, u32::MAX)?;
+    io.write32(0x10338, 0)?;
+    io.write32(0x1033c, 0)?;
+    io.write32(0x10340, 0)?;
+    // `rtw8851b_bb_gpio_trsw(RF_PATH_A, tx_path_en, trsw_tx, trsw_rx,
+    // trsw_a, trsw_b)`.
+    for (tx, trsw_tx, trsw_rx, trsw_a, trsw_b) in GPIO_TRSW {
+        let shift = 16 + (tx * 4 + trsw_tx * 2 + trsw_rx) * 2;
+        modify(io, 0x15868, 3 << shift, (trsw_a << 1) | trsw_b)?;
+    }
+    Ok(())
+}
+/// The eight `bb_gpio_trsw` rows shared by rtw8852c.c and rtw8851b.c.
+const GPIO_TRSW: [(u32, u32, u32, u32, u32); 8] = [
+    (0, 0, 0, 0, 1),
+    (0, 0, 1, 1, 0),
+    (0, 1, 0, 1, 0),
+    (0, 1, 1, 1, 0),
+    (1, 0, 0, 0, 1),
+    (1, 0, 1, 1, 0),
+    (1, 1, 0, 1, 0),
+    (1, 1, 1, 1, 0),
+];
 /// The register state `rtw8852c_bb_gpio_init` leaves behind (per path base
 /// 0x5800/0x7800): TRSW_A set, TRSW_X/TRSW_SO_A2 clear, the eight
 /// `rtw8852c_bb_gpio_trsw` 2-bit fields at [31:16] = 0xa9a9, 0x80/0x84 =
@@ -539,24 +702,65 @@ fn gpio_c(io: &mut impl Io) -> Result<(), Error> {
 /// Exact AX NCTL pre-init and selected real table. Full DM/coexistence and
 /// RFK orchestration must establish its correct startup position before use.
 pub(super) async fn nctl(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
-    nctl_for(io, program, false).await
+    nctl_for(io, program, &NCTL_PREINIT).await
 }
 /// RTL8852C NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` without the
 /// RTL8852B/BT-only second `R_IOQ_IQK_DPK |= 0x2`, then the selected
 /// firmware NCTL table (`rtw8852c_chip_info.nctl_post_table` is NULL).
 pub(super) async fn nctl_c(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
-    nctl_for(io, program, true).await
+    nctl_for(io, program, &NCTL_PREINIT[..4]).await
 }
-async fn nctl_for(io: &mut impl Io, program: &[Pair], c: bool) -> Result<(), Error> {
+/// RTL8851B NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` with the one-path
+/// skips (no `R_P1_PATH_RST`, no RTL8852B/BT second `R_IOQ_IQK_DPK`), the
+/// selected firmware NCTL table, then `rtw8851b_chip_info.nctl_post_table`
+/// (`rtw8851b_nctl_post_defs`, rtw8851b_rfk_table.c) through
+/// `rtw89_rfk_parser`, each WM field read back.
+pub(super) async fn nctl_51(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    nctl_for(io, program, &NCTL_PREINIT[..3]).await?;
+    for (address, mask, value) in NCTL_POST_51 {
+        modify(io, 0x10000 + address, mask, value)?;
+    }
+    for (address, mask, value) in NCTL_POST_51 {
+        if read(io, 0x10000 + address)? & mask != (value << mask.trailing_zeros()) & mask {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
+}
+/// phy.c `rtw89_phy_preinit_rf_nctl_ax` set-bit writes in Linux order:
+/// R_IOQ_IQK_DPK, R_GNT_BT_WGT_EN, R_P0_PATH_RST, R_P1_PATH_RST (not
+/// RTL8851B) and the RTL8852B/BT-only second R_IOQ_IQK_DPK.
+const NCTL_PREINIT: [(u32, u32); 5] = [
+    (0x10c60, 3),
+    (0x10c6c, 1),
+    (0x158ac, 0x08000000),
+    (0x178ac, 0x08000000),
+    (0x10c60, 2),
+];
+/// rtw8851b_rfk_table.c `rtw8851b_nctl_post_defs` (all RTW89_DECL_RFK_WM,
+/// PHY-relative addresses), verbatim including the path-B literals.
+pub(super) const NCTL_POST_51: [(u32, u32, u32); 17] = [
+    (0x5864, 0x18000000, 0x3),
+    (0x7864, 0x18000000, 0x3),
+    (0x030c, 0xff000000, 0x13),
+    (0x032c, 0xffff0000, 0x0041),
+    (0x12b8, 0x10000000, 0x1),
+    (0x2008, 0x01ffffff, 0x00fffff),
+    (0x0c60, 0x00000003, 0x3),
+    (0x0c6c, 0x00000001, 0x1),
+    (0x58ac, 0x08000000, 0x1),
+    (0x78ac, 0x08000000, 0x1),
+    (0x0730, 0x00003800, 0x7),
+    (0x2730, 0x00003800, 0x7),
+    (0x0c7c, 0x00e00000, 0x1),
+    (0x58c0, 0x0001ffff, 0x00000),
+    (0x78c0, 0x0001ffff, 0x00000),
+    (0x58fc, 0x3f000000, 0x00),
+    (0x78fc, 0x3f000000, 0x00),
+];
+async fn nctl_for(io: &mut impl Io, program: &[Pair], preinit: &[(u32, u32)]) -> Result<(), Error> {
     validate_bb(program)?;
-    const PREINIT: [(u32, u32); 5] = [
-        (0x10c60, 3),
-        (0x10c6c, 1),
-        (0x158ac, 0x08000000),
-        (0x178ac, 0x08000000),
-        (0x10c60, 2),
-    ];
-    for &(address, mask) in &PREINIT[..if c { 4 } else { 5 }] {
+    for &(address, mask) in preinit {
         let value = read(io, address)?;
         io.write32(address, value | mask)?;
     }
