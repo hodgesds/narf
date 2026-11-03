@@ -1096,10 +1096,20 @@ a reset does not recreate secondary interfaces; `Device::withdraw`
 are pumped by the primary worker (`pop_vif_data` into the shell RX ring
 and `on_rx_frame_from`, shell TX ring into `send_vif_data` with
 `cfg80211_classify8021d` priority, one credit-blocked frame retained),
-gated on the shell carrier. Only a secondary station raises that carrier
-(below); an AP shell refuses every role operation, and
-`supports_virtual_interfaces` stays false (`VIF_ROLES`); nothing is
-advertised.
+gated on the shell carrier. A secondary station raises that carrier
+(below); an AP shell raises it between a committed START and STOP
+(Secondary AP role). `VIF_ROLES` is true: `supports_virtual_interfaces`
+is advertised while the booted firmware's `cap` admits one more
+interface, and `interface_combinations` (`Device::vif_combinations`)
+lists only the STA/AP combinations `vif_owner::admits` enforces, from
+`cfg80211.c` `brcmf_setup_ifmodes`: without `p2p`, combo0 = 1 STA + 1 AP,
+`max_interfaces` 2, one channel; with `p2p` (RSDB unparsed, treated
+absent) combo0 = `1 + mchan` STAs on `1 + mchan` channels (listed only
+with `mchan`, since cfg80211 needs `max_interfaces` >= 2 once the P2P
+iftype limits are dropped — no P2P role is created here) plus the P2P
+combination's 1 STA + 1 AP on one channel. The `mbss` multi-AP
+combination is not advertised (`vif->mbss` is not implemented; only one
+AP runs).
 
 #### Per-bsscfg Fullmac adapter
 
@@ -1206,11 +1216,26 @@ same per-interface model. `smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_
 through the actual SDHCI/F2/SDPCM/BCDC stack beside an idle primary
 station with `cap` = `ap sta wme mchan`: Program entirely on ifidx 1 in
 the combo0 form, a bsscfg-1 peer reaching NEW_STATION, STOP retiring only
-that BSS. Still unwritten: a secondary STA join on the SDIO stack, a
-joined primary STA + secondary AP on SDIO (the SDIO firmware adapter's
-primary AP profile intercepts STA security iovars), and unread
-completion-ring entries attributed to an ifidx (they still gate every
-ifidx's Program).
+that BSS; the associated peer's data, received with BDC `flags2` 1
+(`bcdc.c` `brcmf_proto_bcdc_hdrpull`; the SDIO model sends the
+secondary profile's downlink on ifidx 1), reaches only the AP shell's
+netdev. `sdio_ap_firmware::Firmware::station` (`Handle::station_primary`,
+`SdioBound::new_station`) boots the same SDIO device with interface 0 as
+the station model (no primary AP profile, `BRCMF_C_GET_AP` 0), so a
+primary STA join's `wsec`/`wpa_auth`/`sup_wpa` reach the station model.
+`smoke_cyw_vif_joined_primary_station_beside_secondary_ap_on_actual_sdio`
+(written/unexecuted) is the combo0 concurrency case on SDIO: primary STA
+joined on ifidx 0, then the same secondary AP Program/peer/downlink/STOP
+checks, the composed `event_msgs` still holding the STA events and the
+primary still joined after STOP.
+`smoke_cyw_vif_secondary_station_joins_on_actual_sdio_bcdc_ifidx_one`
+(written/unexecuted, `cap` = `ap sta wme p2p mchan`) joins a secondary
+STA through the actual SDIO/BCDC stack: IF ADD over the BCDC event
+channel, every join dcmd on `BCDC_DCMD_IF_SHIFT` ifidx 1 with
+`bsscfg:wpa_auth`, the bsscfg-1 link opening only the secondary port and
+a bsscfg-1 `BRCMF_E_DEAUTH` (`Handle::secondary_event`) closing only it.
+Remaining gap: unread completion-ring entries are not attributed to an
+ifidx (they still gate every ifidx's Program).
 
 #### Secondary AP role
 

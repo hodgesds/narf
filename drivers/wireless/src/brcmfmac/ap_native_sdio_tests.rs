@@ -87,9 +87,23 @@ impl SdioBound {
         Self::new_capability(b"ap sta wme\0", true)
     }
     fn new_capability(capability: &[u8], enter_ap: bool) -> Result<Self, &'static str> {
+        Self::build(capability, enter_ap, false)
+    }
+    /// Interface 0 answers as the station model, not a primary AP profile.
+    fn new_station(capability: &[u8]) -> Result<Self, &'static str> {
+        Self::build(capability, false, true)
+    }
+    fn build(
+        capability: &[u8],
+        enter_ap: bool,
+        station_primary: bool,
+    ) -> Result<Self, &'static str> {
         use crate::brcmfmac::provision::{tests::selected_fixture, Family};
         let (selection, assets) = selected_fixture(Family::Sdio43439)?;
         let (endpoint, bus) = sdio_ap_model::Device::new();
+        if station_primary {
+            bus.station_primary();
+        }
         bus.capability(capability);
         let host = Model::with_endpoint(Box::new(endpoint), Some(selection.host()));
         let card = Card::initialize(host.clone(), Config::default())
@@ -836,11 +850,36 @@ kernel_test_in!(
 /// IOCTL carries `BCDC_DCMD_IF_SHIFT` ifidx 1; with `mchan` there is no
 /// `BRCMF_C_DOWN`/`apsta 0`, no `nmode`/`vhtmode`/`qtxpower`, and the
 /// security iovars are `bsscfg:` + le32 1. A peer association on bsscfg 1
-/// reaches the AP shell's NEW_STATION, and STOP retires only that BSS.
-fn secondary_ap() -> Result<(), &'static str> {
-    const NAME: &str = "wlsvap7";
-    let b = SdioBound::new_capability(b"ap sta wme mchan\0", false)?;
+/// reaches the AP shell's NEW_STATION, that peer's data received with BDC
+/// `flags2` 1 (`bcdc.c` `brcmf_proto_bcdc_hdrpull`) reaches the AP shell's
+/// netdev, and STOP retires only that BSS. With `joined` the primary is an
+/// associated station first (interface 0 is the station model, not an AP
+/// profile) and stays joined; the composed `event_msgs` keeps its events.
+fn secondary_ap(joined: bool) -> Result<(), &'static str> {
+    use crate::brcmfmac::runtime_tests::station_model::AP;
+    use crate::cyw43439::fullmac_fixture::{cache, request};
+    let name = if joined { "wlsvap8" } else { "wlsvap7" };
+    let b = if joined {
+        SdioBound::new_station(b"ap sta wme mchan\0")?
+    } else {
+        SdioBound::new_capability(b"ap sta wme mchan\0", false)?
+    };
     b.bus.enable_vif_ap();
+    if joined {
+        let mut state = b.device.state.try_lock().ok_or("state")?;
+        let station = &mut state.station;
+        cache(station, AP, 6, narf_wireless::scan::BssSecurity::Open, &[]);
+        ready(station.associate(request(
+            AP,
+            6,
+            narf_wireless::SecurityConfig::Open,
+            Vec::new(),
+        )))?
+        .map_err(|_| "SDIO primary station join")?;
+        if station.bssid != Some(AP) {
+            return Err("SDIO primary station not joined");
+        }
+    }
     let owner = {
         let mut state = b.device.state.try_lock().ok_or("state")?;
         let mac = state.station.mac;
@@ -848,7 +887,7 @@ fn secondary_ap() -> Result<(), &'static str> {
             .map_err(|_| "SDIO cap discovery")?
             .ok_or("SDIO firmware cap refused")?
     };
-    if !owner.features().mchan {
+    if !owner.features().mchan || owner.features().mbss {
         return Err("SDIO cap tokens not parsed as brcmf_feat_attach");
     }
     b.device.state.try_lock().ok_or("state")?.vif = Some(owner);
@@ -856,15 +895,15 @@ fn secondary_ap() -> Result<(), &'static str> {
     let result = (|| {
         let vap = b
             .device
-            .vif_new(NAME, 3, None)
+            .vif_new(name, 3, None)
             .map_err(|_| "SDIO secondary AP shell admission")?;
         ready(b.device.vif_worker())?;
         if vap.ap_sme_capabilities() != Some(0) {
             return Err("SDIO secondary AP shell not attached after IF ADD");
         }
-        narf_net::iface::set_link_state(NAME, true);
+        narf_net::iface::set_link_state(name, true);
         let cap = narf_net::registry()
-            .with_handle(NAME, |cap| *cap)
+            .with_handle(name, |cap| *cap)
             .ok_or("SDIO secondary netdev handle")?;
         let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
             iface: cap,
@@ -878,7 +917,7 @@ fn secondary_ap() -> Result<(), &'static str> {
             admin,
             &iface,
             0,
-            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            narf_net::iface::lookup(name).ok_or("ifindex")?.ifindex,
             source.clone(),
         )
         .map_err(|_| "SDIO AP authority bind")?
@@ -910,8 +949,28 @@ fn secondary_ap() -> Result<(), &'static str> {
         {
             return Err("SDIO secondary AP Program not the combo0 bsscfg-1 form");
         }
+        if joined {
+            // fweh.c brcmf_fweh_activate_events: one device-wide union.
+            let mask = program
+                .iter()
+                .rev()
+                .find(|((command, body), _)| *command == 263 && body.starts_with(b"event_msgs\0"))
+                .map(|((_, body), _)| body[11..].to_vec())
+                .ok_or("SDIO secondary AP wrote no event_msgs")?;
+            let sta = crate::cyw43439::station::roam::event_mask(false);
+            if sta.iter().zip(&mask).any(|(s, m)| s & m != *s) {
+                return Err("SDIO secondary AP mask dropped the primary STA events");
+            }
+        }
+        let primary_joined = |b: &SdioBound| {
+            b.device
+                .state
+                .try_lock()
+                .is_some_and(|state| state.station.bssid == Some(AP))
+        };
         if !b.bus.vif_change(|p| p.active && p.up && p.formed)
-            || b.bus.change(|p| p.active)
+            || !joined && b.bus.change(|p| p.active)
+            || joined && !primary_joined(&b)
             || !vap.link_up()
         {
             return Err("SDIO secondary AP not running on its own interface");
@@ -924,8 +983,24 @@ fn secondary_ap() -> Result<(), &'static str> {
         if source.count(19) != 1 {
             return Err("SDIO secondary AP NEW_STATION not observed on its shell");
         }
+        // The associated peer's data arrives on BDC flags2 1 only.
+        let rx = || narf_net::iface::lookup(name).map_or(0, |iface| iface.stats.rx_packets);
+        let primary_rx = b.rx_packets();
+        let before = rx();
+        let mut frame = uplink();
+        frame[..6].copy_from_slice(&vif_mac);
+        b.bus.vif_change(|p| p.downlink.push_back(frame));
+        for _ in 0..4 {
+            ready(b.device.vif_worker())?;
+        }
+        if rx() != before + 1 || b.rx_packets() != primary_rx {
+            return Err("SDIO secondary AP downlink not received on ifidx 1 only");
+        }
         ready(vap.stop_ap_async(&authority))?.map_err(|_| "SDIO secondary AP STOP")?;
-        if b.bus.vif_change(|p| p.active || !p.peers.is_empty()) || vap.link_up() {
+        if b.bus.vif_change(|p| p.active || !p.peers.is_empty())
+            || vap.link_up()
+            || joined && !primary_joined(&b)
+        {
             return Err("SDIO secondary AP stop kept its BSS");
         }
         Ok(())
@@ -934,7 +1009,7 @@ fn secondary_ap() -> Result<(), &'static str> {
     result
 }
 fn smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one() -> TestResult {
-    match secondary_ap() {
+    match secondary_ap(false) {
         Ok(()) => TestResult::Pass,
         Err(reason) => TestResult::Fail(reason),
     }
@@ -942,4 +1017,117 @@ fn smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one
+);
+fn smoke_cyw_vif_joined_primary_station_beside_secondary_ap_on_actual_sdio() -> TestResult {
+    match secondary_ap(true) {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_cyw_vif_joined_primary_station_beside_secondary_ap_on_actual_sdio
+);
+
+/// Linux 7.3-rc4 `cfg80211.c` `brcmf_cfg80211_connect` on an additional
+/// STA `brcmf_if` over the actual SDIO/BCDC stack: every join dcmd carries
+/// `BCDC_DCMD_IF_SHIFT` ifidx 1, the security iovars are
+/// `brcmf_fil_bsscfg_*` (`bsscfg:` + le32 1), the bsscfg-1 link events
+/// (`fweh.c` dispatch by the event header) open only the secondary port,
+/// and its `BRCMF_E_DEAUTH` closes only that port.
+fn secondary_station() -> Result<(), &'static str> {
+    use crate::brcmfmac::{
+        runtime_tests::station_model::{AP, VIF},
+        vif_bsscfg::{Bsscfg, Link},
+        vif_owner::{Owner, Role},
+        vif_wire::Features,
+    };
+    use crate::cyw43439::fullmac_fixture::{cache, request};
+    let b = SdioBound::new_station(b"ap sta wme p2p mchan\0")?;
+    let mut state = b.device.state.try_lock().ok_or("state")?;
+    let station = &mut state.station;
+    let features = Features {
+        p2p: true,
+        mchan: true,
+        ..Features::default()
+    };
+    let mut owner = Owner::new(station.mac, features);
+    let entry = ready(owner.create(&mut station.runtime, Role::Station, Some(VIF)))?
+        .map_err(|_| "SDIO IF ADD over the BCDC event channel")?;
+    station
+        .runtime
+        .vif_open(entry.ifidx)
+        .map_err(|_| "SDIO vif_open")?;
+    let parked = station.secondary(entry.mac);
+    let mut link = Link::new(entry);
+    let before = b.bus.commands().len();
+    let parked = {
+        let adapter = Bsscfg::new(&mut station.runtime, &mut owner, &mut link);
+        let (mut secondary, rest) = parked.rebind(adapter);
+        ready(secondary.configure_secondary())?
+            .map_err(|_| "SDIO secondary per-interface dcmds")?;
+        cache(
+            &mut secondary,
+            AP,
+            6,
+            narf_wireless::scan::BssSecurity::Open,
+            &[],
+        );
+        ready(secondary.associate(request(
+            AP,
+            6,
+            narf_wireless::SecurityConfig::Open,
+            Vec::new(),
+        )))?
+        .map_err(|_| "SDIO secondary join")?;
+        secondary.rebind(rest).0
+    };
+    let commands = b.bus.commands();
+    let ifidx = b.bus.command_ifidx();
+    let joined: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+    let mut wpa_auth = b"bsscfg:wpa_auth\0".to_vec();
+    wpa_auth.extend_from_slice(&1u32.to_le_bytes());
+    if joined.iter().any(|(_, index)| **index != 1)
+        || ![86u32, 20, 22, 26]
+            .iter()
+            .all(|dcmd| joined.iter().any(|((command, _), _)| command == dcmd))
+        || joined.iter().any(|((command, _), _)| *command == 134)
+        || !joined
+            .iter()
+            .any(|((_, body), _)| body.starts_with(&wpa_auth))
+        || joined
+            .iter()
+            .any(|((_, body), _)| body.starts_with(b"wpa_auth\0") || body.starts_with(b"wsec\0"))
+    {
+        return Err("SDIO secondary join not addressed to BCDC ifidx 1 / bsscfg 1");
+    }
+    if link.peer() != Some(AP)
+        || parked.bssid != Some(AP)
+        || station.bssid.is_some()
+        || station.runtime.pop_event().is_some()
+    {
+        return Err("SDIO secondary link leaked into the primary interface");
+    }
+    // BRCMF_E_DEAUTH (6) on bsscfg 1 closes only the secondary port.
+    b.bus.secondary_event(6, 0, AP);
+    let adapter = Bsscfg::new(&mut station.runtime, &mut owner, &mut link);
+    let (mut secondary, rest) = parked.rebind(adapter);
+    for _ in 0..4 {
+        let _ = secondary.poll();
+    }
+    let (parked, _) = secondary.rebind(rest);
+    if parked.bssid.is_some() || link.peer().is_some() || station.bssid.is_some() {
+        return Err("SDIO secondary deauthentication kept the port open");
+    }
+    Ok(())
+}
+fn smoke_cyw_vif_secondary_station_joins_on_actual_sdio_bcdc_ifidx_one() -> TestResult {
+    match secondary_station() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_cyw_vif_secondary_station_joins_on_actual_sdio_bcdc_ifidx_one
 );

@@ -50,12 +50,16 @@ impl State {
     }
     fn outputs(&mut self) {
         let (events, data) = self.firmware.outputs();
-        for (channel, outputs) in [(1, events), (2, data)] {
-            for body in outputs {
-                let mut payload = vec![0x20, 0, 0, 0];
-                payload.extend(body);
-                self.packet(channel, &payload);
-            }
+        for body in events {
+            let mut payload = vec![0x20, 0, 0, 0];
+            payload.extend(body);
+            self.packet(1, &payload);
+        }
+        // BDC `flags2` names the receiving interface (`BCDC_SET_IF_IDX`).
+        for (ifidx, body) in data {
+            let mut payload = vec![0x20, 0, ifidx, 0];
+            payload.extend(body);
+            self.packet(2, &payload);
         }
     }
     fn consume(&mut self, packet: &[u8]) -> Result<(), SdioError> {
@@ -128,6 +132,17 @@ impl Handle {
     /// BCDC ifidx of each IOCTL, parallel to [`Self::commands`].
     pub(super) fn command_ifidx(&self) -> Vec<u8> {
         self.0.lock().command_ifidx.clone()
+    }
+    /// Interface 0 is the station model instead of the primary AP profile
+    /// ([`Firmware::station`]); call before the firmware boots.
+    pub(super) fn station_primary(&self) {
+        self.0.lock().firmware = Firmware::station();
+    }
+    /// Raise one event of ifidx/bsscfg 1.
+    pub(super) fn secondary_event(&self, kind: u32, flags: u16, source: [u8; 6]) {
+        let mut state = self.0.lock();
+        state.firmware.secondary_event(kind, flags, source);
+        state.outputs();
     }
     /// Create ifidx 1 as a firmware-SME AP.
     pub(super) fn enable_vif_ap(&self) {

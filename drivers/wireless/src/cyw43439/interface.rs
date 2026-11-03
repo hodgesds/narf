@@ -1082,10 +1082,17 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     fn current_iftype(&self) -> u32 {
         self.ap_mode()
     }
-    /// Advertised only with a per-bsscfg role owner for the new interface
-    /// (none yet) and a firmware `cap` set that admits one more interface.
+    /// Advertised with the per-bsscfg STA/AP role owners and a firmware
+    /// `cap` set that admits one more interface.
     fn supports_virtual_interfaces(&self) -> bool {
         VIF_ROLES && self.vif_composable()
+    }
+    /// The firmware-reported STA/AP combinations (`brcmf_setup_ifmodes`).
+    fn interface_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
+        if !VIF_ROLES {
+            return Vec::new();
+        }
+        self.vif_combinations()
     }
     fn new_virtual_interface(
         &self,
@@ -1545,8 +1552,9 @@ fn wireless_error(error: Error) -> WirelessError {
         _ => WirelessError::HardwareError,
     }
 }
-/// Secondary STA/AP shells carry no role owner yet (`interface_vif.rs`).
-const VIF_ROLES: bool = false;
+/// Secondary STA (`interface_vif.rs`) and firmware-SME AP
+/// (`interface_vif_ap.rs`) shells carry their per-bsscfg role owners.
+const VIF_ROLES: bool = true;
 struct Registered<R: Fullmac>(Arc<Device<R>>);
 fn receive_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())

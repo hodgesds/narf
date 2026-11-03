@@ -454,6 +454,50 @@ impl<R: Fullmac + 'static> Device<R> {
         })
     }
 
+    /// `brcmf_setup_ifmodes` combinations for the STA/AP roles this driver
+    /// creates, from the booted firmware's `cap` tokens (the same rules as
+    /// `vif_owner::admits`). Without `p2p`, combo0 is one STA + one AP on
+    /// one channel. With `p2p` (RSDB unparsed, treated absent) combo0 is
+    /// `1 + mchan` STAs on `1 + mchan` channels and the P2P combination is
+    /// one STA + one AP on one channel; the P2P iftype limits are left out
+    /// (no P2P role here), so a combo0 of a single STA is not listed
+    /// (cfg80211 needs `max_interfaces >= 2`). The `mbss` multi-AP
+    /// combination is not advertised: `vif->mbss` is not implemented and
+    /// only one AP may run.
+    pub(super) fn vif_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
+        use narf_wireless::{InterfaceCombination, InterfaceTypeLimit};
+        let Some(features) = self
+            .state
+            .try_lock()
+            .and_then(|state| state.vif.as_ref().map(|owner| owner.features()))
+        else {
+            return Vec::new();
+        };
+        let combination = |limits: &[(u32, u32)], channels: u32| InterfaceCombination {
+            limits: limits
+                .iter()
+                .map(|&(max, iftype)| InterfaceTypeLimit {
+                    max,
+                    iftypes: alloc::vec![iftype],
+                })
+                .collect(),
+            max_interfaces: limits.iter().map(|&(max, _)| max).sum(),
+            max_channels: channels,
+            sta_ap_beacon_interval_match: false,
+            beacon_interval_min_gcd: None,
+            radar_detect_widths: None,
+        };
+        if !features.p2p {
+            return alloc::vec![combination(&[(1, 2), (1, 3)], 1)];
+        }
+        let mut combinations = Vec::new();
+        if features.mchan {
+            combinations.push(combination(&[(2, 2)], 2));
+        }
+        combinations.push(combination(&[(1, 2), (1, 3)], 1));
+        combinations
+    }
+
     /// `brcmf_cfg80211_add_iface` admission and `brcmf_net_attach`
     /// publication; the native create is the worker's (module docs).
     pub(super) fn vif_new(
