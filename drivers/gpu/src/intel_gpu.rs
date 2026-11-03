@@ -1133,6 +1133,26 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    // VBT (`intel_bios_init`): the ACPI OpRegion named by ASLS, read-only.
+    // Installed before any external hotplug pass so the MTL port policy,
+    // its legacy Type-C hotplug sources, DP SSC and the HDMI DDC pins
+    // follow the board; without one every consumer keeps its no-VBT
+    // behaviour.
+    {
+        use crate::intel_gpu_vbt::VbtInstall;
+        let asls = narf_bus::pci::read_config32(&cap, &device, crate::intel_gpu_vbt::ASLS).ok();
+        let gen12 = crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip);
+        let note = match crate::intel_gpu_vbt::install_for_probe(dev.chip.generation, gen12, asls) {
+            VbtInstall::NotApplicable => None,
+            VbtInstall::Missing => Some("no VBT found in the ACPI OpRegion; using defaults"),
+            VbtInstall::Installed(_) => Some("VBT parsed from the ACPI OpRegion and installed"),
+            VbtInstall::Refused(_) => Some("VBT found but refused: outputs already owned"),
+        };
+        if let Some(note) = note {
+            log_probe(note, &device);
+        }
+    }
+
     let mut panel_mode: Option<crate::intel_gpu_modeset::Mode> = None;
     if dev.chip.generation.display_supported() {
         // eDP panel power sequencing (#1020): the panel must be
@@ -2083,7 +2103,8 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
             return None;
         }
         let window = gpu.mode_window();
-        let probe = crate::intel_gpu_hdmi::probe_sink(&window, ddi).ok()?;
+        let ddc = crate::intel_gpu_vbt::gen12_ddc_overrides();
+        let probe = crate::intel_gpu_hdmi::probe_sink(&window, ddi, &ddc).ok()?;
         let width = probe.mode.h_active as u32;
         let height = probe.mode.v_active as u32;
         let stride_bytes = padded_stride_bytes(width);

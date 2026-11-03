@@ -76,15 +76,17 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
 use crate::dp_link_training::{
-    negotiate, read_caps, stream_demand_kbps, train_link, DpcdCaps, LinkError,
-    LinkRate as TrainRate, NegotiatedLink, SourceCaps, TrainedLink,
+    negotiate, stream_demand_kbps, train_link, DpcdCaps, LinkError, LinkRate as TrainRate,
+    NegotiatedLink, SourceCaps, TrainedLink,
 };
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
+use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_modeset_xelpg::{
     acknowledged_cdclk, mtl_cdclk_for_pixel_clock, program_cdclk_floor, XeLpgModeset,
 };
+use crate::intel_gpu_vbt::{dp_ssc_enabled, Vbt, VbtEncoder, VbtPlatform, DP_MAX_DOWNSPREAD};
 use crate::intel_gpu_xelpg::{
     disable_d2d, disable_port_pll_complete, dp_pll_request, enable_d2d, enable_port_pll_state,
     program_port_buf_ctl, set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
@@ -98,6 +100,10 @@ use crate::intel_gpu_xelpg_tc::{
     aux_power_disable, aux_power_enable, connect as tc_connect, connection_intact,
     disconnect as tc_disconnect, TcConnection, TcError, TcMode,
 };
+
+/// DPCD receiver-capability bytes read at probe (0x000..0x00F, the span
+/// `read_caps` decodes; `DP_MAX_DOWNSPREAD` is byte 3).
+const DPCD_RECEIVER_CAP_BYTES: usize = 16;
 
 /// Largest EDID retained (base + three extensions).
 pub const EDID_CAPACITY: usize = 512;
@@ -219,6 +225,12 @@ pub struct MtlSinkProbe {
     pub mode: Mode,
     /// Negotiated starting link configuration.
     pub negotiated: NegotiatedLink,
+    /// The sink's raw `DP_MAX_DOWNSPREAD` byte.
+    pub max_downspread: u8,
+    /// `pll_state->ssc_enabled` for this sink: [`dp_ssc_enabled`] of the
+    /// board's SSC preference and `max_downspread` (set at probe with the
+    /// no-VBT preference, which is on; the service applies its policy).
+    pub ssc: bool,
     /// Complete EDID bytes (`edid_len` valid).
     pub edid: [u8; EDID_CAPACITY],
     /// Valid EDID length.
@@ -282,7 +294,12 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         return Err(e.into());
     }
     let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
-    let caps = read_caps(&mut aux).map_err(|e| rollback(ExternalError::Link(e)))?;
+    // `read_caps`'s DPCD read, keeping the raw bytes for DP_MAX_DOWNSPREAD.
+    let mut raw = [0u8; DPCD_RECEIVER_CAP_BYTES];
+    aux.dpcd_read(0, &mut raw)
+        .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
+    let caps = DpcdCaps::decode(&raw);
+    let max_downspread = raw[DP_MAX_DOWNSPREAD];
     let mut edid = [0u8; EDID_CAPACITY];
     let edid_len =
         read_full_edid(&mut aux, &mut edid).map_err(|e| rollback(ExternalError::Edid(e)))?;
@@ -313,6 +330,8 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         caps,
         mode,
         negotiated,
+        max_downspread,
+        ssc: dp_ssc_enabled(true, max_downspread),
         edid,
         edid_len,
     })
@@ -516,6 +535,7 @@ fn program<M: MmioWindow + ?Sized>(
         lanes,
         route.probe.dp_alt(),
         route.probe.legacy(),
+        route.probe.ssc,
     )
     .map_err(phy_err)?;
     enable_port_pll_state(io, port, &request).map_err(phy_err)?;
@@ -785,11 +805,11 @@ impl MtlExternalRoute {
 
 /// Board declaration for one external port: the facts a VBT child device
 /// carries (`intel_bios.c`): `intel_bios_encoder_supports_dp`
-/// (`DEVICE_TYPE_DISPLAYPORT_OUTPUT`), `intel_bios_encoder_supports_hdmi`
-/// (`DEVICE_TYPE_TMDS_DVI_SIGNALING` without `DEVICE_TYPE_NOT_HDMI_OUTPUT`)
-/// and, for Type-C, `intel_ddi_init`'s legacy test (neither
-/// `dp_usb_type_c` nor `tbt`). No VBT parser exists in this tree, so the
-/// declaration is supplied instead of parsed; see [`MtlPortPolicy::NO_VBT`].
+/// (`DEVICE_TYPE_DISPLAYPORT_OUTPUT`), the HDMI connector
+/// (`DEVICE_TYPE_TMDS_DVI_SIGNALING` and a usable DDC pin) and, for
+/// Type-C, `intel_ddi_init`'s legacy test (neither `dp_usb_type_c` nor
+/// `tbt`). A parsed VBT yields it through [`MtlPortPolicy::from_vbt`];
+/// without one production uses [`MtlPortPolicy::NO_VBT`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MtlPortDecl {
     /// The port carries DisplayPort.
@@ -798,6 +818,10 @@ pub struct MtlPortDecl {
     pub hdmi: bool,
     /// Type-C only: the PHY is wired to a fixed DP/HDMI connector.
     pub legacy: bool,
+    /// The HDMI DDC pin `intel_hdmi_ddc_pin` resolved from the VBT; `None`
+    /// for a hand declaration, which uses the port's
+    /// [`crate::intel_gpu_xelpg_hdmi::ddc_pin`].
+    pub ddc_pin: Option<PinPair>,
 }
 
 impl MtlPortDecl {
@@ -806,6 +830,7 @@ impl MtlPortDecl {
         dp: false,
         hdmi: false,
         legacy: false,
+        ddc_pin: None,
     };
     /// `init_vbt_missing_defaults` for a non-TC port other than A and E:
     /// `DEVICE_TYPE_TMDS_DVI_SIGNALING | DEVICE_TYPE_DISPLAYPORT_OUTPUT`.
@@ -813,18 +838,21 @@ impl MtlPortDecl {
         dp: true,
         hdmi: true,
         legacy: false,
+        ddc_pin: None,
     };
     /// A USB-C connector: DP-alt only.
     pub const USB_C: Self = Self {
         dp: true,
         hdmi: false,
         legacy: false,
+        ddc_pin: None,
     };
     /// A Type-C PHY wired to a native HDMI connector.
     pub const LEGACY_HDMI: Self = Self {
         dp: false,
         hdmi: true,
         legacy: true,
+        ddc_pin: None,
     };
 
     /// `intel_ddi_init`: a Type-C port declared non-legacy but with HDMI
@@ -834,13 +862,16 @@ impl MtlPortDecl {
     }
 }
 
-/// Declarations for DDI B and TC1..TC4.
+/// Declarations for DDI B and TC1..TC4, plus the board's SSC preference.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MtlPortPolicy {
     /// DDI B (C10 combo PHY).
     pub ddi_b: MtlPortDecl,
     /// TC1..TC4.
     pub tc: [MtlPortDecl; 4],
+    /// `intel_panel_use_ssc` (the VBT's `lvds_use_ssc`): DP SSC is only
+    /// enabled when this holds and the sink advertises 0.5% downspread.
+    pub use_ssc: bool,
 }
 
 impl MtlPortPolicy {
@@ -849,11 +880,51 @@ impl MtlPortPolicy {
     /// encoder without a VBT ("VBT has the TypeC mode ... we don't want to
     /// detect it"); this tree keeps the USB-C DP-alt route it already
     /// owns and declares no legacy or HDMI Type-C port, so the policy
-    /// matches [`MtlHpdConfig::TYPE_C`].
+    /// matches [`MtlHpdConfig::TYPE_C`]. `init_vbt_defaults` turns SSC on.
     pub const NO_VBT: Self = Self {
         ddi_b: MtlPortDecl::COMBO_DP_HDMI,
         tc: [MtlPortDecl::USB_C; 4],
+        use_ssc: true,
     };
+
+    /// The policy a parsed VBT declares: one declaration per external port
+    /// `intel_ddi_init` would create an encoder for
+    /// ([`Vbt::encoders`]), every other external port [`MtlPortDecl::NONE`]
+    /// (Linux creates no encoder for a port the VBT omits), and the VBT's
+    /// SSC preference. See [`decl_from_encoder`] for the per-port mapping
+    /// and the declarations this route cannot drive.
+    pub fn from_vbt(vbt: &Vbt) -> Self {
+        let mut policy = Self {
+            ddi_b: MtlPortDecl::NONE,
+            tc: [MtlPortDecl::NONE; 4],
+            use_ssc: vbt.use_ssc(),
+        };
+        for encoder in vbt.encoders(VbtPlatform::MeteorLake) {
+            let port = match encoder.port {
+                1 => XeLpgPort::B,
+                3 => XeLpgPort::Tc1,
+                4 => XeLpgPort::Tc2,
+                5 => XeLpgPort::Tc3,
+                6 => XeLpgPort::Tc4,
+                _ => continue,
+            };
+            let decl = decl_from_encoder(port, &encoder);
+            match port.tc_index() {
+                Some(tc) => policy.tc[tc as usize] = decl,
+                None => policy.ddi_b = decl,
+            }
+        }
+        policy
+    }
+
+    /// The HDMI DDC pin for `port`: the VBT-resolved pin, else the port's
+    /// default ([`crate::intel_gpu_xelpg_hdmi::ddc_pin`]).
+    pub const fn ddc_pin(&self, port: XeLpgPort) -> Option<PinPair> {
+        match self.decl(port).ddc_pin {
+            Some(pin) => Some(pin),
+            None => crate::intel_gpu_xelpg_hdmi::ddc_pin(port),
+        }
+    }
 
     /// The declaration for `port` (DDI A is never external).
     pub const fn decl(&self, port: XeLpgPort) -> MtlPortDecl {
@@ -878,6 +949,41 @@ impl MtlPortPolicy {
                 self.tc[3].legacy_effective(),
             ],
         }
+    }
+}
+
+/// The declaration for one VBT encoder on an external MTL port. DP and
+/// HDMI follow the encoder's connectors (`init_dp`, an HDMI connector with
+/// its `intel_hdmi_ddc_pin`), legacy follows `intel_ddi_init`'s Type-C
+/// rule. Encoders this route cannot drive as declared become
+/// [`MtlPortDecl::NONE`] (fail closed): DSI and eDP encoders, a VBT AUX
+/// channel other than the port's own (`default_aux_ch`; the AUX, power
+/// and Type-C paths are keyed by port), lane reversal (the route never
+/// programs `PORT_REVERSAL`), and a Type-C port marked dedicated external
+/// (Linux then treats it as non-Type-C; this route always owns it through
+/// TCSS).
+pub fn decl_from_encoder(port: XeLpgPort, encoder: &VbtEncoder) -> MtlPortDecl {
+    let type_c = port.tc_index().is_some();
+    let foreign_aux = encoder
+        .aux_ch
+        .is_some_and(|aux| u32::from(aux) != port.port_enum());
+    if encoder.dsi
+        || encoder.edp
+        || foreign_aux
+        || encoder.lane_reversal
+        || (type_c && !encoder.type_c)
+    {
+        return MtlPortDecl::NONE;
+    }
+    let hdmi = encoder.hdmi_ddc.is_some();
+    if !encoder.dp && !hdmi {
+        return MtlPortDecl::NONE;
+    }
+    MtlPortDecl {
+        dp: encoder.dp,
+        hdmi,
+        legacy: type_c && encoder.tc_legacy,
+        ddc_pin: encoder.hdmi_ddc,
     }
 }
 
@@ -1082,6 +1188,17 @@ impl MtlExternalService {
         self.policy
     }
 
+    /// Replace the port policy (the VBT found at probe). Refused while a
+    /// route is owned: its probe, PLL and DDC choices came from the old
+    /// policy.
+    pub fn set_policy(&mut self, policy: MtlPortPolicy) -> bool {
+        if self.route.is_some() {
+            return self.policy == policy;
+        }
+        self.policy = policy;
+        true
+    }
+
     /// The retained route, if any.
     pub fn route(&self) -> Option<&MtlRoute> {
         self.route.as_ref()
@@ -1107,7 +1224,10 @@ impl MtlExternalService {
             RoutePlan::Hdmi => self.connect_hdmi(io, port, legacy, alloc),
             RoutePlan::Dp | RoutePlan::DpThenHdmi => {
                 match probe_sink(io, Generation::MeteorLake, port, legacy) {
-                    Ok(probe) => self.connect_dp(io, probe, alloc),
+                    Ok(mut probe) => {
+                        probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
+                        self.connect_dp(io, probe, alloc)
+                    }
                     Err(e) if plan == RoutePlan::DpThenHdmi && dpcd_absent(&e) => {
                         self.connect_hdmi(io, port, legacy, alloc)
                     }
@@ -1172,7 +1292,8 @@ impl MtlExternalService {
         legacy: bool,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
-        let probe = match probe_hdmi(io, Generation::MeteorLake, port, legacy) {
+        let ddc = self.policy.ddc_pin(port);
+        let probe = match probe_hdmi(io, Generation::MeteorLake, port, legacy, ddc) {
             Ok(probe) => probe,
             Err(e) => {
                 return ServiceOutcome::Refused {
@@ -1407,6 +1528,29 @@ pub fn external_route_blocks_dc() -> bool {
     SERVICE
         .try_lock()
         .is_none_or(|service| service_blocks_dc(&service))
+}
+
+/// Install the board policy found at probe into the process-wide service
+/// and the hotplug monitor (its legacy Type-C sources,
+/// [`MtlPortPolicy::hpd_config`]). Refused (`false`, nothing changed) while
+/// a service pass runs, a route is owned or the hotplug sources are
+/// already established under another configuration.
+pub fn install_mtl_port_policy(policy: MtlPortPolicy) -> bool {
+    let Some(mut service) = SERVICE.try_lock() else {
+        return false;
+    };
+    if service.route().is_some() && service.policy() != policy {
+        return false;
+    }
+    if !crate::intel_gpu_xelpg_hpd::configure_hpd(policy.hpd_config()) {
+        return false;
+    }
+    service.set_policy(policy)
+}
+
+/// The process-wide service's port policy (`None` while a pass runs).
+pub fn installed_mtl_port_policy() -> Option<MtlPortPolicy> {
+    SERVICE.try_lock().map(|service| service.policy())
 }
 
 /// Act on one hotplug event with the process-wide service. `None` when a

@@ -386,6 +386,23 @@ impl MtlHpdMonitor {
         bits
     }
 
+    /// The board configuration.
+    pub fn config(&self) -> MtlHpdConfig {
+        self.config
+    }
+
+    /// Replace the board configuration (the VBT's legacy Type-C ports)
+    /// before the owned sources are established. Once enabled (or after
+    /// losing authority) only the current configuration is accepted, so
+    /// the owned SDE sources never change underneath a baseline.
+    pub fn configure(&mut self, config: MtlHpdConfig) -> bool {
+        if self.initialized || self.uncertain {
+            return self.config == config;
+        }
+        self.config = config;
+        true
+    }
+
     /// Whether current authority was lost since initialization.
     pub fn uncertain(&self) -> bool {
         self.uncertain
@@ -764,6 +781,12 @@ pub fn poll_hpd_event<M: MmioWindow + ?Sized>(
         return None;
     }
     MTL_HPD.lock().poll(io)
+}
+
+/// Configure the process-wide monitor's board facts before its first poll
+/// ([`MtlHpdMonitor::configure`]).
+pub fn configure_hpd(config: MtlHpdConfig) -> bool {
+    MTL_HPD.lock().configure(config)
 }
 
 /// Withdraw the process-wide monitor's sources before a display reset or

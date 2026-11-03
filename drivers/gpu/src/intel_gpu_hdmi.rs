@@ -78,13 +78,13 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_dp::sink_id_for;
 use crate::intel_gpu_gmbus::{
-    build_edid_read, gen12_ddc_pin, gmbus1_byte_count, gmbus1_slave_addr, GmbusError, GmbusStatus,
-    PinPair, DDC_SLAVE_EDID, DDC_SLAVE_SEGMENT, GMBUS0, GMBUS0_RATE_100KHZ, GMBUS1,
-    GMBUS1_DIR_READ, GMBUS1_ENT, GMBUS1_STO, GMBUS1_SW_CLR_INT, GMBUS1_SW_RDY, GMBUS2, GMBUS3,
-    GMBUS5,
+    build_edid_read, gmbus1_byte_count, gmbus1_slave_addr, GmbusError, GmbusStatus, PinPair,
+    DDC_SLAVE_EDID, DDC_SLAVE_SEGMENT, GMBUS0, GMBUS0_RATE_100KHZ, GMBUS1, GMBUS1_DIR_READ,
+    GMBUS1_ENT, GMBUS1_STO, GMBUS1_SW_CLR_INT, GMBUS1_SW_RDY, GMBUS2, GMBUS3, GMBUS5,
 };
 use crate::intel_gpu_modeset::{Framebuffer, Mode, Modeset, ModesetError};
 use crate::intel_gpu_pipes::Transcoder;
+use crate::intel_gpu_vbt::Gen12DdcOverrides;
 
 // ── DDC over GMBUS ─────────────────────────────────────────────
 
@@ -650,6 +650,9 @@ impl From<ModesetError> for HdmiError {
 pub struct HdmiSinkProbe {
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
+    /// The DDC pin the probe used (`intel_hdmi_ddc_pin`: the VBT pin or
+    /// the platform default); SCDC traffic uses the same pin.
+    pub pin: PinPair,
     /// The sink's preferred mode (first detailed timing).
     pub mode: Mode,
     /// The complete EDID bytes (`edid_len` valid).
@@ -707,19 +710,25 @@ fn mode_from_edid(edid_raw: &[u8]) -> Result<Mode, HdmiError> {
 /// Phase 1 of a connect: run the DDC conversation — read the
 /// complete EDID over GMBUS and derive the mode and the
 /// sink's SCDC capabilities. No display registers are touched
-/// beyond the GMBUS block. The DDC pin is the family's default
-/// ([`gen12_ddc_pin`]); a DDI the family does not have refuses
-/// before any access.
-pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<HdmiSinkProbe, HdmiError> {
+/// beyond the GMBUS block. The DDC pin is the VBT's
+/// (`ddc`, resolved by `intel_hdmi_ddc_pin`) or the family's default
+/// ([`crate::intel_gpu_gmbus::gen12_ddc_pin`]); a DDI with neither
+/// refuses before any access.
+pub fn probe_sink<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+    ddc: &Gen12DdcOverrides,
+) -> Result<HdmiSinkProbe, HdmiError> {
     let family = mmio
         .gen12_display_family()
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pin = gen12_ddc_pin(family, ddi).ok_or(DdcError::NoPinPair)?;
+    let pin = ddc.pin(family, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
     Ok(HdmiSinkProbe {
         ddi,
+        pin,
         mode,
         edid,
         edid_len,
@@ -745,7 +754,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     let family = mmio
         .gen12_display_family()
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pin = gen12_ddc_pin(family, probe.ddi).ok_or(DdcError::NoPinPair)?;
+    let pin = probe.pin;
     let mut scrambling = false;
     if probe.scrambling_required {
         configure_scdc(mmio, pin, &probe.hf_vsdb)?;
@@ -788,11 +797,12 @@ pub fn activate<M: MmioWindow + ?Sized>(
 pub fn connect<M: MmioWindow + ?Sized>(
     mmio: &M,
     ddi: Ddi,
+    ddc: &Gen12DdcOverrides,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
     mmio.gen12_display_family()
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let probe = probe_sink(mmio, ddi)?;
+    let probe = probe_sink(mmio, ddi, ddc)?;
     activate(mmio, &probe, fb)
 }
 
@@ -1365,7 +1375,7 @@ pub mod tests {
     fn smoke_hdmi_1080p_connect_no_scdc_traffic() -> TestResult {
         let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Scdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        let conn = match connect(&mmio, Ddi::B, &test_fb(8192)) {
+        let conn = match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(8192)) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("1080p connect over the sink model must succeed"),
         };
@@ -1475,7 +1485,7 @@ pub mod tests {
     fn smoke_hdmi_4k60_scdc_scrambling() -> TestResult {
         let edid = fixture_edid_hdmi(594_000, 3840, 560, 2160, 90, HfFixture::Scdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        let probe = match probe_sink(&mmio, Ddi::B) {
+        let probe = match probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("4K60 probe must succeed"),
         };
@@ -1531,7 +1541,7 @@ pub mod tests {
     fn smoke_hdmi_4k60_without_scdc_refused() -> TestResult {
         let edid = fixture_edid_hdmi(594_000, 3840, 560, 2160, 90, HfFixture::NoScdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        match connect(&mmio, Ddi::B, &test_fb(16384)) {
+        match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(16384)) {
             Err(HdmiError::ScramblingUnsupported) => {}
             _ => return TestResult::Fail(">340 Mcsc without SCDC must be refused"),
         }
@@ -1560,7 +1570,7 @@ pub mod tests {
         let mut sink = GmbusSink::new(edid);
         sink.ignore_scrambling = true; // never reports status
         let mmio = HdmiSinkMmio::new(Ddi::B, sink);
-        match connect(&mmio, Ddi::B, &test_fb(16384)) {
+        match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(16384)) {
             Err(HdmiError::ScramblingVerifyFailed) => {}
             _ => return TestResult::Fail("unverified scrambling must fail the connect"),
         }
@@ -1576,7 +1586,7 @@ pub mod tests {
         let mut sink = GmbusSink::new(edid);
         sink.nack_all = true;
         let mmio = HdmiSinkMmio::new(Ddi::B, sink);
-        match probe_sink(&mmio, Ddi::B) {
+        match probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) {
             Err(HdmiError::Ddc(DdcError::SlaveNack)) => TestResult::Pass,
             _ => TestResult::Fail("a NACKing sink must surface SlaveNack"),
         }
@@ -1602,7 +1612,7 @@ pub mod tests {
             edid[start + 127] = ((256 - (sum % 256)) % 256) as u8;
         }
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid.clone()));
-        let probe = match probe_sink(&mmio, Ddi::B) {
+        let probe = match probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("4-block EDID probe must succeed"),
         };
@@ -1622,7 +1632,7 @@ pub mod tests {
     fn smoke_hdmi_disconnect_tears_down() -> TestResult {
         let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Scdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        let conn = match connect(&mmio, Ddi::B, &test_fb(8192)) {
+        let conn = match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(8192)) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("connect must succeed"),
         };
@@ -1666,7 +1676,7 @@ pub mod tests {
         let no_b = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(alloc::vec![0u8; 128]));
         *no_b.family.borrow_mut() = Some(Gen12Platform::AlderLakeS);
         if !matches!(
-            probe_sink(&no_b, Ddi::B),
+            probe_sink(&no_b, Ddi::B, &Gen12DdcOverrides::NONE),
             Err(HdmiError::Ddc(DdcError::NoPinPair))
         ) || !no_b.writes.borrow().is_empty()
         {
@@ -1690,7 +1700,7 @@ pub mod tests {
                 )),
             );
             *mmio.family.borrow_mut() = Some(family);
-            let conn = connect(&mmio, ddi, &test_fb(8192)).unwrap();
+            let conn = connect(&mmio, ddi, &Gen12DdcOverrides::NONE, &test_fb(8192)).unwrap();
             assert_eq!(conn.family, family);
             assert_eq!(mmio.writes_to(0x70180).last(), Some(&expected));
             let before = mmio.writes.borrow().len();
@@ -1723,7 +1733,7 @@ pub mod tests {
         );
         *mmio.family.borrow_mut() = None;
         assert!(matches!(
-            connect(&mmio, Ddi::B, &test_fb(15360)),
+            connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(15360)),
             Err(HdmiError::Modeset(ModesetError::UnsupportedGeneration))
         ));
         assert!(mmio.writes.borrow().is_empty());

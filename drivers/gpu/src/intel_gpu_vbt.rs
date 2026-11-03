@@ -1700,6 +1700,64 @@ pub fn gen12_ddc_overrides() -> Gen12DdcOverrides {
     *GEN12_DDC.lock()
 }
 
+/// What probe installed from the board's VBT.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VbtInstall {
+    /// No consumer on this generation; nothing was read.
+    NotApplicable,
+    /// No VBT found: every consumer keeps its no-VBT behaviour.
+    Missing,
+    /// A VBT from `source` was parsed and its facts installed.
+    Installed(VbtSource),
+    /// A VBT was found but the consumer refused the new facts (a route
+    /// or hotplug baseline already exists); the old facts stay.
+    Refused(VbtSource),
+}
+
+/// Probe-time discovery and installation (`intel_bios_init`'s place in
+/// probe): Meteor Lake gets [`crate::intel_gpu_xelpg_external::MtlPortPolicy::from_vbt`]
+/// (ports, legacy Type-C, DDC pins, SSC) or `NO_VBT`; Gen12 gets its HDMI
+/// DDC overrides. `asls` is PCI config [`ASLS`] (`None`: unreadable).
+pub fn install_for_probe(
+    generation: crate::intel_gpu::Generation,
+    gen12: Option<crate::intel_gpu_gt::Gen12Platform>,
+    asls: Option<u32>,
+) -> VbtInstall {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_xelpg_external::{install_mtl_port_policy, MtlPortPolicy};
+    let applicable = match generation {
+        Generation::MeteorLake => true,
+        Generation::TigerLake | Generation::AlderLake => gen12.is_some(),
+        _ => false,
+    };
+    if !applicable {
+        return VbtInstall::NotApplicable;
+    }
+    let found = asls.and_then(discover);
+    let ok = match (generation, &found) {
+        (Generation::MeteorLake, Some((vbt, _))) => {
+            install_mtl_port_policy(MtlPortPolicy::from_vbt(vbt))
+        }
+        (Generation::MeteorLake, None) => install_mtl_port_policy(MtlPortPolicy::NO_VBT),
+        (_, Some((vbt, _))) => match gen12 {
+            Some(family) => {
+                install_gen12_ddc(Gen12DdcOverrides::from_vbt(vbt, family));
+                true
+            }
+            None => false,
+        },
+        (_, None) => {
+            install_gen12_ddc(Gen12DdcOverrides::NONE);
+            true
+        }
+    };
+    match (found, ok) {
+        (None, _) => VbtInstall::Missing,
+        (Some((_, source)), true) => VbtInstall::Installed(source),
+        (Some((_, source)), false) => VbtInstall::Refused(source),
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_vbt_tests.rs"]
 pub mod tests;

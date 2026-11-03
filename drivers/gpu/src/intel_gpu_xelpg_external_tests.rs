@@ -1206,6 +1206,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
                 dp: true,
                 hdmi: true,
                 legacy: true,
+                ddc_pin: None,
             },
             Legacy,
             RoutePlan::DpThenHdmi,
@@ -1230,6 +1231,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
         dp: false,
         hdmi: true,
         legacy: false,
+        ddc_pin: None,
     };
     if !hdmi_only.legacy_effective() || MtlPortDecl::COMBO_DP_HDMI.legacy_effective() {
         return TestResult::Fail("effective legacy flag must follow intel_ddi_init");
@@ -1601,4 +1603,302 @@ fn smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin
+);
+
+// ── VBT-derived policy (intel_bios.c / intel_ddi_init) ──────────────
+
+fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
+    use crate::intel_gpu_vbt::tests::mtl_reference_vbt;
+    let vbt = match crate::intel_gpu_vbt::Vbt::parse(&mtl_reference_vbt(250, true)) {
+        Ok(vbt) => vbt,
+        Err(_) => return TestResult::Fail("reference VBT must parse"),
+    };
+    let policy = MtlPortPolicy::from_vbt(&vbt);
+    let want = MtlPortPolicy {
+        ddi_b: MtlPortDecl {
+            dp: true,
+            hdmi: true,
+            legacy: false,
+            ddc_pin: Some(PinPair::Pin2Bxt),
+        },
+        tc: [
+            MtlPortDecl::USB_C,
+            MtlPortDecl {
+                dp: false,
+                hdmi: true,
+                legacy: true,
+                ddc_pin: Some(PinPair::Pin10Tc2),
+            },
+            MtlPortDecl {
+                dp: true,
+                hdmi: true,
+                legacy: false,
+                ddc_pin: Some(PinPair::Pin11Tc3),
+            },
+            MtlPortDecl::NONE,
+        ],
+        use_ssc: true,
+    };
+    if policy != want {
+        return TestResult::Fail("VBT policy must follow the board's child devices");
+    }
+    if policy.hpd_config().legacy_tc != [false, true, false, false] {
+        return TestResult::Fail("only the VBT legacy port owns an SDE TC source");
+    }
+    use LiveMode::{DpAlt, Legacy, Native};
+    let plans = [
+        (XeLpgPort::B, Native, RoutePlan::DpThenHdmi),
+        (XeLpgPort::Tc1, DpAlt, RoutePlan::Dp),
+        (XeLpgPort::Tc1, Legacy, RoutePlan::Refuse),
+        (XeLpgPort::Tc2, Legacy, RoutePlan::Hdmi),
+        (XeLpgPort::Tc2, DpAlt, RoutePlan::Refuse),
+        (XeLpgPort::Tc3, DpAlt, RoutePlan::Dp),
+        (XeLpgPort::Tc3, Legacy, RoutePlan::Refuse),
+        (XeLpgPort::Tc4, DpAlt, RoutePlan::Refuse),
+    ];
+    for (port, live, plan) in plans {
+        if route_plan(port, policy.decl(port), live) != plan {
+            return TestResult::Fail("route plans must follow the VBT declarations");
+        }
+    }
+    if policy.ddc_pin(XeLpgPort::Tc2) != Some(PinPair::Pin10Tc2)
+        || policy.ddc_pin(XeLpgPort::B) != Some(PinPair::Pin2Bxt)
+    {
+        return TestResult::Fail("HDMI DDC pins come from the VBT");
+    }
+    // enable_ssc clear in the general-features block turns SSC off.
+    let no_ssc = crate::intel_gpu_vbt::Vbt::parse(&mtl_reference_vbt(250, false)).unwrap();
+    if MtlPortPolicy::from_vbt(&no_ssc).use_ssc {
+        return TestResult::Fail("the VBT's SSC preference must reach the policy");
+    }
+    // A VBT with no child devices declares no external port (Linux only
+    // generates defaults when no VBT exists at all).
+    let empty =
+        crate::intel_gpu_vbt::Vbt::parse(&crate::intel_gpu_vbt::tests::VbtImage::new(250).build())
+            .unwrap();
+    let p = MtlPortPolicy::from_vbt(&empty);
+    if p.ddi_b != MtlPortDecl::NONE || p.tc != [MtlPortDecl::NONE; 4] || !p.use_ssc {
+        return TestResult::Fail("a childless VBT declares nothing and keeps SSC on");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_vbt_policy_from_reference_board
+);
+
+fn smoke_mtl_vbt_policy_fails_closed_on_undrivable_ports() -> TestResult {
+    use crate::intel_gpu_vbt::device_type::{DP, DP_DUAL_MODE, EDP, MIPI_OUTPUT};
+    use crate::intel_gpu_vbt::tests::{general_definitions, Child, VbtImage};
+    use crate::intel_gpu_vbt::{block, dp_aux, dvo_port, Vbt};
+    let policy = |version: u16, children: &[Child]| {
+        let vbt = Vbt::parse(
+            &VbtImage::new(version)
+                .block(
+                    block::GENERAL_DEFINITIONS,
+                    general_definitions(44, children),
+                )
+                .build(),
+        )
+        .unwrap();
+        MtlPortPolicy::from_vbt(&vbt)
+    };
+    // Lane reversal on DDI B: the route never programs PORT_REVERSAL.
+    let p = policy(
+        250,
+        &[Child::new(DP_DUAL_MODE, dvo_port::DPB).lane_reversal()],
+    );
+    if p.ddi_b != MtlPortDecl::NONE {
+        return TestResult::Fail("a lane-reversed port must not be driven unreversed");
+    }
+    // TC1 on TC2's AUX channel (unclaimed): AUX is keyed by port here.
+    let p = policy(250, &[Child::new(DP, dvo_port::DPF).aux(dp_aux::G).typec()]);
+    if p.tc[0] != MtlPortDecl::NONE {
+        return TestResult::Fail("a foreign VBT AUX channel must refuse the port");
+    }
+    // eDP declared on DDI B, DSI on DDI B, and a dedicated-external TC1.
+    let p = policy(250, &[Child::new(EDP, dvo_port::DPB)]);
+    let q = policy(250, &[Child::new(MIPI_OUTPUT, dvo_port::MIPIC)]);
+    let r = policy(
+        264,
+        &[Child::new(DP, dvo_port::DPF).typec().dedicated_external()],
+    );
+    if p.ddi_b != MtlPortDecl::NONE || q.ddi_b != MtlPortDecl::NONE || r.tc[0] != MtlPortDecl::NONE
+    {
+        return TestResult::Fail("eDP, DSI and dedicated-external ports are not external routes");
+    }
+    // The same TC1 without the dedicated bit is a plain USB-C port.
+    let s = policy(264, &[Child::new(DP, dvo_port::DPF).typec()]);
+    if s.tc[0] != MtlPortDecl::USB_C {
+        return TestResult::Fail("a USB-C VBT child is a DP-alt port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_vbt_policy_fails_closed_on_undrivable_ports
+);
+
+fn smoke_mtl_vbt_ddc_override_reaches_hdmi_probe() -> TestResult {
+    use crate::intel_gpu_vbt::device_type::DP_DUAL_MODE;
+    use crate::intel_gpu_vbt::tests::{general_definitions, Child, VbtImage};
+    use crate::intel_gpu_vbt::{block, dp_aux, dvo_port, Vbt};
+    // DDI B declares DDC code 1 (ICL_DDC_BUS_DDI_A -> GMBUS pin 1 "dpa");
+    // the sink answers only there and has no DPCD.
+    let vbt = Vbt::parse(
+        &VbtImage::new(250)
+            .block(
+                block::GENERAL_DEFINITIONS,
+                general_definitions(
+                    44,
+                    &[Child::new(DP_DUAL_MODE, dvo_port::DPB)
+                        .aux(dp_aux::B)
+                        .ddc(1)],
+                ),
+            )
+            .build(),
+    )
+    .unwrap();
+    let policy = MtlPortPolicy::from_vbt(&vbt);
+    if policy.ddc_pin(XeLpgPort::B) != Some(PinPair::Pin1Bxt) {
+        return TestResult::Fail("DDC code 1 maps to GMBUS pin 1 on MTL");
+    }
+    let connect = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    let io = hdmi_on_ddi_b(edid_1024());
+    io.ddc.set_pin(1);
+    let mut service = MtlExternalService::with_policy(policy);
+    match service.handle(&io, connect, &mut fb_for) {
+        ServiceOutcome::Activated {
+            protocol: MtlProtocol::Hdmi,
+            ..
+        } => {}
+        _ => return TestResult::Fail("HDMI must probe on the VBT DDC pin"),
+    }
+    match service.route() {
+        Some(MtlRoute::Hdmi(route)) if route.probe.ddc == PinPair::Pin1Bxt => {}
+        _ => return TestResult::Fail("the HDMI route must keep the VBT DDC pin"),
+    }
+    if !service.teardown(&io) {
+        return TestResult::Fail("the VBT HDMI route must tear down");
+    }
+    // The no-VBT policy uses dpb and finds nothing on this board.
+    let io = hdmi_on_ddi_b(edid_1024());
+    io.ddc.set_pin(1);
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Hdmi(HdmiError::Ddc(_)),
+            ..
+        }
+    ) {
+        return TestResult::Fail("the default pin must not reach a sink wired elsewhere");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_vbt_ddc_override_reaches_hdmi_probe
+);
+
+fn smoke_mtl_dp_ssc_follows_vbt_and_sink_downspread() -> TestResult {
+    use crate::intel_gpu_xelpg::{Cx0PllState, SSC_ENABLE_PLLB};
+    let connect = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    // intel_cx0pll_update_ssc: SSC = VBT preference && DP_MAX_DOWNSPREAD_0_5.
+    for (use_ssc, downspread, want) in [
+        (true, 0x01u8, true),
+        (true, 0x00, false),
+        (false, 0x01, false),
+    ] {
+        let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid_1024()));
+        io.sink.borrow_mut().caps[3] = downspread;
+        let mut policy = MtlPortPolicy::NO_VBT;
+        policy.use_ssc = use_ssc;
+        let mut service = MtlExternalService::with_policy(policy);
+        if !matches!(
+            service.handle(&io, connect, &mut fb_for),
+            ServiceOutcome::Activated {
+                protocol: MtlProtocol::Dp,
+                ..
+            }
+        ) {
+            return TestResult::Fail("DDI B DP must activate");
+        }
+        let probe_ssc = match service.route() {
+            Some(MtlRoute::Dp(route)) if route.probe.max_downspread == downspread => {
+                route.probe.ssc
+            }
+            _ => return TestResult::Fail("a DP route with the sink's downspread must be owned"),
+        };
+        let clock_ssc = io.read32(XeLpgPort::B.port_clock_ctl()) & SSC_ENABLE_PLLB != 0;
+        if probe_ssc != want || clock_ssc != want {
+            return TestResult::Fail("PORT_CLOCK_CTL SSC must follow the VBT and the sink");
+        }
+        if !service.teardown(&io) {
+            return TestResult::Fail("the DP route must tear down");
+        }
+    }
+    // intel_c10pll_update_pll: the non-SSC C10 state zeroes PLL bytes 4..8
+    // and keeps the rest; C20 tables are used as shipped.
+    let rate = crate::intel_gpu_pll::LinkRate::DpHbr2;
+    let c10 = |ssc| dp_pll_request(XeLpgPort::B, rate, 4, false, false, ssc).unwrap();
+    match (c10(true).state, c10(false).state) {
+        (Cx0PllState::C10(on), Cx0PllState::C10(off))
+            if on.pll[4..9] != [0; 5]
+                && off.pll[4..9] == [0; 5]
+                && on.pll[..4] == off.pll[..4]
+                && on.pll[9..] == off.pll[9..]
+                && c10(true).ssc
+                && !c10(false).ssc => {}
+        _ => return TestResult::Fail("C10 non-SSC form must zero PLL bytes 4..8 only"),
+    }
+    let c20 = |ssc| dp_pll_request(XeLpgPort::Tc1, rate, 4, true, false, ssc).unwrap();
+    if c20(true).state != c20(false).state || !c20(true).ssc || c20(false).ssc {
+        return TestResult::Fail("C20 keeps its table; only the SSC request differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_dp_ssc_follows_vbt_and_sink_downspread
+);
+
+fn smoke_mtl_no_vbt_install_keeps_missing_defaults() -> TestResult {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_gt::Gen12Platform;
+    use crate::intel_gpu_vbt::{
+        gen12_ddc_overrides, install_for_probe, Gen12DdcOverrides, VbtInstall,
+    };
+    // No readable ASLS, or ASLS 0: no VBT, the NO_VBT policy stays
+    // (init_vbt_missing_defaults: DDI B DP+HDMI, USB-C DP-alt TC ports,
+    // no legacy hotplug source, SSC by sink downspread).
+    if install_for_probe(Generation::MeteorLake, None, None) != VbtInstall::Missing
+        || install_for_probe(Generation::MeteorLake, None, Some(0)) != VbtInstall::Missing
+    {
+        return TestResult::Fail("no OpRegion must report a missing VBT");
+    }
+    if installed_mtl_port_policy() != Some(MtlPortPolicy::NO_VBT)
+        || MtlPortPolicy::NO_VBT.hpd_config() != MtlHpdConfig::TYPE_C
+        || !MtlPortPolicy::NO_VBT.use_ssc
+    {
+        return TestResult::Fail("a missing VBT must keep the NO_VBT policy");
+    }
+    if install_for_probe(Generation::TigerLake, Some(Gen12Platform::TigerLake), None)
+        != VbtInstall::Missing
+        || gen12_ddc_overrides() != Gen12DdcOverrides::NONE
+    {
+        return TestResult::Fail("Gen12 without a VBT keeps the default DDC pins");
+    }
+    if install_for_probe(Generation::LunarLake, None, Some(0x1234_5000))
+        != VbtInstall::NotApplicable
+        || install_for_probe(Generation::TigerLake, None, Some(0x1234_5000))
+            != VbtInstall::NotApplicable
+    {
+        return TestResult::Fail("generations without a consumer must not read the OpRegion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_no_vbt_install_keeps_missing_defaults
 );

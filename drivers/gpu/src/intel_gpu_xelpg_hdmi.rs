@@ -398,8 +398,10 @@ pub fn hdmi_pll_request(
 /// not wire to TC1..TC4, so Linux takes a Type-C port's DDC only from its
 /// VBT child (`intel_bios_hdmi_ddc_pin`, mapped by `map_ddc_pin` with
 /// `adlp_ddc_pin_map`: `ADLP_DDC_BUS_PORT_TCn` = `GMBUS_PIN_9_TC1_ICP +
-/// n - 1`, "tc1".."tc4"). A declared legacy port carries that VBT fact
-/// here: TCn's DDC is the MTP "tcn" pin. DDI A (internal) has none.
+/// n - 1`, "tc1".."tc4"). A hand-declared legacy port carries that VBT
+/// fact here: TCn's DDC is the MTP "tcn" pin. DDI A (internal) has none.
+/// A policy derived from a parsed VBT carries `intel_hdmi_ddc_pin`'s
+/// own result instead (`MtlPortDecl::ddc_pin`).
 pub const fn ddc_pin(port: XeLpgPort) -> Option<PinPair> {
     match port {
         XeLpgPort::A => None,
@@ -426,6 +428,9 @@ pub struct MtlHdmiProbe {
     pub sink: SinkScdc,
     /// The scrambling state the source drives for the mode.
     pub link: TmdsLink,
+    /// The DDC pin EDID and SCDC traffic use (the port policy's
+    /// `intel_hdmi_ddc_pin` result).
+    pub ddc: PinPair,
     /// EDID bytes (`edid_len` valid).
     pub edid: [u8; crate::intel_gpu_hdmi::EDID_CAPACITY],
     /// Valid EDID length.
@@ -456,13 +461,16 @@ pub fn read_edid_ddc<M: MmioWindow + ?Sized>(
 }
 
 /// Probe an HDMI sink: Type-C legacy connect (TC only), DDC EDID,
-/// preferred mode and its TMDS PLL request. Refusals precede MMIO where
+/// preferred mode and its TMDS PLL request. `ddc` is the port's DDC pin
+/// from the board policy (`None`: the port has no usable DDC pin, as
+/// `intel_hdmi_init_connector` refuses). Refusals precede MMIO where
 /// possible; a Type-C connection is rolled back on failure.
 pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
     port: XeLpgPort,
     legacy_port: bool,
+    ddc: Option<PinPair>,
 ) -> Result<MtlHdmiProbe, HdmiError> {
     if generation != Generation::MeteorLake {
         return Err(ExternalError::UnsupportedGeneration.into());
@@ -474,7 +482,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     if type_c && !legacy_port {
         return Err(HdmiError::NotLegacy);
     }
-    let pin = ddc_pin(port).ok_or(HdmiError::DdcUnavailable)?;
+    let pin = ddc.ok_or(HdmiError::DdcUnavailable)?;
     // A legacy Type-C port is owned in legacy mode before its DDC is used,
     // as the DP probe owns the PHY before AUX.
     let tc = if type_c {
@@ -509,6 +517,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
         pll,
         sink,
         link,
+        ddc: pin,
         edid,
         edid_len,
     })
@@ -654,8 +663,12 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Result<
     // active. Linux only logs an SCDC failure; a stream that needs the
     // sink scrambling cannot work without it, so that failure stops here.
     if route.probe.sink.scrambling {
-        let pin = ddc_pin(port).ok_or(HdmiError::DdcUnavailable)?;
-        let scdc = sink_scrambling(io, pin, link.high_tmds_clock_ratio, link.scrambling);
+        let scdc = sink_scrambling(
+            io,
+            route.probe.ddc,
+            link.high_tmds_clock_ratio,
+            link.scrambling,
+        );
         if scdc.is_err() && (link.scrambling || link.high_tmds_clock_ratio) {
             return scdc;
         }
@@ -739,9 +752,7 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Resu
     // reset sink scrambling and the 1/10 ratio, best effort as in Linux
     // (an SCDC NACK never replaces the local stop proof).
     if route.probe.sink.scrambling {
-        if let Some(pin) = ddc_pin(port) {
-            let _ = sink_scrambling(io, pin, false, false);
-        }
+        let _ = sink_scrambling(io, route.probe.ddc, false, false);
     }
     let conf = rd(io, PIPECONF_A)?;
     wr(io, PIPECONF_A, conf & !ENABLE)?;

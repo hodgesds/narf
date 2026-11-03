@@ -1531,19 +1531,32 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
 }
 
 /// The DP 1.4 PLL request for `rate` on `port` (C10 DP/eDP table or C20
-/// MPLLB table with DP VDR parameters, SSC form as shipped).
+/// MPLLB table with DP VDR parameters). `ssc` is
+/// `intel_cx0pll_update_ssc`'s decision
+/// ([`crate::intel_gpu_vbt::dp_ssc_enabled`]); without it the C10 state
+/// takes `intel_c10pll_update_pll`'s non-SSC form (PLL bytes 4..8 zeroed)
+/// and PORT_CLOCK_CTL leaves `SSC_ENABLE_PLLB` clear. The C20 tables are
+/// used as shipped either way; only the PORT_CLOCK_CTL bit follows `ssc`.
 pub fn dp_pll_request(
     port: XeLpgPort,
     rate: LinkRate,
     lane_count: u8,
     dp_alt: bool,
     protocol_switch: bool,
+    ssc: bool,
 ) -> Result<PllRequest, Cx0Error> {
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
     let state = match port.phy() {
-        PhyKind::C10 => Cx0PllState::C10(
-            *c10_pll_state(port_clock_khz, port.is_edp()).ok_or(Cx0Error::UnsupportedRate)?,
-        ),
+        PhyKind::C10 => {
+            let mut state =
+                *c10_pll_state(port_clock_khz, port.is_edp()).ok_or(Cx0Error::UnsupportedRate)?;
+            if !ssc {
+                for byte in &mut state.pll[4..9] {
+                    *byte = 0;
+                }
+            }
+            Cx0PllState::C10(state)
+        }
         PhyKind::C20 => Cx0PllState::C20(
             *c20_pll_state(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
             C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
@@ -1554,7 +1567,7 @@ pub fn dp_pll_request(
         port_clock_khz,
         lane_count,
         dp_alt,
-        ssc: true,
+        ssc,
         hdmi: false,
         protocol_switch,
     })

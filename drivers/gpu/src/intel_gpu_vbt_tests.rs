@@ -1280,3 +1280,23 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_vbt",
     vbt_gen12_ddc_overrides_follow_map_ddc_pin
 );
+
+fn vbt_firmware_copy_refuses_unmapped_ranges_before_access() -> TestResult {
+    // Only zero-length, overflowing or beyond-direct-map ranges are tried:
+    // each must refuse before any page is classified or read.
+    if copy_firmware_ram(0x1000, 0).is_some()
+        || copy_firmware_ram(u64::MAX - 0x10, 0x100).is_some()
+        || copy_firmware_ram(DIRECT_MAP_FLOOR - 0x1000, 0x2000).is_some()
+        || copy_firmware_ram(DIRECT_MAP_FLOOR, OPREGION_SIZE).is_some()
+    {
+        return TestResult::Fail("firmware copies outside the direct map must refuse");
+    }
+    if discover(0).is_some() {
+        return TestResult::Fail("ASLS 0 means no OpRegion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vbt",
+    vbt_firmware_copy_refuses_unmapped_ranges_before_access
+);

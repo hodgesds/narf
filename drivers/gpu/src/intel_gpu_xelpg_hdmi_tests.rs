@@ -151,6 +151,7 @@ fn dp_pll_request_for_test(port: XeLpgPort) -> PllRequest {
         4,
         false,
         false,
+        true,
     )
     .unwrap()
 }
@@ -262,6 +263,7 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
         pll: hdmi_pll_request(XeLpgPort::B, mode.pixel_clock_khz, false).unwrap(),
         sink: SinkScdc::default(),
         link: TmdsLink::default(),
+        ddc: PinPair::Pin2Bxt,
         edid: [0; crate::intel_gpu_hdmi::EDID_CAPACITY],
         edid_len: 0,
     }
@@ -372,7 +374,7 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
         ),
     ];
     for (generation, port, legacy, error) in cases {
-        match probe_hdmi(&NoAccess, generation, port, legacy) {
+        match probe_hdmi(&NoAccess, generation, port, legacy, ddc_pin(port)) {
             Err(e) if e == error => {}
             _ => return TestResult::Fail("HDMI probe refusals must precede MMIO"),
         }
@@ -573,7 +575,13 @@ fn position(io: &ExtFake, f: impl Fn(u64, u32) -> bool) -> Option<usize> {
 
 fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
     let io = ddi_b_hdmi_sink(&edid_with_cta(edid_4k60(), &hf_vsdb(120, 0x80)));
-    let probe = match probe_hdmi(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+    let probe = match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("4K60 HF-VSDB sink must probe"),
     };
@@ -664,7 +672,13 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
     // clearing a stale ratio/scrambling; the source does not scramble.
     let io = ddi_b_hdmi_sink(&edid_with_cta(edid_1080p(), &hf_vsdb(120, 0x80)));
     io.ddc.set_scdc(SCDC_TMDS_CONFIG, 0x03);
-    let probe = match probe_hdmi(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+    let probe = match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
         Ok(p) if p.link == TmdsLink::default() => p,
         _ => return TestResult::Fail("1080p on an HDMI 2.0 sink must not scramble"),
     };
@@ -685,7 +699,13 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
     }
     // LTE_340Mcsc_Scramble: scramble at 148.5 MHz without the 1/40 ratio.
     let io = ddi_b_hdmi_sink(&edid_with_cta(edid_1080p(), &hf_vsdb(120, 0x88)));
-    let probe = match probe_hdmi(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+    let probe = match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("low-rate scrambling sink must probe"),
     };
@@ -701,7 +721,14 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
     }
     // A 594 MHz mode the sink cannot scramble is refused at the probe.
     let io = ddi_b_hdmi_sink(&edid_4k60());
-    if probe_hdmi(&io, Generation::MeteorLake, XeLpgPort::B, false).err()
+    if probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    )
+    .err()
         != Some(HdmiError::ScramblingRequired(594_000))
     {
         return TestResult::Fail("594 MHz without HF-VSDB must refuse");
@@ -709,7 +736,13 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
     // The SCDC slave vanishes after the probe: the scrambled stream cannot
     // work, activation fails, the local stop is still proven.
     let io = ddi_b_hdmi_sink(&edid_with_cta(edid_4k60(), &hf_vsdb(120, 0x80)));
-    let probe = match probe_hdmi(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+    let probe = match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("4K probe must succeed"),
     };
