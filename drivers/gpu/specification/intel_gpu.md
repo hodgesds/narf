@@ -2220,7 +2220,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Trusted GPU range copies | DG2/BMG retained private BCS0 copy jobs, atomic reservations, local data/CCS ownership, cancellation and full-reset retirement | Implemented; native fixtures pass |
 | PCI runtime policy controls | Current admin/epoch sysfs actor, core forbid/auto/signed delay, cached enabled-PM accounting and cancellation-safe disable | Implemented; native fixtures pass |
 | Fixed Tile4 primary | Qualified MTL/Arrow layout/panning with source watermark equations, retained original/current/pending images and joint DSB/primary/console retirement | Implemented; native fixtures pass |
-| Fixed opaque XR30 primary | Qualified MTL/Arrow LINEAR XR30 input, epoch-bound metadata, projected FIFO, common DSB/primary witnesses and retained original-console restoration | Implemented; debug native fixtures pass; release gates pending |
+| Fixed opaque XR30 primary | Qualified MTL/Arrow LINEAR XR30 input, epoch-bound metadata, projected FIFO, common DSB/primary witnesses and retained original-console restoration | Implemented; native fixtures pass |
 | Gen12 GuC execution | Exact firmware families, optional HWCONFIG, source cache/context/restore policy,39-bit DMA, RCS0/BCS0 native execution, owned reset and non-tile MSI | Implemented; native fixtures pass |
 | Gen12 fixed internal primary | Live exclusive GT, unchanged bandwidth/route/resource image, PAT-free bounded mappings and native FIFO/cancel/reset/console proof | Implemented; native fixtures pass |
 | Gen12 fixed CTM | Driver-established internal RGB bypass, retained route/resource/console proofs and native queued CSC latch/restoration | Implemented; native fixtures pass |
@@ -3187,13 +3187,13 @@ callbacks, S3 and controller/console publication remain manually traced rather
 than executed by these new fixtures. Silicon, visible-pixel, complete-link,
 Mesa, codec and performance acceptance remain unrun. No broad workstream closes.
 
-### Fixed opaque XR30 input — debug native checkpoint; release gates pending
+### Fixed opaque XR30 input — software gates recorded
 
 The bounded opaque XR30 slice adds LINEAR four-byte XRGB2101010 input to the existing exact fixed MTL/Arrow internal profile, with integer panning, real projected FIFO state and retained joint primary/color restoration. Current backend epoch publication and explicit reconciliation preserve owner authority. Output depth/HDR, other formats/platforms, global bandwidth policy and broader display work remain outside this slice. The ten broad workstreams remain Open.
 
 The expected selection is 1,918 tests: 1,248 Intel/DRM/framebuffer/backlight plus 670 shared. All 1,912 NEXT10 names remain unchanged; six new registrations bring the cumulative new-or-replacement labels from 157 to 163. All 31 backlight regressions remain. The six additions belong to the existing intel_gpu_dsb namespace in group0 (369); group4 remains135 and group5 remains197.
 
-All seven debug groups pass 1,918 unique tests, including all six additions, all prior names and163 cumulative labels, with zero failures/duplicates, no Intel skips and the existing shared RNG-registration skip. Release native, production/btrfs and remaining gates are pending. The bounded native checkpoint is v0.37 with66 implemented rows; ten broad workstreams stay Open.
+All seven debug and release groups each pass 1,918 unique tests with zero failures/duplicates, no Intel skips and one existing shared RNG-registration skip. All six additions, all prior names,163 cumulative labels and31 backlight regressions pass. Release production boot/both btrfs postflights, both-target CI Clippy, four host vendor all-target Clippy contexts, both-target debug plus aarch64 release package builds, formatting, diff and all125 frozen source/linker hashes pass. The release native path supplies the x86_64 production release build. aarch64 QEMU is omitted under the existing iteration policy; no aarch64-native result is claimed. Version v0.37 has66 implemented rows and ten broad workstreams remain Open.
 
 The new fixtures exercise shared GETPLANE/IN_FORMATS/GET_CAP query helpers,
 real Card::addfb2_intel and raw atomic/PAGE_FLIP/DIRTYFB/cursor/master FIFO
