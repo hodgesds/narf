@@ -43,6 +43,8 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "ht_protection_tests.rs"]
 mod ht_protection_tests;
+#[path = "key_replace_tests.rs"]
+mod key_replace_tests;
 #[path = "monitor_tests.rs"]
 mod monitor_tests;
 #[path = "pmf_tests.rs"]
