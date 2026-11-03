@@ -988,15 +988,32 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.local,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: (1..=13u8)
-                    .filter(|channel| {
-                        station::channel_admitted(self.channels.load(Ordering::Acquire), *channel)
-                    })
+            bands: {
+                // Only signed-admitted 20MHz primaries, per band; the 5GHz
+                // band is advertised only when one of its primaries is
+                // admitted (rtw89 core.c `rtw89_core_set_supported_band`
+                // registers `rtw89_sband_5ghz` for 5GHz-capable chips).
+                let admitted = self.channels.load(Ordering::Acquire);
+                let mut bands = vec![WirelessBand {
+                    freq_mhz: 2400,
+                    channels: (1..=13u8)
+                        .filter(|channel| station::channel_admitted(admitted, *channel))
+                        .map(u32::from)
+                        .collect(),
+                }];
+                let five: Vec<u32> = super::operating_channel::GHZ5
+                    .into_iter()
+                    .filter(|channel| station::channel_admitted(admitted, *channel))
                     .map(u32::from)
-                    .collect(),
-            }],
+                    .collect();
+                if !five.is_empty() {
+                    bands.push(WirelessBand {
+                        freq_mhz: 5000,
+                        channels: five,
+                    });
+                }
+                bands
+            },
             modes: WirelessModes::STATION
                 | if self.monitor_capable.load(Ordering::Acquire) {
                     WirelessModes::MONITOR

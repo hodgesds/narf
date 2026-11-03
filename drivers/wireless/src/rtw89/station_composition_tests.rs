@@ -3121,6 +3121,62 @@ kernel_test_in!(
     smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial
 );
 
+/// A signed-admitted 5GHz primary is advertised in its own band and an
+/// active scan there retunes to it and probes with OFDM-only rates and no
+/// DS Parameter Set; unadmitted 5GHz channels/frequencies are refused.
+fn smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted() -> TestResult {
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    NEXT_CHANNELS.store(1 << 16, Ordering::Release); // channel36
+    let h = Harness::new(false);
+    let bands = h.device.get_wireless_info().bands;
+    if bands.len() != 2
+        || bands[0].freq_mhz != 2400
+        || bands[0].channels != vec![1]
+        || bands[1].freq_mhz != 5000
+        || bands[1].channels != vec![36]
+    {
+        return TestResult::Fail("5GHz band not advertised with only admitted primaries");
+    }
+    let request = |channels: Vec<u32>, frequencies_mhz: Vec<u32>| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz,
+        channels,
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    if complete(h.device.scan(request(vec![40], Vec::new()))).is_ok()
+        || complete(h.device.scan(request(Vec::new(), vec![5200]))).is_ok()
+        || !h.model(|io| io.retunes.is_empty())
+    {
+        return TestResult::Fail("unadmitted 5GHz channel scanned");
+    }
+    if complete(h.device.scan(request(Vec::new(), vec![5180]))).is_err() {
+        return TestResult::Fail("admitted 5GHz scan refused");
+    }
+    let probes = h.peer.lock().probes.clone();
+    if h.model(|io| io.retunes.clone()) != vec![36]
+        || probes.len() != 1
+        || probes[0][24 + 2 + SSID.len()..] != [1, 8, 12, 18, 24, 36, 48, 72, 96, 108]
+    {
+        return TestResult::Fail("5GHz scan did not retune or probe per band");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted
+);
+
 /// mac80211 station CSA on an open link: an AP on channel6 announces a
 /// switch to channel1 (count1, quiet mode). The switch runs through the
 /// associated native owner with the peer kept, the beacon monitor restarts,

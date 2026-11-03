@@ -2387,10 +2387,17 @@ gated), `frequency` is cfg80211 `ieee80211_channel_to_freq_khz`, and
 DAV/DDV words. Capture metadata carries the observed 5GHz frequency (the
 shared radiotap encoder is band-aware).
 
-Remaining before `five_ghz_operation` is whole (no row credit): interface
-band advertisement, coex switch-band, DFS passive scanning, and all native
-two-arch plus physical validation. New unexecuted case:
-`smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`. New unexecuted cases:
+**Interface band.** `get_wireless_info` advertises the 2.4GHz band with its
+admitted primaries and, only when at least one 5GHz primary is
+signed-admitted, a 5000MHz band listing exactly those primaries (core.c
+`rtw89_core_set_supported_band`, narrowed to the admission mask).
+Association requests are checked against the same mask and the cfg80211
+frequency of the primary.
+
+Remaining before `five_ghz_operation` is whole (no row credit): coex switch-band, DFS passive scanning, and all native
+two-arch plus physical validation. New unexecuted cases:
+`smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`,
+`smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted`. New unexecuted cases:
 `smoke_rtw89_b_operating_profile_5ghz_matches_linux_indices_and_groups`,
 `smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx`,
 `smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary`,
