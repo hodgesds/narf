@@ -16,7 +16,14 @@ pub(super) struct Native {
     /// only its original function; neither path fabricates DMA retirement.
     barrier: Option<Arc<Barrier>>,
 }
-pub(super) struct Parked {
+pub(super) enum Parked {
+    /// MAC-off (`rtw_core_stop` + `rtw_power_off`), retired original owner.
+    Cold(Cold),
+    /// RTL8822CE Wake-on-WLAN: the original station stays retained and
+    /// published, the WoW firmware owns the association, no card-off ran.
+    Wow(Wow),
+}
+pub(super) struct Cold {
     claim: ResetClaim,
     retired: Retired,
     off: OffReceipt,
@@ -24,6 +31,17 @@ pub(super) struct Parked {
     name: &'static str,
     rfe6: bool,
     operating: bool,
+    /// cfg80211 keeps `wiphy->wowlan_config` (and the last wake report)
+    /// across a full restart; the fresh shell inherits them.
+    wowlan: Option<narf_wireless::WowlanConfig>,
+    wakeup: Option<super::wow::WakeReport>,
+}
+pub(super) struct Wow {
+    /// System reset claim over the original function; republished to the
+    /// same owner on success, handed to the cold path on failure.
+    claim: ResetClaim,
+    armed: super::wow::Armed,
+    config: SavedPciConfig,
 }
 impl Native {
     pub(super) fn new(owner: Arc<Rtw88Device>, barrier: Arc<Barrier>) -> Self {
@@ -111,7 +129,11 @@ impl super::system_pm_worker::Backend for Native {
             if state != Some(PciPowerState::D0) {
                 return Err(Error::Busy);
             }
-            ResetClaim::acquire_system(&owner, barrier).map_err(|_| Error::Busy)?
+            let claim = ResetClaim::acquire_system(&owner, barrier).map_err(|_| Error::Busy)?;
+            match self.prepare_wow(interface, claim).await {
+                Ok(parked) => return Ok(parked),
+                Err(claim) => claim,
+            }
         } else {
             // IPS is for the actual unassociated passive station only.
             // Hold its real retained owner across eligibility, reservation
@@ -121,10 +143,189 @@ impl super::system_pm_worker::Backend for Native {
                 .await
                 .map_err(|_| Error::Busy)?
         };
+        self.prepare_cold(interface, &lifecycle, claim, operating, true)
+            .await
+            .map(Parked::Cold)
+    }
+    async fn resume(&mut self, parked: Parked) -> Result<(), Error> {
+        match parked {
+            Parked::Cold(cold) => self.resume_cold(cold).await,
+            Parked::Wow(wow) => {
+                let interface = self.owner.interface.clone().ok_or(Error::DriverError)?;
+                let owner = self.owner.clone();
+                let _provision = owner.provisioning.lock().await;
+                match self.resume_wow(&interface, wow).await {
+                    Ok(()) => Ok(()),
+                    Err(Some(claim)) => {
+                        // rtw_ops_resume returning 1: mac80211 restarts the
+                        // hardware. Here: the existing cold MAC-off park of
+                        // the original station (already D0), then the cold
+                        // resume with a fresh shell and fresh association.
+                        let lifecycle = self.lifecycle()?;
+                        let cold = self
+                            .prepare_cold(&interface, &lifecycle, claim, true, false)
+                            .await?;
+                        self.resume_cold(cold).await
+                    }
+                    Err(None) => Err(Error::DriverError),
+                }
+            }
+        }
+    }
+}
+impl Native {
+    fn lifecycle(
+        &self,
+    ) -> Result<Arc<super::firmware_lifecycle::Lifecycle<super::pci_firmware::Transport>>, Error>
+    {
+        self.owner
+            .firmware
+            .as_ref()
+            .map(|firmware| firmware.lifecycle())
+            .or_else(|| {
+                self.owner
+                    .sibling
+                    .as_ref()
+                    .map(|sibling| sibling.lifecycle())
+            })
+            .ok_or(Error::NotImplemented)
+    }
+    /// `rtw_ops_suspend` -> `rtw_wow_suspend`, then the PCI core's
+    /// `pci_pm_suspend_noirq`: save config and move the function to D3hot
+    /// without card-off (rtw88 `rtw_pci_suspend` powers nothing off).
+    /// Returns the claim when WoW is not configured, not applicable or
+    /// failed, so the caller takes the existing cold path.
+    async fn prepare_wow(
+        &mut self,
+        interface: &Arc<super::interface::Native>,
+        claim: ResetClaim,
+    ) -> Result<Parked, ResetClaim> {
+        if self.owner.device_id != 0xc822
+            || super::wow::support(self.owner.device_id).is_none()
+            || interface.wowlan().is_none()
+            // rtw_pci_suspend's RFE6 CLKREQ pad step exists only over the
+            // retired-function RecoveryIo; such boards keep the cold path.
+            || self
+                .owner
+                .firmware
+                .as_ref()
+                .is_none_or(|firmware| firmware.factory().rfe() == 6)
+        {
+            return Err(claim);
+        }
+        // pci_pm_suspend_noirq -> pci_save_state: BME/MEM stay as the
+        // running driver left them; the saved command is restored verbatim.
+        let config = match self.config(&claim, |origin| {
+            narf_bus::pci::save_config(&origin.authority, &origin.device)
+        }) {
+            Ok(config) => config,
+            Err(_) => return Err(claim),
+        };
+        let armed = match interface.wow_suspend().await {
+            Ok(Some(armed)) => armed,
+            Ok(None) | Err(()) => return Err(claim),
+        };
+        let parked = Wow {
+            claim,
+            armed,
+            config,
+        };
+        // pci_prepare_to_sleep: D3hot, no card-off. PME/wake-enable is the
+        // system-PM owner's and is not claimed here (iwlwifi.md §3.80).
+        let result = self.config(&parked.claim, |origin| {
+            narf_bus::pci::set_power_state(&origin.authority, &origin.device, PciPowerState::D3Hot)
+        });
+        if result.is_ok() {
+            Self::settle().await;
+            if self.state(&parked.claim, PciPowerState::D3Hot).is_ok() {
+                return Ok(Parked::Wow(parked));
+            }
+        }
+        // Back to D0 and restore the armed station before the cold path.
+        let _ = self.config(&parked.claim, |origin| {
+            narf_bus::pci::set_power_state(&origin.authority, &origin.device, PciPowerState::D0)
+        });
+        Self::settle().await;
+        Err(self.unwind_wow(interface, parked).await)
+    }
+    /// A suspend-side WoW failure after arming: run `rtw_wow_resume` so the
+    /// station owner is coherent again, then hand the claim to the cold path
+    /// regardless (the normal image and receipts are re-earned there).
+    async fn unwind_wow(
+        &mut self,
+        interface: &Arc<super::interface::Native>,
+        wow: Wow,
+    ) -> ResetClaim {
+        let Wow { claim, armed, .. } = wow;
+        let _ = interface.wow_resume(armed).await;
+        claim
+    }
+    /// PCI core resume (`pci_pm_resume_noirq`: D0 + `pci_restore_state`),
+    /// then `rtw_ops_resume` -> `rtw_wow_resume`. `Err(Some(claim))`: the
+    /// cold path must run; `Err(None)`: the original function is gone.
+    async fn resume_wow(
+        &mut self,
+        interface: &Arc<super::interface::Native>,
+        wow: Wow,
+    ) -> Result<(), Option<ResetClaim>> {
+        let Wow {
+            claim,
+            armed,
+            config,
+        } = wow;
+        let origin = self.origin().map_err(|_| None)?;
+        let pci = self.config(&claim, |origin| {
+            narf_bus::pci::set_power_state(&origin.authority, &origin.device, PciPowerState::D0)
+        });
+        if pci.is_err() {
+            drop(armed);
+            return Err(Some(claim));
+        }
+        Self::settle().await;
+        let restored = self.state(&claim, PciPowerState::D0).and_then(|()| {
+            self.config(&claim, |origin| {
+                narf_bus::pci::restore_config(&origin.authority, &origin.device, &config)
+            })?;
+            self.config(&claim, |origin| {
+                narf_bus::pci::save_config(&origin.authority, &origin.device)
+            })
+        });
+        let pci_ok = restored.as_ref().is_ok_and(|restored| {
+            restored.bars == config.bars
+                && restored.expansion_rom_bar == config.expansion_rom_bar
+                && restored.command == config.command
+        }) && origin.current(&self.owner).is_ok();
+        if !pci_ok {
+            drop(armed);
+            return Err(Some(claim));
+        }
+        if interface.wow_resume(armed).await.is_err() {
+            return Err(Some(claim));
+        }
+        if claim.current().is_err() {
+            return Err(None);
+        }
+        // Same original owner: the reservation returns to it unchanged.
+        claim.publish(self.owner.clone()).map_err(|_| None)
+    }
+    /// The existing cold system-suspend park: withdraw the published shell
+    /// for rebind, retire the original owner, MAC-off (and the RFE6 pad).
+    async fn prepare_cold(
+        &mut self,
+        interface: &Arc<super::interface::Native>,
+        lifecycle: &super::firmware_lifecycle::Lifecycle<super::pci_firmware::Transport>,
+        claim: ResetClaim,
+        operating: bool,
+        d3: bool,
+    ) -> Result<Cold, Error> {
+        let owner = self.owner.clone();
+        let origin = self.origin()?;
+        let wowlan = interface.wowlan();
+        let wakeup = interface.wakeup();
         interface
             .withdraw_for_rebind()
             .map_err(|_| Error::DriverError)?;
-        let retired = super::operating_reset::retire(interface, &lifecycle)
+        let retired = super::operating_reset::retire(interface, lifecycle)
             .await
             .map_err(|_| Error::DriverError)?;
         let name = interface.rebound_name().ok_or(Error::DriverError)?;
@@ -152,7 +353,7 @@ impl super::system_pm_worker::Backend for Native {
             }
             off
         };
-        let parked = Parked {
+        let parked = Cold {
             claim,
             retired,
             off,
@@ -160,8 +361,10 @@ impl super::system_pm_worker::Backend for Native {
             name,
             rfe6,
             operating,
+            wowlan,
+            wakeup,
         };
-        if self.barrier.is_none() {
+        if self.barrier.is_none() || !d3 {
             // ps.c::rtw_enter_ips / main.c::rtw_core_stop: actual card-off
             // is enough; IPS does not claim PCI D3 or a system wake source.
             return Ok(parked);
@@ -172,18 +375,18 @@ impl super::system_pm_worker::Backend for Native {
         if result.is_err() {
             // Card-off already completed. Preserve its real receipts through
             // best-effort rollback rather than dropping the original claim.
-            let _ = <Self as super::system_pm_worker::Backend>::resume(self, parked).await;
+            let _ = self.resume_cold(parked).await;
             return Err(Error::DriverError);
         }
         // No config/MMIO accesses during the mandatory D3 settle interval.
         Self::settle().await;
         if self.state(&parked.claim, PciPowerState::D3Hot).is_err() {
-            let _ = <Self as super::system_pm_worker::Backend>::resume(self, parked).await;
+            let _ = self.resume_cold(parked).await;
             return Err(Error::DriverError);
         }
         Ok(parked)
     }
-    async fn resume(&mut self, parked: Parked) -> Result<(), Error> {
+    async fn resume_cold(&mut self, parked: Cold) -> Result<(), Error> {
         let origin = self.origin()?;
         if self.barrier.is_some() {
             self.config(&parked.claim, |origin| {
@@ -226,12 +429,14 @@ impl super::system_pm_worker::Backend for Native {
             };
             system_pm_wire::clkreq_pad(&mut io, false).map_err(|_| Error::DriverError)?;
         }
-        let Parked {
+        let Cold {
             claim,
             retired,
             off,
             name,
             operating,
+            wowlan,
+            wakeup,
             ..
         } = parked;
         // SAFETY: original claim + actual card-off/D3/D0/config/retirement
@@ -260,6 +465,7 @@ impl super::system_pm_worker::Backend for Native {
             .map_err(|_| Error::DriverError)?;
         claim.current().map_err(|_| Error::DriverError)?;
         let interface = fresh.interface.as_ref().ok_or(Error::DriverError)?;
+        interface.restore_wowlan(wowlan, wakeup);
         super::interface::publish(interface.clone()).map_err(|_| Error::DriverError)?;
         if claim.publish(fresh.clone()).is_err() {
             interface.withdraw();

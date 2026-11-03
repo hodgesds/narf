@@ -203,3 +203,66 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8822ce_carrier_preserves_admin_state_without_reentering_locked_owner
 );
+
+fn wow_config() -> narf_wireless::WowlanConfig {
+    narf_wireless::WowlanConfig {
+        disconnect: true,
+        magic_packet: true,
+        gtk_rekey_failure: false,
+        patterns: vec![narf_wireless::WowlanPattern {
+            mask: vec![0x3f],
+            pattern: vec![2, 4, 6, 8, 10, 12],
+            offset: 0,
+        }],
+        net_detect: None,
+    }
+}
+/// `SET_WOWLAN` on the RTL8822CE shell: advertised stub, validated retained
+/// configuration, and an unlinked station never arms (cold path instead).
+fn smoke_rtw88_wow_interface_config_and_unlinked_suspend() -> TestResult {
+    let device = shell();
+    if device.wowlan_support() != super::super::wow::support(0xc822) {
+        return TestResult::Fail("C22 shell did not advertise rtw_wowlan_stub_8822c");
+    }
+    let mut bad = wow_config();
+    bad.patterns[0].offset = 1;
+    if device.set_wowlan(Some(bad)) != Err(EINVAL) || device.wowlan_config().is_some() {
+        return TestResult::Fail("packet offset outside the stub was retained");
+    }
+    if device.set_wowlan(Some(wow_config())).is_err()
+        || device.wowlan_config() != Some(wow_config())
+    {
+        return TestResult::Fail("valid WoW configuration was not retained");
+    }
+    let mut suspend = core::pin::pin!(device.wow_suspend());
+    match poll(suspend.as_mut()) {
+        Poll::Ready(Ok(None)) => {}
+        _ => return TestResult::Fail("unlinked shell armed WoW instead of the cold path"),
+    }
+    if device.wow_armed.load(Ordering::Acquire) || device.wakeup().is_some() {
+        return TestResult::Fail("refused WoW suspend changed the shell");
+    }
+    if device.set_wowlan(None).is_err() || device.wowlan_config().is_some() {
+        return TestResult::Fail("WoW configuration could not be cleared");
+    }
+    device.restore_wowlan(Some(wow_config()), None);
+    if device.wowlan_config() != Some(wow_config()) {
+        return TestResult::Fail("cold resume did not carry the WoW configuration");
+    }
+    let c21: Native = Device::new(
+        "rtw8821ce-wow-shell",
+        [2, 4, 6, 8, 10, 14],
+        Arc::new(Lifecycle::new(0xc821)),
+        Arc::new(Clock),
+    );
+    if c21.wowlan_support().is_some()
+        || c21.set_wowlan(Some(wow_config())) != Err(narf_wireless::EOPNOTSUPP)
+    {
+        return TestResult::Fail("RTL8821CE advertised or accepted WoW");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/wow",
+    smoke_rtw88_wow_interface_config_and_unlinked_suspend
+);

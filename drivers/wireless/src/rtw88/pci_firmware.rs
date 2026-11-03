@@ -712,13 +712,23 @@ unsafe impl Registers for Native {
         };
         // The swap window carries the swapped image's general/phydm info
         // (`rtw_wow_swap_fw`) on the same retained H2C ring.
+        // Inside the swap window only the swapped image's
+        // `rtw_fw_send_general_info` (13) / `rtw_fw_send_phydm_info` (17)
+        // packets may run, each carrying Linux's running `h2c.seq`
+        // (`rtw_fw_send_h2c_packet`), reset by the download.
+        let swap = self.state == State::Swap;
+        let swap_ok = !swap
+            || matches!(u16::from_le_bytes([packet[2], packet[3]]), 13 | 17)
+                && packet[..2] == [1, 255]
+                && u16::from_le_bytes([packet[6], packet[7]]) == self.tracking_sequence;
         if (!matches!(self.state, State::Commands | State::Swap) && !mission)
             || self.command_ring.pending()
             || mission && *packet != expected
+            || !swap_ok
         {
             return Err(Error::State);
         }
-        if mission {
+        if mission || swap {
             self.tracking_sequence = self.tracking_sequence.checked_add(1).ok_or(Error::State)?;
         }
         let result = (|| {

@@ -66,6 +66,13 @@ pub(super) struct Device<I: Io> {
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    /// cfg80211's retained `SET_WOWLAN` configuration (`wow::validate`d).
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// The WoW firmware owns the association until `wow_resume`; host
+    /// control and packet paths are closed (`admitted` is down) meanwhile.
+    wow_armed: AtomicBool,
+    /// The last resume's `ieee80211_report_wowlan_wakeup` subset.
+    wakeup: IrqSafeSpinLock<Option<super::wow::WakeReport>>,
 }
 impl<I: Io> core::fmt::Debug for Device<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -147,7 +154,99 @@ impl<I: Io + 'static> Device<I> {
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            wowlan: IrqSafeSpinLock::new(None),
+            wow_armed: AtomicBool::new(false),
+            wakeup: IrqSafeSpinLock::new(None),
         }
+    }
+    /// The retained WoW configuration, carried across a cold system resume
+    /// into the fresh shell as cfg80211 keeps `wiphy->wowlan_config`.
+    pub(super) fn wowlan(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
+    }
+    pub(super) fn restore_wowlan(
+        &self,
+        config: Option<narf_wireless::WowlanConfig>,
+        wakeup: Option<super::wow::WakeReport>,
+    ) {
+        if config
+            .as_ref()
+            .is_none_or(|c| super::wow::validate(self.lifecycle.device_id(), c).is_ok())
+        {
+            *self.wowlan.lock() = config;
+        }
+        *self.wakeup.lock() = wakeup;
+    }
+    /// The last WoW resume's wake reason (`rtw_wow_show_wakeup_reason`).
+    pub(super) fn wakeup(&self) -> Option<super::wow::WakeReport> {
+        *self.wakeup.lock()
+    }
+    /// `rtw_ops_suspend` -> `rtw_wow_suspend` on the retained managed-linked
+    /// station while the interface stays published. `Ok(None)`: no WoW
+    /// configuration or no settled association, nothing was touched.
+    /// `Err`: WoW was attempted and failed; the caller must take the cold
+    /// path (`rtw_ops_suspend` returning 1 makes mac80211 fully stop).
+    pub(super) async fn wow_suspend(&self) -> Result<Option<super::wow::Armed>, ()> {
+        let Some(config) = self.wowlan() else {
+            return Ok(None);
+        };
+        let mut storage = self.lifecycle.retained.lock().await;
+        if self.closed()
+            || self.withdrawn()
+            || !self.published.load(Ordering::Acquire)
+            || !self.admitted.load(Ordering::Acquire)
+            || self.wow_armed.load(Ordering::Acquire)
+            || self.lifecycle.removed()
+            || self.lifecycle.status().stage != super::firmware_lifecycle::Stage::StationReady
+        {
+            return Ok(None);
+        }
+        let Some(owner) = storage.as_mut() else {
+            return Ok(None);
+        };
+        if owner.station_peer().is_none() || owner.wow_plan(&config).is_err() {
+            return Ok(None);
+        }
+        // mac80211 `ieee80211_suspend`: stop the queues and refuse host
+        // control before the driver op; nothing can reach the owner while
+        // `admitted` is down (`control_ready`, `enqueue`, `progress`,
+        // `watchdog`), and this mutex is held for the whole sequence.
+        self.wow_armed.store(true, Ordering::Release);
+        self.admitted.store(false, Ordering::Release);
+        {
+            self.rings.lock().await.clear();
+        }
+        *self.wakeup.lock() = None;
+        owner.wow_suspend(&config).await.map(Some).map_err(|_| ())
+    }
+    /// `rtw_ops_resume` -> `rtw_wow_resume`. Success reopens host control
+    /// and packets over the same association; an error (including a
+    /// disconnect or unknown wake reason, which Linux reports and mac80211
+    /// then drops the link for) leaves it closed for the cold path.
+    pub(super) async fn wow_resume(&self, armed: super::wow::Armed) -> Result<(), ()> {
+        let mut storage = self.lifecycle.retained.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            drop(armed);
+            return Err(());
+        };
+        let (report, result) = owner.wow_resume(armed).await;
+        *self.wakeup.lock() = report;
+        if result.is_err()
+            || !report.as_ref().is_some_and(super::wow::keeps_link)
+            || self.closed()
+            || self.withdrawn()
+            || owner.station_peer().is_none()
+            || owner.station_check().is_err()
+        {
+            return Err(());
+        }
+        self.wow_armed.store(false, Ordering::Release);
+        self.admitted.store(true, Ordering::Release);
+        if self.publish_link(owner).is_err() {
+            self.admitted.store(false, Ordering::Release);
+            return Err(());
+        }
+        Ok(())
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
@@ -674,6 +773,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         if self.closed() {
             return Err(ENODEV);
         }
+        if self.wow_armed.load(Ordering::Acquire) {
+            return Err(EBUSY);
+        }
         let mut storage = self.lifecycle.retained.try_lock().ok_or(EBUSY)?;
         let owner = storage.as_mut().ok_or(EBUSY)?;
         let result = owner.station_set_rts_threshold(value);
@@ -713,6 +815,22 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
     fn max_scan_ie_len(&self) -> u16 {
         super::scan::MAX_EXTRA_IES
+    }
+    /// `rtw_wowlan_stub_8822c` (`wow::support`), RTL8822CE only.
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        super::wow::support(self.lifecycle.device_id())
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        let did = self.lifecycle.device_id();
+        super::wow::support(did).ok_or(narf_wireless::EOPNOTSUPP)?;
+        if let Some(config) = &config {
+            super::wow::validate(did, config).map_err(|_| EINVAL)?;
+        }
+        *self.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan()
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {

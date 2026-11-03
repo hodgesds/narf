@@ -233,7 +233,14 @@ impl Native {
             } else {
                 Ok(())
             }
-        })
+        })?;
+        // mac.c::__rtw_download_firmware tail: `h2c.last_box_num = 0` and
+        // `h2c.seq = 0` for every image download, the WoW swap included.
+        // The swapped image's general/phydm info then carries 0/1 and the
+        // running counter continues from there.
+        self.mailbox_cursor = 0;
+        self.tracking_sequence = 0;
+        Ok(())
     }
     /// `rtw_wow_resume_trx` done: close the swap window and readmit the
     /// packet core that `restart_packets` reset (or never halted).

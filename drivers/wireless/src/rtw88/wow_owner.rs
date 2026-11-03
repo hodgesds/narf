@@ -24,10 +24,85 @@ impl<I: Io> Owner<I> {
         let phy = self.phy.ok_or(Error::State)?;
         self.swap_firmware(image).await?;
         self.phase = Phase::Failed;
+        // mac.c::__rtw_download_firmware resets `h2c.seq` per download, so
+        // the swapped image's info packets carry 0/1 exactly as at bring-up
+        // (the native swap window enforces that running counter).
         super::super::command::send(&mut self.io, &super::super::command::general(mac, 0)?).await?;
         super::super::command::send(&mut self.io, &super::super::command::phydm(phy, 1)?).await?;
         self.phase = Phase::Station;
         Ok(())
+    }
+    /// `rtw_wow_suspend` inputs from the managed-linked, settled station:
+    /// own address, AP, AID, WMM and the AOAC temporal keys. Refuses an
+    /// unassociated, handshaking, switching or retuning station.
+    pub(in super::super) fn wow_plan(
+        &self,
+        config: &narf_wireless::WowlanConfig,
+    ) -> Result<super::super::wow::Plan, super::super::wow::Error> {
+        use super::super::wow::Error as WowError;
+        self.wow_live()?;
+        let station = self.station.as_deref().ok_or(WowError::Unsupported)?;
+        if !station.ready() || station.phase() != super::super::station::Phase::Open {
+            return Err(WowError::Unsupported);
+        }
+        let peer = station.peer().ok_or(WowError::Unsupported)?;
+        let aid = station.aid().ok_or(WowError::Unsupported)?;
+        let wmm = station.wmm().ok_or(WowError::Unsupported)?;
+        let keys = station.suspend_keys().map_err(|_| WowError::Unsupported)?;
+        super::super::wow::Plan::new(
+            self.did,
+            config,
+            station.local(),
+            peer,
+            aid,
+            wmm,
+            keys.as_ref(),
+        )
+    }
+    /// `rtw_wow_suspend` on this retained station owner: the WoW image is
+    /// opened through the same registry/signature authority as the NIC
+    /// image. The caller holds the retained mutex and has closed host
+    /// packet publication; an error leaves the owner for the cold path.
+    pub(in super::super) async fn wow_suspend(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+    ) -> Result<super::super::wow::Armed, super::super::wow::Error> {
+        let plan = self.wow_plan(config)?;
+        let image = super::registered_wow_image(self.did)?;
+        super::super::wow::suspend(self, &plan, &image).await
+    }
+    /// `rtw_wow_resume`: restores a freshly registered normal image (never a
+    /// cached copy). The report is returned even when the restore fails.
+    pub(in super::super) async fn wow_resume(
+        &mut self,
+        armed: super::super::wow::Armed,
+    ) -> (
+        Option<super::super::wow::WakeReport>,
+        Result<(), super::super::wow::Error>,
+    ) {
+        let image = match super::registered_image(self.did) {
+            Ok(image) => image,
+            Err(e) => {
+                // The WoW firmware stays armed; the caller takes the cold
+                // full-restart path. Still capture the wake reason.
+                let report = self
+                    .io
+                    .read8(super::super::wow::REG_WOWLAN_WAKE_REASON)
+                    .ok()
+                    .map(super::super::wow::decode);
+                drop(armed);
+                return (report, Err(e.into()));
+            }
+        };
+        let (report, mut result) = super::super::wow::resume(self, armed, &image).await;
+        if result.is_ok() && report.as_ref().is_some_and(super::super::wow::keeps_link) {
+            if let Some(station) = self.station.as_deref_mut() {
+                result = station
+                    .wow_resumed()
+                    .map_err(|_| super::super::wow::Error::Unsupported);
+            }
+        }
+        (report, result)
     }
 }
 

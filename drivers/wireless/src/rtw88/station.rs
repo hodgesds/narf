@@ -440,6 +440,26 @@ impl State {
             None
         }
     }
+    /// Association ID the AP granted (`vif->cfg.aid`), only while linked;
+    /// the WoW PS-Poll reserved page carries it (`rtw_add_rsvd_page_sta`).
+    pub(super) fn aid(&self) -> Option<u16> {
+        self.peer().and(self.associated_aid)
+    }
+    /// The association negotiated WMM (`sta->wme`), only while linked; the
+    /// WoW keep-alive reserved pages then include the QoS NULL template.
+    pub(super) fn wmm(&self) -> Option<bool> {
+        self.peer().map(|_| self.wmm.is_some())
+    }
+    /// After a kept-link WoW resume: the suspended interval does not count
+    /// toward the 5 s link-loss window, as mac80211's jiffies-based beacon
+    /// and connection monitors do not advance across system suspend.
+    pub(super) fn wow_resumed(&mut self) -> Result<(), Error> {
+        if self.peer().is_none() {
+            return Err(Error::State);
+        }
+        self.last_peer = self.now()?;
+        Ok(())
+    }
     /// Current temporal keys for the WoW security CAM (`wow.c` AOAC):
     /// `Ok(None)` for an open BSS, an error unless an associated protected
     /// port is open and settled (no handshake or reply in flight).
