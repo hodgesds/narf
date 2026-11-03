@@ -618,6 +618,8 @@ pub mod amdgpu_rdna2_smu_telemetry;
 /// Compatibility alias for the original Navi22 API.
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_smu_telemetry as amdgpu_smu_navi22_telemetry;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_dp_bridge;
 #[path = "amdgpu_vcn_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn;
@@ -916,6 +918,11 @@ pub fn register_initcalls() {
     });
     #[cfg(feature = "amdgpu")]
     narf_init::register(Stage::Late, "amdgpu-usbc", amdgpu_usbc::start);
+    #[cfg(feature = "amdgpu")]
+    narf_init::register(Stage::Late, "amdgpu-dp-bridge", || {
+        amdgpu_dp_bridge::register_bridge();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Device, "gpu-backlight", || {
         backlight::init_backlight_initcall();
         InitResult::Ok

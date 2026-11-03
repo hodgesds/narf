@@ -53,7 +53,7 @@ vendor feature off, none of that vendor's modules compile and none
 of its PCI drivers register: the Intel modules,
 `intel_gpu::register_pci_driver` and the `intel-gpu-pci` /
 `intel-gpu-dp-bridge` initcalls exist only under `intel`; the AMD
-module tree, `amdgpu-pci` and `amdgpu-usbc` only under `amdgpu`.
+module tree, `amdgpu-pci`, `amdgpu-usbc` and `amdgpu-dp-bridge` only under `amdgpu`.
 The `smoke_gpu_vendor_feature_registration_census` kernel-test
 fixture pins the registered initcall names against the compiled
 feature set. The named-config registry in build/xtask
@@ -11786,6 +11786,24 @@ worker is the sole mailbox owner, responds to UCSI changes, and periodically
 rescans without assuming a UCSI-to-GPU wiring map. Suspend is refused while a
 command cycle is active; resume revalidates the firmware mailbox mapping.
 Firmware replacement is rejected while this worker owns DMUB.
+
+`amdgpu_dp_bridge::AmdDpBridge` implements `DpAltModeGpuBridge` (`"amdgpu"`)
+and registers at Stage::Late under `amdgpu` alongside `amdgpu-usbc`. On DP
+entry it resolves the negotiated link to a DMUB endpoint and records it in
+`entered_links()` for the modeset stage; it does not modeset itself. The
+resolution rule is a documented stage-1 assumption, not a wiring map: no
+in-tree map connects the PD layer's TCPM registry index, the DMUB scan's
+`(Channel, instance)` sink pairs, and ATOM/KMS connector indices, so the
+bridge resolves the endpoint class from the published sink set — a DPIA
+sink present resolves to a DMUB tunnel endpoint, otherwise a Legacy sink
+resolves to a native transmitter — taking the first sink of the winning
+class in scan order and flagging the entry `ambiguous` when several sinks
+of that class were published. Unprobed AMD GPUs, and Navi22 (whose usbc
+scan never runs), decline with `NoSuchConnector` so dispatch falls
+through; a probed GPU with no sinks published yet reports `NotReady`.
+Building a board wiring map (VBT/ATOM matching) to remove the
+first-of-many assumption is follow-up work. The vendor-feature census
+pins the `amdgpu-dp-bridge` initcall against the `amdgpu` feature.
 
 `amdgpu_dp_training::train` performs async 8b/10b clock recovery and channel
 equalization over a caller-supplied `LinkIo`, which owns the AUX channel and

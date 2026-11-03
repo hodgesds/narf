@@ -14561,6 +14561,9 @@ fn smoke_gpu_vendor_feature_registration_census() -> TestResult {
     if late.contains(&"amdgpu-usbc") != amdgpu {
         return TestResult::Fail("amdgpu-usbc registration does not match the amdgpu feature");
     }
+    if late.contains(&"amdgpu-dp-bridge") != amdgpu {
+        return TestResult::Fail("amdgpu-dp-bridge registration does not match the amdgpu feature");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
