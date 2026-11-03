@@ -2607,11 +2607,27 @@ verified, and only while GT0's user epoch is live:
 - EXEC on a GT1 queue checks GT1's epoch and submits to the media GuC. A media
   GuC fault or restart bans such queues (ECANCELED); an unpublished GT1 is
   ENODEV.
+- `DRM_XE_DEVICE_QUERY_ENGINE_CYCLES` accepts gt_id 1 in query_engine_cycles'
+  order: size (EINVAL), input copy (EFAULT), clockid (EINVAL), then an unknown
+  gt_id or an unpublished GT1 (EINVAL), then a class or logical instance absent
+  from GT1 (EINVAL). The media GuC samples the engine's RING_TIMESTAMP(_UDW) at
+  its absolute engine base (above MEDIA_GT_GSI_LENGTH, so no GSI adjustment)
+  while it holds GT1's GT wake and every VDBOX/VEBOX well. The width is 36, and
+  userspace converts with GT1's reference clock from the GT list. A lost GT1
+  wake is EIO and begins the media GuC's verified stop, which unpublishes GT1.
+  An unstable rollover sample is EAGAIN, as on GT0.
+- `DRM_XE_DEVICE_QUERY_GT_TOPOLOGY` appends GT1's entries after GT0's, in
+  for_each_gt order. Like Linux (xe_gt_topology_init runs on the media GT),
+  probe reads GT1's own GSI-translated XELP_GT_GEOMETRY_DSS_ENABLE,
+  XEHP_GT_COMPUTE_DSS_ENABLE and XELP_EU_ENABLE under GT1 wake, as two equal
+  samples. It reports them as read, empty masks included, with gt_id 1: a
+  geometry and a compute DSS mask and a SIMD8 EU-per-DSS mask (graphics
+  12.7x), using GT0's existing 4-byte DSS and 2-byte EU wire widths and no L3
+  bank entry. Reserved EU bits refuse the media GT as unavailable.
 
-Without the option, or before publication, the GT list, engine query and queue
-creation are exactly GT0-only as before, and gt_id 1 is EINVAL. The engine
-cycles and topology queries remain GT0-only. HuC (GSC-loaded on MTL) stays
-unadvertised.
+Without the option, or before publication, the GT list, engine, engine-cycles
+and topology queries and queue creation are exactly GT0-only as before, and
+gt_id 1 is EINVAL. HuC (GSC-loaded on MTL) stays unadvertised.
 
 ### Intel fixed Gen12 views and exact family selection
 

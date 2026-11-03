@@ -66,30 +66,53 @@ pub(crate) async fn query_user(
     if !matches!(clock, 0 | 1 | 4 | 7) {
         return Err(FsError::InvalidData);
     }
-    // Like xe_query.c, the engine pad is ignored. Only main GT0's published
-    // logical instances can be sampled, including BMG COPY1 -> BCS8.
+    // Like xe_query.c, the engine pad is ignored. GT0's published logical
+    // instances (including BMG COPY1 -> BCS8) and, while the standalone media
+    // GT is published, GT1's VCS/VECS logical instances can be sampled.
     let class = u16::from_le_bytes([input[0], input[1]]);
     let logical = u16::from_le_bytes([input[2], input[3]]);
-    if input[4..6] != [0; 2] {
-        return Err(FsError::InvalidData);
-    }
+    // query_engine_cycles: gt_id >= max_gt_per_tile and xe_device_get_gt
+    // are EINVAL; gt_id 1 exists only while GT1 is published.
+    let media = match u16::from_le_bytes([input[4], input[5]]) {
+        0 => None,
+        1 => Some(
+            info.backend
+                .as_ref()
+                .and_then(|b| b.media_gt())
+                .ok_or(FsError::InvalidData)?,
+        ),
+        _ => return Err(FsError::InvalidData),
+    };
     let destination = data.checked_add(12).ok_or(FsError::BadAddress)?;
-    let status = info
-        .backend
-        .as_ref()
-        .and_then(|b| b.status())
-        .ok_or(FsError::NoDevice)?;
-    // A known class this GT did not publish (fused-off CCS0) is EINVAL.
-    let engine = status
-        .engines
-        .from_class_instance(class, logical)
-        .ok_or(FsError::InvalidData)?;
-    let stamp = info
-        .backend
-        .as_ref()
-        .ok_or(FsError::NoDevice)?
-        .engine_cycles(engine, clock)
-        .await?;
+    let stamp = if let Some(media) = media {
+        // xe_gt_hw_engine(gt, class, instance, true) on GT1: render, copy
+        // and compute classes, or an absent logical instance, are EINVAL.
+        let engine = media
+            .engines
+            .from_class_instance(class, logical)
+            .ok_or(FsError::InvalidData)?;
+        info.backend
+            .as_ref()
+            .ok_or(FsError::NoDevice)?
+            .media_engine_cycles(engine, clock)
+            .await?
+    } else {
+        let status = info
+            .backend
+            .as_ref()
+            .and_then(|b| b.status())
+            .ok_or(FsError::NoDevice)?;
+        // A known class this GT did not publish (fused-off CCS0) is EINVAL.
+        let engine = status
+            .engines
+            .from_class_instance(class, logical)
+            .ok_or(FsError::InvalidData)?;
+        info.backend
+            .as_ref()
+            .ok_or(FsError::NoDevice)?
+            .engine_cycles(engine, clock)
+            .await?
+    };
     let mut output = [0; 28];
     put32(&mut output, 0, stamp.width);
     put64(&mut output, 4, stamp.engine_cycles);
@@ -246,13 +269,15 @@ fn query_wire(
                 .ok_or(FsError::NoDevice)?;
             let mut reply = Vec::new();
             let width = if info.platform.is_ptl() { 12 } else { 4 };
-            for (kind, mask) in [
+            let mut masks = vec![
                 (
+                    0u16,
                     1u16,
                     topology.geometry_dss().to_le_bytes()[..width].to_vec(),
                 ),
-                (2, topology.compute_dss().to_le_bytes()[..width].to_vec()),
+                (0, 2, topology.compute_dss().to_le_bytes()[..width].to_vec()),
                 (
+                    0,
                     if topology.eu_type() == EuType::Simd16 {
                         5
                     } else {
@@ -260,8 +285,20 @@ fn query_wire(
                     },
                     topology.eu_mask_per_dss().to_le_bytes().to_vec(),
                 ),
-            ] {
+            ];
+            // query_gt_topology walks for_each_gt: the published media GT
+            // follows with its own GSI-read fuses in the same per-GT layout
+            // (geometry, compute, then SIMD8 EU per DSS at graphics 12.7x).
+            if let Some(media) = info.backend.as_ref().and_then(|b| b.media_gt()) {
+                masks.extend([
+                    (1, 1, media.topology.geometry.to_le_bytes().to_vec()),
+                    (1, 2, media.topology.compute.to_le_bytes().to_vec()),
+                    (1, 4, media.topology.eu_per_dss.to_le_bytes().to_vec()),
+                ]);
+            }
+            for (gt, kind, mask) in masks {
                 let mut header = [0u8; 8];
+                header[..2].copy_from_slice(&gt.to_le_bytes());
                 header[2..4].copy_from_slice(&kind.to_le_bytes());
                 put32(&mut header, 4, mask.len() as u32);
                 reply.extend_from_slice(&header);

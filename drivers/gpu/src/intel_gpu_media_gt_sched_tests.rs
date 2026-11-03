@@ -233,8 +233,18 @@ impl Hw {
 }
 
 pub(super) fn start_media(w: &Window, arena: &Arena) -> MediaGuc<Window, Arena> {
+    start_media_with(w, arena, Default::default())
+}
+
+/// `start_media` over a media GT that observed these GT1 topology fuses.
+pub(super) fn start_media_with(
+    w: &Window,
+    arena: &Arena,
+    topology: crate::intel_gpu_gt::media::MediaTopology,
+) -> MediaGuc<Window, Arena> {
     let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
-    let media = MediaGt::initialized_for_test(MTL, MEDIA_GMD, FUSE);
+    let media =
+        MediaGt::initialized_for_test(MTL, MEDIA_GMD, FUSE).with_topology_for_test(topology);
     w.0.borrow_mut().regs.insert(0x380d00, RPM_CONFIG0);
     MediaGuc::start(w.clone(), arena.clone(), &firmware, media_config(), &media, 0).unwrap()
 }

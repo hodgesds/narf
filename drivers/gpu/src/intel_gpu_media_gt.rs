@@ -48,6 +48,11 @@
 //!   through the media CT (xe_guc_tlb_inval.c::send_tlb_inval_ggtt).
 //! - Every engine executes and retires a private PPGTT job before
 //!   `MediaGuc::publication` exposes GT1.
+//! - xe_gt_topology.c::xe_gt_topology_init also runs on GT1, so probe reads
+//!   GT1's own GSI-translated fuse mirrors (`MediaTopology`) for
+//!   xe_query.c::query_gt_topology; query_engine_cycles samples a published
+//!   VCS/VECS RING_TIMESTAMP at its absolute engine base under GT1's wake
+//!   (`MediaGuc::engine_cycles`).
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
@@ -209,6 +214,60 @@ impl MediaIp {
     }
 }
 
+/// The media GT's own topology fuses, as xe_gt_topology.c::
+/// xe_gt_topology_init reads them through GT1's GSI-adjusted MMIO under GT
+/// forcewake (gt_init_with_gt_forcewake runs it for the media GT too). At
+/// graphics 12.70-12.74 get_num_dss_regs selects one geometry and one compute
+/// register, and load_eu_mask reads XELP_EU_ENABLE without inversion as SIMD8
+/// (one fuse bit is two EUs). Linux keeps whatever GT1 reports, including
+/// empty masks; nothing here is inferred from GT0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct MediaTopology {
+    /// XELP_GT_GEOMETRY_DSS_ENABLE (0x913c + GSI).
+    pub geometry: u32,
+    /// XEHP_GT_COMPUTE_DSS_ENABLE (0x9144 + GSI).
+    pub compute: u32,
+    /// SIMD8 EU mask per DSS expanded from XELP_EU_ENABLE (0x9134 + GSI).
+    pub eu_per_dss: u16,
+}
+
+/// regs/xe_gt_regs.h topology fuse mirrors (pre-GSI offsets).
+const GEOMETRY_DSS_ENABLE: u64 = 0x913c;
+const COMPUTE_DSS_ENABLE: u64 = 0x9144;
+const EU_ENABLE: u64 = 0x9134;
+
+impl MediaTopology {
+    /// Two identical samples of GT1's fuse mirrors under GT1 wake. As for
+    /// GT0 (`GtTopology::read`), a fully populated DSS mask may read all
+    /// ones, so the EU register's reserved bits 31:8 (XELP_EU_MASK is 7:0)
+    /// identify unavailable MMIO instead.
+    pub(crate) fn read(media: &impl MmioWindow) -> Result<Self, MediaError> {
+        let sample = || {
+            (
+                media.read32(GEOMETRY_DSS_ENABLE),
+                media.read32(COMPUTE_DSS_ENABLE),
+                media.read32(EU_ENABLE),
+            )
+        };
+        let first = sample();
+        if first != sample() {
+            return Err(MediaError::Unstable);
+        }
+        let (geometry, compute, raw_eu) = first;
+        if raw_eu & !0xff != 0 {
+            return Err(MediaError::Unavailable);
+        }
+        let eu_per_dss = (0..8)
+            .filter(|bit| raw_eu & 1 << bit != 0)
+            .fold(0u16, |mask, bit| mask | 3 << (bit * 2));
+        Ok(Self {
+            geometry,
+            compute,
+            eu_per_dss,
+        })
+    }
+}
+
 /// Facts this owner established for one GT0 incarnation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MediaFacts {
@@ -217,6 +276,8 @@ pub struct MediaFacts {
     pub fuse: u32,
     /// Present physical VCS/VECS engines of GT1.
     pub engines: EngineSet,
+    /// GT1's own topology fuses (DRM_XE_DEVICE_QUERY_GT_TOPOLOGY gt_id 1).
+    pub topology: MediaTopology,
 }
 
 /// Only Generation::MeteorLake (which includes Arrow Lake) has this profile.
@@ -352,6 +413,7 @@ pub(crate) struct MediaGt {
     ip: Option<MediaIp>,
     fuse: u32,
     engines: EngineSet,
+    topology: MediaTopology,
     /// Domains whose kernel wake request this owner wrote and not released.
     requested: u16,
     gsc_prepared: bool,
@@ -371,6 +433,7 @@ impl MediaGt {
             ip: None,
             fuse: 0,
             engines: EngineSet::default(),
+            topology: MediaTopology::default(),
             requested: 0,
             gsc_prepared: false,
             recovery: false,
@@ -393,6 +456,7 @@ impl MediaGt {
             ip: self.ip.expect("initialized identity"),
             fuse: self.fuse,
             engines: self.engines,
+            topology: self.topology,
         })
     }
 
@@ -406,6 +470,13 @@ impl MediaGt {
         owner.engines = inventory(fuse);
         owner.phase = Phase::Initialized;
         owner
+    }
+
+    /// The same fixture with GT1 topology fuses already observed.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn with_topology_for_test(mut self, topology: MediaTopology) -> Self {
+        self.topology = topology;
+        self
     }
 
     /// Wake requests this owner still has outstanding.
@@ -495,6 +566,8 @@ impl MediaGt {
                 if self.engines.iter().next().is_none() {
                     return Err(MediaError::NoEngines);
                 }
+                // gt_init_with_gt_forcewake -> xe_gt_topology_init on GT1.
+                self.topology = MediaTopology::read(media)?;
                 if !self.recovery {
                     // Probe: no GT reset (xe_gt.c::do_gt_reset runs only from
                     // gt_reset_worker and xe_gt_shutdown). The GuC sanitize
@@ -907,6 +980,7 @@ pub(crate) struct MediaPublication {
     pub(crate) engines: EngineSet,
     pub(crate) gmd: u32,
     pub(crate) reference_clock: u32,
+    pub(crate) topology: MediaTopology,
 }
 
 /// The standalone media GuC of one GT0 incarnation, run through the shared
@@ -929,6 +1003,7 @@ pub(crate) struct MediaGuc<
     error: Option<MediaGucError>,
     engines: EngineSet,
     gmd: u32,
+    topology: MediaTopology,
     /// VDBOX/VEBOX domains whose kernel wake request this owner wrote.
     wells: u16,
     deadline: u64,
@@ -1001,6 +1076,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             error: None,
             engines: facts.engines,
             gmd: facts.ip.gmd,
+            topology: facts.topology,
             wells: 0,
             deadline: 0,
             defaults: None,
@@ -1181,6 +1257,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
                     engines: self.engines,
                     gmd: self.gmd,
                     reference_clock,
+                    topology: self.topology,
                 });
                 self.step = Step::Published;
                 self.state = MediaGucState::Running;
@@ -1259,6 +1336,39 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
                 .submit_user_batch_with_output(now, context, batch, output),
             None => self.gt.submit_user_batch(now, context, batch),
         };
+        if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Lost {
+            self.error.get_or_insert(MediaGucError::Gt(
+                result
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or(crate::intel_gpu_guc_gt::GtError::State),
+            ));
+            self.begin_stop(now);
+        }
+        result
+    }
+
+    /// DRM_XE_DEVICE_QUERY_ENGINE_CYCLES for a published GT1 engine
+    /// (xe_query.c::query_engine_cycles -> hwe_read_timestamp). The sample
+    /// reads the engine's own RING_TIMESTAMP(_UDW) through GT1's MMIO: engine
+    /// bases are above MEDIA_GT_GSI_LENGTH, so xe_mmio_adjusted_addr leaves
+    /// them absolute. GuCGt rechecks GT1's GT wake and every held VDBOX/VEBOX
+    /// well (Linux holds XE_FORCEWAKE_ALL on the media GT), and the width is
+    /// 36 bits (GRAPHICS_VER < 20). A lost wake loses this GuC, as on GT0.
+    pub(crate) fn engine_cycles(
+        &mut self,
+        now: u64,
+        engine: Engine,
+        clock: i32,
+    ) -> Result<crate::intel_gpu_timestamp::EngineCycles, crate::intel_gpu_guc_gt::GtError> {
+        let publication = self
+            .publication()
+            .ok_or(crate::intel_gpu_guc_gt::GtError::State)?;
+        if !publication.engines.contains(engine) {
+            return Err(crate::intel_gpu_guc_gt::GtError::State);
+        }
+        let result = self.gt.engine_cycles(engine, clock);
         if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Lost {
             self.error.get_or_insert(MediaGucError::Gt(
                 result

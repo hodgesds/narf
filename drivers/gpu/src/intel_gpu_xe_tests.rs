@@ -1994,6 +1994,7 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
         engines: publication.engines,
         gmd: publication.gmd,
         reference_clock: publication.reference_clock,
+        topology: publication.topology,
     };
     assert_eq!(
         status.engines,

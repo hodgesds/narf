@@ -811,6 +811,36 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             })
         })
     }
+    fn media_engine_cycles(
+        &self,
+        engine: crate::intel_gpu_engine::Engine,
+        clock: i32,
+    ) -> narf_filesystem::FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
+        Box::pin(async move {
+            use narf_filesystem::FsError;
+            let owner = self.owner.upgrade().ok_or(FsError::NoDevice)?;
+            let _awake = Awake::take(&owner).await?;
+            let mut state = owner.lock_running().await;
+            if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+                return Err(FsError::NoDevice);
+            }
+            // GT1 is sampled only while published beside a live GT0 epoch.
+            if self.epoch.load(Ordering::Acquire) == 0 {
+                return Err(FsError::NoDevice);
+            }
+            let guc = state.media_guc.as_mut().ok_or(FsError::NoDevice)?;
+            let result = guc.engine_cycles(narf_time::monotonic_ns(), engine, clock);
+            if guc.publication().is_none() {
+                // A lost media GuC unpublishes GT1 before its verified stop.
+                *owner.user_media.lock() = None;
+            }
+            result.map_err(|error| match error {
+                GtError::Busy => FsError::WouldBlock,
+                GtError::State => FsError::NoDevice,
+                _ => crate::intel_gpu_user::io_error(),
+            })
+        })
+    }
     fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
         // GT1 is only addressable beside a live GT0 user epoch.
         if self.epoch.load(Ordering::Acquire) == 0 {
@@ -2336,6 +2366,7 @@ impl Owner {
                 engines: publication.engines,
                 gmd: publication.gmd,
                 reference_clock: publication.reference_clock,
+                topology: publication.topology,
             });
         }
         match polled {

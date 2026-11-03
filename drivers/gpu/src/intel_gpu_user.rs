@@ -53,6 +53,8 @@ pub struct MediaGtStatus {
     pub gmd: u32,
     /// GT1's command-streamer timestamp clock (xe_gt_clock_init on GT1).
     pub reference_clock: u32,
+    /// GT1's own topology fuses (query_gt_topology for gt_id 1).
+    pub topology: crate::intel_gpu_gt::media::MediaTopology,
 }
 
 /// Observed PF/graphics-GT facts for the native Xe discovery ABI. Published
@@ -172,6 +174,15 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     /// Correlate a live engine counter with one supported CPU clock while the
     /// owner retains PCI D0, render forcewake and its reset mutex.
     fn engine_cycles(
+        &self,
+        _engine: crate::intel_gpu_engine::Engine,
+        _clock: i32,
+    ) -> FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// The same correlation for a published media GT (gt_id 1) engine, under
+    /// the media GuC's GT1 wake and engine wells. Default: no media GT.
+    fn media_engine_cycles(
         &self,
         _engine: crate::intel_gpu_engine::Engine,
         _clock: i32,

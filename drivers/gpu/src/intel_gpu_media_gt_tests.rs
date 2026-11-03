@@ -49,6 +49,9 @@ struct Soc {
     /// The second GMD_ID sample differs from the first.
     flip_gmd_after: Cell<Option<usize>>,
     gmd_reads: Cell<usize>,
+    /// Every later read of GT1's geometry DSS fuse differs from the first.
+    flip_topology: Cell<bool>,
+    topology_reads: Cell<usize>,
 }
 
 fn is_request(reg: u64) -> bool {
@@ -89,6 +92,8 @@ impl Soc {
             reset_drops_wake: Cell::new(false),
             flip_gmd_after: Cell::new(None),
             gmd_reads: Cell::new(0),
+            flip_topology: Cell::new(false),
+            topology_reads: Cell::new(0),
         }
     }
     fn get(&self, reg: u64) -> u32 {
@@ -170,6 +175,15 @@ impl MmioWindow for Soc {
             match self.flip_gmd_after.get() {
                 Some(after) if reads > after => gmd ^ 1,
                 _ => gmd,
+            }
+        } else if reg == 0x38913c {
+            let reads = self.topology_reads.get() + 1;
+            self.topology_reads.set(reads);
+            let geometry = self.get(reg);
+            if self.flip_topology.get() && reads > 1 {
+                geometry ^ 1
+            } else {
+                geometry
             }
         } else {
             self.get(reg)
@@ -1155,4 +1169,80 @@ fn smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable
+);
+
+/// xe_gt.c::gt_init_with_gt_forcewake runs xe_gt_topology_init on the media
+/// GT as well: XELP_GT_GEOMETRY_DSS_ENABLE, XEHP_GT_COMPUTE_DSS_ENABLE and
+/// XELP_EU_ENABLE through GT1's GSI window under GT wake, SIMD8 at graphics
+/// 12.7x. GT1 keeps whatever it reports (including empty masks) and GT0's
+/// own fuses are never read or reused.
+fn smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake() -> TestResult {
+    let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+    // GT0's fuses differ; GT1 must report only its own mirrors.
+    for (reg, value) in [(0x913c, 0xff), (0x9144, 0xf0), (0x9134, 0xff)] {
+        soc.set(reg, value);
+    }
+    soc.set(0x38913c, 0x0000_0003);
+    soc.set(0x389144, 0x0000_0006);
+    soc.set(0x389134, 0b1000_0101);
+    let mut owner = MediaGt::new(MTL, 1274);
+    let (result, _) = drive(&mut owner, &soc, 0, 100_000);
+    let Ok(facts) = result else {
+        return TestResult::Fail("media GT with topology fuses did not initialize");
+    };
+    kt_assert_eq!(
+        facts.topology,
+        MediaTopology {
+            geometry: 3,
+            compute: 6,
+            // load_eu_mask: each enabled fuse bit is a pair of SIMD8 EUs.
+            eu_per_dss: 0xc033,
+        }
+    );
+    // Read under GT wake, after the engine fuse and before any engine well.
+    let gt_wake = soc.first_write(0x38a188, 0x0001_0001);
+    let fuse = soc.first_read(0x389140);
+    let geometry = soc.first_read(0x38913c);
+    let compute = soc.first_read(0x389144);
+    let eu = soc.first_read(0x389134);
+    let wells = soc.first_write(0x38a540, 0x0001_0001);
+    kt_assert!(gt_wake.is_some() && gt_wake < fuse && fuse < geometry);
+    kt_assert!(geometry < compute && compute < eu && eu < wells);
+    kt_assert_eq!(soc.topology_reads.get(), 2, "two identical samples");
+    for gt0 in [0x913c, 0x9144, 0x9134] {
+        kt_assert!(soc.first_read(gt0).is_none(), "GT0 fuse never read");
+    }
+    kt_assert!(soc.gt0_untouched());
+    kt_assert_eq!(soc.held_requests(), 0);
+    // Empty GT1 masks (no DSS on the media GT) are reported as read.
+    let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+    let mut owner = MediaGt::new(MTL, 1274);
+    let (result, _) = drive(&mut owner, &soc, 0, 100_000);
+    kt_assert_eq!(
+        result.map(|facts| facts.topology),
+        Ok(MediaTopology::default())
+    );
+    // Unstable samples and reserved EU bits (lost MMIO) refuse before any
+    // engine well, and release the GT wake.
+    for (flip, eu, error) in [
+        (true, 0x1, MediaError::Unstable),
+        (false, 0x100, MediaError::Unavailable),
+        (false, u32::MAX, MediaError::Unavailable),
+    ] {
+        let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+        soc.set(0x389134, eu);
+        soc.flip_topology.set(flip);
+        let mut owner = MediaGt::new(MTL, 1274);
+        kt_assert_eq!(drive(&mut owner, &soc, 0, 100_000).0, Err(error));
+        kt_assert!(soc.first_write(0x38a540, 0x0001_0001).is_none());
+        kt_assert!(soc.first_write(0x38941c, 8).is_none());
+        kt_assert_eq!(soc.held_requests(), 0);
+        kt_assert_eq!(owner.outstanding_wake(), 0);
+        kt_assert!(soc.gt0_untouched());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake
 );
