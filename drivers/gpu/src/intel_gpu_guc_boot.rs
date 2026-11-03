@@ -30,15 +30,8 @@ const SYSINFO: u64 = 0x123c;
 const WA_KLVS: u64 = 0x3000; // reserved ADS page, separate from register saves/private data
 
 fn invalidate_guc_tlb(mmio: &impl MmioWindow, platform: GtPlatform) {
-    let _ = mmio.read32(0x1901f8);
-    if platform.is_xe2() {
-        mmio.write32(0xcf80, 1 << 6);
-        mmio.write32(0xcf7c, 1);
-        let _ = mmio.read32(0xcf7c);
-    } else {
-        mmio.write32(0xcee8, 1);
-        let _ = mmio.read32(0xcee8);
-    }
+    crate::intel_gpu_ggtt_tlb::barrier(mmio);
+    crate::intel_gpu_ggtt_tlb::invalidate_mmio(mmio, platform.is_xe2());
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -99,6 +92,29 @@ pub trait BootAllocator: GpuAllocator {
         Err(BootError::Cache)
     }
 
+    /// Shared-GGTT GuC TLB protocol (`crate::intel_gpu_ggtt_tlb`). An
+    /// allocator with no GGTT shared with a GuC has no TLB to invalidate.
+    /// These defaults keep it a no-op.
+    ///
+    /// Select CT (`true`) or MMIO GGTT invalidation for `gt`'s GuC, as
+    /// send_tlb_inval_ggtt does on CT-and-submission enabled.
+    fn ggtt_tlb_ct(
+        &mut self,
+        _gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+        _enabled: bool,
+    ) -> Result<(), BootError> {
+        Ok(())
+    }
+    /// `gt`'s GuC reset (or a full GT reset) is proven: nothing it cached
+    /// survives, so ranges held for it are released.
+    fn ggtt_tlb_reset(&mut self, _gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {}
+    /// The arena generation a CT-mode `gt` must still invalidate.
+    fn ggtt_tlb_pending(&mut self, _gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+        None
+    }
+    /// `gt`'s TLB_INVALIDATION_DONE for a request issued at `generation`.
+    fn ggtt_tlb_complete(&mut self, _gt: crate::intel_gpu_ggtt_tlb::GuCTlb, _generation: u64) {}
+
     fn configure_cache(
         &mut self,
         _backing: &mut Self::Backing,
@@ -129,6 +145,23 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
     fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
         self.set_media_guc_submission(enabled)
             .map_err(BootError::Allocation)
+    }
+    fn ggtt_tlb_ct(
+        &mut self,
+        gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+        enabled: bool,
+    ) -> Result<(), BootError> {
+        self.set_guc_tlb_ct(gt, enabled)
+            .map_err(BootError::Allocation)
+    }
+    fn ggtt_tlb_reset(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {
+        self.guc_tlb_reset(gt);
+    }
+    fn ggtt_tlb_pending(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+        self.guc_tlb_pending(gt)
+    }
+    fn ggtt_tlb_complete(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb, generation: u64) {
+        self.guc_tlb_complete(gt, generation);
     }
 
     fn configure_cache(
@@ -255,6 +288,16 @@ impl<A: BootAllocator> Resources<A> {
 pub(crate) enum GuCRole {
     Primary,
     Media(crate::intel_gpu_gt::media::MediaIp),
+}
+
+impl GuCRole {
+    /// This GuC's slot in the shared GGTT's TLB bookkeeping.
+    pub(crate) const fn tlb(self) -> crate::intel_gpu_ggtt_tlb::GuCTlb {
+        match self {
+            Self::Primary => crate::intel_gpu_ggtt_tlb::GuCTlb::Primary,
+            Self::Media(_) => crate::intel_gpu_ggtt_tlb::GuCTlb::Media,
+        }
+    }
 }
 
 pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
@@ -663,6 +706,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.awake()?;
         invalidate_guc_tlb(&self.mmio, self.platform);
         Ok(())
+    }
+
+    /// Switch this GuC's shared-GGTT invalidation to its CT once submission
+    /// is enabled, or back to MMIO when submission stops.
+    pub(crate) fn ggtt_tlb_ct(&mut self, enabled: bool) -> Result<(), BootError> {
+        if self.released {
+            return Err(BootError::State);
+        }
+        let gt = self.role.tlb();
+        self.resources.allocator.ggtt_tlb_ct(gt, enabled)
+    }
+
+    /// This GuC's reset is proven: release ranges held for its TLB.
+    pub(crate) fn ggtt_tlb_reset(&mut self) {
+        if !self.released {
+            let gt = self.role.tlb();
+            self.resources.allocator.ggtt_tlb_reset(gt);
+        }
     }
 
     pub(crate) fn window(&self) -> &M {
@@ -1489,6 +1550,41 @@ mod tests {
         media_tlb_at: Option<usize>,
         // Media GuC GGTT invalidation mode: CT (submission enabled) or MMIO.
         media_ct: Option<bool>,
+        // Opt-in shared-GGTT GuC TLB bookkeeping: the production Tracker over
+        // model backings, keyed by base. `None` keeps earlier fixtures exact.
+        ggtt_tlb: Option<crate::intel_gpu_ggtt_tlb::Tracker<u32>>,
+        // GuCs invalidated by MMIO, in publication order (opt-in only).
+        ggtt_tlb_mmio: Vec<crate::intel_gpu_ggtt_tlb::GuCTlb>,
+        // Every GuC-TLB protocol call the owners made, in order.
+        ggtt_tlb_events: Vec<(crate::intel_gpu_ggtt_tlb::GuCTlb, TlbEvent)>,
+    }
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum TlbEvent {
+        Ct,
+        Mmio,
+        Reset,
+        Complete(u64),
+    }
+    impl Device {
+        /// Publish one model PTE burst to the opt-in tracker.
+        fn tlb_publish(&mut self) -> Option<u64> {
+            let tlb = self.ggtt_tlb.as_mut()?;
+            let mmio = tlb.publish();
+            let generation = tlb.generation();
+            for (gt, invalidate) in crate::intel_gpu_ggtt_tlb::GuCTlb::ALL.into_iter().zip(mmio) {
+                if invalidate {
+                    self.ggtt_tlb_mmio.push(gt);
+                }
+            }
+            Some(generation)
+        }
+        /// Return released model backings to the free state.
+        fn tlb_release(&mut self, released: Vec<u32>) {
+            for base in released {
+                self.memory.remove(&base);
+                self.cpu_ready.remove(&base);
+            }
+        }
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
@@ -1703,6 +1799,7 @@ mod tests {
             let cpu_ready = Rc::new(Cell::new(true));
             device.cpu_ready.insert(base, cpu_ready.clone());
             device.memory.insert(base, words.clone());
+            device.tlb_publish();
             Ok(Backing {
                 base,
                 words,
@@ -1712,6 +1809,13 @@ mod tests {
         }
         fn free(&mut self, backing: Backing) {
             let mut device = self.0.borrow_mut();
+            if let Some(generation) = device.tlb_publish() {
+                // Opt-in: a cleared range stays live until every GuC covers it.
+                let tlb = device.ggtt_tlb.as_mut().expect("opted-in tracker");
+                if tlb.remove(generation, backing.base).is_none() {
+                    return;
+                }
+            }
             device.memory.remove(&backing.base);
             device.cpu_ready.remove(&backing.base);
         }
@@ -1733,22 +1837,83 @@ mod tests {
         } // model has no GGTT PTE window
 
         fn register_media_guc_tlb(&mut self, live: bool) -> Result<(), BootError> {
+            use crate::intel_gpu_ggtt_tlb::{GuCTlb, Mode};
             let mut device = self.0.borrow_mut();
             if live && device.media_tlb_at.is_none() {
                 device.media_tlb_at = Some(device.writes.len());
             }
             device.media_tlb = Some(live);
             device.media_ct = None;
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let mode = if live { Mode::Mmio } else { Mode::Off };
+                let released = tlb.set_mode(GuCTlb::Media, mode);
+                device.tlb_release(released);
+            }
             Ok(())
         }
 
         fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
+            use crate::intel_gpu_ggtt_tlb::{GuCTlb, Mode};
             let mut device = self.0.borrow_mut();
             if device.media_tlb != Some(true) {
                 return Err(BootError::Cache);
             }
             device.media_ct = Some(enabled);
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let mode = if enabled { Mode::Ct } else { Mode::Mmio };
+                let released = tlb.set_mode(GuCTlb::Media, mode);
+                device.tlb_release(released);
+            }
             Ok(())
+        }
+
+        fn ggtt_tlb_ct(
+            &mut self,
+            gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+            enabled: bool,
+        ) -> Result<(), BootError> {
+            use crate::intel_gpu_ggtt_tlb::Mode;
+            let mut device = self.0.borrow_mut();
+            let event = if enabled {
+                TlbEvent::Ct
+            } else {
+                TlbEvent::Mmio
+            };
+            device.ggtt_tlb_events.push((gt, event));
+            let Some(tlb) = device.ggtt_tlb.as_mut() else {
+                return Ok(());
+            };
+            // As SharedArena: only a registered GuC changes transport.
+            if tlb.mode(gt) == Mode::Off {
+                return Err(BootError::Cache);
+            }
+            let released = tlb.set_mode(gt, if enabled { Mode::Ct } else { Mode::Mmio });
+            device.tlb_release(released);
+            Ok(())
+        }
+
+        fn ggtt_tlb_reset(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {
+            let mut device = self.0.borrow_mut();
+            device.ggtt_tlb_events.push((gt, TlbEvent::Reset));
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let released = tlb.reset(gt);
+                device.tlb_release(released);
+            }
+        }
+
+        fn ggtt_tlb_pending(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+            self.0.borrow().ggtt_tlb.as_ref()?.pending(gt)
+        }
+
+        fn ggtt_tlb_complete(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb, generation: u64) {
+            let mut device = self.0.borrow_mut();
+            device
+                .ggtt_tlb_events
+                .push((gt, TlbEvent::Complete(generation)));
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let released = tlb.complete(gt, generation);
+                device.tlb_release(released);
+            }
         }
 
         fn configure_cache(

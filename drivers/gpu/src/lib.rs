@@ -750,6 +750,8 @@ pub(crate) mod intel_gpu_gen12_cursor_resources;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_ggtt_ranges;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_ggtt_tlb;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gt;

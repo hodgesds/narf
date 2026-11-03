@@ -848,14 +848,25 @@ pub struct GgttArena {
     retired: bool,
     live_ranges: alloc::collections::BTreeMap<u32, u32>,
     ggtt_ledger: Option<alloc::sync::Arc<crate::intel_gpu_ggtt_ranges::Ledger>>,
-    /// The MTL/Arrow media GuC (GT1) may cache translations of this shared
-    /// GGTT. Set by its owner before firmware DMA, cleared after verified stop.
-    media_guc: bool,
-    /// Media GuC submission is enabled: like xe_guc_tlb_inval.c::
-    /// send_tlb_inval_ggtt with CT and submission enabled, its GGTT TLB is
-    /// invalidated through the media CT (TLB_INVALIDATION, XE_GUC_TLB_INVAL_GUC)
-    /// before every context registration and after deregistration, not MMIO.
-    media_guc_ct: bool,
+    /// Every GuC that may cache translations of this GGTT, and the cleared
+    /// ranges held until each has invalidated past the clear
+    /// (xe_ggtt.c::xe_ggtt_invalidate, both GTs). GT0's GuC is an MMIO client
+    /// of every authorized arena from construction until its proven reset.
+    /// No PTE is published before its owner holds the GT wake. The MTL/Arrow
+    /// media GuC (GT1) registers before its firmware DMA and leaves after its
+    /// verified stop. In `Mode::Ct` that GuC's scheduler invalidates over its
+    /// CT.
+    tlb: GuCTlbTracker,
+}
+
+type GuCTlbTracker = crate::intel_gpu_ggtt_tlb::Tracker<RetainedRange>;
+
+/// A cleared GGTT range, kept out of the free list with its frames until
+/// every GuC that may cache it has invalidated past the clear.
+struct RetainedRange {
+    ggtt: u32,
+    pages: u32,
+    frames: Vec<narf_memory::frame::PhysFrame>,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -864,6 +875,7 @@ impl core::fmt::Debug for GgttArena {
             .field("free_blocks", &self.free_list.len())
             .field("live_allocations", &self.live)
             .field("live_pages", &self.live_pages)
+            .field("tlb", &self.tlb)
             .finish()
     }
 }
@@ -918,9 +930,18 @@ impl GgttArena {
             live_ranges: alloc::collections::BTreeMap::new(),
             ggtt_ledger: crate::intel_gpu_ggtt_ranges::Ledger::for_bar(bar.phys.raw(), bar.len)
                 .ok(),
-            media_guc: false,
-            media_guc_ct: false,
+            tlb: crate::intel_gpu_ggtt_tlb::Tracker::new(),
         }
+    }
+
+    /// GT0's GuC owns this arena's GGTT: xe_ggtt_invalidate always reaches
+    /// the primary GT, by MMIO until its submission is enabled.
+    fn gt0_guc_client(&mut self) {
+        let released = self.tlb.set_mode(
+            crate::intel_gpu_ggtt_tlb::GuCTlb::Primary,
+            crate::intel_gpu_ggtt_tlb::Mode::Mmio,
+        );
+        debug_assert!(released.is_empty());
     }
 
     pub(crate) fn for_gt(
@@ -931,6 +952,7 @@ impl GgttArena {
         let mut arena = Self::new(bar);
         arena.authority = Some(crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap));
         arena.gt_platform = Some(platform);
+        arena.gt0_guc_client();
         arena
     }
 
@@ -949,6 +971,7 @@ impl GgttArena {
         arena.authority = Some(mmio);
         arena.gt_platform = Some(crate::intel_gpu_gt::GtPlatform::Battlemage);
         arena.bmg_authority = Some(authority);
+        arena.gt0_guc_client();
         Ok(arena)
     }
 
@@ -1042,21 +1065,33 @@ impl GgttArena {
     /// Posting flush for a burst of arena PTE writes: fence,
     /// then read back the slot at `last_ggtt_off` so the writes
     /// are visible before the backing is handed to an engine.
-    fn flush_pte_writes(&self, last_ggtt_off: u32) {
+    /// Then xe_ggtt.c::xe_ggtt_invalidate: the VF_CAP_REG barrier, then
+    /// each GuC's GGTT TLB. MMIO-mode GuCs are invalidated here (GT0 through
+    /// its own registers, GT1 at the media GSI offset), under the GT wakes
+    /// their owners retain. CT-mode GuCs see a new pending generation that
+    /// their scheduler invalidates from its poll.
+    fn flush_pte_writes(&mut self, last_ggtt_off: u32) {
+        use crate::intel_gpu_ggtt_tlb as tlb;
         compiler_fence(Ordering::SeqCst);
         let pte_byte = GGTT_ARRAY_BASE + (last_ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
+        let mmio = self.tlb.publish();
         if let Some(window) = &self.authority {
             let _ = window.read32(pte_byte);
-            let _ = window.read32(0x1901f8);
-            if self.media_guc && !self.media_guc_ct {
-                // xe_ggtt.c::xe_ggtt_invalidate: each GT of a tile has its own
-                // GGTT TLB. Without media GuC submission,
-                // xe_guc_tlb_inval.c::send_tlb_inval_ggtt writes the media
-                // GUC_TLB_INV_CR under the media GT wake its owner retains.
-                let media = crate::intel_gpu_gt::media::gsi(0xcee8);
-                window.write32(media, 1);
-                let _ = window.read32(media);
+            tlb::barrier(window);
+            let xe2 = self
+                .gt_platform
+                .is_some_and(crate::intel_gpu_gt::GtPlatform::is_xe2);
+            for (gt, invalidate) in tlb::GuCTlb::ALL.into_iter().zip(mmio) {
+                match (invalidate, gt) {
+                    (false, _) => {}
+                    (true, tlb::GuCTlb::Primary) => tlb::invalidate_mmio(window, xe2),
+                    (true, tlb::GuCTlb::Media) => tlb::invalidate_mmio(
+                        &crate::intel_gpu_gt::media::MediaWindow::new(window),
+                        xe2,
+                    ),
+                }
             }
+            compiler_fence(Ordering::SeqCst);
             return;
         }
         // SAFETY: same BAR ownership and in-arena argument as
@@ -1170,8 +1205,15 @@ impl GpuAllocator for GgttArena {
         Ok(backing)
     }
 
+    /// xe_ggtt.c::ggtt_node_remove: clear the PTEs, then invalidate every
+    /// GuC TLB before the backing is freed. A CT-mode GuC cannot complete that
+    /// here, so the range and its frames stay out of the free list until its
+    /// scheduler observes the covering TLB_INVALIDATION_DONE, or until that
+    /// GuC's reset is proven. A range that never had live PTEs has nothing to
+    /// invalidate. After whole-arena retirement the reset already covers it.
     fn free(&mut self, backing: FrameBacking) {
-        if backing.mapped && !self.retired {
+        let published = backing.mapped && !self.retired;
+        if published {
             for p in 0..backing.pages {
                 if self
                     .write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0)
@@ -1183,14 +1225,41 @@ impl GpuAllocator for GgttArena {
             }
             self.flush_pte_writes(backing.ggtt + (backing.pages - 1) * GTT_PAGE_SIZE as u32);
         }
-        for f in backing.frames {
+        let range = RetainedRange {
+            ggtt: backing.ggtt,
+            pages: backing.pages,
+            frames: backing.frames,
+        };
+        if !published {
+            self.release(range);
+            return;
+        }
+        let generation = self.tlb.generation();
+        if let Some(range) = self.tlb.remove(generation, range) {
+            self.release(range);
+        }
+    }
+
+    fn live_allocations(&self) -> usize {
+        self.live
+    }
+    fn live_pages(&self) -> u32 {
+        self.live_pages
+    }
+}
+
+impl GgttArena {
+    /// Return a range whose clear every GuC has invalidated: its frames to
+    /// the frame allocator and its GGTT pages to the free list.
+    fn release(&mut self, range: RetainedRange) {
+        for f in range.frames {
             narf_memory::frame::free_frame(f);
         }
         self.live -= 1;
-        self.live_pages -= backing.pages;
-        self.live_ranges.remove(&backing.ggtt);
+        self.live_pages -= range.pages;
+        self.live_ranges.remove(&range.ggtt);
         // Reinsert and coalesce with neighbours.
-        self.free_list.push((backing.ggtt, backing.pages));
+        self.free_list.push((range.ggtt, range.pages));
         self.free_list.sort_by_key(|&(off, _)| off);
         let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.free_list.len());
         for (off, len) in self.free_list.drain(..) {
@@ -1206,11 +1275,11 @@ impl GpuAllocator for GgttArena {
         self.free_list = merged;
     }
 
-    fn live_allocations(&self) -> usize {
-        self.live
-    }
-    fn live_pages(&self) -> u32 {
-        self.live_pages
+    /// Apply one GuC-TLB bookkeeping step and release what it made safe.
+    fn guc_tlb_step(&mut self, step: impl FnOnce(&mut GuCTlbTracker) -> Vec<RetainedRange>) {
+        for range in step(&mut self.tlb) {
+            self.release(range);
+        }
     }
 }
 
@@ -1246,9 +1315,11 @@ impl SharedArena {
 
     /// Register (`true`) the MTL/Arrow media GuC as a second GGTT TLB of this
     /// arena before its firmware can translate, or unregister it after its
-    /// verified stop. Only an authorized MTL-classified arena qualifies; GT0
-    /// flushes are unchanged while no media GuC is registered.
+    /// verified stop. Unregistering releases ranges held only for GT1.
+    /// Only an authorized MTL-classified arena qualifies. GT0's own GuC TLB
+    /// is invalidated on every update either way.
     pub(crate) fn set_media_guc_tlb(&self, live: bool) -> Result<(), SubmitError> {
+        use crate::intel_gpu_ggtt_tlb::{GuCTlb, Mode};
         let mut arena = self.inner.lock();
         if arena.retired
             || arena.authority.is_none()
@@ -1258,34 +1329,87 @@ impl SharedArena {
         {
             return Err(SubmitError::NoEngine);
         }
-        arena.media_guc = live;
-        arena.media_guc_ct = false;
+        let mode = if live { Mode::Mmio } else { Mode::Off };
+        arena.guc_tlb_step(|tlb| tlb.set_mode(GuCTlb::Media, mode));
         Ok(())
     }
 
-    /// Switch the registered media GuC's GGTT invalidation between the MMIO
-    /// GUC_TLB_INV_CR (`false`) and its CT TLB_INVALIDATION action (`true`),
-    /// as xe_guc_tlb_inval.c::send_tlb_inval_ggtt selects on
-    /// `xe_guc_ct_enabled && submission_state.enabled`. The media scheduler
-    /// invalidates through its CT before registering and after deregistering
-    /// every context, so CT mode needs no arena-side MMIO write.
+    /// Switch the registered media GuC between MMIO (`false`) and CT (`true`)
+    /// GGTT invalidation. Equivalent to `set_guc_tlb_ct(GuCTlb::Media, ..)`.
     pub(crate) fn set_media_guc_submission(&self, enabled: bool) -> Result<(), SubmitError> {
+        self.set_guc_tlb_ct(crate::intel_gpu_ggtt_tlb::GuCTlb::Media, enabled)
+    }
+
+    /// Select a registered GuC's GGTT invalidation: MMIO GUC_TLB_INV_CR /
+    /// PVC_GUC_TLB_INV_DESC (`false`) or its CT TLB_INVALIDATION (`true`).
+    /// This follows send_tlb_inval_ggtt's
+    /// `xe_guc_ct_enabled && submission_state.enabled` test. Leaving CT keeps
+    /// any range still owed a CT invalidation until that GuC's reset is proven.
+    pub(crate) fn set_guc_tlb_ct(
+        &self,
+        gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+        enabled: bool,
+    ) -> Result<(), SubmitError> {
+        use crate::intel_gpu_ggtt_tlb::Mode;
         let mut arena = self.inner.lock();
-        if arena.retired || arena.authority.is_none() || !arena.media_guc {
+        if arena.retired || arena.authority.is_none() || arena.tlb.mode(gt) == Mode::Off {
             return Err(SubmitError::NoEngine);
         }
-        arena.media_guc_ct = enabled;
+        let mode = if enabled { Mode::Ct } else { Mode::Mmio };
+        arena.guc_tlb_step(|tlb| tlb.set_mode(gt, mode));
         Ok(())
+    }
+
+    /// The generation a CT-mode GuC must still invalidate, if any. The
+    /// scheduler sends the TLB_INVALIDATION after this returns, with no
+    /// arena lock held.
+    pub(crate) fn guc_tlb_pending(&self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+        self.inner.lock().tlb.pending(gt)
+    }
+
+    /// TLB_INVALIDATION_DONE for a request issued at `generation`: release
+    /// every retained range all GuCs have now invalidated.
+    pub(crate) fn guc_tlb_complete(&self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb, generation: u64) {
+        self.inner
+            .lock()
+            .guc_tlb_step(|tlb| tlb.complete(gt, generation));
+    }
+
+    /// The GuC's reset (or a full GT reset) was proven.
+    /// xe_tlb_inval_reset releases what was waiting on it.
+    pub(crate) fn guc_tlb_reset(&self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {
+        self.inner.lock().guc_tlb_step(|tlb| tlb.reset(gt));
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn guc_tlb_mode(
+        &self,
+        gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+    ) -> crate::intel_gpu_ggtt_tlb::Mode {
+        self.inner.lock().tlb.mode(gt)
+    }
+
+    /// Cleared ranges (GGTT offset, pages) still awaiting an invalidation.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn guc_tlb_retained(&self) -> Vec<(u32, u32)> {
+        self.inner
+            .lock()
+            .tlb
+            .retained_items()
+            .map(|range| (range.ggtt, range.pages))
+            .collect()
     }
 
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn media_guc_tlb(&self) -> bool {
-        self.inner.lock().media_guc
+        self.guc_tlb_mode(crate::intel_gpu_ggtt_tlb::GuCTlb::Media)
+            != crate::intel_gpu_ggtt_tlb::Mode::Off
     }
 
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn media_guc_ct(&self) -> bool {
-        self.inner.lock().media_guc_ct
+        self.guc_tlb_mode(crate::intel_gpu_ggtt_tlb::GuCTlb::Media)
+            == crate::intel_gpu_ggtt_tlb::Mode::Ct
     }
 
     pub(crate) fn retire_ggtt(&self) -> Result<(), SubmitError> {
@@ -1297,7 +1421,12 @@ impl SharedArena {
         {
             return Ok(());
         }
-        for (&offset, &pages) in &arena.live_ranges {
+        let ranges: Vec<(u32, u32)> = arena
+            .live_ranges
+            .iter()
+            .map(|(&offset, &pages)| (offset, pages))
+            .collect();
+        for (offset, pages) in ranges {
             for page in 0..pages {
                 arena.write_pte(offset + page * 4096, 0)?;
             }

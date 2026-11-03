@@ -869,9 +869,9 @@ kernel_test_in!(
 );
 
 /// The real shared GGTT arena over a RAM-backed 16 MiB BAR0 with current
-/// capability authority: GT0 flushes are unchanged until the media GuC
-/// registers, then every PTE publication and clear also invalidates the
-/// media GuC's GGTT TLB (xe_ggtt.c::xe_ggtt_invalidate, both GTs).
+/// capability authority: every PTE publication and clear invalidates GT0's
+/// GuC TLB, and while the media GuC is registered also the media GuC's
+/// (xe_ggtt.c::xe_ggtt_invalidate, both GTs).
 fn smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered() -> TestResult {
     use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, GpuBacking, SharedArena};
     use narf_capabilities::{Cap, Write};
@@ -910,40 +910,46 @@ fn smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered() 
     let pte = |backing: &crate::intel_gpu_rcs::FrameBacking| {
         crate::intel_gpu_gtt::GGTT_ARRAY_BASE + u64::from(backing.ggtt_offset()) / 4096 * 8
     };
-    // No media GuC: GT0's publication path writes PTEs but never the media
-    // TLB, and the arena never writes either GuC's invalidation register.
+    // No media GuC: GT0's publication path writes PTEs and invalidates GT0's
+    // own GuC TLB (GUC_TLB_INV_CR), never the media TLB. Until the GGTT TLB
+    // invalidation fix this pinned no GT0 write; Linux invalidates GT0 on
+    // every GGTT update, so NARF now does too.
     let Ok(mut first) = alloc.alloc(1) else {
         return TestResult::Fail("fixture arena refused its first page");
     };
     kt_assert!(arena.configure_cache(&mut first, policy).is_ok());
     kt_assert_ne!(load(pte(&first)), 0);
     kt_assert_eq!(load(MEDIA_INV), SENTINEL);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
+    store(GT0_INV, SENTINEL);
     kt_assert!(!arena.media_guc_tlb());
-    // Registered media GuC: publication and clear both invalidate GT1 only.
+    // Registered media GuC: publication and clear invalidate both GTs.
     kt_assert!(arena.set_media_guc_tlb(true).is_ok());
     let Ok(second) = alloc.alloc(2) else {
         return TestResult::Fail("fixture arena refused a mapped allocation");
     };
     kt_assert_ne!(load(pte(&second)), 0);
     kt_assert_eq!(load(MEDIA_INV), 1);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
     store(MEDIA_INV, SENTINEL);
+    store(GT0_INV, SENTINEL);
     let cleared = pte(&second);
     alloc.free(second);
     kt_assert_eq!(load(cleared), 0);
     kt_assert_eq!(load(MEDIA_INV), 1);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
     // Unregistered after the media GuC's proven stop: identical GT0 path.
     kt_assert!(arena.set_media_guc_tlb(false).is_ok());
     store(MEDIA_INV, SENTINEL);
+    store(GT0_INV, SENTINEL);
     let Ok(third) = alloc.alloc(1) else {
         return TestResult::Fail("fixture arena refused a later allocation");
     };
     alloc.free(third);
     alloc.free(first);
     kt_assert_eq!(load(MEDIA_INV), SENTINEL);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
+    kt_assert!(arena.guc_tlb_retained().is_empty());
     kt_assert_eq!(arena.live_allocations(), 0);
     // Only an authorized MTL-classified arena can host a media GuC TLB.
     let other = SharedArena::new(GgttArena::for_gt(bar, cap, GtPlatform::Battlemage));
@@ -962,7 +968,8 @@ kernel_test_in!(
 /// `narf.intel.media_gt=1` is default-off with the shared pre-`--` grammar.
 /// Absent the option the runtime constructs no media owner, so every GT0
 /// teardown hook retires nothing without MMIO and the shared GGTT arena
-/// flushes exactly as before: no second TLB, no GuC invalidation write.
+/// registers no second TLB. GT0's own GuC TLB is invalidated on every
+/// update, as xe_ggtt_invalidate does with or without a media GT.
 fn smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged() -> TestResult {
     use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, GpuBacking, SharedArena};
     use narf_boot::args::KernelCmdline;
@@ -1031,7 +1038,8 @@ fn smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged() -> Te
     > = None;
     kt_assert_eq!(retire(&mut media, &mut guc, &soc, 0, || true), Retire::Done);
     kt_assert!(soc.log.borrow().is_empty());
-    // A never-registered arena: GT0 publication/clear write PTEs only.
+    // A never-registered arena: GT0 publication/clear write PTEs and GT0's
+    // GUC_TLB_INV_CR (formerly pinned unwritten), never the media register.
     const SENTINEL: u32 = 0x5a5a_5a5a;
     let mut words = alloc::vec![0u32; 4 * 1024 * 1024];
     let bar = narf_bus::bar::MmioRegion {
@@ -1076,7 +1084,7 @@ fn smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged() -> Te
     alloc.free(first);
     kt_assert_eq!(load(pte), 0);
     kt_assert_eq!(load(0x38cee8), SENTINEL);
-    kt_assert_eq!(load(0xcee8), SENTINEL);
+    kt_assert_eq!(load(0xcee8), 1);
     kt_assert_eq!(arena.live_allocations(), 0);
     kt_assert!(!arena.media_guc_tlb());
     drop((arena, alloc));
@@ -1089,9 +1097,11 @@ kernel_test_in!(
 );
 
 /// Once media GuC submission is enabled, xe_guc_tlb_inval.c sends GGTT TLB
-/// invalidation through the media CT (the scheduler's per-context
-/// TLB_INVALIDATION), so arena PTE writes stop writing GUC_TLB_INV_CR on
-/// GT1; disabling submission or unregistering returns to the MMIO path.
+/// invalidation through the media CT (the media scheduler's TLB_INVALIDATION),
+/// so arena PTE writes stop writing GUC_TLB_INV_CR on GT1 and a removal is
+/// held until GT1 invalidates. Disabling submission returns to the MMIO path
+/// and unregistering after the proven stop releases the held removal. GT0's
+/// own register is written throughout (formerly pinned unwritten).
 fn smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable() -> TestResult {
     use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, SharedArena};
     use narf_capabilities::{Cap, Write};
@@ -1142,25 +1152,31 @@ fn smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable() -> TestResult {
     let Ok(first) = alloc.alloc(1) else {
         return TestResult::Fail("fixture arena refused its first page");
     };
+    store(GT0_INV, SENTINEL);
     alloc.free(first);
     kt_assert_eq!(load(MEDIA_INV), SENTINEL);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
+    kt_assert_eq!(arena.guc_tlb_retained().len(), 1);
     // Submission disabled again (stop begins): MMIO invalidation resumes.
     kt_assert!(arena.set_media_guc_submission(false).is_ok());
+    store(GT0_INV, SENTINEL);
     let Ok(second) = alloc.alloc(1) else {
         return TestResult::Fail("fixture arena refused a later page");
     };
     kt_assert_eq!(load(MEDIA_INV), 1);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
     store(MEDIA_INV, SENTINEL);
-    // Unregistering also clears CT mode; GT0 flushes are unchanged.
+    // Unregistering also clears CT mode and releases the held removal.
     kt_assert!(arena.set_media_guc_submission(true).is_ok());
+    kt_assert_eq!(arena.guc_tlb_retained().len(), 1);
     kt_assert!(arena.set_media_guc_tlb(false).is_ok());
     kt_assert!(!arena.media_guc_ct());
+    kt_assert!(arena.guc_tlb_retained().is_empty());
+    store(GT0_INV, SENTINEL);
     alloc.free(second);
     alloc.free(seed);
     kt_assert_eq!(load(MEDIA_INV), SENTINEL);
-    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), 1);
     kt_assert_eq!(arena.live_allocations(), 0);
     drop((arena, alloc));
     drop(words);

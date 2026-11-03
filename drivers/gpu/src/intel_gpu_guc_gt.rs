@@ -1176,6 +1176,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if let Some(scheduler) = self.parts.scheduler.as_mut() {
             scheduler.huc.invalidate();
         }
+        // Submission stops being serviced: GGTT invalidation returns to MMIO,
+        // as send_tlb_inval_ggtt does once submission is disabled. Ranges
+        // still owed a CT invalidation stay retained until the reset proof.
+        // Best effort: a refusal leaves CT mode, which only retains more.
+        let _ = self.parts.boot.ggtt_tlb_ct(false);
         // Close admission before any fallible reset/recovery operation.
         self.log_stream.take();
         if let Some(collector) = self.parts.eu_stall.as_mut() {
@@ -1717,6 +1722,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn after_boot_stop(&mut self, now: u64) -> Result<(), GtError> {
+        // GuCBoot proved MIA in reset and firmware DMA idle (or never booted):
+        // this GuC's GGTT TLB holds nothing live, and its next boot
+        // invalidates before use. Release ranges held for it
+        // (xe_tlb_inval_reset), before the stop frees scheduler and CT memory.
+        self.parts.boot.ggtt_tlb_reset();
         if self.parts.boot.platform().is_gen12() {
             if self
                 .gen12_reset
@@ -2099,6 +2109,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     Poll::Ready(Ok(TransportState::Enabled)) => {
                         if self.parts.scheduler.is_some() {
                             self.verify_register_policy()?;
+                            // CT enabled with submission enabled: from now on
+                            // send_tlb_inval_ggtt reaches this GuC over its
+                            // CT, and the scheduler sends those requests.
+                            self.parts.boot.ggtt_tlb_ct(true).map_err(GtError::Boot)?;
                         }
                         self.state = if self.parts.scheduler.is_some() {
                             GtState::SchedulingReady
@@ -2229,6 +2243,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// Any exposed TGL HuC image additionally requires full media-engine
     /// reset/idle and retained media-wake release, never GuC-only Stopped.
     pub unsafe fn release_after_gt_reset(mut self) {
+        // The caller's full-reset proof also covers this GuC's GGTT TLB.
+        self.parts.boot.ggtt_tlb_reset();
         self.released = true;
         // SAFETY: consumed once under the caller's full-reset proof.
         let Parts {

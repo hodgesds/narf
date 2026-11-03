@@ -3538,3 +3538,8 @@ mod reset_policy {
 mod lnl_eu_stall {
     include!("intel_gpu_eu_stall_hw_tests.rs");
 }
+
+mod ggtt_tlb_hw {
+    use super::*;
+    include!("intel_gpu_ggtt_tlb_hw_tests.rs");
+}

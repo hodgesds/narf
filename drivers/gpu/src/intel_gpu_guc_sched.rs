@@ -304,6 +304,9 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     reset_policy: Option<crate::intel_gpu_reset_policy::ResetPolicy>,
     /// The MTL/Arrow standalone media GT (GT1): VCS/VECS only, no RCS0.
     media_gt: bool,
+    /// Shared-GGTT TLB invalidation of this GuC over this CT
+    /// (xe_guc_tlb_inval.c::send_tlb_inval_ggtt with submission enabled).
+    ggtt: crate::intel_gpu_ggtt_tlb::Inval,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -419,6 +422,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             pending_error: None,
             reset_policy: None,
             media_gt,
+            ggtt: crate::intel_gpu_ggtt_tlb::Inval::new(),
         })
     }
 
@@ -938,7 +942,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let placements = user
             .as_ref()
             .map_or(EngineSet::of(&[engine]), |claim| claim.placements());
-        let live = |stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp);
+        // Context stamps share the GuC's TLB-invalidation seqno space with the
+        // in-flight shared-GGTT request.
+        let live = |stamp| {
+            self.resources.contexts.iter().any(|c| c.stamp == stamp)
+                || self.ggtt.inflight_seqno() == Some(stamp)
+        };
         let (id, stamp) = if width == 1 {
             self.identities.candidate(live)?
         } else {
@@ -1249,8 +1258,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
             let Some(message) = ct.receive().map_err(SchedulingError::Transport)? else {
                 break;
             };
+            if let Some(generation) = self.ggtt.done(&message) {
+                let gt = self.tlb_gt();
+                self.resources.allocator.ggtt_tlb_complete(gt, generation);
+                continue;
+            }
             self.event(message, now)?;
         }
+        // Ahead of every other H2G of this poll, so an update published
+        // before it is invalidated before GuC sees later requests.
+        self.service_ggtt_tlb(ct, now)?;
         self.progress_slpc(ct, now)?;
         self.huc
             .progress(ct, now)
@@ -1641,6 +1658,53 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
         }
         Ok(())
+    }
+
+    fn tlb_gt(&self) -> crate::intel_gpu_ggtt_tlb::GuCTlb {
+        if self.media_gt {
+            crate::intel_gpu_ggtt_tlb::GuCTlb::Media
+        } else {
+            crate::intel_gpu_ggtt_tlb::GuCTlb::Primary
+        }
+    }
+
+    /// xe_ggtt.c::xe_ggtt_invalidate for this GuC once its submission is
+    /// enabled: send XE_GUC_ACTION_TLB_INVALIDATION {seqno,
+    /// MAKE_INVAL_OP(XE_GUC_TLB_INVAL_GUC)} for the newest published GGTT
+    /// generation, one request at a time. The arena lock is not held here.
+    /// Its DONE releases the ranges retained for it. A request older than
+    /// tlb_inval_timeout_delay fails closed: those ranges stay retained and
+    /// the GT is lost, so recovery proves a GuC reset before they are freed.
+    fn service_ggtt_tlb<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        use crate::intel_gpu_ggtt_tlb as tlb;
+        if self.ggtt.inflight_seqno().is_some() {
+            return if self.ggtt.expired(now) {
+                Err(SchedulingError::Timeout)
+            } else {
+                Ok(())
+            };
+        }
+        let gt = self.tlb_gt();
+        let Some(generation) = self.resources.allocator.ggtt_tlb_pending(gt) else {
+            return Ok(());
+        };
+        let contexts = &self.resources.contexts;
+        let seqno = self
+            .ggtt
+            .candidate(|stamp| contexts.iter().any(|c| c.stamp == stamp));
+        match ct.send(0, tlb::ACTION, 0, &[seqno, tlb::OP_GUC], true) {
+            Ok(()) => self
+                .ggtt
+                .issued(seqno, generation, now)
+                .map_err(|()| SchedulingError::Timeout),
+            // CT full: the generation stays pending for the next poll.
+            Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => Ok(()),
+            Err(error) => Err(SchedulingError::Transport(error)),
+        }
     }
 
     fn event(&mut self, message: GuCMessage, now: u64) -> Result<(), SchedulingError> {
