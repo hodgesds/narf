@@ -390,7 +390,7 @@ pub(super) fn parse_info_v1(bytes: &[u8]) -> Result<WakeStatus, &'static str> {
     }
     let mut status = WakeStatus::default();
     // iwl_mvm_convert_key_counters_v5 uses gtk[0].sc for every counter.
-    let sc = &bytes[48..48 + 200];
+    let sc = &bytes[44..44 + 200]; // key32 len flags res2 mic8
     for (tid, pn) in status.ptk_rx.iter_mut().enumerate() {
         *pn = get64(sc, tid * 8);
     }

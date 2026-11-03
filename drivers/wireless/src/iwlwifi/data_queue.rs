@@ -193,6 +193,20 @@ impl DataQueue {
         }
         self.validate_reclaim(self.native_pointer(after))
     }
+    /// `iwl_txq_set_q_ptrs`: after WoWLAN the firmware scheduler advanced
+    /// this queue by the frames it transmitted from D3; the drained host
+    /// ring follows it so later TFDs and BA reclaims use the firmware's
+    /// index. The host token keeps its own allocation-time origin, so the
+    /// move is relative (Linux's absolute `seq >> 4` assumes origin zero).
+    pub(super) fn advance_pointers(&mut self, frames: u16) -> Result<(), &'static str> {
+        if self.removing || !self.is_idle() {
+            return Err("TX queue pointers moved with outstanding descriptors");
+        }
+        self.write = self.write.wrapping_add(frames);
+        self.read = self.write;
+        Ok(())
+    }
+
     pub fn is_idle(&self) -> bool {
         self.read == self.write
     }

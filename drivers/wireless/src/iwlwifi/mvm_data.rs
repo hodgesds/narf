@@ -17,7 +17,7 @@ use core::{
 };
 use narf_wireless::reg::RegulatoryDomain;
 
-const STATION: u8 = 0;
+pub(super) const STATION: u8 = 0;
 const TID: u8 = 0; // fw/api/tx.h::IWL_TID_NON_QOS
 
 /// Completed native prerequisite metadata, not a permanent transmit grant.

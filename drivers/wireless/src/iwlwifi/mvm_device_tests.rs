@@ -68,8 +68,17 @@ fn image() -> Vec<u8> {
         2, 12, 1, 4, 0x98, 1, 1, 0, 0x9b, 1, 6, 0, 1, 2, 2, 0, 0x77, 1, 6, 0, 0x1c, 1, 9, 6, 0xc1,
         0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2, 5, 1, 0, 0xff, 5, 0, 1,
     ]);
+    // Installed API77 WoWLAN/D3 inventory (`mvm_d3::D3Api::admit`).
+    versions.extend_from_slice(&[
+        0xe1, 1, 6, 0, 0xe0, 1, 3, 0, 0xe2, 1, 5, 0, 0xe4, 1, 4, 0, 0xd4, 1, 4, 0, 0xd3, 1, 4, 0,
+        0xfd, 0xb, 99, 1, 0xfc, 0xb, 99, 1, 0xfe, 0xb, 99, 1,
+    ]);
+    let flags = parsed.api.flags | 1 << 16; // NEW_NSOFFL_LARGE
     tlv(&mut bytes, 48, &versions);
-    tlv(&mut bytes, 29, &[0, 0, 0, 0, 0, 0, 0x10, 0x20]);
+    // Capability 17: consolidated D3/D0 image; API 53: TCP-SYN wake.
+    tlv(&mut bytes, 29, &[0, 0, 0, 0, 0, 0, 0x12, 0x20]);
+    tlv(&mut bytes, 30, &[1, 0, 0, 0, 0, 0, 0x20, 0]);
+    tlv(&mut bytes, 18, &flags.to_le_bytes());
     bytes
 }
 fn asset(name: &'static str, bytes: &[u8], signed: bool) -> Result<Asset, &'static str> {
@@ -850,6 +859,12 @@ impl Actor {
                     }
                     vec![]
                 }
+                // WoWLAN/D3 (`mvm_d3`): exact API77 extents only.
+                (1, 0xe2) if b.len() == 200 => vec![],
+                (1, 0xe1) if b.len() == 28 => vec![],
+                (1, 0xe0) if b.len() >= 4 && b.len() == 4 + usize::from(b[0]) * 152 => vec![],
+                (1, 0xd4) if b.len() == 428 => vec![],
+                (1, 0xd3) if b.len() == 12 => vec![],
                 _ => return Err("unexpected MVM interface control publication"),
             };
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
@@ -2425,3 +2440,5 @@ mod reconnect_tests;
 mod recovery_tests;
 #[path = "mvm_vht_tests.rs"]
 mod vht_tests;
+#[path = "mvm_wowlan_tests.rs"]
+mod wowlan_tests;

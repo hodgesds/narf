@@ -42,6 +42,11 @@ pub const RX_BUFFER_BYTES: usize = 4096;
 
 /// Order coherent DMA against the peripheral, including on aarch64
 /// where an inner-shareable CPU atomic barrier alone is insufficient.
+/// `CSR_HW_IF_CONFIG_REG_PERSISTENCE` (`iwl-csr.h`, 0x40000000).
+const D3_PERSISTENCE: u32 = 0x4000_0000;
+/// `CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ` (`iwl-csr.h`).
+const GP_CNTRL_MAC_ACCESS_REQ: u32 = 1 << 3;
+
 pub fn dma_barrier() {
     compiler_fence(Ordering::SeqCst);
     #[cfg(target_arch = "aarch64")]
@@ -652,6 +657,8 @@ pub struct Hardware {
     shared_memory: smem::State,
     armed: bool,
     failed: bool,
+    /// Firmware owns the device in WoWLAN D3 (`IWL_MVM_STATUS_IN_D3`).
+    in_d3: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
     /// Protected MPDUs published to data/management queues. Each consumes
     /// at most one fresh firmware TX PN (retries reuse it), so differences
@@ -782,6 +789,7 @@ impl Hardware {
             shared_memory: smem::State::new(parsed),
             armed: false,
             failed: false,
+            in_d3: false,
             station_stop: None,
             protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
@@ -1629,6 +1637,122 @@ impl Hardware {
         result
     }
 
+    /// WoWLAN transport half of `pcie/gen1_2/trans.c::iwl_trans_pcie_d3_suspend`
+    /// for a unified image (`reset == false`) on the 22000 family: set
+    /// `CSR_HW_IF_CONFIG_REG_PERSISTENCE`, then `iwl_pcie_d3_complete_suspend`
+    /// masks interrupts and clears `MAC_ACCESS_REQ` and `INIT_DONE`. 22000 has
+    /// no D3 doorbell handshake (`iwl_pcie_d3_handshake` starts at AX210) and
+    /// `iwl_pcie_set_pwr` is a no-op without APMG. Firmware stays alive and
+    /// every DMA allocation stays published for it; nothing is released.
+    pub(in crate::iwlwifi) fn d3_suspend(&mut self) -> Result<(), &'static str> {
+        if self.failed || self.in_d3 || !self.d3_transport_supported() {
+            return Err("MVM D3 suspend without a live 22000 transport");
+        }
+        // The RAM fixture never arms a physical transport.
+        #[cfg(any(test, feature = "kernel-test"))]
+        if model::is_model(self) {
+            self.in_d3 = true;
+            return Ok(());
+        }
+        if !self.armed {
+            return Err("MVM D3 suspend without a live transport");
+        }
+        let value = self.mmio.read(super::regs::CSR_HW_IF_CONFIG_REG);
+        self.mmio
+            .write(super::regs::CSR_HW_IF_CONFIG_REG, value | D3_PERSISTENCE);
+        if let Some(interrupts) = &mut self.interrupts {
+            interrupts.mask();
+        }
+        self.mmio.write(super::regs::CSR_INT_MASK, 0);
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio.write(
+            super::regs::CSR_GP_CNTRL,
+            value & !(GP_CNTRL_MAC_ACCESS_REQ | super::regs::csr_gp_cntrl::MAC_INIT),
+        );
+        self.in_d3 = true;
+        Ok(())
+    }
+
+    /// `iwl_trans_pcie_d3_resume(trans, reset = false)` for 22000: request MAC
+    /// access, `iwl_trans_activate_nic` (INIT_DONE then MAC_CLOCK_READY),
+    /// reprogram MSI-X and re-enable interrupts, release MAC access, and
+    /// treat `CSR_RESET_REG_FLAG_NEVO_RESET` ("device was reset during
+    /// suspend") as failure so the caller performs the full restart.
+    pub(in crate::iwlwifi) async fn d3_resume(&mut self) -> Result<(), &'static str> {
+        if !self.in_d3 {
+            return Err("MVM D3 resume without D3 suspend");
+        }
+        self.in_d3 = false;
+        #[cfg(any(test, feature = "kernel-test"))]
+        if model::is_model(self) {
+            return if self.failed {
+                Err("MVM device was reset during suspend")
+            } else {
+                Ok(())
+            };
+        }
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio
+            .write(super::regs::CSR_GP_CNTRL, value | GP_CNTRL_MAC_ACCESS_REQ);
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio.write(
+            super::regs::CSR_GP_CNTRL,
+            value | super::regs::csr_gp_cntrl::MAC_INIT,
+        );
+        let ready = super::regs::csr_gp_cntrl::MAC_CLOCK_READY;
+        if let Err(error) = self
+            .poll_register(super::regs::CSR_GP_CNTRL, ready, ready, 25)
+            .await
+        {
+            self.fail();
+            return Err(error);
+        }
+        let queues = self.receive_queue_count();
+        if let Some(interrupts) = &mut self.interrupts {
+            let enabled = interrupts.enable(false).and_then(|()| {
+                if queues > 1 {
+                    interrupts.receive_queues(queues)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = enabled {
+                self.fail();
+                return Err(error);
+            }
+        }
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio
+            .write(super::regs::CSR_GP_CNTRL, value & !GP_CNTRL_MAC_ACCESS_REQ);
+        if self.mmio.read(super::regs::CSR_RESET) & super::regs::csr_reset::NEVO_RESET != 0 {
+            self.fail();
+            return Err("MVM device was reset during suspend");
+        }
+        Ok(())
+    }
+
+    /// `iwl_trans_set_q_ptrs` on the WoWLAN offload TID queue.
+    pub(in crate::iwlwifi) fn advance_queue_pointers(
+        &mut self,
+        id: u16,
+        frames: u16,
+    ) -> Result<(), &'static str> {
+        self.resources
+            .data
+            .iter_mut()
+            .find(|queue| queue.id() == Some(id))
+            .ok_or("WoWLAN offload queue absent")?
+            .advance_pointers(frames)
+    }
+
+    pub(in crate::iwlwifi) fn d3_transport_supported(&self) -> bool {
+        self.format == rx_rfh::CompletionFormat::Qu
+    }
+
+    pub(in crate::iwlwifi) fn is_in_d3(&self) -> bool {
+        self.in_d3
+    }
+
     fn finish_stop(
         &mut self,
         stopped: Result<(), &'static str>,
@@ -1702,6 +1826,7 @@ impl Hardware {
         self.scan_mcc_watch = false;
         self.armed = false;
         self.failed = false;
+        self.in_d3 = false;
         self.notifications.clear();
         self.responses.clear();
         self.tx_completed.clear();
@@ -2013,6 +2138,9 @@ impl Hardware {
     ) -> Result<Packet, &'static str> {
         if self.failed {
             return Err("Wi-Fi transport failed");
+        }
+        if self.in_d3 {
+            return Err("Wi-Fi transport is in WoWLAN D3");
         }
         // iwl-trans.c::iwl_trans_send_cmd maps narrow HostCommands to
         // LONG_GROUP on a wide-header transport, except REPLY_ERROR.

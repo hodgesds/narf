@@ -254,10 +254,10 @@ fn info(reasons: u32, rekeys: u32) -> Vec<u8> {
     bytes[32] = 16;
     bytes[33] = 0x81;
     for tid in 0..8 {
-        put64(&mut bytes, 48 + tid * 8, 100 + tid as u64);
-        put64(&mut bytes, 48 + 64 + 64 + tid * 8, 200 + tid as u64);
+        put64(&mut bytes, 44 + tid * 8, 100 + tid as u64);
+        put64(&mut bytes, 44 + 64 + 64 + tid * 8, 200 + tid as u64);
     }
-    bytes[48 + 196..48 + 200].copy_from_slice(&[0xff, 1, 0xff, 0xff]);
+    bytes[44 + 196..44 + 200].copy_from_slice(&[0xff, 1, 0xff, 0xff]);
     put64(&mut bytes, 568, 0x0102030405060708);
     put16(&mut bytes, 576, 3);
     put16(&mut bytes, 580, 0x120);
@@ -324,9 +324,7 @@ fn smoke_mvm_d3_info_v1_wake_packet_and_d3_end() -> TestResult {
         {
             return Err("pattern wake report differs");
         }
-        if parse_d3_end(&[1, 0, 0, 0])? != true
-            || parse_d3_end(&[0; 4])?
-            || parse_d3_end(&[0; 3]).is_ok()
+        if !parse_d3_end(&[1, 0, 0, 0])? || parse_d3_end(&[0; 4])? || parse_d3_end(&[0; 3]).is_ok()
         {
             return Err("D3_END reset flag differs");
         }

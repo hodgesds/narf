@@ -293,9 +293,12 @@ pub(super) fn passive_channel(domain: &narf_wireless::reg::RegulatoryDomain, cha
 }
 #[path = "mvm_station.rs"]
 mod station;
+#[path = "mvm_wowlan.rs"]
+mod wowlan;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) use rsna::tests::Device as SecurityModel;
 pub(in crate::iwlwifi) use station::Credential;
+pub(super) use wowlan::Resumed as WowlanResumed;
 
 #[path = "mvm_rx_multi.rs"]
 mod rx_multi;

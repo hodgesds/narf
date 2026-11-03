@@ -142,6 +142,10 @@ enum Operation {
     Recover,
     /// System-suspend transport stop (`Owner::suspend_transport`).
     Suspend,
+    /// Associated WoWLAN entry into D3 (`__iwl_mvm_suspend`).
+    WowlanSuspend(super::mvm_d3::Wake),
+    /// D3 exit and wake-reason query (`__iwl_mvm_resume`).
+    WowlanResume,
     QuerySharedMemory,
 }
 struct Join {
@@ -157,6 +161,7 @@ enum Outcome {
     Joined([u8; 6]),
     Done,
     SharedMemory(super::mvm_boot::SharedMemory),
+    Wowlan(super::mvm_boot::WowlanResumed),
 }
 struct Completion {
     result: Option<Result<Outcome, &'static str>>,
@@ -194,6 +199,15 @@ pub(super) struct Device {
     terminal: AtomicBool,
     /// Set by a completed system-suspend stop until resume restarts it.
     suspended: AtomicBool,
+    /// The retained executable admits the exact API77 D3 surface on a
+    /// 22000 transport (`wiphy->wowlan` registration).
+    wowlan_capable: bool,
+    /// cfg80211's retained `SET_WOWLAN` configuration.
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// Firmware owns the association in D3 until the resume conversation.
+    wowlan_d3: AtomicBool,
+    /// The last resume's `ieee80211_report_wowlan_wakeup` report.
+    wowlan_wakeup: IrqSafeSpinLock<Option<super::mvm_d3::WakeReport>>,
     stopping: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     up: AtomicBool,
@@ -371,6 +385,7 @@ impl Device {
         let he = owner.supports_native_he_contract();
         let schedule_profiles = owner.scheduled_profile()?.0 as u8;
         let ap_capable = owner.ap_capable();
+        let wowlan_capable = owner.wowlan_capable();
         let p2p_capable = owner.p2p_capable();
         let go_capable = ap_capable
             && matches!(
@@ -421,6 +436,10 @@ impl Device {
             publication: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            wowlan_capable,
+            wowlan: IrqSafeSpinLock::new(None),
+            wowlan_d3: AtomicBool::new(false),
+            wowlan_wakeup: IrqSafeSpinLock::new(None),
             stopping,
             generation: Arc::new(AtomicU64::new(0)),
             up: AtomicBool::new(false),
@@ -539,13 +558,18 @@ impl Device {
         if !self.publication.load(Ordering::Acquire) {
             return Err("MVM native interface is not published");
         }
+        let wowlan_resuming = matches!(operation, Operation::WowlanResume);
+        if self.wowlan_d3.load(Ordering::Acquire) != wowlan_resuming {
+            return Err("MVM WoWLAN D3 ownership mismatch");
+        }
+        let wowlan_suspending = matches!(operation, Operation::WowlanSuspend(_));
         let recovering = matches!(operation, Operation::Recover);
         let suspending = matches!(operation, Operation::Suspend);
         let terminal = self.terminal.load(Ordering::Acquire);
         if recovering && !terminal {
             return Err("MVM recovery requires a terminal station");
         }
-        if terminal && !recovering && !suspending {
+        if terminal && !recovering && !suspending && !wowlan_resuming {
             return Err("MVM station is terminal");
         }
         if self.stopping.load(Ordering::Acquire) && !matches!(operation, Operation::Close) {
@@ -574,6 +598,7 @@ impl Device {
                     && phase != Phase::DataPrepared)
                 || (recovering && !owner.station_failed())
                 || (suspending && phase != Phase::Configured && !owner.station_failed())
+                || ((wowlan_suspending || wowlan_resuming) && phase != Phase::DataPrepared)
             {
                 return Err("MVM control busy");
             }
@@ -631,7 +656,12 @@ impl Device {
                         };
                     }
                     match device.source.invoke(|| {
-                        if closing || suspending || reading_geometry || stopping_schedule {
+                        if closing
+                            || suspending
+                            || wowlan_resuming
+                            || reading_geometry
+                            || stopping_schedule
+                        {
                             return Ok(future.as_mut().poll(cx));
                         }
                         let domain = (device.environment.policy)()?;
@@ -663,6 +693,7 @@ impl Device {
                 .await
             };
             let scheduled_failed = stopping_schedule && state.scheduled.is_some();
+            let mut wowlan_lost = false;
             let owner = state.owner.as_mut().unwrap();
             if result.is_err() && (owner.phase() == Phase::Scanning || scheduled_failed) {
                 // The outer executable/PCI/receive-policy fence can stop
@@ -675,6 +706,28 @@ impl Device {
                 Ok(_) if !closing && device.stopping.load(Ordering::Acquire) => Ok(Outcome::Done),
                 Ok(Outcome::Joined(bssid)) => {
                     device.admit_port(owner, bssid).map(|()| Outcome::Done)
+                }
+                Ok(Outcome::Wowlan(mut resumed)) => {
+                    // iwl_mvm_d3_disconnect_iter: only a kept connection
+                    // reopens its port; anything else is torn down and
+                    // restarted by the caller.
+                    if resumed.keep {
+                        let bssid = owner
+                            .prepared_legacy_data()
+                            .ok_or("MVM WoWLAN data identity missing")
+                            .map(|s| s.bssid);
+                        if bssid
+                            .and_then(|bssid| device.admit_port(owner, bssid))
+                            .is_err()
+                        {
+                            resumed.keep = false;
+                        }
+                    }
+                    if !resumed.keep {
+                        owner.station_fail();
+                        wowlan_lost = true;
+                    }
+                    Ok(Outcome::Wowlan(resumed))
                 }
                 Ok(Outcome::Done)
                     if !closing && port_commit && owner.phase() == Phase::DataPrepared =>
@@ -701,6 +754,18 @@ impl Device {
             } else if closing {
                 let _publication = device.admission.lock();
                 device.stopping.store(false, Ordering::Release);
+            } else if wowlan_suspending {
+                let _publication = device.admission.lock();
+                device.retire_port_locked();
+                *device.fence.lock() = None;
+                device.wowlan_d3.store(true, Ordering::Release);
+                device.suspended.store(true, Ordering::Release);
+                state.pending = None;
+                state.scan_time = None;
+            } else if wowlan_lost {
+                device.down(true);
+                state.pending = None;
+                state.scan_time = None;
             } else if suspending {
                 owner.station_fail();
                 device.down(true);
@@ -720,6 +785,9 @@ impl Device {
                     state.scan_time = None;
                     device.terminal.store(false, Ordering::Release);
                 }
+            }
+            if wowlan_resuming {
+                device.wowlan_d3.store(false, Ordering::Release);
             }
             let wake = {
                 let mut completion = result_slot.lock();
@@ -759,6 +827,23 @@ impl Device {
             .stop_retained()
             .await
             .map_err(|_| "MVM suspend could not retire P2P native owner")?;
+        // mac80211 `__ieee80211_suspend` -> `drv_suspend` with a WoWLAN
+        // configuration: an associated station enters D3; an idle one makes
+        // `__iwl_mvm_suspend` return 1 (no net-detect) and falls through to
+        // the ordinary quiesce/stop below. A D3 entry failure aborts suspend.
+        let wake = self
+            .wowlan
+            .lock()
+            .as_ref()
+            .and_then(|config| super::mvm_d3::Wake::from_config(config).ok());
+        if let Some(wake) = wake.filter(|_| self.wowlan_capable && self.link_up()) {
+            let reply = self.begin(Operation::WowlanSuspend(wake))?;
+            self.wait(reply).await?;
+            if !self.wowlan_d3.load(Ordering::Acquire) {
+                return Err("MVM WoWLAN suspend did not enter D3");
+            }
+            return Ok(());
+        }
         if !self.terminal.load(Ordering::Acquire) {
             WirelessNetIface::disassociate(self)
                 .await
@@ -778,11 +863,38 @@ impl Device {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
+        if self.wowlan_d3.load(Ordering::Acquire) {
+            // `iwl_mvm_resume`: report the wake, keep the connection when
+            // Linux would; otherwise the firmware restart below replaces
+            // `IWL_MVM_STATUS_HW_RESTART_REQUESTED` + `ieee80211_reconfig`.
+            let reply = self.begin(Operation::WowlanResume)?;
+            let kept = match self.wait(reply).await {
+                Ok(Outcome::Wowlan(resumed)) => {
+                    let keep = resumed.keep;
+                    *self.wowlan_wakeup.lock() = Some(resumed.report);
+                    keep
+                }
+                _ => {
+                    *self.wowlan_wakeup.lock() = None;
+                    false
+                }
+            };
+            if kept {
+                self.suspended.store(false, Ordering::Release);
+                return Ok(());
+            }
+        }
         let result = self.recover_failed().await;
         if result.is_ok() {
             self.suspended.store(false, Ordering::Release);
         }
         result
+    }
+    /// The last WoWLAN resume's wake report (cfg80211
+    /// `struct cfg80211_wowlan_wakeup`); `None` after a resume that never
+    /// reached the firmware's report.
+    pub(super) fn wowlan_wakeup(&self) -> Option<super::mvm_d3::WakeReport> {
+        self.wowlan_wakeup.lock().clone()
     }
     async fn wait(&self, reply: Reply) -> Result<Outcome, &'static str> {
         poll_fn(|cx| {
@@ -1000,6 +1112,13 @@ impl Device {
             Operation::QuerySharedMemory => {
                 owner.query_shared_memory().await.map(Outcome::SharedMemory)
             }
+            Operation::WowlanSuspend(wake) => {
+                *pending = None;
+                *scan_time = None;
+                owner.wowlan_suspend(&wake).await?;
+                Ok(Outcome::Done)
+            }
+            Operation::WowlanResume => owner.wowlan_resume().await.map(Outcome::Wowlan),
         }
     }
     fn request_close(&self) {
@@ -1036,7 +1155,9 @@ impl Device {
         if root_pending || p2p_busy {
             return Vec::new();
         }
-        if self.terminal.load(Ordering::Acquire) {
+        // Firmware owns the device in D3; the transport is not touched
+        // until the resume conversation (`IWL_MVM_STATUS_IN_D3`).
+        if self.terminal.load(Ordering::Acquire) || self.wowlan_d3.load(Ordering::Acquire) {
             return Vec::new();
         }
         if self.stopping.load(Ordering::Acquire) {
@@ -1861,6 +1982,22 @@ impl WirelessNetIface for Device {
             Poll::Pending
         })
         .await
+    }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.wowlan_capable.then(super::mvm_d3::support)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        if !self.wowlan_capable {
+            return Err(narf_wireless::EOPNOTSUPP);
+        }
+        if let Some(config) = &config {
+            super::mvm_d3::Wake::from_config(config).map_err(|_| 22)?; // EINVAL, like nl80211 parse_wowlan
+        }
+        *self.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         let v = self.bssid.load(Ordering::Acquire);

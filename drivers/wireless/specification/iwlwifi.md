@@ -2231,8 +2231,12 @@ describe the remaining native paths.
   bounded GO9 peer/key/data and native NoA continuation with exact host group
   PN reporting. CLIENT and native CTWindow/OPPPS remain open; this
   device-only continuation does not close the family row.
-- **wow.** There is no D3 firmware image, `D3_CONFIG_CMD` or WoWLAN key
-  material path, although the shared `wowlan_support` exists.
+- **wow (implemented; validation pending).** §3.80 implements Gen2/API77
+  22000 WoWLAN on the unified image (no separate D3 image is needed or
+  loaded): exact-version `D3_CONFIG_CMD`/WOWLAN command admission, current
+  PTK/GTK replay-floor handoff, D3 transport entry/exit, notification-based
+  wake reasons and counter restoration or full restart. GTK-rekey offload,
+  net-detect, API89/AX210 and MLD Sc/Bz WoWLAN stay unadvertised.
 - **ml_baid** is implemented for source-advertised API77
   RX_BAID_ALLOCATION_CONFIG v1/v2 (§3.41), retaining the existing host
   reorder and RX-marker retirement contract.
@@ -5004,3 +5008,89 @@ legacy MAC_CONTEXT hardware/firmware, optional concurrent roles or richer PHY
 would require new actual adapters/qualification and advertisement. The P2P
 row may be recorded as implemented pending validation after review/compilation
 of this complete graph; full native acceptance remains a separate gate.
+
+### 3.80 Gen2/API77 WoWLAN (implementation; validation pending)
+
+**Scope and firmware image.** WoWLAN is implemented for the native Gen2
+MVM station on the 22000 transport (AX200 Cc / AX201 Qu/QuZ, §3.17).
+`mvm_d3.rs::D3Api::admit` parses the retained executable and admits only
+the exact surface every installed API77 image advertises: capability 17
+(`IWL_UCODE_TLV_CAPA_CNSLDTD_D3_D0_IMG`), no capability 41
+(`D0I3_END_FIRST`), API 53 (`WOWLAN_TCP_SYN_WAKE`), TLV18 flag 16
+(`NEW_NSOFFL_LARGE`, not `SMALL`), LONG_GROUP command versions
+`WOWLAN_CONFIGURATION` 6, `WOWLAN_PATTERNS` 3, `WOWLAN_TSC_RSC_PARAM` 5,
+`PROT_OFFLOAD_CONFIG_CMD` 4, `D3_CONFIG_CMD` 4, and `PROT_OFFLOAD_GROUP`
+notification versions `WOWLAN_INFO` 1, `WOWLAN_WAKE_PKT` 1, `D3_END` 1
+(`iwl_mvm_d3_resume_notif_based`). Any other version, a non-unified image
+or a non-22000 transport leaves WoWLAN unadvertised. Because the image is
+unified, no separate D3 firmware (`IWL_UCODE_WOWLAN`) is loaded and keys
+stay installed: Linux runs `iwl_mvm_switch_to_d3`/`iwl_mvm_d3_reprogram`
+only for non-unified images. API89 (WOWLAN_INFO v3), Sc/Bz (Linux
+`mld/d3.c`) and AX210-family API77 transports remain unadvertised.
+
+**Advertisement and configuration.** `WirelessNetIface::wowlan_support`
+returns `mvm_d3::support()` only for that admitted owner: disconnect, magic
+packet and up to 20 bitmask patterns of 16..128 bytes at offset 0
+(`mvm/mac80211.c`, `IWL_WOWLAN_*`). GTK-rekey offload
+(`WOWLAN_KEK_KCK_MATERIAL`), the GTK-failure/EAP/4-way/RF-kill triggers and
+net-detect are not advertised; nl80211 refuses them and `set_wowlan`
+re-validates every configuration before retaining it.
+
+**Suspend (`__iwl_mvm_suspend`).** `mvm_device.rs::system_suspend` with a
+retained configuration and an open controlled port runs the retained
+`Operation::WowlanSuspend`; an idle station falls through to the ordinary
+§3.29 suspend exactly as `__iwl_mvm_suspend` returns 1 without net-detect.
+`mvm_wowlan.rs::Owner::wowlan_suspend` drains TX completions (mac80211
+`ieee80211_flush_queues`), then sends `WOWLAN_TSC_RSC_PARAM` v5 with the
+host's current PTK and up to two GTK per-TID replay floors (merged across
+RSS queues; non-QoS slot folded into TID 0 as in
+`iwl_mvm_wowlan_get_rsc_v5_data`; omitted on an open BSS), `WOWLAN_CONFIGURATION`
+v6 (filters, `qos_seq` = next sequence − 0x10, HT, MFP and the L3/NBNS/DHCP
+filtering flags), `WOWLAN_PATTERNS` v3 when patterns exist,
+`PROT_OFFLOAD_CONFIG_CMD` v4 and finally `D3_CONFIG_CMD` (10 s minimum
+sleep). `runtime.rs::Hardware::d3_suspend` then follows
+`iwl_trans_pcie_d3_suspend(reset = false)` for 22000: set
+`CSR_HW_IF_CONFIG_REG_PERSISTENCE` (0x40000000), mask interrupts and clear
+`MAC_ACCESS_REQ`/`INIT_DONE`; 22000 has no D3 doorbell handshake. Every DMA
+allocation stays published for firmware. The netdev retires its port
+generation and stops touching the transport while `wowlan_d3` is set; all
+other control is refused. A D3 entry failure aborts suspend (Linux negative
+return) and leaves the station terminal.
+
+**Resume (`__iwl_mvm_resume`).** `Hardware::d3_resume` requests MAC access,
+sets `INIT_DONE`, polls `MAC_CLOCK_READY`, re-enables MSI-X (including
+additional RSS vectors), releases MAC access and treats
+`CSR_RESET_REG_FLAG_NEVO_RESET` as "device was reset during suspend".
+`Owner::wowlan_resume` waits at most 333 ms (`IWL_MVM_D3_NOTIF_TIMEOUT`)
+for `WOWLAN_INFO`, the wake packet when a packet reason is set, and
+`D3_END`. The report follows `iwl_mvm_report_wakeup_reasons` and is
+retained as `Device::wowlan_wakeup` (`mvm_d3::WakeReport`). The connection
+is kept only without `IWL_D0I3_RESET_REQUIRE`, missed-beacon/deauth/ucode
+error reasons or a reported GTK rekey (NARF does not offload rekeying), for
+the expected station id. Keeping raises host PTK/GTK replay floors to the
+firmware's counters (never lowers them), continues QoS sequence numbers
+after firmware's last-used values and advances the drained TID0 queue by
+the frames firmware sent (`iwl_trans_set_q_ptrs`, relative because the host
+ring token keeps its allocation-time origin), then reopens the port under
+current power/policy authority. Every other outcome, including a transport
+or notification failure, fails the owner and runs the §3.29 full restart,
+leaving the station disconnected for a new SME join, as Linux's
+`IWL_MVM_STATUS_HW_RESTART_REQUESTED` + `ieee80211_reconfig`.
+
+**Deliberate differences and remaining gaps.** NARF has no ARP/IPv6
+address notifier into the driver, so `PROT_OFFLOAD_CONFIG_CMD` carries no
+ARP/NS address (Linux's behaviour with `arp_addr_cnt == 0`), plus BTM when
+capability 113 is set. The D3 MAC/device power-table re-send
+(`iwl_mvm_power_update_device/mac` with `IWL_MVM_STATUS_IN_D3`) is not
+performed: the already-qualified awake power program stays in force, so
+no unmeasured D3 emitting program is introduced. The firmware error-table
+check (`iwl_mvm_check_rt_status`) is replaced by the notification timeout
+plus full restart. The shared contract has no
+`ieee80211_report_wowlan_wakeup` event, so the report is a driver accessor.
+Platform PME/wake-enable of the PCI function belongs to the system-PM
+owner and is not claimed here. Native fixtures
+(`drivers/wireless/iwlwifi/gen2/wowlan`) cover version admission, every
+command/notification layout, magic-packet keep with restored counters and
+DHCP afterward, disconnect-wake restart and rejoin, idle fallback and
+reset-required restart; they are written and not yet executed. Physical D3
+entry/exit on silicon remains unvalidated.

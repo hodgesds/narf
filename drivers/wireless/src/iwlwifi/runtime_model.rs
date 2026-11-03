@@ -365,6 +365,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         shared_memory: smem::State::default(),
         armed: false,
         failed: false,
+        in_d3: false,
         station_stop: None,
         protected_tx: 0,
         // This RAM constructor models an already admitted post-INIT owner.
