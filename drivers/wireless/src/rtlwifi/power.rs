@@ -372,7 +372,11 @@ pub fn power_on_table_for(did: u16) -> Option<&'static [WlanPwrCfg]> {
     use super::regs::*;
     match did {
         RTL_DEV_8188EE => Some(RTL8188EE_PWR_ON),
-        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT | RTL_DEV_8192DE => Some(RTL8192CE_PWR_ON),
+        // RTL8192CE / 8188CE have no pwrseq table: Linux reads the chip
+        // version and EFUSE at probe without a power-on step and powers the
+        // MAC in `rtl92ce_hw_init` (`_rtl92ce_init_mac`,
+        // `rtl8192ce::power::power_on`, run by the firmware owner).
+        RTL_DEV_8192DE => Some(RTL8192CE_PWR_ON),
         RTL_DEV_8192EE => Some(RTL8192EE_PWR_ON),
         RTL_DEV_8723AE | RTL_DEV_8723BE => Some(RTL8723BE_PWR_ON),
         RTL_DEV_8821AE => Some(RTL8821AE_PWR_ON),

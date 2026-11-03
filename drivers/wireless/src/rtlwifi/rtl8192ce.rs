@@ -11,10 +11,14 @@
 //! - `rtlwifi/rtl8192ce/def.h`  — chip-version and rate constants
 //! - `rtlwifi/rtl8192de/reg.h`  — minor offset additions (mostly identical)
 //!
-//! ## Retained-runtime foundation (`rtl8192ce/`)
+//! ## Retained runtime (`rtl8192ce/`)
 //!
-//! Exact Linux `rtl8192ce` + `rtl8192c` (common) pieces a native
-//! RTL8192CE / RTL8188CE owner is built from:
+//! Exact Linux `rtl8192ce` + `rtl8192c` (common) pieces the retained
+//! RTL8192CE / RTL8188CE owner is built from. Probe retains an admissible
+//! `rtl92ce_pci_ids` function (qualified RF_1T1R / RF_2T2R version,
+//! provisioned map, no BT coexistence, TX power decodes) and admits it
+//! under its signed `N92C` envelope (`prepare_native::prepare_rtl8192ce`);
+//! the HT20/40 station is in [`ht`].
 //!
 //! - [`version`] — `_rtl92ce_read_chip_version`, the `fw_common.h` version
 //!   predicates, RF-type qualification (1T1R `CHIP_88C`, 2T2R `CHIP_92C`;
@@ -81,8 +85,8 @@ pub(crate) mod tests;
 
 /// Further `rtl92ce_pci_ids` entries (`rtl8192ce/sw.c`) beside the two
 /// `regs.rs` IDs.
-pub const DEV_ID_8192CE_8177: u16 = 0x8177;
-pub const DEV_ID_8192CE_8191: u16 = 0x8191;
+pub const DEV_ID_8192CE_8177: u16 = super::regs::RTL_DEV_8192CE_8177;
+pub const DEV_ID_8192CE_8191: u16 = super::regs::RTL_DEV_8192CE_8191;
 
 /// Whether `did` is one of the `rtl92ce_pci_ids` (RTL8192CE / RTL8188CE).
 pub const fn is_8192ce(did: u16) -> bool {

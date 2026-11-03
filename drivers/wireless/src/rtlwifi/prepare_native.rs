@@ -1,4 +1,4 @@
-//! Private retained RTL8188EE/RTL8821AE/RTL8192EE LLT/descriptor
+//! Private retained RTL8188EE/RTL8821AE/RTL8192EE/RTL8192CE LLT/descriptor
 //! continuation, with PCI BME off.
 use super::{
     firmware_native::PciIo,
@@ -293,6 +293,87 @@ pub(super) async fn prepare_rtl8192ee(
     admit_rtl8192ee(prepared, &factory, &domain, channel).await
 }
 
+/// RTL8192CE / RTL8188CE retained continuation to an admitted 2.4 GHz
+/// station owner, as [`prepare_rtl8192ee`]: registry firmware (the image
+/// `rtl92c_init_sw_vars` selects for the measured version), the one-shot
+/// packet claim, the 92C linked rings with `_rtl92ce_llt_table_init` and
+/// the remaining `_rtl92ce_init_mac` (`prepare`), the parked
+/// `rtl92ce_hw_init` radio (`configure_rtl8192ce`: test chips, 1T2R
+/// bondings, unprovisioned maps, BT-coexist boards and a MAC other than the
+/// factory identity refused before any table write), then the channel from
+/// the signed per-board `N92C` envelope (probed device + measured RF type)
+/// under current host policy, the operational MAC and the staged envelope
+/// the station re-proves at every publication. Packet DMA, CR gates and
+/// IRQs stay closed until the station service starts.
+pub(super) async fn prepare_rtl8192ce(
+    firmware: Arc<Owner<PciIo>>,
+    retained: Arc<Retained>,
+    factory: Arc<super::efuse::Factory>,
+    channel: u8,
+) -> Result<(), Error> {
+    let device = firmware.device_id();
+    if !(1..=11).contains(&channel) || !super::rtl8192ce::is_8192ce(device) {
+        return Err(Error::State);
+    }
+    if firmware.status().stage == super::firmware_transport::Stage::Detected {
+        firmware.initialize_registered().await?;
+        let prepared = allocate(firmware, 128)?;
+        prepare_retained(&retained, prepared).await?;
+        let mut storage = retained.lock().await;
+        storage
+            .as_mut()
+            .ok_or(Error::State)?
+            .configure_rtl8192ce(&factory, device)
+            .await?;
+    } else if firmware.status().stage != super::firmware_transport::Stage::Ready {
+        return Err(Error::State);
+    }
+    let mut storage = retained.lock().await;
+    let prepared = storage.as_mut().ok_or(Error::State)?;
+    if prepared.phase() == super::prepare::Phase::MacConfigured && prepared.station_transmit_ready()
+    {
+        return Ok(());
+    }
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+    admit_rtl8192ce(prepared, &factory, &domain, channel).await
+}
+
+/// RadioConfigured/ChannelConfigured → MacConfigured with a staged `N92C`
+/// envelope (20 MHz permission on `channel`) for the owner's probed device
+/// and measured RF type; a MacConfigured owner without one only stages it.
+/// Shared by native provisioning and the interface's readiness path.
+pub(super) async fn admit_rtl8192ce<I: super::firmware_transport::Io, M: Memory>(
+    prepared: &mut Prepared<I, M>,
+    factory: &super::efuse::Factory,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+) -> Result<(), Error> {
+    use super::prepare::Phase;
+    let (device, rf) = prepared.rtl8192ce_binding().ok_or(Error::State)?;
+    let calibration = super::rtl8192ce::envelope::Calibration::load_registered(factory, device, rf)
+        .map_err(Error::Power)?;
+    if matches!(
+        prepared.phase(),
+        Phase::RadioConfigured | Phase::ChannelConfigured
+    ) {
+        let permission = calibration
+            .permission(domain, channel)
+            .map_err(Error::Power)?;
+        prepared.configure_rtl8192ce_channel(permission).await?;
+        prepared.configure_rtl8192ce_mac(factory)?;
+    }
+    if prepared.phase() != Phase::MacConfigured {
+        return Err(Error::State);
+    }
+    if prepared.station_calibration_present() {
+        return Ok(());
+    }
+    prepared
+        .stage_rtl8192ce_calibration(calibration, domain)
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))
+}
+
 /// RadioConfigured/ChannelConfigured → MacConfigured with a staged `N92E`
 /// envelope (20 MHz permission on `channel`); a MacConfigured owner
 /// without one only stages it. Shared by native provisioning and the
@@ -349,6 +430,9 @@ pub(super) async fn initialize_registered_on_channel(
     }
     if firmware.device_id() == super::regs::RTL_DEV_8192EE {
         return prepare_rtl8192ee(firmware, retained, factory, channel).await;
+    }
+    if super::rtl8192ce::is_8192ce(firmware.device_id()) {
+        return prepare_rtl8192ce(firmware, retained, factory, channel).await;
     }
     if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);

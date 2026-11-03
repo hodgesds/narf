@@ -26,21 +26,26 @@ impl
         let device = firmware.device_id();
         let rtl8821ae = device == super::super::regs::RTL_DEV_8821AE;
         let rtl8192ee = device == super::super::regs::RTL_DEV_8192EE;
+        let rtl8192ce = super::super::rtl8192ce::is_8192ce(device);
         let disabled = if rtl8821ae {
             super::super::power_runtime::disable_rtl8821ae(&io, ready).await
         } else if rtl8192ee {
             // `rtl92ee_card_disable` → `_rtl92ee_poweroff_adapter`, after the
             // owner's `ee92_quiesce` retirement proof.
             super::super::power_runtime::disable_rtl8192ee(&io, ready).await
+        } else if rtl8192ce {
+            // `rtl92ce_card_disable`, normally already run by the owner's
+            // `ce92_quiesce` (accepted by its `SYS_FUNC_EN + 1` receipt).
+            super::super::power_runtime::disable_rtl8192ce(&io).await
         } else {
             super::super::power_runtime::disable(&io, ready).await
         };
         disabled.map_err(prepare::Error::Access)?;
         self.power_state.store(1, Ordering::Release);
-        if rtl8821ae || rtl8192ee {
-            // ASPM is not composed for 8821AE/8192EE (`prepare_bus_power`;
-            // 8192EE `enable_aspm` is not issued): the probe's
-            // ASPM-disabled link state is kept.
+        if rtl8821ae || rtl8192ee || rtl8192ce {
+            // ASPM is not composed for 8821AE/8192EE/8192CE
+            // (`prepare_bus_power`; 8192EE / 8192CE `enable_aspm` is not
+            // issued): the probe's ASPM-disabled link state is kept.
             return Ok(());
         }
         // Card-disable proof is complete. Optional idle-link optimization
@@ -84,9 +89,12 @@ impl
         // The fresh-generation rebuild is the card-disable/enable flow:
         // 88EE `_rtl88ee_poweroff_adapter` + NIC enable, 8821AE
         // `_rtl8821ae_poweroff_adapter` + `_rtl8821ae_init_mac`'s enable,
-        // 8192EE `_rtl92ee_poweroff_adapter` + `_rtl92ee_init_mac`'s enable.
+        // 8192EE `_rtl92ee_poweroff_adapter` + `_rtl92ee_init_mac`'s enable,
+        // 8192CE `rtl92ce_card_disable` + a fresh `rtl92ce_hw_init`.
         let device = self.firmware().device_id();
-        if !matches!(device, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE) {
+        if !matches!(device, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE)
+            && !super::super::rtl8192ce::is_8192ce(device)
+        {
             return Err(Error::State);
         }
         self.power_down().await?;
@@ -101,6 +109,12 @@ impl
             super::super::power_runtime::enable_rtl8821ae(&io).await
         } else if device == RTL_DEV_8192EE {
             super::super::power_runtime::enable_rtl8192ee(&io).await
+        } else if super::super::rtl8192ce::is_8192ce(device) {
+            // No separate enable: the fresh owner's firmware run issues the
+            // `_rtl92ce_init_mac` power prefix (`power_runtime::
+            // disable_rtl8192ce` note); EFUSE identity is read through the
+            // EFUSE power switch, as Linux's probe does.
+            Ok(())
         } else {
             super::super::power_runtime::enable(&io).await
         };

@@ -233,3 +233,41 @@ pub(super) async fn disable_rtl8192ee(io: &impl Io, firmware_ready: bool) -> Res
     update(io, 0x1d, 0, 1).await?;
     io.write8(0x1c, 0x0e)
 }
+
+/// RTL8192CE / RTL8188CE `rtl92ce_card_disable` for the rebuild's power
+/// down. The retained owner's quiescence (`ce92_quiesce`) already ran
+/// `_rtl92ce_poweroff_adapter` after its descriptor retirement proof and
+/// read back `REG_SYS_FUNC_EN + 1 == 0x51` (`FEN_DCORE` dropped); that
+/// state is accepted unchanged, as Linux disables the card once. A card
+/// still enabled (no owner was retained) runs the non-BT
+/// `_rtl92ce_poweroff_adapter` for the live qualified version. There is no
+/// matching enable step: the fresh owner's firmware run issues the
+/// `_rtl92ce_init_mac` power prefix (`rtl8192ce::power::power_on`) before
+/// the download, exactly once, as `rtl92ce_hw_init` does.
+pub(super) async fn disable_rtl8192ce(io: &impl Io) -> Result<(), Error> {
+    use super::rtl8192ce::{fw::REG_SYS_FUNC_EN, ps, version};
+    if io.read8(REG_SYS_FUNC_EN + 1)? == 0x51 {
+        return Ok(());
+    }
+    let sys_cfg = io.read32(version::REG_SYS_CFG)?;
+    if sys_cfg == u32::MAX {
+        return Err(Error::Gone);
+    }
+    let mut hpon = Ok(0);
+    let qualified = version::Version::from_registers(sys_cfg, || {
+        hpon = io.read32(version::REG_HPON_FSM);
+        *hpon.as_ref().unwrap_or(&0)
+    });
+    hpon?;
+    let qualified = qualified.map_err(|_| Error::Unsupported)?;
+    ps::poweroff_adapter(io, qualified)
+        .await
+        .map_err(|error| match error {
+            super::prepare::Error::Access(access) => access,
+            _ => Error::Gate,
+        })?;
+    if io.read8(REG_SYS_FUNC_EN + 1)? != 0x51 {
+        return Err(Error::Gate);
+    }
+    Ok(())
+}

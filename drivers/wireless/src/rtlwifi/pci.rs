@@ -501,9 +501,12 @@ pub unsafe fn bring_up(
 ) -> Result<RtlwifiDevice, ProbeError> {
     let did = device.id.device;
     // Retained native station profiles: RTL8188EE, (no BT coexistence)
-    // RTL8821AE and (2.4 GHz, no BT coexistence, EFUSE TX power present)
-    // RTL8192EE. Every other matched chip stays diagnostic.
-    let retained = matches!(did, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE);
+    // RTL8821AE, (2.4 GHz, no BT coexistence, EFUSE TX power present)
+    // RTL8192EE and (qualified RF_1T1R / RF_2T2R version, provisioned map,
+    // no BT coexistence) RTL8192CE / RTL8188CE. Every other matched chip
+    // stays diagnostic.
+    let rtl8192ce = super::rtl8192ce::is_8192ce(did);
+    let retained = matches!(did, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE) || rtl8192ce;
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
             .map_err(|_| ProbeError::RegisterBarMapFailed)?;
@@ -513,6 +516,7 @@ pub unsafe fn bring_up(
                 && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
             || (device.id.device == RTL_DEV_8192EE
                 && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
+            || (rtl8192ce && registers.len < super::rtl8192ce::MMIO_SIZE as u64)
         {
             return Err(ProbeError::RegisterBarMapFailed);
         }
@@ -564,6 +568,36 @@ pub unsafe fn bring_up(
                 .is_ok_and(|facts| !facts.bt_coexist && facts.mac == factory.mac)
                 && txpower::Efuse::from_logical(&factory.logical).is_ok()
         };
+
+        // RTL8192CE / RTL8188CE: the facts `configure_rtl8192ce`
+        // re-derives. `_rtl92ce_read_chip_version` must qualify (no
+        // `TRP_VAUX_EN` test chip, no `CHIP_BONDING_92C_1T2R`, no unknown
+        // cut, so the RF type is RF_1T1R or RF_2T2R), the map must be
+        // provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`), the
+        // board must not be BT-coexist (`RF_OPTION1[7:5]`), the EFUSE MAC
+        // must be the factory identity and the TX-power areas must decode.
+        let admissible = admissible
+            && (!rtl8192ce || {
+                use super::rtl8192ce::{adapter, txpower, version};
+                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                let (sys_cfg, cr9346) = unsafe {
+                    (
+                        registers.read32(u64::from(version::REG_SYS_CFG)),
+                        registers.read8(u64::from(adapter::REG_9346CR)),
+                    )
+                };
+                // SAFETY: as above (HPON_FSM is read only for 92C serials).
+                let hpon = || unsafe { registers.read32(u64::from(version::REG_HPON_FSM)) };
+                version::Version::from_registers(sys_cfg, hpon).is_ok_and(|qualified| {
+                    adapter::Adapter::from_hardware(qualified, cr9346, &factory.logical).is_ok_and(
+                        |facts| {
+                            !facts.bt_coexistence()
+                                && facts.mac == factory.mac
+                                && txpower::Efuse::from_hwinfo(&facts.hwinfo).is_ok()
+                        },
+                    )
+                })
+            });
 
         Ok((registers, (factory, admissible)))
     })
@@ -643,6 +677,8 @@ pub const fn name_for(did: u16) -> &'static str {
         RTL_DEV_8188EE => "rtlwifi-8188ee",
         RTL_DEV_8192CE => "rtlwifi-8192ce",
         RTL_DEV_8192CE_ALT => "rtlwifi-8192ce-alt",
+        RTL_DEV_8192CE_8177 => "rtlwifi-8192ce-8177",
+        RTL_DEV_8192CE_8191 => "rtlwifi-8192ce-8191",
         RTL_DEV_8192DE => "rtlwifi-8192de",
         RTL_DEV_8192EE => "rtlwifi-8192ee",
         RTL_DEV_8723AE => "rtlwifi-8723ae",

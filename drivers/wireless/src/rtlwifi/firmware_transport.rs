@@ -361,7 +361,7 @@ impl<I: Io> Owner<I> {
             .await
     }
     /// `_rtl92ce_read_chip_version` over this owner's registers.
-    fn rtl8192ce_version(&self) -> Result<super::rtl8192ce::version::Version, Error> {
+    pub(super) fn rtl8192ce_version(&self) -> Result<super::rtl8192ce::version::Version, Error> {
         use super::rtl8192ce::version::{Version, REG_HPON_FSM, REG_SYS_CFG};
         let sys_cfg = self.io.read32(REG_SYS_CFG)?;
         if sys_cfg == u32::MAX {

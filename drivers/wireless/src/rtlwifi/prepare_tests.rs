@@ -554,7 +554,7 @@ pub(crate) fn smoke_rtl8821ae_retained_rings_dw12_and_exact_llt() -> TestResult 
     }
     if owner.chip() != Chip::Rtl8821ae
         || Chip::from_device(0x8821) != Some(Chip::Rtl8821ae)
-        || Chip::from_device(0x8178).is_some()
+        || Chip::from_device(0x8178) != Some(Chip::Rtl8192ce)
     {
         return TestResult::Fail("8821AE ring profile selection");
     }

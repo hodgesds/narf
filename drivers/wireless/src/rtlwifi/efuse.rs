@@ -75,7 +75,9 @@ pub(super) fn read_factory_with(
         RTL_DEV_8188EE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8821AE => {
             (256 - 18, 512, 0xd0, true)
         }
-        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT => (512 - 15, 128, 0x16, false),
+        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT | RTL_DEV_8192CE_8177 | RTL_DEV_8192CE_8191 => {
+            (512 - 15, 128, 0x16, false)
+        }
         RTL_DEV_8192DE if function < 2 => (
             512 - 15,
             256,

@@ -78,6 +78,8 @@ pub(in super::super) struct State {
     /// `mac->min_space_cfg` (`_rtl_pci_init_struct`: 0), the
     /// `HW_VAR_AMPDU_MIN_SPACE` / `_SHORTGI_DENSITY` cache.
     pub(in super::super) min_space_cfg: u8,
+    /// Probed `rtl92ce_pci_ids` device (`configure_rtl8192ce`).
+    pub(in super::super) device: Option<u16>,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -91,6 +93,7 @@ impl State {
             receive_config: None,
             erp_timing: None,
             min_space_cfg: 0,
+            device: None,
         }
     }
 }

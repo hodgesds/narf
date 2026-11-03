@@ -18,12 +18,17 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     /// re-qualified from live `REG_SYS_CFG` / `REG_HPON_FSM` and the adapter
     /// facts from `REG_9346CR`; test chips, 1T2R bondings, unknown cuts,
     /// unprovisioned maps, BT-coexist boards and a MAC differing from the
-    /// factory identity are refused before the first table write.
+    /// factory identity are refused before the first table write. `device`
+    /// is the probed `rtl92ce_pci_ids` function the `N92C` envelope binds.
     pub async fn configure_rtl8192ce(
         &mut self,
         factory: &crate::rtlwifi::efuse::Factory,
+        device: u16,
     ) -> Result<(), Error> {
-        if self.phase != Phase::Prepared || self.chip != Chip::Rtl8192ce {
+        if self.phase != Phase::Prepared
+            || self.chip != Chip::Rtl8192ce
+            || !crate::rtlwifi::rtl8192ce::is_8192ce(device)
+        {
             return Err(Error::State);
         }
         let qualified = radio_version(&self.io)?;
@@ -41,8 +46,18 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         let radio = init::configure(&self.io, &facts).await?;
         let identity = crate::rtlwifi::radio::factory_identity(factory);
         self.rtl8192ce = Some(alloc::boxed::Box::new((identity, radio)));
+        self.packet.ce92.device = Some(device);
         self.phase = Phase::RadioConfigured;
         Ok(())
+    }
+
+    /// The probed PCI device and measured RF type of the configured radio
+    /// (the `N92C` envelope's binding), if any.
+    pub(crate) fn rtl8192ce_binding(&self) -> Option<(u16, version::RfType)> {
+        Some((
+            self.packet.ce92.device?,
+            self.rtl8192ce_radio()?.version.rf_type(),
+        ))
     }
 
     /// Admitted CE operating point committed by

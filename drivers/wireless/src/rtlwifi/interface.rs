@@ -327,6 +327,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 )
                 .await?;
             }
+        } else if owner.chip() == super::prepare::Chip::Rtl8192ce {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8192ce(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
         } else if matches!(
             owner.phase(),
             Phase::RadioConfigured | Phase::ChannelConfigured
@@ -344,7 +358,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if owner.phase() == Phase::MacConfigured && !owner.station_calibration_present() {
             if matches!(
                 owner.chip(),
-                super::prepare::Chip::Rtl8821ae | super::prepare::Chip::Rtl8192ee
+                super::prepare::Chip::Rtl8821ae
+                    | super::prepare::Chip::Rtl8192ee
+                    | super::prepare::Chip::Rtl8192ce
             ) {
                 return Err(Error::Profile);
             }
@@ -1470,13 +1486,15 @@ impl NativeEnvironment {
 }
 impl Environment for NativeEnvironment {
     async fn prepare_bus_power(&self) -> Result<(), Error> {
+        let device = self.firmware().device_id();
         if matches!(
-            self.firmware().device_id(),
+            device,
             super::regs::RTL_DEV_8821AE | super::regs::RTL_DEV_8192EE
-        ) {
-            // `_rtl8821ae_enable_aspm_back_door` / ASPM and the 8192EE
-            // `enable_aspm` are not composed for these profiles: probe's
-            // ASPM-disabled link state is kept.
+        ) || super::rtl8192ce::is_8192ce(device)
+        {
+            // `_rtl8821ae_enable_aspm_back_door` / ASPM and the 8192EE /
+            // 8192CE `enable_aspm` are not composed for these profiles:
+            // probe's ASPM-disabled link state is kept.
             return Ok(());
         }
         self.firmware()
@@ -1504,6 +1522,27 @@ impl Environment for NativeEnvironment {
             // (`rebuild_native`); admission is the `N92E` 20 MHz permission
             // on 2.4 GHz channels 1-11 that `prepare_rtl8192ee` re-derives.
             return super::rtl8192ee::envelope::Calibration::load_registered(factory)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
+        }
+        let device = self.firmware().device_id();
+        if super::rtl8192ce::is_8192ce(device) {
+            // Retuning rebuilds through `rtl92ce_card_disable` and a fresh
+            // `rtl92ce_hw_init` (`rebuild_native`); admission is the `N92C`
+            // 20 MHz permission on 2.4 GHz channels 1-11 that
+            // `prepare_rtl8192ce` re-derives for the probed device and the
+            // measured RF type.
+            if !(1..=11).contains(&channel) {
+                return Err(Error::Profile);
+            }
+            let rf = self
+                .firmware()
+                .rtl8192ce_version()
+                .map_err(|_| Error::Profile)?
+                .rf_type();
+            return super::rtl8192ce::envelope::Calibration::load_registered(factory, device, rf)
                 .map_err(|_| Error::Profile)?
                 .permission(&self.domain()?, channel)
                 .map(|_| ())

@@ -2573,13 +2573,14 @@ Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack`
 (`rtl8192ee/packet_owner_tests.rs`).
 
-### RTL8192CE / RTL8188CE retained-runtime foundation (groundwork, not admitted)
+### RTL8192CE / RTL8188CE retained runtime (admitted station, both RF types)
 
-`rtl8192ce/` holds the Linux `rtl8192ce` + `rtl8192c` (common) pieces a
+`rtl8192ce/` holds the Linux `rtl8192ce` + `rtl8192c` (common) pieces the
 native RTL8192CE (2T2R) / RTL8188CE (1T1R) owner is built from
-(`rtl92ce_pci_ids`: `0x8178`, `0x8177`, `0x8176`, `0x8191`;
-`rtl8192ce::is_8192ce`). None is reachable from probe as a WLAN capability:
-these IDs stay diagnostic (`pci::bring_up` does not retain them).
+(`rtl92ce_pci_ids`: `0x8178`, `0x8177`, `0x8176`, `0x8191`, all four in
+`regs::ALL_DEV_IDS`; `rtl8192ce::is_8192ce`). Probe retains an admissible
+function and admits it under its signed `N92C` envelope (probe admission,
+at the end of this section).
 
 - `version` — `_rtl92ce_read_chip_version` over `REG_SYS_CFG` and (92C
   serial only) `REG_HPON_FSM`. Qualified: `CHIP_88C` ⇒ `RF_1T1R`
@@ -2601,9 +2602,10 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   `APS_FSMCO+1` BIT0 request and 1000 x 100 us poll, exact-width
   `APS_FSMCO = 0x1012`, `SYS_ISO_CTRL+1 = 0x82`). BT-coexist branches are
   not issued (such boards are never admitted). An APFM poll expiry is a
-  gate failure (Linux continues). The probe-time `power::RTL8192CE_PWR_ON`
-  table used for diagnostic identity is not this sequence and must be
-  replaced before admission.
+  gate failure (Linux continues). Probe issues no power-on step for these
+  IDs (`power::power_on_table_for` is `None`; `RTL8192CE_PWR_ON` stays for
+  8192DE only): Linux reads the chip version and EFUSE at probe and powers
+  the MAC in `rtl92ce_hw_init`, here the firmware owner's run.
 - `fw` — `IS_FW_HEADER_EXIST` (`0x92c0` / `0x88c0`), exact RAM-code length
   (linux-firmware: `0x3f20` / `0x39c2` / `0x3fac`), whole file at most
   `max_fw_size = 0x4000`. `rtl92c_download_fw` for normal chips:
@@ -2793,13 +2795,12 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   issues no `0x301` stop on this chip). Start: bus mastering, then the
   deferred `_rtl92ce_init_mac` `REG_CR = 0x2ff` (word) and `TXPAUSE = 0`,
   with both 92C IMRs read back zero; requires the channel recorded by
-  `configure_rtl8192ce_channel`. TX: one outstanding forced-rate legacy
-  frame, [`trx::fill`] descriptor (`RATR_INX_WIRELESS_MC`, macid 0 under
-  `dm.useramask`), OWN written last, `REG_PCIE_CTRL_REG` `BIT(hw_queue)`
+  `configure_rtl8192ce_channel`. TX: one outstanding frame (rate rules
+  below), [`trx::fill`] descriptor (macid 0 under `dm.useramask`), OWN
+  written last, `REG_PCIE_CTRL_REG` `BIT(hw_queue)`
   doorbell; the shared host receipt (`delivery`) applies unchanged. RX:
   in-ring 32-byte descriptor (`trx::RxStatus`, payload at `drvinfo +
-  shift`, `rx_arm` re-post with OWN last); HT/A-MPDU frames are consumed
-  and dropped, PHY status is not decoded. IRQ: `rtl92ce_enable_interrupt`
+  shift`, `rx_arm` re-post with OWN last; HT/A-MPDU and PWDB below). IRQ: `rtl92ce_enable_interrupt`
   / `_disable_` / `_interrupt_recognized` (HISRE untouched, `intb` 0).
   Leisure: `HW_VAR_FW_LPS_ACTION` — enter: `fw_current_inpsmode`, on 88C
   `rtl92c_dm_rf_saving(hw, true)` (the `HW_VAR_H2C_FW_PWRMODE` rule for
@@ -2866,14 +2867,90 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   (`install_rtl8192ce_station_rate_mask`: `mac->mode` B for
   `supp_rates[0] <= 0xf` else G, `bw_40` from the programmed width,
   bounded by the `N92C` admitted rates, inside the envelope's authority;
-  an HT profile is refused here) and the DM watchdog
+  N_24G for an HT profile, below) and the DM watchdog
   (`rtl8192ce_watchdog`, never re-sends a mask, as Linux). The 88EE
   `install_rate_mask` path refuses CE. Test (written, unexecuted):
   `smoke_rtl8192ce_station_registers`.
-  Not reachable yet: probe admission and the native continuation
-  (`prepare_native`) do not run the CE envelope/MAC steps; RX HT/A-MPDU,
-  PHY-status PWDB, RA-adapted TX, the HT20/40 station plan and ERP/RTS
-  protection are not composed for CE.
+- RX (`ce92_receive_step`, `rtl92ce_rx_query_desc`): on an HT link
+  (`packet.ht`, set at Configuring) MCS0-7 on `RF_1T1R` / MCS0-15 on
+  `RF_2T2R` (the advertised RX set) and A-MPDU members (the BA owner gates
+  them) up to the 7935-byte A-MSDU MPDU; `Mpdu.ht` from RXHT, `width40`
+  from the BW bit (`rx_is40mhzpacket`), `aggregated` from PAGGR; no SGI
+  flag (Linux reports none). PWDB: `_rtl92ce_query_rxphystatus`
+  `rx_pwdb_all` from the driver-info PHY status at `rx_bufshift`
+  (`trx::rx_pwdb`: OFDM `pwdb_all` byte 4; CCK `cck_agc_rpt` byte 5 with
+  the `cck_high_power` report/gain split, `+6` cap and the four offset
+  bands), fed to `rtl_process_phyinfo` smoothing for BSSID-matched frames.
+  Test `smoke_rtl8192ce_rx_phy_status_pwdb` (`rtl8192ce/tests.rs`,
+  written, unexecuted).
+- TX (`ce92_submit`, `rtl_get_tcb_desc` + `rtl92ce_tx_fill_desc`):
+  ordinary unicast DATA under the installed RA mask (`queue_station`'s
+  8192EE/8192CE arm, protection independent) clears USE_RATE, starting at
+  `_rtl_get_highest_n_rate` (MCS15 on `RF_2T2R` with `rx_mask[1]`, else
+  MCS7; 11M B / 54M G); every DATA frame of the link names RATE_ID from
+  `wireless_mode` (`_rtl_txrate_selectmode` with `dm.useramask`, no
+  NEW_RATEID: NGB 0 / GB 4 / B 6), MACID 0; other frames
+  `RATR_INX_WIRELESS_MC`. DISFB is never set (`set_tx_desc_disable_fb(0)`).
+  Special data (`rtl_is_special_data`, shared `packet_owner::special_data`:
+  EAPOL, ARP, DHCP; plaintext only) takes `_rtl_rc_get_rate` rix 0, i.e.
+  `use_driver_rate` at `DESC_RATE1M`; a (QoS) Null DATA frame keeps
+  `use_driver_rate` at the driver rate (`rtl92ce_tx_fill_desc` writes
+  USE_RATE as given, unlike 92EE). `bw_40`: unicast above 54M on an HT link
+  is 40 MHz (`data_bw` 1, SC 3), every other frame `cur_40_prime_sc`.
+  AGG_EN (`agg_break`) + `max_agg_num 0x14` for an operational BA TID with
+  the peer's density (QoS DATA only); data SGI from `_rtl_query_shortgi`
+  (SGI40 at 40 MHz, SGI20 at 20). Protection: ERP Use_Protection / RTS
+  threshold admitted under `N92C` (`native_protection`), RTS_EN or
+  CTS2SELF at `DESC_RATE24M`, long preamble, HW_RTS per `trx::fill`. Every
+  rate the descriptor can put on air (`hw_rate`, and `DESC_RATE24M` when
+  protected) must be in `admitted_rates` (`Power(Policy)` otherwise).
+  Short preamble / slot follow `ieee80211_handle_bss_capability` (BSS ERP
+  octet at association, `configure_rates`; tracked beacon changes through
+  `rtl8192ce::station::erp_changed`, `ce92.erp_timing`).
+- HT station (`rtl8192ce/ht.rs`): `_rtl_init_hw_ht_capab` per RF type
+  (RX MCS0-7 / MCS0-15, `SUP_WIDTH_20_40 | SGI_40 | SGI_20 | DSSSCCK40 |
+  MAX_AMSDU`, factor 3, density 7; MCS32 / `rx_highest` omitted); the
+  20/40 form only under an admitted 40 MHz `N92C` permission for the AP's
+  geometry (`ht_width.rs::rtl8192ce_wide`), TX MCS8-15 only on `RF_2T2R`
+  when the 20 MHz and (offered) 40 MHz permissions admit every two-stream
+  rate (`rtl8192ce_two_stream`). Join plan: `rtl8192ce::ht::local` under
+  `rtl8192ce_ht()` (MCS0-7 admitted); width via `retune_rtl8192ce`
+  (`configure_rtl8192ce_channel` at the target operating point inside the
+  permission's authority, as `retune_rtl8192ee`). `BSS_CHANGED_HT`: all
+  three `rtl92ce_set_hw_reg` cases (`HW_VAR_SHORTGI_DENSITY`,
+  `HW_VAR_AMPDU_FACTOR` `regtoset_normal` into `REG_AGGLEN_LMT`,
+  `HW_VAR_AMPDU_MIN_SPACE` into `0x45c`, `min_space_cfg` cache kept across
+  associations). Beacon observation with the HT20 PHY; host capability
+  (`ht::host_capabilities` / `host_phy` → `interface.rs`
+  `rtl8192ce_caps`). Association RA mask: N_24G peer with mac80211's
+  intersected TX MCS set and SGI flags, bounded by `admitted_rates`. Test
+  `smoke_rtl8192ce_ht_capability_timing_and_erp` (`rtl8192ce/ps_tests.rs`,
+  written, unexecuted).
+- Probe admission (`pci.rs`, `prepare_native.rs`, `interface.rs`,
+  `rebuild_native.rs`, `power_runtime.rs`). `bring_up` retains a
+  `rtl92ce_pci_ids` function (BAR2 at least `rtl8192ce::MMIO_SIZE`) only
+  when the facts `configure_rtl8192ce` re-derives already hold:
+  `_rtl92ce_read_chip_version` qualifies (no test chip, 1T2R bonding or
+  unknown cut, so the RF type is `RF_1T1R` or `RF_2T2R`), provisioned map,
+  not a BT-coexist board, EFUSE MAC equal, TX-power areas decode; otherwise
+  it stays diagnostic. `prepare_native::prepare_rtl8192ce` (channels 1-11):
+  registry firmware, generic linked-ring `allocate`, `prepare`,
+  `configure_rtl8192ce(factory, firmware.device_id())`, then
+  `admit_rtl8192ce` (`N92C` envelope for the probed device and measured RF
+  type, 20 MHz permission on the channel, `configure_rtl8192ce_channel`,
+  `configure_rtl8192ce_mac`, `stage_rtl8192ce_calibration`), shared with
+  the interface readiness path. `prepare_bus_power` keeps ASPM disabled
+  (92CE `enable_aspm` not composed); `allow_channel` is the `N92C` 20 MHz
+  permission (RF type from the live version). Rebuild: `power_down`
+  accepts the owner's `ce92_quiesce` card disable by its `SYS_FUNC_EN + 1
+  == 0x51` receipt (else runs `_rtl92ce_poweroff_adapter` for the live
+  qualified version, `power_runtime::disable_rtl8192ce`); there is no
+  separate enable (the fresh owner's firmware run issues the
+  `_rtl92ce_init_mac` prefix once, as `rtl92ce_hw_init`), then
+  `verify_factory` and a fresh `Owner`. Not composed: BT coexistence, ASPM,
+  WoWLAN, LDPC/STBC, DIG / dynamic TX power / TX-power tracking / EDCA
+  turbo (above). No board envelope values are supplied (format only), so
+  no physical board is admitted without its signed `N92C` asset.
   Tests (`rtl8192ce/phy_tests.rs`, written, unexecuted):
   `smoke_rtl8192ce_rf_serial_read_write_both_paths`,
   `smoke_rtl8192ce_h2c_rate_mask_and_irq_profile`,
