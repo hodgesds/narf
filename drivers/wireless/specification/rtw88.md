@@ -3068,10 +3068,19 @@ grant is published. Remaining blockers, verified against the tree:
    VID/DID 0x10ec/0xc821. RTL8821CU needs its own USB VID/PID-bound signed
    records. No RTL8821CU board/power measurement exists, and none is
    invented.
-4. Tables. Linux selects BB/AGC/RF rows with `cond.intf = INTF_USB`
-   (`phy.c::rtw_phy_setup_phy_cond`). The retained C21 tables were checked
-   for PCIe only. The USB selection must be re-derived and checked before any
-   PHY stage runs.
+4. Tables (resolved). Linux selects rows with `cond.intf = INTF_USB`
+   (`phy.c::rtw_phy_setup_phy_cond`, `check_positive`).
+   `phy/rtl8821c.rs::Info::interface` (`Interface::{Pcie, Usb}`, set with
+   `Info::on`) feeds `rows`, which every table application and
+   `bind_tables` use. Re-derived from `rtw8821c_table.c`: the only
+   interface-qualified branch headers in `rtw8821c_mac`/`_bb`/`_agc`/
+   `_agc_btg_type2`/`_rf_a` are `INTF_SDIO` (`_bb`, `_rf_a`), so for every
+   admitted cut 0..=6, package 0/1 and RFE 0/2/4/6 the USB parse emits the
+   PCIe rows (138/1669/386/128/586) and USB selects the same frozen tables.
+   `bind_tables` prefixes `intf-usb` for USB only, so PCIe hashes are
+   unchanged and USB bindings never alias PCIe ones. Written, unexecuted:
+   `smoke_rtw8821cu_phy_usb_interface_rows_match_linux_references` (USB
+   replays the frozen Linux callback hashes).
 
 RTL8822BU needs the 8822B chip runtime (`rtw88 | rtl8822be` is open: no
 8822B firmware/MAC/PHY/RF tables are ported), so the RTL8822BU row stays

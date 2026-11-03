@@ -38,6 +38,7 @@ fn info(cut: u8, package: u8, rfe: u8) -> Info {
         rfe,
         crystal: 0x33,
         channel_filters: [0; 3],
+        interface: phy8821c::Interface::Pcie,
     }
 }
 pub(super) fn factory() -> Factory8821c {
@@ -298,4 +299,42 @@ fn smoke_rtw8821ce_phy_cancel_retains_outer_inner_owner_and_blocks_reconstructio
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8821c",
     smoke_rtw8821ce_phy_cancel_retains_outer_inner_owner_and_blocks_reconstruction
+);
+/// `rtw_phy_setup_phy_cond` with `cond.intf = INTF_USB` (RTL8821CU): the
+/// Linux table parse emits the PCIe rows for every admitted cut/package/
+/// RFE, so the USB interface replays the frozen Linux callback references
+/// exactly, while the table binding hash separates the two interfaces.
+fn smoke_rtw8821cu_phy_usb_interface_rows_match_linux_references() -> TestResult {
+    for (cut, packages) in LINUX_C21_HASHES.iter().enumerate() {
+        for (package, rfes) in packages.iter().enumerate() {
+            for (rfe_index, kinds) in rfes.iter().enumerate() {
+                let pcie = info(cut as u8, package as u8, (rfe_index * 2) as u8);
+                let usb = pcie.on(phy8821c::Interface::Usb);
+                for (kind, expected) in kinds.iter().enumerate() {
+                    if phy8821c::rows(usb, kind) != phy8821c::rows(pcie, kind) {
+                        return TestResult::Fail("INTF_USB selected different C21 rows");
+                    }
+                    let mut io = seeded();
+                    if narf_scheduler::block_on(phy8821c::apply_table(&mut io, usb, kind)).is_err()
+                        || hash(&io.trace) != *expected
+                    {
+                        return TestResult::Fail("USB C21 table callbacks diverged");
+                    }
+                }
+                let mut a = narf_crypto::sha256::Sha256::new();
+                let mut b = narf_crypto::sha256::Sha256::new();
+                if phy8821c::bind_tables(&mut a, pcie).is_err()
+                    || phy8821c::bind_tables(&mut b, usb).is_err()
+                    || a.finalize() == b.finalize()
+                {
+                    return TestResult::Fail("table binding does not separate USB from PCIe");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821cu_phy_usb_interface_rows_match_linux_references
 );
