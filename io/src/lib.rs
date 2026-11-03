@@ -15,6 +15,10 @@ pub mod coherent_pool;
 mod coherent_pool_tests;
 pub mod iommu;
 mod iommu_e2e_tests;
+#[doc(hidden)]
+pub mod iommu_model;
+mod iommu_perdomain_tests;
+pub mod iova;
 pub mod pool;
 mod tests;
 
@@ -205,10 +209,16 @@ pub struct DmaBuffer {
     /// Kernel virtual base of a reserved-pool buffer (Linux
     /// `dma_coherent_mem::virt_base` + page offset). `None` for buddy
     /// buffers, whose CPU view is the direct map.
-    cpu_base: Option<usize>,
+    cpu_base: Option<core::num::NonZeroUsize>,
     /// Reserved pool and first page this buffer occupies; released to the
     /// pool (never the buddy) on drop.
     pool: Option<(Arc<CoherentPool>, usize)>,
+    /// Per-domain IOMMU mapping `(domain, iova)` when the buffer was
+    /// allocated for a device in [`iommu::IommuMode::PerDomain`]
+    /// (Linux `iommu_dma_alloc` → `__iommu_dma_map`). The device sees
+    /// `iova`, never `phys`.
+    /// Boxed so `DmaBuffer` does not grow for the common unmapped case.
+    iommu: Option<alloc::boxed::Box<(Arc<iommu::IommuDomain>, u64)>>,
 }
 
 impl fmt::Debug for DmaBuffer {
@@ -219,6 +229,7 @@ impl fmt::Debug for DmaBuffer {
             .field("domain", &self.domain)
             .field("coherency", &self.coherency)
             .field("pool_backed", &self.pool.is_some())
+            .field("iova", &self.iommu.as_deref().map(|(_, iova)| *iova))
             .finish_non_exhaustive()
     }
 }
@@ -272,13 +283,16 @@ impl DmaBuffer {
     /// registers; it cannot be dereferenced (see [`DmaAddr`]).
     #[inline]
     pub fn dma_addr(&self) -> DmaAddr {
-        DmaAddr(self.phys.raw())
+        match self.iommu.as_deref() {
+            Some((_, iova)) => DmaAddr(*iova),
+            None => DmaAddr(self.phys.raw()),
+        }
     }
 
     /// Device-side address of a sub-range, for ring arithmetic.
     #[inline]
     pub fn dma_addr_at(&self, offset: u64) -> DmaAddr {
-        DmaAddr(self.phys.raw() + offset)
+        self.dma_addr().offset(offset)
     }
 
     /// The pointer the CPU should use, resolved through the kernel direct
@@ -289,7 +303,7 @@ impl DmaBuffer {
     /// resolves through the pool's own non-cacheable mapping instead.
     #[inline]
     pub fn cpu_ptr<T>(&self) -> *const T {
-        if let Some(base) = self.cpu_base {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
             return base as *const T;
         }
         self.phys.kernel_ptr::<T>()
@@ -301,7 +315,7 @@ impl DmaBuffer {
     /// holds only a shared reference.
     #[inline]
     pub fn cpu_mut_ptr<T>(&self) -> *mut T {
-        if let Some(base) = self.cpu_base {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
             return base as *mut T;
         }
         self.phys.kernel_mut_ptr::<T>()
@@ -310,7 +324,7 @@ impl DmaBuffer {
     /// Const CPU pointer at a byte offset.
     #[inline]
     pub fn cpu_ptr_at<T>(&self, offset: u64) -> *const T {
-        if let Some(base) = self.cpu_base {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
             return (base + offset as usize) as *const T;
         }
         crate::PhysAddr::new(self.phys.raw() + offset).kernel_ptr::<T>()
@@ -320,7 +334,7 @@ impl DmaBuffer {
     /// [`Self::dma_addr_at`] for descriptor-ring walks.
     #[inline]
     pub fn cpu_mut_ptr_at<T>(&self, offset: u64) -> *mut T {
-        if let Some(base) = self.cpu_base {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
             return (base + offset as usize) as *mut T;
         }
         crate::PhysAddr::new(self.phys.raw() + offset).kernel_mut_ptr::<T>()
@@ -474,12 +488,51 @@ impl DmaBuffer {
         self.pool.is_some()
     }
 
-    /// Return the storage to its owner exactly once.
+    /// IOMMU domain ID this buffer is mapped in, when its DMA address
+    /// is a per-domain IOVA rather than the physical address.
+    #[inline]
+    pub fn iommu_domain_id(&self) -> Option<u16> {
+        self.iommu.as_deref().map(|(d, _)| d.domain_id())
+    }
+
+    /// Map this buffer into `domain` (read/write) with an IOVA at or
+    /// below `dma_mask`, making [`Self::dma_addr`] return the IOVA.
+    pub(crate) fn map_into(
+        &mut self,
+        domain: &Arc<iommu::IommuDomain>,
+        dma_mask: u64,
+        pci: bool,
+    ) -> Result<(), IoError> {
+        if self.iommu.is_some() {
+            return Err(IoError::DomainMismatch);
+        }
+        let iova = domain.map_below(
+            self.phys.raw(),
+            self.len as u64,
+            iommu::IommuPerms::READ_WRITE,
+            dma_mask,
+            pci,
+        )?;
+        self.iommu = Some(alloc::boxed::Box::new((domain.clone(), iova)));
+        Ok(())
+    }
+
+    /// Return the storage to its owner exactly once. A per-domain IOVA
+    /// is torn down first (PTE clear → IOTLB invalidate + wait → IOVA
+    /// free); if that invalidation fails the frames are leaked rather
+    /// than reused, since the device may still translate to them.
     fn release(&mut self) {
         if self.freed {
             return;
         }
         self.freed = true;
+        if let Some(mapping) = self.iommu.take() {
+            let (domain, iova) = *mapping;
+            if domain.unmap(iova, self.len as u64).is_err() {
+                self.pool = None;
+                return;
+            }
+        }
         match self.pool.take() {
             Some((pool, page)) => pool.release(page, self.order),
             None => free_pages(PhysFrame::new(self.phys), self.order),
@@ -718,6 +771,7 @@ fn alloc_with(
         slot_index: None,
         cpu_base: None,
         pool: None,
+        iommu: None,
     })
 }
 

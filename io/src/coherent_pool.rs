@@ -250,8 +250,9 @@ impl CoherentPool {
             coherency: Coherency::Coherent,
             freed: false,
             slot_index: None,
-            cpu_base: Some(cpu),
+            cpu_base: core::num::NonZeroUsize::new(cpu),
             pool: Some((self.clone(), first)),
+            iommu: None,
         })
     }
 }
@@ -263,6 +264,9 @@ impl CoherentPool {
 pub struct DmaDevice {
     coherence: DmaCoherence,
     pool: Option<Arc<CoherentPool>>,
+    /// The device's IOMMU DMA domain in `IommuMode::PerDomain` (Linux
+    /// `iommu_get_dma_domain(dev)`); `None` = DMA addresses are physical.
+    iommu: Option<Arc<crate::iommu::IommuDomain>>,
 }
 
 impl DmaDevice {
@@ -271,6 +275,7 @@ impl DmaDevice {
         Self {
             coherence: DmaCoherence::Coherent,
             pool: None,
+            iommu: None,
         }
     }
 
@@ -288,7 +293,24 @@ impl DmaDevice {
             (None, DmaCoherence::NonCoherent) => default_pool,
             (None, DmaCoherence::Coherent) => None,
         };
-        Self { coherence, pool }
+        Self {
+            coherence,
+            pool,
+            iommu: None,
+        }
+    }
+
+    /// Route this device's DMA through `domain`: every
+    /// [`alloc_coherent_for`] buffer is mapped there and its
+    /// `dma_addr()` is the IOVA.
+    pub fn with_iommu_domain(mut self, domain: Arc<crate::iommu::IommuDomain>) -> Self {
+        self.iommu = Some(domain);
+        self
+    }
+
+    /// The device's IOMMU DMA domain, if it translates.
+    pub fn iommu_domain(&self) -> Option<&Arc<crate::iommu::IommuDomain>> {
+        self.iommu.as_ref()
     }
 
     pub fn coherence(&self) -> DmaCoherence {
@@ -305,18 +327,36 @@ impl DmaDevice {
 /// dma_mask)`: [`crate::alloc_coherent_masked`] for a coherent device
 /// without a pool (bit-identical), the device's reserved pool otherwise, and
 /// [`IoError::NoCoherentPool`] for a non-coherent device without one.
+///
+/// With an IOMMU domain ([`DmaDevice::with_iommu_domain`]) this is Linux
+/// `iommu_dma_alloc`: the frames may lie anywhere, `dma_mask` bounds the
+/// IOVA instead, and the buffer's `dma_addr()` is that IOVA. In
+/// `IommuMode::PerDomain` a device without a domain is refused
+/// (`NotMapped`): its physical addresses would fault.
 pub fn alloc_coherent_for(
     dev: &DmaDevice,
     len: usize,
     domain: DomainId,
     dma_mask: u64,
 ) -> Result<DmaBuffer, IoError> {
-    match (&dev.pool, dev.coherence) {
-        (Some(pool), _) => pool.alloc(len, domain, dma_mask),
-        (None, DmaCoherence::Coherent) => {
-            let mask = (dma_mask != u64::MAX).then_some(dma_mask);
-            alloc_with(len, domain, Coherency::Coherent, mask)
+    let phys_mask = match &dev.iommu {
+        Some(_) => u64::MAX,
+        None if crate::iommu::mode() == crate::iommu::IommuMode::PerDomain => {
+            return Err(IoError::NotMapped)
         }
-        (None, DmaCoherence::NonCoherent) => Err(IoError::NoCoherentPool),
+        None => dma_mask,
+    };
+    let mut buf = match (&dev.pool, dev.coherence) {
+        (Some(pool), _) => pool.alloc(len, domain, phys_mask)?,
+        (None, DmaCoherence::Coherent) => {
+            let mask = (phys_mask != u64::MAX).then_some(phys_mask);
+            alloc_with(len, domain, Coherency::Coherent, mask)?
+        }
+        (None, DmaCoherence::NonCoherent) => return Err(IoError::NoCoherentPool),
+    };
+    if let Some(iommu) = &dev.iommu {
+        // On failure `buf` drops and returns its frames: nothing was mapped.
+        buf.map_into(iommu, dma_mask, true)?;
     }
+    Ok(buf)
 }

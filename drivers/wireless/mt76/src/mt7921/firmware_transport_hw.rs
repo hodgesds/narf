@@ -1478,8 +1478,11 @@ impl Transport {
     /// # Safety
     /// Caller exclusively owns this posted CONNAC2 device, its BAR0/L1 latch,
     /// DMA/reset/power controls and permanent mappings. No other client may
-    /// access them until verified shutdown. The PCI function must be in an
-    /// identity DMA domain (or have no IOMMU); a non-coherent function needs
+    /// access them until verified shutdown. Under a per-domain IOMMU the
+    /// function's default domain (from `narf_bus::dma::configure`) maps
+    /// every ring and frame buffer, and the programmed addresses are those
+    /// IOVAs (Linux mt76 via `dma_alloc_coherent` → iommu-dma); without
+    /// one the bus addresses are physical. A non-coherent function needs
     /// a reserved `shared-dma-pool` (see `narf_bus::dma::configure`). This is not VF/reset
     /// recovery. Firmware must be prepared for this exact chip. Initially
     /// PCI bus mastering must be disabled by the caller.
@@ -1496,9 +1499,6 @@ impl Transport {
                 || !matches!(device.id.device, 0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920)
             {
                 return Err(Error::Bounds);
-            }
-            if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
-                return Err(Error::DmaAddress);
             }
             if narf_bus::pci::read_command(&authority, &device).map_err(|_| Error::Authority)?
                 & narf_bus::pci::cmd::BUS_MASTER

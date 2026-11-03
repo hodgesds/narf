@@ -13,6 +13,8 @@ mod ap_packet_hw_tests;
 #[path = "ap_timing_hw_tests.rs"]
 mod ap_timing_hw_tests;
 
+#[path = "firmware_transport_hw_iommu_tests.rs"]
+mod iommu_tests;
 #[path = "firmware_transport_hw_ncdma_tests.rs"]
 mod ncdma_tests;
 #[path = "tx_pipeline_hw_tests.rs"]

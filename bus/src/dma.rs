@@ -20,6 +20,9 @@
 //! * A DTB-less aarch64 boot is NARF's QEMU `virt` fallback, whose PCIe and
 //!   virtio are coherent; it keeps the coherent configuration. aarch64 boots
 //!   never carry ACPI (`acpi_rsdp_phys = None`), so `_CCA` has no source.
+//! * In `narf_io::iommu::IommuMode::PerDomain` a PCI function also gets its
+//!   default IOMMU DMA domain (Linux `iommu_probe_device` →
+//!   `iommu_setup_dma_ops`), so its coherent buffers carry IOVAs.
 
 use narf_io::{CoherentPool, DmaCoherence, DmaDevice, IoError};
 
@@ -30,7 +33,27 @@ use crate::BusDevice;
 /// Errors: a non-PCI device on a Devicetree boot (`NotMapped`: platform
 /// device ↔ node association is not implemented for DMA), or a described
 /// pool that cannot be mapped (`PoolRejected` / `NotMapped`).
+///
+/// In `IommuMode::PerDomain` the result also carries the function's default
+/// IOMMU domain ([`narf_io::iommu::default_domain`]); a non-PCI device or a
+/// PCI segment other than 0 (the 16-bit requester ID has no segment) is
+/// `NotMapped` there.
 pub fn configure(device: &BusDevice) -> Result<DmaDevice, IoError> {
+    let dma = configure_coherence(device)?;
+    if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+        return Ok(dma);
+    }
+    let crate::BusKind::Pcie { addr, .. } = device.kind else {
+        return Err(IoError::NotMapped);
+    };
+    if addr.segment != 0 {
+        return Err(IoError::NotMapped);
+    }
+    let bdf = narf_io::iommu::Bdf::new(addr.bus, addr.device, addr.function);
+    Ok(dma.with_iommu_domain(narf_io::iommu::default_domain(bdf)?))
+}
+
+fn configure_coherence(device: &BusDevice) -> Result<DmaDevice, IoError> {
     #[cfg(target_arch = "aarch64")]
     {
         const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;

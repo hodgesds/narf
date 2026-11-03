@@ -154,6 +154,60 @@ inside it keeps that cacheable alias (the same residual Linux accepts for
 (`arch_dma_prep_coherent`), and nothing in the kernel touches the alias.
 Removing `no-map` ranges from the linear map is a `memory/` change.
 
+**Per-domain IOMMU translation** (module `iommu`, `iova`; Linux
+`iommu.c` + `dma-iommu.c` + `iova.c` + `generic_pt/fmt/{amdv1,vtdss}.h`).
+
+```rust
+pub enum PageTableFormat { AmdV1, VtdSecondStage }   // 4-level, 48-bit IOVA
+pub trait IommuHw: Send + Sync {                      // one per unit type
+    fn name(&self) -> &'static str;
+    fn format(&self) -> PageTableFormat;
+    fn coherent_walk(&self) -> bool;                  // else PTE stores are cleaned
+    fn attach(&self, bdf: Bdf, domain_id: u16, root: u64, levels: u8) -> Result<(), IoError>;
+    fn detach(&self, bdf: Bdf, domain_id: u16) -> Result<(), IoError>;
+    /// Invalidate + completion wait; Ok = no cached translation survives.
+    fn flush_iotlb(&self, domain_id: u16, iova: u64, len: u64) -> Result<(), IoError>;
+    fn sync_map(&self, domain_id: u16, iova: u64, len: u64) -> Result<(), IoError>; // default Ok
+}
+pub fn enable_per_domain(hw: &'static dyn IommuHw) -> Result<(), IoError>; // → IommuMode::PerDomain
+pub fn default_domain(bdf: Bdf) -> Result<Arc<IommuDomain>, IoError>;     // iommu_get_dma_domain
+pub fn release_default_domain(bdf: Bdf) -> Result<(), IoError>;
+pub fn walk(format: PageTableFormat, root: u64, iova: u64) -> Option<u64>; // software walk
+impl IommuDomain {
+    pub fn attach(&self, bdf: Bdf) -> Result<(), IoError>;  // exclusive: DomainMismatch if attached elsewhere
+    pub fn detach(&self, bdf: Bdf) -> Result<(), IoError>;
+    pub fn map(&self, iova: u64, phys: u64, len: u64, perms: IommuPerms) -> Result<u64, IoError>;
+    pub fn map_below(&self, phys: u64, len: u64, perms: IommuPerms, dma_mask: u64, pci: bool)
+        -> Result<u64, IoError>;                              // iommu_dma_alloc_iova (PCI: 32-bit first)
+    pub fn unmap(&self, iova: u64, len: u64) -> Result<(), IoError>;
+    pub fn translate(&self, iova: u64) -> Option<(u64, IommuPerms)>;
+    pub fn page_table_root(&self) -> Option<(PageTableFormat, u64)>;
+    pub fn quarantined_pages(&self) -> u64;
+}
+pub struct IovaAllocator;  // new / reserve / alloc(pages, limit_pfn, size_aligned) /
+                           // alloc_fixed / free / quarantine
+impl DmaDevice { pub fn with_iommu_domain(self, d: Arc<IommuDomain>) -> Self;
+                 pub fn iommu_domain(&self) -> Option<&Arc<IommuDomain>>; }
+impl DmaBuffer { pub fn iommu_domain_id(&self) -> Option<u16>; }
+```
+
+In `PerDomain`, `alloc_coherent_for(dev, ..)` with a domain allocates frames
+anywhere, maps them read/write at a size-aligned top-down IOVA `<= dma_mask`
+(32-bit tried first: Linux PCI SAC behaviour) and `DmaBuffer::dma_addr()`
+returns the IOVA; `phys_addr()` stays physical. A device without a domain is
+`NotMapped`, as are device-less `map_phys` / `unmap_iova`.
+`narf_bus::dma::configure` attaches a PCI function (segment 0) to its default
+domain. Domain IDs start at 1 and are never recycled. Each domain reserves
+the x86 interrupt window `0xfee0_0000..=0xfeef_ffff` (and, for AMD v1, the
+HyperTransport window `0xfd_0000_0000..=0xff_ffff_ffff`). Intermediate
+tables live until the domain is destroyed; a domain dropped with devices
+still attached leaks its tables. `iommu_model::ModelIommu` is a recording
+software backend for tests only. **No silicon backend exists yet**: `init`
+still selects `Identity`, so nothing in the boot path enters `PerDomain`.
+AMD-Vi (device table + command buffer + `COMPLETION_WAIT`), VT-d (context
+tables + queued invalidation) and SMMUv3 (STE + CMDQ `CMD_SYNC`) backends
+are open work.
+
 `DmaPool` is deliberately per queue, rather than a global allocator cache:
 that maintains NUMA/device affinity and prevents unrelated RX/TX completion
 cores from contending on a shared recycler. The hot path treats an empty pool
@@ -168,6 +222,10 @@ the allocating APIs.
   equal the calling task's `DomainId`; mismatch is a panic, not a
   return value. Without this runtime check the correspondence is
   aspirational, not load-bearing.
+- Per-domain unmap is strict: PTEs cleared → `IommuHw::flush_iotlb`
+  (invalidate + completion wait) → IOVA freed → frames freed. A failed
+  flush quarantines the IOVA and leaks the frames (`DmaBuffer` drop);
+  neither is reused while a stale translation may exist.
 - Dropping a `DmaBuffer` tears down the IOMMU mapping before freeing
   physical storage. **IOTLB invalidation must complete before
   `PhysFrame` is returned to `memory/`.** Completion mechanism:
