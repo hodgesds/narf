@@ -16,6 +16,8 @@ struct Bus {
     busy: bool,
     header_only: bool,
     firmware_error: Option<u32>,
+    /// Reply with BCDC_DCMD_IF bits cleared (no ifidx echo).
+    zero_ifidx: bool,
 }
 impl Transport for Bus {
     fn read32(&mut self, _: Function, _: u32) -> Result<u32, TransportError> {
@@ -62,6 +64,9 @@ impl PacketTransport for Bus {
             data.extend_from_slice(&ethernet());
             self.rx.push_back(frame(2, CHANNEL_DATA, 8, &data));
             let mut reply = request;
+            if self.zero_ifidx {
+                reply.flags &= !bcdc_flag::IF_MASK;
+            }
             if !self.header_only {
                 reply.len = 4;
             }
@@ -505,6 +510,15 @@ fn smoke_cyw_f2_secondary_ifidx_demux() -> TestResult {
     {
         return TestResult::Fail("secondary IOCTL ifidx not encoded/correlated");
     }
+    // Linux bcdc.c correlates by request id only: a reply without the
+    // ifidx echo still completes the secondary request.
+    runtime.transport.as_mut().unwrap().zero_ifidx = true;
+    if ready(runtime.command_on(1, ioctl::Direction::Get, 262, b"ver\0", 4))
+        != Some(Ok(vec![1, 2, 3, 4]))
+    {
+        return TestResult::Fail("secondary IOCTL reply required an ifidx echo");
+    }
+    runtime.transport.as_mut().unwrap().zero_ifidx = false;
     // Close discards queued data; failure clears every secondary record.
     if rx(&mut runtime, frame(9, CHANNEL_DATA, 8, &data)) != Ok(1) || !runtime.vif_close(1) {
         return TestResult::Fail("close");

@@ -1005,7 +1005,11 @@ implement it over `brcmfmac::vif_demux` (`Demux`, `route`).
 
 - SDIO BCDC (`cyw43439::runtime`): RX data uses `BCDC_GET_IF_IDX` (BDC
   `flags2` low nibble), TX sets it (`BCDC_SET_IF_IDX`), and IOCTLs carry
-  `BCDC_DCMD_IF_SHIFT`; the reply must echo the pending ifidx.
+  `BCDC_DCMD_IF_SHIFT`. As in `bcdc.c` `brcmf_proto_bcdc_cmplt` /
+  `brcmf_proto_bcdc_query_dcmd`, a reply is correlated by its
+  `BCDC_DCMD_ID` request id (plus command/direction); its ifidx bits are
+  not consulted, so a zeroed or different echo still completes the
+  request (`smoke_cyw_f2_secondary_ifidx_demux`).
 - PCIe msgbuf (`brcmfmac::runtime` + `station_transport::Adapter`): flow
   rings are keyed by (ifidx, fifo, da) with `create->msg.ifidx`
   (`msgbuf.c::brcmf_msgbuf_flowring_create_worker`), TX posts carry the

@@ -47,8 +47,6 @@ struct Pending {
     command: u32,
     direction: ioctl::Direction,
     maximum: usize,
-    /// BCDC `BCDC_DCMD_IF_SHIFT` ifidx of the request; the reply must echo it.
-    if_idx: u8,
 }
 
 /// One interface (firmware ifidx zero), with no aggregation or firmware
@@ -344,10 +342,14 @@ impl<T: PacketTransport> Runtime<T> {
         let Some(pending) = self.pending else {
             return Ok(());
         };
-        // Stale, foreign-interface and wrong-command replies cannot affect
-        // the current operation, including replies carrying an ERROR flag.
+        // Stale and wrong-command replies cannot affect the current
+        // operation, including replies carrying an ERROR flag. As in Linux
+        // bcdc.c (`brcmf_proto_bcdc_cmplt`/`brcmf_proto_bcdc_query_dcmd`),
+        // a reply is correlated by its BCDC_DCMD_ID request id; the
+        // BCDC_DCMD_IF_SHIFT ifidx of the reply is not consulted, so a
+        // secondary-interface reply with a zeroed or different echo still
+        // completes its own request.
         if header.xact_id() != pending.id
-            || header.if_idx() != pending.if_idx
             || header.cmd != pending.command
             || header.is_set() != (pending.direction == ioctl::Direction::Set)
         {
@@ -427,7 +429,6 @@ impl<T: PacketTransport> Runtime<T> {
             command,
             direction,
             maximum,
-            if_idx,
         };
         self.pending = Some(pending);
         self.response = None;
