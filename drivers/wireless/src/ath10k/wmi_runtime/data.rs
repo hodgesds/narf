@@ -504,7 +504,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.station.peer.is_some() || self.station.data.is_some() {
             return Err(Error::Failed);
         }
-        Ok(self.station_own()?)
+        self.station_own()
     }
     pub fn fail_station_data(&mut self) {
         self.beacon_hints.retire();

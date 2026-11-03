@@ -2144,10 +2144,49 @@ will bind; none of them grants RF, peer, key or data authority.
   owner exists.
 - **Admission.** `p2p_combinations` reproduces `ath10k_tlv_if_comb`
   (STA≤2; AP/P2P_CLIENT/P2P_GO≤2; P2P_DEVICE≤1; 4 interfaces, 1 channel)
-  or `ath10k_tlv_qcs_if_comb` with TLV service 39 ADAPTIVE_OCS (2
-  channels), minus the IBSS combination, and nothing for non-TLV dialects
-  or `ATH10K_FW_FEATURE_NO_P2P` (bit 3). It is not yet returned from
-  `interface_combinations`.
+  or, with TLV service 39 ADAPTIVE_OCS, `ath10k_tlv_qcs_if_comb`: that
+  same one-channel entry followed by the two-channel
+  `ath10k_tlv_qcs_if_limit` entry (STA≤2; P2P_CLIENT≤2; AP/P2P_GO≤1;
+  P2P_DEVICE≤1), minus the IBSS combination, and nothing for non-TLV
+  dialects or `ATH10K_FW_FEATURE_NO_P2P` (bit 3). It is not yet returned
+  from `interface_combinations`. Linux also sends
+  `ath10k_wmi_adaptive_qcs(ar, true)` at start with that service; this
+  driver does not, so only the one-channel entry may be advertised until it
+  does.
+- **Per-vdev station slots.** The station owner (BSS `peer`, `data`,
+  `power_save`, `protection`, `coexistence`, `peer_pmf_offload`) is a
+  `StationSlot` (Linux per-`arvif` state). `Radio.station` is the home slot
+  on the managed vdev with the INIT address (unchanged behaviour); an
+  optional `p2p_client` slot records its own vdev and address. A
+  `ClientScope` exchanges the slots so the existing station prepare,
+  association, key, data and management paths run on the client's vdev
+  (`station_vdev`, `station_own`) and restores them on drop (including
+  cancellation). PEER_MAP must carry the peer's own vdev (byte 1,
+  `ath10k_peer_map_event`). The data step demultiplexes what it polls
+  (`htt_rx.c` delivery by `peer->vdev_id`): a legacy RX batch by peer id,
+  an in-order indication by vdev and peer id, a WMI management frame whose
+  A2/A3 is the sibling's BSSID, peer-scoped HTT notes, and PEER_MAP/UNMAP
+  the slot did not record are parked in the sibling's bounded inbox (256;
+  overflow fails that slot's data owner); TX completions follow the MSDU
+  id to the slot that queued it (`txrx.c::ath10k_txrx_tx_unref`), also on
+  the protection, coexistence and data-start receipt drains. Radio-level
+  observers (scan, ROC, beacon hints) see each event once, when polled.
+- **P2P client vdev (radio owner).** `wmi_runtime/p2p_client.rs`
+  `start_p2p_client` follows `ath10k_add_interface` for
+  `NL80211_IFTYPE_P2P_CLIENT`: TLV P2P firmware, no client yet, no
+  scan/ROC/AP, a unicast address other than the INIT address, lowest free
+  id, `WMI_VDEV_CREATE` (STA, subtype P2P_CLI) and the vdev NSS parameter
+  (the same two commands as the managed station vdev), then a client slot.
+  `stop_p2p_client` needs the slot's peer and data retired, sends
+  `WMI_VDEV_DELETE` and with SYNC_DELETE waits for 0x5006
+  (`wait_vdev_delete`, shared with the P2P_DEVICE vdev). 0x5006 carries no
+  vdev id (`ath10k_wmi_tlv_event_vdev_delete_resp`); Linux serialises
+  deletes under `conf_mutex` and the radio lock is held across delete and
+  wait here, so at most one delete is outstanding. One-channel rule:
+  while the sibling slot has a peer, a slot's BSS prepare is refused
+  (`Unsupported`, before any coexistence scan) unless it is on the same
+  primary frequency. `vdev_address` answers the client vdev with its
+  address.
 
 - **P2P_DEVICE vdev (radio owner only).** `wmi_runtime/p2p_device.rs`
   `start_p2p_device` follows `mac.c::ath10k_add_interface` for
@@ -2209,13 +2248,14 @@ will bind; none of them grants RF, peer, key or data authority.
   `-EBUSY` before publication (a P2P scan concurrent with an associated
   station is not supported: the associated dwell owner is vdev0-only).
 
-Remaining before the row can be claimed: a P2P client netdev role (iftype 8,
-STA vdev subtype P2P_CLI) on its own vdev beside the home station. The
-builders are ready; the blocker is that `Radio` holds exactly one station
-owner (`peer`, `data`, `power_save`, `protection`, `coexistence`,
-`peer_pmf_offload`, HTT RX admission by `peer.vdev`), so a concurrent
-second station needs those moved into a per-vdev station slot with HTT
-RX/TX-completion demux by vdev/peer and a second netdev data ring; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
+Remaining before the row can be claimed: the P2P client netdev role
+(iftype 8): a second netdev with its own rings and service worker, created
+by NEW_INTERFACE and removed by DEL_INTERFACE, whose scan/CONNECT/data
+paths drive the radio inside a `ClientScope` and whose create/delete call
+`start_p2p_client`/`stop_p2p_client` (the radio owner, slots and demux are
+in place); other event consumers that still poll HTT outside the data step
+(station prepare, flush and protection loops) queue rather than park
+sibling events and must be audited for a concurrent client; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
 into the beacon publication and `NoaOwner` into P2P_NOA event routing and
 probe-response TX; then advertisement through `P2P_ADVERTISED`,
 `p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
@@ -2232,7 +2272,8 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_station_builders_carry_vdev`,
 `smoke_ath10k_p2p_ap_builders_carry_vdev`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
-`smoke_ath10k_p2p_device_scan_admits_listen_probe_response`.
+`smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
+`smoke_ath10k_p2p_station_slot_parks_bounded`.
 
 ## 4. Invariants
 

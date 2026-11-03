@@ -87,22 +87,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.failed = true;
         self.send_scan_command(&command, validate).await?;
         if sync {
-            let deadline = narf_time::Deadline::after_ms(5000);
-            loop {
-                validate()?;
-                if deadline.expired() {
-                    return Err(Error::Timeout);
-                }
-                match self.htt.poll_now()? {
-                    htt::Event::Wmi(bytes)
-                        if wire::word(&bytes, 0)? & 0xffffff == DELETE_RESPONSE =>
-                    {
-                        break;
-                    }
-                    htt::Event::Idle | htt::Event::Progress => narf_scheduler::yield_now().await,
-                    event => self.queue(event)?,
-                }
-            }
+            self.wait_vdev_delete(validate).await?;
         }
         self.p2p_device = None;
         self.p2p_device_mac = [0; 6];
@@ -112,6 +97,31 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .release(vdev.id())?;
         self.failed = false;
         Ok(())
+    }
+    /// `ath10k_vdev_delete_sync`: wait up to 5 s for
+    /// `WMI_TLV_VDEV_DELETE_RESP`. The event carries no vdev id
+    /// (`wmi-tlv.c::ath10k_wmi_tlv_event_vdev_delete_resp` only completes
+    /// `ar->vdev_delete_done`); Linux correlates it by holding `conf_mutex`
+    /// across the delete, and here the radio lock is held across the delete
+    /// and this wait, so at most one delete is ever outstanding.
+    pub(super) async fn wait_vdev_delete(
+        &mut self,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(5000);
+        loop {
+            validate()?;
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            match self.htt.poll_now()? {
+                htt::Event::Wmi(bytes) if wire::word(&bytes, 0)? & 0xffffff == DELETE_RESPONSE => {
+                    return Ok(());
+                }
+                htt::Event::Idle | htt::Event::Progress => narf_scheduler::yield_now().await,
+                event => self.queue(event)?,
+            }
+        }
     }
     /// The address frames on `vdev` carry as A2 (and A3 for Public Action)
     /// and the directed-RX address on it: the INIT address for the managed
@@ -123,6 +133,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         if self.p2p_device_vdev() == Some(vdev) {
             return Ok(self.p2p_device_mac);
+        }
+        if let Some((id, own)) = self.p2p_client_identity() {
+            if id == vdev {
+                return Ok(own);
+            }
         }
         Err(Error::Failed)
     }

@@ -276,11 +276,13 @@ fn smoke_ath10k_p2p_tlv_combinations() -> TestResult {
     {
         return TestResult::Fail("ath10k_tlv_if_comb");
     }
-    if qcs.len() != 1
-        || qcs[0].max_channels != 2
-        || qcs[0].limits.len() != 4
-        || qcs[0].limits[1].iftypes != [8]
-        || qcs[0].limits[2].iftypes != [3, 9]
+    if qcs.len() != 2
+        || qcs[0] != plain[0]
+        || qcs[1].max_channels != 2
+        || qcs[1].max_interfaces != 4
+        || qcs[1].limits.len() != 4
+        || qcs[1].limits[1].iftypes != [8]
+        || qcs[1].limits[2].iftypes != [3, 9]
     {
         return TestResult::Fail("ath10k_tlv_qcs_if_comb");
     }

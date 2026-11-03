@@ -404,28 +404,39 @@ pub(super) fn p2p_combinations(
         max,
         iftypes: iftypes.to_vec(),
     };
-    let limits = if adaptive_ocs {
-        alloc::vec![
-            limit(2, &[IFTYPE_STATION]),
-            limit(2, &[IFTYPE_P2P_CLIENT]),
-            limit(1, &[IFTYPE_AP, IFTYPE_P2P_GO]),
-            limit(1, &[IFTYPE_P2P_DEVICE]),
-        ]
-    } else {
+    let combination = |limits, max_channels| InterfaceCombination {
+        limits,
+        max_interfaces: 4,
+        max_channels,
+        sta_ap_beacon_interval_match: false,
+        beacon_interval_min_gcd: None,
+        radar_detect_widths: None,
+    };
+    // `ath10k_tlv_if_limit`: one channel; the first entry of both arrays.
+    let single = combination(
         alloc::vec![
             limit(2, &[IFTYPE_STATION]),
             limit(2, &[IFTYPE_AP, IFTYPE_P2P_CLIENT, IFTYPE_P2P_GO]),
             limit(1, &[IFTYPE_P2P_DEVICE]),
-        ]
-    };
-    alloc::vec![InterfaceCombination {
-        limits,
-        max_interfaces: 4,
-        max_channels: if adaptive_ocs { 2 } else { 1 },
-        sta_ap_beacon_interval_match: false,
-        beacon_interval_min_gcd: None,
-        radar_detect_widths: None,
-    }]
+        ],
+        1,
+    );
+    if !adaptive_ocs {
+        return alloc::vec![single];
+    }
+    // `ath10k_tlv_qcs_if_limit`: the second, two-channel entry.
+    alloc::vec![
+        single,
+        combination(
+            alloc::vec![
+                limit(2, &[IFTYPE_STATION]),
+                limit(2, &[IFTYPE_P2P_CLIENT]),
+                limit(1, &[IFTYPE_AP, IFTYPE_P2P_GO]),
+                limit(1, &[IFTYPE_P2P_DEVICE]),
+            ],
+            2,
+        ),
+    ]
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

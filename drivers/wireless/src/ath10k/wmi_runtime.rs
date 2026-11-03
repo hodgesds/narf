@@ -42,6 +42,9 @@ mod hw_keys;
 mod mlme;
 mod nwifi;
 pub(in crate::ath10k) mod offchannel;
+// The P2P client netdev role (iftype 8) binds the vdev owner next.
+#[allow(dead_code)]
+mod p2p_client;
 mod p2p_device;
 // Role owners (P2P device/client/GO) bind these codecs in later steps.
 #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
@@ -219,6 +222,8 @@ pub(super) struct Radio<T> {
     /// The P2P client's station slot while one exists (outside a
     /// `ClientScope`; inside one it holds the home slot).
     p2p_client: Option<alloc::boxed::Box<StationSlot>>,
+    /// A `ClientScope` holds the slots exchanged.
+    in_client_scope: bool,
     ap: Option<alloc::boxed::Box<ap::Session>>,
     ap_staging: Option<alloc::boxed::Box<ap::Staging>>,
     ap_history: Option<alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<ap_key::History>>>,
@@ -276,6 +281,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Self {
             station: StationSlot::new(),
             p2p_client: None,
+            in_client_scope: false,
             ap: None,
             ap_staging: None,
             ap_history: None,
@@ -646,6 +652,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     fn exchange_client(&mut self) {
         if let Some(client) = self.p2p_client.as_deref_mut() {
             core::mem::swap(&mut self.station, client);
+            self.in_client_scope = !self.in_client_scope;
         }
     }
     /// Enter the P2P client slot, if one exists. The client slot must not be
@@ -653,6 +660,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     // Bound by the P2P client netdev role (iftype 8) in a later step.
     #[allow(dead_code)]
     pub(super) fn client_scope(&mut self) -> Option<ClientScope<'_, T>> {
+        if self.in_client_scope {
+            return None;
+        }
         self.p2p_client.as_ref()?;
         self.exchange_client();
         Some(ClientScope { radio: self })

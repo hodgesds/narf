@@ -551,6 +551,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Failed);
         }
+        // One channel across station slots (`ath10k_tlv_if_limit`).
+        if !self.sibling_channel_admits(frequency) {
+            return Err(Error::Unsupported);
+        }
         self.prepare_coexistence(domain, bssid, frequency, validate)
             .await?;
         let bss = self
