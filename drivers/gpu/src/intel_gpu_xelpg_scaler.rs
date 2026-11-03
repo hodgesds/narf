@@ -116,7 +116,7 @@ pub fn panel_fit(native: &Mode, src_w: u32, src_h: u32, mode: ScalingMode) -> Op
                     width += 1;
                 }
                 Window {
-                    x: (hd - width + 1) / 2,
+                    x: (hd - width).div_ceil(2),
                     y: 0,
                     width,
                     height: vd,
@@ -129,7 +129,7 @@ pub fn panel_fit(native: &Mode, src_w: u32, src_h: u32, mode: ScalingMode) -> Op
                 }
                 Window {
                     x: 0,
-                    y: (vd - height + 1) / 2,
+                    y: (vd - height).div_ceil(2),
                     width: hd,
                     height,
                 }
