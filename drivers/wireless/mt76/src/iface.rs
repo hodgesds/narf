@@ -168,9 +168,19 @@ impl Mt76Iface {
         bands
     }
 
+    /// STATION or P2P_CLIENT: mac80211 runs both as a STATION vif
+    /// (`ieee80211_setup_sdata`), sharing the native station owner.
+    pub(crate) fn station_role(&self) -> bool {
+        matches!(self.current_iftype(), 2 | 8)
+    }
+    /// AP or P2P_GO: one AP vif, `vif->p2p` only selecting the GO BSS type.
+    pub(crate) fn ap_role(&self) -> bool {
+        matches!(self.current_iftype(), 3 | 9)
+    }
+
     /// Transmit an 802.3 Ethernet frame over the associated wireless datapath.
     pub async fn transmit_frame(&self, frame: &[u8]) -> Result<(), WirelessError> {
-        if self.current_iftype() != 2 {
+        if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
         if !self.link_up() {
@@ -230,7 +240,7 @@ impl Mt76Iface {
 
     /// Receive an 802.3 Ethernet frame from the wireless datapath.
     pub async fn receive_frame(&self) -> Result<Option<Vec<u8>>, WirelessError> {
-        if self.current_iftype() != 2 {
+        if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
         if !self.link_up() {
@@ -258,7 +268,7 @@ impl Mt76Iface {
         if !self.sleeping.load(Ordering::Acquire) && self.poll_p2p().await? {
             return Ok(());
         }
-        if self.ap_owned.load(Ordering::Acquire) || self.current_iftype() == 3 {
+        if self.ap_owned.load(Ordering::Acquire) || self.ap_role() {
             return self.poll_ap().await;
         }
         if self.sleeping.load(Ordering::Acquire) {
@@ -301,7 +311,7 @@ impl Mt76Iface {
         if !progressed {
             return Ok(false);
         }
-        if self.ap_owned.load(Ordering::Acquire) || self.current_iftype() == 3 {
+        if self.ap_owned.load(Ordering::Acquire) || self.ap_role() {
             return self.drain_ap_network();
         }
         if !self.link_up() {
@@ -420,7 +430,7 @@ impl Mt76Iface {
     }
 
     fn clear_link(&self) {
-        let ap = self.current_iftype() == 3 || self.ap_owned.load(Ordering::Acquire);
+        let ap = self.ap_role() || self.ap_owned.load(Ordering::Acquire);
         self.close_ap_host();
         self.close_monitor();
         self.receive_epoch.store(0, Ordering::Release);
@@ -436,7 +446,7 @@ impl Mt76Iface {
     }
 
     fn lose_link(&self) {
-        let connected = self.current_iftype() == 2 && self.link_up();
+        let connected = self.station_role() && self.link_up();
         if connected {
             self.teardown_needed.store(true, Ordering::Release);
         }
@@ -515,8 +525,8 @@ impl Mt76Iface {
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
         let admitted = match self.current_iftype() {
-            2 => transmit_admitted(bytes, self.mac()),
-            3 => self.ap_transmit_admitted(bytes),
+            2 | 8 => transmit_admitted(bytes, self.mac()),
+            3 | 9 => self.ap_transmit_admitted(bytes),
             _ => false,
         };
         if !admitted {
@@ -614,7 +624,7 @@ impl Interface for Mt76Iface {
         1500
     }
     fn link_up(&self) -> bool {
-        if self.current_iftype() == 3 {
+        if self.ap_role() {
             self.ap_link_up()
         } else {
             self.associated_bssid.lock().is_some()
@@ -862,7 +872,7 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        if self.current_iftype() != 2 {
+        if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
         let six = crate::mt7921::six_ghz::qualified(self.radio);
@@ -978,7 +988,7 @@ impl WirelessNetIface for Mt76Iface {
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
-        if self.current_iftype() != 2 {
+        if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
         let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
@@ -1053,8 +1063,10 @@ impl WirelessNetIface for Mt76Iface {
         .ok_or(WirelessError::Denied)?;
 
         {
-            use crate::mt7921::firmware_transport::{associate_boot_station, Error};
-            let aid = associate_boot_station(&bss, &req.ssid, security, &req.ie)
+            use crate::mt7921::firmware_transport::{associate_boot_station_as, Error};
+            // Stable under `control`: SET_INTERFACE also takes that lock.
+            let p2p_client = self.current_iftype() == 8;
+            let aid = associate_boot_station_as(&bss, &req.ssid, security, &req.ie, p2p_client)
                 .await
                 .map_err(|error| match error {
                     Error::Bounds => WirelessError::InvalidArgs,

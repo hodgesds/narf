@@ -306,6 +306,7 @@ impl<B: Backend> Session<B> {
         self.security = None;
         self.station_permission = None;
         self.station_bss = None;
+        self.station_network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.wmm = None;
         self.wmm_pending = None;
         self.ht20_rx = None;

@@ -38,7 +38,7 @@ impl Mt76Iface {
     ) -> Result<(), WirelessError> {
         self.active_weak()?;
         authority.check_for(self)?;
-        if self.current_iftype() != 3 || self.sleeping.load(Ordering::Acquire) {
+        if !self.ap_role() || self.sleeping.load(Ordering::Acquire) {
             return Err(WirelessError::Denied);
         }
         Ok(())
@@ -132,7 +132,7 @@ impl Mt76Iface {
         self.ap_owned.store(false, Ordering::Release);
     }
     fn ap_host_current(&self) -> bool {
-        if self.current_iftype() != 3
+        if !self.ap_role()
             || !self.ap_started.load(Ordering::Acquire)
             || self.sleeping.load(Ordering::Acquire)
             || self.active_weak().is_err()

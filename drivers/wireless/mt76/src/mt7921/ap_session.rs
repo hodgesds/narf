@@ -99,7 +99,12 @@ impl<B: Backend> Session<B> {
         let info = self.recover(info.capabilities.mac).await?;
         authority.current().map_err(|_| Error::Authority)?;
         let policy = self.backend.regulatory_domain()?;
-        let plan = Arc::new(Plan::prepare(info, config, &policy)?);
+        let mut plan = Plan::prepare(info, config, &policy)?;
+        // mac80211 ieee80211_setup_sdata: P2P_GO is an AP vif with vif->p2p.
+        if authority.mode() == 9 {
+            plan.network = crate::mt7921::p2p_wire::Network::P2p;
+        }
+        let plan = Arc::new(plan);
         self.backend.check_tx_permission(plan.permission)?;
         // WFSYS recovery recycled backend capture metadata. Bind the new
         // BSS to a new actual copy-time epoch, after that retirement.
@@ -151,14 +156,7 @@ impl<B: Backend> Session<B> {
         self.ap_exchange(
             authority,
             Command::Unified { id: 2 },
-            &ap_wire::bss(
-                plan.own,
-                plan.config.beacon_interval as u16,
-                plan.config.dtim_period as u8,
-                plan.five_ghz,
-                false,
-                false,
-            )?,
+            &role_bss(plan, false)?,
         )
         .await?;
         self.ap_exchange(
@@ -252,14 +250,7 @@ impl<B: Backend> Session<B> {
             != 0;
         self.backend.finish_ap_timing(plan.five_ghz, short_slot)?;
         self.check_ap_request(authority)?;
-        let bss = ap_wire::bss(
-            plan.own,
-            plan.config.beacon_interval as u16,
-            plan.config.dtim_period as u8,
-            plan.five_ghz,
-            true,
-            false,
-        )?;
+        let bss = role_bss(plan, true)?;
         self.ap_exchange(authority, Command::Unified { id: 2 }, &bss)
             .await?;
         self.ap_exchange(
@@ -333,18 +324,8 @@ impl<B: Backend> Session<B> {
             )
             .await?;
             self.confirm_command_progress().await?;
-            self.exchange(
-                Command::Unified { id: 2 },
-                &ap_wire::bss(
-                    plan.own,
-                    plan.config.beacon_interval as u16,
-                    plan.config.dtim_period as u8,
-                    plan.five_ghz,
-                    false,
-                    false,
-                )?,
-            )
-            .await?;
+            self.exchange(Command::Unified { id: 2 }, &role_bss(&plan, false)?)
+                .await?;
             // Stop/reset, rather than a bare command ACK, retires every
             // old AP key/FIFO/packet owner before another role may run.
             self.recover(info.capabilities.mac).await.map(|_| ())
@@ -436,4 +417,19 @@ pub(crate) enum ApEvent {
         pdu: alloc::vec::Vec<u8>,
         unencrypted: bool,
     },
+}
+
+/// Linux mt76_connac_mcu_uni_add_bss for the AP vif: the infrastructure AP
+/// BSS-basic request, with `vif->p2p` selecting CONNECTION_P2P_GO.
+fn role_bss(plan: &Plan, enable: bool) -> Result<[u8; 44], Error> {
+    let mut bss = ap_wire::bss(
+        plan.own,
+        plan.config.beacon_interval as u16,
+        plan.config.dtim_period as u8,
+        plan.five_ghz,
+        enable,
+        false,
+    )?;
+    crate::mt7921::p2p_wire::group_bss(&mut bss, plan.network)?;
+    Ok(bss)
 }

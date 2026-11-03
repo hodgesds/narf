@@ -147,6 +147,11 @@ impl ApControlAuthority {
     pub fn current(&self) -> Result<(), WirelessError> {
         self.check(None)
     }
+    /// The `enum nl80211_iftype` this authority was bound to (AP3/GO9 for
+    /// AP control). Every `check` keeps the live interface in this mode.
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
     fn bind_control_wdev(
         admin: AdminHandle,
         iface: &Arc<dyn WirelessNetIface>,

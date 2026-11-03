@@ -496,14 +496,30 @@ pub async fn associate_boot_station(
     security: crate::mt7921::association::Security,
     extra_ies: &[u8],
 ) -> Result<u16, Error> {
+    associate_boot_station_as(bss, ssid, security, extra_ies, false).await
+}
+
+/// Station or P2P-client (`p2p_client`) join on the retained boot owner.
+pub(crate) async fn associate_boot_station_as(
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+    p2p_client: bool,
+) -> Result<u16, Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
+    let network = if p2p_client {
+        crate::mt7921::p2p_wire::Network::P2p
+    } else {
+        crate::mt7921::p2p_wire::Network::Infrastructure
+    };
     owner
         .as_mut()
         .ok_or(Error::DeviceGone)?
-        .associate_station_with_ies(bss, ssid, security, extra_ies)
+        .associate_station_as(bss, ssid, security, extra_ies, network)
         .await
 }
 
@@ -1462,6 +1478,9 @@ struct Session<B: Backend> {
     tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
+    /// BSS0 group role captured at join; retained for the exact disconnect
+    /// record of that association (Linux `vif->p2p` is fixed per vif type).
+    station_network: crate::mt7921::p2p_wire::Network,
     station_permission: Option<crate::mt7921::association::TxPermission>,
     wmm: Option<crate::mt7921::association::wmm::Parameters>,
     wmm_pending: Option<crate::mt7921::association::wmm::Parameters>,
@@ -1514,6 +1533,7 @@ impl<B: Backend> Session<B> {
             tx_restart: None,
             peer_lost: false,
             station_bss: None,
+            station_network: crate::mt7921::p2p_wire::Network::Infrastructure,
             station_permission: None,
             wmm: None,
             wmm_pending: None,

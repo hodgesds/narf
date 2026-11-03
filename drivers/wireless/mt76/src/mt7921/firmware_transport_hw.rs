@@ -1793,6 +1793,26 @@ impl Transport {
         security: crate::mt7921::association::Security,
         extra_ies: &[u8],
     ) -> Result<u16, Error> {
+        self.associate_station_as(
+            bss,
+            ssid,
+            security,
+            extra_ies,
+            crate::mt7921::p2p_wire::Network::Infrastructure,
+        )
+        .await
+    }
+    /// Join as the BSS0 infrastructure station or P2P client. The P2P role
+    /// uses the same qualified station grant, peer/key/data owners and
+    /// native records; only the BSS-basic connection type differs.
+    pub(crate) async fn associate_station_as(
+        &mut self,
+        bss: &super::ScanBss,
+        ssid: &[u8],
+        security: crate::mt7921::association::Security,
+        extra_ies: &[u8],
+        network: crate::mt7921::p2p_wire::Network,
+    ) -> Result<u16, Error> {
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
         let info = match self.session.state {
             State::RadioReady(info) | State::ScanReady(info) => info,
@@ -1802,7 +1822,7 @@ impl Transport {
             .ok_or(Error::Authority)?;
         let aid = self
             .session
-            .associate_station(bss, ssid, security, permission, extra_ies)
+            .associate_station_as(bss, ssid, security, permission, extra_ies, network)
             .await?;
         self.session.service_keys().await?;
         self.session.negotiate_transmit_ba().await?;

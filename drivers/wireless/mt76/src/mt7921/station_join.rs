@@ -1653,6 +1653,28 @@ impl<B: Backend> Session<B> {
         permission: crate::mt7921::association::TxPermission,
         extra_ies: &[u8],
     ) -> Result<u16, Error> {
+        self.associate_station_as(
+            bss,
+            ssid,
+            security,
+            permission,
+            extra_ies,
+            crate::mt7921::p2p_wire::Network::Infrastructure,
+        )
+        .await
+    }
+
+    /// Linux `mt7921_mac_sta_add`/`mt7921_bss_info_changed` for a STATION
+    /// vif, with `vif->p2p` selecting the P2P-client BSS connection type.
+    pub(super) async fn associate_station_as(
+        &mut self,
+        bss: &ScanBss,
+        ssid: &[u8],
+        security: Security,
+        permission: crate::mt7921::association::TxPermission,
+        extra_ies: &[u8],
+        network: crate::mt7921::p2p_wire::Network,
+    ) -> Result<u16, Error> {
         if self.p2p_rf_busy() {
             return Err(Error::Busy);
         }
@@ -1662,6 +1684,9 @@ impl<B: Backend> Session<B> {
             State::Associated { .. } => return Err(Error::Busy),
             _ => return Err(Error::Busy),
         };
+        // No station BSS is live here, so the role cannot change under an
+        // already published BSS record.
+        self.station_network = network;
         let six = crate::mt7921::association::is_six_ghz(bss);
         let band = if six {
             // MT_NIC_CAP_6G gates the 6 GHz band (mt7921/mcu.c:595).
@@ -1783,8 +1808,9 @@ impl<B: Backend> Session<B> {
 
             // Publish BSSID and an unauthorized AP WCID before management
             // or EAPOL RX; a scan-only BSS has no peer address installed.
-            let bss_record = crate::mt7921::association::bss_record_qos(bss, false, false)
+            let mut bss_record = crate::mt7921::association::bss_record_qos(bss, false, false)
                 .map_err(|_| Error::Bounds)?;
+            crate::mt7921::p2p_wire::group_bss(&mut bss_record, network)?;
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
             let peer_record = plan.peer_record(0, false).map_err(|_| Error::Bounds)?;
@@ -1912,6 +1938,7 @@ impl<B: Backend> Session<B> {
             if plan.vht().is_some() {
                 bss_record[29] |= 1 << 5;
             } // PHY_MODE_AC.
+            crate::mt7921::p2p_wire::group_bss(&mut bss_record, network)?;
             if let Some(he) = plan.he() {
                 bss_record[29] |= he.phy_mode();
             }
@@ -2190,8 +2217,9 @@ impl<B: Backend> Session<B> {
                 self.exchange(Command::Unified { id: 3 }, &record).await?;
             }
             if let Some(bss) = &self.station_bss {
-                let record = crate::mt7921::association::bss_record_qos(bss, false, false)
+                let mut record = crate::mt7921::association::bss_record_qos(bss, false, false)
                     .map_err(|_| Error::Bounds)?;
+                crate::mt7921::p2p_wire::group_bss(&mut record, self.station_network)?;
                 self.exchange(Command::Unified { id: 2 }, &record).await?;
                 // mt76_connac_mcu_uni_add_bss(enable = false) still sends the
                 // HE request while he_support is set, with BSS color disabled.
@@ -2230,6 +2258,7 @@ impl<B: Backend> Session<B> {
             return Err(error);
         }
         self.station_bss = None;
+        self.station_network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.peer_lost = false;
         self.state = State::ScanReady(info);
         Ok(())

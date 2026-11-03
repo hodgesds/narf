@@ -12,7 +12,7 @@ impl Mt76Iface {
         }
     }
     pub(super) fn change_iftype(&self, iftype: u32) -> Result<(), WirelessError> {
-        if ![2, 3, 6].contains(&iftype) {
+        if ![2, 3, 6, 8, 9].contains(&iftype) {
             return Err(WirelessError::NotSupported);
         }
         let _control = self.control.try_lock().ok_or(WirelessError::Busy)?;

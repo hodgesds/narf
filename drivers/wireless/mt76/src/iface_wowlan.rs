@@ -13,7 +13,7 @@ impl Mt76Iface {
         &self,
         probe: impl FnOnce() -> Result<bool, crate::mt7921::firmware_transport::Error>,
     ) -> Option<WowlanSupport> {
-        if self.current_iftype() != 2 {
+        if !self.station_role() {
             return None;
         }
         if !self.wake_reported.load(Ordering::Acquire) {
@@ -53,7 +53,7 @@ impl Mt76Iface {
             return Err(-16);
         }
         if let Some(config) = config.as_ref() {
-            if self.current_iftype() != 2 {
+            if !self.station_role() {
                 return Err(-95);
             }
             match probe() {
@@ -74,7 +74,7 @@ impl Mt76Iface {
             if self.sleeping.load(Ordering::Acquire) {
                 return Err(-16);
             }
-            if self.current_iftype() != 2 || !self.link_up() {
+            if !self.station_role() || !self.link_up() {
                 return Err(-107);
             }
             // This driver owns the RSNA. An external offload request can

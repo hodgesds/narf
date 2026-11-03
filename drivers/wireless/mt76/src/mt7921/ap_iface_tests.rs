@@ -370,3 +370,5 @@ kernel_test_in!(
     "drivers/wireless/mt7921/ap",
     mt76_ap_concrete_key_epoch_rings_and_exact_source_management_delivery
 );
+#[path = "p2p_group_tests.rs"]
+mod p2p_group;

@@ -27,6 +27,9 @@ pub(crate) struct Plan {
     pub beacon: Vec<u8>,
     pub tim_offset: usize,
     pub probe: Vec<u8>,
+    /// AP or P2P-GO BSS connection type; bound from the START authority's
+    /// actual mode, never inferred from beacon/P2P elements.
+    pub network: crate::mt7921::p2p_wire::Network,
 }
 
 impl core::fmt::Debug for Plan {
@@ -140,6 +143,7 @@ impl Plan {
             beacon,
             tim_offset,
             probe,
+            network: crate::mt7921::p2p_wire::Network::Infrastructure,
         })
     }
 

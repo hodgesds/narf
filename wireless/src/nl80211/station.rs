@@ -1150,8 +1150,9 @@ pub(super) fn tx_control_port(
     };
     let dest = mac_of(attrs)?.ok_or(EINVAL)?;
     let proto = u16::from_ne_bytes(int_le::<2>(proto)?);
+    // nl80211_tx_control_port: AP and P2P_GO need no connected BSS.
     match iface.current_iftype() {
-        IFTYPE_AP => {}
+        IFTYPE_AP | 9 => {}
         IFTYPE_STATION | 8 => {
             if iface.connected_bssid().is_none() {
                 return Err(ENOTCONN);

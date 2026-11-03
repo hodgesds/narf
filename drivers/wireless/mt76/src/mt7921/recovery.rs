@@ -126,6 +126,7 @@ impl<B: Backend> Session<B> {
         self.tx_fragments.clear();
         self.received_msdu.clear();
         self.station_bss = None;
+        self.station_network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.data_pending.clear();
         self.peer_lost = false;
         self.events.clear();

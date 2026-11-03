@@ -24,7 +24,10 @@ impl<B: Backend> Session<B> {
             config.probe_resp = (!probe.is_empty()).then_some(probe);
         }
         let policy = self.backend.regulatory_domain()?;
-        let plan = Arc::new(Plan::prepare(owner.info, config, &policy)?);
+        let mut plan = Plan::prepare(owner.info, config, &policy)?;
+        // The START role is fixed for this BSS (no AP<->GO retargeting).
+        plan.network = owner.plan.network;
+        let plan = Arc::new(plan);
         if plan.permission != owner.plan.permission
             || plan.rates != owner.plan.rates
             || plan.basic_rates != owner.plan.basic_rates

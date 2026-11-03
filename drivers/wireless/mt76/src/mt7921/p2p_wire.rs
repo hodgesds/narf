@@ -111,3 +111,43 @@ impl Request {
         Ok(duration)
     }
 }
+
+/// P2P group role of the physical BSS0 owner. Linux maps P2P_CLIENT/P2P_GO
+/// to a STATION/AP vif with `vif->p2p` (net/mac80211/iface.c
+/// `ieee80211_setup_sdata`). For CONNAC2 that flag changes only the
+/// `mt76_connac_mcu_uni_add_bss` BSS-basic `conn_type`
+/// (mt76_connac_mcu.c:1663–1678); `uni_add_dev` keeps INFRA_STA/INFRA_AP and
+/// `mt76_connac_mcu_sta_basic_tlv` keeps the infrastructure peer type
+/// (`!is_connac2`). Peer, key, WTBL and data ownership are unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Network {
+    #[default]
+    Infrastructure,
+    P2p,
+}
+const UNI_BSS_INFO_BASIC: u16 = 0;
+const CONNECTION_INFRA_STA: u32 = (1 << 16) | 1;
+const CONNECTION_INFRA_AP: u32 = (1 << 16) | 2;
+/// Retarget one complete UNI BSS-basic request built for the infrastructure
+/// role. Only an exact infrastructure STA/AP basic TLV is accepted; any
+/// other record is a builder mismatch rather than something to patch.
+pub(crate) fn group_bss(record: &mut [u8], network: Network) -> Result<(), Error> {
+    let tag = record
+        .get(4..6)
+        .map(|tag| u16::from_le_bytes([tag[0], tag[1]]));
+    let kind = record
+        .get(12..16)
+        .map(|kind| u32::from_le_bytes([kind[0], kind[1], kind[2], kind[3]]));
+    let p2p = match kind {
+        Some(CONNECTION_INFRA_STA) => CONNECTION_P2P_CLIENT,
+        Some(CONNECTION_INFRA_AP) => CONNECTION_P2P_GO,
+        _ => return Err(Error::Bounds),
+    };
+    if tag != Some(UNI_BSS_INFO_BASIC) || record.len() < 36 {
+        return Err(Error::Bounds);
+    }
+    if network == Network::P2p {
+        record[12..16].copy_from_slice(&p2p.to_le_bytes());
+    }
+    Ok(())
+}
