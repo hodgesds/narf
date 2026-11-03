@@ -10724,3 +10724,19 @@ kernel_test_in!(
     "drivers/usb/xhci",
     smoke_xhci_port_reset_ack_preserves_enable
 );
+
+/// HID-bound hub ports are never idle-suspended (Linux keeps HID at
+/// `power/control=on` without remote wakeup); other bound ports still are.
+fn smoke_usb_idle_suspend_spares_hid_ports() -> TestResult {
+    use crate::attach::without_hid_ports;
+    let candidates = alloc::vec![(4u8, 1u8), (4, 2), (4, 3), (9, 1)];
+    let hid = [(4u8, 1u8), (4, 3)];
+    if without_hid_ports(candidates.clone(), &hid) != alloc::vec![(4u8, 2u8), (9, 1)] {
+        return TestResult::Fail("HID-bound hub port selected for idle suspend");
+    }
+    if without_hid_ports(candidates.clone(), &[]) != candidates {
+        return TestResult::Fail("non-HID ports must stay idle-suspend candidates");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_idle_suspend_spares_hid_ports);

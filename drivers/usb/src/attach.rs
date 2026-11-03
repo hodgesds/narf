@@ -321,6 +321,18 @@ pub(crate) fn idle_suspend_candidates(hubs: &[HubBinding], now: u64) -> Vec<(u8,
     out
 }
 
+/// Drop HID-bound ports from the idle-suspend candidates. Linux leaves
+/// USB HID devices at `power/control=on` (never autosuspended) unless
+/// remote wakeup is armed, and NARF arms none: a suspended keyboard
+/// cannot signal a key press, and the next interrupt transfer to it
+/// fails with a USB Transaction Error that halts the endpoint. On the
+/// RX 6750 XT desktop this killed the keyboard and mouse 30 s after they
+/// attached.
+pub(crate) fn without_hid_ports(mut candidates: Vec<(u8, u8)>, hid: &[(u8, u8)]) -> Vec<(u8, u8)> {
+    candidates.retain(|port| !hid.contains(port));
+    candidates
+}
+
 /// Walk every bound hub + suspend any downstream port whose last
 /// activity is older than `IDLE_SUSPEND_NS`. Called once per
 /// supervisor cycle. Suspended ports stay in `bound_downstream`
@@ -340,6 +352,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
         let g = HUBS.of(xhci_dev.id()).lock();
         idle_suspend_candidates(&g[..], now)
     };
+    let work = without_hid_ports(work, &hid::hub_ports(xhci_dev.id()));
     let mut suspended = 0;
     for (slot, p) in &work {
         // Snapshot the bound hub out of the registry lock so we don't

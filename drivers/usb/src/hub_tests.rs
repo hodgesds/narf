@@ -114,31 +114,35 @@ fn smoke_hub_negotiates_multiple_tt() -> TestResult {
 }
 kernel_test_in!("drivers/usb/hub", smoke_hub_negotiates_multiple_tt);
 
-fn smoke_hub_rejects_failed_multiple_tt_switch() -> TestResult {
+/// `hub_configure`: a hub that refuses its multiple-TT alternate keeps
+/// working single-TT ("Using single TT") instead of failing to attach.
+fn smoke_hub_falls_back_to_single_tt_when_switch_fails() -> TestResult {
     let firmware = HubFirmware::new(true);
-    if narf_scheduler::block_on(UsbHub::attach_transport(
+    let hub = match narf_scheduler::block_on(UsbHub::attach_transport(
         &firmware,
         7,
         0,
         HUB_PROTOCOL_MULTI_TT,
         PortSpeed::High,
         &VIA_DESCRIPTORS[18..],
-    ))
-    .is_ok()
-    {
-        return TestResult::Fail("hub attached despite a rejected multiple-TT alternate");
+    )) {
+        Ok(hub) => hub,
+        Err(_) => return TestResult::Fail("hub rejected after a refused multiple-TT alternate"),
+    };
+    if hub.is_multi_tt() || hub.interface_alt != 0 {
+        return TestResult::Fail("refused multiple-TT switch still programmed multiple TT");
     }
     if firmware.alternate.load(Ordering::Acquire) != 0 {
         return TestResult::Fail("failed SET_INTERFACE changed the firmware's active alternate");
     }
-    if firmware.requests.lock().len() != 1 {
-        return TestResult::Fail("failed mode switch continued with hub class requests");
+    if firmware.requests.lock().len() < 2 {
+        return TestResult::Fail("fallback did not continue with hub class requests");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/usb/hub",
-    smoke_hub_rejects_failed_multiple_tt_switch
+    smoke_hub_falls_back_to_single_tt_when_switch_fails
 );
 
 fn smoke_hub_single_tt_does_not_switch_alternate() -> TestResult {
