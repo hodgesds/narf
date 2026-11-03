@@ -971,6 +971,57 @@ kernel_test_in!(
     smoke_rtl8821ae_signed_envelope_admission
 );
 
+fn smoke_rtl8821ae_ra_mask_rates_within_napc_admission() -> TestResult {
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x02],
+        logical: powered_logical(0xf2, 2),
+    };
+    let Ok(cal) =
+        envelope::Calibration::from_verified(&napc(&factory, &[6], 30), Some([1; 32]), &factory)
+    else {
+        return TestResult::Fail("valid signed envelope rejected");
+    };
+    let Ok(p) = cal.permission(&crate::rtlwifi::channel_power::tests::domain(20), 6) else {
+        return TestResult::Fail("covered channel refused");
+    };
+    let station = txpower::station_rates().fold(0u64, |m, r| m | (1 << r));
+    if p.admitted_rates() != station || !p.admits(trx::DESC_RATE24M) || p.admits(20) {
+        return TestResult::Fail("admitted set is not exactly the measured station rates");
+    }
+    let g = h2c::Peer {
+        legacy: 0xfff,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+    };
+    let n = h2c::Peer {
+        ht: Some([0xff, 0]),
+        ..g
+    };
+    let gm = h2c::mask_rates(&h2c::rate_mask(&g, false, 0, true));
+    let nm = h2c::mask_rates(&h2c::rate_mask(&n, false, 0, true));
+    if gm != Some(0xff5) || nm != Some(0xff005) {
+        return TestResult::Fail("ratr bitmap not mapped to full-order rates");
+    }
+    if nm.unwrap() & !p.admitted_rates() != 0 {
+        return TestResult::Fail("installed RA mask exceeds the admitted rates");
+    }
+    // VHT 1SS bits 12..21 are DESC_RATEVHT1SS_MCS0..9 (28..37); 2SS refused.
+    let vht = [0, 10, 0, 0x10, 0xf0, 0x3f, 0];
+    if h2c::mask_rates(&vht) != Some(0x10 | (0x3ff << 28))
+        || h2c::mask_rates(&[0, 10, 0, 0, 0, 0x40, 0]).is_some()
+        || h2c::mask_rates(&[0, 1, 0, 0, 0, 0x10, 0]).is_some()
+        || h2c::mask_rates(&[0, 6, 0, 0, 0x10, 0, 0]).is_some()
+    {
+        return TestResult::Fail("VHT/2SS ratr bitmap mapping wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_ra_mask_rates_within_napc_admission
+);
+
 fn smoke_rtl8821ae_band_channel_bw20_txagc_order() -> TestResult {
     let factory = crate::rtlwifi::efuse::Factory {
         mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x03],

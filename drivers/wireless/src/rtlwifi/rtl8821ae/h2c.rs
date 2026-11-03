@@ -267,6 +267,26 @@ pub fn rate_mask(peer: &Peer, bw40: bool, rssi_level: u8, update_bw: bool) -> [u
     ]
 }
 
+/// Full-order TXAGC rates (`DESC_RATE*` bit positions, see
+/// [`super::txpower`]) a `H2C_8821AE_RA_MASK` payload lets the firmware RA
+/// choose. The ratr bitmap's bits 0..=11 are the legacy rates; bits 12.. are
+/// HT MCS (`RATEID_IDX_BGN_*`/`GN_*`, `ht_cap.mcs.rx_mask << 12`) or VHT
+/// 1SS MCS0-9 (`RATEID_IDX_VHT_1SS`/`MIX1`, `_rtl8821ae_rate_to_bitmap_2ssvht
+/// << 12`) by `arfr_id` (`rtl_mrate_idx_to_arfr_id`). `None` for an id this
+/// 1T1R station never installs or a bitmap with 2SS bits.
+pub fn mask_rates(payload: &[u8; 7]) -> Option<u64> {
+    let bitmap = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
+    let legacy = u64::from(bitmap & 0xfff);
+    let high = bitmap >> 12;
+    let upper = match payload[1] & 0x7f {
+        6..=8 if high == 0 => 0,
+        1 | 3 | 5 if high & !0xff == 0 => u64::from(high) << 12,
+        10 | 11 if high & !0x3ff == 0 => u64::from(high) << 28,
+        _ => return None,
+    };
+    Some(legacy | upper)
+}
+
 /// `_rtl8821ae_set_bcn_ctrl_reg` against the cached `reg_bcn_ctrl_val`.
 pub fn set_bcn_ctrl(io: &impl Io, cached: &mut u8, set: u8, clear: u8) -> Result<(), Error> {
     *cached |= set;

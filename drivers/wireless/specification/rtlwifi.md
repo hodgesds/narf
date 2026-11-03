@@ -1631,9 +1631,17 @@ chain below is composed.
     highest rate (11M for B, 54M otherwise) and RATE_ID the AP's
     `ratr_index` (addr1 is the AP, whatever the DA), so the firmware RA
     picks and falls back inside the mask. This needs no separate
-    continuation: the `NAPC` permission admits a measured TXAGC index for
-    every station rate (CCK, OFDM, MCS0-7, VHT1SS0-9), unlike 88EE's
-    fixed-rate NEPC (NEFB). Every other frame keeps the forced `hw_rate`
+    continuation (unlike 88EE's fixed-rate NEPC/NEFB) because the mask is
+    bounded by the `NAPC` permission: `envelope::Permission` carries the
+    set of full-order rates holding a measured admitted index
+    (`admits`/`admitted_rates`), `h2c::mask_rates` maps the installed
+    `H2C_8821AE_RA_MASK` bitmap to full-order rates by `arfr_id` (legacy
+    bits 0..=11, HT MCS or VHT1SS bits 12.. by `RATEID_IDX_*`), and
+    `ae_install_rate_mask` refuses (`Power(Policy)`) an empty mask or any
+    rate outside the admitted set — never silently narrowing it, so the
+    Linux mask/`ratr_index` pair stays exact. `ae_submit` likewise refuses a
+    descriptor whose `hw_rate` (forced or RA initial) or, with protection
+    selected, `DESC_RATE24M` RTS rate is not admitted. Every other frame keeps the forced `hw_rate`
     with fallback disabled and RATE_ID the installed `ratr_index` for
     unicast, `RATR_INX_WIRELESS_MC` otherwise (`_rtl_txrate_selectmode`,
     8821AE has no `RTL_SPEC_NEW_RATEID`). EAPOL (unprotected; software
@@ -1643,8 +1651,8 @@ chain below is composed.
     protection as 88EE (`protection::select`, AP must offer 24M), filled as
     `_rtl_query_protection_mode`: RTS/CTS sets `RTS_EN`, CTS-to-self
     `CTS2SELF`, both `RTS_RATE = DESC_RATE24M`, long preamble. No NERT
-    continuation is needed: the `NAPC` permission already admits OFDM24's
-    measured power. Only legacy rates are admitted (no HT, A-MPDU or SGI
+    continuation is needed: the RTS rate must be in the `NAPC` admitted
+    set (checked per frame, above). Only legacy rates are admitted (no HT, A-MPDU or SGI
     yet). The host receipt checks OWN clear with dwords
     0/1/7, the buffer in dword 10, dword 11/13 zero and the linked next
     pointer.
@@ -1720,7 +1728,8 @@ chain below is composed.
   `smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation`
   (`packet_ae_tests.rs`) and
   `smoke_rtl8821ae_pwdb_ra_hysteresis_and_init_rate_match_linux`
-  (`rate_adaptive.rs`) (written, unexecuted).
+  (`rate_adaptive.rs`), `smoke_rtl8821ae_ra_mask_rates_within_napc_admission`
+  (`rtl8821ae/tests.rs`) (written, unexecuted).
 
 Tests in `rtl8821ae/tests.rs` and `packet_ae_tests.rs` are written and
 unexecuted. Physical-board qualification (signed `NAPC` envelope

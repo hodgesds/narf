@@ -438,6 +438,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         admission: Option<&super::super::station::Admission>,
     ) -> Result<(), Error> {
         let index = ratr_index(&payload).ok_or(Error::Packet)?;
+        // The firmware RA may only pick rates whose measured power the
+        // signed `NAPC` permission admits: the installed mask must be a
+        // non-empty subset of the admitted set (refused otherwise, never
+        // silently narrowed, so the Linux mask/ratr_index pair stays exact).
+        let rates = h2c::mask_rates(&payload).ok_or(Error::Packet)?;
+        let admitted = self.rtl8821ae_power.ok_or(Error::State)?.admitted_rates();
+        if rates == 0 || rates & !admitted != 0 {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Policy,
+            ));
+        }
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
@@ -632,6 +643,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             Some(_) => trx::DESC_RATE54M,
             None => rate,
         };
+        // Every rate the descriptor can put on air — the forced/initial
+        // `hw_rate`, the firmware-RA mask (checked at install) and the
+        // `DESC_RATE24M` RTS/CTS-to-self rate — must hold an admitted
+        // measured index in the current `NAPC` permission.
+        let permission = self.rtl8821ae_power.ok_or(Error::State)?;
+        if !permission.admits(hw_rate)
+            || (self.packet.protection != super::super::super::protection::Mode::None
+                && !permission.admits(trx::DESC_RATE24M))
+        {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Policy,
+            ));
+        }
         let tx_report = wants_report(frame).then(|| self.packet.ae.reports.next_sn());
         let params = trx::TxParams {
             pkt_size: frame.len() as u16,

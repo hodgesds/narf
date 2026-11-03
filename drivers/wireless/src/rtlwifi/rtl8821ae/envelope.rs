@@ -64,6 +64,8 @@ pub struct Permission {
     channel: u8,
     /// Admitted TXAGC per full-order rate index (`0..48`; non-station rates 0).
     index: [u8; 48],
+    /// Rates (bit = full-order rate) holding a measured admitted index.
+    admitted: u64,
     swing: u32,
     eirp: i16,
 }
@@ -78,6 +80,16 @@ impl Permission {
     /// Admitted TXAGC index for a full-order rate.
     pub fn index(&self, rate: u8) -> u8 {
         self.index.get(usize::from(rate)).copied().unwrap_or(0)
+    }
+    /// Whether `rate` (full order) has a measured, admitted TXAGC index:
+    /// the only rates a forced descriptor rate, an RTS rate or a firmware RA
+    /// mask may name.
+    pub fn admits(&self, rate: u8) -> bool {
+        rate < 64 && self.admitted & (1 << rate) != 0
+    }
+    /// Bit set of [`Self::admits`].
+    pub fn admitted_rates(&self) -> u64 {
+        self.admitted
     }
     /// `phy_get_tx_swing_8812A(BAND_ON_2_4G)` for this board.
     pub fn swing(&self) -> u32 {
@@ -256,6 +268,7 @@ impl Calibration {
             .find(|c| c.channel == channel)
             .ok_or(Error::NoMeasuredGain)?;
         let mut index = [0u8; 48];
+        let mut admitted = 0u64;
         for rate in txpower::station_rates() {
             let linux = self
                 .by_rate
@@ -273,11 +286,13 @@ impl Calibration {
                     out != UNKNOWN && i32::from(out) + i32::from(self.antenna) <= i32::from(eirp)
                 })
                 .ok_or(Error::NoMeasuredGain)?;
+            admitted |= 1 << rate;
         }
         Ok(Permission {
             identity: self.identity,
             channel,
             index,
+            admitted,
             swing: self.swing,
             eirp,
         })
