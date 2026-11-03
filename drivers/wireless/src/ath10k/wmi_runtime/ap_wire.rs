@@ -384,10 +384,17 @@ pub(super) fn command(id: u32, tag: u32, values: &[u32]) -> Result<Vec<u8>, Erro
     }
     Ok(bytes)
 }
-/// The ordinary TLV AP vdev: vdev0, VDEV_TYPE_AP, subtype NONE.
-pub(super) fn create(own: [u8; 6]) -> Result<Vec<u8>, Error> {
+/// A TLV AP-type vdev (VDEV_TYPE_AP; subtype NONE, or P2P_GO for a GO).
+pub(super) fn create(vdev: super::p2p::Vdev, own: [u8; 6]) -> Result<Vec<u8>, Error> {
+    if vdev.role().vdev_type() != 1 {
+        return Err(Error::Unsupported);
+    }
     let tlv = wire::Wire::new(crate::ath10k::wmi_boot::Dialect::Tlv);
-    super::p2p::Vdev::new(0, super::p2p::Role::Ap).create(&tlv, own)
+    vdev.create(&tlv, own)
+}
+/// TLV `WMI_VDEV_DELETE_CMDID` for the AP-owned vdev.
+pub(super) fn delete(vdev: super::p2p::Vdev) -> Result<Vec<u8>, Error> {
+    vdev.delete(&wire::Wire::new(crate::ath10k::wmi_boot::Dialect::Tlv))
 }
 pub(super) fn beacon(plan: &Plan) -> Result<Vec<u8>, Error> {
     let mut out = command(0x7003, 103, &[0, plan.tim as u32, plan.beacon.len() as u32])?;

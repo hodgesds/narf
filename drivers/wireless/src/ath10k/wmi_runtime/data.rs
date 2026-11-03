@@ -691,7 +691,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::InOrder(i, frames)
                     if security.is_some()
                         && peer.owns(i.peer)
-                        && i.vdev == 0
+                        && i.vdev == peer.vdev
                         && !i.offload
                         && !i.fragment =>
                 {
@@ -870,7 +870,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let parameters = htt::tx::Parameters {
             kind: htt::tx::Kind::Raw,
-            vdev: 0,
+            vdev: self.primary.id(),
             tid: tx_qos::descriptor_tid(&frame),
             hardware_crypto: hardware,
         };
@@ -1018,7 +1018,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             } else {
                 htt::tx::Kind::Raw
             },
-            vdev: 0,
+            vdev: self.primary.id(),
             tid: 16,
             hardware_crypto: native_wifi && reply.get(1).is_some_and(|fc| fc & 0x40 != 0),
         })
@@ -1183,7 +1183,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             htt::Event::InOrder(indication, frames) => {
                 if !indication.offload
                     && !indication.fragment
-                    && indication.vdev == 0
+                    && indication.vdev == peer.vdev
                     && peer.owns(indication.peer)
                 {
                     for frame in frames {

@@ -118,6 +118,23 @@ impl Vdev {
         out[at + 12..at + 18].copy_from_slice(&mac);
         Ok(out)
     }
+    /// `WMI_VDEV_DELETE_CMDID` (`struct wmi_vdev_delete_cmd`: vdev_id).
+    /// Every dialect's command table places DELETE directly after CREATE
+    /// (`wmi.h` `WMI_VDEV_DELETE_CMDID`, `WMI_10X_`/`WMI_10_2_`/`WMI_10_4_`);
+    /// `wmi-tlv.c::ath10k_wmi_tlv_op_gen_vdev_delete` wraps it in
+    /// `WMI_TLV_TAG_STRUCT_VDEV_DELETE_CMD` (87).
+    pub(super) fn delete(self, wire: &Wire) -> Result<Vec<u8>, Error> {
+        let tlv = wire.dialect == Dialect::Tlv;
+        let mut out = packet(wire.create + 1, 4 + usize::from(tlv) * 4)?;
+        let at = if tlv {
+            put(&mut out, 4, (87 << 16) | 4);
+            8
+        } else {
+            4
+        };
+        put(&mut out, at, u32::from(self.id));
+        Ok(out)
+    }
 }
 
 fn unicast(mac: [u8; 6]) -> bool {

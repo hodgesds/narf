@@ -204,7 +204,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = self.wire.scan_event(&bytes[4..])?;
             if Some(event.sequence) != self.scan_pending.map(|id| 0xa000 | u32::from(id))
                 || event.request != 0xa001
-                || event.vdev != 0
+                || event.vdev != u32::from(self.primary.id())
             {
                 work.report.ignored = work.report.ignored.saturating_add(1);
                 return Ok(());

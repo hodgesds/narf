@@ -5,6 +5,9 @@ use crate::ath10k::regulatory::Permission;
 
 #[derive(Debug)]
 pub(super) struct Peer {
+    /// The station vdev this BSS peer was created on; HTT RX for any other
+    /// vdev never reaches this peer's data owner.
+    pub(super) vdev: u8,
     pub(super) permission: Permission,
     pub(super) bssid: [u8; 6],
     ids: [u64; 32],
@@ -587,6 +590,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let create = self.wire.peer(bssid)?;
         self.peer = Some(Peer {
+            vdev: self.primary.id(),
             permission: permission.clone(),
             bssid,
             ids: [0; 32],
@@ -716,7 +720,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .transmit(
                         htt::tx::Parameters {
                             kind: htt::tx::Kind::Management,
-                            vdev: 0,
+                            vdev: self.primary.id(),
                             tid: 17,
                             hardware_crypto: false,
                         },

@@ -204,12 +204,18 @@ pub(super) struct Scan {
     terminal: bool,
     /// Shared `narf_wireless::reg::witness` generation of this scan.
     generation: ScanGeneration,
+    /// The vdev whose scan events this hint scan observes.
+    vdev: u32,
 }
 impl Scan {
+    pub(super) fn on_vdev(mut self, vdev: u32) -> Self {
+        self.vdev = vdev;
+        self
+    }
     pub fn event(&mut self, event: &ScanEvent, channels: &[u16]) {
         if event.sequence != 0xa000 | u32::from(self.sequence)
             || event.request != 0xa001
-            || event.vdev != 0
+            || event.vdev != self.vdev
             || self.terminal
         {
             return;
@@ -303,6 +309,7 @@ impl Owner {
             dwell: None,
             terminal: false,
             generation,
+            vdev: 0,
         })
     }
     /// Called only with the original decoded native WMI event in the actual
@@ -420,7 +427,8 @@ impl<T: super::Hif + super::HostMemory + super::HttMemory> super::Radio<T> {
             .caps
             .as_ref()
             .and_then(|caps| Factory::from_eeprom(caps.eeprom_domain).ok())
-            .and_then(|factory| self.beacon_hints.begin(factory, sequence, channels));
+            .and_then(|factory| self.beacon_hints.begin(factory, sequence, channels))
+            .map(|scan| scan.on_vdev(u32::from(self.primary.id())));
     }
     pub(super) fn observe_beacon_hint_event(
         &mut self,

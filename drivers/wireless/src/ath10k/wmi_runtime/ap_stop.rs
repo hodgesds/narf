@@ -118,7 +118,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             // CREATE may have been only partially published. A genuine delete
             // response is mandatory here; silence/timeout is never success.
             self.ap_publish(
-                &ap_wire::command(0x5002, 87, &[0])?,
+                &ap_wire::delete(self.primary)?,
                 Publication::Vdev(Vdev::DeleteSent),
                 validate,
             )
@@ -132,7 +132,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Reconstruct the original inactive station discovery vdev only after
         // actual AP destruction. No AP/STA role alias or new DATA port exists.
         let own = self.ap.as_ref().unwrap().own.mac;
-        self.ap_command(&self.wire.create(own)?, validate).await?;
+        self.primary = super::p2p::Vdev::new(self.primary.id(), super::p2p::Role::Station);
+        self.ap_command(&self.primary.create(&self.wire, own)?, validate)
+            .await?;
         let nss = self
             .chains
             .ok_or(Error::Failed)?

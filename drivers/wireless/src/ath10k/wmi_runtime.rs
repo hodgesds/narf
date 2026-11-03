@@ -125,6 +125,13 @@ pub(super) struct Radio<T> {
     ap_dirty_wmm: bool,
     pub htt: htt::Runtime<T>,
     wire: wire::Wire,
+    /// `ar->free_vdev_map` from the real INIT resource count; set by
+    /// `start`, which allocates the managed role's vdev first.
+    vdev_map: Option<p2p::VdevMap>,
+    /// The managed netdev's vdev (station discovery, or the AP that replaced
+    /// it on the same id). Station peer/data and AP owners route by its id;
+    /// additional P2P role vdevs are allocated from `vdev_map` beside it.
+    primary: p2p::Vdev,
     features: u64,
     /// Linux `cryptmode=0` beside the RAW decap: station PTK/GTK go to the
     /// firmware key cache (`hw_keys`), software CCMP stays the fallback.
@@ -174,6 +181,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             ap_dirty_wmm: false,
             htt,
             wire: wire::Wire::new(dialect),
+            vdev_map: None,
+            primary: p2p::Vdev::new(0, p2p::Role::Station),
             features,
             hardware_keys: false,
             peer_pmf_offload: false,
@@ -240,7 +249,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let mac = self.htt.wmi.ready.ok_or(Error::Failed)?.mac;
-        let create = self.wire.create(mac)?;
+        // `mac.c::ath10k_add_interface`: the first interface takes the
+        // lowest free id of `(1 << max_num_vdevs) - 1`, i.e. vdev 0.
+        let (vdevs, _) = self.htt.wmi.ap_resources().ok_or(Error::Failed)?;
+        let mut vdev_map = p2p::VdevMap::new(vdevs)?;
+        let primary = p2p::Vdev::new(vdev_map.allocate()?, p2p::Role::Station);
+        let create = primary.create(&self.wire, mac)?;
         let configured = self.wire.channels(channels)?;
         let chains =
             chains::Chains::new(self.htt.wmi.initialized_chain_mask.ok_or(Error::Failed)?)?;
@@ -298,6 +312,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(crate::ath10k::control::Error::from)
             .map_err(htt::Error::from)?;
         self.chains = Some(chains);
+        self.vdev_map = Some(vdev_map);
+        self.primary = primary;
         self.ready = Some(ready);
         self.failed = false;
         Ok(ready)
@@ -399,7 +415,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         let event = self.wire.scan_event(&bytes[4..])?;
                         if event.sequence != 0xa000 | u32::from(sequence)
                             || event.request != 0xa001
-                            || event.vdev != 0
+                            || event.vdev != self.primary_vdev()
                         {
                             report.ignored = report.ignored.saturating_add(1);
                             continue;
@@ -483,6 +499,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub fn take_event(&mut self) -> Option<htt::Event> {
         self.pending.pop_front()
+    }
+    /// The managed role's firmware vdev id (WMI `vdev_id`, HTT routing key).
+    pub(in crate::ath10k) fn primary_vdev(&self) -> u32 {
+        u32::from(self.primary.id())
     }
 }
 fn beacon(event: &Management, channels: &[u16]) -> Result<Option<ScanBss>, Error> {

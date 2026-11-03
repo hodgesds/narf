@@ -121,7 +121,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let id = self.htt.begin_transmit(
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
-                vdev: 0,
+                vdev: self.primary.id(),
                 tid,
                 hardware_crypto: false,
             },
@@ -255,7 +255,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             management::Path::Htt => Token::Htt(self.htt.begin_transmit(
                 htt::tx::Parameters {
                     kind: htt::tx::Kind::Management,
-                    vdev: 0,
+                    vdev: self.primary.id(),
                     tid: 17,
                     hardware_crypto: false,
                 },

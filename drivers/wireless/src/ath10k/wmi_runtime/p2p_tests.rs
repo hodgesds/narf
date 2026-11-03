@@ -57,7 +57,8 @@ fn smoke_ath10k_p2p_vdev_create_roles() -> TestResult {
         }
     }
     if tlv.create(OWN) != Vdev::new(0, Role::Station).create(&tlv, OWN)
-        || super::super::ap_wire::create(OWN) != Vdev::new(0, Role::Ap).create(&tlv, OWN)
+        || super::super::ap_wire::create(Vdev::new(0, Role::Ap), OWN)
+            != Vdev::new(0, Role::Ap).create(&tlv, OWN)
     {
         return TestResult::Fail("vdev0 builders diverged");
     }
@@ -294,4 +295,53 @@ fn smoke_ath10k_p2p_tlv_combinations() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_tlv_combinations
+);
+
+/// VDEV_DELETE follows CREATE in every dialect's command table; TLV wraps
+/// it in tag 87 and the TLV AP delete is the former literal vdev0 command.
+/// A ROC scan carries the requesting vdev at `wmi_start_scan_common.vdev_id`.
+fn smoke_ath10k_p2p_vdev_delete_and_roc_vdev() -> TestResult {
+    for (dialect, id) in [
+        (Dialect::Main, 0x5002),
+        (Dialect::TenOne, 0x9012),
+        (Dialect::TenTwo, 0x9011),
+        (Dialect::TenTwoFour, 0x9011),
+        (Dialect::TenFour, 0x9014),
+    ] {
+        let wire = Wire::new(dialect);
+        let Ok(bytes) = Vdev::new(2, Role::P2pDevice).delete(&wire) else {
+            return TestResult::Fail("legacy delete refused");
+        };
+        if bytes.len() != 8 || wire::word(&bytes, 0) != Ok(id) || wire::word(&bytes, 4) != Ok(2) {
+            return TestResult::Fail("legacy delete layout");
+        }
+    }
+    let tlv = Wire::new(Dialect::Tlv);
+    if Vdev::new(1, Role::P2pDevice).delete(&tlv)
+        != Ok(vec![2, 0x50, 0, 0, 4, 0, 87, 0, 1, 0, 0, 0])
+        || super::super::ap_wire::delete(Vdev::new(0, Role::Ap))
+            != super::super::ap_wire::command(0x5002, 87, &[0])
+    {
+        return TestResult::Fail("TLV delete layout");
+    }
+    for dialect in [Dialect::Main, Dialect::TenTwo, Dialect::Tlv] {
+        let wire = Wire::new(dialect);
+        let base = if dialect == Dialect::Tlv { 8 } else { 4 };
+        let (Ok(zero), Ok(one)) = (wire.roc(0, 7, 2412, 100), wire.roc(1, 7, 2412, 100)) else {
+            return TestResult::Fail("roc refused");
+        };
+        if wire::word(&zero, base + 8) != Ok(0) || wire::word(&one, base + 8) != Ok(1) {
+            return TestResult::Fail("roc vdev_id");
+        }
+        let mut patched = one.clone();
+        patched[base + 8] = 0;
+        if patched != zero {
+            return TestResult::Fail("roc vdev changed other fields");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_vdev_delete_and_roc_vdev
 );

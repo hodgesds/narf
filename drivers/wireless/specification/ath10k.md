@@ -2089,9 +2089,21 @@ will bind; none of them grants RF, peer, key or data authority.
   (the AP builder additionally refuses a zero/multicast own address).
 - **Vdev ids.** `VdevMap` mirrors `ar->free_vdev_map` (INIT `num_vdevs`,
   lowest free bit as `__ffs64`); exhaustion is `Exhausted` (Linux
-  `-EBUSY`), double or out-of-range release is an error. The running
-  station and AP owners still use vdev0 only; the per-vdev refactor of
-  `Radio` (`peer`, `data`, `ap`, HTT vdev routing) is not done.
+  `-EBUSY`), double or out-of-range release is an error. `Radio::start`
+  builds the map from the real INIT `num_vdevs` and allocates the managed
+  role's vdev first (`Radio::primary`, id 0 as Linux's first interface).
+  Scan/dwell/associated-scan/beacon-hint events, HTT TX parameters, the
+  station `Peer` (which records its vdev) and its RX indications, the AP
+  RX/TX paths and the ROC `Work` all route by that id instead of a literal
+  0; the AP replaces the station role on the same id and restores it at
+  stop (`ap_wire::create/delete(vdev)`; the TLV delete is byte-identical to
+  the former literal command). `Vdev::delete` is `WMI_VDEV_DELETE_CMDID`
+  (CREATE+1 in every dialect, TLV tag 87). The ROC scan writes the owning
+  vdev at `wmi_start_scan_common.vdev_id` (`mac.c::ath10k_remain_on_channel`
+  uses `arvif->vdev_id`). Station/AP WMI builders whose `vdev_id` field is
+  still the implicit zero (peer, start/up/down, params) remain valid only
+  because the primary role always holds id 0; a second vdev may not use
+  them.
 - **GO beacon P2P IE.** `go_beacon_ie` follows
   `mac.c::ath10k_mac_setup_bcn_p2p_ie` + `ath10k_mac_remove_vendor_ie`:
   for a GO vdev the first WFA P2P vendor IE after the beacon fixed fields
@@ -2119,8 +2131,7 @@ will bind; none of them grants RF, peer, key or data authority.
   or `ATH10K_FW_FEATURE_NO_P2P` (bit 3). It is not yet returned from
   `interface_combinations`.
 
-Remaining before the row can be claimed: per-vdev `Radio` refactor so a
-second vdev can coexist with the managed/AP vdev0; a control-only
+Remaining before the row can be claimed: a control-only
 P2P_DEVICE WDEV owning its own vdev for discovery ROC/FRAME
 (`async_p2p_device_control`, `async_p2p_management_{rx,tx}_control`); a
 P2P client netdev role (iftype 8, STA vdev subtype P2P_CLI) reusing the
@@ -2134,7 +2145,8 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_go_beacon_ie_moves_to_firmware`,
 `smoke_ath10k_p2p_noa_event_builds_absence_ie`,
 `smoke_ath10k_p2p_noa_owner_probe_response_only`,
-`smoke_ath10k_p2p_tlv_combinations`.
+`smoke_ath10k_p2p_tlv_combinations`,
+`smoke_ath10k_p2p_vdev_delete_and_roc_vdev`.
 
 ## 4. Invariants
 

@@ -34,6 +34,9 @@ pub(super) struct Completed {
 }
 #[derive(Debug)]
 pub(super) struct Work {
+    /// The vdev the ROC scan runs on (`mac.c::ath10k_remain_on_channel`
+    /// uses the requesting interface's `arvif->vdev_id`).
+    pub vdev: u8,
     pub owner: Owner,
     pub receipt: Receipt,
     plan: active_scan::Plan,
@@ -186,9 +189,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .checked_add(1)
             .filter(|n| *n <= 4095)
             .ok_or(Error::Exhausted)?;
-        let command = self
-            .wire
-            .roc(sequence, receipt.frequency, receipt.duration)?;
+        let command = self.wire.roc(
+            self.primary.id(),
+            sequence,
+            receipt.frequency,
+            receipt.duration,
+        )?;
         // Invalidate every copied RX batch before changing physical RF. The
         // shared epoch already fences native40->20; no pre-ROC PPDU or host
         // callback may cross this additional channel-ownership boundary.
@@ -208,6 +214,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.scan_terminal = None;
         let home = plan.station.is_none();
         self.roc = Some(Box::new(Work {
+            vdev: self.primary.id(),
             owner,
             receipt,
             plan,
@@ -306,7 +313,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let event = self.wire.scan_event(&bytes[4..])?;
         if event.sequence != 0xa000 | u32::from(self.scan_pending.ok_or(Error::Failed)?)
             || event.request != 0xa001
-            || event.vdev != 0
+            || event.vdev != u32::from(w.vdev)
         {
             return Ok(());
         }

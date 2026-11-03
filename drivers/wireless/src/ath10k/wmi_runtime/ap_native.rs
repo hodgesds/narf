@@ -153,7 +153,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 // TLV RX_IN_ORD supplies the same complete RAW descriptor
                 // plus an exact owned DMA pointer/peer/vdev/TID receipt.
                 // Decapped offload/fragment forms supply no AP RAW authority.
-                if !indication.offload && !indication.fragment && indication.vdev == 0 {
+                if !indication.offload
+                    && !indication.fragment
+                    && u32::from(indication.vdev) == self.primary_vdev()
+                {
                     for frame in frames {
                         self.ap.as_mut().ok_or(Error::Failed)?.receive(
                             1,
@@ -403,7 +406,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         self.ap_prefix(&current).await?;
         self.ap_publish(
-            &ap_wire::command(0x5002, 87, &[0])?,
+            &ap_wire::delete(self.primary)?,
             ap::Publication::Vdev(Vdev::DeleteSent),
             &current,
         )
@@ -412,7 +415,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.ap.as_mut().unwrap().vdev = Vdev::Absent;
         self.ap_prefix(&current).await?;
         self.ap.as_mut().unwrap().vdev = Vdev::CreateSent;
-        self.ap_command(&ap_wire::create(own)?, &current).await?;
+        // The AP replaces the station discovery role on the same id.
+        self.primary = super::p2p::Vdev::new(self.primary.id(), super::p2p::Role::Ap);
+        self.ap_command(&ap_wire::create(self.primary, own)?, &current)
+            .await?;
         self.ap_barrier(&current).await?;
         self.ap.as_mut().unwrap().vdev = Vdev::Created;
         self.ap_create_peer(own, &current).await?;
@@ -548,7 +554,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let id = self.htt.begin_transmit(
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
-                vdev: 0,
+                vdev: self.primary.id(),
                 tid,
                 hardware_crypto: false,
             },

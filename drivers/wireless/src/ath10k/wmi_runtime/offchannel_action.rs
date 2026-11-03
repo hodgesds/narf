@@ -251,7 +251,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 let (id, command) = self.htt.prepare_offchannel(
                     Parameters {
                         kind: Kind::Management,
-                        vdev: 0,
+                        vdev: self.roc.as_ref().ok_or(Error::Failed)?.vdev,
                         tid: 17,
                         hardware_crypto: false,
                     },

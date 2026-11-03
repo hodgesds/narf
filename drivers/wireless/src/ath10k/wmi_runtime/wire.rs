@@ -374,12 +374,20 @@ impl Wire {
         }
         Ok(out)
     }
-    pub fn roc(&self, sequence: u16, frequency: u16, duration: u32) -> Result<Vec<u8>, Error> {
+    pub fn roc(
+        &self,
+        vdev: u8,
+        sequence: u16,
+        frequency: u16,
+        duration: u32,
+    ) -> Result<Vec<u8>, Error> {
         if !(1..=super::offchannel::MAX_DURATION).contains(&duration) {
             return Err(Error::Unsupported);
         }
         let mut out = self.scan(sequence, &[frequency])?;
         let base = if self.dialect == Dialect::Tlv { 8 } else { 4 };
+        // `wmi_start_scan_common.vdev_id` follows scan_id and scan_req_id.
+        put(&mut out, base + 8, u32::from(vdev));
         // mac.c::ath10k_remain_on_channel fields, with a stricter native
         // finite dwell/max-scan budget. A delayed host/credit waiter cannot
         // extend RF beyond this requested interval. 10.x has no burst word.
