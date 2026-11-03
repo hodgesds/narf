@@ -196,7 +196,9 @@ pub(super) struct Controller {
     peer: Option<Peer>,
     admission: Option<Admission>,
     /// Static BA CAM entries (`rtw8852b bacam_num = 2`): owning TID.
-    ba_cam: [Option<u8>; 2],
+    /// Static BA CAM owners: `bacam_num` 2 on B, 8 on C (only the first
+    /// `bacam_num()` slots are used).
+    ba_cam: [Option<u8>; 8],
     /// Random scan address currently in the address CAM SMA.
     scan: Option<[u8; 6]>,
     /// Committed association identifier (firmware-swap restore input).
@@ -234,7 +236,7 @@ impl Controller {
             phase: Phase::New,
             peer: None,
             admission: None,
-            ba_cam: [None; 2],
+            ba_cam: [None; 8],
             scan: None,
             aid: None,
             ra: None,
@@ -259,6 +261,14 @@ impl Controller {
             (2, codec::fixed_cctl(ghz5))
         }
     }
+    /// `rtw8852b_chip_info.bacam_num` 2 / `rtw8852c_chip_info.bacam_num` 8.
+    fn bacam_num(&self) -> usize {
+        if self.chip == ChipId::Rtl8852C {
+            8
+        } else {
+            2
+        }
+    }
     pub(super) fn phase(&self) -> Phase {
         if self.admission.as_ref().is_some_and(Admission::closed) && self.phase != Phase::Stopped {
             Phase::Failed
@@ -271,7 +281,7 @@ impl Controller {
     }
     pub(super) fn invalidate(&mut self) {
         self.phase = Phase::Failed;
-        self.ba_cam = [None; 2];
+        self.ba_cam = [None; 8];
         if let Some(peer) = &self.peer {
             peer.invalidate();
         }
@@ -303,6 +313,15 @@ impl Controller {
             }
             Ok(())
         })?;
+        // core.c `rtw89_core_start` -> `rtw89_fw_h2c_init_ba_cam`: C
+        // (`RTW89_BACAM_V0_EXT`) arms its 8 dynamic BA CAM entries
+        // (`bacam_num`..+`bacam_dynamic_num`, uid 0..7) with DONE_ACK.
+        if self.chip == ChipId::Rtl8852C {
+            for uid in 0..8u8 {
+                let body = codec::init_ba_cam_v0_ext(8 + uid, uid);
+                command(io, 0xc, 0, &body, true, Some(admission)).await?;
+            }
+        }
         command(io, 9, 8, &codec::pause(false), false, Some(admission)).await?;
         pause_applied(io, false, Some(admission)).await?;
         command(io, 8, 4, &codec::role(false), true, Some(admission)).await?;
@@ -589,17 +608,17 @@ impl Controller {
         }
         let peer = self.peer.clone().ok_or(Error::Terminal)?;
         peer.current()?;
+        let cams = &self.ba_cam[..self.bacam_num()];
         let entry = if valid {
-            match self.ba_cam.iter().position(Option::is_none) {
+            match cams.iter().position(Option::is_none) {
                 Some(index) => Some(index),
-                None if tid == 0 || tid == 5 => self
-                    .ba_cam
-                    .iter()
-                    .position(|owner| !matches!(owner, Some(0 | 5))),
+                None if tid == 0 || tid == 5 => {
+                    cams.iter().position(|owner| !matches!(owner, Some(0 | 5)))
+                }
                 None => None,
             }
         } else {
-            self.ba_cam.iter().position(|owner| *owner == Some(tid))
+            cams.iter().position(|owner| *owner == Some(tid))
         };
         let Some(entry) = entry else {
             return Ok(());
@@ -611,7 +630,11 @@ impl Controller {
             peer: Some(peer.clone()),
             armed: true,
         };
-        let body = codec::ba_cam(valid, entry as u8, tid, buf, ssn);
+        let body = if self.chip == ChipId::Rtl8852C {
+            codec::ba_cam_v0_ext(valid, entry as u8, tid, buf, ssn)
+        } else {
+            codec::ba_cam(valid, entry as u8, tid, buf, ssn)
+        };
         command(io, 0xc, 0, &body, true, Some(admission)).await?;
         admission.run(|| {
             peer.current()?;

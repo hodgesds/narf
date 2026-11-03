@@ -3515,6 +3515,20 @@ station. Unexecuted case:
 (plus the extended `smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info`
 and `smoke_rtw89_native_rejects_unsupported_extents`).
 
+**C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
+`Controller::initialize` first sends core.c `rtw89_core_start`'s
+`rtw89_fw_h2c_init_ba_cam` -> fw.c `rtw89_fw_h2c_init_dynamic_ba_cam_v0_ext`:
+eight `H2C_FUNC_MAC_BA_CAM` (class 0xc, function 0, DONE_ACK) bodies
+`codec::init_ba_cam_v0_ext(8 + uid, uid)` (W0 VALID; W1 ENTRY_IDX_V1
+[31:28], UID [7:0], BAND/STD_EN 0) for `bacam_num` 8 .. +`bacam_dynamic_num`
+8. Recipient sessions use C's 8 static entries (`bacam_num()`; B keeps 2)
+with core.c `rtw89_core_acquire_sta_ba_entry`'s TID0/5 replacement, and
+`codec::ba_cam_v0_ext` (no W0 ENTRY_IDX; W1 ENTRY_IDX_V1, STD_EN, BAND =
+`mac_idx` 0; an invalidation carries only MACID and W1 ENTRY_IDX_V1). The
+recipient path is reached only under the (not yet admitted) C HT program.
+B bytes are unchanged. Unexecuted case:
+`smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c`.
+
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 
 `Startup` now retains an `ApController` beside the same `Firmware<Native>`

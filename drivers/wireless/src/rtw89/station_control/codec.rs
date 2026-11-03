@@ -297,6 +297,34 @@ pub(super) fn ba_cam_at(macid: u8, valid: bool, entry: u8, tid: u8, buf: u16, ss
     word(&mut bytes, 0, w0);
     bytes
 }
+/// `rtw89_fw_h2c_ba_cam` under `RTW89_BACAM_V0_EXT` (RTL8852C): W0 VALID,
+/// INIT_REQ, TID, MACID, BMAP_SIZE, SSN as v0 but no W0 ENTRY_IDX; W1
+/// `ENTRY_IDX_V1`[31:28], `STD_EN` BIT 8 and `BAND` BIT 9 (`mac_idx` 0).
+/// An invalidation carries only MACID and W1 ENTRY_IDX_V1.
+pub(super) fn ba_cam_v0_ext(valid: bool, entry: u8, tid: u8, buf: u16, ssn: u16) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    let mut w0 = 0u32;
+    let mut w1 = u32::from(entry & 0xf) << 28;
+    if valid {
+        w0 |= 1
+            | 1 << 1
+            | u32::from(tid & 0xf) << 4
+            | if buf > 64 { 4 << 16 } else { 0 }
+            | u32::from(ssn & 0xfff) << 20;
+        w1 |= 1 << 8;
+    }
+    word(&mut bytes, 0, w0);
+    word(&mut bytes, 1, w1);
+    bytes
+}
+/// fw.c `rtw89_fw_h2c_init_ba_cam_v0_ext` for dynamic entry `entry` /
+/// `uid`: W0 VALID; W1 ENTRY_IDX_V1, UID[7:0], BAND 0, STD_EN 0.
+pub(super) fn init_ba_cam_v0_ext(entry: u8, uid: u8) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    word(&mut bytes, 0, 1);
+    word(&mut bytes, 1, u32::from(entry & 0xf) << 28 | u32::from(uid));
+    bytes
+}
 /// Negotiated HT facts consumed by `rtw89_phy_ra_sta_update`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rtw89) struct HtRa {

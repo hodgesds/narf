@@ -1072,3 +1072,34 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1
 );
+fn smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c() -> TestResult {
+    // rtw89_fw_h2c_ba_cam, RTW89_BACAM_V0_EXT: no W0 ENTRY_IDX, W1
+    // ENTRY_IDX_V1[31:28] | STD_EN; BAND 0 (mac_idx 0).
+    let v0 = codec::ba_cam(true, 1, 5, 64, 0x123);
+    let ext = codec::ba_cam_v0_ext(true, 7, 5, 64, 0x123);
+    if word_at(&ext, 0) != word_at(&v0, 0) & !(3 << 2)
+        || word_at(&ext, 1) != (7 << 28 | 1 << 8)
+        || word_at(&codec::ba_cam_v0_ext(true, 0, 0, 256, 0), 0) != (1 | 1 << 1 | 4 << 16)
+    {
+        return TestResult::Fail("C BA CAM V0_EXT body differs from fw.c");
+    }
+    // Invalidation: MACID 0 and W1 ENTRY_IDX_V1 only.
+    let off = codec::ba_cam_v0_ext(false, 6, 5, 64, 0x123);
+    if word_at(&off, 0) != 0 || word_at(&off, 1) != 6 << 28 {
+        return TestResult::Fail("C BA CAM invalidation differs");
+    }
+    // rtw89_fw_h2c_init_ba_cam_v0_ext: VALID, entry 8 + uid, uid.
+    for uid in 0..8u8 {
+        let init = codec::init_ba_cam_v0_ext(8 + uid, uid);
+        if word_at(&init, 0) != 1
+            || word_at(&init, 1) != (u32::from(8 + uid) << 28 | u32::from(uid))
+        {
+            return TestResult::Fail("C dynamic BA CAM init differs");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c
+);
