@@ -1891,7 +1891,12 @@ checked before parsing) and a value in `[0, pid_max]` (`EINVAL`), and sets the
 cursor to `value + 1`. It is published in every build. `pid_max` is one global
 value shared by all namespaces (Linux 6.14+ keeps it per namespace).
 
-Userspace core dumps honor `RLIMIT_CORE` and emit ELF64 metadata with
+Userspace core dumps honor `RLIMIT_CORE` and, like Linux `vma_dump_size` for
+`VM_IO`/`VM_PFNMAP`, write no bytes for device mappings (regions carrying a
+non-write-back memory type, such as DRM VRAM BAR mappings): their `PT_LOAD`
+keeps `p_memsz` with `p_filesz = 0`. A page whose frame is not System RAM is
+written as zeros, never read through the direct map. Core dumps emit ELF64
+metadata with
 `PT_NOTE` data immediately after the ELF header, before the VMA program-header
 table. Metadata is written as one sequential buffer (retrying short writes),
 so a partial dump preserves process identity and raw register notes before a
