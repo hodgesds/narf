@@ -22,7 +22,6 @@ rtlwifi	rtl8192ce_family	RTL8192CE retained runtime including exact RTL8188CE RF
 rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rtl8192de dual-MAC per-function runtime (shared MAC/PHY ownership, dual-band tables) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1477
 rtlwifi	rtl8723ae	RTL8723AE retained runtime; blocked on porting the rtl8723ae runtime (firmware event mailbox, BT coexistence) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
 rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be runtime (C2H packets, BT coexistence, antenna path) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
-rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2196
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2198
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2257
 rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading and its NHM noise monitoring (support_noise)	chip	drivers/wireless/specification/rtw89.md	2256
