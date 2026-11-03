@@ -3,6 +3,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 #[path = "reg/policy.rs"]
 pub mod policy;
+#[path = "reg/witness.rs"]
+pub mod witness;
 
 #[derive(Clone)]
 pub struct RegulatoryDomain {

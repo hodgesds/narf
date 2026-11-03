@@ -14,6 +14,7 @@ use super::{beacon, wire, Error, Management, ScanEvent};
 use crate::ath10k::regulatory::Factory;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
+use narf_wireless::reg::witness::{self, BeaconWitness, ScanGeneration};
 use narf_wireless::reg::{db, RegulatoryDomain};
 
 const FREQUENCIES: [u16; 25] = [
@@ -201,6 +202,8 @@ pub(super) struct Scan {
     started: bool,
     dwell: Option<u16>,
     terminal: bool,
+    /// Shared `narf_wireless::reg::witness` generation of this scan.
+    generation: ScanGeneration,
 }
 impl Scan {
     pub fn event(&mut self, event: &ScanEvent, channels: &[u16]) {
@@ -237,7 +240,9 @@ pub(super) struct Owner {
     radio: Arc<Life>,
     window: Option<Arc<Window>>,
     observed: u32,
-    radar: u32,
+    /// Radar `beacon_found` witnesses (shared driver-neutral record, scoped
+    /// to the window's policy snapshot and latest covering scan).
+    radar: BeaconWitness,
 }
 impl Owner {
     pub fn new() -> Self {
@@ -246,7 +251,7 @@ impl Owner {
             radio: Arc::new(Life(AtomicBool::new(true))),
             window: None,
             observed: 0,
-            radar: 0,
+            radar: BeaconWitness::new(),
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -279,18 +284,25 @@ impl Owner {
                 radio: Arc::downgrade(&self.radio),
             }));
             self.observed = 0;
-            self.radar = 0;
+            self.radar.clear();
         }
+        let window = self.window.as_ref()?.clone();
         // A radar witness is "heard in the current scan": a new scan that
         // covers a channel retracts its earlier observation until re-heard.
-        self.radar &= !allowed;
+        let covered: alloc::vec::Vec<u16> = channels
+            .iter()
+            .copied()
+            .filter(|f| bit(*f).is_some())
+            .collect();
+        let generation = self.radar.begin_scan(&window.original, &covered);
         Some(Scan {
-            window: self.window.as_ref()?.clone(),
+            window,
             sequence,
             allowed,
             started: false,
             dwell: None,
             terminal: false,
+            generation,
         })
     }
     /// Called only with the original decoded native WMI event in the actual
@@ -328,20 +340,14 @@ impl Owner {
         // Explicit host DFS never becomes a World NO_IR hint, even on a
         // normally non-DFS center; it becomes only the client radar witness.
         // NO_IR remains a separate immutable host restriction.
-        let low = u32::from(frequency) - 10;
-        let high = u32::from(frequency) + 10;
-        let radar = scan.window.original.rules.iter().any(|rule| {
-            rule.freq_start_mhz < high
-                && low < rule.freq_end_mhz
-                && rule.flags.contains(narf_wireless::reg::RegFlags::DFS)
-        });
+        let radar = witness::is_radar(&scan.window.original, frequency);
         if !scan.window.current() {
             return Ok(());
         }
         let b = bit(frequency).unwrap_or(0);
         if radar {
             if crate::ath10k::regulatory::Permission::dfs_frequency(frequency) {
-                self.radar |= b;
+                let _ = self.radar.beacon_found(scan.generation, frequency);
             }
         } else if world(scan.window.factory) {
             self.observed |= b;
@@ -368,10 +374,15 @@ impl Owner {
         if !window.current() || !same_domain(&window.original, domain) {
             return None;
         }
+        let radar = FREQUENCIES
+            .iter()
+            .filter(|f| self.radar.heard(&window.original, **f))
+            .filter_map(|f| bit(*f))
+            .fold(0, |mask, b| mask | b);
         Some(Arc::new(Receipt {
             window: window.clone(),
-            observed: self.observed | self.radar,
-            radar: self.radar,
+            observed: self.observed | radar,
+            radar,
         }))
     }
     pub fn retire(&self) {

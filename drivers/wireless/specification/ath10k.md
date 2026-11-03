@@ -1819,7 +1819,12 @@ is the passive scan).
 channel from the same native Beacon-in-matching-dwell source as §3.2, for
 every factory SKU (World or fixed country). A new scan whose channel list
 covers a radar channel retracts that channel's witness until it is heard
-again ("heard in the current scan"). Only `Owner::client_receipt`, consumed
+again ("heard in the current scan"). The witness set, its scan generations,
+retraction and the RADAR classification are the shared driver-neutral
+`narf_wireless::reg::witness::{BeaconWitness, is_radar}` (wireless spec §3.5
+"Station passive-channel witness"), bound to the hint window's policy
+snapshot; ath10k still records only its `Permission::dfs_frequency`
+inventory and keeps its own mask-based `Receipt`. Only `Owner::client_receipt`, consumed
 solely by `station_profile`, carries the radar mask; it also satisfies the
 World NO_IR layer on those channels because cfg80211 `reg.c::handle_reg_beacon`
 clears NO_IR without a RADAR test. `Permission::from_factory_width_with_hint`

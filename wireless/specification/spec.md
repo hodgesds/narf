@@ -2556,6 +2556,28 @@ the `db.txt` values. `WmmRule::limit(ac, ap, wmm::Ac) -> wmm::Ac` is mac80211
 the floor and caps TXOP at COT/32 us. `limit_parameters(ap, wmm::Parameters)`
 applies it in the parser's ACI order (BE, BK, VI, VO). A driver applies it to
 every EDCA set it programs on a channel whose rule carries the WMM rule.
+
+**Station passive-channel witness (`reg::witness`).** cfg80211 marks a
+20 MHz channel `IEEE80211_CHAN_RADAR` / `NO_IR` when an overlapping rule
+carries DFS / NO_IR (reg.c `handle_channel_single_rule`); mac80211 scans those
+passively (scan.c `ieee80211_scan_state_decision`, `ieee80211_prep_hw_scan`)
+and a station joins only a BSS it heard (scan.c `cfg80211_bss_update`, reg.c
+`regulatory_hint_found_beacon` / `beacon_found`). Driver-neutral helpers:
+`span_flags(domain, center) -> Option<RegFlags>` (union over rules overlapping
+`center±10`, open interval), `is_radar`, `passive_only` (DFS or NO_IR) and
+`may_probe` (covered and neither; no probe request otherwise).
+`BeaconWitness` holds per-20 MHz-center witnesses scoped to one policy
+snapshot (`Arc` identity) and to the latest scan generation covering each
+center: `begin_scan(&policy, centers) -> ScanGeneration` (new snapshot
+discards all; each covered center is retracted until re-heard),
+`beacon_found(generation, center) -> bool` (only the latest covering
+generation records; the caller validates the Beacon and its dwell),
+`heard(&policy, center)`, `clear()`, and `may_associate(&policy, centers)`:
+nonempty, every constituent covered, every passive-only constituent heard.
+The same query gates a station CSA target. A witness never authorizes probe,
+AP, IBSS, P2P or off-channel TX; bandwidth, power, indoor and inventory checks
+stay with the driver. Users: ath10k (`beacon_hints::Owner`, radar only) and
+rtw89 (station scan / association / CSA).
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 
