@@ -42,10 +42,12 @@
 //! silent resynchronisation. Station profile here: one outstanding frame,
 //! forced legacy driver rate, fallback disabled, `RATR_INX_WIRELESS_MC`
 //! (8192EE has no `RTL_SPEC_NEW_RATEID`), no protection, aggregation or
-//! short GI; received HT/A-MPDU frames and C2H packets are consumed and
-//! dropped. The owner cannot reach `MacConfigured` until the 8192EE
+//! short GI; received HT/A-MPDU frames are consumed and dropped; C2H packets
+//! are parsed (`rtl8192ee/c2h.rs`). Interrupts use the 8192EE profile
+//! (`rtl8192ee/h2c.rs`) and a stopped owner's DMA is released only after
+//! the card-disable retirement proof (`ee92_quiesce`). The owner cannot reach `MacConfigured` until the 8192EE
 //! PHY/RF/channel steps exist, so none of this is reachable from probe.
-use super::super::super::rtl8192ee::{mac, trx};
+use super::super::super::rtl8192ee::{c2h, h2c, mac, trx};
 use super::{
     extent, queue, Delivery, Error, Io, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep,
     RX_BASE, RX_BUFFER, TX_BASES,
@@ -100,6 +102,15 @@ pub(in super::super) struct State {
     remained: u16,
     /// Programmed station channel (set by the 8192EE channel step).
     pub(in super::super) channel: Option<u8>,
+    /// `rtl8192ee/fw.c` H2C mailbox (`last_hmeboxnum`, power-save gate).
+    pub(in super::super) mailbox: h2c::Mailbox,
+    /// `rtlpriv->tx_report` sequence state (V1 reports).
+    pub(in super::super) reports: c2h::TxReportState,
+    /// Latest C2H TX report `(sn, acked, retry)`.
+    pub(in super::super) tx_report: Option<(u16, bool, u8)>,
+    /// Pending C2H RA report `(rate, collision)` for the DM step's
+    /// `rtl92ee_dm_dynamic_arfb_select` (Linux: `c2hcmd_wq`).
+    pub(in super::super) ra_report: Option<(u8, bool)>,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -107,9 +118,38 @@ impl State {
             started: false,
             remained: 0,
             channel: None,
+            mailbox: h2c::Mailbox::default(),
+            reports: c2h::TxReportState::default(),
+            tx_report: None,
+            ra_report: None,
+        }
+    }
+    /// `rtl_c2h_content_parsing` for the packets this profile consumes.
+    /// Malformed packets are consumed without effect, as Linux logs them.
+    fn c2h(&mut self, packet: &[u8]) {
+        match c2h::parse(packet) {
+            Ok(c2h::Event::TxReport { sn, st, retry }) => {
+                self.reports.record(sn);
+                self.tx_report = Some((sn, st == 0, retry));
+            }
+            Ok(c2h::Event::RaReport { rate, collision }) => {
+                self.ra_report = Some((rate, collision));
+            }
+            _ => {}
         }
     }
 }
+
+/// Bytes of a C2H packet the owner copies out of an RX buffer (the V1 TX
+/// report needs 9, the RA report 6).
+const C2H_COPY: usize = 32;
+/// `RTL8192E_TRANS_ACT_TO_LPS` 0x5f8..0x5fb polls (`rtl_hal_pwrseqcmdparsing`
+/// polling bound, 5000 × 10 us).
+const TX_EMPTY_POLLS: usize = 5000;
+/// `REG_RXDMA_CONTROL` and its RX DMA pause bit (`0x284[18]`,
+/// `_rtl8192ee_reset_pcie_interface_dma` step 2).
+const REG_RXDMA_CONTROL: u16 = 0x0286;
+const RXDMA_PAUSE: u8 = 1 << 2;
 
 fn write_words(ring: &mut impl Memory, offset: usize, words: &[u32]) -> Result<(), Error> {
     for (word, value) in words.iter().copied().enumerate() {
@@ -583,6 +623,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 return Err(Error::Descriptor);
             }
             let mut packet = None;
+            let mut report = None;
+            if status.c2h && length >= c2h::C2H_DATA_OFFSET {
+                let mut bytes = [0u8; C2H_COPY];
+                let take = length.min(C2H_COPY);
+                buffer.read_bytes(start, &mut bytes[..take])?;
+                report = Some((bytes, take));
+            }
             if !status.c2h
                 && !status.crc
                 && !status.icv
@@ -614,12 +661,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
             write_words(ring, offset, &trx::RxBufferDesc::prepare(buffer_addr).dw)?;
             ring.sync();
-            Ok(Some(packet))
+            Ok(Some((packet, report)))
         })?;
-        let Some(packet) = consumed else {
+        let Some((packet, report)) = consumed else {
             self.phase = Phase::Running;
             return Ok(idle);
         };
+        if let Some((bytes, take)) = report {
+            self.packet.ee92.c2h(&bytes[..take]);
+        }
         let next = (slot + 1) % DEPTH;
         self.packet.receive = next;
         self.packet.ee92.remained -= 1;
@@ -629,6 +679,117 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             consumed: true,
             packet,
         })
+    }
+
+    /// `rtl92ee_enable_interrupt` (HIMR/HIMRE = `irq_mask[0]`/`[1]`; no
+    /// status clear, HSIMR or C2H-event write on this chip). Only a running
+    /// owner whose vector is bound may unmask; the polling fallback keeps
+    /// every mask clear.
+    pub(super) fn ee92_enable_interrupts(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.authority(true, || Ok(()))?;
+        self.packet.interrupts = true;
+        h2c::enable_interrupt(&self.io)?;
+        if self.io.read32(h2c::REG_HIMR)? != h2c::IRQ_MASK0
+            || self.io.read32(h2c::REG_HIMRE)? != h2c::IRQ_MASK1
+        {
+            return Err(Error::Readback);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// One `_rtl_pci_interrupt` recognition pass for the 8192EE profile
+    /// (`rtl92ee_interrupt_recognized`).
+    pub(super) fn ee92_recognize_interrupts(
+        &mut self,
+    ) -> Result<super::super::super::irq::Recognized, Error> {
+        if self.phase != Phase::Running || !self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let (inta, intb) = h2c::service_interrupt(&self.io)?;
+        self.phase = Phase::Running;
+        Ok(super::super::super::irq::Recognized { inta, intb })
+    }
+
+    /// Card-disable DMA retirement proof for a stopped 8192EE owner, from
+    /// the `rtl92ee_card_disable` sources: with TX paused (`0x522 = 0xff`),
+    /// host DMA stopped (`0x301 = 0xff`) and bus mastering cleared by
+    /// `stop_packets`, the `RTL8192E_TRANS_ACT_TO_LPS` TX packet-buffer polls
+    /// (0x5f8..=0x5fb zero, 5000 × 10 us); every TX queue's device read
+    /// point at the host write point (`rtl92ee_is_tx_desc_closed` for every
+    /// published BD: nothing left for the engine to fetch); then RX DMA
+    /// paused by `REG_RXDMA_CONTROL` BIT(2) (`_rtl8192ee_reset_pcie_
+    /// interface_dma` step 2) and read back. The 8192EE sources have no RX
+    /// DMA idle bit (the 88EE `0x286` BIT(1) poll is not applied); the RX
+    /// side rests on that pause plus the cleared bus mastering. Any timeout
+    /// or disagreement leaves every mapping retained. Success allows the
+    /// published rings and buffers to be unmapped.
+    pub(super) async fn ee92_quiesce(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Stopped || !self.published {
+            return Err(Error::State);
+        }
+        if self.io.read8(0x522)? != 0xff || self.io.read8(0x301)? != 0xff {
+            return Err(Error::Readback);
+        }
+        let mut empty = false;
+        for _ in 0..TX_EMPTY_POLLS {
+            if self.io.read32(0x5f8)? == u32::MAX {
+                return Err(Error::Access(super::super::AccessError::Gone));
+            }
+            let mut busy = false;
+            for reg in 0x5f8..=0x5fb {
+                busy |= self.io.read8(reg)? != 0;
+            }
+            if !busy {
+                empty = true;
+                break;
+            }
+            self.io.delay_us(10).await;
+        }
+        if !empty {
+            return Err(Error::PacketTimeout);
+        }
+        for (queue, index) in INDEX.iter().enumerate() {
+            let Some(index) = *index else { continue };
+            let (rp, wp) = trx::tx_points(self.io.read32(index)?);
+            if usize::from(wp) != self.packet.next[queue] || rp != wp {
+                return Err(Error::PacketTimeout);
+            }
+        }
+        let control = self.io.read8(REG_RXDMA_CONTROL)?;
+        self.io.write8(REG_RXDMA_CONTROL, control | RXDMA_PAUSE)?;
+        if self.io.read8(REG_RXDMA_CONTROL)? & RXDMA_PAUSE == 0 {
+            return Err(Error::Readback);
+        }
+        self.published = false;
+        Ok(())
+    }
+
+    /// The pending C2H RA report's `rtl92ee_dm_dynamic_arfb_select`
+    /// (`REG_DARFRC` pair), run by the DM step inside the owner's current
+    /// authority (Linux runs it from `c2hcmd_wq`). Returns whether a report
+    /// was applied.
+    pub(super) fn ee92_apply_ra_report(&mut self) -> Result<bool, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        let Some((rate, collision)) = self.packet.ee92.ra_report.take() else {
+            return Ok(false);
+        };
+        self.phase = Phase::Failed;
+        c2h::apply_dynamic_arfb(&self.io, rate, collision)?;
+        self.phase = Phase::Running;
+        Ok(true)
+    }
+
+    /// Take the latest C2H TX report `(sn, acked, retry)`.
+    pub(super) fn ee92_take_tx_report(&mut self) -> Option<(u16, bool, u8)> {
+        self.packet.ee92.tx_report.take()
     }
 }
 

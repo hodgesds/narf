@@ -2173,9 +2173,24 @@ diagnostic (`pci::bring_up` does not retain it).
   re-prepared and the advanced `next_rx_rp` written to `0x3b4`.
   Deliberate: an RX BD never showing completion is not consumed; the BD is
   re-prepared before the `0x3b4` acknowledgement; host/device pointer
-  disagreement fails the owner. IRQ unmask/recognition is refused (polled
-  until the 8192EE IRQ profile exists); the 88EE quiescence registers are
-  not accepted as an 8192EE retirement proof, so its DMA stays pinned.
+  disagreement fails the owner. Interrupts use the 8192EE profile
+  (`h2c` below; `enable_interrupts`/`recognize_interrupts` dispatch to it)
+  and C2H RX packets are parsed (below) instead of dropped. Card-disable
+  retirement proof (`quiesce` → `ee92_quiesce`, from the
+  `rtl92ee_card_disable` sources; the 88EE `0x286` BIT(1) RX-idle poll is
+  not applied, the 8192EE sources have no such bit): stopped owner with
+  `0x522 = 0xff` and `0x301 = 0xff`, the `RTL8192E_TRANS_ACT_TO_LPS` TX
+  packet-buffer polls (0x5f8..=0x5fb zero, 5000 × 10 us), every TX queue's
+  device read point at the host write point (nothing left to fetch), then
+  RX DMA paused by `REG_RXDMA_CONTROL` BIT(2) (`_rtl8192ee_reset_pcie_
+  interface_dma` step 2) with read-back; any timeout or disagreement keeps
+  every mapping pinned. The RX side of the proof rests on that pause and
+  the cleared bus mastering. `power_runtime::disable_rtl8192ee` is
+  `_rtl92ee_poweroff_adapter` in source order (LPS-enter flow, `REG_RF_CTRL
+  = 0`, self-reset when MCUFWDL BIT(7) and the firmware is ready, MCU reset,
+  MCUFWDL 0, disable flow, RSV_CTRL+1 BIT(0) pulse, RSV_CTRL `0x0e`; the
+  `_rtl92ee_set_media_status(UNSPECIFIED)` write is not issued, as 88EE/
+  8821AE); it has no caller until the 8192EE rebuild owner exists.
 - `tables` / `headerfile` — all six `rtl8192ee/table.c` arrays (MAC,
   PHY_REG, PHY_REG_PG, AGC, RADIOA, RADIOB; lengths from `table.h`, source
   sha256 `d3bc9536…7937e` recorded), generated verbatim. The 8192EE walker is
@@ -2253,8 +2268,59 @@ diagnostic (`pci::bring_up` does not retain it).
   the DM owner. `Prepared::configure_rtl8192ee_channel(Operating)`
   (RadioConfigured/ChannelConfigured → ChannelConfigured) runs `channel::
   configure` with the factory TX power and the retained `rfreg_chnlval`.
-  The owner still cannot reach `MacConfigured` (no H2C/RA/media status,
-  no IRQ profile, no envelope); probe keeps `0x818b` diagnostic.
+  The owner still cannot reach `MacConfigured` (no envelope or station
+  branch yet); probe keeps `0x818b` diagnostic.
+- `h2c` — `fw.c::_rtl92ee_fill_h2c_command` (`REG_CR == 0xEA` ⇒
+  `REG_SYS_CFG1 (0xf0) + 3 = 0xff` side effect and `RadioOff`; HMETFR one
+  plus 99 × 10 us checks, each re-check followed by Linux's `0x130` read;
+  byte-wise writes, 4–7-byte commands writing the zero-padded extension box
+  first; `last_hmeboxnum` rotation; a timeout or MAC-off box poisons the
+  mailbox). Linux's power-save gate is kept: while `dot11_psmode !=
+  EACTIVE` or IPS RF-off the command is dropped without any access
+  (`Sent::Dropped`); since `rtl_lps_set_psmode` sets `dot11_psmode` first,
+  `fwlps_enter` (`_rtl92ee_fwlps_enter`, `low_power_enable` false) drops its
+  `SETPWRMODE(DTIM)` and writes only the RPWM RF-off, while `fwlps_leave`
+  writes RPWM all-on then sends `SETPWRMODE(ACTIVE)`. RPWM is
+  `REG_PCIE_HRPWM` **0x3dc** on this chip (`HW_VAR_SET_RPWM` toggle).
+  `pwrmode`: ACTIVE = switch default (rlbm 2, interval 4,
+  `FW_PWR_STATE_ACTIVE`), DTIM = `reg_fwctrl_lps = 3` (rlbm 2,
+  `reg_max_lps_awakeintvl` 5, RF off); smart_ps 1, byte5 `0x40`.
+  `media_status` (MSRRPT, MACID 0), `RSVDPAGE_LOCATION` (`[PROBERSP 4,
+  PSPOLL 2, NULL 3, QOS_NULL 6, BT_QOS_NULL 7]`), `rate_mask` =
+  `rtl92ee_update_hal_rate_mask` for a 2.4 GHz B/G/N station with
+  `rf_type` 2T2R (N rows `0x0f8f0000` / `0x0ffff000` / `0x0ffff015` (40) /
+  `0x0ffff005` (20), so MCS8-15 come from `rx_mask[1] << 20`;
+  `_rtl92ee_mrate_idx_to_arfr_id` NGB 0 at 40 MHz / NB 2 at 20, GB 6, B 8;
+  SGI only for the width's SGI; `rate_mask[2] = bw40 | !update_bw << 3`),
+  `mask_rates` (full-order rates: legacy bits 0..=11, MCS0-15 bits
+  12..=27), `set_bcn_ctrl`. Interrupts: `rtl92ee_enable_interrupt` writes
+  only HIMR `0x200004ff` / HIMRE `0x100` (`sw.c`; no status clear, HSIMR or
+  C2H-event write); `service_interrupt` = disable → `rtl92ee_interrupt_
+  recognized` W1C under the masks → enable (HSISR / `IMR_C2HCMD` handlers
+  are other chips').
+- `c2h` — `rtl_c2h_content_parsing` with the core V1 TX report (no
+  `RTL_SPEC_EXT_C2H`) and `rtl92ee_c2h_ra_report_handler` (`cmd_buf[0] &
+  0x3f` rate, `cmd_buf[3]` BIT(0) collision; a body under four bytes is
+  refused, Linux reads it unconditionally) → `rtl92ee_dm_dynamic_arfb_
+  select` (`REG_DARFRC` low/high pair tables). The packet owner records TX
+  reports and keeps the RA report pending for the DM step
+  (`ee92_apply_ra_report`, Linux's `c2hcmd_wq`).
+- `dm` — `_rtl92ee_dm_ra_state_check` (thresholds 50 / 20 from
+  `rtl92ee_dm_init_rate_adaptive_mask`, `go_up_gap` 5 raising high from
+  MIDDLE and both from LOW; the state is the rate mask's `rssi_level`) and
+  the `_rtl92ee_query_rxphystatus` `rx_pwdb_all` (OFDM `((byte4 >> 1) &
+  0x7f) - 110`; CCK 8192EE LNA/VGA table `+ 16` and the `!cck_highpwr`
+  boost). Of `rtl92ee_dm_watchdog` only the RA mask refresh is composed;
+  false alarm/DIG/adaptivity/CCK PD/EDCA turbo/ATC/primary CCA are not run
+  (as on 88EE). The 8192EE watchdog has no TX-power tracking step
+  (`rtl92ee_dm_init_txpower_tracking` only seeds indices).
+  Tests (`rtl8192ee/h2c_tests.rs`, written, unexecuted):
+  `smoke_rtl8192ee_h2c_box_order_rotation_and_ps_gate`,
+  `smoke_rtl8192ee_h2c_busy_off_and_lps_order`,
+  `smoke_rtl8192ee_rate_mask_2t2r_levels_and_rates`,
+  `smoke_rtl8192ee_interrupt_profile_masks_and_w1c`,
+  `smoke_rtl8192ee_c2h_reports_and_dynamic_arfb`,
+  `smoke_rtl8192ee_dm_ra_state_and_pwdb`.
   Test `smoke_rtl8192ee_tables_and_check_condition_walk` (written,
   unexecuted).
 

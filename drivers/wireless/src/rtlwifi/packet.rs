@@ -281,6 +281,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             && self.packet.pending.is_none()
             && !self.packet.mailbox.failed
             && !self.packet.ae.mailbox.failed
+            && !self.packet.ee92.mailbox.failed
     }
     fn rtl8821ae(&self) -> bool {
         self.chip == super::Chip::Rtl8821ae
@@ -724,9 +725,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// timeout leaves every mapping retained. Success is the retirement
     /// proof that allows the published rings and buffers to be unmapped.
     pub(crate) async fn quiesce(&mut self) -> Result<(), Error> {
-        // The 88EE idle registers below are not an RTL8192EE proof; its
-        // owner stays retained until a chip card-disable proof exists.
-        if self.phase != Phase::Stopped || !self.published || self.rtl8192ee() {
+        if self.rtl8192ee() {
+            return self.ee92_quiesce().await;
+        }
+        if self.phase != Phase::Stopped || !self.published {
             return Err(Error::State);
         }
         if self.io.read8(0x522)? != 0xff || self.io.read8(0x301)? != 0xff {
@@ -822,7 +824,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ae_enable_interrupts();
         }
         if self.rtl8192ee() {
-            return Err(Error::State); // No 8192EE IRQ profile yet: polled.
+            return self.ee92_enable_interrupts();
         }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);
@@ -867,7 +869,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ae_recognize_interrupts();
         }
         if self.rtl8192ee() {
-            return Err(Error::State);
+            return self.ee92_recognize_interrupts();
         }
         if self.phase != Phase::Running || !self.packet.interrupts {
             return Err(Error::State);

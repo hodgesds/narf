@@ -178,3 +178,35 @@ pub(super) async fn disable_rtl8821ae(io: &impl Io, firmware_ready: bool) -> Res
     update(io, 0x1d, 0, 1).await?;
     io.write8(0x1c, 0x0e)
 }
+
+/// RTL8192EE `rtl92ee_card_disable` → `_rtl92ee_poweroff_adapter`, in
+/// source order, after the independent old-DMA retirement proof
+/// (`Prepared::quiesce`): `RTL8192E_NIC_LPS_ENTER_FLOW` (PCIe DMA stop, TX
+/// pause, the 0x5f8..0x5fb TX-buffer polls, CCK/OFDM and BB reset, CR =
+/// 0x03, CR+1 BIT1 off, 0x553 BIT5); `REG_RF_CTRL = 0` (8192EE-specific);
+/// `rtl92ee_firmware_selfreset` when MCUFWDL BIT(7) and the firmware is
+/// ready; SYS_FUNC_EN+1 BIT(2) off (MCU reset); MCUFWDL = 0;
+/// `RTL8192E_NIC_DISABLE_FLOW`; the REG_RSV_CTRL+1 BIT(0) MCU IO-wrapper
+/// reset pulse; REG_RSV_CTRL = 0x0e. Linux first calls
+/// `_rtl92ee_set_media_status(UNSPECIFIED)`; that MSR write is not issued
+/// (88EE/8821AE precedent: the card-disable/enable cycle resets MSR and the
+/// fresh owner's MAC init reprograms it). LED control is not composed.
+pub(super) async fn disable_rtl8192ee(io: &impl Io, firmware_ready: bool) -> Result<(), Error> {
+    use super::rtl8192ee::pwrseq::{RTL8192E_CARD_DISABLE_FLOW, RTL8192E_ENTER_LPS_FLOW};
+    flow(io, PWR_CUT_ALL_MSK, RTL8192E_ENTER_LPS_FLOW).await?;
+    io.write8(0x1f, 0)?;
+    if io.read8(0x80)? & 0x80 != 0 && firmware_ready {
+        // fw.c::rtl92ee_firmware_selfreset.
+        update(io, 0x1d, 1, 0).await?;
+        update(io, 3, 4, 0).await?;
+        io.delay_us(50).await;
+        update(io, 0x1d, 0, 1).await?;
+        update(io, 3, 0, 4).await?;
+    }
+    update(io, 3, 4, 0).await?;
+    io.write8(0x80, 0)?;
+    flow(io, PWR_CUT_ALL_MSK, RTL8192E_CARD_DISABLE_FLOW).await?;
+    update(io, 0x1d, 1, 0).await?;
+    update(io, 0x1d, 0, 1).await?;
+    io.write8(0x1c, 0x0e)
+}

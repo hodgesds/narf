@@ -35,6 +35,10 @@
 //! - [`init`] — the `rtl92ee_hw_init` tail after the firmware download
 //!   (`_rtl92ee_hw_configure`, CAM reset, station address, IQK, PA bias,
 //!   NAV, LDPC fix), run by `Prepared::configure_rtl8192ee`.
+//! - [`h2c`] / [`c2h`] / [`dm`] — `rtl92ee_fill_h2c_cmd` mailbox (with the
+//!   Linux power-save gate), media status, PWRMODE/RPWM LPS, the 2T2R RA
+//!   mask, the interrupt profile, C2H TX/RA reports with the dynamic ARFB
+//!   table, the RA state check and the PHY-status PWDB.
 //! - `packet_owner.rs` — the BD-ring profile of the retained owner, mounted
 //!   as `prepare::packet::ee92` (allocation, publication, TXBD_IDX
 //!   doorbells, RXQ_TXBD_IDX consumption and the deferred DMA releases).
@@ -42,8 +46,11 @@
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod c2h;
 pub mod channel;
+pub mod dm;
 pub mod fw;
+pub mod h2c;
 pub mod headerfile;
 pub mod init;
 pub mod iqk;
@@ -54,6 +61,8 @@ pub mod tables;
 pub mod trx;
 pub mod txpower;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod h2c_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod phy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
