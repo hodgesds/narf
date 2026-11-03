@@ -7,6 +7,8 @@ use narf_wireless::ap_control::RadioControlAuthority;
 mod coexist;
 #[path = "p2p_delete_tests.rs"]
 mod deletion;
+#[path = "p2p_group_netdev_tests.rs"]
+mod group_netdev;
 #[derive(Debug)]
 struct Source {
     live: AtomicBool,

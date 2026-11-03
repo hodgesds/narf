@@ -20,6 +20,11 @@ impl Mt76Iface {
         if self.sleeping.load(Ordering::Acquire) {
             return Err(WirelessError::Busy);
         }
+        // The group link shares the home station owner's channel context
+        // and is never retained beside a home AP or monitor.
+        if !matches!(iftype, 2 | 8) && self.p2p_group.lock().is_some() {
+            return Err(WirelessError::Busy);
+        }
         let entry = narf_net::iface::lookup(&self.name).ok_or(WirelessError::HardwareError)?;
         if entry.link_up
             || entry.carrier
