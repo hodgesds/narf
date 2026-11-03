@@ -1544,7 +1544,8 @@ after submitted control ownership drains and native DELBA closes uncertainty.
 Before that dialog, T programs and reads back the exact source
 `coex.c::rtw_coex_limited_tx` retry value `RETRY_LIMIT(0x042a)=0x0808` and
 `AMPDU_MAX_TIME_V1(0x0455)=0x20`. Fixed native MCS/GI and disabled fallback
-remain from H. This is not the entire Bluetooth coexistence state machine.
+remain from H. The full state machine is the separate N2xK owner, which leaves
+these two registers to T while T is bound.
 The separate R BAR/RA aggregate limit `0x04ce=0x0801` is unchanged and still
 checked by R. These distinct addresses and complete T-over-R emission recipe
 allow the recipient and originator owners to coexist without relaxing either
@@ -1815,6 +1816,77 @@ and refusal cases (`dm_station_tests.rs`, `drivers/wireless/rtw88/dm/rtl882{1,2}
 plus HT protection modes 1..3 (`drivers/wireless/rtw88/ht_protection/*`).
 These are software/model results. A real signed N2xD measurement and physical
 acceptance remain external deployment gates.
+
+### C21/C22 Bluetooth coexistence state machine (`N2xK`)
+
+`coex.rs` ports Linux `coex.c` with the `rtw8821c.c`/`rtw8822c.c` chip hooks
+and tables (`table_{sant,nsant}`, `tdma_{sant,nsant}`, `rf_para_{tx,rx}`,
+`wl_rssi_step`/`bt_rssi_step`, AFH spans 0x24/0x36, `new_scbd10_def`,
+`ble_hid_profile_support`, `bt_rssi_type`). It runs only under a separately
+signed `N21K`/`N22K` continuation (stem `coex`, `qualification::Kind` tag
+`K`) whose payload is `[modes, share_ant, rfe_option, btcoex, 0..]`:
+
+| bit | family | Linux source |
+|---|---|---|
+| 0 `PTA` (required) | power-on/init, scoreboard, PTA/GNT/antenna path, coex tables, TDMA off, WL-only/BT-off/not-connected/all-off/IPS | `rtw_coex_power_on_setting`, `__rtw_coex_init_hw_config`, `rtw_coex_set_ant_path`, `rtw_coex_table`, `coex_cfg_{init,ant_switch,gnt_fix,gnt_debug,rfe_type}` |
+| 1 `TDMA` | PS-TDMA on (H2C 0x60) and every BT-profile action using it | `rtw_coex_tdma`, `rtw_coex_action_bt_*`, `_wl_linkscan` |
+| 2 `FREERUN` | non-shared freerun and every RF parameter set except the normal one (BT TX power H2C 0x62, BT LNA constraint H2C 0x67/op 0x32 + scoreboard RXGAIN, C22 WL RX low gain RF 0xde/0x1d) | `rtw_coex_action_freerun`, `rtw_coex_set_rf_para` |
+| 3 `BAND5` | pure-5GHz action/antenna path | `rtw_coex_action_wl_under5g`, `COEX_SET_ANT_5G` |
+| 4 `MIMO_PS` | C22 only; not admitted yet (`smps_txrx_1ss`) | `rtw_coex_mimo_ps` |
+
+Board facts are never supplied by the record alone: `Facts` carries the
+retained efuse `rfe_option`, raw `rf_board_option` and `bt_setting`;
+`share_ant = bt_setting & BIT(0)` and `btcoex = (rf_board_option & 0xe0) ==
+0x20` (0xff normalised to 0) exactly as `main.c::rtw_chip_efuse_info_setup`.
+A record qualified on different facts never binds; a WL-only board
+(`!btcoex`) admits only `PTA` and stops after init (`stop_dm`). An action
+needing a family the record does not carry returns `Unsupported`; the
+station then restores the base and unbinds coexistence for the station's
+lifetime (fail-closed, like the dm envelope).
+
+Trigger points (`station.rs`, `CoexEvent`): bind + `rtw_power_on` program at
+station `start`; `rtw_core_scan_start`/`_complete` (`COEX_SCAN_START`/
+`FINISH`) around `scan_for`; `rtw_set_channel` band change in `retune`
+(`switchband`, 5G or 2.4G for/not-for scan); `mgd_prepare_tx` connect start
+before authentication; `BSS_CHANGED_ASSOC` connect finish + media connect
+after `commit_peer` (beacon interval recorded after the run, as
+`BSS_CHANGED_BEACON_INT` follows); media disconnect in `disconnect` before
+the owner closes; C2H 0x09/0x0b/0x27/0x45 queued by `progress` and handled
+after it returns (`rtw_c2h_work`); every 2s watchdog the busy-traffic
+change (`tx_cnt`/`rx_cnt` > 100, `wl_status_change_notify`),
+`rtw_coex_wl_status_check` (BT counters 0x770/0x774, 0x76e) and
+`rtw_coex_query_bt_hid_list`; the eight delayed works (relink 1/6s,
+reenable 15s, defreeze 5s, wl_remain 12s, bt_remain 4s, connecting 2s,
+multi-link remain 3s, cck-lock 3s) run as deadlines from the watchdog and
+after each `poll`. `stop` restores synchronously (best effort, base gate
+only) like `rtw_coex_power_off_setting`.
+
+Every touched MAC byte/word/dword, RF register and LTE-coex indirect word
+(0x38/0xa0/0xa4 via 0x1700/0x1704/0x1708 with `check_hw_ready`) is backed
+up on first write and restored in reverse order; restore also sends TDMA
+off and a zero WL channel info when they had been sent nonzero.
+`rtw_coex_limited_tx` programs 0x45e/0x426/0x430/0x434 and, unless the T
+originator owner is bound (it already holds the same coex-limited values
+and checks their readbacks), 0x42a/0x455.
+
+Deviations, each explicit: the BT MP info request (scan type / LNA
+constraint) is not awaited for 10ms; its 0x0b reply updates
+`bt_ble_scan_type` when it arrives. WL RSSI comes from the bound N2xD
+tracker (`min_rssi`); without it RSSI is 0 (every RSSI state LOW: no
+RSSI-driven freerun). The noisy-environment CCK count is 0 (no CCK FA
+counter is shared with coex), so `wl_noisy_level` stays 0. No LPS owner is
+compiled, so `COEX_PS_LPS_OFF` only records `wl_force_lps_ctrl`
+(`Coex::forces_lps_off`), and LPS/IPS notifications are implemented but have
+no native caller; unassociated IPS stops the station, which unbinds and
+restores coexistence. HID game detection (and with it `COEX_WLINK_2GFREE`)
+requires `MIMO_PS`, so it is inactive until `smps_txrx_1ss`.
+
+Evidence: five `drivers/wireless/rtw88/coex` register-model cases
+(`coex_tests.rs`): record/efuse admission, C22 power-on/init program, C22
+non-shared A2DP table 112/TDMA 113 4-slot/limited TX, unqualified TDMA
+refusal with exact restore, revoked authority writes nothing. Written,
+**unexecuted**. No signed N2xK record, BT-active measurement or physical
+coexistence pass exists.
 
 ### C21/C22 HT TX coding: LDPC and STBC (`N2xC`)
 
@@ -3358,7 +3430,7 @@ changes. None is a physical blocker unless stated.
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
 | `multi_stream_ht` | Source-complete for actual2T2R RTL8822CE under separate N22H256v2: cumulative per-path factory ceilings, measured combined-chain envelope, native quiet/parked two-path gains/readbacks, original local RX16/peer TX negotiation and actual RA/TXWD/RXD MCS8..15. C21 is1TX-path hardware. Five native cases are written; release/native and physical acceptance remain pending. |
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
-| `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
+| `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
 | `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
 | `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |

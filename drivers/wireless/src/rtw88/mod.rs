@@ -48,6 +48,9 @@ mod channel_policy;
 mod coding;
 #[cfg(feature = "kernel-test")]
 mod coding_tests;
+mod coex;
+#[cfg(feature = "kernel-test")]
+mod coex_tests;
 mod command;
 mod dack;
 mod dm;

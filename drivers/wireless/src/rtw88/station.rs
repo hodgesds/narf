@@ -207,6 +207,33 @@ pub(super) struct State {
     witness: BeaconWitness,
     /// Witness generation of the current scan dwell, if one is open.
     witness_scan: Option<ScanGeneration>,
+    /// Separately qualified coexistence owner (`coex`, tag `K`).
+    coex: Coexistence,
+}
+/// The N2xK coexistence owner and its Linux trigger inputs.
+#[derive(Default)]
+struct Coexistence {
+    facts: Option<super::coex::Facts>,
+    grant: Option<Arc<super::qualification::Grant>>,
+    owner: Option<Box<super::coex::Coex>>,
+    /// Base gate captured at bind, for the synchronous `stop` restore.
+    gate: Option<super::power_policy::Gate>,
+    next: u64,
+    scanning: bool,
+    traffic: super::coex::Traffic,
+    /// C2H events queued by `progress` (Linux `rtw_c2h_work`).
+    c2h: VecDeque<Vec<u8>>,
+}
+/// One Linux coexistence trigger point.
+enum CoexEvent {
+    Start,
+    Scan(Option<bool>),
+    Switchband(bool),
+    Connect(bool),
+    Media(bool, u16),
+    C2h(Vec<u8>),
+    Watchdog(super::coex::Traffic),
+    Works,
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -319,7 +346,157 @@ impl State {
             switch_wait_beacon: false,
             witness: BeaconWitness::new(),
             witness_scan: None,
+            coex: Coexistence::default(),
         }
+    }
+    /// Exact retained efuse antenna facts for the coexistence owner.
+    pub(super) fn set_coex_facts(&mut self, facts: Option<super::coex::Facts>) {
+        self.coex.facts = facts;
+    }
+    pub(super) fn coex_active(&self) -> bool {
+        self.coex.owner.is_some()
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn coex(&self) -> Option<&super::coex::Coex> {
+        self.coex.owner.as_deref()
+    }
+    fn coex_link(&self) -> super::coex::Link {
+        super::coex::Link {
+            now: self.last_now,
+            connected: self.associated_aid.is_some(),
+            scanning: self.coex.scanning,
+            band5: super::band5::primary(self.channel),
+            channel: self.channel,
+            width: if self.vht.is_some() && self.wide {
+                2
+            } else {
+                u8::from(self.ht40.is_some() && self.wide)
+            },
+            rssi: self
+                .tracking
+                .tracker
+                .as_ref()
+                .filter(|_| self.peer.is_some())
+                .map(|t| t.min_rssi()),
+            t_owns_retry: self.tx_ba_grant.is_some(),
+        }
+    }
+    /// Bind the separately signed N2xK record at station start (Linux
+    /// `rtw_power_on`) when it was qualified on the retained efuse facts.
+    async fn coex_bind(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        let Some(facts) = self.coex.facts else {
+            return Ok(());
+        };
+        let Some(g) = io.station_continuation(&super::coex::KIND)? else {
+            return Ok(());
+        };
+        let gate = io.station_gate()?;
+        let Some(owner) = super::coex::record(gate.did(), g.payload())
+            .filter(|_| facts.did == gate.did() && g.check(&gate).is_ok())
+            .and_then(|r| super::coex::Coex::new(r, facts))
+        else {
+            return Ok(());
+        };
+        self.coex.grant = Some(g);
+        self.coex.owner = Some(Box::new(owner));
+        self.coex.gate = Some(gate);
+        self.coex_event(io, CoexEvent::Start).await
+    }
+    /// Run one coexistence trigger under the N2xK grant and send its H2C
+    /// commands. A refused mode or hardware failure restores every register
+    /// the owner touched under the base gate and unbinds coexistence.
+    async fn coex_event(&mut self, io: &mut impl Io, event: CoexEvent) -> Result<(), Error> {
+        let (Some(grant), Some(mut owner)) = (self.coex.grant.clone(), self.coex.owner.take())
+        else {
+            return Ok(());
+        };
+        let gate = io.station_gate()?;
+        let admission = self.admission.clone();
+        let link = self.coex_link();
+        let live = Live {
+            admission: &admission,
+            grant: &grant,
+            gate: &gate,
+        };
+        let result = match event {
+            CoexEvent::Start => Box::pin(owner.start(io, &live, link)).await,
+            CoexEvent::Scan(start) => Box::pin(owner.scan(io, &live, link, start)).await,
+            CoexEvent::Switchband(to5g) => {
+                let scan = self.coex.scanning;
+                Box::pin(owner.switchband(io, &live, link, to5g, scan)).await
+            }
+            CoexEvent::Connect(start) => Box::pin(owner.connect(io, &live, link, start)).await,
+            CoexEvent::Media(connect, interval) => {
+                Box::pin(owner.media(io, &live, link, connect, interval)).await
+            }
+            CoexEvent::C2h(body) => Box::pin(owner.c2h(io, &live, link, &body))
+                .await
+                .map(Option::unwrap_or_default),
+            CoexEvent::Watchdog(traffic) => {
+                Box::pin(owner.watchdog(io, &live, link, traffic)).await
+            }
+            CoexEvent::Works => Box::pin(owner.poll(io, &live, link)).await,
+        };
+        match result {
+            Ok(commands) => {
+                self.coex.owner = Some(owner);
+                for words in commands {
+                    grant.check(&gate)?;
+                    station_control::send(io, words, Some(&admission)).await?;
+                }
+                Ok(())
+            }
+            Err(firmware_transport::Error::State) if admission.closed() => Err(Error::State),
+            Err(e) => {
+                let base = Base {
+                    admission: &admission,
+                    gate: &gate,
+                };
+                let commands = Box::pin(owner.restore(io, &base)).await?;
+                for words in commands {
+                    station_control::send(io, words, Some(&admission)).await?;
+                }
+                self.coex = Coexistence {
+                    facts: self.coex.facts,
+                    ..Coexistence::default()
+                };
+                match e {
+                    firmware_transport::Error::Gone => Err(Error::Native(e)),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+    /// Drain queued coexistence C2H and due delayed works.
+    async fn coex_progress(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if self.coex.owner.is_none() || self.admission.closed() {
+            self.coex.c2h.clear();
+            return Ok(());
+        }
+        while let Some(body) = self.coex.c2h.pop_front() {
+            self.coex_event(io, CoexEvent::C2h(body)).await?;
+        }
+        self.coex_event(io, CoexEvent::Works).await
+    }
+    /// Best-effort synchronous restore at `stop` (owner already closed),
+    /// like `rtw_coex_power_off_setting` returning the hardware to the base.
+    fn coex_unbind(&mut self, io: &mut impl Io) {
+        if let (Some(mut owner), Some(gate)) = (self.coex.owner.take(), self.coex.gate.take()) {
+            struct GateOnly<'a>(&'a super::power_policy::Gate);
+            impl super::dm::Authority for GateOnly<'_> {
+                fn run<T>(
+                    &self,
+                    op: impl FnOnce() -> Result<T, firmware_transport::Error>,
+                ) -> Result<T, firmware_transport::Error> {
+                    self.0.invoke(op)
+                }
+            }
+            let _ = super::firmware_transport::ready_now(owner.restore(io, &GateOnly(&gate)));
+        }
+        self.coex = Coexistence {
+            facts: self.coex.facts,
+            ..Coexistence::default()
+        };
     }
     /// Exact retained factory/radio facts for the dm watchdog statistics.
     pub(super) fn set_tracking_facts(&mut self, facts: Option<super::dm::Facts>) {
@@ -352,6 +529,14 @@ impl State {
                 return Err(e);
             }
             return Ok(true);
+        }
+        if self.coex.owner.is_some() && !self.admission.closed() {
+            let now = self.now()?;
+            if now >= self.coex.next {
+                self.coex.next = now.saturating_add(super::coex::PERIOD_MS);
+                let traffic = core::mem::take(&mut self.coex.traffic);
+                self.coex_event(io, CoexEvent::Watchdog(traffic)).await?;
+            }
         }
         let mut power_changed = false;
         if self.power_tracking.is_some() && self.established && self.ready() {
@@ -599,10 +784,12 @@ impl State {
         self.last_now = self.environment.now_ms();
         self.phase = Phase::Passive;
         self.local_ht = io.station_ht_facts().and_then(super::ht::Facts::local);
+        self.coex_bind(io).await?;
         attempt.armed = false;
         Ok(())
     }
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        self.coex_unbind(io);
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -660,6 +847,11 @@ impl State {
         } else {
             Some(self.admission.begin_disconnect()?)
         };
+        if self.associated_aid.is_some() && !self.admission.closed() {
+            // mac80211 BSS_CHANGED_ASSOC (false): media disconnect.
+            self.associated_aid = None;
+            let _ = self.coex_event(io, CoexEvent::Media(false, 0)).await;
+        }
         self.admission.close();
         self.established = false;
         if let Some(security) = &mut self.security {
@@ -703,6 +895,11 @@ impl State {
         {
             tracker.observe(sample);
         }
+    }
+    fn coex_rx(&mut self, len: usize) {
+        let t = &mut self.coex.traffic;
+        t.rx_cnt = t.rx_cnt.saturating_add(1);
+        t.rx_bytes = t.rx_bytes.saturating_add(len as u64);
     }
     fn now(&mut self) -> Result<u64, Error> {
         let now = self.environment.now_ms();
@@ -864,6 +1061,10 @@ impl State {
         .await
         .map_err(Error::Native)
         .and_then(|result| result);
+        let result = match result {
+            Ok(out) => self.coex_progress(io).await.map(|()| out),
+            Err(e) => Err(e),
+        };
         if result.is_err() && !self.admission.teardown_pending() {
             self.fail(io);
         }
@@ -885,6 +1086,12 @@ impl State {
             }
             if let Some(body) = &step.c2h {
                 self.amsdu_ra_report(body);
+                if self.coex.owner.is_some()
+                    && matches!(body.first(), Some(0x09 | 0x0b | 0x27 | 0x45))
+                    && self.coex.c2h.len() < 16
+                {
+                    self.coex.c2h.push_back(body.to_vec());
+                }
             }
             if let (Some(body), Some(t)) = (&step.c2h, self.power_tracking.as_mut()) {
                 t.c2h(body);
@@ -1398,6 +1605,7 @@ impl State {
                                     if self.received.len() == RECEIVE_OUTPUTS {
                                         return Err(Error::State);
                                     }
+                                    self.coex_rx(bytes.len());
                                     self.received.push_back(bytes);
                                 }
                             }
@@ -1430,6 +1638,7 @@ impl State {
                         if self.received.len() == RECEIVE_OUTPUTS {
                             return Err(Error::State);
                         }
+                        self.coex_rx(bytes.len());
                         self.received.push_back(bytes);
                     }
                 }
@@ -1547,7 +1756,16 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(a))))??;
             self.scan_address = Some(a);
         }
-        let result = self.scan_channels(io, dwell_ms, probes, channels).await;
+        // rtw_core_scan_start / rtw_core_scan_complete coexistence notify.
+        self.coex.scanning = true;
+        let started = self.coex_event(io, CoexEvent::Scan(Some(false))).await;
+        let result = match started {
+            Ok(()) => self.scan_channels(io, dwell_ms, probes, channels).await,
+            Err(e) => Err(e),
+        };
+        self.coex.scanning = false;
+        let finished = self.coex_event(io, CoexEvent::Scan(None)).await;
+        let result = result.and_then(|r| finished.map(|()| r));
         if self.scan_address.take().is_some() {
             // rtw_core_scan_complete: back to the own address on every exit.
             let own = self.own;
@@ -1620,7 +1838,23 @@ impl State {
     /// pause and drain TX, program the chip channel and TX power (plus IQK
     /// when `rfk`), then commit the epoch and reopen TX. Any failure or
     /// cancellation leaves TX closed and the station failed.
+    /// Native retune plus `main.c::rtw_set_channel`'s
+    /// `rtw_coex_switchband_notify` when the band changes.
     pub(super) async fn retune(
+        &mut self,
+        io: &mut impl Io,
+        channel: u8,
+        rfk: bool,
+    ) -> Result<(), Error> {
+        let was5 = super::band5::primary(self.channel);
+        self.retune_native(io, channel, rfk).await?;
+        let is5 = super::band5::primary(self.channel);
+        if was5 != is5 {
+            self.coex_event(io, CoexEvent::Switchband(is5)).await?;
+        }
+        Ok(())
+    }
+    async fn retune_native(
         &mut self,
         io: &mut impl Io,
         channel: u8,
@@ -2330,6 +2564,8 @@ impl State {
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
         self.last_peer = self.last_now;
+        // mac80211 mgd_prepare_tx: rtw_coex_connect_notify(ASSOCIATE_START).
+        self.coex_event(io, CoexEvent::Connect(true)).await?;
         let auth = plan.start_authentication()?.to_vec();
         self.plan = Some(plan);
         self.phase = Phase::Authentication;
@@ -2341,6 +2577,11 @@ impl State {
                 let band5 = super::band5::primary(self.channel);
                 station_control::commit_peer(io, bssid, aid, short, band5, &self.admission).await?;
                 self.associated_aid = Some(aid);
+                // BSS_CHANGED_ASSOC: connect finish then media connect.
+                let interval = self.peer.as_ref().map_or(0, |p| p.bss.beacon_interval);
+                self.coex_event(io, CoexEvent::Connect(false)).await?;
+                self.coex_event(io, CoexEvent::Media(true, interval))
+                    .await?;
                 self.bf_assoc(io, bssid).await?;
                 if self.extension.is_some() {
                     super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)
@@ -2524,6 +2765,12 @@ impl State {
             return Err(Error::Profile);
         }
         self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
+        self.coex.traffic.tx_cnt = self.coex.traffic.tx_cnt.saturating_add(1);
+        self.coex.traffic.tx_bytes = self
+            .coex
+            .traffic
+            .tx_bytes
+            .saturating_add(frame.len() as u64);
         let tid = self.data_tid(frame);
         if let Some(g) = &self.tx_ba_grant {
             // Linux starts originator BA only for actual non-VO DATA demand.

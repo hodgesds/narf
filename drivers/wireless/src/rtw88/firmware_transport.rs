@@ -803,6 +803,8 @@ pub(super) struct Owner<I: Io> {
     /// construction; inline it would land on small (aarch64) stacks.
     station: Option<alloc::boxed::Box<super::station::State>>,
     tracking_facts: Option<super::dm::Facts>,
+    /// Retained efuse antenna facts for the `coex` (N2xK) owner.
+    coex_facts: Option<super::coex::Facts>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -836,6 +838,7 @@ impl<I: Io> Owner<I> {
             radio_gate: None,
             station: None,
             tracking_facts: None,
+            coex_facts: None,
         }
     }
     /// The same owner behind another C21 host interface (before any stage).
@@ -867,6 +870,7 @@ impl<I: Io> Owner<I> {
             .as_deref_mut()
             .ok_or(super::station::Error::State)?;
         station.set_tracking_facts(self.tracking_facts);
+        station.set_coex_facts(self.coex_facts);
         station.start(&mut self.io).await?;
         self.phase = Phase::Station;
         Ok(station.admission())
@@ -1298,6 +1302,12 @@ impl<I: Io> Owner<I> {
             power_track_type: (factory.logical()[0xc8] >> 4) & 15,
             cck_gi: info.cck_gi,
         });
+        self.coex_facts = Some(super::coex::Facts {
+            did: 0xc822,
+            rfe: factory.rfe(),
+            board_option: factory.board_option(),
+            bt_setting: factory.bt_setting(),
+        });
         self.phase = Phase::Calibrated;
         Ok(info)
     }
@@ -1542,6 +1552,12 @@ impl<I: Io> Owner<I> {
             thermal: [factory.thermal(), 0xff],
             power_track_type: 0,
             cck_gi: [0, 0],
+        });
+        self.coex_facts = Some(super::coex::Facts {
+            did: 0xc821,
+            rfe: factory.rfe(),
+            board_option: factory.board_option(),
+            bt_setting: factory.bt_setting(),
         });
         self.phase = Phase::Radio8821cPrepared;
         Ok(result)
