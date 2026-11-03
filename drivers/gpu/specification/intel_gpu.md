@@ -2188,7 +2188,7 @@ production feature. Unsupported functionality remains unadvertised.
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; separate GT lifecycle |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; modeset resource transactions |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
@@ -3207,3 +3207,64 @@ visible pixels, Mesa/codec and performance acceptance remain unexecuted by these
 fixtures. Supported WC backing is required for positive DMA conversations;
 unsupported architectures retain conservative source/metadata/WB refusal.
 Native register/CT models are not physical Intel or ARM-native acceptance.
+
+### MTL/Arrow standalone media GT lifecycle checkpoint
+
+Meteor Lake and Arrow Lake carry Xe_LPM+ (media IP 13.00) as a separate GT1
+behind the media GSI window. `intel_gpu_media_gt` (mounted as
+`intel_gpu_gt::media`) adds an exclusive per-incarnation owner that follows
+Linux xe's media GT bring-up for that one profile. Register offsets below
+0x40000 translate by 0x380000 (`xe_mmio_adjusted_addr`); media engine bases
+and GSC HECI registers stay absolute. Admission requires an MTL-classified
+device whose published GT0 graphics IP is 12.70, 12.71 or 12.74 and two equal
+media GMD_ID samples reporting 13.00. Version 0 is reported as an absent
+(fused-off) media GT and any other version as unsupported; neither writes a
+register. The owner then takes the media GT forcewake domain
+(FORCEWAKE_GT/FORCEWAKE_ACK_GT_MTL), re-reads GMD_ID under wake, derives the
+present VCS0-7/VECS0-3 set from GT_VEBOX_VDBOX_DISABLE with positive polarity
+(GSCCS0 stays absent without loaded GSC firmware), resets the media GuC with a
+GS_MIA_IN_RESET proof, and performs a full media GT reset bracketed by
+Wa_14015076503 when GSC firmware reports loaded. With every present VDBOX/VEBOX
+domain awake it programs the xelpg PAT through the media steering semaphore and
+multicast selector, media 13.00 GT workarounds 22016670082 and per-VDBOX
+16021867713, and the shared `mtl_mocs_desc` global/LNCF tables. It finally
+releases every wake request it made and reports the identity, fuse word and
+engine set.
+
+Inherited media wake requests or an in-flight GDRST refuse as busy; stale sleep
+acknowledgements from an earlier incarnation are settled within the source's
+50 ms bound before a new request. Wake, reset and semaphore bounds, unstable
+identity, empty inventory, lost wake and lost access are typed refusals. Each
+releases the owner's own wake requests and clears a pending GSC notification.
+The steering semaphore is never held across a return. NARF refuses a semaphore
+that is not granted, where Linux warns and proceeds. No path writes a GT0
+register.
+
+The GT runtime starts one owner after an MTL-classified GT0 incarnation reaches
+Running, polls it from the per-card worker with current D0 checked before each
+step, and logs the outcome once. A refusal ends only that media attempt and is
+never a GT0 error. GT0 fault cleanup, runtime park, system-suspend preparation
+and every other non-Running phase first abandon the owner, synchronously
+releasing its outstanding wake requests. The next GT0 incarnation starts a fresh
+owner. The media GuC remains held in reset. No GT1, media engine, interrupt
+source, firmware version or HuC is published: the GT list and engine queries
+stay GT0-only, and exec-queue creation still refuses non-GT0 placements.
+
+Remaining for this workstream: media GuC firmware load, WOPCM, ADS (including
+media 13.00 KLV workarounds 16021333562/16026508708 and GuC WA flag
+14018913170), and a CT channel through the media mailbox
+(MED_VF_SW_FLAG/MED_GUC_HOST_INTERRUPT) with its own GUC_SG_INTR_MASK half.
+It also needs GGTT TLB invalidation of both GuCs for every shared-GGTT update,
+media engine enablement and default contexts, VCS/VECS interrupt routing, and
+native Xe GT list/engine/exec-queue exposure as gt_id 1. HuC on MTL is
+GSC-loaded (`huc_gsc`) and needs the GSC firmware/proxy path; it stays
+unadvertised.
+
+Twelve native fixtures register under `intel_gpu_media_gt`. Eleven
+register-model cases cover the positive sequence, pre-write refusals,
+wake/reset/semaphore timeouts, GSC workaround ordering, current loss and
+teardown with next-incarnation settling. Each asserts that GT0 registers are
+untouched. One native Xe conversation on the MTL GuC model shows that the GT
+list and engine query stay GT0-only. It also shows that VCS/VECS or gt_id 1
+placements return EINVAL before any allocation. The fixtures are registered
+but were not run in this checkpoint, and they are not physical Intel evidence.
