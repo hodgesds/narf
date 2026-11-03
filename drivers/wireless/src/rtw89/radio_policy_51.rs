@@ -48,7 +48,7 @@ fn programs_valid(flags: u8) -> bool {
 }
 
 /// The full RTL8851B program the identity measures (Linux 7.3-rc4).
-const RECIPE: &[u8] = b"rtw8851b radio_51::Radio: rtw8851b_rfk_init (path A), rtw8851b_set_txpwr_ctrl, rtw8851b_power_trim (path A), rtw8851b_bb_cfg_txrx_path(RF_A); core.c __rtw89_set_channel (rtw8851b_set_channel_help enter S0, rtw8851b_set_channel mac/bb/rf path A, rtw8851b_set_txpwr nss0/1TX, help exit, btc switch band + rtw8851b_tssi_scan on a band change) then rtw8851b_rfk_channel (RX DCK, IQK, TSSI, DPK); no RF_GET_MCCCH";
+const RECIPE: &[u8] = b"rtw8851b radio_51::Radio: rtw8851b_rfk_init (path A), rtw8851b_set_txpwr_ctrl, rtw8851b_power_trim (path A), rtw8851b_bb_cfg_txrx_path(RF_A); core.c __rtw89_set_channel (rtw8851b_set_channel_help enter S0, rtw8851b_set_channel mac/bb/rf path A, rtw8851b_set_txpwr nss0/1TX, help exit, btc switch band + rtw8851b_tssi_scan on a band change) then rtw8851b_rfk_channel (RX DCK, IQK, TSSI, DPK); no RF_GET_MCCCH; core.c rtw89_track_work rtw8851b_rfk_track (path-A DPK track) outside scans";
 /// The RTL8851B TX power program a record measures (`Plan::visit_51`).
 const POWER: &[u8] = b"RTL8851B Plan::visit_51: rtw8851b_set_txpwr byrate nss0, offset, rtw8851b_set_tx_shape (2.4GHz dfir, OFDM triangular), 1TX limit + RU pages, rtw8851b_set_txpwr_ref path A";
 fn domain(profile: Profile) -> &'static [u8] {

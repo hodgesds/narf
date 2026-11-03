@@ -210,19 +210,29 @@ impl Native {
     /// A C operating program the signed C base record enables
     /// (`radio_policy_c::PROGRAMS`: WMM, all-AC QoS, firmware RA, HT20,
     /// HE20 and originator A-MPDU).
+    /// RTL8851B: the signed `N51B` v2 base record's programs
+    /// (`radio_policy_51::PROGRAMS`).
     fn c_program(&self, program: radio_policy::Program) -> Result<bool, power::Error> {
+        if self.chip == ChipId::Rtl8851B {
+            return self
+                .qualification_51
+                .as_ref()
+                .ok_or(power::Error::Unsupported)?
+                .allows(program)
+                .map_err(|_| power::Error::Access);
+        }
         self.qualification_c
             .as_ref()
             .ok_or(power::Error::Unsupported)?
             .allows(program)
             .map_err(|_| power::Error::Access)
     }
-    /// RTL8852C with its current ordinary grant: the B companion program
-    /// C has no path for (A-MSDU) is "no program" (`Ok(false)`); the base
-    /// record programs follow `c_program`.
+    /// RTL8852C or RTL8851B with its current ordinary grant: the B
+    /// companion program neither has a path for (A-MSDU) is "no program"
+    /// (`Ok(false)`); the base record programs follow `c_program`.
     /// B (or no grant) is `Ok(false)` here and keeps its own checks.
     fn c_ordinary(&self) -> Result<bool, power::Error> {
-        if self.chip != ChipId::Rtl8852C {
+        if !matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) {
             return Ok(false);
         }
         self.ordinary_current()?;
@@ -642,6 +652,9 @@ impl Native {
     /// host rule currently permits active emission.
     pub(in crate::rtw89) fn admitted_channels(&self) -> Result<u64, power::Error> {
         if self.c_ordinary()? {
+            if self.chip == ChipId::Rtl8851B {
+                return self.admitted_channels_51();
+            }
             return self.admitted_channels_c();
         }
         let qualification = self.full_radio_scope().ok_or(power::Error::Unsupported)?;
@@ -651,6 +664,27 @@ impl Native {
                 .ok_or(power::Error::Unsupported)?;
             let bit = operating_channel::slot(primary).ok_or(power::Error::Unsupported)?;
             if qualification.channel_allowed(profile).map_err(denied)? {
+                mask |= 1u64 << bit;
+            }
+        }
+        Ok(mask)
+    }
+    /// RTL8851B station mask over the 20MHz profile of every 2.4GHz
+    /// (1..=13) and 5GHz primary with a loaded signed record whose host rule
+    /// currently permits active emission (`channel_active`; RTL8851B has no
+    /// beacon-witness passive TX grant either). Channel 14 has no record.
+    fn admitted_channels_51(&self) -> Result<u64, power::Error> {
+        let qualification = self
+            .qualification_51
+            .as_ref()
+            .ok_or(power::Error::Terminal)?;
+        let mut mask = 0;
+        for primary in (1..=13).chain(operating_channel::GHZ5) {
+            let Some(profile) = operating_channel::Profile::from_primary(primary) else {
+                continue;
+            };
+            let bit = operating_channel::slot(primary).ok_or(power::Error::Unsupported)?;
+            if qualification.channel_active(profile).map_err(denied)? {
                 mask |= 1u64 << bit;
             }
         }
@@ -689,6 +723,22 @@ impl Native {
     pub(in crate::rtw89) fn admitted_wide(
         &self,
     ) -> Result<alloc::vec::Vec<operating_channel::Profile>, power::Error> {
+        if self.c_ordinary()? && self.chip == ChipId::Rtl8851B {
+            // RTL8851B: the same 40/80MHz chandefs (`support_bandwidths`
+            // 20/40/80), each with a loaded signed `N51C` record wholly
+            // active under the host rule.
+            let qualification = self
+                .qualification_51
+                .as_ref()
+                .ok_or(power::Error::Terminal)?;
+            let mut admitted = alloc::vec::Vec::new();
+            for profile in wide_profiles() {
+                if qualification.channel_active(profile).map_err(denied)? {
+                    admitted.push(profile);
+                }
+            }
+            return Ok(admitted);
+        }
         if self.c_ordinary()? {
             // RTL8852C: the same 40/80MHz chandefs plus the C-only 5GHz
             // 160MHz ones, each with a loaded signed `N5CC` record wholly
@@ -731,7 +781,8 @@ impl Native {
         &self,
     ) -> Result<alloc::vec::Vec<SixGhzChannel>, power::Error> {
         let mut admitted = alloc::vec::Vec::new();
-        if !self.c_ordinary()? {
+        // RTL8851B `support_bands` has no 6GHz.
+        if !self.c_ordinary()? || self.chip != ChipId::Rtl8852C {
             return Ok(admitted);
         }
         let qualification = self
@@ -768,7 +819,7 @@ impl Native {
     pub(in crate::rtw89) fn six_ghz_regulatory(
         &self,
     ) -> Result<Option<Arc<narf_wireless::reg::RegulatoryDomain>>, power::Error> {
-        if !self.c_ordinary()? {
+        if !self.c_ordinary()? || self.chip != ChipId::Rtl8852C {
             return Ok(None);
         }
         self.qualification_c

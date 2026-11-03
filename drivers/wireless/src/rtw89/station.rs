@@ -180,7 +180,9 @@ pub(super) unsafe trait Io: Send {
     ) {
         (None, Err(power::Error::Unsupported))
     }
-    fn station_rf_tracking(&mut self, _: &Admission) -> Result<(), power::Error> {
+    /// One periodic RF tracking step (`rtw89_track_work` ->
+    /// `rtw89_chip_rfk_track`); never called while scanning.
+    async fn station_rf_tracking(&mut self, _: &Admission) -> Result<(), power::Error> {
         Ok(())
     }
     fn station_track_read(&mut self, _: u32) -> Result<u32, power::Error> {
@@ -1126,8 +1128,8 @@ impl State {
     async fn track(&mut self, io: &mut impl Io) -> Result<(), Error> {
         struct Hw<'a, I>(&'a mut I, &'a Admission);
         impl<I: Io> super::track::Hw for Hw<'_, I> {
-            fn rfk(&mut self) -> Result<(), power::Error> {
-                self.0.station_rf_tracking(self.1)
+            async fn rfk(&mut self) -> Result<(), power::Error> {
+                self.0.station_rf_tracking(self.1).await
             }
             fn read(&mut self, address: u32) -> Result<u32, power::Error> {
                 self.0.station_track_read(address)

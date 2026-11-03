@@ -110,9 +110,10 @@ impl Native {
     /// first write and every access then runs inside both capability
     /// invocations (`Port`, `calibration_access`). The RTL8851B WLAN-only
     /// coexistence owner (`coex_native::Coex::prepare_51`) runs at core.c's
-    /// `rtw89_btc_ntfy_init` point, before the DM init. No ordinary grant
-    /// is installed: RTL8851B station admission is not composed, so the
-    /// radio is Ready with ordinary TX/ACK closed.
+    /// `rtw89_btc_ntfy_init` point, before the DM init. On `Ready` the
+    /// RTL8851B ordinary grant (`OrdinaryGrant::N51`, the same retained
+    /// signed program, rechecked) is installed; it carries no B companion
+    /// program, so every B-only program accessor reports "no program".
     ///
     /// # Safety
     /// Same retained Startup owner after RTL8851B `prepare_radio_tables`;
@@ -253,6 +254,202 @@ impl Native {
             return Err(power::Error::Access);
         }
         self.channel = Some((OperatingChannel::legacy(profile.primary()), owner.epoch()));
+        // core.c rtw89_core_start ends with the radio Ready for mac80211.
+        self.ordinary = Some(OrdinaryGrant::N51(qualification));
+        Ok(())
+    }
+
+    /// RTL8851B counterpart of `retune_radio_c` for one typed `profile`
+    /// (2.4GHz 20MHz/HT40, 5GHz 20/40/80MHz) on the Ready radio: drain,
+    /// withhold the RTL8851B ordinary grant, `select` the profile's signed
+    /// `N51B`/`N51C` envelope, `radio_51::Radio::retune` (core.c
+    /// `rtw89_set_channel` -> rtw8851b.c `rtw8851b_set_channel`, then
+    /// `rtw89_chip_rfk_channel` -> `rtw8851b_rfk_channel`), then reinstall
+    /// the same grant. RTL8851B sends no RF_GET_MCCCH (its `rfk_channel`
+    /// has no `rtw89_fw_h2c_rf_ntfy_mcc` call).
+    ///
+    /// Admission mirrors `prepare_radio_51`: the identity is rebound to this
+    /// exact factory/assets/plan (`radio_policy_51::Board::new` +
+    /// `channel_matches`) and the profile must be `channel_allowed` under
+    /// the current host rule. Refused with nothing withheld (retryable)
+    /// unless ordinary TX, the H2C queue and RX backlog are drained, the
+    /// radio is awake and no monitor or sleep owner exists; `linked` is the
+    /// associated-station channel switch (a peer must exist; otherwise none
+    /// may).
+    ///
+    /// # Safety
+    /// Same retained Startup owner/tables/assets that prepared `owner`. A
+    /// failed or dropped future after the grant is withheld leaves the
+    /// radio non-Ready; the caller's Attempt terminalizes this Native.
+    pub(in crate::rtw89) async unsafe fn retune_radio_51(
+        &mut self,
+        owner: &mut radio_51::Radio,
+        tables: &radio_init::Init,
+        assets: &radio_assets::Assets,
+        profile: Profile,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.chip != ChipId::Rtl8851B {
+            return Err(power::Error::Unsupported);
+        }
+        self.radio_profile_current()?;
+        self.ordinary_current()?;
+        if owner.state() != radio_51::State::Ready
+            || self.full_qualification.is_some()
+            || !self.coex_ready
+            || !self.nctl_ready
+        {
+            return Err(power::Error::Terminal);
+        }
+        if !radio_policy_51::admissible(profile) {
+            return Err(power::Error::Unsupported);
+        }
+        if owner.channel() == Some(profile) {
+            return Ok(owner.epoch());
+        }
+        let qualification = self
+            .qualification_51
+            .clone()
+            .ok_or(power::Error::Terminal)?;
+        if !self.ordinary.as_ref().is_some_and(
+            |grant| matches!(grant, OrdinaryGrant::N51(q) if Arc::ptr_eq(q, &qualification)),
+        ) {
+            return Err(power::Error::Terminal);
+        }
+        if !qualification.channel_allowed(profile).map_err(denied)? {
+            return Err(power::Error::Unsupported);
+        }
+        let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+        let identity = factory.identity().ok_or(power::Error::Unsupported)?;
+        if identity.chip() != ChipId::Rtl8851B {
+            return Err(power::Error::Access);
+        }
+        let rfe = identity.calibration().rfe_type;
+        let plan = radio_power_c::Plan::from_elements_51(assets.elements(), rfe, profile)
+            .map_err(denied)?;
+        let board = radio_policy_51::Board::new(
+            self.lifecycle,
+            factory,
+            self.device.id,
+            assets,
+            profile,
+            &plan,
+            self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+        )
+        .map_err(denied)?;
+        if !qualification.channel_matches(board) {
+            return Err(power::Error::Access);
+        }
+        let calibration = *tables.calibration_51().ok_or(power::Error::Unsupported)?;
+        if crate::rtw89::factory_51::Calibration::from_factory(factory) != Some(calibration) {
+            return Err(power::Error::Access);
+        }
+        let gain = tables.gain().ok_or(power::Error::Unsupported)?.clone();
+        let tracking = rfk::n51_tssi::Tracking::from_assets(assets).map_err(denied)?;
+        // Drain: rtw89_ops_flush / ieee80211_offchannel_stop_vifs. Busy is a
+        // proven-unpublished refusal; the caller retries after draining.
+        self.poll().map_err(|_| power::Error::Access)?;
+        if self.sleep_blocked
+            || self.sleep_reset.is_some()
+            || self.station_runtime.peer.is_some() != linked
+            || self.station_runtime.monitor.is_some()
+            || self.queue.pending() != 0
+            || !self.station_runtime.backlog.is_empty()
+            || self
+                .station_runtime
+                .core
+                .as_ref()
+                .is_some_and(|core| !core.ready())
+        {
+            return Err(power::Error::Busy);
+        }
+        // rtw89_leave_ps_mode precondition: actual CPWM/MACID0 awake.
+        crate::rtw89::station_control::awake(&mut self.io)?;
+        // Close ordinary publication; RFK runs inside the retained RTL8851B
+        // program (`Port`/`calibration_access`) whose envelope is now the
+        // target profile's signed record over its occupied span.
+        let grant = self.ordinary.take().ok_or(power::Error::Terminal)?;
+        self.channel = None;
+        qualification.select(profile).map_err(denied)?;
+        // SAFETY: caller contract; queues drained and grant withheld above.
+        unsafe {
+            owner.retune(
+                self,
+                radio_51::Inputs {
+                    gain: &gain,
+                    calibration: &calibration,
+                    power: &plan,
+                    tracking: &tracking,
+                    channel: profile,
+                },
+            )
+        }
+        .await
+        .map_err(crate::rtw89::radio_c::error)?;
+        self.radio_profile_current()?;
+        if owner.state() != radio_51::State::Ready
+            || owner.channel() != Some(profile)
+            || qualification.active() != profile
+        {
+            return Err(power::Error::Terminal);
+        }
+        qualification.current().map_err(denied)?;
+        self.channel = Some((OperatingChannel::legacy(profile.primary()), owner.epoch()));
+        // RX admission follows the programmed width (as the B/C retune), VHT
+        // rates only on a 5GHz wide channel.
+        if let Some(core) = self.station_runtime.core.as_mut() {
+            let width = profile.width() as u8;
+            core.set_operating_width(width, width != 0 && profile.is_5ghz());
+        }
+        // ieee80211_offchannel_return: queues reopen only on the same grant.
+        self.ordinary = Some(grant);
+        Ok(owner.epoch())
+    }
+
+    /// One core.c `rtw89_track_work` RF step on the Ready RTL8851B radio
+    /// (`radio_51::Radio::track`: thermal update + `rtw8851b_rfk_track`).
+    /// Linux skips the work while `rtwdev->scanning` (no access). Runs only
+    /// with the current RTL8851B ordinary grant on a started, awake,
+    /// non-calibrating station; a failed step terminalizes this Native.
+    ///
+    /// # Safety
+    /// Same retained Startup owner that prepared `owner`; no concurrent
+    /// RFK/PHY/reset/PM owner (track work runs under the station's lock).
+    pub(in crate::rtw89) async unsafe fn track_radio_51(
+        &mut self,
+        owner: &mut radio_51::Radio,
+        admission: &crate::rtw89::station_control::Admission,
+        scanning: bool,
+    ) -> Result<(), power::Error> {
+        if self.chip != ChipId::Rtl8851B {
+            return Err(power::Error::Unsupported);
+        }
+        if self.sleep_blocked {
+            return Err(power::Error::Terminal);
+        }
+        admission.check()?;
+        self.ordinary_current()?;
+        if scanning {
+            return Ok(());
+        }
+        if !self.station_runtime.started()
+            || self.calibrating.is_some()
+            || owner.state() != radio_51::State::Ready
+            || !self.ordinary.as_ref().is_some_and(|grant| {
+                matches!(grant, OrdinaryGrant::N51(q)
+                    if self.qualification_51.as_ref().is_some_and(|own| Arc::ptr_eq(q, own)))
+            })
+        {
+            return Err(power::Error::Terminal);
+        }
+        crate::rtw89::station_control::awake(&mut self.io)?;
+        // SAFETY: caller contract; every access is admitted by the retained
+        // RTL8851B program (`calibration_access`) on the active profile.
+        let result = unsafe { owner.track(self, false) }.await;
+        if result.is_err() {
+            self.fail();
+            return Err(power::Error::Terminal);
+        }
         Ok(())
     }
 }

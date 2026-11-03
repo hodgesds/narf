@@ -75,16 +75,20 @@ pub(super) struct BasicPreflight {
 /// its WMM/QoS/RA/HT/HE/A-MPDU/sleep/fragment companions); RTL8852C holds
 /// the signed `N5CB` v2 + `N5CC` program, which carries no such companion.
 /// B-only program accessors ([`Self::b`]) therefore see "no program" on C.
+/// RTL8851B holds the signed `N51B` v2 + `N51C` program
+/// (`radio_policy_51`), likewise without a B companion.
 #[derive(Clone)]
 enum OrdinaryGrant {
     B(alloc::sync::Arc<super::radio_policy::Qualification>),
     C(alloc::sync::Arc<super::radio_policy_c::Qualification>),
+    N51(alloc::sync::Arc<super::radio_policy_51::Qualification>),
 }
 impl OrdinaryGrant {
     fn current(&self) -> Result<(), super::power::Error> {
         match self {
             Self::B(q) => q.current().map_err(|_| super::power::Error::Access),
             Self::C(q) => q.current().map_err(|_| super::power::Error::Access),
+            Self::N51(q) => q.current().map_err(|_| super::power::Error::Access),
         }
     }
     /// Keep actual publication inside the chip's exact signed invocation.
@@ -95,13 +99,15 @@ impl OrdinaryGrant {
         match self {
             Self::B(q) => q.with_current(operation),
             Self::C(q) => q.with_current(operation),
+            Self::N51(q) => q.with_current(operation),
         }
     }
-    /// The RTL8852B program and its companions; `None` ("no program") on C.
+    /// The RTL8852B program and its companions; `None` ("no program") on C
+    /// and RTL8851B.
     fn b(&self) -> Option<&alloc::sync::Arc<super::radio_policy::Qualification>> {
         match self {
             Self::B(q) => Some(q),
-            Self::C(_) => None,
+            Self::C(_) | Self::N51(_) => None,
         }
     }
 }

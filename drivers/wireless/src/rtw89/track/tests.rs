@@ -29,7 +29,7 @@ struct Fake {
     ghz5: bool,
 }
 impl Hw for Fake {
-    fn rfk(&mut self) -> Result<(), power::Error> {
+    async fn rfk(&mut self) -> Result<(), power::Error> {
         self.rfk_calls += 1;
         Ok(())
     }

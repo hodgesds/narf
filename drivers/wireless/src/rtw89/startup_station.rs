@@ -306,8 +306,29 @@ unsafe impl Io for Startup {
         self.sleep_service(identity, enabled, idle, force, admission)
             .await
     }
-    fn station_rf_tracking(&mut self, admission: &control::Admission) -> Result<(), power::Error> {
+    async fn station_rf_tracking(
+        &mut self,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
         self.station_allowed()?;
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::super::mac::ChipId::Rtl8851B)
+        {
+            // track.rs `run` returns before any RF step while scanning
+            // (`rtw89_track_work` checks `rtwdev->scanning`).
+            self.station_native()?;
+            let firmware = self.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            // SAFETY: the same retained Startup prepared `radio_51`; track
+            // work runs under the station's retained lock (no concurrent
+            // RFK/PHY/reset/PM owner).
+            return unsafe {
+                firmware
+                    .transport_mut()
+                    .track_radio_51(&mut self.radio_51, admission, false)
+                    .await
+            };
+        }
         self.station_native()?.station_rf_tracking(admission)
     }
     fn station_track_read(&mut self, address: u32) -> Result<u32, power::Error> {

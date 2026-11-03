@@ -173,7 +173,7 @@ pub(super) struct Profile {
 /// Register access for track work, enclosed by the owner's current authority.
 pub(super) trait Hw {
     /// Optional actual same-radio periodic DPK; old qualified profiles no-op.
-    fn rfk(&mut self) -> Result<(), power::Error> {
+    async fn rfk(&mut self) -> Result<(), power::Error> {
         Ok(())
     }
     fn read(&mut self, address: u32) -> Result<u32, power::Error>;
@@ -791,7 +791,7 @@ impl Tracker {
         self.env.track(hw)?;
         let output = self.dig.step(rssi_min, self.env.fa_permil(), ghz5);
         Dig::program(hw, &layout, output, profile.cck_pd)?;
-        hw.rfk()?;
+        hw.rfk().await?;
         if self.cfo.track(self.tx_throughput()) {
             self.cfo.dm(hw, peer.is_some()).await?;
         }
