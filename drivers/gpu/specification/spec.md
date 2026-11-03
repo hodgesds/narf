@@ -1650,8 +1650,24 @@ CPU-clear targets survive execution reset until this separate proof. Failed
 proof retains uncertain state, BOs and wake even if the lost GT is dropped,
 and refuses wake release/D3/S3 handoff. Pending flush/promotion intent never
 replays into a fresh owner; existing confirmed
-SLPC user policy replays only after fresh qualification. Media-GT power remains
-open.
+SLPC user policy replays only after fresh qualification.
+
+The opt-in MTL/Arrow media GuC (`narf.intel.media_gt=1`) runs the same owner
+by role. `Limits::read_media` takes stable GT1 RPn/RP0 from
+MTL_MEDIAP_STATE_CAP 0x138020 and RPe from MTL_MPE_FREQUENCY 0x13802c, with no
+workaround cap. After the default LRCs and engine probes,
+`GuCGt::begin_media_power` writes GT1's POWERGATE_ENABLE (0x38a210:
+MEDIA_POWERGATE_ENABLE plus both VDN bits per present VCS) and starts SLPC.
+The media start lowers only firmware defaults above RP0, confirms programmed
+bounds by readback, then sends GUCRC_FIRMWARE_CONTROL, the compute strategy (a
+refusal is ignored) and the Base profile. `MediaGuc` publishes GT1 only after
+SLPC is Running, and any start failure stops GT1 (`MediaGucError::Slpc`), as
+xe_uc_load_hw fails. `MediaGuc::slpc_status` reports the confirmed status
+while GT1 is published. Before any reset of a GuC that started media power,
+with wake held, the owner sends GUCRC_HOST_CONTROL if firmware control was
+handed over, then writes RC_CONTROL, RC_STATE and POWERGATE_ENABLE to zero at
+GT1's GSI copies. The main GT's sequence and stop are unchanged. GT1 has no
+sysfs or UAPI power interface: the per-card controls below remain GT0's.
 
 `intel_gpu_power_controls::PowerControls` supplies a bounded per-card mailbox
 through `UserBackend::power_controls`. The GT owner explicitly activates a
@@ -1668,7 +1684,9 @@ Intel card sysfs nodes expose writable `gt_min_freq_mhz`, `gt_max_freq_mhz`,
 (`base` or `power-saving`). Read-only `gt_RPn_freq_mhz`, `gt_RP1_freq_mhz`,
 `gt_RP0_freq_mhz` and `slpc_status` report confirmed limits and mailbox state.
 The gt_* names follow i915; slpc_* files and asynchronous store acceptance
-are NARF extensions, not the Xe freq0 sysfs ABI. Callbacks resolve the current
+are NARF extensions, not the Xe freq0 sysfs ABI. They control GT0 only; the
+Xe per-GT `tile0/gt1/freq0` and `gtidle` trees are absent, so the media GT has
+no frequency or idle attributes. Callbacks resolve the current
 per-card backend and perform no MMIO. Every writable SLPC callback requires
 current initial-namespace CAP_SYS_ADMIN; reads remain cached. Only confirmed user policy survives
 close; a newly activated GT revalidates it against fresh limits and replays

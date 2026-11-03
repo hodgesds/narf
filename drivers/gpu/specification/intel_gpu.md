@@ -2210,7 +2210,7 @@ and both btrfs postflights per architecture.
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0, BMG BCS8 and fuse-derived CCS0–3 scheduling with dense logical instances and client-free reset reconfiguration; separate Gen12 foundations | Media GT and media submission, independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings and explicit fence imports; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); DG2/BMG visible VRAM (64 KiB DG2 pages and trusted data/CCS clear, guarded BMG CPU clear, WC BAR mmap, placement fallback); fixed-mode MTL/Arrow WC GEM KMS flips with console handoff, PM exclusion, queued NONBLOCK return, native error fences and hardware latch events; checked-copy fallback and bounded console/GEM GGTT windows; fresh-console retirement after GT reset | Small-BAR/unmapped VRAM, eviction/migration and general GPU copy jobs, VRAM PRIME/P2P, Gen12 production direct-flip admission, tiled/compressed modifiers and extra planes |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset; fixed-mode MTL/Arrow Pipe-A native CTM/gamma with DSB active replacement and joint primary/color arms; fixed 64x64 hardware cursor with owned PM_DEMAND/DBUF/MBUS/watermarks and separate retirement | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
-| Power and faults | Owned GuC/RCS0/BCS0/BMG-BCS8 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery with LRC runtime accounting and engine-progress fallback; bounded first-error reports and protected automatic GuC log/CT failure bundles; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; optional GuC SLPC/RC6 with acknowledged frequency bounds, Base/PowerSaving profiles and userspace policy replay; protected passive and flush-coordinated GuC log descriptors; cached DG2/BMG hwmon, fan/thermal readings, DG2 PL1 and BMG PL1/PL2/interval control | Full devcoredump and broader loss-accounted diagnostics, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, dynamic BMG MERT cap removal/L2-flush frequency coordination and media-GT power management |
+| Power and faults | Owned GuC/RCS0/BCS0/BMG-BCS8 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery with LRC runtime accounting and engine-progress fallback; bounded first-error reports and protected automatic GuC log/CT failure bundles; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; optional GuC SLPC/RC6 with acknowledged frequency bounds, Base/PowerSaving profiles and userspace policy replay; opt-in MTL/Arrow GT1 SLPC from its media fuses, GuC RC6 and powergating, required before GT1 publication and handed back to the host before every media stop; protected passive and flush-coordinated GuC log descriptors; cached DG2/BMG hwmon, fan/thermal readings, DG2 PL1 and BMG PL1/PL2/interval control | Full devcoredump and broader loss-accounted diagnostics, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, dynamic BMG MERT cap removal/L2-flush frequency coordination, GT1 frequency/idle sysfs and silicon acceptance of GT1 power |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
 
 #### Remaining-work status (2026-11-01)
@@ -2385,7 +2385,7 @@ production feature. Unsupported functionality remains unadvertised.
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GSC HECI packets are modelled but unwired; GSCCS, GSC load, GSC HuC authentication and silicon acceptance remain |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; GSC HECI packets are modelled but unwired; GSCCS, GSC load, GSC HuC authentication, GT1 frequency/idle sysfs and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; pipe scalers, bigjoiner, DSC and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
@@ -5102,3 +5102,101 @@ Review against Linux b90c984d agreed on the following:
   Linux keeps it when `intel_fbc_can_flip_nuke` allows.
 
 The debug group pass is deferred to the end of the current integration wave.
+
+### MTL/Arrow media GT power: GuC SLPC, GuC RC6 and powergating
+
+With `narf.intel.media_gt=1`, GT1 now gets power management the way Linux
+b90c984d runs it for every GT. Before this, GT1 had no frequency management
+and no RC6, so turning the option on cost power. Without the option nothing
+changes: no media owner exists, GT0's SLPC start and stop are unchanged, and
+GT0 never reads a media frequency register.
+
+`intel_gpu_slpc` is parameterized by GuC role rather than copied. For the
+media GuC, `Limits::read_media` follows xe_guc_pc.c's mtl_* helpers for a
+media GT. RP0 and RPn come from MTL_MEDIAP_STATE_CAP (0x138020, bits 8:0 and
+24:16) and RPe from MTL_MPE_FREQUENCY (0x13802c, bits 8:0), each decoded as
+DIV_ROUND_CLOSEST(raw * 50, 3). Both registers lie above
+MEDIA_GT_GSI_LENGTH, so GT1's window reads them at their absolute offsets.
+Two equal samples are required, and RPn must be nonzero with RPn <= RPe <=
+RP0. No conservative bound applies to media 13.00: Wa_22019338487 is
+MEDIA_VERSION(2000) only and Wa_14022085890 is BMG G21 only.
+
+The media start follows xe_guc_pc_start on the media GuC. It allocates and
+zeroes the 8 KiB shared data, sends SLPC_EVENT_RESET and waits up to 1005 ms
+for RUNNING. It then queries the task state. pc_adjust_freq_bounds lowers
+only a firmware default above RP0: the maximum first, then the minimum
+through IGNORE_EFFICIENT_FREQUENCY and the minimum, as pc_set_min_freq does.
+Bounds left as firmware set them must lie within the fused limits; programmed
+bounds are confirmed by a readback. pc_init_pcode_freq does nothing here,
+because mtl_desc has no LLC. The start ends with
+SETUP_PC_GUCRC(GUCRC_FIRMWARE_CONTROL), which hands media C6 to firmware,
+SLPC_PARAM_STRATEGIES = SLPC_OPTIMIZED_STRATEGY_COMPUTE and the Base power
+profile. Before SLPC, GT1 enables powergating as xe_gt_idle_enable_pg does
+for a media GT: POWERGATE_ENABLE at its GSI copy (0x38a210) gets
+MEDIA_POWERGATE_ENABLE plus both VDN powergate bits of each present VCS.
+There is no render bit and no media-sampler bit, the hysteresis writes are
+skipped with GuC PC, and Wa_14020316580 (media 13.01) does not apply.
+
+`MediaGuc` runs this after the default LRCs and the per-engine probes, and
+before HuC authentication, matching xe_uc_load_hw's order. GT1 publishes only
+once SLPC is RUNNING. The runtime logs the confirmed limits and range once at
+publication. As on GT0, the shared data is allocated after CT enablement and
+its insert invalidation is queued; the shared-GGTT review above shows that
+is sound for a range no GuC has cached.
+
+Every media stop hands power back to the host before resetting the media
+GuC: recovery, GT0 park, system suspend and GT0 fault cleanup all use it.
+With GT1's wake held, the stop sends SETUP_PC_GUCRC(GUCRC_HOST_CONTROL) if
+firmware control was handed over, then writes RC_CONTROL = 0 and RC_STATE = 0
+at 0x38a090/0x38a094 and POWERGATE_ENABLE = 0. These are
+xe_guc_pc_gucrc_disable, xe_gt_idle_disable_c6 and xe_gt_idle_disable_pg.
+Linux runs the first two before a GT reset and powergate disable at suspend.
+NARF has one verified stop for all of these cases, so it always runs all
+three, and the next media GuC enables them again. Linux's xe_pm_resume also
+disables C6 early on resume. NARF needs no separate resume step, because GT1
+is always handed back to the host before it leaves D0.
+
+Failure policy follows the source. xe_uc_load_hw returns a xe_guc_pc_start
+error, which fails probe or wedges the device after a reset. NARF therefore
+never publishes GT1 without SLPC. Unreadable fuses, global ERROR, no RUNNING
+within the bound, a refused or unacknowledged bound or profile, and a lost
+transport all stop GT1 with its verified stop. GT0 is unaffected, and the
+runtime's one media recovery per GT0 incarnation may retry once. A refused
+compute strategy is not a failure, because xe_guc_pc_start overwrites that
+result with the profile's. If SLPC fails after publication, its confirmed
+status disappears and the engines keep running, as on GT0; Linux has no such
+monitor and only returns later set_param errors to their caller.
+
+Differences from Linux, all fail-closed:
+- Parameter requests are acknowledged REQUESTs; Linux sends them as fast
+  requests.
+- NARF adds a confirming readback after programmed bounds and checks the RPe
+  ordering.
+
+No userspace interface is added. Linux exposes per-GT
+`device/tile0/gt1/freq0/` (act, cur, rp0, rpa, rpe, rpn, min, max and
+power_profile) and `gtidle/` (gt1-mc, MC6 residency from 0x138048). NARF
+exposes GT0's SLPC only through i915-named card attributes, not that Xe
+tree, so it has no GT0 counterpart to mirror. GT1's frequency and idle sysfs
+stay absent. The earlier HuC checkpoint's remark that GT1 runs no SLPC is
+superseded.
+
+New fixtures under `drivers/gpu/intel_gpu_media_gt`:
+- `smoke_media_gt_slpc_limits_decode_gt1_fuses_only` covers the decode, its
+  refusals, and the per-role register selection and powergate values.
+- `smoke_media_gt_slpc_start_bounds_profile_and_rc6_on_media_guc` covers the
+  exact H2G sequence and confirmed status with GT0 decoy fuses, publication
+  only after RUNNING, the C6/powergate handoff before the GuC reset on stop
+  and in `media::retire`, and the recovery restart.
+- `smoke_media_gt_slpc_failures_stop_gt1_and_disable_c6` covers the global
+  ERROR, timeout, refused-bound and unreadable-fuse stops, the ignored
+  strategy refusal, and SLPC loss after publication with a user job still
+  retiring.
+- `smoke_media_gt_power_absent_leaves_gt0_slpc_and_stop_unchanged` pins GT0's
+  sequence and stop, and the MMIO-free retirement without a media owner.
+
+The shared GuC model now records SLPC traffic. It accepts the strategy and
+HOST_CONTROL only from a registered media GuC, and the media model has GT1
+frequency fuses. Every existing GT1 fixture now runs the SLPC start before
+publication. These are native models, not physical Intel evidence; the
+integrated test run is pending.
