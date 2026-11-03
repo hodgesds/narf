@@ -25,20 +25,20 @@ impl core::fmt::Debug for Callback {
     }
 }
 #[derive(Debug)]
-struct Source {
+pub(super) struct Source {
     life: narf_net::native_emission::ProviderLifetime,
     messages: IrqSafeSpinLock<Vec<Vec<u8>>>,
     callback: IrqSafeSpinLock<Option<Callback>>,
 }
 impl Source {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             life: narf_net::native_emission::ProviderLifetime::new(),
             messages: IrqSafeSpinLock::new(Vec::new()),
             callback: IrqSafeSpinLock::new(None),
         }
     }
-    fn count(&self, command: u8) -> usize {
+    pub(super) fn count(&self, command: u8) -> usize {
         self.messages
             .lock()
             .iter()
@@ -69,7 +69,7 @@ impl narf_net::netlink_generic::DeferredReplySink for Source {
         Ok(())
     }
 }
-fn config(secure: bool) -> (narf_wireless::ApConfig, narf_wireless::ApStartSettings) {
+pub(super) fn config(secure: bool) -> (narf_wireless::ApConfig, narf_wireless::ApStartSettings) {
     let mut head = vec![0; 36];
     head[0] = 0x80;
     head[4..10].fill(255);
@@ -124,7 +124,7 @@ fn config(secure: bool) -> (narf_wireless::ApConfig, narf_wireless::ApStartSetti
         },
     )
 }
-fn association(secure: bool) -> Vec<u8> {
+pub(super) fn association(secure: bool) -> Vec<u8> {
     let (config, _) = config(secure);
     let mut ies = config.beacon_head[36..].to_vec();
     ies.extend(config.beacon_tail);

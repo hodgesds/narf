@@ -422,7 +422,7 @@ fn firmware_step(state: &mut State) {
                 firmware.commands.push((command, input.clone(), output_len));
                 firmware.command_ifidx.push(descriptor[1]);
                 let response = if let Some(station) = firmware.station.as_mut() {
-                    station.command(command, &input, output_len)
+                    station.command_on(descriptor[1], command, &input, output_len)
                 } else {
                     match command {
                         1 => 2u32.to_le_bytes().to_vec(),

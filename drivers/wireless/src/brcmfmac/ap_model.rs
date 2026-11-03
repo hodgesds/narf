@@ -43,6 +43,9 @@ pub(crate) struct Profile {
     pub(crate) hold_key: bool,
     pub(crate) hold_remove: bool,
     pub(crate) bad_bss: bool,
+    /// BSSID this interface's BSS reports (`GET_BSS_INFO`): the primary
+    /// address, or a secondary interface's IF ADD address.
+    pub(crate) own: [u8; 6],
 }
 impl Default for Profile {
     fn default() -> Self {
@@ -91,6 +94,7 @@ impl Default for Profile {
             hold_key: false,
             hold_remove: false,
             bad_bss: false,
+            own: OWN,
         }
     }
 }
@@ -213,7 +217,7 @@ impl Profile {
                 let b = &mut out[4..];
                 b[..4].copy_from_slice(&109u32.to_le_bytes());
                 b[4..8].copy_from_slice(&128u32.to_le_bytes());
-                b[8..14].copy_from_slice(&OWN);
+                b[8..14].copy_from_slice(&self.own);
                 b[14..16].copy_from_slice(&self.beacon.to_le_bytes());
                 let cap = 1u16 | if self.vars["wsec"] & 4 != 0 { 16 } else { 0 };
                 b[16..18].copy_from_slice(&cap.to_le_bytes());

@@ -9,9 +9,11 @@
 use super::*;
 use crate::brcmfmac::{
     runtime_tests::station_model::VIF,
+    vif_bsscfg::{Bsscfg, Link},
     vif_owner::{Owner, Role},
     vif_wire::Features,
 };
+use crate::cyw43439::fullmac_fixture::{cache, request};
 
 fn block<F: Future>(future: F) -> F::Output {
     narf_scheduler::block_on(future)
@@ -129,4 +131,251 @@ fn smoke_brcmf_msgbuf_secondary_ifidx_ioctl_events_flows_and_removal() -> TestRe
 kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_brcmf_msgbuf_secondary_ifidx_ioctl_events_flows_and_removal
+);
+
+/// Linux 7.3-rc4 `cfg80211.c` `brcmf_cfg80211_connect` on an additional STA
+/// `brcmf_if` over msgbuf: every join dcmd carries `msg.ifidx` 1, the
+/// security iovars are `brcmf_fil_bsscfg_*` (`bsscfg:` + le32 1), and the
+/// link/SET_SSID events of bsscfg 1 (`fweh.c` dispatch) open only the
+/// secondary port; its deauthentication closes only that port.
+fn secondary_join() -> Result<(), &'static str> {
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
+        .map_err(|_| "primary station over msgbuf")?;
+    let features = Features {
+        p2p: true,
+        mchan: true,
+        ..Features::default()
+    };
+    let mut owner = Owner::new(station.mac, features);
+    let entry = block(owner.create(&mut station.runtime, Role::Station, Some(VIF)))
+        .map_err(|_| "IF ADD over the msgbuf event ring")?;
+    station
+        .runtime
+        .vif_open(entry.ifidx)
+        .map_err(|_| "vif_open")?;
+    let parked = station.secondary(entry.mac);
+    let mut link = Link::new(entry);
+    let before = bus.commands().len();
+    let parked = {
+        let adapter = Bsscfg::new(&mut station.runtime, &mut owner, &mut link);
+        let (mut secondary, rest) = parked.rebind(adapter);
+        block(secondary.configure_secondary()).map_err(|_| "secondary per-interface dcmds")?;
+        cache(
+            &mut secondary,
+            AP,
+            6,
+            narf_wireless::scan::BssSecurity::Open,
+            &[],
+        );
+        block(secondary.associate(request(
+            AP,
+            6,
+            narf_wireless::SecurityConfig::Open,
+            Vec::new(),
+        )))
+        .map_err(|_| "secondary join over msgbuf")?;
+        secondary.rebind(rest).0
+    };
+    let commands = bus.commands();
+    let ifidx = bus.command_ifidx();
+    let joined: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+    let mut wpa_auth = b"bsscfg:wpa_auth\0".to_vec();
+    wpa_auth.extend_from_slice(&1u32.to_le_bytes());
+    if joined.iter().any(|(_, index)| **index != 1)
+        || ![86u32, 20, 22, 26]
+            .iter()
+            .all(|dcmd| joined.iter().any(|((command, _, _), _)| command == dcmd))
+        || joined.iter().any(|((command, _, _), _)| *command == 134)
+        || !joined
+            .iter()
+            .any(|((_, body, _), _)| body.starts_with(&wpa_auth))
+        || joined
+            .iter()
+            .any(|((_, body, _), _)| body.starts_with(b"wpa_auth\0") || body.starts_with(b"wsec\0"))
+    {
+        return Err("secondary join not addressed to msg.ifidx 1 / bsscfg 1");
+    }
+    if link.peer() != Some(AP)
+        || parked.bssid != Some(AP)
+        || station.bssid.is_some()
+        || station.runtime.pop_event().is_some()
+    {
+        return Err("secondary link leaked into the primary interface");
+    }
+    // BRCMF_E_DEAUTH (6) on bsscfg 1 closes only the secondary port.
+    bus.secondary_event(6, 0, AP);
+    let adapter = Bsscfg::new(&mut station.runtime, &mut owner, &mut link);
+    let (mut secondary, rest) = parked.rebind(adapter);
+    for _ in 0..4 {
+        let _ = secondary.poll();
+    }
+    let (parked, _) = secondary.rebind(rest);
+    if parked.bssid.is_some() || link.peer().is_some() || station.bssid.is_some() {
+        return Err("secondary deauthentication kept the port open");
+    }
+    Ok(())
+}
+
+fn smoke_brcmf_msgbuf_secondary_station_joins_on_ifidx_one() -> TestResult {
+    match secondary_join() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_secondary_station_joins_on_ifidx_one
+);
+
+/// Primary STA associated on ifidx 0 + a secondary firmware-SME AP on
+/// ifidx 1 (Linux 7.3-rc4 combo0: `brcmf_cfg80211_add_iface` →
+/// `brcmf_apsta_add_vif`, then `brcmf_cfg80211_start_ap` on the AP vif).
+/// With `mchan` the AP vif skips `BRCMF_C_DOWN`/`apsta 0`, writes no
+/// `nmode`/`vhtmode`/`qtxpower`, and addresses its security iovars to
+/// bsscfg 1; the composed `event_msgs` keeps the primary STA's events.
+/// A peer associates on bsscfg 1 and the stop leaves the primary joined.
+fn primary_station_secondary_ap() -> Result<(), &'static str> {
+    use super::ap_native_tests::{association, config, Source};
+    use crate::brcmfmac::runtime_tests::station_model::ap_model::CLIENT;
+    use narf_capabilities::{Cap, Invoke};
+    use narf_wireless::ap_control::ApControlAuthority;
+    const NAME: &str = "wlvap7";
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    bus.enable_vif_ap();
+    bus.set_caps(b"ap sta mchan");
+    let database = Arc::new(narf_wireless::reg::db::Database::new());
+    database.install(firmware::domain());
+    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
+        .map_err(|_| "primary station over msgbuf")?;
+    cache(
+        &mut station,
+        AP,
+        6,
+        narf_wireless::scan::BssSecurity::Open,
+        &[],
+    );
+    block(station.associate(request(
+        AP,
+        6,
+        narf_wireless::SecurityConfig::Open,
+        Vec::new(),
+    )))
+    .map_err(|_| "primary join")?;
+    let owner = block(super::vif::discover(&mut station.runtime, station.mac))
+        .map_err(|_| "cap discovery")?
+        .ok_or("firmware cap refused")?;
+    if !owner.features().mchan || owner.features().mbss {
+        return Err("cap tokens not parsed as brcmf_feat_attach");
+    }
+    let name = narf_net::iface::register("wlan%d", OWN, send);
+    let device = shell(name.clone(), station);
+    device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    device.ap_fixture_setup(database);
+    super::vif::register_primary(&device);
+    let result = (|| {
+        let vap = device
+            .vif_new(NAME, 3, None)
+            .map_err(|_| "secondary AP shell admission")?;
+        block(device.vif_worker());
+        if vap.ap_sme_capabilities() != Some(0) {
+            return Err("secondary AP shell not attached after IF ADD");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("secondary netdev handle")?;
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "secondary admin authority")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = vap.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            admin,
+            &iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "AP authority bind")?
+        .reserve()
+        .map_err(|_| "AP control reservation")?;
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[VIF, VIF].concat());
+        let before = bus.commands().len();
+        block(vap.start_ap_with_settings_async(&authority, ap_config, settings))
+            .map_err(|_| "secondary AP START")?;
+        let commands = bus.commands();
+        let ifidx = bus.command_ifidx();
+        let program: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+        let mut wsec = b"bsscfg:wsec\0".to_vec();
+        wsec.extend_from_slice(&1u32.to_le_bytes());
+        let mask = program
+            .iter()
+            .rev()
+            .find(|((command, body, _), _)| *command == 263 && body.starts_with(b"event_msgs\0"))
+            .map(|((_, body, _), _)| body[11..].to_vec())
+            .ok_or("secondary AP wrote no event_msgs")?;
+        let sta = crate::cyw43439::station::roam::event_mask(false);
+        if program.iter().any(|(_, index)| **index != 1)
+            || program.iter().any(|((command, body, _), _)| {
+                *command == 3
+                    || body.starts_with(b"apsta\0")
+                    || *command == 263
+                        && (body.starts_with(b"nmode\0")
+                            || body.starts_with(b"vhtmode\0")
+                            || body.starts_with(b"qtxpower\0")
+                            || body.starts_with(b"wsec\0"))
+            })
+            || !program
+                .iter()
+                .any(|((_, body, _), _)| body.starts_with(&wsec))
+            || sta.iter().zip(&mask).any(|(s, m)| s & m != *s)
+        {
+            return Err("secondary AP Program not the combo0 bsscfg-1 form");
+        }
+        if !bus.vif_ap_change(|p| p.active && p.up && p.formed)
+            || !vap.link_up()
+            || device.state.try_lock().ok_or("state")?.station.bssid != Some(AP)
+        {
+            return Err("secondary AP not running beside the joined primary");
+        }
+        // A peer associates with the secondary BSS (events of bsscfg 1).
+        bus.vif_ap_change(|p| p.associate(CLIENT, association(false)));
+        for _ in 0..4 {
+            block(device.vif_worker());
+        }
+        if source.count(19) != 1 {
+            return Err("secondary AP NEW_STATION not observed on its shell");
+        }
+        block(vap.stop_ap_async(&authority)).map_err(|_| "secondary AP STOP")?;
+        if bus.vif_ap_change(|p| p.active || !p.peers.is_empty())
+            || vap.link_up()
+            || device.state.try_lock().ok_or("state")?.station.bssid != Some(AP)
+        {
+            return Err("secondary AP stop disturbed the primary or kept its BSS");
+        }
+        Ok(())
+    })();
+    super::vif::withdraw_family(crate::cyw43439::fullmac::Family::Pcie);
+    bus.d3_ack(true);
+    let _ = block(device.teardown());
+    *ACTIVE_TEST.lock() = None;
+    narf_net::registry().unregister(&name);
+    narf_net::iface::unregister(&name);
+    result
+}
+
+fn smoke_brcmf_msgbuf_primary_station_beside_secondary_ap() -> TestResult {
+    match primary_station_secondary_ap() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_primary_station_beside_secondary_ap
 );

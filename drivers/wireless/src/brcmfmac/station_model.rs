@@ -47,8 +47,27 @@ struct Flow {
     /// Creating request's `msg.ifidx`.
     ifidx: u8,
 }
+/// The modeled secondary firmware interface (ifidx 1, bsscfg 1). Its
+/// dcmds arrive with `msg.ifidx` 1 and its `brcmf_fil_bsscfg_*` iovars
+/// with the `bsscfg:` prefix (Linux 7.3-rc4 `fwil.c`); its events carry
+/// ifidx/bsscfgidx 1 (`fweh.c` dispatch). It is either a STA joining
+/// [`AP`] or, with [`Handle::enable_vif_ap`], a firmware-SME AP.
+#[derive(Default)]
+struct Vif {
+    ap: Option<ap_model::Profile>,
+    /// Associated after a `SET_SSID` on ifidx 1 until `DISASSOC`.
+    joined: bool,
+    /// Plain values of the bsscfg iovars/dcmds this interface was set.
+    sets: Vec<(u32, Vec<u8>)>,
+}
 pub(super) struct Firmware {
     ap: Option<ap_model::Profile>,
+    vif: Vif,
+    /// `msg.ifidx` of the IOCTL being answered (for its status).
+    command_ifidx: u8,
+    /// Firmware `cap` token list (`brcmf_feat_firmware_capabilities`);
+    /// empty answers the historical zero reply.
+    caps: Vec<u8>,
     monitor: Option<monitor_model::Profile>,
     raw_downlink: VecDeque<(Vec<u8>, u16)>,
     secured: bool,
@@ -109,6 +128,9 @@ impl Firmware {
     fn new(secured: bool) -> Self {
         Self {
             ap: None,
+            vif: Vif::default(),
+            command_ifidx: 0,
+            caps: Vec::new(),
             monitor: None,
             raw_downlink: VecDeque::new(),
             secured,
@@ -174,6 +196,7 @@ impl Firmware {
         fresh.vht = self.vht.take();
         fresh.channel = self.channel;
         fresh.wme_ac_sta = self.wme_ac_sta;
+        fresh.caps = core::mem::take(&mut self.caps);
         *self = fresh;
     }
     pub(super) fn post_event(&mut self, descriptor: &[u8]) {
@@ -270,6 +293,65 @@ impl Firmware {
         }));
         ies
     }
+    /// One IOCTL addressed by `msg.ifidx` (Linux `msgbuf.c`
+    /// `brcmf_msgbuf_tx_ioctl`).
+    pub(super) fn command_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: u16,
+    ) -> Vec<u8> {
+        self.command_ifidx = ifidx;
+        if ifidx == 0 || input.starts_with(b"bsscfg:interface_remove\0") {
+            return self.command(command, input, maximum);
+        }
+        assert_eq!(ifidx, 1, "only ifidx 1 is modeled");
+        // fwil.c brcmf_create_bsscfg: `bsscfg:` + name + NUL + le32 index.
+        let plain;
+        let input = match input.strip_prefix(b"bsscfg:") {
+            Some(rest) if matches!(command, 262 | 263) => {
+                let end = rest.iter().position(|byte| *byte == 0).unwrap();
+                assert_eq!(&rest[end + 1..end + 5], &1u32.to_le_bytes());
+                let mut body = rest[..=end].to_vec();
+                body.extend_from_slice(&rest[end + 5..]);
+                plain = body;
+                &plain[..]
+            }
+            _ => input,
+        };
+        if let Some(ap) = self.vif.ap.as_mut() {
+            if let Some(reply) = ap.command(command, input, maximum) {
+                return reply;
+            }
+        }
+        match command {
+            // The secondary STA join completes on bsscfg 1 only.
+            26 => {
+                assert_eq!(&input[..8], &[4, 0, 0, 0, b't', b'e', b's', b't']);
+                assert_eq!(&input[36..42], &AP);
+                self.vif.joined = true;
+                self.event_on(16, (1, 1), AP, &[]);
+                self.events.back_mut().unwrap()[26..28].copy_from_slice(&1u16.to_be_bytes());
+                self.event_on(0, (1, 1), AP, &[]);
+                Vec::new()
+            }
+            52 => {
+                if core::mem::take(&mut self.vif.joined) {
+                    self.event_on(16, (1, 1), AP, &[]);
+                }
+                Vec::new()
+            }
+            23 if self.vif.joined => AP.to_vec(),
+            23 => vec![0; 6],
+            // Read-only queries share the device answers.
+            262 => self.command(command, input, maximum),
+            _ => {
+                self.vif.sets.push((command, input.to_vec()));
+                Vec::new()
+            }
+        }
+    }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
         if let Some(monitor) = self.monitor.as_mut() {
             if let Some(reply) = monitor.command(command, input, maximum) {
@@ -304,8 +386,14 @@ impl Firmware {
             // fweh `BRCMF_E_IF` (`struct brcmf_if_event`) for the one
             // modeled secondary STA interface: ifidx 1, bsscfg 1.
             262 if input.starts_with(b"interface_create\0") => {
-                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, 0]);
+                let role = u8::from(self.vif.ap.is_some());
+                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, role]);
                 Vec::new()
+            }
+            262 if input.starts_with(b"cap\0") && !self.caps.is_empty() => {
+                let mut caps = self.caps.clone();
+                caps.push(0);
+                caps
             }
             263 if input.starts_with(b"bsscfg:interface_remove\0") => {
                 assert_eq!(&input[24..28], &1u32.to_le_bytes());
@@ -643,6 +731,14 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
+        if self.command_ifidx != 0 {
+            return self
+                .vif
+                .ap
+                .as_ref()
+                .filter(|ap| ap.handled)
+                .map_or(0, |ap| ap.status);
+        }
         if let Some(monitor) = self.monitor.as_ref().filter(|monitor| monitor.handled) {
             return monitor.status;
         }
@@ -746,6 +842,14 @@ impl Firmware {
             self.events.extend(ap.events.drain(..));
             self.downlink.extend(ap.downlink.drain(..));
         }
+        // The secondary AP's SME events come from its own interface.
+        if let Some(ap) = self.vif.ap.as_mut() {
+            for mut event in ap.events.drain(..) {
+                event[70] = 1;
+                event[71] = 1;
+                self.events.push_back(event);
+            }
+        }
         while !self.events.is_empty() && !self.event_posts.is_empty() {
             let event = self.events.pop_front().unwrap();
             let (id, address) = self.event_posts.pop_front().unwrap();
@@ -796,7 +900,11 @@ impl Firmware {
                 ethernet.extend_from_slice(&state.dma[&body][..length]);
                 self.uplink.push(ethernet.clone());
                 self.tx_priorities.push((id, tx[22] >> 5));
-                if let Some(ap) = self.ap.as_mut() {
+                if flow.ifidx != 0 {
+                    if let Some(ap) = self.vif.ap.as_mut() {
+                        ap.transmit(&ethernet);
+                    }
+                } else if let Some(ap) = self.ap.as_mut() {
                     ap.transmit(&ethernet);
                 } else if let Some(reply) = self.server.receive(&ethernet) {
                     self.downlink.push_back(reply);
@@ -993,6 +1101,44 @@ impl Handle {
             .as_mut()
             .unwrap()
             .ap = Some(ap_model::Profile::default());
+    }
+    /// The secondary interface is created as a firmware-SME AP (IF ADD
+    /// role 1) whose BSS reports the IF ADD address.
+    /// The native AP source authority is present (as `enable_ap`) while
+    /// the primary interface stays a plain station.
+    pub(crate) fn enable_vif_ap(&self) {
+        self.0.lock().ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));
+        self.change(|f| {
+            let mut ap = ap_model::Profile::default();
+            ap.own = VIF;
+            f.vif.ap = Some(ap);
+        });
+    }
+    /// Firmware `cap` tokens (e.g. `b"ap sta mchan"`).
+    pub(crate) fn set_caps(&self, caps: &[u8]) {
+        self.change(|f| f.caps = caps.to_vec());
+    }
+    /// Apply `change` to the secondary AP model.
+    pub(crate) fn vif_ap_change<T>(&self, change: impl FnOnce(&mut ap_model::Profile) -> T) -> T {
+        let mut state = self.0.lock();
+        let station = state.firmware.as_mut().unwrap().station.as_mut().unwrap();
+        let result = change(station.vif.ap.as_mut().unwrap());
+        firmware_step(&mut state);
+        result
+    }
+    /// Secondary STA dcmds/iovars (plain form) the firmware accepted.
+    pub(crate) fn vif_sets(&self) -> Vec<(u32, Vec<u8>)> {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .station
+            .as_ref()
+            .unwrap()
+            .vif
+            .sets
+            .clone()
     }
     pub(crate) fn ap_change<T>(&self, change: impl FnOnce(&mut ap_model::Profile) -> T) -> T {
         let mut state = self.0.lock();

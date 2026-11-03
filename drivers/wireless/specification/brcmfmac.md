@@ -1180,6 +1180,24 @@ deleted after its TX status). Mock-seam cases (both families, written/
 unexecuted): `smoke_brcmf_vif_event_mask_is_the_union_of_live_owners`
 (primary STA + secondary AP need, roam-policy rewrite, removal) and
 `smoke_brcmf_vif_primary_ap_keeps_secondary_station_events`.
+The msgbuf station model answers ifidx 1 as its own interface
+(`Firmware::command_on`): `bsscfg:` + le32 1 iovars are unwrapped, a
+secondary `SET_SSID`/`DISASSOC` raises link events on bsscfg 1 only, and
+with `Handle::enable_vif_ap` the interface is created as an AP (IF ADD
+role 1) backed by its own `ap_model::Profile` (BSSID = the IF ADD
+address, SME events re-addressed to ifidx/bsscfg 1, TX of ifidx-1 flows).
+`smoke_brcmf_msgbuf_secondary_station_joins_on_ifidx_one` (written/
+unexecuted) joins a secondary STA over msgbuf: every join dcmd carries
+`msg.ifidx` 1, `wpa_auth` goes out as `bsscfg:wpa_auth`, the link opens
+only the secondary port and a bsscfg-1 DEAUTH closes only it.
+`smoke_brcmf_msgbuf_primary_station_beside_secondary_ap` (written/
+unexecuted) is the combo0 concurrency case on the real PCIe transport:
+primary STA joined on ifidx 0, `cap` = `ap sta mchan` parsed by
+`vif::discover`, a `VifDevice` AP shell created by the worker, START
+through `ApControlAuthority` with the Program entirely on ifidx 1 (no
+`BRCMF_C_DOWN`/`apsta`, no `nmode`/`vhtmode`/`qtxpower`, `bsscfg:wsec`,
+`event_msgs` still containing the STA events), a peer association
+reaching the shell's NEW_STATION, and STOP leaving the primary joined.
 
 #### Secondary AP role
 
