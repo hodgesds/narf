@@ -131,10 +131,31 @@ with a session serial and withdrawn by exactly that serial, and
 DC-off bracket, and `route_live()` is the DC-entry refusal predicate.
 
 `intel_gpu_xelpg_hdmi` provides HDMI TMDS (`hdmi_pll_request`, `probe_hdmi`,
-`connect_legacy_tc`, `activate_hdmi`, `MtlHdmiRoute::stop/release`) for DDI B
-and declared legacy Type-C ports up to 340 MHz from the source tables, with an
-AVI infoframe. Scrambling, FRL, non-table clocks, DP-alt and Type-C DDC refuse
-with `HdmiError`. The hotplug service does not yet select HDMI.
+`release_hdmi_probe`, `read_edid_ddc`, `activate_hdmi`,
+`MtlHdmiRoute::stop/release`) for DDI B (DDC pin 2) and declared legacy
+Type-C ports (DDC pin 8 + n), from the source tables up to 594 MHz, with an
+AVI infoframe. `parse_sink_scdc` and `tmds_link` give the HF-VSDB/HF-SCDB sink
+capability and the scrambling decision; above 340 MHz the route sets the
+TRANS_DDI_FUNC_CTL scrambling and high-rate bits and writes the sink's SCDC
+TMDS_CONFIG (`sink_scrambling`) between transcoder and DDI enable, resetting it
+before the transcoder stops. Above-340 MHz clocks the sink cannot scramble or
+exceeds its declared maximum, FRL, clocks above 600 MHz or without a table,
+and DP-alt refuse with `HdmiError`; an SCDC failure on a stream that needs
+scrambling fails activation with a locally stopped route.
+
+`MtlExternalService` owns one `MtlRoute` (`Dp` or `Hdmi`) under an
+`MtlPortPolicy` of per-port `MtlPortDecl { dp, hdmi, legacy }` facts (the VBT
+child data; production `MtlPortPolicy::NO_VBT` = DDI B DP+HDMI, TC1-TC4
+USB-C DP only, `hpd_config()` = `MtlHpdConfig::TYPE_C`). `route_plan` orders a
+connect: DP first, HDMI only on a DPCD read failure (`dpcd_absent`), HDMI only
+on DDI B or a declared legacy Type-C port. `ServiceOutcome::Activated` carries
+the `MtlProtocol`; Refused/Retained carry a `RouteError` (`Dp`/`Hdmi`).
+`route_live`/`routes_stopped` and teardown cover both protocols.
+
+`intel_gpu_gmbus::PinPair` is the `GMBUS_PIN_*` number (DDI A/B/C = 1/2/3,
+TC1-TC6 = 9-14); `GmbusPinTable` is the per-PCH table
+(`for_generation`, `name`, `is_valid`) and `gen12_ddc_pin(family, ddi)` the
+Gen12 default DDC pin, `None` for a DDI the family lacks.
 
 The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
 GGTT byte offset. Both display paths reject invalid plane dimensions,

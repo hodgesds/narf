@@ -115,7 +115,8 @@ the canonical bit definition without re-deriving it.
 
 ### Stage 2 (landed) — Codec layer
 - **`intel_gpu_gmbus`** — GMBUS register file (MMIO 0xC5100..),
-  CMD/STATUS bit layout, pin-pair encoding (DDI A..F), E-EDID
+  CMD/STATUS bit layout, GMBUS pin numbering with the per-PCH
+  `get_gmbus_pin` tables (icp/dg1/dg2/mtp), E-EDID
   read transaction encoder, and the MMIO transport (`GmbusBus`):
   poll-counted HW_RDY / wait-phase waits, STOP-cycle +
   wait-idle teardown, SATOER NAK recovery, CYCLE_INDEX /
@@ -1223,6 +1224,16 @@ HW_DONE bit are #1018's and are not duplicated here — the
 session and its fixtures key off the codec's constants,
 never a private copy of the base.
 
+The DDC pin is the family's Linux default
+(`intel_gmbus::gen12_ddc_pin`, b90c984d
+`intel_hdmi_default_ddc_pin`): Tiger Lake and Alder Lake P/N
+use DDI A/B = GMBUS pin 1/2 and TCn = 8 + n; Alder Lake S
+uses DDI A = 1 and TC1..TC4 = 9..12. A DDI the platform
+lacks (DDI C, ADL-S DDI B, DDI H off Tiger Lake) refuses with
+`NoPinPair` before any access. The earlier DDI A..F = 2..7
+encoding selected the neighbouring pin pair and was
+corrected in 2026-11.
+
 Character-rate rule (HDMI 2.0 §10.4): at 8 bpc the TMDS
 character rate of a mode is its pixel clock. Above
 340 Mcsc the stream requires SCDC scrambling and the 1/40
@@ -1530,8 +1541,9 @@ trusted.
 - Not programmed by this lane: watermark / DBUF allocation and
   PM demand outside a qualified display14.00 all-pipes-off modeset
   (that case runs the display14 resource transaction of §20; other
-  cases retain firmware's allocation), HDMI above 340 MHz and
-  computed (non-table) HDMI PLL states, DP 2.0
+  cases retain firmware's allocation), computed (non-table) HDMI
+  PLL states and HDMI 2.1 FRL (TMDS above 340 MHz with
+  scrambling/SCDC is owned by `intel_gpu_xelpg_hdmi`, §20), DP 2.0
   UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe
   enables, TBT-alt tunnels, pin-assignment-D lane ownership,
   CDCLK notifications on the inherited path (display 14
@@ -2304,7 +2316,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt runtime-wired, Type-C ownership, owned PICA/south hotplug, display-14 AUX power and HDMI TMDS (<= 340 MHz, not yet service-selected) implemented with native fixtures; DC-state join, TBT, HDMI 2.x scrambling/FRL, UHBR, multi-pipe and PSR2 open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; DC-state join, VBT port facts, TBT, HDMI FRL, UHBR, multi-pipe and PSR2 open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
@@ -3767,3 +3779,77 @@ stop, and that a failed exit touches no route register. On Gen12,
 `routes_stopped()` can still report a transient "not stopped" when two callers
 contend for the service's `try_lock`. The Gen12 hook paths otherwise return
 before any register access.
+
+### MTL external outputs: HDMI selection, GMBUS pin correction and HDMI 2.0 scrambling
+
+This slice continues the Output support row for display version 14. Sources
+are Linux b90c984d `intel_ddi.c` (`intel_ddi_init`, `intel_ddi_enable_hdmi`,
+`intel_ddi_disable_hdmi`), `intel_bios.c` (`init_vbt_missing_defaults`,
+`map_ddc_pin`), `intel_hdmi.c`, `intel_gmbus.c`/`intel_gmbus.h`,
+`intel_pch.c`, `drm_edid.c` and `drm_scdc_helper.c`.
+
+- DP or HDMI. `MtlExternalService` owns one `MtlRoute`, either the DP SST
+  route or the HDMI TMDS route, and publishes both through the same
+  `Activated` outcome, ACTIVE/observer serial, and suspend/GT-reset
+  retirement. Linux decides what a port carries from its VBT child device
+  (`intel_ddi_init`: DP, HDMI, and for Type-C "legacy" meaning neither USB-C
+  nor TBT). This tree has no VBT parser, so the facts come from an explicit
+  `MtlPortPolicy`. Production uses `NO_VBT`. Under it, DDI B carries DP and
+  HDMI (the same default `init_vbt_missing_defaults` gives), and TC1-TC4
+  carry USB-C DP-alt only. Linux creates no Type-C encoder at all without a
+  VBT, so no legacy Type-C port and no Type-C HDMI exist until a board
+  declares one. A declaration also derives the hotplug monitor's legacy SDE
+  sources. `NO_VBT` gives exactly `MtlHpdConfig::TYPE_C`. In Linux a dual
+  port gets both connectors and each detects on its own: DP needs a DPCD,
+  HDMI needs a digital DDC EDID. With one owned route the order is DP
+  first, then HDMI only when the DPCD read failed. Any other DP failure
+  (EDID, bandwidth, Type-C) refuses without DDC traffic. HDMI never runs
+  over DP-alt or TBT-alt. A short pulse leaves an HDMI route alone, since
+  `intel_hdmi` has no hpd_pulse. Redetect stops and releases the route,
+  then reconnects in the live mode the route was connected in. That is a
+  superset of `intel_hdmi_reset_link`.
+- GMBUS pin correction (shared Gen12). `PinPair` encoded DDI A..F as
+  GMBUS pins 2..7, so Gen12 DDC selected the neighbouring wires. It now
+  carries the `GMBUS_PIN_*` numbers: DDI A/B/C are 1/2/3 and TC1-TC6 are
+  9-14. `GmbusPinTable` holds the four tables `get_gmbus_pin` selects:
+  icp for PCH_TGP and PCH_ADP, then dg1, dg2, and mtp for Meteor Lake and
+  later. `gen12_ddc_pin` follows `intel_hdmi_default_ddc_pin`: the icl
+  mapping on TGL/ADL-P/ADL-N and the adls mapping on ADL-S. A DDI the
+  platform lacks refuses. Meteor Lake DDI B uses pin 2 ("dpb"). A declared
+  legacy TCn uses pin 8 + n, the pin Linux takes from the VBT through
+  `adlp_ddc_pin_map`; the no-VBT `phy + 1` formula is not wired to Type-C
+  in `gmbus_pins_mtp`. The Type-C DDC refusal is lifted. The MTL route reads
+  EDID through the shared GMBUS transport as `drm_do_probe_ddc_edid` does:
+  one INDEX-cycle transfer per block, segment 0 only.
+- HDMI 2.0 above 340 MHz. Sink capability follows
+  `drm_parse_hdmi_forum_scds` over the HF-VSDB and the HF-SCDB. The
+  scrambling decision follows `intel_hdmi_compute_config`: scramble when
+  the sink supports it and either it accepts low-rate scrambling or the
+  clock is above 340 MHz, with the 1/40 ratio above 340 MHz. A clock above
+  340 MHz refuses if the sink declares no scrambling or a lower maximum;
+  clocks above the 600 MHz source maximum refuse too. The source sets
+  `TRANS_DDI_HDMI_SCRAMBLING` and `TRANS_DDI_HIGH_TMDS_CHAR_RATE`. The sink
+  gets the `drm_scdc` ratio write (then 1 ms) and the scrambling write
+  after the transcoder and before the DDI buffer, and is reset before the
+  transcoder stops. This covers C10 497.75/592/593.407/594 MHz and C20
+  594 MHz. Linux only logs an SCDC failure; here a stream that needs
+  scrambling fails activation and is stopped locally. FRL stays refused.
+
+Remaining: a VBT parser (port facts, DDC pin overrides, dual-mode and
+`max_tmds_clock` caps), E-DDC segments 1+ (the per-call GMBUS transport
+cannot hold the segment pointer across a repeated START), HDMI FRL,
+computed C10/C20 HDMI PLL states, audio, deep colour and YCbCr, and the
+DC-state join. The Gen12 HDMI session still uses its older DDC engine and
+SCDC sequence, so only its pin numbering changed. Native fixtures cover
+these paths. They are not physical sink or visible-pixel acceptance.
+
+New native tests: `drivers/gpu/intel_gpu_xelpg_external` (5),
+`drivers/gpu/intel_gpu_xelpg_hdmi` (3), `drivers/gpu/intel_gpu_gmbus` (1)
+and `drivers/gpu/intel_gpu`
+(`smoke_mtl_external_hook_pass_publishes_and_retires_hdmi_route`). These
+were intentionally corrected: `smoke_pin_pair_round_trip`,
+`smoke_edid_read_program_layout`, `smoke_transport_pin_pair_selection`,
+`smoke_hdmi_1080p_connect_no_scdc_traffic` (it now pins pin 2),
+`smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal`
+(ADL-S has no DDI B), `smoke_mtl_hdmi_pll_tables_and_typed_refusals` and
+`smoke_mtl_hdmi_probe_refusals_before_mmio`.
