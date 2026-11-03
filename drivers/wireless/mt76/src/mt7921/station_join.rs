@@ -522,7 +522,7 @@ impl<B: Backend> Session<B> {
             None => Ok(false),
         }
     }
-    fn owner_receive_current(
+    pub(super) fn owner_receive_current(
         &self,
         station: &super::StationLink,
         state: &State,
@@ -727,20 +727,23 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) fn keys_pending(&self) -> bool {
-        !self.station.peer_lost
+        self.owner_keys_pending(&self.station, &self.state)
+    }
+    /// Key/WMM/BA control work of one station owner (the current one, or
+    /// the swapped-out group owner for `group_keys_pending`).
+    pub(super) fn owner_keys_pending(&self, station: &super::StationLink, state: &State) -> bool {
+        !station.peer_lost
             && !self.p2p_rf_busy()
-            && matches!(self.state, State::Associated { .. })
+            && matches!(state, State::Associated { .. })
             && self.data_pending.is_empty()
-            && (self.station.wmm_pending.is_some()
-                || !self.station.control_pending.is_empty()
-                || self.station.rx_ba.pending(self.backend.now_ns())
-                || self.station.tx_ba.pending(self.backend.now_ns())
-                || self
-                    .station
+            && (station.wmm_pending.is_some()
+                || !station.control_pending.is_empty()
+                || station.rx_ba.pending(self.backend.now_ns())
+                || station.tx_ba.pending(self.backend.now_ns())
+                || station
                     .tx_restart
                     .is_some_and(|request| request.waiting_receipt())
-                || self
-                    .station
+                || station
                     .security
                     .as_ref()
                     .is_some_and(|security| !security.pending.is_empty()))

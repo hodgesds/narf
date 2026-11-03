@@ -471,6 +471,74 @@ impl<B: Backend> Session<B> {
         result?;
         capture.map(|_| ())
     }
+    /// Group-link key/WMM/BA control work is waiting (the home owner's
+    /// `keys_pending` for the swapped-out group owner). Like the home
+    /// owner, it waits for an empty device TX FIFO: the EAPOL/ADDBA frames
+    /// it sends need the native management token.
+    pub(super) fn group_keys_pending(&self, link: Link) -> bool {
+        !self.group_role()
+            && self
+                .group
+                .as_ref()
+                .filter(|group| group.station.link == link)
+                .is_some_and(|group| self.owner_keys_pending(&group.station, &group.state))
+    }
+    /// Service the group link's captured PTK/GTK rekeys, WMM updates and
+    /// RX/TX BA control (`service_keys` on the group owner: Linux runs the
+    /// same mac80211 key/agg work per `ieee80211_sub_if_data`).
+    pub(super) async fn service_group_keys(&mut self, link: Link) -> Result<(), Error> {
+        let result = {
+            let mut role = self.enter_group(link)?;
+            role.service_keys().await
+        };
+        let capture = self.sync_receive_capture();
+        result?;
+        capture.map(|_| ())
+    }
+    /// Negotiate the group link's originator BA before its first QoS MPDU
+    /// (`negotiate_transmit_ba` on the group peer WCID/bss_idx;
+    /// `mt7921_ampdu_action` -> `mt76_connac_mcu_sta_ba` per `mt792x_sta`).
+    pub(super) async fn negotiate_group_transmit_ba(&mut self, link: Link) -> Result<bool, Error> {
+        let result = {
+            let mut role = self.enter_group(link)?;
+            role.negotiate_transmit_ba().await
+        };
+        let capture = self.sync_receive_capture();
+        let negotiated = result?;
+        capture?;
+        Ok(negotiated)
+    }
+    /// An independent originator agreement for an unused group-link TID.
+    pub(super) async fn negotiate_group_transmit_ba_tid(
+        &mut self,
+        link: Link,
+        tid: u8,
+    ) -> Result<bool, Error> {
+        let result = {
+            let mut role = self.enter_group(link)?;
+            role.negotiate_transmit_ba_tid(tid).await
+        };
+        let capture = self.sync_receive_capture();
+        let negotiated = result?;
+        capture?;
+        Ok(negotiated)
+    }
+    /// Whether a group-link batch captured under `epoch` is still current
+    /// for the group owner (its `receive_current`).
+    pub(super) fn group_receive_current(&self, link: Link, epoch: u64) -> Result<bool, Error> {
+        if self.group_role() {
+            return Ok(false);
+        }
+        match self
+            .group
+            .as_ref()
+            .filter(|group| group.station.link == link)
+        {
+            Some(group) => self.owner_receive_current(&group.station, &group.state, epoch),
+            None => Ok(false),
+        }
+    }
+
     /// One data/key service step on the group link (TX, rekey, RX).
     pub(super) fn step_group_network(
         &mut self,

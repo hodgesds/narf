@@ -672,6 +672,105 @@ pub async fn service_boot_keys() -> Result<(), Error> {
     finish_boot_keys().await
 }
 
+/// Borrow the retained boot owner after pending key work (the same
+/// ownership rule as every other boot-owner entry).
+macro_rules! boot_owner_call {
+    ($owner:ident => $call:expr) => {{
+        finish_boot_keys().await?;
+        let Some(mut guard) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        let $owner = guard.as_mut().ok_or(Error::DeviceGone)?;
+        $call.await
+    }};
+}
+
+/// Publish the concurrent P2P-client group vif `vif` with own address
+/// `own` on the retained boot owner (Linux `mt7921_add_interface`).
+pub(crate) async fn start_boot_group_link(
+    vif: crate::mt7921::vif_slots::Vif,
+    own: [u8; 6],
+) -> Result<crate::mt7921::vif_slots::Link, Error> {
+    boot_owner_call!(owner => owner.start_group_link(vif, own))
+}
+/// Retire the idle group vif (`mt792x_remove_interface`).
+pub(crate) async fn stop_boot_group_link(
+    link: crate::mt7921::vif_slots::Link,
+) -> Result<(), Error> {
+    boot_owner_call!(owner => owner.stop_group_link(link))
+}
+/// Join the group link as a P2P client (`p2p_client`) or second station.
+pub(crate) async fn associate_boot_group(
+    link: crate::mt7921::vif_slots::Link,
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+    p2p_client: bool,
+) -> Result<u16, Error> {
+    let network = if p2p_client {
+        crate::mt7921::p2p_wire::Network::P2p
+    } else {
+        crate::mt7921::p2p_wire::Network::Infrastructure
+    };
+    boot_owner_call!(owner => owner.associate_group(link, bss, ssid, security, extra_ies, network))
+}
+/// Leave the group link's association (deauth, key/WCID/BSS retirement).
+pub(crate) async fn disassociate_boot_group(
+    link: crate::mt7921::vif_slots::Link,
+) -> Result<(), Error> {
+    boot_owner_call!(owner => owner.disassociate_group(link))
+}
+/// Explicit group-link originator BA for an unused TID.
+pub(crate) async fn negotiate_boot_group_transmit_ba_tid(
+    link: crate::mt7921::vif_slots::Link,
+    tid: u8,
+) -> Result<bool, Error> {
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    boot_owner_call!(owner => owner.negotiate_group_transmit_ba_tid(link, tid))
+}
+/// One bounded group-link packet step. Pending home or group key work
+/// first runs through the shared retained key owner (`prepare_boot_keys`
+/// covers both owners), exactly as `step_boot_network`.
+pub(crate) fn step_boot_group_network(
+    link: crate::mt7921::vif_slots::Link,
+    tx: Option<&[u8]>,
+) -> Result<PacketStep, Error> {
+    prepare_boot_keys()?;
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match poll_boot_keys(&mut cx) {
+        Poll::Ready(result) => result?,
+        Poll::Pending => return Err(Error::Busy),
+    }
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .step_group_network(link, tx)
+}
+/// The group-link analogue of `boot_receive_current`.
+pub(crate) fn boot_group_receive_current(
+    link: crate::mt7921::vif_slots::Link,
+    epoch: u64,
+) -> Result<bool, Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Ok(false);
+    };
+    owner
+        .as_ref()
+        .map_or(Ok(false), |owner| owner.group_receive_current(link, epoch))
+}
+/// The retained boot owner's group link and its role state.
+pub(crate) fn boot_group_link() -> Option<(crate::mt7921::vif_slots::Link, State)> {
+    let owner = BOOT_OWNER.try_lock()?;
+    let owner = owner.as_ref()?;
+    Some((owner.group_link()?, owner.group_state()?))
+}
+
 /// Recovery owns its transport across polls, including after caller
 /// cancellation. Carrier must be closed before this operation is requested.
 pub async fn recover_boot_radio(expected_mac: [u8; 6]) -> Result<(), Error> {

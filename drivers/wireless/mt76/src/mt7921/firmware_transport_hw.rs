@@ -2029,11 +2029,107 @@ impl Transport {
         self.session.publish_receive(epoch, publish)
     }
 
+    /// Home key service, then the group link's (`service_group_keys`). A
+    /// group failure is recorded in the group role (`State::Failed`) and
+    /// surfaces on its own entries; it never fails the home step.
     pub(super) async fn service_keys(&mut self) -> Result<(), Error> {
-        self.session.service_keys().await
+        self.session.service_keys().await?;
+        if let Some(link) = self.session.group_link() {
+            if self.session.group_keys_pending(link) {
+                let _ = self.session.service_group_keys(link).await;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn keys_pending(&self) -> bool {
         self.session.keys_pending()
+            || self
+                .session
+                .group_link()
+                .is_some_and(|link| self.session.group_keys_pending(link))
+    }
+
+    /// Publish a concurrent P2P-client group vif (`start_group_link`:
+    /// Linux `mt7921_add_interface` for a second STATION|P2P_CLIENT vif).
+    pub(crate) async fn start_group_link(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        own: [u8; 6],
+    ) -> Result<crate::mt7921::vif_slots::Link, Error> {
+        self.session.start_group_link(vif, own).await
+    }
+    /// Retire an idle group vif (`mt792x_remove_interface`).
+    pub(crate) async fn stop_group_link(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+    ) -> Result<(), Error> {
+        self.session.stop_group_link(link).await
+    }
+    /// Join the group link as a P2P client (or a second station): the
+    /// qualified grant comes from the target's regulatory power type, as
+    /// for the home join, and must equal any live owner's channel context.
+    /// Key, BA and key service follow exactly as `associate_station_as`.
+    pub(crate) async fn associate_group(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        bss: &super::ScanBss,
+        ssid: &[u8],
+        security: crate::mt7921::association::Security,
+        extra_ies: &[u8],
+        network: crate::mt7921::p2p_wire::Network,
+    ) -> Result<u16, Error> {
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        let info = match self.session.group_state() {
+            Some(State::RadioReady(info) | State::ScanReady(info)) => info,
+            _ => return Err(Error::Busy),
+        };
+        let permission = crate::mt7921::association::TxPermission::from_ap(&domain, info, bss)
+            .ok_or(Error::Authority)?;
+        let aid = self
+            .session
+            .associate_group(link, bss, ssid, security, permission, extra_ies, network)
+            .await?;
+        self.session.service_group_keys(link).await?;
+        self.session.negotiate_group_transmit_ba(link).await?;
+        self.session.service_group_keys(link).await?;
+        Ok(aid)
+    }
+    pub(crate) async fn disassociate_group(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+    ) -> Result<(), Error> {
+        self.session.disassociate_group(link).await
+    }
+    pub(crate) async fn negotiate_group_transmit_ba_tid(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        tid: u8,
+    ) -> Result<bool, Error> {
+        self.session
+            .negotiate_group_transmit_ba_tid(link, tid)
+            .await
+    }
+    pub(crate) fn step_group_network(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        tx: Option<&[u8]>,
+    ) -> Result<super::PacketStep, Error> {
+        self.session.frag_threshold =
+            super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);
+        self.session.step_group_network(link, tx)
+    }
+    pub(crate) fn group_receive_current(
+        &self,
+        link: crate::mt7921::vif_slots::Link,
+        epoch: u64,
+    ) -> Result<bool, Error> {
+        self.session.group_receive_current(link, epoch)
+    }
+    pub(crate) fn group_link(&self) -> Option<crate::mt7921::vif_slots::Link> {
+        self.session.group_link()
+    }
+    pub(crate) fn group_state(&self) -> Option<State> {
+        self.session.group_state()
     }
 }

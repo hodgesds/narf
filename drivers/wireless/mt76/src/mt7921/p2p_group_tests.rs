@@ -840,6 +840,66 @@ kernel_test_in!(
     mt76_p2p_group_owner_routes_rx_and_tx_completions
 );
 
+fn group_service() -> Result<(), &'static str> {
+    use crate::mt7921::vif_slots::{Link, Vif};
+    let (mut session, bss) = super::super::super::ht20_tests::prepared(6, true);
+    let home = session.state;
+    let vif = Vif::new(1).map_err(|_| "vif")?;
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let link = run(Box::pin(session.start_group_link(vif, own))).map_err(|_| "group start")?;
+    if session.group_keys_pending(link) || session.group_receive_current(link, 1) != Ok(false) {
+        return Err("an unassociated group owner reported key/RX work");
+    }
+    run(Box::pin(session.associate_group(
+        link,
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2Psk { psk: [0x55; 32] },
+        test_permission(),
+        &[],
+        Network::P2p,
+    )))
+    .map_err(|_| "group association")?;
+    // Key/control service runs on the group owner and leaves home intact.
+    run(Box::pin(session.service_group_keys(link))).map_err(|_| "group key service")?;
+    if session.group_keys_pending(link)
+        || session.state != home
+        || session.station.link != Link::HOME
+        || session.group_receive_current(link, session.receive_epoch) != Ok(true)
+        || session.group_receive_current(Link::HOME, session.receive_epoch) != Ok(false)
+    {
+        return Err("group key service changed the home owner or group RX");
+    }
+    // Originator BA on the group peer (mt7921_ampdu_action per mt792x_sta):
+    // ADDBA leaves on the group vif; the home originator stays idle.
+    session.backend.tx_ba_offer = Some((64, 0));
+    let tx = session.backend.tx_vifs.len();
+    if run(Box::pin(session.negotiate_group_transmit_ba(link))) != Ok(true)
+        || !session
+            .group
+            .as_ref()
+            .is_some_and(|group| group.station.tx_ba.active())
+        || session.station.tx_ba.active()
+        || session.backend.tx_vifs[tx..].iter().any(|&v| v != 1)
+    {
+        return Err("group originator BA left its owner or vif");
+    }
+    if run(Box::pin(
+        session.negotiate_group_transmit_ba_tid(Link::HOME, 1),
+    )) != Err(Error::Bounds)
+    {
+        return Err("a home link was accepted as the group owner");
+    }
+    Ok(())
+}
+fn mt76_p2p_group_link_services_keys_and_ba() -> TestResult {
+    group_service().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_group_link_services_keys_and_ba
+);
+
 fn mt76_p2p_group_link_drives_association_on_group_vif() -> TestResult {
     group_association().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
