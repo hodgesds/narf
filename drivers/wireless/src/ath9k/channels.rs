@@ -75,10 +75,28 @@ pub(super) fn request_geometry(
             }
             work.result.clone()
         } else {
-            let owner = CONTROLLER.lock().clone().ok_or(Error::State)?;
-            // Count the accepted original request before it waits for CONTROL;
-            // an idle request cannot retire hardware from under queued work.
-            let awake = owner.idle.use_awake(false).map_err(|_| Error::Busy)?;
+            let ar9285 = CONTROLLER.lock().clone();
+            let reset: Pin<Box<dyn Future<Output = Result<(), BringUpError>> + Send>> =
+                if let Some(owner) = ar9285 {
+                    // Count the accepted original request before it waits for
+                    // CONTROL; an idle request cannot retire hardware from
+                    // under queued work.
+                    let awake = owner.idle.use_awake(false).map_err(|_| Error::Busy)?;
+                    Box::pin(async move {
+                        let _awake = awake;
+                        super::reset_owner_geometry(&owner, Some(geometry), Some(generation), wide)
+                            .await
+                            .map(|_| ())
+                    })
+                } else if wide.is_none() {
+                    // The chip-generic AR9287 owner (no HT40 owner exists).
+                    Box::pin(
+                        super::ar9287_owner::transition(geometry.control(), generation)
+                            .ok_or(Error::State)?,
+                    )
+                } else {
+                    return Err(Error::Profile);
+                };
             let result = Arc::new(IrqSafeSpinLock::new(Completion {
                 result: None,
                 waiters: Vec::new(),
@@ -91,14 +109,11 @@ pub(super) fn request_geometry(
                 result: result.clone(),
                 wake: wake.clone(),
                 future: Box::pin(async move {
-                    let _awake = awake;
-                    super::reset_owner_geometry(&owner, Some(geometry), Some(generation), wide)
-                        .await
-                        .map_err(|e| match e {
-                            BringUpError::Policy => Error::Profile,
-                            BringUpError::DeviceGone => Error::Transport(packet::Error::Access),
-                            _ => Error::State,
-                        })?;
+                    reset.await.map_err(|e| match e {
+                        BringUpError::Policy => Error::Profile,
+                        BringUpError::DeviceGone => Error::Transport(packet::Error::Access),
+                        _ => Error::State,
+                    })?;
                     let device = interface::current().ok_or(Error::State)?;
                     let correct = device.radio.try_lock().is_some_and(|r| {
                         r.frequency_mhz() == geometry.control()

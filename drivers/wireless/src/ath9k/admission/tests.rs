@@ -196,7 +196,7 @@ fn smoke_ath9k_ar9287_native_profile_binds_admission_and_chains() -> TestResult 
         noise_dbm: [Some(-112), Some(-112)],
     };
     let profile = Profile::ar9287(3, 3, true);
-    let build = |id, frequency, profile, map: &[u8]| {
+    let build_mask = |id, frequency, profile, map: &[u8], mask| {
         let cap = Cap::<BusDeviceCap, Write>::bootstrap();
         cap.revoke();
         // SAFETY: the revoked fixture capability makes every config, DMA and
@@ -210,9 +210,12 @@ fn smoke_ath9k_ar9287_native_profile_binds_admission_and_chains() -> TestResult 
                 grant.clone(),
                 map,
                 profile,
+                mask,
             )
         }
     };
+    let build =
+        |id, frequency, profile, map: &[u8]| build_mask(id, frequency, profile, map, 1 << 2);
     for (id, frequency, profile) in [
         (0x002b, 2422, profile),
         (0x002d, 2422, profile),
@@ -238,6 +241,17 @@ fn smoke_ath9k_ar9287_native_profile_binds_admission_and_chains() -> TestResult 
     {
         return TestResult::Fail("AR9287 native profile differs");
     }
+    // Per-channel records: the mask must name the calibrated primary and
+    // stay inside channels 1..=13.
+    for mask in [1 << 5, (1 << 2) | (1 << 13)] {
+        if build_mask(0x002e, 2422, profile, &map, mask).is_ok() {
+            return TestResult::Fail("AR9287 owner accepted a mask without its primary");
+        }
+    }
+    match build_mask(0x002e, 2422, profile, &map, (1 << 2) | (1 << 5)) {
+        Ok(native) if native.channel_mask() == (1 << 2) | (1 << 5) => {}
+        _ => return TestResult::Fail("AR9287 per-channel record mask not retained"),
+    }
     if native.long_calibration() != Err(PacketError::Access)
         || native.read(0x4020) != Err(PacketError::Access)
         || native.master(true) != Err(PacketError::Access)
@@ -249,4 +263,57 @@ fn smoke_ath9k_ar9287_native_profile_binds_admission_and_chains() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar9287_native_profile_binds_admission_and_chains
+);
+
+fn facts_at(frequency: u16) -> Result<Facts, BringUpError> {
+    let prepared = Prepared {
+        geometry: Geometry::from_frequency(frequency)?,
+        ini_writes: 711,
+    };
+    Facts::new(
+        &device(0x002e),
+        &Revision::decode(0x0018_03ff).ok_or(BringUpError::UnsupportedRevision)?,
+        &identity(),
+        &prepared,
+        &image(3),
+        frequency,
+    )
+}
+
+/// Cold retunes load the target channel's own record: each channel has its
+/// own filename and identity, and a record for one channel never admits
+/// another channel's facts.
+fn smoke_ath9k_ar9287_records_are_keyed_per_channel() -> TestResult {
+    let (Ok(one), Ok(six)) = (facts_at(2412), facts_at(2437)) else {
+        return TestResult::Fail("AR9287 per-channel facts refused");
+    };
+    let (a, b) = (one.request(), six.request());
+    if a.filename != "ath9k/ar9287-admit-v1-ch1-02aabbccddee.bin"
+        || b.filename != "ath9k/ar9287-admit-v1-ch6-02aabbccddee.bin"
+        || a.identity == b.identity
+        || b.frequency_mhz != 2437
+    {
+        return TestResult::Fail("AR9287 records are not keyed per channel");
+    }
+    let mut for_one = record(&one, 6, 36);
+    for_one[54] = 1;
+    let mut for_six = record(&six, 6, 36);
+    for_six[54] = 6;
+    if load(six.clone(), for_one.clone(), true).is_ok() {
+        return TestResult::Fail("channel-1 record admitted channel 6");
+    }
+    // Same identity bytes but the channel field of another channel.
+    let mut relabelled = for_one;
+    relabelled[54] = 6;
+    if load(six.clone(), relabelled, true).is_ok() {
+        return TestResult::Fail("relabelled channel-1 record admitted channel 6");
+    }
+    match load(six, for_six, true) {
+        Ok(grant) if grant.request() == b => TestResult::Pass,
+        _ => TestResult::Fail("channel-6 record refused for channel 6"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9287_records_are_keyed_per_channel
 );

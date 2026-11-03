@@ -1364,14 +1364,39 @@ gains `mac_clock` (used by `set_peer`) and `tx_chainmask`
 is not 1). `packet_native::Native` holds a `Calibrated::{Ar9285, Ar9287}`
 profile; `Native::new_ar9287` binds the PCI ID `0x002d`/`0x002e` to the
 grant's device and primary, the exact map length and masks, the factory
-`rfSilent` input, a single-channel mask (the record binds one primary) and
+`rfSilent` input, the per-channel admitted mask (below) and
 the open-loop rate registers `phy::ar9287::power::plan` derives at the
 calibrated ceiling, which every physical readback re-checks.
 `Calibrated::permitted` re-proves the host permission and, for AR9287,
 the signed record (`Grant::invoke`) with `Grant::ceiling(host)` no lower
-than the calibrated power. HT, BA, QoS, PS, the AR9285 periodic/ANI
-receipts and retuning stay AR9285-only (no `ht::Facts`, the AR9285
-`channels` controller is absent so retune requests fail closed).
+than the calibrated power. HT, BA, QoS, PS and the AR9285 periodic/ANI
+receipts stay AR9285-only (no `ht::Facts`; HT40 retune requests fail
+closed).
+
+**AR9287 cold retunes.** `N87A` records are keyed per channel: the record
+identity binds the channel, its factory open-loop plan at the 40 half-dB
+maximum and the shared map/preparation, and the request filename names the
+channel (`ar9287-admit-v1-ch<N>-<mac>.bin`). Each composition sets the
+`Native` channel mask to the calibrated primary plus every channel 1..13
+whose record verifies (`admitted_mask`); the INI row count is
+channel-independent, so a target's expected `Prepared` is known before any
+hardware write. `channels::request_geometry` routes a 20 MHz request to
+`ar9287_owner::transition` when no AR9285 controller exists, so the
+public multi-channel scan, restore and join-to-another-channel paths of
+§3.5 are shared unchanged (AR9285 requests take the identical previous
+path). `ar9287_owner::reset` holds the shared `CONTROL` mutex and, while the
+requesting generation is still current: proves host permission at the
+target and loads the target channel's signed record (an absent, unsigned
+or foreign record never retires the current generation); retires the
+station and requires the DMA-stop proof; requires bus mastering off;
+discards the old calibration; repeats `identify_chip` (power-on + warm
+reset, `hw.c::ath9k_hw_set_reset_reg`) and requires the identical revision,
+identity and factory map; runs `phy::ar9287::prepare` at the target and
+requires the record's preparation; bumps the generation and runs the same
+`initialize` (calibration under the target's `Grant::ceiling`, AR9287 TX
+power at the target, MAC, packet, station, publication). A failed reset
+leaves a fresh un-calibrated owner; old authorities never reopen. Smoke
+(written, not executed): `smoke_ath9k_ar9287_records_are_keyed_per_channel`.
 
 `ar9287_owner.rs` registers `0x002d` (`ath9k-ar9287`) and `0x002e`
 (`ath9k-ar9287e`) with the same singleton address reservation as AR9285.
@@ -1397,8 +1422,7 @@ republish (no generation reset on this profile). Smokes (written, not
 executed): `smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo`,
 `smoke_ath9k_ar9287_native_profile_binds_admission_and_chains`.
 
-Known AR9287 gaps: the station is fixed to the recorded 2412 MHz primary
-(no retune, no generation reset/resume republish); periodic NF/IQ
+Known AR9287 gaps: no generation reset/resume republish; periodic NF/IQ
 per-calibration is not run (only the long-calibration temperature
 compensation); HT20/HT40 TX power and every HT owner are out of scope as for
 the AR9285 legacy base; closed-loop maps stay refused. No physical AR9287

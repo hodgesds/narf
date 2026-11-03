@@ -9,10 +9,21 @@
 //! (`calibration::ar9287`) runs under `Grant::ceiling`; the same native
 //! MAC/packet/station/interface owners as AR9285 then carry a two-chain,
 //! async-FIFO profile. An unprovisioned or foreign record leaves the chip
-//! parked and unadmitted. Retuning, HT and generation reset stay AR9285-only.
+//! parked and unadmitted.
+//!
+//! Cold retunes (multi-channel scans, joins to another channel) follow the
+//! AR9285 generation protocol (`ath9k.md` §3.5): the target channel's own
+//! signed `N87A` record is loaded before the old generation is retired, the
+//! retired generation's DMA stop is proven, then the same function is
+//! power-on/warm-reset (`hw.c::ath9k_hw_reset`), its revision, identity and
+//! factory map must match, and `phy::ar9287::prepare`, the open-loop power
+//! plan and calibration repeat at the target before a fresh station
+//! generation is published. HT stays AR9285-only.
 use super::{
-    admission, calibration, chips::Chip, identity, interface, mac, packet, packet_native, phy,
-    station, BringUpError, RetainedRadio, CLAIMED_ADDRESS,
+    admission, calibration,
+    chips::{Chip, Revision},
+    identity, interface, mac, packet, packet_native, phy, station, BringUpError, RetainedRadio,
+    CLAIMED_ADDRESS, CONTROL,
 };
 use alloc::{boxed::Box, sync::Arc};
 use core::fmt::Write as _;
@@ -20,7 +31,7 @@ use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
-/// The primary the signed record and calibration bind (channel 1).
+/// The initial primary the signed record and calibration bind (channel 1).
 const PRIMARY: u16 = 2412;
 /// `ath9k.h::ATH_LONG_CALINTERVAL` (30 s) of `link.c::ath_ani_calibrate`.
 const LONG_CAL_NS: u64 = 30_000_000_000;
@@ -28,22 +39,65 @@ const LONG_CAL_NS: u64 = 30_000_000_000;
 /// `AR9287_DEVID_PCIE`.
 pub(super) const DEVICES: [(u16, &str); 2] = [(0x002d, "ath9k-ar9287"), (0x002e, "ath9k-ar9287e")];
 
-struct Owner {
+pub(super) struct Owner {
     mmio: MmioRegion,
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
+    revision: Revision,
     identity: identity::Identity,
     image: Box<[u8]>,
     profile: mac::Profile,
+    /// Inactive preparation of the current physical generation.
+    prepared: phy::ar9287::Prepared,
+    /// Primary of the current generation; its record is `grant`.
+    primary: u16,
     grant: Arc<admission::Grant>,
     radio: calibration::ar9287::Calibration,
     station: Option<RetainedRadio>,
     attempted: bool,
+    /// Physical generation; bumped by each successful cold reset.
+    generation: u32,
     removed: bool,
+    /// System suspend parked the chip in FULL_SLEEP; only resume reopens it.
+    suspended: bool,
     /// Retirement could not prove DMA stopped; the address stays reserved.
     pinned: bool,
 }
-static OWNER: IrqSafeSpinLock<Option<Arc<Mutex<Owner>>>> = IrqSafeSpinLock::new(None);
+pub(super) type Shared = Arc<Mutex<Owner>>;
+static OWNER: IrqSafeSpinLock<Option<Shared>> = IrqSafeSpinLock::new(None);
+
+/// The preparation `phy::ar9287::prepare` produces at `frequency` for this
+/// owner: the INI row count depends only on the AR9287 1.1+ tables.
+fn prepared_at(o: &Owner, frequency: u16) -> Result<phy::ar9287::Prepared, BringUpError> {
+    Ok(phy::ar9287::Prepared {
+        geometry: super::channel_width::Geometry::from_frequency(frequency)?,
+        ini_writes: o.prepared.ini_writes,
+    })
+}
+
+/// The signed `N87A` record keyed to `frequency` (its identity binds the
+/// channel, its open-loop plan and the shared map/preparation).
+fn record(o: &Owner, frequency: u16) -> Result<Arc<admission::Grant>, BringUpError> {
+    let prepared = prepared_at(o, frequency)?;
+    let facts = admission::Facts::new(
+        &o.device.id,
+        &o.revision,
+        &o.identity,
+        &prepared,
+        &o.image,
+        frequency,
+    )?;
+    admission::Source::Registered.load(facts)
+}
+
+/// Channels 1..=13 with a factory open-loop plan and a verified record.
+fn admitted_mask(o: &Owner) -> u16 {
+    (1..=13u16)
+        .filter(|channel| record(o, 2407 + 5 * channel).is_ok())
+        .fold(1 << ((o.primary - 2412) / 5), |mask, channel| {
+            mask | 1 << (channel - 1)
+        })
+}
 
 fn matches(id: &narf_bus::DeviceId) -> bool {
     id.vendor == 0x168c
@@ -131,14 +185,19 @@ pub(super) fn probe(
         mmio,
         device,
         cap,
+        revision,
         identity,
         image,
         profile,
+        prepared,
+        primary: PRIMARY,
         grant,
         radio: calibration::ar9287::Calibration::default(),
         station: None,
         attempted: false,
+        generation: 0,
         removed: false,
+        suspended: false,
         pinned: false,
     }));
     *OWNER.lock() = Some(owner.clone());
@@ -155,7 +214,10 @@ pub(super) fn probe(
             if attempt > 0 {
                 narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
             }
-            result = initialize(&owner).await;
+            result = {
+                let _control = CONTROL.lock().await;
+                initialize(&owner).await
+            };
             if !matches!(result, Err(BringUpError::Policy)) {
                 break;
             }
@@ -192,7 +254,7 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<calibration::ar9287::Report,
     if o.removed || o.attempted || o.radio.state() != calibration::State::New {
         return Err(BringUpError::BadState);
     }
-    let host = calibration::Permission::from_domain_at(&domain, PRIMARY)?;
+    let host = calibration::Permission::from_domain_at(&domain, o.primary)?;
     let grant = o.grant.clone();
     let permission = host.with_ceiling(grant.invoke(|| Ok(grant.ceiling(host.budget())))?);
     let command = identity::invoke(&o.cap, || narf_bus::pci::read_command(&o.cap, &o.device))
@@ -208,8 +270,8 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<calibration::ar9287::Report,
     let image = o.image.clone();
     let rx = o.identity.rx_chainmask;
     let report = {
-        // SAFETY: probe identified this AR9287 and ran its complete inactive
-        // preparation for PRIMARY; PCI parking was verified above and no
+        // SAFETY: probe or the last cold reset identified this AR9287 and ran
+        // its complete inactive preparation for `primary`; PCI parking was verified above and no
         // packet DMA exists. The async mutex serializes the whole attempt.
         let future = unsafe { o.radio.run(&mut io, &image, rx, permission) };
         let mut future = core::pin::pin!(future);
@@ -251,6 +313,7 @@ fn compose(
 ) -> Result<RetainedRadio, packet::Error> {
     let noise = report.noise_dbm[0].ok_or(packet::Error::State)?;
     let mac = o.identity.mac;
+    let channel_mask = admitted_mask(o);
     // SAFETY: same sole calibrated AR9287 function, cap and BAR; the signed
     // grant bounded calibration and no packet DMA was published.
     let native = unsafe {
@@ -262,6 +325,7 @@ fn compose(
             o.grant.clone(),
             &o.image,
             o.profile,
+            channel_mask,
         )
     }?;
     mac::prepare_chip(&native, &o.image, mac, o.profile)?;
@@ -269,16 +333,97 @@ fn compose(
     // SAFETY: complete parked MAC/key-cache/queue preparation succeeded on
     // this same non-cloneable native adapter; prepare does not start DMA.
     let packet = unsafe { packet::Packet::prepare(native, mac) }?;
-    // Generation 0 is never a retained AR9285 controller generation: any
-    // retune or HT40 request fails closed in `channels`.
+    // `channels` routes this generation's retunes to `transition`; HT40
+    // requests fail closed (no AR9287 HT owner).
     let station = Arc::new(Mutex::new(station::Radio::new(
         packet,
         mac,
         noise,
-        station::NativeEnvironment { generation: 0 },
+        station::NativeEnvironment {
+            generation: o.generation,
+        },
     )));
     o.station = Some(station.clone());
     Ok(station)
+}
+
+/// Driver-owned cold transition for `channels`: the retained AR9287 owner
+/// is cold-reset to `frequency` only while `generation` is still current.
+pub(super) fn transition(
+    frequency: u16,
+    generation: u32,
+) -> Option<impl core::future::Future<Output = Result<(), BringUpError>> + Send + 'static> {
+    let owner = OWNER.lock().clone()?;
+    Some(async move {
+        reset(&owner, Some(frequency), Some(generation))
+            .await
+            .map(|_| ())
+    })
+}
+
+/// Cold generation reset (Linux `ath_reset` / `ath9k_hw_reset` with the
+/// `AR_RTC` power-on + warm reset of `ath9k_hw_set_reset_reg`): `selected`
+/// retunes to another primary, `None` repeats the current one (recovery
+/// and resume). The target's signed record and host permission are proven
+/// before the old generation is retired; its DMA stop must then be proven
+/// and bus mastering must be off before the function is reset. Revision,
+/// identity and the factory map must match the probe, the inactive
+/// preparation must equal the record's, and calibration plus composition
+/// publish a fresh generation. A failed reset leaves a fresh, un-calibrated
+/// owner; old station authorities never reopen.
+async fn reset(
+    owner: &Mutex<Owner>,
+    selected: Option<u16>,
+    expected: Option<u32>,
+) -> Result<calibration::ar9287::Report, BringUpError> {
+    let _control = CONTROL.lock().await;
+    {
+        let mut o = owner.lock().await;
+        if o.removed || o.pinned || o.suspended {
+            return Err(BringUpError::DeviceGone);
+        }
+        if expected.is_some_and(|generation| generation != o.generation) {
+            return Err(BringUpError::BadState);
+        }
+        let target = selected.unwrap_or(o.primary);
+        if selected.is_some() {
+            let domain =
+                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+            calibration::Permission::from_domain_at(&domain, target)?;
+        }
+        // An absent, unsigned or foreign record for the target never
+        // retires the current generation.
+        let grant = record(&o, target)?;
+        if !retire(&mut o).await {
+            return Err(BringUpError::BadState);
+        }
+        let command = identity::invoke(&o.cap, || narf_bus::pci::read_command(&o.cap, &o.device))
+            .map_err(|_| BringUpError::DeviceGone)?
+            .map_err(|_| BringUpError::DeviceGone)?;
+        if command == u16::MAX || command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+            o.pinned = true;
+            return Err(BringUpError::BadState);
+        }
+        // From here the old calibration/packet state is gone regardless of
+        // outcome.
+        o.radio = calibration::ar9287::Calibration::default();
+        o.attempted = true;
+        let mut io = identity::Registers::new(o.mmio, o.cap);
+        let (revision, identity, image) = identity::identify_chip(&mut io, Chip::Ar9287)?;
+        if revision != o.revision || identity != o.identity || image != o.image {
+            return Err(BringUpError::BadIdentity);
+        }
+        let prepared = phy::ar9287::prepare(&mut io, &revision, &identity, &image, target)?;
+        if prepared != prepared_at(&o, target)? {
+            return Err(BringUpError::BadState);
+        }
+        o.prepared = prepared;
+        o.primary = target;
+        o.grant = grant;
+        o.generation = o.generation.checked_add(1).ok_or(BringUpError::BadState)?;
+        o.attempted = false;
+    }
+    initialize(owner).await
 }
 
 /// `link.c::ath_ani_calibrate` long-calibration cadence for the live
@@ -326,6 +471,7 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         return;
     };
     narf_scheduler::spawn(async move {
+        let _control = CONTROL.lock().await;
         let mut o = owner.lock().await;
         if o.device.addr != device.addr {
             return;

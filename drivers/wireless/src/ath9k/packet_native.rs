@@ -243,6 +243,10 @@ impl Native {
     /// Caller retains the sole AR9287 function and exact mapped BAR after
     /// `phy::ar9287::prepare` and `calibration::ar9287` ran under `grant`'s
     /// ceiling for `report`'s primary; no packet DMA was published.
+    /// `channel_mask` (bit `n - 1` = channel `n`) names the channels whose
+    /// signed per-channel `N87A` record and factory open-loop plan the owner
+    /// verified; a cold retune re-loads the target record before retiring.
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn new_ar9287(
         device: BusDevice,
         cap: Cap<BusDeviceCap, Write>,
@@ -251,6 +255,7 @@ impl Native {
         grant: alloc::sync::Arc<super::admission::Grant>,
         image: &[u8],
         profile: super::mac::Profile,
+        channel_mask: u16,
     ) -> Result<Self, Error> {
         let request = grant.request();
         if device.id.vendor != 0x168c
@@ -263,12 +268,12 @@ impl Native {
             || image[18..20] != [profile.rx_chainmask, profile.tx_chainmask]
             || report.rx_chainmask != profile.rx_chainmask
             || profile.txbuf != 0x700
+            || channel_mask & !0x1fff != 0
+            || channel_mask & (1 << ((report.frequency_mhz - 2412) / 5)) == 0
         {
             return Err(Error::Packet);
         }
         let rf_silent = rf_silent(image)?;
-        // The signed record binds exactly this primary: no other channel.
-        let channel_mask = 1 << ((report.frequency_mhz - 2412) / 5);
         // The exact open-loop rate registers calibration programmed under
         // the signed ceiling are retained for every physical readback.
         let powers =
