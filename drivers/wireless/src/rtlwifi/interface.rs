@@ -1339,9 +1339,14 @@ impl Environment for NativeEnvironment {
 
     fn allow_channel(&self, factory: &Factory, channel: u8) -> Result<(), Error> {
         if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
-            // Retuning rebuilds through the 88EE power-up flow; the 8821AE
-            // owner keeps the channel it was provisioned on.
-            return Err(Error::Profile);
+            // Retuning rebuilds through the 8821AE card-disable/enable flow
+            // (`rebuild_native`); admission is the `NAPC` 20 MHz permission
+            // the fresh owner's `prepare_rtl8821ae` re-derives.
+            return super::rtl8821ae::envelope::Calibration::load_registered(factory)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
         }
         let calibration = super::channel_power::Calibration::load_registered(factory)
             .map_err(|_| Error::Profile)?;

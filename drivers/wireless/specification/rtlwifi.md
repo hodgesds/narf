@@ -1767,10 +1767,34 @@ chain below is composed.
   - ERP: an AP announcing Use_Protection is admitted on 8821AE (88EE
     still needs the NERT grant); the beacon-tracked ERP flag drives the
     per-frame protection mode.
-  - Not composed for 8821AE: ASPM (kept disabled), channel retune (other
-    than the HT40 width change above) and the
-    fresh-generation recovery rebuild (both refused; the owner keeps its
-    provisioned channel and a failed owner stays failed), WMM EDCA from the
+  - Fresh-generation recovery rebuild (`rebuild_native.rs`,
+    `power_runtime::{disable,enable}_rtl8821ae`). After the shared
+    old-DMA retirement proof, `power_down` runs Linux
+    `_rtl8821ae_poweroff_adapter` in source order:
+    `RTL8821A_NIC_LPS_ENTER_FLOW`; `rtl8821ae_firmware_selfreset`
+    (RSV_CTRL+1 BIT0 / SYS_FUNC_EN+1 BIT2 low, 50 us, both high) only when
+    MCUFWDL BIT7 is set and the owner's firmware stage is Ready;
+    SYS_FUNC_EN+1 BIT2 low; MCUFWDL = 0; `RTL8821A_NIC_DISABLE_FLOW`;
+    RSV_CTRL+1 BIT0 low/high; RSV_CTRL = 0x0e. Linux's preceding
+    `_rtl8821ae_set_media_status(UNSPECIFIED)` is not issued (88EE
+    precedent): the card-disable/enable cycle resets MSR and the fresh
+    owner's MAC init programs it before any link. ASPM is not touched
+    afterwards (8821AE keeps it disabled). `rebuild` then runs the
+    `_rtl8821ae_init_mac` enable prefix (RSV_CTRL = 0, APS_FSMCO+1 BIT7
+    low, `RTL8821A_NIC_ENABLE_FLOW` with `PWR_CUT_A_MSK`, as at probe),
+    re-verifies the EFUSE factory identity, builds a fresh
+    `Owner(RTL_DEV_8821AE)` and runs `initialize_registered_on_channel`
+    (`prepare_rtl8821ae`: firmware, LLT, MAC/BB/RF, IQK, `NAPC` channel
+    permission). The same `power_down` now serves system suspend / IPS for
+    this profile (it previously ran the 88EE table). Channel retune
+    (`allow_channel`) is admitted by the `NAPC` 20 MHz permission and
+    rebuilds through this flow on 2.4 GHz channels 1-11. After a
+    disconnect the width is not narrowed eagerly: the running-owner width
+    retune is only legal in Joining/Configuring, and the next join (or any
+    rebuild) re-programs 20 MHz first. Test
+    `smoke_rtl8821ae_recovery_poweroff_and_enable_order` (written,
+    unexecuted).
+  - Not composed for 8821AE: ASPM (kept disabled), WMM EDCA from the
     AP (Linux 8821AE ignores it too), VHT, 5 GHz, BT coexistence.
   - HT20 station (`rtl8821ae/ht.rs`). HT is offered only when the AP
     has WMM and the current `NAPC` permission admits every rate of the

@@ -1907,3 +1907,102 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore
 );
+
+// ── recovery card disable / enable ───────────────────────────────────────
+
+/// Async register model for the native recovery power flows: 0x05[1:0]
+/// requests complete immediately; every byte write is logged in order.
+struct RebuildPwr(IrqSafeSpinLock<PwrState>);
+#[async_trait::async_trait]
+impl Io for RebuildPwr {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        Ok(self.0.lock().0[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        Ok(u32::from_le_bytes([
+            g.0[r],
+            g.0[r + 1],
+            g.0[r + 2],
+            g.0[r + 3],
+        ]))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.0[usize::from(reg)] = if reg == 5 { value & !3 } else { value };
+        g.1.push((reg, value));
+        Ok(())
+    }
+    fn write32(&self, _reg: u16, _value: u32) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+
+/// `_rtl8821ae_poweroff_adapter` order (LPS enter, firmware self-reset only
+/// with MCUFWDL BIT7 + ready firmware, MCU reset, MCUFWDL = 0, NIC disable,
+/// RSV_CTRL+1 BIT0 pulse, RSV_CTRL = 0x0e) and the `_rtl8821ae_init_mac`
+/// enable prefix with `PWR_CUT_A_MSK` on the recovery owner.
+fn smoke_rtl8821ae_recovery_poweroff_and_enable_order() -> TestResult {
+    use crate::rtlwifi::power_runtime::{disable_rtl8821ae, enable_rtl8821ae};
+    let model = |ready_bit: bool| {
+        let mut regs = vec![0u8; 0x800];
+        regs[0x80] = if ready_bit { 0xc6 } else { 0x46 };
+        regs[0x1d] = 1;
+        regs[3] = 0xfc;
+        RebuildPwr(IrqSafeSpinLock::new((regs, Vec::new())))
+    };
+    let io = model(true);
+    if narf_scheduler::block_on(disable_rtl8821ae(&io, true)).is_err() {
+        return TestResult::Fail("8821AE poweroff failed on an idle model");
+    }
+    let g = io.0.lock();
+    let w = &g.1;
+    let at = |reg: u16, value: u8| w.iter().position(|&x| x == (reg, value));
+    let (Some(stop), Some(fw0), Some(mcu0), Some(fwdl), Some(last)) = (
+        at(0x301, 0xff),
+        at(0x1d, 0),
+        w.iter().rposition(|&x| x == (3, 0xf8)),
+        at(0x80, 0),
+        w.last().copied(),
+    ) else {
+        return TestResult::Fail("8821AE poweroff write missing");
+    };
+    let selfreset = w.iter().filter(|&&x| x == (3, 0xfc)).count();
+    if stop != 0
+        || !(fw0 < mcu0 && mcu0 < fwdl)
+        || selfreset != 1
+        || last != (0x1c, 0x0e)
+        || w[w.len() - 2] != (0x1d, 1)
+        || w[w.len() - 3] != (0x1d, 0)
+        || g.0[5] & 4 == 0
+        || g.0[0x1f] != 0
+    {
+        return TestResult::Fail("8821AE poweroff order / final state");
+    }
+    drop(g);
+    let cold = model(false);
+    if narf_scheduler::block_on(disable_rtl8821ae(&cold, true)).is_err()
+        || cold.0.lock().1.contains(&(3, 0xfc))
+    {
+        return TestResult::Fail("self-reset issued without MCUFWDL BIT7");
+    }
+    let on = model(false);
+    on.0.lock().0[6] = 2;
+    if narf_scheduler::block_on(enable_rtl8821ae(&on)).is_err() {
+        return TestResult::Fail("8821AE recovery enable failed on a ready model");
+    }
+    let g = on.0.lock();
+    if g.1.first() != Some(&(0x1c, 0)) || g.1.iter().any(|w| w.0 == 0x7a) || g.0[0x2e] != 0x82 {
+        return TestResult::Fail("8821AE recovery enable prefix / PWR_CUT_A_MSK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_recovery_poweroff_and_enable_order
+);

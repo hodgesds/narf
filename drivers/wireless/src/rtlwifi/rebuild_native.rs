@@ -21,10 +21,20 @@ impl
             .map_err(prepare::Error::Access)?;
         io.disable_aspm().map_err(prepare::Error::Access)?;
         self.power_state.store(2, Ordering::Release);
-        super::super::power_runtime::disable(&io, firmware.status().stage == Stage::Ready)
-            .await
-            .map_err(prepare::Error::Access)?;
+        let ready = firmware.status().stage == Stage::Ready;
+        let rtl8821ae = firmware.device_id() == super::super::regs::RTL_DEV_8821AE;
+        let disabled = if rtl8821ae {
+            super::super::power_runtime::disable_rtl8821ae(&io, ready).await
+        } else {
+            super::super::power_runtime::disable(&io, ready).await
+        };
+        disabled.map_err(prepare::Error::Access)?;
         self.power_state.store(1, Ordering::Release);
+        if rtl8821ae {
+            // ASPM is not composed for 8821AE (`prepare_bus_power`): the
+            // probe's ASPM-disabled link state is kept.
+            return Ok(());
+        }
         // Card-disable proof is complete. Optional idle-link optimization
         // cannot revoke that receipt or grant any packet/DMA ownership.
         let _ = firmware
@@ -39,10 +49,16 @@ impl
         factory: Arc<Factory>,
         channel: u8,
     ) -> Result<(), Error> {
-        use super::super::{firmware_transport::Owner, prepare, regs::RTL_DEV_8188EE};
-        // The fresh-generation rebuild is the 88EE card-disable/enable flow;
-        // the 8821AE owner has no recovery rebuild yet and stays failed.
-        if self.firmware().device_id() != RTL_DEV_8188EE {
+        use super::super::{
+            firmware_transport::Owner,
+            prepare,
+            regs::{RTL_DEV_8188EE, RTL_DEV_8821AE},
+        };
+        // The fresh-generation rebuild is the card-disable/enable flow:
+        // 88EE `_rtl88ee_poweroff_adapter` + NIC enable, 8821AE
+        // `_rtl8821ae_poweroff_adapter` + `_rtl8821ae_init_mac`'s enable.
+        let device = self.firmware().device_id();
+        if !matches!(device, RTL_DEV_8188EE | RTL_DEV_8821AE) {
             return Err(Error::State);
         }
         self.power_down().await?;
@@ -53,13 +69,16 @@ impl
             .map_err(prepare::Error::Access)?;
         io.disable_aspm().map_err(prepare::Error::Access)?;
         self.power_state.store(2, Ordering::Release);
-        super::super::power_runtime::enable(&io)
-            .await
-            .map_err(prepare::Error::Access)?;
+        let enabled = if device == RTL_DEV_8821AE {
+            super::super::power_runtime::enable_rtl8821ae(&io).await
+        } else {
+            super::super::power_runtime::enable(&io).await
+        };
+        enabled.map_err(prepare::Error::Access)?;
         self.power_state.store(0, Ordering::Release);
         io.verify_factory(&factory)
             .map_err(prepare::Error::Access)?;
-        let firmware = Arc::new(Owner::new(io, RTL_DEV_8188EE));
+        let firmware = Arc::new(Owner::new(io, device));
         *self.firmware.lock() = firmware.clone();
         super::super::prepare_native::initialize_registered_on_channel(
             firmware.clone(),
