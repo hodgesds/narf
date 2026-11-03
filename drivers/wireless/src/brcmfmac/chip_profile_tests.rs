@@ -456,3 +456,128 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/chips",
     smoke_brcmf_chip_profile_random_seed_footer_below_nvram
 );
+
+/// One `BRCMF_OTP_SYS_VENDOR` record: header 0x8, chip params, board params.
+fn sys_vendor(board: &str) -> Vec<u8> {
+    let mut data = alloc::vec![8, 0, 0, 0];
+    data.extend_from_slice(b"chip\0");
+    data.extend_from_slice(board.as_bytes());
+    data.push(0);
+    let mut record = alloc::vec![0x15, data.len() as u8];
+    record.extend_from_slice(&data);
+    record
+}
+
+/// `brcmf_pcie_parse_otp` / `_sys_vendor` and the Apple `board_types`,
+/// using the module/vendor/version/SKU of Linux's own comment example
+/// ("apple,shikoku-RASP-m-6.11-X3"); no board is claimed by it.
+fn smoke_brcmf_chip_profile_otp_parse_and_board_types() -> TestResult {
+    let mut otp = alloc::vec![0x80, 2, 0xaa, 0xbb]; // BRCM_CIS, skipped
+    otp.extend(sys_vendor("  M=RASP V=m m=6.11 x=ignored"));
+    otp.extend_from_slice(&[0, 0, 0, 0]);
+    let Some(params) = parse_otp(&otp) else {
+        return TestResult::Fail("valid SYS_VENDOR OTP rejected");
+    };
+    if params.module != "RASP" || params.vendor != "m" || params.version != "6.11" {
+        return TestResult::Fail("OTP module/vendor/version differ");
+    }
+    let types = apple_board_types("apple,shikoku", &params, "X3");
+    if types[0] != "apple,shikoku-RASP-m-6.11-X3"
+        || types[1] != "apple,shikoku-RASP-m-6.11"
+        || types[2] != "apple,shikoku-RASP-m"
+        || types[3] != "apple,shikoku-RASP"
+        || types[4] != "apple,shikoku-X3"
+        || types[5] != "apple,shikoku"
+    {
+        return TestResult::Fail("Apple board_types differ from brcmf_pcie_prepare_fw_request");
+    }
+    // Missing version, bad tag syntax, 16-byte value, no SYS_VENDOR, a bad
+    // header, and an invalid last SYS_VENDOR after a valid one.
+    let mut bad_header = sys_vendor("M=RASP V=m m=6.11");
+    bad_header[2] = 9;
+    let mut last_bad = sys_vendor("M=RASP V=m m=6.11");
+    last_bad.extend(sys_vendor("M"));
+    for bad in [
+        sys_vendor("M=RASP V=m"),
+        sys_vendor("M=RASP Vm m=6.11"),
+        sys_vendor("M=0123456789abcdef V=m m=6.11"),
+        alloc::vec![0x80, 2, 0, 0],
+        bad_header,
+        last_bad,
+    ] {
+        if parse_otp(&bad).is_some() {
+            return TestResult::Fail("invalid OTP accepted");
+        }
+    }
+    // Parameters accumulate across SYS_VENDOR records as devinfo->otp does.
+    let mut split = sys_vendor("M=RASP");
+    split.extend(sys_vendor("V=m m=6.11"));
+    if parse_otp(&split).map(|p| p.module) != Some("RASP".into()) {
+        return TestResult::Fail("OTP parameters did not accumulate");
+    }
+    if otp_source(BRCM_CC_4378)
+        != Some(OtpSource {
+            core: CORE_GCI,
+            offset: 0x1120,
+            words: 0x170,
+        })
+        || otp_source(BRCM_CC_4387).map(|s| s.offset) != Some(0x113c)
+        || otp_source(BRCM_CC_4364).map(|s| (s.core, s.words))
+            != Some((chip::CORE_CHIPCOMMON, 0x1a0))
+        || otp_source(BRCM_CC_4356).is_some()
+    {
+        return TestResult::Fail("OTP core/offset table differs from brcmf_pcie_read_otp");
+    }
+    if asset_board(
+        "brcmfmac4378b1-pcie",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku-RASP.txt",
+        "txt",
+    ) != Some("apple,shikoku-RASP")
+        || asset_board("brcmfmac4378b1-pcie", "brcm/brcmfmac4378b1-pcie.txt", "txt").is_some()
+    {
+        return TestResult::Fail("asset board type extraction differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/chips",
+    smoke_brcmf_chip_profile_otp_parse_and_board_types
+);
+
+/// `brcmf_pcie_read_otp` on a ChipCommon chip (BCM4364): `OTPSEL` set
+/// around the 0x1a0-word read at CC + 0x8c0, `sromcontrol` restored; no
+/// `OTP_PRESENT` is Linux's "using default firmware" (no OTP, no read).
+fn smoke_brcmf_chip_profile_chipcommon_otp_read() -> TestResult {
+    let cc = chip::ENUM_BASE;
+    for present in [true, false] {
+        let mut bus = model(0x1004_4364, chip::CORE_ARM_CR4, None, 0x160000);
+        bus.registers
+            .insert(cc + CC_SROM_CONTROL, if present { 0x20 } else { 0 });
+        let mut otp = sys_vendor("M=RASP V=m m=6.11");
+        otp.resize(0x1a0 * 2, 0);
+        for (i, word) in otp.chunks_exact(4).enumerate() {
+            bus.registers.insert(
+                cc + 0x8c0 + i as u32 * 4,
+                u32::from_le_bytes(word.try_into().unwrap()),
+            );
+        }
+        let Ok(found) = chip::Chip::discover(&mut bus) else {
+            return TestResult::Fail("model chip did not enumerate");
+        };
+        let read = boot::read_otp(&mut bus, &found);
+        let selected = bus.writes.contains(&(cc + CC_SROM_CONTROL, 0x30));
+        match (present, read) {
+            (true, Ok(Some(params)))
+                if params.module == "RASP"
+                    && selected
+                    && bus.registers.get(&(cc + CC_SROM_CONTROL)) == Some(&0x20) => {}
+            (false, Ok(None)) if !selected => {}
+            _ => return TestResult::Fail("ChipCommon OTP read differs from Linux"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/chips",
+    smoke_brcmf_chip_profile_chipcommon_otp_read
+);

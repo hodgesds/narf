@@ -536,13 +536,46 @@ match (revision >= 32 invalid), `brcmf_pcie_devid_table` with its `drvdata`
 the `brcmf_pcie_read_otp` chip set. Covered chips: BCM43602 (retained), CR4
 BCM4350 (4350c2 below rev 8), 4356, 43567/43569/43570, 4358, 4359
 (rev-dependent base), 4371 at their Linux RAM bases, and CA7 BCM4365, 4366,
-43664, 43666, 43465, 43525 at 0x200000. BCM43752 (pass 2) is covered with
-no CPU table fact: the loader takes Linux's discovered-ARM dispatch (CR4
-first, then CA7). Left out: BCM4354 (Linux binds raw
+43664, 43666, 43465, 43525 at 0x200000. Pass 2 covers BCM43752 and the
+Linux OTP chips 4355, 4364, 4377, 4378 and 4387 with no CPU table fact:
+the loader takes Linux's discovered-ARM dispatch (CR4 first, then CA7).
+Left out: BCM4354 (Linux binds raw
 PCI id 0x4354 but has no PCIe firmware row, so Linux itself stops at
-"Unknown chip"), 4355/4364/4377/4378/4387 (Linux OTP Apple board selection),
-CYW-vendor 43596/54591 (CYW fwvid ops) and chips without a PCIe row. Linux
-reads no OTP for any covered chip, so none is read here.
+"Unknown chip"), CYW-vendor 43596/54591 (see below) and chips without a
+PCIe row.
+
+OTP board identity (`brcmf_pcie_read_otp`, WCC/BCA vendors only, after
+chip attach and before the firmware request): `chip_profile::otp_source`
+is Linux's complete switch (4355: ChipCommon + 0x8c0, 0xb2 words; 4364:
+ChipCommon + 0x8c0, 0x1a0; 4377/4378: GCI + 0x1120, 0x170; 4387: GCI +
+0x113c, 0x170). ChipCommon chips read `sromcontrol` (0x190): without
+`OTP_PRESENT` (0x20) Linux uses default firmware (no OTP); otherwise
+`OTPSEL` (0x10) is set around the 16-bit word reads
+(`Backplane::read16`, `brcmf_pcie_read_reg16`) and `sromcontrol` restored.
+`parse_otp` is `brcmf_pcie_parse_otp` + `_sys_vendor`: records `type,
+length, data` until type 0 or overrun; the result is the last
+`SYS_VENDOR` (0x15) record's; header 0x8, chip-params string, then
+board params `M=` module, `V=` vendor, `m=` version (<= 15 bytes each,
+accumulated across records, all non-empty); a parse error fails the
+claim (`Error::Board`) as it fails Linux's probe. Linux names boards with
+these only on Apple platforms (`settings->board_type` from DT
+`brcm,board-type` or ACPI `apple,<module-instance>`, `antenna_sku` from DT
+or ACPI `RWCV`): `board_types` = `<bt>-<M>-<V>-<m>-<sku>`, `<bt>-<M>-<V>-<m>`,
+`<bt>-<M>-<V>`, `<bt>-<M>`, `<bt>-<sku>`, `<bt>`
+(`brcmf_pcie_prepare_fw_request`, `chip_profile::apple_board_types`), each
+tried as `brcm/<base>.<board>.<ext>` before the plain name. NARF has no
+Apple DT/ACPI source, so a family-3 record for an OTP chip carries those
+platform facts: bytes 32..96 are Linux's `board_type` (`,` allowed there
+and in its keys), bytes 96..112 its antenna SKU (required; zero for every
+other chip). Parse requires the NVRAM key `brcm/<base>.<bt>-....txt` and an
+executable key that is plain, `<bt>` or `<bt>-...`; claim then reads the
+OTP and admits only if the NVRAM key is one of `board_types[0..=3]` (each
+binds the OTP module) and the executable one of `[0..=5]` or plain.
+Linux's non-Apple / OTP-absent fallbacks (plain board type, default
+firmware) bind no OTP identity and stay unadmitted, as do trusted
+registrations of OTP chips (refused in `register_board_profile` and
+`BoardProfile::admits`). Not ported: the DT `brcm,cal-blob` calibration
+download (Apple ARM DT platforms) and the optional `.txcap_blob`.
 
 Random seed (`brcmf_pcie_download_fw_nvram` with `devinfo->fwseed`): a PCI
 row with `BRCMF_DRVDATA_WCC_SEED` (0x43dc, 0x4464, 0x4488, 0x4425, 0x4433,

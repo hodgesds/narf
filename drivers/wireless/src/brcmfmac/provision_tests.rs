@@ -712,3 +712,100 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/provision",
     smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables
 );
+
+/// Family 3 for a Linux OTP chip (BCM4378, seeded id 0x4425): the record
+/// carries Linux's `board_type` and antenna SKU; at claim the OTP read must
+/// make the NVRAM key one of `board_types[0..=3]` and the executable one of
+/// `[0..=5]` or plain. Strings follow Linux's own comment example.
+fn smoke_brcm_signed_manifest_fullmac_otp_board_binding() -> TestResult {
+    let record = |board: &str, sku: &str, fw: &str, nv: &str| {
+        let mut bytes = fullmac_record(0x4378, 1 << 3, 0x4425, fw, nv);
+        let raw = &mut bytes[HEADER..];
+        raw[32..112].fill(0);
+        raw[32..32 + board.len()].copy_from_slice(board.as_bytes());
+        raw[96..96 + sku.len()].copy_from_slice(sku.as_bytes());
+        bytes
+    };
+    let otp = super::super::chip_profile::OtpParams {
+        module: "RASP".into(),
+        vendor: "m".into(),
+        version: "6.11".into(),
+    };
+    let ok = record(
+        "apple,shikoku",
+        "X3",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku.bin",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku-RASP-m-6.11-X3.txt",
+    );
+    let records = match parse(&ok) {
+        Ok(records) if records.len() == 1 => records,
+        _ => return TestResult::Fail("OTP-bound BCM4378 record rejected"),
+    };
+    let other = super::super::chip_profile::OtpParams {
+        module: "RASP".into(),
+        vendor: "u".into(),
+        version: "6.11".into(),
+    };
+    if !records[0].admits_otp(0x4378, Some(&otp))
+        || records[0].admits_otp(0x4378, Some(&other))
+        || records[0].admits_otp(0x4378, None)
+    {
+        return TestResult::Fail("OTP identity not bound by the signed record");
+    }
+    // NVRAM naming only the board-SKU form binds no OTP: parses, never claims.
+    match parse(&record(
+        "apple,shikoku",
+        "X3",
+        "brcm/brcmfmac4378b1-pcie.bin",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku-X3.txt",
+    )) {
+        Ok(records) if !records[0].admits_otp(0x4378, Some(&otp)) => {}
+        _ => return TestResult::Fail("board-SKU NVRAM admitted without OTP binding"),
+    }
+    for bad in [
+        // No antenna SKU, plain NVRAM, an NVRAM for another board type.
+        record(
+            "apple,shikoku",
+            "",
+            "brcm/brcmfmac4378b1-pcie.bin",
+            "brcm/brcmfmac4378b1-pcie.apple,shikoku-RASP.txt",
+        ),
+        record(
+            "apple,shikoku",
+            "X3",
+            "brcm/brcmfmac4378b1-pcie.bin",
+            "brcm/brcmfmac4378b1-pcie.txt",
+        ),
+        record(
+            "apple,shikoku",
+            "X3",
+            "brcm/brcmfmac4378b1-pcie.bin",
+            "brcm/brcmfmac4378b1-pcie.apple,other-RASP.txt",
+        ),
+    ] {
+        if parse(&bad).is_ok() {
+            return TestResult::Fail("OTP chip record without Linux board binding accepted");
+        }
+    }
+    // A non-OTP chip still needs bytes 96..112 zero and no OTP at claim.
+    let mut plain = fullmac_record(
+        0x4356,
+        4,
+        0x43ec,
+        "brcm/brcmfmac4356-pcie.bin",
+        "brcm/brcmfmac4356-pcie.txt",
+    );
+    match parse(&plain) {
+        Ok(records) if records[0].admits_otp(0x4356, None) => {}
+        _ => return TestResult::Fail("non-OTP chip record changed"),
+    }
+    plain[HEADER + 96] = b'X';
+    if parse(&plain).is_ok() {
+        return TestResult::Fail("antenna SKU accepted for a non-OTP chip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/provision",
+    smoke_brcm_signed_manifest_fullmac_otp_board_binding
+);

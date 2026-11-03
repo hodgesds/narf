@@ -19,9 +19,11 @@ static RUNTIME: Mutex<Option<runtime::Runtime<PcieBackplane>>> = Mutex::new(None
 static EVENTS: IrqSafeSpinLock<VecDeque<Vec<u8>>> = IrqSafeSpinLock::new(VecDeque::new());
 /// Register exact platform calibration policy before PCI matching runs.
 /// This kernel-only entry does not grant firmware access or override chip
-/// discovery. Multi-device NVRAM and newer Apple OTP selection remain gated.
+/// discovery. Multi-device NVRAM stays gated; Apple OTP chips need a signed selection.
 pub fn register_board_profile(profile: BoardProfile) -> bool {
     if super::chip_profile::covered(profile.chip).is_none()
+        // OTP chips need an OTP-bound signed selection, not a registration.
+        || super::chip_profile::linux_reads_otp(profile.chip)
         || profile.revision_mask == 0
         || profile.pci.vendor != 0x14e4
         || !super::pcie::ALL_DEV_IDS.contains(&profile.pci.device)

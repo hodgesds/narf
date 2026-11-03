@@ -238,6 +238,22 @@ impl Backplane for PcieBackplane {
         })
         .map_err(|_| chip::Error::Access)?
     }
+
+    /// `brcmf_pcie_read_reg16` after `brcmf_pcie_buscore_prep_addr`.
+    fn read16(&mut self, address: u32) -> Result<u16, chip::Error> {
+        if address & 1 != 0 {
+            return Err(chip::Error::Address);
+        }
+        self.qualified()?;
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            let offset = self.select(address & !3)? + u64::from(address & 2);
+            // SAFETY: the dword window was validated by select; the half
+            // stays inside it. Exclusive window/access runs inside invoke.
+            Ok(unsafe { self.bar0.read16(offset) })
+        })
+        .map_err(|_| chip::Error::Access)?
+    }
 }
 
 impl core::fmt::Debug for BrcmfmacDevice {

@@ -235,10 +235,153 @@ pub const fn random_seed_footer() -> [u8; 8] {
 /// `pcie.c::brcmf_pcie_read_otp` reads OTP (Apple board/module selection)
 /// for these chips only; every other chip returns "OTP not supported".
 pub const fn linux_reads_otp(chip: u16) -> bool {
-    matches!(
-        chip,
-        BRCM_CC_4355 | BRCM_CC_4364 | BRCM_CC_4377 | BRCM_CC_4378 | BRCM_CC_4387
-    )
+    otp_source(chip).is_some()
+}
+
+/// `BCMA_CORE_GCI`.
+pub const CORE_GCI: u16 = 0x840;
+/// ChipCommon `sromcontrol` (`chipcregs` 0x190) and its OTP bits
+/// (`BCMA_CC_SROM_CONTROL_OTPSEL` / `_OTP_PRESENT`).
+pub const CC_SROM_CONTROL: u32 = 0x190;
+pub const CC_SROM_CONTROL_OTPSEL: u32 = 0x10;
+pub const CC_SROM_CONTROL_OTP_PRESENT: u32 = 0x20;
+
+/// Where `brcmf_pcie_read_otp` reads a chip's OTP shadow: the core, the
+/// byte offset from that core's base and the number of 16-bit words.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OtpSource {
+    pub core: u16,
+    pub offset: u32,
+    pub words: u32,
+}
+/// `brcmf_pcie_read_otp`'s per-chip switch, complete.
+pub const fn otp_source(chip: u16) -> Option<OtpSource> {
+    let (core, offset, words) = match chip {
+        BRCM_CC_4355 => (super::chip::CORE_CHIPCOMMON, 0x8c0, 0xb2),
+        BRCM_CC_4364 => (super::chip::CORE_CHIPCOMMON, 0x8c0, 0x1a0),
+        BRCM_CC_4377 | BRCM_CC_4378 => (CORE_GCI, 0x1120, 0x170),
+        BRCM_CC_4387 => (CORE_GCI, 0x113c, 0x170),
+        _ => return None,
+    };
+    Some(OtpSource {
+        core,
+        offset,
+        words,
+    })
+}
+
+/// `struct brcmf_otp_params` (`BRCMF_OTP_MAX_PARAM_LEN` 16 with the NUL).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OtpParams {
+    pub module: alloc::string::String,
+    pub vendor: alloc::string::String,
+    pub version: alloc::string::String,
+}
+const OTP_MAX_PARAM_LEN: usize = 16;
+const OTP_SYS_VENDOR: u8 = 0x15;
+const OTP_VENDOR_HDR: u32 = 0x0000_0008;
+
+/// `pcie.c::brcmf_pcie_parse_otp`: walk `type, length, data` records until
+/// a zero type or a record past the end; the result is that of the last
+/// `BRCMF_OTP_SYS_VENDOR` record (none at all is `-EINVAL`). Parameters
+/// accumulate across records as Linux's `devinfo->otp` does. `None` is the
+/// Linux error that fails `brcmf_pcie_probe`.
+pub fn parse_otp(otp: &[u8]) -> Option<OtpParams> {
+    let mut params = OtpParams::default();
+    let mut ok = false;
+    let mut p = 0usize;
+    while p + 1 < otp.len() {
+        let (kind, length) = (otp[p], usize::from(otp[p + 1]));
+        if kind == 0 || p + 2 + length > otp.len() {
+            break;
+        }
+        if kind == OTP_SYS_VENDOR {
+            ok = parse_otp_sys_vendor(&mut params, &otp[p + 2..p + 2 + length]);
+        }
+        p += 2 + length;
+    }
+    ok.then_some(params)
+}
+
+/// `pcie.c::brcmf_pcie_parse_otp_sys_vendor`: a 4-byte header 0x8, the
+/// chip-params string, then the board-params string of space-separated
+/// `tag=value` pairs; `M` module, `V` vendor and `m` version (each at most
+/// 15 bytes) are kept and must all be non-empty afterwards.
+fn parse_otp_sys_vendor(params: &mut OtpParams, data: &[u8]) -> bool {
+    let size = data.len();
+    if size < 6 || u32::from_le_bytes(data[..4].try_into().unwrap()) != OTP_VENDOR_HDR {
+        return false;
+    }
+    let strnlen = |from: usize| {
+        data[from..]
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(size - from)
+    };
+    let mut idx = 4 + strnlen(4) + 1;
+    if idx >= size {
+        return false;
+    }
+    let board_start = idx;
+    idx += strnlen(idx);
+    if idx >= size {
+        return false;
+    }
+    let board = &data[board_start..idx];
+    // skip_spaces() skips isspace(); strchrnul() stops at ' ' only.
+    let space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let skip = |mut at: usize| {
+        while at < board.len() && space(board[at]) {
+            at += 1;
+        }
+        at
+    };
+    let mut at = skip(0);
+    while at < board.len() {
+        let tag = board[at];
+        if board.get(at + 1) != Some(&b'=') {
+            return false;
+        }
+        let value = at + 2;
+        let end = board[value..]
+            .iter()
+            .position(|b| *b == b' ')
+            .map_or(board.len(), |n| value + n);
+        if end - value > OTP_MAX_PARAM_LEN - 1 {
+            return false;
+        }
+        let text = || alloc::string::String::from_utf8_lossy(&board[value..end]).into_owned();
+        match tag {
+            b'M' => params.module = text(),
+            b'V' => params.vendor = text(),
+            b'm' => params.version = text(),
+            _ => {}
+        }
+        at = skip(end);
+    }
+    !params.module.is_empty() && !params.vendor.is_empty() && !params.version.is_empty()
+}
+
+/// `pcie.c::brcmf_pcie_prepare_fw_request`'s Apple selection (board type,
+/// antenna SKU and valid OTP): `board_types[0..=5]` in Linux order.
+pub fn apple_board_types(board: &str, otp: &OtpParams, sku: &str) -> [alloc::string::String; 6] {
+    let (m, v, r) = (&otp.module, &otp.vendor, &otp.version);
+    [
+        alloc::format!("{board}-{m}-{v}-{r}-{sku}"),
+        alloc::format!("{board}-{m}-{v}-{r}"),
+        alloc::format!("{board}-{m}-{v}"),
+        alloc::format!("{board}-{m}"),
+        alloc::format!("{board}-{sku}"),
+        alloc::string::String::from(board),
+    ]
+}
+/// The board type inside a Linux registry key `brcm/<base>.<board>.<ext>`.
+pub fn asset_board<'a>(base: &str, key: &'a str, extension: &str) -> Option<&'a str> {
+    if !linux_asset_name(base, key, extension) {
+        return None;
+    }
+    let rest = &key["brcm/".len() + base.len()..key.len() - extension.len()];
+    (rest.len() > 2).then(|| &rest[1..rest.len() - 1])
 }
 
 /// Firmware CPU, `chip.c::brcmf_chip_set_passive`/`_set_active` dispatch.
@@ -263,9 +406,10 @@ pub struct Profile {
     pub firmware: &'static FwMapping,
 }
 /// Chips covered here. 43602 is the retained original profile. Left out:
-/// 4354 (no Linux PCIe firmware row), 4355/4364/4377/4378/4387 (Linux OTP
-/// board selection), CYW-vendor 43596/54591, and chips with no PCIe row.
-/// BCM43752 has no CPU table fact: Linux discovers its ARM.
+/// 4354 (no Linux PCIe firmware row), CYW-vendor 43596/54591, and chips
+/// with no PCIe row. BCM43752 and the OTP chips 4355/4364/4377/4378/4387
+/// have no CPU table fact: Linux discovers their ARM. The OTP chips need
+/// an OTP-bound signed selection (`provision`) before they are admitted.
 const COVERED: &[(u16, Option<Cpu>)] = &[
     (BRCM_CC_43602, Some(Cpu::Cr4)),
     (BRCM_CC_4350, Some(Cpu::Cr4)),
@@ -283,6 +427,11 @@ const COVERED: &[(u16, Option<Cpu>)] = &[
     (BRCM_CC_43465, Some(Cpu::Ca7)),
     (BRCM_CC_43525, Some(Cpu::Ca7)),
     (BRCM_CC_43752, None),
+    (BRCM_CC_4355, None),
+    (BRCM_CC_4364, None),
+    (BRCM_CC_4377, None),
+    (BRCM_CC_4378, None),
+    (BRCM_CC_4387, None),
 ];
 /// The CPU rule of a covered chip, independent of its revision.
 pub fn covered(chip: u16) -> Option<Option<Cpu>> {
@@ -290,9 +439,6 @@ pub fn covered(chip: u16) -> Option<Option<Cpu>> {
 }
 pub fn profile(chip: u16, chiprev: u8) -> Option<Profile> {
     let cpu = covered(chip)?;
-    if linux_reads_otp(chip) {
-        return None;
-    }
     Some(Profile {
         chip,
         cpu,

@@ -42,6 +42,9 @@ pub struct BoardProfile {
 impl BoardProfile {
     fn admits(self, chip: &Chip, pci: PciIdentity) -> bool {
         chip_profile::profile(self.chip, chip.revision).is_some()
+            // A registration binds no OTP-derived board identity; Linux's
+            // OTP chips need a signed OTP-bound selection instead.
+            && !chip_profile::linux_reads_otp(self.chip)
             // A trusted registration carries no PCI class; the Linux id row
             // must still bind with an implemented vendor path.
             && (self.chip == chip_profile::BRCM_CC_43602
@@ -138,7 +141,8 @@ impl<B: Bus> Cr4<B> {
             (pci.subsystem_vendor, pci.subsystem_device),
         )
         .is_some_and(|row| row.seed);
-        Self::claim_checked(bus, seed, |chip| profile.admits(chip, pci))
+        // Registrations refuse the OTP chips, so no OTP is read here.
+        Self::claim_checked(bus, seed, false, |chip, _| profile.admits(chip, pci))
     }
     pub(super) fn claim_selected(
         bus: B,
@@ -146,8 +150,11 @@ impl<B: Bus> Cr4<B> {
         selection: &super::provision::Selection,
     ) -> Result<Self, Refused<B>> {
         let expected = selection.host().id;
-        let seed = chip_profile::pci_match(&expected).is_some_and(|row| row.seed);
-        Self::claim_checked(bus, seed, |chip| {
+        let row = chip_profile::pci_match(&expected);
+        let seed = row.is_some_and(|row| row.seed);
+        // brcmf_pcie_probe reads OTP for the WCC and BCA vendors only.
+        let otp = row.is_some_and(chip_profile::implemented);
+        Self::claim_checked(bus, seed, otp, |chip, otp| {
             // Family 3 additionally needs the Linux PCI/vendor admission of
             // the actual discovered chip and revision.
             let family = match selection.family() {
@@ -163,14 +170,16 @@ impl<B: Bus> Cr4<B> {
                 && expected.subsystem_vendor == pci.subsystem_vendor
                 && expected.subsystem_id == pci.subsystem_device
                 && selection.admits_chip(chip.id, chip.revision)
+                && selection.admits_otp(chip.id, otp)
         })
     }
     fn claim_checked(
         mut bus: B,
         seed: bool,
-        admitted: impl FnOnce(&Chip) -> bool,
+        otp: bool,
+        admitted: impl FnOnce(&Chip, Option<&chip_profile::OtpParams>) -> bool,
     ) -> Result<Self, Refused<B>> {
-        match Self::discover(&mut bus, admitted) {
+        match Self::discover(&mut bus, otp, admitted) {
             Ok((chip, arm, cpu, ram)) => Ok(Self {
                 bus,
                 chip,
@@ -185,13 +194,21 @@ impl<B: Bus> Cr4<B> {
     }
     fn discover(
         bus: &mut B,
-        admitted: impl FnOnce(&Chip) -> bool,
+        otp: bool,
+        admitted: impl FnOnce(&Chip, Option<&chip_profile::OtpParams>) -> bool,
     ) -> Result<(Chip, Core, Cpu, Ram), Error> {
         if bus.dma_enabled()? {
             return Err(Error::State);
         }
         let chip = Chip::discover(bus).map_err(Error::Chip)?;
-        if !admitted(&chip) {
+        // brcmf_pcie_probe reads OTP after chip attach, before the firmware
+        // request that the OTP board identity names. Only profiled chips.
+        let otp = if otp && chip_profile::profile(chip.id, chip.revision).is_some() {
+            read_otp(bus, &chip)?
+        } else {
+            None
+        };
+        if !admitted(&chip, otp.as_ref()) {
             return Err(Error::Board);
         }
         let profile = chip_profile::profile(chip.id, chip.revision).ok_or(Error::Unsupported)?;
@@ -414,6 +431,58 @@ impl<B: Bus> Cr4<B> {
         Ok((shared, info))
     }
 }
+/// `pcie.c::brcmf_pcie_read_otp` for a chip in its switch (`None`
+/// otherwise): no OTP core is `-ENODEV` (`Unsupported`); a ChipCommon chip
+/// without `OTP_PRESENT` is Linux's "OTP unavailable, using default
+/// firmware" (`None`); else map the shadow with `OTPSEL`, read the 16-bit
+/// words, restore `sromcontrol` and parse (a parse error fails the probe).
+pub(super) fn read_otp(
+    bus: &mut impl Bus,
+    chip: &Chip,
+) -> Result<Option<chip_profile::OtpParams>, Error> {
+    let Some(source) = chip_profile::otp_source(chip.id) else {
+        return Ok(None);
+    };
+    let core = chip.core(source.core).ok_or(Error::Unsupported)?;
+    let control = core.base + chip_profile::CC_SROM_CONTROL;
+    let mut saved = None;
+    if source.core == chip::CORE_CHIPCOMMON {
+        let sromctl = bus.read32(control).map_err(Error::Chip)?;
+        if sromctl == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if sromctl & chip_profile::CC_SROM_CONTROL_OTP_PRESENT == 0 {
+            return Ok(None);
+        }
+        bus.write32(control, sromctl | chip_profile::CC_SROM_CONTROL_OTPSEL)
+            .map_err(Error::Chip)?;
+        saved = Some(sromctl);
+    }
+    let mut bytes = alloc::vec::Vec::new();
+    bytes
+        .try_reserve_exact(source.words as usize * 2)
+        .map_err(|_| Error::Extent)?;
+    let mut failure = None;
+    for index in 0..source.words {
+        match bus.read16(core.base + source.offset + 2 * index) {
+            Ok(word) => bytes.extend_from_slice(&word.to_le_bytes()),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    if let Some(sromctl) = saved {
+        bus.write32(control, sromctl).map_err(Error::Chip)?;
+    }
+    if let Some(error) = failure {
+        return Err(Error::Chip(error));
+    }
+    chip_profile::parse_otp(&bytes)
+        .map(Some)
+        .ok_or(Error::Board)
+}
+
 /// `chip.c::brcmf_chip_tcm_ramsize`: CR4 A+B TCM banks.
 fn cr4_ramsize(bus: &mut impl Bus, arm: Core) -> Result<u32, Error> {
     let capability = bus.read32(arm.base + 4).map_err(Error::Chip)?;
