@@ -29,7 +29,8 @@
 //! - `drm_edid.c::drm_do_probe_ddc_edid` over `intel_gmbus.c::gmbus_xfer`:
 //!   each EDID block is an offset write + read at slave 0x50, an
 //!   INDEX-cycle transfer on the shared GMBUS transport
-//!   ([`crate::intel_gpu_gmbus::GmbusBus`]); see [`read_edid_ddc`].
+//!   ([`crate::intel_gpu_gmbus::GmbusBus`]), with the E-DDC segment
+//!   pointer chained ahead of blocks 2 and 3; see [`read_edid_ddc`].
 //!
 //! [`probe_hdmi`] owns a legacy Type-C PHY in legacy mode before its DDC
 //! is used (rolled back on any failure), and the hotplug service
@@ -70,7 +71,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_gmbus::{GmbusBus, PinPair, DDC_SLAVE_EDID};
+use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_modeset_xelpg::{
     acknowledged_cdclk, mtl_cdclk_for_pixel_clock, program_cdclk_floor, XeLpgModeset,
@@ -294,52 +295,20 @@ pub const SCDC_TMDS_BIT_CLOCK_RATIO_BY_40: u8 = 1 << 1;
 /// `SCDC_SCRAMBLING_ENABLE`.
 pub const SCDC_SCRAMBLING_ENABLE: u8 = 1 << 0;
 
-/// `drm_scdc_readb`: an offset write then a one-byte read, which
-/// `gmbus_xfer` runs as one INDEX-cycle transfer.
-fn scdc_readb<M: MmioWindow + ?Sized>(bus: &GmbusBus<'_, M>, offset: u8) -> Result<u8, HdmiError> {
-    let mut value = [0u8; 1];
-    bus.read_indexed(SCDC_I2C_SLAVE_ADDRESS, offset, &mut value)
-        .map_err(|e| HdmiError::Scdc(e.into()))?;
-    Ok(value[0])
-}
-
-/// `drm_scdc_writeb`: one write message `[offset, value]`.
-fn scdc_writeb<M: MmioWindow + ?Sized>(
-    bus: &GmbusBus<'_, M>,
-    offset: u8,
-    value: u8,
-) -> Result<(), HdmiError> {
-    bus.write(SCDC_I2C_SLAVE_ADDRESS, &[offset, value])
-        .map_err(|e| HdmiError::Scdc(e.into()))
-}
-
 /// `intel_hdmi_handle_sink_scrambling` for a sink whose scrambling is
 /// supported: `drm_scdc_set_high_tmds_clock_ratio` (read-modify-write of
 /// TMDS_CONFIG bit 1, then at least 1 ms before the sink is relied on),
-/// then `drm_scdc_set_scrambling` (read-modify-write of bit 0).
+/// then `drm_scdc_set_scrambling` (read-modify-write of bit 0). The
+/// sequence is shared with Gen12
+/// ([`crate::intel_gpu_hdmi::handle_sink_scrambling`]).
 pub fn sink_scrambling<M: MmioWindow + ?Sized>(
     io: &M,
     pin: PinPair,
     high_tmds_clock_ratio: bool,
     scrambling: bool,
 ) -> Result<(), HdmiError> {
-    let bus = GmbusBus::new(io, pin);
-    let config = scdc_readb(&bus, SCDC_TMDS_CONFIG)?;
-    let config = if high_tmds_clock_ratio {
-        config | SCDC_TMDS_BIT_CLOCK_RATIO_BY_40
-    } else {
-        config & !SCDC_TMDS_BIT_CLOCK_RATIO_BY_40
-    };
-    scdc_writeb(&bus, SCDC_TMDS_CONFIG, config)?;
-    let _ =
-        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ns(1_000_000));
-    let config = scdc_readb(&bus, SCDC_TMDS_CONFIG)?;
-    let config = if scrambling {
-        config | SCDC_SCRAMBLING_ENABLE
-    } else {
-        config & !SCDC_SCRAMBLING_ENABLE
-    };
-    scdc_writeb(&bus, SCDC_TMDS_CONFIG, config)
+    crate::intel_gpu_hdmi::handle_sink_scrambling(io, pin, high_tmds_clock_ratio, scrambling)
+        .map_err(HdmiError::Scdc)
 }
 
 /// Resolve the HDMI TMDS PLL request for `port` at `clock_khz`
@@ -438,26 +407,15 @@ pub struct MtlHdmiProbe {
 }
 
 /// Read the sink's EDID over DDC the way `drm_do_probe_ddc_edid` does:
-/// each 128-byte block is an offset write followed by a read at slave 0x50,
-/// which `intel_gmbus.c::gmbus_xfer` runs as one INDEX-cycle transfer
-/// ([`GmbusBus::read_indexed`]). Only E-DDC segment 0 (base block plus
-/// the first extension) is read: a segment-pointer write must reach the
-/// read across a repeated START, which the one-transfer-per-call GMBUS
-/// transport cannot express, so later extensions are not fetched.
+/// each 128-byte block is an offset write followed by a read at slave
+/// 0x50, which `intel_gmbus.c::do_gmbus_xfer` runs as one INDEX-cycle
+/// transfer; blocks 2 and 3 chain the E-DDC segment pointer ahead of it
+/// with a repeated START ([`crate::intel_gpu_gmbus::read_edid_eddc`]).
 pub fn read_edid_ddc<M: MmioWindow + ?Sized>(
     io: &M,
     pin: PinPair,
 ) -> Result<([u8; crate::intel_gpu_hdmi::EDID_CAPACITY], usize), HdmiError> {
-    let bus = GmbusBus::new(io, pin);
-    let mut edid = [0u8; crate::intel_gpu_hdmi::EDID_CAPACITY];
-    bus.read_indexed(DDC_SLAVE_EDID, 0, &mut edid[..128])
-        .map_err(|e| HdmiError::Ddc(e.into()))?;
-    let blocks = 1 + (edid[126] as usize).min(1);
-    if blocks == 2 {
-        bus.read_indexed(DDC_SLAVE_EDID, 128, &mut edid[128..256])
-            .map_err(|e| HdmiError::Ddc(e.into()))?;
-    }
-    Ok((edid, blocks * 128))
+    crate::intel_gpu_hdmi::read_edid(io, pin).map_err(HdmiError::Ddc)
 }
 
 /// Probe an HDMI sink: Type-C legacy connect (TC only), DDC EDID,
