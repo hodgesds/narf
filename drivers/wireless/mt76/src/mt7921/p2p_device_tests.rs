@@ -68,7 +68,7 @@ fn start() -> Result<(), &'static str> {
             .any(|b| b.get(4..6) == Some(&[7, 0]))
         || !matches!(session.state, State::P2pDevice(_))
         || session.backend.receive_open
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !session.data_pending.is_empty()
         || narf_net::iface::lookup(fixture.radio.name())
             .is_none_or(|link| link.link_up || link.carrier)

@@ -316,7 +316,7 @@ fn bootstrap() -> Result<(), &'static str> {
     ) || session.receive_epoch == old_epoch
         || session.backend.receive_open
         || session.backend.receive_epoch != session.receive_epoch
-        || session.security.is_some()
+        || session.station.security.is_some()
         || session.receive_current(session.receive_epoch) != Ok(false)
     {
         return Err("AP bootstrap promoted station traffic or stale capture");

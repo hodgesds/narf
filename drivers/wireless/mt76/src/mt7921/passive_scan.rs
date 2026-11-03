@@ -595,7 +595,7 @@ impl<B: Backend> Session<B> {
                 return Err(Error::Busy);
             }
             self.check_station_tx()?;
-            Some(self.station_permission.ok_or(Error::Authority)?)
+            Some(self.station.permission.ok_or(Error::Authority)?)
         } else {
             None
         };

@@ -61,8 +61,9 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
         for secured in [false, true] {
             let (mut session, bss) = prepared(channel, secured);
             if join(&mut session, &bss, secured) != Ok(42)
-                || session.ht20_profile.is_none()
+                || session.station.ht20_profile.is_none()
                 || session
+                    .station
                     .ht20_rx
                     .as_ref()
                     .is_none_or(|receiver| !receiver.active)
@@ -143,9 +144,9 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                 return TestResult::Fail("HT20 native BSS RLM width/streams/band");
             }
             if run(session.disassociate_station()).is_err()
-                || session.ht20_profile.is_some()
-                || session.ht20_rx.is_some()
-                || session.station_permission.is_some()
+                || session.station.ht20_profile.is_some()
+                || session.station.ht20_rx.is_some()
+                || session.station.permission.is_some()
             {
                 return TestResult::Fail("HT20 teardown retained negotiated PHY/receive/grant");
             }
@@ -176,6 +177,7 @@ fn mt76_ht20_sgi_intersects_bound_response_without_changing_width_or_smps() -> T
                 reply[2] |= u8::from(response_sgi) << 5;
                 if join(&mut session, &bss, true) != Ok(42)
                     || session
+                        .station
                         .ht20_profile
                         .is_none_or(|p| p.short_gi() != (scan_sgi && response_sgi))
                 {
@@ -279,8 +281,9 @@ fn mt76_ht20_ap_downgrade_and_unsupported_mcs_fail_before_peer_activation() -> T
             session.backend.ht_reply.as_mut().unwrap()[2] = 8;
         }
         if join(&mut session, &bss, false).is_ok()
-            || session.ht20_profile.is_some()
+            || session.station.ht20_profile.is_some()
             || session
+                .station
                 .ht20_rx
                 .as_ref()
                 .is_some_and(|receiver| receiver.active)
@@ -340,8 +343,9 @@ fn mt76_ht20_rlm_policy_and_cancellation_leave_no_active_receiver() -> TestResul
                 return TestResult::Fail("HT20 RLM receipt reused a revoked grant");
             }
         }
-        if session.ht20_profile.is_some()
+        if session.station.ht20_profile.is_some()
             || session
+                .station
                 .ht20_rx
                 .as_ref()
                 .is_some_and(|receiver| receiver.active)
@@ -389,7 +393,7 @@ fn mt76_ht20_addba_is_bound_bounded_and_explicitly_declined_without_ba_state() -
     for _ in 0..8 {
         session.backend.packets.push_back(packet.clone());
     }
-    if session.receive_ethernet() != Ok(None) || session.control_pending.len() != 4 {
+    if session.receive_ethernet() != Ok(None) || session.station.control_pending.len() != 4 {
         return TestResult::Fail("ADDBA refusal queue was not bounded");
     }
     let before = session.backend.frames.len();

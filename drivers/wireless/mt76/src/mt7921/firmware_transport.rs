@@ -1460,28 +1460,25 @@ fn current_station_permission(
     }
 }
 
+/// One station-mode vif's association owner, keyed by its native
+/// [`Link`](crate::mt7921::vif_slots::Link) identity. Linux keeps this
+/// state per `mt792x_vif` / `mt792x_sta` (mt792x.h): the peer WCID, its BA
+/// sessions, WMM and PHY profiles and the RX reorder/defrag caches.
 #[derive(Debug)]
-struct Session<B: Backend> {
-    backend: B,
-    firmware: Firmware,
-    state: State,
-    seq: u8,
-    events: VecDeque<Vec<u8>>,
-    transferred: usize,
-    boot_started: Option<u64>,
-    scan_seq: u8,
+struct StationLink {
+    link: crate::mt7921::vif_slots::Link,
     security: Option<join::StationSecurity>,
     management_rate: crate::mt7921::association::LegacyRate,
-    data_pending: VecDeque<u64>,
     used_tids: u8,
     tx_ba: tx_ba::Owner,
     tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
-    station_bss: Option<ScanBss>,
-    /// BSS0 group role captured at join; retained for the exact disconnect
-    /// record of that association (Linux `vif->p2p` is fixed per vif type).
-    station_network: crate::mt7921::p2p_wire::Network,
-    station_permission: Option<crate::mt7921::association::TxPermission>,
+    bss: Option<ScanBss>,
+    /// This link's group role captured at join; retained for the exact
+    /// disconnect record of that association (Linux `vif->p2p` is fixed per
+    /// vif type).
+    network: crate::mt7921::p2p_wire::Network,
+    permission: Option<crate::mt7921::association::TxPermission>,
     wmm: Option<crate::mt7921::association::wmm::Parameters>,
     wmm_pending: Option<crate::mt7921::association::wmm::Parameters>,
     ht20_rx: Option<amsdu::Receiver>,
@@ -1493,11 +1490,56 @@ struct Session<B: Backend> {
     /// The remaining software fragments of the MSDU in flight (each one
     /// waits for the previous fragment's terminal completion).
     tx_fragments: VecDeque<Vec<u8>>,
-    /// The wiphy fragmentation threshold (`u32::MAX` = off).
-    frag_threshold: u32,
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
     rx_fragments: fragment::Cache,
+}
+impl StationLink {
+    fn new(link: crate::mt7921::vif_slots::Link) -> Self {
+        Self {
+            link,
+            security: None,
+            management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
+            used_tids: 0,
+            tx_ba: tx_ba::Owner::default(),
+            tx_restart: None,
+            peer_lost: false,
+            bss: None,
+            network: crate::mt7921::p2p_wire::Network::Infrastructure,
+            permission: None,
+            wmm: None,
+            wmm_pending: None,
+            ht20_rx: None,
+            ht20_profile: None,
+            vht_profile: None,
+            he_profile: None,
+            ap_phy: None,
+            control_pending: VecDeque::new(),
+            tx_fragments: VecDeque::new(),
+            rx_ba: ba::Owner::default(),
+            received_msdu: VecDeque::new(),
+            rx_fragments: fragment::Cache::default(),
+        }
+    }
+}
+#[derive(Debug)]
+struct Session<B: Backend> {
+    backend: B,
+    firmware: Firmware,
+    state: State,
+    seq: u8,
+    events: VecDeque<Vec<u8>>,
+    transferred: usize,
+    boot_started: Option<u64>,
+    scan_seq: u8,
+    data_pending: VecDeque<u64>,
+    /// The home vif's station owner (BSS0, peer WCID 1).
+    station: StationLink,
+    /// A concurrent P2P group vif's station owner; unused until the
+    /// group netdev lands (Linux mt7921 keeps one `mt792x_vif` per vif).
+    group: Option<StationLink>,
+    /// The wiphy fragmentation threshold (`u32::MAX` = off).
+    frag_threshold: u32,
     receive_epoch: u64,
     /// Original copy-time native packets handed from the scan collector to
     /// the associated station's parsers; never re-stamped at delivery.
@@ -1525,29 +1567,10 @@ impl<B: Backend> Session<B> {
             transferred: 0,
             boot_started: None,
             scan_seq: 0,
-            security: None,
-            management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
             data_pending: VecDeque::with_capacity(crate::mt7921::packet_tx::PIPELINE),
-            used_tids: 0,
-            tx_ba: tx_ba::Owner::default(),
-            tx_restart: None,
-            peer_lost: false,
-            station_bss: None,
-            station_network: crate::mt7921::p2p_wire::Network::Infrastructure,
-            station_permission: None,
-            wmm: None,
-            wmm_pending: None,
-            ht20_rx: None,
-            ht20_profile: None,
-            vht_profile: None,
-            he_profile: None,
-            ap_phy: None,
-            control_pending: VecDeque::new(),
-            tx_fragments: VecDeque::new(),
+            station: StationLink::new(crate::mt7921::vif_slots::Link::HOME),
+            group: None,
             frag_threshold: u32::MAX,
-            rx_ba: ba::Owner::default(),
-            received_msdu: VecDeque::new(),
-            rx_fragments: fragment::Cache::default(),
             receive_epoch: 0,
             scan_packets: VecDeque::new(),
             scanning: false,
@@ -1841,17 +1864,17 @@ impl<B: Backend> Session<B> {
             }
         }
         self.boot_started = None;
-        self.rx_ba.fence();
-        self.tx_ba.fence();
-        self.security = None;
-        self.station_permission = None;
-        self.ht20_rx = None;
-        self.ht20_profile = None;
-        self.vht_profile = None;
-        self.he_profile = None;
-        self.ap_phy = None;
-        self.received_msdu.clear();
-        self.rx_fragments.clear();
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
+        self.station.security = None;
+        self.station.permission = None;
+        self.station.ht20_rx = None;
+        self.station.ht20_profile = None;
+        self.station.vht_profile = None;
+        self.station.he_profile = None;
+        self.station.ap_phy = None;
+        self.station.received_msdu.clear();
+        self.station.rx_fragments.clear();
         self.stage(Stage::Shutdown);
         let result = async {
             self.normalize_wake_bus().await?;

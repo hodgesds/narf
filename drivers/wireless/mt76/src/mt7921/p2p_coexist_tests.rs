@@ -82,7 +82,8 @@ fn join_home(
     )))
     .map_err(|_| "actual home MLME/RSNA")?;
     session.backend.tx_ba_offer = Some((64, 0));
-    if run(Box::pin(session.negotiate_transmit_ba())) != Ok(true) || !session.tx_ba.active() {
+    if run(Box::pin(session.negotiate_transmit_ba())) != Ok(true) || !session.station.tx_ba.active()
+    {
         return Err("actual native home TX BA");
     }
     Ok(())
@@ -99,8 +100,8 @@ fn home_current(session: &Session<Model>, state: State, epoch: u64, secure: bool
     session.state == state
         && session.receive_epoch == epoch
         && session.receive_current(epoch) == Ok(true)
-        && session.security.is_some() == secure
-        && session.tx_ba.active()
+        && session.station.security.is_some() == secure
+        && session.station.tx_ba.active()
         && session.backend.receive_open
 }
 fn coexist() -> Result<(), &'static str> {
@@ -392,7 +393,7 @@ fn retired_home() -> Result<(), &'static str> {
     let epoch = session.receive_epoch;
     let resets = session.backend.recovery_trace.len();
     if !matches!(idle, State::ScanReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !concrete.child.started_current()
     {
         return Err("home disconnect lost independent device or retained old key owner");
@@ -403,7 +404,7 @@ fn retired_home() -> Result<(), &'static str> {
         .map_err(|_| "independent stop after home disconnect")?;
     if session.state != idle
         || session.receive_epoch != epoch
-        || session.security.is_some()
+        || session.station.security.is_some()
         || session.receive_current(epoch) != Ok(false)
         || session.backend.recovery_trace.len() != resets
     {

@@ -91,7 +91,7 @@ fn client() -> Result<(), &'static str> {
             )))
             .map_err(|_| "P2P client actual Open/WPA2 association")?;
             if !matches!(session.state, State::Associated { .. })
-                || session.station_network != network
+                || session.station.network != network
             {
                 return Err("P2P client did not retain the station association/key owner");
             }
@@ -114,7 +114,7 @@ fn client() -> Result<(), &'static str> {
                 .map_err(|_| "P2P client disassociation")?;
             let left = basic_bss(&session.backend.frames[middle..]);
             if !matches!(session.state, State::ScanReady(_))
-                || session.station_network != Network::Infrastructure
+                || session.station.network != Network::Infrastructure
                 || !left
                     .iter()
                     .any(|body| body[16] == 1 && body[12..16] == expected)

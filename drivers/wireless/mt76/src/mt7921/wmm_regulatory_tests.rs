@@ -91,7 +91,7 @@ fn mt76_country_wmm_rule_limits_association_and_dynamic_edca() -> TestResult {
     if commands.len() != 1
         || commands[0] != updated.edca_limited(Some(WmmRule::ETSI))
         || commands[0][30..32] != [3, 0]
-        || session.wmm != Some(updated)
+        || session.station.wmm != Some(updated)
     {
         return TestResult::Fail("dynamic EDCA not regulatory-limited");
     }

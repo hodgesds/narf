@@ -36,7 +36,7 @@ impl<B: Backend> Session<B> {
         if let Some(permission) = permission {
             self.backend.check_tx_permission(permission)?;
             match home {
-                State::Associated { .. } if self.station_permission == Some(permission) => {}
+                State::Associated { .. } if self.station.permission == Some(permission) => {}
                 State::AccessPoint { .. } => {
                     let ap = self.ap_owner.as_ref().ok_or(Error::Authority)?;
                     ap.identity.current().map_err(|_| Error::Authority)?;

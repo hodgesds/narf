@@ -130,8 +130,12 @@ fn mt76_ht40_native_domain_channel_rlm_peer_and_response_geometry() -> TestResul
                 permission40(primary, secondary),
                 &[],
             )) != Ok(42)
-                || session.ht20_profile.and_then(|p| p.negotiated_secondary()) != Some(secondary)
-                || session.ht20_profile.is_none_or(|p| !p.short_gi())
+                || session
+                    .station
+                    .ht20_profile
+                    .and_then(|p| p.negotiated_secondary())
+                    != Some(secondary)
+                || session.station.ht20_profile.is_none_or(|p| !p.short_gi())
             {
                 return TestResult::Fail(
                     "HT40 native association did not activate negotiated width/SGI40",
@@ -218,6 +222,7 @@ fn mt76_ht40_response_narrows_native_geometry_and_failed_receipts_keep_rx_closed
                 &[],
             )) != Ok(42)
                 || session
+                    .station
                     .ht20_profile
                     .is_none_or(|p| p.negotiated_secondary().is_some())
                 || !session.backend.frames.iter().any(|(_, f)| {
@@ -265,8 +270,8 @@ fn mt76_ht40_response_narrows_native_geometry_and_failed_receipts_keep_rx_closed
                 return TestResult::Fail("native HT40 cancellation did not suspend");
             }
         }
-        if session.ht20_profile.is_some()
-            || session.ht20_rx.as_ref().is_some_and(|rx| rx.active)
+        if session.station.ht20_profile.is_some()
+            || session.station.ht20_rx.as_ref().is_some_and(|rx| rx.active)
             || matches!(session.state, State::Associated { .. })
             || !session.backend.owner.published
         {

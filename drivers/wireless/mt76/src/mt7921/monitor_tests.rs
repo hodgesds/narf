@@ -92,7 +92,7 @@ fn native_monitor() -> Result<(), &'static str> {
         })
         || session.receive_epoch == old_epoch
         || session.backend.receive_open
-        || session.security.is_some()
+        || session.station.security.is_some()
         || session.receive_current(session.receive_epoch) != Ok(false)
         || !session.backend.packets.is_empty()
     {
@@ -291,7 +291,7 @@ fn station_monitor_station() -> Result<(), &'static str> {
         .backend
         .packets
         .push_back(super::rx_ba_tests::data_on(6, 1, 11, Some(9), 0x61));
-    if session.receive_ethernet() != Ok(None) || !session.rx_ba.active(1) {
+    if session.receive_ethernet() != Ok(None) || !session.station.rx_ba.active(1) {
         return Err("station reorder queue before role change");
     }
     let mut outbound = vec![0x6f; 60];
@@ -309,12 +309,12 @@ fn station_monitor_station() -> Result<(), &'static str> {
     let before = session.backend.frames.len();
     run(Box::pin(session.disassociate_station()))
         .map_err(|_| "station down native queue/key/BA retirement")?;
-    if session.security.is_some()
-        || session.tx_ba.published()
-        || session.tx_ba.remote()
-        || !session.rx_ba.records().is_empty()
+    if session.station.security.is_some()
+        || session.station.tx_ba.published()
+        || session.station.tx_ba.remote()
+        || !session.station.rx_ba.records().is_empty()
         || !session.data_pending.is_empty()
-        || !session.received_msdu.is_empty()
+        || !session.station.received_msdu.is_empty()
         || session.backend.receive_open
         || session.backend.tx_ba_native_tids != 0
     {
@@ -375,8 +375,8 @@ fn station_monitor_station() -> Result<(), &'static str> {
     if session.receive_epoch == station_epoch
         || session.receive_current(station_epoch) != Ok(false)
         || session.receive_current(session.receive_epoch) != Ok(true)
-        || session.tx_ba.active()
-        || !session.rx_ba.records().is_empty()
+        || session.station.tx_ba.active()
+        || !session.station.rx_ba.records().is_empty()
     {
         return Err("station rejoin reused prior monitor/station grants");
     }

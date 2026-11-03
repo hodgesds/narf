@@ -114,12 +114,12 @@ pub(super) fn establish_window(
         .push_back(request_packet(tid, ssn, window, timeout, channel));
     if session.receive_ethernet() != Ok(None)
         || !session.keys_pending()
-        || session.rx_ba.active(tid)
+        || session.station.rx_ba.active(tid)
     {
         return Err("ADDBA request published premature RX agreement");
     }
     run(session.service_keys()).map_err(|_| "native BA setup receipts/response")?;
-    if !session.rx_ba.active(tid) {
+    if !session.station.rx_ba.active(tid) {
         return Err("terminal BA response did not activate recipient");
     }
     Ok(())
@@ -142,7 +142,7 @@ pub(super) fn decline_oversize(
     let before = session.backend.frames.len();
     run(session.service_keys()).map_err(|_| "oversize ADDBA decline")?;
     let frames = &session.backend.frames[before..];
-    if session.rx_ba.active(tid)
+    if session.station.rx_ba.active(tid)
         || frames.len() != 1
         || frames[0].1.get(24..29) != Some(&[3, 1, 9, 38, 0][..])
         || frames[0].1[29] != (2 | tid << 2)
@@ -382,7 +382,7 @@ fn duplicates_and_declines() -> Result<(), &'static str> {
             .push_back(request_packet(0, 7, 32, 0, 6));
     }
     consume(&mut session, "repeat BA flood unexpectedly delivered data")?;
-    if !session.control_pending.is_empty() {
+    if !session.station.control_pending.is_empty() {
         return Err("response backpressure changed a duplicate accepted agreement into a decline");
     }
     let before = session.backend.frames.len();
@@ -407,11 +407,11 @@ fn duplicates_and_declines() -> Result<(), &'static str> {
           // case3 is an incompatible active-TID renegotiation.
         session.backend.packets.push_back(packet);
     }
-    if session.receive_ethernet() != Ok(None) || session.control_pending.len() != 4 {
+    if session.receive_ethernet() != Ok(None) || session.station.control_pending.len() != 4 {
         return Err("unsupported ADDBA was unbounded or admitted");
     }
     run(session.service_keys()).map_err(|_| "bounded unsupported BA responses")?;
-    if !session.rx_ba.active(0) || session.rx_ba.active(8) {
+    if !session.station.rx_ba.active(0) || session.station.rx_ba.active(8) {
         return Err("declines replaced a live TID or fabricated unsupported TID");
     }
     Ok(())
@@ -535,7 +535,7 @@ fn establish_nested(session: &mut Session<Model>, ssn: u16) -> Result<(), &'stat
     if frames.len() != 3
         || frames[1].1.get(48..) != Some(station.as_slice())
         || frames[2].1.get(24..) != Some(&[3, 1, 9, 0, 0, 15, 16, 0, 0][..])
-        || !session.rx_ba.amsdu(3)
+        || !session.station.rx_ba.amsdu(3)
     {
         return Err("nested permission absent from actual STA_REC_BA/ADDBA receipt");
     }
@@ -590,7 +590,7 @@ fn nested() -> Result<(), &'static str> {
                 return Err("nested/ordinary MPDUs lost SN order across wrap or split one PN");
             }
         }
-        if secured && session.security.as_ref().unwrap().pairwise[3] != 12 {
+        if secured && session.station.security.as_ref().unwrap().pairwise[3] != 12 {
             return Err("nested aggregate committed more than one PN per original MPDU");
         }
         for (marker, value) in [(3, 12), (1, 13)] {
@@ -645,7 +645,7 @@ fn nested_failures() -> Result<(), &'static str> {
             &mut session,
             "bad nested native suffix exposed an authenticated prefix",
         )?;
-        if session.security.as_ref().unwrap().pairwise[3] != 0 {
+        if session.station.security.as_ref().unwrap().pairwise[3] != 0 {
             return Err("bad nested native suffix committed a replay PN");
         }
         for (marker, value) in [(3, 3), (1, 4)] {
@@ -687,7 +687,7 @@ fn retirement() -> Result<(), &'static str> {
             session.backend.packets.push_back(delba(0));
         }
         if session.receive_ethernet() != Ok(None)
-            || session.rx_ba.active(0)
+            || session.station.rx_ba.active(0)
             || !session.keys_pending()
         {
             return Err("DELBA/inactivity did not close host RX before native waits");
@@ -698,7 +698,7 @@ fn retirement() -> Result<(), &'static str> {
         if f.len() != if timeout { 3 } else { 2 }
             || f[0].1.get(80..82) != Some(&[0, 0][..])
             || f[1].1.get(63) != Some(&0)
-            || !session.rx_ba.records().is_empty()
+            || !session.station.rx_ba.records().is_empty()
         {
             return Err("BA native disable/reset/recipient DELBA order");
         }
@@ -745,7 +745,7 @@ fn rekey() -> Result<(), &'static str> {
     }
     let before = session.backend.frames.len();
     run(session.service_keys()).map_err(|_| "BA retirement before rekey M2")?;
-    if session.rx_ba.owns(0) {
+    if session.station.rx_ba.owns(0) {
         return Err("old key's BA owner crossed rekey M2");
     }
     if session.receive_ethernet() != Ok(None) || !session.keys_pending() {
@@ -808,7 +808,8 @@ fn rekey() -> Result<(), &'static str> {
         return Err("old key packet survived into replacement BA window");
     }
     run(session.recover(OWN)).map_err(|_| "verified BA reset")?;
-    if !session.rx_ba.records().is_empty() || !matches!(session.state, State::RadioReady(_)) {
+    if !session.station.rx_ba.records().is_empty() || !matches!(session.state, State::RadioReady(_))
+    {
         return Err("verified reset retained old BA records");
     }
     Ok(())
@@ -832,7 +833,7 @@ fn failure() -> Result<(), &'static str> {
         consume(&mut session, "BA error fixture")?;
         let before = session.backend.frames.len();
         if run(session.service_keys()).is_ok()
-            || session.rx_ba.active(0)
+            || session.station.rx_ba.active(0)
             || !matches!(session.state, State::Failed { .. })
             || !session.backend.owner.published
             || session.backend.frames[before..]
@@ -851,7 +852,7 @@ fn failure() -> Result<(), &'static str> {
         consume(&mut session, "BA policy fixture")?;
         session.backend.deny_tx_after = Some(session.backend.frames.len() + publication);
         if run(session.service_keys()) != Err(Error::Authority)
-            || session.rx_ba.active(0)
+            || session.station.rx_ba.active(0)
             || !matches!(session.state, State::Failed { .. })
             || !session.backend.owner.published
         {
@@ -892,8 +893,8 @@ fn cancelled() -> Result<(), &'static str> {
                 return Err("BA native receipt/response did not suspend for cancellation");
             }
         }
-        if session.rx_ba.active(0)
-            || !session.rx_ba.owns(0)
+        if session.station.rx_ba.active(0)
+            || !session.station.rx_ba.owns(0)
             || !matches!(session.state, State::Running(_))
             || session.receive_ethernet() != Err(Error::Busy)
             || !session.backend.owner.published
@@ -918,10 +919,10 @@ fn cancelled() -> Result<(), &'static str> {
             return Err("BA teardown did not suspend at disable receipt");
         }
     }
-    if session.rx_ba.active(0)
-        || !session.rx_ba.owns(0)
-        || session.station_permission.is_some()
-        || session.security.is_some()
+    if session.station.rx_ba.active(0)
+        || !session.station.rx_ba.owns(0)
+        || session.station.permission.is_some()
+        || session.station.security.is_some()
         || session.receive_ethernet() != Err(Error::Busy)
         || !session.backend.owner.published
     {
@@ -952,9 +953,9 @@ fn cancelled() -> Result<(), &'static str> {
             return Err("BA key retirement did not suspend at native receipt");
         }
     }
-    if rekey.rx_ba.active(0)
-        || !rekey.rx_ba.owns(0)
-        || rekey.security.is_some()
+    if rekey.station.rx_ba.active(0)
+        || !rekey.station.rx_ba.owns(0)
+        || rekey.station.security.is_some()
         || rekey.receive_ethernet() != Err(Error::Busy)
         || !rekey.backend.owner.published
     {
@@ -1003,7 +1004,7 @@ fn delayed() -> Result<(), &'static str> {
         let before = session.backend.frames.len();
         run(session.service_keys()).map_err(|_| "delayed ADDBA decline")?;
         let frames = &session.backend.frames[before..];
-        if session.rx_ba.active(2)
+        if session.station.rx_ba.active(2)
             || frames.len() != 1
             || frames[0].1.get(24..29) != Some(&[3, 1, 9, 38, 0][..])
             || frames[0].1[29] != (2 | 2 << 2)

@@ -83,7 +83,7 @@ fn native() -> Result<(), &'static str> {
         return Err("mt76_connac_gen_ppe_thresh bytes");
     }
     let (mut s, b, p) = prepared5(Some(5), true);
-    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.he_profile.is_none() {
+    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.station.he_profile.is_none() {
         return Err("native HE association");
     }
     let f = &s.backend.frames;
@@ -165,7 +165,7 @@ fn native() -> Result<(), &'static str> {
         0, 0, 0, 0, 5, 0, 16, 0, 0xff, 3, 2, 0, 0xfa, 0xff, 0, 0, 0, 0, 0, 0, 4, 0, 8, 0, 0, 0, 0,
         0,
     ];
-    if s.he_profile.is_some()
+    if s.station.he_profile.is_some()
         || !s.backend.frames[before..]
             .iter()
             .any(|(_, f)| bss_he(f) == Some(&disabled[..]))
@@ -185,7 +185,7 @@ kernel_test_in!(
 fn fallback() -> Result<(), &'static str> {
     // AP without HE: no request element, no HE records, HE PPDUs dropped.
     let (mut s, b, p) = prepared_vht(2, true);
-    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.he_profile.is_some() {
+    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.station.he_profile.is_some() {
         return Err("VHT-only association");
     }
     let f = &s.backend.frames;
@@ -208,7 +208,7 @@ fn fallback() -> Result<(), &'static str> {
     };
     info.capabilities.phy.he = false;
     s.state = State::RadioReady(info);
-    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.he_profile.is_some() {
+    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.station.he_profile.is_some() {
         return Err("non-HE firmware still negotiated HE");
     }
     // No MU EDCA element: the all-zero MU EDCA record is still sent.
@@ -243,7 +243,7 @@ fn failure() -> Result<(), &'static str> {
     let (mut s, mut b, p) = super::vht_tests::prepared(2, true);
     b.information_elements
         .extend_from_slice(&he_elements(true, Some(1)));
-    if super::vht_tests::join(&mut s, &b, p, true).is_ok() || s.he_profile.is_some() {
+    if super::vht_tests::join(&mut s, &b, p, true).is_ok() || s.station.he_profile.is_some() {
         return Err("HE offer without HE response admitted");
     }
     // A malformed MU EDCA element fails the association closed.
@@ -253,7 +253,7 @@ fn failure() -> Result<(), &'static str> {
         .as_mut()
         .unwrap()
         .extend_from_slice(&[255, 13, 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    if super::vht_tests::join(&mut s, &b, p, true).is_ok() || s.he_profile.is_some() {
+    if super::vht_tests::join(&mut s, &b, p, true).is_ok() || s.station.he_profile.is_some() {
         return Err("malformed MU EDCA admitted");
     }
     Ok(())
@@ -278,7 +278,7 @@ fn band24() -> Result<(), &'static str> {
         test_permission_for(6),
         &[],
     ));
-    if joined.is_err() || s.he_profile.is_none_or(|h| h.five()) {
+    if joined.is_err() || s.station.he_profile.is_none_or(|h| h.five()) {
         return Err("2.4GHz HE association");
     }
     let f = &s.backend.frames;
@@ -295,7 +295,7 @@ fn band24() -> Result<(), &'static str> {
         return Err("2.4GHz HE request/STA_REC_HE/PHY_MODE_AX_24G");
     }
     run(s.disassociate_station()).map_err(|_| "2.4GHz HE teardown")?;
-    if s.he_profile.is_some() {
+    if s.station.he_profile.is_some() {
         return Err("2.4GHz HE teardown");
     }
     Ok(())
@@ -354,7 +354,7 @@ fn windows() -> Result<(), &'static str> {
             s.backend.tick_step_ns = 1_000_000;
         }
         run(s.disassociate_station()).map_err(|_| "HE BA teardown")?;
-        if s.rx_ba.active(3) || s.he_profile.is_some() {
+        if s.station.rx_ba.active(3) || s.station.he_profile.is_some() {
             return Err("HE BA teardown retained the agreement");
         }
     }

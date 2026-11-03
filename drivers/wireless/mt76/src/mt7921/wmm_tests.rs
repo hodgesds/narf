@@ -139,8 +139,8 @@ fn mt76_wmm_negotiated_open_and_wpa2_program_edca_before_qos_peer() -> TestResul
         let before = session.backend.frames.len();
         if run(session.associate_station(&bss, b"narf", security(wpa2), test_permission(), &[]))
             != Ok(42)
-            || session.wmm.is_none()
-            || session.ht20_rx.is_some()
+            || session.station.wmm.is_none()
+            || session.station.ht20_rx.is_some()
         {
             return TestResult::Fail("WMM legacy station negotiation/authorization");
         }
@@ -205,9 +205,9 @@ fn mt76_wmm_negotiated_open_and_wpa2_program_edca_before_qos_peer() -> TestResul
         if run(session.disassociate_station()).is_err() {
             return TestResult::Fail("bound model deauth/native WMM cleanup did not complete");
         }
-        if session.wmm.is_some()
-            || session.station_permission.is_some()
-            || session.security.is_some()
+        if session.station.wmm.is_some()
+            || session.station.permission.is_some()
+            || session.station.security.is_some()
             || session.backend.access_point.is_some()
             || !matches!(session.state, State::ScanReady(_))
         {
@@ -252,7 +252,7 @@ fn mt76_wmm_downgrade_malformed_and_unsolicited_responses() -> TestResult {
         let before = session.backend.frames.len();
         if run(session.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
             .is_ok()
-            || session.wmm.is_some()
+            || session.station.wmm.is_some()
             || matches!(session.state, State::Associated { .. })
             || session.backend.frames[before..]
                 .iter()
@@ -267,7 +267,7 @@ fn mt76_wmm_downgrade_malformed_and_unsolicited_responses() -> TestResult {
     session.backend.wmm_reply = Some(PARAMETERS.to_vec());
     if run(session.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
         != Ok(42)
-        || session.wmm.is_some()
+        || session.station.wmm.is_some()
         || session
             .backend
             .frames
@@ -290,7 +290,7 @@ fn mt76_wmm_edca_cancellation_retains_owner_and_never_opens_port() -> TestResult
         if run(failed.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
             .is_ok()
             || !matches!(failed.state, State::Failed { .. })
-            || failed.wmm.is_some()
+            || failed.station.wmm.is_some()
             || !failed.backend.owner.published
             || failed.backend.frames.iter().any(|(_, frame)| {
                 frame.len() >= 168
@@ -317,8 +317,8 @@ fn mt76_wmm_edca_cancellation_retains_owner_and_never_opens_port() -> TestResult
     }
     if !matches!(session.state, State::Running(Stage::Associate))
         || !session.backend.owner.published
-        || session.wmm.is_some()
-        || session.security.is_some()
+        || session.station.wmm.is_some()
+        || session.station.security.is_some()
         || !session.backend.data_qos.is_empty()
         || !session
             .backend
@@ -363,7 +363,7 @@ fn mt76_wmm_current_policy_gates_edca_and_each_data_publication() -> TestResult 
         session.backend.deny_tx_after = Some(limit);
         if run(session.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
             != Err(Error::Authority)
-            || session.wmm.is_some()
+            || session.station.wmm.is_some()
             || matches!(session.state, State::Associated { .. })
             || limit == before && session.backend.frames.len() != before
             || limit == edca
@@ -466,7 +466,7 @@ fn mt76_wmm_bound_beacon_change_closes_port_and_preserves_qos_replay() -> TestRe
     let mut foreign = beacon.clone();
     foreign[10] = 4;
     session.backend.packets.push_back(packet(&foreign));
-    if session.receive_ethernet() != Ok(None) || session.peer_lost {
+    if session.receive_ethernet() != Ok(None) || session.station.peer_lost {
         return TestResult::Fail("foreign AP changed negotiated EDCA");
     }
     session.backend.packets.push_back(packet(&beacon));
@@ -478,7 +478,7 @@ fn mt76_wmm_bound_beacon_change_closes_port_and_preserves_qos_replay() -> TestRe
         || session.start_ethernet(&eth) != Err(Error::DeviceGone)
         || session.backend.frames.len() != count
         || run(session.disassociate_station()).is_err()
-        || session.wmm.is_some()
+        || session.station.wmm.is_some()
     {
         return TestResult::Fail("changed bound AP EDCA retained port or replay authority");
     }
@@ -587,9 +587,9 @@ fn mt76_wmm_cleared_live_policy_never_bootstraps_or_revives_old_grant() -> TestR
                 ..
             }
         )
-        || session.wmm.is_some()
-        || session.station_permission.is_some()
-        || session.security.is_some()
+        || session.station.wmm.is_some()
+        || session.station.permission.is_some()
+        || session.station.security.is_some()
         || session.backend.frames.len() != before
         || !session.data_pending.is_empty()
         || !session.backend.owner.published
@@ -601,7 +601,7 @@ fn mt76_wmm_cleared_live_policy_never_bootstraps_or_revives_old_grant() -> TestR
     current.database.install(staged);
     if session.start_ethernet(&eth) != Err(Error::Busy)
         || session.backend.frames.len() != before
-        || session.wmm.is_some()
+        || session.station.wmm.is_some()
         || run(session.associate_station(&bss, b"narf", security(true), test_permission(), &[]))
             != Err(Error::Busy)
     {
@@ -637,9 +637,9 @@ fn mt76_wmm_policy_loss_after_every_port_and_key_receipt_stops_next_publication(
             if run(session.associate_station(&bss, b"narf", security(wpa2), test_permission(), &[]))
                 != Err(Error::Authority)
                 || session.backend.frames.len() != limit
-                || session.wmm.is_some()
-                || session.station_permission.is_some()
-                || session.security.is_some()
+                || session.station.wmm.is_some()
+                || session.station.permission.is_some()
+                || session.station.security.is_some()
                 || !matches!(session.state, State::Failed { .. })
                 || !session.backend.owner.published
             {
@@ -675,8 +675,8 @@ fn mt76_wmm_policy_loss_after_every_port_and_key_receipt_stops_next_publication(
             && frame[43] == 7
             && frame[49] == 1
             && frame[65] == 1
-    }) || session.wmm.is_some()
-        || session.station_permission.is_some()
+    }) || session.station.wmm.is_some()
+        || session.station.permission.is_some()
     {
         return TestResult::Fail(
             "held QBSS receipt published an Open QoS secure peer after policy clear",
@@ -715,9 +715,9 @@ fn mt76_wmm_rekey_reply_cannot_restore_authority_after_policy_loss() -> TestResu
     session.backend.deny_tx_after = Some(before + 1);
     if run(session.service_keys()) != Err(Error::Authority)
         || session.backend.frames.len() != before + 1
-        || session.security.is_some()
-        || session.wmm.is_some()
-        || session.station_permission.is_some()
+        || session.station.security.is_some()
+        || session.station.wmm.is_some()
+        || session.station.permission.is_some()
         || !matches!(session.state, State::Failed { .. })
         || !session.backend.owner.published
     {
@@ -765,9 +765,9 @@ fn mt76_wmm_teardown_retires_host_grant_before_cancelled_or_uncertain_cleanup() 
                 return TestResult::Fail("WMM cleanup without native ACK became ready");
             }
         }
-        if session.wmm.is_some()
-            || session.station_permission.is_some()
-            || session.security.is_some()
+        if session.station.wmm.is_some()
+            || session.station.permission.is_some()
+            || session.station.security.is_some()
             || session.backend.access_point.is_some()
             || !session.backend.owner.published
             || session.start_ethernet(&[0; 14]) != Err(Error::Busy)

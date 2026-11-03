@@ -124,7 +124,7 @@ fn prestart() -> Result<(), &'static str> {
             || session.p2p_owner.is_some()
             || concrete.child.started_current()
             || session.backend.receive_open
-            || session.security.is_some()
+            || session.station.security.is_some()
             || concrete.child.link_up()
         {
             return Err(
@@ -179,7 +179,7 @@ fn prestart() -> Result<(), &'static str> {
                 || attr(&messages[0][20..], 38) != Some(&2412u32.to_ne_bytes())
                 || attr(&messages[0][20..], 151) != Some(&(-60i32).to_ne_bytes())
                 || session.backend.receive_open
-                || session.security.is_some()
+                || session.station.security.is_some()
             {
                 return Err("native management event invented identity/frequency/signal/port or lost real frame bytes");
             }

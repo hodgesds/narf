@@ -61,8 +61,8 @@ fn mt76_system_suspend_leaves_station_stops_vif_and_hands_off_ownership() -> Tes
         || session.backend.pm.trace != ["dma-off", "fw-own"]
         || session.backend.pm.dma_enabled
         || !session.backend.pm.firmware_owned
-        || session.security.is_some()
-        || session.station_permission.is_some()
+        || session.station.security.is_some()
+        || session.station.permission.is_some()
         || session.start_ethernet(&[0; 14]) != Err(Error::Busy)
         || !session.backend.owner.published
     {
@@ -303,8 +303,8 @@ fn mt76_pci_removal_retires_proven_dma_and_keeps_uncertain_rings() -> TestResult
     if !session.retire_removed()
         || session.state != State::Stopped
         || session.backend.owner.published
-        || session.security.is_some()
-        || session.station_permission.is_some()
+        || session.station.security.is_some()
+        || session.station.permission.is_some()
         || session.backend.receive_open
         || session.start_ethernet(&[0; 14]) != Err(Error::Busy)
     {

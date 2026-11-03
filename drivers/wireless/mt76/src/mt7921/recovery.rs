@@ -35,8 +35,8 @@ impl<B: Backend> Session<B> {
             .as_ref()
             .and_then(|owner| owner.pending.clone());
         self.boot_started = None;
-        self.rx_ba.fence();
-        self.tx_ba.fence();
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
         self.stage(Stage::RecoveryPark);
         let result = self.recover_inner(expected_mac).await;
         if let Err(error) = result {
@@ -101,12 +101,12 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::RecoveryRearm);
         self.backend.recycle()?;
         self.cancel_transmit_ba_restart();
-        self.rx_ba.reset_after_quiescence();
-        self.tx_ba.reset_after_quiescence();
+        self.station.rx_ba.reset_after_quiescence();
+        self.station.tx_ba.reset_after_quiescence();
         self.scan_packets.clear();
         self.scanning = false;
-        self.used_tids = 0;
-        self.security = None;
+        self.station.used_tids = 0;
+        self.station.security = None;
         // Only verified MAC/FW reset plus DMA retirement releases AP owners.
         self.ap_owner = None;
         self.p2p_owner = None;
@@ -114,21 +114,21 @@ impl<B: Backend> Session<B> {
         self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;
-        self.wmm = None;
-        self.wmm_pending = None;
-        self.station_permission = None;
-        self.ht20_rx = None;
-        self.ht20_profile = None;
-        self.vht_profile = None;
-        self.he_profile = None;
-        self.ap_phy = None;
-        self.control_pending.clear();
-        self.tx_fragments.clear();
-        self.received_msdu.clear();
-        self.station_bss = None;
-        self.station_network = crate::mt7921::p2p_wire::Network::Infrastructure;
+        self.station.wmm = None;
+        self.station.wmm_pending = None;
+        self.station.permission = None;
+        self.station.ht20_rx = None;
+        self.station.ht20_profile = None;
+        self.station.vht_profile = None;
+        self.station.he_profile = None;
+        self.station.ap_phy = None;
+        self.station.control_pending.clear();
+        self.station.tx_fragments.clear();
+        self.station.received_msdu.clear();
+        self.station.bss = None;
+        self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.data_pending.clear();
-        self.peer_lost = false;
+        self.station.peer_lost = false;
         self.events.clear();
         self.transferred = 0;
         self.seq = 0;

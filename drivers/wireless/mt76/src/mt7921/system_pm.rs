@@ -217,11 +217,11 @@ impl<B: Backend> Session<B> {
             self.wait(100, |backend| backend.idle().map(|idle| idle.then_some(())))
                 .await?;
             self.backend.reinit_dma()?;
-            self.rx_ba.reset_after_quiescence();
-            self.tx_ba.reset_after_quiescence();
+            self.station.rx_ba.reset_after_quiescence();
+            self.station.tx_ba.reset_after_quiescence();
             self.data_pending.clear();
-            self.received_msdu.clear();
-            self.rx_fragments.clear();
+            self.station.received_msdu.clear();
+            self.station.rx_fragments.clear();
         } else {
             self.backend.resume_dma()?;
         }
@@ -301,23 +301,23 @@ impl<B: Backend> Session<B> {
     pub(super) fn retire_removed(&mut self) -> bool {
         self.boot_started = None;
         self.backend.close_receive_capture(self.receive_epoch);
-        self.rx_ba.fence();
-        self.tx_ba.fence();
-        self.security = None;
-        self.station_permission = None;
-        self.station_bss = None;
-        self.station_network = crate::mt7921::p2p_wire::Network::Infrastructure;
-        self.wmm = None;
-        self.wmm_pending = None;
-        self.ht20_rx = None;
-        self.ht20_profile = None;
-        self.vht_profile = None;
-        self.he_profile = None;
-        self.ap_phy = None;
-        self.control_pending.clear();
-        self.tx_fragments.clear();
-        self.received_msdu.clear();
-        self.rx_fragments.clear();
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
+        self.station.security = None;
+        self.station.permission = None;
+        self.station.bss = None;
+        self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
+        self.station.wmm = None;
+        self.station.wmm_pending = None;
+        self.station.ht20_rx = None;
+        self.station.ht20_profile = None;
+        self.station.vht_profile = None;
+        self.station.he_profile = None;
+        self.station.ap_phy = None;
+        self.station.control_pending.clear();
+        self.station.tx_fragments.clear();
+        self.station.received_msdu.clear();
+        self.station.rx_fragments.clear();
         self.data_pending.clear();
         self.events.clear();
         if matches!(self.state, State::Prepared | State::Stopped) {

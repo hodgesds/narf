@@ -155,7 +155,7 @@ fn handoffs() -> Result<(), &'static str> {
                     .map_err(|_| "NLO D0/reset resume")?;
                 if session.state != State::RadioReady(info)
                     || session.wow_nlo.is_some()
-                    || session.security.is_some()
+                    || session.station.security.is_some()
                     || session.backend.pm.wow.armed
                 {
                     return Err("NLO resume reused an old peer/key/scan owner");

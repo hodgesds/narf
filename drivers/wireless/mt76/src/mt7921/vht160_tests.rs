@@ -70,6 +70,7 @@ fn native() -> Result<(), &'static str> {
                     || permission.channels().len() != 8
                     || super::vht_tests::join(&mut session, &bss, permission, secure) != Ok(42)
                     || session
+                        .station
                         .vht_profile
                         .is_none_or(|profile| profile.width() != 3 || profile.center() != center)
                 {
@@ -151,6 +152,7 @@ fn gates_and_narrowing() -> Result<(), &'static str> {
         if permission.native_width() != 2
             || super::vht_tests::join(&mut session, &bss, permission, false) != Ok(42)
             || session
+                .station
                 .vht_profile
                 .is_none_or(|profile| profile.width() != 2 || profile.center() != 42)
             || session.backend.frames.iter().any(|(_, f)| {
@@ -171,6 +173,7 @@ fn gates_and_narrowing() -> Result<(), &'static str> {
     if permission.native_width() != 2
         || super::vht_tests::join(&mut session, &bss, permission, true) != Ok(42)
         || session
+            .station
             .vht_profile
             .is_none_or(|profile| profile.width() != 2)
     {
@@ -182,7 +185,8 @@ fn gates_and_narrowing() -> Result<(), &'static str> {
     session.backend.vht_reply = Some(vht);
     if super::vht_tests::join(&mut session, &bss, permission, true) != Ok(42)
         || session
-            .station_permission
+            .station
+            .permission
             .is_none_or(|permission| permission.native_width() != 2)
     {
         return Err("bound response160-to80 did not replace the occupied grant");
@@ -370,8 +374,8 @@ fn retirement_and_rx() -> Result<(), &'static str> {
                 return Err("rejected160 peer record accepted");
             }
         }
-        if session.vht_profile.is_some()
-            || session.ht20_rx.as_ref().is_some_and(|r| r.active)
+        if session.station.vht_profile.is_some()
+            || session.station.ht20_rx.as_ref().is_some_and(|r| r.active)
             || matches!(session.state, State::Associated { .. })
             || !session.backend.owner.published
         {
@@ -382,8 +386,8 @@ fn retirement_and_rx() -> Result<(), &'static str> {
         let (mut session, bss, permission) = prepared(36, 50, true, false, 0x7922);
         session.backend.deny_tx_after = Some(stage);
         if super::vht_tests::join(&mut session, &bss, permission, false) != Err(Error::Authority)
-            || session.vht_profile.is_some()
-            || session.station_permission.is_some()
+            || session.station.vht_profile.is_some()
+            || session.station.permission.is_some()
         {
             return Err("160 native publication crossed current policy authority");
         }

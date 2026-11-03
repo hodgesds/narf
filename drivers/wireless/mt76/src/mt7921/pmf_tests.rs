@@ -114,7 +114,7 @@ fn alive(session: &mut Session<Model>) -> bool {
     session
         .receive_ethernet()
         .is_ok_and(|frame| frame.is_none())
-        && !session.peer_lost
+        && !session.station.peer_lost
 }
 
 fn sae_join(pwe: ApSaePwe) -> Result<(), &'static str> {
@@ -140,6 +140,7 @@ fn sae_join(pwe: ApSaePwe) -> Result<(), &'static str> {
     }
     let record = igtk_record(&session).ok_or("no IGTK record")?;
     let gtk = session
+        .station
         .security
         .as_ref()
         .and_then(|s| s.gtk().map(|(id, g)| (id, g.to_vec())))
@@ -149,6 +150,7 @@ fn sae_join(pwe: ApSaePwe) -> Result<(), &'static str> {
         || record[44..48] != [10, 36, 0, 16]
         || record[48..64] != IGTK
         || !session
+            .station
             .security
             .as_ref()
             .is_some_and(|s| s.protects_management())
@@ -192,7 +194,7 @@ fn sae_join(pwe: ApSaePwe) -> Result<(), &'static str> {
         || session.backend.frames[before..]
             .iter()
             .any(|(_, f)| f.first() == Some(&0xc0))
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return Err("teardown after BIP deauth");
     }
@@ -218,7 +220,7 @@ fn mt76_wpa3_sae_wrong_password_and_pmf_policy_failures_install_no_keys() -> Tes
         password: SaePassword::new(b"not-the-password").unwrap(),
     };
     if join(&mut session, &bss, wrong).is_ok()
-        || session.security.is_some()
+        || session.station.security.is_some()
         || igtk_record(&session).is_some()
     {
         return TestResult::Fail("wrong SAE password associated or installed keys");
@@ -278,7 +280,7 @@ fn mt76_wpa2_pmf_protects_robust_tx_answers_sa_query_and_checks_management_pn() 
         .backend
         .packets
         .push_back(super::descriptor(&request));
-    if !alive(&mut session) || !session.control_pending.is_empty() {
+    if !alive(&mut session) || !session.station.control_pending.is_empty() {
         return TestResult::Fail("unprotected SA Query answered under PMF");
     }
     // A hardware-decrypted one is answered, protected, with its ID.
@@ -286,7 +288,7 @@ fn mt76_wpa2_pmf_protects_robust_tx_answers_sa_query_and_checks_management_pn() 
         .backend
         .packets
         .push_back(protected_management(&request, 1));
-    if !alive(&mut session) || session.control_pending.len() != 1 {
+    if !alive(&mut session) || session.station.control_pending.len() != 1 {
         return TestResult::Fail("protected SA Query not queued");
     }
     let before = session.backend.frames.len();
@@ -367,7 +369,7 @@ fn mt76_pmf_teardown_sends_protected_deauth_before_key_retirement() -> TestResul
         .iter()
         .position(|(_, f)| f.len() > 16 && f[f.len() - 8..] == [17, 0, 8, 0, 1, 0, 0, 0]);
     if deauth.is_none_or(|d| frames[d].1[1] != 0x40 || key_off.is_none_or(|k| k < d))
-        || session.security.is_some()
+        || session.station.security.is_some()
         || session.backend.access_point.is_some()
     {
         return TestResult::Fail("protected deauth must precede key retirement");

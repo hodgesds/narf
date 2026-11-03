@@ -38,7 +38,7 @@ impl<B: Backend> Session<B> {
             State::ScanReady(info) if config.net_detect.is_some() => (info, None, false),
             _ => return Err(Error::Busy),
         };
-        if self.peer_lost || associated.is_some() && self.receive_epoch == 0 {
+        if self.station.peer_lost || associated.is_some() && self.receive_epoch == 0 {
             return Err(Error::Busy);
         }
         self.wow_nlo = config
@@ -49,7 +49,7 @@ impl<B: Backend> Session<B> {
                     &self.backend,
                     info,
                     config,
-                    self.station_permission,
+                    self.station.permission,
                 )
                 .map(Arc::new)
             })
@@ -82,12 +82,13 @@ impl<B: Backend> Session<B> {
                 self.service_keys_during_wow(associated).await?;
             }
             if !self.data_pending.is_empty()
-                || !self.tx_fragments.is_empty()
+                || !self.station.tx_fragments.is_empty()
                 || self.data_controls_pending()
             {
                 return Err(Error::Busy);
             }
             let rekey = self
+                .station
                 .security
                 .as_ref()
                 .map(|security| security.wow_gtk_update())
@@ -204,13 +205,13 @@ impl<B: Backend> Session<B> {
     }
 
     fn check_wow_tx(&mut self) -> Result<(), Error> {
-        if self.station_permission.is_some() {
+        if self.station.permission.is_some() {
             self.check_station_tx()?;
         }
         self.check_wow_policy()
     }
     fn check_wow_policy(&self) -> Result<(), Error> {
-        if let Some(permission) = self.station_permission {
+        if let Some(permission) = self.station.permission {
             self.backend.check_tx_permission(permission)?;
         } else if self.wow_nlo.is_none() {
             return Err(Error::Authority);
@@ -227,7 +228,7 @@ impl<B: Backend> Session<B> {
                 return Poll::Ready(Err(error));
             }
             if self.data_pending.is_empty() {
-                return Poll::Ready(if self.tx_fragments.is_empty() {
+                return Poll::Ready(if self.station.tx_fragments.is_empty() {
                     Ok(())
                 } else {
                     Err(Error::Ring)

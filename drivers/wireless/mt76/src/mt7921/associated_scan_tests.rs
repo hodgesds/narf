@@ -60,7 +60,7 @@ fn coexist() -> Result<(), &'static str> {
         let mut session = joined(secure, true)?;
         let associated = session.state;
         let epoch = session.receive_epoch;
-        let permission = session.station_permission.ok_or("station power grant")?;
+        let permission = session.station.permission.ok_or("station power grant")?;
         session
             .backend
             .packets
@@ -78,7 +78,7 @@ fn coexist() -> Result<(), &'static str> {
             || report.bss[0].ssid != b"other-ap"
             || session.state != associated
             || session.receive_epoch != epoch
-            || !session.rx_ba.active(1)
+            || !session.station.rx_ba.active(1)
             || session.receive_current(epoch) != Ok(true)
             || session.receive_ethernet() != Ok(Some(ordinary(0x51)))
         {
@@ -141,10 +141,10 @@ fn terminal() -> Result<(), &'static str> {
     let result = run(session.scan_active_with_policy(&[36], &request(), || Ok(policy())));
     if result.is_ok()
         || !matches!(session.state, State::Failed { .. })
-        || session.security.is_some()
-        || session.station_permission.is_some()
+        || session.station.security.is_some()
+        || session.station.permission.is_some()
         || session.receive_current(old) != Ok(false)
-        || !session.received_msdu.is_empty()
+        || !session.station.received_msdu.is_empty()
     {
         return Err("peer close during scan published data or restored associated authority");
     }

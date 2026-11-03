@@ -32,7 +32,7 @@ fn all_tids() -> Result<(), &'static str> {
                 || frames[0].1.get(24..) != Some(request.as_slice())
                 || frames[1].1.get(48..) != Some(wtbl.as_slice())
                 || frames[2].1.get(48..) != Some(sta.as_slice())
-                || !(0..=tid).all(|t| session.tx_ba.active_tid(t))
+                || !(0..=tid).all(|t| session.station.tx_ba.active_tid(t))
             {
                 return Err("TID request/WTBL/STA fields or independent active records");
             }
@@ -47,8 +47,8 @@ fn all_tids() -> Result<(), &'static str> {
             return Err("per-TID agreement did not select its native aggregate eligibility");
         }
         run(session.disassociate_station()).map_err(|_| "all-TID native teardown")?;
-        if session.tx_ba.published()
-            || session.tx_ba.remote()
+        if session.station.tx_ba.published()
+            || session.station.tx_ba.remote()
             || session.backend.tx_ba_native_tids != 0
         {
             return Err("disconnect left an independent native originator record");
@@ -73,10 +73,10 @@ fn isolation() -> Result<(), &'static str> {
     }
     session.backend.tx_ba_fault = 2; // response names TID2, not requested TID3.
     if run(session.negotiate_transmit_ba_tid(3)) != Ok(false)
-        || !session.tx_ba.active_tid(0)
-        || !session.tx_ba.active_tid(4)
-        || session.tx_ba.active_tid(2)
-        || session.tx_ba.active_tid(3)
+        || !session.station.tx_ba.active_tid(0)
+        || !session.station.tx_ba.active_tid(4)
+        || session.station.tx_ba.active_tid(2)
+        || session.station.tx_ba.active_tid(3)
     {
         return Err("cross-TID response or fallback changed another agreement");
     }
@@ -89,8 +89,8 @@ fn isolation() -> Result<(), &'static str> {
     session.backend.packets.push_back(packet);
     session.receive_ethernet().map_err(|_| "TID4 DELBA")?;
     run(session.service_keys()).map_err(|_| "TID4 native retirement")?;
-    if !session.tx_ba.active_tid(0)
-        || session.tx_ba.active_tid(4)
+    if !session.station.tx_ba.active_tid(0)
+        || session.station.tx_ba.active_tid(4)
         || session.backend.tx_ba_native_tids != 1
     {
         return Err("TID4 DELBA retired an unrelated originator");

@@ -1840,13 +1840,13 @@ impl Transport {
     }
     pub fn transmit_ba_tid_active(&self, tid: u8) -> bool {
         matches!(self.session.state, State::Associated { .. })
-            && !self.session.peer_lost
-            && self.session.tx_ba.active_tid(tid)
+            && !self.session.station.peer_lost
+            && self.session.station.tx_ba.active_tid(tid)
     }
     pub fn transmit_ba_active(&self) -> bool {
         matches!(self.session.state, State::Associated { .. })
-            && !self.session.peer_lost
-            && self.session.tx_ba.active()
+            && !self.session.station.peer_lost
+            && self.session.station.tx_ba.active()
     }
     /// Send deauthentication and tear down peer station record.
     pub async fn disassociate_station(&mut self) -> Result<(), Error> {
@@ -1895,6 +1895,7 @@ impl Transport {
             return Err(Error::Busy);
         }
         self.session
+            .station
             .security
             .as_ref()
             .ok_or(Error::Busy)?

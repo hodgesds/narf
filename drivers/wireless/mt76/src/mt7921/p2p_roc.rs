@@ -467,7 +467,7 @@ impl<B: Backend> Session<B> {
         &self,
     ) -> Result<Option<crate::mt7921::association::TxPermission>, Error> {
         let permission = match self.state {
-            State::Associated { .. } => Some(self.station_permission.ok_or(Error::Authority)?),
+            State::Associated { .. } => Some(self.station.permission.ok_or(Error::Authority)?),
             State::AccessPoint { .. } => {
                 let owner = self.ap_owner.as_ref().ok_or(Error::Busy)?;
                 owner.identity.current().map_err(|_| Error::Authority)?;
@@ -497,7 +497,7 @@ impl<B: Backend> Session<B> {
             if let Err(error) = self.poll_data_tx() {
                 return core::task::Poll::Ready(Err(error));
             }
-            if self.data_pending.is_empty() && self.tx_fragments.is_empty() {
+            if self.data_pending.is_empty() && self.station.tx_fragments.is_empty() {
                 return core::task::Poll::Ready(Ok(()));
             }
             if self.backend.now_ns().saturating_sub(began) >= super::super::TIMEOUT_MS * 1_000_000 {

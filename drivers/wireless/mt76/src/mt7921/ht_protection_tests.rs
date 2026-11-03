@@ -51,14 +51,14 @@ fn protection() -> Result<(), &'static str> {
         let (mut ht, _) = elements(2, 36);
         ht[32] = byte2;
         s.backend.ht_reply = Some(ht);
-        if join(&mut s, &b, p, false) != Ok(42) || s.vht_profile.is_none() {
+        if join(&mut s, &b, p, false) != Ok(42) || s.station.vht_profile.is_none() {
             return Err("HT protection mode refused a VHT80 association");
         }
         // The AP's protection state changes as legacy/non-GF stations come
         // and go; that is not a PHY change and keeps both packet owners.
         for changed in [0, 1, 2, 3, 0b1_0111, 0b0_0100] {
             s.backend.packets.push_back(beacon(changed, None));
-            if s.receive_ethernet() != Ok(None) || s.peer_lost {
+            if s.receive_ethernet() != Ok(None) || s.station.peer_lost {
                 return Err("dynamic HT protection change ended the link");
             }
         }

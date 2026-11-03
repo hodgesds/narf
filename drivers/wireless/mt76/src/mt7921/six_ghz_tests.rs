@@ -292,9 +292,9 @@ fn association() -> Result<(), &'static str> {
             channel: RX_TAG,
             ..
         }
-    ) || session.he_profile.is_none()
-        || session.ht20_profile.is_some()
-        || session.vht_profile.is_some()
+    ) || session.station.he_profile.is_none()
+        || session.station.ht20_profile.is_some()
+        || session.station.vht_profile.is_some()
     {
         return Err("6 GHz associated state / HE-only profile");
     }
@@ -417,8 +417,8 @@ fn association() -> Result<(), &'static str> {
     if after.is_empty()
         || after.iter().any(|&env| env != 0)
         || !matches!(session.state, State::ScanReady(_))
-        || session.he_profile.is_some()
-        || session.station_permission.is_some()
+        || session.station.he_profile.is_some()
+        || session.station.permission.is_some()
     {
         return Err("6 GHz teardown CLC env_6g reset / state");
     }
@@ -482,8 +482,8 @@ fn refusals() -> Result<(), &'static str> {
     let grant = TxPermission::from_ap(&indoor, info(&session), &bss).ok_or("grant")?;
     session.backend.vht_reply = None;
     if join(&mut session, &bss, sae(), grant).is_ok()
-        || session.he_profile.is_some()
-        || session.station_permission.is_some()
+        || session.station.he_profile.is_some()
+        || session.station.permission.is_some()
     {
         return Err("6 GHz response without HE accepted");
     }

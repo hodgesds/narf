@@ -81,8 +81,8 @@ fn restart() -> Result<(), &'static str> {
                 .map_err(|_| "request retained midstream restart")?;
             let retiring = if had_ba { 3 } else { 0 };
             if session.backend.frames.len() != before + retiring
-                || session.tx_ba.active_tid(tid)
-                || !session.tx_ba.active_tid(other)
+                || session.station.tx_ba.active_tid(tid)
+                || !session.station.tx_ba.active_tid(other)
                 || session.backend.tx_ba_native_tids & (1 << tid) != 0
                 || session.receive_current(epoch) != Ok(true)
             {
@@ -90,7 +90,7 @@ fn restart() -> Result<(), &'static str> {
             }
             let before = session.backend.frames.len();
             run(Box::pin(session.service_keys())).map_err(|_| "waiting for a true user packet")?;
-            if session.backend.frames.len() != before || session.tx_restart.is_none() {
+            if session.backend.frames.len() != before || session.station.tx_restart.is_none() {
                 return Err("restart invented RF traffic or guessed an SN without a packet");
             }
             run(session.send_ethernet(&frame(other)))
@@ -116,7 +116,7 @@ fn restart() -> Result<(), &'static str> {
                 .map_err(|_| "terminal packet still awaiting TXS")?;
             if session.start_ethernet(&frame(tid)) != Err(Error::Busy)
                 || session.backend.frames.len() != before
-                || session.tx_ba.active_tid(tid)
+                || session.station.tx_ba.active_tid(tid)
             {
                 return Err("TX_FREE/DMA alone resumed target data or BA");
             }
@@ -124,9 +124,9 @@ fn restart() -> Result<(), &'static str> {
             let next = (observed + 1) & 4095;
             session.backend.tx_status.push_back(txs(3, tid, observed));
             run(Box::pin(session.service_keys())).map_err(|_| "native SN-based ADDBA restart")?;
-            if !session.tx_ba.active_tid(tid)
-                || !session.tx_ba.active_tid(other)
-                || session.tx_restart.is_some()
+            if !session.station.tx_ba.active_tid(tid)
+                || !session.station.tx_ba.active_tid(other)
+                || session.station.tx_restart.is_some()
                 || session.receive_epoch != epoch
                 || session.receive_current(epoch) != Ok(true)
             {
@@ -240,9 +240,10 @@ fn final_fragment() -> Result<(), &'static str> {
         .map_err(|_| "async whole fragmented user MSDU")?;
     let fragments = &session.backend.frames[before..];
     if fragments.len() != 4
-        || !session.tx_fragments.is_empty()
+        || !session.station.tx_fragments.is_empty()
         || !session.data_pending.is_empty()
         || !session
+            .station
             .tx_restart
             .is_some_and(|request| request.waiting_receipt())
     {
@@ -258,7 +259,7 @@ fn final_fragment() -> Result<(), &'static str> {
     }
     session.backend.tx_status.push_back(txs(3, 5, 0x73));
     run(Box::pin(session.service_keys())).map_err(|_| "fragment actual SN ADDBA")?;
-    if !session.tx_ba.active_tid(5) {
+    if !session.station.tx_ba.active_tid(5) {
         return Err("final-fragment native sequence did not activate BA");
     }
     Ok(())

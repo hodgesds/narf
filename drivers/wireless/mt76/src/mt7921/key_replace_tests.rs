@@ -72,7 +72,7 @@ fn replace() -> Result<(), &'static str> {
         return Err("PTK0 replaced before message 4/4");
     }
     // ieee80211_pairwise_rekey tears down BA before the key changes.
-    if s.tx_ba.published() || s.tx_ba.active() {
+    if s.station.tx_ba.published() || s.station.tx_ba.active() {
         return Err("BA survived PTK0 replacement");
     }
     // mt76_wcid_key_setup reloads every per-TID receive counter from the

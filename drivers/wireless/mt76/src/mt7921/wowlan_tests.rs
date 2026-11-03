@@ -67,6 +67,7 @@ fn handoff() -> Result<(), &'static str> {
             session.backend.pm.wow.route_available = true;
             let epoch = session.receive_epoch;
             let gtk = session
+                .station
                 .security
                 .as_ref()
                 .map(|security| security.wow_gtk_update())
@@ -139,8 +140,8 @@ fn handoff() -> Result<(), &'static str> {
                 || session.backend.pm.wow.power != Power::D0
                 || session.backend.pm.wow.armed
                 || session.state != State::RadioReady(info)
-                || session.security.is_some()
-                || session.station_permission.is_some()
+                || session.station.security.is_some()
+                || session.station.permission.is_some()
                 || session.backend.receive_open
                 || !session
                     .backend
@@ -202,7 +203,7 @@ fn cancellation() -> Result<(), &'static str> {
         || session.backend.pm.wow.power != Power::D0
         || session.backend.pm.wow.armed
         || session.state != State::RadioReady(info)
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return Err("recovery shortened entry/exit delays or reopened the old RSNA");
     }

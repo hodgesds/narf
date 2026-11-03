@@ -161,7 +161,7 @@ impl<B: Backend> Session<B> {
         self.state = associated;
         for (epoch, frame) in delivered {
             if self.receive_current(epoch)? {
-                self.received_msdu.push_back(frame);
+                self.station.received_msdu.push_back(frame);
             }
         }
         self.state = State::Running(Stage::ScanWait);

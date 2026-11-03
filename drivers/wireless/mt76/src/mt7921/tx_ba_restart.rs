@@ -23,11 +23,11 @@ impl<B: Backend> Session<B> {
         }
         let associated = self.state;
         if !matches!(associated, State::Associated { .. })
-            || self.ht20_profile.is_none()
-            || self.wmm.is_none()
-            || self.tx_restart.is_some()
+            || self.station.ht20_profile.is_none()
+            || self.station.wmm.is_none()
+            || self.station.tx_restart.is_some()
             || !self.data_pending.is_empty()
-            || !self.tx_fragments.is_empty()
+            || !self.station.tx_fragments.is_empty()
             || self.data_controls_pending()
         {
             return Err(Error::Busy);
@@ -37,7 +37,7 @@ impl<B: Backend> Session<B> {
         // reserves a distinct PID; ambiguous published cancellation cannot
         // make it reusable before full firmware retirement.
         self.backend.arm_transmit_sequence(tid)?;
-        self.tx_restart = Some(Request {
+        self.station.tx_restart = Some(Request {
             tid,
             epoch: self.receive_epoch,
             since: None,
@@ -47,7 +47,7 @@ impl<B: Backend> Session<B> {
             self.retire_transmit_ba_tid(tid, true).await?;
             self.check_station_tx()?;
             self.poll_originator_frames(associated)?;
-            if self.peer_lost {
+            if self.station.peer_lost {
                 return Err(Error::DeviceGone);
             }
             Ok(())
@@ -62,12 +62,13 @@ impl<B: Backend> Session<B> {
         }
     }
     pub(super) fn restart_blocks(&self, tid: u8) -> bool {
-        self.tx_restart.is_some_and(|request| {
+        self.station.tx_restart.is_some_and(|request| {
             request.tid == tid && (request.since.is_some() || !self.data_pending.is_empty())
         })
     }
     pub(super) fn note_sequence_publication(&mut self, tid: u8) {
         if let Some(request) = self
+            .station
             .tx_restart
             .as_mut()
             .filter(|request| request.tid == tid && request.since.is_none())
@@ -78,7 +79,7 @@ impl<B: Backend> Session<B> {
         }
     }
     pub(super) fn cancel_transmit_ba_restart(&mut self) {
-        if self.tx_restart.take().is_some() {
+        if self.station.tx_restart.take().is_some() {
             self.backend.cancel_transmit_sequence();
         }
     }
@@ -87,12 +88,13 @@ impl<B: Backend> Session<B> {
         associated: State,
         restore: State,
     ) -> Result<(), Error> {
-        let Some(request) = self.tx_restart else {
+        let Some(request) = self.station.tx_restart else {
             return Ok(());
         };
         if request.epoch != self.receive_epoch
-            || self.peer_lost
+            || self.station.peer_lost
             || self
+                .station
                 .security
                 .as_ref()
                 .is_some_and(|security| security.has_pending())
@@ -129,7 +131,7 @@ impl<B: Backend> Session<B> {
         let result = self
             .negotiate_transmit_ba_tid_at(associated, restore, request.tid, Some(next))
             .await;
-        self.tx_restart = None;
+        self.station.tx_restart = None;
         result.map(|_| ())
     }
 }

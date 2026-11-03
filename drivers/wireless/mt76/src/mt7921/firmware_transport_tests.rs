@@ -136,7 +136,7 @@ fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestR
     if result.is_err()
         || allocations.get() != 1
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
         || run(session.run()) != Err(Error::Busy)
     {
         return TestResult::Fail("MT76 staged startup replayed or published invalid radio state");
@@ -2541,7 +2541,7 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
                     error: Error::EntropyUnavailable
                 }
             )
-            || session.security.is_some()
+            || session.station.security.is_some()
             || session.backend.entropy_calls != 1
             || session.backend.frames[before..]
                 .iter()
@@ -2632,7 +2632,7 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
         return TestResult::Fail("deauthentication ignored AP basic rate");
     }
     if run(session.recover(own)).is_err()
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !matches!(session.state, State::RadioReady(_))
     {
         return TestResult::Fail("dual-band reset retained association/keys");
@@ -2671,7 +2671,7 @@ fn mcu_ethernet_tx_rx_frame_transport() -> TestResult {
     let State::RadioReady(info) = session.state else {
         return TestResult::Fail("radio state");
     };
-    session.station_permission = Some(test_permission());
+    session.station.permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: [2, 1, 2, 3, 4, 5],
@@ -2899,7 +2899,7 @@ fn mt76_receive_discards_bad_descriptors_and_other_station_frames() -> TestResul
     };
     // This isolated decoder fixture explicitly supplies its synthetic native
     // station grant and receive generation; state alone cannot open RX.
-    session.station_permission = Some(test_permission());
+    session.station.permission = Some(test_permission());
     session.renew_receive_epoch().unwrap();
     for (offset, value) in [
         (3, 0),       // Invalid RX packet discriminator.
@@ -3064,8 +3064,8 @@ fn secure_model() -> NativeSession {
         })
         .unwrap();
     security.port_open = true; // This helper explicitly synthesizes an installed test port.
-    session.security = Some(security);
-    session.station_permission = Some(test_permission());
+    session.station.security = Some(security);
+    session.station.permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: bss.bssid,
@@ -3289,7 +3289,7 @@ fn mt76_retained_key_work_survives_waiter_drop_and_sync_poll_progresses() -> Tes
     };
     if result.is_err()
         || !matches!(session.state, State::Associated { .. })
-        || session.security.is_none()
+        || session.station.security.is_none()
         || session.keys_pending()
     {
         return TestResult::Fail("cancelled waiter lost RSNA state or transport owner");
@@ -3318,15 +3318,15 @@ fn mt76_peer_disconnect_stops_data_and_teardown_requires_firmware_ack() -> TestR
     session.backend.packets.push_back(other);
     session.backend.packets.push_back(valid);
     if session.receive_ethernet() != Err(Error::DeviceGone)
-        || !session.peer_lost
+        || !session.station.peer_lost
         || !matches!(session.step_network(None), Err(Error::DeviceGone))
     {
         return TestResult::Fail("peer deauthentication did not close the packet path");
     }
     if run(session.disassociate_station()).is_err()
         || !matches!(session.state, State::ScanReady(_))
-        || session.peer_lost
-        || session.security.is_some()
+        || session.station.peer_lost
+        || session.station.security.is_some()
     {
         return TestResult::Fail("acknowledged peer/key cleanup did not restore scan-ready state");
     }
@@ -3420,8 +3420,8 @@ fn mt76_reset_recovers_cancelled_dma_then_requires_fresh_station() -> TestResult
             ]
         || trace[3].1.saturating_sub(trace[2].1) < 50_000_000
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
-        || session.station_bss.is_some()
+        || session.station.security.is_some()
+        || session.station.bss.is_some()
         || !session.data_pending.is_empty()
         || !session.events.is_empty()
         || !session.backend.packets.is_empty()
@@ -3505,7 +3505,7 @@ fn mt76_owned_reset_survives_cancelled_waiter() -> TestResult {
     };
     if result.is_err()
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return TestResult::Fail(
             "retained reset completion lost the owner or reopened the old port",
@@ -3522,7 +3522,7 @@ fn mt76_reset_rejects_changed_radio_identity() -> TestResult {
     let mut session = secure_model();
     if run(session.recover([0; 6])) != Err(Error::Bounds)
         || !matches!(session.state, State::Associated { .. })
-        || session.security.is_none()
+        || session.station.security.is_none()
     {
         return TestResult::Fail("invalid reset identity mutated a live station");
     }
@@ -3534,7 +3534,7 @@ fn mt76_reset_rejects_changed_radio_identity() -> TestResult {
                 ..
             }
         )
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return TestResult::Fail("changed post-reset MAC reused an existing network interface");
     }
@@ -3554,7 +3554,7 @@ fn mt76_unregistered_boot_failure_can_recover_before_mac_discovery() -> TestResu
     }
     if run(session.recover_unregistered()).is_err()
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return TestResult::Fail(
             "initial boot failure could not establish a fresh unregistered radio",
@@ -3715,7 +3715,7 @@ fn mt76_rekey_nonce_failure_closes_authorization_before_reply() -> TestResult {
     session.backend.entropy_fail = true;
     if run(session.service_keys()) != Err(Error::EntropyUnavailable)
         || session.backend.frames.len() != sent
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !matches!(
             session.state,
             State::Failed {

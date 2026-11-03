@@ -181,7 +181,7 @@ fn lifecycle() -> Result<(), &'static str> {
     if !concrete.child.started_current()
         || !matches!(session.state, State::RadioReady(_))
         || session.backend.receive_open
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !session.backend.frames[first..]
             .iter()
             .filter_map(|(_, frame)| uni(frame, 1))

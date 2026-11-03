@@ -178,7 +178,7 @@ fn mt76_tx_nss2_native_chain_sku_peer_maps_and_controlled_data() -> TestResult {
                 || switches[0][67] != 1
                 || last[67..69] != [2, 2]
                 || rlm(&s)[60..62] != [2, 3]
-                || s.ht20_profile.unwrap().transmit_streams() != 2
+                || s.station.ht20_profile.unwrap().transmit_streams() != 2
             {
                 return TestResult::Fail(
                     "NSS2 radio count, RX count/mask or actual post-response switch",
@@ -296,7 +296,7 @@ fn mt76_tx_nss2_static_smps_is_single_dynamic_and_disabled_are_native() -> TestR
         let expected = if bits == 0 { 1 } else { 2 };
         if join(&mut s, &b, p, false) != Ok(42)
             || rlm(&s)[60] != expected
-            || s.ht20_profile.unwrap().transmit_streams() != expected
+            || s.station.ht20_profile.unwrap().transmit_streams() != expected
             || vht_tests::record(associated(&s), 7).unwrap()[9] != 2 | ((expected - 1) << 4)
         {
             return TestResult::Fail(
@@ -460,7 +460,7 @@ fn mt76_tx_nss2_ht_basic_mcs8_receiver_and_legacy_fallback_are_distinct() -> Tes
             if result.is_ok() || matches!(s.state, State::Associated { .. }) {
                 return TestResult::Fail("one-path NIC admitted mandatory HT MCS8");
             }
-        } else if result != Ok(42) || s.ht20_rx.as_ref().is_none_or(|r| !r.active) {
+        } else if result != Ok(42) || s.station.ht20_rx.as_ref().is_none_or(|r| !r.active) {
             return TestResult::Fail(
                 "qualified HT RX2/basic-MCS8 failed native receiver activation",
             );
@@ -468,7 +468,7 @@ fn mt76_tx_nss2_ht_basic_mcs8_receiver_and_legacy_fallback_are_distinct() -> Tes
     }
     let (mut s, b) = wmm_tests::prepared(true, false);
     if join(&mut s, &b, test_permission_for(b.channel), false) != Ok(42)
-        || s.ht20_profile.is_some()
+        || s.station.ht20_profile.is_some()
         || s.backend
             .frames
             .iter()
@@ -587,7 +587,7 @@ fn mt76_tx_stbc_follows_stream_count_and_peer_rx_stbc_into_sta_records() -> Test
                 let ht = vht_tests::record(record, 9).unwrap();
                 if (u16::from_le_bytes([ht[4], ht[5]]) & 0x0300 == 0x0100) != expected
                     || u16::from_le_bytes([ht[4], ht[5]]) & 0x0300 & !0x0100 != 0
-                    || s.ht20_profile.unwrap().transmit_stbc() != expected
+                    || s.station.ht20_profile.unwrap().transmit_stbc() != expected
                 {
                     return TestResult::Fail("STA_REC_HT RX STBC not masked by local TX STBC");
                 }
