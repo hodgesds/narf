@@ -2202,3 +2202,28 @@ argument = "No new denial-of-service lever. Swapping or discarding a pinned page
 ref = "security-model/specification/spec.md#L147"
 agent = "Claude Opus 5.5"
 argument = "Untrusted processes reach these paths only through existing triggers (MADV_FREE, driver ioctls that pin their own pages, memory pressure). Their argument validation, errnos and return values are unchanged: MADV_FREE still succeeds and simply leaves a pinned page unmarked, and pinning still returns the same pins. A process can pin only pages of its own address space, so it cannot make another process's memory unreclaimable."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Claude Opus 5.5"
+argument = "Device-frame revocation and refault (Linux ttm_bo_unmap_virtual -> unmap_mapping_range, xe __xe_bo_cpu_fault) live in memory/ (address_space::device_revoke, a child module of address_space like shared_relocation), already in the TCB set. No TCB member, capability or domain is added. The only new lock is the revocation registry, a fixed 16-slot IrqSafeSpinLock taken last (shared transaction -> region tables -> registry) and never held across a callback, allocation or another lock; the refault hook and the waiter run with no address-space lock held, as the existing file-fault hook does. address_space.rs only adds the mask to guard_masked (materialize, mprotect), the Revoked claim and await_refault to both demand paths, refusals in replace_shared_frame, with_revoked_shared_frames and copy_user_bytes_nofault, and makes the fault repair's rmap add idempotent."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Claude Opus 5.5"
+argument = "Revocation only removes translations: it unmaps exact validated base leaves of SHARED regions and removes their reverse-map owners, and changes no permission, PKS key, memory type, W^X classification, capability or domain. A frame is mapped again only by the existing demand repair, from the region's own backing slot with the region's own permissions and frame-derived memory type (user_leaf_flags), exactly as before; the repair now adds the rmap owner only if absent, which removes a duplicate-owner case and grants nothing. The refault hook is driver code reached only through a revocation the driver created through an unsafe API, and it receives only the physical address the fault resolved under the region lock."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L165"
+agent = "Claude Opus 5.5"
+argument = "Revocation never frees, rebinds or retypes a frame and never adds a translation, so it cannot expose another domain's memory; it keeps a CPU from reaching a device aperture while its function leaves D0. The census (provider alias count, rmap owners, pins) runs under the global shared transaction with every named region table locked and refuses any alias it cannot see, so no leaf of the range survives in an address space outside the snapshot; the range is published to the registry before the first leaf is removed, and every leaf installer (materialize for mmap and fork children, mprotect rewrites, shared-frame rebind and replacement) masks it, while mremap moves only resident leaves. Every space's TLB invalidation completes before the call returns. Smokes smoke_device_revoke_removes_leaves_and_masks_installers and smoke_device_refault_waits_then_reinstalls_same_frame encode the refusals, the masking and the same-frame repair."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L171"
+agent = "Claude Opus 5.5"
+argument = "No new denial-of-service lever. Only a driver can create a revocation (unsafe memory API, reached through the filesystem seam the syscall layer installs), the registry is a fixed array of 16 (a full registry refuses with AllocationFailed), and with none live every installer and fault pays one atomic load. A fault on a revoked page parks only the faulting task, through the same waiter the file-fault path uses, which returns on a fatal signal; a missing waiter, a refused wait or a failed refault is SIGBUS rather than a spin. The census allocation is fallible and refuses with AllocationFailed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L147"
+agent = "Claude Opus 5.5"
+argument = "An untrusted process can only touch revoked pages of its own mappings: its access faults, waits for the driver to resume the device or gets SIGBUS, and never reaches the aperture while the device is in D3. mmap, mprotect, mremap, fork and munmap of such mappings keep their validation, errnos and results; their leaves are simply left for the fault. A process cannot create, extend or end a revocation."

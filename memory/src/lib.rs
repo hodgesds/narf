@@ -74,6 +74,7 @@ pub mod vmalloc;
 pub mod wx;
 pub mod zpool;
 
+mod device_revoke_tests;
 mod dma_pin_tests;
 mod guard_tests;
 mod memtype_tests;

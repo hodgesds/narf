@@ -173,7 +173,11 @@ pub unsafe fn with_revoked_shared_frames(
             tracked[alias.frame] += usize::from(alias.tracked);
         }
         for (i, &phys) in old.iter().enumerate() {
+            // A frame of a live device revocation must stay unmapped until
+            // its refault, so it can be neither rebound nor a rebind target.
             if crate::frame::cow::is_pinned(phys)
+                || super::device_revoke::is_revoked(phys)
+                || super::device_revoke::is_revoked(new[i])
                 || counts[i] != aliases(phys.raw())
                 || crate::rmap::owner_count(phys) != tracked[i]
             {

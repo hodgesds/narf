@@ -519,6 +519,45 @@ pub fn registered_intervals() -> usize;
 /// memory only through UserPagePins collected after insert, inside
 /// read_begin/read_retry; mirrors without pins are not supported.
 
+// ── Device-frame revocation and refault (`address_space::device_revoke`) ──
+// Linux ttm_bo_unmap_virtual -> unmap_mapping_range, and the xe CPU fault
+// (__xe_bo_cpu_fault) that resumes the device before re-inserting the PFN.
+pub enum DeviceRefaultError { Bus }
+pub type DeviceRefaultFuture =
+    Pin<Box<dyn Future<Output = Result<(), DeviceRefaultError>> + Send>>;
+pub trait DeviceFrameRefault: Send + Sync {
+    /// No address-space lock held. Completes once the device is accessible
+    /// and the driver has dropped its revocation, or with an error.
+    fn refault(&self, phys: PhysAddr) -> DeviceRefaultFuture;
+}
+/// Parks the faulting task until the future completes; None = cannot wait.
+pub type DeviceRefaultWait = fn(DeviceRefaultFuture) -> Option<Result<(), DeviceRefaultError>>;
+pub fn install_refault_wait(wait: Option<DeviceRefaultWait>) -> Option<DeviceRefaultWait>;
+pub const MAX_DEVICE_REVOCATIONS: usize = 16;
+/// Live until dropped; dropping ends the revocation.
+pub struct DeviceFrameRevocation { /* registry id, range */ }
+impl DeviceFrameRevocation { pub fn range(&self) -> (PhysAddr, u64); }
+pub fn is_device_frame_revoked(phys: PhysAddr) -> bool;
+/// Remove every present leaf of [start, start + len) in `spaces` (and its
+/// rmap owner), fire Clear per space, complete every TLB invalidation, and
+/// keep the range revoked: VMAs, slots and alias references stay. Refused
+/// with nothing changed on a census mismatch or pinned frame (Pinned), a
+/// private alias, inexact leaf or overlapping revocation (Overlap), a bad
+/// range (AlignmentMismatch), or a full registry (AllocationFailed).
+pub unsafe fn revoke_device_frames(spaces: &[Arc<AddressSpace>], start: PhysAddr,
+    len: u64, mapped: &[PhysAddr], aliases: fn(u64) -> usize,
+    refault: Arc<dyn DeviceFrameRefault>) -> Result<DeviceFrameRevocation, AddressSpaceError>;
+/// While a revocation lives: materialize (mmap, fork child), mprotect and
+/// with_revoked_shared_frames/replace_shared_frame never map a frame of it in
+/// a SHARED region; copy_user_bytes_nofault stops at one; a fault on one
+/// calls its refault with no lock held and waits through the installed
+/// waiter. Ok retries the access (once the revocation is dropped, the
+/// ordinary repair installs the same frame and adds its rmap owner once);
+/// no waiter, a refused wait or a refault error is AddressSpaceError::Bus.
+/// mremap moves only resident leaves, so a revoked alias stays unmapped.
+/// Lock order: shared transaction -> region tables -> revocation registry
+/// (a leaf lock).
+
 /// Metadata only: cloning does not retain frames; dropping does not free them.
 /// A sorted 64-page-bucket directory provides logarithmic lookup and amortized
 /// sequential growth. Each bucket's slot vector is a materialized prefix, so a
@@ -1551,6 +1590,17 @@ x86_64 is rejected at runtime.
   `UserPagePin`s collected inside a section, so a frame the device can reach
   is never freed or reused before the consumer drops its pins. When no
   interval is registered every site costs one atomic load.
+- **A revoked device range has no user leaf.** From the moment a
+  `revoke_device_frames` call publishes its range (under the global shared
+  transaction and every named region table, after its alias census) until
+  its handle drops, no path installs a leaf for a frame of the range in a
+  SHARED region: the call removes every present one and completes the TLB
+  invalidation of each space before it returns, the leaf installers mask
+  the range, and a fault waits for the driver's refault. Revocation only
+  removes translations; it never frees, rebinds or grants access to a frame,
+  and the census (provider alias counts, reverse-map owners, pins) refuses
+  any alias it cannot see, so no translation of the range survives in an
+  address space outside the snapshot.
 - **Reclaim never moves or drops a pinned page.** A frame with a
   `UserPagePin` (`cow::is_pinned`) keeps its translation and backing through
   swap-out, lazy-free discard and every migration path, so the frame a

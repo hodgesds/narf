@@ -22,6 +22,8 @@ use core::cell::Cell;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "device_revoke.rs"]
+mod device_revoke;
 #[path = "region_index.rs"]
 mod region_index;
 #[path = "remote_access.rs"]
@@ -29,6 +31,11 @@ mod remote_access;
 #[path = "shared_relocation.rs"]
 mod shared_relocation;
 use crate::region_backing::RegionBacking;
+pub use device_revoke::{
+    install_refault_wait, is_revoked as is_device_frame_revoked, revoke_device_frames,
+    DeviceFrameRefault, DeviceFrameRevocation, DeviceRefaultError, DeviceRefaultFuture,
+    DeviceRefaultWait, MAX_DEVICE_REVOCATIONS,
+};
 use region_index::RegionIndex;
 pub use remote_access::{RemoteAccess, RemoteBuf};
 pub use shared_relocation::with_revoked_shared_frames;
@@ -211,20 +218,29 @@ fn retain_shared_frames(region: &Region) {
 /// zeroed. Leaf installers treat a zero slot as lazy and leave it unmapped,
 /// so a guarded SHARED page — which keeps its borrowed frame until
 /// MADV_GUARD_REMOVE — is never mapped again by materialize or mprotect.
+/// In a SHARED region (`shared`) a frame of a live device revocation is
+/// zeroed too: it is mapped again only by a fault after the revocation ends.
 fn guard_masked<'a>(
     guards: &BTreeSet<u64>,
     base: u64,
     slots: &'a [PhysAddr],
+    shared: bool,
 ) -> alloc::borrow::Cow<'a, [PhysAddr]> {
     let end = base.saturating_add((slots.len() as u64) << 12);
-    if guards.range(base..end).next().is_none() {
-        return alloc::borrow::Cow::Borrowed(slots);
+    let masked = if guards.range(base..end).next().is_none() {
+        alloc::borrow::Cow::Borrowed(slots)
+    } else {
+        let mut masked = slots.to_vec();
+        for &page in guards.range(base..end) {
+            masked[((page - base) >> 12) as usize] = PhysAddr::new(0);
+        }
+        alloc::borrow::Cow::Owned(masked)
+    };
+    if shared {
+        device_revoke::masked(masked)
+    } else {
+        masked
     }
-    let mut masked = slots.to_vec();
-    for &page in guards.range(base..end) {
-        masked[((page - base) >> 12) as usize] = PhysAddr::new(0);
-    }
-    alloc::borrow::Cow::Owned(masked)
 }
 
 /// True when `new` removes READ or WRITE that `old` grants: the protection
@@ -1924,6 +1940,9 @@ enum DemandPageClaim {
     /// observe a half-published frame because publication also takes the
     /// region lock.
     InProgress,
+    /// The page's SHARED backing frame is in a live device revocation: the
+    /// caller waits for the driver's refault with no lock held, then retries.
+    Revoked(PhysAddr),
     /// This caller owns the slow path and may leave the region lock.
     Owner {
         ticket: u64,
@@ -4505,7 +4524,11 @@ impl AddressSpace {
         new_phys: PhysAddr,
     ) -> Result<usize, AddressSpaceError> {
         let mut regions = self.regions.lock();
-        if crate::frame::cow::is_pinned(old_phys) {
+        // A revoked device frame, old or new, gets no leaf until its refault.
+        if crate::frame::cow::is_pinned(old_phys)
+            || device_revoke::is_revoked(old_phys)
+            || device_revoke::is_revoked(new_phys)
+        {
             return Err(AddressSpaceError::Pinned);
         }
         let aliases: Vec<(u64, usize, VirtAddr, RegionPerms)> = regions
@@ -9014,6 +9037,11 @@ impl AddressSpace {
                 else {
                     break;
                 };
+                // A revoked device frame is not accessible (its device may be
+                // in D3); like an absent page, it ends the copy.
+                if region.perms.contains(RegionPerms::SHARED) && device_revoke::is_revoked(phys) {
+                    break;
+                }
                 let amount = (4096 - in_page).min(dst.len() - copied);
                 // SAFETY: the region lock retains ownership of this resident
                 // frame; PhysAddr::kernel_ptr addresses its direct mapping.
@@ -9208,6 +9236,11 @@ impl AddressSpace {
             (index, phys, region.perms)
         };
         if phys.raw() != 0 {
+            // xe_bo_cpu_fault: a revoked device page is mapped again only
+            // through its driver, which resumes the device first.
+            if perms.contains(RegionPerms::SHARED) && device_revoke::is_revoked(phys) {
+                return Ok(DemandPageClaim::Revoked(phys));
+            }
             repair_backed(phys, perms)?;
             return Ok(DemandPageClaim::Resolved);
         }
@@ -9976,7 +10009,11 @@ impl AddressSpace {
             // `map_4kb_demand`.
             match unsafe { map_4kb_demand(self.root, va, phys, flags) } {
                 Ok(()) => {
-                    crate::rmap::add(phys, self.root, va);
+                    // A leaf a PROT_NONE re-protect or a device revocation
+                    // left absent may still have its owner: add it once.
+                    if !crate::rmap::contains_owner(phys, self.root, va) {
+                        crate::rmap::add(phys, self.root, va);
+                    }
                     Ok(())
                 }
                 Err(MapError::AlreadyMapped) => {
@@ -9990,6 +10027,9 @@ impl AddressSpace {
                 Err(error) => Err(demand_map_error(error)),
             }
         })?;
+        if let DemandPageClaim::Revoked(phys) = claim {
+            return device_revoke::await_refault(phys);
+        }
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
@@ -10307,7 +10347,10 @@ impl AddressSpace {
             // contract as the fresh-allocation path below).
             match unsafe { map_4kb(self.root, va, phys, flags) } {
                 Ok(()) => {
-                    crate::rmap::add(phys, self.root, va);
+                    // As the x86_64 twin: add a surviving owner only once.
+                    if !crate::rmap::contains_owner(phys, self.root, va) {
+                        crate::rmap::add(phys, self.root, va);
+                    }
                     Ok(())
                 }
                 Err(MapError::AlreadyMapped) => {
@@ -10321,6 +10364,9 @@ impl AddressSpace {
                 Err(error) => Err(demand_map_error(error)),
             }
         })?;
+        if let DemandPageClaim::Revoked(phys) = claim {
+            return device_revoke::await_refault(phys);
+        }
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
@@ -12415,7 +12461,12 @@ impl AddressSpace {
                 // other callers keep the exact per-page writability decision.
                 for (first, slots) in r.phys.chunks(0, r.phys.len()) {
                     let base = VirtAddr::new(r.base.as_u64() + first as u64 * 4096);
-                    let slots = guard_masked(guards, base.as_u64(), slots);
+                    let slots = guard_masked(
+                        guards,
+                        base.as_u64(),
+                        slots,
+                        r.perms.contains(RegionPerms::SHARED),
+                    );
                     let slots: &[PhysAddr] = &slots;
                     let cow_counts = if cow_readonly {
                         None
@@ -12488,7 +12539,12 @@ impl AddressSpace {
             // read-only — skip the per-page COW refcount lookup and force RO.
             for (first, slots) in r.phys.chunks(0, r.phys.len()) {
                 let base = VirtAddr::new(r.base.as_u64() + first as u64 * 4096);
-                let slots = guard_masked(guards, base.as_u64(), slots);
+                let slots = guard_masked(
+                    guards,
+                    base.as_u64(),
+                    slots,
+                    r.perms.contains(RegionPerms::SHARED),
+                );
                 let slots: &[PhysAddr] = &slots;
                 let cow_counts = if cow_readonly {
                     None
@@ -12981,6 +13037,7 @@ impl AddressSpace {
                     &regions.guard_pages,
                     r.base.as_u64() + ((first as u64) << 12),
                     slice,
+                    r.perms.contains(RegionPerms::SHARED),
                 );
                 let slice: &[PhysAddr] = &slice;
                 let cow_counts = r
@@ -13101,6 +13158,7 @@ impl AddressSpace {
                     &regions.guard_pages,
                     r.base.as_u64() + ((first as u64) << 12),
                     slice,
+                    r.perms.contains(RegionPerms::SHARED),
                 );
                 let slice: &[PhysAddr] = &slice;
                 let cow_counts = r
