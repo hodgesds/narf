@@ -1354,3 +1354,91 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span
 );
+/// A 40MHz N52C record is its own operating program: named and bound per
+/// primary/width/center, `[54..57] = [1, 40, primary]`, `[68] = center`,
+/// never admitting the 20MHz program of its primary (nor the other side),
+/// and gated by the host rule over the whole 40MHz span including the
+/// rule's maximum bandwidth (cfg80211 `reg_does_bw_fit`).
+fn smoke_rtw89_b_wide_channel_record_binds_width_center_and_whole_span() -> TestResult {
+    use super::super::operating_channel::Profile;
+    let (mut base, _base_cap, _record_cap, board) = channel_model(6, 40);
+    let wide = Profile::new_2ghz_40(1, true).unwrap();
+    let other_side = Profile::new_2ghz_40(5, false).unwrap();
+    let narrow_request = channel::Request::new(
+        &base,
+        Profile::from_primary(6).unwrap(),
+        board.with_programs(base.flags),
+    )
+    .unwrap();
+    let request = channel::Request::new(&base, wide, board.with_programs(base.flags)).unwrap();
+    if request.binding == narrow_request.binding
+        || !request.name.contains("-ch01-bw40-c003-")
+        || narrow_request.name.contains("-bw")
+    {
+        return TestResult::Fail("wide request aliased the 20MHz request/name");
+    }
+    let mut bytes = channel_record(&base, &request, 1, 40);
+    bytes[55] = 40;
+    let verify = |bytes: &[u8; 128], profile: Profile| {
+        channel::Request::new(&base, profile, board.with_programs(base.flags)).is_ok_and(|r| {
+            channel::Channel::from_verified(
+                &base,
+                &r,
+                profile,
+                board.with_programs(base.flags),
+                bytes,
+                Some([3; 32]),
+                authority(),
+            )
+            .is_ok()
+        })
+    };
+    if verify(&bytes, wide) {
+        return TestResult::Fail("wide record without its center byte accepted");
+    }
+    bytes[68] = 3;
+    let mut narrow = bytes;
+    narrow[55] = 20;
+    narrow[68] = 0;
+    if !verify(&bytes, wide) || verify(&bytes, other_side) || verify(&narrow, wide) {
+        return TestResult::Fail("wide record format/identity not exact");
+    }
+    let record = channel::Channel::from_verified(
+        &base,
+        &request,
+        wide,
+        board.with_programs(base.flags),
+        &bytes,
+        Some([3; 32]),
+        authority(),
+    )
+    .unwrap();
+    if record.envelope().span != (2402, 2442) {
+        return TestResult::Fail("wide envelope does not cover the whole 40MHz span");
+    }
+    base.channels.push(record);
+    // A 20MHz-wide rule over the span refuses; a 40MHz rule admits.
+    let mut domain = band_domain();
+    base.model_domain = Some(alloc::sync::Arc::new(domain.clone()));
+    if base.select(wide).is_ok() || base.active_profile().is_some() {
+        return TestResult::Fail("40MHz channel selected under a 20MHz maximum bandwidth");
+    }
+    domain.rules[0].max_bandwidth_mhz = 40;
+    base.model_domain = Some(alloc::sync::Arc::new(domain));
+    if base.channel_allowed(wide) != Ok(true)
+        || base.channel_allowed(other_side) != Ok(false)
+        || base.select(wide).is_err()
+        || base.active_profile() != Some(wide)
+        || base.active() != 1
+    {
+        return TestResult::Fail("signed 40MHz record did not gate its own span");
+    }
+    if base.select(Profile::INITIAL).is_err() || base.active_profile().is_some() {
+        return TestResult::Fail("return to channel1/20MHz failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_wide_channel_record_binds_width_center_and_whole_span
+);

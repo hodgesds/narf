@@ -15,7 +15,13 @@
 //! companion, so it measures the complete joint program on that channel.
 //! Its peaks/antenna/ceiling are checked against the current host rule over
 //! the channel's whole occupied span. Channel14 (CCK-only) has no record.
-use super::super::operating_channel::Profile;
+//!
+//! A 40/80MHz operating channel (rtw8852b.c `support_bandwidths`) has its
+//! own record per primary/width/secondary side (`rtw8852b-chan-v1-chNN-
+//! bwWW-cCCC-<mac>.bin`, `[54..57] = [1, width, primary]`, `[68] = center`)
+//! under a distinct wide recipe; it is never derived from, nor admits, the
+//! 20MHz record of its primary.
+use super::super::operating_channel::{Profile, Width};
 use super::*;
 
 pub(super) struct Channel {
@@ -36,7 +42,17 @@ pub(super) struct Request {
 /// Noninitial primaries that may carry a record: 2.4GHz 2..=13 and every
 /// typed 5GHz 20MHz primary. 14 stays unadvertised.
 pub(super) fn admissible(profile: Profile) -> bool {
-    (2..=13).contains(&profile.primary()) || profile.is_5ghz()
+    // Every typed 40/80MHz chandef (2.4GHz HT40 halves within 1..=13, 5GHz
+    // IEEE blocks) is noninitial, primary 1 included.
+    profile.width() != Width::Mhz20 || (2..=13).contains(&profile.primary()) || profile.is_5ghz()
+}
+/// 40/80MHz operating program recipe (distinct from both 20MHz recipes).
+fn recipe_wide() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"RTL8852B 40/80MHz full operating program v1; Linux core.c __rtw89_set_channel: __rtw8852bx_set_channel_mac RFMOD/TX sub-carrier (rtw89_phy_get_txsc), __rtw8852bx_set_channel_bb ctrl_ch(center)/ctrl_bw (FC0 BW_SET, PRICH, 40MHz RXSC)/5M mask, RF _ctrl_ch(center)/_ctrl_bw CFGCH_BW/_rxbb_bw, set_txpwr; band-change TSSI scan; rtw8852b_rfk_channel on a Ready owner with iqk_bw (TXK/RXK command, R_IQKCH BW, 80MHz RX clock), TSSI extra-group DE averaging, DPK bw (TXBB, TPG, 80MHz AFE EX and LBK RXIQK, MDPD order); DPK reload disabled; RFK MCC slot0");
+    hash.update(b"WW0 limit page per rtw89_phy_fill_txpwr_limit_{40m,80m}_ax and RU sections per _ru_{40m,80m}_ax over center/primary/subchannels; init-only power reference/trim/RX-AB retained from initial program");
+    hash.update(b"ordinary TX/CMAC/autonomous response drained before retune, reopened only after Ready; worst-case peaks/antenna cover all calibration, packet, response and optional companion emissions over the whole occupied 40/80MHz span under the current host rule (max bandwidth >= width)");
+    hash.finalize()
 }
 /// 5GHz cross-band operating program recipe (distinct from the unchanged
 /// 2.4GHz v1 recipe, so no 2.4GHz binding moves).
@@ -74,9 +90,19 @@ impl Request {
         {
             return Err(Error::Identity);
         }
+        let wide = profile.width() != Width::Mhz20;
         let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF RTL8852B measured noninitial channel full program v1");
-        hash.update(&[profile.primary(), 20]);
+        if wide {
+            hash.update(b"NARF RTL8852B measured wide operating channel full program v1");
+            hash.update(&[
+                profile.primary(),
+                profile.width().mhz() as u8,
+                profile.center(),
+            ]);
+        } else {
+            hash.update(b"NARF RTL8852B measured noninitial channel full program v1");
+            hash.update(&[profile.primary(), 20]);
+        }
         hash.update(&board.identity);
         hash.update(&base.board.identity);
         hash.update(&base.record_digest);
@@ -105,23 +131,33 @@ impl Request {
                 None => None,
             },
         );
-        hash.update(&if profile.is_5ghz() {
+        hash.update(&if wide {
+            recipe_wide()
+        } else if profile.is_5ghz() {
             recipe_5ghz()
         } else {
             recipe()
         });
         let m = base.board.mac;
-        Ok(Self {
-            name: format!(
-                "rtw89/rtw8852b-chan-v1-ch{:02}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+        let mac = format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        );
+        let name = if wide {
+            format!(
+                "rtw89/rtw8852b-chan-v1-ch{:02}-bw{}-c{:03}-{mac}.bin",
                 profile.primary(),
-                m[0],
-                m[1],
-                m[2],
-                m[3],
-                m[4],
-                m[5]
-            ),
+                profile.width().mhz(),
+                profile.center(),
+            )
+        } else {
+            format!(
+                "rtw89/rtw8852b-chan-v1-ch{:02}-{mac}.bin",
+                profile.primary()
+            )
+        };
+        Ok(Self {
+            name,
             binding: hash.finalize(),
         })
     }
@@ -194,9 +230,15 @@ impl Channel {
             || bytes[8..12] != 128u32.to_le_bytes()
             || bytes[12..14] != 0x10ecu16.to_le_bytes()
             || bytes[14..16] != base.board.device.to_le_bytes()
-            || bytes[54..57] != [1, 20, profile.primary()]
+            || bytes[54..57] != [1, profile.width().mhz() as u8, profile.primary()]
             || bytes[57] != base.flags
-            || bytes[68..] != [0; 60]
+            || bytes[68]
+                != if profile.width() == Width::Mhz20 {
+                    0
+                } else {
+                    profile.center()
+                }
+            || bytes[69..] != [0; 59]
         {
             return Err(Error::Format);
         }

@@ -193,7 +193,9 @@ impl Board {
             assets,
             power,
             phycap,
-            if power.channel().is_5ghz() {
+            if power.channel().width() != super::operating_channel::Width::Mhz20 {
+                b"NARF RTL8852B wide full RF 40/80MHz HT/VHT/HE-wide awake WLAN-only v1;TX-A1M,RX-AB;automatic response paths (CCK only on 2.4GHz);no hardwarecrypto;retuned from Ready ch1 program; actual primary/center/width bound by the plan"
+            } else if power.channel().is_5ghz() {
                 b"NARF RTL8852B 5GHz full RF 20MHz legacy-OFDM20 awake WLAN-only v1;TX-A1M,RX-AB;automatic OFDM response paths, no CCK;no hardwarecrypto;retuned across band from Ready ch1 program"
             } else {
                 b"NARF RTL8852B noninitial full RF 2.4GHz20 legacy20 awake WLAN-only v1;TX-A1M,RX-AB;all automatic CCK/OFDM response paths;no hardwarecrypto;retuned from Ready ch1 program"
@@ -311,8 +313,10 @@ pub(super) struct Qualification {
     fragments: Option<fragment::Fragments>,
     /// Signed noninitial per-channel full-program records (N52C).
     channels: alloc::vec::Vec<channel::Channel>,
-    /// Primary whose envelope gates every publication (1 = base N52B).
-    active: core::sync::atomic::AtomicU8,
+    /// Operating channel whose envelope gates every publication, as
+    /// [`profile_key`] (primary | width << 8 | center << 16); channel1/20MHz
+    /// is the base N52B.
+    active: core::sync::atomic::AtomicU32,
     /// Station TX grant on a passive-only (DFS / NO_IR) primary: the
     /// primary and the exact policy snapshot under which the station
     /// client's `narf_wireless::reg::witness::BeaconWitness` admitted it.
@@ -404,7 +408,9 @@ impl Qualification {
             lps: None,
             fragments: None,
             channels: alloc::vec::Vec::new(),
-            active: core::sync::atomic::AtomicU8::new(1),
+            active: core::sync::atomic::AtomicU32::new(profile_key(
+                super::operating_channel::Profile::INITIAL,
+            )),
             passive_tx: narf_lib::sync::IrqSafeSpinLock::new(None),
             antenna_qdb,
             ceiling_qdbm,
@@ -468,9 +474,9 @@ impl Qualification {
             Some(program) => program.invoke(operation),
             None => operation(),
         };
-        match self.active() {
-            1 => operation(),
-            primary => match self.channel(primary) {
+        match self.active_profile() {
+            None => operation(),
+            Some(profile) => match self.channel(profile) {
                 Some(record) => record.invoke(operation),
                 None => Err(super::power::Error::Access),
             },
@@ -591,23 +597,25 @@ impl Qualification {
     /// Envelope of the active primary: base N52B over 2402..2422 for channel1,
     /// otherwise the current signed N52C record over its occupied span.
     fn envelope(&self) -> Result<Envelope, Error> {
-        let active = self.active.load(core::sync::atomic::Ordering::Acquire);
-        if active == 1 {
+        let Some(active) = self.active_profile() else {
             return Ok(Envelope {
                 span: (2402, 2422),
                 antenna_qdb: self.antenna_qdb,
                 ceiling_qdbm: self.ceiling_qdbm,
                 peaks_qdbm: self.peaks_qdbm,
             });
-        }
+        };
         let record = self.channel(active).ok_or(Error::Policy)?;
         record.current()?;
         Ok(record.envelope())
     }
-    fn channel(&self, primary: u8) -> Option<&channel::Channel> {
+    /// The record of exactly this operating channel (primary, width and,
+    /// for a 2.4GHz 40MHz channel, secondary side). A 20MHz record never
+    /// admits a wider program on its primary, nor the reverse.
+    fn channel(&self, profile: super::operating_channel::Profile) -> Option<&channel::Channel> {
         self.channels
             .iter()
-            .find(|record| record.profile().primary() == primary)
+            .find(|record| record.profile() == profile)
     }
     /// Load the optional N52C record for one noninitial primary. `board` is
     /// [`Board::new_noninitial`] for the same lifecycle; the base program
@@ -636,18 +644,19 @@ impl Qualification {
         if profile == super::operating_channel::Profile::INITIAL {
             return Ok(true);
         }
-        let Some(record) = self.channel(profile.primary()) else {
+        let Some(record) = self.channel(profile) else {
             return Ok(false);
         };
         record.bound(self)?;
-        if !profile.is_5ghz() {
+        if !profile.is_5ghz() && profile.width() == super::operating_channel::Width::Mhz20 {
             return Ok(true);
         }
         // A 5GHz record is only admitted while the current host rule over
         // its span passes the envelope (a DFS / NO_IR span is admitted as
         // passive-only: RX, passive scan, and station TX only under a
         // witness grant, `tx_current`), so a scan never retunes onto a
-        // channel whose envelope `select` would refuse.
+        // channel whose envelope `select` would refuse. A 40/80MHz record
+        // is likewise checked over its whole occupied span (both bands).
         Ok(Self::check_envelope(&*self.policy()?, record.envelope()).is_ok())
     }
     /// The signed noninitial record was measured for exactly this freshly
@@ -657,7 +666,7 @@ impl Qualification {
         profile: super::operating_channel::Profile,
         board: Board,
     ) -> bool {
-        self.channel(profile.primary())
+        self.channel(profile)
             .is_some_and(|record| record.board() == board.with_programs(self.flags))
     }
     /// Switch the envelope gating every later publication to `profile`. The
@@ -666,9 +675,7 @@ impl Qualification {
     /// rule. No register access happens here.
     pub(super) fn select(&self, profile: super::operating_channel::Profile) -> Result<(), Error> {
         if profile != super::operating_channel::Profile::INITIAL {
-            self.channel(profile.primary())
-                .ok_or(Error::Policy)?
-                .bound(self)?;
+            self.channel(profile).ok_or(Error::Policy)?.bound(self)?;
         }
         {
             let mut grant = self.passive_tx.lock();
@@ -680,7 +687,7 @@ impl Qualification {
         }
         let previous = self
             .active
-            .swap(profile.primary(), core::sync::atomic::Ordering::AcqRel);
+            .swap(profile_key(profile), core::sync::atomic::Ordering::AcqRel);
         let result = self.current();
         if result.is_err() {
             self.active
@@ -688,8 +695,15 @@ impl Qualification {
         }
         result
     }
+    /// Primary of the active operating channel.
     pub(super) fn active(&self) -> u8 {
-        self.active.load(core::sync::atomic::Ordering::Acquire)
+        self.active.load(core::sync::atomic::Ordering::Acquire) as u8
+    }
+    /// The active noninitial operating channel (`None` = base channel1/20MHz).
+    pub(super) fn active_profile(&self) -> Option<super::operating_channel::Profile> {
+        let key = self.active.load(core::sync::atomic::Ordering::Acquire);
+        let profile = profile_from_key(key)?;
+        (profile != super::operating_channel::Profile::INITIAL).then_some(profile)
     }
     /// `Ok(passive)`: the active envelope passes; `passive` when its span is
     /// passive-only (DFS / NO_IR).
@@ -716,9 +730,10 @@ impl Qualification {
             if rule.freq_start_mhz > low
                 || rule.freq_end_mhz < high
                 // cfg80211 reg_get_max_bandwidth (AUTO_BW run, NO_160MHZ
-                // cap) must allow this 20MHz channel; NO_160MHZ and
-                // AUTO_BW restrict nothing else at 20MHz.
-                || domain.max_bandwidth(index) < 20
+                // cap) must allow the whole occupied width (20/40/80MHz,
+                // cfg80211 `reg_does_bw_fit`); NO_160MHZ restricts nothing
+                // below 160MHz.
+                || domain.max_bandwidth(index) < high - low
                 || rule.flags.bits() & !(PLAIN_RULE_FLAGS | PASSIVE_RULE_FLAGS) != 0
             {
                 return Err(Error::Policy);
@@ -742,6 +757,23 @@ impl Qualification {
         }
         Ok(passive)
     }
+}
+/// The [`Qualification`] `active` key of an operating channel.
+fn profile_key(profile: super::operating_channel::Profile) -> u32 {
+    u32::from(profile.primary())
+        | ((profile.width() as u32) << 8)
+        | (u32::from(profile.center()) << 16)
+}
+fn profile_from_key(key: u32) -> Option<super::operating_channel::Profile> {
+    use super::operating_channel::{Profile, Width};
+    let (primary, center) = (key as u8, (key >> 16) as u8);
+    let width = match (key >> 8) as u8 {
+        0 => Width::Mhz20,
+        1 => Width::Mhz40,
+        2 => Width::Mhz80,
+        _ => return None,
+    };
+    Profile::new_wide(primary, width, center > primary).filter(|p| p.center() == center)
 }
 /// Rule flags making a 5GHz span passive-only (never on 2.4GHz here).
 const PASSIVE_RULE_FLAGS: u32 =

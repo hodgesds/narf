@@ -70,8 +70,32 @@ fn channel_plan(
 ) -> Result<(operating_channel::Profile, radio_power::Plan), power::Error> {
     let profile =
         operating_channel::Profile::from_primary(primary).ok_or(power::Error::Unsupported)?;
+    profile_plan(assets, rfe, profile)
+}
+fn profile_plan(
+    assets: &radio_assets::Assets,
+    rfe: u8,
+    profile: operating_channel::Profile,
+) -> Result<(operating_channel::Profile, radio_power::Plan), power::Error> {
     let plan = radio_power::Plan::from_assets_for_channel(assets, rfe, profile).map_err(denied)?;
     Ok((profile, plan))
+}
+/// Every typed RTL8852B 40/80MHz operating channel (rtw8852b.c
+/// `support_bandwidths`): 2.4GHz HT40 on either side within 1..=13 and the
+/// 5GHz 40/80MHz IEEE blocks, one per primary/width/side.
+pub(in crate::rtw89) fn wide_profiles() -> impl Iterator<Item = operating_channel::Profile> {
+    use operating_channel::{Profile, Width};
+    let ghz2 = (1..=13u8).flat_map(|primary| {
+        [true, false]
+            .into_iter()
+            .filter_map(move |above| Profile::new_2ghz_40(primary, above))
+    });
+    let ghz5 = operating_channel::GHZ5.into_iter().flat_map(|primary| {
+        [Width::Mhz40, Width::Mhz80]
+            .into_iter()
+            .filter_map(move |width| Profile::new_5ghz(primary, width))
+    });
+    ghz2.chain(ghz5)
 }
 impl Native {
     /// Derive the exact required signed-artifact identity without opening any
@@ -372,9 +396,12 @@ impl Native {
             // Optional signed N52C per-channel full programs, loaded last so
             // each binds every installed companion. Absent records leave
             // that primary unadmitted; channel14 is never loaded.
-            for primary in (2..=13).chain(operating_channel::GHZ5) {
+            let narrow = (2..=13)
+                .chain(operating_channel::GHZ5)
+                .filter_map(operating_channel::Profile::from_primary);
+            for profile in narrow.chain(wide_profiles()) {
                 let (profile, plan) =
-                    channel_plan(assets, identity.calibration().rfe_type, primary)?;
+                    profile_plan(assets, identity.calibration().rfe_type, profile)?;
                 let board = radio_policy::Board::new_noninitial(
                     self.lifecycle,
                     factory,
@@ -499,6 +526,8 @@ impl Native {
 /// Source B RF_GET_MCCCH body (no V0 feature for B): `rtw89_fw_h2c_rf_ntfy_mcc`
 /// with `rtw89_rfk_chan_lookup` replacing slot0 for the single entity, so
 /// ch_0_0 = ch_0_1 = current = primary and slot1 stays zero.
+/// RF_GET_MCCCH channels are `rfk_mcc->ch[]` = `chan->channel` (the center
+/// channel; equal to the primary at 20MHz).
 fn mccch(primary: u8) -> [u8; 20] {
     let mut mcc = [0u8; 20];
     for at in [0, 4, 16] {
@@ -552,6 +581,21 @@ impl Native {
         }
         Ok(mask)
     }
+    /// Every 40/80MHz operating channel with a current signed full program
+    /// whose host rule currently permits it (scan/association may widen to
+    /// exactly these; nothing wider than a record is ever programmed).
+    pub(in crate::rtw89) fn admitted_wide(
+        &self,
+    ) -> Result<alloc::vec::Vec<operating_channel::Profile>, power::Error> {
+        let qualification = self.full_radio_scope().ok_or(power::Error::Unsupported)?;
+        let mut admitted = alloc::vec::Vec::new();
+        for profile in wide_profiles() {
+            if qualification.channel_allowed(profile).map_err(denied)? {
+                admitted.push(profile);
+            }
+        }
+        Ok(admitted)
+    }
     /// Typed primary and retune epoch of the last completed full program.
     pub(in crate::rtw89) fn operating_channel(&self) -> Option<(u8, u32)> {
         self.ordinary.as_ref()?;
@@ -595,6 +639,32 @@ impl Native {
         primary: u8,
         linked: bool,
     ) -> Result<u32, power::Error> {
+        let profile =
+            operating_channel::Profile::from_primary(primary).ok_or(power::Error::Unsupported)?;
+        // SAFETY: caller contract, unchanged.
+        unsafe {
+            self.retune_full_radio_to(owner, tables, basic, assets, profile, linked)
+                .await
+        }
+    }
+    /// [`Self::retune_full_radio`] to an exact typed operating channel,
+    /// including a signed-admitted 40/80MHz chandef (core.c
+    /// `rtw89_set_channel` with `chan->band_width`/`pri_ch_idx`): the
+    /// MAC/BB/RF/power/RFK program is the target width's own, never a
+    /// narrowed or widened alias, and no wider span than its record is used.
+    ///
+    /// # Safety
+    /// Same as [`Self::retune_full_radio`].
+    pub(in crate::rtw89) async unsafe fn retune_full_radio_to(
+        &mut self,
+        owner: &mut radio_full::Radio,
+        tables: &radio_init::Init,
+        basic: &rfk::Rfk,
+        assets: &radio_assets::Assets,
+        profile: operating_channel::Profile,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        let primary = profile.primary();
         self.phy_profile_current()?;
         self.operating_current()?;
         self.ordinary_current()?;
@@ -608,7 +678,7 @@ impl Native {
         let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
         let identity = factory.identity().ok_or(power::Error::Unsupported)?;
         let rfe = identity.calibration().rfe_type;
-        let (profile, plan) = channel_plan(assets, rfe, primary)?;
+        let (profile, plan) = profile_plan(assets, rfe, profile)?;
         if owner.channel() == Some(profile) {
             return Ok(owner.epoch());
         }
@@ -704,7 +774,7 @@ impl Native {
             2,
             0x0a,
             2,
-            &mccch(primary),
+            &mccch(profile.center()),
             false,
             super::station::Permit::Legacy,
         )
