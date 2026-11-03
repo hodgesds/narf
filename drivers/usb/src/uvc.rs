@@ -122,7 +122,8 @@ pub enum UvcError {
     SetInterfaceFailed,
     /// The device already has a different streaming alternate active.
     AlreadyStreaming,
-    /// SET_CUR/GET_CUR(PROBE) failed or returned a truncated payload.
+    /// SET_CUR/GET_CUR(PROBE) failed, returned a truncated payload,
+    /// or returned a malformed 1.1+ version triple.
     ProbeFailed,
     /// SET_CUR(COMMIT) failed for the device-accepted stream parameters.
     CommitFailed,
@@ -1386,6 +1387,16 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
     }
     let accepted = VsProbeCommit::decode(&accepted_bytes[..accepted_len])
         .map_err(|_| UvcError::ProbeFailed)?;
+    // GET_CUR version validation (#1244, UVC 1.5 §4.3.1.1): a 34-byte
+    // response carries version fields, and the device's preferred
+    // version must lie inside its own declared [min, max] range. A
+    // malformed triple is a negotiation failure, not a COMMIT:
+    // committing it verbatim would lock in a payload version the
+    // device never offered. 26-byte (1.0) responses carry no version
+    // fields and skip this check.
+    if accepted_len >= VsProbeCommit::LEN_V15 && !accepted.accepted_versions_valid() {
+        return Err(UvcError::ProbeFailed);
+    }
     // COMMIT carries the device-accepted values at the same version
     // length — including the device's 1.1+ clock and version fields.
     let accepted_encoded = accepted.encode_for(uvc_version);
@@ -1742,9 +1753,13 @@ pub fn uvc_index_for_video_node(node: usize) -> Option<usize> {
 /// report-only in the V4L2 layer — so the frame's interval nearest
 /// 30 fps is requested, with the hint bit set for `dwFrameInterval`.
 /// On UVC 1.1+ devices the 1.1+ fields are filled from the device
-/// record (VC-header clock; 1.0 payload-version declaration — the only
-/// payload format this driver's reassembler implements); on 1.0
-/// devices they stay zero and are never sent.
+/// record (VC-header clock; 1.0 payload-version declaration, retained
+/// as a #1225 design choice — see `VsProbeCommit::preferred_version`
+/// for the spec-correct encoding note); on 1.0 devices they stay zero
+/// and are never sent. The reassembler decodes the shared §2.4.3.3
+/// header for every format class, including frame-based
+/// (temporally-encoded) streams, so the declaration no longer gates
+/// which streams the driver can reassemble.
 /// `pub(crate)` so the negotiation fixture drives the production
 /// desired-construction path instead of hand-building a payload.
 pub(crate) fn desired_probe_commit(
@@ -1878,8 +1893,14 @@ pub mod bfh {
     pub const PTS: u8 = 1 << 2;
     /// `SCR` — 6-byte Source Clock Reference present.
     pub const SCR: u8 = 1 << 3;
-    /// `RES` — reserved.
-    pub const RES: u8 = 1 << 4;
+    /// `PAYLOAD_SPECIFIC` — payload-specific bit (UVC 1.5 §2.4.3.3
+    /// Table 2-5, D4). Its meaning is assigned by the individual
+    /// payload specification, not by the core spec; for
+    /// temporally-encoded (frame-based) formats the header carries
+    /// the EOS slice marker here. It is NOT reserved: a device may
+    /// legitimately set it, and the reassembler must not treat it
+    /// as an error or a framing signal.
+    pub const PAYLOAD_SPECIFIC: u8 = 1 << 4;
     /// `STI` — Still Image marker.
     pub const STI: u8 = 1 << 5;
     /// `ERR` — payload contains an error (driver should drop the
@@ -1952,6 +1973,18 @@ impl UvcPayloadHeader {
     pub fn is_error(&self) -> bool {
         self.bfh & bfh::ERR != 0
     }
+    /// D4 payload-specific bit (UVC 1.5 §2.4.3.3 Table 2-5).
+    /// Surfaced, not acted on: frame completion is driven by
+    /// FID/EOF, and the bit's meaning belongs to the payload spec.
+    pub fn is_payload_specific(&self) -> bool {
+        self.bfh & bfh::PAYLOAD_SPECIFIC != 0
+    }
+    /// STI bit read as the temporally-encoded meaning: for
+    /// frame-based (H.264/VP8) streams D5 marks an intra-coded frame
+    /// (UVC 1.5 §2.4.3.3 Table 2-5, D5).
+    pub fn is_intra_coded(&self) -> bool {
+        self.bfh & bfh::STI != 0
+    }
     /// FID bit — toggles between frames.
     pub fn fid(&self) -> bool {
         self.bfh & bfh::FID != 0
@@ -2017,11 +2050,19 @@ pub struct VsProbeCommit {
     /// Framing-information bitmap. The host declares no framing
     /// requirement (0); the device's GET_CUR value is committed.
     pub framing_info: u8,
-    /// Preferred payload-format version. This driver implements the
-    /// 1.0 payload header only, so it declares 1.0 (0x10, BCD nibble
-    /// encoding as in `bcdUVC`) for preferred, min, and max; the
-    /// device's GET_CUR values are what get committed. A device
-    /// requiring 1.5 payloads needs reassembler work first.
+    /// Preferred payload-format version. This driver declares 1.0
+    /// (0x10) for preferred, min, and max — a #1225 design choice
+    /// that is NOT re-litigated here, so the declared values are
+    /// unchanged by this lane. Note the spec-correct encoding for
+    /// future work: UVC 1.5 §4.3.1.1 Table 4-47 defines these fields
+    /// as the PAYLOAD-FORMAT-spec minor version (1–255), not a BCD
+    /// UVC version, and requires the host to initialise them to zero
+    /// on the first Probe SET, after which the device returns its
+    /// preferred version plus its supported [min, max] range and the
+    /// host may only pick a preferred value inside that range (the
+    /// host must not alter min/max). What this lane enforces is the
+    /// GET_CUR side of that rule: see
+    /// [`accepted_versions_valid`](Self::accepted_versions_valid).
     pub preferred_version: u8,
     pub min_version: u8,
     pub max_version: u8,
@@ -2112,6 +2153,25 @@ impl VsProbeCommit {
         }
         Ok(s)
     }
+
+    /// Validate a device's GET_CUR(PROBE) version triple (UVC 1.5
+    /// §4.3.1.1 Table 4-47): the device must reset min/max to the
+    /// 1–255 range it supports, and its preferred version must lie
+    /// inside its own declared [min, max] range. A triple violating
+    /// that — preferred outside [min, max], min zero, or min > max —
+    /// is malformed: committing it would lock in a payload version
+    /// the device never offered, so negotiation must fail instead
+    /// of committing verbatim.
+    ///
+    /// Applies only to 34-byte (1.1+) responses, which are the only
+    /// ones carrying version fields; callers must not apply it to a
+    /// 26-byte decode (whose version fields are zero by
+    /// construction, not by device answer).
+    pub fn accepted_versions_valid(&self) -> bool {
+        self.min_version >= 1
+            && self.min_version <= self.preferred_version
+            && self.preferred_version <= self.max_version
+    }
 }
 
 // ── Frame reassembler ──────────────────────────────────────────────
@@ -2120,6 +2180,13 @@ impl VsProbeCommit {
 // machine to reassemble whole frames. The xHCI iso ring delivers
 // one payload per packet; this reassembler accumulates them into
 // a single buffer and yields a complete frame on EOF.
+//
+// Frame-based formats (uncompressed, MJPEG, DV) and
+// temporally-encoded formats (H.264, VP8 — `VS_FORMAT_FRAME_BASED`)
+// share this machine: the §2.4.3.3 header is identical and frame
+// boundaries come from the FID toggle with EOF completion
+// (§2.4.3.7). The payload-specific D4 bit and the STI/intra-coded
+// bit are decoded on the header but do not drive completion.
 
 #[derive(Debug)]
 pub struct UvcFrameReassembler {

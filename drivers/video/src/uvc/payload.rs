@@ -6,10 +6,25 @@
 //! Header — BFH) carrying FID, EOF, PTS, SCR and error flags. Optional
 //! 4-byte PTS and 6-byte SCR follow before the compressed/raw video data.
 //!
+//! The header machine is SHARED across format classes: frame-based
+//! formats (uncompressed, MJPEG, DV) and temporally-encoded formats
+//! (H.264, VP8 — `VS_FORMAT_FRAME_BASED`) use this same §2.4.3.3
+//! header; what differs by class is which BFH bits are REQUIRED
+//! (§2.4.3.7: frame-based formats require FID, temporally-encoded
+//! formats require EOF and the EOS slice marker). BFH D4 is the
+//! payload-specific bit (core §2.4.3.3 Table 2-5) — it is NOT a
+//! reserved bit — and D5 (STI) marks an intra-coded frame for
+//! temporally-encoded formats.
+//!
 //! References:
 //! - UVC 1.5 §2.4.3.3 "Video and Still Image Payload Headers",
-//!   table 2-12 (Bit Field Header).
+//!   tables 2-5 (Bit Field Header) and 2-6 (extended fields).
+//! - UVC 1.5 §2.4.3.7 "Data Format Classes" (frame-based /
+//!   stream-based / temporally-encoded framing requirements).
 //! - UVC 1.5 §2.4.3.4 "Source Clock Reference and Presentation Time Stamp".
+//! - USB-IF "Frame-Based Payload, Revision 1.5" (VS_FORMAT_FRAME_BASED
+//!   / VS_FRAME_FRAME_BASED descriptors; the payload header itself is
+//!   the §2.4.3.3 header above).
 //!
 //! Linux reference: `drivers/media/usb/uvc/uvc_video.c`
 //! `uvc_video_decode_data()` (around line 590) and `uvc_video_decode_start()`
@@ -27,9 +42,16 @@ pub const BFH_EOF: u8 = 1 << 1;
 pub const BFH_PTS: u8 = 1 << 2;
 /// Source Clock Reference present: 6-byte SCR at the next offset.
 pub const BFH_SCR: u8 = 1 << 3;
-/// Reserved (must be zero per spec).
-pub const BFH_RES: u8 = 1 << 4;
-/// Still Image marker.
+/// Payload-specific bit (UVC 1.5 §2.4.3.3 Table 2-5, D4): its meaning
+/// is assigned by the individual payload specification, not by the
+/// core spec. For temporally-encoded (frame-based) formats the header
+/// carries the EOS slice marker (core §1.5 glossary; bmFramingInfo
+/// §4.3.1.1); it is surfaced here without a second name because the
+/// assignment itself lives in the companion Frame-Based Payload spec.
+/// This bit is NOT reserved: a device may legitimately set it.
+pub const BFH_PAYLOAD_SPECIFIC: u8 = 1 << 4;
+/// Still Image marker — and, for temporally-encoded formats, the
+/// intra-coded-frame marker (UVC 1.5 §2.4.3.3 Table 2-5, D5).
 pub const BFH_STI: u8 = 1 << 5;
 /// Error: payload contains an error; host should drop the current frame.
 pub const BFH_ERR: u8 = 1 << 6;
@@ -131,8 +153,26 @@ impl PayloadHeader {
         self.bfh & BFH_ERR != 0
     }
 
+    /// D4 payload-specific bit (UVC 1.5 §2.4.3.3 Table 2-5). The
+    /// reassembler does not act on it — frame completion is driven
+    /// by FID/EOF — but it is decoded and surfaced so payload-specific
+    /// consumers (e.g. the EOS slice marker for temporally-encoded
+    /// formats) can observe it instead of it being silently dropped.
+    pub fn payload_specific(&self) -> bool {
+        self.bfh & BFH_PAYLOAD_SPECIFIC != 0
+    }
+
     /// STI bit — Still Image marker.
     pub fn is_still_image(&self) -> bool {
+        self.bfh & BFH_STI != 0
+    }
+
+    /// STI bit read as the temporally-encoded meaning: for
+    /// frame-based (H.264/VP8) streams D5 marks an intra-coded frame
+    /// (UVC 1.5 §2.4.3.3 Table 2-5, D5). Same bit as
+    /// [`is_still_image`](Self::is_still_image); the name records
+    /// which class semantics the caller is applying.
+    pub fn is_intra_coded(&self) -> bool {
         self.bfh & BFH_STI != 0
     }
 }
@@ -156,6 +196,15 @@ pub enum PushResult {
 }
 
 /// Reassembles UVC payloads into complete video frames.
+///
+/// Frame-based formats (uncompressed, MJPEG, DV) and
+/// temporally-encoded formats (H.264, VP8 — `VS_FORMAT_FRAME_BASED`)
+/// share this machine: the §2.4.3.3 header is identical, and frame
+/// boundaries come from the FID toggle with EOF completion
+/// (§2.4.3.7 requires FID for frame-based formats and EOF for
+/// temporally-encoded ones). The payload-specific D4 bit and the
+/// STI/intra-coded bit are decoded on the header but do not drive
+/// completion — frames still complete at EOF.
 ///
 /// Linux equivalent: the state maintained by `struct uvc_buffer` +
 /// `uvc_video_decode_start()` / `uvc_video_decode_data()` in
