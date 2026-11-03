@@ -246,7 +246,7 @@ pub(crate) fn cdclk_current_khz<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
 // Unlike a zero/off readout, an enabled but unlocked clock cannot authorize
 // the fast path or subsequent resource/port programming. Source
 // bxt_de_pll_readout requires both ENABLE and LOCK before trusting the ratio.
-fn acknowledged_cdclk<M: MmioWindow + ?Sized>(mmio: &M) -> Result<u32, ModesetError> {
+pub(crate) fn acknowledged_cdclk<M: MmioWindow + ?Sized>(mmio: &M) -> Result<u32, ModesetError> {
     let current = cdclk_current_khz(mmio);
     let pll = mmio.read32(CDCLK_PLL_ENABLE_REG);
     let enabled = pll & CDCLK_PLL_ENABLE != 0;
@@ -264,7 +264,10 @@ fn acknowledged_cdclk<M: MmioWindow + ?Sized>(mmio: &M) -> Result<u32, ModesetEr
 /// raises; a faster acknowledged firmware CDCLK is left alone.
 /// Refuse if no table rung can meet the required floor; a table miss
 /// cannot authorize later programming below that floor.
-fn program_cdclk_floor<M: MmioWindow + ?Sized>(mmio: &M, mode: &Mode) -> Result<(), ModesetError> {
+pub(crate) fn program_cdclk_floor<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    mode: &Mode,
+) -> Result<(), ModesetError> {
     let floor_khz = mode.pixel_clock_khz.div_ceil(2);
     let current = acknowledged_cdclk(mmio)?;
     if floor_khz <= current {
@@ -703,7 +706,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     // move on Xe-LPG; these steps reuse the shared codecs exactly
     // as the Gen12 orchestrator does.
 
-    fn program_transcoder(&mut self, mode: &Mode) {
+    pub(crate) fn program_transcoder(&mut self, mode: &Mode) {
         use crate::intel_gpu_pipes::{
             build_transcoder, Transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET,
             TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
@@ -723,7 +726,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    fn program_pipe(&mut self, mode: &Mode) {
+    pub(crate) fn program_pipe(&mut self, mode: &Mode) {
         use crate::intel_gpu_pipes::{build_pipe, Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
         let timing = mode_to_display_timing(mode);
         let prog = match build_pipe(&timing) {
@@ -746,7 +749,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    fn program_mn(&mut self, mode: &Mode, rate: LinkRate, lanes: u8) {
+    pub(crate) fn program_mn(&mut self, mode: &Mode, rate: LinkRate, lanes: u8) {
         use crate::intel_gpu_pipes::{
             dp_mn, Transcoder, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
             PIPE_LINK_N1_OFFSET,
@@ -762,7 +765,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
+    pub(crate) fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
         use crate::intel_gpu_pipes::{
             build_primary_plane, Pipe as PipeIdx, PixelFormat as PipeFmt, PLANE_CTL_OFFSET,
             PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET, PLANE_STRIDE_OFFSET,
@@ -1356,7 +1359,12 @@ pub mod tests {
                 panic!("unqualified TC write");
             }
         }
-        for port in [XeLpgPort::Tc1, XeLpgPort::Tc2] {
+        for port in [
+            XeLpgPort::Tc1,
+            XeLpgPort::Tc2,
+            XeLpgPort::Tc3,
+            XeLpgPort::Tc4,
+        ] {
             let mut ms = XeLpgModeset::new(&NoAccess, port);
             assert_eq!(
                 ms.modeset(&test_fb(), Some(&Mode::VESA_1024X768_60)),
