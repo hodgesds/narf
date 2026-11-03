@@ -24,11 +24,13 @@ fn done(seqno: u32) -> GuCMessage {
 
 fn smoke_ggtt_tlb_wire_constants_follow_linux() -> TestResult {
     // XE_GUC_ACTION_TLB_INVALIDATION / _DONE and MAKE_INVAL_OP(GUC):
-    // XE_GUC_TLB_INVAL_GUC 3, XE_GUC_TLB_INVAL_MODE_HEAVY 0 << 8,
-    // XE_GUC_TLB_INVAL_FLUSH_CACHE bit 31.
+    // XE_GUC_TLB_INVAL_GUC 3 in bits 7:0, XE_GUC_TLB_INVAL_MODE_HEAVY (0) in
+    // bits 15:8 and XE_GUC_TLB_INVAL_FLUSH_CACHE in bit 31.
     kt_assert_eq!(ACTION, 0x7000);
     kt_assert_eq!(DONE, 0x7001);
-    kt_assert_eq!(OP_GUC, 3 | (0 << 8) | (1 << 31));
+    kt_assert_eq!(OP_GUC & 0xff, 3);
+    kt_assert_eq!((OP_GUC >> 8) & 0xff, 0);
+    kt_assert_eq!(OP_GUC & !0xffff, 1 << 31);
     kt_assert_eq!(SEQNO_MAX, 0x100000);
     // HZ/4 + 2 * (SZ_4K / SZ_4K) * HZ.
     kt_assert_eq!(TIMEOUT_NS, 2_250_000_000);
@@ -165,7 +167,8 @@ kernel_test_in!(
 /// A RAM-backed 16 MiB BAR0. `key` is a fixture-unique GGTT ledger key;
 /// no real device sits there.
 struct RamBar {
-    words: alloc::vec::Vec<u32>,
+    /// Owns the memory `region` points at; only reached through `region`.
+    _words: alloc::vec::Vec<u32>,
     region: narf_bus::bar::MmioRegion,
 }
 
@@ -180,15 +183,17 @@ impl RamBar {
                 prefetchable: false,
             },
         };
-        let bar = Self { words, region };
+        let bar = Self {
+            _words: words,
+            region,
+        };
         for reg in INV_REGS {
             bar.store(reg, SENTINEL);
         }
         bar
     }
     fn load(&self, reg: u64) -> u32 {
-        debug_assert!(reg % 4 == 0 && (reg as usize / 4) < self.words.len());
-        // SAFETY: `words` backs the whole fixture BAR and outlives every
+        // SAFETY: `_words` backs the whole fixture BAR and outlives every
         // arena built over it. The aligned offset selects an in-bounds dword.
         unsafe { core::ptr::read_volatile((self.region.virt + reg) as *const u32) }
     }

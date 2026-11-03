@@ -385,9 +385,7 @@ fn smoke_ggtt_tlb_media_gt_ct_invalidation_and_proven_stop() -> TestResult {
     let (_, polled) = media_until(&mut guc, &w, &mut hw, now + 8, |p| p.is_ready());
     assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Stopped)));
     assert!(!resident(&w, base));
-    assert!(tlb_events(&w)
-        .iter()
-        .any(|event| *event == (GuCTlb::Media, TlbEvent::Reset)));
+    assert!(tlb_events(&w).contains(&(GuCTlb::Media, TlbEvent::Reset)));
     assert_eq!(
         w.0.borrow().ggtt_tlb.as_ref().unwrap().mode(GuCTlb::Media),
         Mode::Off
