@@ -1681,6 +1681,51 @@ HT owner are out of scope; open-loop maps stay refused; DFS, NO_IR and
 indoor-only channels are refused (no radar detection or passive-only
 handling). No physical AR9280 receipt exists.
 
+**AR5008 PHY preparation (`ar9160_enablement`, `ar5416_enablement`).**
+AR5416 PCI `0x0023` / AR5418 PCIe `0x0024` (macVersion 0xd / 0xc, legacy
+`AR_SREV` format) and AR9160 `0x0027` (macVersion 0x40) read the
+`ar5416_eeprom_def` map (three silicon chains, masks up to 0x7).
+`initvals_ar5008.rs` carries the literal `ar5008_initvals.h` /
+`ar9001_initvals.h` tables and the `ar5008_phy.c` static analog banks;
+`phy/ar5008.rs::tables` selects them as `ar9002_hw_init_mode_regs` does
+(AR9160: `ar5416Modes_9160`, `ar5416Common_9160`, `ar5416Addac_9160_1_1` on
+rev 1 else `ar5416Addac_9160`, `ar5416Bank6TPC_9100`; AR5416: `ar5416Modes`,
+`ar5416Common`, `ar5416Addac` with the CLKDRV row 31 zeroed below 2.2,
+`ar5416Bank6TPC`; both `ar5416BB_RfGain`). `phy/ar5008.rs::prepare` follows
+`ath9k_hw_reset` with PHY, interrupts and RX disabled: the PLL
+(`ar9160_hw_compute_pll_control` REFDIV 5 / DIV 0x58 or 0x50,
+`ar5008_hw_compute_pll_control` REFDIV_5 | DIV2 | 0xb or 0xa), then
+`ar5008_hw_process_ini`: analog shift, ADDAC through
+`ath9k_hw_def_set_addac` (AR9160, minor >= 7: `xpaBiasLvl` or the
+`xpaBiasLvlFreq` bin into row 7 (2 GHz) / row 6 (5 GHz); `phy::ar5008::Addac`
+is the device-lifetime `iniAddac` copy, so a band change keeps the other
+band's patch exactly as Linux's in-place edit does), modes column 1/4,
+common, `BB_RfGain` column 1/2, `ar5008_hw_override_ini` (no MISC_MODE2,
+BB clock gating off at `0x9e2c`, AR9160 `AR_PHY_RIFS_INIT_DELAY` cleared),
+`ar5008_hw_set_channel_regs` (HT20 `AR_PHY_TURBO` 0x3c0, `AR_2040_MODE` 0),
+`ar5008_hw_init_chain_masks` (masks 1/2/3/5/7 program RX/CAL; 0x5 sets
+`AR_PHY_SWAP_ALT_CHAIN`) and `ar5008_hw_set_rf_regs` (Bank 6 from the INI
+column with minor >= 2 OB/DB swizzled by `ar5008_hw_phy_modify_rx_buffer`
+at bits 197/194 or 203/200; banks 0, 1, 2, 3, 6, 7). Then
+`ar5008_hw_set_rfmode` (2 GHz DYNAMIC | RF2GHZ, 5 GHz OFDM | RF5GHZ; no fast
+clock on these parts), delta slope, `ar5008_hw_spur_mitigate` (first
+`spurChans` entry within +-9.5 MHz, 440/400 denominators, the shared
+`ar5008_hw_cmn_spur_mitigate` masks), the non-AR9280
+`ath9k_hw_def_set_board_values` (all three chains, `regChainOffset` swap for
+mask 0x5, `BSW_MARGIN`/`BSW_ATTEN`, `RXGAIN_TXRX_ATTEN`, `RXTX_MARGIN`, PGA
+size, AR5416 `THRESH62` fields) and `ar5008_hw_set_channel`: the CCK Japan
+bit, AR5416's `ar5008_hw_force_bias` Bank 6 rewrite on 2.4 GHz and the
+`AR_PHY(0x37)` AR2133/AR5133 synthesizer word (AR9160 refsel 2 for 10 MHz
+centers). `ath9k_hw_apply_txpower` is the separate power plan. Open-loop
+maps, bands the map's `opCapFlags` do not enable and device/silicon
+mismatches are refused before any write. Smokes (written, not executed):
+`smoke_ath9k_ar5008_ini_follows_linux_revision_tables` (FNV-1a oracles over
+the 534/538 selected Linux rows),
+`smoke_ath9k_ar5008_rf_banks_synth_and_force_bias`,
+`smoke_ath9k_ar5008_board_values_three_chain_swap`,
+`smoke_ath9k_ar9160_addac_bias_persists_across_bands`,
+`smoke_ath9k_ar5008_preparation_refuses_wrong_inputs`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

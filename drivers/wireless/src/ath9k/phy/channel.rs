@@ -23,7 +23,11 @@ use crate::ath9k::{
     EEPROM_4K_BYTES,
 };
 
-fn write(io: &mut impl RegisterIo, register: u64, value: u32) -> Result<(), BringUpError> {
+pub(super) fn write(
+    io: &mut impl RegisterIo,
+    register: u64,
+    value: u32,
+) -> Result<(), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -33,7 +37,7 @@ fn write(io: &mut impl RegisterIo, register: u64, value: u32) -> Result<(), Brin
     }
     Ok(())
 }
-fn field(
+pub(super) fn field(
     io: &mut impl RegisterIo,
     register: u64,
     mask: u32,
@@ -42,7 +46,7 @@ fn field(
 ) -> Result<(), BringUpError> {
     rmw(io, register, mask, (value << shift) & mask)
 }
-fn slope(coefficient: u32) -> (u32, u32) {
+pub(super) fn slope(coefficient: u32) -> (u32, u32) {
     // ath9k_hw_get_delta_slope_vals, COEF_SCALE_S=24. Admitted 2GHz
     // full-rate coefficients keep every shift within the native u32 range.
     let highest = 31 - coefficient.leading_zeros();
@@ -50,7 +54,9 @@ fn slope(coefficient: u32) -> (u32, u32) {
     let mantissa = coefficient + (1 << (24 - exponent - 1));
     (mantissa >> (24 - exponent), exponent - 16)
 }
-fn masks(io: &mut impl RegisterIo, bin: i32) -> Result<(), BringUpError> {
+/// `ar5008_phy.c::ar5008_hw_cmn_spur_mitigate` (shared by the AR5008 and
+/// AR9002 spur paths).
+pub(super) fn masks(io: &mut impl RegisterIo, bin: i32) -> Result<(), BringUpError> {
     let mut current = -6000;
     for (pilot, channel, increment) in [
         (0x9980, 0x9998, 0),

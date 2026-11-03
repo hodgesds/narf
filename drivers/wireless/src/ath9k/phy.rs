@@ -256,6 +256,7 @@ pub(super) fn program_live_power_at(
     }
 }
 
+pub(in crate::ath9k) mod ar5008;
 pub(in crate::ath9k) mod ar9280;
 pub(in crate::ath9k) mod ar9287;
 mod channel;
