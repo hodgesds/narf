@@ -2086,6 +2086,29 @@ skip. The release production boot and both btrfs postflights also pass. The
 debug group pass is deferred to the end of this integration wave. None of this
 has run on physical Intel hardware.
 
+### Display-14 PSR inputs, VBT gate and off-path FBC carve — release gates recorded
+
+Display-14 PSR1 can now enable on hardware. The watermark code publishes the
+Pipe-A `wm_level_disabled` input for Wa_14015648006, and PSR applies it before
+and after plane updates as Linux does. Real behaviour changes:
+- PSR now needs a VBT that enables it, as in Linux, and takes its wake times
+  and idle frames from that VBT. With no VBT, PSR stays off. This replaces the
+  earlier safest-parameters fallback.
+- The FBC stolen-memory carve now runs as a spawned job that scans the GGTT
+  aperture in chunks and yields between them. A flip only checks whether the
+  job has finished, so it no longer stalls the first flip.
+- The BIOS GSC carve-out is applied only when the media GT version takes
+  Wa_14019821291 (13.00, 13.01 or 20.00), as Linux does.
+The SAGV fixture now pins Linux's one-QGV-point case, and zero points stays a
+documented NARF policy.
+
+All eight release groups pass 2,093 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Known limitation: PSR is refused while any external pipe
+is lit. The external-route pipe join must revisit that. None of this has run on
+physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

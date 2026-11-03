@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.46** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.47** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -37,8 +37,8 @@
 > DP/HDMI outputs with Type-C ownership, owned hotplug, DC_off join,
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
-> VCS/VECS scheduling and native Xe gt_id 1 pass release native model
-> gates — see §20).
+> VCS/VECS scheduling and native Xe gt_id 1, and display-14 PSR on
+> hardware inputs pass release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -4376,7 +4376,7 @@ report SAGV as enabled and fail every SAGV-capable state in
 `mtl_find_qgv_points`; NARF keeps SAGV masked, which can cost power but
 never refuses a display configuration.
 
-Fixtures, not executed in this slice. New in `drivers/gpu/intel_gpu_xelpg_wm`:
+Fixtures. New in `drivers/gpu/intel_gpu_xelpg_wm`:
 `smoke_xelpg_wm_level_disabled_follows_skl_wm_check_vblank`,
 `smoke_xelpg_wm_check_vblank_returns_its_level_decision`,
 `smoke_xelpg_wm_profile_value_matches_transaction_vblank_check` and
@@ -4398,6 +4398,19 @@ production `Device`/`Guard` path
 `smoke_fbc_kms_present_only_polls_carve_and_activates_after_it`. The
 existing PSR fixtures now pass a VBT that enables PSR with 2500 µs wake
 times, so their expected `PSR_CTL` values are unchanged.
+
+Integration: all eight release groups pass 2,093 unique tests with no failures
+and no Intel skips; the only skip is the existing shared RNG-registration skip.
+Group 7 now also selects `drivers/gpu/intel_gpu_xelpg_wm`. Every new fixture
+passes, including the production `Device`/`Guard` PSR conversations and the
+LP5 = 0 `owned_resources` fixture. The carve job reads only GT-side registers:
+the GGTT PTE array, GGC, STOLEN_RESERVED, the media GMD_ID and GSCPSMI_BASE,
+and PCI config. It holds the KMS mutex per chunk with no DC_off reference,
+yields between chunks and places outside the mutex. Lost access abandons the
+slot, and the next present relaunches it. Known limitation: PSR refuses while
+any external pipe is lit, because `Profile::capture` requires pipes B–D off;
+the external-route pipe join must revisit this. The debug group pass is
+deferred to the end of the current integration wave.
 `smoke_xelpg_wm_latency_adjust_read_and_sagv_block` now uses one QGV point
 and keeps zero points as the policy case.
 
