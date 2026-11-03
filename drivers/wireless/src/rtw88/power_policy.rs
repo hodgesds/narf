@@ -623,6 +623,21 @@ impl Gate {
             Scope::C21(g) => g.group_limits(group),
         }
     }
+    /// C21 cross-band `rtw8821c_set_channel` facts (None on C22).
+    pub(super) fn band_facts(&self) -> Option<super::radio8821c::BandFacts> {
+        match &self.scope {
+            Scope::C21(g) => Some(g.band_facts()),
+            Scope::C22 { .. } => None,
+        }
+    }
+    /// C22 5GHz OFDM references and difference words of the bound 5GHz
+    /// N2xO record.
+    pub(super) fn ofdm5(&self) -> Option<([u8; 2], [u32; 2])> {
+        let g = self.channel.as_ref()?;
+        super::channel_policy::Record::decode(self.did(), g.payload())
+            .filter(|r| self.did() == 0xc822 && r.band5())
+            .map(|r| (r.ofdm, r.diffs))
+    }
     /// Factory 5GHz OFDM index ceilings for one 5GHz channel group: C22
     /// per path, C21 path A in both slots.
     pub(super) fn band5_limits(&self, group: usize) -> Option<[u8; 2]> {

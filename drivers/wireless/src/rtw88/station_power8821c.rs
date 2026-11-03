@@ -130,6 +130,9 @@ impl Grant {
     pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
         self.power.ht40_group(group)
     }
+    pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
+        self.power.band_facts()
+    }
     /// Factory OFDM index ceiling for one 5GHz channel group.
     pub(super) fn band5_group(&self, group: usize) -> Option<u8> {
         self.power.band5_group(group)

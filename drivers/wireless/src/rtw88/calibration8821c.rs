@@ -34,6 +34,10 @@ pub(super) struct Board {
     mac: [u8; 6],
     thermal: u8,
     hardware: Features,
+    /// Cross-band `rtw8821c_set_channel` facts (`ch_param` CCK filters,
+    /// `rfe_btg`, raw factory swing bytes); covered by the identity through
+    /// the factory map and the hashed filters.
+    band: super::radio8821c::BandFacts,
 }
 impl Board {
     pub(super) fn new(
@@ -82,6 +86,12 @@ impl Board {
             mac: factory.mac(),
             thermal: factory.thermal(),
             hardware,
+            band: super::radio8821c::BandFacts {
+                filters: phy.channel_filters,
+                btg: matches!(phy.rfe, 2 | 4),
+                swing_2g: factory.swing_2g(),
+                swing_5g: factory.swing_5g(),
+            },
         })
     }
     pub(super) fn request(self) -> Request {
@@ -163,6 +173,9 @@ fn signed(raw: &[u8], at: usize) -> i16 {
 impl Envelope {
     pub(super) fn hardware(&self) -> Features {
         self.board.hardware
+    }
+    pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
+        self.board.band
     }
     fn decode(
         raw: &[u8],

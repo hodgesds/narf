@@ -633,3 +633,31 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_band5_base_rate_rrsr_and_ofdm_reference
 );
+
+fn smoke_rtw8821ce_channel5_ofdm_txagc_and_rrsr() -> TestResult {
+    // C21 5GHz retune tail: OFDM TXAGC with CCK zero, RRSR_INIT_5G & mask(6M).
+    let indices = [0, 0, 0, 0, 28, 28, 28, 28, 26, 26, 26, 26];
+    let mut io = RadioIo::new();
+    let run = (|| {
+        radio8821c::write_txagc(&mut io, indices)?;
+        io.write32(0x440, radio::RRSR_OFDM6_5G)?;
+        io.write32(0x1bf0, 0)
+    })();
+    if radio::RRSR_OFDM6_5G != 0x10
+        || run.is_err()
+        || radio8821c::verify_txagc(&mut io, indices, 0x10).is_err()
+        || radio8821c::verify_txagc(&mut io, indices, 0x1f).is_ok()
+    {
+        return TestResult::Fail("C21 5GHz TXAGC/RRSR readback differs");
+    }
+    let mut other = indices;
+    other[4] = 27;
+    if radio8821c::verify_txagc(&mut io, other, 0x10).is_ok() {
+        return TestResult::Fail("C21 TXAGC readback accepted another selection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw8821ce_channel5_ofdm_txagc_and_rrsr
+);

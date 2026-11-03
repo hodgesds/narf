@@ -2554,9 +2554,22 @@ DESC_RATE1M); `response_mask` masks with `RRSR_INIT_5G` (0x150) instead of
 REG_RRSR 0x10. Written, unexecuted:
 `smoke_rtw88_band5_base_rate_rrsr_and_ofdm_reference`.
 
-Remaining for the row: gate/retune/scan/
-CSA wiring, 5GHz HT, and regulatory admission (DFS rules stay refused: no
-shared beacon-hint/DFS owner has landed).
+Gate/retune wiring: `channel_policy::program` dispatches a 5GHz primary to
+`program5`: C22 `radio::channel5_to` + `radio::ofdm5` (IQK via the shared
+firmware path, references reprogrammed after it) with `verify_channel5` /
+`verify_ofdm5`; C21 `radio8821c::set_channel20` over `Gate::band_facts`
+(the N21 calibration board now carries `BandFacts`: hashed `ch_param`
+filters, `rfe_btg`, raw factory swing bytes 0xc6/0xc7), OFDM-only TXAGC
+and REG_RRSR 0x10, checked by `verify_channel20` + `verify_txagc`. A C21
+2.4GHz retune that finds CCK_CHECK bit7 set (a 5GHz program preceded it)
+runs the full cross-band `set_channel20` and restores RRSR 0x1f.
+`PacketCore::set_operating_channel` resets DATA to the band's base profile
+(`LEGACY5`/`LEGACY`) when the band changes. Written, unexecuted:
+`smoke_rtw8821ce_channel5_ofdm_txagc_and_rrsr`.
+
+Remaining for the row: station scan/association/BSS cache/CSA on 5GHz,
+5GHz HT, and DFS (DFS rules stay refused: no shared beacon-hint/DFS owner
+has landed).
 
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station

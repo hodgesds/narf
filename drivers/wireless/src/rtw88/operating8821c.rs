@@ -205,6 +205,9 @@ impl Envelope {
     pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
         self.ht40_groups.get(group).copied().flatten()
     }
+    pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
+        self.calibration.band_facts()
+    }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         Some(super::ht::Facts {
             hardware: self.calibration.hardware(),

@@ -516,6 +516,9 @@ async fn wait_h2c(io: &mut impl Io) -> Result<(), Error> {
 /// retunes skip it like `RTW_FLAG_SCANNING`.
 pub(super) async fn program(io: &mut impl Io, gate: &Gate, rfk: bool) -> Result<(), Error> {
     let channel = gate.channel();
+    if super::band5::primary(channel) {
+        return program5(io, gate, channel, rfk).await;
+    }
     group(channel).ok_or(Error::Unsupported)?;
     match gate.did() {
         0xc822 => {
@@ -529,12 +532,61 @@ pub(super) async fn program(io: &mut impl Io, gate: &Gate, rfk: bool) -> Result<
         }
         0xc821 => {
             let indices = gate.c21_indices().ok_or(Error::State)?;
-            super::radio8821c::retune_channel(io, channel).await?;
+            // `rtw_set_channel_mac` sets CCK_CHECK bit7 only on 5GHz: coming
+            // back from a 5GHz primary needs the full cross-band program and
+            // the 2.4GHz RRSR; within 2.4GHz only `_rf` changes.
+            let cross = io.read8(0x454)? & 0x80 != 0;
+            if cross {
+                let facts = gate.band_facts().ok_or(Error::State)?;
+                super::radio8821c::set_channel20(io, channel, &facts).await?;
+                super::radio8821c::verify_channel20(io, channel, &facts)?;
+                io.write32(0x440, 0x1f)?;
+            } else {
+                super::radio8821c::retune_channel(io, channel).await?;
+            }
             super::radio8821c::write_txagc(io, indices)?;
             if rfk {
                 iqk8821c(io).await?;
             }
             super::radio8821c::verify_retune(io, channel, indices)
+        }
+        _ => Err(Error::Unsupported),
+    }
+}
+
+/// 5GHz/20MHz primary of a bound 5GHz N2xO record. C22:
+/// `rtw8822c_set_channel` 5GHz (`radio::channel5_to`) then the record's
+/// OFDM references/differences (`radio::ofdm5`); C21: `rtw8821c_set_channel`
+/// 20MHz over the gate's [`super::radio8821c::BandFacts`] then the record's
+/// OFDM TXAGC (CCK zero) and REG_RRSR `RRSR_INIT_5G & mask(6M)`. RF
+/// calibration is the same firmware IQK as on 2.4GHz.
+async fn program5(io: &mut impl Io, gate: &Gate, channel: u8, rfk: bool) -> Result<(), Error> {
+    match gate.did() {
+        0xc822 => {
+            let (ofdm, diffs) = gate.ofdm5().ok_or(Error::State)?;
+            super::radio::channel5_to(io, channel).await?;
+            super::radio::ofdm5(io, ofdm, diffs)?;
+            if rfk {
+                iqk8822c_run(io).await?;
+                super::radio::ofdm5(io, ofdm, diffs)?;
+            }
+            super::radio::verify_channel5(io, channel)?;
+            super::radio::verify_ofdm5(io, ofdm, diffs)
+        }
+        0xc821 => {
+            let facts = gate.band_facts().ok_or(Error::State)?;
+            let indices = gate.c21_indices().ok_or(Error::State)?;
+            if indices[..4] != [0; 4] {
+                return Err(Error::State);
+            }
+            super::radio8821c::set_channel20(io, channel, &facts).await?;
+            super::radio8821c::write_txagc(io, indices)?;
+            io.write32(0x440, super::radio::RRSR_OFDM6_5G)?;
+            if rfk {
+                iqk8821c(io).await?;
+            }
+            super::radio8821c::verify_channel20(io, channel, &facts)?;
+            super::radio8821c::verify_txagc(io, indices, super::radio::RRSR_OFDM6_5G)
         }
         _ => Err(Error::Unsupported),
     }
@@ -558,6 +610,13 @@ fn dpd_off(io: &mut impl Io) -> Result<(), Error> {
 /// it could time out on silicon. The stale-level risk is bounded by the
 /// RF18/SCOTRK/TXDFIR/gain/RRSR readbacks that follow.
 pub(super) async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
+    iqk8822c_run(io).await?;
+    super::radio::gains(io, gains)
+}
+
+/// [`iqk8822c`] without the TX power restore; the caller reprograms its
+/// band's references.
+async fn iqk8822c_run(io: &mut impl Io) -> Result<(), Error> {
     dpd_off(io)?;
     super::radio::rfk_power(io, true)?;
     io.station_retune_iqk()?;
@@ -581,8 +640,7 @@ pub(super) async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Err
     }
     io.write8(0x1b10, 0)?;
     super::radio::rfk_power(io, false)?;
-    dpd_off(io)?;
-    super::radio::gains(io, gains)
+    dpd_off(io)
 }
 
 fn verify8822c(io: &mut impl Io, channel: u8, gains: [u8; 2]) -> Result<(), Error> {

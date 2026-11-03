@@ -485,6 +485,11 @@ pub(super) fn verify_retune(io: &mut impl Io, ch: u8, indices: [u8; 12]) -> Resu
     if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20) {
         return Err(Error::Prerequisite);
     }
+    verify_txagc(io, indices, 0x1f)
+}
+/// TXAGC words of [`write_txagc`], REG_RRSR `rrsr` and the clean IQK
+/// report (0x1bf0).
+pub(super) fn verify_txagc(io: &mut impl Io, indices: [u8; 12], rrsr: u32) -> Result<(), Error> {
     for (slot, reg) in TXAGC.into_iter().enumerate() {
         let expected = if slot < 3 {
             u32::from_le_bytes(
@@ -499,7 +504,7 @@ pub(super) fn verify_retune(io: &mut impl Io, ch: u8, indices: [u8; 12]) -> Resu
             return Err(Error::Prerequisite);
         }
     }
-    if read(io, 0x440)? != 0x1f || read(io, 0x1bf0)? & 0x100ff != 0 {
+    if read(io, 0x440)? != rrsr || read(io, 0x1bf0)? & 0x100ff != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())

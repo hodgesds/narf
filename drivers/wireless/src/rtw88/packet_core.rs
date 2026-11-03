@@ -339,8 +339,20 @@ impl Core {
     pub(super) fn set_operating_width(&mut self, width: u8) {
         self.operating_width = width;
     }
+    /// Commit the operating primary. Crossing bands resets DATA to that
+    /// band's base profile (`hal.current_band_type` selects CCK1 or OFDM6
+    /// in `rtw_tx_pkt_info_update_rate`); retunes run only on base-only
+    /// gates, and association reconfigures the profile afterwards.
     pub(super) fn set_operating_channel(&mut self, channel: u8) {
         self.operating_channel = channel;
+        let band5 = super::band5::primary(channel);
+        if self.data_profile.band5 != band5 {
+            self.data_profile = if band5 {
+                format::DataProfile::LEGACY5
+            } else {
+                format::DataProfile::LEGACY
+            };
+        }
     }
     pub(super) fn set_scan(&mut self, address: Option<[u8; 6]>) -> Result<(), Error> {
         if address.is_some_and(|a| a == [0; 6] || a[0] & 1 != 0 || a == self.own)

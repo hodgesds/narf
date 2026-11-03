@@ -70,6 +70,10 @@ impl Factory8821c {
     pub fn swing_2g(&self) -> u8 {
         self.logical[0xc6]
     }
+    /// `rtw8821c_efuse::tx_bb_swing_setting_5g` (map 0xc7), raw.
+    pub fn swing_5g(&self) -> u8 {
+        self.logical[0xc7]
+    }
     pub fn board_option(&self) -> u8 {
         self.logical[0xc1]
     }
