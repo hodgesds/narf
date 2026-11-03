@@ -2721,7 +2721,44 @@ unchanged with these 5GHz differences:
   variant), `W5_DATA_BW` 1 and RA_INFO `BW_MODE` 1 as on 2.4GHz.
 
 `radio::wide5_to`/`radio8821c::wide5` also carry the BW80 branch for
-`vht`. Written, unexecuted:
+`vht`.
+
+**5GHz VHT80 record and program (`N2xV`, `vht.rs`) — not bound.** Partial
+`vht` groundwork; no VHT capability is advertised. Separately signed
+continuation `rtw88/rtw882{1,2}ce-chNN-vht80-v1-<mac>.bin` (tag `V`, stem
+`vht80`) over the primary's band-5 N2xL scope. Payload: primary, center
+(`band5::center80`: Annex E class 128 blocks 42/58/106/122/138/155;
+165..177 not admitted), width 80, flags (bit0 SGI80), antenna gain,
+ceiling, three 80MHz peaks, streams (C22 1..=2, C21 1), highest VHT MCS
+7..=9, VHT80 TXAGC indices 1SS MCS0..9 and 2SS MCS0..9 (zero when unused;
+C22 within the 7-bit signed difference of the VHT1SS MCS7 reference),
+zero tail. Sub-channel `band5::sc80` = `rtw_update_channel` UPPER 1 /
+LOWER 2 / UPMOST 3 / LOWEST 4. `vht::hardware_allows`: `hw_cap.bw` 0 or 7.
+Factory (`Gate::vht80_limits(center)`): `rtw_phy_get_5g_tx_power_index`
+BW80 = `band5::Power5g::bw80` (average of `bw40_base[g]` and `[g+1]` of
+the center's group plus `vht_1s_diff.bw80` (+ `vht_2s_diff.bw80`); C22
+`Board::vht80_groups` min over both paths, factor 2; C21 path A, factor 1,
+max 0x3f). Regulatory (`vht::admission`): one rule covers center +/- 40MHz,
+every overlapping rule plain or passive at 80MHz, a passive span needs all
+four constituents passive-only. Program (`vht::program`): C22
+`radio::wide5_to(center, Eighty(sc))` (BW80 tail TXBWCTL 0xa/sc, SBD 6,
+PT_OPT 1; CCKSB/NBI/DFIRBW/TXCLK untouched as in Linux; DATA_SC
+`sc | txsc40 << 4` with `RTW_SC_40_UPPER` 9 for sc 1/3 else 10; RFMOD 80;
+RF18 bit12, RXBB 0x8), N2xO OFDM power around `iqk8822c_run`, difference
+words 0x3a00..0x3a3c with OFDM at the N2xO selection and VHT bytes
+0x2c..0x3f from the record (HT bytes at index 0: `rtw_update_sta_info`
+builds a VHT-only HT/VHT ra_mask); C21 `radio8821c::wide5(center,
+Eighty(sc))` (ADCCLK `&0xfcffcf00 | 0x40040000 | sc<<2 | 2`, RF18 bit10,
+`_rxdfir` BW80 ACBBRXFIR 1 / TXDFIR 0 / CHFIR 1), IQK, VHT words
+0x1d2c..0x1d34; readbacks `verify_wide5` + `vht::check_power`; RRSR 0x10.
+Remaining for `vht`: station binding/widening at 80MHz (`station.rs`,
+`Gate::with_continuation`, VHT operation parsing, witness of all four
+constituents via `Station::wide_witnessed`), `rtw_init_vht_cap` in the
+association PHY, RA_INFO VHT rate id (`ARFR1_AC_1SS` 10 / `ARFR0_AC_2SS`
+9) and mask, BW_MODE 2, TX descriptor VHT rate/BW 2/SGI, PHY-status 80MHz
+RXSC, C21 HT/VHT readback at 80MHz (`operating_readback_rf18` expects the
+VHT words zero). Written, unexecuted:
+`smoke_rtw88_vht80_record_span_and_bw80_program`. Written, unexecuted:
 `smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span`. No 5GHz N2xB
 record is provisioned for any board.
 

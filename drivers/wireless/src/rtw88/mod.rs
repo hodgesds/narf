@@ -72,6 +72,7 @@ mod hardware;
 mod ht;
 mod ht40;
 pub mod operating_reset;
+mod vht;
 pub use operating_reset::{reset_function, Error as OperatingResetError};
 mod rejoin;
 mod runtime_idle;

@@ -429,3 +429,108 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span
 );
+
+fn vht_payload(primary: u8, center: u8, streams: u8) -> [u8; PAYLOAD] {
+    let mut p = [0; PAYLOAD];
+    p[..4].copy_from_slice(&[primary, center, 80, 1]);
+    for (at, v) in [(4, 4i16), (6, 76), (8, 44), (10, 40), (12, 40)] {
+        p[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    p[14] = streams;
+    p[15] = 9;
+    p[16..26].copy_from_slice(&[40, 40, 40, 40, 38, 38, 36, 36, 34, 34]);
+    if streams == 2 {
+        p[26..36].copy_from_slice(&[38; 10]);
+    }
+    p
+}
+
+fn smoke_rtw88_vht80_record_span_and_bw80_program() -> TestResult {
+    use crate::rtw88::{
+        band5::{self, Width},
+        vht,
+    };
+    // rtw_update_channel 80MHz sub-channel indices for block 36..48 (42).
+    if [36, 40, 44, 48].map(|p| band5::sc80(p, 42)) != [4, 2, 1, 3]
+        || band5::center80(157) != Some(155)
+        || band5::center80(165).is_some()
+        || band5::constituents80(58) != [52, 56, 60, 64]
+    {
+        return TestResult::Fail("80MHz block/sub-channel differs from rtw_update_channel");
+    }
+    let Some(r) = vht::Record::decode(0xc822, &vht_payload(44, 42, 2)) else {
+        return TestResult::Fail("valid C22 VHT80 record refused");
+    };
+    if r.sc() != 1 || r.width() != Width::Eighty(1) || !r.sgi {
+        return TestResult::Fail("VHT80 record width/sub-channel wrong");
+    }
+    let mut stray = vht_payload(44, 42, 1);
+    stray[30] = 1; // 2SS index on a one-stream record
+    let mut tail = vht_payload(44, 42, 1);
+    tail[50] = 1;
+    if vht::Record::decode(0xc822, &vht_payload(44, 46, 1)).is_some()
+        || vht::Record::decode(0xc821, &vht_payload(44, 42, 2)).is_some()
+        || vht::Record::decode(0xc822, &stray).is_some()
+        || vht::Record::decode(0xc822, &tail).is_some()
+        || vht::Record::decode(0xc821, &vht_payload(44, 42, 1)).is_none()
+    {
+        return TestResult::Fail("malformed VHT80 record admitted");
+    }
+    if vht::hardware_allows(6) || !vht::hardware_allows(7) {
+        return TestResult::Fail("hw_cap.bw 80MHz decoding differs from hw_bw_cap_to_bitamp");
+    }
+    // 80MHz span of center 58 is 5250..5330MHz: all four halves DFS.
+    let Some(dfs) = vht::Record::decode(0xc822, &vht_payload(52, 58, 1)) else {
+        return TestResult::Fail("valid DFS-band VHT80 record refused");
+    };
+    if vht::admission(&dfs, &domain(5250, 5330, 80, RegFlags::DFS)) != Ok((76, true))
+        || vht::admission(&r, &domain(5170, 5250, 80, RegFlags::empty())) != Ok((76, false))
+        || vht::admission(&r, &domain(5170, 5250, 40, RegFlags::empty())).is_ok()
+        || vht::admission(&dfs, &domain(5250, 5320, 80, RegFlags::DFS)).is_ok()
+    {
+        return TestResult::Fail("VHT80 regulatory span admission wrong");
+    }
+    // rtw8822c_set_channel(42, BW80, SC_20_UPPER).
+    let mut io = RadioIo::reference();
+    if narf_scheduler::block_on(radio::wide5_to(&mut io, 42, Width::Eighty(1))).is_err()
+        || radio::rf_read(&mut io, 0, 0x18).map(|v| v & 0x733ff)
+            != Ok(1 << 16 | 1 << 8 | 1 << 12 | 42)
+        || radio::read(&mut io, 0x9b0).map(|v| v & 0xffcf) != Ok(0x110a)
+        || io.read8(0x483) != Ok(1 | 9 << 4)
+        || radio::read(&mut io, 0x668).map(|v| v & 0x180) != Ok(0x100)
+        || radio::verify_wide5(&mut io, 42, Width::Eighty(1)).is_err()
+        || radio::verify_wide5(&mut io, 42, Width::Eighty(4)).is_ok()
+    {
+        return TestResult::Fail("C22 BW80 BB/MAC/RF differs from Linux");
+    }
+    if narf_scheduler::block_on(radio::wide5_to(&mut io, 46, Width::Eighty(1))).is_ok()
+        || narf_scheduler::block_on(radio::wide5_to(&mut io, 42, Width::Eighty(5))).is_ok()
+    {
+        return TestResult::Fail("non-80MHz center or sub-channel programmed");
+    }
+    // VHT TX power words (0x3a2c.. relative to the VHT1SS MCS7 reference).
+    let ofdm = [40, 40, 40, 40, 38, 38, 36, 36];
+    let mut regs = alloc::collections::BTreeMap::new();
+    let mut cio = RadioIo::reference();
+    if vht::write_power(&mut cio, 0xc822, &r, Some(ofdm)).is_err() {
+        return TestResult::Fail("C22 VHT80 power write failed");
+    }
+    for reg in (0x3a00u16..0x3a40).step_by(4).chain([0x18e8, 0x41e8]) {
+        regs.insert(reg, radio::read(&mut cio, reg).unwrap_or(0));
+    }
+    let mut read = |r: u16| Ok(regs.get(&r).copied().unwrap_or(0));
+    if vht::check_power(&mut read, 0xc822, &r, Some(ofdm)).is_err()
+        || regs.get(&0x3a2c) != Some(&0x0404_0404)
+        || regs.get(&0x3a3c) != Some(&0x0202_0202)
+        || vht::check_power(&mut read, 0xc822, &r, Some([0; 8])).is_ok()
+    {
+        return TestResult::Fail(
+            "C22 VHT80 difference words differ from rtw8822c_set_tx_power_diff",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_vht80_record_span_and_bw80_program
+);

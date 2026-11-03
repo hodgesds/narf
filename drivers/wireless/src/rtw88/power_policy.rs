@@ -45,6 +45,9 @@ pub(super) struct Board {
     /// HT40 one-/two-stream factory ceilings per 5GHz channel group
     /// (`band5::Power5g::bw40`, txgi factor 2), min over both paths.
     ht40_5_groups: [Option<(u8, Option<u8>)>; 14],
+    /// VHT80 one-/two-stream factory ceilings per 5GHz group of an 80MHz
+    /// center (`band5::Power5g::bw80`, txgi factor 2), min over both paths.
+    vht80_groups: [Option<(u8, Option<u8>)>; 14],
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -166,6 +169,16 @@ impl Board {
                     .map(|(a, b)| a.min(b)),
             ))
         });
+        let vht80_groups = core::array::from_fn(|group| {
+            let path = |path: u8| super::band5::Power5g::parse(factory.power_path(path)?);
+            let (a, b) = (path(0)?, path(1)?);
+            Some((
+                a.bw80(group, false, 2)?.min(b.bw80(group, false, 2)?),
+                a.bw80(group, true, 2)
+                    .zip(b.bw80(group, true, 2))
+                    .map(|(a, b)| a.min(b)),
+            ))
+        });
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
@@ -174,6 +187,7 @@ impl Board {
             band5_groups,
             ht5_groups,
             ht40_5_groups,
+            vht80_groups,
             ht_groups,
             ht40_groups,
             ht: factory
@@ -716,6 +730,21 @@ impl Gate {
                 .copied()
                 .flatten(),
             Scope::C21(g) => g.ht40_5_group(group).map(|m| (m, None)),
+        }
+    }
+    /// Factory VHT80 `(1S, 2S)` index ceilings for an 80MHz `center`
+    /// (`rtw_phy_get_5g_tx_power_index` BW80 over the center's 5GHz group;
+    /// C21 path A, factor 1).
+    pub(super) fn vht80_limits(&self, center: u8) -> Option<(u8, Option<u8>)> {
+        if !super::band5::is_center80(center) {
+            return None;
+        }
+        let group = super::band5::group(center)?;
+        match &self.scope {
+            Scope::C22 { calibration, .. } => {
+                calibration.board.vht80_groups.get(group).copied().flatten()
+            }
+            Scope::C21(g) => g.vht80_group(group).map(|m| (m, None)),
         }
     }
     /// C22 5GHz OFDM6..54 both-path selection of the bound 5GHz N2xO

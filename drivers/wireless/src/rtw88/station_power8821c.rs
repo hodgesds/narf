@@ -130,6 +130,10 @@ impl Grant {
     pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
         self.power.ht40_group(group)
     }
+    /// Factory VHT80 1S index ceiling for one 5GHz channel group.
+    pub(super) fn vht80_group(&self, group: usize) -> Option<u8> {
+        self.power.vht80_group(group)
+    }
     /// Factory 5GHz HT40 1S index ceiling for one 5GHz channel group.
     pub(super) fn ht40_5_group(&self, group: usize) -> Option<u8> {
         self.power.ht40_5_group(group)
