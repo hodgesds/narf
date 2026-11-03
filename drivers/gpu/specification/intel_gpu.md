@@ -2400,7 +2400,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification. Protected queues stay unadvertised: PXP_TYPE, the PXP status query and BO PXP_TYPE now refuse with Linux's no-PXP errnos (HWDRM ENODEV, NONE accepted); PXP needs the GSC proxy's MEI/CSME client, which NARF lacks. GSCCS0 is now a kernel-only (reserved) engine of the MTL/Arrow media GuC under both media and GSC options, never queryable or placeable |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. The MEI GSC proxy client, PXP, GT1 frequency/idle sysfs and silicon acceptance remain |
-| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; OAR/OAC exec-queue streams, OA syncs, OA mmap, sysfs metrics, media-GT OAM, full devcoredump sections and remaining i915 perf interfaces remain |
+| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap checks (mapping itself ENODEV pending a private device-PFN syscall path), `metrics/<uuid>/id` and `dev.xe.observation_paranoid` implemented; OAR/OAC exec-queue streams, OA syncs, the OA buffer mapping, media-GT OAM, steered manual capture, coredump process/time facts and remaining i915 perf interfaces remain |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -6065,3 +6065,146 @@ Changed fixtures:
 - `smoke_lnl_eu_stall_raw_query_open_cancel_reopen_and_full_reset_owner`
   expected EPERM for its raw-ioctl denial and for its revocation across the
   attach await. Both now expect EACCES.
+
+### GuC error capture, coredump text sections and OA remainder — native fixtures added
+
+Sources are Linux b90c984d `xe_guc_capture.c`, `xe_guc_capture_types.h`,
+`abi/guc_capture_abi.h`, `abi/guc_log_abi.h`,
+`xe_guc_ads.c::guc_capture_prep_lists`, `xe_hw_engine.c`,
+`xe_guc_submit.c` (exec-queue snapshot and timeout handler),
+`xe_sched_job.c`, `xe_devcoredump.c`, `xe_oa.c` (mmap and sysfs) and
+`xe_observation.c`. The new module is `intel_gpu_error::capture`.
+
+**GuC error-capture lists.** With `narf.intel.devcoredump=1` the runtime
+prepares capture on the primary GuC before scheduling, beside the EU-stall
+and OA reservations. It builds the source lists: the global FORCEWAKE_GT
+list, the XeLP (Gen12) or XeHPG (12.55 and later) render/compute class list,
+the video-enhance SFC_DONE list and the 27-register engine-instance list. The
+steered SAMPLER/ROW INSTDONE extension (plus the four XeHPG SC/GEOM
+registers) is added for each fused DSS, with HWCONFIG's DSS-per-group or the
+source fallback. `guc_capture_prep_lists` lays them out page by page after a
+zero-descriptor page and fills guc_ads capture_instance, capture_class and
+capture_global. Absent classes, empty lists, lists past the worst size and
+the VF owner point at the zero page. NARF puts the lists in their own
+worst-size GGTT object instead of inside the ADS object: 11 pages on XeHPG,
+9 on XeLP. The object is written only during the submission reload while the
+GuC is proven stopped. It is freed with the boot owner after the existing
+reset proofs. The media GuC registers no lists.
+
+**STATE_CAPTURE_NOTIFICATION.** Without registered lists a 0x8002 G2H stays a
+protocol loss, as before. With them, its one status dword is checked
+(NOSPACE is counted), and the GT owner then runs `__guc_capture_process_output`
+over the log's 1 MiB capture region. It reads the type-2 state header,
+replaces untrusted or overflowed pointers with the whole region, and runs
+`guc_capture_extract_reglists`. That covers the group and capture headers,
+dword reassembly across the ring end, skipping unknown capture types, cloning
+global and class lists for dependent engine resets, replacing stale nodes with
+the same GuC id, and clipping register counts. It then publishes the read
+pointer, clears flush-to-file and sends LOG_BUFFER_FILE_FLUSH_COMPLETE (0x30,
+type 2), retrying while the CT is full. NARF bounds:
+
+- Four parsed nodes, against the source's 1536. When none is free the newest
+  unlocked node is reused; that is what the source's reverse walk does,
+  despite its comment.
+- At most 256 capture groups per notification.
+- Current authority is checked for each group. If it ends, the read pointer
+  is not published and no flush-complete is sent.
+
+**Matching and the manual fallback.** A coredump looks for a GuC node by the
+guilty queue's template GuC class, GuC id and LRC GGTT address, as
+`xe_guc_capture_get_matching_and_lock` does. NARF accepts any reported
+instance among the queue's placements, where the source compares only
+q->hwe. The source's node lock becomes a deferred release at the next
+notification, because extraction and the coredump never overlap under the GT
+owner. Without a match, the node taken at the context's timeout is used. That
+read follows `guc_exec_queue_timedout_job`: the first placement's global,
+class and instance lists, read under the existing forcewake proof before the
+schedule disable is sent. Three differences from the source:
+
+- It omits the steered extension, whose unicast reads need MCR steering
+  writes in the failure path.
+- Its guc_id and LRCA stay zero, as the source's do.
+- Because NARF captures the bundle in the same poll as the timeout, a GuC
+  node from a later reset under the disable is not substituted.
+
+**Coredump version 4.** `NARFCDMP` version 4 keeps every earlier offset and
+appends a `NARFXETX` section: a 64-byte header and 32 KiB of text at 0x275380,
+for a total of 0x27d3c0 bytes. Header bit 5 and words 172/176/180 describe it.
+The text follows `__xe_devcoredump_read`:
+
+- The header facts: the reason, PCI ID and revision, GMD_ID IP version (0.0.0
+  on Gen12 and DG2, as gt->info.gmdid) and CS reference clock. These are
+  sampled once at preparation.
+- The guilty queue's `xe_guc_exec_queue_snapshot_print` fields: GuC id, name,
+  class, logical mask, width, the 5000 ms timeout, timeslice, the 500000 us
+  preemption timeout, EXEC_QUEUE_STATE bits implied by NARF's phase, and the
+  KERNEL and LOW_LATENCY flags. Groups add the workqueue descriptor and up to
+  64 entries.
+- The per-lane batch addresses of `xe_sched_job_snapshot_print`.
+- One `xe_engine_snapshot_print` engine block: source, coverage, forcewake
+  domain, registers in descriptor order with 64-bit pairs joined, and the
+  steered registers with their DSS index.
+
+The GuC log, CT, LRC and VM blocks name their binary sections. Snapshot time,
+process, kernel release and Ref are printed as unavailable. "Reserved" is
+always no, since NARF reserves no published engine. The text reads no
+register, allocates nothing and ends with `output_truncated=1` on overflow.
+
+The engine block discloses GGTT and PPGTT addresses (ring start, ACTHD,
+BBADDR, DMA_FADD, HWS_PGA, CURRENT_LRCA, the GuC LRCA), ring offsets, IPEHR's
+instruction header and error and interrupt state. It appears only in the
+CAP_SYSLOG-gated bundle. The public `error` report keeps its redacted
+six-register whitelist. Without the opt-in the ADS, the log and the bundle are
+unchanged apart from the version.
+
+**OA remainder.**
+
+- *mmap.* OA descriptors now apply `xe_oa_mmap`'s checks in order: EACCES
+  without privilege, EINVAL unless the length is the whole buffer, then
+  EINVAL for write, exec, MAP_SHARED or MAP_SHARED_VALIDATE. The offset is not
+  checked, as in the source. The maximum protection is read. A request that
+  passes every check returns ENODEV: NARF's syscall layer maps device frames
+  only for MAP_SHARED, and its private fallback would copy through read(),
+  which consumes reports. The read-only private PFN mapping, with its
+  DONTCOPY and DONTEXPAND rules, needs that layer (outside `drivers/gpu`).
+- *sysfs.* With the OA opt-in, `metrics/` appears under the card node.
+  ADD_CONFIG publishes `<uuid>/id` with the decimal id under the registry
+  lock, and REMOVE_CONFIG removes it. A refused duplicate publishes nothing.
+- *sysctl.* `dev.xe.observation_paranoid` (0644, 0..1, default 1, EINVAL out
+  of range) is registered through the procfs sysctl registry when the first
+  Intel card is published; the source registers it at module load. At 0 every
+  OA and EU-stall privilege gate allows the caller. NARF's per-read authority
+  checks follow the same gate.
+- *Media-GT OAM, PTL and Gen12* are still not published. OAM needs the media
+  GT's OA unit, the OAM register block and a second query-8 unit tied to the
+  standalone media GT owner. PTL and Gen12 OA layouts are not ported.
+
+**i915 perf.** PERF_OPEN, PERF_ADD_CONFIG, PERF_REMOVE_CONFIG, query item 3 and
+GETPARAM 54/57 remain as recorded in the previous subsection.
+
+New fixtures, all unexecuted in this slice:
+
+- `smoke_guc_capture_ads_lists_follow_prep_lists_per_family`
+- `smoke_guc_capture_extracts_groups_matches_and_acknowledges`
+- `smoke_guc_capture_dependent_resets_wrap_overflow_and_reuse`
+- `smoke_guc_capture_manual_fallback_reads_source_lists`
+- `smoke_coredump_xe_text_section_queue_job_engine_and_bounds`
+- `smoke_hardware_guc_capture_ads_g2h_extraction_and_guc_engine_snapshot`
+- `smoke_hardware_guc_capture_timeout_manual_fallback_snapshot`
+- `smoke_hardware_guc_capture_option_off_unchanged`
+- `smoke_oa_mmap_source_checks_and_private_pfn_refusal`
+- `smoke_oa_metrics_sysfs_uuid_id_follows_registry`
+- `smoke_observation_paranoid_sysctl_range_and_gate`
+
+The three hardware fixtures drive the real BMG `GuCGt` through the GuC
+model. The model now answers the capture flush-complete.
+
+Changed fixtures. Each asserted the bundle version 3 or the total 0x275380
+and now asserts version 4 or 0x27d3c0:
+
+- `smoke_coredump_wire_fixed_extents_and_immutable_reads`
+- `smoke_coredump_execution_wire_lrc_ring_scratch_and_immutable_reads`
+- `smoke_coredump_vm_wire_owned_tables_corruption_and_immutable_reads`
+- `smoke_coredump_live_gt_capture_stop_and_authority_loss`
+- `smoke_hardware_coredump_execution_timeout_snapshot_survives_full_reset`
+- `smoke_hardware_vm_dump_retains_closed_user_bo_through_capture_and_full_reset`

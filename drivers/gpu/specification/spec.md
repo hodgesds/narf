@@ -868,7 +868,16 @@ full-reset proofs. NARF limits:
   card holds at most 1024 ids.
 - Current authority is rechecked on every read and control.
 - OA syncs and OAR/OAC exec-queue streams are EOPNOTSUPP.
-- OA mmap, sysfs metrics and the paranoid sysctl are absent.
+- mmap follows `xe_oa_mmap`'s checks: EACCES without privilege, EINVAL
+  unless the length is the whole buffer, and EINVAL for write, exec or
+  MAP_SHARED(_VALIDATE). A mapping that passes them is ENODEV, because the
+  syscall layer has no read-only private device-PFN mapping; the maximum
+  protection is read.
+- With the opt-in, `metrics/<uuid>/id` (the decimal id) appears under the
+  card node with ADD_CONFIG and disappears with REMOVE_CONFIG.
+- `dev.xe.observation_paranoid` (0644, 0..=1, default 1) is registered with
+  the first Intel card. At 0 every OA and EU-stall privilege gate allows the
+  caller, as `xe_observation_paranoid` does.
 
 `intel_gpu_eu_stall::Info` retains the exact `GtPlatform`, card, physical
 32-bit DSS union and steering divisor. This is immutable source policy;
@@ -2210,11 +2219,12 @@ the public sanitized report intact; unarmed destinations are retried at most
 once per second. First published failure wins until explicit acknowledgement.
 
 This is a partial device coredump, not complete Linux devcoredump parity.
-`NARFCDMP` version three contains a 256-byte little-endian header, a zero-padded
+`NARFCDMP` version four contains a 256-byte little-endian header, a zero-padded
 4 KiB sanitized report region, the exact 0x115000-byte GuC log allocation and
 the exact six-page CT allocation at their original version-one offsets.
 The version-two execution region retains its exact original offset and size.
-An appended VM region makes total size 0x275380 bytes. Header fields include
+An appended VM region ends at 0x275380 and a version-four Xe text region makes
+total size 0x27d3c0 bytes. Header fields include
 card, nonwrapping bundle generation, error/copy times, epoch, platform, actual
 firmware release/incarnation/digest, fixed section offsets/lengths and an
 availability mask. Bit3 marks an execution directory; header 144/148 give its
@@ -2280,6 +2290,52 @@ unknown bytes are never represented as complete. Current authority is renewed
 per 4 KiB; loss zeroes the current field and suppresses subsequent source reads.
 The snapshot borrows existing owners under the same GT reset mutex, preserves
 guilty-first order, and changes no fence, claim, binding or retirement state.
+
+Header availability bit 5 and fields 172/176/180 describe the version-four
+`NARFXETX` v1 section at 0x275380 (64-byte header, 32 KiB text). Its header
+records version, header bytes, text capacity, text length and flags at
+8/12/16/20/24; flags are truncated 1, access lost 2, queue facts 4, GuC engine
+registers 8 and manual engine registers 16. The text follows
+`__xe_devcoredump_read` order. The header block names the reason ("Timedout
+job - seqno, lrc_seqno, guc_id, flags" for a timeout or GuC reset), PCI
+ID/revision, GMD_ID IP version (0.0.0 before GMD) and CS reference clock, all
+sampled once at preparation. Snapshot time, process and kernel release are
+unavailable. The Contexts block gives the first guilty context's GuC id,
+name, class, logical mask, width, the 5000 ms timeout, timeslice, the 500000 us
+preemption timeout, EXEC_QUEUE_STATE bits implied by its phase, the KERNEL and
+LOW_LATENCY flags and, for groups, the workqueue descriptor and up to 64
+entries (coherent scratch, current authority). The Job block gives up to eight
+per-lane batch addresses. The HW Engines block is one
+`xe_engine_snapshot_print` snapshot. The GuC log, CT, LRC and VM blocks name
+their binary sections. A text overflow ends with `output_truncated=1`; the text
+reads no register and allocates nothing.
+
+With the opt-in, the primary GuC registers `xe_guc_capture.c` error-capture
+lists (`intel_gpu_error::capture`): COMMON_XELP_BASE_GLOBAL, the per-class lists
+(XeLP or XeHPG render/compute, video-enhance SFC_DONE) with the steered
+SAMPLER/ROW (and XeHPG SC/GEOM) INSTDONE extension per fused DSS, and the
+27-entry engine-instance list. `guc_capture_prep_lists` places them, a
+zero-descriptor page first, in a separate worst-size GGTT object (11 pages on
+12.55+, 9 on Gen12) whose addresses fill guc_ads.capture_{instance,class,
+global}; absent classes and the VF owner point at the zero page. The object is
+written only with the submission reload while GuC is proven stopped, and freed
+with the boot owner. STATE_CAPTURE_NOTIFICATION (0x8002, one status dword)
+is a protocol loss without registered lists. With them, the GT owner parses the
+log's 1 MiB capture region from its state header (read and sampled write
+pointers, overflow counter) under current authority. It follows
+`guc_capture_extract_reglists`: group/capture headers, dword wrap, unknown-type
+skipping, dependent-engine cloning, stale same-guc_id replacement and register
+clipping. It publishes the read pointer and clears flush-to-file, then sends
+LOG_BUFFER_FILE_FLUSH_COMPLETE (0x30, type 2), retried while the CT is full.
+Four preallocated nodes are retained (the source has 1536); with none free, the
+newest unlocked node is reused, as the source's reverse walk does. A coredump
+matches the queue's template GuC class, GuC id and LRC GGTT address, accepting
+any reported instance among its placements, and releases the consumed node at
+the next notification. Without a match, the node taken at the context's
+timeout is used: the global, class and instance lists of the first placement,
+read under the forcewake proof before scheduling is disabled, without the
+steered extension and with guc_id/LRCA zero. Without the opt-in the ADS, log
+and bundle are unchanged apart from the version.
 
 Opening and every read, including empty/EOF reads, require current
 initial-user-namespace CAP_SYSLOG and the boot opt-in. Reads never touch live
