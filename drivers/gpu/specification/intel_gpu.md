@@ -2383,7 +2383,7 @@ production feature. Unsupported functionality remains unadvertised.
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology queries; GSC/HuC firmware formats and HECI packets are modelled but unwired; GSCCS, GSC load, MTL HuC DMA/GuC/GSC authentication and silicon acceptance remain |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GSC HECI packets are modelled but unwired; GSCCS, GSC load, GSC HuC authentication and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; TBT, HDMI FRL, UHBR, a second concurrent external route, KMS flips/cursor on Pipe A while an external is lit, PSR while an external is lit, PSR2 selective fetch and Panel Replay open |
@@ -3722,6 +3722,101 @@ formats only and carries a temporary module-level dead-code allowance outside
 kernel-test builds until a GSC/HuC owner consumes it. The production
 (no-kernel-test) clippy contexts are clean. The debug group pass is deferred to
 the end of the current integration wave.
+
+#### MTL HuC on the media GuC, and GT1's L3 bank entry
+
+The MTL/Arrow HuC is now loaded and authenticated by the media GuC, following
+Linux xe without the GSC. xe_huc.c::xe_huc_init gives the HuC to the primary
+GT only up to graphics 12.55 and to the media GT above it, so the existing
+HuC owner (`intel_gpu_huc`) is parameterized by GuC role rather than copied:
+TGL stays on GT0, and MTL/Arrow uses GT1. The MTL HuC needs both
+`narf.intel.media_gt=1` and `narf.intel.huc=1`. The media GT must exist for it
+to have an owner. Linux makes HuC separately optional through
+huc_firmware_path, while the media GT always runs. Requiring the HuC option
+therefore keeps `media_gt=1` alone exactly as before, with no WOPCM, DMA,
+firmware or query change.
+
+With both options set, the runtime acquires the authorized
+`i915/mtl_huc_gsc.bin`. It parses the GSC CPD headers (or a whole-file CSS)
+and stages the whole file as the HuC object, as uc_fw_copy does. The media
+GuC's WOPCM reserves the CSS header plus uCode below an aligned GuC base and
+sets HUC_LOADING_AGENT_GUC (xe_wopcm.c). The HuC DMA copies from the object's
+GGTT base plus css_offset to WOPCM offset 0 while the GuC is held in reset.
+It runs before the submission GuC load only: xe_uc_load_hw uploads the HuC,
+but xe_guc_min_load_for_hwconfig, the media GuC's minimal first boot, does
+not. TGL keeps its DMA before both of its loads. After the default LRCs and
+the private per-engine jobs, the media CT sends AUTHENTICATE_HUC with the GGTT
+base plus xe_uc_fw_rsa_offset. A zero-result reply and the success bit of
+HUC_KERNEL_LOAD_INFO, read at 0x38c1dc through GT1's GSI window within
+100 ms, make the HuC RUNNING. Linux starts PC before this step; NARF runs no
+SLPC on GT1, so authentication follows directly.
+
+DEVICE_QUERY query7 type1 on MTL/Arrow reports the release of the media GT's
+running HuC: the CSS sw_version, not the HUCP.man version. As in
+xe_query.c::query_uc_fw_version for MEDIA_VER >= 13, GT0 never answers on
+these devices. The query returns ENODEV without a published GT1, before or
+after authentication fails, when the status bit reads clear or lost, and under
+lost access. It is passive and never loads, authenticates or wakes anything.
+
+Every new media GuC repeats the upload, so media-GT recovery and system resume
+both reload the HuC. xe_huc_auth checks the authentication bit before
+requesting, and Linux reports an already-authenticated HuC as RUNNING, because
+on these platforms the HuC survives GuC/GT reset. NARF adopts such a bit only
+when an earlier media GuC of the same owner authenticated this image itself.
+An inherited bit of unknown origin leaves the HuC unavailable. After resume
+the WOPCM and HuC are lost and a fresh authentication runs.
+
+HuC failure never fails GT1, which keeps publishing its engines without HuC.
+Linux also continues when authentication is rejected or the status bit times
+out. Three cases are NARF deviations where Linux fails the GT or the probe:
+- a missing, revoked or malformed image;
+- a HuC object that cannot be staged, after which the runtime starts the media
+  GuC again without HuC;
+- a locked WOPCM that names no HuC loading agent or has no room below its
+  GuC base, so the HuC is never uploaded.
+A HuC DMA that never completes is a uC load failure in Linux too, and it loses
+the media GuC. So does a lost status register or an unresolved CT request. As
+on TGL, a GT without a VCS gets no HuC.
+
+The media HuC object is reclaimed after the media GuC's verified stop (MIA in
+reset, DMA idle): only that DMA and the media GuC's AUTHENTICATE_HUC read it,
+and NARF issues no GSC authentication. TGL keeps its sticky exposure until full
+Gen12 reset. The GSC module is split accordingly. The HuC parts are now
+production and lose the dead-code allowance. The GSC image, its load batch and
+the HECI/MKHI/PXP packets move to `intel_gpu_gsc_heci.rs` and keep it. GSCCS,
+GSC firmware load, Wa_14015076503 and GSC HuC authentication remain out of
+scope, and scheduling still refuses while GSC firmware reports loaded.
+
+GT1's topology now follows Linux for its L3 banks too. xe_gt_topology_init
+runs load_l3_bank_mask on the media GT. xe_gt_topology_report_l3 keeps a media
+GT's entry before media version 30, as part of the existing ABI. GT1's
+MIRROR_FUSE3 and XEHP_FUSE4 are read with its other fuses and expanded by the
+graphics 12.70 rule: each GT_L3_EXC_MASK bit selects a two-bank pair, repeated
+every four bits for each MEML3_EN node. The 8-byte DRM_XE_TOPO_L3_BANK entry
+sits between GT1's compute and EU entries. Mesa reads only gt_id 0, so this
+changes no Mesa result. GT0's entries stay byte-identical; GT0 still reports no
+L3 bank entry, a separate existing gap.
+
+New fixtures register under `intel_gpu_media_gt`:
+- `smoke_media_huc_guc_upload_auth_reload_and_xe_query` covers the WOPCM, DMA,
+  CT and status sequence, the query routing and wire, the verified stop, and
+  recovery adoption and resume re-authentication.
+- `smoke_media_huc_failures_keep_gt1_published` covers rejection, ACK without
+  status (with GT0's bit set as a decoy), an inherited bit and a blocking
+  locked WOPCM. In each case GT1 publishes and a user job retires.
+- `smoke_media_huc_option_staging_refusals_and_lost_status` covers both
+  options' grammar, profiles, image validation, registry refusals, a TGL image
+  on GT1, the unallocatable-HuC fallback, the option-off sequence and a lost
+  status register.
+- `smoke_media_gt_topology_l3_bank_mask_follows_xe_gt_topology` checks the L3
+  rule.
+
+The GT1 topology fixtures now include the L3 entry, and the media-staging
+fixtures pass the new HuC argument. The TGL HuC fixtures are unchanged apart
+from routing an MTL-profile AUTHENTICATE_HUC to the media model. The runtime's
+firmware acquisition, staging fallback and adoption bookkeeping were reviewed
+manually. No fixture was run in this checkpoint, and none is physical Intel,
+Mesa or codec evidence.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 

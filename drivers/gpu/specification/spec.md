@@ -424,9 +424,11 @@ DEVICE_QUERY query7 (UC_FW_VERSION) validates subtype/reserved fields and
 uses an exact 32-byte payload. Type0 retains branch0 and the loaded GuC CSS
 submission-interface compatibility tuple, independently of firmware release.
 Type1 returns branch0 and the actually running HuC CSS release only for the
-opted-in exact TGL owner after the upload/auth/status proof below. It returns
-ENODEV before proof, after failure, during reset/power loss and on every other
-profile. Size-only negotiation touches no payload. The retained reset/D0/wake
+opted-in exact TGL owner (GT0) or, on MTL/Arrow, the opted-in published media
+GT's GuC (GT1, never GT0) after the upload/auth/status proofs below. It
+returns ENODEV before proof, after failure, without a published GT1 on
+MTL/Arrow, during reset/power loss and on every other profile. Size-only
+negotiation touches no payload. The retained reset/D0/wake
 owner answers type1 without loading, authenticating, acquiring a wake or
 resuming firmware; unsupported subtypes retain their existing refusal.
 Engine-cycle queries retain their input engine/clock and destination before
@@ -1118,7 +1120,9 @@ output fd cannot abandon hardware ownership.
 `intel_gpu_user::UserBackend::huc_version` adds an object-safe async
 `FsFuture<'_, (u8, u8, u8)>` hook whose default returns NoDevice. The retained
 physical runtime overrides it under the async reset mutex and current epoch,
-D0, forcewake and live authentication checks. Unqualified backends gain no
+D0, forcewake and live authentication checks. On MTL/Arrow it answers through
+`intel_gpu_gt::media::query_huc` from the published media GuC under GT1's
+epoch, never GT0. Unqualified backends gain no
 positive reply; this hook cannot load, authenticate, wake or resume firmware.
 
 `intel_gpu_user::UserBackend` exposes a live `UserStatus` and async `submit`:
@@ -1260,8 +1264,12 @@ partial allocation failure rolls back. The default three owned allocations
 contain GuC CSS/uCode/RSA, minimal ADS plus firmware-private data, and logs.
 Exact-TGL `stage_with_huc` adds a fourth owned HuC upload/RSA buffer, deriving
 the pre-WOPCM reservation from the authorized image before either DMA pass.
-All four participate in rollback, pairwise/protected extents and cache sync.
-Other profiles retain their original three allocations. Minimal
+`GuCBoot::stage_media` with a HuC (`intel_gpu_huc::Firmware` plus its adopt
+flag) adds the same fourth buffer on the MTL/Arrow media GuC. It holds the
+whole GSC-headered file; the DMA reads from its CSS offset and the RSA
+pointer is the base plus xe_uc_fw_rsa_offset. All four participate in
+rollback, pairwise/protected extents and cache sync. Other profiles retain
+their original three allocations. Minimal
 ADS uses the source-defined 16-class/32-instance layout with invalid mapping
 value 32, zero enabled engines, valid policies and owned private-data pointers.
 The log layout is one state page plus 16-KiB crash, 64-KiB event and 1-MiB
@@ -1292,7 +1300,11 @@ reclamation. The enclosing full Gen12 engine reset and retained media ACK
 retirement, or an explicit unsafe full HuC/media-stop proof, must complete
 before physical release. GuC-only reset/DMA idle is insufficient for HuC and
 does not prove completion/reset of RCS jobs. Newer profiles keep their existing
-mapping-retirement and wake-release ordering.
+mapping-retirement and wake-release ordering. The media GuC's HuC object is
+read only by its DMA and the media GuC's AUTHENTICATE_HUC, so a verified media
+GuC stop reclaims it. On the media GuC the HuC DMA precedes only the
+submission load, a set auth bit never refuses the upload, and a locked WOPCM
+that cannot host the HuC skips it instead of refusing the boot.
 
 `BootAllocator::sync_for_device` is mandatory before DMA. The SharedArena
 adapter cleans every owned CPU cache line through existing architecture
@@ -2533,10 +2545,12 @@ HuC/codec acceptance is separate.
 ### Intel exact-TGL HuC upload and authentication
 
 Default-off `narf.intel.huc=1` enables source-qualified HuC upload/authentication
-only on exact physical Gen12Platform::TigerLake. The retained main-GT worker
+on exact physical Gen12Platform::TigerLake, as described here, and, together
+with `narf.intel.media_gt=1`, on the MTL/Arrow media GT (see the media GT
+opt-in below). On TGL the retained main-GT worker
 acquires the authorized immutable canonical `i915/tgl_huc.bin` before WOPCM
 planning, retains its real upload/RSA backing through both boot passes and full
-shutdown, and uploads HuC before each GuC upload. Unsupported platforms add no
+shutdown, and uploads HuC before each GuC upload. Other platforms add no
 HuC firmware/DMA or positive query. TGL runtime autosuspend remains refused.
 Existing system-sleep/reset hooks close publication before stop and require a
 fresh source upload/auth/status sequence on restart; no live enable transition
@@ -2567,10 +2581,10 @@ joins all cache/sync/protected-allocation intervals. This adds no new generic
 power, frequency, CT, firmware-registry or TCB authority and changes no newer
 platform's mapping-retirement contract.
 
-This implements only exact-TGL HuC upload/auth/query/lifetime software;
-debug and release native model gates pass. Codec command
-admission, i915 HuC-status error ABI, ADL and newer HuC profiles, separate MTL
-media-GT scheduling, GSC/PXP/protected content and physical Intel/media/S3
+This section's exact-TGL HuC upload/auth/query/lifetime software passed the
+debug and release native model gates. Codec command
+admission, i915 HuC-status error ABI, ADL and other HuC profiles beyond TGL and
+the MTL/Arrow media GT, GSC/PXP/protected content and physical Intel/media/S3
 acceptance remain separate. No capability bit or broader engine/performance claim
 follows from these models.
 
@@ -2642,15 +2656,35 @@ verified, and only while GT0's user epoch is live:
 - `DRM_XE_DEVICE_QUERY_GT_TOPOLOGY` appends GT1's entries after GT0's, in
   for_each_gt order. Like Linux (xe_gt_topology_init runs on the media GT),
   probe reads GT1's own GSI-translated XELP_GT_GEOMETRY_DSS_ENABLE,
-  XEHP_GT_COMPUTE_DSS_ENABLE and XELP_EU_ENABLE under GT1 wake, as two equal
-  samples. It reports them as read, empty masks included, with gt_id 1: a
-  geometry and a compute DSS mask and a SIMD8 EU-per-DSS mask (graphics
-  12.7x), using GT0's existing 4-byte DSS and 2-byte EU wire widths and no L3
+  XEHP_GT_COMPUTE_DSS_ENABLE, XELP_EU_ENABLE, MIRROR_FUSE3 and XEHP_FUSE4
+  under GT1 wake, as two equal samples. It reports them as read, empty masks
+  included, with gt_id 1: a geometry and a compute DSS mask, an 8-byte L3 bank
+  mask (DRM_XE_TOPO_L3_BANK, load_l3_bank_mask's graphics 12.70 rule; Linux
+  reports it for media GTs before media version 30) and a SIMD8 EU-per-DSS
+  mask (graphics 12.7x), in that order, using GT0's existing 4-byte DSS and
+  2-byte EU wire widths. GT0's entries are unchanged and still carry no L3
   bank entry. Reserved EU bits refuse the media GT as unavailable.
 
 Without the option, or before publication, the GT list, engine, engine-cycles
 and topology queries and queue creation are exactly GT0-only as before, and
-gt_id 1 is EINVAL. HuC (GSC-loaded on MTL) stays unadvertised.
+gt_id 1 is EINVAL.
+
+With `narf.intel.huc=1` as well, the media GuC owns the MTL HuC
+(xe_huc.c::xe_huc_init: HuC lives on the media GT above graphics 12.55). The
+runtime acquires the authorized `i915/mtl_huc_gsc.bin` and stages the whole
+file. The media WOPCM reserves its CSS header plus uCode and names GuC the
+HuC loading agent. Before the submission GuC load only, the HuC DMA copies
+from the object's GGTT base plus the CSS offset. After the default LRCs and
+private jobs, AUTHENTICATE_HUC on the media CT and the HUC_KERNEL_LOAD_INFO
+bit at 0x38c1dc (within 100 ms) make it RUNNING. Query7 type1 then reports its
+CSS release, and only while GT1 is published. A pre-set bit is adopted only
+when an earlier media GuC of this owner authenticated the image; otherwise
+the HuC stays unavailable. Rejection, status timeout, an unusable image, an
+unstageable object and a locked WOPCM unable to host the HuC all leave GT1
+published without HuC. A stuck HuC DMA, a lost status register or an
+unresolved CT request faults the media GuC. With `narf.intel.huc=1` alone, or
+`narf.intel.media_gt=1` alone, nothing HuC-related changes. GSC firmware,
+GSCCS and GSC HuC authentication stay unimplemented.
 
 ### Intel fixed Gen12 views and exact family selection
 
