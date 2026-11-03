@@ -48,6 +48,7 @@ pub mod ertm;
 pub mod event;
 pub mod gap;
 pub mod gatt;
+pub mod gatt_client;
 pub mod gatt_server;
 pub mod h4;
 pub mod h5;
