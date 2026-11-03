@@ -146,8 +146,8 @@ mod tssi;
 mod tx_amsdu;
 pub mod tx_transport;
 pub mod txrx;
-mod wow_trx;
 mod wow_security;
+mod wow_trx;
 mod wow_wire;
 
 #[cfg(any(test, feature = "kernel-test"))]

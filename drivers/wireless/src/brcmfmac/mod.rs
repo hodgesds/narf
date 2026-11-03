@@ -72,6 +72,8 @@ pub mod monitor_scope;
 pub(crate) mod monitor_wire;
 pub mod msgbuf;
 pub mod native_runtime;
+pub mod p2p;
+pub mod p2p_wire;
 pub mod pcie;
 pub mod provision;
 pub mod ringbuf;
@@ -82,8 +84,6 @@ pub mod vif_bsscfg;
 pub mod vif_demux;
 pub mod vif_owner;
 pub mod vif_wire;
-pub mod p2p_wire;
-pub mod p2p;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 
