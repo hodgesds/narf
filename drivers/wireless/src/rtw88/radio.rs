@@ -208,6 +208,9 @@ pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
 /// (SCOTRK/TXDFIR per channel, channel14 never admitted), `rtw_set_channel_mac`,
 /// `_rf` (RF18 channel byte) and `rtw8822c_toggle_igi`.
 pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    if !(1..=13).contains(&ch) {
+        return Err(Error::Unsupported);
+    }
     set_channel(io, ch, None).await
 }
 /// `rtw8822c_set_channel(center, RTW_CHANNEL_WIDTH_40, sc)` on 2.4GHz:
@@ -218,7 +221,85 @@ pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
     }
     set_channel(io, center, Some(sc)).await
 }
+/// Linux `rtw8822c_set_channel(ch, RTW_CHANNEL_WIDTH_20, 0)` on a 5GHz
+/// primary: `_bb` 5GHz branch ([`BB_5G`]: CCK TX/RX checks on, RX IQ
+/// weight, TXF4 bit20 clear, CCAMSK 0x22, TXDFIR0 3, OFDM RXAGC and SCOTRK
+/// per band/channel), the BW20 tail, `rtw_set_channel_mac`, `_rf` (RF18 5GHz
+/// band bits16|8, RFSI bit17 on 100..=144 / bit18 on 149..=177) and
+/// `rtw8822c_toggle_igi`. A later 2.4GHz [`channel_to`] rewrites every
+/// field this branch changes.
+pub(super) async fn channel5_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    if !super::band5::primary(ch) {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, ch, None).await
+}
+/// `rtw8822c_set_channel_bb` 5GHz head: (reg, mask, value).
+fn bb_5g(ch: u8) -> Option<[(u16, u32, u32); 9]> {
+    let ofdm = super::band5::rxagc_ofdm8822c(ch)?;
+    let scotrk = super::band5::scotrk8822c(ch)?;
+    Some([
+        (0x1a80, 1 << 18, 1),
+        (0x454, 1 << 7, 1),
+        (0x1a14, 0x300, 3),
+        (0x1a9c, 1 << 20, 0),
+        (0x1c80, 0x3f000000, 0x22),
+        (0x808, 0x70, 3),
+        (0x18ac, 0x1f0, ofdm),
+        (0x41ac, 0x1f0, ofdm),
+        (0xc30, 0xfff, scotrk),
+    ])
+}
+/// Readback of [`channel5_to`] plus the RRSR and IGI-independent fields.
+pub(super) fn verify_channel5(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    let bb = bb_5g(ch).ok_or(Error::Unsupported)?;
+    for path in 0..2u8 {
+        if rf_read(io, path, 0x18)? & 0x733ff != rf18_8822c(ch, 20) {
+            return Err(Error::Prerequisite);
+        }
+    }
+    for (reg, bits, value) in bb {
+        if read(io, reg)? & bits != value << bits.trailing_zeros() {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x9b0)? & 0xffcf != 0 || io.read8(0x483)? != 0 || read(io, 0x668)? & 0x180 != 0 {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// RF18 bits under mask 0x733ff that Linux `rtw8822c_set_channel_rf`
+/// programs: band (5GHz bits16|8), channel byte, RFSI (`IS_CH_5G_BAND_3`
+/// bit17, `_4` bit18) and BW (20MHz bits13:12 = 3, 40MHz bit13, 80MHz
+/// bit12).
+pub(super) const fn rf18_8822c(ch: u8, bw_mhz: u8) -> u32 {
+    let band = if ch <= 14 { 0 } else { 1 << 16 | 1 << 8 };
+    let rfsi = match super::band5::band(ch) {
+        Some(4) => 1 << 18,
+        Some(3) => 1 << 17,
+        _ => 0,
+    };
+    let bw = match bw_mhz {
+        40 => 2 << 12,
+        80 => 1 << 12,
+        _ => 3 << 12,
+    };
+    band | rfsi | bw | ch as u32
+}
 async fn set_channel(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
+    if let Some(bb) = bb_5g(ch) {
+        if wide.is_some() {
+            return Err(Error::Unsupported);
+        }
+        for (reg, bits, value) in bb {
+            mask(io, reg, bits, value)?;
+        }
+    } else {
+        bb_2g(io, ch, wide)?;
+    }
+    set_channel_tail(io, ch, wide).await
+}
+fn bb_2g(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
     if !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
@@ -247,6 +328,9 @@ async fn set_channel(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), E
     ] {
         mask(io, reg, bits, value)?;
     }
+    Ok(())
+}
+async fn set_channel_tail(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
     match wide {
         None => {
             for (reg, bits, value) in [
@@ -287,13 +371,18 @@ async fn set_channel(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), E
     if check == 255 {
         return Err(Error::Gone);
     }
-    io.write8(0x454, check & !(1 << 7))?;
+    // BIT_CHECK_CCK_EN is set only on a 5GHz channel (`IS_CH_5G_BAND`).
+    let cck_check = u8::from(super::band5::band(ch).is_some()) << 7;
+    io.write8(0x454, (check & !(1 << 7)) | cck_check)?;
     // rtw8822c_set_channel_rf: RF18 BW 20M=bits13:12 3, 40M=bit13; RXBB.
-    let (bw, rxbb) = if wide.is_some() { (2, 0x10) } else { (3, 0x18) };
+    let (bw, rxbb) = if wide.is_some() {
+        (40, 0x10)
+    } else {
+        (20, 0x18)
+    };
     let reg18 = (rf_read(io, 0, 0x18)?
         & !((1 << 16) | (1 << 9) | (1 << 8) | 255 | (3 << 17) | (3 << 12)))
-        | u32::from(ch)
-        | bw << 12;
+        | rf18_8822c(ch, bw);
     mask(io, 0x1c90, 1 << 8, 0)?;
     for path in 0..2 {
         rf(io, path, 0xee, 4, 1).await?;

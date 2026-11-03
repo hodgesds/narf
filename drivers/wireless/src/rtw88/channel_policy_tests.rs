@@ -300,3 +300,171 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_channel_switch_announcement_parse
 );
+
+fn smoke_rtw88_band5_linux_groups_and_factory_power() -> TestResult {
+    use crate::rtw88::band5::{self, Power5g};
+    // main.h IS_CH_5G_BAND_* and phy.c rtw_get_channel_group.
+    for (ch, b, g) in [
+        (36, 1, 0),
+        (48, 1, 1),
+        (52, 2, 2),
+        (64, 2, 3),
+        (100, 3, 4),
+        (144, 3, 9),
+        (149, 4, 10),
+        (161, 4, 11),
+        (165, 4, 12),
+        (177, 4, 13),
+    ] {
+        if band5::band(ch) != Some(b)
+            || band5::group(ch) != Some(g)
+            || !band5::primary(ch)
+            || band5::frequency(ch) != Some(5000 + 5 * u16::from(ch))
+        {
+            return TestResult::Fail("5GHz band/group/frequency differs from Linux");
+        }
+    }
+    if [1, 13, 14, 34, 38, 50, 68, 96, 147, 151, 181]
+        .into_iter()
+        .any(band5::primary)
+    {
+        return TestResult::Fail("non-primary 5GHz number accepted as a 20MHz primary");
+    }
+    // rtw8822c_set_channel_bb / rtw8821c_set_channel_bb 5GHz tables.
+    for (ch, agc, sco, scale, clk) in [
+        (36, 1, 0x494, 1, 0x494),
+        (52, 1, 0x493, 1, 0x453),
+        (100, 2, 0x453, 2, 0x452),
+        (116, 2, 0x452, 2, 0x452),
+        (120, 2, 0x412, 2, 0x412),
+        (149, 3, 0x412, 3, 0x412),
+        (177, 3, 0x411, 3, 0x412),
+    ] {
+        if band5::rxagc_ofdm8822c(ch) != Some(agc)
+            || band5::scotrk8822c(ch) != Some(sco)
+            || band5::txscale8821c(ch) != Some(scale)
+            || band5::clktrk8821c(ch) != Some(clk)
+        {
+            return TestResult::Fail("5GHz BB table differs from Linux");
+        }
+    }
+    // rtw_5g_txpwr_idx at bytes 18..42 of one path record.
+    let mut path = [0u8; 42];
+    path[18..32].copy_from_slice(&[40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 30, 0xff]);
+    path[32] = 0x2e; // ht_1s: ofdm -2, bw20 +2
+    path[33] = 0xf1; // ht_2s: bw20 +1, bw40 -1
+    path[38] = 0x30; // vht_1s: bw80 +3
+    path[39] = 0xe0; // vht_2s: bw80 -2
+    let Some(p) = Power5g::parse(&path) else {
+        return TestResult::Fail("5GHz factory record not parsed");
+    };
+    if p.ofdm(0, 1) != Some(38)
+        || p.bw20(1, false, 1) != Some(44)
+        || p.bw20(1, true, 2) != Some(48)
+        || p.bw40(2, false, 1) != Some(44)
+        || p.bw40(2, true, 1) != Some(43)
+        || p.bw80(0, false, 1) != Some(44)
+        || p.bw80(0, true, 1) != Some(42)
+        || p.ofdm(13, 1).is_some()
+        || p.bw80(12, false, 1).is_some()
+    {
+        return TestResult::Fail("5GHz factory index differs from rtw_phy_get_5g_tx_power_index");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_band5_linux_groups_and_factory_power
+);
+
+fn smoke_rtw8822ce_channel5_bb_mac_rf_program() -> TestResult {
+    for (ch, rf18) in [(36, 0x13124), (100, 0x33164), (149, 0x53195)] {
+        if radio::rf18_8822c(ch, 20) != rf18 {
+            return TestResult::Fail("C22 RF18 differs from rtw8822c_set_channel_rf");
+        }
+        let mut io = RadioIo::reference();
+        if narf_scheduler::block_on(radio::channel5_to(&mut io, ch)).is_err()
+            || radio::verify_channel5(&mut io, ch).is_err()
+        {
+            return TestResult::Fail("C22 5GHz program or readback failed");
+        }
+        let check = (|| -> Result<bool, crate::rtw88::firmware_transport::Error> {
+            Ok(io.read8(0x454)? & 0x80 != 0
+                && radio::rf_read(&mut io, 0, 0x18)? & 0x733ff == rf18
+                && radio::rf_read(&mut io, 1, 0x18)? & 0x733ff == rf18)
+        })();
+        if check != Ok(true) || radio::verify_channel5(&mut io, ch + 4).is_ok() {
+            return TestResult::Fail("C22 5GHz readback accepted another primary");
+        }
+        // Back to 2.4GHz rewrites every 5GHz field.
+        if narf_scheduler::block_on(radio::channel_to(&mut io, 6)).is_err() {
+            return TestResult::Fail("C22 2.4GHz program after 5GHz failed");
+        }
+        let back = (|| -> Result<bool, crate::rtw88::firmware_transport::Error> {
+            Ok(io.read8(0x454)? & 0x80 == 0
+                && radio::read(&mut io, 0x1c80)? & 0x3f000000 == 15 << 24
+                && radio::read(&mut io, 0x1a80)? & (1 << 18) == 0
+                && radio::read(&mut io, 0x1a14)? & 0x300 == 0
+                && radio::rf_read(&mut io, 0, 0x18)? & 0x733ff == 0x3006)
+        })();
+        if back != Ok(true) {
+            return TestResult::Fail("C22 2.4GHz program left 5GHz state");
+        }
+    }
+    for ch in [6, 38, 34, 181] {
+        let mut io = RadioIo::reference();
+        if narf_scheduler::block_on(radio::channel5_to(&mut io, ch)).is_ok() {
+            return TestResult::Fail("C22 5GHz program accepted a non-primary");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw8822ce_channel5_bb_mac_rf_program
+);
+
+fn smoke_rtw8821ce_channel20_cross_band_readback() -> TestResult {
+    let facts = radio8821c::BandFacts {
+        filters: [0, 0, 0],
+        btg: false,
+        swing_2g: 0,
+        swing_5g: 4,
+    };
+    if facts.swing(36) != Ok(0x16a)
+        || facts.swing(1) != Ok(0x200)
+        || (radio8821c::BandFacts {
+            swing_5g: 0xff,
+            ..facts
+        })
+        .swing(36)
+        .is_ok()
+    {
+        return TestResult::Fail("C21 swing differs from rtw8821c_get_bb_swing or erased accepted");
+    }
+    let mut io = RadioIo::new();
+    let setup = (|| {
+        io.write32(0x2800 + 0x18 * 4, radio8821c::rf18_for(36, 20))?;
+        io.write32(0x2800 + 0xdf * 4, 0)?;
+        io.write32(0xc1c, 0x16a << 21 | 1 << 8)?;
+        io.write32(0x860, 0x494 << 17)?;
+        io.write32(0xa80, 1 << 18)?;
+        io.write32(0x808, 0)?;
+        io.write8(0x454, 0x80)?;
+        io.write32(0x8ac, 0x10010000)?;
+        io.write32(0xcb8, 0xd00000)
+    })();
+    if setup.is_err() || radio8821c::verify_channel20(&mut io, 36, &facts).is_err() {
+        return TestResult::Fail("C21 5GHz readback refused the programmed primary");
+    }
+    if radio8821c::verify_channel20(&mut io, 40, &facts).is_ok()
+        || radio8821c::verify_channel20(&mut io, 6, &facts).is_ok()
+    {
+        return TestResult::Fail("C21 5GHz readback accepted another channel or band");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw8821ce_channel20_cross_band_readback
+);

@@ -265,6 +265,143 @@ pub(super) async fn retune_channel(io: &mut impl Io, ch: u8) -> Result<(), Error
     rf(io, 0xb8, 1 << 19, 0).await?;
     rf(io, 0xb8, 1 << 19, 1).await
 }
+/// Retained C21 board facts a cross-band `rtw8821c_set_channel` needs:
+/// the 2.4GHz CCK TX filter words Linux reads into `hal->ch_param` at
+/// `phy_set_param`, `hal->rfe_btg` (RFE 2/4) and the raw factory swing
+/// bytes `tx_bb_swing_setting_{2g,5g}` (map 0xc6/0xc7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BandFacts {
+    pub(super) filters: [u32; 3],
+    pub(super) btg: bool,
+    pub(super) swing_2g: u8,
+    pub(super) swing_5g: u8,
+}
+impl BandFacts {
+    /// `rtw8821c_get_bb_swing`. Linux maps a byte above 9 to setting 0;
+    /// this owner refuses it instead of inventing a swing for an erased cell.
+    pub(super) fn swing(&self, channel: u8) -> Result<u16, Error> {
+        let raw = if channel <= 14 {
+            self.swing_2g
+        } else {
+            self.swing_5g
+        };
+        if raw > 9 {
+            return Err(Error::Prerequisite);
+        }
+        Ok([0x200u16, 0x16a, 0x101, 0xb6][usize::from(raw / 3)])
+    }
+}
+/// `rtw8821c_set_channel(ch, RTW_CHANNEL_WIDTH_20, 0)` non-SRRC on either
+/// band, in Linux order: `_bb` (2.4GHz: RXPSEL bit28, CCK checks off,
+/// RXCCAMSK, TXSCALE 0, CLKTRK 0x96a, `ch_param` CCK filters; 5GHz: CCK
+/// TX/RX checks on, RXPSEL off, RXCCAMSK, TXSCALE/CLKTRK per channel) and
+/// the BW20 `set_bw`; `_bb_swing` (band's factory swing); MAC (CCK_CHECK
+/// set only on 5GHz); `_rf` (`rtw8821c_switch_rf_set` BTG/WLG on 2.4GHz,
+/// WLA on 5GHz; LUTDBG bit6 1 + RF 0x64 0xf on 2.4GHz, LUTDBG 0 on 5GHz;
+/// RF18; XTALX2 toggle); `_rxdfir` BW20. Returns the programmed swing.
+/// `rtw8821c_pwrtrack_init` only resets the software tracking state.
+pub(super) async fn set_channel20(
+    io: &mut impl Io,
+    ch: u8,
+    facts: &BandFacts,
+) -> Result<u16, Error> {
+    let five = super::band5::primary(ch);
+    if !five && !(1..=13).contains(&ch) {
+        return Err(Error::Unsupported);
+    }
+    let swing = facts.swing(ch)?;
+    if five {
+        let txscale = super::band5::txscale8821c(ch).ok_or(Error::Unsupported)?;
+        let clktrk = super::band5::clktrk8821c(ch).ok_or(Error::Unsupported)?;
+        for (reg, bits, value) in [
+            (0xa80, 1 << 18, 1),
+            (0x454, 1 << 7, 1),
+            (0x808, 1 << 28, 0),
+            (0x814, 0xfc00, 15),
+            (0xc1c, 0xf00, txscale),
+            (0x860, 0x1ffe0000, clktrk),
+        ] {
+            mask(io, reg, bits, value)?;
+        }
+    } else {
+        for (reg, bits, value) in BB_2G {
+            mask(io, reg, bits, value)?;
+        }
+        io.write32(0xa24, facts.filters[0])?;
+        mask(io, 0xa28, 0xffff, facts.filters[1] & 0xffff)?;
+        io.write32(0xaac, facts.filters[2])?;
+    }
+    let adc = read(io, 0x8ac)?;
+    io.write32(0x8ac, (adc & 0xffcffc00) | 0x10010000)?;
+    mask(io, 0x8c4, 1 << 30, 1)?;
+    mask(io, 0xc1c, 0xffe00000, u32::from(swing))?;
+    io.write8(0x483, 0)?;
+    mask(io, 0x668, 0x180, 0)?;
+    mask(io, 0x24, 3 << 20, 0)?;
+    io.write8(0x55c, 80)?;
+    io.write8(0x638, 80)?;
+    let cck = io.read8(0x454)?;
+    if cck == 255 {
+        return Err(Error::Gone);
+    }
+    io.write8(0x454, (cck & !0x80) | u8::from(five) << 7)?;
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(ch, 20);
+    mask(io, 0x1080, 1 << 16, 1)?;
+    mask(io, 0, 1 << 26, 1)?;
+    if five {
+        // SWITCH_TO_WLA: RFECTL WL|WLA, BTG/CTRL/WLG clear; CCA/LNA kept.
+        mask(io, 0xcb8, 0xf50000, 0xd0)?;
+        rf(io, 0xdf, 1 << 6, 0).await?;
+    } else {
+        let btg = facts.btg;
+        mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 })?;
+        mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 })?;
+        mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 })?;
+        rf(io, 0xdf, 1 << 6, 1).await?;
+        rf(io, 0x64, 15, 15).await?;
+    }
+    rf(io, 0x18, 0xfffff, rf18).await?;
+    rf(io, 0xb8, 1 << 19, 0).await?;
+    rf(io, 0xb8, 1 << 19, 1).await?;
+    for (reg, bits, value) in DFIR {
+        mask(io, reg, bits, value)?;
+    }
+    Ok(swing)
+}
+/// Readback of [`set_channel20`] (band-dependent fields, RF18, swing).
+pub(super) fn verify_channel20(io: &mut impl Io, ch: u8, facts: &BandFacts) -> Result<(), Error> {
+    let swing = facts.swing(ch)?;
+    if !super::band5::primary(ch) {
+        verify_geometry_at(io, ch, swing, facts.btg)?;
+        // Fields a preceding 5GHz program changed.
+        if read(io, 0x808)? & (1 << 28) == 0
+            || read(io, 0xa80)? & (1 << 18) != 0
+            || io.read8(0x454)? & 0x80 != 0
+            || (read(io, 0xc1c)? >> 8) & 15 != 0
+            || (read(io, 0x860)? >> 17) & 0xfff != 0x96a
+            || rf_read(io, 0xdf)? & (1 << 6) == 0
+        {
+            return Err(Error::Prerequisite);
+        }
+        return Ok(());
+    }
+    let txscale = super::band5::txscale8821c(ch).ok_or(Error::Unsupported)?;
+    let clktrk = super::band5::clktrk8821c(ch).ok_or(Error::Unsupported)?;
+    if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20)
+        || rf_read(io, 0xdf)? & (1 << 6) != 0
+        || read(io, 0xc1c)? >> 21 != u32::from(swing)
+        || (read(io, 0xc1c)? >> 8) & 15 != txscale
+        || (read(io, 0x860)? >> 17) & 0xfff != clktrk
+        || read(io, 0xa80)? & (1 << 18) == 0
+        || read(io, 0x808)? & (1 << 28) != 0
+        || io.read8(0x454)? & 0x80 == 0
+        || read(io, 0x8ac)? & (!0xffcffc00 | 0x10010000) != 0x10010000
+        || read(io, 0xcb8)? & 0xf50000 != 0xd00000
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
 /// `rtw8821c_set_channel(center, RTW_CHANNEL_WIDTH_40, sc)` on the retained
 /// non-SRRC C21. The 2.4GHz `_bb` head and `_bb_swing` are identical for
 /// every 2.4GHz channel (left as programmed); the BW40 `set_bw` branch
@@ -377,7 +514,11 @@ fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> 
     Ok(())
 }
 fn verify_geometry(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != rf18_for(1, 20)
+    verify_geometry_at(io, 1, swing, btg)
+}
+/// 2.4GHz/20MHz geometry on primary `ch`; TXPAUSE must still be 0xff.
+fn verify_geometry_at(io: &mut impl Io, ch: u8, swing: u16, btg: bool) -> Result<(), Error> {
+    if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20)
         || read(io, 0xc1c)? >> 21 != u32::from(swing)
         || read(io, 0x8ac)? & (!0xffcffc00 | 0x10010000) != 0x10010000
         || read(io, 0xcb8)? & 0xf50000 != if btg { 0x10000 } else { 0x700000 }

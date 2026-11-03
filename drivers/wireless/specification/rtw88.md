@@ -2392,6 +2392,45 @@ and unexecuted: `smoke_rtw88_ht40_record_pair_factory_and_regulatory_span`,
 `smoke_rtw88_ht40_descriptor_rate_id_and_profile`,
 `smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs`.
 
+### C21/C22 5GHz channel programs (`band5.rs`) — not admitted
+
+Step 1 of `five_ghz_operation`: Linux 7.3-rc4 5GHz primitives only; no
+5GHz channel is admitted, scanned or advertised yet.
+
+- `band5::{band, group, primary, frequency}`: `IS_CH_5G_BAND_{1..4}`,
+  `rtw_get_channel_group` 5GHz rows (unlisted numbers return None where
+  Linux WARNs and falls back to group 0), 20MHz primaries 36..=64,
+  100..=144, 149..=177.
+- `band5::Power5g`: `rtw_5g_txpwr_idx` at bytes 18..42 of each path's
+  factory record and `rtw_phy_get_5g_tx_power_index` (OFDM `bw40_base +
+  ht_1s.ofdm`, HT/VHT20 `+ ht_1s.bw20 (+ ht_2s.bw20)`, 40MHz base
+  `(+ ht_2s.bw40)`, 80MHz group average `+ vht_1s.bw80 (+ vht_2s.bw80)`,
+  times `txgi_factor`). Erased (0xff) or out-of-range bases and negative
+  results return None instead of Linux's u8 wrap.
+- C22 `radio::channel5_to` / `verify_channel5`: `rtw8822c_set_channel_bb`
+  5GHz head (CCKTXONLY/CCK_CHECK set, RX IQ weight, TXF4 bit20 clear,
+  CCAMSK 0x22, TXDFIR0 3, OFDM RXAGC 1/2/3 by band, SCOTRK per channel),
+  BW20 tail, `rtw_set_channel_mac` (CCK_CHECK set only on 5GHz), `_rf` RF18
+  (`radio::rf18_8822c`: band bits16|8, RFSI bit17 band 3 / bit18 band 4),
+  `toggle_igi`. `channel_to` stays 2.4GHz-only and rewrites every 5GHz field.
+- C21 `radio8821c::set_channel20` / `verify_channel20` over
+  `BandFacts` (`ch_param` filters, RFE BTG, factory swing bytes 0xc6/0xc7):
+  full `rtw8821c_set_channel` at 20MHz on either band, including
+  `rtw8821c_switch_rf_set` WLA (RFECTL WL|WLA) and LUTDBG 0 on 5GHz, and the
+  full 2.4GHz `_bb`/swing/BTG-WLG switch when returning. A swing byte above 9
+  is refused (Linux uses setting 0).
+
+Remaining for the row: 5GHz N2xO records (OFDM selection: C22 per-path OFDM
+reference + difference words, C21 OFDM TXAGC; factory bound from
+`Power5g`), band-aware base rate (`rtw_tx_pkt_info_update_rate` OFDM6 /
+`RTW_RATEID_G`, `RRSR_INIT_5G` 0x150, RA `WIRELESS_OFDM`), gate/retune/scan/
+CSA wiring, 5GHz HT, and regulatory admission (DFS rules stay refused: no
+shared beacon-hint/DFS owner has landed; AUTO_BW/NO_160MHZ to be accepted
+via `RegulatoryDomain::max_bandwidth`). Three cases are written and
+unexecuted: `smoke_rtw88_band5_linux_groups_and_factory_power`,
+`smoke_rtw8822ce_channel5_bb_mac_rf_program`,
+`smoke_rtw8821ce_channel20_cross_band_readback`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming

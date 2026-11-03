@@ -41,6 +41,7 @@
 
 extern crate alloc;
 
+mod band5;
 mod calibration8821c;
 mod channel_policy;
 mod coding;
