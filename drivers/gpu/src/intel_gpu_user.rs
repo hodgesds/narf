@@ -122,6 +122,13 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn huc_version(&self) -> FsFuture<'_, (u8, u8, u8)> {
         Box::pin(async { Err(FsError::NoDevice) })
     }
+    /// A runtime-PM reference for a kernel CPU access to this card's LMEM
+    /// BAR (Linux i915/xe `pm_runtime_get` around a CPU copy): the function is
+    /// in D0 with a running GT, and the pool's CPU access open, until the
+    /// returned guard drops. The default has no runtime PM to hold.
+    fn cpu_vram_wakeref(&self) -> FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async { Ok(Box::new(()) as Box<dyn core::any::Any + Send>) })
+    }
     /// Cached physical BMG/LNL main-GT layout; no read-triggered hardware access.
     fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
         None

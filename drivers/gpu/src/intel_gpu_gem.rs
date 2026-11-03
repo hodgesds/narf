@@ -287,6 +287,16 @@ impl GemObject {
         })
     }
 
+    /// Admission of a kernel CPU access to this object's LMEM BAR bytes:
+    /// `None` for a system-memory object, `Busy` while the pool is closed for
+    /// runtime suspend.
+    fn bar_access(&self) -> Result<Option<crate::intel_gpu_vram::CpuAccess<'_>>, FsError> {
+        match &self.vram {
+            Some(vram) => vram.cpu_access().map(Some).ok_or(FsError::Busy),
+            None => Ok(None),
+        }
+    }
+
     /// Kernel WC alias of byte `offset` of a VRAM object.
     fn vram_byte(&self, offset: u64) -> Option<*mut u8> {
         self.vram
@@ -443,6 +453,9 @@ impl GemObject {
         if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(false)) {
             return Err(FsError::WouldBlock);
         }
+        // The LMEM BAR does not decode while the GT owner has the function
+        // runtime-suspended; callers that may resume it hold a wakeref first.
+        let _bar = self.bar_access()?;
         let _guard = self.cpu.lock();
         for (i, byte) in bytes.iter_mut().enumerate() {
             let at = offset + i as u64;
@@ -528,6 +541,7 @@ impl GemObject {
         if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(true)) {
             return Err(FsError::WouldBlock);
         }
+        let _bar = self.bar_access()?;
         let _guard = self.cpu.lock();
         for (i, byte) in bytes.iter().enumerate() {
             let at = offset + i as u64;

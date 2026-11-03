@@ -2622,11 +2622,25 @@ so its owned Pipe A holds its wakeref for the card's lifetime. User submissions 
 a runtime-PM usage reference (`resume_and_get`); a submission keeps it until
 its fence is terminal. `runtime_suspend` refuses (Busy) unless the GT is
 running and `GuCGt::idle` (no registered, running or retiring context), no
-VRAM object exists (CPU BAR mappings cannot be revoked), no display hold
-exists (`display_rpm::park_refusal`: lit pipes, `DC_off` references, a
+display hold exists (`display_rpm::hold`: lit pipes, `DC_off` references, a
 pending DC re-entry, a live external route or KMS work) and no system sleep
 is in progress. CPU mappings of system-memory objects are never an input.
-It then masks IRQs, proves the same full stop used for reset,
+With a VRAM pool published it first closes local
+memory to the CPU (`xe_pm_runtime_suspend`'s vram_userfault release):
+`Vram::close_cpu_access` (Busy while a kernel BAR copy is in flight) and
+`intel_gpu_gem::cpu_mapping::revoke_window` over the BAR window
+`[bar, bar + tile_offset + visible)` through `mmap_relocation::revoke`
+(Busy while a fork or an alias outside the VM snapshot is in flight). Every
+user leaf of the window goes, VMAs and aliases stay, and mappings made while
+parked stay unmapped. A CPU access then faults into `VramRefault`, which
+holds a runtime-PM reference until the resumed GT is published; that
+publication ends the revocation and reopens kernel access first, and the
+retried access maps the same frame. A failed resume or a gone owner is
+SIGBUS. Any refusal before D3 reopens both. GEM PREAD/PWRITE of a VRAM object
+is refused (`Busy`) while the pool is closed; the async i915 copy path takes
+`UserBackend::cpu_vram_wakeref` (default: nothing to hold) first and so
+resumes the function. Local memory is assumed preserved in D3hot, as across
+GT resets. It then masks IRQs, proves the same full stop used for reset,
 reclaims the stopped GT and parks with the user epoch still published; a
 `Display` owner marks the retained DMC program for re-verification. The PCI
 layer saves configuration and enters D3hot; `d3cold::evaluate` names why
@@ -3350,8 +3364,11 @@ drop pending tokens. Physical-row aliases retain backing through unpublished
 fork metadata, including lazy/PROT_NONE metadata after all tokens/handles/PRIME
 fds close. Retirement requires no token or metadata alias, and retired backing
 cannot be reused. Permanent filesystem provider dispatch preserves AMD aliases.
-This does not move immutable BO storage or admit eviction, PREFETCH, USERPTR
-invalidation or asynchronous CPU revocation; GPU/PM/reset/S3 obligations stay.
+The registry is also the census of `revoke_window` (runtime suspend): from
+inside the VM transaction it reports every frame of the BAR window with a
+nonzero alias count, taking only `FRAMES` and allocating nothing.
+This does not move immutable BO storage or admit eviction or PREFETCH;
+GPU/reset/S3 obligations stay.
 
 ### Intel copy, runtime policy and additional scanout layouts
 

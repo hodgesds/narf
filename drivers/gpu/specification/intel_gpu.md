@@ -2585,8 +2585,8 @@ a late poll that finds the condition met progresses instead of timing out.
 | Native gamma activation/bypass | 1024-entry Pipe-A LUT, owned copies/blobs, safe inactive preload, preserved flips and later-frame restoration | Implemented; native fixtures pass |
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
-| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20); i915 GEM_USERPTR, fault-mode/CPU-mirror VMs, long-running VMs and VRAM CPU-mapping revocation remain |
-| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; bounded BMG allocation does not close migration/alias ownership |
+| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR, fault-mode/CPU-mirror VMs and long-running VMs remain |
+| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; bounded BMG allocation does not close migration/alias ownership. CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20), but eviction/migration remains |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
@@ -2648,7 +2648,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
 | i915 context priority | map_i915_prio_to_guc_prio at every registration (default KMD_NORMAL2), request-time priority with same-context in-flight raises as priority-only UPDATE_CONTEXT_POLICIES, advertised I915_SCHEDULER_CAP_PRIORITY | Implemented; native fixtures added, unexecuted |
-| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
+| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). A discrete GT now runtime-suspends with VRAM allocated and mapped (BAR mappings revoked and refaulted, kernel copies gated, §20). D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; opted-in LNL display 20 has an owned eDP Pipe-A modeset with display-20 resources, a display-preserving GT owner (no driver FLR; GT-only GuC/full reset; D0-only), an owned console with the KMS owner's Pipe-A flips at Xe2 PAT3 (linear, and X/Tile4 through an owned power-of-two DPT), the display-14 cursor, CTM/LUTs and DSB with Xe2 PTEs, the Xe `SCANOUT` create flag, Wa_15015404425 on the probe-time modeset window, and the DC service loading `xe2lpd_dmc.bin` into DC6 (native fixtures added, unexecuted); LNL PSR1 (refused), FBC, tiled panning, suspend/relight, externals and all PTL display remain |
 
 The first four workstreams form the initial integration checkpoint. They do
@@ -7123,8 +7123,8 @@ pages as Linux does (`folio_maybe_dma_pinned`); see the follow-up subsection
 below.
 
 **VRAM CPU-mapping revocation** (revoke a device-frame set, then refault after
-runtime resume) is not part of this slice. Autosuspend with live VRAM
-mappings stays refused.
+runtime resume) was not part of this slice. It landed later; see "VRAM CPU
+mappings across runtime suspend" below.
 
 Fixtures, all new and unexecuted in this slice:
 
@@ -7180,3 +7180,62 @@ eager). Fixtures, new and unexecuted in this slice:
 pin between commit and publication),
 `smoke_dma_pin_lazyfree_never_discards_pinned_page` and
 `memory/migrate::smoke_migrate_frame_multi_refuses_pinned`.
+
+### VRAM CPU mappings across runtime suspend — native fixtures added
+
+Sources are Linux b90c984d: `ttm_bo_vm.c` (`ttm_bo_unmap_virtual`,
+`ttm_bo_vm_fault_reserved`), `mm/memory.c::unmap_mapping_range`, `xe_bo.c`
+(`xe_bo_cpu_fault`, `__xe_bo_cpu_fault`, `xe_bo_runtime_pm_release_mmap_offset`,
+the `vram_userfault` list) and `xe_pm.c::xe_pm_runtime_suspend`. The memory/
+half is TCB-class (`memory/specification/spec.md` §3 and §4,
+`safety-argument.toml`).
+
+A discrete GT used to refuse runtime suspend while any VRAM was allocated,
+because user CPU mappings of the LMEM BAR could not be revoked and the BAR
+does not decode outside D0. Park now does what xe does:
+
+1. It closes the pool to kernel CPU access (`Vram::close_cpu_access`, refused
+   while a copy is in flight). GEM PREAD/PWRITE through the BAR then fail
+   with `Busy`. The async i915 copy path takes a runtime-PM wakeref first
+   (`UserBackend::cpu_vram_wakeref`), so it resumes the function instead.
+2. It revokes the BAR window `[bar, bar + tile_offset + visible)` with
+   `memory::revoke_device_frames`, through `mmap_relocation::revoke` and the
+   syscall layer's address-space snapshot. Every user leaf goes, every VMA
+   and alias stays, and the TLB invalidation completes before park continues.
+   The Intel alias registry reports its census from inside the VM
+   transaction. While the revocation lives, mappings made meanwhile (mmap,
+   fork children, mprotect) stay unmapped too. A fork in flight or an unseen
+   alias refuses the park with `Busy`, and the PM core retries.
+3. It stops the GT as before. Any refusal before D3 reopens both.
+
+A CPU access to a revoked page faults into `VramRefault`
+(`__xe_bo_cpu_fault`). With no address-space lock held, the syscall layer's
+waiter parks the faulting task on a future that takes a runtime-PM reference
+(resuming the function) and waits for the resumed GT's publication. That
+publication drops the revocation and reopens kernel access before `Running`
+becomes observable, so the retried access maps the same BAR frame. A failed
+resume, or an owner that is gone, is SIGBUS (xe: `VM_FAULT_SIGBUS` for a lost
+device). Local memory itself is preserved across D3hot, as the pool already
+assumed across GT resets; D3cold, S3 (still refused with VRAM allocated) and
+eviction remain open.
+
+Deviations: Linux revokes per buffer object on the `vram_userfault` list. NARF
+revokes the card's whole BAR window, so mappings created while the function
+is suspended are covered without a per-object list. NARF mmap is eager, so a
+new VRAM mapping made while suspended starts unmapped and faults on first
+touch. The synchronous i915 ioctl entry cannot resume the function, so a
+VRAM PREAD/PWRITE through it is `EBUSY` while suspended.
+
+Fixtures, new and unexecuted in this slice:
+
+- `memory`: `smoke_device_revoke_removes_leaves_and_masks_installers` and
+  `smoke_device_refault_waits_then_reinstalls_same_frame` (x86_64 and
+  aarch64).
+- `drivers/gpu/intel_gpu_gem`:
+  `smoke_intel_vram_runtime_suspend_revokes_bar_mappings_and_gates_copies`.
+- `drivers/gpu/intel_gpu_gt`:
+  `smoke_gt_vram_cpu_revocation_reopens_pool_and_orphan_refault_fails`.
+
+The park and resume wiring itself (`Owner::park`, the resume publication and
+`VramRefault` with a live owner) needs the GT runtime and hardware. It is not
+covered by these fixtures.

@@ -971,7 +971,7 @@ impl RenderFile {
             return Some(self.wait_ioctl(arg, user).await.map(|()| 0));
         }
         if matches!(cmd, abi::GEM_PREAD | abi::GEM_PWRITE) {
-            return Some(self.copy_ioctl(cmd, arg, user).await.map(|()| 0));
+            return Some(self.copy_ioctl(info, cmd, arg, user).await.map(|()| 0));
         }
         if matches!(cmd, abi::GEM_SET_DOMAIN | abi::GEM_SW_FINISH) {
             return Some(self.domain_ioctl(cmd, arg, user).await.map(|()| 0));
@@ -1121,7 +1121,13 @@ impl RenderFile {
         result
     }
 
-    async fn copy_ioctl(&self, cmd: u32, arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+    async fn copy_ioctl(
+        &self,
+        info: &DeviceInfo,
+        cmd: u32,
+        arg: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
         let request = read(user, arg, 32)?;
         if u32_at(&request, 4) != 0 {
             return Err(FsError::InvalidData);
@@ -1133,6 +1139,13 @@ impl RenderFile {
         if size == 0 {
             return Ok(());
         }
+        // i915_gem_pread_ioctl's runtime-PM wakeref: a VRAM copy goes through
+        // the LMEM BAR, so resume a runtime-suspended function first and keep
+        // it in D0 for the whole copy.
+        let _wakeref = match (&info.backend, object.is_vram()) {
+            (Some(backend), true) => Some(backend.cpu_vram_wakeref().await?),
+            _ => None,
+        };
         let pointer = u64_at(&request, 24);
         pointer
             .checked_add(size as u64)
