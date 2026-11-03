@@ -118,9 +118,11 @@ the canonical bit definition without re-deriving it.
   CMD/STATUS bit layout, GMBUS pin numbering with the per-PCH
   `get_gmbus_pin` tables (icp/dg1/dg2/mtp), E-EDID
   read transaction encoder, and the MMIO transport (`GmbusBus`):
-  poll-counted HW_RDY / wait-phase waits, STOP-cycle +
-  wait-idle teardown, SATOER NAK recovery, CYCLE_INDEX /
-  GMBUS5 indexed transfers. Register map corrected against
+  `xfer` over I2C message lists as `do_gmbus_xfer` (poll-counted
+  HW_RDY / wait-phase waits between messages, one STOP-cycle +
+  wait-idle teardown, SATOER NAK recovery with one first-message
+  retry, CYCLE_INDEX|CYCLE_WAIT / GMBUS5 2BYTE_INDEX_EN indexed
+  transfers) and the E-DDC EDID reader. Register map corrected against
   PRM Vol. 12 + i915 `intel_gmbus_regs.h` in #1018 (base
   0xC5100, GMBUS5 at +0x20, HW_WAIT_PHASE at GMBUS2[14]).
   Source: TGL PRM Vol. 12 "GMBUS Programming".
@@ -1198,8 +1200,9 @@ CNL and ICL+), Vol. 12 (DIP banks, AUD_CONFIG), CEA-861-D
 
 Public interface:
 
-- `probe_sink(mmio, ddi) -> HdmiSinkProbe` — the complete
-  EDID over DDC, the preferred mode, the HDMI Forum VSDB
+- `probe_sink(mmio, ddi, ddc) -> HdmiSinkProbe` — the complete
+  EDID over DDC on the VBT or default pin (`ddc`:
+  `Gen12DdcOverrides`), the preferred mode, the HDMI Forum VSDB
   capabilities, and whether the mode's character rate
   demands scrambling. No display registers are touched.
 - `activate(mmio, probe, fb) -> HdmiConnection` — SCDC
@@ -1207,24 +1210,26 @@ Public interface:
   (`Modeset::modeset_hdmi`), the AVI infoframe, then
   display-audio publication. `connect` composes the two.
 - `disconnect(mmio, conn)` — audio disable + sink clear,
-  DIP disable, pipeline teardown.
+  DIP disable, SCDC reset for a scrambled stream
+  (`intel_ddi_disable_hdmi`), pipeline teardown.
 
-DDC runs over the **GMBUS codec** (`intel_gpu_gmbus`): the
-base EDID block uses the codec's own read program verbatim;
-indexed and segment-pointer reads, and the SCDC writes,
-compose the codec's field helpers — no second DDC
-transport. The session drives the codec's documented
-caller sequence (program GMBUS0/GMBUS1, poll GMBUS2 via
-`GmbusStatus`, drain/fill GMBUS3, restore GMBUS0 = 0)
-directly, because Q3 (#1018) has not landed a transport
-yet; when it does, the engine functions in
-`intel_gpu_hdmi` are the swap-out point. The GMBUS_BASE
-correction (0xC510 → 0xC5100) and the duplicated GMBUS2
-HW_DONE bit are #1018's and are not duplicated here — the
-session and its fixtures key off the codec's constants,
-never a private copy of the base.
+DDC runs over the shared **GMBUS transport**
+(`intel_gpu_gmbus::GmbusBus`, `do_gmbus_xfer`). Each EDID block
+is `drm_do_probe_ddc_edid`'s transfer: offset write and read as
+one index transfer, and for blocks 2 and 3 the E-DDC segment
+pointer chained ahead of it by repeated START, so the pointer
+reaches the read before the single STOP (`read_edid_eddc`, up
+to base + 3 extensions). SCDC registers are `drm_scdc_readb`
+(index transfer) and `drm_scdc_writeb`. This replaced an older
+engine that ran each program as one STOP-cycle transfer and then
+waited for bus idle, wrote byte indices to GMBUS5 without
+`GMBUS_2BYTE_INDEX_EN` (so they were not indexed), and checked
+the sink's scrambler status before scrambled data flowed.
 
-The DDC pin is the family's Linux default
+The DDC pin is the VBT's when the board's VBT declares an HDMI
+connector on the DDI (`Gen12DdcOverrides`: `intel_hdmi_ddc_pin`
+through `map_ddc_pin`'s icp/adls/adlp maps, validated and
+unclaimed), otherwise the family's Linux default
 (`intel_gmbus::gen12_ddc_pin`, b90c984d
 `intel_hdmi_default_ddc_pin`): Tiger Lake and Alder Lake P/N
 use DDI A/B = GMBUS pin 1/2 and TCn = 8 + n; Alder Lake S
@@ -1247,13 +1252,21 @@ does not declare SCDC is refused with
 `ScramblingUnsupported`, never silently degraded.
 
 SCDC sequence (`configure_scdc`): refuse unless the
-HF-VSDB declares SCDC_Present; read-modify-write
-TMDS_CONFIG (0x20) setting SCRAMBLING_ENABLE | ratio 1/40;
-wait out the specification's 1 ms minimum settle
-(poll-counted, per the #879 poll-budget discipline); read
-SCRAMBLER_STATUS (0x21) and require the scrambling bit,
-else `ScramblingVerifyFailed`. Configuration runs before
-the modeset binds the transcoder.
+HF-VSDB declares SCDC_Present; then
+`intel_hdmi_handle_sink_scrambling`
+(`handle_sink_scrambling`): read-modify-write TMDS_CONFIG
+(0x20) bit 1 (`drm_scdc_set_high_tmds_clock_ratio`), wait
+at least 1 ms, then read-modify-write bit 0
+(`drm_scdc_set_scrambling`). Configuration runs before the
+modeset binds the transcoder (Linux runs it before the DDI
+buffer enable; both precede any TMDS data). SCRAMBLER_STATUS
+(0x21) is read only after the stream runs and recorded as
+`HdmiConnection::scrambler_status`; like Linux, it does not
+gate the connect. Disconnect resets the ratio and scrambling
+before the pipeline comes down. The admission rule stays
+narrower than Linux's: at or below 340 Mcsc SCDC is never
+touched, where Linux also writes a scrambling-capable sink's
+TMDS_CONFIG.
 
 Clocking: HDMI rates do not come from the fixed DP PLL
 rows — `intel_gpu_pll::hdmi_wrpll_coeffs` runs the WRPLL
@@ -1311,21 +1324,27 @@ Invariants:
 
 - A ≤340 Mcsc connect produces zero SCDC-slave traffic
   (fixture-asserted over the recorded GMBUS programs).
-- SCDC writes precede the first TRANS_DDI_FUNC_CTL write
-  (fixture-asserted over the recorded write log).
+- SCDC writes precede the first TRANS_DDI_FUNC_CTL write,
+  and SCRAMBLER_STATUS is read only after the DDI buffer is
+  enabled (fixture-asserted over the recorded write log).
+- Every DDC transfer ends in one STOP; an E-DDC segment write
+  is followed by its EDID read with no STOP in between.
 - The modeset's CFGCR0/CFGCR1 writes for a mode equal the
   WRPLL fixture rows for that TMDS clock.
 - Disconnect clears the ELD publication before the
   pipeline comes down, and clears the DDI buffer last.
 
 Fixtures: a GMBUS sink model (EDID store + SCDC register
-file decoding the GMBUS1 program fields itself) exercising
-1080p connect with no SCDC traffic, 4K60 connect with the
-SCDC RMW + verify + func-ctl bit pins, 4K60 refused
-without SCDC, scrambling-verify failure, sink NACK,
-4-block EDID over the E-DDC segment pointer, HF-VSDB
-parsing past a decoy HDMI Licensing VSDB, infoframe
-byte pins, and disconnect teardown order.
+file decoding the GMBUS1 program fields itself, wait phase
+only for CYCLE_WAIT programs, E-DDC segment reset on STOP)
+exercising 1080p connect with no SCDC traffic, 4K60 connect
+with the ratio-then-scrambling RMW + post-stream status +
+func-ctl bit pins, 4K60 refused without SCDC, an unlocked
+scrambler reported after the stream without failing the
+connect, the index cycle and GMBUS5 enable bit, sink NACK,
+4-block EDID over chained E-DDC segment writes, HF-VSDB
+parsing past a decoy HDMI Licensing VSDB, infoframe byte
+pins, and disconnect teardown order.
 
 Deliberate remainders: DVI signalling (same TMDS path,
 no infoframes/SCDC — a follow-up, not filed here), YCbCr
@@ -1495,7 +1514,9 @@ then flips the bit). TX signal levels are VDR override
 registers (SNPS preset tables), staged before training and
 re-applied with the trained levels after. PLL enable order:
 port clock control (MAXPCLK select, SSC PLLB for the MPLLB
-tables) → lane reset + powerdown staging (P2 reset, then P0
+tables; the external DP route enables SSC only when the VBT
+allows it and the sink advertises 0.5% downspread, and then
+also zeroes the C10 SSC bytes otherwise) → lane reset + powerdown staging (P2 reset, then P0
 active) → PLL state → per-TX single-TX disables →
 `DDI_CLK_VALFREQ` (C10 only) → PCLK PLL request/ACK. Every MTL
 port also traverses the die-to-die (D2D) link, enabled
@@ -1537,7 +1558,10 @@ trusted.
 - External DP SST on DDI B and TC1–TC4 (Type-C ownership, owned
   PICA/south hotplug) is owned by `intel_gpu_xelpg_external` (§20,
   "MTL external outputs"); the inherited internal path still
-  refuses direct TC routes.
+  refuses direct TC routes. Which ports exist, which are legacy
+  Type-C, their HDMI DDC pins and the SSC preference come from the
+  board VBT (`intel_gpu_vbt`, §20 "VBT parser") when the OpRegion
+  carries one.
 - Not programmed by this lane: watermark / DBUF allocation and
   PM demand outside a qualified display14.00 all-pipes-off modeset
   (that case runs the display14 resource transaction of §20; other
@@ -2316,7 +2340,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; DC-state join, VBT port facts, TBT, HDMI FRL, UHBR, multi-pipe and PSR2 open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join, TBT, HDMI FRL, UHBR, multi-pipe and PSR2 open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
@@ -3853,3 +3877,97 @@ were intentionally corrected: `smoke_pin_pair_round_trip`,
 `smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal`
 (ADL-S has no DDI B), `smoke_mtl_hdmi_pll_tables_and_typed_refusals` and
 `smoke_mtl_hdmi_probe_refusals_before_mmio`.
+
+### VBT parser, its first consumers and the Gen12 DDC corrections
+
+This slice continues the Output support row. Sources are Linux b90c984d
+`intel_bios.c`, `intel_vbt_defs.h`, `intel_opregion.c`, `intel_rom.c`,
+`drivers/pci/rom.c`, `intel_ddi.c` (`intel_ddi_init`), `intel_dp_aux.c`,
+`intel_hdmi.c`, `intel_cx0_phy.c`, `intel_gmbus.c`, `drm_edid.c` and
+`drm_scdc_helper.c`. Struct offsets were checked against a host compile of
+`intel_vbt_defs.h`.
+
+`intel_gpu_vbt` validates a VBT as `intel_bios_is_valid_vbt` does and walks the
+BDB blocks as `find_raw_section` does. A block that runs past `bdb_size` ends
+the walk, and the MIPI sequence v3 block uses its u32 size. Short blocks are
+zero padded to their structure size, as `init_bdb_block` pads them. The parser
+decodes the general features (`enable_ssc` and the DP SSC bits), the child
+devices (`child_device_size_valid`, DVO port, AUX channel, DDC pin, the
+Type-C, TBT and dedicated-external bits by BDB version, DP dual mode, HDMI
+level shifter and max TMDS clock, lane reversal, DP max rate and lanes) and the
+driver features. It also decodes the LFP options panel type, the eDP block
+(bpp, PPS delays, link rate, lanes, pre-emphasis, voltage swing, low vswing,
+max rate, DSC disable), PSR and PSR2 wake times and enable, and the LFP
+backlight. The per-platform tables cover TGL, ADL-S, ADL-P (display 13) and MTL
+(display 14): `dvo_port_to_port`, `map_aux_ch`, `map_ddc_pin`, the default DDC
+pin, `intel_phy_is_tc` and the port masks. `Vbt::encoders` reproduces the
+encoder set `intel_ddi_init` builds: port and AUX claims, the Type-C legacy
+rule, and the `intel_hdmi_ddc_pin` validity and claim checks.
+
+Discovery follows `intel_opregion_setup`. Probe reads ASLS (PCI config 0xFC)
+and copies the 8 KiB OpRegion read-only through the kernel direct map. It
+does so only after every page proves to be known RAM; the boot map registers
+ACPI NVS as known RAM. So no memory-subsystem change was needed, and device
+MMIO cannot be reached. The RVDA VBT (OpRegion 2.0 physical, 2.1+ relative to
+ASLS, bounded by the 16-bit VBT size) comes first, then mailbox #4, which is
+bounded at the ASLE extension when mailbox #5 exists. Unlike Linux, the
+OpRegion is never written. SPI flash is a discrete-only source. The PCI option
+ROM needs the expansion-ROM BAR assigned and enabled, which the bus layer does
+not do. So the ROM search (`pci_get_rom_size`, `oprom_get_vbt`) is parsed and
+tested but not wired, and production discovery is OpRegion only.
+
+Consumers. On Meteor Lake, `MtlPortPolicy::from_vbt` turns the encoder set into
+the DDI B and TC1-TC4 declarations: DP, the HDMI connector with its DDC pin, and
+legacy Type-C. Ports the route cannot drive as declared fail closed. These are
+DSI and eDP encoders, a VBT AUX channel other than the port's own, lane reversal
+(the route never sets PORT_REVERSAL), and a dedicated-external Type-C port. The
+hotplug monitor takes the VBT's legacy sources before its first poll. DP SSC
+now follows `intel_cx0pll_update_ssc`: it is on only when `intel_panel_use_ssc`
+(the VBT `enable_ssc`, on without a VBT) and the sink's `DP_MAX_DOWNSPREAD_0_5`
+both hold. Without SSC the C10 state takes the non-SSC form (PLL bytes 4..8
+zeroed) and PORT_CLOCK_CTL leaves SSC_ENABLE_PLLB clear. This intentionally
+changes sinks without downspread, which used to get SSC unconditionally. Gen12
+HDMI takes its DDC pin from the VBT when the VBT declares an HDMI connector on
+the DDI. With no VBT, Meteor Lake keeps `NO_VBT` (`init_vbt_missing_defaults`)
+and Gen12 keeps `gen12_ddc_pin`. The eDP, PSR and backlight panel facts are
+exposed (`edp_panel`, `psr_panel`, `backlight_panel`, `panel_type`) for the
+panel and PSR owners and are not yet consumed.
+
+Gen12 DDC corrections. The Gen12 HDMI session now runs on `GmbusBus`, whose
+new `xfer` is `do_gmbus_xfer`. Each message ends in the wait phase so the next
+starts with a repeated START, and one STOP follows the last. Index transfers
+use CYCLE_INDEX with CYCLE_WAIT, or GMBUS5 with 2BYTE_INDEX_EN cleared after
+the data phase. A NAK on the first message is retried once. The old engine ran
+each program as one STOP transfer and then waited for idle. It wrote GMBUS5
+without the enable bit, and it read SCRAMBLER_STATUS before scrambled data
+flowed. Indexed programs previously carried CYCLE_INDEX without CYCLE_WAIT,
+which never enters the wait phase the transport then waited for. EDID follows
+`drm_do_probe_ddc_edid`, with the E-DDC segment pointer chained ahead of
+blocks 2 and 3. The MTL HDMI route now reads those blocks too. SCDC follows
+`intel_hdmi_handle_sink_scrambling`: the ratio, at least 1 ms, then scrambling.
+Gen12 records the scrambler status after the stream runs and resets SCDC on
+disconnect; MTL uses the same helper.
+
+Remaining: VBT consumers for the panel (PPS, eDP link, PSR, backlight) and for
+the VBT `max_tmds_clock`, DP rate and lane caps; driving a VBT AUX remap, lane
+reversal or a dedicated-external Type-C port; PnP-ID and OpRegion (SWSCI)
+panel-type selection; the PCI option ROM mapping; Gen12 port existence from
+the VBT; Gen12 SCDC for scrambling-capable sinks at or below 340 MHz, as Linux
+writes them; and GMBUS burst reads above 511 bytes. Native fixtures cover all
+of this; it has not been tested against physical VBTs or sinks.
+
+New native tests: `drivers/gpu/intel_gpu_vbt` (16),
+`drivers/gpu/intel_gpu_xelpg_external` (5), `drivers/gpu/intel_gpu_gmbus` (1)
+and `drivers/gpu/intel_gpu_hdmi` (1). These were intentionally corrected:
+`smoke_transport_edid_base_block_read`,
+`smoke_transport_segment_and_index_reads`,
+`smoke_transport_two_byte_index_uses_gmbus5`,
+`smoke_transport_nak_refusal_and_recovery` and
+`smoke_transport_scdc_write_then_read`. They now follow the `do_gmbus_xfer`
+conversations, and the first four also had a GMBUS0 select of 3 left over from
+before the pin renumbering. On the Gen12 side,
+`smoke_hdmi_1080p_connect_no_scdc_traffic` and
+`smoke_hdmi_4k60_scdc_scrambling` follow the Linux EDID and SCDC sequences, and
+`smoke_hdmi_edid_segment_pointer` checks the chained segment write.
+`smoke_hdmi_scdc_verify_failure` became
+`smoke_hdmi_scdc_status_sampled_after_stream`.

@@ -102,7 +102,11 @@ separate display-14 external contract follows.
 `intel_gpu_xelpg_external` owns at most one external DisplayPort SST route on
 pipe/transcoder A for `Generation::MeteorLake`:
 `probe_sink(io, generation, port, legacy_port)` returns an `MtlSinkProbe`
-that holds the Type-C connection and the AUX power request.
+that holds the Type-C connection and the AUX power request, plus the sink's
+`max_downspread` and the `ssc` decision (`intel_gpu_vbt::dp_ssc_enabled`: the
+policy's `use_ssc` and DP_MAX_DOWNSPREAD_0_5; the service applies its policy).
+`intel_gpu_xelpg::dp_pll_request(port, rate, lanes, dp_alt, protocol_switch,
+ssc)` zeroes the C10 SSC bytes and clears `SSC_ENABLE_PLLB` without SSC.
 `activate(io, probe, fb)` returns a Live `MtlExternalRoute`, or
 `ActivateError::Refused` (the probe comes back with nothing programmed) or
 `ActivateError::Failed` (the route comes back Stopped or Quarantined).
@@ -130,10 +134,11 @@ with a session serial and withdrawn by exactly that serial, and
 `external_routes_stopped` counts it. Every hardware-touching entry runs in one
 DC-off bracket, and `route_live()` is the DC-entry refusal predicate.
 
-`intel_gpu_xelpg_hdmi` provides HDMI TMDS (`hdmi_pll_request`, `probe_hdmi`,
-`release_hdmi_probe`, `read_edid_ddc`, `activate_hdmi`,
-`MtlHdmiRoute::stop/release`) for DDI B (DDC pin 2) and declared legacy
-Type-C ports (DDC pin 8 + n), from the source tables up to 594 MHz, with an
+`intel_gpu_xelpg_hdmi` provides HDMI TMDS (`hdmi_pll_request`,
+`probe_hdmi(io, generation, port, legacy_port, ddc)`, `release_hdmi_probe`,
+`read_edid_ddc`, `activate_hdmi`, `MtlHdmiRoute::stop/release`) for DDI B and
+declared legacy Type-C ports on the policy's DDC pin (`MtlHdmiProbe::ddc`;
+`None` refuses `DdcUnavailable`), from the source tables up to 594 MHz, with an
 AVI infoframe. `parse_sink_scdc` and `tmds_link` give the HF-VSDB/HF-SCDB sink
 capability and the scrambling decision; above 340 MHz the route sets the
 TRANS_DDI_FUNC_CTL scrambling and high-rate bits and writes the sink's SCDC
@@ -144,9 +149,15 @@ and DP-alt refuse with `HdmiError`; an SCDC failure on a stream that needs
 scrambling fails activation with a locally stopped route.
 
 `MtlExternalService` owns one `MtlRoute` (`Dp` or `Hdmi`) under an
-`MtlPortPolicy` of per-port `MtlPortDecl { dp, hdmi, legacy }` facts (the VBT
-child data; production `MtlPortPolicy::NO_VBT` = DDI B DP+HDMI, TC1-TC4
-USB-C DP only, `hpd_config()` = `MtlHpdConfig::TYPE_C`). `route_plan` orders a
+`MtlPortPolicy` of per-port `MtlPortDecl { dp, hdmi, legacy, ddc_pin }` facts
+plus `use_ssc`. `MtlPortPolicy::from_vbt(&Vbt)` derives them from the VBT
+(`decl_from_encoder` fails closed on DSI/eDP, a foreign AUX channel, lane
+reversal and dedicated-external Type-C); without a VBT production keeps
+`MtlPortPolicy::NO_VBT` = DDI B DP+HDMI, TC1-TC4 USB-C DP only, SSC on,
+`hpd_config()` = `MtlHpdConfig::TYPE_C`. `install_mtl_port_policy` installs a
+policy into the process-wide service and hotplug monitor
+(`intel_gpu_xelpg_hpd::configure_hpd`) only while no route is owned and no
+other hotplug baseline exists. `route_plan` orders a
 connect: DP first, HDMI only on a DPCD read failure (`dpcd_absent`), HDMI only
 on DDI B or a declared legacy Type-C port. `ServiceOutcome::Activated` carries
 the `MtlProtocol`; Refused/Retained carry a `RouteError` (`Dp`/`Hdmi`).
@@ -156,6 +167,25 @@ the `MtlProtocol`; Refused/Retained carry a `RouteError` (`Dp`/`Hdmi`).
 TC1-TC6 = 9-14); `GmbusPinTable` is the per-PCH table
 (`for_generation`, `name`, `is_valid`) and `gen12_ddc_pin(family, ddi)` the
 Gen12 default DDC pin, `None` for a DDI the family lacks.
+`GmbusBus::xfer(&mut [I2cMsg])` is `do_gmbus_xfer` (wait phase between
+messages, one STOP, index transfers, first-message NAK retry);
+`read_edid_block`/`read_edid_eddc` follow `drm_do_probe_ddc_edid` including
+the E-DDC segment pointer.
+
+`intel_gpu_vbt` parses the VBT (`validate_vbt`, `Vbt::parse`, `children`,
+`encoders(platform)`, `use_ssc`, `panel_type`, `edp_panel`, `psr_panel`,
+`backlight_panel`, `driver_features`), finds it in an OpRegion image
+(`opregion_vbt`, `opregion_rvda`) or option ROM (`pci_rom_vbt`,
+`rom_find_vbt`), and `discover(asls)` copies the OpRegion read-only from
+known-RAM pages. `install_for_probe` runs from probe and returns a
+`VbtInstall`. eDP/PSR/backlight panel facts are exposed for their owners and
+not yet consumed. `Gen12DdcOverrides` (installed per probe,
+`gen12_ddc_overrides()`) gives the Gen12 HDMI DDC pin: `intel_gpu_hdmi::
+probe_sink(mmio, ddi, &ddc)` records it in `HdmiSinkProbe::pin`.
+`HdmiConnection` carries `pin` and `scrambler_status` (sampled after the
+stream runs, never gating the connect); `handle_sink_scrambling` and
+`scrambler_status` are the shared SCDC helpers. `HdmiError::
+ScramblingVerifyFailed` and `DdcError::ShortTransfer` are removed.
 
 The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
 GGTT byte offset. Both display paths reject invalid plane dimensions,
