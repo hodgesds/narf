@@ -72,6 +72,15 @@ mod both {
         *ALIASES.lock() = counts.iter().map(|(phys, n)| (phys.raw(), *n)).collect();
     }
 
+    /// The same census in the enumerating form revocation takes.
+    fn census(start: u64, end: u64, report: &mut dyn FnMut(u64, usize)) {
+        for &(frame, count) in ALIASES.lock().iter() {
+            if (start..end).contains(&frame) && count != 0 {
+                report(frame, count);
+            }
+        }
+    }
+
     /// The live test revocation; the refault future ends it, as a driver
     /// does once its device is accessible again.
     static REVOCATION: IrqSafeSpinLock<Option<DeviceFrameRevocation>> = IrqSafeSpinLock::new(None);
@@ -236,12 +245,12 @@ mod both {
                 Ok(())
             }
         };
-        let census = [(f[0], 2), (f[1], 2), (f[2], 1), (f[3], 1)];
+        let counts = [(f[0], 2), (f[1], 2), (f[2], 1), (f[3], 1)];
         // 1. The provider counts an alias the snapshot lacks.
         set_aliases(&[(f[0], 3), (f[1], 2), (f[2], 1), (f[3], 1)]);
         // SAFETY: the test owns the aperture; both roots are live.
         let refused =
-            unsafe { revoke_device_frames(&both, f[0], 4 * PAGE, &f, aliases, refault.clone()) };
+            unsafe { revoke_device_frames(&both, f[0], 4 * PAGE, census, refault.clone()) };
         if refused.err() != Some(AddressSpaceError::Pinned) {
             return TestResult::Fail("census shortfall was not refused");
         }
@@ -249,25 +258,35 @@ mod both {
             return result;
         }
         // 2. A space missing from the snapshot.
-        set_aliases(&census);
+        set_aliases(&counts);
         // SAFETY: as above.
-        let refused = unsafe {
-            revoke_device_frames(&both[..1], f[0], 4 * PAGE, &f, aliases, refault.clone())
-        };
+        let refused =
+            unsafe { revoke_device_frames(&both[..1], f[0], 4 * PAGE, census, refault.clone()) };
         if refused.err() != Some(AddressSpaceError::Pinned) {
             return TestResult::Fail("missing space was not refused");
         }
         if let Err(result) = untouched("missing-space refusal changed a leaf") {
             return result;
         }
-        // 3. Success.
+        // 3. An alias the provider does not own (f[3] unreported).
+        set_aliases(&counts[..3]);
         // SAFETY: as above.
-        let revocation = match unsafe {
-            revoke_device_frames(&both, f[0], 4 * PAGE, &f, aliases, refault.clone())
-        } {
-            Ok(revocation) => revocation,
-            Err(_) => return TestResult::Fail("revocation refused"),
-        };
+        let refused =
+            unsafe { revoke_device_frames(&both, f[0], 4 * PAGE, census, refault.clone()) };
+        if refused.err() != Some(AddressSpaceError::Pinned) {
+            return TestResult::Fail("an unowned alias was not refused");
+        }
+        if let Err(result) = untouched("unowned-alias refusal changed a leaf") {
+            return result;
+        }
+        set_aliases(&counts);
+        // 4. Success.
+        // SAFETY: as above.
+        let revocation =
+            match unsafe { revoke_device_frames(&both, f[0], 4 * PAGE, census, refault.clone()) } {
+                Ok(revocation) => revocation,
+                Err(_) => return TestResult::Fail("revocation refused"),
+            };
         if present.iter().any(|(s, va, _)| leaf(s, *va).is_some())
             || slot(&a, va1, 0) != f[0]
             || slot(&a, va1, 1) != f[1]
@@ -285,8 +304,7 @@ mod both {
             return TestResult::Fail("revocation did not fire Clear");
         }
         // SAFETY: as above.
-        let overlap =
-            unsafe { revoke_device_frames(&both, f[1], PAGE, &[], aliases, refault.clone()) };
+        let overlap = unsafe { revoke_device_frames(&both, f[1], PAGE, census, refault.clone()) };
         if overlap.err() != Some(AddressSpaceError::Overlap) {
             return TestResult::Fail("an overlapping revocation was admitted");
         }
@@ -325,7 +343,7 @@ mod both {
         if rebound != Err(AddressSpaceError::Pinned) || slot(&b, va3, 0) != f[2] {
             return TestResult::Fail("a revoked frame was rebound");
         }
-        // 4. End it: the next fault repairs the same frame, owner once.
+        // 5. End it: the next fault repairs the same frame, owner once.
         drop(revocation);
         if f.iter().any(|p| is_device_frame_revoked(*p)) {
             return TestResult::Fail("dropping the revocation did not end it");
@@ -385,14 +403,7 @@ mod both {
         let refault = Refault::new();
         // SAFETY: the test owns the frame; the root is live.
         match unsafe {
-            revoke_device_frames(
-                &[space.clone()],
-                frame,
-                PAGE,
-                &[frame],
-                aliases,
-                refault.clone(),
-            )
+            revoke_device_frames(&[space.clone()], frame, PAGE, census, refault.clone())
         } {
             Ok(revocation) => *REVOCATION.lock() = Some(revocation),
             Err(_) => return TestResult::Fail("revocation refused"),

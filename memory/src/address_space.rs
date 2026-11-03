@@ -33,8 +33,8 @@ mod shared_relocation;
 use crate::region_backing::RegionBacking;
 pub use device_revoke::{
     install_refault_wait, is_revoked as is_device_frame_revoked, revoke_device_frames,
-    DeviceFrameRefault, DeviceFrameRevocation, DeviceRefaultError, DeviceRefaultFuture,
-    DeviceRefaultWait, MAX_DEVICE_REVOCATIONS,
+    DeviceAliasCensus, DeviceFrameRefault, DeviceFrameRevocation, DeviceRefaultError,
+    DeviceRefaultFuture, DeviceRefaultWait, MAX_DEVICE_REVOCATIONS,
 };
 use region_index::RegionIndex;
 pub use remote_access::{RemoteAccess, RemoteBuf};

@@ -80,6 +80,11 @@ pub fn install_refault_wait(wait: Option<DeviceRefaultWait>) -> Option<DeviceRef
 /// Bound on simultaneously live revocations (one per suspended device).
 pub const MAX_DEVICE_REVOCATIONS: usize = 16;
 
+/// The device provider's alias census over `[start, end)`: report
+/// `(frame, metadata aliases)` once for every frame with a nonzero count.
+/// See [`revoke_device_frames`] for when it runs and what it may do.
+pub type DeviceAliasCensus = fn(u64, u64, &mut dyn FnMut(u64, usize));
+
 struct Entry {
     id: u64,
     start: u64,
@@ -225,22 +230,23 @@ struct Alias {
 /// the range in a private region or mapped by a leaf that does not translate
 /// to exactly it (`Overlap`); a pinned frame, a present leaf without its
 /// reverse-map owner, or a census mismatch, meaning an alias outside
-/// `spaces` (`Pinned`); no free registry slot or no memory
-/// (`AllocationFailed`).
+/// `spaces` or one the provider does not count (`Pinned`); no free registry
+/// slot or no memory (`AllocationFailed`).
 ///
 /// # Safety
 /// The range must be device memory the caller owns for as long as the handle
 /// lives, and every space must own a live root or a zero metadata-only root.
-/// `mapped` must name every frame of the range with an external metadata
-/// alias, and `aliases` must count those aliases, including aliases not yet
-/// scheduler-visible; it runs with every region table of `spaces` locked and
-/// may take only leaf locks.
+/// `census(start, end, report)` must call `report(frame, aliases)` once for
+/// every frame in `[start, end)` with a nonzero external metadata-alias
+/// count, including aliases not yet scheduler-visible. It runs inside the
+/// global shared-mapping transaction (which excludes every alias change)
+/// with every region table of `spaces` locked: it may take only leaf locks
+/// and must not allocate.
 pub unsafe fn revoke_device_frames(
     spaces: &[Arc<AddressSpace>],
     start: PhysAddr,
     len: u64,
-    mapped: &[PhysAddr],
-    aliases: fn(u64) -> usize,
+    census: DeviceAliasCensus,
     refault: Arc<dyn DeviceFrameRefault>,
 ) -> Result<DeviceFrameRevocation, AddressSpaceError> {
     let lo = start.raw();
@@ -248,12 +254,6 @@ pub unsafe fn revoke_device_frames(
         .checked_add(len)
         .filter(|_| lo != 0 && lo & 4095 == 0 && len != 0 && len & 4095 == 0)
         .ok_or(AddressSpaceError::AlignmentMismatch)?;
-    if mapped
-        .iter()
-        .any(|phys| phys.raw() & 4095 != 0 || !(lo..hi).contains(&phys.raw()))
-    {
-        return Err(AddressSpaceError::AlignmentMismatch);
-    }
     let mut spaces: Vec<_> = spaces.iter().collect();
     spaces.sort_unstable_by_key(|space| space.identity());
     spaces.dedup_by_key(|space| space.identity());
@@ -323,32 +323,42 @@ pub unsafe fn revoke_device_frames(
                 }
             }
         }
-        // Census: every present leaf is reverse-mapped; per frame, the found
-        // metadata aliases equal the provider's count and the reverse-map
-        // owners are exactly the tracked aliases found; a frame the provider
-        // counts but no snapshot space holds is an alias outside `spaces`.
+        // Census: every present leaf is reverse-mapped and its frame unpinned;
+        // per frame, the reverse-map owners are exactly the tracked aliases
+        // found. The provider then reports every aliased frame of the range,
+        // under this transaction, which excludes every alias change: each
+        // report must equal the aliases found for it (a frame no snapshot
+        // space holds is an alias outside `spaces`), and every frame found
+        // must be reported (an alias the provider does not own).
         found.sort_unstable_by_key(|alias| alias.phys.raw());
         if found.iter().any(|alias| alias.present && !alias.tracked) {
             return Err(AddressSpaceError::Pinned);
         }
+        let mut distinct = 0usize;
         for run in found.chunk_by(|a, b| a.phys == b.phys) {
             let phys = run[0].phys;
             let tracked = run.iter().filter(|alias| alias.tracked).count();
-            if crate::frame::cow::is_pinned(phys)
-                || run.len() != aliases(phys.raw())
-                || crate::rmap::owner_count(phys) != tracked
-            {
+            if crate::frame::cow::is_pinned(phys) || crate::rmap::owner_count(phys) != tracked {
                 return Err(AddressSpaceError::Pinned);
             }
+            distinct += 1;
         }
-        for &phys in mapped {
-            if found
-                .binary_search_by_key(&phys.raw(), |alias| alias.phys.raw())
-                .is_err()
-                && aliases(phys.raw()) != 0
-            {
-                return Err(AddressSpaceError::Pinned);
+        let mut reported = 0usize;
+        let mut consistent = true;
+        census(lo, hi, &mut |frame, count| {
+            let first = found.partition_point(|alias| alias.phys.raw() < frame);
+            let held = found[first..]
+                .iter()
+                .take_while(|alias| alias.phys.raw() == frame)
+                .count();
+            if !(lo..hi).contains(&frame) || held != count || count == 0 {
+                consistent = false;
+            } else {
+                reported += 1;
             }
+        });
+        if !consistent || reported != distinct {
+            return Err(AddressSpaceError::Pinned);
         }
         // Publish before removing any leaf: from here every installer masks
         // the range and every fault on it refaults.

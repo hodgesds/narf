@@ -538,14 +538,22 @@ pub const MAX_DEVICE_REVOCATIONS: usize = 16;
 pub struct DeviceFrameRevocation { /* registry id, range */ }
 impl DeviceFrameRevocation { pub fn range(&self) -> (PhysAddr, u64); }
 pub fn is_device_frame_revoked(phys: PhysAddr) -> bool;
+/// The provider's census: report (frame, metadata aliases) for every frame
+/// of [start, end) with a nonzero count. Runs inside the global shared
+/// transaction with every named region table locked; leaf locks only, no
+/// allocation.
+pub type DeviceAliasCensus = fn(u64, u64, &mut dyn FnMut(u64, usize));
 /// Remove every present leaf of [start, start + len) in `spaces` (and its
 /// rmap owner), fire Clear per space, complete every TLB invalidation, and
 /// keep the range revoked: VMAs, slots and alias references stay. Refused
-/// with nothing changed on a census mismatch or pinned frame (Pinned), a
-/// private alias, inexact leaf or overlapping revocation (Overlap), a bad
-/// range (AlignmentMismatch), or a full registry (AllocationFailed).
+/// with nothing changed on a census mismatch (a reported frame whose found
+/// aliases differ, or a found frame never reported), an unowned present
+/// leaf or a pinned frame (Pinned), a private alias, inexact leaf or
+/// overlapping revocation (Overlap), a bad range (AlignmentMismatch), or a
+/// full registry (AllocationFailed). With an empty `spaces` it succeeds only
+/// if the provider reports no alias at all.
 pub unsafe fn revoke_device_frames(spaces: &[Arc<AddressSpace>], start: PhysAddr,
-    len: u64, mapped: &[PhysAddr], aliases: fn(u64) -> usize,
+    len: u64, census: DeviceAliasCensus,
     refault: Arc<dyn DeviceFrameRefault>) -> Result<DeviceFrameRevocation, AddressSpaceError>;
 /// While a revocation lives: materialize (mmap, fork child), mprotect and
 /// with_revoked_shared_frames/replace_shared_frame never map a frame of it in

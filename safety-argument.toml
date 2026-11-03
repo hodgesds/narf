@@ -2227,3 +2227,8 @@ argument = "No new denial-of-service lever. Only a driver can create a revocatio
 ref = "security-model/specification/spec.md#L147"
 agent = "Claude Opus 5.5"
 argument = "An untrusted process can only touch revoked pages of its own mappings: its access faults, waits for the driver to resume the device or gets SIGBUS, and never reaches the aperture while the device is in D3. mmap, mprotect, mremap, fork and munmap of such mappings keep their validation, errnos and results; their leaves are simply left for the fault. A process cannot create, extend or end a revocation."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L165"
+agent = "Claude Opus 5.5"
+argument = "Device revocation's census now runs entirely inside the global shared-mapping transaction. The provider reports every aliased frame of the range there (DeviceAliasCensus), instead of revoke_device_frames trusting a frame list the caller built before the transaction. Every alias change (mmap publication, fork, munmap, mremap) holds a shared-transaction shard, which the global transaction excludes, so the reported counts are exact. A frame aliased by an address space outside the snapshot, even one created after the snapshot, is reported and refused, so no leaf of the range survives revocation. A found frame the provider never reports (an alias it does not own) is refused too. With an empty snapshot the call succeeds only when no alias exists, which lets the filesystem seam revoke before the syscall layer has installed its VM owner. The callback takes only its provider's leaf lock and does not allocate. memory/ change only; no other invariant moves."
