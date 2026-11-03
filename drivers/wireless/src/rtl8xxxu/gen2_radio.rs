@@ -12,8 +12,10 @@
 //! a grant minted from the same signed record and authenticated domain
 //! (`Authority::grant`), through a cold `retune` (`rtl8xxxu_stop`, the
 //! chip power-off and a fresh `rtl8xxxu_init_device` lifecycle, then
-//! `rtl8xxxu_start` on the new channel). The packet owner never sets
-//! QoS/HT, so this station is a legacy 20 MHz non-QoS station.
+//! `rtl8xxxu_start` on the new channel). QoS DATA needs the programmed
+//! EDCA rows; HT20 MCS reception, firmware-RA HT masks and A-MPDU fields
+//! need a negotiated HT association (`associate(.., ht = true)`) whose
+//! local capability is `ht_local` (the signed admitted MCS set).
 use super::{
     btcoex::Coex,
     firmware_transport::{ControlIo, Error as ControlError, Owner as Firmware, Stage},
@@ -25,6 +27,7 @@ use super::{
     rtl8192e_ra::{Peer, Ra},
 };
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use narf_wireless::association::phy::{HtGi, HtWidth, LocalHt, LocalPhy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -153,28 +156,121 @@ const REG_SLOT: u16 = 0x51b;
 const REG_BEACON_CTRL: u16 = 0x550;
 const REG_MACID: u16 = 0x610;
 const REG_BSSID: u16 = 0x618;
+const REG_AGGLEN_LMT: u16 = 0x458;
+const REG_AMPDU_MIN_SPACE: u16 = 0x45c;
+/// `DESC_RATE_MCS0`.
+const MCS0: u8 = 12;
 const BEACON_ATIM: u8 = 1 << 0;
 const BEACON_FUNCTION_ENABLE: u8 = 1 << 3;
 const BEACON_DISABLE_TSF_UPDATE: u8 = 1 << 4;
 const MSR_LINKTYPE_STATION: u8 = 2;
 
-/// A gen2 rxdesc24 MPDU in the shared management/security frame type. Only
-/// legacy 20 MHz plaintext MPDUs reach this (`Frame::admitted(false, ..)`),
-/// so no rxdesc16 word or HT40 seal is carried.
+/// A gen2 rxdesc24 MPDU admitted by `admit` in the shared
+/// management/security frame type. No rxdesc16 word or HT40 seal is
+/// carried (`Mpdu::admitted` is never the gen2 gate; `station_admitted`
+/// is); `ba` carries the descriptor's A-MPDU (`paggr`) bit, which `admit`
+/// passed only on a TID with an accepted recipient session.
 pub(super) fn mpdu(frame: rtl8192e_packet::Frame) -> Mpdu {
     Mpdu {
+        ht: frame.ht(),
         bytes: frame.bytes,
         phy: frame.phy,
         rate: frame.rate,
-        ht: false,
         bandwidth40: frame.bandwidth40,
         tid: frame.tid,
         decrypted: frame.decrypted,
         timestamp: frame.timestamp,
         native: None,
         wide: None,
-        ba: false,
+        ba: frame.paggr,
     }
+}
+
+/// Gen2 station RX admission of one rxdesc24 MPDU (`rtl8xxxu_parse_rxdesc24`
+/// facts, checked before any crypto): legacy 20 MHz plaintext always; with
+/// a negotiated HT20 association (`ht`) also HT MCS within the advertised
+/// RX streams at 20 MHz (`Frame::admitted(ht, false, ba)`), A-MPDU members
+/// only on a TID in `rx_ba` (accepted recipient sessions), and a
+/// standalone A-MSDU whose descriptor and QoS-header A-MSDU bits agree,
+/// never inside an A-MPDU (the ADDBA response clears A-MSDU permission:
+/// rtl8xxxu lacks `SUPPORTS_AMSDU_IN_AMPDU`).
+pub(super) fn admit(frame: &rtl8192e_packet::Frame, ht: bool, rx_ba: u8, streams: u8) -> bool {
+    if frame.ht() && (!ht || frame.rate >= MCS0 + 8 * streams.clamp(1, 2)) {
+        return false;
+    }
+    let ba = ht && frame.qos && frame.tid < 8 && rx_ba & (1 << frame.tid) != 0;
+    if !frame.amsdu {
+        return frame.admitted(ht, false, ba);
+    }
+    let b = &frame.bytes;
+    ht && frame.ht()
+        && frame.qos
+        && !frame.paggr
+        && !frame.decrypted
+        && !frame.more_frag
+        && !frame.ldpc
+        && !frame.stbc
+        && !frame.bandwidth40
+        && b.len() >= 26
+        && b[0] == 0x88
+        && b[1] & 4 == 0
+        && b[22] & 15 == 0
+        && b[24] & 0x80 != 0
+        && b[24] & 0x70 == 0
+        && b[24] & 15 == frame.tid
+        && b[25] == 0
+}
+
+/// The station-level gate for a gen2 `Mpdu` (descriptor facts already
+/// checked by `admit`): plaintext 20 MHz, legacy rates, or HT MCS0..15
+/// only under a negotiated HT association.
+pub(super) fn station_admitted(frame: &Mpdu, ht: bool) -> bool {
+    !frame.decrypted
+        && !frame.bandwidth40
+        && frame.native.is_none()
+        && frame.wide.is_none()
+        && if frame.ht {
+            ht && (MCS0..MCS0 + 16).contains(&frame.rate)
+        } else {
+            frame.rate < MCS0 && !frame.ba
+        }
+}
+
+/// `rtl8xxxu_probe` HT capability (core.c `sband->ht_cap`) for HT20:
+/// `IEEE80211_HT_MAX_AMPDU_64K` (3), `IEEE80211_HT_MPDU_DENSITY_16` (7),
+/// `IEEE80211_HT_CAP_SGI_20`, `rx_mask[0] = 0xff` and, for a second path,
+/// `rx_mask[1] = 0xff`, `IEEE80211_HT_MCS_TX_DEFINED`. Two streams require a
+/// 2T board whose signed record admits MCS8..15 (a 1T2R RTL8191EU or a 2T
+/// record without 2SS rows advertises one stream). TX selection is the
+/// signed admitted MCS set; a record admitting no MCS keeps the legacy
+/// station. Not advertised: SUP_WIDTH_20_40/SGI_40 (HT40 is not granted)
+/// and MCS32 (`rx_mask[4]`, an HT40-only duplicate).
+pub(super) fn ht_local(admitted: u32, tx_paths: u8) -> Option<LocalPhy> {
+    LocalPhy::ht20(ht_capability(admitted, tx_paths)?).ok()
+}
+pub(super) fn ht_capability(admitted: u32, tx_paths: u8) -> Option<LocalHt> {
+    let one = (admitted >> 12) as u8;
+    let two = (admitted >> 20) as u8;
+    let two_ss = tx_paths == 2 && two != 0;
+    if one == 0 && !two_ss {
+        return None;
+    }
+    let mut mask = [0u8; 10];
+    mask[0] = 0xff;
+    mask[1] = if two_ss { 0xff } else { 0 };
+    let mut selection = [0u8; 10];
+    selection[0] = one;
+    selection[1] = if two_ss { two } else { 0 };
+    let gi = HtGi {
+        rx20: true,
+        tx20: true,
+        rx40: false,
+        tx40: false,
+    };
+    LocalHt::new(mask, mask, HtWidth::Twenty, gi, 3, 7)
+        .ok()?
+        .with_tx_selection(selection)
+        .ok()
 }
 
 /// `rtl8xxxu_rx_addr_match` for the EWMA: bound-BSS frames to us or beacons.
@@ -236,6 +332,10 @@ pub struct Radio<C: ControlIo, B: PacketIo> {
     /// Physical receive-stream generation: advanced by every completed cold
     /// restart, so an observation names the stream that copied it.
     generation: u64,
+    /// Negotiated HT20 association: HT RX admission and HT TX fields.
+    ht: bool,
+    /// TIDs with an accepted recipient BA session (A-MPDU RX admission).
+    rx_ba: u8,
 }
 impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Radio<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -300,6 +400,8 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             coex,
             bt: VecDeque::new(),
             generation: 1,
+            ht: false,
+            rx_ba: 0,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -326,6 +428,18 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// The local HT20 capability this board's signed record supports.
+    pub(super) fn ht_local(&self) -> Option<LocalPhy> {
+        ht_local(self.grant.admitted(), self.tx_paths)
+    }
+    /// Advertised RX spatial streams (`rx_mask[1]` present).
+    fn streams(&self) -> u8 {
+        if self.tx_paths == 2 && self.grant.admitted() >> 20 & 0xff != 0 {
+            2
+        } else {
+            1
+        }
     }
     pub(super) fn bound(&self) -> bool {
         self.peer.is_some()
@@ -429,6 +543,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             }
         };
         let chip = self.chip();
+        let streams = self.streams();
         let mut frames = Vec::new();
         for record in records {
             match record {
@@ -448,7 +563,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
                             self.rssi.add(signal.unwrap_or(0));
                         }
                     }
-                    if frame.admitted(false, false, false) {
+                    if admit(&frame, self.ht, self.rx_ba, streams) {
                         frames.push(mpdu(frame));
                     }
                 }
@@ -584,11 +699,16 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
     }
     /// `BSS_CHANGED_ASSOC` with association: `Ra::new` over the admitted mask
     /// (refused, never narrowed), then `ra_connect_8192e` (both gen2 chips
-    /// share `rtl8xxxu_gen2_update_rate_mask`/`gen2_report_connect`).
+    /// share `rtl8xxxu_gen2_update_rate_mask`/`gen2_report_connect`). An HT
+    /// peer (`peer.ht`) needs the programmed EDCA rows (HT implies WMM) and a
+    /// local HT capability; it then admits HT RX and HT TX fields.
     pub async fn associate(&mut self, aid: u16, peer: Peer, now: u64) -> Result<(), Error> {
         self.current()?;
         if self.phase() != Phase::Receiving || self.peer.is_none() || self.ra.is_some() {
             return Err(Error::State);
+        }
+        if peer.ht && (!self.packets.qos || self.ht_local().is_none()) {
+            return Err(Error::Profile);
         }
         let mut ra = Ra::new(peer, self.grant.admitted(), self.tx_paths, false)
             .map_err(|_| Error::Profile)?;
@@ -598,6 +718,8 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         match result {
             Ok(()) => {
                 self.ra = Some(ra);
+                self.ht = peer.ht;
+                self.packets.ht = peer.ht;
                 self.rssi = Rssi::default();
                 self.next_watchdog = now.saturating_add(WATCHDOG_MS);
                 Ok(())
@@ -670,6 +792,10 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             }
             self.peer = None;
             self.bt.clear();
+            self.ht = false;
+            self.rx_ba = 0;
+            self.packets.ht = false;
+            self.packets.ampdu = None;
             let f = &self.firmware;
             f.write8(REG_TXPAUSE, 0xff).await.map_err(Error::Control)?;
             for reg in [REG_RXFLTMAP0, REG_RXFLTMAP2] {
@@ -773,9 +899,63 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         }
         Ok(())
     }
+    /// Host BA facts, no device access: the HT peer's MPDU density with the
+    /// operational originator TIDs (`priv->tid_tx_operational`) for the
+    /// txdesc40 A-MPDU fields, and the recipient-session TIDs whose A-MPDU
+    /// members `poll` admits. Both are empty without an HT association.
+    pub(super) fn set_ba(&mut self, tx: Option<(u8, u8)>, rx: u8) {
+        self.packets.ampdu = tx.filter(|_| self.ht);
+        self.rx_ba = if self.ht { rx } else { 0 };
+    }
+    /// `rtl8xxxu_set_ampdu_factor` + `rtl8xxxu_set_ampdu_min_space`, issued
+    /// by `rtl8xxxu_ampdu_action` TX_START (peer factor/density) and every
+    /// TX_STOP (both 0): `REG_AGGLEN_LMT` 0x458..0x45b from
+    /// `{0x41, 0xa8, 0x72, 0xb9}` clamped to `1 << (factor + 2)` (max 0xf),
+    /// then the low three bits of `REG_AMPDU_MIN_SPACE` 0x45c. Each write
+    /// has an exact readback; failure is terminal.
+    pub(super) async fn configure_ampdu(&mut self, factor: u8, density: u8) -> Result<(), Error> {
+        self.current()?;
+        if self.phase() != Phase::Receiving || !self.ht || factor > 3 || density > 7 {
+            return Err(Error::State);
+        }
+        let limit = (1u8 << (factor + 2)).min(0xf);
+        let values = [0x41u8, 0xa8, 0x72, 0xb9].map(|mut v| {
+            if v & 0xf0 > limit << 4 {
+                v = (v & 0x0f) | limit << 4;
+            }
+            if v & 0x0f > limit {
+                v = (v & 0xf0) | limit;
+            }
+            v
+        });
+        let mut attempt = self.attempt();
+        let result = async {
+            let f = &self.firmware;
+            for (i, value) in values.into_iter().enumerate() {
+                let reg = REG_AGGLEN_LMT + i as u16;
+                f.write8(reg, value).await.map_err(Error::Control)?;
+                if f.read8(reg).await.map_err(Error::Control)? != value {
+                    return Err(Error::State);
+                }
+            }
+            let space =
+                (f.read8(REG_AMPDU_MIN_SPACE).await.map_err(Error::Control)? & 0xf8) | density;
+            f.write8(REG_AMPDU_MIN_SPACE, space)
+                .await
+                .map_err(Error::Control)?;
+            if f.read8(REG_AMPDU_MIN_SPACE).await.map_err(Error::Control)? != space {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        result.inspect_err(|_| self.fail_terminal())
+    }
     /// `rtl8xxxu_conf_tx` for BE/BK/VI/VO (`REG_EDCA_*_PARAM` 0x508/0x50c/
-    /// 0x504/0x500 with `rtl8xxxu_set_aifs` SIFS 10 (legacy 2.4 GHz) plus
-    /// AIFSN slots, via `wmm_runtime::words_profile`), each with an exact
+    /// 0x504/0x500 with `rtl8xxxu_set_aifs` SIFS 10 (legacy 2.4 GHz; 16 for
+    /// an HT peer, `WIRELESS_MODE_N_24G`) plus AIFSN slots, via
+    /// `wmm_runtime::words_profile`), each with an exact
     /// readback, then `REG_ACM_HW_CTRL` mirroring each AC's ACM. Rows this
     /// profile cannot program (BE ACM, ECW/AIFSN geometry, 8-bit AIFS) are
     /// refused before any write. Only afterwards may QoS DATA (txdesc40 AC
@@ -784,13 +964,14 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         &mut self,
         p: narf_wireless::wmm::Parameters,
         short_slot: bool,
+        ht: bool,
     ) -> Result<(), Error> {
         self.current()?;
         if self.phase() != Phase::Receiving || self.peer.is_none() {
             return Err(Error::State);
         }
         let values =
-            super::wmm_runtime::words_profile(p, short_slot, false).map_err(|_| Error::Profile)?;
+            super::wmm_runtime::words_profile(p, short_slot, ht).map_err(|_| Error::Profile)?;
         let mut attempt = self.attempt();
         let result = async {
             let f = &self.firmware;

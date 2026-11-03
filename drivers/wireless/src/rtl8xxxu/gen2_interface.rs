@@ -131,8 +131,12 @@ async fn listen<C: ControlIo, B: PacketIo>(
         match radio.poll()? {
             Some(frames) => {
                 for frame in frames {
-                    if let Ok(bss) = Candidate::from_receive(&frame, radio.channel(), radio.local())
-                    {
+                    if let Ok(bss) = Candidate::from_receive_with_phy(
+                        &frame,
+                        radio.channel(),
+                        radio.local(),
+                        radio.ht_local().as_ref(),
+                    ) {
                         remember(cache, bss, now_ms(), radio.generation());
                     }
                 }
@@ -174,7 +178,12 @@ async fn probe_visit<C: ControlIo, B: PacketIo>(
         }
         if let Some(frames) = radio.poll()? {
             for frame in frames {
-                if let Ok(bss) = Candidate::from_receive(&frame, radio.channel(), radio.local()) {
+                if let Ok(bss) = Candidate::from_receive_with_phy(
+                    &frame,
+                    radio.channel(),
+                    radio.local(),
+                    radio.ht_local().as_ref(),
+                ) {
                     remember(cache, bss, now_ms(), radio.generation());
                 }
             }

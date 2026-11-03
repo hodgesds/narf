@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+mod ba_sessions;
 pub mod btcoex;
 mod calibration;
 mod calibration_regs;

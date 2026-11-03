@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One legacy 20 MHz station transaction over the gen2 radio, shared by
-//! RTL8192EU and RTL8723BU. The join plan, the shared RSNA/software-CCMP
+//! One 20 MHz station transaction over the gen2 radio, shared by RTL8192EU
+//! and RTL8723BU: legacy, optional WMM and, against a WMM HT AP when the
+//! signed record admits MCS, optional HT20 (`Radio::ht_local`) with host
+//! Block Ack sessions (`ba_sessions`). The join plan, the shared RSNA/software-CCMP
 //! supplicant and the Ethernet conversion are the RTL8188EU station's
 //! (`station_runtime`); rate control is the gen2 firmware's (`ra_connect`
 //! at association, `rtl8xxxu_ra_iter` every 2 s, C2H RA reports), and the
 //! RTL8723BU BT-coexistence policy sees `rtl8xxxu_is_assoc` from here.
 use super::{
+    ba_sessions::{Sessions, Work},
     firmware_transport::ControlIo,
     gen2_radio::{self, Radio},
     management_runtime::{self, Action, Candidate, Join, SecurityMode},
@@ -45,6 +48,15 @@ enum Tx {
     Management,
     Eapol,
     Data,
+    /// Driver-owned BA action (ADDBA Request/Response, DELBA).
+    Control,
+}
+/// One captured MPDU with the controlled-port state at capture.
+struct Captured {
+    frame: Mpdu,
+    admitted: bool,
+    /// Already released by a recipient BA reorder buffer.
+    ordered: bool,
 }
 struct Pending {
     kind: Tx,
@@ -58,6 +70,8 @@ const TX_MS: u64 = 1000;
 /// Beacon loss bound for the open station.
 const PEER_LOSS_MS: u64 = 5000;
 const RX_QUEUE: usize = 32;
+/// Bound on queued BA action frames.
+const CONTROLS: usize = 8;
 const BATCH: usize = 256;
 
 /// `rtl8xxxu_refresh_rate_mask` peer inputs for a legacy association:
@@ -120,7 +134,7 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     pmk: Option<Zeroizing<[u8; 32]>>,
     security: Option<Security>,
     pending: Option<Pending>,
-    batch: VecDeque<(Mpdu, bool)>,
+    batch: VecDeque<Captured>,
     received: VecDeque<Vec<u8>>,
     delivered_reply: Option<usize>,
     deadline: u64,
@@ -136,6 +150,9 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     edca_pending: Option<narf_wireless::wmm::Parameters>,
     /// Open-station per-TID QoS DATA sequence spaces.
     qos_sequence: [u16; 8],
+    /// Recipient/originator BA sessions (HT association only).
+    ba: Sessions<Captured>,
+    controls: VecDeque<Vec<u8>>,
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -159,8 +176,16 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         // A WMM AP selects the optional QoS station: the join plan appends
         // the Information IE (no U-APSD) and requires valid response rows.
-        let plan =
-            Join::prepare(candidate, radio.local(), ssid, mode).map_err(Error::Management)?;
+        // mac80211 `ieee80211_determine_chan_mode` disables HT without WMM;
+        // with WMM the signed record's HT20 capability is offered (a non-HT
+        // AP still negotiates the legacy/QoS station).
+        let wmm = narf_wireless::wmm::Parameters::parse(candidate.information_elements())
+            .ok()
+            .flatten()
+            .is_some();
+        let phy = if wmm { radio.ht_local() } else { None };
+        let plan = Join::prepare_with_phy(candidate, radio.local(), ssid, mode, phy)
+            .map_err(Error::Management)?;
         Ok(Self {
             radio,
             plan,
@@ -180,6 +205,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             edca: None,
             edca_pending: None,
             qos_sequence: [0; 8],
+            ba: Sessions::default(),
+            controls: VecDeque::new(),
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -221,6 +248,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     }
     fn fail(&mut self) {
         self.batch.clear();
+        self.ba.retire();
+        self.controls.clear();
         self.received.clear();
         self.pending = None;
         self.plan.cancel();
@@ -299,15 +328,28 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if let Some(p) = self.edca_pending.take() {
             self.program_edca(p).await?;
         }
+        if matches!(self.phase, Phase::FourWay | Phase::Open) {
+            self.apply_tx_ba().await?;
+        }
         if !self.progress(now)? {
             return Ok(());
         }
+        self.service_ba(now)?;
         let own = self.radio.local();
+        let local = self.radio.ht_local();
         for _ in 0..16 {
-            let Some((frame, admitted)) = self.batch.pop_front() else {
+            let Some(captured) = self.batch.pop_front() else {
                 break;
             };
-            if let Ok(beacon) = Candidate::from_receive(&frame, self.radio.channel(), own) {
+            let Some(Captured {
+                frame, admitted, ..
+            }) = self.reorder_gate(captured, now)
+            else {
+                continue;
+            };
+            if let Ok(beacon) =
+                Candidate::from_receive_with_phy(&frame, self.radio.channel(), own, local.as_ref())
+            {
                 if let Some(observed) = &mut self.observed {
                     let generation = self.radio.generation();
                     observed.retain(|(old, _, _)| old.bssid() != beacon.bssid());
@@ -343,9 +385,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                     }
                 }
             }
-            if matches!(self.phase, Phase::FourWay | Phase::Open)
-                && self.data_frame(&frame, admitted, now, &mut *nonce)?
-            {
+            if !matches!(self.phase, Phase::FourWay | Phase::Open) {
+                continue;
+            }
+            if self.control_frame(&frame, admitted, now)? {
+                continue;
+            }
+            if self.data_frame(&frame, admitted, now, &mut *nonce)? {
                 return Ok(());
             }
         }
@@ -359,11 +405,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if let Some(p) = self.plan.wmm() {
             self.program_edca(p).await?;
         }
-        let (legacy, _, _) = self.plan.rate_mask_inputs();
         self.radio
-            .associate(aid, legacy_peer(legacy), now)
+            .associate(aid, self.ra_peer(), now)
             .await
             .map_err(Error::Radio)?;
+        self.sync_ba();
         if self.mode.is_wpa2() {
             let own = self.radio.local();
             let body = self.plan.rsn_body().ok_or(Error::State)?;
@@ -394,7 +440,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     async fn program_edca(&mut self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
         let short_slot = self.plan.candidate().capability() & 0x400 != 0;
         self.radio
-            .configure_edca(p, short_slot)
+            .configure_edca(p, short_slot, self.plan.ht_selected())
             .await
             .map_err(Error::Radio)?;
         self.edca = Some(p);
@@ -419,7 +465,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         super::wmm_runtime::words_profile(
             fresh,
             self.plan.candidate().capability() & 0x400 != 0,
-            false,
+            self.plan.ht_selected(),
         )
         .map_err(|_| Error::Profile)?;
         self.edca_pending = Some(fresh);
@@ -455,7 +501,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 if self.batch.len() + frames.len() > BATCH {
                     return Err(Error::State);
                 }
-                self.batch.extend(frames.into_iter().map(|f| (f, admitted)));
+                self.batch.extend(frames.into_iter().map(|frame| Captured {
+                    frame,
+                    admitted,
+                    ordered: false,
+                }));
             }
             None => {
                 if let Some(bytes) = self.delivered_reply.take() {
@@ -466,8 +516,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                         .map_err(Error::Security)?;
                     // Frames captured before the receipt never inherit DATA
                     // admission; only the private EAPOL original passes.
-                    for (_, admitted) in self.batch.iter_mut() {
-                        *admitted = false;
+                    for captured in self.batch.iter_mut() {
+                        captured.admitted = false;
                     }
                     if self.phase == Phase::FourWay
                         && self.security.as_ref().is_some_and(Security::port_open)
@@ -478,7 +528,182 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 }
             }
         }
+        if self.pending.is_none() && self.delivered_reply.is_none() && self.controlled_port_open() {
+            if let Some(body) = self.controls.pop_front() {
+                let frame = self.action_frame(&body)?;
+                self.radio.submit_management(&frame).map_err(Error::Radio)?;
+                self.pending = Some(Pending {
+                    kind: Tx::Control,
+                    deadline: now.saturating_add(TX_MS),
+                });
+            }
+        }
         Ok(self.pending.is_none() && self.delivered_reply.is_none())
+    }
+    /// `rtl8xxxu_refresh_rate_mask` peer inputs: the negotiated
+    /// `supp_rates[0]` and, for an HT association, `ht_cap.mcs.rx_mask[0..2]`
+    /// (peer RX MCS within the signed TX selection) and SGI_20.
+    fn ra_peer(&self) -> rtl8192e_ra::Peer {
+        let (legacy, _, _) = self.plan.rate_mask_inputs();
+        match self.plan.ht_peer() {
+            Some((mcs, sgi)) => rtl8192e_ra::Peer {
+                legacy: legacy & 0xfff,
+                mcs,
+                ht: true,
+                sgi,
+            },
+            None => legacy_peer(legacy),
+        }
+    }
+    /// The peer density and operational originator TIDs for txdesc40, and
+    /// the recipient-session TIDs for A-MPDU RX admission.
+    fn sync_ba(&mut self) {
+        let tx = self
+            .plan
+            .peer_ampdu()
+            .map(|(_, density)| (density, self.ba.operational()));
+        self.radio.set_ba(tx, self.ba.rx_tids());
+    }
+    /// The BA action MPDU: peer-bound, SN from the shared non-QoS space.
+    fn action_frame(&mut self, body: &[u8]) -> Result<Vec<u8>, Error> {
+        let sequence = match &mut self.security {
+            Some(security) => security
+                .reserve_plain_control_sequence()
+                .map_err(Error::Security)?,
+            None => {
+                let sequence = self.sequence;
+                self.sequence = (sequence + 1) & 4095;
+                sequence
+            }
+        };
+        let (own, peer) = (self.radio.local(), self.peer());
+        let mut frame = vec![0xd0, 0, 0, 0];
+        frame.extend_from_slice(&peer);
+        frame.extend_from_slice(&own);
+        frame.extend_from_slice(&peer);
+        frame.extend_from_slice(&(sequence << 4).to_le_bytes());
+        frame.extend_from_slice(body);
+        Ok(frame)
+    }
+    /// mac80211 `ieee80211_rx_reorder_ampdu`: unicast QoS DATA from the bound
+    /// peer on a TID with a recipient session is ordered before CCMP/PN and
+    /// delivery; released captures re-enter the batch head in sequence order
+    /// with their capture-time admission. An A-MPDU member (`ba`) outside a
+    /// session is dropped.
+    fn reorder_gate(&mut self, mut captured: Captured, now: u64) -> Option<Captured> {
+        if captured.ordered || !self.plan.ht_selected() {
+            return Some(captured);
+        }
+        let b = &captured.frame.bytes;
+        if b.len() < 26
+            || b[0] != 0x88
+            || b[1] & 3 != 2
+            || b[4..10] != self.radio.local()
+            || b[10..16] != self.peer()
+            || b[22] & 15 != 0
+        {
+            return (!captured.frame.ba).then_some(captured);
+        }
+        let tid = b[24] & 15;
+        let sequence = u16::from_le_bytes([b[22], b[23]]) >> 4;
+        captured.ordered = true;
+        match self.ba.reorder(tid, sequence, now, captured) {
+            Ok(released) => {
+                for item in released.into_iter().rev() {
+                    self.batch.push_front(item);
+                }
+                None
+            }
+            Err(captured) => (!captured.frame.ba).then_some(captured),
+        }
+    }
+    /// BA session timers (`ba_sessions::Sessions::service`): reorder-hole
+    /// releases re-enter the batch, recipient timeouts queue their DELBA.
+    fn service_ba(&mut self, now: u64) -> Result<(), Error> {
+        if !self.plan.ht_selected() || !matches!(self.phase, Phase::FourWay | Phase::Open) {
+            return Ok(());
+        }
+        let (released, delba) = self.ba.service(now);
+        for item in released.into_iter().rev() {
+            self.batch.push_front(item);
+        }
+        for body in delba {
+            if self.controls.len() >= CONTROLS {
+                return Err(Error::State);
+            }
+            self.controls.push_back(body);
+        }
+        self.sync_ba();
+        Ok(())
+    }
+    /// Peer-bound plaintext Block Ack action frames on an authorized HT
+    /// association; every other Action frame is consumed unchanged.
+    fn control_frame(&mut self, frame: &Mpdu, admitted: bool, now: u64) -> Result<bool, Error> {
+        let b = &frame.bytes;
+        if b.first() != Some(&0xd0) {
+            return Ok(false);
+        }
+        let own = self.radio.local();
+        if !admitted
+            || !self.controlled_port_open()
+            || !self.plan.ht_selected()
+            || !gen2_radio::station_admitted(frame, false)
+            || b.len() < 26
+            || b[1] & 0xc7 != 0
+            || b[4..10] != own
+            || b[10..16] != self.peer()
+            || b[16..22] != self.peer()
+            || b[22] & 15 != 0
+            || b[24] != 3
+        {
+            return Ok(true);
+        }
+        if self.controls.len() >= CONTROLS {
+            return Err(Error::State);
+        }
+        if let Some(body) = self.ba.action(&b[24..], now) {
+            self.controls.push_back(body);
+        }
+        self.sync_ba();
+        Ok(true)
+    }
+    /// `rtl8xxxu_ampdu_action` TX_START/TX_STOP EP0 work, then the ADDBA
+    /// Request (SSN = the TID's next QoS sequence) or the initiator DELBA.
+    async fn apply_tx_ba(&mut self) -> Result<(), Error> {
+        let now = self.last_now;
+        while let Some(work) = self.ba.work() {
+            if self.controls.len() >= CONTROLS {
+                return Err(Error::State);
+            }
+            let body = match work {
+                Work::Start(tid) => {
+                    let (factor, density) = self.plan.peer_ampdu().ok_or(Error::State)?;
+                    self.radio
+                        .configure_ampdu(factor, density)
+                        .await
+                        .map_err(Error::Radio)?;
+                    let ssn = match &self.security {
+                        Some(security) => {
+                            security.next_qos_sequence(tid).map_err(Error::Security)?
+                        }
+                        None => self.qos_sequence[usize::from(tid)],
+                    };
+                    self.ba.requested(tid, ssn, now)
+                }
+                Work::Stop(tid) => {
+                    self.radio
+                        .configure_ampdu(0, 0)
+                        .await
+                        .map_err(Error::Radio)?;
+                    self.ba.stopped(tid)
+                }
+            };
+            if let Some(body) = body {
+                self.controls.push_back(body);
+            }
+            self.sync_ba();
+        }
+        Ok(())
     }
     fn data_frame(
         &mut self,
@@ -487,11 +712,42 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         now: u64,
         nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<bool, Error> {
-        if !frame.admitted(false) {
+        let ht = self.plan.ht_selected();
+        if !gen2_radio::station_admitted(frame, ht) {
             return Ok(false);
         }
         let b = &frame.bytes;
         let own = self.radio.local();
+        if b.first() == Some(&0x88) && b.get(24).is_some_and(|q| q & 0x80 != 0) {
+            // A standalone A-MSDU (HT only): whole-aggregate authentication
+            // and deaggregation; a bad MIC or subframe publishes nothing.
+            if !admitted || !self.controlled_port_open() || !ht || self.received.len() >= RX_QUEUE {
+                return Ok(false);
+            }
+            let frames = if let Some(security) = &mut self.security {
+                security.receive_amsdu(frame).map_err(Error::Security)?
+            } else if b.len() >= 26
+                && b[1] & 0xc7 == 2
+                && b[4..10] == own
+                && b[10..16] == self.peer()
+                && b[16] & 1 == 0
+                && b[16..22] != [0; 6]
+                && b[22] & 15 == 0
+                && b[24] & 0x70 == 0
+                && b[25] == 0
+            {
+                narf_wireless::amsdu::decode(&b[26..], own, b[4..10].try_into().unwrap()).ok()
+            } else {
+                None
+            };
+            if let Some(frames) = frames {
+                if self.received.len() + frames.len() <= RX_QUEUE {
+                    self.received.extend(frames);
+                    self.last_peer = now;
+                }
+            }
+            return Ok(false);
+        }
         if !admitted && !private_eapol(b, own, self.peer()) {
             return Ok(false);
         }
@@ -563,6 +819,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         // installed AP rows choose the TID; the codec maps its AC to the
         // txdesc40 queue and the queue-map bulk-OUT pipe.
         let tid = self.edca.map(|p| crate::rtlwifi::wmm::priority(frame, &p));
+        // `rtl8xxxu_tx`: the first QoS DATA on an idle TID to an HT peer
+        // starts its originator session (the frame itself goes unaggregated).
+        if let (Some(tid), true) = (tid, self.plan.ht_selected()) {
+            self.ba.note_tx(tid, now);
+        }
         let native = if let Some(security) = &mut self.security {
             match match tid {
                 Some(tid) => security.transmit_ethernet_qos(frame, tid),
@@ -613,6 +874,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         self.phase = Phase::Stopping;
         self.received.clear();
+        self.ba.retire();
+        self.controls.clear();
         self.pmk = None;
         if let Some(security) = &mut self.security {
             security.fail();
@@ -743,15 +1006,25 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 .map_err(Error::Radio)?;
             if let Some(p) = self.edca {
                 self.radio
-                    .configure_edca(p, short_slot)
+                    .configure_edca(p, short_slot, self.plan.ht_selected())
                     .await
                     .map_err(Error::Radio)?;
             }
-            let (legacy, _, _) = self.plan.rate_mask_inputs();
             self.radio
-                .associate(aid, legacy_peer(legacy), now)
+                .associate(aid, self.ra_peer(), now)
                 .await
-                .map_err(Error::Radio)
+                .map_err(Error::Radio)?;
+            self.sync_ba();
+            // The cold restart reset REG_AGGLEN_LMT/REG_AMPDU_MIN_SPACE; a
+            // started originator session keeps its TX_START limits.
+            if self.ba.tx_started() {
+                let (factor, density) = self.plan.peer_ampdu().ok_or(Error::State)?;
+                self.radio
+                    .configure_ampdu(factor, density)
+                    .await
+                    .map_err(Error::Radio)?;
+            }
+            Ok(())
         }
         .await;
         match result {

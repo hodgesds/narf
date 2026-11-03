@@ -325,6 +325,15 @@ impl Join {
             .map_or(0, |phy| phy.ht().tx_mcs()[0]);
         (self.plan.legacy_rates().0, mcs, self.ht_selected())
     }
+    /// Negotiated HT facts for gen2 firmware RA (`sta->deflink.ht_cap`
+    /// after mac80211 `ieee80211_ht_cap_ie_to_sta_ht_cap`): the peer RX MCS
+    /// the local TX selection may use (`rx_mask[0..2]`) and SGI_20.
+    pub(super) fn ht_peer(&self) -> Option<([u8; 2], bool)> {
+        self.plan.negotiated_phy().map(|phy| {
+            let mcs = phy.ht().tx_mcs();
+            ([mcs[0], mcs[1]], phy.ht().tx_sgi20())
+        })
+    }
     pub(super) fn ht_selected(&self) -> bool {
         self.plan.negotiated_phy().is_some()
     }

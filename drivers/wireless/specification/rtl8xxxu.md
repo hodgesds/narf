@@ -1540,8 +1540,8 @@ rate authority.
   (`stop_tx_beacon`, `BEACON_ATIM | FUNCTION_ENABLE | DISABLE_TSF_UPDATE`,
   `set_linktype`, `set_mac`) + `set_bssid` + slot time, then TSF updates
   re-enabled (Linux: `sw_scan_complete`). `poll` parses rxdesc24
-  (`poll_receive_8192e`): only `Frame::admitted(false, false, false)`
-  MPDUs (legacy 20 MHz plaintext) become `Mpdu`s; bound-BSS frames feed the
+  (`poll_receive_8192e`): only `gen2_radio::admit` MPDUs (legacy 20 MHz
+  plaintext; HT20 under an HT association, see below) become `Mpdu`s; bound-BSS frames feed the
   `ewma_rssi` (`rtl8192e_packet::signal` with `cck_agc_report_type`, or
   `rtl8723b_packet::signal`); C2H RA reports fold into `Ra::report`;
   `C2H_8723B_BT_INFO` records (8723BU only) queue (bound 8) for the async
@@ -1661,9 +1661,74 @@ EDCA rows after the cold restart. TSPEC/U-APSD stay inapplicable as for
 RTL8188EU. Regression (written, unexecuted):
 `smoke_rtl8xxxu_gen2_wmm_qos_data_queues`.
 
-Deviations / not implemented: no HT/A-MPDU/BA on gen2 (legacy rates
-only; HT needs the `wide`/HT RX admission the 8188EU chain proves per
-board); a scan or channel change costs a full cold firmware lifecycle per
+#### Gen2 optional HT20 (SGI_20, A-MPDU/BA)
+
+As the RTL8188EU HT20 program shape, over the shared gen2 composition. The
+local capability is `gen2_radio::ht_capability` (Linux core.c
+`rtl8xxxu_probe` `sband->ht_cap`): `IEEE80211_HT_MAX_AMPDU_64K`,
+`IEEE80211_HT_MPDU_DENSITY_16`, `IEEE80211_HT_CAP_SGI_20`,
+`rx_mask[0] = 0xff`, `IEEE80211_HT_MCS_TX_DEFINED`; `rx_mask[1] = 0xff` only
+for a 2T RTL8192EU whose signed `N92P` record admits MCS8..15 (RTL8723BU is
+1T1R). TX selection is the signed admitted MCS set; a record admitting no MCS
+keeps the legacy station. The plan is offered (`Join::prepare_with_phy`) only
+to a WMM AP (mac80211 `ieee80211_determine_chan_mode` disables HT without
+WMM); a non-HT WMM AP still negotiates the QoS station. Scan/beacon
+observation uses `Candidate::from_receive_with_phy` (HT membership selector
+accepted).
+
+At association EDCA is programmed with the HT SIFS (`rtl8xxxu_set_aifs`
+16 us for `WIRELESS_MODE_N_24G`), then `Radio::associate` with the HT
+`Peer` (`legacy` = `supp_rates[0]`, `mcs` = negotiated peer RX within the
+signed selection, `ht`, `sgi` = negotiated SGI_20) through `Ra::new`
+(refused, never narrowed) and `ra_connect_8192e`; the firmware RA mask then
+carries `ht_cap.mcs.rx_mask` (`rtl8xxxu_refresh_rate_mask`). txdesc40 has no
+SGI bit: the firmware applies SGI from the MACID config.
+
+RX: `gen2_radio::admit` replaces `Frame::admitted(false, false, false)`:
+HT MCS within the advertised streams at 20 MHz only under the HT
+association; A-MPDU members (`paggr`) only on a TID with an accepted
+recipient session; a standalone A-MSDU whose descriptor and QoS-header bits
+agree, never inside an A-MPDU. `Mpdu.ht` is the descriptor rate class and
+`Mpdu.ba` the `paggr` bit; `station_admitted` is the gen2 station gate.
+Standalone A-MSDUs go through whole-aggregate authentication
+(`Security::receive_amsdu`) or the Open decode; a bad MIC/subframe publishes
+nothing.
+
+Block Ack (`ba_sessions::Sessions`, the RTL8188EU `station_runtime` rules
+as plain data): recipient ADDBA per `__ieee80211_start_rx_ba_session`
+(TSPEC 37, delayed/oversized 38, window0 = 64, same-token update only with
+unchanged timeout, new token replaces), response with immediate policy and
+A-MSDU clear (no `SUPPORTS_AMSDU_IN_AMPDU`); RX_START/STOP program nothing
+(`rtl8xxxu_ampdu_action`). Unicast QoS DATA from the peer on a session TID
+is reordered (`narf_wireless::reorder`, 100 ms hole timeout) before CCMP/PN;
+an A-MPDU member outside a session is dropped. Recipient inactivity sends
+the QSTA_TIMEOUT DELBA; originator DELBA purges. Originator: the first
+classified QoS DATA on an idle TID (`rtl8xxxu_tx`,
+`ieee80211_start_tx_ba_session`, HT_AGG retry policy) starts TX_START:
+`Radio::configure_ampdu(peer factor, peer density)` (`REG_AGGLEN_LMT`
+0x458..0x45b clamped from `{0x41,0xa8,0x72,0xb9}`, `REG_AMPDU_MIN_SPACE`
+0x45c low bits, exact readback), then the ADDBA Request (window 64,
+timeout 0, SSN = next TID sequence). A matching successful response sets
+`tid_tx_operational`; txdesc40 then carries AGG_ENABLE (else AGG_BREAK)
+with the peer density and RTS/HW RTS (`rtl8xxxu_fill_txdesc_v2`). Response
+timeout or session timeout stop locally with an initiator DELBA; peer DELBA
+or a declined response stop without one; every TX_STOP resets both limits
+to 0 (Linux). BA action frames are plaintext peer-bound management on the
+MGNT pipe, SN from the shared non-QoS space, sent only with no TX/EAPOL
+receipt outstanding. An associated-scan `rejoin` restores HT admission and
+BA facts after the cold restart and reprograms TX_START limits for a
+started originator session. Disconnect/failure retires all sessions.
+
+Deviations: no HT40/SGI_40 (no HT40 grant for gen2); MCS32 (`rx_mask[4]`)
+not advertised; a 1T2R RTL8191EU advertises one RX stream (Linux
+`rf_paths = 2`); active-scan Probe Requests carry no HT Capabilities; no
+BlockAckReq (RX filter passes none, as RTL8188EU). Regressions (written,
+unexecuted): `smoke_rtl8xxxu_gen2_ht20_rx_admission`,
+`smoke_rtl8xxxu_gen2_ht_local_capability` (`gen2_radio_tests.rs`),
+`smoke_rtl8xxxu_gen2_ba_recipient`, `smoke_rtl8xxxu_gen2_ba_originator`
+(`ba_sessions_tests.rs`).
+
+Deviations / not implemented: no HT40 on gen2; a scan or channel change costs a full cold firmware lifecycle per
 transition (Linux retunes live); the retained host TX/RX rings are not
 serviced on away visits (home grace services one Ethernet frame per step);
 no administrative IFF_UP/DOWN park/wake hooks; no station power-save
