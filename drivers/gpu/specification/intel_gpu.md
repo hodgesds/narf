@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.56** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.57** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -5707,3 +5707,36 @@ The existing refusal fixture still pins the option-off sequence, and
 `smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback` no
 longer lists PXP_TYPE among its ENOSYS properties. None of this is physical
 Intel evidence.
+
+Integration (onto the rebased branch): the code conflicted with the
+media-GT power unit in `GuCGt` and in the GuC model's test-module list. The
+fields and modules are independent, so the GSC reset-workaround fields sit
+beside `media_power`, and `media_gt_gsc` sits beside `media_gt_power`. In the
+combined stop, `media_power_down` (`xe_uc_gucrc_disable`) comes first, then
+the GuC stop, then the Wa_14015076503-bracketed GRDOM_FULL, which is Linux's
+`gt_reset_worker` order. The Media GT ledger row keeps both units' text.
+One targeted release run passed 188 tests with no failures. It covered, under
+`drivers/gpu/`: `intel_gpu_media_gt` 48, `intel_gpu_media` 10,
+`intel_gpu_user` 49, `intel_gpu_xe` 6, `intel_gpu_bcs8` 5, `intel_gpu_guc_gt`
+39, `intel_gpu_gt` 17, `intel_gpu_gt_recovery` 6 and `intel_gpu_huc` 8.
+
+Review against Linux b90c984d agreed on the following:
+- `query_pxp_status`: size 0 negotiates 8; any other size is EINVAL; the exact
+  size reaches `xe_pxp_get_readiness_status(NULL)`, which is ENODEV.
+- `exec_queue_set_pxp_type`: NONE is 0, a non-HWDRM type is EINVAL, and
+  HWDRM is ENODEV.
+- `gem_create_user_extensions` checks the header (pad, name), then the
+  set-property body (property, pad), then `gem_create_set_pxp_type`. Its
+  result applies after the object exists.
+- `xe_gsc_wa_14015076503` sets `HECI_H_GS1` ER_PREP, then `HECI_H_CSR` IG
+  with RST clear and a 200 ms hold before GRDOM_FULL. The clear comes after,
+  even when the reset fails. It applies only to media 13.00 with GSC firmware
+  loaded.
+- Media scheduling beside loaded GSC firmware is admitted only with
+  `narf.intel.gsc=1`.
+
+One errno gap remains (LINUX-GAP): more than `MAX_USER_EXTENSIONS` (16) GEM
+extensions is EINVAL here, where Linux returns E2BIG. `FsError` has no E2BIG.
+`intel_gpu_gsc::load` carries a temporary module-level dead-code allowance
+outside kernel-test builds until a platform owner supplies its GSCCS queue,
+stolen object and CSME component.

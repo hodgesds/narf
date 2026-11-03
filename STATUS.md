@@ -2362,6 +2362,35 @@ passed. The run covered the runtime-power, DC-state, display-14 modeset, pipes
 and external, KMS, HuC and GT prefixes, plus `power/runtime`. None of this has
 run on physical Intel hardware.
 
+### MTL GSC worker, Wa_14015076503 and native Xe PXP refusals — targeted release gates recorded
+
+`narf.intel.gsc=1` is a new default-off option. With it, the media GuC's stop
+honours Wa_14015076503 around its GRDOM_FULL, and media scheduling is admitted
+beside loaded GSC firmware. A GSC worker (firmware load, HuC authentication via
+the GSC, proxy start) runs on native models only. It carries a temporary
+dead-code allowance outside kernel-test builds until a platform owner supplies
+its GSCCS queue, stolen object and CSME component.
+
+**Real UAPI changes on every native Xe device**, following Linux with PXP
+absent:
+- Query 9 (PXP status): size 0 now reports 8, other sizes are EINVAL, and the
+  exact size is ENODEV. It used to be EINVAL.
+- Exec-queue PXP_TYPE: NONE is accepted, HWDRM is ENODEV, and anything else is
+  EINVAL. It used to be ENOSYS.
+- GEM_CREATE now walks its extension chain in Linux's check order and applies
+  the result only after the argument, VM and allocation checks. It used to
+  refuse every extension with EINVAL.
+
+One errno gap remains: more than 16 GEM_CREATE extensions is EINVAL, where
+Linux returns E2BIG, because `FsError` has no E2BIG.
+
+The integration combined this unit with the media-GT power unit's stop path:
+RC6 and powergating are returned first, then the GuC stops, then the
+workaround-bracketed reset runs. That is Linux's order. One targeted release
+run passed 188 tests with no failures. It covered the media-GT, media, user,
+Xe, BCS8, GuC-GT, GT, GT-recovery and HuC prefixes. None of this has run on
+physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
