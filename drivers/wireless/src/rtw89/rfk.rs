@@ -492,6 +492,9 @@ pub(super) mod c;
 /// RTL8852C channel IQK (`rtw8852c_iqk`).
 #[path = "rfk/c_iqk.rs"]
 pub(super) mod c_iqk;
+/// RTL8852C channel TSSI (`rtw8852c_tssi`).
+#[path = "rfk/c_tssi.rs"]
+pub(super) mod c_tssi;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "rfk/tests.rs"]

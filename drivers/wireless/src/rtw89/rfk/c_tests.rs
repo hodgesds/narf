@@ -347,3 +347,79 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_c_iqk_channel_follows_rtw8852c_wideband_flow
 );
+
+fn smoke_rtw89_c_tssi_channel_follows_rtw8852c_tables_and_de() -> TestResult {
+    use super::super::super::{factory_c::Calibration, operating_channel_c::Profile};
+    use super::super::c_tssi::{Tracking, Tssi};
+    // TXPWR_TRK element bytes: bitmap 0xffff, rsvd, then 36 rows of 30
+    // where row r holds r + column for recognisable values.
+    let mut bytes = vec![0xff, 0xff, 0, 0, 0, 0, 0, 0];
+    for row in 0..36u8 {
+        for column in 0..30u8 {
+            bytes.push(row.wrapping_mul(2).wrapping_add(column));
+        }
+    }
+    let Ok(tracking) = Tracking::parse(&bytes) else {
+        return TestResult::Fail("complete C TXPWR_TRK element was refused");
+    };
+    let mut missing = bytes.clone();
+    missing[0] = 0xfe;
+    if Tracking::parse(&missing).is_ok() || Tracking::parse(&bytes[..bytes.len() - 1]).is_ok() {
+        return TestResult::Fail("partial C TXPWR_TRK element was admitted");
+    }
+    let mut cal = Calibration {
+        thermal: [0x20, 0xff],
+        tssi_cck: [[10, 11, 12, 13, 14, 15], [-20, -21, -22, -23, -24, -25]],
+        tssi_mcs: [[3; 19], [-3; 19]],
+        tssi_6g_mcs: [[0; 32]; 2],
+        tssi_trim: [[1; 8], [-2; 8]],
+        tssi_trim_6g: [[0; 16]; 2],
+        trim_programmed: true,
+        thermal_trim: [0; 2],
+        thermal_programmed: false,
+        pa_bias: [0; 2],
+        pa_programmed: false,
+        gain_offset: [[0; 13]; 2],
+        offset_valid: false,
+    };
+    cal.tssi_mcs[0][0] = 7;
+    let mut io = Model::new();
+    let mut tssi = Tssi::default();
+    // SAFETY: private inert register model; no hardware or DMA.
+    if ready(unsafe { tssi.run(&mut io, Profile::INITIAL, &cal, &tracking) }) != Some(Ok(())) {
+        return TestResult::Fail("C TSSI did not complete on a ready model");
+    }
+    let Some(r) = tssi.results() else {
+        return TestResult::Fail("C TSSI published no results");
+    };
+    // Channel 1: CCK group 0, OFDM group 0, trim group 0.
+    if r.de != [[11, 8], [-22, -5]] || r.tssi_mode != [true; 2] {
+        return TestResult::Fail("C TSSI DE values differ from _tssi_set_efuse_to_de");
+    }
+    if (io.word(0x5858) >> 12) & 0x3ff != 11 || (io.word(0x7830) >> 12) & 0x3ff != 0x3fb {
+        return TestResult::Fail("C TSSI DE fields differ");
+    }
+    // Path A 2G rows: up = type 11 (offset row 31), down = type 10 (row 30).
+    // Word 0 = -down[0..4]; word 15 bytes 60..63 = up[4], up[3], up[2], up[1].
+    let down0 = 30 * 2u8;
+    let up0 = 31 * 2u8;
+    let w0 = u32::from_le_bytes([
+        down0.wrapping_neg(),
+        (down0 + 1).wrapping_neg(),
+        (down0 + 2).wrapping_neg(),
+        (down0 + 3).wrapping_neg(),
+    ]);
+    let w15 = u32::from_le_bytes([up0 + 4, up0 + 3, up0 + 2, up0 + 1]);
+    if r.thermal[0][0] != w0 || r.thermal[0][15] != w15 || io.word(0x5c00) != w0 {
+        return TestResult::Fail("C TSSI thermal-offset words differ from _tssi_set_tmeter_tbl");
+    }
+    // Path B unprogrammed thermal: meter 32 and zero offsets.
+    if r.thermal[1] != [0; 16] || (io.word(0x7810) >> 10) & 0x3f != 32 {
+        return TestResult::Fail("C TSSI 0xff thermal default differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_c_tssi_channel_follows_rtw8852c_tables_and_de
+);

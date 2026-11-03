@@ -2931,6 +2931,29 @@ can fail; NARF refuses a LOK failure (no results published) and fails any
 0xbff8/RX-mode poll timeout closed. Unexecuted case:
 `smoke_rtw89_c_iqk_channel_follows_rtw8852c_wideband_flow`.
 
+**Channel TSSI (`rfk::c_tssi`).** `Tssi::run(profile, calibration,
+tracking)` is `rtw8852c_tssi(PHY_0)` (non-DBCC, A then B): both
+`rtw8852c_tssi_disable_defs_*`, per path `_tssi_set_sys` (common defs,
+`R_Px_TSSI_ADC_CLK` 0/1/2 for <=40/80/160MHz, 2G vs 5G table — 6GHz takes
+the 5G table, as Linux's `band == 2G` condition), `txpwr_ctrl_bb`,
+`_he_tb`, DCK, bbgain split, `_tssi_set_tmeter_tbl`, `slope_cal_org`,
+`_tssi_set_aligk_default` (2G/5G/6G defaults; RTL8852C measures no PMAC
+alignment), slope and run-slope, then `_tssi_enable` (track, TXAGC offset
+moving average, enable; `is_tssi_mode` = true) and `_tssi_set_efuse_to_de`
+(`_tssi_get_cck_group(chan->channel)` whatever the band, OFDM/6G-MCS and
+trim/6G-trim groups with the `TSSI_EXTRA` average, CCK long/short and the
+six MCS DE fields). All 39 register programs are generated verbatim from
+rtw8852c_rfk_table.c (`rfk/c_tssi_tables.rs`). Thermal-offset rows come
+only from the container's first TXPWR_TRK element (id 18) parsed as fw.c
+`rtw89_build_txpwr_trk_tbl_from_elm` with all sixteen 2/5/6GHz types
+required (`c_tssi::Tracking`); the shipped `rtw8852c_fw-{1,2}.bin` carry
+it. NARF has no copy of the static `rtw89_8852c_trk_cfg`, so a container
+without it is refused. An unprogrammed thermal (0xff) takes Linux's
+meter 32 / zero-offset default. Linux C TSSI sends no coexistence
+notification; the `Kind::Tssi` bracket is the I/O-free RFK exclusivity
+used by B. Unexecuted case:
+`smoke_rtw89_c_tssi_channel_follows_rtw8852c_tables_and_de`.
+
 Remaining for the `rtl8852c` row (no row credit): the rest of
 `rtw8852c_set_channel_bb` (CCK/CCA enables, spur
 elimination, BTG BT RX, 5M mask, 160MHz P80 RU, CDD EVM, TXPW RSTB, MUIC,

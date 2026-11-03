@@ -450,6 +450,12 @@ impl Profile {
     /// rtw8852c_rfk.c TSSI groups of the center channel: (`_tssi_get_cck_group`
     /// for 2.4GHz, OFDM group, trim group). 6GHz uses `_tssi_get_6g_*`.
     /// Extra groups carry [`TSSI_EXTRA`] (average of idx and idx + 1).
+    /// rtw8852c_rfk.c `_tssi_set_efuse_to_de`: `_tssi_get_cck_group(ch)`
+    /// of `chan->channel` whatever the band (5/6GHz numbers fall to the
+    /// switch default or alias 2.4GHz rows, literally as Linux).
+    pub(super) const fn tssi_cck_group(self) -> u32 {
+        tssi_cck_group(self.center)
+    }
     pub(super) const fn tssi_groups(self) -> (Option<u32>, u32, u32) {
         let ch = self.center;
         match self.band {
