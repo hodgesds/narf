@@ -3514,6 +3514,10 @@ mod media_gt_sched {
     include!("intel_gpu_media_gt_sched_tests.rs");
 }
 
+mod media_huc {
+    include!("intel_gpu_media_huc_tests.rs");
+}
+
 mod coredump_exec {
     use super::*;
     include!("intel_gpu_coredump_exec_hw_tests.rs");

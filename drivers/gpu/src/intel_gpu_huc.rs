@@ -1,12 +1,21 @@
-//! Exact TGL main-GT HuC. Linux b90c984d: xe_huc.c, xe_uc_fw.c,
-//! xe_wopcm.c and xe_guc.c. Firmware authority is not authentication.
-//! The boot owner retains DMA; this typed CT owner never receives independently.
+//! HuC DMA upload and GuC authentication. Linux b90c984d: xe_huc.c,
+//! xe_uc_fw.c, xe_wopcm.c and xe_guc.c. xe_huc.c::xe_huc_init places the HuC
+//! on the primary GT through graphics 12.55 and on the media GT above it, so
+//! NARF's two profiles are owned by different GuCs:
+//! - exact TGL: the main GuC loads `i915/tgl_huc.bin` (whole-file CSS);
+//! - MTL/Arrow: the standalone media GuC loads `i915/mtl_huc_gsc.bin`, whose
+//!   GSC CPD headers embed the CSS that is DMA-uploaded (xe_uc_fw.c
+//!   parse_headers), and authenticates it via XE_HUC_AUTH_VIA_GUC.
+//!
+//! Firmware authority is not authentication. The boot owner retains DMA; this
+//! typed CT owner never receives independently.
 
 use crate::{
     intel_gpu_aux::MmioWindow,
-    intel_gpu_gt::{Gen12Platform, GtPlatform},
+    intel_gpu_gt::{media::gsc, Gen12Platform, GtPlatform},
     intel_gpu_guc::{GuCError, GuCMessage},
-    intel_gpu_guc_boot::BootAllocator,
+    intel_gpu_guc_boot::{BootAllocator, GuCRole},
+    intel_gpu_guc_firmware::FirmwareError,
     intel_gpu_guc_transport::{TransportError, XeLpgTransport},
     intel_gpu_uapi::u32_at,
 };
@@ -17,10 +26,30 @@ pub(crate) const PLATFORM: GtPlatform = GtPlatform::Gen12(Gen12Platform::TigerLa
 const NAME: &str = "i915/tgl_huc.bin";
 const FIRST: u16 = 0x4000;
 const LAST: u16 = 0x7eff; // log sideband starts at7f00; SLPC at8000
-const STATUS: u64 = 0xc1dc;
+/// NARF bound on an acquired HuC file (Linux copies any size into its BO).
+const MAX_FILE: usize = 4 * 1024 * 1024;
 
 pub(crate) fn opted_in(args: narf_boot::args::KernelCmdline<'_>) -> bool {
     crate::intel_gpu_gt::boot_opt_in(args, "narf.intel.huc")
+}
+
+/// xe_huc.c::xe_huc_init: whether the GuC in `role` owns `platform`'s HuC.
+/// Linux supports HuC on the primary GT only through graphics 12.55 and on
+/// the media GT otherwise; NARF admits exact TGL and the MTL/Arrow media GT.
+pub(crate) fn profile(platform: GtPlatform, role: GuCRole) -> bool {
+    match role {
+        GuCRole::Primary => platform == PLATFORM,
+        GuCRole::Media(_) => crate::intel_gpu_gt::media::profile_eligible(platform),
+    }
+}
+
+/// The MTL/Arrow media-GT HuC opt-in: `narf.intel.huc=1` on a device whose
+/// media GT is itself admitted (`narf.intel.media_gt=1`).
+pub(crate) fn media_opted_in(
+    platform: Option<GtPlatform>,
+    args: narf_boot::args::KernelCmdline<'_>,
+) -> bool {
+    crate::intel_gpu_gt::media::admitted(platform, args) && opted_in(args)
 }
 
 #[derive(Debug)]
@@ -28,10 +57,12 @@ pub(crate) struct Image<'a> {
     pub upload: &'a [u8],
     pub signature: &'a [u8],
     pub version: (u8, u8, u8),
+    /// The whole file; `upload` and `signature` are its prefix.
+    file: &'a [u8],
 }
 impl<'a> Image<'a> {
     pub(crate) fn parse(bytes: &'a [u8]) -> Result<Self, GuCError> {
-        if !(128..=4 * 1024 * 1024).contains(&bytes.len())
+        if !(128..=MAX_FILE).contains(&bytes.len())
             || bytes.len() % 4 != 0
             || u32_at(bytes, 0) != 6
             || u32_at(bytes, 8) != 0x10000
@@ -70,45 +101,121 @@ impl<'a> Image<'a> {
             upload: &bytes[..upload],
             signature: &bytes[upload..end],
             version: ((v >> 16) as u8, (v >> 8) as u8, v as u8),
+            file: bytes,
         })
+    }
+}
+
+/// One staged HuC object and its DMA/RSA window: xe_uc_fw.c::uc_fw_copy
+/// places the object at its GGTT base, uc_fw_xfer DMAs DMA_COPY_SIZE bytes
+/// from `css_offset` and xe_huc_auth passes the base plus
+/// xe_uc_fw_rsa_offset to the GuC.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Load<'a> {
+    pub object: &'a [u8],
+    /// uc_fw->css_offset: the DMA source within the object.
+    pub css_offset: u32,
+    /// sizeof(uc_css_header) + ucode_size: DMA_COPY_SIZE and the WOPCM HuC
+    /// reservation (xe_uc_fw_get_upload_size).
+    pub upload: u32,
+    /// xe_uc_fw_rsa_offset: css_offset + upload.
+    pub rsa: u32,
+    /// versions.found[XE_UC_FW_VER_RELEASE] (the CSS sw_version).
+    pub version: (u8, u8, u8),
+}
+
+impl<'a> From<Image<'a>> for Load<'a> {
+    /// TGL stages the CSS header, uCode and RSA signature (not the optional
+    /// modulus/exponent suffix), so its CSS starts the object.
+    fn from(image: Image<'a>) -> Self {
+        let upload = image.upload.len() as u32; // bounded by MAX_FILE
+        Self {
+            object: &image.file[..image.upload.len() + image.signature.len()],
+            css_offset: 0,
+            upload,
+            rsa: upload,
+            version: image.version,
+        }
+    }
+}
+
+impl<'a> Load<'a> {
+    /// The MTL HuC as xe_uc_fw.c::parse_headers reads it: GSC CPD headers
+    /// (HUCP.man, huc_fw) or, without a CPD marker, a whole-file CSS. The
+    /// whole file is the object, as uc_fw_copy copies fw->data.
+    pub(crate) fn media(bytes: &'a [u8]) -> Result<Self, gsc::GscError> {
+        let huc = gsc::HucImage::parse(bytes)?;
+        // parse_css_header bounds both extents by the blob, so neither the
+        // DMA window nor the RSA leaves the object.
+        let narrow = |value: usize| u32::try_from(value).map_err(|_| gsc::GscError::NoExec);
+        Ok(Self {
+            object: bytes,
+            css_offset: narrow(huc.css_offset)?,
+            upload: narrow(huc.dma_bytes())?,
+            rsa: narrow(huc.rsa_offset())?,
+            // CSS sw_version fields are 8 bits wide.
+            version: (
+                huc.release.major as u8,
+                huc.release.minor as u8,
+                huc.release.patch as u8,
+            ),
+        })
+    }
+}
+
+fn validate(platform: GtPlatform, bytes: &[u8]) -> Result<Load<'_>, FirmwareError> {
+    if platform == PLATFORM {
+        Image::parse(bytes)
+            .map(Load::from)
+            .map_err(FirmwareError::Image)
+    } else if crate::intel_gpu_gt::media::profile_eligible(platform) {
+        if bytes.len() > MAX_FILE {
+            return Err(FirmwareError::Image(GuCError::FirmwareLayout));
+        }
+        Load::media(bytes).map_err(|_| FirmwareError::Image(GuCError::FirmwareLayout))
+    } else {
+        Err(FirmwareError::Unsupported)
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct Firmware {
     bytes: Vec<u8>,
+    platform: GtPlatform,
     _digest: [u8; 32],
     _signer: Option<[u8; 32]>,
 }
-struct Open;
+struct Open(GtPlatform);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
-    type Output = Result<Firmware, crate::intel_gpu_guc_firmware::FirmwareError>;
+    type Output = Result<Firmware, FirmwareError>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(NAME, cap) {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(Err(crate::intel_gpu_guc_firmware::FirmwareError::Registry(
-                    e,
-                )))
-            }
+        // xe_uc_fw.c XE_HUC_FIRMWARE_DEFS: TIGERLAKE no_ver(i915, huc, tgl)
+        // and METEORLAKE no_ver(i915, huc_gsc, mtl).
+        let name = if self.0 == PLATFORM {
+            NAME
+        } else {
+            gsc::HUC_FIRMWARE
         };
-        blob.invoke(CopyImage)
+        let blob = match narf_firmware::open(name, cap) {
+            Ok(b) => b,
+            Err(e) => return Ok(Err(FirmwareError::Registry(e))),
+        };
+        blob.invoke(CopyImage(self.0))
     }
 }
-struct CopyImage;
+struct CopyImage(GtPlatform);
 impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
-    type Output = Result<Firmware, crate::intel_gpu_guc_firmware::FirmwareError>;
+    type Output = Result<Firmware, FirmwareError>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareBlob, Read>,
     ) -> Result<Self::Output, CapError> {
-        use crate::intel_gpu_guc_firmware::FirmwareError;
         Ok((|| {
             let view = narf_firmware::view_of(cap).map_err(FirmwareError::Registry)?;
-            Image::parse(view.bytes).map_err(FirmwareError::Image)?;
+            validate(self.0, view.bytes)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(view.bytes.len())
@@ -116,6 +223,7 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
             bytes.extend_from_slice(view.bytes);
             Ok(Firmware {
                 bytes,
+                platform: self.0,
                 _digest: view.sha256,
                 _signer: view.signer,
             })
@@ -126,15 +234,30 @@ impl Firmware {
     pub(crate) fn open(
         platform: GtPlatform,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
-    ) -> Result<Self, crate::intel_gpu_guc_firmware::FirmwareError> {
-        use crate::intel_gpu_guc_firmware::FirmwareError;
-        if platform != PLATFORM {
+    ) -> Result<Self, FirmwareError> {
+        if platform != PLATFORM && !crate::intel_gpu_gt::media::profile_eligible(platform) {
             return Err(FirmwareError::Unsupported);
         }
-        authority.invoke(Open).map_err(|_| FirmwareError::Revoked)?
+        authority
+            .invoke(Open(platform))
+            .map_err(|_| FirmwareError::Revoked)?
     }
-    pub(crate) fn image(&self) -> Image<'_> {
-        Image::parse(&self.bytes).expect("immutable authorized HuC image")
+    /// An authorized-equivalent image for native fixtures.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn from_fixture(platform: GtPlatform, bytes: &[u8]) -> Result<Self, FirmwareError> {
+        validate(platform, bytes)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            platform,
+            _digest: [0; 32],
+            _signer: None,
+        })
+    }
+    pub(crate) fn platform(&self) -> GtPlatform {
+        self.platform
+    }
+    pub(crate) fn load(&self) -> Load<'_> {
+        validate(self.platform, &self.bytes).expect("immutable authorized HuC image")
     }
 }
 
@@ -142,6 +265,11 @@ impl Firmware {
 pub(crate) struct Upload {
     pub rsa: u32,
     pub version: (u8, u8, u8),
+    /// xe_huc.c::xe_huc_auth reports a HuC that is already authenticated as
+    /// RUNNING ("On newer platforms the HuC survives reset"). NARF adopts
+    /// only an authentication it established itself for this image;
+    /// otherwise a pre-set bit leaves the HuC unavailable.
+    pub adopt: bool,
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Phase {
@@ -159,6 +287,8 @@ pub(crate) struct Auth {
     next: u16,
     pending: Option<u16>,
     deadline: u64,
+    /// The pre-request authentication check has run.
+    checked: bool,
 }
 impl Auth {
     pub(crate) fn new() -> Self {
@@ -168,6 +298,7 @@ impl Auth {
             next: FIRST,
             pending: None,
             deadline: 0,
+            checked: false,
         }
     }
     pub(crate) fn started(&self) -> bool {
@@ -175,6 +306,10 @@ impl Auth {
     }
     pub(crate) fn done(&self) -> bool {
         matches!(self.phase, Phase::Running | Phase::Unavailable)
+    }
+    /// XE_UC_FIRMWARE_RUNNING reached; no MMIO.
+    pub(crate) fn running(&self) -> bool {
+        self.phase == Phase::Running
     }
     pub(crate) fn invalidate(&mut self) {
         self.phase = Phase::Unavailable;
@@ -213,7 +348,7 @@ impl Auth {
             7 if m.auxiliary == 0 => {
                 self.pending = None;
                 self.phase = Phase::Status;
-                self.deadline = now.saturating_add(100_000_000);
+                self.deadline = now.saturating_add(gsc::AUTH_WAIT_NS);
             }
             6 | 7 => self.invalidate(), // xe_huc_auth rejects all nonzero DATA0
             _ => return Err(TransportError::Protocol(0x4000)),
@@ -236,6 +371,23 @@ impl Auth {
             return Err(TransportError::Timeout); // unresolved request requires full reset
         }
         if self.phase == Phase::Send {
+            if !core::mem::replace(&mut self.checked, true) {
+                // xe_huc.c::xe_huc_auth: xe_huc_is_authenticated before any
+                // request, through this GuC's GT view (HUC_KERNEL_LOAD_INFO,
+                // GSI-adjusted on the media GT).
+                match gsc::huc_authenticated(ct.window(), gsc::HucAuth::Guc) {
+                    None => return Err(TransportError::Unavailable),
+                    Some(true) => {
+                        if self.image.expect("owned HuC").adopt {
+                            self.phase = Phase::Running;
+                        } else {
+                            self.invalidate();
+                        }
+                        return Ok(());
+                    }
+                    Some(false) => {}
+                }
+            }
             if self.next > LAST {
                 return Err(TransportError::Protocol(0x4000));
             }
@@ -250,12 +402,10 @@ impl Auth {
                 Err(e) => return Err(e),
             }
         } else if self.phase == Phase::Status {
-            let status = ct.window().read32(STATUS);
-            if status == u32::MAX {
-                return Err(TransportError::Unavailable);
-            }
-            if status & 1 != 0 {
-                self.phase = Phase::Running;
+            match gsc::huc_authenticated(ct.window(), gsc::HucAuth::Guc) {
+                None => return Err(TransportError::Unavailable),
+                Some(true) => self.phase = Phase::Running,
+                Some(false) => {}
             }
         }
         Ok(())
@@ -264,8 +414,7 @@ impl Auth {
         if self.phase != Phase::Running {
             return None;
         }
-        let status = mmio.read32(STATUS);
-        (status != u32::MAX && status & 1 != 0)
+        gsc::huc_authenticated(mmio, gsc::HucAuth::Guc)?
             .then(|| self.image.expect("authenticated HuC").version)
     }
 }

@@ -74,6 +74,8 @@ struct State {
     irq_tried: bool,
     gt: Option<ProductionGt>,
     firmware: Option<GuCFirmware>,
+    /// The device's HuC image: GT0's on exact TGL, the media GT's on
+    /// MTL/Arrow (xe_huc.c::xe_huc_init).
     huc: Option<crate::intel_gpu_huc::Firmware>,
     probe: Option<Arc<CompletionFence>>,
     recovery: recovery::Coordinator,
@@ -106,6 +108,12 @@ struct State {
     media_recovered: bool,
     /// Routing GT1's VCS/VECS onto GT0's delivery failed; GT1 stays polled.
     media_irq_failed: bool,
+    /// A media GuC of this owner authenticated `huc` itself. Only then may a
+    /// later media GuC adopt a HuC that survived its GuC/GT reset as
+    /// RUNNING (xe_huc.c::xe_huc_auth); kept for the owner's lifetime.
+    media_huc_established: bool,
+    /// The current media GuC's HuC outcome has been logged.
+    media_huc_reported: bool,
 }
 
 use crate::intel_gpu_gt::media::Retire as MediaRetire;
@@ -235,15 +243,19 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             {
                 return Err(FsError::NoDevice);
             }
-            state
-                .gt
-                .as_ref()
-                .ok_or(FsError::NoDevice)?
-                .huc_version(epoch, || {
-                    narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
-                        == Ok(Some(narf_bus::pci::PciPowerState::D0))
-                })
-                .ok_or(FsError::NoDevice)
+            let current = || {
+                narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+            };
+            // MTL/Arrow report the media GT's HuC (GT1 publication and epoch)
+            // and GT0 never answers; older media reports GT0's.
+            crate::intel_gpu_gt::media::query_huc(
+                self.platform,
+                state.media_guc.as_ref(),
+                current,
+                || state.gt.as_ref()?.huc_version(epoch, current),
+            )
+            .ok_or(FsError::NoDevice)
         })
     }
     fn ccs_control(&self) -> Option<Arc<crate::intel_gpu_ccs_control::Control>> {
@@ -1179,6 +1191,8 @@ pub(crate) fn start_pending() {
                 media_guc_reported: false,
                 media_recovered: false,
                 media_irq_failed: false,
+                media_huc_established: false,
+                media_huc_reported: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -2311,6 +2325,37 @@ impl Owner {
             let Some(facts) = *self.user_facts.lock() else {
                 return;
             };
+            // narf.intel.huc=1 beside the admitted media GT stages the MTL
+            // HuC on this media GuC (xe_huc.c::xe_huc_init: the media GT owns
+            // HuC above graphics 12.55). Linux fails the GT's probe when that
+            // firmware cannot be used; NARF starts GT1 without HuC instead.
+            let platform =
+                GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
+            let huc_wanted = crate::intel_gpu_huc::media_opted_in(platform, narf_boot::args());
+            if let Some(platform) = platform.filter(|_| huc_wanted && state.huc.is_none()) {
+                let opened = narf_firmware::trusted_loader_authority()
+                    .ok_or(RuntimeError::Authority)
+                    .and_then(|authority| {
+                        authority
+                            .derive::<Read>()
+                            .map_err(|_| RuntimeError::Authority)
+                    })
+                    .and_then(|authority| {
+                        crate::intel_gpu_huc::Firmware::open(platform, &authority)
+                            .map_err(RuntimeError::Firmware)
+                    });
+                match opened {
+                    Ok(huc) => state.huc = Some(huc),
+                    Err(error) => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "intel-gt card{}: media HuC firmware refused ({:?}); GT1 starts without HuC",
+                            self.pending.index,
+                            error
+                        );
+                    }
+                }
+            }
             let (Some(gt), Some(firmware), Some(media)) = (
                 state.gt.as_ref(),
                 state.firmware.as_ref(),
@@ -2324,16 +2369,40 @@ impl Owner {
                 huc_upload_bytes: 0,
                 uncached_mocs: None,
             };
-            match MediaGuc::start(
-                self.pending.window.clone(),
-                gt.shared_allocator(),
-                firmware,
-                config,
-                media,
-                now,
-            ) {
+            let huc = state
+                .huc
+                .as_ref()
+                .filter(|_| huc_wanted)
+                .map(|huc| (huc, state.media_huc_established));
+            let start = |huc| {
+                MediaGuc::start(
+                    self.pending.window.clone(),
+                    gt.shared_allocator(),
+                    firmware,
+                    huc,
+                    config,
+                    media,
+                    now,
+                )
+            };
+            // A HuC that cannot be staged (WOPCM, allocation) never keeps
+            // GT1 down: start once more exactly as without the option.
+            let started = match (start(huc), huc) {
+                (Err(error), Some(_)) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: media HuC not staged ({:?}); GT1 starts without HuC",
+                        self.pending.index,
+                        error
+                    );
+                    start(None)
+                }
+                (started, _) => started,
+            };
+            match started {
                 Ok(guc) => {
                     state.media_guc_reported = false;
+                    state.media_huc_reported = false;
                     state.media_guc = Some(guc);
                 }
                 Err(error) => {
@@ -2352,6 +2421,21 @@ impl Owner {
             narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
                 == Ok(Some(narf_bus::pci::PciPowerState::D0))
         });
+        if let Some(running) = guc.huc_outcome() {
+            // RUNNING was reached by this owner's own authentication, or by
+            // adopting one an earlier media GuC of this owner established.
+            state.media_huc_established |= running;
+            if !core::mem::replace(&mut state.media_huc_reported, true) {
+                log(
+                    self.pending.index,
+                    if running {
+                        "media HuC running, authenticated via the media GuC"
+                    } else {
+                        "media HuC unavailable; GT1 continues without HuC"
+                    },
+                );
+            }
+        }
         if !matches!(polled, core::task::Poll::Ready(Ok(MediaGucState::Running))) {
             // GT1 leaves native Xe and its sources are masked again before
             // it leaves Running.

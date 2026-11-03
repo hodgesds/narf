@@ -108,7 +108,7 @@ pub(super) fn complete_dma(d: &mut Device) {
     );
     d.regs.insert(0xc314, 0x200); // START self-clear; HUC flag remains until host disable
 }
-fn response(memory: &Words, id: u16, hxg: u32) {
+pub(super) fn response(memory: &Words, id: u16, hxg: u32) {
     response_payload(memory, id, hxg, &[]);
 }
 fn response_payload(memory: &Words, id: u16, hxg: u32, payload: &[u32]) {
@@ -122,6 +122,14 @@ fn response_payload(memory: &Words, id: u16, hxg: u32, payload: &[u32]) {
     words[513] = (tail + 2 + payload.len() as u32) & 4095;
 }
 pub(super) fn service_auth(w: &Window, memory: &Words, id: u16, request: &[u32]) {
+    // The MTL/Arrow HuC belongs to the media GuC and has its own model.
+    if w.0
+        .borrow()
+        .profile
+        .is_some_and(crate::intel_gpu_gt::media::profile_eligible)
+    {
+        return super::media_huc::service_auth(w, memory, id, request);
+    }
     assert_eq!(request.len(), 2);
     assert_eq!(request[0], 0x4000); // normal REQUEST, not FAST
     assert!((0x4000..=0x7eff).contains(&id)); // excludes logs and SLPC

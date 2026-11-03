@@ -246,7 +246,16 @@ pub(super) fn start_media_with(
     let media =
         MediaGt::initialized_for_test(MTL, MEDIA_GMD, FUSE).with_topology_for_test(topology);
     w.0.borrow_mut().regs.insert(0x380d00, RPM_CONFIG0);
-    MediaGuc::start(w.clone(), arena.clone(), &firmware, media_config(), &media, 0).unwrap()
+    MediaGuc::start(
+        w.clone(),
+        arena.clone(),
+        &firmware,
+        None,
+        media_config(),
+        &media,
+        0,
+    )
+    .unwrap()
 }
 
 fn smoke_media_gt_sched_engines_prime_probe_publish_and_stop() -> TestResult {

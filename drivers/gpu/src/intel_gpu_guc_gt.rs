@@ -184,18 +184,29 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
 
     /// Finish HuC through the existing single scheduler/CT owner before public
     /// epoch admission. Optional PC failure never pretends HuC is available.
+    /// The media GuC runs no SLPC (xe_guc_pc_start is not modelled on GT1),
+    /// so its HuC authenticates once scheduling and default LRCs are ready.
     pub(crate) fn prepare_huc(&mut self, now: u64) -> Result<bool, GtError> {
         let Some(image) = self.parts.boot.huc_upload() else {
             return Ok(true);
         };
+        let media = matches!(
+            self.parts.boot.role(),
+            crate::intel_gpu_guc_boot::GuCRole::Media(_)
+        );
+        let loadable = self.parts.boot.huc_loadable();
         self.admit_scheduling()?;
         let scheduler = self.parts.scheduler.as_mut().ok_or(GtError::State)?;
         if scheduler.huc.started() {
             return Ok(scheduler.huc.done());
         }
-        if !scheduler.engines().iter().any(|engine| engine.is_decode()) {
+        if !loadable || !scheduler.engines().iter().any(|engine| engine.is_decode()) {
             scheduler.huc.invalidate();
             return Ok(true);
+        }
+        if media {
+            scheduler.huc.begin(image, now);
+            return Ok(false);
         }
         match scheduler.slpc() {
             SlpcState::Running => {
@@ -215,7 +226,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         epoch: u64,
         mut current: impl FnMut() -> bool,
     ) -> Option<(u8, u8, u8)> {
-        if self.parts.boot.platform() != crate::intel_gpu_huc::PLATFORM
+        if !crate::intel_gpu_huc::profile(self.parts.boot.platform(), self.parts.boot.role())
             || self.state != GtState::SchedulingReady
             || epoch == 0
             || self.user_epoch() != Some(epoch)
@@ -229,6 +240,15 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .as_ref()?
             .huc
             .version(self.parts.boot.window())
+    }
+
+    /// The staged HuC's terminal outcome on this owner, without MMIO:
+    /// `Some(true)` RUNNING, `Some(false)` unavailable, `None` while pending
+    /// or when no HuC is staged.
+    pub(crate) fn huc_outcome(&self) -> Option<bool> {
+        self.parts.boot.huc_upload()?;
+        let huc = &self.parts.scheduler.as_ref()?.huc;
+        huc.done().then(|| huc.running())
     }
 
     pub(crate) fn from_staged_hardware(boot: GuCBoot<M, A>) -> Result<Self, GtError> {
@@ -2246,16 +2266,19 @@ impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi
     /// request/ACK, GuC reset, WOPCM, DMA, ADS and CT all resolve through the
     /// media GSI window and media mailbox. `policy` proves the media PAT that
     /// gives the shared GGTT PTE index its meaning on this GT.
+    /// `huc` optionally stages the media GT's HuC with its adopt policy
+    /// (`GuCBoot::stage_media`).
     pub(crate) fn stage_media(
         mmio: crate::intel_gpu_gt::media::MediaGsi<W>,
         allocator: A,
         firmware: &GuCFirmware,
+        huc: Option<(&crate::intel_gpu_huc::Firmware, bool)>,
         config: BootConfig,
         ip: crate::intel_gpu_gt::media::MediaIp,
         policy: crate::intel_gpu_gt_hw::CachePolicy,
     ) -> Result<Self, GtError> {
-        let mut boot =
-            GuCBoot::stage_media(mmio, allocator, firmware, config, ip).map_err(GtError::Boot)?;
+        let mut boot = GuCBoot::stage_media(mmio, allocator, firmware, huc, config, ip)
+            .map_err(GtError::Boot)?;
         boot.configure_cache(policy).map_err(GtError::Boot)?;
         Ok(Self::from_staged(boot))
     }

@@ -970,6 +970,8 @@ enum Step {
     Priming,
     /// One private PPGTT job per engine.
     Probing,
+    /// A staged HuC reaches RUNNING or unavailable before publication.
+    Huc,
     Published,
 }
 
@@ -987,7 +989,9 @@ pub(crate) struct MediaPublication {
 /// `GuCGt` owner over the media GSI window and shared GGTT arena. It
 /// registers as the arena's second GGTT TLB before firmware DMA, keeps its
 /// GuC-to-host interrupt half masked (its CT is polled), then schedules the
-/// fused VCS/VECS engines. No SLPC or HuC is admitted.
+/// fused VCS/VECS engines. No SLPC is admitted. With a staged HuC it
+/// authenticates the HuC after the default LRCs, as xe_uc_load_hw does after
+/// xe_gt_record_default_lrcs; a HuC failure never fails GT1.
 pub(crate) struct MediaGuc<
     M: MmioWindow + Clone,
     A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
@@ -1027,12 +1031,15 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
 impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone> MediaGuc<M, A> {
     /// Stage and begin after `MediaGt` initialized this incarnation and
     /// released its own wake. `firmware` is GT0's MTL GuC image (xe_uc_fw.c
-    /// GT_TYPE_ANY). On error nothing has been published: the staged owner
-    /// is dropped and the arena hook is withdrawn.
+    /// GT_TYPE_ANY). `huc` is the media GT's HuC image and whether this
+    /// owner may adopt an authentication that survived an earlier one
+    /// (`intel_gpu_huc::Upload::adopt`). On error nothing has been published:
+    /// the staged owner is dropped and the arena hook is withdrawn.
     pub(crate) fn start(
         bar: M,
         allocator: A,
         firmware: &crate::intel_gpu_guc_firmware::GuCFirmware,
+        huc: Option<(&crate::intel_gpu_huc::Firmware, bool)>,
         config: crate::intel_gpu_guc_boot::BootConfig,
         media: &MediaGt,
         now: u64,
@@ -1044,6 +1051,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             MediaGsi::new(bar.clone()),
             allocator.clone(),
             firmware,
+            huc,
             config,
             facts.ip,
             policy,
@@ -1100,6 +1108,21 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         (self.state == MediaGucState::Running)
             .then_some(self.published)
             .flatten()
+    }
+
+    /// The running HuC release (versions.found[XE_UC_FW_VER_RELEASE]) while
+    /// GT1 is published, read under GT1's epoch, current access and wake
+    /// with a current HUC_KERNEL_LOAD_INFO success bit. Passive: it never
+    /// loads, authenticates or wakes anything.
+    pub(crate) fn huc_version(&self, current: impl FnMut() -> bool) -> Option<(u8, u8, u8)> {
+        let publication = self.publication()?;
+        self.gt.huc_version(publication.epoch, current)
+    }
+
+    /// The staged HuC's terminal outcome without MMIO: `Some(true)` RUNNING,
+    /// `Some(false)` unavailable, `None` while pending or without a HuC.
+    pub(crate) fn huc_outcome(&self) -> Option<bool> {
+        self.gt.huc_outcome()
     }
 
     /// Advance start, scheduling or stop by one bounded step.
@@ -1250,19 +1273,10 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
                     return Err(MediaGucError::Probe);
                 }
                 self.probes.clear();
-                let epoch = self.gt.user_epoch().ok_or(MediaGucError::State)?;
-                let reference_clock = self.gt.media_reference_clock().map_err(MediaGucError::Gt)?;
-                self.published = Some(MediaPublication {
-                    epoch,
-                    engines: self.engines,
-                    gmd: self.gmd,
-                    reference_clock,
-                    topology: self.topology,
-                });
-                self.step = Step::Published;
-                self.state = MediaGucState::Running;
-                Ok(true)
+                self.step = Step::Huc;
+                self.huc_then_publish(now)
             }
+            (Step::Huc, GtState::SchedulingReady) => self.huc_then_publish(now),
             (Step::Published, GtState::SchedulingReady) => Ok(true),
             (
                 Step::Boot | Step::SettleWells | Step::WakeWells | Step::Scheduling,
@@ -1274,6 +1288,28 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             ) => Ok(false),
             _ => Err(MediaGucError::State),
         }
+    }
+
+    /// xe_uc.c::xe_uc_load_hw: xe_huc_auth(XE_HUC_AUTH_VIA_GUC) follows the
+    /// default LRCs, and "We don't fail the driver load if HuC fails to
+    /// auth": rejection or a status timeout leaves the HuC unavailable and
+    /// GT1 publishes anyway. Without a staged HuC this publishes at once.
+    fn huc_then_publish(&mut self, now: u64) -> Result<bool, MediaGucError> {
+        if !self.gt.prepare_huc(now).map_err(MediaGucError::Gt)? {
+            return Ok(false);
+        }
+        let epoch = self.gt.user_epoch().ok_or(MediaGucError::State)?;
+        let reference_clock = self.gt.media_reference_clock().map_err(MediaGucError::Gt)?;
+        self.published = Some(MediaPublication {
+            epoch,
+            engines: self.engines,
+            gmd: self.gmd,
+            reference_clock,
+            topology: self.topology,
+        });
+        self.step = Step::Published;
+        self.state = MediaGucState::Running;
+        Ok(true)
     }
 
     /// Take every present engine's VDBOX/VEBOX domain, after any sleep
@@ -1435,6 +1471,28 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     }
 }
 
+/// xe_query.c::query_uc_fw_version for XE_QUERY_UC_TYPE_HUC. With
+/// MEDIA_VER >= 13 (this MTL/Arrow profile) the HuC is the first tile's media
+/// GT's: no published media GT, or a HuC that is not RUNNING, is ENODEV
+/// (`None`), and GT0 never answers. Older media reports the primary GT's HuC
+/// through `primary`.
+pub(crate) fn query_huc<M, A>(
+    platform: GtPlatform,
+    media: Option<&MediaGuc<M, A>>,
+    current: impl FnMut() -> bool,
+    primary: impl FnOnce() -> Option<(u8, u8, u8)>,
+) -> Option<(u8, u8, u8)>
+where
+    M: MmioWindow + Clone,
+    A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
+{
+    if profile_eligible(platform) {
+        media?.huc_version(current)
+    } else {
+        primary()
+    }
+}
+
 /// Outcome of retiring the media owners before a GT0 transition.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Retire {
@@ -1478,7 +1536,7 @@ where
 }
 
 /// GSC firmware, GSC-headered HuC images and the GSC HECI protocol of this
-/// media GT (formats only; no owner loads either firmware yet).
+/// media GT. The media GuC loads the HuC through it; no owner loads the GSC.
 #[path = "intel_gpu_gsc.rs"]
 pub(crate) mod gsc;
 

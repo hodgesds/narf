@@ -218,7 +218,12 @@ struct HwconfigDma<B: GpuBacking> {
 struct HucDma<B: GpuBacking> {
     backing: B,
     upload: u32,
+    /// uc_fw->css_offset: the DMA source within the object.
+    css_offset: u32,
+    /// xe_uc_fw_rsa_offset within the object.
+    rsa: u32,
     version: (u8, u8, u8),
+    adopt: bool,
 }
 
 struct Resources<A: BootAllocator> {
@@ -260,6 +265,8 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     config: BootConfig,
     huc_exposed: bool,
     huc_dma_done: bool,
+    /// A locked media WOPCM cannot host the staged HuC: it is never uploaded.
+    huc_blocked: bool,
     upload: u32,
     state: BootState,
     deadline: u64,
@@ -341,19 +348,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         huc: &crate::intel_gpu_huc::Firmware,
         mut config: BootConfig,
     ) -> Result<Self, BootError> {
-        if firmware.platform() != crate::intel_gpu_huc::PLATFORM {
+        if firmware.platform() != crate::intel_gpu_huc::PLATFORM
+            || huc.platform() != crate::intel_gpu_huc::PLATFORM
+        {
             return Err(BootError::Unsupported);
         }
-        let huc = huc.image();
-        config.huc_upload_bytes =
-            u32::try_from(huc.upload.len()).map_err(|_| BootError::Address)?;
-        Self::stage_images(
+        let huc = huc.load();
+        config.huc_upload_bytes = huc.upload;
+        Self::stage_loads(
             mmio,
             allocator,
             firmware.platform(),
             firmware.image(),
             config,
             Some(huc),
+            false,
         )
     }
 
@@ -364,21 +373,41 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         image: CssImage<'_>,
         config: BootConfig,
     ) -> Result<Self, BootError> {
-        Self::stage_images(mmio, allocator, platform, image, config, None)
+        Self::stage_loads(mmio, allocator, platform, image, config, None, false)
     }
 
+    /// The exact-TGL main-GT HuC profile over a parsed CSS image.
+    #[cfg(any(test, feature = "kernel-test"))]
     fn stage_images(
         mmio: M,
-        mut allocator: A,
+        allocator: A,
         platform: GtPlatform,
         image: CssImage<'_>,
         config: BootConfig,
         huc: Option<crate::intel_gpu_huc::Image<'_>>,
     ) -> Result<Self, BootError> {
-        if huc.as_ref().is_some_and(|h| {
-            platform != crate::intel_gpu_huc::PLATFORM
-                || usize::try_from(config.huc_upload_bytes).ok() != Some(h.upload.len())
-        }) {
+        if huc.is_some() && platform != crate::intel_gpu_huc::PLATFORM {
+            return Err(BootError::Unsupported);
+        }
+        let huc = huc.map(crate::intel_gpu_huc::Load::from);
+        Self::stage_loads(mmio, allocator, platform, image, config, huc, false)
+    }
+
+    /// `adopt` lets this owner's HuC authentication accept a bit that is
+    /// already set (see `intel_gpu_huc::Upload::adopt`).
+    fn stage_loads(
+        mmio: M,
+        mut allocator: A,
+        platform: GtPlatform,
+        image: CssImage<'_>,
+        config: BootConfig,
+        huc: Option<crate::intel_gpu_huc::Load<'_>>,
+        adopt: bool,
+    ) -> Result<Self, BootError> {
+        if huc
+            .as_ref()
+            .is_some_and(|h| config.huc_upload_bytes != h.upload)
+        {
             return Err(BootError::Unsupported);
         }
         let profile = platform.guc().ok_or(BootError::Unsupported)?;
@@ -407,7 +436,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
         let huc_pages = huc
             .as_ref()
-            .map(|h| (h.upload.len() + h.signature.len()).div_ceil(PAGE as usize) as u32);
+            .map(|h| h.object.len().div_ceil(PAGE as usize) as u32);
         for pages in [
             Some(image_pages),
             Some(ads_pages),
@@ -450,21 +479,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         let huc = huc.map(|h| {
             let backing = allocations.pop().expect("HuC image");
             backing.zero_fill();
-            for (i, word) in h
-                .upload
-                .chunks_exact(4)
-                .chain(h.signature.chunks_exact(4))
-                .enumerate()
-            {
-                backing.write32(
-                    i as u64 * 4,
-                    u32::from_le_bytes(word.try_into().expect("HuC dword")),
-                );
+            // xe_uc_fw.c::uc_fw_copy: the whole object at the BO base; a
+            // trailing partial dword keeps the zero fill.
+            for (i, word) in h.object.chunks(4).enumerate() {
+                let mut dword = [0; 4];
+                dword[..word.len()].copy_from_slice(word);
+                backing.write32(i as u64 * 4, u32::from_le_bytes(dword));
             }
             HucDma {
                 backing,
                 upload: config.huc_upload_bytes,
+                css_offset: h.css_offset,
+                rsa: h.rsa,
                 version: h.version,
+                adopt,
             }
         });
         let logs = allocations.pop().expect("logs");
@@ -511,6 +539,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             config,
             huc_exposed: false,
             huc_dma_done: false,
+            huc_blocked: false,
             upload,
             state: BootState::Staged,
             deadline: 0,
@@ -803,27 +832,44 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Ok(())
     }
 
-    fn layout(&self) -> Result<WopcmLayout, BootError> {
+    fn layout(&mut self) -> Result<WopcmLayout, BootError> {
         let size = self.mmio.read32(0xc050);
         let offset = self.mmio.read32(0xc340);
         if size == u32::MAX || offset == u32::MAX {
             return Err(BootError::Unavailable);
         }
         if size & 1 != 0 || offset & 1 != 0 {
-            // Conservative ownership requirement for enabled TGL HuC: the
+            // Conservative ownership requirement for an enabled HuC: the
             // locked partition must select GuC as loading agent. Linux masks
             // this bit in its inherited-layout path; never rewrite its lock.
+            // The media GuC fails closed for its HuC only: GT1 still boots.
             if self.resources.huc.is_some() && offset & 2 == 0 {
-                return Err(BootError::Wopcm);
+                if self.role == GuCRole::Primary {
+                    return Err(BootError::Wopcm);
+                }
+                self.huc_blocked = true;
             }
             if size & 1 == 0 || offset & 1 == 0 {
                 return Err(BootError::Wopcm);
             }
-            return WopcmLayout {
+            let locked = WopcmLayout {
                 base: offset & 0xffffc000,
                 size: size & 0xfffff000,
-            }
-            .validate(0x800000, self.upload, self.config.huc_upload_bytes);
+            };
+            let huc = if self.huc_blocked {
+                0
+            } else {
+                self.config.huc_upload_bytes
+            };
+            return match locked.validate(0x800000, self.upload, huc) {
+                // A locked GuC base below the HuC reservation is -E2BIG in
+                // xe_wopcm.c::__check_layout; the media GuC drops the HuC.
+                Err(BootError::Wopcm) if huc != 0 && matches!(self.role, GuCRole::Media(_)) => {
+                    self.huc_blocked = true;
+                    locked.validate(0x800000, self.upload, 0)
+                }
+                result => result,
+            };
         }
         let layout = if self.platform.is_gen12() || self.platform.is_headless_integrated() {
             WopcmLayout::plan_total(self.upload, self.config.huc_upload_bytes, 0x200000)?
@@ -863,20 +909,46 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     fn upload(&mut self, now: u64) -> Result<(), BootError> {
         let wa_offset = self.wa_offset();
         self.layout()?;
-        if !self.huc_dma_done && self.resources.huc.is_some() {
-            let status = self.mmio.read32(0xc1dc);
-            if status == u32::MAX {
-                return Err(BootError::Unavailable);
-            }
-            if status & 1 != 0 {
-                return Err(BootError::Reset);
+        // xe_uc.c::xe_uc_load_hw uploads the HuC before the GuC, while
+        // xe_guc_min_load_for_hwconfig (the media GuC's minimal first boot)
+        // uploads none. The TGL owner keeps its HuC DMA before both loads.
+        let huc_load = match self.role {
+            GuCRole::Primary => true,
+            GuCRole::Media(_) => self.scheduling.is_some(),
+        };
+        if !self.huc_dma_done && self.resources.huc.is_some() && huc_load && !self.huc_blocked {
+            if self.role == GuCRole::Primary {
+                // TGL's HuC never survives the full reset preceding this
+                // owner: a set bit is stale state. The media-GT HuC survives
+                // GuC/GT reset (i915 intel_huc.c DOC) and Linux uploads it
+                // regardless; authentication rechecks the bit first.
+                let status = self.mmio.read32(0xc1dc);
+                if status == u32::MAX {
+                    return Err(BootError::Unavailable);
+                }
+                if status & 1 != 0 {
+                    return Err(BootError::Reset);
+                }
             }
             let r = &mut *self.resources;
             let huc = r.huc.as_ref().expect("owned HuC");
+            let source = huc
+                .backing
+                .ggtt_offset()
+                .checked_add(huc.css_offset)
+                .ok_or(BootError::Address)?;
             r.allocator.sync_for_device(&huc.backing)?;
             invalidate_guc_tlb(&self.mmio, self.platform);
-            self.huc_exposed = true; // sticky before the first hardware address publication
-            self.mmio.write32(0xc300, huc.backing.ggtt_offset());
+            if self.role == GuCRole::Primary {
+                // Sticky before the first hardware address publication until
+                // the enclosing full Gen12 reset. The media-GT object is read
+                // only by this DMA and the media GuC's AUTHENTICATE_HUC (NARF
+                // issues no GSC authentication), so the verified GuC stop
+                // (MIA in reset, DMA idle) preceding reclamation ends both.
+                self.huc_exposed = true;
+            }
+            // uc_fw_xfer: source GGTT base + css_offset, WOPCM offset 0.
+            self.mmio.write32(0xc300, source);
             self.mmio.write32(0xc304, 8 << 16);
             self.mmio.write32(0xc308, 0);
             self.mmio.write32(0xc30c, 7 << 16);
@@ -1257,9 +1329,15 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     pub(crate) fn huc_upload(&self) -> Option<crate::intel_gpu_huc::Upload> {
         let h = self.resources.huc.as_ref()?;
         Some(crate::intel_gpu_huc::Upload {
-            rsa: h.backing.ggtt_offset().checked_add(h.upload)?,
+            rsa: h.backing.ggtt_offset().checked_add(h.rsa)?,
             version: h.version,
+            adopt: h.adopt,
         })
+    }
+
+    /// The staged HuC can still be uploaded: a locked WOPCM did not block it.
+    pub(crate) fn huc_loadable(&self) -> bool {
+        self.resources.huc.is_some() && !self.huc_blocked
     }
 
     /// Only the enclosing Gen12 owner calls this after full engine reset and
@@ -1292,27 +1370,41 @@ impl<W: MmioWindow, A: BootAllocator> GuCBoot<crate::intel_gpu_gt::media::MediaG
     /// Stage the MTL/Arrow standalone media GuC with the same GuC firmware
     /// family as GT0 (xe_uc_fw.c: METEORLAKE GT_TYPE_ANY mtl_guc_70). WOPCM,
     /// reset, DMA, status and ADS registers go through the media GSI window;
-    /// HWCONFIG is never queried (xe_guc_hwconfig_init: GT0 only) and no HuC
-    /// image is reserved (MTL HuC is GSC-loaded).
+    /// HWCONFIG is never queried (xe_guc_hwconfig_init: GT0 only).
+    ///
+    /// `huc` optionally stages the media GT's HuC (xe_huc.c::xe_huc_init:
+    /// above graphics 12.55 the HuC lives on the media GT) with its `adopt`
+    /// policy. xe_wopcm.c then reserves the HuC upload below the GuC WOPCM
+    /// and names GuC the HuC loading agent; the HuC DMA precedes only the
+    /// submission load. Without it no HuC image is reserved.
     pub(crate) fn stage_media(
         mmio: crate::intel_gpu_gt::media::MediaGsi<W>,
         allocator: A,
         firmware: &GuCFirmware,
-        config: BootConfig,
+        huc: Option<(&crate::intel_gpu_huc::Firmware, bool)>,
+        mut config: BootConfig,
         ip: crate::intel_gpu_gt::media::MediaIp,
     ) -> Result<Self, BootError> {
         if !crate::intel_gpu_gt::media::profile_eligible(firmware.platform())
             || config.huc_upload_bytes != 0
             || GuCWorkarounds::for_media(firmware.platform(), ip).is_none()
+            || huc.is_some_and(|(huc, _)| huc.platform() != firmware.platform())
         {
             return Err(BootError::Unsupported);
         }
-        let mut boot = Self::stage_image(
+        let adopt = huc.is_some_and(|(_, adopt)| adopt);
+        let huc = huc.map(|(huc, _)| huc.load());
+        if let Some(huc) = &huc {
+            config.huc_upload_bytes = huc.upload;
+        }
+        let mut boot = Self::stage_loads(
             mmio,
             allocator,
             firmware.platform(),
             firmware.image(),
             config,
+            huc,
+            adopt,
         )?;
         boot.role = GuCRole::Media(ip);
         Ok(boot)
@@ -2989,6 +3081,7 @@ mod tests {
             crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
             arena.clone(),
             &firmware,
+            None,
             media_config(),
             ip,
             media_policy(),
@@ -3069,6 +3162,7 @@ mod tests {
                 crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
                 arena.clone(),
                 &firmware,
+                None,
                 media_config(),
                 crate::intel_gpu_gt::media::MediaIp::decode(gmd),
                 media_policy(),
@@ -3087,6 +3181,7 @@ mod tests {
             crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
             arena.clone(),
             &firmware,
+            None,
             media_config(),
             ip,
             media_policy(),
@@ -3137,6 +3232,7 @@ mod tests {
                 window.clone(),
                 arena.clone(),
                 &firmware,
+                None,
                 media_config(),
                 &fresh,
                 0
@@ -3152,6 +3248,7 @@ mod tests {
             window.clone(),
             arena.clone(),
             &firmware,
+            None,
             media_config(),
             &media,
             0,
@@ -3227,6 +3324,7 @@ mod tests {
             window.clone(),
             arena.clone(),
             &firmware,
+            None,
             media_config(),
             &media,
             0,
