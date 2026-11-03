@@ -363,22 +363,11 @@ pub static RTL8723BE_PWR_ON: &[WlanPwrCfg] = &[
     pci_end(),
 ];
 
-/// RTL8821AE Cardemu→Active power-on flow.  Source:
-/// `rtl8821ae/pwrseq.h::RTL8812_TRANS_CARDEMU_TO_ACT`.
-pub static RTL8821AE_PWR_ON: &[WlanPwrCfg] = &[
-    // 0x20[0]=1  enable LDO
-    pci_w(0x0020, 1 << 0, 1 << 0),
-    // 0x67[0]=0
-    pci_w(0x0067, 1 << 0, 0),
-    pci_w(0x0005, 1 << 7, 0),
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    pci_w(0x0005, (1 << 4) | (1 << 3), 0),
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    pci_p(0x0005, 1 << 0, 0),
-    pci_w(0x0023, 1 << 4, 1 << 4),
-    pci_end(),
-];
+/// Exact RTL8821AE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
+/// Linux `rtl8821ae/hw.c::_rtl8821ae_init_mac` runs
+/// `RTL8821A_NIC_ENABLE_FLOW` (`pwrseq.c::rtl8821A_card_enable_flow`) with
+/// all-cut/all-fab/PCI masks; USB/SDIO-only rows are omitted.
+pub static RTL8821AE_PWR_ON: &[WlanPwrCfg] = super::rtl8821ae::pwrseq::RTL8821A_CARD_ENABLE_FLOW;
 
 /// RTL8192CE Cardemu→Active power-on flow.  Source:
 /// `rtl8192ce/pwrseq.h::RTL8192C_TRANS_CARDEMU_TO_ACT`.
@@ -418,13 +407,18 @@ pub fn power_on_with(io: &impl Io, did: u16) -> Result<(), PwrSeqError> {
         io.write8(5, value & !0x80)?;
         io.write8(0x1c, 0)?;
     }
-    run_with(
-        io,
-        PWR_CUT_ALL_MSK,
-        PWR_FAB_ALL_MSK,
-        PWR_INTF_PCI_MSK,
-        table,
-    )
+    // rtl8821ae/hw.c::_rtl8821ae_init_mac: unlock REG_RSV_CTRL, clear the
+    // auto-power-down bit (APS_FSMCO[15]) and parse the enable flow with
+    // PWR_CUT_A_MSK, which skips the test-chip-only 0x7a BT-start row.
+    let cut = if did == super::regs::RTL_DEV_8821AE {
+        io.write8(0x1c, 0)?;
+        let value = io.read8(5)?;
+        io.write8(5, value & !0x80)?;
+        PWR_CUT_A_MSK
+    } else {
+        PWR_CUT_ALL_MSK
+    };
+    run_with(io, cut, PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK, table)
 }
 
 /// High-level power-on entry. Walks the chip's enable table over PCIe.

@@ -1432,6 +1432,53 @@ static restore, copied-source loss and held M4. Compilation and native
 execution remain pending. Physical antenna mapping, full-program per-path
 measurements, trusted signing and silicon/RF acceptance remain external.
 
+### RTL8821AE retained-runtime foundation (groundwork, not admitted)
+
+`rtl8821ae/` holds the exact Linux-derived pieces the RTL8821AE retained owner
+is built from. None is reachable from probe as a WLAN capability; the matched
+`0x8821` function stays diagnostic and returns `NotSupported` until the whole
+chain below is composed.
+
+- `pwrseq` — PCI rows of every `rtl8821A_*_flow` (enable, disable, suspend,
+  resume, radio-off, LPS enter/leave), generated from `pwrseq.h` with masks
+  unchanged; USB/SDIO-only rows are omitted. `power::power_on_with` now runs
+  the exact `_rtl8821ae_init_mac` prefix (`REG_RSV_CTRL=0`, clear
+  `APS_FSMCO[15]`) and parses `RTL8821A_NIC_ENABLE_FLOW` with
+  `PWR_CUT_A_MSK` exactly as Linux, replacing the former approximate table.
+- `tables` / `headerfile` — RTL8821AE MAC, PHY_REG, AGC, RADIOA and
+  PHY_REG_PG arrays (`table.c`, source sha256 recorded) and the conditional
+  `__rtl8821ae_phy_config_with_headerfile` walker with `_rtl8821ae_check_positive`.
+  `Condition::from_hardware` takes the cut from `REG_SYS_CFG[15:12]`, rejects
+  `TRP_VAUX_EN` test chips, requires the `0x8129` EFUSE autoload ID and derives
+  `board_type` from EFUSE `0xbc/0xbd/0xbf` plus `REG_MULTI_FUNC_CTRL[18]`.
+  An unprovisioned map produces no condition, so no row is selected.
+- `power_limit` — typed `RTL8821AE_TXPWR_LMT` rows; 63 (`MAX_POWER_INDEX`)
+  and absent rows return `None` and must not be substituted.
+- `fw` — `rtl8821aefw_29.bin` (alt `rtl8821aefw.bin`) and
+  `rtl8821aefw_wowlan.bin`; `IS_FW_HEADER_EXIST_8821`, exact RAM-code length,
+  at most eight 4 KiB pages; `rtl8821ae_download_fw` enable/page/pad/disable,
+  `FWDL_CHKSUM_RPT`, `MCUFWDL_RDY`, 8821A self-reset and `WINTINI_RDY`
+  polling with Linux counts, plus `_rtl8821ae_wait_for_h2c_cmd_finish`.
+- `llt` — `_rtl8821ae_llt_table_init` (boundary `0xf7`, max page 255,
+  RQPN `0x80e60808`) with exact register widths.
+- `trx` — 64-byte TX ring entry (40-byte descriptor, buffer dword 10, next
+  dword 12) filled as `rtl8821ae_tx_fill_desc`, including SPE_RPT/SW_DEFINE
+  TX-report requests; 32-byte RX status decode including `rpt_sel` (C2H),
+  VHT NSS and WoWLAN pattern/magic/unicast wake reasons.
+- `c2h` — `rtl_c2h_content_parsing` ids, V1 TX reports
+  (`rtl_tx_report_handler`), RA reports with `rtl8821ae_hw_rate_to_mrate`, and
+  the `rtl_get_tx_report_sn` SW_DEFINE sequence.
+
+Remaining for the `rtl8821ae` chip row: generalizing the one-shot firmware
+owner and DMA32 ring/LLT `Prepared` owner to the 8821AE profile; the rest of
+`_rtl8821ae_init_mac`/`rtl8821ae_hw_init` (CR/TRXDMA/RCR/queue bases, BB/RF
+enable, `rtl8821ae_phy_mac_config`/`bb_config`/`rf_config` over `headerfile`,
+power-by-rate and limit-to-index conversion, LCK/IQK `rtl8821ae_phy_iq_calibrate`),
+channel/bandwidth switching (`rtl8821ae_phy_sw_chnl`, `set_bw_mode`), H2C
+(media status, RA mask, PS), interrupt delivery, the native packet/station
+owner and a signed per-board envelope. Tests in `rtl8821ae/tests.rs` are
+written and unexecuted.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
