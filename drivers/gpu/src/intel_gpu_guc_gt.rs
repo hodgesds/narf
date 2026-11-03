@@ -248,7 +248,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     pub(crate) fn huc_outcome(&self) -> Option<bool> {
         self.parts.boot.huc_upload()?;
         let huc = &self.parts.scheduler.as_ref()?.huc;
-        huc.done().then(|| huc.running())
+        huc.done().then_some(huc.running())
     }
 
     pub(crate) fn from_staged_hardware(boot: GuCBoot<M, A>) -> Result<Self, GtError> {
