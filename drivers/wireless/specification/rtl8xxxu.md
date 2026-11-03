@@ -1118,8 +1118,32 @@ EP0 transfer/executable-cap discipline; chip steps live in
   `RX_DRVINFO_SZ = 4`, `HIMR0/1 = 0`.
 - TX power (`rtl8192e_set_tx_power`): gen2 channel groups; path A uses
   diff index 0 and path B index 1 (Linux's shared `tx_idx`); `u8 += s8`
-  wraps. Implemented as `rtl8192e_phy::{tx_power, set_tx_power}`; it is not
-  yet invoked by the owner (the post-table MAC stage calls it in Linux).
+  wraps. Implemented as `rtl8192e_phy::{tx_power, set_tx_power}`.
+- Post-table MAC (`rtl8192e_radio::post_tables`, `rtl8xxxu_init_device`
+  from the WMAC settings to `REG_ACLK_MON`): RCR `0x7000600e`, MAR all-ones
+  (no `init_reg_rxfltmap`), RRSR CCK-1M, `set_spec_sifs(0x10,0x10)` →
+  `set_retry(0x30,0x30)` → `set_spec_sifs(0x0a,0x10)`, MAC/CCK/OFDM SIFS,
+  EDCA, DARFRC/RARFRC, AMPDU retry, ACK timeout, beacon/TBTT/early-int/DMA
+  time/TCFG, CCK+OFDM blocks, CAM invalidate (polled to completion;
+  `CamTimeout` otherwise — Linux does not poll), `set_tx_power(1, HT20)`,
+  HWSEQ, BAR mode, `REG_FAST_EDCA_CTRL = 0`, `REG_QUEUE_CTRL[3] = 0`,
+  `REG_ACLK_MON = 0`. No `REG_LEDCFG2` DPDT handover and no GPIO mux write
+  (both are skipped for RTL8192E in Linux); no burst/aggregation/packet
+  lifetime/statistics hooks (not in `rtl8192eu_fops`).
+- Post-calibration (`rtl8192e_radio::post_calibration`): gen2 thermal meter
+  (`RF_A 0x42 = 0x37cf8`), `NAV_UPPER`, `REG_USB_HRPWM = 0`, mgmt ACK, the
+  LDPC RX hang fix (`REG_AFE_MISC[19:12] = 0x7e`, LDO 0x75) and the CCK AGC
+  report type copied from `0x824[9]` to `0x82c[9]` and `0xa80[7]`; the
+  `0xa9c[17]` CCK-new-AGC and `0xd2c[11]` CFO ATC states are retained.
+- Channel (`rtl8192e_radio::config_channel`, `rtl8xxxu_gen2_config_channel`
+  over both RF paths): 20 MHz (HT or non-HT) and 40 MHz with the secondary
+  above (RF channel +2, subchannel 2) or below (−2, subchannel 1), CCK
+  sideband, OFDM LSTF prime channel, `FPGA0_POWER_SAVE` upper/lower,
+  `WMAC_TRXPTCL_CTL` bandwidth, SIFS `0x0e`/`0x0a`, R2T/T2T, `MODE_AG`
+  bandwidth bits. `channel_geometry` admits 1..=13 (HT20), 1..=14 (non-HT),
+  and 40 MHz pairs fully inside 1..=13; anything else is `RuntimeState`
+  before any transfer. Two-path RF reads use `rtl8192e_radio::read_rfreg`
+  (path-A edge strobe, path-specific HSSI/LSSI/HSPI readback).
 
 The owner currently stops at `TablesReady` for RTL8192EU. The production
 probe stays detection-only for this family; no table, calibration, packet

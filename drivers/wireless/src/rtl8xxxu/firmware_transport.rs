@@ -628,9 +628,9 @@ impl<I: ControlIo> Owner<I> {
     }
 
     /// RTL8192EU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
-    /// through firmware start and the MAC/BB/RF tables. Calibration, channel
-    /// and packet stages follow; until they exist the owner stops at
-    /// TablesReady.
+    /// through firmware start, the MAC/BB/RF tables and the post-table MAC
+    /// stage (`rtl8192e_radio::post_tables`). Calibration, channel and packet
+    /// stages follow; until they exist the owner stops at TablesReady.
     async fn run_device_8192e(
         &self,
         payload: &[u8],
@@ -648,6 +648,7 @@ impl<I: ControlIo> Owner<I> {
         self.download(payload).await?;
         self.stage(Stage::InitializingTables);
         super::rtl8192e_phy::mac_bb_rf(self, &factory).await?;
+        super::rtl8192e_radio::post_tables(self, &factory).await?;
         self.stage(Stage::TablesReady);
         Ok(info)
     }

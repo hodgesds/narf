@@ -34,6 +34,9 @@ pub(super) struct Model {
     config: Vec<u8>,
     fw_bytes: usize,
     pub(super) mailbox_stuck: bool,
+    /// RF register file per path, fed by LSSI writes, read back through the
+    /// HSSI address latched in `0x824`/`0x82c`.
+    pub(super) rf: [[u32; 256]; 2],
 }
 
 #[derive(Clone)]
@@ -113,6 +116,7 @@ impl Fake {
             config: configuration(3),
             fw_bytes: 0,
             mailbox_stuck: false,
+            rf: [[0; 256]; 2],
         })))
     }
     pub(super) fn writes(&self, addr: u16) -> Vec<Vec<u8>> {
@@ -125,6 +129,13 @@ impl Fake {
                 _ => None,
             })
             .collect()
+    }
+    /// Writes of exactly `len` bytes to `addr` (the 8-bit MAC table shares
+    /// many addresses with later 16/32-bit writes).
+    pub(super) fn writes_len(&self, addr: u16, len: usize) -> Vec<Vec<u8>> {
+        let mut out = self.writes(addr);
+        out.retain(|v| v.len() == len);
+        out
     }
 }
 
@@ -162,6 +173,13 @@ impl ControlIo for Fake {
         if addr == REG_HMTFR && g.mailbox_stuck {
             g.regs[a] = 0x0f;
         }
+        if matches!(addr, 0x8a0 | 0x8a4 | 0x8b8 | 0x8bc) && out.len() == 4 {
+            let path = (addr & 4 != 0) as usize;
+            let parm = if path == 1 { 0x82c } else { 0x824 };
+            let latch = u32::from_le_bytes(g.regs[parm..parm + 4].try_into().unwrap());
+            let value = g.rf[path][((latch >> 23) & 0xff) as usize];
+            g.regs[a..a + 4].copy_from_slice(&value.to_le_bytes());
+        }
         out.copy_from_slice(&g.regs[a..a + out.len()]);
         Ok(out.len())
     }
@@ -172,6 +190,13 @@ impl ControlIo for Fake {
         g.regs[a..a + data.len()].copy_from_slice(data);
         if (0x1000..0x2000).contains(&addr) {
             g.fw_bytes += data.len();
+        }
+        if matches!(addr, 0x840 | 0x844) && data.len() == 4 {
+            let word = u32::from_le_bytes(data.try_into().unwrap());
+            g.rf[(addr == 0x844) as usize][(word >> 20) as usize & 0xff] = word & 0xfffff;
+        }
+        if addr == 0x670 && data.len() == 4 {
+            g.regs[0x673] &= 0x7f; // CAM command completes
         }
         if addr == REG_EFUSE_CTRL + 3 && data[0] & 0x80 == 0 {
             let offset = g.regs[0x31] as usize | ((g.regs[0x32] as usize & 3) << 8);
@@ -544,3 +569,148 @@ fn smoke_rtl8192eu_tx_power() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtl8xxxu/8192eu", smoke_rtl8192eu_tx_power);
+
+fn word(v: &[u8]) -> u32 {
+    let mut raw = [0u8; 4];
+    raw[..v.len()].copy_from_slice(v);
+    u32::from_le_bytes(raw)
+}
+
+fn smoke_rtl8192eu_post_table_mac() -> TestResult {
+    use super::rtl8192e_radio::{retry_limit, spec_sifs, RCR_INIT};
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(64))).is_err() {
+        return TestResult::Fail("8192eu lifecycle failed");
+    }
+    if spec_sifs(0x10, 0x10) != 0x1010 || spec_sifs(0x0a, 0x10) != 0x100a {
+        return TestResult::Fail("8192eu spec SIFS encode");
+    }
+    if retry_limit(0x30, 0x30) != 0x3030 {
+        return TestResult::Fail("8192eu retry encode");
+    }
+    if io.writes_len(0x608, 4) != [RCR_INIT.to_le_bytes().to_vec()] || RCR_INIT != 0x7000_600e {
+        return TestResult::Fail("8192eu RCR");
+    }
+    if io.writes_len(0x428, 2) != [vec![0x10, 0x10], vec![0x0a, 0x10]]
+        || io.writes(0x42a) != [vec![0x30, 0x30]]
+    {
+        return TestResult::Fail("8192eu spec SIFS / retry order");
+    }
+    for (reg, value) in [
+        (0x508u16, 0x005e_a42bu32),
+        (0x50c, 0x0000_a44f),
+        (0x504, 0x005e_a324),
+        (0x500, 0x002f_a226),
+        (0x434, 0x1008_0404),
+        (0x438, 0x0403_0201),
+        (0x43c, 0x0807_0605),
+    ] {
+        if io.writes_len(reg, 4) != [value.to_le_bytes().to_vec()] {
+            return TestResult::Fail("8192eu EDCA / ARFR");
+        }
+    }
+    if io.writes(0x670) != [0xc000_0000u32.to_le_bytes().to_vec()] {
+        return TestResult::Fail("8192eu CAM invalidate");
+    }
+    // set_tx_power(1, HT20) from the factory map: ofdm A = 0x28 splat.
+    if io.writes_len(0xe00, 4).last() != Some(&0x2828_2828u32.to_le_bytes().to_vec())
+        || io.writes_len(0x830, 4).last() != Some(&0x3030_3030u32.to_le_bytes().to_vec())
+    {
+        return TestResult::Fail("8192eu initial TX power");
+    }
+    if io.writes_len(0x460, 2) != [vec![0, 0]]
+        || io.writes(0x3e) != [vec![0]]
+        || io.writes(0x423) != [vec![0xff]]
+        || io.writes_len(0x4cc, 4) != [0x0201_ffffu32.to_le_bytes().to_vec()]
+        || io.writes(0x4c6).len() != 1
+        || io.writes(0x4c6)[0][0] & 0x08 != 0
+    {
+        return TestResult::Fail("8192eu FAST_EDCA / ACLK / queue control");
+    }
+    // The 8192E keeps DPDT selection and never gives LEDCFG2 to the 8051.
+    if !io.writes(0x4e).is_empty() {
+        return TestResult::Fail("8192eu must not touch LEDCFG2 at init");
+    }
+    if word(&io.writes(0x800).last().cloned().unwrap_or_default()) & 0x0300_0000 != 0x0300_0000 {
+        return TestResult::Fail("8192eu CCK/OFDM block enable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_post_table_mac
+);
+
+fn smoke_rtl8192eu_config_channel() -> TestResult {
+    use super::rtl8192e_radio::{channel_geometry, config_channel, Width};
+    if channel_geometry(3, Width::Ht40Above) != Some((5, 2))
+        || channel_geometry(11, Width::Ht40Below) != Some((9, 1))
+        || channel_geometry(10, Width::Ht40Above).is_some()
+        || channel_geometry(4, Width::Ht40Below).is_some()
+        || channel_geometry(14, Width::Ht20).is_some()
+        || channel_geometry(14, Width::NoHt20) != Some((14, 0))
+        || channel_geometry(0, Width::NoHt20).is_some()
+    {
+        return TestResult::Fail("8192eu channel geometry");
+    }
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(64))).is_err() {
+        return TestResult::Fail("8192eu lifecycle failed");
+    }
+    // Pre-seed MODE_AG with unrelated high bits that must survive.
+    {
+        let mut g = io.0.lock();
+        g.rf[0][0x18] = 0x8_0401;
+        g.rf[1][0x18] = 0x8_0401;
+    }
+    if narf_scheduler::block_on(config_channel(&owner, 3, Width::Ht40Above)).is_err() {
+        return TestResult::Fail("8192eu HT40 config failed");
+    }
+    {
+        let g = io.0.lock();
+        if g.rf[0][0x18] != 0x8_0405 || g.rf[1][0x18] != 0x8_0405 {
+            return TestResult::Fail("8192eu HT40 MODE_AG channel/bandwidth");
+        }
+        if g.regs[0x483] != 2
+            || word(&g.regs[0x668..0x66a]) & 0x180 != 0x80
+            || g.regs[0x800] & 1 != 1
+            || g.regs[0x900] & 1 != 1
+            || g.regs[0xa00] & 0x10 != 0
+            || word(&g.regs[0xd00..0xd04]) & 0xc00 != 0x400
+            || word(&g.regs[0x818..0x81c]) & 0x0c00_0000 != 0x0800_0000
+            || g.regs[0x515] != 0x0e
+            || g.regs[0x517] != 0x0e
+        {
+            return TestResult::Fail("8192eu HT40-above BB/MAC programming");
+        }
+    }
+    if narf_scheduler::block_on(config_channel(&owner, 6, Width::NoHt20)).is_err() {
+        return TestResult::Fail("8192eu 20 MHz config failed");
+    }
+    let g = io.0.lock();
+    if g.rf[0][0x18] != 0x8_0c06 || g.rf[1][0x18] != 0x8_0c06 {
+        return TestResult::Fail("8192eu 20 MHz MODE_AG");
+    }
+    if g.regs[0x483] != 0
+        || word(&g.regs[0x668..0x66a]) & 0x180 != 0
+        || g.regs[0x800] & 1 != 0
+        || g.regs[0x900] & 1 != 0
+        || g.regs[0x515] != 0x0a
+        || word(&g.regs[0x63c..0x640]) != 0x0a0a_0808
+    {
+        return TestResult::Fail("8192eu 20 MHz BB/MAC programming");
+    }
+    drop(g);
+    if narf_scheduler::block_on(config_channel(&owner, 10, Width::Ht40Above))
+        != Err(Error::RuntimeState)
+    {
+        return TestResult::Fail("8192eu admitted an out-of-band HT40 pair");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_config_channel
+);
