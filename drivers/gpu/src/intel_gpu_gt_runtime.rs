@@ -22,8 +22,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Read, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
-use narf_power::runtime_pm::{RpmError, RpmFuture, RuntimePmOps, SchedulerEnv};
+use narf_power::runtime_pm::{RpmError, RpmFuture, RpmStatus, RuntimePmOps, SchedulerEnv};
 
+#[path = "intel_gpu_display_rpm.rs"]
+pub(crate) mod display_rpm;
 #[path = "intel_gpu_gt_recovery.rs"]
 pub(crate) mod recovery;
 
@@ -132,8 +134,13 @@ struct Pending {
 struct Owner {
     pending: Pending,
     pm: narf_power::runtime_pm_pci::PciRuntimeNode,
+    /// How this owner takes part in runtime PM, fixed at start.
+    profile: Result<display_rpm::Profile, display_rpm::ProfileRefusal>,
     /// Autosuspend has been configured and runtime PM allowed.
     autosuspend: AtomicBool,
+    /// The runtime-PM reference a system sleep holds from preparation to
+    /// resume (`pci_pm_suspend` resumes a runtime-suspended function first).
+    system_awake: IrqSafeSpinLock<Option<Awake>>,
     runtime_power: Arc<crate::intel_gpu_power_controls::runtime::Control>,
     state: Mutex<State>,
     suspended: AtomicBool,
@@ -1146,20 +1153,29 @@ pub(crate) fn start_pending() {
             GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
                 .expect("admitted platform"),
         ));
-        let auto_eligible = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
-            .is_some_and(GtPlatform::is_discrete)
-            && p.mode.is_none()
-            && !p.smallbar;
+        let profile = display_rpm::profile(
+            GtPlatform::from_pci(p.device.id.vendor, p.device.id.device),
+            p.mode.is_some(),
+            p.smallbar,
+        );
+        // Every pipe already reported lit (KMS install's owned Pipe A) holds
+        // its display wakeref from here on: a lit panel keeps the function
+        // active even once autosuspend is armed.
+        if profile == Ok(display_rpm::Profile::Display) {
+            display_rpm::bind(p.bar.phys.raw(), pm.device.clone());
+        }
         let runtime_power = crate::intel_gpu_power_controls::runtime::Control::register(
             p.index,
             pm.device.clone(),
             user_epoch.clone(),
-            auto_eligible,
+            profile.is_ok(),
         );
         let owner = Arc::new(Owner {
             pending: p,
             pm,
+            profile,
             autosuspend: AtomicBool::new(false),
+            system_awake: IrqSafeSpinLock::new(None),
             runtime_power,
             state: Mutex::new(State {
                 coredump,
@@ -1934,6 +1950,11 @@ impl Owner {
             return;
         };
         let mut reconfiguration_power = None;
+        // intel_hpd_poll_enable while an integrated function is runtime-
+        // suspended, and the wakeref of a polled detect, held until the
+        // resumed GT is running again (its restart is not synchronous).
+        let mut hpd_poll = display_rpm::HpdPoll::default();
+        let mut hpd_awake: Option<Awake> = None;
         loop {
             // Policy changes may invoke PCI resume/GT park callbacks, so
             // service the card-lifetime actor before acquiring the GT mutex.
@@ -1948,7 +1969,18 @@ impl Owner {
                 })
                 .await;
             if !self.suspended.load(Ordering::Acquire) {
-                crate::intel_gpu::service_external_sst(&self.pending.bar);
+                if !self.display_profile() || self.pm.device.status() == RpmStatus::Active {
+                    hpd_poll.active();
+                    crate::intel_gpu::service_external_sst(&self.pending.bar);
+                } else if hpd_awake.is_none() && hpd_poll.due(narf_time::monotonic_ns()) {
+                    // A runtime-suspended display touches no register: one
+                    // polled detect per DRM_OUTPUT_POLL_PERIOD, under a
+                    // wakeref that resumes the function first.
+                    if let Ok(awake) = Awake::take(&self).await {
+                        crate::intel_gpu::service_external_sst(&self.pending.bar);
+                        hpd_awake = Some(awake);
+                    }
+                }
             }
             let mut reconfiguration_power_failed = false;
             // Runtime resume can acquire this same GT mutex. Never request
@@ -1976,6 +2008,7 @@ impl Owner {
             }
             let mut wait = None;
             let mut delay_us = 500;
+            let mut settled = false;
             if !self.suspended.load(Ordering::Acquire) {
                 let mut state = self.state.lock().await;
                 // Snapshot the IRQ epoch before servicing any status. The
@@ -2224,12 +2257,21 @@ impl Owner {
                         );
                     }
                 }
+                settled = matches!(state.phase, Phase::Running | Phase::Failed | Phase::Stopped);
             }
             if let Some(epoch) = display_formats_pending {
                 if crate::intel_gpu_kms::refresh_formats_after_publication(&self.pending.bar, epoch)
                 {
                     display_formats_pending = None;
                 }
+            }
+            if (settled && display_formats_pending.is_none())
+                || self.suspended.load(Ordering::Acquire)
+            {
+                // The polled detect's resume finished (or cannot), including
+                // the post-publication display pass: its put re-arms
+                // autosuspend against a running GT.
+                drop(hpd_awake.take());
             }
             self.arm_autosuspend().await;
             narf_scheduler::yield_now().await;
@@ -2577,18 +2619,24 @@ impl Owner {
     }
 }
 
+/// Whether a (non-small-BAR) owner of `platform`, with or without an owned
+/// display, ever allows runtime PM ([`display_rpm::profile`]).
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn autosuspend_profile_eligible(platform: Option<GtPlatform>, has_mode: bool) -> bool {
-    platform.is_some_and(GtPlatform::is_discrete) && !has_mode
+    display_rpm::profile(platform, has_mode, false).is_ok()
 }
 
 impl Owner {
-    /// Discrete functions without a bound display may autosuspend. An iGPU
-    /// scanout keeps its function in D0, as Linux's display wakeref does.
+    /// Display-less discrete functions and integrated MTL/Arrow or Gen12
+    /// functions with an owned display allow runtime PM. An integrated
+    /// function stays active while any display wakeref is held, and a lit
+    /// panel holds one, as Linux's display wakeref does.
     fn autosuspend_eligible(&self) -> bool {
-        let platform =
-            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
-        !self.pending.smallbar
-            && autosuspend_profile_eligible(platform, self.pending.mode.is_some())
+        self.profile.is_ok()
+    }
+
+    fn display_profile(&self) -> bool {
+        self.profile == Ok(display_rpm::Profile::Display)
     }
 
     /// Once the first bring-up publishes users: configure autosuspend, allow
@@ -2612,19 +2660,30 @@ impl Owner {
     }
 
     /// Runtime suspend: refuse unless the GT is running and provably idle,
-    /// no VRAM object exists (CPU BAR mappings cannot be revoked) and no
-    /// system sleep owns the function. Then stop the GT exactly as for
-    /// reset, keeping the user epoch published for the resume.
+    /// no VRAM object exists (CPU BAR mappings cannot be revoked), no
+    /// display wakeref is held and no system sleep owns the function
+    /// ([`display_rpm::park_refusal`]; system-memory CPU mappings never
+    /// refuse). Then stop the GT exactly as for reset, keeping the user
+    /// epoch published for the resume.
     async fn park(&self) -> Result<(), RpmError> {
         let mut state = self.state.lock().await;
-        if self.suspended.load(Ordering::Acquire)
-            || state.phase != Phase::Running
-            || !self.autosuspend_eligible()
-            || self
-                .pending
-                .card
-                .intel_vram_used()
-                .is_some_and(|used| used != 0)
+        // xe_display_pm_runtime_suspend{,_late}: the display wakerefs already
+        // kept the RPM core from calling here; re-read the holds (lit pipes,
+        // DC_off, the deferred DC re-entry, external routes, KMS work).
+        let display = if self.display_profile() {
+            display_rpm::hold(self.pending.index, &self.pending.bar)
+        } else {
+            None
+        };
+        let local = self.pending.card.intel_vram_used();
+        if display_rpm::park_refusal(
+            self.suspended.load(Ordering::Acquire),
+            state.phase == Phase::Running,
+            self.profile,
+            local,
+            display,
+        )
+        .is_some()
         {
             return Err(RpmError::Busy);
         }
@@ -2671,12 +2730,25 @@ impl Owner {
         state.gt.take();
         state.parked_epoch = Some((epoch, engines, compute));
         state.phase = Phase::Parked;
+        if self.display_profile() {
+            // The DMC program and DC target stay across D3hot; the first
+            // publication after the resume re-verifies the program.
+            crate::intel_gpu_dc_states::runtime_suspend_for_bar(&self.pending.bar);
+        }
         log(self.pending.index, "runtime suspended (idle)");
         Ok(())
     }
 
     /// Runtime resume: the PCI layer restored D0 and config space; restart
     /// the verified bring-up, which adopts the parked epoch at publication.
+    /// The restart reloads GuC (and HuC where opted in), re-establishes SLPC
+    /// and GuC-controlled RC6 and replays the confirmed SLPC policy. For an
+    /// integrated display (`xe_display_pm_runtime_resume`): the card worker
+    /// resumes its per-iteration hotplug pass once the function is active
+    /// (`intel_hpd_init` / `intel_hpd_poll_disable`; there is no display
+    /// interrupt to re-arm), the first publication re-verifies the retained
+    /// DMC program before DC5/DC6 is trusted again, and the KMS owner
+    /// re-proves its retained resource image (IPC included) on its next use.
     async fn unpark(&self) {
         let mut state = self.state.lock().await;
         if state.phase == Phase::Parked {
@@ -2746,6 +2818,14 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             if self.pending.smallbar {
                 return Err(E::Busy);
             }
+            // pci_pm_suspend runtime-resumes a suspended function before the
+            // driver's system suspend: an integrated display must be in D0
+            // for the quiesce below. Held until resume_from_suspend.
+            let awake = if self.display_profile() {
+                Some(Awake::take(self).await.map_err(|_| E::Busy)?)
+            } else {
+                None
+            };
             // S3 may lose both data and flat CCS. Until VRAM preservation or
             // migration is owned, retained objects/CPU BAR mappings prevent it.
             if self
@@ -2841,6 +2921,9 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             drop(state);
             if result.is_err() {
                 let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
+            } else if let Some(awake) = awake {
+                let old = self.system_awake.lock().replace(awake);
+                drop(old);
             }
             result
         })
@@ -2874,6 +2957,11 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             state.recovery.cold();
             state.saved = None;
             self.suspended.store(false, Ordering::Release);
+            drop(state);
+            // The system sleep's runtime-PM reference; the display wakerefs
+            // (the relit panel) keep holding the function as before.
+            let awake = self.system_awake.lock().take();
+            drop(awake);
             Ok(())
         })
     }

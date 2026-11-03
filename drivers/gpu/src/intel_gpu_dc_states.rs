@@ -67,6 +67,12 @@
 //! - System suspend preparation takes a Suspend reference first, and
 //!   after the display has quiesced disables the DMC program; the
 //!   first publication after resume reloads it before releasing.
+//! - Runtime PM (`intel_gpu_display_rpm`): once the GT owner bound the
+//!   function's runtime-PM device, every reference and the deferred
+//!   re-entry task hold a display wakeref, taken only while the function
+//!   is runtime-active. Runtime D3hot keeps the program (as Linux does);
+//!   the first publication after the resume re-verifies it under a Load
+//!   reference and reloads it if it was lost.
 //!
 //! Pipe DMC (`intel_dmc_enable_pipe` / `intel_dmc_disable_pipe`): every
 //! accepted pipe program is loaded with the main program, events
@@ -342,6 +348,9 @@ pub struct DcCore {
     pipes_lit: u32,
     /// Pipes whose `PIPEDMC_ENABLE_MTL` bit this driver set.
     pipes_enabled: u32,
+    /// The function went through runtime D3hot with a loaded program: the
+    /// next publication re-verifies it under `DC_off` before trusting it.
+    recheck: bool,
 }
 
 /// `MTL_PIPEDMC_CONTROL` bits for a pipe mask.
@@ -371,6 +380,7 @@ impl DcCore {
             last_block: None,
             pipes_lit: 0,
             pipes_enabled: 0,
+            recheck: false,
         }
     }
 
@@ -778,6 +788,52 @@ impl DcCore {
     pub fn suspend_abort(&mut self, now: u64) -> Option<u64> {
         self.put(DcUser::Suspend, now)
     }
+
+    /// Runtime D3hot entry. Linux keeps the DMC program and the DC target
+    /// across D3hot (`xe_display_pm_runtime_suspend_late` only flushes the
+    /// DMC wakelock release work), so nothing is written here; a loaded
+    /// program is marked for re-verification at the first publication
+    /// after the resume.
+    pub fn runtime_suspend(&mut self) {
+        if matches!(self.program, ProgramState::Loaded { .. }) {
+            self.recheck = true;
+        }
+    }
+
+    /// Whether a runtime-resume re-verification is pending.
+    pub fn recheck_pending(&self) -> bool {
+        self.recheck
+    }
+
+    /// After a runtime resume: under a Load reference (DC5/DC6 may have
+    /// been armed across D3hot, and program RAM is display MMIO), verify
+    /// the main program. One that no longer verifies becomes `Lost`, which
+    /// the following [`Self::begin_load`] reloads before any DC re-entry.
+    /// Returns the Load release's re-entry deadline. A DC exit that fails
+    /// keeps the re-verification pending.
+    pub fn runtime_resume_verify<M: MmioWindow + ?Sized>(
+        &mut self,
+        regs: &M,
+        now: u64,
+    ) -> Result<Option<u64>, DcError> {
+        if !self.recheck {
+            return Ok(None);
+        }
+        if !matches!(self.program, ProgramState::Loaded { .. }) {
+            self.recheck = false;
+            return Ok(None);
+        }
+        self.get(regs, DcUser::Load)?;
+        self.recheck = false;
+        let verified = self.blob.clone().is_some_and(|blob| {
+            parse_dmc_firmware_xelpdp(&blob, b'*', b'*')
+                .is_ok_and(|firmware| verify_program(regs, &firmware, DmcId::Main).is_ok())
+        });
+        if !verified {
+            self.program = ProgramState::Lost;
+        }
+        Ok(self.put(DcUser::Load, now))
+    }
 }
 
 /// Stream and verify a display-14 container (`intel_dmc_load_program`
@@ -803,7 +859,9 @@ pub fn publication_step<M: MmioWindow + ?Sized>(
         let result = acquire();
         core.lock().provide_firmware(result);
     }
-    let mut deadline = None;
+    // A runtime resume re-verifies the retained program first; a lost one
+    // is reloaded just below, before the Init/Suspend release.
+    let mut deadline = core.lock().runtime_resume_verify(regs, now).ok().flatten();
     let blob = core.lock().begin_load(regs).ok().flatten();
     if let Some(blob) = blob {
         let result = load_and_verify(regs, &blob);
@@ -951,10 +1009,17 @@ pub fn external_live() -> bool {
 /// for the last one, schedules deferred re-entry; nothing is written
 /// to hardware on drop. Inert (holds nothing) where no display-14
 /// service exists — every Gen12 path and every fixture platform.
+///
+/// Once the GT owner bound the function's runtime-PM device, a reference
+/// also holds a display wakeref (`intel_display_power_get` →
+/// `intel_display_rpm_get`): it is taken only while the function is
+/// runtime-active and released after the `DC_off` release.
 #[must_use = "dropping the reference releases DC_off immediately"]
 pub(crate) struct DcRef {
     service: Option<Arc<DcService>>,
     user: DcUser,
+    /// Dropped after [`Drop::drop`] released `DC_off`.
+    _wakeref: Option<crate::intel_gpu_gt_runtime::display_rpm::Wakeref>,
 }
 
 impl DcRef {
@@ -963,6 +1028,7 @@ impl DcRef {
         Self {
             service: None,
             user,
+            _wakeref: None,
         }
     }
 }
@@ -1003,10 +1069,16 @@ fn take(service: Option<Arc<DcService>>, user: DcUser) -> Result<DcRef, DcError>
     let Some(service) = service else {
         return Ok(DcRef::none(user));
     };
+    // A runtime-suspending/suspended function refuses before any register
+    // access: the conversation fails closed instead of resuming it.
+    let wakeref =
+        crate::intel_gpu_gt_runtime::display_rpm::wakeref_if_active(service.bar.phys.raw())
+            .map_err(|_| DcError::Unavailable)?;
     service.core.lock().get(&service.window, user)?;
     Ok(DcRef {
         service: Some(service),
         user,
+        _wakeref: wakeref,
     })
 }
 
@@ -1040,10 +1112,14 @@ pub(crate) fn acquire_for_bar(bar: &narf_bus::MmioRegion, user: DcUser) -> Resul
 /// A pipe owner lit `pipe` on this BAR's display (after enabling it, or
 /// when adopting a pipe firmware left lit): the pipe DMC is enabled
 /// under a [`DcUser::PipeDmc`] reference once the program is loaded,
-/// and again after every reload. Inert without a display-14 service.
-/// `Err` means DC states could not be exited; the pipe is still
+/// and again after every reload. The pipe's display wakeref is recorded
+/// first, on every IP; the pipe DMC part is inert without a display-14
+/// service. `Err` means DC states could not be exited; the pipe is still
 /// recorded and is enabled after the next load.
 pub fn pipe_lit_for_bar(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), DcError> {
+    // The pipe's crtc power domains are taken before its enable
+    // (`modeset_get_crtc_power_domains`): its display wakeref, on every IP.
+    crate::intel_gpu_gt_runtime::display_rpm::pipe_lit(bar.phys.raw(), pipe);
     let Some(service) = service_for(bar) else {
         return Ok(());
     };
@@ -1063,11 +1139,20 @@ pub fn pipe_lit_for_bar(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), DcE
 }
 
 /// A pipe owner is about to disable `pipe`: the pipe DMC this driver
-/// enabled is disabled first (`intel_dmc_disable_pipe`). Inert without a
-/// display-14 service. `Err` means DC states could not be exited; the
-/// pipe is forgotten but its enable bit, if any, remains and blocks DC
-/// re-entry as foreign until the hardware clears it.
+/// enabled is disabled first (`intel_dmc_disable_pipe`), then the pipe's
+/// display wakeref is released on every IP. The pipe DMC part is inert
+/// without a display-14 service. `Err` means DC states could not be
+/// exited; the pipe is forgotten but its enable bit, if any, remains and
+/// blocks DC re-entry as foreign until the hardware clears it.
 pub fn pipe_dark_for_bar(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), DcError> {
+    let result = pipe_dmc_dark(bar, pipe);
+    // The pipe's crtc power domains are released after its disable
+    // (`modeset_put_crtc_power_domains`), whatever the pipe DMC did.
+    crate::intel_gpu_gt_runtime::display_rpm::pipe_dark(bar.phys.raw(), pipe);
+    result
+}
+
+fn pipe_dmc_dark(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), DcError> {
     let Some(service) = service_for(bar) else {
         return Ok(());
     };
@@ -1137,8 +1222,20 @@ fn schedule_arm(service: &Arc<DcService>) {
     if service.arming.swap(true, Ordering::AcqRel) {
         return;
     }
+    // The deferred release keeps the function runtime-active until it ran
+    // (`async_put_wakeref`). A function no longer active writes nothing; the
+    // pending deadline is picked up by the next release.
+    let Ok(wakeref) =
+        crate::intel_gpu_gt_runtime::display_rpm::wakeref_if_active(service.bar.phys.raw())
+    else {
+        service.arming.store(false, Ordering::Release);
+        return;
+    };
     let service = service.clone();
-    narf_scheduler::spawn(async move { arm_task(service).await });
+    narf_scheduler::spawn(async move {
+        arm_task(service).await;
+        drop(wakeref);
+    });
 }
 
 async fn arm_task(service: Arc<DcService>) {
@@ -1214,6 +1311,13 @@ pub(crate) fn service_after_publication(bar: &narf_bus::MmioRegion) {
     let Some(service) = service_for(bar) else {
         return;
     };
+    // Display MMIO below: only while the function is runtime-active. A
+    // skipped pass leaves any re-verification pending.
+    let Ok(_wakeref) =
+        crate::intel_gpu_gt_runtime::display_rpm::wakeref_if_active(service.bar.phys.raw())
+    else {
+        return;
+    };
     if publication_step(
         &service.core,
         &service.window,
@@ -1223,6 +1327,28 @@ pub(crate) fn service_after_publication(bar: &narf_bus::MmioRegion) {
     .is_some()
     {
         schedule_arm(&service);
+    }
+}
+
+/// `DC_off` references held and whether a deferred re-entry is pending or
+/// running on this BAR's display, without touching hardware. `(0, false)`
+/// without a display-14 service.
+pub(crate) fn busy_for_bar(bar: &narf_bus::MmioRegion) -> (u32, bool) {
+    let Some(service) = service_for(bar) else {
+        return (0, false);
+    };
+    let core = service.core.lock();
+    (
+        core.total(),
+        core.arm_deadline().is_some() || service.arming.load(Ordering::Acquire),
+    )
+}
+
+/// Runtime D3hot entry for this BAR's display ([`DcCore::runtime_suspend`]).
+/// Writes nothing; inert without a display-14 service.
+pub(crate) fn runtime_suspend_for_bar(bar: &narf_bus::MmioRegion) {
+    if let Some(service) = service_for(bar) {
+        service.core.lock().runtime_suspend();
     }
 }
 

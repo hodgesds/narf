@@ -1075,3 +1075,76 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dc_states",
     smoke_dc_states_pipe_dmc_follows_pipe_lifetime
 );
+
+fn smoke_dc_states_runtime_d3hot_keeps_program_and_reverifies_on_resume() -> TestResult {
+    // Runtime D3hot with the program retained (the Linux D3hot path).
+    let fake = Fake::default();
+    let core = armed(&fake);
+    fake.clear_log();
+    core.lock().runtime_suspend();
+    if !fake.log().is_empty() || !core.lock().recheck_pending() || fake.get(DC_STATE_EN) & 3 != 2 {
+        return TestResult::Fail("runtime suspend must write nothing and keep DC6 armed");
+    }
+    let Some(due) = publication_step(&core, &fake, 40 * MS, || Err(DcRefusal::Authority)) else {
+        return TestResult::Fail("the re-verification must release and schedule re-entry");
+    };
+    let program = core.lock().program();
+    if fake.writes_to(DC_STATE_EN).first().map(|v| v & 3) != Some(0)
+        || fake
+            .log()
+            .iter()
+            .any(|(off, _)| (0x80000..0x8F000).contains(off))
+        || !matches!(program, ProgramState::Loaded { .. })
+        || core.lock().recheck_pending()
+        || core.lock().total() != 0
+    {
+        return TestResult::Fail("a retained program must be verified under DC_off, not reloaded");
+    }
+    if core.lock().arm_if_due(&fake, due, ArmGates::default()) != Ok(DC_STATE_EN_UPTO_DC6) {
+        return TestResult::Fail("DC6 must be re-entered after a verified resume");
+    }
+    // Program RAM lost across D3hot: the same pass reloads it before any
+    // DC re-entry.
+    core.lock().runtime_suspend();
+    fake.set(0x80000, 0);
+    fake.clear_log();
+    let Some(due) = publication_step(&core, &fake, 80 * MS, || Err(DcRefusal::Authority)) else {
+        return TestResult::Fail("a lost program must be reloaded and re-entry scheduled");
+    };
+    if !fake.log().contains(&(0x80000, 0xD0C0_0001))
+        || fake.writes_to(DC_STATE_EN).iter().any(|v| *v & 3 != 0)
+        || !matches!(core.lock().program(), ProgramState::Loaded { .. })
+    {
+        return TestResult::Fail("re-entry must not precede the reload of a lost program");
+    }
+    if core.lock().arm_if_due(&fake, due, ArmGates::default()) != Ok(DC_STATE_EN_UPTO_DC6) {
+        return TestResult::Fail("DC6 must follow the reload");
+    }
+    // A DC exit that fails (function not in D0) keeps the check pending
+    // and trusts nothing.
+    core.lock().runtime_suspend();
+    fake.dead.set(true);
+    let _ = publication_step(&core, &fake, 120 * MS, || Err(DcRefusal::Authority));
+    if !core.lock().recheck_pending() {
+        return TestResult::Fail("an unverified resume must keep the re-verification pending");
+    }
+    fake.dead.set(false);
+    // A program that is not loaded (here: disabled for system suspend) has
+    // nothing to re-verify; the system-resume reload owns it.
+    let fake = Fake::default();
+    let core = armed(&fake);
+    {
+        let mut c = core.lock();
+        let _ = c.suspend_begin(&fake);
+        c.suspend_commit(&fake);
+        c.runtime_suspend();
+        if c.recheck_pending() {
+            return TestResult::Fail("only a loaded program is marked for re-verification");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dc_states",
+    smoke_dc_states_runtime_d3hot_keeps_program_and_reverifies_on_resume
+);
