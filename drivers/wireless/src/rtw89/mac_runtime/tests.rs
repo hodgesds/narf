@@ -27,6 +27,7 @@ struct Model {
     ignore: Option<u32>,
     seen: [usize; 6],
     active: [bool; 6],
+    chip: ChipId,
 }
 impl Model {
     fn new(seed: u8, cut: u8) -> Self {
@@ -44,6 +45,7 @@ impl Model {
             ignore: None,
             seen: [0; 6],
             active: [false; 6],
+            chip: ChipId::Rtl8852B,
         };
         m.store(0xa, 2, 32);
         m.store(0x1e0, 1, 0xe0);
@@ -110,6 +112,13 @@ impl Model {
             if a == R_AX_PUB_PAGE_INFO2 {
                 v = field(B_AX_PUB_AVAL_PG_MASK, 446);
             }
+            // C V1 page block (never read on B).
+            if self.chip == ChipId::Rtl8852C && a == c::R_AX_PUB_PAGE_INFO1_V1 {
+                v = 0;
+            }
+            if self.chip == ChipId::Rtl8852C && a == c::R_AX_PUB_PAGE_INFO2_V1 {
+                v = field(B_AX_PUB_AVAL_PG_MASK, c::PUB_MAX);
+            }
         }
         if width == 2 && a == R_AX_ADDR_CAM_CTRL && self.active[4] && self.settled(4, a) {
             v &= !B_AX_ADDR_CAM_CLR;
@@ -138,7 +147,21 @@ impl Model {
         Ok(())
     }
     fn setup(seed: u8, cut: u8) -> (Self, Factory) {
+        Self::setup_chip(seed, cut, ChipId::Rtl8852B)
+    }
+    /// RTL8852C after its own CH12-only download: HAXI stops 0xbff00, TX
+    /// init bit 7 only, `R_AX_HCI_FUNC_EN_V1` TX-only.
+    fn setup_c(seed: u8, cut: u8) -> (Self, Factory) {
+        Self::setup_chip(seed, cut, ChipId::Rtl8852C)
+    }
+    fn setup_chip(seed: u8, cut: u8, chip: ChipId) -> (Self, Factory) {
         let mut m = Self::new(seed, cut);
+        m.chip = chip;
+        if chip == ChipId::Rtl8852C {
+            m.store(0x1010, 4, 0xbff00);
+            m.store(0x1000, 4, 1 << 7);
+            m.store(0x7880, 4, 1);
+        }
         let mut factory = Factory::default();
         assert_eq!(ready(factory.read(&mut m)), Some(Ok(())));
         m.operations = 0;
@@ -183,7 +206,7 @@ impl Io for Model {
 }
 impl Source for Model {
     fn profile(&self) -> (ChipId, u8) {
-        (ChipId::Rtl8852B, self.cut)
+        (self.chip, self.cut)
     }
     async fn physical(&mut self, start: u16, out: &mut [u8]) -> Result<(), Error> {
         out.fill(255);
@@ -204,7 +227,8 @@ impl Source for Model {
                     cursor += 4;
                 }
             }
-            (0x580, 128) => (),
+            (0x580, 128) if self.chip == ChipId::Rtl8852B => (),
+            (0x590, 0x60) if self.chip == ChipId::Rtl8852C => (),
             _ => return Err(Error::Access),
         }
         Ok(())
@@ -419,4 +443,219 @@ fn smoke_rtw89_b_mac_uses_current_native_authority_before_register_access() -> T
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_mac_uses_current_native_authority_before_register_access
+);
+
+fn c_writes(io: &Model, address: u32) -> Vec<u32> {
+    io.trace
+        .iter()
+        .filter(|&&(width, a, _)| width != 0 && a == address)
+        .map(|&(_, _, v)| v)
+        .collect()
+}
+fn smoke_rtw8852c_post_wcpu_mac_follows_linux_c_branches() -> TestResult {
+    let (mut io, factory) = Model::setup_c(0, 0);
+    let mut mac = Mac::default();
+    // SAFETY: inert single-owner C register model with WCPU7, the C HAXI
+    // download geometry and actual factory-source bytes; no native DMA.
+    if ready(unsafe { mac.prepare(&mut io, &factory) }) != Some(Ok(()))
+        || mac.state() != State::Ready
+    {
+        return TestResult::Fail("C post-WCPU MAC did not reach confirmed Ready");
+    }
+    // rtw8852c_mac_enable_bb_rf: XTAL0 7, ANAPAR_WL 0x6c, RFC S0/S1 0xc7,
+    // XTAL3 0xd, in order; LDO VSEL S0/S1 = 1; no 885xB PHYREG_SET/ZCDC.
+    let xtal: Vec<_> = c_writes(&io, R_AX_WLAN_XTAL_SI_CTRL)
+        .iter()
+        .map(|v| v & 0xffff)
+        .collect();
+    if xtal != [0x0700, 0x6c90, 0xc780, 0xc781, 0x0d03]
+        || io.raw(c::R_AX_AFE_OFF_CTRL1, 4)
+            & (c::B_AX_S0_LDO_VSEL_F_MASK | c::B_AX_S1_LDO_VSEL_F_MASK)
+            != field(c::B_AX_S0_LDO_VSEL_F_MASK, 1) | field(c::B_AX_S1_LDO_VSEL_F_MASK, 1)
+        || !c_writes(&io, R_AX_PHYREG_SET).is_empty()
+    {
+        return TestResult::Fail("C enable_bb_rf differs from rtw8852c_mac_enable_bb_rf");
+    }
+    // dmac_func_en_ax C value with H_AXIDMA; CMAC TX parked.
+    if c_writes(&io, R_AX_DMAC_FUNC_EN).first() != Some(&c::c_dmac_functions())
+        || io.raw(R_AX_CMAC_FUNC_EN, 4) & B_AX_CMAC_TXEN != 0
+        || io
+            .trace
+            .iter()
+            .any(|&(_, a, v)| a == R_AX_CMAC_FUNC_EN && v & B_AX_CMAC_TXEN != 0)
+    {
+        return TestResult::Fail("C sys_init differs or published CMAC TX");
+    }
+    // rtw8852c_dle_mem_pcie SCC: WDE 3328 x 64B, PLE 1904 x 128B bound 26,
+    // wde_qt18, ple_qt46/qt47 incl. the C-only tx_rpt quota 11.
+    let get = |v: u32, m: u32| (v & m) >> m.trailing_zeros();
+    let wde = io.raw(R_AX_WDE_PKTBUF_CFG, 4);
+    let ple = io.raw(R_AX_PLE_PKTBUF_CFG, 4);
+    if get(wde, B_AX_WDE_FREE_PAGE_NUM_MASK) != 3328
+        || get(wde, B_AX_WDE_PAGE_SEL_MASK) != 0
+        || get(ple, B_AX_PLE_FREE_PAGE_NUM_MASK) != 1904
+        || get(ple, B_AX_PLE_START_BOUND_MASK) != 26
+        || get(ple, B_AX_PLE_PAGE_SEL_MASK) != 1
+        || io.raw(R_AX_WDE_QTA0_CFG, 4) != 3228 << 16 | 3228
+        || io.raw(R_AX_WDE_QTA4_CFG, 4) != 40 << 16 | 40
+        || io.raw(R_AX_PLE_QTA0_CFG + 6 * 4, 4) != 1199 << 16 | 178
+        || io.raw(R_AX_PLE_QTA0_CFG + 11 * 4, 4) != 1037 << 16 | 16
+    {
+        return TestResult::Fail("C DLE quotas differ from rtw8852c_dle_mem_pcie");
+    }
+    // HFC on the V1 page block only; groups per rtw8852c_hfc_chcfg_pcie.
+    for channel in 0..12u32 {
+        let group = if [4, 5, 6, 7, 10, 11].contains(&channel) {
+            c::B_AX_GRP
+        } else {
+            0
+        };
+        if c_writes(&io, c::R_AX_ACH0_PAGE_CTRL_V1 + channel * 4) != [1614 << 16 | 13 | group] {
+            return TestResult::Fail("C HFC channel config differs from rtw8852c_hfc_chcfg_pcie");
+        }
+    }
+    if io.raw(c::R_AX_PUB_PAGE_CTRL1_V1, 4) != 1614 << 16 | 1614
+        || io.raw(c::R_AX_PUB_PAGE_CTRL2_V1, 4) != 3228
+        || io.raw(c::R_AX_CH_PAGE_CTRL_V1, 4) != 40 << 16 | 2
+        || io.raw(c::R_AX_HCI_FC_CTRL_V1, 4) & (B_AX_HCI_FC_EN | B_AX_HCI_FC_CH12_EN)
+            != B_AX_HCI_FC_EN | B_AX_HCI_FC_CH12_EN
+        || io
+            .trace
+            .iter()
+            .any(|&(width, a, _)| width != 0 && (0x8a00..=0x8aa8).contains(&a))
+    {
+        return TestResult::Fail("C HFC touched the B page block or misprogrammed V1");
+    }
+    // Preload, SS2F path, security UC_MGNT + TX timeout, C SIFS/RRSR/RX len.
+    if get(
+        io.raw(c::R_AX_TXPKTCTL_B0_PRELD_CFG0, 4),
+        c::B_AX_B0_PRELD_USEMAXSZ_MASK,
+    ) != 520
+        || io.raw(c::R_AX_TXPKTCTL_B0_PRELD_CFG0, 4) & c::B_AX_B0_PRELD_FEN == 0
+        || io.raw(c::R_AX_TXPKTCTL_B0_PRELD_CFG1, 4) & 0xfff != 0x134
+        || get(io.raw(c::R_AX_SS2FINFO_PATH, 4), c::B_AX_SS_DEST_QUEUE_MASK) != 0x0a
+        || io.raw(R_AX_SEC_ENG_CTRL, 4) & c::B_AX_UC_MGNT_DEC == 0
+        || get(io.raw(c::R_AX_SEC_DEBUG1, 4), c::B_AX_TX_TIMEOUT_SEL_MASK) != 2
+        || get(io.raw(R_AX_PREBKF_CFG_1, 4), B_AX_SIFS_MACTXEN_T1_MASK) != 0x41
+        || get(io.raw(c::R_AX_PTCL_RRSR1, 4), c::B_AX_RSC_MASK) != 2
+        || get(io.raw(R_AX_RX_FLTR_OPT, 4), B_AX_RX_MPDU_MAX_LEN_MASK) != 23
+        || !c_writes(&io, R_AX_AGG_LEN_VHT_0).is_empty()
+        || !c_writes(&io, R_AX_SCH_EXT_CTRL).is_empty()
+    {
+        return TestResult::Fail("C DMAC/CMAC branches differ from mac.c");
+    }
+    // 8852C _patch_dis_resp_chk sets the checks; trx_init_ax then clears
+    // the static RTS BW check last.
+    let rsp = io.raw(R_AX_RSP_CHK_SIG, 4);
+    if rsp & (B_AX_RSP_CHK_TXNAV | B_AX_RSP_CHK_INTRA_NAV | B_AX_RSP_CHK_BASIC_NAV)
+        != B_AX_RSP_CHK_TXNAV | B_AX_RSP_CHK_INTRA_NAV | B_AX_RSP_CHK_BASIC_NAV
+        || rsp & c::B_AX_RSP_STATIC_RTS_CHK_SERV_BW_EN != 0
+        || io
+            .trace
+            .iter()
+            .rev()
+            .find(|&&(w, _, _)| w != 0)
+            .map(|&(_, a, _)| a)
+            != Some(R_AX_RSP_CHK_SIG)
+    {
+        return TestResult::Fail("C response checks differ from mac.c");
+    }
+    // rtw8852c_imr_info: V1 registers set, B-only IMR registers untouched.
+    for (reg, set) in [
+        (c::R_AX_SEC_ERROR_FLAG_IMR, 3),
+        (R_AX_MPDU_TX_ERR_IMR, c::B_AX_MPDU_TX_IMR_SET_V1),
+        (
+            c::R_AX_TXPKTCTL_B1_ERRFLAG_IMR,
+            c::B_AX_TXPKTCTL_IMR_B1_SET_V1,
+        ),
+        (R_AX_OTHER_DISPATCHER_ERR_IMR, c::B_AX_OTHER_DISP_IMR_SET_V1),
+        (c::R_AX_TX_ERR_FLAG_IMR, c::B_AX_TX_ERR_IMR_SET_V1),
+        (c::R_AX_TRXPTCL_ERROR_INDICA_MASK, c::B_AX_TMAC_IMR_SET_V1),
+    ] {
+        if io.raw(reg, 4) & set != set {
+            return TestResult::Fail("C IMR differs from rtw8852c_imr_info");
+        }
+    }
+    if io.raw(c::R_AX_TRXPTCL_ERROR_INDICA_MASK, 4)
+        & (c::B_AX_TMAC_IMR_CLR_V1 & !c::B_AX_TMAC_IMR_SET_V1)
+        != 0
+        || [
+            R_AX_TXPKTCTL_ERR_IMR_ISR,
+            R_AX_DLE_CTRL,
+            R_AX_RMAC_ERR_ISR,
+            R_AX_TMAC_ERR_IMR_ISR,
+        ]
+        .iter()
+        .any(|&reg| !c_writes(&io, reg).is_empty())
+    {
+        return TestResult::Fail("C IMR wrote a B-only register");
+    }
+    if io.raw(0x1010, 4) != 0xbff00
+        || io.raw(0x1000, 4) & (1 << 15) != 0
+        || io.raw(0x7880, 4) & 2 != 0
+    {
+        return TestResult::Fail("C MAC init activated unowned packet/RX DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_post_wcpu_mac_follows_linux_c_branches
+);
+fn smoke_rtw8852c_post_wcpu_mac_requires_c_geometry_and_readiness() -> TestResult {
+    // A C device presenting B's download geometry (RX init bit 15 set, or
+    // the C HCI RX layer enabled) is refused before any write.
+    for (address, value) in [
+        (0x1000, (1 << 7) | (1 << 15)),
+        (0x7880, 3),
+        (0x1010, 0xb0f00),
+    ] {
+        let (mut io, factory) = Model::setup_c(0, 0);
+        io.store(address, 4, value);
+        let mut mac = Mac::default();
+        // SAFETY: invalid prerequisite inputs must reject before BB writes.
+        if ready(unsafe { mac.prepare(&mut io, &factory) }) == Some(Ok(())) || !io.trace.is_empty()
+        {
+            return TestResult::Fail("C unowned RX/stop geometry reached MAC initialization");
+        }
+    }
+    for address in [
+        R_AX_WLAN_XTAL_SI_CTRL,
+        R_AX_WDE_INI_STATUS,
+        R_AX_PLE_INI_STATUS,
+        R_AX_SS_CTRL,
+        R_AX_ADDR_CAM_CTRL,
+        R_AX_RESPBA_CAM_CTRL,
+    ] {
+        let (mut io, factory) = Model::setup_c(0, 0);
+        io.late = true;
+        io.stuck = Some(address);
+        let mut mac = Mac::default();
+        // SAFETY: inert exclusive model with one permanently incomplete engine.
+        if ready(unsafe { mac.prepare(&mut io, &factory) }) != Some(Err(Error::Timeout))
+            || mac.state() != State::Preparing
+        {
+            return TestResult::Fail("C incomplete MAC controller became Ready");
+        }
+    }
+    for address in [
+        R_AX_DMAC_FUNC_EN,
+        R_AX_CMAC_FUNC_EN,
+        c::R_AX_HCI_FC_CTRL_V1,
+        R_AX_WDE_PKTBUF_CFG,
+        R_AX_PLE_PKTBUF_CFG,
+    ] {
+        let (mut io, factory) = Model::setup_c(0, 0);
+        io.ignore = Some(address);
+        let mut mac = Mac::default();
+        // SAFETY: inert model ignores a required write, with ordinary readback.
+        if ready(unsafe { mac.prepare(&mut io, &factory) }) == Some(Ok(())) {
+            return TestResult::Fail("C ignored MAC configuration write became Ready");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_post_wcpu_mac_requires_c_geometry_and_readiness
 );

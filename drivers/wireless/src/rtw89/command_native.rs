@@ -313,13 +313,17 @@ impl Native {
         mac: &mut super::mac_runtime::Mac,
     ) -> Result<(), super::power::Error> {
         use super::power::Error as RegisterError;
-        if self.state != State::Active
-            || self.chip != ChipId::Rtl8852B
-            || self
-                .factory
-                .as_ref()
-                .is_none_or(|factory| factory.b_phycap().is_none())
-        {
+        // B or C, each with its own completed factory PHY-cap window; the
+        // chip-specific MAC branches live in `mac_runtime` (C: `mac_runtime/c.rs`).
+        let phycap = self
+            .factory
+            .as_ref()
+            .is_some_and(|factory| match self.chip {
+                ChipId::Rtl8852B => factory.b_phycap().is_some(),
+                ChipId::Rtl8852C => factory.c_phycap().is_some(),
+                _ => false,
+            });
+        if self.state != State::Active || !phycap {
             return Err(RegisterError::Unsupported);
         }
         let command = self.command().map_err(|_| RegisterError::Access)?;

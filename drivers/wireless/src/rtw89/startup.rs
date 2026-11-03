@@ -399,7 +399,7 @@ impl Startup {
         }
         result
     }
-    /// Complete B's post-WCPU MAC0/SCC setup on the same actual backend.
+    /// Complete B's or C's post-WCPU MAC0/SCC setup on the same actual backend.
     /// MAC preparation is not RF/channel, packet, IRQ or station readiness.
     pub async fn prepare_mac(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Running {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! RTL8852B SCC post-WCPU MAC preparation. Packet DMA and IRQs stay closed.
+//! RTL8852B/RTL8852C SCC post-WCPU MAC preparation. Packet DMA and IRQs
+//! stay closed. The RTL8852C branches live in `mac_runtime/c.rs`.
 use super::{
     mac::ChipId,
     mac_runtime_regs::*,
@@ -616,13 +617,23 @@ impl Mac {
             return Err(Error::Terminal);
         }
         let identity = factory.identity().ok_or(Error::Unsupported)?;
-        if identity.chip() != ChipId::Rtl8852B
-            || !identity.calibration().valid
-            || identity.calibration().rfe_type == 255
-            || factory.b_phycap().is_none()
-        {
+        let c = match identity.chip() {
+            ChipId::Rtl8852B if factory.b_phycap().is_some() => false,
+            ChipId::Rtl8852C if factory.c_phycap().is_some() => true,
+            _ => return Err(Error::Unsupported),
+        };
+        if !identity.calibration().valid || identity.calibration().rfe_type == 255 {
             return Err(Error::Unsupported);
         }
+        // download_dma geometry: B keeps ACH0..3/CH8/CH9 stopped (CH12 open)
+        // plus bit 19, RX init bit 13 clear, HCI 0x8380; C (HAXI) keeps
+        // ACH0..7/CH8..11 stopped plus bit 19, RX init bit 15 clear and HCI
+        // `R_AX_HCI_FUNC_EN_V1` 0x7880.
+        let (stopped, rx, hci_reg) = if c {
+            (0x000b_ff00, 1 << 15, 0x7880)
+        } else {
+            (0x000b_0f00, 1 << 13, 0x8380)
+        };
         self.state = State::Preparing;
         let mut a = Access(io);
         let firmware = a.r8(0x1e0)?;
@@ -636,17 +647,28 @@ impl Mac {
         // throughout MAC preparation; no ring base or host IRQ is written here.
         let stops = a.r32(0x1010)?;
         let init = a.r32(0x1000)?;
-        let hci = a.r32(0x8380)?;
-        if stops & 0x000b_0f00 != 0x000b_0f00 || init & (1 << 13) != 0 || hci & 2 != 0 {
+        let hci = a.r32(hci_reg)?;
+        if stops & stopped != stopped || init & rx != 0 || hci & 2 != 0 {
             return Err(Error::Access);
         }
-        a.enable_bb_rf().await?;
-        a.system()?;
-        a.dmac().await?;
-        a.cmac().await?;
-        a.interrupts()?;
-        a.host_rpq()?;
-        let dmac = B_AX_MAC_FUNC_EN
+        if c {
+            a.enable_bb_rf_c().await?;
+            a.system_c()?;
+            a.dmac_c().await?;
+            a.cmac_c().await?;
+            a.interrupts_c()?;
+            a.host_rpq()?;
+            a.trx_tail_c()?;
+        } else {
+            a.enable_bb_rf().await?;
+            a.system()?;
+            a.dmac().await?;
+            a.cmac().await?;
+            a.interrupts()?;
+            a.host_rpq()?;
+        }
+        let dmac = if c { c::B_AX_H_AXIDMA_EN } else { 0 }
+            | B_AX_MAC_FUNC_EN
             | B_AX_DMAC_FUNC_EN
             | B_AX_MAC_SEC_EN
             | B_AX_DISPATCHER_EN
@@ -675,9 +697,9 @@ impl Mac {
         if a.r32(R_AX_DMAC_FUNC_EN)? & dmac != dmac || functions & cmac != cmac & !B_AX_CMAC_TXEN {
             return Err(Error::Access);
         }
-        if a.r32(0x1010)? & 0x000b_0f00 != 0x000b_0f00
-            || a.r32(0x1000)? & (1 << 13) != 0
-            || a.r32(0x8380)? & 2 != 0
+        if a.r32(0x1010)? & stopped != stopped
+            || a.r32(0x1000)? & rx != 0
+            || a.r32(hci_reg)? & 2 != 0
         {
             return Err(Error::Access);
         }
@@ -685,6 +707,9 @@ impl Mac {
         Ok(())
     }
 }
+
+#[path = "mac_runtime/c.rs"]
+mod c;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mac_runtime/tests.rs"]

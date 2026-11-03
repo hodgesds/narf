@@ -3083,8 +3083,8 @@ signed current envelope (current calibration record, coexistence ready, then
 `rfk::Interface::admit`), checked before the first write; no C record format
 or C coexistence owner exists, so an actual RTL8852C stays unadmitted and no
 ordinary grant is installed. No Startup caller invokes it; the C native
-lifecycle is also refused upstream (`prepare_mac` and `prepare_receive` are
-B-only). Unexecuted cases:
+lifecycle is also refused upstream (`prepare_receive` is B-only; C
+`prepare_mac` exists, below). Unexecuted cases:
 `smoke_rtw89_c_dm_init_txrx_path_and_power_trim_follow_rtw8852c`,
 `smoke_rtw89_c_radio_owner_starts_new`.
 
@@ -3123,10 +3123,45 @@ and spatial-reuse bit 29 clear, `R_BMODE_PDTH_EN_V1` limit off,
 part of this owner for either chip. Unexecuted case:
 `smoke_rtw8852c_dm_subinit_physts_dig_cfo_edcca_follow_rtw8852c_regs`.
 
+**C post-WCPU MAC (`mac_runtime/c.rs`).** `mac_runtime::Mac::prepare`
+dispatches on the factory chip (B with its 128-byte PHY-cap, C with its
+0x60-byte window) and `Native::prepare_mac` admits both. The C prerequisite
+is C's own CH12-only download geometry (HAXI 0x1010 stops `0xbff00`, RX init
+bit 15 clear, `R_AX_HCI_FUNC_EN_V1` 0x7880 RX clear), checked before the
+first write and again after. The C sequence is mac.c `rtw89_mac_init` after
+`partial_init`: rtw8852c.c `rtw8852c_mac_enable_bb_rf` (SYS_FUNC_EN BB,
+AFC_AFEDIG set/clear/set, `R_AX_AFE_OFF_CTRL1` S0/S1 LDO VSEL 1, XTAL SI
+XTAL0 7, ANAPAR_WL 0x6c, RFC S0/S1 0xc7, XTAL3 0xd; no PHYREG_SET);
+`sys_init_ax` (`dmac_func_en_ax` with `B_AX_H_AXIDMA_EN`, CMAC0 clocks/
+functions with global CMAC TX parked as on B, no OCP write); `dmac_init_ax`
+with `rtw8852c_dle_mem_pcie[SCC]` (`wde_size19` 3328x64B, `ple_size19`
+1904+16 x128B, bound 26, `wde_qt18` min=max, `ple_qt46`/`ple_qt47` incl. the
+C-only QTA11 `tx_rpt`; used size equals the whole 458752-byte FIFO since
+`dle_scc_rsvd_size` is 0), `preload_init_set_ax(MAC_0)` (USEMAXSZ 520, FEN,
+TXENDWIN 1, RSVMINSZ 52), `rtw89_mac_hfc_init(true,true,true)` on the V1 page
+block (0x1700..0x17a8: all twelve channels `{13,1614}` with `B_AX_GRP` on
+ACH4..7/B1MGQ/B1HIQ, pub groups 1614/1614, pub max 3228, `hfc_preccfg_pcie`;
+the fatal `hfc_pub_info_chk` is enforced), `sta_sch_init_ax` with
+`_patch_ss2f_path` (`SS2F_PATH_WLCPU`), `mpdu_proc_init_ax`,
+`sec_eng_init_ax` (+`B_AX_UC_MGNT_DEC`, PCIe TX partial mode left as read,
+`R_AX_SEC_DEBUG1` TX timeout 2); `cmac_init_ax(MAC_0)` C branches
+(`SIFS_MACTXEN_T1_V1` 0x41, no SCH_EXT, pre-backoff 24us only with partial
+mode clear, `_patch_dis_resp_chk` *setting* the NAV/CCA response checks,
+SIFS OFDM 52C, `rtw8852c_rrsr_cfgs` RSC on `R_AX_PTCL_RRSR1`, RX MPDU max
+23 x 512 from `cma0_dma` 178 capped at 127 pages and 11966 bytes, no RRSR1
+rate enable, VHT A-MPDU length or CMAC DMA); `enable_imr_ax` DMAC/CMAC0
+with `rtw8852c_imr_info` (incl. the extra 8852C MPDU TX clears and the
+CDMA TX IMR) and `err_imr_ctrl_ax` (no CMAC1: `cma1_dma` 0);
+`set_host_rpr_ax` (POH); and the 8852C `B_AX_RSP_STATIC_RTS_CHK_SERV_BW_EN`
+clear. `rtw89_mac_feat_init` is a no-op (`RTW89_BACAM_V0_EXT`). B's path is
+unchanged. Unexecuted cases:
+`smoke_rtw8852c_post_wcpu_mac_follows_linux_c_branches`,
+`smoke_rtw8852c_post_wcpu_mac_requires_c_geometry_and_readiness`.
+
 Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
 C `power::Calibration`/qualification records (N52x are B-bound), a
 Startup caller of `Native::prepare_radio_c` (which exists, unadmitted), the
-C native MAC/RX lifecycle (`prepare_mac`, `prepare_receive` are B-only), `command_native`/
+C native RX lifecycle (`prepare_receive` is B-only), `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:
