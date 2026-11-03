@@ -73,7 +73,8 @@ impl Owner8822b {
             .await
     }
     /// Drive every implemented B22 continuation in order. The chain currently
-    /// ends at `Stage::Ready` (authenticated firmware, host DMA parked).
+    /// ends at `Stage::MacPrepared` (authenticated firmware, inactive
+    /// `rtw_mac_init` + `rtw8822b_mac_init`, host DMA and TXPAUSE closed).
     pub(super) async fn provision(&self) -> Result<(), Error> {
         let _admission = self.admission.lock().await;
         loop {
@@ -81,7 +82,10 @@ impl Owner8822b {
                 Stage::Detected => {
                     self.initialize_registered().await?;
                 }
-                Stage::Ready => return Ok(()),
+                Stage::Ready => {
+                    self.lifecycle.prepare_mac().await?;
+                }
+                Stage::MacPrepared => return Ok(()),
                 _ => return Err(Error::State),
             }
         }

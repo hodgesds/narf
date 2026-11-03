@@ -8,6 +8,8 @@ mod values;
 use values::*;
 #[path = "mac/rtl8821c.rs"]
 mod rtl8821c;
+#[path = "mac/rtl8822b.rs"]
+mod rtl8822b;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
@@ -21,11 +23,18 @@ impl Info {
         // RTL8822C: 256KiB /128, minus CSI50, firmware4, H2CQ8,
         // H2C static8/extra24 and driver16. These are on-chip FIFO pages,
         // unrelated to the separately retained PCI host BD arrays.
+        // RTL8822B (`rtw_set_trx_fifo_info`): 2048 pages, csi_buf_pg_num 0,
+        // rsvd_drv_pg_num 8 -> boundary 1996, H2CQ 2036, FW TXBUF 2044.
+        let (reserved_boundary, h2c_page, firmware_tx_page) = match did {
+            0xc821 => (460, 500, 508),
+            0xb822 => (1996, 2036, 2044),
+            _ => (1938, 1986, 1994),
+        };
         Self {
             cut,
-            reserved_boundary: if did == 0xc821 { 460 } else { 1938 },
-            h2c_page: if did == 0xc821 { 500 } else { 1986 },
-            firmware_tx_page: if did == 0xc821 { 508 } else { 1994 },
+            reserved_boundary,
+            h2c_page,
+            firmware_tx_page,
         }
     }
 }
@@ -328,7 +337,7 @@ pub(super) async fn prepare_for(io: &mut impl Io, did: u16) -> Result<Info, Erro
 /// `mac.c::rtw_mac_init` for `hci`. USB exists only for the C21 die
 /// (RTL8821CU); the PCIe byte stream is unchanged.
 pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<Info, Error> {
-    if !matches!(did, 0xc821 | 0xc822) || did != 0xc821 && hci != Hci::Pcie {
+    if !matches!(did, 0xc821 | 0xc822 | 0xb822) || did != 0xc821 && hci != Hci::Pcie {
         return Err(Error::Unsupported);
     }
     let cfg = io.read32(0xf0).await?;
@@ -343,6 +352,8 @@ pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<I
     fifo(io, info, did, hci).await?;
     if did == 0xc821 {
         rtl8821c::chip(io).await?;
+    } else if did == 0xb822 {
+        rtl8822b::chip(io).await?;
     } else {
         chip(io).await?;
     }

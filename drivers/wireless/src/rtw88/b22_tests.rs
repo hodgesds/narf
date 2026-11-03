@@ -116,3 +116,51 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_factory_map_follows_rtw8822b_efuse_layout
 );
+
+fn smoke_rtw8822be_inactive_mac_follows_rtw8822b_mac_init_and_fifo_pages() -> TestResult {
+    for (seed, cut) in [(0u8, 0u8), (1, 3)] {
+        let mut io = super::mac_tests::Model::new(seed, cut);
+        let info = match narf_scheduler::block_on(crate::rtw88::mac::prepare_for(&mut io, 0xb822)) {
+            Ok(info) => info,
+            Err(_) => return TestResult::Fail("8822B inactive MAC did not complete"),
+        };
+        // rtw_set_trx_fifo_info: 2048 pages, csi 0, drv 8 -> 1996/2036/2044.
+        if info
+            != (crate::rtw88::mac::Info {
+                cut,
+                reserved_boundary: 1996,
+                h2c_page: 2036,
+                firmware_tx_page: 2044,
+            })
+        {
+            return TestResult::Fail("8822B FIFO reserved-page layout differs from Linux");
+        }
+        let writes = |reg: u16| {
+            io.trace
+                .iter()
+                .filter(|op| op.0 == 1 && op.2 == reg)
+                .count()
+        };
+        let first_write = |reg: u16| io.trace.iter().position(|op| op.0 == 1 && op.2 == reg);
+        // 8822B-only BIT_PRE_TX_CMD clear precedes AMPDU_MAX_TIME; the
+        // 8821C PRECNT/INIRTS/ACKTO_CCK/TRXPTCL_H writes and C22 0x3fc quirk
+        // never appear.
+        if io.regs[0x4bc] & (1 << 6) != 0
+            || first_write(0x4bc).is_none()
+            || first_write(0x4bc) > first_write(0x455)
+            || [0x4e5, 0x480, 0x639, 0x66c, 0x3fc]
+                .into_iter()
+                .any(|r| writes(r) != 0)
+            || io.regs[0x522] != 255
+            || io.regs[0x100] & 0xcf != 0
+            || io.regs[0x718] & (1 << 6) == 0
+        {
+            return TestResult::Fail("8822B chip MAC sequence differs from rtw8822b_mac_init");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_inactive_mac_follows_rtw8822b_mac_init_and_fifo_pages
+);

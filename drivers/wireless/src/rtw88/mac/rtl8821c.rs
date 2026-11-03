@@ -2,7 +2,7 @@
 //! Source-matched rtw8821c_mac_init; host DMA/MAC gates remain closed.
 use super::{u8, w16, w8, Error, Io};
 #[path = "rtl8821c_values.rs"]
-mod values;
+pub(super) mod values;
 use values::*;
 
 pub(super) async fn chip(io: &mut impl Io) -> Result<(), Error> {
