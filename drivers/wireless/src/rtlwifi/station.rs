@@ -359,7 +359,7 @@ impl Publication {
         let op = || {
             if self
                 .base
-                .grant(domain, self.permission.channel())
+                .regrant(domain, self.permission)
                 .map_err(RadioError::Power)?
                 != self.permission
             {
@@ -1065,10 +1065,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         let current = self.station_grant().ok_or(Error::State)?;
         if self.phase != Hardware::MacConfigured
             || self.station.phase != Phase::Dormant
-            || base
-                .grant(domain, current.channel())
-                .map_err(|_| Error::Profile)?
-                != current
+            || base.regrant(domain, current).map_err(|_| Error::Profile)? != current
         {
             return Err(Error::Profile);
         }
@@ -1132,7 +1129,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             .calibration
             .as_ref()
             .ok_or(Error::Profile)?
-            .grant(&domain, self.station_grant().ok_or(Error::State)?.channel())
+            .regrant(&domain, self.station_grant().ok_or(Error::State)?)
             .map_err(|_| Error::Profile)?;
         if Some(grant) != self.station_grant() {
             return Err(Error::Profile);
@@ -1534,8 +1531,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         };
         // Ordinary DATA may clear DISFB only under a current NEFB grant;
         // without it the base programs' fixed USE_RATE + DISFB applies.
-        let sgi_profile =
-            self.packet.width.is_none() && self.station.ht_profile.is_some_and(|p| p.tx_sgi20());
+        // `_rtl_query_shortgi`: SGI40 at 40 MHz (8821AE only), else SGI20.
+        let sgi_profile = self.station.ht_profile.is_some_and(|p| {
+            if self.packet.width.is_some() {
+                self.chip == super::Chip::Rtl8821ae && p.tx_sgi40()
+            } else {
+                p.tx_sgi20()
+            }
+        });
         let short_gi = matches!(kind, Kind::Data) && rate > 12 && sgi_profile;
         let protection = if matches!(kind, Kind::Data | Kind::Eapol) {
             super::super::protection::select(
@@ -1708,7 +1711,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .is_some();
         let mut plan = if (self.station.ht.is_some() || self.rtl8821ae_ht()) && has_wmm {
             let phy = if self.chip == super::Chip::Rtl8821ae {
-                super::super::rtl8821ae::ht::local(false)
+                super::super::rtl8821ae::ht::local(
+                    self.rtl8821ae_wide(&candidate, environment)?.is_some(),
+                )
             } else {
                 self.local_ht_for(&candidate)?
             };
@@ -1760,7 +1765,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .flatten();
             self.restore_station_antenna(environment).await?;
             self.restore_station_tracking(environment).await?;
-            self.select_station_width(width, environment).await?;
+            if self.chip == super::Chip::Rtl8821ae {
+                self.retune_rtl8821ae(width, environment).await?;
+            } else {
+                self.select_station_width(width, environment).await?;
+            }
             let protection = match self.ee_base()? {
                 Some(base) => environment
                     .protection(base.clone(), self.station.ht.clone())?
@@ -1834,7 +1843,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .map(|p| Self::offered_width(p.width(), p.ht().operation()))
                         .transpose()?
                         .flatten();
-                    self.select_station_width(width, environment).await?;
+                    if self.chip == super::Chip::Rtl8821ae {
+                        self.retune_rtl8821ae(width, environment).await?;
+                    } else {
+                        self.select_station_width(width, environment).await?;
+                    }
                     let (rates, basic) = self
                         .station
                         .plan
@@ -1868,7 +1881,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             return Err(Error::Profile);
                         }
                         if self.chip == super::Chip::Rtl8821ae {
-                            if !self.rtl8821ae_ht() || self.packet.width.is_some() {
+                            if !self.rtl8821ae_ht() {
                                 return Err(Error::Profile);
                             }
                             let mut min_space = self.rtl8821ae_min_space_cfg();

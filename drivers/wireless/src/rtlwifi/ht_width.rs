@@ -45,6 +45,124 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         Ok(ht::local())
     }
+    /// RTL8821AE: the AP's offered HT40 geometry with its `NAPC` 40 MHz
+    /// permission, when the envelope measures it, current host policy
+    /// admits it and it admits HT (MCS0-7). `None` keeps the HT20 form.
+    pub(super) fn rtl8821ae_wide(
+        &self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<
+        Option<(
+            super::super::super::ht::Geometry,
+            super::super::super::rtl8821ae::envelope::Permission,
+        )>,
+        Error,
+    > {
+        use super::super::super::rtl8821ae::envelope::{Band, Operating, Width};
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8821ae())
+        else {
+            return Ok(None);
+        };
+        let offer = association::phy::Offer::from_elements(
+            super::super::super::rtl8821ae::ht::local(true),
+            &candidate.bss.information_elements,
+            candidate.bss.channel,
+        )
+        .map_err(Error::Management)?;
+        let Some(offer) = offer else {
+            return Ok(None);
+        };
+        let Ok(Some(g)) = Self::offered_width(offer.width(), offer.ht().operation()) else {
+            return Ok(None);
+        };
+        let op = Operating {
+            band: Band::B2g,
+            width: if g.prime() == 1 {
+                Width::W40Above
+            } else {
+                Width::W40Below
+            },
+            channel: g.primary(),
+        };
+        Ok(base
+            .permission_for(&environment.domain()?, op)
+            .ok()
+            .filter(super::super::super::rtl8821ae::ht::admitted)
+            .map(|p| (g, p)))
+    }
+    /// RTL8821AE `rtl_op_config` channel/width change on the running owner
+    /// (mac80211 sets the BSS chandef before authentication and narrows it
+    /// if the association response does): the permission for the target
+    /// operating point (`width` 40 MHz on the provisioned primary, else
+    /// 20 MHz) is re-derived from the `NAPC` envelope under current host
+    /// policy, then `channel::configure` (`sw_chnl_callback`, TXAGC at the
+    /// wide channel, `set_bw_mode_callback`) runs inside that permission's
+    /// authority. No frame may be outstanding; the old receive epoch is
+    /// retired. A failure leaves the owner failed.
+    pub(super) async fn retune_rtl8821ae(
+        &mut self,
+        width: Option<super::super::super::ht::Geometry>,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8821ae::envelope::{Band, Operating, Width};
+        let current = self.rtl8821ae_power.ok_or(Error::State)?;
+        let channel = current.channel();
+        let op = match width {
+            None => Operating::legacy20(channel),
+            Some(g) if g.primary() == channel => Operating {
+                band: Band::B2g,
+                width: if g.prime() == 1 {
+                    Width::W40Above
+                } else {
+                    Width::W40Below
+                },
+                channel,
+            },
+            Some(_) => return Err(Error::Profile),
+        };
+        if current.operating() == op && self.packet.width == width {
+            return Ok(());
+        }
+        if !self.transmit_ready()
+            || self.station.pending.is_some()
+            || !matches!(self.station.phase, Phase::Joining | Phase::Configuring)
+        {
+            return Err(Error::State);
+        }
+        self.check_station_policy(environment)?;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8821ae())
+            .ok_or(Error::Profile)?
+            .clone();
+        let permission = base
+            .permission_for(&environment.domain()?, op)
+            .map_err(|e| Error::Radio(RadioError::Power(e)))?;
+        if width.is_some() && !super::super::super::rtl8821ae::ht::admitted(&permission) {
+            return Err(Error::Profile);
+        }
+        let reg_837 = self.rtl8821ae.ok_or(Error::State)?.reg_837;
+        self.station.retire_receive();
+        self.phase = Hardware::Failed;
+        self.rtl8821ae_power = None;
+        let io = &self.io;
+        super::super::super::station_power::wait_rtl8821ae(base, permission, environment, async {
+            io.authority(true, || Ok(()))?;
+            super::super::super::rtl8821ae::channel::configure(io, &permission, reg_837).await
+        })
+        .await?;
+        self.rtl8821ae_power = Some(permission);
+        self.packet.width = width;
+        self.phase = Hardware::Running;
+        self.check_station_policy(environment)
+    }
     pub(super) async fn select_station_width(
         &mut self,
         width: Option<Geometry>,

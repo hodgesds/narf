@@ -679,6 +679,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 super::super::super::channel_power::Error::Policy,
             ));
         }
+        let wide40 = self.packet.width.is_some() && !multicast && hw_rate > trx::DESC_RATE54M;
         let tx_report = wants_report(frame).then(|| self.packet.ae.reports.next_sn());
         let params = trx::TxParams {
             pkt_size: frame.len() as u16,
@@ -694,8 +695,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             disable_fallback: adaptive.is_none(),
             // hw_rate > DESC_RATEMCS0 ? use_shortgi : use_shortpreamble.
             short: short_gi && hw_rate > super::super::super::rtl8821ae::ht::DESC_RATEMCS0,
-            data_bw: 0,
-            sub_carrier: 0,
+            // rtl8821ae_bw_mapping / rtl8821ae_sc_mapping at
+            // `current_chan_bw` 20_40: `_rtl_query_bandwidth_mode` gives a
+            // 40 MHz packet for unicast above 54M; a 20 MHz packet names
+            // the primary (cur_40_prime_sc LOWER 2 / UPPER 1).
+            data_bw: u8::from(wide40),
+            sub_carrier: match self.packet.width {
+                Some(g) if !wide40 => {
+                    if g.prime() == 1 {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                _ => 0,
+            },
             ampdu: aggregate.is_some_and(|(_, operational)| operational),
             ampdu_density: aggregate.map_or(0, |(density, _)| density),
             sec_type: 0,
@@ -823,6 +837,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let buffer = &self.buffers[slot];
         let channel = self.rtl8821ae_power.ok_or(Error::State)?.channel();
         let ht = self.packet.ht;
+        let forty = self.packet.width.is_some();
         let (consumed, packet, report) = self.io.authority(true, || {
             ring.sync();
             let offset = slot * RX_BYTES;
@@ -868,7 +883,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && !status.hw_error()
                 && (!status.ampdu || ht)
                 && rate_ok
-                && status.bw == 0
+                && (status.bw == 0 || forty && status.bw == 1)
                 && (24..=longest).contains(&length)
             {
                 buffer.sync();
@@ -901,7 +916,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         channel,
                         ht: status.is_ht(),
                         short_gi: false,
-                        width40: false,
+                        width40: status.bw == 1,
                         aggregated: status.ampdu,
                         pwdb,
                         antenna_mux: None,

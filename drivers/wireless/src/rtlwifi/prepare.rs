@@ -432,7 +432,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         {
             return Err(Error::State);
         }
-        let report = super::rtl8821ae::iqk::calibrate(&self.io, false).await;
+        let bw40 = self
+            .rtl8821ae_power
+            .is_some_and(|p| p.operating().width != super::rtl8821ae::envelope::Width::W20);
+        let report = super::rtl8821ae::iqk::calibrate_at(&self.io, false, bw40).await;
         if report.is_err() {
             self.phase = Phase::Failed;
         }

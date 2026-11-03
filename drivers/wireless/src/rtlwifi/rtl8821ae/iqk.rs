@@ -12,10 +12,10 @@
 //! Scope and deliberate differences from Linux (documented in
 //! `drivers/wireless/specification/rtlwifi.md`):
 //!
-//! - Only the 20 MHz branch exists: the retained owner programs 20 MHz only
-//!   (`channel::set_bw20`), so Linux's 80 MHz VDF branch (`vdf_enable`) and
-//!   the post-LOK RF `0x18` bandwidth restore (`current_chan_bw` 1/2) are not
-//!   reachable and are not implemented.
+//! - 20 and 40 MHz branches: the retained owner programs 2.4 GHz 20/40 MHz
+//!   only, so Linux's 80 MHz VDF branch (`vdf_enable`) and the 80 MHz
+//!   post-LOK RF `0x18` restore (`current_chan_bw` 2) are not reachable and
+//!   are not implemented; the 40 MHz restore (`current_chan_bw` 1) is.
 //! - Backup sets: the register lists are the full intended Linux sets — 11
 //!   MAC/BB registers including `0x82c` and the 12 listed AFE registers. The
 //!   helper-scope `MACBB_REG_NUM 10` / `AFE_REG_NUM 14` defines in `phy.c`
@@ -146,7 +146,11 @@ async fn rf_all(io: &impl Io, rows: &[(u32, u32)]) -> Result<(), Error> {
 
 /// One `while (cal < cal_num)` round of `_rtl8821ae_iqk_tx` (path A,
 /// 20 MHz). Returns the TX sample and the RX sample if RX IQK passed.
-async fn round(io: &impl Io, band_5g: bool) -> Result<((i32, i32), Option<(i32, i32)>), Error> {
+async fn round(
+    io: &impl Io,
+    band_5g: bool,
+    bw40: bool,
+) -> Result<((i32, i32), Option<(i32, i32)>), Error> {
     let reg65 = rf_read(io, 0x65).await?;
     // Path-A LOK: AFE all on.
     page(io, false)?;
@@ -191,7 +195,11 @@ async fn round(io: &impl Io, band_5g: bool) -> Result<((i32, i32), Option<(i32, 
     // Load LOK: RF 0x58[18:9] = RF 0x08[19:10].
     let lok = (rf_read(io, 0x08).await? & 0xffc00) >> 10;
     set_rf(io, 0x58, 0x7fe00, lok).await?;
-    // current_chan_bw == 20 MHz: no RF 0x18 bandwidth restore.
+    // `switch (current_chan_bw)`: 40 MHz restores RF 0x18[11:10] = 1;
+    // 20 MHz has no case (the 80 MHz case is not reachable here).
+    if bw40 {
+        set_rf(io, 0x18, 0x00c00, 0x1).await?;
+    }
     page(io, true)?;
 
     // TX RF setting and TX IQK.
@@ -363,6 +371,11 @@ async fn restore(
 /// On an I/O error the backed-up state is still restored (best effort)
 /// before the error is returned.
 pub async fn calibrate(io: &impl Io, band_5g: bool) -> Result<Report, Error> {
+    calibrate_at(io, band_5g, false).await
+}
+
+/// [`calibrate`] at the programmed `current_chan_bw` (`bw40`: 20/40 MHz).
+pub async fn calibrate_at(io: &impl Io, band_5g: bool, bw40: bool) -> Result<Report, Error> {
     let mut macbb = [0u32; 11];
     let mut afe = [0u32; 12];
     let mut rf = [0u32; 3];
@@ -378,14 +391,14 @@ pub async fn calibrate(io: &impl Io, band_5g: bool) -> Result<Report, Error> {
     for (slot, offset) in rf.iter_mut().zip(RF_REGS) {
         *slot = rf_read(io, offset).await?;
     }
-    let outcome = run(io, band_5g).await;
+    let outcome = run(io, band_5g, bw40).await;
     let restored = restore(io, &macbb, &afe, &rf).await;
     let report = outcome?;
     restored?;
     Ok(report)
 }
 
-async fn run(io: &impl Io, band_5g: bool) -> Result<Report, Error> {
+async fn run(io: &impl Io, band_5g: bool, bw40: bool) -> Result<Report, Error> {
     // _rtl8821ae_iqk_configure_mac.
     page(io, false)?;
     io.write8(0x522, 0x3f)?;
@@ -396,7 +409,7 @@ async fn run(io: &impl Io, band_5g: bool) -> Result<Report, Error> {
     let mut tx = Vec::with_capacity(CAL_NUM);
     let mut rx = Vec::with_capacity(CAL_NUM);
     for _ in 0..CAL_NUM {
-        let (t, r) = round(io, band_5g).await?;
+        let (t, r) = round(io, band_5g, bw40).await?;
         tx.push(t);
         if let Some(r) = r {
             rx.push(r);

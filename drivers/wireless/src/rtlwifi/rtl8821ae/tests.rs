@@ -1839,3 +1839,71 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_ht_capability_timing_and_n_mask
 );
+
+/// HT40: the station regrants a 40 MHz `NAPC` permission at its own
+/// operating point (a 20 MHz-only host rule refuses it), and IQK at 40 MHz
+/// restores RF 0x18[11:10] = 1 after every LOK load (`current_chan_bw` 1).
+fn smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore() -> TestResult {
+    use crate::rtlwifi::station_power::{Base, Grant};
+    use envelope::{Band, Operating, Width};
+    use narf_wireless::reg::*;
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x05],
+        logical: powered_logical_5g(2),
+    };
+    let Ok(cal) = envelope::Calibration::from_verified(
+        &napc_v2(&factory, &[(1, 0, 20, 0), (1, 0, 40, 1)], 30, false),
+        Some([1; 32]),
+        &factory,
+    ) else {
+        return TestResult::Fail("v2 envelope rejected");
+    };
+    let domain = |bw| RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: bw,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    };
+    let op = Operating {
+        band: Band::B2g,
+        width: Width::W40Above,
+        channel: 1,
+    };
+    let Ok(p40) = cal.permission_for(&domain(40), op) else {
+        return TestResult::Fail("40 MHz row refused");
+    };
+    if !super::ht::admitted(&p40) {
+        return TestResult::Fail("measured MCS0-7 not admitted at 40 MHz");
+    }
+    let base = Base::Rtl8821ae(Arc::new(cal));
+    if base.regrant(&domain(40), Grant::Rtl8821ae(p40)) != Ok(Grant::Rtl8821ae(p40)) {
+        return TestResult::Fail("40 MHz grant not re-derived at its operating point");
+    }
+    if base.regrant(&domain(20), Grant::Rtl8821ae(p40)).is_ok() {
+        return TestResult::Fail("20 MHz-only host rule must refuse the 40 MHz grant");
+    }
+    let rf18 = |trace: &[(u8, u16, u32)], value: u32| {
+        trace
+            .iter()
+            .filter(|w| w.1 == 0xc90 && (w.2 >> 20) & 0xff == 0x18 && w.2 & 0xc00 == value)
+            .count()
+    };
+    for (bw40, restores) in [(false, 0), (true, 10)] {
+        let io = iqk_model(0x7f0 << 16);
+        if narf_scheduler::block_on(iqk::calibrate_at(&io, false, bw40)).is_err() {
+            return TestResult::Fail("IQK failed on model");
+        }
+        if rf18(&io.0.lock().1, 0x400) != restores {
+            return TestResult::Fail("RF 0x18 bandwidth restore count");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore
+);

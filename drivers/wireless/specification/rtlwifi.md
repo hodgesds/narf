@@ -1570,8 +1570,8 @@ chain below is composed.
   1T1R `RL1PEAKTH` 8 (6 when `reg_837` BIT(2)), `RCCK_SYSTEM` BIT(4) for
   an upper primary, RF `0x18[11:10] = 1` on paths A and B. 5 GHz and
   80 MHz permissions are still refused (`State`) until the band switch and
-  BW80 programming exist. A 40 MHz permission is not yet requested by the
-  station owner (HT40 association is not wired). No board values are supplied by the
+  BW80 programming exist. The station owner requests a 40 MHz permission
+  for an HT40 AP (HT20/40 station, below). No board values are supplied by the
   format. Tests
   `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`,
   `smoke_rtl8821ae_txpower_index_bw40_and_5ghz`,
@@ -1611,8 +1611,8 @@ chain below is composed.
   `rx_fail == 0` check is real; (4) Linux indexes RX samples by round but
   averages `0..rx_average`, reading uninitialised slots after a failed RX
   round — here only successful RX samples, in round order, are compared.
-  Only the 20 MHz branch exists (the owner never programs 40/80 MHz), so
-  the 80 MHz VDF branch is not implemented. Tests
+  The 20 and 40 MHz branches exist (40 MHz: the RF `0x18` restore, see
+  HT40 below); the 80 MHz VDF branch is not implemented. Tests
   `smoke_rtl8821ae_iqk_fill_and_full_restore`,
   `smoke_rtl8821ae_iqk_rx_fail_retries_and_untouched`,
   `smoke_rtl8821ae_iqk_linked_interval_and_agreement` (written, unexecuted).
@@ -1767,7 +1767,8 @@ chain below is composed.
   - ERP: an AP announcing Use_Protection is admitted on 8821AE (88EE
     still needs the NERT grant); the beacon-tracked ERP flag drives the
     per-frame protection mode.
-  - Not composed for 8821AE: ASPM (kept disabled), channel retune and the
+  - Not composed for 8821AE: ASPM (kept disabled), channel retune (other
+    than the HT40 width change above) and the
     fresh-generation recovery rebuild (both refused; the owner keeps its
     provisioned channel and a failed owner stays failed), WMM EDCA from the
     AP (Linux 8821AE ignores it too), VHT, 5 GHz, BT coexistence.
@@ -1799,6 +1800,29 @@ chain below is composed.
     no frame is gated on it. An AP with HT protection mode ≠ 0 is refused
     (as on 88EE). Test `smoke_rtl8821ae_ht_capability_timing_and_n_mask`
     (written, unexecuted).
+  - HT40. At join the AP's HT40 offer (against the 20/40 capability) gives
+    a geometry on the provisioned primary; the 20/40 capability is sent
+    only when `permission_for(domain, 2.4 GHz 40 MHz above/below)` succeeds
+    under current host policy and admits MCS0-7. Before authentication
+    (mac80211's BSS chandef) and again at Configuring (the negotiated
+    width, which may narrow to 20 MHz) the owner re-derives the target
+    permission (`legacy20` for 20 MHz) and, if it differs from the held
+    one, runs `channel::configure` (band switch, `sw_chnl_callback` and
+    TXAGC at the wide channel, `set_bw_mode_callback`) inside that
+    permission's authority (`station_power::wait_rtl8821ae` now re-derives
+    at the grant's operating point, as does `Base::regrant` for every
+    station policy check), with no frame outstanding and the receive epoch
+    retired; failure fails the owner. The link keeps the width after a
+    disconnect until the next join retunes. TX at 40 MHz:
+    `_rtl_query_bandwidth_mode` (unicast above 54M ⇒ packet BW40) through
+    `rtl8821ae_bw_mapping`/`rtl8821ae_sc_mapping` (BW40 ⇒ DATA_BW 1, SC 0;
+    20 MHz packets name the primary, secondary above ⇒ 2, below ⇒ 1), SGI
+    from the both-side SGI40 (`_rtl_query_shortgi`), RA mask
+    `current_chan_bw` 1 with the BW40 N rows (`0x000ff015`). RX accepts BW
+    20/40. IQK at 40 MHz restores RF `0x18[11:10] = 1` after each LOK load
+    (`iqk::calibrate_at`). Test
+    `smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore` (written,
+    unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
   Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,

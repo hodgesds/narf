@@ -47,14 +47,29 @@ impl Base {
             Self::Rtl8821ae(_) => None,
         }
     }
-    pub(crate) fn grant(
+    /// The 8821AE `NAPC` calibration.
+    pub(crate) fn rtl8821ae(&self) -> Option<&Arc<envelope::Calibration>> {
+        match self {
+            Self::Rtl8188ee(_) => None,
+            Self::Rtl8821ae(base) => Some(base),
+        }
+    }
+    /// Re-derive `current` under `domain`: the 88EE channel permission, or
+    /// the 8821AE permission at the same operating point (band, width,
+    /// primary), so an admitted 40 MHz grant is re-derived as 40 MHz.
+    pub(crate) fn regrant(
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
-        channel: u8,
+        current: Grant,
     ) -> Result<Grant, channel_power::Error> {
-        match self {
-            Self::Rtl8188ee(base) => base.permission(domain, channel).map(Grant::Rtl8188ee),
-            Self::Rtl8821ae(base) => base.permission(domain, channel).map(Grant::Rtl8821ae),
+        match (self, current) {
+            (Self::Rtl8188ee(base), _) => base
+                .permission(domain, current.channel())
+                .map(Grant::Rtl8188ee),
+            (Self::Rtl8821ae(base), Grant::Rtl8821ae(p)) => base
+                .permission_for(domain, p.operating())
+                .map(Grant::Rtl8821ae),
+            (Self::Rtl8821ae(_), Grant::Rtl8188ee(_)) => Err(channel_power::Error::Identity),
         }
     }
     pub(crate) fn with_current<T>(
@@ -84,7 +99,7 @@ pub(crate) async fn wait_rtl8821ae<F: core::future::Future<Output = Result<(), p
                 .domain()
                 .map_err(|_| prepare::Error::Power(channel_power::Error::Policy))?;
             if base
-                .permission(&domain, grant.channel())
+                .permission_for(&domain, grant.operating())
                 .map_err(prepare::Error::Power)?
                 != grant
             {
