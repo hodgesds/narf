@@ -20,8 +20,11 @@
 //! any failure leaves the backend `Terminal`. The MAC gate checks of the PCI
 //! backend that are MAC registers (CR, TXPAUSE, HIMR) are kept; the PCIe DMA
 //! configuration (0x303) and bus-master gates have no USB counterpart.
-//! Station-grant hooks (`station_*`) keep the trait's `Unsupported`
-//! defaults here; the USB station front-end binds them.
+//! Station-grant hooks: the PCI backend's signed-gate operations
+//! (extensions, HT/BA/protection/continuation/channel records, host bind)
+//! and an EP0 profile readback; publications are `Publication::usb`.
+//! Register-driving retune, widening, power-tracking maintenance and the
+//! HT program/PS quiet proofs keep the trait's `Unsupported` defaults.
 use super::firmware_transport::{self, Error};
 use super::packet_core::{self, Step};
 use super::usb::{self, Endpoints, Registers, Speed};
@@ -106,8 +109,10 @@ pub(super) struct Backend<C: ControlIo, P: Bulk + Clone> {
     mailbox_pending: bool,
     packets: Option<usb_packet::Owner<P>>,
     backlog: Backlog,
-    /// `packet_open` wrote CR = 0xff / TXPAUSE = 0 and read them back.
-    opened: bool,
+    /// `packet_open` wrote CR = 0xff / TXPAUSE = 0 and read them back;
+    /// shared with every [`super::publication::Publication::usb`] and cleared
+    /// on close, stop, packet failure and quiesce.
+    open: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     reclaimable: bool,
 }
 impl<C: ControlIo, P: Bulk + Clone> core::fmt::Debug for Backend<C, P> {
@@ -141,7 +146,7 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             mailbox_pending: false,
             packets: None,
             backlog: Backlog::default(),
-            opened: false,
+            open: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             reclaimable: false,
         })
     }
@@ -151,8 +156,43 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
     fn fail<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if result.is_err() {
             self.state = State::Terminal;
+            self.set_open(false);
         }
         result
+    }
+    fn opened(&self) -> bool {
+        self.open.load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn set_open(&self, open: bool) {
+        self.open.store(open, core::sync::atomic::Ordering::Release);
+    }
+    /// `pci_packet::Native::with_packet`: any packet error but `Busy` leaves
+    /// the backend terminal and withdraws every publication.
+    fn packet_fail<T>(
+        &mut self,
+        result: Result<T, packet_core::Error>,
+    ) -> Result<T, packet_core::Error> {
+        if result
+            .as_ref()
+            .is_err_and(|error| *error != packet_core::Error::Busy)
+        {
+            self.state = State::Terminal;
+            self.set_open(false);
+        }
+        result
+    }
+    fn gate_ref(&self) -> Result<&super::power_policy::Gate, Error> {
+        self.gate.as_ref().ok_or(Error::State)
+    }
+    /// Replace the station gate with `bind(current)` (`Gate::with_*`).
+    fn rebind(
+        &mut self,
+        bind: impl FnOnce(&super::power_policy::Gate) -> Result<super::power_policy::Gate, Error>,
+    ) -> Result<(), Error> {
+        firmware_transport::Io::station_allowed(self)?;
+        let next = bind(self.gate_ref()?)?;
+        self.gate = Some(next);
+        Ok(())
     }
     /// Submit one descriptor-prefixed packet on the pipe for `qsel` and keep
     /// the receipt until its exact completion.
@@ -269,7 +309,7 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             super::packet_phy::Chip::C21,
         )?);
         self.state = State::Packets;
-        self.opened = true;
+        self.set_open(true);
         Ok(())
     }
 }
@@ -477,14 +517,235 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         if !matches!(self.state, State::Calibrated | State::Packets) {
             return Err(Error::State);
         }
+        // PCI checks bus mastering once packets run; USB checks the MAC
+        // open from `packet_open` (between `packet_start` and it, only the
+        // signed gate).
         self.gate_current()
+    }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        self.station_allowed()?;
+        if self.state != State::Packets || !self.opened() {
+            return Err(Error::State);
+        }
+        Ok(super::publication::Publication::usb(
+            self.gate_ref()?.clone(),
+            self.open.clone(),
+        ))
     }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.station_allowed()?;
-        Ok(self.gate.as_ref().ok_or(Error::State)?.own())
+        Ok(self.gate_ref()?.own())
     }
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        self.station_allowed()?;
         self.gate.clone().ok_or(Error::State)
+    }
+    // The signed-grant hooks below are the PCI backend's
+    // (`pci_firmware.rs`) gate operations without register access; every
+    // record is host-keyed (`rtw8821cu-*`, `Host::header`), so a PCI record
+    // never admits this backend.
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        self.station_allowed()?;
+        let gate = self.gate_ref()?;
+        if gate.extension_request().is_none() {
+            return Ok(None);
+        }
+        Ok(super::station_profile::Source::Registered
+            .load(gate.clone())
+            .ok())
+    }
+    fn station_bind_extension(
+        &mut self,
+        grant: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        self.rebind(|g| g.with_extension(grant))
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_profile_readback(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        // `pci_firmware.rs` readback over EP0. USB has no retune/widening,
+        // so the HT readback is always the 20 MHz committed profile.
+        async move {
+            let gate = self.gate_ref()?.clone();
+            let r = Read(&self.registers);
+            if let Some(w) = gate.power_tracking() {
+                w.readback(Read(&self.registers)).await?;
+                let thermal = self.registers.read32(0x2908).await.map_err(usb_error)?;
+                w.temperature(((thermal >> 10) & 63) as u8)?;
+            }
+            if let Some(g) = gate.ht_grant() {
+                return g.readback_at(r, None).await;
+            }
+            if let Some((indices, channel)) = gate.c21_indices().map(|i| (i, gate.channel())) {
+                return super::radio8821c::operating_readback(r, indices, channel).await;
+            }
+            if let Some((ofdm, diffs)) = gate.ofdm5() {
+                return super::wmm::readback5(r, ofdm, diffs).await;
+            }
+            let gains = gate.cck_gains().ok_or(Error::Unsupported)?;
+            super::wmm::readback(r, gains).await
+        }
+    }
+    fn station_ht_facts(&self) -> Option<super::ht::Facts> {
+        self.gate.as_ref()?.ht_facts()
+    }
+    fn station_ht_extension(
+        &mut self,
+        base: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::ht::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(super::ht::Source::Registered.load(base).ok())
+    }
+    fn station_bind_ht(&mut self, g: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
+        self.rebind(|gate| gate.with_ht(g))
+    }
+    fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
+        self.station_allowed()?;
+        let gate = self.gate_ref()?;
+        if let Some(g) = gate.ht_grant() {
+            return Ok(g.request());
+        }
+        let base = match gate.ht_base() {
+            Some(b) => b,
+            None => super::station_profile::Source::Registered.load(gate.clone())?,
+        };
+        super::ht::request(&base)
+    }
+    fn station_rx_ba_extension(
+        &mut self,
+        base: alloc::sync::Arc<super::ht::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::rx_ba_power::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(super::rx_ba_power::Source::Registered.load(base).ok())
+    }
+    fn station_bind_rx_ba(
+        &mut self,
+        g: alloc::sync::Arc<super::rx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.rebind(|gate| gate.with_rx_ba(g))
+    }
+    fn station_rx_ba_request(&mut self) -> Result<super::RxBaRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.gate_ref()?;
+        let h = match gate.ht_grant() {
+            Some(h) => h,
+            None => {
+                let base = match gate.ht_base() {
+                    Some(b) => b,
+                    None => super::station_profile::Source::Registered.load(gate.clone())?,
+                };
+                super::ht::Source::Registered.load(base)?
+            }
+        };
+        super::rx_ba_power::request(&h)
+    }
+    fn station_tx_ba_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
+        self.station_allowed()?;
+        let base = self.gate_ref()?.tx_base().ok_or(Error::State)?;
+        Ok(super::tx_ba_power::Source::Registered.load(base).ok())
+    }
+    fn station_bind_tx_ba(
+        &mut self,
+        g: alloc::sync::Arc<super::tx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.rebind(|gate| gate.with_tx_ba(g))
+    }
+    fn station_tx_ba_request(&mut self) -> Result<super::TxBaRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.gate_ref()?;
+        if let Some(g) = gate.tx_grant() {
+            return Ok(g.request());
+        }
+        let base = match gate.tx_base() {
+            Some(b) => b,
+            None => {
+                let l = match gate.ht_base() {
+                    Some(l) => l,
+                    None => super::station_profile::Source::Registered.load(gate.clone())?,
+                };
+                let h = super::ht::Source::Registered.load(l)?;
+                match super::rx_ba_power::Source::Registered.load(h.clone()).ok() {
+                    Some(r) => super::tx_ba_power::Base::R(r),
+                    None => super::tx_ba_power::Base::H(h),
+                }
+            }
+        };
+        super::tx_ba_power::request(&base)
+    }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::protection::Grant>>, Error> {
+        self.station_allowed()?;
+        let base = self.gate_ref()?.protection_base().ok_or(Error::State)?;
+        Ok(super::protection::Source::Registered.load(base).ok())
+    }
+    fn station_bind_protection(
+        &mut self,
+        g: alloc::sync::Arc<super::protection::Grant>,
+    ) -> Result<(), Error> {
+        self.rebind(|gate| gate.with_protection(g))
+    }
+    fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.gate_ref()?;
+        if let Some(g) = gate.protection_grant() {
+            return Ok(g.request());
+        }
+        super::protection::request(&super::protection::registered_base(gate)?)
+    }
+    fn station_bind_continuation(
+        &mut self,
+        g: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<(), Error> {
+        self.rebind(|gate| gate.with_continuation(g))
+    }
+    fn station_continuation(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(super::qualification::Source::Registered
+            .load(kind, self.gate_ref()?)
+            .ok())
+    }
+    fn station_continuation_request(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        self.station_allowed()?;
+        super::qualification::request(kind, self.gate_ref()?)
+    }
+    fn station_channel_grant(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.station_allowed()?;
+        let kind = super::channel_policy::kind(channel).ok_or(Error::Unsupported)?;
+        let base = self.gate_ref()?.without_channel();
+        Ok(super::qualification::Source::Registered
+            .load(kind, &base)
+            .ok()
+            .filter(|g| base.with_channel(g.clone()).is_ok()))
+    }
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        Ok(narf_wireless::reg::db::snapshot())
+    }
+    fn station_bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        if !self.packet_ready() || self.mailbox_pending || self.outstanding.is_some() {
+            return Err(Error::State);
+        }
+        self.rebind(|gate| gate.with_host(host))
     }
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
@@ -590,7 +851,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         &mut self,
     ) -> impl core::future::Future<Output = Result<(), packet_core::Error>> + Send {
         async move {
-            if self.state != State::Packets || self.opened || self.outstanding.is_some() {
+            if self.state != State::Packets || self.opened() || self.outstanding.is_some() {
                 return Err(packet_core::Error::State);
             }
             self.gate_current()
@@ -607,7 +868,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
                 return Err(packet_core::Error::Access);
             }
             self.state = State::Packets;
-            self.opened = true;
+            self.set_open(true);
             Ok(())
         }
     }
@@ -623,7 +884,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             if self.packets.is_none() || self.state == State::Closed {
                 return Ok(());
             }
-            let opened = core::mem::replace(&mut self.opened, false);
+            let opened = self.open.swap(false, core::sync::atomic::Ordering::AcqRel);
             self.state = State::Terminal;
             self.backlog = Backlog::default();
             let r = &self.registers;
@@ -652,18 +913,24 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     }
     fn packet_ready(&self) -> bool {
         self.state == State::Packets
-            && self.opened
+            && self.opened()
             && self.backlog.is_empty()
             && self.packets.as_ref().is_some_and(usb_packet::Owner::ready)
     }
     fn packet_submit(&mut self, frame: &[u8], report: bool) -> Result<u64, packet_core::Error> {
-        if self.state != State::Packets || !self.opened {
+        if self.state != State::Packets || !self.opened() {
             return Err(packet_core::Error::State);
         }
-        self.packets
+        // `Port::transmit_allowed`: the signed station gate is current.
+        if self.gate_current().is_err() {
+            return Err(packet_core::Error::Access);
+        }
+        let result = self
+            .packets
             .as_mut()
-            .ok_or(packet_core::Error::State)?
-            .submit(frame, report)
+            .ok_or(packet_core::Error::State)
+            .and_then(|owner| owner.submit(frame, report));
+        self.packet_fail(result)
     }
     fn packet_scan_address(&mut self, address: Option<[u8; 6]>) -> Result<(), packet_core::Error> {
         self.packets
@@ -672,6 +939,11 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             .set_scan(address)
     }
     fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
+        let gate = self.gate_ref()?.clone();
+        if !gate.allows_profile(profile) {
+            return Err(Error::Unsupported);
+        }
+        gate.current().map_err(Error::Power)?;
         self.packets
             .as_mut()
             .ok_or(Error::State)?
@@ -686,7 +958,8 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             return Ok(self.backlog.take());
         }
         let owner = self.packets.as_mut().ok_or(packet_core::Error::State)?;
-        let step = owner.poll(Self::now_us())?;
+        let step = owner.poll(Self::now_us());
+        let step = self.packet_fail(step)?;
         self.backlog.frames.extend(step.frames);
         self.backlog.c2h.extend(step.c2h);
         self.backlog.receipts.extend(step.receipts);
@@ -703,7 +976,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             return Err(packet_core::Error::State);
         }
         self.backlog = Backlog::default();
-        self.opened = false;
+        self.set_open(false);
         // After `packet_close` the MAC is closed and every receipt retired.
         // Without it (synchronous failure path) a sync stop cannot retire
         // bulk receipts: fail closed and leave them to `quiesce_dma`.
@@ -716,6 +989,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         // `Closed` already retired every packet receipt (`Owner::stop` is
         // idempotent); the backend still ends terminal.
         self.state = State::Terminal;
+        self.set_open(false);
         if let Some((receipt, _)) = self.outstanding.as_ref() {
             self.bulk.stop(receipt).await.map_err(|_| Error::Access)?;
             self.outstanding = None;
@@ -728,6 +1002,18 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     }
     fn dma_reclaimable(&self) -> bool {
         self.reclaimable
+    }
+}
+
+/// `firmware_transport::Read32` over EP0 (signed-record readbacks).
+struct Read<'a, C: ControlIo>(&'a Registers<C>);
+impl<C: ControlIo> firmware_transport::Read32 for Read<'_, C> {
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        let r = self.0;
+        async move { r.read32(reg).await.map_err(usb_error) }
     }
 }
 

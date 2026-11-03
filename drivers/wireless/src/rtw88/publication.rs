@@ -2,6 +2,10 @@
 //! Read-only retained authority for actual carrier/host frame publication.
 //! Unlike a readiness snapshot this encloses the publication in current
 //! signed-source and PCI invocations, without retaining device/ring locks.
+//! A USB publication (`Publication::usb`) encloses it in the signed source
+//! and the backend's open flag instead: there is no bus-master bit, so the
+//! retained `packet_open`ed USB owner (cleared on close/stop/failure) is the
+//! host-side condition.
 use super::{firmware_transport::Error, power_policy::Gate};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -9,6 +13,8 @@ use narf_capabilities::{Cap, Write};
 pub(super) struct Publication {
     gate: Gate,
     native: Option<(BusDevice, Cap<BusDeviceCap, Write>)>,
+    /// USB: set while the backend's MAC is open and its owner is live.
+    usb: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
     receive_epoch: Option<super::station_control::ReceiveEpoch>,
     #[cfg(any(test, feature = "kernel-test"))]
     before: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -22,6 +28,20 @@ impl Publication {
         Self {
             gate,
             native: Some((device, cap)),
+            usb: None,
+            receive_epoch: None,
+            #[cfg(any(test, feature = "kernel-test"))]
+            before: None,
+            #[cfg(any(test, feature = "kernel-test"))]
+            model: None,
+        }
+    }
+    /// RTL8821CU: `open` is the USB backend's live packet-owner flag.
+    pub(super) fn usb(gate: Gate, open: alloc::sync::Arc<core::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            gate,
+            native: None,
+            usb: Some(open),
             receive_epoch: None,
             #[cfg(any(test, feature = "kernel-test"))]
             before: None,
@@ -39,6 +59,7 @@ impl Publication {
         Self {
             gate,
             native: None,
+            usb: None,
             receive_epoch: None,
             before: None,
             model: policy,
@@ -68,6 +89,14 @@ impl Publication {
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(hook) = &self.before {
             hook();
+        }
+        if let Some(open) = &self.usb {
+            return self.gate.invoke(|| {
+                if !open.load(core::sync::atomic::Ordering::Acquire) {
+                    return Err(Error::Prerequisite);
+                }
+                operation()
+            });
         }
         #[cfg(any(test, feature = "kernel-test"))]
         if self.native.is_none() {

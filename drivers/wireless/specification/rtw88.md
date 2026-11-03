@@ -3251,8 +3251,27 @@ grant is published. Remaining blockers, verified against the tree:
    bulk receipt (`rtw_usb_cancel_rx_bufs`/TX purge) even when the register
    close failed; on success the backend is `Closed` and `packet_stop` only
    records it (it fails the backend closed only when no asynchronous close
-   ran, leaving retirement to `quiesce_dma`). Not yet bound: `station_*`
-   grant hooks (trait `Unsupported` defaults). Written, unexecuted:
+   ran, leaving retirement to `quiesce_dma`). Station grant hooks
+   (landed): the USB backend binds the PCI backend's signed-gate operations
+   without register access (`station_extension`/`_bind_extension`,
+   `_ht_extension`/`_bind_ht`/`_ht_request`, `_rx_ba_*`, `_tx_ba_*`,
+   `_protection_extension`/`_bind_protection`/`_rts_request`,
+   `_continuation*`, `_channel_grant`, `_regulatory`, `_bind_host`,
+   `_gate`, `_ht_facts`); every record is host-keyed (`rtw8821cu-*`), so a
+   PCI record never admits it. `station_publication` returns
+   `Publication::usb(gate, open)`: it encloses each publication in the
+   signed gate plus the backend's open flag (set by `packet_open`, cleared by
+   `packet_close`/`packet_stop`/`quiesce_dma` and any non-`Busy` packet
+   failure, the USB counterpart of the PCI bus-master check).
+   `packet_submit` requires the current gate (`Port::transmit_allowed`),
+   `packet_profile` the gate's `allows_profile`, and
+   `station_profile_readback` replays the PCI readback over EP0 (always the
+   20 MHz HT profile: USB has no retune/widening). Still `Unsupported` on
+   USB: `station_retune_*`, `station_width_begin`, `station_power_tracking_*`,
+   `station_ht_program_quiet`, `station_ps_rx_quiet`, `station_passive_tx`
+   grants and `packet_aggregation`/`packet_submit_batch`, so a USB station
+   stays on its initial channel-1 20 MHz profile without power-tracking
+   maintenance. Written, unexecuted:
    `smoke_rtw88_usb_firmware_reserved_page_sequence`,
    `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`,
    `smoke_rtw88_usb_packet_open_close_async`.

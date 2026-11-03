@@ -356,6 +356,13 @@ fn smoke_rtw88_usb_packet_open_close_async() -> TestResult {
     if complete(b.packet_open()).is_ok() {
         return TestResult::Fail("reopen");
     }
+    // No signed station gate: no publication and no frame admission.
+    if b.station_publication().is_ok() || b.station_gate().is_ok() {
+        return TestResult::Fail("ungated publication");
+    }
+    if b.packet_submit(&[0; 24], false) != Err(crate::rtw88::packet_core::Error::Access) {
+        return TestResult::Fail("ungated submit");
+    }
     {
         let mut m = fake.0.lock();
         m.regs.insert(0x100, 0xff);
