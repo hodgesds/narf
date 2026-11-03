@@ -130,6 +130,7 @@ pub mod rx;
 mod rx_multi;
 pub mod rx_rfh;
 mod sc_eht;
+mod sc_emlsr;
 mod sc_he;
 mod sc_mlo;
 mod sc_security;

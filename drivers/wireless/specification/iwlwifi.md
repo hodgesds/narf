@@ -4084,6 +4084,48 @@ associated link, with no EML or extra-link request. Multiple simultaneously
 active PHY/LINK/STA/queue owners, per-link power/key/PN/reorder lifetimes,
 link switching and public multiple-link control remain open in `mlo`.
 
+**Multiple-active-link groundwork (partial; nothing advertised).** The
+shared Basic MLE parser now retains common-info Medium Sync Delay, EML
+Capabilities and MLD Capabilities in Linux `ieee80211-eht.h` presence
+order, plus bounded per-STA profile headers (link id, COMPLETE, STA MAC)
+per affiliated link. `EmlCapabilities` mirrors Linux's EMLSR padding/
+transition delay and transition-timeout helpers and carries Intel's
+`IWL_MLD_EMLSR_CAPA`; it is not placed in any request. A single-link
+context still refuses any affiliated profile in a response.
+
+`sc_mlo::Binding` is split into a primary `LinkOwner` (spec link, FW
+link, FW STA, channel, physical own/peer link MAC) and at most one
+secondary owner (`IWL_FW_MAX_ACTIVE_LINKS_NUM`=2). RX admission, explicit
+management projection, LINK_CONFIG/STA_CONFIG per-link fields and bound
+beacon proof all resolve through exactly one owner; the secondary slot is
+never populated today, so behaviour equals the single-link profile.
+`FwIds` allocates firmware link/station ids lowest-free (Linux
+`IWL_MLD_ALLOC_FN` with `IWL_MLD_DIS_RANDOM_FW_ID`), bounded by the actual
+`FW_NUM_LINKS`/`FW_NUM_STATIONS` TLVs; an absent link-count TLV admits no
+extra link, as Linux's zeroed `num_links` does.
+
+`sc_emlsr` holds the pure EMLSR decision state mirroring Linux
+`mld/{mlo.c,mlo.h,iface.h,constants.h}`: blocked/exit reason masks,
+`iwl_mld_vif_has_emlsr_cap` (authorized station, NVM 11be, AP EMLSR bit,
+non-CDB; admitted Sc/Bz profiles already refuse CDB capability40),
+per-link RSSI/BT/CSA disallowance, the 5GHz UNII separation and
+bandwidth-ratio channel-load pair rules, pair grading and link selection,
+block/unblock, the 30s/300s/600s exit prevention, ESR_MODE_NOTIF v2
+recommend-leave and EMLSR_TRANS_FAIL_NOTIF v1 keep/disconnect handling,
+and the MAC client `esr_transition_timeout` clamp. Three written,
+unexecuted cases in `drivers/wireless/iwlwifi/mlo` cover these vectors;
+one shared case covers EML/affiliated parsing.
+
+Still open for a second active link: multi-link association request
+per-STA profiles and per-link response status (mac80211
+`ieee80211_assoc_add_ml_elem`/`ieee80211_assoc_success`), per-link
+PHY/LINK ADD and link-STA ADD, queue and pairwise-key STA masks spanning
+both link STAs, per-link GTK/IGTK/BIGTK install and PN/reorder owners,
+`iwl_mld_change_vif_links`/`ieee80211_set_active_links` sequencing with
+TX quiescing, MLO scan freshness for selection, missed-beacon/EMLSR
+notification routing in the native receive path, EML OMN, TID-to-link
+mapping and the public narf_wireless multiple-link surface.
+
 
 ### 3.67 Complete native6GHz discovery, refinement and live TPE (validation pending)
 
