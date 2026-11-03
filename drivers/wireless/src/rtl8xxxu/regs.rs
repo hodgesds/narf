@@ -174,7 +174,7 @@ impl ChipFamily {
     pub const fn firmware_name(self) -> Option<&'static str> {
         match self {
             ChipFamily::Rtl8188eu => Some("rtlwifi/rtl8188eufw.bin"),
-            ChipFamily::Rtl8192eu => Some("rtlwifi/rtl8192eufw.bin"),
+            ChipFamily::Rtl8192eu => Some("rtlwifi/rtl8192eu_nic.bin"),
             ChipFamily::Rtl8723bu => Some("rtlwifi/rtl8723bufw.bin"),
             ChipFamily::Rtl8821cu => Some("rtlwifi/rtl8821cufw.bin"),
             ChipFamily::Rtl8822bu => Some("rtlwifi/rtl8822bufw.bin"),
@@ -294,10 +294,10 @@ pub const CR_RXDMA_ENABLE: u16 = 1 << 3;
 pub const CR_PROTOCOL_ENABLE: u16 = 1 << 4;
 /// `CR_SCHEDULE_ENABLE` — scheduler enable (bit 5).
 pub const CR_SCHEDULE_ENABLE: u16 = 1 << 5;
-/// `CR_SECURITY_ENABLE` — security engine enable (bit 6).
-pub const CR_SECURITY_ENABLE: u16 = 1 << 6;
-/// `CR_CALTIMER_ENABLE` — 32 kHz calibration timer enable (bit 7).
-pub const CR_CALTIMER_ENABLE: u16 = 1 << 7;
+/// `CR_SECURITY_ENABLE` — security engine enable (bit 9, `regs.h`).
+pub const CR_SECURITY_ENABLE: u16 = 1 << 9;
+/// `CR_CALTIMER_ENABLE` — 32 kHz calibration timer enable (bit 10, `regs.h`).
+pub const CR_CALTIMER_ENABLE: u16 = 1 << 10;
 
 /// CR open mask for 8188EU-style bring-up.
 /// Source: `8188e.c::rtl8188eu_power_on` — `CR_HCI_TXDMA_ENABLE |

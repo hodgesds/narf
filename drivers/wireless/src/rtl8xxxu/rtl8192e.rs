@@ -1,28 +1,25 @@
-//! RTL8192EU chip-specific init, PHY tables, RF tables, IQ/LC cal.
+//! RTL8192EU chip constants, PHY tables, RF tables, IQ/LC cal.
 //!
-//! RTL8192EU: 802.11n 2x2 USB, dual spatial streams.
-//! USB IDs: `0x0BDA:0x818B` (native), plus many OEM variants.
-//! Firmware: `rtlwifi/rtl8192eufw.bin`.
+//! RTL8192EU: 802.11n 2x2 USB (RTL8191EU is the 1T2R bonding).
+//! USB IDs: `0x0BDA:0x818B` (native), plus OEM variants.
+//! Firmware: `rtlwifi/rtl8192eu_nic.bin` (`8192e.c::rtl8192eu_load_firmware`).
 //!
 //! ## Per-chip integration
 //!
-//! 8192EU is gen1 (n) but 2T2R, so PHY/RF init runs both RF_A and RF_B
-//! tables. IQ-cal additionally exercises path B.
+//! The 8192EU is a gen2 rtl8xxxu chip (`rtl8192eu_fops`): H2C via
+//! `rtl8xxxu_gen2_h2c_cmd`, gen2 channel config, TX descriptor v2 (40 B),
+//! RX descriptor 24 B and firmware rate adaptation. Identity, EFUSE, power
+//! and the H2C mailbox live in `rtl8192e_init`.
 //!
 //! ## References (GPL-2.0-or-later)
 //!
 //! - `drivers/net/wireless/realtek/rtl8xxxu/8192e.c`
-//!   - `rtl8192e_mac_init_table[]`         L19..L48  (~99 rows, write-8).
-//!   - `rtl8192eu_phy_init_table[]`        L49..L180 (~260 rows, write-32).
-//!   - `rtl8xxx_agc_8192eu_std_table[]`    L181..L249 (~135 rows, AGC).
-//!   - `rtl8xxx_agc_8192eu_highpa_table[]` L250..L318 (~135 rows, AGC).
-//!   - `rtl8192eu_radioa_init_table[]`     L319..L398 (~155 rows, RF A).
-//!   - `rtl8192eu_radiob_init_table[]`     L399..L470 (~140 rows, RF B).
-//!   - `rtl8192eu_init_phy_bb()`           L652..L677.
-//!   - `rtl8192eu_init_phy_rf()`           L679..L691.
-//!   - `rtl8192eu_iqk_path_a()`            L693..L867.
-//!   - `rtl8192eu_iqk_path_b()`            L870..L1047.
-//!   - `rtl8192eu_phy_iqcalibrate()`       L1050..L1255.
+//!   - `rtl8192e_mac_init_table[]`, `rtl8192eu_phy_init_table[]`,
+//!     `rtl8xxx_agc_8192eu_{std,highpa}_table[]`,
+//!     `rtl8192eu_radio{a,b}_init_table[]`.
+//!   - `rtl8192eu_init_phy_bb()`, `rtl8192eu_init_phy_rf()`.
+//!   - `rtl8192eu_iqk_path_{a,b}()`, `rtl8192eu_phy_iqcalibrate()`.
+//!   - `rtl8192eu_fops`.
 
 #![allow(dead_code)]
 
@@ -34,8 +31,14 @@ use super::usb::UsbControlSetup;
 /// Chip name string.
 pub const CHIP_NAME: &str = "RTL8192EU";
 
-/// Firmware blob path.
-pub const FIRMWARE_NAME: &str = "rtlwifi/rtl8192eufw.bin";
+/// Firmware blob path (`rtl8192eu_load_firmware`).
+pub const FIRMWARE_NAME: &str = "rtlwifi/rtl8192eu_nic.bin";
+
+/// `rtl8192eu_fops.writeN_block_size`.
+pub const WRITEN_BLOCK_SIZE: usize = 128;
+
+/// `rtl8192eu_fops.trxff_boundary`.
+pub const TRXFF_BOUNDARY: u16 = 0x3cff;
 
 /// TX total pages. `TX_TOTAL_PAGE_NUM_8192E = 0xF3`.
 pub const TX_TOTAL_PAGES: u8 = TX_TOTAL_PAGE_NUM_8192E;
@@ -47,8 +50,10 @@ pub const TX_PAGE_NUM_LO: u8 = 0x0C;
 /// TX normal-priority page count. `TX_PAGE_NUM_NORM_PQ_8192E = 0x00`.
 pub const TX_PAGE_NUM_NORM: u8 = 0x00;
 
-/// TX descriptor size: 32 bytes.
-pub const TX_DESC_SIZE: usize = TXDESC_SIZE_32;
+/// TX descriptor size: `sizeof(struct rtl8xxxu_txdesc40)`.
+pub const TX_DESC_SIZE: usize = TXDESC_SIZE_40;
+/// RX descriptor size: `sizeof(struct rtl8xxxu_rxdesc24)`.
+pub const RX_DESC_SIZE: usize = RXDESC_SIZE_24;
 
 /// LDO 1.2V control register.
 /// `REG_8192E_LDOV12_CTRL = 0x0014`. `regs.h` L70.

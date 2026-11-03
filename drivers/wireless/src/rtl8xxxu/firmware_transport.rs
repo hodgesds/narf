@@ -1,4 +1,5 @@
-//! Live RTL8188EU power and firmware transport over vendor USB control.
+//! Live RTL8188EU/RTL8192EU power and firmware transport over vendor USB
+//! control. RTL8192EU chip steps live in `rtl8192e_init`.
 //!
 //! Linux references: `rtl8xxxu/8188e.c::{rtl8188eu_power_on,
 //! rtl8188e_emu_to_active,rtl8188eu_reset_8051}` and
@@ -11,7 +12,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_drivers_usb::device::{USBDevice, UsbError};
 use narf_firmware::FirmwareError;
@@ -22,6 +23,23 @@ use super::regs::*;
 const HEADER_LEN: usize = 32;
 const MAX_PAYLOAD: usize = 8 * RTL_FW_PAGE_SIZE;
 const CONTROL_CHUNK: usize = 196; // rtl8188eu_fops.writeN_block_size
+
+/// `rtl8xxxu_fileops.writeN_block_size` of the families with a native owner.
+fn control_chunk(chip: ChipFamily) -> usize {
+    match chip {
+        ChipFamily::Rtl8192eu => super::rtl8192e::WRITEN_BLOCK_SIZE,
+        _ => CONTROL_CHUNK,
+    }
+}
+
+/// `rtl8xxxu_load_firmware` signature family accepted per chip.
+fn firmware_signature(chip: ChipFamily) -> Option<u16> {
+    match chip {
+        ChipFamily::Rtl8188eu => Some(0x88e0),
+        ChipFamily::Rtl8192eu => Some(0x92e0),
+        _ => None,
+    }
+}
 const REG_LPLDO_CTRL: u16 = 0x23;
 const REG_AFE_XTAL_CTRL: u16 = 0x24;
 const MCU_RAM_SELECT: u8 = 1 << 7;
@@ -50,6 +68,7 @@ pub enum Error {
     PowerTimeout,
     ChecksumTimeout,
     StartTimeout,
+    MailboxBusy,
     Deadline,
     Cancelled,
 }
@@ -100,16 +119,14 @@ pub struct FirmwareInfo {
 /// Validate the chip-bound header and exact RAM-code extent before any USB
 /// access. Other families have different power/reset/download requirements.
 pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]), Error> {
-    if chip != ChipFamily::Rtl8188eu {
-        return Err(Error::UnsupportedChip);
-    }
+    let family = firmware_signature(chip).ok_or(Error::UnsupportedChip)?;
     if blob.len() <= HEADER_LEN {
         return Err(Error::InvalidImage);
     }
     let signature = u16::from_le_bytes([blob[0], blob[1]]);
     let payload = &blob[HEADER_LEN..];
     let declared = u16::from_le_bytes([blob[12], blob[13]]) as usize;
-    if signature & 0xfff0 != 0x88e0 || payload.len() != declared || payload.len() > MAX_PAYLOAD {
+    if signature & 0xfff0 != family || payload.len() != declared || payload.len() > MAX_PAYLOAD {
         return Err(Error::InvalidImage);
     }
     Ok((
@@ -194,6 +211,11 @@ pub struct Owner<I: ControlIo> {
     executable: IrqSafeSpinLock<Option<Executable>>,
     // Exact uploaded image; a restart invokes its original executable cap.
     runtime_image: IrqSafeSpinLock<Option<Arc<[u8]>>>,
+    // RTL8192EU factory/queue facts and gen2 H2C mailbox state.
+    factory_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::Factory>>,
+    queues_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
+    h2c_next: AtomicU8,
+    h2c_busy: AtomicBool,
 }
 
 /// Identity of the exact immutable image uploaded by this retained owner.
@@ -297,6 +319,10 @@ impl<I: ControlIo> Owner<I> {
             runtime_taken: AtomicBool::new(false),
             executable: IrqSafeSpinLock::new(None),
             runtime_image: IrqSafeSpinLock::new(None),
+            factory_8192e: IrqSafeSpinLock::new(None),
+            queues_8192e: IrqSafeSpinLock::new(None),
+            h2c_next: AtomicU8::new(0),
+            h2c_busy: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -350,8 +376,8 @@ impl<I: ControlIo> Owner<I> {
         let authority = loader
             .derive()
             .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-        self.initialize_registered_from(&authority, "rtlwifi/rtl8188eufw.bin")
-            .await
+        let name = self.chip.firmware_name().ok_or(Error::UnsupportedChip)?;
+        self.initialize_registered_from(&authority, name).await
     }
     pub async fn wait_initialize_registered(&self) -> Result<FirmwareInfo, Error> {
         loop {
@@ -380,7 +406,7 @@ impl<I: ControlIo> Owner<I> {
         if self.started.load(Ordering::Acquire) {
             return Err(Error::AlreadyStarted);
         }
-        if self.chip != ChipFamily::Rtl8188eu {
+        if firmware_signature(self.chip).is_none() {
             return Err(Error::UnsupportedChip);
         }
         let asset = crate::firmware_asset::load(authority, name, HEADER_LEN + MAX_PAYLOAD, false)
@@ -428,6 +454,34 @@ impl<I: ControlIo> Owner<I> {
 
     pub fn factory(&self) -> Option<super::device_init::Factory> {
         *self.factory.lock()
+    }
+
+    /// RTL8192EU identity/EFUSE facts once `FactoryReady` was reached.
+    pub fn factory_8192e(&self) -> Option<super::rtl8192e_init::Factory> {
+        *self.factory_8192e.lock()
+    }
+
+    /// RTL8192EU TX queue to bulk-OUT endpoint map installed before firmware.
+    pub fn queues_8192e(&self) -> Option<super::rtl8192e_init::QueueMap> {
+        *self.queues_8192e.lock()
+    }
+
+    pub fn chip(&self) -> ChipFamily {
+        self.chip
+    }
+
+    /// Exclusive gen2 H2C mailbox claim; a concurrent command is refused.
+    pub(super) fn h2c_claim(&self) -> Result<super::rtl8192e_init::H2cClaim<'_>, Error> {
+        if self.chip != ChipFamily::Rtl8192eu {
+            return Err(Error::UnsupportedChip);
+        }
+        self.h2c_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::RuntimeBusy)?;
+        Ok(super::rtl8192e_init::H2cClaim {
+            next: &self.h2c_next,
+            busy: &self.h2c_busy,
+        })
     }
 
     pub(super) fn executable(&self) -> Option<Executable> {
@@ -541,6 +595,9 @@ impl<I: ControlIo> Owner<I> {
                 return Err(Error::BadEndpoints);
             }
             let endpoints = super::device_init::endpoints(&config[..count])?;
+            if self.chip == ChipFamily::Rtl8192eu {
+                return self.run_device_8192e(payload, endpoints, info).await;
+            }
             let factory = super::device_init::factory(self).await?;
             if expected.is_some_and(|old| old != (factory, endpoints)) {
                 return Err(Error::BadEfuse);
@@ -568,6 +625,27 @@ impl<I: ControlIo> Owner<I> {
         })
         .await
         .unwrap_or(Err(Error::Deadline))
+    }
+
+    /// RTL8192EU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
+    /// through firmware start. MAC/BB/RF tables and calibration are the
+    /// following stages; until they exist the owner stops at FirmwareReady.
+    async fn run_device_8192e(
+        &self,
+        payload: &[u8],
+        endpoints: super::device_init::Endpoints,
+        info: FirmwareInfo,
+    ) -> Result<FirmwareInfo, Error> {
+        let factory = super::rtl8192e_init::factory(self, endpoints).await?;
+        *self.endpoints.lock() = Some(endpoints);
+        *self.factory_8192e.lock() = Some(factory);
+        self.stage(Stage::FactoryReady);
+        self.power_on().await?;
+        let queues = super::rtl8192e_init::pre_firmware(self, factory).await?;
+        *self.queues_8192e.lock() = Some(queues);
+        self.stage(Stage::Powered);
+        self.download(payload).await?;
+        Ok(info)
     }
 
     async fn run_before(
@@ -662,6 +740,9 @@ impl<I: ControlIo> Owner<I> {
     }
 
     async fn power_on(&self) -> Result<(), Error> {
+        if self.chip == ChipFamily::Rtl8192eu {
+            return super::rtl8192e_init::power_on(self).await;
+        }
         let value = self.read16(REG_APS_FSMCO).await?;
         self.write16(REG_APS_FSMCO, value & !((1 << 11) | (1 << 12)))
             .await?;
@@ -703,6 +784,9 @@ impl<I: ControlIo> Owner<I> {
     }
 
     async fn reset_8051(&self) -> Result<(), Error> {
+        if self.chip == ChipFamily::Rtl8192eu {
+            return super::rtl8192e_init::reset_8051(self).await;
+        }
         let value = self.read16(REG_SYS_FUNC).await?;
         self.write16(REG_SYS_FUNC, value & !SYS_FUNC_CPU_ENABLE)
             .await?;
@@ -728,12 +812,13 @@ impl<I: ControlIo> Owner<I> {
         let value = self.read8(REG_MCU_FW_DL).await?;
         self.write8(REG_MCU_FW_DL, value | MCU_FW_DL_CSUM_REPORT)
             .await?;
+        let block = control_chunk(self.chip);
         for (page, bytes) in payload.chunks(RTL_FW_PAGE_SIZE).enumerate() {
             let value = self.read8(REG_MCU_FW_DL + 2).await?;
             self.write8(REG_MCU_FW_DL + 2, (value & 0xf8) | page as u8)
                 .await?;
-            for (chunk, bytes) in bytes.chunks(CONTROL_CHUNK).enumerate() {
-                let addr = REG_FW_START_ADDRESS + (chunk * CONTROL_CHUNK) as u16;
+            for (chunk, bytes) in bytes.chunks(block).enumerate() {
+                let addr = REG_FW_START_ADDRESS + (chunk * block) as u16;
                 self.write(addr, bytes).await?;
             }
         }

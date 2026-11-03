@@ -440,8 +440,15 @@ fn smoke_rtl8xxxu_live_firmware_header_preflight() -> TestResult {
             return TestResult::Fail("invalid RTL8188EU firmware touched USB or did not fail");
         }
     }
+    // RTL8192EU has its own owner path but must refuse an 88E-signed image.
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize(&valid)) != Err(Error::InvalidImage)
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("RTL8192EU owner accepted an RTL8188EU image");
+    }
     for chip in [
-        ChipFamily::Rtl8192eu,
         ChipFamily::Rtl8723bu,
         ChipFamily::Rtl8821cu,
         ChipFamily::Rtl8822bu,

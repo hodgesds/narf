@@ -1069,6 +1069,44 @@ They await coordinated release compilation and native execution; all prior
 v1/scan registrations remain required. Hardware measurements and physical
 USB/RF interoperability remain external.
 
+### RTL8192EU native owner (in progress)
+
+RTL8192EU (and its 1T2R RTL8191EU bonding) is the second native rtl8xxxu
+chip. It reuses the retained one-shot `firmware_transport::Owner` and its
+EP0 transfer/executable-cap discipline; chip steps live in
+`rtl8xxxu/rtl8192e_init.rs`, constants/tables in `rtl8xxxu/rtl8192e.rs`.
+
+- Image: `rtlwifi/rtl8192eu_nic.bin`, signature family `0x92e0`
+  (`core.c::rtl8xxxu_load_firmware`); an 88E-signed image is rejected
+  before any USB access.
+- Identity (`8192e.c::rtl8192eu_identify_chip`): `REG_SYS_CFG` cut/vendor,
+  test silicon refused, `REG_HPON_FSM` bonding → `tx_paths` 1 or 2,
+  `REG_GPIO_OUTSTS` ROM rev, TX queues from `REG_NORMAL_SIE_EP_TX` or the
+  bulk-OUT count. A SIE queue set larger than the descriptor's bulk-OUT
+  endpoints is `BadEndpoints` (Linux would index past `out_ep[]`).
+- EFUSE: `core.c::rtl8xxxu_read_efuse` PG-header decode (extended headers,
+  word masks, stop at `0xff`) and `rtl8192eu_parse_efuse` (`0x8129` ID,
+  both paths' CCK/HT40 bases, signed HT20/HT40/OFDM diffs, crystal cap,
+  thermal, PA/LNA type, board/antenna option). Retained as
+  `Owner::factory_8192e()`.
+- Power (`rtl8192eu_power_on`): SPS/LDO select, `crystal_afe_adjust`,
+  `disabled_to_emu`, `emu_to_active` (checked polls), CR with MAC TX/RX as
+  Linux does. `active_to_emu`/`emu_to_disabled` are implemented for the
+  power-off path.
+- Pre-firmware (`rtl8xxxu_init_device`): reserved pages with the 8192E
+  budget, `init_queue_priority` (TRXDMA + queue→endpoint map retained as
+  `Owner::queues_8192e()`), `TRXFF_BNDY+2 = 0x3cff`.
+- Firmware: shared download with `writeN_block_size = 128`, generic
+  `rtl8xxxu_reset_8051`, no `init_reg_hmtfr`. Download is not retried: a
+  short transfer is terminal for the owner.
+- Gen2 H2C (`rtl8xxxu_gen2_h2c_cmd`): ext word then mailbox word, mailbox
+  rotation over 4, exclusive claim. A mailbox still busy after 101 polls is
+  `MailboxBusy` (Linux proceeds because its `!retry` test sees -1).
+
+The owner currently stops at `FirmwareReady` for RTL8192EU. The production
+probe stays detection-only for this family; no table, calibration, packet
+or station capability is advertised.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -1113,7 +1151,8 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 | Prerequisite | State |
 |---|---|
 | RTL8188EU power + EP0 firmware lifecycle | Implemented; shared-path regressions |
-| RTL8192EU / RTL8723BU / RTL8821CU / RTL8822BU runtime initialization | Missing |
+| RTL8192EU runtime initialization | Identity/EFUSE/power/firmware/H2C implemented; tables, IQK, TX/RX, RA, signed records and station missing |
+| RTL8723BU / RTL8821CU / RTL8822BU runtime initialization | Missing |
 | EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented with retained RX filter/MAC activation |
 | MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |

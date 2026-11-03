@@ -61,6 +61,7 @@ pub mod receive_runtime;
 pub mod regs;
 pub mod rtl8188e;
 pub mod rtl8192e;
+pub mod rtl8192e_init;
 pub mod rtl8723b;
 pub mod rtl8821c;
 pub mod rtl8822b;
@@ -314,3 +315,6 @@ mod management_tests;
 
 #[cfg(feature = "kernel-test")]
 mod rate_adaptation_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rtl8192e_tests;
