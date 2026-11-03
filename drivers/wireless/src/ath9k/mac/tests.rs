@@ -219,3 +219,42 @@ kernel_test_in!(
     "drivers/wireless/ath9k/mac",
     smoke_ar9285_mac_every_access_failure_stops_before_packet_activation
 );
+
+fn smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu() -> TestResult {
+    let io = Model::new(0);
+    if peer_clocked(&io, None, 9, Clock::AsyncFifo).is_err()
+        || async_fifo_pcu(&io).is_err()
+        || dma_txbuf(&io, 0x700).is_err()
+    {
+        return TestResult::Fail("AR9287 async-FIFO MAC settings refused");
+    }
+    // 117 MHz: SIFS (10 - 2) us, 9 us slot, 64 us ACK / 48 us CTS, EIFS
+    // AR_D_GBL_IFS_EIFS_ASYNC_FIFO and USEC = AR_USEC_ASYNC_FIFO.
+    for (reg, value) in [
+        (0x1030, 8 * 117),
+        (0x1070, 9 * 117),
+        (0x8014, (64 * 117) | ((48 * 117) << 16)),
+        (0x10b0, 363 * 117),
+        (0x801c, 0x12e0_0074),
+        (0x8264, 0x2000_0000),
+        (0x4024, 0xc4),
+        (0x8344, 0x2_0000),
+        (0x8340, 0x700),
+    ] {
+        if io.raw(reg) != value {
+            return TestResult::Fail("AR9287 async-FIFO MAC register differs from hw.c");
+        }
+    }
+    let ofdm = Model::new(0);
+    if peer_clocked(&ofdm, None, 9, Clock::Ofdm2g).is_err()
+        || ofdm.raw(0x801c) != 43
+        || ofdm.trace.borrow().iter().any(|w| w.0 == 0x10b0)
+    {
+        return TestResult::Fail("44 MHz clock profile changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu
+);

@@ -286,3 +286,61 @@ kernel_test_in!(
     "drivers/wireless/ath9k/phy",
     smoke_ath9k_ar9287_preparation_refuses_wrong_inputs
 );
+
+fn smoke_ath9k_ar9287_13_enables_async_fifo_before_ini() -> TestResult {
+    let mut io = Io::default();
+    io.regs.insert(0x8358, 0x8000_0000);
+    if prepare(
+        &mut io,
+        &revision(0x0018_03ff),
+        &identity(3, 3),
+        &image(false),
+        2412,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("AR9287 1.3 preparation refused");
+    }
+    let fifo: Vec<(usize, (u64, u32))> = io
+        .writes
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, (reg, _))| reg == 0x8358 || reg == 0xa200)
+        .take(4)
+        .collect();
+    let expected = [
+        (0x8358, 0x8000_0400),
+        (0xa200, 0x80),
+        (0x8358, 0x400),
+        (0x8358, 0x8000_0400),
+    ];
+    let Some(phy) = io.writes.iter().position(|w| *w == (0x9800, 7)) else {
+        return TestResult::Fail("AR9287 preparation skipped AR_PHY(0)");
+    };
+    if fifo.iter().map(|f| f.1).ne(expected) || fifo.last().is_none_or(|f| f.0 > phy) {
+        return TestResult::Fail("ar9002_hw_enable_async_fifo order differs");
+    }
+    // ar5008_hw_set_rfmode later rewrites AR_PHY_MODE without ASYNCFIFO.
+    if io.regs.get(&0xa200) != Some(&4) {
+        return TestResult::Fail("AR_PHY_MODE not rewritten by the channel path");
+    }
+    let mut old = Io::default();
+    if prepare(
+        &mut old,
+        &revision(0x0018_01ff),
+        &identity(3, 3),
+        &image(false),
+        2412,
+    )
+    .is_err()
+        || old.writes.iter().any(|w| w.0 == 0x8358)
+    {
+        return TestResult::Fail("AR9287 1.1 enabled the 1.3 async FIFO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/phy",
+    smoke_ath9k_ar9287_13_enables_async_fifo_before_ini
+);

@@ -1307,9 +1307,23 @@ Smokes (written, not executed):
 `smoke_ath9k_ar9287_olc_temp_compensation_follows_linux`,
 `smoke_ath9k_ar9287_ht40_adc_dc_offset_correction`.
 
-Still missing before `0x002d`/`0x002e` can be matched: the
-`AR_SREV_9287_13_OR_LATER` async-FIFO MAC settings (117 MHz clock,
-`AR_USEC_ASYNC_FIFO`, AHB custom burst, AGGWEP), two-chain TX descriptor
+AR9287 1.3+ (`Revision::ar9287_async_fifo`, `AR_SREV_9287_13_OR_LATER`):
+`phy/ar9287.rs::prepare` runs `ar9002_hw_enable_async_fifo` immediately
+before the INI (`AR_MAC_PCU_ASYNC_FIFO_REG3` DATAPATH_SEL,
+`AR_PHY_MODE_ASYNCFIFO`, SOFT_RESET clear then set; the later
+`ar5008_hw_set_rfmode` `AR_PHY_MODE = 4` write replaces that bit exactly as
+on Linux). `mac.rs` names the MAC clock: `Clock::Ofdm2g` is the unchanged
+AR9285 44 MHz profile, `Clock::AsyncFifo` is `ath9k_hw_set_clockrate`'s
+117 MHz with `ath9k_hw_init_global_settings`' `AR_D_GBL_IFS_EIFS_ASYNC_FIFO`
+(363 us) and `AR_USEC_ASYNC_FIFO` latencies (`peer_clocked`); SIFS, slot and
+the 64/48 us ACK/CTS workaround scale with the clock. `async_fifo_pcu` is
+the following `ath9k_hw_reset` block (logic-analyzer DISBUG20768, AHB
+custom burst 3, MISC_MODE2 AGGWEP) and `dma_txbuf` takes the chip's
+`AR_PCU_TXBUF_CTRL` usable size (0x380 AR9285, 0x700 otherwise). Smokes
+(written, not executed): `smoke_ath9k_ar9287_13_enables_async_fifo_before_ini`,
+`smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu`.
+
+Still missing before `0x002d`/`0x002e` can be matched: two-chain TX descriptor
 chain selection in the packet owner, signed board records naming the AR9287
 devices, and the probe/station wiring. No AR9287 device is matched.
 

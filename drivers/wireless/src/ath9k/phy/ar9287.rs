@@ -138,6 +138,17 @@ pub(in crate::ath9k) fn set_board_values(
     Ok(())
 }
 
+/// `ar9002_hw.c::ar9002_hw_enable_async_fifo` (AR9287 1.3+), run by
+/// `ath9k_hw_reset` immediately before `ath9k_hw_process_ini`. The later
+/// `ar5008_hw_set_rfmode` write of `AR_PHY_MODE` replaces the ASYNCFIFO bit
+/// exactly as on Linux.
+fn enable_async_fifo(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
+    rmw(io, 0x8358, 0, 0x400)?; // AR_MAC_PCU_ASYNC_FIFO_REG3_DATAPATH_SEL.
+    rmw(io, 0xa200, 0, 0x80)?; // AR_PHY_MODE_ASYNCFIFO.
+    rmw(io, 0x8358, 0x8000_0000, 0)?; // ..._REG3_SOFT_RESET clear, then set.
+    rmw(io, 0x8358, 0, 0x8000_0000)
+}
+
 /// Inactive full-reset INI, channel and board-value preparation for one
 /// 20 MHz 2.4 GHz channel. PHY, interrupts and packet engines stay off.
 pub(in crate::ath9k) fn prepare(
@@ -167,6 +178,9 @@ pub(in crate::ath9k) fn prepare(
     io.write32(0x7014, (5 << 10) | 0x2c);
     io.delay_us(100);
     io.write32(0x7048, 2); // AR_RTC_FORCE_DERIVED_CLK.
+    if revision.ar9287_async_fifo() {
+        enable_async_fifo(io)?;
+    }
     io.write32(0x9800, 7);
     io.write32(0x9830, 1); // AR_PHY_SEL_EXTERNAL_RADIO.
     io.write32(0x9830, 0); // No AR9287 ADDAC table or set_addac op.

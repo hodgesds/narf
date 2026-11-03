@@ -119,10 +119,37 @@ pub(super) fn prepare(
     }
     Ok(())
 }
+/// MAC clock of `hw.c::ath9k_hw_set_clockrate` for a full-rate 20 MHz
+/// 2.4 GHz channel, as used by `ath9k_hw_init_global_settings`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Clock {
+    /// `ATH9K_CLOCK_RATE_2GHZ_OFDM` (44 MHz); USEC latencies stay as the INI
+    /// left them and only `AR_USEC_USEC` is rewritten.
+    Ofdm2g,
+    /// `AR_SREV_9287_13_OR_LATER`: async FIFO at 117 MHz with
+    /// `AR_USEC_ASYNC_FIFO` latencies and `AR_D_GBL_IFS_EIFS_ASYNC_FIFO`.
+    AsyncFifo,
+}
+impl Clock {
+    pub(super) fn rate(self) -> u32 {
+        match self {
+            Self::Ofdm2g => 44,
+            Self::AsyncFifo => 117,
+        }
+    }
+}
 pub(super) fn peer(
     io: &impl Port,
     bssid: Option<([u8; 6], u16)>,
     slot_us: u32,
+) -> Result<(), Error> {
+    peer_clocked(io, bssid, slot_us, Clock::Ofdm2g)
+}
+pub(super) fn peer_clocked(
+    io: &impl Port,
+    bssid: Option<([u8; 6], u16)>,
+    slot_us: u32,
+    clock: Clock,
 ) -> Result<(), Error> {
     if !matches!(slot_us, 9 | 20) {
         return Err(Error::Packet);
@@ -141,12 +168,20 @@ pub(super) fn peer(
         0x800c,
         u32::from(u16::from_le_bytes([bssid[4], bssid[5]])) | (u32::from(aid) << 16),
     )?;
-    // Channel1 full-rate clock44MHz, zero coverage class: Linux's2GHz
-    //64us ACK/48us CTS workaround is independent of the selected slot time.
-    write(io, 0x1030, (10 - 2) * 44)?;
-    write(io, 0x1070, slot_us * 44)?;
-    modify(io, 0x8014, 0x3fff_3fff, (64 * 44) | ((48 * 44) << 16))?;
-    modify(io, 0x801c, 0x7f, 43)?;
+    // Full-rate 2.4 GHz, zero coverage class: Linux's 2 GHz 64us ACK/48us
+    // CTS workaround is independent of the selected slot time.
+    let rate = clock.rate();
+    write(io, 0x1030, (10 - 2) * rate)?;
+    write(io, 0x1070, slot_us * rate)?;
+    modify(io, 0x8014, 0x3fff_3fff, (64 * rate) | ((48 * rate) << 16))?;
+    match clock {
+        Clock::Ofdm2g => modify(io, 0x801c, 0x7f, rate - 1)?,
+        Clock::AsyncFifo => {
+            write(io, 0x10b0, 363 * rate)?;
+            // TX_LAT | RX_LAT | USEC = AR_USEC_ASYNC_FIFO (USEC = 117 - 1).
+            modify(io, 0x801c, 0x1fff_c07f, 0x12e0_0074)?;
+        }
+    }
     // All multicast is received for software peer/key admission, with no
     // PHY error, HT/aggregation/control offload or promiscuous data contract.
     write(io, 0x803c, 0x17)?;
@@ -232,13 +267,27 @@ pub(super) fn qos(io: &impl Port) -> Result<(), Error> {
 }
 pub(super) fn dma(io: &impl Port) -> Result<(), Error> {
     // Linux ath9k_hw_set_dma, AR9285's2KiB TX FIFO workaround and128B bursts.
+    dma_txbuf(io, 0x380)
+}
+/// `ath9k_hw_set_dma` with the chip's `AR_PCU_TXBUF_CTRL` usable size
+/// (`AR_9285_PCU_TXBUF_CTRL_USABLE_SIZE` 0x380, otherwise 0x700).
+pub(super) fn dma_txbuf(io: &impl Port, txbuf: u32) -> Result<(), Error> {
     modify(io, 0x4024, 0, 4)?;
     modify(io, 0x30, 7, 5)?;
     modify(io, 0x30, 0x3f0, 4 << 4)?;
     modify(io, 0x34, 7, 5)?;
     write(io, 0x8114, 0x200)?;
-    write(io, 0x8340, 0x380)?;
+    write(io, 0x8340, txbuf)?;
     Ok(())
+}
+
+/// `hw.c::ath9k_hw_reset` AR9287 1.3+ PCU settings that follow
+/// `ath9k_hw_init_global_settings`: logic-analyzer bug-20768 disable, AHB
+/// custom burst `AR_AHB_CUSTOM_BURST_ASYNC_FIFO_VAL` and MISC_MODE2 AGGWEP.
+pub(super) fn async_fifo_pcu(io: &impl Port) -> Result<(), Error> {
+    modify(io, 0x8264, 0, 0x2000_0000)?;
+    modify(io, 0x4024, 0xc0, 3 << 6)?;
+    modify(io, 0x8344, 0, 0x2_0000)
 }
 
 pub(super) fn opmode(io: &impl Port) -> Result<(), Error> {
