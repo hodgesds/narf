@@ -980,14 +980,17 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// Train Linux's computed link (a 6 bpc pipe, or a panel with a rate
-    /// table): one attempt at `link`, `DP_LINK_RATE_SET` when the panel
-    /// publishes a table. A failed attempt on a panel not already at its
-    /// maximum parameters retries once with them, as
-    /// `intel_dp_get_link_train_fallback_values` sets `use_max_params` for
-    /// eDP and the modeset retry recomputes the link: the PHY PLL, its TX
-    /// lanes, the port width and `TRANS_DDI_FUNC_CTL` move to the new link
-    /// (`pll_khz` / `pll_lanes` follow). A retry that would change the pipe
-    /// bpp, or a second failure, fails the modeset.
+    /// table), with `DP_LINK_RATE_SET` when the panel publishes a table,
+    /// and on failure walk Linux's fallback (Linux b90c984d
+    /// `intel_dp_link_training.c::intel_dp_get_link_train_fallback_values`,
+    /// each step the modeset retry's recomputed link): first eDP's
+    /// `use_max_params`, then `reduce_link_params_in_rate_lane_order` from
+    /// the failed link while the panel's mode at 18 bpp still fits, else
+    /// one more attempt at the same parameters. The PHY PLL, its TX lanes,
+    /// the port width and `TRANS_DDI_FUNC_CTL` move to each new link
+    /// (`pll_khz` / `pll_lanes` follow). A step that would change the pipe
+    /// bpp or need DSC refuses (`Dsc(TrainingFallback)`); a ladder with
+    /// nothing left refuses `LinkTrainingExhausted`.
     fn train_planned_link(
         &mut self,
         mode: &Mode,
@@ -997,43 +1000,73 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         pll_khz: &mut u32,
         pll_lanes: &mut u8,
     ) -> Result<(u32, u8, LaneLevels), ModesetError> {
-        let first = self.train_select(rate_select(link.link_rate, select)?, link.lanes);
-        let err = match first {
-            Ok(levels) => return Ok((link.link_rate, link.lanes, levels)),
-            Err(e @ (ModesetError::LinkTrainingCr | ModesetError::LinkTrainingEq))
-                if !caps.limits(0).use_max =>
-            {
-                e
+        use crate::intel_gpu_xelpg_dsc::{installed_edp_vbt, EdpFallback, Fallback};
+        let common = caps.limits(installed_edp_vbt().max_link_rate());
+        let mut use_max_params = false;
+        let mut cap = None;
+        let mut same_retried = false;
+        let (mut current, mut current_select) = (link, select);
+        for _ in 0..LINK_FALLBACK_ATTEMPTS {
+            match self.train_select(
+                rate_select(current.link_rate, current_select)?,
+                current.lanes,
+            ) {
+                Ok(levels) => return Ok((current.link_rate, current.lanes, levels)),
+                Err(ModesetError::LinkTrainingCr | ModesetError::LinkTrainingEq) => {}
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
-        };
-        let EdpPlan::Link {
-            link: retry,
-            select: retry_select,
-            ..
-        } = decide_plan(caps, mode, true)?
-        else {
-            return Err(err);
-        };
-        if retry.pipe_bpp != link.pipe_bpp
-            || (retry.link_rate, retry.lanes) == (link.link_rate, link.lanes)
-        {
-            return Err(err);
-        }
-        reprogram_pll_khz(self.mmio, self.port, retry.link_rate).map_err(map_cx0_err)?;
-        *pll_khz = retry.link_rate;
-        if retry.lanes != link.lanes {
-            crate::intel_gpu_xelpg::reprogram_phy_lanes(self.mmio, self.port, retry.lanes, false)
+            match common.fallback(
+                current.link_rate,
+                current.lanes,
+                Some(EdpFallback {
+                    use_max_params,
+                    fixed_mode: *mode,
+                }),
+            ) {
+                Fallback::MaxParams => use_max_params = true,
+                Fallback::Reduce {
+                    max_rate,
+                    max_lanes,
+                } => cap = Some((max_rate, max_lanes)),
+                Fallback::Same if !same_retried => same_retried = true,
+                Fallback::Same | Fallback::Exhausted => {
+                    return Err(ModesetError::LinkTrainingExhausted)
+                }
+            }
+            let EdpPlan::Link {
+                link: retry,
+                select: retry_select,
+                ..
+            } = decide_plan_capped(caps, mode, use_max_params, cap)?
+            else {
+                return Err(ModesetError::Dsc(DscRefusal::TrainingFallback));
+            };
+            if retry.pipe_bpp != link.pipe_bpp {
+                return Err(ModesetError::Dsc(DscRefusal::TrainingFallback));
+            }
+            if retry.link_rate != *pll_khz {
+                reprogram_pll_khz(self.mmio, self.port, retry.link_rate).map_err(map_cx0_err)?;
+                *pll_khz = retry.link_rate;
+            }
+            if retry.lanes != *pll_lanes {
+                crate::intel_gpu_xelpg::reprogram_phy_lanes(
+                    self.mmio,
+                    self.port,
+                    retry.lanes,
+                    false,
+                )
                 .map_err(map_cx0_err)?;
-            program_port_buf_ctl(self.mmio, self.port, retry.lanes);
-            self.program_trans_ddi_func_ctl(retry.lanes, retry.pipe_bpp);
-            *pll_lanes = retry.lanes;
+                program_port_buf_ctl(self.mmio, self.port, retry.lanes);
+                self.program_trans_ddi_func_ctl(retry.lanes, retry.pipe_bpp);
+                *pll_lanes = retry.lanes;
+            }
+            let phy = Cx0Phy::new(self.mmio, self.port);
+            set_signal_levels_khz(&phy, retry.link_rate, retry.lanes, &[(0, 0); 4])
+                .map_err(map_cx0_err)?;
+            current = retry;
+            current_select = retry_select;
         }
-        let phy = Cx0Phy::new(self.mmio, self.port);
-        set_signal_levels_khz(&phy, retry.link_rate, retry.lanes, &[(0, 0); 4])
-            .map_err(map_cx0_err)?;
-        let levels = self.train_select(rate_select(retry.link_rate, retry_select)?, retry.lanes)?;
-        Ok((retry.link_rate, retry.lanes, levels))
+        Err(ModesetError::LinkTrainingExhausted)
     }
 
     /// `bdw_set_pipe_misc` for Pipe A at `pipe_bpp`. The Linux-link path
@@ -1840,6 +1873,11 @@ enum EdpPlan {
     Dsc { plan: DscPlan, select: Option<u8> },
 }
 
+/// The bound on one modeset's training attempts: the eDP retry at maximum
+/// parameters, one same-parameter retry, and a step for every lower rate
+/// and lane count the ladder can reach.
+const LINK_FALLBACK_ATTEMPTS: usize = 24;
+
 /// `intel_dp_compute_link_config` for the panel, with `use_max_params`
 /// forced by `use_max` (the retry after a failed training), mapped onto
 /// the modeset's sequences.
@@ -1848,13 +1886,27 @@ fn decide_plan(
     mode: &Mode,
     use_max: bool,
 ) -> Result<EdpPlan, ModesetError> {
-    use crate::intel_gpu_xelpg_dsc::{decide_edp, installed_edp_vbt, LinkDecision, PIPE_BPP};
-    let decision = decide_edp(
+    decide_plan_capped(caps, mode, use_max, None)
+}
+
+/// [`decide_plan`] under a training fallback's `link.max_rate` and
+/// `link.max_lane_count`.
+fn decide_plan_capped(
+    caps: &crate::intel_gpu_xelpg_dsc::EdpCaps,
+    mode: &Mode,
+    use_max: bool,
+    cap: Option<(u32, u8)>,
+) -> Result<EdpPlan, ModesetError> {
+    use crate::intel_gpu_xelpg_dsc::{
+        decide_edp_capped, installed_edp_vbt, LinkDecision, PIPE_BPP,
+    };
+    let decision = decide_edp_capped(
         caps,
         &installed_edp_vbt(),
         panel_display_bpc(),
         mode,
         use_max,
+        cap,
     )
     .map_err(ModesetError::Dsc)?;
     let select = |rate: u32| -> Result<Option<u8>, ModesetError> {
@@ -2012,6 +2064,8 @@ pub mod tests {
         /// When set, `PP_STATUS` follows `PP_CONTROL`: on-idle while the
         /// power target or VDD force is set, off-idle otherwise.
         pub pps: Cell<bool>,
+        /// The sink refuses clock recovery at every link.
+        pub cr_fails_all: Cell<bool>,
     }
 
     const PIPECONF_OFF: u64 = 0x7_0008;
@@ -2049,6 +2103,7 @@ pub mod tests {
                 refuse_color: Cell::new(u64::MAX),
                 dpcd_writes: RefCell::new(Vec::new()),
                 pps: Cell::new(false),
+                cr_fails_all: Cell::new(false),
             }
         }
 
@@ -2095,7 +2150,8 @@ pub mod tests {
             match addr {
                 0x202 | 0x203 => {
                     let bw = self.dpcd.borrow()[0x100];
-                    if (self.hbr2_cr_fails.get() && bw == 0x14)
+                    if self.cr_fails_all.get()
+                        || (self.hbr2_cr_fails.get() && bw == 0x14)
                         || (self.cr_fails_at.get() != 0 && bw == self.cr_fails_at.get())
                     {
                         0x00
@@ -2814,19 +2870,112 @@ pub mod tests {
         {
             return TestResult::Fail("one attempt each, then 6 bpc M/N on HBR2 x4");
         }
-        // A failure at the maximum parameters fails the modeset.
+        // A failure at the maximum parameters walks Linux's fallback: the
+        // next lower common rate at the same lanes (HBR x4) lights.
         let fake = MtlFake::new(XeLpgPort::A);
         edp_panel(&fake, 0x14, 4, 0x03);
         fake.cr_fails_at.set(0x06);
         fake.hbr2_cr_fails.set(true);
-        if run_with(&fake, &mode, EdpVbt::Missing, 6) != Err(ModesetError::LinkTrainingCr) {
-            return TestResult::Fail("a failed retry must fail the modeset");
+        if run_with(&fake, &mode, EdpVbt::Missing, 6) != Ok(mode)
+            || fake.writes_to(0x6_4030) != [162_000, 540_000, 270_000]
+        {
+            return TestResult::Fail("the fallback after the max-params retry must reach HBR x4");
+        }
+        // A sink that trains nowhere exhausts the ladder: typed refusal.
+        let fake = MtlFake::new(XeLpgPort::A);
+        edp_panel(&fake, 0x14, 4, 0x03);
+        fake.cr_fails_all.set(true);
+        if run_with(&fake, &mode, EdpVbt::Missing, 6) != Err(ModesetError::LinkTrainingExhausted) {
+            return TestResult::Fail("an exhausted ladder must refuse LinkTrainingExhausted");
+        }
+        let bw: Vec<u8> = fake
+            .dpcd_writes
+            .borrow()
+            .iter()
+            .filter(|&&(a, _, _)| a == 0x100)
+            .map(|&(_, v, _)| v)
+            .collect();
+        let lanes: Vec<u8> = fake
+            .dpcd_writes
+            .borrow()
+            .iter()
+            .filter(|&&(a, _, _)| a == 0x101)
+            .map(|&(_, v, _)| v & 0x1f)
+            .collect();
+        if bw != [0x06, 0x14, 0x0a, 0x06, 0x14, 0x0a, 0x06, 0x14, 0x0a, 0x06]
+            || lanes != [1, 4, 4, 4, 2, 2, 2, 1, 1, 1]
+        {
+            return TestResult::Fail("the ladder must step rate, then lanes, as Linux does");
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_edp_planned_link_retries_at_max_params
+    );
+
+    /// `intel_dp_get_link_train_fallback_values` as a pure decision: eDP
+    /// first takes `use_max_params`; then the rate steps down the common
+    /// rates at the same lanes; at the lowest rate the lanes halve with the
+    /// rate back at the maximum; one lane at the lowest rate is exhausted;
+    /// an eDP mode whose 18 bpp stream would not fit keeps its parameters.
+    fn smoke_link_fallback_ladder_follows_rate_lane_order() -> TestResult {
+        use crate::intel_gpu_xelpg_dsc::{EdpFallback, Fallback, LinkLimits};
+        let limits = LinkLimits::standard(540_000, 4);
+        let small = Mode::VESA_1024X768_60;
+        let edp = |use_max_params, fixed_mode| {
+            Some(EdpFallback {
+                use_max_params,
+                fixed_mode,
+            })
+        };
+        let cases = [
+            (162_000, 1, edp(false, small), Fallback::MaxParams),
+            (
+                540_000,
+                4,
+                None,
+                Fallback::Reduce {
+                    max_rate: 270_000,
+                    max_lanes: 4,
+                },
+            ),
+            (
+                162_000,
+                4,
+                edp(true, small),
+                Fallback::Reduce {
+                    max_rate: 540_000,
+                    max_lanes: 2,
+                },
+            ),
+            (162_000, 1, None, Fallback::Exhausted),
+        ];
+        for (rate, lanes, edp, want) in cases {
+            if limits.fallback(rate, lanes, edp) != want {
+                return TestResult::Fail("a fallback step left Linux's rate-lane order");
+            }
+        }
+        // A 4K panel's 18 bpp stream does not fit RBR x4: same parameters.
+        let big = Mode {
+            pixel_clock_khz: 533_250,
+            h_active: 3840,
+            v_active: 2160,
+            ..small
+        };
+        if limits.fallback(270_000, 4, edp(true, big)) != Fallback::Same {
+            return TestResult::Fail("an eDP mode that no longer fits must keep its link");
+        }
+        // The capped limits keep the common rates up to the new maximum.
+        let capped = limits.capped(270_000, 2);
+        if capped.max_rate() != 270_000 || capped.max_lanes != 2 {
+            return TestResult::Fail("the reduced limits must cap rate and lanes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_link_fallback_ladder_follows_rate_lane_order
     );
 
     fn smoke_mtl_edp_eight_bpc_keeps_write_stream_and_clears_stale_six_bpc() -> TestResult {

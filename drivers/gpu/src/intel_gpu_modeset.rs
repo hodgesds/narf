@@ -293,6 +293,9 @@ pub enum ModesetError {
     /// The eDP panel power sequencer never reached the requested on or off
     /// state (`intel_pps.c::wait_panel_on` / `wait_panel_off`).
     PanelPowerTimeout,
+    /// Link training failed at every configuration Linux's fallback
+    /// (`intel_dp_get_link_train_fallback_values`) reaches.
+    LinkTrainingExhausted,
     /// MTL source enable, primary image or a fresh common frame was not observed.
     /// This is not evidence of complete sink training or visible pixels.
     PipelineEnableUnavailable,

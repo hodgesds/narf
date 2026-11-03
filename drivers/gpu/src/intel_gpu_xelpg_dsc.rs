@@ -424,6 +424,102 @@ impl LinkLimits {
     }
 }
 
+/// What `intel_dp_get_link_train_fallback_values` (Linux b90c984d
+/// `intel_dp_link_training.c`) decides after a training failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fallback {
+    /// eDP, the first failure: retry with `use_max_params`.
+    MaxParams,
+    /// Retry with `link.max_rate` / `link.max_lane_count` lowered to these
+    /// (`reduce_link_params_in_rate_lane_order`).
+    Reduce {
+        /// The new `link.max_rate`.
+        max_rate: u32,
+        /// The new `link.max_lane_count`.
+        max_lanes: u8,
+    },
+    /// eDP whose fixed mode at 18 bpp would not fit the reduced link
+    /// (`intel_dp_can_link_train_fallback_for_edp`): the same parameters.
+    Same,
+    /// Nothing lower exists (`reduce_link_params` fails): the link
+    /// cannot train.
+    Exhausted,
+}
+
+/// The eDP facts the fallback reads: whether `use_max_params` is already
+/// set, and the panel's fixed mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdpFallback {
+    /// `intel_dp->use_max_params`.
+    pub use_max_params: bool,
+    /// `intel_panel_preferred_fixed_mode`.
+    pub fixed_mode: Mode,
+}
+
+impl LinkLimits {
+    /// `intel_dp_get_link_train_fallback_values` after a failed training at
+    /// `rate` x `lanes`, these limits holding `intel_dp->common_rates`
+    /// (unreduced) and the sink's lane maximum. eDP first retries at its
+    /// maximum parameters; then the SST order (`reduce_link_rate`, else
+    /// `reduce_lane_count` with the rate back at the highest common rate);
+    /// an eDP panel whose fixed mode at 18 bpp no longer fits the reduced
+    /// link keeps its parameters.
+    pub fn fallback(&self, rate: u32, lanes: u8, edp: Option<EdpFallback>) -> Fallback {
+        if edp.is_some_and(|e| !e.use_max_params) {
+            return Fallback::MaxParams;
+        }
+        let common = || self.rates.iter().copied().take_while(|&r| r != 0);
+        // reduce_link_rate: the next lower common rate (UHBR is not used).
+        let lower = common()
+            .position(|r| r == rate)
+            .filter(|&i| i > 0)
+            .and_then(|i| common().nth(i - 1));
+        let (max_rate, max_lanes) = match lower {
+            Some(lower) => (lower, lanes),
+            // reduce_lane_count, at intel_dp_max_common_rate.
+            None if lanes > 1 => (self.max_rate(), lanes >> 1),
+            None => return Fallback::Exhausted,
+        };
+        if let Some(edp) = edp {
+            let mode = edp.fixed_mode;
+            let need = link_required(
+                u32::from(max_lanes),
+                mode.pixel_clock_khz,
+                u32::from(mode.h_active),
+                MIN_PIPE_BPP * 16,
+                false,
+            );
+            if need > max_link_data_rate(max_rate, u32::from(max_lanes)) {
+                return Fallback::Same;
+            }
+        }
+        Fallback::Reduce {
+            max_rate,
+            max_lanes,
+        }
+    }
+
+    /// These limits under a fallback's `link.max_rate` /
+    /// `link.max_lane_count`.
+    pub fn capped(&self, max_rate: u32, max_lanes: u8) -> Self {
+        let mut rates = [0u32; 9];
+        for (dst, r) in rates.iter_mut().zip(
+            self.rates
+                .iter()
+                .copied()
+                .take_while(|&r| r != 0)
+                .filter(|&r| r <= max_rate),
+        ) {
+            *dst = r;
+        }
+        Self {
+            rates,
+            max_lanes: lane_floor(max_lanes.min(self.max_lanes)),
+            use_max: self.use_max,
+        }
+    }
+}
+
 /// The largest of 4, 2, 1 not above `lanes` (1 for 0).
 fn lane_floor(lanes: u8) -> u8 {
     match lanes {
@@ -884,8 +980,24 @@ pub fn decide_edp(
     mode: &Mode,
     use_max: bool,
 ) -> Result<LinkDecision, DscRefusal> {
+    decide_edp_capped(caps, vbt, display_bpc, mode, use_max, None)
+}
+
+/// [`decide_edp`] under a link-training fallback's `link.max_rate` and
+/// `link.max_lane_count` (`cap`), as the modeset retry recomputes it.
+pub fn decide_edp_capped(
+    caps: &EdpCaps,
+    vbt: &EdpVbt,
+    display_bpc: u8,
+    mode: &Mode,
+    use_max: bool,
+    cap: Option<(u32, u8)>,
+) -> Result<LinkDecision, DscRefusal> {
     let max_bpp = max_pipe_bpp(display_bpc, vbt.edp_bpp());
     let mut limits = caps.limits(vbt.max_link_rate());
+    if let Some((max_rate, max_lanes)) = cap {
+        limits = limits.capped(max_rate, max_lanes);
+    }
     limits.use_max |= use_max;
     if let Some(link) = uncompressed_link(&limits, mode, max_bpp) {
         return Ok(LinkDecision::Uncompressed(link));
