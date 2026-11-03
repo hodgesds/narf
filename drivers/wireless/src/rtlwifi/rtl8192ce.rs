@@ -46,6 +46,10 @@
 //!   payloads, RPWM and the 92C interrupt profile.
 //! - [`init`] — the `rtl92ce_hw_init` tail after the firmware download
 //!   (run by `Prepared::configure_rtl8192ce`).
+//! - [`ps`] — media status, AID, beacon control, `rtl92c_dm_rf_saving`,
+//!   false-alarm statistics and `_rtl92ce_poweroff_adapter`, composed by the
+//!   linked-ring packet owner branch (`rtl8192ce/packet_owner.rs`, mounted
+//!   as `prepare::packet::ce92`).
 
 #![allow(dead_code)]
 
@@ -59,6 +63,7 @@ pub mod llt;
 pub mod mac;
 pub mod phy;
 pub mod power;
+pub mod ps;
 pub mod tables;
 pub mod trx;
 pub mod txpower;
@@ -66,6 +71,8 @@ pub mod version;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod phy_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod ps_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
 

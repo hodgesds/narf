@@ -2649,9 +2649,64 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   `rtl92ce_interrupt_recognized` (HISR `0x124` under mask, W1C). Probe's
   `pci::bring_up` now masks through `irq::disable_interrupts_for(did)`
   (`irq::imr_pair`: `0x120/0x128` for the CE IDs, `0xb0/0xb8` otherwise).
-  Not composed yet: the LPS enter/leave sequence (with 88C
-  `rtl92c_dm_rf_saving`), the reserved-page download, the DM watchdog and
-  the `_rtl92ce_poweroff_adapter` card-disable proof.
+- `packet owner` — `rtl8192ce/packet_owner.rs`, mounted as
+  `prepare::packet::ce92` and dispatched from `packet.rs` for
+  `Chip::Rtl8192ce` (start, submit, receive, IRQ enable/disable/recognize,
+  leisure enter/leave, quiesce; `stop_packets` masks `0x120`/`0x128` and
+  issues no `0x301` stop on this chip). Start: bus mastering, then the
+  deferred `_rtl92ce_init_mac` `REG_CR = 0x2ff` (word) and `TXPAUSE = 0`,
+  with both 92C IMRs read back zero; requires the channel recorded by
+  `configure_rtl8192ce_channel`. TX: one outstanding forced-rate legacy
+  frame, [`trx::fill`] descriptor (`RATR_INX_WIRELESS_MC`, macid 0 under
+  `dm.useramask`), OWN written last, `REG_PCIE_CTRL_REG` `BIT(hw_queue)`
+  doorbell; the shared host receipt (`delivery`) applies unchanged. RX:
+  in-ring 32-byte descriptor (`trx::RxStatus`, payload at `drvinfo +
+  shift`, `rx_arm` re-post with OWN last); HT/A-MPDU frames are consumed
+  and dropped, PHY status is not decoded. IRQ: `rtl92ce_enable_interrupt`
+  / `_disable_` / `_interrupt_recognized` (HISRE untouched, `intb` 0).
+  Leisure: `HW_VAR_FW_LPS_ACTION` — enter: `fw_current_inpsmode`, on 88C
+  `rtl92c_dm_rf_saving(hw, true)` (the `HW_VAR_H2C_FW_PWRMODE` rule for
+  `!IS_92C_SERIAL`), `SETPWRMODE(FW_PS_DTIM_MODE)` (`reg_fwctrl_lps = 3`),
+  RPWM `0x02`; leave: RPWM `0x0c`, `SETPWRMODE(FW_PS_ACTIVE_MODE)`. Join
+  (`ce92_join_report`): `_rtl92ce_set_media_status(STATION, linked)`, then
+  `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)` exactly as `rtl92ce_set_
+  hw_reg` (`HW_VAR_AID`, `REG_CR + 1` BIT0, BCN_CTRL `(0,BIT3)`/`(BIT4,0)`,
+  `0x422` BIT6 clear, `rtl92c_set_fw_rsvdpagepkt` — the 768-byte
+  `reserved_page_packet` (byte-identical to 88EE's, so
+  `station_control::reserved_pages` is reused) through beacon descriptor 0
+  with `rtl92ce_tx_fill_cmddesc` and the `BIT(4)` doorbell, then
+  `H2C_RSVDPAGE {4, 2, 3}` — restores, `H2C_JOINBSSRPT(1)`). The 92C has no
+  BCN_VALID receipt (Linux sends the location right after the doorbell);
+  the body is owned by the claim until quiescence. Leave
+  (`ce92_leave_report`): LPS leave, `JOINBSSRPT(0)`, `MSR_NOLINK`, AID 0.
+  RA (`ce92_install_rate_mask`): `rtl92ce_update_hal_rate_mask` refused
+  unless its rate bits are a non-empty subset of the caller's admitted
+  set. DM (`ce92_dm_watchdog`, only out of LPS): `rtl92c_dm_false_alarm_
+  counter_statistics` and `rtl92c_dm_dynamic_bb_powersaving` (88C
+  `rtl92c_dm_rf_saving(false)` on `undec_sm_pwdb`, 30/25 hysteresis; 92C
+  nothing). Linux's `rtl92c_dm_watchdog` has
+  `rtl92c_dm_refresh_rate_adaptive_mask` commented out, so the RA mask is
+  never refreshed by the watchdog. Not composed: PWDB monitor, DIG,
+  dynamic TX power, TX-power tracking, EDCA turbo (registers keep their
+  `rtl92ce_hw_init` values). Card disable (`ce92_quiesce`): the 92C
+  sources define no TX-buffer-empty / RXDMA-idle status (no 88EE
+  `0x5f8`/`0x286` poll). Proof composed here, after `stop_packets`
+  (TXPAUSE `0xff`, CR DMA enables clear, BME off): every non-beacon TX
+  descriptor OWN clear (`rtl92ce_is_tx_desc_closed`), then
+  `rtl92ce_card_disable` (`_rtl92ce_set_media_status(UNSPECIFIED)`,
+  `_rtl92ce_poweroff_adapter` non-BT without `enable_aspm`, incl.
+  `REG_SYS_FUNC_EN + 1 = 0x51` dropping `FEN_DCORE`), then a non-posted
+  read of `REG_SYS_FUNC_EN + 1` returning `0x51` (PCIe ordering keeps any
+  earlier device write ahead of it). Any disagreement retains every
+  mapping. Chip pieces: `rtl8192ce/ps.rs`. Tests (`rtl8192ce/ps_tests.rs`,
+  written, unexecuted): `smoke_rtl8192ce_media_status_and_aid`,
+  `smoke_rtl8192ce_rf_saving_hysteresis`,
+  `smoke_rtl8192ce_false_alarm_statistics`,
+  `smoke_rtl8192ce_poweroff_adapter`. Owner-level model tests of the
+  `ce92` paths are not written yet.
+  Not reachable yet: nothing advances the owner to MacConfigured (no
+  signed envelope / station grant / probe admission), and the station
+  path's peer prepare/associate (`station_control`) is 88EE-only.
   Tests (`rtl8192ce/phy_tests.rs`, written, unexecuted):
   `smoke_rtl8192ce_rf_serial_read_write_both_paths`,
   `smoke_rtl8192ce_h2c_rate_mask_and_irq_profile`,

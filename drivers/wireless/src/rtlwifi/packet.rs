@@ -107,6 +107,8 @@ pub(super) struct State<M: Memory> {
     pub(super) ae: ae::State,
     /// RTL8192EE buffer-descriptor RX pointers (`rtl8192ee/packet_owner.rs`).
     pub(super) ee92: ee92::State,
+    /// RTL8192CE / RTL8188CE mailbox and DM state (`rtl8192ce/packet_owner.rs`).
+    pub(super) ce92: ce92::State,
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
     /// rate fallback is only enabled while the firmware owns this mask
     /// and the caller holds a current `NEFB` grant.
@@ -137,6 +139,7 @@ impl<M: Memory> State<M> {
             leisure: false,
             ae: ae::State::new(),
             ee92: ee92::State::new(),
+            ce92: ce92::State::new(),
             rate_mask: None,
             retired: Vec::new(),
         }
@@ -282,12 +285,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             && !self.packet.mailbox.failed
             && !self.packet.ae.mailbox.failed
             && !self.packet.ee92.mailbox.failed
+            && !self.packet.ce92.mailbox.failed
     }
     fn rtl8821ae(&self) -> bool {
         self.chip == super::Chip::Rtl8821ae
     }
     fn rtl8192ee(&self) -> bool {
         self.chip == super::Chip::Rtl8192ee
+    }
+    fn rtl8192ce(&self) -> bool {
+        self.chip == super::Chip::Rtl8192ce
     }
     pub(crate) async fn awake_station(&mut self) -> Result<(), Error> {
         if self.rtl8821ae() {
@@ -614,6 +621,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ee() {
             return self.ee92_enter_leisure().await;
         }
+        if self.rtl8192ce() {
+            return self.ce92_enter_leisure().await;
+        }
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
@@ -631,6 +641,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ee() {
             return self.ee92_leave_leisure().await;
+        }
+        if self.rtl8192ce() {
+            return self.ce92_leave_leisure().await;
         }
         if self.phase != Phase::Running || !self.packet.leisure {
             return Err(Error::State);
@@ -784,6 +797,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ee() {
             return self.ee92_quiesce().await;
         }
+        if self.rtl8192ce() {
+            return self.ce92_quiesce().await;
+        }
         if self.phase != Phase::Stopped || !self.published {
             return Err(Error::State);
         }
@@ -832,6 +848,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ee() {
             return self.ee92_start_packets();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_start_packets();
         }
         if self.phase != Phase::MacConfigured
             || self.packet.local.is_none()
@@ -882,6 +901,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ee() {
             return self.ee92_enable_interrupts();
         }
+        if self.rtl8192ce() {
+            return self.ce92_enable_interrupts();
+        }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);
         }
@@ -904,6 +926,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl88ee_disable_interrupt` (HIMR/HIMRE = IMR_DISABLED). Used
     /// when the bound vector is withdrawn while the owner keeps polling.
     pub(crate) fn disable_interrupts(&mut self) -> Result<(), Error> {
+        if self.rtl8192ce() {
+            return self.ce92_disable_interrupts();
+        }
         self.packet.interrupts = false;
         self.io.write32(0xb0, 0)?;
         self.io.write32(0xb8, 0)?;
@@ -926,6 +951,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ee() {
             return self.ee92_recognize_interrupts();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_recognize_interrupts();
         }
         if self.phase != Phase::Running || !self.packet.interrupts {
             return Err(Error::State);
@@ -1015,6 +1043,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 return Err(Error::Packet);
             }
             return self.ee92_submit(frame, rate);
+        }
+        if self.rtl8192ce() {
+            if aggregate.is_some() || adaptive || short_gi {
+                return Err(Error::Packet);
+            }
+            return self.ce92_submit(frame, rate);
         }
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
@@ -1235,6 +1269,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ee() {
             return self.ee92_receive_step();
         }
+        if self.rtl8192ce() {
+            return self.ce92_receive_step();
+        }
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -1388,11 +1425,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.rate_mask = None;
         self.packet.vht_highest = None;
         let mut result = Ok(());
+        // RTL8192CE: 92C IMRs and no HCI DMA-stop byte (0x301 is part of
+        // its TX polling doorbell).
+        let ce = self.rtl8192ce();
+        let (himr, himre) = if ce { (0x120, 0x128) } else { (0xb0, 0xb8) };
         for operation in [
-            self.io.write32(0xb0, 0).map_err(Error::from),
-            self.io.write32(0xb8, 0).map_err(Error::from),
+            self.io.write32(himr, 0).map_err(Error::from),
+            self.io.write32(himre, 0).map_err(Error::from),
             self.io.write8(0x522, 0xff).map_err(Error::from),
-            self.io.write8(0x301, 0xff).map_err(Error::from),
+            if ce {
+                Ok(())
+            } else {
+                self.io.write8(0x301, 0xff).map_err(Error::from)
+            },
         ] {
             if result.is_ok() {
                 result = operation;
@@ -1402,9 +1447,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let cr = self.io.read8(0x100)?;
             self.io.write8(0x100, cr & !0xcf)?;
             if self.io.read8(0x100)? & 0xcf != 0
-                || self.io.read8(0x301)? != 0xff
-                || self.io.read32(0xb0)? != 0
-                || self.io.read32(0xb8)? != 0
+                || (!ce && self.io.read8(0x301)? != 0xff)
+                || self.io.read32(himr)? != 0
+                || self.io.read32(himre)? != 0
             {
                 return Err(Error::Readback);
             }
@@ -1428,6 +1473,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 
 #[path = "packet_ae.rs"]
 pub(crate) mod ae;
+#[path = "rtl8192ce/packet_owner.rs"]
+pub(crate) mod ce92;
 #[path = "rtl8192ee/packet_owner.rs"]
 pub(crate) mod ee92;
 

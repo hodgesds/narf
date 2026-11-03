@@ -64,6 +64,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         let (version, power, groups) = (radio.version, radio.power, radio.phy.pg.pwrgroup_cnt);
         channel::configure(&self.io, version, &power, groups, &op, &mut radio.chnlval).await?;
         self.rtl8192ce = Some(state);
+        self.packet.ce92.channel = Some(op.primary);
         self.phase = Phase::ChannelConfigured;
         Ok(())
     }
