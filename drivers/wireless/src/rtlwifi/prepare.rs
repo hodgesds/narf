@@ -86,21 +86,27 @@ const RX_BASE: u16 = super::rtl8188ee::REG_RX_DESA;
 pub enum Chip {
     Rtl8188ee,
     Rtl8821ae,
+    /// New-TRX-flow buffer-descriptor profile (`rtl8192ee/packet_owner.rs`):
+    /// no linked next pointer; built only by `Prepared::allocate_rtl8192ee`.
+    Rtl8192ee,
 }
 impl Chip {
     pub const fn from_device(did: u16) -> Option<Self> {
         match did {
             super::regs::RTL_DEV_8188EE => Some(Self::Rtl8188ee),
             super::regs::RTL_DEV_8821AE => Some(Self::Rtl8821ae),
+            super::regs::RTL_DEV_8192EE => Some(Self::Rtl8192ee),
             _ => None,
         }
     }
     /// Byte offset of `set_tx_desc_next_desc_address`: 88EE dword 10,
     /// 8821AE dword 12 (`rtl8821ae/trx.h`; its dword 10 is the buffer).
-    pub const fn next_desc_offset(self) -> usize {
+    /// `None` for the RTL8192EE buffer-descriptor rings, which have none.
+    pub const fn next_desc_offset(self) -> Option<usize> {
         match self {
-            Self::Rtl8188ee => 40,
-            Self::Rtl8821ae => 48,
+            Self::Rtl8188ee => Some(40),
+            Self::Rtl8821ae => Some(48),
+            Self::Rtl8192ee => None,
         }
     }
 }
@@ -177,6 +183,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         depth: usize,
         mut allocate: impl FnMut(usize) -> Result<M, Error>,
     ) -> Result<Self, Error> {
+        let Some(next_offset) = chip.next_desc_offset() else {
+            return Err(Error::Geometry);
+        };
         if !(4..=256).contains(&depth) || !depth.is_power_of_two() {
             return Err(Error::Geometry);
         }
@@ -209,7 +218,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 // Linux txdesc.next_desc_address (88EE DW10, 8821AE DW12);
                 // never alias queues or use another family's TXBD convention.
                 let next = base + (((slot + 1) % depth) * TX_BYTES) as u32;
-                ring.write32(slot * TX_BYTES + chip.next_desc_offset(), next)?;
+                ring.write32(slot * TX_BYTES + next_offset, next)?;
             }
             ring.sync();
             tx.push(ring);
@@ -231,7 +240,11 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             buffers.push(buffer);
         }
         receive.sync();
-        Ok(Self {
+        Ok(Self::assemble(chip, io, tx, receive, buffers, depth))
+    }
+    /// The unpublished owner over already built and validated rings.
+    fn assemble(chip: Chip, io: I, tx: Vec<M>, receive: M, buffers: Vec<M>, depth: usize) -> Self {
+        Self {
             io,
             chip,
             tx,
@@ -247,7 +260,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
-        })
+        }
     }
     pub fn phase(&self) -> Phase {
         self.phase
@@ -468,6 +481,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         result
     }
     async fn prepare_inner(&mut self) -> Result<(), Error> {
+        if self.chip == Chip::Rtl8192ee {
+            return self.ee92_prepare().await;
+        }
         // Linux poweroff stops PCIe DMA through this byte. Preparing never
         // reopens it; BME remains off independently in the native adapter.
         self.io.write8(0x301, 0xff)?;

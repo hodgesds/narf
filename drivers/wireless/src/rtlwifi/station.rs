@@ -1108,6 +1108,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::Chip::Rtl8821ae => self
                 .rtl8821ae_power
                 .map(super::super::station_power::Grant::Rtl8821ae),
+            super::Chip::Rtl8192ee => None,
         }
     }
     /// 88EE calibration for the 88EE-only HT/protection/tracking/antenna/

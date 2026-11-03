@@ -1995,8 +1995,42 @@ diagnostic (`pci::bring_up` does not retain it).
   `|= 0xf7`, INT_MIG/MCUTST_1 0, `TXBD_NUM = 0x1200` (14 writes in Linux
   order, VOQ twice) and `RXBD_NUM = 0xa200`. Deliberate: the `REG_CR` `0xff`
   / `0x2ff` writes open the DMA engines and are left to the packet owner
-  (`mac::release_cr`); LLT always runs (fresh owner). Not yet composed into
-  `prepare::Prepared` (the linked-ring owner cannot describe BD rings).
+  (`mac::release_cr`); LLT always runs (fresh owner).
+- BD-ring owner profile — `prepare::Chip::Rtl8192ee` (`from_device(0x818b)`;
+  `allocate_for` refuses it: no linked next pointer) built by
+  `Prepared::allocate_rtl8192ee` (`rtl8192ee/packet_owner.rs`, mounted as
+  `prepare::packet::ee92`; native shape `prepare_native::allocate_rtl8192ee`).
+  Linux `_rtl_pci_init_trx_var`/`_rtl_pci_init_tx_ring`/`_rtl_pci_init_rx_ring`
+  counts: per TX queue a 64-byte BD ring and a 64-byte descriptor ring of
+  `TX_DESC_NUM_92E` 512 entries (beacon 2), 256-byte aligned, zeroed; 512
+  RX BDs `HW_DESC_RX_PREPARE`d over 9100-byte buffers; DMA32, overlap
+  checked before any BAR access. `prepare()` runs
+  `_rtl8192ee_check_pcie_dma_hang` (`REG_BACKDOOR_DBI_DATA + 3` BIT(2)
+  then 100 ms; a TX/RX hang bit refuses the board — the
+  `_rtl8192ee_reset_pcie_interface_dma` recovery is not implemented), keeps
+  host DMA stopped (`0x301 = 0xff`), CR DMA/MAC gates and HIMR/HIMRE
+  closed, marks the owner retained and runs `mac::init_mac` with the BD
+  bases, then reads back the eight bases and every `*_TXBD_NUM`/`RXBD_NUM`.
+  Packet owner (reachable only from `MacConfigured`, which this profile
+  cannot reach yet): `start_packets` validates the published rings, idle
+  BDs and zero `TXBD_IDX`/`RXQ_TXBD_IDX`, opens bus mastering, then issues
+  the deferred `REG_CR = 0x2ff` and `rtl92ee_hw_init`'s `REG_PCIE_CTRL_REG
+  = 0x8000`. TX (`rtl_pci_tx`): the device write point must equal
+  `cur_tx_wp` with `calc_fifo_space` room; descriptor (forced legacy
+  rate, fallback disabled, `RATR_INX_WIRELESS_MC` — no
+  `RTL_SPEC_NEW_RATEID`), BD naming it and the frame, then the
+  `REG_*_TXBD_IDX` doorbell (`rtl92ee_set_desc(HW_DESC_OWN)`). Completion
+  is `rtl92ee_is_tx_desc_closed` over the `[27:16]` read point with the BD
+  and stable descriptor words intact. RX (`_rtl_pci_rx_interrupt`): the
+  `rtl92ee_rx_desc_buff_remained_cnt` count (`start_rx` per owner), the
+  `rtl92ee_rx_check_dma_ok` reads, the 24-byte status, legacy non-A-MPDU
+  frames delivered, C2H/HT/error frames consumed and dropped, the BD
+  re-prepared and the advanced `next_rx_rp` written to `0x3b4`.
+  Deliberate: an RX BD never showing completion is not consumed; the BD is
+  re-prepared before the `0x3b4` acknowledgement; host/device pointer
+  disagreement fails the owner. IRQ unmask/recognition is refused (polled
+  until the 8192EE IRQ profile exists); the 88EE quiescence registers are
+  not accepted as an 8192EE retirement proof, so its DMA stays pinned.
 
 Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb`,
@@ -2009,7 +2043,10 @@ Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_firmware_header_geometry`,
 `smoke_rtl8192ee_firmware_paged_download_and_selfreset`,
 `smoke_rtl8192ee_retained_firmware_owner_profile`,
-`smoke_rtl8192ee_adapter_info_factory_rules`.
+`smoke_rtl8192ee_adapter_info_factory_rules`,
+`smoke_rtl8192ee_bd_rings_allocation_publish_and_retention`,
+`smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack`
+(`rtl8192ee/packet_owner_tests.rs`).
 
 ## 4. Invariants
 

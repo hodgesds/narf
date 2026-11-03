@@ -23,6 +23,9 @@
 //!   status and the read/write-pointer helpers (`trx.{c,h}`, `pci.c`).
 //! - [`mac`] — the `_rtl92ee_init_mac` remainder (auto LLT, BD ring bases
 //!   and counts) with the `REG_CR` release deferred to the packet owner.
+//! - `packet_owner.rs` — the BD-ring profile of the retained owner, mounted
+//!   as `prepare::packet::ee92` (allocation, publication, TXBD_IDX
+//!   doorbells, RXQ_TXBD_IDX consumption and the deferred DMA releases).
 
 #![allow(dead_code)]
 

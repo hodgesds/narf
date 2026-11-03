@@ -126,6 +126,9 @@ impl super::prepare::packet::Port for PacketIo<PciIo> {
 /// Dropping/failing this call never makes the claim available to another owner.
 pub(super) fn allocate(owner: Arc<Owner<PciIo>>, depth: usize) -> Result<NativePrepared, Error> {
     let chip = super::prepare::Chip::from_device(owner.device_id()).ok_or(Error::State)?;
+    if chip == super::prepare::Chip::Rtl8192ee {
+        return allocate_rtl8192ee(owner);
+    }
     let port = owner.claim_packet_io()?;
     let mut blocks = alloc::vec::Vec::new();
     // Collect the exact allocation shape before moving the unique port into
@@ -146,6 +149,23 @@ pub(super) fn allocate(owner: Arc<Owner<PciIo>>, depth: usize) -> Result<NativeP
     }
     let mut blocks = blocks.into_iter();
     Prepared::allocate_for(chip, port, depth, |_| blocks.next().ok_or(Error::Memory))
+}
+
+/// RTL8192EE two-ring shape (`prepare::packet::ee92::blocks`): Linux's
+/// fixed `TX_DESC_NUM_92E`/`RTL_PCI_MAX_RX_COUNT` counts, which `init_mac`
+/// programs, replace the caller's linked-ring depth.
+fn allocate_rtl8192ee(owner: Arc<Owner<PciIo>>) -> Result<NativePrepared, Error> {
+    use super::prepare::packet::ee92;
+    let port = owner.claim_packet_io()?;
+    let mut blocks = alloc::vec::Vec::new();
+    blocks
+        .try_reserve_exact(ee92::DEPTH + 15)
+        .map_err(|_| Error::Memory)?;
+    for bytes in ee92::blocks() {
+        blocks.push(Coherent(port.with_io(|io| io.allocate_dma(bytes))?));
+    }
+    let mut blocks = blocks.into_iter();
+    Prepared::allocate_rtl8192ee(port, |_| blocks.next().ok_or(Error::Memory))
 }
 
 pub(super) type Retained = narf_lib::mutex::Mutex<Option<NativePrepared>>;

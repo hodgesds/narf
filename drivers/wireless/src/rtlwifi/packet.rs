@@ -98,6 +98,8 @@ pub(super) struct State<M: Memory> {
     leisure: bool,
     /// RTL8821AE mailbox and receive/beacon-control cache (`packet_ae`).
     pub(super) ae: ae::State,
+    /// RTL8192EE buffer-descriptor RX pointers (`rtl8192ee/packet_owner.rs`).
+    pub(super) ee92: ee92::State,
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
     /// rate fallback is only enabled while the firmware owns this mask
     /// and the caller holds a current `NEFB` grant.
@@ -125,6 +127,7 @@ impl<M: Memory> State<M> {
             interrupts: false,
             leisure: false,
             ae: ae::State::new(),
+            ee92: ee92::State::new(),
             rate_mask: None,
             retired: Vec::new(),
         }
@@ -272,6 +275,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
     fn rtl8821ae(&self) -> bool {
         self.chip == super::Chip::Rtl8821ae
+    }
+    fn rtl8192ee(&self) -> bool {
+        self.chip == super::Chip::Rtl8192ee
     }
     pub(crate) async fn awake_station(&mut self) -> Result<(), Error> {
         if self.rtl8821ae() {
@@ -684,7 +690,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// timeout leaves every mapping retained. Success is the retirement
     /// proof that allows the published rings and buffers to be unmapped.
     pub(crate) async fn quiesce(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Stopped || !self.published {
+        // The 88EE idle registers below are not an RTL8192EE proof; its
+        // owner stays retained until a chip card-disable proof exists.
+        if self.phase != Phase::Stopped || !self.published || self.rtl8192ee() {
             return Err(Error::State);
         }
         if self.io.read8(0x522)? != 0xff || self.io.read8(0x301)? != 0xff {
@@ -729,6 +737,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     pub(crate) fn start_packets(&mut self) -> Result<(), Error> {
         if self.rtl8821ae() {
             return self.ae_start_packets();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_start_packets();
         }
         if self.phase != Phase::MacConfigured
             || self.packet.local.is_none()
@@ -776,6 +787,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8821ae() {
             return self.ae_enable_interrupts();
         }
+        if self.rtl8192ee() {
+            return Err(Error::State); // No 8192EE IRQ profile yet: polled.
+        }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);
         }
@@ -817,6 +831,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         use super::super::irq::*;
         if self.rtl8821ae() {
             return self.ae_recognize_interrupts();
+        }
+        if self.rtl8192ee() {
+            return Err(Error::State);
         }
         if self.phase != Phase::Running || !self.packet.interrupts {
             return Err(Error::State);
@@ -900,6 +917,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<u64, Error> {
         if self.rtl8821ae() {
             return self.ae_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
+        if self.rtl8192ee() {
+            if aggregate.is_some() || adaptive || short_gi {
+                return Err(Error::Packet);
+            }
+            return self.ee92_submit(frame, rate);
         }
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
@@ -1039,6 +1062,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8821ae() {
             return self.ae_delivery();
         }
+        if self.rtl8192ee() {
+            return self.ee92_delivery();
+        }
         let Some(pending) = self.packet.pending.as_ref() else {
             return Ok(None);
         };
@@ -1113,6 +1139,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     pub(crate) fn poll_receive_step(&mut self) -> Result<ReceiveStep, Error> {
         if self.rtl8821ae() {
             return self.ae_receive_step();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_receive_step();
         }
         if self.phase != Phase::Running {
             return Err(Error::State);
@@ -1306,6 +1335,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 
 #[path = "packet_ae.rs"]
 pub(crate) mod ae;
+#[path = "rtl8192ee/packet_owner.rs"]
+pub(crate) mod ee92;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "packet_tests.rs"]
