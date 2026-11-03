@@ -489,6 +489,10 @@ impl ChannelRxDck {
 /// RTL8852C `rtw8852c_rfk_init` (RCK/DACK/RX DCK).
 #[path = "rfk/c.rs"]
 pub(super) mod c;
+/// RTL8852C channel switch (`rtw8852c_set_channel_help`/`set_channel`) and
+/// the composed `rtw8852c_rfk_channel`.
+#[path = "rfk/c_channel.rs"]
+pub(super) mod c_channel;
 /// RTL8852C channel DPK (`rtw8852c_dpk`).
 #[path = "rfk/c_dpk.rs"]
 pub(super) mod c_dpk;

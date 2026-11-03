@@ -4,8 +4,11 @@
 //! `rtw8852c_set_channel_mac`, `rtw8852c_ctrl_sco_cck` and
 //! `rtw8852c_ctrl_ch` (`rtw8852c_set_gain_error`,
 //! `rtw8852c_set_gain_offset`, band select, SCO FC0, CCK pulse coefficients,
-//! `B_CH_IDX_SEG0`) and `rtw8852c_ctrl_bw`, each read back. No native
-//! caller and no admission.
+//! `B_CH_IDX_SEG0`) and `rtw8852c_ctrl_bw`, then the rest of
+//! `rtw8852c_set_channel_bb` (CCK/CCA/PD arbiter, spur CSI/NBI/notch, BTG
+//! BT RX, 5M mask, 160MHz P80 RU, CDD EVM, TXPW RSTB, MUIC,
+//! `rtw8852c_ctrl_tx_path_tmac`, `rtw8852c_bb_reset_all`), each read back.
+//! No native caller and no admission.
 use super::{
     factory_c,
     operating_channel_c::{Band, Profile, Width},
@@ -86,20 +89,24 @@ fn apply(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
     for &(address, mask, value) in fields {
         modify(io, address, mask, value)?;
     }
-    // Read back the final state of every field (later writes to the same
-    // field win, as on hardware).
-    for (i, &(address, mask, _)) in fields.iter().enumerate() {
-        if fields[i + 1..]
-            .iter()
-            .any(|f| f.0 == address && f.1 == mask)
-        {
-            continue;
+    verify(io, fields)
+}
+/// Read back the final state of every written bit: the fields are folded in
+/// order per address (later and overlapping writes win, as on hardware) and
+/// each address is read once.
+fn verify(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
+    let mut known: alloc::vec::Vec<(u32, u32, u32)> = alloc::vec::Vec::new();
+    for &(address, mask, value) in fields {
+        let bits = (value << mask.trailing_zeros()) & mask;
+        match known.iter_mut().find(|k| k.0 == address) {
+            Some(k) => {
+                k.1 |= mask;
+                k.2 = (k.2 & !mask) | bits;
+            }
+            None => known.push((address, mask, bits)),
         }
-        let expected = fields[..=i]
-            .iter()
-            .rev()
-            .find(|f| f.0 == address && f.1 == mask)
-            .map_or(0, |f| (f.2 << mask.trailing_zeros()) & mask);
+    }
+    for (address, mask, expected) in known {
         let value = io.read32(address)?;
         if value == u32::MAX || value & mask != expected {
             return Err(power::Error::Access);
@@ -248,6 +255,284 @@ fn ctrl_bw(profile: Profile, out: &mut alloc::vec::Vec<Field>) {
     let per20 = if width == Width::Mhz20 { 0xff } else { 0 };
     out.push((PHY + 0x0c9c, 0x000f_f000, per20));
     out.push((PHY + 0x0ca0, 0x000f_f000, 0));
+}
+
+/// rtw8852c.c `rtw8852c_spur_freq` (MHz; 0 = no spur).
+pub(super) fn spur_freq(profile: Profile) -> u32 {
+    let center = profile.center();
+    match (profile.band(), profile.width()) {
+        (Band::Ghz2, Width::Mhz20) if (5..=8).contains(&center) => 2440,
+        (Band::Ghz2, Width::Mhz20) if center == 13 => 2480,
+        (Band::Ghz2, Width::Mhz40) if (3..=10).contains(&center) => 2440,
+        (Band::Ghz5, _) if matches!(center, 151 | 153 | 155 | 163) => 5760,
+        (Band::Ghz6, _) if matches!(center, 195 | 197 | 199 | 207) => 6920,
+        _ => 0,
+    }
+}
+
+/// util.h `s32_div_u32_round_down`: (floor quotient, non-negative remainder).
+fn div_round_down(dividend: i32, divisor: i32) -> (i32, i32) {
+    let (mut q, mut r) = (dividend / divisor, dividend % divisor);
+    if r < 0 {
+        q -= 1;
+        r += divisor;
+    }
+    (q, r)
+}
+/// util.h `s32_div_u32_round_closest`.
+fn div_round_closest(dividend: i32, divisor: i32) -> i32 {
+    div_round_down(dividend + divisor / 2, divisor).0
+}
+/// Linux `(spur_freq - fc) * 1000000` in u32 assigned to s32.
+fn freq_diff(spur: u32, fc: u32) -> i32 {
+    spur.wrapping_sub(fc).wrapping_mul(1_000_000) as i32
+}
+
+/// `rtw8852c_nbi_reg_def[path]`: (notch1, notch2) registers; idx 0xff,
+/// frac 0xc00, en 0x1000 in each.
+const NBI: [(u32, u32); 2] = [(0x4c14, 0x4c20), (0x4cd8, 0x4ce4)];
+
+/// `rtw8852c_set_nbi_tone_idx(chan, path)`.
+fn nbi_tone(profile: Profile, path: usize, out: &mut alloc::vec::Vec<Field>) {
+    let (n1, n2) = NBI[path];
+    let spur = spur_freq(profile);
+    if spur == 0 {
+        // Linux clears notch1_en twice (notch2 is left alone).
+        out.push((PHY + n1, 0x1000, 0));
+        out.push((PHY + n1, 0x1000, 0));
+        return;
+    }
+    let width = profile.width();
+    let mut fc = profile.center_mhz();
+    let mut notch2 = false;
+    if width == Width::Mhz160 {
+        fc = if spur > fc { fc + 40 } else { fc - 40 };
+        let (center, primary) = (profile.center(), profile.primary());
+        notch2 = (fc > spur && center < primary) || (fc < spur && center > primary);
+    }
+    let (nbi_idx, frac) = div_round_down(freq_diff(spur, fc), 312_500);
+    let tone = if width == Width::Mhz20 {
+        div_round_down(nbi_idx + 32, 64).1
+    } else {
+        div_round_down(nbi_idx, if width == Width::Mhz40 { 128 } else { 256 }).1
+    };
+    let frac_tone = div_round_closest(frac, 78_125);
+    let (on, off) = if width == Width::Mhz160 && notch2 {
+        (n2, n1)
+    } else {
+        (n1, n2)
+    };
+    out.push((PHY + on, 0xff, tone as u32));
+    out.push((PHY + on, 0xc00, frac_tone as u32));
+    out.push((PHY + on, 0x1000, 0));
+    out.push((PHY + on, 0x1000, 1));
+    out.push((PHY + off, 0x1000, 0));
+}
+
+/// `rtw8852c_spur_elimination(chan, pri_ch_idx, PHY_0)` with `dbcc_en` = 0
+/// (`rtw8852c_set_csi_tone_idx`, the 160MHz `rtw8852c_spur_notch` for
+/// PHY_0 and PHY_1 or `rtw8852c_set_nbi_tone_idx` A and B, PD boost).
+fn spur_elimination(profile: Profile, out: &mut alloc::vec::Vec<Field>) {
+    let spur = spur_freq(profile);
+    if spur == 0 {
+        out.push((PHY + 0x42c4, 1 << 23, 0));
+    } else {
+        let csi = div_round_closest(freq_diff(spur, profile.center_mhz()), 78_125);
+        out.push((PHY + 0x42ac, 0x7ff, div_round_down(csi, 2048).1 as u32));
+        out.push((PHY + 0x42c4, 1 << 23, 1));
+    }
+    let pri = profile.pri_ch_idx();
+    // RTW89_SC_20_LOWER = 2, UP3X = 7, UPPER = 1, LOW3X = 8.
+    let notch = match (profile.width(), pri) {
+        (Width::Mhz160, 2 | 7) => Some(0xe7f),
+        (Width::Mhz160, 1 | 8) => Some(0x280),
+        _ => None,
+    };
+    match notch {
+        Some(value) => {
+            for (notch, notch2) in NBI {
+                out.push((PHY + notch, 0x1fff, value));
+                out.push((PHY + notch, 0x1000, 1));
+                out.push((PHY + notch2, 0x1fff, value));
+                out.push((PHY + notch2, 0x1000, 1));
+            }
+        }
+        None => {
+            nbi_tone(profile, 0, out);
+            nbi_tone(profile, 1, out);
+        }
+    }
+    out.push((PHY + 0x49e8, 1 << 7, u32::from(!matches!(pri, 7 | 8))));
+}
+
+/// `rtw8852c_ctrl_btg_bt_rx(en, PHY_0)`.
+fn btg_bt_rx(en: bool, out: &mut alloc::vec::Vec<Field>) {
+    let e = u32::from(en);
+    out.push((PHY + 0x4738, 1 << 19, e));
+    out.push((PHY + 0x4738, 1 << 22, 0));
+    out.push((PHY + 0x476c, 0xff00_0000, if en { 0x20 } else { 0x1a }));
+    out.push((PHY + 0x4778, 0xff, if en { 0x30 } else { 0x2a }));
+    out.push((PHY + 0x4aa4, 1 << 19, e));
+    out.push((PHY + 0x4aa4, 1 << 22, e));
+    if en {
+        out.push((PHY + 0x0980, 0x001e_0000, 0));
+    } else {
+        out.push((PHY + 0x0980, 0x001e_0000, 0xf));
+        out.push((PHY + 0x0980, 0x3c00_0000, 0x4));
+    }
+    out.push((PHY + 0x4978, 1 << 14, e));
+    out.push((PHY + 0x4974, 0x03c0_0000, if en { 2 } else { 0 }));
+    out.push((PHY + 0x441c, 1 << 31, e));
+    out.push((PHY + 0x0c6c, 1 << 21, e));
+}
+
+/// `rtw8852c_5m_mask(chan, PHY_0)`.
+fn mask_5m(profile: Profile, out: &mut alloc::vec::Vec<Field>) {
+    let pri = profile.pri_ch_idx();
+    // RTW89_SC_20_LOWER = 2, UPMOST = 3, LOWEST = 4.
+    let (en, low) = match profile.width() {
+        Width::Mhz40 => (true, pri == 2),
+        Width::Mhz80 => (pri == 3 || pri == 4, pri == 4),
+        _ => (false, false),
+    };
+    if !en {
+        out.push((PHY + 0x4c4c, 1 << 12, 0));
+        out.push((PHY + 0x4d10, 1 << 12, 0));
+        out.push((PHY + 0x4450, 1 << 24, 0));
+        return;
+    }
+    for reg in [0x4c4c, 0x4d10] {
+        out.push((PHY + reg, 0x3f, 0x4));
+        out.push((PHY + reg, 1 << 12, 1));
+        out.push((PHY + reg, 1 << 8, u32::from(!low)));
+        out.push((PHY + reg, 1 << 6, u32::from(low)));
+    }
+    out.push((PHY + 0x4450, 1 << 24, 1));
+}
+
+/// reg.h `R_AX_PATH_COM0..11` with `AX_PATH_COMn_DFVAL`.
+const PATH_COM: [(u32, u32); 12] = [
+    (0xd800, 0),
+    (0xd804, 0),
+    (0xd808, 0),
+    (0xd80c, 0x4924_9249),
+    (0xd810, 0x1c9c_9c49),
+    (0xd814, 0x3939_3939),
+    (0xd818, 0x3939_3939),
+    (0xd81c, 0x3939_3939),
+    (0xd820, 0),
+    (0xd824, 0x0000_07c0),
+    (0xd828, 0xe000_0000),
+    (0xd82c, 0),
+];
+
+/// `rtw8852c_ctrl_tx_path_tmac(tx_path, MAC_0)`; `tx_path` is RF_A (1),
+/// RF_B (2) or RF_AB (3).
+pub(super) fn tx_path_tmac_fields(tx_path: u8) -> Option<alloc::vec::Vec<Field>> {
+    // AX_PATH_COM{0,1,2,7,8}_PATH{A,B,AB}.
+    let sel: [u32; 5] = match tx_path {
+        1 => [0x0888_9880, 0x1311_1111, 0x0120_9313, 0x3939_3939, 0x3939],
+        2 => [0x1111_1900, 0x2322_2222, 0x0120_9323, 0x3938_3939, 0x3938],
+        3 => [0x1999_9980, 0x3333_3333, 0x0120_9333, 0x3939_3939, 0x3939],
+        _ => return None,
+    };
+    let mut out = alloc::vec::Vec::new();
+    // R_MAC_SEL B_MAC_SEL_MOD for PHY_0 and PHY_1 (no DBCC offset).
+    out.push((PHY + 0x09a4, 0x1c, 0));
+    out.push((PHY + 0x09a4, 0x1c, 0));
+    for address in (0xdc00..=0xddfc).step_by(4) {
+        out.push((address, u32::MAX, 0));
+    }
+    let mut com = PATH_COM;
+    for (slot, value) in [0, 1, 2, 7, 8].into_iter().zip(sel) {
+        com[slot].1 = value;
+    }
+    for (address, value) in com {
+        out.push((address, u32::MAX, value));
+    }
+    Some(out)
+}
+
+/// `rtw8852c_set_channel_bb` after `rtw8852c_ctrl_bw` for non-DBCC PHY_0
+/// with no user `antenna_tx`, up to (not including) `bb_reset_all`. `cav`
+/// is `hal.cv == CHIP_CAV`. MAC fields (0xd848, MACID/path tables) carry
+/// absolute MAC addresses.
+pub(super) fn tail_fields(profile: Profile, cav: bool) -> alloc::vec::Vec<Field> {
+    let mut out = alloc::vec::Vec::new();
+    let cck = profile.cck_enabled();
+    out.push((PHY + 0x0700, 1 << 5, u32::from(cck)));
+    out.push((PHY + 0x2320, 1, u32::from(!cck)));
+    out.push((PHY + 0x0c80, 1 << 31, u32::from(!cck)));
+    spur_elimination(profile, &mut out);
+    btg_bt_rx(profile.band() == Band::Ghz2, &mut out);
+    mask_5m(profile, &mut out);
+    let width = profile.width();
+    if width == Width::Mhz160 && !cav {
+        let high = u32::from(profile.primary() > profile.center());
+        out.push((PHY + 0x09d8, 1 << 26, 0));
+        out.push((PHY + 0x2410, 1 << 13, high));
+        out.push((0xd848, 1 << 28, high));
+    }
+    let cdd = u32::from(!(profile.band() == Band::Ghz6 && width == Width::Mhz160));
+    out.push((PHY + 0x46c0, 1, cdd));
+    for reg in [0x58dc, 0x78dc] {
+        out.push((PHY + reg, 0xc000_0000, 1));
+        out.push((PHY + reg, 0xc000_0000, 3));
+    }
+    out.push((PHY + 0x40f8, 1, u32::from(profile.band() == Band::Ghz6)));
+    let tx_path = if profile.band() == Band::Ghz6 { 2 } else { 3 };
+    if let Some(tmac) = tx_path_tmac_fields(tx_path) {
+        out.extend(tmac);
+    }
+    out
+}
+
+/// `rtw8852c_bb_reset_all(PHY_0)`: (before the 1us hold, after it).
+pub(super) const RESET_ALL: ([Field; 2], [Field; 5]) = (
+    [
+        (PHY + 0x1200, 0x7000_0000, 7),
+        (PHY + 0x3200, 0x7000_0000, 7),
+    ],
+    [
+        (PHY + 0x0704, 1 << 1, 1),
+        (PHY + 0x0704, 1 << 1, 0),
+        (PHY + 0x1200, 0x7000_0000, 0),
+        (PHY + 0x3200, 0x7000_0000, 0),
+        (PHY + 0x0704, 1 << 1, 1),
+    ],
+);
+
+/// Program the rest of `rtw8852c_set_channel_bb` after [`program`]
+/// ([`tail_fields`]) and `rtw8852c_bb_reset_all`, reading back every
+/// final bit.
+///
+/// # Safety
+/// Same as [`program`], immediately after it on the same owner.
+pub(super) async unsafe fn program_tail(
+    io: &mut impl Io,
+    profile: Profile,
+    cav: bool,
+) -> Result<(), power::Error> {
+    let tail = tail_fields(profile, cav);
+    for &(address, mask, value) in &tail {
+        if mask == u32::MAX {
+            // rtw89_write32 (MACID antenna / PATH_COM tables).
+            io.write32(address, value)?;
+        } else {
+            modify(io, address, mask, value)?;
+        }
+    }
+    verify(io, &tail)?;
+    for &(address, mask, value) in &RESET_ALL.0 {
+        modify(io, address, mask, value)?;
+    }
+    io.delay_us(1).await;
+    for &(address, mask, value) in &RESET_ALL.1 {
+        modify(io, address, mask, value)?;
+    }
+    let mut all = RESET_ALL.0.to_vec();
+    all.extend_from_slice(&RESET_ALL.1);
+    verify(io, &all)
 }
 
 /// Program `rtw8852c_set_channel_mac(MAC_0)` then the C BB channel control

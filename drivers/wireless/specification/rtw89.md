@@ -2975,20 +2975,57 @@ only logs a 20ms one-shot timeout and indexes `dpk_par_regs` with an
 unchecked `cur_k_set - 1`; NARF fails both closed. Unexecuted case:
 `smoke_rtw89_c_dpk_channel_follows_rtw8852c_agc_and_bypass`.
 
-These three owners and `rfk::c::Access::c_rx_dck` are the pieces of
-rtw8852c.c `rtw8852c_rfk_channel` (RX DCK, IQK, TSSI, DPK); the composed
-caller with `rtw89_btc_ntfy_conn_rfk`, the 30ms BT preserve and
-`rtw89_fw_h2c_rf_ntfy_mcc` is not wired yet.
+**Rest of `rtw8852c_set_channel_bb` (`channel_c::program_tail`).** After
+`ctrl_bw`, `tail_fields(profile, cav)` is, in Linux order for non-DBCC
+PHY_0 with no user `antenna_tx`: CCK enable / `R_RXCCA_V1` / PD arbiter by
+band; `rtw8852c_spur_elimination` (`rtw8852c_spur_freq` 2440/2480/5760/
+6920MHz, `rtw8852c_set_csi_tone_idx` round-closest/round-down mod 2048
+against the center `chan->freq`, the 160MHz `rtw8852c_spur_notch`
+0xe7f/0x280 on PHY_0 and PHY_1 or `rtw8852c_set_nbi_tone_idx` A and B incl.
+the 160MHz +-40MHz notch2 selection and Linux's doubled notch1-disable,
+`R_PD_BOOST_EN` off for UP3X/LOW3X); `rtw8852c_ctrl_btg_bt_rx(band == 2G)`;
+`rtw8852c_5m_mask`; the non-CAV 160MHz P80 RU allocation (PHY 0x2410 and
+MAC 0xd848); CDD EVM (off only at 6GHz/160MHz); TXPW RSTB 1 then 3 per
+path; MUIC on at 6GHz; `rtw8852c_ctrl_tx_path_tmac` (RF_B at 6GHz, else
+RF_AB: MAC_SEL for PHY_0/PHY_1, MACID antenna table 0xdc00..0xddfc zeroed,
+`R_AX_PATH_COM0..11` defaults with the per-path COM0/1/2/7/8 values). Then
+`rtw8852c_bb_reset_all` (HW-SI 7, 1us, RSTB_ASYNC 1/0, HW-SI 0, RSTB 1).
+Every final bit is read back, folding overlapping writes per address.
+Unexecuted case: `smoke_rtw89_c_set_channel_bb_tail_follows_rtw8852c`.
 
-Remaining for the `rtl8852c` row (no row credit): the rest of
-`rtw8852c_set_channel_bb` (CCK/CCA enables, spur
-elimination, BTG BT RX, 5M mask, 160MHz P80 RU, CDD EVM, TXPW RSTB, MUIC,
-`rtw8852c_ctrl_tx_path_tmac`, `bb_reset_all`), `rtw8852c_set_channel_rf`
-(`_ctrl_ch`/`_ctrl_bw`/`_rxbb_bw`), the composed C channel RFK caller
-(its IQK/TSSI/DPK owners exist, see above), C power-table
+**C channel switch and channel RFK (`rfk::c_channel`).**
+`Channel::set_channel(profile, inputs, cut)` is rtw8852c.c
+`rtw8852c_set_channel_help(enter)` (stop scheduler TX, PPDU status off,
+`dfs_en(false)`, `tssi_cont_en_phyidx(false)` A/B, `adc_en(false)`, 40us,
+`bb_reset_en(false)`), `rtw8852c_set_channel` (`channel_c::program`,
+`program_tail`, then rtw8852c_rfk.c `rtw8852c_set_channel_rf`: `_ctrl_ch`
+with its channel-range guard, RF18 at 0x18 and 0x10018 per path with 100us
+holds, `_ctrl_bw` incl. CFCH BW0/BW1 and the CAV path-B RF18 copy,
+`_rxbb_bw` LUT/TIA; final RF18 words read back) and
+`set_channel_help(exit)` (PPDU status 0x2b + HW_RPT_FWD host, ADC/DFS on,
+`tssi_cont_en(true)` A then B, each running `_tssi_set_efuse_to_de(PHY_0)`
+for both paths as Linux, `bb_reset_en(true)` with CCA release only on
+2.4GHz, resume TX). `Channel::rfk_channel(calibration, tracking, cut)` is
+`rtw8852c_rfk_channel`: `rtw8852c_mcc_get_ch_info` (single context: table
+index 0), `rtw89_btc_ntfy_conn_rfk(true)` (a state flag, no I/O), RX DCK
+with the retained `is_tssi_mode`, IQK, 30ms preserve, TSSI (updates the
+retained `is_tssi_mode`), 30ms, DPK, `conn_rfk(false)`, and returns the
+`rtw89_fw_h2c_rf_ntfy_mcc` body. RTL8852C firmware has `RFK_NTFY_MCC_V0`
+from 0.0.0 (fw.c), so the body is `rtw89_fw_h2c_rf_get_mccch_v0`
+{ch_0 = center, ch_1 = 0, band_0, band_1 = 0, current_channel, current_band}
+(24 bytes; B uses the 20-byte non-V0 layout). The BT preserves always wait
+the full 30ms because the owner cannot assert A2DP absence (as B).
+`__rtw89_set_channel`'s `rtw89_chip_set_txpwr` and band-change
+`rtw8852c_tssi_scan` are not composed: no native caller may use
+`set_channel` until C power tables exist. Unexecuted case:
+`smoke_rtw89_c_set_channel_rf_and_help_follow_rtw8852c`.
+
+Remaining for the `rtl8852c` row (no row credit): C power-table
 composition (`rtw8852c_set_txpwr*`, firmware TXPWR_* elements incl. DA
-limits), C coexistence init, the C `power::Calibration`/qualification
-records (N52x are B-bound), `command_native`/`startup_station` admission
+limits) between `set_channel_rf` and the help exit, band-change
+`rtw8852c_tssi_scan`, C coexistence init, the C
+`power::Calibration`/qualification records (N52x are B-bound), the native
+caller sending the MCC V0 H2C, `command_native`/`startup_station` admission
 (B-only at `Io::station_allowed`, `Startup::start` assets), and native
 execution. Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,

@@ -268,7 +268,7 @@ impl<I: Interface> Access<'_, I> {
         Ok(words)
     }
     /// `_tssi_set_efuse_to_de` for one path; returns (CCK, MCS) DE.
-    fn c_tssi_de(
+    pub(super) fn c_tssi_de(
         &mut self,
         path: u8,
         channel: Profile,
