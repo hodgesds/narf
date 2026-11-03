@@ -1070,8 +1070,11 @@ GETPARAM output bytes and ioctl encodings are unchanged.
 Unsupported engines and their capabilities are never advertised.
 
 The i915 compatibility GETPARAM discovery path reports observed PCI revision
-(32), union DSS count (33), actual fused EU count (34) and timestamp frequency
-(51). Missing or mismatched topology/facts return ENODEV, never zero; immutable
+(32), union DSS count (33), actual fused EU count (34), timestamp frequency
+(51) and OA timestamp frequency (57: `DeviceFacts::oa_timestamp_frequency`,
+the clock with Wa_18013179988's CTC shift on 12.55 and 12.70–12.74, sampled
+with the clock and independent of the OA opt-in). PERF_REVISION (54) stays 0
+without i915 perf. Missing or mismatched topology/facts return ENODEV, never zero; immutable
 facts survive a stopped GT without MMIO or wake. HAS_SCHEDULER (41) reports
 ENABLED while live and 0 otherwise, leaving the
 priority/preemption/semaphore/busy-stat/static-priority-map capability bits

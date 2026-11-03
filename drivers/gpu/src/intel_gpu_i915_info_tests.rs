@@ -30,6 +30,8 @@ impl UserBackend for Facts {
             graphics_version: 1270,
             graphics_step: 0,
             reference_clock: self.clock,
+            // 12.70 with RPM_CONFIG0 CTC shift 2: the clock doubled.
+            oa_timestamp_frequency: self.clock << 1,
         })
     }
     fn submit<'a>(
@@ -140,6 +142,7 @@ fn smoke_i915_observed_discovery_and_immutable_facts_after_loss() -> TestResult 
                     },
                 ),
                 (51, 19_200_000),
+                (57, 38_400_000),
                 (41, i32::from(live)),
             ] {
                 assert_eq!(parameter(&file, &info, &user, param), Ok(value));
@@ -186,7 +189,7 @@ fn smoke_i915_discovery_missing_cross_platform_and_faulted_copies() -> TestResul
     }
     info.topology = None;
     info.backend = None;
-    for param in [32, 33, 34, 51] {
+    for param in [32, 33, 34, 51, 57] {
         assert_eq!(
             parameter(&file, &info, &user, param),
             Err(FsError::NoDevice)
@@ -198,6 +201,7 @@ fn smoke_i915_discovery_missing_cross_platform_and_faulted_copies() -> TestResul
         clock: 0,
     }));
     assert_eq!(parameter(&file, &info, &user, 51), Err(FsError::NoDevice));
+    assert_eq!(parameter(&file, &info, &user, 57), Err(FsError::NoDevice));
     TestResult::Pass
 }
 kernel_test_in!(

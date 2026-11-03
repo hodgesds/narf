@@ -65,6 +65,10 @@ pub struct DeviceFacts {
     pub graphics_version: u16,
     pub graphics_step: u8,
     pub reference_clock: u32,
+    /// i915_perf_oa_timestamp_frequency: the reference clock with
+    /// Wa_18013179988's RPM_CONFIG0 CTC shift on 12.55 and 12.70..12.74,
+    /// sampled with the clock and independent of the OA opt-in.
+    pub oa_timestamp_frequency: u32,
 }
 
 /// Trusted metadata-only smallbar publication transaction. Faultable output

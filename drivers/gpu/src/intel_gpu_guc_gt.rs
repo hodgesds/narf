@@ -1224,11 +1224,15 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if rpm == u32::MAX || rpm != window.read32(0xd00) {
             return Err(GtError::Unavailable);
         }
+        let reference = reference_clock(rpm).ok_or(GtError::Unavailable)?;
         Ok(crate::intel_gpu_user::DeviceFacts {
             revision: self.parts.boot.revision(),
             graphics_version: ip.version,
             graphics_step: ip.step,
-            reference_clock: reference_clock(rpm).ok_or(GtError::Unavailable)?,
+            reference_clock: reference,
+            oa_timestamp_frequency: crate::intel_gpu_oa::timestamp_frequency(
+                ip.version, reference, rpm,
+            ),
         })
     }
 

@@ -1959,6 +1959,21 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             }
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
+        // I915_PARAM_OA_TIMESTAMP_FREQUENCY: i915_perf_oa_timestamp_frequency,
+        // unconditional in i915_getparam.c (no perf or OA opt-in). The CTC
+        // shift is cached with the clock rather than read per call.
+        57 => {
+            let frequency = info
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.device_facts())
+                .ok_or(FsError::NoDevice)?
+                .oa_timestamp_frequency;
+            if frequency == 0 {
+                return Err(FsError::NoDevice);
+            }
+            i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
+        }
         // Explicitly absent features; do not advertise perf, USERPTR,
         // secure dispatch, CPU coherency or unimplemented scheduler controls.
         6..=8
@@ -1972,7 +1987,8 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         | 42
         | 52
         | 54
-        | 56..=58 => 0,
+        | 56
+        | 58 => 0,
         _ => return Err(FsError::InvalidData),
     })
 }
