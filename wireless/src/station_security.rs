@@ -14,8 +14,10 @@ use zeroize::{Zeroize, Zeroizing};
 /// That includes a +HTC QoS DATA MPDU's Order bit and four-octet HT Control
 /// field: `Security` skips HT Control and masks Order from the CCMP AAD
 /// itself, so a station advertising HTC_HE keeps receiving such traffic.
-/// Hardware-decrypted or firmware-decapsulated data is not admitted here.
-/// This trait grants no radio, key, carrier or controlled-port authority.
+/// Hardware-decrypted data is admitted only through the `*_decrypted`
+/// entry points of an owner built `with_hardware_keys`; firmware-decapsulated
+/// data is never admitted. This trait grants no radio, key, carrier or
+/// controlled-port authority.
 pub trait RawFrame {
     fn bytes(&self) -> &[u8];
     /// True only for an original MPDU in this adapter's admitted PHY profile.
@@ -79,6 +81,44 @@ struct Pending {
     frame: Vec<u8>,
     change: Change,
 }
+/// One device key-cache entry for an owner built `with_hardware_keys`
+/// (mac80211 `ieee80211_key_enable_hw_accel` -> `drv_set_key(SET_KEY)`).
+/// Emitted once per committed material change, pairwise before group, after
+/// the reply that commits it reached terminal delivery. IGTK is never
+/// emitted: BIP stays in software, as ath10k/ath11k `set_key` return 1 for
+/// every BIP suite. The driver reports the device's completion with
+/// `key_installed(token)`; until then that slot stays software-only.
+pub struct KeyInstall {
+    pub pairwise: bool,
+    pub key_id: u8,
+    pub material: Zeroizing<[u8; 16]>,
+    pub token: u32,
+}
+impl core::fmt::Debug for KeyInstall {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KeyInstall")
+            .field("pairwise", &self.pairwise)
+            .field("key_id", &self.key_id)
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hardware {
+    Absent,
+    Pending(u32),
+    Installed,
+}
+/// Device key-cache mirror. A slot is `Installed` only when the device
+/// confirmed the host's *current* material for it; any newer commit returns
+/// it to `Pending`, so device-decrypted frames under a stale device key are
+/// never checked against the fresh key's replay window.
+struct Offload {
+    installs: Vec<KeyInstall>,
+    next: u32,
+    pair: Hardware,
+    group: [Hardware; 4],
+}
 /// Remember rejected retired material for the full owner lifetime. An old
 /// TK cannot reappear in a fresh Key with reset PN/replay state. History is
 /// bounded; exhausting it terminates the owner rather than evicting evidence.
@@ -102,6 +142,7 @@ pub struct Security {
     epd: bool,
     mld: Option<Box<crate::association::mlo::Context>>,
     fragment_rx: Option<Box<fragment::Receive>>,
+    offload: Option<Box<Offload>>,
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -357,7 +398,94 @@ impl Security {
             epd: false,
             mld: None,
             fragment_rx: None,
+            offload: None,
         })
+    }
+    /// Opt into device key offload before any EAPOL work (Linux ath10k
+    /// `cryptmode=0` beside a RAW receive decap). Software CCMP stays the
+    /// fallback for every frame the device did not handle: committed keys are
+    /// reported through `take_key_installs`, and only a slot whose current
+    /// material the driver confirmed with `key_installed` admits
+    /// header-only transmit or device-decrypted receive. Not for MLD owners.
+    pub fn with_hardware_keys(mut self) -> Result<Self, Error> {
+        if self.mld.is_some() || self.pair.is_some() || self.pending.is_some() {
+            return Err(Error::Profile);
+        }
+        self.offload = Some(Box::new(Offload {
+            installs: Vec::new(),
+            next: 1,
+            pair: Hardware::Absent,
+            group: [Hardware::Absent; 4],
+        }));
+        Ok(self)
+    }
+    pub fn hardware_keys(&self) -> bool {
+        self.offload.is_some()
+    }
+    /// Drain committed key-cache entries for the device, oldest first.
+    pub fn take_key_installs(&mut self) -> Vec<KeyInstall> {
+        self.offload
+            .as_mut()
+            .map(|o| core::mem::take(&mut o.installs))
+            .unwrap_or_default()
+    }
+    /// The device confirmed entry `token`. True when it still names the
+    /// current material of its slot, which then admits offload; a stale
+    /// confirmation (a newer commit replaced that slot) changes nothing.
+    pub fn key_installed(&mut self, token: u32) -> bool {
+        let Some(offload) = self.offload.as_mut().filter(|_| !self.failed) else {
+            return false;
+        };
+        for slot in core::iter::once(&mut offload.pair).chain(offload.group.iter_mut()) {
+            if *slot == Hardware::Pending(token) {
+                *slot = Hardware::Installed;
+                return true;
+            }
+        }
+        false
+    }
+    /// The device rejected or never confirmed `token`: that slot remains
+    /// software-only until a later commit (mac80211 keeps a key in software
+    /// when `drv_set_key` fails).
+    pub fn key_install_failed(&mut self, token: u32) {
+        if let Some(offload) = self.offload.as_mut() {
+            for slot in core::iter::once(&mut offload.pair).chain(offload.group.iter_mut()) {
+                if *slot == Hardware::Pending(token) {
+                    *slot = Hardware::Absent;
+                }
+            }
+        }
+    }
+    fn offloaded(&self, group: Option<u8>) -> bool {
+        self.offload.as_ref().is_some_and(|o| match group {
+            None => o.pair == Hardware::Installed,
+            Some(id) => o.group.get(usize::from(id)) == Some(&Hardware::Installed),
+        })
+    }
+    /// The current pairwise key is in the device: data may use
+    /// `transmit_ethernet_offload` and protected management
+    /// `protect_management_offload`.
+    pub fn pairwise_offloaded(&self) -> bool {
+        self.port_open() && self.offloaded(None)
+    }
+    fn offload_commit(&mut self, pairwise: bool, key_id: u8, material: &[u8; 16]) {
+        let Some(offload) = self.offload.as_mut() else {
+            return;
+        };
+        let token = offload.next;
+        offload.next = offload.next.wrapping_add(1).max(1);
+        let slot = if pairwise {
+            &mut offload.pair
+        } else {
+            &mut offload.group[usize::from(key_id)]
+        };
+        *slot = Hardware::Pending(token);
+        offload.installs.push(KeyInstall {
+            pairwise,
+            key_id,
+            material: Zeroizing::new(*material),
+            token,
+        });
     }
     /// Frame MSDUs with EtherType Protocol Discrimination (IEEE802.11-2020
     /// 5.1.4: the MSDU starts with a two-octet EtherType instead of the
@@ -442,6 +570,9 @@ impl Security {
     pub fn fail(&mut self) {
         self.failed = true;
         self.established = false;
+        if let Some(offload) = self.offload.as_mut() {
+            offload.installs.clear();
+        }
         if let Some(cache) = self.fragment_rx.as_mut() {
             cache.clear();
         }
@@ -456,7 +587,11 @@ impl Security {
             self.pending.as_ref().map(|p| p.frame.as_slice())
         }
     }
-    fn normalize(&mut self, mpdu: &impl RawFrame) -> Result<Option<Vec<u8>>, Error> {
+    fn normalize(
+        &mut self,
+        mpdu: &impl RawFrame,
+        decrypted: bool,
+    ) -> Result<Option<Vec<u8>>, Error> {
         if !self.admitted_link(mpdu) {
             return Ok(None);
         }
@@ -496,10 +631,14 @@ impl Security {
             return Ok(None);
         }
         if b[1] & 0x40 == 0 {
-            return Ok(Some(b.to_vec()));
+            return Ok((!decrypted).then(|| b.to_vec()));
         }
         let wire = b.get(length..).ok_or(Error::Protocol)?;
         let key_id = wire.get(3).ok_or(Error::Protocol)? >> 6;
+        if decrypted && !self.offloaded((b[4] & 1 != 0).then_some(key_id)) {
+            // The device may still hold an older key for this slot.
+            return Ok(None);
+        }
         let slot = if b[4] & 1 != 0 {
             self.group[usize::from(key_id)].as_mut()
         } else {
@@ -510,7 +649,12 @@ impl Security {
         };
         let Some(slot) = slot else { return Ok(None) };
         let mut wire = wire.to_vec();
-        let plaintext = match slot.key.unprotect(&b[..length], &mut wire) {
+        let opened = if decrypted {
+            slot.key.accept_decrypted(&b[..length], &wire)
+        } else {
+            slot.key.unprotect(&b[..length], &mut wire)
+        };
+        let plaintext = match opened {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
@@ -555,6 +699,27 @@ impl Security {
         mpdu: &impl RawFrame,
         admission: packet_key::AmsduAdmission,
     ) -> Result<Option<packet_key::AmsduReceive>, Error> {
+        self.receive_amsdu_checked(mpdu, admission, false)
+    }
+    /// `receive_amsdu_with` for one device-decrypted original A-MSDU
+    /// (CCMP header kept, MIC removed); same slot/replay rules as
+    /// `receive_decrypted_with_nonce`.
+    pub fn receive_amsdu_decrypted_with(
+        &mut self,
+        mpdu: &impl RawFrame,
+        admission: packet_key::AmsduAdmission,
+    ) -> Result<Option<packet_key::AmsduReceive>, Error> {
+        if self.offload.is_none() {
+            return Err(Error::State);
+        }
+        self.receive_amsdu_checked(mpdu, admission, true)
+    }
+    fn receive_amsdu_checked(
+        &mut self,
+        mpdu: &impl RawFrame,
+        admission: packet_key::AmsduAdmission,
+        decrypted: bool,
+    ) -> Result<Option<packet_key::AmsduReceive>, Error> {
         if !self.port_open() {
             return Err(Error::State);
         }
@@ -578,8 +743,12 @@ impl Security {
         } else {
             raw
         };
+        // A device-decrypted aggregate carries no MIC (8 octets fewer).
+        let overhead = if decrypted { 8 } else { 16 };
         if !mpdu.unmodified()
-            || !(26 + 16 + 22..=26 + 16 + admission.limit().bytes()).contains(&bytes.len())
+            || decrypted && bytes.get(1).is_none_or(|b| b & 0x40 == 0)
+            || !(26 + overhead + 22..=26 + overhead + admission.limit().bytes())
+                .contains(&bytes.len())
         {
             return Ok(None);
         }
@@ -593,6 +762,9 @@ impl Security {
         }
         let wire = &bytes[26..];
         let id = usize::from(wire[3] >> 6);
+        if decrypted && !self.offloaded((header[4] & 1 != 0).then_some(id as u8)) {
+            return Ok(None);
+        }
         let slot = if header[4] & 1 != 0 {
             self.group[id].as_mut()
         } else if id == 0 {
@@ -603,14 +775,43 @@ impl Security {
         let Some(slot) = slot else {
             return Ok(None);
         };
-        Ok(slot.key.unprotect_amsdu_with(header, wire, admission).ok())
+        Ok(if decrypted {
+            slot.key
+                .accept_decrypted_amsdu_with(header, wire, admission)
+        } else {
+            slot.key.unprotect_amsdu_with(header, wire, admission)
+        }
+        .ok())
     }
     pub fn receive_with_nonce(
         &mut self,
         mpdu: &impl RawFrame,
         fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<Rx, Error> {
-        let result = self.receive_inner(mpdu, fresh_snonce);
+        self.receive_checked(mpdu, fresh_snonce, false)
+    }
+    /// `receive_with_nonce` for one device-decrypted MPDU (Protected still
+    /// set, CCMP header kept, MIC removed: Linux htt_rx.c
+    /// `ath10k_htt_rx_h_undecap_raw` with `is_decrypted`). Only a
+    /// `with_hardware_keys` owner whose matching slot is confirmed installed
+    /// admits it; the PN must pass the same replay counter as software CCMP.
+    pub fn receive_decrypted_with_nonce(
+        &mut self,
+        mpdu: &impl RawFrame,
+        fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
+    ) -> Result<Rx, Error> {
+        if self.offload.is_none() {
+            return Err(Error::State);
+        }
+        self.receive_checked(mpdu, fresh_snonce, true)
+    }
+    fn receive_checked(
+        &mut self,
+        mpdu: &impl RawFrame,
+        fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
+        decrypted: bool,
+    ) -> Result<Rx, Error> {
+        let result = self.receive_inner(mpdu, fresh_snonce, decrypted);
         if result.as_ref().is_err_and(|e| *e != Error::State) {
             self.fail();
         }
@@ -620,12 +821,13 @@ impl Security {
         &mut self,
         mpdu: &impl RawFrame,
         fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
+        decrypted: bool,
     ) -> Result<Rx, Error> {
         if self.failed || self.pending.is_some() {
             return Err(Error::State);
         }
         let protected = mpdu.bytes().get(1).is_some_and(|b| b & 0x40 != 0);
-        let Some(frame) = self.normalize(mpdu)? else {
+        let Some(frame) = self.normalize(mpdu, decrypted)? else {
             return Ok(Rx::Ignored);
         };
         self.receive_normalized(frame, protected, fresh_snonce)
@@ -790,7 +992,26 @@ impl Security {
     /// Ring clients submit Ethernet data only. Native EAPOL is exclusively
     /// generated by the retained supplicant, before this controlled port.
     pub fn transmit_ethernet(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, Error> {
-        self.transmit_ethernet_inner(ethernet, None, None)
+        self.transmit_ethernet_inner(ethernet, None, None, false)
+    }
+    /// Header-only form of `transmit_ethernet`/`transmit_ethernet_qos`
+    /// (`tid`) for the device's confirmed current pairwise key: the Protected
+    /// header and CCMP header with a PN from the shared counter, then the
+    /// plaintext MSDU; the device appends the MIC (mac80211
+    /// `IEEE80211_KEY_FLAG_GENERATE_IV`). `State` when the pairwise slot is
+    /// not offloaded, in which case the caller uses the software form.
+    pub fn transmit_ethernet_offload(
+        &mut self,
+        ethernet: &[u8],
+        tid: Option<u8>,
+    ) -> Result<Vec<u8>, Error> {
+        if !self.pairwise_offloaded() {
+            return Err(Error::State);
+        }
+        if tid.is_some_and(|tid| tid > 15) {
+            return Err(Error::Profile);
+        }
+        self.transmit_ethernet_inner(ethernet, tid, None, true)
     }
     /// Form the QoS header before CCMP authenticates its TID and nonce. The
     /// caller must separately own negotiated WMM/EDCA and native QoS admission.
@@ -799,7 +1020,7 @@ impl Security {
         if tid > 15 {
             return Err(Error::Profile);
         }
-        self.transmit_ethernet_inner(ethernet, Some(tid), None)
+        self.transmit_ethernet_inner(ethernet, Some(tid), None, false)
     }
     /// Form HE +HTC QoS DATA before CCMP encryption. `control` is the
     /// little-endian four-octet HE-variant HT Control field; the caller owns
@@ -816,7 +1037,7 @@ impl Security {
         if tid > 15 || control[0] & 3 != 3 {
             return Err(Error::Profile);
         }
-        self.transmit_ethernet_inner(ethernet, Some(tid), Some(control))
+        self.transmit_ethernet_inner(ethernet, Some(tid), Some(control), false)
     }
     /// Aggregate station-originated Ethernet-II frames into one protected
     /// QoS A-MSDU MPDU for `tid` (IEEE802.11-2020 9.3.2.2.2). Every frame
@@ -896,6 +1117,7 @@ impl Security {
         ethernet: &[u8],
         tid: Option<u8>,
         control: Option<[u8; 4]>,
+        offload: bool,
     ) -> Result<Vec<u8>, Error> {
         if !self.port_open() {
             return Err(Error::State);
@@ -930,12 +1152,12 @@ impl Security {
         }
         let mut body = self.msdu_header(protocol);
         body.extend_from_slice(&ethernet[14..]);
-        let result = self
-            .pair
-            .as_mut()
-            .ok_or(Error::State)?
-            .key
-            .protect(&header, &body);
+        let key = &mut self.pair.as_mut().ok_or(Error::State)?.key;
+        let result = if offload {
+            key.protect_header(&header, &body)
+        } else {
+            key.protect(&header, &body)
+        };
         let wire = match result {
             Ok(wire) => wire,
             Err(error) => {
@@ -1051,6 +1273,7 @@ impl Security {
                         .and_then(|key| key.with_mld_context(mld.as_ref()))
                         .map_err(Error::Crypto)?;
                     self.history.push(Zeroizing::new(*material));
+                    self.offload_commit(true, 0, &material);
                     self.pair = Some(Slot { material, key });
                 }
             } else {
@@ -1059,6 +1282,7 @@ impl Security {
                     .and_then(|key| key.with_mld_context(mld.as_ref()))
                     .map_err(Error::Crypto)?;
                 self.history.push(Zeroizing::new(*material));
+                self.offload_commit(true, 0, &material);
                 self.pair = Some(Slot { material, key });
             }
             self.supplicant.pairwise_key_installed();
@@ -1080,6 +1304,7 @@ impl Security {
                 .and_then(|key| key.with_mld_context(mld.as_ref()))
                 .map_err(Error::Crypto)?;
                 self.history.push(Zeroizing::new(*group.material));
+                self.offload_commit(false, group.id, &group.material);
                 self.group[at] = Some(Slot {
                     material: group.material,
                     key,
@@ -1132,25 +1357,60 @@ impl Security {
     /// BIP MMIE under the installed IGTK. Before keys, or without PMF,
     /// unprotected frames pass unchanged; deauthentication and SA Query
     /// policy remains the MLME owner's.
+    fn management_admitted(&self, mpdu: &impl RawFrame) -> bool {
+        let b = mpdu.bytes();
+        self.admitted_link(mpdu)
+            && mpdu.unmodified()
+            && (24..=4096).contains(&b.len())
+            && b[0] & 0x0c == 0
+            && b[1] & 0x07 == 0
+            && b[22] & 15 == 0
+            && b[10..16] == self.peer
+            && b[16..22] == self.peer
+            && (b[4..10] == self.own || b[4] & 1 != 0)
+    }
+    /// A device-decrypted unicast robust management frame (Linux wmi.c
+    /// `ath10k_wmi_rx_is_decrypted`: Protected still set, CCMP header kept;
+    /// the driver removed the MIC). mac80211 then only checks the PN against
+    /// the pairwise key's management replay counter, as here. Only a PMF
+    /// owner with the current pairwise key confirmed in the device admits it.
+    pub fn receive_management_decrypted(&mut self, mpdu: &impl RawFrame) -> Result<MgmtRx, Error> {
+        if self.failed || self.offload.is_none() {
+            return Err(Error::State);
+        }
+        let b = mpdu.bytes();
+        if !self.management_admitted(mpdu)
+            || b[1] & 0x40 == 0
+            || b[4] & 1 != 0
+            || !self.pmf
+            || !Self::robust(b)
+            || !self.offloaded(None)
+        {
+            return Ok(MgmtRx::Ignored);
+        }
+        let Some(pair) = self.pair.as_mut() else {
+            return Ok(MgmtRx::Ignored);
+        };
+        Ok(
+            match pair.key.accept_decrypted_management(&b[..24], &b[24..]) {
+                Ok(plain) => {
+                    let mut out = b[..24].to_vec();
+                    out[1] &= !0x40;
+                    out.extend_from_slice(&plain);
+                    MgmtRx::Frame(out)
+                }
+                Err(_) => MgmtRx::Ignored,
+            },
+        )
+    }
     pub fn receive_management(&mut self, mpdu: &impl RawFrame) -> Result<MgmtRx, Error> {
         if self.failed {
             return Err(Error::State);
         }
-        if !self.admitted_link(mpdu) {
+        if !self.management_admitted(mpdu) {
             return Ok(MgmtRx::Ignored);
         }
         let b = mpdu.bytes();
-        if !mpdu.unmodified()
-            || !(24..=4096).contains(&b.len())
-            || b[0] & 0x0c != 0
-            || b[1] & 0x07 != 0
-            || b[22] & 15 != 0
-            || b[10..16] != self.peer
-            || b[16..22] != self.peer
-            || b[4..10] != self.own && b[4] & 1 == 0
-        {
-            return Ok(MgmtRx::Ignored);
-        }
         let protected = b[1] & 0x40 != 0;
         if !self.pmf || self.pair.is_none() || !Self::robust(b) {
             return Ok(if protected {
@@ -1198,6 +1458,22 @@ impl Security {
     /// caller's sequence number; the PN is consumed even if the transport
     /// later drops the frame.
     pub fn protect_management(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
+        self.protect_management_checked(frame, false)
+    }
+    /// Header-only form of `protect_management` for the device's confirmed
+    /// current pairwise key (mac80211 `IEEE80211_KEY_FLAG_GENERATE_IV_MGMT`):
+    /// the device appends the MIC. `State` when not offloaded.
+    pub fn protect_management_offload(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.offloaded(None) {
+            return Err(Error::State);
+        }
+        self.protect_management_checked(frame, true)
+    }
+    fn protect_management_checked(
+        &mut self,
+        frame: &[u8],
+        offload: bool,
+    ) -> Result<Vec<u8>, Error> {
         if !self.pmf || !self.port_open() {
             return Err(Error::State);
         }
@@ -1214,13 +1490,13 @@ impl Security {
         }
         let mut header = frame[..24].to_vec();
         header[1] |= 0x40;
-        let wire = self
-            .pair
-            .as_mut()
-            .ok_or(Error::State)?
-            .key
-            .protect_management(&header, &frame[24..])
-            .map_err(Error::Crypto)?;
+        let key = &mut self.pair.as_mut().ok_or(Error::State)?.key;
+        let wire = if offload {
+            key.protect_management_header(&header, &frame[24..])
+        } else {
+            key.protect_management(&header, &frame[24..])
+        }
+        .map_err(Error::Crypto)?;
         header.extend_from_slice(&wire);
         Ok(header)
     }

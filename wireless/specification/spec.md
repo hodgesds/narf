@@ -2206,11 +2206,36 @@ clear/retire/drop ownership.
 
 `station_security::{Security, RawFrame, Rx}` composes the shared WPA2-PSK
 supplicant with those keys. Drivers supply already-negotiated station/AP RSNEs
-and original descriptor-validated native MPDUs. `RawFrame::unmodified()` must
-reject hardware-decrypted/decapsulated packets and frames outside the adapter's
+and original descriptor-validated native MPDUs. Outside the `*_decrypted`
+entry points below, `RawFrame::unmodified()` must reject
+hardware-decrypted/decapsulated packets and frames outside the adapter's
 admitted peer/channel/PHY profile before nonce or key state can advance. The
 security owner additionally checks native addresses, DS direction, fragments,
 EAPOL envelope and negotiated crypto. It grants no radio or carrier authority.
+
+Device key offload (Interface addition; first user ath10k, Linux
+`rawmode=1 cryptmode=0`) is an additive pre-handshake opt-in,
+`Security::with_hardware_keys() -> Result<Self, Error>` (refused for MLD or
+after keys exist). The owner stays the RSNA, PN and replay authority:
+- `take_key_installs() -> Vec<KeyInstall { pairwise, key_id, material, token }>`
+  drains PTK/GTK entries committed at a reply's terminal delivery (only when
+  material changes; PTK before GTK; IGTK never, BIP stays software as in
+  ath10k/ath11k `set_key`). `key_installed(token) -> bool` marks a slot's
+  *current* material device-resident; `key_install_failed(token)` keeps it
+  software-only; any newer commit returns the slot to pending.
+- `pairwise_offloaded()`, `transmit_ethernet_offload(eth, tid)` and
+  `protect_management_offload(frame)` emit the mac80211
+  `IEEE80211_KEY_FLAG_GENERATE_IV{,_MGMT}` form (Protected header + CCMP
+  header + plaintext, PN from the shared counter; the device appends the MIC).
+- `receive_decrypted_with_nonce`, `receive_amsdu_decrypted_with` and
+  `receive_management_decrypted` admit a device-decrypted MPDU (Protected and
+  CCMP header kept, MIC removed by the driver) only for a confirmed slot, and
+  apply the PN check against the same per-key/TID (or management) replay
+  window as software CCMP (mac80211 `ieee80211_crypto_ccmp_decrypt` with
+  `RX_FLAG_DECRYPTED`). Software receive/transmit remain available per frame.
+`packet_key::Key` gains the matching `protect_header`,
+`protect_management_header`, `accept_decrypted`,
+`accept_decrypted_management` and `accept_decrypted_amsdu_with` (non-MLD).
 
 `Security::with_mld(context)` is an additive pre-handshake opt-in. Its
 constructor MACs must equal the context's physical link pair and PMF must be

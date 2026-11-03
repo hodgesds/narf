@@ -7,6 +7,8 @@ mod epd_tests;
 mod htc_tests;
 #[path = "station_security_mlo_tests.rs"]
 mod mlo_tests;
+#[path = "station_security_offload_tests.rs"]
+mod offload_tests;
 #[path = "station_security_sae_tests.rs"]
 mod sae_tests;
 use crate::eapol::{self, KeyFrame, KeyMgmt, Ptk};
