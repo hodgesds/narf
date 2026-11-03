@@ -1236,7 +1236,13 @@ mod tests {
         {
             return TestResult::Fail("capture lifecycle failed");
         }
-        regs.set_counter(4096);
+        regs.set_counter(12288);
+        // NOTE: the fake counter block is shared across leases, and
+        // capture `start` latched baseline 8192 (the playback lease's
+        // final value). The counter must move monotonically under a
+        // running engine — a backward jump reads as an overrun and
+        // trips xrun — so the capture completion is 8192 + 4096, not
+        // a reset to 4096.
         let mut out = [0u8; 4096];
         if cap.read(&mut out) != Ok(4096) || out != [0u8; 4096] {
             return TestResult::Fail("capture read mismatch");
