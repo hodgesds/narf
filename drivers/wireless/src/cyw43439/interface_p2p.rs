@@ -25,7 +25,7 @@
 use super::super::{wireless_error, Device, Fullmac, State};
 use super::{primary, Roles};
 use crate::brcmfmac::{p2p::Notice, p2p_wire, vif_owner::Owner};
-use crate::cyw43439::{fullmac::Family, ioctl::Direction, runtime::Error};
+use crate::cyw43439::{fullmac::Family, ioctl::Direction, runtime::Error, station::Station};
 use alloc::{
     boxed::Box,
     string::String,
@@ -243,6 +243,55 @@ impl<R: Fullmac + 'static> Device<R> {
     }
 }
 
+impl<R: Fullmac + 'static> Device<R> {
+    /// `brcmf_cfg80211_scan` with `request->wdev` the P2P_DEVICE:
+    /// `brcmf_p2p_scan_prep` turns a `DIRECT-` wildcard request into the
+    /// P2P escan on the discovery bsscfg; any other request is sent over
+    /// the primary (`vif = p2p->bss_idx[P2PAPI_BSSCFG_PRIMARY].vif`,
+    /// `brcmf_do_escan`). As the primary's own scan, it needs the primary in
+    /// station mode and unassociated (`station_p2p_scan.rs`).
+    pub(super) async fn p2p_device_scan_operation(
+        &self,
+        request: ScanRequest,
+    ) -> Result<Vec<(BssInfo, Vec<u8>)>, WirelessError> {
+        if self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        let mut state = self.state.lock().await;
+        if self.withdrawn() || self.ap_mode() != 2 {
+            return Err(WirelessError::HardwareError);
+        }
+        let results = if Station::<R>::is_p2p_scan(&request) {
+            let go = state
+                .vif
+                .as_ref()
+                .is_some_and(|owner| owner.has_role(crate::brcmfmac::vif_owner::Role::P2pGo));
+            let State {
+                station, vif, p2p, ..
+            } = &mut *state;
+            let (Some(owner), Some(device)) = (vif.as_mut(), p2p.as_mut()) else {
+                return Err(WirelessError::Denied);
+            };
+            station.p2p_scan(owner, device, go, request).await
+        } else {
+            state.station.scan(request).await
+        }
+        .map_err(wireless_error)?;
+        let cache = &state.station.cache;
+        Ok(results
+            .into_iter()
+            .map(|info| {
+                let ies = cache
+                    .iter()
+                    .find(|bss| bss.info.bssid == info.bssid)
+                    .map(|bss| bss.ies.clone())
+                    .unwrap_or_default();
+                (info, ies)
+            })
+            .collect())
+    }
+}
+
 /// `BRCMF_C_GET_CHANNEL` on the discovery interface (`hw_channel`, the
 /// first word of `struct channel_info_le`).
 async fn current_channel<R: Fullmac>(runtime: &mut R, ifidx: u8) -> Result<u32, Error> {
@@ -392,6 +441,7 @@ pub(in crate::cyw43439) async fn create<R: Fullmac + 'static>(
         started: IrqSafeSpinLock::new(None),
         listens: IrqSafeSpinLock::new(Vec::new()),
         filters: IrqSafeSpinLock::new(Vec::new()),
+        scan_ies: IrqSafeSpinLock::new(Vec::new()),
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
@@ -444,6 +494,8 @@ pub struct P2pWdev {
     started: IrqSafeSpinLock<Option<RadioInterfaceIdentity>>,
     listens: IrqSafeSpinLock<Vec<Listen>>,
     filters: IrqSafeSpinLock<Vec<Filter>>,
+    /// IEs of the last WDEV scan's BSSes (`scan_information_elements`).
+    scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -749,6 +801,43 @@ impl WirelessNetIface for P2pWdev {
     }
     fn p2p_interface_types(&self) -> Vec<u32> {
         alloc::vec![10]
+    }
+    /// The wiphy's `max_scan_ssids`, as the primary advertises it.
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+    fn async_p2p_device_scan_control(&self) -> bool {
+        true
+    }
+    /// `brcmf_cfg80211_scan` on the P2P_DEVICE wdev (`check_vif_up`:
+    /// READY, else `-EIO`), see `Device::p2p_device_scan_operation`.
+    async fn p2p_device_scan_async(
+        &self,
+        authority: &RadioControlAuthority,
+        request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        let parent = self.request_current(authority)?;
+        if !self.started() {
+            return Err(WirelessError::HardwareError);
+        }
+        let results = parent.p2p_device_scan(request).await?;
+        self.request_current(authority)?;
+        let mut bsses = Vec::with_capacity(results.len());
+        let mut ies = Vec::with_capacity(results.len());
+        for (bss, elements) in results {
+            ies.push((bss.bssid, elements));
+            bsses.push(bss);
+        }
+        let replaced = core::mem::replace(&mut *self.scan_ies.lock(), ies);
+        drop(replaced);
+        Ok(bsses)
+    }
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        self.scan_ies
+            .lock()
+            .iter()
+            .find(|(address, _)| *address == bssid)
+            .map(|(_, elements)| elements.clone())
     }
     /// `brcmf_p2p_start_device` (`brcmf_p2p_enable_discovery`, READY).
     async fn start_p2p_device_async(

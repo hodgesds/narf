@@ -944,6 +944,30 @@ Closed/rebound sockets, deleted/replaced registrations or revoked grants
 cannot publish old success or events to a successor. These shared defaults
 advertise no P2P mode and refuse unsupported native operations.
 
+`NL80211_CMD_TRIGGER_SCAN` (33) and `GET_SCAN` (32) also accept
+`NL80211_ATTR_WDEV` (153), as Linux `nl80211_trigger_scan`/`nl80211_dump_scan`
+take the wdev from it (`nl80211/p2p_scan_async.rs`). A netdev WDEV resolves to
+its IFINDEX (both selectors, when supplied, must name the same netdev) and is
+then exactly the IFINDEX request. An actual control-only WDEV is routed to
+`p2p_device_scan_async(authority, ScanRequest)` only when the iftype is
+P2P_DEVICE (10) and `async_p2p_device_scan_control()` opts in; the defaults
+(`false`, `NotSupported`) refuse it with `-EOPNOTSUPP`, so drivers without the
+hook (iwlwifi, mt76: discovery by ROC + management frames) are unchanged and
+every IFINDEX scan keeps `scan`/`scan_with_flags`. The request parses like an
+IFINDEX scan (no IFINDEX alias, no `ScanFlags` bit), one scan per WDEV is in
+flight (`-EBUSY`, Linux `rdev->scan_req`), and it runs under a reserved Radio
+authority bound to the source like the other control-WDEV operations, so the
+ACK follows native completion (Linux ACKs at `rdev_scan` acceptance). On
+success the WDEV's result cache (IEs from `scan_information_elements` on the
+same WDEV) is replaced and `NL80211_CMD_NEW_SCAN_RESULTS` with
+`NL80211_ATTR_WIPHY` + `NL80211_ATTR_WDEV` and no IFINDEX
+(`nl80211_prep_scan_msg` for a wdev without netdev) goes to the `scan` group
+before the ACK; a failure is the ACK errno only. A WDEV `GET_SCAN` dump returns
+that cache with the WDEV selector (`nl80211_send_bss`). Linux keeps one BSS list
+per wiphy; the netdev and WDEV caches here are separate. Written, unexecuted:
+`smoke_nl80211_wdev_scan_routing_keeps_ifindex_scans`
+(`nl80211/p2p_scan_tests.rs`).
+
 `async_p2p_management_rx_control` opts an actual control WDEV into the
 source-bound `REGISTER_FRAME` path and `register_mgmt_frame_radio_async`.
 The caller supplies its WDEV and explicit current child authority, without

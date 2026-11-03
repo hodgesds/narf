@@ -1011,6 +1011,24 @@ pub trait WirelessNetIface: Interface {
     ) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
+    /// `NL80211_CMD_TRIGGER_SCAN` addressed by `NL80211_ATTR_WDEV` to an
+    /// actual control-only P2P_DEVICE WDEV (Linux `nl80211_trigger_scan`
+    /// → `rdev_scan` with the P2P_DEVICE `wdev`). Off by default: such a
+    /// WDEV scan is then refused with `-EOPNOTSUPP`, and every ifindex scan
+    /// keeps `scan`/`scan_with_flags`.
+    fn async_p2p_device_scan_control(&self) -> bool {
+        false
+    }
+    /// The WDEV scan itself, bound to the exact current request. Returned
+    /// BSSes are this WDEV's scan results; their IEs come from
+    /// `scan_information_elements` on the same WDEV.
+    async fn p2p_device_scan_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
 
     /// Opt into scheduled-scan acknowledgements after native completion.
     /// This flag supplies no grant: radio_control_generation and the actual

@@ -19,6 +19,11 @@ pub(super) enum Operation {
         cookie: u64,
         request: crate::MgmtTxRequest,
     },
+    /// `nl80211_trigger_scan` on the control WDEV (`p2p_scan_async`).
+    Scan {
+        request: crate::ScanRequest,
+        guard: super::p2p_scan_async::ScanGuard,
+    },
 }
 /// Only these explicitly opted-in control-only operations may consult a
 /// fresh child grant retained on the actual creating socket. Legacy callers
@@ -338,6 +343,30 @@ pub(super) fn defer(
                             command: FRAME,
                             attrs,
                         });
+                        Ok(())
+                    }
+                    Operation::Scan { request, guard } => {
+                        let mut results = iface
+                            .p2p_device_scan_async(&call, request)
+                            .await
+                            .map_err(errno)?;
+                        call.check_for(iface.as_ref()).map_err(errno)?;
+                        results.truncate(256);
+                        let results = results
+                            .into_iter()
+                            .map(|bss| {
+                                let ies = iface
+                                    .scan_information_elements(bss.bssid)
+                                    .unwrap_or_default();
+                                (bss, ies)
+                            })
+                            .collect();
+                        let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).ok_or(ENODEV)?;
+                        call.require_link().map_err(errno)?;
+                        guard.store(results);
+                        // Scan done precedes the deferred ACK; the guard
+                        // (`rdev->scan_req`) ends with this request.
+                        guard.publish_done(wiphy);
                         Ok(())
                     }
                     Operation::Roc {

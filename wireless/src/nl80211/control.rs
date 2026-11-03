@@ -20,6 +20,8 @@ mod ap_async;
 mod ap_key_async;
 #[path = "p2p_async.rs"]
 mod p2p_async;
+#[path = "p2p_scan_async.rs"]
+mod p2p_scan_async;
 #[path = "sched_async.rs"]
 mod sched_async;
 #[path = "virtual_async.rs"]
@@ -1190,8 +1192,25 @@ fn route(
     if !matches!(command, SCAN | GET_SCAN | CONNECT | DISCONNECT) {
         return super::handle_in(command, bytes, dump, context.net_ns_id);
     }
-    let attrs = attributes(bytes)?;
-    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
+    let mut attrs = attributes(bytes)?;
+    // `nl80211_trigger_scan` / `nl80211_dump_scan` take their wdev from
+    // NL80211_ATTR_WDEV as well as from a netdev IFINDEX. An actual
+    // control-only WDEV (P2P_DEVICE) has its own source-bound path; a netdev
+    // WDEV resolves to (and must agree with) its IFINDEX.
+    let wdev_index = if matches!(command, SCAN | GET_SCAN) && attr(&attrs, 153).is_some() {
+        let (iface, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
+        let Some(index) = index else {
+            return p2p_scan_async::handle(command, &attrs, dump, context, deferred, iface);
+        };
+        attrs.retain(|(kind, _)| *kind != 153);
+        Some(index)
+    } else {
+        None
+    };
+    let index = match wdev_index {
+        Some(index) => index,
+        None => u32_attr(&attrs, 3)?.ok_or(EINVAL)?,
+    };
     let iface = crate::registry::list()
         .into_iter()
         .find(|iface| {
@@ -4478,6 +4497,23 @@ fn scan_reply(
 ) -> GenlReply {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    scan_reply_with(attrs, bss, information_elements, associated)
+}
+
+/// `nl80211_send_bss` for a wdev without a netdev: the selector is
+/// `NL80211_ATTR_WDEV` (`wdev_id`) instead of `NL80211_ATTR_IFINDEX`.
+fn scan_reply_wdev(wdev: u64, bss: &crate::BssInfo, information_elements: &[u8]) -> GenlReply {
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 153, &wdev.to_ne_bytes());
+    scan_reply_with(attrs, bss, information_elements, false)
+}
+
+fn scan_reply_with(
+    mut attrs: Vec<u8>,
+    bss: &crate::BssInfo,
+    information_elements: &[u8],
+    associated: bool,
+) -> GenlReply {
     let mut nested = Vec::new();
     push_attr(&mut nested, 1, &bss.bssid);
     if associated {

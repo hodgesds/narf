@@ -127,6 +127,12 @@ pub(super) trait Roles: Send + Sync {
         &self,
         operation: p2p_device::Operation,
     ) -> Result<p2p_device::Outcome, WirelessError>;
+    /// `brcmf_cfg80211_scan` with the P2P_DEVICE `request->wdev`; each BSS
+    /// with its IEs.
+    async fn p2p_device_scan(
+        &self,
+        request: ScanRequest,
+    ) -> Result<Vec<(BssInfo, Vec<u8>)>, WirelessError>;
     /// The AP serialization lease the P2P_DEVICE shares with its primary.
     fn p2p_reserve(
         &self,
@@ -951,6 +957,12 @@ impl<R: Fullmac + 'static> Roles for Device<R> {
         operation: p2p_device::Operation,
     ) -> Result<p2p_device::Outcome, WirelessError> {
         self.p2p_device_operation(operation).await
+    }
+    async fn p2p_device_scan(
+        &self,
+        request: ScanRequest,
+    ) -> Result<Vec<(BssInfo, Vec<u8>)>, WirelessError> {
+        self.p2p_device_scan_operation(request).await
     }
     fn p2p_reserve(
         &self,

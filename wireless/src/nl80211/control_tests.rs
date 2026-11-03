@@ -6,6 +6,8 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
 #[path = "p2p_iftype_tests.rs"]
 mod p2p_iftype;
+#[path = "p2p_scan_tests.rs"]
+mod p2p_scan;
 #[path = "permission_tests.rs"]
 mod permission;
 #[path = "pmf_tests.rs"]

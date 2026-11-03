@@ -1471,9 +1471,29 @@ grants and `qtxpower` apply as for an ordinary scan. Results are the
 the discovery bsscfg queues, not SSID-filtered (Linux reports every BSS);
 other discovery events keep their `p2p.c` handlers. The P2P escan is
 refused while the primary is associated (the scan loop consumes the
-primary event queue, as `scan`). Not reachable: `TRIGGER_SCAN` addressed
-by `NL80211_ATTR_WDEV` to the P2P_DEVICE (the generic nl80211 scan path
-resolves only an ifindex), and scans on the P2P_CLIENT/GO shells.
+primary event queue, as the ordinary station `scan`, which NARF also
+refuses while associated). Linux has no such restriction
+(`brcmf_p2p_scan_prep` and `brcmf_p2p_run_escan` only consult the GO
+bsscfg; the escan handler is wiphy-wide), so `p2p_find` while the primary
+is connected is a documented gap: lifting it needs the associated station
+loop to divert `BRCMF_E_ESCAN_RESULT` and keep servicing link events, the
+same change an associated ordinary scan needs. Scans on the
+P2P_CLIENT/GO shells are not offered.
+
+`TRIGGER_SCAN` addressed by `NL80211_ATTR_WDEV` to the P2P_DEVICE
+(wpa_supplicant's `p2p_find`; generic routing in
+`wireless/specification/spec.md` §3.1) reaches
+`P2pWdev::p2p_device_scan_async` (`async_p2p_device_scan_control`):
+`brcmf_cfg80211_scan` with `request->wdev` the P2P_DEVICE. `check_vif_up`
+needs READY (START_P2P_DEVICE), else `HardwareError` (`-EIO`). Through
+`Roles::p2p_device_scan` → `Device::p2p_device_scan_operation` under the
+primary state mutex, a `DIRECT-` request is the P2P escan above
+(`brcmf_p2p_scan_prep`, `brcmf_p2p_run_escan`) and any other request goes
+over the primary (`vif = bss_idx[P2PAPI_BSSCFG_PRIMARY].vif`,
+`brcmf_do_escan`). Each BSS's IEs (P2P/WPS IEs of probe responses) are
+taken from the station cache and kept on the WDEV for
+`scan_information_elements`; the WDEV advertises the primary's
+`max_scan_ssids` (16).
 
 `mgmt_tx` probe-response branch: on the WDEV, a probe response's IEs
 after `DOT11_MGMT_HDR_LEN + DOT11_BCN_PRB_FIXED_LEN` become the discovery
