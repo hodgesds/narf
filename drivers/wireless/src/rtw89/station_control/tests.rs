@@ -1103,3 +1103,124 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c
 );
+
+/// AP elements for a wide-channel BSS: rates, HT Capabilities (20/40, SGI20/
+/// SGI40, LDPC, RX MCS0..15), HT Operation (`secondary` 1 above / 3 below),
+/// and on 5GHz VHT Capabilities (2SS MCS0..9) and VHT Operation.
+fn wide_ap_ies(primary: u8, secondary: u8, vht: Option<(u8, u8)>) -> Vec<u8> {
+    let mut ies = if primary > 14 {
+        vec![1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]
+    } else {
+        vec![1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36]
+    };
+    let mut ht = [0u8; 26];
+    ht[0] = 0x63;
+    ht[2] = 3;
+    ht[3] = 255;
+    ht[4] = 255;
+    ht[15] = 1;
+    ies.extend_from_slice(&[45, 26]);
+    ies.extend_from_slice(&ht);
+    let mut op = [0u8; 22];
+    op[0] = primary;
+    op[1] = secondary | if secondary != 0 { 4 } else { 0 };
+    ies.extend_from_slice(&[61, 22]);
+    ies.extend_from_slice(&op);
+    if let Some((width, center)) = vht {
+        ies.extend_from_slice(&[191, 12, 0x30, 0, 0, 0, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]);
+        ies.extend_from_slice(&[192, 5, width, center, 0, 0xfc, 0xff]);
+    }
+    ies
+}
+
+fn smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef() -> TestResult {
+    use super::super::operating_channel::{Profile, Width};
+    // core.c rtw89_init_ht_cap width bits over the HT20 profile.
+    let Some(ht40) = local_ht40() else {
+        return TestResult::Fail("HT40 capability rejected by the shared API");
+    };
+    let body = ht40.capability_body();
+    let narrow = local_ht().capability_body();
+    if u16::from_le_bytes([body[0], body[1]]) != 0x116f || body[2..] != narrow[2..] {
+        return TestResult::Fail("HT40 capability is not rtw89_init_ht_cap width bits over HT20");
+    }
+    // rtw89_init_vht_cap restricted: RXLDPC|SGI80|RXSTBC1, no 160/TXSTBC/BF.
+    let Some(vht) = local_vht80() else {
+        return TestResult::Fail("VHT80 capability rejected by the shared API");
+    };
+    let vbody = vht.capability_body();
+    if u32::from_le_bytes([vbody[0], vbody[1], vbody[2], vbody[3]]) != 0x130
+        || vbody[4..6] != [0xfa, 0xff]
+        || vbody[8..10] != [0xfe, 0xff]
+    {
+        return TestResult::Fail("VHT80 capability differs from the restricted Linux profile");
+    }
+    // HE PHY cap0: 40MHz-in-2.4GHz / 40-80MHz-in-5GHz; rest is HE20's.
+    let (Some(he2), Some(he5), Some(he)) = (local_he_wide(false), local_he_wide(true), local_he())
+    else {
+        return TestResult::Fail("wide HE capability rejected");
+    };
+    let (b2, b5, b) = (
+        he2.capability_body(),
+        he5.capability_body(),
+        he.capability_body(),
+    );
+    if b2[7] != 0x02 || b5[7] != 0x04 || b2[8..] != b[8..] || b5[8..] != b[8..] || b2[..7] != b[..7]
+    {
+        return TestResult::Fail("wide HE PHY cap0 differs from rtw89_init_he_cap");
+    }
+    // 2.4GHz HT40+ on primary 1: offered only for the admitted HT40+ profile.
+    let ies = wide_ap_ies(1, 1, None);
+    let Some(plus) = Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("HT40+ profile missing");
+    };
+    if wide_phy(&ies, 1, true, &[]).is_some() {
+        return TestResult::Fail("wide PHY offered without an admitted profile");
+    }
+    let other = Profile::new_2ghz_40(5, false).unwrap();
+    if wide_phy(&ies, 1, true, &[other]).is_some() {
+        return TestResult::Fail("wide PHY offered for a different admitted chandef");
+    }
+    match wide_phy(&ies, 1, true, &[other, plus]) {
+        Some((local, profile)) if profile == plus => {
+            if local.he().map(|he| he.capability_body()) != Some(b2.clone()) {
+                return TestResult::Fail("2.4GHz HT40 join lacks the 40MHz HE capability");
+            }
+        }
+        _ => return TestResult::Fail("admitted HT40+ chandef not offered"),
+    }
+    // A 20MHz AP never maps to a wide profile.
+    if wide_phy(&wide_ap_ies(1, 0, None), 1, false, &[plus]).is_some() {
+        return TestResult::Fail("20MHz BSS offered a wide PHY");
+    }
+    // 5GHz VHT80 at center 42 (primary 40): 80MHz when admitted, else the
+    // admitted 40MHz half, else nothing.
+    let ies = wide_ap_ies(40, 3, Some((1, 42)));
+    let (Some(p80), Some(p40)) = (
+        Profile::new_5ghz(40, Width::Mhz80),
+        Profile::new_5ghz(40, Width::Mhz40),
+    ) else {
+        return TestResult::Fail("5GHz wide profiles missing");
+    };
+    if !matches!(wide_phy(&ies, 40, true, &[p40, p80]), Some((_, p)) if p == p80) {
+        return TestResult::Fail("admitted VHT80 chandef not offered");
+    }
+    if !matches!(wide_phy(&ies, 40, false, &[p40]), Some((_, p)) if p == p40) {
+        return TestResult::Fail("admitted 40MHz half of a VHT80 BSS not offered");
+    }
+    if wide_phy(
+        &ies,
+        40,
+        false,
+        &[Profile::new_5ghz(44, Width::Mhz40).unwrap()],
+    )
+    .is_some()
+    {
+        return TestResult::Fail("wide PHY offered for a chandef not containing the primary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef
+);

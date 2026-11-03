@@ -393,6 +393,53 @@ impl Startup {
                 .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
         result
     }
+    /// RTL8852B retune of the Ready unassociated radio to one signed-admitted
+    /// 40/80MHz `profile` (`Native::retune_full_radio_to`), with
+    /// `retune_channel`'s retry/terminal split. RTL8852C wide profiles are
+    /// `retune_channel_c`'s.
+    pub(super) async fn retune_wide(
+        &mut self,
+        profile: super::operating_channel::Profile,
+    ) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852B)
+        {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: as `retune_channel`.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_full_radio_to(
+                        &mut owner.full_radio,
+                        &owner.radio,
+                        &owner.rfk,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        profile,
+                        false,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
+        result
+    }
     /// RTL8852C retune of the Ready radio to one signed-admitted typed
     /// `profile` (`Native::retune_radio_c`), with `retune_channel`'s
     /// retry/terminal split: a refusal that withheld nothing (the C ordinary

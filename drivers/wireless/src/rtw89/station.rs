@@ -198,6 +198,23 @@ pub(super) unsafe trait Io: Send {
     async fn station_retune(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Signed-admitted RTL8852B 40/80MHz operating channels
+    /// (`Native::admitted_wide`). Default: none, so the station stays 20MHz.
+    fn station_wide_channels(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<super::operating_channel::Profile>, power::Error> {
+        Ok(alloc::vec::Vec::new())
+    }
+    /// Retune the Ready unassociated radio to one admitted 40/80MHz
+    /// `profile` (`Native::retune_full_radio_to`), same refusal contract as
+    /// [`Self::station_retune`].
+    async fn station_retune_wide(
+        &mut self,
+        _: super::operating_channel::Profile,
+        _: &Admission,
+    ) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// Associated channel switch (CSA): retune the Ready radio to `primary`
     /// keeping the installed peer, same admission/record rules as
     /// [`Self::station_retune`]. `Busy` is a proven-unpublished refusal.
@@ -677,6 +694,9 @@ pub(super) struct State {
     witness_scan: Option<ScanGeneration>,
     /// Actual primary of the retained radio (native retune epoch below).
     channel: u8,
+    /// The admitted 40/80MHz operating channel the radio is tuned to around
+    /// `channel`, if any (`None`: the 20MHz profile of `channel`).
+    wide: Option<super::operating_channel::Profile>,
     /// Native retune epoch this state's channel-bound work was built for.
     epoch: Option<u32>,
     /// Accepted AP channel switch (mac80211 `link->csa`), if any.
@@ -815,6 +835,7 @@ impl State {
             witness: BeaconWitness::new(),
             witness_scan: None,
             channel: 1,
+            wide: None,
             epoch: None,
             csa: None,
         }
@@ -1400,6 +1421,16 @@ impl State {
         };
         if self.phase != Phase::Open || !typed(csa.primary) {
             return Err(Error::State);
+        }
+        // A 40/80MHz link cannot follow the switch: the native CSA owner
+        // retunes 20MHz profiles only. mac80211 disconnects when it cannot
+        // use the new chandef (`ieee80211_sta_process_chanswitch` ->
+        // connection loss), so the link fails instead of narrowing silently.
+        if self.wide.is_some() {
+            if !self.admission.teardown_pending() {
+                self.fail(io);
+            }
+            return Err(Error::PeerLost);
         }
         let now = self.now()?;
         let quiet = self.pending.is_empty()
@@ -2310,7 +2341,7 @@ impl State {
         if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
             return Err(Error::State);
         }
-        if primary == self.channel {
+        if primary == self.channel && self.wide.is_none() {
             return Ok(());
         }
         let deadline = self.now()?.saturating_add(1000);
@@ -2320,8 +2351,45 @@ impl State {
                 match io.station_retune(primary, &self.admission).await {
                     Ok(epoch) => {
                         self.channel = primary;
+                        self.wide = None;
                         self.epoch = Some(epoch);
                         // rtw89_track_work statistics belong to the old primary.
+                        self.track = super::track::Tracker::default();
+                        return Ok(());
+                    }
+                    Err(power::Error::Busy) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if self.now()? >= deadline {
+                return Err(Error::State);
+            }
+            self.environment.pause().await;
+        }
+    }
+    /// [`Self::retune`] to one admitted 40/80MHz operating channel
+    /// (`Io::station_retune_wide`): mac80211 `ieee80211_prep_channel` with
+    /// the AP chandef the local capability selects (`wide_phy`).
+    async fn retune_wide(
+        &mut self,
+        io: &mut impl Io,
+        profile: super::operating_channel::Profile,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
+            return Err(Error::State);
+        }
+        if self.wide == Some(profile) {
+            return Ok(());
+        }
+        let deadline = self.now()?.saturating_add(1000);
+        loop {
+            self.poll(io)?;
+            if self.pending.is_empty() {
+                match io.station_retune_wide(profile, &self.admission).await {
+                    Ok(epoch) => {
+                        self.channel = profile.primary();
+                        self.wide = Some(profile);
+                        self.epoch = Some(epoch);
                         self.track = super::track::Tracker::default();
                         return Ok(());
                     }
@@ -2442,9 +2510,40 @@ impl State {
             }
             None => None,
         };
+        // HT is offered only with an AP WMM element and the signed HT20
+        // program (which itself requires WMM and firmware RA).
+        let ap_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+            .ok()
+            .flatten()
+            .is_some();
+        let ht_allowed = ap_wmm && io.station_wmm_allowed()? && io.station_ht_allowed()?;
+        let he_allowed = ht_allowed && io.station_he_allowed()?;
+        // A 40/80MHz join needs an admitted wide record for exactly the
+        // chandef the AP and local capability select, wholly active (no
+        // passive-only subchannel: no beacon witness covers a wide span).
+        let wide = if ht_allowed {
+            let admitted = io.station_wide_channels()?;
+            super::station_control::wide_phy(
+                &candidate.bss.information_elements,
+                candidate.bss.channel,
+                he_allowed,
+                &admitted,
+            )
+            .filter(|(_, profile)| {
+                profile
+                    .subchannels()
+                    .all(|ch| !passive_only(policy.as_ref(), ch))
+            })
+        } else {
+            None
+        };
         // mac80211 ieee80211_prep_channel: the station joins on the BSS's
-        // own primary; the native owner retunes (signed record required).
-        self.retune(io, candidate.bss.channel).await?;
+        // own primary (or the selected wide chandef around it); the native
+        // owner retunes (signed record required).
+        match wide {
+            Some((_, profile)) => self.retune_wide(io, profile).await?,
+            None => self.retune(io, candidate.bss.channel).await?,
+        }
         if grant.is_some() {
             io.station_passive_tx(grant)?;
         }
@@ -2475,22 +2574,23 @@ impl State {
                 JoinOptions::default().with_akms(AkmSet::SAE),
             ),
         };
-        // HT is offered only with an AP WMM element and the signed HT20
-        // program (which itself requires WMM and firmware RA).
-        let ap_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
-            .ok()
-            .flatten()
-            .is_some();
-        let mut plan = if ap_wmm && io.station_wmm_allowed()? && io.station_ht_allowed()? {
-            let mut local =
-                narf_wireless::association::phy::LocalPhy::ht20(super::station_control::local_ht())
+        let mut plan = if ht_allowed {
+            let local = match wide {
+                Some((local, _)) => local,
+                None => {
+                    let mut local = narf_wireless::association::phy::LocalPhy::ht20(
+                        super::station_control::local_ht(),
+                    )
                     .map_err(|_| Error::Profile)?;
-            // HE is offered only under the signed HE20 program (which
-            // itself requires HT20).
-            if io.station_he_allowed()? {
-                let he = super::station_control::local_he().ok_or(Error::Profile)?;
-                local = local.with_he(he).map_err(|_| Error::Profile)?;
-            }
+                    // HE is offered only under the signed HE20 program
+                    // (which itself requires HT20).
+                    if he_allowed {
+                        let he = super::station_control::local_he().ok_or(Error::Profile)?;
+                        local = local.with_he(he).map_err(|_| Error::Profile)?;
+                    }
+                    local
+                }
+            };
             JoinPlan::prepare_with_options(
                 &candidate.bss,
                 self.own,
@@ -2502,6 +2602,15 @@ impl State {
         } else {
             JoinPlan::prepare_with_options(&candidate.bss, self.own, ssid, mode, None, options)?
         };
+        // The plan's own selection must be the chandef the radio was tuned to.
+        if let Some((_, profile)) = wide {
+            let offer = plan.offered_phy().ok_or(Error::Profile)?;
+            if offer.center_channel() != profile.center()
+                || offer.occupied_channels().len() != 1 << profile.width() as usize
+            {
+                return Err(Error::Profile);
+            }
+        }
         plan.append_sme_ies(ies)?;
         if let Credential::Sae(password) = &credential {
             use narf_wireless::sae::{SaeError, SaeSession};

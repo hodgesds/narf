@@ -1040,6 +1040,136 @@ pub(super) fn local_he() -> Option<narf_wireless::association::he::LocalHe> {
     // RX MCS0..11 on both RX paths, TX MCS0..11 on the single TX path.
     narf_wireless::association::he::LocalHe::new(MAC, PHY, 0xfffa, 0xfffe).ok()
 }
+/// `local_he` with the core.c `rtw89_init_he_cap` HE PHY cap0 channel-width
+/// bit of the band: `CHANNEL_WIDTH_SET_40MHZ_IN_2G` on 2.4GHz,
+/// `CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G` on 5GHz (RTL8852B
+/// `support_bandwidths` has no 160MHz). Every other bit is `local_he`'s.
+/// Offered only for an admitted wide operating channel (`wide_phy`).
+pub(super) fn local_he_wide(ghz5: bool) -> Option<narf_wireless::association::he::LocalHe> {
+    use narf_wireless::association::he::LocalHe;
+    let base = local_he()?;
+    let narrow = base.capability();
+    let mut phy = narrow.phy_capability();
+    phy[0] = if ghz5 { 0x04 } else { 0x02 };
+    LocalHe::new(narrow.mac_capability(), phy, 0xfffa, 0xfffe).ok()
+}
+/// Wide-channel station capability bound by every 40/80MHz record identity
+/// (`radio_policy::Board::new_noninitial`): the exact HT40/VHT80/HE-wide
+/// bodies `wide_phy` may offer on such a channel.
+pub(super) fn wide_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B wide station v1; rtw89_init_ht_cap SUP_WIDTH_20_40 DSSSCCK40 SGI40; rtw89_init_vht_cap 5GHz SGI80 RXLDPC RXSTBC1 RX2SS TX1SS MCS0..9; HE PHY cap0 40MHz-2G / 40-80MHz-5G; offered only on the admitted chandef");
+    if let Some(ht) = local_ht40() {
+        hash.update(&ht.capability_body());
+    }
+    if let Some(vht) = local_vht80() {
+        hash.update(&vht.capability_body());
+    }
+    for ghz5 in [false, true] {
+        hash.update(
+            &local_he_wide(ghz5)
+                .map(|he| he.capability_body())
+                .unwrap_or_default(),
+        );
+    }
+    hash.finalize()
+}
+/// Local 20/40MHz HT capability: `local_ht` plus the core.c
+/// `rtw89_init_ht_cap` width bits `SUP_WIDTH_20_40 | DSSSCCK40 | SGI_40`.
+/// Every non-width field (MCS sets, A-MPDU factor/density, LDPC, RX STBC1,
+/// no TX STBC/greenfield/large A-MSDU) is `local_ht`'s.
+pub(super) fn local_ht40() -> Option<narf_wireless::association::phy::LocalHt> {
+    use narf_wireless::association::phy::{HtGi, HtWidth, LocalHt};
+    let narrow = local_ht().capability_body();
+    let mut mcs = [0; 10];
+    mcs.copy_from_slice(&narrow[3..13]);
+    let gi = HtGi {
+        rx20: true,
+        tx20: true,
+        rx40: true,
+        tx40: true,
+    };
+    Some(
+        LocalHt::new(
+            mcs,
+            mcs,
+            HtWidth::TwentyForty,
+            gi,
+            narrow[2] & 3,
+            narrow[2] >> 2 & 7,
+        )
+        .ok()?
+        .with_ldpc(true, true)
+        .with_rx_stbc(true)
+        .with_dsss_cck40(true),
+    )
+}
+/// Local VHT80 capability on 5GHz: core.c `rtw89_init_vht_cap` restricted to
+/// the retained TX-A/RX-AB profile: VHT-MCS0..9 RX on both paths and TX on
+/// the single path (`hal->rx_nss` 2 / `tx_nss` 1 maps), SHORT_GI_80, RXLDPC
+/// and RXSTBC_1. Cleared like the HT/HE profiles: TXSTBC (second TX path),
+/// SU/MU beamformee and STS (no sounding feedback owner), HTC_VHT (no VHT
+/// A-Control), the large `max_vht_mpdu_cap` (no large RX A-MSDU promise) and
+/// the A-MPDU length exponent beyond the HT factor; no 160MHz on RTL8852B.
+pub(super) fn local_vht80() -> Option<narf_wireless::association::phy::LocalVht> {
+    let factor = local_ht().capability_body()[2] & 3;
+    narf_wireless::association::phy::LocalVht::new(0xfffa, 0xfffe, true, true, factor)
+        .ok()
+        .map(|vht| vht.with_ldpc(true, true).with_rx_stbc(true))
+}
+/// Local PHY for joining the AP at `primary` over an admitted 40/80MHz
+/// operating channel, and that exact channel. Mirrors mac80211
+/// `ieee80211_determine_ap_chan` (the chandef is the narrower of the AP's
+/// HT/VHT/HE operation and the local capability): candidates are tried from
+/// widest (5GHz VHT80, then HT40), and one is used only when its selected
+/// chandef is exactly a profile in `admitted` (a signed wide record whose
+/// host rule currently permits it). `None` keeps the 20MHz join unchanged.
+/// HE is added (`local_he_wide`) only when `he` (the signed HE program).
+pub(super) fn wide_phy(
+    ies: &[u8],
+    primary: u8,
+    he: bool,
+    admitted: &[super::operating_channel::Profile],
+) -> Option<(
+    narf_wireless::association::phy::LocalPhy,
+    super::operating_channel::Profile,
+)> {
+    use narf_wireless::association::phy::{LocalPhy, Offer, Width};
+    if admitted.is_empty() {
+        return None;
+    }
+    let ghz5 = primary > 14;
+    let ht = local_ht40()?;
+    let mut candidates = alloc::vec::Vec::new();
+    if ghz5 {
+        candidates.push(LocalPhy::vht80(ht, local_vht80()?).ok()?);
+    }
+    candidates.push(LocalPhy::ht40(ht).ok()?);
+    for mut local in candidates {
+        if he {
+            local = local.with_he(local_he_wide(ghz5)?).ok()?;
+        }
+        let Ok(Some(offer)) = Offer::from_elements(local, ies, primary) else {
+            continue;
+        };
+        let width = match offer.width() {
+            Width::Forty => super::operating_channel::Width::Mhz40,
+            Width::Eighty => super::operating_channel::Width::Mhz80,
+            _ => continue,
+        };
+        let center = offer.center_channel();
+        let Some(profile) =
+            super::operating_channel::Profile::new_wide(primary, width, center > primary)
+                .filter(|p| p.center() == center)
+        else {
+            continue;
+        };
+        if admitted.contains(&profile) {
+            return Some((local, profile));
+        }
+    }
+    None
+}
 /// Local HT20 capability (Linux `rtw89_init_ht_cap` restricted to the
 /// retained TX-A/RX-AB 20MHz profile).
 pub(super) fn local_ht() -> narf_wireless::association::phy::LocalHt {

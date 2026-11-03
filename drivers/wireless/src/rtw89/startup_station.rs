@@ -223,6 +223,27 @@ unsafe impl Io for Startup {
         admission.check()?;
         Ok(epoch)
     }
+    fn station_wide_channels(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::rtw89::operating_channel::Profile>, power::Error> {
+        self.station_allowed()?;
+        // No full-radio wide scope (no signed wide record path): 20MHz only.
+        match self.station_native()?.admitted_wide() {
+            Err(power::Error::Unsupported) => Ok(alloc::vec::Vec::new()),
+            other => other,
+        }
+    }
+    async fn station_retune_wide(
+        &mut self,
+        profile: crate::rtw89::operating_channel::Profile,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        self.station_allowed()?;
+        admission.check()?;
+        let epoch = self.retune_wide(profile).await?;
+        admission.check()?;
+        Ok(epoch)
+    }
     async fn station_switch_channel(
         &mut self,
         primary: u8,

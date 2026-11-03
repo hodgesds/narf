@@ -235,6 +235,11 @@ impl Board {
         ] {
             h.update(&recipe);
         }
+        // A 40/80MHz record also binds the wide station capability its
+        // channel lets the station offer (`station_control::wide_phy`).
+        if power.channel().width() != super::operating_channel::Width::Mhz20 {
+            h.update(&super::station_control::wide_fingerprint());
+        }
         power.bind(&mut h);
         // Actual MAC source profile enables CCK+OFDM automatic rate selection and
         // source20MHz response RSC. TX-A CCTL cannot imply autonomous path-A only.

@@ -644,6 +644,10 @@ impl Native {
     pub(in crate::rtw89) fn admitted_wide(
         &self,
     ) -> Result<alloc::vec::Vec<operating_channel::Profile>, power::Error> {
+        // RTL8852C wide operating channels belong to its own C records.
+        if self.c_ordinary()? {
+            return Ok(alloc::vec::Vec::new());
+        }
         let qualification = self.full_radio_scope().ok_or(power::Error::Unsupported)?;
         let mut admitted = alloc::vec::Vec::new();
         for profile in wide_profiles() {
