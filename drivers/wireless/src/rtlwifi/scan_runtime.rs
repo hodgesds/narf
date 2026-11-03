@@ -18,7 +18,10 @@ impl Observation {
             bssid: candidate.bss.bssid,
             ssid: candidate.bss.ssid.clone(),
             channel: u32::from(candidate.bss.channel),
-            frequency_mhz: 2407 + u32::from(candidate.bss.channel) * 5,
+            frequency_mhz: crate::rtlwifi::rtl8821ae::envelope::station_frequency_mhz(
+                candidate.bss.channel,
+            )
+            .unwrap_or(0),
             rssi: i8::MIN,
             security: if candidate.rsne.is_some() {
                 narf_wireless::scan::BssSecurity::Wpa2
@@ -40,8 +43,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             })
             .map(|entry| entry.candidate.bss.information_elements.clone())
     }
+    /// 2.4 GHz 1-11, then the RTL8821AE 5 GHz plan; each channel is listed
+    /// only when the profile's `allow_channel` admits it (88EE refuses every
+    /// 5 GHz channel; DFS/NO_IR rules refuse the `NAPC` permission, so such
+    /// channels are neither listed nor scanned).
     pub(super) fn available_channels(&self) -> Vec<u32> {
         (1..=11)
+            .chain(crate::rtlwifi::rtl8821ae::envelope::CHANNELS_5G)
             .filter(|&channel| {
                 self.environment
                     .allow_channel(&self.factory, channel)
@@ -238,8 +246,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         request: &AssociateRequest,
     ) -> Result<(), WirelessError> {
         let channel = u8::try_from(request.channel).map_err(|_| WirelessError::NotSupported)?;
-        if !(1..=11).contains(&channel)
-            || request.frequency_mhz != 2407 + u32::from(channel) * 5
+        if crate::rtlwifi::rtl8821ae::envelope::station_frequency_mhz(channel)
+            != Some(request.frequency_mhz)
             || request.ssid.len() > 32
         {
             return Err(WirelessError::NotSupported);
@@ -253,10 +261,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
 fn requested_channels(request: &ScanRequest) -> Result<Vec<u8>, WirelessError> {
     let mut frequencies = Vec::new();
     for &frequency in &request.frequencies_mhz {
-        if !(2412..=2462).contains(&frequency) || (frequency - 2407) % 5 != 0 {
-            return Err(WirelessError::NotSupported);
-        }
-        let channel = ((frequency - 2407) / 5) as u8;
+        let channel = crate::rtlwifi::rtl8821ae::envelope::station_channel_at(frequency)
+            .ok_or(WirelessError::NotSupported)?;
         if !frequencies.contains(&channel) {
             frequencies.push(channel);
         }
@@ -264,7 +270,7 @@ fn requested_channels(request: &ScanRequest) -> Result<Vec<u8>, WirelessError> {
     let mut channels = Vec::new();
     for &raw in &request.channels {
         let channel = u8::try_from(raw).map_err(|_| WirelessError::NotSupported)?;
-        if !(1..=11).contains(&channel) {
+        if !crate::rtlwifi::rtl8821ae::envelope::station_channel(channel) {
             return Err(WirelessError::NotSupported);
         }
         if !channels.contains(&channel) {

@@ -9,12 +9,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<Option<Geometry>, Error> {
         match width {
             association::phy::Width::Twenty => Ok(None),
-            association::phy::Width::Forty => Geometry::new(
-                operation.primary(),
-                operation.secondary().ok_or(Error::Profile)?,
-            )
-            .map(Some)
-            .map_err(Error::Radio),
+            association::phy::Width::Forty => {
+                let (primary, secondary) = (
+                    operation.primary(),
+                    operation.secondary().ok_or(Error::Profile)?,
+                );
+                // 5 GHz pairs only ever reach the RTL8821AE profile, whose
+                // owner is the only one granted a 5 GHz channel.
+                if primary >= 36 {
+                    Geometry::new_5g(primary, secondary)
+                } else {
+                    Geometry::new(primary, secondary)
+                }
+                .map(Some)
+                .map_err(Error::Radio)
+            }
             _ => Err(Error::Profile),
         }
     }
@@ -81,7 +90,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Ok(None);
         };
         let op = Operating {
-            band: Band::B2g,
+            band: if g.primary() >= 36 {
+                Band::B5g
+            } else {
+                Band::B2g
+            },
             width: if g.prime() == 1 {
                 Width::W40Above
             } else {
@@ -109,13 +122,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         width: Option<super::super::super::ht::Geometry>,
         environment: &impl Environment,
     ) -> Result<(), Error> {
-        use super::super::super::rtl8821ae::envelope::{Band, Operating, Width};
+        use super::super::super::rtl8821ae::envelope::{Operating, Width};
         let current = self.rtl8821ae_power.ok_or(Error::State)?;
         let channel = current.channel();
         let op = match width {
-            None => Operating::legacy20(channel),
+            None => Operating::twenty(channel),
             Some(g) if g.primary() == channel => Operating {
-                band: Band::B2g,
+                band: current.operating().band,
                 width: if g.prime() == 1 {
                     Width::W40Above
                 } else {

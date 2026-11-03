@@ -176,6 +176,16 @@ impl Admission {
         }
     }
 }
+/// Legacy rate shape a join needs: on 2.4 GHz 1 Mb/s supported and basic;
+/// on 5 GHz no CCK rate and 6 Mb/s supported and basic (12-bit
+/// `DESC_RATE*` order, bit 0 = 1 Mb/s, bit 4 = 6 Mb/s).
+fn legacy_rates_fit(rates: u16, basic: u16, five_ghz: bool) -> bool {
+    if five_ghz {
+        (rates | basic) & 0xf == 0 && rates & basic & 0x10 != 0
+    } else {
+        rates & basic & 1 != 0
+    }
+}
 #[derive(Clone, Debug)]
 pub(crate) struct Candidate {
     pub bss: Bss,
@@ -188,8 +198,11 @@ impl Candidate {
         local: [u8; 6],
         ht: Option<&association::phy::LocalPhy>,
     ) -> Result<Self, Error> {
+        // The receive channel is the retained owner's grant: 2.4 GHz 1-11,
+        // or a 5 GHz plan channel that only the RTL8821AE profile is granted.
         let channel = frame.channel();
-        if !(1..=11).contains(&channel) {
+        let five_ghz = super::super::rtl8821ae::envelope::CHANNELS_5G.contains(&channel);
+        if !(1..=11).contains(&channel) && !five_ghz {
             return Err(Error::Profile);
         }
         let observed = if let Some(phy) = ht {
@@ -198,7 +211,14 @@ impl Candidate {
             association::observe(frame, channel, local, None)
         }
         .map_err(Error::Management)?;
-        if observed.basic_rates & 1 == 0 {
+        // The management rate (1 Mb/s on 2.4 GHz, 6 Mb/s on 5 GHz, the
+        // band's lowest `rate_control_send_low` rate) must be basic; a
+        // 5 GHz BSS may not name CCK rates.
+        if !legacy_rates_fit(
+            observed.rates | observed.basic_rates,
+            observed.basic_rates,
+            five_ghz,
+        ) {
             return Err(Error::Profile);
         }
         Ok(Self {
@@ -1046,6 +1066,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .rtl8821ae_power
                 .is_some_and(|p| super::super::rtl8821ae::ht::admitted(&p))
     }
+    /// The RTL8821AE owner holds a 5 GHz channel grant.
+    pub(crate) fn rtl8821ae_five_ghz(&self) -> bool {
+        self.chip == super::Chip::Rtl8821ae
+            && self
+                .rtl8821ae_power
+                .is_some_and(|p| p.operating().band == super::super::rtl8821ae::envelope::Band::B5g)
+    }
     /// The 8821AE `NAPC` envelope that minted this owner's channel grant.
     pub(crate) fn stage_rtl8821ae_calibration(
         &mut self,
@@ -1515,7 +1542,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .ok_or(Error::Profile)?
             }
         } else {
-            0
+            // `_rtl_get_tx_hw_rate` of `rate_control_send_low`: the band's
+            // lowest rate, DESC_RATE1M (2.4 GHz) or DESC_RATE6M (5 GHz,
+            // `rtl_ratetable_5g[0]`).
+            if self.rtl8821ae_five_ghz() {
+                4
+            } else {
+                0
+            }
         };
         let calibration = self
             .station
@@ -1741,7 +1775,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if let Some(p) = wmm {
             super::super::wmm::admit(p, capability & 0x400 != 0)?;
         }
-        if rates & 1 == 0 || basic & 1 == 0 || basic & !0x15f != 0 {
+        if !legacy_rates_fit(rates, basic, self.rtl8821ae_five_ghz()) || basic & !0x15f != 0 {
             return Err(Error::Profile);
         }
         self.station.phase = Phase::Joining;
@@ -1862,6 +1896,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 basic,
                                 self.station.capability,
                                 self.station.ht_profile.is_some(),
+                                self.rtl8821ae_five_ghz(),
                             );
                         }
                         super::super::station_control::configure_rates(
@@ -2601,6 +2636,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             ht: ht.map(|p| [p.tx_mcs()[0], 0]),
             sgi20: ht.is_some_and(|p| p.tx_sgi20()),
             sgi40: ht.is_some_and(|p| p.tx_sgi40()),
+            five_ghz: self.rtl8821ae_five_ghz(),
         };
         let payload = h2c::rate_mask(&peer, bw40, level, true);
         let base = self

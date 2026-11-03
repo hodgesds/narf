@@ -993,6 +993,7 @@ fn smoke_rtl8821ae_ra_mask_rates_within_napc_admission() -> TestResult {
         ht: None,
         sgi20: false,
         sgi40: false,
+        five_ghz: false,
     };
     let n = h2c::Peer {
         ht: Some([0xff, 0]),
@@ -1154,6 +1155,7 @@ fn smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission() -> TestResu
         ht: Some([0xff, 0]),
         sgi20: false,
         sgi40: false,
+        five_ghz: false,
     };
     let mask = h2c::mask_rates(&h2c::rate_mask(&n, false, 0, true)).unwrap_or(0);
     if p.admitted_rates() != 0xfff || p.admits(12) || mask & !p.admitted_rates() == 0 {
@@ -1671,6 +1673,7 @@ fn smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order() -> TestResult {
         ht: None,
         sgi20: false,
         sgi40: false,
+        five_ghz: false,
     };
     let b = h2c::Peer {
         legacy: 0x000f,
@@ -1681,6 +1684,7 @@ fn smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order() -> TestResult {
         ht: Some([0xff, 0]),
         sgi20: true,
         sgi40: false,
+        five_ghz: false,
     };
     if h2c::rate_mask(&g, false, 0, true) != [0, 6, 0, 0xf5, 0x0f, 0, 0]
         || h2c::rate_mask(&b, false, 0, true) != [0, 8, 0, 0x0d, 0, 0, 0]
@@ -1827,6 +1831,7 @@ fn smoke_rtl8821ae_ht_capability_timing_and_n_mask() -> TestResult {
         ht: Some([0xff, 0]),
         sgi20: true,
         sgi40: false,
+        five_ghz: false,
     };
     let mask = h2c::rate_mask(&n, false, 0, true);
     // RATR_INX_WIRELESS_NGB -> RATEID_IDX_BGN_40M_1SS (1) | SGI.
@@ -2114,4 +2119,108 @@ fn smoke_rtl8821ae_5ghz_band_channel_and_bw80() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_5ghz_band_channel_and_bw80
+);
+
+/// 5 GHz station plumbing: plan channels and frequencies, the 5 GHz probe
+/// request IEs (`ieee80211_put_preq_ies_band`), WIRELESS_MODE_A / N_5G RA
+/// masks (`rtl8821ae_update_hal_rate_mask`, `rtl_mrate_idx_to_arfr_id`),
+/// the 5 GHz HT40 pairing and the 5 GHz `configure_rates` (forced short
+/// slot, SIFS 0x0e, no CCK).
+fn smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates() -> TestResult {
+    use super::envelope::{station_channel, station_channel_at, station_frequency_mhz};
+    if !station_channel(36)
+        || !station_channel(165)
+        || !station_channel(11)
+        || station_channel(12)
+        || station_channel(14)
+        || station_channel(34)
+        || station_channel(169)
+        || station_frequency_mhz(36) != Some(5180)
+        || station_frequency_mhz(165) != Some(5825)
+        || station_frequency_mhz(6) != Some(2437)
+        || station_channel_at(5180) != Some(36)
+        || station_channel_at(5745) != Some(149)
+        || station_channel_at(2462) != Some(11)
+        || station_channel_at(2467).is_some()
+        || station_channel_at(5185).is_some()
+        || station_channel_at(5170).is_some()
+    {
+        return TestResult::Fail("station channel plan");
+    }
+    let own = [0x02, 0, 0, 0, 0, 1];
+    let Ok(probe) = crate::rtlwifi::probe_scan::request(own, 36, b"ap", None) else {
+        return TestResult::Fail("5 GHz probe refused");
+    };
+    if probe[24..] != [0, 2, b'a', b'p', 1, 8, 12, 18, 24, 36, 48, 72, 96, 108] {
+        return TestResult::Fail("5 GHz probe: OFDM rates only, no ERP rates or DS IE");
+    }
+    if crate::rtlwifi::probe_scan::request(own, 14, b"ap", None).is_ok()
+        || crate::rtlwifi::probe_scan::request(own, 38, b"ap", None).is_ok()
+    {
+        return TestResult::Fail("probe outside the plan");
+    }
+    let a = h2c::Peer {
+        legacy: 0x0ff0,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+        five_ghz: true,
+    };
+    let n = h2c::Peer {
+        ht: Some([0xff, 0]),
+        sgi20: true,
+        ..a
+    };
+    if a.mode() != h2c::WirelessMode::A
+        || n.mode() != h2c::WirelessMode::N5
+        || h2c::rate_mask(&a, false, 0, true) != [0, 7, 0, 0xf0, 0x0f, 0, 0]
+        || h2c::rate_mask(&n, false, 0, true) != [0, 0x85, 0, 0, 0xf0, 0x0f, 0]
+        || h2c::rate_mask(&n, true, 0, true) != [0, 0x85, 1, 0x10, 0xf0, 0x0f, 0]
+        || h2c::mask_rates(&h2c::rate_mask(&a, false, 0, true)) != Some(0xff0)
+        || h2c::mask_rates(&h2c::rate_mask(&n, false, 0, true)) != Some(0xff << 12)
+    {
+        return TestResult::Fail("WIRELESS_MODE_A / N_5G masks");
+    }
+    use crate::rtlwifi::ht::Geometry;
+    if Geometry::new_5g(36, 40)
+        .ok()
+        .map(|g| (g.prime(), g.center()))
+        != Some((1, 38))
+        || Geometry::new_5g(161, 157)
+            .ok()
+            .map(|g| (g.prime(), g.center()))
+            != Some((2, 159))
+        || Geometry::new_5g(40, 44).is_ok()
+        || Geometry::new_5g(165, 169).is_ok()
+        || Geometry::new_5g(144, 149).is_ok()
+    {
+        return TestResult::Fail("5 GHz HT40 pairing");
+    }
+    let io = h2c_model();
+    // 6/12/24 basic, 6-54 supported; capability without short slot.
+    if super::station::configure_rates(&io, 0x0ff0, 0x0150, 0x0001, false, true).is_err() {
+        return TestResult::Fail("5 GHz rates refused");
+    }
+    {
+        let g = io.0.lock();
+        let at = |reg: u16| g.1.iter().rev().find(|w| w.1 == reg).map(|w| w.2);
+        if at(super::station::REG_RRSR) != Some(0x0150)
+            || at(super::station::REG_SLOT) != Some(9)
+            || at(super::station::REG_SIFS_CTX + 1) != Some(0x0e)
+        {
+            return TestResult::Fail("5 GHz RRSR / short slot / SIFS");
+        }
+    }
+    let io = h2c_model();
+    if super::station::configure_rates(&io, 0x0fff, 0x0151, 0, false, true).is_ok()
+        || super::station::configure_rates(&io, 0x0fe0, 0x0140, 0, false, true).is_ok()
+        || super::station::configure_rates(&io, 0x0ff0, 0x0150, 0, false, false).is_ok()
+    {
+        return TestResult::Fail("CCK at 5 GHz / missing 6M / 2.4 GHz without 1M accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates
 );

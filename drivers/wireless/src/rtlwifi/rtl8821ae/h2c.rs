@@ -186,28 +186,40 @@ pub async fn fwlps_enter(io: &impl Io, mailbox: &mut Mailbox) -> Result<(), Erro
     set_rpwm(io, FW_PS_STATE_RF_OFF).await
 }
 
-/// `sta_entry->wireless_mode` for a 2.4 GHz station (`core.c::rtl_op_sta_add`).
+/// `sta_entry->wireless_mode` for the station (`core.c::rtl_op_sta_add` /
+/// `rtl_op_bss_info_changed`): B/G/N_24G on 2.4 GHz, A/N_5G on 5 GHz.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WirelessMode {
     B,
     G,
     N24,
+    A,
+    N5,
 }
 
 /// Peer facts `rtl8821ae_update_hal_rate_mask` reads from `ieee80211_sta`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer {
-    /// `supp_rates[NL80211_BAND_2GHZ]`: bits 0–3 CCK 1/2/5.5/11, 4–11 OFDM.
+    /// `supp_rates[NL80211_BAND_2GHZ]`: bits 0–3 CCK 1/2/5.5/11, 4–11 OFDM;
+    /// on 5 GHz `supp_rates[NL80211_BAND_5GHZ] << 4` (bits 0–3 clear).
     pub legacy: u16,
     /// `ht_cap.ht_supported` with `mcs.rx_mask[0]`, `[1]`.
     pub ht: Option<[u8; 2]>,
     pub sgi20: bool,
     pub sgi40: bool,
+    /// `rtlhal->current_bandtype == BAND_ON_5G`.
+    pub five_ghz: bool,
 }
 
 impl Peer {
     pub fn mode(&self) -> WirelessMode {
-        if self.ht.is_some() {
+        if self.five_ghz {
+            if self.ht.is_some() {
+                WirelessMode::N5
+            } else {
+                WirelessMode::A
+            }
+        } else if self.ht.is_some() {
             WirelessMode::N24
         } else if self.legacy <= 0xf {
             WirelessMode::B
@@ -218,7 +230,7 @@ impl Peer {
 }
 
 /// `rtl8821ae_update_hal_rate_mask` H2C payload for the INFRA station (MACID
-/// 0, `rf_type` 1T1R, 2.4 GHz). `bw40` is `mac->bw_40` (and the station's
+/// 0, `rf_type` 1T1R, 2.4 or 5 GHz without VHT). `bw40` is `mac->bw_40` (and the station's
 /// `current_chan_bw`);
 /// `rssi_level` is the DM level (0 at association). Returns the 7-byte
 /// `H2C_8821AE_RA_MASK` body; the caller then sets `REG_BCN_CTRL` BIT(3).
@@ -242,15 +254,24 @@ pub fn rate_mask(peer: &Peer, bw40: bool, rssi_level: u8, update_bw: bool) -> [u
             };
             6 // RATR_INX_WIRELESS_GB → RATEID_IDX_BG
         }
-        WirelessMode::N24 => {
-            // mimo_ps is IEEE80211_SMPS_OFF; rf_type 1T1R.
+        WirelessMode::A => {
+            bitmap &= 0x0000_0ff0;
+            7 // RATR_INX_WIRELESS_G → RATEID_IDX_G
+        }
+        WirelessMode::N24 | WirelessMode::N5 => {
+            // mimo_ps is IEEE80211_SMPS_OFF; rf_type 1T1R. The N_5G rows
+            // are the N_24G ones (their CCK bits find nothing on 5 GHz).
             bitmap &= match (rssi_level, bw40) {
                 (1, _) => 0x000f_0000,
                 (2, _) => 0x000f_f000,
                 (_, true) => 0x000f_f015,
                 (_, false) => 0x000f_f005,
             };
-            1 // RATR_INX_WIRELESS_NGB → RATEID_IDX_BGN_40M_1SS
+            if mode == WirelessMode::N24 {
+                1 // RATR_INX_WIRELESS_NGB → RATEID_IDX_BGN_40M_1SS
+            } else {
+                5 // RATR_INX_WIRELESS_NG → RATEID_IDX_GN_N1SS
+            }
         }
     };
     let sgi = peer.ht.is_some() && (peer.sgi20 || peer.sgi40);

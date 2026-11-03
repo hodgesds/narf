@@ -18,6 +18,27 @@ impl Geometry {
         }
         Ok(Self { primary, secondary })
     }
+    /// A 5 GHz HT40 pair on the RTL8821AE plan (`envelope::Operating`
+    /// fixed pairing: 36/40 .. 140/144, 149/153, 157/161), for the 8821AE
+    /// owner only; the 88EE NEHT programs keep [`Self::new`] (2.4 GHz).
+    pub(in crate::rtlwifi) fn new_5g(primary: u8, secondary: u8) -> Result<Self, Error> {
+        use crate::rtlwifi::rtl8821ae::envelope::{Band, Operating, Width};
+        let width = if secondary == primary.wrapping_add(4) {
+            Width::W40Above
+        } else if secondary.wrapping_add(4) == primary {
+            Width::W40Below
+        } else {
+            return Err(Error::State);
+        };
+        Operating {
+            band: Band::B5g,
+            width,
+            channel: primary,
+        }
+        .center_mhz()
+        .ok_or(Error::State)?;
+        Ok(Self { primary, secondary })
+    }
     pub(in crate::rtlwifi) fn primary(self) -> u8 {
         self.primary
     }

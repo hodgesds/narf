@@ -146,7 +146,9 @@ fn ratr_index(payload: &[u8; 7]) -> Option<u8> {
         8 => Some(6), // RATR_INX_WIRELESS_B
         6 => Some(4), // RATR_INX_WIRELESS_GB
         1 => Some(0), // RATR_INX_WIRELESS_NGB (WIRELESS_MODE_N_24G)
-        _ => None,    // 5 GHz / VHT masks are not installed on this profile.
+        7 => Some(5), // RATR_INX_WIRELESS_G (WIRELESS_MODE_A)
+        5 => Some(1), // RATR_INX_WIRELESS_NG (WIRELESS_MODE_N_5G)
+        _ => None,    // VHT masks are not installed on this profile.
     }
 }
 
@@ -266,7 +268,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase = Phase::Failed;
         hw::set_bssid(&self.io, peer)?;
-        hw::configure_rates(&self.io, rates, basic, capability, false)?;
+        let five_ghz = self.rtl8821ae_five_ghz();
+        hw::configure_rates(&self.io, rates, basic, capability, false, five_ghz)?;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -661,7 +664,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             _ => None,
         };
         let hw_rate = match adaptive {
-            Some(0) => super::super::super::rtl8821ae::ht::DESC_RATEMCS7,
+            Some(0 | 1) => super::super::super::rtl8821ae::ht::DESC_RATEMCS7,
             Some(6) => 0x03,
             Some(_) => trx::DESC_RATE54M,
             None => rate,

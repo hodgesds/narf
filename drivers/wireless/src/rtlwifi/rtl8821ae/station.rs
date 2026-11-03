@@ -117,22 +117,37 @@ fn sifs(io: &impl Io, value: u8) -> Result<(), Error> {
 /// `WIRELESS_MODE_G` else 0x0e, `HW_VAR_R2T_SIFS` 0x0a), the conf_tx
 /// `set_qos` rows and `HW_VAR_ACK_PREAMBLE`. `rates` is the legacy
 /// intersection (bit 0 = 1 Mb/s), `basic` the BSS basic set; `ht` is an HT
-/// peer (`mac->mode = WIRELESS_MODE_N_24G`, so SIFS 0x0e).
+/// peer (`mac->mode = WIRELESS_MODE_N_24G`, so SIFS 0x0e). `five_ghz`: a
+/// 5 GHz BSS (`BAND_ON_5G`): the rate bitmaps carry no CCK bit and 6 Mb/s
+/// (bit 4, `supp_rates[1] << 4`) is the mandatory rate; mac80211's
+/// `ieee80211_handle_bss_capability` forces the short slot and `core.c`
+/// sets `WIRELESS_MODE_A`/`N_5G`, so SIFS 0x0e.
 pub fn configure_rates(
     io: &impl Io,
     rates: u16,
     basic: u16,
     capability: u16,
     ht: bool,
+    five_ghz: bool,
 ) -> Result<(), Error> {
-    if rates & 1 == 0 || basic & 1 == 0 || basic & !0x15f != 0 || rates & !0xfff != 0 {
+    let mandatory = if five_ghz {
+        rates & basic & 0x10 != 0 && (rates | basic) & 0xf == 0
+    } else {
+        rates & basic & 1 != 0
+    };
+    if !mandatory || basic & !0x15f != 0 || rates & !0xfff != 0 {
         return Err(Error::Packet);
     }
     io.write16(REG_RRSR, basic & 0x15f)?;
-    let slot = if capability & 0x400 != 0 { 9 } else { 20 };
+    let slot = if five_ghz || capability & 0x400 != 0 {
+        9
+    } else {
+        20
+    };
     byte(io, REG_SLOT, slot)?;
-    // core.c sets mac->mode WIRELESS_MODE_B for supp_rates <= 0xf.
-    let mode_g = !ht && rates > 0xf;
+    // core.c sets mac->mode WIRELESS_MODE_B for supp_rates <= 0xf (2.4 GHz
+    // only; 5 GHz is WIRELESS_MODE_A or N_5G, never G).
+    let mode_g = !five_ghz && !ht && rates > 0xf;
     sifs(io, if mode_g { 0x0a } else { 0x0e })?;
     byte(io, REG_RESP_SIFS_OFDM + 1, 0x0a)?;
     set_qos_all(io)?;

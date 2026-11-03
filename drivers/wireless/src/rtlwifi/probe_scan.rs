@@ -13,7 +13,12 @@ pub(super) fn request(
     ssid: &[u8],
     ht: Option<[u8; 26]>,
 ) -> Result<Vec<u8>, Error> {
-    if own == [0; 6] || own[0] & 1 != 0 || ssid.len() > 32 || !(1..=11).contains(&channel) {
+    let five_ghz = super::rtl8821ae::envelope::CHANNELS_5G.contains(&channel);
+    if own == [0; 6]
+        || own[0] & 1 != 0
+        || ssid.len() > 32
+        || !(1..=11).contains(&channel) && !five_ghz
+    {
         return Err(Error::Profile);
     }
     let mut bytes = Vec::new();
@@ -27,9 +32,16 @@ pub(super) fn request(
     bytes.extend_from_slice(&[0, 0]); // The retained station assigns its SSN.
     bytes.extend_from_slice(&[0, ssid.len() as u8]);
     bytes.extend_from_slice(ssid);
-    bytes.extend_from_slice(&[1, 8, 2, 4, 11, 22, 12, 18, 24, 36]);
-    bytes.extend_from_slice(&[50, 4, 48, 72, 96, 108]);
-    bytes.extend_from_slice(&[3, 1, channel]);
+    if five_ghz {
+        // `ieee80211_put_preq_ies_band` for the 5 GHz band
+        // (`rtl_ratetable_5g`: 6-54 Mb/s, eight rates, no Extended
+        // Supported Rates) and no DS Parameter Set (2.4 GHz only).
+        bytes.extend_from_slice(&[1, 8, 12, 18, 24, 36, 48, 72, 96, 108]);
+    } else {
+        bytes.extend_from_slice(&[1, 8, 2, 4, 11, 22, 12, 18, 24, 36]);
+        bytes.extend_from_slice(&[50, 4, 48, 72, 96, 108]);
+        bytes.extend_from_slice(&[3, 1, channel]);
+    }
     if let Some(ht) = ht {
         bytes.extend_from_slice(&[45, 26]);
         bytes.extend_from_slice(&ht);

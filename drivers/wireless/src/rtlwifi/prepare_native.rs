@@ -169,7 +169,9 @@ pub(super) async fn prepare_rtl8821ae(
     factory: Arc<super::efuse::Factory>,
     channel: u8,
 ) -> Result<(), Error> {
-    if !(1..=11).contains(&channel) || firmware.device_id() != super::regs::RTL_DEV_8821AE {
+    if !super::rtl8821ae::envelope::station_channel(channel)
+        || firmware.device_id() != super::regs::RTL_DEV_8821AE
+    {
         return Err(Error::State);
     }
     if firmware.status().stage == super::firmware_transport::Stage::Detected {
@@ -241,11 +243,13 @@ pub(super) async fn initialize_registered_on_channel(
     factory: Arc<super::efuse::Factory>,
     channel: u8,
 ) -> Result<(), Error> {
-    if !(1..=11).contains(&channel) {
-        return Err(Error::State);
-    }
+    // RTL8821AE is dual-band (its own gate admits the 5 GHz plan); every
+    // other profile stays on 2.4 GHz channels 1-11.
     if firmware.device_id() == super::regs::RTL_DEV_8821AE {
         return prepare_rtl8821ae(firmware, retained, factory, channel).await;
+    }
+    if !(1..=11).contains(&channel) {
+        return Err(Error::State);
     }
     if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);

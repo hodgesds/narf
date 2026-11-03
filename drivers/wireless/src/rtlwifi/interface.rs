@@ -941,10 +941,25 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.factory.mac,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: self.available_channels(),
-            }],
+            // One entry per band with an admitted channel (the RTL8821AE
+            // profile's 5 GHz `NAPC` permissions add the 5000 MHz band).
+            bands: {
+                let (low, high): (Vec<u32>, Vec<u32>) = self
+                    .available_channels()
+                    .into_iter()
+                    .partition(|&channel| channel < 36);
+                let mut bands = vec![WirelessBand {
+                    freq_mhz: 2400,
+                    channels: low,
+                }];
+                if !high.is_empty() {
+                    bands.push(WirelessBand {
+                        freq_mhz: 5000,
+                        channels: high,
+                    });
+                }
+                bands
+            },
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht.load(Ordering::Acquire),
@@ -955,7 +970,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
     }
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        (band == 2400 && self.ht.load(Ordering::Acquire)).then(|| {
+        let band_listed = band == 2400
+            || band == 5000
+                && self
+                    .available_channels()
+                    .iter()
+                    .any(|&channel| channel >= 36);
+        (band_listed && self.ht.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
                 ht: if self.ht40.load(Ordering::Acquire) {
                     super::ht::wide_capability()
@@ -1085,7 +1106,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
         let channel = u8::try_from(config.channel).map_err(|_| WirelessError::NotSupported)?;
-        if config.tx_power_dbm.is_some() || !(1..=11).contains(&config.channel) {
+        if config.tx_power_dbm.is_some() || !super::rtl8821ae::envelope::station_channel(channel) {
             return Err(WirelessError::NotSupported);
         }
         if channel == self.lifecycle.channel.load(Ordering::Acquire)
@@ -1341,7 +1362,8 @@ impl Environment for NativeEnvironment {
         if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
             // Retuning rebuilds through the 8821AE card-disable/enable flow
             // (`rebuild_native`); admission is the `NAPC` 20 MHz permission
-            // the fresh owner's `prepare_rtl8821ae` re-derives.
+            // (2.4 GHz or 5 GHz) the fresh owner's `prepare_rtl8821ae`
+            // re-derives.
             return super::rtl8821ae::envelope::Calibration::load_registered(factory)
                 .map_err(|_| Error::Profile)?
                 .permission(&self.domain()?, channel)

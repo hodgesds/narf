@@ -128,6 +128,18 @@ impl Operating {
         }
     }
 
+    /// The 20 MHz operating point on primary `channel`: 5 GHz for the
+    /// 5 GHz channel numbers (36 and above), 2.4 GHz otherwise
+    /// (`rtl_op_config` takes the band from the chandef's channel). An
+    /// out-of-plan channel has no [`Self::center_mhz`] and is refused.
+    pub const fn twenty(channel: u8) -> Self {
+        Self {
+            band: if channel >= 36 { Band::B5g } else { Band::B2g },
+            width: Width::W20,
+            channel,
+        }
+    }
+
     /// The wide channel `core.c::rtl_op_config` stores in
     /// `rtlphy->current_channel` (20 MHz: primary; 40 MHz: primary ± 2;
     /// 80 MHz: the 80 MHz center channel).
@@ -175,6 +187,29 @@ impl Operating {
             }
         }
     }
+}
+
+/// Whether `channel` is a station primary channel this profile can be
+/// granted at 20 MHz: 2.4 GHz 1-11 or the 5 GHz plan ([`CHANNELS_5G`]).
+/// Admission still needs a measured `NAPC` row under current host policy.
+pub fn station_channel(channel: u8) -> bool {
+    Operating::twenty(channel).center_mhz().is_some()
+}
+
+/// Primary centre frequency (cfg80211 `ieee80211_channel_to_freq_khz`) of a
+/// [`station_channel`].
+pub fn station_frequency_mhz(channel: u8) -> Option<u32> {
+    Operating::twenty(channel).center_mhz()
+}
+
+/// The [`station_channel`] whose primary centre is `frequency` MHz.
+pub fn station_channel_at(frequency: u32) -> Option<u8> {
+    let base = if frequency >= 5000 { 5000 } else { 2407 };
+    if frequency < base || (frequency - base) % 5 != 0 {
+        return None;
+    }
+    let channel = u8::try_from((frequency - base) / 5).ok()?;
+    (station_frequency_mhz(channel) == Some(frequency)).then_some(channel)
 }
 
 struct Curve {
@@ -443,13 +478,14 @@ impl Calibration {
         })
     }
 
-    /// 2.4 GHz 20 MHz [`Self::permission_for`] (the v1 operating point).
+    /// 20 MHz [`Self::permission_for`] on primary `channel` ([`Operating::twenty`]:
+    /// 2.4 GHz 1-11, the v1 operating point, or a 5 GHz plan channel).
     pub fn permission(
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
         channel: u8,
     ) -> Result<Permission, Error> {
-        self.permission_for(domain, Operating::legacy20(channel))
+        self.permission_for(domain, Operating::twenty(channel))
     }
 
     /// Whether the envelope carries a measured row for `op` (no policy).

@@ -1586,7 +1586,7 @@ chain below is composed.
   band (`0xc8c` 5 GHz values); at 80 MHz it is refused before any I/O
   (VDF branch not implemented). `rtl8821ae_phy_lc_calibrate` is empty in
   Linux. Test `smoke_rtl8821ae_5ghz_band_channel_and_bw80` (written,
-  unexecuted). No station path requests a 5 GHz permission yet. The station owner requests a 40 MHz permission
+  unexecuted). The 5 GHz station (below) requests these permissions. The station owner requests a 40 MHz permission
   for an HT40 AP (HT20/40 station, below). No board values are supplied by the
   format. Tests
   `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`,
@@ -1811,7 +1811,7 @@ chain below is composed.
     `smoke_rtl8821ae_recovery_poweroff_and_enable_order` (written,
     unexecuted).
   - Not composed for 8821AE: ASPM (kept disabled), WMM EDCA from the
-    AP (Linux 8821AE ignores it too), VHT, 5 GHz, BT coexistence.
+    AP (Linux 8821AE ignores it too), VHT, BT coexistence.
   - HT20 station (`rtl8821ae/ht.rs`). HT is offered only when the AP
     has WMM and the current `NAPC` permission admits every rate of the
     Linux association RA mask (`ht::admitted`: MCS0-7 measured), so the
@@ -1863,6 +1863,53 @@ chain below is composed.
     (`iqk::calibrate_at`). Test
     `smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore` (written,
     unexecuted).
+  - 5 GHz station (8821AE only; 88EE stays on 2.4 GHz 1-11 because its
+    `allow_channel`/`channel_power` refuse every other channel). The
+    channel identity stays the primary channel number (5 GHz numbers never
+    collide with 1-14): `envelope::Operating::twenty` takes the band from
+    it (36+ ⇒ 5 GHz, as `rtl_op_config` takes it from the chandef), and
+    `Calibration::permission` (allow_channel, `prepare_rtl8821ae`,
+    `admit_rtl8821ae`) is the 20 MHz `NAPC` v2 permission on that band.
+    `station_channel` / `station_frequency_mhz` / `station_channel_at`
+    (2.4 GHz 1-11 at 2407 + 5 ch, the `CHANNELS_5G` plan at 5000 + 5 ch)
+    replace the `1..=11` / 2407 shapes in scan (`available_channels` lists
+    1-11 then the 5 GHz plan, each only if `allow_channel` admits it;
+    requested channels/frequencies; observation frequency; join
+    channel/frequency), `retune_once`, `set_config` and the
+    `initialize_registered_on_channel` 8821AE dispatch (moved before the
+    88EE 1-11 gate). DFS / NO_IR / indoor rules refuse the permission
+    (`span_ceiling`), so such channels are neither listed, scanned nor
+    joined — a deliberate narrowing of cfg80211, which would passively
+    scan NO_IR channels; no receive-only grant exists. Interface band
+    advertisement lists a 5000 MHz band with the admitted 5 GHz channels
+    (HT capability as at 2.4 GHz). Probe requests on 5 GHz are
+    `ieee80211_put_preq_ies_band` for the 5 GHz band: Supported Rates
+    6-54 Mb/s (`rtl_ratetable_5g`, eight rates, no Extended Supported
+    Rates) and no DS Parameter Set. Candidates (`Candidate::receive`)
+    and joins on 5 GHz require no CCK rate and 6 Mb/s supported and basic
+    (the 2.4 GHz analogue of the 1 Mb/s rule). Management, probe, EAPOL
+    and Null frames use `_rtl_get_tx_hw_rate` of `rate_control_send_low`,
+    the band's lowest rate: `DESC_RATE6M` on 5 GHz (`DESC_RATE1M` on
+    2.4 GHz), which the permission must admit (every 5 GHz legacy rate is).
+    The reserved-page download descriptor keeps `rtl8821ae_tx_fill_cmddesc`'s
+    `DESC_RATE1M` on both bands, as Linux (it is a beacon-queue download,
+    not an on-air frame). `configure_rates(five_ghz)`: RRSR
+    `basic & 0x15f` (`supp_rates[1] << 4` layout), slot 9 (mac80211
+    `ieee80211_handle_bss_capability` forces short slot on 5 GHz), SIFS
+    `0x0e` (`WIRELESS_MODE_A`/`N_5G`, never G). RA mask
+    (`rtl8821ae_update_hal_rate_mask`): `WIRELESS_MODE_A` ⇒
+    `RATR_INX_WIRELESS_G` / `RATEID_IDX_G` (7), `bitmap & 0xff0`;
+    `WIRELESS_MODE_N_5G` ⇒ `RATR_INX_WIRELESS_NG` / `RATEID_IDX_GN_N1SS`
+    (5) with the N_24G 1T1R rows; data RA initial rate 54M (A) / MCS7
+    (N_5G); RATE_ID the raw `ratr_index` (5 / 1), multicast
+    `RATR_INX_WIRELESS_MC`. HT40 on 5 GHz: `ht::Geometry::new_5g` takes
+    only the fixed 8821AE pairing (36/40 .. 140/144, 149/153, 157/161);
+    `rtl8821ae_wide` and `retune_rtl8821ae` build the 5 GHz operating
+    point (band of the held permission), and `channel::configure` runs the
+    5 GHz band switch / `sw_chnl` / `set_bw_mode` above. 80 MHz is not
+    requested (IQK 80 MHz VDF branch and VHT not implemented). Test
+    `smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates`
+    (`rtl8821ae/tests.rs`, written, unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
   Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,
