@@ -122,14 +122,17 @@ impl EnginePolicy {
 
     /// VCS/VECS of the MTL/Arrow standalone media GT (xe_reg_whitelist.c
     /// oam_mmio_trg_vcs/vecs, MEDIA_VERSION_RANGE(1300, ...)). Graphics-rule
-    /// whitelist entries never match a media GT.
+    /// whitelist entries never match a media GT. GSCCS0 (class OTHER) matches
+    /// no register_whitelist entry, so every one of its slots is RING_NOPID.
     pub(crate) fn media(
         platform: GtPlatform,
         engines: crate::intel_gpu_engine::EngineSet,
     ) -> Result<Self, RegisterError> {
         if !crate::intel_gpu_gt::media::profile_eligible(platform)
-            || engines.bits() == 0
-            || engines.iter().any(|engine| !engine.is_media())
+            || !engines.iter().any(|engine| engine.is_media())
+            || engines
+                .iter()
+                .any(|engine| !engine.is_media() && !engine.is_gsc())
         {
             return Err(RegisterError::Identity);
         }
@@ -145,7 +148,9 @@ impl EnginePolicy {
     fn banks(self) -> impl Iterator<Item = Slots> {
         self.engines.iter().map(move |engine| Slots {
             base: engine.base(),
-            allowed: if self.media_gt {
+            allowed: if self.media_gt && engine.is_gsc() {
+                &[]
+            } else if self.media_gt {
                 &MEDIA_OAM
             } else if self.gen12 {
                 if engine.simple_ring() {

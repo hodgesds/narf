@@ -379,13 +379,23 @@ pub(crate) fn inventory(fuse: u32) -> EngineSet {
     EngineSet::from_bits(bits)
 }
 
-/// Forcewake domain bitmap: bit0 GT, bits1-8 VDBOX0-7, bits9-12 VEBOX0-3.
+/// Forcewake domain bitmap: bit0 GT, bits1-8 VDBOX0-7, bits9-12 VEBOX0-3,
+/// bit13 GSC. Linux numbers these XE_FW_DOMAIN_ID_GT, _MEDIA_VDBOX0..7,
+/// _MEDIA_VEBOX0..3 and _GSC (enum value 15: the media GT has no RENDER or
+/// MEDIA domain, so this bitmap packs them); xe_force_wake_init_engines
+/// gives GSCCS0 its own FORCEWAKE_GSC / FORCEWAKE_ACK_GSC domain.
 pub(crate) fn engine_domains(engines: EngineSet) -> u16 {
     engines.iter().fold(0, |domains, engine| {
+        if engine.is_gsc() {
+            return domains | 1 << GSC_DOMAIN;
+        }
         let first = if engine.is_decode() { 1 } else { 9 };
         domains | 1 << (first + engine.physical_instance())
     })
 }
+
+/// The GSC forcewake domain's bit in `engine_domains`.
+pub(crate) const GSC_DOMAIN: u32 = 13;
 
 /// xe_gsc.c::xe_gsc_wa_14015076503 applies only while GSC firmware reports
 /// HECI1_FWSTS1_INIT_COMPLETE. The HECI1 block is absolute (above the GSI
@@ -404,6 +414,8 @@ pub(crate) fn gsc_firmware_loaded(
 pub(crate) const fn domain_registers(domain: u32) -> (u64, u64) {
     match domain {
         0 => (FORCEWAKE_GT, FORCEWAKE_ACK_GT_MTL),
+        // regs/xe_gt_regs.h FORCEWAKE_GSC / FORCEWAKE_ACK_GSC.
+        GSC_DOMAIN => (0xa618, 0xdf8),
         1..=8 => (
             0xa540 + (domain as u64 - 1) * 4,
             0xd50 + (domain as u64 - 1) * 4,
@@ -416,11 +428,13 @@ pub(crate) const fn domain_registers(domain: u32) -> (u64, u64) {
 }
 
 fn domains(mask: u16) -> impl Iterator<Item = u32> {
-    (0..13).filter(move |domain| mask & 1 << domain != 0)
+    (0..=GSC_DOMAIN).filter(move |domain| mask & 1 << domain != 0)
 }
 
 fn domains_rev(mask: u16) -> impl Iterator<Item = u32> {
-    (0..13).rev().filter(move |domain| mask & 1 << domain != 0)
+    (0..=GSC_DOMAIN)
+        .rev()
+        .filter(move |domain| mask & 1 << domain != 0)
 }
 
 fn read(mmio: &impl MmioWindow, reg: u64) -> Result<u32, MediaError> {
@@ -1066,7 +1080,12 @@ pub(crate) struct MediaGuc<
     state: MediaGucState,
     step: Step,
     error: Option<MediaGucError>,
+    /// Published VCS/VECS (never GSCCS0).
     engines: EngineSet,
+    /// GSCCS0 is scheduled beside them (`schedule_gsccs`).
+    gsc: bool,
+    /// The GSC kernel queue's newest job (`GscQueue`).
+    gsc_job: Option<alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>>,
     gmd: u32,
     topology: MediaTopology,
     /// VDBOX/VEBOX domains whose kernel wake request this owner wrote.
@@ -1144,6 +1163,8 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             step: Step::Boot,
             error: None,
             engines: facts.engines,
+            gsc: false,
+            gsc_job: None,
             gmd: facts.ip.gmd,
             topology: facts.topology,
             wells: 0,
@@ -1165,6 +1186,66 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         self.gt
             .honour_gsc_reset_workaround()
             .map_err(MediaGucError::Gt)
+    }
+
+    /// `narf.intel.gsc=1` with available GSC firmware: schedule GSCCS0 beside
+    /// the published VCS/VECS, before any engine well is requested.
+    /// xe_hw_engine.c::check_gsc_availability keeps GSCCS0 in GT1's engine
+    /// mask only then; it takes the XE_FW_GSC domain (xe_force_wake_init_engines),
+    /// joins the ADS, records its default LRC, and stays out of every
+    /// publication, query and placement (xe_hw_engine_is_reserved).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn schedule_gsccs(&mut self) -> Result<(), MediaGucError> {
+        if self.state != MediaGucState::Starting || self.step != Step::Boot {
+            return Err(MediaGucError::State);
+        }
+        self.gsc = true;
+        Ok(())
+    }
+
+    /// GSCCS0 is part of this owner's scheduler.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn gsccs_scheduled(&self) -> bool {
+        self.gsc
+    }
+
+    /// Every engine the media GuC schedules: the published VCS/VECS, plus
+    /// GSCCS0 when `schedule_gsccs` admitted it.
+    fn scheduled(&self) -> EngineSet {
+        if self.gsc {
+            EngineSet::from_bits(self.engines.bits() | EngineSet::of(&[Engine::Gsccs0]).bits())
+        } else {
+            self.engines
+        }
+    }
+
+    /// One GSC kernel job on GSCCS0 while GT1 runs (`gsc->q`). The worker
+    /// polls its fence; it retires only after deregistration, as every NARF
+    /// kernel job does.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn submit_gsc(
+        &mut self,
+        now: u64,
+        commands: &[u32],
+    ) -> Result<
+        alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>,
+        crate::intel_gpu_guc_gt::GtError,
+    > {
+        if !self.gsc || self.state != MediaGucState::Running {
+            return Err(crate::intel_gpu_guc_gt::GtError::State);
+        }
+        let result = self.gt.submit_gsc(now, commands);
+        if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Lost {
+            self.error.get_or_insert(MediaGucError::Gt(
+                result
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or(crate::intel_gpu_guc_gt::GtError::State),
+            ));
+            self.begin_stop(now);
+        }
+        result.map(|(_, fence)| fence)
     }
 
     /// The first refusal of this owner, if any.
@@ -1275,7 +1356,8 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             }
             (Step::SettleWells, GtState::Ready) => self.request_wells(now),
             (Step::WakeWells, GtState::Ready) => {
-                let mask = engine_domains(self.engines);
+                let scheduled = self.scheduled();
+                let mask = engine_domains(scheduled);
                 for domain in domains(mask) {
                     if read(&self.media, domain_registers(domain).1)
                         .map_err(MediaGucError::Wells)?
@@ -1290,7 +1372,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
                     }
                 }
                 self.gt
-                    .begin_media_scheduling(self.engines, mask)
+                    .begin_media_scheduling(scheduled, mask)
                     .map_err(MediaGucError::Gt)?;
                 self.step = Step::Scheduling;
                 Ok(false)
@@ -1406,7 +1488,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     /// Take every present engine's VDBOX/VEBOX domain, after any sleep
     /// acknowledgement of an earlier owner settled (xe_force_wake.c bounds).
     fn request_wells(&mut self, now: u64) -> Result<bool, MediaGucError> {
-        let mask = engine_domains(self.engines);
+        let mask = engine_domains(self.scheduled());
         for domain in domains(mask) {
             let (request, ack) = domain_registers(domain);
             if read(&self.media, request).map_err(MediaGucError::Wells)? & 1 != 0 {
@@ -1522,6 +1604,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         }
         self.published = None;
         self.defaults = None;
+        self.gsc_job = None;
         if self.submission {
             // Linux's GGTT invalidation reverts to MMIO once submission stops.
             if self.allocator.media_guc_submission(false).is_ok() {
@@ -1559,6 +1642,73 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     /// any wake/firmware publication (`start` never returns such an owner).
     pub(crate) fn reclaimable(&self) -> bool {
         self.state == MediaGucState::Stopped && !self.registered
+    }
+}
+
+/// The production `gsc::load::Gsccs`: the GSC worker's kernel jobs on the
+/// media GuC's GSCCS0 (`gsc->q`), one outstanding at a time.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+pub(crate) struct GscQueue<
+    'a,
+    M: MmioWindow + Clone,
+    A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
+> {
+    guc: &'a mut MediaGuc<M, A>,
+    now: u64,
+}
+
+impl<'a, M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
+    GscQueue<'a, M, A>
+{
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn new(guc: &'a mut MediaGuc<M, A>, now: u64) -> Self {
+        Self { guc, now }
+    }
+}
+
+impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone> gsc::load::Gsccs
+    for GscQueue<'_, M, A>
+{
+    fn submit(&mut self, commands: &[u32]) -> Result<(), gsc::load::LoadError> {
+        use crate::intel_gpu_guc_gt::GtError;
+        use crate::intel_gpu_guc_sched::SchedulingError;
+        use gsc::load::LoadError;
+        if self
+            .guc
+            .gsc_job
+            .as_ref()
+            .is_some_and(|job| job.result().is_none())
+        {
+            return Err(LoadError::Queue);
+        }
+        match self.guc.submit_gsc(self.now, commands) {
+            Ok(fence) => {
+                self.guc.gsc_job = Some(fence);
+                Ok(())
+            }
+            // No running GT1 or no GSCCS0: xe_gsc_init_post_hwconfig's ENODEV.
+            Err(GtError::State) => Err(LoadError::NoDevice),
+            Err(GtError::Scheduling(SchedulingError::Full | SchedulingError::Busy)) => {
+                Err(LoadError::Queue)
+            }
+            Err(GtError::Scheduling(SchedulingError::Allocation(_))) => Err(LoadError::NoMemory),
+            // Not one of the two GSC instruction shapes the queue admits.
+            Err(GtError::Scheduling(SchedulingError::Address)) => Err(LoadError::Invalid),
+            Err(_) => Err(LoadError::Io),
+        }
+    }
+
+    /// NARF: a job that retired with an error (reset, cancellation) fails
+    /// the step with EIO; dma_fence_wait_timeout ignores the fence error.
+    fn finished(&mut self) -> Option<Result<(), gsc::load::LoadError>> {
+        match self.guc.gsc_job.as_ref()?.result()? {
+            Ok(()) => Some(Ok(())),
+            Err(_) => Some(Err(gsc::load::LoadError::Io)),
+        }
+    }
+
+    fn holds_wake(&self) -> bool {
+        self.guc.gsc && self.guc.wells & 1 << GSC_DOMAIN != 0
     }
 }
 

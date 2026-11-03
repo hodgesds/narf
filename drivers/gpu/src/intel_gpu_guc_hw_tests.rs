@@ -1391,7 +1391,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x4502 => {
                 // GUC_RENDER/BLITTER/COMPUTE_CLASS for the admitted engines;
                 // physical BCS0/BCS8 share BLITTER with logical COPY0/COPY1.
-                assert!(matches!(request[3], 0..=4));
+                // GUC_GSC_OTHER_CLASS (5) only for the media GT's GSCCS0.
+                assert!(matches!(request[3], 0..=5));
                 assert_eq!(
                     &request[1..10],
                     &[1, request[2], request[3], request[4], 0, 0, 0, 0, 0]
@@ -1408,6 +1409,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                             8
                         } else if request[3] == 2 || request[3] == 4 {
                             4
+                        } else if request[3] == 5 {
+                            1
                         } else {
                             2
                         }
@@ -1554,9 +1557,20 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 assert!((1..=3).contains(&request[3]));
                 assert!((1..=100_000).contains(&request[5]));
                 assert_eq!(request.len(), 10);
+                // xe_hw_engine.c raises class OTHER's preempt timeout to at
+                // least 600 ms; every other class keeps NARF's 500 ms.
+                let gsc = registered.get(&request[1]).is_some_and(|base| {
+                    w.0.borrow().memory[base].borrow()[1024 + 2] == 0x11a244
+                });
                 assert_eq!(
                     [request[2], request[4], request[6], request[7], request[8]],
-                    [0x20030001, 0x20010001, 0x20020001, 500000, 0x20050001]
+                    [
+                        0x20030001,
+                        0x20010001,
+                        0x20020001,
+                        if gsc { 600_000 } else { 500_000 },
+                        0x20050001
+                    ]
                 );
                 assert!(matches!(request[9], 0 | 0x10000000));
             }
@@ -1974,6 +1988,10 @@ fn model_engine_base(class: u32, physical: u32) -> u32 {
             _ => panic!("COPY physical"),
         },
         4 => [0x1a000, 0x1c000, 0x1e000, 0x26000][physical as usize],
+        5 => {
+            assert_eq!(physical, 6, "OTHER_GSC_INSTANCE");
+            0x11a000
+        }
         _ => panic!("class"),
     }
 }
@@ -3533,6 +3551,10 @@ mod media_gt_power {
 
 mod media_gt_gsc {
     include!("intel_gpu_media_gt_gsc_tests.rs");
+}
+
+mod media_gt_gsccs {
+    include!("intel_gpu_media_gt_gsccs_tests.rs");
 }
 
 mod coredump_exec {

@@ -110,6 +110,17 @@ pub(crate) fn wa_14015076503_clear(mmio: &impl MmioWindow) -> Option<()> {
     Some(())
 }
 
+/// xe_hw_engine.c::check_gsc_availability: media_xelpmp carries GSCCS0 but
+/// the GSC firmware is not available, so the engine is dropped and the
+/// GSC interrupts an earlier owner may have enabled are turned off
+/// (GUNIT_GSC_INTR_ENABLE 0, GUNIT_GSC_INTR_MASK all ones). Both registers
+/// lie above MEDIA_GT_GSI_LENGTH and are reached at their absolute offsets.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+pub(crate) fn disable_unavailable_interrupts(mmio: &impl MmioWindow) {
+    mmio.write32(crate::intel_gpu_gt_irq::GSC_ENABLE, 0);
+    mmio.write32(crate::intel_gpu_gt_irq::GSC_MASK, u32::MAX);
+}
+
 /// xe_uc_fw.c no_ver(i915, huc_gsc, mtl): any HuC release is accepted.
 pub(crate) const HUC_FIRMWARE: &str = "i915/mtl_huc_gsc.bin";
 /// xe_huc.c::xe_huc_auth: the authentication bit must appear within 100 ms.

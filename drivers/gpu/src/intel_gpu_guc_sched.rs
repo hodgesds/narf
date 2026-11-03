@@ -326,15 +326,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
 
     /// Scheduler of the MTL/Arrow standalone media GuC. Linux builds its
     /// engine list from the media fuses (xe_hw_engine.c::read_media_fuses) and
-    /// never reads HWCONFIG on GT1; every engine is a present VCS/VECS.
+    /// never reads HWCONFIG on GT1; every engine is a present VCS/VECS, plus
+    /// GSCCS0 when GSC firmware is available (check_gsc_availability).
     pub(crate) fn allocate_media(
         allocator: A,
         platform: GtPlatform,
         engines: EngineSet,
     ) -> Result<Self, SchedulingError> {
         if !crate::intel_gpu_gt::media::profile_eligible(platform)
-            || engines.bits() == 0
-            || engines.iter().any(|engine| !engine.is_media())
+            || !engines.iter().any(|engine| engine.is_media())
+            || engines
+                .iter()
+                .any(|engine| !engine.is_media() && !engine.is_gsc())
         {
             return Err(SchedulingError::State);
         }
@@ -792,6 +795,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         let engine = context.engine();
         let placements = context.placements();
+        // GSCCS0 is reserved for the kernel (xe_hw_engine_is_reserved).
+        if engine.reserved() || placements.iter().any(Engine::reserved) {
+            return Err(SchedulingError::State);
+        }
         if context.parallel().map(|lanes| lanes.len() - 1) != batch.0.parallel().map(<[_]>::len) {
             return Err(SchedulingError::State);
         }
@@ -872,6 +879,34 @@ impl<A: BootAllocator> GuCScheduler<A> {
         self.resources.defaults_completion = Some(completion.clone());
         self.defaults = Defaults::Seed(first, id);
         Ok(completion)
+    }
+
+    /// One GSC kernel job on GSCCS0 (xe_gsc_submit.c::xe_gsc_pkt_submit_kernel
+    /// and xe_gsc.c::emit_gsc_upload on `gsc->q`: EXEC_QUEUE_FLAG_KERNEL, no
+    /// VM, GGTT addresses). Only the two GSC instruction shapes the GSC worker
+    /// emits are admitted: an 8-dword GSC_HECI_CMD_PKT or a 4-dword
+    /// GSC_FW_LOAD. As NARF does for every owned kernel job, the commands run
+    /// inline in the context ring ahead of the MI_FLUSH_DW breadcrumb, where
+    /// Linux places them in an xe_bb behind MI_BATCH_BUFFER_START (GGTT).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn submit_gsc(
+        &mut self,
+        now: u64,
+        commands: &[u32],
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        if !self.media_gt || !self.engines.contains(Engine::Gsccs0) || !self.defaults_ready() {
+            return Err(SchedulingError::State);
+        }
+        if !crate::intel_gpu_engine::gsc_job_valid(commands) {
+            return Err(SchedulingError::Address);
+        }
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(commands.len())
+            .map_err(|_| SchedulingError::Full)?;
+        words.extend_from_slice(commands);
+        self.submit(now, Engine::Gsccs0, None, Some(words))
     }
 
     /// # Safety
@@ -1289,7 +1324,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // with no render 3D state.
             let seed = if engine.is_copy() {
                 crate::intel_gpu_engine::copy_seed(engine, self.platform)
-            } else if engine.is_media() {
+            } else if engine.is_media() || engine.is_gsc() {
+                // No lrc_was, lrc_tunings or default LRC state entry matches
+                // class OTHER on media 13.00 either: GSCCS0's WA job is empty.
                 crate::intel_gpu_engine::media_seed(self.platform)
             } else {
                 crate::intel_gpu_engine::compute_seed(engine, self.platform, self.disable_wmtp)
@@ -1591,7 +1628,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             0x20010001,
                             timeslice,
                             0x20020001,
-                            500000,
+                            preemption_timeout_us(context.engine),
                             0x20050001,
                             if low_latency { 1 << 28 } else { 0 },
                         ]
@@ -2015,6 +2052,21 @@ impl<A: BootAllocator> Drop for GuCScheduler<A> {
         if !self.published {
             self.free();
         }
+    }
+}
+
+/// GUC_CONTEXT_POLICIES_KLV_ID_PREEMPTION_TIMEOUT. Every class uses NARF's
+/// 500 ms, except that xe_hw_engine.c::hw_engine_init_early raises class
+/// OTHER (GSCCS0) to at least 600 ms: a GSC shim reset may stall a request
+/// for up to 250 ms, the request itself is not preemptible for as long, and
+/// 100 ms is the safety margin.
+pub(crate) fn preemption_timeout_us(engine: Engine) -> u32 {
+    const DEFAULT: u32 = 500_000;
+    const GSC_MIN: u32 = 600_000;
+    if engine.is_gsc() {
+        DEFAULT.max(GSC_MIN)
+    } else {
+        DEFAULT
     }
 }
 

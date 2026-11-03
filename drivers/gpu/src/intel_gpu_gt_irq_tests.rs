@@ -127,6 +127,8 @@ impl MmioWindow for Window {
                     0x40 => 0x80250001,
                     0x80 => 0x80350001,       // valid COMPUTE0 MI_USER_INTERRUPT
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
+                    0x40000000 => 0x80344000, // valid OTHER3 (GSC HECI2) GSC_IRQ_INTF(1)
+                    0x80000000 => 0x80640021, // valid OTHER6 (GSCCS0) ER_COMPLETE | USER
                     _ => panic!("selected an unowned interrupt"),
                 };
             }
@@ -940,4 +942,115 @@ fn smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits() -> 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits
+);
+
+/// MTL/Arrow media GT with GSCCS0: xe_irq.c::xe_irq_enable_hwe's
+/// GUNIT_GSC_INTR_ENABLE / _MASK and HECI2_RSVD_INTR_MASK values, bank-0
+/// INTR_GSC (31) and HECI_2 (30) identities decoded as class OTHER instances
+/// 6 and 3 into latched GSC events, and gt_irq_reset's 0 / ~0 / ~0 on
+/// unrouting. GT0's sources are untouched throughout.
+fn smoke_mtl_media_gt_gsc_irq_enables_decodes_and_resets() -> TestResult {
+    let w = Window::new();
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190044, 0x0000_1234);
+        r.words.insert(0x1900f4, 0x5678_0000);
+        r.words.insert(0x1900e4, 0x0000_9abc);
+    }
+    let irq = install(&w);
+    assert_eq!(irq.service(0), Ok(false));
+    // GT0 activation never touches a GSC source.
+    assert_eq!(
+        [0x190044u64, 0x1900f4, 0x1900e4].map(|reg| w.read32(reg)),
+        [0x1234, 0x5678_0000, 0x9abc]
+    );
+    let gt0 = [
+        0x190030u64,
+        0x190090,
+        0x1900a0,
+        0x190038,
+        0x1900e8,
+        0x20a8,
+        0x220a8,
+    ]
+    .map(|reg| (reg, w.read32(reg)));
+    assert!(!irq.gsc_routed());
+    irq.route_gsc().unwrap();
+    assert!(irq.gsc_routed());
+    assert_eq!(irq.route_gsc(), Err(IrqError::Identity));
+    // GSCCS MI_USER_INTERRUPT | FLUSH_COMPLETE | GSC_ER_COMPLETE plus HECI2
+    // GSC_IRQ_INTF(1); only the GSCCS causes unmasked in GUNIT_GSC_INTR_MASK;
+    // HECI2's own mask unmasks GSC_IRQ_INTF(1) in its ENGINE1 half.
+    assert_eq!(w.read32(0x190044), 0x0000_4031);
+    assert_eq!(w.read32(0x1900f4), !0x31);
+    assert_eq!(w.read32(0x1900e4), !0x4000_0000);
+    for (reg, value) in gt0 {
+        assert_eq!(w.read32(reg), value, "GT0 source changed by GSC routing");
+    }
+    let from = w.0.lock().writes.len();
+    w.raise(0xc000_0000);
+    for now in 1..20 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(
+        irq.take_gsc_events(),
+        GSC_EVENT_ER_COMPLETE | GSC_EVENT_PROXY
+    );
+    assert_eq!(irq.take_gsc_events(), 0);
+    let selected: Vec<_> = w.0.lock().writes[from..]
+        .iter()
+        .copied()
+        .filter(|(reg, _)| matches!(*reg, 0x190070 | 0x190060 | 0x190018))
+        .collect();
+    assert_eq!(
+        selected,
+        [
+            (0x190070, 0x4000_0000),
+            (0x190060, 0x8034_4000),
+            (0x190018, 0x4000_0000),
+            (0x190070, 0x8000_0000),
+            (0x190060, 0x8064_0021),
+            (0x190018, 0x8000_0000),
+        ]
+    );
+    // gt_irq_reset: sources off, every cause masked; decoding ownership stays
+    // so a late latched identity is still acknowledged.
+    irq.unroute_gsc();
+    assert!(!irq.gsc_routed());
+    assert_eq!(
+        [0x190044u64, 0x1900f4, 0x1900e4].map(|reg| w.read32(reg)),
+        [0, u32::MAX, u32::MAX]
+    );
+    w.raise(0x8000_0000);
+    for now in 20..40 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(irq.take_gsc_events(), GSC_EVENT_ER_COMPLETE);
+    // Routing again after unrouting is allowed; teardown resets the GSC
+    // registers exactly as gt_irq_reset.
+    irq.route_gsc().unwrap();
+    let writes = w.0.lock().writes.len();
+    drop(irq);
+    assert_eq!(
+        [0x190044u64, 0x1900f4, 0x1900e4].map(|reg| w.read32(reg)),
+        [0, u32::MAX, u32::MAX]
+    );
+    assert!(w.0.lock().writes[writes..].contains(&(0x190044, 0)));
+    // check_gsc_availability's pair leaves HECI2's mask alone.
+    let other = Window::new();
+    other.0.lock().words.insert(0x1900e4, 0x77);
+    crate::intel_gpu_gt::media::gsc::disable_unavailable_interrupts(&other);
+    assert_eq!(other.0.lock().writes, [(0x190044, 0), (0x1900f4, u32::MAX)]);
+    assert_eq!(other.read32(0x1900e4), 0x77);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_mtl_media_gt_gsc_irq_enables_decodes_and_resets
 );

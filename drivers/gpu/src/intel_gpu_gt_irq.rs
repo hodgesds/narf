@@ -41,6 +41,26 @@ const CCS_MASK: u64 = 0x190100;
 const CCS_MASKS: [u64; 2] = [CCS_MASK, 0x190104];
 const CCS_BASES: [u64; 4] = [0x1a000, 0x1c000, 0x1e000, 0x26000];
 const MEDIA_ENABLE: u64 = 0x190034;
+// regs/xe_irq_regs.h: GUNIT_GSC_INTR_ENABLE / _MASK and HECI2_RSVD_INTR_MASK.
+// On the MTL/Arrow media GT, xe_irq.c::xe_irq_enable_hwe enables GSCCS0's
+// MI_USER_INTERRUPT | FLUSH_COMPLETE | GSC_ER_COMPLETE plus the HECI2
+// GSC_IRQ_INTF(1) cause in GUNIT_GSC_INTR_ENABLE, unmasks the GSCCS causes in
+// GUNIT_GSC_INTR_MASK and HECI2's (shifted into ENGINE1) in its own mask.
+// Their bank-0 bits are i915's GEN11_CSME (31, INTR_GSC) and GEN12_HECI_2
+// (30); identities decode as class OTHER, OTHER_GSC_INSTANCE (6) and
+// OTHER_GSC_HECI2_INSTANCE (3).
+pub(crate) const GSC_ENABLE: u64 = 0x190044;
+pub(crate) const GSC_MASK: u64 = 0x1900f4;
+pub(crate) const HECI2_MASK: u64 = 0x1900e4;
+const GSC_ER_COMPLETE: u32 = 1 << 5;
+const GSC_ENGINE_EVENTS: u32 = RCS | GSC_ER_COMPLETE;
+const HECI2_EVENT: u32 = 1 << 14; // GSC_IRQ_INTF(1)
+const GSC_BIT: u32 = 1 << 31;
+const HECI2_BIT: u32 = 1 << 30;
+/// `take_gsc_events`: xe_gsc_hwe_irq_handler saw GSC_ER_COMPLETE.
+pub(crate) const GSC_EVENT_ER_COMPLETE: u32 = 1 << 0;
+/// `take_gsc_events`: xe_gsc_proxy_irq_handler saw the HECI2 cause.
+pub(crate) const GSC_EVENT_PROXY: u32 = 1 << 1;
 const MEDIA_MASKS: [u64; 6] = [0x1900a8, 0x1900ac, 0x1900b0, 0x1900b4, 0x1900d0, 0x1900d4];
 const MEDIA: [Engine; 12] = [
     Engine::Vcs0,
@@ -130,6 +150,12 @@ struct State<M> {
     /// for identity decoding after unrouting, so a late pending identity is
     /// still acknowledged rather than read as a foreign cause.
     media_routed: bool,
+    /// GSCCS0 and HECI2 bank-0 identities belong to this controller (set by
+    /// `route_gsc`, kept for decoding after `unroute_gsc`).
+    gsc: bool,
+    gsc_routed: bool,
+    /// GSC causes decoded since the last `take_gsc_events`.
+    gsc_events: u32,
     tiled: bool,
     active: bool,
     pending: bool,
@@ -265,6 +291,9 @@ impl<M: MmioWindow> Controller<M> {
             copy8,
             media,
             media_routed: media.bits() != 0,
+            gsc: false,
+            gsc_routed: false,
+            gsc_events: 0,
             tiled,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
@@ -424,6 +453,57 @@ impl<M: MmioWindow> Controller<M> {
         );
     }
 
+    /// Enable the media GT's GSC sources as xe_irq.c::xe_irq_enable_hwe does
+    /// when GSCCS0 exists (`other_fuse_mask`): GUNIT_GSC_INTR_ENABLE =
+    /// GSCCS events | HECI2 GSC_IRQ_INTF(1), GUNIT_GSC_INTR_MASK = ~GSCCS
+    /// events, HECI2_RSVD_INTR_MASK = ~(GSC_IRQ_INTF(1) << 16). Decoded causes
+    /// only latch `take_gsc_events`; GSC job completion stays fence-polled.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn route_gsc(&self) -> Result<(), IrqError> {
+        let mut s = self.0.lock();
+        if !s.active || !s.tiled || s.gsc_routed {
+            return Err(IrqError::Identity);
+        }
+        for reg in [GSC_ENABLE, GSC_MASK, HECI2_MASK] {
+            read(&s.mmio, reg)?;
+        }
+        s.gsc = true;
+        s.gsc_routed = true;
+        let routes = [
+            (GSC_ENABLE, GSC_ENGINE_EVENTS | HECI2_EVENT),
+            (GSC_MASK, !GSC_ENGINE_EVENTS),
+            (HECI2_MASK, !(HECI2_EVENT << 16)),
+        ];
+        for (reg, value) in routes {
+            s.mmio.write32(reg, value);
+        }
+        for (reg, value) in routes {
+            if s.mmio.read32(reg) != value {
+                return Err(IrqError::Route);
+            }
+        }
+        Ok(())
+    }
+
+    /// xe_irq.c::gt_irq_reset for a media GT with GSCCS0: GUNIT_GSC_INTR_ENABLE
+    /// 0, GUNIT_GSC_INTR_MASK and HECI2_RSVD_INTR_MASK all ones. Decoding
+    /// ownership stays, so an identity already latched is acknowledged.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn unroute_gsc(&self) {
+        let mut s = self.0.lock();
+        if !s.gsc_routed {
+            return;
+        }
+        s.gsc_routed = false;
+        gsc_reset(&s.mmio);
+    }
+
+    /// The GSC causes decoded since the last call (`GSC_EVENT_*`).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn take_gsc_events(&self) -> u32 {
+        core::mem::take(&mut self.0.lock().gsc_events)
+    }
+
     pub(crate) fn hard_irq(&self) -> narf_interrupts::dispatch::IrqStatus {
         let mut s = self.0.lock();
         if !s.active {
@@ -473,6 +553,8 @@ impl<M: MmioWindow> Controller<M> {
                     RCS0 => (RCS, 0, 0),
                     BCS0 => (RCS, 3, 0),
                     BCS8 => (RCS, 3, 8),
+                    GSC_BIT => (GSC_ENGINE_EVENTS, 4, 6),
+                    HECI2_BIT => (HECI2_EVENT, 4, 3),
                     bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
                     _ => (0x8000, 4, 0),
                 }
@@ -483,6 +565,12 @@ impl<M: MmioWindow> Controller<M> {
                 || identity & 0xffff & !expected != 0
             {
                 return Err(IrqError::Identity);
+            }
+            if s.bank == 0 && s.selected == GSC_BIT && identity & GSC_ER_COMPLETE != 0 {
+                s.gsc_events |= GSC_EVENT_ER_COMPLETE;
+            }
+            if s.bank == 0 && s.selected == HECI2_BIT {
+                s.gsc_events |= GSC_EVENT_PROXY;
             }
             // Identity acknowledgement must precede the bank acknowledgement.
             s.mmio.write32(IDENTITY + s.bank as u64 * 4, identity);
@@ -506,7 +594,10 @@ impl<M: MmioWindow> Controller<M> {
                 if master & (1 << bank) != 0 {
                     let bits = read(&s.mmio, DW + bank as u64 * 4)?;
                     let owned = if bank == 0 {
-                        OWNED | (u32::from(s.compute) << 4) | if s.copy8 { BCS8 } else { 0 }
+                        OWNED
+                            | (u32::from(s.compute) << 4)
+                            | if s.copy8 { BCS8 } else { 0 }
+                            | if s.gsc { GSC_BIT | HECI2_BIT } else { 0 }
                     } else {
                         media_bits(s.media)
                     };
@@ -609,6 +700,9 @@ impl<M: MmioWindow> Controller<M> {
             restore_bits(&s.mmio, BCS8_RING_MASK, RCS, s.saved.bcs8_ring);
             restore_bits(&s.mmio, BCS8_MASK, RCS, s.saved.bcs8);
         }
+        if core::mem::take(&mut s.gsc_routed) {
+            gsc_reset(&s.mmio);
+        }
         // The primary/media GuCs share this enable bit. An independently
         // unmasked media GuC still needs it, even if it was clear at takeover.
         if s.mmio.read32(GUC_MASK) & (1 << 15) != 0 {
@@ -618,6 +712,14 @@ impl<M: MmioWindow> Controller<M> {
         let _ = s.mmio.read32(MASTER);
         quiet
     }
+}
+
+/// xe_irq.c::gt_irq_reset's GSC registers (and check_gsc_availability's
+/// pair): sources disabled and every cause masked.
+pub(crate) fn gsc_reset(mmio: &impl MmioWindow) {
+    mmio.write32(GSC_ENABLE, 0);
+    mmio.write32(GSC_MASK, u32::MAX);
+    mmio.write32(HECI2_MASK, u32::MAX);
 }
 
 pub(crate) trait MessageRoute {
@@ -704,6 +806,30 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
     /// Whether media sources are currently enabled on this delivery graph.
     pub(crate) fn media_routed(&self) -> bool {
         self.controller.0.lock().media_routed
+    }
+
+    /// See `Controller::route_gsc`.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn route_gsc(&self) -> Result<(), IrqError> {
+        self.controller.route_gsc()
+    }
+
+    /// See `Controller::unroute_gsc`.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn unroute_gsc(&self) {
+        self.controller.unroute_gsc()
+    }
+
+    /// Whether the GSC sources are currently enabled on this delivery graph.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn gsc_routed(&self) -> bool {
+        self.controller.0.lock().gsc_routed
+    }
+
+    /// See `Controller::take_gsc_events`.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn take_gsc_events(&self) -> u32 {
+        self.controller.take_gsc_events()
     }
 }
 

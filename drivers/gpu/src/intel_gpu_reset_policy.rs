@@ -82,11 +82,16 @@ impl ResetPolicy {
     /// entry matches media 13.00 VCS/VECS (graphics rules never match a media
     /// GT). guc_mmio_regset_write adds RING_MODE, HWS_PGA and IMR, and skips
     /// RCU_MODE/CCS_MODE because the media GT has no render reset domain.
+    /// GSCCS0's reg_sr adds hw_engine_setup_default_state's "MTL GSCCS IDLE
+    /// MSG enable" pair (RING_PSMI_CTL, masked, and RING_PWRCTX_MAXCNT) and
+    /// no whitelist grant.
     pub(crate) fn media(platform: GtPlatform, device: u16, engines: EngineSet) -> Option<Self> {
         if GtPlatform::from_pci(0x8086, device) != Some(platform)
             || !crate::intel_gpu_gt::media::profile_eligible(platform)
-            || engines.bits() == 0
-            || engines.iter().any(|engine| !engine.is_media())
+            || !engines.iter().any(|engine| engine.is_media())
+            || engines
+                .iter()
+                .any(|engine| !engine.is_media() && !engine.is_gsc())
         {
             return None;
         }
@@ -124,6 +129,10 @@ impl ResetPolicy {
         // RING_MODE is not XE_REG_OPTION_MASKED in xe_engine_regs.h:160.
         for offset in [0x29c, 0x80, 0xa8] {
             add(base + offset, 0);
+        }
+        if engine.is_gsc() {
+            add(base + 0x50, 1); // RING_PSMI_CTL (XE_REG_OPTION_MASKED).
+            add(base + 0x54, 0); // RING_PWRCTX_MAXCNT.
         }
         add(base + 0xc4, 1); // RING_CMD_CCTL_default_MOCS, every engine.
                              // whitelist_apply_to_hwe adds every installed grant to hwe.reg_sr.

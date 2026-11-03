@@ -1041,7 +1041,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if !self.requested || request & 1 == 0 || self.read_ack()? == 0 {
             return Err(GtError::WakeLost);
         }
-        for domain in (1..13).filter(|domain| self.media_wells & 1 << domain != 0) {
+        for domain in (1..=crate::intel_gpu_gt::media::GSC_DOMAIN)
+            .filter(|domain| self.media_wells & 1 << domain != 0)
+        {
             let (request, ack) = crate::intel_gpu_gt::media::domain_registers(domain);
             let (request, ack) = (
                 self.parts.boot.window().read32(request),
@@ -2455,6 +2457,23 @@ impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi
             .as_mut()
             .expect("owned scheduler")
             .begin_media_defaults(now)
+            .map_err(GtError::Scheduling)
+    }
+
+    /// One GSC kernel job on GSCCS0 (`GuCScheduler::submit_gsc`), under the
+    /// same wake, region and register-policy proof as every submission.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn submit_gsc(
+        &mut self,
+        now: u64,
+        commands: &[u32],
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .submit_gsc(now, commands)
             .map_err(GtError::Scheduling)
     }
 

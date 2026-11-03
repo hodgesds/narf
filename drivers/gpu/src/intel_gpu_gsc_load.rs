@@ -246,6 +246,13 @@ pub(crate) trait Gsccs {
     fn submit(&mut self, commands: &[u32]) -> Result<(), LoadError>;
     /// The pushed job's finished fence: `None` while it runs.
     fn finished(&mut self) -> Option<Result<(), LoadError>>;
+    /// The queue's owner already holds XE_FW_GSC (the media GuC keeps every
+    /// scheduled engine's domain awake). gsc_work's xe_force_wake_get is then
+    /// a nested reference: no request is written, only the acknowledgement is
+    /// checked, and nothing is released at the end of the run.
+    fn holds_wake(&self) -> bool {
+        false
+    }
 }
 
 /// `struct i915_gsc_proxy_component_ops`
@@ -620,7 +627,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
                     if self.actions == 0 {
                         return Poll::Ready(());
                     }
-                    self.begin_work(mmio, now);
+                    self.begin_work(mmio, now, gsccs.holds_wake());
                     true
                 }
                 Step::Wake => self.woken(mmio, now, gsccs, huc),
@@ -683,10 +690,16 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
         }
     }
 
-    /// gsc_work: take the queued actions and request XE_FW_GSC.
-    fn begin_work(&mut self, mmio: &impl MmioWindow, now: u64) {
+    /// gsc_work: take the queued actions and request XE_FW_GSC, or take a
+    /// nested reference on a domain the queue's owner holds.
+    fn begin_work(&mut self, mmio: &impl MmioWindow, now: u64, held: bool) {
         self.work = core::mem::take(&mut self.actions);
         self.proxy_for_load = false;
+        if held {
+            self.deadline = now.saturating_add(WAKE_NS);
+            self.step = Step::Wake;
+            return;
+        }
         match read(mmio, FORCEWAKE_GSC) {
             Ok(request) if request & 1 == 0 => {
                 mmio.write32(FORCEWAKE_GSC, KERNEL_WAKE);

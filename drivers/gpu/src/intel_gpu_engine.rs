@@ -41,7 +41,18 @@ pub enum Engine {
     Vecs1,
     Vecs2,
     Vecs3,
+    /// The MTL/Arrow media GT's GSC command streamer (xe_hw_engine.c
+    /// XE_HW_ENGINE_GSCCS0: class OTHER, OTHER_GSC_INSTANCE). Kernel-only:
+    /// xe_hw_engine_is_reserved holds for class OTHER, so no UAPI class,
+    /// query or placement ever names it.
+    Gsccs0,
 }
+
+/// DRM_XE_ENGINE_CLASS has no OTHER member (xe_query.c skips reserved
+/// engines and user_to_xe_engine_class maps none to OTHER). GSCCS0 reports
+/// this value, which no UAPI lookup accepts (`EngineSet::from_class_instance`
+/// skips reserved engines as well).
+pub(crate) const RESERVED_CLASS: u16 = u16::MAX;
 
 /// The engines a GT publishes, decided from fuses before scheduling starts.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -83,7 +94,7 @@ impl EngineSet {
     }
     pub fn from_class_instance(self, class: u16, logical: u16) -> Option<Engine> {
         self.iter()
-            .filter(|engine| engine.xe_class() == class)
+            .filter(|engine| !engine.reserved() && engine.xe_class() == class)
             .nth(usize::from(logical))
     }
     /// GuC submits a width-one virtual context to this dense logical mask.
@@ -91,7 +102,7 @@ impl EngineSet {
     pub(crate) fn logical_mask(self, placements: Self) -> Option<u32> {
         let first = placements.iter().next()?;
         placements.iter().try_fold(0, |mask, engine| {
-            (engine.xe_class() == first.xe_class())
+            (!engine.reserved() && engine.xe_class() == first.xe_class())
                 .then(|| self.logical_instance(engine))
                 .flatten()
                 .map(|logical| mask | 1 << logical)
@@ -101,13 +112,7 @@ impl EngineSet {
     /// numbering (xe_engine_regs.h + xe_lrc.c::get_ctx_timestamp).
     pub(crate) fn decode_hardware_id(self, word: u32) -> Option<Engine> {
         self.iter().find(|engine| {
-            word & 7
-                == if engine.is_compute() {
-                    5
-                } else {
-                    engine.guc_class()
-                }
-                && (word >> 4) & 63 == engine.physical_instance()
+            word & 7 == engine.hw_class() && (word >> 4) & 63 == engine.physical_instance()
         })
     }
 }
@@ -182,7 +187,7 @@ pub(crate) fn ccs_mode(instances: u8, engines: u8) -> Option<u32> {
 }
 
 impl Engine {
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
     /// Stable original graphics slots; Gen12 media appends without renumbering.
     pub const GRAPHICS: [Engine; 7] = [
         Self::Rcs0,
@@ -213,6 +218,7 @@ impl Engine {
         Engine::Vecs1,
         Engine::Vecs2,
         Engine::Vecs3,
+        Engine::Gsccs0,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -239,9 +245,13 @@ impl Engine {
             Self::Vecs1 => 0x1d8000,
             Self::Vecs2 => 0x1e8000,
             Self::Vecs3 => 0x1f8000,
+            // regs/xe_engine_regs.h GSCCS_RING_BASE.
+            Self::Gsccs0 => 0x11a000,
         }
     }
-    /// GUC_RENDER_CLASS / GUC_BLITTER_CLASS / GUC_COMPUTE_CLASS.
+    /// GUC_RENDER_CLASS / GUC_BLITTER_CLASS / GUC_COMPUTE_CLASS, and
+    /// GUC_GSC_OTHER_CLASS for class OTHER (xe_guc.h
+    /// xe_engine_class_to_guc_class, abi/guc_scheduler_abi.h).
     pub(crate) fn guc_class(self) -> u32 {
         match self {
             Engine::Rcs0 => 0,
@@ -256,6 +266,17 @@ impl Engine {
             | Self::Vcs6
             | Self::Vcs7 => 1,
             Self::Vecs0 | Self::Vecs1 | Self::Vecs2 | Self::Vecs3 => 2,
+            Self::Gsccs0 => 5,
+        }
+    }
+    /// The hardware class of RING ENGINE_ID and interrupt identities
+    /// (`enum xe_engine_class`): RENDER 0, VIDEO_DECODE 1, VIDEO_ENHANCE 2,
+    /// COPY 3, OTHER 4, COMPUTE 5.
+    pub(crate) fn hw_class(self) -> u32 {
+        match self.guc_class() {
+            4 => 5,
+            5 => 4,
+            class => class,
         }
     }
     /// DRM_XE_ENGINE_CLASS_RENDER / _COPY / _COMPUTE (also i915 UABI).
@@ -273,6 +294,7 @@ impl Engine {
             | Self::Vcs6
             | Self::Vcs7 => 2,
             Self::Vecs0 | Self::Vecs1 | Self::Vecs2 | Self::Vecs3 => 3,
+            Self::Gsccs0 => RESERVED_CLASS,
         }
     }
     pub(crate) fn physical_instance(self) -> u32 {
@@ -285,6 +307,8 @@ impl Engine {
             Self::Vcs5 => 5,
             Self::Vcs6 => 6,
             Self::Vcs7 => 7,
+            // regs/xe_irq_regs.h OTHER_GSC_INSTANCE.
+            Self::Gsccs0 => 6,
             _ => 0,
         }
     }
@@ -297,8 +321,19 @@ impl Engine {
     pub(crate) fn is_decode(self) -> bool {
         self.xe_class() == 2
     }
+    /// xe_ring_ops.c ring_ops_gen12_gsc: emit_job_gen12_gsc runs
+    /// __emit_job_gen12_simple, as COPY does; VCS/VECS add AUX invalidation.
     pub(crate) fn simple_ring(self) -> bool {
-        self.is_copy() || self.is_media()
+        self.is_copy() || self.is_media() || self.is_gsc()
+    }
+    /// GSCCS0 (class OTHER).
+    pub(crate) fn is_gsc(self) -> bool {
+        self == Self::Gsccs0
+    }
+    /// xe_hw_engine.c::xe_hw_engine_is_reserved for class OTHER: kernel
+    /// use only, never in a query, placement or published engine set.
+    pub(crate) fn reserved(self) -> bool {
+        self.is_gsc()
     }
     pub fn is_compute(self) -> bool {
         matches!(self, Self::Ccs0 | Self::Ccs1 | Self::Ccs2 | Self::Ccs3)
@@ -336,6 +371,16 @@ pub(crate) fn enable_ring(
     hwsp: u32,
 ) {
     let base = u64::from(engine.base());
+    if engine.is_gsc() {
+        // hwe->reg_sr "MTL GSCCS IDLE MSG enable" (MEDIA_VERSION(1300),
+        // ENGINE_CLASS(OTHER)), which hw_engine_init applies before
+        // xe_hw_engine_enable_ring: masked CLR of RING_PSMI_CTL
+        // IDLE_MSG_DISABLE, then RING_PWRCTX_MAXCNT IDLE_WAIT_TIME = 0xA (5 us
+        // hysteresis) read-modify-written as xe_reg_sr_apply_mmio does.
+        mmio.write32(base + 0x50, 0x0001_0000);
+        let maxcnt = mmio.read32(base + 0x54);
+        mmio.write32(base + 0x54, (maxcnt & !0x000f_ffff) | 0xa);
+    }
     let uc = uncached_mocs(platform);
     // hw_engine_setup_default_state: discrete Xe2 compute reads use WB.
     let read = if engine.is_compute() && platform == GtPlatform::Battlemage {
@@ -490,6 +535,23 @@ pub(crate) fn gen12_media(fuse: u32) -> EngineSet {
     EngineSet::from_bits(bits)
 }
 
+/// The only GSC instructions the kernel GSC queue admits
+/// (instructions/xe_gsc_commands.h): xe_gsc_pkt_submit_kernel's 8-dword
+/// GSC_HECI_CMD_PKT, both buffers carrying at least a GSC header, or
+/// emit_gsc_upload's GSC_FW_LOAD with GSC_FW_LOAD_LIMIT_VALID. Every GGTT
+/// address fits the 4 GiB GGTT, so the upper dwords are zero.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+pub(crate) fn gsc_job_valid(words: &[u32]) -> bool {
+    use crate::intel_gpu_gt::media::gsc::{GSC_FW_LOAD, GSC_HECI_CMD_PKT, HEADER};
+    match *words {
+        [GSC_HECI_CMD_PKT, _, 0, input, _, 0, output, 0] => {
+            input >= HEADER as u32 && output >= HEADER as u32
+        }
+        [GSC_FW_LOAD, _, 0, limit] => limit & 1 << 31 != 0 && limit & !(1 << 31) != 0,
+        _ => false,
+    }
+}
+
 /// MI_FLUSH_DW post-sync GGTT store, then MI_USER_INTERRUPT. Tails stay
 /// qword aligned.
 pub(crate) fn copy_completion(image: u32, seq: u32, words: &mut Vec<u32>) {
@@ -560,9 +622,12 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
     let mut first: Vec<u32> = alloc::vec![
         0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4,
     ];
-    // dg2_xcs_offsets (graphics >= 12.55) also serves VCS/VECS on the MTL
-    // media GT: xe_lrc.c::reg_offsets keys on the device graphics IP.
-    if xe2 || engine.is_compute() || (engine.is_media() && !platform.is_gen12()) {
+    // dg2_xcs_offsets (graphics >= 12.55) also serves VCS/VECS and GSCCS on
+    // the MTL media GT: xe_lrc.c::reg_offsets keys on the device graphics IP.
+    if xe2
+        || engine.is_compute()
+        || ((engine.is_media() || engine.is_gsc()) && !platform.is_gen12())
+    {
         first.extend_from_slice(&[0x120, 0x124]);
     }
     let second: &[u32] = if xe2 {
@@ -826,7 +891,7 @@ pub(crate) mod tests {
             (Engine::Vecs3, 0x1f8000, 2, 3, 3),
         ];
         assert_eq!(EngineSet::of(&Engine::GRAPHICS).bits(), 0x7f);
-        assert_eq!(EngineSet::from_bits(u32::MAX).iter().count(), 19);
+        assert_eq!(EngineSet::from_bits(u32::MAX).iter().count(), 20);
         assert_eq!(gen12_media(0x000f00ff).bits(), 0);
         assert_eq!(gen12_media(0).iter().count(), 12);
         for (index, (engine, base, guc, uapi, instance)) in physical.into_iter().enumerate() {

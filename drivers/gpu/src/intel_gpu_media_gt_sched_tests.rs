@@ -37,6 +37,10 @@ pub(super) struct Hw {
     stuck_wells: bool,
     /// The engine at this base runs its ring but drops the PPGTT store.
     drop_store: Option<u32>,
+    /// GSC instructions GSCCS0 executed, one entry per kernel job.
+    pub(super) gsc_jobs: Vec<Vec<u32>>,
+    /// GSCCS0 rings that carried no GSC instruction (priming jobs).
+    pub(super) gsc_empty: usize,
 }
 
 /// Hardware side of one tick: forcewake acknowledgements follow requests,
@@ -47,7 +51,7 @@ pub(super) fn media_hw(w: &Window, hw: &Hw) {
     let mut d = w.0.borrow_mut();
     let gt = d.regs.get(&0x38a188).copied().unwrap_or(0) & 1;
     d.regs.insert(0x380dfc, gt);
-    for domain in 1..13 {
+    for domain in 1..=crate::intel_gpu_gt::media::GSC_DOMAIN {
         let (request, ack) = crate::intel_gpu_gt::media::domain_registers(domain);
         let awake = d.regs.get(&(request + GSI_OFFSET)).copied().unwrap_or(0) & 1;
         d.regs
@@ -87,7 +91,7 @@ pub(super) fn media_hw(w: &Window, hw: &Hw) {
 /// Independent VCS/VECS model on the MTL media GT: dg2_xcs register state,
 /// the plain or MI_FLUSH_DW breadcrumb, and for PPGTT jobs the GSI-adjusted
 /// AUX invalidation ahead of the TLB-invalidating start stamp.
-fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
+pub(super) fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
     let d = w.0.borrow();
     assert!(d.synced.contains(&base));
     let image = d.memory[&base].clone();
@@ -170,6 +174,53 @@ fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
     image.borrow_mut()[1024 + 5] = tail;
 }
 
+/// Independent GSCCS0 model on the MTL media GT: a dg2_xcs image at
+/// GSCCS_RING_BASE and __emit_job_gen12_simple's MI_FLUSH_DW breadcrumb. The
+/// GSC instructions of a kernel job sit inline between MI_ARB_ON_OFF and
+/// that breadcrumb; they are recorded, not interpreted.
+pub(super) fn execute_gsc(w: &Window, base: u32, hw: &mut Hw) {
+    let d = w.0.borrow();
+    assert!(d.synced.contains(&base));
+    let image = d.memory[&base].clone();
+    let (tail, ring_base) = {
+        let data = image.borrow();
+        assert_eq!(data.len(), 2048, "GSCCS LRC is PPHWSP + one page");
+        assert_eq!(
+            &data[1024..1031],
+            &[0, 0x1108101d, 0x11a244, data[1027], 0x11a034, 0, 0x11a030]
+        );
+        assert_eq!((data[1024 + 28], data[1024 + 30]), (0x11a120, 0x11a124));
+        assert_eq!((data[1024 + 0x31], data[1024 + 0x33]), (0, 0), "no PPGTT");
+        (data[1024 + 7], data[1024 + 9])
+    };
+    assert!(d.synced.contains(&ring_base));
+    let ring = d.memory[&ring_base].borrow().clone();
+    drop(d);
+    let words = &ring[..tail as usize / 4];
+    let stamp = if words[..3] == [0x04000001, 0, 0x10400002] {
+        assert_eq!(words[3], base + 0x800);
+        words[5]
+    } else {
+        let at = words
+            .windows(7)
+            .rposition(|v| {
+                v[..3] == [0x13004002, (base + 0x800) | 4, 0]
+                    && v[4..] == [0x01000000, 0x04000001, 0x02800000]
+            })
+            .expect("GSCCS breadcrumb");
+        assert_eq!(words[0], 0x04000001);
+        if at == 1 {
+            hw.gsc_empty += 1;
+        } else {
+            hw.gsc_jobs.push(words[1..at].to_vec());
+        }
+        words[at + 3]
+    };
+    assert_ne!(stamp, 0);
+    image.borrow_mut()[0x800 / 4] = stamp;
+    image.borrow_mut()[1024 + 5] = tail;
+}
+
 /// One model tick around a production poll: hardware first, then GuC CT
 /// service and execution of every newly submitted context.
 pub(super) fn media_tick(
@@ -197,7 +248,11 @@ pub(super) fn media_tick(
         for base in pending {
             let tail = w.0.borrow().memory[&base].borrow()[1024 + 7];
             if tail != 0 {
-                execute_media(w, base, hw);
+                if w.0.borrow().memory[&base].borrow()[1024 + 2] == 0x11a244 {
+                    execute_gsc(w, base, hw);
+                } else {
+                    execute_media(w, base, hw);
+                }
                 hw.executed.insert(base);
             }
         }
