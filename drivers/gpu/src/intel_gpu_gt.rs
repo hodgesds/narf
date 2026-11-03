@@ -17,6 +17,9 @@ pub(crate) mod lnl;
 #[path = "intel_gpu_bmg_smallbar.rs"]
 pub(crate) mod smallbar;
 
+#[path = "intel_gpu_media_gt.rs"]
+pub(crate) mod media;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GraphicsError {
     Unsupported,

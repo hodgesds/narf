@@ -402,6 +402,18 @@ impl MmioWindow for AuthorizedWindow {
     }
 }
 
+/// xe_mocs.c `mtl_mocs_desc` GLOBAL_MOCS control values for Xe-LPG/Xe_LPM+;
+/// undefined indices 10..13 take `unused_entries_index` 1. Shared by GT0 and
+/// the standalone media GT, which program it through their own windows.
+pub(crate) const MTL_GLOBAL_MOCS: [u32; 16] = [
+    0, 0x100, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x100, 0x100, 0x100,
+    0x104, 0x100,
+];
+/// `mtl_mocs_desc` L3CC values in index order, paired into LNCFCMOCS words.
+pub(crate) const MTL_L3CC: [u16; 16] = [
+    0xb0, 0xb0, 0x90, 0x90, 0xd0, 0xd0, 0x10, 0x10, 0x50, 0x50, 0xb0, 0xb0, 0xb0, 0xb0, 0xb0, 0x50,
+];
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HardwareError {
     Unsupported,
@@ -699,19 +711,14 @@ impl HardwareInit {
                 // xe_pat.c: PAT2 is UC. Non-snooping Xe-LPG PPGTT walks
                 // use this policy independently of coherent WB leaf BOs.
                 mmio.write32(0x4808, 0xc);
-                let global = [
-                    0, 0x100, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x100,
-                    0x100, 0x100, 0x104, 0x100,
-                ];
-                let l3 = [
-                    0xb0, 0xb0, 0x90, 0x90, 0xd0, 0xd0, 0x10, 0x10, 0x50, 0x50, 0xb0, 0xb0, 0xb0,
-                    0xb0, 0xb0, 0x50,
-                ];
-                for (i, value) in global.into_iter().enumerate() {
+                for (i, value) in MTL_GLOBAL_MOCS.into_iter().enumerate() {
                     mmio.write32(0x4000 + i as u64 * 4, value);
                 }
-                for (i, pair) in l3.chunks_exact(2).enumerate() {
-                    mmio.write32(0xb020 + i as u64 * 4, pair[0] | pair[1] << 16);
+                for (i, pair) in MTL_L3CC.chunks_exact(2).enumerate() {
+                    mmio.write32(
+                        0xb020 + i as u64 * 4,
+                        u32::from(pair[0]) | u32::from(pair[1]) << 16,
+                    );
                 }
                 3
             }
