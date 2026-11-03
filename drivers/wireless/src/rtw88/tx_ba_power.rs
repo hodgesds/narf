@@ -200,6 +200,8 @@ impl Grant {
         };
         if signer.is_none()
             || b.len() != 192
+            // B22 binds no T record until its program is ported (fail closed).
+            || !matches!(did, 0xc821 | 0xc822)
             || b[..4] != *if did == 0xc821 { b"N21T" } else { b"N22T" }
             || !matches!(version, 1 | 2)
             || b[4..8] != [version, 0, 192, 0]

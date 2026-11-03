@@ -197,6 +197,8 @@ impl Grant {
         let did = base.ht().rx_ba_identity().2;
         if signer.is_none()
             || b.len() != 128
+            // B22 binds no X record until its program is ported (fail closed).
+            || !matches!(did, 0xc821 | 0xc822)
             || b[..4] != *if did == 0xc821 { b"N21X" } else { b"N22X" }
             || b[4..8] != [1, 0, 128, 0]
             || b[8..12] != 128u32.to_le_bytes()
