@@ -501,6 +501,47 @@ kernel_test_in!(
     smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck
 );
 
+/// A P2P client netdev scan (`ath10k_hw_scan` on the P2P_CLI vif) is the
+/// ordinary station scan with `vdev_id` (byte 16) set to the client vdev:
+/// the active flags keep WMI_SCAN_ADD_CCK_RATES. TLV only.
+fn smoke_ath10k_p2p_client_scan_on_client_vdev() -> TestResult {
+    let tlv = Wire::new(Dialect::Tlv);
+    let channels = [2412, 5180];
+    let ssids = vec![b"DIRECT-ab".to_vec()];
+    let (Ok(netdev), Ok(client), Ok(passive), Ok(client_passive)) = (
+        tlv.active_scan(9, &channels, &ssids, &[]),
+        tlv.scan_on_vdev(1, 9, &channels, &ssids, &[]),
+        tlv.scan(9, &channels),
+        tlv.scan_on_vdev(1, 9, &channels, &[], &[]),
+    ) else {
+        return TestResult::Fail("client scan refused");
+    };
+    if wire::word(&client, 16) != Ok(1)
+        || wire::word(&client, 64) != wire::word(&netdev, 64)
+        || wire::word(&client_passive, 16) != Ok(1)
+    {
+        return TestResult::Fail("client scan vdev/flags");
+    }
+    let (mut active, mut quiet) = (client.clone(), client_passive.clone());
+    active[16] = 0;
+    quiet[16] = 0;
+    if active != netdev || quiet != passive {
+        return TestResult::Fail("client scan changed other fields");
+    }
+    if tlv.scan_on_vdev(1, 9, &channels, &[], &[221, 4, 0, 0x50, 0xf2, 4])
+        != Err(Error::Unsupported)
+        || Wire::new(Dialect::TenTwo).scan_on_vdev(1, 9, &channels, &[], &[])
+            != Err(Error::Unsupported)
+    {
+        return TestResult::Fail("client scan refusals");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_client_scan_on_client_vdev
+);
+
 fn probe_response(capability: u16, ies: &[u8]) -> Vec<u8> {
     let mut frame = vec![0; 36];
     frame[0] = 0x50;

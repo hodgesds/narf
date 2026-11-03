@@ -140,6 +140,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(|_| Error::NoMemory)?;
         self.sequence = sequence;
         self.scan_pending = Some(sequence);
+        self.scan_vdev = u32::from(self.primary.id());
         self.begin_beacon_hint_scan(sequence, &plan.channels);
         self.scan_terminal = None;
         self.failed = true;

@@ -123,7 +123,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     let event = self.wire.scan_event(&bytes[4..])?;
                     if event.sequence == 0xa000 | u32::from(sequence)
                         && event.request == 0xa001
-                        && event.vdev == self.primary_vdev()
+                        && event.vdev == self.scan_vdev
                         && matches!(event.kind, 2 | 64)
                     {
                         stopped = true;

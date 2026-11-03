@@ -231,6 +231,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.close_roc_capture()?;
         self.sequence = sequence;
         self.scan_pending = Some(sequence);
+        self.scan_vdev = u32::from(vdev);
         self.scan_terminal = None;
         let home = plan.station.is_none();
         self.roc = Some(Box::new(Work {

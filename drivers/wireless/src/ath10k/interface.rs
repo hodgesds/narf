@@ -23,6 +23,8 @@ mod ap;
 pub(in crate::ath10k) use ap::Operation as ApOperation;
 #[path = "interface_offchannel.rs"]
 mod offchannel;
+#[path = "interface_p2p_client.rs"]
+pub(super) mod p2p_client;
 #[path = "interface_p2p.rs"]
 pub(super) mod p2p_wdev;
 #[path = "interface_wow.rs"]
@@ -34,6 +36,14 @@ enum Policy {
     Model(Arc<dyn Fn() -> Option<narf_wireless::reg::RegulatoryDomain> + Send + Sync>),
 }
 impl Policy {
+    /// The same policy source for a sibling netdev of this radio.
+    fn duplicate(&self) -> Self {
+        match self {
+            Self::Installed => Self::Installed,
+            #[cfg(any(test, feature = "kernel-test"))]
+            Self::Model(current) => Self::Model(current.clone()),
+        }
+    }
     fn current(&self) -> Result<narf_wireless::reg::RegulatoryDomain, Error> {
         match self {
             Self::Installed => narf_wireless::reg::db::get_domain(),
@@ -148,6 +158,13 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     >,
     /// The control-only P2P_DEVICE wdev (`interface_p2p.rs`).
     p2p_wdev: IrqSafeSpinLock<Option<Arc<p2p_wdev::P2pWdev>>>,
+    /// This netdev is the P2P client (iftype 8, `interface_p2p_client.rs`):
+    /// its station paths run on the client slot (`StationGuard`).
+    client: bool,
+    /// nl80211 wiphy identity: the home netdev's for a P2P client.
+    wiphy: u64,
+    /// DEL_INTERFACE accepted; the worker retires the client vdev.
+    deleting: AtomicBool,
 }
 impl<T: Hif + HostMemory + HttMemory> core::fmt::Debug for Device<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -289,7 +306,21 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             p2p_capable: features.p2p,
             net_registration: IrqSafeSpinLock::new(None),
             p2p_wdev: IrqSafeSpinLock::new(None),
+            client: false,
+            wiphy: name_wiphy_id(name),
+            deleting: AtomicBool::new(false),
         }
+    }
+    /// The radio with this netdev's station slot current (the P2P client's
+    /// inside its scope), if this owner's slot exists.
+    fn try_station(&self) -> Option<wmi_runtime::StationGuard<'_, T>> {
+        wmi_runtime::StationGuard::new(self.radio.try_lock()?, self.client)
+    }
+    /// As `try_station`, waiting for the radio; a P2P client without its
+    /// vdev (not yet created or being deleted) is `Busy`.
+    async fn station(&self) -> Result<wmi_runtime::StationGuard<'_, T>, WirelessError> {
+        wmi_runtime::StationGuard::new(self.radio.lock().await, self.client)
+            .ok_or(WirelessError::Busy)
     }
     pub(super) fn reserve_control(
         &self,
@@ -311,7 +342,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     /// future has gone away. The radio mutex excludes live scan/recovery;
     /// retire_host closes this path before a successor may touch hardware.
     pub(super) async fn cleanup_failed_scan(&self) -> Result<bool, Error> {
-        let mut radio = if self.closed.load(Ordering::Acquire) {
+        let radio = if self.closed.load(Ordering::Acquire) {
             self.radio.lock().await
         } else {
             let Some(radio) = self.radio.try_lock() else {
@@ -319,11 +350,20 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             };
             radio
         };
+        let Some(mut radio) = wmi_runtime::StationGuard::new(radio, self.client) else {
+            return Ok(false);
+        };
         if self.retired.load(Ordering::Acquire) {
             return Ok(false);
         }
-        radio.ap_prune_staging();
-        if radio.ap_exists() {
+        // The sibling netdev's scan or ROC is that netdev's to clean up.
+        if radio.scan_on_sibling() {
+            return Ok(false);
+        }
+        if !self.client {
+            radio.ap_prune_staging();
+        }
+        if !self.client && radio.ap_exists() {
             if !self.closed.load(Ordering::Acquire) && !radio.ap_abandoned() {
                 return Ok(false);
             }
@@ -346,7 +386,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             // retired; failed/uncertain terminal cleanup takes PCI recovery.
             return Ok(false);
         }
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) && !self.client {
             radio.ap_retire_staging();
         }
         if !radio.scan_in_progress() {
@@ -551,7 +591,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        let Some(mut radio) = self.radio.try_lock() else {
+        let Some(mut radio) = self.try_station() else {
             return Ok(());
         };
         if radio.roc_active() {
@@ -595,7 +635,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        let Some(mut radio) = self.radio.try_lock() else {
+        let Some(mut radio) = self.try_station() else {
             return Ok(());
         };
         // Firmware owns scan power-save dwell. Keep an operator PS request
@@ -639,7 +679,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         Ok(())
     }
     fn progress(&self) -> Option<ReceiveBatch> {
-        let mut radio = self.radio.try_lock()?;
+        let mut radio = self.try_station()?;
         let mut state = self.state.try_lock()?;
         if self.closed.load(Ordering::Acquire) {
             // Host closure precedes the control path's async mutex acquire.
@@ -670,7 +710,10 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                     // Only an actual opted-in physical host-vote owner gets
                     // passive maintenance. No peer/data owner or publication
                     // is inferred from a PM defer or an empty receive prefix.
-                    radio.poll_passive_host_idle()?;
+                    // The radio's host vote belongs to the home netdev.
+                    if !self.client {
+                        radio.poll_passive_host_idle()?;
+                    }
                     return Ok(None);
                 }
                 // Sampling under the publication gate precedes consuming any
@@ -781,7 +824,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 if self.closed.load(Ordering::Acquire) {
                     return Ok(false);
                 }
-                let Some(radio) = self.radio.try_lock() else {
+                let Some(radio) = self.try_station() else {
                     return Ok(false);
                 };
                 radio.check_data_policy(&self.policy.current()?)?;
@@ -888,7 +931,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::HardwareError);
         }
         let (mut frequencies, implicit) = self.scan_frequencies(&mut request)?;
-        let mut radio = self.radio.lock().await;
+        let mut radio = self.station().await?;
         if radio.roc_active() {
             return Err(WirelessError::Busy);
         }
@@ -907,6 +950,10 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         receive_permission(&domain, &frequencies).map_err(error)?;
         let associated = radio.station_link().is_some();
+        // The associated dwell owner is the managed vdev's only.
+        if self.client && associated {
+            return Err(WirelessError::Busy);
+        }
         let active = if request.active {
             Some(
                 radio
@@ -950,7 +997,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 current().map_err(error)?;
                 self.drain();
                 {
-                    let mut radio = self.radio.lock().await;
+                    let mut radio = self.station().await?;
                     if radio
                         .associated_scan_complete(&current().map_err(error)?)
                         .map_err(error)?
@@ -1039,7 +1086,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             ),
             _ => return Err(WirelessError::NotSupported),
         };
-        let mut radio = self.radio.lock().await;
+        let mut radio = self.station().await?;
         if radio.roc_active() {
             return Err(WirelessError::Busy);
         }
@@ -1236,7 +1283,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         // An operator disconnect ends the network block's automatic reuse.
         narf_wireless::reconnect::forget(&self.name);
         self.close();
-        let mut radio = self.radio.lock().await;
+        let mut radio = self.station().await?;
         self.state.lock().await.clear();
         if self.retired.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
@@ -1345,6 +1392,13 @@ pub(super) fn bss_info(b: wmi_runtime::ScanBss) -> BssInfo {
         },
     }
 }
+/// `WirelessNetIface::wiphy_id`'s default for a netdev name (FNV-1a), kept
+/// as the home netdev's identity and inherited by its P2P client netdev.
+fn name_wiphy_id(name: &str) -> u64 {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
 /// ath10k's reconnect identity: the family and the radio's permanent MAC
 /// (firmware/OTP `SERVICE_READY` address), unchanged across recovery.
 fn reconnect_owner(mac: [u8; 6]) -> narf_wireless::reconnect::Owner {
@@ -1374,7 +1428,11 @@ pub(super) fn generation_name() -> (&'static str, bool) {
     }
 }
 fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let device = ACTIVE.lock().clone().ok_or(())?;
+    let active = ACTIVE.lock().clone();
+    let device = match active.filter(|d| d.generation == generation) {
+        Some(device) => device,
+        None => p2p_client::current().ok_or(())?,
+    };
     device.enqueue_generation(generation, bytes, meta)
 }
 /// Remove only this physical generation. Its retired name remains reserved so
@@ -1387,6 +1445,7 @@ pub(super) fn retire(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) {
     let device = device.clone();
     *active = None;
     drop(active);
+    p2p_client::retire(radio);
     device.retire_host();
     remember_rebind(device.name());
 }
@@ -1400,7 +1459,9 @@ pub(super) fn active_for(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) -> Opt
 }
 fn drain() -> bool {
     let device = ACTIVE.lock().clone();
-    device.is_some_and(|d| d.drain())
+    let home = device.is_some_and(|d| d.drain());
+    let client = p2p_client::current().is_some_and(|d| d.drain());
+    home || client
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Admission {
@@ -1497,6 +1558,9 @@ fn publish_with_mac(
                     }
                 }
                 let seen = signal.count();
+                // One vector serves both netdevs: events this drain parks in
+                // the P2P client slot are that netdev's worker's to deliver.
+                p2p_client::kick_for(&worker.radio);
                 let progressed = worker.drain();
                 let _ = worker.flush_management().await;
                 let _ = worker.apply_power_save().await;
@@ -1638,10 +1702,23 @@ impl WirelessNetIface for Native {
     fn supports_control_port_no_preauth(&self) -> bool {
         self.ap_capable
     }
+    fn wiphy_id(&self) -> u64 {
+        self.wiphy
+    }
     fn current_iftype(&self) -> u32 {
+        if self.client {
+            return p2p_client::IFTYPE;
+        }
         self.ap_mode()
     }
     fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        if self.client {
+            return if mode == p2p_client::IFTYPE {
+                Ok(())
+            } else {
+                Err(WirelessError::NotSupported)
+            };
+        }
         self.ap_set_mode(mode)
     }
     fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
@@ -1814,12 +1891,26 @@ impl WirelessNetIface for Native {
     {
         self.reserve_control()
     }
+    /// ROC and offchannel FRAME run on the home netdev or the P2P_DEVICE
+    /// wdev; the P2P client netdev has no ROC owner.
     fn async_roc_control(&self) -> bool {
-        true
+        !self.client
     }
-    /// Only the control-only P2P_DEVICE wdev is a virtual interface.
+    /// The control-only P2P_DEVICE wdev (async) and the P2P client netdev
+    /// (`new_virtual_interface`) are this radio's virtual interfaces.
     fn supports_virtual_interfaces(&self) -> bool {
         p2p_wdev::P2P_ADVERTISED && self.p2p_capable
+    }
+    fn new_virtual_interface(
+        &self,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        self.new_p2p_client(name, iftype, mac)
+    }
+    fn delete_virtual_interface(&self) -> Result<(), WirelessError> {
+        self.delete_p2p_client()
     }
     fn async_control_interfaces(&self) -> bool {
         self.supports_virtual_interfaces()
@@ -1846,7 +1937,7 @@ impl WirelessNetIface for Native {
         self.offchannel_tx
     }
     fn async_radio_management_rx_control(&self) -> bool {
-        true
+        !self.client
     }
     async fn register_mgmt_frame_radio_async(
         &self,
@@ -1854,6 +1945,9 @@ impl WirelessNetIface for Native {
         frame_type: u16,
         prefix: &[u8],
     ) -> Result<(), i32> {
+        if self.client {
+            return Err(-95);
+        }
         self.register_offchannel_frame(authority, frame_type, prefix)
             .await
     }
@@ -1864,6 +1958,9 @@ impl WirelessNetIface for Native {
         frequency: u32,
         duration: u32,
     ) -> Result<(), WirelessError> {
+        if self.client {
+            return Err(WirelessError::NotSupported);
+        }
         self.start_offchannel(authority, cookie, frequency, duration)
             .await
     }
@@ -1872,6 +1969,9 @@ impl WirelessNetIface for Native {
         authority: &narf_wireless::ap_control::RadioControlAuthority,
         cookie: u64,
     ) -> Result<(), WirelessError> {
+        if self.client {
+            return Err(WirelessError::NotSupported);
+        }
         self.cancel_offchannel(authority, cookie).await
     }
     async fn mgmt_tx_radio_async(
@@ -1880,6 +1980,9 @@ impl WirelessNetIface for Native {
         cookie: u64,
         request: narf_wireless::MgmtTxRequest,
     ) -> Result<bool, WirelessError> {
+        if self.client {
+            return Err(WirelessError::NotSupported);
+        }
         self.transmit_offchannel(authority, cookie, request).await
     }
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {

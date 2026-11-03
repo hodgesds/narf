@@ -2271,12 +2271,47 @@ will bind; none of them grants RF, peer, key or data authority.
   `-EBUSY` before publication (a P2P scan concurrent with an associated
   station is not supported: the associated dwell owner is vdev0-only).
 
-Remaining before the row can be claimed: the P2P client netdev role
-(iftype 8): a second netdev with its own rings and service worker, created
-by NEW_INTERFACE and removed by DEL_INTERFACE, whose scan/CONNECT/data
-paths drive the radio inside a `ClientScope` and whose create/delete call
-`start_p2p_client`/`stop_p2p_client` (the radio owner, slots and demux are
-in place); a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
+- **P2P client netdev** (`interface_p2p_client.rs`, iftype 8, gated by
+  `P2P_ADVERTISED`). `NEW_INTERFACE` reaches the legacy
+  `new_virtual_interface` (iftype 8 is outside the async control mask) on
+  the home netdev: TLV P2P firmware, home netdev in station mode, no AP and
+  no client yet (one client slot; `-EBUSY`), address = the requested one,
+  else the netdev address with the local bit and byte 4 XOR 0x80
+  (`brcmfmac/p2p.c::brcmf_p2p_generate_bss_mac`; never the netdev or
+  P2P Device address). A second `Device` is registered at once (own
+  rings, TX generation, nl80211 wiphy of the home netdev, `current_iftype`
+  8) and its service worker creates the vdev (`start_p2p_client` =
+  `ath10k_add_interface`); until then its station paths are `Busy`.
+  Every station path of the client netdev holds the radio through a client
+  `StationGuard` (the mutex guard with the slots exchanged for its whole
+  lifetime), so scan, CONNECT (coexistence, prepare, association, keys,
+  data start), disconnect, power save, management flush and data drains
+  run on the client slot and vdev. Its scan runs on the client vdev
+  (`Wire::scan_on_vdev`: `vdev_id` byte 16, ordinary station flags) and
+  merges into the shared BSS table; the pending scan's vdev is recorded
+  (`scan_vdev`) for its events, retained STOP and beacon hints, and each
+  netdev's worker leaves the sibling's failed scan alone
+  (`scan_on_sibling`). A client scan (including its 2.4 GHz HT40
+  coexistence scan) while the home station has a peer, or while the client
+  is associated (the associated dwell owner is the managed vdev's), is
+  refused. The client netdev has no AP, ROC, offchannel FRAME, WoW,
+  P2P_DEVICE child or radio host-vote maintenance; the home netdev cannot
+  become an AP while a client vdev exists. The home worker's vector turn
+  kicks the client worker (events it parked in the client slot). TX
+  dispatch (`send`) and the netdev RX drain cover both netdevs.
+  `DEL_INTERFACE` (`delete_virtual_interface`) closes and unpublishes the
+  netdev at once; the worker then disassociates a joined client (best
+  effort deauthentication) and deletes the vdev (`stop_p2p_client`), and
+  only then frees the client slot. Because station retirement keeps the
+  radio failed until a whole-device reset (as for the home netdev), DEL of
+  a client that associated, or any ambiguous VDEV_CREATE/DELETE, ends in
+  radio recovery, which retires the client netdev with the generation
+  (it is not recreated; userspace re-forms the group). WPS provisioning
+  over the client netdev is not supported (no host EAP-WSC path), so a
+  group is joined with WPA2-PSK credentials (persistent group or
+  pre-provisioned PSK).
+
+Remaining before the row can be claimed: a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
 into the beacon publication and `NoaOwner` into P2P_NOA event routing and
 probe-response TX; then advertisement through `P2P_ADVERTISED`,
 `p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
@@ -2294,6 +2329,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_ap_builders_carry_vdev`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
+`smoke_ath10k_p2p_client_scan_on_client_vdev`,
 `smoke_ath10k_p2p_station_slot_parks_bounded`,
 `smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid`;
 `wmi_boot/radio_tests.rs`

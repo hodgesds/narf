@@ -277,6 +277,32 @@ impl Wire {
         }
         Ok(out)
     }
+    /// `mac.c::ath10k_hw_scan` on a station-type vif other than the managed
+    /// one (the P2P client): `arg->vdev_id = arvif->vdev_id`, so firmware
+    /// sources Probe Requests from that vif's address. Flags and probe
+    /// content are the ordinary station scan's. TLV only.
+    pub fn scan_on_vdev(
+        &self,
+        vdev: u8,
+        sequence: u16,
+        channels: &[u16],
+        ssids: &[Vec<u8>],
+        extra_ies: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if self.dialect != Dialect::Tlv {
+            return Err(Error::Unsupported);
+        }
+        let mut out = if !ssids.is_empty() {
+            self.active_scan(sequence, channels, ssids, extra_ies)?
+        } else if extra_ies.is_empty() {
+            self.scan(sequence, channels)?
+        } else {
+            return Err(Error::Unsupported);
+        };
+        // `wmi_start_scan_common.vdev_id` follows scan_id and scan_req_id.
+        put(&mut out, 16, u32::from(vdev));
+        Ok(out)
+    }
     pub fn active_channels(
         &self,
         permissions: &[crate::ath10k::regulatory::Permission],

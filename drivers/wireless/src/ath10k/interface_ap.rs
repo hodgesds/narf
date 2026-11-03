@@ -114,10 +114,13 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::Busy);
         }
         let mut radio = self.radio.try_lock().ok_or(WirelessError::Busy)?;
+        // The AP replaces the managed station vdev and is not yet
+        // sibling-aware: no AP beside a P2P client vdev.
         if radio.ap_exists()
             || radio.scan_in_progress()
             || radio.roc_active()
             || radio.prepared_peer().is_some()
+            || (mode == 3 && radio.p2p_client_vdev().is_some())
         {
             return Err(WirelessError::Busy);
         }

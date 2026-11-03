@@ -241,6 +241,49 @@ impl<T: Hif + HostMemory + HttMemory> Drop for ClientScope<'_, T> {
         self.radio.exchange_client();
     }
 }
+/// One netdev's owner of the radio mutex: the home netdev runs on the home
+/// slot; the P2P client netdev holds the slots exchanged (a `ClientScope`
+/// that owns the guard) for as long as it holds the radio, so every station
+/// path it calls runs on the client vdev and nothing else observes the
+/// exchanged state.
+pub(in crate::ath10k) struct StationGuard<'a, T: Hif + HostMemory + HttMemory> {
+    guard: narf_lib::mutex::MutexGuard<'a, Radio<T>>,
+    client: bool,
+}
+impl<'a, T: Hif + HostMemory + HttMemory> StationGuard<'a, T> {
+    /// `None` for a client owner whose slot does not exist (not yet
+    /// created, or already deleted).
+    pub(in crate::ath10k) fn new(
+        mut guard: narf_lib::mutex::MutexGuard<'a, Radio<T>>,
+        client: bool,
+    ) -> Option<Self> {
+        if client {
+            if guard.in_client_scope || guard.p2p_client.is_none() {
+                return None;
+            }
+            guard.exchange_client();
+        }
+        Some(Self { guard, client })
+    }
+}
+impl<T: Hif + HostMemory + HttMemory> core::ops::Deref for StationGuard<'_, T> {
+    type Target = Radio<T>;
+    fn deref(&self) -> &Radio<T> {
+        &self.guard
+    }
+}
+impl<T: Hif + HostMemory + HttMemory> core::ops::DerefMut for StationGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Radio<T> {
+        &mut self.guard
+    }
+}
+impl<T: Hif + HostMemory + HttMemory> Drop for StationGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.client {
+            self.guard.exchange_client();
+        }
+    }
+}
 #[derive(Debug)]
 pub(super) struct Radio<T> {
     scan_cache: Vec<ScanBss>,
@@ -285,6 +328,9 @@ pub(super) struct Radio<T> {
     // terminal plus successful restore. A dropped public future leaves this
     // retained for the registered worker's STOP/vdev cleanup.
     scan_pending: Option<u16>,
+    /// The vdev `scan_pending` runs on (`ar->scan.vdev_id`): its events and
+    /// a retained STOP's terminal must carry it.
+    scan_vdev: u32,
     scan_terminal: Option<u16>,
     scan_dwell: Option<dwell_scan::Work>,
     roc: Option<alloc::boxed::Box<offchannel::Work>>,
@@ -337,6 +383,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             channels: Vec::new(),
             sequence: 0,
             scan_pending: None,
+            scan_vdev: 0,
             scan_terminal: None,
             scan_dwell: None,
             roc: None,
@@ -513,7 +560,24 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Unsupported);
         }
-        let scan_vdev = p2p_device.map_or_else(|| self.primary_vdev(), u32::from);
+        // Inside a `ClientScope` the scan runs on the P2P client vdev
+        // (`ath10k_hw_scan` on that vif). The firmware's single scan engine
+        // and this owner's unassociated scan loop do not service the home
+        // slot's data, so the home station must have no peer.
+        let client = p2p_device.is_none() && self.in_client_scope;
+        if client
+            && self
+                .p2p_client
+                .as_deref()
+                .is_some_and(|home| home.peer.is_some())
+        {
+            return Err(Error::Unsupported);
+        }
+        let scan_vdev = match p2p_device {
+            Some(vdev) => u32::from(vdev),
+            None if client => u32::from(self.station_vdev()),
+            None => self.primary_vdev(),
+        };
         wire::validate_channels(channels)?;
         if channels.iter().any(|f| !self.channels.contains(f)) {
             return Err(Error::Unsupported);
@@ -527,6 +591,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let command = if let Some(vdev) = p2p_device {
             self.wire
                 .p2p_device_scan(vdev, sequence, channels, ssids, extra_ies)?
+        } else if client {
+            self.wire
+                .scan_on_vdev(self.station_vdev(), sequence, channels, ssids, extra_ies)?
         } else if ssids.is_empty() {
             self.wire.scan(sequence, channels)?
         } else {
@@ -546,6 +613,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.sequence = sequence;
         self.failed = true;
         self.scan_pending = Some(sequence);
+        self.scan_vdev = scan_vdev;
         self.begin_beacon_hint_scan(sequence, channels);
         self.scan_terminal = None;
         let retained = self.htt.wmi.htc.transport.nonblocking_wmi();
@@ -626,7 +694,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                                     }
                                 }
                                 validate()?;
-                                self.publish_scan_cache(&report.bss, None, p2p_device.is_some())?;
+                                self.publish_scan_cache(
+                                    &report.bss,
+                                    None,
+                                    p2p_device.is_some() || client,
+                                )?;
                                 self.scan_pending = None;
                                 self.failed = false;
                                 return Ok(report);
@@ -810,6 +882,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.p2p_client.as_ref()?;
         self.exchange_client();
         Some(ClientScope { radio: self })
+    }
+    /// The pending scan or ROC runs on the sibling slot's vdev; its
+    /// retained cleanup belongs to that slot's netdev, not this one.
+    pub(in crate::ath10k) fn scan_on_sibling(&self) -> bool {
+        self.scan_pending.is_some()
+            && self
+                .p2p_client
+                .as_deref()
+                .is_some_and(|s| u32::from(s.vdev.unwrap_or(self.primary.id())) == self.scan_vdev)
     }
     /// The next TX completion for the current slot: one a sibling handed
     /// over, else the HTT queue, passing a sibling-owned id to that slot

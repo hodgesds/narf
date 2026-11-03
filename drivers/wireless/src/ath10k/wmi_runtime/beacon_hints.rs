@@ -428,7 +428,7 @@ impl<T: super::Hif + super::HostMemory + super::HttMemory> super::Radio<T> {
             .as_ref()
             .and_then(|caps| Factory::from_eeprom(caps.eeprom_domain).ok())
             .and_then(|factory| self.beacon_hints.begin(factory, sequence, channels))
-            .map(|scan| scan.on_vdev(u32::from(self.primary.id())));
+            .map(|scan| scan.on_vdev(self.scan_vdev));
     }
     pub(super) fn observe_beacon_hint_event(
         &mut self,
