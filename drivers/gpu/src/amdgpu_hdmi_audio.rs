@@ -244,6 +244,84 @@ impl ShortAudioDescriptor {
     }
 }
 
+// ── CEA-861 audio data blocks ────────────────────────────────────
+//
+// A sink's audio capabilities arrive in the EDID's CEA-861 extension
+// block (tag 0x02): a data-block collection between the header and
+// the first detailed timing descriptor, each block a tag/length
+// header followed by its payload (CEA-861 §7.5, "Data Block
+// Collection").
+//
+//   - Tag 1, Audio Data Block: payload is N × 3-byte Short Audio
+//     Descriptors (CEA-861 §7.5.2); each decodes via
+//     `ShortAudioDescriptor::decode`.
+//   - Tag 4, Speaker Allocation Data Block: payload is 3 bytes, the
+//     first of which is the speaker-allocation mask (CEA-861
+//     §7.5.3) — the byte `Dcn20AudioRequest::speakers` carries.
+//
+// Malformed input degrades, never fails: a block whose payload
+// overruns the collection ends the walk, an undecodable SAD is
+// skipped, and a second speaker block is ignored (the first wins).
+// A slice that is not a CEA extension at all yields empty caps.
+
+/// Sink audio capabilities parsed out of one CEA-861 extension block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CeaAudioCaps {
+    /// The sink's SAD list, in block order.
+    pub sads: Vec<ShortAudioDescriptor>,
+    /// Speaker-allocation mask, if a speaker block was present.
+    pub speakers: Option<u8>,
+}
+
+/// Parse the audio blocks of one CEA-861 extension block. The
+/// caller hands over the extension block itself (128 bytes in
+/// EDID, but any prefix parses best-effort); the DTD offset at
+/// byte 2 bounds the collection, or byte 127 when it is zero
+/// (no detailed timings — the collection runs to the checksum).
+pub fn parse_cea_audio_blocks(cea: &[u8]) -> CeaAudioCaps {
+    let mut caps = CeaAudioCaps::default();
+    if cea.len() < 4 || cea[0] != 0x02 {
+        return caps;
+    }
+    let dtd_offset = cea[2] as usize;
+    let end = if dtd_offset == 0 {
+        cea.len().min(127)
+    } else {
+        dtd_offset.min(cea.len())
+    };
+    if end < 4 {
+        return caps;
+    }
+    let mut i = 4;
+    while i < end {
+        let header = cea[i];
+        let tag = header >> 5;
+        let len = (header & 0x1f) as usize;
+        let payload_start = i + 1;
+        let payload_end = payload_start.saturating_add(len);
+        if payload_end > end {
+            break;
+        }
+        match tag {
+            1 => {
+                for sad in cea[payload_start..payload_end].chunks_exact(3) {
+                    if let Ok(d) = ShortAudioDescriptor::decode([sad[0], sad[1], sad[2]]) {
+                        caps.sads.push(d);
+                    }
+                }
+            }
+            4 => {
+                if caps.speakers.is_none() && len >= 1 {
+                    caps.speakers = Some(cea[payload_start]);
+                }
+            }
+            _ => {}
+        }
+        i = payload_end;
+    }
+    caps
+}
+
 // ── DTO (DMA Timing Offset) calculation ──────────────────────────
 //
 // The audio DTO is a ratio that converts the wallclock (audio
@@ -1006,4 +1084,93 @@ mod smoke_tests {
         "drivers/gpu",
         smoke_encode_format_word_48khz_lpcm_stereo_16bit
     );
+
+    fn smoke_cea_audio_blocks_spec_shaped() -> TestResult {
+        // Hand-built CEA-861 extension block, byte-for-byte from the
+        // spec layout: tag 0x02, revision 3, DTD offset 15, then an
+        // audio block (tag 1, 6 bytes = two SADs) and a speaker
+        // block (tag 4, 3 bytes).
+        let mut cea = [0u8; 128];
+        cea[0] = 0x02;
+        cea[1] = 0x03;
+        cea[2] = 0x0F;
+        cea[4] = 0x26; // tag 1, length 6
+                       // SAD 1: LPCM, 2 channels, 48 kHz, 16-bit.
+        cea[5] = 0x09;
+        cea[6] = 0x04;
+        cea[7] = 0x01;
+        // SAD 2: AC-3, 6 channels, 48 kHz.
+        cea[8] = 0x15;
+        cea[9] = 0x04;
+        cea[10] = 0x00;
+        cea[11] = 0x83; // tag 4, length 3
+        cea[12] = 0x01; // FL/FR
+        let caps = parse_cea_audio_blocks(&cea);
+        if caps.sads.len() != 2 {
+            return TestResult::Fail("expected two SADs");
+        }
+        if caps.sads[0].encode() != [0x09, 0x04, 0x01] {
+            return TestResult::Fail("SAD 1 bytes wrong");
+        }
+        if caps.sads[1].encode() != [0x15, 0x04, 0x00] {
+            return TestResult::Fail("SAD 2 bytes wrong");
+        }
+        if caps.speakers != Some(0x01) {
+            return TestResult::Fail("speaker mask wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_cea_audio_blocks_spec_shaped);
+
+    fn smoke_cea_audio_blocks_degrade() -> TestResult {
+        // Not a CEA block at all: empty caps.
+        let mut cea = [0u8; 128];
+        cea[0] = 0x00;
+        let caps = parse_cea_audio_blocks(&cea);
+        if !caps.sads.is_empty() || caps.speakers.is_some() {
+            return TestResult::Fail("non-CEA block must yield empty caps");
+        }
+        // One good SAD, then a truncated audio block whose payload
+        // overruns the DTD offset: the walk stops, the good SAD stays.
+        let mut cea = [0u8; 128];
+        cea[0] = 0x02;
+        cea[1] = 0x03;
+        cea[2] = 0x0B;
+        cea[4] = 0x23;
+        cea[5] = 0x09;
+        cea[6] = 0x04;
+        cea[7] = 0x01;
+        cea[8] = 0x26; // claims 6 payload bytes, only 2 fit before 11
+        cea[9] = 0x09;
+        cea[10] = 0x04;
+        let caps = parse_cea_audio_blocks(&cea);
+        if caps.sads.len() != 1 || caps.sads[0].encode() != [0x09, 0x04, 0x01] {
+            return TestResult::Fail("truncated block must keep only the good SAD");
+        }
+        // Bad SAD skipped, good SAD kept; first speaker block wins.
+        let mut cea = [0u8; 128];
+        cea[0] = 0x02;
+        cea[1] = 0x03;
+        cea[2] = 0x14;
+        cea[4] = 0x26;
+        cea[5] = 0xF8; // code 15: undecodable
+        cea[6] = 0x04;
+        cea[7] = 0x01;
+        cea[8] = 0x09;
+        cea[9] = 0x04;
+        cea[10] = 0x01;
+        cea[11] = 0x83;
+        cea[12] = 0x01;
+        cea[15] = 0x83;
+        cea[16] = 0x07;
+        let caps = parse_cea_audio_blocks(&cea);
+        if caps.sads.len() != 1 || caps.sads[0].encode() != [0x09, 0x04, 0x01] {
+            return TestResult::Fail("bad SAD must be skipped, good SAD kept");
+        }
+        if caps.speakers != Some(0x01) {
+            return TestResult::Fail("first speaker block must win");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_cea_audio_blocks_degrade);
 }

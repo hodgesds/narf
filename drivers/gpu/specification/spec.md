@@ -12183,6 +12183,80 @@ The implementation references local Linux `amdgpu_ucode.h`,
 `dcn31_dio_link_encoder.c`, `link_dp_training_8b_10b.c`,
 `link_dp_training_dpia.c` and DCN 3.1.4 register headers.
 
+### Laptop DCN display-audio lifecycle (DCN 2.0 / 3.1.4)
+
+The laptop DCN path (Renoir / Cezanne / Lucienne on DCN 2.0,
+Phoenix / HawkPoint on DCN 3.1.4, which shares the 2.0 audio
+register map) programs display audio through the KMS plan layer,
+not the dGPU owners. The surface:
+
+- `amdgpu_modeset::Connector::audio_caps: Option<SinkAudioCaps>`
+  carries the sink's audio capabilities, fed from EDID by
+  `feed_connector_audio_caps(kms, connector_idx, sads,
+  speakers)`, which returns false for an out-of-range connector.
+  `SinkAudioCaps` is the SAD list in CEA block order plus the
+  speaker-allocation mask. `None` means the sink's audio side has
+  not been read.
+- `amdgpu_hdmi_audio::parse_cea_audio_blocks(cea) ->
+  CeaAudioCaps` parses one CEA-861 extension block's data-block
+  collection (tag 1 audio blocks → SADs via
+  `ShortAudioDescriptor::decode`, tag 4 speaker block → the
+  allocation mask). Malformed input degrades: a block whose
+  payload overruns the collection ends the walk, an undecodable
+  SAD is skipped, a second speaker block is ignored, and a
+  non-CEA slice yields empty caps.
+- `plan_modeset` negotiates the audio request from fed caps when
+  present: the sample rate is the best LPCM rate the SADs admit
+  among the ACR-covered rates (48 kHz preferred, else 44.1, else
+  32 kHz) and the speaker byte comes from the caps; without caps
+  the plan carries the baseline every HDMI sink must accept
+  (LPCM stereo 48 kHz, speakers FL/FR). The fed SADs program
+  the Azalia descriptor words in the enable sequence (see
+  below). Higher SAD rates are not selected: the enable
+  sequence's ACR pairs cover 32 / 44.1 / 48 kHz only.
+- `amdgpu_dcn20_audio::dcn20_audio_enable_sequence(dcn_base,
+  dcn_base2, req, sads)` takes the sink's SADs and emits the
+  Azalia audio-descriptor words between the speaker write and
+  the hot-plug enable, in `dce_aud_az_configure` order: one word
+  per format code at `IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + code -
+  1`, the most-channels SAD winning per code (first on ties),
+  one-bit audio (code 9) and DST (code 13) never programmed.
+  Word layout: channels - 1 in bits [2:0], the SAD rate byte in
+  [15:8], the SAD byte 2 in [23:16], and for LPCM the rate byte
+  repeated in [31:24].
+- `amdgpu_dcn::execute_modeset_chained(regs, video, audio)`
+  executes a plan: video writes first, then the plan's audio
+  writes, through the same BAR5 indexed pair `set_mode` uses.
+  The order is load-bearing — the video sequence ends with
+  OTG_MASTER_EN, and audio starts only once scanout is live.
+  Teardown is the mirror: `plan_audio_disable`'s writes execute
+  through `execute_modeset` BEFORE the OTG master-enable clear.
+- `amdgpu_modeset::hotplug_audio_action(kms, connector_idx,
+  new_status, dcn_base, dcn_base2) -> HotplugAudioAction` maps
+  a hotplug transition to its audio action: `ReprogramAudio`
+  for a connect on an external HDMI/DP connector (the caller
+  runs `plan_modeset` + `execute_modeset_chained`),
+  `DisableAudio { writes }` for a disconnect (the
+  `plan_audio_disable` writes, to execute before video
+  teardown), `None` otherwise. The caller computes the action
+  from the PRE-transition state and applies the status change
+  afterwards: disconnect drops the CRTC binding in `set_status`,
+  so a disable computed after the transition would find
+  nothing to tear down.
+- `amdgpu_modeset::resume_display_audio_writes(kms, dcn_base,
+  dcn_base2)` rebuilds the audio enable writes for every
+  still-Connected external connector with a programmed mode, for
+  the PM resume handler to execute AFTER `set_mode`
+  re-programs video.
+
+Explicitly not in this surface: the IH ring's HPD dispatch into
+the `amdgpu_hpd` state machine has no production driver on this
+path, and neither does the plan layer have a production caller
+yet — the executor and the hotplug actions above are the
+contract those callers consume when they land. Intel
+display-side audio programming is out of scope while another
+agent works Intel GPU; no Intel modeset file is touched.
+
 ### VirtIO-GPU rendering
 
 The Phase-B VirtIO-GPU render path is layered over the existing DRM primary
