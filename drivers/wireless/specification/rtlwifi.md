@@ -1878,6 +1878,59 @@ Tests in `rtl8821ae/tests.rs` and `packet_ae_tests.rs` are written and
 unexecuted. Physical-board qualification (signed `NAPC` envelope
 measurements, silicon association) remains external.
 
+### RTL8192EE retained-runtime foundation (groundwork, not admitted)
+
+`rtl8192ee/` holds the Linux-derived pieces a third native rtlwifi chip
+(`0x818b`, 2T2R 2.4 GHz) is built from, following the RTL8821AE pattern.
+None is reachable from probe as a WLAN capability: `0x818b` stays
+diagnostic (`pci::bring_up` does not retain it).
+
+- `pwrseq` — PCI rows of every `rtl8192E_*_flow` (card enable/disable,
+  suspend/resume, radio-off, LPS enter/leave), generated from `pwrseq.h`
+  with masks unchanged; USB/SDIO-only rows are omitted.
+  `power::RTL8192EE_PWR_ON` is now the exact `RTL8192E_NIC_ENABLE_FLOW`
+  (CardDis→CardEmu→Act; it was the CardEmu→Act subset), and
+  `power::power_on_with` runs the `_rtl92ee_init_mac` prefix before it:
+  `REG_RSV_CTRL = 0`, `REG_SYS_CFG1[24]` ⇒ `0x7c = 0xc3` else `0x16 |=
+  BIT4|BIT6`, `0x7c = 0x83`, then `REG_AFE_CTRL2 &= 0xfb`, `REG_AFE_CTRL4 &=
+  0xfffffc7f`, `REG_AFE_CTRL2 &= 0xbf`, `REG_AFE_CTRL4 &= 0xffdfffff` (the
+  dword masks are issued as RMWs of the affected bytes over the byte power
+  interface).
+- `fw` — `rtlwifi/rtl8192eefw.bin` (no alternate or WoWLAN image):
+  `IS_FW_HEADER_EXIST` (`0x92e0`), exact RAM-code length (Linux-firmware
+  image: `0x7dfe` = 32254 payload bytes), at most eight 4 KiB pages; a
+  headerless image is refused. `rtl92ee_download_fw` with Linux counts:
+  enable (`MCUFWDL = 0x05`, `+2 &= 0xf7`), pages with `udelay(2)` after each
+  full page and the `rtl_fill_dummy` pad, disable, `FWDL_CHKSUM_RPT` within
+  the first 2999 undelayed reads (the post-increment bound of
+  `_rtl92ee_fw_free_to_go`), `MCUFWDL_RDY`/`~WINTINI_RDY`,
+  `rtl92ee_firmware_selfreset`, `WINTINI_RDY` over 3001 reads × 50 us.
+  `firmware_transport::Owner` admits `0x818b` (parse dispatch, registry
+  name, `run_8192ee`): CR DMA/MAC gates cleared, then the `rtl92ee_hw_init`
+  `0x577 = 0x03` and 40 MHz crystal (`AFE_CTRL4 = 0x2a`, `+1 = 0`,
+  `AFE_CTRL2 = 0x83`) writes and the download with the `mac_func_enable`
+  stop of a still-running RAM image. Not issued: `REG_PCIE_CTRL_REG =
+  0x8000` (releases the TX DMA queue stops; belongs to the ring owner) and
+  the BT-coexist antenna writes (`0x64`/`0x65`; BT boards are never
+  admitted). The `_rtl92ee_init_mac` remainder (CR, HWSEQ, auto LLT, BD ring
+  bases and counts) is the ring owner's.
+- `adapter` — `rtl92ee_read_eeprom_info`/`_rtl92ee_read_adapter_info`
+  (`rtl_get_hwinfo`) and `rtl92ee_read_bt_coexist_info_from_hwpg`: a
+  `TRP_VAUX_EN` test chip is refused; EEPROM boot, autoload failure or a map
+  without `0x8129` is unprovisioned (no facts; Linux would run defaults with
+  `btcoexist = 1`). MAC, VID/DID/SVID/SMID, channel plan, version, customer
+  id (`0xff` ⇒ 0), board type `0xc1[7:5]` (`0xff` ⇒ 0) plus `ODM_BOARD_BT`
+  when `[7:5] == 1` (the BT-coexist board), crystal cap `0xb9` (`0xff` ⇒
+  `0x20`) and the Lenovo OEM rule.
+
+Tests (`rtl8192ee/tests.rs`, written, unexecuted):
+`smoke_rtl8192ee_init_mac_prefix_and_enable_flow`,
+`smoke_rtl8192ee_all_flows_pci_mac_and_terminated`,
+`smoke_rtl8192ee_firmware_header_geometry`,
+`smoke_rtl8192ee_firmware_paged_download_and_selfreset`,
+`smoke_rtl8192ee_retained_firmware_owner_profile`,
+`smoke_rtl8192ee_adapter_info_factory_rules`.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE

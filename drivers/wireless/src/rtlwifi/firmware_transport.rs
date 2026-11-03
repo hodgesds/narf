@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Retained rtlwifi paged MMIO firmware owner; Linux rtlwifi/rtl8188ee/fw.c
-//! and rtl8821ae/fw.c. Profiles: RTL8188EE and RTL8821AE (normal image).
+//! rtl8821ae/fw.c and rtl8192ee/fw.c. Profiles: RTL8188EE, RTL8821AE and
+//! RTL8192EE (normal images).
 //! PCI bus mastering remains parked. This does not install native packet rings.
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,10 @@ pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
     if did == super::regs::RTL_DEV_8821AE {
         // IS_FW_HEADER_EXIST_8821 plus exact RAM-code length (rtl8821ae/fw.rs).
         return super::rtl8821ae::fw::parse(bytes);
+    }
+    if did == super::regs::RTL_DEV_8192EE {
+        // IS_FW_HEADER_EXIST (0x92e0) plus exact RAM-code length.
+        return super::rtl8192ee::fw::parse(bytes);
     }
     if did != super::regs::RTL_DEV_8188EE {
         return Err(Error::Unsupported);
@@ -316,6 +321,12 @@ impl<I: Io> Owner<I> {
             }
             return result;
         }
+        if self.did == super::regs::RTL_DEV_8192EE {
+            // rtl8192ee/sw.c fw_name; no alt_fw_name.
+            return self
+                .initialize_registered_from(&authority, super::rtl8192ee::fw::FW_NORMAL)
+                .await;
+        }
         self.initialize_registered_from(&authority, super::fw::FW_8188EE)
             .await
     }
@@ -337,6 +348,7 @@ impl<I: Io> Owner<I> {
                     super::regs::RTL_DEV_8821AE,
                     super::rtl8821ae::fw::FW_NORMAL | super::rtl8821ae::fw::FW_NORMAL_ALT
                 )
+                | (super::regs::RTL_DEV_8192EE, super::rtl8192ee::fw::FW_NORMAL)
         ) {
             return Err(Error::Unsupported);
         }
@@ -386,6 +398,9 @@ impl<I: Io> Owner<I> {
         self.set(Stage::Validated, None);
         if self.did == super::regs::RTL_DEV_8821AE {
             return self.run_8821ae(info, payload).await;
+        }
+        if self.did == super::regs::RTL_DEV_8192EE {
+            return self.run_8192ee(info, payload).await;
         }
         narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
@@ -478,6 +493,42 @@ impl<I: Io> Owner<I> {
             self.io.write8(0xf0, sys_cfg & 0x7f)?;
             self.set(Stage::Downloading, None);
             super::rtl8821ae::fw::download(&self.io, payload, true).await?;
+            Ok(info)
+        })
+        .await
+        .unwrap_or(Err(Error::Deadline))
+    }
+    /// `rtl92ee_hw_init` firmware step with packet engines still closed.
+    /// Linux runs `_rtl92ee_init_mac` first; here the probe has already run
+    /// its enable prefix and `RTL8192E_NIC_ENABLE_FLOW`, and the retained ring
+    /// owner later performs the ring-base/LLT remainder, so CR DMA/MAC TX/RX
+    /// gates are cleared as for the other profiles. Then, in Linux order, the
+    /// `0x577 = 0x03` and 40 MHz crystal AFE writes and `rtl92ee_download_fw`.
+    /// The `REG_PCIE_CTRL_REG = 0x8000` write that precedes the download in
+    /// Linux releases the TX DMA queue stops; it belongs to the ring owner
+    /// (bus mastering stays parked here) and is not issued. The BT-coexist
+    /// antenna writes (`0x64`/`0x65`) are not issued: BT-coexist boards are
+    /// never admitted. A still-running RAM image is handled as Linux's
+    /// `mac_func_enable` case, since probe does not power the adapter off.
+    async fn run_8192ee(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
+        // 2999 checksum reads plus 3001 x 50 us WINTINI polls fit well inside
+        // the one-second bound.
+        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+            self.set(Stage::Preparing, None);
+            let control = self.read8(0x100).await?;
+            self.io.write8(0x100, control & !0xcf)?;
+            if self.read8(0x100).await? & 0xcf != 0 {
+                return Err(Error::Gate);
+            }
+            if self.io.read32(MCU)? == u32::MAX {
+                return Err(Error::Gone);
+            }
+            self.io.write8(0x577, 0x03)?;
+            self.io.write8(0x78, 0x2a)?;
+            self.io.write8(0x79, 0x00)?;
+            self.io.write8(0x28, 0x83)?;
+            self.set(Stage::Downloading, None);
+            super::rtl8192ee::fw::download(&self.io, payload, true).await?;
             Ok(info)
         })
         .await

@@ -8,8 +8,26 @@
 //!
 //! - `rtlwifi/rtl8192ee/reg.h`  — register offsets
 //! - `rtlwifi/rtl8192ee/def.h`  — chip-version, rate, qsel constants
+//!
+//! ## Retained-runtime foundation (`rtl8192ee/`)
+//!
+//! Exact Linux-derived pieces a retained RTL8192EE owner is built from. None
+//! is reachable from probe as a WLAN capability: `0x818b` stays diagnostic.
+//!
+//! - [`pwrseq`] — PCI rows of every `rtl8192E_*_flow` (`pwrseq.{c,h}`).
+//! - [`fw`] — `rtl8192eefw.bin` header validation and the
+//!   `rtl92ee_download_fw` page/self-reset sequence.
+//! - [`adapter`] — `rtl92ee_read_eeprom_info` / `_rtl92ee_read_adapter_info`
+//!   factory facts; test chips and unprovisioned maps yield none.
 
 #![allow(dead_code)]
+
+pub mod adapter;
+pub mod fw;
+pub mod pwrseq;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
 
 /// PCI device ID.
 pub const DEV_ID: u16 = super::regs::RTL_DEV_8192EE;
