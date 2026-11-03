@@ -4861,3 +4861,37 @@ Review against Linux b90c984d agreed on the following:
   short arena calls, and sends the H2G with no arena lock held.
 
 The debug group pass is deferred to the end of the current integration wave.
+
+### Main-GT L3 bank topology entry
+
+GT0's native Xe topology now carries the DRM_XE_TOPO_L3_BANK entry that
+xe_query.c::query_gt_topology always reports for a primary GT
+(xe_gt_topology_report_l3 holds for every non-media GT) and that Mesa reads
+for l3_banks. GtTopology::read samples load_l3_bank_mask's fuses after the EU
+fuse, inside both existing stable samples under the same GT wake:
+MIRROR_FUSE3 everywhere, plus XEHP_FUSE4 on MTL/Arrow and
+MIRROR_L3BANK_ENABLE on PTL. `L3Rule` picks Linux's branch by graphics IP
+(inverted bank bits on Gen12 TGL/ADL, eight banks per mslice on DG2, the 12.70
+pair rule on MTL/Arrow, the Xe2 mode nibble per node on BMG/LNL, 32 bank bits
+per node on PTL) and expands it as gen_l3_mask_from_pattern does into 64 bits.
+The 8-byte entry sits between the compute DSS and EU entries. The media GT
+now calls the same 12.70 function, with unchanged bytes.
+
+Every NARF-admitted platform reports the entry. The only omission is a PTL
+snapshot enabling an L3 node above 1: its pattern would shift past bit 63,
+which xe_assert forbids and C leaves undefined, so NARF omits that entry
+rather than guess. Linux's i915 topology queries have no L3 field, so the
+compatibility path is unchanged.
+
+This intentionally changes the ABI: the PTL native-Xe fixture's reply grows
+from 50 to 66 bytes, the MTL media-GT fixture counts four GT0 entries instead
+of three, strict mock fuse windows now answer MIRROR_FUSE3 and XEHP_FUSE4, and
+the context-seed instability fixture flips MIRROR_FUSE3 only during the seed's
+own samples. New `intel_gpu_topology` fixtures check each
+branch and the platform mapping
+(`smoke_l3_bank_rules_follow_load_l3_bank_mask`), read order and double
+sampling (`smoke_gt_topology_samples_l3_fuses_after_eu_fuses`), and exact
+query bytes on TGL, ADL-P/S/N, DG2, MTL, BMG, LNL and PTL with fused-off banks
+and the PTL omission (`smoke_xe_gt_topology_query_reports_gt0_l3_bank_entry`).
+They were registered but not run in this checkpoint, and none is physical
+Intel or Mesa evidence.
