@@ -2,6 +2,9 @@
 //! RTL8822CE WoW source-sequence fixtures against a register model. Expected
 //! values derive from Linux 7.3-rc4 `rtw88/wow.c`, `fw.c`, `fw.h`, `reg.h`.
 use super::super::firmware_transport::preflight_image;
+use super::super::security_cam::{
+    CMD_POLLING, CMD_WRITE_ENABLE, CR_HIGH, ENGINE_EN, SEC_CMD, SEC_CONFIG, SEC_WRITE,
+};
 use super::*;
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
@@ -9,6 +12,8 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_wireless::station_security::SuspendKeys;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {
@@ -27,6 +32,8 @@ struct Model {
     stuck_reason: bool,
     fail_download: Option<usize>,
     downloads: usize,
+    /// Security CAM words (`entry << 3 | word`).
+    sec_cam: [u32; 256],
 }
 impl Model {
     fn new() -> Self {
@@ -36,6 +43,7 @@ impl Model {
             stuck_reason: false,
             fail_download: None,
             downloads: 0,
+            sec_cam: [0; 256],
         };
         m.mem[REG_TXPAUSE as usize] = 0x0f;
         m.mem[REG_SYS_FUNC_EN as usize] = 0xe3;
@@ -92,6 +100,13 @@ impl Io for Model {
         let mut v = value;
         if reg == REG_WKFMCAM_CMD {
             v &= !BIT_WKFCAM_POLLING_V1; // hardware completes immediately
+        }
+        if reg == SEC_CMD {
+            v &= !CMD_POLLING;
+            if value & CMD_WRITE_ENABLE != 0 {
+                let addr = (value & 0xff) as usize;
+                self.sec_cam[addr] = self.get32(SEC_WRITE);
+            }
         }
         if reg == REG_RXPKT_NUM {
             v = if v & BIT_RW_RELEASE != 0 {
@@ -183,17 +198,18 @@ fn config() -> WowlanConfig {
         net_detect: None,
     }
 }
+const PTK: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
+const GTK: [u8; 16] = [0xa5; 16];
+fn keys() -> SuspendKeys {
+    SuspendKeys {
+        pairwise: Zeroizing::new(PTK),
+        groups: vec![(1, Zeroizing::new(GTK))],
+    }
+}
 fn plan() -> Plan {
-    Plan::new(
-        0xc822,
-        &config(),
-        OWN,
-        PEER,
-        1,
-        true,
-        (KeyType::Aes, KeyType::Aes),
-    )
-    .unwrap()
+    Plan::new(0xc822, &config(), OWN, PEER, 1, true, Some(&keys())).unwrap()
 }
 /// Independent CRC16/0x1021, LSB-first input, seed 0xffff, inverted.
 fn reference_crc(data: &[u8]) -> u16 {
@@ -388,8 +404,23 @@ fn smoke_rtw88_wow_resume_reason_and_firmware_restore() -> TestResult {
         {
             return TestResult::Fail("wake reason decode/link policy wrong");
         }
-        if io.events.first() != Some(&Event::HciRestart)
-            || !io.events.contains(&Event::Download(image_len(&normal)))
+        let Some(restart) = io.events.iter().position(|e| *e == Event::HciRestart) else {
+            return TestResult::Fail("hci not restarted");
+        };
+        // Only the security-CAM teardown may precede the host ring restart.
+        if io.events[..restart].iter().any(|e| {
+            !matches!(
+                e,
+                Event::Write32(SEC_CMD | SEC_WRITE, _) | Event::Write8(SEC_CONFIG | CR_HIGH, _)
+            )
+        }) || io.mem[CR_HIGH as usize] & ENGINE_EN != 0
+            || io.mem[SEC_CONFIG as usize] != 0
+            || io.sec_cam[1 << 3] & 1 << 15 != 0
+            || io.sec_cam[4 << 3] & 1 << 15 != 0
+        {
+            return TestResult::Fail("security CAM not back to software CCMP before hci restart");
+        }
+        if !io.events.contains(&Event::Download(image_len(&normal)))
             || io.events.contains(&Event::Download(image_len(&wow)))
         {
             return TestResult::Fail("normal image not restored after hci restart");
@@ -493,4 +524,110 @@ fn smoke_rtw88_wow_failure_requires_full_restart() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/wow",
     smoke_rtw88_wow_failure_requires_full_restart
+);
+
+fn smoke_rtw88_wow_security_cam_install_and_clear() -> TestResult {
+    // sec.c::rtw_sec_write_cam word layout, independent of the builder.
+    let entries = match super::super::security_cam::entries(&keys(), PEER) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("entries refused current keys"),
+    };
+    if entries.len() != 2
+        || (entries[0].index, entries[0].key_id, entries[0].group) != (1, 1, true)
+        || entries[0].addr != [0xff; 6]
+        || (entries[1].index, entries[1].key_id, entries[1].group) != (4, 0, false)
+        || entries[1].addr != PEER
+    {
+        return TestResult::Fail("default-key-search slot choice differs from rtw_ops_set_key");
+    }
+    let mut io = Model::new();
+    io.mem[REG_WOWLAN_WAKE_REASON as usize] = 0x99;
+    let plan = plan();
+    let Ok(armed) = run(suspend(&mut io, &plan, &image(16))) else {
+        return TestResult::Fail("suspend failed on a healthy model");
+    };
+    // Pairwise entry 4: AES(4)<<2 | valid, AP address, PTK little-endian.
+    let w = |entry: usize, word: usize| io.sec_cam[entry << 3 | word];
+    if w(4, 0) != (4 << 2 | 1 << 15 | 0x02 << 16 | 0x11 << 24)
+        || w(4, 1) != u32::from_le_bytes([0x22, 0x33, 0x44, 0x55])
+        || w(4, 2) != u32::from_le_bytes([0x00, 0x11, 0x22, 0x33])
+        || w(4, 5) != u32::from_le_bytes([0xcc, 0xdd, 0xee, 0xff])
+        || w(4, 6) != 0
+        || w(4, 7) != 0
+    {
+        return TestResult::Fail("pairwise CAM entry layout differs from rtw_sec_write_cam");
+    }
+    // Group entry 1: key id 1, group bit, broadcast address.
+    if w(1, 0) != (1 | 4 << 2 | 1 << 6 | 1 << 15 | 0xff << 16 | 0xff << 24)
+        || w(1, 1) != u32::MAX
+        || w(1, 3) != 0xa5a5_a5a5
+    {
+        return TestResult::Fail("group CAM entry layout differs from rtw_sec_write_cam");
+    }
+    // Word 0 (valid) of each entry is written last.
+    let cmds: Vec<u32> = io
+        .events
+        .iter()
+        .filter_map(|e| match *e {
+            Event::Write32(SEC_CMD, v) => Some(v & 0xff),
+            _ => None,
+        })
+        .collect();
+    if cmds[..8] != [15, 14, 13, 12, 11, 10, 9, 8]
+        || cmds[8..16] != [39, 38, 37, 36, 35, 34, 33, 32]
+    {
+        return TestResult::Fail("CAM words not written 7..0 per entry");
+    }
+    if io.mem[CR_HIGH as usize] & ENGINE_EN == 0 || io.mem[SEC_CONFIG as usize] != 0xcf {
+        return TestResult::Fail("rtw_sec_enable_sec_engine state missing for WoW");
+    }
+    // Keys go in after host RX DMA stopped and the WoW image runs.
+    let pos = |pred: &dyn Fn(&Event) -> bool| io.events.iter().position(pred);
+    let (Some(dl), Some(first_cam), Some(page)) = (
+        pos(&|e| matches!(e, Event::Download(_))),
+        pos(&|e| matches!(e, Event::Write32(SEC_CMD, _))),
+        pos(&|e| matches!(e, Event::Page(_))),
+    ) else {
+        return TestResult::Fail("download/CAM/page events missing");
+    };
+    if !(dl < first_cam && first_cam < page) {
+        return TestResult::Fail("CAM install not between WoW swap and fw start");
+    }
+    io.events.clear();
+    io.mem[REG_WOWLAN_WAKE_REASON as usize] = 0x21;
+    let (_, result) = run(resume(&mut io, armed, &image(32)));
+    if result.is_err() {
+        return TestResult::Fail("resume failed on a healthy model");
+    }
+    if io.sec_cam[1 << 3] != 0 || io.sec_cam[4 << 3] != 0 {
+        return TestResult::Fail("rtw_sec_clear_cam did not invalidate the WoW entries");
+    }
+    // Software crypto required before install: a live engine is refused.
+    let mut io = Model::new();
+    io.mem[REG_WOWLAN_WAKE_REASON as usize] = 0x99;
+    io.mem[SEC_CONFIG as usize] = 0x0c;
+    if run(suspend(&mut io, &plan, &image(16))).is_ok() || io.events.contains(&Event::HciStop) {
+        return TestResult::Fail("CAM installed over a non-software crypto state");
+    }
+    // Open BSS: no CAM writes, AOAC reports no cipher.
+    let open = match Plan::new(0xc822, &config(), OWN, PEER, 1, true, None) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("open BSS plan refused"),
+    };
+    let mut io = Model::new();
+    io.mem[REG_WOWLAN_WAKE_REASON as usize] = 0x99;
+    if run(suspend(&mut io, &open, &image(16))).is_err()
+        || io
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Write32(SEC_CMD, _)))
+        || !io.h2c().contains(&h2c::aoac(KeyType::None, KeyType::None))
+    {
+        return TestResult::Fail("open BSS WoW touched the security CAM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/wow",
+    smoke_rtw88_wow_security_cam_install_and_clear
 );

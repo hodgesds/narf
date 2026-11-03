@@ -433,6 +433,18 @@ impl State {
             None
         }
     }
+    /// Current temporal keys for the WoW security CAM (`wow.c` AOAC):
+    /// `Ok(None)` for an open BSS, an error unless an associated protected
+    /// port is open and settled (no handshake or reply in flight).
+    pub(super) fn suspend_keys(&self) -> Result<Option<station_security::SuspendKeys>, Error> {
+        if self.peer().is_none() {
+            return Err(Error::State);
+        }
+        match self.security.as_ref() {
+            None => Ok(None),
+            Some(security) => security.suspend_keys().map(Some).ok_or(Error::State),
+        }
+    }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
             && !self.switch.as_ref().is_some_and(|s| s.block)

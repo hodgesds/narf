@@ -103,6 +103,24 @@ impl core::fmt::Debug for KeyInstall {
             .finish_non_exhaustive()
     }
 }
+/// Current CCMP-128 temporal keys for a device that must decrypt on its
+/// own while the host is suspended (Linux rtw88 `wow.c` AOAC: the WoW
+/// firmware decrypts through the security CAM that `sec.c::rtw_sec_write_cam`
+/// filled from mac80211's keys). Group keys are listed by key id; IGTK is
+/// never included (BIP stays in software, rtw88 `set_key` returns
+/// `-EOPNOTSUPP` for every BIP suite).
+pub struct SuspendKeys {
+    pub pairwise: Zeroizing<[u8; 16]>,
+    pub groups: Vec<(u8, Zeroizing<[u8; 16]>)>,
+}
+impl core::fmt::Debug for SuspendKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let ids: Vec<u8> = self.groups.iter().map(|(id, _)| *id).collect();
+        f.debug_struct("SuspendKeys")
+            .field("groups", &ids)
+            .finish_non_exhaustive()
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hardware {
     Absent,
@@ -562,6 +580,31 @@ impl Security {
     /// the retained supplicant still awaits M3. During an established rekey,
     /// the old-key controlled port may reopen before this exchange finishes.
     /// Drivers use this independently of carrier/port state for their timeout.
+    /// Snapshot of the current temporal keys for a suspend window in which
+    /// the device decrypts by itself ([`SuspendKeys`]). Only a settled open
+    /// port qualifies: no reply awaiting delivery, no handshake in flight, no
+    /// MLD owner. The host keeps every PN and replay floor unchanged; the
+    /// caller must not let the device transmit protected frames under these
+    /// keys, so host transmit PNs stay unique after resume.
+    pub fn suspend_keys(&self) -> Option<SuspendKeys> {
+        if !self.port_open() || self.handshake_active() || self.mld.is_some() {
+            return None;
+        }
+        let pair = self.pair.as_ref()?;
+        let groups = self
+            .group
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                slot.as_ref()
+                    .map(|slot| (id as u8, Zeroizing::new(*slot.material)))
+            })
+            .collect();
+        Some(SuspendKeys {
+            pairwise: Zeroizing::new(*pair.material),
+            groups,
+        })
+    }
     pub fn handshake_active(&self) -> bool {
         !self.failed
             && (self.pending.is_some()

@@ -2243,13 +2243,39 @@ re-sent on resume (Linux sends it only in `rtw_wow_fw_start`). PCI PME /
 wake-enable of the function belongs to the system-PM owner, as for iwlwifi
 WoW (iwlwifi.md §3.80), and is not claimed here.
 
+**Security CAM for AOAC (`security_cam.rs`).** The awake station keeps
+software CCMP (`radio::software_crypto`: all 32 CAM entries invalid,
+`REG_CR` bit 9 clear, `RTW_SEC_CONFIG` & 0xcf zero, re-checked by the HT
+and C21 guards). For the WoW window only, `wow::Plan::new` takes
+`station_security::Security::suspend_keys` (current PTK + every live GTK
+by key id; only a settled open port, never IGTK — BIP stays in software as
+rtw88 `set_key` returns `-EOPNOTSUPP` for BIP; `station::State::suspend_keys`
+returns `Ok(None)` for an open BSS) and builds `rtw_ops_set_key` entries
+under default key search: GTK at its key id, PTK at entry 4 addressed to the
+AP, both `RTW_CAM_AES`. `wow::suspend` writes them with
+`rtw_sec_write_cam`'s word order (7..0, valid bit last) after the WoW image
+runs and before the reserved pages/`rtw_wow_fw_start`, then
+`rtw_sec_enable_sec_engine` (CR bit 9, `RTW_SEC_CONFIG |= 0xcf`); AOAC
+reports `RTW_CAM_AES` for both (or none on an open BSS). Install refuses a
+non-software-crypto starting state. `wow::resume` first runs
+`rtw_sec_clear_cam` for each installed entry, turns the engine off and
+re-proves the software-crypto state *before* `rtw_hci_setup/start`, so the
+host CCMP path never sees a device-decrypted frame. Deliberate differences:
+Linux keeps the keys in the CAM permanently (hardware crypto awake); NARF
+bounds each CAM command on the polling bit (10 us x 1000) where Linux does
+not poll. PN/replay: the host's PN counters and replay windows never leave
+`station_security` and are not lowered; the WoW firmware transmits only
+unprotected NULL keep-alives (no ARP/NS/GTK-rekey offload is ported), so
+host transmit PNs stay unique. Linux rtw88 reads back no AOAC RX counters
+either (no `rtw_wow_get_aoac_rpt` in rtw88), so frames the firmware consumed
+while asleep do not raise the host replay floor — identical to Linux.
+Unexecuted case: `smoke_rtw88_wow_security_cam_install_and_clear`.
+
 **Not wired (why the row stays open).** No native backend implements
 `wow::Io` or `firmware_transport::Io::claim_swap` (default `Unsupported`):
-the native reserved-page channel is single-use (`claim_pristine`) and the
-station uses software CCMP, so a WPA2 WoW additionally needs the PTK/GTK in
-the hardware security CAM (`sec.c::rtw_sec_write_cam`) for AOAC to decrypt
-magic/pattern frames, plus a `system_pm_native` branch that keeps D0/the
-retained station instead of card-off. `WirelessNetIface::wowlan_support`
+the native reserved-page channel is single-use (`claim_pristine`), plus a
+`system_pm_native` branch that keeps D0/the retained station instead of
+card-off is missing. `WirelessNetIface::wowlan_support`
 therefore stays `None` for rtw88. Five fixture cases are written and
 unexecuted: `smoke_rtw88_wow_support_and_validation`,
 `smoke_rtw88_wow_pattern_cam_layout`,
@@ -2488,4 +2514,4 @@ changes. None is a physical blocker unless stated.
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
 | `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
-| `wow` | Source layer only (see "RTL8822CE Wake-on-WLAN source layer"): authenticated `wow_fw_name` load, `rtw_wow_swap_fw` download hook, full `wow.c` suspend/resume sequence, pattern CAM, WoW H2Cs and wake-reason decode with five unexecuted fixture cases. Not advertised: no native `wow::Io`/`claim_swap` backend, no hardware security-CAM key install for WPA2 AOAC, and no D0-retaining `system_pm_native` branch. |
+| `wow` | Source layer only (see "RTL8822CE Wake-on-WLAN source layer"): authenticated `wow_fw_name` load, `rtw_wow_swap_fw` download hook, full `wow.c` suspend/resume sequence, pattern CAM, WoW H2Cs and wake-reason decode with five unexecuted fixture cases. WPA2 AOAC security-CAM PTK/GTK install + software-CCMP restore (`security_cam.rs`). Not advertised: no native `wow::Io`/`claim_swap` backend and no D0-retaining `system_pm_native` branch. |

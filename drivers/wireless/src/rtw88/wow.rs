@@ -365,6 +365,8 @@ pub(super) struct Plan {
     pub patterns: Vec<Pattern>,
     pub pairwise: KeyType,
     pub group: KeyType,
+    /// PTK/GTK security-CAM entries for AOAC (`sec.c`); empty on an open BSS.
+    pub cam: Vec<super::security_cam::Entry>,
     /// STA reserved pages (`rtw_add_rsvd_page_sta`), built by
     /// `runtime_ps_wire::Pages::station`.
     pub pages: Vec<u8>,
@@ -378,9 +380,19 @@ impl Plan {
         peer: [u8; 6],
         aid: u16,
         wmm: bool,
-        keys: (KeyType, KeyType),
+        keys: Option<&narf_wireless::station_security::SuspendKeys>,
     ) -> Result<Self, Error> {
         validate(did, config)?;
+        // wow.c::rtw_wow_fw_security_type_iter: CCMP maps to RTW_CAM_AES for
+        // both the pairwise and the group slot; an open BSS reports none.
+        let (cam, pairwise, group) = match keys {
+            Some(keys) => (
+                super::security_cam::entries(keys, peer)?,
+                KeyType::Aes,
+                KeyType::Aes,
+            ),
+            None => (Vec::new(), KeyType::None, KeyType::None),
+        };
         let pages =
             super::runtime_ps_wire::Pages::station(own, peer, aid, wmm).ok_or(Error::Invalid)?;
         Ok(Self {
@@ -388,8 +400,9 @@ impl Plan {
             mac_id: 0,
             flags: Flags::from_config(config),
             patterns: config.patterns.iter().map(|p| generate(p, own)).collect(),
-            pairwise: keys.0,
-            group: keys.1,
+            pairwise,
+            group,
+            cam,
             pages: pages.bytes,
             locations: pages.locations,
         })
@@ -507,6 +520,7 @@ pub(super) struct Armed {
     flags: Flags,
     mac_id: u8,
     pages: Vec<u8>,
+    cam: super::security_cam::Installed,
 }
 
 /// `rtw_wow_suspend` for a managed-linked station (`rtw_wow_enable` +
@@ -523,6 +537,10 @@ pub(super) async fn suspend<I: Io>(
     // rtw_wow_swap_fw(RTW_WOWLAN_FW)
     io.download(wow_image).await?;
     io.h2c(h2c::media_status(plan.mac_id, true)).await?;
+    // rtw_ops_set_key(SET_KEY) + rtw_sec_enable_sec_engine: Linux keeps the
+    // keys in the CAM all along; NARF installs them only now, with host RX
+    // DMA stopped, so the awake path never saw device-decrypted frames.
+    let cam = super::security_cam::install(io, &plan.cam).await?;
     // rtw_wow_config_wow_fw_rsvd_page
     io.reserved_page(&plan.pages).await?;
     // rtw_wow_fw_start (mgd linked)
@@ -548,6 +566,7 @@ pub(super) async fn suspend<I: Io>(
         flags: plan.flags,
         mac_id: plan.mac_id,
         pages: plan.pages.clone(),
+        cam,
     })
 }
 
@@ -563,14 +582,18 @@ pub(super) async fn resume<I: Io>(
         Ok(reason) => decode(reason),
         Err(e) => return (None, Err(e.into())),
     };
-    let result = resume_inner(io, &armed, normal_image).await;
+    let result = resume_inner(io, armed, normal_image).await;
     (Some(report), result)
 }
 async fn resume_inner<I: Io>(
     io: &mut I,
-    armed: &Armed,
+    armed: Armed,
     normal_image: &PreparedImage,
 ) -> Result<(), Error> {
+    // Return to software CCMP before any host ring restarts, so no
+    // device-decrypted frame reaches the host's CCMP/replay path. Linux
+    // keeps hardware keys (rtw_ops_set_key) and has nothing to undo.
+    super::security_cam::clear(io, armed.cam).await?;
     // rtw_wow_stop
     io.hci_restart().await?;
     io.h2c(h2c::disconnect_decision(armed.flags, false)).await?;
