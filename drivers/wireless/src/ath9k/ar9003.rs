@@ -18,6 +18,7 @@ pub(super) mod eeprom;
 pub(super) mod ini;
 pub(super) mod initvals;
 pub(super) mod irq;
+pub(super) mod mac;
 pub(super) mod packet;
 pub(super) mod phy;
 pub(super) mod power;

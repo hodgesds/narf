@@ -2069,9 +2069,27 @@ owner instead of being skipped, one frame is in flight. Smokes (written,
 not executed): `smoke_ath9k_ar9300_edma_packet_owner_tx_rx_and_stop`,
 `smoke_ath9k_ar9300_edma_interrupt_mask_and_cause`.
 
-Still to port before `ar9300_enablement` can be claimed: the AR9300
-station MAC profile (EDMA `ath9k_hw_set_dma`, `AR_Q_DESC_CRCCHK`, the
-AR9300 RF-silent GPIO), `ar9003_calib.c`, signed AR9300 records and the
+AR9003 station MAC profile (step 3c). `ar9003/mac.rs::prepare` is the
+AR9300 profile of the shared `mac::prepare_chip` recipe (which stays
+byte-identical for AR5008/AR9002): parked engines and `AR_PHY_ACTIVE`
+(0xa20c on AR9003) are required, the MAC must be the restored map's and
+the band enabled in `opFlags`; the shared `peer_clocked` runs at
+`ath9k_hw_set_clockrate`'s clock (`Clock::Ofdm2g` on 2 GHz, `Clock::Fast5g`
+under `ATH9K_HW_CAP_FASTCLOCK` on 5 GHz; only `AR_USEC_USEC` is
+rewritten, the fast-clock INI set the latencies), then `opmode`, `mfp`
+(`AR_SREV_9280_20_OR_LATER`), the 128-entry key-cache clear, `queue0`,
+`AR_Q_DESC_CRCCHK_EN` (`ath9k_hw_resettxqueue`), `qos`,
+`AR_STA_ID1_PRESERVE_SEQNUM` and the EDMA `ath9k_hw_set_dma` (no AHB
+prefetch or `AR_FTRIG`, 128-byte TX/RX DMA, `AR_RXFIFO_CFG` 0x200,
+`AR_RXBP_THRESH` HP/LP 1, `AR_PCU_TXBUF_CTRL` 0x700; `AR_DATABUF_SIZE`
+and the status ring belong to the EDMA packet owner). `rf_silent` decodes
+`EEP_RF_SILENT` (byte 35; reserved bits or a pin outside
+`AR9300_GPIO_MASK` refused), the input is configured through the AR9300
+`AR_GPIO_OE_OUT` 0x4050 (`AR_GPIO_OE_OUT_DRV_NO`) and `rf_kill_asserted`
+is `ath_is_rfkill_set` over the `AR_GPIO_IN` 0x404c bit. Smoke (written,
+not executed): `smoke_ath9k_ar9300_mac_profile_dma_clock_and_rf_silent`.
+
+Still to port before `ar9300_enablement` can be claimed: `ar9003_calib.c`, signed AR9300 records and the
 probe/station/retune/reset/periodic/suspend owner.
 Nothing registers `0x0030`.
 
