@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Retained rtlwifi paged MMIO firmware owner; Linux rtlwifi/rtl8188ee/fw.c
-//! rtl8821ae/fw.c and rtl8192ee/fw.c. Profiles: RTL8188EE, RTL8821AE and
-//! RTL8192EE (normal images).
+//! rtl8821ae/fw.c, rtl8192ee/fw.c and rtl8192c/fw_common.c. Profiles:
+//! RTL8188EE, RTL8821AE, RTL8192EE and RTL8192CE/8188CE (normal images).
 //! PCI bus mastering remains parked. This does not install native packet rings.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +77,10 @@ pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
     if did == super::regs::RTL_DEV_8192EE {
         // IS_FW_HEADER_EXIST (0x92e0) plus exact RAM-code length.
         return super::rtl8192ee::fw::parse(bytes);
+    }
+    if super::rtl8192ce::is_8192ce(did) {
+        // IS_FW_HEADER_EXIST (0x92c0 / 0x88c0), exact length, max_fw_size.
+        return super::rtl8192ce::fw::parse(bytes);
     }
     if did != super::regs::RTL_DEV_8188EE {
         return Err(Error::Unsupported);
@@ -347,8 +351,29 @@ impl<I: Io> Owner<I> {
                 .initialize_registered_from(&authority, super::rtl8192ee::fw::FW_NORMAL)
                 .await;
         }
+        if super::rtl8192ce::is_8192ce(self.did) {
+            // rtl8192ce/sw.c rtl92c_init_sw_vars: the image follows the
+            // measured chip version; unqualified versions load nothing.
+            let name = self.rtl8192ce_version()?.firmware();
+            return self.initialize_registered_from(&authority, name).await;
+        }
         self.initialize_registered_from(&authority, super::fw::FW_8188EE)
             .await
+    }
+    /// `_rtl92ce_read_chip_version` over this owner's registers.
+    fn rtl8192ce_version(&self) -> Result<super::rtl8192ce::version::Version, Error> {
+        use super::rtl8192ce::version::{Version, REG_HPON_FSM, REG_SYS_CFG};
+        let sys_cfg = self.io.read32(REG_SYS_CFG)?;
+        if sys_cfg == u32::MAX {
+            return Err(Error::Gone);
+        }
+        let mut hpon = Ok(0);
+        let version = Version::from_registers(sys_cfg, || {
+            hpon = self.io.read32(REG_HPON_FSM);
+            *hpon.as_ref().unwrap_or(&0)
+        });
+        hpon?;
+        version.map_err(|_| Error::Unsupported)
     }
     pub(super) async fn initialize_registered_from(
         &self,
@@ -361,15 +386,21 @@ impl<I: Io> Owner<I> {
         if self.started.load(Ordering::Acquire) {
             return Err(Error::AlreadyStarted);
         }
-        if !matches!(
-            (self.did, name),
-            (super::regs::RTL_DEV_8188EE, super::fw::FW_8188EE)
-                | (
-                    super::regs::RTL_DEV_8821AE,
-                    super::rtl8821ae::fw::FW_NORMAL | super::rtl8821ae::fw::FW_NORMAL_ALT
-                )
-                | (super::regs::RTL_DEV_8192EE, super::rtl8192ee::fw::FW_NORMAL)
-        ) {
+        // rtl8192ce: only the image rtl92c_init_sw_vars selects for the
+        // measured chip version.
+        let ce_bound =
+            super::rtl8192ce::is_8192ce(self.did) && self.rtl8192ce_version()?.firmware() == name;
+        if !ce_bound
+            && !matches!(
+                (self.did, name),
+                (super::regs::RTL_DEV_8188EE, super::fw::FW_8188EE)
+                    | (
+                        super::regs::RTL_DEV_8821AE,
+                        super::rtl8821ae::fw::FW_NORMAL | super::rtl8821ae::fw::FW_NORMAL_ALT
+                    )
+                    | (super::regs::RTL_DEV_8192EE, super::rtl8192ee::fw::FW_NORMAL)
+            )
+        {
             return Err(Error::Unsupported);
         }
         let asset = crate::firmware_asset::load(authority, name, HEADER + MAX_PAYLOAD, false)
@@ -421,6 +452,9 @@ impl<I: Io> Owner<I> {
         }
         if self.did == super::regs::RTL_DEV_8192EE {
             return self.run_8192ee(info, payload).await;
+        }
+        if super::rtl8192ce::is_8192ce(self.did) {
+            return self.run_8192ce(info, payload).await;
         }
         narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
@@ -549,6 +583,38 @@ impl<I: Io> Owner<I> {
             self.io.write8(0x28, 0x83)?;
             self.set(Stage::Downloading, None);
             super::rtl8192ee::fw::download(&self.io, payload, true).await?;
+            Ok(info)
+        })
+        .await
+        .unwrap_or(Err(Error::Deadline))
+    }
+    /// `rtl92ce_hw_init` firmware step with packet engines still closed.
+    /// The chip version is measured and qualified first (test chips, unknown
+    /// cuts and the 1T2R bonding are refused). Linux order follows:
+    /// `_rtl92ce_init_mac` power-on prefix (this family has no pwrseq table),
+    /// then — instead of `REG_CR = 0x2ff`, the LLT and the ring bases, which
+    /// belong to the retained ring owner — the CR DMA/MAC gates are cleared
+    /// as for the other profiles. A still-running RAM image is stopped as in
+    /// `_rtl92ce_poweroff_adapter` (probe does not power the adapter off),
+    /// then `rtl92c_download_fw`.
+    async fn run_8192ce(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
+        // 1000 x 100 us APFM poll, 99 checksum reads and 101 x 5 ms WINTINI
+        // polls fit inside the one-second bound.
+        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+            self.set(Stage::Preparing, None);
+            if self.io.read32(MCU)? == u32::MAX {
+                return Err(Error::Gone);
+            }
+            self.rtl8192ce_version()?;
+            super::rtl8192ce::power::power_on(&self.io).await?;
+            let control = self.read8(0x100).await?;
+            self.io.write8(0x100, control & !0xcf)?;
+            if self.read8(0x100).await? & 0xcf != 0 {
+                return Err(Error::Gate);
+            }
+            super::rtl8192ce::fw::stop_running(&self.io).await?;
+            self.set(Stage::Downloading, None);
+            super::rtl8192ce::fw::download(&self.io, payload).await?;
             Ok(info)
         })
         .await

@@ -2351,6 +2351,60 @@ Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack`
 (`rtl8192ee/packet_owner_tests.rs`).
 
+### RTL8192CE / RTL8188CE retained-runtime foundation (groundwork, not admitted)
+
+`rtl8192ce/` holds the Linux `rtl8192ce` + `rtl8192c` (common) pieces a
+native RTL8192CE (2T2R) / RTL8188CE (1T1R) owner is built from
+(`rtl92ce_pci_ids`: `0x8178`, `0x8177`, `0x8176`, `0x8191`;
+`rtl8192ce::is_8192ce`). None is reachable from probe as a WLAN capability:
+these IDs stay diagnostic (`pci::bring_up` does not retain them).
+
+- `version` — `_rtl92ce_read_chip_version` over `REG_SYS_CFG` and (92C
+  serial only) `REG_HPON_FSM`. Qualified: `CHIP_88C` ⇒ `RF_1T1R`
+  (RTL8188CE) and `CHIP_92C` ⇒ `RF_2T2R` (RTL8192CE), TSMC and UMC A/B
+  cuts. Refused: `TRP_VAUX_EN` test chips, `CHIP_UNKNOWN` cuts, and the
+  `CHIP_BONDING_92C_1T2R` bonding (Linux's `switch (version & 3)` assigns no
+  RF type to it). Firmware per `rtl92c_init_sw_vars`: UMC A-cut 88C ⇒
+  `rtl8192cfwU.bin`, UMC B-cut ⇒ `rtl8192cfwU_B.bin`, else `rtl8192cfw.bin`.
+- `adapter` — `rtl92ce_read_eeprom_info` / `_rtl92ce_read_adapter_info`
+  over the 128-byte `HWSET_MAX_SIZE` map: EEPROM boot, autoload failure or
+  a map without `0x8129` is unprovisioned (no facts). MAC `0x16`,
+  VID/DID/SVID/SMID, channel plan `0x75` (Linux then installs
+  `COUNTRY_CODE_WORLD_WIDE_13`), version, customer id, the
+  `rtl8192ce_read_bt_coexist_info_from_hwpg` fields (`RF_OPTION1[7:5]` is
+  `bt_coexistence`) and the HP/Toshiba/QMI OEM rule. The map is kept
+  verbatim for the TX-power decode.
+- `power` — this family has no pwrseq table: the `_rtl92ce_init_mac`
+  prefix (`RSV_CTRL = 0`, `SPS0_CTRL = 0x2b`, `AFE_XTAL_CTRL = 0x0f`,
+  `APS_FSMCO+1` BIT0 request and 1000 x 100 us poll, exact-width
+  `APS_FSMCO = 0x1012`, `SYS_ISO_CTRL+1 = 0x82`). BT-coexist branches are
+  not issued (such boards are never admitted). An APFM poll expiry is a
+  gate failure (Linux continues). The probe-time `power::RTL8192CE_PWR_ON`
+  table used for diagnostic identity is not this sequence and must be
+  replaced before admission.
+- `fw` — `IS_FW_HEADER_EXIST` (`0x92c0` / `0x88c0`), exact RAM-code length
+  (linux-firmware: `0x3f20` / `0x39c2` / `0x3fac`), whole file at most
+  `max_fw_size = 0x4000`. `rtl92c_download_fw` for normal chips:
+  `SYS_FUNC_EN+1 |= 0x04`, `MCUFWDL |= 1`, `+2 &= 0xf7`, pages with
+  `rtl_fill_dummy` and no inter-page delay, close (`&= 0xfe`, `+1 = 0`),
+  `FWDL_CHKSUM_RPT` within the first 99 undelayed reads, `MCUFWDL_RDY` /
+  `~WINTINI_RDY`, `WINTINI_RDY` over 101 reads x 5 ms. A failed
+  `_rtl92c_fw_free_to_go` is an error here (Linux logs and returns 0). A
+  still-running RAM image is stopped as in `_rtl92ce_poweroff_adapter`
+  (`rtl92c_firmware_selfreset`: `HMETFR+3 = 0x20`, up to 100 x 50 us for
+  `SYS_FUNC_EN+1` BIT2, then `MCUFWDL = 0`).
+  `firmware_transport::Owner` admits the family (parse dispatch,
+  `run_8192ce`): the registered image must be the one selected for the
+  measured version; the run qualifies the version before any write, runs
+  the power prefix, clears CR DMA/MAC gates instead of `REG_CR = 0x2ff`
+  (ring owner), stops a running image and downloads.
+
+Tests (written, unexecuted): `smoke_rtl8192ce_chip_version_rf_type_and_firmware_name`,
+`smoke_rtl8192ce_firmware_header_geometry`,
+`smoke_rtl8192ce_firmware_paged_download`,
+`smoke_rtl8192ce_retained_firmware_owner_profile`,
+`smoke_rtl8192ce_adapter_info_factory_rules`.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE

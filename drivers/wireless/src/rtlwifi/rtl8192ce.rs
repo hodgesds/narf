@@ -10,8 +10,45 @@
 //! - `rtlwifi/rtl8192ce/reg.h`  — register offsets
 //! - `rtlwifi/rtl8192ce/def.h`  — chip-version and rate constants
 //! - `rtlwifi/rtl8192de/reg.h`  — minor offset additions (mostly identical)
+//!
+//! ## Retained-runtime foundation (`rtl8192ce/`)
+//!
+//! Exact Linux `rtl8192ce` + `rtl8192c` (common) pieces a native
+//! RTL8192CE / RTL8188CE owner is built from:
+//!
+//! - [`version`] — `_rtl92ce_read_chip_version`, the `fw_common.h` version
+//!   predicates, RF-type qualification (1T1R `CHIP_88C`, 2T2R `CHIP_92C`;
+//!   1T2R bonding, test chips and unknown cuts refused) and the
+//!   `rtl92c_init_sw_vars` firmware-name selection.
+//! - [`adapter`] — `rtl92ce_read_eeprom_info` / `_rtl92ce_read_adapter_info`
+//!   factory facts, BT-coexist EFUSE fields and the OEM rule.
+//! - [`power`] — the `_rtl92ce_init_mac` power-on prefix (no pwrseq table).
+//! - [`fw`] — `rtl8192cfw*.bin` header validation and `rtl92c_download_fw`
+//!   (normal-chip paged write, `_rtl92c_fw_free_to_go`,
+//!   `rtl92c_firmware_selfreset`).
 
 #![allow(dead_code)]
+
+pub mod adapter;
+pub mod fw;
+pub mod power;
+pub mod version;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
+
+/// Further `rtl92ce_pci_ids` entries (`rtl8192ce/sw.c`) beside the two
+/// `regs.rs` IDs.
+pub const DEV_ID_8192CE_8177: u16 = 0x8177;
+pub const DEV_ID_8192CE_8191: u16 = 0x8191;
+
+/// Whether `did` is one of the `rtl92ce_pci_ids` (RTL8192CE / RTL8188CE).
+pub const fn is_8192ce(did: u16) -> bool {
+    matches!(
+        did,
+        DEV_ID_8192CE | DEV_ID_8192CE_ALT | DEV_ID_8192CE_8177 | DEV_ID_8192CE_8191
+    )
+}
 
 /// Primary PCI device ID for RTL8192CE.
 pub const DEV_ID_8192CE: u16 = super::regs::RTL_DEV_8192CE;
