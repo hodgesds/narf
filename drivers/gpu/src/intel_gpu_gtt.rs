@@ -131,6 +131,9 @@ pub const PTE_PRESENT: u64 = 1 << 0;
 /// Read/write bit — display plane scanout sets this clear (RO);
 /// 3D/compute engines may set it.
 pub const PTE_RW: u64 = 1 << 1;
+/// regs/xe_gtt_defs.h XE_GGTT_PTE_DM: the GGTT entry maps device memory
+/// (stolen DSM on graphics >= 12.70), shares bit 1 with the PPGTT RW bit.
+pub const PTE_DM: u64 = 1 << 1;
 /// PPGTT PAT index bit 0 (Gen12+).
 pub const PTE_PAT0: u64 = 1 << 3;
 /// PPGTT PAT index bit 1 (Gen12+).
@@ -168,6 +171,19 @@ impl PteFormat {
             }
         };
         Ok(phys | PTE_PRESENT | pat)
+    }
+
+    /// xe_ggtt.c::xelpg_ggtt_pte_flags for a stolen BO on graphics >= 12.70
+    /// (xe_bo_is_stolen_devmem): XE_PAGE_PRESENT | XE_GGTT_PTE_DM, the two
+    /// GGTT PAT bits, and as address the device-memory offset that
+    /// xe_ggtt_map_bo prepends (vram_region_gpu_offset: the stolen manager's
+    /// `stolen_base`, 8 MiB above GSMBASE, plus the DSM offset). Only the
+    /// GSC private object is mapped this way; earlier formats have no DM bit.
+    pub fn encode_ggtt_stolen(self, gsm_offset: u64, pat_index: u8) -> Result<u64, GttError> {
+        if self == Self::Gen12 {
+            return Err(GttError::InvalidPatIndex);
+        }
+        Ok(self.encode_ggtt(gsm_offset, pat_index)? | PTE_DM)
     }
 
     pub fn encode_ppgtt(self, phys: u64, pat_index: u8, writable: bool) -> Result<u64, GttError> {

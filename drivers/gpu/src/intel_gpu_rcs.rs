@@ -1062,6 +1062,62 @@ impl GgttArena {
         Ok(())
     }
 
+    /// xe_ggtt.c::xe_ggtt_map_bo for the MTL/Arrow media GT's GSC private
+    /// object (XE_BO_FLAG_STOLEN | XE_BO_FLAG_GGTT): one DM PTE per page,
+    /// `encode_ggtt_stolen(stolen_base + DSM offset, WB index)`, at the
+    /// ledger's fixed GSC window above this arena. Without
+    /// XE_BO_FLAG_GGTT_INVALIDATE Linux invalidates no TLB on that insert, and
+    /// no GuC ever touches the object. The window and its DSM pages are the
+    /// function's for its lifetime: the arena never allocates, clears or
+    /// retires them, and each GT0 incarnation rewrites the same entries. Every
+    /// entry is read back.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    fn map_gsc_stolen(&self, dsm_offset: u64, pages: u32) -> Result<u32, SubmitError> {
+        let platform = self.gt_platform.ok_or(SubmitError::NoEngine)?;
+        let policy = self.policy.ok_or(SubmitError::NoEngine)?;
+        let window = crate::intel_gpu_stolen::GSC_GGTT;
+        let bytes = u64::from(pages) * GTT_PAGE_SIZE;
+        if !crate::intel_gpu_gt::media::profile_eligible(platform)
+            || policy.platform() != platform
+            || self.authority.is_none()
+            || bytes != crate::intel_gpu_stolen::GSC_BYTES
+            || dsm_offset % GTT_PAGE_SIZE != 0
+            || !self.ggtt_ledger.as_ref().is_some_and(|ledger| {
+                ledger.allows(crate::intel_gpu_ggtt_ranges::Kind::Gsc, window, bytes)
+            })
+            || (self.ggtt_va_size != 0 && window + bytes > self.ggtt_va_size)
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        let format = platform.pte_format();
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(pages as usize)
+            .map_err(|_| SubmitError::OutOfMemory)?;
+        for page in 0..u64::from(pages) {
+            let gsm = crate::intel_gpu_stolen::DSM_GSM_OFFSET + dsm_offset + page * GTT_PAGE_SIZE;
+            entries.push(
+                format
+                    .encode_ggtt_stolen(gsm, policy.ggtt_pat())
+                    .map_err(|_| SubmitError::OutOfMemory)?,
+            );
+        }
+        for (page, pte) in entries.iter().enumerate() {
+            self.write_pte(window as u32 + page as u32 * GTT_PAGE_SIZE as u32, *pte)?;
+        }
+        compiler_fence(Ordering::SeqCst);
+        let mmio = self.authority.as_ref().ok_or(SubmitError::NoEngine)?;
+        for (page, pte) in entries.iter().enumerate() {
+            let slot = GGTT_ARRAY_BASE + (window / GTT_PAGE_SIZE + page as u64) * 8;
+            let read = u64::from(mmio.read32(slot)) | u64::from(mmio.read32(slot + 4)) << 32;
+            if read != *pte {
+                return Err(SubmitError::NoEngine);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        Ok(window as u32)
+    }
+
     /// Posting flush for a burst of arena PTE writes: fence,
     /// then read back the slot at `last_ggtt_off` so the writes
     /// are visible before the backing is handed to an engine.
@@ -1434,6 +1490,13 @@ impl SharedArena {
         }
         arena.retired = true;
         Ok(())
+    }
+
+    /// Map the GSC private object's claimed DSM range at the fixed GSC GGTT
+    /// window (`GgttArena::map_gsc_stolen`); returns the window's GGTT base.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn map_gsc_stolen(&self, dsm_offset: u64, pages: u32) -> Result<u32, SubmitError> {
+        self.inner.lock().map_gsc_stolen(dsm_offset, pages)
     }
 
     pub(crate) fn configure_cache(

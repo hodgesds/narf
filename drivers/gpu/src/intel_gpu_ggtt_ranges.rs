@@ -15,6 +15,10 @@ pub(crate) enum Kind {
     Console(u8),
     Primary,
     Gt,
+    /// The media GT's GSC private object: DM PTEs written once per GT0
+    /// incarnation and never cleared (the GSC owns the memory until an FLR).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    Gsc,
 }
 #[derive(Debug)]
 pub(crate) struct Ledger {
@@ -54,6 +58,10 @@ impl Ledger {
                 u64::from(crate::intel_gpu_rcs::GGTT_ARENA_BASE),
                 u64::from(crate::intel_gpu_rcs::GGTT_ARENA_BASE)
                     + u64::from(crate::intel_gpu_rcs::GGTT_ARENA_PAGES) * 4096,
+            ),
+            Kind::Gsc => (
+                crate::intel_gpu_stolen::GSC_GGTT,
+                crate::intel_gpu_stolen::GSC_GGTT + crate::intel_gpu_stolen::GSC_BYTES,
             ),
         };
         bytes != 0

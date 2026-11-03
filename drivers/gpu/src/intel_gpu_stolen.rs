@@ -46,9 +46,20 @@
 //! [`Carve`] reads at most [`CARVE_CHUNK_PTES`] entries per step and its
 //! driver yields between steps; the present path only polls a
 //! [`CarveSlot`], and FBC stays off until the carve has finished. A
-//! finished survey stays valid: this driver never writes a DM PTE, so the
-//! set of aperture-reachable DSM pages can only shrink, and a stale survey
-//! only over-excludes.
+//! finished survey stays valid: the only DM PTEs this driver writes map the
+//! GSC private object at [`GSC_GGTT`], above every CPU-mappable GGTT entry,
+//! so the set of aperture-reachable DSM pages can only shrink, and a stale
+//! survey only over-excludes.
+//!
+//! Two owners place DSM ranges for one function: display FBC (the CFB) and
+//! the media GT's GSC (the 4 MiB private object of
+//! `xe/xe_gsc.c::xe_gsc_init_post_hwconfig`, `XE_BO_FLAG_STOLEN |
+//! XE_BO_FLAG_GGTT`). A device-lifetime claim registry keyed by the DSM base
+//! keeps them apart: every CFB placement avoids the GSC claim, and the GSC
+//! placement avoids every recent CFB claim. The GSC claim is made once and
+//! never released or moved: the GSC may keep using that memory until an FLR
+//! (Linux sets `xe->needs_flr_on_fini`), and NARF performs none, so every
+//! later GT0 incarnation and resume gets the same range back.
 
 use alloc::vec::Vec;
 use core::task::Poll;
@@ -94,6 +105,15 @@ pub const MIN_OFFSET: u64 = 4096;
 pub const PAGE: u64 = 4096;
 /// Bounded placements per function (the FBC CFB needs one).
 pub const MAX_PLACEMENTS: usize = 2;
+/// `xe_gsc_init_post_hwconfig`'s SZ_4M GSC private object.
+pub const GSC_BYTES: u64 = 4 << 20;
+/// The GGTT window of the GSC private object's DM PTEs: directly above the
+/// GT arena (`GGTT_ARENA_BASE` + 32 MiB), owned by the function's GGTT
+/// ledger for its lifetime and never handed to any arena.
+pub const GSC_GGTT: u64 = 288 << 20;
+/// Recent CFB claims the GSC placement avoids (FBC uses its newest carve;
+/// an earlier one may still be scanned until FBC re-activates).
+pub const MAX_CFB_CLAIMS: usize = 4;
 
 /// Why DSM cannot be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +258,9 @@ pub struct Dsm {
     layout: Layout,
     excluded_pages: Vec<u64>,
     placed: Vec<(u64, u64)>,
+    /// Ranges another DSM owner of this function holds (not counted against
+    /// [`MAX_PLACEMENTS`]).
+    reserved: Vec<(u64, u64)>,
 }
 
 impl Dsm {
@@ -246,7 +269,12 @@ impl Dsm {
             layout,
             excluded_pages,
             placed: Vec::new(),
+            reserved: Vec::new(),
         }
+    }
+    /// Exclude `[start, start + len)`, held by another owner of this DSM.
+    pub fn reserve(&mut self, start: u64, len: u64) {
+        self.reserved.push((start, len));
     }
     pub fn layout(&self) -> Layout {
         self.layout
@@ -266,8 +294,10 @@ impl Dsm {
         let range = self
             .placed
             .iter()
-            .find(|&&(s, l)| s < end && start < s + l)
-            .map(|&(s, l)| s + l);
+            .chain(&self.reserved)
+            .filter(|&&(s, l)| s < end && start < s + l)
+            .map(|&(s, l)| s + l)
+            .max();
         match (page, range) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -369,7 +399,8 @@ impl Carve {
 
     /// After a complete survey: `find_compression_limit` over first-fit
     /// placements below `intel_fbc_cfb_base_max`, each proved free of
-    /// system RAM. `None` before the survey completes or when nothing fits.
+    /// system RAM and of this function's GSC claim, then recorded as a CFB
+    /// claim. `None` before the survey completes or when nothing fits.
     pub fn place(
         self,
         size: u64,
@@ -382,20 +413,137 @@ impl Carve {
         let mut pages = self.pages;
         pages.sort_unstable();
         pages.dedup();
-        let mut stolen = Dsm::new(self.layout, pages);
-        let mut offset = None;
-        let (limit, bytes) =
-            crate::intel_gpu_fbc::find_compression_limit(size, min_limit, |bytes| {
-                match stolen.place(bytes, PAGE, CFB_BASE_MAX, &is_system_ram) {
+        // A GSC claim committed between the snapshot and the commit forces
+        // one more placement over the new snapshot.
+        loop {
+            let (generation, gsc, _) = claims(self.layout);
+            let mut stolen = Dsm::new(self.layout, pages.clone());
+            if let Some((start, len)) = gsc {
+                stolen.reserve(start, len);
+            }
+            let mut offset = None;
+            let (limit, bytes) = crate::intel_gpu_fbc::find_compression_limit(
+                size,
+                min_limit,
+                |bytes| match stolen.place(bytes, PAGE, CFB_BASE_MAX, &is_system_ram) {
                     Ok(placed) => {
                         offset = Some(placed);
                         true
                     }
                     Err(_) => false,
-                }
-            })?;
-        Some((u32::try_from(offset?).ok()?, bytes, limit))
+                },
+            )?;
+            let offset = offset?;
+            if commit(self.layout, generation, Claim::Cfb(offset, bytes)) {
+                return Some((u32::try_from(offset).ok()?, bytes, limit));
+            }
+        }
     }
+
+    /// After a complete survey: the GSC private object's DSM range,
+    /// `GSC_BYTES` placed first-fit in usable DSM away from every excluded
+    /// aperture page and recent CFB claim, each page proved free of system
+    /// RAM. A function that already holds a GSC claim gets that range back
+    /// without a placement (`gsc_claim`). `None` before the survey completes.
+    pub fn place_gsc(
+        &self,
+        is_system_ram: impl Fn(u64) -> bool,
+    ) -> Option<Result<(u64, u64), StolenError>> {
+        if let Some(claim) = gsc_claim(self.layout) {
+            return Some(Ok(claim));
+        }
+        if !self.done() {
+            return None;
+        }
+        let mut pages = self.pages.clone();
+        pages.sort_unstable();
+        pages.dedup();
+        loop {
+            let (generation, gsc, cfb) = claims(self.layout);
+            if let Some(claim) = gsc {
+                return Some(Ok(claim));
+            }
+            let mut stolen = Dsm::new(self.layout, pages.clone());
+            for (start, len) in cfb {
+                stolen.reserve(start, len);
+            }
+            let offset = match stolen.place(GSC_BYTES, PAGE, u64::MAX, &is_system_ram) {
+                Ok(offset) => offset,
+                Err(error) => return Some(Err(error)),
+            };
+            if commit(self.layout, generation, Claim::Gsc(offset, GSC_BYTES)) {
+                return Some(Ok((offset, GSC_BYTES)));
+            }
+        }
+    }
+}
+
+/// One function's device-lifetime DSM claims.
+#[derive(Clone, Debug, Default)]
+struct Claims {
+    /// Bumped by every commit (optimistic placement outside the lock).
+    generation: u64,
+    /// The GSC private object: placed once, never released.
+    gsc: Option<(u64, u64)>,
+    /// The newest CFB placements, oldest first.
+    cfb: Vec<(u64, u64)>,
+}
+
+enum Claim {
+    Cfb(u64, u64),
+    Gsc(u64, u64),
+}
+
+/// Claims per DSM base (`Layout::base_phys`, the function's BSM).
+static CLAIMS: IrqSafeSpinLock<Vec<(u64, Claims)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// A snapshot: (generation, GSC claim, recent CFB claims).
+fn claims(layout: Layout) -> (u64, Option<(u64, u64)>, Vec<(u64, u64)>) {
+    CLAIMS
+        .lock()
+        .iter()
+        .find(|(base, _)| *base == layout.base_phys)
+        .map_or((0, None, Vec::new()), |(_, c)| {
+            (c.generation, c.gsc, c.cfb.clone())
+        })
+}
+
+/// Record `claim` if no other claim of this DSM landed since `generation`.
+fn commit(layout: Layout, generation: u64, claim: Claim) -> bool {
+    let mut all = CLAIMS.lock();
+    let at = match all.iter().position(|(base, _)| *base == layout.base_phys) {
+        Some(at) => at,
+        None => {
+            all.push((layout.base_phys, Claims::default()));
+            all.len() - 1
+        }
+    };
+    let claims = &mut all[at].1;
+    if claims.generation != generation {
+        return false;
+    }
+    match claim {
+        Claim::Cfb(start, len) => {
+            if claims.cfb.len() == MAX_CFB_CLAIMS {
+                claims.cfb.remove(0);
+            }
+            claims.cfb.push((start, len));
+        }
+        Claim::Gsc(start, len) => {
+            if claims.gsc.is_some() {
+                return false;
+            }
+            claims.gsc = Some((start, len));
+        }
+    }
+    claims.generation += 1;
+    true
+}
+
+/// This function's GSC private object, if one was ever claimed: the GSC
+/// owns it until an FLR, so it is never released or reused.
+pub fn gsc_claim(layout: Layout) -> Option<(u64, u64)> {
+    claims(layout).1
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -473,6 +621,88 @@ impl CarveSlot {
     }
 }
 
+/// The function's BAR2 (GMADR) as the CPU reaches DSM on graphics >= 12.70:
+/// GSM, then DSM at [`DSM_GSM_OFFSET`] (`detect_bar2_integrated`'s
+/// `io_base`). Accesses outside the BAR or unaligned read as all ones and
+/// write nothing.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+pub(crate) struct Bar2Window(pub(crate) narf_bus::MmioRegion);
+
+impl crate::intel_gpu_aux::MmioWindow for Bar2Window {
+    fn read32(&self, offset: u64) -> u32 {
+        if offset % 4 != 0 || offset.checked_add(4).is_none_or(|end| end > self.0.len) {
+            return u32::MAX;
+        }
+        // SAFETY: the probe-mapped BAR2 this driver owns; the dword is
+        // aligned and inside the BAR. DSM is memory and tolerates any read.
+        unsafe { self.0.read32(offset) }
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        if offset % 4 != 0 || offset.checked_add(4).is_none_or(|end| end > self.0.len) {
+            return;
+        }
+        // SAFETY: as `read32`; callers write only a DSM range they claimed.
+        unsafe { self.0.write32(offset, value) }
+    }
+}
+
+/// The GSC private object: its claimed DSM range, which the CPU writes
+/// through BAR2 at `io_base + offset` as `xe_ttm_stolen_io_offset` does on
+/// graphics >= 12.70 (no GGTT detour), and which the GSC reaches through its
+/// fixed GGTT DM window. Dropping it releases nothing: the claim and the
+/// GGTT window stay the function's for its lifetime.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+pub(crate) struct StolenObject<W> {
+    cpu: W,
+    offset: u64,
+    ggtt: u32,
+}
+
+impl<W: crate::intel_gpu_aux::MmioWindow> StolenObject<W> {
+    /// The claimed `GSC_BYTES` range at `claim` within usable DSM of
+    /// `layout`, mapped at the GGTT window base `ggtt`.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
+    pub(crate) fn gsc(cpu: W, layout: Layout, claim: (u64, u64), ggtt: u32) -> Option<Self> {
+        let (offset, len) = claim;
+        (len == GSC_BYTES
+            && offset % PAGE == 0
+            && offset >= MIN_OFFSET
+            && offset
+                .checked_add(len)
+                .is_some_and(|end| end <= layout.usable)
+            && gsc_claim(layout) == Some(claim)
+            && u64::from(ggtt) == GSC_GGTT)
+            .then_some(Self { cpu, offset, ggtt })
+    }
+}
+
+impl<W: crate::intel_gpu_aux::MmioWindow> crate::intel_gpu_rcs::GpuBacking for StolenObject<W> {
+    fn ggtt_offset(&self) -> u32 {
+        self.ggtt
+    }
+    fn size_pages(&self) -> u32 {
+        (GSC_BYTES / PAGE) as u32
+    }
+    fn read32(&self, byte_off: u64) -> u32 {
+        if byte_off >= GSC_BYTES {
+            return u32::MAX;
+        }
+        self.cpu.read32(DSM_GSM_OFFSET + self.offset + byte_off)
+    }
+    fn write32(&self, byte_off: u64, val: u32) {
+        if byte_off < GSC_BYTES {
+            self.cpu
+                .write32(DSM_GSM_OFFSET + self.offset + byte_off, val);
+        }
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_stolen_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_stolen_gsc_tests.rs"]
+mod gsc_tests;
