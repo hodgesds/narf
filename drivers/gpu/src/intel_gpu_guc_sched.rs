@@ -1566,7 +1566,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     };
                     let mask = self
                         .engines
-                        .logical_mask(context.placements)
+                        .registration_mask(context.placements)
                         .expect("published placements");
                     if let Some(group) = &context.parallel {
                         let scratch = group.scratch.ggtt_offset();

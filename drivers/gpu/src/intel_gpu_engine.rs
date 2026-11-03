@@ -108,6 +108,20 @@ impl EngineSet {
                 .map(|logical| mask | 1 << logical)
         })
     }
+    /// The REGISTER_CONTEXT logical mask of an already admitted context. For
+    /// advertised engines this is [`Self::logical_mask`]. A kernel-only
+    /// (reserved) engine context, which no UAPI placement can name, maps to
+    /// its own logical instance, as Linux creates the kernel GSC queue with
+    /// `BIT(hwe->logical_instance)` (xe_gsc.c::xe_gsc_init_post_hwconfig).
+    pub(crate) fn registration_mask(self, placements: Self) -> Option<u32> {
+        let first = placements.iter().next()?;
+        placements.iter().try_fold(0, |mask, engine| {
+            (engine.reserved() == first.reserved() && engine.xe_class() == first.xe_class())
+                .then(|| self.logical_instance(engine))
+                .flatten()
+                .map(|logical| mask | 1 << logical)
+        })
+    }
     /// ENGINE_ID uses hardware class/physical instance, not GuC or UAPI
     /// numbering (xe_engine_regs.h + xe_lrc.c::get_ctx_timestamp).
     pub(crate) fn decode_hardware_id(self, word: u32) -> Option<Engine> {
