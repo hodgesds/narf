@@ -292,7 +292,7 @@ fn smoke_psr_enable_conversation_is_linux_ordered() -> TestResult {
         let regs = Regs::default();
         regs.set(0x60800, 1 << 29); // context-restore flag is preserved
         regs.set(0x46430, (if wm_level_disabled { 0 } else { 1 << 23 }) | 1);
-        regs.set(0x60814, 0xffff_ffff_u32 & !0x10);
+        regs.set(0x60814, !0x10);
         let mut aux = psr1_sink();
         let sink = Sink::read(&mut aux).unwrap();
         let config = compute_psr1(&sink, &timing(), Some(wm_level_disabled)).unwrap();
@@ -337,6 +337,8 @@ kernel_test_in!(
     smoke_psr_enable_conversation_is_linux_ordered
 );
 
+type RefusalCase<'a> = (&'a dyn Fn(&Regs), Refusal);
+
 fn smoke_psr_enable_refuses_before_any_write() -> TestResult {
     let config = compute_psr1(
         &Sink::read(&mut psr1_sink()).unwrap(),
@@ -344,7 +346,7 @@ fn smoke_psr_enable_refuses_before_any_write() -> TestResult {
         Some(false),
     )
     .unwrap();
-    let cases: [(&dyn Fn(&Regs), Refusal); 7] = [
+    let cases: [RefusalCase<'_>; 7] = [
         (&|r| r.set(0x60800, 1 << 31), Refusal::Inherited),
         (&|r| r.set(0x60900, 1 << 31), Refusal::Inherited),
         (&|r| r.set(0x60800, u32::MAX), Refusal::Unavailable),

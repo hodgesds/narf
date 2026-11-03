@@ -653,15 +653,16 @@ impl Psr {
 
 // ── Watermark-lane input ──────────────────────────────────────────
 
-static WM_LEVEL_DISABLED: IrqSafeSpinLock<Option<fn() -> Option<bool>>> =
-    IrqSafeSpinLock::new(None);
+/// A Wa_14015648006 input provider: Pipe-A `wm_level_disabled`, or `None`
+/// while the watermark lane cannot answer.
+pub type WmLevelProvider = fn() -> Option<bool>;
+
+static WM_LEVEL_DISABLED: IrqSafeSpinLock<Option<WmLevelProvider>> = IrqSafeSpinLock::new(None);
 
 /// Register (or clear) the Wa_14015648006 input: the Pipe-A
 /// `wm_level_disabled` that `skl_wm_check_vblank` computes. Returns the
 /// previous provider. The provider must not touch registers or block.
-pub fn register_wm_level_disabled(
-    provider: Option<fn() -> Option<bool>>,
-) -> Option<fn() -> Option<bool>> {
+pub fn register_wm_level_disabled(provider: Option<WmLevelProvider>) -> Option<WmLevelProvider> {
     core::mem::replace(&mut *WM_LEVEL_DISABLED.lock(), provider)
 }
 

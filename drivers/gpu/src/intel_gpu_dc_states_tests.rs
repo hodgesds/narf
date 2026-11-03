@@ -897,6 +897,9 @@ kernel_test_in!(
 /// the windows and stack tops the shipped `mtl_dmc.bin` uses (main
 /// 0x80000, pipe A 0x90000 / SSP 0x96FC0, pipe C 0x52000 / SSP 0x53FC0),
 /// laid out field by field like [`mtl_container`].
+/// (DMC id, load address, payload, MMIO table) of one container program.
+type ProgramSpec<'a> = (u8, u32, [u32; 2], &'a [(u32, u32)]);
+
 fn mtl_container_with_pipes() -> Vec<u8> {
     let package = 16 + 32 * 12;
     let mut blob = alloc::vec![0u8; 128 + package];
@@ -906,7 +909,7 @@ fn mtl_container_with_pipes() -> Vec<u8> {
     put32(&mut blob, 88, 0x0002_0017);
     blob[128] = (package / 4) as u8;
     blob[129] = 2;
-    let programs: [(u8, u32, [u32; 2], &[(u32, u32)]); 3] = [
+    let programs: [ProgramSpec<'_>; 3] = [
         (
             0,
             0x80000,
