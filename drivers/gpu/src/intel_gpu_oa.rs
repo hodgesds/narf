@@ -172,6 +172,7 @@ impl Format {
             | u32::from(self.counter_size) << 8
     }
     /// The DRM_XE_OA_PROPERTY_OA_FORMAT encoding of this format.
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn wire(self) -> u64 {
         u64::from(self.kind)
             | u64::from(self.select) << 8
