@@ -238,12 +238,15 @@ fn configured(bar: &RamBar, platform: GtPlatform) -> (SharedArena, FrameBacking)
     (arena, seed)
 }
 
+/// A platform, its fixture BAR and the invalidation writes it must see.
+type PlatformWrites<'a> = (GtPlatform, u64, &'a [(u64, u32)]);
+
 /// Option-off GT0 behaviour: every authorized GuC arena now invalidates GT0's
 /// GuC TLB after each PTE publication and clear, as xe_ggtt_invalidate does,
 /// by GUC_TLB_INV_CR before Xe2 and PVC_GUC_TLB_INV_DESC1/DESC0 from Xe2.
 /// The legacy execlist arena drives no GuC and writes neither register.
 fn smoke_ggtt_tlb_arena_gt0_mmio_every_update_per_platform() -> TestResult {
-    let cases: [(GtPlatform, u64, &[(u64, u32)]); 4] = [
+    let cases: [PlatformWrites<'_>; 4] = [
         (MTL, 0x6_e000_0000, &[(0xcee8, 1)]),
         (GtPlatform::Alchemist, 0x6_e100_0000, &[(0xcee8, 1)]),
         (
