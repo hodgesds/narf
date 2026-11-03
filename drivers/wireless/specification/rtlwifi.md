@@ -1981,6 +1981,29 @@ chain below is composed.
     `smoke_rtl8821ae_host_vht_capability_per_band`,
     `smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping`,
     `smoke_rtl8821ae_iqk_80mhz_vdf_branch` (written, unexecuted).
+  - WoWLAN pieces (8821AE, `rtl8821ae/wow.rs`; groundwork, no capability
+    is advertised to the host yet). Capability as Linux
+    `base.c::_rtl_init_mac80211` with `sw.c` `wo_wlan_mode = MAGIC |
+    PATTERN`: magic packet, 16 patterns of 13..=128 bytes, no offset; no
+    disconnect / GTK-rekey trigger (Linux never sets `gtk_offload_enable`
+    or `arp_offload_enable` for this chip, so GTK rekey offload is out of
+    scope; the firmware still wakes on disconnect). H2C payloads
+    `rtl8821ae_set_fw_wowlan_mode` (0x80), `_remote_wake_ctrl_cmd` (0x81),
+    `_keep_alive_cmd` (0x03, 10 s), `_disconnect_decision_ctrl_cmd`
+    (0x04, 30 s / 3), `_global_info_cmd` (0x82) and the
+    `H2C_8821AE_AOAC_RSVDPAGE` (0x83) locations; whole-packet reserved
+    pages (`rtl8821ae_set_fw_rsvdpagepkt(.., true)`: pages 5..7 verbatim in
+    `rsvd_page::WOWLAN_TEMPLATE`, ARP-response A1/A2/A3, 2008 bytes);
+    `core.c::_rtl_add_wowlan_patterns` (type, 6-bit mask shift, CRC over
+    the masked bytes after DA/SA, `crc16_ccitt` + complement) and
+    `hw.c::rtl8821ae_add_wowlan_pattern` WKFM CAM writes through the RX
+    packet-buffer window (a write the buffer never completes is an error
+    here; Linux only warns), then `REG_WKFMCAM_NUM`; wake reason
+    `_rtl8821ae_get_wakeup_reason` (`REG_MCUTST_WOWLAN`). 8812AE (PCI
+    0x8812, `rtl8812aefw_wowlan.bin`) is not a supported chip here: its
+    probe is not bound, so its WoWLAN is out of scope. Test
+    `smoke_rtl8821ae_wowlan_payloads_patterns_and_wake_reason` (written,
+    unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
   Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,

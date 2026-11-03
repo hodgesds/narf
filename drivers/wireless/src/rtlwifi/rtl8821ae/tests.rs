@@ -2520,3 +2520,172 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_rsvd_page_template_page_layout
 );
+
+/// WoWLAN payloads, pattern translation/CRC and the WKFM CAM writes
+/// (`rtl8821ae/fw.c`, `core.c::_rtl_add_wowlan_patterns`,
+/// `hw.c::rtl8821ae_add_wowlan_pattern`, `_rtl8821ae_get_wakeup_reason`).
+fn smoke_rtl8821ae_wowlan_payloads_patterns_and_wake_reason() -> TestResult {
+    use narf_wireless::{WowlanConfig, WowlanPattern};
+    if wow::wowlan_mode(true) != [0x87, 0, 0]
+        || wow::wowlan_mode(false) != [0x86, 0, 0]
+        || wow::remote_wake_ctrl(true) != [1]
+        || wow::keep_alive(true) != [0x03, 10, 0]
+        || wow::disconnect_decision(true) != [0x03, 30, 3]
+        || wow::global_info(wow::AESCCMP_ENCRYPTION, wow::AESCCMP_ENCRYPTION) != [4, 4]
+        || wow::aoac_rsvdpage() != [6, 5, 0, 0, 0, 7, 0]
+    {
+        return TestResult::Fail("WoWLAN H2C payloads");
+    }
+    let s = wow::support();
+    if !s.magic_packet || s.disconnect || s.gtk_rekey || s.max_patterns != 16 {
+        return TestResult::Fail("WoWLAN capability");
+    }
+    // Linux crc16_ccitt + complement, transliterated vectors.
+    if wow::pattern_crc(&[0x08, 0x06]) != 0x8d25 || wow::pattern_crc(b"123456789") != 0x7609 {
+        return TestResult::Fail("WoL pattern CRC");
+    }
+    let own = [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x04];
+    let mut bytes = vec![0u8; 14];
+    bytes[..6].copy_from_slice(&own);
+    bytes[12..14].copy_from_slice(&[0x08, 0x06]);
+    let pattern = WowlanPattern {
+        mask: vec![0xff, 0x3f],
+        pattern: bytes,
+        offset: 0,
+    };
+    let t = wow::translate(&pattern, own);
+    if t.kind != wow::PatternType::Unicast || t.mask != [0xc0, 0, 0, 0] || t.crc != 0x8d25 {
+        return TestResult::Fail("pattern translation");
+    }
+    let bcast = WowlanPattern {
+        pattern: vec![0xff; 14],
+        ..pattern.clone()
+    };
+    if wow::translate(&bcast, own).kind != wow::PatternType::Broadcast {
+        return TestResult::Fail("broadcast pattern type");
+    }
+    if wow::cam_entry(&t, 0)
+        != Some((
+            wow::REG_PKTBUF_DBG_DATA_L,
+            1 << 31 | 1 << 24 | 0x8d25,
+            0x0f01,
+        ))
+        || wow::cam_entry(&t, 1).is_some()
+        || wow::cam_entry(&t, 2) != Some((wow::REG_PKTBUF_DBG_DATA_L, 0xc0, 0x0f01))
+        || wow::cam_entry(&t, 3) != Some((wow::REG_PKTBUF_DBG_DATA_H, 0, 0xf001))
+        || wow::cam_address(0, 0) != 0x3e80 >> 3
+        || wow::cam_address(1, 2) != (0x3e80 + 24 + 8) >> 3
+    {
+        return TestResult::Fail("WKFM CAM entries");
+    }
+    let config = WowlanConfig {
+        magic_packet: true,
+        patterns: vec![pattern.clone()],
+        ..Default::default()
+    };
+    if wow::validate(&config).is_err()
+        || wow::validate(&WowlanConfig {
+            disconnect: true,
+            ..config.clone()
+        })
+        .is_ok()
+        || wow::validate(&WowlanConfig {
+            patterns: vec![WowlanPattern {
+                pattern: vec![0; 12],
+                mask: vec![0xff, 0x0f],
+                offset: 0,
+            }],
+            ..config.clone()
+        })
+        .is_ok()
+    {
+        return TestResult::Fail("WoWLAN configuration validation");
+    }
+    // CAM programming: access window opened and closed, 0x698 = count. The
+    // modelled RX packet buffer completes each command immediately.
+    struct Cam(RegFake);
+    #[async_trait::async_trait]
+    impl Io for Cam {
+        fn read8(&self, reg: u16) -> Result<u8, FwError> {
+            self.0.read8(reg)
+        }
+        fn read32(&self, reg: u16) -> Result<u32, FwError> {
+            self.0.read32(reg)
+        }
+        fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+            self.0.write8(reg, value)
+        }
+        fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+            self.0.write16(reg, value)?;
+            if reg == wow::REG_RXPKTBUF_CTRL {
+                self.0 .0.lock().0[usize::from(reg)] = 0;
+            }
+            Ok(())
+        }
+        fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+            self.0.write32(reg, value)
+        }
+        fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), FwError> {
+            self.0.write_bytes(reg, bytes)
+        }
+        async fn delay_us(&self, _micros: u64) {}
+    }
+    let io = Cam(RegFake(IrqSafeSpinLock::new((
+        vec![0u8; 0x1000],
+        Vec::new(),
+    ))));
+    if narf_scheduler::block_on(wow::program_patterns(&io, &config, own)).is_err() {
+        return TestResult::Fail("pattern programming");
+    }
+    {
+        let g = io.0 .0.lock();
+        let writes = &g.1;
+        let first = (
+            1,
+            wow::REG_PKT_BUFF_ACCESS_CTRL,
+            u32::from(wow::RXPKT_BUF_SELECT),
+        );
+        let cam_word = (4, wow::REG_PKTBUF_DBG_DATA_L, 1 << 31 | 1 << 24 | 0x8d25);
+        if writes.first() != Some(&first)
+            || !writes.contains(&cam_word)
+            || g.0[usize::from(wow::REG_PKT_BUFF_ACCESS_CTRL)] != 0
+            || g.0[usize::from(wow::REG_WKFMCAM_NUM)] != 1
+        {
+            return TestResult::Fail("pattern CAM access window");
+        }
+    }
+    // A command the buffer never completes is an error, window closed.
+    let stuck = RegFake(IrqSafeSpinLock::new((vec![0u8; 0x1000], Vec::new())));
+    if narf_scheduler::block_on(wow::program_patterns(&stuck, &config, own)).is_ok()
+        || stuck.0.lock().0[usize::from(wow::REG_PKT_BUFF_ACCESS_CTRL)] != 0
+    {
+        return TestResult::Fail("stuck CAM write accepted");
+    }
+    // Whole reserved pages: ARP response A1/A2/A3 substituted, 2008 bytes.
+    let bssid = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let Ok(pages) = wow::whole_reserved_pages(own, bssid, 5) else {
+        return TestResult::Fail("whole reserved pages");
+    };
+    let at = 5 * 256;
+    if pages.len() != 2008
+        || pages[at..at + 4] != [0x08, 0x01, 0x00, 0x00]
+        || pages[at + 4..at + 10] != bssid
+        || pages[at + 10..at + 16] != own
+        || pages[at + 16..at + 22] != bssid
+        || pages[..station::RSVD_PAGE_LEN] != station::reserved_pages(own, bssid, 5).unwrap()[..]
+    {
+        return TestResult::Fail("whole reserved-page layout");
+    }
+    if wow::wake_reason(0x21) != wow::WakeReason::MagicPacket
+        || wow::wake_reason(0x23) != wow::WakeReason::PatternPacket
+        || wow::wake_reason(0x10) != wow::WakeReason::ApLost
+        || wow::wake_reason(0x55) != wow::WakeReason::Unknown(0x55)
+    {
+        return TestResult::Fail("wake reason decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_wowlan_payloads_patterns_and_wake_reason
+);

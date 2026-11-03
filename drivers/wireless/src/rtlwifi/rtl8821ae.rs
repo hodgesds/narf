@@ -66,6 +66,7 @@ pub(crate) mod tables;
 pub mod trx;
 pub mod txpower;
 pub mod vht;
+pub mod wow;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
