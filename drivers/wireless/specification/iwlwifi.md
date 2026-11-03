@@ -4116,6 +4116,10 @@ and the MAC client `esr_transition_timeout` clamp. Three written,
 unexecuted cases in `drivers/wireless/iwlwifi/mlo` cover these vectors;
 one shared case covers EML/affiliated parsing.
 
+The native (re)association request now inserts the Basic MLE immediately
+before EHT Capabilities, as mac80211 `ieee80211_add_link_elems` does
+(after the Reassociation Request current-AP field when roaming).
+
 Still open for a second active link: multi-link association request
 per-STA profiles and per-link response status (mac80211
 `ieee80211_assoc_add_ml_elem`/`ieee80211_assoc_success`), per-link

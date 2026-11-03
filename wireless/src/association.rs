@@ -951,15 +951,15 @@ impl JoinPlan {
                 status: None,
             });
         }
-        // Replace the trailing one-link request MLE with the profiles form.
+        // Replace the one-link request MLE with the per-STA profiles form,
+        // at the same position (before EHT Capabilities).
         let single = mld.request_element();
-        let start = plan
-            .assoc
-            .len()
-            .checked_sub(single.len())
-            .filter(|at| plan.assoc[*at..] == single[..])
-            .ok_or(Error::InvalidBss)?;
-        plan.assoc.truncate(start);
+        let mut start = 28;
+        while plan.assoc.get(start..start + single.len()) != Some(&single[..]) {
+            let length = *plan.assoc.get(start + 1).ok_or(Error::InvalidBss)?;
+            start += 2 + usize::from(length);
+        }
+        plan.assoc.drain(start..start + single.len());
         let outer = mlo::present_elements(&plan.assoc[28..])?;
         let mut profiles = Vec::new();
         for link in &plan.links {
@@ -973,8 +973,8 @@ impl JoinPlan {
                 &outer,
             )?;
         }
-        plan.assoc
-            .extend_from_slice(&mld.request_element_with_profiles(&profiles));
+        let element = mld.request_element_with_profiles(&profiles);
+        mlo::insert_request_element(&mut plan.assoc, 28, &element);
         Ok(plan)
     }
     fn prepare_link(
@@ -1311,7 +1311,7 @@ impl JoinPlan {
             plan.append_capabilities(&mut assoc);
         }
         if let Some(local) = profile.mld {
-            assoc.extend_from_slice(&local.request_element());
+            mlo::insert_request_element(&mut assoc, 28, &local.request_element());
         }
         Ok(Self {
             own: management_own,

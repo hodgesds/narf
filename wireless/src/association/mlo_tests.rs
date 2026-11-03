@@ -491,6 +491,25 @@ fn link_only(ap: &Bss) -> Vec<u8> {
 }
 /// Association response on link3 with a link5 per-STA profile.
 fn multi_reply(ap: &Bss, second: &Bss, status: u16, outer_change: bool, peer: [u8; 6]) -> Vec<u8> {
+    padded_reply(ap, second, status, outer_change, peer, 0)
+}
+/// ieee80211_fragment_element as an AP would apply it.
+fn fragmented(out: &mut Vec<u8>, id: u8, body: &[u8], fragment: u8) {
+    for (index, chunk) in body.chunks(255).enumerate() {
+        out.extend_from_slice(&[if index == 0 { id } else { fragment }, chunk.len() as u8]);
+        out.extend_from_slice(chunk);
+    }
+}
+/// `padding` octets of an unrecognised vendor element inside the profile
+/// force per-STA profile and MLE fragmentation once they exceed255.
+fn padded_reply(
+    ap: &Bss,
+    second: &Bss,
+    status: u16,
+    outer_change: bool,
+    peer: [u8; 6],
+    padding: usize,
+) -> Vec<u8> {
     let mut frame = reply(ap);
     let original = mle();
     let at = frame
@@ -516,9 +535,14 @@ fn multi_reply(ap: &Bss, second: &Bss, status: u16, outer_change: bool, peer: [u
     if status == 0 {
         profile.extend_from_slice(&link_only(second));
     }
-    element(&mut body, 0, &profile);
+    if padding > 0 {
+        let mut vendor = vec![0xfa, 0xfa, 0xfa];
+        vendor.resize(padding, 0);
+        element(&mut profile, 221, &vendor);
+    }
+    fragmented(&mut body, 0, &profile, 254);
     let mut replacement = Vec::new();
-    element(&mut replacement, 255, &body);
+    fragmented(&mut replacement, 255, &body, 242);
     frame.splice(at - 2..at + original.len(), replacement);
     frame
 }
@@ -574,6 +598,24 @@ fn multiple_links() -> Result<(), &'static str> {
             .any(|w| w[0] == 255 && w[2] == mlo::EXT_NON_INHERITANCE),
         "identical link element sets emitted a Non-Inheritance element"
     );
+    // mlme.c ieee80211_add_link_elems: the Basic MLE precedes the outer EHT
+    // Capabilities (the profile's own EHT element sits inside the MLE).
+    let mut order = Vec::new();
+    let mut at = 28;
+    while at + 2 < request.len() {
+        if request[at] == 255 {
+            order.push(request[at + 2]);
+        }
+        at += 2 + usize::from(request[at + 1]);
+    }
+    check!(
+        order.iter().position(|ext| *ext == 107)
+            < order
+                .iter()
+                .position(|ext| *ext == crate::association::eht::EXT_EHT_CAPABILITIES)
+            && order.contains(&crate::association::eht::EXT_EHT_CAPABILITIES),
+        "request Basic MLE not placed before EHT Capabilities"
+    );
     // Accepted link: both links commit with their own negotiated PHY.
     check!(
         plan.association_response(&multi_reply(&first, &second, 0, true, AP2)) == Ok(Some(7)),
@@ -587,6 +629,29 @@ fn multiple_links() -> Result<(), &'static str> {
             && link.channel() == 149
             && plan.negotiated_phy().is_some(),
         "accepted affiliated link did not commit its own negotiation"
+    );
+    // A fragmented MLE / per-STA profile (cfg80211_defragment_element) is
+    // reassembled; the padded profile vendor element overrides outer ones.
+    let long = padded_reply(&first, &second, 0, true, AP2, 240);
+    check!(
+        long.windows(2).any(|w| w[0] == 242) && long.contains(&254),
+        "fixture did not fragment"
+    );
+    let mut reassembled = multi(&first, &second).unwrap();
+    associate(&mut reassembled)?;
+    check!(
+        reassembled.association_response(&long) == Ok(Some(7))
+            && reassembled.mld_links()[0].accepted(),
+        "fragmented multi-link response refused"
+    );
+    let mut stray = reply(&first);
+    stray.extend_from_slice(&[242, 1, 0]);
+    let mut strayed = mld(&first, local(Some(local_eht()))).unwrap();
+    strayed.start_authentication().unwrap();
+    strayed.authentication_response(&auth()).unwrap();
+    check!(
+        strayed.association_response(&stray).is_err(),
+        "Fragment element not continuing the MLE admitted"
     );
     // A per-STA rejection drops only that link.
     let mut rejected = multi(&first, &second).unwrap();

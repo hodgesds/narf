@@ -793,7 +793,14 @@ impl Connection {
             request.extend_from_slice(&capability);
         }
         if let Some(mld) = &this.mld {
-            request.extend_from_slice(mld.request_element());
+            // mlme.c places the Basic MLE before EHT Capabilities; the
+            // Reassociation Request has the 6-octet current AP field too.
+            let ies_start = if response_subtype == 0x30 { 34 } else { 28 };
+            narf_wireless::association::mlo::insert_request_element(
+                &mut request,
+                ies_start,
+                mld.request_element(),
+            );
             mld.project_management(&mut request);
         }
         if let Some(client) = &this.client {

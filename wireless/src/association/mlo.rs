@@ -229,11 +229,11 @@ impl Context {
     /// change count, and a nested Basic MLE is refused. A missing requested
     /// link fails the association as in Linux; profiles for links that were
     /// not requested are ignored. The result grants no native link owner.
-    pub fn multi_link_response<'a>(
+    pub fn multi_link_response(
         self,
-        bytes: &'a [u8],
+        bytes: &[u8],
         requested: u16,
-    ) -> Result<Vec<LinkResponse<'a>>, Error> {
+    ) -> Result<Vec<LinkResponse>, Error> {
         let ap = BasicMultiLink::from_ies(bytes)?;
         if ap.address != self.peer_mld
             || ap.link_id.is_some_and(|id| id != self.link_id)
@@ -241,21 +241,21 @@ impl Context {
         {
             return Err(Error::Protocol);
         }
-        let body = basic_body(bytes).ok_or(Error::Protocol)?;
+        let body = basic_body(bytes).map_err(|_| Error::Protocol)?;
         let mut links = Vec::new();
         for link_id in 0..MAX_LINKS {
             if requested & (1 << link_id) == 0 || link_id == self.link_id {
                 continue;
             }
-            let (control, info, content) = sta_profile(body, link_id).ok_or(Error::Protocol)?;
+            let (control, info, content) = sta_profile(&body, link_id).ok_or(Error::Protocol)?;
             if control & STA_COMPLETE == 0 || content.len() < 4 {
                 return Err(Error::Protocol);
             }
             let capability = u16::from_le_bytes([content[0], content[1]]);
             let status = u16::from_le_bytes([content[2], content[3]]);
-            let elements = &content[4..];
+            let elements = content[4..].to_vec();
             let mut nested = false;
-            ies(elements, |id, element| {
+            ies(&elements, |id, element| {
                 nested |= id == 255 && element.first() == Some(&EXT_MULTI_LINK);
                 Ok(())
             })
@@ -264,7 +264,7 @@ impl Context {
                 return Err(Error::Protocol);
             }
             let address = if control & STA_MAC != 0 {
-                info.get(1..7).and_then(|mac| mac.try_into().ok())
+                info[1..7].try_into().ok()
             } else {
                 None
             };
@@ -406,12 +406,26 @@ impl BasicMultiLink {
         let mut affiliated = [None; MAX_LINKS as usize];
         while at < body.len() {
             let header = body.get(at..at + 2).ok_or(Error::InvalidBss)?;
-            let end = at + 2 + usize::from(header[1]);
+            let mut end = at + 2 + usize::from(header[1]);
             let profile = body.get(at + 2..end).ok_or(Error::InvalidBss)?;
-            // Fragmented MLE/profile reassembly and unknown subelements are
-            // unsupported in this bounded one-link request/response profile.
-            if header[0] != 0 || profile.len() < 3 {
+            // Unknown subelements are unsupported. A255-octet profile may
+            // continue in Fragment subelements; as in Linux
+            // ieee80211_mle_basic_sta_prof_size_ok only the first fragment
+            // carries the checked STA control/info header.
+            if header[0] != SUBELEM_PROFILE || profile.len() < 3 {
                 return Err(Error::InvalidBss);
+            }
+            if profile.len() == 255 {
+                while body.get(end) == Some(&SUBELEM_FRAGMENT) {
+                    let length = usize::from(*body.get(end + 1).ok_or(Error::InvalidBss)?);
+                    end += 2 + length;
+                    if end > body.len() {
+                        return Err(Error::InvalidBss);
+                    }
+                    if length < 255 {
+                        break;
+                    }
+                }
             }
             let flags = u16::from_le_bytes([profile[0], profile[1]]);
             let id = flags & 15;
@@ -461,21 +475,11 @@ impl BasicMultiLink {
             affiliated,
         })
     }
+    /// The single Basic MLE of an element stream, reassembled from its
+    /// trailing Fragment elements (cfg80211_defragment_element). A Fragment
+    /// element that does not continue the MLE is refused.
     pub fn from_ies(bytes: &[u8]) -> Result<Self, Error> {
-        let mut result = None;
-        ies(bytes, |id, body| {
-            if id == 255 && body.first() == Some(&EXT_MULTI_LINK) {
-                if result.is_some() {
-                    return Err(Error::InvalidBss);
-                }
-                result = Some(Self::parse(&body[1..])?);
-            }
-            if id == 242 {
-                return Err(Error::InvalidBss);
-            }
-            Ok(())
-        })?;
-        result.ok_or(Error::InvalidBss)
+        Self::parse(&basic_body(bytes)?)
     }
 }
 
@@ -556,63 +560,96 @@ pub fn max_simultaneous_links(mld_capabilities: u16) -> u8 {
 /// One requested affiliated link's per-STA profile in an association
 /// response: the fixed capability/status fields and the profile elements
 /// (which still need `link_elements` inheritance before validation).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LinkResponse<'a> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkResponse {
     link_id: u8,
     address: Option<[u8; 6]>,
     capability: u16,
     status: u16,
-    elements: &'a [u8],
+    elements: Vec<u8>,
 }
-impl<'a> LinkResponse<'a> {
-    pub fn link_id(self) -> u8 {
+impl LinkResponse {
+    pub fn link_id(&self) -> u8 {
         self.link_id
     }
     /// The AP's affiliated link address from STA Info, when present.
-    pub fn address(self) -> Option<[u8; 6]> {
+    pub fn address(&self) -> Option<[u8; 6]> {
         self.address
     }
-    pub fn capability(self) -> u16 {
+    pub fn capability(&self) -> u16 {
         self.capability
     }
     /// Per-link status; non-zero rejects only this link (mlme.c
     /// ieee80211_assoc_success removes it from the valid links).
-    pub fn status(self) -> u16 {
+    pub fn status(&self) -> u16 {
         self.status
     }
-    pub fn elements(self) -> &'a [u8] {
-        self.elements
+    /// The reassembled profile elements after capability/status.
+    pub fn elements(&self) -> &[u8] {
+        &self.elements
     }
 }
 
-/// The single unfragmented Basic MLE body (after the extension id) in an
-/// element stream already validated by `BasicMultiLink::from_ies`.
-fn basic_body(mut bytes: &[u8]) -> Option<&[u8]> {
-    while let [id, length, rest @ ..] = bytes {
-        let body = rest.get(..usize::from(*length))?;
-        if *id == 255 && body.first() == Some(&EXT_MULTI_LINK) {
-            return Some(&body[1..]);
+/// The single Basic MLE body (after the extension id), reassembled from
+/// any Fragment elements that immediately follow a255-octet MLE. Fragment
+/// elements anywhere else, or a second Basic MLE, are refused.
+fn basic_body(mut bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut found: Option<Vec<u8>> = None;
+    let mut continuing = false;
+    while !bytes.is_empty() {
+        let (id, length) = match bytes {
+            [id, length, ..] => (*id, usize::from(*length)),
+            _ => return Err(Error::InvalidBss),
+        };
+        let body = bytes.get(2..2 + length).ok_or(Error::InvalidBss)?;
+        bytes = &bytes[2 + length..];
+        if id == ELEMENT_FRAGMENT {
+            let Some(mle) = found.as_mut().filter(|_| continuing) else {
+                return Err(Error::InvalidBss);
+            };
+            mle.extend_from_slice(body);
+            continuing = length == 255;
+            continue;
         }
-        bytes = &rest[usize::from(*length)..];
+        continuing = false;
+        if id == 255 && body.first() == Some(&EXT_MULTI_LINK) {
+            if found.is_some() {
+                return Err(Error::InvalidBss);
+            }
+            found = Some(body[1..].to_vec());
+            continuing = length == 255;
+        }
     }
-    None
+    found.ok_or(Error::InvalidBss)
 }
 
 /// parse.c::ieee80211_mle_get_sta_prof over a validated Basic MLE body:
-/// (STA control, STA info including its length octet, profile content).
-fn sta_profile(body: &[u8], link_id: u8) -> Option<(u16, &[u8], &[u8])> {
+/// (STA control, STA info including its length octet, profile content), the
+/// profile reassembled from Fragment subelements as Linux does.
+fn sta_profile(body: &[u8], link_id: u8) -> Option<(u16, [u8; 7], Vec<u8>)> {
     let mut at = 2 + usize::from(*body.get(2)?);
     while at < body.len() {
         let length = usize::from(*body.get(at + 1)?);
-        let profile = body.get(at + 2..at + 2 + length)?;
+        let mut profile = body.get(at + 2..at + 2 + length)?.to_vec();
         at += 2 + length;
+        let mut continuing = length == 255;
+        while continuing && body.get(at) == Some(&SUBELEM_FRAGMENT) {
+            let length = usize::from(*body.get(at + 1)?);
+            profile.extend_from_slice(body.get(at + 2..at + 2 + length)?);
+            at += 2 + length;
+            continuing = length == 255;
+        }
         let control = u16::from_le_bytes([profile[0], profile[1]]);
         if control & 15 != u16::from(link_id) {
             continue;
         }
         let info_len = usize::from(profile[2]);
-        let info = profile.get(2..2 + info_len)?;
-        return Some((control, info, &profile[2 + info_len..]));
+        let mut info = [0; 7];
+        let raw = profile.get(2..2 + info_len)?;
+        let kept = raw.len().min(7);
+        info[..kept].copy_from_slice(&raw[..kept]);
+        let content = profile.get(2 + info_len..)?.to_vec();
+        return Some((control, info, content));
     }
     None
 }
@@ -749,9 +786,14 @@ pub fn link_elements(outer: &[u8], profile: &[u8]) -> Result<Vec<u8>, Error> {
     })
     .map_err(|_| Error::Protocol)?;
     let mut view = Vec::with_capacity(outer.len() + profile.len());
+    let mut mle_fragment = false;
     ies(outer, |id, body| {
         let key = element_key(id, body);
-        if key != 0x100 | u16::from(EXT_MULTI_LINK)
+        // The outer MLE and its Fragment continuation are never inherited.
+        let continues = mle_fragment && id == ELEMENT_FRAGMENT;
+        mle_fragment = (key == 0x100 | u16::from(EXT_MULTI_LINK) || continues) && body.len() == 255;
+        if !continues
+            && key != 0x100 | u16::from(EXT_MULTI_LINK)
             && key != 0x100 | u16::from(EXT_NON_INHERITANCE)
             && !excluded.contains(&key)
             && !overridden.contains(&key)
@@ -770,4 +812,20 @@ pub fn link_elements(outer: &[u8], profile: &[u8]) -> Result<Vec<u8>, Error> {
         Ok(())
     })?;
     Ok(view)
+}
+
+/// mlme.c::ieee80211_add_link_elems places the assoc link's Basic MLE after
+/// the HE/HE 6GHz/regulatory elements and immediately before EHT
+/// Capabilities (802.11be element order). Without EHT Capabilities it is
+/// appended. `ies_start` is the offset of the first element.
+pub fn insert_request_element(frame: &mut Vec<u8>, ies_start: usize, element: &[u8]) {
+    let mut at = ies_start;
+    while let (Some(&id), Some(&length)) = (frame.get(at), frame.get(at + 1)) {
+        if id == 255 && frame.get(at + 2) == Some(&crate::association::eht::EXT_EHT_CAPABILITIES) {
+            frame.splice(at..at, element.iter().copied());
+            return;
+        }
+        at += 2 + usize::from(length);
+    }
+    frame.extend_from_slice(element);
 }

@@ -269,7 +269,8 @@ bits, exact common-info lengths, unicast MLD MAC and optional Link ID, bounds
 affiliated Per-STA profiles and rejects duplicate/fragmented elements. Those
 profiles never supply the selected link's RSN or PHY. The association request
 contains one canonical Basic MLE (common length9, local MLD MAC and MLD
-Capabilities with Max Simultaneous Links0); it requests no additional link,
+Capabilities with Max Simultaneous Links0) before EHT Capabilities; it
+requests no additional link,
 EML, TID-to-link mapping or beacon protection. `Local::request_element()`
 exposes that same builder for native owners. `Context::response(ies)` requires
 the exact AP MLD, rejects extra link profiles and mismatched present Link IDs;
@@ -298,8 +299,9 @@ Capabilities, and per link a COMPLETE per-STA profile (STA MAC present,
 capability field, that link's rates and HT/VHT/HE/HE6/EHT/UHR capabilities)
 followed by Non-Inheritance for every tracked outer element the link lacks;
 over-long (sub)elements are fragmented as `ieee80211_fragment_element`.
-`single_link` requests are byte-for-byte unchanged and still place the MLE
-last; unlike Linux the multiple-link MLE also stays after EHT Capabilities.
+Every MLD request (single- and multiple-link, shared and native iwlwifi)
+places the Basic MLE where `ieee80211_add_link_elems` does: after HE/HE6 and
+immediately before EHT Capabilities (`mlo::insert_request_element`).
 
 `Context::multi_link_response(ies, requested)` (`ieee80211_assoc_success`/
 `ieee80211_assoc_config_link`) requires the exact AP MLD, a matching present
@@ -315,7 +317,10 @@ negotiated by that link's own plan (rates, 6GHz, RSN, PHY) before anything
 commits; a non-zero per-STA status drops only that link.
 `JoinPlan::mld_links() -> &[MldLink]` exposes `context()`, `link_id()`,
 `channel()`, `status()`, `accepted()`, offered/negotiated PHY, 6GHz plan and
-legacy rates. Response MLE/profile fragmentation is still refused, and no
+legacy rates. `BasicMultiLink::from_ies` and the response path reassemble a
+Basic MLE from the Fragment elements following a255-octet MLE, and a
+per-STA profile from its Fragment subelements (`cfg80211_defragment_element`,
+`ieee80211_mle_get_sta_prof`); any other Fragment element is refused. No
 native driver requests or activates an additional link yet.
 
 **UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
