@@ -2105,6 +2105,27 @@ idle, then completes GRDOM_FULL and rechecks both proofs before releasing
 scheduler/CT storage or signaling pending fences Reset. Render-well sleep ACK
 precedes graphics-GT sleep ACK. A failed stop retains the complete owner.
 
+Shared-GGTT GuC TLB invalidation (`intel_gpu_ggtt_tlb`) follows
+xe_ggtt.c::xe_ggtt_invalidate for every GuC that may cache the arena's
+translations. That is GT0's GuC on every authorized arena, and the MTL/Arrow
+media GuC while registered. Each PTE publication or clear is one generation.
+Before a GuC's CT and submission are both enabled, the arena invalidates it by
+MMIO under the arena lock: GUC_TLB_INV_CR, or PVC_GUC_TLB_INV_DESC1/DESC0 on
+Xe2. That completes at once. From `SchedulingReady`, the GT's scheduler sends
+TLB_INVALIDATION {seqno, 0x80000003} on fence 0, one request at a time, with
+no arena lock held. The seqno is 1..0xfffff and skips live context stamps;
+context stamps skip the in-flight seqno. The exact 0x7001 seqno completes the
+request. A cleared range keeps its frames and stays out of the free list until
+every GuC has invalidated past the clear. `BootAllocator::ggtt_tlb_ct`,
+`ggtt_tlb_pending`, `ggtt_tlb_complete` and `ggtt_tlb_reset` carry this
+protocol; their defaults are no-ops for allocators without a shared GGTT.
+`GuCGt::begin_stop` returns the GuC to MMIO but keeps any CT debt. The proven
+GuC stop (or the unsafe full-reset release) settles it and removes the GuC from
+the arena's clients. A request unanswered for 2.25 s
+(tlb_inval_timeout_delay), or a DONE with no in-flight owner, fails the
+scheduler with `Timeout`/`Protocol`. The GT is then lost and the ranges stay
+retained.
+
 `intel_gpu_gt_runtime` binds persistent owners to the actual registered card,
 PCI function, current authority, immutable firmware and dedicated arena. The
 GT reserves 32 MiB of GGTT space starting at 256 MiB; this virtual reservation
@@ -2609,25 +2630,26 @@ exactly once with value 1 before the first `--`. Bare, malformed or duplicate
 occurrences refuse it, and post-separator init arguments neither enable nor
 negate it. Only MTL-classified devices admit it.
 
-Without the option, no media owner is constructed. GT0's runtime, its
-shared-GGTT arena flushes, runtime park and system suspend behave exactly as
-before. With the option, the media GT probe programs wells, PAT, MOCS and
-workarounds and performs only a GuC sanitize reset. It then boots the media GuC
-with its own mailbox and polled CT and registers it as the arena's second GGTT
-TLB. A full media-GT reset with Wa_14015076503 runs only on the recovery path
-after a media GuC fault. An unproven media-GuC stop keeps its GGTT memory
-retained. It also refuses park, fails suspend preparation and leaves GT0
-failed rather than rebuilding the arena.
+Without the option, no media owner is constructed. GT0's runtime, runtime park
+and system suspend behave exactly as before, and the shared-GGTT arena
+invalidates only GT0's GuC TLB. With the option, the media GT probe programs
+wells, PAT, MOCS and workarounds and performs only a GuC sanitize reset. It then
+boots the media GuC with its own mailbox and polled CT and registers it as the
+arena's second GGTT TLB. A full media-GT reset with Wa_14015076503 runs only on
+the recovery path after a media GuC fault. An unproven media-GuC stop keeps its
+GGTT memory retained. It also refuses park, fails suspend preparation and leaves
+GT0 failed rather than rebuilding the arena.
 
-With the option, the media GuC then schedules the fused VCS/VECS engines
-without HWCONFIG. It holds every present VDBOX/VEBOX wake and installs the
+With the option, the media GuC then schedules the fused VCS/VECS engines without
+HWCONFIG. It holds every present VDBOX/VEBOX wake and installs the
 oam_mmio_trg_vcs/vecs NONPRIV grants with NOPID fill. It enables each ring,
-reloads the GuC with a media-only ADS and enables CT. It records one default
-LRC per engine from the empty media 13.00 WA job, then runs one private-PPGTT
-store job per engine. GGTT invalidation for GT1 moves to the media CT once
-submission is enabled. Published VCS/VECS user interrupts are routed onto GT0's
-tiled MSI and masked again before GT1 stops. Scheduling refuses while GSC
-firmware reports loaded, because NARF has no owner for Wa_14015076503.
+reloads the GuC with a media-only ADS and enables CT. It records one default LRC
+per engine from the empty media 13.00 WA job, then runs one private-PPGTT store
+job per engine. GGTT invalidation for GT1 moves to the media CT once submission
+is enabled, with the same retention and fail-closed rules as GT0. Published
+VCS/VECS user interrupts are routed onto GT0's tiled MSI and masked again before
+GT1 stops. Scheduling refuses while GSC firmware reports loaded, because NARF
+has no owner for Wa_14015076503.
 
 Native Xe publishes GT1 only after every engine's private job retired and
 verified, and only while GT0's user epoch is live:

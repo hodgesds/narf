@@ -3490,7 +3490,8 @@ enable stay untouched. Before the media wake request, it registers the media GuC
 as the shared GGTT arena's second TLB. While registered, every arena PTE
 publication and clear also writes the media GUC_TLB_INV_CR (at the GSI base). This
 matches xe_ggtt_invalidate on both GTs while media GuC submission is off.
-Without a registered media GuC, GT0's arena flush is unchanged. An unsolicited
+Without a registered media GuC, the arena invalidates GT0's GuC only (GT0's
+own invalidation is described at the end of this section). An unsolicited
 G2H message on the idle media CT is a protocol failure that begins a stop. A
 stop that cannot be proven leaves the owner retained, keeping its firmware memory
 and the TLB registration.
@@ -3577,11 +3578,12 @@ Images use dg2_xcs_offsets, as Linux keys them on the device graphics IP.
 Video rings follow __emit_job_gen12_video. MTL has no flat CCS, so AUX
 invalidation applies; emit_aux_table_inv adds GT1's MMIO adjustment, which
 places VD0/VE0_AUX_INV at 0x384218/0x384238. Once submission is enabled, the
-shared arena stops writing GT1's GUC_TLB_INV_CR. The media scheduler's
-per-context CT TLB_INVALIDATION covers GT1 instead, as send_tlb_inval_ggtt does
-with CT and submission enabled. Stop reverts to MMIO. GT1 is declared ready
-only after each engine runs its own private-PPGTT store job, retires it and
-verifies the result.
+shared arena stops writing GT1's GUC_TLB_INV_CR. The media scheduler's CT
+TLB_INVALIDATION covers GT1 instead, as send_tlb_inval_ggtt does with CT and
+submission enabled. Since the shared-GGTT TLB checkpoint at the end of this
+section, that is a GGTT request per update rather than the per-context one.
+Stop reverts to MMIO. GT1 is declared ready only after each engine runs its own
+private-PPGTT store job, retires it and verifies the result.
 
 Stop follows GT0's verified model: GuC reset, media GRDOM_FULL with a
 scheduler, DMA idle, memory release and wake release, with engine wakes
@@ -3635,8 +3637,10 @@ Once media submission is on, the arena stops writing the media
 GUC_TLB_INV_CR. The media scheduler's TLB_INVALIDATION (0x7000) around context
 registration and deregistration then covers GT1, as GT0's scheduler does for
 GT0. Linux `xe_ggtt_invalidate` instead sends one CT invalidation per GGTT
-update on each GT, so this is a deliberate NARF policy. Media 13.00 uses AUX
-invalidation (MTL has no flat CCS) at the GSI-adjusted VD0/VE0_AUX_INV
+update on each GT, so this was a deliberate NARF policy. The shared-GGTT TLB
+checkpoint at the end of this section replaces it with Linux's per-update
+invalidation on both GTs. Media 13.00 uses AUX invalidation (MTL has no flat
+CCS) at the GSI-adjusted VD0/VE0_AUX_INV
 (0x384218/0x384238), as `emit_aux_table_inv` adds the media `adj_offset`.
 With `narf.intel.media_gt=1` absent, GT0 interrupt routing, scheduling, the
 arena and the UAPI are unchanged. The debug group pass is deferred to the end
@@ -4752,3 +4756,81 @@ Intel skips; the only skip is the existing shared RNG-registration skip.
 Every new fixture passes. These are native models, not physical Intel
 evidence. The debug group pass is deferred to the end of the current
 integration wave.
+
+### Shared-GGTT GuC TLB invalidation on GT0 and the media GT
+
+Linux b90c984d invalidates the GGTT TLB of each GuC of the tile after every
+GGTT update. This is xe_ggtt.c::xe_ggtt_invalidate, which calls
+ggtt_invalidate_gt_tlb on the primary and the media GT. Before this change the
+shared arena never invalidated GT0's GuC TLB. It wrote GT1's GUC_TLB_INV_CR
+only before media submission, and then relied on the per-context
+TLB_INVALIDATION around registration. A range freed and reused outside a
+registration could leave a GuC holding a stale translation to freed or reused
+memory.
+
+`intel_gpu_ggtt_tlb` now gives the arena one client per GuC. GT0's GuC is a
+client of every authorized arena from its construction. The MTL/Arrow media
+GuC is a client while it is registered. Every PTE publication or clear is one
+generation. While a GuC's CT or submission is off, the arena invalidates it by
+MMIO at once, following xe_guc_tlb_inval.c::send_tlb_inval_ggtt. That is
+GUC_TLB_INV_CR before Xe2 (MTL, DG2, Gen12 and GT1 at the GSI offset) and
+PVC_GUC_TLB_INV_DESC1 then DESC0 on BMG, LNL and PTL, after the VF_CAP_REG
+barrier. From `SchedulingReady` the GT's scheduler sends
+XE_GUC_ACTION_TLB_INVALIDATION {seqno, MAKE_INVAL_OP(XE_GUC_TLB_INVAL_GUC)} on
+fence 0 for the newest generation, ahead of that poll's other H2G. Only the
+exact TLB_INVALIDATION_DONE seqno completes it. Seqnos follow
+xe_tlb_inval_fence_prep: they start at 1, wrap at 0x100000 and skip 0. They
+also skip live per-context stamps, and new context stamps skip the in-flight
+seqno, so a 0x7001 cookie never has two owners. The per-context invalidations
+themselves are unchanged.
+
+Removal follows ggtt_node_remove: the PTEs are cleared, then the GuCs are
+invalidated before the backing is freed. The arena cannot wait, so a cleared
+range keeps its frames and stays out of the first-fit free list until every
+GuC has invalidated past the clear. A request unanswered for
+tlb_inval_timeout_delay (HZ/4 plus twice one second per 4 KiB of H2G CTB,
+2.25 s), or a DONE with no in-flight owner, fails the scheduler with `Timeout`
+or `Protocol`. The GT is then lost and goes through the normal reset
+escalation. Linux signals -ETIME and frees; NARF keeps the ranges retained.
+`GuCGt::begin_stop` returns the GuC to MMIO but keeps any CT debt. Only the
+proven GuC stop (or the unsafe full-reset release) settles that debt, as
+xe_tlb_inval_reset does. It also removes the stopped GuC from the clients, so
+the arena never writes a GuC register after its owner may have released the
+GT wake. The media owner's registration and unregistration are unchanged.
+
+Other differences from Linux, all fail-closed:
+- One request per GuC is in flight. It covers every update published before
+  it was sent.
+- An insertion's CT invalidation is queued, not waited for. The per-context
+  invalidation before registration still waits.
+- There is no G2H credit reservation: NARF's CT keeps no G2H credit
+  accounting, and at most one request per GuC is outstanding.
+
+Lock order: the runtime's GT mutex, then the GT, scheduler and CT (owned
+exclusively, no lock), then the arena's IRQ-safe spin lock, then the frame
+allocator. The arena has no CT handle. The scheduler reads the pending
+generation and reports a completion through short arena calls, and sends the
+H2G between them with no arena lock held. Frees made while the scheduler
+handles G2H only record retention. No IRQ handler or timer touches the arena
+or the CT.
+
+GT0 behaviour without `narf.intel.media_gt=1` changes on purpose: every
+authorized GuC arena now writes GT0's invalidation register on each
+publication and clear. The three media fixtures that pinned GT0's
+GUC_TLB_INV_CR as unwritten now expect GT0's write. GT1's register behaviour
+stays as before, and the CT-mode fixture also checks the held removal.
+
+New fixtures under `drivers/gpu/intel_gpu_ggtt_tlb`:
+- Tracker, request and wire checks.
+- The real `SharedArena` over a RAM BAR: MMIO on every update for MTL, DG2,
+  TGL and BMG, and none on the legacy arena; CT-mode removal blocking first-fit
+  reuse until the covering DONE; an unproven stop retaining ranges until the
+  reset proof; GT0 and GT1 both covering before release.
+- On the GuC model: GT0 MMIO before CT, the CT action and DONE releases,
+  verified stop, seqno and context-stamp disjointness through a full kernel
+  job, and timeout and stale-DONE retention and loss.
+
+Under `drivers/gpu/intel_gpu_media_gt`,
+`smoke_ggtt_tlb_media_gt_ct_invalidation_and_proven_stop` runs GT1 through
+MediaGuc. These are native models, not physical Intel evidence. Silicon
+confirmation of the GuC-type invalidation round trip on each platform remains.
