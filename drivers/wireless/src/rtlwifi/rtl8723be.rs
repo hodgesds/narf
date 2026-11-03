@@ -37,12 +37,15 @@
 //!   generated verbatim.
 //! - [`phy`] — BB/RF access, `_rtl8723be_check_positive` table walks and
 //!   the MAC / BB / RF6052 configuration.
+//! - [`channel`] — `rtl8723be_phy_set_rfpath_switch`, LC calibration,
+//!   20/40 MHz bandwidth and the channel RF write.
 //! - [`init`] — the `rtl8723be_hw_init` tail through the station address,
 //!   run by `Prepared::configure_rtl8723be`.
 
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod channel;
 pub mod fw;
 pub mod init;
 pub mod llt;

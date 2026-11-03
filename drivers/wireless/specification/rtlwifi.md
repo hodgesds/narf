@@ -3079,6 +3079,19 @@ keeps the chip diagnostic until admission lands.
   the station address. Tests `smoke_rtl8723be_tables_verbatim_geometry`,
   `smoke_rtl8723be_check_positive_package_selection`,
   `smoke_rtl8723be_mac_bb_rf_config` (written, unexecuted).
+- `channel` — `_rtl8723be_phy_set_rfpath_switch` (`0x92C` = 1 main / 2
+  aux), `_rtl8723be_phy_lc_calibrate(hw, false)` (TX-pause or
+  continuous-TX RF 0x00 save by `0xd03[6:4]`, the discarded `RF 0x18`
+  read, `RF 0xb0` / `RF 0x18` writes around 50 ms),
+  `rtl8723be_phy_set_bw_mode_callback` + `rtl8723be_phy_rf6052_set_bandwidth`
+  over the retained `rfreg_chnlval[0]`, and the `CMDID_RF_WRITEREG`
+  channel step (`RF_CHNLBW[9:0]`, path A, 10 ms; channels 1..=14). Not yet
+  composed into the owner: the preceding `rtl8723be_phy_set_txpower_level`
+  step needs the signed per-board envelope, and IQK
+  (`rtl8723be_phy_iq_calibrate`, path A/B S0/S1 with the 1-antenna BT
+  exception) is not implemented. Test
+  `smoke_rtl8723be_rfpath_lck_bandwidth_and_channel` (written,
+  unexecuted).
 
 ## 4. Invariants
 

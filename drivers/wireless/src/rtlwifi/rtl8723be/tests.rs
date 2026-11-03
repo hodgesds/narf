@@ -842,3 +842,106 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_mac_bb_rf_config
 );
+
+/// `_rtl8723be_phy_set_rfpath_switch`, `_rtl8723be_phy_lc_calibrate(hw,
+/// false)` (TX-pause and continuous-TX branches), the 20/40 MHz
+/// `rtl8723be_phy_set_bw_mode_callback` + RF6052 bandwidth and the
+/// `CMDID_RF_WRITEREG` channel step.
+fn smoke_rtl8723be_rfpath_lck_bandwidth_and_channel() -> TestResult {
+    use channel::*;
+    let rf = |addr: u32, data: u32| (0x840u16, (addr << 20) | data, 4u8);
+    let io = fw_fake(true, true, false);
+    let ok =
+        set_rfpath_switch(&io, true).is_ok() && narf_scheduler::block_on(lc_calibrate(&io)).is_ok();
+    if !ok {
+        return TestResult::Fail("rfpath / LCK failed");
+    }
+    {
+        let g = io.0.lock();
+        let w = |row: (u16, u32, u8)| g.writes.iter().position(|x| *x == row);
+        let (Some(s), Some(p), Some(b0), Some(c18), Some(b1), Some(r)) = (
+            w((REG_RFPATH_SWITCH, 1, 4)),
+            w((REG_TXPAUSE, 0xff, 1)),
+            w(rf(0xb0, 0xdfbe0)),
+            w(rf(0x18, 0x8c0a)),
+            w(rf(0xb0, 0xdffe0)),
+            w((REG_TXPAUSE, 0, 1)),
+        ) else {
+            return TestResult::Fail("8723BE LCK rows missing");
+        };
+        if !(s < p && p < b0 && b0 < c18 && c18 < b1 && b1 < r)
+            || g.writes.iter().any(|x| x.0 == 0xd03)
+        {
+            return TestResult::Fail("8723BE LCK order (TX-pause branch)");
+        }
+    }
+    // Continuous TX (0xd03[6:4] set): the RF 0x00 save/restore instead.
+    let io = fw_fake(true, true, false);
+    io.0.lock().regs[0xd03] = 0x75;
+    if narf_scheduler::block_on(lc_calibrate(&io)).is_err() {
+        return TestResult::Fail("continuous LCK failed");
+    }
+    {
+        let g = io.0.lock();
+        if !g.writes.contains(&(0xd03, 0x05, 1))
+            || !g.writes.contains(&rf(0x00, 0x10000))
+            || g.writes.last() != Some(&rf(0x00, 0))
+            || g.writes.iter().any(|x| x.0 == REG_TXPAUSE)
+            || !g.writes.contains(&(0xd03, 0x75, 1))
+        {
+            return TestResult::Fail("8723BE LCK continuous-TX branch");
+        }
+    }
+    let io = fw_fake(true, true, false);
+    {
+        let mut g = io.0.lock();
+        g.regs[usize::from(REG_RRSR) + 2] = 0xff;
+        g.regs[usize::from(REG_BWOPMODE)] = 0;
+        g.regs[0xa00] = 0x10;
+    }
+    let mut chnlval = [0x0c00 | 1, 0];
+    let ok = narf_scheduler::block_on(set_bw_mode(
+        &io,
+        true,
+        PRIME_CHNL_OFFSET_LOWER,
+        &mut chnlval,
+    ))
+    .is_ok()
+        && chnlval[0] == 0x0400 | 1
+        && narf_scheduler::block_on(switch_channel_rf(&io, 6, &mut chnlval)).is_ok()
+        && chnlval[0] == 0x0400 | 6
+        && narf_scheduler::block_on(switch_channel_rf(&io, 15, &mut chnlval)).is_err();
+    if !ok {
+        return TestResult::Fail("8723BE 40 MHz / channel");
+    }
+    {
+        let g = io.0.lock();
+        let r32 =
+            |r: usize| u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]]);
+        if g.regs[usize::from(REG_BWOPMODE)] & BW_OPMODE_20MHZ != 0
+            || g.regs[usize::from(REG_RRSR) + 2] != 0x90 | (1 << 5)
+            || r32(0x800) & 1 != 1
+            || r32(0x900) & 1 != 1
+            || r32(0xa00) & 0x10 != 0
+            || (r32(0xd00) >> 10) & 3 != 1
+            || (r32(0x818) >> 26) & 3 != 2
+            || !g.writes.contains(&rf(0x18, 0x0401))
+            || g.writes.last() != Some(&rf(0x18, 0x0406))
+        {
+            return TestResult::Fail("8723BE 40 MHz register values");
+        }
+    }
+    let io = fw_fake(true, true, false);
+    if narf_scheduler::block_on(set_bw_mode(&io, false, 0, &mut chnlval)).is_err()
+        || chnlval[0] != 0x0c06
+        || io.0.lock().regs[usize::from(REG_BWOPMODE)] & BW_OPMODE_20MHZ == 0
+        || io.0.lock().writes.iter().any(|x| x.0 == REG_RRSR + 2)
+    {
+        return TestResult::Fail("8723BE 20 MHz");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_rfpath_lck_bandwidth_and_channel
+);
