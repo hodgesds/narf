@@ -40,13 +40,31 @@ fn sink() -> BTreeMap<u32, u8> {
     .collect()
 }
 
+/// A VBT panel with PSR enabled (`psr.enable`), 2500 µs TP1 and TP2/TP3
+/// wake times and no idle-frame floor.
+fn vbt(idle_frames: u8, tp1: u32, tp23: u32) -> crate::intel_gpu_psr::VbtPsr {
+    crate::intel_gpu_psr::VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
+        enable: true,
+        table: Some(crate::intel_gpu_vbt::PsrTable {
+            full_link: false,
+            require_aux_wakeup: false,
+            idle_frames,
+            tp1_wakeup_time_us: tp1,
+            tp2_tp3_wakeup_time_us: tp23,
+            psr2_tp2_tp3_wakeup_time_us: tp23,
+        }),
+    })
+}
+
 /// The fixture's fixed timing (64x32, htotal 224, vtotal 77 at 1034 kHz:
-/// the 330 µs setup is 2 lines, well inside 44) with a PSR sink attached.
+/// the 330 µs setup is 2 lines, well inside 44) with a PSR sink and a
+/// PSR-enabling VBT attached.
 fn attach(platform: &MockPlatform, timing: crate::intel_gpu_dsb::Timing, wm: Option<bool>) {
     let mut hw = platform.0.lock();
     hw.psr_dpcd = Some(sink());
     hw.psr_timing = Some(timing);
     hw.psr_wm = wm;
+    hw.psr_vbt = vbt(0, 2500, 2500);
 }
 
 fn psr_platform() -> MockPlatform {
@@ -380,4 +398,178 @@ fn smoke_psr_kms_refusals_leave_zero_psr_traffic() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_psr",
     smoke_psr_kms_refusals_leave_zero_psr_traffic
+);
+
+/// `cursor_resources` with LP4/LP5 latency word `lp4_lp5`: the owned
+/// display-14 modeset programs the watermarks for that table, so a later
+/// profile capture proves them programmed.
+fn owned_resources(platform: &MockPlatform, lp4_lp5: u32) -> crate::intel_gpu_dsb::Timing {
+    let timing = platform.dsb_timing();
+    platform.set(0x45788, lp4_lp5);
+    platform.set(0x70008, 0);
+    platform.set(0x70180, 0);
+    platform.set(0x510a0, (14 << 22) | 8);
+    platform.set(0x46070, 0xc0000010);
+    platform.set(0x46000, 612);
+    platform.set(0x46008, 0);
+    let mode = crate::intel_gpu_modeset::Mode {
+        pixel_clock_khz: timing.clock,
+        h_active: timing.width,
+        h_total: timing.htotal,
+        v_active: timing.height,
+        v_total: timing.vtotal,
+        ..crate::intel_gpu_modeset::Mode::VESA_1024X768_60
+    };
+    crate::intel_gpu_display_resources::initialize(platform, &mode, 307200)
+        .unwrap()
+        .unwrap();
+    platform.set(0x70008, 3 << 30);
+    platform.set(0x70180, 0x84000000);
+    timing
+}
+
+/// A platform whose Wa_14015648006 input takes the production route (the
+/// registered provider), over watermarks the owned modeset programmed.
+fn provider_platform(lp4_lp5: u32) -> MockPlatform {
+    let platform = MockPlatform::new();
+    let timing = owned_resources(&platform, lp4_lp5);
+    attach(&platform, timing, None);
+    platform.0.lock().psr_wm_provider = true;
+    platform
+}
+
+fn smoke_psr_kms_production_wm_provider_qualifies_and_enables() -> TestResult {
+    {
+        let previous = crate::intel_gpu_psr::register_wm_level_disabled(None);
+        crate::intel_gpu_xelpg_wm::publish_pipe_a(None);
+        // LP4 14 µs, LP5 16 µs: every level fits the fixture's 45-line
+        // vblank (216 µs lines), so wm_level_disabled is false.
+        let platform = provider_platform(14 | (16 << 16));
+        let device = platform.meteor();
+        // No provider registered: the input is unknown and PSR is retried.
+        present_once(&device, object(true).unwrap());
+        assert!(psr(&device).is_none());
+        assert_eq!(device.state.try_lock().unwrap().psr_refused, None);
+        assert!(sink_writes(&platform.all_writes()).is_empty());
+        // The display-14 watermark provider: qualification proves the
+        // programmed Pipe-A watermarks and reads their value.
+        crate::intel_gpu_xelpg_wm::register_psr_provider();
+        present_once(&device, object(true).unwrap());
+        assert_eq!(
+            crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled(),
+            Some(false)
+        );
+        assert!(!psr(&device).unwrap().config().wm_level_disabled);
+        assert_eq!(platform.read32(0x46430) & (1 << 23), 0);
+        assert_eq!(platform.read32(PSR_CTL), ARMED);
+        assert_eq!(
+            sink_writes(&platform.all_writes()),
+            [(EN_CFG, 0x04), (EN_CFG, 0x05), (SET_POWER, 0x01)]
+        );
+        crate::intel_gpu_psr::register_wm_level_disabled(previous);
+        crate::intel_gpu_xelpg_wm::publish_pipe_a(None);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_kms_production_wm_provider_qualifies_and_enables
+);
+
+fn smoke_psr_kms_wm_level_disabled_takes_wa_14015648006() -> TestResult {
+    {
+        let previous = crate::intel_gpu_psr::register_wm_level_disabled(None);
+        crate::intel_gpu_xelpg_wm::register_psr_provider();
+        // LP5 latency 0: skl_max_wm_level_for_vblank skips the zero level,
+        // so the highest fitting level is 4 and wm_level_disabled is true.
+        let platform = provider_platform(14);
+        let device = platform.meteor();
+        present_once(&device, object(true).unwrap());
+        assert_eq!(
+            crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled(),
+            Some(true)
+        );
+        assert!(psr(&device).unwrap().config().wm_level_disabled);
+        // intel_psr_enable_source → wm_optimization_wa sets
+        // LATENCY_REPORTING_REMOVED(PIPE_A) before PSR is activated.
+        let writes = platform.all_writes();
+        let wa = writes
+            .iter()
+            .position(|&(r, v)| r == 0x46430 && v & (1 << 23) != 0)
+            .unwrap();
+        let activate = writes.iter().position(|&w| w == (PSR_CTL, ARMED)).unwrap();
+        assert!(wa < activate);
+        assert_eq!(platform.read32(PSR_CTL), ARMED);
+        // intel_psr_disable_locked undoes it.
+        complete(device.quiesce()).unwrap();
+        assert!(psr(&device).is_none());
+        assert_eq!(platform.read32(0x46430) & (1 << 23), 0);
+        crate::intel_gpu_psr::register_wm_level_disabled(previous);
+        crate::intel_gpu_xelpg_wm::publish_pipe_a(None);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_kms_wm_level_disabled_takes_wa_14015648006
+);
+
+fn smoke_psr_kms_vbt_refusal_precedes_sink_and_source() -> TestResult {
+    {
+        use crate::intel_gpu_psr::VbtPsr;
+        for refused in [
+            VbtPsr::Missing,
+            VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
+                enable: false,
+                table: None,
+            }),
+            VbtPsr::PanelByPnpId,
+        ] {
+            let platform = psr_platform();
+            platform.0.lock().psr_vbt = refused;
+            let device = platform.meteor();
+            present_once(&device, object(true).unwrap());
+            present_once(&device, object(true).unwrap());
+            assert!(psr(&device).is_none());
+            {
+                let state = device.state.try_lock().unwrap();
+                // Not latched, and no sink conversation was started.
+                assert_eq!(state.psr_refused, None);
+                assert!(state.psr_sink.is_none());
+            }
+            assert!(sink_writes(&platform.all_writes()).is_empty());
+            assert!(platform
+                .all_writes()
+                .iter()
+                .all(|&(r, _)| !(0x60800..0x60a00).contains(&r) && r != 0x46430));
+            // The gate is re-evaluated at every latch.
+            platform.0.lock().psr_vbt = vbt(0, 2500, 2500);
+            present_once(&device, object(true).unwrap());
+            assert_eq!(platform.read32(PSR_CTL), ARMED);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_kms_vbt_refusal_precedes_sink_and_source
+);
+
+fn smoke_psr_kms_vbt_wakeup_times_reach_psr_ctl() -> TestResult {
+    {
+        // VBT TP1 100 µs (code 1), TP2/TP3 500 µs (code 0), idle frames 9.
+        let platform = psr_platform();
+        platform.0.lock().psr_vbt = vbt(9, 100, 500);
+        let device = platform.meteor();
+        present_once(&device, object(true).unwrap());
+        assert_eq!(
+            platform.read32(PSR_CTL),
+            (1 << 31) | (0x1f << 20) | (1 << 11) | (1 << 10) | (3 << 6) | (1 << 4) | 9
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_kms_vbt_wakeup_times_reach_psr_ctl
 );

@@ -16,10 +16,16 @@
 //! - cursor DDB size: `skl_cursor_allocation` (ARGB8888 linear at
 //!   `mode_config->cursor_width == 256`);
 //! - vblank: `skl_wm_check_vblank` with `skl_prefill.c` for an unscaled,
-//!   non-DSC, non-VRR pipe with `framestart_delay == 1`.
+//!   non-DSC, non-VRR pipe with `framestart_delay == 1`, including its
+//!   `wm_level_disabled` (`skl_max_wm_level_for_vblank` below the top
+//!   level), which `intel_psr.c::wm_optimization_wa` consumes as
+//!   Wa_14015648006. The Pipe-A value of the watermarks proved programmed
+//!   is published here and registered as PSR's provider.
 //!
 //! Gen12 keeps its own transcription in [`crate::intel_gpu_wm`]; nothing
 //! here changes Gen12 results.
+
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::intel_gpu_aux::MmioWindow;
 use narf_filesystem::FsError;
@@ -361,55 +367,143 @@ fn usecs_to_lines(timing: Timing, us: u32) -> u64 {
         .div_ceil(u64::from(timing.htotal) * 1000)
 }
 
+/// `struct skl_prefill_ctx` after `skl_prefill_init` for an unscaled,
+/// non-DSC, non-VRR pipe with `framestart_delay == 1`.
+struct Prefill {
+    timing: Timing,
+    /// `prefill.full` (.16 lines).
+    full: u64,
+    /// `prefill_guardband` (.16 lines).
+    guardband: u64,
+}
+
+impl Prefill {
+    /// `skl_prefill_init` with `skl_wm0_prefill_lines` = `wm0_lines`, the
+    /// worst level-0 lines of the pipe's planes (`skl_max_wm0_lines`).
+    fn new(timing: Timing, wm0_lines: u16) -> Result<Self, WmError> {
+        if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
+            return Err(WmError::Unsupported);
+        }
+        // prefill_init: framestart_delay 1 + 20 us of translation walks.
+        let fixed = (1u64 << 16) + usecs_to_lines(timing, 20);
+        // No DSC/scalers: nocdclk prefill is the worst wm0 lines.
+        let wm0 = u64::from(wm0_lines) << 16;
+        // intel_cdclk_prefill_adjustment(_worst): calc_cdclk at the
+        // pixel-rate minimum, ppc 2.
+        let cdclk = crate::intel_gpu_xelpg_cdclk::calc_cdclk(
+            crate::intel_gpu_xelpg_cdclk::pixel_rate_to_cdclk(timing.pixel_rate_khz),
+        )
+        .ok_or(WmError::Unsupported)?
+        .cdclk_khz;
+        let adj = ((u64::from(timing.pixel_rate_khz) << 16).div_ceil(2 * u64::from(cdclk))).min(FX);
+        Ok(Self {
+            timing,
+            full: fixed + (wm0 * adj).div_ceil(FX),
+            guardband: u64::from(timing.vtotal - timing.vblank_start) << 16,
+        })
+    }
+
+    /// `skl_prefill_vblank_too_short`.
+    fn too_short(&self, us: u32) -> bool {
+        self.guardband < self.full + usecs_to_lines(self.timing, us)
+    }
+
+    /// `skl_max_wm_level_for_vblank`: the highest level with a non-zero
+    /// latency whose prefill fits vblank (level 0 at zero latency).
+    fn max_level(&self, latency: &Latency) -> Result<usize, WmError> {
+        for (l, &lat) in latency.levels.iter().enumerate().rev() {
+            if lat == 0 {
+                continue;
+            }
+            let lat = if l == 0 { 0 } else { u32::from(lat) };
+            if !self.too_short(lat) {
+                return Ok(l);
+            }
+        }
+        Err(WmError::VblankTooShort)
+    }
+}
+
+/// `skl_wm_check_vblank`'s `crtc_state->wm_level_disabled` for display 14
+/// (`display->wm.num_levels == 6`): whether the highest level that fits
+/// the vblank prefill is below the top level. A zero latency level never
+/// fits, so a latency table that ends early also reports true, exactly as
+/// Linux does. `wm0_lines` is the worst level-0 lines over the pipe's
+/// planes (`skl_max_wm0_lines`).
+pub(crate) fn wm_level_disabled(
+    timing: Timing,
+    latency: &Latency,
+    wm0_lines: u16,
+) -> Result<bool, WmError> {
+    Ok(Prefill::new(timing, wm0_lines)?.max_level(latency)? < LEVELS - 1)
+}
+
 /// `skl_wm_check_vblank` for a pipe whose planes are `planes`. Levels that
 /// cannot complete prefill inside vblank lose their enable bit (keeping
 /// blocks/lines, as Linux does); SAGV levels likewise when the block time
-/// does not fit. No fitting level is a typed refusal.
+/// does not fit. No fitting level is a typed refusal. Returns the pipe's
+/// `wm_level_disabled` (Wa_14015648006's input, see [`wm_level_disabled`]).
 pub(crate) fn check_vblank(
     timing: Timing,
     latency: &Latency,
     planes: &mut [&mut PlaneWm],
-) -> Result<(), WmError> {
-    if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
-        return Err(WmError::Unsupported);
-    }
-    // prefill_init: framestart_delay 1 + 20 us of translation walks.
-    let fixed = (1u64 << 16) + usecs_to_lines(timing, 20);
-    // No DSC/scalers: nocdclk prefill is the worst wm0 lines.
-    let wm0 = u64::from(planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0)) << 16;
-    // intel_cdclk_prefill_adjustment(_worst): calc_cdclk at the pixel-rate
-    // minimum, ppc 2.
-    let cdclk = crate::intel_gpu_xelpg_cdclk::calc_cdclk(
-        crate::intel_gpu_xelpg_cdclk::pixel_rate_to_cdclk(timing.pixel_rate_khz),
-    )
-    .ok_or(WmError::Unsupported)?
-    .cdclk_khz;
-    let adj = ((u64::from(timing.pixel_rate_khz) << 16).div_ceil(2 * u64::from(cdclk))).min(FX);
-    let full = fixed + (wm0 * adj).div_ceil(FX);
-    let guardband = u64::from(timing.vtotal - timing.vblank_start) << 16;
-    let too_short = |us: u32| guardband < full + usecs_to_lines(timing, us);
-    let mut max_level = None;
-    for (l, &lat) in latency.levels.iter().enumerate().rev() {
-        if lat == 0 {
-            continue;
-        }
-        let lat = if l == 0 { 0 } else { u32::from(lat) };
-        if !too_short(lat) {
-            max_level = Some(l);
-            break;
-        }
-    }
-    let max_level = max_level.ok_or(WmError::VblankTooShort)?;
+) -> Result<bool, WmError> {
+    let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
+    let prefill = Prefill::new(timing, wm0)?;
+    let max_level = prefill.max_level(latency)?;
     for plane in planes.iter_mut() {
         for level in plane.levels.iter_mut().skip(max_level + 1) {
             level.enable = false;
         }
     }
-    if latency.sagv_block_us != 0 && too_short(u32::from(latency.sagv_block_us)) {
+    if latency.sagv_block_us != 0 && prefill.too_short(u32::from(latency.sagv_block_us)) {
         for plane in planes.iter_mut() {
             plane.sagv.enable = false;
             plane.sagv_trans.enable = false;
         }
     }
-    Ok(())
+    Ok(max_level < LEVELS - 1)
 }
+
+// ── Wa_14015648006's Pipe-A input ─────────────────────────────────
+
+const PIPE_A_UNKNOWN: u8 = 0;
+const PIPE_A_CLEAR: u8 = 1;
+const PIPE_A_DISABLED: u8 = 2;
+
+/// The Pipe-A `wm_level_disabled` of the watermarks last proved programmed
+/// (one integrated display per system). Lock-free: the PSR provider reads
+/// it without touching registers.
+static PIPE_A_WM_LEVEL_DISABLED: AtomicU8 = AtomicU8::new(PIPE_A_UNKNOWN);
+
+/// Record the Pipe-A `wm_level_disabled` of the watermarks a resource owner
+/// just proved programmed (`Some`), or that no programmed state is proved
+/// (`None`: before a write, while a new image is pending, or after a
+/// failed verification).
+pub(crate) fn publish_pipe_a(value: Option<bool>) {
+    let raw = match value {
+        None => PIPE_A_UNKNOWN,
+        Some(false) => PIPE_A_CLEAR,
+        Some(true) => PIPE_A_DISABLED,
+    };
+    PIPE_A_WM_LEVEL_DISABLED.store(raw, Ordering::Release);
+}
+
+/// The [`crate::intel_gpu_psr::WmLevelProvider`]: Pipe A's published
+/// `wm_level_disabled`, `None` while no programmed state is proved.
+pub(crate) fn pipe_a_wm_level_disabled() -> Option<bool> {
+    match PIPE_A_WM_LEVEL_DISABLED.load(Ordering::Acquire) {
+        PIPE_A_CLEAR => Some(false),
+        PIPE_A_DISABLED => Some(true),
+        _ => None,
+    }
+}
+
+/// Register [`pipe_a_wm_level_disabled`] as PSR's Wa_14015648006 input.
+pub(crate) fn register_psr_provider() {
+    crate::intel_gpu_psr::register_wm_level_disabled(Some(pipe_a_wm_level_disabled));
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_xelpg_wm_tests.rs"]
+mod tests;

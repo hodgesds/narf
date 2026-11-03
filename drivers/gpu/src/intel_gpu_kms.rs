@@ -237,10 +237,14 @@ pub(crate) trait Platform:
     ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
         Err(crate::dp_aux::AuxError::Nacked)
     }
-    /// Wa_14015648006's Pipe-A `wm_level_disabled`. Default: unknown,
-    /// which refuses PSR.
+    /// Wa_14015648006's Pipe-A `wm_level_disabled` for the watermarks the
+    /// caller just proved programmed. Default: unknown, which refuses PSR.
     fn psr_wm_level_disabled(&self) -> Option<bool> {
         None
+    }
+    /// The Pipe-A eDP PSR VBT facts. Default: no VBT, which refuses PSR.
+    fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
+        crate::intel_gpu_psr::VbtPsr::Missing
     }
 }
 
@@ -680,6 +684,9 @@ impl Platform for Physical {
     fn psr_wm_level_disabled(&self) -> Option<bool> {
         crate::intel_gpu_psr::wm_level_disabled()
     }
+    fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
+        crate::intel_gpu_psr::installed_vbt()
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -921,6 +928,11 @@ pub(crate) fn install(
     // Display-14 DC service: DC states exited and held off (Init) until
     // the card worker loads the DMC program. Inert for every other IP.
     crate::intel_gpu_dc_states::install(generation, bar, cap);
+    // Wa_14015648006's input: the display-14 watermark code's Pipe-A
+    // wm_level_disabled for the watermarks proved programmed.
+    if generation == Generation::MeteorLake {
+        crate::intel_gpu_xelpg_wm::register_psr_provider();
+    }
     // The owned internal Pipe A is lit (the console scans out of it): its
     // pipe DMC is enabled once the program loads (intel_modeset_setup's
     // sanitize of an active pipe). A refused DC exit still records it.
@@ -1632,8 +1644,10 @@ impl<M: Platform> Guard<'_, M> {
                         state.failed = true;
                         return Err(FsError::NoDevice);
                     }
+                    let mut completed_primary = false;
                     if let Some(resources) = state.primary_resources.as_mut() {
                         let result = if resources.pending() {
+                            completed_primary = true;
                             resources.complete(&self.device.platform)
                         } else {
                             resources.check_current(&self.device.platform)
@@ -1661,6 +1675,9 @@ impl<M: Platform> Guard<'_, M> {
                         }
                     }
                     state.current = state.pending.take();
+                    if completed_primary {
+                        self.psr_wm_post_update();
+                    }
                     return Ok(Some(completion.stamp));
                 }
                 Ok(None) => self.device.platform.tick().await,
@@ -1971,12 +1988,17 @@ impl<M: Platform> Guard<'_, M> {
             self.state.psr_refused = Some(refusal);
         }
     }
-    /// `intel_psr_compute_config` against the live fixed timing and the
-    /// (cached) sink capability.
+    /// `intel_psr_compute_config` against the live fixed timing, the VBT,
+    /// the (cached) sink capability and the `wm_level_disabled` of the
+    /// Pipe-A watermarks proved programmed just now.
     fn psr_qualify(&mut self) -> Result<crate::intel_gpu_psr::Psr1, crate::intel_gpu_psr::Refusal> {
         use crate::intel_gpu_psr::{compute_psr1, Refusal, Sink, DRM_MODE_FLAG_INTERLACE};
         let platform = &self.device.platform;
         let timing = platform.psr_timing().ok_or(Refusal::NoTiming)?;
+        // psr_global_enabled comes first: no sink conversation for a panel
+        // the VBT does not enable.
+        let vbt = platform.psr_vbt();
+        vbt.enabled()?;
         if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
             return Err(Refusal::Interlaced);
         }
@@ -2001,7 +2023,54 @@ impl<M: Platform> Guard<'_, M> {
                 sink
             }
         };
-        compute_psr1(&sink, &timing, platform.psr_wm_level_disabled())
+        // Prove the programmed Pipe-A watermarks now (the retained primary
+        // owner, else the fixed console profile); the proof publishes their
+        // wm_level_disabled, or "unknown" when it fails.
+        match &self.state.primary_resources {
+            Some(primary) => {
+                let _ = primary.check_current(platform);
+            }
+            None => {
+                let _ =
+                    crate::intel_gpu_display_resources::Profile::capture_timing(platform, timing);
+            }
+        }
+        compute_psr1(&sink, &timing, &vbt, platform.psr_wm_level_disabled())
+    }
+    /// `intel_psr_pre_plane_update`'s Wa_14015648006 half: before a staged
+    /// primary image whose `wm_level_disabled` is true can latch, an
+    /// enabled PSR gets `LATENCY_REPORTING_REMOVED`.
+    fn psr_wm_pre_update(&mut self) {
+        let target = self.state.primary_resources.as_ref().and_then(|primary| {
+            primary
+                .pending_tile4()
+                .map(|tile4| primary.wm_level_disabled(tile4))
+        });
+        if target == Some(true) {
+            self.psr_wm_update(true);
+        }
+    }
+    /// `intel_psr_post_plane_update`'s Wa_14015648006 half: once the
+    /// programmed image's `wm_level_disabled` is false, an enabled PSR
+    /// drops `LATENCY_REPORTING_REMOVED`.
+    fn psr_wm_post_update(&mut self) {
+        let current = self
+            .state
+            .primary_resources
+            .as_ref()
+            .and_then(|primary| primary.current_wm_level_disabled());
+        if current == Some(false) {
+            self.psr_wm_update(false);
+        }
+    }
+    fn psr_wm_update(&mut self, wm_level_disabled: bool) {
+        let platform = &self.device.platform;
+        let Some(psr) = self.state.psr.as_mut() else {
+            return;
+        };
+        if let Err(refusal) = psr.wm_optimization_wa(platform, wm_level_disabled) {
+            psr_disable(&mut self.state, platform, Some(refusal));
+        }
     }
     /// `intel_psr_resume`: re-activate a paused PSR from idle; an error
     /// disables it.
@@ -2511,6 +2580,7 @@ impl<M: Platform> Guard<'_, M> {
                         resources
                             .complete(&self.device.platform)
                             .inspect_err(|_| self.state.failed = true)?;
+                        self.psr_wm_post_update();
                     }
                 }
                 if self
@@ -3048,6 +3118,7 @@ impl<M: Platform> Guard<'_, M> {
                             view.layout == crate::intel_gpu_scanout::Layout::Tile4,
                         )?);
                     }
+                    self.psr_wm_pre_update();
                     Some(arm)
                 } else {
                     None
@@ -3121,6 +3192,8 @@ impl<M: Platform> Guard<'_, M> {
                 if let Some(resources) = self.state.primary_resources.as_mut() {
                     resources.rollback();
                 }
+                // The current image stays programmed: undo a pre-update.
+                self.psr_wm_post_update();
                 if !had_primary_resources {
                     self.state.primary_resources = None;
                 }

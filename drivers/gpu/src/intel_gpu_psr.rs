@@ -2,7 +2,8 @@
 //!
 //! Pinned source: Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! `i915/display/intel_psr.c`, `intel_psr_regs.h`, `intel_alpm.c`,
-//! `intel_fbc.c`, `intel_dp.c`, `intel_crtc.c`, `i915_reg.h`,
+//! `intel_fbc.c`, `intel_dp.c`, `intel_crtc.c`, `intel_bios.c`,
+//! `intel_display_params.h`, `skl_watermark.c`, `i915_reg.h`,
 //! `drm/display/drm_dp_helper.c` and `include/drm/display/drm_dp.h`.
 //!
 //! What is modelled, for display 14 (Meteor Lake / Arrow Lake), eDP on
@@ -13,7 +14,9 @@
 //!   `intel_dp_get_sink_sync_latency`, the `DP_DPCD_QUIRK_NO_PSR` sink-OUI
 //!   entry of `dpcd_quirk_list`).
 //! - Qualification (`intel_psr_compute_config` → `_psr_compute_config` →
-//!   `intel_psr_entry_setup_frames`): no interlace, a valid setup time that
+//!   `intel_psr_entry_setup_frames`): first `psr_global_enabled` (eDP
+//!   with the default debug mode: the VBT's `psr.enable` for the panel),
+//!   then no interlace, a valid setup time that
 //!   fits `vtotal - vdisplay - 1` lines (display < 20 has no entry setup
 //!   frames). Panel Replay and selective update are not offered here.
 //! - Enable (`intel_psr_enable_locked`): `psr_interrupt_error_check`, then
@@ -21,7 +24,13 @@
 //!   then `intel_psr_enable_source` (PSR_MASK, `psr_irq_control`,
 //!   Wa_14015648006 through `wm_optimization_wa`; display 14 has no PSR2 HW
 //!   tracking chicken, no DC3CO exit line and no ALPM programming), then
-//!   `hsw_activate_psr1`.
+//!   `hsw_activate_psr1` with the VBT training-pattern wake times
+//!   (`intel_psr1_get_tp_time`) and idle frames (`psr_compute_idle_frames`).
+//! - Watermark changes while enabled (`intel_psr_pre_plane_update` /
+//!   `intel_psr_post_plane_update`): `wm_optimization_wa` sets
+//!   `LATENCY_REPORTING_REMOVED` before a state whose `wm_level_disabled`
+//!   is true, and clears it after one whose value is false
+//!   ([`Psr::wm_optimization_wa`]).
 //! - Exit / re-arm (`intel_psr_exit`, `intel_psr_wait_exit_locked`,
 //!   `intel_psr_pause`, `intel_psr_resume`, `intel_psr_work`'s
 //!   `__psr_wait_for_idle_locked` gate) and disable
@@ -33,18 +42,25 @@
 //!   the same consequence; enable refuses while `GEN8_DE_MISC_IER` could
 //!   deliver `GEN8_DE_EDP_PSR` to the CPU.
 //!
-//! Choices this driver makes where Linux reads a VBT: there is no VBT
-//! parser, so the training-pattern wake times are the
-//! `psr_safest_params` pair (2500 µs for TP1 and TP2/TP3), the idle-frame
-//! floor has no VBT term, and `link_standby` keeps its display >= 12
-//! default (false: link off). Linux additionally requires the VBT's
-//! `psr.enable` for eDP by default; this driver substitutes the sink and
-//! source qualification above, and a sink that reports a PSR error is
-//! never re-enabled.
+//! The VBT ([`VbtPsr`], installed at probe): `psr_global_enabled` takes
+//! eDP PSR from the panel's `psr.enable`. Without a VBT Linux never sets
+//! it (`init_vbt_missing_defaults` and `parse_power_conservation_features`
+//! leave it false), so PSR is refused (`VbtDisabled`) exactly as Linux's
+//! "PSR disabled by flag". `psr_safest_params` defaults to false, so the
+//! TP1 and TP2/TP3 wake times come from the VBT's PSR table (zero when the
+//! VBT has no PSR block, as Linux's zeroed panel data gives), and the idle
+//! frames are `max(6, vbt idle_frames, sync_latency + 1)`. `link_standby`
+//! keeps its display >= 12 default (false: link off; `full_link` is only
+//! read below display 12). The panel is `get_panel_type`'s VBT index for
+//! the port-A child (`panel_type2` for an LFP2 handle), falling back to 0
+//! as Linux does; a VBT that selects its panel by EDID PnP ID (0xFF) is
+//! refused (`VbtPanelByPnpId`) because this driver does not match PnP IDs.
+//! A sink that reports a PSR error is never re-enabled.
 //!
-//! Wa_14015648006 needs `wm_level_disabled` from `skl_wm_check_vblank`,
-//! which the watermark lane owns. Until that lane registers it
-//! ([`register_wm_level_disabled`]) PSR is refused (`WmLevelUnknown`)
+//! Wa_14015648006 needs `wm_level_disabled` from `skl_wm_check_vblank`.
+//! The display-14 watermark code registers its Pipe-A provider
+//! ([`register_wm_level_disabled`]); with no provider, or while the
+//! programmed watermarks are not proved, PSR is refused (`WmLevelUnknown`)
 //! rather than guessed.
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -85,12 +101,24 @@ pub const EDP_PSR_MAX_SLEEP_TIME_MAX: u32 = 0x1f << 20;
 pub const EDP_PSR_TP_TP1_TP3: u32 = 1 << 11;
 /// `EDP_PSR_CRC_ENABLE`.
 pub const EDP_PSR_CRC_ENABLE: u32 = 1 << 10;
+/// `EDP_PSR_TP2_TP3_TIME_500us`.
+pub const EDP_PSR_TP2_TP3_TIME_500US: u32 = 0;
+/// `EDP_PSR_TP2_TP3_TIME_100us`.
+pub const EDP_PSR_TP2_TP3_TIME_100US: u32 = 1 << 8;
 /// `EDP_PSR_TP2_TP3_TIME_2500us`.
 pub const EDP_PSR_TP2_TP3_TIME_2500US: u32 = 2 << 8;
+/// `EDP_PSR_TP2_TP3_TIME_0us`.
+pub const EDP_PSR_TP2_TP3_TIME_0US: u32 = 3 << 8;
 /// `EDP_PSR_TP4_TIME_0us` (ICL+).
 pub const EDP_PSR_TP4_TIME_0US: u32 = 3 << 6;
+/// `EDP_PSR_TP1_TIME_500us`.
+pub const EDP_PSR_TP1_TIME_500US: u32 = 0;
+/// `EDP_PSR_TP1_TIME_100us`.
+pub const EDP_PSR_TP1_TIME_100US: u32 = 1 << 4;
 /// `EDP_PSR_TP1_TIME_2500us`.
 pub const EDP_PSR_TP1_TIME_2500US: u32 = 2 << 4;
+/// `EDP_PSR_TP1_TIME_0us`.
+pub const EDP_PSR_TP1_TIME_0US: u32 = 3 << 4;
 /// `EDP_PSR_IDLE_FRAMES_MASK`.
 pub const EDP_PSR_IDLE_FRAMES_MASK: u32 = 0xf;
 /// `EDP_PSR_STATUS_STATE_MASK`.
@@ -190,6 +218,11 @@ const PSR_SETUP_TIME_US: [u32; 7] = [330, 275, 220, 165, 110, 55, 0];
 pub enum Refusal {
     /// No fixed Pipe-A panel timing (not display 14, or no mode).
     NoTiming,
+    /// `psr_global_enabled` is false: the VBT's `psr.enable` for the
+    /// panel is clear, or there is no VBT ("PSR disabled by flag").
+    VbtDisabled,
+    /// The VBT selects the panel by EDID PnP ID, which is not matched.
+    VbtPanelByPnpId,
     /// A sink AUX transaction failed.
     Aux(AuxError),
     /// `DP_PSR_SUPPORT` is zero.
@@ -404,23 +437,87 @@ pub(crate) fn usecs_to_scanlines(timing: &crate::intel_gpu_dsb::Timing, usecs: u
     (u64::from(usecs) * u64::from(timing.clock)).div_ceil(1000 * u64::from(timing.htotal)) as u32
 }
 
+// ── VBT ───────────────────────────────────────────────────────────
+
+/// `DEVICE_HANDLE_LFP2`.
+const DEVICE_HANDLE_LFP2: u16 = 0x0080;
+
+/// The VBT facts eDP PSR consumes for the Pipe-A panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VbtPsr {
+    /// No VBT: `panel->vbt.psr.enable` is never set.
+    Missing,
+    /// `panel_type` 0xFF: Linux picks the panel by EDID PnP ID
+    /// (`pnpid_get_panel_type`), which this driver does not implement.
+    PanelByPnpId,
+    /// `parse_psr` and the PSR enable for the selected panel.
+    Panel(crate::intel_gpu_vbt::PsrPanel),
+}
+
+impl VbtPsr {
+    /// `intel_bios_init_panel` for the port-A eDP of a display-14 VBT:
+    /// `get_panel_type` (OpRegion panel type only applies to a DMI quirk
+    /// list; LFP2 when the port's child has that handle; the VBT index,
+    /// else `fallback_get_panel_type`'s 0), then `parse_psr` and the PSR
+    /// enable for that panel.
+    pub fn from_vbt(vbt: &crate::intel_gpu_vbt::Vbt) -> Self {
+        use crate::intel_gpu_vbt::{port, PanelType, VbtPlatform};
+        let second = vbt
+            .encoder(VbtPlatform::MeteorLake, port::A)
+            .and_then(|encoder| vbt.children().get(encoder.child))
+            .is_some_and(|child| child.handle() == DEVICE_HANDLE_LFP2);
+        match vbt.panel_type(second) {
+            PanelType::PnpId => VbtPsr::PanelByPnpId,
+            panel => VbtPsr::Panel(vbt.psr_panel(panel.index_or_fallback())),
+        }
+    }
+
+    /// `psr_global_enabled` for eDP under `I915_PSR_DEBUG_DEFAULT` (and
+    /// `enable_psr`'s default -1): the panel's facts when PSR may run.
+    pub fn enabled(&self) -> Result<crate::intel_gpu_vbt::PsrPanel, Refusal> {
+        match self {
+            VbtPsr::Panel(panel) if panel.enable => Ok(*panel),
+            VbtPsr::PanelByPnpId => Err(Refusal::VbtPanelByPnpId),
+            _ => Err(Refusal::VbtDisabled),
+        }
+    }
+}
+
+static VBT: IrqSafeSpinLock<VbtPsr> = IrqSafeSpinLock::new(VbtPsr::Missing);
+
+/// Install the probe's VBT facts ([`VbtPsr::Missing`] without a VBT).
+pub fn install_vbt(vbt: VbtPsr) {
+    *VBT.lock() = vbt;
+}
+
+/// The installed VBT facts.
+pub fn installed_vbt() -> VbtPsr {
+    *VBT.lock()
+}
+
 /// A qualified PSR1 configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Psr1 {
-    /// `psr_compute_idle_frames` (no VBT term).
+    /// `psr_compute_idle_frames`.
     pub idle_frames: u32,
     /// TP1/TP3 training-pattern select.
     pub tps3: bool,
     /// Wa_14015648006's input.
     pub wm_level_disabled: bool,
+    /// The VBT's `psr.tp1_wakeup_time_us`.
+    pub tp1_wakeup_us: u32,
+    /// The VBT's `psr.tp2_tp3_wakeup_time_us`.
+    pub tp2_tp3_wakeup_us: u32,
 }
 
 /// `intel_psr_compute_config` for PSR1 on display 14.
 pub(crate) fn compute_psr1(
     sink: &Sink,
     timing: &crate::intel_gpu_dsb::Timing,
+    vbt: &VbtPsr,
     wm_level_disabled: Option<bool>,
 ) -> Result<Psr1, Refusal> {
+    let panel = vbt.enabled()?;
     if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
         return Err(Refusal::Interlaced);
     }
@@ -432,26 +529,47 @@ pub(crate) fn compute_psr1(
         return Err(Refusal::SetupTimeTooLong);
     }
     let wm_level_disabled = wm_level_disabled.ok_or(Refusal::WmLevelUnknown)?;
+    // The VBT's psr_table is zero when the VBT has no PSR block.
+    let table = panel.table;
     Ok(Psr1 {
         idle_frames: 6u32
+            .max(table.map_or(0, |t| u32::from(t.idle_frames)))
             .max(u32::from(sink.sync_latency) + 1)
             .min(EDP_PSR_IDLE_FRAMES_MASK),
         tps3: sink.tps3(),
         wm_level_disabled,
+        tp1_wakeup_us: table.map_or(0, |t| t.tp1_wakeup_time_us),
+        tp2_tp3_wakeup_us: table.map_or(0, |t| t.tp2_tp3_wakeup_time_us),
     })
 }
 
-/// `hsw_activate_psr1`'s value for display 14 (`link_standby` false,
-/// `psr_safest_params` TP times).
+/// `intel_psr1_get_tp_time` for display 14 (`psr_safest_params` false).
+pub fn psr1_tp_time(config: &Psr1) -> u32 {
+    let mut value = EDP_PSR_TP4_TIME_0US;
+    value |= match config.tp1_wakeup_us {
+        0 => EDP_PSR_TP1_TIME_0US,
+        1..=100 => EDP_PSR_TP1_TIME_100US,
+        101..=500 => EDP_PSR_TP1_TIME_500US,
+        _ => EDP_PSR_TP1_TIME_2500US,
+    };
+    value |= match config.tp2_tp3_wakeup_us {
+        0 => EDP_PSR_TP2_TP3_TIME_0US,
+        1..=100 => EDP_PSR_TP2_TP3_TIME_100US,
+        101..=500 => EDP_PSR_TP2_TP3_TIME_500US,
+        _ => EDP_PSR_TP2_TP3_TIME_2500US,
+    };
+    if config.tps3 {
+        value |= EDP_PSR_TP_TP1_TP3;
+    }
+    value
+}
+
+/// `hsw_activate_psr1`'s value for display 14 (`link_standby` false).
 pub fn psr1_ctl(config: &Psr1) -> u32 {
     let mut value = EDP_PSR_ENABLE;
     value |= config.idle_frames & EDP_PSR_IDLE_FRAMES_MASK;
     value |= EDP_PSR_MAX_SLEEP_TIME_MAX;
-    value |= EDP_PSR_TP4_TIME_0US;
-    value |= EDP_PSR_TP1_TIME_2500US | EDP_PSR_TP2_TP3_TIME_2500US;
-    if config.tps3 {
-        value |= EDP_PSR_TP_TP1_TP3;
-    }
+    value |= psr1_tp_time(config);
     value | EDP_PSR_CRC_ENABLE
 }
 
@@ -560,6 +678,29 @@ impl Psr {
     pub fn config(&self) -> Psr1 {
         self.config
     }
+
+    /// `wm_optimization_wa` for a new `wm_level_disabled` while PSR is
+    /// enabled: `intel_psr_pre_plane_update` calls it (setting
+    /// `LATENCY_REPORTING_REMOVED`) before a state whose value is true,
+    /// `intel_psr_post_plane_update` (clearing it) after one whose value
+    /// is false. Only bit 23 changes.
+    pub fn wm_optimization_wa<M: MmioWindow + ?Sized>(
+        &mut self,
+        regs: &M,
+        wm_level_disabled: bool,
+    ) -> Result<(), Refusal> {
+        let dcpr = readable(regs, CHICKEN_DCPR_1)?;
+        regs.write32(
+            CHICKEN_DCPR_1,
+            if wm_level_disabled {
+                dcpr | LATENCY_REPORTING_REMOVED_PIPE_A
+            } else {
+                dcpr & !LATENCY_REPORTING_REMOVED_PIPE_A
+            },
+        );
+        self.config.wm_level_disabled = wm_level_disabled;
+        Ok(())
+    }
     /// `intel_dp->psr.active`.
     pub fn active(&self) -> bool {
         self.active
@@ -654,7 +795,9 @@ impl Psr {
 // ── Watermark-lane input ──────────────────────────────────────────
 
 /// A Wa_14015648006 input provider: Pipe-A `wm_level_disabled`, or `None`
-/// while the watermark lane cannot answer.
+/// while the watermark lane cannot answer. Production registers
+/// [`crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled`] at display-14
+/// KMS install.
 pub type WmLevelProvider = fn() -> Option<bool>;
 
 static WM_LEVEL_DISABLED: IrqSafeSpinLock<Option<WmLevelProvider>> = IrqSafeSpinLock::new(None);

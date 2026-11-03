@@ -8,11 +8,17 @@
 //! repartitioning occurs with every pipe/fetcher verified off. The owned
 //! console keeps the joined/no-SAGV policy and budgets the 64x64 cursor
 //! even while it is hidden.
+//!
+//! Every proof of the programmed Pipe-A watermarks (profile capture,
+//! primary complete/check) publishes that image's `wm_level_disabled`
+//! ([`crate::intel_gpu_xelpg_wm::publish_pipe_a`]) for PSR's
+//! Wa_14015648006; a transaction about to write, a pending image and a
+//! failed proof publish "unknown".
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
     intel_gpu_xelpg_resources::{self as res, ResourceError},
-    intel_gpu_xelpg_wm::{Latency, PlaneWm, Tiling},
+    intel_gpu_xelpg_wm::{self as wm, Latency, PlaneWm, Tiling},
 };
 use narf_filesystem::FsError;
 
@@ -106,6 +112,10 @@ pub(crate) struct Profile {
     pub(crate) cursor: PlaneWm,
     pub(crate) cursor_start: u16,
     cursor_ddb: u32,
+    /// `skl_wm_check_vblank`'s `wm_level_disabled` for this layout: the
+    /// same prefill the transaction's vblank check used (the primary and
+    /// the always-budgeted cursor; level-0 lines survive the DDB stage).
+    pub(crate) wm_level_disabled: bool,
 }
 impl Profile {
     fn compute_for_layout(
@@ -136,11 +146,22 @@ impl Profile {
         let state = res::compute(&request(mode, tiling, min_cdclk_khz), &latency)
             .map_err(|_| FsError::Unsupported)?;
         let alloc = &state.dbuf.pipes[0];
+        let timing = wm::Timing {
+            pixel_rate_khz: mode.pixel_clock_khz,
+            htotal: u32::from(mode.h_total),
+            vtotal: u32::from(mode.v_total),
+            vblank_start: u32::from(mode.v_active),
+        };
+        let wm0 = alloc.wm[0].levels[0]
+            .lines
+            .max(alloc.cursor_wm.levels[0].lines);
         let profile = Self {
             primary: alloc.wm[0],
             cursor: alloc.cursor_wm,
             cursor_start: alloc.cursor.start,
             cursor_ddb: alloc.cursor.reg(),
+            wm_level_disabled: wm::wm_level_disabled(timing, &latency, wm0)
+                .map_err(|_| FsError::Unsupported)?,
         };
         // The fixed owner admits only the joined single-pipe layout whose
         // primary and cursor both hold their level-0 watermark.
@@ -264,13 +285,28 @@ impl Profile {
         }
         Ok(profile)
     }
+    /// The proved layout, published as Pipe A's programmed
+    /// `wm_level_disabled`; any failure publishes "unknown".
     fn capture_layout(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+        let profile = Self::capture_layout_inner(io, mode);
+        wm::publish_pipe_a(profile.as_ref().ok().map(|p| p.wm_level_disabled));
+        profile
+    }
+    fn capture_layout_inner(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
         let mut profile = Self::capture_globals(io, mode)?;
         // X-tiled takes the linear watermark arithmetic on display >= 10.
         match read(io, 0x70180)? & (7 << 10) {
             0 => {}
-            0x400 => profile.primary = Self::compute_for_layout(io, mode, Tiling::X)?.primary,
-            0x1400 => profile.primary = Self::compute_for_layout(io, mode, Tiling::Tile4)?.primary,
+            0x400 => {
+                let layout = Self::compute_for_layout(io, mode, Tiling::X)?;
+                profile.primary = layout.primary;
+                profile.wm_level_disabled = layout.wm_level_disabled;
+            }
+            0x1400 => {
+                let layout = Self::compute_for_layout(io, mode, Tiling::Tile4)?;
+                profile.primary = layout.primary;
+                profile.wm_level_disabled = layout.wm_level_disabled;
+            }
             _ => return Err(FsError::Unsupported),
         }
         verify_primary(io, profile.primary)?;
@@ -300,6 +336,8 @@ pub(crate) struct Primary {
     mode: Mode,
     original: Profile,
     tile4: PlaneWm,
+    /// `wm_level_disabled` of the Tile4 image.
+    tile4_wm_level_disabled: bool,
     current_tile4: bool,
     pending: Option<bool>,
 }
@@ -325,14 +363,34 @@ impl Primary {
             return Err(FsError::Unsupported);
         }
         let original = Profile::capture(io, &mode)?;
-        let tile4 = Profile::compute_for_layout(io, &mode, Tiling::Tile4)?.primary;
+        let tile4 = Profile::compute_for_layout(io, &mode, Tiling::Tile4)?;
         Ok(Self {
             mode,
             original,
-            tile4,
+            tile4: tile4.primary,
+            tile4_wm_level_disabled: tile4.wm_level_disabled,
             current_tile4: false,
             pending: None,
         })
+    }
+    /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.
+    pub(crate) fn wm_level_disabled(&self, tile4: bool) -> bool {
+        if tile4 {
+            self.tile4_wm_level_disabled
+        } else {
+            self.original.wm_level_disabled
+        }
+    }
+    /// The image a staged update moves to, if one is pending.
+    pub(crate) fn pending_tile4(&self) -> Option<bool> {
+        self.pending
+    }
+    /// `wm_level_disabled` of the image programmed now; `None` while an
+    /// update is pending.
+    pub(crate) fn current_wm_level_disabled(&self) -> Option<bool> {
+        self.pending
+            .is_none()
+            .then(|| self.wm_level_disabled(self.current_tile4))
     }
     pub(crate) fn check_globals(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
         let profile = Profile::capture_globals(io, &self.mode)?;
@@ -349,7 +407,15 @@ impl Primary {
             self.original.primary
         }
     }
+    /// Prove the programmed image (globals always; the primary image when no
+    /// update is pending) and publish its `wm_level_disabled` (unknown
+    /// while pending or on failure).
     pub(crate) fn check_current(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
+        let result = self.check_current_inner(io);
+        wm::publish_pipe_a(result.ok().and_then(|()| self.current_wm_level_disabled()));
+        result
+    }
+    fn check_current_inner(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
         self.check_globals(io)?;
         if self.pending.is_none() {
             let tiling = read(io, 0x70180)? & (7 << 10);
@@ -375,10 +441,13 @@ impl Primary {
         self.check_current(io)?;
         let image = primary_registers(self.image(tile4))?;
         self.pending = Some(tile4);
+        wm::publish_pipe_a(None);
         Ok(image.to_vec())
     }
+    /// A staged image was never armed: the current image stays programmed.
     pub(crate) fn rollback(&mut self) {
         self.pending = None;
+        wm::publish_pipe_a(self.current_wm_level_disabled());
     }
     pub(crate) fn pending(&self) -> bool {
         self.pending.is_some()
@@ -389,6 +458,7 @@ impl Primary {
         verify_primary(io, self.image(target))?;
         self.current_tile4 = target;
         self.pending = None;
+        wm::publish_pipe_a(self.current_wm_level_disabled());
         Ok(())
     }
     /// Caller has independently retired all DSB streams and holds display
@@ -398,6 +468,7 @@ impl Primary {
         self.check_globals(io)?;
         let image = primary_registers(self.original.primary)?;
         self.pending = Some(false); // retained before the first possible write
+        wm::publish_pipe_a(None);
         for (r, value) in image {
             checked(io, r, value)?;
         }
@@ -434,6 +505,9 @@ pub(crate) fn initialize(
     if irq_enable & !irq_mask & ((1 << 3) | (1 << 27)) != 0 || read(io, 0x44468)? & (1 << 27) != 0 {
         return Ok(None);
     }
+    // The programmed Pipe-A watermarks are unproved until the final
+    // capture below republishes them.
+    wm::publish_pipe_a(None);
     wait(io, REQUEST1, ENABLE, 0)?;
     wait(io, INFLIGHT, 1 << 26, 0)?;
     // intel_dpt_common.c::intel_dpt_configure, display14 no-DPT profile.

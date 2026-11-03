@@ -82,6 +82,11 @@ struct Hardware {
     psr_dpcd: Option<BTreeMap<u32, u8>>,
     psr_timing: Option<crate::intel_gpu_dsb::Timing>,
     psr_wm: Option<bool>,
+    /// Answer `psr_wm_level_disabled` through the registered PSR provider
+    /// (the production route) instead of `psr_wm`.
+    psr_wm_provider: bool,
+    /// The Pipe-A eDP PSR VBT facts.
+    psr_vbt: crate::intel_gpu_psr::VbtPsr,
     /// DSM offset an FBC CFB is placed at (1:1); `None` places nothing.
     fbc_offset: Option<u32>,
 }
@@ -164,6 +169,8 @@ impl MockPlatform {
                 psr_dpcd: None,
                 psr_timing: None,
                 psr_wm: None,
+                psr_wm_provider: false,
+                psr_vbt: crate::intel_gpu_psr::VbtPsr::Missing,
                 fbc_offset: None,
             })),
             Arc::new(AtomicBool::new(false)),
@@ -1124,7 +1131,16 @@ impl Platform for MockPlatform {
         }
     }
     fn psr_wm_level_disabled(&self) -> Option<bool> {
-        self.0.lock().psr_wm
+        let hw = self.0.lock();
+        if hw.psr_wm_provider {
+            drop(hw);
+            crate::intel_gpu_psr::wm_level_disabled()
+        } else {
+            hw.psr_wm
+        }
+    }
+    fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
+        self.0.lock().psr_vbt
     }
     fn fbc_carve(&self, size: u64, min_limit: u32) -> Option<(u32, u64, u32)> {
         self.0

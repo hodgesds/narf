@@ -121,6 +121,22 @@ fn timing() -> crate::intel_gpu_dsb::Timing {
     }
 }
 
+/// A VBT panel with PSR enabled, 2500 µs TP1 and TP2/TP3 wake times (BDB
+/// 205+ code 2) and no idle-frame floor.
+fn vbt() -> VbtPsr {
+    VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
+        enable: true,
+        table: Some(crate::intel_gpu_vbt::PsrTable {
+            full_link: false,
+            require_aux_wakeup: false,
+            idle_frames: 0,
+            tp1_wakeup_time_us: 2500,
+            tp2_tp3_wakeup_time_us: 2500,
+            psr2_tp2_tp3_wakeup_time_us: 2500,
+        }),
+    })
+}
+
 /// hsw_activate_psr1: EDP_PSR_ENABLE, MAX_SLEEP_TIME(0x1f), TP_TP1_TP3,
 /// CRC_ENABLE, TP2_TP3_TIME_2500us, TP4_TIME_0us, TP1_TIME_2500us, idle.
 fn armed(idle: u32, tps3: bool) -> u32 {
@@ -203,25 +219,27 @@ kernel_test_in!(
 fn smoke_psr_qualify_follows_compute_config() -> TestResult {
     let sink = Sink::read(&mut psr1_sink()).unwrap();
     assert_eq!(
-        compute_psr1(&sink, &timing(), Some(true)),
+        compute_psr1(&sink, &timing(), &vbt(), Some(true)),
         Ok(Psr1 {
             idle_frames: 6,
             tps3: true,
             wm_level_disabled: true,
+            tp1_wakeup_us: 2500,
+            tp2_tp3_wakeup_us: 2500,
         })
     );
     // idle = max(6, sync_latency + 1), at most 0xf.
     let mut latency = sink;
     latency.sync_latency = 9;
     assert_eq!(
-        compute_psr1(&latency, &timing(), Some(false))
+        compute_psr1(&latency, &timing(), &vbt(), Some(false))
             .unwrap()
             .idle_frames,
         10
     );
     latency.sync_latency = 15;
     assert_eq!(
-        compute_psr1(&latency, &timing(), Some(false))
+        compute_psr1(&latency, &timing(), &vbt(), Some(false))
             .unwrap()
             .idle_frames,
         15
@@ -229,14 +247,14 @@ fn smoke_psr_qualify_follows_compute_config() -> TestResult {
     let mut interlaced = timing();
     interlaced.flags |= 1 << 4;
     assert_eq!(
-        compute_psr1(&sink, &interlaced, Some(false)),
+        compute_psr1(&sink, &interlaced, &vbt(), Some(false)),
         Err(Refusal::Interlaced)
     );
     // Setup code 7 is reserved: drm_dp_psr_setup_time returns -EINVAL.
     let mut reserved = sink;
     reserved.psr[1] = 7 << 1;
     assert_eq!(
-        compute_psr1(&reserved, &timing(), Some(false)),
+        compute_psr1(&reserved, &timing(), &vbt(), Some(false)),
         Err(Refusal::InvalidSetupTime)
     );
     // 37 setup lines must fit vtotal - vdisplay - 1.
@@ -244,17 +262,17 @@ fn smoke_psr_qualify_follows_compute_config() -> TestResult {
     let mut tight = timing();
     tight.vtotal = 1800 + 37;
     assert_eq!(
-        compute_psr1(&sink, &tight, Some(false)),
+        compute_psr1(&sink, &tight, &vbt(), Some(false)),
         Err(Refusal::SetupTimeTooLong)
     );
     tight.vtotal = 1800 + 38;
-    assert!(compute_psr1(&sink, &tight, Some(false)).is_ok());
+    assert!(compute_psr1(&sink, &tight, &vbt(), Some(false)).is_ok());
     // The 0 µs setup code always fits.
     let mut zero = sink;
     zero.psr[1] = 6 << 1;
-    assert!(compute_psr1(&zero, &timing(), Some(false)).is_ok());
+    assert!(compute_psr1(&zero, &timing(), &vbt(), Some(false)).is_ok());
     assert_eq!(
-        compute_psr1(&sink, &timing(), None),
+        compute_psr1(&sink, &timing(), &vbt(), None),
         Err(Refusal::WmLevelUnknown)
     );
     // Latched refusals are sink/mode facts; the rest are retried.
@@ -272,6 +290,8 @@ fn smoke_psr_qualify_follows_compute_config() -> TestResult {
     }
     for r in [
         Refusal::NoTiming,
+        Refusal::VbtDisabled,
+        Refusal::VbtPanelByPnpId,
         Refusal::Aux(AuxError::Deferred),
         Refusal::WmLevelUnknown,
         Refusal::InterruptDelivery,
@@ -295,7 +315,7 @@ fn smoke_psr_enable_conversation_is_linux_ordered() -> TestResult {
         regs.set(0x60814, !0x10);
         let mut aux = psr1_sink();
         let sink = Sink::read(&mut aux).unwrap();
-        let config = compute_psr1(&sink, &timing(), Some(wm_level_disabled)).unwrap();
+        let config = compute_psr1(&sink, &timing(), &vbt(), Some(wm_level_disabled)).unwrap();
         let mut psr = Psr::enable(&regs, &mut aux, config).unwrap();
         // _psr_enable_sink: CRC verification without and then with
         // DP_PSR_ENABLE (no link standby on display >= 12), then D0.
@@ -326,7 +346,7 @@ fn smoke_psr_enable_conversation_is_linux_ordered() -> TestResult {
     let mut aux = psr1_sink();
     aux.dpcd.insert(0x002, 0x84);
     let sink = Sink::read(&mut aux).unwrap();
-    let config = compute_psr1(&sink, &timing(), Some(false)).unwrap();
+    let config = compute_psr1(&sink, &timing(), &vbt(), Some(false)).unwrap();
     let mut psr = Psr::enable(&regs, &mut aux, config).unwrap();
     psr.resume(&regs).unwrap();
     assert_eq!(regs.get(0x60800), armed(6, false));
@@ -343,6 +363,7 @@ fn smoke_psr_enable_refuses_before_any_write() -> TestResult {
     let config = compute_psr1(
         &Sink::read(&mut psr1_sink()).unwrap(),
         &timing(),
+        &vbt(),
         Some(false),
     )
     .unwrap();
@@ -392,6 +413,7 @@ fn smoke_psr_pause_resume_and_disable_sequences() -> TestResult {
     let config = compute_psr1(
         &Sink::read(&mut psr1_sink()).unwrap(),
         &timing(),
+        &vbt(),
         Some(true),
     )
     .unwrap();
@@ -467,4 +489,220 @@ fn smoke_psr_wm_level_provider_registry() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_psr",
     smoke_psr_wm_level_provider_registry
+);
+
+fn vbt_panel(enable: bool, idle_frames: u8, tp1: u32, tp23: u32) -> VbtPsr {
+    VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
+        enable,
+        table: Some(crate::intel_gpu_vbt::PsrTable {
+            full_link: false,
+            require_aux_wakeup: false,
+            idle_frames,
+            tp1_wakeup_time_us: tp1,
+            tp2_tp3_wakeup_time_us: tp23,
+            psr2_tp2_tp3_wakeup_time_us: tp23,
+        }),
+    })
+}
+
+fn smoke_psr_vbt_gate_precedes_every_other_check() -> TestResult {
+    let sink = Sink::read(&mut psr1_sink()).unwrap();
+    let mut interlaced = timing();
+    interlaced.flags |= 1 << 4;
+    // psr_global_enabled is intel_psr_compute_config's first test: no
+    // VBT (psr.enable never set), a VBT that clears psr.enable for the
+    // panel, and an unmatched PnP-ID panel all refuse before interlace,
+    // sink or watermark facts are consulted.
+    for (vbt, refusal) in [
+        (VbtPsr::Missing, Refusal::VbtDisabled),
+        (vbt_panel(false, 0, 2500, 2500), Refusal::VbtDisabled),
+        (
+            VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
+                enable: false,
+                table: None,
+            }),
+            Refusal::VbtDisabled,
+        ),
+        (VbtPsr::PanelByPnpId, Refusal::VbtPanelByPnpId),
+    ] {
+        assert_eq!(vbt.enabled().map(|_| ()), Err(refusal));
+        assert_eq!(compute_psr1(&sink, &interlaced, &vbt, None), Err(refusal));
+        assert!(!refusal.latched());
+    }
+    // An enabled panel without a PSR block qualifies; its wake times are
+    // Linux's zeroed defaults.
+    let bare = VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
+        enable: true,
+        table: None,
+    });
+    let config = compute_psr1(&sink, &timing(), &bare, Some(false)).unwrap();
+    assert_eq!((config.tp1_wakeup_us, config.tp2_tp3_wakeup_us), (0, 0));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_vbt_gate_precedes_every_other_check
+);
+
+fn smoke_psr_vbt_wakeup_times_and_idle_frames_reach_psr_ctl() -> TestResult {
+    let sink = Sink::read(&mut psr1_sink()).unwrap();
+    // intel_psr1_get_tp_time: 0 µs → code 3, <= 100 → 1, <= 500 → 0,
+    // otherwise 2500 µs → 2; TP1 at bits 5:4, TP2/TP3 at bits 9:8.
+    for (us, code) in [
+        (0u32, 3u32),
+        (1, 1),
+        (100, 1),
+        (101, 0),
+        (500, 0),
+        (501, 2),
+        (2500, 2),
+    ] {
+        let vbt = vbt_panel(true, 0, us, us);
+        let config = compute_psr1(&sink, &timing(), &vbt, Some(false)).unwrap();
+        assert_eq!(
+            psr1_tp_time(&config),
+            (3 << 6) | (code << 4) | (code << 8) | (1 << 11)
+        );
+    }
+    // Independent TP1 and TP2/TP3 fields: TP1 100 µs, TP2/TP3 500 µs,
+    // VBT idle frames 9 above the floor of 6 and sync latency 2 + 1.
+    let vbt = vbt_panel(true, 9, 100, 500);
+    let config = compute_psr1(&sink, &timing(), &vbt, Some(false)).unwrap();
+    assert_eq!(config.idle_frames, 9);
+    assert_eq!(
+        psr1_ctl(&config),
+        (1 << 31) | (0x1f << 20) | (1 << 11) | (1 << 10) | (3 << 6) | (1 << 4) | 9
+    );
+    // The VBT term never exceeds EDP_PSR_IDLE_FRAMES_MASK; 0 µs codes.
+    let zero = vbt_panel(true, 15, 0, 0);
+    let config = compute_psr1(&sink, &timing(), &zero, Some(false)).unwrap();
+    assert_eq!(config.idle_frames, 15);
+    assert_eq!(
+        psr1_ctl(&config),
+        (1 << 31) | (0x1f << 20) | (1 << 11) | (1 << 10) | (3 << 8) | (3 << 6) | (3 << 4) | 15
+    );
+    // Activation programs exactly that value.
+    let regs = Regs::default();
+    let mut aux = psr1_sink();
+    let config = compute_psr1(&sink, &timing(), &vbt, Some(false)).unwrap();
+    let mut psr = Psr::enable(&regs, &mut aux, config).unwrap();
+    psr.resume(&regs).unwrap();
+    assert_eq!(regs.get(0x60800), psr1_ctl(&config));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_vbt_wakeup_times_and_idle_frames_reach_psr_ctl
+);
+
+/// A BDB 228 VBT: the eDP child on DDI A with `handle`, LFP options
+/// selecting `panel` (LFP1) and `panel ^ 1` (LFP2), the LFP power block
+/// enabling PSR for `enabled` panels, and a PSR table giving every panel
+/// TP1 code 1 (100 µs), TP2/TP3 code 0 (500 µs) and idle frames = panel.
+fn psr_vbt_image(handle: u16, panel: u8, enabled: u16) -> crate::intel_gpu_vbt::Vbt {
+    use crate::intel_gpu_vbt::tests::{general_definitions, Child, VbtImage};
+    use crate::intel_gpu_vbt::{block, device_type, dp_aux, dvo_port};
+    let [lo, hi] = handle.to_le_bytes();
+    let edp = Child::new(device_type::EDP, dvo_port::DPA)
+        .aux(dp_aux::A)
+        .byte(0, lo)
+        .byte(1, hi);
+    let mut options = alloc::vec![0u8; 34];
+    options[0] = panel;
+    options[1] = panel ^ 1;
+    let mut power = alloc::vec![0u8; 136];
+    power[24..26].copy_from_slice(&enabled.to_le_bytes());
+    let mut psr = alloc::vec![0u8; 100];
+    for p in 0..16usize {
+        psr[6 * p + 1] = p as u8;
+        psr[6 * p + 2..6 * p + 4].copy_from_slice(&1u16.to_le_bytes());
+        psr[6 * p + 4..6 * p + 6].copy_from_slice(&0u16.to_le_bytes());
+    }
+    crate::intel_gpu_vbt::Vbt::parse(
+        &VbtImage::new(228)
+            .block(block::GENERAL_DEFINITIONS, general_definitions(44, &[edp]))
+            .block(block::LFP_OPTIONS, options)
+            .block(block::LFP_POWER, power)
+            .block(block::PSR, psr)
+            .build(),
+    )
+    .unwrap()
+}
+
+fn smoke_psr_vbt_facts_follow_intel_bios_init_panel() -> TestResult {
+    // LFP1 handle: panel_type 2, enabled by the LFP power bit for panel 2.
+    let facts = VbtPsr::from_vbt(&psr_vbt_image(0x0008, 2, 1 << 2));
+    let panel = facts.enabled().unwrap();
+    let table = panel.table.unwrap();
+    assert_eq!(
+        (
+            table.idle_frames,
+            table.tp1_wakeup_time_us,
+            table.tp2_tp3_wakeup_time_us
+        ),
+        (2, 100, 500)
+    );
+    // Panel 2's bit clear: disabled even though another panel's is set.
+    assert_eq!(
+        VbtPsr::from_vbt(&psr_vbt_image(0x0008, 2, 1 << 3))
+            .enabled()
+            .map(|_| ()),
+        Err(Refusal::VbtDisabled)
+    );
+    // An LFP2 child reads panel_type2 (2 ^ 1 = 3).
+    let lfp2 = VbtPsr::from_vbt(&psr_vbt_image(0x0080, 2, 1 << 3));
+    assert_eq!(lfp2.enabled().unwrap().table.unwrap().idle_frames, 3);
+    // 0xFF selects by PnP ID, which this driver does not match.
+    assert_eq!(
+        VbtPsr::from_vbt(&psr_vbt_image(0x0008, 0xff, 0xffff)),
+        VbtPsr::PanelByPnpId
+    );
+    // install / installed round trip; probe installs Missing without a
+    // VBT.
+    let previous = installed_vbt();
+    install_vbt(facts);
+    assert_eq!(installed_vbt(), facts);
+    install_vbt(VbtPsr::Missing);
+    assert_eq!(
+        installed_vbt().enabled().map(|_| ()),
+        Err(Refusal::VbtDisabled)
+    );
+    install_vbt(previous);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_vbt_facts_follow_intel_bios_init_panel
+);
+
+fn smoke_psr_wm_optimization_wa_follows_pre_and_post_plane_update() -> TestResult {
+    let sink = Sink::read(&mut psr1_sink()).unwrap();
+    let config = compute_psr1(&sink, &timing(), &vbt(), Some(false)).unwrap();
+    let regs = Regs::default();
+    regs.set(0x46430, 1 | (1 << 22));
+    let mut aux = psr1_sink();
+    let mut psr = Psr::enable(&regs, &mut aux, config).unwrap();
+    assert_eq!(regs.get(0x46430), 1 | (1 << 22));
+    // intel_psr_pre_plane_update: set before a disabling state latches.
+    let before = regs.log().len();
+    assert_eq!(psr.wm_optimization_wa(&regs, true), Ok(()));
+    assert_eq!(regs.log()[before..], [(0x46430, 1 | (1 << 22) | (1 << 23))]);
+    assert!(psr.config().wm_level_disabled);
+    // intel_psr_post_plane_update: cleared after a full-level state.
+    assert_eq!(psr.wm_optimization_wa(&regs, false), Ok(()));
+    assert_eq!(regs.get(0x46430), 1 | (1 << 22));
+    assert!(!psr.config().wm_level_disabled);
+    // An unreadable chicken register is refused before any write.
+    regs.set(0x46430, u32::MAX);
+    let before = regs.log().len();
+    assert_eq!(
+        psr.wm_optimization_wa(&regs, true),
+        Err(Refusal::Unavailable)
+    );
+    assert_eq!(regs.log().len(), before);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_psr_wm_optimization_wa_follows_pre_and_post_plane_update
 );

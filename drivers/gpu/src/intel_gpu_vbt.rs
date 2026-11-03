@@ -1716,7 +1716,8 @@ pub enum VbtInstall {
 
 /// Probe-time discovery and installation (`intel_bios_init`'s place in
 /// probe): Meteor Lake gets [`crate::intel_gpu_xelpg_external::MtlPortPolicy::from_vbt`]
-/// (ports, legacy Type-C, DDC pins, SSC) or `NO_VBT`; Gen12 gets its HDMI
+/// (ports, legacy Type-C, DDC pins, SSC) or `NO_VBT`, and the Pipe-A eDP
+/// PSR facts ([`crate::intel_gpu_psr::VbtPsr`]); Gen12 gets its HDMI
 /// DDC overrides. `asls` is PCI config [`ASLS`] (`None`: unreadable).
 pub fn install_for_probe(
     generation: crate::intel_gpu::Generation,
@@ -1734,6 +1735,17 @@ pub fn install_for_probe(
         return VbtInstall::NotApplicable;
     }
     let found = asls.and_then(discover);
+    // The Pipe-A eDP PSR facts (intel_bios_init_panel's parse_psr and PSR
+    // enable); without a VBT, psr.enable stays false as in Linux.
+    if generation == Generation::MeteorLake {
+        crate::intel_gpu_psr::install_vbt(
+            found
+                .as_ref()
+                .map_or(crate::intel_gpu_psr::VbtPsr::Missing, |(vbt, _)| {
+                    crate::intel_gpu_psr::VbtPsr::from_vbt(vbt)
+                }),
+        );
+    }
     let ok = match (generation, &found) {
         (Generation::MeteorLake, Some((vbt, _))) => {
             install_mtl_port_policy(MtlPortPolicy::from_vbt(vbt))
