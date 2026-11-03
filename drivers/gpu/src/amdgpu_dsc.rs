@@ -17,7 +17,8 @@
 //! - `prepare` is dsc_prepare_config: the PPS with its rate-control
 //!   parameters (rc_calc_fpu.c in Linux's own float/double arithmetic, then
 //!   drm_dsc_compute_rc_parameters) and the OPTC's bytes per pixel;
-//! - `pack_pps` is drm_dsc_pps_payload_pack;
+//! - `pack_pps` is drm_dsc_pps_payload_pack, re-exported with `Pps`
+//!   (drm_dsc_config) from the shared [`crate::drm_dsc`];
 //! - `stream_kbps` and `dsc_kbps` are dc_bandwidth_in_kbps_from_timing and
 //!   dc_dsc_stream_bandwidth_in_kbps, in Linux's 31.32 fixed point.
 //!
@@ -25,6 +26,10 @@
 //! eDP-specific panel/AUX lifecycle is outside this module.
 #[path = "amdgpu_dsc_qp.rs"]
 mod qp;
+
+// drm_dsc_helper.c is shared with the Intel VDSC path.
+use crate::drm_dsc::compute_rc_parameters;
+pub use crate::drm_dsc::{pack_pps, Pps};
 
 /// Linux's `struct fixed31_32` (dc/basics/fixpt31_32.c), as the DSC code
 /// uses it.
@@ -1411,54 +1416,6 @@ fn target_bpp_x16(
     (bpp != 0).then_some(bpp)
 }
 
-/// drm_dsc_config: the PPS and the rate-control model behind it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Pps {
-    pub line_buf_depth: u8,
-    pub bits_per_component: u8,
-    pub convert_rgb: bool,
-    pub slice_width: u16,
-    pub slice_height: u16,
-    pub simple_422: bool,
-    pub pic_width: u16,
-    pub pic_height: u16,
-    pub rc_tgt_offset_high: u8,
-    pub rc_tgt_offset_low: u8,
-    pub bits_per_pixel: u16,
-    pub rc_edge_factor: u8,
-    pub rc_quant_incr_limit1: u8,
-    pub rc_quant_incr_limit0: u8,
-    pub initial_xmit_delay: u16,
-    pub initial_dec_delay: u16,
-    pub block_pred_enable: bool,
-    pub first_line_bpg_offset: u8,
-    pub initial_offset: u16,
-    /// As the registers take them (the model's thresholds / 64).
-    pub rc_buf_thresh: [u16; 14],
-    /// (min QP, max QP, 6-bit BPG offset).
-    pub rc_range_params: [(u8, u8, u8); 15],
-    pub rc_model_size: u16,
-    pub flatness_min_qp: u8,
-    pub flatness_max_qp: u8,
-    pub initial_scale_value: u8,
-    pub scale_decrement_interval: u16,
-    pub scale_increment_interval: u16,
-    pub nfl_bpg_offset: u16,
-    pub slice_bpg_offset: u16,
-    pub final_offset: u16,
-    pub vbr_enable: bool,
-    pub mux_word_size: u8,
-    pub slice_chunk_size: u16,
-    pub rc_bits: u16,
-    pub dsc_version_minor: u8,
-    pub dsc_version_major: u8,
-    pub native_422: bool,
-    pub native_420: bool,
-    pub second_line_bpg_offset: u8,
-    pub nsl_bpg_offset: u16,
-    pub second_line_offset_adj: u16,
-}
-
 /// DSCCIF_CONFIG0.INPUT_PIXEL_FORMAT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -1792,69 +1749,6 @@ fn calc_rc(
     })
 }
 
-/// drm_dsc_compute_rc_parameters. None for -ERANGE.
-fn compute_rc_parameters(c: &mut Pps) -> Option<()> {
-    let native = c.native_420 || c.native_422;
-    let width = u64::from(c.slice_width) / if native { 2 } else { 1 };
-    let bpp = u64::from(c.bits_per_pixel);
-    let groups_per_line = width.div_ceil(3);
-    c.slice_chunk_size = (width * bpp).div_ceil(8 * 16) as u16;
-    let mux = u64::from(c.mux_word_size);
-    let bpc4 = 4 * u64::from(c.bits_per_component);
-    let mut extra_mux_bits = if c.convert_rgb {
-        3 * (mux + bpc4 + 4 - 2)
-    } else if c.native_422 {
-        4 * mux + (bpc4 + 4) + 3 * bpc4 - 2
-    } else {
-        3 * mux + (bpc4 + 4) + 2 * bpc4 - 2
-    };
-    let slice_bits = 8 * u64::from(c.slice_chunk_size) * u64::from(c.slice_height);
-    while extra_mux_bits > 0 && slice_bits.wrapping_sub(extra_mux_bits) % mux != 0 {
-        extra_mux_bits -= 1;
-    }
-    // groups_per_line < initial_scale_value - 8, an int compared as unsigned
-    // long.
-    let scale = i64::from(c.initial_scale_value) - 8;
-    if (groups_per_line as i64) < scale || scale < 0 {
-        c.initial_scale_value = (groups_per_line + 8) as u8;
-    }
-    c.scale_decrement_interval = if c.initial_scale_value > 8 {
-        (groups_per_line / (u64::from(c.initial_scale_value) - 8)) as u16
-    } else {
-        4095
-    };
-    let model = u64::from(c.rc_model_size);
-    c.final_offset = model
-        .wrapping_sub((u64::from(c.initial_xmit_delay) * bpp + 8) / 16)
-        .wrapping_add(extra_mux_bits) as u16;
-    if c.final_offset >= c.rc_model_size {
-        return None;
-    }
-    let final_scale = (model * 8) / (model - u64::from(c.final_offset));
-    c.nfl_bpg_offset = if c.slice_height > 1 {
-        (u64::from(c.first_line_bpg_offset) << 11).div_ceil(u64::from(c.slice_height) - 1) as u16
-    } else {
-        0
-    };
-    let groups_total = groups_per_line * u64::from(c.slice_height);
-    c.slice_bpg_offset = ((model - u64::from(c.initial_offset) + extra_mux_bits) << 11)
-        .div_ceil(groups_total) as u16;
-    c.scale_increment_interval = if final_scale > 9 {
-        ((u64::from(c.final_offset) << 11)
-            / ((u64::from(c.nfl_bpg_offset) + u64::from(c.slice_bpg_offset)) * (final_scale - 9)))
-            as u16
-    } else {
-        0
-    };
-    let rbs_min = model - u64::from(c.initial_offset)
-        + (u64::from(c.initial_xmit_delay) * bpp).div_ceil(16)
-        + groups_per_line * u64::from(c.first_line_bpg_offset);
-    let hrd_delay = (rbs_min * 16).div_ceil(bpp);
-    c.rc_bits = (hrd_delay * bpp / 16) as u16;
-    c.initial_dec_delay = (hrd_delay - u64::from(c.initial_xmit_delay)) as u16;
-    Some(())
-}
-
 /// dsc_prepare_config for one DSC on the stream's pipe (no ODM, no
 /// padding): the PPS, rate control and OPTC parameters.
 pub fn prepare(t: &DscTiming, cfg: &DscConfig) -> Option<DscRegisters> {
@@ -1971,60 +1865,6 @@ pub fn prepare(t: &DscTiming, cfg: &DscConfig) -> Option<DscRegisters> {
             PixelFormat::Rgb | PixelFormat::Ycbcr444 | PixelFormat::Simple422
         ),
     })
-}
-
-/// drm_dsc_pps_payload_pack: the 128-byte PPS the sink receives.
-pub fn pack_pps(c: &Pps) -> [u8; 128] {
-    let mut p = [0u8; 128];
-    let be = |p: &mut [u8; 128], at: usize, v: u16| p[at..at + 2].copy_from_slice(&v.to_be_bytes());
-    p[0] = c.dsc_version_minor | c.dsc_version_major << 4;
-    p[3] = c.line_buf_depth | c.bits_per_component << 4;
-    p[4] = ((c.bits_per_pixel & 0x300) >> 8) as u8
-        | u8::from(c.vbr_enable) << 2
-        | u8::from(c.simple_422) << 3
-        | u8::from(c.convert_rgb) << 4
-        | u8::from(c.block_pred_enable) << 5;
-    p[5] = c.bits_per_pixel as u8;
-    be(&mut p, 6, c.pic_height);
-    be(&mut p, 8, c.pic_width);
-    be(&mut p, 10, c.slice_height);
-    be(&mut p, 12, c.slice_width);
-    be(&mut p, 14, c.slice_chunk_size);
-    p[16] = ((c.initial_xmit_delay & 0x300) >> 8) as u8;
-    p[17] = c.initial_xmit_delay as u8;
-    be(&mut p, 18, c.initial_dec_delay);
-    p[21] = c.initial_scale_value;
-    be(&mut p, 22, c.scale_increment_interval);
-    p[24] = ((c.scale_decrement_interval & 0xf00) >> 8) as u8;
-    p[25] = c.scale_decrement_interval as u8;
-    p[27] = c.first_line_bpg_offset;
-    be(&mut p, 28, c.nfl_bpg_offset);
-    be(&mut p, 30, c.slice_bpg_offset);
-    be(&mut p, 32, c.initial_offset);
-    be(&mut p, 34, c.final_offset);
-    p[36] = c.flatness_min_qp;
-    p[37] = c.flatness_max_qp;
-    be(&mut p, 38, c.rc_model_size);
-    // DSC_RC_EDGE_FACTOR_CONST and the target offset constants.
-    p[40] = 6;
-    p[41] = c.rc_quant_incr_limit0;
-    p[42] = c.rc_quant_incr_limit1;
-    p[43] = 3 | 3 << 4;
-    for (i, &th) in c.rc_buf_thresh.iter().enumerate() {
-        p[44 + i] = th as u8;
-    }
-    for (i, &(min, max, ofs)) in c.rc_range_params.iter().enumerate() {
-        be(
-            &mut p,
-            58 + 2 * i,
-            u16::from(min) << 11 | u16::from(max) << 6 | u16::from(ofs),
-        );
-    }
-    p[88] = u8::from(c.native_422) | u8::from(c.native_420) << 1;
-    p[89] = c.second_line_bpg_offset;
-    be(&mut p, 90, c.nsl_bpg_offset);
-    be(&mut p, 92, c.second_line_offset_adj);
-    p
 }
 
 #[cfg(feature = "kernel-test")]

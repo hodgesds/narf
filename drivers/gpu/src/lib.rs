@@ -688,6 +688,7 @@ pub mod dp_mst;
 pub mod dp_mst_mgr;
 pub mod drm;
 pub mod drm_devfs_bridge;
+pub mod drm_dsc;
 pub mod drm_fb_hook;
 pub mod drm_ioctl_bridge;
 #[cfg(feature = "amdgpu")]
