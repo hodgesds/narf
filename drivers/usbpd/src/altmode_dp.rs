@@ -100,6 +100,10 @@ pub struct DpAltModePort {
     /// the order ports come up — `connector_to_ddi` on the GPU side
     /// translates this back to a board-specific DDI.
     connector: ConnectorId,
+    /// TCPC-owned Type-C class connector for this port. DP entry is
+    /// reflected into it (#1211); detach clearing is owned by the
+    /// TCPM task's connector sync.
+    typec: Arc<narf_drivers_extcon::typec::TypecConnector>,
     driver: IrqSafeSpinLock<DpAltModeDriver>,
     next_msg_id: AtomicU8,
     /// Once we go `Active`, dispatch to the GPU bridge exactly once
@@ -108,10 +112,15 @@ pub struct DpAltModePort {
 }
 
 impl DpAltModePort {
-    pub fn new(port: Arc<TcpmPort>, connector: ConnectorId) -> Self {
+    pub fn new(
+        port: Arc<TcpmPort>,
+        connector: ConnectorId,
+        typec: Arc<narf_drivers_extcon::typec::TypecConnector>,
+    ) -> Self {
         Self {
             port,
             connector,
+            typec,
             driver: IrqSafeSpinLock::new(DpAltModeDriver::new()),
             next_msg_id: AtomicU8::new(0),
             gpu_wiring_dispatched: AtomicU8::new(0),
@@ -291,6 +300,17 @@ impl DpAltModePort {
                 );
             }
         }
+        // #1211: reflect DP entry in the Type-C class. The GPU bridge
+        // dispatch above is the hardware handoff; this is the class
+        // observation of the same event. Exit on detach is handled by
+        // the TCPM task's connector sync, which clears entered modes.
+        // Re-attach entry inherits the pre-existing first-attach-only
+        // dispatch limit: the driver state machine never leaves Active
+        // on contract loss, so a second entry is not re-fed.
+        self.typec.set_alt_mode(
+            narf_drivers_extcon::typec::AltMode::DisplayPort(link.pin_assignment),
+            true,
+        );
     }
 }
 
@@ -504,7 +524,11 @@ pub(crate) mod tests {
             SourcePolicy::default(),
             alloc::string::String::from("dp-test"),
         ));
-        let alt = DpAltModePort::new(port, ConnectorId::from_index(0));
+        let alt = DpAltModePort::new(
+            port,
+            ConnectorId::from_index(0),
+            Arc::new(narf_drivers_extcon::typec::TypecConnector::new("dp-test")),
+        );
         let cap = narf_usbpd::bootstrap_usbpd_authority();
         match alt.step(&cap) {
             Ok(DpAltStep::NotReady) => TestResult::Pass,
@@ -535,7 +559,8 @@ pub(crate) mod tests {
         if port.state() != PortState::AttachedSnk {
             return TestResult::Fail("expected AttachedSnk after drive_to_sink_ready");
         }
-        let alt = DpAltModePort::new(port.clone(), ConnectorId::from_index(0));
+        let typec = Arc::new(narf_drivers_extcon::typec::TypecConnector::new("dp-walk"));
+        let alt = DpAltModePort::new(port.clone(), ConnectorId::from_index(0), typec.clone());
 
         // Step 1: kick off — transmits Discover Identity REQ.
         let _ = alt.step(&cap).unwrap();
@@ -626,6 +651,18 @@ pub(crate) mod tests {
         if chip.last_tx().is_none() {
             return TestResult::Fail("alt-mode driver didn't transmit anything");
         }
+        // #1211: DP entry is reflected in the Type-C class.
+        use narf_drivers_extcon::class::ExtconDevice as _;
+        if !typec
+            .entered_alt_modes()
+            .iter()
+            .any(|m| matches!(m, narf_drivers_extcon::typec::AltMode::DisplayPort(_)))
+        {
+            return TestResult::Fail("DP entry not reflected in TypecConnector alt modes");
+        }
+        if !typec.cable_state(narf_drivers_extcon::cable::Cable::Dp) {
+            return TestResult::Fail("DP entry not reflected in TypecConnector cable state");
+        }
         TestResult::Pass
     }
     kernel_test_in!(
@@ -643,7 +680,11 @@ pub(crate) mod tests {
         ));
         let cap = narf_usbpd::bootstrap_usbpd_authority();
         drive_to_sink_ready(&chip, &port, &cap);
-        let alt = DpAltModePort::new(port, ConnectorId::from_index(0));
+        let alt = DpAltModePort::new(
+            port,
+            ConnectorId::from_index(0),
+            Arc::new(narf_drivers_extcon::typec::TypecConnector::new("dp-test")),
+        );
 
         let _ = alt.step(&cap).unwrap(); // kick Discover Identity
                                          // Identity ACK.
@@ -681,7 +722,11 @@ pub(crate) mod tests {
             SourcePolicy::default(),
             alloc::string::String::from("reg"),
         ));
-        let alt = Arc::new(DpAltModePort::new(port, ConnectorId::from_index(0)));
+        let alt = Arc::new(DpAltModePort::new(
+            port,
+            ConnectorId::from_index(0),
+            Arc::new(narf_drivers_extcon::typec::TypecConnector::new("dp-test")),
+        ));
         super::register_port(alt);
         if super::registered_ports().len() != 1 {
             return TestResult::Fail("registry didn't capture port");
@@ -705,7 +750,11 @@ pub(crate) mod tests {
             SourcePolicy::default(),
             alloc::string::String::from("rev"),
         ));
-        let alt = DpAltModePort::new(port, ConnectorId::from_index(0));
+        let alt = DpAltModePort::new(
+            port,
+            ConnectorId::from_index(0),
+            Arc::new(narf_drivers_extcon::typec::TypecConnector::new("dp-test")),
+        );
         let cap = narf_usbpd::bootstrap_usbpd_authority();
         cap.revoke();
         match alt.step(&cap) {

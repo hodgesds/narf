@@ -169,7 +169,12 @@ fn publish(connector: &Connector) {
                     alloc::format!("{}:{}", connector.ppm, connector.number).into_boxed_str(),
                 );
                 let c = Arc::new(TypecConnector::new(name));
+                // #1212: same single publication path as TCPC bindings —
+                // both registries at creation. The sysfs bridge reads only
+                // TYPEC_REGISTRY, so without this UCSI connectors were
+                // invisible in /sys/class/typec despite live firmware state.
                 narf_drivers_extcon::class::register(c.clone());
+                narf_drivers_extcon::typec_class::typec_register(c.clone());
                 list.push((connector.ppm.clone(), connector.number, c.clone()));
                 c
             }
@@ -603,4 +608,71 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usbpd/ucsi", ucsi_status_versions_and_disconnect);
+
+    fn ucsi_publish_registers_typec_connector() -> TestResult {
+        use narf_drivers_extcon::class::ExtconDevice as _;
+        // Reset all publication state this path touches.
+        CONNECTORS.lock().clear();
+        TYPEC.lock().clear();
+        narf_drivers_extcon::class::REGISTRY.lock().clear();
+        narf_drivers_extcon::typec_class::TYPEC_REGISTRY
+            .lock()
+            .clear();
+        let mut c = Connector::new("\\_SB.UCSI", 1);
+        c.connected = true;
+        c.source = true;
+        c.reversed = Some(false);
+        c.partner_type = 2;
+        c.usb = true;
+        c.active_mode = Some(AltMode {
+            index: 0,
+            svid: 0xff01,
+            vdo: 0,
+        });
+        publish(&c);
+        // Publication → TYPEC_REGISTRY exactly once, with firmware state.
+        let registry = narf_drivers_extcon::typec_class::TYPEC_REGISTRY.lock();
+        if registry.len() != 1 {
+            return TestResult::Fail("TYPEC_REGISTRY should hold exactly one UCSI connector");
+        }
+        let typec = registry[0].clone();
+        drop(registry);
+        if typec.name() != "\\_SB.UCSI:1"
+            || typec.power_role() != narf_drivers_extcon::typec::PowerRole::Source
+            || typec.data_role() != narf_drivers_extcon::typec::DataRole::Host
+            || typec.orientation() != narf_drivers_extcon::typec::Orientation::Normal
+            || !typec.cable_state(narf_drivers_extcon::cable::Cable::Dp)
+        {
+            return TestResult::Fail("UCSI connector firmware state not reflected in class");
+        }
+        // A repeat publish of identical state adds no second entry.
+        publish(&c);
+        if narf_drivers_extcon::typec_class::TYPEC_REGISTRY
+            .lock()
+            .len()
+            != 1
+        {
+            return TestResult::Fail("repeat publish duplicated the TYPEC_REGISTRY entry");
+        }
+        // Disconnect clears roles but keeps the single entry.
+        let mut off = c.clone();
+        off.connected = false;
+        off.source = false;
+        off.usb = false;
+        off.active_mode = None;
+        publish(&off);
+        if narf_drivers_extcon::typec_class::TYPEC_REGISTRY
+            .lock()
+            .len()
+            != 1
+            || typec.power_role() != narf_drivers_extcon::typec::PowerRole::Dual
+        {
+            return TestResult::Fail("disconnect should keep one entry and clear roles");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-publish",
+        ucsi_publish_registers_typec_connector
+    );
 }

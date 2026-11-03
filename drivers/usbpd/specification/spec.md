@@ -28,6 +28,13 @@ exists to avoid competing with firmware for the same controller.
   validates PPM/connector identity and refreshes connection/mode support.
   Its mode-specific configuration is a Configure VDO, not a lane count.
 - UCSI publishes `extcon::typec::FirmwareState` without programming a host mux.
+- TCPC bindings publish one `TypecConnector` per binding through BOTH the
+  extcon registry and `TYPEC_REGISTRY` at creation (`register_port`); the
+  TCPM task mirrors attach, power/data roles, orientation, and DP Alt Mode
+  entry/exit into it, and detach clears roles and entered modes. UCSI
+  connectors take the same dual-registry creation path, so the Type-C class
+  is the single publication path for both producers; a connector is owned
+  by exactly one producer and is registered exactly once.
 - Existing TCPC drivers register `Arc<dyn Tcpc>`; production I2C drivers retain
   their granted `Cap<I2cBus, Write>` and use capability-checked operations.
 - EPR policy (`policy::SinkPolicy::evaluate_epr`,

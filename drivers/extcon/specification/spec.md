@@ -19,6 +19,11 @@ retains the host-controlled TCPC/mux interfaces and adds
 publishes USB host/device, DP, USB4 dock and audio-adapter state and clears
 entered modes on disconnect. It does not invoke the host mux or synthesize
 DP pin assignments from firmware state.
+Creation sites publish a `TypecConnector` through BOTH `class::register` and
+`typec_class::typec_register`, exactly once per connector object;
+`populate_typec_class` reads only `TYPEC_REGISTRY`. `typec_register` has no
+dedup, so the exactly-once creation rule is what keeps one `port<N>` per
+connector.
 
 ## 4. Invariants
 
