@@ -23,9 +23,10 @@
 //!
 //! Display 20 (Xe2_LPD, [`crate::intel_gpu_xe2lpd`]) runs the same
 //! single-pipe ownership with its resource state ([`res::compute_ip`]):
-//! no `PLANE_CHICKEN` no-DPT bit and no 14.00 stepping workaround, so its
-//! profile is the linear primary only; the multi-pipe layout stays
-//! display 14.
+//! no `PLANE_CHICKEN` no-DPT bit and no 14.00 stepping workaround. Its X and
+//! Tile4 primaries are fetched through the presenter's display page table
+//! and take the same tiled watermark images (skl_watermark.c has no DPT
+//! term); the multi-pipe layout stays display 14.
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
@@ -152,6 +153,8 @@ pub(crate) struct Profile {
     /// It depends only on Pipe A's own planes and timing, so every layout
     /// gives the same value for the same primary tiling.
     pub(crate) wm_level_disabled: bool,
+    /// The display IP this layout was proved on.
+    pub(crate) ip: DisplayIp,
 }
 impl Profile {
     /// Pipe A's share of `state` for `mode`: its primary ends where the
@@ -181,6 +184,7 @@ impl Profile {
             primary_ddb: alloc.planes[0].reg(),
             wm_level_disabled: wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
                 .map_err(|_| FsError::Unsupported)?,
+            ip: state.ip,
         };
         if state.dbuf.active_pipes & 1 == 0
             || alloc.planes[0].size() == 0
@@ -522,17 +526,15 @@ impl Profile {
     ) -> Result<Self, FsError> {
         let (mut profile, layout, ip) = Self::capture_globals(io, mode, dsc)?;
         // X-tiled takes the linear watermark arithmetic on display >= 10.
+        // A display-20 tiled primary is fetched through the presenter's DPT
+        // (no no-DPT chicken, intel_dpt_configure); its watermarks are the
+        // same tiled images.
         let tiling = match read(io, 0x70180)? & (7 << 10) {
             0 => None,
             0x400 => Some(Tiling::X),
             0x1400 => Some(Tiling::Tile4),
             _ => return Err(FsError::Unsupported),
         };
-        // Display 20 has no no-DPT chicken (intel_dpt_configure): a tiled
-        // primary is not one of its profiles.
-        if tiling.is_some() && !ip.has_no_dpt_chicken() {
-            return Err(FsError::Unsupported);
-        }
         if let Some(tiling) = tiling {
             let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_ref(), dsc)?;
             profile.primary = share.primary;
@@ -571,11 +573,26 @@ pub(crate) struct Primary {
     wm_level_disabled: [bool; 2],
     current_tile4: bool,
     pending: Option<bool>,
+    /// The display IP every proof must find again.
+    ip: DisplayIp,
 }
 impl Primary {
+    /// The display-14 owner ([`Self::capture_ip`] on 14.00).
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn capture(
         io: &(impl MmioWindow + ?Sized),
         timing: crate::intel_gpu_dsb::Timing,
+    ) -> Result<Self, FsError> {
+        Self::capture_ip(io, timing, DisplayIp::Xelpdp)
+    }
+    /// Retained primary watermark ownership on `ip`. Display 14 requires
+    /// the owned `PLANE_CHICKEN` no-DPT bit; display 20 has none (its tiled
+    /// primary is fetched through the presenter's DPT), so nothing extra is
+    /// read there. The proved layout must be `ip`'s.
+    pub(crate) fn capture_ip(
+        io: &(impl MmioWindow + ?Sized),
+        timing: crate::intel_gpu_dsb::Timing,
+        ip: DisplayIp,
     ) -> Result<Self, FsError> {
         let mode = Mode {
             pixel_clock_khz: timing.clock,
@@ -590,15 +607,19 @@ impl Primary {
         if !matches!(read(io, 0x70180)? & (7 << 10), 0 | 0x400) {
             return Err(FsError::Unsupported);
         }
-        if read(io, 0x7026c)? & (1 << 19) == 0 {
+        if ip.has_no_dpt_chicken() && read(io, 0x7026c)? & (1 << 19) == 0 {
             return Err(FsError::Unsupported);
         }
         let original = Profile::capture(io, &mode)?;
+        if original.ip != ip {
+            return Err(FsError::Unsupported);
+        }
         let mut primary = Self {
             mode,
             wm_level_disabled: [original.wm_level_disabled; 2],
             current_tile4: false,
             pending: None,
+            ip,
         };
         let [_, tile4] = primary.images(io)?;
         primary.wm_level_disabled[1] = tile4.wm_level_disabled;
@@ -610,7 +631,10 @@ impl Primary {
         let dsc = pipe_a_dsc(io, &self.mode)?;
         let (linear, layout, ip) = Profile::capture_globals(io, &self.mode, dsc)?;
         Profile::check_cdclk(io, &self.mode)?;
-        if read(io, 0x7026c)? & (1 << 19) == 0 {
+        if ip != self.ip {
+            return Err(FsError::Unsupported);
+        }
+        if ip.has_no_dpt_chicken() && read(io, 0x7026c)? & (1 << 19) == 0 {
             return Err(FsError::Unsupported);
         }
         let tile4 =
@@ -752,7 +776,7 @@ pub(crate) fn initialize_dsc(
     wait(io, INFLIGHT, 1 << 26, 0)?;
     // intel_dpt_common.c::intel_dpt_configure, display14 no-DPT profile.
     // Only our primary changes, with every pipe/fetcher proved off above.
-    // Display 20 programs no PLANE_CHICKEN (and owns only linear primaries).
+    // Display 20 programs no PLANE_CHICKEN: its tiled primaries use a DPT.
     if ip == DisplayIp::Xelpdp {
         let chicken = read(io, 0x7026c)?;
         checked(io, 0x7026c, chicken | (1 << 19))?;

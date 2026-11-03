@@ -785,13 +785,16 @@ fn smoke_xe2lpd_owned_modeset_lights_pipe_a_with_display20_resources() -> TestRe
     let profile =
         crate::intel_gpu_display_resources::Profile::capture(&io, &Mode::VESA_1024X768_60).unwrap();
     assert!(profile.primary.levels[0].enable && profile.cursor.levels[0].enable);
-    // A tiled primary is not a display-20 profile (no no-DPT chicken).
+    // A display-20 tiled primary is fetched through the presenter's DPT (no
+    // no-DPT chicken) and proves its tiled watermarks: X takes the linear
+    // arithmetic (display >= 10), so the same programmed image holds.
     let before = io.writes.borrow().len();
     let linear = io.mode.read32(0x70180);
     io.mode.write32(0x70180, linear | 0x400);
-    assert!(
-        crate::intel_gpu_display_resources::Profile::capture(&io, &Mode::VESA_1024X768_60).is_err()
-    );
+    let x_tiled =
+        crate::intel_gpu_display_resources::Profile::capture(&io, &Mode::VESA_1024X768_60).unwrap();
+    assert_eq!(x_tiled.primary, profile.primary);
+    assert_eq!(x_tiled.ip, DisplayIp::Xe2Lpd);
     io.mode.write32(0x70180, linear);
     io.writes.borrow_mut().truncate(before);
     // A diverged throttle no longer proves the layout.

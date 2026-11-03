@@ -39,19 +39,28 @@ fn x_tiled_profile(
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
 ) -> Result<(), FsError> {
-    tiled_profile(io, geometry, timing, crate::intel_gpu_scanout::Layout::X)
+    tiled_profile(io, geometry, timing, crate::intel_gpu_scanout::Layout::X).map(|_| ())
 }
+/// The display IP the KMS owner of `generation` proves its resources on.
+fn resource_ip(generation: Generation) -> crate::intel_gpu_xe2lpd::DisplayIp {
+    if generation == Generation::LunarLake {
+        crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd
+    } else {
+        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp
+    }
+}
+/// The tiled primary's admission; the proved display IP, `None` on Gen12.
 fn tiled_profile(
     io: &impl Platform,
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
     layout: crate::intel_gpu_scanout::Layout,
-) -> Result<(), FsError> {
+) -> Result<Option<crate::intel_gpu_xe2lpd::DisplayIp>, FsError> {
     if !io.console_access_ok() {
         return Err(FsError::NoDevice);
     }
     if let Some(family) = io.gen12_family() {
-        return gen12_primary::view_profile(io, geometry, timing, family, layout);
+        return gen12_primary::view_profile(io, geometry, timing, family, layout).map(|()| None);
     }
     crate::intel_gpu_scanout::View {
         origin: Default::default(),
@@ -60,31 +69,40 @@ fn tiled_profile(
     }
     .footprint(geometry)
     .map_err(scanout_error)?;
-    crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
-    let chicken = io.read32(0x7026c);
-    if chicken == u32::MAX {
-        return Err(FsError::NoDevice);
-    }
-    if chicken & (1 << 19) == 0 {
+    let profile = crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
+    // Display 14 scans the tiled primary out directly behind the owned
+    // PLANE_CHICKEN no-DPT bit. Display 20 has none (intel_dpt_configure):
+    // the presenter fetches it through its own DPT, whose POT-remapped
+    // layout must hold for this geometry.
+    if profile.ip.has_no_dpt_chicken() {
+        let chicken = io.read32(0x7026c);
+        if chicken == u32::MAX {
+            return Err(FsError::NoDevice);
+        }
+        if chicken & (1 << 19) == 0 {
+            return Err(FsError::Unsupported);
+        }
+    } else if crate::intel_gpu_scanout::DptLayout::new(geometry, layout).is_none() {
         return Err(FsError::Unsupported);
     }
     if !io.console_access_ok() {
         return Err(FsError::NoDevice);
     }
-    Ok(())
+    Ok(Some(profile.ip))
 }
 pub(crate) fn tile4_profile(
     io: &impl Platform,
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
 ) -> Result<(), FsError> {
-    tiled_profile(
+    let ip = tiled_profile(
         io,
         geometry,
         timing,
         crate::intel_gpu_scanout::Layout::Tile4,
-    )?;
-    crate::intel_gpu_display_resources::Primary::capture(io, timing)?;
+    )?
+    .ok_or(FsError::Unsupported)?;
+    crate::intel_gpu_display_resources::Primary::capture_ip(io, timing, ip)?;
     Ok(())
 }
 
@@ -594,7 +612,10 @@ impl Physical {
             }
             card.intel_x_tiled = gen12_x;
             card.intel_tile4 = false;
-            if self.generation == Generation::MeteorLake {
+            if matches!(
+                self.generation,
+                Generation::MeteorLake | Generation::LunarLake
+            ) {
                 if let Some(mode) = card.crtcs.first().and_then(|c| c.mode) {
                     if (mode.width, mode.height) != (geometry.width, geometry.height) {
                         return;
@@ -1256,8 +1277,10 @@ pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoc
     let Some(display) = display_for_bar(bar) else {
         return true;
     };
-    if display.generation != Generation::MeteorLake
-        || display.platform.published_epoch() != Some(epoch)
+    if !matches!(
+        display.generation,
+        Generation::MeteorLake | Generation::LunarLake
+    ) || display.platform.published_epoch() != Some(epoch)
     {
         return true;
     }
@@ -3647,14 +3670,15 @@ impl<M: Platform> Guard<'_, M> {
             return Err(FsError::InvalidData);
         }
         if view.layout != crate::intel_gpu_scanout::Layout::Linear {
-            tiled_profile(&self.device.platform, geometry, timing, view.layout)?;
+            let ip = tiled_profile(&self.device.platform, geometry, timing, view.layout)?;
             if view.layout == crate::intel_gpu_scanout::Layout::Tile4
                 && self.state.primary_resources.is_none()
             {
                 // Prove target WM/min-DDB fit before any new GEM mapping.
-                crate::intel_gpu_display_resources::Primary::capture(
+                crate::intel_gpu_display_resources::Primary::capture_ip(
                     &self.device.platform,
                     timing,
+                    ip.ok_or(FsError::Unsupported)?,
                 )?;
             }
         }
@@ -3899,9 +3923,10 @@ impl<M: Platform> Guard<'_, M> {
                         && self.state.primary_resources.is_none()
                     {
                         self.state.primary_resources =
-                            Some(crate::intel_gpu_display_resources::Primary::capture(
+                            Some(crate::intel_gpu_display_resources::Primary::capture_ip(
                                 &self.device.platform,
                                 timing,
+                                resource_ip(self.device.generation),
                             )?);
                     }
                     let id = self.prepare_surface(object.clone(), *geometry, *view)?;

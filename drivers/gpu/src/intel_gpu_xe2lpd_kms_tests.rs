@@ -521,3 +521,137 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe2lpd_kms",
     smoke_xe2lpd_kms_ctm_and_gamma_owned_on_display20
 );
+
+/// The display-20 DPT layout (intel_fb.c, display >= 14 with DPT): the
+/// remapped stride `roundup_pow_of_two(max(width tiles, 8))`, entries for
+/// the visible tiles of each row at `row * dst`, padding unmapped, and a
+/// source stride wider than the DPT stride refused (it would make
+/// `PLANE_STRIDE` the DPT stride).
+fn smoke_xe2lpd_kms_dpt_layout_pot_remap() -> TestResult {
+    use crate::intel_gpu_scanout::{DptLayout, Layout};
+    let g = |width, height, pitch| Geometry {
+        width,
+        height,
+        pitch,
+    };
+    // 1080p Tile4 (128-byte, 32-row tiles) at the packed pitch: 60 source
+    // tiles, DPT stride 64, 34 tile rows.
+    let tile4 = DptLayout::new(g(1920, 1080, 7680), Layout::Tile4).unwrap();
+    assert_eq!(
+        tile4,
+        DptLayout {
+            src: 60,
+            width: 60,
+            dst: 64,
+            rows: 34
+        }
+    );
+    assert_eq!(tile4.bytes(), 20480);
+    assert_eq!(tile4.source(0), Some(0));
+    assert_eq!(tile4.source(59), Some(59));
+    assert_eq!(tile4.source(60), None);
+    assert_eq!(tile4.source(63), None);
+    assert_eq!(tile4.source(64), Some(60));
+    assert_eq!(tile4.source(64 * 33 + 59), Some(33 * 60 + 59));
+    assert_eq!(tile4.source(64 * 34), None);
+    // A power-of-two pitch is its own DPT stride.
+    let pot = DptLayout::new(g(1920, 1080, 8192), Layout::Tile4).unwrap();
+    assert_eq!((pot.src, pot.dst), (64, 64));
+    assert_eq!(pot.source(64), Some(64));
+    // A source stride beyond the DPT stride is refused.
+    assert_eq!(DptLayout::new(g(1920, 1080, 9216), Layout::Tile4), None);
+    // X (512-byte, 8-row tiles): 15 tiles, DPT stride 16, 135 rows.
+    let x = DptLayout::new(g(1920, 1080, 7680), Layout::X).unwrap();
+    assert_eq!((x.src, x.width, x.dst, x.rows), (15, 15, 16, 135));
+    assert_eq!(x.bytes(), 20480);
+    // The minimum DPT stride is 8: the 64x32 fixture has two tiles in one
+    // row.
+    let small = DptLayout::new(geometry(), Layout::Tile4).unwrap();
+    assert_eq!(
+        (small.src, small.width, small.dst, small.rows),
+        (2, 2, 8, 1)
+    );
+    assert_eq!(small.bytes(), 4096);
+    assert_eq!(small.source(1), Some(1));
+    assert_eq!(small.source(2), None);
+    assert_eq!(small.source(8), None);
+    // No DPT for a linear surface or an invalid tiled geometry.
+    assert_eq!(DptLayout::new(geometry(), Layout::Linear), None);
+    assert_eq!(DptLayout::new(g(1920, 1080, 7744), Layout::Tile4), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_xe2lpd_kms_dpt_layout_pot_remap
+);
+
+/// A display-20 Tile4 flip through the production Guard and the joint DSB:
+/// Tile4 is admitted over the display-20 resources without the display-14
+/// no-DPT chicken, and the presenter builds the remapped DPT (64x32 at pitch
+/// 256: source stride 2, DPT stride 8, one row), maps its page at a 2 MiB
+/// aligned GGTT address with Xe2 PAT3 and arms `PLANE_SURF` there with
+/// `PLANE_CTL_TILED_4` and the source stride. The entries are the
+/// framebuffer pages' GGTT PTEs at PAT3; the padding stays zero.
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe2lpd_kms_tile4_flips_through_owned_dpt() -> TestResult {
+    use crate::intel_gpu_scanout::{Layout, View};
+    let platform = MockPlatform::new();
+    let timing = display20_resources(&platform);
+    crate::intel_gpu_kms::tile4_profile(&platform, geometry(), timing).unwrap();
+    let device = lunar(&platform);
+    let fb = object(true).unwrap();
+    let frames: Vec<u64> = fb.pages().collect();
+    assert_eq!(frames.len(), 2);
+    let view = View {
+        layout: Layout::Tile4,
+        ..View::default()
+    };
+    {
+        let mut session = complete(device.session()).unwrap();
+        drive(session.present_color(
+            fb.clone(),
+            geometry(),
+            view,
+            None,
+            Default::default(),
+            timing,
+        ))
+        .unwrap();
+    }
+    assert_eq!(platform.read32(0x70180), 0x8400_1400);
+    assert_eq!(platform.read32(0x70188), 2);
+    let surface = platform.read32(LIVE);
+    assert_eq!(platform.read32(SURF), surface);
+    assert_eq!(surface % (2 << 20), 0);
+    assert!((GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(surface)));
+    let pte = GGTT_ARRAY_BASE + u64::from(surface) / 4096 * 8;
+    let (low, high) = (platform.read32(pte), platform.read32(pte + 4));
+    assert_eq!(low & 1, 1);
+    assert_eq!((high >> 20) & 3, 3);
+    // The one-page table is all that is mapped behind PLANE_SURF.
+    assert_eq!(platform.read32(pte + 8), 0);
+    let table = (u64::from(low) | (u64::from(high) << 32)) & crate::intel_gpu_gtt::PTE_PHYS_MASK;
+    let entry = |index: u64| -> u64 {
+        // SAFETY: the presenter retains this DPT page, mapped by the PTE
+        // just read, for the surface's lifetime.
+        unsafe {
+            narf_memory::PhysAddr::new(table + index * 8)
+                .kernel_ptr::<u64>()
+                .read_volatile()
+        }
+    };
+    for (index, phys) in frames.iter().enumerate() {
+        assert_eq!(entry(index as u64), phys | 1 | (3 << 52), "entry {index}");
+    }
+    for index in 2..512 {
+        assert_eq!(entry(index), 0, "padding {index}");
+    }
+    // Display 20 has no no-DPT chicken to own.
+    assert!(platform.all_writes().iter().all(|&(r, _)| r != 0x7026c));
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_kms",
+    smoke_xe2lpd_kms_tile4_flips_through_owned_dpt
+);

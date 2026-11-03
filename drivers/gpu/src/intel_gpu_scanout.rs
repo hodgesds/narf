@@ -10,6 +10,9 @@
 //! modeset/PM exclusion and transactional event publication. Its PollIo adapter
 //! enables status latching with IRQ delivery masked; this owner never invents
 //! vblank completion or programs timing/geometry.
+//!
+//! Display 20 has no no-DPT chicken, so its X/Tile4 surfaces are fetched
+//! through a display page table this owner builds ([`DptLayout`]).
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -17,7 +20,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_gem::GemObject;
+use crate::intel_gpu_gem::{GemObject, GemState, Placement};
 use crate::intel_gpu_gtt::{
     check_ggtt_range, PteFormat, GEM_SCANOUT_GTT_END, GEM_SCANOUT_GTT_START, GGTT_ARRAY_BASE,
     GTT_PAGE_SIZE,
@@ -332,8 +335,80 @@ pub enum ScanoutError {
     Timeout,
 }
 
+/// `PLANE_SURF` alignment of a display page table in GGTT
+/// (skl_universal_plane.c::tgl_plane_min_alignment: "PLANE_SURF GGTT -> DPT
+/// alignment", 512 x 4 KiB for linear-class X/Tile4 modifiers).
+const DPT_ALIGNMENT: u32 = 512 * 4096;
+
+/// The power-of-two remapped display page table of a display-20 X/Tile4
+/// surface. Display 20 has no `PLANE_CHICKEN` no-DPT bit
+/// (intel_dpt_common.c::intel_dpt_configure programs it on display 14
+/// only), so intel_fb.c::intel_fb_uses_dpt holds for every non-linear
+/// modifier (`HAS_DPT`, `enable_dpt` by default), and display >= 14 remaps
+/// it to a power-of-two stride (`intel_fb_needs_pot_stride_remap`). Tile
+/// row `r` starts at DPT entry `r * dst`, with `dst =
+/// roundup_pow_of_two(max(width tiles, 8))`
+/// (`plane_view_dst_stride_tiles`), and `PLANE_STRIDE` is the source stride
+/// when it is the smaller (`plane_view_scanout_stride`). Only that case is
+/// owned: `dst` is then Linux's for any framebuffer width up to the pitch,
+/// and `PLANE_STRIDE` stays the source stride.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DptLayout {
+    /// Source stride in tiles (`pitch / tile width bytes`).
+    pub(crate) src: u32,
+    /// Visible width in tiles (`plane_view_width_tiles` at origin zero).
+    pub(crate) width: u32,
+    /// Remapped DPT stride in entries.
+    pub(crate) dst: u32,
+    /// Tile rows (`plane_view_height_tiles` at origin zero).
+    pub(crate) rows: u32,
+}
+impl DptLayout {
+    /// The layout of `geometry` in `layout`, or `None` for a linear surface,
+    /// an invalid tiled geometry or a source stride wider than `dst`.
+    pub(crate) fn new(geometry: Geometry, layout: Layout) -> Option<Self> {
+        let view = View {
+            layout,
+            ..View::default()
+        };
+        if layout == Layout::Linear || view.footprint(geometry).is_err() {
+            return None;
+        }
+        // intel_tile_width_bytes / intel_tile_height for plain X and Tile4.
+        let (tile_bytes, tile_rows) = if layout == Layout::X {
+            (512, 8)
+        } else {
+            (128, 32)
+        };
+        let src = geometry.pitch / tile_bytes;
+        let width = geometry.width.div_ceil(tile_bytes / 4);
+        let dst = width.max(8).next_power_of_two();
+        let rows = geometry.height.div_ceil(tile_rows);
+        (src <= dst).then_some(Self {
+            src,
+            width,
+            dst,
+            rows,
+        })
+    }
+    /// The DPT's bytes, page aligned.
+    pub(crate) fn bytes(self) -> u64 {
+        (u64::from(self.dst) * u64::from(self.rows) * 8).next_multiple_of(GTT_PAGE_SIZE)
+    }
+    /// The framebuffer page DPT entry `index` maps, `None` for a padding
+    /// entry (xe_fb_pin.c::write_dpt_remapped leaves them unwritten: "The
+    /// DE ignores the PTEs for the padding tiles").
+    pub(crate) fn source(self, index: u32) -> Option<u32> {
+        let (row, column) = (index / self.dst, index % self.dst);
+        (row < self.rows && column < self.width).then_some(row * self.src + column)
+    }
+}
+
 struct Surface {
     object: Arc<GemObject>,
+    /// The display page table a display-20 tiled surface is fetched through;
+    /// `offset`/`pages` then map the table, not the framebuffer.
+    _dpt: Option<Arc<GemObject>>,
     offset: u32,
     pages: u32,
     geometry: Geometry,
@@ -641,15 +716,19 @@ impl<M: ScanoutIo> Presenter<M> {
         self.gen12_family = Some(family);
         Ok(())
     }
-    fn no_dpt(&self, layout: Layout) -> bool {
+    /// Whether `layout` is scanned out at this owner's surface address:
+    /// directly (linear, or the display-14/Gen12 no-DPT chickens), or on
+    /// display 20 through the DPT [`Self::prepare_dpt`] builds for every
+    /// tiled surface.
+    fn tiling_addressable(&self, layout: Layout) -> bool {
         if layout == Layout::Linear {
             return true;
         }
         // intel_dpt_common.c::intel_dpt_configure sets the PLANE_CHICKEN
-        // no-DPT bit on display 14 only: a display-20 tiled primary needs a
-        // DPT this owner does not build.
+        // no-DPT bit on display 14 only: a display-20 tiled primary is
+        // fetched through its owned DPT.
         if self.format == PteFormat::Xe2 {
-            return false;
+            return true;
         }
         if self.format == PteFormat::Gen12 {
             if layout != Layout::X {
@@ -712,7 +791,7 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Unsupported);
         }
         if view.layout != Layout::Linear
-            && (!self.no_dpt(view.layout)
+            && (!self.tiling_addressable(view.layout)
                 || (self.format == PteFormat::Gen12 && self.gen12_family.is_none()))
         {
             return Err(ScanoutError::Unsupported);
@@ -720,7 +799,125 @@ impl<M: ScanoutIo> Presenter<M> {
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(ScanoutError::Unsupported);
         }
+        if self.format == PteFormat::Xe2 && view.layout != Layout::Linear {
+            return self.prepare_dpt(object, geometry, view);
+        }
         self.prepare_object_view(object, geometry, view)
+    }
+
+    /// Map a display-20 X/Tile4 surface through an owned display page
+    /// table ([`DptLayout`]). Each entry is a GGTT PTE of the framebuffer
+    /// page at this owner's display PAT (xe_fb_pin.c::write_dpt_remapped,
+    /// `idx[XE_CACHE_NONE]`); padding entries stay zero. The table is a WC
+    /// system object (xe_fb_pin.c::__xe_pin_fb_vma_dpt falls back to system
+    /// memory when stolen is not used) whose pages are mapped, at the same
+    /// display PAT, at a [`DPT_ALIGNMENT`]-aligned GGTT address that
+    /// `PLANE_SURF` names (`skl_surf_address` adds `offset >> 9`, zero at the
+    /// origin). Panning is refused: the view's origin must be zero.
+    fn prepare_dpt(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+        view: View,
+    ) -> Result<SurfaceId, ScanoutError> {
+        self.ready()?;
+        if view.origin != Viewport::default() || view.input != InputFormat::Xrgb8888 {
+            return Err(ScanoutError::Unsupported);
+        }
+        let (_, _, extent) = view.footprint(geometry)?;
+        if extent > object.size() {
+            return Err(ScanoutError::Bounds);
+        }
+        let layout = DptLayout::new(geometry, view.layout).ok_or(ScanoutError::Unsupported)?;
+        if !object.idle(false) {
+            return Err(ScanoutError::Busy);
+        }
+        let frames: Vec<u64> = object
+            .pages()
+            .take((extent / GTT_PAGE_SIZE) as usize)
+            .collect();
+        if frames.len() as u64 != extent / GTT_PAGE_SIZE {
+            return Err(ScanoutError::Bounds);
+        }
+        let mut entries = alloc::vec![0u8; layout.bytes() as usize];
+        for index in 0..layout.dst * layout.rows {
+            let Some(page) = layout.source(index) else {
+                continue;
+            };
+            let phys = *frames.get(page as usize).ok_or(ScanoutError::Bounds)?;
+            let pte = crate::intel_gpu_gtt::encode_display_pte(self.format, phys, self.pat)
+                .map_err(|_| ScanoutError::Bounds)?;
+            entries[index as usize * 8..index as usize * 8 + 8].copy_from_slice(&pte.to_le_bytes());
+        }
+        let gem = GemState::new();
+        let handle = gem
+            .create_placed(layout.bytes(), None, Placement::SystemWc, |_, _| Ok(()))
+            .map_err(|_| ScanoutError::Busy)?;
+        let table = gem.object(handle).map_err(|_| ScanoutError::Busy)?;
+        gem.close(handle).map_err(|_| ScanoutError::Busy)?;
+        table
+            .write(0, &entries)
+            .map_err(|_| ScanoutError::Unavailable)?;
+        let pages = (layout.bytes() / GTT_PAGE_SIZE) as u32;
+        let ptes: Vec<u64> = table
+            .pages()
+            .take(pages as usize)
+            .map(|phys| crate::intel_gpu_gtt::encode_display_pte(self.format, phys, self.pat))
+            .collect::<Result<_, _>>()
+            .map_err(|_| ScanoutError::Bounds)?;
+        if ptes.len() != pages as usize {
+            return Err(ScanoutError::Bounds);
+        }
+        let (slot, offset, prefix) = self
+            .free
+            .iter()
+            .enumerate()
+            .find_map(|(slot, &(start, n))| {
+                let aligned = start.next_multiple_of(DPT_ALIGNMENT);
+                let prefix = (aligned - start) / 4096;
+                (n >= pages + prefix).then_some((slot, aligned, prefix))
+            })
+            .ok_or(ScanoutError::Busy)?;
+        if !object.publish_for_device() || !table.publish_for_device() {
+            return Err(ScanoutError::Unavailable);
+        }
+        let id = SurfaceId(self.next_id);
+        let next = self.next_id.checked_add(1).ok_or(ScanoutError::Busy)?;
+        let (start, available) = self.free.remove(slot);
+        if prefix != 0 {
+            self.free.push((start, prefix));
+        }
+        if available > pages + prefix {
+            self.free
+                .push((offset + pages * 4096, available - pages - prefix));
+        }
+        self.free.sort_unstable_by_key(|&(base, _)| base);
+        self.next_id = next;
+        // Ownership of the framebuffer and its table precedes the first
+        // hardware-visible write, including on readback failure.
+        self.surfaces.insert(
+            id,
+            Surface {
+                object,
+                _dpt: Some(table),
+                offset,
+                pages,
+                geometry,
+                view,
+            },
+        );
+        for (i, &pte) in ptes.iter().enumerate() {
+            self.write_pte(offset + i as u32 * 4096, pte);
+        }
+        let installed = ptes.iter().enumerate().all(|(i, &pte)| {
+            let reg = GGTT_ARRAY_BASE + (u64::from(offset / 4096) + i as u64) * 8;
+            self.io().read32(reg) == pte as u32 && self.io().read32(reg + 4) == (pte >> 32) as u32
+        });
+        if !installed || !self.post_ptes(offset + (pages - 1) * 4096) {
+            self.failed = true;
+            return Err(ScanoutError::Unavailable);
+        }
+        Ok(id)
     }
 
     pub(crate) fn linear_surface(&self, id: SurfaceId) -> bool {
@@ -811,6 +1008,7 @@ impl<M: ScanoutIo> Presenter<M> {
             id,
             Surface {
                 object,
+                _dpt: None,
                 offset,
                 pages,
                 geometry,
@@ -854,7 +1052,7 @@ impl<M: ScanoutIo> Presenter<M> {
             && ctl & (PLANE_CTL_ENABLE | CTL_FORMAT_MASK | CTL_TILED_MASK | CTL_RGB_ORDER)
                 == PLANE_CTL_ENABLE | view.input.control() | view.tiled()
             && ctl == self.control(view)
-            && self.no_dpt(view.layout)
+            && self.tiling_addressable(view.layout)
             && self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) == stride
             && self.io().read32(self.plane() + PLANE_SIZE_OFFSET)
                 == ((geometry.height - 1) << 16) | (geometry.width - 1)
