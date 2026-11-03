@@ -4,7 +4,7 @@
 //! and copies, never invent hardware key IDs, PNs or firmware generations.
 use super::{
     ap_key::{History, Installed},
-    ap_native::{self, Phase, Saved},
+    ap_native::{self, Phase, Saved, Scope},
     ap_peer::Peer,
     ap_plan::Plan,
     ap_scope::{Capture, Epoch, Policy, Use},
@@ -46,6 +46,8 @@ pub(crate) struct Mode {
 }
 pub(crate) struct Session {
     pub(super) plan: Plan,
+    /// Interface this AP programs: the primary, or a secondary bsscfg.
+    pub(super) scope: Scope,
     pub(super) base: Capture,
     pub(super) power: u8,
     pub(super) saved: Option<Saved>,
@@ -78,8 +80,53 @@ impl Session {
         mode: Mode,
         history: Arc<narf_lib::sync::IrqSafeSpinLock<History>>,
     ) -> Result<Self, Error> {
-        if !R::PRIMARY_AP
-            || mode.value == 0
+        if !R::PRIMARY_AP {
+            return Err(Error::Authority);
+        }
+        Self::prepare_in(
+            station,
+            config,
+            settings,
+            source,
+            policy,
+            mode,
+            history,
+            Scope::Primary,
+        )
+    }
+    /// A firmware-SME AP on a secondary bsscfg (`station` is bound to a
+    /// `vif_bsscfg::Bsscfg`), with the Linux `start_ap` rules of `scope`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_secondary<R: Fullmac>(
+        station: &Station<R>,
+        config: ApConfig,
+        settings: ApStartSettings,
+        source: ApEmissionAuthority,
+        policy: Policy,
+        mode: Mode,
+        history: Arc<narf_lib::sync::IrqSafeSpinLock<History>>,
+        scope: Scope,
+    ) -> Result<Self, Error> {
+        if scope == Scope::Primary {
+            return Err(Error::Authority);
+        }
+        Self::prepare_in(
+            station, config, settings, source, policy, mode, history, scope,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_in<R: Fullmac>(
+        station: &Station<R>,
+        config: ApConfig,
+        settings: ApStartSettings,
+        source: ApEmissionAuthority,
+        policy: Policy,
+        mode: Mode,
+        history: Arc<narf_lib::sync::IrqSafeSpinLock<History>>,
+        scope: Scope,
+    ) -> Result<Self, Error> {
+        scope.admits::<R>()?;
+        if mode.value == 0
             || mode.value == u64::MAX
             || mode.generation.load(Ordering::Acquire) != mode.value
             || !source.current()
@@ -114,6 +161,7 @@ impl Session {
         base.current().map_err(|_| Error::Authority)?;
         Ok(Self {
             plan,
+            scope,
             base,
             power: channel.power_dbm,
             saved: None,
@@ -161,7 +209,7 @@ impl Session {
             }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
-        self.saved = Some(Saved::read(&mut station.runtime, &self.base).await?);
+        self.saved = Some(Saved::read(&mut station.runtime, &self.base, self.scope).await?);
         station.runtime.ap_enter(self.base.clone())?;
         self.native_entered = true;
         let mfp = station.supports_management_protection();

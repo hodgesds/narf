@@ -160,6 +160,15 @@ impl Owner {
         })?;
         self.events.remove(position).map(|(_, event)| event)
     }
+    /// Retained (not yet popped) events of the live entry `entry`.
+    pub fn events_for<'a>(&'a self, entry: &'a Entry) -> impl Iterator<Item = &'a Event> + 'a {
+        self.events
+            .iter()
+            .filter(move |(generation, event)| {
+                *generation == entry.generation && event.header.bsscfg_idx == entry.bsscfgidx
+            })
+            .map(|(_, event)| event)
+    }
     fn live(&self) -> bool {
         self.roles.iter().any(Option::is_some)
     }

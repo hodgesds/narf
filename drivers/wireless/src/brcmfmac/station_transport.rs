@@ -48,6 +48,9 @@ pub struct Adapter<B: Bus> {
     /// A reset bus whose last download was refused, kept for a retry.
     parked: Option<B>,
     ap: Option<alloc::boxed::Box<super::ap_tx::Owner>>,
+    /// Secondary-ifidx AP owners (`brcmf_cfg80211_start_ap` on
+    /// `ifp->ifidx`): each owns only its own (ifidx, fifo, da) flows.
+    vif_ap: Vec<(u8, super::ap_tx::Owner)>,
     /// Secondary-interface events and data admission (ifidx != 0).
     vif: super::vif_demux::Demux,
     /// Secondary ifidx whose flows are being deleted (bit per ifidx).
@@ -82,6 +85,7 @@ where
             reboot: None,
             parked: None,
             ap: None,
+            vif_ap: Vec::new(),
             vif: super::vif_demux::Demux::new(),
             vif_closing: 0,
         })
@@ -224,6 +228,7 @@ where
         if self.failed
             || self.closing
             || self.ap.is_some()
+            || !self.vif_ap.is_empty()
             || self.peer.is_some()
             || !self.flows.is_empty()
             || !self.tx.is_empty()
@@ -405,34 +410,7 @@ where
             return Err(Error::Unsupported);
         }
         self.progress()?;
-        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
-        let mut pending = false;
-        for flow in self
-            .flows
-            .iter()
-            .filter(|flow| flow.ifidx == 0 && flow.destination == peer)
-        {
-            match inner.flow_state(flow.token).map_err(map)? {
-                FlowState::Open => {
-                    pending = true;
-                    match inner.close_flow(flow.token) {
-                        Ok(()) | Err(runtime::Error::Busy) => {}
-                        Err(error) => return Err(map(error)),
-                    }
-                }
-                FlowState::Creating | FlowState::Deleting => pending = true,
-                FlowState::Closed => {}
-            }
-        }
-        // The retained flow cache removes Closed only after its correlated
-        // native completion. Refused DELETE now fail-stops rather than
-        // granting a false success/reuse fence (independent baseline repair).
-        Ok(!pending
-            && !self
-                .flows
-                .iter()
-                .any(|flow| flow.ifidx == 0 && flow.destination == peer)
-            && inner.ap_completed_idle().map_err(map)?)
+        self.retire_peer_flows(0, peer)
     }
     async fn command_ap<'a>(
         &'a mut self,
@@ -596,6 +574,7 @@ where
         self.tx.clear();
         self.events.clear();
         self.vif.clear();
+        self.vif_ap.clear();
         self.vif_closing = 0;
         self.failed = true;
         let inner = self.inner.as_mut().ok_or(Error::Failed)?;
@@ -681,6 +660,7 @@ where
             reboot: self.reboot.take(),
             parked: None,
             ap: None,
+            vif_ap: Vec::new(),
             vif: super::vif_demux::Demux::new(),
             vif_closing: 0,
         })
@@ -709,6 +689,7 @@ where
         self.failed = true;
         self.peer = None;
         self.vif.clear();
+        self.vif_ap.clear();
         if let Some(inner) = self.inner.as_mut() {
             inner.fail();
         }
@@ -729,6 +710,226 @@ where
         self.begin_data(0, frame, priority, None).map(|_| ())
     }
     const VIF_DEMUX: bool = true;
+    const SECONDARY_AP: bool = true;
+    fn ap_enter_on(&mut self, ifidx: u8, original: super::ap_scope::Capture) -> Result<(), Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.monitor_reserved())
+        {
+            return Err(Error::Busy);
+        }
+        if !original.lifecycle() || !self.vif.is_open(ifidx) {
+            return Err(Error::Authority);
+        }
+        // Linux keys msgbuf flows by (ifidx, fifo, da): this AP needs only
+        // its own interface free of flows, TX and unconsumed records.
+        if self.failed
+            || self.vif_ap_owner(ifidx).is_some()
+            || self.vif_closing & (1 << ifidx) != 0
+            || self.vif.has_events_for(ifidx)
+            || self.tx.iter().any(|tx| tx.ifidx == ifidx)
+            || self.flows.iter().any(|flow| flow.ifidx == ifidx)
+        {
+            return Err(Error::Busy);
+        }
+        let inner = self.inner.as_ref().ok_or(Error::Failed)?;
+        if !inner.ap_owns(&original.native) {
+            return Err(Error::Authority);
+        }
+        original.current().map_err(|_| Error::Authority)?;
+        self.vif_ap.push((ifidx, super::ap_tx::Owner { original }));
+        Ok(())
+    }
+    fn ap_send_on(
+        &mut self,
+        ifidx: u8,
+        bytes: &[u8],
+        priority: u8,
+        original: &super::ap_scope::Capture,
+    ) -> Result<super::ap_tx::Ticket, Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if !original.transmit(bytes) {
+            return Err(Error::Authority);
+        }
+        if self.failed || self.vif_closing & (1 << ifidx) != 0 {
+            return Err(Error::Failed);
+        }
+        self.vif_ap_owner(ifidx)
+            .ok_or(Error::Unsupported)?
+            .admits(original)?;
+        if !self
+            .inner
+            .as_ref()
+            .ok_or(Error::Failed)?
+            .ap_owns(&original.native)
+        {
+            return Err(Error::Authority);
+        }
+        // As `ap_send`: an unconsumed record of this interface must reach
+        // its AP owner before any flow/TX publication.
+        let mut idle = false;
+        for _ in 0..4 {
+            if self.vif.has_events_for(ifidx) {
+                return Err(Error::Busy);
+            }
+            let progress = self.progress()?;
+            if self.vif.has_events_for(ifidx) {
+                return Err(Error::Busy);
+            }
+            if progress == 0
+                && self
+                    .inner
+                    .as_mut()
+                    .ok_or(Error::Failed)?
+                    .ap_completed_idle()
+                    .map_err(map)?
+            {
+                idle = true;
+                break;
+            }
+        }
+        if !idle {
+            return Err(Error::Busy);
+        }
+        self.vif_ap_owner(ifidx)
+            .ok_or(Error::Failed)?
+            .admits(original)?;
+        let id = self.begin_data(ifidx, bytes, priority, Some(original))?;
+        let (ticket, terminal) = super::ap_tx::Ticket::new(id, original.clone());
+        self.tx
+            .iter_mut()
+            .find(|tx| tx.id == id)
+            .ok_or(Error::Failed)?
+            .ap_terminal = Some(terminal);
+        Ok(ticket)
+    }
+    /// Retire only this interface's flows (`vif_closing`) and TX.
+    fn ap_leave_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if self.vif_ap_owner(ifidx).is_none() {
+            return Ok(true);
+        }
+        if self.flows.iter().any(|flow| flow.ifidx == ifidx) {
+            self.vif_closing |= 1 << ifidx;
+        }
+        self.progress()?;
+        if self.vif_closing & (1 << ifidx) != 0
+            || self.tx.iter().any(|tx| tx.ifidx == ifidx)
+            || self.flows.iter().any(|flow| flow.ifidx == ifidx)
+        {
+            return Ok(false);
+        }
+        self.vif_ap.retain(|(index, _)| *index != ifidx);
+        Ok(true)
+    }
+    fn ap_completed_prefix_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if self.vif.has_events_for(ifidx) {
+            return Ok(false);
+        }
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .ap_completed_idle()
+            .map_err(map)
+    }
+    fn ap_quiet_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if self.vif_ap_owner(ifidx).is_none() {
+            return Err(Error::Unsupported);
+        }
+        self.progress()?;
+        if self.vif.has_events_for(ifidx) {
+            return Ok(false);
+        }
+        Ok(!self.tx.iter().any(|tx| tx.ifidx == ifidx)
+            && self
+                .inner
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .ap_completed_idle()
+                .map_err(map)?)
+    }
+    fn ap_retire_peer_on(&mut self, ifidx: u8, peer: [u8; 6]) -> Result<bool, Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if self.vif_ap_owner(ifidx).is_none() || !super::ap_wire::unicast(peer) {
+            return Err(Error::Unsupported);
+        }
+        self.progress()?;
+        self.retire_peer_flows(ifidx, peer)
+    }
+    async fn command_ap_on<'a>(
+        &'a mut self,
+        ifidx: u8,
+        original: &'a super::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let ifidx = crate::cyw43439::fullmac::secondary(ifidx)?;
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        if !self.vif.is_open(ifidx) {
+            return Err(Error::Authority);
+        }
+        if direction == Direction::Set {
+            let mut idle = false;
+            for _ in 0..4 {
+                let progress = self.progress()?;
+                if self
+                    .vif
+                    .events()
+                    .filter(|event| event.header.if_idx == ifidx)
+                    .any(|event| original.program_event_blocks(&event.header))
+                {
+                    return Err(Error::Busy);
+                }
+                if progress == 0
+                    && self
+                        .inner
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .ap_completed_idle()
+                        .map_err(map)?
+                {
+                    idle = true;
+                    break;
+                }
+            }
+            if !idle {
+                return Err(Error::Busy);
+            }
+        }
+        let extent = if direction == Direction::Set {
+            input.len()
+        } else {
+            maximum
+        };
+        let mut response = self
+            .inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .command_ap_on(
+                ifidx,
+                command,
+                input,
+                extent,
+                original,
+                direction == Direction::Set,
+            )
+            .await
+            .map_err(map)?;
+        if direction == Direction::Set {
+            response.clear();
+        } else {
+            response.truncate(maximum);
+        }
+        Ok(response)
+    }
     fn vif_listen(&mut self, on: bool) {
         self.vif.listen(on);
     }
@@ -755,6 +956,10 @@ where
         if ifidx == 0 || ifidx >= super::vif_wire::MAX_IFS {
             return Err(Error::Malformed);
         }
+        // Its AP owner retires the ifidx's flows/TX first (`ap_leave_on`).
+        if self.vif_ap_owner(ifidx).is_some() {
+            return Err(Error::Busy);
+        }
         self.vif.close(ifidx);
         if self.failed {
             return Err(Error::Failed);
@@ -780,6 +985,10 @@ where
     fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
         if self.failed || !self.vif.is_open(ifidx) {
             return Err(Error::Failed);
+        }
+        // A secondary AP owns its ifidx's data (`ap_send_on` only).
+        if self.vif_ap_owner(ifidx).is_some() {
+            return Err(Error::Authority);
         }
         self.begin_data(ifidx, frame, priority, None).map(|_| ())
     }
@@ -839,6 +1048,44 @@ impl<B: Bus + Send> Adapter<B>
 where
     B::Memory: Send,
 {
+    fn vif_ap_owner(&self, ifidx: u8) -> Option<&super::ap_tx::Owner> {
+        self.vif_ap
+            .iter()
+            .find(|(index, _)| *index == ifidx)
+            .map(|(_, owner)| owner)
+    }
+    /// Close `ifidx`'s flows toward `peer`; true once none remains and the
+    /// control path is idle.
+    fn retire_peer_flows(&mut self, ifidx: u8, peer: [u8; 6]) -> Result<bool, Error> {
+        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
+        let mut pending = false;
+        for flow in self
+            .flows
+            .iter()
+            .filter(|flow| flow.ifidx == ifidx && flow.destination == peer)
+        {
+            match inner.flow_state(flow.token).map_err(map)? {
+                FlowState::Open => {
+                    pending = true;
+                    match inner.close_flow(flow.token) {
+                        Ok(()) | Err(runtime::Error::Busy) => {}
+                        Err(error) => return Err(map(error)),
+                    }
+                }
+                FlowState::Creating | FlowState::Deleting => pending = true,
+                FlowState::Closed => {}
+            }
+        }
+        // The retained flow cache removes Closed only after its correlated
+        // native completion. Refused DELETE now fail-stops rather than
+        // granting a false success/reuse fence (independent baseline repair).
+        Ok(!pending
+            && !self
+                .flows
+                .iter()
+                .any(|flow| flow.ifidx == ifidx && flow.destination == peer)
+            && inner.ap_completed_idle().map_err(map)?)
+    }
     fn begin_data(
         &mut self,
         ifidx: u8,

@@ -56,6 +56,8 @@ pub struct Runtime<T: PacketTransport> {
     stopped: bool,
     ap_live: Arc<AtomicBool>,
     ap: Option<alloc::boxed::Box<ap::Owner>>,
+    /// Secondary-ifidx firmware-SME AP owners (one per open ifidx).
+    vif_ap: Vec<ap::Owner>,
     tx_sequence: u8,
     tx_max: u8,
     flow_control: u8,
@@ -103,6 +105,7 @@ impl<T: PacketTransport> Runtime<T> {
             stopped: false,
             ap_live: Arc::new(AtomicBool::new(true)),
             ap: None,
+            vif_ap: Vec::new(),
             tx_sequence: 0,
             tx_max: 0,
             flow_control: 0,
@@ -138,6 +141,7 @@ impl<T: PacketTransport> Runtime<T> {
         self.ap_live.store(false, Ordering::Release);
         self.failed = true;
         self.vif.clear();
+        self.vif_ap.clear();
     }
     pub(crate) fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
         if self.failed || self.stopped {
@@ -478,11 +482,20 @@ impl<T: PacketTransport> Runtime<T> {
         loop {
             if direction == ioctl::Direction::Set
                 && original.is_some_and(|original| {
-                    transaction
-                        .runtime
-                        .events
-                        .iter()
-                        .any(|event| original.program_event_blocks(&event.header))
+                    if if_idx == 0 {
+                        transaction
+                            .runtime
+                            .events
+                            .iter()
+                            .any(|event| original.program_event_blocks(&event.header))
+                    } else {
+                        transaction
+                            .runtime
+                            .vif
+                            .events()
+                            .filter(|event| event.header.if_idx == if_idx)
+                            .any(|event| original.program_event_blocks(&event.header))
+                    }
                 })
             {
                 // Do not program past a consumed native denial/replacement.
@@ -549,7 +562,9 @@ impl<T: PacketTransport> Runtime<T> {
     /// packet by ifidx (`brcmf_proto_bcdc_hdrpush`), so a secondary
     /// interface keeps its own data beside it (Linux combo0).
     pub fn send_data_on(&mut self, if_idx: u8, ethernet: &[u8], priority: u8) -> Result<(), Error> {
-        if if_idx == 0 || !self.vif.is_open(if_idx) {
+        // A secondary AP owns its ifidx's data (`ap_send_if` only), as the
+        // primary AP owns interface 0's.
+        if if_idx == 0 || !self.vif.is_open(if_idx) || self.ap_owns_if(if_idx) {
             return Err(Error::Authority);
         }
         self.send_data_inner(if_idx, ethernet, priority, None)
@@ -565,6 +580,10 @@ impl<T: PacketTransport> Runtime<T> {
     }
     /// BCDC holds no per-interface native resource; closing is immediate.
     pub fn vif_close(&mut self, if_idx: u8) -> bool {
+        // An AP owner of this ifidx keeps it until its own stop retires it.
+        if self.ap_owns_if(if_idx) {
+            return false;
+        }
         self.vif.close(if_idx);
         true
     }

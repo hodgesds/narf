@@ -13,7 +13,25 @@ impl<B: Bus> Runtime<B> {
         original: &Capture,
         write: bool,
     ) -> Result<Vec<u8>, Error> {
-        let ticket = self.begin_ioctl_ap(command, input, maximum, original, write)?;
+        self.command_ap_on(0, command, input, maximum, original, write)
+            .await
+    }
+    /// AP Program IOCTL on firmware interface `ifidx` (`msg.ifidx`, as
+    /// `brcmf_msgbuf_query_dcmd` passes `ifp->ifidx`). The completion is
+    /// correlated by transaction id only.
+    pub(crate) async fn command_ap_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: usize,
+        original: &Capture,
+        write: bool,
+    ) -> Result<Vec<u8>, Error> {
+        if ifidx >= super::super::vif_wire::MAX_IFS {
+            return Err(Error::Bounds);
+        }
+        let ticket = self.begin_ioctl_ap(ifidx, command, input, maximum, original, write)?;
         let mut transaction = Transaction {
             runtime: self,
             retired: false,
@@ -33,6 +51,7 @@ impl<B: Bus> Runtime<B> {
     }
     fn begin_ioctl_ap(
         &mut self,
+        ifidx: u8,
         command: u32,
         input: &[u8],
         maximum: usize,
@@ -102,7 +121,7 @@ impl<B: Bus> Runtime<B> {
         let request = IoctlReq {
             hdr: CommonHdr {
                 msgtype: 9,
-                ifidx: 0,
+                ifidx,
                 flags: 0,
                 request_id: 0xfffe,
             },

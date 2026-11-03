@@ -143,6 +143,16 @@ impl Demux {
         let position = self.data.iter().position(|(index, _)| *index == ifidx)?;
         self.data.remove(position).map(|(_, frame)| frame)
     }
+    /// Queued (not yet consumed) secondary events.
+    pub fn events(&self) -> impl Iterator<Item = &Event> {
+        self.events.iter()
+    }
+    pub fn has_events_for(&self, ifidx: u8) -> bool {
+        self.events.iter().any(|event| event.header.if_idx == ifidx)
+    }
+    pub fn has_data_for(&self, ifidx: u8) -> bool {
+        self.data.iter().any(|(index, _)| *index == ifidx)
+    }
     pub fn has_data(&self) -> bool {
         !self.data.is_empty()
     }

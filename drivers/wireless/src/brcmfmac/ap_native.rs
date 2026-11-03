@@ -146,6 +146,50 @@ const SAVED: [&str; 9] = [
     "arp_ol",
     "ndoe",
 ];
+/// Which interface an AP Program addresses (Linux 7.3-rc4
+/// `cfg80211.c::brcmf_cfg80211_start_ap` / `brcmf_cfg80211_stop_ap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Interface 0: the established device-wide primary Program.
+    Primary,
+    /// A secondary bsscfg on its own ifidx (`vif_bsscfg::Bsscfg`). Linux
+    /// `start_ap` never writes `event_msgs`, `nmode`, `vhtmode` or
+    /// `qtxpower`, so this scope leaves the primary's device-wide event
+    /// mask (it only adds the AP SME bits) and PHY modes untouched.
+    Secondary {
+        /// `BRCMF_C_DOWN` + `apsta 0` before `SET_INFRA`: Linux issues
+        /// them for an AP vif only when `ifp->ifidx == 0` or the firmware
+        /// has neither `BRCMF_FEAT_RSDB` nor `BRCMF_FEAT_MCHAN`.
+        down_apsta: bool,
+        /// `BRCMF_FEAT_MBSS`: `mbss 1` before `SET_AP` (first AP, Linux
+        /// `!vif->mbss`) and `mbss 0` on stop.
+        mbss: bool,
+    },
+}
+impl Scope {
+    /// Linux `brcmf_cfg80211_start_ap` rules for a secondary AP vif that
+    /// is the first AP (`vif->mbss` false). RSDB is not parsed by NARF
+    /// (`rsdb_mode`); it is treated as absent.
+    pub(crate) fn secondary(features: super::vif_wire::Features) -> Self {
+        Self::Secondary {
+            down_apsta: !features.mchan,
+            mbss: features.mbss,
+        }
+    }
+    fn primary(self) -> bool {
+        self == Self::Primary
+    }
+    /// A scope is only valid on its own kind of runtime: the primary
+    /// Program never runs through a bsscfg view, nor a secondary on ifidx 0.
+    pub(crate) fn admits<R: Fullmac>(self) -> Result<(), Error> {
+        if self.primary() == R::BSSCFG || !self.primary() && !R::SECONDARY_AP {
+            return Err(Error::Authority);
+        }
+        Ok(())
+    }
+}
+/// AP SME events (association/removal plus radio/firmware loss).
+const AP_EVENTS: [usize; 11] = [0, 5, 6, 8, 10, 11, 12, 16, 17, 23, 63];
 #[derive(Clone, Copy)]
 enum Variable {
     Known(u32),
@@ -155,6 +199,7 @@ enum Variable {
     DisabledWriteOnly,
 }
 pub(super) struct Saved {
+    scope: Scope,
     vars: [Variable; 9],
     beacon: u32,
     dtim: u32,
@@ -164,7 +209,9 @@ impl Saved {
     pub(super) async fn read<R: Fullmac>(
         runtime: &mut R,
         original: &Capture,
+        scope: Scope,
     ) -> Result<Self, Error> {
+        scope.admits::<R>()?;
         let guard = Guard::Program(original);
         if get(runtime, &guard, ap_wire::GET_AP).await? != 0 || get(runtime, &guard, 19).await? != 1
         {
@@ -185,6 +232,7 @@ impl Saved {
             .try_into()
             .map_err(|_| Error::Malformed)?;
         Ok(Self {
+            scope,
             vars,
             beacon: get(runtime, &guard, ap_wire::GET_BEACON).await?,
             dtim: get(runtime, &guard, ap_wire::GET_DTIM).await?,
@@ -254,7 +302,11 @@ impl Saved {
         for name in ["auth", "wsec", "wpa_auth", "sup_wpa"] {
             set_int(runtime, &guard, name, 0).await?;
         }
-        for (name, value) in SAVED.iter().zip(self.vars) {
+        for (index, (name, value)) in SAVED.iter().zip(self.vars).enumerate() {
+            // A secondary never wrote the device-wide PHY modes.
+            if index < 2 && !self.scope.primary() {
+                continue;
+            }
             match value {
                 Variable::Known(value) => set_int(runtime, &guard, name, value).await?,
                 Variable::ReadOnlyZero => {
@@ -283,7 +335,16 @@ impl Saved {
         }
         set(runtime, &guard, ap_wire::SET_BEACON, self.beacon).await?;
         set(runtime, &guard, ap_wire::SET_DTIM, self.dtim).await?;
-        set_var(runtime, &guard, "event_msgs", &self.events).await?;
+        match self.scope {
+            Scope::Primary => set_var(runtime, &guard, "event_msgs", &self.events).await?,
+            // brcmf_cfg80211_stop_ap: `mbss 0` with BRCMF_FEAT_MBSS. The
+            // shared event mask stays (Linux keeps every handled event).
+            Scope::Secondary { mbss, .. } => {
+                if mbss {
+                    set_var(runtime, &guard, "mbss", &0u32.to_le_bytes()).await?;
+                }
+            }
+        }
         set(runtime, &guard, ap_wire::UP, 1).await?;
         Ok(())
     }
@@ -323,14 +384,15 @@ pub(super) async fn verify<R: Fullmac>(
     runtime: &mut R,
     original: &Capture,
     plan: &Plan,
+    scope: Scope,
 ) -> Result<(), Error> {
     let guard = Guard::Program(original);
     if get(runtime, &guard, ap_wire::GET_AP).await? != 1
         || get(runtime, &guard, ap_wire::GET_BEACON).await? != plan.config.beacon_interval
         || get(runtime, &guard, ap_wire::GET_DTIM).await? != plan.config.dtim_period
         || get_int(runtime, &guard, "chanspec").await? != u32::from(plan.chanspec)
-        || get_int(runtime, &guard, "nmode").await? != 0
-        || get_int(runtime, &guard, "vhtmode").await? != 0
+        || scope.primary() && get_int(runtime, &guard, "nmode").await? != 0
+        || scope.primary() && get_int(runtime, &guard, "vhtmode").await? != 0
         || get_int(runtime, &guard, "wme_bss_disable").await? != 1
         || get_int(runtime, &guard, "ap_isolate").await? != 1
     {
@@ -395,6 +457,8 @@ pub(super) async fn program<R: Fullmac>(
     saved: &mut Saved,
     phase: &mut Phase,
 ) -> Result<(), Error> {
+    let scope = saved.scope;
+    scope.admits::<R>()?;
     let guard = Guard::Program(original);
     *phase = Phase::Changing;
     set_int(runtime, &guard, "mpc", 0).await?;
@@ -407,14 +471,27 @@ pub(super) async fn program<R: Fullmac>(
     )
     .await?;
     set(runtime, &guard, ap_wire::SET_DTIM, plan.config.dtim_period).await?;
-    set(runtime, &guard, ap_wire::DOWN, 1).await?;
-    set_int(runtime, &guard, "apsta", 0).await?;
-    set_int(runtime, &guard, "nmode", 0).await?;
-    set_int(runtime, &guard, "vhtmode", 0).await?;
+    let (down_apsta, mbss) = match scope {
+        Scope::Primary => (true, false),
+        Scope::Secondary { down_apsta, mbss } => (down_apsta, mbss),
+    };
+    if down_apsta {
+        set(runtime, &guard, ap_wire::DOWN, 1).await?;
+        set_int(runtime, &guard, "apsta", 0).await?;
+    }
+    if scope.primary() {
+        set_int(runtime, &guard, "nmode", 0).await?;
+        set_int(runtime, &guard, "vhtmode", 0).await?;
+    }
     set(runtime, &guard, ap_wire::INFRA, 1).await?;
+    if mbss {
+        set_int(runtime, &guard, "mbss", 1).await?;
+    }
     set(runtime, &guard, ap_wire::SET_AP, 1).await?;
     set_int(runtime, &guard, "chanspec", u32::from(plan.chanspec)).await?;
-    set_int(runtime, &guard, "qtxpower", u32::from(power_dbm) * 4).await?;
+    if scope.primary() {
+        set_int(runtime, &guard, "qtxpower", u32::from(power_dbm) * 4).await?;
+    }
     set_int(runtime, &guard, "ap_isolate", 1).await?;
     set_int(runtime, &guard, "wme_bss_disable", 1).await?;
     set(runtime, &guard, ap_wire::UP, 1).await?;
@@ -434,10 +511,18 @@ pub(super) async fn program<R: Fullmac>(
         u32::from(plan.config.hidden_ssid == 1),
     )
     .await?;
-    let mut mask = [0; 16];
     // Actual AP SME association/removal plus radio/firmware loss. No P2P
     // or extra-bsscfg namespace is created by enabling these observations.
-    for event in [0usize, 5, 6, 8, 10, 11, 12, 16, 17, 23, 63] {
+    // A secondary only adds these bits to the shared mask the primary owns.
+    let mut mask: [u8; 16] = if scope.primary() {
+        [0; 16]
+    } else {
+        get_var(runtime, &guard, "event_msgs", &[], 16)
+            .await?
+            .try_into()
+            .map_err(|_| Error::Malformed)?
+    };
+    for event in AP_EVENTS {
         mask[event / 8] |= 1 << (event % 8);
     }
     set_var(runtime, &guard, "event_msgs", &mask).await?;
@@ -455,7 +540,7 @@ pub(super) async fn program<R: Fullmac>(
     // successful public result still requires all template transactions.
     vendor(runtime, &guard, &[], &plan.beacon_vendor, 1).await?;
     vendor(runtime, &guard, &[], &plan.probe_vendor, 2).await?;
-    verify(runtime, original, plan).await?;
+    verify(runtime, original, plan, scope).await?;
     saved.check_disabled(runtime, &guard).await?;
     *phase = Phase::Formed;
     Ok(())

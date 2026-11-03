@@ -111,6 +111,53 @@ pub trait Fullmac: Send {
         input: &'a [u8],
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a;
+    /// Per-ifidx AP transport owners: one firmware-SME AP per firmware
+    /// interface (Linux `brcmf_cfg80211_start_ap` addresses every dcmd to
+    /// `ifp->ifidx`). Interface 0 is the primary methods above; a
+    /// secondary ifidx is owned only through `vif_bsscfg::Bsscfg`, whose
+    /// interface its owner opened. Primary ownership is unchanged by it.
+    const SECONDARY_AP: bool = false;
+    fn ap_enter_on(
+        &mut self,
+        _ifidx: u8,
+        _original: crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_send_on(
+        &mut self,
+        _ifidx: u8,
+        _bytes: &[u8],
+        _priority: u8,
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_leave_on(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_completed_prefix_on(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_quiet_on(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_retire_peer_on(&mut self, _ifidx: u8, _peer: [u8; 6]) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    /// [`Self::command_ap`] addressed to secondary firmware interface
+    /// `ifidx`; `blocked` is the caller's retained per-bsscfg record check.
+    fn command_ap_on<'a>(
+        &'a mut self,
+        _ifidx: u8,
+        _original: &'a crate::brcmfmac::ap_scope::Capture,
+        _direction: Direction,
+        _command: u32,
+        _input: &'a [u8],
+        _maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        core::future::ready(Err(Error::Unsupported))
+    }
     /// Original fixed AP Program scope reaches actual native publication.
     /// Unsupported backends deny by default. Stop/source-only cleanup uses
     /// ordinary command and never obtains new AP Program authority.
@@ -347,6 +394,55 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
         Runtime::send_data_on(self, ifidx, frame, priority)
     }
+    const SECONDARY_AP: bool = true;
+    fn ap_enter_on(
+        &mut self,
+        ifidx: u8,
+        original: crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), Error> {
+        Runtime::ap_enter_if(self, secondary(ifidx)?, original)
+    }
+    fn ap_send_on(
+        &mut self,
+        ifidx: u8,
+        bytes: &[u8],
+        priority: u8,
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Runtime::ap_send_if(self, secondary(ifidx)?, bytes, priority, original)
+    }
+    fn ap_leave_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Runtime::ap_leave_if(self, secondary(ifidx)?)
+    }
+    fn ap_completed_prefix_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Runtime::ap_completed_prefix_if(self, secondary(ifidx)?)
+    }
+    fn ap_quiet_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Runtime::ap_completed_prefix_if(self, secondary(ifidx)?)
+    }
+    fn ap_retire_peer_on(&mut self, ifidx: u8, peer: [u8; 6]) -> Result<bool, Error> {
+        Runtime::ap_retire_peer_if(self, secondary(ifidx)?, peer)
+    }
+    async fn command_ap_on<'a>(
+        &'a mut self,
+        ifidx: u8,
+        original: &'a crate::brcmfmac::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        Runtime::command_ap_if(
+            self,
+            secondary(ifidx)?,
+            original,
+            direction,
+            command,
+            input,
+            maximum,
+        )
+        .await
+    }
     fn command_vif<'a>(
         &'a mut self,
         ifidx: u8,
@@ -365,5 +461,14 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     }
     fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
         Runtime::interrupt(self).map(|signal| (signal, true))
+    }
+}
+
+/// A secondary firmware interface index (1..`vif_wire::MAX_IFS`).
+pub(crate) fn secondary(ifidx: u8) -> Result<u8, Error> {
+    if ifidx == 0 || ifidx >= crate::brcmfmac::vif_wire::MAX_IFS {
+        Err(Error::Malformed)
+    } else {
+        Ok(ifidx)
     }
 }

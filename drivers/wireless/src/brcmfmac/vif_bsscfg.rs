@@ -173,6 +173,43 @@ impl<'a, R: Fullmac> Bsscfg<'a, R> {
     }
 }
 
+impl<R: Fullmac> Bsscfg<'_, R> {
+    /// AP Program dcmd on this bsscfg: the same `brcmf_fil_*` form as
+    /// [`Self::command_inner`], under the transport's per-ifidx AP owner.
+    async fn command_ap_inner(
+        &mut self,
+        original: &super::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        self.usable()?;
+        let entry = self.link.entry;
+        // Do not program past a retained native denial of this bsscfg.
+        if direction == Direction::Set
+            && self
+                .owner
+                .events_for(&entry)
+                .any(|event| original.program_event_blocks(&event.header))
+        {
+            return Err(Error::Busy);
+        }
+        match wire_command(entry.bsscfgidx, command, input)? {
+            Some(wrapped) => {
+                self.runtime
+                    .command_ap_on(entry.ifidx, original, direction, command, &wrapped, maximum)
+                    .await
+            }
+            None => {
+                self.runtime
+                    .command_ap_on(entry.ifidx, original, direction, command, input, maximum)
+                    .await
+            }
+        }
+    }
+}
+
 impl<R: Fullmac> Fullmac for Bsscfg<'_, R> {
     const FAMILY: Family = R::FAMILY;
     const EXTERNAL_CLM: bool = R::EXTERNAL_CLM;
@@ -181,6 +218,68 @@ impl<R: Fullmac> Fullmac for Bsscfg<'_, R> {
     const BSSCFG: bool = true;
     // PRIMARY_AP / PRIMARY_MONITOR / VIF_DEMUX stay false: those owners are
     // interface-0 (or interface-owner) authorities, never per bsscfg.
+    /// This bsscfg may own a firmware-SME AP on its own ifidx
+    /// (`brcmf_cfg80211_start_ap` on `ifp`), through the transport's
+    /// per-ifidx AP owner.
+    const SECONDARY_AP: bool = R::SECONDARY_AP;
+
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        if self.link.failed {
+            return None;
+        }
+        self.runtime.ap_source()
+    }
+    fn ap_enter(&mut self, original: super::ap_scope::Capture) -> Result<(), Error> {
+        self.usable()?;
+        if self.owner.events_for(&self.link.entry).next().is_some() {
+            return Err(Error::Busy);
+        }
+        self.runtime.ap_enter_on(self.link.entry.ifidx, original)
+    }
+    fn ap_send(
+        &mut self,
+        bytes: &[u8],
+        priority: u8,
+        original: &super::ap_scope::Capture,
+    ) -> Result<super::ap_tx::Ticket, Error> {
+        self.usable()?;
+        // A retained record of this bsscfg reaches its AP owner first.
+        if self.owner.events_for(&self.link.entry).next().is_some() {
+            return Err(Error::Busy);
+        }
+        self.runtime
+            .ap_send_on(self.link.entry.ifidx, bytes, priority, original)
+    }
+    // Retirement never requires a live entry: after an IF DEL the AP
+    // owner still retires its own ifidx's flows and TX terminals.
+    fn ap_leave(&mut self) -> Result<bool, Error> {
+        self.runtime.ap_leave_on(self.link.entry.ifidx)
+    }
+    fn ap_completed_prefix(&mut self) -> Result<bool, Error> {
+        if self.owner.events_for(&self.link.entry).next().is_some() {
+            return Ok(false);
+        }
+        self.runtime.ap_completed_prefix_on(self.link.entry.ifidx)
+    }
+    fn ap_quiet(&mut self) -> Result<bool, Error> {
+        if self.owner.events_for(&self.link.entry).next().is_some() {
+            return Ok(false);
+        }
+        self.runtime.ap_quiet_on(self.link.entry.ifidx)
+    }
+    fn ap_retire_peer(&mut self, peer: [u8; 6]) -> Result<bool, Error> {
+        self.runtime.ap_retire_peer_on(self.link.entry.ifidx, peer)
+    }
+    fn command_ap<'b>(
+        &'b mut self,
+        original: &'b super::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'b [u8],
+        maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'b {
+        self.command_ap_inner(original, direction, command, input, maximum)
+    }
 
     fn command<'b>(
         &'b mut self,

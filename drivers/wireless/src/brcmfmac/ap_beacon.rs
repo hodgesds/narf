@@ -69,7 +69,7 @@ impl Session {
             2,
         )
         .await?;
-        ap_native::verify(&mut station.runtime, &original, &next).await?;
+        ap_native::verify(&mut station.runtime, &original, &next, self.scope).await?;
         if !self.prefix(&mut station.runtime)? {
             return Err(Error::Busy);
         }
