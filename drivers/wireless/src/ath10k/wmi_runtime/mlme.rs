@@ -66,7 +66,7 @@ pub(super) fn peer_phy(
         || rates & !0xfff != 0
         || capabilities & 3 != 1
         || (capabilities & 16 != 0) != protected
-        || !crate::ath10k::regulatory::Permission::profile_frequency(frequency)
+        || !crate::ath10k::regulatory::Permission::station_frequency(frequency)
         || frequency > 3000 && rates & 15 != 0
         || ht.is_some() && !qos
     {

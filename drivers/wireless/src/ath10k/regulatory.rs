@@ -38,6 +38,12 @@ pub(super) struct Permission {
     /// A separately granted noncontiguous80 segment; never fills the gap.
     pub center2: Option<u16>,
     pub half_dbm: u8,
+    /// Occupied 20 MHz constituents under a host DFS rule, as
+    /// `beacon_hints::bit` masks. Nonzero only for a station-client receipt
+    /// whose radar witness heard the AP there; those rows carry
+    /// `WMI_CHAN_FLAG_PASSIVE | WMI_CHAN_FLAG_DFS` (Linux mac.c
+    /// `ath10k_update_channel_list`).
+    pub radar: u32,
     /// Original native World-layer observation and exact policy/radio scope.
     /// None keeps every existing unhinted constructor conservative.
     pub(super) hint: Option<Arc<Receipt>>,
@@ -50,6 +56,17 @@ impl Permission {
                 5180 | 5200 | 5220 | 5240 | 5745 | 5765 | 5785 | 5805 | 5825
             )
     }
+    /// The 5 GHz radar-inventory centers (UNII-2 ch52–64, UNII-2e ch100–144
+    /// as far as the passive hardware inventory lists them). Admitted only
+    /// for a station client under a radar `beacon_found` witness.
+    pub fn dfs_frequency(frequency: u16) -> bool {
+        matches!(frequency, 5260..=5320 | 5500..=5720) && frequency % 20 == 0
+    }
+    /// Station-client inventory: the non-DFS profile plus radar channels.
+    /// AP, off-channel and active-probe paths keep `profile_frequency`.
+    pub fn station_frequency(frequency: u16) -> bool {
+        Self::profile_frequency(frequency) || Self::dfs_frequency(frequency)
+    }
     pub fn from_domain(
         caps: &super::wmi_boot::Capabilities,
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -57,11 +74,16 @@ impl Permission {
     ) -> Result<Self, Error> {
         Self::occupied(caps, domain, frequency, None)
     }
-    /// The 80 MHz segment center for a non-DFS profile primary (ch36-48,
-    /// ch149-161); cfg80211 chandef `center_freq1` for VHT80.
+    /// The 80 MHz segment center for a profile primary (ch36-48, ch149-161,
+    /// and the station-only radar segments ch52-64, ch100-112, ch116-128,
+    /// ch132-144); cfg80211 chandef `center_freq1` for VHT80.
     pub fn center80(frequency: u16) -> Option<u16> {
         match frequency {
             5180..=5240 => Some(5210),
+            5260..=5320 => Some(5290),
+            5500..=5560 => Some(5530),
+            5580..=5640 => Some(5610),
+            5660..=5720 => Some(5690),
             5745..=5805 => Some(5775),
             _ => None,
         }
@@ -97,7 +119,7 @@ impl Permission {
         // Keep the existing inventory: channels1..11 and these non-DFS5GHz
         // centers only. World5GHz additionally needs the original native
         // Beacon receipt below; a hint never extends the hardware inventory.
-        if !Self::profile_frequency(frequency)
+        if !Self::station_frequency(frequency)
             || !domain.country_code.iter().all(u8::is_ascii_uppercase)
         {
             return Err(Error::Unsupported);
@@ -159,10 +181,14 @@ impl Permission {
             if two_ghz {
                 !Self::profile_frequency(s) || frequency.abs_diff(s) != 20
             } else {
-                !matches!(
-                    (frequency.min(s), frequency.max(s)),
+                let low = frequency.min(s);
+                !(matches!(
+                    (low, frequency.max(s)),
                     (5180, 5200) | (5220, 5240) | (5745, 5765) | (5785, 5805)
-                )
+                ) || Self::dfs_frequency(low)
+                    && Self::dfs_frequency(low + 20)
+                    && frequency.max(s) == low + 20
+                    && (low - 5180) % 40 == 0)
             }
         }) {
             return Err(Error::Unsupported);
@@ -187,20 +213,47 @@ impl Permission {
         } else {
             20
         };
+        let frequencies = if width80 {
+            [center - 30, center - 10, center + 10, center + 30]
+        } else {
+            [
+                frequency,
+                secondary.unwrap_or(frequency),
+                frequency,
+                secondary.unwrap_or(frequency),
+            ]
+        };
+        // Occupied constituents under any overlapping host DFS rule
+        // (cfg80211 `IEEE80211_CHAN_RADAR`). Each needs the client's radar
+        // `beacon_found` witness; nothing else admits a radar channel.
+        let mut radar_frequencies = [0u16; 4];
+        let mut radar_count = 0;
+        let mut radar = 0u32;
+        for f in frequencies {
+            let (low, high) = (u32::from(f) - 10, u32::from(f) + 10);
+            let dfs = domain.rules.iter().any(|r| {
+                r.freq_start_mhz < high && low < r.freq_end_mhz && r.flags.contains(RegFlags::DFS)
+            });
+            if !dfs || radar_frequencies[..radar_count].contains(&f) {
+                continue;
+            }
+            radar_frequencies[radar_count] = f;
+            radar_count += 1;
+            radar |= super::wmi_runtime::beacon_hints::bit(f).ok_or(Error::Unsupported)?;
+        }
+        let radar_frequencies = &radar_frequencies[..radar_count];
+        if radar != 0
+            && (two_ghz
+                || !hint
+                    .as_ref()
+                    .is_some_and(|h| h.permits_radar(factory, domain, radar_frequencies)))
+        {
+            return Err(Error::Unsupported);
+        }
         let hint = if !two_ghz && factory.country == 0 {
             // Only a typed original native observation can lift the factory
             // World NO_IR layer. No host rule is changed, and a primary
             // beacon cannot fill an unobserved wider occupied channel.
-            let frequencies = if width80 {
-                [center - 30, center - 10, center + 10, center + 30]
-            } else {
-                [
-                    frequency,
-                    secondary.unwrap_or(frequency),
-                    frequency,
-                    secondary.unwrap_or(frequency),
-                ]
-            };
             Some(
                 hint.and_then(|h| h.restrict(factory, domain, &frequencies))
                     .ok_or(Error::Unsupported)?,
@@ -209,7 +262,20 @@ impl Permission {
             if !two_ghz && factory.alpha2 != domain.country_code {
                 return Err(Error::Unsupported);
             }
-            None
+            match hint {
+                Some(h) if radar != 0 => Some(
+                    h.restrict_radar(factory, domain, radar_frequencies)
+                        .ok_or(Error::Unsupported)?,
+                ),
+                _ => None,
+            }
+        };
+        // A host DFS rule (optionally also NO_IR, as wireless-regdb pairs
+        // them for some countries) is admissible only under that witness.
+        let radar_flags = if radar != 0 {
+            RegFlags::DFS | RegFlags::NO_IR
+        } else {
+            RegFlags::empty()
         };
         let low = u32::from(center) - width / 2;
         let high = u32::from(center) + width / 2;
@@ -226,11 +292,16 @@ impl Permission {
                 // An indoor-only rule additionally needs the current trusted
                 // deployment's explicit installation fact. Neither an AP nor
                 // a country hint supplies that fact. Every overlapping row
-                // must agree; NO_IR/DFS and unknown restrictions stay closed.
+                // must agree; NO_IR without DFS and unknown restrictions
+                // stay closed. NO_IR alongside DFS needs the radar witness.
                 || r.flags.contains(RegFlags::INDOOR_ONLY)
                     != r.flags.contains(RegFlags::DEPLOYMENT_INDOOR)
+                || r.flags.contains(RegFlags::NO_IR) && !r.flags.contains(RegFlags::DFS)
                 || r.flags.bits()
-                    & !(RegFlags::NO_P2P | RegFlags::INDOOR_ONLY | RegFlags::DEPLOYMENT_INDOOR)
+                    & !(RegFlags::NO_P2P
+                        | RegFlags::INDOOR_ONLY
+                        | RegFlags::DEPLOYMENT_INDOOR
+                        | radar_flags)
                         .bits()
                     != 0
             {
@@ -258,6 +329,7 @@ impl Permission {
             width80,
             center2: None,
             half_dbm,
+            radar,
             hint,
         })
     }
@@ -285,6 +357,7 @@ impl Permission {
                 self.hint.clone(),
             )?;
             current.half_dbm = current.half_dbm.min(other.half_dbm);
+            current.radar |= other.radar;
             current.center2 = Some(second);
             current.merge_hint(&other)?;
         }
@@ -331,9 +404,23 @@ impl Permission {
         )?;
         first.center2 = Some(center2);
         first.half_dbm = first.half_dbm.min(other.half_dbm);
+        first.radar |= other.radar;
         first.merge_hint(&other)?;
         first.check(domain)?;
         Ok(first)
+    }
+    /// Factory-level entry for native observation tests that have no
+    /// SERVICE_READY capability fixture.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn factory_with_hint_for_test(
+        factory: Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+        secondary: Option<u16>,
+        width80: bool,
+        hint: Option<Arc<Receipt>>,
+    ) -> Result<Self, Error> {
+        Self::from_factory_width_with_hint(factory, domain, frequency, secondary, width80, hint)
     }
     fn merge_hint(&mut self, other: &Self) -> Result<(), Error> {
         self.hint = match (&self.hint, &other.hint) {

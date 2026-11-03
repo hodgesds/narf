@@ -11,6 +11,7 @@ fn smoke_ath10k_wmi_station_prepare_all_native_dialects() -> TestResult {
         country: *b"US",
         frequency: 2412,
         half_dbm: 34,
+        radar: 0,
         hint: None,
     };
     for (dialect, rd, power, start, peer) in [

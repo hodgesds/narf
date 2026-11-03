@@ -198,11 +198,16 @@ impl Wire {
                 .map_or(low, |center| center - 30);
             let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
             // Legacy11A inventory row, ALLOW_HT; only the lower channel of
-            // each HT40 pair admits a positive secondary. No IBSS/DFS.
+            // each HT40 pair admits a positive secondary. No IBSS. A host
+            // radar row is PASSIVE | DFS (Linux mac.c
+            // ath10k_update_channel_list: `passive |= chan_radar`).
+            let radar =
+                super::beacon_hints::bit(frequency).is_some_and(|b| permission.radar & b != 0);
             put(
                 &mut out,
                 at + 12,
                 u32::from(frequency < 3000)
+                    | if radar { (1 << 7) | (1 << 10) } else { 0 }
                     | (1 << 11)
                     | if vht { 1 << 12 } else { 0 }
                     | if (frequency - pair_base) % 40 == 0 {

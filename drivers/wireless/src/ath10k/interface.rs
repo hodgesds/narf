@@ -838,7 +838,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         };
         if frequencies.is_empty()
             || frequencies.iter().any(|f| {
-                !super::regulatory::Permission::profile_frequency(*f)
+                !super::regulatory::Permission::station_frequency(*f)
                     || !self.frequencies.contains(f)
             })
         {
@@ -989,7 +989,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::Busy);
         }
         if u16::try_from(request.frequency_mhz).ok().is_none_or(|f| {
-            !super::regulatory::Permission::profile_frequency(f) || !self.frequencies.contains(&f)
+            !super::regulatory::Permission::station_frequency(f) || !self.frequencies.contains(&f)
         }) || narf_wireless::association::channel::from_frequency(request.frequency_mhz)
             .map(u32::from)
             != Some(request.channel)
@@ -1486,7 +1486,7 @@ pub(super) fn publish(
             r.configured_channels()
                 .iter()
                 .copied()
-                .filter(|f| super::regulatory::Permission::profile_frequency(*f))
+                .filter(|f| super::regulatory::Permission::station_frequency(*f))
                 .collect(),
             r.htt.wmi.htc.transport.interrupt(),
         )
@@ -1524,7 +1524,7 @@ pub(super) async fn wait_publish(
                         r.configured_channels()
                             .iter()
                             .copied()
-                            .filter(|f| super::regulatory::Permission::profile_frequency(*f))
+                            .filter(|f| super::regulatory::Permission::station_frequency(*f))
                             .collect(),
                         r.htt.wmi.htc.transport.interrupt(),
                     )
@@ -1857,7 +1857,7 @@ impl WirelessNetIface for Native {
                         .iter()
                         .copied()
                         .filter(|f| {
-                            super::regulatory::Permission::profile_frequency(*f)
+                            super::regulatory::Permission::station_frequency(*f)
                                 && (*f < 3000) == (band == 2400)
                         })
                         .filter_map(|f| {

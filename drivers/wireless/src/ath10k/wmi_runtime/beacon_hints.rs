@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Per-radio native observations lifting only the factory World NO_IR layer.
 //! Linux7.2 ath/regd.c and cfg80211 reg.c; signed host rules stay separate.
+//!
+//! The same native dwell observation also records cfg80211 `beacon_found`
+//! on host-DFS (radar) channels for any factory SKU. That radar witness is
+//! handed only to the station client (`Owner::client_receipt`): Linux
+//! mac80211 scans RADAR channels passively (scan.c
+//! `ieee80211_prep_hw_scan`/`ieee80211_scan_state_decision` with
+//! `IEEE80211_CHAN_RADAR`), a STA performs no radar detection, and a client
+//! only follows an AP it actually heard there. AP, active-probe and
+//! off-channel TX keep using `Owner::receipt`, which never carries radar.
 use super::{beacon, wire, Error, Management, ScanEvent};
 use crate::ath10k::regulatory::Factory;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::{db, RegulatoryDomain};
 
-const FREQUENCIES: [u16; 9] = [5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825];
-fn bit(frequency: u16) -> Option<u16> {
+const FREQUENCIES: [u16; 25] = [
+    5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825, 5260, 5280, 5300, 5320, 5500, 5520, 5540,
+    5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720,
+];
+pub(in crate::ath10k) fn bit(frequency: u16) -> Option<u32> {
     FREQUENCIES
         .iter()
         .position(|f| *f == frequency)
@@ -84,11 +96,16 @@ impl Window {
 #[derive(Clone, Debug)]
 pub(in crate::ath10k) struct Receipt {
     window: Arc<Window>,
-    observed: u16,
+    observed: u32,
+    /// Host-DFS channels whose Beacon this window's latest covering scan
+    /// heard (cfg80211 `beacon_found`). Zero in every non-client receipt.
+    radar: u32,
 }
 impl PartialEq for Receipt {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.window, &other.window) && self.observed == other.observed
+        Arc::ptr_eq(&self.window, &other.window)
+            && self.observed == other.observed
+            && self.radar == other.radar
     }
 }
 impl Eq for Receipt {}
@@ -120,33 +137,67 @@ impl Receipt {
         let observed = frequencies
             .iter()
             .try_fold(0, |mask, f| bit(*f).map(|b| mask | b))?;
-        if observed == self.observed {
-            return Some(self.clone());
+        Some(self.narrowed(observed, self.radar & observed))
+    }
+    /// cfg80211 `beacon_found` for every host-DFS 20 MHz constituent: the
+    /// client heard an AP Beacon on each in this window's latest scan of it.
+    /// Any factory SKU; the World NO_IR layer is still `permits`' business.
+    pub fn permits_radar(
+        &self,
+        factory: Factory,
+        domain: &RegulatoryDomain,
+        frequencies: &[u16],
+    ) -> bool {
+        !frequencies.is_empty()
+            && self.window.factory == factory
+            && self.window.current()
+            && same_domain(&self.window.original, domain)
+            && frequencies
+                .iter()
+                .all(|frequency| bit(*frequency).is_some_and(|b| self.radar & b != 0))
+    }
+    /// Narrow to exactly the radar constituents `frequencies` (non-World
+    /// factory: no NO_IR observation is retained alongside).
+    pub fn restrict_radar(
+        self: &Arc<Self>,
+        factory: Factory,
+        domain: &RegulatoryDomain,
+        frequencies: &[u16],
+    ) -> Option<Arc<Self>> {
+        if !self.permits_radar(factory, domain, frequencies) {
+            return None;
         }
-        Some(Arc::new(Self {
+        let radar = frequencies
+            .iter()
+            .try_fold(0, |mask, f| bit(*f).map(|b| mask | b))?;
+        Some(self.narrowed(0, radar))
+    }
+    /// Radar constituents this receipt retains, as `bit` masks.
+    pub fn radar_mask(&self) -> u32 {
+        self.radar
+    }
+    fn narrowed(self: &Arc<Self>, observed: u32, radar: u32) -> Arc<Self> {
+        if observed == self.observed && radar == self.radar {
+            return self.clone();
+        }
+        Arc::new(Self {
             window: self.window.clone(),
             observed,
-        }))
+            radar,
+        })
     }
     pub fn union(self: &Arc<Self>, other: &Arc<Self>) -> Option<Arc<Self>> {
         if !Arc::ptr_eq(&self.window, &other.window) || !self.window.current() {
             return None;
         }
-        let observed = self.observed | other.observed;
-        if observed == self.observed {
-            return Some(self.clone());
-        }
-        Some(Arc::new(Self {
-            window: self.window.clone(),
-            observed,
-        }))
+        Some(self.narrowed(self.observed | other.observed, self.radar | other.radar))
     }
 }
 #[derive(Debug)]
 pub(super) struct Scan {
     window: Arc<Window>,
     sequence: u16,
-    allowed: u16,
+    allowed: u32,
     started: bool,
     dwell: Option<u16>,
     terminal: bool,
@@ -185,7 +236,8 @@ pub(super) struct Owner {
     policy: Policy,
     radio: Arc<Life>,
     window: Option<Arc<Window>>,
-    observed: u16,
+    observed: u32,
+    radar: u32,
 }
 impl Owner {
     pub fn new() -> Self {
@@ -194,6 +246,7 @@ impl Owner {
             radio: Arc::new(Life(AtomicBool::new(true))),
             window: None,
             observed: 0,
+            radar: 0,
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -203,7 +256,9 @@ impl Owner {
         owner
     }
     pub fn begin(&mut self, factory: Factory, sequence: u16, channels: &[u16]) -> Option<Scan> {
-        if !world(factory) || !self.radio.0.load(Ordering::Acquire) {
+        // Every SKU records radar `beacon_found`; only World SKUs record the
+        // NO_IR lift (`observe`).
+        if !self.radio.0.load(Ordering::Acquire) {
             return None;
         }
         let current = self.policy.snapshot()?;
@@ -224,7 +279,11 @@ impl Owner {
                 radio: Arc::downgrade(&self.radio),
             }));
             self.observed = 0;
+            self.radar = 0;
         }
+        // A radar witness is "heard in the current scan": a new scan that
+        // covers a channel retracts its earlier observation until re-heard.
+        self.radar &= !allowed;
         Some(Scan {
             window: self.window.as_ref()?.clone(),
             sequence,
@@ -266,19 +325,26 @@ impl Owner {
         if found.frequency != frequency || found.beacon_interval == 0 {
             return Ok(());
         }
-        // Explicit host DFS never becomes a hint, even on a normally
-        // non-DFS center; NO_IR remains a separate immutable host restriction.
+        // Explicit host DFS never becomes a World NO_IR hint, even on a
+        // normally non-DFS center; it becomes only the client radar witness.
+        // NO_IR remains a separate immutable host restriction.
         let low = u32::from(frequency) - 10;
         let high = u32::from(frequency) + 10;
-        if scan.window.original.rules.iter().any(|rule| {
+        let radar = scan.window.original.rules.iter().any(|rule| {
             rule.freq_start_mhz < high
                 && low < rule.freq_end_mhz
                 && rule.flags.contains(narf_wireless::reg::RegFlags::DFS)
-        }) {
+        });
+        if !scan.window.current() {
             return Ok(());
         }
-        if scan.window.current() {
-            self.observed |= bit(frequency).unwrap_or(0);
+        let b = bit(frequency).unwrap_or(0);
+        if radar {
+            if crate::ath10k::regulatory::Permission::dfs_frequency(frequency) {
+                self.radar |= b;
+            }
+        } else if world(scan.window.factory) {
+            self.observed |= b;
         }
         Ok(())
     }
@@ -290,6 +356,22 @@ impl Owner {
         Some(Arc::new(Receipt {
             window: window.clone(),
             observed: self.observed,
+            radar: 0,
+        }))
+    }
+    /// The station client's receipt: also carries the radar `beacon_found`
+    /// witnesses (which satisfy the World NO_IR layer on those channels,
+    /// as cfg80211 `handle_reg_beacon` clears NO_IR without a RADAR test).
+    /// Never pass this to an AP, active-probe or off-channel TX path.
+    pub fn client_receipt(&self, domain: &RegulatoryDomain) -> Option<Arc<Receipt>> {
+        let window = self.window.as_ref()?;
+        if !window.current() || !same_domain(&window.original, domain) {
+            return None;
+        }
+        Some(Arc::new(Receipt {
+            window: window.clone(),
+            observed: self.observed | self.radar,
+            radar: self.radar,
         }))
     }
     pub fn retire(&self) {

@@ -146,7 +146,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let chains = self.chains.ok_or(Error::Failed)?;
-        let hint = self.beacon_hints.receipt(domain);
+        // Only the station client consumes the radar `beacon_found` witness.
+        let hint = self.beacon_hints.client_receipt(domain);
         let cached = self
             .scan_cache
             .iter()
@@ -903,11 +904,20 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 }
 
-/// The HT40 partner inside the qualified non-DFS 80 MHz segments.
+/// The HT40 partner inside the qualified 80 MHz segments.
 fn ht40_pair(frequency: u16) -> Option<u16> {
     Some(match frequency {
         5180 | 5220 | 5745 | 5785 => frequency + 20,
         5200 | 5240 | 5765 | 5805 => frequency - 20,
+        // Radar HT40 pairs ch52/56 .. ch140/144 (lower channel at a 40 MHz
+        // boundary from ch36), admitted only under a client radar witness.
+        f if Permission::dfs_frequency(f) => {
+            if (f - 5180) % 40 == 0 {
+                f + 20
+            } else {
+                f - 20
+            }
+        }
         _ => return None,
     })
 }

@@ -212,3 +212,110 @@ kernel_test_in!(
     "drivers/wireless/ath10k/beacon_hints",
     smoke_ath10k_beacon_hint_original_policy_arc_and_radio_cannot_be_recaptured
 );
+
+/// wireless-regdb `country US` shape around UNII-1/UNII-2: 5170–5250 plain,
+/// 5250–5330 `DFS` (cfg80211 `IEEE80211_CHAN_RADAR`).
+fn radar_domain(extra: narf_wireless::reg::RegFlags) -> RegulatoryDomain {
+    use narf_wireless::reg::{RegFlags, RegRule};
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![
+            RegRule {
+                freq_start_mhz: 5170,
+                freq_end_mhz: 5250,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 23,
+                flags: RegFlags::empty(),
+            },
+            RegRule {
+                freq_start_mhz: 5250,
+                freq_end_mhz: 5330,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 23,
+                flags: RegFlags::DFS | extra,
+            },
+        ],
+    }
+}
+fn observe_with(
+    owner: &mut Owner,
+    factory: Factory,
+    sequence: u16,
+    frequencies: &[u16],
+) -> Result<(), &'static str> {
+    let mut scan = owner
+        .begin(factory, sequence, frequencies)
+        .ok_or("radar scan scope")?;
+    scan.event(&event(sequence, 1, 0), frequencies);
+    for frequency in frequencies {
+        scan.event(&event(sequence, 8, u32::from(*frequency)), frequencies);
+        owner
+            .observe(&scan, &native(*frequency), frequencies)
+            .map_err(|_| "native Beacon decode")?;
+    }
+    Ok(())
+}
+/// cfg80211 `beacon_found` on a RADAR channel admits only the station
+/// client, only for heard constituents, and only until a newer scan of that
+/// channel fails to hear it again. The non-client receipt never carries it.
+fn smoke_ath10k_dfs_client_needs_radar_beacon_in_current_scan() -> TestResult {
+    use crate::ath10k::regulatory::Permission;
+    (|| {
+        for (extra, factory) in [
+            (narf_wireless::reg::RegFlags::empty(), 0x8348),
+            (narf_wireless::reg::RegFlags::NO_IR, 0x8348),
+            (narf_wireless::reg::RegFlags::empty(), 0x64),
+        ] {
+            let factory = Factory::from_eeprom(factory).map_err(|_| "factory")?;
+            let database = Arc::new(db::Database::new());
+            let policy = radar_domain(extra);
+            database.install(policy.clone());
+            let mut owner = Owner::scoped(database.clone());
+            let permit = |hint, f, s, w| {
+                Permission::factory_with_hint_for_test(factory, &policy, f, s, w, hint)
+            };
+            if permit(owner.client_receipt(&policy), 5260, None, false).is_ok() {
+                return Err("radar channel admitted without any Beacon");
+            }
+            observe_with(&mut owner, factory, 1, &[5260])?;
+            let client = owner.client_receipt(&policy).ok_or("client receipt")?;
+            if owner.receipt(&policy).is_some_and(|r| r.radar_mask() != 0)
+                || permit(owner.receipt(&policy), 5260, None, false).is_ok()
+            {
+                return Err("non-client (AP/probe/off-channel) receipt carried radar");
+            }
+            let p = permit(Some(client.clone()), 5260, None, false)
+                .map_err(|_| "heard radar channel refused for the client")?;
+            if p.radar == 0 || p.check(&policy).is_err() {
+                return Err("radar permission lost its constituent or receipt");
+            }
+            if permit(Some(client.clone()), 5260, Some(5280), false).is_ok() {
+                return Err("unheard radar secondary admitted");
+            }
+            observe_with(&mut owner, factory, 2, &[5260, 5280, 5300, 5320])?;
+            let wide = owner.client_receipt(&policy).ok_or("wide receipt")?;
+            let w = permit(Some(wide), 5260, Some(5280), true)
+                .map_err(|_| "fully heard radar VHT80 refused")?;
+            if w.center != 5290 || w.radar.count_ones() != 4 {
+                return Err("radar VHT80 geometry");
+            }
+            // A newer scan of ch52 that hears nothing retracts the witness.
+            let mut scan = owner.begin(factory, 3, &[5260]).ok_or("rescan")?;
+            scan.event(&event(3, 1, 0), &[5260]);
+            if permit(owner.client_receipt(&policy), 5260, None, false).is_ok() {
+                return Err("stale radar witness survived a newer scan of it");
+            }
+            // Policy replacement closes previously issued radar permissions.
+            database.install(policy.clone());
+            if p.check(&policy).is_ok() || w.check(&policy).is_ok() {
+                return Err("radar receipt outlived its policy generation");
+            }
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/dfs",
+    smoke_ath10k_dfs_client_needs_radar_beacon_in_current_scan
+);

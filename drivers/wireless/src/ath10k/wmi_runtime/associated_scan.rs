@@ -247,6 +247,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     &mut row,
                     at + 12,
                     u32::from(permission.frequency < 3000)
+                        // A host radar home row stays PASSIVE | DFS.
+                        | if permission.radar != 0 {
+                            (1 << 7) | (1 << 10)
+                        } else {
+                            0
+                        }
                         | u32::from(station.ht) << 11
                         | u32::from(station.vht) << 12,
                 );

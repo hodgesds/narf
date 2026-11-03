@@ -1753,6 +1753,44 @@ Coordinated release compilation, native execution and physical
 firmware/board acceptance are pending; no physical key-cache behaviour is
 claimed.
 
+### 3.5 DFS
+
+**Station client on radar channels (step 1).** The passive hardware
+inventory already lists ch52–64 and ch100–144 as `WMI_CHAN_FLAG_PASSIVE` rows
+and `receive_permission` admits host DFS rules for receive-only scans. The
+station inventory (`Permission::station_frequency` = non-DFS profile plus
+`Permission::dfs_frequency`) now exposes those channels to the interface
+scan/associate/band surface; AP (`ap_wire`), off-channel and active-probe
+paths keep `profile_frequency` and an ordinary `Owner::receipt`, which never
+carries radar, so none of them can transmit first on a radar channel. An
+explicit active scan naming a radar channel is refused; the implicit active
+scan drops it (Linux mac80211 would probe passively there — discovery here
+is the passive scan).
+
+`beacon_hints::Owner` records cfg80211 `beacon_found` for a host-DFS 20 MHz
+channel from the same native Beacon-in-matching-dwell source as §3.2, for
+every factory SKU (World or fixed country). A new scan whose channel list
+covers a radar channel retracts that channel's witness until it is heard
+again ("heard in the current scan"). Only `Owner::client_receipt`, consumed
+solely by `station_profile`, carries the radar mask; it also satisfies the
+World NO_IR layer on those channels because cfg80211 `reg.c::handle_reg_beacon`
+clears NO_IR without a RADAR test. `Permission::from_factory_width_with_hint`
+admits an overlapping host rule flagged `DFS` (optionally with `NO_IR`) only
+when every occupied constituent under a DFS rule has that witness
+(`Receipt::permits_radar`), and retains the narrowed receipt so a policy
+generation change or radio retirement closes the permission (`check`).
+`NO_IR` without `DFS`, unknown flags, indoor and power/bandwidth limits stay
+as before. HT40 pairs (ch52/56 … ch140/144) and VHT80 segments (centres 5290,
+5530, 5610, 5690) follow; 80+80 remains bounded to the non-DFS centres 5210 /
+5775. `Permission::radar` names the radar constituents; their station
+channel-list rows (`station_ht40_channels`, the associated-scan home row) are
+`PASSIVE | DFS` exactly as Linux `mac.c::ath10k_update_channel_list`
+(`ch->passive |= ch->chan_radar`). A station VDEV_START carries no DFS flag
+(Linux sets `chan_radar` only for `WMI_VDEV_TYPE_AP` in
+`ath10k_vdev_start_restart`). A STA performs no radar detection in Linux;
+neither does this one. Test (written, unexecuted):
+`smoke_ath10k_dfs_client_needs_radar_beacon_in_current_scan`.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
