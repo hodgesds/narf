@@ -22,8 +22,8 @@
 /// enables SMU_FEATURE_GFXOFF in `EnableAllSmuFeatures` at SMU hw_init,
 /// before any ring exists and together with DS_GFXCLK, GFX_ULV, DPM_GFX_GPO
 /// and GFX_DCS. NARF enables it alone, late, with the CP already running:
-/// a firmware configuration Linux never exercises, and the leading suspect
-/// for the first client GFX job stalling on RX 6750 XT silicon.
+/// a firmware configuration Linux never exercises. It stays opt-in until it
+/// is enabled with that set or validated on silicon as it is.
 pub const DEFAULT_POWER_SAVING: &str = "cg,gfxcg,hubpg,memdpm,fclkdpm,ds,wm";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

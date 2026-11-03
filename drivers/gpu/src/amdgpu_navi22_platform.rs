@@ -654,8 +654,7 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                         narf_console::Writer,
                         "amdgpu: navi22 GPU page fault {fault:?} -> {result:?}"
                     );
-                    // gfxhub_v2_1_print_l2_protection_fault_status, plus the
-                    // faulting space's mappings and walk at the address.
+                    // gfxhub_v2_1_print_l2_protection_fault_status.
                     let status = crate::amdgpu_vmid::fault(fault.pasid).status;
                     const CLIENTS: [&str; 18] = [
                         "CB/DB",
@@ -687,16 +686,6 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                         (status >> 8) & 1,
                         (status >> 18) & 1,
                     );
-                    if fault.hub == crate::amdgpu_gmc_navi22::Hub::Gfx {
-                        if let Some(d) =
-                            crate::amdgpu_vm::describe_fault(fault.pasid, fault.address)
-                        {
-                            let _ = writeln!(
-                                narf_console::Writer,
-                                "amdgpu: navi22 GPU page fault vm {d}"
-                            );
-                        }
-                    }
                 }
             }
         });
