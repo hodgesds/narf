@@ -3262,9 +3262,44 @@ chip-dispatched `Native::coex_enforce` (`enforce_c` on C, B unchanged).
 Unexecuted case:
 `smoke_rtw8852c_wlan_only_coex_init_follows_btc_init_cfg_and_gnt_v1`.
 
+**C TX path (`packet_format::transmit_c`, `packet_core`, `dma_stop::Layout::C`).**
+`packet_core::Port::chip` selects the ring registers and TXWD layout (old
+fixtures default to B). A C `Core` publishes only the ordinary BE0/MGMT8
+station rings on `rtw89_pci_ch_dma_addr_set_v1` (`Queue::regs_for`: the
+ACH0..CH9 NUM/IDX registers are shared with the baseline, DESA/BDRAM are
+`_V1`, ACH0 0x1230 / CH8 0x1270); the AP role, all-AC QoS, A-MPDU, A-MSDU
+and software fragments stay B-only. `transmit_c` is core.c
+`rtw89_core_fill_txdesc_v1` for management and non-QoS data: the 32-byte
+`rtw89_txwd_body_v1` (body0 without HW SSN, so C management keeps the host
+SW_SEQ; body1 `ADDR_INFO_NUM`; body7 `USE_RATE_V1`/`DATA_RATE` for fixed
+CCK1/OFDM6 rates), the 24-byte `rtw89_txwd_info` (`info0_v1` without the
+rate fields: DISDATAFB for fixed rates, firmware RA leaves it clear with
+the lowest retry rate in info1; info3 SPE_RPT; info4 HW_RTS_EN/RTS_EN),
+the WP sequence and pci.c `rtw89_pci_fill_txaddr_info_v1` (2044-byte
+segments, high address bits [14:11], LS on the last). The TX BD length is
+`txwd->len` (`descriptor_len`, 70..76 bytes). `tx_transport` admits
+already-encrypted host CCMP (non-QoS data to the AP, robust management) on
+C as on B: `sec_en` stays false, so neither body carries a key. The native
+`Access` reports the retained chip, doorbells/readbacks the chip's ring
+set, and `start` requires C's `B_AX_RXHCI_EN_V1|B_AX_TXHCI_EN_V1` and
+`R_AX_HCI_FUNC_EN_V1`. Terminal closure now earns a C DMA-idle proof
+(`dma_stop::stop_with(Layout::C)`, rtw8852ce.c `rtw8852c_pci_info`:
+WPDMA + `B_AX_TX_STOP1_MASK` on HAXI_DMA_STOP1, CH10/CH11 on
+`R_AX_HAXI_DMA_STOP2`, INIT_CFG1 `B_AX_STOP_AXI_MST` set and the V1 HCI
+enables clear, `R_AX_HCI_FUNC_EN_V1`, `DMA_BUSY1_CHECK`, BUSY2 CH10/CH11,
+BUSY3 RXQ/RPQ, then BME off and the flushing re-check), so C DMA can be
+reclaimed like B; B's proof is unchanged. The WoW rewind
+(`wow_trx::Rewind`) is `rtw89_pci_clr_idx_all_ax` per chip (C: CLR1 incl.
+ACH4..7, `R_AX_TXBD_RWPTR_CLR2_V1` 0x11c4, `R_AX_RXBD_RWPTR_CLR_V1`
+0x1200); the WoW owner itself remains B-only. Unexecuted cases:
+`smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info`,
+`smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs`,
+`smoke_rtw8852c_dma_stop_follows_haxi_v1_pci_info`,
+`smoke_rtw8852c_wow_rewind_uses_v1_rwptr_clear_registers`.
+
 Remaining for the `rtl8852c` row (no row credit): a native C retune caller
 over the admitted `N5CC` profiles,
-C WoW/DMA-stop RX rewind (B registers only), `command_native`/
+the C ordinary grant, `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:

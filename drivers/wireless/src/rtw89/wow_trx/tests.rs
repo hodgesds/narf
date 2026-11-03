@@ -245,7 +245,7 @@ fn smoke_rtw89_wow_trx_halt_restart_reversible() -> TestResult {
     for ring in &rings {
         io.set(ring.index(), 0x0042_0017);
     }
-    if once(leave_pre(&mut io, &snapshot, &rings)) != Some(Ok(())) {
+    if once(leave_pre(&mut io, &snapshot, &rings, Rewind::B)) != Some(Ok(())) {
         return TestResult::Fail("disable_trx_pre");
     }
     if rings.iter().any(|ring| io.get(ring.index()) != 0)
@@ -322,7 +322,7 @@ fn smoke_rtw89_wow_trx_refusals_fail_closed() -> TestResult {
         return TestResult::Fail("enter_pre");
     };
     io.stuck_bdram = true;
-    if once(leave_pre(&mut io, &snapshot, &rings())) != Some(Err(Error::Timeout)) {
+    if once(leave_pre(&mut io, &snapshot, &rings(), Rewind::B)) != Some(Err(Error::Timeout)) {
         return TestResult::Fail("reset bdram busy");
     }
     // An index the clear did not reach is not a restarted ring.
@@ -348,7 +348,7 @@ fn smoke_rtw89_wow_trx_refusals_fail_closed() -> TestResult {
         depth: 0,
     });
     io.set(regs.tx[4].idx as u32, 5);
-    if once(leave_pre(&mut io, &snapshot, &stale)) != Some(Err(Error::Index)) {
+    if once(leave_pre(&mut io, &snapshot, &stale, Rewind::B)) != Some(Err(Error::Index)) {
         return TestResult::Fail("uncleared index");
     }
     TestResult::Pass
@@ -356,4 +356,29 @@ fn smoke_rtw89_wow_trx_refusals_fail_closed() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_wow_trx_refusals_fail_closed
+);
+
+fn smoke_rtw8852c_wow_rewind_uses_v1_rwptr_clear_registers() -> TestResult {
+    let mut io = Model::awake();
+    let mut a = Access(&mut io);
+    if Rewind::C.clear(&mut a).is_err() {
+        return TestResult::Fail("C clr_idx_all failed");
+    }
+    // rtw89_pci_clr_idx_all_ax for RTL8852C: CLR1 incl. ACH4..7, CLR2_V1
+    // CH10/CH11, RXBD_RWPTR_CLR_V1; the B RX clear register is untouched.
+    if io.get(TXBD_RWPTR_CLR1) != C_CLR_TX_IDX
+        || io.get(C_TXBD_RWPTR_CLR2) != 3
+        || io.get(C_RXBD_RWPTR_CLR) != CLR_RX_IDX
+        || io.get(RXBD_RWPTR_CLR) != 0
+        || Rewind::for_chip(ChipId::Rtl8852C) != Some(Rewind::C)
+        || Rewind::for_chip(ChipId::Rtl8852B) != Some(Rewind::B)
+        || Rewind::for_chip(ChipId::Rtl8852A).is_some()
+    {
+        return TestResult::Fail("C rewind registers differ from rtw8852c_pci_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_wow_rewind_uses_v1_rwptr_clear_registers
 );

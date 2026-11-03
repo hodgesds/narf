@@ -86,6 +86,8 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) release: bool,
     ignore: bool,
     pub(in crate::rtw89) controls: Arc<Controls>,
+    /// Reported `Port::chip` (RTL8852B unless a C case sets it).
+    pub(in crate::rtw89) chip: ChipId,
 }
 impl Model {
     pub(in crate::rtw89) fn pending_receive(&self) -> bool {
@@ -125,6 +127,7 @@ impl Model {
             last: None,
             history: Vec::new(),
             reaction: None,
+            chip: ChipId::Rtl8852B,
 
             consume: false,
             release: false,
@@ -516,6 +519,9 @@ unsafe impl Port for Model {
             result
         })
         .map_err(|_| Error::Access)?
+    }
+    fn chip(&self) -> ChipId {
+        self.chip
     }
     fn ordinary_allowed(&mut self) -> Result<(), Error> {
         self.guard()?;
@@ -1089,3 +1095,43 @@ impl Core {
         }))
     }
 }
+
+fn smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs() -> TestResult {
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    for (qos_all, rx) in [(true, RxPhy::Legacy), (false, RxPhy::Ht)] {
+        let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, qos_all, rx) else {
+            if qos_all {
+                continue;
+            }
+            return TestResult::Fail("C ordinary rings refused");
+        };
+        if qos_all || core.enable_aggregation().is_ok() || core.enable_amsdu(1).is_ok() {
+            return TestResult::Fail("C admitted an all-AC, A-MPDU or A-MSDU program");
+        }
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    if Core::prepare(&mut model, OWN, 0).is_err()
+        || Core::prepare_ap(&mut model, OWN, false, RxPhy::Legacy).is_ok()
+    {
+        return TestResult::Fail("C station ring preparation or AP refusal");
+    }
+    // rtw89_pci_ch_dma_addr_set_v1: ACH0 0x1230/0x1234, CH8 0x1270/0x1274
+    // with the shared NUM registers; the baseline DESA stays untouched.
+    let half = |model: &mut Model, a: u32| power::Io::read16(model, a).unwrap();
+    if model.word(0x1230) == 0
+        || model.word(0x1270) == 0
+        || half(&mut model, 0x1024) != format::DEPTH
+        || half(&mut model, 0x1034) != format::DEPTH
+        || model.word(0x1110) != 0
+        || model.word(0x1150) != 0
+    {
+        return TestResult::Fail("C ring bases did not follow the V1 address set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs
+);

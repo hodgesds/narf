@@ -2,7 +2,7 @@
 //! Fresh RTL8852B BE0/MGMT8 TX rings attached to one retained RX/RPQ owner.
 //! Consumption and firmware release are separate ownership facts. No reset,
 //! diagnostic-ring reuse, guessed RF receipt, IRQ worker or sustained service.
-use super::{packet_format as format, power, rx_packet, tx_transport};
+use super::{mac::ChipId, packet_format as format, power, rx_packet, tx_transport};
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_io::DmaBuffer;
 
@@ -66,6 +66,12 @@ pub(super) unsafe trait Port: power::Io {
         operation: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error>;
     fn ordinary_allowed(&mut self) -> Result<(), Error>;
+    /// The exact retained chip: selects the ring registers
+    /// (`rtw89_pci_ch_dma_addr_set{,_v1}`) and the TXWD layout
+    /// (`rtw89_core_fill_txdesc{,_v1}`). Old fixtures are RTL8852B.
+    fn chip(&self) -> ChipId {
+        ChipId::Rtl8852B
+    }
     fn peer_allowed(&mut self, frame: &[u8]) -> Result<(), Error>;
     /// Separate current full A-MSDU emitter. Default old profiles deny.
     fn amsdu_allowed(&mut self) -> Result<Option<usize>, Error> {
@@ -189,6 +195,8 @@ struct Submission<'a> {
 }
 pub(super) struct Core {
     phase: Phase,
+    /// RTL8852B or RTL8852C (ordinary BE/MGMT station only).
+    chip: ChipId,
     own: [u8; 6],
     mac_id: u8,
     rings: Vec<Ring>,
@@ -331,7 +339,14 @@ impl Core {
         rx: RxPhy,
         ap: bool,
     ) -> Result<Self, Error> {
-        if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
+        let chip = port.chip();
+        if own == [0; 6]
+            || own[0] & 1 != 0
+            || mac_id != 0
+            || !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
+            // C: only the ordinary BE0/MGMT8 station rings (no AP/QoS program).
+            || chip == ChipId::Rtl8852C && (ap || queues != format::Queue::ordinary(false))
+        {
             return Err(Error::Packet);
         }
         let stop = queues
@@ -353,6 +368,7 @@ impl Core {
             };
             let mut owner = Self {
                 phase: Phase::Prepared,
+                chip,
                 own,
                 mac_id,
                 rings: {
@@ -374,7 +390,7 @@ impl Core {
                 ap,
             };
             for ring in &mut owner.rings {
-                let regs = ring.kind.regs();
+                let regs = ring.kind.regs_for(chip);
                 if port.read32(regs.idx as u32)? & 0x0fff_0fff != 0 {
                     return Err(Error::State);
                 }
@@ -399,7 +415,7 @@ impl Core {
     /// signed aggregate program (`Program::Ampdu`, which requires HT20)
     /// enables this, before `start`.
     pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Prepared || self.rx < RxPhy::Ht {
+        if self.phase != Phase::Prepared || self.rx < RxPhy::Ht || self.chip != ChipId::Rtl8852B {
             return Err(Error::State);
         }
         self.aggregate = true;
@@ -532,7 +548,9 @@ impl Core {
         if self.phase != Phase::Running || self.ap {
             return Err(Error::State);
         }
-        if agg.is_some() && !self.aggregate {
+        if agg.is_some() && !self.aggregate
+            || self.chip == ChipId::Rtl8852C && (fragment.is_some() || agg.is_some())
+        {
             return Err(Error::Packet);
         }
         // HE extended-range SU TX belongs to the signed HE program only.
@@ -581,8 +599,13 @@ impl Core {
             if !format::probe_request(bytes, source) {
                 port.peer_allowed(bytes)?;
             }
+            let header_capacity = if self.chip == ChipId::Rtl8852C {
+                format::C_HEADER_MAX
+            } else {
+                format::HEADER
+            };
             let packet = Packet {
-                header: allocate(port, format::HEADER)?,
+                header: allocate(port, header_capacity)?,
                 body: allocate(port, bytes.len())?,
                 id,
                 length: bytes.len(),
@@ -602,7 +625,17 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (mut header, actual) = if fragment.is_some() {
+                let (mut header, actual) = if self.chip == ChipId::Rtl8852C {
+                    format::transmit_c(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                    )?
+                } else if fragment.is_some() {
                     format::transmit_fragment(
                         bytes,
                         source,
@@ -636,7 +669,8 @@ impl Core {
                 }
                 copy_to(&packet.body, 0, bytes)?;
                 copy_to(&packet.header, 0, &header)?;
-                format::descriptor(packet.header.dma_addr().raw()).map_err(Error::from)
+                format::descriptor_len(packet.header.dma_addr().raw(), header.len())
+                    .map_err(Error::from)
             })();
             let descriptor = match preparation {
                 Ok(value) => value,
@@ -677,8 +711,9 @@ impl Core {
                     &descriptor,
                 )?;
                 barrier();
-                port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
-                if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
+                let regs = kind.regs_for(self.chip);
+                port.write16(regs.idx as u32, ring.queue.write_pointer())?;
+                if port.read16(regs.idx as u32)? & 0x0fff != ring.queue.write_pointer() {
                     return Err(Error::Access);
                 }
                 self.next_id = next_id;
@@ -953,7 +988,7 @@ impl Core {
             self.receive(port, &mut step)?;
             for slot in 0..self.rings.len() {
                 let ring = &mut self.rings[slot];
-                let index = port.read32(ring.kind.regs().idx as u32)?;
+                let index = port.read32(ring.kind.regs_for(self.chip).idx as u32)?;
                 if index & 0x0fff != u32::from(ring.queue.write_pointer()) {
                     return Err(Error::Packet);
                 }
@@ -1039,7 +1074,7 @@ impl Core {
             copy_to(memory, 0, &alloc::vec![0; usize::from(format::DEPTH) * 8])?;
             bases.push((
                 usize::from(ring.kind.channel()),
-                ring.kind.regs(),
+                ring.kind.regs_for(self.chip),
                 memory.dma_addr().raw(),
                 format::DEPTH,
             ));

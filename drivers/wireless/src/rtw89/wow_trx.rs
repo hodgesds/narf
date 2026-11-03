@@ -54,6 +54,48 @@ pub(super) const CLR_TX_IDX: u32 = 0xf | 1 << 8 | 1 << 9 | 1 << 10;
 /// `R_AX_RXBD_RWPTR_CLR`: `B_AX_CLR_RXQ_IDX | B_AX_CLR_RPQ_IDX`.
 pub(super) const RXBD_RWPTR_CLR: u32 = 0x1018;
 pub(super) const CLR_RX_IDX: u32 = 3;
+/// RTL8852C `rtw89_pci_clr_idx_all_ax` (rtw8852ce.c `rtw8852c_pci_info`):
+/// ACH4..7 join `R_AX_TXBD_RWPTR_CLR1`, CH10/CH11 clear through
+/// `txbd_rwptr_clr2_reg` = `R_AX_TXBD_RWPTR_CLR2_V1`, and RXQ/RPQ through
+/// `rxbd_rwptr_clr_reg` = `R_AX_RXBD_RWPTR_CLR_V1`.
+pub(super) const C_CLR_TX_IDX: u32 = 0x7ff;
+pub(super) const C_TXBD_RWPTR_CLR2: u32 = 0x11c4;
+pub(super) const C_RXBD_RWPTR_CLR: u32 = 0x1200;
+/// One chip's `rtw89_pci_clr_idx_all_ax` registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Rewind {
+    tx_clr1: u32,
+    tx_clr2: Option<u32>,
+    rx_clr: u32,
+}
+impl Rewind {
+    pub(super) const B: Self = Self {
+        tx_clr1: CLR_TX_IDX,
+        tx_clr2: None,
+        rx_clr: RXBD_RWPTR_CLR,
+    };
+    pub(super) const C: Self = Self {
+        tx_clr1: C_CLR_TX_IDX,
+        tx_clr2: Some(C_TXBD_RWPTR_CLR2),
+        rx_clr: C_RXBD_RWPTR_CLR,
+    };
+    pub(super) fn for_chip(chip: super::mac::ChipId) -> Option<Self> {
+        match chip {
+            super::mac::ChipId::Rtl8852B => Some(Self::B),
+            super::mac::ChipId::Rtl8852C => Some(Self::C),
+            _ => None,
+        }
+    }
+    /// `rtw89_pci_clr_idx_all_ax`: TX CLR1, CLR2 (CH10/CH11) when present,
+    /// then RX, each `rtw89_write32_set`.
+    fn clear(self, a: &mut Access<'_, impl Io>) -> Result<(), Error> {
+        a.modify(TXBD_RWPTR_CLR1, 0, self.tx_clr1)?;
+        if let Some(clr2) = self.tx_clr2 {
+            a.modify(clr2, 0, 3)?;
+        }
+        a.modify(self.rx_clr, 0, CLR_RX_IDX)
+    }
+}
 /// `R_AX_PCIE_DMA_BUSY1` with `DMA_BUSY1_CHECK_V1`.
 pub(super) const BUSY1: u32 = 0x101c;
 pub(super) const TX_BUSY: u32 = 0x0007_0f00;
@@ -431,11 +473,11 @@ pub(super) async fn leave_pre(
     io: &mut impl Io,
     snapshot: &Snapshot,
     rings: &[Ring],
+    rewind: Rewind,
 ) -> Result<(), Error> {
     let mut a = Access(io);
     // rtw89_pci_clr_idx_all_ax.
-    a.modify(TXBD_RWPTR_CLR1, 0, CLR_TX_IDX)?;
-    a.modify(RXBD_RWPTR_CLR, 0, CLR_RX_IDX)?;
+    rewind.clear(&mut a)?;
     // rtw89_pci_rst_bdram_ax.
     a.modify(INIT_CFG1, 0, RST_BDRAM)?;
     a.poll(BDRAM_POLL_US, BDRAM_TIMEOUT_US, Error::Timeout, |a| {

@@ -6,6 +6,10 @@ use super::{dma, mac::ChipId, tx_transport, txrx::TxwdInfo};
 use alloc::vec::Vec;
 
 pub(super) const HEADER: usize = 24 + 24 + 8 + 8;
+/// RTL8852C `rtw89_txwd_body_v1` (32) + `rtw89_txwd_info` (24) + WP (8) +
+/// at most two `rtw89_pci_tx_addr_info_32_v1` (6 each) for a [`MAX_MPDU`]
+/// body (`TXADDR_INFO_LENTHG_V1_MAX` 2044).
+pub(super) const C_HEADER_MAX: usize = 32 + 24 + 8 + 2 * 6;
 pub(super) const MAX_MPDU: usize = 2304;
 /// New TX fragments: maximum2346 plaintext+FCS, then16 CCMP overhead.
 pub(super) const FRAGMENT_MAX_MPDU: usize = 2346 - 4 + 16;
@@ -59,7 +63,13 @@ impl Queue {
         }
     }
     pub(super) fn regs(self) -> dma::TxRingRegs {
-        dma::addr_set_for_chip(ChipId::Rtl8852B).tx[self.channel() as usize]
+        self.regs_for(ChipId::Rtl8852B)
+    }
+    /// `chip->pci_info.dma_addr_set` ring registers: RTL8852C takes
+    /// `rtw89_pci_ch_dma_addr_set_v1` (same ACH0..CH9 NUM/IDX, `_V1`
+    /// DESA/BDRAM).
+    pub(super) fn regs_for(self, chip: ChipId) -> dma::TxRingRegs {
+        dma::addr_set_for_chip(chip).tx[self.channel() as usize]
     }
     /// `R_AX_PCIE_DMA_STOP1` bit for this channel (`B_AX_STOP_ACHn`/`CH8`/`CH9`).
     pub(super) fn stop_bit(self) -> u32 {
@@ -286,6 +296,7 @@ pub(super) fn transmit_profile(
     limit: Option<usize>,
 ) -> Result<(Vec<u8>, Queue), Error> {
     transmit_profile_inner(Tx {
+        chip: ChipId::Rtl8852B,
         frame,
         own,
         mac_id,
@@ -314,6 +325,7 @@ pub(super) fn transmit_fragment(
         return Err(Error::Metadata);
     }
     transmit_profile_inner(Tx {
+        chip: ChipId::Rtl8852B,
         frame,
         own,
         mac_id,
@@ -327,6 +339,7 @@ pub(super) fn transmit_fragment(
     })
 }
 struct Tx<'a> {
+    chip: ChipId,
     frame: &'a [u8],
     own: [u8; 6],
     mac_id: u8,
@@ -338,8 +351,40 @@ struct Tx<'a> {
     limit: Option<usize>,
     fragments: bool,
 }
+/// RTL8852C ordinary station TXWD (core.c `rtw89_core_fill_txdesc_v1`,
+/// pci.c `rtw89_pci_fill_txaddr_info_v1`): management and non-QoS data at
+/// a fixed rate or firmware RA, no aggregation, A-MSDU, +HTC or fragments.
+/// The v1 body carries `ADDR_INFO_NUM`, moves USE_RATE/DATA_RATE into body
+/// dword7 and has no HW SSN fields (management keeps the host SW_SEQ).
+pub(super) fn transmit_c(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+) -> Result<(Vec<u8>, Queue), Error> {
+    if frame.first().is_some_and(|fc| fc & 0xfc == 0x88) || rate & DATA_ER != 0 {
+        return Err(Error::Frame);
+    }
+    transmit_profile_inner(Tx {
+        chip: ChipId::Rtl8852C,
+        frame,
+        own,
+        mac_id,
+        sequence,
+        address,
+        report,
+        rate,
+        agg: None,
+        limit: None,
+        fragments: false,
+    })
+}
 fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
     let Tx {
+        chip,
         frame,
         own,
         mac_id,
@@ -371,6 +416,11 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
         return Err(Error::Metadata);
     }
     extent(address, frame.len())?;
+    let c = match chip {
+        ChipId::Rtl8852B => false,
+        ChipId::Rtl8852C if !fragments && agg.is_none() && limit.is_none() => true,
+        _ => return Err(Error::Metadata),
+    };
     let prepare = if fragments {
         tx_transport::prepare_header_fragment
     } else if amsdu(frame) {
@@ -379,7 +429,7 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
         tx_transport::prepare_header
     };
     let baseline = prepare(
-        ChipId::Rtl8852B,
+        chip,
         TxwdInfo {
             channel: queue.channel(),
             qsel: queue.qsel(),
@@ -391,23 +441,28 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
         frame,
     )
     .map_err(|_| Error::Frame)?;
-    let mut bytes = alloc::vec![0; HEADER];
-    bytes[..24].copy_from_slice(&baseline[..24]);
-    bytes[48..].copy_from_slice(&baseline[24..]);
+    // TXWD body (24, v1 32), then the WD info, then WP + address info.
+    let body = if c { 32 } else { 24 };
+    let info = body;
+    let mut bytes = alloc::vec![0; baseline.len() + 24];
+    bytes[..body].copy_from_slice(&baseline[..body]);
+    bytes[body + 24..].copy_from_slice(&baseline[body..]);
     let body0 = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| Error::Metadata)?);
     // RTW89_TXWD_BODY2_TID_INDICATE from rtw89_core_get_tid_indicate.
     if qos_tid(frame).is_some_and(super::qos::tid_indicate) {
         let body2 = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| Error::Metadata)?);
         put(&mut bytes, 8, body2 | 1 << 23);
     }
-    // Linux management uses hardware SSN selector1/mode1. Non-QoS data
-    // retains the supplied host sequence; neither enables hardware crypto.
+    // Linux management uses hardware SSN selector1/mode1 (body0 v0 only;
+    // `rtw89_build_txwd_body0_v1` has no HW SSN field, so C management
+    // keeps the host SW_SEQ). Non-QoS data retains the supplied host
+    // sequence; neither enables hardware crypto.
     put(
         &mut bytes,
         0,
         body0
             | 1 << 22
-            | if queue == Queue::Management && !fragments {
+            | if queue == Queue::Management && !fragments && !c {
                 5
             } else {
                 0
@@ -416,23 +471,32 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
     if adaptive {
         // rtw89_build_txwd_info0/1 for data: firmware RA owns the rate;
         // INFO1 DATA_RTY_LOWEST_RATE[24:16] bounds hardware retry fallback.
-        put(&mut bytes, 24, u32::from(er) << 15);
+        put(&mut bytes, info, u32::from(er) << 15);
         let num = agg.map_or(0, |agg| u32::from(agg.num));
         put(
             &mut bytes,
-            28,
+            info + 4,
             u32::from(index) << 16 | num | u32::from(frame[1] & 0x80 != 0) << 14,
         );
+    } else if c {
+        // rtw89_build_txwd_body7_v1 USE_RATE_V1 + DATA_RATE[24:16];
+        // rtw89_build_txwd_info0_v1 keeps DISDATAFB.
+        put(&mut bytes, 28, 1 << 31 | u32::from(rate) << 16);
+        put(&mut bytes, info, 1 << 10);
     } else {
-        put(&mut bytes, 24, 1 << 30 | 1 << 10 | u32::from(rate) << 16); // Source DATA_RATE[24:16].
+        put(&mut bytes, info, 1 << 30 | 1 << 10 | u32::from(rate) << 16); // Source DATA_RATE[24:16].
     }
     if let Some(agg) = agg {
         let body3 = u32::from_le_bytes(bytes[12..16].try_into().map_err(|_| Error::Metadata)?);
         put(&mut bytes, 12, body3 | 1 << 12);
-        put(&mut bytes, 32, u32::from(agg.density) << 18);
+        put(&mut bytes, info + 8, u32::from(agg.density) << 18);
     }
-    put(&mut bytes, 36, u32::from(report) << 10);
-    put(&mut bytes, 40, 1 << 31 | u32::from(frame[4] & 1 == 0) << 27);
+    put(&mut bytes, info + 12, u32::from(report) << 10);
+    put(
+        &mut bytes,
+        info + 16,
+        1 << 31 | u32::from(frame[4] & 1 == 0) << 27,
+    );
     Ok((bytes, queue))
 }
 /// `B_AX_STOP_CH9`: the AP high queue stop bit.
@@ -558,9 +622,16 @@ pub(super) fn transmit_ap(
     Ok((bytes, queue))
 }
 pub(super) fn descriptor(address: u64) -> Result<[u8; 8], Error> {
-    extent(address, HEADER)?;
+    descriptor_len(address, HEADER)
+}
+/// `rtw89_pci_txwd_submit` TX BD for a `txwd->len` = `length` header.
+pub(super) fn descriptor_len(address: u64, length: usize) -> Result<[u8; 8], Error> {
+    if !(HEADER..=C_HEADER_MAX).contains(&length) {
+        return Err(Error::Metadata);
+    }
+    extent(address, length)?;
     let mut bytes = [0; 8];
-    bytes[..2].copy_from_slice(&(HEADER as u16).to_le_bytes());
+    bytes[..2].copy_from_slice(&(length as u16).to_le_bytes());
     bytes[2..4].copy_from_slice(&(1 << 14 | ((address >> 32) as u16) << 6).to_le_bytes());
     bytes[4..].copy_from_slice(&(address as u32).to_le_bytes());
     Ok(bytes)

@@ -177,7 +177,10 @@ impl Native {
         if self.state != State::Active {
             return self.wow_failed(wow_trx::Error::State);
         }
-        if let Err(error) = wow_trx::leave_pre(&mut self.io, &snapshot, &rings).await {
+        let Some(rewind) = wow_trx::Rewind::for_chip(self.chip) else {
+            return self.wow_failed(wow_trx::Error::State);
+        };
+        if let Err(error) = wow_trx::leave_pre(&mut self.io, &snapshot, &rings, rewind).await {
             return self.wow_failed(error);
         }
         if let Some(binding) = self.irq.as_ref() {

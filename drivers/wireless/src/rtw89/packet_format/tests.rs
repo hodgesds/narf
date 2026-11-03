@@ -239,3 +239,84 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_txwd_ampdu_fields
 );
+
+fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
+    let word = |bytes: &[u8], offset: usize| {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    };
+    // Fixed-rate (CCK1) authentication on CH8, with a TX report.
+    let bytes = frame(100, true);
+    let Ok((header, queue)) = transmit_c(&bytes, OWN, 0, 5, 0x1234_5000, true, 0) else {
+        return TestResult::Fail("C management TXWD refused");
+    };
+    let mut wp = [0u8; 8];
+    wp[..2].copy_from_slice(&0x8005u16.to_le_bytes());
+    if queue != Queue::Management
+        || header.len() != 70
+        // body0 v1: WD_INFO_EN, CH8, HDR_LLC_LEN 12, WD_PAGE; no HW SSN.
+        || word(&header, 0) != (1 << 22 | 8 << 16 | 12 << 11 | 1 << 7)
+        || word(&header, 4) != 1 << 26
+        || word(&header, 8) != (0x12 << 17 | 100)
+        || word(&header, 12) != 0x123
+        || header[16..28] != [0; 12]
+        // body7 v1: USE_RATE_V1 + DATA_RATE (CCK1 = 0).
+        || word(&header, 28) != 1 << 31
+        // info0 v1: DISDATAFB only; info3 SPE_RPT; info4 HW_RTS_EN|RTS_EN.
+        || word(&header, 32) != 1 << 10
+        || word(&header, 36) != 0
+        || word(&header, 40) != 0
+        || word(&header, 44) != 1 << 10
+        || word(&header, 48) != (1 << 31 | 1 << 27)
+        || word(&header, 52) != 0
+        || header[56..64] != wp
+        || header[64..66] != (100u16 | 1 << 15).to_le_bytes()
+        || word(&header, 66) != 0x1234_5000
+    {
+        return TestResult::Fail("C v1 body/info/WP/address-info differs from Linux layout");
+    }
+    // OFDM6 fixed rate lands in body7 DATA_RATE.
+    let Ok((header, _)) = transmit_c(&bytes, OWN, 0, 5, 0x1234_5000, false, OFDM6) else {
+        return TestResult::Fail("C OFDM6 management TXWD refused");
+    };
+    if word(&header, 28) != (1 << 31 | u32::from(OFDM6) << 16) || word(&header, 44) != 0 {
+        return TestResult::Fail("C OFDM6 rate or unrequested report");
+    }
+    // Firmware-RA non-QoS data on ACH0: no body7 rate, lowest rate in info1.
+    let data = frame(2304, false);
+    let Ok((header, queue)) = transmit_c(&data, OWN, 0, 7, 0xf_1234_5000, false, FIRMWARE_RA | 4)
+    else {
+        return TestResult::Fail("C firmware-RA data TXWD refused");
+    };
+    if queue != Queue::Data
+        || header.len() != 76
+        || word(&header, 0) != (1 << 22 | 12 << 11 | 1 << 7)
+        || word(&header, 4) != 2 << 26
+        || word(&header, 28) != 0
+        || word(&header, 32) != 0
+        || word(&header, 36) != 4 << 16
+        || header[64..66] != (2044u16 | 0xf << 11).to_le_bytes()
+        || header[70..72] != (260u16 | 0xf << 11 | 1 << 15).to_le_bytes()
+        || word(&header, 72) != 0x1234_5000 + 2044
+    {
+        return TestResult::Fail("C firmware-RA data or two-entry address info differs");
+    }
+    // QoS data, extended range and descriptor bounds.
+    let mut qos = frame(100, false);
+    qos[0] = 0x88;
+    if transmit_c(&qos, OWN, 0, 1, 0x1000, false, FIRMWARE_RA).is_ok()
+        || transmit_c(&data, OWN, 0, 1, 0x1000, false, FIRMWARE_RA | DATA_ER).is_ok()
+        || descriptor_len(0xf_1234_5000, 70) != Ok([70, 0, 0xc0, 0x43, 0, 0x50, 0x34, 0x12])
+        || descriptor_len(0x1000, C_HEADER_MAX + 1).is_ok()
+        || descriptor(0xf_1234_5000) != descriptor_len(0xf_1234_5000, HEADER)
+        || Queue::Data.regs_for(ChipId::Rtl8852C).desa_l != 0x1230
+        || Queue::Management.regs_for(ChipId::Rtl8852C).desa_l != 0x1270
+        || Queue::Data.regs_for(ChipId::Rtl8852C).idx != Queue::Data.regs().idx
+    {
+        return TestResult::Fail("C refusals, TXBD length or V1 ring registers differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info
+);

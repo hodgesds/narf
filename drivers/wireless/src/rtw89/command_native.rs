@@ -828,11 +828,15 @@ impl Native {
                 let _ = self.io.write32(0xc000, value & !(1 << 29));
             }
         }
-        if self.chip == ChipId::Rtl8852B {
+        if let Some(layout) = super::dma_stop::Layout::for_chip(self.chip) {
             // Linux stop/poll order with BME still on, then BME off and a
             // flushing re-read. An earlier proof already cleared BME.
             if self.dma_idle.is_none() && !self.dma_reclaimed {
-                self.dma_idle = super::dma_stop::stop(&mut self.stop_port()).ok();
+                self.dma_idle = super::dma_stop::stop_with(&mut self.stop_port(), layout).ok();
+            }
+            if self.chip == ChipId::Rtl8852C {
+                // No RF/clock teardown owner for C yet; DMA proof only.
+                return;
             }
             if self.radio_started {
                 let _ = super::radio_stop::engines(&mut self.io);
@@ -1137,7 +1141,9 @@ impl Native {
         if self.state != State::Terminal || self.irq.is_some() || self.dma_idle.is_none() {
             return Err(super::dma_stop::Error::Unproven);
         }
-        super::dma_stop::verify(&mut self.stop_port())?;
+        let layout =
+            super::dma_stop::Layout::for_chip(self.chip).ok_or(super::dma_stop::Error::Unproven)?;
+        super::dma_stop::verify_with(&mut self.stop_port(), layout)?;
         let proof = self
             .dma_idle
             .take()

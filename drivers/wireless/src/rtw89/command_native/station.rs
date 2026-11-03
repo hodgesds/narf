@@ -445,7 +445,7 @@ impl power::Io for Access<'_> {
         if self.native.sleep_reset.is_some() {
             return Err(power::Error::Terminal);
         }
-        let rings = addr_set_for_chip(ChipId::Rtl8852B).tx;
+        let rings = addr_set_for_chip(self.native.chip).tx;
         if let Some(part) = &self.fragment {
             // This exact part is already issued. A prepared-part predicate
             // would deny every valid doorbell or tempt an unsafe bypass.
@@ -591,6 +591,9 @@ unsafe impl packet::Port for Access<'_> {
         crate::rtw88::pci_park::invoke(&cap, || operation(self))
             .map_err(|_| packet::Error::Access)?
     }
+    fn chip(&self) -> ChipId {
+        self.native.chip
+    }
     fn ordinary_allowed(&mut self) -> Result<(), packet::Error> {
         if self.native.sleep_blocked {
             return Err(packet::Error::Busy);
@@ -705,12 +708,20 @@ unsafe impl packet::Port for Access<'_> {
                 native.ordinary_current()?;
                 control::awake(&mut native.io)?;
                 // CH12/RX/RPQ and both HCI directions must still be this owner's.
+                // RTL8852C: `B_AX_RXHCI_EN_V1` and `R_AX_HCI_FUNC_EN_V1`
+                // (rtw8852ce.c `rtw8852c_pci_info`) with `B_AX_TXHCI_EN_V1`,
+                // which the CH12 download already opened.
+                let (hci, function) = if native.chip == ChipId::Rtl8852C {
+                    (1 << 15 | 1 << 7, 0x7880)
+                } else {
+                    (3 << 12, 0x8380)
+                };
                 if native.receive.state() != rx_dma::State::Polling
                     || native.command().map_err(|_| power::Error::Access)?
                         & narf_bus::pci::cmd::BUS_MASTER
                         == 0
-                    || native.io.read32(0x1000)? & (3 << 12) != 3 << 12
-                    || native.io.read32(0x8380)? & 3 != 3
+                    || native.io.read32(0x1000)? & hci != hci
+                    || native.io.read32(function)? & 3 != 3
                 {
                     return Err(power::Error::Access);
                 }

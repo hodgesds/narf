@@ -390,8 +390,10 @@ fn prepare_header_profile(
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
     // Initial transport profile: native management or ordinary non-QoS
-    // three-address data, without fragmentation. Only B's
-    // retained ordinary station path admits already encrypted host CCMP.
+    // three-address data, without fragmentation. Only the B and C retained
+    // ordinary station paths admit already encrypted host CCMP (no TXWD SEC
+    // fields: `sec_en` stays false, so neither the v0 nor the v1 body or
+    // `rtw89_build_txwd_info2_v1` FORCE_KEY_EN carries a key).
     if !matches!(
         fc & 0x00fc,
         0x0000
@@ -443,7 +445,7 @@ fn prepare_header_profile(
         24
     };
     if fc & 0x4000 != 0
-        && (chip != ChipId::Rtl8852B
+        && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
             // Host-CCMP data to the AP, or (PMF) a robust disassociation,
             // deauthentication or Action frame with no DS bits.
             || !(matches!(fc & 0x00fc, 8 | 0x88) && fc & 0x0300 == 0x0100
