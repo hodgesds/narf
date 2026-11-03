@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! Signed measured envelope for the exact B cold/calibration recipe. This
 //! grants calibration only: neither packet TX nor autonomous ACK/CTS emission.
+//!
+//! RTL8852C has its own format (magic `N5CB` v1, `rtw8852c-cal-v1-<mac>.bin`)
+//! over its own identity ([`Board::new_c`]); a B record never admits C and
+//! vice versa. Both admit only the cold channel-1/20MHz span 2402..2422.
 use super::{factory::Factory, mac::ChipId, radio_assets::Assets};
 use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
@@ -20,7 +24,12 @@ pub(super) struct Board {
     identity: [u8; 32],
     mac: [u8; 6],
     device: u16,
+    chip: ChipId,
 }
+/// RTL8852C cold calibration recipe (Linux 7.3-rc4 call chain). NARF has no
+/// static rtw8852c_table.c copy: every table byte the recipe programs comes
+/// from the bound firmware container (`Assets::bind`) and the bound factory.
+const C_RECIPE: &[u8] = b"rtw89_mac_init(C) then phy.c rtw89_phy_dm_init: rtw89_phy_init_bb_reg, rtw8852c_init_txpwr_unit, rtw8852c_bb_reset_all, rtw89_phy_init_rf_reg {radiob,radioa}, rtw8852c_bb_sethw, physts/dig(V1 cckpd)/cfo/edcca init, rtw89_phy_init_rf_nctl (no second IOQ write), rtw8852c_rfk_init (dpk_init, _rck A/B, _dac_cal, _rx_dck recover), rtw8852c_set_txpwr_ctrl, rtw8852c_power_trim, rtw8852c_bb_cfg_txrx_path(RF_AB)";
 impl Board {
     pub fn new(
         factory: &Factory,
@@ -60,7 +69,56 @@ impl Board {
             identity: hash.finalize(),
             mac: identity.mac(),
             device: device.device,
+            chip: ChipId::Rtl8852B,
         })
+    }
+    /// RTL8852C cold channel-1 calibration identity (rtw8852ce.c
+    /// `rtw89_8852ce_id_table`: 10ec:c852 only): the C factory logical map
+    /// and 0x60-byte PHY-cap window, cut/RFE/XTAL, the bound C firmware
+    /// container tables and the C recipe. No coexistence protocol is bound
+    /// here; the C coexistence owner extends identities that need it.
+    pub fn new_c(
+        factory: &Factory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+    ) -> Result<Self, Error> {
+        let identity = factory.identity().ok_or(Error::Identity)?;
+        let calibration = identity.calibration();
+        if device.vendor != 0x10ec
+            || device.device != 0xc852
+            || identity.chip() != ChipId::Rtl8852C
+            || assets.chip() != ChipId::Rtl8852C
+            || !calibration.valid
+            || calibration.rfe_type == 255
+        {
+            return Err(Error::Identity);
+        }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(b"NARF RTL8852C cold ch1 20MHz awake WLAN-only calibration v1");
+        hash.update(b"CMAC TXEN=0; NCTL RCK DACK RXDCK; no ordinary packet/response grant");
+        hash.update(C_RECIPE);
+        hash.update(&device.vendor.to_le_bytes());
+        hash.update(&device.device.to_le_bytes());
+        hash.update(&device.subsystem_vendor.to_le_bytes());
+        hash.update(&device.subsystem_id.to_le_bytes());
+        hash.update(factory.logical().ok_or(Error::Identity)?);
+        hash.update(factory.c_phycap().ok_or(Error::Identity)?);
+        hash.update(&[identity.cut(), calibration.rfe_type, identity.xtal()]);
+        assets
+            .bind(&mut hash, calibration.rfe_type, identity.cut())
+            .map_err(|_| Error::Identity)?;
+        Ok(Self {
+            identity: hash.finalize(),
+            mac: identity.mac(),
+            device: device.device,
+            chip: ChipId::Rtl8852C,
+        })
+    }
+    pub(super) fn is_c(self) -> bool {
+        self.chip == ChipId::Rtl8852C
+    }
+    pub(super) fn mac(self) -> [u8; 6] {
+        self.mac
     }
     pub fn identity(self) -> [u8; 32] {
         self.identity
@@ -98,8 +156,14 @@ impl Calibration {
     pub fn load(board: Board) -> Result<Self, Error> {
         let m = board.mac;
         let name = format!(
-            "rtw89/rtw8852b-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            "rtw89/rtw8852{}-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            if board.is_c() { "c" } else { "b" },
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
         );
         let loader = narf_firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
@@ -116,7 +180,7 @@ impl Calibration {
         authority.invoke(Current).map_err(|_| Error::Authority)?;
         signer.ok_or(Error::Unsigned)?;
         if bytes.len() != LENGTH
-            || &bytes[..4] != b"N52B"
+            || &bytes[..4] != if board.is_c() { b"N5CB" } else { b"N52B" }
             || bytes[4..8] != [1, 0, 96, 0]
             || bytes[8..12] != (LENGTH as u32).to_le_bytes()
             || bytes[12..14] != 0x10ecu16.to_le_bytes()

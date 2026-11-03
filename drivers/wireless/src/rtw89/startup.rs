@@ -223,16 +223,20 @@ impl Startup {
         attempt.committed = result.is_ok();
         result
     }
-    /// RTL8852C radio bring-up for one 20MHz `primary` after the C tables:
-    /// `Native::prepare_radio_c` (phy.c `rtw89_phy_dm_init` controls and DM
-    /// sub-inits, `rtw8852c_rfk_init`, power trim, cfg_txrx_path,
-    /// `__rtw89_set_channel`, `rtw8852c_rfk_channel`, RF_GET_MCCCH V0). Its
-    /// signed calibration/coexistence admission is checked before the first
-    /// write. There is no separate pure C preflight (unlike B's
-    /// `preflight_basic_rfk`), so any failure, including that refusal,
-    /// terminalizes this owner. Success is `RadioReady` with no ordinary
-    /// grant (station admission stays B-only).
-    pub async fn prepare_radio_c(&mut self, primary: u8) -> Result<(), Error> {
+    /// RTL8852C radio bring-up for one typed `profile` after the C tables:
+    /// the pure `Native::preflight_radio_c` (C calibration `N5CB` v1, base
+    /// `N5CB` v2 and `N5CC` records; a missing record is retryable and
+    /// touches nothing), then `Native::prepare_radio_c` (phy.c
+    /// `rtw89_phy_dm_init` controls and DM sub-inits, `rtw8852c_rfk_init`,
+    /// power trim, cfg_txrx_path, `__rtw89_set_channel`,
+    /// `rtw8852c_rfk_channel`, RF_GET_MCCCH V0) admitted only when the
+    /// staged records admit exactly `profile`. Any failure after the
+    /// preflight terminalizes this owner. Success is `RadioReady` with no
+    /// ordinary grant (station admission stays B-only).
+    pub(super) async fn prepare_radio_c(
+        &mut self,
+        profile: super::operating_channel_c::Profile,
+    ) -> Result<(), Error> {
         if self.phase != Phase::RadioTablesLoaded
             || self
                 .identity
@@ -240,6 +244,14 @@ impl Startup {
         {
             return Err(Error::Terminal);
         }
+        let firmware = self.firmware.as_mut().ok_or(Error::Terminal)?;
+        if firmware.phase() != firmware_boot::Phase::Running {
+            return Err(Error::Terminal);
+        }
+        let preflight = firmware
+            .transport_mut()
+            .preflight_radio_c(self.assets.as_ref().ok_or(Error::Terminal)?)
+            .map_err(Error::Register)?;
         self.phase = Phase::FullRadioPreparing;
         let mut attempt = Attempt::new(self);
         let result = async {
@@ -254,7 +266,7 @@ impl Startup {
             unsafe {
                 firmware
                     .transport_mut()
-                    .prepare_radio_c(&mut owner.radio_c, &owner.radio, assets, primary)
+                    .prepare_radio_c(&mut owner.radio_c, &owner.radio, assets, profile, preflight)
                     .await
             }
             .map_err(Error::Register)?;

@@ -4,7 +4,7 @@
 use super::*;
 use crate::rtw89::{
     operating_channel, operating_channel_c, power, radio_assets, radio_c, radio_full, radio_init,
-    radio_policy, radio_power, radio_power_c, rfk, tssi,
+    radio_policy, radio_policy_c, radio_power, radio_power_c, rfk, tssi,
 };
 use alloc::sync::Arc;
 pub(in crate::rtw89) struct RadioPreflight {
@@ -671,16 +671,28 @@ pub(super) struct Port<'a> {
     io: &'a mut NativeIo,
     basic: Option<&'a crate::rtw89::calibration_policy::Calibration>,
     full: Option<Arc<radio_policy::Qualification>>,
+    c: Option<Arc<radio_policy_c::Qualification>>,
 }
 impl<'a> Port<'a> {
     pub(super) fn new(
         io: &'a mut NativeIo,
         basic: Option<&'a crate::rtw89::calibration_policy::Calibration>,
         full: Option<Arc<radio_policy::Qualification>>,
+        c: Option<Arc<radio_policy_c::Qualification>>,
     ) -> Self {
-        Self { io, basic, full }
+        Self { io, basic, full, c }
     }
     fn current<T>(
+        &mut self,
+        operation: impl FnOnce(&mut NativeIo) -> Result<T, power::Error>,
+    ) -> Result<T, power::Error> {
+        // RTL8852C: the signed C full program encloses the calibration scope.
+        if let Some(c) = self.c.clone() {
+            return c.with_current(|| self.current_b(operation));
+        }
+        self.current_b(operation)
+    }
+    fn current_b<T>(
         &mut self,
         operation: impl FnOnce(&mut NativeIo) -> Result<T, power::Error>,
     ) -> Result<T, power::Error> {
@@ -731,7 +743,12 @@ impl Native {
     pub(super) fn radio_io(&mut self) -> Result<Port<'_>, power::Error> {
         self.register_access()?;
         let full = self.full_radio_scope();
-        Ok(Port::new(&mut self.io, self.calibration.as_ref(), full))
+        Ok(Port::new(
+            &mut self.io,
+            self.calibration.as_ref(),
+            full,
+            self.qualification_c.clone(),
+        ))
     }
 }
 impl crate::rtw89::channel_bb::Interface for Native {
@@ -770,20 +787,70 @@ impl crate::rtw89::phy_operating::Interface for Native {
 impl Native {
     /// Typed C channel from a 2.4GHz (1..=14) or 5GHz 20MHz primary, with its
     /// `rtw8852c_set_txpwr` program. 6GHz stays refused (no 6GHz TPE/regd).
-    fn channel_plan_c(
+    /// Pure staging of the RTL8852C signed records (no register access):
+    /// the C cold calibration record (`N5CB` v1), the base full program
+    /// (`N5CB` v2, channel 1/20MHz) and every provisioned noninitial
+    /// `N5CC` record over `radio_policy_c::noninitial`. A profile whose
+    /// `radio_power_c` plan cannot be built from the actual assets is not
+    /// looked up (it stays unadmitted). A missing base or calibration record
+    /// is an error before Startup creates its terminal Attempt (retryable).
+    pub(in crate::rtw89) fn preflight_radio_c(
+        &self,
         assets: &radio_assets::Assets,
-        rfe: u8,
-        primary: u8,
-    ) -> Result<(operating_channel_c::Profile, radio_power_c::Plan), power::Error> {
-        use operating_channel_c::{Band, Profile};
-        let band = if primary <= 14 {
-            Band::Ghz2
-        } else {
-            Band::Ghz5
-        };
-        let profile = Profile::new20(band, primary).ok_or(power::Error::Unsupported)?;
-        let plan = radio_power_c::Plan::from_assets(assets, rfe, profile).map_err(denied)?;
-        Ok((profile, plan))
+    ) -> Result<RadioPreflightC, power::Error> {
+        crate::rtw88::pci_park::invoke(&self.authority, || {
+            if self.state != State::Active
+                || self.chip != ChipId::Rtl8852C
+                || self.receive.state() != crate::rtw89::rx_dma::State::Polling
+                || self.calibration.is_some()
+                || self.qualification_c.is_some()
+            {
+                return Err(power::Error::Terminal);
+            }
+            self.radio_profile_current()?;
+            let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+            let identity = factory.identity().ok_or(power::Error::Unsupported)?;
+            let rfe = identity.calibration().rfe_type;
+            let phycap = self.firmware_phycap().ok_or(power::Error::Unsupported)?;
+            let cal_board =
+                crate::rtw89::calibration_policy::Board::new_c(factory, self.device.id, assets)
+                    .map_err(denied)?;
+            let calibration =
+                crate::rtw89::calibration_policy::Calibration::load(cal_board).map_err(denied)?;
+            calibration.current().map_err(denied)?;
+            let board = |plan: &radio_power_c::Plan| {
+                radio_policy_c::Board::new(
+                    self.lifecycle,
+                    factory,
+                    self.device.id,
+                    assets,
+                    plan,
+                    phycap,
+                )
+                .map_err(denied)
+            };
+            let initial = radio_power_c::Plan::from_assets(
+                assets,
+                rfe,
+                operating_channel_c::Profile::INITIAL,
+            )
+            .map_err(denied)?;
+            let mut qualification =
+                radio_policy_c::Qualification::load(board(&initial)?).map_err(denied)?;
+            for profile in radio_policy_c::noninitial() {
+                let Ok(plan) = radio_power_c::Plan::from_assets(assets, rfe, profile) else {
+                    continue;
+                };
+                qualification.load_channel(board(&plan)?).map_err(denied)?;
+            }
+            qualification.current().map_err(denied)?;
+            Ok(RadioPreflightC {
+                cal_board,
+                calibration,
+                qualification: Arc::new(qualification),
+            })
+        })
+        .map_err(denied)?
     }
     /// The C counterpart of `prepare_basic_rfk` + `prepare_full_radio` for
     /// the initial primary: `radio_c::Radio::prepare_controls` (bb_sethw,
@@ -793,12 +860,15 @@ impl Native {
     /// `rtw8852c_rfk_channel`) and the `RF_GET_MCCCH` V0 H2C (category 2,
     /// class 0x0a, function 2, 24-byte body; fw.c `RFK_NTFY_MCC_V0`).
     ///
-    /// Admission is the same signed current envelope B uses
-    /// (`calibration_access`/`rfk::Interface::admit`: a current calibration
-    /// record, coexistence and NCTL ready). No C board/qualification record
-    /// format or C coexistence owner exists yet, so an actual RTL8852C stays
-    /// unadmitted and this returns before its first register write. No
-    /// ordinary grant is ever installed for C here.
+    /// Admission is the C signed record family staged by
+    /// [`Self::preflight_radio_c`], rebound here to this exact Native and
+    /// assets: the C cold calibration record (`N5CB` v1) and the C full
+    /// program whose base (`N5CB` v2) or `N5CC` record admits exactly
+    /// `profile` under the current host rule; that profile is selected
+    /// before the first write and every access then runs inside both
+    /// capability invocations (`Port`, `calibration_access`). Coexistence
+    /// must also be ready; no C coexistence owner exists yet, so an actual
+    /// RTL8852C still stops here. No ordinary grant is installed for C.
     ///
     /// # Safety
     /// Same retained Startup owner after C `prepare_radio_tables`; the outer
@@ -808,25 +878,57 @@ impl Native {
         owner: &mut radio_c::Radio,
         tables: &radio_init::Init,
         assets: &radio_assets::Assets,
-        primary: u8,
+        profile: operating_channel_c::Profile,
+        preflight: RadioPreflightC,
     ) -> Result<(), power::Error> {
         if self.state != State::Active
             || self.chip != ChipId::Rtl8852C
             || owner.state() != radio_c::State::New
             || self.ordinary.is_some()
             || self.full_qualification.is_some()
+            || self.qualification_c.is_some()
+            || self.calibration.is_some()
             || self.nctl_ready
             || tables.state() != radio_init::State::TablesLoaded
         {
             return Err(power::Error::Terminal);
         }
         self.radio_profile_current()?;
-        // Signed current envelope before any write (fail closed for C).
-        self.calibration
-            .as_ref()
-            .ok_or(power::Error::Access)?
-            .current()
-            .map_err(denied)?;
+        let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+        let rfe = factory
+            .identity()
+            .ok_or(power::Error::Unsupported)?
+            .calibration()
+            .rfe_type;
+        let plan = radio_power_c::Plan::from_assets(assets, rfe, profile).map_err(denied)?;
+        let cal_board =
+            crate::rtw89::calibration_policy::Board::new_c(factory, self.device.id, assets)
+                .map_err(denied)?;
+        let board = radio_policy_c::Board::new(
+            self.lifecycle,
+            factory,
+            self.device.id,
+            assets,
+            &plan,
+            self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+        )
+        .map_err(denied)?;
+        let RadioPreflightC {
+            cal_board: staged,
+            calibration: signed,
+            qualification,
+        } = preflight;
+        if staged != cal_board
+            || !signed.matches(cal_board)
+            || !qualification.channel_matches(board)
+            || !qualification.channel_allowed(profile).map_err(denied)?
+        {
+            return Err(power::Error::Access);
+        }
+        signed.current().map_err(denied)?;
+        qualification.select(profile).map_err(denied)?;
+        self.calibration = Some(signed);
+        self.qualification_c = Some(qualification);
         if !self.coex_ready {
             return Err(power::Error::Access);
         }
@@ -842,7 +944,6 @@ impl Native {
         let rfe = identity.calibration().rfe_type;
         let cut = identity.cut();
         let gain = tables.gain().ok_or(power::Error::Unsupported)?.clone();
-        let (_, plan) = Self::channel_plan_c(assets, rfe, primary)?;
         let tracking = rfk::c_tssi::Tracking::from_assets(assets).map_err(denied)?;
         let nctl = crate::rtw89::radio_table::program(
             assets.table(4).ok_or(power::Error::Unsupported)?,
@@ -885,9 +986,15 @@ impl Native {
         if owner.state() != radio_c::State::Ready {
             return Err(power::Error::Terminal);
         }
-        self.channel = Some((primary, owner.epoch()));
+        self.channel = Some((profile.primary(), owner.epoch()));
         Ok(())
     }
+}
+/// Pure staged RTL8852C signed records (`Native::preflight_radio_c`).
+pub(in crate::rtw89) struct RadioPreflightC {
+    cal_board: crate::rtw89::calibration_policy::Board,
+    calibration: crate::rtw89::calibration_policy::Calibration,
+    qualification: Arc<radio_policy_c::Qualification>,
 }
 impl Native {
     /// Chip dispatch of `phy_profile_current`: B unchanged; C requires the

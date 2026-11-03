@@ -3078,11 +3078,11 @@ chip's own factory PHY-cap and PHY window (`NativeIo::c_phy_window`, same
 (C: actual C identity + firmware receipt topology), `prepare_radio_tables`
 selects `Qualified::from_factory_c` for C, and
 `Native::prepare_radio_c(owner, tables, assets, primary)` runs the owner and
-sends `RF_GET_MCCCH` (H2C 2/0x0a/2) with the V0 body. Its admission is B's
-signed current envelope (current calibration record, coexistence ready, then
-`rfk::Interface::admit`), checked before the first write; no C record format
-or C coexistence owner exists, so an actual RTL8852C stays unadmitted and no
-ordinary grant is installed. No Startup caller invokes it; the C native
+sends `RF_GET_MCCCH` (H2C 2/0x0a/2) with the V0 body. Its admission is the
+C signed record family (below: C calibration + `radio_policy_c` profile
+record, then coexistence ready and `rfk::Interface::admit`), checked before
+the first write; no C coexistence owner exists yet, so an actual RTL8852C
+stays unadmitted and no ordinary grant is installed. No Startup caller invokes it; the C native
 MAC/RX lifecycle (`prepare_mac`, `prepare_receive`) now exists for C (below). Unexecuted cases:
 `smoke_rtw89_c_dm_init_txrx_path_and_power_trim_follow_rtw8852c`,
 `smoke_rtw89_c_radio_owner_starts_new`.
@@ -3183,17 +3183,57 @@ a wide C PPDU is not mistaken for 20MHz; B keeps [31:30]. Unexecuted cases:
 and C (`from_prepared` admits both element layouts), so `prepare_mac`,
 `prepare_receive` and `prepare_radio_tables` (C `Qualified::from_factory_c`,
 C firmware PHY-cap) run through the same Startup phases for C.
-`Startup::prepare_radio_c(primary)` follows `RadioTablesLoaded` and drives
+`Startup::prepare_radio_c(profile)` follows `RadioTablesLoaded`, runs the
+pure `preflight_radio_c` record staging (retryable) and then drives
 `Native::prepare_radio_c` on a retained `radio_c::Radio` to `RadioReady`
-(no ordinary grant); it has no pure preflight, so any failure, including
-the fail-closed admission refusal, terminalizes the owner. The bootstrap
-`advance` step dispatches C at `RadioTablesLoaded` to `prepare_radio_c(1)`
+(no ordinary grant); any failure after the preflight terminalizes the
+owner. The bootstrap `advance` step dispatches C at `RadioTablesLoaded` to
+`prepare_radio_c(Profile::INITIAL)`
 (core.c `rtw89_get_default_chandef`: 2.4GHz channel 1, 20MHz) instead of
 B's basic/full calibration. No new test case (the gate needs an actual claim).
 
-Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
-C `power::Calibration`/qualification records (N52x are B-bound), so the
-Startup C radio step currently stops at admission,
+**C signed records (`calibration_policy::Board::new_c`, `radio_policy_c`).**
+The C record family mirrors B's with its own magics, names and identities;
+no B record admits C or vice versa. `Board::new_c` (10ec:c852 only,
+rtw8852ce.c `rtw89_8852ce_id_table`) hashes a C domain string and recipe
+text, the PCI IDs, the C logical map, the 0x60-byte C PHY-cap window,
+cut/RFE/XTAL and `Assets::bind` (container digest, firmware version, the
+five decoded C tables); no coexistence protocol is bound yet. Its record
+is `N5CB` v1 (`rtw89/rtw8852c-cal-v1-<mac>.bin`, 96 bytes, B's v1 layout),
+admitting the cold channel-1/20MHz span 2402..2422 like B. The full program
+(`radio_policy_c::Board::new`) composes that identity with the C-bound
+firmware PHY-cap receipt fingerprint, the `radio_c` recipe text, the exact
+`radio_power_c::Plan::bind` and the profile (band, primary, centre, width),
+domain-separated per band and per observed-FLR lifecycle. Its base record
+is `N5CB` v2 (`rtw89/rtw8852c-radio-v2-<mac>.bin`, 128 bytes, B's v2
+layout with profile `[1, 20, 1]` and flags exactly 3: C has no WMM/QoS/RA/
+HT/HE/A-MPDU programs and no N52A/N52T/N52P/N52F companions). Each
+noninitial typed profile in `radio_policy_c::noninitial` (2.4GHz 20MHz
+2..=13, 2.4GHz HT40 either side, every 5GHz 20/40/80/160MHz block; never
+channel 14 or 6GHz) may carry `N5CC` v1
+(`rtw89/rtw8852c-chan-v1-<2|5>g-ch<primary>-bw<width>-<mac>.bin`, 128 bytes:
+`[1, width MHz, primary, 3]` at 54, band/centre at 68/69), signed by the base
+signer and bound to the base digest/signer. The envelope check covers the
+profile's whole occupied span: overlapping rules must cover it without a
+gap, each must allow the profile width (`max_bandwidth`, incl. AUTO_BW and
+NO_160MHZ), DFS/NO_IR only at 5GHz (passive), and every peak plus antenna
+gain must stay under the minimum rule power and signed ceiling.
+`Native::preflight_radio_c` stages all of them without register access (a
+profile whose `radio_power_c` plan cannot be built from the actual assets is
+not looked up); `Startup::prepare_radio_c(profile)` runs it before creating
+its terminal Attempt (a missing record is retryable), and
+`Native::prepare_radio_c(.., profile, preflight)` rebinds both identities,
+requires `channel_allowed(profile)`, `select`s it and installs the C
+calibration and `qualification_c`, which then gate every `Port` access and
+`calibration_access`. NARF carries no C board value; an unprovisioned board
+stays unadmitted. Unexecuted cases:
+`smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record`,
+`smoke_rtw8852c_full_radio_base_record_is_n5cb_v2_exact_and_revocable`,
+`smoke_rtw8852c_channel_records_admit_exactly_their_profile_and_span`.
+
+Remaining for the `rtl8852c` row (no row credit): C coexistence init (the
+Startup C radio step stops at `coex_ready` after record admission), a native
+C retune caller over the admitted `N5CC` profiles,
 C WoW/DMA-stop RX rewind (B registers only), `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.

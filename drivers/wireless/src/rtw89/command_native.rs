@@ -110,6 +110,9 @@ pub struct Native {
     radio_shutdown: super::radio_shutdown::Shutdown,
     ordinary: Option<OrdinaryGrant>,
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
+    /// RTL8852C signed full program (N5CB v2 + N5CC records) gating every
+    /// C radio access together with the C calibration record.
+    qualification_c: Option<alloc::sync::Arc<super::radio_policy_c::Qualification>>,
     operating: Option<super::phy_operating::Operating>,
     irq: Option<super::irq::Binding>,
     /// RTL8852B HCI DMA-stop proof earned by the terminal closure.
@@ -295,6 +298,7 @@ impl Native {
             radio_shutdown: super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
+            qualification_c: None,
             operating: Some(super::phy_operating::Operating::default()),
             irq: None,
         })
@@ -478,6 +482,9 @@ impl Native {
         Ok(())
     }
     fn calibration_access(&mut self) -> Result<(), super::power::Error> {
+        if let Some(c) = self.qualification_c.as_ref() {
+            c.current().map_err(|_| super::power::Error::Access)?;
+        }
         if let Some(full) = self.full_radio_scope() {
             full.current().map_err(|_| super::power::Error::Access)?;
         } else {
@@ -756,7 +763,12 @@ impl Native {
     ) -> Result<u32, super::power::Error> {
         self.radio_access()?;
         let full = self.full_radio_scope();
-        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full);
+        let mut io = radio::Port::new(
+            &mut self.io,
+            self.calibration.as_ref(),
+            full,
+            self.qualification_c.clone(),
+        );
         // SAFETY: actual cold/MAC/RX owner, complete B aperture and current
         // signed register scope; retained outer attempt handles cancellation.
         let result = unsafe { self.radio.read(&mut io, path, address, mask).await };
@@ -781,7 +793,12 @@ impl Native {
         // SAFETY: same actual full-aperture/current B radio owner; no parallel
         // producer and outer attempt retains DMA on failure/cancellation.
         let full = self.full_radio_scope();
-        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full);
+        let mut io = radio::Port::new(
+            &mut self.io,
+            self.calibration.as_ref(),
+            full,
+            self.qualification_c.clone(),
+        );
         // SAFETY: same retained analog owner with current signed MMIO scope.
         let result = unsafe { self.radio.write(&mut io, path, address, mask, value).await };
         if result.is_err() {

@@ -553,7 +553,8 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
                 .identity()
                 .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C) =>
         {
-            io.prepare_radio_c(1).await?
+            io.prepare_radio_c(super::operating_channel_c::Profile::INITIAL)
+                .await?
         }
         Phase::RadioTablesLoaded => io.prepare_basic_calibration().await?,
         Phase::BasicCalibrated => io.prepare_full_radio().await?,

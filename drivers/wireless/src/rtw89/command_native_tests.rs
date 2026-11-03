@@ -109,6 +109,7 @@ impl Fixture {
             radio_shutdown: super::super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
+            qualification_c: None,
             operating: Some(super::super::phy_operating::Operating::default()),
             irq: None,
             phycap: None,

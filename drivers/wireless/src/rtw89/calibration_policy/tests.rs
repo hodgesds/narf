@@ -20,6 +20,7 @@ fn board() -> Board {
         identity: [7; 32],
         mac: [2, 4, 6, 8, 10, 12],
         device: 0xb852,
+        chip: ChipId::Rtl8852B,
     }
 }
 fn image(board: Board) -> [u8; LENGTH] {
@@ -297,3 +298,36 @@ pub(in crate::rtw89) fn revocable_model() -> (Calibration, Cap<FirmwareBlob, Rea
     calibration.model_domain = Some(domain());
     (calibration, cap)
 }
+fn smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record() -> TestResult {
+    let b = board();
+    let c = Board {
+        device: 0xc852,
+        chip: ChipId::Rtl8852C,
+        ..b
+    };
+    let mut bytes = image(c);
+    let cap = authority();
+    // A B-magic record never admits the C board.
+    if Calibration::from_verified(&bytes, Some([3; 32]), c, cap).is_ok() {
+        return TestResult::Fail("N52B record admitted an RTL8852C board");
+    }
+    bytes[..4].copy_from_slice(b"N5CB");
+    let calibration = match Calibration::from_verified(&bytes, Some([3; 32]), c, cap) {
+        Ok(calibration) => calibration,
+        Err(_) => return TestResult::Fail("exact N5CB calibration refused"),
+    };
+    if !calibration.matches(c) || calibration.matches(b) || calibration.check(&domain()).is_err() {
+        return TestResult::Fail("C calibration bound to the wrong board or span");
+    }
+    // ... and an N5CB record never admits the B board.
+    let mut b_bytes = image(b);
+    b_bytes[..4].copy_from_slice(b"N5CB");
+    if Calibration::from_verified(&b_bytes, Some([3; 32]), b, cap).is_ok() {
+        return TestResult::Fail("N5CB record admitted an RTL8852B board");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record
+);
