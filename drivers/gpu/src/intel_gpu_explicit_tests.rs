@@ -544,6 +544,128 @@ kernel_test_in!(
     smoke_explicit_fence_arrays_resolve_entry_by_entry
 );
 
+/// MIT Linux b90c984d i915_gem_execbuffer.c::i915_gem_execbuffer2_ioctl:3555
+/// runs check_buffer_count:3541 and i915_gem_check_execbuffer:2180, copies
+/// the exec-object array (-EFAULT), and only then calls
+/// i915_gem_do_execbuffer:3339, which refuses I915_EXEC_SECURE (-ENODEV)
+/// before parse_execbuf2_extensions, add_fence_array and the IN/SUBMIT
+/// sync_file; eb_lookup_vmas resolves the objects after all of them.
+fn smoke_explicit_execbuffer_checks_and_copies_before_fences() -> TestResult {
+    use crate::intel_gpu_exec::ExecRequest;
+    const UNREADABLE: u64 = 0x7fff_0000;
+    let file = RenderFile::new();
+    let user = Fds::new();
+    let object = file.gem.create(4096, |_, _| Ok(())).unwrap();
+    // One pinned 48-bit object at 2 MiB, and a FENCE_ARRAY entry waiting on
+    // a syncobj that does not exist (-ENOENT once parsed).
+    let mut entry = [0; 56];
+    put32(&mut entry, 0, object);
+    put64(&mut entry, 24, 0x20_0000);
+    put64(&mut entry, 32, 0x18);
+    user.user.store(256, &entry);
+    let mut fence = [0; 8];
+    put32(&mut fence, 0, 99);
+    put32(&mut fence, 4, 1);
+    user.user.store(1024, &fence);
+    let fenced = abi::EXEC_NO_RELOC | abi::EXEC_FENCE_ARRAY;
+    let submit = |edit: &dyn Fn(&mut [u8; 64])| {
+        let mut request = [0; 64];
+        put64(&mut request, 0, 256);
+        put32(&mut request, 8, 1);
+        put32(&mut request, 16, 8);
+        put32(&mut request, 28, 1);
+        put64(&mut request, 32, 1024);
+        put64(&mut request, 40, fenced);
+        edit(&mut request);
+        user.user.store(64, &request);
+        ExecRequest::read_submission(&user, 64, &file.gem, &file.syncobjs).map(|(exec, _)| exec)
+    };
+    let errno = |edit: &dyn Fn(&mut [u8; 64])| submit(edit).map(|_| ());
+    let plain = |request: &mut [u8; 64]| {
+        put32(request, 28, 0);
+        put64(request, 32, 0);
+        put64(request, 40, abi::EXEC_NO_RELOC);
+    };
+    assert_eq!(errno(&|_| {}), Err(FsError::NotFound), "the fence array");
+    // check_buffer_count and i915_gem_check_execbuffer, before the fences.
+    let header: [(&dyn Fn(&mut [u8; 64]), &str); 8] = [
+        (&|r: &mut [u8; 64]| put32(r, 8, 0), "no buffers"),
+        (&|r: &mut [u8; 64]| put32(r, 12, 4), "batch_start_offset & 7"),
+        (&|r: &mut [u8; 64]| put32(r, 16, 12), "batch_len & 7"),
+        (&|r: &mut [u8; 64]| put32(r, 20, 1), "DR1"),
+        (&|r: &mut [u8; 64]| put32(r, 24, 1), "DR4"),
+        (&|r: &mut [u8; 64]| put64(r, 40, fenced | 1 << 6), "CONSTANTS_MASK"),
+        (&|r: &mut [u8; 64]| put64(r, 40, fenced | 1 << 15), "RESOURCE_STREAMER"),
+        (&|r: &mut [u8; 64]| put64(r, 40, fenced | 1 << 22), "unknown flag"),
+    ];
+    for (edit, why) in header {
+        assert_eq!(errno(edit), Err(FsError::InvalidData), "{why}");
+    }
+    // DRI1 cliprects without FENCE_ARRAY or USE_EXTENSIONS: before the copy.
+    assert_eq!(
+        errno(&|r| {
+            put64(r, 40, abi::EXEC_NO_RELOC);
+            put64(r, 0, UNREADABLE);
+        }),
+        Err(FsError::InvalidData)
+    );
+    // The exec-object copy precedes the fences.
+    assert_eq!(
+        errno(&|r| put64(r, 0, UNREADABLE)),
+        Err(FsError::BadAddress)
+    );
+    // SECURE: after the copy, before the fences.
+    let secure = fenced | abi::EXEC_SECURE;
+    assert_eq!(errno(&|r| put64(r, 40, secure)), Err(FsError::NoDevice));
+    assert_eq!(
+        errno(&|r| {
+            put64(r, 40, secure);
+            put64(r, 0, UNREADABLE);
+        }),
+        Err(FsError::BadAddress)
+    );
+    // The objects follow the fences: an unknown object flag loses to the
+    // fence, and is -EINVAL without one.
+    let mut bad = entry;
+    put64(&mut bad, 32, 0x18 | 1 << 9);
+    user.user.store(256, &bad);
+    assert_eq!(errno(&|_| {}), Err(FsError::NotFound));
+    assert_eq!(errno(&plain), Err(FsError::InvalidData));
+    user.user.store(256, &entry);
+    // UXA's DR4 0xffffffff is fixed up to 0; IS_PINNED only steers gen2;
+    // rsvd1's upper half never reaches i915_gem_context_lookup(u32).
+    let exec = submit(&|r| {
+        plain(r);
+        put32(r, 24, u32::MAX);
+        put64(r, 40, abi::EXEC_NO_RELOC | abi::EXEC_IS_PINNED);
+        put64(r, 48, 1 << 32 | 5);
+    })
+    .expect("accepted execbuffer");
+    assert_eq!(exec.context_id, 5);
+    // The synchronous kernel path keeps the same order.
+    let mut request = [0; 64];
+    put64(&mut request, 0, UNREADABLE);
+    put32(&mut request, 8, 1);
+    put32(&mut request, 16, 8);
+    put64(&mut request, 40, abi::EXEC_NO_RELOC | abi::EXEC_SECURE);
+    user.user.store(64, &request);
+    assert_eq!(
+        ExecRequest::read(&user, 64, &file.gem).map(|_| ()),
+        Err(FsError::BadAddress)
+    );
+    put64(&mut request, 0, 256);
+    user.user.store(64, &request);
+    assert_eq!(
+        ExecRequest::read(&user, 64, &file.gem).map(|_| ()),
+        Err(FsError::NoDevice)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_explicit_execbuffer_checks_and_copies_before_fences
+);
+
 mod submit {
     include!("intel_gpu_submit_tests.rs");
 }

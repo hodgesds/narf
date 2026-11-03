@@ -1207,8 +1207,15 @@ RAM as system RAM; no local-memory region or Arc display binding is inferred.
 `intel_gpu_exec::ExecRequest::read` admits a bounded softpin/no-relocation
 residency plan: this file's unique handles, valid canonical GPU addresses,
 alignment, non-overlap, first/last batch selection and in-object batch extent.
-Secure execution, relocations and unsupported flags are refused.
-`read_submission` additionally copies explicit synchronization once;
+Both entry points follow i915_gem_execbuffer2_ioctl/i915_gem_do_execbuffer:
+check_buffer_count and i915_gem_check_execbuffer (EINVAL: no buffers, illegal
+flags, DRI1 cliprects without FENCE_ARRAY/USE_EXTENSIONS, DR1, DR4 other than
+UXA's 0xffffffff, batch start/length alignment), then the exec-object copy
+(EFAULT), then SECURE (ENODEV); IS_PINNED is accepted and rsvd1's upper half
+ignored. Relocations, more than 4096 objects and, on the synchronous path,
+fence flags are refused (EINVAL) with the header checks.
+`read_submission` then copies explicit synchronization once, and only after
+it resolves the objects (eb_lookup_vmas);
 `address_space(format, pat_index)` constructs immutable private PPGTT
 tables retaining every referenced object; failed construction tears down all
 tables. This compatibility planner has a single WB host PAT: WC and VRAM

@@ -88,7 +88,9 @@ fn find(table: &IrqSafeSpinLock<SyncObjTable>, handle: u32) -> Result<Arc<SyncOb
 impl SyncRequest {
     /// The fence half of i915_gem_do_execbuffer, in its order:
     /// parse_execbuf2_extensions (TIMELINE_FENCES), add_fence_array, then
-    /// the IN/SUBMIT sync_file.
+    /// the IN/SUBMIT sync_file. The caller has already run
+    /// i915_gem_check_execbuffer, which refuses cliprects without
+    /// FENCE_ARRAY or USE_EXTENSIONS, and copied the exec objects.
     pub fn read(
         user: &dyn IoctlContext,
         wire: &[u8; 64],
@@ -99,13 +101,9 @@ impl SyncRequest {
         let extensions = flags & abi::EXEC_USE_EXTENSIONS != 0;
         let count = u32_at(wire, 28);
         let pointer = u64_at(wire, 32);
-        // i915_gem_check_execbuffer refuses cliprects without either flag;
         // parse_execbuf2_extensions refuses FENCE_ARRAY or num_cliprects
-        // beside USE_EXTENSIONS.
-        if (array && extensions)
-            || (!array && count != 0)
-            || (!array && !extensions && pointer != 0)
-        {
+        // beside USE_EXTENSIONS before walking the chain.
+        if extensions && (array || count != 0) {
             return Err(FsError::InvalidData);
         }
         let input_word = u64_at(wire, 56) as u32;

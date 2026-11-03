@@ -175,35 +175,49 @@ impl ExecRequest {
     /// Admit the modern no-relocation, fixed-placement subset. Rejection
     /// changes no object, VM or context and never writes an output offset.
     pub fn read(user: &dyn IoctlContext, address: u64, gem: &GemState) -> Result<Self, FsError> {
-        let mut request = [0; 64];
-        user.read(address, &mut request)?;
-        Self::read_wire(user, &request, gem, false)
+        ExecWire::read(user, address, false)?.resolve(gem)
     }
 
+    /// i915_gem_execbuffer2_ioctl:3555 and i915_gem_do_execbuffer:3339 in
+    /// their order: the argument checks and the exec-object copy
+    /// (ExecWire::read), then the fences (parse_execbuf2_extensions,
+    /// add_fence_array, the IN/SUBMIT sync_file), and only then the objects
+    /// eb_lookup_vmas resolves.
     pub(crate) fn read_submission(
         user: &dyn IoctlContext,
         address: u64,
         gem: &GemState,
         syncobjs: &narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
     ) -> Result<(Self, crate::intel_gpu_exec_sync::SyncRequest), FsError> {
+        let wire = ExecWire::read(user, address, true)?;
+        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &wire.request, syncobjs)?;
+        Ok((wire.resolve(gem)?, sync))
+    }
+}
+
+/// The copied drm_i915_gem_execbuffer2 and its exec-object array: what
+/// i915_gem_execbuffer2_ioctl hands i915_gem_do_execbuffer.
+struct ExecWire {
+    request: [u8; 64],
+    objects: Vec<u8>,
+}
+
+impl ExecWire {
+    /// i915_gem_execbuffer2_ioctl's check_buffer_count:3541 and
+    /// i915_gem_check_execbuffer:2180 (each -EINVAL), the exec-object copy
+    /// (-EFAULT), then i915_gem_do_execbuffer's first refusal: I915_EXEC_SECURE
+    /// is -ENODEV on GRAPHICS_VER >= 11. No fence, handle or context is read.
+    fn read(user: &dyn IoctlContext, address: u64, explicit: bool) -> Result<Self, FsError> {
         let mut request = [0; 64];
         user.read(address, &mut request)?;
-        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &request, syncobjs)?;
-        Ok((Self::read_wire(user, &request, gem, true)?, sync))
-    }
-
-    fn read_wire(
-        user: &dyn IoctlContext,
-        request: &[u8; 64],
-        gem: &GemState,
-        explicit: bool,
-    ) -> Result<Self, FsError> {
-        let count = u32_at(request, 8) as usize;
-        let start = u32_at(request, 12) as u64;
-        let length = u32_at(request, 16) as u64;
-        let flags = u64_at(request, 40);
+        let count = u32_at(&request, 8) as usize;
+        let flags = u64_at(&request, 40);
+        // __I915_EXEC_ILLEGAL_FLAGS is every unknown bit, CONSTANTS_MASK and
+        // RESOURCE_STREAMER. IS_PINNED only steers gen2 dispatch.
         let mut supported = 0x3f
             | abi::EXEC_BSD_MASK
+            | abi::EXEC_SECURE
+            | abi::EXEC_IS_PINNED
             | abi::EXEC_NO_RELOC
             | abi::EXEC_HANDLE_LUT
             | abi::EXEC_BATCH_FIRST;
@@ -214,30 +228,50 @@ impl ExecRequest {
                 | abi::EXEC_FENCE_SUBMIT
                 | abi::EXEC_USE_EXTENSIONS;
         }
+        // DRI1 cliprects: FENCE_ARRAY and USE_EXTENSIONS reuse the fields.
+        let cliprects = flags & (abi::EXEC_FENCE_ARRAY | abi::EXEC_USE_EXTENSIONS) == 0
+            && (u32_at(&request, 28) != 0 || u64_at(&request, 32) != 0);
+        // "UXA submitting garbage DR4, fixing up": 0xffffffff counts as 0.
+        let dr4 = u32_at(&request, 24);
+        // check_buffer_count refuses no buffers (NARF bounds the list at
+        // MAX_OBJECTS beside it), then i915_gem_check_execbuffer's illegal
+        // flags, cliprects, DR1/DR4 and batch alignment. NARF also refuses
+        // here what it cannot execute: relocations, and on the synchronous
+        // kernel path fences, with rsvd2 then zero. rsvd1's upper half is
+        // ignored: i915_gem_context_lookup takes a u32.
         if count == 0
             || count > MAX_OBJECTS
             || flags & !supported != 0
             || flags & abi::EXEC_NO_RELOC == 0
-            || u32_at(request, 20) != 0
-            || u32_at(request, 24) != 0
-            || (!explicit
-                && (u32_at(request, 28) != 0
-                    || u64_at(request, 32) != 0
-                    || u64_at(request, 56) != 0))
-            || u64_at(request, 48) > u32::MAX as u64
-            || start % 8 != 0
-            || length % 8 != 0
+            || cliprects
+            || u32_at(&request, 20) != 0
+            || (dr4 != 0 && dr4 != u32::MAX)
+            || (!explicit && u64_at(&request, 56) != 0)
+            || (u32_at(&request, 12) | u32_at(&request, 16)) % 8 != 0
         {
             return Err(FsError::InvalidData);
         }
-        let mut wire = vec![0; count * 56];
-        user.read(u64_at(request, 0), &mut wire)?;
+        let mut objects = vec![0; count * 56];
+        user.read(u64_at(&request, 0), &mut objects)?;
+        if flags & abi::EXEC_SECURE != 0 {
+            return Err(FsError::NoDevice);
+        }
+        Ok(Self { request, objects })
+    }
+
+    /// eb_lookup_vmas and the batch selection, after the fences.
+    fn resolve(self, gem: &GemState) -> Result<ExecRequest, FsError> {
+        let request = &self.request;
+        let count = u32_at(request, 8) as usize;
+        let start = u32_at(request, 12) as u64;
+        let length = u32_at(request, 16) as u64;
+        let flags = u64_at(request, 40);
         let mut handles = BTreeSet::new();
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(count)
             .map_err(|_| FsError::OutOfMemory)?;
-        for entry in wire.chunks_exact(56) {
+        for entry in self.objects.chunks_exact(56) {
             let handle = u32_at(entry, 0);
             let alignment = u64_at(entry, 16);
             let offset = u64_at(entry, 24);
@@ -309,7 +343,7 @@ impl ExecRequest {
         {
             return Err(FsError::InvalidData);
         }
-        Ok(Self {
+        Ok(ExecRequest {
             context_id: u64_at(request, 48) as u32,
             ring: (flags & (0x3f | abi::EXEC_BSD_MASK)) as u32,
             batch_va: batch.va + start,
@@ -317,7 +351,9 @@ impl ExecRequest {
             objects,
         })
     }
+}
 
+impl ExecRequest {
     /// Build private tables without touching any engine or existing VM. A
     /// failed build drops all table pages; successful ownership includes all
     /// leaf objects and survives GEM_CLOSE or the submitting fd's destruction.

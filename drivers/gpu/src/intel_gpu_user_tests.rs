@@ -421,7 +421,8 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
     let handles = buffers(&file, &info, &user);
     exec(&user, handles, 0);
     let mut cx = Context::from_waker(Waker::noop());
-    // Secure dispatch is rejected before the backend sees any work.
+    // Secure dispatch is rejected before the backend sees any work:
+    // i915_gem_do_execbuffer's -ENODEV for GRAPHICS_VER >= 11.
     let mut hostile = user.load(64, 64);
     let flags = u64_at(&hostile, 40);
     put64(&mut hostile, 40, flags | (1 << 9));
@@ -430,7 +431,7 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
         let mut call = core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2, 64, &user));
         assert_eq!(
             call.as_mut().poll(&mut cx),
-            Poll::Ready(Some(Err(FsError::InvalidData)))
+            Poll::Ready(Some(Err(FsError::NoDevice)))
         );
         assert!(backend.pending.lock().is_empty());
     }

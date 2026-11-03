@@ -69,6 +69,8 @@ pub const CONTEXT_ENGINES_EXT_LOAD_BALANCE: u32 = 0;
 /// I915_ENGINE_CLASS_INVALID with I915_ENGINE_CLASS_INVALID_NONE: an empty
 /// engine-map slot.
 pub const ENGINE_INVALID: u16 = 0xffff;
+pub const EXEC_SECURE: u64 = 1 << 9;
+pub const EXEC_IS_PINNED: u64 = 1 << 10;
 pub const EXEC_NO_RELOC: u64 = 1 << 11;
 pub const EXEC_HANDLE_LUT: u64 = 1 << 12;
 pub const EXEC_FENCE_IN: u64 = 1 << 16;
