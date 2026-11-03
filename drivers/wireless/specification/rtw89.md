@@ -4128,10 +4128,53 @@ yet. Unexecuted cases:
 `smoke_rtw89_n51_dm_init_txrx_path_and_power_trim_follow_rtw8851b`,
 `smoke_rtw89_n51_radio_owner_starts_new`.
 
+**RTL8851B signed records (`calibration_policy::Board::new_51`,
+`radio_policy_51`).** The RTL8851B family mirrors C's with its own magics,
+names and identities; no B or C record admits RTL8851B or vice versa.
+`Board::new_51` (10ec:b851 only, rtw8851be.c `rtw89_8851be_id_table`) hashes
+an RTL8851B domain string, the path-A calibration recipe and the WLAN-only
+coexistence recipe (rtw8851b.c `rtw8851b_btc_set_rfe`/`_btc_init_cfg`), the
+PCI IDs, the logical map, the 128-byte PHY-cap window at 0x580
+(`n51_phycap`), cut/RFE/XTAL and `Assets::bind`; it requires a firmware on a
+known RTL8851B BTC ABI row (`coex_native::Protocol51`: coex.c
+`rtw89_btc_ver_defs` 0.29.29 up to the 0.29.133 v7 row, field-for-field the
+RTL8852B 0.29.29 row; the shipped `rtw8851b_fw-1.bin` is 0.29.41.5) and has
+no identity for an antenna-diversity RFE (`rfe_type % 3 == 2`) until that
+owner exists. Its record is `N51B` v1 (`rtw89/rtw8851b-cal-v1-<mac>.bin`, 96
+bytes, B's v1 layout) over the cold 2402..2422 span. The firmware PHY-cap
+receipt gains an RTL8851B decode (`firmware_phycap::Receipt::decode_51`:
+mac.c `rtw89_mac_setup_phycap_part0` with `chip->tx_nss`/`rx_nss` 1 and the
+`rf_path_num == 1` RF_A override; `initial_profile_51` refuses Linux's
+one-path `tx_path_diversity` and any non-RTL8851B receipt; distinct
+fingerprint label). The full program (`radio_policy_51::Board::new`)
+composes the calibration identity with that receipt fingerprint, the
+`radio_51` recipe, the `Plan::visit_51` program text and `Plan::bind`
+(restated geometry checked against the typed B profile), the B
+`Profile::bind` geometry and (band, primary, centre, width), domain-separated
+per band and per observed-FLR lifecycle; a 40/80MHz identity also binds
+`station_control::wide_fingerprint`. Base record `N51B` v2
+(`rtw89/rtw8851b-radio-v2-<mac>.bin`, 128 bytes, profile `[1, 20, 1]`, flags
+exactly 3: no RTL8851B station program exists yet). Each noninitial typed
+profile in `radio_policy_51::noninitial` (2.4GHz 20MHz 2..=13, 2.4GHz HT40
+either side, every 5GHz 20/40/80MHz block incl. UNII-4; never channel 14,
+160MHz or 2.4GHz 80MHz) may carry `N51C` v1
+(`rtw89/rtw8851b-chan-v1-<2|5>g-ch<primary>-c<centre>-bw<width>-<mac>.bin`,
+128 bytes: `[1, width, primary, 3]` at 54, `rtw89_band`/centre at 68/69;
+the centre is in the name so the two HT40 sides never share a file), signed
+by the base signer and bound to the base digest/signer. Admission is C's
+whole-span rule (`radio_policy_c::check_envelope`, now shared): gapless
+overlapping rules, each allowing the width (AUTO_BW, NO_160MHZ), DFS/NO_IR
+passive-only at 5GHz (signed emissions but no frame: `tx_current`), every
+peak plus antenna gain under the minimum rule power and the signed ceiling.
+NARF carries no RTL8851B board value; an unprovisioned board stays
+unadmitted. Unexecuted cases:
+`smoke_rtw8851b_calibration_record_is_n51b_and_never_a_b_or_c_record`,
+`smoke_rtw8851b_full_radio_base_record_is_n51b_v2_exact_and_revocable`,
+`smoke_rtw8851b_channel_records_admit_exactly_their_profile_and_span`.
+
 **Remaining for the row.** the native composition (chip dispatch in
 `command_native`, RTL8851B startup assets/bootstrap, post-WCPU MAC and
-ring-geometry branches; native radio access needs the signed record family
-first), the signed record family, coex (`rtw8851b_btc_*`,
+ring-geometry branches), coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)

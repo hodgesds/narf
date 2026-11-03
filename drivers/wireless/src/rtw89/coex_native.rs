@@ -55,6 +55,22 @@ impl Protocol {
         ]
     }
 }
+/// RTL8851B coex.c `rtw89_btc_ver_defs` rows: 0.29.29 (up to the 0.29.133
+/// row) is field-for-field the RTL8852B 0.29.29 row (`fcxtdma` 3,
+/// `fcxslots` 1, `fcxinit` 0, `fcxctrl` 1, `drvinfo_ver` 0), so B's
+/// [`Protocol`] encodings apply; the shipped `rtw8851b_fw-1.bin` (0.29.41.5)
+/// selects it. The 0.29.133 v7 row and anything below 0.29.29 (Linux's
+/// default row belongs to another chip) have no NARF ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Protocol51;
+impl Protocol51 {
+    pub fn for_version(v: [u8; 4]) -> Option<Self> {
+        let code = u32::from_be_bytes(v);
+        (u32::from_be_bytes([0, 29, 29, 0])..u32::from_be_bytes([0, 29, 133, 0]))
+            .contains(&code)
+            .then_some(Self)
+    }
+}
 /// RTL8852C coex.c `rtw89_btc_ver_defs` rows: every C row has `fcxinit` 0
 /// and `fcxctrl` 1 (B's init/ctrl encodings); 0.27.0..0.27.97 use
 /// `fcxtdma` 3 / `fcxslots` 1 (B's policy encoding) and 0.27.97 onward

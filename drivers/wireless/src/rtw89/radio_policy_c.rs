@@ -305,7 +305,7 @@ impl Board {
 const SIX_GHZ_STATION: &[u8] = b"NARF RTL8852C HE-only 6GHz station v1;HE cap + HE 6GHz band cap (ieee80211_he_6ghz_capa);no HT/VHT;RA HE-only (rtw89_phy_ra_sta_update, RTW89_BAND_6G)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Envelope {
+pub(super) struct Envelope {
     span: (u32, u32),
     /// 6GHz only: the client power type every overlapping rule must admit.
     client: Option<narf_wireless::reg::PowerType6Ghz>,
@@ -322,11 +322,26 @@ impl CapOp<FirmwareBlob, Read> for Current {
     }
 }
 fn envelope(bytes: &[u8], profile: Profile, six: Option<SixGhzPower>) -> Result<Envelope, Error> {
+    envelope_at(
+        bytes,
+        profile.occupied(),
+        profile.width().mhz(),
+        six.map(client_type),
+    )
+}
+/// The signed antenna/ceiling/peaks (bytes 58..68) over an occupied span of
+/// `width` MHz; shared with the RTL8851B family (`radio_policy_51`).
+pub(super) fn envelope_at(
+    bytes: &[u8],
+    span: (u32, u32),
+    width: u32,
+    client: Option<narf_wireless::reg::PowerType6Ghz>,
+) -> Result<Envelope, Error> {
     let signed = |at: usize| i16::from_le_bytes([bytes[at], bytes[at + 1]]);
     let e = Envelope {
-        span: profile.occupied(),
-        client: six.map(client_type),
-        width: profile.width().mhz(),
+        span,
+        client,
+        width,
         antenna_qdb: signed(58),
         ceiling_qdbm: signed(60),
         peaks_qdbm: [signed(62), signed(64), signed(66)],
@@ -339,7 +354,7 @@ fn envelope(bytes: &[u8], profile: Profile, six: Option<SixGhzPower>) -> Result<
     }
     Ok(e)
 }
-fn loader() -> Result<Cap<narf_firmware::FirmwareRegistry, Read>, Error> {
+pub(super) fn loader() -> Result<Cap<narf_firmware::FirmwareRegistry, Read>, Error> {
     narf_firmware::trusted_loader_authority()
         .and_then(|c| c.derive::<Read>().ok())
         .ok_or(Error::Authority)
@@ -831,7 +846,7 @@ impl Qualification {
     }
 }
 /// The host rules over the envelope's whole occupied span. `Ok(passive)`.
-fn check_envelope(domain: &RegulatoryDomain, envelope: Envelope) -> Result<bool, Error> {
+pub(super) fn check_envelope(domain: &RegulatoryDomain, envelope: Envelope) -> Result<bool, Error> {
     if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
         return Err(Error::Policy);
     }

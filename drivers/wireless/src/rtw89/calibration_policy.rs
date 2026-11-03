@@ -4,7 +4,9 @@
 //!
 //! RTL8852C has its own format (magic `N5CB` v1, `rtw8852c-cal-v1-<mac>.bin`)
 //! over its own identity ([`Board::new_c`]); a B record never admits C and
-//! vice versa. Both admit only the cold channel-1/20MHz span 2402..2422.
+//! vice versa. RTL8851B likewise has `N51B` v1 (`rtw8851b-cal-v1-<mac>.bin`)
+//! over [`Board::new_51`]. All admit only the cold channel-1/20MHz span
+//! 2402..2422.
 use super::{factory::Factory, mac::ChipId, radio_assets::Assets};
 use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
@@ -32,6 +34,14 @@ pub(super) struct Board {
 const C_RECIPE: &[u8] = b"rtw89_mac_init(C) then phy.c rtw89_phy_dm_init: rtw89_phy_init_bb_reg, rtw8852c_init_txpwr_unit, rtw8852c_bb_reset_all, rtw89_phy_init_rf_reg {radiob,radioa}, rtw8852c_bb_sethw, physts/dig(V1 cckpd)/cfo/edcca init, rtw89_phy_init_rf_nctl (no second IOQ write), rtw8852c_rfk_init (dpk_init, _rck A/B, _dac_cal, _rx_dck recover), rtw8852c_set_txpwr_ctrl, rtw8852c_power_trim, rtw8852c_bb_cfg_txrx_path(RF_AB)";
 /// RTL8852C WLAN-only coexistence owner (`coex_native::Coex::prepare_c`).
 const C_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8852c_btc_set_rfe, rtw8852c_btc_init_cfg (rtw89_mac_coex_init_v1 RTK inner, wl_pri TX_RESP/BEACON, RR_WLSEL 0, trx mask, break 0xf0ffffff, BT cnt en|rst), scbd 0x4003, cxinit v0, cxctrl v1, txpwr ctrl off, _set_ant WONLY gnt_v1 0x57ddf + plt 0x111, OFF_BT policy";
+/// RTL8851B cold calibration recipe (Linux 7.3-rc4 call chain, RF path A
+/// only). As for C, every table byte comes from the bound firmware
+/// container (`Assets::bind`) and the bound factory.
+const N51_RECIPE: &[u8] = b"rtw89_mac_init(8851B) then phy.c rtw89_phy_dm_init: rtw89_phy_init_bb_reg, rtw8851b_init_txpwr_unit, rtw8851b_bb_reset (S0 HW-SI only), rtw89_phy_init_rf_reg {radioa}, rtw8851b_bb_sethw (rtw8851b_bb_gpio_init path A), physts/dig(cckpd every cut)/cfo(hw comp)/edcca init, no antdiv RFE, rtw89_phy_init_rf_nctl (no P1 reset, no second IOQ write) + rtw8851b_nctl_post_defs, rtw8851b_rfk_init (lck_init, dpk_init by_rate_dpd, aack, _rck A, _dac_cal, rx_dck), rtw8851b_set_txpwr_ctrl, rtw8851b_power_trim (path A), rtw8851b_bb_cfg_txrx_path(RF_A)";
+/// RTL8851B WLAN-only coexistence recipe the native owner runs at core.c
+/// `rtw89_btc_ntfy_init` (rtw8851b.c `rtw8851b_btc_set_rfe` +
+/// `rtw8851b_btc_init_cfg`, single WL RF path S0).
+const N51_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8851b_btc_set_rfe (ant num 1 shared at rfe%3==1 else 2 dedicated, single_pos/btg_pos S0, stream 1), rtw8851b_btc_init_cfg (rtw89_mac_coex_init RTK inner, wl_pri TX_RESP/BEACON, path A RR_WLSEL 0 + LUTWE trx mask), scbd 0x4003, cxinit v0, cxctrl v1, txpwr ctrl off, _set_ant WONLY, OFF_BT policy";
 impl Board {
     pub fn new(
         factory: &Factory,
@@ -121,8 +131,62 @@ impl Board {
             chip: ChipId::Rtl8852C,
         })
     }
-    pub(super) fn is_c(self) -> bool {
-        self.chip == ChipId::Rtl8852C
+    /// RTL8851B cold channel-1 calibration identity (rtw8851be.c
+    /// `rtw89_8851be_id_table`: 10ec:b851 only): the RTL8851B factory
+    /// logical map and 128-byte PHY-cap window (0x580), cut/RFE/XTAL, the
+    /// bound container tables (BB/GAIN/RADIO_A/NCTL), the RTL8851B recipe
+    /// and coexistence owner with its firmware BTC ABI row
+    /// (`coex_native::Protocol51`). An antenna-diversity RFE
+    /// (`rfe_type % 3 == 2`) has no identity until that owner exists.
+    pub fn new_51(
+        factory: &Factory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+    ) -> Result<Self, Error> {
+        let identity = factory.identity().ok_or(Error::Identity)?;
+        let calibration = identity.calibration();
+        if device.vendor != 0x10ec
+            || device.device != 0xb851
+            || identity.chip() != ChipId::Rtl8851B
+            || assets.chip() != ChipId::Rtl8851B
+            || !calibration.valid
+            || calibration.rfe_type == 255
+            || super::radio_51::antenna_diversity(calibration.rfe_type)
+        {
+            return Err(Error::Identity);
+        }
+        // coex.c rtw89_btc_ver_defs: only a known RTL8851B BTC ABI row.
+        super::coex_native::Protocol51::for_version(assets.firmware_version())
+            .ok_or(Error::Identity)?;
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(b"NARF RTL8851B cold ch1 20MHz awake WLAN-only calibration v1;RF path A");
+        hash.update(b"CMAC TXEN=0; NCTL AACK RCK DACK RXDCK; no ordinary packet/response grant");
+        hash.update(N51_RECIPE);
+        hash.update(N51_COEX_RECIPE);
+        hash.update(&device.vendor.to_le_bytes());
+        hash.update(&device.device.to_le_bytes());
+        hash.update(&device.subsystem_vendor.to_le_bytes());
+        hash.update(&device.subsystem_id.to_le_bytes());
+        hash.update(factory.logical().ok_or(Error::Identity)?);
+        hash.update(factory.n51_phycap().ok_or(Error::Identity)?);
+        hash.update(&[identity.cut(), calibration.rfe_type, identity.xtal()]);
+        assets
+            .bind(&mut hash, calibration.rfe_type, identity.cut())
+            .map_err(|_| Error::Identity)?;
+        Ok(Self {
+            identity: hash.finalize(),
+            mac: identity.mac(),
+            device: device.device,
+            chip: ChipId::Rtl8851B,
+        })
+    }
+    /// Record magic and firmware-name chip of this board's family.
+    fn family(self) -> (&'static [u8; 4], &'static str) {
+        match self.chip {
+            ChipId::Rtl8852C => (b"N5CB", "8852c"),
+            ChipId::Rtl8851B => (b"N51B", "8851b"),
+            _ => (b"N52B", "8852b"),
+        }
     }
     pub(super) fn mac(self) -> [u8; 6] {
         self.mac
@@ -163,8 +227,8 @@ impl Calibration {
     pub fn load(board: Board) -> Result<Self, Error> {
         let m = board.mac;
         let name = format!(
-            "rtw89/rtw8852{}-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if board.is_c() { "c" } else { "b" },
+            "rtw89/rtw{}-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            board.family().1,
             m[0],
             m[1],
             m[2],
@@ -187,7 +251,7 @@ impl Calibration {
         authority.invoke(Current).map_err(|_| Error::Authority)?;
         signer.ok_or(Error::Unsigned)?;
         if bytes.len() != LENGTH
-            || &bytes[..4] != if board.is_c() { b"N5CB" } else { b"N52B" }
+            || &bytes[..4] != board.family().0
             || bytes[4..8] != [1, 0, 96, 0]
             || bytes[8..12] != (LENGTH as u32).to_le_bytes()
             || bytes[12..14] != 0x10ecu16.to_le_bytes()

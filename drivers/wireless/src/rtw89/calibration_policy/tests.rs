@@ -331,3 +331,64 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_calibration_record_is_n5cb_and_never_a_b_record
 );
+fn smoke_rtw8851b_calibration_record_is_n51b_and_never_a_b_or_c_record() -> TestResult {
+    let b = board();
+    let n51 = Board {
+        device: 0xb851,
+        chip: ChipId::Rtl8851B,
+        ..b
+    };
+    let c = Board {
+        device: 0xc852,
+        chip: ChipId::Rtl8852C,
+        ..b
+    };
+    let cap = authority();
+    let mut bytes = image(n51);
+    // Neither a B nor a C magic admits the RTL8851B board.
+    for magic in [b"N52B", b"N5CB"] {
+        bytes[..4].copy_from_slice(magic);
+        if Calibration::from_verified(&bytes, Some([3; 32]), n51, cap).is_ok() {
+            return TestResult::Fail("B/C calibration magic admitted an RTL8851B board");
+        }
+    }
+    bytes[..4].copy_from_slice(b"N51B");
+    if Calibration::from_verified(&bytes, None, n51, cap).is_ok() {
+        return TestResult::Fail("unsigned N51B calibration accepted");
+    }
+    let calibration = match Calibration::from_verified(&bytes, Some([3; 32]), n51, cap) {
+        Ok(calibration) => calibration,
+        Err(_) => return TestResult::Fail("exact N51B calibration refused"),
+    };
+    if !calibration.matches(n51)
+        || calibration.matches(b)
+        || calibration.matches(c)
+        || calibration.check(&domain()).is_err()
+    {
+        return TestResult::Fail("RTL8851B calibration bound to the wrong board or span");
+    }
+    // An N51B record never admits a B or C board.
+    for other in [b, c] {
+        let mut o = image(other);
+        o[..4].copy_from_slice(b"N51B");
+        if Calibration::from_verified(&o, Some([3; 32]), other, cap).is_ok() {
+            return TestResult::Fail("N51B record admitted an RTL8852B/C board");
+        }
+    }
+    // Only the shipped-firmware BTC ABI row has an RTL8851B identity.
+    if super::super::coex_native::Protocol51::for_version([0, 29, 41, 5]).is_none()
+        || super::super::coex_native::Protocol51::for_version([0, 29, 28, 0]).is_some()
+        || super::super::coex_native::Protocol51::for_version([0, 29, 133, 0]).is_some()
+    {
+        return TestResult::Fail("RTL8851B BTC ABI rows wrong");
+    }
+    cap.revoke();
+    if calibration.current().is_ok() {
+        return TestResult::Fail("revoked N51B calibration still current");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_calibration_record_is_n51b_and_never_a_b_or_c_record
+);
