@@ -142,6 +142,12 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
             return;
         }
     };
+    // dup_mmap leaves VM_DONTCOPY VMAs out of the child (a dup failure there
+    // is ENOMEM too); the child is not yet runnable.
+    if crate::mapped_file::finish_fork_address_space(&child_as).is_err() {
+        ctx.set_return(errno_ret(ENOMEM));
+        return;
+    }
     // LAZY child materialize (Linux-style demand fork): do NOT eagerly install a
     // leaf PTE for every inherited base page. Each base page the child actually
     // touches demand-faults through `claim_demand_page`'s already-backed path,

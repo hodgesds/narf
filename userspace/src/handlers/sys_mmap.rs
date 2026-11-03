@@ -682,6 +682,137 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // A driver's read-only private PFN mapping, as `xe_oa_mmap` builds with
+    // `vm_flags_mod(VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY,
+    // VM_MAYWRITE | VM_MAYEXEC)` and `remap_pfn_range`. The driver's own pages
+    // are aliased read-only and borrowed (`SHARED` frame ownership), never
+    // copied through `read()`; the owner row records the VMA flags so mremap
+    // refuses growth and fork leaves the range out of the child. The mapping
+    // retains the file and the driver's lifetime token until munmap or exit,
+    // as the VMA's `vm_file` does.
+    if map_type == MAP_PRIVATE {
+        if let Some((ops, _)) = file.as_ref() {
+            if let Some(pfn) = ops.mmap_private_pfn(offset) {
+                // No copy-on-write exists over borrowed frames: a provider
+                // that admits write or exec now or through mprotect is a
+                // contract violation, refused before any VMA mutation.
+                if prot & (PROT_WRITE | PROT_EXEC) != 0
+                    || ops.mmap_max_prot(offset) & (PROT_WRITE | PROT_EXEC) != 0
+                {
+                    ctx.set_return(errno_ret(ENODEV));
+                    return;
+                }
+                let narf_filesystem::MmapBacking {
+                    frames,
+                    lifetime: mmap_lifetime,
+                    memory_type,
+                } = match ops.mmap_backing(offset, len as usize) {
+                    Ok(backing) => backing,
+                    Err(error) => {
+                        ctx.set_return(errno_ret(copy_fs_errno(error)));
+                        return;
+                    }
+                };
+                if frames.len() != pages || frames.contains(&0) {
+                    ctx.set_return(errno_ret(EINVAL));
+                    return;
+                }
+                let phys = match try_raw_region_backing(&frames) {
+                    Ok(backing) => backing,
+                    Err(()) => {
+                        ctx.set_return(errno_ret(ENOMEM));
+                        return;
+                    }
+                };
+                // LOCK_EXEMPT is VM_SPECIAL: no mlock population, and a
+                // SHARED non-FILE_DEMAND VMA cannot grow by mremap (EFAULT).
+                let region = Region {
+                    base: VirtAddr::new(base),
+                    len,
+                    perms: (perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT)
+                        .with_memory_type(memory_type),
+                    phys,
+                };
+                let mapped = as_ref.with_vma_transaction(|| {
+                    narf_memory::with_address_space_shared_mapping_transaction(
+                        as_ref.identity(),
+                        || {
+                            crate::mapped_file::publish_current_pfn_mapping(
+                                as_ref.identity(),
+                                crate::mapped_file::MappingOwnerRegistration {
+                                    base,
+                                    len,
+                                    file_offset: offset,
+                                    ops: Arc::clone(ops),
+                                    lifetime: mmap_lifetime.clone(),
+                                    writeback_phys: None,
+                                    private_copy: false,
+                                    replace: destructive_fixed,
+                                    zero_from: None,
+                                    provenance: provenance.clone(),
+                                },
+                                pfn,
+                                || {
+                                    // SAFETY: VMA -> shared transactions are
+                                    // held; the owner lock stays held until the
+                                    // VMA has its lifetime registered.
+                                    unsafe {
+                                        if destructive_fixed {
+                                            as_ref.replace_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        } else {
+                                            as_ref.map_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        }
+                                    }
+                                },
+                                |receipt| {
+                                    // SAFETY: same live root and VMA
+                                    // transaction; rollback is receipt-scoped.
+                                    match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                                        Ok(()) => {
+                                            ops.mmap_published(mmap_lifetime.as_ref());
+                                            Ok(())
+                                        }
+                                        Err(error) => {
+                                            // SAFETY: VMA -> shared transactions
+                                            // remain held by the enclosing scopes.
+                                            let _ = unsafe {
+                                                as_ref.rollback_mapping_locked(receipt)
+                                            };
+                                            Err(error)
+                                        }
+                                    }
+                                },
+                            )
+                        },
+                    )
+                });
+                if let Err(error) = mapped {
+                    let errno = match error {
+                        narf_memory::AddressSpaceError::LockLimit => EAGAIN,
+                        narf_memory::AddressSpaceError::Overlap if fixed_noreplace => EEXIST,
+                        _ => ENOMEM,
+                    };
+                    ctx.set_return(errno_ret(errno));
+                    return;
+                }
+                record_fixed_replacement_owner_committed!();
+                crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
+                ctx.set_return(SyscallReturn::ok(base));
+                return;
+            }
+        }
+    }
+
     let mut fallback_file_ops: Option<Arc<dyn narf_filesystem::FileOps>> = None;
     // Device-backed shared mapping — the keystone for graphics. A
     // `/dev/fb0` framebuffer (or a DRM dumb buffer) returns the

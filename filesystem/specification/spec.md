@@ -393,6 +393,7 @@ pub trait FileOps {
     fn validate_mmap(&self, offset: u64, len: usize, prot: u32, flags: u32) -> Result<u32, FsError>;
     fn mmap_max_prot(&self, offset: u64) -> u32;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
+    fn mmap_private_pfn(&self, offset: u64) -> Option<PrivatePfnMap>; // default None
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>); // default no-op
     fn mmap_is_ram(&self) -> bool;
     fn supports_mmap_fault(&self) -> bool;
@@ -663,6 +664,13 @@ address space applies it per frame, refusing it on System RAM (`memory/` §4). `
 or a device error; only Unsupported from mmap_backing selects generic file
 fallback. `mmap_max_prot` defaults to RWX and constrains later mprotect calls,
 including after fd close, fork and mapping splits. Overlay forwards these hooks.
+`mmap_private_pfn` returning `Some(PrivatePfnMap { dont_copy })` makes a
+`MAP_PRIVATE` request that passed `validate_mmap` a read-only alias of the
+`mmap_backing` frames and lifetime, as a driver's `remap_pfn_range` into a
+VMA without `VM_MAYWRITE`/`VM_MAYEXEC` does (`VM_PFNMAP | VM_DONTEXPAND`,
+plus `VM_DONTCOPY` when `dont_copy`). The provider must refuse write and
+exec and exclude them from `mmap_max_prot`; the syscall layer returns ENODEV
+otherwise. The default `None` keeps the generic private-file path.
 `mmap_published` runs once per successful device mapping, after its PTEs and
 owner are materialized and while that address space's shared-mapping
 transaction is held; a provider may treat its lifetime token as revocable only

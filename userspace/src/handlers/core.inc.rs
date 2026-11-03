@@ -11804,6 +11804,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
                 return;
             }
         };
+        // dup_mmap leaves VM_DONTCOPY VMAs out of the child.
+        if crate::mapped_file::finish_fork_address_space(&dup).is_err() {
+            ctx.set_return(errno_ret(ENOMEM));
+            return;
+        }
         // Leave ordinary child leaves uninstalled, matching `sys_fork`'s lazy
         // COW path. The first child access demand-faults the already-retained
         // `Region::phys` frame as read-only and a later write splits it. This is

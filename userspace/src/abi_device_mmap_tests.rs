@@ -419,3 +419,297 @@ fn smoke_abi_device_mmap_write_combining() -> TestResult {
     result
 }
 kernel_test_in!("syscall_abi", smoke_abi_device_mmap_write_combining);
+
+// ── Private PFN mapping: a driver's read-only page alias (xe_oa_mmap) ───
+
+static PFN_FRAMES: IrqSafeSpinLock<Vec<u64>> = IrqSafeSpinLock::new(Vec::new());
+static PFN_TOKENS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static PFN_READS: AtomicUsize = AtomicUsize::new(0);
+static PFN_MAX_PROT: AtomicUsize = AtomicUsize::new(1);
+
+struct PfnToken;
+impl Drop for PfnToken {
+    fn drop(&mut self) {
+        PFN_TOKENS_DROPPED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// `xe_oa_mmap`'s shape: read-only `MAP_PRIVATE` only, `VM_MAYWRITE |
+/// VM_MAYEXEC` cleared, `VM_DONTCOPY`, pages remapped from the VMA start.
+struct PfnDevice;
+impl FileOps for PfnDevice {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        PFN_READS.fetch_add(1, Ordering::AcqRel);
+        alloc::boxed::Box::pin(async { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Err(FsError::BadFd) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+    fn validate_mmap(
+        &self,
+        _offset: u64,
+        _len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<u32, FsError> {
+        if prot & 6 != 0 || flags & 1 != 0 {
+            return Err(FsError::InvalidData);
+        }
+        Ok(prot)
+    }
+    fn mmap_max_prot(&self, _offset: u64) -> u32 {
+        PFN_MAX_PROT.load(Ordering::Acquire) as u32
+    }
+    fn mmap_private_pfn(&self, _offset: u64) -> Option<narf_filesystem::PrivatePfnMap> {
+        Some(narf_filesystem::PrivatePfnMap { dont_copy: true })
+    }
+    fn mmap_backing(&self, _offset: u64, len: usize) -> Result<MmapBacking, FsError> {
+        let frames = PFN_FRAMES.lock();
+        Ok(MmapBacking {
+            frames: frames
+                .get(..len / PAGE as usize)
+                .ok_or(FsError::InvalidData)?
+                .to_vec(),
+            lifetime: Some(Arc::new(PfnToken) as Arc<dyn MmapLifetime>),
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
+    }
+}
+
+fn user_read_only(space: &AddressSpace, va: u64) -> bool {
+    // SAFETY: the test-owned root is live and never activated.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use narf_memory::x86_64::paging::{leaf_flags_at, PtFlags};
+            leaf_flags_at(space.root, VirtAddr::new(va))
+                .is_some_and(|(flags, _)| flags.bits() & PtFlags::WRITABLE.bits() == 0)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AP[2] set: read-only at every exception level.
+            narf_memory::aarch64::paging::leaf_flags_at(space.root, VirtAddr::new(va))
+                .is_some_and(|(flags, _)| flags.bits() & (1 << 7) != 0)
+        }
+    }
+}
+
+/// A `MAP_PRIVATE` read-only mapping of driver pages through `mmap(2)`:
+/// the leaves alias the driver's frames read-only (never a `read()` copy),
+/// mprotect cannot add write or exec (EACCES), mremap refuses growth
+/// (EFAULT), DONTUNMAP and private duplication (EINVAL) but shrinks, a fork
+/// child does not inherit it (VM_DONTCOPY), close(fd) keeps the file and
+/// pages until munmap, and address-space teardown releases them. A driver
+/// that admits write is refused (ENODEV) before any VMA exists.
+fn smoke_abi_private_pfn_mmap_readonly_dontcopy_dontexpand() -> TestResult {
+    const PROT_EXEC: u64 = 4;
+    const MAP_PRIVATE: u64 = 2;
+    const O_RDONLY: u32 = 0;
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_DONTUNMAP: u64 = 4;
+    let mut owned = Vec::new();
+    for _ in 0..2 {
+        match narf_memory::alloc_frame() {
+            Ok(frame) => owned.push(frame.start_address()),
+            Err(_) => {
+                for &phys in &owned {
+                    narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
+                }
+                return TestResult::Skip("device frame allocation failed");
+            }
+        }
+    }
+    for (index, phys) in owned.iter().enumerate() {
+        // SAFETY: freshly allocated frames owned by this test, reached
+        // through the kernel direct map.
+        unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0xa0 + index as u8, 4096) };
+    }
+    let frames: Vec<u64> = owned.iter().map(|p| p.raw()).collect();
+    *PFN_FRAMES.lock() = frames.clone();
+    PFN_TOKENS_DROPPED.store(0, Ordering::Release);
+    PFN_READS.store(0, Ordering::Release);
+    PFN_MAX_PROT.store(1, Ordering::Release);
+    let result = with_setup(|| {
+        // SAFETY: paging is enabled; the root is owned by this test.
+        let space = Arc::new(
+            unsafe { AddressSpace::new_for_user() }.map_err(|_| "address space allocation")?,
+        );
+        *DEVICE_AS.lock() = Some(space.clone());
+        crate::handlers::install_address_space_lookup(lookup_device_as);
+        let device = Arc::new(PfnDevice);
+        let install = |device: &Arc<PfnDevice>| {
+            crate::fd::install(
+                FAKE_TASK,
+                crate::fd::FdEntry {
+                    ops: device.clone(),
+                    offset: 0,
+                    flags: 0,
+                    status_flags: O_RDONLY,
+                },
+            )
+            .map(u64::from)
+            .ok_or("fd install failed")
+        };
+        let map = |fd: u64, prot: u64, flags: u64| {
+            call(
+                Syscall::Mmap.raw(),
+                SyscallArgs {
+                    arg0: 0,
+                    arg1: 2 * PAGE,
+                    arg2: prot,
+                    arg3: flags,
+                    arg4: fd,
+                    arg5: 0,
+                },
+            )
+        };
+        let mremap = |old: u64, old_len: u64, new_len: u64, flags: u64| {
+            call(
+                Syscall::Mremap.raw(),
+                SyscallArgs {
+                    arg0: old,
+                    arg1: old_len,
+                    arg2: new_len,
+                    arg3: flags,
+                    arg4: 0,
+                    arg5: 0,
+                },
+            )
+        };
+        let outcome = (|| -> Result<(), &'static str> {
+            let fd = install(&device)?;
+            // The driver's own refusals come first.
+            if map(fd, PROT_READ, MAP_SHARED) != Some(EINVAL)
+                || map(fd, PROT_READ | PROT_WRITE, MAP_PRIVATE) != Some(EINVAL)
+            {
+                return Err("driver mmap refusals were not preserved");
+            }
+            let base = match map(fd, PROT_READ, MAP_PRIVATE) {
+                Some(addr) if addr > 0 => addr as u64,
+                _ => return Err("private PFN mmap failed"),
+            };
+            for (page, &frame) in frames.iter().enumerate() {
+                let va = base + page as u64 * PAGE;
+                if translated(&space, va) != Some(frame) || !user_read_only(&space, va) {
+                    return Err("leaf is not a read-only alias of the driver page");
+                }
+                // SAFETY: the frame is test-owned and still allocated.
+                let byte = unsafe { *PhysAddr::new(frame).kernel_ptr::<u8>().add(4095) };
+                if byte != 0xa0 + page as u8 {
+                    return Err("mapped page lost the driver's contents");
+                }
+            }
+            let perms = space
+                .lookup(VirtAddr::new(base))
+                .map(|region| region.perms)
+                .ok_or("no VMA")?;
+            if !perms.contains(narf_memory::RegionPerms::SHARED)
+                || perms.contains(narf_memory::RegionPerms::WRITE)
+                || PFN_READS.load(Ordering::Acquire) != 0
+            {
+                return Err("private PFN VMA copied or became writable");
+            }
+            // VM_MAYWRITE and VM_MAYEXEC are clear.
+            if call(
+                Syscall::MProtect.raw(),
+                a2(base, 2 * PAGE, PROT_READ | PROT_WRITE),
+            ) != Some(EACCES)
+                || call(
+                    Syscall::MProtect.raw(),
+                    a2(base, 2 * PAGE, PROT_READ | PROT_EXEC),
+                ) != Some(EACCES)
+            {
+                return Err("mprotect added write or exec");
+            }
+            // check_prep_vma: VM_DONTEXPAND growth EFAULT; DONTUNMAP and a
+            // private duplicate EINVAL.
+            if mremap(base, 2 * PAGE, 3 * PAGE, MREMAP_MAYMOVE) != Some(EFAULT)
+                || mremap(base, 2 * PAGE, 3 * PAGE, 0) != Some(EFAULT)
+                || mremap(base, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP)
+                    != Some(EINVAL)
+                || mremap(base, 0, 2 * PAGE, MREMAP_MAYMOVE) != Some(EINVAL)
+                || translated(&space, base) != Some(frames[0])
+            {
+                return Err("mremap expanded or duplicated the PFN mapping");
+            }
+            // dup_mmap skips VM_DONTCOPY: the child has neither the VMA nor
+            // its owner, the parent keeps both. Memory's fork hook (installed
+            // at boot) withholds the owner; completion removes the region.
+            // SAFETY: paging is live; the child is an inactive copy.
+            let child = unsafe { space.clone_for_fork() }.map_err(|_| "clone_for_fork failed")?;
+            crate::mapped_file::finish_fork_address_space(&child)
+                .map_err(|_| "fork completion failed")?;
+            if child.lookup(VirtAddr::new(base)).is_some()
+                || crate::mapped_file::private_pfn_at(child.identity(), base)
+                || space.lookup(VirtAddr::new(base)).is_none()
+                || !crate::mapped_file::private_pfn_at(space.identity(), base)
+            {
+                return Err("fork child inherited the DONTCOPY mapping");
+            }
+            drop(child);
+            if PFN_TOKENS_DROPPED.load(Ordering::Acquire) != 0 {
+                return Err("fork released the parent's page hold");
+            }
+            // close(fd) while mapped: the VMA keeps the file and the pages.
+            if call(Syscall::Close.raw(), a0(fd)) != Some(0)
+                || Arc::strong_count(&device) != 2
+                || translated(&space, base) != Some(frames[0])
+            {
+                return Err("close dropped the mapped file");
+            }
+            // Shrinking a DONTEXPAND VMA is allowed and keeps the head.
+            if mremap(base, 2 * PAGE, PAGE, 0) != Some(base as i64)
+                || translated(&space, base + PAGE).is_some()
+                || PFN_TOKENS_DROPPED.load(Ordering::Acquire) != 0
+            {
+                return Err("shrink was refused or released the remaining page");
+            }
+            if call(Syscall::Munmap.raw(), a1(base, PAGE)) != Some(0)
+                || PFN_TOKENS_DROPPED.load(Ordering::Acquire) != 1
+                || Arc::strong_count(&device) != 1
+            {
+                return Err("munmap did not release the file and page hold");
+            }
+            // A driver that leaves VM_MAYWRITE set is a contract violation.
+            PFN_MAX_PROT.store(3, Ordering::Release);
+            let fd = install(&device)?;
+            let refused = map(fd, PROT_READ, MAP_PRIVATE);
+            PFN_MAX_PROT.store(1, Ordering::Release);
+            if refused != Some(ENODEV) || PFN_TOKENS_DROPPED.load(Ordering::Acquire) != 1 {
+                return Err("a writable private PFN provider was mapped");
+            }
+            // Address-space teardown (exit) releases a live mapping's hold.
+            if !matches!(map(fd, PROT_READ, MAP_PRIVATE), Some(addr) if addr > 0) {
+                return Err("second private PFN mmap failed");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            Ok(())
+        })();
+        crate::handlers::restore_address_space_lookup(None);
+        *DEVICE_AS.lock() = None;
+        drop(space);
+        if outcome.is_ok()
+            && (PFN_TOKENS_DROPPED.load(Ordering::Acquire) != 2 || Arc::strong_count(&device) != 1)
+        {
+            return Err("address-space teardown kept the page hold");
+        }
+        outcome
+    });
+    PFN_FRAMES.lock().clear();
+    for &phys in &owned {
+        narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
+    }
+    result
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_private_pfn_mmap_readonly_dontcopy_dontexpand
+);
