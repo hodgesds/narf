@@ -1455,6 +1455,53 @@ impl Hardware {
         }
     }
 
+    /// Linux mld/tx.c `iwl_mld_update_sta_txqs`: SCD_QUEUE_CONFIG MODIFY
+    /// moves every allocated queue of the AP MLD station from `old` to
+    /// `new` STA mask, TID by TID (management queue as IWL_MGMT_TID).
+    /// Queues must already be quiesced: an outstanding descriptor's
+    /// completion is never re-attributed to a different link STA set.
+    pub(super) async fn modify_tx_station_mask(
+        &mut self,
+        old: u32,
+        new: u32,
+    ) -> Result<(), &'static str> {
+        if self.failed || self.version(5, 0x17).map(|v| v.0) != Some(3) || old == 0 || new == 0 {
+            return Err("unsupported or failed TX queue STA mask change");
+        }
+        let targets: Vec<(u16, u8)> = self
+            .resources
+            .data
+            .iter()
+            .filter(|q| q.station_mask() == Some(old))
+            .map(|q| {
+                if !q.is_idle() {
+                    return Err("TX queue STA mask change before quiescing");
+                }
+                Ok((q.id().unwrap(), q.tid().unwrap()))
+            })
+            .collect::<Result<_, _>>()?;
+        for (id, tid) in targets {
+            let mut body = [0; 36];
+            boot_context::put32(&mut body, 0, 2); // IWL_SCD_QUEUE_MODIFY
+            boot_context::put32(&mut body, 4, old);
+            boot_context::put32(&mut body, 8, u32::from(tid));
+            boot_context::put32(&mut body, 12, new);
+            if let Err(reason) = self.command(5, 0x17, &body).await {
+                // The firmware's queue mask is no longer known.
+                self.failed = true;
+                return Err(reason);
+            }
+            let queue = self
+                .resources
+                .data
+                .iter_mut()
+                .find(|q| q.id() == Some(id))
+                .ok_or("TX queue vanished during STA mask change")?;
+            queue.modify_station_mask(old, new)?;
+        }
+        Ok(())
+    }
+
     pub async fn remove_tx(&mut self, id: u16, station: u8, tid: u8) -> Result<(), &'static str> {
         self.remove_idle_tx(id, station, tid).await
     }
@@ -1479,12 +1526,14 @@ impl Hardware {
             .ok_or("unknown idle TX queue")?;
         let mut body = [0; 36];
         boot_context::put32(&mut body, 0, 1);
-        boot_context::put32(
-            &mut body,
-            4,
-            1u32.checked_shl(u32::from(station))
-                .ok_or("invalid idle TX station")?,
-        );
+        1u32.checked_shl(u32::from(station))
+            .ok_or("invalid idle TX station")?;
+        // Linux mld/tx.c iwl_mld_remove_txq names the queue's current
+        // full STA mask, including any further MLD link STA.
+        let mask = self.resources.data[index]
+            .station_mask()
+            .ok_or("unknown idle TX queue")?;
+        boot_context::put32(&mut body, 4, mask);
         boot_context::put32(&mut body, 8, u32::from(tid));
         // Reserve before publication: dropping the waiter cannot reopen
         // packet admission, replay REMOVE or let ADD reuse this native ID.

@@ -4120,13 +4120,38 @@ The native (re)association request now inserts the Basic MLE immediately
 before EHT Capabilities, as mac80211 `ieee80211_add_link_elems` does
 (after the Reassociation Request current-AP field when roaming).
 
+**Further active link ownership (partial; nothing advertised).**
+`sc_mlo::Binding::with_secondary`/`without_secondary` install or drop the
+one further owner, refusing any spec link, FW link, FW STA or physical
+address that aliases the association link or the MLD addresses.
+`Binding::sta_mask` is Linux `iwl_mld_fw_sta_id_mask`. `PhyIds` mirrors
+`iwl_mld_allocate_fw_phy_id` (NUM_PHY_CTX=3, PHY0 retained).
+`activate_further_link` drives, in mac80211 `_ieee80211_set_active_links`
+order: LINK ADD (inactive, spec link id) -> PHY ADD -> LINK MODIFY
+RATES_INFO with the PHY id -> link STA ADD -> `iwl_mld_update_sta_resources`
+(SCD_QUEUE_CONFIG MODIFY of every allocated queue, SEC_KEY MODIFY of the
+pairwise key, RX_BAID MODIFY) -> LINK MODIFY ACTIVE -> that link's
+GTK/IGTK/BIGTK on only its link STA (`iwl_mld_get_key_sta_mask`).
+`deactivate_further_link` is the inverse (deactivate, PHY REMOVE, group
+key REMOVE, narrowed resources, STA_REMOVE, LINK REMOVE). TX queues must
+be idle; a queue REMOVE names its current full STA mask (`iwl_mld_remove_txq`).
+A failure after the first device-visible command fails the device instead
+of guessing firmware ownership. Pairwise PN and reorder (BAID) state stay
+MLD-wide as in Linux; per-link group keys carry their own RX PN floor.
+The caller must supply PHY/LINK/STA bodies built from the further link's
+own accepted facts; no caller does so yet, so behaviour is unchanged.
+Two written, unexecuted cases in `drivers/wireless/iwlwifi/mlo`:
+`smoke_iwl_mld_further_link_owner_and_sta_mask`,
+`smoke_iwl_mld_further_link_key_queue_baid_bodies`.
+
 Still open for a second active link: multi-link association request
 per-STA profiles and per-link response status (mac80211
-`ieee80211_assoc_add_ml_elem`/`ieee80211_assoc_success`), per-link
-PHY/LINK ADD and link-STA ADD, queue and pairwise-key STA masks spanning
-both link STAs, per-link GTK/IGTK/BIGTK install and PN/reorder owners,
-`iwl_mld_change_vif_links`/`ieee80211_set_active_links` sequencing with
-TX quiescing, MLO scan freshness for selection, missed-beacon/EMLSR
+`ieee80211_assoc_add_ml_elem`/`ieee80211_assoc_success`) in the native
+connection, building the further link's PHY/LINK/STA bodies and per-link
+MLO GTK/IGTK/BIGTK delivery from that link's own accepted facts, routing
+per-link group RX PN and beacon proof through the further owner, invoking
+the activation/deactivation primitives from EMLSR link selection with TX
+quiescing, MLO scan freshness for selection, missed-beacon/EMLSR
 notification routing in the native receive path, EML OMN, TID-to-link
 mapping and the public narf_wireless multiple-link surface.
 

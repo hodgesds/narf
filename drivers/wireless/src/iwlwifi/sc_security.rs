@@ -297,19 +297,40 @@ pub(super) fn key_command(
     key: Option<&[u8; 16]>,
     rx_pn: u64,
 ) -> Result<Zeroizing<[u8; 80]>, &'static str> {
-    if (group && id > 5) || (!group && id != 0) || rx_pn >= 1 << 48 {
+    if group && id > 5 {
         return Err("invalid MLD native key identity/PN");
     }
-    let igtk = group && id >= 4;
+    key_command_for(1, id, group, pmf, key, rx_pn)
+}
+
+/// Linux mld/key.c `iwl_mld_get_key_flags` for a station vif: CCMP/CMAC
+/// cipher, MCAST|NO_TX for group keys, MFP for IGTK (4/5) and an MFP
+/// station's pairwise key. BIGTK (6/7) is neither IGTK nor pairwise.
+pub(super) fn key_flags(id: u8, group: bool, pmf: bool) -> u32 {
+    let igtk = group && matches!(id, 4 | 5);
+    2 | if group { 0x48 } else { 0 } | if igtk || (!group && pmf) { 0x20 } else { 0 }
+}
+
+/// SEC_KEY_CMD v1 ADD/REMOVE for an explicit firmware STA mask. Linux
+/// `iwl_mld_get_key_sta_mask`: a pairwise key (link_id < 0) spans every
+/// link STA of the AP MLD; a station's per-link GTK/IGTK/BIGTK names only
+/// that link's STA.
+pub(super) fn key_command_for(
+    sta_mask: u32,
+    id: u8,
+    group: bool,
+    pmf: bool,
+    key: Option<&[u8; 16]>,
+    rx_pn: u64,
+) -> Result<Zeroizing<[u8; 80]>, &'static str> {
+    if (group && id > 7) || (!group && id != 0) || rx_pn >= 1 << 48 || sta_mask == 0 {
+        return Err("invalid MLD native key identity/PN");
+    }
     let mut body = Zeroizing::new([0; 80]);
     put32(&mut body[..], 0, if key.is_some() { 1 } else { 3 });
-    put32(&mut body[..], 4, 1);
+    put32(&mut body[..], 4, sta_mask);
     put32(&mut body[..], 8, u32::from(id));
-    put32(
-        &mut body[..],
-        12,
-        2 | if group { 0x48 } else { 0 } | if igtk || (!group && pmf) { 0x20 } else { 0 },
-    );
+    put32(&mut body[..], 12, key_flags(id, group, pmf));
     if let Some(key) = key {
         body[16..32].copy_from_slice(key);
         put64(&mut body[..], 64, rx_pn);

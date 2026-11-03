@@ -22,6 +22,9 @@ pub struct DataQueue {
     pending: Vec<Option<DmaBuffer>>,
     id: Option<u16>,
     station_tid: Option<(u8, u8)>,
+    /// Further MLD link STAs served by this queue (Linux SCD_QUEUE_CONFIG
+    /// MODIFY new_sta_mask); the allocating station bit is never removed.
+    link_stations: u32,
     aggregated: bool,
     removing: bool,
     read: u16,
@@ -44,6 +47,7 @@ impl DataQueue {
             pending: (0..DEPTH).map(|_| None).collect(),
             id: None,
             station_tid: None,
+            link_stations: 0,
             aggregated: false,
             removing: false,
             read: 0,
@@ -85,6 +89,29 @@ impl DataQueue {
 
     pub(super) fn aggregated(&self) -> bool {
         self.aggregated
+    }
+    /// The firmware STA mask this allocated queue currently serves.
+    pub(super) fn station_mask(&self) -> Option<u32> {
+        let (station, _) = self.station_tid?;
+        self.id?;
+        Some(1 << station | self.link_stations)
+    }
+    pub(super) fn tid(&self) -> Option<u8> {
+        self.station_tid.map(|(_, tid)| tid)
+    }
+    /// Adopt a firmware-acknowledged MODIFY. Only an idle, retained queue
+    /// may change link STAs, and its allocating station stays a member.
+    pub(super) fn modify_station_mask(&mut self, old: u32, new: u32) -> Result<(), &'static str> {
+        let (station, _) = self.station_tid.ok_or("unallocated TX queue mask change")?;
+        if self.removing
+            || !self.is_idle()
+            || self.station_mask() != Some(old)
+            || new & (1 << station) == 0
+        {
+            return Err("TX queue STA mask change ownership/outstanding mismatch");
+        }
+        self.link_stations = new & !(1 << station);
+        Ok(())
     }
     pub(super) fn begin_remove(&mut self, station: u8, tid: u8) -> Result<(), &'static str> {
         if self.removing || !self.belongs_to(station, tid) || !self.is_idle() {
