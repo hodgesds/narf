@@ -66,6 +66,16 @@ pub(super) fn ssid(value: &[u8]) -> Result<[u8; 52], Error> {
     out[4..4 + value.len()].copy_from_slice(value);
     Ok(out)
 }
+/// `sizeof(struct brcmf_ssid_le)`: the leading part of [`ssid`].
+pub(super) const SSID_LE: usize = 36;
+/// `brcmf_fil_bss_enable_le` (`bsscfgidx`, `enable`) for the `bss` iovar
+/// (Linux 7.3-rc4 `cfg80211.c` P2P_GO `start_ap`/`stop_ap`).
+pub(super) fn bss_enable(bsscfgidx: u8, enable: bool) -> [u8; 8] {
+    let mut out = [0; 8];
+    out[..4].copy_from_slice(&u32::from(bsscfgidx).to_le_bytes());
+    out[4..].copy_from_slice(&u32::from(enable).to_le_bytes());
+    out
+}
 /// `brcmf_scb_val_le`, including its real trailing alignment. Deleting
 /// one SCB grants no native TX terminal credit and cannot release its DMA.
 pub(super) fn deauth(peer: [u8; 6], reason: u16) -> Result<[u8; 12], Error> {

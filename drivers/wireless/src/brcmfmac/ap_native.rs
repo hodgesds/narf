@@ -166,6 +166,18 @@ pub(crate) enum Scope {
         /// `!vif->mbss`) and `mbss 0` on stop.
         mbss: bool,
     },
+    /// A P2P GO connection bsscfg (`vif_owner::create_p2p`, `p2p_ifadd`
+    /// GO): Linux 7.3-rc4 `brcmf_cfg80211_start_ap` P2P_GO branch. The
+    /// shared radio setup (`mpc 0`, offloads, `BCNPRD`, `DTIMPRD`,
+    /// `SET_INFRA 1`) runs as for the first AP, but without `DOWN`/`apsta`,
+    /// `mbss`, `SET_AP` or `UP`; the BSS is formed by `chanspec`, the
+    /// security iovars, bsscfg `ssid` and `bss` enable for `bsscfgidx`
+    /// (`brcmf_fil_bss_enable_le`), and stopped by `bss` disable
+    /// (`brcmf_cfg80211_stop_ap` non-AP branch).
+    Go {
+        /// The GO connection bsscfg's firmware index (`ifp->bsscfgidx`).
+        bsscfgidx: u8,
+    },
 }
 impl Scope {
     /// Linux `brcmf_cfg80211_start_ap` rules for a secondary AP vif that
@@ -179,6 +191,13 @@ impl Scope {
     }
     fn primary(self) -> bool {
         self == Self::Primary
+    }
+    /// The P2P GO scope's bsscfg index.
+    pub(super) fn go(self) -> Option<u8> {
+        match self {
+            Self::Go { bsscfgidx } => Some(bsscfgidx),
+            _ => None,
+        }
     }
     /// A scope is only valid on its own kind of runtime: the primary
     /// Program never runs through a bsscfg view, nor a secondary on ifidx 0.
@@ -214,7 +233,11 @@ impl Saved {
     ) -> Result<Self, Error> {
         scope.admits::<R>()?;
         let guard = Guard::Program(original);
-        if get(runtime, &guard, ap_wire::GET_AP).await? != 0 || get(runtime, &guard, 19).await? != 1
+        // A GO bsscfg is created in the AP role by `p2p_ifadd`; Linux
+        // checks no AP/infra precondition on it.
+        if scope.go().is_none()
+            && (get(runtime, &guard, ap_wire::GET_AP).await? != 0
+                || get(runtime, &guard, 19).await? != 1)
         {
             return Err(Error::Busy);
         }
@@ -292,12 +315,17 @@ impl Saved {
         native: &Source,
     ) -> Result<(), Error> {
         let guard = Guard::Stop(native);
-        set(runtime, &guard, ap_wire::DOWN, 1).await?;
-        set(runtime, &guard, ap_wire::SET_AP, 0).await?;
-        if get(runtime, &guard, ap_wire::GET_AP).await? != 0 {
-            return Err(Error::Malformed);
+        let go = self.scope.go().is_some();
+        // A GO's BSS was already disabled by `bss` 0 (`ap_stop`); Linux
+        // never takes the radio down or clears `SET_AP` for it.
+        if !go {
+            set(runtime, &guard, ap_wire::DOWN, 1).await?;
+            set(runtime, &guard, ap_wire::SET_AP, 0).await?;
+            if get(runtime, &guard, ap_wire::GET_AP).await? != 0 {
+                return Err(Error::Malformed);
+            }
+            set(runtime, &guard, ap_wire::INFRA, 1).await?;
         }
-        set(runtime, &guard, ap_wire::INFRA, 1).await?;
         // Never replay a retired AP/STA credential or native key/port. A
         // later station join explicitly programs its own new security owner.
         for name in ["auth", "wsec", "wpa_auth", "sup_wpa"] {
@@ -306,6 +334,10 @@ impl Saved {
         for (index, (name, value)) in SAVED.iter().zip(self.vars).enumerate() {
             // A secondary never wrote the device-wide PHY modes.
             if index < 2 && !self.scope.primary() {
+                continue;
+            }
+            // Nor did a GO write `apsta` (a down-only setting).
+            if index == 3 && go {
                 continue;
             }
             match value {
@@ -351,8 +383,11 @@ impl Saved {
                     set_var(runtime, &guard, "mbss", &0u32.to_le_bytes()).await?;
                 }
             }
+            Scope::Go { .. } => {}
         }
-        set(runtime, &guard, ap_wire::UP, 1).await?;
+        if !go {
+            set(runtime, &guard, ap_wire::UP, 1).await?;
+        }
         Ok(())
     }
 }
@@ -394,7 +429,9 @@ pub(super) async fn verify<R: Fullmac>(
     scope: Scope,
 ) -> Result<(), Error> {
     let guard = Guard::Program(original);
-    if get(runtime, &guard, ap_wire::GET_AP).await? != 1
+    // Linux never reads `SET_AP` state of a GO bsscfg (it never sets it);
+    // the GO BSS is observed through `GET_BSS_INFO` below.
+    if scope.go().is_none() && get(runtime, &guard, ap_wire::GET_AP).await? != 1
         || get(runtime, &guard, ap_wire::GET_BEACON).await? != plan.config.beacon_interval
         || get(runtime, &guard, ap_wire::GET_DTIM).await? != plan.config.dtim_period
         || get_int(runtime, &guard, "chanspec").await? != u32::from(plan.chanspec)
@@ -481,7 +518,9 @@ pub(super) async fn program<R: Fullmac>(
     let (down_apsta, mbss) = match scope {
         Scope::Primary => (true, false),
         Scope::Secondary { down_apsta, mbss } => (down_apsta, mbss),
+        Scope::Go { .. } => (false, false),
     };
+    let go = scope.go();
     if down_apsta {
         set(runtime, &guard, ap_wire::DOWN, 1).await?;
         set_int(runtime, &guard, "apsta", 0).await?;
@@ -494,14 +533,18 @@ pub(super) async fn program<R: Fullmac>(
     if mbss {
         set_int(runtime, &guard, "mbss", 1).await?;
     }
-    set(runtime, &guard, ap_wire::SET_AP, 1).await?;
+    if go.is_none() {
+        set(runtime, &guard, ap_wire::SET_AP, 1).await?;
+    }
     set_int(runtime, &guard, "chanspec", u32::from(plan.chanspec)).await?;
     if scope.primary() {
         set_int(runtime, &guard, "qtxpower", u32::from(power_dbm) * 4).await?;
     }
     set_int(runtime, &guard, "ap_isolate", 1).await?;
     set_int(runtime, &guard, "wme_bss_disable", 1).await?;
-    set(runtime, &guard, ap_wire::UP, 1).await?;
+    if go.is_none() {
+        set(runtime, &guard, ap_wire::UP, 1).await?;
+    }
     set_int(runtime, &guard, "sup_wpa", 0).await?;
     set_int(runtime, &guard, "auth", 0).await?;
     // Linux's AP WPA/RSN configuration includes SES_OW_ENABLED (0x40).
@@ -511,13 +554,17 @@ pub(super) async fn program<R: Fullmac>(
         set_int(runtime, &guard, "mfp", 0).await?;
     }
     set_int(runtime, &guard, "wpa_auth", plan.wpa_auth).await?;
-    set_int(
-        runtime,
-        &guard,
-        "closednet",
-        u32::from(plan.config.hidden_ssid == 1),
-    )
-    .await?;
+    // `closednet` is AP-branch only in Linux; a hidden GO is refused at
+    // prepare (`ap::Session::prepare_in`).
+    if go.is_none() {
+        set_int(
+            runtime,
+            &guard,
+            "closednet",
+            u32::from(plan.config.hidden_ssid == 1),
+        )
+        .await?;
+    }
     // Actual AP SME association/removal plus radio/firmware loss. No P2P
     // or extra-bsscfg namespace is created by enabling these observations.
     // This AP's events replace only its own owner's need (the primary
@@ -528,15 +575,31 @@ pub(super) async fn program<R: Fullmac>(
     set_var(runtime, &guard, "event_msgs", &mask).await?;
     runtime.events_written(mask);
     *phase = Phase::BssRequested;
-    command(
-        runtime,
-        &guard,
-        Direction::Set,
-        ap_wire::SET_SSID,
-        &ap_wire::ssid(&plan.config.ssid)?,
-        52,
-    )
-    .await?;
+    match go {
+        None => {
+            command(
+                runtime,
+                &guard,
+                Direction::Set,
+                ap_wire::SET_SSID,
+                &ap_wire::ssid(&plan.config.ssid)?,
+                52,
+            )
+            .await?;
+        }
+        // P2P_GO branch: bsscfg `ssid` (`brcmf_ssid_le`) then `bss` enable.
+        Some(bsscfgidx) => {
+            let ssid = ap_wire::ssid(&plan.config.ssid)?;
+            set_var(runtime, &guard, "ssid", &ssid[..ap_wire::SSID_LE]).await?;
+            set_var(
+                runtime,
+                &guard,
+                "bss",
+                &ap_wire::bss_enable(bsscfgidx, true),
+            )
+            .await?;
+        }
+    }
     // Linux programs native vndr_ie after creating the primary BSS. The
     // successful public result still requires all template transactions.
     vendor(runtime, &guard, &[], &plan.beacon_vendor, 1).await?;

@@ -43,19 +43,30 @@ impl Session {
         // still not fabricated here; matching flow/TX terminals follow.
         // Linux primary stop withdraws SET_SSID then DOWN; it does not
         // require a second deauth of a native SCB already removed by loss.
-        ap_native::command(
-            &mut station.runtime,
-            &guard,
-            Direction::Set,
-            ap_wire::SET_SSID,
-            &[0; 52],
-            52,
-        )
-        .await?;
-        ap_native::set(&mut station.runtime, &guard, ap_wire::DOWN, 1).await?;
-        ap_native::set(&mut station.runtime, &guard, ap_wire::SET_AP, 0).await?;
-        if ap_native::get(&mut station.runtime, &guard, ap_wire::GET_AP).await? != 0 {
-            return Err(Error::Malformed);
+        if let Some(bsscfgidx) = self.scope.go() {
+            // brcmf_cfg80211_stop_ap for a P2P GO: `bss` disable only.
+            ap_native::set_var(
+                &mut station.runtime,
+                &guard,
+                "bss",
+                &ap_wire::bss_enable(bsscfgidx, false),
+            )
+            .await?;
+        } else {
+            ap_native::command(
+                &mut station.runtime,
+                &guard,
+                Direction::Set,
+                ap_wire::SET_SSID,
+                &[0; 52],
+                52,
+            )
+            .await?;
+            ap_native::set(&mut station.runtime, &guard, ap_wire::DOWN, 1).await?;
+            ap_native::set(&mut station.runtime, &guard, ap_wire::SET_AP, 0).await?;
+            if ap_native::get(&mut station.runtime, &guard, ap_wire::GET_AP).await? != 0 {
+                return Err(Error::Malformed);
+            }
         }
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {

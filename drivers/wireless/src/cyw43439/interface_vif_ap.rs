@@ -33,7 +33,7 @@ pub(super) type Delivery = (Arc<VifDevice>, Received);
 
 impl VifDevice {
     pub(super) fn ap_capable(&self) -> bool {
-        self.role == Role::Ap
+        matches!(self.role, Role::Ap | Role::P2pGo)
             && self.phase() == LIVE
             && !self.closing.load(Ordering::Acquire)
             && self.ap.capable.load(Ordering::Acquire)
@@ -46,7 +46,7 @@ impl VifDevice {
     }
     fn ap_role_matches(&self, source: &ApEmissionAuthority) -> bool {
         self.ap_generation()
-            .is_some_and(|generation| source.matches_role(self, 3, generation))
+            .is_some_and(|generation| source.matches_role(self, self.current_iftype(), generation))
     }
     /// AP carrier: up after a committed START (`brcmf_net_setcarrier(ifp,
     /// true)`), down on STOP or failure. No station disconnect is notified.
@@ -221,6 +221,18 @@ impl<R: Fullmac + 'static> Device<R> {
             .as_ref()
             .map(|owner| owner.features())
             .ok_or(WirelessError::Denied)?;
+        // A P2P GO starts on its own connection bsscfg (`Scope::Go`).
+        let scope = if shell.role == Role::P2pGo {
+            let bsscfgidx = state
+                .secondaries
+                .iter()
+                .find(|slot| slot.cookie == cookie)
+                .map(|slot| slot.link.entry().bsscfgidx)
+                .ok_or(WirelessError::Denied)?;
+            Scope::Go { bsscfgidx }
+        } else {
+            Scope::secondary(features)
+        };
         let mode = Mode {
             generation: host.generation.clone(),
             value: host.generation.load(Ordering::Acquire),
@@ -260,7 +272,7 @@ impl<R: Fullmac + 'static> Device<R> {
                             policy.unwrap(),
                             mode,
                             history,
-                            Scope::secondary(features),
+                            scope,
                         )?;
                         // Stored before the first wait: a dropped START keeps
                         // a real cleanup owner in the slot.

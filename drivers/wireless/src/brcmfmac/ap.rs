@@ -134,6 +134,11 @@ impl Session {
             return Err(Error::Authority);
         }
         let plan = Plan::new(config, settings, station.mac)?;
+        // Linux programs `closednet` only in the AP branch of `start_ap`;
+        // a hidden P2P GO SSID would be silently ignored, so refuse it.
+        if scope.go().is_some() && plan.config.hidden_ssid != 0 {
+            return Err(Error::Unsupported);
+        }
         let channel = station.ap_channel(&policy, plan.primary)?;
         if channel.chanspec != plan.chanspec {
             return Err(Error::Unsupported);

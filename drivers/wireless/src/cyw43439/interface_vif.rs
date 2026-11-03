@@ -230,12 +230,8 @@ async fn attach_role<R: Fullmac>(
         });
         shell.ap.mode.store(3, Ordering::Release);
         // A P2P GO starts its BSS with `bss` enable on the connection
-        // bsscfg (`brcmf_cfg80211_start_ap` P2P_GO branch), which the
-        // secondary AP program does not issue: its AP host stays off.
-        shell
-            .ap
-            .capable
-            .store(shell.role == Role::Ap, Ordering::Release);
+        // bsscfg (`brcmf_cfg80211_start_ap` P2P_GO branch, `Scope::Go`).
+        shell.ap.capable.store(true, Ordering::Release);
         return true;
     }
     let (mut bound, rest) = parked.rebind(Bsscfg::new(runtime, owner, &mut link));
@@ -768,6 +764,9 @@ impl<R: Fullmac + 'static> Device<R> {
                         if ap_like(shell.role) {
                             match ifidx.map(|ifidx| runtime.ap_leave_on(ifidx)) {
                                 Some(Ok(false)) => continue,
+                                // No per-ifidx AP owner on this family
+                                // (`!SECONDARY_AP`): nothing to retire.
+                                Some(Err(Error::Unsupported)) => {}
                                 Some(Err(_)) => {
                                     runtime.fail();
                                     shell.finish();

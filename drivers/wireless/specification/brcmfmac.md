@@ -1520,15 +1520,29 @@ native create is `vif_owner::create_p2p` (`brcmf_p2p_add_vif`:
 retirement), after a GO's secondary AP owner left its flows. A CLIENT
 shell runs the secondary station role exactly as a STA shell
 (`configure_secondary`, scan/join/disconnect through `Roles`, carrier
-from its correlated link). A GO shell gets the parked AP-shell state but
-its AP host stays incapable: Linux starts a GO BSS through the
-`brcmf_cfg80211_start_ap` P2P_GO branch (`chanspec`, bsscfg `ssid`,
-`bss` enable on the connection bsscfg; stop by `bss` disable), which the
-secondary AP program (`ap_native` `Scope::Secondary`) does not issue, so
-`START_AP` on a GO is refused.
+from its correlated link). A GO shell gets the parked AP-shell state and a capable AP host (role
+generation checked against iftype 9). `START_AP` runs the secondary AP
+`Session` with `ap_native::Scope::Go { bsscfgidx }`, the
+`brcmf_cfg80211_start_ap` P2P_GO branch: the shared non-MBSS radio setup
+(`mpc 0`, offloads, `BCNPRD`, `DTIMPRD`, `SET_INFRA 1`) without
+`DOWN`/`apsta`, `mbss`, `SET_AP` or `UP`; `chanspec`, `ap_isolate`,
+`wme_bss_disable`, the security iovars (`sup_wpa`, `auth`, `wsec`, `mfp`,
+`wpa_auth`), the AP event need, bsscfg `ssid` (`brcmf_ssid_le`, 36 bytes)
+and `bss` enable (`brcmf_fil_bss_enable_le` {`bsscfgidx`, 1}, on the GO
+ifidx); then the vendor IEs and the `GET_BSS_INFO` verification. Linux
+never sets or reads `SET_AP` on the GO bsscfg (`p2p_ifadd` created it in
+the AP role), so the `GET_AP` pre/post checks are skipped for this
+scope. `closednet` is AP-only in Linux, so a hidden-SSID GO is refused
+(`Unsupported`). `STOP_AP` is the `brcmf_cfg80211_stop_ap` non-AP branch:
+`bss` disable instead of the `SET_SSID`/`DOWN`/`SET_AP 0` sequence, then
+the usual SCB drain and a restore that skips `DOWN`, `SET_AP`,
+`SET_INFRA`, `apsta`, the PHY modes and `UP`. A GO beside another running
+AP (Linux non-MBSS GO) is refused like every second AP. An AP/GO shell
+whose CLOSING `ap_leave_on` reports `Unsupported` (no per-ifidx AP owner)
+proceeds to `vif_close` instead of failing the runtime.
 
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: the P2P_GO BSS start/stop (`bss` enable path), the P2P
+either family: the P2P
 escan,
 transport-model (msgbuf/SDIO) fixtures, and P2P iftype/combination
 advertisement, which stays off.
