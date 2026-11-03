@@ -453,3 +453,85 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_huc_auth_modes_read_gt1_registers
 );
+
+/// A writable register model that records every write in order.
+struct Heci(RefCell<BTreeMap<u64, u32>>, RefCell<Vec<(u64, u32)>>);
+impl Heci {
+    fn new() -> Self {
+        Self(RefCell::new(BTreeMap::new()), RefCell::new(Vec::new()))
+    }
+}
+impl MmioWindow for Heci {
+    fn read32(&self, offset: u64) -> u32 {
+        *self.0.borrow().get(&offset).unwrap_or(&0)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        self.1.borrow_mut().push((offset, value));
+        self.0.borrow_mut().insert(offset, value);
+    }
+}
+
+/// `narf.intel.gsc=1` uses the shared opt-in grammar and needs the media GT
+/// option too (xe_gsc.c::xe_gsc_init: the GSC lives only on the media GT).
+/// The Wa_14015076503 helpers write only HECI2 GS1/CSR at their absolute
+/// offsets through a media GSI window, and refuse lost MMIO.
+fn smoke_media_gsc_option_grammar_and_wa_14015076503_registers() -> TestResult {
+    use narf_boot::args::KernelCmdline;
+    const MTL: crate::intel_gpu_gt::GtPlatform =
+        crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    for line in [
+        "",
+        "narf.intel.gsc",
+        "narf.intel.gsc=",
+        "narf.intel.gsc=0",
+        "narf.intel.gsc=1 narf.intel.gsc=1",
+        "-- narf.intel.gsc=1",
+        "narf.intel.gsc_x=1",
+    ] {
+        kt_assert!(!requested(KernelCmdline::new(line)));
+    }
+    for line in [
+        "narf.intel.gsc=1",
+        "quiet narf.intel.gsc=1 -- narf.intel.gsc",
+    ] {
+        kt_assert!(requested(KernelCmdline::new(line)));
+    }
+    let both = KernelCmdline::new("narf.intel.media_gt=1 narf.intel.gsc=1");
+    kt_assert!(admitted(Some(MTL), both));
+    kt_assert!(!admitted(Some(MTL), KernelCmdline::new("narf.intel.gsc=1")));
+    kt_assert!(!admitted(
+        Some(MTL),
+        KernelCmdline::new("narf.intel.media_gt=1")
+    ));
+    kt_assert!(!admitted(None, both));
+    kt_assert!(!admitted(
+        Some(crate::intel_gpu_gt::GtPlatform::Battlemage),
+        both
+    ));
+
+    let regs = Heci::new();
+    regs.0.borrow_mut().insert(0x117c4c, 0x80);
+    regs.0.borrow_mut().insert(0x117004, 0x1b);
+    let media = crate::intel_gpu_gt::media::MediaWindow::new(&regs);
+    kt_assert_eq!(wa_14015076503_prepare(&media), Some(()));
+    // ER_PREP set beside the other GS1 bits, then IG with RST cleared.
+    kt_assert_eq!(&regs.1.borrow()[..], &[(0x117c4c, 0x81), (0x117004, 0x0f)]);
+    kt_assert_eq!(wa_14015076503_clear(&media), Some(()));
+    kt_assert_eq!(regs.1.borrow()[2], (0x117c4c, 0x80));
+    kt_assert_eq!(RESET_PREPARE_NS, 200_000_000);
+    regs.1.borrow_mut().clear();
+    regs.0.borrow_mut().insert(0x117c4c, u32::MAX);
+    kt_assert_eq!(wa_14015076503_prepare(&media), None);
+    kt_assert_eq!(wa_14015076503_clear(&media), None);
+    kt_assert!(regs.1.borrow().is_empty());
+    // A lost CSR stops after the GS1 alert, which the caller still owes.
+    regs.0.borrow_mut().insert(0x117c4c, 0);
+    regs.0.borrow_mut().insert(0x117004, u32::MAX);
+    kt_assert_eq!(wa_14015076503_prepare(&media), None);
+    kt_assert_eq!(&regs.1.borrow()[..], &[(0x117c4c, 1)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gsc_option_grammar_and_wa_14015076503_registers
+);

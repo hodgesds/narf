@@ -2448,7 +2448,14 @@ impl Owner {
                 (started, _) => started,
             };
             match started {
-                Ok(guc) => {
+                Ok(mut guc) => {
+                    // narf.intel.gsc=1: Wa_14015076503 brackets the stop's
+                    // GRDOM_FULL, so loaded GSC firmware no longer refuses
+                    // media scheduling (xe_gt.c::do_gt_reset).
+                    if crate::intel_gpu_gt::media::gsc::admitted(platform, narf_boot::args()) {
+                        // A fresh owner has no scheduler: this cannot refuse.
+                        let _ = guc.honour_gsc_reset_workaround();
+                    }
                     state.media_guc_reported = false;
                     state.media_huc_reported = false;
                     state.media_guc = Some(guc);

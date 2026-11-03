@@ -129,6 +129,14 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     /// Standalone media GT power management started (`begin_media_power`):
     /// the next reset first returns RC6 and powergating to the host.
     media_power: bool,
+    /// Standalone media GT with `narf.intel.gsc=1`: the stop's GRDOM_FULL is
+    /// bracketed by Wa_14015076503 while GSC firmware reports loaded
+    /// (xe_gt.c::do_gt_reset), so scheduling is admitted beside it.
+    gsc_reset_wa: bool,
+    /// HECI_H_GS1 ER_PREP was set and is still owed its clear.
+    gsc_prepared: bool,
+    /// GRDOM_FULL waits for the GSC's reset preparation until this time.
+    gsc_prepare_until: Option<u64>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -291,7 +299,35 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             gen12_reset: None,
             media_wells: 0,
             media_power: false,
+            gsc_reset_wa: false,
+            gsc_prepared: false,
+            gsc_prepare_until: None,
         }
+    }
+
+    /// `narf.intel.gsc=1` on the standalone media GT, before scheduling:
+    /// honour Wa_14015076503 around the stop's GRDOM_FULL instead of refusing
+    /// to schedule while GSC firmware reports loaded. The primary GT has no
+    /// GSC and refuses.
+    pub(crate) fn honour_gsc_reset_workaround(&mut self) -> Result<(), GtError> {
+        let crate::intel_gpu_guc_boot::GuCRole::Media(_) = self.parts.boot.role() else {
+            return Err(GtError::State);
+        };
+        if self.parts.scheduler.is_some() {
+            return Err(GtError::State);
+        }
+        self.gsc_reset_wa = true;
+        Ok(())
+    }
+
+    /// xe_gsc_wa_14015076503(gt, false), owed once ER_PREP was set.
+    fn clear_gsc_prepare(&mut self) -> Result<(), GtError> {
+        if self.gsc_prepared {
+            crate::intel_gpu_gt::media::gsc::wa_14015076503_clear(self.parts.boot.window())
+                .ok_or(GtError::Unavailable)?;
+            self.gsc_prepared = false;
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> GtState {
@@ -1771,15 +1807,29 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         if self.parts.scheduler.is_some() || self.parts.mert.is_some() {
             // xe_gt.c::do_gt_reset brackets a media GRDOM_FULL with
-            // Wa_14015076503 while GSC firmware is loaded. NARF never loads
-            // GSC firmware and admits media scheduling only without it; a
-            // GSC load that appears later keeps this owner retained instead.
+            // Wa_14015076503 while GSC firmware is loaded. Without
+            // `narf.intel.gsc=1` NARF admits media scheduling only without
+            // loaded GSC firmware, and a GSC load that appears later keeps
+            // this owner retained instead.
             if matches!(
                 self.parts.boot.role(),
                 crate::intel_gpu_guc_boot::GuCRole::Media(_)
             ) && crate::intel_gpu_gt::media::gsc_firmware_loaded(self.parts.boot.window())?
             {
-                return Err(GtError::State);
+                if !self.gsc_reset_wa {
+                    return Err(GtError::State);
+                }
+                // xe_gsc_wa_14015076503(gt, true): alert the GSC, then hold
+                // GRDOM_FULL for its 200 ms preparation.
+                let until = now
+                    .checked_add(crate::intel_gpu_gt::media::gsc::RESET_PREPARE_NS)
+                    .ok_or(GtError::State)?;
+                self.gsc_prepared = true;
+                crate::intel_gpu_gt::media::gsc::wa_14015076503_prepare(self.parts.boot.window())
+                    .ok_or(GtError::Unavailable)?;
+                self.gsc_prepare_until = Some(until);
+                self.state = GtState::ResettingEngines;
+                return Ok(());
             }
             self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
             self.parts.boot.window().write32(0x941c, 1);
@@ -1852,6 +1902,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             Poll::Ready(Err(GtError::Unavailable))
         };
         if matches!(result, Poll::Ready(Err(_))) && self.state != GtState::Staged {
+            // do_gt_reset clears the GSC notification even when GRDOM_FULL
+            // failed; lost MMIO leaves it unclearable.
+            let _ = self.clear_gsc_prepare();
+            self.gsc_prepare_until = None;
             self.state = GtState::Lost;
             if let Some(actor) = &mut self.log_stream {
                 actor.lost();
@@ -1987,6 +2041,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 return Poll::Pending;
             }
             GtState::ResettingEngines => {
+                if let Some(until) = self.gsc_prepare_until {
+                    // Wa_14015076503: the alerted GSC prepares for up to
+                    // 200 ms before do_gt_reset writes GRDOM_FULL.
+                    if now < until {
+                        return Poll::Pending;
+                    }
+                    self.gsc_prepare_until = None;
+                    self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
+                    self.parts.boot.window().write32(0x941c, 1);
+                    let _ = self.parts.boot.window().read32(0x941c);
+                    return Poll::Pending;
+                }
                 let reset = self.parts.boot.window().read32(0x941c);
                 if reset == u32::MAX {
                     return Poll::Ready(Err(GtError::Unavailable));
@@ -1997,6 +2063,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 if reset & 1 != 0 {
                     return Poll::Pending;
                 }
+                // do_gt_reset: xe_gsc_wa_14015076503(gt, false) once
+                // GRDOM_FULL has self-cleared.
+                self.clear_gsc_prepare()?;
                 let status = self.parts.boot.window().read32(0xc000);
                 let dma = self.parts.boot.window().read32(0xc314);
                 if status == u32::MAX || dma == u32::MAX {
@@ -2352,7 +2421,11 @@ impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi
             self.state = GtState::Lost;
             return Err(error);
         }
-        if crate::intel_gpu_gt::media::gsc_firmware_loaded(self.parts.boot.window())? {
+        // Without Wa_14015076503 around the stop's GRDOM_FULL, loaded GSC
+        // firmware refuses scheduling (`honour_gsc_reset_workaround`).
+        if !self.gsc_reset_wa
+            && crate::intel_gpu_gt::media::gsc_firmware_loaded(self.parts.boot.window())?
+        {
             return Err(GtError::Busy);
         }
         let mut scheduler = self.parts.boot.scheduler(engines).map_err(GtError::Boot)?;

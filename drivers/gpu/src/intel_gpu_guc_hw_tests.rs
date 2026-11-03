@@ -3531,6 +3531,10 @@ mod media_gt_power {
     include!("intel_gpu_media_gt_power_tests.rs");
 }
 
+mod media_gt_gsc {
+    include!("intel_gpu_media_gt_gsc_tests.rs");
+}
+
 mod coredump_exec {
     use super::*;
     include!("intel_gpu_coredump_exec_hw_tests.rs");

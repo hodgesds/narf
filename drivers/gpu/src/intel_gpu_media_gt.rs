@@ -1158,6 +1158,15 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         self.state
     }
 
+    /// `narf.intel.gsc=1`: bracket the stop's media GRDOM_FULL with
+    /// Wa_14015076503 while GSC firmware reports loaded, and schedule beside
+    /// it (`GuCGt::honour_gsc_reset_workaround`). Call before scheduling.
+    pub(crate) fn honour_gsc_reset_workaround(&mut self) -> Result<(), MediaGucError> {
+        self.gt
+            .honour_gsc_reset_workaround()
+            .map_err(MediaGucError::Gt)
+    }
+
     /// The first refusal of this owner, if any.
     pub(crate) fn error(&self) -> Option<MediaGucError> {
         self.error

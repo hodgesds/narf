@@ -42,6 +42,65 @@ mod heci;
 #[cfg_attr(not(feature = "kernel-test"), allow(unused_imports))]
 pub(crate) use heci::*;
 
+/// Default-off opt-in for GSC handling on the MTL/Arrow media GT, with the
+/// shared pre-`--` grammar of `narf.intel.media_gt=1` and `narf.intel.huc=1`.
+/// Linux makes GSC separately optional through `gsc_firmware_path` (an
+/// empty path disables it), so it needs its own switch beside the media GT.
+pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, "narf.intel.gsc")
+}
+
+/// `narf.intel.gsc=1` on a device whose media GT is itself admitted
+/// (`narf.intel.media_gt=1`): the GSC is only available on the media GT
+/// (xe_gsc.c::xe_gsc_init).
+pub(crate) fn admitted(
+    platform: Option<crate::intel_gpu_gt::GtPlatform>,
+    args: narf_boot::args::KernelCmdline<'_>,
+) -> bool {
+    crate::intel_gpu_gt::media::admitted(platform, args) && requested(args)
+}
+
+/// regs/xe_gsc_regs.h: MTL_GSC_HECI2_BASE 0x117000 (HECI1 is 0x116000).
+/// Both blocks lie above MEDIA_GT_GSI_LENGTH, so a media GSI window reaches
+/// them at their absolute offsets (xe_mmio_adjusted_addr).
+pub(crate) const HECI2_H_CSR: u64 = 0x117000 + 0x4;
+pub(crate) const HECI_H_CSR_IG: u32 = 1 << 2;
+pub(crate) const HECI_H_CSR_RST: u32 = 1 << 4;
+pub(crate) const HECI2_H_GS1: u64 = 0x117000 + 0xc4c;
+pub(crate) const HECI_H_GS1_ER_PREP: u32 = 1 << 0;
+/// xe_gsc.c::xe_gsc_wa_14015076503: up to 200 ms for the GSC to prepare.
+pub(crate) const RESET_PREPARE_NS: u64 = 200_000_000;
+
+/// xe_gsc_wa_14015076503(gt, true), Wa_14015076503 (MEDIA_VERSION(1300)):
+/// alert loaded GSC firmware of the coming GT reset by setting
+/// HECI_H_GS1 ER_PREP, then raise the HECI2 interrupt (IG) with the CSR
+/// reset bit cleared. The caller waits `RESET_PREPARE_NS` before GDRST and
+/// skips the whole workaround when `firmware_loaded` is false. `None` is
+/// lost MMIO: GS1 may then already carry the notification.
+pub(crate) fn wa_14015076503_prepare(mmio: &impl MmioWindow) -> Option<()> {
+    let gs1 = mmio.read32(HECI2_H_GS1);
+    if gs1 == u32::MAX {
+        return None;
+    }
+    mmio.write32(HECI2_H_GS1, gs1 | HECI_H_GS1_ER_PREP);
+    let csr = mmio.read32(HECI2_H_CSR);
+    if csr == u32::MAX {
+        return None;
+    }
+    mmio.write32(HECI2_H_CSR, (csr & !HECI_H_CSR_RST) | HECI_H_CSR_IG);
+    Some(())
+}
+
+/// xe_gsc_wa_14015076503(gt, false): clear the notification after the reset.
+pub(crate) fn wa_14015076503_clear(mmio: &impl MmioWindow) -> Option<()> {
+    let gs1 = mmio.read32(HECI2_H_GS1);
+    if gs1 == u32::MAX {
+        return None;
+    }
+    mmio.write32(HECI2_H_GS1, gs1 & !HECI_H_GS1_ER_PREP);
+    Some(())
+}
+
 /// xe_uc_fw.c no_ver(i915, huc_gsc, mtl): any HuC release is accepted.
 pub(crate) const HUC_FIRMWARE: &str = "i915/mtl_huc_gsc.bin";
 /// xe_huc.c::xe_huc_auth: the authentication bit must appear within 100 ms.
@@ -295,8 +354,8 @@ pub(crate) enum HucAuth {
 
 const HUC_KERNEL_LOAD_INFO: u64 = 0xc1dc;
 const HUC_LOAD_SUCCESSFUL: u32 = 1 << 0;
-const HECI1_FWSTS5: u64 = 0x116000 + 0xc68;
-const HECI1_FWSTS5_HUC_AUTH_DONE: u32 = 1 << 19;
+pub(crate) const HECI1_FWSTS5: u64 = 0x116000 + 0xc68;
+pub(crate) const HECI1_FWSTS5_HUC_AUTH_DONE: u32 = 1 << 19;
 
 /// xe_huc.c::xe_huc_is_authenticated through the HuC-owning GT's MMIO view:
 /// the media GT's `MediaGsi` on MTL/Arrow, GT0's window on exact TGL. An
