@@ -23,6 +23,8 @@ pub const E_ACTION_FRAME_COMPLETE: u32 = 60;
 pub const E_ACTION_FRAME_OFF_CHAN_COMPLETE: u32 = 70;
 pub const E_P2P_PROBEREQ_MSG: u32 = 72;
 pub const E_ACTION_FRAME_RX: u32 = 75;
+/// `BRCMF_E_ESCAN_RESULT`.
+pub const E_ESCAN_RESULT: u32 = 69;
 /// The events `cfg80211.c::brcmf_register_event_handlers` registers for
 /// P2P; `fweh` enables every registered handler device-wide.
 pub const DEVICE_EVENTS: [usize; 5] = [
@@ -456,4 +458,194 @@ pub fn frequency_channel(mhz: u32) -> Option<u8> {
         _ => return None,
     };
     u8::try_from(channel).ok()
+}
+
+/// `BRCMF_P2P_WILDCARD_SSID` (`p2p.c`).
+pub const WILDCARD_SSID: &[u8] = b"DIRECT-";
+/// `SOCIAL_CHAN_1/2/3`.
+pub const SOCIAL_CHANNELS: [u8; 3] = [1, 6, 11];
+/// `brcmf_p2p_escan` `sync_id`.
+pub const ESCAN_SYNC_ID: u16 = 0x1234;
+/// `P2PAPI_SCAN_HOME_TIME_MS`.
+const SCAN_HOME_TIME_MS: u32 = 60;
+/// `P2PAPI_SCAN_SOCIAL_DWELL_TIME_MS`.
+const SCAN_SOCIAL_DWELL_TIME_MS: u32 = 40;
+/// `P2PAPI_SCAN_AF_SEARCH_DWELL_TIME_MS`.
+const SCAN_AF_SEARCH_DWELL_TIME_MS: u32 = 100;
+/// `P2PAPI_SCAN_DWELL_TIME_MS`.
+const SCAN_DWELL_TIME_MS: u32 = 80;
+/// `WL_SCAN_CONNECT_DWELL_TIME_MS`.
+const SCAN_CONNECT_DWELL_TIME_MS: u32 = 200;
+/// `WL_SCAN_JOIN_PROBE_INTERVAL_MS`.
+const SCAN_JOIN_PROBE_INTERVAL_MS: u32 = 20;
+/// `P2PAPI_SCAN_NPROBS_TIME_MS`.
+const SCAN_NPROBS_TIME_MS: u32 = 30;
+/// `offsetof(struct brcmf_p2p_scan_le, eparams.params_le.channel_list)`:
+/// type + 3 reserved, escan version/action/sync_id, then
+/// `brcmf_scan_params_le` up to `channel_list` (ssid_le 36, bssid 6,
+/// bss_type, scan_type, nprobes, active, passive, home, channel_num).
+pub const P2P_SCAN_FIXED: usize = 4 + 8 + 64;
+
+/// `brcmf_p2p_scan_is_p2p_request`: one requested SSID is exactly the
+/// P2P wildcard.
+pub fn is_p2p_request(ssids: &[Vec<u8>]) -> bool {
+    ssids.iter().any(|ssid| ssid.as_slice() == WILDCARD_SSID)
+}
+
+/// `cfg80211_get_p2p_attr`: the body of P2P attribute `attr` across the
+/// concatenated payloads of every P2P IE (WFA OUI 50:6f:9a type 9) in
+/// `ies`. A truncated element or attribute is refused.
+pub fn p2p_attr(mut ies: &[u8], attr: u8) -> Result<Option<Vec<u8>>, WireError> {
+    let mut payload = Vec::new();
+    while !ies.is_empty() {
+        let [id, length, ..] = *ies else {
+            return Err(WireError::Invalid);
+        };
+        let element = ies
+            .get(..2 + usize::from(length))
+            .ok_or(WireError::Invalid)?;
+        if id == 221 && element.len() >= 6 && element[2..6] == [0x50, 0x6f, 0x9a, 0x09] {
+            payload.extend_from_slice(&element[6..]);
+        }
+        ies = &ies[element.len()..];
+    }
+    let mut rest = payload.as_slice();
+    while !rest.is_empty() {
+        let [id, low, high, ..] = *rest else {
+            return Err(WireError::Invalid);
+        };
+        let end = 3 + usize::from(u16::from_le_bytes([low, high]));
+        let body = rest.get(3..end).ok_or(WireError::Invalid)?;
+        if id == attr {
+            return Ok(Some(body.to_vec()));
+        }
+        rest = &rest[end..];
+    }
+    Ok(None)
+}
+
+/// `brcmf_p2p_find_listen_channel`: the social channel of the Listen
+/// Channel attribute (6: country 3, operating class, channel).
+pub fn listen_channel(ies: &[u8]) -> Option<u8> {
+    let body = p2p_attr(ies, 6).ok()??;
+    let channel = *body.get(4)?;
+    SOCIAL_CHANNELS.contains(&channel).then_some(channel)
+}
+
+/// `brcmf_p2p_run_escan` search-state choice: the three social channels
+/// in order (or an existing GO) search; anything else is a SCAN phase.
+pub fn search_state(channels: &[u8], go: bool) -> DiscState {
+    if channels == SOCIAL_CHANNELS || go {
+        DiscState::Search
+    } else {
+        DiscState::Scan
+    }
+}
+
+/// `brcmf_p2p_escan` body (`struct brcmf_p2p_scan_le`, type 'E', escan
+/// v1 START). SEARCH uses the null SSID (the firmware's own P2P wildcard),
+/// SCAN the `DIRECT-` wildcard. Dwell/probe policy is Linux's for an
+/// unconnected device (`active = -1` when connected is not reachable:
+/// the NARF P2P escan is refused while the primary is associated).
+pub fn p2p_scan(state: DiscState, chanspecs: &[u16]) -> Result<Vec<u8>, WireError> {
+    if chanspecs.is_empty() || chanspecs.len() > 0xffff || state == DiscState::Listen {
+        return Err(WireError::Invalid);
+    }
+    let count = chanspecs.len();
+    let active = match count {
+        3 | 4 => SCAN_SOCIAL_DWELL_TIME_MS,
+        2 => SCAN_AF_SEARCH_DWELL_TIME_MS,
+        1 => SCAN_CONNECT_DWELL_TIME_MS,
+        _ => SCAN_DWELL_TIME_MS,
+    };
+    let nprobes = if count == 1 {
+        active / SCAN_JOIN_PROBE_INTERVAL_MS
+    } else {
+        active / SCAN_NPROBS_TIME_MS
+    }
+    .max(1);
+    let mut out = alloc::vec![0; P2P_SCAN_FIXED + count * 2];
+    out[0] = b'E';
+    out[4..8].copy_from_slice(&1u32.to_le_bytes()); // BRCMF_ESCAN_REQ_VERSION
+    out[8..10].copy_from_slice(&1u16.to_le_bytes()); // WL_ESCAN_ACTION_START
+    out[10..12].copy_from_slice(&ESCAN_SYNC_ID.to_le_bytes());
+    let params = 12;
+    if state == DiscState::Scan {
+        out[params..params + 4].copy_from_slice(&(WILDCARD_SSID.len() as u32).to_le_bytes());
+        out[params + 4..params + 4 + WILDCARD_SSID.len()].copy_from_slice(WILDCARD_SSID);
+    }
+    out[params + 36..params + 42].fill(0xff); // broadcast BSSID
+    out[params + 42] = 2; // DOT11_BSSTYPE_ANY
+    out[params + 43] = 0; // BRCMF_SCANTYPE_ACTIVE
+    out[params + 44..params + 48].copy_from_slice(&nprobes.to_le_bytes());
+    out[params + 48..params + 52].copy_from_slice(&active.to_le_bytes());
+    out[params + 52..params + 56].copy_from_slice(&u32::MAX.to_le_bytes()); // passive -1
+    out[params + 56..params + 60].copy_from_slice(&SCAN_HOME_TIME_MS.to_le_bytes());
+    // BRCMF_SCAN_PARAMS_COUNT_MASK: no SSID count in the upper half.
+    out[params + 60..params + 64].copy_from_slice(&(count as u32 & 0xffff).to_le_bytes());
+    for (index, chanspec) in chanspecs.iter().enumerate() {
+        let at = P2P_SCAN_FIXED + index * 2;
+        out[at..at + 2].copy_from_slice(&chanspec.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// `IE_MAX_LEN`: the size of each `vif_saved_ie` buffer.
+pub const SAVED_IE_MAX: usize = 512;
+/// `BRCMF_VNDR_IE_PRBREQ_FLAG` / `BRCMF_VNDR_IE_PRBRSP_FLAG`.
+pub const VNDR_IE_PRBREQ_FLAG: u32 = 0x10;
+pub const VNDR_IE_PRBRSP_FLAG: u32 = 0x2;
+/// `VNDR_IE_PARSE_LIMIT`.
+const VNDR_IE_PARSE_LIMIT: usize = 5;
+
+/// `brcmf_parse_vndr_ies`: the vendor-specific elements of `ies` with a
+/// body of at least OUI + type + one byte, without Microsoft WPA (1) or
+/// WME (2), at most `VNDR_IE_PARSE_LIMIT`. Other elements are skipped as
+/// in Linux; a truncated element list is refused, as is a kept set larger
+/// than the saved-IE buffer (`brcmf_vif_set_mgmt_ie` -ENOMEM).
+pub fn vendor_ies(mut ies: &[u8]) -> Result<Vec<u8>, WireError> {
+    let mut out = Vec::new();
+    let mut count = 0;
+    while !ies.is_empty() && count < VNDR_IE_PARSE_LIMIT {
+        let [id, length, ..] = *ies else {
+            return Err(WireError::Invalid);
+        };
+        let element = ies
+            .get(..2 + usize::from(length))
+            .ok_or(WireError::Invalid)?;
+        ies = &ies[element.len()..];
+        if id != 221 || length < 5 {
+            continue;
+        }
+        if element[2..5] == [0x00, 0x50, 0xf2] && matches!(element[5], 1 | 2) {
+            continue;
+        }
+        out.extend_from_slice(element);
+        count += 1;
+    }
+    if out.len() > SAVED_IE_MAX {
+        return Err(WireError::Invalid);
+    }
+    Ok(out)
+}
+
+/// `brcmf_vif_set_mgmt_ie` `vndr_ie` body: `del` records of `installed`
+/// then `add` records of `requested` for `flag`, or `None` when they are
+/// equal (Linux compares the saved buffer and skips the iovar).
+pub fn vndr_ie_update(installed: &[u8], requested: &[u8], flag: u32) -> Option<Vec<u8>> {
+    if installed == requested {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (command, mut rest) in [(b"del\0", installed), (b"add\0", requested)] {
+        while let [_, length, ..] = *rest {
+            let end = (2 + usize::from(length)).min(rest.len());
+            out.extend_from_slice(command);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&flag.to_le_bytes());
+            out.extend_from_slice(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    Some(out)
 }

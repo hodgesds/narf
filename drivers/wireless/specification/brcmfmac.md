@@ -1447,9 +1447,38 @@ BSSID from the bsscfg's `BRCMF_C_GET_BSSID` or zero;
 `brcmf_p2p_notify_rx_mgmt_p2p_probereq`: bsscfg 0 and GO-negotiation
 phase filtered, needs the probe-request registration). Not mirrored, and
 unreachable in Linux as well without the P2P escan: the peer-channel
-search (needs saved P2P probe-request IEs) and the extra-listen WAR
-(needs `my_listen_chan`); the P2P escan (`p2p_scan` 'E', `DIRECT-`
-wildcard, social channels) itself is not implemented.
+search (`brcmf_p2p_af_searching_channel`) and the extra-listen WAR,
+although `my_listen_chan` is now recorded by the P2P escan.
+
+P2P escan (`cyw43439/station_p2p_scan.rs`, `Device::scan_prep`,
+`run_escan`, `service_escan`): with the P2P_DEVICE WDEV present, a primary
+`TRIGGER_SCAN` whose SSIDs include the `DIRECT-` wildcard
+(`brcmf_p2p_scan_is_p2p_request`) is `brcmf_p2p_scan_prep` (social
+Listen Channel from the request's P2P IE attribute 6, else `-EPERM` →
+Denied; GO-negotiation phase cleared; `brcmf_p2p_enable_discovery`), the
+request's vendor IEs as the discovery vif's PRBREQ `vndr_ie` set
+(`brcmf_vif_set_mgmt_ie`: vendor elements of at least OUI+type+1, no MS
+WPA/WME, at most 5, del/add against the saved set) and
+`brcmf_p2p_run_escan`/`brcmf_p2p_escan`: discovery state SEARCH for the
+social channels 1/6/11 (or with a live P2P GO bsscfg), else SCAN with the
+`DIRECT-` SSID; bsscfg `p2p_scan` = `brcmf_p2p_scan_le` ('E', escan v1
+START, `sync_id` 0x1234, ANY/active, broadcast BSSID, home 60 ms, active
+40/100/200/80 ms and nprobes by channel count, passive -1). Channels with
+no TX ceiling under the current policy (Linux: RADAR/NO_IR) are left out
+(compacted; Linux leaves zero holes). The station's active-scan TX
+grants and `qtxpower` apply as for an ordinary scan. Results are the
+`BRCMF_E_ESCAN_RESULT` records with that `sync_id` from the primary and
+the discovery bsscfg queues, not SSID-filtered (Linux reports every BSS);
+other discovery events keep their `p2p.c` handlers. The P2P escan is
+refused while the primary is associated (the scan loop consumes the
+primary event queue, as `scan`). Not reachable: `TRIGGER_SCAN` addressed
+by `NL80211_ATTR_WDEV` to the P2P_DEVICE (the generic nl80211 scan path
+resolves only an ifindex), and scans on the P2P_CLIENT/GO shells.
+
+`mgmt_tx` probe-response branch: on the WDEV, a probe response's IEs
+after `DOT11_MGMT_HDR_LEN + DOT11_BCN_PRB_FIXED_LEN` become the discovery
+vif's PRBRSP `vndr_ie` set and the TX status is ACK, as
+`brcmf_cfg80211_mgmt_tx` does (the firmware answers probes itself).
 
 Three written/unexecuted cases in `drivers/wireless/brcmfmac/p2p`
 (`p2p_tests.rs`, both fixture families):
@@ -1489,10 +1518,9 @@ primary's AP serialization lease (`reserve_radio_control`).
   Linux cookie WAR).
 - FRAME: action frames only, through `brcmf_p2p_send_action_frame` with
   the requested channel or `BRCMF_C_GET_CHANNEL` on the discovery ifidx
-  and `wait` as dwell; the returned ACK is the TX status. The
-  probe-response vendor-IE branch of `brcmf_cfg80211_mgmt_tx` is not
-  mirrored (refused), nor are other subtypes (Linux returns 0 without a
-  status).
+  and `wait` as dwell; the returned ACK is the TX status. A probe
+  response takes the PRBRSP `vndr_ie` branch (above); other subtypes are
+  refused (Linux returns 0 without a status).
 - REGISTER_FRAME: action (0xd0) and probe request (0x40) only
   (`brcmf_txrx_stypes[P2P_DEVICE].rx`), overlapping prefixes `EALREADY`,
   at most 16; the union of current subscriptions is the discovery vif's
@@ -1542,8 +1570,7 @@ whose CLOSING `ap_leave_on` reports `Unsupported` (no per-ifidx AP owner)
 proceeds to `vif_close` instead of failing the runtime.
 
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: the P2P
-escan,
+either family: the
 transport-model (msgbuf/SDIO) fixtures, and P2P iftype/combination
 advertisement, which stays off.
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are

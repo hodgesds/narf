@@ -89,6 +89,9 @@ pub(in crate::cyw43439) enum Operation {
         wait_ms: u32,
         cookie: u64,
     },
+    /// `brcmf_cfg80211_mgmt_tx` probe-response branch: the frame's
+    /// vendor IEs become the discovery vif's PRBRSP `vndr_ie` set.
+    ProbeResponse(Vec<u8>),
     /// `vif->mgmt_rx_reg` action / probe-request bits.
     Registrations {
         action: bool,
@@ -215,6 +218,16 @@ impl<R: Fullmac + 'static> Device<R> {
                     .send_action_frame(runtime, owner, &frame, channel, wait_ms, cookie)
                     .await
                     .map_err(wireless_error)?;
+            }
+            Operation::ProbeResponse(ies) => {
+                let device = p2p.as_mut().ok_or(WirelessError::NotSupported)?;
+                device
+                    .set_mgmt_ie(runtime, p2p_wire::VNDR_IE_PRBRSP_FLAG, &ies)
+                    .await
+                    .map_err(wireless_error)?;
+                // `cfg80211_mgmt_tx_status(..., true)`: the firmware sends
+                // its own probe responses carrying these IEs.
+                outcome.acked = true;
             }
             Operation::Registrations { action, probe_req } => {
                 let device = p2p.as_mut().ok_or(WirelessError::NotSupported)?;
@@ -823,8 +836,9 @@ impl WirelessNetIface for P2pWdev {
         Ok(())
     }
     /// `brcmf_cfg80211_mgmt_tx` on the P2P_DEVICE: action frames go
-    /// through `brcmf_p2p_send_action_frame`; the probe-response vendor-IE
-    /// branch is not mirrored and other subtypes are refused.
+    /// through `brcmf_p2p_send_action_frame`; a probe response installs
+    /// its vendor IEs as the discovery vif's PRBRSP set and reports ACK
+    /// (Linux's probe-response branch); other subtypes are refused.
     async fn mgmt_tx_radio_async(
         &self,
         authority: &RadioControlAuthority,
@@ -834,6 +848,18 @@ impl WirelessNetIface for P2pWdev {
         let parent = self.request_current(authority)?;
         if !self.started() {
             return Err(WirelessError::NotSupported);
+        }
+        if p2p_wire::is_probe_resp(&request.frame) {
+            // `DOT11_MGMT_HDR_LEN + DOT11_BCN_PRB_FIXED_LEN`.
+            let ies = request
+                .frame
+                .get(p2p_wire::MGMT_HDR_LEN + 12..)
+                .ok_or(WirelessError::InvalidArgs)?
+                .to_vec();
+            let outcome = parent.p2p_device(Operation::ProbeResponse(ies)).await?;
+            self.notices(outcome.notices);
+            self.request_current(authority)?;
+            return Ok(outcome.acked);
         }
         if !p2p_wire::is_action(&request.frame) {
             return Err(WirelessError::NotSupported);

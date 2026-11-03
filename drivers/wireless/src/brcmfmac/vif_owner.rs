@@ -218,6 +218,10 @@ impl Owner {
         counts.add(role);
         admits_counts(self.features, counts)
     }
+    /// Whether a live secondary bsscfg has `role`.
+    pub fn has_role(&self, role: Role) -> bool {
+        self.roles.iter().flatten().any(|current| *current == role)
+    }
     /// The live role of secondary bsscfg `bsscfgidx`.
     pub fn role(&self, bsscfgidx: u8) -> Option<Role> {
         *self.roles.get(bsscfgidx as usize)?

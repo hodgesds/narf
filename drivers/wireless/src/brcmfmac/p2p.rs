@@ -92,6 +92,12 @@ pub struct Device {
     rx_action: bool,
     rx_probe_req: bool,
     notices: VecDeque<Notice>,
+    /// `vif->saved_ie` probe-request / probe-response vendor IEs installed
+    /// on the discovery bsscfg (`brcmf_vif_set_mgmt_ie`).
+    probe_req_ies: Vec<u8>,
+    probe_resp_ies: Vec<u8>,
+    /// `afx_hdl.my_listen_chan` from the last P2P scan request.
+    my_listen_chan: Option<u8>,
 }
 
 impl Device {
@@ -113,6 +119,9 @@ impl Device {
             rx_action: false,
             rx_probe_req: false,
             notices: VecDeque::new(),
+            probe_req_ies: Vec::new(),
+            probe_resp_ies: Vec::new(),
+            my_listen_chan: None,
         }
     }
     pub fn entry(&self) -> Entry {
@@ -254,6 +263,112 @@ impl Device {
             cookie,
             frequency_mhz,
         });
+        Ok(())
+    }
+
+    /// `afx_hdl.my_listen_chan` of the last P2P scan request.
+    pub fn my_listen_channel(&self) -> Option<u8> {
+        self.my_listen_chan
+    }
+
+    /// `brcmf_vif_set_mgmt_ie` on the discovery bsscfg: replace the saved
+    /// vendor IEs of `flag` (PRBREQ or PRBRSP) with the vendor elements
+    /// of `ies`. A refused or cancelled update leaves the installed set
+    /// unknown; the saved copy is then cleared so the next request
+    /// re-issues a full `add` without claiming the old set was deleted.
+    pub async fn set_mgmt_ie<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        flag: u32,
+        ies: &[u8],
+    ) -> Result<(), Error> {
+        let requested = wire::vendor_ies(ies).map_err(|_| Error::Malformed)?;
+        let installed = core::mem::take(self.saved_ies(flag)?);
+        let Some(update) = wire::vndr_ie_update(&installed, &requested, flag) else {
+            *self.saved_ies(flag)? = installed;
+            return Ok(());
+        };
+        let input = vif_wire::bsscfg_iovar(self.entry.bsscfgidx, b"vndr_ie", &update)?;
+        let result = runtime
+            .command_vif(
+                self.entry.ifidx,
+                Direction::Set,
+                SET_VAR,
+                &input,
+                input.len(),
+            )
+            .await;
+        match result {
+            Ok(_) => *self.saved_ies(flag)? = requested,
+            // A firmware refusal rejects the whole batch: the old set is
+            // still installed. Any other failure leaves it unknown.
+            Err(Error::Firmware(_)) => *self.saved_ies(flag)? = installed,
+            Err(_) => {}
+        }
+        result.map(|_| ())
+    }
+
+    fn saved_ies(&mut self, flag: u32) -> Result<&mut Vec<u8>, Error> {
+        match flag {
+            wire::VNDR_IE_PRBREQ_FLAG => Ok(&mut self.probe_req_ies),
+            wire::VNDR_IE_PRBRSP_FLAG => Ok(&mut self.probe_resp_ies),
+            _ => Err(Error::Unsupported),
+        }
+    }
+
+    /// `brcmf_p2p_scan_prep` for a P2P scan request (the caller checked
+    /// `brcmf_p2p_scan_is_p2p_request`): the social listen channel from
+    /// the request's P2P IE (`-EPERM` otherwise), GO-negotiation phase
+    /// cleared, discovery enabled, then the caller's probe-request vendor
+    /// IEs on this vif (`brcmf_cfg80211_scan` `brcmf_vif_set_mgmt_ie`).
+    pub async fn scan_prep<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        ies: &[u8],
+    ) -> Result<(), Error> {
+        let listen = wire::listen_channel(ies).ok_or(Error::Authority)?;
+        self.my_listen_chan = Some(listen);
+        self.go_neg_phase = false;
+        self.enable_discovery(runtime).await?;
+        self.set_mgmt_ie(runtime, wire::VNDR_IE_PRBREQ_FLAG, ies)
+            .await
+    }
+
+    /// `brcmf_p2p_escan` on the discovery bsscfg: discovery state
+    /// `state` (SEARCH or SCAN), then bsscfg `p2p_scan` 'E'. The escan
+    /// results carry `wire::ESCAN_SYNC_ID`.
+    pub async fn run_escan<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        state: DiscState,
+        chanspecs: &[u16],
+    ) -> Result<(), Error> {
+        let body = wire::p2p_scan(state, chanspecs).map_err(|_| Error::Malformed)?;
+        // Linux ignores this result (`brcmf_p2p_set_discover_state`).
+        match self.set_discover_state(runtime, state, 0, 0).await {
+            Ok(()) | Err(Error::Firmware(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.bsscfg_set(runtime, b"p2p_scan", &body).await
+    }
+
+    /// [`Self::service`] during a P2P escan: `BRCMF_E_ESCAN_RESULT`
+    /// records of this bsscfg go to `escan` (the escan handler), every
+    /// other event to the `p2p.c` handlers as usual.
+    pub async fn service_escan<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        owner: &mut Owner,
+        escan: &mut Vec<Event>,
+    ) -> Result<(), Error> {
+        owner.service(runtime)?;
+        while let Some(event) = owner.pop_event(&self.entry) {
+            if event.header.event_type == wire::E_ESCAN_RESULT {
+                escan.push(event);
+            } else {
+                self.handle(runtime, event).await?;
+            }
+        }
         Ok(())
     }
 

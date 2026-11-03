@@ -1639,6 +1639,24 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         if self.ap_mode() != 2 {
             return Err(WirelessError::NotSupported);
         }
+        // `brcmf_p2p_scan_prep`: a `DIRECT-` wildcard request is a P2P
+        // escan on the discovery bsscfg, which must exist (`-EPERM`).
+        if self.p2p_device_enabled() && Station::<R>::is_p2p_scan(&request) {
+            let go = state
+                .vif
+                .as_ref()
+                .is_some_and(|owner| owner.has_role(crate::brcmfmac::vif_owner::Role::P2pGo));
+            let State {
+                station, vif, p2p, ..
+            } = &mut *state;
+            let (Some(owner), Some(device)) = (vif.as_mut(), p2p.as_mut()) else {
+                return Err(WirelessError::Denied);
+            };
+            return station
+                .p2p_scan(owner, device, go, request)
+                .await
+                .map_err(wireless_error);
+        }
         state.station.scan(request).await.map_err(wireless_error)
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {

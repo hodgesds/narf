@@ -1010,6 +1010,8 @@ pub(crate) mod vif;
 /// SET_SSID, AUTH, DEAUTH(_IND), DISASSOC(_IND), LINK, PSK_SUP,
 /// CHANNEL_ADOPTED (`63`) and ESCAN_RESULT.
 const EVENTS: [usize; 11] = [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69];
+#[path = "station_p2p_scan.rs"]
+mod p2p_scan;
 #[path = "station_probe_ies.rs"]
 mod probe_ies;
 #[path = "station_sae.rs"]
