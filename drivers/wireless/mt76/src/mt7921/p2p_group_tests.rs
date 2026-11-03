@@ -222,3 +222,195 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_p2p_go_role_reuses_ap_owner_with_go_bss
 );
+
+/// Per-vif native identity for a concurrent group interface. Linux
+/// `mt7921_add_interface` gives vif idx its own OMAC/HW BSS/WMM set and BMC
+/// WCID 19 - idx; `mt76_connac_mcu_alloc_sta_req` stamps `bss_idx` and
+/// `muar_idx`; `mt76_connac_mcu_uni_add_bss` the BSS indices and BMC WCID;
+/// `mt76_connac2_mac_write_txwi` the TXD OWN_MAC and WMM queue. The HOME
+/// identity reproduces the historical BSS0/WCID1/WCID19 bytes exactly.
+fn vif_link() -> Result<(), &'static str> {
+    use crate::mt7921::{
+        ap_wire, association as assoc, packet_tx,
+        vif_slots::{Link, Vif},
+    };
+    let peer = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let own = [0x02, 0x66, 0x77, 0x88, 0x99, 0xaa];
+    let vif = Vif::new(1).map_err(|_| "vif 1")?;
+    let link = Link::new(vif, 2).map_err(|_| "link 1/2")?;
+    if Link::new(vif, 0).is_ok() || Link::new(vif, 15).is_ok() || Link::new(vif, 14).is_err() {
+        return Err("peer WCID admission differs from mt76_wcid_alloc(MT792x_WTBL_STA)");
+    }
+    // HOME stays byte-identical to the historical single-vif builders.
+    let home_group = assoc::group_record(peer, 1).map_err(|_| "home group")?;
+    if home_group[..8] != [0, 19, 1, 0, 1, 0xe, 0, 0]
+        || assoc::disconnect_record(peer)[..8] != [0, 1, 2, 0, 1, 0, 0, 0]
+        || assoc::group_disconnect_record()[..8] != [0, 19, 1, 0, 1, 0xe, 0, 0]
+        || ap_wire::group()[..8] != [0, 19, 1, 0, 1, 0xe, 0, 0]
+    {
+        return Err("HOME records left BSS0/WCID1/WCID19");
+    }
+    // A second vif changes exactly its header/index fields.
+    let group = assoc::group_record_on(link, peer, 1).map_err(|_| "vif group")?;
+    let mut expect = home_group.clone();
+    expect[0] = 1;
+    expect[1] = 18;
+    expect[12] = 18; // WTBL request WCID
+    if group != expect {
+        return Err("vif BMC record differs beyond bss_idx/BMC WCID");
+    }
+    let gone = assoc::disconnect_record_on(link, peer);
+    let mut expect = assoc::disconnect_record(peer);
+    expect[0] = 1;
+    expect[1] = 2;
+    expect[5] = 1;
+    let wtbl = expect.len() - 12;
+    expect[wtbl + 4] = 2;
+    if gone != expect {
+        return Err("vif disconnect differs beyond bss/peer/MUAR");
+    }
+    let mut expect = assoc::group_disconnect_record();
+    expect[0] = 1;
+    expect[1] = 18;
+    expect[12] = 18;
+    if assoc::group_disconnect_record_on(link) != expect {
+        return Err("vif BMC disconnect differs beyond bss/BMC");
+    }
+    // Per-vif WTBL keys: only this vif's peer (key 0) and BMC (GTKs).
+    let key = [0x5a; 16];
+    if assoc::key_record_on(link, 1, 0, Some(&key)).is_ok()
+        || assoc::key_record_on(link, 19, 1, Some(&key)).is_ok()
+        || assoc::key_record_on(link, 2, 1, Some(&key)).is_ok()
+    {
+        return Err("vif key reached another vif's WTBL");
+    }
+    let pairwise = assoc::key_record_on(link, 2, 0, Some(&key)).map_err(|_| "vif PTK")?;
+    let group_key = assoc::key_record_on(link, 18, 2, Some(&key)).map_err(|_| "vif GTK")?;
+    let mut home_ptk = assoc::key_record(1, 0, Some(&key)).map_err(|_| "home PTK")?;
+    let mut home_gtk = assoc::key_record(19, 2, Some(&key)).map_err(|_| "home GTK")?;
+    home_ptk[..2].copy_from_slice(&[1, 2]);
+    home_ptk[5] = 1;
+    home_gtk[..2].copy_from_slice(&[1, 18]);
+    if pairwise != home_ptk || group_key != home_gtk {
+        return Err("vif key records differ beyond bss/WCID/MUAR");
+    }
+    let igtk = assoc::igtk_record_on(link, 1, &key, &key).map_err(|_| "vif IGTK")?;
+    let mut home_igtk = assoc::igtk_record(1, &key, &key).map_err(|_| "home IGTK")?;
+    home_igtk[..2].copy_from_slice(&[1, 18]);
+    if igtk != home_igtk {
+        return Err("vif IGTK differs beyond bss/BMC");
+    }
+    // UNI BSS for station and AP vifs.
+    let bss = crate::mt7921::firmware_transport::ScanBss {
+        bssid: peer,
+        ssid: b"DIRECT-xy".to_vec(),
+        channel: 6,
+        band: None,
+        signal_dbm: Some(-50),
+        capability: 1,
+        beacon_interval: 100,
+        information_elements: Vec::new(),
+    };
+    let mut home = assoc::bss_record(&bss, true).map_err(|_| "home BSS")?;
+    let record = assoc::bss_record_on(link, &bss, true).map_err(|_| "vif BSS")?;
+    if home[0] != 0 || home[9..11] != [0, 0] || home[17] != 0 || home[24..26] != [19, 0] {
+        return Err("HOME station BSS left BSS0/OMAC0/WMM0/BMC19");
+    }
+    home[0] = 1;
+    home[9] = 1;
+    home[10] = 1;
+    home[17] = 1;
+    home[24] = 18;
+    home[30] = 18;
+    if record != home {
+        return Err("vif station BSS differs beyond its indices/BMC");
+    }
+    let mut home = ap_wire::bss(own, 100, 2, false, true, true).map_err(|_| "home AP BSS")?;
+    let record = ap_wire::bss_on(vif, own, 100, 2, false, true, true).map_err(|_| "vif AP")?;
+    let (_, slot) = vif.device_payloads(own, true, true).map_err(|_| "slot")?;
+    home[0] = 1;
+    home[9] = 1;
+    home[10] = 1;
+    home[17] = 1;
+    home[24] = 18;
+    home[30] = 18;
+    if record != home || record[..12] != slot[..12] || record[17] != slot[17] {
+        return Err("vif AP BSS differs from Linux uni_add_bss indices");
+    }
+    let mut home = ap_wire::group();
+    home[..2].copy_from_slice(&[1, 18]);
+    home[12] = 18;
+    if ap_wire::group_on(vif) != home {
+        return Err("vif AP BMC differs beyond bss/BMC");
+    }
+    let station = ap_wire::PeerRecord {
+        mac: peer,
+        wcid: 3,
+        aid: 1,
+        newly: true,
+        qos: true,
+        five_ghz: false,
+        rates: 0x0fff,
+        basic_rates: 0x000f,
+    };
+    let mut home = ap_wire::peer(ap_wire::PeerRecord { ..station }).map_err(|_| "home peer")?;
+    let record = ap_wire::peer_on(vif, station).map_err(|_| "vif peer")?;
+    if home[0] != 0 || home[5] != 0 {
+        return Err("HOME AP peer left BSS0/MUAR0");
+    }
+    home[0] = 1;
+    home[5] = 1;
+    // header 8 + BASIC 20 + PHY 12 + RA 16 + STATE 12 + WTBL 12.
+    let generic = 80;
+    if home[generic..generic + 4] != [0, 0, 20, 0] {
+        return Err("AP peer WTBL generic offset");
+    }
+    home[generic + 10] = 1;
+    if record != home {
+        return Err("vif AP peer differs beyond bss/MUAR");
+    }
+    // TXD: HOME no-op; vif 1 OWN_MAC 1 and WMM set 1 on AC queues only.
+    let frame = [0u8; 60];
+    let mut ethernet = frame;
+    ethernet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    let base =
+        packet_tx::ethernet_tid(&ethernet, 0x1000, 7, 2, false, 0).map_err(|_| "data TXD")?;
+    let mut home = base;
+    packet_tx::on_vif(&mut home, Vif::HOME).map_err(|_| "home TXD")?;
+    let mut data = base;
+    packet_tx::on_vif(&mut data, vif).map_err(|_| "vif TXD")?;
+    let w0 = |b: &[u8; 64]| u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let w1 = |b: &[u8; 64]| u32::from_le_bytes(b[4..8].try_into().unwrap());
+    if home != base
+        || w0(&data) >> 25 != 4 + (w0(&base) >> 25)
+        || w1(&data) != w1(&base) | 1 << 24
+        || data[8..] != base[8..]
+        || packet_tx::on_vif(&mut data, vif).is_ok()
+    {
+        return Err("data TXD OWN_MAC/WMM queue differ from mt76_connac2_mac_write_txwi");
+    }
+    let mut management = frame;
+    management[0] = 0xd0; // action
+    management[4..10].copy_from_slice(&peer);
+    let base = packet_tx::management(
+        &management,
+        0x1000,
+        8,
+        2,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .map_err(|_| "management TXD")?;
+    let mut altx = base;
+    packet_tx::on_vif(&mut altx, vif).map_err(|_| "vif ALTX")?;
+    if w0(&altx) != w0(&base) || w1(&altx) != w1(&base) | 1 << 24 {
+        return Err("ALTX0 queue was retargeted to a WMM set");
+    }
+    Ok(())
+}
+fn mt76_p2p_vif_link_records_match_connac2() -> TestResult {
+    vif_link().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_vif_link_records_match_connac2
+);

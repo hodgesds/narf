@@ -255,6 +255,30 @@ fn ethernet_txd(
     Ok(bytes)
 }
 
+/// Retarget one HOME (OMAC0/WMM0) TXD to `vif`, as Linux
+/// mt76_connac2_mac_write_txwi derives both from `mvif`: TXD1 `OWN_MAC`
+/// (bits 24..=29) = `omac_idx`, and an LMAC AC queue (TXD0 `Q_IDX` below
+/// `MT_LMAC_ALTX0`) becomes `wmm_idx * MT76_CONNAC_MAX_WMM_SETS + ac`.
+/// ALTX/beacon queues are per-band and unchanged. `Vif::HOME` is a no-op,
+/// so the physical interface's descriptors stay byte-identical.
+pub(super) fn on_vif(header: &mut [u8; HEADER], vif: super::vif_slots::Vif) -> Result<(), Error> {
+    let mut word0 = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let mut word1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if word1 & (0x3f << 24) != 0 {
+        return Err(Error::Bounds); // already retargeted / not a HOME TXD
+    }
+    let queue = word0 >> 25;
+    if queue < 4 {
+        word0 = (word0 & !(0x7f << 25)) | ((u32::from(vif.wmm()) * 4 + queue) << 25);
+    } else if queue < 0x10 {
+        return Err(Error::Bounds);
+    }
+    word1 |= u32::from(vif.omac()) << 24;
+    header[0..4].copy_from_slice(&word0.to_le_bytes());
+    header[4..8].copy_from_slice(&word1.to_le_bytes());
+    Ok(())
+}
+
 /// mt76_connac2_mac_write_txwi: `MT_TXD7_HW_AMSDU` (bit 10) when the peer's
 /// `wcid->amsdu` is set; firmware aggregates up to STA_REC_HW_AMSDU's count.
 pub(super) fn set_hw_amsdu(header: &mut [u8; HEADER]) {

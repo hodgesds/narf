@@ -8,6 +8,8 @@ pub(crate) struct Vif {
     index: u8,
 }
 impl Vif {
+    /// The retained physical interface's logical BSS0/OMAC0/WMM0.
+    pub(crate) const HOME: Self = Self { index: 0 };
     pub(crate) fn new(index: u8) -> Result<Self, Error> {
         if index >= 4 {
             return Err(Error::Bounds);
@@ -19,6 +21,14 @@ impl Vif {
     }
     pub(crate) fn bmc(self) -> u8 {
         19 - self.index
+    }
+    /// Linux mt7921_add_interface: `omac_idx = idx` (band 0, HW BSS).
+    pub(crate) fn omac(self) -> u8 {
+        self.index
+    }
+    /// Linux mt7921_add_interface: `wmm_idx = idx % MT76_CONNAC_MAX_WMM_SETS`.
+    pub(crate) fn wmm(self) -> u8 {
+        self.index % 4
     }
     pub(crate) fn device_payloads(
         self,
@@ -50,6 +60,55 @@ impl Vif {
         Ok((device, bss))
     }
 }
+
+/// One vif's native station-record identity: its BSS/OMAC/WMM indices, the
+/// peer WCID it owns (the AP of a STATION/P2P_CLIENT vif) and its BMC WCID
+/// (19 - idx). Linux `mt76_connac_mcu_alloc_sta_req` stamps `bss_idx`,
+/// `muar_idx = omac_idx` for a peer and 0xe for the vif's own BMC WCID;
+/// `mt76_wcid_alloc` hands out the peer index from the shared WTBL map.
+/// `HOME` is BSS0 with peer WCID 1 and BMC WCID 19, the retained physical
+/// interface's identity, so every `HOME` record is byte-identical to the
+/// historical single-vif builders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Link {
+    vif: Vif,
+    peer: u8,
+}
+impl Link {
+    pub(crate) const HOME: Self = Self {
+        vif: Vif::HOME,
+        peer: 1,
+    };
+    /// A peer WCID from Linux `mt76_wcid_alloc(.., MT792x_WTBL_STA)`:
+    /// below `MT792x_WTBL_STA` = 19 - 4 = 15 (the per-vif BMC WCIDs 16..=19
+    /// are reserved); WCID 0 is the global WCID.
+    pub(crate) fn new(vif: Vif, peer: u8) -> Result<Self, Error> {
+        if !(1..=LAST_PEER_WCID).contains(&peer) {
+            return Err(Error::Bounds);
+        }
+        Ok(Self { vif, peer })
+    }
+    pub(crate) fn vif(self) -> Vif {
+        self.vif
+    }
+    pub(crate) fn bss(self) -> u8 {
+        self.vif.index
+    }
+    pub(crate) fn omac(self) -> u8 {
+        self.vif.omac()
+    }
+    pub(crate) fn wmm(self) -> u8 {
+        self.vif.wmm()
+    }
+    pub(crate) fn peer(self) -> u8 {
+        self.peer
+    }
+    pub(crate) fn bmc(self) -> u8 {
+        self.vif.bmc()
+    }
+}
+/// Highest peer WCID (`MT792x_WTBL_STA` - 1, mt792x.h).
+pub(crate) const LAST_PEER_WCID: u8 = 14;
 
 /// Metadata allocation identity; no start, packet, RF or current grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
