@@ -1763,6 +1763,34 @@ realigned) and no `pwr_table_offset` removal from the rate registers.
 effective RX or TX mask is 0x5). Smoke (written, not executed):
 `smoke_ath9k_ar5008_txpower_three_chain_closed_loop`.
 
+AR5008 calibration (`calibration::ar5008`): `ar9002_hw_init_cal` below
+AR9280_20 is the plain AGC offset calibration (`AR_PHY_AGC_CONTROL |= CAL`,
+no `FLTR_CAL`, no `OFF_PWDADC`), after `power::program_chip` for the chip and
+`pcie_pm::configure_ar5008` (`ath9k_start` → `ath9k_hw_configpcipowersave`,
+which is gated only by `aspm_enabled`, i.e. the PCIe AR5418 `0x0024` with
+upstream ASPM: the nine pre-AR9280 `AR_PCIE_SERDES` words, `SERDES2 = 0`,
+`AR_WA_DEFAULT` 0x73f and `AR_PCIE_PM_CTRL_ENA`; D3 clears `PM_CTRL_ENA`
+and writes the live `AR_WA` back with no chip-specific bits). The noise
+floor is `ar5008_hw_do_getnf` over the three control chains
+(`AR_PHY_MINCCA_PWR` bits 19..27 of `0x9864`/`0xa864`/`0xb864`) with
+`ar5008_hw_set_nf_limits` (2 GHz -100/-90/-80, 5 GHz -110/-100/-90 as
+min/nominal/max); load and history follow the RX mask bits. AR5416 has
+`supp_cals = 0` (no list, no IQ; `ath9k_hw_reset_calvalid` returns early).
+AR9160 runs `iq_cal_multi_sample`: `MAX_CAL_SAMPLES` (64, `calib.h`)
+samples at `PER_MIN_LOG_COUNT` (2), each `ar9002_hw_iqcal_collect` adding
+all three chains' `CAL_MEAS_0..2` into wrapping u32 totals, then
+`ar9002_hw_iqcalibrate` over `numChains = popcount(rxchainmask)` (so a 0x5
+mask corrects chains 0 and 1, as Linux does) and chain-0 `IQCORR_ENABLE`.
+The initial run collects all 64 samples inside one `AR9002_CAL_MAX_TIME`;
+`calibration::ar5008::Periodic` (three-chain NF history, AR9160 IQ entry
+with per-tick collection and the 30 s timeout) is the `ar9002_hw_calibrate`
+state machine. ADC gain/DC are HT40-only and never run. The AR9287/AR9280
+single-sample paths are unchanged. Smokes (written, not executed):
+`smoke_ath9k_ar5416_calibration_plain_agc_three_chain_nf_no_iq`,
+`smoke_ath9k_ar9160_calibration_multi_sample_iq_numchains`,
+`smoke_ath9k_ar9160_periodic_iq_collects_sixty_four_samples`,
+`smoke_ath9k_ar5008_calibration_refuses_and_aspm_serdes`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

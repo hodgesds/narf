@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9285/AR9287/AR9280 PCIe power-save workarounds. Linux ath9k pci.c::ath_pci_aspm_init,
+//! AR9285/AR9287/AR9280 and AR5418 PCIe power-save workarounds. Linux ath9k pci.c::ath_pci_aspm_init,
 //! ar9002_hw.c::ar9002_hw_configpcipowersave and ar9002_initvals.h.
 use super::identity::{BringUpError, RegisterIo};
 
@@ -79,6 +79,35 @@ pub(super) fn configure_ar9280(
     )
 }
 
+/// The pre-AR9280 SerDes words `ar9002_hw_configpcipowersave` writes
+/// (`pcie_clock_req` ignored for pre-AR9280 11n).
+const SERDES_AR5008: [u32; 9] = [
+    0x9248_fc00,
+    0x2492_4924,
+    0x2800_0039,
+    0x5316_0824,
+    0xe598_0579,
+    0x001d_efff,
+    0x1aaa_be40,
+    0xbe10_5554,
+    0x000e_3007,
+];
+/// `AR_WA_DEFAULT`.
+const WA_DEFAULT: u32 = 0x0000_073f;
+
+/// `ar9002_hw_configpcipowersave` below AR9280_20 (only the PCIe AR5418
+/// `0x0024` can have `aspm_enabled`): D0 writes the legacy SerDes words,
+/// `AR_WA_DEFAULT` (no AR9285/AR9287 bits 6/7) and sets
+/// `AR_PCIE_PM_CTRL_ENA`; D3 clears `AR_PCIE_PM_CTRL_ENA` and writes the live
+/// workaround word back unchanged (no chip-specific D3 bits).
+pub(super) fn configure_ar5008(
+    io: &mut impl RegisterIo,
+    enabled: bool,
+    power_off: bool,
+) -> Result<(), BringUpError> {
+    apply_with(io, enabled, power_off, &SERDES_AR5008, WA_DEFAULT, 0, 0)
+}
+
 /// `d0` is the D0 workaround word; `d3_set` the bits Linux ORs into the
 /// live word before D3.
 fn apply(
@@ -88,6 +117,20 @@ fn apply(
     d0: u32,
     d3_set: u32,
 ) -> Result<(), BringUpError> {
+    apply_with(io, enabled, power_off, &SERDES, d0, D0_WORKAROUND, d3_set)
+}
+
+/// `apply` with the chip's SerDes table and the bits Linux clears from the
+/// live word before D3 (`d3_clear`).
+fn apply_with(
+    io: &mut impl RegisterIo,
+    enabled: bool,
+    power_off: bool,
+    serdes: &[u32],
+    d0: u32,
+    d3_clear: u32,
+    d3_set: u32,
+) -> Result<(), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -95,7 +138,7 @@ fn apply(
         return Ok(());
     }
     if !power_off {
-        for value in SERDES {
+        for &value in serdes {
             io.write32(0x4040, value);
         }
         io.write32(0x4044, 0);
@@ -114,7 +157,7 @@ fn apply(
         // AR9285_WA_DEFAULT and AR9280_WA_DEFAULT lack D3_L1_DISABLE, so
         // preserve its prior value. Clear bits6/7 before D3 to avoid the
         // documented hang.
-        io.write32(WA, (wa & !D0_WORKAROUND) | d3_set);
+        io.write32(WA, (wa & !d3_clear) | d3_set);
     } else {
         io.write32(WA, d0);
         io.write32(PM, pm | L1_ENABLE);

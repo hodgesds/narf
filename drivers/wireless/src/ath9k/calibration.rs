@@ -541,3 +541,7 @@ pub(in crate::ath9k) mod ar9287;
 /// AR9280 dual-band closed-loop AGC (with `OFF_PWDADC`), per-band NF and
 /// two-chain IQ calibration.
 pub(in crate::ath9k) mod ar9280;
+
+/// AR5416/AR5418 (plain AGC, no per-calibration) and AR9160 (plain AGC +
+/// multi-sample IQ) three-chain calibration on the AR5008 PHY ops.
+pub(in crate::ath9k) mod ar5008;
