@@ -546,6 +546,15 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
         Phase::Running => io.prepare_mac().await?,
         Phase::MacPrepared => io.prepare_receive().await?,
         Phase::Receiving => io.prepare_radio_tables().await?,
+        // RTL8852C: one owner for DM/RFK/channel at Linux's default unlinked
+        // chandef (2.4GHz channel 1, 20MHz; core.c `rtw89_get_default_chandef`).
+        Phase::RadioTablesLoaded
+            if io
+                .identity()
+                .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C) =>
+        {
+            io.prepare_radio_c(1).await?
+        }
         Phase::RadioTablesLoaded => io.prepare_basic_calibration().await?,
         Phase::BasicCalibrated => io.prepare_full_radio().await?,
         Phase::RadioReady => return Ok(true),

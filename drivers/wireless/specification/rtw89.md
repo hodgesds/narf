@@ -3179,9 +3179,21 @@ a wide C PPDU is not mistaken for 20MHz; B keeps [31:30]. Unexecuted cases:
 `smoke_rtw8852c_rx_rings_follow_haxi_v1_geometry`,
 `smoke_rtw8852c_rx_refuses_open_rx_before_publication`.
 
+**C Startup wiring.** `Startup::start` builds `radio_assets::Assets` for B
+and C (`from_prepared` admits both element layouts), so `prepare_mac`,
+`prepare_receive` and `prepare_radio_tables` (C `Qualified::from_factory_c`,
+C firmware PHY-cap) run through the same Startup phases for C.
+`Startup::prepare_radio_c(primary)` follows `RadioTablesLoaded` and drives
+`Native::prepare_radio_c` on a retained `radio_c::Radio` to `RadioReady`
+(no ordinary grant); it has no pure preflight, so any failure, including
+the fail-closed admission refusal, terminalizes the owner. The bootstrap
+`advance` step dispatches C at `RadioTablesLoaded` to `prepare_radio_c(1)`
+(core.c `rtw89_get_default_chandef`: 2.4GHz channel 1, 20MHz) instead of
+B's basic/full calibration. No new test case (the gate needs an actual claim).
+
 Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
-C `power::Calibration`/qualification records (N52x are B-bound), a
-Startup caller of `Native::prepare_radio_c` (which exists, unadmitted),
+C `power::Calibration`/qualification records (N52x are B-bound), so the
+Startup C radio step currently stops at admission,
 C WoW/DMA-stop RX rewind (B registers only), `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.

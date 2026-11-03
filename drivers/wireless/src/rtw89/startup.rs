@@ -62,6 +62,9 @@ pub struct Startup {
     coex: super::coex_native::Coex,
     rfk: super::rfk::Rfk,
     full_radio: super::radio_full::Radio,
+    /// RTL8852C radio owner (`radio_c`), the C counterpart of `rfk` +
+    /// `full_radio`; unused on B.
+    radio_c: super::radio_c::Radio,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
     /// AP-role control owner (`startup_ap.rs`); exclusive with the station.
@@ -142,6 +145,7 @@ impl Startup {
             coex: super::coex_native::Coex::default(),
             rfk: super::rfk::Rfk::default(),
             full_radio: super::radio_full::Radio::default(),
+            radio_c: super::radio_c::Radio::default(),
             station_controller: None,
             station_binding: None,
             ap_controller: None,
@@ -213,6 +217,48 @@ impl Startup {
             }
             .map_err(Error::Calibration)?;
             attempt.owner.phase = Phase::BasicCalibrated;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    /// RTL8852C radio bring-up for one 20MHz `primary` after the C tables:
+    /// `Native::prepare_radio_c` (phy.c `rtw89_phy_dm_init` controls and DM
+    /// sub-inits, `rtw8852c_rfk_init`, power trim, cfg_txrx_path,
+    /// `__rtw89_set_channel`, `rtw8852c_rfk_channel`, RF_GET_MCCCH V0). Its
+    /// signed calibration/coexistence admission is checked before the first
+    /// write. There is no separate pure C preflight (unlike B's
+    /// `preflight_basic_rfk`), so any failure, including that refusal,
+    /// terminalizes this owner. Success is `RadioReady` with no ordinary
+    /// grant (station admission stays B-only).
+    pub async fn prepare_radio_c(&mut self, primary: u8) -> Result<(), Error> {
+        if self.phase != Phase::RadioTablesLoaded
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852C)
+        {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::FullRadioPreparing;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = attempt.owner_mut();
+            let firmware = owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            let assets = owner.assets.as_ref().ok_or(Error::Terminal)?;
+            // SAFETY: same retained actual cold/firmware/MAC/RX/table owner;
+            // the outer guard terminalizes Native and retains DMA on failure.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_radio_c(&mut owner.radio_c, &owner.radio, assets, primary)
+                    .await
+            }
+            .map_err(Error::Register)?;
+            owner.phase = Phase::RadioReady;
             Ok(())
         }
         .await;
@@ -478,7 +524,11 @@ impl Startup {
         // blacklist policy; no all-clear default is created for those chips.
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
-        let assets = if identity.chip() == super::mac::ChipId::Rtl8852B {
+        // radio_assets admits the RTL8852B and RTL8852C element layouts.
+        let assets = if matches!(
+            identity.chip(),
+            super::mac::ChipId::Rtl8852B | super::mac::ChipId::Rtl8852C
+        ) {
             Some(super::radio_assets::Assets::from_prepared(&image).map_err(Error::Assets)?)
         } else {
             None
