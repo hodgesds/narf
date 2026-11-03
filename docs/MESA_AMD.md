@@ -529,9 +529,32 @@ table, and mmap routing uses a separate opaque offset tag. A missing native
 heap fails rather than creating a conflicting generic dumb handle. Legacy
 primary cards using the old card-global dumb table remain outside this
 compact-primary contract. New ioctl regressions reproduce the original
-sparse-handle and split-table failures. This fixes the oversized allocation
-at its source; physical KWin startup and desktop presentation after the
-correction still require acceptance.
+sparse-handle and split-table failures.
+
+Boot `331b602f-b079-479e-b012-fe4a7c8db876` on `785513a38` validates the
+allocation correction: sampled KWin RSS peaks at 107324 KiB, and the earlier
+8 GiB anonymous allocation is absent. It still fails to show the greeter.
+KWin launches at 73.33 seconds; four atomic TEST_ONLY probes pass at 93.33–96.44.
+The native display is unlit and relit at 96.45–96.55. GFX times out at 98.37
+with signaled sequence 1 and emitted sequence 3; the raw VM-programming
+writeback is 2. This establishes progress through VM programming, without
+establishing that either client job or the first frame completed. The reported
+black screen therefore does not establish a successful framebuffer takeover.
+
+KWin disappears by the 102.25-second process sample; the greeter aborts at
+103.29. The persistent journal ends at 77.46, so the order and cause of KWin's
+exit relative to the GPU stall are not captured. In particular, the installed
+user manager's 15-second start timeout and 10-second stop timeout overlap
+this interval; a timeout kill must not be presented as proven for this boot.
+Likewise, sparse `/proc/PID/syscall` read snapshots do not establish that KWin
+blocked in a single DRM read throughout the sample gap.
+
+The next graphics-timeout capture records CP/GRBM status, current IB bases,
+sizes and offsets, GC10.3 VM faults and a ring window around the hardware
+read pointer. It runs only after a detected hang, holds the normal owner and
+power lease while reading, and reports after releasing them. This adds
+localization evidence; it does not correct or physically validate the stalled
+client submission. Desktop presentation remains unverified.
 
 ### Linux Navi22 initialization comparison
 

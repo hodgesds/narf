@@ -8910,6 +8910,15 @@ after an HDP invalidate; an all-ones read-back is device loss). The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
 advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
 emitted seq=…` once and is retained in `tdr::status()`. Detection is always on.
+After a GFX timeout, the retained owner also samples CP/GRBM, current IB and
+GC10.3 VM fault registers, fence writebacks and a bounded ring window around
+the hardware read pointer. The snapshot uses live PCI authority and a GFXOFF
+reference; only HDP read-cache invalidation is written. It does not change
+selectors, CP/VM control, queue pointers or submissions. Serial reporting runs
+after releasing the owner and power reference, before attempted recovery.
+There are no extra samples or records on the submission or trap paths. These
+reads are sequential observations, not an atomic snapshot or proof of client
+IB execution; capture refusal is logged for a lost/revoked device.
 `unsafe tdr::set_automatic_recovery(bool)` (Linux `amdgpu_gpu_recovery`) makes
 a detected hang call `recover()`; the fb boot handoff enables it on RX 6000
 unless `amdgpu.gpu_recovery=0`, after installing the console hook below. At

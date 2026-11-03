@@ -440,6 +440,17 @@ pub(crate) async fn queue_progress(
     owner.as_mut().ok_or(boot::Error::Invalid)?.queue_progress()
 }
 
+/// Sample only after a graphics timeout, under the same ownership and power
+/// rules as queue progress. The caller prints after both guards drop.
+pub(crate) async fn gfx_hang_snapshot(
+) -> Result<crate::amdgpu_cp_navi22::GfxHangSnapshot, boot::Error> {
+    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::Invalid)?;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .gfx_hang_snapshot()
+}
+
 /// Recovery effects on the retained owner (see amdgpu_navi22_recovery).
 struct Recovering<'a> {
     owner: &'a mut Option<boot::ColdBoot>,

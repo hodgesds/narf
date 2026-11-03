@@ -223,6 +223,17 @@ pub(crate) async fn monitor(epoch: u64) {
                 hang.emitted,
                 hang.stalled_ms
             );
+            if hang.engine == Engine::Gfx {
+                match crate::amdgpu_navi22_platform::gfx_hang_snapshot().await {
+                    Ok(snapshot) => snapshot.report(),
+                    Err(error) => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 Gfx hang snapshot {error:?}"
+                        );
+                    }
+                }
+            }
             if AUTOMATIC.load(Ordering::Acquire) {
                 if claim_automatic_recovery() {
                     // SAFETY: the caller of set_automatic_recovery accepted

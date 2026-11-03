@@ -1800,6 +1800,22 @@ impl ColdBoot {
         samples.extend(queues.sdma.progress().map_err(Error::Queues)?);
         Ok(samples)
     }
+    /// Timeout-only graphics evidence from the retained verified queue.
+    pub(crate) fn gfx_hang_snapshot(
+        &mut self,
+    ) -> Result<crate::amdgpu_cp_navi22::GfxHangSnapshot, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        self.sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .gfx
+            .hang_snapshot()
+            .map_err(Error::Queues)
+    }
     /// Whether `into_recovery` can rebuild this owner: a completed boot with
     /// a board power table and IH, and no GDDR6 training to replay (Linux
     /// replays it as `PSP_MEM_TRAIN_RESUME`; NARF has no short training).

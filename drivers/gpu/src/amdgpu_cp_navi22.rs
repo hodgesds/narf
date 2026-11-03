@@ -22,6 +22,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 #[path = "amdgpu_cp_navi22_regs.rs"]
 pub(crate) mod regs;
 use regs::*;
+#[path = "amdgpu_navi22_hang.rs"]
+mod hang;
+pub(crate) use hang::Snapshot as GfxHangSnapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -1265,6 +1268,13 @@ impl Gfx {
             return Err(Error::Busy);
         }
         progress(&mut self.engine.hw, &self.engine.queue)
+    }
+    /// Timeout-only evidence; caller retains the GC power reference.
+    pub(crate) fn hang_snapshot(&mut self) -> Result<GfxHangSnapshot, Error> {
+        if self.engine.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        hang::capture(&mut self.engine.hw, &self.engine.queue)
     }
 }
 
