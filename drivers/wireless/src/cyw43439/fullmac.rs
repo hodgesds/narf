@@ -233,12 +233,12 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     }
     const FAMILY: Family = Family::Sdio;
     const EXTERNAL_CLM: bool = true;
-    // Withheld until the whole native SDIO AP composition (Card/F2/SDPCM/
-    // BCDC firmware-SME path, Program ownership, stop/pin, preverification
-    // hold) is reviewed complete. Even when set, metadata still requires an
-    // actual original typed Card/firmware source, exact native `ap`
-    // capability token and GET_AP0 discovery.
-    const PRIMARY_AP: bool = false;
+    // The whole native SDIO AP composition (Card/F2/SDPCM/BCDC firmware-SME
+    // path, Program ownership, stop/pin, preverification hold) is in place.
+    // Metadata still requires an actual original typed Card/firmware source,
+    // exact native `ap` capability token and GET_AP0 discovery; START then
+    // requires its own actual command/BSS/SCB/key/port receipts.
+    const PRIMARY_AP: bool = true;
     fn command<'a>(
         &'a mut self,
         direction: Direction,
