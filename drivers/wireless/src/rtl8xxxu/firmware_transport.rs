@@ -697,8 +697,9 @@ impl<I: ControlIo> Owner<I> {
 
     /// RTL8723BU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
     /// through power-on, reserved pages/queue priority/RX boundary, firmware
-    /// download/start and the `init_reg_hmtfr` H2C init. The owner stops at
-    /// FirmwareReady: the 8723B table/radio stages are not implemented yet.
+    /// download/start, the `init_reg_hmtfr` H2C init, antenna selection and
+    /// the MAC/BB/RF tables through HIMR. The owner stops at TablesReady:
+    /// post-table MAC, calibration and the radio tail are not implemented.
     async fn run_device_8723b(
         &self,
         payload: &[u8],
@@ -714,6 +715,9 @@ impl<I: ControlIo> Owner<I> {
         *self.queues_8723b.lock() = Some(queues);
         self.stage(Stage::Powered);
         self.download(payload).await?;
+        self.stage(Stage::InitializingTables);
+        super::rtl8723b_phy::mac_bb_rf(self, &factory).await?;
+        self.stage(Stage::TablesReady);
         Ok(info)
     }
 

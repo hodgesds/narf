@@ -73,6 +73,8 @@ mod rtl8192e_radio;
 mod rtl8192e_tables;
 pub mod rtl8723b;
 pub mod rtl8723b_init;
+mod rtl8723b_phy;
+mod rtl8723b_tables;
 pub mod rtl8821c;
 pub mod rtl8822b;
 pub mod rx;

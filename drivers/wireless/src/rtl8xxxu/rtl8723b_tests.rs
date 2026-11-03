@@ -129,6 +129,9 @@ impl ControlIo for Fake {
                 g.regs[a] |= MCU_WINT_INIT_READY as u8;
             }
         }
+        if addr == 0x224 && out.len() == 4 {
+            g.regs[0x226] &= !1; // auto-LLT completes
+        }
         out.copy_from_slice(&g.regs[a..a + out.len()]);
         Ok(out.len())
     }
@@ -231,8 +234,8 @@ fn smoke_rtl8723bu_power_and_firmware() -> TestResult {
     if narf_scheduler::block_on(owner.initialize(&image(payload))).is_err() {
         return TestResult::Fail("8723bu lifecycle failed");
     }
-    if owner.status().stage != Stage::FirmwareReady || owner.status().error.is_some() {
-        return TestResult::Fail("8723bu did not stop at FirmwareReady");
+    if owner.status().stage != Stage::TablesReady || owner.status().error.is_some() {
+        return TestResult::Fail("8723bu did not stop at TablesReady");
     }
     let factory = match owner.factory_8723b() {
         Some(f) => f,
@@ -262,9 +265,11 @@ fn smoke_rtl8723bu_power_and_firmware() -> TestResult {
     }
     // 0x67 is both BT_GPS_SEL (emu_to_active) and REG_PAD_CTRL1 + 3.
     if io.writes(0x0067).last() != Some(&vec![0x20])
-        || io.writes(0x0765) != vec![vec![0x18]]
-        || io.writes(0x076e) != vec![vec![0x04]]
-        || io.writes(REG_S0S1_PATH_SWITCH) != vec![vec![0, 0, 0, 0]]
+        // The MAC table repeats the BT control / WLAN act bytes and
+        // rtl8723bu_init_phy_bb clears the S0S1 switch again.
+        || io.writes(0x0765) != vec![vec![0x18]; 2]
+        || io.writes(0x076e) != vec![vec![0x04]; 2]
+        || io.writes(REG_S0S1_PATH_SWITCH) != vec![vec![0, 0, 0, 0]; 2]
         || io.writes(0xfe08) != vec![vec![0x01]]
     {
         return TestResult::Fail("8723bu BT-coex power-on settings");
@@ -319,3 +324,78 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8723bu",
     smoke_rtl8723bu_rejects_mismatched_sie
 );
+
+fn word(v: &[u8]) -> u32 {
+    u32::from_le_bytes(v.try_into().unwrap())
+}
+
+fn smoke_rtl8723bu_tables_antenna_and_lck() -> TestResult {
+    use super::rtl8723b_tables::{AGC_TABLE, MAC_INIT_TABLE, PHY_INIT_TABLE, RADIO_A_INIT_TABLE};
+    // Generated verbatim from 8723b.c (rows + Linux sentinel).
+    if MAC_INIT_TABLE.len() != 104
+        || PHY_INIT_TABLE.len() != 194
+        || AGC_TABLE.len() != 132
+        || RADIO_A_INIT_TABLE.len() != 109
+    {
+        return TestResult::Fail("8723bu table row counts");
+    }
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
+    if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
+        || owner.status().stage != Stage::TablesReady
+    {
+        return TestResult::Fail("8723bu did not reach TablesReady");
+    }
+    let rfe = io.writes(0x0930);
+    if rfe.len() != 1 || word(&rfe[0]) & 0xff != 0x77 {
+        return TestResult::Fail("8723bu antenna selection RFE source");
+    }
+    let lssi: Vec<u32> = io.writes(0x0840).iter().map(|v| word(v)).collect();
+    let rf_rows = RADIO_A_INIT_TABLE
+        .iter()
+        .filter(|r| !(0xf9..=0xff).contains(&r.reg))
+        .count();
+    let tail = [
+        0xb0 << 20 | 0xdfbe0,
+        0x18 << 20 | 0x8c01,
+        0xb0 << 20 | 0xdffe0,
+    ];
+    // + the PHY table's own 0x840 row.
+    if lssi.len() != rf_rows + 4 || lssi[lssi.len() - 3..] != tail {
+        return TestResult::Fail("8723bu RF table + PHY LCK writes");
+    }
+    if io.writes(0x0860).last().map(|v| word(v)) != Some(0x66f6_0210)
+        || io.writes(0x0104) != vec![vec![0x22]]
+        || io.writes(0x0424) != vec![vec![0xf8]]
+        || io.writes(0x04f0) != vec![0xcdf0u16.to_le_bytes().to_vec()]
+        || io.writes(0x0120) != vec![vec![0xff; 4]]
+        || io.writes(0x0124) != vec![vec![0xff; 4]]
+    {
+        return TestResult::Fail("8723bu post-RF MAC/LLT/report/HIMR state");
+    }
+    // Crystal cap 0x24 into XTAL1/XTAL0 of REG_MAC_PHY_CTRL.
+    let xtal = io.writes(0x002c);
+    if xtal.len() != 1 || word(&xtal[0]) & 0x00ff_f000 != (0x24 << 18 | 0x24 << 12) {
+        return TestResult::Fail("8723bu crystal cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_tables_antenna_and_lck
+);
+
+fn smoke_rtl8723bu_tx_power() -> TestResult {
+    use super::rtl8723b_phy::tx_power;
+    let id = parse_identity(0, 0, 0, Queues::from_sie(0x0111)).unwrap();
+    let factory = parse_efuse(id, &logical_map()).unwrap();
+    // Path B, group 0: cck 0x21, ht40 0x29; ofdm +3, ht20 -2, ht40 +0.
+    if tx_power(&factory, 1, false) != (0x21, 0x2c2c_2c2c, 0x2727_2727)
+        || tx_power(&factory, 1, true) != (0x21, 0x2c2c_2c2c, 0x2929_2929)
+        || tx_power(&factory, 13, false).0 != 0x25
+    {
+        return TestResult::Fail("8723bu tx power indices");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu/8723bu", smoke_rtl8723bu_tx_power);

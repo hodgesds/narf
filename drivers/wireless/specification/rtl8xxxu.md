@@ -1341,16 +1341,41 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   8723B budget (HI 0x0c, LO 2, NORM 2 of 0xf7), queue priority (retained
   as `Owner::queues_8723b()`), `TRXFF_BNDY+2 = 0x3f7f`.
 
-The owner currently stops at `FirmwareReady`; MAC/BB/RF tables, antenna
-selection, calibration, packet codec, RA, BT coexistence, signed records
-and the station are not implemented, and the production probe does not
+- Tables (`rtl8xxxu/rtl8723b_tables.rs`, generated verbatim by
+  `rtl8xxxu/gen_rtl8723b_tables.py` from `8723b.c`): MAC 103, PHY 193,
+  AGC 131, RF A 108 rows (+ Linux sentinel).
+- `rtl8723b_phy::mac_bb_rf` (`rtl8xxxu_init_device` antenna selection →
+  HIMR): `rtl8723bu_phy_init_antenna_selection` (PAD_CTRL1[20,24],
+  GPIO_MUXCFG[4:3], LEDCFG0[24:23], RFE buffer, `RFE_CTRL_ANTA_SRC = 0x77`,
+  RFE pad), MAC table (no `REG_MAX_AGGR_NUM`), `rtl8723bu_init_phy_bb`
+  (BB resets + DIO_RF, S0S1 switch 0, RF_CTRL 7, `SYS_FUNC = 0xe3`,
+  `AFE_XTAL_CTRL+1 = 0x80`, PHY + AGC; 1T1R so no 1T2R patch),
+  `rtl8723a_set_crystal_cap` (skipped for cap 0), RF A via
+  `rtl8xxxu_init_phy_rf` with the plain `rtl8xxxu_write_rfreg` (no
+  RTL8192E power-save bracket), then the `rtl8723bu_init_phy_rf` PHY LCK
+  (`0xb0 = 0xdfbe0`, `MODE_AG = 0x8c01`, 200 ms, `0xb0 = 0xdffe0`); RF
+  switch control with PAPE, `XA_RF_INT_OE = 0x66f60210`, no
+  `FPGA0_TX_INFO = 3`, TX buffer boundary `0xf8`, `REG_PBP = 0x22`, auto
+  LLT (checked), gen2 USB quirk, the `has_tx_report` timer (bit 1 only,
+  max macid 2, `0xcdf0`, `0xa3 &= 0xf8`), `RX_DRVINFO_SZ = 4`,
+  `HISR`/`HIMR` all-ones.
+- TX power (`rtl8723b_set_tx_power`, `rtl8723b_phy::{tx_power,
+  set_tx_power}`): gen2 channel group; the path-B EFUSE CCK/HT40 indices
+  with diff index 0's `.b` member, written to the path-A AGC registers
+  (CCK1/CCK2-11, OFDM 6..54, MCS0..7); `u8 += s8` wraps.
+
+The owner currently stops at `TablesReady`; the post-table MAC stage,
+`rtl8723bu_init_aggregation`/`init_statistics`/`init_burst`, LCK/IQK,
+the post-calibration tail, `rtl8723b_enable_rf`, power-off, packet codec,
+RA, BT coexistence, signed records and the station are not implemented, and the production probe does not
 start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
 `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
 (`drivers/wireless/rtl8xxxu/8723bu`): identity/EFUSE/page budget,
-power + firmware lifecycle against a register model, no-SIE fallback and
-test-silicon refusal.
+power + firmware + tables lifecycle against a register model, no-SIE
+fallback and test-silicon refusal, table/antenna/PHY-LCK/post-RF state,
+and TX power indices.
 
 ## 4. Invariants
 
@@ -1397,7 +1422,7 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 |---|---|
 | RTL8188EU power + EP0 firmware lifecycle | Implemented; shared-path regressions |
 | RTL8192EU runtime initialization | Identity/EFUSE/power/firmware/H2C and MAC/BB/RF tables + TX power implemented; post-table MAC, gen2 channel/bandwidth, IQK/LCK, TX/RX, RA, signed records and station missing |
-| RTL8723BU runtime initialization | Identity/EFUSE/power/firmware/HMTFR implemented; tables, antenna, calibration, TX/RX, RA, BT coexistence, signed records and station missing |
+| RTL8723BU runtime initialization | Identity/EFUSE/power/firmware/HMTFR, antenna selection, MAC/BB/RF tables + PHY LCK and TX power implemented; post-table MAC, calibration, TX/RX, RA, BT coexistence, signed records and station missing |
 | RTL8821CU / RTL8822BU runtime initialization | Bound by rtw88 (see rtw88.md) |
 | EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented with retained RX filter/MAC activation |

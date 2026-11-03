@@ -12,10 +12,8 @@
 //! ## References (GPL-2.0-or-later)
 //!
 //! - `drivers/net/wireless/realtek/rtl8xxxu/8723b.c`
-//!   - `rtl8723b_mac_init_table[]`         L19..L49  (~95 rows, write-8).
-//!   - `rtl8723b_phy_1t_init_table[]`      L50..L150 (~200 rows, write-32).
-//!   - `rtl8xxx_agc_8723bu_table[]`        L151..L220 (~140 rows, AGC).
-//!   - `rtl8723bu_radioa_1t_init_table[]`  L222..L300 (~155 rows, RF A).
+//!   - init tables: generated into `rtl8723b_tables.rs` by
+//!     `gen_rtl8723b_tables.py` (MAC 103, PHY 193, AGC 131, RF A 108 rows).
 //!   - `rtl8723bu_init_phy_bb()`           L498..L519.
 //!   - `rtl8723bu_init_phy_rf()`           L521..L535.
 //!   - `rtl8723bu_iqk_path_a()`            L575..L893.
@@ -26,8 +24,7 @@
 
 #![allow(dead_code)]
 
-use super::phy::{IqkStep, Reg32Val};
-use super::phy_tables::{MacRow, RfRow};
+use super::phy::IqkStep;
 use super::regs::*;
 use super::usb::UsbControlSetup;
 
@@ -57,20 +54,19 @@ pub const TX_COUNT: usize = 4;
 /// Maximum RF paths.
 pub const MAX_RF_PATHS: usize = 4;
 
-// ── Row-count constants ───────────────────────────────────────────
+// ── Init tables (generated verbatim from `8723b.c`) ───────────────
 
-/// Row count of `rtl8723b_mac_init_table[]`.
-/// Source: `8723b.c` L19..L49.
-pub const N_MAC_ROWS: usize = 95;
+/// Row count of `rtl8723b_mac_init_table[]` (without the sentinel).
+pub const N_MAC_ROWS: usize = 103;
 /// Row count of `rtl8723b_phy_1t_init_table[]`.
-/// Source: `8723b.c` L50..L150.
-pub const N_PHY_ROWS: usize = 200;
+pub const N_PHY_ROWS: usize = 193;
 /// Row count of `rtl8xxx_agc_8723bu_table[]`.
-/// Source: `8723b.c` L151..L220.
-pub const N_AGC_ROWS: usize = 140;
+pub const N_AGC_ROWS: usize = 131;
 /// Row count of `rtl8723bu_radioa_1t_init_table[]`.
-/// Source: `8723b.c` L222..L300.
-pub const N_RF_A_ROWS: usize = 155;
+pub const N_RF_A_ROWS: usize = 108;
+
+/// The tables applied by `rtl8723b_phy::mac_bb_rf` (Linux sentinel kept).
+pub use super::rtl8723b_tables::{AGC_TABLE, MAC_INIT_TABLE, PHY_INIT_TABLE, RADIO_A_INIT_TABLE};
 
 /// Stage 0 / 1 register init table for RTL8723BU.
 pub const INIT_TABLE: &[(u16, u8)] = &[
@@ -84,20 +80,6 @@ pub const INIT_TABLE: &[(u16, u8)] = &[
 pub fn stage0_register_bank() -> &'static [(u16, u8)] {
     INIT_TABLE
 }
-
-// ── Per-chip table sentinels (populated at integration time) ───────
-
-/// MAC init table. Source: `8723b.c` L19..L49.
-pub const MAC_INIT_TABLE: &[MacRow] = &[MacRow::SENTINEL];
-
-/// PHY/BB init table. Source: `8723b.c` L50..L150.
-pub const PHY_INIT_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
-
-/// AGC table. Source: `8723b.c` L151..L220.
-pub const AGC_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
-
-/// RF path A init table. Source: `8723b.c` L222..L300.
-pub const RADIO_A_INIT_TABLE: &[RfRow] = &[RfRow::SENTINEL];
 
 /// Path count. 8723BU is 1T1R.
 pub const NUM_RF_PATHS: usize = 1;

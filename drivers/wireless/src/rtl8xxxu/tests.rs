@@ -677,14 +677,12 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8192eu_per_chip);
 fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
     use super::rtl8723b;
 
-    if rtl8723b::N_MAC_ROWS != 95 {
-        return TestResult::Fail("8723b N_MAC_ROWS != 95");
-    }
-    if rtl8723b::N_PHY_ROWS != 200 {
-        return TestResult::Fail("8723b N_PHY_ROWS != 200");
-    }
-    if rtl8723b::N_RF_A_ROWS != 110 {
-        return TestResult::Fail("8723b N_RF_A_ROWS != 110");
+    if rtl8723b::N_MAC_ROWS + 1 != rtl8723b::MAC_INIT_TABLE.len()
+        || rtl8723b::N_PHY_ROWS + 1 != rtl8723b::PHY_INIT_TABLE.len()
+        || rtl8723b::N_AGC_ROWS + 1 != rtl8723b::AGC_TABLE.len()
+        || rtl8723b::N_RF_A_ROWS + 1 != rtl8723b::RADIO_A_INIT_TABLE.len()
+    {
+        return TestResult::Fail("8723b table row counts");
     }
     if rtl8723b::NUM_RF_PATHS != 1 {
         return TestResult::Fail("8723b is 1T1R");
