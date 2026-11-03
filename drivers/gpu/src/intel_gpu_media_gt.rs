@@ -1477,6 +1477,11 @@ where
     }
 }
 
+/// GSC firmware, GSC-headered HuC images and the GSC HECI protocol of this
+/// media GT (formats only; no owner loads either firmware yet).
+#[path = "intel_gpu_gsc.rs"]
+pub(crate) mod gsc;
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_media_gt_tests.rs"]
 mod tests;
