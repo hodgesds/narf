@@ -505,6 +505,10 @@ pub(super) mod c_tssi;
 /// RTL8851B `rtw8851b_rfk_init` and channel RX DCK (path A).
 #[path = "rfk/n51.rs"]
 pub(super) mod n51;
+/// RTL8851B channel switch (`rtw8851b_set_channel_help`,
+/// `rtw8851b_set_channel`, `rtw8851b_set_txpwr`) and `rtw8851b_rfk_channel`.
+#[path = "rfk/n51_channel.rs"]
+pub(super) mod n51_channel;
 /// RTL8851B channel DPK (`rtw8851b_dpk`) and `rtw8851b_rfk_track`
 /// (`dpk_track` + `lck_track`, path A).
 #[path = "rfk/n51_dpk.rs"]

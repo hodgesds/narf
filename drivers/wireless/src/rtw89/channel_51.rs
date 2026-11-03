@@ -87,7 +87,7 @@ fn gain_error(profile: Profile, gain: &Gain, out: &mut alloc::vec::Vec<Field>) {
 }
 
 /// `rtw8851b_set_gain_offset(subband, PHY_0)` (PHY_0: no `_idx` offset).
-fn gain_offset(profile: Profile, inputs: &Inputs<'_>, out: &mut alloc::vec::Vec<Field>) {
+pub(super) fn gain_offset(profile: Profile, inputs: &Inputs<'_>, out: &mut alloc::vec::Vec<Field>) {
     let cal = inputs.calibration;
     let subband = usize::from(profile.subband());
     if cal.comp_valid {

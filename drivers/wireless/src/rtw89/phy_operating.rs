@@ -93,7 +93,14 @@ impl Operating {
             return Err(Error::Terminal);
         }
         self.state = State::Failed;
-        if identity.chip() != ChipId::Rtl8852B
+        // RTL8851B shares this exact sequence: `rtw8851b_dig_regs` and
+        // `rtw8851b_edcca_regs` are byte-identical to RTL8852B's, both set
+        // `cfo_hw_comp`, and `rtw89_phy_dig_sdagc_follow_pagc_config` writes
+        // the p1 PAGCUGC fields on every AX chip. Only core.c
+        // `rtw89_core_setup_phycap` differs: `support_cckpd` is false solely
+        // for RTL8852B CAV, so every RTL8851B cut takes the CCK PD reset.
+        let n51 = identity.chip() == ChipId::Rtl8851B;
+        if !(identity.chip() == ChipId::Rtl8852B || n51)
             || identity.cut() > 15
             || !identity.calibration().valid
             || identity.calibration().rfe_type == 255
@@ -106,7 +113,7 @@ impl Operating {
         // reads/forced IGI writes. Initial disabled DIG PD is still real HW.
         a.bb(R_SEG0R_PD_V1, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
         a.bb(R_SEG0R_PD_V1, B_SEG0R_PD_SPATIAL_REUSE_EN_MSK_V1, 0)?;
-        let cck_pd = identity.cut() > 0;
+        let cck_pd = n51 || identity.cut() > 0;
         if cck_pd {
             a.bb(R_BMODE_PDTH_EN_V1, B_BMODE_PDTH_LIMIT_EN_MSK_V1, 0)?;
             // Exact first no-link DIG reset: igi_rssi initially0, under-region

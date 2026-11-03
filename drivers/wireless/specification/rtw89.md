@@ -4091,13 +4091,47 @@ emits with `rf_path_num` 1: byrate nss 0 only (7 words), the offset word,
 the same flat/sharp/sharp_14 tables as B; `R_DCFO_OPT` [25:24] OFDM
 shape), the 1TX limit and RU pages, then `rtw8851b_set_txpwr_ref`
 (B_AX_PWR_REF 0, path-A 0x5804/0x5808 = TSSI 172 / PWR 312 / REF 0); no
-C bandedge/TSSI-DBW, SAR-diff or path-B writes. RTL8851B has no
-`RFK_NTFY_MCC_V0` firmware feature (fw.c feature table), so its RF notify
-is B's 20-byte `rtw89_fw_h2c_rf_ntfy_mcc` body (`command_native::radio`
-`mccch`). Unexecuted case:
+C bandedge/TSSI-DBW, SAR-diff or path-B writes. RTL8851B sends no RF
+notify at all: unlike rtw8852b.c/rtw8852c.c, `rtw8851b_rfk_channel` never
+calls `rtw89_fw_h2c_rf_ntfy_mcc` (no `mcc_get_ch_info`), so no
+RF_GET_MCCCH body is built for it. Unexecuted case:
 `smoke_rtw89_n51_set_txpwr_follows_rtw8851b_and_phy_ax`.
 
-**Remaining for the row.** the signed record family, coex (`rtw8851b_btc_*`,
+**Retained radio owner (`radio_51`, `rfk::n51_channel`).** `radio_51::Radio`
+is the RTL8851B counterpart of `radio_c::Radio` (phy.c `rtw89_phy_dm_init`
+order). `prepare_controls`: `controls_51`, the phy.c DM sub-inits through
+`phy_operating::Operating::prepare` (now admitting RTL8851B: `rtw8851b_dig_regs`
+and `_edcca_regs` match RTL8852B's byte for byte, `cfo_hw_comp` is set on both,
+and core.c `support_cckpd` is true for every RTL8851B cut), then `nctl_51`. An
+antenna-diversity RFE (mac.c `rtw89_mac_setup_phycap`: one path and
+`rfe_type % 3 == 2`, which gates `rtw8851b_rfe_gpio` and `rtw89_phy_antdiv_*`)
+is refused before any write until that owner exists. `prepare` then runs:
+`rfk::n51::Init`, `rtw8851b_set_txpwr_ctrl` (`radio_power_c::reference_51`,
+which `visit_51` now shares), `rtw8851b_power_trim` (path A),
+`rtw8851b_bb_cfg_txrx_path` (`ctrl_rx_path(RF_A)` with `set_gain_offset` on the
+default 2.4GHz channel-1 chandef, RSTB 1/3, the `rx_nss` 1 limits, because mac.c
+clamps `rx_nss` to `chip->rx_nss` = 1, and `R_MAC_SEL`; read back), and
+`n51_channel::Channel::set_channel` + `rfk_channel`. `set_channel` is core.c
+`__rtw89_set_channel`: `rtw8851b_set_channel_help` enter (PPDU status off,
+path-A TSSI cont off, ADC FIFO, 40us, `rtw8851b_bb_reset_en(false)` with only the
+S0 HW-SI), `channel_51::program`, `channel_rf::prepare_for_channel_51`,
+`Plan::visit_51`, help exit (RX CCA re-enabled only on 2.4GHz), then on the
+first channel or a band change `coex_switch_band` + `rtw8851b_tssi_scan`.
+`rfk_channel` is `rtw8851b_rfk_channel`: conn_rfk, RX DCK with the retained
+`is_tssi_mode`, IQK, 30ms, TSSI, 30ms, DPK. `retune` repeats only those two
+steps. `track(scanning)` is one `rtw89_track_work` RF step
+(`n51_dpk::Track::step`). It returns without any access while scanning, as core.c
+skips the work when `rtwdev->scanning` is set. Nothing natively calls this owner
+yet. Unexecuted cases:
+`smoke_rtw89_n51_set_channel_help_follows_rtw8851b`,
+`smoke_rtw89_n51_channel_owner_gates_rfk_and_scan_tracking`,
+`smoke_rtw89_n51_dm_init_txrx_path_and_power_trim_follow_rtw8851b`,
+`smoke_rtw89_n51_radio_owner_starts_new`.
+
+**Remaining for the row.** the native composition (chip dispatch in
+`command_native`, RTL8851B startup assets/bootstrap, post-WCPU MAC and
+ring-geometry branches; native radio access needs the signed record family
+first), the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)

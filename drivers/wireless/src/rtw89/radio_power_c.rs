@@ -725,13 +725,7 @@ impl Plan {
         for (i, w) in self.ru[0].chunks_exact(4).enumerate() {
             emit(R_AX_PWR_RU_LMT + 4 * i as u32, u32::MAX, pack(w))?;
         }
-        // rtw8851b_set_txpwr_ref: B_AX_PWR_REF 0, then OFDM / CCK path A
-        // `rtw8851b_bb_cal_txpwr_ref(0)` = TSSI 172, PWR 312, REF 0.
-        emit(0xd200, 0x0fff_fc00, 0)?;
-        for a in [PHY + 0x5804, PHY + 0x5808] {
-            emit(a, 0x07ff_ffff, (172 << 18) | (312 << 9))?;
-        }
-        Ok(())
+        reference_51(emit)
     }
     fn build(
         elements: &[Element],
@@ -959,6 +953,21 @@ impl Plan {
         emit(PHY + 0x76cc, 0x1ff, sar_rf)?;
         Ok(())
     }
+}
+
+/// rtw8851b.c `rtw8851b_set_txpwr_ctrl` = `rtw8851b_set_txpwr_ref(PHY_0)`:
+/// `R_AX_PWR_RATE_CTRL` B_AX_PWR_REF 0, then the path-A OFDM / CCK words
+/// (`0x5800 + 4` / `+ 8`) with `rtw8851b_bb_cal_txpwr_ref(0)` = TSSI 172,
+/// PWR 312, REF 0. phy.c `rtw89_phy_dm_init` runs it once at init; the
+/// landed `Plan::visit_51` also ends with it.
+pub(super) fn reference_51(
+    mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>,
+) -> Result<(), Error> {
+    emit(0xd200, 0x0fff_fc00, 0)?;
+    for a in [PHY + 0x5804, PHY + 0x5808] {
+        emit(a, 0x07ff_ffff, (172 << 18) | (312 << 9))?;
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
