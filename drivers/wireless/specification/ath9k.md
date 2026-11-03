@@ -1500,6 +1500,35 @@ oracles over the 547/560 selected Linux rows),
 `smoke_ath9k_ar9280_board_values_follow_eeprom_def`,
 `smoke_ath9k_ar9280_preparation_refuses_wrong_inputs`.
 
+`phy/ar9280/power.rs` is `eeprom_def.c::ath9k_hw_def_set_txpower` for a
+20 MHz channel in either band, closed-loop only. Per-rate table
+(`ath9k_hw_set_def_power_per_rate_table`): 2.4 GHz CCK (3 rows), OFDM and
+HT20 (4 rows each), 5 GHz OFDM and HT20 (8 rows each) through
+`ath9k_hw_get_legacy_target_powers`/`_get_target_powers` with
+`ath9k_hw_fbin2freq` per band; `ath9k_hw_get_scaled_power` with
+`EEP_ANTENNA_GAIN_2G/5G` (max over all three map entries) plus
+`POWER_CORRECTION_FOR_TWO_CHAIN`; the CTL walk over the 24 `ctlIndex`
+entries on `ctlEdges[ntxchains - 1]` (8 edges, `ath9k_hw_get_max_edge_power`)
+for `CTL_11B`/`CTL_11G`/`CTL_2GHT20` or `CTL_11A`/`CTL_5GHT20` under the
+band's `ath_regd_get_band_ctl` (`rates::initial_ctl_5ghz` for 5 GHz). Power
+calibration (`ath9k_hw_set_def_power_cal_table`): `xpdGain` PD gains to
+`AR_PHY_TPCRG1`, `pdGainOverlap` (live `AR_PHY_TPCRG5` below minor 2) and,
+per `txMask` chain, `ath9k_hw_get_gain_boundaries_pdadcs` over the band's
+piers (`AR9280_20_OR_LATER` first-gain start, unused boundaries filled with
+the last one), `ath9k_change_gain_boundary_setting` and
+`ath9k_adjust_pdadc_values` for `pwr_table_offset` (minor 21, else
+`AR5416_PWR_TABLE_OFFSET_DB`), written as `AR_PHY_TPCRG5 + chain` and the 32
+PDADC words. Rate registers follow with `pwr_table_offset * 2` removed (no
+CCK registers on 5 GHz), `AR_PHY_POWER_TX_SUB` from
+`pwrDecreaseFor2Chain/3Chain` and TPC disabled. The plan is validated before
+the first write; a `pwr_table_offset` below -5 or a 128+ entry shift (Linux
+indexes outside `pdadcValues`), a rate that would wrap the six-bit
+`ATH9K_POW_SM` field, empty target lists and open-loop maps are refused.
+Smokes (written, not executed):
+`smoke_ath9k_ar9280_txpower_two_chain_closed_loop_2ghz`,
+`smoke_ath9k_ar9280_txpower_5ghz_one_chain_and_table_offset`,
+`smoke_ath9k_ar9280_txpower_refuses_before_writes`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

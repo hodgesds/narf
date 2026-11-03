@@ -182,6 +182,17 @@ pub(in crate::ath9k) fn initial_ctl(factory: Factory) -> u16 {
         factory.ctl_2ghz
     }) | 2
 }
+/// `ath_regd_get_band_ctl(NL80211_BAND_5GHZ)` | `CTL_11A` with the same
+/// world-SKU rule as [`initial_ctl`].
+pub(in crate::ath9k) fn initial_ctl_5ghz(factory: Factory) -> u16 {
+    let rd = factory.eeprom & !0x4000;
+    let world = rd & 0x8000 == 0 && (rd & 0xf0 == 0x60 || rd == 0x199);
+    if factory.country == 0 && world {
+        0xe0
+    } else {
+        factory.ctl_5ghz
+    }
+}
 pub(in crate::ath9k) fn checked_plan_at(
     image: &[u8; EEPROM_4K_BYTES],
     frequency: u16,

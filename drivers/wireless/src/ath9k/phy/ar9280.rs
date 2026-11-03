@@ -361,3 +361,6 @@ pub(in crate::ath9k) fn prepare(
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+/// `ath9k_hw_def_set_txpower` (closed-loop, 20 MHz, both bands).
+pub(in crate::ath9k) mod power;

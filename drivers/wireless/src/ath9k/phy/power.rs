@@ -31,7 +31,8 @@ pub(in crate::ath9k) fn indices(target: u8, list: &[u8]) -> (usize, usize) {
     }
     unreachable!()
 }
-fn interpolate(target: u16, left: u16, right: u16, a: u8, b: u8) -> u8 {
+/// `eeprom.c::ath9k_hw_interpolate` (u8 result).
+pub(in crate::ath9k) fn interpolate(target: u16, left: u16, right: u16, a: u8, b: u8) -> u8 {
     if left == right {
         return a;
     }
@@ -39,7 +40,8 @@ fn interpolate(target: u16, left: u16, right: u16, a: u8, b: u8) -> u8 {
         + (i32::from(right) - i32::from(target)) * i32::from(a))
         / (i32::from(right) - i32::from(left))) as u8
 }
-fn vpd(minimum: u8, maximum: u8, power: &[u8], detector: &[u8]) -> [u8; 64] {
+/// `eeprom.c::ath9k_hw_fill_vpd_table`.
+pub(in crate::ath9k) fn vpd(minimum: u8, maximum: u8, power: &[u8], detector: &[u8]) -> [u8; 64] {
     let mut out = [0; 64];
     for (i, at) in out
         .iter_mut()
