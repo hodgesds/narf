@@ -6,10 +6,9 @@
 //! `\r`, and scrolls the visible area up by one row when the cursor
 //! falls off the bottom.
 //!
-//! Scroll is a memmove of stride*(rows-1)*8 pixels through the FB,
-//! followed by clearing the bottom row. Cheap on the few-K-bytes /
-//! second cadence kernel logs run at; far from optimal for a real
-//! TTY but this isn't one yet.
+//! Scroll shifts the character grid in RAM and paints changed cells only.
+//! It never reads pixels from device memory. Palette changes and external
+//! drawing through `fb_mut` force the next scroll to repaint every cell.
 
 use core::fmt;
 
@@ -41,16 +40,10 @@ pub struct FbConsole {
     pub bg: Pixel32,
     /// Glyph character shadow — `cols * rows` bytes, ASCII per cell.
     /// 0x00 means "no glyph" (clear cell, background colour).
-    /// Used by `scroll_up_one_row` to avoid reading from the FB,
-    /// which is catastrophically slow on real-HW WC-mapped GPU
-    /// framebuffers (~500 KB/s reads on Renoir's iGPU FB).
-    ///
-    /// On scroll we shift this Vec up by one row in cached RAM
-    /// (~ns) and redraw the cells from the shadow to the FB
-    /// (write-only, hits the WC combine buffers, ~GB/s on iGPU).
-    /// Net effect: scroll drops from ~200 ms per line (read-bound)
-    /// to ~5 ms per line (write-bound). 5 lines/sec → ~200/sec.
+    /// Scroll compares adjacent rows here before writing device memory.
     chars: Vec<u8>,
+    scroll_palette: (Pixel32, Pixel32),
+    repaint_scroll: bool,
 }
 
 impl FbConsole {
@@ -77,6 +70,8 @@ impl FbConsole {
             fg,
             bg,
             chars,
+            scroll_palette: (fg, bg),
+            repaint_scroll: false,
         }
     }
 
@@ -93,6 +88,7 @@ impl FbConsole {
     /// composer to draw a title bar background underneath the text
     /// the console will paint over the top.
     pub fn fb_mut(&mut self) -> &mut crate::Framebuffer {
+        self.repaint_scroll = true;
         &mut self.fb
     }
     /// Reset the cursor to the top-left without clearing the FB.
@@ -104,12 +100,16 @@ impl FbConsole {
     pub fn reset_with_bg(&mut self, bg: crate::Pixel32) {
         self.bg = bg;
         self.fb.clear(bg);
+        self.repaint_scroll = true;
         self.cur_col = 0;
         self.cur_row = 0;
     }
 
     /// Write a single byte, handling control characters and wrap.
     pub fn write_byte(&mut self, b: u8) {
+        // Remember even a temporary palette change: a caller may draw with
+        // a different colour, then restore the old palette before scrolling.
+        self.repaint_scroll |= self.scroll_palette != (self.fg, self.bg);
         match b {
             b'\n' => self.newline(),
             b'\r' => {
@@ -178,12 +178,9 @@ impl FbConsole {
             // real-HW boot ("newest line is somewhere on screen
             // depending on where the cursor was at wrap time").
             //
-            // Cost of this memmove on a 1280×800 GOP FB at UC-MMIO
-            // write speed: ~40 ms (792 source rows × 1280 px × 4 B
-            // = 4 MB) per newline. The bring-up workflow needs
-            // readability more than throughput, and once the screen
-            // settles at the shell prompt scrolls happen only on
-            // user input cadence.
+            // Compare character rows in RAM before painting. Repainting
+            // every blank cell of a 4K screen for each boot-log newline
+            // makes console output itself a substantial synchronous wait.
             self.scroll_up_one_row();
             // cur_row stays at rows-1; cursor returns to bottom-
             // left for the next line.
@@ -196,66 +193,60 @@ impl FbConsole {
         }
     }
 
-    /// Scroll the text region up by one glyph row. Walks the
-    /// `chars` shadow grid (cached RAM, ~ns access) instead of
-    /// reading from the FB. The previous implementation did
-    /// `ptr::copy(src, dst, width)` where both `src` and `dst`
-    /// were FB addresses — on real-HW Renoir's WC-mapped iGPU FB
-    /// those READS run at ~500 KB/s, making each scroll cost
-    /// ~200 ms (= 5 lines/sec on `ls /`).
-    ///
-    /// New algorithm:
-    ///   1. Shift `chars[cols..]` to `chars[0..]` — cached RAM,
-    ///      sub-millisecond.
-    ///   2. Zero the last row in `chars`.
-    ///   3. Redraw every cell from the shadow to the FB. Each
-    ///      cell write is a `draw_glyph_8x8` which is WRITE-only
-    ///      to the FB (WC combine buffers → ~GB/s on iGPU).
-    ///   4. Cells whose shadow byte is 0 are painted as bg
-    ///      (cleared) via a fill_rect; printable bytes go through
-    ///      the font8x8 lookup.
+    /// Scroll from the RAM character grid, without device-memory reads or
+    /// writes to cells whose rendered contents remain the same.
     fn scroll_up_one_row(&mut self) {
+        self.scroll_up_one_row_with(Self::paint_cell);
+    }
+
+    // The paint callback lets tests count actual cell redraws without adding
+    // counters or hooks to the production console. Production monomorphizes
+    // this with the direct framebuffer painter above.
+    fn scroll_up_one_row_with(
+        &mut self,
+        mut paint: impl FnMut(&mut Framebuffer, u32, u32, u8, Pixel32, Pixel32),
+    ) {
         if self.rows == 0 {
             return;
         }
         let cols = self.cols as usize;
         let rows = self.rows as usize;
-        // 1. Shift the shadow grid one row up.
-        // SAFETY: `chars` is at least `cols * rows` bytes long;
-        // copy of `(rows-1) * cols` from `cols..` to `0..` stays
-        // within bounds.
-        if rows > 1 {
-            let total = cols * rows;
-            // Use Vec methods to keep this safe + simple.
-            self.chars.copy_within(cols..total, 0);
-        }
-        // 2. Clear the last row in the shadow.
-        if let Some(last) = self.chars.get_mut(cols * (rows - 1)..cols * rows) {
-            for c in last {
-                *c = 0;
-            }
-        }
-        // 3. Redraw the entire text region from the shadow to
-        //    the FB. This is the only path that needs to touch
-        //    FB memory; everything else is cached RAM.
+        let repaint = self.repaint_scroll || self.scroll_palette != (self.fg, self.bg);
         for row in 0..rows {
             let y = TOP_PX_OFFSET + (row as u32) * GLYPH_H;
             for col in 0..cols {
                 let x = (col as u32) * GLYPH_W;
                 let idx = row * cols + col;
-                let b = self.chars[idx];
-                if b == 0 || b == b' ' {
-                    self.fb.fill_rect(x, y, GLYPH_W, GLYPH_H, self.bg);
+                let old = self.chars[idx];
+                // Traverse top to bottom: the source row has not moved yet.
+                let next = if row + 1 < rows {
+                    self.chars[idx + cols]
                 } else {
-                    let g = font8x8::lookup(b);
-                    self.fb.draw_glyph_8x8(x, y, &g, self.fg, self.bg);
+                    0
+                };
+                let blank = |b| b == 0 || b == b' ';
+                if repaint || !(old == next || (blank(old) && blank(next))) {
+                    paint(&mut self.fb, x, y, next, self.fg, self.bg);
                 }
+                self.chars[idx] = next;
             }
         }
+        self.scroll_palette = (self.fg, self.bg);
+        self.repaint_scroll = false;
         // Cursor lands at the (now-cleared) bottom row.
         self.cur_row = self.rows - 1;
     }
+
+    fn paint_cell(fb: &mut Framebuffer, x: u32, y: u32, b: u8, fg: Pixel32, bg: Pixel32) {
+        if b == 0 || b == b' ' {
+            fb.fill_rect(x, y, GLYPH_W, GLYPH_H, bg);
+        } else {
+            fb.draw_glyph_8x8(x, y, &font8x8::lookup(b), fg, bg);
+        }
+    }
 }
+
+mod scroll_tests;
 
 /// Process-wide console writer registered by the boot path. Held
 /// behind a coarse IRQ-safe lock so `console::write_str` can fan

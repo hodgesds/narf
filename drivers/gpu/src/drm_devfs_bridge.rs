@@ -200,7 +200,7 @@ impl DriCardFile {
             #[cfg(feature = "intel")]
             intel: crate::intel_gpu_render::RenderFile::new(),
             #[cfg(feature = "amdgpu")]
-            amdgpu_gem: crate::amdgpu_gem::GemState::for_card(index),
+            amdgpu_gem: crate::amdgpu_gem::GemState::for_primary_card(index),
             #[cfg(feature = "amdgpu")]
             amdgpu_vm: crate::amdgpu_vm::VmState::for_card(index),
             #[cfg(feature = "amdgpu")]
@@ -315,7 +315,7 @@ impl FileOps for DriCardFile {
         }
         #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
-            && offset >> 12 >= 0x4000_0000
+            && offset >> 12 >= crate::amdgpu_gem::MMAP_PAGE_BASE
         {
             return self.amdgpu_gem.mmap_backing(offset, len);
         }

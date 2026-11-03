@@ -342,6 +342,34 @@ impl<I: Io> Engine<I> {
         self.proof.compute_ring = true;
         Ok(())
     }
+    /// `amdgpu_gfx_enable_kgq`: HDP flush, one KIQ MAP_QUEUES (ENGINE_SEL 4,
+    /// ME0) per kernel gfx ring, then the KIQ ring test proves the packets
+    /// were consumed. Runs between the compute mapping and the IB tests; a
+    /// failure leaves the KIQ Failed.
+    pub(crate) async fn map_gfx(
+        &mut self,
+        maps: &[crate::amdgpu_cp_navi22::GfxQueueMap],
+    ) -> Result<(), Error> {
+        self.begin(State::Mapped, State::Mapping)?;
+        let kiq = &mut self.kiq;
+        let result = self.hw.access(|io, l| {
+            flush(io, l);
+            for m in maps {
+                kiq.emit(
+                    io,
+                    // linux: n/a (ENGINE_SEL literal 4 for AMDGPU_RING_TYPE_GFX in gfx10_kiq_map_queues)
+                    &pm4::map_queues_engine(0, m.pipe, 0, m.doorbell, m.mqd, m.wptr, 4),
+                )?;
+            }
+            kiq.commit(io, l);
+            Ok(())
+        });
+        let result = match result {
+            Ok(()) => ring_test(&mut self.hw, &mut self.kiq).await,
+            Err(error) => Err(error),
+        };
+        self.finish(result, State::Mapped)
+    }
     pub(crate) async fn test_ib(&mut self) -> Result<(), Error> {
         self.begin(State::Mapped, State::Testing)?;
         let result = ib_test(&mut self.hw, &mut self.compute).await;
@@ -419,6 +447,17 @@ impl Compute {
     /// `init_kiq` succeeded under the same ownership contract.
     pub async unsafe fn map_compute(&mut self) -> Result<(), Error> {
         self.engine.map_compute().await
+    }
+    /// Map the kernel gfx rings' MQDs through the KIQ (Linux async gfx path).
+    ///
+    /// # Safety
+    /// `map_compute` succeeded and `maps` came from
+    /// [`crate::amdgpu_cp_navi22::Gfx::prepare_queues`] on this GPU.
+    pub(crate) async unsafe fn map_gfx(
+        &mut self,
+        maps: &[crate::amdgpu_cp_navi22::GfxQueueMap],
+    ) -> Result<(), Error> {
+        self.engine.map_gfx(maps).await
     }
     pub async fn test_ib(&mut self) -> Result<(), Error> {
         self.engine.test_ib().await

@@ -130,3 +130,47 @@ fn smoke_coredump_zero_write_is_an_error() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/coredump", smoke_coredump_zero_write_is_an_error);
+
+/// Linux `vma_dump_size` dumps nothing for VM_IO/VM_PFNMAP mappings. A DRM
+/// VRAM BAR mapping (WriteCombining device frames, here at 992 GiB, far above
+/// the direct map) keeps its PT_LOAD size but no file bytes; reading it
+/// through `kernel_ptr` faulted the kernel and froze the machine.
+fn smoke_coredump_skips_device_mappings() -> TestResult {
+    use narf_memory::address_space::{Region, RegionPerms};
+    let bar = PhysAddr::new(0xf8_0000_0000);
+    let Ok(backing) = narf_memory::region_backing::RegionBacking::try_from_slice(&[bar]) else {
+        return TestResult::Fail("backing allocation");
+    };
+    let shared = RegionPerms(
+        RegionPerms::READ.0
+            | RegionPerms::WRITE.0
+            | RegionPerms::SHARED.0
+            | RegionPerms::LOCK_EXEMPT.0,
+    );
+    let device = Region {
+        base: narf_memory::VirtAddr::new(0x7000_0000),
+        len: 4096,
+        perms: shared.with_memory_type(narf_memory::MemoryType::WriteCombining),
+        phys: backing.clone(),
+    };
+    let write_back = Region {
+        perms: shared,
+        ..device.clone()
+    };
+    let anon = Region {
+        perms: RegionPerms(RegionPerms::READ.0 | RegionPerms::WRITE.0),
+        ..device.clone()
+    };
+    if dump_len(&device) != 0 {
+        return TestResult::Fail("device (VRAM BAR) mapping would be read into the core");
+    }
+    if dump_len(&write_back) != 4096 || dump_len(&anon) != 4096 {
+        return TestResult::Fail("write-back mappings must still be dumped");
+    }
+    // The per-page guard: a non-RAM frame is never dereferenced.
+    if narf_memory::frame::is_system_ram(bar) {
+        return TestResult::Fail("a 992 GiB BAR frame classified as System RAM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/coredump", smoke_coredump_skips_device_mappings);

@@ -199,7 +199,9 @@ static FAILED: AtomicBool = AtomicBool::new(false);
 /// Bumped by [`forget_for_reset`], which cannot wait for the mutex.
 static RESETS: AtomicU64 = AtomicU64::new(0);
 /// Set by the uapi/CS owner once every userspace GC MMIO path it serves
-/// (submission, `READ_MMR_REG`) holds a [`Reference`]. Until then the
+/// (`READ_MMR_REG`) holds a [`Reference`]. Submission is no such path: like
+/// Linux's `amdgpu_ib_schedule` it writes only ring memory and the doorbell,
+/// which wakes GC itself, so it takes no reference. Until then the
 /// policy's `gfxoff_safe_gc_access` is false and GFXOFF is refused.
 static SUBMISSION_GUARDED: AtomicBool = AtomicBool::new(false);
 

@@ -16,11 +16,14 @@
 //! card — unlike the KMS dumb-buffer table, which is card-global because a
 //! dumb handle is shared deliberately between a compositor's own opens.
 //!
-//! Handles are allocated from [`HANDLE_BASE`] upward so they cannot collide
-//! with the card-global dumb-buffer handles, which are small integers. Linux
-//! has one handle space per file covering both kinds; NARF has two tables with
-//! different lifetimes, and keeping their numbering disjoint is what lets
-//! `GEM_CLOSE` tell which table a handle belongs to without a lookup in both.
+//! Render opens and native-display primary opens allocate compact handles
+//! starting at one. Native dumb buffers use this same per-open table. This
+//! matters to libdrm's dense handle-indexed pointer array: starting at
+//! 0x40000000 makes its first insertion allocate and zero over 8 GiB.
+//! Fake mmap offsets have a separate high namespace; their routing tag must
+//! never become the userspace GEM handle. Legacy primary cards that still
+//! own dumb buffers in a separate card-global table retain their disjoint
+//! handle range until that older KMS path also gains per-open ownership.
 //!
 //! ## Placement
 //!
@@ -75,9 +78,23 @@ pub(crate) mod cpu_mapping;
 pub(crate) mod stats;
 pub use cpu_mapping::{release_cpu_frame, retain_cpu_frame};
 
-/// First amdgpu GEM handle. Chosen above any plausible dumb-buffer handle so
-/// the two spaces cannot overlap; see the module header.
-const HANDLE_BASE: u32 = 0x4000_0000;
+const HANDLE_BASE: u32 = 1;
+const LEGACY_PRIMARY_HANDLE_BASE: u32 = 0x4000_0000;
+/// A routing tag in mmap's page-offset namespace, not a GEM handle.
+pub(crate) const MMAP_PAGE_BASE: u64 = 0x4000_0000;
+
+pub(crate) const fn mmap_offset(handle: u32) -> u64 {
+    (MMAP_PAGE_BASE + handle as u64) << 12
+}
+
+fn mmap_handle(offset: u64) -> Option<u32> {
+    if offset & (PAGE_SIZE - 1) != 0 {
+        return None;
+    }
+    u32::try_from((offset >> 12).checked_sub(MMAP_PAGE_BASE)?)
+        .ok()
+        .filter(|&handle| handle != 0)
+}
 
 /// `DRM_IOCTL_GEM_CLOSE`'s command number — generic DRM, not amdgpu-private.
 const DRM_GEM_CLOSE_NR: u32 = 0x09;
@@ -1764,7 +1781,7 @@ impl GemState {
         offset: u64,
         len: usize,
     ) -> Result<narf_filesystem::MmapBacking, FsError> {
-        let handle = u32::try_from(offset >> 12).map_err(|_| FsError::InvalidData)?;
+        let handle = mmap_handle(offset).ok_or(FsError::InvalidData)?;
         let object = self.get(handle).ok_or(FsError::InvalidData)?;
         cpu_mapping::backing(object, 0, len)
     }
@@ -1787,6 +1804,21 @@ impl GemState {
         }
     }
 
+    /// Native primary opens share one compact table for dumb and render BOs.
+    /// The legacy primary path still has a separate card-global dumb table;
+    /// retain its disjoint range rather than aliasing two live objects.
+    pub(crate) fn for_primary_card(index: u32) -> Self {
+        let mut state = Self::for_card(index);
+        let native = crate::drm_registry::mode_state(index).is_some_and(|mode| {
+            let card = mode.lock();
+            card.gfx12_modifiers || crate::amdgpu_native_kms::linear_gem_card(&card)
+        });
+        if !native {
+            state.next_handle = AtomicU32::new(LEGACY_PRIMARY_HANDLE_BASE);
+        }
+        state
+    }
+
     fn insert(&self, mut object: GemObject) -> Result<u32, FsError> {
         object.stats = stats::for_card(object.card);
         let object = Arc::new(object);
@@ -1799,12 +1831,13 @@ impl GemState {
     }
 
     fn insert_shared(&self, object: Arc<GemObject>) -> Result<u32, FsError> {
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        // Wrapping back into the dumb-handle space would make two different
-        // objects answer to one number. Refuse instead.
-        if handle < HANDLE_BASE {
-            return Err(FsError::NoSpace);
-        }
+        // Exhaustion is permanent: never wrap onto an existing object's id.
+        let handle = self
+            .next_handle
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| FsError::NoSpace)?;
         self.table().lock().insert(handle, object);
         Ok(handle)
     }
@@ -1939,10 +1972,9 @@ impl GemState {
         self.get(handle)
     }
 
-    /// Whether `handle` belongs to this table at all, so `GEM_CLOSE` can tell
-    /// an amdgpu handle from a dumb one without consulting both.
+    /// Whether `handle` belongs to this open's table.
     pub fn owns(&self, handle: u32) -> bool {
-        handle >= HANDLE_BASE && self.get(handle).is_some()
+        self.get(handle).is_some()
     }
 
     /// `amdgpu_mode_dumb_create` on a dGPU card with a VRAM heap: a buffer of
@@ -2069,20 +2101,20 @@ impl GemState {
         {
             return Some(Err(FsError::OperationNotPermitted));
         }
-        Some(Ok(u64::from(handle) << 12))
+        Some(Ok(mmap_offset(handle)))
     }
 
     /// `drm_mode_destroy_dumb`'s drm_gem_handle_delete for a handle of this
     /// table: false when it holds no such handle.
     pub fn destroy_dumb(&self, handle: u32) -> bool {
-        handle >= HANDLE_BASE && self.remove(handle)
+        self.remove(handle)
     }
 
     /// The object an `mmap` of `len` bytes at `offset` maps, which the
     /// mapping holds until it is torn down (`FileOps::mmap_lifetime`), as
     /// Linux's VMA holds its GEM object.
     pub fn mapping_object(&self, offset: u64, len: usize) -> Option<Arc<GemMapping>> {
-        let handle = u32::try_from(offset >> 12).ok()?;
+        let handle = mmap_handle(offset)?;
         if self.get(handle)?.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 {
             return None;
         }
@@ -2093,11 +2125,10 @@ impl GemState {
 
     /// Resolve an `mmap` offset to the object's physical frames.
     ///
-    /// The offset is the handle shifted by the page shift, which is how the
-    /// dumb path encodes it too — there is no separate offset allocator, so an
-    /// offset cannot name an object this open does not hold.
+    /// Decode the mmap routing tag and resolve only this open's object table.
+    /// MAP_DUMB and GEM_MMAP return the same offset for a native buffer.
     pub fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
-        let handle = u32::try_from(offset >> 12).map_err(|_| FsError::InvalidData)?;
+        let handle = mmap_handle(offset).ok_or(FsError::InvalidData)?;
         let object = self.get(handle).ok_or(FsError::InvalidData)?;
         if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 {
             return Err(FsError::OperationNotPermitted);
@@ -2521,7 +2552,7 @@ fn mmap(state: &GemState, arg: usize) -> Result<u64, FsError> {
         return Err(FsError::OperationNotPermitted);
     }
     let mut out = [0u8; 8];
-    out[0..8].copy_from_slice(&((handle as u64) << 12).to_le_bytes());
+    out[0..8].copy_from_slice(&mmap_offset(handle).to_le_bytes());
     // SAFETY: as above.
     unsafe { copy_out(arg, &out)? };
     Ok(0)

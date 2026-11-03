@@ -29,9 +29,9 @@
 
 use super::{
     identity::{apply_identity, resolve_usb_identity},
-    HidError, HID_BOOT_PROTOCOL, HID_INTERFACE_CLASS, HID_REQ_SET_PROTOCOL, HID_SUBCLASS_BOOT,
+    HidError, HID_BOOT_PROTOCOL, HID_REQ_SET_PROTOCOL, HID_SUBCLASS_BOOT,
 };
-use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
+use crate::xhci::{EndpointConfig, Xhci};
 use narf_input::{
     evdev::{
         dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode,
@@ -109,52 +109,8 @@ pub struct BootMouse {
 /// Returns `(interface_num, ep_config)` for the caller to feed into
 /// `xhci::configure_endpoints`.
 pub fn find_boot_mouse(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
-    let mut i = 0usize;
-    let mut in_match = false;
-    let mut iface_num: u8 = 0;
-    let mut int_in: Option<EndpointConfig> = None;
-    while i + 2 <= cfg.len() {
-        let len = cfg[i] as usize;
-        if len < 2 || i + len > cfg.len() {
-            break;
-        }
-        let dtype = cfg[i + 1];
-        match dtype {
-            // Interface Descriptor (§9.6.5). Audit F-72: don't gate
-            // on bInterfaceSubClass == Boot — many modern HID
-            // pointing devices report Subclass=0 but still respond
-            // to SET_PROTOCOL(Boot). Gate on Protocol == Mouse only;
-            // the attach step issues SET_PROTOCOL and bails on STALL.
-            4 if len >= 9 => {
-                in_match = cfg[i + 5] == HID_INTERFACE_CLASS
-                    && (cfg[i + 6] == HID_SUBCLASS_BOOT || cfg[i + 6] == 0)
-                    && cfg[i + 7] == HID_PROTOCOL_MOUSE;
-                if in_match {
-                    iface_num = cfg[i + 2];
-                }
-            }
-            // Endpoint Descriptor (§9.6.6): interrupt-IN.
-            5 if len >= 7 && in_match && int_in.is_none() => {
-                let ep_addr = cfg[i + 2];
-                let attr = cfg[i + 3];
-                let mps = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
-                let xfer_t = attr & 0x03;
-                let is_in = ep_addr & 0x80 != 0;
-                if xfer_t == 3 && is_in {
-                    int_in = Some(EndpointConfig {
-                        ep_addr,
-                        max_packet: mps,
-                        kind: EndpointKind::InterruptIn,
-                        interval: cfg[i + 6],
-                    });
-                }
-            }
-            _ => {}
-        }
-        i += len;
-    }
-    int_in
-        .map(|ep| (iface_num, ep))
+    super::find_boot_interface(cfg, HID_PROTOCOL_MOUSE, HID_SUBCLASS_BOOT)
+        .or_else(|| super::find_boot_interface(cfg, HID_PROTOCOL_MOUSE, 0))
         .ok_or(HidError::NoInterruptIn)
 }
 
@@ -419,7 +375,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     }
     .await;
     if res.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id).await;
+        let _ = crate::attach::release_slot(xhci_dev, slot_id).await;
     }
     res
 }

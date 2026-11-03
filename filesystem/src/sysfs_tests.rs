@@ -26,6 +26,183 @@ use crate::sysfs::{
 use crate::uevent::{self, UeventAction, UeventReader};
 use crate::{FileType, FsInstance};
 
+fn smoke_sysfs_notify_wakes_and_preserves_per_open_events() -> TestResult {
+    use crate::{DirOps, POLL_ERR, POLL_PRI};
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Poll;
+    struct Counter(AtomicUsize);
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let node = Kobject::new_root("notify-test");
+    kobject_add_attr(&node, "value", || "value\n".into());
+    kobject_add_attr(&node, "other", || "other\n".into());
+    let dir = crate::sysfs::SysKobjDir { kobj: node.clone() };
+    let inode = dir.lookup("value").unwrap();
+    let first = inode.open_instance().unwrap();
+    let second = inode.open_instance().unwrap();
+    let other = dir.lookup("other").unwrap();
+    let mut buf = [0; 16];
+    for file in [&first, &second, &other] {
+        if narf_scheduler::block_on_spin(file.read(0, &mut buf)).is_err() {
+            return TestResult::Fail("initial attribute read");
+        }
+    }
+    let count = Arc::new(Counter(AtomicUsize::new(0)));
+    let waker = core::task::Waker::from(count.clone());
+    // events=0 still includes ERR in poll/epoll. Arm both the parked poll
+    // path and the persistent epoll path, then notify after registration.
+    if first.arm_readiness(1, POLL_ERR, &waker) != Some(Poll::Pending)
+        || second.arm_readiness_persistent(2, POLL_ERR, &waker) != Some(0)
+    {
+        return TestResult::Fail("sysfs waiter registration");
+    }
+    crate::sysfs::kobject_notify(&node, "value");
+    if count.0.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("notify must wake both poll and epoll observers");
+    }
+    let changed = POLL_PRI | POLL_ERR;
+    if first.poll_readiness() & changed != changed || other.poll_readiness() & changed != 0 {
+        return TestResult::Fail("attribute notifications are not isolated");
+    }
+    // EOF/zero-byte probes must not consume the event without rereading.
+    let _ = narf_scheduler::block_on_spin(first.read(99, &mut buf));
+    let _ = narf_scheduler::block_on_spin(first.read(0, &mut []));
+    if first.poll_readiness() & changed != changed {
+        return TestResult::Fail("empty read consumed pending notification");
+    }
+    let _ = narf_scheduler::block_on_spin(first.read(0, &mut buf));
+    if first.poll_readiness() & changed != 0 || second.poll_readiness() & changed != changed {
+        return TestResult::Fail("separate opens shared a notification cursor");
+    }
+    first.disarm_readiness(1);
+    let _ = narf_scheduler::block_on_spin(second.read(0, &mut buf));
+    // A change preceding arm must also be returned, without requiring a
+    // future notification. Repeated notifications must wake persistent users.
+    crate::sysfs::kobject_notify(&node, "value");
+    if count.0.load(Ordering::SeqCst) != 3
+        || first.arm_readiness(3, POLL_ERR, &waker) != Some(Poll::Ready(POLL_ERR))
+    {
+        return TestResult::Fail("notification lost across rearm");
+    }
+    second.disarm_readiness(2);
+    crate::sysfs::kobject_notify(&node, "value");
+    if count.0.load(Ordering::SeqCst) != 3 {
+        return TestResult::Fail("disarmed sysfs observer was woken");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/sysfs/notify",
+    smoke_sysfs_notify_wakes_and_preserves_per_open_events
+);
+
+fn smoke_sysfs_notify_during_show_remains_pending() -> TestResult {
+    use crate::{DirOps, POLL_ERR};
+    let node = Kobject::new_root("notify-during-show");
+    let weak = Arc::downgrade(&node);
+    kobject_add_attr(&node, "value", move || {
+        if let Some(node) = weak.upgrade() {
+            crate::sysfs::kobject_notify(&node, "value");
+        }
+        "changed\n".into()
+    });
+    let file = crate::sysfs::SysKobjDir { kobj: node }
+        .lookup("value")
+        .unwrap();
+    let mut buf = [0; 16];
+    if narf_scheduler::block_on_spin(file.read(0, &mut buf)) != Ok(8)
+        || file.poll_readiness() & POLL_ERR == 0
+    {
+        return TestResult::Fail("read lost a concurrent attribute notification");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/sysfs/notify",
+    smoke_sysfs_notify_during_show_remains_pending
+);
+
+fn smoke_input_hotplug_publication() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+
+    crate::sysfs::populate_input_class();
+    let mut reader = UeventReader::new();
+    let mut caps = DeviceCaps {
+        name: String::from("late USB keyboard regression"),
+        ..DeviceCaps::default()
+    };
+    caps.add_key(30);
+    let (id, node) = ROUTER.register_device(caps);
+    let n = id.0 - 1;
+    let result = (|| {
+        let root = crate::sysfs::get_root();
+        let parent = root
+            .get_child("devices")?
+            .get_child("platform")?
+            .get_child("narf-input")?;
+        let input = parent.get_child(&alloc::format!("input{}", n))?;
+        let event = input.get_child(&alloc::format!("event{}", n))?;
+        let class = root.get_child("class")?.get_child("input")?;
+        let chars = root.get_child("dev")?.get_child("char")?;
+        if event.attr_show("dev")? != alloc::format!("13:{}\n", 64 + n)
+            || class.get_symlink(&alloc::format!("event{}", n)).is_none()
+            || chars
+                .get_symlink(&alloc::format!("13:{}", 64 + n))
+                .is_none()
+        {
+            return None;
+        }
+        let added = reader.drain(16);
+        if added.len() != 2
+            || added[0].action != UeventAction::Add
+            || added[1].action != UeventAction::Add
+            || added[0].devpath != input.path().trim_start_matches("/sys")
+            || added[1].devpath != event.path().trim_start_matches("/sys")
+            || added.iter().any(|env| env.subsystem != "input")
+        {
+            return None;
+        }
+        crate::sysfs::populate_input_class();
+        if !Arc::ptr_eq(&input, &parent.get_child(&alloc::format!("input{}", n))?)
+            || !reader.drain(16).is_empty()
+        {
+            return None;
+        }
+        ROUTER.unregister_device(id);
+        let removed = reader.drain(16);
+        if removed.len() != 2
+            || removed[0].action != UeventAction::Remove
+            || removed[1].action != UeventAction::Remove
+            || removed[0].devpath != added[1].devpath
+            || removed[1].devpath != added[0].devpath
+            || parent.get_child(&alloc::format!("input{}", n)).is_some()
+            || class.get_symlink(&alloc::format!("event{}", n)).is_some()
+            || class.get_symlink(&alloc::format!("input{}", n)).is_some()
+            || chars
+                .get_symlink(&alloc::format!("13:{}", 64 + n))
+                .is_some()
+            || node.is_alive()
+        {
+            return None;
+        }
+        Some(())
+    })();
+    ROUTER.unregister_device(id);
+    if result.is_some() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("late input device discovery, notification or removal is inconsistent")
+    }
+}
+kernel_test_in!("filesystem/input-hotplug", smoke_input_hotplug_publication);
+
 // ── Minimal fake block device for tests ───────────────────────────────
 
 use alloc::vec;

@@ -132,9 +132,26 @@ fn smoke_btrfs_loader_private_map_survives_replacement() -> TestResult {
             if fresh.ino() == old_ino {
                 return Err("replacement reused a still-mapped inode");
             }
-            let fresh_base = map_then_close(fresh, 8192)?;
+            let fresh_base = map_then_close(fresh.clone(), 8192)?;
             if fault_byte(&space, fresh_base)? != 0x59 {
                 return Err("new mapping read old cache bytes");
+            }
+            if fault_byte(&space, fresh_base + 4096)? != 0x59 {
+                return Err("new mapping's second page read wrong bytes");
+            }
+            // Btrfs holds its operation mutex while publishing EOF and
+            // revoking mappings. Exercise the real revoke hook and a later
+            // fault, including an already-resident private page past EOF.
+            complete(fresh.truncate(4096))?;
+            if fault_byte(&space, fresh_base + 4096).is_ok() {
+                return Err("truncated mapped page remained accessible");
+            }
+            complete(fresh.truncate(8192))?;
+            if fault_byte(&space, fresh_base + 4096)? != 0 {
+                return Err("regrown mapping retained bytes from a retired extent");
+            }
+            if fault_byte(&space, fresh_base)? != 0x59 {
+                return Err("truncate changed the retained first page");
             }
             for base in [old_base, fresh_base] {
                 if call(

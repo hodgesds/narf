@@ -5,6 +5,38 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_evdev_lifecycle_observer_can_query_router() -> TestResult {
+    use crate::evdev::{DeviceCaps, DeviceChange, DeviceId, Router};
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static OBSERVED: AtomicU8 = AtomicU8::new(0);
+    fn observe(router: &Router, id: DeviceId, change: DeviceChange) {
+        let present = router.caps(id).is_some() && router.device_ids().contains(&id);
+        let bit = match (change, present) {
+            (DeviceChange::Added, true) => 1,
+            (DeviceChange::Removed, false) => 2,
+            _ => 4,
+        };
+        OBSERVED.fetch_or(bit, Ordering::Relaxed);
+    }
+    OBSERVED.store(0, Ordering::Relaxed);
+    let router = Router::new();
+    router.set_device_change_hook(observe);
+    let (id, node) = router.register_device(DeviceCaps::default());
+    if OBSERVED.load(Ordering::Relaxed) != 1 || !node.is_alive() {
+        return TestResult::Fail("registration observer cannot query the inserted device");
+    }
+    router.unregister_device(id);
+    router.unregister_device(id);
+    if OBSERVED.load(Ordering::Relaxed) != 3 || node.is_alive() {
+        return TestResult::Fail("removal observer ran before cleanup or for an absent device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "input/evdev",
+    smoke_evdev_lifecycle_observer_can_query_router
+);
+
 fn smoke_input_ring_push_pop_round_trip() -> TestResult {
     use crate::{EventRing, InputEvent, KeyCode, KeyEvent, Modifiers};
     let r = EventRing::new(4);

@@ -1,0 +1,17 @@
+[Unit]
+Description=NARF Plasma hardware boot diagnostics
+DefaultDependencies=no
+ConditionKernelCommandLine=narf.disks=root-rw
+After=systemd-journald.service
+Before=sysinit.target systemd-journal-flush.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash /usr/local/libexec/narf-plasma-capture
+UMask=0077
+RuntimeMaxSec=600
+TimeoutStopSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=sysinit.target

@@ -835,13 +835,14 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            // Bump before the bytes move: a partial write that ends
-            // in an error must still invalidate retained cache pages
-            // (the `mmap_cache_generation` contract; the minix rule).
-            self.bump_cache_generation(&vol);
             autogrow!(
                 vol,
                 async {
+                    // Invalidate after acquiring op_lock, before bytes move.
+                    // Otherwise a reader can tag old bytes with the epoch a
+                    // queued writer will leave current after changing them.
+                    // Partial errors must invalidate retained pages too.
+                    self.bump_cache_generation(&vol);
                     let result =
                         crate::write::cow_write_file(&vol, self.ino, &self.inode(), offset, buf)
                             .await;
@@ -863,29 +864,27 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
-            // Bump before the length moves (see `write`).
-            self.bump_cache_generation(&vol);
-            let old_size = self
-                .anchor
-                .live_size
-                .load(core::sync::atomic::Ordering::Relaxed);
-            if len < old_size {
-                // Publish the new EOF, then revoke every installed PTE
-                // past it before the extents are retired — the ordering
-                // ext2's truncate uses. Without the revoke, an
-                // already-mapped page keeps serving its retired extent
-                // instead of faulting SIGBUS.
-                self.anchor
-                    .live_size
-                    .store(len, core::sync::atomic::Ordering::Relaxed);
-                if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
-                    self.refresh_inode().await?;
-                    return Err(error);
-                }
-            }
             autogrow!(
                 vol,
                 async {
+                    // The epoch, visible EOF and PTE revoke all belong to
+                    // this serialized mutation, before retiring its extents.
+                    self.bump_cache_generation(&vol);
+                    let old_size = self
+                        .anchor
+                        .live_size
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    if len < old_size {
+                        self.anchor
+                            .live_size
+                            .store(len, core::sync::atomic::Ordering::Relaxed);
+                        if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
+                            // op_lock is already held; refresh_inode would
+                            // try to acquire it recursively.
+                            self.cache_inode(vol.load_inode(self.ino).await?);
+                            return Err(error);
+                        }
+                    }
                     let result = crate::write::truncate_file(&vol, self.ino, len).await;
                     self.cache_inode(vol.load_inode(self.ino).await?);
                     result
@@ -905,14 +904,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
-            // Bump before the range moves: fallocate is staged (a
-            // zero-range can commit before the preallocation stage
-            // fails), so a fallocate that ends in an error may still
-            // have changed bytes or length.
-            self.bump_cache_generation(&vol);
             autogrow!(
                 vol,
                 async {
+                    // Serialize the epoch with readers as for write. A
+                    // staged fallocate can change bytes before returning an
+                    // error, so invalidate before its first stage.
+                    self.bump_cache_generation(&vol);
                     let result =
                         crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await;
                     self.cache_inode(vol.load_inode(self.ino).await?);
@@ -1576,8 +1574,16 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         self.inode().perms() & 0o777
     }
 
+    fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        <Self as FileOps>::set_perms(self, perms)
+    }
+
     fn dir_owners(&self) -> (u32, u32) {
         (self.inode().uid, self.inode().gid)
+    }
+
+    fn set_dir_owners_async<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        <Self as FileOps>::set_owners(self, uid, gid)
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {

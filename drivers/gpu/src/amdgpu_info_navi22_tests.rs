@@ -115,6 +115,7 @@ fn booted(queues_verified: bool) -> Published {
         pcie: Some((4, 16)),
         memory_khz: Some((100_000, 1_000_000)),
         topology: Some(topology),
+        chip_revision: Some(0),
         pci_revision: Some(0xc0),
         boot: Some(Boot {
             firmware: firmware(),
@@ -210,6 +211,41 @@ fn navi22_dev_info_matches_linux() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_dev_info_matches_linux);
 
+/// A failed GRBM harvest must not erase a successfully sampled NBIO identity.
+/// Linux reads the revision in nv_common_early_init, before GC harvesting.
+fn navi22_identity_survives_unavailable_topology() -> TestResult {
+    for revision in [0, 1, 9] {
+        let mut published = booted(true);
+        published.topology = None;
+        published.chip_revision = Some(revision);
+        let d: uapi::DrmAmdgpuInfoDevice = decode(
+            &ask(
+                &snap(published),
+                Submission::NotWired,
+                uapi::AMDGPU_INFO_DEV_INFO,
+                [0; 4],
+            )
+            .unwrap(),
+        );
+        if d.chip_rev != u32::from(revision)
+            || d.external_rev != 0x32 + u32::from(revision)
+            || d.pci_rev != 0xc0
+            || d.cu_active_number != 0
+            || d.cu_bitmap != [[0; 4]; 4]
+            || d.enabled_rb_pipes_mask != 0
+        {
+            return TestResult::Fail(
+                "GC harvest failure erased NBIO identity or invented topology",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_identity_survives_unavailable_topology
+);
+
 fn navi22_hw_ip_and_submission_switch() -> TestResult {
     let s = snap(booted(true));
     let hw = |sub, ip, inst| ask(&s, sub, uapi::AMDGPU_INFO_HW_IP_INFO, [ip, inst, 0, 0]);
@@ -286,7 +322,8 @@ fn navi22_hw_ip_and_submission_switch() -> TestResult {
         && info(w, uapi::AMDGPU_HW_IP_VCN_DEC).available_rings == 0
         && count(w, uapi::AMDGPU_HW_IP_GFX) == 1
         && count(w, uapi::AMDGPU_HW_IP_DMA) == 2
-        && d.ids_flags == u64::from(uapi::AMDGPU_IDS_FLAGS_GANG_SUBMIT);
+        // Single-ring acceleration remains available without gang support.
+        && d.ids_flags & u64::from(uapi::AMDGPU_IDS_FLAGS_GANG_SUBMIT) == 0;
     // Wired but the ring/IB tests failed: still closed.
     let failed = snap(booted(false));
     if !closed || !open || accel(w, &failed) != 0 {

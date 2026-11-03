@@ -12,7 +12,7 @@
 //! everything (`HARDWARE_VALIDATED` is false). A gate opens only through
 //! [`Policy::request_opted_in`] with an [`OptIn`] from `amdgpu.rdna2_pg=`;
 //! when that argument is absent the boot uses
-//! `amdgpu_rdna2::options::DEFAULT_POWER_SAVING` (every feature) as an
+//! `amdgpu_rdna2::options::DEFAULT_POWER_SAVING` (every feature but GFXOFF) as an
 //! implicit opt-in, and `amdgpu.rdna2_pg=none` opts out. Either way every
 //! display-admission and driver prerequisite still applies; only the
 //! hardware-validation facts (`HARDWARE_VALIDATED`, `recovery_validated`)

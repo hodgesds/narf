@@ -963,7 +963,7 @@ fn kms_allocation_and_lookup_observe_pm_placement_exclusion() -> TestResult {
     }
     // Lookup used to promote directly, bypassing PM's guard despite a
     // completely free heap. First native handle belongs to this BO.
-    if f.gem.object(0x4000_0000).is_none() || !a.system() {
+    if f.gem.object(1).as_ref().is_none_or(|o| !Arc::ptr_eq(o, &a)) || !a.system() {
         return TestResult::Fail("lookup promoted after the PM eviction snapshot");
     }
     let mut bytes = [0u8; 32];

@@ -21,6 +21,334 @@ const DST_MC: u64 = 0x9_2000_0000;
 
 const PASID: u16 = 0x0042;
 
+fn navi22_client_hdp_commands_bracket_ibs() -> TestResult {
+    let layout = crate::amdgpu_cp_navi22::tests::layout();
+    let ibs = [Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: 0,
+    }; 2];
+    let frame = Frame {
+        gfx: false,
+        engine: 4,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    // Literal Linux gfx_v10_0 / nbio_v2_3 / hdp_v5_0 ABI oracles.
+    // No VM flush or optional cache-sync flag: maintenance is unconditional
+    // even when a subsequent job reuses its already-programmed VMID.
+    for gfx in [false, true] {
+        let words = encode_cp(layout, &Frame { gfx, ..frame });
+        let mask = if gfx { 1 } else { 4 };
+        let flush = [
+            0xc005_3c00,
+            if gfx { 0x143 } else { 0x43 },
+            0xd20 + 0x106,
+            0xd20 + 0x107,
+            mask,
+            mask,
+            0x20,
+        ];
+        let invalidation = [
+            0xc003_3700,
+            if gfx { 0x4010_0000 } else { 0x0010_0000 },
+            0xf20 + 0xd1,
+            0,
+            1,
+        ];
+        let first_ib = if gfx { 12 } else { 7 };
+        let after_ibs = first_ib + 8 + if gfx { 2 } else { 0 };
+        if words.get(..7) != Some(&flush)
+            || words.get(first_ib) != Some(&0xc002_3f00)
+            || words.get(first_ib + 4) != Some(&0xc002_3f00)
+            || words.get(after_ibs..after_ibs + 5) != Some(&invalidation)
+            || words.get(after_ibs + 5) != Some(&0xc006_4900)
+        {
+            return TestResult::Fail(
+                "CP HDP maintenance must bracket all client IBs before the fence",
+            );
+        }
+    }
+    for instance in 0..4 {
+        // Nonzero ring start also checks that HDP packets participate in
+        // SDMA's absolute 8-dword IB alignment.
+        let wptr = 3;
+        let words = encode_sdma(
+            layout,
+            &Frame {
+                engine: 13 + instance,
+                wptr,
+                ..frame
+            },
+        );
+        let flush: alloc::vec::Vec<u32> = if instance < 2 {
+            let mask = 0x400 << instance;
+            alloc::vec![
+                0x3400_0008,
+                (0xd20 + 0x107) * 4,
+                (0xd20 + 0x106) * 4,
+                mask,
+                mask,
+                0x0fff_000a
+            ]
+        } else {
+            alloc::vec![0xf000_000e, 0x7f000 / 4, 0]
+        };
+        let at = flush.len() + ((2u64.wrapping_sub(wptr + flush.len() as u64) & 7) as usize);
+        let second = at + 8;
+        let end = second + 6;
+        if !words.starts_with(&flush)
+            || words.get(at) != Some(&(4 | (u32::from(VMID) << 16)))
+            || words.get(second) != Some(&(4 | (u32::from(VMID) << 16)))
+            || (wptr + at as u64 + 6) & 7 != 0
+            || words.get(end..end + 3) != Some(&[0xf000_000e, 0xf20 + 0xd1, 1])
+            || words.get(end + 3) != Some(&0x0003_0005)
+        {
+            return TestResult::Fail(
+                "SDMA HDP maintenance ordering or IB alignment differs from Linux",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-hdp-order",
+    navi22_client_hdp_commands_bracket_ibs
+);
+
+fn navi22_client_flags_reach_compute_packets() -> TestResult {
+    use crate::amdgpu_uapi::{AMDGPU_IB_FLAG_EMIT_MEM_SYNC, AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID};
+    let client = crate::amdgpu_cs::Ib {
+        va_start: IB_VA,
+        length_dw: 8,
+        ip_type: crate::amdgpu_uapi::AMDGPU_HW_IP_COMPUTE,
+        ip_instance: 0,
+        ring: 0,
+        flags: AMDGPU_IB_FLAG_EMIT_MEM_SYNC | AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID,
+    };
+    let ib = Ib::from(&client);
+    let words = encode_cp(
+        crate::amdgpu_cp_navi22::tests::layout(),
+        &Frame {
+            gfx: false,
+            engine: 4,
+            sync: None,
+            flush: None,
+            pasid_map: None,
+            vm_fence: Some((0x3000, 2)),
+            vmid: VMID,
+            context_switch: true,
+            gds_max_wave_id: Some(1279),
+            ibs: &[ib],
+            fence: 0x4000,
+            seq: 2,
+            wptr: 0,
+        },
+    );
+    // Linux: VM programming witness, whole-cache ACQUIRE_MEM, GDS reset,
+    // compute IB, final job fence. Numeric GCR oracle is independent of
+    // the production bit helpers (gfx_v10_0_emit_mem_sync).
+    if words.get(8..16) != Some(&[0xc006_5800, 0, 0xffff_ffff, 0x00ff_ffff, 0, 0, 10, 0xc3b1])
+        || words.get(23..26) != Some(&[0xc001_6800, 0x20e8, 1279])
+        || words.get(26..30)
+            != Some(&[
+                0xc002_3f00,
+                IB_VA as u32,
+                (IB_VA >> 32) as u32,
+                8 | (u32::from(VMID) << 24) | (1 << 23),
+            ])
+        || words.get(35) != Some(&0xc006_4900)
+    {
+        return TestResult::Fail("client compute sync/GDS requests lost before IB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-flags",
+    navi22_client_flags_reach_compute_packets
+);
+
+fn navi22_first_ib_requests_sdma_cache_rinse() -> TestResult {
+    use crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC;
+    let ib = Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+    };
+    let frame = Frame {
+        gfx: false,
+        engine: 13,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &[ib],
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    let words = encode_sdma(crate::amdgpu_cp_navi22::tests::layout(), &frame);
+    if words.get(..5) != Some(&[17, 0, 0xc3a1_0000, 0, 0])
+        || words.get(18..22)
+            != Some(&[
+                4 | (u32::from(VMID) << 16),
+                IB_VA as u32,
+                (IB_VA >> 32) as u32,
+                8,
+            ])
+    {
+        return TestResult::Fail("SDMA cache rinse missing or IB alignment lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-flags",
+    navi22_first_ib_requests_sdma_cache_rinse
+);
+
+fn navi22_sync_is_job_wide_and_gds_reset_is_per_compute_ib() -> TestResult {
+    use crate::amdgpu_uapi::{AMDGPU_IB_FLAG_EMIT_MEM_SYNC, AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID};
+    let mut ibs = [Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: 0,
+    }; 2];
+    ibs[1].flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC | AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID;
+    for first in [
+        0,
+        AMDGPU_IB_FLAG_EMIT_MEM_SYNC | AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID,
+    ] {
+        ibs[0].flags = first;
+        for gfx in [false, true] {
+            let frame = Frame {
+                gfx,
+                engine: if gfx { 0 } else { 4 },
+                sync: None,
+                flush: None,
+                pasid_map: None,
+                vm_fence: None,
+                vmid: VMID,
+                context_switch: true,
+                gds_max_wave_id: Some(1279),
+                ibs: &ibs,
+                fence: 0x4000,
+                seq: 2,
+                wptr: 0,
+            };
+            let words = encode_cp(crate::amdgpu_cp_navi22::tests::layout(), &frame);
+            let syncs = words.iter().filter(|&&w| w == 0xc006_5800).count();
+            let resets = words
+                .windows(3)
+                .filter(|w| *w == [0xc001_6800, 0x20e8, 1279])
+                .count();
+            if syncs != usize::from(first != 0)
+                || resets != if gfx { 0 } else { 1 + usize::from(first != 0) }
+            {
+                return TestResult::Fail("IB flag scope or ring type changed");
+            }
+            if !gfx {
+                let sdma = encode_sdma(
+                    crate::amdgpu_cp_navi22::tests::layout(),
+                    &Frame {
+                        engine: 13,
+                        ..frame
+                    },
+                );
+                if sdma
+                    .windows(5)
+                    .filter(|w| *w == [17, 0, 0xc3a1_0000, 0, 0])
+                    .count()
+                    != usize::from(first != 0)
+                {
+                    return TestResult::Fail("SDMA sync used a later IB's flags");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-flags",
+    navi22_sync_is_job_wide_and_gds_reset_is_per_compute_ib
+);
+
+fn navi22_unknown_gds_geometry_refuses_before_ring_access() -> TestResult {
+    use crate::amdgpu_discovery::GcInfo;
+    let (_pool, mut e) = gfx_engine();
+    let before = (
+        e.queue.wptr,
+        e.queue.seq,
+        e.hw.io.writes.len(),
+        e.hw.io.doorbells.len(),
+    );
+    let ib = Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: crate::amdgpu_uapi::AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID,
+    };
+    let good = GcInfo {
+        num_se: 2,
+        num_sa_per_se: 2,
+        num_cu_per_sa: 10,
+        ..Default::default()
+    };
+    let mut state = RingState::default();
+    state.configure_gds(Some(good));
+    if state.gds_max_wave_id != Some(1279) {
+        return TestResult::Fail("GDS limit did not use discovery maxima");
+    }
+    for gc in [
+        None,
+        Some(GcInfo::default()),
+        Some(GcInfo {
+            num_cu_per_sa: u32::MAX,
+            ..good
+        }),
+        Some(GcInfo {
+            num_cu_per_sa: 128,
+            ..good
+        }),
+    ] {
+        state.configure_gds(gc);
+        if state.gds_max_wave_id.is_some()
+            || submit(
+                &mut e.hw,
+                &mut e.queue,
+                &mut state,
+                Ring::Compute,
+                vm(),
+                1,
+                &[ib],
+            ) != Err(Error::Invalid)
+            || (
+                e.queue.wptr,
+                e.queue.seq,
+                e.hw.io.writes.len(),
+                e.hw.io.doorbells.len(),
+            ) != before
+        {
+            return TestResult::Fail("unknown GDS limit changed a queue or used a guessed value");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-flags",
+    navi22_unknown_gds_geometry_refuses_before_ring_access
+);
+
 /// A grant that flushes and maps the PASID (a VMID's first use).
 fn vm() -> VmRef {
     VmRef {
@@ -60,15 +388,18 @@ fn install(model: &mut Model, sdma: bool, value: u32) -> Ib {
     Ib {
         va: IB_VA,
         dwords: words.len() as u32,
+        flags: 0,
     }
 }
 
 fn gfx_engine() -> (crate::amdgpu_vram::Pool, GfxEngine<Model>) {
     let pool = pool(1 << 20);
     let queue = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx).unwrap();
+    let pipe1 = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING1, fence::Engine::Gfx).unwrap();
     let mut e = GfxEngine {
         hw: hw(enabled()),
         queue,
+        pipe1,
         state: GfxState::Prepared,
         proof: GfxProof::default(),
         golden: false,
@@ -103,7 +434,8 @@ fn navi22_submit_gfx_user_vmid_ib_executes_and_fences() -> TestResult {
         return TestResult::Fail("gfx user IB did not run under its flushed VMID");
     }
     // Same VM again: no second flush, no context switch, new fence.
-    let ib = install(&mut e.hw.io, false, 0x9abc_def0);
+    let mut ib = install(&mut e.hw.io, false, 0x9abc_def0);
+    ib.flags = crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC;
     let next = submit(
         &mut e.hw,
         &mut e.queue,
@@ -118,6 +450,7 @@ fn navi22_submit_gfx_user_vmid_ib_executes_and_fences() -> TestResult {
         || next != seq.wrapping_add(1)
         || e.hw.io.word(DST_MC) != 0x9abc_def0
         || e.hw.io.flushes.len() != 1
+        || e.hw.io.cache_syncs != [0]
     {
         return TestResult::Fail("same VM was re-flushed or second fence lost");
     }
@@ -161,8 +494,16 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
     if run(c.init_kiq()).is_err() || run(c.map_compute()).is_err() || run(c.test_ib()).is_err() {
         return TestResult::Fail("compute bring-up");
     }
-    let ib = install(&mut c.hw.io, false, 0x00c0_ffee);
+    let mut ib = install(&mut c.hw.io, false, 0x00c0_ffee);
+    ib.flags = crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC
+        | crate::amdgpu_uapi::AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID;
     let mut state = RingState::default();
+    state.configure_gds(Some(crate::amdgpu_discovery::GcInfo {
+        num_se: 2,
+        num_sa_per_se: 2,
+        num_cu_per_sa: 10,
+        ..Default::default()
+    }));
     let seq = submit(
         &mut c.hw,
         &mut c.compute,
@@ -176,6 +517,8 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         || c.hw.io.word(DST_MC) != 0x00c0_ffee
         || c.hw.io.user_ibs != [(2, VMID)]
         || c.hw.io.flushes != [(4, VMID)]
+        || c.hw.io.cache_syncs != [2]
+        || c.hw.io.gds_limits != [1279]
     {
         return TestResult::Fail("compute user IB did not run under its flushed VMID");
     }
@@ -194,7 +537,8 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
     if run(s.start()).is_err() || run(s.test_ib()).is_err() {
         return TestResult::Fail("SDMA bring-up");
     }
-    let ib = install(&mut s.hw.io, true, 0x5d5d_0001);
+    let mut ib = install(&mut s.hw.io, true, 0x5d5d_0001);
+    ib.flags = crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC;
     let mut state = RingState::default();
     let seq = submit(
         &mut s.hw,
@@ -209,6 +553,7 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         || s.hw.io.word(DST_MC) != 0x5d5d_0001
         || s.hw.io.user_ibs != [(4, VMID)]
         || s.hw.io.flushes != [(14, VMID)]
+        || s.hw.io.cache_syncs != [4]
     {
         return TestResult::Fail("SDMA user IB did not run under its flushed VMID");
     }
@@ -223,6 +568,7 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
     let ib = Ib {
         va: 0x1000,
         dwords: 4,
+        flags: 0,
     };
     let bad = [
         validate(Ring::Gfx, VmRef { vmid: 0, ..vm() }, &[ib]),
@@ -235,6 +581,7 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
             &[Ib {
                 va: 0x1002,
                 dwords: 4,
+                flags: 0,
             }],
         ),
         validate(
@@ -243,6 +590,7 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
             &[Ib {
                 va: 0x1000,
                 dwords: 0,
+                flags: 0,
             }],
         ),
         validate(
@@ -251,6 +599,7 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
             &[Ib {
                 va: 0x1010,
                 dwords: 4,
+                flags: 0,
             }],
         ),
     ];
@@ -314,6 +663,7 @@ fn navi22_submit_encodes_linux_vm_flush() -> TestResult {
             vm_fence: None,
             vmid: VMID,
             context_switch: true,
+            gds_max_wave_id: None,
             ibs: &[],
             fence: 0x2000,
             seq: 6,
@@ -360,7 +710,7 @@ fn navi22_submit_encodes_linux_vm_flush() -> TestResult {
                 0,
                 u32::from(PASID),
             ]
-        || words[31..34] != [packet3(PACKET3_CONTEXT_CONTROL, 1), 0x8101_8003, 0]
+        || words[38..41] != [packet3(PACKET3_CONTEXT_CONTROL, 1), 0x8101_8003, 0]
     {
         return TestResult::Fail("gfx VM flush / PASID map / context control encoding");
     }
@@ -376,6 +726,7 @@ fn navi22_submit_encodes_linux_vm_flush() -> TestResult {
             vm_fence: None,
             vmid: VMID,
             context_switch: false,
+            gds_max_wave_id: None,
             ibs: &[],
             fence: 0x2000,
             seq: 1,
@@ -477,6 +828,7 @@ fn job(
     let ib = Ib {
         va: IB_VA,
         dwords: pm4::write_data(DST_VA, value).len() as u32,
+        flags: 0,
     };
     let seq = submit(
         &mut e.hw,
@@ -765,6 +1117,7 @@ fn navi22_vmid_clients_on_two_rings_keep_their_own_translations() -> TestResult 
         &[Ib {
             va: IB_VA,
             dwords: words.len() as u32,
+            flags: 0,
         }],
     );
     let Ok(seq) = seq else {
@@ -814,6 +1167,7 @@ fn rdna2_vm_writeback_precedes_client_ib_and_job_fence() -> TestResult {
     let ibs = [Ib {
         va: IB_VA,
         dwords: 4,
+        flags: 0,
     }];
     let frame = Frame {
         gfx: true,
@@ -824,6 +1178,7 @@ fn rdna2_vm_writeback_precedes_client_ib_and_job_fence() -> TestResult {
         vm_fence: Some((0x3000, 7)),
         vmid: VMID,
         context_switch: true,
+        gds_max_wave_id: None,
         ibs: &ibs,
         fence: 0x4000,
         seq: 7,
@@ -1040,7 +1395,10 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
             return TestResult::Fail("invalid kernel job mutated ring or MMIO");
         }
     }
+    let layout = engine.hw.layout;
     let words = kernel_words(
+        layout,
+        0,
         &[KernelOp::Fill {
             dst: IB_MC,
             bytes: MAX_PACKET_BYTES + 4,
@@ -1050,7 +1408,31 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         9,
     )
     .unwrap();
-    if words[..10]
+    // amdgpu_ib_schedule brackets kernel copies/fills: SDMA0's NBIO HDP
+    // flush poll first, the HDP read-cache invalidate right before the fence.
+    let fence_words = pm4::sdma_fence(DST_MC, 9);
+    let tail = words.len() - fence_words.len();
+    if words[..6] != sdma_hdp_flush(layout, 0)[..]
+        || words[..6]
+            != [
+                8 | (1 << 26) | (3 << 28),
+                bank_reg(layout.nbio, HDP_FLUSH_DONE) << 2,
+                bank_reg(layout.nbio, HDP_FLUSH_REQ) << 2,
+                0x400,
+                0x400,
+                (0xfff << 16) | 10,
+            ]
+        || words[tail - 3..tail]
+            != [
+                14 | (0xf << 28),
+                bank_reg(layout.hdp, HDP_READ_CACHE_INVALIDATE),
+                1,
+            ]
+        || words[tail..] != fence_words[..]
+    {
+        return TestResult::Fail("kernel SDMA frame lacks Linux's HDP bracket");
+    }
+    if words[6..16]
         != [
             11,
             IB_MC as u32,
@@ -1071,4 +1453,79 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_kernel_sdma_fill_copy_and_validation
+);
+
+/// Mesa places IBs in the high half (`0xffff_8xxx_xxxx_xxxx`). VM lookups use
+/// the hole-stripped address, but the packet must carry the sign-extended
+/// one, as Linux emits `ib->gpu_addr = chunk_ib->va_start`: the CP raises
+/// `CP_GFX_ERROR.SUA_ERROR` on a stripped `0x0000_8xxx` (in-hole) address
+/// and never fetches the IB (RX 6750 XT, first client GFX job).
+fn navi22_high_half_ib_is_emitted_sign_extended() -> TestResult {
+    let l = crate::amdgpu_cp_navi22::tests::layout();
+    const CLIENT: u64 = 0xffff_8001_0021_8000;
+    let client = crate::amdgpu_cs::Ib {
+        va_start: crate::amdgpu_vm::strip_hole(CLIENT),
+        length_dw: 0xe0,
+        ip_type: 0,
+        ip_instance: 0,
+        ring: 0,
+        flags: 0,
+    };
+    let ib = Ib::from(&client);
+    if ib.va != 0x0000_8001_0021_8000 || ib.gpu_addr() != CLIENT {
+        return TestResult::Fail("stripped lookup address or sign-extended packet address wrong");
+    }
+    let low = Ib {
+        va: IB_VA,
+        dwords: 4,
+        flags: 0,
+    };
+    if low.gpu_addr() != IB_VA {
+        return TestResult::Fail("low-half address changed by sign extension");
+    }
+    let ibs = [ib];
+    let frame = Frame {
+        gfx: true,
+        engine: 0,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    let cp = encode_cp(l, &frame);
+    let Some(at) = cp
+        .iter()
+        .position(|&w| w == packet3(PACKET3_INDIRECT_BUFFER, 2))
+    else {
+        return TestResult::Fail("no INDIRECT_BUFFER");
+    };
+    if cp[at + 1] != 0x0021_8000 || cp[at + 2] != 0xffff_8001 {
+        return TestResult::Fail("gfx INDIRECT_BUFFER carries a stripped (in-hole) address");
+    }
+    let sdma = encode_sdma(
+        l,
+        &Frame {
+            gfx: false,
+            engine: 4,
+            ..frame
+        },
+    );
+    let Some(at) = sdma.iter().position(|&w| w == 4 | u32::from(VMID) << 16) else {
+        return TestResult::Fail("no SDMA INDIRECT");
+    };
+    if sdma[at + 1] != 0x0021_8000 || sdma[at + 2] != 0xffff_8001 {
+        return TestResult::Fail("SDMA INDIRECT carries a stripped (in-hole) address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_high_half_ib_is_emitted_sign_extended
 );

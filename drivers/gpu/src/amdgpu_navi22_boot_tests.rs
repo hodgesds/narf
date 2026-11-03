@@ -604,6 +604,44 @@ fn navi22_boot_fence_interrupts_map_to_their_engine() -> TestResult {
     }
     TestResult::Pass
 }
+fn navi22_cp_faults_target_only_owned_queues() -> TestResult {
+    use crate::{amdgpu_fence_navi22::Engine, amdgpu_ih_navi22::Iv};
+    for src in [183, 184, 185] {
+        let mut iv = Iv {
+            client: 0x14,
+            src,
+            vmid: 3,
+            pasid: 17,
+            ..Iv::default()
+        };
+        assert_eq!(cp_fault_engine(&iv), Some(Engine::Gfx));
+        iv.ring_id = 0x04;
+        assert_eq!(
+            cp_fault_engine(&iv),
+            (src != 185).then_some(Engine::Compute)
+        );
+        for ring_id in [0x01, 0x05, 0x09, 0x10, 0x14, 0x24, 0x7f] {
+            iv.ring_id = ring_id;
+            assert_eq!(cp_fault_engine(&iv), None, "unowned ring {ring_id:#x}");
+        }
+        iv.ring_id = 0;
+        iv.client = 8;
+        assert_eq!(cp_fault_engine(&iv), None);
+    }
+    for src in [0, 181, 182, 186, 224] {
+        let iv = Iv {
+            client: 0x14,
+            src,
+            ..Iv::default()
+        };
+        assert_eq!(cp_fault_engine(&iv), None);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-cp-faults",
+    navi22_cp_faults_target_only_owned_queues
+);
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_boot_fence_interrupts_map_to_their_engine

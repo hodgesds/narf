@@ -219,7 +219,7 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         }
         // Whole-object GEM view, writable; snapshot is not yet published.
         let whole = state
-            .mmap_backing(u64::from(handle) << 12, 3 * 4096)
+            .mmap_backing(crate::amdgpu_gem::mmap_offset(handle), 3 * 4096)
             .map_err(|_| "GEM mmap backing failed")?;
         if whole.memory_type != MemoryType::WriteCombining
             || !map(&parent, va_rw, &whole.frames, true, whole.memory_type)
@@ -314,7 +314,7 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         let refused = relocate(&object, false);
         drop(lease);
         let legacy = state
-            .mapping_object(u64::from(handle) << 12, 4096)
+            .mapping_object(crate::amdgpu_gem::mmap_offset(handle), 4096)
             .ok_or("legacy mapping failed")?;
         let refused_legacy = relocate(&object, false);
         drop(legacy);

@@ -47,8 +47,9 @@
 //! that can allocate, or console output happens under it, so the allocator
 //! or a console write can never recurse into it. A per-CPU re-entrancy
 //! guard ([`IN_RECORD`]) still short-circuits a record attempted from an NMI
-//! or fault on the CPU that already holds the lock. The trap and panic sinks
-//! in `lib.rs` never touch the store at all.
+//! or fault on the CPU that already holds the lock. Trap output only tries
+//! the lock; a contended store must never prevent its physical-console output.
+//! The panic sink does not enter the store.
 
 extern crate alloc;
 
@@ -759,6 +760,27 @@ pub fn record_level(level: u32, s: &str) {
     let ts = now_ns();
     let cpu = narf_lib::percpu::current_cpu();
     let _ = with_store(|st| st.append(level.min(7) as u8, ts, cpu, s.as_bytes()));
+}
+
+/// Best-effort trap text: never wait for a store lock the interrupted code
+/// (or a stopped peer) may hold. Keep the ordinary continuation and timestamp
+/// format so kmsg readers and persistent-log exports can capture diagnostics
+/// on hosts without an attached serial console. No allocation or console I/O.
+pub(crate) fn try_record_trap(s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    if IN_RECORD.load(Ordering::Acquire) == cpu {
+        return;
+    }
+    let ts = now_ns();
+    let Some(mut store) = RING.try_lock() else {
+        return;
+    };
+    IN_RECORD.store(cpu, Ordering::Release);
+    store.append(DEFAULT_MESSAGE_LOGLEVEL as u8, ts, cpu, s.as_bytes());
+    IN_RECORD.store(usize::MAX, Ordering::Release);
 }
 
 /// Store one complete message from userspace (`/dev/kmsg` write) with an

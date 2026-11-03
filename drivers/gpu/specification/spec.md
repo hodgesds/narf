@@ -72,6 +72,14 @@ rest of that backend. Generic DRM/DP fixtures stay enabled with either or
 both vendors disabled. The registration census has its own test subsystem,
 `drivers/gpu/vendor_features`, for focused boot checks.
 
+The DRM framebuffer hook distinguishes a kernel copy destination from a
+userspace-mappable fbdev backing. A rebased boot framebuffer can receive DRM
+copies through its kernel mapping only while its live physical range and
+geometry match the original boot publication. The CPU copy retains a scanout
+epoch lease. Adopted native scanouts require their owner's live publication;
+boot GPU quarantine refuses copy targets. This does not grant a physical
+fbdev mmap of rebased generic scanouts.
+
 ### Intel scanout takeover and restore
 
 `intel_gpu_modeset::Modeset::modeset_fixed` and
@@ -1911,7 +1919,8 @@ dmub_tables, atom_pixclk, connector}`. Switches
 corresponding `amdgpu.navi22_*` spellings remain aliases; the canonical name
 wins. Defaults: native display, accel and hardware cursor on; multi-display
 off (secondary CRTCs cannot present or deliver vblank yet). `power_saving` is
-the `amdgpu.rdna2_pg=` list, or `DEFAULT_POWER_SAVING` (every feature) when
+the `amdgpu.rdna2_pg=` list, or `DEFAULT_POWER_SAVING` (every feature except
+`gfxoff`, which Linux enables only at SMU init alongside its GFX siblings) when
 absent; `=none|off|0` or an empty value applies nothing. The first canonical
 power value takes precedence over the first legacy value, including an empty
 or invalid canonical value; invalid power lists enable nothing. Defaulted
@@ -2050,16 +2059,25 @@ MEMORY. VRAM_USAGE and VIS_VRAM_USAGE report the open's card heap usage (zero
 without a registered heap); GTT_USAGE reports that shared system-memory usage.
 These are byte counts, not per-open allocations; retained PRIME/mmap/job owners
 continue to count after handle closure. Replies retain Linux's short-copy rule.
-`Snapshot::navi22: Published { topology, pci_revision,
+`Snapshot::navi22: Published { topology, chip_revision, pci_revision,
 boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
 (cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
+`publish_rdna2_board` (the NBIO ATI revision strap, sampled independently
+of GC harvesting before cold boot),
 `publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`
 (after a successful cold boot, from `ColdBoot::uapi_versions` and the
 report). Unpublished inputs leave the corresponding fields zero.
+`DEV_INFO.chip_rev` and `external_rev` use `chip_revision`, so a failed GC
+harvest cannot erase a successfully read chip identity. Unknown CU/RB/TCC
+harvest data remains zero; no board-specific topology is substituted.
 `amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
-`available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
+`available_rings`, HW_IP_COUNT, the DRM minor (3.64.0 vs
 3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
-unless `Boot::queues_verified`. Media IPs additionally need
+unless `Boot::queues_verified`. `DEV_INFO.ids_flags` never claims
+`AMDGPU_IDS_FLAGS_GANG_SUBMIT`: the native backend runs one scheduler entity
+per ioctl, and `amdgpu_navi22_cs` rejects IBs naming different
+`(ip_type, ip_instance, ring)` tuples (even two logical compute rings that
+share hardware ring 1) before dependency waits or placement. Media IPs additionally need
 `Published::media_rings` (`publish_navi22_media_rings`, from
 `amdgpu_vcn_navi22_cs::register`): VCN_DEC/ENC/JPEG report one ring each
 when their rings passed, HW_IP_COUNT(VCN_DEC/ENC) is `num_vcn_inst` (every
@@ -2072,9 +2090,14 @@ reports
 selector ownership with RLC booted and GFX powered. It samples the NBIO
 revision strap, GB_ADDR_CONFIG, per-SE/SA fused and user RB/WGP disables and
 the TCC disables, restores SE/SA broadcast within one capability operation,
-and checks selector readback using only GRBM_GFX_INDEX's defined fields;
-reserved read bits cannot invalidate a correct selection. A mismatch in a
-defined selector or broadcast field still fails with `Readback`.
+without requiring GRBM_GFX_INDEX to echo the selector, following Linux's
+`gfx_v10_0_select_se_sh`. The RX 6750 XT returns zero for that register
+under Linux's locked `amdgpu_regs2` API, including after broadcast; that
+readback cannot validate selection. Harvest reads still reject all-ones
+device loss, and broadcast is restored on a failed per-array read.
+`unsafe read_revision(gpu, pci_cap)` reads only the read-only NBIO strap,
+under current capability authority and exclusive permanent BAR ownership;
+it needs neither GRBM selection nor powered GC.
 `derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
 `gfx_v10_0_get_cu_info` and `gfx_v10_0_get_tcc_info`. A zero or non-256 B
 interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
@@ -7451,8 +7474,26 @@ copied at the commit. Dumb buffers are such GEM buffers in VRAM (below) and take
 this path; only one of the card's own system-memory dumb buffers, made
 while no VRAM heap was up, is still CPU-copied.
 
-**Dumb buffers in VRAM.** On the native card, once its client VRAM heap is
-registered (`drm_ioctl_bridge::amdgpu_vram_dumb`), `DriCardFile` answers
+**Native GEM handles and mmap offsets.** AMD render opens and native RDNA2 /
+GFX12 primary opens allocate compact nonzero GEM handles starting at one.
+CREATE_DUMB, GEM_CREATE, USERPTR and PRIME imports on a native primary share
+its one per-open object table. Another open's same-numbered handle names
+only that other open's object. Counter exhaustion returns NoSpace permanently,
+without wrapping onto a live id. Native primary-node selection is made when
+the file opens from its published KMS capabilities. Legacy primary cards that
+still use the separate card-global dumb table retain their disjoint large
+handle range; compact primary handles are not claimed for that older path.
+
+GEM_MMAP and native MAP_DUMB return the opaque byte offset
+`(0x40000000 + u64::from(handle)) << 12`. The high tag belongs only to the
+mmap-offset namespace; exposing it as the GEM handle makes libdrm 2.4.134's
+dense `handle_table_insert` allocate and clear over 8 GiB on its first buffer.
+All GEM mmap entry points remove that tag, reject unaligned or out-of-range
+offsets and resolve only the opener's table. Existing CPU-mapping permission,
+memory-type, revocation and lifetime checks continue to apply.
+
+**Dumb buffers in VRAM.** On native RDNA2 and GFX12 primary cards
+(`drm_ioctl_bridge::amdgpu_vram_dumb`), `DriCardFile` answers
 CREATE_DUMB as amdgpu_mode_dumb_create (`drm_ioctl_bridge::amdgpu_dumb`,
 `GemState::create_dumb`): drm_mode_create_dumb's checks, the pitch of
 `amdgpu_gem::align_pitch` and the page-rounded size (`dumb_layout`), in
@@ -7467,11 +7508,13 @@ domains VRAM | GTT. Full visible VRAM first evicts idle unmapped buffers
 (`evict_visible_locked`), and from a user open (`amdgpu_create_dumb_async`,
 `amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram_locked`, shared
 with GEM_CREATE's strict path); there is no GTT fallback, so it is then
-ENOMEM. MAP_DUMB and DESTROY_DUMB of one of an open's amdgpu GEM handles,
+ENOMEM. An absent native heap returns NoDevice instead of falling back to
+the card-global dumb table and creating an overlapping handle. MAP_DUMB and
+DESTROY_DUMB of one of an open's amdgpu GEM handles,
 on any amdgpu card, are amdgpu_mode_dumb_mmap (`GemState::map_dumb`: the
 GEM_MMAP offset, EPERM for a userptr or NO_CPU_ACCESS buffer) and
-drm_gem_handle_delete (`destroy_dumb`); other handles fall through to the
-card's table. mmap of the offset is the revocable CPU-mapping backing
+drm_gem_handle_delete (`destroy_dumb`); the legacy primary path still falls
+through to its card table for generic dumb handles. mmap of the offset is the revocable CPU-mapping backing
 (`cpu_mapping::backing`) over the buffer's BAR window, which follows the
 buffer when it moves. ADDFB2 of the handle is `amdgpu_addfb2_bo`, so
 showing it pins it and scans it out in place as above. Native amdgpu user
@@ -8764,6 +8807,17 @@ once every queue is verified, then subscribes to `GFX_EOP`, `SDMA0_TRAP` and
 `SDMA1_TRAP` and spawns one forwarder per source that calls
 `amdgpu_fence_navi22::notify` for the decoded engine (`notify_all` on a
 terminal IH error). A subscription failure only logs; fences keep polling.
+The same stage enables `gfx_v10_0_late_init`'s CP error interrupts on the
+owned queues — `PRIV_REG_INT_ENABLE`, `OPCODE_ERROR_INT_ENABLE` and (GFX
+`CP_INT_CNTL_RING0` only) `PRIV_INSTR_INT_ENABLE`, beside the existing
+`TIME_STAMP_INT_ENABLE` on `CP_INT_CNTL_RING0` and `CP_ME1_PIPE0_INT_CNTL`
+— and subscribes to GC sources 183 (`CP_BAD_OPCODE_ERROR`), 184
+(`CP_PRIV_REG_FAULT`) and 185 (`CP_PRIV_INSTR_FAULT`). A fault whose
+ME/pipe/queue names the owned GFX or MEC1 pipe 0 queue 0 marks only that
+queue's jobs guilty (`amdgpu_navi22_cs::hung`); other queues or a
+privileged-instruction fault on compute accuse nothing. Callbacks and the
+watchdog carry the fence generation, so a stale source cannot poison a
+recovered submitter. Fault messages are bounded and failure-only.
 
 GC 10.3.2 runs without MES. `amdgpu_cp_navi22::Doorbells::map_navi22(device)`
 (unsafe, boot-time) maps BAR2's first 4 KiB uncached; kernel doorbells use the
@@ -8798,8 +8852,22 @@ non-repeatable state and retains published memory. Register polls are bounded
 by 100 ms and fences by 1 s. `amdgpu_fence_navi22::{notify, notify_all}` are
 the IH hook: an EOP/trap consumer calls them so fence waits re-sample at once;
 without it waits poll every 1 ms. `QueueProof` aggregates the three proofs.
-Clock gating, GFXOFF, the cleaner shader and Linux's second gfx ring are not
-enabled. These are kernel bring-up rings, not a submission API.
+GC 10.3 has two gfx rings (`GFX10_NUM_GFX_RINGS_Sienna_Cichlid`), brought up
+on Linux's default async path (`amdgpu_async_gfx_ring` = 1,
+`gfx_v10_0_cp_async_gfx_ring_resume`), not the direct `CP_RB0/RB1` path.
+`Gfx::prepare_queues` writes a v10 gfx MQD per ring (`gfx_v10_0_gfx_mqd_init`
+under that ring's ME0 pipe selection; ring 1 on pipe 1 is the high-priority
+queue) into the queue's EOP slot (ring 0's MQD slot holds the RLC CSIB) and
+sets the global doorbell range from ring 0 only. `Compute::map_gfx`
+(`amdgpu_gfx_enable_kgq`) flushes HDP, sends one KIQ MAP_QUEUES with
+ENGINE_SEL 4 per ring and ring-tests the KIQ. `Gfx::start_mapped` then runs
+`gfx_v10_0_cp_gfx_start` (CSB on ring 0, CLEAR_STATE on ring 1) and ring-tests
+both rings, as `gfx_v10_0_cp_resume`. Ring 1 (doorbell
+`AMDGPU_NAVI10_DOORBELL_GFX_RING1 << 1`, its own 24 KiB queue) carries no
+client work and no fences. A KIQ mapping failure leaves both owners Failed.
+The cleaner shader is not enabled at bring-up; clock gating and GFXOFF are
+applied later by the power-saving opt-in. These are kernel bring-up rings,
+not a submission API.
 
 ### Navi 22 runtime power, thermal and recovery
 
@@ -8868,10 +8936,23 @@ with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
 queues all verified, a task samples every 250 ms, under the owner lock,
 `Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
 (`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
-after an HDP invalidate; an all-ones read-back is device loss). The per-engine
+after an HDP invalidate; an all-ones read-back is device loss). The sample
+reads no GC register, so like Linux's fence timeout it takes no GFXOFF
+reference and never wakes an idle GPU. The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
 advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
 emitted seq=…` once and is retained in `tdr::status()`. Detection is always on.
+After a GFX timeout, the retained owner also samples CP/GRBM, current IB,
+GC10.3 VM fault registers, CE/DE state (CE header/instruction pointer, CE IB1,
+CE/DE handshake counters, CE and DE ring ROQ status, `CP_ME_CNTL`, the live
+`GRBM_GFX_CNTL` selection, CPF status, `CP_RB1_RPTR`, `RLC_STAT`), fence writebacks and a bounded ring window around
+the hardware read pointer. The snapshot uses live PCI authority and a GFXOFF
+reference; only HDP read-cache invalidation is written. It does not change
+selectors, CP/VM control, queue pointers or submissions. Serial reporting runs
+after releasing the owner and power reference, before attempted recovery.
+There are no extra samples or records on the submission or trap paths. These
+reads are sequential observations, not an atomic snapshot or proof of client
+IB execution; capture refusal is logged for a lost/revoked device.
 `unsafe tdr::set_automatic_recovery(bool)` (Linux `amdgpu_gpu_recovery`) makes
 a detected hang call `recover()`; the fb boot handoff enables it on RX 6000
 unless `amdgpu.gpu_recovery=0`, after installing the console hook below. At
@@ -8881,8 +8962,10 @@ logged. Explicit `recover()` calls are not counted.
 
 `amdgpu_navi22_platform::set_recovery_console_hook(fn(bool))` installs the
 fb owner's pause (`true`) / resume (`false`) of every kernel CPU writer of the
-boot framebuffer. `recover()` pauses through it before the reset, withdraws
-the runtime power controls, and after success resets the requested power
+boot framebuffer. Only after `check` accepts the recovery does backend
+quiesce unregister the client submitter, pause the console through it and
+withdraw the runtime power controls; a refused (`Unsupported`) recovery
+leaves clients, console and controls untouched. After success recovery resets the requested power
 opt-in to none, republishes the controls and resumes the console; a lost
 device keeps the console quarantined. User CPU mappings of VRAM are not
 revoked during a reset, as in Linux (their accesses reach an unresponsive BAR
@@ -8891,8 +8974,10 @@ and the contents are lost).
 `unsafe amdgpu_navi22_platform::recover().await` is
 `amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
 stored outside the future). `check` refuses (`Unsupported`, no side effects) a
-boot that needed GDDR6 training (no short-training replay yet) or lacks a board
-table, PSP or IH. Quiesce stops VCN idle work, TDR, telemetry and thermal, disables the IH ring
+boot that needed GDDR6 training or lacks a board table, PSP or IH: the shared
+`gddr6::Trainer::resume` replay exists (RDNA4 wires it), but RDNA2 recovery
+reconstruction drops the trainer, so retention, replay order and
+cancellation are not yet wired for this ASIC. Quiesce stops VCN idle work, TDR, telemetry and thermal, disables the IH ring
 (every subscriber gets `Disabled`) and calls `amdgpu_fence_navi22::abandon_all`,
 which ends every pending fence wait with its error. Reinitialize consumes the
 owner (`ColdBoot::into_recovery`: same snapshot, authority, pool and prepared
@@ -9139,11 +9224,36 @@ gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) when `flush`, the
 `IH_VMID_<vmid>_LUT` ← PASID write (`gmc_v10_0_emit_pasid_mapping`, at the
 queue layout's OSSSYS base) when `map_pasid` — preceded by a pipeline sync
 when the job flushes or its context differs from the ring's previous job's
-(`RingState`), then CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16 IBs with
-the VMID, then the ring fence. `validate` refuses VMID 0/>15,
+(`RingState`), then (as `amdgpu_ib_schedule`) a ring-ordered HDP flush
+(CP: WAIT_REG_MEM write-wait on NBIO `BIF_BX_PF_GPU_HDP_FLUSH_REQ/DONE`, CP0
+on gfx/PFP, CP2 on compute/ME; SDMA0/1: POLL_REGMEM with HDP_FLUSH; SDMA2/3:
+SRBM write of the remapped `HDP_MEM_FLUSH_CNTL` at 0x7f000), then
+CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16 IBs with the VMID,
+FRAME_CONTROL end on gfx, an HDP read-cache invalidate
+(`HDP_READ_CACHE_INVALIDATE` ← 1 by WRITE_DATA / SRBM_WRITE), the ring fence,
+and SWITCH_BUFFER on gfx. These engine commands are in addition to the CPU
+HDP flush before the doorbell and the CPU invalidate before fence reads.
+Kernel SDMA jobs (`submit_kernel`, `KernelOp::{Fill, Copy}` for the RDNA2
+VRAM clear/upload/readback paths) carry the same HDP flush before and
+invalidate after their packets, before the fence. `validate` refuses VMID 0/>15,
 empty or oversized IB lists, unaligned or zero-length IBs. At most two
 submissions are outstanding per ring; a third returns `Busy` without
 touching the ring.
+
+Native `Ib { va, dwords, flags }` retains the validated client's flags
+through both queue adapters. As `amdgpu_ib_schedule` does, only the first
+IB's `AMDGPU_IB_FLAG_EMIT_MEM_SYNC` requests a job-wide whole-cache sync:
+GC10 ACQUIRE_MEM before context control and the IBs, or SDMA5 GCR_REQ
+before the aligned INDIRECT packets. Each compute IB carrying
+`AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID` is preceded by SET_CONFIG_REG of
+GDS_COMPUTE_MAX_WAVE_ID. `ColdBoot::submit` configures `RingState`'s limit
+from discovery maxima (`num_se * num_sa_per_se * num_cu_per_sa * 32 - 1`,
+as `gfx_v10_0_set_gds_init`), independent of harvested CU counts. Missing,
+zero, overflowing or out-of-field geometry refuses that request before
+any ring access; no board-specific limit is guessed. Graphics and SDMA
+ignore the compute-only flag as their Linux emitters do. Existing
+PREEMPT/PREAMBLE behavior remains without hardware preemption; secure
+and CE requests remain rejected by the native adapter.
 
 `amdgpu_navi22_cs::{register, unregister, Submitter, ring_id, ring_index,
 job_done, drm_card}` plug the card into the generic render path: after a cold
@@ -9910,7 +10020,10 @@ geometry, and provides a LINEAR-only `IN_FORMATS` blob. Publication selects
 the same PCI-identified RDNA2 card as the submission backend.
 
 `Card::addfb2_bo` accepts those linear GEM framebuffers on a native atomic
-amdgpu card without GFX12 capabilities. Nonlinear modifiers, DCC and other
+amdgpu card without GFX12 capabilities. The primary file's ADDFB/ADDFB2
+dispatcher admits that same card and looks up its own AMDGPU GEM handle
+table before generic dumb-buffer dispatch. This admission does not require
+GFX12 modifiers. Nonlinear modifiers, DCC and other
 formats are rejected. The async KMS entry resolves synthetic-primary targets
 as well as native-plane targets, prepares their VRAM placement outside the
 KMS lock, and revalidates master and targets before commit. TEST_ONLY prepares
@@ -10375,7 +10488,10 @@ paths; only the tables differ.
 - Submission (`amdgpu_cs`): a card registers a `Submitter`
   (`register_submitter`); on such a card the `/dev/dri` ioctl route
   (`dispatch_async`, for card and render nodes) queues a validated
-  `AMDGPU_CS` and returns the engine's sequence as the handle, and
+  `AMDGPU_CS` and returns the engine's sequence as the handle (an IB's
+  `Ib::va_start` is hole-stripped for VM lookups; every IB packet carries
+  `amdgpu_vm::sign_extend(va_start)`, as Linux emits `ib->gpu_addr`, since
+  the CP rejects an in-hole address with `CP_GFX_ERROR.SUA_ERROR`), and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
   monotonic deadline passes (status 0/1; a negative s64 deadline waits
   forever, `amdgpu_gem_timeout`). Every `drm_amdgpu_fence`-shaped handle

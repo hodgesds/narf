@@ -53,8 +53,10 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::task::{Poll, Waker};
 
+use narf_lib::readiness::Readiness;
 use narf_lib::smp;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -399,6 +401,9 @@ pub struct Kobject {
     children: IrqSafeSpinLock<Vec<Arc<Kobject>>>,
     /// Text attribute files (`show` callbacks).
     attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrShow>>,
+    /// Lazily allocated kernfs notification state, shared by all opens of an
+    /// attribute. The observed event is separate in each `SysAttrFile`.
+    attr_events: IrqSafeSpinLock<BTreeMap<&'static str, Arc<AttrEvents>>>,
     /// Write callbacks for read-write attributes.
     /// Linux ref: `struct attribute / store` (include/linux/sysfs.h:26).
     store_attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrStore>>,
@@ -430,6 +435,7 @@ impl Kobject {
             parent: None,
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            attr_events: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -446,6 +452,7 @@ impl Kobject {
             parent: Some(parent.clone()),
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            attr_events: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -728,6 +735,17 @@ where
     kobj.attrs.lock().insert(name, Arc::new(show));
 }
 
+/// Notify poll/epoll observers of a text attribute after publishing its value.
+/// Linux's `kernfs_notify` advances a shared event and wakes the attribute's
+/// wait queue; each open consumes that event only when it reads the attribute.
+pub fn kobject_notify(kobj: &Kobject, name: &str) {
+    let events = kobj.attr_events.lock().get(name).cloned();
+    if let Some(events) = events {
+        events.generation.fetch_add(1, Ordering::Release);
+        events.waiters.notify(crate::POLL_PRI | crate::POLL_ERR);
+    }
+}
+
 /// Add a binary attribute to a kobject.
 /// Linux ref: `sysfs_create_bin_file` (fs/sysfs/bin.c:209).
 pub fn kobject_add_bin_attr(kobj: &Kobject, name: &'static str, read: BinAttrRead) {
@@ -996,6 +1014,19 @@ pub fn populate_tty_class() {
     let dev_char = get_or_create_child(&dev_dir, "char");
     let _dev_block = get_or_create_child(&dev_dir, "block");
     dev_char.add_symlink("4:64", "../../devices/virtual/tty/ttyS0");
+}
+
+/// Called after a logical VT switch, with the VT state lock released. logind
+/// watches this attribute with an empty epoll interest mask: POLL_ERR must
+/// still wake it so it can refresh the active session and device ACLs.
+pub(crate) fn notify_tty_active() {
+    let tty0 = get_root()
+        .get_child("class")
+        .and_then(|class| class.get_child("tty"))
+        .and_then(|tty| tty.get_child("tty0"));
+    if let Some(tty0) = tty0 {
+        kobject_notify(&tty0, "active");
+    }
 }
 
 /// Contents of `/sys/class/tty/console/active`.
@@ -1788,7 +1819,34 @@ pub(crate) fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::
     s
 }
 
+// Serialize the initial snapshot with late registration/removal, including
+// notification order. The router never holds its device lock in this callback.
+static INPUT_PUBLICATION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+
 pub fn populate_input_class() {
+    class_register("input");
+    narf_input::evdev::ROUTER.set_device_change_hook(input_device_changed);
+    for id in narf_input::evdev::ROUTER.device_ids() {
+        publish_input_device(id, false);
+    }
+}
+
+fn input_device_changed(
+    _router: &narf_input::evdev::Router,
+    id: narf_input::evdev::DeviceId,
+    change: narf_input::evdev::DeviceChange,
+) {
+    match change {
+        narf_input::evdev::DeviceChange::Added => publish_input_device(id, true),
+        narf_input::evdev::DeviceChange::Removed => unpublish_input_device(id),
+    }
+}
+
+fn publish_input_device(id: narf_input::evdev::DeviceId, emit: bool) {
+    let _publication = INPUT_PUBLICATION.lock();
+    if narf_input::evdev::ROUTER.caps(id).is_none() {
+        return;
+    }
     let class_input = class_register("input");
     let root = get_root();
     // Mirror Linux's /sys/devices/.../inputN/eventN topology. This is
@@ -1856,122 +1914,79 @@ pub fn populate_input_class() {
     // udev scandir()s both /sys/dev/{char,block}; keep block present too.
     let _dev_block = get_or_create_child(&dev_dir, "block");
 
-    for id in narf_input::evdev::ROUTER.device_ids() {
-        let n = id.0.saturating_sub(1);
-        let minor = 64 + n;
+    let n = id.0.saturating_sub(1);
+    let minor = 64 + n;
+    // Refreshing sysfs must preserve existing kobject identity. A device
+    // arriving concurrently with the initial snapshot is published once.
+    if narf_input.get_child(&format!("input{}", n)).is_some() {
+        return;
+    }
 
-        // The device's registered identity (name/phys/id) — sysfs and
-        // the parent uevent report the transport's real values, not a
-        // per-index synthetic name.
-        let caps = narf_input::evdev::ROUTER.caps(id);
-        let dev_name = caps
-            .as_ref()
-            .map(|c| c.name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| format!("narf-input{}", n));
-        let dev_phys = caps.as_ref().map(|c| c.phys.clone()).unwrap_or_default();
-        let dev_uniq = caps.as_ref().map(|c| c.uniq.clone()).unwrap_or_default();
-        let dev_id = caps
-            .as_ref()
-            .map(|c| c.id)
-            .unwrap_or(narf_input::evdev::InputId::new(
-                narf_input::evdev::bus::VIRTUAL,
-                0,
-                0,
-                0,
-            ));
+    // The device's registered identity (name/phys/id) — sysfs and
+    // the parent uevent report the transport's real values, not a
+    // per-index synthetic name.
+    let caps = narf_input::evdev::ROUTER.caps(id);
+    let dev_name = caps
+        .as_ref()
+        .map(|c| c.name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("narf-input{}", n));
+    let dev_phys = caps.as_ref().map(|c| c.phys.clone()).unwrap_or_default();
+    let dev_uniq = caps.as_ref().map(|c| c.uniq.clone()).unwrap_or_default();
+    let dev_id = caps
+        .as_ref()
+        .map(|c| c.id)
+        .unwrap_or(narf_input::evdev::InputId::new(
+            narf_input::evdev::bus::VIRTUAL,
+            0,
+            0,
+            0,
+        ));
 
-        // ── Parent input device: /sys/devices/platform/narf-input/inputN ──
-        let inputn = Kobject::new_child(narf_input.clone(), format!("input{}", n));
-        {
-            let attr_name = dev_name.clone();
-            kobject_add_attr(&inputn, "name", move || format!("{}\n", attr_name));
-        }
-        {
-            let attr_phys = dev_phys.clone();
-            kobject_add_attr(&inputn, "phys", move || format!("{}\n", attr_phys));
-        }
-        {
-            let attr_uniq = dev_uniq.clone();
-            kobject_add_attr(&inputn, "uniq", move || format!("{}\n", attr_uniq));
-        }
-        // (The id quartet rides the uevent PRODUCT= line below; the
-        // sysfs `id/` subdirectory shape is a follow-up, not faked
-        // here with slash-named attrs the VFS cannot walk.)
-        // A `uevent` file is what sd_device_new_from_syspath uses to accept a
-        // directory as a device (so the parent walk resolves it). Writable, like
-        // the child eventN below: `udevadm trigger --action=add` walks /sys and
-        // writes "add" to every device's uevent file — including this parent
-        // input *device* node. Without a store, that write hits ReadOnly and no
-        // parent-device ADD is ever broadcast, so real udevd never runs its
-        // input rules against inputN and never writes /run/udev/data/+input:inputN
-        // (the seat-tag DB file libinput needs — see the topology comment above).
-        // In Linux EVERY kobject's uevent attr is writable (`uevent_store`,
-        // drivers/base/core.c:2453); mirror that. Weak ref avoids a closure↔kobject
-        // refcount cycle.
-        {
-            let pu = format!(
-                "PRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"{}\"\nPHYS=\"{}\"\nUNIQ=\"{}\"\n",
-                dev_id.bustype,
-                dev_id.vendor,
-                dev_id.product,
-                dev_id.version,
-                dev_name,
-                dev_phys,
-                dev_uniq
-            );
-            let weak = alloc::sync::Arc::downgrade(&inputn);
-            kobject_add_writable_attr(
-                &inputn,
-                "uevent",
-                move || pu.clone(),
-                move |data: &[u8]| {
-                    if let Some(k) = weak.upgrade() {
-                        kobject_emit_uevent_from_write(&k, data);
-                    }
-                    Ok(())
-                },
-            );
-        }
-        // subsystem → /sys/class/input (basename "input"). From
-        // /sys/devices/platform/narf-input/inputN that is four levels up.
-        inputn.add_symlink("subsystem", "../../../../class/input");
-
-        // ── evdev char node: …/inputN/eventN ──
-        let eventn = Kobject::new_child(inputn.clone(), format!("event{}", n));
-        {
-            let dev = format!("13:{}\n", minor);
-            kobject_add_attr(&eventn, "dev", move || dev.clone());
-        }
-        // Capability bitmaps (EV/KEY/REL/ABS) so udev tags ID_INPUT* and
-        // libinput classifies + opens the device. Sourced from the live
-        // router so they match what EVIOCGBIT reports on /dev/input/eventN.
-        let caps_lines = narf_input::evdev::ROUTER
-            .caps(id)
-            .map(|c| evdev_caps_uevent(&c))
-            .unwrap_or_default();
-        let uevent = format!(
-            "MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\nPRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"{}\"\nPHYS=\"{}\"\nUNIQ=\"{}\"\n{}",
-            minor,
-            n,
+    // ── Parent input device: /sys/devices/platform/narf-input/inputN ──
+    let inputn = Kobject::new_child(narf_input.clone(), format!("input{}", n));
+    {
+        let attr_name = dev_name.clone();
+        kobject_add_attr(&inputn, "name", move || format!("{}\n", attr_name));
+    }
+    {
+        let attr_phys = dev_phys.clone();
+        kobject_add_attr(&inputn, "phys", move || format!("{}\n", attr_phys));
+    }
+    {
+        let attr_uniq = dev_uniq.clone();
+        kobject_add_attr(&inputn, "uniq", move || format!("{}\n", attr_uniq));
+    }
+    // (The id quartet rides the uevent PRODUCT= line below; the
+    // sysfs `id/` subdirectory shape is a follow-up, not faked
+    // here with slash-named attrs the VFS cannot walk.)
+    // A `uevent` file is what sd_device_new_from_syspath uses to accept a
+    // directory as a device (so the parent walk resolves it). Writable, like
+    // the child eventN below: `udevadm trigger --action=add` walks /sys and
+    // writes "add" to every device's uevent file — including this parent
+    // input *device* node. Without a store, that write hits ReadOnly and no
+    // parent-device ADD is ever broadcast, so real udevd never runs its
+    // input rules against inputN and never writes /run/udev/data/+input:inputN
+    // (the seat-tag DB file libinput needs — see the topology comment above).
+    // In Linux EVERY kobject's uevent attr is writable (`uevent_store`,
+    // drivers/base/core.c:2453); mirror that. Weak ref avoids a closure↔kobject
+    // refcount cycle.
+    {
+        let pu = format!(
+            "PRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"{}\"\nPHYS=\"{}\"\nUNIQ=\"{}\"\n",
             dev_id.bustype,
             dev_id.vendor,
             dev_id.product,
             dev_id.version,
             dev_name,
             dev_phys,
-            dev_uniq,
-            caps_lines
+            dev_uniq
         );
-        // Writable so `udevadm trigger` (which writes "add"/"change" to the
-        // uevent file) makes the kernel broadcast a netlink uevent. Weak ref
-        // so the attr closure doesn't pin the kobject in a cycle. Linux ref:
-        // `uevent_store` (drivers/base/core.c:2453).
-        let weak = alloc::sync::Arc::downgrade(&eventn);
+        let weak = alloc::sync::Arc::downgrade(&inputn);
         kobject_add_writable_attr(
-            &eventn,
+            &inputn,
             "uevent",
-            move || uevent.clone(),
+            move || pu.clone(),
             move |data: &[u8]| {
                 if let Some(k) = weak.upgrade() {
                     kobject_emit_uevent_from_write(&k, data);
@@ -1979,29 +1994,113 @@ pub fn populate_input_class() {
                 Ok(())
             },
         );
-        // subsystem → /sys/class/input (five levels up from the event node).
-        eventn.add_symlink("subsystem", "../../../../../class/input");
-
-        // ── /sys/class/input/{inputN,eventN} → the /sys/devices nodes ──
-        // Linux makes the class entries symlinks into /sys/devices.
-        class_input.add_symlink(
-            format!("input{}", n),
-            format!("../../devices/platform/narf-input/input{}", n),
-        );
-        class_input.add_symlink(
-            format!("event{}", n),
-            format!("../../devices/platform/narf-input/input{}/event{}", n, n),
-        );
-
-        // ── /sys/dev/char/13:<minor> → the evdev node under /sys/devices ──
-        // sd_device_new_from_devnum('c',13:<minor>) realpath()s this link;
-        // landing under /sys/devices/.../inputN/eventN gives it a walkable
-        // "input" parent (unlike the old /sys/class/input/eventN target).
-        dev_char.add_symlink(
-            format!("13:{}", minor),
-            format!("../../devices/platform/narf-input/input{}/event{}", n, n),
-        );
     }
+    // subsystem → /sys/class/input (basename "input"). From
+    // /sys/devices/platform/narf-input/inputN that is four levels up.
+    inputn.add_symlink("subsystem", "../../../../class/input");
+
+    // ── evdev char node: …/inputN/eventN ──
+    let eventn = Kobject::new_child(inputn.clone(), format!("event{}", n));
+    {
+        let dev = format!("13:{}\n", minor);
+        kobject_add_attr(&eventn, "dev", move || dev.clone());
+    }
+    // Capability bitmaps (EV/KEY/REL/ABS) so udev tags ID_INPUT* and
+    // libinput classifies + opens the device. Sourced from the live
+    // router so they match what EVIOCGBIT reports on /dev/input/eventN.
+    let caps_lines = narf_input::evdev::ROUTER
+        .caps(id)
+        .map(|c| evdev_caps_uevent(&c))
+        .unwrap_or_default();
+    let uevent = format!(
+        "MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\nPRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"{}\"\nPHYS=\"{}\"\nUNIQ=\"{}\"\n{}",
+        minor,
+        n,
+        dev_id.bustype,
+        dev_id.vendor,
+        dev_id.product,
+        dev_id.version,
+        dev_name,
+        dev_phys,
+        dev_uniq,
+        caps_lines
+    );
+    // Writable so `udevadm trigger` (which writes "add"/"change" to the
+    // uevent file) makes the kernel broadcast a netlink uevent. Weak ref
+    // so the attr closure doesn't pin the kobject in a cycle. Linux ref:
+    // `uevent_store` (drivers/base/core.c:2453).
+    let weak = alloc::sync::Arc::downgrade(&eventn);
+    kobject_add_writable_attr(
+        &eventn,
+        "uevent",
+        move || uevent.clone(),
+        move |data: &[u8]| {
+            if let Some(k) = weak.upgrade() {
+                kobject_emit_uevent_from_write(&k, data);
+            }
+            Ok(())
+        },
+    );
+    // subsystem → /sys/class/input (five levels up from the event node).
+    eventn.add_symlink("subsystem", "../../../../../class/input");
+
+    // ── /sys/class/input/{inputN,eventN} → the /sys/devices nodes ──
+    // Linux makes the class entries symlinks into /sys/devices.
+    class_input.add_symlink(
+        format!("input{}", n),
+        format!("../../devices/platform/narf-input/input{}", n),
+    );
+    class_input.add_symlink(
+        format!("event{}", n),
+        format!("../../devices/platform/narf-input/input{}/event{}", n, n),
+    );
+
+    // ── /sys/dev/char/13:<minor> → the evdev node under /sys/devices ──
+    // sd_device_new_from_devnum('c',13:<minor>) realpath()s this link;
+    // landing under /sys/devices/.../inputN/eventN gives it a walkable
+    // "input" parent (unlike the old /sys/class/input/eventN target).
+    dev_char.add_symlink(
+        format!("13:{}", minor),
+        format!("../../devices/platform/narf-input/input{}/event{}", n, n),
+    );
+    if emit {
+        kobject_emit_uevent(&inputn, UeventAction::Add);
+        kobject_emit_uevent(&eventn, UeventAction::Add);
+    }
+}
+
+fn unpublish_input_device(id: narf_input::evdev::DeviceId) {
+    let _publication = INPUT_PUBLICATION.lock();
+    let root = get_root();
+    let Some(parent) = root
+        .get_child("devices")
+        .and_then(|devices| devices.get_child("platform"))
+        .and_then(|platform| platform.get_child("narf-input"))
+    else {
+        return;
+    };
+    let n = id.0.saturating_sub(1);
+    let Some(inputn) = parent.get_child(&format!("input{}", n)) else {
+        return;
+    };
+    if let Some(eventn) = inputn.get_child(&format!("event{}", n)) {
+        kobject_emit_uevent(&eventn, UeventAction::Remove);
+    }
+    kobject_emit_uevent(&inputn, UeventAction::Remove);
+    // Children retain their parent. Break the reverse edge so detached
+    // devices are reclaimed after their last open sysfs reference closes.
+    inputn.remove_child(&format!("event{}", n));
+    if let Some(class) = root
+        .get_child("class")
+        .and_then(|class| class.get_child("input"))
+    {
+        class.remove_symlink(&format!("event{}", n));
+        class.remove_symlink(&format!("input{}", n));
+    }
+    if let Some(chars) = root.get_child("dev").and_then(|dev| dev.get_child("char")) {
+        chars.remove_symlink(&format!("13:{}", 64 + n));
+    }
+    parent.remove_child(&format!("input{}", n));
 }
 
 /// Populate `/sys/kernel/` with standard kernel-global files.
@@ -3287,10 +3386,7 @@ impl DirOps for SysRoot {
         // Text attrs: use find_attr_key so any dynamically-registered attr
         // is visible without a separate static allowlist.
         if let Some(attr_s) = kobj.find_attr_key(name) {
-            return Some(Arc::new(SysAttrFile {
-                kobj: kobj.clone(),
-                attr_name: attr_s,
-            }));
+            return Some(Arc::new(SysAttrFile::new(kobj.clone(), attr_s)));
         }
         // Sub-kobjects look like directories
         if let Some(child) = kobj.get_child(name) {
@@ -3358,10 +3454,7 @@ impl DirOps for SysKobjDir {
         // Text attrs: use find_attr_key so any dynamically-registered attr
         // (backlight, leds, hwmon, etc.) is visible without a static list.
         if let Some(attr_s) = self.kobj.find_attr_key(name) {
-            return Some(Arc::new(SysAttrFile {
-                kobj: self.kobj.clone(),
-                attr_name: attr_s,
-            }));
+            return Some(Arc::new(SysAttrFile::new(self.kobj.clone(), attr_s)));
         }
         // Binary attrs. Previously omitted, which made every bin attr
         // UNREACHABLE: `kobject_add_bin_attr` registered it, `has_attr`
@@ -3595,11 +3688,42 @@ impl FileOps for SysBinAttrFile {
     }
 }
 
+struct AttrEvents {
+    generation: AtomicU64,
+    /// Notification-only wait queue. Readiness levels depend on each open's
+    /// cursor, so the shared cell has no level bits of its own.
+    waiters: Readiness,
+}
+
 struct SysAttrFile {
     kobj: Arc<Kobject>,
     /// The key into `kobj.attrs`; must be `&'static str` because it
     /// is stored as such in the `BTreeMap`.
     attr_name: &'static str,
+    events: Arc<AttrEvents>,
+    observed: AtomicU64,
+}
+
+impl SysAttrFile {
+    fn new(kobj: Arc<Kobject>, attr_name: &'static str) -> Self {
+        let events = kobj
+            .attr_events
+            .lock()
+            .entry(attr_name)
+            .or_insert_with(|| {
+                Arc::new(AttrEvents {
+                    generation: AtomicU64::new(1),
+                    waiters: Readiness::new(0),
+                })
+            })
+            .clone();
+        Self {
+            kobj,
+            attr_name,
+            events,
+            observed: AtomicU64::new(0),
+        }
+    }
 }
 
 impl fmt::Debug for SysAttrFile {
@@ -3611,6 +3735,46 @@ impl fmt::Debug for SysAttrFile {
 }
 
 impl FileOps for SysAttrFile {
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        // Path lookup may be cached; only dup/fork share an open's cursor.
+        Some(Arc::new(Self::new(self.kobj.clone(), self.attr_name)))
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        let mut ready = crate::POLL_IN | crate::POLL_OUT;
+        if self.observed.load(Ordering::Acquire) != self.events.generation.load(Ordering::Acquire) {
+            ready |= crate::POLL_PRI | crate::POLL_ERR;
+        }
+        ready
+    }
+
+    fn arm_readiness(&self, id: u64, interest: u32, waker: &Waker) -> Option<Poll<u32>> {
+        // Register before checking the per-open generation. A concurrent
+        // notify either wakes this registration or is visible to the check.
+        let _ = self.events.waiters.arm(id, interest, waker);
+        let ready = self.poll_readiness() & interest;
+        Some(if ready == 0 {
+            Poll::Pending
+        } else {
+            self.events.waiters.disarm(id);
+            Poll::Ready(ready)
+        })
+    }
+
+    fn arm_readiness_persistent(&self, id: u64, interest: u32, waker: &Waker) -> Option<u32> {
+        self.events.waiters.arm_persistent(id, interest, waker);
+        Some(self.poll_readiness() & interest)
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.events.waiters.disarm(id);
+        true
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     fn ino(&self) -> u64 {
         self.kobj.node_ino(self.attr_name)
     }
@@ -3618,8 +3782,16 @@ impl FileOps for SysAttrFile {
         sysfs_attrs()
     }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
         Box::pin(async move {
+            // Capture before show(), as kernfs_seq_show does. A notification
+            // concurrent with generating the value must remain pending.
+            if offset == 0 && !buf.is_empty() {
+                self.observed.store(
+                    self.events.generation.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            }
+            let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
             let bytes = content.as_bytes();
             let start = offset as usize;
             if start >= bytes.len() {
@@ -3681,6 +3853,54 @@ pub fn mount_sysfs() {
 }
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_sysfs_active_vt_notifies_each_open() -> TestResult {
+    crate::vt::__reset_for_test();
+    populate_tty_class();
+    let root = get_root();
+    let tty0 = root
+        .get_child("class")
+        .unwrap()
+        .get_child("tty")
+        .unwrap()
+        .get_child("tty0")
+        .unwrap();
+    let dir = SysKobjDir { kobj: tty0 };
+    let first = dir.lookup("active").unwrap();
+    let second = dir.lookup("active").unwrap();
+    let mut buf = [0u8; 16];
+    for file in [&first, &second] {
+        if narf_scheduler::block_on_spin(file.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty1\n"
+        {
+            return TestResult::Fail("initial active VT read");
+        }
+    }
+    let changed = crate::POLL_PRI | crate::POLL_ERR;
+    if first.poll_readiness() & changed != 0 {
+        return TestResult::Fail("read must clear sysfs notification");
+    }
+    if crate::vt::activate(2).is_err() || first.poll_readiness() & changed != changed {
+        return TestResult::Fail("VT activation must notify sysfs pollers");
+    }
+    // Poll delivery is not an acknowledgement: Linux kernfs consumes the
+    // notification when the attribute is read, separately for each open.
+    first.acknowledge_poll_readiness(changed);
+    if first.poll_readiness() & changed != changed {
+        return TestResult::Fail("poll consumed sysfs notification before read");
+    }
+    if narf_scheduler::block_on_spin(first.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty2\n" {
+        return TestResult::Fail("activated VT read");
+    }
+    if first.poll_readiness() & changed != 0 || second.poll_readiness() & changed != changed {
+        return TestResult::Fail("sysfs notification cursors must be per open");
+    }
+    crate::vt::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/sysfs/vt_notify",
+    smoke_sysfs_active_vt_notifies_each_open
+);
 
 fn smoke_sysfs_numa_node_live_files() -> TestResult {
     populate_numa_nodes();

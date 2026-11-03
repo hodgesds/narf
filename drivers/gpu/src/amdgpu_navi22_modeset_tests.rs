@@ -1191,7 +1191,11 @@ fn navi22_plane_power_up_initializes_hubp_before_surface_fetch() -> TestResult {
     let connector = m::connector(Signal::Hdmi, 3, 3);
     let r = Resources::new().acquire(&connector).unwrap();
     let mut p = pipeline(&bench, connector, r);
-    if run(p.power_on_plane()).is_err() {
+    // No published boot sample: the pre-ReadTopology live read.
+    let saved = crate::amdgpu_info::__set_navi22_topology_for_test(None);
+    let activated = run(p.power_on_plane());
+    crate::amdgpu_info::__set_navi22_topology_for_test(saved);
+    if activated.is_err() {
         return TestResult::Fail("plane activation rejected");
     }
     if bench.get(d2(0x5f7)) != 1 << 26 {
@@ -1205,6 +1209,43 @@ fn navi22_plane_power_up_initializes_hubp_before_surface_fetch() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_plane_power_up_initializes_hubp_before_surface_fetch
+);
+
+/// A runtime relight must not read GB_ADDR_CONFIG live: GC may be in
+/// GFXOFF (reads return all ones). amdgpu_dm uses the cached
+/// `adev->gfx.config` value; NARF uses the ReadTopology sample.
+fn navi22_plane_power_up_uses_cached_gb_addr_config() -> TestResult {
+    let bench = Bench::new();
+    bench.set(0x263e, u32::MAX);
+    bench.set(d2(0x5e6), 0x8007_30c7);
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    let saved = crate::amdgpu_info::__set_navi22_topology_for_test(Some(
+        crate::amdgpu_gfx10_topology::Topology {
+            rev_id: 0,
+            gb_addr_config: 0x343,
+            active_cus: 0,
+            cu_bitmap: [[0; 4]; 4],
+            ao_cu_bitmap: [[0; 4]; 4],
+            ao_cu_mask: 0,
+            enabled_rb_mask: 0,
+            tcc_disabled_mask: 0,
+        },
+    ));
+    let activated = run(p.power_on_plane());
+    crate::amdgpu_info::__set_navi22_topology_for_test(saved);
+    if activated.is_err() {
+        return TestResult::Fail("plane activation read GB_ADDR_CONFIG during GFXOFF");
+    }
+    if bench.get(d2(0x5e6)) != 0x8003_1003 {
+        return TestResult::Fail("HUBP fabric configuration ignored the boot sample");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_up_uses_cached_gb_addr_config
 );
 
 fn navi22_plane_power_request_is_released_on_error_and_cancellation() -> TestResult {

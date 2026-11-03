@@ -48,6 +48,14 @@ The read-only scheduler debugfs `sched/quantum_unit` file reports `nanos`,
 unit. Instruction-mode admission and limits are defined in
 `scheduler/specification/spec.md` §3.1.1.
 
+Evdev registration publishes a stable `/sys/devices/platform/narf-input/inputN`
+parent and `eventN` child, class links and the `13:(64+N)` device link, with
+`N = DeviceId - 1` matching `/dev/input/eventN`. The input registry observer
+is installed before the boot snapshot. Late registrations emit parent then
+child ADD notifications after publication; removal emits child then parent
+REMOVE notifications and removes discovery links. Refresh preserves existing
+kobject identity and emits no duplicate ADD notifications.
+
 `FileOps::hardware_clock()` optionally returns the retained precision-clock
 interface for a dynamic clock fd. `devfs_ptp` publishes registered `/dev/ptpN`
 nodes (0600), PHC capability ioctls and bounded system/device offset sampling
@@ -152,6 +160,15 @@ callback. `populate_all()` snapshots callbacks and invokes them without its
 lock. Providers support explicit refresh after probes and use the existing
 kobject/class registration API. Every sysfs mount shares that live graph;
 mounting a new view never repopulates it or emits device ADD events.
+
+`sysfs::kobject_notify(kobj, attribute)` publishes a text-attribute change
+after its value changes. Each open has an independent event cursor (shared
+by dup/fork): `poll`/`epoll` report `POLLPRI|POLLERR` until that open reads
+the attribute again. Notification wakes registered waiters, including epoll
+registrations interested only in the always-reported error bit. Poll delivery
+alone does not consume the event. A logical VT activation notifies
+`/sys/class/tty/tty0/active` after releasing the VT state lock, allowing logind
+to update seat0's active session and transfer device ACLs.
 
 ### 3.0 Root-device orchestration
 
@@ -714,6 +731,15 @@ The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
 continues to open only the side-effect-free path node.
+`vt::install_process_hooks` supplies opaque installing-thread identities and
+a privileged signal enqueue callback before userspace runs. The callback must
+not wait or re-enter VT state. `VT_SETMODE(VT_PROCESS)` captures that thread;
+activation sends its release signal and waits for `VT_RELDISP` acceptance
+before publishing the active VT, notifying sysfs, and signalling acquisition.
+Rejection leaves the old VT active. A dead controller reverts to VT_AUTO.
+`VT_WAITACTIVE` through `FileOps::ioctl_user` sleeps on a registered wake and
+unregisters on cancellation; the direct synchronous ioctl returns WouldBlock
+until the target is active. `/dev/tty` forwards this async ioctl contract.
 Userspace writes to console ttys (`/dev/console`, serial and virtual terminals)
 apply the selected tty's output processing and reach its output device without
 creating kernel log records. A kernel-log reader may print records to a tty and

@@ -17,6 +17,11 @@ validates options and returns an unattached `Arc<dyn FsInstance>`.
 Both legacy mount and fsconfig use this constructor. Existing volume/node APIs
 are described in the [driver README](../README.md) and their Rust documentation.
 
+Directory ownership and mode updates through `DirOps` use the same persistent
+inode update path as `FileOps`. In particular, the ownership and mode assigned
+by `mkdir(2)` are visible through both views and survive remounting; directory
+setters propagate write errors instead of silently accepting an update.
+
 Write safety (`rw_gate`):
 
 ```rust
@@ -58,6 +63,16 @@ metadata, size, and mapping identity. Creation and lookup acquire that reference
 before releasing the operation mutex. `stat_async` and `statx_async` refresh
 metadata from the current tree; writes and size changes publish shared metadata
 before releasing the same mutex. Reads serialize with mutation and eviction.
+Content generations advance after acquiring that mutex and before changing
+bytes or length. A queued mutation cannot publish the epoch that would let a
+reader retain old bytes as current after the mutation completes. Shrinking
+truncate publishes EOF and revokes mappings under the same operation lock,
+before retiring extents; a failed revoke restores the cached inode there.
+
+File-content reads seek to the extent at or before the requested offset and
+walk only the requested window. A small read must not collect the inode's
+entire extent list. The existing operation lock, checksum verification,
+compressed-extent cache and zero filling of holes still cover these reads.
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
@@ -70,6 +85,12 @@ Read-only mounts do not recover orphans. Final-view Drop only makes previously
 accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
+
+Free-space bitmap edits accumulate only in a private logical leaf. Each
+changed block group's free-run count is recomputed after all allocations and
+releases for that fixed-point round, before packing or publishing any node.
+Bitmap ranges are found by their ordered keys, with coverage and body bounds
+checked across every bitmap boundary. The on-disk format is unchanged.
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.

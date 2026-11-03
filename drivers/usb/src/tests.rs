@@ -200,6 +200,80 @@ async fn release_fixture_slots(
     first_error.map_or(Ok(()), Err)
 }
 
+fn smoke_enumeration_failure_reclaims_slot() -> TestResult {
+    use crate::{attach, xhci};
+    let Some(controller) = xhci::controller() else {
+        return TestResult::Skip("xhci not probed");
+    };
+    let Some((port, _)) = controller.connected_ports().first().copied() else {
+        return TestResult::Skip("no connected port");
+    };
+    let mut held = alloc::vec::Vec::new();
+    let result = narf_scheduler::block_on(async {
+        if let Some(slot) = controller.slot_for_port(port) {
+            attach::detach_slot(&controller, slot).await;
+        }
+        let mut previous_generation = 0;
+        for cycle in 0..2 {
+            if controller.port_reset(port).await.is_err() {
+                return TestResult::Fail("enumeration port reset failed");
+            }
+            let Some(speed) = controller.port_speed(port) else {
+                return TestResult::Fail("unknown port speed");
+            };
+            // Only the initial reservation bypasses slots retained by other
+            // fixtures. The retry uses the ordinary production allocator.
+            let slot = if cycle == 0 {
+                match reserve_fresh_address_slot(&controller, &mut held).await {
+                    Ok((slot, _)) => slot,
+                    Err(_) => return TestResult::Fail("no initial slot available"),
+                }
+            } else {
+                match controller.enable_slot().await {
+                    Ok(slot) if slot != 0 && !held.contains(&slot) => {
+                        held.push(slot);
+                        slot
+                    }
+                    _ => return TestResult::Fail("retry could not enable a slot"),
+                }
+            };
+            if !controller.test_address_slot_unused(slot)
+                || controller.address_device(slot, port, speed).await.is_err()
+            {
+                return TestResult::Fail("retry received a retired software slot");
+            }
+            let Some(generation) = controller.device_generation(slot) else {
+                return TestResult::Fail("addressed device has no generation");
+            };
+            if generation <= previous_generation {
+                return TestResult::Fail("retry reused an old device generation");
+            }
+            previous_generation = generation;
+            // A class-probe failure after addressing uses this exact cleanup
+            // path. The next attempt must be able to address the returned id.
+            if attach::release_slot(&controller, slot).await.is_err() {
+                return TestResult::Fail("terminal enumeration cleanup failed");
+            }
+            held.retain(|held_slot| *held_slot != slot);
+            if !controller.test_address_slot_unused(slot)
+                || controller.device_generation(slot).is_some()
+            {
+                return TestResult::Fail("failed enumeration left its slot or DMA retained");
+            }
+        }
+        TestResult::Pass
+    });
+    let cleanup = narf_scheduler::block_on(release_fixture_slots(&controller, &mut held));
+    if matches!(result, TestResult::Pass) && cleanup.is_err() {
+        return TestResult::Fail("fixture cleanup failed");
+    }
+    result
+}
+kernel_test_in!(
+    "drivers/usb/enumeration_cleanup",
+    smoke_enumeration_failure_reclaims_slot
+);
+
 fn smoke_xhci_address_device_qemu() -> TestResult {
     use crate::{hid, xhci};
     if !xhci::is_probed() {
@@ -327,8 +401,20 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
         if c.address_device(slot, port, speed).await.is_err() {
             return TestResult::Fail("HID Address Device failed");
         }
+        let before = narf_input::evdev::ROUTER.device_ids();
         match hid::try_bind_kbd_already_addressed(&c, slot, port, speed, None).await {
-            Ok(()) => TestResult::Pass,
+            Ok(()) => {
+                let Some(id) = narf_input::evdev::ROUTER
+                    .device_ids()
+                    .into_iter()
+                    .find(|id| !before.contains(id))
+                else {
+                    return TestResult::Fail(
+                        "live USB keyboard bind did not publish an evdev node",
+                    );
+                };
+                verify_live_keyboard_evdev(slot, id).await
+            }
             Err(hid::HidError::NotBootKeyboard) => TestResult::Skip("port not a HID Boot Keyboard"),
             Err(_) => TestResult::Fail("HID configuration/transport failed"),
         }
@@ -353,6 +439,59 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
     result
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_hid_kbd_first_report);
+
+/// Feed the live binding's decoder, then read the real Linux evdev file.
+/// QEMU covers USB address/configure/arm; these literal reports cover key and
+/// modifier press/release without requiring an operator to type in the VM.
+async fn verify_live_keyboard_evdev(slot: u8, id: narf_input::evdev::DeviceId) -> TestResult {
+    use crate::hid;
+    use narf_filesystem::devfs_input::{DeviceKind, InputEventFile};
+    use narf_filesystem::FileOps;
+
+    narf_input::__reset_modifiers_for_test();
+    let Some(file) = InputEventFile::open(id, DeviceKind::Hardware) else {
+        return TestResult::Fail("live keyboard has no Linux evdev file");
+    };
+    let press = [hid::kbd_mod::LSHIFT, 0, 4, 0, 0, 0, 0, 0];
+    for (report, value) in [(press, 1), ([0; 8], 0)] {
+        if hid::feed_keyboard_report_for_test(slot, report) != 2 {
+            return TestResult::Fail("live keyboard lost a key or modifier transition");
+        }
+        if file.poll_readiness() & 1 == 0 {
+            return TestResult::Fail("live keyboard evdev file did not become readable");
+        }
+        let mut bytes = [0u8; 4 * 24];
+        if file.read(0, &mut bytes).await != Ok(bytes.len()) {
+            return TestResult::Fail("live keyboard evdev read lost a Linux input_event frame");
+        }
+        for (record, (kind, code, expected)) in
+            bytes
+                .chunks_exact(24)
+                .zip([(1u16, 42u16, value), (0, 0, 0), (1, 30, value), (0, 0, 0)])
+        {
+            if u16::from_le_bytes([record[16], record[17]]) != kind
+                || u16::from_le_bytes([record[18], record[19]]) != code
+                || i32::from_le_bytes(record[20..24].try_into().unwrap()) != expected
+            {
+                return TestResult::Fail("live USB keyboard produced the wrong Linux evdev event");
+            }
+        }
+        if hid::feed_keyboard_report_for_test(slot, report) != 0 || file.poll_readiness() != 0 {
+            return TestResult::Fail("identical keyboard report repeated a key transition");
+        }
+    }
+    // Unplug with a modifier held: both the evdev node and the legacy state
+    // must be retired, so neither the compositor nor the console gets stuck.
+    hid::feed_keyboard_report_for_test(slot, press);
+    if !hid::detach_boot_keyboard(slot)
+        || narf_input::evdev::ROUTER.device_ids().contains(&id)
+        || InputEventFile::open(id, DeviceKind::Hardware).is_some()
+        || narf_input::current_modifiers().bits() != 0
+    {
+        return TestResult::Fail("live keyboard detach left an evdev node or a held modifier");
+    }
+    TestResult::Pass
+}
 
 // ── MSC class-driver descriptor parser ─────────────────────────────
 
@@ -656,6 +795,8 @@ fn fake_hub_binding(slot_id: u8, num_ports: u8) -> crate::attach::HubBinding {
             },
             speed: crate::xhci::PortSpeed::High,
             device_protocol: 1,
+            interface_alt: 0,
+            interface_protocol: 1,
         },
         route_string: 0,
         tier: 0,
@@ -928,33 +1069,33 @@ kernel_test_in!("drivers/usb/hub_pm", smoke_hub_hid_wake_selection);
 /// bindings. Seeds the keyboard + consumer registries via
 /// their test hooks and resets them afterwards.
 fn smoke_hub_hid_context_collection() -> TestResult {
-    use crate::hid::{self, BootKeyboard, KbdReport};
+    use crate::hid::{self, BootKeyboard};
     hid::__reset_keyboards_for_test();
     hid::consumer::__reset_consumers_for_test();
     let result = (|| {
-        hid::__push_keyboard_for_test(BootKeyboard {
-            slot_id: 11,
-            interrupt_in_ep: 3,
-            interface_num: 0,
-            hub_port: Some((7, 1)),
-            last_report: KbdReport::default(),
-        });
+        hid::__push_keyboard_for_test(BootKeyboard::from_configured_endpoint(
+            11,
+            0,
+            3,
+            Some((7, 1)),
+            narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+        ));
         // A second binding on the same port — must collapse.
-        hid::__push_keyboard_for_test(BootKeyboard {
-            slot_id: 12,
-            interrupt_in_ep: 3,
-            interface_num: 0,
-            hub_port: Some((7, 1)),
-            last_report: KbdReport::default(),
-        });
+        hid::__push_keyboard_for_test(BootKeyboard::from_configured_endpoint(
+            12,
+            0,
+            3,
+            Some((7, 1)),
+            narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+        ));
         // Root-attached keyboard — omitted.
-        hid::__push_keyboard_for_test(BootKeyboard {
-            slot_id: 13,
-            interrupt_in_ep: 3,
-            interface_num: 0,
-            hub_port: None,
-            last_report: KbdReport::default(),
-        });
+        hid::__push_keyboard_for_test(BootKeyboard::from_configured_endpoint(
+            13,
+            0,
+            3,
+            None,
+            narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+        ));
         // A second class on a different hub's port.
         hid::consumer::__push_consumer_for_test(14, Some((8, 2)));
         let got = hid::hub_ports();
@@ -1494,13 +1635,13 @@ fn smoke_hid_diff_press_release_repeat() -> TestResult {
 
     // Fabricate a keyboard binding without going through the
     // controller — we only exercise translate_report here.
-    let mut kbd = BootKeyboard {
-        slot_id: 1,
-        interrupt_in_ep: 3,
-        interface_num: 0,
-        hub_port: None,
-        last_report: KbdReport::default(),
-    };
+    let mut kbd = BootKeyboard::from_configured_endpoint(
+        1,
+        0,
+        3,
+        None,
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+    );
 
     // First report: A pressed (with LShift held) — should fire two
     // events: LeftShift press, then A press.
@@ -1605,13 +1746,13 @@ fn smoke_hid_rollover_suppressed() -> TestResult {
 
     init_global_ring(64);
     __reset_global_ring_for_test();
-    let mut kbd = BootKeyboard {
-        slot_id: 1,
-        interrupt_in_ep: 3,
-        interface_num: 0,
-        hub_port: None,
-        last_report: KbdReport::default(),
-    };
+    let mut kbd = BootKeyboard::from_configured_endpoint(
+        1,
+        0,
+        3,
+        None,
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+    );
     // The HID error roll-over: all six positions = 0x01 with no
     // modifier bits set. Should produce zero events.
     let roll = KbdReport::from_bytes([0, 0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01]);
@@ -1634,13 +1775,13 @@ fn smoke_hid_modifier_only_transition() -> TestResult {
 
     init_global_ring(64);
     __reset_global_ring_for_test();
-    let mut kbd = BootKeyboard {
-        slot_id: 1,
-        interrupt_in_ep: 3,
-        interface_num: 0,
-        hub_port: None,
-        last_report: KbdReport::default(),
-    };
+    let mut kbd = BootKeyboard::from_configured_endpoint(
+        1,
+        0,
+        3,
+        None,
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+    );
     // Press LCtrl alone → one event with CTRL set.
     let r1 = KbdReport::from_bytes([hid::kbd_mod::LCTRL, 0, 0, 0, 0, 0, 0, 0]);
     let n1 = kbd.translate_report(r1);
@@ -6651,6 +6792,8 @@ fn smoke_usb_hub_multi_tt_child_topology() -> TestResult {
         },
         speed: PortSpeed::High,
         device_protocol: HUB_PROTOCOL_MULTI_TT,
+        interface_alt: 1,
+        interface_protocol: HUB_PROTOCOL_MULTI_TT,
     };
     if !hub.is_multi_tt() {
         return TestResult::Fail("protocol 2 hub was not classified multi-TT");

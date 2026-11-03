@@ -120,7 +120,9 @@ const IB_FLAGS_KNOWN: u32 = uapi::AMDGPU_IB_FLAG_CE
 /// One indirect buffer, as validated.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Ib {
-    /// GPU virtual address, with the canonical hole already stripped.
+    /// GPU virtual address, with the canonical hole already stripped (the
+    /// form VM lookups use). Packets must carry
+    /// [`amdgpu_vm::sign_extend`]`(va_start)`, as Linux emits `ib->gpu_addr`.
     pub va_start: u64,
     pub length_dw: u32,
     pub ip_type: u32,

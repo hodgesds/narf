@@ -19,6 +19,7 @@ use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 
 /// `_IOWR('d'=0x64, 0x2e, struct drm_prime_handle)` — 12-byte payload.
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: u64 = 0xC00C_642E;
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: u64 = 0xC00C_642D;
 /// `_IOWR('d'=0x64, 0x42, struct drm_virtgpu_execbuffer)` — 64 bytes.
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: u64 = 0xC040_6442;
 const VIRTGPU_EXECBUF_FENCE_FD_IN: u32 = 0x01;
@@ -48,6 +49,15 @@ impl FileOps for FakeRenderNode {
     }
     fn as_drm_render_index(&self) -> Option<u32> {
         Some(0)
+    }
+    fn drm_prime_export_file(
+        &self,
+        handle: u32,
+    ) -> Result<Arc<dyn FileOps>, narf_filesystem::FsError> {
+        if handle != FAKE_GEM_HANDLE {
+            return Err(narf_filesystem::FsError::NotFound);
+        }
+        Ok(Arc::new(FakeDmabuf))
     }
     fn ioctl(&self, cmd: u32, _arg: usize) -> Result<u64, narf_filesystem::FsError> {
         if cmd as u64 == DRM_IOCTL_VIRTGPU_EXECBUFFER {
@@ -238,7 +248,7 @@ fn smoke_abi_drm_prime_fd_to_handle_on_render_node() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/drm_prime",
     smoke_abi_drm_prime_fd_to_handle_on_render_node
 );
 
@@ -269,8 +279,56 @@ fn smoke_abi_drm_prime_fd_to_handle_rejects_non_drm_fd() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/drm_prime",
     smoke_abi_drm_prime_fd_to_handle_rejects_non_drm_fd
+);
+
+fn smoke_abi_drm_prime_export_preserves_access_and_cloexec() -> TestResult {
+    with_setup(|| {
+        let render = install_ops(Arc::new(FakeRenderNode)).ok_or("install render node")?;
+        for flags in [0u32, 2, 0x80000, 0x80002] {
+            let mut request = [0u8; 12];
+            request[..4].copy_from_slice(&FAKE_GEM_HANDLE.to_ne_bytes());
+            request[4..8].copy_from_slice(&flags.to_ne_bytes());
+            if call(
+                Syscall::Ioctl.raw(),
+                a3(
+                    render as u64,
+                    DRM_IOCTL_PRIME_HANDLE_TO_FD,
+                    request.as_mut_ptr() as u64,
+                    0,
+                ),
+            ) != Some(0)
+            {
+                return Err("PRIME export failed");
+            }
+            let exported = u32::from_ne_bytes(request[8..12].try_into().unwrap()) as u64;
+            let access = call(Syscall::Fcntl.raw(), a3(exported, 3, 0, 0))
+                .ok_or("F_GETFL on exported dma-buf")?;
+            if access & 3 != (flags & 2) as i64 {
+                return Err("DRM_RDWR export lost writable access (shared mmap returns EACCES)");
+            }
+            let fd_flags = call(Syscall::Fcntl.raw(), a3(exported, 1, 0, 0));
+            if fd_flags != Some(i64::from(flags & 0x80000 != 0)) {
+                return Err("PRIME export did not preserve CLOEXEC independently of access mode");
+            }
+            let duplicate = call(Syscall::Dup.raw(), a3(exported, 0, 0, 0))
+                .filter(|fd| *fd >= 0)
+                .ok_or("dup exported dma-buf")?;
+            let duplicate_access = call(Syscall::Fcntl.raw(), a3(duplicate as u64, 3, 0, 0))
+                .ok_or("F_GETFL on duplicate")?;
+            if duplicate_access & 3 != (flags & 2) as i64 {
+                return Err("dup lost the dma-buf's access mode");
+            }
+            let _ = call(Syscall::Close.raw(), a3(duplicate as u64, 0, 0, 0));
+            let _ = call(Syscall::Close.raw(), a3(exported, 0, 0, 0));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/drm_prime",
+    smoke_abi_drm_prime_export_preserves_access_and_cloexec
 );
 
 // Linux drivers/gpu/drm/virtio/virtgpu_submit.c installs an O_CLOEXEC

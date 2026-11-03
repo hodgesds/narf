@@ -1883,7 +1883,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let ibs: alloc::vec::Vec<(u64, u32)> = submission
                 .ibs
                 .iter()
-                .map(|ib| (ib.va_start, ib.length_dw))
+                .map(|ib| (crate::amdgpu_vm::sign_extend(ib.va_start), ib.length_dw))
                 .collect();
             if vm.geometry() != crate::amdgpu_vm::Geometry::GMC12 {
                 return Err(FsError::InvalidData);

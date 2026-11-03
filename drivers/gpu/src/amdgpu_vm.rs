@@ -449,6 +449,20 @@ pub const fn strip_hole(va: u64) -> u64 {
     va & GMC_HOLE_MASK
 }
 
+/// `amdgpu_gmc_sign_extend`: the canonical form of a [`strip_hole`]d
+/// address. Linux emits client IB addresses as the client gave them
+/// (`ib->gpu_addr = chunk_ib->va_start`), sign-extended above the hole; the
+/// CP treats a stripped high-half address (`0x0000_8xxx_xxxx_xxxx`, inside
+/// the hole) as outside the unified address space and raises
+/// `CP_GFX_ERROR.SUA_ERROR` without fetching it.
+pub const fn sign_extend(va: u64) -> u64 {
+    if va >= GMC_HOLE_START {
+        va | GMC_HOLE_END
+    } else {
+        va
+    }
+}
+
 // ── PTE composition ────────────────────────────────────────────────────
 
 /// Base flags for a mapping, before the per-request refinement.
@@ -1439,12 +1453,34 @@ impl PageTable {
     /// # Safety
     /// `index` must be within the table's entry count.
     unsafe fn write(&self, index: u64, value: u64) {
+        use core::sync::atomic::{compiler_fence, fence, Ordering};
         // SAFETY: physical memory is kernel-mapped at a fixed offset, and the
         // caller bounds `index` against the allocation.
-        unsafe {
+        let entry = unsafe {
             let base = narf_memory::PhysAddr::new(self.phys).kernel_mut_ptr::<u64>();
-            base.add(index as usize).write_volatile(value);
+            let entry = base.add(index as usize);
+            entry.write_volatile(value);
+            entry
+        };
+        // The tables live in system RAM (Linux keeps a dGPU's in VRAM and
+        // follows a CPU update with mb() + an HDP flush, amdgpu_vm_cpu_commit).
+        // Push the entry out of the CPU cache before any walk can read it, as
+        // the Intel GTT path does: on RX 6750 XT the GC walker read a fresh
+        // PTB's invalid pattern after the CPU had written a valid PTE
+        // (CPG read fault, PERMISSION_FAULTS valid|read, walk valid in RAM).
+        compiler_fence(Ordering::SeqCst);
+        #[cfg(target_arch = "x86_64")]
+        if narf_arch::x86_64::cache::caps().clflush {
+            // SAFETY: `entry` is inside this table's direct-mapped frames.
+            unsafe { narf_arch::x86_64::cache::clflush(entry.cast::<u8>()) };
         }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as above; one 8-byte entry.
+        unsafe {
+            narf_arch::aarch64::cache::clean_inval_to_poc(entry as usize, 8);
+        }
+        fence(Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// Read entry `index`.

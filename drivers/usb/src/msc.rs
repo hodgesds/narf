@@ -1609,7 +1609,7 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
             Ok(())
         }
         Err(e) => {
-            let _ = xhci_dev.disable_slot(slot_id).await;
+            let _ = crate::attach::release_slot(xhci_dev, slot_id).await;
             Err(e)
         }
     }

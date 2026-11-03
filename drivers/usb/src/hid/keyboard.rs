@@ -37,7 +37,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_input::{
-    evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceId, DeviceNode, ROUTER},
+    evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceId, DeviceNode, InputId, ROUTER},
     push_key, update_modifiers, KeyCode, Modifiers,
 };
 use narf_lib::sync::IrqSafeSpinLock;
@@ -130,6 +130,37 @@ pub struct UsbKeyboard {
     pub(crate) evdev_id: DeviceId,
     /// evdev DeviceNode — used to dispatch events to ROUTER.
     pub(crate) evdev_node: Arc<DeviceNode>,
+}
+
+impl UsbKeyboard {
+    pub(super) fn publish_boot(
+        slot_id: u8,
+        interface_num: u8,
+        interrupt_in_dci: u8,
+        identity: InputId,
+    ) -> Self {
+        let mut caps = keyboard_evdev_caps();
+        caps.set_identity(
+            "USB HID keyboard",
+            &alloc::format!("usb-xhci/slot{slot_id}/input{interface_num}"),
+            "",
+            identity,
+        );
+        let (evdev_id, evdev_node) = ROUTER.register_device(caps);
+        Self {
+            slot_id,
+            interrupt_in_dci,
+            interface_num,
+            protocol: KbdProtocol::Boot,
+            led_report_id: None,
+            last_keys: [0; 6],
+            last_mods: 0,
+            descriptor: None,
+            leds: LedState::default(),
+            evdev_id,
+            evdev_node,
+        }
+    }
 }
 
 /// Global registry of bound USB keyboards.

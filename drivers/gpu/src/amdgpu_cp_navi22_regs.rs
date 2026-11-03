@@ -90,6 +90,12 @@ pub const CP_RB_WPTR_POLL_ADDR_LO: Reg = Reg(0, 0x1e8b); // linux: mmCP_RB_WPTR_
 pub const CP_RB_WPTR_POLL_ADDR_HI: Reg = Reg(0, 0x1e8c); // linux: mmCP_RB_WPTR_POLL_ADDR_HI@gc101
 pub const CP_RB_DOORBELL_CONTROL: Reg = Reg(0, 0x1e8d); // linux: mmCP_RB_DOORBELL_CONTROL@gc101
 pub const CP_RB_ACTIVE: Reg = Reg(0, 0x1f40); // linux: mmCP_RB_ACTIVE@gc101
+                                              // Gfx HQD, GRBM-selected by ME0 pipe/queue (gfx_v10_0_gfx_mqd_init).
+pub const CP_GFX_HQD_QUEUE_PRIORITY: Reg = Reg(0, 0x1e84); // linux: mmCP_GFX_HQD_QUEUE_PRIORITY@gc101
+pub const CP_GFX_HQD_QUANTUM: Reg = Reg(0, 0x1e85); // linux: mmCP_GFX_HQD_QUANTUM@gc101
+pub const CP_GFX_HQD_RPTR: Reg = Reg(0, 0x1e88); // linux: mmCP_GFX_HQD_RPTR@gc101
+pub const CP_GFX_HQD_CNTL: Reg = Reg(0, 0x1e8f); // linux: mmCP_GFX_HQD_CNTL@gc101
+pub const CP_GFX_MQD_CONTROL: Reg = Reg(0, 0x1e9a); // linux: mmCP_GFX_MQD_CONTROL@gc101
 
 // MEC HQD, GRBM-selected (kiq_init_register, compute_mqd_init)
 pub const CP_PQ_WPTR_POLL_CNTL: Reg = Reg(0, 0x1e23); // linux: mmCP_PQ_WPTR_POLL_CNTL@gc101

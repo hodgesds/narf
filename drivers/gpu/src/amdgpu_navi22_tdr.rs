@@ -192,7 +192,7 @@ pub(crate) fn record(
 }
 
 /// Detector task for one owner generation; exits on `stop` or device loss.
-pub(crate) async fn monitor(epoch: u64) {
+pub(crate) async fn monitor(epoch: u64, generation: u64) {
     use core::fmt::Write;
     let mut watchdog = Watchdog::new(TIMEOUT_MS);
     loop {
@@ -214,7 +214,7 @@ pub(crate) async fn monitor(epoch: u64) {
         }
         let now_ms = narf_time::wall::cycles_to_ns(narf_time::now_cycles()) / 1_000_000;
         for hang in record(&mut watchdog, &samples, now_ms) {
-            crate::amdgpu_navi22_cs::hung(hang.engine);
+            crate::amdgpu_navi22_cs::hung(hang.engine, generation);
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 ring {:?} timeout, signaled seq={}, emitted seq={} ({} ms)",
@@ -223,6 +223,17 @@ pub(crate) async fn monitor(epoch: u64) {
                 hang.emitted,
                 hang.stalled_ms
             );
+            if hang.engine == Engine::Gfx {
+                match crate::amdgpu_navi22_platform::gfx_hang_snapshot().await {
+                    Ok(snapshot) => snapshot.report(),
+                    Err(error) => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 Gfx hang snapshot {error:?}"
+                        );
+                    }
+                }
+            }
             if AUTOMATIC.load(Ordering::Acquire) {
                 if claim_automatic_recovery() {
                     // SAFETY: the caller of set_automatic_recovery accepted
@@ -248,7 +259,7 @@ pub(crate) async fn monitor(epoch: u64) {
 /// Start a detector for the current owner; any previous one exits.
 pub(crate) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
-    narf_scheduler::spawn(monitor(epoch));
+    narf_scheduler::spawn(monitor(epoch, crate::amdgpu_fence_navi22::generation()));
 }
 /// Stop the detector (recovery quiesce or device loss).
 pub(crate) fn stop() {

@@ -132,9 +132,23 @@ also consult upstream Linux GPL sources.
   An already registered root incurs no wait. A missing or ambiguous root
   still fails through the normal root selector and disk-policy checks.
 
-- `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed)` binds an
-  addressed hub and retains its negotiated speed plus Device Descriptor
-  protocol so xHCI can set the multiple-TT bit correctly.
+- `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed, config)`
+  binds an addressed, configured hub. A high-speed protocol-2 hub must expose
+  a multiple-TT alternate for that interface and acknowledge `SET_INTERFACE`
+  before attachment succeeds. `interface_alt` and `interface_protocol` retain
+  the selected mode; `is_multi_tt()` describes that active mode, rather than
+  the Device Descriptor capability. Failed selection or controller hub-context
+  setup prevents publication of the hub and downstream children.
+- `hid::BootKeyboard::attach(..., identity: InputId)` publishes an evdev
+  keyboard only after protocol selection and interrupt-IN arming succeed.
+  Its live report pump uses the shared evdev-aware keyboard decoder, sending
+  key/modifier transitions to both the console ring and `/dev/input/eventN`.
+  Unplug, controller recovery and binding destruction release held keys and
+  remove the evdev node. The USB identity comes from the Device Descriptor.
+- HID boot-interface selectors return an endpoint together with its owning
+  alternate-zero interface. Declared boot interfaces take precedence over
+  subclass-zero compatibility matches; a declared boot mouse prevents its
+  auxiliary non-boot keyboard interface from claiming the whole device.
 - `HubDescriptor::tt_think_time()` returns the USB 2.0
   `wHubCharacteristics[6:5]` encoding used directly in a low/full-speed
   child's xHCI Slot Context.
@@ -333,6 +347,17 @@ also consult upstream Linux GPL sources.
   the bulk-stop profile. `USBDevice::clear_endpoint_halt(endpoint)` pairs
   it with the device-side CLEAR_FEATURE(ENDPOINT_HALT) so host and device
   data toggles restart together; EP0 skips the CLEAR_FEATURE step.
+- The supervisor drives root and hub enumeration to a terminal result using
+  the hardware operations' individual deadlines. It does not cancel an
+  in-flight owner at a whole-port deadline. Pending enumeration and hub-status
+  waits service existing nonblocking report pumps, with bound suspended ports
+  resumed before the first pump in each supervisor cycle.
+- Terminal enumeration failures and device detach share slot cleanup. They
+  await successful Disable Slot completion before reclaiming the reservation
+  and retained DMA, so a retry can address the hardware's returned slot under
+  a fresh generation. Failed or cancelled disable operations do not reclaim.
+  Class probes that merely decline a device still leave its addressed slot
+  available to later probes; cleanup runs only at the terminal failure.
 - `Xhci::reclaim_slot(slot)` is the explicit stop/drain/removal path that
   makes a disabled slot reusable. It refuses any slot that has not
   completed Disable Slot (the completion is the hardware-quiescence

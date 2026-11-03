@@ -28,6 +28,83 @@ fn create(state: &GemState, size: u64, domains: u64) -> u32 {
     u32::from_le_bytes(b[0..4].try_into().unwrap())
 }
 
+// libdrm 2.4.134 amdgpu/handle_table.c indexes a pointer array by the
+// kernel handle and zeroes it through ALIGN(handle + 1, 4096 / 8).
+// A first handle of 0x40000000 therefore allocates 8 GiB + 4096 bytes.
+// Exercise the actual GEM ioctls; never allocate that userspace array here.
+fn render_abi_handles_are_compact_and_mmap_offsets_are_separate() -> TestResult {
+    let state = GemState::new();
+    let first = create(&state, 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT));
+    let second = create(&state, 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT));
+    if (first, second) != (1, 2) {
+        return TestResult::Fail("GEM handles make libdrm grow a sparse multi-GiB table");
+    }
+    let mut mapping = [0u8; 8];
+    mapping[..4].copy_from_slice(&first.to_le_bytes());
+    if dispatch(
+        amd(uapi::DRM_AMDGPU_GEM_MMAP),
+        mapping.as_mut_ptr() as usize,
+        &state,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GEM_MMAP");
+    }
+    let offset = u64::from_le_bytes(mapping);
+    if offset < 0x400_0000_0000
+        || offset & 4095 != 0
+        || state.mmap_frames(offset, 4096).is_err()
+        || state.mmap_frames(u64::from(first) << 12, 4096).is_ok()
+    {
+        return TestResult::Fail("GEM handle confused with the mmap-offset namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/compact-handles",
+    render_abi_handles_are_compact_and_mmap_offsets_are_separate
+);
+
+fn render_abi_handle_exhaustion_never_wraps_or_replaces_a_buffer() -> TestResult {
+    let state = GemState::new();
+    let first = create(&state, 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT));
+    let original = state.object(first).unwrap();
+    state.next_handle.store(u32::MAX - 1, Ordering::Relaxed);
+    let last = create(&state, 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT));
+    if last != u32::MAX - 1 {
+        return TestResult::Fail("last available handle");
+    }
+    for _ in 0..3 {
+        let mut arg = [0u8; 32];
+        arg[..8].copy_from_slice(&4096u64.to_le_bytes());
+        arg[16..24].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT).to_le_bytes());
+        let before = arg;
+        if dispatch(
+            amd(uapi::DRM_AMDGPU_GEM_CREATE),
+            arg.as_mut_ptr() as usize,
+            &state,
+        ) != Err(FsError::NoSpace)
+            || arg != before
+        {
+            return TestResult::Fail("exhausted namespace wrapped or mutated the request");
+        }
+    }
+    if !Arc::ptr_eq(&original, &state.object(first).unwrap()) || !state.owns(last) {
+        return TestResult::Fail("handle exhaustion replaced a live buffer");
+    }
+    let offset = mmap_offset(last);
+    if state.mmap_frames(offset, 4096).is_err()
+        || state.mmap_frames(offset + 1, 4096).is_ok()
+        || state.mmap_frames(u64::MAX & !4095, 4096).is_ok()
+    {
+        return TestResult::Fail("mmap handle decoding truncated or accepted an unaligned offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/compact-handles",
+    render_abi_handle_exhaustion_never_wraps_or_replaces_a_buffer
+);
+
 /// A card engine that completes everything at once.
 #[derive(Debug)]
 struct Instant;
@@ -164,7 +241,7 @@ fn render_abi_metadata_mmap_layout_and_prime_identity() -> TestResult {
     let mut m = [0u8; 8];
     m[0..4].copy_from_slice(&h.to_le_bytes());
     dispatch(amd(uapi::DRM_AMDGPU_GEM_MMAP), m.as_mut_ptr() as usize, &a).unwrap();
-    if u64::from_le_bytes(m) != u64::from(h) << 12 {
+    if u64::from_le_bytes(m) != crate::amdgpu_gem::mmap_offset(h) {
         return TestResult::Fail("GEM_MMAP offset layout");
     }
     // SET then GET metadata (tiling + 8 bytes of UMD data).
@@ -366,7 +443,9 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
     let imported = peer.import(&shared).unwrap();
     let exported = shared.dma_buf().clone();
     let export_file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(shared.clone()).unwrap();
-    let pin_a = state.mapping_object(u64::from(a) << 12, 4096).unwrap();
+    let pin_a = state
+        .mapping_object(crate::amdgpu_gem::mmap_offset(a), 4096)
+        .unwrap();
     let fence = Arc::new(Busy(core::sync::atomic::AtomicBool::new(false)));
     {
         let b = state.object(b).unwrap();
@@ -398,7 +477,9 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
         {
             return TestResult::Fail("VRAM pressure failed to preserve data or pinned mapping");
         }
-        let frames = state.mmap_frames(u64::from(b) << 12, 3 * 4096).unwrap();
+        let frames = state
+            .mmap_frames(crate::amdgpu_gem::mmap_offset(b), 3 * 4096)
+            .unwrap();
         if frames != evicted.frames(0, 3 * 4096).unwrap() {
             return TestResult::Fail("evicted scattered GTT mapping used a contiguous assumption");
         }
@@ -863,7 +944,7 @@ fn rdna2_hidden_readback_preserves_vm_and_rolls_back_failure() -> TestResult {
     {
         return TestResult::Fail("invisible readback lost data, ownership or VM rebinding");
     }
-    let offset = u64::from(handle) << 12;
+    let offset = crate::amdgpu_gem::mmap_offset(handle);
     if state.mapping_object(offset, P as usize).is_some()
         || state.mmap_frames(offset, P as usize) != Err(FsError::OperationNotPermitted)
         || exported.mmap_frames(0, P as usize) != Err(FsError::OperationNotPermitted)
@@ -1468,9 +1549,11 @@ fn amdgpu_dumb_buffers_live_in_visible_vram() -> TestResult {
         return TestResult::Fail("GEM_OP of a dumb buffer");
     }
     // MAP_DUMB: the GEM_MMAP offset, whose frames are the BAR window.
-    if state.map_dumb(a) != Some(Ok(u64::from(a) << 12))
+    if state.map_dumb(a) != Some(Ok(crate::amdgpu_gem::mmap_offset(a)))
         || state.map_dumb(a + 1000).is_some()
-        || state.mmap_frames(u64::from(a) << 12, 8192).ok()
+        || state
+            .mmap_frames(crate::amdgpu_gem::mmap_offset(a), 8192)
+            .ok()
             != Some(alloc::vec![object.phys(), object.phys() + 4096])
     {
         return TestResult::Fail("MAP_DUMB of a dumb buffer");
@@ -1501,7 +1584,9 @@ fn amdgpu_dumb_buffers_live_in_visible_vram() -> TestResult {
         return TestResult::Fail("dumb buffer did not evict the idle buffer");
     }
     // The pinned and the mapped buffer stay: no room, and no fallback.
-    let mapping = state.mapping_object(u64::from(b) << 12, 4096).unwrap();
+    let mapping = state
+        .mapping_object(crate::amdgpu_gem::mmap_offset(b), 4096)
+        .unwrap();
     let before = gtt_used();
     if state.create_dumb(512, 16, 32) != Err(FsError::NoSpace)
         || gtt_used() != before

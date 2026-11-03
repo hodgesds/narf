@@ -67,3 +67,11 @@ Framebuffer device mmap backings request WC, matching device scanout mappings;
 the address-space owner keeps RAM-backed scanout leaves WB. The devfs proxy
 forwards the complete backing and its attributes. Rebased native AMD generic
 scanouts continue to expose no physical fbdev mmap backing.
+
+DRM's kernel copy path can also present into the permanent boot framebuffer
+through its current kernel mapping. The live physical range and geometry must
+still match the original boot publication, and the copy retains a scanout epoch
+lease. This supports a UEFI GOP selected ahead of a virtual display driver;
+it does not expose a userspace mmap. Adopted external displays continue to
+require the native owner's live publication, and boot GPU quarantine refuses
+all copy targets.

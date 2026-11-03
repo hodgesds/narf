@@ -77,6 +77,8 @@ pub(crate) struct Mapped {
 pub(crate) struct Model {
     pub regs: BTreeMap<u64, u32>,
     pub writes: Vec<(u64, u32)>,
+    /// Every register read, in order (BAR5 byte offsets).
+    pub reads: Vec<u64>,
     pub mem: BTreeMap<u64, u32>,
     pub doorbells: Vec<(u32, u64)>,
     dirty: bool,
@@ -84,8 +86,9 @@ pub(crate) struct Model {
     /// Hardware already remaps the VGT/SPI UMD aliases.
     pub cam_remapped: bool,
     pub cam: Vec<u32>,
-    /// Engines that ignore doorbells: 0 gfx, 1 KIQ, 2 compute, 3/4 SDMA.
-    pub stalled: [bool; 7],
+    /// Engines that ignore doorbells: 0 gfx, 1 KIQ, 2 compute, 3-6 SDMA,
+    /// 7 gfx ring 1 (ME0 pipe 1).
+    pub stalled: [bool; 8],
     pub drop_ib_writes: bool,
     pub drop_fences: bool,
     /// An active HQD that never acknowledges DEQUEUE_REQUEST.
@@ -96,7 +99,7 @@ pub(crate) struct Model {
     pub mapped: Vec<Mapped>,
     pub traps: u32,
     pub sdma_count: u32,
-    rptr: [u64; 7],
+    rptr: [u64; 8],
     pub progress: Arc<AtomicU32>,
     pub revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
     /// User VMIDs: 4 KiB VA page -> MC page (the GMC10 walk is modelled in
@@ -106,6 +109,8 @@ pub(crate) struct Model {
     pub flushes: Vec<(u32, u8)>,
     /// (ring engine, VMID) per executed client IB.
     pub user_ibs: Vec<(usize, u8)>,
+    pub cache_syncs: Vec<usize>,
+    pub gds_limits: Vec<u32>,
 }
 /// GCVM PTB / invalidation registers used by ring-side VM flushes.
 const PTB_LO: u64 = GC0 + 0x1667 * 4;
@@ -128,13 +133,14 @@ impl Model {
         Self {
             regs,
             writes: Vec::new(),
+            reads: Vec::new(),
             mem: BTreeMap::new(),
             doorbells: Vec::new(),
             dirty: false,
             stale: false,
             cam_remapped: false,
             cam: Vec::new(),
-            stalled: [false; 7],
+            stalled: [false; 8],
             drop_ib_writes: false,
             drop_fences: false,
             stuck_hqd: false,
@@ -144,10 +150,12 @@ impl Model {
             mapped: Vec::new(),
             traps: 0,
             sdma_count: 2,
-            rptr: [0; 7],
+            rptr: [0; 8],
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
             vms: BTreeMap::new(),
+            cache_syncs: Vec::new(),
+            gds_limits: Vec::new(),
             flushes: Vec::new(),
             user_ibs: Vec::new(),
         }
@@ -175,6 +183,15 @@ impl Model {
     fn engine_wreg(&mut self, dword: u32, value: u32) {
         let address = u64::from(dword) * 4;
         self.regs.insert(address, value);
+        if address == NBIO + 0x106 * 4 {
+            // NBIO2.3's request/done handshake, independent of VM ACKs.
+            assert!(matches!(value, 1 | 4 | 0x400 | 0x800));
+            self.regs.insert(NBIO + 0x107 * 4, value);
+        }
+        if address == HDP + 0xd1 * 4 {
+            assert_eq!(value, 1);
+            self.stale = false;
+        }
         if (INV_REQ..INV_REQ + 18 * 4).contains(&address) {
             let eng = ((address - INV_REQ) / 4) as u32;
             assert_eq!(value & 0xf8_0000, 0xf8_0000, "legacy L1/L2 invalidation");
@@ -251,6 +268,19 @@ impl Model {
             let body = &words[i + 1..i + 2 + n as usize];
             match op {
                 0x10 => {}
+                0x58 => {
+                    assert!(!ib);
+                    assert_eq!(n, 6);
+                    assert_eq!(body, [0, u32::MAX, 0xffffff, 0, 0, 10, 0xc3b1]);
+                    self.cache_syncs.push(engine);
+                }
+                0x68 => {
+                    assert!(!ib);
+                    assert_eq!(engine, 2);
+                    assert_eq!(n, 1);
+                    assert_eq!(body[0], 0x20e8);
+                    self.gds_limits.push(body[1]);
+                }
                 0x79 => {
                     assert_eq!(n, 1);
                     let reg = 0xc000 + body[0];
@@ -297,7 +327,7 @@ impl Model {
                             assert_eq!(
                                 self.reg(u64::from(body[2]) * 4) & body[4],
                                 body[4],
-                                "no invalidate ack"
+                                "no register write-wait acknowledgement"
                             );
                         }
                         _ => panic!("unexpected WAIT_REG_MEM form"),
@@ -305,6 +335,12 @@ impl Model {
                 }
                 0x42 => assert_eq!(engine, 0, "PFP_SYNC_ME on a compute queue"),
                 0x90 => assert_eq!(engine, 0, "FRAME_CONTROL on a compute queue"),
+                0x8b => {
+                    // gfx_v10_0_ring_emit_sb: one zero body dword, kernel ring.
+                    assert_eq!(engine, 0, "SWITCH_BUFFER on a compute queue");
+                    assert!(!ib, "SWITCH_BUFFER inside a client IB");
+                    assert_eq!((n, body[0]), (0, 0), "SWITCH_BUFFER form");
+                }
                 0x49 => {
                     assert_eq!(n, 6);
                     assert_eq!(body[0], 0x0660_3514);
@@ -347,13 +383,27 @@ impl Model {
                 }
                 0xa2 => {
                     assert_eq!(engine, 1, "MAP_QUEUES outside KIQ");
-                    assert_eq!(body[0] & 0x0c00_00f0, 0, "ENGINE_SEL/QUEUE_SEL");
+                    assert_eq!(body[0] & 0x0000_00f0, 0, "QUEUE_SEL/VMID");
                     assert_eq!(body[0] >> 29, 1, "NUM_QUEUES");
+                    // ENGINE_SEL: 0 compute, 4 gfx (gfx10_kiq_map_queues).
+                    let engine_sel = (body[0] >> 26) & 7;
+                    assert!(engine_sel == 0 || engine_sel == 4, "ENGINE_SEL");
+                    if engine_sel == 4 {
+                        assert_ne!(body[0] & (1 << 18), 0, "gfx ME0 is ME field 1");
+                    }
                     let mqd = u64::from(body[2]) | (u64::from(body[3]) << 32);
+                    // v10 compute and gfx MQDs both keep the rptr report
+                    // address at dwords 139/140.
                     let rptr = u64::from(self.word(mqd + 139 * 4))
                         | (u64::from(self.word(mqd + 140 * 4)) << 32);
                     self.mapped.push(Mapped {
-                        me: if body[0] & (1 << 18) != 0 { 2 } else { 1 },
+                        me: if engine_sel == 4 {
+                            0
+                        } else if body[0] & (1 << 18) != 0 {
+                            2
+                        } else {
+                            1
+                        },
                         pipe: (body[0] >> 16) & 3,
                         queue: (body[0] >> 13) & 7,
                         doorbell: body[1] >> 2,
@@ -456,14 +506,32 @@ impl Model {
                 }
                 8 => {
                     assert_eq!((h >> 28) & 7, 3, "POLL_REGMEM equal");
-                    assert!(h & (1 << 31) != 0, "register POLL_REGMEM unexpected");
-                    let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
-                    assert_eq!(
-                        self.word(address) & words[i + 4],
-                        words[i + 3],
-                        "pipeline sync would hang"
-                    );
+                    if h & (1 << 26) != 0 {
+                        assert!(instance < 2);
+                        assert_eq!(h, 0x3400_0008);
+                        assert_eq!(u64::from(words[i + 1]), NBIO + 0x107 * 4);
+                        assert_eq!(u64::from(words[i + 2]), NBIO + 0x106 * 4);
+                        assert_eq!(words[i + 3], 0x400 << instance);
+                        assert_eq!(words[i + 4], words[i + 3]);
+                        assert_eq!(words[i + 5], 0x0fff_000a);
+                        self.engine_wreg(words[i + 2] / 4, words[i + 3]);
+                        assert_eq!(self.reg(u64::from(words[i + 1])), words[i + 3]);
+                    } else {
+                        assert!(h & (1 << 31) != 0, "register POLL_REGMEM unexpected");
+                        let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
+                        assert_eq!(
+                            self.word(address) & words[i + 4],
+                            words[i + 3],
+                            "pipeline sync would hang"
+                        );
+                    }
                     6
+                }
+                17 => {
+                    assert!(!ib);
+                    assert_eq!(&words[i..i + 5], [17, 0, 0xc3a1_0000, 0, 0]);
+                    self.cache_syncs.push(3 + instance);
+                    5
                 }
                 op => panic!("unexpected SDMA opcode {op}"),
             };
@@ -480,34 +548,39 @@ impl Model {
         if !self.apertures(index) {
             return;
         }
-        // GFX ring 0
-        let control = self.reg(r(CP_RB_DOORBELL_CONTROL));
-        let lower = self.reg(r(CP_RB_DOORBELL_RANGE_LOWER));
-        let upper = self.reg(r(CP_RB_DOORBELL_RANGE_UPPER));
-        if control & (1 << 30) != 0
-            && (control & 0x0fff_fffc) >> 2 == index
-            && (lower..=upper).contains(&(index << 2))
-            && self.reg(r(CP_RB_ACTIVE)) == 1
-            && self.reg(r(CP_ME_CNTL)) & 0x1500_0000 == 0
+        // Gfx rings mapped by the KIQ (ENGINE_SEL 4): the HQD state is the
+        // MQD; the doorbell range registers are global.
+        if let Some(q) = self
+            .mapped
+            .iter()
+            .copied()
+            .find(|q| q.me == 0 && q.doorbell == index)
         {
-            let cntl = self.reg(r(CP_RB0_CNTL));
-            let base = (u64::from(self.reg(r(CP_RB0_BASE)))
-                | (u64::from(self.reg(r(CP_RB0_BASE_HI))) << 32))
-                << 8;
-            let rptr_address = u64::from(self.reg(r(CP_RB0_RPTR_ADDR)))
-                | (u64::from(self.reg(r(CP_RB0_RPTR_ADDR_HI))) << 32);
-            let wptr_address = u64::from(self.reg(r(CP_RB_WPTR_POLL_ADDR_LO)))
-                | (u64::from(self.reg(r(CP_RB_WPTR_POLL_ADDR_HI))) << 32);
-            assert_eq!(shadow(self, wptr_address), value, "gfx wptr shadow");
-            if self.stalled[0] {
+            let field = |m: &Self, i: u64| m.word(q.mqd + i * 4);
+            let control = field(self, 143);
+            if control & (1 << 30) == 0
+                || (control & 0x0fff_fffc) >> 2 != index
+                || !(self.reg(r(CP_RB_DOORBELL_RANGE_LOWER))
+                    ..=self.reg(r(CP_RB_DOORBELL_RANGE_UPPER)))
+                    .contains(&(index << 2))
+                || field(self, 130) != 1
+                || self.reg(r(CP_ME_CNTL)) & 0x1500_0000 != 0
+            {
                 return;
             }
-            let size = (8u64 << (cntl & 0x3f)) / 4;
-            let words = self.ring(base, size, self.rptr[0], value);
+            let wptr_address = u64::from(field(self, 141)) | (u64::from(field(self, 142)) << 32);
+            assert_eq!(wptr_address, q.wptr, "MAP_QUEUES wptr vs MQD poll address");
+            assert_eq!(shadow(self, wptr_address), value, "gfx wptr shadow");
+            let slot = if q.pipe == 0 { 0 } else { 7 };
+            if self.stalled[slot] {
+                return;
+            }
+            let base = (u64::from(field(self, 136)) | (u64::from(field(self, 137)) << 32)) << 8;
+            let size = 2u64 << (field(self, 145) & 0x3f);
+            let words = self.ring(base, size, self.rptr[slot], value);
             self.pm4(&words, 0, false, 0);
-            self.rptr[0] = value;
-            self.regs.insert(r(CP_RB0_RPTR), value as u32);
-            self.put(rptr_address, value as u32);
+            self.rptr[slot] = value;
+            self.put(q.rptr, value as u32);
             return;
         }
         // MEC queues: KIQ through its HQD registers, KCQs through MAP_QUEUES.
@@ -540,7 +613,12 @@ impl Model {
             self.put(rptr_address, value as u32);
             return;
         }
-        if let Some(q) = self.mapped.iter().copied().find(|q| q.doorbell == index) {
+        if let Some(q) = self
+            .mapped
+            .iter()
+            .copied()
+            .find(|q| q.me != 0 && q.doorbell == index)
+        {
             if !mec {
                 return;
             }
@@ -615,6 +693,7 @@ impl Io for Model {
         Some(16)
     }
     fn read(&mut self, address: u64) -> u32 {
+        self.reads.push(address);
         let address = self.key(self.cam_target(address));
         *self.regs.get(&address).unwrap_or(&0)
     }
@@ -699,16 +778,33 @@ pub(crate) fn cancel_at<F: Future>(future: F, progress: &AtomicU32, goal: u32) -
 fn gfx(model: Model) -> (Pool, GfxEngine<Model>) {
     let pool = pool(1 << 20);
     let queue = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx).unwrap();
+    let pipe1 = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING1, fence::Engine::Gfx).unwrap();
     (
         pool,
         GfxEngine {
             hw: hw(model),
             queue,
+            pipe1,
             state: GfxState::Prepared,
             proof: GfxProof::default(),
             golden: false,
         },
     )
+}
+
+impl GfxEngine<Model> {
+    /// The boot's GfxRing stage against the model: `prepare_queues`, the
+    /// KIQ's MAP_QUEUES packets (ENGINE_SEL 4) decoded by the model's KIQ,
+    /// then `start_mapped`.
+    pub(crate) async fn start(&mut self) -> Result<(), Error> {
+        let maps = self.prepare_queues()?;
+        let words: Vec<u32> = maps
+            .iter()
+            .flat_map(|m| pm4::map_queues_engine(0, m.pipe, 0, m.doorbell, m.mqd, m.wptr, 4))
+            .collect();
+        self.hw.io.pm4(&words, 1, false, 0);
+        self.start_mapped().await
+    }
 }
 
 /// Boot-test GPU descriptor with the live Navi22 discovery bases.
@@ -766,6 +862,30 @@ fn cp_navi22_layout_uses_discovery_banks_and_rejects_aliases() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/cp-navi22",
     cp_navi22_layout_uses_discovery_banks_and_rejects_aliases
+);
+
+/// The TDR sampler holds no GFXOFF reference (Linux's fence timeout takes
+/// none): a progress sample may touch only HDP, outside GC, and memory.
+fn cp_navi22_progress_sample_touches_no_gc_register() -> TestResult {
+    let (_pool, mut e) = gfx(enabled());
+    let (reads, writes) = (e.hw.io.reads.len(), e.hw.io.writes.len());
+    if progress(&mut e.hw, &e.queue).is_err() {
+        return TestResult::Fail("progress sample failed");
+    }
+    let invalidate = HDP + 0xd1 * 4;
+    if e.hw.io.reads[reads..].iter().any(|&a| a != invalidate)
+        || e.hw.io.writes[writes..]
+            .iter()
+            .any(|&(a, v)| (a, v) != (invalidate, 1))
+        || e.hw.io.writes.len() == writes
+    {
+        return TestResult::Fail("progress sample touched a register other than HDP invalidate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-navi22",
+    cp_navi22_progress_sample_touches_no_gc_register
 );
 
 fn cp_navi22_gfx_configure_programs_golden_cam_and_constants() -> TestResult {
@@ -839,6 +959,81 @@ kernel_test_in!(
     cp_navi22_gfx_configure_programs_golden_cam_and_constants
 );
 
+/// Linux's default gfx queue path (`amdgpu_async_gfx_ring` = 1) for GC 10.3's
+/// two gfx rings: a v10 gfx MQD per ring (`gfx_v10_0_gfx_mqd_init`), the
+/// doorbell range set from ring 0 only, KIQ MAP_QUEUES with ENGINE_SEL 4,
+/// then CLEAR_STATE on ring 1 and a ring test of each ring. The direct
+/// CP_RB0/RB1 and CP_RB_DOORBELL_CONTROL registers are never programmed.
+fn cp_navi22_gfx_mqds_map_through_kiq_and_start_both_rings() -> TestResult {
+    use crate::amdgpu_cp_navi22::gfx_mqd_dw as dw;
+    let (_pool, mut e) = gfx(enabled());
+    if run(e.configure()).is_err() || run(e.start()).is_err() {
+        return TestResult::Fail("gfx start failed");
+    }
+    let m = &e.hw.io;
+    let gfx: Vec<_> = m.mapped.iter().filter(|q| q.me == 0).copied().collect();
+    if gfx.len() != 2 {
+        return TestResult::Fail("KIQ did not map both gfx queues");
+    }
+    for (pipe, q, priority) in [(0u32, &e.queue, 0u32), (1, &e.pipe1, 1)] {
+        let mapped = gfx[pipe as usize];
+        let mqd = q.address(GFX_MQD);
+        let f = |i: usize| m.word(mqd + i as u64 * 4);
+        let (base, rptr, wptr) = (q.address(0) >> 8, q.address(RPTR), q.address(WPTR));
+        if mapped.pipe != pipe
+            || mapped.queue != 0
+            || mapped.doorbell != q.doorbell
+            || mapped.mqd != mqd
+            || mapped.wptr != wptr
+            || f(dw::MQD_BASE_ADDR) != mqd as u32
+            || f(dw::MQD_BASE_ADDR_HI) != (mqd >> 32) as u32
+            || f(dw::MQD_CONTROL) & 0x0300_010f != 0x100
+            || f(dw::HQD_ACTIVE) != 1
+            || f(dw::HQD_VMID) != 0
+            || f(dw::HQD_QUEUE_PRIORITY) & 0xf != priority
+            || f(dw::HQD_QUANTUM) & 1 != 1
+            || f(dw::HQD_BASE) != base as u32
+            || f(dw::HQD_BASE_HI) != (base >> 32) as u32
+            || f(dw::HQD_RPTR_ADDR) != rptr as u32
+            || f(dw::RB_WPTR_POLL_ADDR_LO) != wptr as u32
+            || f(dw::HQD_CNTL) & 0x3f3f != RB_BUFSZ | ((RB_BUFSZ - 2) << 8)
+            || f(dw::RB_DOORBELL_CONTROL) & 0x4fff_fffc != (1 << 30) | (q.doorbell << 2)
+        {
+            return TestResult::Fail("gfx MQD differs from gfx_v10_0_gfx_mqd_init");
+        }
+    }
+    // The global range covers both rings: lower from ring 0.
+    if m.reg(r(CP_RB_DOORBELL_RANGE_LOWER)) != (doorbell::GFX_RING0 << 2) & 0xffc
+        || m.reg(r(CP_RB_DOORBELL_RANGE_UPPER)) != 0xffc
+        || !((doorbell::GFX_RING0 << 2)..=0xffc).contains(&(doorbell::GFX_RING1 << 2))
+    {
+        return TestResult::Fail("gfx doorbell range");
+    }
+    let direct = [
+        CP_RB_DOORBELL_CONTROL,
+        CP_RB0_CNTL,
+        CP_RB0_BASE,
+        CP_RB_ACTIVE,
+    ];
+    if m.writes
+        .iter()
+        .any(|&(a, _)| direct.iter().any(|&reg| r(reg) == a))
+    {
+        return TestResult::Fail("async gfx path programmed the direct CP_RB registers");
+    }
+    if m.clear_states != 2 || m.rptr[0] == 0 || m.rptr[7] == 0 || !e.proof.ring {
+        return TestResult::Fail("both gfx rings must run CLEAR_STATE and their ring tests");
+    }
+    if m.reg(r(GRBM_GFX_CNTL)) & 0xfff != 0 {
+        return TestResult::Fail("GRBM selection not restored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-navi22",
+    cp_navi22_gfx_mqds_map_through_kiq_and_start_both_rings
+);
+
 fn cp_navi22_gfx_ring_clear_state_ring_and_ib_tests() -> TestResult {
     let (pool, mut e) = gfx(enabled());
     let available = pool.available();
@@ -876,41 +1071,36 @@ fn cp_navi22_gfx_ring_clear_state_ring_and_ib_tests() -> TestResult {
     if !m.writes[ring..].windows(6).any(|w| w == brake) {
         return TestResult::Fail("GC 10.3 power-brake sequence missing or misordered");
     }
-    let base = e.queue.address(0);
+    // Async gfx path: ring state lives in the MQDs (checked in
+    // cp_navi22_gfx_mqds_map_through_kiq_and_start_both_rings).
     for (reg, value) in [
-        (CP_RB0_CNTL, 0x80a),
-        (CP_RB0_BASE, (base >> 8) as u32),
-        (CP_RB0_BASE_HI, (base >> 40) as u32),
-        (CP_RB_ACTIVE, 1),
-        (CP_RB_DOORBELL_CONTROL, (1 << 30) | (0x116 << 2)),
         (CP_RB_DOORBELL_RANGE_LOWER, 0x458),
         (CP_RB_DOORBELL_RANGE_UPPER, 0xffc),
         (CP_MAX_CONTEXT, 7),
         (CP_DEVICE_ID, 1),
         (CP_ME_CNTL, 0),
-        (CP_RB_VMID, 0),
         (SCRATCH_REG0, 0xdead_beef),
     ] {
         if m.reg(r(reg)) != value {
             return TestResult::Fail("gfx ring register encoding");
         }
     }
-    // CP_RB0_CNTL is written twice around the 1 ms pointer settle delay.
-    let cntl = m
-        .writes
-        .iter()
-        .filter(|&&(a, _)| a == r(CP_RB0_CNTL))
-        .count();
     let order = |a: Reg| m.writes.iter().position(|&(w, _)| w == r(a)).unwrap();
-    if cntl != 2
-        || order(CP_RB0_RPTR_ADDR) > order(CP_RB0_BASE)
-        || order(CP_RB_DOORBELL_CONTROL) > order(CP_ME_CNTL)
-        || m.clear_states != 1
+    // The doorbell range is set (kgq_init_queue) before the CP is unhalted.
+    if order(CP_RB_DOORBELL_RANGE_LOWER) > order(CP_ME_CNTL)
+        || m.clear_states != 2
         || m.context.get(&0xa00d) != Some(&0x4000_4000)
         || m.context.get(&0xa0d7) != Some(&0)
         || m.context.len() != 922
-        || m.doorbells.iter().map(|d| d.0).any(|i| i != 0x116)
-        || m.doorbells.iter().map(|d| d.1).collect::<Vec<_>>() != [1024, 1280, 1536]
+        // Ring 0 CSB, ring 1 CLEAR_STATE, ring tests 0 then 1, ring 0 IB test.
+        || m.doorbells
+            != [
+                (0x116, 1024),
+                (0x118, 256),
+                (0x116, 1280),
+                (0x118, 512),
+                (0x116, 1536),
+            ]
         || m.word(e.queue.address(SCRATCH)) != 0xdead_beef
         || m.word(e.queue.address(FENCE)) != 1
         || m.word(e.queue.address(RPTR)) != 1536
@@ -976,7 +1166,8 @@ fn cp_navi22_gfx_failures_are_bounded_and_terminal() -> TestResult {
         };
         let (pool, mut e) = gfx(model);
         if case == 6 {
-            e.hw.io.revoke = Some((r(CP_RB_ACTIVE), 1, e.hw.authority));
+            // Revoked mid-start: on the async path's doorbell-range write.
+            e.hw.io.revoke = Some((r(CP_RB_DOORBELL_RANGE_LOWER), 0x458, e.hw.authority));
         }
         let result = match run(e.configure()) {
             Err(error) => Err(error),
@@ -1016,7 +1207,8 @@ fn cp_navi22_gfx_cancellation_retains_ring_and_blocks_replay() -> TestResult {
     if run(e.configure()).is_err() {
         return TestResult::Fail("gfx configure failed");
     }
-    // First doorbell (clear-state) has been rung; cancel during the ring test.
+    // Clear-state doorbells (ring 0 CSB, ring 1 CLEAR_STATE) have been rung;
+    // cancel during the stalled ring-0 test.
     if !cancel_at(e.start(), &progress, 2 << 16) {
         return TestResult::Fail("gfx start did not reach its ring test");
     }
@@ -1029,7 +1221,8 @@ fn cp_navi22_gfx_cancellation_retains_ring_and_blocks_replay() -> TestResult {
         return TestResult::Fail("cancelled gfx start replayed");
     }
     drop(e);
-    if pool.available() != (1 << 20) - QUEUE_BYTES {
+    // Both published gfx rings (pipe 0 and pipe 1) stay reserved.
+    if pool.available() != (1 << 20) - 2 * QUEUE_BYTES {
         return TestResult::Fail("cancelled gfx ring recycled");
     }
     TestResult::Pass
@@ -1096,7 +1289,8 @@ fn cp_navi22_owner_constructors_reserve_without_io() -> TestResult {
     if gfx.state() != GfxState::Prepared
         || compute.state() != crate::amdgpu_kiq_navi22::State::Prepared
         || sdma.state() != crate::amdgpu_sdma_navi22_queues::State::Prepared
-        || pool.available() != (1 << 20) - 5 * QUEUE_BYTES
+        // gfx rings 0 and 1, KIQ + compute, SDMA0/1.
+        || pool.available() != (1 << 20) - 6 * QUEUE_BYTES
         || doorbells().bus_address() != BAR2
     {
         return TestResult::Fail("queue owners performed I/O or misreserved");
@@ -1129,8 +1323,8 @@ fn cp_navi22_fence_interrupts_arm_eop_and_both_sdma_traps() -> TestResult {
         return TestResult::Fail("fence interrupt enable failed");
     }
     let expected = [
-        (r(CP_INT_CNTL_RING0), 0x0400_0001),
-        (r(CP_ME1_PIPE0_INT_CNTL), 0x0400_0000),
+        (r(CP_INT_CNTL_RING0), 0x05c0_0001),
+        (r(CP_ME1_PIPE0_INT_CNTL), 0x0580_0000),
         (sdma(0, SDMA0_CNTL), 0x23),
         (sdma(1, SDMA0_CNTL), 0x23),
     ];
@@ -1261,7 +1455,7 @@ fn rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs() -> TestRes
         run(engine.configure()).unwrap();
         run(engine.start()).unwrap();
         run(engine.test_ib()).unwrap();
-        if engine.state != GfxState::Verified || engine.hw.io.clear_states != 1 {
+        if engine.state != GfxState::Verified || engine.hw.io.clear_states != 2 {
             return TestResult::Fail("RDNA2 GFX clear-state/ring/IB proof failed");
         }
     }

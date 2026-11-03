@@ -304,7 +304,7 @@ has an off switch for bring-up:
 | Native HDMI/DP display (retires the GOP) | on | `amdgpu.native_display=0` |
 | Native client submission (radeonsi/RADV, VCN/JPEG) | on | `amdgpu.rdna2_accel=0` |
 | DCN3.0 hardware cursor | on | `amdgpu.rdna2_hw_cursor=0` |
-| Power saving (GFXOFF, CG, hub PG, memory/fabric DPM, deep sleep, PMFW watermarks) | all requested | `amdgpu.rdna2_pg=none`, or a list such as `amdgpu.rdna2_pg=gfxoff,cg` |
+| Power saving (GFXOFF, CG, hub PG, memory/fabric DPM, deep sleep, PMFW watermarks) | all but GFXOFF requested (opt in with `gfxoff` in the list) | `amdgpu.rdna2_pg=none`, or a list such as `amdgpu.rdna2_pg=gfxoff,cg` |
 | Automatic GPU recovery after a hang (mode1, at most 3 per boot) | on | `amdgpu.gpu_recovery=0` |
 | Multi-display (secondary CRTCs) | off | `amdgpu.rdna2_multi` |
 
@@ -362,7 +362,258 @@ physical HDMI link or Mesa shader execution on this card.
 | Post-modeset power saving | Latest boot failed on an all-ones RLC override read after partial writes. Its full-word override operand now follows Linux's RMW, with a fresh running-RLC control probe before accepting all-set data; status and other control reads still fail on all ones. Native RX 6000 submission now declares GC access guarded: submission, READ_MMR_REG, TDR and kernel VRAM work acquire a GFXOFF reference and recheck activation/reset epoch under the owner. Other policy prerequisites still apply. Physical power transitions remain unverified. |
 | Recovery, cancellation and device loss | Native RX 6000 tracks guilty hangs, cancelled pending jobs and device loss separately from physical retirement. Shared WAIT_CS and WAIT_FENCES all/any keep the original job/submitter across reset on RX 6000 and RX 9000. Failed jobs wake waiters without releasing unconfirmed memory. Physical mode1 reset remains unverified. |
 | VCN idle and resume | RX 6000 VCN3 idle work releases encode DPG pause after physical completion, stops idle instances after one second and conditionally sends SMU PowerDownVcn. Begin-use restores power/hardware while preserving sessions and logical fences; JPEG remains independent. MM_DPM_PG keeps its existing opt-in. Static/DPG, cancellation and failure paths have model coverage; physical acceptance remains pending. |
-| Optional media and topology | Native VCN degraded to `BootFailed(0)` and topology returned `Readback`; JPEG verified. Topology now checks defined GRBM selector fields while ignoring reserved read bits; a stuck real selector still fails. Native topology and VCN decoding remain unverified. |
+| Optional media and topology | Native VCN degraded; JPEG verified. The 2026-11-01 Linux comparison below identified the selector-readback check as invalid on this GPU. Subsequent physical boots completed topology sampling; VCN decoding remains unverified. |
+
+The 2026-11-01 physical boot `9e92160e-b279-479e-b112-fecaa9c90366`
+(kernel revision `9d7387de6`, EFI SHA-256
+`e951a532095dc73bda462e60d91c1e7005ce3da82149f9678f8afd0a6c98d4fa`)
+reached PlasmaLogin on the writable Btrfs root. VT 1 and the greeter's DRM
+ACL were active. Its persistent journal records Mesa rejecting
+`(family_id, chip_external_rev): (143, 0)` at 89 seconds, KWin's service
+startup timeout at 107 seconds, and the compositor's SIGKILL at 113 seconds.
+The wallpaper/greeter Wayland connection failures and wallpaper SIGABRT
+followed the compositor's termination; they do not identify the first failure.
+
+A read-only `AMDGPU_INFO_DEV_INFO` query on the same RX 6750 XT under
+Linux returned chip revision 0, external revision `0x32`, PCI revision
+`0xc0` and family 143. Linux `nv_common_early_init` computes the external
+revision from the NBIO ATI revision strap independently of GC harvesting.
+NARF now samples and publishes that strap before cold boot, preserving a
+known identity if the optional harvest is unavailable, without inventing
+CU/RB masks.
+
+Linux's driver-controlled `amdgpu_regs2` read interface, with its runtime-PM
+reference, GRBM mutex and automatic broadcast restoration, returned zero for
+GRBM_GFX_INDEX at each of SE/SA 0/0, 0/1, 1/0, 1/1 and broadcast. The same
+reads returned GB_ADDR_CONFIG `0x344` and plausible fused harvest data.
+The GC discovery bases were `0x1260`, `0xa000`, `0x1c000`, `0x02402c00`;
+the selector byte offset was `0x30800`. NARF's extra selector-echo check
+therefore discarded a valid selection. The sampler now follows Linux
+`gfx_v10_0_select_se_sh` / `gfx_v10_0_get_cu_info`: write the selector,
+read the harvest data and restore broadcast, including on read failure.
+The zero-readback and identity regressions both fail the original code.
+These findings identify a concrete Mesa initialization blocker. Physical
+boots `3890c824-b279-479e-b112-fecaf8c86c73` and
+`90c7a810-b279-479e-b112-feca2ce35c69` with revision `af55606ee`
+completed topology sampling without the earlier Mesa identity rejection.
+Neither reached a visible desktop.
+
+The latter boot's KWin main thread was sampled in the dynamic loader,
+including a 1024-byte library read at 135 seconds. KWin exited before the
+collector could copy its stack; the persistent journal ends before that
+process starts. Separate fd-link and fdinfo samples can observe descriptor
+reuse and do not establish a stable blocked file or the termination cause.
+The preceding boot had a main-thread 4096-byte read, an approximately 8 GiB
+resident footprint and a service startup timeout; the allocation's origin
+and that read's fd target remain unknown.
+
+The read-path audit found that Btrfs `read_file` collected every extent of
+an inode for each small read. Linux `fs/btrfs/inode.c::btrfs_get_extent`
+instead looks up the requested offset and its predecessor. Linux FIEMAP
+on this host reports 713 extents for `libLLVM.so.23.1` and 361 for
+`libgallium-26.2.5-arch3.1.so`. NARF now seeks to the covering predecessor
+and walks only the requested window, retaining the existing operation
+lock, checksums, decompressed cache and hole behavior. A synthetic
+512-extent, 32-leaf regression bounds a 1 KiB middle read to four metadata
+reads; the old whole-inode scan fails it. This establishes read amplification
+and its correction, not the cause of the remaining native desktop failure
+or a measured startup-time improvement.
+
+The next physical attempt, `045727b4-b279-479e-b112-feca662b1b3b`,
+used the installed `fc68acfe1` bundle. The operator reset after about a
+minute; the saved process/seat samples end before PlasmaLogin or KWin
+starts. This attempt therefore does not establish whether the read-window
+correction resolves KWin startup. Its direct kernel stream places memory
+training at 33.100091–43.972903 and 37 completed GPU summary lines at
+46.641497–49.247976, with approximately 72 ms between adjacent lines.
+Early device-node setup spans approximately 16 seconds across the kernel
+stream and journal. These are observations from one boot, not a benchmark;
+the service intervals overlap. NARF scales the raw TSC without subtracting
+kernel entry, so absolute timestamps can include firmware time, and early
+records before calibration are zero.
+
+The console audit identifies a concrete source of synchronous work: every
+scroll repainted the full 480×266 character grid through the framebuffer
+hook while IRQ-safe console locks were held. PID 1's `/dev/kmsg` output
+uses this same hook. Scrolling now compares character rows in RAM and
+paints changed cells only; palette changes and `fb_mut` drawing force a
+complete repaint. Regressions check pixels, redraw counts, palette changes,
+the reserved beacon band and stride padding. Native boot-time improvement
+and visible Plasma remain unverified.
+
+Boot `616ff046-b079-479e-b012-fe4a55b77042`, with the installed
+`fb3f69a38` console correction, ran long enough to reach KWin. The user
+manager starts KWin at approximately 107 seconds and reports it started
+at 115.67. At 129.49 it reports `Failed to create framebuffer: Invalid
+argument`, repeated before a Compute-ring timeout at 132.58 (signalled
+sequence 1, emitted 2). Recovery returns `Unsupported`; greeter and
+wallpaper clients subsequently report no outputs. The kernel status panel
+continuing to draw is consistent with the display never accepting a
+client frame: console ownership changes after the presenter accepts a
+client frame, before the asynchronous copy and hardware flip complete.
+
+The framebuffer rejection has a reproducible entry-path defect:
+`amdgpu_addfb2_bo` admitted only `gfx12_modifiers` cards, although
+`Card::addfb2_bo` already admitted DCN30's linear native GEM buffers. On
+Navi22 the ioctl therefore skipped the per-open AMDGPU GEM table and fell
+through to the generic card's different handle table. A primary-device
+ioctl regression fails the original code and passes when the entry gate
+admits `linear_gem_card` too. It covers 8888 formats with implicit/explicit
+LINEAR, legacy ADDFB, foreign-handle and tiled-layout rejection, master
+authority, and framebuffer lifetime after GEM_CLOSE and file close.
+This does not enable RDNA4 modifiers or planes.
+
+The compute timeout's cause remains unproven. The timeout path now reports
+the stalled ring's raw VM-programming writeback before recovery withdraws
+the owner. No polling or syscall-path tracing is added. This value alone
+does not prove the client job completed, or that a reused VM required a
+new programming fence. The captured approximately 8 GiB KWin RSS also
+remains unexplained. Physical desktop acceptance after the ioctl fix is
+still required.
+
+The subsequent Linux comparison also found the Navi22 native adapter
+discarded IB flags when converting the generic submission. This omitted
+requested `EMIT_MEM_SYNC` on graphics/compute/SDMA and
+`RESET_GDS_MAX_WAVE_ID` on compute. The adapter now retains flags, and the
+emitters follow `amdgpu_ib_schedule`, `gfx_v10_0_emit_mem_sync`,
+`gfx_v10_0_ring_emit_ib_compute`, and `sdma_v5_2_ring_emit_mem_sync`.
+The GDS limit uses discovery maxima, as `gfx_v10_0_set_gds_init` does;
+unknown or invalid geometry refuses the reset request before ring access.
+Packet regressions fail with the omitted emitters. Register-model jobs
+also exercise requested synchronization on each engine through VM
+translation and final fence completion. Whether the stalled native job
+requested these flags is not established by the saved log.
+
+Boot `c361e996-b179-479e-b012-fe4a04307caa` verifies that the installed
+`9a0ec98c4` kernel contains both the framebuffer-entry and IB-flag fixes.
+Native queue/IB proofs pass at about 36.15 seconds, followed by 4K HDMI setup
+at 37.49. PlasmaLogin starts at 89.75 and its unit reports started at 94.94;
+the persistent journal ends there, before any KWin execution, framebuffer
+attempt or client-compute timeout is recorded. This capture therefore does
+not test either correction through desktop presentation.
+
+The startup audit also reproduced a collector observer effect on the same
+kernel in a disposable Arch/Btrfs VM. The previous shell collector made
+byte-at-a-time pipe reads and many small Btrfs writes; bulk reads alone left
+the small-write problem. A bounded userspace helper now batches both sides,
+including process samples, while map copies use `cat`. Host regressions and
+NARF guest checks cover byte preservation, partial flush, normal stop and
+retained logs after a clean reboot. See
+[native graphical capture setup](BOOTING_ON_CACHYOS.md#capturing-a-native-graphical-boot).
+The corrected collector's effect on physical startup and Plasma remains
+unverified. The journal-flush unit's 11.21-second elapsed interval in this
+physical capture must not be described as pure disk-flush time: journald
+reports 1.46 seconds for its own flush operation.
+
+With the corrected collector, boot `47e05b54-b079-479e-b012-fe4ac670254b`
+records PlasmaLogin started at 60.05 seconds and KWin launched at 65.15.
+KWin never acquires its service's bus name before the distro's 15-second
+user-service start timeout. systemd begins terminating it at 83.19 and kills
+it at 90.04; the greeter's later Wayland connection failures are downstream
+of that loss. No framebuffer rejection or client-compute timeout is recorded
+in this attempt. These are observations from one boot, not a performance
+benchmark of the collector change.
+
+The previously unexplained 8 GiB RSS has a concrete ABI cause. NARF starts
+amdgpu GEM handles at `0x40000000` to distinguish them from its generic dumb
+table. libdrm 2.4.134's
+[`handle_table_insert`](https://gitlab.freedesktop.org/mesa/drm/-/blob/libdrm-2.4.134/amdgpu/handle_table.c)
+uses a dense handle-indexed pointer array and zeroes newly grown entries.
+The first handle therefore requests 8 GiB + 4096 bytes; the saved KWin maps
+contain an 8 GiB + 8192-byte anonymous malloc mapping, and samples catch its
+RSS rising through 2.4, 5.3 and 8.1 GiB during libc's zeroing loop.
+
+The correction gives render opens and native RDNA2/GFX12 primary opens
+compact handles starting at one. Native dumb buffers use that same per-open
+table, and mmap routing uses a separate opaque offset tag. A missing native
+heap fails rather than creating a conflicting generic dumb handle. Legacy
+primary cards using the old card-global dumb table remain outside this
+compact-primary contract. New ioctl regressions reproduce the original
+sparse-handle and split-table failures.
+
+Boot `331b602f-b079-479e-b012-fe4a7c8db876` on `785513a38` validates the
+allocation correction: sampled KWin RSS peaks at 107324 KiB, and the earlier
+8 GiB anonymous allocation is absent. It still fails to show the greeter.
+KWin launches at 73.33 seconds; four atomic TEST_ONLY probes pass at 93.33–96.44.
+The native display is unlit and relit at 96.45–96.55. GFX times out at 98.37
+with signaled sequence 1 and emitted sequence 3; the raw VM-programming
+writeback is 2. This establishes progress through VM programming, without
+establishing that either client job or the first frame completed. The reported
+black screen therefore does not establish a successful framebuffer takeover.
+
+KWin disappears by the 102.25-second process sample; the greeter aborts at
+103.29. The persistent journal ends at 77.46, so the order and cause of KWin's
+exit relative to the GPU stall are not captured. In particular, the installed
+user manager's 15-second start timeout and 10-second stop timeout overlap
+this interval; a timeout kill must not be presented as proven for this boot.
+Likewise, sparse `/proc/PID/syscall` read snapshots do not establish that KWin
+blocked in a single DRM read throughout the sample gap.
+
+The next graphics-timeout capture records CP/GRBM status, current IB bases,
+sizes and offsets, GC10.3 VM faults and a ring window around the hardware
+read pointer. It runs only after a detected hang, holds the normal owner and
+power lease while reading, and reports after releasing them. This adds
+localization evidence; it does not correct or physically validate the stalled
+client submission. Desktop presentation remains unverified.
+
+### Linux Navi22 initialization comparison
+
+Reference checkout: `~/git/linux` at `ecd997b0189a`. This is a mapping of
+the active PF boot, queue and presentation paths, with targeted register
+and packet comparisons. It is not an exhaustive equivalence proof of
+Linux AMDGPU, or physical validation of every optional block.
+
+| Phase | Linux reference | NARF mapping and evidence / limit |
+| --- | --- | --- |
+| Discovery and board identity | `amdgpu_discovery.c`, GC 10.3.2 / NV, PSP11, GMC10, GFX10, SDMA5.2 | `amdgpu_rdna2`, `amdgpu_info_navi22`, discovery maxima and separately sampled NBIO revision. Native topology completes; earlier wrong external-revision selection is corrected. |
+| Training and firmware | `psp_v11_0.c`, `amdgpu_psp.c`: training, SOS, PSP ring/TMR, SMC and graphics firmware, RLC autoload | `ColdBoot`'s ResetOnInit through RlcBoot and PowerSetup stages. Native training, firmware versions and RLC boot witnesses succeed. Stage ordering is explicit rather than Linux's IP callback passes. |
+| Translation and interrupts | `amdgpu_device_ip_init`, `gmc_v10_0_hw_init`, IH phase 1 | MemoryHubs/Gart precede IH and engine starts; native VMID0 SDMA and IH round-trip proofs succeed. Client VMIDs are a separate, later path. |
+| GFX constants and queues | `gfx_v10_0_hw_init`, constants/CAM/SH_MEM/GDS VMIDs, RLC resume, `cp_resume` | `amdgpu_cp_navi22`, `amdgpu_kiq_navi22`: direct GFX ring, KIQ and one mapped kernel compute queue. Uses Linux's direct-ring alternative, without MES or hardware preemption. Native ring and IB fences pass. |
+| SDMA | `sdma_v5_2_start`, ring/IB tests | `amdgpu_sdma_navi22_queues`; both native SDMA queues pass. Ring-side user VM flush, IB alignment and cache-rinse packets have model coverage. |
+| Client jobs | `amdgpu_ib_schedule`, `amdgpu_vm_flush`, GMC10/GFX10/SDMA5.2 emitters | PTB/invalidation/PASID writes, pipeline sync, HDP flush and completion fences are present. Missing IB flag requests are corrected here. Physical boot's first client compute job still lacks a completion witness. Boot's VMID0 self-test does not prove shader execution under a client VMID. |
+| DMUB and display | `dm_dmub_hw_init`, DCN30 modeset / atomic update | NARF starts DMUB after queue proofs, whereas Linux starts DM earlier in phase 2. Native DMUB and 4K HDMI setup succeed. NARF supports a linear primary copy presenter rather than Linux's full direct-scanout plane support; the framebuffer ioctl gate is corrected. |
+| Render-to-scanout handoff | implicit dma-resv waits, prepare_fb, atomic commit | NARF resolves and pins native GEM targets, waits for rendering and hidden-VRAM readback outside OWNER, then copies and flips. Models cover lifetime and wait ordering. The failing boot never supplies a working client frame. |
+| Late clock/power gating | `amdgpu_device_ip_late_init`, GFX safe-mode clock gating and SMU GFXOFF | NARF applies admitted policy after queue tests and display setup; client access takes a GFXOFF reference before OWNER. The all-ones RLC override message is diagnostic: an independent enabled-RLC read admits that value, and native boot reports policy applied. Post-idle client execution still needs physical confirmation. |
+| VCN/JPEG | `vcn_v3_0_hw_init`, `jpeg_v3_0_hw_init`, media IB tests | Native MediaIbTests time out; the failed VCN rings are withheld, and only verified JPEG is exposed (`0x8`). This remains an unresolved difference; NARF deliberately continues graphics boot after a media failure. |
+| Hang recovery | `amdgpu_device_gpu_recover` and IP resume | Native attempt returns Unsupported: NARF's recovery admission excludes a retained training owner. Recovery is not equivalent to Linux, and does not explain why the original compute job stalls. Do not remove this guard without implementing training replay and validating reset ownership. |
+
+Remaining hardware questions are the first client compute completion,
+native presentation after these corrections, post-idle power behavior,
+media self-tests, and trained-board recovery. No successful desktop or
+complete Linux equivalence is claimed from the VM boot matrix.
+
+### GFX-timeout audit, 2026-11-02
+
+On the 2026-11-01 native boot the first client GFX job (seq 1) completed. Seq 2
+passed its VM-programming writeback and then stalled. It was already pending
+at about 96.35 s, before KWin's first real modeset at 96.45 s. No GPU page
+fault was logged. Every client job ran with the default power saving (GFX/SoC
+clock gating and GFXOFF), which the boot IB tests do not exercise. The audit
+compared NARF with Linux and changed these:
+
+- **Ring frame.** CP and SDMA jobs now carry `amdgpu_ib_schedule`'s HDP flush
+  before the IBs and its HDP read-cache invalidate before the fence. Kernel
+  SDMA fill/copy jobs carry them too. GFX jobs end with SWITCH_BUFFER. This
+  adds to the CPU-side HDP flush and invalidate, which were already present.
+- **Gang submission.** `GANG_SUBMIT` is no longer advertised. A job naming
+  more than one `(ip, instance, ring)` is rejected instead of being merged.
+- **CP faults.** Bad-opcode and privileged-register/-instruction interrupts
+  (sources 183–185) are enabled. A fault marks only the owned queue's jobs
+  guilty.
+- **Recovery.** An `Unsupported` recovery no longer pauses the console,
+  unregisters clients or withdraws the power controls.
+- **GFXOFF wakes.** The hang watchdog no longer takes a GFXOFF reference every
+  250 ms, which had woken an idle GPU about four times a second. It reads only
+  fence memory and HDP, as Linux's fence timeout does.
+- **Runtime modesets.** They now use the boot-time `GB_ADDR_CONFIG` sample
+  rather than reading GC without a GFXOFF reference, matching amdgpu_dm.
+
+Clock-gating and power-gating flags and sequences match `nv.c` and
+`gfx_v10_0.c` for GC 10.3.2. NARF enables less than Linux does at runtime.
+The changes above are not proven to cause the seq-2 stall. The next boot's
+timeout snapshot records CP/GRBM/VM state. Booting once with
+`amdgpu.rdna2_pg=none` separates power saving from the stall without a
+rebuild.
 
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must

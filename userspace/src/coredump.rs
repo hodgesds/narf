@@ -291,6 +291,21 @@ pub(crate) fn build_note_segment(
     buf
 }
 
+/// Bytes of `r` written to the core: Linux `vma_dump_size` dumps nothing for
+/// `VM_IO`/`VM_PFNMAP` mappings. Here those are the device mappings a region
+/// marks with a non-write-back memory type (DRM GEM VRAM BAR frames, which
+/// may lie far above the kernel direct map, e.g. a ReBAR at 992 GiB). Their
+/// PT_LOAD keeps `p_memsz` with `p_filesz = 0`.
+fn dump_len(r: &narf_memory::address_space::Region) -> u64 {
+    let device = narf_memory::memtype::region_may_request(r.perms)
+        && r.perms.memory_type() != narf_memory::MemoryType::WriteBack;
+    if device {
+        0
+    } else {
+        r.len
+    }
+}
+
 pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     // Fatal path only: publish the cause before any optional dump-file I/O
     // can fail or stall. This also covers RLIMIT_CORE=0. Do not put this
@@ -504,11 +519,11 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
             p_offset: current_offset,
             p_vaddr: r.base.as_u64(),
             p_paddr: 0,
-            p_filesz: r.len,
+            p_filesz: dump_len(r),
             p_memsz: r.len,
             p_align: 4096,
         });
-        current_offset = align_up(current_offset + r.len);
+        current_offset = align_up(current_offset + dump_len(r));
     }
 
     if let Err(error) = write_metadata(file.as_ref(), limit, &ehdr, &phdrs, &note_buf) {
@@ -522,8 +537,11 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     // Write segment data
     for (i, r) in regions.iter().enumerate() {
         let ph = &phdrs[i + 1];
+        if ph.p_filesz == 0 {
+            continue;
+        }
         let mut offset = ph.p_offset;
-        let mut bytes_left = r.len;
+        let mut bytes_left = ph.p_filesz;
         let mut page_idx = 0;
 
         while bytes_left > 0 {
@@ -533,8 +551,11 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
             let chunk_len = core::cmp::min(bytes_left, 4096);
             let phys = r.phys.get(page_idx).copied().unwrap_or(PhysAddr::new(0));
 
-            if phys != PhysAddr::new(0) {
-                // SAFETY: phys is valid page frame mapped in kernel.
+            // Only System RAM is covered by the kernel direct map; any other
+            // frame (device memory that slipped past `dump_len`) is written
+            // as zeros instead of dereferenced.
+            if phys != PhysAddr::new(0) && narf_memory::frame::is_system_ram(phys) {
+                // SAFETY: phys is a System RAM frame, covered by the direct map.
                 let ptr = phys.kernel_ptr::<u8>();
                 // SAFETY: reading chunk_len <= 4096 from page is safe.
                 let slice = unsafe { core::slice::from_raw_parts(ptr, chunk_len as usize) };

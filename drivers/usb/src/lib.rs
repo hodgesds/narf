@@ -24,6 +24,7 @@ pub mod ctap;
 pub mod device;
 pub mod dfu;
 pub mod ehci;
+mod enumeration_wait;
 pub mod fingerprint;
 pub mod firmware;
 pub mod hid;
@@ -226,69 +227,13 @@ pub fn register_initcalls() {
     });
 }
 
-/// Number of times YieldTimeout::poll was entered (across the
-/// supervisor's lifetime). Increments on every poll regardless of
-/// inner future / deadline state. Surfaced on the FB panel as
-/// `yt=N`. Three diagnostic outcomes:
-///   - yt=0   → task never polled (executor isn't scheduling it)
-///   - yt=1   → first poll happened, never re-polled (waker bug)
-///   - yt>>1  → polled many times but deadline never fires
-///     (Instant::now frozen, or stuck inner spin loop)
+/// Number of enumeration-future polls across the supervisor's lifetime.
+/// Surfaced on the FB panel under the historical `yt` label. A growing
+/// count while phase=5 distinguishes a pending hardware operation from a
+/// supervisor that is never polled. Hardware operations own their deadlines;
+/// the supervisor keeps their future alive through terminal cleanup.
 pub static YIELD_TIMEOUT_POLLS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
-
-/// Wheel-bypass timeout. Polls the inner future on every executor
-/// round and checks a TSC-driven wall-clock deadline. No
-/// `timer_wheel::register` call. Self-wakes via
-/// `cx.waker().wake_by_ref()` so the slot's `awake` flag is kept
-/// true through the executor's swap(false, Acquire) gate.
-///
-/// Used by the USB HID supervisor because `narf_time::timeout` /
-/// `narf_time::sleep_cycles` register with the timer wheel, and on
-/// real HW the supervisor's wheel-registered wakers were not being
-/// fired even though the panel paint task (which uses the same
-/// `sleep_cycles` primitive) was being woken correctly. Bypassing
-/// the wheel entirely localizes that bug.
-pub struct YieldTimeout<F> {
-    fut: F,
-    deadline: narf_time::Deadline,
-}
-
-impl<F> core::fmt::Debug for YieldTimeout<F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("YieldTimeout")
-            .field("deadline", &self.deadline)
-            .finish()
-    }
-}
-
-impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
-    type Output = Result<F::Output, ()>;
-    fn poll(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        YIELD_TIMEOUT_POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // SAFETY: structural pin projection — `fut` is never moved
-        // out, only re-pinned for the inner poll call.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let this = unsafe { self.get_unchecked_mut() };
-        // SAFETY: `this` came from a `Pin<&mut Self>`, so `this.fut`
-        // is itself structurally pinned. We re-pin the `&mut` to it
-        // and never move `fut` out, upholding the pin contract.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let fut = unsafe { core::pin::Pin::new_unchecked(&mut this.fut) };
-        match fut.poll(cx) {
-            core::task::Poll::Ready(v) => return core::task::Poll::Ready(Ok(v)),
-            core::task::Poll::Pending => {}
-        }
-        if this.deadline.expired() {
-            return core::task::Poll::Ready(Err(()));
-        }
-        cx.waker().wake_by_ref();
-        core::task::Poll::Pending
-    }
-}
 
 /// Liveness counter for the USB HID supervisor. Incremented at the
 /// VERY TOP of every loop iteration, before any controller lookup,
@@ -321,6 +266,23 @@ pub static SUPERVISOR_PHASE: core::sync::atomic::AtomicU8 = core::sync::atomic::
 /// see which specific port wedged when phase=5.
 pub static SUPERVISOR_ATTACHING_PORT: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
+
+/// Nonblocking report pumps; callers resume suspended bound ports first.
+fn pump_bound_devices(controller: &xhci::Xhci) {
+    hid::pump_all(controller);
+    hid::mouse::pump_all(controller);
+    hid::touchpad::pump_all(controller);
+    hid::consumer::pump_all(controller);
+    cdc_acm::pump_all(controller);
+    serial::port::pump_all(controller);
+    xpad::pump_all(controller);
+}
+
+async fn resume_bound_ports(controller: &xhci::Xhci) {
+    hid::resume_suspended_hub_ports(controller).await;
+    cdc_acm::resume_suspended_hub_ports(controller).await;
+    serial::port::resume_suspended_hub_ports(controller).await;
+}
 
 /// Spawn the long-running USB HID supervisor task. Walks every
 /// xHCI root-hub port the controller reports as connected, then
@@ -522,6 +484,9 @@ fn spawn_supervisor_task() {
             // Find the next unbound, not-yet-burned port starting
             // from `next_root_idx`. Wrap at end so on later passes
             // we revisit ports whose `root_fail_count` reset.
+            // Enumeration also pumps existing bindings while waiting. Resume
+            // their ports before the first such pump, just as in Phase 7.
+            resume_bound_ports(c).await;
             let mut attempted = false;
             for step in 0..connected_root.len() {
                 let idx = (next_root_idx + step) % connected_root.len();
@@ -536,28 +501,10 @@ fn spawn_supervisor_task() {
                 }
                 SUPERVISOR_PHASE.store(5, core::sync::atomic::Ordering::Relaxed);
                 SUPERVISOR_ATTACHING_PORT.store(p, core::sync::atomic::Ordering::Relaxed);
-                // Per-port hard wall-clock cap. Individual sub-awaits
-                // (port_reset, await_event, control transfers) have
-                // their own 250ms bounds, but a misbehaving port can
-                // chain enough of them that the supervisor sits on a
-                // single port for 5-10s. Wrapping the whole call in a
-                // 3s timeout guarantees forward progress: a wedged
-                // port burns its retry budget instead of stalling the
-                // whole supervisor.
-                // Short per-port budget so sup-ticks advances visibly
-                // on the panel. 500 ms is enough for a healthy port
-                // (~100 ms port_reset + a few 250 ms command waits)
-                // but small enough that a wedged port can't hide
-                // forward progress.
-                let outcome = match (YieldTimeout {
-                    fut: attach::try_attach_root(c, p),
-                    deadline: narf_time::Deadline::after_ms(500),
+                let outcome = enumeration_wait::run(attach::try_attach_root(c, p), || {
+                    pump_bound_devices(c);
                 })
-                .await
-                {
-                    Ok(o) => o,
-                    Err(()) => AttachOutcome::UnknownClass,
-                };
+                .await;
                 SUPERVISOR_ATTACHING_PORT.store(0, core::sync::atomic::Ordering::Relaxed);
                 match outcome {
                     AttachOutcome::Keyboard
@@ -637,7 +584,11 @@ fn spawn_supervisor_task() {
                     Some(h) => h,
                     None => continue,
                 };
-                let connected = hub_copy.connected_downstream_ports(c).await;
+                let connected =
+                    enumeration_wait::run(hub_copy.connected_downstream_ports(c), || {
+                        pump_bound_devices(c);
+                    })
+                    .await;
                 // Downstream disconnect pass: bound ports that left
                 // the connected set were unplugged. Detach each
                 // (class unbind → Disable Slot → reclaim) and clear
@@ -674,9 +625,11 @@ fn spawn_supervisor_task() {
                     if (bound_mask | new_bound_bits) & dpb != 0 {
                         continue;
                     }
-                    let outcome =
-                        attach::try_attach_via_hub(c, &hub_copy, *route, *tier, *root_port, dp)
-                            .await;
+                    let outcome = enumeration_wait::run(
+                        attach::try_attach_via_hub(c, &hub_copy, *route, *tier, *root_port, dp),
+                        || pump_bound_devices(c),
+                    )
+                    .await;
                     match outcome {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse
@@ -721,16 +674,8 @@ fn spawn_supervisor_task() {
             // ACM console or USB-serial dongle behind an
             // autosuspended port is exactly as dead as the
             // keyboard was (#763).
-            hid::resume_suspended_hub_ports(c).await;
-            cdc_acm::resume_suspended_hub_ports(c).await;
-            serial::port::resume_suspended_hub_ports(c).await;
-            hid::pump_all(c);
-            hid::mouse::pump_all(c);
-            hid::touchpad::pump_all(c);
-            hid::consumer::pump_all(c);
-            cdc_acm::pump_all(c);
-            serial::port::pump_all(c);
-            xpad::pump_all(c);
+            resume_bound_ports(c).await;
+            pump_bound_devices(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose
             // last activity is older than IDLE_SUSPEND_NS. Pumps

@@ -1,0 +1,213 @@
+#!/usr/bin/bash
+# Capture independent streams so a stuck bus query cannot hide process state.
+umask 077
+case " $(cat /proc/cmdline) " in
+    *' narf.disks=root-rw '*) ;;
+    *) exit 0 ;;
+esac
+[ -x "${NARF_CAPTURE_STREAM_HELPER:-/usr/local/libexec/narf-capture-stream}" ] || {
+    printf '%s\n' 'narf capture: missing executable stream helper' >&2
+    exit 1
+}
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+case "$boot_id" in ''|*[!a-fA-F0-9-]*) exit 1 ;; esac
+output=/narf-diagnostics/plasma-$boot_id
+mkdir -p "$output/process-maps" || exit 1
+printf 'capture-version: 10-buffered-stream-helper\n' > "$output/capture-version.txt"
+
+# Keep stream writes bounded and batched: dmesg's per-line writes otherwise
+# force repeated root-filesystem transactions while other services page in.
+# Preserve partial lines across read timeouts and flush at EOF.
+batched_stream() {
+    # A shell timed read reads a pipe byte by byte; shell printf also emits
+    # tiny writes. This helper batches both sides and flushes partial data
+    # after two seconds, EOF or a normal service-stop signal.
+    exec "${NARF_CAPTURE_STREAM_HELPER:-/usr/local/libexec/narf-capture-stream}"
+}
+
+kernel_snapshots() {
+    # Append new records instead of repeatedly rewriting the entire boot log.
+    dmesg --follow --color=never 2>&1 | batched_stream > "$output/kernel-stream.log"
+}
+
+# Capture the missing identity of a blocked compositor read. No trap hooks.
+kwin_read_snapshots() {
+    local specified=${2-} group
+    local -a candidates=()
+    local duration=${1:-120} started=$SECONDS round=0 proc pid comm line sample field fd number target
+    local path nr arg0 arg1 arg2 arg3 arg4 arg5 rsp rip key dest count
+    local -A stack_seen=() stack_count=()
+    mkdir -p "$output/kwin-stacks"
+    while ((SECONDS - started < duration)); do
+        candidates=()
+        if [ -n "$specified" ]; then
+            candidates=("$specified")
+        else
+            # The service creates its cgroup before exec. Poll this small
+            # membership file instead of scanning every process each second.
+            for group in /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/session.slice/plasma-login-kwin_wayland.service/cgroup.procs; do
+                [ -r "$group" ] || continue
+                while IFS= read -r pid; do
+                    [[ "$pid" =~ ^[0-9]+$ ]] && candidates+=("$pid")
+                done < "$group"
+            done
+        fi
+        for pid in "${candidates[@]}"; do
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            proc=/proc/$pid
+            [ -r "$proc/comm" ] || continue
+            IFS= read -r comm < "$proc/comm" || continue
+            case "$comm" in kwin*) ;; *) continue ;; esac
+            pid=${proc##*/}
+            sample=$'\n'
+            printf -v sample '%sKWIN-READ sample=%s pid=%s comm=%s uptime=%s\n' "$sample" "$round" "$pid" "$comm" "$(</proc/uptime)"
+            for field in status syscall wchan; do
+                path=$proc/task/$pid/$field
+                [ "$field" = status ] && path=$proc/status
+                [ -r "$path" ] || continue
+                printf -v sample '%s%s:\n%s\n' "$sample" "$field" "$(<"$path")"
+            done
+            line=$(<"$proc/task/$pid/syscall")
+            read -r nr arg0 arg1 arg2 arg3 arg4 arg5 rsp rip <<< "$line"
+            if [ "$nr" = 0 ] && [[ "$arg0" =~ ^0x[0-9a-fA-F]+$ ]]; then
+                number=$((arg0))
+                target=$(readlink "$proc/fd/$number" 2>/dev/null)
+                printf -v sample '%sBLOCKED-READ fd=%s target=%s\n' "$sample" "$number" "$target"
+                if [ -r "$proc/fdinfo/$number" ]; then
+                    printf -v sample '%sfdinfo:\n%s\n' "$sample" "$(<"$proc/fdinfo/$number")"
+                fi
+            fi
+            # Publish descriptor evidence before any optional memory read.
+            printf '%s' "$sample" | batched_stream >> "$output/kwin-reads.log"
+            if [ "$nr" != 0 ] || ! [[ "$rsp" =~ ^0x[0-9a-fA-F]+$ ]]; then
+                continue
+            fi
+            if ((rsp <= 0 || rsp >= 0x0000800000000000)); then
+                continue
+            fi
+            key=$pid-$arg0-$rsp
+            count=${stack_count[$pid]-0}
+            if [ "${stack_seen[$key]-}" = 1 ] || ((count >= 12)); then
+                continue
+            fi
+            stack_seen[$key]=1
+            stack_count[$pid]=$((count+1))
+            dest="$output/kwin-stacks/pid-$pid-sample-$round-rsp-$rsp"
+            printf 'pid=%s syscall=%s target=%s\n' "$pid" "$line" "$target" > "$dest.txt"
+            [ -r "$proc/maps" ] && cat "$proc/maps" > "$dest.maps"
+            # Four KiB of the userspace stack, through ptrace-checked procfs.
+            # This does not read kernel memory or change the target process.
+            dd if="$proc/mem" of="$dest.bin" iflag=skip_bytes,count_bytes skip="$((rsp))" count=4096 status=none 2>> "$output/kwin-read-errors.log"
+        done
+        ((round++))
+        sleep 1
+    done
+}
+
+process_snapshots() {
+    local round=0 process comm field thread sample pid
+    local -A mapped_comm=()
+    while :; do
+        # One append per sample: many tiny Btrfs writes distort boot timing.
+        printf -v sample '\n===== process sample %d =====\nuptime: %s\n' "$round" "$(</proc/uptime)"
+        {
+            for process in /proc/[0-9]*; do
+                [ -r "$process/comm" ] || continue
+                IFS= read -r comm < "$process/comm" || continue
+                pid=${process##*/}
+                printf -v sample '%spid=%s comm=%s\n' "$sample" "$pid" "$comm"
+                case "$comm" in
+                    systemd|plasmalogin*|plasma-login*|startplasma*|kwin*|systemd-execut*|systemd-tmpfile*|mount|\(mount\)|dbus*|systemd-logind|systemd-journal*|journalctl|timeout)
+                        for field in status syscall wchan; do
+                            if [ -r "$process/$field" ]; then
+                                printf -v sample '%s%s:\n%s\n' "$sample" "$field" "$(<"$process/$field")"
+                            fi
+                        done
+                        for thread in "$process"/task/[0-9]*; do
+                            [ -d "$thread" ] || continue
+                            printf -v sample '%sthread=%s\n' "$sample" "${thread##*/}"
+                            for field in comm syscall wchan; do
+                                if [ -r "$thread/$field" ]; then
+                                    printf -v sample '%s  %s: %s\n' "$sample" "$field" "$(<"$thread/$field")"
+                                fi
+                            done
+                        done
+                        if [ "${mapped_comm[$pid]-}" != "$comm" ] && [ -r "$process/maps" ]; then
+                            cat "$process/maps" > "$output/process-maps/$pid.maps"
+                            mapped_comm[$pid]=$comm
+                        fi
+                        ;;
+                esac
+            done
+            printf '%s' "$sample" | batched_stream >> "$output/processes.log"
+        } 2>> "$output/process-errors.log"
+        ((round++))
+        sleep 10
+    done
+}
+
+boot_console_snapshots() {
+    local boot_console='' previous=''
+    while :; do
+        # The next Linux boot replaces this file. Match the boot identity
+        # before preserving it; this collector never waits for a bus query.
+        if [ -r /var/log/boot.log ]; then
+            boot_console=$(</var/log/boot.log)
+            if [[ $boot_console == *"bootid=${boot_id//-/}"* && $boot_console != "$previous" ]]; then
+                cp /var/log/boot.log "$output/plymouth-native.log"
+                previous=$boot_console
+            fi
+        fi
+        sleep 5
+    done
+}
+
+service_snapshots() {
+    local round=0
+    while :; do
+        {
+            printf '\n===== service sample %d =====\n' "$round"
+            cat /proc/uptime
+            timeout 8 systemctl --no-pager --full list-jobs
+            timeout 8 systemctl --no-pager --full status plasmalogin.service systemd-logind.service dbus.service plymouth-quit.service
+            timeout 8 loginctl show-seat seat0 -p CanGraphical -p CanTTY -p ActiveSession
+            ls -l /dev/dri /sys/class/drm /dev/input
+        } 2>&1 | batched_stream >> "$output/state.log"
+        ((round++))
+        sleep 30
+    done
+}
+
+seat_snapshots() {
+    local round=0
+    while :; do
+        {
+            printf '\n===== seat sample %d =====\n' "$round"
+            cat /proc/uptime /sys/class/tty/tty0/active
+            for file in /run/systemd/seats/seat0 /run/systemd/sessions/* /run/systemd/users/*; do
+                [ -f "$file" ] || continue
+                printf '\n--- %s ---\n' "$file"
+                cat "$file"
+            done
+            stat -Lc '%u:%g %a %t:%T %n' /dev/dri/card* /dev/dri/renderD* /dev/input/event* 2>/dev/null
+            getfacl -p /dev/dri/card* /dev/input/event* 2>/dev/null
+        } 2>&1 | batched_stream >> "$output/seat.log"
+        ((round++))
+        sleep 5
+    done
+}
+
+seat_snapshots &
+boot_console_snapshots &
+kernel_snapshots &
+process_snapshots &
+kwin_read_snapshots &
+service_snapshots &
+(journalctl -b --no-pager --follow --all -o short-monotonic 2>&1 | batched_stream) > "$output/journal-stream.log" &
+{
+    uname -a
+    cat /proc/cmdline
+    cat /proc/mounts
+} > "$output/boot.txt" 2>&1
+dmesg --color=never 2>&1 | batched_stream > "$output/kernel-initial.txt"
+wait

@@ -10099,9 +10099,10 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
         return TestResult::Fail("GEM_CREATE of an 8 KiB VRAM buffer failed");
     }
     let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
-    // Handles come from a high base so they cannot alias a dumb-buffer handle.
-    if handle < 0x4000_0000 {
-        return TestResult::Fail("a GEM handle must not fall in the dumb-handle space");
+    // libdrm indexes its dense object table with this id; a fresh open must
+    // start compactly rather than allocating GiB for an mmap routing tag.
+    if handle != 1 {
+        return TestResult::Fail("a fresh GEM namespace must start at handle one");
     }
 
     // ── mmap offset, and that it resolves to real distinct frames ──
@@ -10225,14 +10226,14 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
     if state.owns(handle) {
         return TestResult::Fail("the handle survived GEM_CLOSE");
     }
-    // A low handle is a dumb handle: fall through rather than claiming it.
+    // A handle this open never allocated must fall through, regardless of id.
     let mut low = [0u8; 8];
     low[0..4].copy_from_slice(&3u32.to_le_bytes());
     if !matches!(
         dispatch(close_cmd, low.as_mut_ptr() as usize, &state),
         Err(FsError::Unsupported)
     ) {
-        return TestResult::Fail("a dumb-buffer handle must fall through to the generic path");
+        return TestResult::Fail("an unowned handle must fall through to the generic path");
     }
 
     // ── the validations, each reachable from userspace ──
@@ -10333,7 +10334,7 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
 }
 #[cfg(feature = "amdgpu")]
 kernel_test_in!(
-    "drivers/gpu",
+    "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_lifecycle_and_handle_isolation
 );
 
@@ -14299,7 +14300,7 @@ fn smoke_amdgpu_gem_mapping_outlives_gem_close() -> TestResult {
         return TestResult::Fail("setup: GEM_CREATE");
     }
     let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
-    let offset = u64::from(handle) << 12;
+    let offset = crate::amdgpu_gem::mmap_offset(handle);
     if state.mapping_object(offset, 8193).is_some() {
         return TestResult::Fail("a mapping past the buffer");
     }

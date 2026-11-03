@@ -17,7 +17,7 @@ use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
 use crate::btree;
-use crate::format::{self, le64};
+use crate::format::{self, le64, BtrfsKey};
 use crate::volume::BtrfsVolume;
 
 /// Decompress a whole compressed extent according to its algorithm. zlib and
@@ -146,7 +146,28 @@ pub async fn read_file<B: BlockDevice + 'static>(
     } else {
         None
     };
-    let extents = btree::collect_for(vol, tree_root, ino, format::EXTENT_DATA_KEY).await?;
+    // A loader/page fault reads a small window of a potentially large file.
+    // Start at the extent at/before that window, which may cover its first
+    // byte. Collecting the whole inode's extent list for each such read walks
+    // unrelated leaves and allocates all their bodies repeatedly.
+    let start = if offset == 0 {
+        0
+    } else {
+        // offset < size above, so the inclusive ceiling cannot overflow.
+        let ceiling = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, offset + 1);
+        match btree::last_before(vol, tree_root, &ceiling).await? {
+            Some((key, _)) if key.objectid == ino && key.item_type == format::EXTENT_DATA_KEY => {
+                key.offset
+            }
+            _ => offset,
+        }
+    };
+    let mut cursor = btree::Cursor::seek(
+        vol,
+        tree_root,
+        &BtrfsKey::new(ino, format::EXTENT_DATA_KEY, start),
+    )
+    .await?;
 
     // Zero the window first; extents overwrite what they cover, so any hole
     // (explicit or `no-holes`-implicit) is left as zeros.
@@ -154,13 +175,18 @@ pub async fn read_file<B: BlockDevice + 'static>(
 
     let win_start = offset;
     let win_end = offset + want as u64;
-    for (key, body) in &extents {
+    while let Some((key, body)) = cursor.current()? {
+        if key.objectid != ino || key.item_type != format::EXTENT_DATA_KEY || key.offset >= win_end
+        {
+            break;
+        }
         let (extent, ram_bytes) = decode_extent(body)?;
         let file_start = key.offset;
         let file_end = file_start.saturating_add(extent.file_len(ram_bytes));
         let ov_start = win_start.max(file_start);
         let ov_end = win_end.min(file_end);
         if ov_start >= ov_end {
+            cursor.advance().await?;
             continue;
         }
         match extent {
@@ -177,19 +203,17 @@ pub async fn read_file<B: BlockDevice + 'static>(
                     dst[(pos - offset) as usize] = byte;
                 }
             }
+            // Holes and preallocated ranges stay zero-filled; still advance
+            // the cursor (or finish this window) below.
+            Extent::Regular { disk_bytenr: 0, .. } | Extent::Regular { prealloc: true, .. } => {}
             Extent::Regular {
                 compression,
                 disk_bytenr,
                 disk_num_bytes,
                 extent_offset,
                 ram_bytes,
-                prealloc,
                 ..
             } => {
-                // Holes and preallocated ranges stay zero-filled.
-                if disk_bytenr == 0 || prealloc {
-                    continue;
-                }
                 let d0 = (ov_start - offset) as usize;
                 let read_len = (ov_end - ov_start) as usize;
                 if compression == format::COMPRESS_NONE {
@@ -230,6 +254,10 @@ pub async fn read_file<B: BlockDevice + 'static>(
                 }
             }
         }
+        if file_end >= win_end {
+            break;
+        }
+        cursor.advance().await?;
     }
     Ok(want)
 }

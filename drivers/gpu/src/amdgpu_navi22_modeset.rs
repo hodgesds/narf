@@ -1165,7 +1165,13 @@ impl Pipeline {
         self.regs
             .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)?;
         // hubp3_program_tiling derives the display fabric geometry from
-        // this ASIC's GB_ADDR_CONFIG, not the GOP's previous surface.
+        // this ASIC's GB_ADDR_CONFIG, not the GOP's previous surface. Like
+        // amdgpu_dm, use the boot sample: runtime modesets hold no GFXOFF
+        // reference and GC reads do not wake GC. Only a modeset before
+        // ReadTopology (GFXOFF not yet started) reads the register live.
+        if let Some(config) = crate::amdgpu_info::navi22_gb_addr_config() {
+            return self.hubp.initialize(config).map_err(Error::Block);
+        }
         let profile = crate::amdgpu_rdna2::for_pci_id(self.gpu.chip.vid, self.gpu.chip.did)
             .ok_or(Error::Unsupported)?;
         let gc0 = crate::amdgpu_psp_ring::bank(

@@ -74,6 +74,79 @@ const KEY_LEFTSHIFT_CODE: u16 = 42;
 /// KEY_F1 in evdev.
 const KEY_F1_CODE: u16 = 59;
 
+// USB Device + Configuration descriptors read through Linux sysfs from the
+// physical host. The mouse has a real boot-mouse interface 0 and an auxiliary
+// non-boot keyboard interface 1; its vendor interface 2 is not input.
+fn smoke_host_holdchip_input_interfaces() -> TestResult {
+    let keyboard = &include_bytes!("fixtures/holdchip-a0f8.bin")[18..];
+    let mouse = &include_bytes!("fixtures/holdchip-a118.bin")[18..];
+    match super::find_boot_keyboard(keyboard) {
+        Ok((0, ep)) if ep.ep_addr == 0x81 && ep.max_packet == 8 => {}
+        _ => return TestResult::Fail("physical keyboard boot interface was not selected"),
+    }
+    if super::find_boot_keyboard(mouse).is_ok() {
+        return TestResult::Fail("physical mouse auxiliary keyboard can claim the mouse");
+    }
+    match super::mouse::find_boot_mouse(mouse) {
+        Ok((0, ep)) if ep.ep_addr == 0x81 && ep.max_packet == 8 => TestResult::Pass,
+        _ => TestResult::Fail("physical mouse boot interface was not selected"),
+    }
+}
+kernel_test_in!("drivers/usb/hid/e2e", smoke_host_holdchip_input_interfaces);
+
+fn smoke_boot_interface_selection_preserves_owner_and_fallback() -> TestResult {
+    // Two declared keyboards: the chosen endpoint must still belong to the
+    // returned interface, rather than pairing the first endpoint with the last
+    // matching interface number. Alternate 1 is deliberately not active.
+    let descriptors = [
+        9, 4, 2, 1, 1, 3, 1, 1, 0, 7, 5, 0x83, 3, 8, 0, 1, 9, 4, 3, 0, 1, 3, 1, 1, 0, 7, 5, 0x81,
+        3, 8, 0, 1, 9, 4, 4, 0, 1, 3, 1, 1, 0, 7, 5, 0x82, 3, 8, 0, 1,
+    ];
+    match super::find_boot_keyboard(&descriptors) {
+        Ok((3, ep)) if ep.ep_addr == 0x81 => {}
+        _ => return TestResult::Fail("boot keyboard endpoint escaped its active interface"),
+    }
+    let mut keyboard = include_bytes!("fixtures/holdchip-a0f8.bin")[18..].to_vec();
+    // Preserve support for subclass-zero keyboard firmware when no declared
+    // boot mouse competes for the same physical device.
+    keyboard[9 + 6] = 0;
+    match super::find_boot_keyboard(&keyboard) {
+        Ok((0, ep)) if ep.ep_addr == 0x81 => TestResult::Pass,
+        _ => TestResult::Fail("standalone subclass-zero keyboard lost its existing support"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/hid/e2e",
+    smoke_boot_interface_selection_preserves_owner_and_fallback
+);
+
+fn smoke_boot_keyboard_recovery_unpublishes_evdev() -> TestResult {
+    super::__reset_keyboards_for_test();
+    let keyboard = super::BootKeyboard::from_configured_endpoint(
+        201,
+        0,
+        3,
+        Some((7, 1)),
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0x04d9, 0xa0f8, 0x0200),
+    );
+    let id = keyboard.input.evdev_id;
+    let reader = ROUTER.open_reader(id).unwrap();
+    let caps = ROUTER.caps(id).unwrap();
+    if caps.id.vendor != 0x04d9 || caps.id.product != 0xa0f8 {
+        return TestResult::Fail("keyboard publication lost USB identity");
+    }
+    super::__push_keyboard_for_test(keyboard);
+    super::clear_boot_keyboards();
+    if ROUTER.device_ids().contains(&id) || reader.is_valid() {
+        return TestResult::Fail("controller recovery left a published USB keyboard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/hid/e2e",
+    smoke_boot_keyboard_recovery_unpublishes_evdev
+);
+
 // ── Test helper: evdev-bridged keyboard ──────────────────────────────────────
 
 /// A fake USB keyboard hooked to a live evdev DeviceNode.
@@ -1094,13 +1167,13 @@ kernel_test_in!(
 fn smoke_e2e_detach_removes_boot_keyboard_binding() -> TestResult {
     {
         let mut g = super::KEYBOARDS.lock();
-        g.push(super::BootKeyboard {
-            slot_id: 7,
-            interrupt_in_ep: 3,
-            interface_num: 0,
-            hub_port: None,
-            last_report: super::KbdReport::default(),
-        });
+        g.push(super::BootKeyboard::from_configured_endpoint(
+            7,
+            0,
+            3,
+            None,
+            narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
+        ));
     }
     if !super::detach_boot_keyboard(7) {
         return TestResult::Fail("detach_boot_keyboard reported no binding for slot 7");

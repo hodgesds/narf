@@ -630,6 +630,56 @@ fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom>
         virt: fb.addr,
     })
 }
+
+/// The permanent boot framebuffer is a valid kernel copy destination even
+/// after its address has been rebased to an ioremap. This does not grant a
+/// userspace mmap of that mapping. An adopted replacement must instead pass
+/// the external owner's publication/lifetime checks above.
+fn boot_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
+    let boot = (*BOOT_GENERIC.lock())?;
+    let fb = (*GENERIC_FB.lock())?;
+    let phys = GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
+    if (phys, fb.width, fb.height, fb.pitch, fb.bpp)
+        != (boot.addr, boot.width, boot.height, boot.pitch, boot.bpp)
+        || phys == 0
+        || fb.addr == 0
+        || fb.width == 0
+        || fb.height == 0
+        || fb.bpp != 32
+        || fb.pitch % 4 != 0
+        || fb.pitch < fb.width.checked_mul(4)?
+    {
+        return None;
+    }
+    let len = u64::from(fb.pitch.checked_mul(fb.height)?);
+    phys.checked_add(len)?;
+    fb.addr.checked_add(len)?;
+    Some(narf_drivers_gpu::drm_fb_hook::ScanoutGeom {
+        phys,
+        width: fb.width,
+        height: fb.height,
+        stride_bytes: fb.pitch,
+        virt: fb.addr,
+    })
+}
+
+/// Called under the DRM copy path's scanout epoch lease, which pins the
+/// selected mapping until the CPU finishes writing it.
+fn drm_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
+    if drawing_paused() {
+        return None;
+    }
+    let Some(info) = fbdev_info() else {
+        return external_scanout_geom().or_else(boot_scanout_geom);
+    };
+    Some(narf_drivers_gpu::drm_fb_hook::ScanoutGeom {
+        phys: info.phys,
+        width: info.width,
+        height: info.height,
+        stride_bytes: info.stride_bytes,
+        virt: 0,
+    })
+}
 /// Observer for the AMD display pipeline's external scanout.
 ///
 /// Moving the console to a newly lit external display is this layer's policy
@@ -1291,25 +1341,13 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "drm-fb-hook", || {
-        fn query() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
-            let Some(info) = fbdev_info() else {
-                return external_scanout_geom();
-            };
-            Some(narf_drivers_gpu::drm_fb_hook::ScanoutGeom {
-                phys: info.phys,
-                width: info.width,
-                height: info.height,
-                stride_bytes: info.stride_bytes,
-                virt: 0,
-            })
-        }
         fn flush() {
             fbdev_flush();
         }
         // SAFETY: single-CPU Stage::Late initcall; no concurrent reader.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            narf_drivers_gpu::drm_fb_hook::install_drm_fb_hook(query, flush);
+            narf_drivers_gpu::drm_fb_hook::install_drm_fb_hook(drm_scanout_geom, flush);
         }
         InitResult::Ok
     });

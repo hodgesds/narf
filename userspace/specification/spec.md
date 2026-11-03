@@ -338,6 +338,10 @@ past EOF. Resident pages follow the ordinary private COW rules across fork,
 and untouched pages remain absent in both parent and child. Explicit
 `MAP_LOCKED` or blocking `MAP_POPULATE` retains eager best-effort population;
 `MAP_NONBLOCK` suppresses prefaulting.
+Generic file-owner publication installs the same truncate-revocation hook as
+direct file mappings, independently of any earlier mappings. A filesystem
+shrink can therefore revoke tracked pages wholly past EOF before retiring
+their backing, including pages already made resident by a private demand fault.
 `MAP_FIXED_NOREPLACE` publishes its exact address non-destructively under the
 address-space VMA transaction. An occupied target returns `EEXIST`, including
 when a `CLONE_VM` peer claims the range after the syscall's initial fast probe;
@@ -1560,7 +1564,12 @@ event. The audited command matrix and remaining gaps live in
 `observability/PERF_LINUX_COMPAT_AUDIT.md`.
 
 DRM ioctl handling that creates process descriptors remains in the syscall
-layer even when request validation and submission are driver-owned. VirtIO-GPU
+layer even when request validation and submission are driver-owned.
+PRIME HANDLE_TO_FD exports preserve `DRM_RDWR` as the dma-buf's `O_RDWR`
+access mode independently of `DRM_CLOEXEC`/`FD_CLOEXEC`. Without `DRM_RDWR`
+the exported description is read-only. `F_GETFL`, duplication, and writable
+shared mmap use that description's access mode.
+VirtIO-GPU
 `EXECBUFFER(FENCE_FD_OUT)` reserves a descriptor before submission, installs
 a sync-file description backed by the driver's exact asynchronous submission
 fence with `FD_CLOEXEC`, and then copies the descriptor number to the ioctl
@@ -1885,7 +1894,12 @@ checked before parsing) and a value in `[0, pid_max]` (`EINVAL`), and sets the
 cursor to `value + 1`. It is published in every build. `pid_max` is one global
 value shared by all namespaces (Linux 6.14+ keeps it per namespace).
 
-Userspace core dumps honor `RLIMIT_CORE` and emit ELF64 metadata with
+Userspace core dumps honor `RLIMIT_CORE` and, like Linux `vma_dump_size` for
+`VM_IO`/`VM_PFNMAP`, write no bytes for device mappings (regions carrying a
+non-write-back memory type, such as DRM VRAM BAR mappings): their `PT_LOAD`
+keeps `p_memsz` with `p_filesz = 0`. A page whose frame is not System RAM is
+written as zeros, never read through the direct map. Core dumps emit ELF64
+metadata with
 `PT_NOTE` data immediately after the ELF header, before the VMA program-header
 table. Metadata is written as one sequential buffer (retrying short writes),
 so a partial dump preserves process identity and raw register notes before a

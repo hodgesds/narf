@@ -26,20 +26,19 @@
 //! 8-byte reports.
 //!
 //! Pipeline:
-//!   1. `enumerate_and_attach_keyboards` — walks every connected
-//!      port, addresses + configures each device, and binds any HID
-//!      Boot-Keyboard interface it finds. Runs as the
-//!      `usb-hid-keyboard` Stage::Device initcall.
+//!   1. The USB supervisor addresses/configures a device and binds its
+//!      selected keyboard interface through `try_bind_kbd_already_addressed`.
 //!   2. `pump_all` — polls each bound keyboard once, diffs the new
 //!      report against the previous one, and emits press/release
-//!      `KeyEvent`s onto the `narf_input` global event ring.
+//!      events to both the console input ring and its evdev node.
 //!   3. The `usage` submodule maps HID Usage Page 0x07 IDs onto
 //!      `narf_input::KeyCode`. Coverage: every key a Boot-Protocol
 //!      keyboard can emit — letters, digits, modifiers, F1-F12,
 //!      navigation cluster, full numpad, GUI / Application keys.
 
 use crate::xhci::{self, EndpointConfig, EndpointKind, Xhci};
-use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
+use narf_input::evdev::{bus, InputId, ROUTER};
+use narf_input::Modifiers;
 use narf_lib::sync::IrqSafeSpinLock;
 
 extern crate alloc;
@@ -154,10 +153,9 @@ pub struct BootKeyboard {
     /// a report completes, so an in-use keyboard's port never
     /// idle-suspends mid-typing (#840).
     pub hub_port: Option<(u8, u8)>,
-    /// Last report seen, used for press/release diffing in
-    /// `pump_once`. Initialised to the all-zero report so the
-    /// first non-empty poll fires presses for every key in it.
-    pub(crate) last_report: KbdReport,
+    /// The live binding owns the same evdev-aware decoder used by the
+    /// report-keyboard path. Its node survives until this binding is dropped.
+    input: keyboard::UsbKeyboard,
 }
 
 /// Walk a Configuration Descriptor (§9.6.3) tree looking for a HID
@@ -165,70 +163,88 @@ pub struct BootKeyboard {
 /// Returns `(interface_num, ep_config)` for the caller to feed into
 /// `xhci::configure_endpoints`.
 pub fn find_boot_keyboard(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
-    let mut i = 0usize;
-    let mut in_match = false;
-    let mut iface_num: u8 = 0;
-    let mut int_in: Option<EndpointConfig> = None;
-    while i + 2 <= cfg.len() {
-        let len = cfg[i] as usize;
-        if len < 2 || i + len > cfg.len() {
+    if let Some(keyboard) = find_boot_interface(cfg, HID_PROTOCOL_KBD, HID_SUBCLASS_BOOT) {
+        return Ok(keyboard);
+    }
+    // A declared boot mouse takes precedence over the subclass-zero keyboard
+    // heuristic. Composite mice often expose macro keys on a second interface;
+    // claiming that interface as the whole device would hide the real mouse.
+    if find_boot_interface(cfg, mouse::HID_PROTOCOL_MOUSE, HID_SUBCLASS_BOOT).is_some() {
+        return Err(HidError::NotBootKeyboard);
+    }
+    find_boot_interface(cfg, HID_PROTOCOL_KBD, 0).ok_or(HidError::NoInterruptIn)
+}
+
+/// Select an endpoint and its owning interface together. Only alternate zero
+/// is active after SET_CONFIGURATION; never silently choose another alternate.
+/// The caller tries a declared boot interface before subclass-zero heuristics.
+pub(crate) fn find_boot_interface(
+    cfg: &[u8],
+    protocol: u8,
+    subclass: u8,
+) -> Option<(u8, EndpointConfig)> {
+    let mut offset = 0;
+    let mut interface = None;
+    while offset + 2 <= cfg.len() {
+        let len = cfg[offset] as usize;
+        if len < 2 || offset + len > cfg.len() {
             break;
         }
-        let dtype = cfg[i + 1];
-        match dtype {
-            // Interface Descriptor (§9.6.5).
-            //   +2 bInterfaceNumber
-            //   +5 bInterfaceClass
-            //   +6 bInterfaceSubClass
-            //   +7 bInterfaceProtocol
-            4 if len >= 9 => {
-                // Audit F-72: don't require bInterfaceSubClass == Boot.
-                // Many modern internal laptop keyboards report Subclass=0
-                // (no boot interface) even though they accept
-                // SET_PROTOCOL(Boot) and emit boot-format reports. A
-                // strict Boot-only match silently dropped them. We
-                // still gate on bInterfaceProtocol == 1 (Keyboard) so
-                // the bind targets only kbd-shaped interfaces; the
-                // attach step issues SET_PROTOCOL(Boot) and abandons
-                // on STALL, so non-boot-capable devices fall through
-                // gracefully.
-                in_match = cfg[i + 5] == HID_INTERFACE_CLASS
-                    && (cfg[i + 6] == HID_SUBCLASS_BOOT || cfg[i + 6] == 0)
-                    && cfg[i + 7] == HID_PROTOCOL_KBD;
-                if in_match {
-                    iface_num = cfg[i + 2];
-                }
+        let descriptor = &cfg[offset..offset + len];
+        match descriptor[1] {
+            4 => {
+                interface = (len >= 9
+                    && descriptor[3] == 0
+                    && descriptor[5] == HID_INTERFACE_CLASS
+                    && descriptor[6] == subclass
+                    && descriptor[7] == protocol)
+                    .then(|| descriptor[2]);
             }
-            // Endpoint Descriptor (§9.6.6).
-            //   +2 bEndpointAddress (bit 7 = IN)
-            //   +3 bmAttributes (bits[1:0] = transfer type; 3 = interrupt)
-            //   +4..=5 wMaxPacketSize
-            5 if len >= 7 && in_match && int_in.is_none() => {
-                let ep_addr = cfg[i + 2];
-                let attr = cfg[i + 3];
-                let mps = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
-                let xfer_t = attr & 0x03;
-                let is_in = ep_addr & 0x80 != 0;
-                if xfer_t == 3 && is_in {
-                    int_in = Some(EndpointConfig {
-                        ep_addr,
-                        max_packet: mps,
-                        kind: EndpointKind::InterruptIn,
-                        interval: cfg[i + 6],
-                    });
+            5 if len >= 7 => {
+                if let Some(iface) = interface {
+                    let address = descriptor[2];
+                    if address & 0x80 != 0 && descriptor[3] & 3 == 3 {
+                        return Some((
+                            iface,
+                            EndpointConfig {
+                                ep_addr: address,
+                                max_packet: u16::from_le_bytes([descriptor[4], descriptor[5]]),
+                                kind: EndpointKind::InterruptIn,
+                                interval: descriptor[6],
+                            },
+                        ));
+                    }
                 }
             }
             _ => {}
         }
-        i += len;
+        offset += len;
     }
-    match int_in {
-        Some(ep) => Ok((iface_num, ep)),
-        None => Err(HidError::NoInterruptIn),
-    }
+    None
 }
 
 impl BootKeyboard {
+    pub(crate) fn from_configured_endpoint(
+        slot_id: u8,
+        interface_num: u8,
+        interrupt_in_ep: u8,
+        hub_port: Option<(u8, u8)>,
+        identity: InputId,
+    ) -> Self {
+        Self {
+            slot_id,
+            interrupt_in_ep,
+            interface_num,
+            hub_port,
+            input: keyboard::UsbKeyboard::publish_boot(
+                slot_id,
+                interface_num,
+                interrupt_in_ep,
+                identity,
+            ),
+        }
+    }
+
     /// Bind a boot keyboard to an already-addressed + configured
     /// xHCI slot. Issues `Set Protocol(Boot)` so subsequent
     /// `read_report` calls return the fixed 8-byte format.
@@ -238,6 +254,7 @@ impl BootKeyboard {
         interface_num: u8,
         interrupt_in_ep: u8,
         hub_port: Option<(u8, u8)>,
+        identity: InputId,
     ) -> Result<Self, HidError> {
         // Set Protocol class request (§7.2.6):
         //   bmRequestType: 0x21 (Class | Interface | Host-to-Device)
@@ -284,13 +301,13 @@ impl BootKeyboard {
         xhci_dev
             .arm_interrupt_in(slot_id, interrupt_in_ep, 8)
             .map_err(HidError::Xhci)?;
-        Ok(BootKeyboard {
+        Ok(Self::from_configured_endpoint(
             slot_id,
-            interrupt_in_ep,
             interface_num,
+            interrupt_in_ep,
             hub_port,
-            last_report: KbdReport::default(),
-        })
+            identity,
+        ))
     }
 
     /// Drain any pending interrupt-IN report. Returns
@@ -343,15 +360,26 @@ impl BootKeyboard {
     /// supplied report. Used by both the live pump and the
     /// in-tree smokes.
     pub fn translate_report(&mut self, report: KbdReport) -> usize {
-        let n = translate_diff(&self.last_report, &report);
-        self.last_report = report;
-        n
+        let mut raw = [0; 8];
+        raw[0] = report.modifiers;
+        raw[2..].copy_from_slice(&report.keys);
+        keyboard::process_boot_report(&mut self.input, &raw)
     }
 
     /// Reset the diff baseline — the next report is treated as if
     /// no keys were previously pressed. Useful after re-attach.
     pub fn reset_diff(&mut self) {
-        self.last_report = KbdReport::default();
+        self.input.last_keys = [0; 6];
+        self.input.last_mods = 0;
+    }
+}
+
+impl Drop for BootKeyboard {
+    fn drop(&mut self) {
+        // Release held keys/modifiers in the legacy ring as well. Removing
+        // the node marks existing evdev readers dead and wakes blocked reads.
+        self.translate_report(KbdReport::default());
+        ROUTER.unregister_device(self.input.evdev_id);
     }
 }
 
@@ -374,81 +402,6 @@ pub fn modifier_byte_to_modifiers(byte: u8) -> Modifiers {
         m.insert(Modifiers::META);
     }
     m
-}
-
-/// Walk two consecutive boot-keyboard reports and emit press /
-/// release `KeyEvent`s onto the global input ring. Returns the
-/// number of events pushed.
-fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
-    let cur_mods = modifier_byte_to_modifiers(cur.modifiers);
-    let mut emitted = 0usize;
-
-    // Modifier-byte transitions: bit-by-bit. Each bit corresponds
-    // to a dedicated KeyCode (LCtrl / LShift / LAlt / LGui / ...).
-    let mod_pairs: &[(u8, KeyCode)] = &[
-        (kbd_mod::LCTRL, KeyCode::LeftCtrl),
-        (kbd_mod::LSHIFT, KeyCode::LeftShift),
-        (kbd_mod::LALT, KeyCode::LeftAlt),
-        (kbd_mod::LGUI, KeyCode::LeftMeta),
-        (kbd_mod::RCTRL, KeyCode::RightCtrl),
-        (kbd_mod::RSHIFT, KeyCode::RightShift),
-        (kbd_mod::RALT, KeyCode::RightAlt),
-        (kbd_mod::RGUI, KeyCode::RightMeta),
-    ];
-    for &(bit, code) in mod_pairs {
-        let was = prev.modifiers & bit != 0;
-        let now = cur.modifiers & bit != 0;
-        if was != now {
-            push_global(InputEvent::Key(KeyEvent {
-                code,
-                pressed: now,
-                modifiers: cur_mods,
-            }));
-            emitted += 1;
-        }
-    }
-
-    // Roll-over indicator: a HID keyboard signals "more than 6
-    // keys held" by writing 0x01 into all six positions. Don't
-    // emit anything for those.
-    let is_rollover = cur.keys.iter().all(|&k| k == 0x01);
-
-    // Usage-array transitions. Both arrays are short (<= 6
-    // entries); a nested membership check is fine.
-    if !is_rollover {
-        // Releases: keys in prev that aren't in cur.
-        for &k in &prev.keys {
-            if k == 0 || k == 0x01 {
-                continue;
-            }
-            if !cur.keys.contains(&k) {
-                let code = usage_to_keycode(k);
-                push_global(InputEvent::Key(KeyEvent {
-                    code,
-                    pressed: false,
-                    modifiers: cur_mods,
-                }));
-                emitted += 1;
-            }
-        }
-        // Presses: keys in cur that weren't in prev.
-        for &k in &cur.keys {
-            if k == 0 || k == 0x01 {
-                continue;
-            }
-            if !prev.keys.contains(&k) {
-                let code = usage_to_keycode(k);
-                push_global(InputEvent::Key(KeyEvent {
-                    code,
-                    pressed: true,
-                    modifiers: cur_mods,
-                }));
-                emitted += 1;
-            }
-        }
-    }
-
-    emitted
 }
 
 // ── Hot-plug enumeration ──────────────────────────────────────────
@@ -673,7 +626,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         // contexts. AMD Renoir's MaxSlots is typically 32 and a
         // laptop with multiple internal USB devices can burn
         // through them quickly across enumeration retries.
-        let _ = xhci_dev.disable_slot(slot_id).await;
+        let _ = crate::attach::release_slot(xhci_dev, slot_id).await;
     }
     res
 }
@@ -698,7 +651,8 @@ async fn bind_kbd_addressed_slot(
     // speed devices (we initially seed MPS=8 — the smallest
     // legal — and most FS devices are actually 8/16/32/64).
     // High-speed defaults to 64 already.
-    if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
+    let descriptor = xhci_dev.get_device_descriptor(slot_id).await.ok();
+    if let Some(desc) = descriptor {
         let mps0 = desc[7] as u16;
         // Valid Full-Speed values per USB 2.0 §9.6.1: 8/16/32/64.
         // Low-Speed must be 8. High-Speed must be 64. SuperSpeed
@@ -798,7 +752,15 @@ async fn bind_kbd_addressed_slot(
 
     let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
     let dci = (interrupt_in_ep * 2) + 1;
-    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci, hub_port)
+    let identity = descriptor.map_or(InputId::new(bus::USB, 0, 0, 0), |desc| {
+        InputId::new(
+            bus::USB,
+            u16::from_le_bytes([desc[8], desc[9]]),
+            u16::from_le_bytes([desc[10], desc[11]]),
+            u16::from_le_bytes([desc[12], desc[13]]),
+        )
+    });
+    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci, hub_port, identity)
         .await
         .inspect_err(|e| {
             note_attach_fail(port, AttachStep::SetProtocol, e);
@@ -920,10 +882,8 @@ pub static REPORTS_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 
 /// Detach the boot keyboard bound to `slot_id` — the device was
 /// unplugged, its hub went away, or the supervisor is tearing the
-/// binding down before slot reclaim. Boot keyboards feed the shared
-/// input ring and own no evdev node, so dropping the binding (which
-/// stops `pump_all` from polling the dead slot) is the whole
-/// detach. Returns true when a binding was removed.
+/// binding down before slot reclaim. Dropping the binding releases held
+/// keys and removes its evdev node. Returns true when a binding was removed.
 pub fn detach_boot_keyboard(slot_id: u8) -> bool {
     let mut g = KEYBOARDS.lock();
     let before = g.len();
@@ -952,4 +912,14 @@ pub fn __reset_keyboards_for_test() {
 #[doc(hidden)]
 pub fn __push_keyboard_for_test(kbd: BootKeyboard) {
     KEYBOARDS.lock().push(kbd);
+}
+
+#[doc(hidden)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn feed_keyboard_report_for_test(slot: u8, report: [u8; 8]) -> usize {
+    KEYBOARDS
+        .lock()
+        .iter_mut()
+        .find(|kbd| kbd.slot_id == slot)
+        .map_or(0, |kbd| kbd.translate_report(KbdReport::from_bytes(report)))
 }

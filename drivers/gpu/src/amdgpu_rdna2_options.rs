@@ -2,7 +2,8 @@
 //!
 //! Every functionally complete feature is on by default: native display
 //! (retiring the GOP for the native HDMI/DP modeset), the DCN3.0 hardware
-//! cursor, native client submission (`accel`), power saving and automatic
+//! cursor, native client submission (`accel`), power saving (except GFXOFF;
+//! see [`DEFAULT_POWER_SAVING`]) and automatic
 //! GPU recovery after a hang. Each has an off switch
 //! (`amdgpu.rdna2_accel=0`, `amdgpu.native_display=0`,
 //! `amdgpu.gpu_recovery=0`, ...).
@@ -16,7 +17,14 @@
 
 /// Power-saving features requested when `amdgpu.rdna2_pg=` is absent. Each is
 /// still refused unless its display admission and driver prerequisites hold.
-pub const DEFAULT_POWER_SAVING: &str = "gfxoff,cg,gfxcg,hubpg,memdpm,fclkdpm,ds,wm";
+///
+/// Every feature except GFXOFF (`amdgpu.rdna2_pg=gfxoff,...` opts in). Linux
+/// enables SMU_FEATURE_GFXOFF in `EnableAllSmuFeatures` at SMU hw_init,
+/// before any ring exists and together with DS_GFXCLK, GFX_ULV, DPM_GFX_GPO
+/// and GFX_DCS. NARF enables it alone, late, with the CP already running:
+/// a firmware configuration Linux never exercises. It stays opt-in until it
+/// is enabled with that set or validated on silicon as it is.
+pub const DEFAULT_POWER_SAVING: &str = "cg,gfxcg,hubpg,memdpm,fclkdpm,ds,wm";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootOptions<'a> {
@@ -151,6 +159,12 @@ mod tests {
         assert!(!BootOptions::parse("amdgpu.gpu_recovery=0").gpu_recovery);
         assert!(!default.multi);
         assert_eq!(default.power_saving, Some(DEFAULT_POWER_SAVING));
+        // GFXOFF is opt-in until it is enabled with Linux's SMU-init set.
+        assert!(!DEFAULT_POWER_SAVING.split(',').any(|t| t == "gfxoff"));
+        assert_eq!(
+            BootOptions::parse("amdgpu.rdna2_pg=gfxoff,cg").power_saving,
+            Some("gfxoff,cg")
+        );
         let off = BootOptions::parse(
             "amdgpu.native_display=0 amdgpu.rdna2_accel=0 amdgpu.navi22_hw_cursor=off \
              amdgpu.rdna2_pg=none amdgpu.rdna2_multix",

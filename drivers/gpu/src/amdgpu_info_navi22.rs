@@ -7,21 +7,22 @@
 //!
 //! - the discovery GC table (maxima), already in the [`Snapshot`];
 //! - [`Topology`], sampled by the cold boot's `ReadTopology` stage from the
-//!   fuse/user-disable registers, GB_ADDR_CONFIG and the NBIO revision strap
+//!   fuse/user-disable registers and GB_ADDR_CONFIG
 //!   (the same publish-from-boot-owner pattern Navi48 uses for GFX12);
+//! - the read-only NBIO ATI revision strap, sampled before cold boot
+//!   independently of the optional GC harvest;
 //! - [`Boot`], the firmware versions of the set the cold boot loaded, plus
 //!   the SMU version and GFX DPM range it observed, published only after the
 //!   cold boot completed.
 //!
-//! A field whose source has not been published is zero, as Navi48 reports an
-//! unread harvest; Mesa then declines the device (`external_rev` 0 is not a
-//! Navi 22) rather than mis-compiling for a guessed topology.
+//! A field whose source has not been published is zero. An unavailable GC
+//! harvest does not erase a known chip identity or invent active CUs/RBs.
 //!
 //! ## The submission switch
 //!
 //! [`SUBMISSION`] is the one place that decides whether userspace is told the
 //! GPU accepts work: `ACCEL_WORKING`, every `available_rings` mask,
-//! `HW_IP_COUNT` and `AMDGPU_IDS_FLAGS_GANG_SUBMIT` all derive from it, as do
+//! and `HW_IP_COUNT` all derive from it, as do
 //! the DRM version minor and whether `amdgpu_navi22_cs` registers the card's
 //! submitter.
 //!
@@ -59,19 +60,18 @@ pub enum Submission {
 /// `navi22_submit_gfx_user_vmid_ib_executes_and_fences`). Even wired,
 /// nothing is advertised unless the cold boot's ring/IB tests passed
 /// ([`Boot::queues_verified`]). Setting it to `NotWired` withdraws
-/// ACCEL_WORKING, every ring mask, HW_IP_COUNT, GANG_SUBMIT, DRM minor 64 and
+/// ACCEL_WORKING, every ring mask, HW_IP_COUNT, DRM minor 64 and
 /// the render ioctls at once.
 pub const SUBMISSION: Submission = Submission::Wired;
 
 static ACCEL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Boot-time opt-in (`amdgpu.navi22_accel`, set by the fb handoff before the
-/// cold boot runs). Not yet validated on hardware, so off by default.
+/// Boot-time `amdgpu.rdna2_accel` policy, set by the fb handoff before cold
+/// boot. Enabled by default; `amdgpu.rdna2_accel=0` withdraws client work.
 pub fn set_accel(enabled: bool) {
     ACCEL.store(enabled, core::sync::atomic::Ordering::Release);
 }
-/// The switch as this boot applies it: wired code is advertised only with
-/// `amdgpu.navi22_accel`, so the first bare-metal boots prove firmware,
-/// queues and display without userspace picking the native path.
+/// Wired code is advertised only when this boot's acceleration policy
+/// permits it. Individual replies also require successful queue proofs.
 pub fn submission() -> Submission {
     if SUBMISSION == Submission::Wired && ACCEL.load(core::sync::atomic::Ordering::Acquire) {
         Submission::Wired
@@ -244,6 +244,8 @@ pub struct Published {
     /// Observed UCLK limits in kHz; boot MCLK while UCLK DPM is disabled.
     pub memory_khz: Option<(u64, u64)>,
     pub topology: Option<Topology>,
+    /// NBIO ATI revision strap, sampled independently of GC harvesting.
+    pub chip_revision: Option<u8>,
     /// PCI config revision (offset 0x08), `pdev->revision`.
     pub pci_revision: Option<u8>,
     pub boot: Option<Boot>,
@@ -303,7 +305,7 @@ fn ip_version(block: &IpBlock) -> u32 {
 }
 
 /// `AMDGPU_INFO_DEV_INFO`, field for field as `amdgpu_kms.c`.
-fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError> {
+fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let table = snap.gc.ok_or(FsError::InvalidData)?;
     let topology = snap.navi22.topology;
     let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
@@ -316,9 +318,9 @@ fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError>
         });
     let info = uapi::DrmAmdgpuInfoDevice {
         device_id: snap.did,
-        chip_rev: topology.map_or(0, |t| t.rev_id),
-        external_rev: topology.map_or(0, |t| {
-            t.rev_id
+        chip_rev: snap.navi22.chip_revision.map_or(0, u32::from),
+        external_rev: snap.navi22.chip_revision.map_or(0, |revision| {
+            u32::from(revision)
                 + crate::amdgpu_rdna2::for_pci_id(crate::amdgpu::AMD_VENDOR, snap.did as u16)
                     .map_or(0, |p| match p.gc_version.2 {
                         0 => 0x28,
@@ -351,13 +353,9 @@ fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError>
         num_rb_pipes: table.num_rb_per_se.saturating_mul(table.num_se),
         num_hw_gfx_contexts: MAX_HW_CONTEXTS,
         // Discrete; MCBP and TMZ are off by default on GC 10.3.2 and
-        // CONFORMANT_TRUNC_COORD is GFX11-only. Linux claims GANG_SUBMIT on
-        // every bare-metal device; here only once submissions run.
-        ids_flags: if accepting(&snap.navi22, submission) {
-            u64::from(uapi::AMDGPU_IDS_FLAGS_GANG_SUBMIT)
-        } else {
-            0
-        },
+        // CONFORMANT_TRUNC_COORD is GFX11-only. The native RDNA2 backend
+        // accepts one entity per ioctl, so it cannot claim GANG_SUBMIT.
+        ids_flags: 0,
         virtual_address_offset: va.low_offset,
         virtual_address_max: va.low_max,
         high_va_offset: va.high_offset,
@@ -649,7 +647,7 @@ pub fn query_with(
         uapi::AMDGPU_INFO_ACCEL_WORKING => Ok(u32::from(accepting(&snap.navi22, submission))
             .to_le_bytes()
             .to_vec()),
-        uapi::AMDGPU_INFO_DEV_INFO => dev_info(snap, submission),
+        uapi::AMDGPU_INFO_DEV_INFO => dev_info(snap),
         uapi::AMDGPU_INFO_HW_IP_INFO => hw_ip_info(snap, submission, payload[0], payload[1]),
         uapi::AMDGPU_INFO_HW_IP_COUNT => hw_ip_count(snap, submission, payload[0]),
         uapi::AMDGPU_INFO_FW_VERSION => fw_version(snap, payload),

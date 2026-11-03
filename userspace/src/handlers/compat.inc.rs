@@ -2051,6 +2051,15 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.ioctl(cmd, arg)
     }
 
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> narf_filesystem::FsFuture<'a, u64> {
+        self.inner.ioctl_user(cmd, arg, context)
+    }
+
     fn poll_readiness(&self) -> u32 {
         self.inner.poll_readiness()
     }

@@ -866,6 +866,8 @@ mod atomic_e2e_tests;
 
 #[cfg(feature = "kernel-test")]
 mod drm_ioctl_smokes;
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+mod drm_rdna2_fb_tests;
 
 #[cfg(all(feature = "kernel-test", feature = "amdgpu", target_arch = "x86_64"))]
 mod drm_sync_tests;

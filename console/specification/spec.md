@@ -96,8 +96,13 @@ Legacy unlevelled `Writer` calls have `DEFAULT_MESSAGE_LOGLEVEL` priority.
 The `quiet` boot token selects that threshold, suppressing routine boot and
 runtime chatter; `debug` selects level 10, and `loglevel=N` selects an explicit
 1..15 threshold in command-line order. Panic and fatal-trap sinks bypass this
-filter and remain visible; they also bypass the store (its lock may be held by
-the code that faulted).
+filter and remain visible. The panic sink bypasses the store. `trap_sink`
+and `TrapWriter` also attempt to record their text without waiting for the
+store lock, so `dmesg`, `/dev/kmsg` and persistent-log exports can retain CPU
+samples, watchdog reports and fatal diagnostics without a serial connection.
+A reentrant or contended store drops that fragment; physical trap output
+still proceeds without the console lock or framebuffer hook. This path never
+allocates, and keeps the ordinary record/continuation format.
 
 The store is RECORD-based, like Linux's printk ringbuffer: each record has a
 64-bit sequence number, a monotonic timestamp (`set_clock`; 0 until the clock

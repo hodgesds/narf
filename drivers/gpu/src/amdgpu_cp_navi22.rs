@@ -10,8 +10,9 @@ use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_fence_navi22 as fence,
     amdgpu_pm4_defs::{
-        packet3, PACKET3_INDIRECT_BUFFER, PACKET3_MAP_QUEUES, PACKET3_NOP, PACKET3_RELEASE_MEM,
-        PACKET3_SET_BASE, PACKET3_SET_RESOURCES, PACKET3_SET_UCONFIG_REG, PACKET3_WRITE_DATA,
+        packet3, PACKET3_CLEAR_STATE, PACKET3_INDIRECT_BUFFER, PACKET3_MAP_QUEUES, PACKET3_NOP,
+        PACKET3_RELEASE_MEM, PACKET3_SET_BASE, PACKET3_SET_RESOURCES, PACKET3_SET_UCONFIG_REG,
+        PACKET3_WRITE_DATA,
     },
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
@@ -22,6 +23,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 #[path = "amdgpu_cp_navi22_regs.rs"]
 pub(crate) mod regs;
 use regs::*;
+#[path = "amdgpu_navi22_hang.rs"]
+mod hang;
+pub(crate) use hang::Snapshot as GfxHangSnapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -43,6 +47,7 @@ pub mod doorbell {
     pub const MEC_RING0: u32 = 0x003 << 1; // linux: AMDGPU_NAVI10_DOORBELL_MEC_RING0 << 1
     pub const USERQUEUE_END: u32 = 0x08a; // linux: AMDGPU_NAVI10_DOORBELL_USERQUEUE_END
     pub const GFX_RING0: u32 = 0x08b << 1; // linux: AMDGPU_NAVI10_DOORBELL_GFX_RING0 << 1
+    pub const GFX_RING1: u32 = 0x08c << 1; // linux: AMDGPU_NAVI10_DOORBELL_GFX_RING1 << 1
     pub const SDMA0: u32 = 0x100 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 << 1
     pub const SDMA1: u32 = 0x10a << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1 << 1
     pub const SDMA2: u32 = 0x114 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE2 << 1
@@ -478,12 +483,29 @@ pub(crate) mod pm4 {
         mqd: u64,
         wptr: u64,
     ) -> [u32; 7] {
+        map_queues_engine(me, pipe, queue, doorbell, mqd, wptr, 0)
+    }
+    /// `gfx10_kiq_map_queues` with its ENGINE_SEL: 0 compute, 4 gfx.
+    pub(crate) fn map_queues_engine(
+        me: u32,
+        pipe: u32,
+        queue: u32,
+        doorbell: u32,
+        mqd: u64,
+        wptr: u64,
+        engine_sel: u32,
+    ) -> [u32; 7] {
         [
             // linux: n/a (count literal in gfx_v10_0.c:gfx10_kiq_map_queues)
             packet3(PACKET3_MAP_QUEUES, 5),
             // linux-lit: 13=13 * (PACKET3_MAP_QUEUES_QUEUE(1) >> 13); 16=16 * (PACKET3_MAP_QUEUES_PIPE(1) >> 16)
             // linux-lit: 18=18 * (PACKET3_MAP_QUEUES_ME(1) >> 18); 29=29 * (PACKET3_MAP_QUEUES_NUM_QUEUES(1) >> 29)
-            (queue << 13) | (pipe << 16) | (u32::from(me != 1) << 18) | (1 << 29),
+            (queue << 13)
+                | (pipe << 16)
+                | (u32::from(me != 1) << 18)
+                // linux-lit: 26=26 * (PACKET3_MAP_QUEUES_ENGINE_SEL(1) >> 26)
+                | (engine_sel << 26)
+                | (1 << 29),
             doorbell << 2, // linux-lit: 2=2 * (PACKET3_MAP_QUEUES_DOORBELL_OFFSET(1) >> 2)
             mqd as u32,
             (mqd >> 32) as u32,
@@ -696,6 +718,89 @@ pub(crate) async fn wait_fence<I: Io>(
 }
 /// `gfx_v10_0_ring_test_ring`: SCRATCH_REG0 0xCAFEDEAD -> SET_UCONFIG_REG
 /// 0xDEADBEEF, polled through MMIO for at most `adev->usec_timeout`.
+/// One gfx ring's KIQ MAP_QUEUES inputs (`gfx10_kiq_map_queues`, ENGINE_SEL 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GfxQueueMap {
+    pub pipe: u32,
+    pub doorbell: u32,
+    pub mqd: u64,
+    pub wptr: u64,
+}
+/// Gfx rings use no EOP buffer; ring 0's MQD slot holds the RLC CSIB, so the
+/// v10 gfx MQD (512 dwords) lives in the EOP slot of each gfx queue.
+pub(crate) const GFX_MQD: u64 = EOP;
+/// `struct v10_gfx_mqd` dword indices (v10_structs.h).
+pub(crate) mod gfx_mqd_dw {
+    pub const MQD_BASE_ADDR: usize = 128;
+    pub const MQD_BASE_ADDR_HI: usize = 129;
+    pub const HQD_ACTIVE: usize = 130;
+    pub const HQD_VMID: usize = 131;
+    pub const HQD_QUEUE_PRIORITY: usize = 134;
+    pub const HQD_QUANTUM: usize = 135;
+    pub const HQD_BASE: usize = 136;
+    pub const HQD_BASE_HI: usize = 137;
+    pub const HQD_RPTR: usize = 138;
+    pub const HQD_RPTR_ADDR: usize = 139;
+    pub const HQD_RPTR_ADDR_HI: usize = 140;
+    pub const RB_WPTR_POLL_ADDR_LO: usize = 141;
+    pub const RB_WPTR_POLL_ADDR_HI: usize = 142;
+    pub const RB_DOORBELL_CONTROL: usize = 143;
+    pub const HQD_CNTL: usize = 145;
+    pub const HQD_WPTR: usize = 149;
+    pub const HQD_WPTR_HI: usize = 150;
+    pub const MQD_CONTROL: usize = 162;
+    pub const DWORDS: usize = 512;
+}
+/// `gfx_v10_0_gfx_mqd_init` for a kernel gfx ring, with the ring's ME0 pipe
+/// already GRBM-selected (it read-modify-writes the selected HQD registers).
+/// `high_priority` is `amdgpu_gfx_is_high_priority_graphics_queue`: pipe 1
+/// queue 0 when async gfx rings span two pipes.
+fn gfx_mqd<I: Io>(
+    io: &mut I,
+    l: Layout,
+    q: &Queue,
+    high_priority: bool,
+) -> [u32; gfx_mqd_dw::DWORDS] {
+    use gfx_mqd_dw::*;
+    let mut m = [0u32; DWORDS];
+    let (mqd, base, rptr, wptr) = (
+        q.address(GFX_MQD),
+        q.address(0) >> 8,
+        q.address(RPTR),
+        q.address(WPTR),
+    );
+    m[HQD_WPTR] = 0;
+    m[HQD_WPTR_HI] = 0;
+    m[MQD_BASE_ADDR] = mqd as u32 & !3;
+    m[MQD_BASE_ADDR_HI] = (mqd >> 32) as u32;
+    // VMID 0, PRIV_STATE 1, CACHE_POLICY 0.
+    // linux-lit: 0xf=CP_GFX_MQD_CONTROL__VMID_MASK; 0x100=CP_GFX_MQD_CONTROL__PRIV_STATE_MASK; 0x3000000=CP_GFX_MQD_CONTROL__CACHE_POLICY_MASK
+    m[MQD_CONTROL] = (io.read(l.reg(CP_GFX_MQD_CONTROL)) & !0x0300_010f) | 0x100;
+    m[HQD_VMID] = 0;
+    // linux-lit: 0xf=CP_GFX_HQD_QUEUE_PRIORITY__PRIORITY_LEVEL_MASK
+    m[HQD_QUEUE_PRIORITY] =
+        (io.read(l.reg(CP_GFX_HQD_QUEUE_PRIORITY)) & !0xf) | u32::from(high_priority);
+    // linux-lit: 1=CP_GFX_HQD_QUANTUM__QUANTUM_EN_MASK
+    m[HQD_QUANTUM] = io.read(l.reg(CP_GFX_HQD_QUANTUM)) | 1;
+    m[HQD_BASE] = base as u32;
+    m[HQD_BASE_HI] = (base >> 32) as u32;
+    m[HQD_RPTR_ADDR] = rptr as u32 & !3;
+    // linux-lit: 0xffff=CP_GFX_HQD_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK
+    m[HQD_RPTR_ADDR_HI] = (rptr >> 32) as u32 & 0xffff;
+    m[RB_WPTR_POLL_ADDR_LO] = wptr as u32 & !3;
+    m[RB_WPTR_POLL_ADDR_HI] = (wptr >> 32) as u32 & 0xffff;
+    // order_base_2(queue_size / 4) - 1, RB_BLKSZ = RB_BUFSZ - 2.
+    let bufsz = RB_BUFSZ;
+    // linux-lit: 0x3f=CP_GFX_HQD_CNTL__RB_BUFSZ_MASK; 0x3f00=CP_GFX_HQD_CNTL__RB_BLKSZ_MASK; 8=CP_GFX_HQD_CNTL__RB_BLKSZ__SHIFT
+    m[HQD_CNTL] = (io.read(l.reg(CP_GFX_HQD_CNTL)) & !0x3f3f) | bufsz | ((bufsz - 2) << 8);
+    m[RB_DOORBELL_CONTROL] = (io.read(l.reg(CP_RB_DOORBELL_CONTROL)) & !0x4fff_fffc)
+        // linux-lit: 30=CP_RB_DOORBELL_CONTROL__DOORBELL_EN__SHIFT; 2=CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT
+        | (1 << 30)
+        | (q.doorbell << 2);
+    m[HQD_RPTR] = io.read(l.reg(CP_GFX_HQD_RPTR));
+    m[HQD_ACTIVE] = 1;
+    m
+}
 pub(crate) async fn ring_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<(), Error> {
     hw.access(|io, l| {
         // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ring)
@@ -825,6 +930,8 @@ pub enum GfxState {
     Prepared,
     Configuring,
     Configured,
+    /// Both gfx MQDs written; waiting for the KIQ to map them.
+    Mapping,
     Starting,
     Running,
     Testing,
@@ -844,8 +951,10 @@ pub struct GfxProof {
     pub ib_fence: u32,
 }
 /// gfx ring 0 (ME0 pipe 0), 8 KiB: RB_BUFSZ = order_base_2(8192 / 8).
-const RB_BUFSZ: u32 = 10; // linux: n/a (order_base_2(NARF 8 KiB ring / 8))
-                          // linux: (0 << SH_MEM_CONFIG__ADDRESS_MODE__SHIFT) | (3 << SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT) | (0 << SH_MEM_CONFIG__RETRY_MODE__SHIFT) | (3 << SH_MEM_CONFIG__INITIAL_INST_PREFETCH__SHIFT)
+/// Gfx HQD RB_BUFSZ: `order_base_2(queue_size / 4) - 1` (gfx_v10_0_gfx_mqd_init).
+const RB_BUFSZ: u32 = 10; // linux: n/a (order_base_2(NARF 8 KiB ring / 4) - 1)
+const _: () = assert!(RB_BUFSZ == (RING_BYTES / 4).trailing_zeros() - 1);
+// linux: (0 << SH_MEM_CONFIG__ADDRESS_MODE__SHIFT) | (3 << SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT) | (0 << SH_MEM_CONFIG__RETRY_MODE__SHIFT) | (3 << SH_MEM_CONFIG__INITIAL_INST_PREFETCH__SHIFT)
 const SH_MEM_CONFIG_DEFAULT: u32 = (3 << 2) | (3 << 14); // 64-bit, unaligned, retry all
 const FIRST_KFD_VMID: u32 = 8; // linux: n/a (literal in gmc_v10_0.c:gmc_v10_0_sw_init)
 
@@ -853,6 +962,12 @@ const FIRST_KFD_VMID: u32 = 8; // linux: n/a (literal in gmc_v10_0.c:gmc_v10_0_s
 pub(crate) struct GfxEngine<I: Io> {
     pub hw: Hw<I>,
     pub queue: Queue,
+    /// GFX ring 1 on ME0 pipe 1 (the high-priority gfx queue). GC 10.3.x has
+    /// `num_gfx_rings` = 2: Linux's default async path maps it through the
+    /// KIQ with its own MQD, `cp_gfx_start` submits a CLEAR_STATE to it
+    /// ("copy state 0 to next available state") and `cp_resume` ring-tests
+    /// it. It carries no client work.
+    pub pipe1: Queue,
     pub state: GfxState,
     pub proof: GfxProof,
     /// The ASIC's golden sequence already applied (`golden`), so `configure`
@@ -920,16 +1035,19 @@ impl<I: Io> GfxEngine<I> {
     async fn configure_inner(&mut self) -> Result<(), Error> {
         let csb = crate::amdgpu_clearstate_gfx10::csb(self.hw.layout.segment(1), 0)
             .ok_or(Error::Unsupported)?;
-        let queue = &mut self.queue;
+        let (queue, pipe1) = (&mut self.queue, &mut self.pipe1);
         self.hw.access(|io, l| {
             checked(io.read(l.reg(GRBM_CNTL)))?;
             queue.clear(io);
             queue.write(io, MQD, &csb);
+            pipe1.clear(io);
             flush(io, l);
             Ok(())
         })?;
-        // Published before the RLC can learn the CSIB address.
+        // Published before the RLC can learn the CSIB address, and before
+        // `start` gives ME0 pipe 1 its ring base.
         self.queue.memory.publish();
+        self.pipe1.memory.publish();
         let golden = !self.golden;
         self.golden = true;
         let cam = self.hw.access(|io, l| {
@@ -1041,56 +1159,70 @@ impl<I: Io> GfxEngine<I> {
         self.proof.csb_dwords = csb.len() as u32;
         Ok(())
     }
-    /// `gfx_v10_0_cp_gfx_resume` + `cp_gfx_start` + gfx ring test. Linux's
-    /// second gfx ring (pipe 1) is not created.
-    pub(crate) async fn start(&mut self) -> Result<(), Error> {
-        self.begin(GfxState::Configured, GfxState::Starting)?;
+    /// Linux's default gfx queue path (`amdgpu_async_gfx_ring` = 1),
+    /// `gfx_v10_0_cp_async_gfx_ring_resume` step 1: `gfx_v10_0_kgq_init_queue`
+    /// writes a v10 gfx MQD for each ring under its ME0 pipe selection and
+    /// programs the doorbell range from ring 0 only (the range registers are
+    /// global; ring 1's index would otherwise exclude ring 0). The caller then
+    /// has the KIQ map both queues (`amdgpu_gfx_enable_kgq`) and calls
+    /// [`Self::start_mapped`].
+    pub(crate) fn prepare_queues(&mut self) -> Result<[GfxQueueMap; 2], Error> {
+        self.begin(GfxState::Configured, GfxState::Mapping)?;
+        let result = self.prepare_inner();
+        if result.is_err() {
+            self.state = GfxState::Failed;
+        }
+        result
+    }
+    fn prepare_inner(&mut self) -> Result<[GfxQueueMap; 2], Error> {
+        let (ring0, ring1) = (&self.queue, &self.pipe1);
+        self.hw.access(|io, l| {
+            checked(io.read(l.reg(GRBM_CNTL)))?;
+            for (pipe, q) in [(0, ring0), (1, ring1)] {
+                grbm_select(io, l, 0, pipe, 0, 0);
+                let mqd = gfx_mqd(io, l, q, pipe == 1);
+                if pipe == 0 {
+                    // gfx_v10_0_cp_gfx_set_doorbell with async rings: only the
+                    // Sienna Cichlid range fields (control lives in the MQD).
+                    // linux-lit: 2=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT; 0xffc=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK
+                    io.write(l.reg(CP_RB_DOORBELL_RANGE_LOWER), (q.doorbell << 2) & 0xffc);
+                    // linux-lit: 0xffc=CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK
+                    io.write(l.reg(CP_RB_DOORBELL_RANGE_UPPER), 0xffc);
+                }
+                grbm_select(io, l, 0, 0, 0, 0);
+                for (i, &word) in mqd.iter().enumerate() {
+                    io.write_memory(q.map(), GFX_MQD + i as u64 * 4, word);
+                }
+            }
+            flush(io, l);
+            Ok([0, 1].map(|pipe| {
+                let q = if pipe == 0 { ring0 } else { ring1 };
+                GfxQueueMap {
+                    pipe,
+                    doorbell: q.doorbell,
+                    mqd: q.address(GFX_MQD),
+                    wptr: q.address(WPTR),
+                }
+            }))
+        })
+    }
+    /// The KIQ could not map the gfx queues: this owner cannot start.
+    pub(crate) fn abandon_mapping(&mut self) {
+        if self.state == GfxState::Mapping {
+            self.state = GfxState::Failed;
+        }
+    }
+    /// After the KIQ mapped both gfx queues: `gfx_v10_0_cp_gfx_start` and
+    /// `cp_resume`'s ring test of each gfx ring.
+    pub(crate) async fn start_mapped(&mut self) -> Result<(), Error> {
+        self.begin(GfxState::Mapping, GfxState::Starting)?;
         let result = self.start_inner().await;
         self.finish(result, GfxState::Running)
     }
     async fn start_inner(&mut self) -> Result<(), Error> {
-        let q = &self.queue;
-        let (base, rptr, wptr, index) =
-            (q.address(0), q.address(RPTR), q.address(WPTR), q.doorbell);
-        let cntl = RB_BUFSZ | ((RB_BUFSZ - 2) << 8); // linux-lit: 8=CP_RB0_CNTL__RB_BLKSZ__SHIFT
         self.hw.access(|io, l| {
-            io.write(l.reg(CP_RB_WPTR_DELAY), 0);
-            io.write(l.reg(CP_RB_VMID), 0);
-            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
-            io.write(l.reg(CP_RB0_CNTL), cntl);
-            io.write(l.reg(CP_RB0_WPTR), 0);
-            io.write(l.reg(CP_RB0_WPTR_HI), 0);
-            io.write(l.reg(CP_RB0_RPTR_ADDR), rptr as u32);
-            // linux-lit: 0xffff=CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK
-            io.write(l.reg(CP_RB0_RPTR_ADDR_HI), (rptr >> 32) as u32 & 0xffff);
-            io.write(l.reg(CP_RB_WPTR_POLL_ADDR_LO), wptr as u32);
-            io.write(l.reg(CP_RB_WPTR_POLL_ADDR_HI), (wptr >> 32) as u32);
-            Ok(())
-        })?;
-        delay(1000).await; // linux: n/a (mdelay(1) in gfx_v10_0_cp_gfx_resume)
-        self.hw.access(|io, l| {
-            io.write(l.reg(CP_RB0_CNTL), cntl);
-            // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
-            io.write(l.reg(CP_RB0_BASE), (base >> 8) as u32);
-            // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
-            io.write(l.reg(CP_RB0_BASE_HI), (base >> 40) as u32);
-            io.write(l.reg(CP_RB_ACTIVE), 1);
-            // gfx_v10_0_cp_gfx_set_doorbell, Sienna Cichlid range fields
-            update(
-                io,
-                l.reg(CP_RB_DOORBELL_CONTROL),
-                // linux: CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK | CP_RB_DOORBELL_CONTROL__DOORBELL_EN_MASK
-                0x4fff_fffc,
-                // linux-lit: 30=CP_RB_DOORBELL_CONTROL__DOORBELL_EN__SHIFT; 2=CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT
-                (1 << 30) | (index << 2),
-            )?;
-            // linux-lit: 2=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT; 0xffc=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK
-            io.write(l.reg(CP_RB_DOORBELL_RANGE_LOWER), (index << 2) & 0xffc);
-            // linux-lit: 0xffc=CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK
-            io.write(l.reg(CP_RB_DOORBELL_RANGE_UPPER), 0xffc);
-            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
-                                                     // gfx_v10_0_cp_gfx_start
-                                                     // linux: n/a (max_hw_contexts literal 8 in gfx_v10_0_gpu_early_init)
+            // gfx_v10_0_cp_gfx_start
+            // linux: n/a (max_hw_contexts literal 8 in gfx_v10_0_gpu_early_init)
             io.write(l.reg(CP_MAX_CONTEXT), 8 - 1);
             io.write(l.reg(CP_DEVICE_ID), 1);
             // linux-lit: 0x15000000=CP_ME_CNTL__ME_HALT_MASK | CP_ME_CNTL__PFP_HALT_MASK | CP_ME_CNTL__CE_HALT_MASK
@@ -1107,14 +1239,18 @@ impl<I: Io> GfxEngine<I> {
             .await;
         let csb = crate::amdgpu_clearstate_gfx10::csb(self.hw.layout.segment(1), 0)
             .ok_or(Error::Unsupported)?;
-        let queue = &mut self.queue;
+        let (queue, pipe1) = (&mut self.queue, &mut self.pipe1);
         self.hw.access(|io, l| {
             queue.emit(io, &csb)?;
             queue.emit(io, &pm4::ce_partition_base())?;
             queue.commit(io, l);
+            // num_gfx_rings > 1: copy state 0 to the next available state.
+            pipe1.emit(io, &[packet3(PACKET3_CLEAR_STATE, 0), 0])?;
+            pipe1.commit(io, l);
             Ok(())
         })?;
         ring_test(&mut self.hw, &mut self.queue).await?;
+        ring_test(&mut self.hw, &mut self.pipe1).await?;
         self.proof.ring = true;
         // gfx_v10_0_hw_init ends with gfx_v10_3_set_power_brake_sequence for
         // GC >= 10.3 after cp_resume; the KIQ/KCQ halves ran before this ring.
@@ -1189,6 +1325,9 @@ impl Gfx {
                     authority,
                 },
                 queue: Queue::new(pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx)?,
+                // No fence is emitted on pipe 1; the Gfx slot only times its
+                // ring-test register poll.
+                pipe1: Queue::new(pool, Kind::Cp, doorbell::GFX_RING1, fence::Engine::Gfx)?,
                 state: GfxState::Prepared,
                 proof: GfxProof::default(),
                 golden: false,
@@ -1211,11 +1350,23 @@ impl Gfx {
     pub async unsafe fn configure(&mut self) -> Result<(), Error> {
         self.engine.configure().await
     }
+    /// Write both gfx MQDs (`gfx_v10_0_kgq_init_queue`); the KIQ maps them
+    /// next ([`crate::amdgpu_kiq_navi22::Compute::map_gfx`]).
+    ///
     /// # Safety
     /// `configure` succeeded, the NBIF doorbell aperture is enabled and the
-    /// KIQ was initialized first (Linux `cp_resume` order).
-    pub async unsafe fn start(&mut self) -> Result<(), Error> {
-        self.engine.start().await
+    /// KIQ and compute queue were mapped first (Linux `cp_resume` order).
+    pub(crate) unsafe fn prepare_queues(&mut self) -> Result<[GfxQueueMap; 2], Error> {
+        self.engine.prepare_queues()
+    }
+    /// The KIQ failed to map the gfx queues.
+    pub(crate) fn abandon_mapping(&mut self) {
+        self.engine.abandon_mapping();
+    }
+    /// # Safety
+    /// The KIQ mapped the MQDs returned by [`Self::prepare_queues`].
+    pub(crate) async unsafe fn start_mapped(&mut self) -> Result<(), Error> {
+        self.engine.start_mapped().await
     }
     pub async fn test_ib(&mut self) -> Result<(), Error> {
         self.engine.test_ib().await
@@ -1266,6 +1417,13 @@ impl Gfx {
         }
         progress(&mut self.engine.hw, &self.engine.queue)
     }
+    /// Timeout-only evidence; caller retains the GC power reference.
+    pub(crate) fn hang_snapshot(&mut self) -> Result<GfxHangSnapshot, Error> {
+        if self.engine.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        hang::capture(&mut self.engine.hw, &self.engine.queue)
+    }
 }
 
 /// Enable the NBIF doorbell and self-ring apertures once, before any queue
@@ -1312,9 +1470,10 @@ const SDMA_TRAP_ENABLE: u32 = 1; // linux: SDMA0_CNTL__TRAP_ENABLE_MASK@gc
 /// The interrupt sources `amdgpu_fence_driver_hw_init` arms through
 /// `amdgpu_irq_get` for the kernel rings created here:
 /// `gfx_v10_0_set_gfx_eop_interrupt_state` (ME0 pipe 0),
-/// `gfx_v10_0_set_compute_eop_interrupt_state` (MEC1 pipe 0) and
-/// `sdma_v5_2_set_trap_irq_state` (both engines). The KIQ's MEC2 pipe is not
-/// armed, as in Linux; its fences stay polled.
+/// EOP/trap completion plus `gfx_v10_0_late_init`'s CP error interrupts on
+/// the owned GFX/MEC1 pipes. Linux enables privileged-instruction faults on
+/// GFX only; privileged-register and bad-opcode faults cover both.
+/// The KIQ's MEC2 pipe stays polled, as in Linux.
 pub(crate) fn enable_fence_irqs<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     enable_fence_irqs_for(io, l, 2)
 }
@@ -1323,8 +1482,16 @@ pub(crate) fn enable_fence_irqs_for<I: Io>(
     l: Layout,
     count: usize,
 ) -> Result<(), Error> {
-    for reg in [CP_INT_CNTL_RING0, CP_ME1_PIPE0_INT_CNTL] {
-        update(io, l.reg(reg), TIME_STAMP_INT_ENABLE, TIME_STAMP_INT_ENABLE)?;
+    // linux: CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE_MASK@gc101 | CP_INT_CNTL_RING0__OPCODE_ERROR_INT_ENABLE_MASK@gc101
+    const COMMON_FAULTS: u32 = 0x0180_0000;
+    // linux: CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE_MASK@gc101
+    const GFX_INSTRUCTION_FAULT: u32 = 0x0040_0000;
+    for (reg, faults) in [
+        (CP_INT_CNTL_RING0, COMMON_FAULTS | GFX_INSTRUCTION_FAULT),
+        (CP_ME1_PIPE0_INT_CNTL, COMMON_FAULTS),
+    ] {
+        let mask = TIME_STAMP_INT_ENABLE | faults;
+        update(io, l.reg(reg), mask, mask)?;
     }
     // Re-armed after SdmaQueues' soft reset cleared the IH proof's enable.
     for instance in 0..count as u32 {
