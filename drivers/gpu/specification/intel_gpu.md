@@ -2362,7 +2362,7 @@ production feature. Unsupported functionality remains unadvertised.
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 lifecycle owner, media GuC firmware/ADS/polled CT and dual-GuC GGTT invalidation run beside GT0; media engines, gt_id 1 UAPI and HuC remain |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire; GSC-loaded HuC, GT1 engine-cycles/topology queries and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20), gated on the watermark lane's Wa_14015648006 input; TBT, HDMI FRL, UHBR, multi-pipe, PSR2 selective fetch and Panel Replay open |
@@ -3536,6 +3536,73 @@ the shared `boot_opt_in` grammar. With the option absent, the runtime builds no
 media owner, `media::retire` returns `Done` without MMIO, GT0 install, park,
 suspend and cold-start proceed as before, and the arena registers no second TLB.
 The debug group pass is deferred to the end of the current integration wave.
+
+#### Media engines, interrupts and native Xe gt_id 1
+
+The media GuC now schedules GT1's fused VCS/VECS engines through the shared
+GuCBoot, GuCGt and GuCScheduler owners. Linux reads HWCONFIG on GT0 only, so
+the media role builds its engine list from the media fuses and its ADS from
+that list: logical-to-physical maps, enable masks, golden LRCs and per-engine
+register saves. GT1 has no render reset domain, so the ADS saves no RCU or CCS
+mode. While its engines are scheduled the owner holds every present VDBOX/VEBOX
+wake. Every GT1 wake proof checks those wakes. The owner installs the
+oam_mmio_trg_vcs/vecs NONPRIV grants with NOPID fill and enables each ring, then
+reloads the GuC. No engine workaround or tuning entry matches media 13.00
+VCS/VECS.
+
+Default LRCs follow xe_gt_record_default_lrcs. On GT1 the media 13.00 WA job is
+empty, because no LRC workaround or tuning rule matches a standalone media GT.
+Images use dg2_xcs_offsets, as Linux keys them on the device graphics IP.
+Video rings follow __emit_job_gen12_video. MTL has no flat CCS, so AUX
+invalidation applies; emit_aux_table_inv adds GT1's MMIO adjustment, which
+places VD0/VE0_AUX_INV at 0x384218/0x384238. Once submission is enabled, the
+shared arena stops writing GT1's GUC_TLB_INV_CR. The media scheduler's
+per-context CT TLB_INVALIDATION covers GT1 instead, as send_tlb_inval_ggtt does
+with CT and submission enabled. Stop reverts to MMIO. GT1 is declared ready
+only after each engine runs its own private-PPGTT store job, retires it and
+verifies the result.
+
+Stop follows GT0's verified model: GuC reset, media GRDOM_FULL with a
+scheduler, DMA idle, memory release and wake release, with engine wakes
+released last. NARF never loads GSC firmware and has no owner for
+Wa_14015076503. Scheduling therefore refuses while GSC firmware reports loaded,
+and a later load keeps the owner retained rather than resetting without the
+workaround.
+
+Published engines' user interrupts are routed onto GT0's tiled MSI. The owned
+bits are the VCS/VECS halves of VCS_VECS_INTR_ENABLE, the mask-pair halves
+and each RING_IMR. GT0's sources and both GuC halves are untouched. Bank-1
+identities decode as VIDEO_DECODE/VIDEO_ENHANCE and only wake the worker that
+polls GT1. Sources are masked again before GT1 leaves Running. Without
+delivery, GT1 is serviced from the worker's timer.
+
+With the option on, native Xe lists GT1 only after every engine's job has
+verified, and only while GT0's epoch is live. The GT list then has a MEDIA
+entry (gt_id 1, GT1's own clock and GMD_ID). The engine query adds VCS/VECS on
+gt_id 1, and queue creation resolves placements per gt_id in
+xe_exec_queue_create_ioctl's errno order. EXEC submits to the media GuC under
+GT1's epoch. With the option off, or before publication, the UAPI is GT0-only
+exactly as before. The engine cycles and topology queries, width > 1 media
+queues and GSC-loaded HuC remain open, along with silicon and Mesa acceptance.
+
+New fixtures register under `intel_gpu_media_gt`:
+- `smoke_media_gt_sched_engines_prime_probe_publish_and_stop` and
+  `smoke_media_gt_sched_refusals_stop_and_publish_nothing` run the GuC model
+  through scheduling, priming, probes, a user job and verified stop. They also
+  cover wake timeout, loaded GSC, a dropped store and owner-level refusals.
+- `smoke_media_gt_video_ring_ops_and_lrc_layout` checks the ring and LRC
+  layouts.
+- `smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable` covers the
+  shared arena's invalidation modes.
+- `smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits`
+  covers interrupt routing.
+- `smoke_xe_mtl_media_gt1_published_queries_queues_and_exec` exercises the
+  published UAPI. The existing unpublished conversation remains its negative
+  counterpart.
+
+The MediaGuc owner fixture was updated: a booted media GuC now takes its engine
+wakes instead of enabling an idle CT. These fixtures were registered but not
+run in this checkpoint, and they are not physical Intel evidence.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 
