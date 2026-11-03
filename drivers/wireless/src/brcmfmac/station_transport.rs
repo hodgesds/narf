@@ -1035,6 +1035,13 @@ where
         }
         Ok(response)
     }
+    fn wowl_supported(&mut self) -> bool {
+        !self.failed
+            && self
+                .inner
+                .as_mut()
+                .is_some_and(|inner| inner.wowl_supported())
+    }
     fn set_link(&mut self, peer: Option<[u8; 6]>) {
         if self.ap.is_some()
             || self

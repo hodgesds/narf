@@ -57,6 +57,8 @@ enum ExternalOp {
     Key(narf_wireless::KeyParams),
     DeleteKey(u8),
     Authorize([u8; 6], bool),
+    /// `gtk_key_info` (`struct brcmf_gtk_keyinfo_le`), wiped on drop.
+    Rekey(zeroize::Zeroizing<[u8; super::station::wowl::GTK_KEYINFO_LEN]>),
 }
 #[cfg(any(test, feature = "kernel-test"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +168,12 @@ pub struct Device<R: Fullmac> {
     pmksa: IrqSafeSpinLock<super::station::pmksa::Cache>,
     ht_capabilities: [Option<[u8; 26]>; 2],
     vht_capabilities: [Option<[u8; 12]>; 2],
+    /// Firmware WoWL features (`wiphy->wowlan`), fixed per generation.
+    wowl: Option<super::station::wowl::Features>,
+    /// nl80211 SET_WOWLAN triggers armed at the next system suspend.
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// Wake report of the last WoWL resume (`cfg80211_report_wowlan_wakeup`).
+    wakeup: IrqSafeSpinLock<Option<super::station::wowl::Wakeup>>,
     up: AtomicBool,
     // Requested PS policy: 0=awake, 1=PM_FAST, 2=terminal failure. The
     // retained worker serializes firmware commands with scan/join/packets.
@@ -242,6 +250,7 @@ trait Endpoint: Send + Sync {
     fn drain(&self) -> bool;
     fn suspend(&self) -> PmFuture<'_>;
     fn resume(&self) -> PmFuture<'_>;
+    fn wowlan_wakeup(&self) -> Option<super::station::wowl::Wakeup>;
 }
 /// System-suspend prepare for the attached PCIe FullMAC owner, if any:
 /// Linux `brcmf_cfg80211_suspend` without WoWL (`brcmf_link_down` on a
@@ -252,6 +261,13 @@ pub async fn suspend_pcie() -> Result<(), Error> {
         Some(active) => active.suspend().await,
         None => Ok(()),
     }
+}
+/// The firmware wake report of the attached PCIe owner's last WoWL resume
+/// (Linux `cfg80211_report_wowlan_wakeup`; `None` for a NULL report or no
+/// WoWL resume). The shared contract has no wake event, so this is a
+/// driver accessor.
+pub fn last_wowlan_wakeup_pcie() -> Option<super::station::wowl::Wakeup> {
+    ACTIVE_PCIE.lock().clone()?.wowlan_wakeup()
 }
 /// Paired resume for [`suspend_pcie`].
 pub async fn resume_pcie() -> Result<(), Error> {
@@ -344,6 +360,9 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         pmksa: IrqSafeSpinLock::new(Default::default()),
         ht_capabilities: station.ht_capabilities(),
         vht_capabilities: station.vht_capabilities(),
+        wowl: station.wowl(),
+        wowlan: IrqSafeSpinLock::new(None),
+        wakeup: IrqSafeSpinLock::new(None),
         state: Mutex::new(State {
             station,
             rx: rx_producer,
@@ -423,6 +442,11 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
 }
 
 impl<R: Fullmac + 'static> Device<R> {
+    /// Wake report of this shell's last WoWL resume (see
+    /// [`last_wowlan_wakeup_pcie`]).
+    pub fn last_wowlan_wakeup(&self) -> Option<super::station::wowl::Wakeup> {
+        *self.wakeup.lock()
+    }
     /// Interface name of this shell.
     pub fn interface_name(&self) -> &str {
         &self.name
@@ -766,6 +790,7 @@ impl<R: Fullmac + 'static> Device<R> {
                 ExternalOp::Authorize(peer, authorized) => {
                     state.station.authorize_port(peer, authorized)
                 }
+                ExternalOp::Rekey(keyinfo) => state.station.set_rekey_data(&keyinfo).await,
             };
             if let Err(error) = result {
                 self.external_ops.lock().clear();
@@ -987,6 +1012,22 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
                 self.ap_retire_staging();
                 return station.runtime.suspend_transport().await;
             }
+            // brcmf_cfg80211_suspend with a cfg80211_wowlan: configure WoWL
+            // and keep the association; a refused programming falls back
+            // to the no-WoWL path below (Linux ignores those errors).
+            let wowlan = self.wowlan.lock().clone();
+            if let Some(config) = wowlan.filter(|_| self.wowl.is_some()) {
+                let mut state = self.state.lock().await;
+                state.clear_transmit();
+                if state.station.wowl_suspend(&config).await.is_ok() {
+                    let result = state.station.runtime.suspend_transport().await;
+                    if result.is_err() {
+                        // The transport stays UP; undo WoWL for the unwind.
+                        let _ = state.station.wowl_resume().await;
+                    }
+                    return result;
+                }
+            }
             let connected = self.state.lock().await.station.bssid.is_some();
             if connected {
                 let _ = WirelessNetIface::disassociate(self).await;
@@ -996,6 +1037,9 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
             state.station.runtime.suspend_transport().await
         })
     }
+    fn wowlan_wakeup(&self) -> Option<super::station::wowl::Wakeup> {
+        self.last_wowlan_wakeup()
+    }
     fn resume(&self) -> PmFuture<'_> {
         alloc::boxed::Box::pin(async move {
             let mut state = self.state.lock().await;
@@ -1003,6 +1047,17 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
             if result.is_err() {
                 self.power_save.store(2, Ordering::Release);
                 self.link(None);
+                return result;
+            }
+            if state.station.wowl_armed() {
+                // brcmf_cfg80211_resume: report and clear the wake reason.
+                match state.station.wowl_resume().await {
+                    Ok(wakeup) => *self.wakeup.lock() = wakeup,
+                    Err(error) => {
+                        *self.wakeup.lock() = None;
+                        narf_console::klog!("{}: FullMAC WoWL resume: {:?}\n", self.name, error);
+                    }
+                }
             }
             result
         })
@@ -1293,6 +1348,34 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     }
     fn supports_external_supplicant(&self) -> bool {
         true
+    }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.wowl.map(super::station::wowl::Features::support)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        let features = self.wowl.ok_or(95)?;
+        if let Some(config) = config.as_ref() {
+            features.validate(config)?;
+        }
+        *self.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowl.and(self.wowlan.lock().clone())
+    }
+    fn supports_gtk_rekey_offload(&self) -> bool {
+        self.wowl.is_some_and(|features| features.gtk)
+    }
+    fn set_gtk_rekey_data(&self, data: narf_wireless::GtkRekeyData) -> Result<(), i32> {
+        // brcmf_cfg80211_set_rekey_data exists only with BRCMF_FEAT_WOWL_GTK.
+        if !self.supports_gtk_rekey_offload() || self.ap_mode() != 2 {
+            return Err(95);
+        }
+        self.connected_bssid().ok_or(107)?; // ENOTCONN
+        self.external_ops
+            .lock()
+            .push_back(ExternalOp::Rekey(super::station::wowl::gtk_keyinfo(&data)));
+        Ok(())
     }
     fn add_key(&self, key: narf_wireless::KeyParams) -> Result<(), i32> {
         if self.ap_mode() != 2 {

@@ -56,6 +56,10 @@ pub struct Station<R: Fullmac> {
     probe_ies: Vec<u8>,
     /// Negotiated firmware WMM rank map for the authorized peer.
     ac_priority: [u8; 8],
+    /// Firmware WoWL features (`wowl::probe`); `None` without bus wake.
+    wowl: Option<wowl::Features>,
+    /// `cfg->wowl.active`: armed for the current suspend.
+    wowl_armed: Option<wowl::Armed>,
 }
 impl<R: Fullmac> core::fmt::Debug for Station<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -160,6 +164,7 @@ impl<R: Fullmac> Station<R> {
             Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
+        let wowl = wowl::probe(&mut runtime).await?;
         policy::check_initial(&mut runtime, &policy, &domain)?;
         policy::enable(&mut runtime, &policy, &domain).await?;
         policy::check_initial(&mut runtime, &policy, &domain)?;
@@ -214,6 +219,8 @@ impl<R: Fullmac> Station<R> {
             operation: false,
             probe_ies: Vec::new(),
             ac_priority: wmm::DEFAULT_AC_PRIORITY,
+            wowl,
+            wowl_armed: None,
         })
     }
 
@@ -1009,6 +1016,8 @@ mod probe_ies;
 pub mod sae;
 #[path = "station_wmm.rs"]
 pub mod wmm;
+#[path = "station_wowl.rs"]
+pub mod wowl;
 
 const MAX_REPLY: usize = 1502;
 

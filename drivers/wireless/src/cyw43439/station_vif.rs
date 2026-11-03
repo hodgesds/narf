@@ -47,6 +47,8 @@ impl<R: Fullmac> Station<R> {
             operation,
             probe_ies,
             ac_priority,
+            wowl,
+            wowl_armed,
         } = self;
         (
             Station {
@@ -76,6 +78,8 @@ impl<R: Fullmac> Station<R> {
                 operation,
                 probe_ies,
                 ac_priority,
+                wowl,
+                wowl_armed,
             },
             old,
         )
@@ -114,6 +118,9 @@ impl<R: Fullmac> Station<R> {
             operation: false,
             probe_ies: Vec::new(),
             ac_priority: wmm::DEFAULT_AC_PRIORITY,
+            // Linux arms WoWL only on the primary interface.
+            wowl: None,
+            wowl_armed: None,
         }
     }
 

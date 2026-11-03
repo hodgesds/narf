@@ -699,6 +699,28 @@ impl runtime::Bus for PcieBackplane {
     fn disarm_interrupts(&mut self) {
         self.disarm_msi();
     }
+    fn pme_d3hot(&mut self) -> bool {
+        if self.qualified().is_err() {
+            return false;
+        }
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            // SAFETY: bounded standard capability discovery over this exact
+            // retained function's validated live configuration window.
+            let Ok(Some(offset)) = (unsafe {
+                narf_bus::pci_cap::find_cap(&self.device, narf_bus::pci_cap::id::POWER_MGMT)
+            }) else {
+                return false;
+            };
+            // PMC is the upper half of the capability's first dword;
+            // `PCI_PM_CAP_PME_SHIFT` 11 + `PCI_D3hot` 3 = bit 14.
+            u16::try_from(offset).ok().is_some_and(|offset| {
+                narf_bus::pci::read_config32(&self.cap, &self.device, offset)
+                    .is_ok_and(|dword| dword != u32::MAX && (dword >> 16) & (1 << 14) != 0)
+            })
+        })
+        .unwrap_or(false)
+    }
     fn link_control(&mut self) -> Result<u32, runtime::Error> {
         self.qualified().map_err(|_| runtime::Error::Access)?;
         let cap = self.cap;

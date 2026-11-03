@@ -91,6 +91,12 @@ pub trait Bus: BootBus {
     }
     /// Release a vector bound by [`Self::arm_interrupts`].
     fn disarm_interrupts(&mut self) {}
+    /// Linux `pcie.c` `bus->wowl_supported = pci_pme_capable(pdev,
+    /// PCI_D3hot)`: the function's PCI PM capability lists D3hot in
+    /// `PME_Support`. Backends without config access report false.
+    fn pme_d3hot(&mut self) -> bool {
+        false
+    }
     /// Config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
     fn link_control(&mut self) -> Result<u32, Error> {
         Err(Error::Protocol)
@@ -924,6 +930,10 @@ fn publish_ring<B: Bus>(
     Ok(())
 }
 impl<B: Bus> Runtime<B> {
+    /// Linux `bus_if->wowl_supported` for this function ([`Bus::pme_d3hot`]).
+    pub fn wowl_supported(&mut self) -> bool {
+        !self.failed && self.bus.pme_d3hot()
+    }
     /// Data rings remain transport-only: a station must authorize the link and
     /// controlled port before exposing send/received Ethernet to the network.
     pub fn enable_data(&mut self) -> Result<(), Error> {

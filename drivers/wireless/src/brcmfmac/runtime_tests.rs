@@ -80,6 +80,8 @@ struct State {
     generation_base: usize,
     /// The function fell off the bus: every BAR read returns all-ones.
     gone: bool,
+    /// PCI PM capability `PME_Support` includes D3hot.
+    pme: bool,
 }
 pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
 pub(crate) struct Mem {
@@ -302,6 +304,9 @@ impl runtime::Bus for Model {
         let mut s = self.0.lock();
         s.disarmed += 1;
         s.signal = None;
+    }
+    fn pme_d3hot(&mut self) -> bool {
+        self.0.lock().pme
     }
     fn link_control(&mut self) -> Result<u32, runtime::Error> {
         Ok(self.0.lock().lsc)

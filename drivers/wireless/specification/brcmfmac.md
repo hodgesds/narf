@@ -752,7 +752,8 @@ interrupt-gated device fan-out — mirroring Linux v7.2 `brcmf_pciedrvr_pm`
 (`.suspend = brcmf_pcie_pm_enter_D3`, `.resume = brcmf_pcie_pm_leave_D3`):
 
 - Prepare: `cyw43439::interface::suspend_pcie` runs Linux
-  `brcmf_cfg80211_suspend` without WoWL — a connected station is brought
+  `brcmf_cfg80211_suspend` — with WoWL configured, see "Wake-on-WLAN and
+  GTK rekey offload" below; without it, a connected station is brought
   down (`brcmf_link_down`: DISASSOC and carrier off) and queued TX dropped —
   then `Fullmac::suspend_transport`. The msgbuf adapter retires every flow
   (delete completions) and outstanding TX within 2 s and calls
@@ -785,6 +786,72 @@ the device IOTLB invalidation and waits for its completion (AMD-Vi
 before returning — plus a `PerDomain` `alloc_coherent` that maps into that
 device's domain. Today `IommuDomain::detach`/`unmap` only adjust counters
 and `PerDomain` map/unmap return `NotMapped`.
+
+### Wake-on-WLAN and GTK rekey offload (BCM43602)
+
+Shared FullMAC owner `cyw43439/station_wowl.rs` (`Station::wowl_*`),
+mirroring Linux 7.3-rc4 brcmfmac `feature.c`/`cfg80211.c`:
+
+- Probe (`brcmf_feat_attach`): only when the bus reports
+  `wowl_supported` — `Fullmac::wowl_supported`, on PCIe
+  `runtime::Bus::pme_d3hot`, i.e. `pci_pme_capable(pdev, PCI_D3hot)`
+  (PCI PM capability `PMC.PME_Support` bit for D3hot) — does
+  `Station::initialize` read `wowl` (`BRCMF_FEAT_WOWL`) and `wowl_cap`
+  (`BRCMF_FEAT_WOWL_ARP_ND`; `BRCMF_WOWL_GTK_FAILURE` -> `WOWL_GTK`,
+  `BRCMF_WOWL_PFN_FOUND` -> `WOWL_ND`). A firmware error on either leaves
+  WoWL unadvertised. Difference: Linux still advertises basic WoWL when
+  `wowl_cap` fails and then toggles host ARP/ND offload around suspend;
+  NARF's station never enables ARP/ND offload, so that variant is not
+  offered. Net-detect (`WOWL_ND`) is not advertised: the FullMAC station
+  has no `pfn` scheduled-scan owner. Secondary bsscfgs never arm WoWL.
+- `wowlan_support` (`brcmf_wiphy_wowl_params` over `brcmf_wowlan_support`):
+  magic packet, disconnect, 16 patterns of 1..128 bytes at offsets up to
+  1500, plus GTK rekey / GTK-failure only with `WOWL_GTK`. `set_wowlan`
+  validates against exactly these bounds (-EINVAL) and retains the config.
+- Suspend (`brcmf_cfg80211_suspend` with a `cfg80211_wowlan`): instead of
+  disassociating, `brcmf_configure_wowl` — `GET_PM` saved, `SET_PM`
+  `PM_MAX`, one `wowl_pattern` "add" (`brcmf_fil_wowl_pattern_le`, bitmap
+  type) per pattern, `wowl_wakeind` "clear", `wowl` trigger word
+  (DIS|BCN|RETR for disconnect, MAGIC, NET with patterns, GTK_FAILURE,
+  UNASSOC when not connected), `wowl_activate` 1 — then
+  `brcmf_keepalive_start(ifp, 30)` (`mkeep_alive`), then the D3_INFORM bus
+  suspend above with the association kept. A refused WoWL command falls
+  back to the no-WoWL disconnect suspend (Linux ignores those errors); a
+  refused D3 undoes WoWL (clear sequence below) with the transport UP.
+- Resume (`brcmf_cfg80211_resume` with `wowl.active`) after the hot
+  D0_INFORM: `wowl_wakeind` decoded as `brcmf_report_wowl_wakeind`
+  (`Wakeup`: magic, disconnect for DIS/BCN/RETR, pattern 0 for NET,
+  GTK failure; a NULL report when none of MAGIC/DIS/BCN/RETR/NET/PFN is
+  set), `wowl_clear` 0, `wowl_pattern` "clr", the saved PM mode restored,
+  and the host port reopened toward the retained peer (the msgbuf bus
+  suspend retires flows and closes it; Linux keeps its flowrings). Later
+  firmware link events are consumed as usual. The report is exposed by
+  `Device::last_wowlan_wakeup` / `interface::last_wowlan_wakeup_pcie`
+  (the shared contract has no `cfg80211_report_wowlan_wakeup` event). A
+  cold resume (power lost) swaps the generation and reports nothing.
+- GTK rekey offload (`brcmf_cfg80211_set_rekey_data`, installed only with
+  `BRCMF_FEAT_WOWL_GTK`): nl80211 `SET_REKEY_OFFLOAD` from the userspace
+  supplicant that holds KCK/KEK (host-supplicant fallback; the firmware
+  `sup_wpa` offload never exposes them) becomes an ordered worker op that
+  writes `gtk_key_info` (`brcmf_gtk_keyinfo_le`: KCK, KEK, replay counter
+  in nl80211 order) from zeroized buffers. Linux brcmfmac has no GTK rekey
+  notify/replay-counter readback after resume, so none is consumed here
+  either: the firmware installs rekeyed GTKs itself and the supplicant's
+  next EAPOL replay counter check stays monotonic.
+- PCI PME / wake-enable of the function belongs to the system-PM owner
+  (as for iwlwifi, rtw88 and ath10k WoW); this driver only reports
+  `wowl_supported` from the capability. No physical WoW entry, wake
+  latency, PME routing or power measurement is claimed.
+
+Tests (written, unexecuted) in `brcmfmac/wowl_tests.rs` under
+`drivers/wireless/brcmfmac/wow`:
+`smoke_brcmf_wowl_wire_layouts_and_wake_decode`,
+`smoke_brcmf_wowl_advertised_only_with_pme_and_firmware`,
+`smoke_brcmf_wowl_suspend_magic_wake_resume_conversation` (composed WPA2
+station: rekey data -> `gtk_key_info`, SET_WOWLAN, WoWL program and
+keep-alive before D3_INFORM with the association kept, magic wake,
+D0_INFORM, wake report, clear/PM restore, post-resume uplink),
+`smoke_brcmf_wowl_refused_d3_restores_awake_config`.
 
 ### Primary-bsscfg firmware-SME AP
 

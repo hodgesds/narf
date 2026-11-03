@@ -266,6 +266,14 @@ pub trait Fullmac: Send {
     fn resume_transport(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
         async { Err(Error::Unsupported) }
     }
+    /// Linux `bus_if->wowl_supported`: the bus can keep the dongle powered
+    /// and let it wake the host from system suspend (PCIe
+    /// `pci_pme_capable(pdev, PCI_D3hot)`; SDIO `MMC_PM_KEEP_POWER` with a
+    /// wake IRQ). Enabling PME / the platform wake source is the system-PM
+    /// owner's job, not the driver's. Transports without one report false.
+    fn wowl_supported(&mut self) -> bool {
+        false
+    }
     /// Bus-match firmware vendor (Linux `bus_if->fwvid`).
     fn firmware_vendor(&self) -> FirmwareVendor {
         FirmwareVendor::Wcc

@@ -40,6 +40,8 @@ mod vht_tests;
 mod vif_msgbuf_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
+#[path = "wowl_tests.rs"]
+mod wowl_tests;
 
 type ModelDevice = Device<TestAdapter>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
@@ -82,6 +84,7 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
     let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
     let ht_capabilities = station.ht_capabilities();
     let vht_capabilities = station.vht_capabilities();
+    let wowl = station.wowl();
     let (rx, consumer) = narf_ipc::channel();
     let (producer, tx) = narf_ipc::channel();
     let device = Arc::new(Device {
@@ -109,6 +112,9 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
         pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
         ht_capabilities,
         vht_capabilities,
+        wowl,
+        wowlan: IrqSafeSpinLock::new(None),
+        wakeup: IrqSafeSpinLock::new(None),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
         bssid: AtomicU64::new(0),

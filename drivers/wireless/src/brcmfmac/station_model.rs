@@ -117,6 +117,11 @@ pub(super) struct Firmware {
     wme_ac_sta: [u8; 16],
     deletes: usize,
     statuses: usize,
+    /// `wowl_cap` reply and the `wowl_wakeind` the firmware reports.
+    wowl_cap: u32,
+    wakeind: u32,
+    /// Current `BRCMF_C_SET_PM` mode (`BRCMF_C_GET_PM` answers it).
+    pm: u32,
 }
 impl Firmware {
     /// Inject one real firmware-SME peer loss at the native control setup
@@ -180,6 +185,9 @@ impl Firmware {
             wme_ac_sta: [0; 16],
             deletes: 0,
             statuses: 0,
+            wowl_cap: 0,
+            wakeind: 0,
+            pm: 0,
         }
     }
     /// Watchdog reset: the session (rings, flows, association, keys)
@@ -401,6 +409,11 @@ impl Firmware {
                 Vec::new()
             }
             1 => 2u32.to_le_bytes().to_vec(),
+            85 => self.pm.to_le_bytes().to_vec(),
+            86 => {
+                self.pm = u32::from_le_bytes(input[..4].try_into().unwrap());
+                Vec::new()
+            }
             23 => {
                 if self.mfp_fault == 3 || self.phy_profile.is_some_and(|p| p.1 == 6) {
                     vec![2, 9, 8, 7, 6, 5]
@@ -432,6 +445,12 @@ impl Firmware {
                 let mut out = vec![0; usize::from(maximum)];
                 if input.starts_with(b"cur_etheraddr\0") {
                     out[..6].copy_from_slice(&OWN);
+                } else if input.starts_with(b"wowl_cap\0") {
+                    out[..4].copy_from_slice(&self.wowl_cap.to_le_bytes());
+                } else if input.starts_with(b"wowl_wakeind\0") {
+                    // brcmf_wowl_wakeind_le: pci_wakeind, ucode_wakeind.
+                    out[..4].copy_from_slice(&u32::from(self.wakeind != 0).to_le_bytes());
+                    out[4..8].copy_from_slice(&self.wakeind.to_le_bytes());
                 } else if input.starts_with(b"nmode\0") {
                     out[..4].copy_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
                 } else if input.starts_with(b"rxchain\0") {
@@ -1170,6 +1189,28 @@ impl Handle {
         let mut state = self.0.lock();
         operation(state.firmware.as_mut().unwrap().station.as_mut().unwrap());
         firmware_step(&mut state);
+    }
+    /// The function's PCI PM capability lists PME from D3hot (Linux
+    /// `wowl_supported`) and the firmware answers `wowl_cap` with `cap`.
+    pub(crate) fn wowl_profile(&self, cap: u32) {
+        self.0.lock().pme = true;
+        self.change(|f| f.wowl_cap = cap);
+    }
+    /// The wake indication the firmware latched while the host slept.
+    pub(crate) fn wowl_wake(&self, wakeind: u32) {
+        self.change(|f| f.wakeind = wakeind);
+    }
+    /// Current firmware PM mode.
+    pub(crate) fn pm(&self) -> u32 {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .station
+            .as_ref()
+            .unwrap()
+            .pm
     }
     /// Firmware answers D3_INFORM with D3_ACK (confirmed stop).
     pub(crate) fn d3_ack(&self, value: bool) {
