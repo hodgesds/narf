@@ -637,3 +637,45 @@ kernel_test_in!(
     "drivers/wireless/rtw89/monitor",
     smoke_rtw8852b_monitor_down_rebind_original_copies_and_role_generations
 );
+
+/// WoWLAN is advertised only by a generation that composed the whole WoW
+/// path; an inert/unactivated shell refuses it and never arms, while the
+/// retained configuration still crosses generations. Unexecuted.
+fn smoke_rtw8852b_wowlan_unadvertised_without_composed_wow() -> TestResult {
+    let lifecycle = Arc::new(Lifecycle::new(Driver::new()));
+    let device = interface::Device::new_selected(
+        "r89wow-inert",
+        OWN,
+        lifecycle,
+        Arc::new(station::NativeEnvironment),
+        selected(),
+    );
+    let config = narf_wireless::WowlanConfig {
+        disconnect: true,
+        magic_packet: true,
+        gtk_rekey_failure: false,
+        patterns: Vec::new(),
+        net_detect: None,
+    };
+    if device.wowlan_support().is_some()
+        || device.set_wowlan(Some(config.clone())) != Err(narf_wireless::EOPNOTSUPP)
+        || device.wowlan_config().is_some()
+    {
+        return TestResult::Fail("WoWLAN advertised before the WoW path was composed");
+    }
+    device.restore_wowlan(Some(config.clone()), None);
+    if device.wowlan_config().is_none() || device.wowlan().0.is_none() {
+        return TestResult::Fail("retained WoWLAN configuration lost across generations");
+    }
+    if narf_scheduler::block_on(device.wow_suspend()) != Ok(false)
+        || narf_scheduler::block_on(device.wow_resume()).is_ok()
+        || device.closed()
+    {
+        return TestResult::Fail("uncomposed shell armed WoW or closed itself");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852b_wowlan_unadvertised_without_composed_wow
+);

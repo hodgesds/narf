@@ -1160,6 +1160,31 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             },
         }
     }
+    /// `rtw_wowlan_stub_8852b` (`wow_wire::support`), only when this
+    /// generation composed the whole WoW path (RTL8852B, an image without
+    /// `WOW_CPUIO_RX`): security CAM, keep-alive, firmware swap, TRX
+    /// halt/restart and the system-PM branch.
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.wow_capable
+            .load(Ordering::Acquire)
+            .then(super::wow_wire::support)
+    }
+    /// `rtw89_ops_set_wakeup` + cfg80211 `wiphy->wowlan_config`: validated
+    /// against the stub and the station address before it is retained;
+    /// suspend re-validates (`rtw89_wow_set_wakeups`).
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        if !self.wow_capable.load(Ordering::Acquire) {
+            return Err(narf_wireless::EOPNOTSUPP);
+        }
+        if let Some(config) = &config {
+            super::wow_wire::validate(config, self.local).map_err(|_| 22)?;
+        }
+        *self.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
+    }
     fn power_save_default(&self) -> Option<bool> {
         self.sleep_capable
             .load(Ordering::Acquire)

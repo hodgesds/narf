@@ -1794,7 +1794,7 @@ the suspend rows of
 and `smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity`.
 WoW (`wow`) remains open.
 
-### RTL8852B Wake-on-WLAN source layer (`wow_wire.rs`) — not advertised
+### RTL8852B Wake-on-WLAN (`wow_wire.rs` and composition) — advertised when composed, unexecuted
 
 Linux 7.3-rc4 `rtw8852b.c` declares `rtw_wowlan_stub_8852b` (magic packet,
 disconnect, 18 patterns of 1..=128 bytes; no GTK-rekey, no net-detect).
@@ -1985,8 +1985,9 @@ RX IVs do not advance the host replay floors (host PN state stays in
 `station_security`, as rtw88), and Linux's `rtw89_pci_suspend`/`resume`
 LDO/PERST register writes are not ported.
 
-**Not wired (why `wow` stays open).** The whole row still needs, in Linux
-order (`rtw89_wow_suspend`/`resume`):
+**Composition checklist (Linux `rtw89_wow_suspend`/`resume` order).** All
+six items are implemented and compile; every case is unexecuted and no
+physical WoW wake has been observed:
 1. (Done above: `wow_trx`/`command_native/wow.rs`.) Reversible TRX
    halt/restart on the retained station:
    `rtw89_wow_enable_trx_pre` (`ctrl_txdma_ch(false)` with the CH12 FW
@@ -2024,6 +2025,13 @@ order (`rtw89_wow_suspend`/`resume`):
    stays with the system-PM owner (iwlwifi.md section 3.80) (Done above: WoW suspend/resume composition; the
    generation goes to D3hot without card-off instead of staying in D0.)
 6. `WirelessNetIface::wowlan_support`/`set_wowlan` only after 1..5 exist.
+   (Done: `wowlan_support` returns `wow_wire::support` only when the
+   generation sampled `station_wow_capable` at activation — RTL8852B,
+   started station, an image without `WOW_CPUIO_RX`; `set_wowlan`
+   validates with `wow_wire::validate` against the station address
+   (`EINVAL`) or refuses with `EOPNOTSUPP`; `wowlan_config` returns the
+   retained configuration. Unexecuted case:
+   `smoke_rtw8852b_wowlan_unadvertised_without_composed_wow`.)
 
 Unexecuted cases: `smoke_rtw89_wow_support_patterns_and_cam`,
 `smoke_rtw89_wow_h2c_bodies_reason_and_aoac`,
