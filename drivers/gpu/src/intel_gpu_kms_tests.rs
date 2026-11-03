@@ -97,6 +97,11 @@ struct Hardware {
     /// synchronous waiters (the live repartition, the external pass) see
     /// frames, latches and DSB progress without an executor.
     step_on_read: Option<u64>,
+    /// PCI device and subsystem identity (`QUIRK_FW_SYNC_LEN`); `None`
+    /// refuses PSR2.
+    psr_pci: Option<(u16, u16, u16)>,
+    /// A `CURSURFLIVE` write does not take PSR2 out of deep sleep.
+    psr2_stuck: bool,
 }
 /// Sink AUX writes are logged in the MMIO write log at this pseudo offset
 /// plus the DPCD address, so register and sink order can be compared.
@@ -183,6 +188,8 @@ impl MockPlatform {
                 fbc_carve_pending: false,
                 fbc_carve_polls: 0,
                 step_on_read: None,
+                psr_pci: None,
+                psr2_stuck: false,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -744,6 +751,21 @@ impl Hardware {
         if offset == self.refuse_layout {
             return;
         }
+        // CURSURFLIVE reads the live cursor surface; a write only raises
+        // the PSR frame-change event, which takes PSR2 out of deep sleep.
+        if offset == 0x700ac {
+            if !self.psr2_stuck {
+                let status = self.regs.get(&0x60940).copied().unwrap_or(0);
+                if status & (1 << 31) != 0 {
+                    self.regs.insert(0x60940, 0);
+                }
+            }
+            return;
+        }
+        // Clearing EDP_PSR2_ENABLE lets the PSR2 state machine idle.
+        if offset == 0x60900 && value & (1 << 31) == 0 {
+            self.regs.insert(0x60940, 0);
+        }
         if (0x4a000..0x4a400).contains(&offset) {
             if self.refuse_palette {
                 return;
@@ -1166,6 +1188,9 @@ impl Platform for MockPlatform {
     }
     fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
         self.0.lock().psr_vbt
+    }
+    fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
+        self.0.lock().psr_pci
     }
     fn fbc_carve(&self, size: u64, min_limit: u32) -> Poll<Option<(u32, u64, u32)>> {
         let mut hw = self.0.lock();

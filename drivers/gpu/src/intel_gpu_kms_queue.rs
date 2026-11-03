@@ -176,6 +176,10 @@ impl Queue {
     pub(super) fn is_master(&self, open: u64) -> bool {
         self.mode.lock().is_master(open)
     }
+    /// `drm_framebuffer_lookup` for DIRTYFB admission.
+    pub(super) fn has_framebuffer(&self, id: u32) -> bool {
+        self.mode.lock().framebuffer(id).is_ok()
+    }
     pub(super) fn check_legacy_gamma(&self, crtc: u32, size: usize) -> Result<(), FsError> {
         legacy_gamma_store(&self.mode, crtc, size).map(|_| ())
     }
@@ -475,7 +479,14 @@ impl Worker for DisplayWorker {
         reservation: Option<FlipEventReservation>,
     ) -> FsFuture<'a, FlipStamp> {
         alloc::boxed::Box::pin(async move {
-            let mut session = self.display.session().await?;
+            // A primary present may keep an active PSR2 selective update
+            // running (the commit programs selective fetch); every other
+            // transaction exits PSR first.
+            let mut session = if matches!(plan.action, Action::Present) {
+                self.display.selective_session().await?
+            } else {
+                self.display.session().await?
+            };
             if self.display.reset_lost() || self.display.epoch() != epoch {
                 return Err(FsError::NoDevice);
             }

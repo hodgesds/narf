@@ -945,3 +945,6 @@ mod cursor;
 
 #[path = "intel_gpu_legacy_gamma_tests.rs"]
 mod legacy_gamma;
+
+#[path = "intel_gpu_kms_damage_tests.rs"]
+mod damage;

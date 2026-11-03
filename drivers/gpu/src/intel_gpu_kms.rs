@@ -250,6 +250,11 @@ pub(crate) trait Platform:
     fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
         crate::intel_gpu_psr::VbtPsr::Missing
     }
+    /// PCI device, subsystem vendor and subsystem device, which
+    /// `QUIRK_FW_SYNC_LEN` matches. Default: unknown, which refuses PSR2.
+    fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
+        None
+    }
 }
 
 /// The Pipe-A eDP sink as an AUX channel over a platform window.
@@ -763,6 +768,13 @@ impl Platform for Physical {
     fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
         crate::intel_gpu_psr::installed_vbt()
     }
+    fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
+        Some((
+            self.device.id.device,
+            self.device.id.subsystem_vendor,
+            self.device.id.subsystem_id,
+        ))
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -923,6 +935,9 @@ struct State<M: Platform> {
     psr_sink: Option<crate::intel_gpu_psr::Sink>,
     /// A refusal that holds for the card's lifetime.
     psr_refused: Option<crate::intel_gpu_psr::Refusal>,
+    /// Why the last PSR qualification fell back to PSR1 (`None` when it
+    /// selected PSR2 or did not reach selective update).
+    psr2_refused: Option<crate::intel_gpu_psr::Psr2Refusal>,
 }
 
 #[derive(Debug)]
@@ -1239,6 +1254,7 @@ impl<M: Platform> Device<M> {
                 psr: None,
                 psr_sink: None,
                 psr_refused: None,
+                psr2_refused: None,
             }),
         }
     }
@@ -1490,6 +1506,16 @@ impl<M: Platform> Device<M> {
         Ok(())
     }
     pub(crate) async fn session(&self) -> Result<Guard<'_, M>, FsError> {
+        self.session_for(false).await
+    }
+    /// A session for one primary present: an active PSR2 selective update
+    /// keeps running, and the present programs the commit's selective
+    /// fetch ([`Guard::present_damaged`]). PSR1, and PSR2 not active, are
+    /// paused as by [`Device::session`].
+    pub(crate) async fn selective_session(&self) -> Result<Guard<'_, M>, FsError> {
+        self.session_for(true).await
+    }
+    async fn session_for(&self, selective: bool) -> Result<Guard<'_, M>, FsError> {
         let mut state = self.state.lock().await;
         if state.blocked || state.failed || self.platform.reset_lost() {
             return Err(FsError::NoDevice);
@@ -1500,34 +1526,23 @@ impl<M: Platform> Device<M> {
         if let Some(fbc) = state.fbc.as_mut() {
             fbc.invalidate(&self.platform);
         }
-        // intel_psr_pause: PSR exits and reaches idle before this session
-        // can change any frame (flip, DIRTYFB, cursor, color/DSB, console).
-        // A latched error or a failed exit disables PSR instead.
-        if let Some(Err(refusal)) = state.psr.as_mut().map(|psr| psr.pause(&self.platform)) {
-            psr_disable(&mut state, &self.platform, Some(refusal));
-        } else if state.psr.is_some() {
-            use crate::intel_gpu_psr::{idle, Refusal, PSR_EXIT_TIMEOUT_MS};
-            let deadline = self
-                .platform
-                .now()
-                .saturating_add(PSR_EXIT_TIMEOUT_MS * 1_000_000);
-            let exited = loop {
-                match idle(&self.platform) {
-                    Ok(true) => break Ok(()),
-                    Ok(false) if self.platform.now() < deadline => self.platform.tick().await,
-                    Ok(false) => break Err(Refusal::ExitTimeout),
-                    Err(refusal) => break Err(refusal),
-                }
-            };
-            if let Err(refusal) = exited {
-                psr_disable(&mut state, &self.platform, Some(refusal));
-            }
-        }
-        Ok(Guard {
+        let mut guard = Guard {
             device: self,
             state,
             _power,
-        })
+        };
+        // intel_psr_pause: PSR exits and reaches idle before this session
+        // can change any frame (flip, DIRTYFB, cursor, color/DSB, console),
+        // unless a selective update keeps running through a present.
+        if !(selective
+            && guard
+                .state
+                .psr
+                .is_some_and(|psr| psr.selective() && psr.active()))
+        {
+            guard.psr_pause().await;
+        }
+        Ok(guard)
     }
     pub(crate) async fn quiesce(&self) -> Result<(), FsError> {
         let state = self.state.lock().await;
@@ -1737,10 +1752,7 @@ impl<M: Platform> ExternalPass<'_, M> {
             let platform = &guard.device.platform;
             let paused = guard.state.psr.as_mut().map(|psr| {
                 psr.pause(platform).and_then(|()| {
-                    crate::intel_gpu_psr::wait_idle(
-                        platform,
-                        crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS,
-                    )
+                    psr.wait_idle(platform, crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS)
                 })
             });
             if let Some(Err(refusal)) = paused {
@@ -2221,6 +2233,19 @@ impl<M: Platform> Guard<'_, M> {
         object: Arc<GemObject>,
         geometry: Geometry,
     ) -> Result<FlipStamp, FsError> {
+        self.present_damaged(object, geometry, &crate::drm::fb_cmd::Damage::Full)
+            .await
+    }
+    /// [`Guard::present`] for a commit whose primary-plane damage is
+    /// `damage` (FB_DAMAGE_CLIPS or DIRTYFB clips). An active PSR2 runs a
+    /// selective update: the commit's selective fetch is programmed around
+    /// the arm ([`Guard::psr_su_prepare`]).
+    pub(crate) async fn present_damaged(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+        damage: &crate::drm::fb_cmd::Damage,
+    ) -> Result<FlipStamp, FsError> {
         self.reconcile_unexposed_xr30();
         self.check(geometry)?;
         if self.state.color_unpublished || self.state.mixed_unpublished {
@@ -2232,10 +2257,14 @@ impl<M: Platform> Guard<'_, M> {
         self.finish_color().await?;
         self.finish_pending().await?;
         self.start().await?;
+        let selective = self.psr_su_prepare(damage).await;
         let id = self.prepare_surface(object.clone(), geometry, Default::default())?;
         let ticket = self.ticket()?;
         // Record the new owner before arming. Cancellation never unpins it.
         self.state.pending = Some((object, id));
+        if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
+            psr.program_sel_fetch_arm(&self.device.platform, sf);
+        }
         if let Err(error) = self.state.presenter.as_mut().expect("presenter").arm(
             id,
             ticket,
@@ -2260,6 +2289,10 @@ impl<M: Platform> Guard<'_, M> {
             }
             self.state.failed = true;
             return Err(scanout_error(error));
+        }
+        // The cursor's arm follows the primary's in the same commit.
+        if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
+            psr.program_sel_fetch_cursor(&self.device.platform, sf);
         }
         let stamp = self
             .finish_pending()
@@ -2287,12 +2320,39 @@ impl<M: Platform> Guard<'_, M> {
             return;
         }
         let refusal = match self.psr_qualify() {
-            Ok(config) => {
+            Ok((config, su)) => {
                 if let Some(fbc) = self.state.fbc.as_mut() {
                     fbc.disable(&self.device.platform);
                 }
                 let platform = &self.device.platform;
-                match crate::intel_gpu_psr::Psr::enable(platform, &mut PsrAux(platform), config) {
+                let enabled = match su {
+                    // The commit that qualified PSR2 damaged the whole plane.
+                    Some(su) => self.psr_su_facts().and_then(|(scaled, cursor)| {
+                        let src = crate::drm::fb_cmd::Rect::new(
+                            0,
+                            0,
+                            i32::from(su.width),
+                            i32::from(su.height),
+                        );
+                        crate::intel_gpu_psr::Psr::enable_su(
+                            platform,
+                            &mut PsrAux(platform),
+                            config,
+                            su,
+                            &crate::intel_gpu_psr::SuCommit {
+                                damage: &crate::drm::fb_cmd::Damage::Full,
+                                old_src: src,
+                                src,
+                                pipe_supported: !scaled,
+                                cursor,
+                            },
+                        )
+                    }),
+                    None => {
+                        crate::intel_gpu_psr::Psr::enable(platform, &mut PsrAux(platform), config)
+                    }
+                };
+                match enabled {
                     Ok(psr) => {
                         self.state.psr = Some(psr);
                         return;
@@ -2308,15 +2368,29 @@ impl<M: Platform> Guard<'_, M> {
     }
     /// `intel_psr_compute_config` against the live fixed timing, the VBT,
     /// the (cached) sink capability and the `wm_level_disabled` of the
-    /// Pipe-A watermarks proved programmed just now.
-    fn psr_qualify(&mut self) -> Result<crate::intel_gpu_psr::Psr1, crate::intel_gpu_psr::Refusal> {
-        use crate::intel_gpu_psr::{compute_psr1, Refusal, Sink, DRM_MODE_FLAG_INTERLACE};
+    /// Pipe-A watermarks proved programmed just now; then
+    /// `intel_sel_update_config_valid`, whose refusal (recorded in
+    /// `psr2_refused`) falls back to PSR1.
+    #[allow(clippy::type_complexity)]
+    fn psr_qualify(
+        &mut self,
+    ) -> Result<
+        (
+            crate::intel_gpu_psr::Psr1,
+            Option<crate::intel_gpu_psr::Psr2>,
+        ),
+        crate::intel_gpu_psr::Refusal,
+    > {
+        use crate::intel_gpu_psr::{
+            compute_psr1, compute_psr2, psr2_source, Psr2Refusal, Refusal, Sink,
+            DRM_MODE_FLAG_INTERLACE,
+        };
         let platform = &self.device.platform;
         let timing = platform.psr_timing().ok_or(Refusal::NoTiming)?;
         // psr_global_enabled comes first: no sink conversation for a panel
         // the VBT does not enable.
         let vbt = platform.psr_vbt();
-        vbt.enabled()?;
+        let panel = vbt.enabled()?;
         if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
             return Err(Refusal::Interlaced);
         }
@@ -2353,7 +2427,145 @@ impl<M: Platform> Guard<'_, M> {
                     crate::intel_gpu_display_resources::Profile::capture_timing(platform, timing);
             }
         }
-        compute_psr1(&sink, &timing, &vbt, platform.psr_wm_level_disabled())
+        let config = compute_psr1(&sink, &timing, &vbt, platform.psr_wm_level_disabled())?;
+        // has_sel_update: a sink without SU support needs no source facts.
+        let su = if sink.su_support() {
+            psr2_source(
+                platform,
+                &mut PsrAux(platform),
+                &sink,
+                platform.psr_pci_ids(),
+            )
+            .and_then(|source| compute_psr2(&sink, &timing, &panel, &source))
+        } else {
+            Err(Psr2Refusal::NoSinkSu)
+        };
+        self.state.psr2_refused = su.err();
+        Ok((config, su.ok()))
+    }
+    /// The live pipe facts a selective-fetch commit needs: whether a pipe
+    /// or plane scaler is engaged, and the visible cursor.
+    #[allow(clippy::type_complexity)]
+    fn psr_su_facts(
+        &self,
+    ) -> Result<(bool, Option<crate::intel_gpu_psr::CursorPlane>), crate::intel_gpu_psr::Refusal>
+    {
+        let platform = &self.device.platform;
+        Ok((
+            crate::intel_gpu_psr::pipe_scaled(platform)?,
+            crate::intel_gpu_psr::CursorPlane::read(platform)?,
+        ))
+    }
+    /// `intel_psr_pause` and `intel_psr_wait_exit_locked` within
+    /// [`crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS`] for this PSR's mode. A
+    /// latched error or a failed exit disables PSR instead.
+    async fn psr_pause(&mut self) {
+        use crate::intel_gpu_psr::{Refusal, PSR_EXIT_TIMEOUT_MS};
+        let device = self.device;
+        let platform = &device.platform;
+        match self.state.psr.as_mut().map(|psr| psr.pause(platform)) {
+            None => return,
+            Some(Err(refusal)) => {
+                psr_disable(&mut self.state, platform, Some(refusal));
+                return;
+            }
+            Some(Ok(())) => {}
+        }
+        let Some(psr) = self.state.psr else {
+            return;
+        };
+        let deadline = platform
+            .now()
+            .saturating_add(PSR_EXIT_TIMEOUT_MS * 1_000_000);
+        let exited = loop {
+            match psr.idle(platform) {
+                Ok(true) => break Ok(()),
+                Ok(false) if platform.now() < deadline => platform.tick().await,
+                Ok(false) => break Err(Refusal::ExitTimeout),
+                Err(refusal) => break Err(refusal),
+            }
+        };
+        if let Err(refusal) = exited {
+            psr_disable(&mut self.state, platform, Some(refusal));
+        }
+    }
+    /// The PSR half of a primary commit before its arm, for an active PSR2
+    /// selective update (`intel_psr2_sel_fetch_update`, then the pipe
+    /// update): compute the SU area from `damage` and the live cursor,
+    /// write the primary's no-arm selective-fetch registers, raise the
+    /// frame-change event and wait (bounded at `PSR_IDLE_TIMEOUT_MS`) for
+    /// PSR2 to leave deep sleep. The caller writes the arm half around the
+    /// plane arm. Linux proceeds after a timed-out wait; here PSR2 also
+    /// exits then (the guard's drop re-arms it), because no vblank
+    /// interrupt can wake it. Anything in flight on the pipe (DSB, cursor
+    /// or color) exits PSR as every other session does. A latched error or
+    /// a register that reads all-ones disables PSR. `None` when no
+    /// selective update runs.
+    async fn psr_su_prepare(
+        &mut self,
+        damage: &crate::drm::fb_cmd::Damage,
+    ) -> Option<crate::intel_gpu_psr::SelFetch> {
+        use crate::intel_gpu_psr::{frame_change_event, Psr, SuCommit, PSR_IDLE_TIMEOUT_MS};
+        let device = self.device;
+        let platform = &device.platform;
+        let psr = self.state.psr?;
+        if !psr.active() {
+            return None;
+        }
+        if !psr.selective() {
+            self.psr_pause().await;
+            return None;
+        }
+        if let Err(refusal) = Psr::error(platform) {
+            psr_disable(&mut self.state, platform, Some(refusal));
+            return None;
+        }
+        let state = &self.state;
+        if state.joint.is_some()
+            || state.dsb.as_ref().is_some_and(|d| d.armed())
+            || state.cursor.as_ref().is_some_and(|c| c.pending())
+            || state.color.as_ref().is_some_and(|c| c.pending())
+        {
+            self.psr_pause().await;
+            return None;
+        }
+        let (scaled, cursor) = match self.psr_su_facts() {
+            Ok(facts) => facts,
+            Err(refusal) => {
+                psr_disable(&mut self.state, platform, Some(refusal));
+                return None;
+            }
+        };
+        let geometry = self.console_geometry();
+        let src =
+            crate::drm::fb_cmd::Rect::new(0, 0, geometry.width as i32, geometry.height as i32);
+        let sf = psr.sel_fetch(&SuCommit {
+            damage,
+            old_src: src,
+            src,
+            pipe_supported: !scaled,
+            cursor,
+        })?;
+        psr.program_sel_fetch_noarm(platform, &sf);
+        frame_change_event(platform);
+        let deadline = platform
+            .now()
+            .saturating_add(PSR_IDLE_TIMEOUT_MS * 1_000_000);
+        loop {
+            match psr.ready_for_update(platform) {
+                Ok(true) => break,
+                Ok(false) if platform.now() < deadline => platform.tick().await,
+                Ok(false) => {
+                    self.psr_pause().await;
+                    break;
+                }
+                Err(refusal) => {
+                    psr_disable(&mut self.state, platform, Some(refusal));
+                    return None;
+                }
+            }
+        }
+        Some(sf)
     }
     /// `intel_psr_pre_plane_update`'s Wa_14015648006 half: before a staged
     /// primary image whose `wm_level_disabled` is true can latch, an
@@ -2422,8 +2634,10 @@ impl<M: Platform> Guard<'_, M> {
     /// plane disables.
     fn fbc_after_latch(&mut self, geometry: Geometry) {
         use crate::intel_gpu_fbc::{cfb_size, check_plane, min_limit, override_stride, Fbc};
-        // has_psr (enabled, even while paused) refuses FBC: PSR wins.
+        // has_psr (enabled, even while paused) refuses FBC: PSR wins, and
+        // has_sel_update refuses it first ("Selective update enabled").
         let psr = self.state.psr.is_some();
+        let selective_update = self.state.psr.is_some_and(|p| p.selective());
         let plane = crate::intel_gpu_fbc::Plane {
             kms_owned: self.state.current.is_some(),
             format: if self.state.xr30_timing.is_some() || self.state.xr30_epoch.is_some() {
@@ -2440,7 +2654,7 @@ impl<M: Platform> Guard<'_, M> {
             rotated_90: false,
             interlaced: false,
             psr1: psr,
-            selective_update: false,
+            selective_update,
         };
         if self.state.fbc.is_none() && !self.state.fbc_refused && check_plane(&plane).is_ok() {
             // Only polled: the carve and its GGTT survey run off this path,

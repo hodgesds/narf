@@ -46,7 +46,9 @@ enum Request {
     Remove(u32),
     DropMaster,
     SetMaster,
-    Dirty(u32),
+    /// DRM_IOCTL_MODE_DIRTYFB: the framebuffer and its damage
+    /// (`drm_atomic_helper_dirtyfb`).
+    Dirty(u32, crate::drm::fb_cmd::Damage),
     Cursor(Vec<u8>, Option<Arc<crate::intel_gpu_gem::GemObject>>, bool),
     LegacyGamma {
         crtc: u32,
@@ -218,20 +220,6 @@ impl Request {
                 })
             }
             0xaf => Self::Remove(words(&read(context, arg, 4)?)[0]),
-            0xb1 => {
-                let w = words(&read(context, arg, 24)?);
-                if w[1] != 0 || w[3] > 256 {
-                    return Err(FsError::InvalidData);
-                }
-                if w[3] != 0 {
-                    let _ = read(
-                        context,
-                        u64::from(w[4]) | u64::from(w[5]) << 32,
-                        w[3] as usize * 8,
-                    )?;
-                }
-                Self::Dirty(w[0])
-            }
             0xa3 | 0xbb => Self::Cursor(
                 read(
                     context,
@@ -247,6 +235,35 @@ impl Request {
             ),
             _ => return Err(FsError::Unsupported),
         })
+    }
+    /// DRM_IOCTL_MODE_DIRTYFB in Linux's order: `drm_ioctl` copies the
+    /// 24-byte request (`-EFAULT`), `drm_ioctl_permit` refuses a non-master
+    /// (`-EACCES`), then `drm_mode_dirtyfb_ioctl` looks the framebuffer up
+    /// (`-ENOENT`), checks the clip count (`-EINVAL`) and copies the clips
+    /// (`-EFAULT`). Unknown flag bits are masked, not refused. The clips
+    /// become the commit's damage as `drm_atomic_helper_dirtyfb` builds it.
+    fn copy_dirty(
+        arg: u64,
+        context: &dyn IoctlContext,
+        master: bool,
+        exists: impl FnOnce(u32) -> bool,
+    ) -> Result<Self, FsError> {
+        use crate::drm::fb_cmd::DirtyCmd;
+        let raw = read(context, arg, 24)?;
+        if !master {
+            return Err(FsError::PermissionDenied);
+        }
+        let cmd = DirtyCmd::decode(&raw).ok_or(FsError::InvalidData)?;
+        if !exists(cmd.fb_id) {
+            return Err(FsError::NotFound);
+        }
+        cmd.validate().map_err(|()| FsError::InvalidData)?;
+        let clips = if cmd.num_clips == 0 {
+            Vec::new()
+        } else {
+            read(context, cmd.clips_ptr, cmd.clips_len())?
+        };
+        Ok(Self::Dirty(cmd.fb_id, cmd.damage(&clips)))
     }
 }
 
@@ -298,6 +315,9 @@ struct Plan {
     previous_degamma: u32,
     next_degamma: u32,
     legacy_store: Option<Vec<u16>>,
+    /// The primary plane's frame damage for a [`Action::Present`]: the
+    /// FB_DAMAGE_CLIPS blob or DIRTYFB clips, else the whole plane.
+    damage: crate::drm::fb_cmd::Damage,
 }
 
 fn same_timing(
@@ -442,6 +462,7 @@ impl Plan {
             test: false,
             nonblock: false,
             legacy_store,
+            damage: crate::drm::fb_cmd::Damage::Full,
         };
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
@@ -539,12 +560,13 @@ impl Plan {
                 }
                 return Ok(p);
             }
-            Request::Dirty(id) => {
+            Request::Dirty(id, damage) => {
                 card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 if p.next.primary_fb != Some(id) {
                     p.action = Action::Noop;
                     return Ok(p);
                 }
+                p.damage = damage;
             }
             Request::PageFlip(r) => {
                 primary_changed = true;
@@ -620,6 +642,7 @@ impl Plan {
                                 && matches!(
                                     prop,
                                     PLANE_IN_FENCE_FD_PROP_ID
+                                        | PLANE_FB_DAMAGE_CLIPS_PROP_ID
                                         | PLANE_FB_ID_PROP_ID
                                         | PLANE_CRTC_ID_PROP_ID
                                         | PLANE_SRC_X_PROP_ID
@@ -635,8 +658,27 @@ impl Plan {
                             color_compatible = false;
                         }
                         if object == PLANE_ID_BASE {
-                            color_primary |= prop != PLANE_IN_FENCE_FD_PROP_ID;
+                            color_primary |= !matches!(
+                                prop,
+                                PLANE_IN_FENCE_FD_PROP_ID | PLANE_FB_DAMAGE_CLIPS_PROP_ID
+                            );
                             match prop {
+                                // drm_atomic_set_property: the blob id is
+                                // looked up as u32 (-EINVAL when absent),
+                                // then drm_property_replace_blob_from_id
+                                // refuses (-EINVAL) a length that is not a
+                                // whole number of drm_mode_rect.
+                                PLANE_FB_DAMAGE_CLIPS_PROP_ID => {
+                                    let blob = value as u32;
+                                    p.damage = if blob == 0 {
+                                        crate::drm::fb_cmd::Damage::Full
+                                    } else {
+                                        crate::drm::fb_cmd::Damage::from_blob(
+                                            card.property_blob(blob).ok_or(FsError::InvalidData)?,
+                                        )
+                                        .map_err(|()| FsError::InvalidData)?
+                                    };
+                                }
                                 PLANE_FB_ID_PROP_ID => {
                                     primary_changed = true;
                                     fb = (value != 0).then(|| u32_value(value)).transpose()?
@@ -1051,6 +1093,11 @@ impl Plan {
             p.next.primary_fb = fb;
             p.next.x = 0;
             p.next.y = 0;
+            // drm_atomic_helper_damage_iter_init: a source that moved
+            // damages the whole plane.
+            if (p.previous.x, p.previous.y) != (0, 0) {
+                p.damage = crate::drm::fb_cmd::Damage::Full;
+            }
         }
         Ok(p)
     }
@@ -1132,6 +1179,16 @@ trait Backend {
         o: Arc<crate::intel_gpu_gem::GemObject>,
         g: Geometry,
     ) -> FsFuture<'a, FlipStamp>;
+    /// [`Backend::present`] carrying the commit's primary-plane damage.
+    /// Backends without selective update present the whole plane.
+    fn present_damaged<'a>(
+        &'a mut self,
+        o: Arc<crate::intel_gpu_gem::GemObject>,
+        g: Geometry,
+        _damage: &'a crate::drm::fb_cmd::Damage,
+    ) -> FsFuture<'a, FlipStamp> {
+        self.present(o, g)
+    }
     fn restore(&mut self) -> FsFuture<'_, ()>;
     fn color_published(&mut self) {}
     fn surface(&mut self) -> FsFuture<'_, ()> {
@@ -1191,6 +1248,14 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         g: Geometry,
     ) -> FsFuture<'a, FlipStamp> {
         alloc::boxed::Box::pin(self.present(o, g))
+    }
+    fn present_damaged<'a>(
+        &'a mut self,
+        o: Arc<crate::intel_gpu_gem::GemObject>,
+        g: Geometry,
+        damage: &'a crate::drm::fb_cmd::Damage,
+    ) -> FsFuture<'a, FlipStamp> {
+        alloc::boxed::Box::pin(self.present_damaged(o, g, damage))
     }
     fn restore(&mut self) -> FsFuture<'_, ()> {
         alloc::boxed::Box::pin(self.restore_console())
@@ -1519,18 +1584,23 @@ async fn execute_plan<B: Backend>(
             };
             if direct {
                 let object = direct_object(fb)?;
-                stamp = Some(match backend.present(object.clone(), plan.geometry).await {
-                    Ok(stamp) => stamp,
-                    // The display owner uses Unsupported only for admission
-                    // before arm. A hard/lost/pending hardware error must keep
-                    // its owners and cannot silently turn into CPU presentation.
-                    Err(FsError::Unsupported) => {
-                        backend.surface().await?;
-                        backend.copy(fb, mode).await?;
-                        backend.vblank().await?
-                    }
-                    Err(error) => return Err(error),
-                });
+                stamp = Some(
+                    match backend
+                        .present_damaged(object.clone(), plan.geometry, &plan.damage)
+                        .await
+                    {
+                        Ok(stamp) => stamp,
+                        // The display owner uses Unsupported only for admission
+                        // before arm. A hard/lost/pending hardware error must keep
+                        // its owners and cannot silently turn into CPU presentation.
+                        Err(FsError::Unsupported) => {
+                            backend.surface().await?;
+                            backend.copy(fb, mode).await?;
+                            backend.vblank().await?
+                        }
+                        Err(error) => return Err(error),
+                    },
+                );
             } else {
                 backend.surface().await?;
                 backend.copy(fb, mode).await?;
@@ -1735,10 +1805,15 @@ async fn admit_with_gem(
     epoch: u64,
     gem: Option<&crate::intel_gpu_gem::GemState>,
 ) -> Result<queue::Submitted, queue::SubmitError> {
-    if drm_uapi::ioc_nr(cmd) != 0x1e && !queue.is_master(open) {
+    // DIRTYFB copies its request before the master check (drm_ioctl).
+    if !matches!(drm_uapi::ioc_nr(cmd), 0x1e | 0xb1) && !queue.is_master(open) {
         return Err(FsError::PermissionDenied.into());
     }
-    let mut request = if drm_uapi::ioc_nr(cmd) == 0xa5 {
+    let mut request = if drm_uapi::ioc_nr(cmd) == 0xb1 {
+        Request::copy_dirty(arg, context, queue.is_master(open), |id| {
+            queue.has_framebuffer(id)
+        })?
+    } else if drm_uapi::ioc_nr(cmd) == 0xa5 {
         let bytes = read(context, arg, 32)?;
         let w = words(&bytes);
         let (crtc, size) = (w[0], w[1] as usize);

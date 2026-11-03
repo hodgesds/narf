@@ -625,3 +625,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_fbc",
     smoke_fbc_kms_present_only_polls_carve_and_activates_after_it
 );
+
+#[path = "intel_gpu_psr2_kms_tests.rs"]
+mod psr2;
