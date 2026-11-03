@@ -46,6 +46,30 @@ impl core::fmt::Display for SdioError {
     }
 }
 
+/// Host power-management capabilities / requested flags (Linux
+/// `mmc_pm_flag_t`, `include/linux/mmc/pm.h`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PmFlags(u8);
+impl PmFlags {
+    pub const NONE: Self = Self(0);
+    /// `MMC_PM_KEEP_POWER`: the card keeps power across system suspend.
+    pub const KEEP_POWER: Self = Self(1 << 0);
+    /// `MMC_PM_WAKE_SDIO_IRQ`: the card interrupt wakes the host.
+    pub const WAKE_SDIO_IRQ: Self = Self(1 << 1);
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
 /// Maximum byte count for a single CMD53 byte-mode transfer (2^9 - 1; 0 ≡ 512).
 pub const CMD53_MAX_BYTE_COUNT: u16 = 512;
 /// Maximum block count for a single CMD53 block-mode transfer.
@@ -180,6 +204,27 @@ pub trait SdioFunction {
     /// The owner serviced every function interrupt source; re-enable
     /// delivery (Linux's SDIO IRQ thread re-enabling the card interrupt).
     fn rearm_card_interrupt(&mut self) {}
+
+    /// Linux `sdio_get_host_pm_caps`: what this host can honour across a
+    /// system suspend. Adapters without a system-PM path report none.
+    fn host_pm_caps(&mut self) -> PmFlags {
+        PmFlags::NONE
+    }
+
+    /// System suspend of the card's host with the function driver's
+    /// requested `flags` (Linux `sdio_set_host_pm_flags` followed by
+    /// `mmc_sdio_suspend` and the host's suspend). With `KEEP_POWER` the
+    /// card stays powered and selected; without it the card is powered
+    /// off and [`Self::resume_host`] re-enumerates it. Every other access
+    /// is refused until resume.
+    fn suspend_host(&mut self, _flags: PmFlags) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Paired system resume (Linux host resume + `mmc_sdio_resume`).
+    fn resume_host(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 }
 
 /// Encode a CMD52 argument for a read and validate fields.

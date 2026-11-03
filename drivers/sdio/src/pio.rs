@@ -58,6 +58,12 @@ pub trait Registers {
     fn enable_intx(&mut self) -> bool {
         false
     }
+    /// Host PM capabilities the platform owner grants (Linux
+    /// `mmc->pm_caps`). `WAKE_SDIO_IRQ` additionally needs a bound card
+    /// interrupt line (`Card` masks it otherwise). Default: none.
+    fn pm_caps(&mut self) -> crate::sdio::function::PmFlags {
+        crate::sdio::function::PmFlags::NONE
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

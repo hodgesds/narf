@@ -37,4 +37,4 @@ pub use sdhci::probe::{probe_device, ProbeResult};
 pub use sdhci::regs::PCI_CLASS_SDHCI;
 pub use sdhci::voltage::SignalVoltage;
 pub use sdio::cccr::{CccrInfo, FBR_BLKSZ_0, FBR_CIS_PTR_0, FBR_STD_IF};
-pub use sdio::function::{SdioError, SdioFunction};
+pub use sdio::function::{PmFlags, SdioError, SdioFunction};

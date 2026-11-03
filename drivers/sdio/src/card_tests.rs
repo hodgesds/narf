@@ -5,6 +5,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 #[path = "card_endpoint.rs"]
 pub mod endpoint;
+#[path = "card_pm_tests.rs"]
+mod pm_tests;
 
 struct State {
     registers: [u8; 256],
@@ -22,6 +24,7 @@ struct State {
     endpoint: Option<alloc::boxed::Box<dyn endpoint::Endpoint>>,
     endpoint_read: VecDeque<u8>,
     endpoint_write: Option<endpoint::Write>,
+    pm: crate::sdio::function::PmFlags,
 }
 impl State {
     fn data_commands(&self) -> usize {
@@ -87,6 +90,7 @@ impl Model {
             endpoint: None,
             endpoint_read: VecDeque::new(),
             endpoint_write: None,
+            pm: crate::sdio::function::PmFlags::NONE,
         };
         s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
         s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
@@ -124,6 +128,9 @@ impl Registers for Model {
     }
     fn enable_intx(&mut self) -> bool {
         true
+    }
+    fn pm_caps(&mut self) -> crate::sdio::function::PmFlags {
+        self.0.lock().pm
     }
     fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         self.1

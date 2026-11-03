@@ -91,6 +91,33 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   line. `Ok(false)` without a line. `rearm_card_interrupt` unmasks after the
   owner serviced every function source. Dropping the card clears SDHCI
   status/signal enables before the line is masked.
+- System PM (`card_pm.rs`). `PmFlags` is Linux `mmc_pm_flag_t`
+  (`KEEP_POWER`, `WAKE_SDIO_IRQ`). `Registers::pm_caps()` (default none) is
+  the platform grant; the native PCI owner reports `KEEP_POWER` as
+  sdhci-pci-core `sdhci_pci_probe_slot` does, plus `WAKE_SDIO_IRQ` when the
+  host function's PCI PM capability has a non-zero `PME_Support`
+  (`pci_pm_init` -> `device_can_wakeup`). `SdioFunction::host_pm_caps()`
+  (`sdio_get_host_pm_caps`) masks `WAKE_SDIO_IRQ` without a bound card line.
+  `SdioFunction::suspend_host(flags)` refuses a flag the host lacks
+  (`sdio_set_host_pm_flags` -EINVAL), wake without keep-power, or an active
+  command/data engine. With `KEEP_POWER` the card keeps power, selection and
+  function enables; a waking suspend requires CCCR IENM, arms the line with
+  `InterruptLine::set_wake` (oneshot: `narf_interrupts` `enable_irq_wake`),
+  drops a 4-bit bus to 1-bit with `SDIO_BUS_ASYNC_INT` (`mmc_sdio_suspend` ->
+  `sdio_disable_wide`), sets SDHCI `WAKE_UP_CONTROL` `WAKE_ON_INT`, enables
+  only card-interrupt status/signal and unmasks the line
+  (`sdhci_enable_irq_wakeups`); a non-waking one clears both enables
+  (`sdhci_suspend_host`). Without `KEEP_POWER` it is `mmc_power_off`: clock
+  and power off, function enables and the card receipt retired. Every
+  command is refused (`Busy`) while suspended. `resume_host()` with power
+  kept is `sdhci_resume_host` (CMD/DATA-line reset, replay of timing, bus
+  width, 3.3-V power and clock, wake disarm, saved enables restored) then
+  `mmc_sdio_resume` (4-bit restored); the CCCR I/O-enable byte must still
+  equal the enabled functions (the card kept power), else the card turns
+  terminal (`HostError`). A power-off resume is `mmc_sdio_reinit_card`: full
+  enumeration whose per-function identities must match; functions return
+  disabled. Arming PCI PME / the ACPI wake route of the host for an S-state
+  is the system-PM owner's (`narf-power` `pci_wake`), not this crate's.
 - `source::Source` is an opaque original native host plus Controller/Card
   lifetime receipt. `Registers::source` and `SdioFunction::source` default
   to None; observed identity, a caller validator or a scalar cannot create

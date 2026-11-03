@@ -122,6 +122,40 @@ impl Registers for Mmio {
     fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         Some(self.identity)
     }
+    /// sdhci-pci-core.c `sdhci_pci_probe_slot`: `pm_caps =
+    /// MMC_PM_KEEP_POWER`, plus `MMC_PM_WAKE_SDIO_IRQ` when
+    /// `device_can_wakeup` — set by `pci.c::pci_pm_init` when the PM
+    /// capability's `PME_Support` field is non-zero. ACPI-only wake
+    /// capability is not modelled. Arming PME/the GPE route for a sleep
+    /// state is the system-PM owner's (`narf-power` `pci_wake`).
+    fn pm_caps(&mut self) -> crate::sdio::function::PmFlags {
+        use crate::sdio::function::PmFlags;
+        if self.gone || !self.source_live.current() {
+            return PmFlags::NONE;
+        }
+        let device = self.device;
+        let pme = invoke(&self.authority, || {
+            // SAFETY: bounded standard capability walk over this exact
+            // retained live function's configuration window.
+            let Ok(Some(offset)) = (unsafe {
+                narf_bus::pci_cap::find_cap(&device, narf_bus::pci_cap::id::POWER_MGMT)
+            }) else {
+                return false;
+            };
+            // PMC is the upper half of the first dword; `PME_Support` is
+            // PMC[15:11] (`PCI_PM_CAP_PME_MASK`).
+            u16::try_from(offset).ok().is_some_and(|offset| {
+                narf_bus::pci::read_config32(&self.authority, &device, offset)
+                    .is_ok_and(|dword| dword != u32::MAX && (dword >> 27) & 0x1f != 0)
+            })
+        })
+        .unwrap_or(false);
+        if pme {
+            PmFlags::KEEP_POWER.union(PmFlags::WAKE_SDIO_IRQ)
+        } else {
+            PmFlags::KEEP_POWER
+        }
+    }
     fn read8(&mut self, offset: u32) -> u8 {
         self.access(offset, 1, |region| {
             // SAFETY: complete exact-width extent and current PCI invocation.

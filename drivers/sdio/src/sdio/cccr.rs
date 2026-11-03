@@ -58,6 +58,8 @@ pub const CCCR_INT_EXT: u32 = 0x16;
 pub const BUS_IFACE_BW_MASK: u8 = 0x03;
 pub const BUS_IFACE_BW_1BIT: u8 = 0x00;
 pub const BUS_IFACE_BW_4BIT: u8 = 0x02;
+/// `SDIO_BUS_ASYNC_INT`: asynchronous interrupt in 1-bit mode (SDIO 3.0).
+pub const BUS_IFACE_ASYNC_INT: u8 = 0x20;
 pub const BUS_IFACE_CD_DISABLE: u8 = 0x80;
 
 // CCCR_CARD_CAPABILITY bits

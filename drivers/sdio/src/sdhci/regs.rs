@@ -75,6 +75,12 @@ pub const POWER_180: u8 = 0x0A; // 1.8 V
 pub const POWER_300: u8 = 0x0C; // 3.0 V
 pub const POWER_330: u8 = 0x0E; // 3.3 V
 
+// ── Wakeup control (0x2B) ─────────────────────────────────────────────
+pub const WAKE_UP_CONTROL: u32 = 0x2B;
+pub const WAKE_ON_INT: u8 = 0x01;
+pub const WAKE_ON_INSERT: u8 = 0x02;
+pub const WAKE_ON_REMOVE: u8 = 0x04;
+
 // ── Clock control (0x2C–0x2D) ─────────────────────────────────────────
 pub const CLOCK_CONTROL: u32 = 0x2C;
 pub const CLK_INT_EN: u16 = 0x0001; // internal clock enable

@@ -63,10 +63,18 @@ pub struct FunctionInfo {
 /// [`InterruptLine::unmask`] re-enables it after service.
 pub trait InterruptLine: Send {
     fn unmask(&self);
+    /// Linux `enable_irq_wake`/`disable_irq_wake` on the host's line.
+    /// `false`: the line cannot be a system wake source.
+    fn set_wake(&self, _on: bool) -> bool {
+        false
+    }
 }
 impl InterruptLine for narf_interrupts::oneshot::Line {
     fn unmask(&self) {
         narf_interrupts::oneshot::Line::unmask(self)
+    }
+    fn set_wake(&self, on: bool) -> bool {
+        narf_interrupts::oneshot::Line::set_wake(self, on).is_ok()
     }
 }
 type Notify = alloc::sync::Arc<dyn Fn() + Send + Sync>;
@@ -123,14 +131,23 @@ pub struct Card<R: Registers> {
     /// Platform card-interrupt line; dropped (masked) after the host's
     /// signal enables are cleared.
     interrupt: Option<Interrupt>,
+    /// Enumeration configuration, replayed by a power-off resume.
+    config: Config,
+    /// System-suspend state (`card_pm.rs`); every access is refused while
+    /// it is held.
+    suspend: Option<pm::Suspended>,
+    /// A resume could not prove the card kept its state; terminal.
+    pm_failed: bool,
 }
 impl<R: Registers> Drop for Card<R> {
     fn drop(&mut self) {
         self.live.retire();
         if let Some(interrupt) = self.interrupt.as_ref() {
             interrupt.subscriber.clear();
+            interrupt.line.set_wake(false);
         }
         let io = self.controller.registers();
+        io.write8(WAKE_UP_CONTROL, 0);
         io.write32(SIGNAL_ENABLE, 0);
         io.write32(INT_ENABLE, 0);
         io.write16(CLOCK_CONTROL, 0);
@@ -150,6 +167,9 @@ impl<R: Registers> Card<R> {
             observing: 0,
             live: crate::source::Lifetime::new(),
             interrupt: None,
+            config,
+            suspend: None,
+            pm_failed: false,
         };
         card.start(config)?;
         Ok(card)
@@ -373,7 +393,19 @@ impl<R: Registers> Card<R> {
         self.host.high_speed = high_speed;
         Ok(())
     }
+    /// Linux `mmc_card_suspended`: no command reaches a suspended card,
+    /// and a card whose resume failed stays refused.
+    fn pm_gate(&self) -> Result<(), SdioError> {
+        if self.pm_failed {
+            Err(SdioError::HostError)
+        } else if self.suspend.is_some() {
+            Err(SdioError::Busy)
+        } else {
+            Ok(())
+        }
+    }
     fn direct(&mut self, write: bool, func: u8, addr: u32, value: u8) -> Result<u8, SdioError> {
+        self.pm_gate()?;
         if func > self.host.func_count {
             return Err(SdioError::BadFunction);
         }
@@ -477,6 +509,7 @@ impl<R: Registers> Card<R> {
         data: Data<'_>,
         scope: Option<&mut dyn crate::pio::Publication>,
     ) -> Result<(), SdioError> {
+        self.pm_gate()?;
         if func == 0 || func > self.host.func_count {
             return Err(SdioError::BadFunction);
         }
@@ -610,6 +643,7 @@ impl<R: Registers> SdioFunction for Card<R> {
         Ok(())
     }
     fn clear_publication_pending(&mut self) -> Result<(), SdioError> {
+        self.pm_gate()?;
         if self.observing == 0 {
             return Err(SdioError::Unsupported);
         }
@@ -821,6 +855,15 @@ impl<R: Registers> SdioFunction for Card<R> {
             interrupt.line.unmask();
         }
     }
+    fn host_pm_caps(&mut self) -> crate::sdio::function::PmFlags {
+        Card::host_pm_caps(self)
+    }
+    fn suspend_host(&mut self, flags: crate::sdio::function::PmFlags) -> Result<(), SdioError> {
+        Card::suspend_host(self, flags)
+    }
+    fn resume_host(&mut self) -> Result<(), SdioError> {
+        Card::resume_host(self)
+    }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), SdioError> {
         if func == 0 || func > self.host.func_count {
             return Err(SdioError::BadFunction);
@@ -866,6 +909,9 @@ impl<R: Registers> SdioFunction for Card<R> {
         Ok(())
     }
 }
+
+#[path = "card_pm.rs"]
+mod pm;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "card_tests.rs"]
