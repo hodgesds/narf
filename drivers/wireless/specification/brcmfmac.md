@@ -966,6 +966,47 @@ retirement, invalid records, activation/cancel, control-prefix progress and
 system PM. Execution and software acceptance are pending; no physical RF or
 firmware qualification follows from these source fixtures.
 
+### Virtual-interface wire foundation
+
+`brcmfmac::vif_wire` is the shared (PCIe msgbuf and SDIO BCDC) encoding and
+host-registry layer that additional interfaces and P2P will compose. It
+grants no interface, role, data or transmit authority, and no adapter
+advertises an additional interface, P2P or a new monitor role from it.
+It mirrors Linux 7.3-rc4: `features` maps only the exact native `cap`
+tokens of `feature.c` `brcmf_fwcap_map` (`mbss`, `mchan`, `p2p`, `rtap`)
+with `brcmf_feat_attach`'s MBSS exclusion for 4330/43362, using the same
+strict bounded C-string rules as monitor/AP discovery. `bsscfg_iovar`
+is `fwil.c::brcmf_create_bsscfg` (bsscfg0 is a plain iovar; others are
+`bsscfg:` + name NUL + le32 index + data). `vif_mac`,
+`interface_create_v{1,2,3}` and `mbss_ssid` reproduce
+`brcmf_set_vif_sta_macaddr`, the naturally aligned
+`wl_interface_create_v1/v2` (20 bytes) and `v3` fixed part (28 bytes, with
+`len`/`fixed_len`/`bssid`/`if_index` left zero as Linux does), and the
+legacy `bsscfg:ssid` `ssid<N>` fallback of `brcmf_cfg80211_request_ap_if`.
+`IfEvent`/`classify` decode `struct brcmf_if_event` (event 54) and apply
+`fweh.c::brcmf_fweh_handle_if_event`: NOIF is ignored unless it is the P2P
+device (P2P_CLIENT role, or STA role while P2P-device setup is ongoing),
+and out-of-range ifidx/bsscfgidx is dropped. Unlike Linux, a payload
+shorter than five bytes or an unknown action/role is malformed rather than
+read. `Registry` is `iflist[bsscfgidx]` + `if2bss[ifidx]` with
+`brcmf_add_if`/`brcmf_del_if`/`brcmf_get_ifp` semantics: an ADD over a
+live nonzero ifidx reports the detached old entry for authority retirement
+(nonwrapping generation; it never revives), an ifidx0 ADD over an occupied
+bsscfg and DEL of bsscfg0 are ignored, a P2P device bsscfg gets no ifidx
+data mapping, and `first_free_bsscfgidx` skips the P2P-reserved bsscfg1.
+
+Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
+either family: per-ifidx demultiplexing in the `Fullmac` seam
+(`pop_data`/`send_data`/events are interface0-only; msgbuf flow rings are
+created for ifidx0 only), a secondary netdev/`WirelessNetIface`
+registration and removal owner, `interface_create`/`interface_remove`
+command owners that wait for the matching native IF event, per-bsscfg role
+owners (the AP `Session` and `Station` are primary-bsscfg only), and for
+P2P the `p2p.c` discovery bsscfg (`p2p_disc`, `p2p_ifadd`/`p2p_ifdel`,
+`bsscfg:p2p_da_override`), action-frame TX/RX and GO negotiation owners.
+Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
+written for this foundation.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a

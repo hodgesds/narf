@@ -77,6 +77,7 @@ pub mod ringbuf;
 pub mod runtime;
 pub mod shared;
 pub mod station_transport;
+pub mod vif_wire;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 
@@ -126,3 +127,6 @@ pub(crate) mod runtime_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod data_wire_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod vif_wire_tests;
