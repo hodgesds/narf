@@ -35,7 +35,6 @@ rtlwifi	rtl8821ae	RTL8821AE retained runtime; blocked on porting the rtl8821ae/8
 rtlwifi	vht	VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime	feature	drivers/wireless/specification/rtlwifi.md	1592
 rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend	feature	drivers/wireless/specification/rtlwifi.md	1593
 rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2196
-rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	2199
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2198
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2257
 rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading and its NHM noise monitoring (support_noise)	chip	drivers/wireless/specification/rtw89.md	2256
