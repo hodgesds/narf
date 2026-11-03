@@ -56,8 +56,9 @@ pub(super) struct Bootstrap {
     suspended: AtomicBool,
     /// System suspend took the WoW branch: the generation stays live (D3hot,
     /// no card-off) with the WoW image owning the radio until resume; the
-    /// config header `pci_save_state` saved before the driver op.
-    wow: IrqSafeSpinLock<Option<narf_bus::pci::SavedPciConfig>>,
+    /// config header and MSI capability `pci_save_state` saved before the
+    /// driver op.
+    wow: IrqSafeSpinLock<Option<PciState>>,
     /// cfg80211 `wiphy->wowlan_config` and the last wake report, carried
     /// from a retired generation's shell into the next one.
     wowlan: IrqSafeSpinLock<(
@@ -649,9 +650,24 @@ async fn pci_settle() {
 fn pci_state(owner: &Bootstrap, expected: narf_bus::pci::PciPowerState) -> bool {
     narf_bus::pci::power_state(&owner.authority, &owner.device) == Ok(Some(expected))
 }
-/// `pci_pm_resume_noirq`: D0, the exit delay, `pci_restore_state`, and a
-/// read-back of the restored BARs and command register.
-async fn pci_wake(owner: &Bootstrap, saved: &narf_bus::pci::SavedPciConfig) -> bool {
+/// `pci_pm_resume_noirq`: D0, the exit delay, `pci_restore_state`
+/// (header, then MSI) and a read-back of the restored BARs, command
+/// register and MSI capability.
+/// `pci_save_state`: the type-0 header and the MSI capability (address,
+/// data, mask, Multi-Message Enable and Enable), which a function may lose
+/// across D3hot (Linux `pci_restore_msi_state`).
+#[derive(Clone, Copy)]
+struct PciState {
+    config: narf_bus::pci::SavedPciConfig,
+    msi: narf_bus::msi::SavedMsi,
+}
+fn pci_save(owner: &Bootstrap) -> Option<PciState> {
+    Some(PciState {
+        config: narf_bus::pci::save_config(&owner.authority, &owner.device).ok()?,
+        msi: narf_bus::msi::save_msi(&owner.authority, &owner.device).ok()?,
+    })
+}
+async fn pci_wake(owner: &Bootstrap, saved: &PciState) -> bool {
     if narf_bus::pci::set_power_state(
         &owner.authority,
         &owner.device,
@@ -662,18 +678,23 @@ async fn pci_wake(owner: &Bootstrap, saved: &narf_bus::pci::SavedPciConfig) -> b
         return false;
     }
     pci_settle().await;
+    let config = &saved.config;
     pci_state(owner, narf_bus::pci::PciPowerState::D0)
-        && narf_bus::pci::restore_config(&owner.authority, &owner.device, saved).is_ok()
+        && narf_bus::pci::restore_config(&owner.authority, &owner.device, config).is_ok()
         && narf_bus::pci::save_config(&owner.authority, &owner.device).is_ok_and(|now| {
-            now.bars == saved.bars
-                && now.expansion_rom_bar == saved.expansion_rom_bar
-                && now.command == saved.command
+            now.bars == config.bars
+                && now.expansion_rom_bar == config.expansion_rom_bar
+                && now.command == config.command
         })
+        // `__pci_restore_msi_state`, proven by read-back of the capability.
+        && narf_bus::msi::restore_msi(&owner.authority, &owner.device, &saved.msi).is_ok()
 }
 /// The WoW suspend branch; false means the cold path must run (a failed
 /// WoW owner already closed its shell).
 async fn wow_suspend_owner(owner: &Bootstrap, shell: &Arc<Device<startup::Startup>>) -> bool {
-    let Ok(saved) = narf_bus::pci::save_config(&owner.authority, &owner.device) else {
+    // The WoW resume needs the bound MSI vector: refuse WoW unless it is
+    // enabled and saved (polled delivery keeps the cold path).
+    let Some(saved) = pci_save(owner).filter(|saved| saved.msi.enabled()) else {
         return false;
     };
     if shell.wow_suspend().await != Ok(true) {

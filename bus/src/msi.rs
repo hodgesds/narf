@@ -261,6 +261,118 @@ fn msi_message(target: u32, base_irq: u8) -> (u64, u32) {
     }
 }
 
+/// The MSI capability state `pci_save_state` keeps for a function
+/// (Linux `drivers/pci/msi/msi.c` `__pci_restore_msi_state`): Message
+/// Control, address, data and, when per-vector masking exists, the mask.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SavedMsi {
+    cap_offset: u64,
+    control: u16,
+    addr_lo: u32,
+    addr_hi: u32,
+    data: u16,
+    mask: Option<u32>,
+}
+
+impl SavedMsi {
+    /// Message Control bit 0.
+    pub fn enabled(&self) -> bool {
+        self.control & 1 != 0
+    }
+}
+
+fn msi_layout(device: &BusDevice) -> Result<(PhysAddr, u64), MsiError> {
+    let cfg_phys = match device.kind {
+        BusKind::Pcie { cfg_phys, .. } => cfg_phys,
+        BusKind::VirtioMmio { .. } => return Err(MsiError::NotPcie),
+    };
+    // SAFETY: bounded cap-list walk.
+    let cap_off = unsafe { pci_cap::find_cap(device, MSI_CAP_ID) }
+        .map_err(|_| MsiError::NotPcie)?
+        .ok_or(MsiError::CapabilityNotFound)?;
+    Ok((cfg_phys, cap_off))
+}
+
+/// Field offsets after Message Control: (data, mask) for the 32/64-bit
+/// address variants.
+fn msi_offsets(control: u16) -> (u64, u64) {
+    if control & (1 << 7) != 0 {
+        (0xC, 0x10)
+    } else {
+        (0x8, 0xC)
+    }
+}
+
+fn read_msi(cfg: PhysAddr, cap_off: u64) -> SavedMsi {
+    // SAFETY: every offset stays inside the MSI capability, which lies in
+    // the type-0 header's capability area (< 0x100).
+    unsafe {
+        let control = cfg_read16(cfg, cap_off + 2);
+        let (data_off, mask_off) = msi_offsets(control);
+        SavedMsi {
+            cap_offset: cap_off,
+            control,
+            addr_lo: cfg_read32(cfg, cap_off + 4),
+            addr_hi: if control & (1 << 7) != 0 {
+                cfg_read32(cfg, cap_off + 8)
+            } else {
+                0
+            },
+            data: cfg_read16(cfg, cap_off + data_off),
+            mask: (control & (1 << 8) != 0).then(|| cfg_read32(cfg, cap_off + mask_off)),
+        }
+    }
+}
+
+/// `pci_save_state`'s MSI half: snapshot the function's MSI capability.
+/// Cap-gated.
+pub fn save_msi(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<SavedMsi, MsiError> {
+    cap.check_live()?;
+    let (cfg, cap_off) = msi_layout(device)?;
+    let saved = read_msi(cfg, cap_off);
+    if saved.control == u16::MAX {
+        return Err(MsiError::NotPcie);
+    }
+    Ok(saved)
+}
+
+/// `pci_restore_state` -> `__pci_restore_msi_state`: MSI enable off,
+/// address/data and the per-vector mask rewritten, then Message Control
+/// (Multi-Message Enable and Enable) last; the capability is read back
+/// and must equal the snapshot. Cap-gated; the caller owns the function's
+/// configuration space and has returned it to D0.
+pub fn restore_msi(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    saved: &SavedMsi,
+) -> Result<(), MsiError> {
+    cap.check_live()?;
+    let (cfg, cap_off) = msi_layout(device)?;
+    if cap_off != saved.cap_offset {
+        return Err(MsiError::CapabilityNotFound);
+    }
+    let (data_off, mask_off) = msi_offsets(saved.control);
+    // SAFETY: as in `read_msi`; the caller owns configuration space.
+    unsafe {
+        let current = cfg_read16(cfg, cap_off + 2);
+        cfg_write16(cfg, cap_off + 2, current & !1);
+        cfg_write32(cfg, cap_off + 4, saved.addr_lo);
+        if saved.control & (1 << 7) != 0 {
+            cfg_write32(cfg, cap_off + 8, saved.addr_hi);
+        }
+        cfg_write16(cfg, cap_off + data_off, saved.data);
+        if let Some(mask) = saved.mask {
+            cfg_write32(cfg, cap_off + mask_off, mask);
+        }
+        let control = (current & !(1 | 0x7 << 4)) | (saved.control & (1 | 0x7 << 4));
+        cfg_write16(cfg, cap_off + 2, control);
+    }
+    if read_msi(cfg, cap_off) != *saved {
+        return Err(MsiError::Unsupported);
+    }
+    Ok(())
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 #[inline]
@@ -299,4 +411,18 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
         };
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+#[inline]
+unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller asserts the slot is readable + 4-byte aligned.
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u32),
+            None => u32::MAX,
+        }
+    };
+    compiler_fence(Ordering::SeqCst);
+    v
 }

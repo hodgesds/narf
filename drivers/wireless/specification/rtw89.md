@@ -1972,7 +1972,11 @@ carried across generations by `Bootstrap::wowlan` (cfg80211 keeps
 `wiphy->wowlan_config`). `bootstrap::SystemPm` takes the WoW branch for a
 `Stage::Station` generation: `pci_save_state`, the driver op, D3hot without
 card-off (as rtw88; 10 ms exit delay, PMCSR read-back); resume returns to
-D0, restores and re-reads BARs/command, then `wow_resume`. Every failure
+D0, restores and re-reads BARs/command, then restores the MSI capability
+(`narf_bus::msi::restore_msi`: enable off, address/data/per-vector mask,
+then Multi-Message Enable + Enable, whole capability read back; Linux
+`__pci_restore_msi_state`), then `wow_resume`. WoW is refused (cold path)
+unless MSI was enabled and saved before suspend. Every failure
 (including a non-D3hot read-back, which resumes the station first) takes
 the existing cold path: the shell is closed and the supervisor retires the
 generation (park on suspend, regenerate behind a fresh FLR on resume).
