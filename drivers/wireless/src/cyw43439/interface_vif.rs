@@ -488,16 +488,16 @@ impl<R: Fullmac + 'static> Device<R> {
         })
     }
 
-    /// `brcmf_setup_ifmodes` combinations for the STA/AP roles this driver
-    /// creates, from the booted firmware's `cap` tokens (the same rules as
-    /// `vif_owner::admits`). Without `p2p`, combo0 is one STA + one AP on
-    /// one channel. With `p2p` (RSDB unparsed, treated absent) combo0 is
-    /// `1 + mchan` STAs on `1 + mchan` channels and the P2P combination is
-    /// one STA + one AP on one channel; the P2P iftype limits are left out
-    /// (no P2P role here), so a combo0 of a single STA is not listed
-    /// (cfg80211 needs `max_interfaces >= 2`). The `mbss` multi-AP
-    /// combination is not advertised: `vif->mbss` is not implemented and
-    /// only one AP may run.
+    /// `brcmf_setup_ifmodes` combinations from the booted firmware's `cap`
+    /// tokens (the same rules as `vif_owner::admits_counts`; RSDB unparsed,
+    /// treated absent; no monitor limit, as no monitor vif is created).
+    /// Without `p2p`, combo0 is one STA + one AP on one channel. With
+    /// `p2p`, combo0 is `1 + mchan` STAs, one P2P_DEVICE and one
+    /// P2P_CLIENT|P2P_GO on `1 + mchan` channels with Linux's
+    /// `max_interfaces` = the limit count (3), and the P2P combination is
+    /// one each of STA, AP, P2P_CLIENT and P2P_DEVICE on one channel. The
+    /// `mbss` multi-AP combination is not advertised: `vif->mbss` is not
+    /// implemented and only one AP may run.
     pub(super) fn vif_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
         use narf_wireless::{InterfaceCombination, InterfaceTypeLimit};
         let Some(features) = self
@@ -507,29 +507,29 @@ impl<R: Fullmac + 'static> Device<R> {
         else {
             return Vec::new();
         };
-        let combination = |limits: &[(u32, u32)], channels: u32| InterfaceCombination {
-            limits: limits
-                .iter()
-                .map(|&(max, iftype)| InterfaceTypeLimit {
-                    max,
-                    iftypes: alloc::vec![iftype],
-                })
-                .collect(),
-            max_interfaces: limits.iter().map(|&(max, _)| max).sum(),
-            max_channels: channels,
-            sta_ap_beacon_interval_match: false,
-            beacon_interval_min_gcd: None,
-            radar_detect_widths: None,
-        };
-        if !features.p2p {
-            return alloc::vec![combination(&[(1, 2), (1, 3)], 1)];
+        let combination =
+            |limits: &[(u32, &[u32])], max_interfaces: u32, channels: u32| InterfaceCombination {
+                limits: limits
+                    .iter()
+                    .map(|&(max, iftypes)| InterfaceTypeLimit {
+                        max,
+                        iftypes: iftypes.to_vec(),
+                    })
+                    .collect(),
+                max_interfaces,
+                max_channels: channels,
+                sta_ap_beacon_interval_match: false,
+                beacon_interval_min_gcd: None,
+                radar_detect_widths: None,
+            };
+        if !features.p2p || !p2p_device::P2P_ADVERTISED {
+            return alloc::vec![combination(&[(1, &[2]), (1, &[3])], 2, 1)];
         }
-        let mut combinations = Vec::new();
-        if features.mchan {
-            combinations.push(combination(&[(2, 2)], 2));
-        }
-        combinations.push(combination(&[(1, 2), (1, 3)], 1));
-        combinations
+        let mchan = u32::from(features.mchan);
+        alloc::vec![
+            combination(&[(1 + mchan, &[2]), (1, &[10]), (1, &[8, 9])], 3, 1 + mchan),
+            combination(&[(1, &[2]), (1, &[3]), (1, &[8]), (1, &[10])], 4, 1),
+        ]
     }
 
     /// `brcmf_cfg80211_add_iface` admission and `brcmf_net_attach`

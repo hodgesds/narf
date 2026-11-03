@@ -462,3 +462,180 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/p2p",
     smoke_brcmf_p2p_connection_bsscfg_ifadd_and_ifdel
 );
+
+/// P2P IE (attribute 6 Listen Channel "XX\x04", class 81, `channel`),
+/// a WPS IE, an Extended Capabilities element and an MS WPA IE.
+fn p2p_scan_ies(channel: u8) -> Vec<u8> {
+    let mut ies = alloc::vec![221, 12, 0x50, 0x6f, 0x9a, 9, 6, 5, 0, b'X', b'X', 4, 81, channel];
+    ies.extend_from_slice(&[221, 7, 0x00, 0x50, 0xf2, 4, 0x10, 0x4a, 0]);
+    ies.extend_from_slice(&[127, 2, 0, 0]);
+    ies.extend_from_slice(&[221, 6, 0x00, 0x50, 0xf2, 1, 1, 0]);
+    ies
+}
+
+fn vndr_records(command: &[u8; 4], flag: u32, ies: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for ie in ies {
+        out.extend_from_slice(command);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&flag.to_le_bytes());
+        out.extend_from_slice(ie);
+    }
+    out
+}
+
+fn escan_case<const PCIE: bool>() -> Result<(), &'static str> {
+    // Wire: SEARCH has the null SSID and social dwell; one channel is a
+    // connect-dwell SCAN with the DIRECT- wildcard.
+    let social = [0x1001u16, 0x1006, 0x100b];
+    let Ok(search) = wire::p2p_scan(DiscState::Search, &social) else {
+        return Err("p2p_scan SEARCH refused");
+    };
+    let Ok(scan) = wire::p2p_scan(DiscState::Scan, &[0x1006]) else {
+        return Err("p2p_scan SCAN refused");
+    };
+    let word = |body: &[u8], at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
+    if search.len() != wire::P2P_SCAN_FIXED + 6
+        || search[0] != b'E'
+        || word(&search, 4) != 1
+        || search[8..12] != [1, 0, 0x34, 0x12]
+        || word(&search, 12) != 0
+        || search[48..54] != [0xff; 6]
+        || search[54..56] != [2, 0]
+        || word(&search, 56) != 1
+        || word(&search, 60) != 40
+        || word(&search, 64) != u32::MAX
+        || word(&search, 68) != 60
+        || word(&search, 72) != 3
+        || search[76..82] != [0x01, 0x10, 0x06, 0x10, 0x0b, 0x10]
+        || word(&scan, 12) != 7
+        || &scan[16..23] != wire::WILDCARD_SSID
+        || word(&scan, 56) != 10
+        || word(&scan, 60) != 200
+        || wire::p2p_scan(DiscState::Listen, &social).is_ok()
+        || wire::p2p_scan(DiscState::Scan, &[]).is_ok()
+    {
+        return Err("brcmf_p2p_scan_le layout");
+    }
+    if wire::search_state(&[1, 6, 11], false) != DiscState::Search
+        || wire::search_state(&[1, 6], false) != DiscState::Scan
+        || wire::search_state(&[36], true) != DiscState::Search
+        || !wire::is_p2p_request(&[Vec::new(), b"DIRECT-".to_vec()])
+        || wire::is_p2p_request(&[b"DIRECT-xy".to_vec()])
+        || wire::listen_channel(&p2p_scan_ies(6)) != Some(6)
+        || wire::listen_channel(&p2p_scan_ies(3)).is_some()
+    {
+        return Err("P2P request classification");
+    }
+    let device = wire::generate_bss_mac(PRIMARY, None, [0; 6]).device;
+    let mut runtime = Mock::<PCIE>::new(discovery_firmware(device));
+    let mut owner = Owner::new(PRIMARY, p2p_features());
+    let entry =
+        block(owner.create_p2p_device(&mut runtime, device)).map_err(|_| "create p2pdev")?;
+    let mut p2p = Device::new(entry);
+    // A non-social listen channel is brcmf_p2p_find_listen_channel -EPERM.
+    if block(p2p.scan_prep(&mut runtime, &p2p_scan_ies(3))) != Err(Error::Authority)
+        || !runtime
+            .fw
+            .iovars(Direction::Set, b"bsscfg:vndr_ie")
+            .is_empty()
+    {
+        return Err("P2P scan with a non-social listen channel accepted");
+    }
+    let ies = p2p_scan_ies(11);
+    block(p2p.scan_prep(&mut runtime, &ies)).map_err(|_| "brcmf_p2p_scan_prep")?;
+    let vndr = runtime.fw.iovars(Direction::Set, b"bsscfg:vndr_ie");
+    let added = vndr_records(
+        b"add\0",
+        wire::VNDR_IE_PRBREQ_FLAG,
+        &[&ies[..14], &ies[14..23]],
+    );
+    if p2p.my_listen_channel() != Some(11)
+        || vndr.len() != 1
+        || vndr[0][..4] != 1u32.to_le_bytes()
+        || vndr[0][4..] != added[..]
+        || runtime
+            .fw
+            .iovars(Direction::Set, b"bsscfg:wsec")
+            .last()
+            .map(|v| v[4..].to_vec())
+            != Some(4u32.to_le_bytes().to_vec())
+    {
+        return Err("PRBREQ vndr_ie on the discovery bsscfg (vendor IEs only)");
+    }
+    // The same request again issues no vndr_ie.
+    block(p2p.scan_prep(&mut runtime, &ies)).map_err(|_| "repeat scan_prep")?;
+    block(p2p.run_escan(&mut runtime, DiscState::Search, &social)).map_err(|_| "run_escan")?;
+    let states = runtime.fw.iovars(Direction::Set, b"bsscfg:p2p_state");
+    let scans = runtime.fw.iovars(Direction::Set, b"bsscfg:p2p_scan");
+    if runtime.fw.iovars(Direction::Set, b"bsscfg:vndr_ie").len() != 1
+        || states.last().map(|v| v[4..].to_vec())
+            != Some(wire::disc_state(DiscState::Search, 0, 0).to_vec())
+        || scans.len() != 1
+        || scans[0][..4] != 1u32.to_le_bytes()
+        || scans[0][4..] != search[..]
+        || runtime
+            .fw
+            .vif_log
+            .iter()
+            .filter(|(_, c)| c.iovar() == Some(&b"bsscfg:p2p_scan"[..]))
+            .any(|(ifidx, _)| *ifidx != 1)
+    {
+        return Err("brcmf_p2p_escan on the discovery bsscfg");
+    }
+    // Escan results of this bsscfg are diverted; other events keep their
+    // p2p.c handler (a listen-complete with no listen is a no-op).
+    runtime
+        .fw
+        .secondary_event_status(wire::E_ESCAN_RESULT, 1, 1, PEER, 0, 0, &[]);
+    runtime
+        .fw
+        .secondary_event(wire::E_P2P_DISC_LISTEN_COMPLETE, 1, 1, PEER, &[]);
+    let mut escan = Vec::new();
+    block(p2p.service_escan(&mut runtime, &mut owner, &mut escan)).map_err(|_| "service_escan")?;
+    if escan.len() != 1 || escan[0].header.event_type != wire::E_ESCAN_RESULT {
+        return Err("discovery escan result not diverted");
+    }
+    // mgmt_tx probe-response branch: PRBRSP vndr_ie, deduplicated.
+    block(p2p.set_mgmt_ie(&mut runtime, wire::VNDR_IE_PRBRSP_FLAG, &ies))
+        .map_err(|_| "PRBRSP vndr_ie")?;
+    block(p2p.set_mgmt_ie(&mut runtime, wire::VNDR_IE_PRBRSP_FLAG, &ies))
+        .map_err(|_| "PRBRSP repeat")?;
+    let vndr = runtime.fw.iovars(Direction::Set, b"bsscfg:vndr_ie");
+    let response = vndr_records(
+        b"add\0",
+        wire::VNDR_IE_PRBRSP_FLAG,
+        &[&ies[..14], &ies[14..23]],
+    );
+    if vndr.len() != 2 || vndr[1][4..] != response[..] {
+        return Err("PRBRSP vndr_ie set");
+    }
+    // A changed probe-request set deletes the old records first.
+    block(p2p.scan_prep(&mut runtime, &ies[..14])).map_err(|_| "narrowed scan_prep")?;
+    let vndr = runtime.fw.iovars(Direction::Set, b"bsscfg:vndr_ie");
+    let mut replaced = vndr_records(
+        b"del\0",
+        wire::VNDR_IE_PRBREQ_FLAG,
+        &[&ies[..14], &ies[14..23]],
+    );
+    replaced.extend(vndr_records(
+        b"add\0",
+        wire::VNDR_IE_PRBREQ_FLAG,
+        &[&ies[..14]],
+    ));
+    if vndr.len() != 3 || vndr[2][4..] != replaced[..] {
+        return Err("PRBREQ vndr_ie del/add");
+    }
+    Ok(())
+}
+
+fn smoke_brcmf_p2p_escan_prep_search_and_probe_response_ies() -> TestResult {
+    match escan_case::<false>().and_then(|_| escan_case::<true>()) {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/p2p",
+    smoke_brcmf_p2p_escan_prep_search_and_probe_response_ies
+);

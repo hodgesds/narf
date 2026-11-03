@@ -1532,8 +1532,9 @@ primary's AP serialization lease (`reserve_radio_control`).
   already dropped the host entry, so a repeated DEL retires the WDEV. A
   primary withdrawal (`withdraw_family`) withdraws the WDEV metadata.
 
-The whole WDEV is behind `P2P_ADVERTISED = false` (the primary's
-`async_control_interfaces` and `radio_control_generation` stay off).
+The WDEV is offered when `P2P_ADVERTISED` and the firmware `cap` has
+`p2p` (the primary's `async_control_interfaces` and
+`radio_control_generation` follow `p2p_device_enabled`).
 
 #### P2P_CLIENT / P2P_GO netdevs (`cyw43439/interface_vif.rs`)
 
@@ -1569,10 +1570,28 @@ AP (Linux non-MBSS GO) is refused like every second AP. An AP/GO shell
 whose CLOSING `ap_leave_on` reports `Unsupported` (no per-ifidx AP owner)
 proceeds to `vif_close` instead of failing the runtime.
 
-Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: the
-transport-model (msgbuf/SDIO) fixtures, and P2P iftype/combination
-advertisement, which stays off.
+Advertisement (`P2P_ADVERTISED = true`), only when the booted firmware's
+`cap` has `p2p` (`brcmf_setup_ifmodes`, RSDB treated absent, no monitor
+limit): the primary's modes gain `WirelessModes::P2P` (default
+`p2p_interface_types` 10/8/9), `NEW_INTERFACE` admits iftypes 8/9 (legacy)
+and 10 (async control WDEV), and the combinations are combo0
+{STA <= 1 + mchan, P2P_DEVICE <= 1, P2P_CLIENT|P2P_GO <= 1}, Linux's
+`max_interfaces` = 3, `1 + mchan` channels, and the P2P combination
+{STA, AP, P2P_CLIENT, P2P_DEVICE} each <= 1, four interfaces, one
+channel. Without `p2p` the single STA + AP combination is unchanged.
+
+Written, unexecuted cases: `smoke_brcmf_p2p_escan_prep_search_and_probe_response_ies`
+(`drivers/wireless/brcmfmac/p2p`, scripted seam, both families: P2P scan
+wire layout and classification, `scan_prep` listen-channel refusal,
+PRBREQ/PRBRSP `vndr_ie` del/add and dedup, `p2p_scan` on the discovery
+bsscfg, escan diversion) and
+`smoke_brcmf_msgbuf_p2p_go_start_client_stop_and_delete`
+(`drivers/wireless/brcmfmac/vif`, BCM43602 CR4/msgbuf model: GO shell via
+`p2p_ifadd`, `start_ap` P2P_GO program on ifidx 1, client association,
+`bss` disable, `p2p_ifdis`/`p2p_ifdel`/IF DEL). Not written: the CYW SDIO
+transport-model P2P cases, a msgbuf-model discovery/listen/action/escan
+case and a P2P_CLIENT join case; the discovery and client paths are
+covered only at the scripted seam (`p2p_tests.rs`).
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
 written for this foundation.
 

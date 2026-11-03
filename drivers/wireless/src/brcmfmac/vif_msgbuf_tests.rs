@@ -379,3 +379,195 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_brcmf_msgbuf_primary_station_beside_secondary_ap
 );
+
+/// Linux 7.3-rc4 `p2p.c` `brcmf_p2p_add_vif` (GO) and `cfg80211.c`
+/// `brcmf_cfg80211_start_ap`/`_stop_ap` P2P_GO branch over msgbuf: the
+/// GO connection bsscfg comes from `p2p_ifadd` on the primary, its BSS is
+/// formed by bsscfg `ssid` + `bss` enable on ifidx 1 (no `SET_AP`, `UP`,
+/// `SET_SSID`, `DOWN` or `apsta`), a client associates, STOP is `bss`
+/// disable, and DEL is `p2p_ifdis` (LINK_BSSCFG_DIS) + `p2p_ifdel` + IF DEL.
+fn p2p_go_lifecycle() -> Result<(), &'static str> {
+    use super::ap_native_tests::{association, config, Source};
+    use crate::brcmfmac::runtime_tests::station_model::ap_model::CLIENT;
+    use narf_capabilities::{Cap, Invoke};
+    use narf_wireless::ap_control::ApControlAuthority;
+    const NAME: &str = "p2pgo7";
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    bus.enable_vif_ap();
+    bus.set_caps(b"ap sta mchan p2p");
+    let database = Arc::new(narf_wireless::reg::db::Database::new());
+    database.install(firmware::domain());
+    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
+        .map_err(|_| "primary station over msgbuf")?;
+    cache(
+        &mut station,
+        AP,
+        6,
+        narf_wireless::scan::BssSecurity::Open,
+        &[],
+    );
+    block(station.associate(request(
+        AP,
+        6,
+        narf_wireless::SecurityConfig::Open,
+        Vec::new(),
+    )))
+    .map_err(|_| "primary join")?;
+    let owner = block(super::vif::discover(&mut station.runtime, station.mac))
+        .map_err(|_| "cap discovery")?
+        .ok_or("firmware cap refused")?;
+    if !owner.features().p2p {
+        return Err("p2p cap token not parsed");
+    }
+    let name = narf_net::iface::register("wlan%d", OWN, send);
+    let device = shell(name.clone(), station);
+    device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    device.ap_fixture_setup(database);
+    super::vif::register_primary(&device);
+    let result = (|| {
+        let before_add = bus.commands().len();
+        let go = device
+            .vif_new(NAME, 9, None)
+            .map_err(|_| "P2P_GO shell admission")?;
+        block(device.vif_worker());
+        let commands = bus.commands();
+        let ifidx = bus.command_ifidx();
+        let added: Vec<_> = commands[before_add..]
+            .iter()
+            .zip(&ifidx[before_add..])
+            .collect();
+        if go.current_iftype() != 9
+            || go.ap_sme_capabilities() != Some(0)
+            || !added.iter().any(|((command, body, _), index)| {
+                *command == 263 && **index == 0 && body.starts_with(b"p2p_ifadd\0")
+            })
+            || added
+                .iter()
+                .any(|((_, body, _), _)| body.starts_with(b"interface_create\0"))
+            || !added
+                .iter()
+                .any(|((command, _, _), index)| *command == 158 && **index == 1)
+        {
+            return Err("GO shell not created by p2p_ifadd with SCB timeout");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("GO netdev handle")?;
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "GO admin authority")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = go.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            admin,
+            &iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "GO authority bind")?
+        .reserve()
+        .map_err(|_| "GO control reservation")?;
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[VIF, VIF].concat());
+        let before = bus.commands().len();
+        block(go.start_ap_with_settings_async(&authority, ap_config, settings))
+            .map_err(|_| "P2P GO START")?;
+        let commands = bus.commands();
+        let ifidx = bus.command_ifidx();
+        let program: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+        let mut ssid = b"bsscfg:ssid\0".to_vec();
+        ssid.extend_from_slice(&1u32.to_le_bytes());
+        let mut enable = b"bss\0".to_vec();
+        enable.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0]);
+        let position = |prefix: &[u8]| {
+            program
+                .iter()
+                .position(|((_, body, _), _)| body.starts_with(prefix))
+        };
+        if program.iter().any(|(_, index)| **index != 1)
+            || program.iter().any(|((command, body, _), _)| {
+                matches!(*command, 2 | 3 | 26 | 118)
+                    || body.starts_with(b"apsta\0")
+                    || body.starts_with(b"mbss\0")
+                    || body.starts_with(b"closednet\0")
+            })
+            || position(&ssid).is_none()
+            || position(&enable).is_none()
+            || position(b"chanspec\0") >= position(&ssid)
+            || position(&ssid) >= position(&enable)
+        {
+            return Err("GO Program not the start_ap P2P_GO branch on bsscfg 1");
+        }
+        if !bus.vif_ap_change(|p| p.active && p.up && p.formed) || !go.link_up() {
+            return Err("GO BSS not formed");
+        }
+        bus.vif_ap_change(|p| p.associate(CLIENT, association(false)));
+        for _ in 0..4 {
+            block(device.vif_worker());
+        }
+        if source.count(19) != 1 {
+            return Err("GO NEW_STATION not observed on its shell");
+        }
+        let before = bus.commands().len();
+        block(go.stop_ap_async(&authority)).map_err(|_| "P2P GO STOP")?;
+        let commands = bus.commands();
+        let mut disable = b"bss\0".to_vec();
+        disable.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        if !commands[before..]
+            .iter()
+            .any(|(command, body, _)| *command == 263 && *body == disable)
+            || commands[before..]
+                .iter()
+                .any(|(command, _, _)| matches!(*command, 2 | 3 | 26 | 118))
+            || bus.vif_ap_change(|p| p.active || !p.peers.is_empty())
+            || go.link_up()
+            || device.state.try_lock().ok_or("state")?.station.bssid != Some(AP)
+        {
+            return Err("GO STOP not bss disable beside the joined primary");
+        }
+        let before = bus.commands().len();
+        go.delete_virtual_interface()
+            .map_err(|_| "GO DEL_INTERFACE")?;
+        for _ in 0..6 {
+            block(device.vif_worker());
+        }
+        let commands = bus.commands();
+        let ifdis = commands[before..]
+            .iter()
+            .position(|(_, body, _)| body.starts_with(b"p2p_ifdis\0"));
+        let ifdel = commands[before..]
+            .iter()
+            .position(|(_, body, _)| body.starts_with(b"p2p_ifdel\0"));
+        if ifdis.is_none()
+            || ifdel.is_none()
+            || ifdis >= ifdel
+            || narf_net::iface::lookup(NAME).is_some()
+        {
+            return Err("GO DEL not p2p_ifdis + p2p_ifdel + IF DEL");
+        }
+        Ok(())
+    })();
+    super::vif::withdraw_family(crate::cyw43439::fullmac::Family::Pcie);
+    bus.d3_ack(true);
+    let _ = block(device.teardown());
+    *ACTIVE_TEST.lock() = None;
+    narf_net::registry().unregister(&name);
+    narf_net::iface::unregister(&name);
+    result
+}
+
+fn smoke_brcmf_msgbuf_p2p_go_start_client_stop_and_delete() -> TestResult {
+    match p2p_go_lifecycle() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_p2p_go_start_client_stop_and_delete
+);

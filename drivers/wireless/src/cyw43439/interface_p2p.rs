@@ -46,10 +46,10 @@ use narf_wireless::{
     WirelessIfaceInfo, WirelessNetIface,
 };
 
-/// Whether the P2P_DEVICE WDEV is offered through nl80211. Off until the
-/// P2P CLIENT/GO netdevs, the P2P escan and the transport-model cases are
-/// in place (`drivers/wireless/specification/brcmfmac.md`).
-pub(in crate::cyw43439) const P2P_ADVERTISED: bool = false;
+/// Whether the P2P_DEVICE WDEV and the P2P_CLIENT/GO netdevs are offered
+/// through nl80211 (still only when the booted firmware's `cap` has `p2p`,
+/// `brcmf_setup_ifmodes`; `drivers/wireless/specification/brcmfmac.md`).
+pub(in crate::cyw43439) const P2P_ADVERTISED: bool = true;
 /// `wiphy->max_remain_on_channel_duration` (`brcmf_setup_wiphy`).
 const MAX_ROC_MS: u32 = 5000;
 /// `BRCMF_C_GET_CHANNEL`.

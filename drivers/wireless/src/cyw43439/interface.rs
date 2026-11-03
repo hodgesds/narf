@@ -1622,6 +1622,12 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
                 WirelessModes::MONITOR
             } else {
                 WirelessModes::empty()
+            } | if self.p2p_device_enabled() {
+                // brcmf_setup_ifmodes: P2P_CLIENT, P2P_GO, P2P_DEVICE
+                // with `p2p` (the default `p2p_interface_types`).
+                WirelessModes::P2P
+            } else {
+                WirelessModes::empty()
             },
             hw_caps: HwCaps {
                 ht_supported: self.ht_capabilities.iter().any(Option::is_some),

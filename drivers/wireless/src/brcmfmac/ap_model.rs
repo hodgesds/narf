@@ -322,6 +322,30 @@ impl Profile {
                         assert_eq!(at, body.len());
                         Some(Vec::new())
                     }
+                    // cfg80211.c brcmf_cfg80211_start_ap P2P_GO branch:
+                    // bsscfg `ssid` (brcmf_ssid_le) then `bss` enable on the
+                    // GO's own bsscfg; stop_ap disables it.
+                    (263, "ssid") => {
+                        assert_eq!(body.len(), 36);
+                        let n = word(body, 0) as usize;
+                        assert!((1..=32).contains(&n));
+                        self.ssid = body[4..4 + n].to_vec();
+                        Some(Vec::new())
+                    }
+                    (263, "bss") => {
+                        assert_eq!(body.len(), 8);
+                        let enable = word(body, 4) != 0;
+                        self.active = enable;
+                        self.up = enable;
+                        self.formed = enable && !self.ssid.is_empty();
+                        if !enable && !self.hold_remove {
+                            let peers: Vec<_> = self.peers.keys().copied().collect();
+                            for mac in peers {
+                                self.remove(mac);
+                            }
+                        }
+                        Some(Vec::new())
+                    }
                     (262, name) if self.vars.contains_key(name) => scalar(self.vars[name]),
                     (263, name) if self.vars.contains_key(name) => {
                         assert_eq!(body.len(), 4);

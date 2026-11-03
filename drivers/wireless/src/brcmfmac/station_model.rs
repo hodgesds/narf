@@ -403,6 +403,26 @@ impl Firmware {
                 caps.push(0);
                 caps
             }
+            // p2p.c brcmf_p2p_add_vif / brcmf_p2p_del_vif for the one
+            // modeled connection bsscfg (ifidx 1, bsscfg 1, role P2P_GO 3).
+            263 if input.starts_with(b"p2p_ifadd\0") => {
+                assert_eq!(input[10 + 6], 1, "only a GO connection is modeled");
+                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, 3]);
+                Vec::new()
+            }
+            // brcmf_notify_connect_status_ap: the GO bsscfg's BRCMF_E_LINK
+            // with BRCMF_E_REASON_LINK_BSSCFG_DIS (4) completes vif_disabled.
+            263 if input.starts_with(b"p2p_ifdis\0") => {
+                assert_eq!(&input[10..16], &VIF);
+                self.event_on(16, (1, 1), VIF, &[]);
+                self.events.back_mut().unwrap()[36..40].copy_from_slice(&4u32.to_be_bytes());
+                Vec::new()
+            }
+            263 if input.starts_with(b"p2p_ifdel\0") => {
+                assert_eq!(&input[10..16], &VIF);
+                self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, 3]);
+                Vec::new()
+            }
             263 if input.starts_with(b"bsscfg:interface_remove\0") => {
                 assert_eq!(&input[24..28], &1u32.to_le_bytes());
                 self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, 0]);
