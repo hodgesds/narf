@@ -657,6 +657,82 @@ impl Plan {
         }
         Ok(plan)
     }
+    /// RTL8851B (rtw8851b.c `rtw8851b_set_txpwr`, PHY_0) from the same
+    /// firmware TXPWR elements and fw.c selection as RTL8852C: the typed
+    /// B 2.4/5GHz 20/40/80MHz profile is restated as the identical C
+    /// geometry (center checked) and built by the same generic AX
+    /// `rtw89_phy_read_txpwr_{byrate,limit,limit_ru}` rules under regd WW
+    /// with no SAR/DAG. RTL8851B's static `rtw89_8851b_dflt_parms`
+    /// (rtw8851b_table.c) is not carried, so a container missing BYRATE,
+    /// the band's TXPWR_LMT / LMT_RU or TX_SHAPE_LMT is refused. Only
+    /// [`Self::visit_51`] may emit the result.
+    pub(super) fn from_elements_51(
+        elements: &[Element],
+        rfe: u8,
+        channel: super::operating_channel::Profile,
+    ) -> Result<Self, Error> {
+        use super::operating_channel::Width as BWidth;
+        let primary = channel.primary();
+        let c = match (channel.width(), channel.is_5ghz()) {
+            (BWidth::Mhz20, false) => Profile::new20(Band::Ghz2, primary),
+            (BWidth::Mhz20, true) => Profile::new20(Band::Ghz5, primary),
+            (BWidth::Mhz40, false) => Profile::new_2ghz_40(primary, channel.secondary_above()),
+            (BWidth::Mhz40, true) => Profile::new_wide(Band::Ghz5, primary, Width::Mhz40),
+            (BWidth::Mhz80, true) => Profile::new_wide(Band::Ghz5, primary, Width::Mhz80),
+            // rtw8851b.c `support_bandwidths` has no 160MHz (nor 2.4GHz 80).
+            _ => None,
+        }
+        .filter(|c| c.center() == channel.center() && c.primary() == primary)
+        .ok_or(Error::Policy)?;
+        Self::build(elements, rfe, c, None)
+    }
+    /// `rtw8851b_set_txpwr(chan, PHY_0)` then `rtw8851b_set_txpwr_ctrl`
+    /// as (absolute address, mask, value) writes in Linux order, for a
+    /// [`Self::from_elements_51`] plan. `rf_path_num` 1 bounds phy.c
+    /// `rtw89_phy_set_txpwr_byrate_ax` to nss 0 (CCK, OFDM, MCS, HEDCM: 7
+    /// words) and `_limit_ax` / `_limit_ru_ax` to the 1TX page;
+    /// `rtw8851b_set_tx_shape` is the 2.4GHz `rtw8851b_bb_set_tx_shape_dfir`
+    /// (full-word R_TXFIR0.. writes, same tables as B) and the OFDM
+    /// `R_DCFO_OPT` B_TXSHAPE_TRIANGULAR_CFG; `rtw8851b_set_txpwr_ref`
+    /// writes only the path-A 0x5804/0x5808 reference words.
+    pub(super) fn visit_51(
+        &self,
+        mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let pack = |b: &[i8]| u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8]);
+        for (i, w) in self.byrate[..28].chunks_exact(4).enumerate() {
+            emit(R_AX_PWR_BY_RATE + 4 * i as u32, u32::MAX, pack(w))?;
+        }
+        let mut offset = 0;
+        for (i, &v) in self.offset.iter().enumerate() {
+            offset |= (v as u8 as u32 & 0xf) << (4 * i);
+        }
+        emit(R_AX_PWR_RATE_OFST_CTRL, 0xf_ffff, offset)?;
+        if self.channel.band() == Band::Ghz2 {
+            let b = super::operating_channel::Profile::new(
+                narf_wireless::association::channel::Band::Ghz2,
+                self.channel.center(),
+            )
+            .ok_or(Error::Policy)?;
+            for (i, v) in b.cck_fir(self.shape[0]).into_iter().enumerate() {
+                emit(PHY + 0x2300 + 4 * i as u32, u32::MAX, v)?;
+            }
+        }
+        emit(PHY + 0x4494, 0x0300_0000, u32::from(self.shape[1]))?;
+        for (i, w) in self.limit[0].chunks_exact(4).enumerate() {
+            emit(R_AX_PWR_LMT + 4 * i as u32, u32::MAX, pack(w))?;
+        }
+        for (i, w) in self.ru[0].chunks_exact(4).enumerate() {
+            emit(R_AX_PWR_RU_LMT + 4 * i as u32, u32::MAX, pack(w))?;
+        }
+        // rtw8851b_set_txpwr_ref: B_AX_PWR_REF 0, then OFDM / CCK path A
+        // `rtw8851b_bb_cal_txpwr_ref(0)` = TSSI 172, PWR 312, REF 0.
+        emit(0xd200, 0x0fff_fc00, 0)?;
+        for a in [PHY + 0x5804, PHY + 0x5808] {
+            emit(a, 0x07ff_ffff, (172 << 18) | (312 << 9))?;
+        }
+        Ok(())
+    }
     fn build(
         elements: &[Element],
         rfe: u8,

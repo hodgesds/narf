@@ -4076,7 +4076,28 @@ skip it during scans as Linux does. No native caller yet. Unexecuted
 cases: `smoke_rtw89_n51_dpk_agc_on_and_restore_follow_rtw8851b`,
 `smoke_rtw89_n51_rfk_track_dpk_pwsf_and_lck_follow_rtw8851b`.
 
-**Remaining for the row.** Firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+**Firmware TX power (`radio_power_c::Plan::{from_elements_51,visit_51}`).**
+rtw8851b.c `rtw8851b_set_txpwr(PHY_0)` + `rtw8851b_set_txpwr_ctrl` from the
+container's TXPWR elements under the same fw.c
+`rtw89_fw_recognize_txpwr_from_elm` selection and `rtw89_fw_load_txpwr_*`
+entry rules as RTL8852C (aid 0, exact RFE else last default, extended or
+invalid entries skipped). The typed B profile is restated as the identical
+C geometry (center and primary checked; no 160MHz, no 2.4GHz 80MHz) and
+read by the generic AX phy.c byrate/limit/RU rules (regd WW, no SAR, no
+DAG). `rtw89_8851b_dflt_parms` is not carried, so a container missing
+BYRATE, the band's LMT / LMT_RU or TX_SHAPE_LMT is refused. `visit_51`
+emits with `rf_path_num` 1: byrate nss 0 only (7 words), the offset word,
+`rtw8851b_set_tx_shape` (2.4GHz `rtw8851b_bb_set_tx_shape_dfir`, full-word,
+the same flat/sharp/sharp_14 tables as B; `R_DCFO_OPT` [25:24] OFDM
+shape), the 1TX limit and RU pages, then `rtw8851b_set_txpwr_ref`
+(B_AX_PWR_REF 0, path-A 0x5804/0x5808 = TSSI 172 / PWR 312 / REF 0); no
+C bandedge/TSSI-DBW, SAR-diff or path-B writes. RTL8851B has no
+`RFK_NTFY_MCC_V0` firmware feature (fw.c feature table), so its RF notify
+is B's 20-byte `rtw89_fw_h2c_rf_ntfy_mcc` body (`command_native::radio`
+`mccch`). Unexecuted case:
+`smoke_rtw89_n51_set_txpwr_follows_rtw8851b_and_phy_ax`.
+
+**Remaining for the row.** the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)
