@@ -1315,7 +1315,10 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
     );
     assert_eq!(user.wire.load(4096, 2), b"xe");
     assert_eq!(u64_at(&user.wire.load(64, 64), 16), 2);
-    for (query, size) in [(0, 104), (1, 96), (2, 48), (3, 104), (5, 34)] {
+    // GT_TOPOLOGY: geometry and compute (header8 + mask4 each), GT0's L3 bank
+    // entry (header8 + mask8, always reported for a primary GT), then EU per
+    // DSS (header8 + mask2).
+    for (query, size) in [(0, 104), (1, 96), (2, 48), (3, 104), (5, 50)] {
         let mut wire = [0; 40];
         put32(&mut wire, 8, query);
         put64(&mut wire, 16, u64::MAX);
@@ -1373,7 +1376,13 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             _ => {
                 assert_eq!(&reply[..4], &[0, 0, 1, 0]);
                 assert_eq!(u32_at(&reply, 4), 4);
-                assert_eq!(&reply[24..28], &[0, 0, 5, 0]);
+                // load_l3_bank_mask's Xe2 branch: the model's MIRROR_FUSE3
+                // (1) enables no XE2_NODE_ENABLE_MASK node, so the mask is
+                // empty, and query_gt_topology still reports it.
+                assert_eq!(&reply[24..28], &[0, 0, 3, 0]);
+                assert_eq!(u32_at(&reply, 28), 8);
+                assert_eq!(&reply[32..40], &[0; 8]);
+                assert_eq!(&reply[40..44], &[0, 0, 5, 0]);
             }
         }
     }
