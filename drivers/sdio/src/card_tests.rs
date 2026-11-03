@@ -14,8 +14,16 @@ struct State {
     hold_disabled_ready: bool,
     refuse_irq_mask: bool,
     retire_on_ready: Option<Arc<crate::source::Lifetime>>,
+    pending_card_on_ready: bool,
+    gone_on_card_enable_readback: bool,
 }
 impl State {
+    fn data_commands(&self) -> usize {
+        self.commands
+            .iter()
+            .filter(|(command, _, _)| *command == 53)
+            .count()
+    }
     fn set32(&mut self, a: u32, v: u32) {
         self.registers[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -67,6 +75,8 @@ impl Model {
             hold_disabled_ready: false,
             refuse_irq_mask: false,
             retire_on_ready: None,
+            pending_card_on_ready: false,
+            gone_on_card_enable_readback: false,
         };
         s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
         s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
@@ -116,9 +126,20 @@ impl Registers for Model {
     }
     fn read32(&mut self, a: u32) -> u32 {
         let mut s = self.0.lock();
+        if a == INT_ENABLE
+            && s.gone_on_card_enable_readback
+            && s.get32(INT_ENABLE) & INT_CARD_INT != 0
+        {
+            return u32::MAX;
+        }
         if a == PRESENT_STATE {
             if let Some(owner) = s.retire_on_ready.take() {
                 owner.retire();
+            }
+            if s.pending_card_on_ready {
+                s.pending_card_on_ready = false;
+                let status = s.get32(INT_STATUS);
+                s.set32(INT_STATUS, status | INT_CARD_INT);
             }
         }
         if a == BUFFER {
@@ -743,14 +764,14 @@ fn smoke_sdio_scoped_command_rechecks_original_after_actual_readiness_wait() -> 
     let Ok(mut card) = Card::initialize(model, Config::default()) else {
         return TestResult::Fail("publication native card initialization");
     };
-    if card.enable_func(2).is_err() {
+    if card.enable_func(2).is_err() || card.observe_publication(4).is_err() {
         return TestResult::Fail("publication F2 enable");
     }
     let mut scope = Scope(SdioFunction::source(&card).unwrap());
-    let before = shared.lock().commands.len();
+    let before = shared.lock().data_commands();
     shared.lock().retire_on_ready = Some(card.live.clone());
     if card.cmd53_write_published(2, 0x8000, &[1; 4], &mut scope) != Err(SdioError::Denied)
-        || shared.lock().commands.len() != before
+        || shared.lock().data_commands() != before
         || !shared.lock().words.is_empty()
         || card.controller.is_failed()
     {
@@ -779,16 +800,16 @@ fn smoke_sdio_scoped_command_issued_scope_failure_keeps_original_native_owner_te
     let Ok(mut card) = Card::initialize(model, Config::default()) else {
         return TestResult::Fail("issued publication native card init");
     };
-    if card.enable_func(2).is_err() {
+    if card.enable_func(2).is_err() || card.observe_publication(4).is_err() {
         return TestResult::Fail("issued publication F2 enable");
     }
     let original = SdioFunction::source(&card).unwrap();
     let mut scope = Scope(original.clone());
-    let before = shared.lock().commands.len();
+    let before = shared.lock().data_commands();
     if card
         .cmd53_write_published(2, 0x8000, &[1; 4], &mut scope)
         .is_ok()
-        || shared.lock().commands.len() != before + 1
+        || shared.lock().data_commands() != before + 1
         || !card.controller.is_failed()
         || original.current().is_ok()
         || !shared.lock().words.is_empty()
@@ -829,7 +850,7 @@ fn smoke_sdio_scoped_command_actual_copy_and_each_command_scope_stay_distinct() 
     let Ok(mut card) = Card::initialize(model, Config::default()) else {
         return TestResult::Fail("copy publication native card init");
     };
-    if card.enable_func(2).is_err() {
+    if card.enable_func(2).is_err() || card.observe_publication(4).is_err() {
         return TestResult::Fail("copy publication F2 enable");
     }
     let mut scope = Scope {
@@ -855,4 +876,111 @@ fn smoke_sdio_scoped_command_actual_copy_and_each_command_scope_stay_distinct() 
 kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_scoped_command_actual_copy_and_each_command_scope_stay_distinct
+);
+
+fn smoke_sdio_block_publication_observes_late_card_interrupt_before_single_command() -> TestResult {
+    struct Scope(crate::source::Source);
+    impl crate::pio::Publication for Scope {
+        fn publish(&mut self, action: &mut dyn FnMut()) -> Result<(), HostError> {
+            self.0.invoke(action).map_err(|_| HostError::Denied)
+        }
+    }
+    let model = Model::new();
+    let shared = model.0.clone();
+    let Ok(mut card) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("block publication actual card initialization");
+    };
+    if card.enable_func(2).is_err()
+        || card.set_block_size(2, 512).is_err()
+        || card.observe_publication(4).is_err()
+    {
+        return TestResult::Fail("block publication actual F2/observer geometry");
+    }
+    let original = SdioFunction::source(&card).unwrap();
+    let mut scope = Scope(original.clone());
+    let mut bytes = [0; 1536];
+    bytes[..20].copy_from_slice(&[0x11; 20]);
+    let before = shared.lock().data_commands();
+    shared.lock().pending_card_on_ready = true;
+    if card.cmd53_block_write_published(2, 0x8000, 512, 3, &bytes, &mut scope)
+        != Err(SdioError::Busy)
+        || shared.lock().data_commands() != before
+        || !shared.lock().words.is_empty()
+        || card.controller.is_failed()
+        || original.current().is_err()
+        || shared.lock().get32(INT_STATUS) & INT_CARD_INT == 0
+    {
+        return TestResult::Fail(
+            "late actual CARD_INT published old block DATA or poisoned unissued owner",
+        );
+    }
+    if card.clear_publication_pending().is_err()
+        || card
+            .cmd53_block_write_published(2, 0x8000, 512, 3, &bytes, &mut scope)
+            .is_err()
+    {
+        return TestResult::Fail("fresh block scope did not copy one full native transfer");
+    }
+    {
+        let state = shared.lock();
+        let issued: Vec<_> = state
+            .commands
+            .iter()
+            .filter(|(cmd, _, _)| *cmd == 53)
+            .collect();
+        if issued.len() != before + 1
+            || state.words.len() != 384
+            || issued.last().is_none_or(|(_, argument, mode)| {
+                argument & (1 << 27) == 0 || argument & 511 != 3 || mode & TRNS_MULTI == 0
+            })
+            || state.words[..5] != [0x11111111; 5]
+            || state.words[5..].iter().any(|word| *word != 0)
+            || state.get32(SIGNAL_ENABLE) & INT_CARD_INT != 0
+            || state.common[CCCR_INT_ENABLE as usize] & 5 != 5
+        {
+            return TestResult::Fail(
+                "block copy invented geometry/padding, split COMMAND or CPU IRQ grant",
+            );
+        }
+    }
+    // A stale retained block size cannot authorize a changed physical FBR.
+    if card
+        .cmd52_write(0, fbr_base(2) + FBR_BLKSZ_0 + 1, 1)
+        .is_err()
+    {
+        return TestResult::Fail("block geometry fault injection");
+    }
+    let before = shared.lock().data_commands();
+    if card
+        .cmd53_block_write_published(2, 0x8000, 512, 3, &bytes, &mut scope)
+        .is_ok()
+        || shared.lock().data_commands() != before
+    {
+        return TestResult::Fail("changed actual FBR geometry published native block transfer");
+    }
+    // Removal on the actual final status-enable readback cannot fabricate
+    // an observer receipt even though every bit of all-ones is set.
+    let model = Model::new();
+    let shared = model.0.clone();
+    let Ok(mut card) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("disappearing observer card initialization");
+    };
+    if card.enable_func(2).is_err() {
+        return TestResult::Fail("disappearing observer F2 enable");
+    }
+    shared.lock().gone_on_card_enable_readback = true;
+    if card.observe_publication(4) != Err(SdioError::HostError) || card.observing != 0 {
+        return TestResult::Fail("all-ones final INT_ENABLE fabricated publication observer");
+    }
+    let before = shared.lock().data_commands();
+    if card.cmd53_write_published(2, 0x8000, &[1; 4], &mut scope) != Err(SdioError::Unsupported)
+        || shared.lock().data_commands() != before
+    {
+        return TestResult::Fail("absent observer receipt admitted native publication");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_block_publication_observes_late_card_interrupt_before_single_command
 );

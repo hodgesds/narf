@@ -18,6 +18,8 @@ pub enum Error {
     Invalid,
     /// Original fixed scope refused before actual COMMAND action.
     Denied,
+    /// Native CARD_INT became pending before COMMAND; apply prefix first.
+    Busy,
     Failed,
     Gone,
     Timeout,
@@ -177,12 +179,15 @@ impl<R: Registers> Controller<R> {
         response: Response,
         data: Option<Data<'_>>,
     ) -> Result<u32, Error> {
-        self.execute_published(
+        self.execute_mode(
             command,
             argument,
             response,
             data,
-            &mut publication::Immediate,
+            publication::Mode {
+                scope: &mut publication::Immediate,
+                observe_pending: false,
+            },
         )
     }
     pub fn execute_published(
@@ -190,8 +195,27 @@ impl<R: Registers> Controller<R> {
         command: u8,
         argument: u32,
         response: Response,
-        mut data: Option<Data<'_>>,
+        data: Option<Data<'_>>,
         scope: &mut dyn Publication,
+    ) -> Result<u32, Error> {
+        self.execute_mode(
+            command,
+            argument,
+            response,
+            data,
+            publication::Mode {
+                scope,
+                observe_pending: true,
+            },
+        )
+    }
+    fn execute_mode(
+        &mut self,
+        command: u8,
+        argument: u32,
+        response: Response,
+        mut data: Option<Data<'_>>,
+        mode: publication::Mode<'_>,
     ) -> Result<u32, Error> {
         if self.failed {
             return Err(Error::Failed);
@@ -211,8 +235,11 @@ impl<R: Registers> Controller<R> {
                 return Err(Error::Invalid);
             }
         }
-        let result = self.execute_inner(command, argument, response, &mut data, shape, scope);
-        if result.as_ref().is_err_and(|error| *error != Error::Denied) {
+        let result = self.execute_inner(command, argument, response, &mut data, shape, mode);
+        if result
+            .as_ref()
+            .is_err_and(|error| !matches!(*error, Error::Denied | Error::Busy))
+        {
             self.live.retire();
             self.failed = true;
         }
@@ -226,7 +253,7 @@ impl<R: Registers> Controller<R> {
         response: Response,
         data: &mut Option<Data<'_>>,
         shape: Option<(usize, u16, bool)>,
-        scope: &mut dyn Publication,
+        mode: publication::Mode<'_>,
     ) -> Result<u32, Error> {
         let inhibit = PS_CMD_INHIBIT
             | if shape.is_some() || matches!(response, Response::Busy) {
@@ -254,20 +281,20 @@ impl<R: Registers> Controller<R> {
             Response::Short | Response::R5 => CMD_RESP_SHORT | CMD_CRC | CMD_INDEX,
             Response::Busy => CMD_RESP_SHORT_BUSY | CMD_CRC | CMD_INDEX,
         };
-        let mut mode = 0;
+        let mut transfer_mode = 0;
         if let Some((len, block_size, read)) = shape {
             let blocks = len / block_size as usize;
             self.io.write16(BLOCK_SIZE, block_size);
             self.io.write16(BLOCK_COUNT, blocks as u16);
-            mode = TRNS_BLK_CNT_EN
+            transfer_mode = TRNS_BLK_CNT_EN
                 | if read { TRNS_READ } else { 0 }
                 | if blocks > 1 { TRNS_MULTI } else { 0 };
             flags |= CMD_DATA;
         }
         // SDIO CMD53 never uses the memory-card auto-CMD12/CMD23 paths.
         self.io.write32(ARGUMENT, argument);
-        self.io.write16(TRANSFER_MODE, mode);
-        publication::issue(&mut self.io, make_cmd(command, flags), scope)?;
+        self.io.write16(TRANSFER_MODE, transfer_mode);
+        publication::issue(&mut self.io, make_cmd(command, flags), mode)?;
         self.wait(Deadline::after_us(COMMAND_TIMEOUT_US), |io| {
             Ok(Self::status(io)? & INT_RESPONSE != 0)
         })?;

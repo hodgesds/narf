@@ -120,6 +120,27 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   retirement gate plus a nonreviving atomic terminal latch: normal retire
   serializes against publication, while actual MMIO failure inside its own
   short action latches denial without recursively acquiring that gate.
+- Published writes additionally require `observe_publication(function_mask)`
+  to establish actual CCCR master/function interrupt-enable and SDHCI
+  CARD_INT status-enable readbacks. It installs no CPU route or callback.
+  The Card retains the exact observed function mask; every scoped transfer
+  rechecks that function's actual CCCR bits. After all hardware waits, the
+  final fixed publication action reads actual host status-enable and
+  INT_STATUS immediately before COMMAND. A pending CARD_INT returns `Busy`
+  without COMMAND/FIFO or controller poison. An absent enable or retired
+  source refuses the unissued operation. Command/data W1C handling preserves
+  the independent CARD_INT latch. `clear_publication_pending` acknowledges
+  only that latch before a fresh family mailbox read; it never proves an
+  empty native prefix by itself.
+- `cmd53_block_write_published` admits one exact size/count extent under
+  the same original scope, with actual current FBR block-size readbacks in
+  addition to retained CIS/function bounds. It does not split or restart
+  a frame. Unknown adapters default to `Unsupported`. A new native Card
+  case observes late CARD_INT denial, one actual three-block COMMAND and
+  FIFO copy including its zero tail, polling-only status observation and
+  refusal after physical FBR geometry changes. Existing scoped byte cases
+  retain native source/issued-terminal assertions, accounting read-only
+  CCCR proof commands separately from forbidden CMD53 publication.
 - The `kernel-test` feature also enables bus ECAM fixture support. Four
   written publication cases exercise actual NativeMmio under its original
   scope, late original loss after readiness, attempted-command failure and

@@ -26,6 +26,8 @@ pub enum SdioError {
     Unsupported,
     /// Fixed original scope denied before native COMMAND publication.
     Denied,
+    /// Actual pending native card prefix, definitely no new COMMAND issued.
+    Busy,
 }
 
 impl core::fmt::Display for SdioError {
@@ -39,6 +41,7 @@ impl core::fmt::Display for SdioError {
             SdioError::AddressOverflow => f.write_str("address overflow"),
             SdioError::Unsupported => f.write_str("unsupported transfer mode"),
             SdioError::Denied => f.write_str("original publication scope retired"),
+            SdioError::Busy => f.write_str("native card input pending"),
         }
     }
 }
@@ -78,6 +81,28 @@ pub trait SdioFunction {
         &mut self,
         _func: u8,
         _addr: u32,
+        _buf: &[u8],
+        _scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Actual status-only card interrupt observation, including polling
+    /// hosts. No CPU callback/IRQ route or RF authority is installed.
+    fn observe_publication(&mut self, _functions: u8) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+    /// Clear only the original CARD_INT latch before a fresh physical
+    /// mailbox observation; this alone is never an empty-prefix receipt.
+    fn clear_publication_pending(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+    fn cmd53_block_write_published(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _block_size: u16,
+        _block_count: u16,
         _buf: &[u8],
         _scope: &mut dyn crate::pio::Publication,
     ) -> Result<(), SdioError> {
