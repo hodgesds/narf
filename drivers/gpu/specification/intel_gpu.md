@@ -2400,7 +2400,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification. Protected queues stay unadvertised: PXP_TYPE, the PXP status query and BO PXP_TYPE now refuse with Linux's no-PXP errnos (HWDRM ENODEV, NONE accepted); PXP needs the GSC proxy's MEI/CSME client, which NARF lacks. GSCCS0 is now a kernel-only (reserved) engine of the MTL/Arrow media GuC under both media and GSC options, never queryable or placeable |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. The MEI GSC proxy client, PXP, GT1 frequency/idle sysfs and silicon acceptance remain |
-| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap checks (mapping itself ENODEV pending a private device-PFN syscall path), `metrics/<uuid>/id` and `dev.xe.observation_paranoid` implemented; OAR/OAC exec-queue streams, OA syncs, the OA buffer mapping, media-GT OAM, steered manual capture, coredump process/time facts and remaining i915 perf interfaces remain |
+| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap (read-only private PFN mapping with VM_DONTCOPY/VM_DONTEXPAND semantics in the syscall layer), `metrics/<uuid>/id`, `dev.xe.observation_paranoid` and i915 GETPARAM 57 implemented; OAR/OAC exec-queue streams, OA syncs, media-GT OAM, steered manual capture, coredump process/time facts and remaining i915 perf interfaces (PERF_OPEN, ADD/REMOVE_CONFIG, query item 3, PERF_REVISION) remain |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -6208,3 +6208,82 @@ and now asserts version 4 or 0x27d3c0:
 - `smoke_coredump_live_gt_capture_stop_and_authority_loss`
 - `smoke_hardware_coredump_execution_timeout_snapshot_survives_full_reset`
 - `smoke_hardware_vm_dump_retains_closed_user_bo_through_capture_and_full_reset`
+
+### OA buffer mapping and the i915 OA timestamp frequency — native fixtures added
+
+Sources are Linux b90c984d `xe_oa.c::xe_oa_mmap`, `mm/memory.c`
+(`remap_pfn_range`), `mm/mmap.c::dup_mmap`, `mm/mremap.c::check_prep_vma`,
+`i915_getparam.c` and `i915_perf.c::i915_perf_oa_timestamp_frequency`.
+
+**The syscall-layer mapping.** `xe_oa_mmap` sets `VM_PFNMAP`,
+`VM_DONTEXPAND`, `VM_DONTDUMP` and `VM_DONTCOPY`, clears `VM_MAYWRITE` and
+`VM_MAYEXEC`, and then runs `remap_pfn_range` over the BO's pages. NARF's
+syscall layer gained the matching mapping without a memory/ (TCB) change. A
+file returns `Some(PrivatePfnMap { dont_copy })` from the new
+`FileOps::mmap_private_pfn`. A `MAP_PRIVATE` request that passes the file's
+`validate_mmap` is then mapped from `mmap_backing` as a borrowed, read-only
+region. It keeps the usual owner row (file plus lifetime token), and nothing
+is copied through `read()`. A provider whose request or `mmap_max_prot`
+admits write or exec is refused with ENODEV, since there is no
+copy-on-write over borrowed frames. The owner row keeps the flags across
+splits and moves:
+
+- mprotect cannot add write or exec (EACCES).
+- mremap growth is EFAULT. DONTUNMAP and an `old_len` of 0 (a private
+  duplicate) are EINVAL. Shrinking and same-size moves proceed.
+- With `dont_copy`, memory's fork hook withholds the owner row from the
+  child. `sys_fork` and the non-`CLONE_VM` clone then call
+  `mapped_file::finish_fork_address_space`, which punches the range from
+  the child's region copy before the child can run, as `dup_mmap` clears
+  the VMA. The punch frees no borrowed frame.
+- Shared futex keying treats the range as private.
+
+**The OA buffer.** A request that passes the unchanged `xe_oa_mmap` checks
+now maps the stream's first buffer-size pages of the 16 MiB reservation from
+the VMA start, write-back. As in the source, the offset is ignored.
+`GpuBacking::host_frame` supplies the pages; only `FrameBacking` has them, so
+model and device-local backings stay ENODEV. Each mapping holds a token on
+the unit's page set. Because the mapping also holds the file, close(fd)
+keeps the stream and its exclusive unit until munmap, as `vm_file` does.
+Once the unit releases the reservation after a GT reset, suspend or
+teardown, new mappings are ENODEV. A unit released while a token lives never
+returns the reservation to its allocator. The 16 MiB GGTT range stays
+quarantined, where Linux would keep the BO until the last VMA closes.
+
+NARF gaps: `/proc/<pid>/maps` prints the range as shared (`s`), not `p`,
+because the region uses borrowed-frame ownership. There is no `VM_DONTDUMP`
+counterpart. madvise does not apply Linux's `VM_PFNMAP` refusals, such as
+EINVAL for `MADV_DONTNEED`.
+
+**GETPARAM 57.** `I915_PARAM_OA_TIMESTAMP_FREQUENCY` now returns
+`i915_perf_oa_timestamp_frequency`: the CS reference clock, shifted by
+RPM_CONFIG0's CTC shift on 12.55 and 12.70–12.74 (Wa_18013179988). As in
+i915, it does not depend on i915 perf or the OA opt-in. The source reads
+RPM_CONFIG0 on every call. NARF samples it once with the clock in
+`DeviceFacts::oa_timestamp_frequency`, and both are ENODEV without published
+facts. GETPARAM 54 (PERF_REVISION) stays 0 while PERF_OPEN is absent.
+
+**Still open.** These remain as the previous subsection records:
+
+- Media-GT OAM. It needs a media-GT OA unit with its own reservation, the
+  OAM register block at the media GSI offset, a second query-8 unit, and
+  privileged kernel LRI jobs on the media GuC, whose scheduler has no
+  kernel-command submission yet.
+- DRM_I915_PERF_OPEN, ADD_CONFIG, REMOVE_CONFIG and query item 3.
+
+Fixtures, all unexecuted in this slice:
+
+- `smoke_abi_private_pfn_mmap_readonly_dontcopy_dontexpand` (new,
+  `syscall_abi`). It drives `sys_mmap`, `mprotect`, `mremap`, fork
+  completion, close, munmap and address-space teardown over a
+  driver-shaped file.
+- `smoke_oa_mmap_pages_hold_stream_and_survive_unit_release` (new). It
+  covers the frames and offset rule, holds across close, reopen after the
+  last unmap, and reset release with and without a live mapping.
+- `smoke_oa_mmap_source_checks_then_private_pfn_backing`. This is the
+  renamed `smoke_oa_mmap_source_checks_and_private_pfn_refusal`: a passing
+  request now validates, and a backing without host pages is ENODEV at
+  `mmap_backing`.
+- `smoke_i915_observed_discovery_and_immutable_facts_after_loss` and
+  `smoke_i915_discovery_missing_cross_platform_and_faulted_copies` now also
+  cover GETPARAM 57.
