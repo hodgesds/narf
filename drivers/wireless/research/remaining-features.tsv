@@ -64,7 +64,6 @@ rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/w
 rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	2201
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	2203
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	2204
-rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	2246
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2198
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	2247
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2257
