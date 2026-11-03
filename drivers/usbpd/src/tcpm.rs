@@ -278,6 +278,20 @@ impl SourcePort {
             .store(capable as u8, Ordering::Release);
     }
 
+    /// Set the data-role flag directly. Used by the port driver to
+    /// carry the role across a PR_Swap (see `SinkPort::set_dfp`).
+    pub fn set_dfp(&self, dfp: bool) {
+        self.is_dfp
+            .store(if dfp { 1 } else { 0 }, Ordering::Release);
+    }
+
+    /// Set the VConn-supplier flag directly. Same carry-across-a-
+    /// swap rationale as `set_dfp`.
+    pub fn set_vconn_supplier(&self, supplying: bool) {
+        self.is_vconn_supplier
+            .store(if supplying { 1 } else { 0 }, Ordering::Release);
+    }
+
     fn set_state(&self, s: SourceState) {
         self.state.store(s as u8, Ordering::Release);
     }
@@ -1040,7 +1054,7 @@ pub enum PortStepOutcome {
     /// until the partner clears it.
     BistEntered,
     /// Power role just flipped — we were sourcing and are now a sink
-    /// (or vice-versa, once Stage-2's sink-side PR_Swap lands).
+    /// (or vice-versa).
     RoleSwapped(PortState),
     /// Data role just flipped — UFP/DFP toggled.
     DataRoleSwapped {
@@ -1079,10 +1093,14 @@ impl TcpmPort {
         source_policy: SourcePolicy,
         label: String,
     ) -> Self {
-        let _ = sink_policy; // sink policy lives in the engine via
-                             // narf_usbpd's default; Stage-2 will
-                             // make narf_usbpd::SinkPort policy-driven.
         let sink = Arc::new(SinkPort::new(tcpc.clone()));
+        // The sink engine's swap policy is driven by the drivers-side
+        // SinkPolicy accept flags (previously ignored here).
+        sink.set_swap_policy(narf_usbpd::tcpm::SinkSwapPolicy {
+            accept_pr_swap: sink_policy.accept_pr_swap,
+            accept_dr_swap: sink_policy.accept_dr_swap,
+            accept_vconn_swap: sink_policy.accept_vconn_swap,
+        });
         let source = Arc::new(SourcePort::new(tcpc.clone(), source_policy));
         Self {
             tcpc,
@@ -1160,6 +1178,25 @@ impl TcpmPort {
                     StepOutcome::Ready { contract } => PortStepOutcome::SinkReady(contract),
                     StepOutcome::Advanced(_) => PortStepOutcome::Advanced(PortState::AttachedSnk),
                     StepOutcome::Idle(_) => PortStepOutcome::Idle(PortState::AttachedSnk),
+                    StepOutcome::RoleSwappedToSource => {
+                        // The sink completed a PR_Swap and is now
+                        // logically a source. Data role and VConn
+                        // supply are port-level properties, not
+                        // per-engine state, so the source engine
+                        // inherits them before it starts stepping
+                        // from Startup.
+                        self.source.set_dfp(self.sink.is_dfp());
+                        self.source
+                            .set_vconn_supplier(self.sink.is_vconn_supplier());
+                        self.set_state(PortState::AttachedSrc);
+                        PortStepOutcome::RoleSwapped(PortState::AttachedSrc)
+                    }
+                    StepOutcome::DataRoleSwapped { now_dfp } => {
+                        PortStepOutcome::DataRoleSwapped { now_dfp }
+                    }
+                    StepOutcome::VconnSwapped { now_supplying } => {
+                        PortStepOutcome::VconnSwapped { now_supplying }
+                    }
                 })
             }
             PortState::AttachedSrc => {
@@ -1181,7 +1218,12 @@ impl TcpmPort {
                         // The source completed a PR_Swap and is now
                         // logically a sink. Move the port-level state
                         // to AttachedSnk and let the sink engine pick
-                        // up from Unattached on the next step.
+                        // up from Unattached on the next step. Data
+                        // role and VConn supply carry across, as in
+                        // the reverse transition.
+                        self.sink.set_dfp(self.source.is_dfp());
+                        self.sink
+                            .set_vconn_supplier(self.source.is_vconn_supplier());
                         self.set_state(PortState::AttachedSnk);
                         PortStepOutcome::RoleSwapped(PortState::AttachedSnk)
                     }
@@ -1249,6 +1291,31 @@ impl TcpmPort {
             return false;
         }
         self.source.initiate_vconn_swap()
+    }
+
+    /// Ask the sink engine to initiate a PR_Swap. Only legal while
+    /// the port is `AttachedSnk` with the sink in `Ready`.
+    pub fn initiate_sink_pr_swap(&self) -> bool {
+        if !matches!(self.state(), PortState::AttachedSnk) {
+            return false;
+        }
+        self.sink.initiate_pr_swap()
+    }
+
+    /// Ask the sink engine to initiate a DR_Swap.
+    pub fn initiate_sink_dr_swap(&self) -> bool {
+        if !matches!(self.state(), PortState::AttachedSnk) {
+            return false;
+        }
+        self.sink.initiate_dr_swap()
+    }
+
+    /// Ask the sink engine to initiate a VConn_Swap.
+    pub fn initiate_sink_vconn_swap(&self) -> bool {
+        if !matches!(self.state(), PortState::AttachedSnk) {
+            return false;
+        }
+        self.sink.initiate_vconn_swap()
     }
 }
 

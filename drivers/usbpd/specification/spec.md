@@ -57,6 +57,14 @@ exists to avoid competing with firmware for the same controller.
   `entered_eudo`). Production task registration is a follow-up —
   real entry parameters must come from host capabilities and SOP'
   cable discovery, not fixture values.
+- `TcpmPort` drives both power-role engines and routes role swaps:
+  `initiate_{pr,dr,vconn}_swap` for the source engine,
+  `initiate_sink_{pr,dr,vconn}_swap` for the sink engine. A completed
+  PR_Swap flips the port-level state (`AttachedSrc` ↔ `AttachedSnk`)
+  and the contract is renegotiated from scratch; data role and VConn
+  supply carry across the swap. Sink swap answers are policy-gated by
+  the `SinkPolicy` accept flags, wired into the sink engine at
+  `TcpmPort` construction (default: reject all).
 
 ## 4. Invariants
 
@@ -100,7 +108,7 @@ Lenovo firmware has not been exercised by this change.
 
 ## 8. Open work
 
-Broader platform quirks and role-swap interfaces.
+Broader platform quirks.
 GPU source modesetting and native USB4 tunneling are separate subsystems.
 EPR follow-ups: EPR_Source_Capabilities / EPR_Sink_Capabilities extended-message
 transport (§6.5.15) for EPR contract advertisement after entry; sink-side EPR

@@ -52,7 +52,12 @@ point.**
   (Unattached → AttachWait → Attached → Startup → Discovery →
   WaitCaps → EvaluateCaps → SelectCapability → TransitionSink →
   Ready). Lands a `Contract { object_position, voltage_mv,
-  op_current_ma }` on PS_RDY.
+  op_current_ma }` on PS_RDY. In `Ready` the sink answers
+  partner-initiated PR_Swap / DR_Swap / VConn_Swap per the swap
+  policy (default: reject all) and can initiate swaps itself; a
+  completed PR_Swap flips the port to source role and the contract
+  is renegotiated from scratch. Data role and VConn-supplier flags
+  are port-level properties carried across a swap.
 - **`vdm`** — VDM header codec (USB-PD §6.4.4), DiscoverIdentity /
   DiscoverSVIDs / DiscoverModes / EnterMode / Attention builders.
   DP_Capabilities / DP_Status / DP_Configure VDO codecs (VESA DP
@@ -80,7 +85,6 @@ point.**
     Discover Identity request that targets a cable plug.
 
 ### Out of scope (deliberate)
-- Power Role Swap, Data Role Swap, VCONN Swap.
 - Thunderbolt Alt Mode (Intel-specific spec, not in this crate's
   scope).
 - Concrete TCPC drivers — see `narf-drivers-usbpd` for FUSB302.
