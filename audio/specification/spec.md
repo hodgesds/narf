@@ -200,12 +200,14 @@ glitchless bank switching mid-stream is out of scope.
 `acp63_sdw::probe`, `register_pci_driver`, `is_probed`, `capture_card`
 bind the ACP 6.3 function's SDW0 manager for pin configurations without
 PDM (the PDM probe declines those, and this driver is the next candidate
-for the function — but note the dispatcher dependency: `probe_all` as
-of this writing attempts only the single best match per device, so
-this binding is inert until the candidate-walking dispatcher (PR #852)
-is on main; required merge order is #852 before this binding.
-Configurations where PDM and SoundWire coexist stay with the PDM
-binding). Probe powers the ACP up, initialises the manager (enable,
+for the function under the candidate-walking dispatcher, PR #852, which
+is on main). Configurations where PDM and SoundWire coexist compose
+through the PDM probe instead: after claiming the function it calls
+`acp63_sdw::bind_composed`, which runs the manager init + enumeration
+on the already-powered block and publishes any codecs found alongside
+the PDM capture card (#871); SDW presence on a PDM wiring is
+enumeration, not a pin bit, and a failed composition just means
+PDM-only. Probe powers the ACP up, initialises the manager (enable,
 bus reset, 50×10 frame shape, interrupt masks), enumerates, and
 publishes one sound card per enumerated codec through the registry,
 using the generic codec profile (DP1 sink + DP1 source, stereo S16LE
@@ -328,11 +330,11 @@ proofs, not evidence of audible playback or microphone quality on Lenovo 50ee.
 Physical validation must establish the actual HDA codec, BIOS route quality,
 jack behavior and whether speaker amplifiers need a model-specific quirk.
 HDMI/DP and system power-transition reinitialization remain separate
-implementation work. SoundWire follow-ups to #780 remain: PDM+SoundWire coexisting ACP pin
-configurations, Intel DSP/SOF-owned SoundWire links, and vendor codec
-profiles (jack/amp sequences) beyond the generic conversation. The ACP
-SDW DMA payload engine has landed (#870), but its channel programming
-still needs validation on silicon against the Linux `ps-sdw-dma.c`
-register map (see §3.2). PCM pause/resume preserves DMA buffers and position.
+implementation work. SoundWire follow-ups to #780 remain: Intel
+DSP/SOF-owned SoundWire links, and vendor codec profiles (jack/amp
+sequences) beyond the generic conversation. The ACP SDW DMA payload
+engine has landed (#870), but its channel programming still needs
+validation on silicon against the Linux `ps-sdw-dma.c` register map
+(see §3.2). PCM pause/resume preserves DMA buffers and position.
 The shared sound bridge supplies Linux ALSA ioctl/mmap/poll for the registered
 native endpoints, subject to its documented feature limits.
