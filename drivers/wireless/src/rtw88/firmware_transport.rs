@@ -7,6 +7,19 @@ use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::FirmwareError;
 #[path = "runtime_lps.rs"]
 pub(super) mod runtime_lps;
+/// Outcome of one power-save H2C publication attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PsSubmit {
+    /// The HMEBOX low word was written under the original source.
+    Issued,
+    /// Native RX/TX/command prefix advanced after extended-word staging; no
+    /// command was published. The caller retires that prefix and may retry.
+    Unissued,
+}
+/// Encloses the final native publication check/write in the caller's
+/// original PS source; it must invoke the operation at most once.
+pub(super) type PsScope<'a> =
+    dyn FnMut(&mut dyn FnMut() -> Result<bool, Error>) -> Result<bool, Error> + 'a;
 const HEADER: usize = 64;
 const CHECKSUM: usize = 8;
 const MAX_IMAGE: usize = 1024 * 1024;
@@ -456,6 +469,14 @@ pub(super) unsafe trait Io: Send {
     }
     fn mailbox_pending(&self) -> bool {
         false
+    }
+    /// Power-save H2C only, Linux fw.c `rtw_fw_send_h2c_command`: stage
+    /// HMEBOX_EXT, then run `scope` around the final current native checks
+    /// and the HMEBOX low-word write that actually publishes the command.
+    /// `Unissued` (and any error before that write) means firmware never saw
+    /// a command; the extended-only staging is overwritten by a retry.
+    fn ps_mailbox_submit(&mut self, _: [u8; 8], _: &mut PsScope<'_>) -> Result<PsSubmit, Error> {
+        Err(Error::Unsupported)
     }
     fn packet_prepare(&mut self, _: [u8; 6], _: u8) -> Result<(), super::packet_core::Error> {
         Err(super::packet_core::Error::State)

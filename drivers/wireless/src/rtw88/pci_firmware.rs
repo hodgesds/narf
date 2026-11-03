@@ -1354,6 +1354,79 @@ unsafe impl Registers for Native {
         }
         result
     }
+    fn ps_mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+        scope: &mut super::firmware_transport::PsScope<'_>,
+    ) -> Result<super::firmware_transport::PsSubmit, Error> {
+        use super::firmware_transport::PsSubmit;
+        // Linux fw.c rtw_fw_send_h2c_command: HMETFR box free, then
+        // HMEBOX_EXT (w1), then HMEBOX (w0). Firmware latches the command on
+        // the low-word write only, so the extended staging alone is inert.
+        if self.state != State::Packets || !self.mailbox_ready()? {
+            return Err(Error::State);
+        }
+        self.check_packet_permission()?;
+        let cursor = self.mailbox_cursor;
+        let bit = 1u8 << cursor;
+        let ext = u32::from_le_bytes(words[4..].try_into().unwrap());
+        let body = u32::from_le_bytes(words[..4].try_into().unwrap());
+        self.mailbox_pending = true;
+        let mut published = false;
+        let result = self
+            .write32(0x1f0 + u16::from(cursor) * 4, ext)
+            .and_then(|()| {
+                // Original PS source, actual native Core RX-prefix receipt and
+                // TX/command quiescence are rechecked after staging, immediately
+                // before the publishing low word. New peer-loss/key/control RX in
+                // this gap leaves the command unissued.
+                scope(&mut || {
+                    if self.state != State::Packets || self.command_ring.pending() {
+                        return Err(Error::State);
+                    }
+                    let state = self.read8(0x1cc)?;
+                    if state == 255 {
+                        return Err(Error::Gone);
+                    }
+                    if state & bit != 0 {
+                        return Err(Error::State);
+                    }
+                    if !self
+                        .with_packet(|core, port| {
+                            core.maintenance_quiet(|r| super::packet_core::Port::index(port, r))
+                        })
+                        .map_err(|_| Error::State)?
+                    {
+                        return Ok(false);
+                    }
+                    self.check_packet_permission()?;
+                    published = true;
+                    self.write32(0x1d0 + u16::from(cursor) * 4, body)?;
+                    Ok(true)
+                })
+            });
+        match result {
+            Ok(true) if published => Ok(PsSubmit::Issued),
+            Ok(false) if !published => {
+                self.mailbox_pending = false;
+                Ok(PsSubmit::Unissued)
+            }
+            Err(e) if !published => {
+                self.mailbox_pending = false;
+                Err(e)
+            }
+            // Low word written (or the scope misreported): ownership of the
+            // mailbox is ambiguous; never retry it.
+            Ok(_) => {
+                self.state = State::Terminal;
+                Err(Error::State)
+            }
+            Err(e) => {
+                self.state = State::Terminal;
+                Err(e)
+            }
+        }
+    }
     fn mailbox_consumed(&mut self) -> Result<bool, Error> {
         if !matches!(self.state, State::Calibrated | State::Packets) || !self.mailbox_pending {
             return Err(Error::State);

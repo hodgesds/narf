@@ -255,3 +255,99 @@ kernel_test_in!(
     "drivers/wireless/rtw88/ps",
     smoke_rtw8821ce_lps_private_ccmp_rx_is_preserved_until_confirmed_awake
 );
+
+/// Input/source loss after HMEBOX_EXT staging and before the low-word write
+/// that publishes LPS entry: the staged extension is not a command.
+fn smoke_rtw8821ce_lps_input_or_source_loss_after_ext_staging_leaves_entry_unissued() -> TestResult
+{
+    let enter = [0x20, 1, 0x21, 1, 0, 0, 0, 0];
+    for revoke in [false, true] {
+        let (h, cap, host) = match setup(true, 3) {
+            Ok(h) => h,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let port = h.port.clone();
+        h.port.0.lock().ps_gap = Some((
+            [0x20, 1],
+            Arc::new(move || {
+                if revoke {
+                    cap.revoke();
+                } else {
+                    // AP deauthentication arrives in the staging gap.
+                    let mut deauth = vec![0xc0, 0, 0, 0];
+                    deauth.extend_from_slice(&OWN);
+                    deauth.extend_from_slice(&AP);
+                    deauth.extend_from_slice(&AP);
+                    deauth.extend_from_slice(&[0x10, 0, 7, 0]);
+                    port.0.lock().packet_model.receive(&deauth, false, false);
+                }
+            }),
+        ));
+        if sleep(&h, host).is_ok() || !h.device.closed() {
+            return TestResult::Fail("LPS entry survived peer/source loss in the H2C gap");
+        }
+        let m = h.port.0.lock();
+        if m.ps_gap.is_some()
+            || !m.ps_staged.contains(&enter)
+            || m.mailboxes.contains(&enter)
+            || m.bytes[0x604] & 0x80 != 0
+        {
+            return TestResult::Fail("extended-only LPS staging published or retried entry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw8821ce_lps_input_or_source_loss_after_ext_staging_leaves_entry_unissued
+);
+
+/// Benign protected DATA in the wake-command gap: the command stays unissued,
+/// the RX prefix is retained privately, then the wake H2C is staged again and
+/// published exactly once.
+fn smoke_rtw8821ce_lps_rx_in_wake_h2c_gap_retries_unissued_once_and_keeps_data() -> TestResult {
+    let wake = [0x20, 0, 0, 1, 0, 0x0c, 0, 0];
+    let (h, _, host) = match setup(true, 3) {
+        Ok(h) => h,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let plan = h.peer.lock().plan;
+    let bytes = narf_wifi_fixtures::udp_ipv4(
+        OWN,
+        AP,
+        plan.server_ip,
+        plan.lease_ip,
+        7,
+        49152,
+        b"native-CCMP-in-wake-gap",
+    );
+    let frame = match h.peer.lock().downlink(&bytes) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let port = h.port.clone();
+    h.port.0.lock().ps_gap = Some((
+        [0x20, 0],
+        Arc::new(move || port.0.lock().packet_model.receive(&frame, false, false)),
+    ));
+    if sleep(&h, host).is_err() {
+        return TestResult::Fail("unissued wake H2C was not retried after RX retirement");
+    }
+    {
+        let m = h.port.0.lock();
+        if m.ps_staged.iter().filter(|w| **w == wake).count() != 2
+            || m.mailboxes.iter().filter(|w| **w == wake).count() != 1
+        {
+            return TestResult::Fail("wake H2C published twice or without restaging");
+        }
+    }
+    h.pump();
+    if !h.received().contains(&bytes) {
+        return TestResult::Fail("gap RX lost across unissued wake retry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw8821ce_lps_rx_in_wake_h2c_gap_retries_unissued_once_and_keeps_data
+);

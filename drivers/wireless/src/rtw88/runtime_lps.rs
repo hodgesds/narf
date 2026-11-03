@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Explicit bounded nondeep LPS under the exact original retained station.
 use crate::rtw88::{
-    firmware_transport::{Error as NativeError, Io, Owner},
+    firmware_transport::{Error as NativeError, Io, Owner, PsSubmit},
     runtime_ps_scope::{Bound, KIND},
     runtime_ps_wire::{self as wire, Pages, Profile},
+    station::State,
     station_control::Admission,
 };
 use narf_bus::BusAddr;
@@ -75,30 +76,55 @@ pub async fn lps_function(address: BusAddr, milliseconds: u32) -> Result<(), Err
         .await
 }
 
-async fn send(
-    io: &mut impl Io,
+type Peer = ([u8; 6], [u8; 6], u16);
+
+/// One PS H2C under the exact original source, Linux fw.c
+/// rtw_fw_send_h2c_command. Native RX/TX/command progress after HMEBOX_EXT
+/// staging leaves the command unissued: that prefix is retired privately
+/// through `lps_collect` (peer loss/key/control still denies) and the
+/// command is staged again. `expect` (pre-entry only) requires the original
+/// LPS peer to stay idle and unchanged, else `Busy` with nothing issued.
+/// A published low word is never resent; only its consumption is polled.
+async fn send<I: Io>(
+    io: &mut I,
+    station: &mut State,
     command: [u8; 8],
     source: &Bound,
     admission: &Admission,
-) -> Result<(), NativeError> {
+    expect: Option<Peer>,
+) -> Result<(), Error> {
     for i in 0..=30 {
         if admission.run(|| source.invoke(|| io.mailbox_ready()))? {
-            admission.run(|| source.invoke(|| io.mailbox_submit(command)))?;
-            for j in 0..=30 {
-                if admission.run(|| source.invoke(|| io.mailbox_consumed()))? {
-                    return Ok(());
+            let mut scope = |op: &mut dyn FnMut() -> Result<bool, NativeError>| {
+                admission.run(|| source.invoke(op))
+            };
+            match io.ps_mailbox_submit(command, &mut scope)? {
+                PsSubmit::Issued => {
+                    for j in 0..=30 {
+                        if admission.run(|| source.invoke(|| io.mailbox_consumed()))? {
+                            return Ok(());
+                        }
+                        if j < 30 {
+                            io.delay_us(100).await;
+                        }
+                    }
+                    return Err(NativeError::Timeout.into());
                 }
-                if j < 30 {
-                    io.delay_us(100).await;
+                PsSubmit::Unissued => {
+                    station
+                        .lps_collect(io, source)
+                        .map_err(|_| Error::Generation)?;
+                    if expect.is_some() && station.lps_peer() != expect {
+                        return Err(Error::Busy);
+                    }
                 }
             }
-            return Err(NativeError::Timeout);
         }
         if i < 30 {
             io.delay_us(100).await;
         }
     }
-    Err(NativeError::Timeout)
+    Err(NativeError::Timeout.into())
 }
 
 impl<I: Io> Owner<I> {
@@ -149,16 +175,27 @@ impl<I: Io> Owner<I> {
         if !idle || station.lps_peer() != Some((own, peer, aid)) {
             return Err(Error::Busy);
         }
+        let boundary = self.mac.ok_or(Error::Busy)?.reserved_boundary;
         let mut attempt = Attempt {
             admission: admission.clone(),
             armed: true,
         };
-        let boundary = self.mac.ok_or(Error::Busy)?.reserved_boundary;
         self.io
             .station_reserved_page(&pages.bytes, boundary, &source, &admission)
             .await?;
-        send(&mut self.io, pages.locations, &source, &admission).await?;
-        send(&mut self.io, wire::parameters(true), &source, &admission).await?;
+        let expect = Some((own, peer, aid));
+        for command in [pages.locations, wire::parameters(true)] {
+            match send(&mut self.io, station, command, &source, &admission, expect).await {
+                // Unissued before LPS entry: firmware stays active, the page
+                // was restored and collected RX stays queued for ordinary
+                // processing, so the original station remains open.
+                Err(Error::Busy) => {
+                    attempt.armed = false;
+                    return Err(Error::Busy);
+                }
+                result => result?,
+            }
+        }
         let mut sleeping = false;
         for i in 0..=100 {
             let tcr = admission.run(|| source.invoke(|| self.io.read32(wire::TCR)))?;
@@ -193,7 +230,15 @@ impl<I: Io> Owner<I> {
         if !idle {
             return Err(NativeError::Timeout.into());
         }
-        send(&mut self.io, wire::parameters(false), &source, &admission).await?;
+        send(
+            &mut self.io,
+            station,
+            wire::parameters(false),
+            &source,
+            &admission,
+            None,
+        )
+        .await?;
         let mut wake = false;
         let mut awake = false;
         for i in 0..=100 {

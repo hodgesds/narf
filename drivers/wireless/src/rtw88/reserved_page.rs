@@ -137,6 +137,14 @@ pub(super) unsafe trait Registers: Send {
     fn station_ps_rx_quiet(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
+    /// See `firmware_transport::Io::ps_mailbox_submit`.
+    fn ps_mailbox_submit(
+        &mut self,
+        _: [u8; 8],
+        _: &mut firmware_transport::PsScope<'_>,
+    ) -> Result<firmware_transport::PsSubmit, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         Err(Error::Unsupported)
     }
@@ -784,6 +792,13 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn mailbox_submit(&mut self, p: [u8; 8]) -> Result<(), Error> {
         self.io.mailbox_submit(p)
+    }
+    fn ps_mailbox_submit(
+        &mut self,
+        p: [u8; 8],
+        scope: &mut firmware_transport::PsScope<'_>,
+    ) -> Result<firmware_transport::PsSubmit, Error> {
+        self.io.ps_mailbox_submit(p, scope)
     }
     fn mailbox_consumed(&mut self) -> Result<bool, Error> {
         self.io.mailbox_consumed()

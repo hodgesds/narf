@@ -55,6 +55,7 @@ unsafe impl Memory for Block {
         self.state.lock().acquires += 1;
     }
 }
+type Hook = Arc<dyn Fn() + Send + Sync>;
 struct Model {
     bytes: Vec<u8>,
     calls: usize,
@@ -113,6 +114,11 @@ struct Model {
     ps_wake_stuck: bool,
     ps_suppress_rfon: bool,
     ps_corrupt_power: bool,
+    /// HMEBOX_EXT stagings by the PS-only submission primitive.
+    ps_staged: Vec<[u8; 8]>,
+    /// One-shot hook after HMEBOX_EXT staging and before the scoped low-word
+    /// publication of the PS H2C whose first two bytes match.
+    ps_gap: Option<([u8; 2], Hook)>,
 }
 #[derive(Clone)]
 struct Port(Arc<IrqSafeSpinLock<Model>>);
@@ -1221,6 +1227,43 @@ unsafe impl Registers for Port {
         }
         Ok(())
     }
+    fn ps_mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+        scope: &mut crate::rtw88::firmware_transport::PsScope<'_>,
+    ) -> Result<crate::rtw88::firmware_transport::PsSubmit, Error> {
+        use crate::rtw88::firmware_transport::PsSubmit;
+        self.access()?;
+        let gap = {
+            let mut m = self.0.lock();
+            if m.mailbox_pending {
+                return Err(Error::State);
+            }
+            m.ps_staged.push(words);
+            match &m.ps_gap {
+                Some((key, _)) if words[..2] == *key => m.ps_gap.take().map(|(_, g)| g),
+                _ => None,
+            }
+        };
+        if let Some(gap) = gap {
+            gap();
+        }
+        let mut published = false;
+        let result = scope(&mut || {
+            if !self.station_ps_rx_quiet()? {
+                return Ok(false);
+            }
+            published = true;
+            self.mailbox_submit(words)?;
+            Ok(true)
+        });
+        match (result, published) {
+            (Ok(true), true) => Ok(PsSubmit::Issued),
+            (Ok(false), false) => Ok(PsSubmit::Unissued),
+            (Err(e), _) => Err(e),
+            _ => Err(Error::State),
+        }
+    }
     fn mailbox_consumed(&mut self) -> Result<bool, Error> {
         self.access()?;
         let mut m = self.0.lock();
@@ -1406,6 +1449,8 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         ps_wake_stuck: false,
         ps_suppress_rfon: false,
         ps_corrupt_power: false,
+        ps_staged: Vec::new(),
+        ps_gap: None,
     })));
     let backend = Backend::new(
         port.clone(),
