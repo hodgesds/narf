@@ -57,6 +57,7 @@ pub mod iqk;
 pub mod mac;
 pub mod phy;
 pub mod pwrseq;
+pub mod rsvd_page;
 pub mod tables;
 pub mod trx;
 pub mod txpower;

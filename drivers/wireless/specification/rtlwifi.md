@@ -2314,7 +2314,18 @@ diagnostic (`pci::bring_up` does not retain it).
   false alarm/DIG/adaptivity/CCK PD/EDCA turbo/ATC/primary CCA are not run
   (as on 88EE). The 8192EE watchdog has no TX-power tracking step
   (`rtl92ee_dm_init_txpower_tracking` only seeds indices).
+- `rsvd_page` — `fw.c::reserved_page_packet` verbatim (1024 bytes, eight
+  128-byte pages: beacon 0..=1, PS-Poll 2, Null 3, probe response 4..=5,
+  QoS-Null 6, BT-QoS-Null 7; sha256 `7182a1ec…7ff043` recorded; Linux's
+  pages 6/7 are all zero and still get A1/A2/A3) and the
+  `rtl92ee_set_fw_rsvdpagepkt(false)` substitutions (beacon A2/A3, PS-Poll
+  AID `| 0xc000`/BSSID/TA, Null/probe/QoS-Null/BT-QoS-Null A1/A2/A3). The
+  `_rtl92ee_download_rsvd_page` upload (CR+1 BIT0, BCN_CTRL BIT3/BIT4,
+  0x422 BIT6, up to five uploads through the beacon BD with the
+  `REG_MGQ_TXBD_NUM + 3` BIT(4) and `REG_DWBCN0_CTRL + 2` BCN_VALID polls)
+  belongs to the station branch and is not composed yet.
   Tests (`rtl8192ee/h2c_tests.rs`, written, unexecuted):
+  `smoke_rtl8192ee_rsvd_page_template_and_substitution`,
   `smoke_rtl8192ee_h2c_box_order_rotation_and_ps_gate`,
   `smoke_rtl8192ee_h2c_busy_off_and_lps_order`,
   `smoke_rtl8192ee_rate_mask_2t2r_levels_and_rates`,

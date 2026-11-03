@@ -369,3 +369,61 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_dm_ra_state_and_pwdb
 );
+
+/// `reserved_page_packet` is verbatim (digest, page headers) and
+/// `rtl92ee_set_fw_rsvdpagepkt` substitutes only the Linux fields.
+fn smoke_rtl8192ee_rsvd_page_template_and_substitution() -> TestResult {
+    use super::rsvd_page as rp;
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(&rp::TEMPLATE);
+    let digest = hash.finalize();
+    let mut hex = [0u8; 64];
+    for (i, b) in digest.iter().enumerate() {
+        hex[2 * i] = b"0123456789abcdef"[usize::from(b >> 4)];
+        hex[2 * i + 1] = b"0123456789abcdef"[usize::from(b & 15)];
+    }
+    if hex[..] != *rp::TEMPLATE_SHA256.as_bytes() {
+        return TestResult::Fail("template digest");
+    }
+    let heads = [0, 2 * 128, 3 * 128, 4 * 128, 6 * 128, 7 * 128].map(|at| rp::TEMPLATE[at]);
+    if heads != [0x80, 0xa4, 0x48, 0x50, 0, 0] {
+        return TestResult::Fail("page frame-control layout");
+    }
+    let own = [2, 0, 0, 0, 0, 1];
+    let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let Some(pages) = rp::pages(own, bssid, 5) else {
+        return TestResult::Fail("valid AID refused");
+    };
+    if pages[10..16] != own
+        || pages[16..22] != bssid
+        || pages[258..260] != [0x05, 0xc0]
+        || pages[260..266] != bssid
+        || pages[266..272] != own
+    {
+        return TestResult::Fail("beacon / PS-Poll substitution");
+    }
+    for page in [3, 4, 6, 7] {
+        let at = page * 128;
+        if pages[at + 4..at + 10] != bssid
+            || pages[at + 10..at + 16] != own
+            || pages[at + 16..at + 22] != bssid
+        {
+            return TestResult::Fail("Null/probe/QoS-Null A1-A3");
+        }
+    }
+    let mut changed = 0;
+    for (a, b) in pages.iter().zip(rp::TEMPLATE.iter()) {
+        changed += usize::from(a != b);
+    }
+    if changed > 12 + 2 + 12 + 4 * 18 || rp::pages(own, bssid, 0).is_some() {
+        return TestResult::Fail("only Linux fields change / AID 0");
+    }
+    if h2c::RSVDPAGE_LOCATION != [4, 2, 3, 6, 7] {
+        return TestResult::Fail("location command");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_rsvd_page_template_and_substitution
+);
