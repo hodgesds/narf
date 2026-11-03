@@ -728,8 +728,8 @@ impl VbtPlatform {
     pub const fn port_is_tc(self, port: u8) -> bool {
         let phy = self.port_to_phy(port);
         match self {
-            VbtPlatform::AlderLakeP | VbtPlatform::MeteorLake => phy >= 5 && phy <= 8,
-            VbtPlatform::TigerLake => phy >= 3 && phy <= 8,
+            VbtPlatform::AlderLakeP | VbtPlatform::MeteorLake => matches!(phy, 5..=8),
+            VbtPlatform::TigerLake => matches!(phy, 3..=8),
             VbtPlatform::AlderLakeS => false,
         }
     }
