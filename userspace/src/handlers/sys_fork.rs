@@ -62,6 +62,22 @@ pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler
     narf_scheduler::select_fork_cpu(allowed, preferred).or(rotated)
 }
 
+/// Boot trace: the first few forks print the child's allowed CPUs and
+/// whether they came from the parent's explicit affinity, so a hardware
+/// boot shows whether userspace spreads beyond the boot CPU.
+pub(super) fn trace_fork_affinity(parent: u64, allowed: narf_scheduler::CpuSet, inherited: bool) {
+    static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  fork-affinity: parent={parent} allowed={:#x} inherited={inherited} online={:#x}",
+            allowed.bits(),
+            narf_scheduler::online_cpu_set().bits(),
+        );
+    }
+}
+
 pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     do_fork(ctx, false);
 }
@@ -309,9 +325,11 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // until all fork inheritance below is complete.  The child may otherwise
     // run on another CPU before `fd::fork` installs its table.
     let mut child_spec = narf_scheduler::TaskSpec::user_task();
-    if let Some(allowed) = narf_scheduler::inheritable_task_affinity(narf_scheduler::TaskId(parent_pid)) {
+    let inherited = narf_scheduler::inheritable_task_affinity(narf_scheduler::TaskId(parent_pid));
+    if let Some(allowed) = inherited {
         child_spec.affinity.allowed = allowed;
     }
+    trace_fork_affinity(parent_pid, child_spec.affinity.allowed, inherited.is_some());
     if let Some(cpu) = fork_cpu(child_spec.affinity.allowed) {
         child_spec.affinity.preferred = Some(cpu);
     }

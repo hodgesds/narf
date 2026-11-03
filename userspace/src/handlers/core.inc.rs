@@ -12154,9 +12154,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // execute its first `execveat(AT_EMPTY_PATH)` immediately, so publishing
     // it before `fd::fork` is an SMP-visible ENOENT race.
     let mut child_spec = narf_scheduler::TaskSpec::user_task();
-    if let Some(allowed) = narf_scheduler::inheritable_task_affinity(narf_scheduler::TaskId(parent_pid)) {
+    let inherited = narf_scheduler::inheritable_task_affinity(narf_scheduler::TaskId(parent_pid));
+    if let Some(allowed) = inherited {
         child_spec.affinity.allowed = allowed;
     }
+    handler_sys_fork::trace_fork_affinity(parent_pid, child_spec.affinity.allowed, inherited.is_some());
     if share_thread {
         // `CLONE_THREAD` shares the parent's mm and usually its hottest data.
         // Keep Linux's clone wake-affinity shape: start the sibling on the

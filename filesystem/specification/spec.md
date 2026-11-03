@@ -790,7 +790,10 @@ surface is `MqueueFs`, `MqueueOpenOptions`, `MqueueAttr`,
 
 ### 3.3.1 cgroup-v2 cpuset placement
 
-`cpuset.cpus.effective` is pushed into scheduler CPU affinity.
+`cpuset.cpus.effective` is pushed into scheduler CPU affinity. The root's
+effective CPUs are the live online set (`narf_scheduler::online_cpu_set`,
+from AP bring-up), resolved when read, not the scheduler's hot-plug
+counter; a child inherits the root's set at creation.
 `cpuset.mems.effective` is the parent-effective/requested intersection
 and is pushed into the scheduler's per-task allowed-node table on attach
 and every local policy update. Empty requests inherit the parent; an

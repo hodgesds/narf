@@ -2,7 +2,8 @@
 //!
 //! Stores `cpuset.cpus` / `cpuset.mems` (requested) and computes
 //! `cpuset.cpus.effective` / `cpuset.mems.effective` as
-//! `parent.effective ∩ requested` (root effective = all online CPUs).
+//! `parent.effective ∩ requested` (root effective = all online CPUs,
+//! resolved from the live online set when read).
 //! Applies the effective CPU set as task affinity to member tasks via
 //! the `narf-scheduler` cgroup affinity hook.
 //!
@@ -74,9 +75,14 @@ fn ensure_hooks() {
 fn ensure_hooks() {}
 
 /// Bitmask of all online CPUs (root cgroup's effective set).
+///
+/// The real online set (`online_cpu_set`, from AP bring-up), not the
+/// scheduler's hot-plug counter (`online_count`): boot never calls
+/// `cpu_bring_up`, so that counter stays at CPU 0 and a root sized from
+/// it pinned every cgroup member to CPU 0.
 #[cfg(feature = "cgroup")]
 fn all_online_mask() -> u64 {
-    mask_lo_bits(narf_scheduler::online_count())
+    narf_scheduler::online_cpu_set().bits()
 }
 
 #[cfg(not(feature = "cgroup"))]
@@ -97,18 +103,6 @@ fn all_memory_mask() -> u64 {
         1
     } else {
         mask
-    }
-}
-
-/// Mask with the low `n` bits set, clamped to the inline width.
-fn mask_lo_bits(n: u32) -> u64 {
-    let n = n.min(MASK_BITS);
-    if n == 0 {
-        0
-    } else if n == MASK_BITS {
-        u64::MAX
-    } else {
-        (1u64 << n) - 1
     }
 }
 
@@ -193,7 +187,7 @@ impl Controller for CpuSetController {
         let parent_effective = parent
             .as_ref()
             .and_then(|p| p.as_any().downcast_ref::<CpuSetState>())
-            .map(|ps| *ps.effective_cpus.lock())
+            .map(CpuSetState::current_effective_cpus)
             .unwrap_or_else(all_online_mask);
         let parent_effective_mems = parent
             .as_ref()
@@ -201,6 +195,7 @@ impl Controller for CpuSetController {
             .map(|ps| *ps.effective_mems.lock())
             .unwrap_or_else(all_memory_mask);
         Arc::new(CpuSetState {
+            is_root: parent.is_none(),
             cpus: IrqSafeSpinLock::new(String::new()),
             mems: IrqSafeSpinLock::new(String::new()),
             partition: IrqSafeSpinLock::new(String::from("member")),
@@ -216,6 +211,10 @@ impl Controller for CpuSetController {
 
 #[derive(Debug)]
 pub struct CpuSetState {
+    /// The hierarchy root: its parent set is "every online CPU", resolved
+    /// when read (Linux's top_cpuset tracks hot-plug), so a root created
+    /// before the APs came up does not stay narrowed to the boot CPU.
+    is_root: bool,
     /// Requested cpu list, e.g. "0-3" (empty = inherit parent).
     cpus: IrqSafeSpinLock<String>,
     mems: IrqSafeSpinLock<String>,
@@ -236,11 +235,36 @@ pub struct CpuSetState {
 }
 
 impl CpuSetState {
+    /// The parent's effective CPUs: every online CPU for the root, else
+    /// the snapshot captured at creation.
+    fn parent_cpus(&self) -> u64 {
+        if self.is_root {
+            all_online_mask()
+        } else {
+            *self.parent_effective_cpus.lock()
+        }
+    }
+
+    /// This level's effective CPUs. The root recomputes from the live
+    /// online set; other levels return their stored intersection.
+    fn current_effective_cpus(&self) -> u64 {
+        if !self.is_root {
+            return *self.effective_cpus.lock();
+        }
+        let requested = parse_cpulist(&self.cpus.lock()).unwrap_or(0);
+        let parent = self.parent_cpus();
+        if requested == 0 {
+            parent
+        } else {
+            requested & parent
+        }
+    }
+
     /// Recompute `effective_cpus` from the requested list and the
     /// captured parent effective mask, then re-apply to members.
     fn recompute_and_apply_cpus(&self) -> Result<(), FsError> {
         let requested = parse_cpulist(&self.cpus.lock())?;
-        let parent = *self.parent_effective_cpus.lock();
+        let parent = self.parent_cpus();
         // Empty request ⇒ inherit the parent's effective set.
         let effective = if requested == 0 {
             parent
@@ -274,6 +298,23 @@ impl CpuSetState {
     }
 }
 
+/// Boot trace: the first few attaches print the CPU set pushed to the
+/// task as its affinity, so a hardware boot shows cgroup placement no
+/// longer narrows tasks to CPU 0.
+fn trace_attach(pid: u64, effective: u64) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  cgroup-cpuset: attach pid={pid} cpus={} (online {})",
+            format_cpulist(effective),
+            format_cpulist(all_online_mask()),
+        );
+    }
+}
+
 #[cfg(feature = "cgroup")]
 fn push_affinity(pid: u64, mask: u64) {
     let _ = narf_scheduler::cgroup_set_affinity(pid, mask);
@@ -295,7 +336,7 @@ impl ControllerState for CpuSetState {
         };
         match file {
             "cpuset.cpus" => line(&self.cpus.lock()),
-            "cpuset.cpus.effective" => line(&format_cpulist(*self.effective_cpus.lock())),
+            "cpuset.cpus.effective" => line(&format_cpulist(self.current_effective_cpus())),
             "cpuset.mems" => line(&self.mems.lock()),
             "cpuset.mems.effective" => line(&format_cpulist(*self.effective_mems.lock())),
             "cpuset.cpus.partition" => line(&self.partition.lock()),
@@ -347,7 +388,8 @@ impl ControllerState for CpuSetState {
         self.members.lock().insert(pid);
         // Apply this cgroup's current effective CPU set to the
         // joining task.
-        let effective = *self.effective_cpus.lock();
+        let effective = self.current_effective_cpus();
+        trace_attach(pid, effective);
         push_affinity(pid, effective);
         let effective_mems = *self.effective_mems.lock();
         narf_scheduler::set_task_mems_allowed(pid, effective_mems);
@@ -388,3 +430,40 @@ fn smoke_cpuset_mems_propagates_to_task() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("filesystem/cgroupfs", smoke_cpuset_mems_propagates_to_task);
+
+/// The root cpuset's effective CPUs are every online CPU — the APs
+/// included — and a child that inherits ("" request) sees the same set.
+/// The root used to size its mask from the scheduler's hot-plug counter,
+/// which stays at CPU 0 because boot never calls `cpu_bring_up`; every
+/// cgroup then inherited `{0}` and `on_attach` pinned each task systemd
+/// placed (and, through the inheritable affinity, all of its
+/// descendants) to CPU 0.
+#[cfg(feature = "cgroup")]
+fn smoke_cpuset_root_effective_is_every_online_cpu() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    let online = narf_scheduler::online_cpu_set().bits();
+    let want = {
+        let mut s = format_cpulist(online);
+        s.push('\n');
+        s
+    };
+    let root = CpuSetController.new_state(None);
+    if root.read("cpuset.cpus.effective") != want {
+        return TestResult::Fail("root cpuset.cpus.effective is not the online CPU set");
+    }
+    let child = CpuSetController.new_state(Some(root.clone()));
+    if child.read("cpuset.cpus.effective") != want {
+        return TestResult::Fail("inheriting child cpuset is narrower than the online set");
+    }
+    // An explicit narrowing still applies (requested ∩ parent).
+    if child.write("cpuset.cpus", b"0").is_err() || child.read("cpuset.cpus.effective") != "0\n" {
+        return TestResult::Fail("explicit cpuset.cpus=0 not honoured");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "cgroup")]
+narf_kernel_test::kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cpuset_root_effective_is_every_online_cpu
+);
