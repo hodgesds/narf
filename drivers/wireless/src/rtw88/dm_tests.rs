@@ -187,6 +187,7 @@ fn period(linked: bool) -> Period {
         tx_bytes: 0,
         rx_bytes: 0,
         country: *b"US",
+        txrx_1ss: false,
     }
 }
 fn strong(t: &mut Tracker, n: usize, rssi: u8) {
@@ -442,6 +443,62 @@ fn smoke_rtw88_dm_path_div_cfo_window_and_bt_reset() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_path_div_cfo_window_and_bt_reset
+);
+
+fn smoke_rtw88_dm_path_div_held_under_coex_txrx_1ss() -> TestResult {
+    let b = dm::bounds(0xc822, &payload(dm::PATH_DIV, 0x40, 0, 2, 0, 0)).unwrap();
+    let mut t = Tracker::new(b, c22_facts());
+    let mut io = c22_regs();
+    let auth = Auth(Cell::new(true));
+    let b_stronger = |t: &mut Tracker| {
+        for _ in 0..5 {
+            t.observe(Sample {
+                rssi: 40,
+                path_rssi: [Some(30), Some(50)],
+                cfo_tail: None,
+                rate: 12,
+            });
+        }
+    };
+    b_stronger(&mut t);
+    let _ = run(t.tick(&mut io, &auth, period(true)));
+    if t.tx_path() != 2 {
+        return TestResult::Fail("path B not selected");
+    }
+    // Coexistence 1SS: diversity returns to A (rtw_phy_set_tx_path_by_reg).
+    if run(t.hold_tx_path(&mut io, &auth)).is_err()
+        || t.tx_path() != 1
+        || io.get(0x1a04) >> 28 != 8
+        || io.get(0x820) & 0xff != 0x31
+    {
+        return TestResult::Fail("hold did not return TX to path A");
+    }
+    // While hal.txrx_1ss the stronger path B is never selected.
+    b_stronger(&mut t);
+    io.writes.clear();
+    let held = Period {
+        txrx_1ss: true,
+        ..period(true)
+    };
+    let _ = run(t.tick(&mut io, &auth, held));
+    if t.tx_path() != 1
+        || io
+            .writes
+            .iter()
+            .any(|(a, _)| matches!(*a, 0x820 | 0x1a04 | 0x1e2c))
+    {
+        return TestResult::Fail("path diversity wrote while 1SS was held");
+    }
+    // Released: samples taken under 1SS were dropped, fresh ones decide.
+    let _ = run(t.tick(&mut io, &auth, period(true)));
+    if t.tx_path() != 1 {
+        return TestResult::Fail("held-period samples leaked into selection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm_engine",
+    smoke_rtw88_dm_path_div_held_under_coex_txrx_1ss
 );
 
 fn smoke_rtw88_dm_power_tracking_trigger_clamp_and_envelope() -> TestResult {

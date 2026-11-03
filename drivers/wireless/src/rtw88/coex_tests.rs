@@ -177,11 +177,14 @@ fn smoke_rtw88_coex_record_admission_per_chip_and_board() -> TestResult {
     if coex::record(0xc821, &payload(all, 1, 2, 1)).is_none() {
         return TestResult::Fail("C21 shared record");
     }
-    // Row 2 (coexistence-driven 1SS) is not admitted yet; TDMA without
-    // the PTA base, a WL-only board with more than PTA, unknown chips and
-    // nonzero tails are refused.
+    // Coexistence-driven 1SS is C22 only (`wl_mimo_ps_support`); TDMA
+    // without the PTA base, a WL-only board with more than PTA, unknown
+    // chips and nonzero tails are refused.
+    if coex::record(0xc822, &payload(all | coex::MIMO_PS, 0, 0, 1)).is_none() {
+        return TestResult::Fail("C22 MIMO_PS record");
+    }
     let refused = [
-        (0xc822, payload(coex::PTA | coex::MIMO_PS, 0, 0, 1)),
+        (0xc821, payload(coex::PTA | coex::MIMO_PS, 0, 0, 1)),
         (0xc821, payload(coex::TDMA, 0, 0, 1)),
         (0xc822, payload(coex::PTA | coex::TDMA, 0, 0, 0)),
         (0xc812, payload(coex::PTA, 0, 0, 1)),
@@ -370,4 +373,149 @@ fn smoke_rtw88_coex_revoked_authority_writes_nothing() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/coex",
     smoke_rtw88_coex_revoked_authority_writes_nothing
+);
+
+/// The base TX/RX path fields `rtw8822c_config_trx_mode(AB, AB)` leaves
+/// (two-path RX, 1SS TX on A, two-stream ANTMAP 0x31) with unrelated bits.
+fn trx_base(io: &mut Regs) {
+    io.set(0x1800, 0xa013_3312);
+    io.set(0x4100, 0x3623_3312);
+    io.set(0x1a2c, 0x0022_0000 | 0x0004_c000);
+    io.set(0x1a04, 0x8169_5847);
+    io.set(0x1d30, 0x0020_0100 | 0x1000_0000);
+    io.set(0xc44, 1 << 17 | 3);
+    io.set(0xc54, 1 << 20 | 5);
+    io.set(0xc38, 1 << 24 | 7);
+    io.set(0x824, 0x0333_0000 | 0x11);
+    io.set(0x820, 0x0000_0031 | 0x2200);
+    io.set(0x1e2c, 0x2211_0400);
+    io.set(0x1d70, 0x2020);
+}
+const TRX_REGS: [u16; 12] = [
+    0x1800, 0x4100, 0x1a2c, 0x1a04, 0x1d30, 0xc44, 0xc54, 0xc38, 0x824, 0x820, 0x1e2c, 0x1d70,
+];
+
+fn smoke_rtw88_coex_c22_mimo_ps_config_trx_mode_and_exact_restore() -> TestResult {
+    let modes = coex::PTA | coex::TDMA | coex::FREERUN | coex::BAND5 | coex::MIMO_PS;
+    let r = coex::record(0xc822, &payload(modes, 0, 0, 1)).unwrap();
+    let mut c = Coex::new(r, c22_facts(0)).unwrap();
+    let mut io = regs();
+    trx_base(&mut io);
+    let auth = Auth(Cell::new(true));
+    if run(c.start(&mut io, &auth, link(true))).is_err() {
+        return TestResult::Fail("init");
+    }
+    let base: Vec<u32> = TRX_REGS.iter().map(|&a| io.get(a)).collect();
+    // rtw_coex_mimo_ps(force, true): hal.txrx_1ss and WL channel info.
+    c.mimo_ps_for_test(true, true);
+    if !c.txrx_1ss() || c.trx_1ss() {
+        return TestResult::Fail("mimo_ps request");
+    }
+    io.writes.clear();
+    if !matches!(run(c.config_trx(&mut io, &auth)), Ok(true)) || !c.trx_1ss() {
+        return TestResult::Fail("config_trx_mode(A, A)");
+    }
+    // ORITXCODE 0x33312 / ORITXCODE2 0x11111; CCK RX A (CCANRX 0, RXCCKSEL
+    // 27:24 = 0); OFDM RX A (RXFNCTL, AGCSWSH, ANTWTPD, MRCM 0, 0x824 = 1);
+    // CCK TX A (8), OFDM TX A (ANTMAP0 0x11, TXLGMAP 7:0 = 0).
+    if io.get(0x1800) != 0xa013_3312
+        || io.get(0x4100) != 0x3621_1111
+        || io.get(0x1a2c) != 0x0004_c000
+        || io.get(0x1a04) != 0x8069_5847
+        || io.get(0x1d30) != 0x1000_0000
+        || io.get(0xc44) != 3
+        || io.get(0xc54) != 5
+        || io.get(0xc38) != 7
+        || io.get(0x824) != 0x0111_0011
+        || io.get(0x820) != 0x2211
+        || io.get(0x1e2c) != 0x2211_0400
+    {
+        return TestResult::Fail("1SS TX/RX path fields");
+    }
+    // Three bb_resets (set/clear/set of BIT_FEN_BB_RSTB) and toggle_igi
+    // (igi - 2 then igi on both paths).
+    let resets = io.writes.iter().filter(|(a, _)| *a == 2).count();
+    let igi: Vec<u32> = io
+        .writes
+        .iter()
+        .filter(|(a, _)| *a == 0x1d70)
+        .map(|(_, v)| *v & 0x7f7f)
+        .collect();
+    if resets != 9 || igi.first() != Some(&0x201e) || io.get(0x1d70) & 0x7f7f != 0x2020 {
+        return TestResult::Fail("bb_reset / toggle_igi");
+    }
+    // Same state again: rtw_set_txrx_1ss returns early.
+    io.writes.clear();
+    if !matches!(run(c.config_trx(&mut io, &auth)), Ok(false)) || !io.writes.is_empty() {
+        return TestResult::Fail("unchanged txrx_1ss rewrote");
+    }
+    // Leaving 2GFREE: the exact base fields come back.
+    c.mimo_ps_for_test(false, false);
+    if !matches!(run(c.config_trx(&mut io, &auth)), Ok(true)) || c.trx_1ss() {
+        return TestResult::Fail("exit config_trx");
+    }
+    if TRX_REGS.iter().zip(&base).any(|(&a, &v)| io.get(a) != v) {
+        return TestResult::Fail("exit did not restore the base paths exactly");
+    }
+    // Entered again, then unbound: restore returns the base paths too.
+    c.mimo_ps_for_test(true, true);
+    if !matches!(run(c.config_trx(&mut io, &auth)), Ok(true)) {
+        return TestResult::Fail("re-enter");
+    }
+    if run(c.restore(&mut io, &auth)).is_err()
+        || c.trx_1ss()
+        || c.txrx_1ss()
+        || TRX_REGS.iter().zip(&base).any(|(&a, &v)| io.get(a) != v)
+    {
+        return TestResult::Fail("restore did not return the base paths");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coex",
+    smoke_rtw88_coex_c22_mimo_ps_config_trx_mode_and_exact_restore
+);
+
+fn smoke_rtw88_coex_mimo_ps_unqualified_refused_and_smps_frame_shape() -> TestResult {
+    let r = coex::record(0xc822, &payload(coex::PTA, 0, 0, 1)).unwrap();
+    let mut c = Coex::new(r, c22_facts(0)).unwrap();
+    let mut io = regs();
+    trx_base(&mut io);
+    let auth = Auth(Cell::new(true));
+    if run(c.start(&mut io, &auth, link(true))).is_err() {
+        return TestResult::Fail("init");
+    }
+    c.mimo_ps_for_test(true, true);
+    io.writes.clear();
+    if !matches!(run(c.config_trx(&mut io, &auth)), Err(Error::Unsupported))
+        || c.trx_1ss()
+        || !io.writes.is_empty()
+    {
+        return TestResult::Fail("1SS without MIMO_PS must write nothing");
+    }
+    // ieee80211_send_smps_action: HT category 7, SMPS action 1, control
+    // static (1) or disabled (0); DA = BSSID, never dynamic.
+    let own = [2, 0, 0, 0, 0, 1];
+    let ap = [2, 0, 0, 0, 0, 2];
+    let frame = |control: u8, bssid: [u8; 6]| {
+        let mut b = vec![0xd0, 0, 0, 0];
+        b.extend_from_slice(&ap);
+        b.extend_from_slice(&own);
+        b.extend_from_slice(&bssid);
+        b.extend_from_slice(&[0x10, 0, 7, 1, control]);
+        b
+    };
+    use super::packet_format::smps_action;
+    if !smps_action(&frame(1, ap))
+        || !smps_action(&frame(0, ap))
+        || smps_action(&frame(3, ap))
+        || smps_action(&frame(1, own))
+    {
+        return TestResult::Fail("SMPS action shape");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coex",
+    smoke_rtw88_coex_mimo_ps_unqualified_refused_and_smps_frame_shape
 );

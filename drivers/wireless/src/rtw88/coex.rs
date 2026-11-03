@@ -48,9 +48,31 @@ pub(super) const BAND5: u8 = 1 << 3;
 /// RTL8822C coexistence-driven 1SS (`rtw_coex_mimo_ps`, `wl_mimo_ps_support`).
 pub(super) const MIMO_PS: u8 = 1 << 4;
 const C21_MODES: u8 = PTA | TDMA | FREERUN | BAND5;
-const C22_MODES: u8 = PTA | TDMA | FREERUN | BAND5;
+const C22_MODES: u8 = PTA | TDMA | FREERUN | BAND5 | MIMO_PS;
 /// The watchdog period (`RTW_WATCH_DOG_DELAY_TIME`).
 pub(super) const PERIOD_MS: u64 = 2000;
+/// `rtw8822c.c::rtw8822c_config_trx_mode(rtwdev, BB_PATH_A, BB_PATH_A,
+/// false)` as `(register, field mask, 1SS value, bb_reset after)` in source
+/// order: ORITXCODE/ORITXCODE2, `config_cck_rx_path(A)`,
+/// `config_ofdm_rx_path(A)`, `config_cck_tx_path(A)`,
+/// `config_ofdm_tx_path(A)`.
+const TRX_1SS: &[(u16, u32, u32, bool)] = &[
+    (0x1800, 0x000f_ffff, 0x33312, false),
+    (0x4100, 0x000f_ffff, 0x11111, false),
+    (0x1a2c, 0x0006_0000, 0, false),
+    (0x1a2c, 0x0060_0000, 0, false),
+    (0x1a04, 0x0f00_0000, 0, false),
+    (0x1d30, 0x0000_0300, 0, false),
+    (0x1d30, 0x0060_0000, 0, false),
+    (0x0c44, 1 << 17, 0, false),
+    (0x0c54, 1 << 20, 0, false),
+    (0x0c38, 1 << 24, 0, false),
+    (0x0824, 0x0f00_0000, 1, false),
+    (0x0824, 0x000f_0000, 1, false),
+    (0x1a04, 0xf000_0000, 8, true),
+    (0x0820, 0x0000_00ff, 0x11, false),
+    (0x1e2c, 0x0000_00ff, 0, true),
+];
 
 pub(super) static KIND: Kind = Kind {
     tag: b'K',
@@ -65,7 +87,8 @@ run_coex 5g/bt_disabled/native_lps/game_hid/whql/relink/inquiry/idle/linkscan/co
 mimo_ps 2GFREE, gnt_fix, limited_wl 45e bit3 426 0f 42a 0808 430 1000000 434 4030201 455 20, tdma h2c60 timer h2c69 0b c1/01/tbtt, toggle 0d/07, \
 tables 6c0/6c4/6c8 f0ffffff, wl_ch_info h2c66 24/36, bt_pwr h2c62, ignore h2c63, ltecoex 1700/1704/1708 38 a0 a4 gnt c000/0c00/3000/0300, ctrl owner 73 bit2, \
 8821c init 550/790/778/40/4c6/762/6cf ant switch 4c/cb4/67 rfe 0..15 rssi{101,45,101,40}/{101x4} ratio; \
-8822c init +4fc rf b01 40000 gnt_fix rf b01 1c32/1c39/1c3b/4160/1860/1ca7 rx_gain rf de/1d 22/36 20/00 rssi{60,50,44,30}/{8,15,20,25} dbm; delayed works 1/6/15/5/12/4/2/3/3s";
+8822c init +4fc rf b01 40000 gnt_fix rf b01 1c32/1c39/1c3b/4160/1860/1ca7 rx_gain rf de/1d 22/36 20/00 rssi{60,50,44,30}/{8,15,20,25} dbm; delayed works 1/6/15/5/12/4/2/3/3s; \
+mimo_ps 8822c rtw_set_txrx_1ss config_trx_mode(A,A) 1800=33312 4100=11111 1a2c[18:17][22:21]=0 1a04[27:24]=0 1d30[9:8][22:21]=0 c44[17] c54[20] c38[24]=0 824=1/1 1a04[31:28]=8 bb_reset 820=11 1e2c[7:0]=0 bb_reset bb_reset toggle_igi, exit restores the fields; RA 1SS mask, STBC off, SMPS static/disabled action";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     record(did, p).is_some()
@@ -875,6 +898,9 @@ pub(super) struct Coex {
     initialized: bool,
     /// Requested `hal.txrx_1ss` (`rtw_coex_mimo_ps`), consumed by the caller.
     txrx_1ss: bool,
+    /// Pre-1SS values of the [`TRX_1SS`] fields while
+    /// `rtw8822c_config_trx_mode(A, A)` is in effect (empty otherwise).
+    trx_saved: Vec<u32>,
 }
 
 const MAGIC_SDIO_CTRL3: u16 = 0x73;
@@ -904,6 +930,7 @@ impl Coex {
             rx_tp: 0,
             initialized: false,
             txrx_1ss: false,
+            trx_saved: Vec::new(),
         })
     }
     #[cfg(feature = "kernel-test")]
@@ -920,6 +947,16 @@ impl Coex {
     }
     pub(super) fn txrx_1ss(&self) -> bool {
         self.txrx_1ss
+    }
+    /// Test hook: `rtw_coex_mimo_ps(force, state)` as `rtw_coex_run_coex`
+    /// calls it on leaving or entering `COEX_WLINK_2GFREE`.
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn mimo_ps_for_test(&mut self, force: bool, state: bool) {
+        self.mimo_ps(force, state);
+    }
+    /// The hardware currently runs `config_trx_mode(A, A)` (`hal.txrx_1ss`).
+    pub(super) fn trx_1ss(&self) -> bool {
+        !self.trx_saved.is_empty()
     }
     #[cfg(feature = "kernel-test")]
     pub(super) fn bt_status(&self) -> BtStatus {
@@ -1145,6 +1182,11 @@ impl Coex {
         if self.ch_info_sent {
             h2c.push([0x66, 0, 0, 0, 0, 0, 0, 0]);
             self.ch_info_sent = false;
+        }
+        if self.trx_1ss() {
+            let saved = self.trx_saved.clone();
+            Self::trx_program(io, base, &saved).await?;
+            self.trx_saved.clear();
         }
         while let Some(s) = self.saved.pop() {
             match s {
@@ -2609,6 +2651,70 @@ impl Coex {
         self.txrx_1ss = state;
         let connected = self.s.wl_connected;
         self.update_wl_ch_info(connected);
+    }
+    /// `main.c::rtw_set_txrx_1ss` hardware half for the requested state:
+    /// `rtw8822c_config_trx_mode(BB_PATH_A, BB_PATH_A, false)` on entry,
+    /// and on exit the exact pre-entry fields (Linux reprograms
+    /// `hal.antenna_tx/rx`, which is the retained base program). Returns
+    /// whether the hardware state changed. The caller applies the RA mask,
+    /// STBC and SMPS halves.
+    pub(super) async fn config_trx(
+        &mut self,
+        io: &mut impl Io,
+        auth: &impl Authority,
+    ) -> Result<bool, Error> {
+        if self.txrx_1ss == self.trx_1ss() {
+            return Ok(false);
+        }
+        if self.txrx_1ss {
+            if !self.facts.c22() {
+                return Err(Error::Unsupported);
+            }
+            self.need(MIMO_PS)?;
+            let mut saved = Vec::with_capacity(TRX_1SS.len());
+            for &(reg, mask, _, _) in TRX_1SS {
+                let v = enclosed(|op| auth.run(op), super::radio::read(io, reg)).await?;
+                saved.push((v & mask) >> mask.trailing_zeros());
+            }
+            // Retained before the first write so a failure restores them.
+            self.trx_saved = saved;
+            let values: Vec<u32> = TRX_1SS.iter().map(|t| t.2).collect();
+            Self::trx_program(io, auth, &values).await?;
+        } else {
+            // Cleared only once the base fields are back, so a failure here
+            // still restores them under the base gate.
+            let saved = self.trx_saved.clone();
+            Self::trx_program(io, auth, &saved).await?;
+            self.trx_saved.clear();
+        }
+        Ok(true)
+    }
+    /// `rtw8822c_config_trx_mode` order over [`TRX_1SS`] with `values`:
+    /// `config_cck_tx_path`/`config_ofdm_tx_path` each end in `bb_reset`,
+    /// `config_tx_path` adds one more, then `rtw8822c_toggle_igi`.
+    async fn trx_program(
+        io: &mut impl Io,
+        auth: &impl Authority,
+        values: &[u32],
+    ) -> Result<(), Error> {
+        if values.len() != TRX_1SS.len() {
+            return Err(Error::State);
+        }
+        for (&(reg, mask, _, reset), &v) in TRX_1SS.iter().zip(values) {
+            enclosed(|op| auth.run(op), async {
+                super::radio::mask(io, reg, mask, v).await?;
+                if reset {
+                    super::radio::bb_reset(io).await?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        enclosed(|op| auth.run(op), async {
+            super::radio::bb_reset(io).await?;
+            super::radio::toggle_igi(io).await
+        })
+        .await
     }
     /// `rtw_coex_limited_wl` / `rtw_coex_limited_tx`.
     async fn limited_wl(&mut self, io: &mut impl Io, auth: &impl Authority) -> Result<(), Error> {

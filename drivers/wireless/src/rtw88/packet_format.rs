@@ -443,6 +443,7 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         {
             Ok(Queue::Management)
         }
+        0xd0 if profile.mcs != 0 && smps_action(frame) => Ok(Queue::Management),
         0xd0 if profile.mcs != 0 && recipient_control(frame) => Ok(Queue::Management),
         0xd0 if profile.mcs != 0 && originator_control(frame) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
@@ -460,6 +461,18 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         }
         _ => Err(Error::Frame),
     }
+}
+/// `mac80211 ht.c::ieee80211_send_smps_action` from a station: HT category
+/// (7), `WLAN_HT_ACTION_SMPS` (1), SM Power Control disabled (0) or static
+/// (1); `rtw88` sets no `NL80211_FEATURE_DYNAMIC_SMPS`, so never dynamic.
+pub(super) fn smps_action(b: &[u8]) -> bool {
+    b.len() == 27
+        && b[..2] == [0xd0, 0]
+        && unicast(&b[4..10])
+        && b[4..10] == b[16..22]
+        && b[22] & 15 == 0
+        && b[24..26] == [7, 1]
+        && b[26] <= 1
 }
 pub(super) fn originator_control(b: &[u8]) -> bool {
     originator_control_tid(b).is_some()

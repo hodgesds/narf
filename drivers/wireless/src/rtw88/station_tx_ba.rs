@@ -208,6 +208,7 @@ impl State {
         self.coding_live(io)?;
         self.qos_live(io)?;
         self.fallback_live(io)?;
+        self.txrx_1ss_live(io)?;
         io.station_allowed()?;
         let first = *frames.first().ok_or(Error::Profile)?;
         if !admitted(first, self.own) {

@@ -301,6 +301,9 @@ pub(super) struct Grant {
     mcs: u16,
     sgi: bool,
     version: u8,
+    /// Coexistence `hal.txrx_1ss`: `config_trx_mode(A, A)` leaves 1SS TX on
+    /// path A only (`REG_ANTMAP0` 0x11 instead of the two-path 0x31).
+    txrx_1ss: core::sync::atomic::AtomicBool,
 }
 impl Source {
     pub(super) fn load(self, base: Arc<station_profile::Grant>) -> Result<Arc<Grant>, Error> {
@@ -445,6 +448,7 @@ impl Grant {
             },
             sgi: b[if v2 { 68 } else { 67 }] != 0,
             version: if v2 { 2 } else { 1 },
+            txrx_1ss: core::sync::atomic::AtomicBool::new(false),
         };
         if !(0..=128).contains(&g.antenna)
             || !(-512..=256).contains(&g.ceiling)
@@ -471,6 +475,32 @@ impl Grant {
     }
     fn two_streams(&self) -> bool {
         self.version == 2
+    }
+    /// Record whether coexistence 1SS (`hal.txrx_1ss`) is in effect.
+    pub(super) fn set_txrx_1ss(&self, on: bool) {
+        self.txrx_1ss
+            .store(on, core::sync::atomic::Ordering::Release);
+    }
+    /// Two-stream TX path readback: `config_tx_path(AB, A, A)` (0x820 0x31,
+    /// TXLGMAP 0x0400, CCK path A), or under coexistence 1SS
+    /// `config_tx_path(A, A, A)` (0x820 0x11; TXLGMAP 15:8 and CCK unchanged).
+    async fn tx_paths(
+        &self,
+        read: &mut impl super::firmware_transport::Read32,
+    ) -> Result<(), Error> {
+        let ant = if self.txrx_1ss.load(core::sync::atomic::Ordering::Acquire) {
+            0x11
+        } else {
+            0x31
+        };
+        if self.two_streams()
+            && (read.read32(0x820).await? & 255 != ant
+                || read.read32(0x1e2c).await? & 0xffff != 0x400
+                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
+        {
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
     }
     fn rx_mask(&self) -> u16 {
         if self.two_streams() {
@@ -660,13 +690,7 @@ impl Grant {
             )
             .await;
         }
-        if self.two_streams()
-            && (read.read32(0x820).await? & 255 != 0x31
-                || read.read32(0x1e2c).await? & 0xffff != 0x400
-                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
-        {
-            return Err(Error::Prerequisite);
-        }
+        self.tx_paths(&mut read).await?;
         for (reg, v) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
             if read.read32(reg).await? >> 16 & 127 != u32::from(v) {
                 return Err(Error::Prerequisite);
@@ -698,13 +722,7 @@ impl Grant {
             )
             .await;
         }
-        if self.two_streams()
-            && (read.read32(0x820).await? & 255 != 0x31
-                || read.read32(0x1e2c).await? & 0xffff != 0x400
-                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
-        {
-            return Err(Error::Prerequisite);
-        }
+        self.tx_paths(&mut read).await?;
         for (reg, c) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
             if read.read32(reg).await? >> 16 & 127 != u32::from(c) {
                 return Err(Error::Prerequisite);
@@ -729,13 +747,7 @@ impl Grant {
             )
             .await;
         }
-        if self.two_streams()
-            && (read.read32(0x820).await? & 255 != 0x31
-                || read.read32(0x1e2c).await? & 0xffff != 0x400
-                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
-        {
-            return Err(Error::Prerequisite);
-        }
+        self.tx_paths(&mut read).await?;
         for (r, v) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
             if read.read32(r).await? >> 16 & 127 != u32::from(v) {
                 return Err(Error::Prerequisite);

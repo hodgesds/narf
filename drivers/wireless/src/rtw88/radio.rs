@@ -170,7 +170,12 @@ async fn reset(io: &mut impl Io) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn toggle_igi(io: &mut impl Io) -> Result<(), Error> {
+/// `rtw8822c_bb_reset`: `BIT_FEN_BB_RSTB` set, clear, set.
+pub(super) async fn bb_reset(io: &mut impl Io) -> Result<(), Error> {
+    reset(io).await
+}
+/// `rtw8822c_toggle_igi`.
+pub(super) async fn toggle_igi(io: &mut impl Io) -> Result<(), Error> {
     let igi = read(io, 0x1d70).await? & 0x7f;
     let lower = igi.checked_sub(2).ok_or(Error::Prerequisite)?;
     for value in [lower, igi] {

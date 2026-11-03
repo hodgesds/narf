@@ -94,6 +94,9 @@ enum Kind {
     Decline,
     Ba,
     TxBa,
+    /// HT SM Power Save action (`ieee80211_send_smps_action`); mac80211
+    /// acts only on an acknowledged status, so a lost one is not fatal.
+    Smps,
     /// Broadcast software-scan Probe Request: no ACK, so no CCX report.
     Probe,
 }
@@ -209,6 +212,25 @@ pub(super) struct State {
     witness_scan: Option<ScanGeneration>,
     /// Separately qualified coexistence owner (`coex`, tag `K`).
     coex: Coexistence,
+    /// Coexistence-driven `hal.txrx_1ss` (`main.c::rtw_set_txrx_1ss`).
+    one_ss: OneSs,
+}
+/// `hal.txrx_1ss` as the station follows it: the coexistence owner programs
+/// `config_trx_mode`, the station limits DATA/RA to one stream without STBC
+/// and tells the AP (`rtw_vif_smps_iter` -> `ieee80211_request_smps`).
+#[derive(Default)]
+struct OneSs {
+    /// The hardware runs `config_trx_mode(A, A)`.
+    on: bool,
+    /// The native DATA profile still has to follow `on`.
+    profile: bool,
+    /// RA_INFO still has to follow `on` (next watchdog, as Linux's
+    /// `rtw_phy_ra_info_update` -> `rtw_update_sta_info`).
+    ra: bool,
+    /// mac80211 `link->u.mgd.req_smps` is `IEEE80211_SMPS_STATIC`.
+    smps_static: bool,
+    /// SM Power Save action frame waiting for the control slot.
+    frame: Option<Vec<u8>>,
 }
 /// The N2xK coexistence owner and its Linux trigger inputs.
 #[derive(Default)]
@@ -347,6 +369,7 @@ impl State {
             witness: BeaconWitness::new(),
             witness_scan: None,
             coex: Coexistence::default(),
+            one_ss: OneSs::default(),
         }
     }
     /// Exact retained efuse antenna facts for the coexistence owner.
@@ -437,9 +460,34 @@ impl State {
             }
             CoexEvent::Works => Box::pin(owner.poll(io, &live, link)).await,
         };
+        // rtw_coex_mimo_ps -> rtw_set_txrx_1ss: the dm path diversity is
+        // first returned to path A and held, then config_trx_mode runs.
+        let result = match result {
+            Ok(commands) => {
+                let mut held = Ok(());
+                if owner.txrx_1ss() && !owner.trx_1ss() {
+                    if let Some(t) = self.tracking.tracker.as_mut() {
+                        let base = Base {
+                            admission: &admission,
+                            gate: &gate,
+                        };
+                        held = Box::pin(t.hold_tx_path(io, &base)).await;
+                    }
+                }
+                match held {
+                    Ok(()) => Box::pin(owner.config_trx(io, &live))
+                        .await
+                        .map(|_| commands),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
         match result {
             Ok(commands) => {
+                let on = owner.trx_1ss();
                 self.coex.owner = Some(owner);
+                self.follow_txrx_1ss(on);
                 for words in commands {
                     grant.check(&gate)?;
                     station_control::send(io, words, Some(&admission)).await?;
@@ -453,6 +501,7 @@ impl State {
                     gate: &gate,
                 };
                 let commands = Box::pin(owner.restore(io, &base)).await?;
+                self.follow_txrx_1ss(false);
                 for words in commands {
                     station_control::send(io, words, Some(&admission)).await?;
                 }
@@ -466,6 +515,78 @@ impl State {
                 }
             }
         }
+    }
+    /// `main.c::rtw_set_txrx_1ss` after the coexistence owner changed
+    /// `config_trx_mode`: the HT readback expects the new TX path at once;
+    /// the DATA profile (`tx.c` STBC off, one-stream rates), RA_INFO
+    /// (`rtw_update_sta_info` 1SS mask) and the SM Power Save request
+    /// (`rtw_vif_smps_iter`) follow on the associated HT link.
+    fn follow_txrx_1ss(&mut self, on: bool) {
+        if on == self.one_ss.on {
+            return;
+        }
+        self.one_ss.on = on;
+        if let Some(h) = &self.ht {
+            h.set_txrx_1ss(on);
+        }
+        if self.peer.is_none() {
+            return;
+        }
+        self.one_ss.profile = true;
+        self.one_ss.ra = true;
+        // rtw_vif_smps_iter: associated stations only; mac80211
+        // __ieee80211_request_smps_mgd sends nothing on a non-HT link or
+        // for an unchanged request.
+        if self.data_profile.mcs != 0
+            && self.associated_aid.is_some()
+            && self.one_ss.smps_static != on
+        {
+            if let Some(ap) = self.peer.as_ref().map(|p| p.bss.bssid) {
+                self.one_ss.smps_static = on;
+                self.one_ss.frame = Some(smps_action(self.own, ap, on));
+            }
+        }
+    }
+    /// The profile the hardware may send with: under `hal.txrx_1ss`,
+    /// `tx.c::rtw_tx_pkt_info_update` clears STBC and `rtw_update_sta_info`
+    /// keeps only one-stream HT/VHT rates.
+    pub(super) fn hal_profile(
+        &self,
+        p: super::packet_format::DataProfile,
+    ) -> super::packet_format::DataProfile {
+        if !self.one_ss.on {
+            return p;
+        }
+        super::packet_format::DataProfile {
+            mcs: p.mcs & 0xff,
+            stbc: false,
+            vht: p.vht.map(|v| super::packet_format::VhtRates {
+                tx: v.tx & 0x3ff,
+                ..v
+            }),
+            ..p
+        }
+    }
+    /// Apply a pending 1SS profile change once the native packet owner is
+    /// idle; DATA waits (`Busy`) until it has.
+    pub(super) fn txrx_1ss_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if !self.one_ss.profile {
+            return Ok(());
+        }
+        if !self.established || !self.ready() || !io.packet_ready() {
+            return Err(Error::Busy);
+        }
+        io.packet_profile(self.hal_profile(self.data_profile))?;
+        self.one_ss.profile = false;
+        Ok(())
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn txrx_1ss(&self) -> bool {
+        self.one_ss.on
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn smps_static(&self) -> bool {
+        self.one_ss.smps_static
     }
     /// Drain queued coexistence C2H and due delayed works.
     async fn coex_progress(&mut self, io: &mut impl Io) -> Result<(), Error> {
@@ -493,6 +614,9 @@ impl State {
             }
             let _ = super::firmware_transport::ready_now(owner.restore(io, &GateOnly(&gate)));
         }
+        // The owner is closed: nothing more is sent to the AP.
+        self.follow_txrx_1ss(false);
+        self.one_ss = OneSs::default();
         self.coex = Coexistence {
             facts: self.coex.facts,
             ..Coexistence::default()
@@ -570,10 +694,16 @@ impl State {
                     .and_then(|()| self.qos_live(io))
                     .and_then(|()| self.fallback_live(io)))
             })??;
-            if self.coding_restore {
-                // Source RA_INFO without LDPC once coding is no longer current.
-                super::wmm::ra_info(io, self.data_profile, &self.admission).await?;
+            if self.one_ss.profile && io.packet_ready() {
+                admission.run(|| Ok(self.txrx_1ss_live(io)))??;
+            }
+            if self.coding_restore || self.one_ss.ra {
+                // Source RA_INFO without LDPC once coding is no longer
+                // current, and with the 1SS mask while hal.txrx_1ss.
+                super::wmm::ra_info(io, self.hal_profile(self.data_profile), &self.admission)
+                    .await?;
                 self.coding_restore = false;
+                self.one_ss.ra = false;
             }
         }
         if self.tracking.grant.is_none() || !self.established || !self.ready() {
@@ -593,10 +723,11 @@ impl State {
         }
         let period = super::dm::Period {
             linked: self.peer.is_some(),
-            profile: self.data_profile,
+            profile: self.hal_profile(self.data_profile),
             tx_bytes: core::mem::take(&mut self.tracking.tx_bytes),
             rx_bytes: core::mem::take(&mut self.tracking.rx_bytes),
             country: narf_wireless::reg::db::get_domain().map_or(*b"00", |d| d.country_code),
+            txrx_1ss: self.one_ss.on,
         };
         let admission = self.admission.clone();
         let live = Live {
@@ -1041,7 +1172,9 @@ impl State {
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
-        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data | Kind::Probe) {
+        if !delivery.radio_acknowledged
+            && !matches!(pending.kind, Kind::Data | Kind::Probe | Kind::Smps)
+        {
             return Err(Error::State);
         }
         if pending.kind == Kind::Security {
@@ -1664,6 +1797,8 @@ impl State {
                 self.transmit(io, reply, Kind::Ba)?;
             } else if let Some(reply) = self.tx_ba.next() {
                 self.transmit(io, reply, Kind::TxBa)?;
+            } else if let Some(frame) = self.one_ss.frame.take() {
+                self.transmit(io, frame, Kind::Smps)?;
             }
         }
         if idle
@@ -2192,6 +2327,12 @@ impl State {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
+        // The HT program writes the TX paths coexistence 1SS holds; Linux
+        // leaves 1SS only while connected (2GFREE needs `wl_connected`), so
+        // joining waits for the media-disconnect run to clear it.
+        if self.one_ss.on {
+            return Err(Error::Busy);
+        }
         let candidate = self
             .candidates()
             .into_iter()
@@ -2507,7 +2648,8 @@ impl State {
                     }),
                 ..p
             };
-            self.admission.run(|| io.packet_profile(p))?;
+            let hal = self.hal_profile(p);
+            self.admission.run(|| io.packet_profile(hal))?;
             if let Some(g) = io.station_rx_ba_extension(h.clone())? {
                 self.admission.run(|| io.station_bind_rx_ba(g.clone()))?;
                 self.rx_ba_grant = Some(g);
@@ -2584,8 +2726,14 @@ impl State {
                     .await?;
                 self.bf_assoc(io, bssid).await?;
                 if self.extension.is_some() {
-                    super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)
-                        .await?;
+                    super::wmm::commit(
+                        io,
+                        self.hal_profile(self.data_profile),
+                        self.wmm,
+                        short,
+                        &self.admission,
+                    )
+                    .await?;
                 }
                 self.admission.run(|| {
                     self.peer_commit = None;
@@ -2707,7 +2855,7 @@ impl State {
         self.coding_restore |= self.data_profile.ldpc;
         let p = self.data_profile.uncoded();
         // Callers already run inside the current admission.
-        io.packet_profile(p)?;
+        io.packet_profile(self.hal_profile(p))?;
         self.data_profile = p;
         Ok(())
     }
@@ -2730,7 +2878,7 @@ impl State {
             acs: 0,
             ..self.data_profile
         };
-        io.packet_profile(p)?;
+        io.packet_profile(self.hal_profile(p))?;
         self.data_profile = p;
         Ok(())
     }
@@ -2753,7 +2901,7 @@ impl State {
             fallback: false,
             ..self.data_profile
         };
-        io.packet_profile(p)?;
+        io.packet_profile(self.hal_profile(p))?;
         self.data_profile = p;
         Ok(())
     }
@@ -2761,6 +2909,7 @@ impl State {
         self.coding_live(io)?;
         self.qos_live(io)?;
         self.fallback_live(io)?;
+        self.txrx_1ss_live(io)?;
         if !admitted(frame, self.own) {
             return Err(Error::Profile);
         }
@@ -2841,6 +2990,17 @@ pub(super) fn passive_only(policy: Option<&Arc<RegulatoryDomain>>, channel: u8) 
             super::channel_policy::any_frequency(channel)
                 .is_some_and(|c| witness::passive_only(p, c))
         })
+}
+/// `ht.c::ieee80211_send_smps_action(sdata, smps, ap, ap)`: DA = BSSID =
+/// the AP, HT category, `WLAN_HT_ACTION_SMPS`, `WLAN_HT_SMPS_CONTROL_STATIC`
+/// (1) or `_DISABLED` (0). The sequence number is filled at transmit.
+fn smps_action(own: [u8; 6], ap: [u8; 6], static_smps: bool) -> Vec<u8> {
+    let mut b = vec![0xd0, 0, 0, 0];
+    b.extend_from_slice(&ap);
+    b.extend_from_slice(&own);
+    b.extend_from_slice(&ap);
+    b.extend_from_slice(&[0, 0, 7, 1, u8::from(static_smps)]);
+    b
 }
 pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
     (14..=1514).contains(&frame.len())

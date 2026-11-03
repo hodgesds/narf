@@ -189,6 +189,7 @@ fn period() -> Period {
         tx_bytes: 0,
         rx_bytes: 0,
         country: *b"US",
+        txrx_1ss: false,
     }
 }
 

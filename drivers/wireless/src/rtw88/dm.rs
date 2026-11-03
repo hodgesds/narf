@@ -455,6 +455,9 @@ pub(super) struct Period {
     pub(super) tx_bytes: u64,
     pub(super) rx_bytes: u64,
     pub(super) country: [u8; 2],
+    /// `hal.txrx_1ss` (coexistence `config_trx_mode(A, A)`) is in effect:
+    /// 1SS TX path diversity is held on path A.
+    pub(super) txrx_1ss: bool,
 }
 
 /// Linux `rtw_dm_info`/`rtw_cfo_track`/`rtw_path_div` subset.
@@ -981,6 +984,29 @@ impl Tracker {
         bb_reset(io).await
     }
 
+    /// Return 1SS TX path diversity to path A before coexistence programs
+    /// `config_trx_mode(A, A)`; [`Period::txrx_1ss`] then holds it there
+    /// until the 1SS fields are restored. Linux keeps running
+    /// `rtw_phy_tx_path_diversity` (it checks only `hal.antenna_rx`), which
+    /// could select path B while ORITXCODE2/RX run path A only; here the
+    /// two owners never write the same fields at once. Runs under the base
+    /// gate like [`Self::restore`].
+    pub(super) async fn hold_tx_path(
+        &mut self,
+        io: &mut impl Io,
+        base: &impl Authority,
+    ) -> Result<(), Error> {
+        self.path_sum = [0; 2];
+        self.path_cnt = [0; 2];
+        if !self.initialized || !self.facts.c22() || !self.on(PATH_DIV) || self.tx_path == 1 {
+            return Ok(());
+        }
+        crate::rtw88::firmware_transport::enclosed(|op| base.run(op), Self::set_tx_path(io, 1))
+            .await?;
+        self.tx_path = 1;
+        Ok(())
+    }
+
     /// `rtw8822c_set_crystal_cap` bounded by the measured window.
     async fn set_crystal(&mut self, io: &mut impl Io, cap: u8) -> Result<(), Error> {
         let f = self.facts.crystal;
@@ -1366,7 +1392,11 @@ impl Tracker {
                 }
             }
         }
-        if c22 && self.on(PATH_DIV) && period.linked {
+        if period.txrx_1ss {
+            // The coexistence 1SS owner holds the TX path (`hold_tx_path`).
+            self.path_sum = [0; 2];
+            self.path_cnt = [0; 2];
+        } else if c22 && self.on(PATH_DIV) && period.linked {
             // rtw_phy_tx_path_div_select
             let avg = |s: u32, c: u32| if c != 0 { s / c } else { 0 };
             let a = avg(self.path_sum[0], self.path_cnt[0]);

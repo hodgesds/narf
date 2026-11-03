@@ -1832,7 +1832,7 @@ signed `N21K`/`N22K` continuation (stem `coex`, `qualification::Kind` tag
 | 1 `TDMA` | PS-TDMA on (H2C 0x60) and every BT-profile action using it | `rtw_coex_tdma`, `rtw_coex_action_bt_*`, `_wl_linkscan` |
 | 2 `FREERUN` | non-shared freerun and every RF parameter set except the normal one (BT TX power H2C 0x62, BT LNA constraint H2C 0x67/op 0x32 + scoreboard RXGAIN, C22 WL RX low gain RF 0xde/0x1d) | `rtw_coex_action_freerun`, `rtw_coex_set_rf_para` |
 | 3 `BAND5` | pure-5GHz action/antenna path | `rtw_coex_action_wl_under5g`, `COEX_SET_ANT_5G` |
-| 4 `MIMO_PS` | C22 only; not admitted yet (`smps_txrx_1ss`) | `rtw_coex_mimo_ps` |
+| 4 `MIMO_PS` | C22 only: coexistence-driven 1SS on 2GFREE (see below) | `rtw_coex_mimo_ps`, `rtw_set_txrx_1ss`, `rtw8822c_config_trx_mode` |
 
 Board facts are never supplied by the record alone: `Facts` carries the
 retained efuse `rfe_option`, raw `rf_board_option` and `bt_setting`;
@@ -1879,7 +1879,71 @@ compiled, so `COEX_PS_LPS_OFF` only records `wl_force_lps_ctrl`
 (`Coex::forces_lps_off`), and LPS/IPS notifications are implemented but have
 no native caller; unassociated IPS stops the station, which unbinds and
 restores coexistence. HID game detection (and with it `COEX_WLINK_2GFREE`)
-requires `MIMO_PS`, so it is inactive until `smps_txrx_1ss`.
+requires `MIMO_PS` (`hid_supported`, Linux `wl_mimo_ps_support`); a 2GFREE
+mode reached without it is refused (`Unsupported`, restore and unbind).
+
+#### Coexistence-driven static SMPS (`smps_txrx_1ss`, C22 `MIMO_PS`)
+
+Linux sources: `coex.c::rtw_coex_run_coex` exit (`wl_mimo_ps_support`:
+2GFREE -> `rtw_coex_mimo_ps(force = reason 2GMEDIA, true)`, otherwise
+`(false, false)`), `rtw_coex_mimo_ps`, `main.c::rtw_set_txrx_1ss`,
+`rtw_vif_smps_iter`, `rtw_update_sta_info` (`hal.txrx_1ss` -> 1SS RA mask),
+`tx.c::rtw_tx_pkt_info_update` (`stbc = hal.txrx_1ss ? false : ..`),
+`rtw8822c.c::rtw8822c_config_trx_mode` and mac80211
+`ht.c::ieee80211_request_smps`/`ieee80211_send_smps_action`,
+`cfg.c::__ieee80211_request_smps_mgd`, `status.c::ieee80211_handle_smps_status`.
+
+- Hardware (`coex.rs` `Coex::config_trx`, run after every coex event in
+  `station.rs::coex_event`): on entry the exact `rtw8822c_config_trx_mode(A,
+  A, false)` field program (`TRX_1SS`): ORITXCODE 0x1800 = 0x33312,
+  ORITXCODE2 0x4100 = 0x11111, CCK RX A (0x1a2c 18:17/22:21 = 0, 0x1a04
+  27:24 = 0), OFDM RX A (0x1d30 9:8/22:21, 0xc44[17], 0xc54[20], 0xc38[24] =
+  0, 0x824 27:24/19:16 = 1), CCK TX A (0x1a04 31:28 = 8, `bb_reset`), OFDM TX
+  A (0x820 7:0 = 0x11, 0x1e2c 7:0 = 0, `bb_reset`), `bb_reset`,
+  `toggle_igi`. The pre-entry field values are retained first; exit (and
+  `Coex::restore` at unbind/failure) writes them back in the same order with
+  the same resets and IGI toggle, so the base paths return exactly. Linux
+  exit reprograms `hal.antenna_tx/rx`, which is the retained base program.
+- Path-diversity ownership: before entry the station calls
+  `dm::Tracker::hold_tx_path` (base gate) which returns 1SS TX diversity to
+  path A (`rtw_phy_set_tx_path_by_reg(A)`); `dm::Period::txrx_1ss` then skips
+  `rtw_phy_tx_path_div_select` and drops its samples until exit. Linux keeps
+  running path diversity (it checks only `hal.antenna_rx`) and could select
+  path B while ORITXCODE2/RX run A only; here 0x820/0x1a04/0x1e2c never have
+  two writers at once.
+- Readback: `ht::Grant::set_txrx_1ss` makes the two-stream (N22H256v2) TX
+  readback expect 0x820 = 0x11 instead of 0x31 (TXLGMAP 15:8 and CCK path
+  are unchanged).
+- Station (`follow_txrx_1ss`, `hal_profile`, `txrx_1ss_live`): once the
+  native packet owner is idle the DATA profile drops 2SS HT/VHT rates and
+  STBC (descriptor W5 STBC = 0, highest rate 1SS); DATA waits (`Busy`) until
+  it has. The next watchdog sends RA_INFO with the 1SS mask and dm's periodic
+  RA_INFO uses the same profile. Exit restores the negotiated profile.
+- AP notification: on an associated HT link a changed request queues
+  `ieee80211_send_smps_action` (DA = BSSID = AP, category 7, action 1, SM
+  power control static = 1 on entry, disabled = 0 on exit). It goes out in
+  the native control slot after BA control frames; an unacknowledged status
+  is ignored like `ieee80211_handle_smps_status`. `packet_format::smps_action`
+  admits only that shape on an HT profile.
+
+Deviations, explicit: the hardware half runs after the run's `gnt_fix` /
+`limited_wl` writes but before the H2C commands (ch_info) are sent; the RA
+rate id follows the masked set (Linux keeps `tx_num = hw_cap.nss`), because
+the fixed-rate descriptor here must not name an MCS8..15 rate on one path;
+`associate` returns `Busy` while 1SS is in effect (the HT program owns the
+same TX path fields; 2GFREE needs `wl_connected`, so the media-disconnect
+run clears it first); mac80211's `req_smps` is per station lifetime here,
+so the next association request never carries a stale static SM PS.
+
+Evidence: `drivers/wireless/rtw88/coex`
+`smoke_rtw88_coex_c22_mimo_ps_config_trx_mode_and_exact_restore` (1SS
+fields, resets, IGI toggle, idempotence, exact exit and unbind restore) and
+`smoke_rtw88_coex_mimo_ps_unqualified_refused_and_smps_frame_shape`, and
+`drivers/wireless/rtw88/dm_engine`
+`smoke_rtw88_dm_path_div_held_under_coex_txrx_1ss` (`coex_tests.rs`,
+`dm_tests.rs`). Written, **unexecuted**; the station-side profile/RA/action
+path has no composed case yet. No signed N22K `MIMO_PS` record, BT-active
+measurement or over-the-air SMPS capture exists.
 
 Evidence: five `drivers/wireless/rtw88/coex` register-model cases
 (`coex_tests.rs`): record/efuse admission, C22 power-on/init program, C22
@@ -1921,8 +1985,10 @@ capability) agree. `wmm::ra_info` sets RA_INFO bit 26 and the native
 descriptor sets W5 bit 7 and W5 bits 9:8 = 1. `Gate::allows_profile` admits a
 coded profile only with a current bound grant whose flags permit it.
 
-`hal.txrx_1ss` is never set because coexistence-driven SMPS is not
-implemented (`smps_txrx_1ss` stays open), so STBC is not forced off. The
+While coexistence holds `hal.txrx_1ss` (C22 `MIMO_PS`, see "Coexistence-driven
+static SMPS") `Station::hal_profile` forces STBC off in the native
+descriptor and limits RA_INFO to one stream; the negotiated coded profile
+returns on exit. The
 coding grant is not part of `Gate::current`. Every DATA send and every
 watchdog pass call `coding_live`. If the grant is revoked or no longer
 matches, the station drops to the uncoded HT profile under the base gate.
@@ -3445,7 +3511,7 @@ Resolved into named feature rows (applicability proven, work remains):
 | `broader_ba_variants` | `tx_ba_all_tids`: `tx.c::rtw_txq_check_agg` requests originator BA for every non-VO TID (never EAPOL). `tx_amsdu_5ghz`: `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU` with `rtw_ops_can_aggregate_in_amsdu` declining only on 2.4GHz. Recipient negotiation is mac80211-owned (`RX_START`/`RX_STOP` are driver no-ops) and already covered by the R contract. |
 | `dynamic_phy_thermal_scope` | `phy.c::rtw_phy_dynamic_mechanism` runs statistics, `dig_tracking` (all chips), `cck_pd_tracking` (C21/C22C `cck_pd_set`, 2.4GHz only), `ra_tracking` (firmware RA info and RRSR update), `tx_path_diversity` (C22C `path_div_supported`), `cfo_tracking` and `dpk_tracking` (C22C only), `rf_power_tracking` (all chips, existing row) and `edcca_adaptivity` (C22B/C22C `adaptivity`, or firmware `FW_FEATURE_ADAPTIVITY`). |
 | `ldpc_applicability` | `ldpc`: `rx_ldpc = true` on 8822B/8822C (false on 8821C) gates HT `LDPC_CODING` and VHT `RXLDPC`; TX sets `W5_DATA_LDPC` from the peer's `si->ldpc_en`. |
-| `stbc_applicability` | `stbc`: one-stream RX STBC is advertised on every chip (HT `RX_STBC`=1, VHT `RXSTBC_1`); HT TX STBC only with `tx_stbc` (8822C) and VHT `TXSTBC` when `rf_path_num > 1`; `W5_DATA_STBC` is forced off while `hal.txrx_1ss`. |
+| `stbc_applicability` | `stbc`: one-stream RX STBC is advertised on every chip (HT `RX_STBC`=1, VHT `RXSTBC_1`); HT TX STBC only with `tx_stbc` (8822C) and VHT `TXSTBC` when `rf_path_num > 1`; `W5_DATA_STBC` is forced off while `hal.txrx_1ss` (implemented: `Station::hal_profile`, "Coexistence-driven static SMPS"). |
 | `smps_scope` | `smps_txrx_1ss`: only 8822C has `config_txrx_mode`; `main.c::rtw_vif_smps_iter` requests static SMPS while coexistence forces 1SS and SMPS off otherwise. No `NL80211_FEATURE_{STATIC,DYNAMIC}_SMPS` is set, so user-driven local SMPS is inapplicable. |
 
 Refined feature rows: `wow` applies to RTL8822CE only (`wow_fw_name`/
@@ -3473,7 +3539,7 @@ changes. None is a physical blocker unless stated.
 | `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
 | `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
-| `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
+| `smps_txrx_1ss` | Source-complete for C22 under N22K `MIMO_PS` (see "Coexistence-driven static SMPS"): `rtw_coex_mimo_ps` -> `config_trx_mode(A, A)` with exact field restore, dm path diversity held on A, 1SS RA mask / STBC off, SM Power Save static/disabled action. Three register-model cases written, unexecuted; no signed N22K MIMO_PS record or BT-active measurement. |
 | `system_suspend` | Source-complete for actual C21/C22 identity-DMA PCI-PM D0 profiles: retained uncancelled native retirement/card-off/D3hot receipts, original-source C22 RFE6 DBI pad, D0/config restoration and fresh cold provisioning on the original netdev. Foreground cancellation rolls workers back; old keys/cookies never revive and fresh association stays explicit. Six native cases are written; release/native and physical S3 acceptance remain pending. |
 | `tx_amsdu_5ghz` | Source-complete on 5GHz HT/VHT associations (see "5GHz TX A-MSDU and A-MSDU in A-MPDU"): gated producer, peer/allocation/RA-report size bound, CCMP over the aggregate, ADDBA A-MSDU request bit and NO_AMSDU. Four cases written, unexecuted; physical acceptance pending. |
 | `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
