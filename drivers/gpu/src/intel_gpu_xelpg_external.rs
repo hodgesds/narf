@@ -70,10 +70,15 @@
 //! first write. PM demand is computed with the route's chosen port clock
 //! (the negotiated DP link rate or the HDMI TMDS clock), as Linux's
 //! `crtc_state->port_clock`; the owned panel keeps its HBR3 reservation
-//! (the KMS fixed profile requires it). 8 bpc RGB,
-//! DP 1.4 rates RBR–HBR3 with the C10/C20 tables in
-//! [`crate::intel_gpu_xelpg`]; a stream whose demand exceeds the
-//! negotiated ceiling refuses unless the sink decompresses DSC (below).
+//! (the KMS fixed profile requires it). RGB at 8 bpc, or at 6 bpc
+//! (`intel_dp_compute_link_config`: the sink's EDID bpc caps the pipe,
+//! `compute_sink_pipe_bpp`, and the link drops to 18 bpp before DSC);
+//! a 6 bpc route takes Linux's link (`intel_dp_compute_link_config_wide`),
+//! `TRANS_DDI_FUNC_CTL` BPC_6, the dithered `PIPE_MISC` of the Pipes owner,
+//! the 6 bpc MSA (`intel_ddi_set_dp_msa`) and `intel_link_compute_m_n` at
+//! 18 bpp; the 8 bpc route is unchanged. DP 1.4 rates RBR–HBR3 with the
+//! C10/C20 tables in [`crate::intel_gpu_xelpg`]; a stream that neither
+//! bpp carries refuses unless the sink decompresses DSC (below).
 //! UHBR (128b/132b, C20 MPLLA), MST, TBT-alt tunnels, audio and lane
 //! reversal are refused or unadvertised (HDMI is the separate route
 //! described below).
@@ -479,6 +484,7 @@ pub(crate) fn external_pipe(
     fb: &Framebuffer,
     port_clock_khz: u32,
     dsc: Option<dsc::DscTerm>,
+    pipe_bpp: u32,
 ) -> Result<ExternalPipe, ExternalError> {
     let surface = u32::try_from(fb.phys_addr)
         .map_err(|_| ExternalError::Modeset(ModesetError::InvalidFramebuffer))?;
@@ -490,6 +496,7 @@ pub(crate) fn external_pipe(
         port_clock_khz,
         combo_phy: port.tc_index().is_none().then_some(port.phy_index() as u8),
         dsc,
+        pipe_bpp,
     })
 }
 
@@ -550,6 +557,10 @@ pub struct MtlSinkProbe {
     /// The DSC configuration when the stream needs compression; the
     /// negotiated link is then the plan's.
     pub dsc: Option<DscPlan>,
+    /// `crtc_state->pipe_bpp`: 24, or 18 (6 bpc, dithered) when the sink's
+    /// EDID limits the pipe to it or only 18 bpp fits the link; the
+    /// negotiated link is then Linux's (`intel_dp_compute_link_config_wide`).
+    pub pipe_bpp: u32,
 }
 
 impl MtlSinkProbe {
@@ -630,24 +641,54 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         max_lanes: tc.map_or(4, |conn| conn.max_lanes),
     };
     let mut negotiated = negotiate(&source, &caps, stream_demand_kbps(mode.pixel_clock_khz, 24));
-    // intel_dp_get_dsc_sink_cap, then intel_dp_compute_link_config for a
-    // sink that decompresses.
+    // intel_dp_get_dsc_sink_cap, then intel_dp_compute_link_config: the
+    // pipe's maximum from the EDID's bpc (compute_sink_pipe_bpp), the
+    // uncompressed bpp descent (24, then 18) and, for a sink that
+    // decompresses, DSC.
     let sink = dsc::read_dp_sink(&mut aux, &raw)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
+    let max_bpp = dsc::max_pipe_bpp(dsc::edid_display_bpc(&edid[..edid_len]), 0);
+    let ceiling = if source.max_rate.rate_kbps() <= caps.max_rate.rate_kbps() {
+        source.max_rate
+    } else {
+        caps.max_rate
+    };
+    let limits = dsc::LinkLimits::standard(
+        link_clock_khz(ceiling),
+        source.max_lanes.min(caps.max_lanes),
+    );
     let mut plan = None;
-    if sink.dsc.dpcd.supports_dsc() {
-        let ceiling = if source.max_rate.rate_kbps() <= caps.max_rate.rate_kbps() {
-            source.max_rate
-        } else {
-            caps.max_rate
-        };
-        let limits = dsc::LinkLimits::standard(
-            link_clock_khz(ceiling),
-            source.max_lanes.min(caps.max_lanes),
-        );
-        match dsc::decide_dp(&sink, &limits, &mode) {
-            Ok(None) => {}
-            Ok(Some(p)) => {
+    let mut pipe_bpp = dsc::PIPE_BPP;
+    // A 6 bpc link: Linux's own (intel_dp_compute_link_config_wide).
+    let six_bpc = |link: dsc::UncompressedLink| {
+        let rate = train_rate_for(link.link_rate)?;
+        Some(NegotiatedLink {
+            rate,
+            lanes: link.lanes,
+            demand_kbps: stream_demand_kbps(mode.pixel_clock_khz, link.pipe_bpp),
+            payload_kbps: rate.payload_kbps(link.lanes),
+            over_budget: false,
+        })
+    };
+    if !sink.dsc.dpcd.supports_dsc() && (negotiated.over_budget || max_bpp < dsc::PIPE_BPP) {
+        // No DSC: 24 bpp that the negotiation carries keeps it; otherwise
+        // the bpp descent, or the existing over-budget refusal.
+        if let Some(link) = dsc::uncompressed_link(&limits, &mode, max_bpp)
+            .filter(|link| link.pipe_bpp < dsc::PIPE_BPP)
+        {
+            negotiated = six_bpc(link)
+                .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
+            pipe_bpp = link.pipe_bpp;
+        }
+    } else if sink.dsc.dpcd.supports_dsc() {
+        match dsc::decide_dp(&sink, &limits, &mode, max_bpp) {
+            Ok(dsc::LinkDecision::Uncompressed(link)) if link.pipe_bpp == dsc::PIPE_BPP => {}
+            Ok(dsc::LinkDecision::Uncompressed(link)) => {
+                negotiated = six_bpc(link)
+                    .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
+                pipe_bpp = link.pipe_bpp;
+            }
+            Ok(dsc::LinkDecision::Dsc(p)) => {
                 let rate = train_rate_for(p.link_rate)
                     .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
                 negotiated = NegotiatedLink {
@@ -688,6 +729,7 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         edid,
         edid_len,
         dsc: plan,
+        pipe_bpp,
     })
 }
 
@@ -842,6 +884,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
         &fb,
         link_clock_khz(negotiated.rate),
         probe.dsc.map(|plan| plan.term(&probe.mode)),
+        probe.pipe_bpp,
     ) {
         Ok(ext) => ext,
         Err(e) => return Err(ActivateError::Refused(probe, e)),
@@ -895,8 +938,10 @@ fn program<M: MmioWindow + ?Sized>(
         return Err(ExternalError::Dsc(DscRefusal::TrainingFallback));
     }
     if trained.rate != rate || trained.lanes != lanes {
-        // The fallback link must still carry the stream (no DSC).
-        let demand_kbps = stream_demand_kbps(route.probe.mode.pixel_clock_khz, 24);
+        // The fallback link must still carry the stream (no DSC) at the
+        // pipe bpp.
+        let demand_kbps =
+            stream_demand_kbps(route.probe.mode.pixel_clock_khz, route.probe.pipe_bpp);
         let payload_kbps = trained.rate.payload_kbps(trained.lanes);
         if payload_kbps < demand_kbps {
             return Err(ExternalError::OverBudget {
@@ -958,7 +1003,7 @@ fn enable_port<M: MmioWindow + ?Sized>(
     // 6.a TRANS_CLK_SEL = TGL_TRANS_CLK_SEL_PORT(phy).
     write(io, trans_clk_sel(trans), trans_clk_sel_port(port))?;
     // 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
-    let func = dp_func(port, lanes);
+    let func = dp_func(port, lanes, route.probe.pipe_bpp);
     write(io, trans_ddi_func_ctl(trans), func & !TRANS_DDI_FUNC_ENABLE)?;
     // intel_dp_set_power(D0), intel_dp_sink_enable_decompression and
     // intel_dp_sink_set_fec_ready, before training.
@@ -1005,28 +1050,41 @@ fn enable_port<M: MmioWindow + ?Sized>(
     .map_err(ExternalError::Link)
 }
 
-/// `TRANS_DDI_FUNC_CTL` for DP SST on `port` at `lanes`.
-fn dp_func(port: XeLpgPort, lanes: u8) -> u32 {
+/// `TRANS_DDI_FUNC_CTL` for DP SST on `port` at `lanes`, with the pipe's
+/// BPC field (`TRANS_DDI_BPC_8` is 0).
+fn dp_func(port: XeLpgPort, lanes: u8, pipe_bpp: u32) -> u32 {
     crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
         port.func_ctl_index(),
         crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
         lanes,
-    )
+    ) | dsc::trans_ddi_bpc(pipe_bpp)
 }
 
-/// `intel_cpu_transcoder_set_m1_n1` for `trans` (8 bpc RGB); `LINK_N1`
-/// last, it triggers the update.
+/// `intel_cpu_transcoder_set_m1_n1` for `trans`; `LINK_N1` last, it
+/// triggers the update. The 8 bpc route keeps its `dp_mn` values; a 6 bpc
+/// route writes `intel_link_compute_m_n` at 18 bpp.
 fn program_mn<M: MmioWindow + ?Sized>(
     io: &M,
     trans: Transcoder,
     mode: &Mode,
     rate: crate::intel_gpu_pll::LinkRate,
     lanes: u8,
+    pipe_bpp: u32,
 ) -> Result<(), ExternalError> {
     use crate::intel_gpu_pipes::{
         dp_mn, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
     };
     let ls_khz = rate.megabits_per_sec() * 100;
+    if pipe_bpp != dsc::PIPE_BPP {
+        let m_n = dsc::link_m_n(
+            pipe_bpp * 16,
+            u32::from(lanes),
+            mode.pixel_clock_khz,
+            ls_khz,
+            false,
+        );
+        return dsc::write_m_n(io, trans, &m_n).map_err(|_| ExternalError::AccessLost);
+    }
     let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, u32::from(lanes), 3);
     let base = trans.base();
     write(io, base + PIPE_DATA_M1_OFFSET, dm)?;
@@ -1066,6 +1124,17 @@ fn finish<M: MmioWindow + ?Sized>(
         (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | DP_TP_CTL_LINK_TRAIN_NORMAL,
     )?;
     let lost = |_| ExternalError::AccessLost;
+    let pipe_bpp = route.probe.pipe_bpp;
+    // intel_ddi_set_dp_msa, the last step of intel_ddi_pre_enable_dp. The
+    // 8 bpc route keeps its write stream (and leaves the MSA as it is); a
+    // 6 bpc route writes its 6 bpc MSA, and its stop restores 8 bpc.
+    if pipe_bpp != dsc::PIPE_BPP {
+        write(
+            io,
+            trans.base() + dsc::TRANS_MSA_MISC_OFFSET,
+            dsc::msa_misc(pipe_bpp),
+        )?;
+    }
     let plan = route.probe.dsc;
     if let Some(plan) = &plan {
         // intel_ddi_enable_fec, then intel_dsc_dp_pps_write; then
@@ -1080,11 +1149,11 @@ fn finish<M: MmioWindow + ?Sized>(
     // is off, so nothing here latches before its enable.
     match &plan {
         Some(plan) => dsc::write_m_n(io, trans, &plan.m_n(&mode)).map_err(lost)?,
-        None => program_mn(io, trans, &mode, pll_rate, lanes)?,
+        None => program_mn(io, trans, &mode, pll_rate, lanes, pipe_bpp)?,
     }
     rp.pipes.program_timings(io, pipe)?;
     // intel_ddi_enable: function, then the transcoder.
-    let func = dp_func(port, lanes);
+    let func = dp_func(port, lanes, pipe_bpp);
     write(io, trans_ddi_func_ctl(trans), func)?;
     let start = read(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
@@ -1174,6 +1243,16 @@ fn stop_port<M: MmioWindow + ?Sized>(
         trans_ddi_func_ctl(trans),
         func & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE),
     )?;
+    // A 6 bpc route leaves the MSA at 8 bpc: the 8 bpc route does not
+    // write it (its write stream predates the MSA), and Linux's
+    // intel_ddi_set_dp_msa would write 8 bpc at its next enable.
+    if route.probe.pipe_bpp != dsc::PIPE_BPP {
+        write(
+            io,
+            trans.base() + dsc::TRANS_MSA_MISC_OFFSET,
+            dsc::msa_misc(dsc::PIPE_BPP),
+        )?;
+    }
     // intel_dsc_disable, then intel_dp_set_infoframes(false)'s PPS SDP.
     let pipe = route_pipe(route)?.pipe;
     dsc::disable_engines(io, pipe).map_err(|_| ExternalError::AccessLost)?;

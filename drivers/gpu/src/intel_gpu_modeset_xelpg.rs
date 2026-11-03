@@ -48,15 +48,32 @@
 //!   preloads a table instead); that is the same simplification
 //!   class, named here rather than hidden.
 //!
-//! ## eDP DSC
+//! ## Pipe bpp, the panel's link and eDP DSC
 //!
 //! Before anything is stopped, the panel's link and DSC capabilities are
-//! read (`intel_edp_init_dpcd`) and `intel_dp_compute_link_config` decides
-//! with NARF's 8 bpc pipe ([`crate::intel_gpu_xelpg_dsc::decide_edp`]): a
-//! panel that is not DSC capable, or whose link carries 24 bpp, takes the
-//! uncompressed sequence unchanged; a stream only Linux's 6 bpc would carry
-//! and every unqualified DSC configuration refuse with
-//! [`ModesetError::Dsc`]. A compressed modeset follows
+//! read (`intel_edp_init_dpcd`), a lit eDP transcoder's bpp raises the
+//! VBT's `edp.bpp` (`intel_edp_fixup_vbt_bpp`), and
+//! `intel_dp_compute_link_config` decides
+//! ([`crate::intel_gpu_xelpg_dsc::decide_edp`]) with the panel's EDID bpc
+//! (cached from the last EDID read, [`panel_display_bpc`]) and the VBT's
+//! `edp.bpp`. Three sequences follow:
+//!
+//! - 24 bpp fits and the panel has no rate table: the existing
+//!   uncompressed sequence, unchanged (its rate rule, four lanes,
+//!   `DP_LINK_BW_SET` and the training ladder). It only reads `PIPE_MISC`
+//!   and rewrites it and the MSA to 8 bpc when an earlier 6 bpc modeset or
+//!   firmware left a 6 bpc or dithered pipe.
+//! - 18 bpp (6 bpc), or a panel that publishes `DP_SUPPORTED_LINK_RATES`:
+//!   Linux's link (`intel_dp_compute_link_config_wide`, eDP intermediate
+//!   rates included) on the C10 eDP PLL, `PIPE_MISC` (`BPC_6` with
+//!   dithering at 18 bpp), `TRANS_DDI_FUNC_CTL` BPC, one training attempt
+//!   with `DP_LINK_RATE_SET` when the panel has a table
+//!   (`intel_dp_compute_rate`), the MSA (`intel_ddi_set_dp_msa`) and
+//!   Linux's M/N at the pipe bpp. A failed attempt retries once at the
+//!   panel's maximum link (`use_max_params`).
+//! - DSC, when no uncompressed link fits.
+//!
+//! Every refusal is typed ([`ModesetError::Dsc`]). A compressed modeset follows
 //! `mtl_ddi_pre_enable_dp` and `hsw_crtc_enable`: the resource transaction
 //! carries the VDSC CDCLK and prefill terms, the PHY PLL and training run at
 //! the plan's maximum link (eDP), `DP_DSC_ENABLE` is set after
@@ -83,12 +100,13 @@
 use core::cell::Cell;
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use crate::dp_link_training::RateSelect;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError, PixelFormat};
 use crate::intel_gpu_pll::LinkRate;
 use crate::intel_gpu_xelpg::{
-    disable_port_pll, enable_d2d, enable_port_pll, program_port_buf_ctl, reprogram_pll_rate,
-    set_signal_levels, Cx0Error, Cx0Phy, XeLpgPort,
+    disable_port_pll, enable_d2d, enable_port_pll_khz, program_port_buf_ctl, reprogram_pll_khz,
+    set_signal_levels_khz, Cx0Error, Cx0Phy, XeLpgPort,
 };
 use crate::intel_gpu_xelpg_dsc::{DscPlan, DscRefusal};
 
@@ -562,10 +580,18 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         crate::intel_gpu_xelpg_tc::aux_power_enable(self.mmio, self.port)
             .map_err(|_| ModesetError::PowerWellTimeout)?;
 
-        // intel_edp_init_dpcd + intel_dp_compute_link_config: decide DSC
-        // before the first destructive write, so a refusal leaves the panel
-        // as it was.
-        let dsc = self.plan_edp_dsc(&mode)?;
+        // intel_edp_init_dpcd + intel_dp_compute_link_config: decide the
+        // pipe bpp, the link and DSC before the first destructive write, so
+        // a refusal leaves the panel as it was.
+        let plan = self.plan_edp(&mode)?;
+        let dsc = match plan {
+            EdpPlan::Dsc { plan, .. } => Some(plan),
+            _ => None,
+        };
+        let pipe_bpp = match plan {
+            EdpPlan::Link { link, .. } => link.pipe_bpp,
+            _ => crate::intel_gpu_xelpg_dsc::PIPE_BPP,
+        };
 
         // This bounded correction preserves an already-enabled DDI. The
         // existing PHY helper does not implement a complete DDI-off/on pair;
@@ -614,15 +640,22 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // the next disable, as Linux keeps it for the crtc's lifetime.
         self.pipe_dmc.enable_pipe(0);
 
-        // Step 5: enable the port PLL at the rate this pixel
-        // clock needs (the same bandwidth rule the Gen12 path
-        // picks its DPLL rate with).
-        // A compressed eDP stream runs at the plan's (maximum) link.
-        let (mut pll_rate, lanes) = match &dsc {
-            Some(plan) => (dsc_link_rate(plan)?, plan.lanes),
-            None => (link_rate_for_pixel_clock(mode.pixel_clock_khz), 4),
+        // Step 5: enable the port PLL. The existing 8 bpc sequence takes
+        // the rate this pixel clock needs (the same bandwidth rule the
+        // Gen12 path picks its DPLL rate with) on four lanes; a 6 bpc or
+        // rate-table panel takes Linux's computed link; a compressed eDP
+        // stream runs at the plan's (maximum) link.
+        let (mut link_khz, mut lanes) = match plan {
+            EdpPlan::Legacy => (
+                link_rate_for_pixel_clock(mode.pixel_clock_khz).megabits_per_sec() * 100,
+                4,
+            ),
+            EdpPlan::Link { link, .. } => (link.link_rate, link.lanes),
+            EdpPlan::Dsc { plan, .. } => {
+                (dsc_link_rate(&plan)?.megabits_per_sec() * 100, plan.lanes)
+            }
         };
-        enable_port_pll(self.mmio, self.port, pll_rate, lanes).map_err(map_cx0_err)?;
+        enable_port_pll_khz(self.mmio, self.port, link_khz, lanes, false).map_err(map_cx0_err)?;
 
         // Step 6: route the port clock to transcoder A.
         self.mmio
@@ -630,12 +663,14 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
 
         // Step 7: transcoder timing + pipe source size (register
-        // block shared with Gen12 — the shared codecs build them).
+        // block shared with Gen12 — the shared codecs build them),
+        // then bdw_set_pipe_misc.
         self.program_transcoder(&mode);
         self.program_pipe(&mode);
+        let program_msa = self.program_pipe_misc(pipe_bpp, matches!(plan, EdpPlan::Link { .. }))?;
 
-        // Step 8: bind transcoder A to this port (DP-SST, 8 bpc).
-        self.program_trans_ddi_func_ctl(lanes);
+        // Step 8: bind transcoder A to this port (DP-SST at the pipe bpp).
+        self.program_trans_ddi_func_ctl(lanes, pipe_bpp);
 
         // Step 9: program the primary plane.
         self.program_plane(primary_fb, &mode);
@@ -645,7 +680,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         enable_d2d(self.mmio, self.port).map_err(map_cx0_err)?;
         program_port_buf_ctl(self.mmio, self.port, lanes);
         let phy = Cx0Phy::new(self.mmio, self.port);
-        set_signal_levels(&phy, pll_rate, lanes, &[(0, 0); 4]).map_err(map_cx0_err)?;
+        set_signal_levels_khz(&phy, link_khz, lanes, &[(0, 0); 4]).map_err(map_cx0_err)?;
 
         // mtl_ddi_pre_enable_dp: intel_dp_set_power(D0), then
         // intel_dp_sink_enable_decompression, before training.
@@ -656,36 +691,78 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // Step 11: source pattern generator into TPS1 and run
         // DPCD link training over this port's AUX.
         self.program_dp_tp_ctl(DP_TP_CTL_LINK_TRAIN_PAT1);
-        let trained = match &dsc {
-            Some(plan) => {
+        let (trained_khz, trained_lanes, trained_levels) = match plan {
+            EdpPlan::Dsc { plan, select } => {
                 // The configuration was computed for the plan's link; a
                 // fallback below it needs a new one (Linux's modeset retry).
-                let trained = self.train_dp_link_at(train_rate(plan)?, plan.lanes)?;
-                if trained.0 != pll_rate || trained.1 != plan.lanes {
+                let trained = match select {
+                    Some(index) => (
+                        link_khz,
+                        plan.lanes,
+                        self.train_select(
+                            RateSelect::Table {
+                                index,
+                                link_rate: plan.link_rate,
+                            },
+                            plan.lanes,
+                        )?,
+                    ),
+                    None => {
+                        let (rate, lanes, levels) =
+                            self.train_dp_link_at(train_rate(&plan)?, plan.lanes)?;
+                        (rate.megabits_per_sec() * 100, lanes, levels)
+                    }
+                };
+                if trained.0 != link_khz || trained.1 != plan.lanes {
                     return Err(ModesetError::Dsc(DscRefusal::TrainingFallback));
                 }
                 trained
             }
-            None => self.train_dp_link()?,
+            EdpPlan::Link { link, select, caps } => {
+                self.train_planned_link(&mode, link, select, &caps, &mut link_khz, &mut lanes)?
+            }
+            EdpPlan::Legacy => {
+                let (rate, lanes, levels) = self.train_dp_link()?;
+                (rate.megabits_per_sec() * 100, lanes, levels)
+            }
         };
-        let trained_rate = trained.0;
-        let trained_lanes = trained.1;
-        let trained_levels = trained.2;
 
         // Step 12: settle — if training converged below the PLL
         // rate (or on fewer lanes), re-target the PLL and the
         // width programming, then apply the trained levels.
-        if trained_rate != pll_rate {
-            reprogram_pll_rate(self.mmio, self.port, trained_rate).map_err(map_cx0_err)?;
-            pll_rate = trained_rate;
+        if trained_khz != link_khz {
+            reprogram_pll_khz(self.mmio, self.port, trained_khz).map_err(map_cx0_err)?;
+            link_khz = trained_khz;
         }
         if trained_lanes != lanes {
             program_port_buf_ctl(self.mmio, self.port, trained_lanes);
-            self.program_trans_ddi_func_ctl(trained_lanes);
+            self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
         }
-        set_signal_levels(&phy, pll_rate, trained_lanes, &trained_levels).map_err(map_cx0_err)?;
-        if dsc.is_none() {
-            self.program_mn(&mode, pll_rate, trained_lanes);
+        set_signal_levels_khz(&phy, link_khz, trained_lanes, &trained_levels)
+            .map_err(map_cx0_err)?;
+        // intel_ddi_set_dp_msa, at the end of intel_ddi_pre_enable_dp.
+        if program_msa {
+            self.program_msa(pipe_bpp);
+        }
+        match plan {
+            EdpPlan::Legacy => self.program_mn_khz(&mode, link_khz, trained_lanes),
+            EdpPlan::Link { .. } => {
+                // intel_link_compute_m_n at the pipe bpp, no FEC.
+                let m_n = crate::intel_gpu_xelpg_dsc::link_m_n(
+                    pipe_bpp * 16,
+                    u32::from(trained_lanes),
+                    mode.pixel_clock_khz,
+                    link_khz,
+                    false,
+                );
+                crate::intel_gpu_xelpg_dsc::write_m_n(
+                    self.mmio,
+                    crate::intel_gpu_pipes::Transcoder::A,
+                    &m_n,
+                )
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            }
+            EdpPlan::Dsc { .. } => {}
         }
 
         // Step 13: pattern generator to normal data, then the
@@ -699,7 +776,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             return Err(ModesetError::PipelineEnableUnavailable);
         }
         self.enable_transcoder()?;
-        self.observe_plane(primary_fb, &mode, trained_lanes, frame)?;
+        self.observe_plane(primary_fb, &mode, trained_lanes, pipe_bpp, frame)?;
         if owned.is_some() {
             *OWNED_PANEL.lock() = Some(mode);
         }
@@ -707,20 +784,159 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         Ok(mode)
     }
 
-    /// Read the panel's caps and run Linux's DSC decision for `mode`.
-    /// A panel whose caps cannot be read takes the uncompressed path, as
-    /// before this decision existed.
-    fn plan_edp_dsc(&mut self, mode: &Mode) -> Result<Option<DscPlan>, ModesetError> {
-        use crate::intel_gpu_xelpg_dsc::{decide_edp, installed_edp_vbt, EdpCaps, EdpDecision};
+    /// Read the panel's caps (`intel_edp_init_dpcd`), apply
+    /// `intel_edp_fixup_vbt_bpp` from a lit eDP transcoder, and run
+    /// `intel_dp_compute_link_config` for `mode` with the panel's EDID bpc
+    /// ([`panel_display_bpc`]). A panel whose caps cannot be read takes the
+    /// existing uncompressed path, as before this decision existed.
+    fn plan_edp(&mut self, mode: &Mode) -> Result<EdpPlan, ModesetError> {
+        use crate::intel_gpu_xelpg_dsc::EdpCaps;
         let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
         let Ok(caps) = EdpCaps::read(&mut aux) else {
-            return Ok(None);
+            return Ok(EdpPlan::Legacy);
         };
-        match decide_edp(&caps, &installed_edp_vbt(), mode) {
-            Ok(EdpDecision::Dsc(plan)) => Ok(Some(plan)),
-            Ok(EdpDecision::NotCapable | EdpDecision::Uncompressed) => Ok(None),
-            Err(refusal) => Err(ModesetError::Dsc(refusal)),
+        if let Some(bpp) = self.lit_pipe_bpp() {
+            crate::intel_gpu_xelpg_dsc::fixup_vbt_bpp(bpp);
         }
+        decide_plan(&caps, mode, false)
+    }
+
+    /// `intel_ddi_read_func_ctl`'s `pipe_bpp` of transcoder A when it is
+    /// enabled and selects this port (the lit eDP readout).
+    fn lit_pipe_bpp(&self) -> Option<u32> {
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_DDI_FUNC_CTL_DDI_SHIFT, TRANS_DDI_FUNC_CTL_ENABLE,
+            TRANS_DDI_FUNC_CTL_OFFSET,
+        };
+        let func = self
+            .mmio
+            .read32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET);
+        let port = (func >> TRANS_DDI_FUNC_CTL_DDI_SHIFT) & 0xf;
+        if func == u32::MAX
+            || func & TRANS_DDI_FUNC_CTL_ENABLE == 0
+            || port != u32::from(self.port.func_ctl_index()) + 1
+        {
+            return None;
+        }
+        match (func >> 20) & 7 {
+            0 => Some(24),
+            1 => Some(30),
+            2 => Some(18),
+            3 => Some(36),
+            _ => None,
+        }
+    }
+
+    /// One training attempt at exactly `select` x `lanes` (no fallback
+    /// ladder), with this port's AUX: the converged levels.
+    fn train_select(&mut self, select: RateSelect, lanes: u8) -> Result<LaneLevels, ModesetError> {
+        use crate::dp_link_training::{train_link_select, LinkError};
+        let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
+        match train_link_select(&mut aux, select, lanes, |_us| core::hint::spin_loop()) {
+            Ok(trained) => {
+                let mut levels = [(0u8, 0u8); 4];
+                for (i, lane) in trained.lanes.iter().enumerate() {
+                    levels[i] = (lane.swing, lane.pre_emph);
+                }
+                Ok(levels)
+            }
+            Err(LinkError::CrFailed(_)) => Err(ModesetError::LinkTrainingCr),
+            Err(LinkError::EqFailed(_)) => Err(ModesetError::LinkTrainingEq),
+            Err(LinkError::Aborted) => Err(ModesetError::LinkTrainingCr),
+            Err(LinkError::AuxFailure(e)) => Err(ModesetError::AuxFailure(e)),
+        }
+    }
+
+    /// Train Linux's computed link (a 6 bpc pipe, or a panel with a rate
+    /// table): one attempt at `link`, `DP_LINK_RATE_SET` when the panel
+    /// publishes a table. A failed attempt on a panel not already at its
+    /// maximum parameters retries once with them, as
+    /// `intel_dp_get_link_train_fallback_values` sets `use_max_params` for
+    /// eDP and the modeset retry recomputes the link: the PHY PLL, its TX
+    /// lanes, the port width and `TRANS_DDI_FUNC_CTL` move to the new link
+    /// (`pll_khz` / `pll_lanes` follow). A retry that would change the pipe
+    /// bpp, or a second failure, fails the modeset.
+    fn train_planned_link(
+        &mut self,
+        mode: &Mode,
+        link: crate::intel_gpu_xelpg_dsc::UncompressedLink,
+        select: Option<u8>,
+        caps: &crate::intel_gpu_xelpg_dsc::EdpCaps,
+        pll_khz: &mut u32,
+        pll_lanes: &mut u8,
+    ) -> Result<(u32, u8, LaneLevels), ModesetError> {
+        let first = self.train_select(rate_select(link.link_rate, select)?, link.lanes);
+        let err = match first {
+            Ok(levels) => return Ok((link.link_rate, link.lanes, levels)),
+            Err(e @ (ModesetError::LinkTrainingCr | ModesetError::LinkTrainingEq))
+                if !caps.limits(0).use_max =>
+            {
+                e
+            }
+            Err(e) => return Err(e),
+        };
+        let EdpPlan::Link {
+            link: retry,
+            select: retry_select,
+            ..
+        } = decide_plan(caps, mode, true)?
+        else {
+            return Err(err);
+        };
+        if retry.pipe_bpp != link.pipe_bpp
+            || (retry.link_rate, retry.lanes) == (link.link_rate, link.lanes)
+        {
+            return Err(err);
+        }
+        reprogram_pll_khz(self.mmio, self.port, retry.link_rate).map_err(map_cx0_err)?;
+        *pll_khz = retry.link_rate;
+        if retry.lanes != link.lanes {
+            crate::intel_gpu_xelpg::reprogram_phy_lanes(self.mmio, self.port, retry.lanes, false)
+                .map_err(map_cx0_err)?;
+            program_port_buf_ctl(self.mmio, self.port, retry.lanes);
+            self.program_trans_ddi_func_ctl(retry.lanes, retry.pipe_bpp);
+            *pll_lanes = retry.lanes;
+        }
+        let phy = Cx0Phy::new(self.mmio, self.port);
+        set_signal_levels_khz(&phy, retry.link_rate, retry.lanes, &[(0, 0); 4])
+            .map_err(map_cx0_err)?;
+        let levels = self.train_select(rate_select(retry.link_rate, retry_select)?, retry.lanes)?;
+        Ok((retry.link_rate, retry.lanes, levels))
+    }
+
+    /// `bdw_set_pipe_misc` for Pipe A at `pipe_bpp`. The Linux-link path
+    /// (`always`) writes it. The existing 8 bpc sequences keep their write
+    /// stream: they read `PIPE_MISC` and rewrite it (and later the MSA)
+    /// only when it still carries a 6 bpc or dithered pipe, left by an
+    /// earlier 6 bpc modeset or by firmware. Returns whether the MSA must
+    /// be written after training.
+    fn program_pipe_misc(&mut self, pipe_bpp: u32, always: bool) -> Result<bool, ModesetError> {
+        use crate::intel_gpu_pipes::Pipe as PipeIdx;
+        use crate::intel_gpu_xelpg_dsc::{pipe_misc, PIPE_MISC_OFFSET};
+        let off = PipeIdx::A.base() + PIPE_MISC_OFFSET;
+        if !always {
+            let v = self.mmio.read32(off);
+            if v == u32::MAX || !self.mmio.display_access_ok() {
+                return Err(ModesetError::PipelineEnableUnavailable);
+            }
+            if v & PIPE_MISC_STALE_BPC == 0 {
+                return Ok(false);
+            }
+        }
+        self.mmio.write32(off, pipe_misc(pipe_bpp));
+        compiler_fence(Ordering::SeqCst);
+        Ok(true)
+    }
+
+    /// `intel_ddi_set_dp_msa` for transcoder A at `pipe_bpp`.
+    fn program_msa(&mut self, pipe_bpp: u32) {
+        use crate::intel_gpu_pipes::Transcoder;
+        use crate::intel_gpu_xelpg_dsc::{msa_misc, TRANS_MSA_MISC_OFFSET};
+        self.mmio.write32(
+            Transcoder::A.base() + TRANS_MSA_MISC_OFFSET,
+            msa_misc(pipe_bpp),
+        );
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// `intel_dp_set_power(D0)` then `intel_dp_sink_enable_decompression`.
@@ -768,6 +984,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let d = edid
             .preferred_timing()
             .map_err(|_| ModesetError::EdidUnavailable)?;
+        // drm_add_display_info: the panel's bpc for every later decision.
+        set_panel_display_bpc(crate::intel_gpu_xelpg_dsc::edid_display_bpc(&edid_buf));
         Ok(Mode {
             pixel_clock_khz: d.pixel_clock_khz,
             h_active: d.h_active,
@@ -934,24 +1152,24 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    fn program_trans_ddi_func_ctl(&mut self, lanes: u8) {
-        use crate::intel_gpu_pipes::{
-            build_trans_ddi_func_ctl, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_SST,
-        };
-        let val =
-            build_trans_ddi_func_ctl(self.port.func_ctl_index(), TRANS_DDI_MODE_DP_SST, lanes);
+    /// `TRANS_DDI_FUNC_CTL` for DP SST on this port at `lanes`, with the
+    /// pipe's BPC field (`TRANS_DDI_BPC_8` is 0).
+    fn program_trans_ddi_func_ctl(&mut self, lanes: u8, pipe_bpp: u32) {
+        use crate::intel_gpu_pipes::{Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
+        let val = dp_sst_func_ctl(self.port, lanes, pipe_bpp);
         self.mmio
             .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
     }
 
-    pub(crate) fn program_mn(&mut self, mode: &Mode, rate: LinkRate, lanes: u8) {
+    /// The existing 8 bpc M/N (`dp_mn` at three bytes per pixel) for a
+    /// link symbol clock of `link_khz`.
+    pub(crate) fn program_mn_khz(&mut self, mode: &Mode, link_khz: u32, lanes: u8) {
         use crate::intel_gpu_pipes::{
             dp_mn, Transcoder, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
             PIPE_LINK_N1_OFFSET,
         };
-        let ls_khz = rate.megabits_per_sec() * 100;
-        let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, lanes as u32, 3);
+        let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, link_khz, lanes as u32, 3);
         let base = Transcoder::A.base();
         self.mmio.write32(base + PIPE_DATA_M1_OFFSET, dm);
         self.mmio.write32(base + PIPE_DATA_N1_OFFSET, dn);
@@ -1076,12 +1294,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         fb: &Framebuffer,
         mode: &Mode,
         lanes: u8,
+        pipe_bpp: u32,
         start: u32,
     ) -> Result<(), ModesetError> {
-        use crate::intel_gpu_pipes::{
-            build_primary_plane, build_trans_ddi_func_ctl, PixelFormat as PipeFmt,
-            TRANS_DDI_MODE_DP_SST,
-        };
+        use crate::intel_gpu_pipes::{build_primary_plane, PixelFormat as PipeFmt};
         let plane = build_primary_plane(
             mode.h_active,
             mode.v_active,
@@ -1091,8 +1307,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         )
         .map_err(|_| ModesetError::InvalidFramebuffer)?;
         let ddi_reg = inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
-        let route =
-            build_trans_ddi_func_ctl(self.port.func_ctl_index(), TRANS_DDI_MODE_DP_SST, lanes);
+        let route = dp_sst_func_ctl(self.port, lanes, pipe_bpp);
         let mut refused = false;
         let done = narf_scheduler::responsive_spin_until(
             || {
@@ -1170,14 +1385,117 @@ fn dsc_link_rate(plan: &DscPlan) -> Result<LinkRate, ModesetError> {
 
 /// The training rate of a DSC plan's link.
 fn train_rate(plan: &DscPlan) -> Result<crate::dp_link_training::LinkRate, ModesetError> {
+    train_rate_of(plan.link_rate)
+}
+
+/// The `DP_LINK_BW_SET` rate of a standard link rate (Linux link units).
+fn train_rate_of(link_rate: u32) -> Result<crate::dp_link_training::LinkRate, ModesetError> {
     use crate::dp_link_training::LinkRate as TrainRate;
-    match plan.link_rate {
+    match link_rate {
         162_000 => Ok(TrainRate::Rbr),
         270_000 => Ok(TrainRate::Hbr),
         540_000 => Ok(TrainRate::Hbr2),
         810_000 => Ok(TrainRate::Hbr3),
         _ => Err(ModesetError::Dsc(DscRefusal::LinkRateUnqualified)),
     }
+}
+
+/// `intel_dp_compute_rate`: `DP_LINK_RATE_SET` at `select` for a panel
+/// with a rate table, `DP_LINK_BW_SET` otherwise.
+fn rate_select(link_rate: u32, select: Option<u8>) -> Result<RateSelect, ModesetError> {
+    match select {
+        Some(index) => Ok(RateSelect::Table { index, link_rate }),
+        None => Ok(RateSelect::LinkBw(train_rate_of(link_rate)?)),
+    }
+}
+
+/// `TRANS_DDI_FUNC_CTL` for DP SST on `port` at `lanes` and `pipe_bpp`.
+fn dp_sst_func_ctl(port: XeLpgPort, lanes: u8, pipe_bpp: u32) -> u32 {
+    use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl, TRANS_DDI_MODE_DP_SST};
+    build_trans_ddi_func_ctl(port.func_ctl_index(), TRANS_DDI_MODE_DP_SST, lanes)
+        | crate::intel_gpu_xelpg_dsc::trans_ddi_bpc(pipe_bpp)
+}
+
+/// `PIPE_MISC`'s BPC field and dither enable: a pipe other than an
+/// undithered 8 bpc one.
+const PIPE_MISC_STALE_BPC: u32 = (7 << 5) | (1 << 4);
+
+/// How the Pipe A modeset drives the panel's link.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EdpPlan {
+    /// The existing uncompressed 8 bpc sequence (24 bpp fits, no rate
+    /// table): the pixel-clock rate rule on four lanes, `DP_LINK_BW_SET`
+    /// and the training ladder, byte for byte as before.
+    Legacy,
+    /// Linux's computed uncompressed link: a 6 bpc pipe, or a panel
+    /// trained with `DP_LINK_RATE_SET` (`select`, its table index).
+    Link {
+        link: crate::intel_gpu_xelpg_dsc::UncompressedLink,
+        select: Option<u8>,
+        caps: crate::intel_gpu_xelpg_dsc::EdpCaps,
+    },
+    /// Compress with `plan` (`select` as for [`EdpPlan::Link`]).
+    Dsc { plan: DscPlan, select: Option<u8> },
+}
+
+/// `intel_dp_compute_link_config` for the panel, with `use_max_params`
+/// forced by `use_max` (the retry after a failed training), mapped onto
+/// the modeset's sequences.
+fn decide_plan(
+    caps: &crate::intel_gpu_xelpg_dsc::EdpCaps,
+    mode: &Mode,
+    use_max: bool,
+) -> Result<EdpPlan, ModesetError> {
+    use crate::intel_gpu_xelpg_dsc::{decide_edp, installed_edp_vbt, LinkDecision, PIPE_BPP};
+    let decision = decide_edp(
+        caps,
+        &installed_edp_vbt(),
+        panel_display_bpc(),
+        mode,
+        use_max,
+    )
+    .map_err(ModesetError::Dsc)?;
+    let select = |rate: u32| -> Result<Option<u8>, ModesetError> {
+        if !caps.has_rate_table() {
+            return Ok(None);
+        }
+        caps.rate_select(rate)
+            .map(Some)
+            .ok_or(ModesetError::Dsc(DscRefusal::LinkRateUnqualified))
+    };
+    Ok(match decision {
+        LinkDecision::Uncompressed(link)
+            if link.pipe_bpp == PIPE_BPP && !caps.has_rate_table() && !use_max =>
+        {
+            EdpPlan::Legacy
+        }
+        LinkDecision::Uncompressed(link) => EdpPlan::Link {
+            link,
+            select: select(link.link_rate)?,
+            caps: *caps,
+        },
+        LinkDecision::Dsc(plan) => EdpPlan::Dsc {
+            select: select(plan.link_rate)?,
+            plan,
+        },
+    })
+}
+
+/// The internal panel's `display_info.bpc`
+/// ([`crate::intel_gpu_xelpg_dsc::edid_display_bpc`]) from the last EDID
+/// the Pipe A modeset read; 0 (undefined) until one was read, as Linux's
+/// eDP connector without an EDID.
+static PANEL_DISPLAY_BPC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The internal panel's cached `display_info.bpc`.
+pub fn panel_display_bpc() -> u8 {
+    PANEL_DISPLAY_BPC.load(Ordering::Relaxed)
+}
+
+/// Replace the internal panel's cached `display_info.bpc` (the EDID read,
+/// and fixtures restoring it).
+pub fn set_panel_display_bpc(bpc: u8) {
+    PANEL_DISPLAY_BPC.store(bpc, Ordering::Relaxed);
 }
 
 /// Convert our [`Mode`] into the codec layer's `DisplayTiming`
@@ -1282,6 +1600,9 @@ pub mod tests {
         aux_reply: RefCell<Vec<u8>>,
         dpcd: RefCell<[u8; 0x1000]>,
         pub hbr2_cr_fails: Cell<bool>,
+        /// The sink refuses clock recovery while `DP_LINK_BW_SET` holds
+        /// this code (0: never).
+        pub cr_fails_at: Cell<u8>,
         refuse_color: Cell<u64>,
         /// Every native DPCD write byte with the register-write count at
         /// its arrival: (address, value, writes so far).
@@ -1300,6 +1621,11 @@ pub mod tests {
             if let Some(ddi) = inherited_ddi_ctl(port) {
                 phy.write32(ddi, 1 << 31);
             }
+            // A valid eDP 1.3 receiver: DPCD 1.2, HBR2, four lanes with
+            // enhanced framing (the all-zero DPCD is invalid: Linux would
+            // fall back to RBR x1, `intel_dp_set_sink_rates`).
+            let mut dpcd = [0u8; 0x1000];
+            dpcd[..3].copy_from_slice(&[0x12, 0x14, 0x84]);
             Self {
                 phy,
                 port,
@@ -1312,8 +1638,9 @@ pub mod tests {
                 aux_data: RefCell::new([0; 5]),
                 aux_ctl_read: Cell::new(0),
                 aux_reply: RefCell::new(Vec::new()),
-                dpcd: RefCell::new([0; 0x1000]),
+                dpcd: RefCell::new(dpcd),
                 hbr2_cr_fails: Cell::new(false),
+                cr_fails_at: Cell::new(0),
                 refuse_color: Cell::new(u64::MAX),
                 dpcd_writes: RefCell::new(Vec::new()),
             }
@@ -1341,7 +1668,10 @@ pub mod tests {
         fn dpcd_read(&self, addr: usize) -> u8 {
             match addr {
                 0x202 | 0x203 => {
-                    if self.hbr2_cr_fails.get() && self.dpcd.borrow()[0x100] == 0x14 {
+                    let bw = self.dpcd.borrow()[0x100];
+                    if (self.hbr2_cr_fails.get() && bw == 0x14)
+                        || (self.cr_fails_at.get() != 0 && bw == self.cr_fails_at.get())
+                    {
                         0x00
                     } else {
                         0x77
@@ -1715,7 +2045,7 @@ pub mod tests {
     }
 
     fn oled_plan() -> crate::intel_gpu_xelpg_dsc::DscPlan {
-        use crate::intel_gpu_xelpg_dsc::{decide_edp, DscDpcd, EdpCaps, EdpDecision, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{decide_edp, DscDpcd, EdpCaps, EdpVbt, LinkDecision};
         let mut receiver = [0u8; 16];
         receiver[..3].copy_from_slice(&[0x14, 0x14, 0x82]);
         let caps = EdpCaps {
@@ -1724,8 +2054,8 @@ pub mod tests {
             link_rates: [0; 8],
             dsc: DscDpcd(OLED_DSC),
         };
-        match decide_edp(&caps, &EdpVbt::Missing, &oled_mode()) {
-            Ok(EdpDecision::Dsc(plan)) => plan,
+        match decide_edp(&caps, &EdpVbt::Missing, 0, &oled_mode(), false) {
+            Ok(LinkDecision::Dsc(plan)) => plan,
             other => panic!("the OLED must compress: {other:?}"),
         }
     }
@@ -1831,10 +2161,20 @@ pub mod tests {
             (result, untouched)
         };
         let cases = [
-            // HBR3 x2 carries 18 bpp: Linux's 6 bpc, not this pipe's.
+            // The VBT's 18 bpp (no EDID bpc) caps the DSC input too: its
+            // 8 bpc minimum leaves no pipe bpp range (Linux's
+            // intel_dp_dsc_compute_pipe_bpp_limits).
             (
-                run(0x1e, 2, EdpVbt::Missing),
-                Err(ModesetError::Dsc(DscRefusal::SixBpcUnqualified)),
+                run(
+                    0x14,
+                    2,
+                    EdpVbt::Panel {
+                        dsc_disable: false,
+                        max_link_rate: 0,
+                        bpp: 18,
+                    },
+                ),
+                Err(ModesetError::Dsc(DscRefusal::NoBppRange)),
             ),
             (
                 run(
@@ -1843,6 +2183,7 @@ pub mod tests {
                     EdpVbt::Panel {
                         dsc_disable: true,
                         max_link_rate: 0,
+                        bpp: 0,
                     },
                 ),
                 Err(ModesetError::Dsc(DscRefusal::VbtDisabled)),
@@ -1863,6 +2204,280 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_edp_dsc_refusals_precede_every_write
+    );
+
+    /// An eDP panel's receiver caps and eDP revision on `fake`.
+    fn edp_panel(fake: &MtlFake, rate: u8, lanes: u8, edp_rev: u8) {
+        let mut dpcd = fake.dpcd.borrow_mut();
+        dpcd[..3].copy_from_slice(&[0x14, rate, 0x80 | lanes]);
+        dpcd[0x700] = edp_rev;
+    }
+
+    /// `TRANS_DDI_FUNC_CTL` A for DP SST on DDI A with `bpc` bits.
+    fn func_a(lanes: u8, bpc: u32) -> u32 {
+        crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+            XeLpgPort::A.func_ctl_index(),
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+            lanes,
+        ) | bpc
+    }
+
+    /// Run the fixed modeset with `vbt` installed and the panel's EDID bpc
+    /// at `bpc`, restoring both.
+    fn run_with(
+        fake: &MtlFake,
+        mode: &Mode,
+        vbt: crate::intel_gpu_xelpg_dsc::EdpVbt,
+        bpc: u8,
+    ) -> Result<Mode, ModesetError> {
+        use crate::intel_gpu_xelpg_dsc::{install_edp_vbt, installed_edp_vbt};
+        let previous = installed_edp_vbt();
+        let previous_bpc = panel_display_bpc();
+        install_edp_vbt(vbt);
+        set_panel_display_bpc(bpc);
+        let result = XeLpgModeset::new(fake, XeLpgPort::A).modeset_fixed(&test_fb(), mode);
+        set_panel_display_bpc(previous_bpc);
+        install_edp_vbt(previous);
+        result
+    }
+
+    fn smoke_mtl_edp_six_bpc_programs_pipe_misc_ddi_msa_and_mn() -> TestResult {
+        use crate::intel_gpu_xelpg_dsc::{link_m_n, EdpVbt};
+        // An eDP 1.4 panel without a rate table on one RBR lane: 1024x768@60
+        // needs 195000 kBps at 24 bpp and 146250 at 18; the lane carries
+        // 162000. Linux drives 6 bpc (intel_dp_compute_link_config_wide).
+        let fake = MtlFake::new(XeLpgPort::A);
+        edp_panel(&fake, 0x06, 1, 0x03);
+        let mode = Mode::VESA_1024X768_60;
+        if run_with(&fake, &mode, EdpVbt::Missing, 0) != Ok(mode) {
+            return TestResult::Fail("the 6 bpc eDP modeset must complete");
+        }
+        // The PLL at RBR; TRANS_DDI_FUNC_CTL one lane with BPC_6.
+        if fake.writes_to(0x6_4030) != [162_000] || fake.writes_to(0x6_0400) != [func_a(1, 2 << 20)]
+        {
+            return TestResult::Fail("the link must be RBR x1 with TRANS_DDI BPC_6");
+        }
+        // bdw_set_pipe_misc: BPC_6 | DITHER_ENABLE | TRUNC; the MSA's
+        // SYNC_CLOCK with 6 bpc; intel_link_compute_m_n at 18 bpp, TU 64.
+        let mn = link_m_n(18 * 16, 1, mode.pixel_clock_khz, 162_000, false);
+        if fake.writes_to(0x7_0030) != [0x150]
+            || fake.writes_to(0x6_0410) != [0x01]
+            || fake.writes_to(0x6_0030) != [mn[0]]
+            || fake.writes_to(0x6_0034) != [mn[1]]
+            || fake.writes_to(0x6_0040) != [mn[2]]
+            || fake.writes_to(0x6_0044) != [mn[3]]
+            || mn[0] >> 25 != 63
+        {
+            return TestResult::Fail("PIPE_MISC, the MSA and M/N must carry 6 bpc");
+        }
+        // DP_LINK_BW_SET (no rate table), never DP_LINK_RATE_SET.
+        let dpcd = fake.dpcd_writes.borrow().clone();
+        if !dpcd.iter().any(|&(a, v, _)| a == 0x100 && v == 0x06)
+            || !dpcd.iter().any(|&(a, v, _)| a == 0x101 && v == 0x81)
+            || dpcd.iter().any(|&(a, _, _)| a == 0x115)
+        {
+            return TestResult::Fail("a panel without a table trains with DP_LINK_BW_SET");
+        }
+        // PIPE_MISC follows PIPE_SRCSZ; the MSA follows training (the sink's
+        // pattern off) and precedes the transcoder enable.
+        let writes = fake.writes.borrow().clone();
+        let pos =
+            |r: u64, f: &dyn Fn(u32) -> bool| writes.iter().position(|&(o, v)| o == r && f(v));
+        let trained = dpcd
+            .iter()
+            .rfind(|&&(a, v, _)| a == 0x102 && v == 0)
+            .map(|&(_, _, at)| at);
+        match (
+            pos(0x6_001c, &|_| true),
+            pos(0x7_0030, &|_| true),
+            trained,
+            pos(0x6_0410, &|_| true),
+            pos(PIPECONF_OFF, &|v| v & (1 << 31) != 0),
+        ) {
+            (Some(src), Some(misc), Some(t), Some(msa), Some(on))
+                if src < misc && t <= msa && msa < on => {}
+            _ => return TestResult::Fail("the 6 bpc steps must follow hsw_crtc_enable"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_edp_six_bpc_programs_pipe_misc_ddi_msa_and_mn
+    );
+
+    fn smoke_mtl_edp_rate_table_trains_with_link_rate_set() -> TestResult {
+        use crate::intel_gpu_xelpg_dsc::{link_m_n, EdpVbt};
+        // An eDP 1.4 panel with DP_MAX_LINK_RATE 0 and the table 1.62, 2.16,
+        // 2.43, 2.7 Gbps on two lanes. A 140 MHz 1024x768 needs 420000 kBps
+        // at 24 bpp: 2.16 Gbps x2 (432000), the table's index 1.
+        let fake = MtlFake::new(XeLpgPort::A);
+        edp_panel(&fake, 0x00, 2, 0x03);
+        fake.dpcd.borrow_mut()[0x10..0x18]
+            .copy_from_slice(&[0xa4, 0x1f, 0x30, 0x2a, 0x76, 0x2f, 0xbc, 0x34]);
+        let mode = Mode {
+            pixel_clock_khz: 140_000,
+            ..Mode::VESA_1024X768_60
+        };
+        if run_with(&fake, &mode, EdpVbt::Missing, 0) != Ok(mode) {
+            return TestResult::Fail("the rate-table eDP modeset must complete");
+        }
+        // The C10 eDP PLL at the intermediate 2.16 Gbps, two lanes, 8 bpc.
+        if fake.writes_to(0x6_4030) != [216_000] || fake.writes_to(0x6_0400) != [func_a(2, 0)] {
+            return TestResult::Fail("the PLL and function must take 2.16 Gbps x2");
+        }
+        // intel_dp_link_training_set_bw: DP_LANE_COUNT_SET, then
+        // DP_LINK_RATE_SET = 1; DP_LINK_BW_SET is never written.
+        let dpcd = fake.dpcd_writes.borrow().clone();
+        let lane = dpcd.iter().position(|&(a, v, _)| a == 0x101 && v == 0x82);
+        let select = dpcd.iter().position(|&(a, v, _)| a == 0x115 && v == 1);
+        match (lane, select) {
+            (Some(l), Some(s)) if l < s => {}
+            _ => return TestResult::Fail("the panel must train with DP_LINK_RATE_SET 1"),
+        }
+        if dpcd.iter().any(|&(a, _, _)| a == 0x100) {
+            return TestResult::Fail("a rate-table panel must never see DP_LINK_BW_SET");
+        }
+        // Linux's link: PIPE_MISC and the MSA at 8 bpc, M/N at 2.16 Gbps.
+        let mn = link_m_n(24 * 16, 2, 140_000, 216_000, false);
+        if fake.writes_to(0x7_0030) != [0x100]
+            || fake.writes_to(0x6_0410) != [0x21]
+            || fake.writes_to(0x6_0030) != [mn[0]]
+            || fake.writes_to(0x6_0044) != [mn[3]]
+        {
+            return TestResult::Fail("the rate-table link must program Linux's M/N");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_edp_rate_table_trains_with_link_rate_set
+    );
+
+    fn smoke_mtl_edp_planned_link_retries_at_max_params() -> TestResult {
+        use crate::intel_gpu_xelpg_dsc::{link_m_n, EdpVbt};
+        // An EDID 6 bpc panel (eDP 1.4, HBR2 x4): Linux's first link is
+        // 18 bpp on RBR x1. The sink refuses clock recovery at RBR, so the
+        // retry takes use_max_params: 18 bpp on HBR2 x4.
+        let fake = MtlFake::new(XeLpgPort::A);
+        edp_panel(&fake, 0x14, 4, 0x03);
+        fake.cr_fails_at.set(0x06);
+        let mode = Mode::VESA_1024X768_60;
+        if run_with(&fake, &mode, EdpVbt::Missing, 6) != Ok(mode) {
+            return TestResult::Fail("the retry at maximum parameters must light");
+        }
+        if fake.writes_to(0x6_4030) != [162_000, 540_000]
+            || fake.writes_to(0x6_0400) != [func_a(1, 2 << 20), func_a(4, 2 << 20)]
+        {
+            return TestResult::Fail("the retry must move the PLL and function to HBR2 x4");
+        }
+        let bw: Vec<u8> = fake
+            .dpcd_writes
+            .borrow()
+            .iter()
+            .filter(|&&(a, _, _)| a == 0x100)
+            .map(|&(_, v, _)| v)
+            .collect();
+        let mn = link_m_n(18 * 16, 4, 65_000, 540_000, false);
+        if bw != [0x06, 0x14]
+            || fake.writes_to(0x6_0030) != [mn[0]]
+            || fake.writes_to(0x7_0030) != [0x150]
+        {
+            return TestResult::Fail("one attempt each, then 6 bpc M/N on HBR2 x4");
+        }
+        // A failure at the maximum parameters fails the modeset.
+        let fake = MtlFake::new(XeLpgPort::A);
+        edp_panel(&fake, 0x14, 4, 0x03);
+        fake.cr_fails_at.set(0x06);
+        fake.hbr2_cr_fails.set(true);
+        if run_with(&fake, &mode, EdpVbt::Missing, 6) != Err(ModesetError::LinkTrainingCr) {
+            return TestResult::Fail("a failed retry must fail the modeset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_edp_planned_link_retries_at_max_params
+    );
+
+    fn smoke_mtl_edp_eight_bpc_keeps_write_stream_and_clears_stale_six_bpc() -> TestResult {
+        use crate::intel_gpu_xelpg_dsc::EdpVbt;
+        // 24 bpp fits and there is no rate table: the existing sequence
+        // writes neither PIPE_MISC nor the MSA, and still trains with
+        // DP_LINK_BW_SET from HBR2 (VALFREQ RBR, then HBR2).
+        let fake = MtlFake::new(XeLpgPort::A);
+        let mode = Mode::VESA_1024X768_60;
+        if run_with(&fake, &mode, EdpVbt::Missing, 0) != Ok(mode)
+            || !fake.writes_to(0x7_0030).is_empty()
+            || !fake.writes_to(0x6_0410).is_empty()
+            || fake.writes_to(0x6_4030) != [162_000, 540_000]
+            || fake.writes_to(0x6_0400) != [func_a(4, 0)]
+        {
+            return TestResult::Fail("the 8 bpc sequence must keep its write stream");
+        }
+        // A 6 bpc, dithered PIPE_MISC left behind is rewritten to 8 bpc,
+        // and the MSA with it.
+        let fake = MtlFake::new(XeLpgPort::A);
+        fake.phy.write32(0x7_0030, 0x150);
+        if run_with(&fake, &mode, EdpVbt::Missing, 0) != Ok(mode)
+            || fake.writes_to(0x7_0030) != [0x100]
+            || fake.writes_to(0x6_0410) != [0x21]
+        {
+            return TestResult::Fail("a stale 6 bpc pipe must return to 8 bpc");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_edp_eight_bpc_keeps_write_stream_and_clears_stale_six_bpc
+    );
+
+    fn smoke_mtl_edp_vbt_bpp_clamp_and_lit_pipe_fixup() -> TestResult {
+        use crate::intel_gpu_xelpg_dsc::{install_edp_vbt, installed_edp_vbt, EdpVbt};
+        let vbt18 = EdpVbt::Panel {
+            dsc_disable: false,
+            max_link_rate: 0,
+            bpp: 18,
+        };
+        // The default panel (eDP 1.3, HBR2 x4, use_max_params) with the
+        // VBT's 18 bpp and no EDID bpc: 18 bpp on HBR2 x4.
+        let fake = MtlFake::new(XeLpgPort::A);
+        let mode = Mode::VESA_1024X768_60;
+        if run_with(&fake, &mode, vbt18, 0) != Ok(mode)
+            || fake.writes_to(0x7_0030) != [0x150]
+            || fake.writes_to(0x6_0400) != [func_a(4, 2 << 20)]
+            || fake.writes_to(0x6_4030) != [540_000]
+        {
+            return TestResult::Fail("the VBT's 18 bpp must clamp an EDID without bpc");
+        }
+        // An EDID bpc overrides the VBT: the 8 bpc sequence.
+        let fake = MtlFake::new(XeLpgPort::A);
+        if run_with(&fake, &mode, vbt18, 8) != Ok(mode) || !fake.writes_to(0x7_0030).is_empty() {
+            return TestResult::Fail("an EDID bpc must override the VBT's");
+        }
+        // intel_edp_fixup_vbt_bpp: transcoder A lit on DDI A at 8 bpc
+        // raises the VBT's 18 to 24 before the decision.
+        let previous = installed_edp_vbt();
+        let fake = MtlFake::new(XeLpgPort::A);
+        fake.phy.write32(0x6_0400, func_a(4, 0));
+        let result = run_with(&fake, &mode, vbt18, 0);
+        install_edp_vbt(vbt18);
+        let fake2 = MtlFake::new(XeLpgPort::A);
+        fake2.phy.write32(0x6_0400, func_a(4, 0));
+        let fixed = XeLpgModeset::new(&fake2, XeLpgPort::A).modeset_fixed(&test_fb(), &mode);
+        let raised = installed_edp_vbt().edp_bpp();
+        install_edp_vbt(previous);
+        if result != Ok(mode)
+            || !fake.writes_to(0x7_0030).is_empty()
+            || fixed != Ok(mode)
+            || raised != 24
+        {
+            return TestResult::Fail("a lit 8 bpc pipe must raise the VBT's bpp");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_edp_vbt_bpp_clamp_and_lit_pipe_fixup
     );
 
     fn smoke_mtl_modeset_tears_down_firmware_dsc_in_linux_order() -> TestResult {

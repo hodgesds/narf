@@ -70,12 +70,6 @@ const PLANE_CTL_TILED_4: u32 = 5 << 10;
 const TRANSCONF_WAIT_MS: u64 = 100;
 /// `PIPE_MISC` relative to the pipe block.
 const PIPE_MISC_OFFSET: u64 = 0x30;
-/// `bdw_set_pipe_misc` for an 8 bpc RGB pipe without dithering on display
-/// 14: `PIPE_MISC_BPC_8` (0) | `PIPE_MISC_PIXEL_ROUNDING_TRUNC` (bit 8,
-/// display >= 12) | `PIPE_MISC_HDR_MODE_PRECISION` (bit 23, display >= 11
-/// when `is_hdr_mode`: no plane but `PLANE_1`..`PLANE_3` and the cursor is
-/// active, always true for a Pipe B-D that scans out its primary only).
-pub(crate) const PIPE_MISC: u32 = (1 << 23) | (1 << 8);
 /// `PIPE_CHICKEN` relative to the pipe block (`_PIPEA_CHICKEN`).
 const PIPE_CHICKEN_OFFSET: u64 = 0x38;
 /// `icl_set_pipe_chicken` on display 14: `PER_PIXEL_ALPHA_BYPASS_EN`
@@ -118,6 +112,8 @@ pub(crate) struct ExternalPipe {
     pub(crate) combo_phy: Option<u8>,
     /// The route's VDSC term when it compresses (DP DSC).
     pub(crate) dsc: Option<crate::intel_gpu_xelpg_dsc::DscTerm>,
+    /// `crtc_state->pipe_bpp`: 24, or 18 for a 6 bpc DP route.
+    pub(crate) pipe_bpp: u32,
 }
 
 /// Typed pipe-owner failures.
@@ -510,7 +506,11 @@ impl Pipes {
             .map_err(|_| PipeEnableError::Unsupported)?;
         // intel_set_pipe_src_size, bdw_set_pipe_misc.
         checked(io, pipe.trans_base() + PIPE_SRCSZ_OFFSET, src.srcsz)?;
-        checked(io, pipe.base() + PIPE_MISC_OFFSET, PIPE_MISC)?;
+        checked(
+            io,
+            pipe.base() + PIPE_MISC_OFFSET,
+            crate::intel_gpu_xelpg_dsc::pipe_misc(ext.pipe_bpp) | (1 << 23),
+        )?;
         // hsw_configure_cpu_transcoder (the DP M/N precede it here):
         // intel_set_transcoder_timings, intel_vrr_set_transcoder_timings,
         // TRANS_MULT, hsw_set_frame_start_delay, hsw_set_transconf.

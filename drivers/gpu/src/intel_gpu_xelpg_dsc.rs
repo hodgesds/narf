@@ -16,7 +16,18 @@
 //!   `intel_dp_dsc_compute_params`, `intel_dp_get_slice_height`,
 //!   `intel_dp_link_required`, `intel_dp_needs_8b10b_fec`,
 //!   `intel_edp_set_sink_rates`, `intel_dp_get_dsc_sink_cap`,
-//!   `intel_edp_get_dsc_sink_cap`, `intel_dp_sink_set_dsc_decompression`;
+//!   `intel_edp_get_dsc_sink_cap`, `intel_dp_sink_set_dsc_decompression`,
+//!   `intel_dp_max_bpp`, `intel_dp_min_bpp`, `intel_edp_fixup_vbt_bpp`,
+//!   `intel_dp_compute_rate`, `intel_dp_rate_select`,
+//!   `intel_dp_set_sink_rates`, `intel_dp_set_max_sink_lane_count`,
+//!   `intel_edp_init_dpcd` (`use_max_params`);
+//! - `intel_display.c`: `compute_baseline_pipe_bpp`,
+//!   `compute_sink_pipe_bpp`, `bdw_set_pipe_misc`, the `dither` decision
+//!   of `intel_modeset_pipe_config`; `intel_ddi.c`:
+//!   `intel_ddi_set_dp_msa`, `intel_ddi_transcoder_func_reg_val_get`;
+//!   `drm_edid.c`: `update_display_info`, `edid_quirk_list`,
+//!   `drm_edid_get_panel_id`; `drm_atomic.c::drm_atomic_connector_check`
+//!   (`max_bpc`);
 //! - `intel_vdsc.c`: `intel_dsc_compute_params`, `calculate_rc_params`,
 //!   `intel_dsc_pps_configure`, `intel_dsc_enable`, `intel_dsc_disable`,
 //!   `intel_dsc_dp_pps_write`, `intel_vdsc_min_cdclk`,
@@ -34,11 +45,21 @@
 //! The generic VESA helpers (`drm_dsc_config`, the rate-control parameter
 //! derivation and PPS packing) are the shared [`crate::drm_dsc`].
 //!
-//! Qualified profile: one pipe, no joiner (big, ultra or uncompressed),
-//! RGB with NARF's 8 bpc pipe (`pipe_bpp` 24: Linux's selection with
-//! `max bpc` 8), 8b/10b SST (UHBR refused upstream), at most four slices
-//! per line (two VDSC engines), no branch device. Everything else is a
-//! typed [`DscRefusal`].
+//! The same module carries the rest of `intel_dp_compute_link_config`:
+//! the pipe bpp. NARF's pipe tops out at 8 bpc (Linux's selection with
+//! `max bpc` 8); the sink's EDID bpc (`drm_edid.c::update_display_info`
+//! and its bpc quirks) and, for eDP, the VBT's `edp.bpp`
+//! (`intel_dp_max_bpp`, `intel_edp_fixup_vbt_bpp`) can lower it to 6 bpc,
+//! and `intel_dp_compute_link_config_wide` drops to 18 bpp before DSC is
+//! tried. A 6 bpc pipe dithers (`bdw_set_pipe_misc`) and sets
+//! `TRANS_DDI_FUNC_CTL` BPC_6 and the MSA's 6 bpc
+//! (`intel_ddi_set_dp_msa`): [`pipe_misc`], [`trans_ddi_bpc`],
+//! [`msa_misc`].
+//!
+//! Qualified DSC profile: one pipe, no joiner (big, ultra or
+//! uncompressed), RGB, a DSC input of at most 8 bpc, 8b/10b SST (UHBR
+//! refused upstream), at most four slices per line (two VDSC engines), no
+//! branch device. Everything else is a typed [`DscRefusal`].
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::drm_dsc::{self, Pps};
@@ -262,8 +283,6 @@ pub enum DscRefusal {
     LineBufDepth,
     /// `drm_dsc_compute_rc_parameters` -ERANGE.
     RcParameters,
-    /// Linux carries the stream uncompressed at 6 bpc; the pipe is 8 bpc.
-    SixBpcUnqualified,
     /// The link's maximum rate is not RBR, HBR, HBR2 or HBR3.
     LinkRateUnqualified,
     /// The compressed stream exceeds the eDP link Linux trains (this
@@ -277,11 +296,11 @@ pub enum DscRefusal {
 
 // ── Source (display 14) ──────────────────────────────────────────
 
-/// NARF's pipe: 8 bpc (`PIPE_MISC` BPC_8); Linux's `crtc_state->pipe_bpp`
-/// with `max bpc` 8.
+/// NARF's widest pipe: 8 bpc (`PIPE_MISC` BPC_8); Linux's
+/// `crtc_state->pipe_bpp` with `max bpc` 8.
 pub const PIPE_BPP: u32 = 24;
-/// `intel_display_min_pipe_bpp`.
-const MIN_PIPE_BPP: u32 = 18;
+/// `intel_display_min_pipe_bpp`: 6 bpc.
+pub const MIN_PIPE_BPP: u32 = 18;
 /// `intel_dp_dsc_min_src_input_bpc` / `_max_src_input_bpc` (display 12+).
 const SRC_MIN_INPUT_BPC: u32 = 8;
 const SRC_MAX_INPUT_BPC: u32 = 12;
@@ -352,6 +371,10 @@ pub struct LinkLimits {
     pub rates: [u32; 9],
     /// `limits->max_lane_count` (1, 2 or 4).
     pub max_lanes: u8,
+    /// `intel_dp->use_max_params`: the minimum rate and lane count are
+    /// the maximum ones (an eDP panel below 1.4, or the retry after a
+    /// failed eDP training).
+    pub use_max: bool,
 }
 
 impl LinkLimits {
@@ -367,21 +390,37 @@ impl LinkLimits {
         Self {
             rates,
             max_lanes: lane_floor(max_lanes),
+            use_max: false,
         }
     }
 
+    /// The rates `limits->min_rate..=max_rate` admits, ascending.
     fn rates(&self) -> impl Iterator<Item = u32> + '_ {
-        self.rates.iter().copied().take_while(|&r| r != 0)
+        let max = self.max_rate();
+        self.rates
+            .iter()
+            .copied()
+            .take_while(|&r| r != 0)
+            .filter(move |&r| !self.use_max || r == max)
     }
 
     /// `limits->max_rate`.
     pub fn max_rate(&self) -> u32 {
-        self.rates().last().unwrap_or(0)
+        self.rates
+            .iter()
+            .copied()
+            .take_while(|&r| r != 0)
+            .last()
+            .unwrap_or(0)
     }
 
+    /// `limits->min_lane_count..=max_lane_count`, doubling.
     fn lanes(&self) -> impl Iterator<Item = u32> {
         let max = u32::from(self.max_lanes);
-        [1u32, 2, 4].into_iter().filter(move |&l| l <= max)
+        let min = if self.use_max { max } else { 1 };
+        [1u32, 2, 4]
+            .into_iter()
+            .filter(move |&l| l >= min && l <= max)
     }
 }
 
@@ -394,11 +433,32 @@ fn lane_floor(lanes: u8) -> u8 {
     }
 }
 
-/// `intel_dp_compute_link_config_wide` for NARF's pipe: the highest
-/// uncompressed bpp in 24..=18 (steps of 6), then the lowest rate, then
-/// the fewest lanes, that carries the mode. `None` when DSC is needed.
-pub fn uncompressed_link(limits: &LinkLimits, mode: &Mode) -> Option<(u32, u32, u8)> {
-    let mut bpp = PIPE_BPP;
+/// An uncompressed link configuration: `crtc_state->pipe_bpp`,
+/// `port_clock` and `lane_count`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UncompressedLink {
+    /// 24 (8 bpc) or 18 (6 bpc, dithered).
+    pub pipe_bpp: u32,
+    /// Linux link units (kHz of the symbol clock: 162000 = RBR).
+    pub link_rate: u32,
+    /// 1, 2 or 4.
+    pub lanes: u8,
+}
+
+/// `intel_dp_compute_config_link_bpp_limits(dsc = false)` and
+/// `intel_dp_compute_link_config_wide` for an RGB pipe whose maximum is
+/// `max_bpp` ([`max_pipe_bpp`]): the link bpp range is
+/// `intel_display_min_pipe_bpp`..=`rounddown(max_bpp, 2 * 3)`; the highest
+/// bpp (steps of 6), then the lowest rate, then the fewest lanes, that
+/// carries the mode wins. `None` when no uncompressed configuration does
+/// (Linux then tries DSC).
+pub fn uncompressed_link(
+    limits: &LinkLimits,
+    mode: &Mode,
+    max_bpp: u32,
+) -> Option<UncompressedLink> {
+    let max_bpp = max_bpp.min(PIPE_BPP);
+    let mut bpp = max_bpp - max_bpp % 6;
     while bpp >= MIN_PIPE_BPP {
         for rate in limits.rates() {
             for lanes in limits.lanes() {
@@ -410,13 +470,155 @@ pub fn uncompressed_link(limits: &LinkLimits, mode: &Mode) -> Option<(u32, u32, 
                     false,
                 );
                 if need <= max_link_data_rate(rate, lanes) {
-                    return Some((bpp, rate, lanes as u8));
+                    return Some(UncompressedLink {
+                        pipe_bpp: bpp,
+                        link_rate: rate,
+                        lanes: lanes as u8,
+                    });
                 }
             }
         }
         bpp -= 6;
     }
     None
+}
+
+// ── Pipe bpp (6 bpc) ─────────────────────────────────────────────
+
+/// `drm_add_display_info`'s `display_info.bpc` from a base EDID block
+/// (`update_display_info`, Linux b90c984d `drm_edid.c`): 0 below EDID 1.3
+/// or for an analog input; a 1.3 digital "DFP 1.x" sink assumes 8; 1.4
+/// takes the color bit depth field (6..16, 0 undefined); then the
+/// panel-ID bpc quirks (`EDID_QUIRK_FORCE_6BPC` .. `_12BPC`). The CTA
+/// HDMI deep-color input Linux also parses for 1.3 sinks only ever yields
+/// 8 bpc or more, which this 8 bpc pipe treats as 8, so it is not read.
+pub fn edid_display_bpc(edid: &[u8]) -> u8 {
+    let (Some(&revision), Some(&input)) = (edid.get(19), edid.get(20)) else {
+        return 0;
+    };
+    let mut bpc = 0;
+    if revision >= 3 && input & EDID_INPUT_DIGITAL != 0 {
+        if revision == 3 && input & EDID_DIGITAL_DFP_1_X != 0 {
+            bpc = 8;
+        }
+        if revision >= 4 {
+            bpc = match (input >> 4) & 7 {
+                1 => 6,
+                2 => 8,
+                3 => 10,
+                4 => 12,
+                5 => 14,
+                6 => 16,
+                _ => 0,
+            };
+        }
+    }
+    if let (Some(&m0), Some(&m1), Some(&p0), Some(&p1)) =
+        (edid.get(8), edid.get(9), edid.get(10), edid.get(11))
+    {
+        // drm_edid_get_panel_id: mfg_id big-endian, product id little-endian.
+        let id = u32::from(m0) << 24 | u32::from(m1) << 16 | u32::from(p0) | u32::from(p1) << 8;
+        if let Some(&(_, force)) = EDID_BPC_QUIRKS.iter().find(|(q, _)| *q == id) {
+            bpc = force;
+        }
+    }
+    bpc
+}
+
+/// `DRM_EDID_INPUT_DIGITAL`.
+const EDID_INPUT_DIGITAL: u8 = 1 << 7;
+/// `DRM_EDID_DIGITAL_DFP_1_X`.
+const EDID_DIGITAL_DFP_1_X: u8 = 1 << 0;
+
+/// `drm_edid_encode_panel_id`.
+const fn panel_id(v: &[u8; 3], product: u16) -> u32 {
+    ((v[0] - b'@') as u32 & 0x1f) << 26
+        | ((v[1] - b'@') as u32 & 0x1f) << 21
+        | ((v[2] - b'@') as u32 & 0x1f) << 16
+        | product as u32
+}
+
+/// The bpc entries of `edid_quirk_list`, with the bpc each forces. Each
+/// panel ID appears once in that list, so `edid_get_quirks`' first match
+/// is the entry itself.
+const EDID_BPC_QUIRKS: [(u32, u8); 12] = [
+    (panel_id(b"AEO", 0), 6),
+    (panel_id(b"BNQ", 0x78d6), 8),
+    (panel_id(b"BOE", 0x78b), 6),
+    (panel_id(b"CPT", 0x17df), 6),
+    (panel_id(b"SDC", 0x3652), 6),
+    (panel_id(b"BOE", 0x0771), 6),
+    (panel_id(b"LGD", 764), 10),
+    (panel_id(b"SNY", 0x2541), 12),
+    (panel_id(b"SDC", 18514), 6),
+    (panel_id(b"SEC", 0xd033), 8),
+    (panel_id(b"ETR", 13896), 8),
+    (panel_id(b"SHP", 0x154c), 6),
+];
+
+/// The pipe's maximum bpp for a sink whose `display_info.bpc` is
+/// `display_bpc` (0: undefined): `compute_baseline_pipe_bpp` and
+/// `compute_sink_pipe_bpp` with the connector's `max_bpc` (the EDID bpc,
+/// 8 when undefined) capped at NARF's 8 bpc, then `intel_dp_max_bpp`'s
+/// eDP clamp: a panel whose EDID has no bpc takes the VBT's `edp.bpp`
+/// (`vbt_edp_bpp`; 0 for none, and always 0 for DP) when it is lower.
+pub fn max_pipe_bpp(display_bpc: u8, vbt_edp_bpp: u8) -> u32 {
+    let max_bpc = match display_bpc {
+        0 => 8,
+        bpc => bpc.min(8),
+    };
+    let bpp = if max_bpc < 8 { MIN_PIPE_BPP } else { PIPE_BPP };
+    let vbt = u32::from(vbt_edp_bpp);
+    if display_bpc == 0 && vbt != 0 && vbt < bpp {
+        vbt
+    } else {
+        bpp
+    }
+}
+
+/// `PIPE_MISC_BPC_6`, `PIPE_MISC_DITHER_ENABLE`, `PIPE_MISC_DITHER_TYPE_SP`
+/// (0) and `PIPE_MISC_PIXEL_ROUNDING_TRUNC` (`intel_display_regs.h`).
+const PIPE_MISC_BPC_6: u32 = 2 << 5;
+const PIPE_MISC_DITHER_ENABLE: u32 = 1 << 4;
+const PIPE_MISC_PIXEL_ROUNDING_TRUNC: u32 = 1 << 8;
+/// `PIPE_MISC` relative to the pipe block.
+pub const PIPE_MISC_OFFSET: u64 = 0x30;
+
+/// `bdw_set_pipe_misc` for an RGB pipe on display 14: `BPC_8` (0) or
+/// `BPC_6`; `crtc_state->dither` is `pipe_bpp == 6 * 3` (no compliance
+/// test forces it off), which adds `DITHER_ENABLE | DITHER_TYPE_SP`;
+/// `PIXEL_ROUNDING_TRUNC` on display 12+.
+pub const fn pipe_misc(pipe_bpp: u32) -> u32 {
+    if pipe_bpp == MIN_PIPE_BPP {
+        PIPE_MISC_BPC_6 | PIPE_MISC_DITHER_ENABLE | PIPE_MISC_PIXEL_ROUNDING_TRUNC
+    } else {
+        PIPE_MISC_PIXEL_ROUNDING_TRUNC
+    }
+}
+
+/// `TRANS_DDI_BPC_6` / `TRANS_DDI_BPC_8`
+/// (`intel_ddi_transcoder_func_reg_val_get`).
+pub const fn trans_ddi_bpc(pipe_bpp: u32) -> u32 {
+    if pipe_bpp == MIN_PIPE_BPP {
+        2 << 20
+    } else {
+        0
+    }
+}
+
+/// `TRANS_MSA_MISC` relative to the transcoder (`_TRANSA_MSA_MISC` 0x60410).
+pub const TRANS_MSA_MISC_OFFSET: u64 = 0x410;
+
+/// `intel_ddi_set_dp_msa` for RGB without limited range or a VSC SDP:
+/// `DP_MSA_MISC_SYNC_CLOCK` with `DP_MSA_MISC_6_BPC` (0) or `_8_BPC`
+/// (1 << 5). An 18 bpp pipe is never limited range
+/// (`intel_dp_limited_color_range`).
+pub const fn msa_misc(pipe_bpp: u32) -> u32 {
+    if pipe_bpp == MIN_PIPE_BPP {
+        1
+    } else {
+        1 | (1 << 5)
+    }
 }
 
 // ── eDP sink ─────────────────────────────────────────────────────
@@ -468,9 +670,43 @@ impl EdpCaps {
         self.edp_rev >= DP_EDP_14 && self.dsc.supports_dsc()
     }
 
+    /// The panel's rate table in Linux link units (`intel_edp_set_sink_rates`:
+    /// `val * 200 / 10` up to the first zero) and its length; empty
+    /// without a table.
+    pub fn sink_rates(&self) -> ([u32; 8], usize) {
+        let mut sink = [0u32; 8];
+        let n = self.link_rates.iter().take_while(|&&r| r != 0).count();
+        for (dst, &v) in sink.iter_mut().zip(self.link_rates.iter().take(n)) {
+            *dst = u32::from(v) * 200 / 10;
+        }
+        (sink, n)
+    }
+
+    /// `intel_dp_compute_rate` for an eDP panel: with a rate table
+    /// (`intel_dp->use_rate_select`) the `DP_LINK_RATE_SET` index of
+    /// `link_rate` (`intel_dp_rate_select`); `None` for a panel trained
+    /// with `DP_LINK_BW_SET`, or a rate missing from its table.
+    pub fn rate_select(&self, link_rate: u32) -> Option<u8> {
+        let (sink, n) = self.sink_rates();
+        sink[..n]
+            .iter()
+            .position(|&r| r == link_rate)
+            .map(|i| i as u8)
+    }
+
+    /// The panel publishes `DP_SUPPORTED_LINK_RATES` (`use_rate_select`).
+    pub fn has_rate_table(&self) -> bool {
+        self.sink_rates().1 != 0
+    }
+
     /// The common rates of this panel and the C10 PHY, capped by the VBT's
     /// eDP maximum (`vbt_max_link_rate`; 0 for none), and the panel's lane
-    /// count: `intel_dp_common_rates` / `intel_dp_max_common_lane_count`.
+    /// count: `intel_dp_common_rates` / `intel_dp_max_common_lane_count`,
+    /// with `use_max_params` for an eDP panel below 1.4
+    /// (`intel_edp_init_dpcd`). A panel with neither a table nor a valid
+    /// `DP_MAX_LINK_RATE` takes Linux's defaults (`intel_dp_set_sink_rates`:
+    /// RBR; `intel_dp_set_max_sink_lane_count`: one lane for a count other
+    /// than 1, 2 or 4).
     pub fn limits(&self, vbt_max_rate: u32) -> LinkLimits {
         let src_max = if vbt_max_rate != 0 {
             vbt_max_rate.min(810_000)
@@ -479,14 +715,10 @@ impl EdpCaps {
         };
         let mut rates = [0u32; 9];
         let mut n = 0;
-        let table: usize = self.link_rates.iter().take_while(|&&r| r != 0).count();
+        let (sink, table) = self.sink_rates();
         if table != 0 {
-            // intel_edp_set_sink_rates: rate = val * 200 / 10; then the
-            // intersection with the source rates (both ascending).
-            let mut sink = [0u32; 8];
-            for (dst, &v) in sink.iter_mut().zip(self.link_rates.iter().take(table)) {
-                *dst = u32::from(v) * 200 / 10;
-            }
+            // intel_edp_set_sink_rates, then the intersection with the
+            // source rates (both ascending).
             for &r in MTL_C10_RATES.iter().filter(|&&r| r <= src_max) {
                 if sink[..table].contains(&r) && n < rates.len() {
                     rates[n] = r;
@@ -497,14 +729,25 @@ impl EdpCaps {
             // intel_dp_set_dpcd_sink_rates: the standard rates up to
             // DP_MAX_LINK_RATE (drm_dp_bw_code_to_link_rate).
             let max = u32::from(self.receiver[DP_MAX_LINK_RATE]) * 27_000;
-            for &r in DP_RATES.iter().filter(|&&r| r <= max && r <= src_max) {
-                rates[n] = r;
-                n += 1;
+            let mut sink_any = false;
+            for &r in DP_RATES.iter().filter(|&&r| r <= max) {
+                sink_any = true;
+                if r <= src_max {
+                    rates[n] = r;
+                    n += 1;
+                }
+            }
+            if !sink_any {
+                rates[0] = DP_RATES[0];
             }
         }
         LinkLimits {
             rates,
-            max_lanes: lane_floor((self.receiver[DP_MAX_LANE_COUNT] & 0x1f).min(4)),
+            max_lanes: match self.receiver[DP_MAX_LANE_COUNT] & 0x1f {
+                l @ (1 | 2 | 4) => l,
+                _ => 1,
+            },
+            use_max: self.edp_rev < DP_EDP_14,
         }
     }
 }
@@ -516,12 +759,15 @@ pub enum EdpVbt {
     Missing,
     /// The panel is chosen by PnP ID (not implemented).
     PanelByPnpId,
-    /// The selected panel's `dsc_disable` and `max_link_rate` (0: none).
+    /// The selected panel's `dsc_disable`, `max_link_rate` (0: none) and
+    /// `bpp` (0: none).
     Panel {
         /// `edp.dsc_disable`.
         dsc_disable: bool,
         /// `edp.max_link_rate` in link units, 0 when absent.
         max_link_rate: u32,
+        /// `edp.bpp` (18, 24 or 30), 0 when absent or reserved.
+        bpp: u8,
     },
 }
 
@@ -540,10 +786,12 @@ impl EdpVbt {
                 Some(edp) => EdpVbt::Panel {
                     dsc_disable: edp.dsc_disable.unwrap_or(false),
                     max_link_rate: edp.max_link_rate_khz.unwrap_or(0),
+                    bpp: edp.bpp.unwrap_or(0),
                 },
                 None => EdpVbt::Panel {
                     dsc_disable: false,
                     max_link_rate: 0,
+                    bpp: 0,
                 },
             },
         }
@@ -553,6 +801,16 @@ impl EdpVbt {
     pub fn max_link_rate(&self) -> u32 {
         match *self {
             EdpVbt::Panel { max_link_rate, .. } => max_link_rate,
+            _ => 0,
+        }
+    }
+
+    /// `vbt.edp.bpp` (0 for none). A panel chosen by PnP ID has no known
+    /// entry here, so it takes no VBT clamp (a LINUX-GAP: Linux matches
+    /// the EDID against the VBT's PnP table).
+    pub fn edp_bpp(&self) -> u8 {
+        match *self {
+            EdpVbt::Panel { bpp, .. } => bpp,
             _ => 0,
         }
     }
@@ -586,29 +844,54 @@ pub fn installed_edp_vbt() -> EdpVbt {
     *EDP_VBT.lock()
 }
 
-/// What the Pipe-A eDP modeset does with a panel (`intel_dp_compute_link_config`
-/// for NARF's 8 bpc pipe).
+/// `intel_edp_fixup_vbt_bpp`, from `intel_ddi_get_config`'s readout of a
+/// lit eDP transcoder: when the pipe runs at more than the VBT's
+/// `edp.bpp`, that bpp becomes the VBT's ("some machines in UEFI boot mode
+/// provide us a VBT that has 18 bpp ... yet the same BIOS boots up with
+/// 24 bpp"). The installed facts change for every later decision, as
+/// Linux changes `connector->panel.vbt.edp.bpp`.
+pub fn fixup_vbt_bpp(pipe_bpp: u32) {
+    let mut vbt = EDP_VBT.lock();
+    if let EdpVbt::Panel { ref mut bpp, .. } = *vbt {
+        if *bpp != 0 && pipe_bpp > u32::from(*bpp) {
+            *bpp = pipe_bpp.min(u32::from(u8::MAX)) as u8;
+        }
+    }
+}
+
+/// `intel_dp_compute_link_config`'s outcome.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EdpDecision {
-    /// The panel is not DSC capable: the uncompressed path, unchanged.
-    NotCapable,
-    /// 24 bpp fits the panel's link uncompressed.
-    Uncompressed,
+pub enum LinkDecision {
+    /// Uncompressed: 24 bpp, or 18 bpp (6 bpc) when only that fits or the
+    /// sink limits the pipe to it.
+    Uncompressed(UncompressedLink),
     /// Compress with this plan.
     Dsc(DscPlan),
 }
 
-/// `intel_dp_compute_link_config` for the eDP panel: uncompressed when
-/// 24 bpp fits, a refusal when only 18 bpp fits, DSC otherwise.
-pub fn decide_edp(caps: &EdpCaps, vbt: &EdpVbt, mode: &Mode) -> Result<EdpDecision, DscRefusal> {
-    if !caps.dsc_capable() {
-        return Ok(EdpDecision::NotCapable);
+/// `intel_dp_compute_link_config` for the eDP panel with NARF's 8 bpc
+/// pipe: the pipe's maximum is [`max_pipe_bpp`] of the EDID's
+/// `display_bpc` and the VBT's `edp.bpp`; the uncompressed link with the
+/// highest bpp that fits (24, then 18) wins; only when none fits is the
+/// stream compressed, from the same pipe maximum. A panel that cannot
+/// decompress then refuses `SinkUnsupported` ("DSC required but not
+/// available"). `use_max` forces `use_max_params`, as the retry after a
+/// failed eDP training does (`intel_dp_get_link_train_fallback_values`).
+pub fn decide_edp(
+    caps: &EdpCaps,
+    vbt: &EdpVbt,
+    display_bpc: u8,
+    mode: &Mode,
+    use_max: bool,
+) -> Result<LinkDecision, DscRefusal> {
+    let max_bpp = max_pipe_bpp(display_bpc, vbt.edp_bpp());
+    let mut limits = caps.limits(vbt.max_link_rate());
+    limits.use_max |= use_max;
+    if let Some(link) = uncompressed_link(&limits, mode, max_bpp) {
+        return Ok(LinkDecision::Uncompressed(link));
     }
-    let limits = caps.limits(vbt.max_link_rate());
-    match uncompressed_link(&limits, mode) {
-        Some((PIPE_BPP, _, _)) => return Ok(EdpDecision::Uncompressed),
-        Some(_) => return Err(DscRefusal::SixBpcUnqualified),
-        None => {}
+    if !caps.dsc_capable() {
+        return Err(DscRefusal::SinkUnsupported);
     }
     vbt.allows_dsc()?;
     if !DP_RATES.contains(&limits.max_rate()) {
@@ -619,7 +902,7 @@ pub fn decide_edp(caps: &EdpCaps, vbt: &EdpVbt, mode: &Mode) -> Result<EdpDecisi
         is_edp: true,
         fec_capable: false,
     };
-    compute(&sink, &limits, mode).map(EdpDecision::Dsc)
+    compute(&sink, &limits, mode, max_bpp).map(LinkDecision::Dsc)
 }
 
 // ── Compression decision ─────────────────────────────────────────
@@ -672,12 +955,13 @@ fn round_up(x: u32, step: u32) -> u32 {
     ((x - 1) | (step - 1)) + 1
 }
 
-/// `intel_dp_dsc_compute_pipe_bpp_limits` from Linux's 18..=`PIPE_BPP`:
-/// the source's 8..=12 bpc aligned to the sink's input depths.
-fn pipe_bpp_limits(dpcd: &DscDpcd) -> Option<(u32, u32)> {
+/// `intel_dp_dsc_compute_pipe_bpp_limits` from Linux's 18..=`max_bpp`
+/// (the pipe maximum, [`max_pipe_bpp`]): the source's 8..=12 bpc aligned
+/// to the sink's input depths.
+fn pipe_bpp_limits(dpcd: &DscDpcd, max_bpp: u32) -> Option<(u32, u32)> {
     let (bpcs, n) = dpcd.input_bpcs();
     let min = MIN_PIPE_BPP.max(SRC_MIN_INPUT_BPC * 3);
-    let max = PIPE_BPP.min(SRC_MAX_INPUT_BPC * 3);
+    let max = max_bpp.min(PIPE_BPP).min(SRC_MAX_INPUT_BPC * 3);
     // align_min_sink_dsc_input_bpp: lowest first; align_max: highest first.
     let min = bpcs[..n]
         .iter()
@@ -756,8 +1040,14 @@ pub fn slice_height(vactive: u32) -> u32 {
 }
 
 /// `intel_dp_dsc_compute_config` (SST, one pipe) after
-/// `intel_dp_compute_config_limits(dsc = true)`.
-pub fn compute(sink: &DscSink, limits: &LinkLimits, mode: &Mode) -> Result<DscPlan, DscRefusal> {
+/// `intel_dp_compute_config_limits(dsc = true)` with the pipe maximum
+/// `max_bpp` ([`max_pipe_bpp`]).
+pub fn compute(
+    sink: &DscSink,
+    limits: &LinkLimits,
+    mode: &Mode,
+    max_bpp: u32,
+) -> Result<DscPlan, DscRefusal> {
     let dpcd = &sink.dpcd;
     // intel_dp_supports_dsc: DSC, and FEC on DP.
     if !dpcd.supports_dsc() {
@@ -773,7 +1063,7 @@ pub fn compute(sink: &DscSink, limits: &LinkLimits, mode: &Mode) -> Result<DscPl
         return Err(DscRefusal::NoBppRange);
     }
     // intel_dp_compute_config_limits(dsc = true).
-    let (_, pipe_max) = pipe_bpp_limits(dpcd).ok_or(DscRefusal::NoBppRange)?;
+    let (_, pipe_max) = pipe_bpp_limits(dpcd, max_bpp).ok_or(DscRefusal::NoBppRange)?;
     let min_x16 = min_compressed_bpp_x16(dpcd);
     let max_x16 = max_compressed_bpp_x16(dpcd, hdisplay, pipe_max, pipe_max * 16);
     if min_x16 == 0 || min_x16 > max_x16 {
@@ -1649,17 +1939,18 @@ pub struct DpDscSink {
 }
 
 /// `intel_dp_compute_link_config` for an external DP sink with NARF's
-/// 8 bpc pipe: `None` when 24 bpp fits uncompressed (the route's own
-/// negotiation then runs), a plan when DSC (with FEC) carries it.
+/// 8 bpc pipe whose maximum is `max_bpp` ([`max_pipe_bpp`] of the EDID's
+/// bpc): the uncompressed link with the highest bpp that fits (24, then
+/// 18) wins before DSC; otherwise DSC with FEC from the same pipe maximum,
+/// or a typed refusal.
 pub fn decide_dp(
     sink: &DpDscSink,
     limits: &LinkLimits,
     mode: &Mode,
-) -> Result<Option<DscPlan>, DscRefusal> {
-    match uncompressed_link(limits, mode) {
-        Some((PIPE_BPP, _, _)) => return Ok(None),
-        Some(_) => return Err(DscRefusal::SixBpcUnqualified),
-        None => {}
+    max_bpp: u32,
+) -> Result<LinkDecision, DscRefusal> {
+    if let Some(link) = uncompressed_link(limits, mode, max_bpp) {
+        return Ok(LinkDecision::Uncompressed(link));
     }
     if !sink.dsc.dpcd.supports_dsc() {
         return Err(DscRefusal::SinkUnsupported);
@@ -1667,7 +1958,7 @@ pub fn decide_dp(
     if sink.branch {
         return Err(DscRefusal::BranchDevice);
     }
-    compute(&sink.dsc, limits, mode).map(Some)
+    compute(&sink.dsc, limits, mode, max_bpp).map(LinkDecision::Dsc)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
