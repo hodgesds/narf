@@ -24,6 +24,9 @@ pub(super) enum Queue {
     Video,
     /// Voice, ACH3 / `RTW89_TX_QSEL_VO_0`.
     Voice,
+    /// Band0 high queue, CH9 / `RTW89_TX_QSEL_B0_HI`: AP frames sent after
+    /// the DTIM beacon (`IEEE80211_TX_CTL_SEND_AFTER_DTIM`). AP role only.
+    High,
 }
 impl Queue {
     /// `rtw89_core_get_qsel` + `rtw89_core_get_ch_dma` for a QoS TID.
@@ -42,6 +45,7 @@ impl Queue {
             Self::Video => 2,
             Self::Voice => 3,
             Self::Management => 8,
+            Self::High => 9,
         }
     }
     pub(super) fn qsel(self) -> u8 {
@@ -51,12 +55,13 @@ impl Queue {
             Self::Video => 2,
             Self::Voice => 3,
             Self::Management => 0x12,
+            Self::High => 0x11,
         }
     }
     pub(super) fn regs(self) -> dma::TxRingRegs {
         dma::addr_set_for_chip(ChipId::Rtl8852B).tx[self.channel() as usize]
     }
-    /// `R_AX_PCIE_DMA_STOP1` bit for this channel (`B_AX_STOP_ACHn`/`CH8`).
+    /// `R_AX_PCIE_DMA_STOP1` bit for this channel (`B_AX_STOP_ACHn`/`CH8`/`CH9`).
     pub(super) fn stop_bit(self) -> u32 {
         1 << (8 + u32::from(self.channel()))
     }
@@ -430,6 +435,128 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
     put(&mut bytes, 40, 1 << 31 | u32::from(frame[4] & 1 == 0) << 27);
     Ok((bytes, queue))
 }
+/// `B_AX_STOP_CH9`: the AP high queue stop bit.
+pub(super) const STOP_CH9: u32 = 1 << 17;
+/// Every TX stop bit the AP role can open (ordinary plus CH9).
+pub(super) const AP_STOP_ALL: u32 = STOP_ALL | STOP_CH9;
+/// AP role rings: every ordinary ring plus the CH9 high queue.
+pub(super) fn ap_queues(qos_all: bool) -> alloc::vec::Vec<Queue> {
+    let mut queues = Queue::ordinary(qos_all).to_vec();
+    queues.push(Queue::High);
+    queues
+}
+/// One AP-role transmission (`rtw89_core_tx_update_desc_info` for an AP
+/// vif): the MACID of the peer link or, without one, the vif MACID
+/// (`rtw89_core_tx_get_mac_id`), the vif port used only for HIQ, and
+/// `IEEE80211_TX_CTL_SEND_AFTER_DTIM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ApTx {
+    pub(super) mac_id: u8,
+    pub(super) port: u8,
+    pub(super) after_dtim: bool,
+    pub(super) report: bool,
+    /// Fixed rate index (management: CCK1/OFDM6) or `FIRMWARE_RA | lowest`.
+    pub(super) rate: u8,
+}
+/// The AP-role queue of `frame`: `rtw89_core_get_tx_type` (management and
+/// any Null are MGMT), `rtw89_core_get_qsel_mgmt`/`rtw89_core_get_qsel`
+/// with `hiq` mapping both to `RTW89_TX_QSEL_B0_HI`.
+pub(super) fn classify_ap(frame: &[u8], own: [u8; 6], after_dtim: bool) -> Result<Queue, Error> {
+    if frame.len() < 24 || frame.len() > MAX_MPDU || !unicast(&own) || frame[10..16] != own {
+        return Err(Error::Frame);
+    }
+    let group = frame[4] & 1 != 0;
+    let management = frame[0] & 0x0c == 0 || matches!(frame[0], 0x48 | 0xc8);
+    // Only group-addressed frames are buffered for after-DTIM delivery.
+    if after_dtim && !group {
+        return Err(Error::Frame);
+    }
+    if frame[0] & 0x0c == 0 && frame[16..22] != own {
+        return Err(Error::Frame);
+    }
+    // Group-addressed Null/QoS-Null, probe/auth/assoc responses are invalid.
+    if group && (matches!(frame[0], 0x48 | 0xc8 | 0x10 | 0x30 | 0x50 | 0xb0)) {
+        return Err(Error::Frame);
+    }
+    if !group && !unicast(&frame[4..10]) {
+        return Err(Error::Frame);
+    }
+    Ok(if after_dtim {
+        Queue::High
+    } else if management {
+        Queue::Management
+    } else {
+        qos_tid(frame).map_or(Queue::Data, Queue::for_tid)
+    })
+}
+/// AP-role TXWD (`rtw89_core_fill_txdesc` for the AP vif): MACID, QSEL and
+/// channel from [`classify_ap`], `INFO0_MULTIPORT_ID` = port for HIQ only,
+/// management HW SSN selector1/mode1 with a fixed rate, data host
+/// sequence with firmware RA or a fixed rate, `INFO4_RTS_EN` unicast only.
+pub(super) fn transmit_ap(
+    frame: &[u8],
+    own: [u8; 6],
+    tx: ApTx,
+    sequence: u16,
+    address: u64,
+) -> Result<(Vec<u8>, Queue), Error> {
+    let queue = classify_ap(frame, own, tx.after_dtim)?;
+    let management = frame[0] & 0x0c == 0 || matches!(frame[0], 0x48 | 0xc8);
+    let adaptive = tx.rate & FIRMWARE_RA != 0;
+    let index = tx.rate & !(FIRMWARE_RA | DATA_ER);
+    if tx.mac_id >= 128
+        || tx.port > 4
+        || tx.port != 0 && !tx.after_dtim
+        || sequence >= IDENTITIES
+        || index > 11
+        || tx.rate & DATA_ER != 0
+        || management && !matches!(tx.rate, 0 | OFDM6)
+        // Group frames carry the vif MACID and no firmware RA peer.
+        || frame[4] & 1 != 0 && adaptive
+    {
+        return Err(Error::Metadata);
+    }
+    extent(address, frame.len())?;
+    let baseline = tx_transport::prepare_header_ap(
+        TxwdInfo {
+            channel: queue.channel(),
+            qsel: queue.qsel(),
+            mac_id: tx.mac_id,
+            pkt_size: frame.len() as u16,
+        },
+        sequence,
+        address,
+        frame,
+    )
+    .map_err(|_| Error::Frame)?;
+    let mut bytes = alloc::vec![0; HEADER];
+    bytes[..24].copy_from_slice(&baseline[..24]);
+    bytes[48..].copy_from_slice(&baseline[24..]);
+    let body0 = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| Error::Metadata)?);
+    if qos_tid(frame).is_some_and(super::qos::tid_indicate) {
+        let body2 = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| Error::Metadata)?);
+        put(&mut bytes, 8, body2 | 1 << 23);
+    }
+    put(
+        &mut bytes,
+        0,
+        body0 | 1 << 22 | if management { 5 } else { 0 },
+    );
+    let port = u32::from(tx.port) << 4;
+    if adaptive {
+        put(&mut bytes, 24, port);
+        put(&mut bytes, 28, u32::from(index) << 16);
+    } else {
+        put(
+            &mut bytes,
+            24,
+            1 << 30 | 1 << 10 | u32::from(tx.rate) << 16 | port,
+        );
+    }
+    put(&mut bytes, 36, u32::from(tx.report) << 10);
+    put(&mut bytes, 40, 1 << 31 | u32::from(frame[4] & 1 == 0) << 27);
+    Ok((bytes, queue))
+}
 pub(super) fn descriptor(address: u64) -> Result<[u8; 8], Error> {
     extent(address, HEADER)?;
     let mut bytes = [0; 8];
@@ -442,3 +569,7 @@ pub(super) fn descriptor(address: u64) -> Result<[u8; 8], Error> {
 #[cfg(feature = "kernel-test")]
 #[path = "packet_format/tests.rs"]
 mod tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "packet_format/ap_tests.rs"]
+mod ap_tests;

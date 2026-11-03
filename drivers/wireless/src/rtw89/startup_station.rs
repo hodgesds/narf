@@ -497,6 +497,72 @@ unsafe impl Io for Startup {
             .disconnect(&mut native.station_cleanup(), admission)
             .await
     }
+    fn ap_allowed(&mut self) -> Result<(), power::Error> {
+        self.ap_admissible()
+    }
+    async fn ap_prepare(
+        &mut self,
+        own: [u8; 6],
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        Startup::ap_prepare(self, own, admission).await
+    }
+    async fn ap_start(
+        &mut self,
+        config: crate::rtw89::ap_control::PortConfig,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        Startup::ap_start(self, config, admission).await
+    }
+    async fn ap_publish_beacon(
+        &mut self,
+        beacon: &[u8],
+        tim_at: usize,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        Startup::ap_publish_beacon(self, beacon, tim_at, admission).await
+    }
+    async fn ap_add_peer(
+        &mut self,
+        addr: [u8; 6],
+        admission: &control::Admission,
+    ) -> Result<u8, power::Error> {
+        Startup::ap_add_peer(self, addr, admission).await
+    }
+    async fn ap_associate_peer(
+        &mut self,
+        addr: [u8; 6],
+        aid: u16,
+        ra: [u8; 16],
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        Startup::ap_associate_peer(self, addr, aid, ra, admission).await
+    }
+    async fn ap_remove_peer(
+        &mut self,
+        addr: [u8; 6],
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        Startup::ap_remove_peer(self, addr, admission).await
+    }
+    async fn ap_stop(&mut self, admission: &control::Admission) -> Result<(), power::Error> {
+        Startup::ap_stop(self, admission).await
+    }
+    fn ap_packet_ready(&self) -> bool {
+        Startup::ap_packet_ready(self)
+    }
+    fn ap_lowest_rate(&mut self) -> Result<u8, power::Error> {
+        Startup::ap_lowest_rate(self)
+    }
+    fn packet_submit_ap(
+        &mut self,
+        bytes: &[u8],
+        after_dtim: bool,
+        report: bool,
+        rate: u8,
+    ) -> Result<u64, packet::Error> {
+        self.ap_submit(bytes, after_dtim, report, rate)
+    }
     fn packet_prepare(&mut self, own: [u8; 6], macid: u8) -> Result<(), packet::Error> {
         if self.station_controller.as_ref().is_none_or(|controller| {
             controller.phase() != control::Phase::Passive || controller.own() != own

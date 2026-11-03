@@ -134,6 +134,8 @@ struct Pending {
     /// Published with TXWD AGG_EN (an operational originator session).
     agg: bool,
     fragment: Option<super::command_native::FragmentPart>,
+    /// TXWD MACID (always the owner MACID for a station).
+    mac_id: u8,
 }
 /// Most data MPDUs the aggregate emitter keeps in flight at once
 /// (`radio_policy::Program::Ampdu`). Every other frame is alone in flight.
@@ -174,6 +176,9 @@ pub(super) struct Step {
     pub(super) rssi: Option<u8>,
     /// IE01 CFO for this owner's MACID (`rtw89_phy_cfo_parse`).
     pub(super) cfo: Option<i16>,
+    /// AP role only: the long-RXD `AX_RXD_MAC_ID` of `frame` (zero for a
+    /// short RXD), the hardware address-CAM classification of the peer.
+    pub(super) rx_mac_id: Option<u8>,
 }
 struct Submission<'a> {
     bytes: &'a [u8],
@@ -202,6 +207,9 @@ pub(super) struct Core {
     amsdu: Option<usize>,
     /// Last published A-Control form (`rtwvif_link->last_a_ctrl`).
     last_a_ctrl: bool,
+    /// AP role (`prepare_ap`): multi-peer MACIDs, CH9 HIQ, unacknowledged
+    /// RPQ releases are ordinary TX status rather than a failure.
+    ap: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
 /// Receive PHY admission granted by the signed operating programs.
@@ -294,10 +302,38 @@ impl Core {
         qos_all: bool,
         rx: RxPhy,
     ) -> Result<Self, Error> {
+        Self::prepare_role(
+            port,
+            own,
+            mac_id,
+            format::Queue::ordinary(qos_all),
+            rx,
+            false,
+        )
+    }
+    /// AP role for the vif on MACID0/port0: the ordinary rings plus the CH9
+    /// high queue (pci.c `rtw89_pci_init_tx_ring` for `RTW89_TXCH_CH9`, the
+    /// RTL8852B `B0HIQ` HFC channel already sized by `mac_runtime`).
+    pub(super) fn prepare_ap(
+        port: &mut impl Port,
+        own: [u8; 6],
+        qos_all: bool,
+        rx: RxPhy,
+    ) -> Result<Self, Error> {
+        let queues = format::ap_queues(qos_all);
+        Self::prepare_role(port, own, 0, &queues, rx, true)
+    }
+    fn prepare_role(
+        port: &mut impl Port,
+        own: [u8; 6],
+        mac_id: u8,
+        queues: &[format::Queue],
+        rx: RxPhy,
+        ap: bool,
+    ) -> Result<Self, Error> {
         if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
             return Err(Error::Packet);
         }
-        let queues = format::Queue::ordinary(qos_all);
         let stop = queues
             .iter()
             .fold(format::STOP_WPDMA, |mask, queue| mask | queue.stop_bit());
@@ -335,6 +371,7 @@ impl Core {
                 aggregate: false,
                 amsdu: None,
                 last_a_ctrl: false,
+                ap,
             };
             for ring in &mut owner.rings {
                 let regs = ring.kind.regs();
@@ -492,7 +529,7 @@ impl Core {
             agg,
             fragment,
         } = submission;
-        if self.phase != Phase::Running {
+        if self.phase != Phase::Running || self.ap {
             return Err(Error::State);
         }
         if agg.is_some() && !self.aggregate {
@@ -632,6 +669,7 @@ impl Core {
                     report: false,
                     agg: agg.is_some(),
                     fragment: fragment.cloned(),
+                    mac_id: self.mac_id,
                 });
                 copy_to(
                     ring.descriptors.as_ref().ok_or(Error::State)?,
@@ -662,6 +700,113 @@ impl Core {
         }
         result
     }
+    /// AP role: one frame on its `classify_ap` ring with the caller-resolved
+    /// peer MACID (`Port::peer_allowed` re-proves the binding at both
+    /// publication checks). Every frame is alone in flight.
+    pub(super) fn submit_ap<P: Port>(
+        &mut self,
+        port: &mut P,
+        bytes: &[u8],
+        tx: format::ApTx,
+    ) -> Result<u64, Error> {
+        if self.phase != Phase::Running || !self.ap {
+            return Err(Error::State);
+        }
+        if !self.ready() {
+            return Err(Error::Busy);
+        }
+        let kind = format::classify_ap(bytes, self.own, tx.after_dtim)?;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).ok_or(Error::State)?;
+        let mut issued = false;
+        let result = port.current(|port| {
+            port.ordinary_allowed()?;
+            port.peer_allowed(bytes)?;
+            let packet = Packet {
+                header: allocate(port, format::HEADER)?,
+                body: allocate(port, bytes.len())?,
+                id,
+                length: bytes.len(),
+            };
+            let ring = self
+                .rings
+                .iter_mut()
+                .find(|ring| ring.kind == kind)
+                .ok_or(Error::Packet)?;
+            let ticket = ring
+                .queue
+                .reserve(packet, tx.mac_id, kind.qsel())
+                .map_err(|(e, _)| Error::from(e))?;
+            if ticket.sequence >= format::IDENTITIES {
+                let _ = ring.queue.abort(ticket)?;
+                return Err(Error::State);
+            }
+            let packet = ring.queue.reserved_mut(ticket)?;
+            let preparation = (|| {
+                let (header, actual) = format::transmit_ap(
+                    bytes,
+                    self.own,
+                    tx,
+                    ticket.sequence,
+                    packet.body.dma_addr().raw(),
+                )?;
+                if actual != kind {
+                    return Err(Error::Packet);
+                }
+                copy_to(&packet.body, 0, bytes)?;
+                copy_to(&packet.header, 0, &header)?;
+                format::descriptor(packet.header.dma_addr().raw()).map_err(Error::from)
+            })();
+            let descriptor = match preparation {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = ring.queue.abort(ticket)?;
+                    return Err(error);
+                }
+            };
+            let result = (|| {
+                port.ordinary_allowed()?;
+                port.peer_allowed(bytes)?;
+                issued = true;
+                ring.queue.publish(ticket)?;
+                self.pending.push(Pending {
+                    id,
+                    ticket,
+                    queue: kind,
+                    started: port.now_us(),
+                    report: false,
+                    agg: false,
+                    fragment: None,
+                    mac_id: tx.mac_id,
+                });
+                copy_to(
+                    ring.descriptors.as_ref().ok_or(Error::State)?,
+                    usize::from(ticket.slot) * 8,
+                    &descriptor,
+                )?;
+                barrier();
+                port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
+                if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
+                    return Err(Error::Access);
+                }
+                self.next_id = next_id;
+                Ok(id)
+            })();
+            if result.is_err() && !issued {
+                let _ = ring.queue.abort(ticket)?;
+            }
+            result
+        });
+        if result.is_err() && (issued || result != Err(Error::Busy)) {
+            self.phase = Phase::Failed;
+            let _ = Self::close_dma(port, self.stop);
+        }
+        result
+    }
+    /// Whether this owner is the AP role.
+    pub(super) fn ap(&self) -> bool {
+        self.ap
+    }
     /// Whether this owner published the ring for `queue`.
     pub(super) fn has_queue(&self, queue: format::Queue) -> bool {
         self.rings.iter().any(|ring| ring.kind == queue)
@@ -669,9 +814,13 @@ impl Core {
     fn completed(&mut self, completion: tx_transport::Completion<Packet>) -> Result<(), Error> {
         // All non-success release statuses are terminal; ownership is no longer
         // ambiguous but the station must never consume a success receipt.
-        if completion.status != 0 {
+        // AP role: pci.c `rtw89_pci_tx_status` maps any non-TX_DONE release
+        // (retry limit, lifetime, MACID drop) to a frame without
+        // IEEE80211_TX_STAT_ACK; it is ordinary peer TX status.
+        if completion.status != 0 && !self.ap {
             return Err(Error::Packet);
         }
+        let acknowledged = completion.status == 0;
         let packet = completion.resource;
         let index = self
             .pending
@@ -685,7 +834,7 @@ impl Core {
         self.completions.push_back(Receipt {
             id: packet.id,
             bytes,
-            radio_acknowledged: true,
+            radio_acknowledged: acknowledged,
         });
         self.pending.remove(index);
         Ok(())
@@ -724,6 +873,9 @@ impl Core {
                     && (16..=format::MAX_MPDU).contains(&bytes.len())
                     && meta.size == bytes.len() + 4
                 {
+                    if self.ap {
+                        step.rx_mac_id = Some(meta.mac_id);
+                    }
                     step.frame = Some(Frame { bytes });
                 }
             }
@@ -748,6 +900,9 @@ impl Core {
                 // An actual A-MPDU subframe is DONTFRAG. Raw fragment
                 // numbers cannot enter ordinary BA reorder as equal-SN DATA.
                 if !meta.ampdu || !super::fragment_rx::fragmented(&bytes) {
+                    if self.ap {
+                        step.rx_mac_id = Some(meta.mac_id);
+                    }
                     step.frame = Some(Frame { bytes });
                 }
             }
@@ -759,7 +914,7 @@ impl Core {
                     // Multi-entry RPQ retirement: each report names exactly
                     // one unreported in-flight frame by WD sequence, queue
                     // and MACID; anything else is a stale/forged release.
-                    if report.mac_id != self.mac_id {
+                    if !self.ap && report.mac_id != self.mac_id {
                         return Err(Error::Packet);
                     }
                     let pending = self
@@ -767,6 +922,7 @@ impl Core {
                         .iter_mut()
                         .find(|pending| {
                             !pending.report
+                                && report.mac_id == pending.mac_id
                                 && report.sequence == pending.ticket.sequence
                                 && report.channel == pending.queue.channel()
                                 && report.qsel == pending.queue.qsel()

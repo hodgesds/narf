@@ -64,6 +64,8 @@ pub struct Startup {
     full_radio: super::radio_full::Radio,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
+    /// AP-role control owner (`startup_ap.rs`); exclusive with the station.
+    ap_controller: Option<super::ap_control::ApController>,
     sleep: Option<runtime_sleep::Runtime>,
     monitor: Option<super::monitor::Controller>,
     /// Running WoW image state (`startup_wow.rs`).
@@ -142,6 +144,7 @@ impl Startup {
             full_radio: super::radio_full::Radio::default(),
             station_controller: None,
             station_binding: None,
+            ap_controller: None,
             sleep: None,
             monitor: None,
             wow: None,
@@ -529,6 +532,8 @@ impl Drop for Startup {
         self.fail();
     }
 }
+#[path = "startup_ap.rs"]
+mod ap;
 #[path = "startup_lps.rs"]
 mod runtime_sleep;
 #[path = "startup_station.rs"]

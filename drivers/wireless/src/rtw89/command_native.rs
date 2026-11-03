@@ -27,6 +27,8 @@ mod fragment;
 pub(super) use fragment::{
     Binding as FragmentBinding, Part as FragmentPart, Train as FragmentTrain,
 };
+#[path = "command_native/ap.rs"]
+mod ap;
 #[path = "command_native/lps.rs"]
 mod lps;
 #[path = "command_native/monitor.rs"]

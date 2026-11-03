@@ -2877,6 +2877,50 @@ execution. Unexecuted new cases:
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
 `smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.
 
+### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
+
+`Startup` now retains an `ApController` beside the same `Firmware<Native>`
+(`startup_ap.rs`), exclusive with the station and monitor owners (both
+hold MACID0/port0/address CAM 0). `station::Io` gains default-unsupported
+AP methods (`ap_prepare`/`ap_start`/`ap_publish_beacon`/`ap_add_peer`/
+`ap_associate_peer`/`ap_remove_peer`/`ap_stop`/`packet_submit_ap`), so
+every existing implementation keeps refusing AP. `ap_prepare` runs
+`rtw89_mac_vif_init` and then publishes the AP packet owner; the
+controller is retained before every await.
+
+`packet_core::Core::prepare_ap` (`command_native/ap.rs`
+`prepare_ap_packets`) publishes the ordinary rings plus the CH9 high queue
+(pci.c `rtw89_pci_init_tx_ring` for `RTW89_TXCH_CH9`; the RTL8852B `B0HIQ`
+HFC channel 4/342 is already programmed by `mac_runtime`, the DMA-stop
+proof already covers CH9). The AP stop mask is `STOP_ALL | B_AX_STOP_CH9`
+only while the AP binding exists; the station mask and bytes are unchanged.
+`submit_ap` publishes one frame at a time; the native owner resolves the
+TXWD MACID (`rtw89_core_tx_get_mac_id`: bound peer, else vif MACID0 for
+group frames and management to an unbound peer), refuses unicast data/Null
+to an unbound peer at both publication checks, uses the vif port only for
+HIQ (`desc_info->port = hiq ? port : 0`), the band floor rate for
+management/Null/group frames and firmware RA (only with the signed RA
+program) or the floor for unicast data. `packet_format::transmit_ap`
+follows `rtw89_core_tx_update_desc_info`: `rtw89_core_get_tx_type`
+(management and any Null are MGMT), `rtw89_core_get_qsel_mgmt` /
+`rtw89_core_get_qsel` with `SEND_AFTER_DTIM` -> `B0_HI`/CH9, MGMT HW SSN
+selector1/mode1, `INFO0_MULTIPORT_ID`, `INFO3_SPE_RPT`, `INFO4_RTS_EN`
+unicast only. `tx_transport::prepare_header_ap` admits only FromDS data,
+QoS data with EOSP (no +HTC), Null/QoS-Null, the AP management subtypes
+and host CCMP on FromDS data/robust management; the station validator is
+untouched. RPQ releases match pending frames by MACID as well as WD
+sequence/queue; in the AP role a non-TX_DONE release is ordinary TX status
+(`radio_acknowledged = false`, pci.c `rtw89_pci_tx_status`) instead of a
+failure. RX in the AP role reports the long-RXD `AX_RXD_MAC_ID` beside
+each frame (`Step::rx_mac_id`) for MACID classification of the peer.
+
+Still missing for `uapsd`: the interface (narf_wireless AP controls and
+per-peer host RSNA), signed AP channel/power admission, `ap_ps` wiring
+and the advertisement. No AP or U-APSD capability is advertised. Two new
+cases are written, unexecuted:
+`smoke_rtw89_ap_txwd_macid_qsel_port_and_rates`,
+`smoke_rtw89_ap_txwd_refuses_station_and_misplaced_frames`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before

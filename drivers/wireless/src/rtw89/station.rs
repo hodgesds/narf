@@ -293,6 +293,64 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<u64, packet::Error> {
         Err(packet::Error::State)
     }
+    // AP role (`startup_ap.rs`): exclusive with the station owner. Default
+    // unsupported; no AP capability follows from these alone.
+    fn ap_allowed(&mut self) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_prepare(&mut self, _: [u8; 6], _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_start(
+        &mut self,
+        _: super::ap_control::PortConfig,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_publish_beacon(
+        &mut self,
+        _: &[u8],
+        _: usize,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_add_peer(&mut self, _: [u8; 6], _: &Admission) -> Result<u8, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_associate_peer(
+        &mut self,
+        _: [u8; 6],
+        _: u16,
+        _: [u8; 16],
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_remove_peer(&mut self, _: [u8; 6], _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_stop(&mut self, _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn ap_packet_ready(&self) -> bool {
+        false
+    }
+    fn ap_lowest_rate(&mut self) -> Result<u8, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// One AP frame (`after_dtim`: CH9 HIQ); the native owner resolves the
+    /// peer MACID and refuses unbound unicast data.
+    fn packet_submit_ap(
+        &mut self,
+        _: &[u8],
+        _: bool,
+        _: bool,
+        _: u8,
+    ) -> Result<u64, packet::Error> {
+        Err(packet::Error::State)
+    }
     fn packet_prepare(&mut self, own: [u8; 6], macid: u8) -> Result<(), packet::Error>;
     fn packet_start(&mut self) -> Result<(), packet::Error>;
     fn packet_ready(&self) -> bool;

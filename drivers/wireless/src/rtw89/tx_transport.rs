@@ -456,6 +456,80 @@ fn prepare_header_profile(
     {
         return Err(Error::BadFrame);
     }
+    encode_header(chip, info, sequence, frame_dma, frame, header_length)
+}
+/// RTL8852B AP-role TXWD formatting (`rtw89_core_tx_update_desc_info` for
+/// an AP vif). Admits only the frames a host-SME AP emits: FromDS data,
+/// QoS data (EOSP allowed without +HTC, mac80211 `ieee80211_send_null_response`
+/// / `_deliver_response`), Null/QoS-Null, and the AP management subtypes
+/// with no DS bits. Host CCMP is admitted on FromDS data and robust
+/// management. The caller proves the actual AP peer/MACID binding.
+pub(super) fn prepare_header_ap(
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if sequence > 0x7fff
+        || info.channel >= 12
+        || info.mac_id >= 128
+        || channel_for_qsel(info.qsel) != Ok(info.channel)
+        || frame.len() < 24
+        || frame.len() > 0x3fff
+        || info.pkt_size as usize != frame.len()
+        || frame[0] & 3 != 0
+        || frame[22] & 0xf != 0
+    {
+        return Err(Error::BadFrame);
+    }
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    let ds = fc & 0x0300;
+    let subtype = fc & 0x00fc;
+    // No MoreFrag, PwrMgt (AP), Order/+HTC; Retry is hardware-owned.
+    if fc & (0x0400 | 0x0800 | 0x1000 | 0x8000) != 0 {
+        return Err(Error::BadFrame);
+    }
+    let header_length = match subtype {
+        0x10 | 0x30 | 0x50 | 0xa0 | 0xb0 | 0xc0 | 0xd0 if ds == 0 => 24,
+        0x08 | 0x48 if ds == 0x0200 => 24,
+        0x88 | 0xc8 if ds == 0x0200 => {
+            // TID0..7, normal ack policy, no A-MSDU; EOSP permitted.
+            if frame.len() < 26 || frame[24] & 0xe8 != 0 || frame[25] != 0 {
+                return Err(Error::BadFrame);
+            }
+            26
+        }
+        _ => return Err(Error::BadFrame),
+    };
+    if fc & 0x4000 != 0
+        && (!(matches!(subtype, 0x08 | 0x88) && ds == 0x0200
+            || matches!(subtype, 0xa0 | 0xc0 | 0xd0))
+            || frame.len() < header_length + if fc & 0x0c == 0 { 18 } else { 24 }
+            || frame[header_length + 2] != 0
+            || frame[header_length + 3] & 0x3f != 0x20)
+    {
+        return Err(Error::BadFrame);
+    }
+    if fc & 0x4000 == 0 && matches!(subtype, 0x48 | 0xc8) && frame.len() != header_length {
+        return Err(Error::BadFrame);
+    }
+    encode_header(
+        ChipId::Rtl8852B,
+        info,
+        sequence,
+        frame_dma,
+        frame,
+        header_length,
+    )
+}
+fn encode_header(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+    header_length: usize,
+) -> Result<Vec<u8>, Error> {
     // B uses the AX baseline descriptor encoding, but its retained/native
     // device mask is36 bits. Encoding capacity is not device DMA authority.
     let dma_mask = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) {

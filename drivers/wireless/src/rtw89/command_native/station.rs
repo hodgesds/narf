@@ -13,6 +13,8 @@ pub(super) struct Runtime {
     pub(super) backlog: VecDeque<rx_packet::Event>,
     started: bool,
     pub(super) rf_tracking: Option<crate::rtw89::rf_tracking::Tracker>,
+    /// AP-role packet binding (`command_native/ap.rs`); None for a station.
+    pub(super) ap: Option<super::ap::ApBinding>,
 }
 impl Runtime {
     pub(super) fn started(&self) -> bool {
@@ -146,7 +148,7 @@ impl Native {
             }
         }
     }
-    fn packet_operation<T>(
+    pub(super) fn packet_operation<T>(
         &mut self,
         operation: impl FnOnce(&mut packet::Core, &mut Access<'_>) -> Result<T, packet::Error>,
     ) -> Result<T, packet::Error> {
@@ -194,7 +196,7 @@ impl Native {
     /// passive-only (DFS / NO_IR) active primary only a station witness
     /// grant admits a frame. Without a full-radio scope only the base
     /// 2.4GHz channel can be active, which is never passive-admitted.
-    fn station_tx_current(&self) -> Result<(), packet::Error> {
+    pub(super) fn station_tx_current(&self) -> Result<(), packet::Error> {
         match self.full_radio_scope() {
             Some(qualification) => qualification
                 .tx_current()
@@ -400,6 +402,7 @@ impl Native {
             packet::Port::stop(&mut self.station_cleanup())
         };
         self.station_runtime.peer = None;
+        self.station_runtime.ap = None;
         self.station_runtime.started = false;
         self.fail();
         result?;
@@ -597,6 +600,9 @@ unsafe impl packet::Port for Access<'_> {
             .map_err(Into::into)
     }
     fn peer_allowed(&mut self, bytes: &[u8]) -> Result<(), packet::Error> {
+        if let Some(ap) = self.native.station_runtime.ap.as_ref() {
+            return ap.admits(bytes);
+        }
         if self
             .native
             .station_runtime
@@ -691,9 +697,7 @@ unsafe impl packet::Port for Access<'_> {
         })
     }
     fn start(&mut self, open: u32) -> Result<(), packet::Error> {
-        if open & !crate::rtw89::packet_format::STOP_ALL != 0
-            || open & ORDINARY_STOP != ORDINARY_STOP
-        {
+        if open & !self.native.tx_stop_all() != 0 || open & ORDINARY_STOP != ORDINARY_STOP {
             return Err(packet::Error::State);
         }
         self.native
@@ -739,20 +743,18 @@ unsafe impl packet::Port for Access<'_> {
             }
             self.native.io.write32(0xc000, v & !(1 << 29))
         });
+        let stop_all = self.native.tx_stop_all();
         let dma = self.native.io.read32(0x1010).and_then(|v| {
             if v == u32::MAX {
                 return Err(power::Error::Gone);
             }
-            self.native
-                .io
-                .write32(0x1010, v | crate::rtw89::packet_format::STOP_ALL)
+            self.native.io.write32(0x1010, v | stop_all)
         });
         self.native.station_runtime.started = false;
         cmac?;
         dma?;
         if self.native.io.read32(0xc000)? & (1 << 29) != 0
-            || self.native.io.read32(0x1010)? & crate::rtw89::packet_format::STOP_ALL
-                != crate::rtw89::packet_format::STOP_ALL
+            || self.native.io.read32(0x1010)? & stop_all != stop_all
         {
             return Err(packet::Error::Access);
         }
