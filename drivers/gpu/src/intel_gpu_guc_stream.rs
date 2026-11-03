@@ -665,16 +665,18 @@ impl Actor {
             if self.deadline == 0 {
                 self.deadline = now.saturating_add(TIMEOUT);
             }
-            if now >= self.deadline {
-                self.lost();
-                return Ok(true);
-            }
+            // guc_ct_send_locked retries -EBUSY and gives up only after a
+            // failed attempt: CT space found by a late poll sends.
             match ct.send(id, action, 0, &[value], false) {
                 Ok(()) => {
                     self.phase = next;
                     self.deadline = now.saturating_add(TIMEOUT);
                 }
-                Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+                Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {
+                    if now >= self.deadline {
+                        self.lost();
+                    }
+                }
                 Err(e) => {
                     self.lost();
                     return Err(e);
@@ -753,10 +755,6 @@ impl Actor {
         }
         let (buffer, states) = self.pending.as_ref().expect("copied flush frame");
         let _ = buffer;
-        if now >= self.deadline {
-            self.failure(crate::intel_gpu_user::io_error());
-            return Ok(true);
-        }
         if !access() {
             self.lost();
             return Ok(true);
@@ -811,7 +809,13 @@ impl Actor {
                 }
                 self.session.relay_publish(buffer);
             }
-            Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+            // The frame's bound covers only this ACK's CT backpressure. As
+            // guc_ct_send_locked, it fails only after an attempt finds no room.
+            Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {
+                if now >= self.deadline {
+                    self.failure(crate::intel_gpu_user::io_error());
+                }
+            }
             Err(e) => {
                 self.lost();
                 return Err(e);
