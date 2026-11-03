@@ -130,6 +130,10 @@ impl Grant {
     pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
         self.power.ht40_group(group)
     }
+    /// Factory OFDM index ceiling for one 5GHz channel group.
+    pub(super) fn band5_group(&self, group: usize) -> Option<u8> {
+        self.power.band5_group(group)
+    }
     /// Factory CCK/OFDM index ceilings for one 2.4GHz channel group.
     pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
         self.power.group_limits(group)

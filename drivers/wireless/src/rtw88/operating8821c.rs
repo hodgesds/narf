@@ -86,6 +86,9 @@ pub(super) struct Envelope {
     /// HT20 1S factory ceilings per channel group (`bw40_base[group]`).
     ht_groups: [Option<u8>; 5],
     ht40_groups: [Option<u8>; 5],
+    /// 5GHz OFDM factory ceilings per `rtw_get_channel_group` 5GHz group
+    /// (`band5::Power5g::ofdm`, path A, txgi factor 1, max index 0x3f).
+    band5_groups: [Option<u8>; 14],
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
     group_limits(factory, 0) // C21 factor1, channel1 group0, max_power_index0x3f.
@@ -171,6 +174,15 @@ impl Source {
                     .power_path(path)
                     .and_then(|p| super::ht::factory_limit_bw40(p, g, 63))
             });
+            // rtw8821c_read_efuse substitutes only the 2.4GHz record; 5GHz
+            // power always comes from path A.
+            e.band5_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(0)
+                    .and_then(super::band5::Power5g::parse)
+                    .and_then(|p| p.ofdm(g, 1))
+                    .map(|v| v.min(63))
+            });
             e
         })
     }
@@ -184,6 +196,10 @@ impl Envelope {
     }
     pub(super) fn ht_group(&self, group: usize) -> Option<u8> {
         self.ht_groups.get(group).copied().flatten()
+    }
+    /// Factory 5GHz OFDM index ceiling for one 5GHz channel group.
+    pub(super) fn band5_group(&self, group: usize) -> Option<u8> {
+        self.band5_groups.get(group).copied().flatten()
     }
     /// Factory HT40 1S index ceiling (`bw40_base[group]`, txgi factor 1).
     pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
@@ -270,6 +286,7 @@ impl Envelope {
             group_limits: [None; 5],
             ht_groups: [None; 5],
             ht40_groups: [None; 5],
+            band5_groups: [None; 14],
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {

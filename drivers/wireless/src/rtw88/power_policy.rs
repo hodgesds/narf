@@ -36,6 +36,9 @@ pub(super) struct Board {
     /// HT40 one-/two-stream factory ceilings per group (`bw40_base[group]`
     /// plus `ht_2s_diff.bw40`), min over both paths.
     ht40_groups: [Option<(u8, Option<u8>)>; 5],
+    /// Per-path 5GHz OFDM ceilings per 5GHz channel group
+    /// (`band5::Power5g::ofdm`, txgi factor 2, max index 0x7f).
+    band5_groups: [Option<[u8; 2]>; 14],
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -128,11 +131,21 @@ impl Board {
                 two(0).zip(two(1)).map(|(a, b)| a.min(b)),
             ))
         });
+        let band5_groups = core::array::from_fn(|group| {
+            let mut limit = [0; 2];
+            for (path, slot) in limit.iter_mut().enumerate() {
+                *slot = super::band5::Power5g::parse(factory.power_path(path as u8)?)?
+                    .ofdm(group, 2)?
+                    .min(127);
+            }
+            Some(limit)
+        });
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
             maximum,
             groups,
+            band5_groups,
             ht_groups,
             ht40_groups,
             ht: factory
@@ -610,6 +623,16 @@ impl Gate {
             Scope::C21(g) => g.group_limits(group),
         }
     }
+    /// Factory 5GHz OFDM index ceilings for one 5GHz channel group: C22
+    /// per path, C21 path A in both slots.
+    pub(super) fn band5_limits(&self, group: usize) -> Option<[u8; 2]> {
+        match &self.scope {
+            Scope::C22 { calibration, .. } => {
+                calibration.board.band5_groups.get(group).copied().flatten()
+            }
+            Scope::C21(g) => g.band5_group(group).map(|l| [l; 2]),
+        }
+    }
     /// Factory HT40 `(1S, 2S)` index ceilings for one 2.4GHz group.
     pub(super) fn ht40_limits(&self, group: usize) -> Option<(u8, Option<u8>)> {
         match &self.scope {
@@ -762,7 +785,7 @@ impl Gate {
     pub(super) fn cck_gains(&self) -> Option<[u8; 2]> {
         if let Some(g) = &self.channel {
             return super::channel_policy::Record::decode(self.did(), g.payload())
-                .filter(|_| self.did() == 0xc822)
+                .filter(|r| self.did() == 0xc822 && !r.band5())
                 .map(|r| r.gains);
         }
         match &self.scope {

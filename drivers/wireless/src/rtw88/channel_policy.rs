@@ -97,14 +97,23 @@ pub(super) const fn txdfir(channel: u8) -> u32 {
 ///
 /// | Bytes | Field |
 /// |---|---|
-/// | 0 | primary channel 2..=13 |
+/// | 0 | primary channel 2..=13, or a 5GHz primary (`band5::primary`) |
 /// | 1 | width 20 (MHz) |
 /// | 2..4 | antenna gain, quarter dBi |
 /// | 4..6 | qualified EIRP ceiling, quarter dBm |
 /// | 6..12 | measured peaks (IQK/calibration, response, data), quarter dBm |
-/// | 12..14 | C22 per-path CCK references (C21: zero) |
-/// | 14..26 | C21 TXAGC indices CCK1..11, OFDM6..54 (C22: zero) |
-/// | 26..64 | zero |
+/// | 12..14 | C22 per-path CCK references (2.4GHz only; else zero) |
+/// | 14..26 | C21 TXAGC indices CCK1..11, OFDM6..54 (C22: zero; 5GHz: CCK zero) |
+/// | 26..28 | C22 5GHz per-path OFDM references (REG_TX_PWR_REF_OFDM) |
+/// | 28..36 | C22 5GHz OFDM difference words 0x3a04 (6/9/12/18M), 0x3a08 (24..54M) |
+/// | 36..64 | zero |
+///
+/// The C22 5GHz selection mirrors `rtw8822c_set_tx_power_index`: a per-path
+/// OFDM reference plus one 7-bit signed difference per OFDM rate
+/// (`rtw8822c_set_tx_power_diff`), so OFDM rate r on path p transmits at
+/// index `ofdm[p] + diff(r)`. CCK is not transmitted on 5GHz
+/// (`rtw_phy_set_tx_power_level_by_path` skips the CCK section); its
+/// reference and differences stay zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Record {
     pub(super) channel: u8,
@@ -113,6 +122,8 @@ pub(super) struct Record {
     pub(super) peaks: [i16; 3],
     pub(super) gains: [u8; 2],
     pub(super) indices: [u8; 12],
+    pub(super) ofdm: [u8; 2],
+    pub(super) diffs: [u32; 2],
 }
 
 impl Record {
@@ -125,20 +136,56 @@ impl Record {
             peaks: [signed(6), signed(8), signed(10)],
             gains: [p[12], p[13]],
             indices: p[14..26].try_into().ok()?,
+            ofdm: [p[26], p[27]],
+            diffs: [
+                u32::from_le_bytes(p[28..32].try_into().ok()?),
+                u32::from_le_bytes(p[32..36].try_into().ok()?),
+            ],
         };
+        let five = record.band5();
         let chip = match did {
-            0xc822 => record.indices == [0; 12] && record.gains.iter().all(|g| *g <= 127),
-            0xc821 => record.gains == [0; 2] && record.indices.iter().all(|i| *i <= 63),
+            0xc822 if five => {
+                record.indices == [0; 12]
+                    && record.gains == [0; 2]
+                    && record.ofdm.iter().all(|r| *r <= 127)
+                    && record.diffs.iter().all(|w| w & 0x8080_8080 == 0)
+            }
+            0xc822 => {
+                record.indices == [0; 12]
+                    && record.gains.iter().all(|g| *g <= 127)
+                    && record.ofdm == [0; 2]
+                    && record.diffs == [0; 2]
+            }
+            0xc821 => {
+                record.gains == [0; 2]
+                    && record.ofdm == [0; 2]
+                    && record.diffs == [0; 2]
+                    && record.indices.iter().all(|i| *i <= 63)
+                    && (!five || record.indices[..4] == [0; 4])
+            }
             _ => false,
         };
         (chip
-            && (2..=LAST).contains(&record.channel)
+            && ((2..=LAST).contains(&record.channel) || five)
             && p[1] == 20
             && (0..=128).contains(&record.antenna)
             && (-512..=256).contains(&record.ceiling)
             && record.peaks.iter().all(|v| (-512..=256).contains(v))
-            && p[26..] == [0; PAYLOAD - 26])
+            && p[36..] == [0; PAYLOAD - 36])
             .then_some(record)
+    }
+    /// A 5GHz primary record.
+    pub(super) fn band5(&self) -> bool {
+        super::band5::primary(self.channel)
+    }
+    /// C22 signed OFDM difference for OFDM rate `rate` (0 = 6M .. 7 = 54M).
+    pub(super) fn diff(&self, rate: usize) -> i8 {
+        let byte = (self.diffs[rate / 4] >> (8 * (rate % 4))) as u8;
+        ((byte << 1) as i8) >> 1
+    }
+    /// Center frequency of the 20MHz primary on either band.
+    pub(super) fn frequency(&self) -> Option<u16> {
+        frequency(self.channel).or(super::band5::frequency(self.channel))
     }
 }
 
@@ -166,6 +213,64 @@ macro_rules! channel_kind {
     };
 }
 
+macro_rules! channel5_kind {
+    ($channel:literal, $stem:literal) => {
+        Kind {
+            tag: b'O',
+            stem: $stem,
+            source: concat!(
+                "Linux 7.3-rc4 rtw88 main.c rtw_set_channel; rtw8822c.c rtw8822c_set_channel_bb ",
+                "5G head/rtw_set_channel_mac/rtw8822c_set_channel_rf/rtw8822c_toggle_igi; ",
+                "rtw8821c.c rtw8821c_set_channel 20MHz incl. rtw8821c_switch_rf_set WLA; phy.c ",
+                "rtw_get_channel_group rtw_phy_get_5g_tx_power_index OFDM; rtw8822c_set_tx_power_index ",
+                "OFDM reference + rtw8822c_set_tx_power_diff / C21 OFDM TXAGC; no CCK; ",
+                "native TXPAUSE drain, legacy OFDM6 base only, 5GHz 20MHz non-DFS ",
+                $stem
+            )
+            .as_bytes(),
+            admit: |did, payload| admit(did, payload, $channel),
+        }
+    };
+}
+
+/// One static continuation kind per 5GHz 20MHz primary, in channel order.
+pub(super) static KINDS5: [Kind; 28] = [
+    channel5_kind!(36, "channel36"),
+    channel5_kind!(40, "channel40"),
+    channel5_kind!(44, "channel44"),
+    channel5_kind!(48, "channel48"),
+    channel5_kind!(52, "channel52"),
+    channel5_kind!(56, "channel56"),
+    channel5_kind!(60, "channel60"),
+    channel5_kind!(64, "channel64"),
+    channel5_kind!(100, "channel100"),
+    channel5_kind!(104, "channel104"),
+    channel5_kind!(108, "channel108"),
+    channel5_kind!(112, "channel112"),
+    channel5_kind!(116, "channel116"),
+    channel5_kind!(120, "channel120"),
+    channel5_kind!(124, "channel124"),
+    channel5_kind!(128, "channel128"),
+    channel5_kind!(132, "channel132"),
+    channel5_kind!(136, "channel136"),
+    channel5_kind!(140, "channel140"),
+    channel5_kind!(144, "channel144"),
+    channel5_kind!(149, "channel149"),
+    channel5_kind!(153, "channel153"),
+    channel5_kind!(157, "channel157"),
+    channel5_kind!(161, "channel161"),
+    channel5_kind!(165, "channel165"),
+    channel5_kind!(169, "channel169"),
+    channel5_kind!(173, "channel173"),
+    channel5_kind!(177, "channel177"),
+];
+
+/// 5GHz primaries in [`KINDS5`] order.
+pub(super) const PRIMARIES5: [u8; 28] = [
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165, 169, 173, 177,
+];
+
 /// One static continuation kind per noninitial primary, index `channel - 2`.
 pub(super) static KINDS: [Kind; 12] = [
     channel_kind!(2, "channel02"),
@@ -183,15 +288,38 @@ pub(super) static KINDS: [Kind; 12] = [
 ];
 
 pub(super) fn kind(channel: u8) -> Option<&'static Kind> {
-    (2..=LAST)
-        .contains(&channel)
-        .then(|| &KINDS[usize::from(channel - 2)])
+    if (2..=LAST).contains(&channel) {
+        return Some(&KINDS[usize::from(channel - 2)]);
+    }
+    PRIMARIES5
+        .iter()
+        .position(|c| *c == channel)
+        .map(|i| &KINDS5[i])
 }
 
 /// The record's TX power selection never exceeds the factory base of the
 /// channel's own group (C22: per-path CCK reference incl. RFE response
-/// adjustment; C21: CCK and 1S OFDM indices).
+/// adjustment; C21: CCK and 1S OFDM indices). On 5GHz the bound is the
+/// `rtw_phy_get_5g_tx_power_index` OFDM base of the channel's 5GHz group:
+/// C22 every per-path `reference + difference` lies in `0..=limit`, C21
+/// every OFDM index is at most the path-A limit.
 pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
+    if record.band5() {
+        let Some(limits) = super::band5::group(record.channel).and_then(|g| gate.band5_limits(g))
+        else {
+            return false;
+        };
+        return match gate.did() {
+            0xc822 => (0..2).all(|path| {
+                (0..8).all(|rate| {
+                    let v = i16::from(record.ofdm[path]) + i16::from(record.diff(rate));
+                    (0..=i16::from(limits[path])).contains(&v)
+                })
+            }),
+            0xc821 => record.indices[4..].iter().all(|i| *i <= limits[0]),
+            _ => false,
+        };
+    }
     let Some(limits) = group(record.channel).and_then(|g| gate.group_limits(g)) else {
         return false;
     };
@@ -210,7 +338,7 @@ pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
 /// measured peak plus antenna gain fits the minimum ceiling. Returns the
 /// admitted EIRP ceiling (quarter dBm).
 pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, Error> {
-    let center = u32::from(frequency(record.channel).ok_or(Error::Unsupported)?);
+    let center = u32::from(record.frequency().ok_or(Error::Unsupported)?);
     let (low, high) = (center - 10, center + 10);
     if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
         return Err(Error::Prerequisite);

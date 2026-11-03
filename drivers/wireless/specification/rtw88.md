@@ -2528,9 +2528,21 @@ Step 1 of `five_ghz_operation`: Linux 7.3-rc4 5GHz primitives only; no
   full 2.4GHz `_bb`/swing/BTG-WLG switch when returning. A swing byte above 9
   is refused (Linux uses setting 0).
 
-Remaining for the row: 5GHz N2xO records (OFDM selection: C22 per-path OFDM
-reference + difference words, C21 OFDM TXAGC; factory bound from
-`Power5g`), band-aware base rate (`rtw_tx_pkt_info_update_rate` OFDM6 /
+5GHz N2xO records (`channel_policy::Record`, payload bytes 26..36): a 5GHz
+primary record carries C22 per-path OFDM references (bytes 26..28) and the
+two OFDM difference words for 0x3a04/0x3a08 (bytes 28..36, four 7-bit
+signed `rtw8822c_set_tx_power_diff` bytes each, bit 7 clear), with the CCK
+references zero; C21 carries OFDM6..54 TXAGC indices with CCK1..11 zero.
+2.4GHz records must leave bytes 26..36 zero. One static Kind per 5GHz
+primary (`KINDS5`, stems `channel36`..`channel177`, file
+`rtw88/rtw882Xce-channelNN-v1-<mac>.bin`). `within_factory` bounds the
+selection by the channel's 5GHz group `Power5g::ofdm` (C22 txgi factor 2,
+max 0x7f, both paths: every `reference + difference` in `0..=limit`; C21
+factor 1, max 0x3f, path A, since `rtw8821c_read_efuse` substitutes only
+the 2.4GHz record). Regulatory admission uses the 5GHz center frequency.
+Written, unexecuted: `smoke_rtw88_channel5_record_ofdm_selection_and_kinds`.
+
+Remaining for the row: band-aware base rate (`rtw_tx_pkt_info_update_rate` OFDM6 /
 `RTW_RATEID_G`, `RRSR_INIT_5G` 0x150, RA `WIRELESS_OFDM`), gate/retune/scan/
 CSA wiring, 5GHz HT, and regulatory admission (DFS rules stay refused: no
 shared beacon-hint/DFS owner has landed).

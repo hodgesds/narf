@@ -509,3 +509,72 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_plain_rule_auto_bw_and_no_160mhz
 );
+
+fn smoke_rtw88_channel5_record_ofdm_selection_and_kinds() -> TestResult {
+    // 5GHz N2xO payload: C22 per-path OFDM reference + 0x3a04/0x3a08
+    // difference words; C21 OFDM TXAGC with CCK zero.
+    let mut c22 = payload(36, true);
+    c22[12..14].copy_from_slice(&[0, 0]);
+    c22[26..28].copy_from_slice(&[40, 38]);
+    // 6M +2, 9M -1 (0x7f), 12M 0, 18M -3 (0x7d); 24..54M -4 (0x7c).
+    c22[28..32].copy_from_slice(&[0x02, 0x7f, 0x00, 0x7d]);
+    c22[32..36].copy_from_slice(&[0x7c; 4]);
+    let Some(r) = Record::decode(0xc822, &c22) else {
+        return TestResult::Fail("valid C22 5GHz record refused");
+    };
+    if !r.band5()
+        || r.frequency() != Some(5180)
+        || [r.diff(0), r.diff(1), r.diff(2), r.diff(3), r.diff(7)] != [2, -1, 0, -3, -4]
+    {
+        return TestResult::Fail("C22 5GHz OFDM differences or frequency misdecoded");
+    }
+    let mut cck = c22;
+    cck[12] = 30;
+    let mut sign = c22;
+    sign[29] = 0x80;
+    let mut odd = c22;
+    odd[0] = 38;
+    let mut tail = c22;
+    tail[36] = 1;
+    let mut stale = payload(6, true);
+    stale[26] = 1;
+    if [cck, sign, odd, tail]
+        .iter()
+        .any(|p| Record::decode(0xc822, p).is_some())
+        || Record::decode(0xc822, &stale).is_some()
+    {
+        return TestResult::Fail(
+            "5GHz CCK, bad diff byte, non-primary, tail or 2.4GHz OFDM admitted",
+        );
+    }
+    let mut c21 = payload(149, false);
+    c21[14..18].copy_from_slice(&[0; 4]);
+    if Record::decode(0xc821, &c21).map(|r| r.indices[4]) != Some(28)
+        || Record::decode(0xc821, &payload(149, false)).is_some()
+    {
+        return TestResult::Fail("C21 5GHz record must carry OFDM only");
+    }
+    let (Some(k36), Some(k177)) = (channel_policy::kind(36), channel_policy::kind(177)) else {
+        return TestResult::Fail("5GHz primary without a static kind");
+    };
+    if k36.stem != "channel36"
+        || k177.stem != "channel177"
+        || !(k36.admit)(0xc822, &c22)
+        || (k177.admit)(0xc822, &c22)
+        || channel_policy::kind(38).is_some()
+        || channel_policy::kind(14).is_some()
+    {
+        return TestResult::Fail("5GHz kind identity/admission is not exact");
+    }
+    // Regulatory span 5170..5190 under a plain UNII-1 rule; DFS refuses.
+    let unii1 = domain(5170, 5250, 23, RegFlags::empty());
+    let dfs = domain(5170, 5250, 23, RegFlags::DFS);
+    if channel_policy::policy(&r, &unii1) != Ok(76) || channel_policy::policy(&r, &dfs).is_ok() {
+        return TestResult::Fail("5GHz record regulatory span not checked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_channel5_record_ofdm_selection_and_kinds
+);
