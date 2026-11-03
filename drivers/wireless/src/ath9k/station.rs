@@ -171,8 +171,9 @@ impl Drop for Attempt {
         }
     }
 }
-pub(super) struct Radio<P: Port, E: Environment> {
-    packet: Packet<P>,
+pub(super) struct Radio<P: Port, E: Environment, K: Engine = Packet<P>> {
+    packet: K,
+    _port: core::marker::PhantomData<fn() -> P>,
     environment: E,
     own: [u8; 6],
     noise: i16,
@@ -212,7 +213,7 @@ pub(super) struct Radio<P: Port, E: Environment> {
     force_twenty: bool,
     epoch: u64,
 }
-impl<P: Port, E: Environment> core::fmt::Debug for Radio<P, E> {
+impl<P: Port, E: Environment, K: Engine> core::fmt::Debug for Radio<P, E, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ar9285Station")
             .field("phase", &self.phase)
@@ -220,10 +221,11 @@ impl<P: Port, E: Environment> core::fmt::Debug for Radio<P, E> {
             .finish_non_exhaustive()
     }
 }
-impl<P: Port, E: Environment> Radio<P, E> {
-    pub(super) fn new(packet: Packet<P>, own: [u8; 6], noise: i16, environment: E) -> Self {
+impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
+    pub(super) fn new(packet: K, own: [u8; 6], noise: i16, environment: E) -> Self {
         Self {
             packet,
+            _port: core::marker::PhantomData,
             environment,
             own,
             noise,
@@ -2153,3 +2155,6 @@ fn plaintext_eapol(f: &[u8]) -> bool {
 #[cfg(feature = "kernel-test")]
 #[path = "station/tests.rs"]
 pub(super) mod tests;
+
+mod engine;
+pub(in crate::ath9k) use engine::Engine;

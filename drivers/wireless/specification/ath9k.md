@@ -2150,9 +2150,13 @@ supplied in-tree. Smoke (written, not executed):
 Still to port before `ar9300_enablement` can be claimed: the
 probe/station/retune/reset/periodic/suspend owner (`0x0030` registration,
 `Calibrated::Ar9300` with the EDMA packet owner and MAC profile, the 5 GHz
-APM chain-mask reduction in `tx_chainmask()`). `station::Radio` is concrete
-over the AR9002 `packet::Packet`, so the AR9003 EDMA owner needs either a
-packet-engine abstraction there or its own station.
+APM chain-mask reduction in `tx_chainmask()`). Step 5b-0:
+`station::Engine` (`station/engine.rs`) is the packet-engine trait
+`station::Radio<P, E, K: Engine = packet::Packet<P>>` drives; the AR9002
+`packet::Packet<P>` implements it by delegating to its inherent methods
+(mechanical extraction: AR9285/AR9287/AR9280/AR5008 behaviour and
+register streams unchanged). The AR9003 EDMA owner is to implement the
+same trait, so the AR9003 family shares one station.
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
