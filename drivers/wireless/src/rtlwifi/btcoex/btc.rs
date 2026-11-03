@@ -196,6 +196,14 @@ pub enum Packet {
     Eapol = 3,
 }
 
+/// `enum btc_power_save_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerSave {
+    WifiNative = 0,
+    LpsOn = 1,
+    LpsOff = 2,
+}
+
 /// `enum btc_bt_reg_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtReg {
@@ -925,6 +933,10 @@ impl<'a, H: Hal> Ctx<'a, H> {
     /// `BTC_GET_BL_HS_OPERATION` (always false on rtlwifi).
     pub const fn hs_operation(&self) -> bool {
         false
+    }
+    /// `BTC_GET_U1_IOT_PEER` (always `BTC_IOT_PEER_UNKNOWN` on rtlwifi).
+    pub const fn iot_peer(&self) -> u8 {
+        0
     }
     /// `BTC_GET_U1_LPS_MODE`.
     pub const fn lps_mode(&self) -> u8 {

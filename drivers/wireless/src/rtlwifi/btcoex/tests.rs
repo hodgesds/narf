@@ -288,3 +288,249 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/btcoex",
     smoke_rtlwifi_btc_lps_actions_and_aggregation
 );
+
+// ── halbtc8723b1ant ───────────────────────────────────────────────────────
+
+use super::b8723b1ant::{ap_tdma, ps_tdma_bytes, wifi_duration_adjust, B8723b1Ant, BtStatus};
+
+fn h2c_last(hal: &FakeHal, id: u8) -> Option<Vec<u8>> {
+    hal.h2c
+        .iter()
+        .rev()
+        .find(|h| h.0 == id)
+        .map(|h| h.1.clone())
+}
+
+/// Connected 8723BE station with a Linux-era firmware (>= 0x180000).
+fn coex_1ant() -> (BtCoexist, FakeHal, B8723b1Ant) {
+    let mut btc = BtCoexist::bind(pg(1, true));
+    btc.wifi.fw_version = 0x24;
+    btc.wifi.station_linked = true;
+    btc.wifi.current_channel = 6;
+    (btc, FakeHal::default(), B8723b1Ant::new())
+}
+
+/// `halbtc8723b1ant_ps_tdma` byte selection, `wifi_duration_adjust` and the
+/// `set_fw_ps_tdma` AP-mode rewrite.
+fn smoke_rtlwifi_btc8723b1ant_ps_tdma_tables() -> TestResult {
+    if wifi_duration_adjust(3, 0) != 5
+        || wifi_duration_adjust(3, 40) != -10
+        || wifi_duration_adjust(50, 40) != -10
+        || wifi_duration_adjust(50, 50) != -15
+        || wifi_duration_adjust(25, 50) != -15
+        || wifi_duration_adjust(10, 36) != -10
+        || wifi_duration_adjust(10, 0) != 0
+    {
+        return TestResult::Fail("wifi_duration_adjust");
+    }
+    // (turn_on, type, force_lps_on, adj, slave_a2dp, scan_ap_num, bytes)
+    type Case = (bool, u8, bool, i8, bool, u8, [u8; 5]);
+    let cases: [Case; 9] = [
+        (true, 2, false, 5, false, 10, [0x61, 0x32, 0x03, 0x11, 0x10]),
+        (
+            true,
+            2,
+            true,
+            -10,
+            false,
+            10,
+            [0x51, 0x23, 0x03, 0x10, 0x50],
+        ),
+        (
+            true,
+            101,
+            false,
+            0,
+            false,
+            10,
+            [0xe3, 0x3a, 0x03, 0x71, 0x10],
+        ),
+        (true, 32, false, 0, true, 10, [0x61, 0x35, 0x03, 0x11, 0x11]),
+        (true, 13, false, 0, false, 2, [0x51, 0x40, 0x03, 0x10, 0x10]),
+        (true, 14, false, 0, false, 2, [0x51, 0x30, 0x03, 0x10, 0x50]),
+        (
+            true,
+            99,
+            false,
+            0,
+            false,
+            10,
+            [0x51, 0x1a, 0x1a, 0x00, 0x11],
+        ),
+        (false, 8, false, 0, false, 10, [0x08, 0, 0, 0, 0]),
+        (false, 1, false, 0, false, 10, [0, 0, 0, 0x48, 0]),
+    ];
+    for (on, ty, lps, adj, slave, aps, want) in cases {
+        if ps_tdma_bytes(on, ty, lps, adj, slave, aps) != want {
+            return TestResult::Fail("ps_tdma byte table");
+        }
+    }
+    if ap_tdma([0x51, 0x1a, 0x1a, 0, 0x50], true) != [0x61, 0x1a, 0x1a, 0, 0x30]
+        || ap_tdma([0x51, 0x1a, 0x1a, 0, 0x50], false) != [0x51, 0x1a, 0x1a, 0, 0x50]
+        || ap_tdma([0x61, 1, 1, 1, 0x50], true) != [0x61, 1, 1, 1, 0x50]
+    {
+        return TestResult::Fail("AP-mode TDMA rewrite");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b1ant_ps_tdma_tables
+);
+
+/// `ex_btc8723b1ant_power_on_setting` on an S0 (aux) PCI board, then
+/// `rtl_btc_init_hw_config` with `bt_exist == 0` (`wifi_only`):
+/// `init_hw_config` + `init_coex_dm` + the BT info query.
+fn smoke_rtlwifi_btc8723b1ant_power_on_and_init_hw_config() -> TestResult {
+    let (mut btc, mut hal, mut a) = coex_1ant();
+    btc.bt_exist = false;
+    hal.regs.insert(0x2, 0x10);
+    hal.regs.insert(0x4c, 0x00);
+    hal.regs.insert(0x4f, 0x01);
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.power_on_setting(&mut a)).is_err() {
+            return TestResult::Fail("power on");
+        }
+    }
+    if !btc.stop_coex_dm
+        || btc.board_info.btdm_ant_pos != BTC_ANTENNA_AT_AUX_PORT
+        || hal.last(0x67) != Some(0x20)
+        || hal.writes.iter().all(|w| *w != (0x2, 0x13, 2))
+        || hal.last(0x765) != Some(0x18)
+        || hal.last(0x76e) != Some(0x4)
+        || hal.last(0x948) != Some(0)
+        || hal.last(0x384) != Some(1)
+    {
+        return TestResult::Fail("power_on_setting S0 writes");
+    }
+    hal.writes.clear();
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.init_hw_config(&mut a)).is_err() {
+            return TestResult::Fail("init hw config");
+        }
+    }
+    let ids: Vec<u8> = hal.h2c.iter().map(|h| h.0).collect();
+    if btc.stop_coex_dm
+        || !btc.initialized
+        // TDMA off(8) → PTA path (0x765 != 0 ⇒ 0x6e [0]), then the
+        // init path's 0x6e [1] and antenna-select 0x65.
+        || ids != [0x60, 0x6e, 0x6e, 0x65, 0x61]
+        || hal.h2c[0].1 != [0x08, 0, 0, 0, 0]
+        || hal.h2c[1].1 != [0]
+        || hal.h2c[2].1 != [1]
+        || hal.h2c[3].1 != [1, 0]
+        || hal.rf != [(BTC_RF_A, 0x1, 0xfffff, 0x780)]
+        // WIFI path on the aux port without the external switch.
+        || hal.last(0x948) != Some(0x280)
+        || hal.last(0x4c).map(|v| v & (3 << 23)) != Some(1 << 23)
+        || hal.last(0x6c0) != Some(0x5555_5555)
+        || hal.last(0x6c8) != Some(0x00ff_ffff)
+        || hal.last(0x6cc) != Some(0x3)
+        || hal.last(0x790) != Some(0x5)
+        || hal.last(0x778) != Some(0x1)
+        || !a.sta.c2h_bt_info_req_sent
+    {
+        return TestResult::Fail("init_hwconfig(wifi_only) sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b1ant_power_on_and_init_hw_config
+);
+
+/// A BT-response A2DP-busy `bt_info` C2H with a connected idle station:
+/// profile parse, `bt_status`, `limited_tx/rx`, low-penalty RA and the
+/// A2DP-only idle TDMA 32 / coex table 4.
+fn smoke_rtlwifi_btc8723b1ant_bt_info_a2dp_connected() -> TestResult {
+    let (mut btc, mut hal, mut a) = coex_1ant();
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        let _ = narf_scheduler::block_on(cx.power_on_setting(&mut a));
+        let _ = narf_scheduler::block_on(cx.init_hw_config(&mut a));
+    }
+    hal.h2c.clear();
+    // src BT_RSP; CONNECTION | ACL_BUSY | A2DP; TRx mask set; ext BIT4
+    // (auto report on); bit pool 48.
+    let info = [0x01, 0x49, 0x40, 0x30, 0x10, 0x00, 0x30];
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.bt_info_notify(&mut a, &info)).is_err() {
+            return TestResult::Fail("bt_info notify");
+        }
+    }
+    if !a.sta.a2dp_exist
+        || a.sta.num_of_profile != 1
+        || a.dm.bt_status != BtStatus::AclBusy
+        || a.sta.a2dp_bit_pool != 0x30
+        || !btc.bt_link_info.a2dp_only
+        || !btc.bt_info.bt_busy
+        || btc.bt_info.ra_mask != 0x3
+        || hal.last(0x434) != Some(0x0403_0201)
+        || hal.last(0x456) != Some(0x38)
+        || h2c_last(&hal, 0x69) != Some(alloc::vec![0x6, 0x1, 0x00, 0xf7, 0xf8, 0xf9])
+        || h2c_last(&hal, 0x60) != Some(alloc::vec![0x61, 0x35, 0x03, 0x11, 0x11])
+        || hal.last(0x6c4) != Some(0x5a5a_5a5a)
+        || h2c_last(&hal, 0x67).is_some()
+    {
+        return TestResult::Fail("A2DP connected-idle mechanism");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b1ant_bt_info_a2dp_connected
+);
+
+/// `ex_btc8723b1ant_periodical` without auto report: a BT info query per
+/// period and, after two all-zero counter periods, `bt_disabled` with the
+/// Wi-Fi-only action; then `rtl_btc_ips_notify(ERFOFF)`.
+fn smoke_rtlwifi_btc8723b1ant_periodical_bt_disable_and_ips() -> TestResult {
+    let (mut btc, mut hal, mut a) = coex_1ant();
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        let _ = narf_scheduler::block_on(cx.init_hw_config(&mut a));
+    }
+    hal.h2c.clear();
+    for _ in 0..2 {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.periodical(&mut a)).is_err() {
+            return TestResult::Fail("periodical");
+        }
+    }
+    let queries = hal.h2c.iter().filter(|h| h.0 == 0x61).count();
+    if queries != 2
+        || !a.sta.bt_disabled
+        || !btc.bt_info.bt_disabled
+        || btc.statistics.cnt_periodical != 2
+    {
+        return TestResult::Fail("BT disable monitor");
+    }
+    if hal.last(0x6c0) != Some(0x5555_5555)
+        || h2c_last(&hal, 0x60) != Some(alloc::vec![0x08, 0, 0, 0, 0])
+    {
+        return TestResult::Fail("action_wifi_only");
+    }
+    hal.regs.insert(0x4f, 0x01);
+    hal.regs.insert(0x4e, 0x80);
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.ips_notify(&mut a, true)).is_err() {
+            return TestResult::Fail("ips enter");
+        }
+    }
+    if !a.sta.under_ips
+        || h2c_last(&hal, 0x60) != Some(alloc::vec![0, 0, 0, 0, 0])
+        || hal.last(0x4c).map(|v| v & (3 << 23)) != Some(0)
+        || btc.statistics.cnt_ips_notify != 1
+    {
+        return TestResult::Fail("IPS enter: BT path, wifi_off, TDMA off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b1ant_periodical_bt_disable_and_ips
+);

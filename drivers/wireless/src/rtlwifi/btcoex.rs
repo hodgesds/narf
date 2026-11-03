@@ -23,6 +23,7 @@
 
 #![allow(dead_code)]
 
+pub mod b8723b1ant;
 pub mod btc;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
