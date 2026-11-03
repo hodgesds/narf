@@ -31,23 +31,28 @@ const INTR_ENABLE: u64 = 0x1a00;
 const INTR_CONTROL: u64 = 0x1a04;
 const INTR_STATUS: u64 = 0x1a0c;
 const PDM_ENABLE: u64 = 0x2c04;
-const DMA_ENABLE: u64 = 0x2c08;
-const RING_ADDR: u64 = 0x2c0c;
-const RING_SIZE: u64 = 0x2c10;
-const COUNT_HIGH: u64 = 0x2c18;
-const COUNT_LOW: u64 = 0x2c1c;
-const WATERMARK: u64 = 0x2c20;
+/// ACP DMA channel block, shared with the SDW DMA engine in
+/// `crate::acp63_sdw_dma` (the SDW binding owns the function
+/// exclusively when it binds, so the channel is free for its stream).
+/// Offsets as in Linux `include/sound/acp63_chip_offset_byte.h`, the
+/// same header the PDM path's constants come from.
+pub(crate) const DMA_ENABLE: u64 = 0x2c08;
+pub(crate) const RING_ADDR: u64 = 0x2c0c;
+pub(crate) const RING_SIZE: u64 = 0x2c10;
+pub(crate) const COUNT_HIGH: u64 = 0x2c18;
+pub(crate) const COUNT_LOW: u64 = 0x2c1c;
+pub(crate) const WATERMARK: u64 = 0x2c20;
 const FIFO_FLUSH: u64 = 0x2c24;
 const CHANNELS: u64 = 0x2c28;
 const DECIMATION: u64 = 0x2c2c;
 const CLOCK: u64 = 0x2c60;
 const MISC: u64 = 0x2c5c;
-const ATU_PAGE_SIZE: u64 = 0xc00;
-const ATU_BASE: u64 = 0xc04;
-const ATU_CONTROL: u64 = 0xc40;
-const SCRATCH: u64 = 0x10000;
-const DMA_WINDOW: u32 = 0x4000000;
-const PTE_BASE: u32 = 0x03800000;
+pub(crate) const ATU_PAGE_SIZE: u64 = 0xc00;
+pub(crate) const ATU_BASE: u64 = 0xc04;
+pub(crate) const ATU_CONTROL: u64 = 0xc40;
+pub(crate) const SCRATCH: u64 = 0x10000;
+pub(crate) const DMA_WINDOW: u32 = 0x4000000;
+pub(crate) const PTE_BASE: u32 = 0x03800000;
 const PDM_IRQ: u32 = 1 << 16;
 
 #[derive(Debug, Default)]

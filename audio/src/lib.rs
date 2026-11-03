@@ -31,6 +31,7 @@ pub mod acp3x;
 pub mod acp6;
 pub mod acp63;
 pub mod acp63_sdw;
+pub mod acp63_sdw_dma;
 pub mod acp6_bdl;
 pub mod acp6_codec_link;
 pub mod acp6_pcm;

@@ -415,16 +415,63 @@ enum Direction {
     Capture,
 }
 
+/// Platform payload engine for an SDW card's streams: the DMA block
+/// that moves PCM samples between host memory and the manager. The
+/// bus layer owns the control lifecycle (configure/prepare/enable/
+/// disable/deprepare against the port); the engine owns the data path
+/// (ring, DMA channel programming, counter/pointer accounting). A card
+/// without an engine keeps the historical behaviour: payload
+/// reads/writes report `BadState` instead of pretending samples moved.
+pub trait PayloadEngine: Send + Sync + core::fmt::Debug {
+    /// Build a fresh ring for `params`, replacing any stopped ring.
+    /// Rejects a running stream.
+    fn configure(&mut self, params: HwParams) -> Result<(), SoundError>;
+    /// Stop a running stream if needed, reset the ring, and program
+    /// the DMA channel (ATU/window, ring address/size, watermark).
+    fn prepare(&mut self) -> Result<(), SoundError>;
+    /// Claim the DMA channel and enable DMA. Fails `DeviceBusy` when
+    /// another stream on the same card already owns the channel.
+    fn start(&mut self) -> Result<(), SoundError>;
+    /// Stop DMA. On failure the ring, position, and channel claim are
+    /// retained (failed-stop retention) and the caller must retry.
+    fn stop(&mut self) -> Result<(), SoundError>;
+    /// Re-mark a stopped stream prepared without reprogramming, for
+    /// pause/resume: queued samples and position are retained.
+    fn mark_prepared(&mut self) -> Result<(), SoundError>;
+    /// Current hardware position in frames.
+    fn pointer(&mut self) -> u64;
+    /// Queue playback samples into free ring slots.
+    fn write(&mut self, data: &[u8]) -> Result<usize, SoundError>;
+    /// Drain completed capture slots.
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, SoundError>;
+    /// Drop-path shutdown: stop DMA and report whether the ring may
+    /// be freed. The default reports success only on a clean stop; an
+    /// engine with channel arbitration overrides this to release its
+    /// guard even when the stop itself fails, so the card is not
+    /// wedged by a lease that is going away anyway.
+    fn shutdown_for_drop(&mut self) -> bool {
+        self.stop().is_ok()
+    }
+}
+
+/// Builds one fresh [`PayloadEngine`] per stream lease. The factory is
+/// per-card, so every engine it builds shares the card's DMA channel
+/// arbitration.
+pub trait PayloadEngineFactory: Send + Sync + core::fmt::Debug {
+    fn create(&self) -> Box<dyn PayloadEngine>;
+}
+
 /// A sound card backed by one enumerated SDW peripheral, published
 /// through `narf_drivers_sound` next to the HDA and ACP PDM cards.
 ///
 /// The card implements the full PCM lifecycle against the bus
-/// (configure → prepare → enable → disable → deprepare). Payload
-/// *movement* between host memory and the wire is the platform SDW
-/// DMA engine's job; on ACP 6.3 that engine is a separate block whose
-/// register model is not in-tree yet, so `write`/`read` report
-/// `BadState` until it lands (tracked as a follow-up to #780) instead
-/// of pretending samples moved.
+/// (configure → prepare → enable → disable → deprepare) and, when a
+/// payload engine is installed, moves real samples through it
+/// (`crate::acp63_sdw_dma` on ACP 6.3). Cards without an engine still
+/// report `BadState` for payload reads/writes rather than pretending
+/// samples moved. A full stop invalidates prepare on both layers
+/// (acp63 semantics: restart needs a fresh prepare); pause/resume is
+/// the path that preserves queued samples and position.
 #[derive(Debug)]
 pub struct CodecCard<T: Transport> {
     bus: Arc<IrqSafeSpinLock<Bus<T>>>,
@@ -433,6 +480,7 @@ pub struct CodecCard<T: Transport> {
     stream: StreamConfig,
     playback_claimed: Arc<IrqSafeSpinLock<bool>>,
     capture_claimed: Arc<IrqSafeSpinLock<bool>>,
+    payload_factory: Option<Arc<dyn PayloadEngineFactory>>,
 }
 
 impl<T: Transport> CodecCard<T> {
@@ -450,7 +498,16 @@ impl<T: Transport> CodecCard<T> {
             stream,
             playback_claimed: Arc::new(IrqSafeSpinLock::new(false)),
             capture_claimed: Arc::new(IrqSafeSpinLock::new(false)),
+            payload_factory: None,
         }
+    }
+
+    /// Install the platform payload engine factory. The ACP binding
+    /// calls this at probe; generic transports leave the card
+    /// engine-less, and its streams keep reporting `BadState` for
+    /// payload reads/writes.
+    pub fn set_payload_engine(&mut self, factory: Arc<dyn PayloadEngineFactory>) {
+        self.payload_factory = Some(factory);
     }
 
     fn port_for(&self, direction: Direction) -> Option<PortProfile> {
@@ -513,6 +570,10 @@ impl<T: Transport + 'static> PcmDevice for CodecCard<T> {
             params: None,
             prepared: false,
             enabled: false,
+            engine: self
+                .payload_factory
+                .as_ref()
+                .map(|factory| Arc::new(IrqSafeSpinLock::new(factory.create()))),
         }))
     }
 }
@@ -533,6 +594,7 @@ struct SdwPcm<T: Transport> {
     params: Option<HwParams>,
     prepared: bool,
     enabled: bool,
+    engine: Option<Arc<IrqSafeSpinLock<Box<dyn PayloadEngine>>>>,
 }
 
 impl<T: Transport> SdwPcm<T> {
@@ -564,6 +626,12 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
         if self.enabled {
             return Err(SoundError::BadState);
         }
+        // Build the engine ring first: a failed engine configure
+        // (e.g. DMA allocation) leaves the previous parameters in
+        // place rather than half-configuring the lease.
+        if let Some(engine) = &self.engine {
+            engine.lock().configure(params)?;
+        }
         self.params = Some(params);
         // A fresh configuration invalidates any earlier prepare, the
         // same way acp63's configure builds a fresh (unprepared) ring.
@@ -575,6 +643,11 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
             return Err(SoundError::BadState);
         }
         if self.enabled {
+            // Mirror acp63 prepare: stop DMA and the wire before
+            // re-preparing. A failed DMA stop retains the stream.
+            if let Some(engine) = &self.engine {
+                engine.lock().stop()?;
+            }
             self.bus_op(|bus| bus.port_disable(self.card.dev_num, self.port))?;
             self.enabled = false;
         }
@@ -591,6 +664,13 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
             self.prepared = false;
             return result;
         }
+        if let Some(engine) = &self.engine {
+            if let Err(e) = engine.lock().prepare() {
+                let _ = self.bus_op(|bus| bus.port_deprepare(self.card.dev_num, self.port));
+                self.prepared = false;
+                return Err(e);
+            }
+        }
         self.prepared = true;
         Ok(())
     }
@@ -603,10 +683,48 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
         }
         let mask = self.ch_mask();
         self.bus_op(|bus| bus.port_enable(self.card.dev_num, self.port, mask))?;
+        if let Some(engine) = &self.engine {
+            if let Err(e) = engine.lock().start() {
+                // Roll the wire back: never leave a port enabled with
+                // dead DMA behind it.
+                let _ = self.bus_op(|bus| bus.port_disable(self.card.dev_num, self.port));
+                return Err(e);
+            }
+        }
         self.enabled = true;
         Ok(())
     }
     fn stop(&mut self) -> Result<(), SoundError> {
+        // Quiesce DMA before dropping the wire; a failed DMA stop
+        // retains the whole stream (port stays enabled, retry stop).
+        // A full stop invalidates prepare on both layers (acp63
+        // semantics); pause/resume is the path that preserves it.
+        if let Some(engine) = &self.engine {
+            engine.lock().stop()?;
+        }
+        if self.enabled {
+            self.bus_op(|bus| bus.port_disable(self.card.dev_num, self.port))?;
+            self.enabled = false;
+        }
+        self.prepared = false;
+        Ok(())
+    }
+    fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
+        if !paused {
+            return self.start();
+        }
+        // Only a prepared stream can be frozen; a stopped stream
+        // needs a fresh prepare, and a never-prepared stream has no
+        // ring to retain. Mirror acp63 pause: stop DMA, re-mark
+        // prepared without reprogramming, drop the wire — queued
+        // samples and position survive.
+        if !self.prepared {
+            return Err(SoundError::BadState);
+        }
+        if let Some(engine) = &self.engine {
+            engine.lock().stop()?;
+            engine.lock().mark_prepared()?;
+        }
         if self.enabled {
             self.bus_op(|bus| bus.port_disable(self.card.dev_num, self.port))?;
             self.enabled = false;
@@ -614,16 +732,23 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
         Ok(())
     }
     fn pointer(&self) -> u64 {
-        0
+        self.engine
+            .as_ref()
+            .map_or(0, |engine| engine.lock().pointer())
     }
-    fn write(&mut self, _: &[u8]) -> Result<usize, SoundError> {
-        // Payload movement is the platform SDW DMA engine's job; see
-        // the CodecCard doc. Failing here keeps a stream that cannot
-        // actually carry samples from reporting progress.
-        Err(SoundError::BadState)
+    fn write(&mut self, data: &[u8]) -> Result<usize, SoundError> {
+        match &self.engine {
+            Some(engine) => engine.lock().write(data),
+            // No platform DMA engine: fail instead of reporting
+            // progress for samples that cannot reach the wire.
+            None => Err(SoundError::BadState),
+        }
     }
-    fn read(&mut self, _: &mut [u8]) -> Result<usize, SoundError> {
-        Err(SoundError::BadState)
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, SoundError> {
+        match &self.engine {
+            Some(engine) => engine.lock().read(out),
+            None => Err(SoundError::BadState),
+        }
     }
     fn drain(&mut self) -> Result<(), SoundError> {
         self.stop()
@@ -632,6 +757,19 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
 
 impl<T: Transport> Drop for SdwPcm<T> {
     fn drop(&mut self) {
+        // Quiesce DMA before dropping the wire. A failed stop must
+        // not free the ring under a live engine, so leak the engine
+        // instead (its channel guard is force-released by
+        // `shutdown_for_drop`, so the card is not wedged; the next
+        // lease reprograms the channel for its own ring).
+        if self.enabled {
+            if let Some(engine) = self.engine.take() {
+                let stopped = engine.lock().shutdown_for_drop();
+                if !stopped {
+                    core::mem::forget(engine);
+                }
+            }
+        }
         {
             let bus = self.card.bus.lock();
             if self.enabled {
@@ -1015,4 +1153,149 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire", absent_and_stuck_peripherals_fail_closed);
+
+    fn sdw_pcm_moves_samples_through_dma_engine() -> TestResult {
+        use crate::acp63_sdw_dma::{FakeDmaFactory, FakeRegs};
+
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let stream = StreamConfig {
+            word_length: 16,
+            sample_interval: 100,
+        };
+        let regs = FakeRegs::new();
+        let mut card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            GENERIC_CODEC_PROFILE,
+            stream,
+        );
+        card.set_payload_engine(Arc::new(FakeDmaFactory::new(regs.clone())));
+        // Playback lease: configure → prepare → start → write →
+        // pointer → pause → resume → stop.
+        let mut pcm = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("playback open failed"),
+        };
+        if pcm.configure(card.default_params(false)) != Ok(()) {
+            return TestResult::Fail("playback configure failed");
+        }
+        if pcm.start() != Err(SoundError::BadState) {
+            return TestResult::Fail("start before prepare must fail");
+        }
+        if pcm.prepare() != Ok(()) {
+            return TestResult::Fail("playback prepare failed");
+        }
+        if pcm.start() != Ok(()) {
+            return TestResult::Fail("playback start failed");
+        }
+        if pcm.write(&[0x11u8; 4096]) != Ok(4096) {
+            return TestResult::Fail("playback write failed");
+        }
+        regs.set_counter(4096);
+        if pcm.pointer() != 1024 {
+            return TestResult::Fail("playback pointer mismatch");
+        }
+        // Pause preserves the queued samples; resume continues from
+        // the paused position.
+        if pcm.pause(true) != Ok(()) {
+            return TestResult::Fail("pause failed");
+        }
+        if pcm.write(&[0x22u8; 4096]) != Ok(4096) {
+            return TestResult::Fail("post-pause write failed");
+        }
+        if pcm.pause(false) != Ok(()) {
+            return TestResult::Fail("resume failed");
+        }
+        regs.set_counter(8192);
+        if pcm.pointer() != 2048 {
+            return TestResult::Fail("resumed pointer mismatch");
+        }
+        if pcm.stop() != Ok(()) {
+            return TestResult::Fail("playback stop failed");
+        }
+        // A full stop invalidates prepare: restart needs a fresh one.
+        if pcm.start() != Err(SoundError::BadState) {
+            return TestResult::Fail("start after stop must fail without prepare");
+        }
+        drop(pcm);
+        // Capture lease on the same card (the guard hands off across
+        // leases). The fake counter drives completion; the ring was
+        // reset to zeros, so the read returns zero bytes — the
+        // accounting path, not the data path (data across the ring is
+        // pinned in the engine fixtures).
+        let mut cap = match card.open(true, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("capture open failed"),
+        };
+        if cap.configure(card.default_params(true)) != Ok(())
+            || cap.prepare() != Ok(())
+            || cap.start() != Ok(())
+        {
+            return TestResult::Fail("capture lifecycle failed");
+        }
+        regs.set_counter(12288);
+        // NOTE: the fake counter block is shared across leases, and
+        // capture `start` latched baseline 8192 (the playback lease's
+        // final value). The counter must move monotonically under a
+        // running engine — a backward jump reads as an overrun and
+        // trips xrun — so the capture completion is 8192 + 4096, not
+        // a reset to 4096.
+        let mut out = [0u8; 4096];
+        if cap.read(&mut out) != Ok(4096) || out != [0u8; 4096] {
+            return TestResult::Fail("capture read mismatch");
+        }
+        if cap.read(&mut out) != Ok(0) {
+            return TestResult::Fail("capture read with no new data must return 0");
+        }
+        if cap.stop() != Ok(()) {
+            return TestResult::Fail("capture stop failed");
+        }
+        drop(cap);
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", sdw_pcm_moves_samples_through_dma_engine);
+
+    fn sdw_pcm_without_engine_reports_bad_state() -> TestResult {
+        // A card with no payload engine keeps the historical
+        // behaviour: the control lifecycle works, but payload
+        // reads/writes report BadState instead of pretending.
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let stream = StreamConfig {
+            word_length: 16,
+            sample_interval: 100,
+        };
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            GENERIC_CODEC_PROFILE,
+            stream,
+        );
+        let mut pcm = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("open failed"),
+        };
+        if pcm.configure(card.default_params(false)) != Ok(())
+            || pcm.prepare() != Ok(())
+            || pcm.start() != Ok(())
+        {
+            return TestResult::Fail("control lifecycle failed");
+        }
+        if pcm.write(&[0u8; 4096]) != Err(SoundError::BadState) {
+            return TestResult::Fail("engine-less write must report BadState");
+        }
+        if pcm.read(&mut [0u8; 4096]) != Err(SoundError::BadState) {
+            return TestResult::Fail("engine-less read must report BadState");
+        }
+        if pcm.pointer() != 0 {
+            return TestResult::Fail("engine-less pointer must stay 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", sdw_pcm_without_engine_reports_bad_state);
 }
