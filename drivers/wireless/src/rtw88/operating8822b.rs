@@ -499,6 +499,7 @@ pub(super) enum StationSource {
 /// Decoded, still-authorized `N2BS` record nested in its `N2BP` envelope.
 pub(super) struct Grant {
     request: StationRequest,
+    digest: [u8; 32],
     cap: Cap<FirmwareBlob, Read>,
     power: Arc<Envelope>,
     antenna: i16,
@@ -577,6 +578,11 @@ impl Grant {
         }
         Ok(Self {
             request,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(raw);
+                h.finalize()
+            },
             cap,
             power,
             antenna,
@@ -605,6 +611,21 @@ impl Grant {
     /// Both `N2BP` thermal windows (`N2BS` itself must cover 0..63).
     pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
         self.power.temperature(value)
+    }
+    /// The `N2BL` legacy12/WMM request this exact `N2BS` grant anchors
+    /// (`station_profile::request_b22`).
+    pub(super) fn extension_request(&self) -> super::station_profile::Request {
+        super::station_profile::request_b22(
+            self.request.identity,
+            self.digest,
+            self.power.indices(),
+            self.own(),
+        )
+    }
+    /// The current station policy limit under `domain`, inside all three
+    /// source invocations (the N2xL extension ceiling input).
+    pub(super) fn extension_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
+        self.invoke(&|| Ok(domain.clone()), || self.policy_limit(domain))
     }
     pub(super) fn policy_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
         let limit = policy_limit(domain, self.ceiling)?;

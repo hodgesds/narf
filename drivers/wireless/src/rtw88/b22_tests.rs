@@ -818,9 +818,9 @@ fn smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm() -> Test
         || gate.host() != Host::PCI_B22
         || Host::PCI_B22.family() != "rtw8822be"
         || gate.own() != factory.mac()
-        || gate.extension_base().is_some()
+        || gate.extension_base().is_none()
         || gate.calibrated_base().is_some()
-        || gate.base_request().is_some()
+        || gate.base_request().is_none()
         || gate.ht_facts().is_some()
         || gate.c21_indices().is_some()
         || !gate.base_only()
@@ -1189,4 +1189,94 @@ fn smoke_rtw8822be_edcca_adaptivity_follows_rtw8822b() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_edcca_adaptivity_follows_rtw8822b
+);
+
+/// One signed 128-byte `N2BL` legacy12/WMM record (`station_profile` layout).
+fn b22_legacy_record(
+    r: &super::super::station_profile::Request,
+    rates: u16,
+    wmm: bool,
+) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 128];
+    b[..4].copy_from_slice(b"N2BL");
+    b[4..8].copy_from_slice(&[1, 0, 128, 0]);
+    b[8..12].copy_from_slice(&128u32.to_le_bytes());
+    b[12..16].copy_from_slice(&[0xec, 0x10, 0x22, 0xb8]);
+    b[16..48].copy_from_slice(&r.identity);
+    b[48..54].copy_from_slice(&r.mac);
+    b[54..56].copy_from_slice(&[1, 20]);
+    for (at, v) in [(56, 4i16), (58, 76), (60, 48), (62, 48)] {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    for i in 0..12 {
+        b[64 + i * 2..66 + i * 2].copy_from_slice(&(40i16 + i as i16).to_le_bytes());
+    }
+    b[88..90].copy_from_slice(&rates.to_le_bytes());
+    b[90] = u8::from(wmm);
+    b
+}
+
+/// `N2BL` binds the exact `N2BS` grant (identity hashes its record digest
+/// and both paths' `N2BP` indices) under the B22 magic/header; C21/C22
+/// magics, a foreign identity or MAC refuse, and a bound record admits
+/// exactly its legacy12/WMM DATA profile. Written; not yet executed natively.
+fn smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs() -> TestResult {
+    use super::super::{packet_format::DataProfile, power_policy::Gate, station_profile::Source};
+    use narf_capabilities::Cap;
+    let Some((factory, phy, grant, us)) = b22_station_fixture() else {
+        return TestResult::Fail("8822B station fixture rejected");
+    };
+    let gate = Gate::b22(grant, phy);
+    let Some(base) = gate.extension_base() else {
+        return TestResult::Fail("8822B gate exposes no N2xL base");
+    };
+    let r = base.request();
+    if base.did() != 0xb822
+        || r.mac != factory.mac()
+        || !r.filename.starts_with("rtw88/rtw8822be-legacy-wmm-v1-")
+        || gate.extension_request().as_ref() != Some(&r)
+    {
+        return TestResult::Fail("8822B N2BL request is not the N2BS-scoped one");
+    }
+    let db = alloc::sync::Arc::new(narf_wireless::reg::db::Database::new());
+    db.install(us);
+    let load = |bytes| {
+        Source::Verified {
+            bytes,
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+            policy: db.clone(),
+        }
+        .load(gate.clone())
+    };
+    for fault in 0..5 {
+        let mut b = b22_legacy_record(&r, 0xfff, true);
+        match fault {
+            0 => b[..4].copy_from_slice(b"N22L"),
+            1 => b[..4].copy_from_slice(b"N21L"),
+            2 => b[14] = 0x21,
+            3 => b[16] ^= 1,
+            _ => b[48] ^= 1,
+        }
+        if load(b).is_ok() {
+            return TestResult::Fail("8822B N2BL accepted a foreign record");
+        }
+    }
+    let Ok(l) = load(b22_legacy_record(&r, 0xfff, true)) else {
+        return TestResult::Fail("8822B N2BL rejected its exact record");
+    };
+    let Ok(bound) = gate.with_extension(l) else {
+        return TestResult::Fail("8822B N2BL did not bind over N2BS");
+    };
+    if bound.extension_base().is_some()
+        || bound.ht_base().is_none()
+        || !bound.allows_profile(DataProfile::LEGACY)
+    {
+        return TestResult::Fail("8822B N2BL binding differs from the C21/C22 family");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs
 );

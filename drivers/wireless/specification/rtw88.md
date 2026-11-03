@@ -495,8 +495,8 @@ this literal recipe. `Gate::b22` (`Scope::B22`) is keyed by `10ec:b822`
 (`phy8821c::Host::PCI_B22`, family `rtw8822be`), binds the grant's MAC and
 re-invokes `N2BS` + current policy on every `current`/`invoke`. It also
 retains the `rtw8822b_phy_set_param` facts (`phy8822b::Info`) a retune needs.
-Its only continuation family so far is `N2BO` (below); it has no
-N2xL/HT/BA/protection base, so those extension accessors return None.
+Its continuation families are `N2BO`, `N2BD`/`N2BW` and the station-core
+families bound over `N2BL` (below).
 The reserved-page backend's `finish_station8821c` (firmware beacon-page
 disarm: 0x383 bit4, `BCN_CTRL` 0x550 bit3, as for C21) also admits the B22
 gate.
@@ -515,11 +515,10 @@ signed records current) `provision_owner` calls `interface.activate()`, i.e.
 C21 page layout (`rtw8822b.h` `GET_PHY_STAT_P0/P1_*` page/RXSC/RF_MODE fields
 equal `rtw8821c.h`; no channel field). The admitted B22 station is the base
 profile only: channel 1 / 20 MHz legacy, host-only crypto, plus the
-per-channel `N2BO` primaries below. `Gate::b22`
-admits no N2xL extension, HT/VHT, BA, protection, coding/QoS,
-fallback or coex record, so retune/width/HT/BA/protection
-continuations refuse and `reserved_page::station_boundary(0xb822)` is None (no
-LPS/firmware swap). `N2BS` qualifies only the static awake profile; thermal
+per-channel `N2BO` primaries below, and the station-core continuations
+bound over `N2BL` (below). `Gate::b22` admits no coex record and
+`reserved_page::station_boundary(0xb822)` is None (no LPS/firmware swap; see
+"RTL8822BE documented gaps" below). `N2BS` qualifies only the static awake profile; thermal
 tracking and re-IQK run only under their own `N2BD` + `N2BW` records (below). No board's
 `N2BP`/`N2BS` asset is provisioned, so on real hardware the shell is
 published but stays unadmitted at `PhyTablesPrepared` until signed records
@@ -645,6 +644,26 @@ C22/B22 64/64/64/64); the former 16/16/16/14 constant refused every
 C22/B22 retune, HT program and IQK quiet on real FIFO geometry. No `N2BD`
 or `N2BW` asset is provisioned for any board. Case written, unexecuted:
 `smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission`.
+
+#### RTL8822BE legacy12 DATA and WMM BE/TID0 (`N2BL`)
+
+B22 joins the shared N2xL family (`station_profile.rs`, "RTL8822CE
+separately qualified legacy12 DATA and WMM BE/TID0" below) through
+`power_policy::ExtensionChip::B22` over the exact `N2BS` grant
+(`Gate::extension_base`, channel-scoped by a bound `N2BO` record as for
+C21/C22). The request (`station_profile::request_b22`,
+`rtw88/rtw8822be-legacy-wmm-v1-<mac>.bin`) hashes the `N2BS` request identity,
+the `N2BS` record digest (`operating8822b::Grant::extension_request`), both
+paths' `N2BP` DESC_RATE 0..11 indices and the literal program. The record is
+the 128-byte N2xL layout with magic `N2BL` and PCI header `10ec:b822`. No new
+gain program exists: the B22 base already writes both paths' measured legacy
+words through `rtw8822b_set_tx_power_index_by_rate` (0x1d00/0x1d80) under
+`rtw8822b_config_trx_mode(AB, AB)`, so the record measures DATA at those
+indices. Its limit is the live `N2BS` policy limit inside all three source
+invocations (`operating8822b::Grant::extension_limit`), intersected with the
+record ceiling and the bound channel record's span. The DATA/RA/EDCA program
+is the shared chip-independent one. No `N2BL` asset is provisioned. Case
+written, unexecuted: `smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs`.
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 

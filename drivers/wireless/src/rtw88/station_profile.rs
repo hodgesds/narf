@@ -75,6 +75,35 @@ pub(super) fn request_c21(
         ),
     }
 }
+/// RTL8822BE `N2BL`: legacy12 DATA + WMM BE/TID0 over the exact `N2BS`
+/// grant. The B22 base program already writes both paths' measured `N2BP`
+/// legacy words (`rtw8822b_set_tx_power_index_by_rate` 0x1d00/0x1d80), so
+/// this record measures DATA at those indices; no new gain program.
+pub(super) fn request_b22(
+    station: [u8; 32],
+    qualification: [u8; 32],
+    indices: [[u8; 12]; 2],
+    mac: [u8; 6],
+) -> Request {
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(b"NARF RTL8822BE ch1/20 2T2R static legacy12 DATA and response-bound WMM BE/TID0 v1");
+    h.update(&station);
+    h.update(&qualification);
+    h.update(&indices[0]);
+    h.update(&indices[1]);
+    h.update(b"exact retained N2BQ IQK/N2BP TXAGC12 A+B/N2BS awake qualification; measured full thermal0..63; rtw8822b_set_tx_power_index_by_rate 1d00/1d80 measured legacy words, HT/VHT words0; config_trx_mode AB/AB");
+    h.update(b"actual bound legacy12 intersection; rateID B8/BG6/G7; H2C40 init1 PTdisabled mask12; fixed highest IEEE kbps data USE_RATE DISDATAFB; mgmt/EAPOL1M");
+    h.update(b"WMM1 strict singleton Param; no UAPSD ACM BE; AP-response parameters; source EDCA 500/504/508/50c; SIFS10 slot9/20; BE AIFSN>=3 CWmin>=31 CWmax>=1023 TXOP0; no HT AMPDU BA");
+    h.update(b"source phy_get_rrsr_mask(selected_rate)&15f=1f/5f/15f; TXDESC48 TXBD16 RXDESC24 RXBD8; BE3a8; raw QoS26 TID0 before software CCMP; mgmt/EAPOL24; current Q/P/S/L signed sources and policy at every publication");
+    Request {
+        identity: h.finalize(),
+        mac,
+        filename: format!(
+            "rtw88/rtw8822be-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ),
+    }
+}
 pub(super) enum Source {
     Registered,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -154,10 +183,10 @@ impl Grant {
         signer.ok_or(denied(power_policy::Error::Unsigned))?;
         if raw.len() != 128
             || &raw[..4]
-                != if base.did() == 0xc821 {
-                    b"N21L"
-                } else {
-                    b"N22L"
+                != match base.did() {
+                    0xc821 => b"N21L",
+                    0xb822 => b"N2BL",
+                    _ => b"N22L",
                 }
             || raw[4..8] != [1, 0, 128, 0]
             || raw[8..12] != 128u32.to_le_bytes()

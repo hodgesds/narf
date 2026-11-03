@@ -371,6 +371,8 @@ impl CalibratedBase {
 pub(super) enum ExtensionChip {
     C22(CalibratedBase),
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
+    /// RTL8822BE `N2BS` (nesting `N2BQ` + `N2BP`).
+    B22(alloc::sync::Arc<super::operating8822b::Grant>),
 }
 /// The chip base plus, off channel 1, the bound N2xO channel record. Every
 /// program loaded over a channel-scoped base is a distinct per-channel record
@@ -389,12 +391,14 @@ impl ExtensionBase {
                 f.cck = b.permission.gains;
                 f
             }),
+            ExtensionChip::B22(_) => None,
         };
         let group = |five: bool, g: usize| match &self.chip {
             ExtensionChip::C21(b) if five => b.ht5_group(g).map(|m| (m, None)),
             ExtensionChip::C21(b) => b.ht_group(g).map(|m| (m, None)),
             ExtensionChip::C22(b) if five => b.calibration.board.ht5_groups[g],
             ExtensionChip::C22(b) => b.calibration.board.ht_groups[g],
+            ExtensionChip::B22(_) => None,
         };
         overlay(self.did(), facts, self.channel.as_deref(), group)
     }
@@ -402,6 +406,7 @@ impl ExtensionBase {
         match &self.chip {
             ExtensionChip::C22(_) => 0xc822,
             ExtensionChip::C21(_) => 0xc821,
+            ExtensionChip::B22(_) => 0xb822,
         }
     }
     /// Host identity keying this board's records (`phy8821c::Host`).
@@ -409,6 +414,7 @@ impl ExtensionBase {
         match &self.chip {
             ExtensionChip::C22(_) => super::phy8821c::Host::PCI_C22,
             ExtensionChip::C21(b) => b.host(),
+            ExtensionChip::B22(_) => super::phy8821c::Host::PCI_B22,
         }
     }
     /// Operating primary of this base: 1, or the bound N2xO record's.
@@ -432,6 +438,7 @@ impl ExtensionBase {
     pub(super) fn temperature(&self, value: u8) -> Result<(), super::firmware_transport::Error> {
         match &self.chip {
             ExtensionChip::C21(b) => b.temperature(value),
+            ExtensionChip::B22(b) => b.temperature(value),
             ExtensionChip::C22(_) => Ok(()),
         }
     }
@@ -439,6 +446,7 @@ impl ExtensionBase {
         let base = match &self.chip {
             ExtensionChip::C22(b) => b.request(),
             ExtensionChip::C21(b) => b.extension_request(),
+            ExtensionChip::B22(b) => b.extension_request(),
         };
         scoped(base, self.did(), self.channel.as_deref())
     }
@@ -456,6 +464,7 @@ impl ExtensionBase {
                 b.check()?;
                 b.extension_limit(d)?
             }
+            ExtensionChip::B22(b) => b.extension_limit(d)?,
         };
         match &self.channel {
             Some(g) => Ok(limit.min(super::channel_policy::limit_in(g, self.did(), d)?)),
@@ -480,6 +489,7 @@ impl ExtensionBase {
         match &self.chip {
             ExtensionChip::C22(b) => b.invoke(d, op),
             ExtensionChip::C21(b) => b.invoke(op),
+            ExtensionChip::B22(b) => b.invoke(&|| Ok(d.clone()), op),
         }
     }
 }
@@ -536,8 +546,8 @@ enum Scope {
     /// RTL8822BE `N2BS` awake-station grant (nesting `N2BQ` + `N2BP`) and
     /// the retained `rtw8822b_phy_set_param` facts `rtw8822b_set_channel`
     /// needs on a retune. Per-channel `N2BO` records bind over it
-    /// ([`Gate::with_channel`]); no N2xL/HT/BA/protection family exists for
-    /// B22 yet, so those extension accessors return None.
+    /// ([`Gate::with_channel`]) and the `N2BL` legacy12/WMM extension over
+    /// that ([`ExtensionChip::B22`]).
     B22(
         alloc::sync::Arc<super::operating8822b::Grant>,
         super::phy8822b::Info,
@@ -593,7 +603,7 @@ impl Gate {
                 own: *own,
             }),
             Scope::C21(b) => ExtensionChip::C21(b.clone()),
-            Scope::B22(..) => return None,
+            Scope::B22(b, _) => ExtensionChip::B22(b.clone()),
         };
         Some(ExtensionBase {
             chip,
