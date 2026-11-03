@@ -2892,9 +2892,31 @@ closed. No native caller runs these yet. Unexecuted cases:
 `smoke_rtw89_c_bb_sethw_gpio_and_nctl_follow_rtw8852c`,
 `smoke_rtw89_c_rfk_init_rck_dack_rxdck_follow_rtw8852c`.
 
-Remaining for the `rtl8852c` row (no row credit): C channel RFK
-(`rtw8852c_rfk_channel`: IQK/DPK/TSSI from rtw8852c_rfk.c), C channel MAC/BB/RF (`rtw8852c_set_channel_{mac,bb}`,
-`rtw8852c_ctrl_ch`/`_bw`, `_ch_setting` for 2.4/5/6GHz), C power-table
+**Channel MAC and BB channel control (`channel_c`).** `channel_c::program`
+writes rtw8852c.c `rtw8852c_set_channel_mac(MAC_0)` from
+`Profile::mac_program` (byte-masked RFMOD 0xc010, TX_SUB_CARRIER 0xc088,
+TXRATE_CHK 0xc628 clear-then-set) and then the `rtw8852c_set_channel_bb`
+prefix for non-DBCC PHY_0: `rtw8852c_ctrl_sco_cck` (2.4GHz) and
+`rtw8852c_ctrl_ch` — per path `rtw8852c_set_gain_error` over the
+`bb_gain_lna`/`bb_gain_tia`/`bb_gain_bypass_lna`/`bb_gain_op1db_a` register
+tables (2G `gain_g` vs `gain_a`, op1db and TIA0/LNA6 only off 2G) from the
+decoded `radio_gain::Gain` at `rtw89_subband_to_bb_gain_band`,
+`rtw8852c_set_gain_offset` (skipped unless `offset_valid`; the shared
+R_RPL_OFST CCK write is per path so path B's value wins, as in Linux; S8
+clamps), path band select, `R_2P4G_BAND` clear, FC0/`DIV_ROUND_CLOSEST`
+SCO, CCK `R_PCOEFF*` and `B_CH_IDX_SEG0` — then `rtw8852c_ctrl_bw`
+(FC0 BW set, CHBW SBW/`pri_ch_idx`, per-path sample delay 3/3/2/1 and BW
+select 0xf/0xf/0xd/0xb for 20/40/80/160MHz, BW40 2xFFT/T2F GI combine,
+`rtw8852c_bw_setting` A and B, `rtw8852c_edcca_per20_bitmap_sifs`). Every
+final field is read back.
+Unexecuted case: `smoke_rtw89_c_channel_mac_and_ctrl_ch_follow_rtw8852c`.
+
+Remaining for the `rtl8852c` row (no row credit): the rest of
+`rtw8852c_set_channel_bb` (CCK/CCA enables, spur
+elimination, BTG BT RX, 5M mask, 160MHz P80 RU, CDD EVM, TXPW RSTB, MUIC,
+`rtw8852c_ctrl_tx_path_tmac`, `bb_reset_all`), `rtw8852c_set_channel_rf`
+(`_ctrl_ch`/`_ctrl_bw`/`_rxbb_bw`), C channel RFK
+(`rtw8852c_rfk_channel`: IQK/DPK/TSSI from rtw8852c_rfk.c), C power-table
 composition (`rtw8852c_set_txpwr*`, firmware TXPWR_* elements incl. DA
 limits), C coexistence init, the C `power::Calibration`/qualification
 records (N52x are B-bound), `command_native`/`startup_station` admission
