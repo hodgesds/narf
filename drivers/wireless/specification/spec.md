@@ -685,7 +685,7 @@ implementations,78 remain; physical RF/firmware/board acceptance stays separate.
 | rtw88 | 11 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, runtime sleep and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset, explicit safe rejoin and retained system suspend/resume are implemented pending validation |
 | rtw89 | 7 | Additional channels/bands/widths, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor and source-qualified host fragmentation are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
-| cyw43439 | 11 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop is implemented pending validation |
+| cyw43439 | 10 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop and native primary-bsscfg SDIO AP are implemented pending validation |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
 through the common retained FullMAC owner; system suspend, wake offload and
@@ -1715,6 +1715,18 @@ peer and cryptographic cache through complete reassembly. Family §3 defines the
 profile and eight unexecuted cases. Independent RTW88 firmware feature/wire and
 unassociated IPS continuations remain partial runtime-sleep work; they grant no
 new RF admission or completed-row credit.
+
+### 3.17 Native CYW43439 SDIO AP (validation pending)
+
+CYW43439 advertises the primary-bsscfg AP only through the actual Card/SDHCI,
+signed CM3 loader, F1/F2 and SDPCM/BCDC firmware-SME path with its original
+typed source, native `ap` token and GET_AP0 discovery. Program IOCTL/DATA is
+one whole zero-tailed F2 block COMMAND (padding inferred from Linux `sdio.c`,
+not a board measurement); a fresh mailbox with pending RX defers an unissued
+packet, and nothing is retried after issue. Ordinary RX denied at the ring is
+never delivered to the stack. Family `cyw43439.md` lists nine unexecuted cases.
+2026-11-02 recount: 53 open features plus 25 implemented pending validation
+(78 including unvalidated); the full release/native matrix is now due.
 
 
 ## 4. Interaction with `narf-wireless`

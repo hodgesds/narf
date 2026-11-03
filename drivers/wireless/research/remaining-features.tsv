@@ -27,7 +27,6 @@ brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	53
 brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	531
 brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	530
 cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	534
-cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	531
 cyw43439	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	530
 cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	531
 cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	531
