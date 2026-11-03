@@ -10697,3 +10697,28 @@ fn smoke_usb_bindings_are_per_controller() -> TestResult {
     result
 }
 kernel_test_in!("drivers/usb/hub", smoke_usb_bindings_are_per_controller);
+
+/// The PRC acknowledgement after a root-port reset must not echo PED
+/// (RW1C): the reset has just enabled the port, and writing PED=1 back
+/// disables it again (`xhci_port_state_to_neutral`). That left every
+/// reset on real hardware connected but disabled (PORTSC 0x6e1).
+fn smoke_xhci_port_reset_ack_preserves_enable() -> TestResult {
+    use crate::xhci::op::*;
+    // Connected, enabled, powered, U0, high speed, PRC + CSC latched.
+    let after_reset = PORTSC_CCS | PORTSC_PED | PORTSC_PP | (3 << 10) | PORTSC_PRC | PORTSC_CSC;
+    let ack = PortStatus::clear_changes_value(after_reset, PORTSC_PRC | PORTSC_CSC | PORTSC_PEC);
+    if ack & PORTSC_PED != 0 {
+        return TestResult::Fail("reset acknowledgement writes PED=1 and disables the port");
+    }
+    if ack & PORTSC_PR != 0 {
+        return TestResult::Fail("reset acknowledgement re-asserts PR");
+    }
+    if ack & (PORTSC_PRC | PORTSC_CSC) != PORTSC_PRC | PORTSC_CSC || ack & PORTSC_PP == 0 {
+        return TestResult::Fail("reset acknowledgement lost PRC/CSC or port power");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_port_reset_ack_preserves_enable
+);

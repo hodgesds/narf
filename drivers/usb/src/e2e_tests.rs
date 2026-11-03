@@ -245,7 +245,10 @@ fn smoke_e2e_portsc_port_reset_bits() -> TestResult {
     }
     // After PR self-clears and PRC is set, ack PRC + CSC + PEC.
     let post_reset_portsc: u32 = PORTSC_CCS | PORTSC_PP | PORTSC_PED | PORTSC_PRC | PORTSC_CSC;
-    let ack = (post_reset_portsc & !PORTSC_CHG_MASK) | PORTSC_PRC | PORTSC_CSC | PORTSC_PEC;
+    let ack = crate::xhci::op::PortStatus::clear_changes_value(
+        post_reset_portsc,
+        PORTSC_PRC | PORTSC_CSC | PORTSC_PEC,
+    );
     if ack & PORTSC_PRC == 0 {
         return TestResult::Fail("PRC not acknowledged");
     }

@@ -2198,7 +2198,12 @@ impl Xhci {
                 // which W1Cs every change bit it observes set). PEC
                 // gets the same treatment in case the port toggled
                 // PED across the reset.
-                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_PRC | PORTSC_CSC | PORTSC_PEC;
+                //
+                // The writeback must not carry PED: it is RW1C and the
+                // reset just set it, so echoing it disables the port
+                // the controller enabled (`xhci_port_state_to_neutral`).
+                let ack =
+                    op::PortStatus::clear_changes_value(v, PORTSC_PRC | PORTSC_CSC | PORTSC_PEC);
                 // SAFETY: same.
                 unsafe {
                     self.mmio.write32(off, ack);
