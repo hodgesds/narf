@@ -3306,8 +3306,8 @@ pub mod tests {
         // publication the glue withdraws is exactly this serial.
         let torn =
             crate::intel_gpu_xelpg_external::teardown_mtl_external(&io, Generation::MeteorLake);
-        let withdrawn = !crate::intel_gpu_xelpg_external::route_live()
-            && MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel) == serial;
+        let published = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
+        let withdrawn = !crate::intel_gpu_xelpg_external::route_live() && published == serial;
         {
             let mut slot = MTL_SCANOUT.lock();
             if slot.is_some_and(|(owner, _)| owner == BAR) {
