@@ -2306,6 +2306,35 @@ existing shared RNG-registration skip. The release production boot and both
 btrfs postflights also pass. The debug group pass is deferred to the end of
 this integration wave. None of this has run on physical Intel hardware.
 
+### Display-14 DSC, FEC and the panel-fitter model — targeted release gates recorded
+
+Meteor Lake now supports Display Stream Compression (DSC):
+- **eDP panel:** compressed with DSC when its link needs it. The sink's DSC
+  enable is set before link training.
+- **External DP:** compressed with DSC and Forward Error Correction (FEC). FEC
+  is set ready before training and enabled in DP_TP_CTL afterwards, followed by
+  the PPS SDP. A FEC status timeout is only logged, as in Linux.
+- **Resources:** the CDCLK minimum and the 1.5-line prefill account for
+  compression.
+- **Shared helpers:** the `drm_dsc` helpers now serve both AMD and Intel, and
+  AMD's behaviour is byte-identical.
+- **Panel fitter:** the display-14 pipe scaler is modelled for panel fitting.
+- **Register fix:** TRANS_VBLANK's start field is cleared on display 14, as
+  Linux does.
+
+Behaviour notes:
+- 6 bpc output is not supported yet. A panel that Linux would drive uncompressed
+  at 18 bpp is refused with `SixBpcUnqualified`; a follow-up worker is adding
+  6 bpc.
+- A failed FEC_READY AUX write refuses the external route. Linux only logs it.
+
+Targeted release runs passed 627 tests with no failures. They covered the new
+DSC, scaler and `drm_dsc` prefixes, every touched display-14 and KMS prefix
+(including the fail-closed modeset fixtures), and the AMD DSC, DCN401 and
+Navi48 prefixes. One Clippy fix was needed. The production boot was not run,
+because the only probe change (VBT eDP facts) cannot be reached in QEMU. None
+of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

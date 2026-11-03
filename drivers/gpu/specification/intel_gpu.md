@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.54** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.55** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -41,8 +41,9 @@
 > queries, the media-GuC HuC and GT1 SLPC/RC6/powergating, GT0's L3
 > bank topology entry, shared-GGTT GuC TLB invalidation on both GTs,
 > display-14 PSR on hardware inputs, and MTL external outputs on Pipes
-> B–D beside the lit panel with the panel's KMS, PSR and FBC services
-> pass release native model gates — see §20).
+> B–D beside the lit panel with the panel's KMS, PSR and FBC services,
+> and display-14 DSC/FEC with the panel-fitter model pass release native
+> model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -5362,3 +5363,40 @@ Fixtures, all new and unexecuted in this slice:
 Test fixtures that build `PipeRequest` or `ExternalPipe` literals gain
 `dsc: None`. `MtlFake` logs its native DPCD writes, and the `ExtFake` sink
 models the DSC and FEC DPCD registers.
+
+Integration: the code applied cleanly over the J3 fix-ups. The Pipes B–D
+`PIPE_MISC` with HDR mode precision, the runtime-pass helper and the x86_64
+read tick all survive. One Clippy fix was needed: the panel-fitter centring
+now uses `div_ceil(2)`, which is the same value. Targeted release runs passed
+627 tests with no failures, in two selections:
+- 168 tests: `drm_dsc`, `intel_gpu_xelpg_dsc`, `intel_gpu_xelpg_scaler`,
+  `intel_gpu_modeset_xelpg` (including the fail-closed fixtures),
+  `intel_gpu_xelpg_external`, `intel_gpu_xelpg_resources`, `intel_gpu_xelpg_wm`,
+  `intel_gpu_xelpg_pipes`, `intel_gpu_xelpg_hdmi`, `intel_gpu_xelpg_live`,
+  `intel_gpu_dsb`, `intel_gpu_display_resources` and `intel_gpu_cursor`.
+- 459 tests: `intel_gpu_vbt`, `intel_gpu_kms`, `intel_gpu_psr`, `intel_gpu_fbc`,
+  `intel_gpu_pipes` and `intel_gpu_modeset`, plus the AMD prefixes that use the
+  moved helpers: `dsc`, `dcn30-dsc`, `dcn401-frl-link`, `dcn401-dsc-link`,
+  `dcn401-otg`, `dcn401-opp`, `dcn401-mst-audio`, `navi48-mst`,
+  `navi48-modeset` and `amdgpu/navi48`.
+All prefixes are under `drivers/gpu/`.
+
+Production boot was not run. The only probe change installs the VBT eDP facts,
+and QEMU has no Intel display, so a boot cannot reach it.
+
+The `drm_dsc` move leaves AMD byte-identical. With comments and visibility
+stripped, the code removed from `amdgpu_dsc.rs` is the moved code; the
+module adds only the Intel-side `set_rc_buf_thresh` and the PPS SDP header.
+
+Review against Linux b90c984d agreed on the following:
+- `intel_vdsc_min_cdclk` without a joiner is
+  `DIV_ROUND_UP(pixel_rate * (htotal + 14 * slices) / htotal, instances)`.
+- `intel_vdsc_prefill_lines` is 0x18000 (1.5 lines).
+- The external DP order follows `mtl_ddi_pre_enable_dp`: sink decompression,
+  then `FEC_READY` (with the detected flags cleared), then training, then
+  `intel_ddi_enable_fec`, then the PPS SDP. The FEC status wait only logs a
+  timeout, as in Linux.
+- One fail-closed divergence remains: a failed `DP_FEC_CONFIGURATION` or
+  `DP_FEC_STATUS` AUX write refuses the route. Linux only logs it.
+
+The debug group pass is deferred to the end of the campaign.
