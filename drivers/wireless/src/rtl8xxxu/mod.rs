@@ -62,6 +62,7 @@ pub mod regs;
 pub mod rtl8188e;
 pub mod rtl8192e;
 pub mod rtl8192e_init;
+mod rtl8192e_iqk;
 mod rtl8192e_phy;
 mod rtl8192e_radio;
 mod rtl8192e_tables;

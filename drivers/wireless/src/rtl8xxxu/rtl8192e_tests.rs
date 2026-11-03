@@ -37,6 +37,10 @@ pub(super) struct Model {
     /// RF register file per path, fed by LSSI writes, read back through the
     /// HSSI address latched in `0x824`/`0x82c`.
     pub(super) rf: [[u32; 256]; 2],
+    /// RF address latched by the read request (`rtl8xxxu_read_rfreg`).
+    rf_latch: [usize; 2],
+    /// Whether the last `0x824` write dropped the edge-read strobe.
+    edge_low: bool,
 }
 
 #[derive(Clone)]
@@ -109,6 +113,20 @@ impl Fake {
         regs[REG_APS_FSMCO as usize + 2] = 2; // power ready, bit 17
         regs[0xfe66] = 0x11; // SIE: high + normal
         regs[0xfe67] = 0x01; // SIE: low
+                             // IQK result registers: every check passes with x=0x100, y=0x10
+                             // (TX) and x=0x100, y=4 (RX) on both paths.
+        for (reg, value) in [
+            (0xe94usize, 0x0100_0000u32),
+            (0xe9c, 0x0010_0000),
+            (0xea4, 0x0100_0000),
+            (0xeac, 0x0004_0000),
+            (0xeb4, 0x0100_0000),
+            (0xebc, 0x0010_0000),
+            (0xec4, 0x0100_0000),
+            (0xecc, 0x0004_0000),
+        ] {
+            regs[reg..reg + 4].copy_from_slice(&value.to_le_bytes());
+        }
         Self(Arc::new(IrqSafeSpinLock::new(Model {
             regs,
             ops: Vec::new(),
@@ -117,6 +135,8 @@ impl Fake {
             fw_bytes: 0,
             mailbox_stuck: false,
             rf: [[0; 256]; 2],
+            rf_latch: [0; 2],
+            edge_low: false,
         })))
     }
     pub(super) fn writes(&self, addr: u16) -> Vec<Vec<u8>> {
@@ -175,9 +195,7 @@ impl ControlIo for Fake {
         }
         if matches!(addr, 0x8a0 | 0x8a4 | 0x8b8 | 0x8bc) && out.len() == 4 {
             let path = (addr & 4 != 0) as usize;
-            let parm = if path == 1 { 0x82c } else { 0x824 };
-            let latch = u32::from_le_bytes(g.regs[parm..parm + 4].try_into().unwrap());
-            let value = g.rf[path][((latch >> 23) & 0xff) as usize];
+            let value = g.rf[path][g.rf_latch[path]];
             g.regs[a..a + 4].copy_from_slice(&value.to_le_bytes());
         }
         out.copy_from_slice(&g.regs[a..a + out.len()]);
@@ -194,6 +212,21 @@ impl ControlIo for Fake {
         if matches!(addr, 0x840 | 0x844) && data.len() == 4 {
             let word = u32::from_le_bytes(data.try_into().unwrap());
             g.rf[(addr == 0x844) as usize][(word >> 20) as usize & 0xff] = word & 0xfffff;
+        }
+        if matches!(addr, 0x824 | 0x82c) && data.len() == 4 {
+            let word = u32::from_le_bytes(data.try_into().unwrap());
+            let edge = word & (1 << 31) != 0;
+            let latch = (word >> 23) as usize & 0xff;
+            if addr == 0x82c && edge {
+                g.rf_latch[1] = latch;
+            } else if addr == 0x824 {
+                // Path A's request directly follows the strobe-low write;
+                // the strobe-high restore carries the old address.
+                if g.edge_low && edge {
+                    g.rf_latch[0] = latch;
+                }
+                g.edge_low = !edge;
+            }
         }
         if addr == 0x670 && data.len() == 4 {
             g.regs[0x673] &= 0x7f; // CAM command completes
@@ -393,8 +426,8 @@ fn smoke_rtl8192eu_power_and_firmware() -> TestResult {
         Ok(info) => info,
         Err(_) => return TestResult::Fail("8192eu device lifecycle failed"),
     };
-    if info.signature != 0x92e1 || owner.status().stage != Stage::TablesReady {
-        return TestResult::Fail("8192eu tables stage");
+    if info.signature != 0x92e1 || owner.status().stage != Stage::RadioReady {
+        return TestResult::Fail("8192eu radio stage");
     }
     let factory = match owner.factory_8192e() {
         Some(f) => f,
@@ -404,8 +437,9 @@ fn smoke_rtl8192eu_power_and_firmware() -> TestResult {
         return TestResult::Fail("8192eu retained factory");
     }
     // LDO path: SYS_CFG bit 24 clear raises the 1.2 V rail, then LDO_SW 0x83.
-    // The MAC table's later {0x014, 0x75} row follows the power-on write.
-    if io.writes(0x14) != [vec![0x00, 0x00, 0x50, 0x00], vec![0x75]]
+    // The MAC table's {0x014, 0x75} row and the post-calibration LDPC fix
+    // follow the power-on write.
+    if io.writes(0x14) != [vec![0x00, 0x00, 0x50, 0x00], vec![0x75], vec![0x75]]
         || io.writes(0x7c) != [vec![0x83]]
     {
         return TestResult::Fail("8192eu LDO sequence");
@@ -493,8 +527,8 @@ fn smoke_rtl8192eu_tables_and_rf() -> TestResult {
     let (a, b) = (rf(0x840), rf(0x844));
     if a.first() != Some(&0x0001_0000)
         || b.first() != Some(&0x0001_0000)
-        || a[1..] != expect(RADIO_A_INIT_TABLE)[..]
-        || b[1..] != expect(RADIO_B_INIT_TABLE)[..]
+        || !a[1..].starts_with(&expect(RADIO_A_INIT_TABLE))
+        || !b[1..].starts_with(&expect(RADIO_B_INIT_TABLE))
     {
         return TestResult::Fail("8192eu RF table rows/path routing");
     }
@@ -713,4 +747,138 @@ fn smoke_rtl8192eu_config_channel() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8192eu",
     smoke_rtl8192eu_config_channel
+);
+
+fn smoke_rtl8192eu_simularity_compare() -> TestResult {
+    use super::rtl8192e_iqk::simularity_compare;
+    let row = [0x100, 0x3fe, 0x0fc, 0x004, 0x101, 0x011, 0x0ff, 0x005];
+    // Within MAX_TOLERANCE, odd entries compared sign-extended (0x3fe = -2
+    // vs 0x002 = +2 differs by 4).
+    let mut close = row;
+    close[1] = 0x002;
+    close[4] = 0x105;
+    let mut result = [row, close, [0; 8], [0; 8]];
+    if !simularity_compare(&mut result, 0, 1, 2) || result[3] != [0; 8] {
+        return TestResult::Fail("8192eu similar rows");
+    }
+    // Path B TX differs: path A TX/RX and path B RX are copied into
+    // result[3] from c1 and the runs are not similar.
+    let mut far = row;
+    far[4] = 0x140;
+    let mut result = [row, far, [0; 8], [0; 8]];
+    if simularity_compare(&mut result, 0, 1, 2)
+        || result[3] != [0x100, 0x3fe, 0x0fc, 0x004, 0, 0, 0x0ff, 0x005]
+    {
+        return TestResult::Fail("8192eu per-group copy");
+    }
+    // A 1T board (bound 4) ignores path B entirely.
+    let mut result = [row, far, [0; 8], [0; 8]];
+    if !simularity_compare(&mut result, 0, 1, 1) {
+        return TestResult::Fail("8192eu 1T bound");
+    }
+    // Path A RX missing in c1 only (first difference at i == 2): c2 is the
+    // candidate and Linux copies its path-A TX pair (j in 0..2).
+    let mut no_rx = row;
+    no_rx[2] = 0;
+    no_rx[3] = 0;
+    let mut other = row;
+    other[0] = 0x102;
+    let mut result = [no_rx, other, [0; 8], [0; 8]];
+    if simularity_compare(&mut result, 0, 1, 2) || result[3] != [0x102, 0x3fe, 0, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("8192eu RX-missing candidate copy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_simularity_compare
+);
+
+fn smoke_rtl8192eu_iqk_and_lck() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(64))).is_err()
+        || owner.status().stage != Stage::RadioReady
+    {
+        return TestResult::Fail("8192eu lifecycle to RadioReady");
+    }
+    let radio = match owner.radio_8192e() {
+        Some(radio) => radio,
+        None => return TestResult::Fail("8192eu radio state not retained"),
+    };
+    if radio.iqk.candidate != 0 || radio.iqk.row != [0x100, 0x10, 0x100, 4, 0x100, 0x10, 0x100, 4] {
+        return TestResult::Fail("8192eu IQK candidate/row");
+    }
+    // Two runs (t = 0, 1 agree): per run, path A one TX + two RX one-shots
+    // (0xf9000000) and path B the same (0xfa000000).
+    let pts = io.writes_len(0xe48, 4);
+    let count = |v: u32| pts.iter().filter(|w| **w == v.to_le_bytes()).count();
+    if count(0xf900_0000) != 6 || count(0xfa00_0000) != 6 || count(0xf800_0000) != 12 {
+        return TestResult::Fail("8192eu IQK one-shot count");
+    }
+    // Only run t = 1 restores and reloads the 0xe30/0xe34 IQC default.
+    let default = 0x0100_8c00u32.to_le_bytes().to_vec();
+    if io
+        .writes_len(0xe30, 4)
+        .iter()
+        .filter(|w| **w == default)
+        .count()
+        != 1
+    {
+        return TestResult::Fail("8192eu IQK restore count");
+    }
+    // LC calibration in packet-TX mode pauses then releases every queue,
+    // before IQK's MAC calibration writes 0x3f.
+    let pause = io.writes_len(0x522, 1);
+    if pause.len() < 3 || pause[0] != [0xff] || pause[1] != [0x00] || pause[2] != [0x3f] {
+        return TestResult::Fail("8192eu LCK/IQK TXPAUSE order");
+    }
+    let g = io.0.lock();
+    if g.rf[0][0x18] & 0x8000 == 0 {
+        return TestResult::Fail("8192eu LCK trigger");
+    }
+    // fill_iqk_matrix_{a,b} with oldval 0x100 from the PHY table.
+    let r32 = |reg: usize| word(&g.regs[reg..reg + 4]);
+    if r32(0xc80) != 0x4010_0100
+        || r32(0xc88) != 0x4010_0100
+        || r32(0xc14) != 0x4000_1100
+        || r32(0xc1c) != 0x4000_1100
+    {
+        return TestResult::Fail("8192eu IQK matrix");
+    }
+    // Post-calibration: thermal meter, NAV upper, HRPWM, LDPC fix.
+    if g.rf[0][0x42] != 0x37cf8 || g.regs[0x652] != 235 || r32(0x10) & 0x000f_f000 != 0x0007_e000 {
+        return TestResult::Fail("8192eu post-calibration");
+    }
+    drop(g);
+    if io.writes(0xfe58) != [vec![0]] {
+        return TestResult::Fail("8192eu USB HRPWM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_iqk_and_lck
+);
+
+fn smoke_rtl8192eu_iqk_rejects_failed_path_a() -> TestResult {
+    let io = Fake::new();
+    // e94 & 0x03ff0000 == 0x01420000 fails every path-A TX IQK attempt.
+    io.0.lock().regs[0xe94..0xe98].copy_from_slice(&0x0142_0000u32.to_le_bytes());
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(64))) != Err(Error::Calibration)
+        || owner.status().stage != Stage::Failed
+        || owner.radio_8192e().is_some()
+    {
+        return TestResult::Fail("8192eu admitted a failed path-A IQK");
+    }
+    // Linux's post-calibration tail never ran.
+    if io.writes(0xfe58).iter().any(|w| w.len() == 1) {
+        return TestResult::Fail("8192eu continued after failed IQK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_iqk_rejects_failed_path_a
 );

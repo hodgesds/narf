@@ -656,26 +656,6 @@ fn smoke_rtl8xxxu_8192eu_per_chip() -> TestResult {
     if rtl8192e::NUM_RF_PATHS != 2 {
         return TestResult::Fail("8192e is 2T2R");
     }
-    if rtl8192e::LC_CAL_PATH_COUNT != 2 {
-        return TestResult::Fail("8192e LC cal both paths");
-    }
-
-    // IQK both paths.
-    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8192e::IQK_PATH_A_STEP_COUNT];
-    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8192e::IQK_PATH_B_STEP_COUNT];
-    if rtl8192e::build_iqk_path_a_sequence(&mut iqk_a) != 8 {
-        return TestResult::Fail("8192e IQK_A step count != 8");
-    }
-    if rtl8192e::build_iqk_path_b_sequence(&mut iqk_b) != 8 {
-        return TestResult::Fail("8192e IQK_B step count != 8");
-    }
-
-    // Dual-path channel set.
-    let cs = rtl8192e::channel_set_writes_8192e(11);
-    if cs.len() != 2 {
-        return TestResult::Fail("8192e channel set should emit 2 writes (A+B)");
-    }
-
     if !rtl8192e::channel_valid(6) {
         return TestResult::Fail("8192e ch 6 valid");
     }

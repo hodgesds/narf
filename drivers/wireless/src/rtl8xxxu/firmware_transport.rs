@@ -100,6 +100,13 @@ pub struct Status {
     pub error: Option<Error>,
 }
 
+/// RTL8192EU radio state retained at RadioReady.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Radio8192e {
+    pub iqk: super::rtl8192e_iqk::Iqk,
+    pub post: super::rtl8192e_radio::PostCalibration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalibrationInfo {
     pub tx_x: u16,
@@ -214,6 +221,7 @@ pub struct Owner<I: ControlIo> {
     // RTL8192EU factory/queue facts and gen2 H2C mailbox state.
     factory_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::Factory>>,
     queues_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
+    radio_8192e: IrqSafeSpinLock<Option<Radio8192e>>,
     h2c_next: AtomicU8,
     h2c_busy: AtomicBool,
 }
@@ -321,6 +329,7 @@ impl<I: ControlIo> Owner<I> {
             runtime_image: IrqSafeSpinLock::new(None),
             factory_8192e: IrqSafeSpinLock::new(None),
             queues_8192e: IrqSafeSpinLock::new(None),
+            radio_8192e: IrqSafeSpinLock::new(None),
             h2c_next: AtomicU8::new(0),
             h2c_busy: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
@@ -459,6 +468,11 @@ impl<I: ControlIo> Owner<I> {
     /// RTL8192EU identity/EFUSE facts once `FactoryReady` was reached.
     pub fn factory_8192e(&self) -> Option<super::rtl8192e_init::Factory> {
         *self.factory_8192e.lock()
+    }
+
+    /// RTL8192EU IQK outcome and post-calibration state once RadioReady.
+    pub fn radio_8192e(&self) -> Option<Radio8192e> {
+        *self.radio_8192e.lock()
     }
 
     /// RTL8192EU TX queue to bulk-OUT endpoint map installed before firmware.
@@ -628,9 +642,10 @@ impl<I: ControlIo> Owner<I> {
     }
 
     /// RTL8192EU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
-    /// through firmware start, the MAC/BB/RF tables and the post-table MAC
-    /// stage (`rtl8192e_radio::post_tables`). Calibration, channel and packet
-    /// stages follow; until they exist the owner stops at TablesReady.
+    /// through firmware start, the MAC/BB/RF tables, the post-table MAC
+    /// stage, LC + two-path IQ calibration and the post-calibration tail, in
+    /// Linux order. Channel and packet stages belong to the station owner.
+    /// RadioReady is not packet readiness.
     async fn run_device_8192e(
         &self,
         payload: &[u8],
@@ -650,6 +665,13 @@ impl<I: ControlIo> Owner<I> {
         super::rtl8192e_phy::mac_bb_rf(self, &factory).await?;
         super::rtl8192e_radio::post_tables(self, &factory).await?;
         self.stage(Stage::TablesReady);
+        self.stage(Stage::Calibrating);
+        let tx_paths = factory.identity.tx_paths;
+        super::rtl8192e_iqk::lc_calibrate(self, tx_paths).await?;
+        let iqk = super::rtl8192e_iqk::iq_calibrate(self, tx_paths).await?;
+        let post = super::rtl8192e_radio::post_calibration(self).await?;
+        *self.radio_8192e.lock() = Some(Radio8192e { iqk, post });
+        self.stage(Stage::RadioReady);
         Ok(info)
     }
 

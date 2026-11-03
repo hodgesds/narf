@@ -1135,6 +1135,25 @@ EP0 transfer/executable-cap discipline; chip steps live in
   LDPC RX hang fix (`REG_AFE_MISC[19:12] = 0x7e`, LDO 0x75) and the CCK AGC
   report type copied from `0x824[9]` to `0x82c[9]` and `0xa80[7]`; the
   `0xa9c[17]` CCK-new-AGC and `0xd2c[11]` CFO ATC states are retained.
+- Calibration (`rtl8192e_iqk`), between `post_tables` and
+  `post_calibration` exactly where `rtl8xxxu_init_device` runs it:
+  `rtl8723a_phy_lc_calibrate` (both paths' RF `0x00` standby in continuous
+  TX, else `TXPAUSE` 0xff/0x00 around `MODE_AG[15]` and 100 ms; no S0S1),
+  then `rtl8192eu_phy_iq_calibrate`: up to three `rtl8192eu_phy_iqcalibrate`
+  runs (ADDA `0x0fc01616`, MAC calibration, BB setup, path-A TX/RX IQK with
+  two retries each, path-A standby, path-B TX (1 ms settle)/RX IQK, run ≥ 1
+  restores ADDA/MAC/BB, the XA/XB AGC core and the `0xe30/0xe34` default),
+  `rtl8xxxu_gen2_simularity_compare` (sign-extended odd entries, the
+  `result[3]` per-group/candidate copies verbatim, bound 4 for 1T), Linux's
+  candidate 0/1/3 selection, `fill_iqk_matrix_a/b` with Linux u32
+  arithmetic (path-B RX ext in `0xc78[15:12]`), and the
+  `rtl8xxxu_iqk_phy_iq_bb_reg` recovery snapshot. Deviation: a chosen
+  candidate without a path-A TX result (or path-B TX on a 2T board) is
+  `Error::Calibration` and the owner fails before the post-calibration tail;
+  Linux silently keeps the power-on matrix. The outcome (`Iqk` +
+  `PostCalibration`) is retained as `Owner::radio_8192e()`; the owner then
+  reaches `RadioReady` (not packet readiness). The former placeholder IQK
+  skeleton in `rtl8192e.rs` is removed.
 - Channel (`rtl8192e_radio::config_channel`, `rtl8xxxu_gen2_config_channel`
   over both RF paths): 20 MHz (HT or non-HT) and 40 MHz with the secondary
   above (RF channel +2, subchannel 2) or below (−2, subchannel 1), CCK
@@ -1145,7 +1164,7 @@ EP0 transfer/executable-cap discipline; chip steps live in
   before any transfer. Two-path RF reads use `rtl8192e_radio::read_rfreg`
   (path-A edge strobe, path-specific HSSI/LSSI/HSPI readback).
 
-The owner currently stops at `TablesReady` for RTL8192EU. The production
+The owner reaches `RadioReady` for RTL8192EU after calibration. The production
 probe stays detection-only for this family; no table, calibration, packet
 or station capability is advertised.
 

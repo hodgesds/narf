@@ -18,12 +18,12 @@
 //!     `rtl8xxx_agc_8192eu_{std,highpa}_table[]`,
 //!     `rtl8192eu_radio{a,b}_init_table[]`.
 //!   - `rtl8192eu_init_phy_bb()`, `rtl8192eu_init_phy_rf()`.
-//!   - `rtl8192eu_iqk_path_{a,b}()`, `rtl8192eu_phy_iqcalibrate()`.
+//!   - `rtl8192eu_iqk_path_{a,b}()`, `rtl8192eu_phy_iqcalibrate()`
+//!     (implemented in `rtl8192e_iqk`).
 //!   - `rtl8192eu_fops`.
 
 #![allow(dead_code)]
 
-use super::phy::IqkStep;
 use super::regs::*;
 use super::usb::UsbControlSetup;
 
@@ -98,143 +98,18 @@ pub use super::rtl8192e_tables::{
 /// Path count for this chip. 8192EU is 2T2R.
 pub const NUM_RF_PATHS: usize = 2;
 
-// ── IQ calibration shape (gen1, dual path) ─────────────────────────
+// ── Calibration ────────────────────────────────────────────────────
 //
-// Source: `8192e.c::rtl8192eu_iqk_path_a()` L693..L867,
-// `rtl8192eu_iqk_path_b()` L870..L1047.
-
-/// Number of fixed-register writes per path-A IQK iteration.
-pub const IQK_PATH_A_STEP_COUNT: usize = 8;
-/// Number of fixed-register writes per path-B IQK iteration.
-pub const IQK_PATH_B_STEP_COUNT: usize = 8;
-/// IQK result-read delay (ms).
-/// Source: `8192e.c` ~L767 — `mdelay(10)`.
-pub const IQK_RESULT_DELAY_MS: u32 = 10;
-/// IQK outer retry count. `8192e.c` ~L1057 — `retry = 2`.
-pub const IQK_RETRY: usize = 2;
-/// IQK outer iterations.
-pub const IQK_ITERATIONS: usize = 3;
-/// IQK pass criteria — same masks as 8188EU.
-pub const IQK_PASS_BIT_EAC: u32 = 1 << 28;
-pub const IQK_REJECT_E94: u32 = 0x01420000;
-pub const IQK_REJECT_E9C: u32 = 0x00420000;
-pub const IQK_E94_MASK: u32 = 0x03ff0000;
-
-/// Build the path-A IQK fixed-register sequence skeleton.
-/// Returns the number of steps written.
-///
-/// Source: `8192e.c::rtl8192eu_iqk_path_a` L693..L867 — the eight
-/// `rtl8xxxu_write32` calls in the path-A LOK + IQK setup form
-/// the eight steps recorded here.
-pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
-    if buf.len() < IQK_PATH_A_STEP_COUNT {
-        return 0;
-    }
-    buf[0] = IqkStep {
-        reg: REG_TX_IQK_TONE_A,
-        val: 0,
-    };
-    buf[1] = IqkStep {
-        reg: REG_RX_IQK_TONE_A,
-        val: 0,
-    };
-    buf[2] = IqkStep {
-        reg: REG_TX_IQK_PI_A,
-        val: 0,
-    };
-    buf[3] = IqkStep {
-        reg: REG_RX_IQK_PI_A,
-        val: 0,
-    };
-    buf[4] = IqkStep {
-        reg: REG_TX_IQK,
-        val: 0,
-    };
-    buf[5] = IqkStep {
-        reg: REG_RX_IQK,
-        val: 0,
-    };
-    buf[6] = IqkStep {
-        reg: REG_IQK_AGC_PTS,
-        val: 0,
-    };
-    buf[7] = IqkStep {
-        reg: REG_IQK_AGC_PTS,
-        val: 0,
-    };
-    IQK_PATH_A_STEP_COUNT
-}
-
-/// Build path-B IQK skeleton.
-/// Source: `8192e.c::rtl8192eu_iqk_path_b` L870..L1047.
-pub fn build_iqk_path_b_sequence(buf: &mut [IqkStep]) -> usize {
-    if buf.len() < IQK_PATH_B_STEP_COUNT {
-        return 0;
-    }
-    // Path B reads/writes through path-B RF mode and PI control
-    // registers, but the LOK + IQK trigger sequence has the same
-    // shape as path A.
-    buf[0] = IqkStep {
-        reg: REG_TX_IQK_TONE_A,
-        val: 0,
-    };
-    buf[1] = IqkStep {
-        reg: REG_RX_IQK_TONE_A,
-        val: 0,
-    };
-    buf[2] = IqkStep {
-        reg: REG_TX_IQK_PI_A,
-        val: 0,
-    };
-    buf[3] = IqkStep {
-        reg: REG_RX_IQK_PI_A,
-        val: 0,
-    };
-    buf[4] = IqkStep {
-        reg: REG_TX_IQK,
-        val: 0,
-    };
-    buf[5] = IqkStep {
-        reg: REG_RX_IQK,
-        val: 0,
-    };
-    buf[6] = IqkStep {
-        reg: REG_IQK_AGC_PTS,
-        val: 0,
-    };
-    buf[7] = IqkStep {
-        reg: REG_IQK_AGC_PTS,
-        val: 0,
-    };
-    IQK_PATH_B_STEP_COUNT
-}
-
-/// IQK pass predicate (shared with 8188EU).
-pub fn iqk_passed(reg_eac: u32, reg_e94: u32, reg_e9c: u32) -> bool {
-    (reg_eac & IQK_PASS_BIT_EAC) == 0
-        && (reg_e94 & IQK_E94_MASK) != IQK_REJECT_E94
-        && (reg_e9c & IQK_E94_MASK) != IQK_REJECT_E9C
-}
-
-// ── LC calibration ─────────────────────────────────────────────────
-
-/// Both paths participate in LC-cal on the 2T2R 8192EU.
-pub const LC_CAL_PATH_COUNT: usize = 2;
+// LC calibration and the two-path IQK (`rtl8192eu_phy_iq_calibrate`) are
+// implemented against the owner in `rtl8192e_iqk`.
 
 // ── Channel-set sequence ───────────────────────────────────────────
 //
-// 8192EU is 2.4 GHz only — both RF paths receive the channel write.
-// Source: `core.c::rtl8xxxu_gen1_config_channel`.
+// 8192EU is 2.4 GHz only. The gen2 channel programming
+// (`core.c::rtl8xxxu_gen2_config_channel`) lives in `rtl8192e_radio`.
 
 pub const CHANNEL_MIN: u8 = 1;
 pub const CHANNEL_MAX: u8 = 14;
-
-/// Build the dual-path channel-set RF writes.
-pub fn channel_set_writes_8192e(channel: u8) -> [(u16, u32); 2] {
-    use super::phy::{lssi_encode, REG_FPGA0_LSSI_A, REG_FPGA0_LSSI_B};
-    let w = lssi_encode(RF_REG_CHANNEL, channel as u32);
-    [(REG_FPGA0_LSSI_A, w), (REG_FPGA0_LSSI_B, w)]
-}
 
 /// Validate a 2.4 GHz channel number.
 pub fn channel_valid(channel: u8) -> bool {
