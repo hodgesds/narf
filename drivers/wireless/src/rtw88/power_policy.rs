@@ -879,7 +879,13 @@ impl Gate {
         p.valid()
             && match &self.extension {
                 Some(g) => p.rates & !g.rates() == 0 && (!p.qos || g.wmm()),
-                None => p == super::packet_format::DataProfile::LEGACY,
+                None => {
+                    p == if p.band5 {
+                        super::packet_format::DataProfile::LEGACY5
+                    } else {
+                        super::packet_format::DataProfile::LEGACY
+                    }
+                }
             }
     }
     pub(super) fn with_extension(

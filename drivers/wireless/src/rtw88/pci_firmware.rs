@@ -929,6 +929,13 @@ unsafe impl Registers for Native {
         {
             return super::radio8821c::operating_readback(|r| self.read32(r), indices, channel);
         }
+        if let Some((ofdm, diffs)) = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::ofdm5)
+        {
+            return super::wmm::readback5(|r| self.read32(r), ofdm, diffs);
+        }
         let gains = self
             .packet_gate
             .as_ref()

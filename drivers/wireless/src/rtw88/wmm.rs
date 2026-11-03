@@ -31,7 +31,34 @@ pub(super) fn readback(
     }
     Ok(())
 }
-pub(super) fn words(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
+/// Readback of a C22 5GHz primary's retained OFDM program (`radio::ofdm5`):
+/// CCK references zero, the N2xO per-path OFDM references and the
+/// 0x3a04/0x3a08 differences. REG_RRSR is the profile's, checked by
+/// [`commit`] itself.
+pub(super) fn readback5(
+    mut read: impl FnMut(u16) -> Result<u32, Error>,
+    ofdm: [u8; 2],
+    diffs: [u32; 2],
+) -> Result<(), Error> {
+    for ((cck, reg), reference) in [(0x18a0, 0x18e8), (0x41a0, 0x41e8)].into_iter().zip(ofdm) {
+        if read(cck)? & 0x7f_0000 != 0 || read(reg)? & 0x1fc00 != u32::from(reference) << 10 {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(0x3a00)? != 0 || read(0x3a04)? != diffs[0] || read(0x3a08)? != diffs[1] {
+        return Err(Error::Prerequisite);
+    }
+    if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// EDCA words. rtw88 mac80211.c::rtw_aifsn_to_aifs: AIFS = AIFSN * slot +
+/// SIFS, SIFS 16 on `RTW_BAND_5G` and 10 otherwise; mac80211 mlme.c
+/// `ieee80211_handle_bss_capability` forces the short slot on 5GHz.
+pub(super) fn words(p: Parameters, short: bool, band5: bool) -> Result<[u32; 4], Error> {
+    let short = short || band5;
+    let sifs = if band5 { 16 } else { 10 };
     if p.ac[0].admission_control {
         return Err(Error::Unsupported);
     }
@@ -43,7 +70,7 @@ pub(super) fn words(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
             ac.ecw_max = ac.ecw_max.max(10);
             ac.txop = 0;
         }
-        let aifs = u16::from(ac.aifsn) * if short { 9 } else { 20 } + 10;
+        let aifs = u16::from(ac.aifsn) * if short { 9 } else { 20 } + sifs;
         if ac.aifsn < 2
             || ac.ecw_min > ac.ecw_max
             || ac.ecw_max > 15
@@ -71,7 +98,7 @@ pub(super) async fn commit(
     // backend before opening a descriptor/rate mode that depends on them.
     io.station_profile_readback()?;
     if let Some(p) = p {
-        let words = words(p, short)?;
+        let words = words(p, short, profile.band5)?;
         // Canonical ACI BE/BK/VI/VO maps to source BE/BK/VI/VO registers.
         for (reg, value) in [0x508, 0x50c, 0x504, 0x500].into_iter().zip(words) {
             admission.run(|| {

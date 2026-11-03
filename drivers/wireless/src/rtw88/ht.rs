@@ -201,7 +201,8 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
         .ht_facts()
         .filter(|f| f.local().is_some())
         .ok_or(Error::Unsupported)?;
-    if !base.wmm() {
+    // 5GHz HT facts/groups are not part of this program yet.
+    if !base.wmm() || base.band5() {
         return Err(Error::Unsupported);
     }
     let (recipe, digest) = base.ht_identity();

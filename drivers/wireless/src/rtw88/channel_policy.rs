@@ -491,6 +491,11 @@ pub(super) fn scope_request(
     h.update(&identity);
     h.update(&digest);
     h.update(b"Linux 7.3-rc4 rtw_set_channel + rtw_phy_set_tx_power_level for this primary; rtw_get_channel_group factory ceilings of this primary only; N2xO CCK references (C22) / TXAGC indices (C21) as the program base; record regulatory span and EIRP ceiling enclose every continuation; no channel-1 measurement reused");
+    if record.band5() {
+        // The 5GHz variant replaces the base text's CCK references,
+        // mgmt/EAPOL 1M, rate ids B8/BG6 and SIFS10 terms.
+        h.update(b"5GHz band variant: OFDM-only legacy8 intersection with OFDM6 mandatory (CCK1..11 refused); rateID G7 (get_rate_id WIRELESS_OFDM); mgmt/EAPOL 6M RATEID_G (rtw_tx_pkt_info_update_rate); RRSR_INIT_5G 0x150; N2xO OFDM references + 0x3a04/0x3a08 differences (C22) / OFDM TXAGC with CCK zero (C21) as the program base; WMM AIFS SIFS16 (rtw_aifsn_to_aifs RTW_BAND_5G) with the short slot forced (ieee80211_handle_bss_capability)");
+    }
     Some(super::station_profile::Request {
         identity: h.finalize(),
         mac: base.mac,

@@ -2627,6 +2627,27 @@ qualified over the OFDM6 base, 5GHz HT facts and C22 HT/MCS difference
 words) are follow-on work like every per-channel continuation; without
 them a 5GHz primary runs the legacy OFDM base profile.
 
+**5GHz legacy extension (N2xL band-5 variant).** Groundwork for 5GHz
+HT/VHT. A base scoped to a 5GHz N2xO primary (`channel_policy::scope_request`)
+hashes an extra band-5 contract line (OFDM-only legacy8 with OFDM6
+mandatory, rate id G7, mgmt/EAPOL 6M `RTW_RATEID_G`, `RRSR_INIT_5G`, the
+record's OFDM references/differences or OFDM TXAGC, SIFS16 with the forced
+short slot), so its N2xL identity and filename stem differ from every
+2.4GHz program. `station_profile::Grant::decode` then requires `rates &
+0x1f == 0x10` (no CCK, OFDM6) instead of CCK1; `Grant::band5`. The station
+binds such an extension on its own primary (`associate`), checks the
+association response's legacy intersection the same way and commits a
+`band5` DATA profile; `wmm::words(p, short, band5)` encodes AIFS with
+`rtw_aifsn_to_aifs` SIFS16 and the forced short slot on 5GHz.
+`wmm::readback5` checks a C22 5GHz retained program (CCK references zero,
+N2xO OFDM references, 0x3a04/0x3a08 differences) where 2.4GHz checks the
+CCK references; C21 keeps `operating_readback` at the 5GHz RF18.
+`Gate::allows_profile` without an extension admits the band's own base
+(`LEGACY5` on 5GHz). `ht::request` refuses a band-5 base: 5GHz HT facts
+and continuations are not implemented, so a 5GHz extension runs non-HT
+(legacy OFDM, optional WMM BE). Written, unexecuted: the 5GHz rows of
+`smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units`.
+
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station
 power check): a rule may carry only `NO_P2P`, `AUTO_BW` and `NO_160MHZ`;

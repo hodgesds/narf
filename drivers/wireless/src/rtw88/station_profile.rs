@@ -170,9 +170,17 @@ impl Grant {
         let ceiling = signed(58);
         let peaks = core::array::from_fn(|i| signed(60 + i * 2));
         let rates = u16::from_le_bytes([raw[88], raw[89]]);
+        // The band's mandatory base rate: CCK1 on 2.4GHz; on 5GHz (a base
+        // scoped to a 5GHz N2xO primary) no CCK rate and OFDM6 present
+        // (`tx.c::rtw_tx_pkt_info_update_rate` uses DESC_RATE6M there).
+        let band5 = super::band5::primary(base.channel());
         if !(0..=128).contains(&antenna)
             || !(-512..=256).contains(&ceiling)
-            || rates & 1 == 0
+            || if band5 {
+                rates & 0x1f != 0x10
+            } else {
+                rates & 1 == 0
+            }
             || rates & !0xfff != 0
             || peaks
                 .iter()
@@ -230,6 +238,10 @@ impl Grant {
     }
     pub(super) fn wmm(&self) -> bool {
         self.wmm
+    }
+    /// Qualified over a 5GHz N2xO primary: OFDM-only rates, OFDM6 base.
+    pub(super) fn band5(&self) -> bool {
+        super::band5::primary(self.channel())
     }
     pub(super) fn matches(&self, gate: &Gate) -> bool {
         gate.extension_request().as_ref() == Some(&self.request)

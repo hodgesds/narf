@@ -171,10 +171,21 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
         let p = narf_wireless::wmm::Parameters::parse(&parameters(4))
             .map_err(|_| "literal WMM parse")?
             .ok_or("literal WMM absent")?;
-        if crate::rtw88::wmm::words(p, false).map_err(|_| "literal WMM encode")?
+        if crate::rtw88::wmm::words(p, false, false).map_err(|_| "literal WMM encode")?
             != [0xa55a, 0xa496, 0x005e4332, 0x002f3232]
         {
             return Err("source C22 EDCA register fields or conservative BE changed");
+        }
+        // 5GHz: rtw_aifsn_to_aifs SIFS16 and the forced short slot.
+        let short = crate::rtw88::wmm::words(p, true, false).map_err(|_| "short WMM encode")?;
+        let five = crate::rtw88::wmm::words(p, false, true).map_err(|_| "5GHz WMM encode")?;
+        if five != crate::rtw88::wmm::words(p, true, true).map_err(|_| "5GHz WMM encode")?
+            || five
+                .iter()
+                .zip(short)
+                .any(|(f, s)| *f != (s & !0xff) | ((s & 0xff) + 6))
+        {
+            return Err("5GHz EDCA AIFS is not SIFS16 over the forced short slot");
         }
         for (index, _) in RATES.iter().enumerate() {
             let profile = DataProfile {

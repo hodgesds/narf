@@ -1084,14 +1084,20 @@ impl State {
                             let (rates, basic) =
                                 self.plan.as_ref().ok_or(Error::State)?.legacy_rates();
                             let rates = rates & grant.rates();
-                            if rates & 1 == 0 || basic & !rates != 0 {
+                            let band5 = grant.band5();
+                            if (if band5 {
+                                rates & 0x1f != 0x10
+                            } else {
+                                rates & 1 == 0
+                            }) || basic & !rates != 0
+                            {
                                 return Err(Error::Profile);
                             }
                             if self.wmm_requested {
                                 let p = narf_wireless::wmm::Parameters::parse(&frame.bytes()[30..])
                                     .map_err(|_| Error::Profile)?
                                     .ok_or(Error::Profile)?;
-                                super::wmm::words(p, short)?;
+                                super::wmm::words(p, short, band5)?;
                                 self.wmm = Some(p);
                             }
                             self.data_profile = super::packet_format::DataProfile {
@@ -1105,7 +1111,7 @@ impl State {
                                 acs: 0,
                                 fallback: false,
                                 bw40: false,
-                                band5: false,
+                                band5,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -1874,16 +1880,19 @@ impl State {
         };
         let extension = io
             .station_extension()?
-            // On 5GHz only the base OFDM6 profile is admitted: every
-            // continuation program is qualified over a CCK1 base.
+            // A 5GHz primary loads its own band-5 N2xL (OFDM-only, OFDM6
+            // base; `channel_policy::scope_request`).
             .filter(|g| {
-                !super::band5::primary(self.channel)
+                g.band5() == super::band5::primary(self.channel)
                     && candidate.basic_rates & !g.rates() == 0
                     && g.channel() == self.channel
             });
         let proposed = match &extension {
+            // 5GHz HT continuations are not qualified yet: the band-5
+            // extension runs non-HT (legacy OFDM, optional WMM).
             Some(g)
                 if g.wmm()
+                    && !g.band5()
                     && narf_wireless::wmm::Parameters::parse(
                         &candidate.bss.information_elements,
                     )
@@ -1991,7 +2000,7 @@ impl State {
                     None
                 };
                 if let Some(p) = p {
-                    super::wmm::words(p, candidate.bss.capability & 0x400 != 0)?;
+                    super::wmm::words(p, candidate.bss.capability & 0x400 != 0, grant.band5())?;
                 }
                 self.wmm_requested = p.is_some();
                 self.admission
