@@ -7,6 +7,7 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
 };
 use narf_filesystem::FsError;
 use narf_lib::{
@@ -212,10 +213,13 @@ pub(crate) trait Platform:
             crate::intel_gpu_dc_states::DcUser::Kms,
         ))
     }
-    /// Place a display-14 FBC CFB of `size` bytes (1:1) in DSM: returns
-    /// (DSM offset, placed bytes, compression limit). Default: no FBC.
-    fn fbc_carve(&self, _size: u64, _min_limit: u32) -> Option<(u32, u64, u32)> {
-        None
+    /// Poll the display-14 FBC CFB carve for `size` bytes (1:1) in DSM:
+    /// `Ready(Some((DSM offset, placed bytes, compression limit)))`,
+    /// `Ready(None)` when nothing can be placed, or `Pending` while the
+    /// carve (with its GGTT aperture survey) runs off the present path.
+    /// Never blocks and never surveys. Default: no FBC.
+    fn fbc_carve(&self, _size: u64, _min_limit: u32) -> Poll<Option<(u32, u64, u32)>> {
+        Poll::Ready(None)
     }
     /// A view that may reach registers while a GT-reset loss is being
     /// recovered, used only to stop an owned FBC before recovery's
@@ -295,6 +299,104 @@ pub(crate) struct Physical {
     /// outstanding display/cache witnesses; reset alone never retires DMA.
     reset_lost: Arc<AtomicBool>,
     recovering: bool,
+    /// The off-path FBC CFB carve, shared by every clone.
+    fbc_carve: Arc<crate::intel_gpu_stolen::CarveSlot>,
+}
+impl Physical {
+    fn read64(&self, offset: u64) -> u64 {
+        u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32)
+    }
+    /// The display-14 DSM layout (`detect_bar2_integrated`) and the
+    /// number of CPU-aperture GGTT entries to survey. `Err` when access
+    /// is lost (retry later); `Ok(None)` when there is no usable DSM.
+    fn fbc_dsm(&self) -> Result<Option<(crate::intel_gpu_stolen::Layout, u64)>, ()> {
+        use crate::intel_gpu_stolen as dsm;
+        if self.generation != Generation::MeteorLake {
+            return Ok(None);
+        }
+        if !self.access_ok() {
+            return Err(());
+        }
+        let Some((gmadr_base, gmadr_len)) =
+            crate::intel_gpu::with_controller(|gpu| (gpu.gmadr.phys.raw(), gpu.gmadr.len))
+        else {
+            return Ok(None);
+        };
+        let config = |offset| narf_bus::pci::read_config32(&self.cap, &self.device, offset).ok();
+        let (Some(bsm_dw0), Some(bsm_dw1)) = (config(dsm::PCI_BSM_DW0), config(dsm::PCI_BSM_DW1))
+        else {
+            return Ok(None);
+        };
+        let layout = dsm::layout(dsm::Facts {
+            ggc: self.read32(dsm::GGC),
+            stolen_reserved_lo: self.read32(dsm::STOLEN_RESERVED),
+            gscpsmi_base: self.read64(dsm::MEDIA_GSCPSMI_BASE),
+            gmadr_base,
+            gmadr_len,
+            bsm_dw0,
+            bsm_dw1,
+        });
+        if !self.access_ok() {
+            return Err(());
+        }
+        // Every DSM page a CPU can reach through the aperture: present DM
+        // PTEs in GGTT [0, BAR2 length). This covers the boot framebuffer.
+        let entries = (gmadr_len / dsm::PAGE).min(self.bar.len.saturating_sub(GGTT_ARRAY_BASE) / 8);
+        Ok(layout.ok().map(|layout| (layout, entries)))
+    }
+}
+
+/// The off-path FBC carve for one display-14 function: the GGTT aperture
+/// survey in [`crate::intel_gpu_stolen::CARVE_CHUNK_PTES`] chunks, each
+/// under the KMS mutex (the window's contract) and followed by a yield,
+/// then the CFB placement outside it. A KMS session never waits for it.
+async fn fbc_carve_job(platform: Physical, size: u64, min_limit: u32) {
+    let slot = platform.fbc_carve.clone();
+    match fbc_carve_run(&platform, size, min_limit).await {
+        Ok(placed) => slot.finish(size, min_limit, placed),
+        Err(()) => slot.abandon(),
+    }
+}
+async fn fbc_carve_run(
+    platform: &Physical,
+    size: u64,
+    min_limit: u32,
+) -> Result<Option<(u32, u64, u32)>, ()> {
+    use crate::intel_gpu_stolen::{Carve, CARVE_CHUNK_PTES};
+    let display = display(platform.index).ok_or(())?;
+    let mut carve: Option<Carve> = None;
+    loop {
+        let done = {
+            let state = display.state.lock().await;
+            if state.failed || platform.reset_lost() {
+                return Err(());
+            }
+            let carve = match carve.as_mut() {
+                Some(carve) => carve,
+                None => match platform.fbc_dsm()? {
+                    Some((layout, entries)) => carve.insert(Carve::new(layout, entries)),
+                    None => return Ok(None),
+                },
+            };
+            let done = carve.survey(CARVE_CHUNK_PTES, |index| {
+                platform.read64(GGTT_ARRAY_BASE + 8 * index)
+            });
+            if !platform.access_ok() {
+                return Err(());
+            }
+            drop(state);
+            done
+        };
+        if done {
+            break;
+        }
+        narf_scheduler::yield_now().await;
+    }
+    Ok(carve.and_then(|carve| {
+        carve.place(size, min_limit, |phys| {
+            narf_memory::frame::is_system_ram(narf_memory::PhysAddr::new(phys))
+        })
+    }))
 }
 impl MmioWindow for Physical {
     fn read32(&self, offset: u64) -> u32 {
@@ -603,48 +705,13 @@ impl Platform for Physical {
         )
         .map_err(|_| crate::intel_gpu_user::io_error())
     }
-    fn fbc_carve(&self, size: u64, min_limit: u32) -> Option<(u32, u64, u32)> {
-        use crate::intel_gpu_stolen as dsm;
-        if self.generation != Generation::MeteorLake || !self.access_ok() {
-            return None;
+    fn fbc_carve(&self, size: u64, min_limit: u32) -> Poll<Option<(u32, u64, u32)>> {
+        if self.generation != Generation::MeteorLake {
+            return Poll::Ready(None);
         }
-        let (gmadr_base, gmadr_len) =
-            crate::intel_gpu::with_controller(|gpu| (gpu.gmadr.phys.raw(), gpu.gmadr.len))?;
-        let config = |offset| narf_bus::pci::read_config32(&self.cap, &self.device, offset).ok();
-        let read64 =
-            |offset| u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32);
-        let layout = dsm::layout(dsm::Facts {
-            ggc: self.read32(dsm::GGC),
-            stolen_reserved_lo: self.read32(dsm::STOLEN_RESERVED),
-            gscpsmi_base: read64(dsm::MEDIA_GSCPSMI_BASE),
-            gmadr_base,
-            gmadr_len,
-            bsm_dw0: config(dsm::PCI_BSM_DW0)?,
-            bsm_dw1: config(dsm::PCI_BSM_DW1)?,
+        self.fbc_carve.poll(size, min_limit, || {
+            narf_scheduler::spawn(fbc_carve_job(self.clone(), size, min_limit));
         })
-        .ok()?;
-        // Every DSM page a CPU can reach through the aperture: present DM
-        // PTEs in GGTT [0, BAR2 length). This covers the boot framebuffer.
-        let entries = (gmadr_len / dsm::PAGE).min(self.bar.len.saturating_sub(GGTT_ARRAY_BASE) / 8);
-        let pages = dsm::aperture_dsm_pages((0..entries).map(|i| read64(GGTT_ARRAY_BASE + 8 * i)));
-        if !self.access_ok() {
-            return None;
-        }
-        let mut stolen = dsm::Dsm::new(layout, pages);
-        let mut offset = None;
-        let (limit, bytes) =
-            crate::intel_gpu_fbc::find_compression_limit(size, min_limit, |bytes| {
-                match stolen.place(bytes, dsm::PAGE, dsm::CFB_BASE_MAX, |phys| {
-                    narf_memory::frame::is_system_ram(narf_memory::PhysAddr::new(phys))
-                }) {
-                    Ok(placed) => {
-                        offset = Some(placed);
-                        true
-                    }
-                    Err(_) => false,
-                }
-            })?;
-        Some((u32::try_from(offset?).ok()?, bytes, limit))
     }
     fn fbc_recovery_view(&self) -> Option<Self> {
         let mut view = self.clone();
@@ -914,6 +981,7 @@ pub(crate) fn install(
         generation,
         reset_lost: Arc::new(AtomicBool::new(false)),
         recovering: false,
+        fbc_carve: Arc::new(crate::intel_gpu_stolen::CarveSlot::new()),
     };
     let display = Arc::new(Device::new(platform, generation, bar.len, console.clone()));
     let mut displays = DISPLAYS.lock();
@@ -2099,8 +2167,9 @@ impl<M: Platform> Guard<'_, M> {
             && !self.device.platform.reset_lost()
             && self.device.platform.console_access_ok()
     }
-    /// Display-14 FBC on the latched KMS framebuffer: place the CFB once,
-    /// then nuke or (re)activate; any ineligible plane disables.
+    /// Display-14 FBC on the latched KMS framebuffer: once the off-path
+    /// carve has placed the CFB, nuke or (re)activate; any ineligible
+    /// plane disables.
     fn fbc_after_latch(&mut self, geometry: Geometry) {
         use crate::intel_gpu_fbc::{cfb_size, check_plane, min_limit, override_stride, Fbc};
         // has_psr (enabled, even while paused) refuses FBC: PSR wins.
@@ -2124,13 +2193,15 @@ impl<M: Platform> Guard<'_, M> {
             selective_update: false,
         };
         if self.state.fbc.is_none() && !self.state.fbc_refused && check_plane(&plane).is_ok() {
+            // Only polled: the carve and its GGTT survey run off this path,
+            // and FBC stays off until a later latch finds them finished.
             let size = cfb_size(plane.format, plane.width, plane.height, plane.stride_bytes);
             match self
                 .device
                 .platform
                 .fbc_carve(size, min_limit(plane.format))
             {
-                Some((offset, bytes, limit)) => {
+                Poll::Ready(Some((offset, bytes, limit))) => {
                     self.state.fbc = Some(Fbc::new(
                         offset,
                         bytes,
@@ -2138,7 +2209,8 @@ impl<M: Platform> Guard<'_, M> {
                         override_stride(plane.format, plane.width, plane.stride_bytes),
                     ))
                 }
-                None => self.state.fbc_refused = true,
+                Poll::Ready(None) => self.state.fbc_refused = true,
+                Poll::Pending => {}
             }
         }
         if let Some(fbc) = self.state.fbc.as_mut() {

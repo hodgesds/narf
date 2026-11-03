@@ -158,3 +158,130 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_stolen",
     smoke_stolen_cfb_avoids_boot_fb_wopcm_and_gsc
 );
+
+/// 5000 GGTT entries: the boot framebuffer (DSM pages 0..1024) at entries
+/// 3000..4024, a stray DM page at 6 MiB in the last entry, system-memory
+/// PTEs everywhere else.
+fn aperture() -> Vec<u64> {
+    let mut ptes: Vec<u64> = (0..5000u64)
+        .map(|i| (0x8000_0000 + i * PAGE) | GGTT_PTE_PRESENT)
+        .collect();
+    for i in 0..1024u64 {
+        ptes[3000 + i as usize] = (DSM_GSM_OFFSET + i * PAGE) | GGTT_PTE_DM | GGTT_PTE_PRESENT;
+    }
+    ptes[4999] = (DSM_GSM_OFFSET + 6 * MIB) | GGTT_PTE_DM | GGTT_PTE_PRESENT;
+    ptes
+}
+
+fn smoke_stolen_carve_survey_is_chunked_and_places_like_one_shot() -> TestResult {
+    let ptes = aperture();
+    let l = layout(facts()).unwrap();
+    let mut carve = Carve::new(l, ptes.len() as u64);
+    // Before the survey completes nothing is placed.
+    if carve.clone().place(3 * MIB, 1, |_| false).is_some() {
+        return TestResult::Fail("an incomplete survey must not place");
+    }
+    let mut seen = alloc::vec![0u32; ptes.len()];
+    let mut steps = 0;
+    loop {
+        let mut reads = 0u64;
+        let done = carve.survey(CARVE_CHUNK_PTES, |i| {
+            reads += 1;
+            seen[i as usize] += 1;
+            ptes[i as usize]
+        });
+        steps += 1;
+        if reads > CARVE_CHUNK_PTES {
+            return TestResult::Fail("a survey step must stay within its chunk");
+        }
+        if done {
+            break;
+        }
+    }
+    // ceil(5000 / 1024) bounded steps, each entry read exactly once.
+    if steps != 5 || carve.read() != 5000 || seen.iter().any(|&n| n != 1) {
+        return TestResult::Fail("the survey must read every entry once, in chunks");
+    }
+    if !carve.survey(CARVE_CHUNK_PTES, |_| panic!("no reads after completion")) {
+        return TestResult::Fail("a complete survey stays complete");
+    }
+    // The chunked survey places exactly what the one-shot scan would:
+    // find_compression_limit tries 2x first (6 MiB does not fit the 4..6
+    // MiB gap, so it lands past the stray page).
+    let mut one_shot = Dsm::new(l, aperture_dsm_pages(ptes.iter().copied()));
+    let mut want = None;
+    let (limit, bytes) = crate::intel_gpu_fbc::find_compression_limit(3 * MIB, 1, |bytes| {
+        match one_shot.place(bytes, PAGE, CFB_BASE_MAX, |_| false) {
+            Ok(offset) => {
+                want = Some(offset);
+                true
+            }
+            Err(_) => false,
+        }
+    })
+    .unwrap();
+    let placed = carve.clone().place(3 * MIB, 1, |_| false);
+    if placed != Some((want.unwrap() as u32, bytes, limit))
+        || placed != Some(((6 * MIB + PAGE) as u32, 6 * MIB, 1))
+    {
+        return TestResult::Fail("chunked survey must place like the one-shot scan");
+    }
+    // The placement keeps its RAM proof: every candidate RAM-backed.
+    if carve.place(3 * MIB, 1, |_| true).is_some() {
+        return TestResult::Fail("RAM-backed DSM must never be handed out");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_stolen",
+    smoke_stolen_carve_survey_is_chunked_and_places_like_one_shot
+);
+
+fn smoke_stolen_carve_slot_polls_without_blocking() -> TestResult {
+    use core::cell::Cell;
+    use core::task::Poll;
+    let slot = CarveSlot::new();
+    let starts = Cell::new(0);
+    let start = || starts.set(starts.get() + 1);
+    // The first poll launches the off-path carve and returns at once.
+    if slot.poll(100, 1, start) != Poll::Pending || starts.get() != 1 {
+        return TestResult::Fail("the first poll launches exactly one carve");
+    }
+    // While it runs: Pending, no second launch, for any parameters.
+    if slot.poll(100, 1, start) != Poll::Pending
+        || slot.poll(200, 1, start) != Poll::Pending
+        || starts.get() != 1
+    {
+        return TestResult::Fail("a running carve is never relaunched or waited for");
+    }
+    // A completion for other parameters is ignored.
+    slot.finish(200, 1, Some((1, 2, 1)));
+    if slot.poll(100, 1, start) != Poll::Pending || starts.get() != 1 {
+        return TestResult::Fail("only the running carve may finish");
+    }
+    slot.finish(100, 1, Some((0x1000, 200, 1)));
+    if slot.poll(100, 1, start) != Poll::Ready(Some((0x1000, 200, 1))) || starts.get() != 1 {
+        return TestResult::Fail("a finished carve answers without relaunching");
+    }
+    // New parameters (a replaced console geometry) carve again.
+    if slot.poll(300, 2, start) != Poll::Pending || starts.get() != 2 {
+        return TestResult::Fail("new parameters launch a new carve");
+    }
+    slot.finish(300, 2, None);
+    if slot.poll(300, 2, start) != Poll::Ready(None) {
+        return TestResult::Fail("a carve that placed nothing is a refusal");
+    }
+    // Lost access abandons a running carve; the next poll relaunches.
+    if slot.poll(400, 1, start) != Poll::Pending || starts.get() != 3 {
+        return TestResult::Fail("relaunch for new parameters");
+    }
+    slot.abandon();
+    if slot.poll(400, 1, start) != Poll::Pending || starts.get() != 4 {
+        return TestResult::Fail("an abandoned carve is relaunched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_stolen",
+    smoke_stolen_carve_slot_polls_without_blocking
+);

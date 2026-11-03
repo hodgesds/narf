@@ -573,3 +573,51 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_psr",
     smoke_psr_kms_vbt_wakeup_times_reach_psr_ctl
 );
+
+fn smoke_fbc_kms_present_only_polls_carve_and_activates_after_it() -> TestResult {
+    {
+        // No PSR timing: PSR is not offered, so FBC is eligible.
+        let platform = MockPlatform::new();
+        let _ = platform.dsb_timing();
+        {
+            let mut hw = platform.0.lock();
+            hw.fbc_offset = Some(0x10_0000);
+            hw.fbc_carve_pending = true;
+        }
+        let device = platform.meteor();
+        let front = object(true).unwrap();
+        let fbc_writes = |platform: &MockPlatform| {
+            platform
+                .all_writes()
+                .iter()
+                .filter(|&&(r, _)| (0x43200..0x43230).contains(&r) || r == PIPE_CLKGATE_DIS2)
+                .count()
+        };
+        // Two latches while the off-path carve runs: each only polls it,
+        // FBC stays off, nothing is programmed and nothing is refused.
+        for polls in 1..=2 {
+            present_once(&device, front.clone());
+            assert_eq!(platform.0.lock().fbc_carve_polls, polls);
+            assert_eq!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+            assert_eq!(fbc_writes(&platform), 0);
+            let state = device.state.try_lock().unwrap();
+            assert!(state.fbc.is_none() && !state.fbc_refused);
+        }
+        // The carve finished off-path: the next eligible latch places the
+        // CFB and activates FBC on it.
+        platform.0.lock().fbc_carve_pending = false;
+        present_once(&device, front.clone());
+        assert_eq!(platform.0.lock().fbc_carve_polls, 3);
+        assert_eq!(platform.read32(0x43200), 0x10_0000);
+        assert_ne!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+        // Placed once: later latches never poll again.
+        present_once(&device, front);
+        assert_eq!(platform.0.lock().fbc_carve_polls, 3);
+        assert_ne!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_fbc",
+    smoke_fbc_kms_present_only_polls_carve_and_activates_after_it
+);

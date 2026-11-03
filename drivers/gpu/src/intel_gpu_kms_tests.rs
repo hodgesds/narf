@@ -89,6 +89,10 @@ struct Hardware {
     psr_vbt: crate::intel_gpu_psr::VbtPsr,
     /// DSM offset an FBC CFB is placed at (1:1); `None` places nothing.
     fbc_offset: Option<u32>,
+    /// The off-path carve has not finished: `fbc_carve` answers `Pending`.
+    fbc_carve_pending: bool,
+    /// `fbc_carve` polls (each is non-blocking and runs no survey).
+    fbc_carve_polls: usize,
 }
 /// Sink AUX writes are logged in the MMIO write log at this pseudo offset
 /// plus the DPCD address, so register and sink order can be compared.
@@ -172,6 +176,8 @@ impl MockPlatform {
                 psr_wm_provider: false,
                 psr_vbt: crate::intel_gpu_psr::VbtPsr::Missing,
                 fbc_offset: None,
+                fbc_carve_pending: false,
+                fbc_carve_polls: 0,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -1142,11 +1148,13 @@ impl Platform for MockPlatform {
     fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
         self.0.lock().psr_vbt
     }
-    fn fbc_carve(&self, size: u64, min_limit: u32) -> Option<(u32, u64, u32)> {
-        self.0
-            .lock()
-            .fbc_offset
-            .map(|offset| (offset, size, min_limit))
+    fn fbc_carve(&self, size: u64, min_limit: u32) -> Poll<Option<(u32, u64, u32)>> {
+        let mut hw = self.0.lock();
+        hw.fbc_carve_polls += 1;
+        if hw.fbc_carve_pending {
+            return Poll::Pending;
+        }
+        Poll::Ready(hw.fbc_offset.map(|offset| (offset, size, min_limit)))
     }
     fn fbc_recovery_view(&self) -> Option<Self> {
         let mut view = self.clone();

@@ -34,8 +34,20 @@
 //! `narf_memory::frame::is_system_ram`: the buddy allocator is seeded only
 //! from Usable boot RAM (plus hotplug), so a page that is not system RAM
 //! can never be owned by the page allocator. No memory/ change is needed.
+//!
+//! The aperture survey reads one GGTT PTE per CPU-mappable 4 KiB page (64Ki
+//! entries for a 256 MiB BAR2). It never runs on the present path: a
+//! [`Carve`] reads at most [`CARVE_CHUNK_PTES`] entries per step and its
+//! driver yields between steps; the present path only polls a
+//! [`CarveSlot`], and FBC stays off until the carve has finished. A
+//! finished survey stays valid: this driver never writes a DM PTE, so the
+//! set of aperture-reachable DSM pages can only shrink, and a stale survey
+//! only over-excludes.
 
 use alloc::vec::Vec;
+use core::task::Poll;
+
+use narf_lib::sync::IrqSafeSpinLock;
 
 /// `GGC` (xe_regs.h).
 pub const GGC: u64 = 0x108040;
@@ -173,15 +185,19 @@ pub fn layout(facts: Facts) -> Result<Layout, StolenError> {
     })
 }
 
+/// The DSM-relative page offset a present DM PTE maps, if `pte` is one.
+fn dm_page(pte: u64) -> Option<u64> {
+    if pte & (GGTT_PTE_PRESENT | GGTT_PTE_DM) != GGTT_PTE_PRESENT | GGTT_PTE_DM {
+        return None;
+    }
+    (pte & GGTT_PTE_ADDR_MASK).checked_sub(DSM_GSM_OFFSET)
+}
+
 /// DSM pages reachable through the CPU aperture: the DSM-relative page
 /// offset of every present DM PTE among `ptes` (GGTT entries
 /// `[0, BAR2 length / 4 KiB)`).
 pub fn aperture_dsm_pages(ptes: impl IntoIterator<Item = u64>) -> Vec<u64> {
-    let mut pages: Vec<u64> = ptes
-        .into_iter()
-        .filter(|pte| pte & (GGTT_PTE_PRESENT | GGTT_PTE_DM) == GGTT_PTE_PRESENT | GGTT_PTE_DM)
-        .filter_map(|pte| (pte & GGTT_PTE_ADDR_MASK).checked_sub(DSM_GSM_OFFSET))
-        .collect();
+    let mut pages: Vec<u64> = ptes.into_iter().filter_map(dm_page).collect();
     pages.sort_unstable();
     pages.dedup();
     pages
@@ -269,6 +285,163 @@ impl Dsm {
         }
         self.placed.push((start, len));
         Ok(start)
+    }
+}
+
+/// GGTT entries one [`Carve::survey`] step reads (two MMIO reads each)
+/// before its driver yields.
+pub const CARVE_CHUNK_PTES: u64 = 1024;
+
+/// A placed FBC CFB: (DSM offset, placed bytes, compression limit).
+pub type Placed = (u32, u64, u32);
+
+/// A resumable DSM survey and FBC CFB placement for one function.
+#[derive(Clone, Debug)]
+pub struct Carve {
+    layout: Layout,
+    entries: u64,
+    next: u64,
+    pages: Vec<u64>,
+}
+
+impl Carve {
+    /// A survey of GGTT entries `[0, entries)` over `layout`.
+    pub fn new(layout: Layout, entries: u64) -> Self {
+        Self {
+            layout,
+            entries,
+            next: 0,
+            pages: Vec::new(),
+        }
+    }
+
+    /// Read at most `budget` further GGTT entries through
+    /// `read_pte(index)`, keeping every present DM page. Returns whether
+    /// every entry has been read.
+    pub fn survey(&mut self, budget: u64, mut read_pte: impl FnMut(u64) -> u64) -> bool {
+        let end = self.next.saturating_add(budget).min(self.entries);
+        for index in self.next..end {
+            if let Some(page) = dm_page(read_pte(index)) {
+                self.pages.push(page);
+            }
+        }
+        self.next = end;
+        self.done()
+    }
+
+    /// Every entry has been read.
+    pub fn done(&self) -> bool {
+        self.next >= self.entries
+    }
+
+    /// GGTT entries read so far.
+    pub fn read(&self) -> u64 {
+        self.next
+    }
+
+    /// After a complete survey: `find_compression_limit` over first-fit
+    /// placements below `intel_fbc_cfb_base_max`, each proved free of
+    /// system RAM. `None` before the survey completes or when nothing fits.
+    pub fn place(
+        self,
+        size: u64,
+        min_limit: u32,
+        is_system_ram: impl Fn(u64) -> bool,
+    ) -> Option<Placed> {
+        if !self.done() {
+            return None;
+        }
+        let mut pages = self.pages;
+        pages.sort_unstable();
+        pages.dedup();
+        let mut stolen = Dsm::new(self.layout, pages);
+        let mut offset = None;
+        let (limit, bytes) =
+            crate::intel_gpu_fbc::find_compression_limit(size, min_limit, |bytes| {
+                match stolen.place(bytes, PAGE, CFB_BASE_MAX, &is_system_ram) {
+                    Ok(placed) => {
+                        offset = Some(placed);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            })?;
+        Some((u32::try_from(offset?).ok()?, bytes, limit))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SlotState {
+    #[default]
+    Idle,
+    Running {
+        size: u64,
+        min_limit: u32,
+    },
+    Done {
+        size: u64,
+        min_limit: u32,
+        result: Option<Placed>,
+    },
+}
+
+/// One function's off-path CFB carve as the present path sees it: polled,
+/// never waited for.
+#[derive(Debug)]
+pub struct CarveSlot(IrqSafeSpinLock<SlotState>);
+
+impl Default for CarveSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CarveSlot {
+    pub const fn new() -> Self {
+        Self(IrqSafeSpinLock::new(SlotState::Idle))
+    }
+
+    /// The finished carve for exactly `size`/`min_limit` (`Ready(None)`:
+    /// nothing fits), or `Pending`. When no carve for these parameters is
+    /// running or finished, the slot records one as running and calls
+    /// `start` (outside its lock) to launch it; `start` must not block.
+    pub fn poll(&self, size: u64, min_limit: u32, start: impl FnOnce()) -> Poll<Option<Placed>> {
+        let mut state = self.0.lock();
+        match *state {
+            SlotState::Done {
+                size: s,
+                min_limit: m,
+                result,
+            } if (s, m) == (size, min_limit) => Poll::Ready(result),
+            SlotState::Running { .. } => Poll::Pending,
+            _ => {
+                *state = SlotState::Running { size, min_limit };
+                drop(state);
+                start();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// The running carve for `size`/`min_limit` finished.
+    pub fn finish(&self, size: u64, min_limit: u32, result: Option<Placed>) {
+        let mut state = self.0.lock();
+        if *state == (SlotState::Running { size, min_limit }) {
+            *state = SlotState::Done {
+                size,
+                min_limit,
+                result,
+            };
+        }
+    }
+
+    /// The running carve could not complete (access lost): the next poll
+    /// starts another.
+    pub fn abandon(&self) {
+        let mut state = self.0.lock();
+        if matches!(*state, SlotState::Running { .. }) {
+            *state = SlotState::Idle;
+        }
     }
 }
 
