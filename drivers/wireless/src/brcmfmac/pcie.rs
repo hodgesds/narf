@@ -421,7 +421,7 @@ pub unsafe fn bring_up(
         return Err(ProbeError::Bar0TooSmall);
     }
     // BCM43602 ids as before; other ids only where Linux binds them with a
-    // vendor path the chip profiles implement (no seed, not CYW).
+    // vendor path the chip profiles implement (WCC/BCA, seeded or not).
     let bar2 = if matches!(
         device.id.device,
         BRCM_PCIE_43602_DEVICE_ID | BRCM_PCIE_43602_2G_DEVICE_ID | BRCM_PCIE_43602_5G_DEVICE_ID

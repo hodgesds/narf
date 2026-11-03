@@ -18,6 +18,8 @@ pub enum Error {
     State,
     Timeout,
     Metadata,
+    /// The kernel DRBG could not provide the random-seed footer bytes.
+    Entropy,
     Chip(chip::Error),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +101,8 @@ pub struct Cr4<B: Bus> {
     arm: Core,
     cpu: Cpu,
     ram: Ram,
+    /// The bound PCI row's `fw_seed` (`brcmf_pcie_probe` drvdata).
+    seed: bool,
     used: bool,
 }
 impl<B: Bus> core::fmt::Debug for Cr4<B> {
@@ -106,6 +110,7 @@ impl<B: Bus> core::fmt::Debug for Cr4<B> {
         f.debug_struct("BrcmCr4")
             .field("cpu", &self.cpu)
             .field("ram", &self.ram)
+            .field("seed", &self.seed)
             .field("used", &self.used)
             .finish_non_exhaustive()
     }
@@ -127,7 +132,13 @@ impl<B: Bus> Cr4<B> {
     /// Policy/identity admission precedes writes; actual cores come from
     /// EROM. Missing calibration policy is a software gate, not a fallback.
     pub fn claim(bus: B, pci: PciIdentity, profile: BoardProfile) -> Result<Self, Refused<B>> {
-        Self::claim_checked(bus, |chip| profile.admits(chip, pci))
+        let seed = chip_profile::pci_row(
+            pci.vendor,
+            pci.device,
+            (pci.subsystem_vendor, pci.subsystem_device),
+        )
+        .is_some_and(|row| row.seed);
+        Self::claim_checked(bus, seed, |chip| profile.admits(chip, pci))
     }
     pub(super) fn claim_selected(
         bus: B,
@@ -135,7 +146,8 @@ impl<B: Bus> Cr4<B> {
         selection: &super::provision::Selection,
     ) -> Result<Self, Refused<B>> {
         let expected = selection.host().id;
-        Self::claim_checked(bus, |chip| {
+        let seed = chip_profile::pci_match(&expected).is_some_and(|row| row.seed);
+        Self::claim_checked(bus, seed, |chip| {
             // Family 3 additionally needs the Linux PCI/vendor admission of
             // the actual discovered chip and revision.
             let family = match selection.family() {
@@ -153,7 +165,11 @@ impl<B: Bus> Cr4<B> {
                 && selection.admits_chip(chip.id, chip.revision)
         })
     }
-    fn claim_checked(mut bus: B, admitted: impl FnOnce(&Chip) -> bool) -> Result<Self, Refused<B>> {
+    fn claim_checked(
+        mut bus: B,
+        seed: bool,
+        admitted: impl FnOnce(&Chip) -> bool,
+    ) -> Result<Self, Refused<B>> {
         match Self::discover(&mut bus, admitted) {
             Ok((chip, arm, cpu, ram)) => Ok(Self {
                 bus,
@@ -161,6 +177,7 @@ impl<B: Bus> Cr4<B> {
                 arm,
                 cpu,
                 ram,
+                seed,
                 used: false,
             }),
             Err(error) => Err(Refused { error, bus }),
@@ -188,16 +205,17 @@ impl<B: Bus> Cr4<B> {
         };
         // Linux brcmf_chip_set_passive dispatches CR4 first, then CA7.
         let (cr4, ca7) = (only(chip::CORE_ARM_CR4)?, only(chip::CORE_ARM_CA7)?);
-        let arm = match (profile.cpu, cr4, ca7) {
-            (Cpu::Cr4, Some(arm), _) => arm,
-            (Cpu::Ca7, None, Some(arm)) => arm,
+        // A profile without a fixed CPU takes that dispatch as is.
+        let (arm, cpu) = match (profile.cpu, cr4, ca7) {
+            (Some(Cpu::Cr4) | None, Some(arm), _) => (arm, Cpu::Cr4),
+            (Some(Cpu::Ca7) | None, None, Some(arm)) => (arm, Cpu::Ca7),
             _ => return Err(Error::Unsupported),
         };
         // BCM43602 additionally resets SOCRAM at exit (pcie.c
         // brcmf_pcie_exit_download_state); CA7 sizes RAM from SYS_MEM.
         if chip.id == chip_profile::BRCM_CC_43602
             && chip.core(chip_profile::CORE_INTERNAL_MEM).is_none()
-            || profile.cpu == Cpu::Ca7
+            || cpu == Cpu::Ca7
                 && (chip.core(chip_profile::CORE_SYS_MEM).is_none()
                     || chip.core(chip::CORE_D11).is_none())
         {
@@ -210,7 +228,7 @@ impl<B: Bus> Cr4<B> {
         }
         // brcmf_chip_disable_arm: keep only HALT, reset with HALT.
         Chip::reset_core(bus, arm, previous & 0x20, 0x20, 0x20).map_err(Error::Chip)?;
-        let size = match profile.cpu {
+        let size = match cpu {
             Cpu::Cr4 => {
                 // brcmf_chip_cr4_set_passive: disable every D11 core.
                 for core in chip
@@ -247,7 +265,7 @@ impl<B: Bus> Cr4<B> {
         {
             return Err(Error::Extent);
         }
-        Ok((chip, arm, profile.cpu, ram))
+        Ok((chip, arm, cpu, ram))
     }
     /// NVRAM is already board-selected single-device packed data, with
     /// Linux's final list NUL, alignment and token excluding token bytes.
@@ -284,18 +302,33 @@ impl<B: Bus> Cr4<B> {
         }
         let token = u32::from_le_bytes(nvram[nvram.len() - 4..].try_into().unwrap());
         let words = token & 0xffff;
+        // The seed footer and its random bytes sit directly below NVRAM;
+        // keep them clear of the image as well.
+        let footer = chip_profile::random_seed_footer();
+        let tail_bytes = nvram.len()
+            + if self.seed {
+                footer.len() + chip_profile::RANDOM_SEED_LENGTH
+            } else {
+                0
+            };
         if (token >> 16) != (!words & 0xffff)
             || words as usize * 4 != nvram.len() - 4
-            || firmware.len() + nvram.len() > self.ram.size as usize
+            || firmware.len() + tail_bytes > self.ram.size as usize
         {
             return Err(Error::Image);
         }
         if let Some(size) = super::firmware::embedded_ramsize(firmware) {
             // Never let a firmware hint enlarge actual hardware RAM.
-            if size < 8 || size > self.ram.size || firmware.len() + nvram.len() > size as usize {
+            if size < 8 || size > self.ram.size || firmware.len() + tail_bytes > size as usize {
                 return Err(Error::Image);
             }
             self.ram.size = size;
+        }
+        // brcmf_pcie_provide_random_bytes takes get_random_bytes(); NARF's
+        // DRBG can fail, so draw before the first device write.
+        let mut random = [0u8; chip_profile::RANDOM_SEED_LENGTH];
+        if self.seed {
+            narf_crypto::try_fill_random_bytes(&mut random).map_err(|_| Error::Entropy)?;
         }
         // brcmf_pcie_enter_download_state, BCM43602 only: remove the
         // bank5/7 power-down before firmware writes.
@@ -316,6 +349,18 @@ impl<B: Bus> Cr4<B> {
         self.bus.write_tcm(tail, &[0; 4])?;
         let nvram_address = self.ram.base + self.ram.size - nvram.len() as u32;
         self.bus.write_tcm(nvram_address, nvram)?;
+        if self.seed {
+            // brcmf_pcie_download_fw_nvram (devinfo->fwseed): the footer
+            // directly below NVRAM, then the random bytes below the footer.
+            let footer_address = nvram_address - footer.len() as u32;
+            self.bus.write_tcm(footer_address, &footer)?;
+            let written = self.bus.write_tcm(
+                footer_address - chip_profile::RANDOM_SEED_LENGTH as u32,
+                &random,
+            );
+            random.fill(0);
+            written?;
+        }
         let sentinel = read32(&mut self.bus, tail)?;
         // brcmf_pcie_exit_download_state: BCM43602 resets SOCRAM first.
         if self.chip.id == chip_profile::BRCM_CC_43602 {

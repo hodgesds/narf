@@ -214,9 +214,22 @@ pub fn pci_row(vendor: u16, device: u16, subsystem: (u16, u16)) -> Option<PciMat
         .copied()
         .find(|row| row.device == device && row.subsystem.is_none_or(|s| s == subsystem))
 }
-/// A PCI row whose vendor path NARF implements: WCC/BCA without the seed.
+/// A PCI row whose vendor path NARF implements: WCC/BCA, with or without
+/// the random-seed footer (`pcie.c::brcmf_pcie_download_fw_nvram`).
 pub fn implemented(row: PciMatch) -> bool {
-    !row.seed && row.vendor != FwVendor::Cyw
+    row.vendor != FwVendor::Cyw
+}
+
+/// `pcie.c::BRCMF_RANDOM_SEED_MAGIC` / `BRCMF_RANDOM_SEED_LENGTH`.
+pub const RANDOM_SEED_MAGIC: u32 = 0xfeedc0de;
+pub const RANDOM_SEED_LENGTH: usize = 0x100;
+/// `struct brcmf_random_seed_footer` (`length`, `magic`, little endian).
+pub const fn random_seed_footer() -> [u8; 8] {
+    let length = (RANDOM_SEED_LENGTH as u32).to_le_bytes();
+    let magic = RANDOM_SEED_MAGIC.to_le_bytes();
+    [
+        length[0], length[1], length[2], length[3], magic[0], magic[1], magic[2], magic[3],
+    ]
 }
 
 /// `pcie.c::brcmf_pcie_read_otp` reads OTP (Apple board/module selection)
@@ -229,6 +242,8 @@ pub const fn linux_reads_otp(chip: u16) -> bool {
 }
 
 /// Firmware CPU, `chip.c::brcmf_chip_set_passive`/`_set_active` dispatch.
+/// A profile without a fixed CPU takes Linux's dispatch on the discovered
+/// ARM core (CR4 first, then CA7).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cpu {
     /// ARM CR4: RAM from the CR4 TCM bank registers.
@@ -238,38 +253,39 @@ pub enum Cpu {
 }
 
 /// A chip NARF boots through the retained PCIe transport: one with a Linux
-/// RAM base and firmware row, a CR4 or CA7 CPU, no Linux OTP read and no
-/// random-seed footer for any of its PCI ids.
+/// RAM base and firmware row and a CR4 or CA7 CPU.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Profile {
     pub chip: u16,
-    pub cpu: Cpu,
+    /// `None`: no table fact; Linux's discovered-ARM dispatch decides.
+    pub cpu: Option<Cpu>,
     pub rambase: u32,
     pub firmware: &'static FwMapping,
 }
 /// Chips covered here. 43602 is the retained original profile. Left out:
 /// 4354 (no Linux PCIe firmware row), 4355/4364/4377/4378/4387 (Linux OTP
-/// board selection and, on their PCI ids, the random-seed footer), 43752
-/// (random seed), CYW-vendor 43596/54591, and chips with no PCIe row.
-const COVERED: &[(u16, Cpu)] = &[
-    (BRCM_CC_43602, Cpu::Cr4),
-    (BRCM_CC_4350, Cpu::Cr4),
-    (BRCM_CC_4356, Cpu::Cr4),
-    (BRCM_CC_43567, Cpu::Cr4),
-    (BRCM_CC_43569, Cpu::Cr4),
-    (BRCM_CC_43570, Cpu::Cr4),
-    (BRCM_CC_4358, Cpu::Cr4),
-    (BRCM_CC_4359, Cpu::Cr4),
-    (BRCM_CC_4371, Cpu::Cr4),
-    (BRCM_CC_4365, Cpu::Ca7),
-    (BRCM_CC_4366, Cpu::Ca7),
-    (BRCM_CC_43664, Cpu::Ca7),
-    (BRCM_CC_43666, Cpu::Ca7),
-    (BRCM_CC_43465, Cpu::Ca7),
-    (BRCM_CC_43525, Cpu::Ca7),
+/// board selection), CYW-vendor 43596/54591, and chips with no PCIe row.
+/// BCM43752 has no CPU table fact: Linux discovers its ARM.
+const COVERED: &[(u16, Option<Cpu>)] = &[
+    (BRCM_CC_43602, Some(Cpu::Cr4)),
+    (BRCM_CC_4350, Some(Cpu::Cr4)),
+    (BRCM_CC_4356, Some(Cpu::Cr4)),
+    (BRCM_CC_43567, Some(Cpu::Cr4)),
+    (BRCM_CC_43569, Some(Cpu::Cr4)),
+    (BRCM_CC_43570, Some(Cpu::Cr4)),
+    (BRCM_CC_4358, Some(Cpu::Cr4)),
+    (BRCM_CC_4359, Some(Cpu::Cr4)),
+    (BRCM_CC_4371, Some(Cpu::Cr4)),
+    (BRCM_CC_4365, Some(Cpu::Ca7)),
+    (BRCM_CC_4366, Some(Cpu::Ca7)),
+    (BRCM_CC_43664, Some(Cpu::Ca7)),
+    (BRCM_CC_43666, Some(Cpu::Ca7)),
+    (BRCM_CC_43465, Some(Cpu::Ca7)),
+    (BRCM_CC_43525, Some(Cpu::Ca7)),
+    (BRCM_CC_43752, None),
 ];
-/// The CPU of a covered chip, independent of its revision.
-pub fn covered(chip: u16) -> Option<Cpu> {
+/// The CPU rule of a covered chip, independent of its revision.
+pub fn covered(chip: u16) -> Option<Option<Cpu>> {
     COVERED.iter().find(|row| row.0 == chip).map(|row| row.1)
 }
 pub fn profile(chip: u16, chiprev: u8) -> Option<Profile> {
@@ -286,7 +302,8 @@ pub fn profile(chip: u16, chiprev: u8) -> Option<Profile> {
 }
 /// The discovered chip/revision plus the actual PCI identity form one
 /// admitted profile only when Linux would bind this PCI id with a vendor
-/// whose path NARF implements (WCC/BCA, no random seed).
+/// whose path NARF implements (WCC/BCA). The PCI row's `seed` is separate:
+/// Linux keys the footer on the PCI id, not on the chip.
 pub fn admit(chip: u16, chiprev: u8, pci: &narf_bus::DeviceId) -> Option<(Profile, FwVendor)> {
     let matched = pci_match(pci)?;
     if !implemented(matched) {

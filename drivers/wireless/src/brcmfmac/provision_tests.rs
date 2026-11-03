@@ -627,6 +627,19 @@ fn smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables() -> TestResult {
     {
         return TestResult::Fail("covered BCM4366 CA7 family-3 record rejected");
     }
+    // A seeded WCC id (BCM43752, 0x449d) is admitted now that the loader
+    // writes Linux's random-seed footer.
+    if parse(&fullmac_record(
+        43752,
+        2,
+        0x449d,
+        "brcm/brcmfmac43752-pcie.bin",
+        "brcm/brcmfmac43752-pcie.txt",
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("seeded BCM43752 family-3 record rejected");
+    }
     for bad in [
         // One record cannot span the 4350c2 (rev <8) and 4350 (rev >=8) rows.
         fullmac_record(
@@ -651,7 +664,7 @@ fn smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables() -> TestResult {
             "brcm/brcmfmac43602-pcie.bin",
             "brcm/brcmfmac43602-pcie.txt",
         ),
-        // No Linux PCIe firmware row / seeded PCI id / non-Linux key.
+        // No Linux PCIe firmware row / CYW-vendor PCI id / non-Linux key.
         fullmac_record(
             0x4354,
             2,
@@ -662,7 +675,7 @@ fn smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables() -> TestResult {
         fullmac_record(
             0x4356,
             4,
-            0x449d,
+            0x4415,
             "brcm/brcmfmac4356-pcie.bin",
             "brcm/brcmfmac4356-pcie.txt",
         ),

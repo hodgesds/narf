@@ -363,8 +363,8 @@ fn parse_asset(bytes: &[u8], role: u8) -> Result<Asset, Error> {
     })
 }
 /// Family 3 admission from the Linux tables: a covered chip, a PCI identity
-/// `brcmf_pcie_devid_table` binds with an implemented vendor (WCC/BCA, no
-/// random seed), and one `brcmf_pcie_fwnames` row for every revision in the
+/// `brcmf_pcie_devid_table` binds with an implemented vendor (WCC/BCA,
+/// seeded or not), and one `brcmf_pcie_fwnames` row for every revision in the
 /// record's mask. Returns that row's firmware base name.
 fn fullmac_firmware(
     chip: u16,

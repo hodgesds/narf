@@ -62,32 +62,35 @@ fn smoke_brcmf_chip_profile_admission_and_asset_names() -> TestResult {
             BRCM_CC_43602,
             1,
             pci(0x43ba, (0x106b, 0x0133)),
-            Some(Cpu::Cr4),
+            Some(Some(Cpu::Cr4)),
         ),
         (
             BRCM_CC_4350,
             8,
             pci(0x43a3, (0x1028, 0x0023)),
-            Some(Cpu::Cr4),
+            Some(Some(Cpu::Cr4)),
         ),
         (
             BRCM_CC_4356,
             2,
             pci(0x43ec, (0x17aa, 0x0777)),
-            Some(Cpu::Cr4),
+            Some(Some(Cpu::Cr4)),
         ),
         (
             BRCM_CC_4366,
             4,
             pci(0x43c3, (0x1043, 0x86fb)),
-            Some(Cpu::Ca7),
+            Some(Some(Cpu::Ca7)),
         ),
         // 4354 raw PCI id binds in Linux, but no PCIe firmware row exists.
         (BRCM_CC_4354, 1, pci(0x4354, (0, 0)), None),
-        // OTP board selection and the random-seed footer are not ported.
+        // OTP board selection is not part of the chip-only admission.
         (BRCM_CC_4364, 4, pci(0x4464, (0x106b, 0x07bf)), None),
-        // A covered chip under a seeded or CYW PCI id is refused.
-        (BRCM_CC_4356, 2, pci(0x449d, (0, 0)), None),
+        // BCM43752 (seeded PCI id): no CPU table fact, Linux dispatch.
+        (BRCM_CC_43752, 1, pci(0x449d, (0, 0)), Some(None)),
+        // Linux keys the seed on the PCI id, so a covered chip under a
+        // seeded id is admitted (with the footer); a CYW id is refused.
+        (BRCM_CC_4356, 2, pci(0x449d, (0, 0)), Some(Some(Cpu::Cr4))),
         (BRCM_CC_4356, 2, pci(0x4415, (0, 0)), None),
         // Unknown PCI id or a non-network class never matches.
         (BRCM_CC_4356, 2, pci(0x43df, (0, 0)), None),
@@ -394,4 +397,62 @@ fn smoke_brcmf_chip_profile_cr4_and_ca7_boot_transcripts() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/brcmfmac/chips",
     smoke_brcmf_chip_profile_cr4_and_ca7_boot_transcripts
+);
+
+/// `brcmf_pcie_download_fw_nvram` with `devinfo->fwseed`: BCM43752 (seeded
+/// PCI id 0x449d, Linux RAM base 0x170000, CR4 found by Linux's dispatch)
+/// gets the `brcmf_random_seed_footer` {0x100, 0xfeedc0de} directly below
+/// NVRAM and 0x100 DRBG bytes below the footer; an unseeded id gets none.
+fn smoke_brcmf_chip_profile_random_seed_footer_below_nvram() -> TestResult {
+    let nvram = match boot::pack_nvram(b"boardrev=0x1101\nboardtype=0x0777\n") {
+        Ok(nvram) => nvram,
+        Err(_) => return TestResult::Fail("fixture NVRAM did not pack"),
+    };
+    let size = 2 * 16 * 8192u32;
+    for (identity, chip_id, device, base, seeded) in [
+        (0x1001_a9e8, BRCM_CC_43752, 0x449d, 0x170000, true),
+        (0x1002_4356, BRCM_CC_4356, 0x43ec, 0x180000, false),
+    ] {
+        let bus = model(identity, chip::CORE_ARM_CR4, None, base);
+        let (pci, profile) = board(chip_id, (identity >> 16 & 15) as u8, device);
+        let booted = match boot::Cr4::claim(bus, pci, profile)
+            .and_then(|loader| loader.boot(&FIRMWARE, &nvram))
+        {
+            Ok(booted) => booted,
+            Err(refused) if refused.error == boot::Error::Entropy => {
+                return TestResult::Fail("kernel DRBG refused the random-seed bytes")
+            }
+            Err(_) => return TestResult::Fail("seeded/unseeded chip did not boot"),
+        };
+        let bus = &booted.bus;
+        let nvram_address = base + size - nvram.len() as u32;
+        let footer = nvram_address - 8;
+        let random = footer - 0x100;
+        let mut tail = [0u8; 8];
+        for (i, b) in tail.iter_mut().enumerate() {
+            *b = *bus.tcm.get(&(footer + i as u32)).unwrap_or(&0);
+        }
+        let wrote_footer = bus.tcm_writes.contains(&(footer, 8));
+        let wrote_random = bus.tcm_writes.contains(&(random, 0x100));
+        if seeded != (wrote_footer && wrote_random && tail == [0, 1, 0, 0, 0xde, 0xc0, 0xed, 0xfe])
+            || !seeded && (wrote_footer || wrote_random)
+        {
+            return TestResult::Fail("random-seed footer placement differs from Linux");
+        }
+        if !bus.tcm_writes.contains(&(nvram_address, nvram.len()))
+            || !bus.tcm_writes.contains(&(base, FIRMWARE.len()))
+        {
+            return TestResult::Fail("NVRAM/firmware placement changed by the seed");
+        }
+        // The footer and seed follow NVRAM in Linux's write order.
+        let order = |at: u32| bus.tcm_writes.iter().position(|w| w.0 == at);
+        if seeded && !(order(nvram_address) < order(footer) && order(footer) < order(random)) {
+            return TestResult::Fail("seed written out of Linux order");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/chips",
+    smoke_brcmf_chip_profile_random_seed_footer_below_nvram
 );

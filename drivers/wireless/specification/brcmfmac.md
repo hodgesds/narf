@@ -536,12 +536,25 @@ match (revision >= 32 invalid), `brcmf_pcie_devid_table` with its `drvdata`
 the `brcmf_pcie_read_otp` chip set. Covered chips: BCM43602 (retained), CR4
 BCM4350 (4350c2 below rev 8), 4356, 43567/43569/43570, 4358, 4359
 (rev-dependent base), 4371 at their Linux RAM bases, and CA7 BCM4365, 4366,
-43664, 43666, 43465, 43525 at 0x200000. Left out: BCM4354 (Linux binds raw
+43664, 43666, 43465, 43525 at 0x200000. BCM43752 (pass 2) is covered with
+no CPU table fact: the loader takes Linux's discovered-ARM dispatch (CR4
+first, then CA7). Left out: BCM4354 (Linux binds raw
 PCI id 0x4354 but has no PCIe firmware row, so Linux itself stops at
-"Unknown chip"), 4355/4364/4377/4378/4387 (Linux OTP Apple board selection;
-their PCI ids also take the random-seed footer), 43752 (random seed),
+"Unknown chip"), 4355/4364/4377/4378/4387 (Linux OTP Apple board selection),
 CYW-vendor 43596/54591 (CYW fwvid ops) and chips without a PCIe row. Linux
 reads no OTP for any covered chip, so none is read here.
+
+Random seed (`brcmf_pcie_download_fw_nvram` with `devinfo->fwseed`): a PCI
+row with `BRCMF_DRVDATA_WCC_SEED` (0x43dc, 0x4464, 0x4488, 0x4425, 0x4433,
+0x449d; Linux keys it on the PCI id, not the chip) makes the loader write,
+after NVRAM, the `brcmf_random_seed_footer` {`length` 0x100, `magic`
+0xfeedc0de} (little endian) directly below NVRAM and then
+`BRCMF_RANDOM_SEED_LENGTH` (0x100) random bytes directly below the footer
+(`brcmf_pcie_provide_random_bytes`). The bytes come from
+`narf_crypto::try_fill_random_bytes` (the hardware-seeded DRBG stream other
+drivers use), drawn before the first device write; an entropy failure
+refuses the boot (`boot::Error::Entropy`) where Linux's `get_random_bytes`
+cannot fail. The image plus NVRAM, footer and seed must fit the RAM.
 
 The retained loader (`boot::Cr4`, CR4 or CA7) takes the RAM base from the
 table. CR4 sizes RAM from its TCM bank registers
@@ -563,7 +576,7 @@ is unchanged.
 Signed selection adds NBSP family 3 (`Family::PcieFullmac`) for covered
 non-43602 chips; BCM43602 stays family 1 and family 3 refuses chip 43602.
 The record's full PCI identity must bind a Linux table row with an
-implemented vendor (WCC/BCA, no seed); every revision in its mask must select
+implemented vendor (WCC/BCA, seeded or not); every revision in its mask must select
 the same firmware row (so 4350c2 and 4350 need separate records); the
 executable and NVRAM keys must be that row's `brcm/<base>.bin` / `.txt` or
 board-type `brcm/<base>.<board>.bin` / `.txt`; function, card and the third
