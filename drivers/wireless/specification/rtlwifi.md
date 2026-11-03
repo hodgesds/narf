@@ -2399,11 +2399,45 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   the power prefix, clears CR DMA/MAC gates instead of `REG_CR = 0x2ff`
   (ring owner), stops a running image and downloads.
 
+- `trx` — legacy linked rings (`trx.{c,h}`): 64-byte TX entries whose
+  first 40 bytes (`clear_pci_tx_desc_content` / `TX_DESC_NEXT_DESC_OFFSET`)
+  are filled per frame and whose dword 10 is the next link; the
+  single-segment `rtl92ce_tx_fill_desc` fields (6-bit rate, A-MPDU
+  `agg_break` + `max_agg_num 0x14`, RTS/HW-RTS/CTS2SELF at `DESC_RATE24M`,
+  40 MHz `data_bw`/sub-carrier incl. `cur_40_prime_sc`, fallback limits,
+  `hwseq_en`/`pkt_id 8` for non-QoS under `fwctrl_lps`, BMC) and
+  `rtl92ce_tx_fill_cmddesc`; 32-byte RX descriptors with the buffer at
+  dword 6 and the `rtl92ce_rx_query_desc` status fields (payload at
+  `drvinfo + shift`; the descriptor is not in the buffer).
+- `llt` — `_rtl92ce_llt_table_init` with `LLT_CONFIG == 5`: `RQPN_NPQ`
+  word 0, `RQPN = 0x80b01c29`, `TRXFF_BNDY = 0x27ff00f6`, boundary 246 in
+  `TDECTRL+1`/BCNQ/MGQ/`0x45d`, PBP `0x11`, DRVINFO 4, 256 links (TX chain
+  ending `0xff`, ring 246..255 closing at 246) with the 21-read LLT poll.
+- `mac` — `_rtl92ce_init_mac` after the LLT: HISR (`0x124`) / HISRE W1C,
+  `TRXFF_BNDY+2 = 0x27ff`, `TRXDMA_CTRL = (old & 0xf) | 0xf771`,
+  `FWHW_TXQ+1 = 0x1f`, RCR `0xf0006b0e`, TCR `0x3200`, `0x4d0 = 0`,
+  `PCIE_CTRL_REG+3 = 0x77` (92C) / `0x22` (88C), INT_MIG 0, the
+  `APSD_CTRL` BIT6/BIT7 wait, `MCUTST_1 = 0`; the post-MAC-table RCR trim
+  (`~(ACRC32|AICV)`), `_rtl92ce_hw_configure` (non-BT) and software crypto +
+  station address. `REG_CR = 0x2ff` and the ring bases stay with the owner.
+- `prepare::Chip::Rtl8192ce` — the retained linked-ring owner profile
+  (88EE geometry, next link at byte 40) runs `_rtl92ce_llt_table_init` and
+  masks the 92C IMRs (`0x120` / `0x128`, not the 88EE `0xb0` / `0xb8`). The
+  88EE `REG_PCIE_CTRL_REG+1 = 0xff` DMA-stop write is not issued: on the
+  92C Linux uses `REG_PCIE_CTRL_REG` only as the TX polling doorbell, so CR
+  gates and parked BME hold its DMA closed. Probe's
+  `irq::disable_interrupts` writes the 88EE IMR offsets and must be made
+  chip-aware before these IDs are retained.
+
 Tests (written, unexecuted): `smoke_rtl8192ce_chip_version_rf_type_and_firmware_name`,
 `smoke_rtl8192ce_firmware_header_geometry`,
 `smoke_rtl8192ce_firmware_paged_download`,
 `smoke_rtl8192ce_retained_firmware_owner_profile`,
-`smoke_rtl8192ce_adapter_info_factory_rules`.
+`smoke_rtl8192ce_adapter_info_factory_rules`,
+`smoke_rtl8192ce_tx_descriptor_fields`,
+`smoke_rtl8192ce_rx_descriptor_status_and_arm`,
+`smoke_rtl8192ce_llt_and_init_mac_remainder`,
+`smoke_rtl8192ce_linked_ring_profile`.
 
 ## 4. Invariants
 

@@ -26,12 +26,22 @@
 //! - [`fw`] — `rtl8192cfw*.bin` header validation and `rtl92c_download_fw`
 //!   (normal-chip paged write, `_rtl92c_fw_free_to_go`,
 //!   `rtl92c_firmware_selfreset`).
+//! - [`trx`] — 64-byte linked TX ring entries (40-byte descriptor, next link
+//!   at dword 10) and 32-byte RX descriptors (`trx.{c,h}`); the ring owner
+//!   is `prepare::Chip::Rtl8192ce`.
+//! - [`llt`] — `_rtl92ce_llt_table_init` (`LLT_CONFIG == 5`).
+//! - [`mac`] — the `_rtl92ce_init_mac` remainder, `_rtl92ce_hw_configure`
+//!   and the station address, with `REG_CR` and ring bases left to the
+//!   packet owner.
 
 #![allow(dead_code)]
 
 pub mod adapter;
 pub mod fw;
+pub mod llt;
+pub mod mac;
 pub mod power;
+pub mod trx;
 pub mod version;
 
 #[cfg(any(test, feature = "kernel-test"))]

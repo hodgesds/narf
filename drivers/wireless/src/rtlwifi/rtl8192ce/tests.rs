@@ -402,3 +402,315 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ce",
     smoke_rtl8192ce_adapter_info_factory_rules
 );
+
+// ── TRX descriptors ───────────────────────────────────────────────────────
+
+/// `rtl92ce_tx_fill_desc` field positions (`trx.h`) for a 40 MHz HT A-MPDU
+/// QoS data frame with RTS/CTS, and the non-QoS fwctrl_lps hardware sequence.
+fn smoke_rtl8192ce_tx_descriptor_fields() -> TestResult {
+    let p = trx::TxParams {
+        pkt_size: 1500,
+        queue_sel: trx::QSLT_BE,
+        macid: 1,
+        rate_id: 0,
+        hw_rate: trx::DESC_RATEMCS0 + 7,
+        use_driver_rate: true,
+        short: true,
+        bw_40: true,
+        packet_bw_40: true,
+        prime_sc: 1,
+        ampdu: true,
+        ampdu_density: 5,
+        sec_type: 3,
+        qos_data: true,
+        fwctrl_lps: true,
+        seq: 0x123,
+        multicast: false,
+        protection: 1,
+        buffer_addr: 0x1234_5000,
+    };
+    let dw = trx::fill(&p);
+    let want0 = 1500 | (32 << 16) | (1 << 26) | (1 << 27);
+    let want1 = 1 | (1 << 5) | (u32::from(trx::QSLT_BE) << 8) | (3 << 22);
+    let want4 =
+        u32::from(trx::DESC_RATE24M) | (1 << 8) | (1 << 12) | (1 << 13) | (3 << 20) | (1 << 25);
+    let want5 = 0x13 | (1 << 6) | (0x1f << 8) | (0xf << 13);
+    if dw[0] != want0
+        || dw[1] != want1
+        || dw[2] != 5 << 20
+        || dw[3] != 0x123 << 16
+        || dw[4] != want4
+        || dw[5] != want5
+        || dw[6] != 0x14 << 11
+        || dw[7] != 1500
+        || dw[8] != 0x1234_5000
+        || dw[9] != 0
+        || trx::own(dw[0])
+    {
+        return TestResult::Fail("92C TX descriptor field layout");
+    }
+    // CTS-to-self: RTS_ENABLE clear, HW_RTS + CTS2SELF set; 20 MHz frame in
+    // a 40 MHz BSS uses the primary sub-carrier; non-QoS + fwctrl_lps.
+    let q = trx::TxParams {
+        protection: 2,
+        packet_bw_40: false,
+        qos_data: false,
+        multicast: true,
+        ampdu: false,
+        ..p
+    };
+    let dw = trx::fill(&q);
+    if dw[4] & (1 << 12) != 0
+        || dw[4] & (1 << 13) == 0
+        || dw[4] & (1 << 11) == 0
+        || (dw[4] >> 20) & 3 != 1
+        || dw[4] & (1 << 25) != 0
+        || dw[4] & (1 << 7) == 0
+        || dw[3] >> 28 != 8
+        || dw[0] & (1 << 24) == 0
+        || dw[6] != 0
+    {
+        return TestResult::Fail("CTS-to-self / prime sub-carrier / hwseq / BMC");
+    }
+    let mut cmd = trx::fill_cmd(256, 0x2000, false);
+    if trx::queue_sel(&cmd) != trx::QSLT_BEACON
+        || (cmd[1] >> 16) & 0xf != 7
+        || trx::pkt_size(&cmd) != 256
+        || cmd[7] != 256
+        || cmd[4] & (1 << 8) == 0
+        || trx::tx_rate(&cmd) != trx::DESC_RATE1M
+    {
+        return TestResult::Fail("rtl92ce_tx_fill_cmddesc fields");
+    }
+    trx::set_own(&mut cmd, true);
+    if !trx::own(cmd[0]) {
+        return TestResult::Fail("TX OWN bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_tx_descriptor_fields
+);
+
+fn smoke_rtl8192ce_rx_descriptor_status_and_arm() -> TestResult {
+    let mut dw = [0u32; 8];
+    trx::rx_arm(&mut dw, 0x4000, 9100, true);
+    if dw[6] != 0x4000
+        || dw[0] != 9100 | (1 << 30) | (1 << 31)
+        || trx::RxStatus::parse(&dw).is_some()
+    {
+        return TestResult::Fail("RX arm / hardware-owned descriptor parsed");
+    }
+    dw[0] = 200 | (1 << 14) | (4 << 16) | (2 << 24) | (1 << 26) | (1 << 27);
+    dw[1] = (1 << 14) | (1 << 15);
+    dw[3] = 0x13 | (1 << 6) | (1 << 8) | (1 << 9);
+    dw[5] = 0xdead_beef;
+    let s = match trx::RxStatus::parse(&dw) {
+        Some(s) => s,
+        None => return TestResult::Fail("driver-owned RX descriptor"),
+    };
+    if s.length != 200
+        || !s.crc
+        || s.icv
+        || s.drvinfo_size != 32
+        || s.shift != 2
+        || !s.physt
+        || s.decrypted
+        || !s.ampdu
+        || !s.first_ampdu
+        || s.rate != 0x13
+        || !s.ht
+        || !s.short_preamble
+        || !s.bw_40
+        || s.tsfl != 0xdead_beef
+        || s.payload_offset() != 34
+        || !s.hw_error()
+        || s.is_cck()
+    {
+        return TestResult::Fail("rtl92ce_rx_query_desc fields");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_rx_descriptor_status_and_arm
+);
+
+// ── LLT / MAC ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    W8(u16, u8),
+    W16(u16, u16),
+    W32(u16, u32),
+}
+#[derive(Clone)]
+struct MacFake(Arc<IrqSafeSpinLock<(Vec<u8>, Vec<Op>)>>);
+impl MacFake {
+    fn new() -> Self {
+        Self(Arc::new(IrqSafeSpinLock::new((vec![0; 0x800], Vec::new()))))
+    }
+    fn ops(&self) -> Vec<Op> {
+        self.0.lock().1.clone()
+    }
+}
+#[async_trait::async_trait]
+impl Io for MacFake {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        Ok(self.0.lock().0[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        // The modelled LLT engine completes every write at once.
+        let v = u32::from_le_bytes([g.0[r], g.0[r + 1], g.0[r + 2], g.0[r + 3]]);
+        Ok(if reg == llt::REG_LLT_INIT {
+            v & 0x3fff_ffff
+        } else {
+            v
+        })
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.0[usize::from(reg)] = value;
+        g.1.push(Op::W8(reg, value));
+        Ok(())
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.0[r..r + 2].copy_from_slice(&value.to_le_bytes());
+        g.1.push(Op::W16(reg, value));
+        Ok(())
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.0[r..r + 4].copy_from_slice(&value.to_le_bytes());
+        g.1.push(Op::W32(reg, value));
+        Ok(())
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+struct LltView<'a>(&'a MacFake);
+impl llt::Regs for LltView<'_> {
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        self.0.read32(reg)
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        self.0.write8(reg, value)
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        self.0.write16(reg, value)
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        self.0.write32(reg, value)
+    }
+}
+
+/// `_rtl92ce_llt_table_init` (`LLT_CONFIG == 5`) order, boundary 246 and the
+/// 256 LLT links; then the `_rtl92ce_init_mac` remainder per RF type.
+fn smoke_rtl8192ce_llt_and_init_mac_remainder() -> TestResult {
+    let io = MacFake::new();
+    if llt::init(&LltView(&io)).is_err() {
+        return TestResult::Fail("LLT init on a completing model");
+    }
+    let ops = io.ops();
+    let head = [
+        Op::W16(0x214, 0),
+        Op::W32(0x200, 0x80b0_1c29),
+        Op::W32(0x114, 0x27ff_00f6),
+        Op::W8(0x209, 246),
+        Op::W8(0x424, 246),
+        Op::W8(0x425, 246),
+        Op::W8(0x45d, 246),
+        Op::W8(0x104, 0x11),
+        Op::W8(0x60f, 4),
+    ];
+    let links: Vec<u32> = ops[head.len()..]
+        .iter()
+        .filter_map(|op| match op {
+            Op::W32(0x1e0, v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    if ops[..head.len()] != head[..]
+        || links.len() != 256
+        || links[0] != (1 << 30) | 1
+        || links[245] != (1 << 30) | (245 << 8) | 0xff
+        || links[246] != (1 << 30) | (246 << 8) | 247
+        || links[255] != (1 << 30) | (255 << 8) | 246
+        || ops.len() != head.len() + 256
+    {
+        return TestResult::Fail("92CE LLT order / links");
+    }
+    for (is_92c, pcie) in [(true, 0x77), (false, 0x22)] {
+        let io = MacFake::new();
+        io.0.lock().0[usize::from(mac::REG_TRXDMA_CTRL)] = 0x0a;
+        if narf_scheduler::block_on(mac::init_mac(&io, is_92c)).is_err() {
+            return TestResult::Fail("init_mac remainder on a model");
+        }
+        let ops = io.ops();
+        let want = [
+            Op::W32(0x124, u32::MAX),
+            Op::W8(0x12c, 0xff),
+            Op::W16(0x116, 0x27ff),
+            Op::W16(0x10c, 0xf77b),
+            Op::W8(0x421, 0x1f),
+            Op::W32(0x608, mac::RCR),
+            Op::W32(0x604, mac::TCR),
+            Op::W8(0x4d0, 0),
+            Op::W8(0x303, pcie),
+            Op::W32(0x304, 0),
+            Op::W8(0x600, 0),
+            Op::W32(0x1c0, 0),
+        ];
+        if ops[..] != want[..] || mac::RCR != 0xf000_6b0e || mac::TCR != 0x3200 {
+            return TestResult::Fail("92CE init_mac remainder order / PCIE_CTRL+3 per RF type");
+        }
+    }
+    let io = MacFake::new();
+    if mac::hw_configure(&io).is_err() || mac::station_identity(&io, &[2, 0, 0, 0, 0, 1]).is_err() {
+        return TestResult::Fail("hw_configure / station identity");
+    }
+    let ops = io.ops();
+    if ops.len() != 31 + 7
+        || ops[0] != Op::W8(0x480, 0x8)
+        || !ops.contains(&Op::W32(0x458, 0xb972_a841))
+        || !ops.contains(&Op::W32(0x460, 0x0008_6666))
+        || !ops.contains(&Op::W16(0x420, 0x1f80))
+        || ops[31] != Op::W8(0x680, 0)
+        || ops[37] != Op::W8(0x615, 1)
+    {
+        return TestResult::Fail("_rtl92ce_hw_configure / ETHER_ADDR writes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_llt_and_init_mac_remainder
+);
+
+/// The linked-ring profile: 88EE geometry with the 92C next link at dword 10.
+fn smoke_rtl8192ce_linked_ring_profile() -> TestResult {
+    use crate::rtlwifi::prepare::Chip;
+    for did in [0x8178, 0x8176, 0x8177, 0x8191] {
+        if Chip::from_device(did) != Some(Chip::Rtl8192ce) {
+            return TestResult::Fail("92CE IDs select the 92CE ring profile");
+        }
+    }
+    if Chip::Rtl8192ce.next_desc_offset() != Some(40)
+        || Chip::from_device(crate::rtlwifi::regs::RTL_DEV_8192DE).is_some()
+    {
+        return TestResult::Fail("92CE next-descriptor offset / 8192DE excluded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_linked_ring_profile
+);

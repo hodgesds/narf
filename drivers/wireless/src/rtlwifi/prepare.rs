@@ -89,6 +89,9 @@ pub enum Chip {
     /// New-TRX-flow buffer-descriptor profile (`rtl8192ee/packet_owner.rs`):
     /// no linked next pointer; built only by `Prepared::allocate_rtl8192ee`.
     Rtl8192ee,
+    /// RTL8192CE / RTL8188CE linked rings (`rtl8192ce/trx.h`): 88EE ring
+    /// geometry, `_rtl92ce_llt_table_init` and the 92C IMR map.
+    Rtl8192ce,
 }
 impl Chip {
     pub const fn from_device(did: u16) -> Option<Self> {
@@ -96,6 +99,7 @@ impl Chip {
             super::regs::RTL_DEV_8188EE => Some(Self::Rtl8188ee),
             super::regs::RTL_DEV_8821AE => Some(Self::Rtl8821ae),
             super::regs::RTL_DEV_8192EE => Some(Self::Rtl8192ee),
+            did if super::rtl8192ce::is_8192ce(did) => Some(Self::Rtl8192ce),
             _ => None,
         }
     }
@@ -106,6 +110,8 @@ impl Chip {
         match self {
             Self::Rtl8188ee => Some(40),
             Self::Rtl8821ae => Some(48),
+            // TX_DESC_NEXT_DESC_OFFSET.
+            Self::Rtl8192ce => Some(super::rtl8192ce::trx::TX_DESC_NEXT_DESC_OFFSET),
             Self::Rtl8192ee => None,
         }
     }
@@ -481,16 +487,30 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         }
         // Linux poweroff stops PCIe DMA through this byte. Preparing never
         // reopens it; BME remains off independently in the native adapter.
-        self.io.write8(0x301, 0xff)?;
-        if self.io.read8(0x301)? != 0xff {
-            return Err(Error::Readback);
+        // The 92C has no such HCI DMA-stop byte in Linux (`REG_PCIE_CTRL_REG`
+        // is only its TX polling doorbell), so CR gates and parked BME alone
+        // hold its DMA closed.
+        let ce = self.chip == Chip::Rtl8192ce;
+        if !ce {
+            self.io.write8(0x301, 0xff)?;
+            if self.io.read8(0x301)? != 0xff {
+                return Err(Error::Readback);
+            }
         }
         let cr = self.io.read8(0x100)?;
         self.io.write8(0x100, cr & !0xcf)?;
         if self.io.read8(0x100)? & 0xcf != 0 {
             return Err(Error::Readback);
         }
-        for address in [0xb0, 0xb8] {
+        let imr = if ce {
+            [
+                super::rtl8192ce::mac::REG_HIMR,
+                super::rtl8192ce::mac::REG_HIMRE,
+            ]
+        } else {
+            [0xb0, 0xb8]
+        };
+        for address in imr {
             self.io.write32(address, 0)?;
             if self.io.read32(address)? != 0 {
                 return Err(Error::Readback);
@@ -517,7 +537,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             return Err(Error::Readback);
         }
         // Ordinary DMA, IRQ and MAC gates remain independently closed.
-        if self.io.read8(0x301)? != 0xff || self.io.read8(0x100)? & 0xcf != 0 {
+        if (!ce && self.io.read8(0x301)? != 0xff) || self.io.read8(0x100)? & 0xcf != 0 {
             return Err(Error::Readback);
         }
         Ok(())
@@ -526,6 +546,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         if self.chip == Chip::Rtl8821ae {
             // Exact rtl8821ae/hw.c::_rtl8821ae_llt_table_init.
             return super::rtl8821ae::llt::init(&LltRegs(&self.io)).map_err(|e| match e {
+                AccessError::Deadline => Error::LltTimeout,
+                e => Error::Access(e),
+            });
+        }
+        if self.chip == Chip::Rtl8192ce {
+            // Exact rtl8192ce/hw.c::_rtl92ce_llt_table_init (LLT_CONFIG 5).
+            return super::rtl8192ce::llt::init(&LltRegs(&self.io)).map_err(|e| match e {
                 AccessError::Deadline => Error::LltTimeout,
                 e => Error::Access(e),
             });
