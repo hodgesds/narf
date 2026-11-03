@@ -375,10 +375,28 @@ and `RXPSEL` release. Rows are `rtw8822b_table.c` verbatim, preselected by
 for PCIe (pkg 15 since 8822B sets no `pkg_type`, cut 0 → 15) over all 16 cuts
 and the only `rtw8822b_rfe_defs` RFEs 2/3/5 (17 distinct tables, 48
 profiles). Other RFEs, an erased crystal/board option or a non-2T2R firmware
-report are refused. The chain ends at `FirmwareStage::PhyTablesPrepared`;
-`rtw8822b_config_trx_mode`, `rtw_phy_init`, RFE/power-track/BF init, channel
-programming, calibration and station continuations are not yet ported, so no
-station shell is published.
+report are refused. The same stage then runs the `rtw8822b_phy_set_param`
+tail (`radio8822b::finish_set_param`): `rtw8822b_config_trx_mode(BB_PATH_AB,
+BB_PATH_AB, false)` (AGC/CDD/TX-RX path select, MRC, the RF-mode LUT write
+after the bounded 100-try `RF_LUTWA` readback poll — refused with
+`Error::Timeout` where Linux only WARNs — `rtw8822b_toggle_igi`, ch1/20 CCA and
+the `rtw8822b_rfe_info` RFE program for `hal.current_channel` 0, i.e. the 5 GHz
+branch), `rtw_phy_init` (IGI history from `rtw8822b_dig[0]`,
+`rtw8822b_adaptivity_init` EDCCA 0x7f/0x7f), `rtw8822b_phy_rfe_init`,
+`rtw8822b_pwrtrack_init` (`default_ofdm_index` from 0xc1c against
+`rtw8822b_txscale_tbl`, else 24) and `rtw8822b_phy_bf_init`
+(`bf::phy_init` + 0x1c94 `0xafffafff`); `phy8822b::Info` retains IGI and
+`default_ofdm_index`. RF access uses the 8822B direct window 0x2800/0x2c00
+and SIPI 0xc90/0xe90 only. `radio8822b::set_channel` ports
+`rtw8822b_set_channel` (`_bb`, `rtw_set_channel_mac` on the 3081 WCPU, `_rf`
+with RF18 on both paths and the RF 0xbe band table, `_rxdfir`, IGI toggle,
+`_cca` per RFE 2 I2GE5G / RFE 3,5 IFEM_EXT and cut B, `_rfe_efem`/`_rfe_ifem`)
+for 2.4 GHz 20/40 MHz and 5 GHz 20/40/80 MHz centres; centres outside
+`IS_CH_*_BAND`, the `0xff` RFBE table holes, malformed sub-channel indices and
+2.4 GHz 80 MHz are refused before any register access. It is not yet invoked by
+the chain: channel programming, calibration and station continuations follow,
+so the chain ends at `FirmwareStage::PhyTablesPrepared` and no station shell is
+published.
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 

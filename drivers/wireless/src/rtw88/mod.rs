@@ -134,6 +134,7 @@ pub use qualification::Request as ContinuationRequest;
 mod native8822b;
 mod radio;
 mod radio8821c;
+mod radio8822b;
 mod reserved_page;
 mod scan;
 #[cfg(feature = "kernel-test")]

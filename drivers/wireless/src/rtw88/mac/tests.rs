@@ -21,6 +21,9 @@ pub(super) struct Model {
     pub(super) suspend_at: Option<usize>,
     bad_h2c: u8,
     pub(super) phy_started: bool,
+    /// Mirror 8822B SIPI writes (0xc90/0xe90) into the direct RF window
+    /// (0x2800/0x2c00), as `rtw_phy_read_rf` observes on hardware.
+    pub(super) sipi8822b: bool,
 }
 impl Model {
     pub(super) fn new(seed: u8, cut: u8) -> Self {
@@ -43,6 +46,7 @@ impl Model {
             suspend_at: None,
             bad_h2c: 0,
             phy_started: false,
+            sipi8822b: false,
         }
     }
     fn access(&mut self, op: Operation) -> Result<(), Error> {
@@ -84,6 +88,11 @@ impl Model {
         let at = usize::from(reg);
         self.regs[at..at + usize::from(width / 8)]
             .copy_from_slice(&value.to_le_bytes()[..usize::from(width / 8)]);
+        if self.sipi8822b && (reg == 0xc90 || reg == 0xe90) && width == 32 {
+            let base = if reg == 0xc90 { 0x2800 } else { 0x2c00 };
+            let direct = base + (((value >> 20) & 0xff) as usize) * 4;
+            self.regs[direct..direct + 4].copy_from_slice(&(value & 0xfffff).to_le_bytes());
+        }
         if self.mac_started
             && (reg == 0x100 && value & 0xcf != 0 || reg == 0x522 && value & 255 != 255)
         {

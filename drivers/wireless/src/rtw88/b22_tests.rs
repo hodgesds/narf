@@ -202,9 +202,11 @@ fn smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order() -> TestResul
             return TestResult::Fail("8822B crystal cap is not efuse crystal_cap & 0x3f");
         }
         let mut io = super::mac_tests::Model::new(cut, cut);
-        if narf_scheduler::block_on(prepare(&mut io, info)).is_err() {
-            return TestResult::Fail("8822B PHY table stage did not complete");
-        }
+        io.sipi8822b = true;
+        let info = match narf_scheduler::block_on(prepare(&mut io, info)) {
+            Ok(info) => info,
+            Err(_) => return TestResult::Fail("8822B PHY table stage did not complete"),
+        };
         let rows = |kind| super::super::phy8822b::tables_for_test(cut, rfe, kind).unwrap();
         let w8 = io.trace.iter().filter(|op| op.0 == 1 && op.1 == 8).count();
         let sipi = |reg: u16| {
@@ -219,9 +221,11 @@ fn smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order() -> TestResul
                 .filter(|(a, _)| !matches!(a, 0xffe | 0xfe))
                 .count()
         };
-        // Two power-on byte RMWs (SYS_FUNC_EN, RF_CTRL) precede the MAC rows.
-        if w8 != rows(0).len() + 2
-            || sipi(0xc90) != rf_rows(3)
+        // Two power-on byte RMWs (SYS_FUNC_EN, RF_CTRL) precede the MAC rows;
+        // rtw_bf_phy_init adds its two byte writes. config_trx_mode adds one
+        // LUT poll (2 path-A SIPI words) and the six RF-mode LUT words.
+        if w8 != rows(0).len() + 4
+            || sipi(0xc90) != rf_rows(3) + 8
             || sipi(0xe90) != rf_rows(4)
             || u32::from_le_bytes(io.regs[0x808..0x80c].try_into().unwrap()) & (3 << 28) != 3 << 28
             || (u32::from_le_bytes(io.regs[0x24..0x28].try_into().unwrap()) >> 25) & 0x3f != 0x25
@@ -232,6 +236,27 @@ fn smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order() -> TestResul
         let first = io.trace.iter().position(|op| op.0 == 1).unwrap();
         if io.trace[first].2 != 0x02 {
             return TestResult::Fail("8822B BB/RF domain power-on is not first");
+        }
+        let r32 = |reg: usize| u32::from_le_bytes(io.regs[reg..reg + 4].try_into().unwrap());
+        // config_trx_mode(AB, AB): RX/TX path select 0x33, MRC on, AGC 0x3231;
+        // phy_bf_init grouping bitmap; rfe_init chip-top mux.
+        if r32(0x808) & 0xff != 0x33
+            || r32(0x80c) & 0xff != 0x33
+            || r32(0xc08) & 0xffff != 0x3231
+            || r32(0xe08) & 0xffff != 0x3231
+            || r32(0x850) & (1 << 23) == 0
+            || r32(0x1c94) != 0xafffafff
+            || (r32(0x64) >> 28) & 3 != 3
+            || r32(0x8a4) & 0xffff != 0x7f7f
+            || u32::from(info.igi) != r32(0xc50) & 0x7f
+            || usize::from(info.default_ofdm_index) > 36
+        {
+            return TestResult::Fail("8822B phy_set_param tail differs from rtw8822b.c");
+        }
+        // channel 0 (no rtw_set_channel yet) selects the 5 GHz RFE program.
+        let trsw = if rfe == 2 { 0xa501 } else { 0xa5a5 };
+        if r32(0xca0) & 0xffff != trsw || r32(0xea0) & 0xffff != trsw {
+            return TestResult::Fail("8822B config_trx_mode RFE TRSW differs");
         }
     }
     if super::super::phy8822b::tables_for_test(0, 4, 0).is_some()
@@ -244,4 +269,76 @@ fn smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order() -> TestResul
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order
+);
+
+fn smoke_rtw8822be_set_channel_follows_rtw8822b_set_channel() -> TestResult {
+    use super::super::{band5::Width, phy8822b::Info, radio8822b};
+    // RF18 band/channel/RFSI/BW and the RF 0xbe band table.
+    if radio8822b::rf18(0, 1, Width::Twenty) != 0x0c01
+        || radio8822b::rf18(0, 36, Width::Twenty) != 0x10d24
+        || radio8822b::rf18(0, 106, Width::Eighty(1)) != 0x3056a
+        || radio8822b::rf18(0, 153, Width::Forty(1)) != 0x50999
+        || radio8822b::rf_be(42) != Some(0x5)
+        || radio8822b::rf_be(114) != Some(0xff)
+        || radio8822b::rf_be(30).is_some()
+        || radio8822b::valid_channel(15)
+        || radio8822b::valid_channel(37)
+    {
+        return TestResult::Fail("8822B RF18/RFBE encoding differs from set_channel_rf");
+    }
+    let info = match Info::from_factory(&b22_factory(3, 0x20), 2, b22_features(2)) {
+        Ok(info) => info,
+        Err(_) => return TestResult::Fail("8822B RFE3 factory rejected"),
+    };
+    let mut io = super::mac_tests::Model::new(3, 2);
+    io.sipi8822b = true;
+    let set = |io: &mut super::mac_tests::Model, ch, width| {
+        narf_scheduler::block_on(radio8822b::set_channel(io, info, ch, width))
+    };
+    if set(&mut io, 114, Width::Twenty).is_ok()
+        || set(&mut io, 1, Width::Eighty(1)).is_ok()
+        || set(&mut io, 36, Width::Forty(3)).is_ok()
+    {
+        return TestResult::Fail("8822B set_channel admitted an invalid centre/width");
+    }
+    if set(&mut io, 42, Width::Eighty(2)).is_err() {
+        return TestResult::Fail("8822B set_channel 42/80 failed");
+    }
+    let r32 = |io: &super::mac_tests::Model, reg: usize| {
+        u32::from_le_bytes(io.regs[reg..reg + 4].try_into().unwrap())
+    };
+    // 5 GHz BB, 80MHz ADCCLK, RF18 on both paths, ifem_ext CCA, ifem TRSW.
+    if r32(&io, 0x808) & (1 << 28) != 0
+        || (r32(&io, 0x958) & 0x1f) != 1
+        || (r32(&io, 0x860) >> 17) & 0xfff != 0x494
+        || r32(&io, 0x8ac) & 0xff != (2 << 2 | 2)
+        || io.regs[0x483] != (2 | 10 << 4)
+        || r32(&io, 0x2800 + 0x18 * 4) & 0x70fff != 0x1052a
+        || r32(&io, 0x2c00 + 0x18 * 4) & 0x70fff != 0x1052a
+        || r32(&io, 0x82c) != 0x75da8010
+        || r32(&io, 0x838) != 0x86666361
+        || r32(&io, 0xca0) & 0xffff != 0xa5a5
+        || io.regs[0x454] & 0x80 == 0
+    {
+        return TestResult::Fail("8822B 42/80 program differs from rtw8822b_set_channel");
+    }
+    if set(&mut io, 6, Width::Forty(1)).is_err() {
+        return TestResult::Fail("8822B set_channel 6/40 failed");
+    }
+    if r32(&io, 0x808) & (1 << 28) == 0
+        || r32(&io, 0xa24) != 0x384f6577
+        || r32(&io, 0xa00) & (1 << 4) == 0
+        || r32(&io, 0x8ac) & 0xff != (1 << 2 | 1)
+        || r32(&io, 0x2800 + 0x18 * 4) & 0x70fff != 0x0806
+        || r32(&io, 0xca0) & 0xffff != 0xa501
+        || r32(&io, 0x82c) != 0x75da8010
+        || io.regs[0x454] & 0x80 != 0
+    {
+        return TestResult::Fail("8822B 6/40 program differs from rtw8822b_set_channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_set_channel_follows_rtw8822b_set_channel
 );

@@ -2,11 +2,12 @@
 //! Factory-selected inactive RTL8822BE ("B22") PHY tables.
 //!
 //! `rtw8822b.c::rtw8822b_phy_set_param` through `rtw_phy_load_tables`, the
-//! crystal cap and the post-table `REG_RXPSEL` reset release. Tables are the
-//! verbatim `rtw8822b_table.c` rows selected for PCIe by
-//! `phy.c::rtw_parse_tbl_phy_cond`. TRX mode, `rtw_phy_init`, RFE/power-track/
-//! beamforming init, channel programming and calibration are separate
-//! continuations; MAC TX/RX and TXPAUSE remain closed.
+//! crystal cap, the post-table `REG_RXPSEL` reset release and the
+//! `radio8822b::finish_set_param` tail (TRX mode, `rtw_phy_init`, RFE,
+//! power-tracking and beamforming init). Tables are the verbatim
+//! `rtw8822b_table.c` rows selected for PCIe by `phy.c::rtw_parse_tbl_phy_cond`.
+//! Channel programming and calibration are separate continuations; MAC TX/RX
+//! and TXPAUSE remain closed.
 use super::{
     efuse8822b::Factory8822b,
     firmware_transport::{Error, Io},
@@ -31,6 +32,10 @@ pub struct Info {
     pub cut: u8,
     pub rfe: u8,
     pub crystal: u8,
+    /// `rtw_phy_init` IGI history and `rtw8822b_pwrtrack_init` default OFDM
+    /// swing index, captured by the `phy_set_param` tail (0 before it).
+    pub igi: u8,
+    pub default_ofdm_index: u8,
 }
 impl Info {
     pub(super) fn from_factory(
@@ -52,6 +57,8 @@ impl Info {
             cut,
             rfe: factory.rfe(),
             crystal: factory.crystal() & 0x3f,
+            igi: 0,
+            default_ofdm_index: 0,
         })
     }
 }
@@ -118,7 +125,7 @@ pub(super) async fn apply_table(io: &mut impl Io, info: Info, kind: usize) -> Re
     }
     Ok(())
 }
-pub(super) async fn prepare(io: &mut impl Io, info: Info) -> Result<Info, Error> {
+pub(super) async fn prepare(io: &mut impl Io, mut info: Info) -> Result<Info, Error> {
     // power on BB/RF domain
     update8(io, REG_SYS_FUNC_EN, BIT_FEN_BB).await?;
     update8(io, REG_RF_CTRL, BIT_RF_ALL).await?;
@@ -134,5 +141,10 @@ pub(super) async fn prepare(io: &mut impl Io, info: Info) -> Result<Info, Error>
     update(io, 0x28, 0x7e, crystal << 1).await?;
     // post init after header files config
     update(io, REG_RXPSEL, 0, BIT_RX_PSEL_RST).await?;
+    // config_trx_mode(BB_PATH_AB, BB_PATH_AB, false), rtw_phy_init, RFE,
+    // power-tracking and beamforming init (`radio8822b`).
+    let init = super::radio8822b::finish_set_param(io, info).await?;
+    info.igi = init.igi;
+    info.default_ofdm_index = init.default_ofdm_index;
     Ok(info)
 }
