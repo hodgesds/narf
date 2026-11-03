@@ -2,6 +2,8 @@
 //! Persistent PCIe beacon-DMA reserved-page owner, Linux rtw88/{fw,pci,tx}.c.
 use super::firmware_transport::{self, Error};
 use alloc::boxed::Box;
+#[path = "runtime_ps_page.rs"]
+mod runtime_ps_page;
 const DESC: usize = 48;
 const PAYLOAD: usize = 4096;
 /// # Safety
@@ -130,6 +132,9 @@ pub(super) unsafe trait Registers: Send {
         Err(Error::Unsupported)
     }
     fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_ps_rx_quiet(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
@@ -641,6 +646,15 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error> {
         self.page(data).await
+    }
+    async fn station_reserved_page(
+        &mut self,
+        data: &[u8],
+        boundary: u16,
+        source: &super::runtime_ps_scope::Bound,
+        admission: &super::station_control::Admission,
+    ) -> Result<(), Error> {
+        self.station_page(data, boundary, source, admission).await
     }
     async fn lte_backup(&mut self) -> Result<u32, Error> {
         self.io.lte_backup().await

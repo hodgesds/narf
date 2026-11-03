@@ -109,6 +109,10 @@ struct Model {
     /// RXDMA never reports idle after RW_RELEASE.
     rx_dma_busy: bool,
     reclaimed: bool,
+    ps_model: bool,
+    ps_wake_stuck: bool,
+    ps_suppress_rfon: bool,
+    ps_corrupt_power: bool,
 }
 #[derive(Clone)]
 struct Port(Arc<IrqSafeSpinLock<Model>>);
@@ -559,6 +563,13 @@ unsafe impl Registers for Port {
     fn station_gate(&mut self) -> Result<crate::rtw88::power_policy::Gate, Error> {
         self.station_allowed()?;
         self.0.lock().station_gate.clone().ok_or(Error::State)
+    }
+    fn station_ps_rx_quiet(&mut self) -> Result<bool, Error> {
+        self.station_allowed()?;
+        self.packet_with(|core, port| {
+            core.maintenance_quiet(|r| crate::rtw88::packet_core::Port::index(port, r))
+        })
+        .map_err(|_| Error::State)
     }
     fn station_rts_request(&mut self) -> Result<crate::rtw88::RtsRequest, Error> {
         self.station_allowed()?;
@@ -1191,6 +1202,23 @@ unsafe impl Registers for Port {
         }
         m.mailboxes.push(words);
         m.mailbox_pending = true;
+        if m.ps_model && words[0] == 0x20 {
+            match words[1] {
+                1 => m.bytes[0x604] |= 0x80,
+                0 => {
+                    if !m.ps_wake_stuck {
+                        m.bytes[0x604] &= !0x80;
+                    }
+                    if m.ps_corrupt_power {
+                        m.bytes[0x1d00] ^= 1;
+                    }
+                    if !m.ps_suppress_rfon {
+                        m.packet_model.receive(&[0x32, 0], true, false);
+                    }
+                }
+                _ => return Err(Error::State),
+            }
+        }
         Ok(())
     }
     fn mailbox_consumed(&mut self) -> Result<bool, Error> {
@@ -1374,6 +1402,10 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         frame: frame.clone(),
         rx_dma_busy: false,
         reclaimed: false,
+        ps_model: false,
+        ps_wake_stuck: false,
+        ps_suppress_rfon: false,
+        ps_corrupt_power: false,
     })));
     let backend = Backend::new(
         port.clone(),

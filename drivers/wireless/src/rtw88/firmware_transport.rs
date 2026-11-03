@@ -5,6 +5,8 @@
 use alloc::boxed::Box;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::FirmwareError;
+#[path = "runtime_lps.rs"]
+pub(super) mod runtime_lps;
 const HEADER: usize = 64;
 const CHECKSUM: usize = 8;
 const MAX_IMAGE: usize = 1024 * 1024;
@@ -199,8 +201,10 @@ fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
 /// exact powered PCI device exclusively. Reserved-page submissions retain
 /// their buffers across cancellation/ambiguous errors and cannot overwrite
 /// them until terminal completion. Dropping this backend must retain any
-/// mapping that hardware can still access. Ordinary MAC TX/RX and IRQs stay
-/// closed throughout; no unrelated command/reset/ring client may race it.
+/// mapping that hardware can still access. Firmware claim keeps MAC TX/RX
+/// and IRQs closed. A station-page continuation requires the original
+/// current qualified PS scope and exact native queue/prefix quiet proof;
+/// no unrelated command/reset/ring client may race either path.
 #[async_trait::async_trait]
 pub(super) unsafe trait Io: Send {
     fn claim_pristine(&mut self) -> Result<(), Error>;
@@ -211,6 +215,17 @@ pub(super) unsafe trait Io: Send {
     fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error>;
     fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error>;
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error>;
+    /// Native station continuation only; a separate exact original PS source
+    /// must enclose CPU mapping writes and each actual DMA publication.
+    async fn station_reserved_page(
+        &mut self,
+        _: &[u8],
+        _: u16,
+        _: &super::runtime_ps_scope::Bound,
+        _: &super::station_control::Admission,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     async fn lte_backup(&mut self) -> Result<u32, Error>;
     async fn lte_restore(&mut self, value: u32) -> Result<(), Error>;
     async fn finish_dma(&mut self) -> Result<(), Error>;

@@ -146,6 +146,7 @@ pub(super) struct State {
     wmm: Option<narf_wireless::wmm::Parameters>,
     data_profile: super::packet_format::DataProfile,
     peer_commit: Option<(u16, bool)>,
+    associated_aid: Option<u16>,
     cache: Vec<Entry>,
     peer: Option<ObservedBss>,
     plan: Option<JoinPlan>,
@@ -244,6 +245,7 @@ impl State {
             wmm: None,
             data_profile: super::packet_format::DataProfile::LEGACY,
             peer_commit: None,
+            associated_aid: None,
             cache: Vec::new(),
             peer: None,
             plan: None,
@@ -412,6 +414,71 @@ impl State {
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
     }
+    /// Actual completed association, unextended fixed CCK1 only. This new
+    /// program does not borrow qualification for HT/BA/tracking combinations.
+    pub(super) fn lps_peer(&self) -> Option<([u8; 6], [u8; 6], u16)> {
+        if self.phase() != Phase::Open
+            || !self.ready()
+            || self.extension.is_some()
+            || self.ht.is_some()
+            || self.rx_ba_grant.is_some()
+            || self.tx_ba_grant.is_some()
+            || self.protection.is_some()
+            || self.power_tracking.is_some()
+            || self.tracking.grant.is_some()
+            || !self.incoming.is_empty()
+            || !self.ordered.is_empty()
+            || !self.received.is_empty()
+        {
+            return None;
+        }
+        Some((self.own, self.peer()?, self.associated_aid?))
+    }
+    /// Receive-only native prefix consumption. Preserve DATA/EAPOL for normal
+    /// processing after confirmed awake; never emit a reply while in LPS.
+    pub(super) fn lps_collect(
+        &mut self,
+        io: &mut impl Io,
+        source: &super::runtime_ps_scope::Bound,
+    ) -> Result<(bool, bool), Error> {
+        let mut wake = false;
+        for _ in 0..32 {
+            let step = self.admission.run(|| {
+                source.invoke(|| {
+                    io.packet_poll()
+                        .map_err(|_| firmware_transport::Error::State)
+                })
+            })?;
+            if step.receipt.is_some() {
+                return Err(Error::State);
+            }
+            if let Some(body) = &step.c2h {
+                wake |= super::runtime_ps_wire::wake_event(body);
+            }
+            if let Some(frame) = step.frame {
+                if frame.phy.is_some_and(|p| !p.initial_channel()) {
+                    continue;
+                }
+                if self.lost(&frame) {
+                    return Err(Error::PeerLost);
+                }
+                if frame.bytes().len() > super::packet_format::MAX_MPDU {
+                    continue;
+                }
+                if self.incoming.len() == 64 {
+                    return Err(Error::State);
+                }
+                let now = self.now()?;
+                self.cache(&frame, now);
+                self.incoming
+                    .push_back((frame, true, self.admission.receive_generation(), false));
+            }
+            if !step.consumed_rx {
+                return Ok((true, wake));
+            }
+        }
+        Ok((false, wake))
+    }
     pub(super) async fn start(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.phase() != Phase::Prepared {
             return Err(Error::State);
@@ -448,6 +515,7 @@ impl State {
         self.data_drain = None;
         self.received.clear();
         self.peer_commit = None;
+        self.associated_aid = None;
         self.decline = None;
         self.wmm = None;
         self.wmm_requested = false;
@@ -1502,6 +1570,7 @@ impl State {
             self.poll(io)?;
             if let Some((aid, short)) = self.peer_commit {
                 station_control::commit_peer(io, bssid, aid, short, &self.admission).await?;
+                self.associated_aid = Some(aid);
                 if self.extension.is_some() {
                     super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)
                         .await?;

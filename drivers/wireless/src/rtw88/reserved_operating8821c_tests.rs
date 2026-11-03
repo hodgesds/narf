@@ -4,7 +4,12 @@ use crate::rtw88::operating8821c::{Request as PowerRequest, Source as PowerSourc
 #[path = "reserved_station8821c_tests.rs"]
 mod station_tests;
 fn calibrated() -> Result<(Fixture, Cap<FirmwareBlob, Read>), &'static str> {
-    let f = fixture(2, 3)?;
+    calibrated_with_features(0)
+}
+fn calibrated_with_features(
+    features: u32,
+) -> Result<(Fixture, Cap<FirmwareBlob, Read>), &'static str> {
+    let f = fixture_with_features(2, 3, features)?;
     let cap = Cap::bootstrap();
     narf_scheduler::block_on(f.lifecycle.prepare_calibration8821c_with(
         &f.factory,

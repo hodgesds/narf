@@ -69,7 +69,11 @@ pub mod operating_reset;
 pub use operating_reset::{reset_function, Error as OperatingResetError};
 mod rejoin;
 mod runtime_idle;
+mod runtime_ps_scope;
 mod runtime_ps_wire;
+pub use firmware_transport::runtime_lps::{
+    lps_function, lps_request_function, Error as RuntimeSleepError,
+};
 pub use runtime_idle::{idle_function, RuntimeIdle};
 mod system_pm;
 mod system_pm_native;

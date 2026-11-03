@@ -1310,6 +1310,15 @@ unsafe impl Registers for Native {
         }
         Ok(true)
     }
+    fn station_ps_rx_quiet(&mut self) -> Result<bool, Error> {
+        if !self.station_ht_program_quiet()? {
+            return Ok(false);
+        }
+        self.with_packet(|core, port| {
+            core.maintenance_quiet(|r| super::packet_core::Port::index(port, r))
+        })
+        .map_err(|_| Error::State)
+    }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         self.station_allowed()?;
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;

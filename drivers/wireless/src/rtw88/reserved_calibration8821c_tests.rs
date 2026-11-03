@@ -19,9 +19,13 @@ struct Fixture {
     request: Request,
 }
 fn fixture(rfe: u8, swing: u8) -> Result<Fixture, &'static str> {
+    fixture_with_features(rfe, swing, 0)
+}
+fn fixture_with_features(rfe: u8, swing: u8, features: u32) -> Result<Fixture, &'static str> {
     let (backend, port, drops) = allocated();
     let mut firmware = image();
     firmware[0] = 0x21;
+    firmware[0x0c..0x10].copy_from_slice(&features.to_le_bytes());
     let lifecycle = Lifecycle::new(0xc821);
     narf_scheduler::block_on(lifecycle.initialize_bytes(|| Ok(backend), firmware))
         .map_err(|_| "C21 calibration fixture firmware failed")?;
