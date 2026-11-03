@@ -181,6 +181,10 @@ pub fn per_domain_opt_in() -> PerDomainOptIn;
 pub fn enable_per_domain(hw: &'static dyn IommuHw) -> Result<(), IoError>; // → IommuMode::PerDomain
 pub fn default_domain(bdf: Bdf) -> Result<Arc<IommuDomain>, IoError>;     // iommu_get_dma_domain
 pub fn release_default_domain(bdf: Bdf) -> Result<(), IoError>;
+pub enum DmaBlock { Untranslated, Blocked }
+pub fn block_device_dma(bdf: Bdf) -> Result<DmaBlock, IoError>;  // pci_dev_reset_iommu_prepare
+pub fn restore_device_dma(bdf: Bdf) -> Result<(), IoError>;       // pci_dev_reset_iommu_done
+pub fn device_dma_blocked(bdf: Bdf) -> bool;
 pub fn walk(format: PageTableFormat, root: u64, iova: u64) -> Option<u64>; // software walk
 impl IommuDomain {
     pub fn attach(&self, bdf: Bdf) -> Result<(), IoError>;  // exclusive: DomainMismatch if attached elsewhere
@@ -211,7 +215,26 @@ the x86 interrupt window `0xfee0_0000..=0xfeef_ffff` (and, for AMD v1, the
 HyperTransport window `0xfd_0000_0000..=0xff_ffff_ffff`). Intermediate
 tables live until the domain is destroyed; a domain dropped with devices
 still attached leaks its tables. `iommu_model::ModelIommu` is a recording
-software backend for tests only.
+software backend for tests only (`set_fail_flush` / `set_fail_detach`
+inject invalidation timeouts).
+
+**Device DMA quiescence.** `block_device_dma` is the driver-neutral way to
+stop a device's DMA before releasing memory it may still reach (Linux
+blocking domain: `pci_dev_reset_iommu_prepare`, and the blocked release
+domain on removal). Outside `PerDomain` it is `Untranslated` and touches no
+hardware: DMA addresses are physical and the caller's device-side evidence
+is the only proof. In `PerDomain` it detaches the device from its default
+domain, which per the `IommuHw::detach` contract returns only after the
+blocking DTE/context entry and the device-entry + domain IOTLB invalidation
+completed; the default domain stays recorded, so buffers still mapped there
+unmap with the usual strict invalidate → wait → free ordering. A device with
+a default domain but no attachment is reported `Blocked` (idempotent; a
+never-attached AMD-Vi requester passes through, so "no default domain" is
+`NotMapped`, never blocked). A detach error (`Timeout`) means the device may
+still translate. `restore_device_dma` re-attaches the retained default
+domain (`pci_dev_reset_iommu_done`) and must only be called by the holder of
+the device's own stop/reset proof. Users: brcmfmac PCIe
+(`drivers/wireless/specification/brcmfmac.md` "IOMMU-backed quiescence").
 
 **AMD-Vi silicon backend** (module `amd_vi`, Linux
 `drivers/iommu/amd/{init.c,iommu.c,amd_iommu_types.h}`):

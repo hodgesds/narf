@@ -82,16 +82,37 @@ struct State {
     gone: bool,
     /// PCI PM capability `PME_Support` includes D3hot.
     pme: bool,
+    /// Requester ID whose DMA goes through the real `narf_io::iommu`
+    /// block/restore API (and, in `PerDomain`, real IOVA-mapped buffers
+    /// in its default domain). `None` = backend without an IOMMU hook.
+    iommu: Option<narf_io::iommu::Bdf>,
+    /// `Bus::block_dma` calls and their outcomes, `Bus::restore_dma` calls.
+    blocks: Vec<Result<narf_io::iommu::DmaBlock, ()>>,
+    restores: usize,
+    /// Watchdog resets already issued at the first successful block.
+    watchdogs_at_block: Option<usize>,
+    /// Mappings released while the IOMMU still let the function translate.
+    freed_while_attached: usize,
 }
 pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
 pub(crate) struct Mem {
     state: Rc<IrqSafeSpinLock<State>>,
     address: u64,
     len: usize,
+    /// Real IOVA-mapped backing in `PerDomain`; its own drop (after this
+    /// `Mem`'s) runs the strict unmap -> invalidate -> wait -> free.
+    iommu: Option<(narf_io::iommu::Bdf, narf_io::DmaBuffer)>,
 }
 impl Drop for Mem {
     fn drop(&mut self) {
+        let attached = self.iommu.as_ref().is_some_and(|(bdf, _)| {
+            narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
+                && !narf_io::iommu::device_dma_blocked(*bdf)
+        });
         let mut state = self.state.lock();
+        if attached {
+            state.freed_while_attached += 1;
+        }
         state.dropped += 1;
         state.dropped_addresses.insert(self.address);
         if state.unreleased_read {
@@ -240,6 +261,25 @@ impl runtime::Bus for Model {
         if s.fail_allocate == Some(s.allocated) {
             return Err(runtime::Error::Access);
         }
+        let iommu = match s.iommu {
+            Some(bdf) if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain => {
+                if narf_io::iommu::device_dma_blocked(bdf) {
+                    return Err(runtime::Error::Access);
+                }
+                let domain =
+                    narf_io::iommu::default_domain(bdf).map_err(|_| runtime::Error::Access)?;
+                let dev = narf_io::DmaDevice::coherent().with_iommu_domain(domain);
+                let buffer = narf_io::alloc_coherent_for(
+                    &dev,
+                    len,
+                    narf_lib::id::DomainId::DRIVER_0,
+                    u64::from(u32::MAX),
+                )
+                .map_err(|_| runtime::Error::Exhausted)?;
+                Some((bdf, buffer))
+            }
+            _ => None,
+        };
         s.allocated += 1;
         let at = s.next;
         s.next += ((len + 4095) & !4095) as u64;
@@ -248,7 +288,34 @@ impl runtime::Bus for Model {
             state: self.0.clone(),
             address: at,
             len,
+            iommu,
         })
+    }
+    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, runtime::Error> {
+        let bdf = self.0.lock().iommu;
+        let Some(bdf) = bdf else {
+            return Ok(narf_io::iommu::DmaBlock::Untranslated);
+        };
+        let result = narf_io::iommu::block_device_dma(bdf);
+        let mut s = self.0.lock();
+        s.blocks.push(result.map_err(|_| ()));
+        if result.is_ok() && s.watchdogs_at_block.is_none() {
+            s.watchdogs_at_block = Some(s.watchdogs);
+        }
+        result.map_err(|_| runtime::Error::Access)
+    }
+    fn restore_dma(&mut self) -> Result<(), runtime::Error> {
+        let bdf = self.0.lock().iommu;
+        let Some(bdf) = bdf else {
+            return Ok(());
+        };
+        self.0.lock().restores += 1;
+        if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
+            && !narf_io::iommu::device_dma_blocked(bdf)
+        {
+            narf_io::iommu::default_domain(bdf).map_err(|_| runtime::Error::Access)?;
+        }
+        narf_io::iommu::restore_device_dma(bdf).map_err(|_| runtime::Error::Access)
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
         let mut s = self.0.lock();

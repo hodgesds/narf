@@ -18,7 +18,9 @@
 //! that must observe a present function and stable D2H write indices,
 //! resets the chip by the ChipCommon watchdog, re-verifies BME clear after
 //! the config shadow restore, halts the ARM CR4 (`brcmf_chip_set_passive`)
-//! and reads the halt back. Only then is the published memory reclaimable.
+//! and reads the halt back. Under a translating IOMMU the function is
+//! blocked (`Bus::block_dma`) after the flush reads and before the reset.
+//! Only then is the published memory reclaimable.
 use super::*;
 use crate::brcmfmac::chip::{self, Chip};
 
@@ -173,6 +175,9 @@ impl<B: Bus> Runtime<B> {
         if first != second {
             return Err(Error::Protocol);
         }
+        // Dead firmware: block at the IOMMU before the watchdog reset and
+        // before anything is reclaimed.
+        self.block_iommu()?;
         let halted = self.reset_device().await?;
         self.reclaimable = true;
         Ok(DeadStop {

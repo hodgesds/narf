@@ -672,9 +672,10 @@ where
         self.failed = true;
         self.peer = None;
         match self.inner.take() {
-            // Drop frees every mapping only after a complete proof and
-            // otherwise leaks them (`Runtime`'s `Drop`).
-            Some(inner) => inner.is_reclaimable(),
+            // Drop frees every mapping only after a complete proof or a
+            // completed IOMMU block and otherwise leaks them (`Runtime`'s
+            // `Drop`).
+            Some(mut inner) => inner.release_dma(),
             None => true,
         }
     }

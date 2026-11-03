@@ -258,7 +258,9 @@ native `DmaBuffer` adapter uses `dmb osh` on aarch64.
 publication; the pre-read invalidation/barrier is not a substitute. Drop after any address
 publication disables BME best effort and retains every mapping permanently:
 config readback alone does not prove all previously posted PCI writes drained.
-Recovery/IOMMU quiescence and reclamation are explicit remaining software work.
+Recovery and reclamation are the confirmed/dead-firmware stops below; under
+a translating IOMMU they additionally block the function at the IOMMU before
+any mapping is released ("IOMMU-backed quiescence").
 
 Physical carrier/peer publication does not change operator `IFF_UP` and never
 invokes administrative open/stop hooks while retained driver state is locked.
@@ -775,17 +777,66 @@ Cold resume (Linux `cleanup:` -> `brcmf_pcie_remove` + `brcmf_pcie_probe`
 when `INTMASK` reads 0) is not replayed: the owner becomes terminal and the
 carrier stays down. See the `system_resume`/`transport_reset` rows.
 
-IOMMU-backed quiescence remains open: the proof above holds with the
-IOMMU in identity/disabled mode (the only modes the native allocator
-accepts; `PerDomain` is refused in `native_runtime.rs::allocate`).
-`narf-io` would need a per-device detach that confirms completion — e.g.
-`narf_io::iommu::IommuDomain::detach_and_flush(&self, bdf: Bdf) ->
-Result<FlushReceipt, IoError>` that clears the DTE/context entry, issues
-the device IOTLB invalidation and waits for its completion (AMD-Vi
-`COMPLETION_WAIT`, VT-d invalidation-wait descriptor, SMMUv3 `CMD_SYNC`)
-before returning — plus a `PerDomain` `alloc_coherent` that maps into that
-device's domain. Today `IommuDomain::detach`/`unmap` only adjust counters
-and `PerDomain` map/unmap return `NotMapped`.
+### IOMMU-backed quiescence
+
+With the opt-in per-domain IOMMU (`iommu.passthrough=0`,
+`io/specification/spec.md` "Per-domain IOMMU translation") the BCM43602
+function's msgbuf memory is IOVA-mapped and every stop blocks the device at
+the IOMMU before anything is released, Linux's model for reclaiming memory
+from a misbehaving or dead device (`dma-iommu.c::iommu_dma_free` →
+`__iommu_dma_unmap` → `iommu_iotlb_sync`; `iommu.c::pci_dev_reset_iommu_prepare`
+/ `_done` around a reset, and the blocked release domain on removal):
+
+- `PcieBackplane::allocate` (`native_runtime.rs`): Identity/Disabled keep
+  `narf_io::alloc_coherent` (physical addresses). In `PerDomain` it maps
+  through the function's default domain (`narf_bus::dma::configure` →
+  `narf_io::alloc_coherent_for`) with the PCI default 32-bit coherent mask
+  (Linux `pci_setup_device`; brcmfmac never widens it), and refuses while
+  the function is IOMMU-blocked.
+- `runtime::Bus::block_dma` / `restore_dma` (defaults: `Untranslated` /
+  no-op) wrap the driver-neutral `narf_io::iommu::block_device_dma` /
+  `restore_device_dma`. `block_dma` is deliberately not gated on the
+  firmware/BAR proof, so a dead or revoked generation can still be blocked.
+- `Runtime::quiesce` (confirmed stop): D3 ack, drain, IRQ release, verified
+  BME clear and flush reads, then `block_iommu`; only then `reclaimable`.
+- `Runtime::stop_dead` (FWHALT, lost power): IRQ release, BME clear, flush
+  reads, `block_iommu`, then `brcmf_pcie_reset_device` and the CR4 halt.
+- A failed block (backend `Timeout`, wrong domain) fails the proof: the
+  device may still translate, so nothing is released.
+- `Runtime::release_dma` (used by `Drop` and `Adapter::release_transport`):
+  a generation without a device-side proof (post-BME activity, vanished
+  function, unanswered D3 on a terminal owner) is stopped best effort and
+  blocked; a completed block frees its mappings (each `DmaBuffer` then runs
+  strict unmap → IOTLB invalidate + completion wait → IOVA/frame free, so no
+  frame is reused before the invalidation completes). Such a generation is
+  never reported as a proven stop: `teardown` still returns false, so the
+  BDF stays quarantined and blocked, and `reset_transport` (gated on
+  `is_reclaimable`) does not run on it.
+- `Runtime::attach` calls `restore_dma` (BME verified clear) before its
+  first allocation, so a reset generation is re-attached to its retained
+  default domain only after the old one was released (Linux
+  `pci_dev_reset_iommu_done`).
+- AP, station and virtual-interface paths share this owner: their flow
+  rings, control/event/RX buffers and TX payloads are `Runtime` resources,
+  freed on a delete completion during operation (strict per-buffer unmap)
+  or by the stop paths above (`interface.rs::teardown`,
+  `interface_ap.rs`/`interface_monitor.rs` stops, `Generation::recover`).
+
+Identity/disabled mode reports `Untranslated`: the device-side proof is the
+only quiescence evidence and an unproven generation stays pinned, exactly
+as before. IOMMU-backed quiescence therefore needs the
+`iommu.passthrough=0` opt-in on an AMD-Vi platform. Residual: a DMA write
+already translated before the blocking invalidation completed is ordered
+only by the IOMMU's completion-wait semantics (as on Linux); interrupt
+remapping is not enabled, so MSI writes are not blocked by the IOMMU.
+
+Smokes (written, unexecuted; `ModelIommu` backend, real NARF page tables,
+no AMD-Vi silicon): `smoke_brcmf_iommu_stop_blocks_then_frees`,
+`smoke_brcmf_iommu_dead_firmware_blocks_before_reclaim`,
+`smoke_brcmf_iommu_unproven_stop_reclaims_only_behind_block`,
+`smoke_brcmf_identity_iommu_keeps_device_proof_order`; io:
+`perdomain_block_device_dma_blocks_then_restores`,
+`identity_block_device_dma_is_untranslated`.
 
 ### Wake-on-WLAN and GTK rekey offload (BCM43602)
 
@@ -1710,7 +1761,8 @@ prefixes exceeding the admitted shared7 slack, other CPU/RAM/chip/OTP selectors
 (including 160 MHz-capable
 chips), HE/EHT profiles, monitor formats outside the bounded native
 radiotap owner above, AP, replayed
-recovery/system PM, IOMMU-backed quiescence.
+recovery/system PM. IOMMU-backed quiescence is implemented pending
+validation ("IOMMU-backed quiescence").
 These do not expand the initial retained-failure acceptance claim.
 WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
 roaming/FT, per-AC telemetry and host-supplicant fallback are common FullMAC

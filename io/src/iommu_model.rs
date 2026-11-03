@@ -46,6 +46,7 @@ pub enum ModelEvent {
 pub struct ModelIommu {
     format: PageTableFormat,
     fail_flush: AtomicBool,
+    fail_detach: AtomicBool,
     events: IrqSafeSpinLock<Vec<ModelEvent>>,
     roots: IrqSafeSpinLock<Vec<(u16, u64)>>,
 }
@@ -55,6 +56,7 @@ impl ModelIommu {
         Self {
             format,
             fail_flush: AtomicBool::new(false),
+            fail_detach: AtomicBool::new(false),
             events: IrqSafeSpinLock::new(Vec::new()),
             roots: IrqSafeSpinLock::new(Vec::new()),
         }
@@ -63,6 +65,12 @@ impl ModelIommu {
     /// Make every following `flush_iotlb` fail (invalidation timeout).
     pub fn set_fail_flush(&self, fail: bool) {
         self.fail_flush.store(fail, Ordering::SeqCst);
+    }
+
+    /// Make every following `detach` fail (blocking-entry invalidation
+    /// timeout): the device stays attached and able to translate.
+    pub fn set_fail_detach(&self, fail: bool) {
+        self.fail_detach.store(fail, Ordering::SeqCst);
     }
 
     /// Snapshot of recorded calls.
@@ -80,6 +88,7 @@ impl ModelIommu {
         self.events.lock().clear();
         self.roots.lock().clear();
         self.fail_flush.store(false, Ordering::SeqCst);
+        self.fail_detach.store(false, Ordering::SeqCst);
     }
 
     /// Reset NARF's IOMMU state, then enter `PerDomain` with this model.
@@ -114,6 +123,9 @@ impl IommuHw for ModelIommu {
     }
 
     fn detach(&self, bdf: Bdf, domain_id: u16) -> Result<(), IoError> {
+        if self.fail_detach.load(Ordering::SeqCst) {
+            return Err(IoError::Timeout);
+        }
         self.events
             .lock()
             .push(ModelEvent::Detach { bdf, domain_id });

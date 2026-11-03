@@ -474,6 +474,16 @@ impl Memory for narf_io::DmaBuffer {
     }
 }
 impl PcieBackplane {
+    /// IOMMU requester ID of this function (`narf_bus::dma::configure`
+    /// attaches only PCI segment 0).
+    fn iommu_bdf(&self) -> Result<narf_io::iommu::Bdf, runtime::Error> {
+        match self.device.kind {
+            narf_bus::BusKind::Pcie { addr, .. } if addr.segment == 0 => Ok(
+                narf_io::iommu::Bdf::new(addr.bus, addr.device, addr.function),
+            ),
+            _ => Err(runtime::Error::Access),
+        }
+    }
     fn aperture(&self, address: u32, length: usize) -> Result<narf_bus::MmioRegion, boot::Error> {
         // Called only inside the enclosing register CapOp. The command read
         // additionally verifies that the retained memory aperture is enabled.
@@ -602,14 +612,51 @@ impl runtime::Bus for PcieBackplane {
             if command == u16::MAX
                 || command & (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
                     != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
-                || narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
             {
                 return Err(runtime::Error::Access);
             }
-            narf_io::alloc_coherent(length, narf_lib::id::DomainId::DRIVER_0)
-                .map_err(|_| runtime::Error::Access)
+            if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+                return narf_io::alloc_coherent(length, narf_lib::id::DomainId::DRIVER_0)
+                    .map_err(|_| runtime::Error::Access);
+            }
+            // PerDomain: map into the function's default domain (Linux
+            // `iommu_dma_alloc`) with the PCI default 32-bit coherent mask
+            // (`pci_setup_device`; brcmfmac never widens it). A blocked
+            // function must be restored by `Runtime::attach` first.
+            if narf_io::iommu::device_dma_blocked(self.iommu_bdf()?) {
+                return Err(runtime::Error::Access);
+            }
+            let dev = narf_bus::dma::configure(&self.device).map_err(|_| runtime::Error::Access)?;
+            narf_io::alloc_coherent_for(
+                &dev,
+                length,
+                narf_lib::id::DomainId::DRIVER_0,
+                u64::from(u32::MAX),
+            )
+            .map_err(|_| runtime::Error::Access)
         })
         .map_err(|_| runtime::Error::Access)?
+    }
+    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, runtime::Error> {
+        // Deliberately ungated by the firmware/BAR proof: a dead or revoked
+        // generation must still be blockable. Identity mode reports
+        // `Untranslated` without touching the IOMMU.
+        if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+            return Ok(narf_io::iommu::DmaBlock::Untranslated);
+        }
+        narf_io::iommu::block_device_dma(self.iommu_bdf()?).map_err(|_| runtime::Error::Access)
+    }
+    fn restore_dma(&mut self) -> Result<(), runtime::Error> {
+        if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+            return Ok(());
+        }
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        let bdf = self.iommu_bdf()?;
+        if !narf_io::iommu::device_dma_blocked(bdf) {
+            // First generation: create/attach the default domain.
+            narf_bus::dma::configure(&self.device).map_err(|_| runtime::Error::Access)?;
+        }
+        narf_io::iommu::restore_device_dma(bdf).map_err(|_| runtime::Error::Access)
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
         self.qualified().map_err(|_| runtime::Error::Access)?;

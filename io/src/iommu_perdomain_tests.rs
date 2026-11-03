@@ -286,3 +286,76 @@ kernel_test_in!(
     "io/iommu/perdomain",
     perdomain_dma_buffer_carries_iova_not_phys
 );
+
+fn perdomain_block_device_dma_blocks_then_restores() -> TestResult {
+    with_model(&MODEL, || {
+        let bdf = Bdf::new(0x7a, 0, 0);
+        if iommu::block_device_dma(bdf) != Err(IoError::NotMapped) {
+            return Err("a device without a default domain reported blocked");
+        }
+        let domain = iommu::default_domain(bdf).map_err(|_| "default domain")?;
+        let dev = DmaDevice::coherent().with_iommu_domain(domain.clone());
+        let buf = match alloc_coherent_for(&dev, 4096, DomainId::DRIVER_0, u64::from(u32::MAX)) {
+            Ok(b) => b,
+            Err(IoError::NoMemory) => return Err("frame allocator unavailable"),
+            Err(_) => return Err("alloc_coherent_for under PerDomain"),
+        };
+        let iova = buf.dma_addr().raw();
+        // A detach that does not complete leaves the device attached.
+        MODEL.set_fail_detach(true);
+        if iommu::block_device_dma(bdf) != Err(IoError::Timeout) || iommu::device_dma_blocked(bdf) {
+            return Err("failed detach reported the device blocked");
+        }
+        MODEL.set_fail_detach(false);
+        MODEL.clear_events();
+        if iommu::block_device_dma(bdf) != Ok(iommu::DmaBlock::Blocked)
+            || !iommu::device_dma_blocked(bdf)
+            || iommu::block_device_dma(bdf) != Ok(iommu::DmaBlock::Blocked)
+        {
+            return Err("block not reported / not idempotent");
+        }
+        // Blocked first, then the buffer's own unmap + invalidation.
+        drop(buf);
+        let events = MODEL.events();
+        let detach = events
+            .iter()
+            .position(|e| matches!(e, ModelEvent::Detach { bdf: b, .. } if *b == bdf));
+        let flush = events.iter().position(|e| {
+            matches!(e, ModelEvent::Flush { iova: i, cleared: Some(true), ok: true, .. } if *i == iova)
+        });
+        match (detach, flush) {
+            (Some(d), Some(f)) if d < f => {}
+            _ => return Err("buffer freed before the device was blocked"),
+        }
+        if domain.translate(iova).is_some() || domain.mapping_count() != 0 {
+            return Err("blocked device's buffer stayed mapped");
+        }
+        iommu::restore_device_dma(bdf).map_err(|_| "restore")?;
+        if iommu::device_dma_blocked(bdf) || domain.device_count() != 1 {
+            return Err("restore did not re-attach the default domain");
+        }
+        iommu::restore_device_dma(bdf).map_err(|_| "restore is not idempotent")?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "io/iommu/perdomain",
+    perdomain_block_device_dma_blocks_then_restores
+);
+
+fn identity_block_device_dma_is_untranslated() -> TestResult {
+    iommu::__reset_for_test();
+    let bdf = Bdf::new(0x79, 0, 0);
+    let ok = iommu::block_device_dma(bdf) == Ok(iommu::DmaBlock::Untranslated)
+        && iommu::restore_device_dma(bdf).is_ok()
+        && !iommu::device_dma_blocked(bdf);
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("identity/disabled mode claimed an IOMMU block")
+    }
+}
+kernel_test_in!(
+    "io/iommu/perdomain",
+    identity_block_device_dma_is_untranslated
+);

@@ -1641,7 +1641,7 @@ fn create_inner(
         })
         .map_err(|_| runtime::Error::Protocol)
 }
-fn boot_fixture(bus: Model) -> Result<boot::Booted<Model>, boot::Refused<Model>> {
+pub(crate) fn boot_fixture(bus: Model) -> Result<boot::Booted<Model>, boot::Refused<Model>> {
     let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
     boot::Cr4::claim(bus, pci(), profile())?.boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)
 }

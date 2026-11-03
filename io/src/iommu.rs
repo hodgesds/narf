@@ -848,6 +848,89 @@ pub fn release_default_domain(bdf: Bdf) -> Result<(), IoError> {
     domain.detach(bdf)
 }
 
+/// Outcome of [`block_device_dma`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DmaBlock {
+    /// Not [`IommuMode::PerDomain`]: DMA addresses are physical and the
+    /// IOMMU cannot stop the device, so DMA quiescence rests on
+    /// device-side evidence alone (bus-master clear, device handshakes).
+    Untranslated,
+    /// The device's requester ID is blocked ([`IommuHw::detach`]: blocking
+    /// DTE / context entry, device-entry and domain IOTLB invalidation,
+    /// completion wait). Its default domain stays recorded, so buffers
+    /// still mapped there unmap (and invalidate) normally.
+    Blocked,
+}
+
+fn attached_domain_id(bdf: Bdf) -> Option<u16> {
+    ATTACHED
+        .lock()
+        .iter()
+        .find(|(b, _)| *b == bdf)
+        .map(|(_, d)| *d)
+}
+
+/// Driver-neutral DMA quiescence through the IOMMU (Linux
+/// `pci_dev_reset_iommu_prepare`: attach the requester to the group's
+/// blocking domain while `group->domain` stays intact; on removal
+/// `iommu_deinit_device` → `release_domain`/blocked domain). In
+/// `PerDomain` the device is detached from its default domain, which per
+/// the [`IommuHw::detach`] contract returns only after the blocking entry
+/// and its invalidations completed: from then on no device transaction
+/// translates, so memory previously mapped for it may be released (each
+/// [`crate::DmaBuffer`] still runs its own strict unmap → invalidate →
+/// wait before its frames are freed).
+///
+/// Idempotent: a device whose default domain exists but is not attached
+/// was detached by an earlier call and is reported `Blocked` (a device
+/// gets a default domain only through a successful attach, and an
+/// AMD-Vi requester that was never attached passes through untranslated,
+/// so "no default domain" is never reported as blocked).
+///
+/// Errors: `NotMapped` (PerDomain, no default domain), `DomainMismatch`
+/// (attached to some other domain), or the backend's detach error
+/// (`Timeout`): the device must then be treated as still able to DMA.
+pub fn block_device_dma(bdf: Bdf) -> Result<DmaBlock, IoError> {
+    if mode() != IommuMode::PerDomain {
+        return Ok(DmaBlock::Untranslated);
+    }
+    let domain = default_domain_of(bdf).ok_or(IoError::NotMapped)?;
+    match attached_domain_id(bdf) {
+        None => Ok(DmaBlock::Blocked),
+        Some(id) if id == domain.domain_id() => {
+            domain.detach(bdf)?;
+            Ok(DmaBlock::Blocked)
+        }
+        Some(_) => Err(IoError::DomainMismatch),
+    }
+}
+
+/// Inverse of [`block_device_dma`] (Linux `pci_dev_reset_iommu_done`):
+/// re-attach the device to its retained default domain so a fresh
+/// generation's buffers translate. A no-op outside `PerDomain` or when
+/// already attached to that domain. Callers must only restore a device
+/// whose own reset/stop proof they hold: restoring re-opens every IOVA
+/// still mapped in the domain to the device.
+pub fn restore_device_dma(bdf: Bdf) -> Result<(), IoError> {
+    if mode() != IommuMode::PerDomain {
+        return Ok(());
+    }
+    let domain = default_domain_of(bdf).ok_or(IoError::NotMapped)?;
+    match attached_domain_id(bdf) {
+        Some(id) if id == domain.domain_id() => Ok(()),
+        Some(_) => Err(IoError::DomainMismatch),
+        None => domain.attach(bdf),
+    }
+}
+
+/// Whether [`block_device_dma`] currently holds `bdf` blocked (always
+/// `false` outside `PerDomain`).
+pub fn device_dma_blocked(bdf: Bdf) -> bool {
+    mode() == IommuMode::PerDomain
+        && default_domain_of(bdf).is_some()
+        && attached_domain_id(bdf).is_none()
+}
+
 fn default_domain_of(bdf: Bdf) -> Option<alloc::sync::Arc<IommuDomain>> {
     DEFAULT_DOMAINS
         .lock()

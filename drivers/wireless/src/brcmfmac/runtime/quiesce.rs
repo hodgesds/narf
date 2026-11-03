@@ -17,9 +17,12 @@
 //! completion published before the ack is consumed, BME is cleared with a
 //! verified readback, and non-posted BAR reads issued after BME clear (whose
 //! completions cannot pass earlier device posted writes) must still observe
-//! unchanged D2H write indices and a present function. Only that complete
-//! proof marks the owner reclaimable; any timeout, fault or change keeps all
-//! published memory retained forever.
+//! unchanged D2H write indices and a present function. Under a translating
+//! IOMMU (`IommuMode::PerDomain`) the function is then blocked at the IOMMU
+//! (`Bus::block_dma`) before the owner is marked reclaimable. Only that
+//! complete proof marks the owner reclaimable; any timeout, fault or change
+//! keeps all published memory retained unless the IOMMU block completes
+//! (`Runtime::release_dma`).
 use super::*;
 use mailbox::{H2D_HOST_D0_INFORM, H2D_HOST_D3_INFORM};
 
@@ -41,6 +44,47 @@ impl<B: Bus> Runtime<B> {
     /// Whether a confirmed stop proved all published DMA reclaimable.
     pub fn is_reclaimable(&self) -> bool {
         self.reclaimable
+    }
+    /// Whether the IOMMU currently blocks this function's DMA.
+    pub fn is_iommu_blocked(&self) -> bool {
+        self.iommu_blocked
+    }
+    /// IOMMU half of every stop proof. Under a translating IOMMU the
+    /// function is detached to a blocking entry (invalidation completed)
+    /// before any published mapping can be released; Linux relies on
+    /// exactly that (`dma-iommu.c::iommu_dma_free` → `__iommu_dma_unmap`
+    /// → `iommu_iotlb_sync`, and the blocked domain on reset/removal).
+    /// Identity/disabled mode is `Untranslated` and keeps the device-side
+    /// proof as the sole evidence.
+    pub(super) fn block_iommu(&mut self) -> Result<(), Error> {
+        if self.iommu_blocked {
+            return Ok(());
+        }
+        match self.bus.block_dma()? {
+            narf_io::iommu::DmaBlock::Blocked => self.iommu_blocked = true,
+            narf_io::iommu::DmaBlock::Untranslated => {}
+        }
+        Ok(())
+    }
+    /// Decide whether published memory may be freed now (by `Drop` or
+    /// `into_bus`). A complete device proof (which already blocked a
+    /// translating IOMMU) qualifies. Otherwise the generation is stopped
+    /// (interrupts released, BME cleared best effort) and the function is
+    /// blocked at the IOMMU: only a completed block lets an unproven
+    /// generation's memory be released, Linux's model for a misbehaving
+    /// or dead device. In identity mode an unproven generation stays
+    /// pinned.
+    pub fn release_dma(&mut self) -> bool {
+        if self.reclaimable || self.iommu_blocked {
+            return true;
+        }
+        self.ap_live.store(false, Ordering::Release);
+        self.down = true;
+        self.failed = true;
+        self.stop_interrupts();
+        let _ = self.bus.park_dma();
+        let _ = self.block_iommu();
+        self.iommu_blocked
     }
     /// Whether the bus is in the Linux `BRCMFMAC_PCIE_STATE_DOWN` state.
     pub fn is_down(&self) -> bool {
@@ -191,6 +235,7 @@ impl<B: Bus> Runtime<B> {
         if after != before {
             return Err(Error::Protocol);
         }
+        self.block_iommu()?;
         self.reclaimable = true;
         Ok(StopProof {
             drained,

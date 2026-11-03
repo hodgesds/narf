@@ -105,6 +105,22 @@ pub trait Bus: BootBus {
     fn set_link_control(&mut self, _value: u32) -> Result<(), Error> {
         Err(Error::Protocol)
     }
+    /// Block the function's DMA at the IOMMU before published memory is
+    /// released (`narf_io::iommu::block_device_dma`, Linux
+    /// `pci_dev_reset_iommu_prepare` / the blocked release domain).
+    /// `Untranslated` (identity/disabled IOMMU, or a backend without one)
+    /// leaves the device-side proof as the only quiescence evidence; an
+    /// error means the device may still translate. Must not depend on
+    /// live firmware or BAR authority: dead-firmware stops call it.
+    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, Error> {
+        Ok(narf_io::iommu::DmaBlock::Untranslated)
+    }
+    /// Undo [`Self::block_dma`] before a fresh generation allocates
+    /// (Linux `pci_dev_reset_iommu_done`). Called by `Runtime::attach`
+    /// with BME verified clear.
+    fn restore_dma(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -230,6 +246,10 @@ pub struct Runtime<B: Bus> {
     down: bool,
     /// Set only by a complete confirmed-stop proof (`quiesce.rs`).
     reclaimable: bool,
+    /// The IOMMU blocks this function (`Bus::block_dma` returned
+    /// `Blocked`): no device transaction translates, so published memory
+    /// may be released even without a device-side proof.
+    iommu_blocked: bool,
     hostrdy_db1: bool,
     /// Discovered AI cores of the booted chip (ChipCommon watchdog, PCIe2
     /// config shadow and ARM CR4 halt for `brcmf_pcie_reset_device`).
@@ -246,19 +266,17 @@ impl<B: Bus> core::fmt::Debug for Runtime<B> {
 impl<B: Bus> Drop for Runtime<B> {
     fn drop(&mut self) {
         self.ap_live.store(false, Ordering::Release);
-        if self.published && !self.reclaimable {
-            self.stop_interrupts();
-            let _ = self.bus.park_dma();
+        if self.published && !self.release_dma() {
             // Without a confirmed stop (D3 ack, drained completions, verified
-            // BME clear and post-clear flush reads) BME readback alone cannot
-            // prove old posted PCI writes drained. Leak this bounded owner
-            // rather than returning live DMA pages.
+            // BME clear and post-clear flush reads) or an IOMMU block, BME
+            // readback alone cannot prove old posted PCI writes drained.
+            // Leak this bounded owner rather than returning live DMA pages.
             if let Some(resources) = self.resources.take() {
                 core::mem::forget(resources);
             }
         }
-        // A reclaimable owner drops its resources normally: the device can no
-        // longer master any of them.
+        // A reclaimable or IOMMU-blocked owner drops its resources normally:
+        // the device can no longer master any of them.
     }
 }
 impl<B: Bus> Runtime<B> {
@@ -278,6 +296,9 @@ impl<B: Bus> Runtime<B> {
         if bus.dma_enabled()? {
             return Err(Error::Protocol);
         }
+        // A reset generation was left IOMMU-blocked by its stop proof:
+        // re-attach before the first new mapping (BME is clear here).
+        bus.restore_dma()?;
         let mut bytes = [0; RINGINFO_SIZE];
         bus.read_tcm(shared.ring_info_addr, &mut bytes)?;
         let info = RingInfo::parse(&bytes).ok_or(Error::Protocol)?;
@@ -401,6 +422,7 @@ impl<B: Bus> Runtime<B> {
             delivered: false,
             down: false,
             reclaimable: false,
+            iommu_blocked: false,
             hostrdy_db1: shared.hostrdy_db1(),
             cores: chip.cores,
         };
