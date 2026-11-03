@@ -2284,7 +2284,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
-| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 all-pipes-off resource transaction landed (owned single-pipe entry, four-pipe computation); live-pipe repartitioning, SAGV/QGV, bigjoiner, DSC, VRR and multi-pipe enables remain |
+| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning and the Pipe B-D owner API (no production port caller yet); SAGV/QGV, bigjoiner, DSC and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
@@ -3508,3 +3508,29 @@ crawl acknowledgement, PM demand bracketing, a two-pipe commit, restoration and
 the production modeset. One existing fail-closed fixture now pins the full
 source CDCLK relock and its restoration instead of the old raise-only
 writes. These are native register models; silicon acceptance is unrun.
+
+Live repartitioning (`intel_gpu_xelpg_live`) moves this state between
+configurations while listed pipes stay lit, following
+`skl_commit_modeset_enables`. PM demand is raised first, and CDCLK changes
+before the planes only when rising. DBUF slices power old and new together.
+MBUS joins (selecting the lit joined pipe), with DBOX and tracker updates,
+before any DDB growth. Lit pipes take their new DDB in reverse pipe order,
+each once its target overlaps no other current allocation, and are armed
+through `PLANE_SURF`/`CURBASE` after the 100 µs vblank evasion. A frame wait
+follows each changed allocation while other pipes remain. The unjoin with its
+vblank, the off pipes, slice power-down, a falling CDCLK and the final PM
+demand come last. A changed lit pipe, an unknown firmware CDCLK, live FBC or
+DSB, a foreign lit pipe, divergence from the programmed state and an
+unorderable DDB move are refused before any write. A later failure undoes the
+executed steps in reverse, rejoining before a formerly joined pipe regrows.
+
+`intel_gpu_xelpg_pipes::Pipes` exposes the Pipe B-D entry described in
+spec.md §3: reserve resources, program timings, let the port owner train,
+enable the transcoder and arm the primary, then disable and release. The
+fixed Pipe-A path is unchanged. Its KMS services still require the
+single-pipe layout and refuse while another pipe is lit. No production port
+caller exists yet, so these entries are reached only by native fixtures.
+Seven more fixtures cover DDB ordering and cycle refusal, MBUS join and
+unjoin sequencing, adding and removing a pipe beside a lit panel, write-free
+refusals, reverse undo and the pipe owner's enable/release and refusals.
+SAGV enablement with QGV derating is still open.

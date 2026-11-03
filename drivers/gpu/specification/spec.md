@@ -8271,6 +8271,24 @@ retain cursor refusal.
 Runtime capture rechecks exact resources, fixed timing and every other pipe,
 including an active blank pipe, before using this ownership proof.
 
+**Intel display14 Pipe B-D owner (crate-internal).** `intel_gpu_xelpg_pipes::Pipes`
+is the entry the external-output (port/PHY) owner uses to light Pipes B-D on
+display14.00 next to the unchanged fixed Pipe-A path. `adopt_panel` proves the
+owned Pipe-A resource image and whether it is lit. `reserve(ExternalPipe)`
+(pipe, mode, 4 KiB-aligned linear XRGB8888 GGTT surface, stride, highest port
+clock, combo PHY or Type-C) computes and commits DBUF/DDB/WM/CDCLK/PM demand
+while lit pipes stay lit. `program_timings` writes transcoder timings and
+source size with the pipe off. The caller then owns port clock, PHY,
+`TRANS_DDI_FUNC_CTL`, `DP_TP_CTL`, M/N and link training. `enable` sets
+`TRANSCONF` with its STATE acknowledgement and arms the primary plane, proved
+by a fresh frame and `PLANE_SURFLIVE`. `disable` turns the plane and
+transcoder off. After the caller stops its port, `release` repartitions
+without the pipe. Pipe A, scaled/tiled/other-format primaries, changed lit
+pipes, an unknown firmware CDCLK, live FBC/DSB, foreign lit pipes and
+unorderable DDB moves are typed refusals before any write; later failures
+undo executed steps in reverse. While another pipe is lit, the fixed Pipe-A
+KMS services keep refusing their single-pipe resource proof.
+
 One retained private WC32 KiB BO supplies two cursor slots through an exclusive
 GGTT lease. After exposure its BO/address are never rebound; ambiguous drop
 retains allocation/mapping/lease rather than freeing hardware-visible storage.
