@@ -708,3 +708,61 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8723bu",
     smoke_rtl8723bu_power_off
 );
+
+fn smoke_rtl8723bu_packet_signal_and_ra() -> TestResult {
+    use super::rtl8192e_ra::{Peer, Ra};
+    use super::rtl8723b_packet::{rssi_setting, signal};
+    // rtl8723b_cck_rssi: LNA [7:5], VGA [4:0].
+    let cck = |agc: u8| signal(&[0, 0, 0, 0, 0, agc], 0);
+    if cck(6 << 5 | 3) != Some(-40)
+        || cck(4 << 5 | 1) != Some(-16)
+        || cck(1 << 5) != Some(6)
+        || cck(2) != Some(12)
+        || cck(7 << 5 | 9) != Some(0)
+        || signal(&[0, 0, 0, 0, 100, 0], 4) != Some(-60)
+        || signal(&[0; 5], 0).is_some()
+    {
+        return TestResult::Fail("8723bu signal");
+    }
+    if rssi_setting(0, 42) != [0x42, 0, 0, 42] {
+        return TestResult::Fail("8723bu 4-byte RSSI setting");
+    }
+    // 1T1R: a 2SS peer is refused rather than narrowed.
+    let two_ss = Peer {
+        legacy: 0xfff,
+        mcs: [0xff, 0xff],
+        ht: true,
+        sgi: false,
+    };
+    let one_ss = Peer {
+        mcs: [0xff, 0],
+        ..two_ss
+    };
+    if Ra::new(two_ss, 0x0fff_ffff, 1, false).is_ok() {
+        return TestResult::Fail("8723bu admitted a 2SS peer");
+    }
+    let mut ra = match Ra::new(one_ss, 0x000f_ffff, 1, false) {
+        Ok(ra) => ra,
+        Err(_) => return TestResult::Fail("8723bu 1SS peer refused"),
+    };
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    if narf_scheduler::block_on(owner.ra_watchdog_8723b(&mut ra, -40)).is_err() {
+        return TestResult::Fail("8723bu RA watchdog failed");
+    }
+    let words = h2c_words(&io);
+    let ext =
+        io.0.lock()
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Write(a, _) if (0x01f0..0x0200).contains(a)));
+    if words.first().map(|w| w[0]) != Some(0x42) || ext && words.len() == 1 {
+        return TestResult::Fail("8723bu RSSI report not 4 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_packet_signal_and_ra
+);

@@ -74,6 +74,7 @@ mod rtl8192e_tables;
 pub mod rtl8723b;
 pub mod rtl8723b_init;
 mod rtl8723b_iqk;
+mod rtl8723b_packet;
 mod rtl8723b_phy;
 mod rtl8723b_power;
 mod rtl8723b_radio;

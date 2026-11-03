@@ -1423,8 +1423,21 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   Linux only warns on are terminal `PowerTimeout`. The owner's park path
   (`power_off_stopped`) dispatches RTL8723BU to this sequence.
 
-Packet codec, RA, BT coexistence, signed records and the station are not
-implemented, and the production probe does not start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
+- Packet codec and RA (`rtl8xxxu/rtl8723b_packet.rs`): `rtl8723bu_fops`
+  shares `txdesc40`, `rtl8xxxu_fill_txdesc_v2`, `rtl8xxxu_parse_rxdesc24` and
+  the gen2 `update_rate_mask`/`report_connect` with the RTL8192EU, and none
+  of those Linux paths has an RTL8723B branch, so the 8723BU uses
+  `rtl8192e_packet` and the gen2 `packet_transport` codec
+  (`packet_transport::Owner::new_8192e` with `Owner::queues_8723b()`), and
+  `rtl8192e_ra::Ra` with `tx_paths = 1` (a 2SS peer is refused, never
+  narrowed). Chip-specific: `rtl8723b_packet::signal` (`rtl8723b_cck_rssi`:
+  LNA 6/4/1/0 → −34/−14/6/16 − 2·VGA, any other LNA index 0 as Linux; OFDM
+  PWDB as gen2) and the 4-byte `RSSI_SETTING`
+  (`rtl8xxxu_gen2_report_rssi` truncates for RTL8723B) in
+  `Owner::ra_watchdog_8723b`.
+
+BT coexistence, signed records and the station are not implemented, and
+the production probe does not start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
 `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
