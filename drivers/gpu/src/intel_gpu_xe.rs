@@ -50,6 +50,55 @@ pub(crate) fn low_latency_supported(info: &DeviceInfo) -> bool {
             })
 }
 
+/// DRM_XE_EXEC_QUEUE_SET_PROPERTY_PXP_TYPE and enum drm_xe_pxp_session_type.
+const PXP_TYPE: u32 = 2;
+const PXP_TYPE_NONE: u64 = 0;
+const PXP_TYPE_HWDRM: u64 = 1;
+/// MAX_USER_EXTENSIONS of xe_bo.c::gem_create_user_extensions.
+const MAX_USER_EXTENSIONS: usize = 16;
+
+/// xe_pxp_is_enabled(xe->pxp) is false on every NARF device: Linux enables
+/// PXP only with CONFIG_INTEL_MEI_GSC_PROXY (xe_pxp_is_supported), and NARF
+/// has no MEI GSC proxy component, so every protected request is -ENODEV.
+fn pxp_disabled() -> FsError {
+    FsError::NoDevice
+}
+
+/// xe_bo.c::gem_create_user_extensions over DRM_XE_GEM_CREATE_EXTENSION_
+/// SET_PROPERTY chains, in its check order: the user extension header
+/// (copy, pad, name), the set-property body (copy, property, pad), then
+/// gem_create_set_pxp_type. The result is applied after the object exists,
+/// as xe_gem_create_ioctl runs the chain after xe_bo_create_user. More than
+/// MAX_USER_EXTENSIONS is Linux's -E2BIG, which `FsError` cannot carry, so
+/// it is -EINVAL here.
+fn gem_create_extensions(user: &dyn IoctlContext, mut next: u64) -> Result<(), FsError> {
+    let mut count = 0;
+    while next != 0 {
+        if count >= MAX_USER_EXTENSIONS {
+            return Err(FsError::InvalidData);
+        }
+        let base = read(user, next, 16)?;
+        // struct drm_xe_user_extension: name 8, pad 12.
+        if u32_at(&base, 12) != 0 || u32_at(&base, 8) >= 1 {
+            return Err(FsError::InvalidData);
+        }
+        // struct drm_xe_ext_set_property: property 16, pad 20, value 24.
+        let ext = read(user, next, 48)?;
+        if u32_at(&ext, 16) >= 1 || u32_at(&ext, 20) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        // gem_create_set_pxp_type, then xe_pxp_key_assign(NULL): -ENODEV.
+        match u64_at(&ext, 24) {
+            PXP_TYPE_NONE => {}
+            PXP_TYPE_HWDRM => return Err(pxp_disabled()),
+            _ => return Err(FsError::InvalidData),
+        }
+        next = u64_at(&base, 0);
+        count += 1;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Queue {
     vm: Arc<Vm>,
@@ -133,7 +182,6 @@ impl XeFile {
             abi::DEVICE_QUERY => crate::intel_gpu_xe_query::query(info, address, user),
             abi::GEM_CREATE => {
                 let mut wire = read(user, address, 56)?;
-                zero(&wire[..8])?;
                 zero(&wire[34..56])?;
                 let size = u64_at(&wire, 8);
                 let placement = u32_at(&wire, 16);
@@ -179,6 +227,10 @@ impl XeFile {
                 // xe_ttm_tt_create: dGPU system memory is always WB (PCIe
                 // snoops); an iGPU WC object's pages are write-combining.
                 let wc = caching == 2 && !info.platform.is_discrete();
+                // Read the extension chain before any lock; its verdict
+                // applies once the object exists, as xe_gem_create_ioctl
+                // runs gem_create_user_extensions after xe_bo_create_user.
+                let extensions = gem_create_extensions(user, u64_at(&wire, 0));
                 // Serialize VM removal through allocation/copyout/publication.
                 let names = self.names.lock();
                 let vm = if u32_at(&wire, 24) != 0 {
@@ -205,6 +257,8 @@ impl XeFile {
                     vm.as_ref().map(|vm| vm.identity),
                     memory,
                     |handle, _| {
+                        // A refused extension drops the new object unpublished.
+                        extensions?;
                         put32(&mut wire, 28, handle);
                         user.write(address, &wire)
                     },
@@ -406,6 +460,13 @@ impl XeFile {
                 0 => return Err(FsError::InvalidData),
                 1 if (1..=100_000).contains(&value) => timeslice = value as u32,
                 1 => return Err(FsError::InvalidData),
+                // xe_exec_queue.c::exec_queue_set_pxp_type: NONE is the
+                // default; only HWDRM is a session type, and without an
+                // enabled PXP (xe->pxp is NULL: no MEI GSC proxy, see
+                // xe_pxp_is_supported) it is -ENODEV.
+                PXP_TYPE if value == PXP_TYPE_NONE => {}
+                PXP_TYPE if value != PXP_TYPE_HWDRM => return Err(FsError::InvalidData),
+                PXP_TYPE => return Err(pxp_disabled()),
                 _ => return Err(FsError::NotImplemented),
             }
             extensions = u64_at(&ext, 0);
@@ -522,7 +583,6 @@ impl XeFile {
         gem: &GemState,
     ) -> Result<(), FsError> {
         let mut wire = read(user, address, 56)?;
-        zero(&wire[..8])?;
         zero(&wire[34..56])?;
         let size = u64_at(&wire, 8);
         let placement = u32_at(&wire, 16);
@@ -543,6 +603,10 @@ impl XeFile {
         {
             return Err(FsError::InvalidData);
         }
+        // gem_create_user_extensions' verdict, applied once the object
+        // exists (xe_gem_create_ioctl), never before a VM or allocation
+        // refusal.
+        let extensions = gem_create_extensions(user, u64_at(&wire, 0));
         let vm_id = u32_at(&wire, 24);
         let vm = if vm_id == 0 {
             None
@@ -559,6 +623,7 @@ impl XeFile {
                 vm.check()?;
             }
             gem.create_for_vm(size, owner, |handle, _| {
+                extensions?;
                 put32(&mut wire, 28, handle);
                 user.write(address, &wire)
             })?;
@@ -578,6 +643,7 @@ impl XeFile {
                     vm.check()?;
                 }
                 gem.create_for_vm(size, owner, |handle, _| {
+                    extensions?;
                     put32(&mut wire, 28, handle);
                     user.write(address, &wire)
                 })?;
@@ -586,6 +652,9 @@ impl XeFile {
             }
             Err(error) => return Err(error),
         };
+        // The VRAM object exists: a refused extension drops it unpublished,
+        // before any clear is submitted.
+        extensions?;
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
         let epoch = backend
             .status()

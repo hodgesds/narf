@@ -316,6 +316,20 @@ fn query_wire(
             }
             reply
         }
+        // xe_query.c::query_pxp_status: size negotiation, an exact
+        // drm_xe_query_pxp_status size, then xe_pxp_get_readiness_status,
+        // which is -ENODEV while xe->pxp is NULL. PXP needs the GSC proxy's
+        // MEI component (xe_pxp_is_supported), which NARF does not have.
+        9 => {
+            let size = u32_at(wire, 12);
+            if size != 0 {
+                if size != 8 {
+                    return Err(FsError::InvalidData);
+                }
+                return Err(FsError::NoDevice);
+            }
+            vec![0; 8]
+        }
         10 => crate::intel_gpu_eu_stall::query(
             info.backend
                 .as_ref()

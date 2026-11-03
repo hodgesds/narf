@@ -131,7 +131,10 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
     }
     // There is no create property or dynamic low-latency mutation in Xe.
     // Unknown properties and the unsupported runtime setter stay refused.
-    for property in [2, 3, 6] {
+    // PXP_TYPE (2) follows exec_queue_set_pxp_type: its NONE value is
+    // accepted, and smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos
+    // pins every PXP_TYPE errno.
+    for property in [3, 6] {
         queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
         let mut ext = [0; 48];
         put32(&mut ext, 16, property);

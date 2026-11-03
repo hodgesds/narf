@@ -1520,6 +1520,9 @@ mod timestamps {
 mod waits {
     include!("intel_gpu_xe_wait_tests.rs");
 }
+mod pxp {
+    include!("intel_gpu_xe_pxp_tests.rs");
+}
 
 mod multi_ccs {
     include!("intel_gpu_multi_ccs_tests.rs");
