@@ -410,7 +410,7 @@ impl Hardware {
             || self
                 .mld_link
                 .as_ref()
-                .is_some_and(|binding| binding.secondary().is_some())
+                .is_some_and(|binding| !binding.association_only())
         {
             return Err("P2P START requires its actual idle native adapter");
         }

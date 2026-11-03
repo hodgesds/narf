@@ -87,6 +87,9 @@ pub struct Connection {
     /// Internal MLO scan, measurements and link-selection triggers.
     mlo_select: super::sc_emlsr::Selector,
     active_request: Option<u16>,
+    /// The association link's final PHY/LINK/STA/TLC bodies, retained so a
+    /// primary-link switch can deactivate and later restore it.
+    mld_association: Option<super::sc_mlo_assoc::AssociationBodies>,
     client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
@@ -143,14 +146,30 @@ impl core::fmt::Debug for AuthMethod {
 
 impl Connection {
     fn admits_channel(&self, mpdu: &scan_api::Mpdu<'_>) -> bool {
-        if self.mld.as_ref().is_some_and(|mld| !mld.owns_mpdu(mpdu)) {
-            return false;
+        let received = super::native_band::Channel::received(mpdu.channel, mpdu.raw_band, true);
+        if let Some(mld) = &self.mld {
+            // Each active owner admits its own channel (iwl mld resolves
+            // the receiving link from the firmware link id).
+            return received.is_some() && mld.owner_channel(mpdu) == received;
         }
-        super::native_band::Channel::received(mpdu.channel, mpdu.raw_band, true)
+        received
             == Some(super::native_band::Channel {
                 band: self.beacon.band,
                 number: self.beacon.channel,
             })
+    }
+    /// The accepted further link that received `mpdu`, or None for the
+    /// association link (whose facts live in this connection).
+    fn receiving_further(
+        &self,
+        mpdu: &scan_api::Mpdu<'_>,
+    ) -> Option<&super::sc_mlo_assoc::ValidLink> {
+        let mld = self.mld.as_ref()?;
+        let link = mld.receiving_link(mpdu)?;
+        if link == mld.association().spec_link {
+            return None;
+        }
+        self.mld_links.iter().find(|valid| valid.link_id() == link)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn open_model() -> Self {
@@ -205,6 +224,7 @@ impl Connection {
             emlsr: super::sc_emlsr::Emlsr::default(),
             mlo_select: super::sc_emlsr::Selector::default(),
             active_request: None,
+            mld_association: None,
             client: None,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -804,6 +824,7 @@ impl Connection {
             emlsr: super::sc_emlsr::Emlsr::default(),
             mlo_select: super::sc_emlsr::Selector::default(),
             active_request: None,
+            mld_association: None,
             client,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -1148,7 +1169,7 @@ impl Connection {
         );
         this.phy.apply_phy(&mut phy_command, this.beacon.channel);
         hw.station_phy(&phy_command, this.beacon.channel).await?;
-        {
+        let association_link = {
             let mut link = station_api::link_channel(
                 2,
                 local,
@@ -1183,7 +1204,8 @@ impl Connection {
             }
             hw.station_link(&mut link);
             hw.command(3, 9, &link).await?;
-        }
+            link
+        };
         let mut peer = station_api::peer(this.beacon.bssid);
         this.phy.apply_peer(&mut peer, response.aid);
         if let Some(he) = this.he {
@@ -1241,6 +1263,14 @@ impl Connection {
             eht.apply_tlc(&mut tlc);
         }
         hw.station_tlc(&tlc).await?;
+        if this.mld.is_some() {
+            this.mld_association = Some(super::sc_mlo_assoc::AssociationBodies {
+                phy: phy_command,
+                link: association_link,
+                peer,
+                tlc,
+            });
+        }
         if let Some(six) = &this.six {
             six.apply_pending(hw).await?;
             hw.install_six_tx_profile(six.clone())?;
@@ -2030,7 +2060,9 @@ impl Connection {
         hw.service_p2p_client().await?;
         self.check_six_pending(hw)?;
         hw.service_six_power().await?;
-        if !self.power_pending {
+        // The association link's power names FWlink0; while a primary-link
+        // switch has it inactive the update waits for its restoration.
+        if !self.power_pending || self.association_key_mask().is_none() {
             return Ok(());
         }
         if self.power_inflight {
@@ -2241,18 +2273,20 @@ impl Connection {
         if frame.first().is_none_or(|fc| fc & 15 != 8) {
             return true;
         }
+        // A further link's data is admitted against that link's own
+        // negotiated PHY/HE/EHT facts.
+        let further = self.receiving_further(mpdu);
+        let (phy, he, eht) = match further {
+            Some(link) => (link.negotiated_phy(), link.he(), link.eht()),
+            None => (&self.phy, self.he, self.eht.as_deref()),
+        };
         if frame.len() < 24
             || self.six.is_some() && !matches!((mpdu.rate_n_flags >> 8) & 7, 1 | 4 | 5)
-            || !self.phy.admits_wide_rx(self.local_phy, mpdu.rate_n_flags)
+            || !phy.admits_wide_rx(self.local_phy, mpdu.rate_n_flags)
             || (mpdu.rate_n_flags >> 8) & 7 >= 5
-                && self
-                    .eht
-                    .as_ref()
-                    .is_none_or(|eht| !eht.admits_rx_rate(mpdu.rate_n_flags))
+                && eht.is_none_or(|eht| !eht.admits_rx_rate(mpdu.rate_n_flags))
             || (mpdu.rate_n_flags >> 8) & 7 == 4
-                && self
-                    .he
-                    .is_none_or(|he| !he.admits_rx_rate(mpdu.rate_n_flags))
+                && he.is_none_or(|he| !he.admits_rx_rate(mpdu.rate_n_flags))
         {
             return false;
         }
@@ -2260,7 +2294,7 @@ impl Connection {
             return true;
         }
         frame[0] == 0x88
-            && self.he.is_some_and(|he| he.negotiation.htc_he())
+            && he.is_some_and(|he| he.negotiation.htc_he())
             && frame.get(26..30).is_some_and(|control| control[0] & 3 == 3)
     }
 
@@ -2286,7 +2320,15 @@ impl Connection {
             mld.confirm_mpdu_beacon(mpdu)?;
         }
         if frame.len() >= 24 && frame[10..16] == peer && frame[16..22] == peer {
-            if frame[0] == 0x80 {
+            if frame[0] == 0x80 && self.receiving_further(mpdu).is_some() {
+                // A further active link's beacon was proven above against
+                // its own spec link; the association link's PHY/power facts
+                // are not compared with another link's operation. Any
+                // active link's beacon keeps the host beacon monitor alive
+                // (iwl mld sets CONNECTION_MONITOR; per-link loss is the
+                // firmware's MISSED_BEACONS_NOTIF).
+                self.last_beacon = narf_time::now_cycles();
+            } else if frame[0] == 0x80 {
                 if let Some(six) = &self.six {
                     let result = mpdu
                         .body(24, 0)
@@ -2431,7 +2473,7 @@ impl Connection {
             return None;
         }
         let link = mld.receiving_link(mpdu)?;
-        if link == mld.primary().spec_link {
+        if link == mld.association().spec_link {
             return None;
         }
         self.mld_links
@@ -2534,7 +2576,10 @@ impl Connection {
     /// Firmware PHY ids with a channel context: the association link's
     /// PHY0 and an active further link's PHY.
     fn active_phy_ids(&self) -> Vec<u8> {
-        let mut phys = alloc::vec![0u8];
+        let mut phys = Vec::new();
+        if self.mld.as_ref().is_none_or(|mld| mld.association_active()) {
+            phys.push(0u8);
+        }
         phys.extend(
             self.mld_links
                 .iter()
@@ -2589,18 +2634,19 @@ impl Connection {
             return;
         };
         let bssid = &frame[16..22];
-        let primary = binding.primary();
-        let spec_link = if bssid == primary.peer_link && mpdu.channel == primary.channel.number {
-            primary.spec_link
-        } else if let Some(link) = self
-            .mld_links
-            .iter()
-            .find(|l| l.beacon.bssid == bssid && l.channel().number == mpdu.channel)
-        {
-            link.link_id()
-        } else {
-            return;
-        };
+        let association = binding.association();
+        let spec_link =
+            if bssid == association.peer_link && mpdu.channel == association.channel.number {
+                association.spec_link
+            } else if let Some(link) = self
+                .mld_links
+                .iter()
+                .find(|l| l.beacon.bssid == bssid && l.channel().number == mpdu.channel)
+            {
+                link.link_id()
+            } else {
+                return;
+            };
         let util = mpdu
             .body(24, 0)
             .and_then(|body| body.get(12..))
@@ -2624,12 +2670,13 @@ impl Connection {
         let Some(binding) = self.mld.as_ref() else {
             return;
         };
-        let primary = *binding.primary();
+        let association = *binding.association();
+        let association_phy = binding.association_active().then_some(0u8);
         let active = self.mld_active_links();
         let mut candidates = Vec::new();
         for seen in &self.mlo_select.seen {
-            let (channel, phy, phy_id) = if seen.spec_link == primary.spec_link {
-                (primary.channel, &self.phy, Some(0u8))
+            let (channel, phy, phy_id) = if seen.spec_link == association.spec_link {
+                (association.channel, &self.phy, association_phy)
             } else if let Some(valid) = self
                 .mld_links
                 .iter()
@@ -2749,7 +2796,7 @@ impl Connection {
             return Ok(());
         };
         let primary = *binding.primary();
-        let mut channels = alloc::vec![primary.channel];
+        let mut channels = alloc::vec![binding.association().channel];
         for link in &self.mld_links {
             if link.keys.is_some() && !channels.contains(&link.channel()) {
                 channels.push(link.channel());
@@ -2764,11 +2811,16 @@ impl Connection {
         Ok(())
     }
 
-    /// Apply a pending active-link set (`_ieee80211_set_active_links`).
-    /// The association link stays the firmware primary owner: a set that
-    /// names only a further link keeps the association link alone, since
-    /// primary-link switching is not implemented. Activation drains TX
-    /// first (`activate_mld_link`).
+    /// Apply a pending active-link set (mac80211
+    /// `_ieee80211_set_active_links`, iwl mld at most two active links).
+    /// Every named link must be valid and hold its keys: the association
+    /// link, or an accepted further link with its MLO GTK. A set naming
+    /// only a further link is a primary-link switch: that link is added
+    /// (if inactive) and then the association link is deactivated, as
+    /// mac80211 adds new links before releasing removed ones; the
+    /// association link later returns with its fixed identity and retained
+    /// facts. When adding would exceed two links, removal goes first.
+    /// TX is drained around each change.
     async fn service_active_links(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         let Some(target) = self.active_request.take() else {
             return Ok(());
@@ -2776,31 +2828,225 @@ impl Connection {
         let Some(binding) = self.mld.clone() else {
             return Ok(());
         };
-        let primary = binding.primary().spec_link;
-        let wanted = if target & (1 << primary) != 0 {
-            target & !(1u16 << primary)
-        } else {
-            0
-        };
-        let current = binding.secondary().map(|owner| owner.spec_link);
-        if let Some(link) = current {
-            if wanted & (1 << link) == 0 {
+        let association = binding.association().spec_link;
+        let usable = self
+            .mld_links
+            .iter()
+            .filter(|valid| valid.keys.is_some())
+            .fold(1u16 << association, |mask, valid| {
+                mask | 1 << valid.link_id()
+            });
+        let current = binding.active_links();
+        if target == 0
+            || target & !usable != 0
+            || target.count_ones() as usize > super::sc_mlo::MAX_ACTIVE_LINKS
+            || target == current
+            || !self.authorized
+            || target & (1 << association) == 0 && self.mld_association.is_none()
+        {
+            return Ok(());
+        }
+        let add = target & !current;
+        let remove = current & !target;
+        let remove_first =
+            (current.count_ones() + add.count_ones()) as usize > super::sc_mlo::MAX_ACTIVE_LINKS;
+        if remove_first {
+            self.remove_links(hw, remove).await?;
+        }
+        for link in (0..15u8).filter(|link| add & (1 << link) != 0) {
+            if link == association {
+                self.restore_association_link(hw).await?;
+            } else {
+                self.activate_mld_link(hw, link).await?;
+            }
+        }
+        if !remove_first {
+            self.remove_links(hw, remove).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_links(&mut self, hw: &mut Hardware, remove: u16) -> Result<(), &'static str> {
+        let association = self
+            .mld
+            .as_ref()
+            .ok_or("no native MLD association")?
+            .association()
+            .spec_link;
+        for link in (0..15u8).filter(|link| remove & (1 << link) != 0) {
+            if link == association {
+                self.deactivate_association_link(hw).await?;
+            } else {
                 self.deactivate_mld_link(hw, link).await?;
             }
         }
-        let link = wanted.trailing_zeros() as u8;
-        // Only a valid link holding its group keys can be added; any other
-        // request is dropped before a device-visible command.
-        if wanted != 0
-            && current.is_none_or(|current| wanted & (1 << current) == 0)
-            && self
-                .mld_links
-                .iter()
-                .any(|valid| valid.link_id() == link && valid.keys.is_some())
-        {
-            self.activate_mld_link(hw, link).await?;
-        }
         Ok(())
+    }
+
+    /// The association link's PHY/LINK/STA/power and TLC bodies for its
+    /// fixed FWlink0/STA0/PHY0 identity, from the retained post-response
+    /// bodies and its committed TX power (Linux mld/power.c
+    /// `iwl_mld_set_tx_power` SET_LINK, v10/v11 only).
+    fn association_further(
+        &self,
+        hw: &Hardware,
+    ) -> Result<(super::sc_mlo::FurtherLink, [u8; 44]), &'static str> {
+        let binding = self.mld.as_ref().ok_or("no native MLD association")?;
+        let bodies = self
+            .mld_association
+            .ok_or("native MLD association link bodies absent")?;
+        let owner = *binding.association();
+        let version = hw.version(1, 0x9f).ok_or("missing TX power command")?.0;
+        if !matches!(version, 10 | 11) {
+            return Err("native MLD per-link TX power command absent");
+        }
+        let mut power = station_api::tx_power(version, self.regulatory.power())?;
+        put32(&mut power, 4, u32::from(owner.fw_link));
+        let mut tlc = bodies.tlc;
+        put32(&mut tlc, 0, 1 << owner.station);
+        Ok((
+            super::sc_mlo::FurtherLink {
+                owner,
+                phy_id: 0,
+                phy: bodies.phy,
+                link: bodies.link,
+                peer: bodies.peer,
+                power,
+            },
+            tlc,
+        ))
+    }
+
+    /// The association link's group keys (GTK 1..3 at their current RX PN
+    /// floor, IGTKs at their BIP floor) for its link STA only
+    /// (`iwl_mld_get_key_sta_mask`, installed by `ieee80211_key_switch_links`).
+    fn association_group_keys(&self) -> Vec<super::sc_mlo::LinkKey<'_>> {
+        let mut keys = Vec::new();
+        for (id, key) in self.group_keys.iter().enumerate().skip(1) {
+            if let Some(key) = key {
+                keys.push(super::sc_mlo::LinkKey {
+                    id: id as u8,
+                    key,
+                    rx_pn: self.replay.group[id].iter().copied().max().unwrap_or(0),
+                });
+            }
+        }
+        if self.mfp_active {
+            for igtk in [&self.mfp.active, &self.mfp.next].into_iter().flatten() {
+                keys.push(super::sc_mlo::LinkKey {
+                    id: igtk.key_id as u8,
+                    key: &igtk.key,
+                    rx_pn: igtk.rx_pn,
+                });
+            }
+        }
+        keys
+    }
+
+    /// The STA mask the association link's group keys name, or None while
+    /// the association link is inactive after a primary-link switch: its
+    /// changed keys are then retained and installed when it returns.
+    fn association_key_mask(&self) -> Option<u32> {
+        match &self.mld {
+            Some(mld) if !mld.association_active() => None,
+            Some(mld) => Some(1 << mld.association().station),
+            None => Some(1),
+        }
+    }
+
+    fn baid_tids(&self) -> Vec<u8> {
+        (0..self.rx_ba.len() as u8)
+            .filter(|&tid| self.rx_ba[usize::from(tid)].is_some())
+            .collect()
+    }
+
+    /// Deactivate the association link while a further link stays active
+    /// (the primary-link switch's removal half): the same order as a
+    /// further link's removal, with the association group keys removed from
+    /// STA0. The association link stays valid with its keys and facts.
+    async fn deactivate_association_link(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        let binding = self.mld.clone().ok_or("no native MLD association")?;
+        if !binding.association_active() || binding.secondary().is_none() {
+            return Err("native MLD association link cannot be deactivated now");
+        }
+        let (further, _) = self.association_further(hw)?;
+        let group_ids: Vec<u8> = self.association_group_keys().iter().map(|k| k.id).collect();
+        let baid_tids = self.baid_tids();
+        let pairwise = self.pairwise_key.is_some().then_some(self.pmf_negotiated);
+        hw.drain_transmits().await?;
+        let next = super::sc_mlo::deactivate_further_link(
+            hw, &binding, &further, pairwise, &baid_tids, &group_ids,
+        )
+        .await?;
+        hw.install_mld_link(next.clone())?;
+        self.mld = Some(next);
+        self.emlsr
+            .links_activated(self.mld_active_links(), now_ms());
+        Ok(())
+    }
+
+    /// Restore the association link beside the active further link, with
+    /// its fixed FWlink0/STA0/PHY0 identity, retained PHY/LINK/STA/TLC
+    /// facts, committed power and current group keys.
+    async fn restore_association_link(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        let binding = self.mld.clone().ok_or("no native MLD association")?;
+        if binding.association_active() || binding.secondary().is_some() || hw.is_mvm89() {
+            return Err("native MLD association link cannot be restored now");
+        }
+        let (further, tlc) = self.association_further(hw)?;
+        let owner = further.owner;
+        // The fixed ids must be free in the shared device pool.
+        let mut ids = hw.mld_fw_ids()?;
+        for active in binding.owners() {
+            ids.claim(active.fw_link, active.station)?;
+        }
+        ids.claim(owner.fw_link, owner.station)?;
+        if self
+            .mld_links
+            .iter()
+            .any(|valid| valid.active.is_some_and(|(_, phy)| phy == further.phy_id))
+        {
+            return Err("native MLD association PHY0 is owned by another link");
+        }
+        let baid_tids = self.baid_tids();
+        let pairwise = self.pairwise_key.is_some().then_some(self.pmf_negotiated);
+        hw.drain_transmits().await?;
+        let next = super::sc_mlo::activate_further_link(
+            hw,
+            &binding,
+            &further,
+            pairwise,
+            &baid_tids,
+            &self.association_group_keys(),
+        )
+        .await?;
+        if let Err(error) = hw.station_tlc(&tlc).await {
+            hw.fail();
+            return Err(error);
+        }
+        hw.install_mld_link(next.clone())?;
+        self.mld = Some(next);
+        self.mlo_select.last_activation_ms = Some(now_ms());
+        self.emlsr
+            .links_activated(self.mld_active_links(), now_ms());
+        Ok(())
+    }
+
+    /// Return to the association link alone (before disconnect): restore it
+    /// if a primary-link switch removed it, then remove any further link.
+    async fn restore_association_only(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        let Some(binding) = self.mld.clone() else {
+            return Ok(());
+        };
+        if binding.association_only() {
+            return Ok(());
+        }
+        if !binding.association_active() {
+            self.restore_association_link(hw).await?;
+        }
+        let association = binding.association().spec_link;
+        let further = self.mld_active_links() & !(1u16 << association);
+        self.remove_links(hw, further).await
     }
 
     /// Adopt one further link's authenticated MLO GTK/IGTK. An inactive
@@ -2900,16 +3146,25 @@ impl Connection {
             .ok_or("native MLD link is not a valid accepted link")?;
         if !self.authorized
             || binding.secondary().is_some()
+            || self.mld_links[index].active.is_some()
             || self.mld_links[index].keys.is_none()
             || hw.is_mvm89()
         {
             return Err("native MLD further link cannot be activated now");
         }
-        let primary = *binding.primary();
+        // Every active owner's ids stay claimed (the shared device pool).
         let mut ids = hw.mld_fw_ids()?;
-        ids.claim(primary.fw_link, primary.station)?;
+        for owner in binding.owners() {
+            ids.claim(owner.fw_link, owner.station)?;
+        }
         let (fw_link, station) = ids.allocate()?;
-        let phy_id = hw.mld_phy_ids().allocate()?;
+        let mut phys = hw.mld_phy_ids();
+        for valid in &self.mld_links {
+            if let Some((_, phy)) = valid.active {
+                phys.claim(phy);
+            }
+        }
+        let phy_id = phys.allocate()?;
         let valid = &self.mld_links[index];
         let owner = super::sc_mlo::LinkOwner {
             spec_link: link_id,
@@ -2921,9 +3176,7 @@ impl Connection {
         };
         let further = valid.further_link(hw, owner, phy_id)?;
         let tlc = valid.tlc(hw, station)?;
-        let baid_tids: Vec<u8> = (0..self.rx_ba.len() as u8)
-            .filter(|&tid| self.rx_ba[usize::from(tid)].is_some())
-            .collect();
+        let baid_tids = self.baid_tids();
         let pairwise = self.pairwise_key.is_some().then_some(self.pmf_negotiated);
         hw.drain_transmits().await?;
         let next = super::sc_mlo::activate_further_link(
@@ -2948,8 +3201,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Deactivate the active further link, the inverse of
-    /// `activate_mld_link`; the link stays valid with its keys retained.
+    /// Deactivate an active further link, the inverse of
+    /// `activate_mld_link`, while another link stays active; the link stays
+    /// valid with its keys retained.
     pub async fn deactivate_mld_link(
         &mut self,
         hw: &mut Hardware,
@@ -2965,9 +3219,7 @@ impl Connection {
         let (owner, phy_id) = valid.active.ok_or("native MLD link is not active")?;
         let further = valid.further_link(hw, owner, phy_id)?;
         let group_ids: Vec<u8> = valid.group_keys().iter().map(|key| key.id).collect();
-        let baid_tids: Vec<u8> = (0..self.rx_ba.len() as u8)
-            .filter(|&tid| self.rx_ba[usize::from(tid)].is_some())
-            .collect();
+        let baid_tids = self.baid_tids();
         let pairwise = self.pairwise_key.is_some().then_some(self.pmf_negotiated);
         hw.drain_transmits().await?;
         let next = super::sc_mlo::deactivate_further_link(
@@ -3159,19 +3411,23 @@ impl Connection {
             // higher EAPOL replay counter with the SAME GTK. Reinstalling
             // it would reset firmware/host packet numbers (KRACK).
             if self.group_keys[id] != Some(keys.group) {
-                if self.group_keys[id].is_some() {
-                    remove_key(hw, 1, keys.group_id, true, self.pmf_negotiated).await?;
+                // An association link a primary-link switch deactivated
+                // keeps its new GTK for its restoration.
+                if let Some(mask) = self.association_key_mask() {
+                    if self.group_keys[id].is_some() {
+                        remove_key(hw, mask, keys.group_id, true, self.pmf_negotiated).await?;
+                    }
+                    install_key(
+                        hw,
+                        mask,
+                        keys.group_id,
+                        true,
+                        self.pmf_negotiated,
+                        &keys.group,
+                        keys.group_rx_pn,
+                    )
+                    .await?;
                 }
-                install_key(
-                    hw,
-                    1,
-                    keys.group_id,
-                    true,
-                    self.pmf_negotiated,
-                    &keys.group,
-                    keys.group_rx_pn,
-                )
-                .await?;
                 if let Some(old) = &mut self.group_keys[id] {
                     old.zeroize();
                 }
@@ -3193,10 +3449,12 @@ impl Connection {
                 if !(4..=5).contains(&key_id) {
                     return Err("invalid IGTK key index");
                 }
-                if self.mfp.find_by_key_id(key_id).is_some() {
-                    remove_key(hw, 1, key_id as u8, true, true).await?;
+                if let Some(mask) = self.association_key_mask() {
+                    if self.mfp.find_by_key_id(key_id).is_some() {
+                        remove_key(hw, mask, key_id as u8, true, true).await?;
+                    }
+                    install_key(hw, mask, key_id as u8, true, true, &material, ipn).await?;
                 }
-                install_key(hw, 1, key_id as u8, true, true, &material, ipn).await?;
                 pending_igtk = Some((material, key_id, ipn));
             }
         }
@@ -3295,6 +3553,9 @@ impl Connection {
     pub async fn disconnect(mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         self.authorized = false;
         hw.close_receive_epoch()?;
+        // The teardown below names the association link's FWlink0/STA0/PHY0:
+        // first return to that link alone.
+        self.restore_association_only(hw).await?;
         for tid in 0..self.rx_ba.len() {
             self.stop_rx_ba(hw, tid as u8).await?;
         }

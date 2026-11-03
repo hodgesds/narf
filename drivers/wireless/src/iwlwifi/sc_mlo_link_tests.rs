@@ -79,9 +79,41 @@ fn smoke_iwl_mld_further_link_owner_and_sta_mask() -> TestResult {
     if two.with_secondary(further(3, 2, 2)).is_ok() {
         return TestResult::Fail("third active link exceeded IWL_FW_MAX_ACTIVE_LINKS_NUM");
     }
-    let back = two.without_secondary();
-    if back.sta_mask() != 1 || back.secondary().is_some() {
+    let Ok(back) = two.without(2) else {
+        return TestResult::Fail("active further link could not be removed");
+    };
+    if back.sta_mask() != 1 || back.secondary().is_some() || !back.association_only() {
         return TestResult::Fail("removed further link still owns resources");
+    }
+    if back.without(back.association().spec_link).is_ok() {
+        return TestResult::Fail("the only active link was removed");
+    }
+    // Primary-link switch (mac80211 _ieee80211_set_active_links removing
+    // the association link): the further link becomes the serving owner.
+    let association = *two.association();
+    let Ok(switched) = two.without(association.spec_link) else {
+        return TestResult::Fail("association link could not be deactivated");
+    };
+    if switched.primary().spec_link != 2
+        || switched.association_active()
+        || switched.sta_mask() != 0b10
+        || switched.active_links() != 0b100
+        || *switched.association() != association
+    {
+        return TestResult::Fail("primary-link switch kept the association owner");
+    }
+    let moved = LinkOwner {
+        fw_link: 3,
+        ..association
+    };
+    if switched.with_secondary(moved).is_ok() {
+        return TestResult::Fail("association link restored with another identity");
+    }
+    let Ok(restored) = switched.with_secondary(association) else {
+        return TestResult::Fail("association link identity could not be restored");
+    };
+    if !restored.association_active() || restored.sta_mask() != 0b11 {
+        return TestResult::Fail("restored association link lost its STA");
     }
     TestResult::Pass
 }

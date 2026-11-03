@@ -102,6 +102,19 @@ pub(super) fn scan_candidates(
     Ok(found)
 }
 
+/// The association link's final native PHY_CONTEXT, LINK_CONFIG,
+/// STA_CONFIG and TLC bodies (as sent after the association response),
+/// retained so a primary-link switch can deactivate the association link
+/// and later restore it with the same facts and its fixed FWlink0/STA0/PHY0
+/// identity (mac80211 re-adding it to `active_links`).
+#[derive(Clone, Copy)]
+pub(super) struct AssociationBodies {
+    pub phy: [u8; 32],
+    pub link: [u8; 208],
+    pub peer: [u8; 104],
+    pub tlc: [u8; 44],
+}
+
 /// A further link the AP accepted (a valid, initially inactive link).
 pub(super) struct ValidLink {
     pub context: Context,
@@ -286,6 +299,14 @@ impl ValidLink {
     /// This link's negotiated PHY (width/center for link grading).
     pub fn negotiated_phy(&self) -> &super::ht_vht::Negotiated {
         &self.phy
+    }
+    /// This link's negotiated HE profile (RX rate admission).
+    pub fn he(&self) -> Option<super::sc_he::Profile> {
+        self.he
+    }
+    /// This link's negotiated EHT profile (RX rate admission).
+    pub fn eht(&self) -> Option<&super::sc_eht::Profile> {
+        self.eht.as_deref()
     }
     pub fn channel(&self) -> Channel {
         Channel {

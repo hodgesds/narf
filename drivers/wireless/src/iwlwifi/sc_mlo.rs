@@ -132,10 +132,15 @@ impl FwIds {
 #[derive(Clone)]
 pub(super) struct Binding {
     pub context: Context,
-    /// The association (default) link owner, never removed while bound.
+    /// The association link's fixed native identity (FWlink0/STA0/PHY0 of
+    /// the retained station producer). It stays valid while inactive and
+    /// is restored with exactly these ids.
+    association: LinkOwner,
+    /// The serving active owner: the association link until a primary-link
+    /// switch (mac80211 `_ieee80211_set_active_links` removing it) makes a
+    /// further link the only, or first, active owner.
     primary: LinkOwner,
-    /// Additional active owners; installed only by a complete
-    /// multiple-active-link setup (none exists yet).
+    /// The other active owner while two links are active (EMLSR).
     secondary: [Option<LinkOwner>; MAX_ACTIVE_LINKS - 1],
     auth: Vec<u8>,
     request: Vec<u8>,
@@ -155,26 +160,44 @@ impl Binding {
         }
         let own = Local::single_link(context.own_mld())
             .map_err(|_| "native MLD local address invalid")?;
+        // The retained station producer owns exactly FWlink0/STA0.
+        // AP spec ids may be any0..15 and never select a native queue.
+        let association = LinkOwner {
+            spec_link: context.link_id(),
+            channel,
+            fw_link: 0,
+            station: 0,
+            own_link,
+            peer_link,
+        };
         Ok(Arc::new(Self {
             context,
-            primary: LinkOwner {
-                spec_link: context.link_id(),
-                channel,
-                // The retained station producer owns exactly FWlink0/STA0.
-                // AP spec ids may be any0..15 and never select a native queue.
-                fw_link: 0,
-                station: 0,
-                own_link,
-                peer_link,
-            },
+            association,
+            primary: association,
             secondary: [None; MAX_ACTIVE_LINKS - 1],
             auth: own.authentication_element(),
             request: own.request_element(),
         }))
     }
-    /// The association link owner (Linux `mld_vif->deflink` analogue).
+    /// The serving active owner: management TX projection and the
+    /// internal MLO scan's serving link. Equal to `association()` until a
+    /// primary-link switch.
     pub fn primary(&self) -> &LinkOwner {
         &self.primary
+    }
+    /// The association link's fixed identity, active or not.
+    pub fn association(&self) -> &LinkOwner {
+        &self.association
+    }
+    /// Whether the association link currently has firmware ownership.
+    pub fn association_active(&self) -> bool {
+        self.owners()
+            .any(|owner| owner.spec_link == self.association.spec_link)
+    }
+    /// Whether the association link alone is active (no further-link or
+    /// switched ownership exists).
+    pub fn association_only(&self) -> bool {
+        self.secondary().is_none() && self.primary == self.association
     }
     pub fn owners(&self) -> impl Iterator<Item = &LinkOwner> {
         core::iter::once(&self.primary).chain(self.secondary.iter().flatten())
@@ -192,13 +215,19 @@ impl Binding {
     pub fn sta_mask(&self) -> u32 {
         self.owners().fold(0, |mask, link| mask | 1 << link.station)
     }
-    /// A copy with `owner` as the further active link. Every per-link
+    /// A copy with `owner` as the second active link. Every per-link
     /// identity (spec link, FW link, FW STA, physical own/peer address)
-    /// must be distinct from the association link and from the MLD
-    /// addresses, so no lookup can alias two owners.
+    /// must be distinct from the active owner and from the MLD addresses,
+    /// so no lookup can alias two owners. Restoring the association link
+    /// must name exactly its fixed identity (its physical addresses were
+    /// admitted at association and may equal the MLD addresses).
     pub fn with_secondary(&self, owner: LinkOwner) -> Result<Arc<Self>, &'static str> {
         let primary = self.primary;
         let unicast = |mac: [u8; 6]| mac[0] & 1 == 0 && mac != [0; 6];
+        let association = owner.spec_link == self.association.spec_link;
+        if association && owner != self.association {
+            return Err("native MLD association link restored with another identity");
+        }
         if self.secondary().is_some()
             || owner.spec_link >= 15
             || owner.station >= 32
@@ -207,10 +236,11 @@ impl Binding {
             || owner.station == primary.station
             || !unicast(owner.own_link)
             || !unicast(owner.peer_link)
-            || [primary.own_link, primary.peer_link, self.context.own_mld()]
-                .contains(&owner.own_link)
-            || [primary.own_link, primary.peer_link, self.context.peer_mld()]
-                .contains(&owner.peer_link)
+            || [primary.own_link, primary.peer_link].contains(&owner.own_link)
+            || [primary.own_link, primary.peer_link].contains(&owner.peer_link)
+            || !association
+                && (owner.own_link == self.context.own_mld()
+                    || owner.peer_link == self.context.peer_mld())
         {
             return Err("native MLD further link identity aliases an owner");
         }
@@ -218,11 +248,24 @@ impl Binding {
         next.secondary[0] = Some(owner);
         Ok(Arc::new(next))
     }
-    /// A copy with only the association link active.
-    pub fn without_secondary(&self) -> Arc<Self> {
+    /// A copy without the active owner of `spec_link`; the other active
+    /// owner remains (and becomes the serving owner when the primary is
+    /// removed: a primary-link switch). The last active owner is never
+    /// removed.
+    pub fn without(&self, spec_link: u8) -> Result<Arc<Self>, &'static str> {
+        let secondary = *self
+            .secondary()
+            .ok_or("native MLD cannot remove its only active link")?;
         let mut next = self.clone();
-        next.secondary = [None; MAX_ACTIVE_LINKS - 1];
-        Arc::new(next)
+        if secondary.spec_link == spec_link {
+            next.secondary = [None; MAX_ACTIVE_LINKS - 1];
+        } else if self.primary.spec_link == spec_link {
+            next.primary = secondary;
+            next.secondary = [None; MAX_ACTIVE_LINKS - 1];
+        } else {
+            return Err("native MLD removal does not name an active link");
+        }
+        Ok(Arc::new(next))
     }
     fn owner_of(&self, mpdu: &Mpdu<'_>) -> Option<&LinkOwner> {
         self.owners().find(|link| link.owns(mpdu))
@@ -234,10 +277,10 @@ impl Binding {
         body[26] = 1;
     }
     pub fn apply_link(&self, body: &mut [u8; 208]) {
-        apply_link_owner(self.primary(), body);
+        apply_link_owner(self.association(), body);
     }
     pub fn apply_peer(&self, body: &mut [u8; 104]) {
-        apply_peer_owner(&self.context, self.primary(), body);
+        apply_peer_owner(&self.context, self.association(), body);
     }
     pub fn authentication_element(&self) -> &[u8] {
         &self.auth
@@ -257,6 +300,10 @@ impl Binding {
     /// `iwl_mld_rx_fill_status` link_id from the firmware link).
     pub fn receiving_link(&self, mpdu: &Mpdu<'_>) -> Option<u8> {
         self.owner_of(mpdu).map(|link| link.spec_link)
+    }
+    /// The channel of the active owner that received `mpdu`.
+    pub fn owner_channel(&self, mpdu: &Mpdu<'_>) -> Option<Channel> {
+        self.owner_of(mpdu).map(|link| link.channel)
     }
     pub fn owns_mpdu(&self, mpdu: &Mpdu<'_>) -> bool {
         self.owner_of(mpdu).is_some()
@@ -289,7 +336,7 @@ impl Binding {
             && frame[16..22] == link.peer_link
     }
     pub fn confirm_beacon(&self, ies: &[u8]) -> Result<(), &'static str> {
-        self.confirm_link_beacon(self.primary(), ies)
+        self.confirm_link_beacon(self.association(), ies)
     }
     fn confirm_link_beacon(&self, link: &LinkOwner, ies: &[u8]) -> Result<(), &'static str> {
         let actual = BasicMultiLink::from_ies(ies)
@@ -538,12 +585,12 @@ pub(super) async fn deactivate_further_link(
     baid_tids: &[u8],
     group_ids: &[u8],
 ) -> Result<Arc<Binding>, &'static str> {
-    if binding.secondary() != Some(&further.owner)
+    if !binding.owners().any(|owner| *owner == further.owner)
         || group_ids.iter().any(|id| !(1..=7).contains(id))
     {
         return Err("native MLD further link removal does not name the active owner");
     }
-    let next = binding.without_secondary();
+    let next = binding.without(further.owner.spec_link)?;
     let result = remove_link_commands(
         hw,
         binding,

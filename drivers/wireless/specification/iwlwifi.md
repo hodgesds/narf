@@ -4316,8 +4316,36 @@ check) and the channel-load level rescan (`iwl_mld_emlsr_check_chan_load`).
 Written, unexecuted: `smoke_iwl_mld_link_grade_tables_chan_load_and_puncturing`,
 `smoke_iwl_mld_stats_tpt_and_internal_mlo_scan_selection`.
 
-Still open (`mlo` row not complete): primary-link switching (a set naming only the further link keeps the
-association link alone); the missed-beacon BSS-parameters-changed
+**Primary-link switching and further-link RX (pass 8).** An active-link
+set is applied as mac80211 `_ieee80211_set_active_links` drives iwl mld:
+every named link must be valid with its keys, at most two; new links are
+added before removed ones are released (removal first only when adding
+would exceed two). A set naming only a further link is a primary-link
+switch: that link is activated (if inactive), then the association link is
+deactivated in the further-link removal order (LINK MODIFY inactive, PHY0
+REMOVE, its GTK/IGTK REMOVE on STA0, queues/pairwise key/BAIDs narrowed to
+the further STA, STA0 REMOVE, FWlink0 REMOVE). `sc_mlo::Binding` keeps the
+association link's fixed identity (`association()`) separately from the
+serving owner (`primary()`, used for management projection and the internal
+MLO scan's serving link); `without(spec)` promotes the remaining owner. The
+association link's final post-response PHY/LINK/STA/TLC bodies are retained
+(`AssociationBodies`) and restore it with exactly FWlink0/STA0/PHY0, its
+committed power (SET_LINK FWlink0), its current GTKs at their RX PN floor
+and IGTKs, then TLC for STA0 (`iwl_mld_config_tlc_link`). While inactive,
+association-link GTK/IGTK rekeys update host state only and its AP power
+update waits; disconnect first returns to the association link alone.
+Further-link ids claim every active owner's FW link/STA and PHY.
+
+RX admission now follows the receiving owner: `admits_channel` accepts the
+channel of the owner the firmware link names (previously only the
+association channel, so further-link frames were dropped), data rate
+admission uses that link's own negotiated PHY/HE/EHT, and a further link's
+beacon refreshes the host beacon monitor without being compared with the
+association link's PHY/power facts (its MLE was proven per link). Group
+replay and BIP resolve the association link by its fixed spec id.
+Written, unexecuted: the extended `smoke_iwl_mld_further_link_owner_and_sta_mask`.
+
+Still open (`mlo` row not complete): the missed-beacon BSS-parameters-changed
 threshold and CQM beacon-loss/MLO-rescan path; advertised TID-to-link
 mapping (dormant links); 6GHz further links; and the public
 narf_wireless/nl80211 multiple-link surface (WIPHY_FLAG_SUPPORTS_MLO,
