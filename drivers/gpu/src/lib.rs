@@ -871,6 +871,8 @@ pub(crate) mod intel_gpu_xelpg_cdclk;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xelpg_dbuf;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_xelpg_dsc;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg_external;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg_hdmi;
