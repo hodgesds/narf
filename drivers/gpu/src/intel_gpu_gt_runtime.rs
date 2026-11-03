@@ -104,6 +104,8 @@ struct State {
     media_guc_reported: bool,
     /// One media-GT reset/recovery per GT0 incarnation after a media GuC fault.
     media_recovered: bool,
+    /// Routing GT1's VCS/VECS onto GT0's delivery failed; GT1 stays polled.
+    media_irq_failed: bool,
 }
 
 use crate::intel_gpu_gt::media::Retire as MediaRetire;
@@ -1110,6 +1112,7 @@ pub(crate) fn start_pending() {
                 media_guc_tried: false,
                 media_guc_reported: false,
                 media_recovered: false,
+                media_irq_failed: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -2281,8 +2284,30 @@ impl Owner {
             narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
                 == Ok(Some(narf_bus::pci::PciPowerState::D0))
         });
+        if !matches!(polled, core::task::Poll::Ready(Ok(MediaGucState::Running))) {
+            // Media sources are masked again before GT1 leaves Running.
+            if let Some(irq) = state.irq.as_ref() {
+                irq.unroute_media();
+            }
+        }
         match polled {
             core::task::Poll::Ready(Ok(MediaGucState::Running)) => {
+                // Published engines wake this worker through GT0's tiled
+                // MSI; without delivery the worker's timer still polls GT1.
+                if let (Some(irq), Some(publication)) = (state.irq.as_ref(), guc.publication()) {
+                    if !irq.media_routed() && !state.media_irq_failed {
+                        if let Err(error) = irq.route_media(publication.engines) {
+                            state.media_irq_failed = true;
+                            irq.unroute_media();
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "intel-gt card{}: media IRQ routing refused ({:?}); GT1 polled",
+                                self.pending.index,
+                                error
+                            );
+                        }
+                    }
+                }
                 if !core::mem::replace(&mut state.media_guc_reported, true) {
                     log(
                         self.pending.index,
@@ -2329,6 +2354,10 @@ impl Owner {
     /// Release the media GT owner's wake requests and advance a verified
     /// media GuC stop before any GT0 stop, park, suspend or fault cleanup.
     fn retire_media(&self, state: &mut State, now: u64) -> MediaRetire {
+        if let Some(irq) = state.irq.as_ref() {
+            irq.unroute_media();
+        }
+        state.media_irq_failed = false;
         state.media_reported = false;
         state.media_guc_tried = false;
         state.media_recovered = false;

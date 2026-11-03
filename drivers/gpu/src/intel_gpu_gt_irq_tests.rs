@@ -802,3 +802,142 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_gen12",
     smoke_gen12_media_irq_foreign_fused_source_and_identity_timeout_fail_closed
 );
+
+/// MTL/Arrow: the standalone media GT's VCS/VECS join GT0's tiled delivery
+/// only after publication (xe_irq.c media-GT VCS_VECS_INTR_ENABLE and
+/// VCSn/VECSn masks), decode in bank 1 as VIDEO_DECODE/VIDEO_ENHANCE, keep
+/// GT0's halves untouched and restore exactly their own bits when unrouted.
+fn smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits() -> TestResult {
+    let w = Window::new();
+    let media_regs = [
+        0x190034u64,
+        0x1900a8,
+        0x1900ac,
+        0x1900b0,
+        0x1900b4,
+        0x1900d0,
+        0x1900d4,
+    ];
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190034, 0x22224444);
+        for reg in &media_regs[1..] {
+            r.words.insert(*reg, 0xa5a55a5a);
+        }
+        for base in [0x1c4000, 0x1f0000, 0x1e8000] {
+            r.words.insert(base + 0xa8, 0xffffaaab);
+        }
+    }
+    let before = w.0.lock().words.clone();
+    let irq = install(&w);
+    let vector = irq.vector();
+    assert_eq!(irq.service(0), Ok(false));
+    // GT0 activation never touches a media source.
+    for reg in media_regs {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    let gt0 = [
+        0x190030u64,
+        0x190090,
+        0x1900a0,
+        0x190038,
+        0x1900e8,
+        0x20a8,
+        0x220a8,
+    ]
+    .map(|reg| (reg, w.read32(reg)));
+    let media = EngineSet::of(&[Engine::Vcs1, Engine::Vcs6, Engine::Vecs2]);
+    assert_eq!(
+        irq.route_media(EngineSet::of(&[Engine::Rcs0])),
+        Err(IrqError::Identity)
+    );
+    assert_eq!(
+        irq.route_media(EngineSet::default()),
+        Err(IrqError::Identity)
+    );
+    irq.route_media(media).unwrap();
+    assert_eq!(irq.route_media(media), Err(IrqError::Identity));
+    assert_eq!(w.read32(0x190034), 0x22334455);
+    assert_eq!(w.read32(0x1900a8), 0xa5a55a4a); // odd VCS1 low half
+    assert_eq!(w.read32(0x1900b4), 0xa5a45a5a); // even VCS6 high half
+    assert_eq!(w.read32(0x1900d4), 0xa5a45a5a); // even VECS2 high half
+    for reg in [0x1900ac, 0x1900b0, 0x1900d0] {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    for base in [0x1c4000u64, 0x1f0000, 0x1e8000] {
+        assert_eq!(w.read32(base + 0xa8), 0xffffaaab & !0x11);
+    }
+    for (reg, value) in gt0 {
+        assert_eq!(w.read32(reg), value, "GT0 half changed by media routing");
+    }
+    // Bank-1 media causes through the real dispatcher and identity decoder.
+    let raise_media = |bits: u32| {
+        {
+            let mut r = w.0.lock();
+            r.words.insert(0x19001c, bits);
+            *r.words.get_mut(&0x190010).unwrap() |= 2;
+            *r.words.get_mut(&0x190008).unwrap() |= 1;
+        }
+        narf_interrupts::dispatch::on_irq(vector);
+    };
+    raise_media(0x20000042);
+    assert_eq!(w.read32(0x190008) & 0x80000000, 0);
+    for now in 1..20 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x19001c), 0);
+    assert_eq!(w.read32(0x190008) & 0x80000000, 0x80000000);
+    let selected: Vec<_> =
+        w.0.lock()
+            .writes
+            .iter()
+            .copied()
+            .filter(|(reg, _)| matches!(*reg, 0x190074 | 0x190064 | 0x19001c))
+            .collect();
+    assert_eq!(
+        selected,
+        [
+            (0x190074, 2),
+            (0x190064, 0x80110001),
+            (0x19001c, 2),
+            (0x190074, 0x40),
+            (0x190064, 0x80610010),
+            (0x19001c, 0x40),
+            (0x190074, 0x20000000),
+            (0x190064, 0x80220001),
+            (0x19001c, 0x20000000)
+        ]
+    );
+    // Unrouting masks the sources again; a latched identity stays owned.
+    irq.unroute_media();
+    for reg in media_regs {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    for base in [0x1c4000u64, 0x1f0000, 0x1e8000] {
+        assert_eq!(w.read32(base + 0xa8), before[&(base + 0xa8)]);
+    }
+    raise_media(2);
+    for now in 30..40 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x19001c), 0);
+    // Re-publication of the same engines routes them again.
+    irq.route_media(media).unwrap();
+    assert_eq!(w.read32(0x190034), 0x22334455);
+    drop(irq);
+    for reg in media_regs {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    for (reg, _) in gt0 {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits
+);

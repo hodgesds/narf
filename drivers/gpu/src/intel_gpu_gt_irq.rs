@@ -125,6 +125,11 @@ struct State<M> {
     compute: u8,
     copy8: bool,
     media: EngineSet,
+    /// The media sources are enabled. On a tiled (MTL/Arrow) controller the
+    /// standalone media GT's engines join `media` when routed and stay owned
+    /// for identity decoding after unrouting, so a late pending identity is
+    /// still acknowledged rather than read as a foreign cause.
+    media_routed: bool,
     tiled: bool,
     active: bool,
     pending: bool,
@@ -259,6 +264,7 @@ impl<M: MmioWindow> Controller<M> {
             compute,
             copy8,
             media,
+            media_routed: media.bits() != 0,
             tiled,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
@@ -322,6 +328,100 @@ impl<M: MmioWindow> Controller<M> {
         }
         // service() drains stale causes before opening the tile master.
         read(&s.mmio, MASTER).map(|_| ())
+    }
+
+    /// Route the MTL/Arrow standalone media GT's published VCS/VECS onto this
+    /// tile's shared banks, as xe_irq.c::xe_irq_enable_hwe does for a media
+    /// GT: VCS (ENGINE1) and VECS (ENGINE0) halves of VCS_VECS_INTR_ENABLE,
+    /// the per-pair VCSn/VECSn mask halves and each engine's RING_IMR, all
+    /// for MI_USER_INTERRUPT | FLUSH_COMPLETE. GT0's bank-0 sources, the
+    /// GuC halves and every other bit keep their values. Bank-1 identities
+    /// decode as VIDEO_DECODE/VIDEO_ENHANCE (pick_engine_gt -> media GT) and
+    /// only wake the polled media owner; they never prove DMA retirement.
+    pub(crate) fn route_media(&self, engines: EngineSet) -> Result<(), IrqError> {
+        let mut s = self.0.lock();
+        if !s.active
+            || !s.tiled
+            || s.media_routed
+            || engines.bits() == 0
+            || engines.bits() & !EngineSet::of(&MEDIA).bits() != 0
+            || (s.media.bits() != 0 && s.media != engines)
+        {
+            return Err(IrqError::Identity);
+        }
+        let enabled = media_enable(engines);
+        let saved_enable = read(&s.mmio, MEDIA_ENABLE)?;
+        let saved_masks: [u32; 6] = core::array::from_fn(|pair| {
+            if media_pair_mask(engines, pair) != 0 {
+                s.mmio.read32(MEDIA_MASKS[pair])
+            } else {
+                0
+            }
+        });
+        let saved_ring: [u32; 12] = core::array::from_fn(|index| {
+            if engines.contains(MEDIA[index]) {
+                s.mmio.read32(u64::from(MEDIA[index].base()) + 0xa8)
+            } else {
+                0
+            }
+        });
+        s.saved.media_enable = saved_enable;
+        s.saved.media_masks = saved_masks;
+        s.saved.media_ring = saved_ring;
+        s.media = engines;
+        s.media_routed = true;
+        let mut routes = alloc::vec![(MEDIA_ENABLE, enabled, enabled)];
+        for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+            let mask = media_pair_mask(engines, pair);
+            if mask != 0 {
+                routes.push((reg, mask, 0));
+            }
+        }
+        for engine in engines.iter() {
+            routes.push((u64::from(engine.base()) + 0xa8, RCS, 0));
+        }
+        for &(offset, mask, value) in &routes {
+            restore_bits(&s.mmio, offset, mask, value);
+        }
+        for (offset, mask, expected) in routes {
+            if s.mmio.read32(offset) & mask != expected {
+                return Err(IrqError::Route);
+            }
+        }
+        Ok(())
+    }
+
+    /// Mask the media sources again before the media GuC stops: restore the
+    /// saved halves of exactly the bits `route_media` owned. The engines stay
+    /// owned for decoding, so an identity already latched is acknowledged.
+    pub(crate) fn unroute_media(&self) {
+        let mut s = self.0.lock();
+        if !s.tiled || !s.media_routed {
+            return;
+        }
+        s.media_routed = false;
+        for (index, engine) in MEDIA.into_iter().enumerate() {
+            if s.media.contains(engine) {
+                restore_bits(
+                    &s.mmio,
+                    u64::from(engine.base()) + 0xa8,
+                    RCS,
+                    s.saved.media_ring[index],
+                );
+            }
+        }
+        for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+            let mask = media_pair_mask(s.media, pair);
+            if mask != 0 {
+                restore_bits(&s.mmio, reg, mask, s.saved.media_masks[pair]);
+            }
+        }
+        restore_bits(
+            &s.mmio,
+            MEDIA_ENABLE,
+            media_enable(s.media),
+            s.saved.media_enable,
+        );
     }
 
     pub(crate) fn hard_irq(&self) -> narf_interrupts::dispatch::IrqStatus {
@@ -480,7 +580,8 @@ impl<M: MmioWindow> Controller<M> {
             }
             restore_bits(&s.mmio, CCS_ENABLE, RCS_EVENTS, s.saved.ccs_enable);
         }
-        if media_enable(s.media) != 0 {
+        if s.media_routed && media_enable(s.media) != 0 {
+            s.media_routed = false;
             for (index, engine) in MEDIA.into_iter().enumerate() {
                 if s.media.contains(engine) {
                     restore_bits(
@@ -588,6 +689,21 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
 
     pub(crate) fn service(&self, now: u64) -> Result<bool, IrqError> {
         self.controller.service(now)
+    }
+
+    /// See `Controller::route_media`.
+    pub(crate) fn route_media(&self, engines: EngineSet) -> Result<(), IrqError> {
+        self.controller.route_media(engines)
+    }
+
+    /// See `Controller::unroute_media`.
+    pub(crate) fn unroute_media(&self) {
+        self.controller.unroute_media()
+    }
+
+    /// Whether media sources are currently enabled on this delivery graph.
+    pub(crate) fn media_routed(&self) -> bool {
+        self.controller.0.lock().media_routed
     }
 }
 
