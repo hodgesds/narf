@@ -432,7 +432,7 @@ pub enum PairingError {
 /// side's distribution, Identity Information (IRK) is always
 /// followed by Identity Address Information — the two are one
 /// IdKey unit, not independent keys.
-
+///
 /// Build this side's Phase 3 PDUs for the negotiated `dist_send`
 /// set, in §3.6.1 order: Identity Information, Identity Address
 /// Information, Signing Information. The IRK and CSRK are fresh
