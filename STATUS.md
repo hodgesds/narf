@@ -2448,6 +2448,39 @@ the top-level ABI suite and were not run. The CI Clippy contexts for
 follow-up worker is aligning the remaining EXEC_QUEUE and i915 extension
 mismatches.
 
+### Xe and i915 extension walkers in Linux's order — targeted release gates recorded
+
+The Xe EXEC_QUEUE_CREATE, EU-stall and i915 user-extension walkers now
+follow Linux's check order and errnos. UAPI changes:
+- **Xe EXEC_QUEUE_CREATE:**
+  - The extension header is checked first (EINVAL), and the reserved-field
+    check is gone.
+  - An unknown property is EINVAL; it used to be ENOSYS.
+  - MULTI_GROUP is ENODEV, and a MULTI_QUEUE_PRIORITY above 2 is EINVAL.
+  - HANG_REPLAY is copied and then refused with ENOSYS (LINUX-GAP).
+  - The parallel-row and VM checks now come before the extension chain.
+- **i915 user extensions:** the walk follows `i915_user_extensions`, with a
+  512-link depth and then E2BIG, and no refusal for revisiting an
+  extension.
+- **Xe EU-stall:** at most 5 extensions, then E2BIG. An open stream is EBUSY
+  before the wait-report range is checked, as in Linux.
+- **i915 GEM_CREATE_EXT:** applied in Linux's table order. SET_PAT is ENODEV
+  before graphics 12.70, and an accepted SET_PAT index is ENOSYS
+  (LINUX-GAP).
+- **i915 MMAP_OFFSET:** the pad is no longer checked, as Linux leaves it.
+
+Integration corrected two fixtures that still pinned the old behaviour:
+- The EU-stall FIFO-capacity smoke now expects EBUSY while its stream is
+  open, then EINVAL once the stream is dropped.
+- The i915 context frequency-hint smoke now expects E2BIG for a
+  self-referencing extension.
+
+One targeted release run passed 171 tests with no failures. It covered the
+Xe, UAPI, render, user, i915-balance, EU-stall, media-GT and context
+prefixes. A follow-up worker is fixing the remaining mismatches: the i915
+context CREATE_EXT apply order, the execbuffer timeline-fence interleaving
+and cap, and the Xe timeslice bound.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
