@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Signed per-board RTL8821AE 2.4 GHz 20 MHz power envelope.
+//! Signed per-board RTL8821AE power envelope (2.4 GHz 20/40 MHz, 5 GHz
+//! 20/40/80 MHz).
 //!
 //! The Linux index ([`super::txpower`]) is an upper bound only: a reporting
 //! index-to-dBm estimate cannot mint transmit permission. Every programmed
@@ -31,6 +32,7 @@
 //! only carries measurements: a band/bandwidth/channel without a row stays
 //! unadmitted, and nothing here supplies any board's values.
 
+use super::power_limit::Bandwidth;
 use super::txpower::{self, ByRate, Factory as FactoryPower};
 use crate::rtlwifi::channel_power::{domain_ceiling, Error};
 use crate::rtlwifi::efuse::Factory;
@@ -46,6 +48,8 @@ pub const V2_ROWS: usize = 98;
 const UNKNOWN: i16 = i16::MAX;
 /// `EEPROM` offset of the 2.4 GHz BB swing selector (`phy_get_tx_swing_8812A`).
 pub const EEPROM_SWING_2G: usize = 0xc6;
+/// `EEPROM` offset of the 5 GHz BB swing selector.
+pub const EEPROM_SWING_5G: usize = 0xc7;
 
 /// Band of an operating point (`BAND_ON_2_4G` / `BAND_ON_5G`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,6 +69,14 @@ pub enum Width {
 }
 
 impl Width {
+    /// `rtlphy->current_chan_bw` for this width.
+    pub fn bandwidth(self) -> Bandwidth {
+        match self {
+            Self::W20 => Bandwidth::Bw20,
+            Self::W40Above | Self::W40Below => Bandwidth::Bw40,
+            Self::W80 => Bandwidth::Bw80,
+        }
+    }
     pub fn mhz(self) -> u32 {
         match self {
             Self::W20 => 20,
@@ -116,6 +128,17 @@ impl Operating {
         }
     }
 
+    /// The wide channel `core.c::rtl_op_config` stores in
+    /// `rtlphy->current_channel` (20 MHz: primary; 40 MHz: primary ± 2;
+    /// 80 MHz: the 80 MHz center channel).
+    pub fn wide_channel(&self) -> Option<u8> {
+        let center = self.center_mhz()?;
+        Some(match self.band {
+            Band::B2g => (center - 2407) / 5,
+            Band::B5g => (center - 5000) / 5,
+        } as u8)
+    }
+
     /// Center frequency (MHz) of the whole channel, or `None` if the
     /// primary channel/width/offset combination is outside the 8821AE plan.
     pub fn center_mhz(&self) -> Option<u32> {
@@ -164,6 +187,7 @@ pub struct Calibration {
     identity: [u8; 32],
     power: FactoryPower,
     swing: u32,
+    swing_5g: u32,
     antenna: i16,
     qualified: i16,
     by_rate: ByRate,
@@ -218,7 +242,7 @@ impl Permission {
     pub fn admitted_rates(&self) -> u64 {
         self.admitted
     }
-    /// `phy_get_tx_swing_8812A(BAND_ON_2_4G)` for this board.
+    /// `phy_get_tx_swing_8812A(band)` for this board and the admitted band.
     pub fn swing(&self) -> u32 {
         self.swing
     }
@@ -238,7 +262,16 @@ fn signed(bytes: &[u8], at: usize) -> i16 {
 /// `0xC6` (`0xff` ⇒ 0), decodes path A then path B, and the path-B decode
 /// (`[3:2]`) decides the returned value.
 pub fn tx_swing_2g(logical: &[u8]) -> Result<u32, Error> {
-    let raw = *logical.get(EEPROM_SWING_2G).ok_or(Error::FactoryPower)?;
+    tx_swing(logical, EEPROM_SWING_2G)
+}
+
+/// `phy_get_tx_swing_8812A(BAND_ON_5G)`: the same decode of `0xC7`.
+pub fn tx_swing_5g(logical: &[u8]) -> Result<u32, Error> {
+    tx_swing(logical, EEPROM_SWING_5G)
+}
+
+fn tx_swing(logical: &[u8], at: usize) -> Result<u32, Error> {
+    let raw = *logical.get(at).ok_or(Error::FactoryPower)?;
     let swing = if raw == 0xff { 0 } else { raw };
     Ok(match (swing & 0xc) >> 2 {
         0 => 0x200,
@@ -324,6 +357,7 @@ impl Calibration {
         let power =
             FactoryPower::from_logical(&factory.logical).map_err(|_| Error::FactoryPower)?;
         let swing = tx_swing_2g(&factory.logical)?;
+        let swing_5g = tx_swing_5g(&factory.logical)?;
         let version = if bytes.len() >= 6 { half(bytes, 4) } else { 0 };
         let rows = if version == 2 { V2_ROWS } else { 11 };
         if bytes.len() < HEADER
@@ -400,6 +434,7 @@ impl Calibration {
             identity,
             power,
             swing,
+            swing_5g,
             antenna,
             qualified,
             by_rate: ByRate::from_table(),
@@ -439,12 +474,16 @@ impl Calibration {
             .iter()
             .find(|c| c.op == op)
             .ok_or(Error::NoMeasuredGain)?;
-        // The Linux index exists for the 2.4 GHz 20 MHz point only so far;
-        // other operating points stay unadmitted until their
-        // `_rtl8821ae_get_txpower_index` arithmetic is composed.
-        if op != Operating::legacy20(op.channel) {
-            return Err(Error::FactoryPower);
-        }
+        // `_rtl8821ae_get_txpower_index` runs at the wide channel and the
+        // operating bandwidth (`rtlphy->current_channel` / `current_chan_bw`).
+        let wide = op.wide_channel().ok_or(Error::Policy)?;
+        let (band, bandwidth) = (
+            match op.band {
+                Band::B2g => super::power_limit::Band::B2g,
+                Band::B5g => super::power_limit::Band::B5g,
+            },
+            op.width.bandwidth(),
+        );
         let mut index = [0u8; 48];
         let mut admitted = 0u64;
         for rate in txpower::station_rates() {
@@ -453,7 +492,7 @@ impl Calibration {
             }
             let linux = self
                 .by_rate
-                .index(&self.power, rate, op.channel)
+                .index_at(&self.power, band, bandwidth, rate, wide)
                 .map_err(|_| Error::FactoryPower)?;
             let bounds = &curve.output[match rate {
                 0..=3 => 0,
@@ -480,7 +519,10 @@ impl Calibration {
             op,
             index,
             admitted,
-            swing: self.swing,
+            swing: match op.band {
+                Band::B2g => self.swing,
+                Band::B5g => self.swing_5g,
+            },
             eirp,
         })
     }

@@ -1540,12 +1540,35 @@ chain below is composed.
   5140-5360 / 5460-5860 MHz 30 dBm). A rate whose curve has no fitting
   measured index is left unadmitted (TXAGC 0, outside `admitted_rates`)
   instead of failing the whole permission; every legacy rate of the band
-  must be admitted. The Linux index exists only for 2.4 GHz 20 MHz so far,
-  so 40/80 MHz and 5 GHz rows parse but mint no permission
-  (`FactoryPower`) until their `_rtl8821ae_get_txpower_index` arithmetic
-  is composed. No board values are supplied by the format. Test
-  `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`
-  (written, unexecuted). `channel` programs
+  must be admitted. The Linux index is composed for every v2 operating
+  point (`txpower::ByRate::index_at`): it runs at the *wide* channel
+  `core.c::rtl_op_config` stores in `current_channel` (40 MHz primary ± 2,
+  80 MHz block center; `Operating::wide_channel`) and the operating
+  `current_chan_bw`. 2.4 GHz 40 MHz: CCK/BW40 group bases of the wide
+  channel, OFDM diff, no HT/VHT diff (`txpwr_ht40diff[TX_1S]` is 0). 5 GHz
+  (path-A block `0x22`-`0x2f` 14 group bases, `0x30` BW20/OFDM diffs,
+  `0x36` BW80 diff; `_rtl8821ae_get_chnl_group` 5 GHz groups; per-channel
+  index from `core.c::channel5g`): base of the wide channel's group, OFDM
+  diff, 20 MHz BW20 diff, 40 MHz no diff (`txpwr_5g_bw40diff[TX_1S]` 0),
+  80 MHz HT/VHT `(group + next group) / 2 + bw80_diff` per `channel5g_80m`
+  while OFDM keeps the 40 MHz base; no CCK. An unprogrammed 5 GHz block
+  (`0x30 == 0xff`), group (> 63, Linux's `0xFE`) or BW80 diff (`0x36 ==
+  0xff`) yields no factory power for the points that need it. 5 GHz
+  power-by-rate (`PHY_REG_PG` band 1, bases OFDM/HT/HT2/VHT/VHT2 into
+  `txpwr_by_rate_base_5g`, relative conversion) and limits
+  (`_rtl8812ae_phy_get_txpower_limit`: OFDM always the 20 MHz rows, 5 GHz
+  HT at 80 MHz reads the 40 MHz rows, `_rtl8812ae_phy_cross_reference_ht_and_vht_txpower_limit`
+  HT↔VHT fill-in at 5 GHz 20/40 MHz, 5 GHz section bases) are the Linux
+  arithmetic (`ByRate::limit_at` / `by_rate_at`). The 5 GHz permission
+  carries `phy_get_tx_swing_8812A(BAND_ON_5G)` (EFUSE `0xC7`, same decode).
+  Minting a wide/5 GHz permission does not program it: `channel::configure`
+  refuses any permission other than 2.4 GHz 20 MHz until the band switch
+  and BW40/80 programming exist. No board values are supplied by the
+  format. Tests
+  `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`,
+  `smoke_rtl8821ae_txpower_index_bw40_and_5ghz`,
+  `smoke_rtl8821ae_napc_v2_permission_bw40_and_5ghz` (written,
+  unexecuted). `channel` programs
   `rtl8821ae_phy_switch_wirelessband(2.4G)` with `phy_get_tx_swing_8812A`
   (EFUSE `0xC6`, path-B decode wins as in Linux; RA/RB_TXSCALE), then
   `sw_chnl_callback` (RFC_AREA `0x96a`, RF `0x18`), the admitted per-rate

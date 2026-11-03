@@ -118,7 +118,14 @@ pub async fn set_bw20(io: &impl Io) -> Result<(), Error> {
 }
 
 /// Band select, channel switch with admitted TX power, then 20 MHz.
+///
+/// Only the 2.4 GHz 20 MHz operating point is programmed here; a 40/80 MHz
+/// or 5 GHz permission (whose TXAGC is computed at its wide channel) is
+/// refused until its band switch and bandwidth programming exist.
 pub async fn configure(io: &impl Io, permission: &Permission) -> Result<(), Error> {
+    if permission.operating() != super::envelope::Operating::legacy20(permission.channel()) {
+        return Err(Error::State);
+    }
     switch_band_2g(io, permission.swing())?;
     sw_chnl(io, permission.channel()).await?;
     set_txpower(io, permission)?;

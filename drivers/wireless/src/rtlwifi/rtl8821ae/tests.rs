@@ -1104,7 +1104,7 @@ fn smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission() -> TestResu
     if p.operating() != Operating::legacy20(6) || p.index(0) == 0 {
         return TestResult::Fail("v2 legacy20 permission wrong");
     }
-    // 5 GHz is outside the host domain; 2.4 GHz 40 MHz has no Linux index yet.
+    // 5 GHz and 2.4 GHz 40 MHz are outside the 20 MHz 2.4 GHz host domain.
     if cal
         .permission_for(&domain, op(Band::B5g, Width::W80, 149))
         .is_ok()
@@ -1164,6 +1164,182 @@ fn smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission() -> TestResu
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission
+);
+
+/// `powered_logical` plus a programmed path-A 5 GHz block: BW40 group bases
+/// 0x20..=0x2d, BW20 +1 / OFDM -2 (`0x30`), BW80 -2 (`0x36`).
+pub(crate) fn powered_logical_5g(option: u8) -> [u8; 512] {
+    let mut map = powered_logical(0xf2, option);
+    for (i, b) in map[0x22..0x30].iter_mut().enumerate() {
+        *b = 0x20 + i as u8;
+    }
+    map[0x30] = 0x1e;
+    map[0x36] = 0xe0;
+    map
+}
+
+fn smoke_rtl8821ae_txpower_index_bw40_and_5ghz() -> TestResult {
+    use power_limit::{Band, Bandwidth};
+    let by_rate = txpower::ByRate::from_table();
+    // 5 GHz PG: OFDM base BCD 0x26, HT/VHT1SS base BCD 0x24; relative values.
+    if by_rate.base_5g[0] != [26, 24, 0, 24, 0]
+        || by_rate.offset_5g[0][1] != 0x0808_0a0a
+        || by_rate.offset_5g[0][3] != 0x080a_0c0c
+        || by_rate.offset_5g[0][9] != 0x0000_0402
+    {
+        return TestResult::Fail("5 GHz power-by-rate bases / relative values");
+    }
+    // Limits: OFDM reads the 20 MHz rows at any width; 5 GHz VHT 1T at
+    // 20 MHz has no rows and is cross-referenced from HT 1T (same base 24);
+    // 5 GHz HT at 80 MHz reads the (absent) 40 MHz rows at the 80 MHz center.
+    if by_rate.limit_at(Band::B5g, Bandwidth::Bw40, 4, 38)
+        != by_rate.limit_at(Band::B5g, Bandwidth::Bw20, 4, 38)
+        || by_rate.limit_at(Band::B5g, Bandwidth::Bw20, 28, 36) == 63
+        || by_rate.limit_at(Band::B5g, Bandwidth::Bw20, 28, 36)
+            != by_rate.limit_at(Band::B5g, Bandwidth::Bw20, 12, 36)
+        || by_rate.limit_at(Band::B5g, Bandwidth::Bw80, 12, 42) != 63
+        || by_rate.limit_at(Band::B5g, Bandwidth::Bw80, 28, 42) == 63
+        || by_rate.limit_at(Band::B5g, Bandwidth::Bw20, 12, 37) != 63
+    {
+        return TestResult::Fail("5 GHz limit selection / cross reference");
+    }
+    let factory = match txpower::Factory::from_logical(&powered_logical_5g(2)) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("5 GHz factory power rejected"),
+    };
+    match factory.five_ghz {
+        Some(f) if f.bw20_diff == 1 && f.ofdm_diff == -2 && f.bw80_diff == Some(-2) => {}
+        _ => return TestResult::Fail("5 GHz diff nibbles"),
+    }
+    let idx = |band, bw, rate, ch| by_rate.index_at(&factory, band, bw, rate, ch);
+    let (b2, b5) = (Band::B2g, Band::B5g);
+    let (w20, w40, w80) = (Bandwidth::Bw20, Bandwidth::Bw40, Bandwidth::Bw80);
+    // 2.4 GHz 40 MHz at wide channel 3 (group 1): HT has no TX_1S BW40 diff.
+    if idx(b2, w40, 0, 3) != Ok(0x21)
+        || idx(b2, w40, 4, 3) != Ok(0x29 + 2)
+        || idx(b2, w40, 12, 3) != Ok(0x29)
+        || idx(b2, w80, 12, 3).is_ok()
+    {
+        return TestResult::Fail("2.4 GHz BW40 index");
+    }
+    if idx(b5, w20, 4, 36) != Ok(0x1e)
+        || idx(b5, w20, 12, 36) != Ok(0x21)
+        || idx(b5, w20, 0, 36).is_ok()
+        || idx(b5, w20, 12, 37).is_ok()
+        || idx(b5, w40, 12, 38) != Ok(0x20)
+        || idx(b5, w40, 12, 46) != Ok(0x21)
+        || idx(b5, w40, 4, 46) != Ok(0x1f)
+        // 80 MHz: (group 0 + group 1) / 2 - 2; OFDM keeps the 40 MHz base.
+        || idx(b5, w80, 12, 42) != Ok(0x1e)
+        || idx(b5, w80, 4, 42) != Ok(0x1e)
+        || idx(b5, w80, 28, 155) != Ok(0x28)
+        || idx(b5, w80, 12, 36).is_ok()
+    {
+        return TestResult::Fail("5 GHz BW20/40/80 index");
+    }
+    let mut map = powered_logical_5g(2);
+    map[0x36] = 0xff;
+    map[0x22 + 3] = 0xff;
+    let partial = txpower::Factory::from_logical(&map).unwrap();
+    if by_rate.index_at(&partial, b5, w80, 12, 42).is_ok()
+        || by_rate.index_at(&partial, b5, w40, 12, 38) != Ok(0x20)
+        || by_rate.index_at(&partial, b5, w20, 12, 60).is_ok()
+    {
+        return TestResult::Fail("unprogrammed 5 GHz group or BW80 diff admitted");
+    }
+    let mut map = powered_logical_5g(2);
+    map[0x30] = 0xff;
+    let none = txpower::Factory::from_logical(&map).unwrap();
+    if none.five_ghz.is_some() || by_rate.index_at(&none, b5, w20, 4, 36).is_ok() {
+        return TestResult::Fail("unprogrammed 5 GHz block admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_txpower_index_bw40_and_5ghz
+);
+
+fn smoke_rtl8821ae_napc_v2_permission_bw40_and_5ghz() -> TestResult {
+    use envelope::{Band, Operating, Width};
+    use narf_wireless::reg::*;
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x04],
+        logical: powered_logical_5g(2),
+    };
+    let rows = [
+        (1, 0, 40, 1),
+        (36, 1, 20, 0),
+        (40, 1, 40, 2),
+        (36, 1, 80, 0),
+    ];
+    let Ok(cal) = envelope::Calibration::from_verified(
+        &napc_v2(&factory, &rows, 30, false),
+        Some([1; 32]),
+        &factory,
+    ) else {
+        return TestResult::Fail("v2 envelope rejected");
+    };
+    let rule = |start, end, bw| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bw,
+        max_power_dbm: 20,
+        flags: RegFlags::empty(),
+    };
+    let domain = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 40), rule(5170, 5250, 80)],
+    };
+    let op = |band, width, channel| Operating {
+        band,
+        width,
+        channel,
+    };
+    // EIRP 80 qdBm - antenna 8 => index <= 42: OFDM's Linux 0x2b is lowered
+    // to 42, every other Linux index is kept.
+    match cal.permission_for(&domain, op(Band::B2g, Width::W40Above, 1)) {
+        Ok(p) if p.index(0) == 0x21 && p.index(4) == 0x2a && p.index(12) == 0x29 => {}
+        _ => return TestResult::Fail("2.4 GHz 40 MHz permission"),
+    }
+    match cal.permission_for(&domain, op(Band::B5g, Width::W20, 36)) {
+        Ok(p)
+            if p.index(4) == 0x1e
+                && p.index(12) == 0x21
+                && p.index(0) == 0
+                && !p.admits(0)
+                && p.admits(4)
+                && p.swing() == 0x200 => {}
+        _ => return TestResult::Fail("5 GHz 20 MHz permission (no CCK, 5 GHz swing)"),
+    }
+    match cal.permission_for(&domain, op(Band::B5g, Width::W40Below, 40)) {
+        Ok(p) if p.index(12) == 0x20 && p.index(4) == 0x1e => {}
+        _ => return TestResult::Fail("5 GHz 40 MHz permission at wide channel 38"),
+    }
+    match cal.permission_for(&domain, op(Band::B5g, Width::W80, 36)) {
+        Ok(p) if p.index(12) == 0x1e && p.index(28) == 0x1e && p.index(4) == 0x1e => {}
+        _ => return TestResult::Fail("5 GHz 80 MHz permission at center 42"),
+    }
+    // No row for 44/80 even though the block is measured from 36.
+    if cal
+        .permission_for(&domain, op(Band::B5g, Width::W80, 44))
+        .is_ok()
+    {
+        return TestResult::Fail("unmeasured 80 MHz primary admitted");
+    }
+    // A permission for a wide point is not programmed by the 20 MHz path.
+    let p = cal
+        .permission_for(&domain, op(Band::B5g, Width::W20, 36))
+        .unwrap();
+    let io = RegFake(IrqSafeSpinLock::new((vec![0u8; 0x1000], Vec::new())));
+    if narf_scheduler::block_on(channel::configure(&io, &p)).is_ok() {
+        return TestResult::Fail("5 GHz permission programmed as 2.4 GHz 20 MHz");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_napc_v2_permission_bw40_and_5ghz
 );
 
 fn smoke_rtl8821ae_band_channel_bw20_txagc_order() -> TestResult {
