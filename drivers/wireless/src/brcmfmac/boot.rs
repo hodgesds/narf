@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Owned BCM43602 CR4 boot, staged against Linux brcmfmac/{chip,pcie}.c.
-//! No DMA or station admission: this hands validated firmware metadata to
-//! the retained common-ring owner. Board calibration is selected explicitly.
+//! Owned PCIe dongle boot (BCM43602 and the `chip_profile` CR4/CA7 chips),
+//! staged against Linux brcmfmac/{chip,pcie}.c. No DMA or station admission:
+//! this hands validated firmware metadata to the retained common-ring owner.
+//! Board calibration is selected explicitly.
 use super::chip::{self, Backplane, Chip, Core};
+use super::chip_profile::{self, Cpu};
 use super::shared::SharedInfo;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +39,7 @@ pub struct BoardProfile {
 }
 impl BoardProfile {
     fn admits(self, chip: &Chip, pci: PciIdentity) -> bool {
-        self.chip == 43602
+        chip_profile::profile(self.chip, chip.revision).is_some()
             && chip.id == self.chip
             && chip.revision < 16
             && self.revision_mask & (1 << chip.revision) != 0
@@ -80,16 +82,20 @@ pub struct Booted<B: Bus> {
     pub shared: SharedInfo,
     pub chip: Chip,
 }
+/// The retained loader. Named for the original CR4 path; `cpu` selects the
+/// Linux `brcmf_chip_cr4_*` or `brcmf_chip_ca7_*` passive/active sequence.
 pub struct Cr4<B: Bus> {
     bus: B,
     chip: Chip,
     arm: Core,
+    cpu: Cpu,
     ram: Ram,
     used: bool,
 }
 impl<B: Bus> core::fmt::Debug for Cr4<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BrcmCr4")
+            .field("cpu", &self.cpu)
             .field("ram", &self.ram)
             .field("used", &self.used)
             .finish_non_exhaustive()
@@ -131,10 +137,11 @@ impl<B: Bus> Cr4<B> {
     }
     fn claim_checked(mut bus: B, admitted: impl FnOnce(&Chip) -> bool) -> Result<Self, Refused<B>> {
         match Self::discover(&mut bus, admitted) {
-            Ok((chip, arm, ram)) => Ok(Self {
+            Ok((chip, arm, cpu, ram)) => Ok(Self {
                 bus,
                 chip,
                 arm,
+                cpu,
                 ram,
                 used: false,
             }),
@@ -144,7 +151,7 @@ impl<B: Bus> Cr4<B> {
     fn discover(
         bus: &mut B,
         admitted: impl FnOnce(&Chip) -> bool,
-    ) -> Result<(Chip, Core, Ram), Error> {
+    ) -> Result<(Chip, Core, Cpu, Ram), Error> {
         if bus.dma_enabled()? {
             return Err(Error::State);
         }
@@ -152,54 +159,68 @@ impl<B: Bus> Cr4<B> {
         if !admitted(&chip) {
             return Err(Error::Board);
         }
-        let mut arms = chip
-            .cores
-            .iter()
-            .copied()
-            .filter(|c| c.id == chip::CORE_ARM_CR4);
-        let arm = arms.next().ok_or(Error::Unsupported)?;
-        if arms.next().is_some() || chip.core(0x80e).is_none() {
+        let profile = chip_profile::profile(chip.id, chip.revision).ok_or(Error::Unsupported)?;
+        let only = |id: u16| {
+            let mut cores = chip.cores.iter().copied().filter(move |c| c.id == id);
+            match (cores.next(), cores.next()) {
+                (Some(core), None) => Ok(Some(core)),
+                (None, _) => Ok(None),
+                _ => Err(Error::Unsupported),
+            }
+        };
+        // Linux brcmf_chip_set_passive dispatches CR4 first, then CA7.
+        let (cr4, ca7) = (only(chip::CORE_ARM_CR4)?, only(chip::CORE_ARM_CA7)?);
+        let arm = match (profile.cpu, cr4, ca7) {
+            (Cpu::Cr4, Some(arm), _) => arm,
+            (Cpu::Ca7, None, Some(arm)) => arm,
+            _ => return Err(Error::Unsupported),
+        };
+        // BCM43602 additionally resets SOCRAM at exit (pcie.c
+        // brcmf_pcie_exit_download_state); CA7 sizes RAM from SYS_MEM.
+        if chip.id == chip_profile::BRCM_CC_43602
+            && chip.core(chip_profile::CORE_INTERNAL_MEM).is_none()
+            || profile.cpu == Cpu::Ca7
+                && (chip.core(chip_profile::CORE_SYS_MEM).is_none()
+                    || chip.core(chip::CORE_D11).is_none())
+        {
             return Err(Error::Unsupported);
         }
-        // CR4 HALT survives reset while its local TCM remains accessible.
+        // The ARM HALT survives reset while its local TCM remains accessible.
         let previous = bus.read32(arm.wrapper + 0x408).map_err(Error::Chip)?;
         if previous == u32::MAX {
             return Err(Error::Gone);
         }
+        // brcmf_chip_disable_arm: keep only HALT, reset with HALT.
         Chip::reset_core(bus, arm, previous & 0x20, 0x20, 0x20).map_err(Error::Chip)?;
-        for core in chip
-            .cores
-            .iter()
-            .copied()
-            .filter(|c| c.id == chip::CORE_D11)
-        {
-            Chip::disable_core(bus, core, 12, 4).map_err(Error::Chip)?;
-        }
-        let capability = bus.read32(arm.base + 4).map_err(Error::Chip)?;
-        if capability == u32::MAX {
-            return Err(Error::Gone);
-        }
-        let banks = (capability & 15) + ((capability >> 4) & 15);
-        if banks == 0 {
-            return Err(Error::Unsupported);
-        }
-        let mut size = 0u32;
-        for bank in 0..banks {
-            bus.write32(arm.base + 0x40, bank).map_err(Error::Chip)?;
-            let info = bus.read32(arm.base + 0x44).map_err(Error::Chip)?;
-            if info == u32::MAX {
-                return Err(Error::Gone);
+        let size = match profile.cpu {
+            Cpu::Cr4 => {
+                // brcmf_chip_cr4_set_passive: disable every D11 core.
+                for core in chip
+                    .cores
+                    .iter()
+                    .copied()
+                    .filter(|c| c.id == chip::CORE_D11)
+                {
+                    Chip::disable_core(bus, core, 12, 4).map_err(Error::Chip)?;
+                }
+                cr4_ramsize(bus, arm)?
             }
-            let unit = if info & 0x200 != 0 { 1024 } else { 8192 };
-            size = size
-                .checked_add(((info & 0x7f) + 1) * unit)
-                .ok_or(Error::Extent)?;
-        }
+            Cpu::Ca7 => {
+                // brcmf_chip_ca7_set_passive: reset the first 80211 core
+                // (PHYRESET|PHYCLOCKEN, PHYCLOCKEN, PHYCLOCKEN).
+                let d11 = chip.core(chip::CORE_D11).ok_or(Error::Unsupported)?;
+                Chip::reset_core(bus, d11, 12, 4, 4).map_err(Error::Chip)?;
+                let sysmem = chip
+                    .core(chip_profile::CORE_SYS_MEM)
+                    .ok_or(Error::Unsupported)?;
+                sysmem_ramsize(bus, sysmem)?
+            }
+        };
         let ram = Ram {
-            base: 0x180000,
+            base: profile.rambase,
             size,
         };
-        if !(8..=4 * 1024 * 1024).contains(&size)
+        if !(8..=chip_profile::MAX_MEMSIZE).contains(&size)
             || ram
                 .base
                 .checked_add(size)
@@ -208,7 +229,7 @@ impl<B: Bus> Cr4<B> {
         {
             return Err(Error::Extent);
         }
-        Ok((chip, arm, ram))
+        Ok((chip, arm, profile.cpu, ram))
     }
     /// NVRAM is already board-selected single-device packed data, with
     /// Linux's final list NUL, alignment and token excluding token bytes.
@@ -258,10 +279,15 @@ impl<B: Bus> Cr4<B> {
             }
             self.ram.size = size;
         }
-        // BCM43602 quirk: remove bank5/7 power-down before firmware writes.
-        for bank in [5, 7] {
+        // brcmf_pcie_enter_download_state, BCM43602 only: remove the
+        // bank5/7 power-down before firmware writes.
+        for bank in if self.chip.id == chip_profile::BRCM_CC_43602 {
+            &[5u32, 7][..]
+        } else {
+            &[][..]
+        } {
             self.bus
-                .write32(self.arm.base + 0x40, bank)
+                .write32(self.arm.base + 0x40, *bank)
                 .map_err(Error::Chip)?;
             self.bus
                 .write32(self.arm.base + 0x4c, 0)
@@ -273,9 +299,16 @@ impl<B: Bus> Cr4<B> {
         let nvram_address = self.ram.base + self.ram.size - nvram.len() as u32;
         self.bus.write_tcm(nvram_address, nvram)?;
         let sentinel = read32(&mut self.bus, tail)?;
-        let memory = self.chip.core(0x80e).ok_or(Error::Unsupported)?;
-        Chip::reset_core(&mut self.bus, memory, 0, 0, 0).map_err(Error::Chip)?;
-        // Linux PCIe activate writes the image's first reset vector at TCM0.
+        // brcmf_pcie_exit_download_state: BCM43602 resets SOCRAM first.
+        if self.chip.id == chip_profile::BRCM_CC_43602 {
+            let memory = self
+                .chip
+                .core(chip_profile::CORE_INTERNAL_MEM)
+                .ok_or(Error::Unsupported)?;
+            Chip::reset_core(&mut self.bus, memory, 0, 0, 0).map_err(Error::Chip)?;
+        }
+        // brcmf_pcie_buscore_activate writes the image's first reset vector
+        // at TCM0; brcmf_chip_{cr4,ca7}_set_active then release the ARM.
         self.bus.write_tcm(0, &firmware[..4])?;
         Chip::reset_core(&mut self.bus, self.arm, 0x20, 0, 0).map_err(Error::Chip)?;
         let mut shared = sentinel;
@@ -317,6 +350,64 @@ impl<B: Bus> Cr4<B> {
         }
         Ok((shared, info))
     }
+}
+/// `chip.c::brcmf_chip_tcm_ramsize`: CR4 A+B TCM banks.
+fn cr4_ramsize(bus: &mut impl Bus, arm: Core) -> Result<u32, Error> {
+    let capability = bus.read32(arm.base + 4).map_err(Error::Chip)?;
+    if capability == u32::MAX {
+        return Err(Error::Gone);
+    }
+    let banks = (capability & 15) + ((capability >> 4) & 15);
+    if banks == 0 {
+        return Err(Error::Unsupported);
+    }
+    let mut size = 0u32;
+    for bank in 0..banks {
+        bus.write32(arm.base + 0x40, bank).map_err(Error::Chip)?;
+        let info = bus.read32(arm.base + 0x44).map_err(Error::Chip)?;
+        if info == u32::MAX {
+            return Err(Error::Gone);
+        }
+        let unit = if info & 0x200 != 0 { 1024 } else { 8192 };
+        size = size
+            .checked_add(((info & 0x7f) + 1) * unit)
+            .ok_or(Error::Extent)?;
+    }
+    Ok(size)
+}
+/// `chip.c::brcmf_chip_sysmem_ramsize`: bring SYS_MEM up when it is not
+/// (`brcmf_chip_ai_iscoreup`: ioctl CLK without FGC, reset released), then
+/// sum `SRCI_SRNB` RAM banks through `bankidx` (0x10) / `bankinfo` (0x40).
+fn sysmem_ramsize(bus: &mut impl Bus, sysmem: Core) -> Result<u32, Error> {
+    let ioctl = bus.read32(sysmem.wrapper + 0x408).map_err(Error::Chip)?;
+    let reset = bus.read32(sysmem.wrapper + 0x800).map_err(Error::Chip)?;
+    if ioctl == u32::MAX || reset == u32::MAX {
+        return Err(Error::Gone);
+    }
+    if ioctl & 3 != 1 || reset & 1 != 0 {
+        Chip::reset_core(bus, sysmem, 0, 0, 0).map_err(Error::Chip)?;
+    }
+    let coreinfo = bus.read32(sysmem.base).map_err(Error::Chip)?;
+    if coreinfo == u32::MAX {
+        return Err(Error::Gone);
+    }
+    let banks = (coreinfo & 0xf0) >> 4;
+    if banks == 0 {
+        return Err(Error::Unsupported);
+    }
+    let mut size = 0u32;
+    for bank in 0..banks {
+        // SOCRAM_MEMTYPE_RAM << SOCRAM_BANKIDX_MEMTYPE_SHIFT is zero.
+        bus.write32(sysmem.base + 0x10, bank).map_err(Error::Chip)?;
+        let info = bus.read32(sysmem.base + 0x40).map_err(Error::Chip)?;
+        if info == u32::MAX {
+            return Err(Error::Gone);
+        }
+        size = size
+            .checked_add(((info & 0x7f) + 1) * 8192)
+            .ok_or(Error::Extent)?;
+    }
+    Ok(size)
 }
 fn read32(bus: &mut impl Bus, address: u32) -> Result<u32, Error> {
     let mut bytes = [0; 4];

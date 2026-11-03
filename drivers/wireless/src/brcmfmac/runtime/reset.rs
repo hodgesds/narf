@@ -17,7 +17,7 @@
 //! order behind every posted write the function issued before the clear)
 //! that must observe a present function and stable D2H write indices,
 //! resets the chip by the ChipCommon watchdog, re-verifies BME clear after
-//! the config shadow restore, halts the ARM CR4 (`brcmf_chip_set_passive`)
+//! the config shadow restore, halts the ARM CR4 or CA7 (`brcmf_chip_set_passive`)
 //! and reads the halt back. Under a translating IOMMU the function is
 //! blocked (`Bus::block_dma`) after the flush reads and before the reset.
 //! Only then is the published memory reclaimable.
@@ -77,7 +77,11 @@ impl<B: Bus> Runtime<B> {
         self.ap_live.store(false, Ordering::Release);
         let common = self.core_of(chip::CORE_CHIPCOMMON)?;
         let pcie = self.core_of(chip::CORE_PCIE2)?;
-        let arm = self.core_of(chip::CORE_ARM_CR4)?;
+        // brcmf_chip_set_passive dispatch: CR4 first, otherwise CA7.
+        let (arm, ca7) = match self.core_of(chip::CORE_ARM_CR4) {
+            Ok(arm) => (arm, false),
+            Err(_) => (self.core_of(chip::CORE_ARM_CA7)?, true),
+        };
         let lsc = self.bus.link_control()?;
         self.bus.set_link_control(lsc & !ASPM_ENAB)?;
         self.backplane_write(common.base + CC_WATCHDOG, 4)?;
@@ -105,14 +109,20 @@ impl<B: Bus> Runtime<B> {
         }
         Chip::reset_core(&mut self.bus, arm, CPUHALT, CPUHALT, CPUHALT)
             .map_err(|_| Error::Access)?;
-        let d11: Vec<chip::Core> = self
-            .cores
-            .iter()
-            .copied()
-            .filter(|core| core.id == chip::CORE_D11)
-            .collect();
-        for core in d11 {
-            Chip::disable_core(&mut self.bus, core, 12, 4).map_err(|_| Error::Access)?;
+        if ca7 {
+            // brcmf_chip_ca7_set_passive: reset the first 80211 core.
+            let d11 = self.core_of(chip::CORE_D11)?;
+            Chip::reset_core(&mut self.bus, d11, 12, 4, 4).map_err(|_| Error::Access)?;
+        } else {
+            let d11: Vec<chip::Core> = self
+                .cores
+                .iter()
+                .copied()
+                .filter(|core| core.id == chip::CORE_D11)
+                .collect();
+            for core in d11 {
+                Chip::disable_core(&mut self.bus, core, 12, 4).map_err(|_| Error::Access)?;
+            }
         }
         let ioctrl = self.backplane_read(arm.wrapper + AI_IOCTRL)?;
         let resetctrl = self.backplane_read(arm.wrapper + AI_RESETCTRL)?;
