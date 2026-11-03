@@ -597,3 +597,118 @@ kernel_test_in!(
     "drivers/wireless/ath9k/identity",
     smoke_ath9k_ar9280_identify_reads_def_map_two_chains
 );
+
+fn ar5008_fake(srev: u32, opflags: u8, rx: u8, tx: u8, radio: u32, gpio: u32) -> Fake {
+    let mut io = Fake::new();
+    io.registers.insert(AR_SREV, srev);
+    io.registers.insert(0x9c00, radio);
+    io.registers.insert(0x4048, gpio);
+    let mut image = chip_image(&MAP_DEF, 3256, rx, tx);
+    // opCapFlags is outside the checksum fixup: keep the XOR at 0xffff.
+    let old = u16::from_le_bytes([image[6], image[7]]);
+    image[6] = opflags;
+    let new = u16::from_le_bytes([image[6], image[7]]);
+    let sum = u16::from_le_bytes([image[2], image[3]]) ^ old ^ new;
+    image[2..4].copy_from_slice(&sum.to_le_bytes());
+    io.words.fill(0xffff);
+    io.words[0] = 0xa55a;
+    for (index, bytes) in image.chunks_exact(2).enumerate() {
+        io.words[MAP_DEF.start_word + index] = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    io
+}
+
+fn smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks() -> TestResult {
+    // PCI AR5416 2.2 (legacy SREV 0xd2), 2.4 GHz-only map: disablepcie,
+    // AR2133 radio (raw 0xb0 -> 0xd0), CB71 GPIO 0 high -> RX 0x5.
+    let mut io = ar5008_fake(0xd2, 0x02, 7, 7, 0xb000_0000, 1 << 14);
+    let Ok((revision, identity, radio, _)) = identify_ar5008(&mut io, Chip::Ar5416, 0x0023) else {
+        return TestResult::Fail("PCI AR5416 identification failed");
+    };
+    let serdes: Vec<_> = io
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Write(0x4040, v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    let radio_read = io.ops.iter().position(|op| *op == Op::Read(0x9c00));
+    let serdes2 = io.ops.iter().position(|op| *op == Op::Write(0x4044, 0));
+    let eeprom = io.ops.iter().position(|op| *op == Op::Read(EEPROM_WINDOW));
+    if revision.mac_version != 0xd
+        || radio.analog_rev != 0xd0
+        || identity.rx_chainmask != 5
+        || identity.tx_chainmask != 7
+        || serdes.len() != 9
+        || serdes[0] != 0x9248_fc00
+        || serdes[8] != 0x000e_1007
+        || !(serdes2 < radio_read && radio_read < eeprom)
+    {
+        return TestResult::Fail("PCI AR5416 SerDes, radio claim or CB71 mask wrong");
+    }
+    // GPIO 0 low -> 0x7; a dual-band PCI map keeps the EEPROM mask.
+    let mut io = ar5008_fake(0xd2, 0x02, 3, 7, 0xb000_0000, 0);
+    let low = identify_ar5008(&mut io, Chip::Ar5416, 0x0023).map(|r| r.1.rx_chainmask);
+    let mut io = ar5008_fake(0xd2, 0x03, 3, 7, 0xb000_0000, 1 << 14);
+    let dual = identify_ar5008(&mut io, Chip::Ar5416, 0x0023).map(|r| r.1.rx_chainmask);
+    if low != Ok(7) || dual != Ok(3) {
+        return TestResult::Fail("CB71 rule applied to the wrong board");
+    }
+    // AR5418 PCIe (0xc2): no SerDes writes, radio major 0 reads as AR5133.
+    let mut io = ar5008_fake(0xc2, 0x03, 3, 3, 0, 1 << 14);
+    let pcie = identify_ar5008(&mut io, Chip::Ar5416, 0x0024);
+    if pcie.map(|r| (r.1.rx_chainmask, r.2.analog_rev)) != Ok((3, 0xc0))
+        || io.ops.iter().any(|op| matches!(op, Op::Write(0x4040, _)))
+    {
+        return TestResult::Fail("AR5418 PCIe identification wrong");
+    }
+    // AR9160 with an unsupported radio major (0x10) never reads the map.
+    let mut io = ar5008_fake(0x0004_01ff, 0x03, 3, 3, 0x8000_0000, 0);
+    if identify_ar5008(&mut io, Chip::Ar9160, 0x0027).map(|_| ())
+        != Err(BringUpError::UnsupportedRevision)
+        || io.ops.contains(&Op::Read(EEPROM_WINDOW))
+    {
+        return TestResult::Fail("AR9160 accepted an unsupported radio");
+    }
+    // Silicon/device mismatch is refused before any write.
+    let mut io = ar5008_fake(0xd2, 0x03, 3, 3, 0, 0);
+    if identify_ar5008(&mut io, Chip::Ar9160, 0x0027).map(|_| ())
+        != Err(BringUpError::UnsupportedRevision)
+        || io.ops.iter().any(|op| matches!(op, Op::Write(..)))
+    {
+        return TestResult::Fail("AR5008 identification wrote to a mismatched part");
+    }
+    if fixup_chainmask(7, 0x8) != 7 || fixup_chainmask(7, 0xd) != 5 {
+        return TestResult::Fail("fixup_chainmask differs from hw.c");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks
+);
+
+fn smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset() -> TestResult {
+    let mut io = Fake::new();
+    if sleep_ar5008_io(&mut io, Chip::Ar5416).is_err()
+        || io.ops.iter().rev().find(|op| matches!(op, Op::Write(..)))
+            != Some(&Op::Write(AR_RC, 0x101))
+    {
+        return TestResult::Fail("AR5416 FULL_SLEEP asserted the RTC reset");
+    }
+    let mut io = Fake::new();
+    if sleep_ar5008_io(&mut io, Chip::Ar9160).is_err()
+        || !matches!(
+            io.ops.iter().rev().find(|op| matches!(op, Op::Write(..))),
+            Some(Op::Write(AR_RTC_RESET, _))
+        )
+    {
+        return TestResult::Fail("AR9160 FULL_SLEEP left the RTC running");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset
+);

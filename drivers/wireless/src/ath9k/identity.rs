@@ -239,17 +239,20 @@ fn disable_and_sleep_with_pcie(
     io: &mut impl RegisterIo,
     pcie_xe2: Option<bool>,
 ) -> Result<(), BringUpError> {
-    disable_and_sleep_with(io, false, |io| match pcie_xe2 {
+    disable_and_sleep_with(io, false, true, |io| match pcie_xe2 {
         Some(xe2) => super::pcie_pm::configure(io, true, xe2, true),
         None => Ok(()),
     })
 }
 
-/// `disable_and_sleep` with the reset type (`cold`) and the D3
+/// `disable_and_sleep` with the reset type (`cold`), whether
+/// `ath9k_set_power_sleep` asserts the active-low RTC reset (`rtc_off`:
+/// every part except AR5416/AR9271) and the D3
 /// `ath9k_hw_configpcipowersave(ah, true)` step of the chip.
 fn disable_and_sleep_with<R: RegisterIo>(
     io: &mut R,
     cold: bool,
+    rtc_off: bool,
     pcie: impl FnOnce(&mut R) -> Result<(), BringUpError>,
 ) -> Result<(), BringUpError> {
     if !io.authorized() {
@@ -266,9 +269,20 @@ fn disable_and_sleep_with<R: RegisterIo>(
     io.write32(AR_STA_ID1, id1 | AR_STA_ID1_PWR_SAV);
     io.write32(AR_RTC_FORCE_WAKE, wake & !1);
     io.write32(AR_RC, 0x101);
-    io.write32(AR_RTC_RESET, rtc & !1);
-    io.delay_us(2);
+    if rtc_off {
+        io.write32(AR_RTC_RESET, rtc & !1);
+        io.delay_us(2);
+    }
     Ok(())
+}
+
+/// AR5416/AR5418/AR9160 `ath_pci_suspend`: WARM reset
+/// (`ath9k_hw_chip_reset` takes no COLD branch below AR9280), no
+/// `configpcipowersave` (AR9280_20_OR_LATER only) and FULL_SLEEP, which on
+/// AR5416 leaves the RTC out of reset (`ath9k_set_power_sleep`).
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+fn sleep_ar5008_io(io: &mut impl RegisterIo, chip: Chip) -> Result<(), BringUpError> {
+    disable_and_sleep_with(io, false, chip != Chip::Ar5416, |_| Ok(()))
 }
 
 pub(super) fn sleep(
@@ -287,7 +301,7 @@ pub(super) fn sleep_ar9280(
     cap: Cap<BusDeviceCap, Write>,
     aspm: bool,
 ) -> Result<(), BringUpError> {
-    disable_and_sleep_with(&mut Registers::new(mmio, cap), true, |io| {
+    disable_and_sleep_with(&mut Registers::new(mmio, cap), true, true, |io| {
         super::pcie_pm::configure_ar9280(io, aspm, true)
     })
 }
@@ -394,6 +408,14 @@ pub(in crate::ath9k) fn identify_chip(
     // AR9280 (closed loop; open-loop maps are refused at preparation) takes
     // the COLD reset every `ath9k_hw_reset` gives it.
     reset_with(io, expected == Chip::Ar9280)?;
+    read_map(io, expected, revision)
+}
+
+fn read_map(
+    io: &mut impl RegisterIo,
+    expected: Chip,
+    revision: Revision,
+) -> Result<(Revision, Identity, alloc::boxed::Box<[u8]>), BringUpError> {
     let map = expected.eeprom_map();
     let magic = read_eeprom_word(io, 0, EEPROM_WINDOW_WORDS)?;
     let mut image = alloc::vec![0u8; map.bytes()].into_boxed_slice();
@@ -443,6 +465,122 @@ pub(super) fn read(
     cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(Identity, [u8; EEPROM_4K_BYTES]), BringUpError> {
     identify(&mut Registers::new(mmio, cap))
+}
+
+/// An AR5008-PHY identification: revision, effective identity, radio and
+/// the normalized map.
+pub(in crate::ath9k) type Identified = (Revision, Identity, Radio, alloc::boxed::Box<[u8]>);
+
+/// The AR5008-PHY identification facts beyond the map: the external radio
+/// revision (`ah->hw_version.analog5GhzRev`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+pub(in crate::ath9k) struct Radio {
+    pub analog_rev: u8,
+}
+
+/// `ar9002_hw.c::ar9002_hw_get_radiorev` + `ar9002_hw_rf_claim`: radio
+/// major 0 reads as AR5133; AR5133/AR5122/AR2133/AR2122 are accepted, every
+/// other major refused.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+pub(in crate::ath9k) fn claim_radio(io: &mut impl RegisterIo) -> Result<Radio, BringUpError> {
+    io.write32(0x9800, 7); // AR_PHY(0).
+    io.write32(0x98d8, 0x7058); // AR_PHY(0x36).
+    for _ in 0..8 {
+        io.write32(0x9880, 0x0001_0000); // AR_PHY(0x20).
+    }
+    let raw = io.read32(0x9c00); // AR_PHY(256).
+    if raw == u32::MAX || !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    let value = (raw >> 24) & 0xff;
+    let value = super::phy::ar5008::reverse_bits(((value & 0xf0) >> 4) | ((value & 0x0f) << 4), 8);
+    match value & 0xf0 {
+        0 => Ok(Radio { analog_rev: 0xc0 }),
+        0xc0 | 0xd0 | 0xe0 | 0xf0 => Ok(Radio {
+            analog_rev: value as u8,
+        }),
+        _ => Err(BringUpError::UnsupportedRevision),
+    }
+}
+
+/// `hw.c::ath9k_hw_disablepcie`: AR5416 (macVersion 0xd/0xc) that is not
+/// PCI Express. With the legacy `AR_SREV` format only macVersion 0xc
+/// (AR5418) is `is_pciexpress`, so this is the PCI AR5416.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+fn disable_pcie(io: &mut impl RegisterIo) {
+    for word in [
+        0x9248_fc00,
+        0x2492_4924,
+        0x2800_0029,
+        0x5716_0824,
+        0x2598_0579,
+        0x0000_0000,
+        0x1aaa_be40,
+        0xbe10_5554,
+        0x000e_1007,
+    ] {
+        io.write32(0x4040, word); // AR_PCIE_SERDES.
+    }
+    io.write32(0x4044, 0); // AR_PCIE_SERDES2.
+}
+
+/// `hw.c::fixup_chainmask`: the mask within the chip's chains, or every
+/// chain when nothing is left.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+pub(in crate::ath9k) fn fixup_chainmask(chip: u8, mask: u8) -> u8 {
+    match mask & chip {
+        0 => chip,
+        fixed => fixed,
+    }
+}
+
+/// AR5416/AR5418/AR9160 identification in `ath9k_hw_init` order: revision,
+/// power-on + WARM reset, `ath9k_hw_disablepcie` (PCI AR5416),
+/// `ar9002_hw_rf_claim`, the def map, then `ath9k_hw_fill_cap_info`'s chain
+/// masks: the CB71 rule for the PCI AR5416 without `AR5416_OPFLAGS_11A`
+/// (GPIO 0 input high: RX 0x5, else 0x7, from `AR_GPIO_IN_OUT`
+/// `AR_GPIO_IN_VAL`) and `fixup_chainmask` against the three chains. The
+/// retained map is unchanged; `Identity` carries the effective masks.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+pub(in crate::ath9k) fn identify_ar5008(
+    io: &mut impl RegisterIo,
+    expected: Chip,
+    device: u16,
+) -> Result<Identified, BringUpError> {
+    if !matches!(expected, Chip::Ar5416 | Chip::Ar9160)
+        || Chip::for_device(device) != Some(expected)
+    {
+        return Err(BringUpError::UnsupportedRevision);
+    }
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    let srev = io.read32(AR_SREV);
+    if srev == u32::MAX {
+        return Err(BringUpError::DeviceGone);
+    }
+    let revision = match Revision::decode(srev) {
+        Some(revision) if revision.chip == expected => revision,
+        _ => return Err(BringUpError::UnsupportedRevision),
+    };
+    reset_with(io, false)?;
+    if revision.mac_version == super::chips::AR_SREV_VERSION_5416_PCI {
+        disable_pcie(io);
+    }
+    let radio = claim_radio(io)?;
+    let (revision, mut identity, image) = read_map(io, expected, revision)?;
+    let chip = 0x7;
+    if device == 0x0023 && image[6] & 0x01 == 0 {
+        let gpio = io.read32(0x4048);
+        if gpio == u32::MAX {
+            return Err(BringUpError::DeviceGone);
+        }
+        identity.rx_chainmask = if (gpio >> 14) & 1 != 0 { 0x5 } else { 0x7 };
+    }
+    identity.rx_chainmask = fixup_chainmask(chip, identity.rx_chainmask);
+    identity.tx_chainmask = fixup_chainmask(chip, identity.tx_chainmask);
+    Ok((revision, identity, radio, image))
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

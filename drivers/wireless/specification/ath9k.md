@@ -1726,6 +1726,27 @@ the 534/538 selected Linux rows),
 `smoke_ath9k_ar9160_addac_bias_persists_across_bands`,
 `smoke_ath9k_ar5008_preparation_refuses_wrong_inputs`.
 
+AR5008 identification (`identity::identify_ar5008`) follows `ath9k_hw_init`:
+the `AR_SREV` decode must match the device ID's chip before any write; then
+power-on + WARM reset (`ath9k_hw_chip_reset` has no COLD branch below
+AR9280), `ath9k_hw_disablepcie` for the PCI AR5416 (macVersion 0xd; the
+legacy format makes only 0xc `is_pciexpress`: nine `AR_PCIE_SERDES` words
+and `AR_PCIE_SERDES2 = 0`), `ar9002_hw_rf_claim` (`AR_PHY(0x36)` /
+`AR_PHY(0x20)` radio-revision strobe, `AR_PHY(256)` nibble swap + bit
+reverse; major 0 reads as AR5133, AR5133/AR5122/AR2133/AR2122 accepted,
+others refused before the map is read), the def map at word 64, and the
+`ath9k_hw_fill_cap_info` chain masks: the CB71 rule for `0x0023` without
+`AR5416_OPFLAGS_11A` (GPIO 0 in `AR_GPIO_IN_OUT` high: RX 0x5, else 0x7)
+and `fixup_chainmask` against the three chains. The retained map is not
+rewritten; `Identity` carries the effective masks. `ath9k_hw_chip_test` is
+not run (as for the other non-AR9285 parts). `identity::sleep_ar5008_io`
+(the MMIO wrapper lands with the owner) is `ath_pci_suspend` for these parts: WARM reset, no D3 PCIe word
+(`ath9k_hw_configpcipowersave` is AR9280_20_OR_LATER-only) and FULL_SLEEP
+that, on AR5416, leaves the RTC out of reset (`ath9k_set_power_sleep`).
+Smokes (written, not executed):
+`smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks`,
+`smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,
