@@ -921,6 +921,10 @@ pub(crate) fn install(
     // Display-14 DC service: DC states exited and held off (Init) until
     // the card worker loads the DMC program. Inert for every other IP.
     crate::intel_gpu_dc_states::install(generation, bar, cap);
+    // The owned internal Pipe A is lit (the console scans out of it): its
+    // pipe DMC is enabled once the program loads (intel_modeset_setup's
+    // sanitize of an active pipe). A refused DC exit still records it.
+    let _ = crate::intel_gpu_dc_states::pipe_lit_for_bar(&bar, 0);
     if let Some(card) = crate::drm_registry::mode_state(index) {
         let mut card = card.lock();
         card.native_atomic = true;

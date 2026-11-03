@@ -892,3 +892,183 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dc_states",
     smoke_dc_states_audit_unreachable_display_paths_on_mtl
 );
+
+/// A display-14 container carrying main, pipe A and pipe C programs at
+/// the windows and stack tops the shipped `mtl_dmc.bin` uses (main
+/// 0x80000, pipe A 0x90000 / SSP 0x96FC0, pipe C 0x52000 / SSP 0x53FC0),
+/// laid out field by field like [`mtl_container`].
+fn mtl_container_with_pipes() -> Vec<u8> {
+    let package = 16 + 32 * 12;
+    let mut blob = alloc::vec![0u8; 128 + package];
+    put32(&mut blob, 0, 0x09);
+    put32(&mut blob, 4, 32);
+    put32(&mut blob, 8, 0x1_0000);
+    put32(&mut blob, 88, 0x0002_0017);
+    blob[128] = (package / 4) as u8;
+    blob[129] = 2;
+    let programs: [(u8, u32, [u32; 2], &[(u32, u32)]); 3] = [
+        (
+            0,
+            0x80000,
+            [0xD0C0_0001, 0xD0C0_0002],
+            &[(0x8F074, 0x86FC0), (0x8F034, 0x8003_3200)],
+        ),
+        (
+            1,
+            0x90000,
+            [0xA0A0_0001, 0xA0A0_0002],
+            &[
+                (0x5F074, 0x96FC0),
+                (0x5F034, 0x8003_DF00),
+                (0x5F004, 0x212C_20F4),
+            ],
+        ),
+        (
+            3,
+            0x52000,
+            [0xC0C0_0001, 0xC0C0_0002],
+            &[
+                (0x5F874, 0x53FC0),
+                (0x5F83C, 0x8003_2C00),
+                (0x5F80C, 0x24A0_2388),
+            ],
+        ),
+    ];
+    put32(&mut blob, 128 + 12, programs.len() as u32);
+    for (i, (id, start, payload, mmio)) in programs.iter().enumerate() {
+        let entry = 128 + 16 + 12 * i;
+        blob[entry + 1] = *id;
+        blob[entry + 2] = b'*';
+        blob[entry + 3] = b'*';
+        let prog = blob.len();
+        put32(&mut blob, entry + 4, ((prog - (128 + package)) / 4) as u32);
+        blob.resize(prog + 256 + payload.len() * 4, 0);
+        put32(&mut blob, prog, 0x4040_3E3E);
+        blob[prog + 4] = 64;
+        blob[prog + 5] = 3;
+        put32(&mut blob, prog + 12, payload.len() as u32);
+        put32(&mut blob, prog + 16, 0x0002_0017);
+        put32(&mut blob, prog + 20, *start);
+        put32(&mut blob, prog + 92, mmio.len() as u32);
+        for (j, (a, d)) in mmio.iter().enumerate() {
+            put32(&mut blob, prog + 96 + 4 * j, *a);
+            put32(&mut blob, prog + 176 + 4 * j, *d);
+        }
+        for (j, v) in payload.iter().enumerate() {
+            put32(&mut blob, prog + 256 + 4 * j, *v);
+        }
+    }
+    blob
+}
+
+fn smoke_dc_states_pipe_dmc_follows_pipe_lifetime() -> TestResult {
+    let fake = Fake::default();
+    let core = IrqSafeSpinLock::new(DcCore::new(XELPDP_ALLOWED_DC_MASK));
+    {
+        let mut c = core.lock();
+        let _ = c.sanitize(&fake);
+        let _ = c.get(&fake, DcUser::Init);
+        // KMS install reports the owned Pipe A lit before any program.
+        if c.pipe_lit(&fake, 0)
+            || c.pipes_lit() != 1
+            || !fake.writes_to(MTL_PIPEDMC_CONTROL).is_empty()
+        {
+            return TestResult::Fail("a lit pipe without a program must only be recorded");
+        }
+    }
+    // Load: every program streams (pipe events disabled), then the lit
+    // pipe's DMC is enabled before the Init release.
+    let Some(due) = publication_step(&core, &fake, 0, || Ok(Arc::new(mtl_container_with_pipes())))
+    else {
+        return TestResult::Fail("the pipe-carrying container must load");
+    };
+    let log = fake.log();
+    let pipe_a = log.iter().position(|w| *w == (0x90000, 0xA0A0_0001));
+    let pipe_c = log.iter().position(|w| *w == (0x52000, 0xC0C0_0001));
+    let enable = log.iter().position(|w| *w == (MTL_PIPEDMC_CONTROL, 1));
+    if !matches!((pipe_a, pipe_c, enable), (Some(a), Some(c), Some(e)) if a < c && c < e)
+        || fake.get(0x5F034) != 0x8003_0100
+        || fake.get(0x5F83C) != 0x8003_0100
+        || core.lock().pipes_enabled() != 1
+    {
+        return TestResult::Fail("load must stream every program, events disabled, then enable A");
+    }
+    // An owned pipe DMC does not block DC6; a foreign one does.
+    if core.lock().arm_if_due(&fake, due, ArmGates::default()) != Ok(DC_STATE_EN_UPTO_DC6) {
+        return TestResult::Fail("an owned pipe DMC must not refuse re-entry");
+    }
+    let release = |at: u64| -> u64 {
+        let mut c = core.lock();
+        let _ = c.get(&fake, DcUser::Kms);
+        c.put(DcUser::Kms, at).unwrap_or(0)
+    };
+    fake.set(MTL_PIPEDMC_CONTROL, 1 | (1 << 4));
+    let due = release(MS);
+    if core.lock().arm_if_due(&fake, due, ArmGates::default())
+        != Err(ArmBlock::UnownedPipeDmc(0x11))
+    {
+        return TestResult::Fail("a pipe DMC this driver did not enable must refuse re-entry");
+    }
+    fake.set(MTL_PIPEDMC_CONTROL, 1);
+    // A pipe C owner lights its pipe: the table is re-applied
+    // (need_pipedmc_load_mmio), then PIPEDMC_ENABLE_MTL(C).
+    {
+        let mut c = core.lock();
+        let _ = c.get(&fake, DcUser::PipeDmc);
+        fake.clear_log();
+        if !c.pipe_lit(&fake, 2)
+            || fake.log()
+                != [
+                    (0x5F874, 0x53FC0),
+                    (0x5F83C, 0x8003_0100),
+                    (0x5F80C, 0x24A0_2388),
+                    (MTL_PIPEDMC_CONTROL, 1 | (1 << 8)),
+                ]
+        {
+            return TestResult::Fail("pipe C enable must re-apply its table, then enable");
+        }
+        c.pipe_dark(&fake, 2);
+        if fake.get(MTL_PIPEDMC_CONTROL) != 1 || c.pipes_enabled() != 1 || c.pipes_lit() != 1 {
+            return TestResult::Fail("a dark pipe must clear only its own enable");
+        }
+        let _ = c.put(DcUser::PipeDmc, 2 * MS);
+    }
+    // Re-entry verifies only the main program (assert_main_dmc_loaded):
+    // pipe C/D state is not kept across DC6.
+    fake.set(0x52000, 0);
+    let due = release(3 * MS);
+    if core.lock().arm_if_due(&fake, due, ArmGates::default()) != Ok(DC_STATE_EN_UPTO_DC6) {
+        return TestResult::Fail("re-entry must not require pipe C program RAM");
+    }
+    // Suspend: the pipe DMC is disabled before the program disable.
+    {
+        let mut c = core.lock();
+        let _ = c.suspend_begin(&fake);
+        fake.clear_log();
+        c.suspend_commit(&fake);
+        let log = fake.log();
+        if log.first() != Some(&(MTL_PIPEDMC_CONTROL, 0))
+            || !log.contains(&(0x5F034, 0x0003_0100))
+            || !log.contains(&(0x5F834, 0x0003_0100))
+            || c.pipes_enabled() != 0
+            || c.pipes_lit() != 1
+        {
+            return TestResult::Fail("suspend must disable pipe DMC, then every program");
+        }
+    }
+    // Resume: reload, then the still-lit pipe A is re-enabled.
+    fake.power_loss();
+    fake.clear_log();
+    if publication_step(&core, &fake, 50 * MS, || Err(DcRefusal::Authority)).is_none()
+        || fake.get(MTL_PIPEDMC_CONTROL) != 1
+        || core.lock().pipes_enabled() != 1
+        || fake.get(0x90000) != 0xA0A0_0001
+    {
+        return TestResult::Fail("resume must reload and re-enable the lit pipe DMC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dc_states",
+    smoke_dc_states_pipe_dmc_follows_pipe_lifetime
+);

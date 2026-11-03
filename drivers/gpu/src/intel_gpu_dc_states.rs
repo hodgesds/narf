@@ -68,13 +68,24 @@
 //!   after the display has quiesced disables the DMC program; the
 //!   first publication after resume reloads it before releasing.
 //!
+//! Pipe DMC (`intel_dmc_enable_pipe` / `intel_dmc_disable_pipe`): every
+//! accepted pipe program is loaded with the main program, events
+//! disabled. A pipe owner reports its pipe lit ([`pipe_lit_for_bar`],
+//! after the pipe is enabled or adopted lit) and dark
+//! ([`pipe_dark_for_bar`], before it is disabled); the service enables
+//! `PIPEDMC_ENABLE_MTL(pipe)` for every lit pipe whose program is
+//! loaded, re-enables them after every (re)load, and clears its enables
+//! before the suspend-time program disable. KMS install reports the
+//! owned internal Pipe A lit.
+//!
 //! Stricter than the pinned tree, and why: re-entry is refused (not
 //! merely warned about) with the utility pin in PWM mode, with a pipe
-//! DMC enabled that this driver did not load, while an external route
+//! DMC enabled that this driver did not enable, while an external route
 //! is live, after any `DC_STATE_EN` write failed to stick, and whenever
-//! the main program no longer verifies. DC3CO and DC9 are never
-//! targeted. Program loss found at re-entry is repaired by a reload
-//! before the next attempt.
+//! the main program no longer verifies. A pipe program that does not
+//! verify is not enabled. DC3CO and DC9 are never targeted. Program
+//! loss found at re-entry is repaired by a reload before the next
+//! attempt.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -85,9 +96,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dmc::{
-    disable_program, load_program, parse_dmc_firmware_xelpdp, pipedmc_enable_mtl, verify_loaded,
-    DmcError, DmcVerifyError, DC_STATE_EN, DG1_DMC_DEBUG_DC5_COUNT, MTL_DMC_FIRMWARE,
-    MTL_PIPEDMC_CONTROL,
+    disable_pipe, disable_program, enable_pipe, load_program, parse_dmc_firmware_xelpdp,
+    pipedmc_enable_mtl, verify_loaded, verify_program, DmcError, DmcFirmware, DmcId,
+    DmcVerifyError, DC_STATE_EN, DG1_DMC_DEBUG_DC5_COUNT, MTL_DMC_FIRMWARE, MTL_PIPEDMC_CONTROL,
 };
 
 // ── Register facts (intel_display_regs.h, intel_backlight_regs.h) ─
@@ -200,6 +211,9 @@ pub enum DcUser {
     /// One full-AUX panel-backlight conversation (AUX transaction, PPS
     /// gate, relight step): AUX_A is a DC_off domain on display 14.
     Aux = 6,
+    /// One pipe-DMC enable or disable conversation
+    /// (`MTL_PIPEDMC_CONTROL`, pipe C/D MMIO re-apply).
+    PipeDmc = 9,
     /// An external display route, held from activation until its stop is
     /// verified. The Type-C/DDI lanes, AUX_B and pipes B-D are DC_off
     /// domains (`xelpd_pwdoms_dc_off`), and `intel_cx0_phy.c` holds
@@ -212,7 +226,7 @@ pub enum DcUser {
     /// registered liveness predicate ([`register_external_live`]).
     External = 8,
 }
-const USER_COUNT: usize = 9;
+const USER_COUNT: usize = 10;
 
 /// Why a DC transition could not be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,7 +305,7 @@ pub enum ArmBlock {
     NoTarget,
     /// See [`ArmGates::external_route_active`].
     ExternalRoute,
-    /// A pipe DMC is enabled that this driver never loaded.
+    /// A pipe DMC is enabled that this driver did not enable.
     UnownedPipeDmc(u32),
     /// The utility pin drives PWM (`assert_can_enable_dc6`).
     UtilPinPwm,
@@ -321,6 +335,17 @@ pub struct DcCore {
     mismatches: u32,
     arms: u64,
     last_block: Option<ArmBlock>,
+    /// Pipes (bit per pipe index) whose owner reported them lit.
+    pipes_lit: u32,
+    /// Pipes whose `PIPEDMC_ENABLE_MTL` bit this driver set.
+    pipes_enabled: u32,
+}
+
+/// `MTL_PIPEDMC_CONTROL` bits for a pipe mask.
+fn pipedmc_bits(pipes: u32) -> u32 {
+    (0..4)
+        .filter(|p| pipes & (1 << p) != 0)
+        .fold(0, |bits, p| bits | pipedmc_enable_mtl(p))
 }
 
 impl DcCore {
@@ -341,6 +366,8 @@ impl DcCore {
             mismatches: 0,
             arms: 0,
             last_block: None,
+            pipes_lit: 0,
+            pipes_enabled: 0,
         }
     }
 
@@ -391,6 +418,85 @@ impl DcCore {
     /// The last re-entry refusal.
     pub fn last_block(&self) -> Option<ArmBlock> {
         self.last_block
+    }
+    /// Pipes reported lit.
+    pub fn pipes_lit(&self) -> u32 {
+        self.pipes_lit
+    }
+    /// Pipes whose pipe DMC this driver enabled.
+    pub fn pipes_enabled(&self) -> u32 {
+        self.pipes_enabled
+    }
+
+    /// A pipe owner lit `pipe` (or adopted it lit): record it and, with a
+    /// loaded program, `intel_dmc_enable_pipe`. The caller holds a DC_off
+    /// reference. Returns whether the pipe DMC is now enabled.
+    pub fn pipe_lit<M: MmioWindow + ?Sized>(&mut self, regs: &M, pipe: u32) -> bool {
+        if pipe >= 4 {
+            return false;
+        }
+        self.pipes_lit |= 1 << pipe;
+        if !matches!(self.program, ProgramState::Loaded { .. }) {
+            return false;
+        }
+        let Some(blob) = self.blob.clone() else {
+            return false;
+        };
+        let Ok(firmware) = parse_dmc_firmware_xelpdp(&blob, b'*', b'*') else {
+            return false;
+        };
+        self.enable_one(regs, &firmware, pipe)
+    }
+
+    /// A pipe owner is about to disable `pipe`: `intel_dmc_disable_pipe`
+    /// for an enable this driver made, then forget the pipe. The caller
+    /// holds a DC_off reference.
+    pub fn pipe_dark<M: MmioWindow + ?Sized>(&mut self, regs: &M, pipe: u32) {
+        if pipe >= 4 {
+            return;
+        }
+        self.pipes_lit &= !(1 << pipe);
+        if self.pipes_enabled & (1 << pipe) == 0 {
+            return;
+        }
+        if let Some(blob) = self.blob.clone() {
+            if let Ok(firmware) = parse_dmc_firmware_xelpdp(&blob, b'*', b'*') {
+                if disable_pipe(regs, &firmware, pipe).is_ok() {
+                    self.pipes_enabled &= !(1 << pipe);
+                }
+            }
+        }
+    }
+
+    fn enable_one<M: MmioWindow + ?Sized>(
+        &mut self,
+        regs: &M,
+        firmware: &DmcFirmware<'_>,
+        pipe: u32,
+    ) -> bool {
+        match enable_pipe(regs, firmware, pipe) {
+            Ok(true) => {
+                self.pipes_enabled |= 1 << pipe;
+                true
+            }
+            _ => {
+                self.pipes_enabled &= !(1 << pipe);
+                false
+            }
+        }
+    }
+
+    /// After a (re)load: `intel_dmc_enable_pipe` for every lit pipe, as
+    /// the crtc enable / sanitize paths do once the program is back.
+    pub fn enable_lit_pipes<M: MmioWindow + ?Sized>(&mut self, regs: &M, blob: &[u8]) {
+        let Ok(firmware) = parse_dmc_firmware_xelpdp(blob, b'*', b'*') else {
+            return;
+        };
+        for pipe in 0..4 {
+            if self.pipes_lit & (1 << pipe) != 0 {
+                self.enable_one(regs, &firmware, pipe);
+            }
+        }
     }
 
     /// `gen9_sanitize_dc_state`: adopt the hardware field.
@@ -534,7 +640,7 @@ impl DcCore {
         if pipedmc == u32::MAX {
             return Err(ArmBlock::Unavailable);
         }
-        if pipedmc & PIPEDMC_ENABLE_MTL_ALL != 0 {
+        if pipedmc & PIPEDMC_ENABLE_MTL_ALL & !pipedmc_bits(self.pipes_enabled) != 0 {
             return Err(ArmBlock::UnownedPipeDmc(pipedmc));
         }
         if self.target & DC_STATE_EN_UPTO_DC6 != 0 {
@@ -547,11 +653,13 @@ impl DcCore {
                 return Err(ArmBlock::UtilPinPwm);
             }
         }
-        // assert_main_dmc_loaded, as a refusal.
+        // assert_main_dmc_loaded, as a refusal. Only the main program:
+        // pipe C/D DMC state is not kept across DC6 by design
+        // (need_pipedmc_load_mmio re-applies it at pipe enable).
         let blob = self.blob.clone().ok_or(ArmBlock::NoProgram)?;
         let firmware =
             parse_dmc_firmware_xelpdp(&blob, b'*', b'*').map_err(|_| ArmBlock::NoProgram)?;
-        if verify_loaded(regs, &firmware).is_err() {
+        if verify_program(regs, &firmware, DmcId::Main).is_err() {
             self.program = ProgramState::Lost;
             return Err(ArmBlock::ProgramLost);
         }
@@ -647,6 +755,16 @@ impl DcCore {
         }
         if let (ProgramState::Loaded { .. }, Some(blob)) = (self.program, self.blob.clone()) {
             if let Ok(firmware) = parse_dmc_firmware_xelpdp(&blob, b'*', b'*') {
+                // The pipes go dark before display-core uninit
+                // (intel_dmc_disable_pipe at crtc disable); they stay
+                // recorded lit and are re-enabled after the reload.
+                for pipe in 0..4 {
+                    if self.pipes_enabled & (1 << pipe) != 0
+                        && disable_pipe(regs, &firmware, pipe).is_ok()
+                    {
+                        self.pipes_enabled &= !(1 << pipe);
+                    }
+                }
                 disable_program(regs, &firmware);
             }
             self.program = ProgramState::Disabled;
@@ -686,7 +804,12 @@ pub fn publication_step<M: MmioWindow + ?Sized>(
     let blob = core.lock().begin_load(regs).ok().flatten();
     if let Some(blob) = blob {
         let result = load_and_verify(regs, &blob);
-        deadline = core.lock().finish_load(result, now);
+        let mut core = core.lock();
+        // Under the Load reference, before it is released.
+        if result.is_ok() {
+            core.enable_lit_pipes(regs, &blob);
+        }
+        deadline = core.finish_load(result, now);
     }
     core.lock().release_held(now).or(deadline)
 }
@@ -706,7 +829,11 @@ pub fn arm_step<M: MmioWindow + ?Sized>(
     let blob = core.lock().begin_load(regs).ok().flatten();
     if let Some(blob) = blob {
         let loaded = load_and_verify(regs, &blob);
-        core.lock().finish_load(loaded, now);
+        let mut core = core.lock();
+        if loaded.is_ok() {
+            core.enable_lit_pipes(regs, &blob);
+        }
+        core.finish_load(loaded, now);
     }
     core.lock().arm_if_due(regs, now, gates)
 }
@@ -905,6 +1032,56 @@ pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
 /// [`DcUser::ExternalRoute`] reference for the route's lifetime.
 pub(crate) fn acquire_for_bar(bar: &narf_bus::MmioRegion, user: DcUser) -> Result<DcRef, DcError> {
     take(service_for(bar), user)
+}
+
+/// A pipe owner lit `pipe` on this BAR's display (after enabling it, or
+/// when adopting a pipe firmware left lit): the pipe DMC is enabled
+/// under a [`DcUser::PipeDmc`] reference once the program is loaded,
+/// and again after every reload. Inert without a display-14 service.
+/// `Err` means DC states could not be exited; the pipe is still
+/// recorded and is enabled after the next load.
+pub fn pipe_lit_for_bar(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), DcError> {
+    let Some(service) = service_for(bar) else {
+        return Ok(());
+    };
+    let power = match take(Some(service.clone()), DcUser::PipeDmc) {
+        Ok(power) => power,
+        Err(error) => {
+            let mut core = service.core.lock();
+            if pipe < 4 {
+                core.pipes_lit |= 1 << pipe;
+            }
+            return Err(error);
+        }
+    };
+    service.core.lock().pipe_lit(&service.window, pipe);
+    drop(power);
+    Ok(())
+}
+
+/// A pipe owner is about to disable `pipe`: the pipe DMC this driver
+/// enabled is disabled first (`intel_dmc_disable_pipe`). Inert without a
+/// display-14 service. `Err` means DC states could not be exited; the
+/// pipe is forgotten but its enable bit, if any, remains and blocks DC
+/// re-entry as foreign until the hardware clears it.
+pub fn pipe_dark_for_bar(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), DcError> {
+    let Some(service) = service_for(bar) else {
+        return Ok(());
+    };
+    let power = match take(Some(service.clone()), DcUser::PipeDmc) {
+        Ok(power) => power,
+        Err(error) => {
+            let mut core = service.core.lock();
+            if pipe < 4 {
+                core.pipes_lit &= !(1 << pipe);
+                core.pipes_enabled &= !(1 << pipe);
+            }
+            return Err(error);
+        }
+    };
+    service.core.lock().pipe_dark(&service.window, pipe);
+    drop(power);
+    Ok(())
 }
 
 fn schedule_arm(service: &Arc<DcService>) {

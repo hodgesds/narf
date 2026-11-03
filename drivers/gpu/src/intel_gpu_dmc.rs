@@ -130,10 +130,14 @@
 //! and 14) before every load or disable sweep. Gen12 parsing,
 //! loading and its tests are unchanged. The pinned tree never bounds
 //! a program's RAM window, so on display 14 this driver accepts a
-//! main payload only inside 0x80000–0x8EFFF and skips the pipe
-//! programs (see [`parse_dmc_firmware_xelpdp`]). The DC-state
-//! machinery that consumes a loaded display-14 program lives in
-//! `intel_gpu_dc_states`.
+//! main payload only inside 0x80000–0x8EFFF and each pipe payload
+//! only inside its slot's [`DmcId::program_range`] (see
+//! [`parse_dmc_firmware_xelpdp`]). Like `intel_dmc_load_program`,
+//! every accepted program is loaded with its pipe events disabled;
+//! [`enable_pipe`] / [`disable_pipe`] are `intel_dmc_enable_pipe` /
+//! `intel_dmc_disable_pipe` for display 14. The DC-state machinery
+//! that consumes a loaded display-14 program, and ties pipe DMC
+//! enables to pipe lifetimes, lives in `intel_gpu_dc_states`.
 //!
 //! ## Composition
 //!
@@ -726,14 +730,10 @@ fn parse_program<'a>(
         DmcPlatform::Gen12 if header_ver == 3 => Some(id.program_range()),
         DmcPlatform::Gen12 => None,
         // Both header versions are windowed on display 14 (a v1
-        // program loads at 0x80000). Pipe programs are skipped
-        // before parse, so any other id has no window at all.
+        // program loads at 0x80000; a v1 pipe program therefore
+        // never fits its pipe window).
         DmcPlatform::Xelpdp if id == DmcId::Main => Some(XELPDP_MAIN_PROGRAM_WINDOW),
-        DmcPlatform::Xelpdp => {
-            return Err(DmcError::LoadAddrOutOfRange {
-                start: start_mmioaddr,
-            })
-        }
+        DmcPlatform::Xelpdp => Some(id.program_range()),
     };
     if let Some((lo, hi)) = window {
         let end = start_mmioaddr as u64 + payload_bytes as u64 - 1;
@@ -780,21 +780,22 @@ pub fn parse_dmc_firmware<'a>(
 /// container — `i915/mtl_dmc.bin` — against the pinned
 /// `intel_dmc.c` rules for DISPLAY_VERx100 == 1400: payload
 /// ceiling `XELPDP_DMC_MAX_FW_SIZE`, main MMIO table in the TGL
-/// main window, no TGL/ADL-S event fixups.
+/// main window, pipe MMIO tables in the ADL-P pipe window
+/// (`ADLP_PIPE_MMIO_START/END`), no TGL/ADL-S event fixups. A
+/// malformed pipe program leaves its slot empty, as in i915.
 ///
-/// Stricter than the pinned tree, and why:
+/// Stricter than the pinned tree, and why: i915 streams every
+/// payload to the firmware's own `start_mmioaddr` unbounded, and an
+/// unbounded firmware-chosen BAR offset could reach GGTT entries.
 /// - The main payload must fit [`XELPDP_MAIN_PROGRAM_WINDOW`]
-///   for v1 and v3 headers alike: i915 streams it to the
-///   firmware's own `start_mmioaddr` unbounded, and an unbounded
-///   firmware-chosen BAR offset could reach GGTT entries.
-/// - Pipe programs (ids 1..=4) are skipped and recorded in
-///   [`DmcFirmware::skipped_mask`]. Their MMIO tables are ranged
-///   by the pinned tree (`ADLP_PIPE_MMIO_START/END`), but their
-///   program-RAM windows are not, so streaming them would write
-///   a firmware-chosen offset. A skipped pipe DMC is never
-///   enabled (`MTL_PIPEDMC_CONTROL` is left clear); on ADL/MTL
-///   the main DMC saves and restores pipe A/B DMC state itself
-///   (`need_pipedmc_load_mmio`).
+///   for v1 and v3 headers alike.
+/// - A pipe payload must fit its slot's [`DmcId::program_range`]:
+///   A 0x90000–0x96FFF, B 0x98000–0x9EFFF, C 0x52000–0x53FFF,
+///   D 0x59000–0x5AFFF. These are the windows the shipped
+///   `mtl_dmc.bin` (v2.23) loads each pipe program into, with each
+///   program's `DMC_SSP_BASE` stack top 0x40 below the window end.
+///   A pipe program outside its window is not loaded and is
+///   recorded in [`DmcFirmware::skipped_mask`].
 pub fn parse_dmc_firmware_xelpdp(
     blob: &[u8],
     stepping: u8,
@@ -888,7 +889,7 @@ fn parse_for(
         };
         let skipped = match platform {
             DmcPlatform::Gen12 => matches!(id, DmcId::PipeC | DmcId::PipeD),
-            DmcPlatform::Xelpdp => id != DmcId::Main,
+            DmcPlatform::Xelpdp => false,
         };
         if skipped {
             skipped_mask |= 1 << id.index();
@@ -906,6 +907,11 @@ fn parse_for(
             Err(e) => {
                 if id == DmcId::Main {
                     return Err(e);
+                }
+                // A display-14 pipe program outside its window is a
+                // deliberate refusal, not a malformed slot.
+                if matches!(e, DmcError::LoadAddrOutOfRange { .. }) {
+                    skipped_mask |= 1 << id.index();
                 }
             }
         }
@@ -1084,37 +1090,133 @@ pub fn verify_loaded<M: MmioWindow + ?Sized>(
     fw: &DmcFirmware<'_>,
 ) -> Result<(), DmcVerifyError> {
     for id in DmcId::ALL {
-        let Some(prog) = fw.program(id) else {
-            continue;
-        };
-        let expected0 = u32::from_le_bytes([
-            prog.payload[0],
-            prog.payload[1],
-            prog.payload[2],
-            prog.payload[3],
-        ]);
-        let found0 = regs.read32(prog.start_mmioaddr as u64);
-        if found0 != expected0 {
-            return Err(DmcVerifyError::ProgramStart {
+        verify_program(regs, fw, id)?;
+    }
+    Ok(())
+}
+
+/// `assert_dmc_loaded` for one id, as a refusal: the program RAM start
+/// dword and every MMIO table entry. An absent program verifies.
+pub fn verify_program<M: MmioWindow + ?Sized>(
+    regs: &M,
+    fw: &DmcFirmware<'_>,
+    id: DmcId,
+) -> Result<(), DmcVerifyError> {
+    let Some(prog) = fw.program(id) else {
+        return Ok(());
+    };
+    let expected0 = u32::from_le_bytes([
+        prog.payload[0],
+        prog.payload[1],
+        prog.payload[2],
+        prog.payload[3],
+    ]);
+    let found0 = regs.read32(prog.start_mmioaddr as u64);
+    if found0 != expected0 {
+        return Err(DmcVerifyError::ProgramStart {
+            id,
+            expected: expected0,
+            found: found0,
+        });
+    }
+    for i in 0..prog.mmio_count {
+        let expected = load_mmiodata_for(fw.platform, id, prog.mmioaddr[i], prog.mmiodata[i]);
+        let found = regs.read32(prog.mmioaddr[i] as u64);
+        if found != expected {
+            return Err(DmcVerifyError::Mmio {
                 id,
-                expected: expected0,
-                found: found0,
+                index: i,
+                expected,
+                found,
             });
-        }
-        for i in 0..prog.mmio_count {
-            let expected = load_mmiodata_for(fw.platform, id, prog.mmioaddr[i], prog.mmiodata[i]);
-            let found = regs.read32(prog.mmioaddr[i] as u64);
-            if found != expected {
-                return Err(DmcVerifyError::Mmio {
-                    id,
-                    index: i,
-                    expected,
-                    found,
-                });
-            }
         }
     }
     Ok(())
+}
+
+// ── Pipe DMC (display 14) ───────────────────────────────────
+
+/// Why a display-14 pipe DMC was not enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeDmcError {
+    /// Not a display-14 container, or not pipe A..D.
+    Unsupported,
+    /// The pipe program did not verify (`assert_dmc_loaded`, which
+    /// i915 only warns about); the enable bit is left clear.
+    Verify(DmcVerifyError),
+    /// `MTL_PIPEDMC_CONTROL` read all-ones; nothing was written.
+    Unavailable,
+}
+
+/// `PIPE_TO_DMC_ID`.
+pub fn pipe_dmc_id(pipe: u32) -> Option<DmcId> {
+    u8::try_from(pipe + 1)
+        .ok()
+        .and_then(DmcId::from_u8)
+        .filter(|id| *id != DmcId::Main)
+}
+
+/// `need_pipedmc_load_mmio` for display 13..14 (ADL/MTL): pipe A/B
+/// DMC state is saved and restored by the main DMC; pipe C/D state
+/// needs its MMIO table re-applied when the pipe is enabled.
+pub fn xelpdp_pipe_needs_mmio(pipe: u32) -> bool {
+    pipe >= 2
+}
+
+/// `intel_dmc_enable_pipe` for display 14: re-apply pipe C/D MMIO
+/// (`dmc_load_mmio`, pipe events still disabled), verify the pipe
+/// program, then set `PIPEDMC_ENABLE_MTL(pipe)`. `Ok(false)` when the
+/// container carries no program for the pipe (i915 returns early).
+pub fn enable_pipe<M: MmioWindow + ?Sized>(
+    regs: &M,
+    fw: &DmcFirmware<'_>,
+    pipe: u32,
+) -> Result<bool, PipeDmcError> {
+    if fw.platform != DmcPlatform::Xelpdp {
+        return Err(PipeDmcError::Unsupported);
+    }
+    let id = pipe_dmc_id(pipe).ok_or(PipeDmcError::Unsupported)?;
+    let Some(prog) = fw.program(id) else {
+        return Ok(false);
+    };
+    let control = regs.read32(MTL_PIPEDMC_CONTROL);
+    if control == u32::MAX {
+        return Err(PipeDmcError::Unavailable);
+    }
+    if xelpdp_pipe_needs_mmio(pipe) {
+        for i in 0..prog.mmio_count {
+            regs.write32(
+                prog.mmioaddr[i] as u64,
+                load_mmiodata_for(fw.platform, id, prog.mmioaddr[i], prog.mmiodata[i]),
+            );
+        }
+    }
+    verify_program(regs, fw, id).map_err(PipeDmcError::Verify)?;
+    regs.write32(MTL_PIPEDMC_CONTROL, control | pipedmc_enable_mtl(pipe));
+    Ok(true)
+}
+
+/// `intel_dmc_disable_pipe` for display 14: clear
+/// `PIPEDMC_ENABLE_MTL(pipe)`. `Ok(false)` when the container carries
+/// no program for the pipe.
+pub fn disable_pipe<M: MmioWindow + ?Sized>(
+    regs: &M,
+    fw: &DmcFirmware<'_>,
+    pipe: u32,
+) -> Result<bool, PipeDmcError> {
+    if fw.platform != DmcPlatform::Xelpdp {
+        return Err(PipeDmcError::Unsupported);
+    }
+    let id = pipe_dmc_id(pipe).ok_or(PipeDmcError::Unsupported)?;
+    if fw.program(id).is_none() {
+        return Ok(false);
+    }
+    let control = regs.read32(MTL_PIPEDMC_CONTROL);
+    if control == u32::MAX {
+        return Err(PipeDmcError::Unavailable);
+    }
+    regs.write32(MTL_PIPEDMC_CONTROL, control & !pipedmc_enable_mtl(pipe));
+    Ok(true)
 }
 
 // ── DC-state handoff ────────────────────────────────────────
@@ -1916,16 +2018,46 @@ pub mod tests {
         }
     }
 
+    /// A display-14 pipe program as the shipped `mtl_dmc.bin` lays it
+    /// out: loaded at its slot window base (A 0x90000, B 0x98000,
+    /// C 0x52000, D 0x59000), an enabled EVT_CTL/HTP pair and the
+    /// DMC_SSP_BASE stack top 0x40 below the window end.
     fn mtl_pipe(id: u8) -> ProgSpec {
+        let (start, ssp) = match id {
+            1 => (0x90000, 0x96FC0),
+            2 => (0x98000, 0x9EFC0),
+            3 => (0x52000, 0x53FC0),
+            _ => (0x59000, 0x5AFC0),
+        };
+        let base = 0x5F000 + 0x400 * (id as u32 - 1);
         ProgSpec {
             entry_dmc_id: id,
             stepping: b'*',
             substepping: b'*',
             header_ver: 3,
-            start: 0x5F800,
-            payload: alloc::vec![0xEEEE_0000 | id as u32],
-            mmio: alloc::vec![(0x5F034 + 0x400 * (id as u32 - 1), 0x8003_1000)],
+            start,
+            payload: alloc::vec![0xEEEE_0000 | id as u32, 0xEEEE_1000 | id as u32],
+            mmio: alloc::vec![
+                (base + 0x074, ssp),         // DMC_SSP_BASE
+                (base + 0x034, 0x8003_1000), // EVT_CTL(pipe,0): enabled
+                (base + 0x004, 0x0000_0040), // EVT_HTP(pipe,0)
+            ],
         }
+    }
+
+    /// The pipe program's load conversation: handler sweep, payload,
+    /// then the table with the pipe event written disabled.
+    fn pipe_load(id: u8) -> Vec<(u64, u32)> {
+        let spec = mtl_pipe(id);
+        let base = 0x5F000 + 0x400 * (id as u32 - 1);
+        let mut out = handler_sweep(base + 0x034, base + 0x004);
+        out.push((spec.start as u64, spec.payload[0]));
+        out.push((spec.start as u64 + 4, spec.payload[1]));
+        out.push((spec.mmio[0].0 as u64, spec.mmio[0].1));
+        // dmc_evt_ctl_disable keeps the sticky enable bit.
+        out.push((spec.mmio[1].0 as u64, 0x8003_0100));
+        out.push((spec.mmio[2].0 as u64, spec.mmio[2].1));
+        out
     }
 
     fn mtl_blob() -> Vec<u8> {
@@ -1939,7 +2071,7 @@ pub mod tests {
         )
     }
 
-    fn smoke_xelpdp_dmc_parse_skips_pipe_programs() -> TestResult {
+    fn smoke_xelpdp_dmc_parse_bounds_pipe_programs() -> TestResult {
         let blob = mtl_blob();
         let fw = match parse_dmc_firmware_xelpdp(&blob, b'*', b'*') {
             Ok(fw) => fw,
@@ -1955,11 +2087,64 @@ pub mod tests {
         if main.mmiodata[0] != 0x8003_3200 || main.mmio_count != 5 {
             return TestResult::Fail("display 14 must not rewrite the main handler table");
         }
-        if fw.program(DmcId::PipeA).is_some() || fw.program(DmcId::PipeB).is_some() {
-            return TestResult::Fail("display 14 pipe programs have no bounded RAM window");
+        // Pipe programs inside their slot windows are accepted, with the
+        // ADL-P pipe MMIO window for their tables.
+        let (Some(a), Some(b)) = (fw.program(DmcId::PipeA), fw.program(DmcId::PipeB)) else {
+            return TestResult::Fail("windowed display 14 pipe programs must parse");
+        };
+        if a.start_mmioaddr != 0x90000 || b.start_mmioaddr != 0x98000 || fw.skipped_mask != 0 {
+            return TestResult::Fail("pipe programs must keep their load addresses");
         }
-        if fw.skipped_mask != 0b110 {
-            return TestResult::Fail("both carried pipe programs must be recorded as skipped");
+        // Every slot window, exactly filled, is accepted; one dword past
+        // the end, or a start below it, is recorded as skipped while the
+        // main program still loads.
+        for (id, lo, hi) in [
+            (1u8, 0x90000u32, 0x96FFFu32),
+            (2, 0x98000, 0x9EFFF),
+            (3, 0x52000, 0x53FFF),
+            (4, 0x59000, 0x5AFFF),
+        ] {
+            let at = |start: u32| {
+                let blob = build_blob(
+                    2,
+                    &[
+                        mtl_main(0x80000, alloc::vec![1]),
+                        ProgSpec {
+                            start,
+                            payload: alloc::vec![7, 8],
+                            ..mtl_pipe(id)
+                        },
+                    ],
+                );
+                let fw = parse_dmc_firmware_xelpdp(&blob, b'*', b'*').unwrap();
+                let slot = DmcId::from_u8(id).unwrap();
+                (fw.program(slot).is_some(), fw.skipped_mask)
+            };
+            if at(hi - 7) != (true, 0)
+                || at(hi - 3) != (false, 1 << id)
+                || at(lo - 4) != (false, 1 << id)
+            {
+                return TestResult::Fail("pipe program windows must be enforced per slot");
+            }
+            if DmcId::from_u8(id).unwrap().program_range() != (lo, hi) {
+                return TestResult::Fail("pipe program window table diverges");
+            }
+        }
+        // A pipe table register outside the ADL-P pipe window leaves the
+        // slot empty (i915 tolerates a bad pipe program), not skipped.
+        let blob = build_blob(
+            2,
+            &[
+                mtl_main(0x80000, alloc::vec![1]),
+                ProgSpec {
+                    mmio: alloc::vec![(0x92034, 1)],
+                    ..mtl_pipe(1)
+                },
+            ],
+        );
+        let fw = parse_dmc_firmware_xelpdp(&blob, b'*', b'*').unwrap();
+        if fw.program(DmcId::PipeA).is_some() || fw.skipped_mask != 0 {
+            return TestResult::Fail("a pipe table outside 0x5F000..=0x5FFFF must be dropped");
         }
         if MTL_DMC_FIRMWARE != "i915/mtl_dmc.bin" || DMC_MAX_FW_SIZE_XELPDP != 0x7000 {
             return TestResult::Fail("DMC_PATH(mtl) / XELPDP_DMC_MAX_FW_SIZE diverge");
@@ -1968,7 +2153,7 @@ pub mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dmc",
-        smoke_xelpdp_dmc_parse_skips_pipe_programs
+        smoke_xelpdp_dmc_parse_bounds_pipe_programs
     );
 
     fn smoke_xelpdp_dmc_parse_refusals() -> TestResult {
@@ -2055,6 +2240,9 @@ pub mod tests {
         expected.push((0x8F038, 0x8003_BF00));
         expected.push((0x8F008, 0x0000_0020));
         expected.push((0x8F074, 0x0000_2FC0));
+        // Then every pipe program, events disabled (for_each_dmc_id).
+        expected.extend(pipe_load(1));
+        expected.extend(pipe_load(2));
         expected.push((DC_STATE_DEBUG, 0x3));
         if fake.writes() != expected {
             return TestResult::Fail("MTL load conversation diverges from intel_dmc_load_program");
@@ -2062,9 +2250,9 @@ pub mod tests {
         if fake
             .writes()
             .iter()
-            .any(|(off, _)| (0x5F000..=0x5FFFF).contains(off) || *off == MTL_PIPEDMC_CONTROL)
+            .any(|(off, _)| *off == MTL_PIPEDMC_CONTROL)
         {
-            return TestResult::Fail("a skipped pipe DMC must never be written or enabled");
+            return TestResult::Fail("loading must not enable a pipe DMC");
         }
         if verify_loaded(&fake, &fw) != Ok(()) {
             return TestResult::Fail("a freshly loaded MTL program must verify");
@@ -2121,13 +2309,91 @@ pub mod tests {
         disable_program(&fake, &fw);
         let mut expected = alloc::vec![(GEN9_CLKGATE_DIS_0, 0xC000)];
         expected.extend(handler_sweep(0x8F034, 0x8F004));
+        expected.extend(handler_sweep(0x5F034, 0x5F004));
+        expected.extend(handler_sweep(0x5F434, 0x5F404));
         if fake.writes() != expected {
-            return TestResult::Fail("MTL disable must be the WA plus the main sweep only");
+            return TestResult::Fail("MTL disable must be the WA plus every program's sweep");
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dmc",
         smoke_xelpdp_dmc_disable_and_geometry
+    );
+
+    fn smoke_xelpdp_pipe_dmc_enable_disable() -> TestResult {
+        let blob = build_blob(
+            2,
+            &[mtl_main(0x80000, alloc::vec![1]), mtl_pipe(1), mtl_pipe(3)],
+        );
+        let fw = parse_dmc_firmware_xelpdp(&blob, b'*', b'*').unwrap();
+        let fake = FakeDmc::new();
+        load_program(&fake, &fw);
+        // Pipe A (main DMC saves/restores it): verify, then set bit 0.
+        let before = fake.writes().len();
+        if enable_pipe(&fake, &fw, 0) != Ok(true)
+            || fake.writes()[before..] != [(MTL_PIPEDMC_CONTROL, 1)]
+        {
+            return TestResult::Fail("pipe A enable must only set PIPEDMC_ENABLE_MTL(A)");
+        }
+        // Pipe C re-applies its table (need_pipedmc_load_mmio), then bit 8.
+        let before = fake.writes().len();
+        let spec = mtl_pipe(3);
+        if enable_pipe(&fake, &fw, 2) != Ok(true)
+            || fake.writes()[before..]
+                != [
+                    (spec.mmio[0].0 as u64, spec.mmio[0].1),
+                    (spec.mmio[1].0 as u64, 0x8003_0100),
+                    (spec.mmio[2].0 as u64, spec.mmio[2].1),
+                    (MTL_PIPEDMC_CONTROL, 1 | (1 << 8)),
+                ]
+        {
+            return TestResult::Fail("pipe C enable must re-apply its table first");
+        }
+        // No program for pipe B: nothing is written (i915 returns early).
+        let before = fake.writes().len();
+        if enable_pipe(&fake, &fw, 1) != Ok(false)
+            || disable_pipe(&fake, &fw, 1) != Ok(false)
+            || fake.writes().len() != before
+        {
+            return TestResult::Fail("an absent pipe program must leave the pipe untouched");
+        }
+        if disable_pipe(&fake, &fw, 0) != Ok(true)
+            || *fake.regs.borrow().get(&MTL_PIPEDMC_CONTROL).unwrap_or(&0) != 1 << 8
+        {
+            return TestResult::Fail("pipe A disable must clear only its bit");
+        }
+        // A pipe program that no longer verifies is refused, unenabled.
+        fake.set_reg(0x90000, 0);
+        let before = fake.writes().len();
+        if !matches!(
+            enable_pipe(&fake, &fw, 0),
+            Err(PipeDmcError::Verify(DmcVerifyError::ProgramStart {
+                id: DmcId::PipeA,
+                ..
+            }))
+        ) || fake.writes().len() != before
+        {
+            return TestResult::Fail("an unverified pipe program must not be enabled");
+        }
+        // Not display 14, not a pipe, or no readable control: refused.
+        let tgl = tgl_blob();
+        let gen12 = parse_dmc_firmware(&tgl, b'*', b'*', DMC_MAX_FW_SIZE_GEN12).unwrap();
+        fake.set_reg(MTL_PIPEDMC_CONTROL, u32::MAX);
+        if enable_pipe(&fake, &gen12, 0) != Err(PipeDmcError::Unsupported)
+            || enable_pipe(&fake, &fw, 4) != Err(PipeDmcError::Unsupported)
+            || enable_pipe(&fake, &fw, 2) != Err(PipeDmcError::Unavailable)
+            || pipe_dmc_id(0) != Some(DmcId::PipeA)
+            || pipe_dmc_id(3) != Some(DmcId::PipeD)
+            || !xelpdp_pipe_needs_mmio(2)
+            || xelpdp_pipe_needs_mmio(1)
+        {
+            return TestResult::Fail("pipe DMC refusals diverge");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dmc",
+        smoke_xelpdp_pipe_dmc_enable_disable
     );
 }
