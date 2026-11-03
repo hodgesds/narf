@@ -15,7 +15,7 @@ const SPARSE_FUSE: u32 = 0b101 | 0b10 << 16;
 
 /// GT0 registers sharing offsets with the media GT's pre-GSI view.
 const GT0: [(u64, u32); 14] = [
-    (0xd8c, 1274 / 100 << 22 | (1274 % 100) << 14),
+    (0xd8c, (1274 / 100) << 22 | (1274 % 100) << 14),
     (0xa188, 0x1),
     (0xdfc, 0x1),
     (0x941c, 0),
