@@ -21,6 +21,7 @@ mod ht40;
 mod identity;
 mod idle;
 mod initvals;
+mod initvals_ar9280;
 mod initvals_ar9287;
 mod interface;
 mod irq;

@@ -196,6 +196,7 @@ pub(in crate::ath9k) fn prepare(
         tx_chainmask: identity.tx_chainmask,
         cck_fir: Some(cck_fir),
         spur_chans: SPUR_CHANS,
+        spur_chans_5g: None,
     };
     channel::prepare_chip(io, image, geometry, &chip)?;
     set_board_values(io, image, false)?;

@@ -549,3 +549,51 @@ kernel_test_in!(
     "drivers/wireless/ath9k/identity",
     smoke_ath9k_ar9287_identify_reads_map_at_word_128
 );
+
+fn smoke_ath9k_ar9280_identify_reads_def_map_two_chains() -> TestResult {
+    let mut io = Fake::new();
+    io.registers.insert(AR_SREV, 0x0008_01ff);
+    // sizeof(struct ar5416_eeprom_def) = 3256: checksum over all 1628 words.
+    let image = chip_image(&MAP_DEF, 3256, 3, 3);
+    io.words.fill(0xffff);
+    io.words[0] = 0xa55a;
+    for (index, bytes) in image.chunks_exact(2).enumerate() {
+        io.words[MAP_DEF.start_word + index] = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    let (revision, identity, read) = match identify_chip(&mut io, Chip::Ar9280) {
+        Ok(result) => result,
+        Err(_) => return TestResult::Fail("AR9280 identification failed"),
+    };
+    if revision.chip != Chip::Ar9280
+        || revision.mac_version != 0x80
+        || identity.rx_chainmask != 3
+        || identity.tx_chainmask != 3
+        || *read != *image
+    {
+        return TestResult::Fail("AR9280 identity/map corrupted");
+    }
+    let last = EEPROM_WINDOW + 4 * (MAP_DEF.start_word + MAP_DEF.words - 1) as u64;
+    if !io.ops.contains(&Op::Read(EEPROM_WINDOW + 4 * 64))
+        || !io.ops.contains(&Op::Read(last))
+        || io.ops.contains(&Op::Read(last + 4))
+    {
+        return TestResult::Fail("AR9280 def map not read at AR5416_EEP_START_LOC");
+    }
+    // The three-chain def map is limited by the two-chain silicon.
+    let mut three = Fake::new();
+    three.registers.insert(AR_SREV, 0x0008_01ff);
+    let image = chip_image(&MAP_DEF, 3256, 7, 3);
+    three.words.fill(0xffff);
+    three.words[0] = 0xa55a;
+    for (index, bytes) in image.chunks_exact(2).enumerate() {
+        three.words[MAP_DEF.start_word + index] = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    if identify_chip(&mut three, Chip::Ar9280).map(|_| ()) != Err(BringUpError::BadIdentity) {
+        return TestResult::Fail("AR9280 accepted a three-chain mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_ar9280_identify_reads_def_map_two_chains
+);

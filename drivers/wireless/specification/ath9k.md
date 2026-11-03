@@ -1457,6 +1457,49 @@ record as the initial primary; HT20/HT40 TX power and every HT owner are out of 
 the AR9285 legacy base; closed-loop maps stay refused. No physical AR9287
 receipt exists.
 
+**AR9280 dual-band profile (`ar9280_enablement`).** AR9280 (`0x0029` PCI,
+`0x002a` PCIe; `AR_SREV_9280_20` is any macVersion 0x80) reads the
+three-chain-capable `ar5416_eeprom_def` map at word 64 (1628 words,
+checksum over `min(length / 2, 1628)`) with RX/TX masks bounded by the
+two-chain silicon (`identity_chip(Chip::Ar9280)`). `initvals_ar9280.rs`
+carries the literal `ar9002_initvals.h` AR9280_2 modes, common, 5 GHz fast
+clock, the three RX gain tables and both TX gain tables. `phy/ar9280.rs`
+selects them as `ar9002_hw.c` does: RX gain by `rxGainType` from minor 17
+(1 = 13 dB, 0 = 23 dB backoff, else original), TX gain high-power for
+`txGainType == 1` from minor 19 (else original); modes column 1 (5 GHz HT20)
+or 4 (2 GHz HT20), then RX gain, TX gain, common and, on 5 GHz
+(`ATH9K_HW_CAP_FASTCLOCK` is always set for AR9280, so every 5 GHz channel is
+`IS_CHAN_A_FAST_CLOCK`), the fast-clock table column 1. The PCI part with
+minor > 0x0a and `pwdclkind == 0` clears `AR_AN_TOP2_PWDCLKIND` in the modes
+row (`need_an_top2_fixup`). `prepare` refuses a band the map's
+`opCapFlags` does not enable (`AR5416_OPFLAGS_11G`/`_11A`), channels outside
+the 2.4 GHz 1..13 and 5 GHz 36..64/100..144/149..165 20 MHz sets, and
+open-loop maps (`EEP_OL_PWRCTRL` from minor 19: this port follows the
+closed-loop def path only). The shared AR9002 channel preparation is
+`phy/channel.rs::prepare_tune` over `Tune::{Two, Five}`; 2.4 GHz is the
+unchanged `prepare_chip` trace, 5 GHz writes `AR_PHY_MODE` OFDM |
+DYNAMIC | DYN_CCK_DISABLE (fast clock), leaves `AR_PHY_CCK_TX_CTRL` alone,
+programs `ar9002_hw_set_channel`'s 5 GHz synthesizer (`EEP_FRAC_N_5G` from
+minor 22: integer `refDivA = 24 >> aModeRefSel` with `aModeRefSel` 3/2 for
+20/10 MHz-aligned centers, otherwise fractional `CHANSEL_5G` after the
+`AR_AN_SYNTH9_REFDIVA = 1` analog write) and runs `ar9002_hw_spur_mitigate`
+against `modalHeader[0].spurChans` with `AR_BASE_FREQ_5GHZ` and denominator
+40. The PLL stays 5/0x2c on both bands (fast clock). Board values are
+`eeprom_def.c::ath9k_hw_def_set_board_values` from `modalHeader[IS_CHAN_2GHZ]`
+for chains 0 and 1: `antCtrlCommon & 0xffff`, per-chain switch/IQ, the
+minor-3 `txRxAttenCh`/XATTEN1/XATTEN2 fields (default attenuation 23/44
+below), OB/DB on `AR_AN_RF2G1_CH0/1` or `AR_AN_RF5G1_CH0/1`, `AR_AN_TOP2`
+xPA bias and LOCALBIAS, `FORCE_XPA_CFG`, settling, ADC size, xPA timing,
+`TX_END_TO_A2_RX_ON`, thresh62, the minor-2 `RF_CTL2` timings, minor-3 HT40
+settle, minor-19 CCK DAC scale and the minor-20 `DACIPMODE` (0 on 5 GHz with
+`dacHiPwrMode_5G`), TX clip and desired CCK scale. Smokes (written, not
+executed): `smoke_ath9k_ar9280_identify_reads_def_map_two_chains`,
+`smoke_ath9k_ar9280_ini_follows_linux_band_and_gain_selection` (FNV-1a
+oracles over the 547/560 selected Linux rows),
+`smoke_ath9k_ar9280_5ghz_synth_rfmode_and_spur_band`,
+`smoke_ath9k_ar9280_board_values_follow_eeprom_def`,
+`smoke_ath9k_ar9280_preparation_refuses_wrong_inputs`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,
