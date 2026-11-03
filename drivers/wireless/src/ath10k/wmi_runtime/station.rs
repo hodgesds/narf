@@ -733,7 +733,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             management::Path::Inline(command) => {
-                let command = management::inline(command, frame)?;
+                let command = management::inline(command, self.primary.id(), frame)?;
                 self.htt
                     .wmi
                     .htc
@@ -747,7 +747,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             management::Path::Reference => {
                 let (id, address) = self.htt.wmi.htc.transport.prepare_wmi_management(frame)?;
-                let command = management::reference(id, address, frame)?;
+                let command = management::reference(self.primary.id(), id, address, frame)?;
                 self.htt
                     .wmi
                     .htc

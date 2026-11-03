@@ -281,8 +281,10 @@ impl Native {
             armed: true,
         };
         if !radio.roc_active() {
+            let vdev =
+                u8::try_from(radio.primary_vdev()).map_err(|_| WirelessError::HardwareError)?;
             radio
-                .begin_private_frame(owner, cookie, &request, || {
+                .begin_private_frame(vdev, owner, cookie, &request, || {
                     if self.closed.load(Ordering::Acquire) || !emission.current() {
                         return Err(Error::Failed);
                     }

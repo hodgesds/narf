@@ -184,10 +184,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         subscriptions: Arc<Subscriptions>,
     ) -> Result<(), Error> {
+        // The managed netdev and the P2P_DEVICE wdev each own a set
+        // (cfg80211 registrations are per wdev). The bound set follows the
+        // ROC owner and may change only while no ROC holds capture state.
         if self
             .management_subscriptions
             .as_ref()
             .is_some_and(|old| !Arc::ptr_eq(old, &subscriptions))
+            && self.roc.is_some()
         {
             return Err(Error::Failed);
         }
@@ -297,7 +301,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let native = self.wire.management(&bytes[4..], self.features)?;
         let frame = &native.frame;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.vdev_address(w.vdev)?;
         if native.status & !0x40 != 0
             || wire::channel_to_frequency(native.channel) != Some(w.receipt.frequency)
             || !(26..=2304).contains(&frame.len())

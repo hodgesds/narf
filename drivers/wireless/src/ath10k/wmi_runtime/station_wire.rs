@@ -101,15 +101,18 @@ impl Wire {
         if bssid == [0; 6] || bssid[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        self.peer_record(bssid, 1)
+        self.peer_record(0, bssid, 1)
     }
-    pub fn offchannel_peer(self, destination: [u8; 6]) -> Result<Vec<u8>, Error> {
+    /// A `WMI_PEER_TYPE_DEFAULT` peer on `vdev` (`struct wmi_peer_create_cmd`
+    /// vdev_id; `mac.c::ath10k_mac_tx_wmi_mgmt`/offchannel and AP stations
+    /// use the owning `arvif->vdev_id`).
+    pub fn offchannel_peer(self, vdev: u8, destination: [u8; 6]) -> Result<Vec<u8>, Error> {
         if destination == [0; 6] {
             return Err(Error::Malformed);
         }
-        self.peer_record(destination, 0)
+        self.peer_record(vdev, destination, 0)
     }
-    fn peer_record(self, bssid: [u8; 6], kind: u32) -> Result<Vec<u8>, Error> {
+    fn peer_record(self, vdev: u8, bssid: [u8; 6], kind: u32) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.station_ids().3, if tlv { 20 } else { 16 })?;
         let at = if tlv {
@@ -118,6 +121,7 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         out[at + 4..at + 10].copy_from_slice(&bssid);
         put(&mut out, at + 12, kind); // Linux DEFAULT0 versus BSS1.
         Ok(out)

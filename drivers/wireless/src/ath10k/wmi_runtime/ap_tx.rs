@@ -276,7 +276,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     control: true,
                 });
                 self.ap_command(
-                    &management::reference(id, address, &request.frame)?,
+                    &management::reference(self.primary.id(), id, address, &request.frame)?,
                     &current,
                 )
                 .await?;

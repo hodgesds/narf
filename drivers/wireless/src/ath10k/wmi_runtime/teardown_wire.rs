@@ -24,15 +24,16 @@ impl Wire {
         if bssid == [0; 6] || bssid[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        self.delete_peer_record(bssid)
+        self.delete_peer_record(0, bssid)
     }
-    pub fn delete_offchannel_peer(self, destination: [u8; 6]) -> Result<Vec<u8>, Error> {
+    /// `WMI_PEER_DELETE` of a DEFAULT peer on its owning `vdev`.
+    pub fn delete_offchannel_peer(self, vdev: u8, destination: [u8; 6]) -> Result<Vec<u8>, Error> {
         if destination == [0; 6] {
             return Err(Error::Malformed);
         }
-        self.delete_peer_record(destination)
+        self.delete_peer_record(vdev, destination)
     }
-    fn delete_peer_record(self, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
+    fn delete_peer_record(self, vdev: u8, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.teardown_ids().1, if tlv { 16 } else { 12 })?;
         let at = if tlv {
@@ -41,6 +42,7 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         out[at + 4..at + 10].copy_from_slice(&bssid);
         Ok(out)
     }

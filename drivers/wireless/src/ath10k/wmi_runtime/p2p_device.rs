@@ -63,6 +63,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         validate()?;
         self.p2p_device = Some(vdev);
+        self.p2p_device_mac = address;
         self.failed = false;
         Ok(id)
     }
@@ -104,12 +105,32 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         self.p2p_device = None;
+        self.p2p_device_mac = [0; 6];
         self.vdev_map
             .as_mut()
             .ok_or(Error::Failed)?
             .release(vdev.id())?;
         self.failed = false;
         Ok(())
+    }
+    /// The address frames on `vdev` carry as A2 (and A3 for Public Action)
+    /// and the directed-RX address on it: the INIT address for the managed
+    /// role's vdev, the wdev address for the P2P_DEVICE vdev
+    /// (`ath10k_add_interface` creates each vdev with `vif->addr`).
+    pub(super) fn vdev_address(&self, vdev: u8) -> Result<[u8; 6], Error> {
+        if vdev == self.primary.id() {
+            return Ok(self.ready.ok_or(Error::Failed)?.mac);
+        }
+        if self.p2p_device_vdev() == Some(vdev) {
+            return Ok(self.p2p_device_mac);
+        }
+        Err(Error::Failed)
+    }
+    /// The current ROC runs on the P2P_DEVICE vdev (its owner is the wdev).
+    pub(in crate::ath10k) fn roc_on_p2p_device(&self) -> bool {
+        self.roc
+            .as_ref()
+            .is_some_and(|w| Some(w.vdev) == self.p2p_device_vdev())
     }
     /// A ROC may run on the managed role's vdev or the P2P_DEVICE vdev.
     pub(super) fn roc_vdev_owned(&self, vdev: u8) -> bool {

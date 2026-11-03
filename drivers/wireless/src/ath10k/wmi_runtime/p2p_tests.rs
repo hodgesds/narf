@@ -376,3 +376,64 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_device_vdev_nss_on_own_id
 );
+
+/// The DEFAULT offchannel peer create/delete, the TLV by-reference MGMT_TX
+/// and the inline MGMT_TX carry the sending vdev at their Linux `vdev_id`
+/// offsets; vdev0 stays byte-identical to the former implicit builders.
+fn smoke_ath10k_p2p_offchannel_builders_carry_vdev() -> TestResult {
+    const DA: [u8; 6] = [2, 0, 0, 0, 0, 9];
+    for dialect in [Dialect::Main, Dialect::TenFour, Dialect::Tlv] {
+        let wire = Wire::new(dialect);
+        let at = if dialect == Dialect::Tlv { 8 } else { 4 };
+        let (Ok(create0), Ok(create2), Ok(delete0), Ok(delete2)) = (
+            wire.offchannel_peer(0, DA),
+            wire.offchannel_peer(2, DA),
+            wire.delete_offchannel_peer(0, DA),
+            wire.delete_offchannel_peer(2, DA),
+        ) else {
+            return TestResult::Fail("peer builder refused");
+        };
+        if wire::word(&create0, at) != Ok(0)
+            || wire::word(&create2, at) != Ok(2)
+            || wire::word(&delete2, at) != Ok(2)
+            || create2[at + 4..at + 10] != DA
+            || wire::word(&create2, at + 12) != Ok(0)
+        {
+            return TestResult::Fail("peer vdev layout");
+        }
+        let (mut c, mut d) = (create2.clone(), delete2.clone());
+        c[at] = 0;
+        d[at] = 0;
+        if c != create0 || d != delete0 {
+            return TestResult::Fail("peer vdev changed other fields");
+        }
+    }
+    let frame = [0xd0u8; 40];
+    let (Ok(zero), Ok(two)) = (
+        super::super::management::reference(0, 5, 0x900000, &frame),
+        super::super::management::reference(2, 5, 0x900000, &frame),
+    ) else {
+        return TestResult::Fail("reference refused");
+    };
+    let mut patched = two.clone();
+    patched[8] = 0;
+    if wire::word(&two, 8) != Ok(2) || wire::word(&two, 12) != Ok(5) || patched != zero {
+        return TestResult::Fail("reference vdev layout");
+    }
+    let (Ok(zero), Ok(two)) = (
+        super::super::management::inline(0x7008, 0, &frame),
+        super::super::management::inline(0x7008, 2, &frame),
+    ) else {
+        return TestResult::Fail("inline refused");
+    };
+    let mut patched = two.clone();
+    patched[4] = 0;
+    if wire::word(&two, 4) != Ok(2) || patched != zero {
+        return TestResult::Fail("inline vdev layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_offchannel_builders_carry_vdev
+);

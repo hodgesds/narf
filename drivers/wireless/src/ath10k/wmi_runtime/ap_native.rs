@@ -312,7 +312,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.ap_publish(
-            &self.wire.offchannel_peer(mac)?,
+            &self.wire.offchannel_peer(self.primary.id(), mac)?,
             ap::Publication::CreatePeer(mac),
             validate,
         )
@@ -324,7 +324,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.ap_publish(
-            &self.wire.delete_offchannel_peer(mac)?,
+            &self.wire.delete_offchannel_peer(self.primary.id(), mac)?,
             ap::Publication::DeletePeer(mac),
             validate,
         )

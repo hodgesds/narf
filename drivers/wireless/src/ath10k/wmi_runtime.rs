@@ -135,6 +135,9 @@ pub(super) struct Radio<T> {
     primary: p2p::Vdev,
     /// The control-only P2P_DEVICE vdev (`p2p_device.rs`), if created.
     p2p_device: Option<p2p::Vdev>,
+    /// The P2P_DEVICE wdev address the vdev was created with (its frames'
+    /// A2/A3 and the directed-RX filter on that vdev).
+    p2p_device_mac: [u8; 6],
     features: u64,
     /// Linux `cryptmode=0` beside the RAW decap: station PTK/GTK go to the
     /// firmware key cache (`hw_keys`), software CCMP stays the fallback.
@@ -187,6 +190,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             vdev_map: None,
             primary: p2p::Vdev::new(0, p2p::Role::Station),
             p2p_device: None,
+            p2p_device_mac: [0; 6],
             features,
             hardware_keys: false,
             peer_pmf_offload: false,

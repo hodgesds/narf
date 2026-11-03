@@ -124,14 +124,19 @@ pub(super) fn validate(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Result<(),
         _ => Err(Error::Unsupported),
     }
 }
-pub(super) fn inline(command: u32, frame: &[u8]) -> Result<Vec<u8>, Error> {
+/// `wmi.c::ath10k_wmi_op_gen_mgmt_tx`: `hdr.vdev_id` is the sending
+/// interface's `arvif->vdev_id`.
+pub(super) fn inline(command: u32, vdev: u8, frame: &[u8]) -> Result<Vec<u8>, Error> {
     let mut out = wire::packet(command, 24 + frame.len().div_ceil(4) * 4)?;
+    wire::put(&mut out, 4, u32::from(vdev));
     out[8..14].copy_from_slice(&frame[4..10]); // padded wmi_mac_addr after vdev0.
     wire::put(&mut out, 24, frame.len() as u32);
     out[28..28 + frame.len()].copy_from_slice(frame);
     Ok(out)
 }
-pub(super) fn reference(id: u32, address: u64, frame: &[u8]) -> Result<Vec<u8>, Error> {
+/// `wmi-tlv.c::ath10k_wmi_tlv_op_gen_mgmt_tx_send`: `vdev_id` is the
+/// sending interface's `arvif->vdev_id`.
+pub(super) fn reference(vdev: u8, id: u32, address: u64, frame: &[u8]) -> Result<Vec<u8>, Error> {
     if address == 0
         || address
             .checked_add(frame.len() as u64)
@@ -142,6 +147,7 @@ pub(super) fn reference(id: u32, address: u64, frame: &[u8]) -> Result<Vec<u8>, 
     let prefix = frame.len().min(64).div_ceil(4) * 4;
     let mut out = wire::packet(0x7008, 36 + prefix)?;
     wire::put(&mut out, 4, (422 << 16) | 28);
+    wire::put(&mut out, 8, u32::from(vdev));
     wire::put(&mut out, 12, id);
     wire::put(&mut out, 20, address as u32);
     wire::put(&mut out, 24, (address >> 32) as u32);

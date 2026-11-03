@@ -8,6 +8,8 @@ use narf_wireless::MgmtTxRequest;
 pub(super) struct Action {
     cookie: u64,
     emission: RadioEmissionAuthority,
+    /// The ROC vdev the temporary peer and descriptor were created on.
+    vdev: u8,
     destination: [u8; 6],
     temporary: bool,
     ids: [u64; 32],
@@ -67,11 +69,6 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let w = self.roc.as_ref().ok_or(Error::Failed)?;
-        // The temporary-peer and WMI MGMT_TX builders still carry the
-        // implicit vdev0 id; a P2P_DEVICE ROC is receive/listen-only.
-        if w.vdev != self.primary.id() {
-            return Err(Error::Unsupported);
-        }
         if request.frequency_mhz != u32::from(w.receipt.frequency)
             || w.public && request.duration != 0
             || w.action.is_some()
@@ -83,7 +80,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !w.plan.permissions.contains(&permission) {
             return Err(Error::Unsupported);
         }
-        validate(&request.frame, self.ready.ok_or(Error::Failed)?.mac).map(|_| ())
+        validate(&request.frame, self.vdev_address(w.vdev)?).map(|_| ())
     }
     pub(in crate::ath10k) fn validate_private_frame(
         &self,
@@ -113,8 +110,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.hinted_permission(domain, frequency, None, false)?;
         validate(&request.frame, self.ready.ok_or(Error::Failed)?.mac).map(|_| ())
     }
+    /// A FRAME outside any ROC gets its own bounded ROC on `vdev` (the
+    /// managed role's or the P2P_DEVICE vdev; mac80211 `ieee80211_mgmt_tx`
+    /// starts an offchannel ROC on the sending interface).
     pub(in crate::ath10k) async fn begin_private_frame(
         &mut self,
+        vdev: u8,
         owner: Owner,
         cookie: u64,
         request: &MgmtTxRequest,
@@ -125,7 +126,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Native setup/peer/TX has a finite500ms budget. The response tail
         // begins only at its actual terminal and is clipped to this original
         // grant; no host timer extends or fabricates foreign-channel time.
-        self.begin_roc(
+        self.begin_roc_on(
+            vdev,
             owner,
             Receipt {
                 cookie,
@@ -173,12 +175,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !w.plan.permissions.contains(&permission) {
             return Err(Error::Unsupported);
         }
-        let destination = validate(&request.frame, self.ready.ok_or(Error::Failed)?.mac)?;
+        // Peer, MGMT_TX and HTT descriptors all name the ROC's own vdev,
+        // whose address the frame must carry (`ath10k_mac_tx_wmi_mgmt`).
+        let vdev = w.vdev;
+        let destination = validate(&request.frame, self.vdev_address(vdev)?)?;
         let path = management::path(self.wire.dialect, self.features, caps)?;
-        let existing = self
-            .peer
-            .as_ref()
-            .is_some_and(|p| p.bssid == destination && p.mapped().is_some());
+        let existing = vdev == self.primary.id()
+            && self
+                .peer
+                .as_ref()
+                .is_some_and(|p| p.bssid == destination && p.mapped().is_some());
         let temporary = !existing && !self.htt.offchannel_frequency_field();
         let sync_delete = self.wire.sync_delete_required(caps);
         // The native protocol has unversioned peer/delete records. Drain the
@@ -201,6 +207,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.roc.as_mut().ok_or(Error::Failed)?.action = Some(Action {
             cookie,
             emission: emission.clone(),
+            vdev,
             destination,
             temporary,
             ids: [0; 32],
@@ -214,7 +221,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if temporary {
             // WMI_PEER_TYPE_DEFAULT, not the associated BSS peer type. Native
             // multicast DA peers are legitimate offchannel firmware records.
-            let create = self.wire.offchannel_peer(destination)?;
+            let create = self.wire.offchannel_peer(vdev, destination)?;
             let roc_emission = self
                 .roc
                 .as_ref()
@@ -256,7 +263,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 let (id, command) = self.htt.prepare_offchannel(
                     Parameters {
                         kind: Kind::Management,
-                        vdev: self.roc.as_ref().ok_or(Error::Failed)?.vdev,
+                        vdev,
                         tid: 17,
                         hardware_crypto: false,
                     },
@@ -274,7 +281,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .prepare_wmi_management(&request.frame)?;
                 (
                     ManagementToken::Wmi(id),
-                    management::reference(id, address, &request.frame)?,
+                    management::reference(vdev, id, address, &request.frame)?,
                 )
             }
             management::Path::Inline(_) => return Err(Error::Unsupported),
@@ -357,7 +364,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let word = &mut a.ids[usize::from(id) / 64];
         let bit = 1u64 << (id % 64);
         if bytes[0] == 3 {
-            if bytes[1] != 0 || bytes[4..10] != a.destination {
+            // HTT PEER_MAP byte 1 is the vdev the peer was created on.
+            if bytes[1] != a.vdev || bytes[4..10] != a.destination {
                 if *word & bit != 0 {
                     return Err(Error::Malformed);
                 }
@@ -461,7 +469,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if a.ids.iter().all(|b| *b == 0) {
                 return Err(Error::Failed);
             }
-            let destination = a.destination;
+            let (vdev, destination) = (a.vdev, a.destination);
             let deadline = narf_time::Deadline::after_ms(1500);
             let mut idle = false;
             for _ in 0..4096 {
@@ -483,7 +491,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .and_then(|w| w.action.as_mut())
                 .ok_or(Error::Failed)?
                 .delete_sent = true;
-            let command = self.wire.delete_offchannel_peer(destination)?;
+            let command = self.wire.delete_offchannel_peer(vdev, destination)?;
             self.send_scan_command(&command, cleanup).await?;
         }
         let deadline = narf_time::Deadline::after_ms(1500);
