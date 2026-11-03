@@ -1199,13 +1199,17 @@ impl RenderFile {
             }
             abi::GEM_MMAP_GTT | abi::GEM_MMAP_OFFSET => {
                 let mut request = read(user, arg, if cmd == abi::GEM_MMAP_GTT { 16 } else { 32 })?;
-                if u32_at(&request, 4) != 0 {
-                    return Err(FsError::InvalidData);
-                }
                 if cmd == abi::GEM_MMAP_OFFSET {
+                    // i915_gem_mmap_offset_ioctl never checks pad or offset
+                    // ("if (args->pad) return -EINVAL; is verbotten!") and
+                    // walks extensions against an empty table: a link is
+                    // refused (-EINVAL) after its own copies and checks.
+                    abi::user_extensions(user, u64_at(&request, 24), |_, _| {
+                        Err(FsError::InvalidData)
+                    })?;
                     // Compatibility supports only WB system mappings; native
                     // Xe handles retain their own cache/memory placement.
-                    if u64_at(&request, 16) != 2 || u64_at(&request, 24) != 0 {
+                    if u64_at(&request, 16) != 2 {
                         return Err(FsError::InvalidData);
                     }
                 } else {
@@ -3050,6 +3054,27 @@ pub(crate) mod tests {
             if u64_at(&reply, 8) != file.gem.mmap_offset(handle).map_err(|_| "offset")? {
                 return Err("mmap wire offset");
             }
+            // Linux never checks pad. Extensions are walked with an empty
+            // table before the flags: an unreadable link is -EFAULT, a
+            // readable one -EINVAL, even under an unsupported flags value.
+            put32(&mut request, 4, 0xa5a5_a5a5);
+            user.store(64, &request);
+            invoke(&file, &user, abi::GEM_MMAP_OFFSET).map_err(|_| "mmap offset pad")?;
+            put32(&mut request, 4, 0);
+            user.store(30000, &[0; 32]);
+            for (flags, extensions, expected) in [
+                (2, 40000, FsError::BadAddress),
+                (7, 40000, FsError::BadAddress),
+                (2, 30000, FsError::InvalidData),
+            ] {
+                put64(&mut request, 16, flags);
+                put64(&mut request, 24, extensions);
+                user.store(64, &request);
+                if invoke(&file, &user, abi::GEM_MMAP_OFFSET) != Err(expected) {
+                    return Err("mmap offset extensions");
+                }
+            }
+            put64(&mut request, 24, 0);
             put64(&mut request, 16, 1); // WC cannot be implemented by a WB RAM alias.
             user.store(64, &request);
             if invoke(&file, &user, abi::GEM_MMAP_OFFSET) != Err(FsError::InvalidData) {

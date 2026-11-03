@@ -838,7 +838,9 @@ format and current capability/terminal-ownership rules are unchanged.
 Implemented storage operations are GEM_CREATE/CREATE_EXT (system region only),
 CLOSE, PREAD/PWRITE, MMAP_OFFSET (WB system RAM only), linear GET/SET_TILING,
 cached GET/SET_CACHING, MADVISE, CPU SET_DOMAIN and BUSY/WAIT/SW_FINISH.
-GEM_MMAP_GTT, legacy GEM_MMAP and GET_APERTURE are unavailable. Handles are local
+GEM_MMAP_GTT, legacy GEM_MMAP and GET_APERTURE are unavailable. MMAP_OFFSET, like
+i915_gem_mmap_offset_ioctl, never checks pad or offset and walks its extensions
+against an empty table before the flags (EFAULT, else EINVAL). Handles are local
 to an open. Each object owns zeroed scattered frames; a mapping atomically
 acquires frames and an Arc retaining their owner. Close removes only the handle.
 Limits are 4096 handles / 256 MiB per open and at most min(512 MiB, half RAM)
