@@ -17,8 +17,12 @@
 //!    `TRANS_DDI_FUNC_CTL` configured, link training (DP) or infoframes
 //!    (HDMI) for this pipe's transcoder.
 //! 3. [`Pipes::program_timings`] — `intel_set_pipe_src_size`,
-//!    `intel_set_transcoder_timings`, `intel_color_modeset` (the owned RGB
-//!    bypass) and the display-14 no-DPT plane chicken
+//!    `bdw_set_pipe_misc`, `hsw_configure_cpu_transcoder`
+//!    (`intel_set_transcoder_timings` with `TRANS_SET_CONTEXT_LATENCY`,
+//!    `intel_vrr_set_transcoder_timings`, `TRANS_MULT`,
+//!    `hsw_set_frame_start_delay`, `hsw_set_transconf`),
+//!    `intel_color_modeset` (the owned RGB bypass), `hsw_set_linetime_wm`,
+//!    `icl_set_pipe_chicken` and the display-14 no-DPT plane chicken
 //!    (`intel_pre_update_crtc` → `intel_dpt_configure`), pipe off.
 //! 4. The caller enables `TRANS_DDI_FUNC_CTL`; [`Pipes::enable`] is
 //!    `intel_enable_transcoder` (`TRANSCONF` with its STATE ack).
@@ -64,6 +68,37 @@ const PLANE_CTL_TILED_X: u32 = 1 << 10;
 const PLANE_CTL_TILED_4: u32 = 5 << 10;
 /// `intel_wait_for_pipe_off` / the transcoder-enable budget, 100 ms.
 const TRANSCONF_WAIT_MS: u64 = 100;
+/// `PIPE_MISC` relative to the pipe block.
+const PIPE_MISC_OFFSET: u64 = 0x30;
+/// `bdw_set_pipe_misc` for an 8 bpc RGB pipe without dithering on display
+/// 14: `PIPE_MISC_BPC_8` (0) | `PIPE_MISC_PIXEL_ROUNDING_TRUNC` (display
+/// >= 12).
+pub(crate) const PIPE_MISC: u32 = 1 << 8;
+/// `PIPE_CHICKEN` relative to the pipe block (`_PIPEA_CHICKEN`).
+const PIPE_CHICKEN_OFFSET: u64 = 0x38;
+/// `icl_set_pipe_chicken` on display 14: `PER_PIXEL_ALPHA_BYPASS_EN`
+/// (Display WA #1153), `PIXEL_ROUNDING_TRUNC_FB_PASSTHRU` (Display WA
+/// #1605353570) and `UNDERRUN_RECOVERY_DISABLE_ADLP` (display 13..29).
+pub(crate) const PIPE_CHICKEN_BITS: u32 = (1 << 30) | (1 << 15) | (1 << 7);
+/// Transcoder-block offsets: `TRANS_VSYNCSHIFT`, `TRANS_MULT`,
+/// `TRANS_SET_CONTEXT_LATENCY`, `TRANS_VRR_CTL` and the display-14
+/// `CHICKEN_TRANS` (`_MTL_CHICKEN_TRANS_A` 0x604e0).
+const TRANS_VSYNCSHIFT_OFFSET: u64 = 0x28;
+const TRANS_MULT_OFFSET: u64 = 0x2c;
+const TRANS_SET_CONTEXT_LATENCY_OFFSET: u64 = 0x7c;
+const TRANS_VRR_CTL_OFFSET: u64 = 0x420;
+const CHICKEN_TRANS_OFFSET: u64 = 0x4e0;
+/// `HSW_FRAME_START_DELAY_MASK`; `framestart_delay` is 1, so the field
+/// (`framestart_delay - 1`) is 0.
+const FRAME_START_DELAY_MASK: u32 = 3 << 27;
+/// `CHICKEN_TRANS` `DP_FEC_BS_JITTER_WA` and `DP_DSC_INSERT_SF_AT_EOL_WA`.
+const DP_FEC_BS_JITTER_WA: u32 = 1 << 15;
+const DP_DSC_INSERT_SF_AT_EOL_WA: u32 = 1 << 4;
+
+/// `WM_LINETIME(pipe)`.
+pub(crate) const fn wm_linetime(pipe: Pipe) -> u64 {
+    0x45270 + pipe as u64 * 4
+}
 
 /// One external pipe the port owner wants lit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +158,16 @@ fn timing(mode: &Mode) -> DisplayTiming {
         vsync_start: mode.v_sync_start,
         vsync_end: mode.v_sync_end,
         vtotal: mode.v_total,
+    }
+}
+
+/// The watermark timing of `ext`'s mode (unscaled: pipe pixel rate).
+fn res_timing(ext: &ExternalPipe) -> crate::intel_gpu_xelpg_wm::Timing {
+    crate::intel_gpu_xelpg_wm::Timing {
+        pixel_rate_khz: ext.mode.pixel_clock_khz,
+        htotal: u32::from(ext.mode.h_total),
+        vtotal: u32::from(ext.mode.v_total),
+        vblank_start: u32::from(ext.mode.v_active),
     }
 }
 
@@ -434,8 +479,13 @@ impl Pipes {
         self.reserved[pipe as usize].ok_or(PipeEnableError::NotReserved)
     }
 
-    /// Step 3: pipe source size, transcoder timings, the owned RGB bypass
-    /// and the no-DPT plane chicken, pipe off.
+    /// Step 3, pipe off, in `hsw_crtc_enable` order for display 14: pipe
+    /// source size and `PIPE_MISC`; the transcoder (set-context latency 0,
+    /// vsync shift 0, timings, `TRANS_VRR_CTL` 0 without VRR,
+    /// `TRANS_MULT` 0, frame-start delay 0 in `CHICKEN_TRANS`, and
+    /// `TRANSCONF` configured progressive and still disabled); the owned
+    /// RGB bypass, the line-time watermark and the pipe chicken bits; then
+    /// the no-DPT plane chicken (`intel_pre_update_crtc`).
     pub(crate) fn program_timings(
         &self,
         io: &(impl MmioWindow + ?Sized),
@@ -448,8 +498,17 @@ impl Pipes {
         let t = timing(&ext.mode);
         let trans = build_transcoder(&t).map_err(|_| PipeEnableError::Unsupported)?;
         let src = build_pipe(&t).map_err(|_| PipeEnableError::Unsupported)?;
+        let linetime = crate::intel_gpu_xelpg_wm::linetime(res_timing(&ext))
+            .map_err(|_| PipeEnableError::Unsupported)?;
+        // intel_set_pipe_src_size, bdw_set_pipe_misc.
         checked(io, pipe.trans_base() + PIPE_SRCSZ_OFFSET, src.srcsz)?;
+        checked(io, pipe.base() + PIPE_MISC_OFFSET, PIPE_MISC)?;
+        // hsw_configure_cpu_transcoder (the DP M/N precede it here):
+        // intel_set_transcoder_timings, intel_vrr_set_transcoder_timings,
+        // TRANS_MULT, hsw_set_frame_start_delay, hsw_set_transconf.
         let base = pipe.transcoder().base();
+        checked(io, base + TRANS_SET_CONTEXT_LATENCY_OFFSET, 0)?;
+        checked(io, base + TRANS_VSYNCSHIFT_OFFSET, 0)?;
         for (off, v) in [
             (TRANS_HTOTAL_OFFSET, trans.htotal),
             (TRANS_HBLANK_OFFSET, trans.hblank),
@@ -460,10 +519,28 @@ impl Pipes {
         ] {
             checked(io, base + off, v)?;
         }
+        checked(io, base + TRANS_VRR_CTL_OFFSET, 0)?;
+        checked(io, base + TRANS_MULT_OFFSET, 0)?;
+        let chicken = read(io, base + CHICKEN_TRANS_OFFSET)?;
+        checked(
+            io,
+            base + CHICKEN_TRANS_OFFSET,
+            chicken & !FRAME_START_DELAY_MASK,
+        )?;
+        checked(io, pipe.base() + PIPECONF_OFFSET, 0)?;
+        // intel_color_modeset (the owned RGB bypass), hsw_set_linetime_wm,
+        // icl_set_pipe_chicken.
         crate::intel_gpu_color::initialize_pipe_rgb_bypass(io, pipe).map_err(|e| match e {
             narf_filesystem::FsError::Busy => PipeEnableError::Busy,
             _ => PipeEnableError::NoDevice,
         })?;
+        checked(io, wm_linetime(pipe), linetime)?;
+        let chicken = read(io, pipe.base() + PIPE_CHICKEN_OFFSET)?;
+        checked(
+            io,
+            pipe.base() + PIPE_CHICKEN_OFFSET,
+            chicken | PIPE_CHICKEN_BITS,
+        )?;
         // intel_dpt_configure (display 14) for every universal plane: this
         // driver scans out of the GGTT, never through a DPT.
         for plane in 0..PLANES as u64 {
@@ -474,9 +551,10 @@ impl Pipes {
         Ok(())
     }
 
-    /// Step 4: `intel_enable_transcoder`. The caller has enabled its port
-    /// and `TRANS_DDI_FUNC_CTL`. From the write on, the pipe counts as lit
-    /// for every later transaction.
+    /// Step 4: `intel_enable_transcoder` (with its display-14
+    /// `CHICKEN_TRANS` workaround bits). The caller has enabled its port
+    /// and `TRANS_DDI_FUNC_CTL`. From the `TRANSCONF` write on, the pipe
+    /// counts as lit for every later transaction.
     pub(crate) fn enable(
         &mut self,
         io: &(impl MmioWindow + ?Sized),
@@ -487,6 +565,15 @@ impl Pipes {
         if self.lit & bit != 0 {
             return Err(PipeEnableError::Busy);
         }
+        // intel_enable_transcoder, display 14: CHICKEN_TRANS clears
+        // DP_DSC_INSERT_SF_AT_EOL_WA and sets DP_FEC_BS_JITTER_WA first.
+        let chicken = pipe.transcoder().base() + CHICKEN_TRANS_OFFSET;
+        let v = read(io, chicken)?;
+        checked(
+            io,
+            chicken,
+            (v & !DP_DSC_INSERT_SF_AT_EOL_WA) | DP_FEC_BS_JITTER_WA,
+        )?;
         let conf = pipe.base() + PIPECONF_OFFSET;
         let old = read(io, conf)?;
         io.write32(conf, (old & !PIPECONF_STATE) | PIPECONF_ENABLE);

@@ -332,6 +332,19 @@ pub(crate) fn plane(
     Ok(wm)
 }
 
+/// `intel_display.c::skl_linetime_wm` for an enabled pipe on display 14:
+/// the line time in 1/8 µs, `DIV_ROUND_UP(crtc_htotal * 1000 * 8,
+/// pixel_rate)`, capped at 0x1ff (Display WA #1135 halves it only on
+/// BXT/GLK). `hsw_crtc_supports_ips` is HSW/BDW only, so the IPS line time
+/// `WM_LINETIME` also carries is 0 here.
+pub(crate) fn linetime(timing: Timing) -> Result<u32, WmError> {
+    if timing.pixel_rate_khz == 0 || timing.htotal == 0 {
+        return Err(WmError::Unsupported);
+    }
+    let lines = (u64::from(timing.htotal) * 1000 * 8).div_ceil(u64::from(timing.pixel_rate_khz));
+    Ok(lines.min(0x1ff) as u32)
+}
+
 /// `skl_cursor_allocation`.
 pub(crate) fn cursor_allocation(
     timing: Timing,

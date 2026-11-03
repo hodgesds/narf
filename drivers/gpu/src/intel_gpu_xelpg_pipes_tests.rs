@@ -401,3 +401,104 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_pipes",
     smoke_xelpg_pipes_publish_layout_and_follow_a_tile4_panel_flip
 );
+
+fn smoke_xelpg_pipes_crtc_enable_programs_linetime_chicken_and_frame_start() -> TestResult {
+    // hsw_crtc_enable for display 14 on each of Pipes B–D, pipe off:
+    // PIPE_MISC after the source size; TRANS_SET_CONTEXT_LATENCY and
+    // TRANS_VSYNCSHIFT before the timings; TRANS_VRR_CTL, TRANS_MULT, the
+    // CHICKEN_TRANS frame-start delay and TRANSCONF (configured, disabled)
+    // after them; then the RGB bypass, WM_LINETIME and PIPE_CHICKEN; the
+    // transcoder enable takes the CHICKEN_TRANS workaround bits.
+    // skl_linetime_wm: DIV_ROUND_UP(1650 * 1000 * 8, 74250) = 178.
+    for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+        let p = pipe as u64;
+        let (trans, pbase) = (0x60000 + p * 0x1000, 0x70000 + p * 0x1000);
+        let hw = lit_panel();
+        // Firmware leftovers each register write must replace; unrelated
+        // chicken bits survive the read-modify-writes.
+        for (r, v) in [
+            (trans + 0x7c, 3),
+            (trans + 0x28, 7),
+            (trans + 0x2c, 1),
+            (trans + 0x420, 1 << 31),
+            (trans + 0x4e0, (3 << 27) | (1 << 4)),
+            (pbase + 0x08, 1 << 21),
+            (pbase + 0x30, 0x10),
+            (pbase + 0x38, 1 << 12),
+            (0x45270 + p * 4, 0x1ff),
+        ] {
+            hw.set(r, v);
+        }
+        let Ok(mut pipes) = Pipes::adopt_panel(&hw, &Mode::VESA_1024X768_60) else {
+            return TestResult::Fail("the owned panel must be adopted");
+        };
+        if pipes.reserve(&hw, &external(pipe), &NoPipeDmc).is_err()
+            || pipes.program_timings(&hw, pipe).is_err()
+        {
+            return TestResult::Fail("the external pipe must be reserved and programmed");
+        }
+        let values = [
+            (pbase + 0x30, 1 << 8),
+            (trans + 0x7c, 0),
+            (trans + 0x28, 0),
+            (trans + 0x420, 0),
+            (trans + 0x2c, 0),
+            (trans + 0x4e0, 1 << 4),
+            (pbase + 0x08, 0),
+            (0x45270 + p * 4, 178),
+            (pbase + 0x38, (1 << 30) | (1 << 15) | (1 << 12) | (1 << 7)),
+        ];
+        if values.iter().any(|&(r, v)| hw.get(r) != v) {
+            return TestResult::Fail("the crtc registers must take Linux's display-14 values");
+        }
+        let order = [
+            trans + 0x1c,
+            pbase + 0x30,
+            trans + 0x7c,
+            trans + 0x28,
+            trans,
+            trans + 0x14,
+            trans + 0x420,
+            trans + 0x2c,
+            trans + 0x4e0,
+            pbase + 0x08,
+            pbase + 0x1cc,
+            0x45270 + p * 4,
+            pbase + 0x38,
+            pbase + 0x26c,
+        ];
+        if order.windows(2).any(|w| hw.last(w[0]) >= hw.first(w[1])) {
+            return TestResult::Fail("the crtc registers must follow hsw_crtc_enable's order");
+        }
+        // intel_enable_transcoder on display 14: DP_FEC_BS_JITTER_WA set
+        // and DP_DSC_INSERT_SF_AT_EOL_WA cleared before TRANSCONF enables.
+        let configured = hw.writes.borrow().len();
+        if pipes.enable(&hw, pipe).is_err() || hw.get(trans + 0x4e0) != 1 << 15 {
+            return TestResult::Fail("the transcoder enable must take its chicken bits");
+        }
+        let chicken = hw.last(trans + 0x4e0);
+        let enable = hw.last(pbase + 0x08);
+        if chicken < configured || chicken >= enable || hw.get(pbase + 0x08) & (1 << 31) == 0 {
+            return TestResult::Fail("the chicken bits must precede TRANSCONF enable");
+        }
+        // Panel Pipe A's line time and chicken are never touched.
+        if hw.wrote(0x45270) || hw.wrote(0x70038) || hw.wrote(0x604e0) {
+            return TestResult::Fail("Pipe A's crtc registers belong to the panel");
+        }
+    }
+    // The 0x1ff cap.
+    let long = crate::intel_gpu_xelpg_wm::Timing {
+        pixel_rate_khz: 25_000,
+        htotal: 4000,
+        vtotal: 600,
+        vblank_start: 480,
+    };
+    if crate::intel_gpu_xelpg_wm::linetime(long) != Ok(0x1ff) {
+        return TestResult::Fail("WM_LINETIME is capped at 0x1ff");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_pipes",
+    smoke_xelpg_pipes_crtc_enable_programs_linetime_chicken_and_frame_start
+);
