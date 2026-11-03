@@ -2492,3 +2492,31 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_host_vht_capability_per_band
 );
+
+/// `reserved_page_packet_8821` pages 0..=4 verbatim: Linux spells four
+/// bytes of the QoS-Null and BT-QoS-Null pages `0XB2`/`0XB3`; dropping them
+/// shifted the BT-QoS-Null frame control and its 40-byte TX descriptor.
+fn smoke_rtl8821ae_rsvd_page_template_page_layout() -> TestResult {
+    let t = &rsvd_page::TEMPLATE;
+    // Each next page's descriptor (pkt_size, offset 40, FIRST/LAST) sits in
+    // the preceding page's last 40 bytes.
+    for (page, size) in [(1usize, 0x10u8), (2, 0x18), (3, 0x1a), (4, 0x1a), (5, 0x3c)] {
+        let at = page * 256 - 40;
+        if t[at..at + 4] != [size, 0x00, 0x28, 0x8c] {
+            return TestResult::Fail("reserved-page TX descriptor misplaced");
+        }
+    }
+    if t[256..258] != [0xa4, 0x10]
+        || t[512..514] != [0x48, 0x01]
+        || t[768..770] != [0xc8, 0x01]
+        || t[1024..1026] != [0xc8, 0x01]
+        || t[1024 + 6..1024 + 10] != [0xb2, 0xa7, 0xb3, 0x6e]
+    {
+        return TestResult::Fail("reserved-page frame headers shifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_rsvd_page_template_page_layout
+);

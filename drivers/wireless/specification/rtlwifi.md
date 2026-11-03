@@ -1765,7 +1765,10 @@ chain below is composed.
     `_rtl8821ae_download_rsvd_page(false)` (CR+1 BIT0, BCN_CTRL BIT3/BIT4,
     TXQ BIT6, up to five uploads of `rtl8821ae_set_fw_rsvdpagepkt(false,
     false)` — the verbatim `reserved_page_packet_8821` pages 0..4 with the
-    Linux A1/A2/A3/AID substitutions, 1240 bytes, `rtl8821ae_tx_fill_cmddesc`
+    Linux A1/A2/A3/AID substitutions (the template now keeps the Linux
+    `0XB2`/`0XB3` bytes of pages 3/4, whose loss had shifted the BT-QoS-Null
+    frame control and TX descriptor; `smoke_rtl8821ae_rsvd_page_template_page_layout`),
+    1240 bytes, `rtl8821ae_tx_fill_cmddesc`
     on BEACON descriptor 0 and BIT(4) polling — each followed by the
     `H2C_8821AE_RSVDPAGE` location command, 20 × 10 us BCN_VALID polls) and
     the MSRRPT connect report. A BCN_VALID timeout (Linux logs and goes on)
