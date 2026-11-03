@@ -152,17 +152,21 @@ impl core::fmt::Debug for Session {
 impl Session {
     pub(crate) fn new(info: Info, config: Config) -> Result<Arc<Self>, FsError> {
         let info = info.validate()?;
-        if !(1..=7).contains(&config.rate) || config.wait == 0 || config.wait > info.reports() {
+        if !(1..=7).contains(&config.rate) {
             return Err(FsError::InvalidData);
         }
+        // xe_eu_stall_stream_open_locked: an open stream is -EBUSY before
         // xe_eu_stall_stream_init bounds wait by all active physical rings.
-        // Reserve enough private host space for the accepted threshold before
-        // exposing any sampler. At 32 DSS this is at most 16 MiB/card.
-        let capacity = HOST_BYTES.max(config.wait as usize * RECORD);
         ACTIVE[info.card as usize]
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| FsError::Busy)?;
         let permit = Permit(info.card);
+        if config.wait == 0 || config.wait > info.reports() {
+            return Err(FsError::InvalidData);
+        }
+        // Reserve enough private host space for the accepted threshold before
+        // exposing any sampler. At 32 DSS this is at most 16 MiB/card.
+        let capacity = HOST_BYTES.max(config.wait as usize * RECORD);
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(capacity)
@@ -302,31 +306,58 @@ pub(crate) fn query(info: Info) -> Result<Vec<u8>, FsError> {
     }
     Ok(bytes)
 }
-fn properties(info: Info, mut address: u64, user: &dyn IoctlContext) -> Result<Config, FsError> {
+/// xe_eu_stall.c's MAX_USER_EXTENSIONS.
+const MAX_USER_EXTENSIONS: usize = 5;
+/// ARRAY_SIZE(xe_set_eu_stall_property_funcs): GT_ID 1, SAMPLE_RATE 2,
+/// WAIT_NUM_REPORTS 3; property 0 has no setter.
+const PROPERTIES: u32 = 4;
+
+/// xe_eu_stall.c::xe_eu_stall_user_extensions, then the `!props.gt` check
+/// of xe_eu_stall_stream_open, in their order. Per link: the
+/// MAX_USER_EXTENSIONS bound (-E2BIG, before any copy; there is no visited
+/// set), the 16-byte drm_xe_user_extension copy and its pad/name, then
+/// xe_eu_stall_user_ext_set_property: the 48-byte drm_xe_ext_set_property
+/// copy (reserved[] unchecked), the property bound, property 0 and the pad,
+/// then the setter. WAIT_NUM_REPORTS is only stored here: its range is
+/// xe_eu_stall_stream_init's, checked by `Session::new` after EBUSY.
+fn properties(mut address: u64, user: &dyn IoctlContext) -> Result<Config, FsError> {
     let mut config = Config { rate: 4, wait: 1 };
     let mut found = false;
-    let mut seen = [0; 5];
-    let mut count = 0;
+    let mut ext_number = 0;
     while address != 0 {
-        if count == 5 || seen[..count].contains(&address) {
+        if ext_number >= MAX_USER_EXTENSIONS {
+            return Err(FsError::ArgumentListTooLong);
+        }
+        ext_number += 1;
+        // struct drm_xe_user_extension: next_extension 0, name 8, pad 12.
+        let mut header = [0; 16];
+        user.read(address, &mut header)?;
+        let u32_at =
+            |wire: &[u8], at: usize| u32::from_le_bytes(wire[at..at + 4].try_into().unwrap());
+        if u32_at(&header, 12) != 0 || u32_at(&header, 8) >= 1 {
             return Err(FsError::InvalidData);
         }
-        seen[count] = address;
-        count += 1;
-        let mut wire = [0; 32];
+        // struct drm_xe_ext_set_property: property 16, pad 20, value 24.
+        let mut wire = [0; 48];
         user.read(address, &mut wire)?;
-        let u32_at = |at| u32::from_le_bytes(wire[at..at + 4].try_into().unwrap());
-        let value = u64::from_le_bytes(wire[24..32].try_into().unwrap());
-        if u32_at(8) != 0 || u32_at(12) != 0 || u32_at(20) != 0 {
+        let property = u32_at(&wire, 16);
+        if property >= PROPERTIES || property == 0 || u32_at(&wire, 20) != 0 {
             return Err(FsError::InvalidData);
         }
-        match u32_at(16) {
-            1 if value == 0 => found = true,
+        let value = u64::from_le_bytes(wire[24..32].try_into().unwrap());
+        match property {
+            // set_prop_eu_stall_gt_id: xe_device_get_gt(xe, value) takes a
+            // u8 gt_id, so only the low byte names the GT. LINUX-GAP: Linux
+            // also accepts the standalone media GT (1) that BMG and LNL
+            // have; NARF samples only the primary GT and refuses it.
+            1 if value as u8 == 0 => found = true,
             2 if (1..=7).contains(&(value / 251)) => config.rate = (value / 251) as u32,
-            3 if value != 0 && value <= info.reports() => config.wait = value,
+            // set_prop_eu_stall_wait_num_reports stores the value in an
+            // int, which stream_init compares as unsigned: its low 32 bits.
+            3 => config.wait = u64::from(value as u32),
             _ => return Err(FsError::InvalidData),
         }
-        address = u64::from_le_bytes(wire[..8].try_into().unwrap());
+        address = u64::from_le_bytes(header[..8].try_into().unwrap());
     }
     if !found {
         return Err(FsError::InvalidData);
@@ -357,7 +388,7 @@ async fn open_with_gate(
     if value(0) != 0 || value(8) != 1 || value(16) != 0 {
         return Err(FsError::InvalidData);
     }
-    let session = Session::new(info, properties(info, value(24), user)?)?;
+    let session = Session::new(info, properties(value(24), user)?)?;
     let mut pending = PendingOpen {
         session: session.clone(),
         committed: false,

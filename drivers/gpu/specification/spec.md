@@ -779,9 +779,17 @@ startup's acknowledged heavy GGTT invalidations. Query 10
 is available only after that owner and the execution epoch are published.
 Xe OBSERVATION type 1/open 0 returns a disabled sampling description; current
 CAP_PERFMON or CAP_SYS_ADMIN is required at open and every read/control, including
-after an awaited operation. GT_ID 0 is required. Sample periods use source
-251-cycle multipliers 1..7. WAIT_NUM_REPORTS accepts 1..8192 times the number of
-active DSSs (maximum 262144 reports); zero or larger values return EINVAL.
+after an awaited operation. The property chain follows
+xe_eu_stall_user_extensions: at most five links (a sixth is E2BIG before it is
+read; links may repeat), each a 16-byte header copied and checked (name, pad:
+EINVAL) before the 48-byte set-property body (EFAULT; reserved[] unchecked),
+then property 1..3 with a zero pad (else EINVAL). GT_ID's low byte must name
+GT 0 (Linux's u8 gt_id; the media GT Linux would accept is EINVAL, a
+LINUX-GAP), and a chain without GT_ID is EINVAL. Sample periods use source
+251-cycle multipliers 1..7. WAIT_NUM_REPORTS keeps its low 32 bits and is
+checked only after an already-open description's EBUSY: it accepts 1..8192
+times the number of active DSSs (maximum 262144 reports); zero or larger values
+return EINVAL.
 
 One description per card preallocates a host FIFO of max(64 KiB, wait*64),
 bounded at 16 MiB, before attaching a sampler. It holds opaque 64-byte records.

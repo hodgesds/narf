@@ -631,36 +631,82 @@ fn smoke_eu_stall_query_properties_record_bounds_and_malformed_cursors() -> Test
     ] {
         assert_eq!(query(bad), Err(FsError::Unsupported));
     }
+    // MIT Linux b90c984d xe_eu_stall.c::{xe_eu_stall_user_extensions,
+    // xe_eu_stall_user_ext_set_property,xe_eu_stall_stream_open,
+    // xe_eu_stall_stream_open_locked,xe_eu_stall_stream_init}.
     let wire = Wire::new();
     wire.opening();
-    assert_eq!(
-        properties(layout, 128, &wire),
-        Ok(Config { rate: 2, wait: 1 })
-    );
-    assert_eq!(properties(layout, 0, &wire), Err(FsError::InvalidData));
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 2, wait: 1 }));
+    // `if (!props.gt) return -EINVAL;` after the chain.
+    assert_eq!(properties(0, &wire), Err(FsError::InvalidData));
+    // Property 0 has no setter and 4 is past ARRAY_SIZE (-EINVAL), as are
+    // sampling rates outside 251..=1757 and (LINUX-GAP) the media GT 1 that
+    // Linux would accept.
     for (key, value, error) in [
+        (0, 0, FsError::InvalidData),
         (1, 1, FsError::InvalidData),
         (2, 250, FsError::InvalidData),
         (2, 2008, FsError::InvalidData),
-        (3, 0, FsError::InvalidData),
-        (3, layout.reports() + 1, FsError::InvalidData),
         (4, 0, FsError::InvalidData),
     ] {
         wire.property(128, 160, 1, 0);
         wire.property(160, 0, key, value);
-        assert_eq!(properties(layout, 128, &wire), Err(error));
+        assert_eq!(properties(128, &wire), Err(error));
     }
+    // xe_device_get_gt takes a u8 gt_id: GT 0x100 is GT 0.
+    wire.property(128, 0, 1, 0x100);
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait: 1 }));
+    // WAIT_NUM_REPORTS is only stored, in an int (its low 32 bits). These
+    // pinned -EINVAL from the chain for 0 and reports + 1; Linux checks the
+    // range in xe_eu_stall_stream_init, after the EBUSY of an open stream.
+    for (value, wait) in [
+        (0, 0),
+        (layout.reports() + 1, layout.reports() + 1),
+        (1 << 32 | 1, 1),
+    ] {
+        wire.property(128, 160, 1, 0);
+        wire.property(160, 0, 3, value);
+        assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait }));
+    }
+    for wait in [0, layout.reports() + 1] {
+        let bad = Config { rate: 4, wait };
+        assert_eq!(Session::new(layout, bad).unwrap_err(), FsError::InvalidData);
+        let held = Session::new(layout, config()).unwrap();
+        assert_eq!(Session::new(layout, bad).unwrap_err(), FsError::Busy);
+        drop(held);
+    }
+    // MAX_USER_EXTENSIONS is 5 and Linux keeps no visited set: five links
+    // are walked, a sixth is -E2BIG before it is read (here unreadable), and
+    // a self-reference ends at the same bound. This pinned -EINVAL.
+    for link in 0..5u64 {
+        let next = if link == 4 { 0 } else { 128 + 64 * (link + 1) };
+        wire.property(128 + 64 * link, next, 1, 0);
+    }
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait: 1 }));
+    wire.property(128 + 64 * 4, 2048, 1, 0);
+    assert_eq!(properties(128, &wire), Err(FsError::ArgumentListTooLong));
     wire.property(128, 128, 1, 0);
-    assert_eq!(properties(layout, 128, &wire), Err(FsError::InvalidData));
+    assert_eq!(properties(128, &wire), Err(FsError::ArgumentListTooLong));
+    // The 16-byte header is copied and refused before the 48-byte body: at
+    // the end of the range a bad name is -EINVAL, a good header -EFAULT.
     wire.property(128, 1008, 1, 0);
-    assert_eq!(properties(layout, 128, &wire), Err(FsError::BadAddress));
+    assert_eq!(properties(128, &wire), Err(FsError::BadAddress));
+    wire.write(1016, &1u32.to_le_bytes()).unwrap();
+    assert_eq!(properties(128, &wire), Err(FsError::InvalidData));
+    wire.write(1016, &0u32.to_le_bytes()).unwrap();
+    // The body is the whole drm_xe_ext_set_property: unreadable reserved[]
+    // words are -EFAULT, readable ones are not checked.
+    wire.property(1024 - 32, 0, 1, 0);
+    assert_eq!(properties(1024 - 32, &wire), Err(FsError::BadAddress));
     wire.property(128, 0, 1, 0);
+    wire.write(160, &[0xa5; 16]).unwrap();
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait: 1 }));
     wire.write(140, &1u32.to_le_bytes()).unwrap();
-    assert_eq!(properties(layout, 128, &wire), Err(FsError::InvalidData));
+    assert_eq!(properties(128, &wire), Err(FsError::InvalidData));
     for wait in [1, 2, layout.reports()] {
         wire.property(128, 160, 1, 0);
         wire.property(160, 0, 3, wait);
-        assert_eq!(properties(layout, 128, &wire), Ok(Config { rate: 4, wait }));
+        assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait }));
         let session = Session::new(layout, Config { rate: 4, wait }).unwrap();
         assert_eq!(session.room(), HOST_BYTES.max(wait as usize * 64));
     }
