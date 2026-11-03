@@ -115,6 +115,23 @@ pub(super) struct Frame {
     /// Original32-byte PHY-status record for dynamic-mechanism statistics.
     pub(super) status: Option<alloc::boxed::Box<[u8; 32]>>,
 }
+impl Frame {
+    /// A received MPDU (FCS removed) parsed by another host interface's
+    /// packet owner (`usb_packet.rs`) under the same admission rules.
+    pub(super) fn received(
+        bytes: Vec<u8>,
+        rate: u8,
+        phy: Option<super::packet_phy::Evidence>,
+        status: Option<alloc::boxed::Box<[u8; 32]>>,
+    ) -> Self {
+        Self {
+            bytes,
+            rate,
+            phy,
+            status,
+        }
+    }
+}
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
         &self.bytes

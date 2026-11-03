@@ -3034,11 +3034,35 @@ grant is published. Remaining blockers, verified against the tree:
    - The HT path-switch RX-DMA idle wait (`ht.rs::program`) samples through
      the gate every executor turn for the same 10 ms bound, instead of a
      synchronous `responsive_spin_until`.
-2. Packet path. `packet_core::Port` is shaped around PCI TXBD/RXBD rings
-   (`index`, `publish`, `tx_descriptor`, `rx_descriptor`, `rx_repost`). A USB
-   port needs a queue/URB-shaped port built from `aggregate`/`split_rx`, with
-   USB-completion (not CCX) receipts for non-report frames, as
-   `rtw_usb_write_port_tx_complete` does.
+2. Packet path (packet owner landed; station worker open).
+   `packet_core::Port` stays shaped around PCI TXBD/RXBD rings.
+   `usb_packet.rs::Owner` is the queue/URB-shaped USB counterpart over the
+   persistent begin/poll bulk receipts (`rtl8xxxu::packet_transport::Io`,
+   `USBDevice::begin_bulk_*`), so `poll` never blocks or spins:
+   - TX (`rtw_usb_tx_write`): `transmit_packet` builds the PCI owner's
+     descriptor (`transmit_profile` + RTS protection), replaces W1 QSEL by
+     `rtw_usb_tx_queue_mapping_to_qsel` (MGMT/HIGH/TID) with MORE_DATA for
+     HIGH, and applies the USB checksum. Frames queue on
+     `tx_queue[qsel_to_ep]` (at most `MAX_QUEUED` = 32 in total, `Busy`
+     beyond); `rtw_usb_tx_handler` walks the pipes from the highest index
+     down, one URB in flight per pipe, each URB one `aggregate` of up to
+     three queued packets.
+   - Completion (`rtw_usb_write_port_tx_complete`): a frame that requested a
+     report (SPE_RPT, six-bit `sn << 2` not held by any queued, in-flight or
+     awaiting frame) waits for its CCX C2H (1 s deadline, NACK terminal, as
+     on PCI); every other frame completes on the exact-length USB completion
+     with `radio_acknowledged = false`. Linux's `IEEE80211_TX_STAT_ACK` for
+     those is mac80211 bookkeeping, not radio evidence.
+   - RX: one persistent 32 KiB bulk-IN receipt; a completed URB is copied,
+     the receipt re-posted, and every `split_rx` record admitted by `admit`
+     under the PCI owner's rules (`receive_rates` at the current profile,
+     PHY status on the operating channel/width, FCS removed, short non-BAR
+     MPDUs dropped). C2H records also feed CCX matching.
+   - Any USB error fails the owner (the 8188EU halt-recovery sequence is not
+     ported); `stop` retires every retained receipt through `Io::stop`.
+   Open: the station worker. `interface.rs`/`pci_firmware.rs` still drive
+   `packet_core::Core` and `ready_now`; a USB station needs an async worker
+   owning `usb_packet::Owner` plus the async register `Io`.
 3. Identity and records. The firmware owner, the N21Q/N21P/N21S/N2x*
    records and the `power_policy` board identity are keyed by PCI
    VID/DID 0x10ec/0xc821. RTL8821CU needs its own USB VID/PID-bound signed
@@ -3063,7 +3087,10 @@ Written, unexecuted: `smoke_rtw88_usb_endpoints_and_qsel_map`,
 `smoke_rtw88_usb_rx_aggregate_split`,
 `smoke_rtw88_usb_register_section_mirror`,
 `smoke_rtw88_usb_power_on_sequence`,
-`smoke_rtw88_usb_interface_cfg_and_rx_agg`.
+`smoke_rtw88_usb_interface_cfg_and_rx_agg`,
+`smoke_rtw88_usb_packet_tx_queues_and_aggregation`,
+`smoke_rtw88_usb_packet_rx_aggregate_and_ccx_receipt`,
+`smoke_rtw88_usb_packet_timeout_stop_and_descriptor`.
 
 ## 4. Invariants
 
