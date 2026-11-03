@@ -488,6 +488,12 @@ impl Calibration {
         self.permission_for(domain, Operating::twenty(channel))
     }
 
+    /// Every operating point the envelope carries a measured row for (no
+    /// policy; [`Self::permission_for`] still decides admission).
+    pub fn operating_points(&self) -> impl Iterator<Item = Operating> + '_ {
+        self.curves.iter().map(|c| c.op)
+    }
+
     /// Whether the envelope carries a measured row for `op` (no policy).
     pub fn measures(&self, op: Operating) -> bool {
         self.curves.iter().any(|c| c.op == op)

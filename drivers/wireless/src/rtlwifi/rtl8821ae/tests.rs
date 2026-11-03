@@ -2390,3 +2390,105 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping
 );
+
+/// Host API (nl80211 `GET_WIPHY`) capability: `_rtl_init_mac80211` HT on
+/// both sbands, VHT on the 5 GHz sband only, each published only for an
+/// admitted envelope operating point, with the association-path bodies.
+fn smoke_rtl8821ae_host_vht_capability_per_band() -> TestResult {
+    use envelope::{Band, Operating, Width};
+    use narf_wireless::reg::*;
+    use vht::{HOST_HT40_2G, HOST_HT40_5G, HOST_HT_2G, HOST_HT_5G, HOST_VHT_5G};
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x04],
+        logical: powered_logical_5g(2),
+    };
+    let rows = [(1, 0, 40, 1), (36, 1, 20, 0), (36, 1, 80, 0)];
+    let Ok(cal) = envelope::Calibration::from_verified(
+        &napc_v2(&factory, &rows, 30, false),
+        Some([1; 32]),
+        &factory,
+    ) else {
+        return TestResult::Fail("v2 envelope rejected");
+    };
+    if cal.operating_points().count() != rows.len() {
+        return TestResult::Fail("operating points of the envelope");
+    }
+    let rule = |start, end, bw| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bw,
+        max_power_dbm: 20,
+        flags: RegFlags::empty(),
+    };
+    let both = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 40), rule(5170, 5250, 80)],
+    };
+    let at = |domain: &RegulatoryDomain, band, width, channel| {
+        cal.permission_for(
+            domain,
+            Operating {
+                band,
+                width,
+                channel,
+            },
+        )
+        .ok()
+    };
+    let mut expect = 0;
+    if at(&both, Band::B2g, Width::W40Above, 1).is_some_and(|p| ht::admitted(&p)) {
+        expect |= HOST_HT_2G | HOST_HT40_2G;
+    }
+    if at(&both, Band::B5g, Width::W20, 36).is_some_and(|p| ht::admitted(&p)) {
+        expect |= HOST_HT_5G;
+    }
+    if at(&both, Band::B5g, Width::W80, 36).is_some_and(|p| vht::admitted(&p)) {
+        expect |= HOST_HT_5G | HOST_HT40_5G | HOST_VHT_5G;
+    }
+    if vht::host_capabilities(&cal, &both) != expect {
+        return TestResult::Fail("host capability bits differ from admitted points");
+    }
+    // No 5 GHz rule: no 5 GHz capability at all.
+    let low = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 40)],
+    };
+    if vht::host_capabilities(&cal, &low) & (HOST_HT_5G | HOST_HT40_5G | HOST_VHT_5G) != 0 {
+        return TestResult::Fail("5 GHz capability without a 5 GHz rule");
+    }
+    // A 20 MHz-only 5 GHz rule refuses the 80 MHz point: no VHT.
+    let narrow = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 40), rule(5170, 5250, 20)],
+    };
+    if vht::host_capabilities(&cal, &narrow) & HOST_VHT_5G != 0 {
+        return TestResult::Fail("VHT published without an admitted 80 MHz point");
+    }
+    // Per-band bodies: the association-path HT/VHT, VHT on 5 GHz only.
+    let all = HOST_HT_2G | HOST_HT40_2G | HOST_HT_5G | HOST_HT40_5G | HOST_VHT_5G;
+    match vht::host_phy(all, 2400) {
+        Some(p) if p.ht == ht::capability(true).capability_body() && p.vht.is_none() => {}
+        _ => return TestResult::Fail("2.4 GHz host PHY"),
+    }
+    match vht::host_phy(all, 5000) {
+        Some(p)
+            if p.ht == ht::capability(true).capability_body()
+                && p.vht == Some(vht::capability().capability_body()) => {}
+        _ => return TestResult::Fail("5 GHz host PHY lacks the VHT body"),
+    }
+    match vht::host_phy(HOST_HT_5G, 5000) {
+        Some(p) if p.ht == ht::capability(false).capability_body() && p.vht.is_none() => {}
+        _ => return TestResult::Fail("5 GHz HT20-only host PHY"),
+    }
+    if vht::host_phy(HOST_HT_2G, 5000).is_some()
+        || vht::host_phy(HOST_HT_5G | HOST_VHT_5G, 2400).is_some()
+        || vht::host_phy(all, 6000).is_some()
+    {
+        return TestResult::Fail("host PHY on a band without HT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_host_vht_capability_per_band
+);

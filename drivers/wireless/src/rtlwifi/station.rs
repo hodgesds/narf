@@ -1070,6 +1070,26 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .rtl8821ae_power
                 .is_some_and(|p| super::super::rtl8821ae::ht::admitted(&p))
     }
+    /// RTL8821AE: the host-API capability bits
+    /// (`rtl8821ae::vht::host_capabilities`) of the staged calibration
+    /// envelope under current host policy; 0 for every other chip, without
+    /// an envelope or without a regulatory domain.
+    pub(crate) fn station_rtl8821ae_host_caps(&self, environment: &impl Environment) -> u8 {
+        if self.chip != super::Chip::Rtl8821ae {
+            return 0;
+        }
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8821ae())
+        else {
+            return 0;
+        };
+        environment.domain().map_or(0, |domain| {
+            super::super::rtl8821ae::vht::host_capabilities(base, &domain)
+        })
+    }
     /// The RTL8821AE owner holds a 5 GHz channel grant.
     pub(crate) fn rtl8821ae_five_ghz(&self) -> bool {
         self.chip == super::Chip::Rtl8821ae

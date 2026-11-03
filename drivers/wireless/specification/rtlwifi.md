@@ -1960,8 +1960,22 @@ chain below is composed.
     (`_rtl_query_shortgi` with `bw_80`). RX accepts VHT 1SS MCS0-9
     (`rtl8821ae_get_rx_vht_nss` 1) and BW 80 on the 80 MHz channel. C2H RA
     reports keep `rtl8821ae_dm_update_init_rate` for any reported rate.
-    Interface band advertisement still lists HT only (no VHT capability
-    is published to the host API). Tests
+    Host API (`get_wireless_info` / `phy_capabilities`, nl80211
+    `GET_WIPHY`): `base.c::_rtl_init_mac80211` runs
+    `_rtl_init_hw_ht_capab` on both sbands and `_rtl_init_hw_vht_capab`
+    on the 5 GHz sband only. `vht::host_capabilities` derives per-band
+    bits from the staged `NAPC` envelope under current host policy
+    (`Calibration::operating_points` + `permission_for`): HT on an
+    `ht::admitted` 20 MHz point, the 20/40 HT form on an `ht::admitted`
+    40 MHz point, VHT (with the 20/40 HT form) on a `vht::admitted`
+    5 GHz W80 point. The interface stores them when the station service
+    starts / a join is published and clears them on close; `hw_caps`
+    `vht_supported` needs the VHT bit and a listed 5 GHz band, and
+    `vht::host_phy` returns the association-path bodies
+    (`ht::capability(forty)`, `vht::capability()` on 5000 only). Without
+    an admitted W80 point no VHT is advertised (never a capability the
+    join could not use). Tests
+    `smoke_rtl8821ae_host_vht_capability_per_band`,
     `smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping`,
     `smoke_rtl8821ae_iqk_80mhz_vdf_branch` (written, unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the

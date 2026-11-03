@@ -40,6 +40,70 @@ pub fn capability() -> LocalVht {
         .with_rx_stbc(true)
 }
 
+/// Host-capability bits ([`host_capabilities`]).
+pub const HOST_HT_2G: u8 = 1 << 0;
+pub const HOST_HT40_2G: u8 = 1 << 1;
+pub const HOST_HT_5G: u8 = 1 << 2;
+pub const HOST_HT40_5G: u8 = 1 << 3;
+pub const HOST_VHT_5G: u8 = 1 << 4;
+
+/// The per-band capability the host API (nl80211 `GET_WIPHY`) publishes.
+/// Linux `base.c::_rtl_init_mac80211` runs `_rtl_init_hw_ht_capab` on both
+/// sbands and `_rtl_init_hw_vht_capab` on the 5 GHz sband only. Here a
+/// band carries a capability only while the signed `NAPC` envelope admits
+/// it under `domain` at some operating point the association path can
+/// select: HT on an `ht::admitted` 20 MHz point, the 20/40 form on an
+/// `ht::admitted` 40 MHz point, and VHT (with the 20/40 HT form
+/// [`local`] sends) on a [`admitted`] 5 GHz 80 MHz point.
+pub fn host_capabilities(
+    base: &super::envelope::Calibration,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+) -> u8 {
+    use super::envelope::Band;
+    let mut caps = 0;
+    for op in base.operating_points() {
+        let Ok(permission) = base.permission_for(domain, op) else {
+            continue;
+        };
+        let five = op.band == Band::B5g;
+        caps |= match op.width {
+            Width::W20 if super::ht::admitted(&permission) => {
+                if five {
+                    HOST_HT_5G
+                } else {
+                    HOST_HT_2G
+                }
+            }
+            Width::W40Above | Width::W40Below if super::ht::admitted(&permission) => {
+                if five {
+                    HOST_HT_5G | HOST_HT40_5G
+                } else {
+                    HOST_HT_2G | HOST_HT40_2G
+                }
+            }
+            Width::W80 if five && admitted(&permission) => HOST_HT_5G | HOST_HT40_5G | HOST_VHT_5G,
+            _ => 0,
+        };
+    }
+    caps
+}
+
+/// The `PhyCapabilities` of `band` (2400 / 5000 MHz) for the
+/// [`host_capabilities`] bits: the same HT body ([`super::ht::capability`])
+/// and VHT body ([`capability`]) the association path sends; `None` when
+/// the band carries no HT.
+pub fn host_phy(caps: u8, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+    let (ht, forty, vht) = match band {
+        2400 => (HOST_HT_2G, HOST_HT40_2G, 0),
+        5000 => (HOST_HT_5G, HOST_HT40_5G, HOST_VHT_5G),
+        _ => return None,
+    };
+    (caps & ht != 0).then(|| narf_wireless::iface::PhyCapabilities {
+        ht: super::ht::capability(caps & forty != 0).capability_body(),
+        vht: (vht != 0 && caps & vht != 0).then(|| capability().capability_body()),
+    })
+}
+
 /// The VHT80 local PHY: the HT20/40 profile plus [`capability`].
 pub fn local() -> LocalPhy {
     LocalPhy::vht80(super::ht::capability(true), capability()).expect("fixed 8821AE VHT80")

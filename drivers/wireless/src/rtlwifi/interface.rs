@@ -75,6 +75,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     bssid: AtomicU64,
     ht: AtomicBool,
     ht40: AtomicBool,
+    /// RTL8821AE per-band host capability (`rtl8821ae::vht::HOST_*`).
+    rtl8821ae_caps: AtomicU8,
     rts_threshold: AtomicU32,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
@@ -196,6 +198,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
 }
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Device<I, M, E> {
+    /// The RTL8821AE envelope publishes HT on some band.
+    fn rtl8821ae_host_ht(&self) -> bool {
+        use super::rtl8821ae::vht::{HOST_HT_2G, HOST_HT_5G};
+        self.rtl8821ae_caps.load(Ordering::Acquire) & (HOST_HT_2G | HOST_HT_5G) != 0
+    }
     pub(crate) fn configured_rts_threshold(&self) -> Option<u16> {
         u16::try_from(self.rts_threshold.load(Ordering::Acquire)).ok()
     }
@@ -203,6 +210,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         self.admission.closed.store(true, Ordering::Release);
         self.ht.store(false, Ordering::Release);
         self.ht40.store(false, Ordering::Release);
+        self.rtl8821ae_caps.store(0, Ordering::Release);
         *self.rx.lock() = None;
         self.update_link(None);
     }
@@ -236,6 +244,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             bssid: AtomicU64::new(0),
             ht: AtomicBool::new(false),
             ht40: AtomicBool::new(false),
+            rtl8821ae_caps: AtomicU8::new(0),
             rts_threshold: AtomicU32::new(u32::MAX),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
@@ -332,6 +341,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
             self.ht40
                 .store(owner.station_ht40_supported(), Ordering::Release);
+            self.rtl8821ae_caps.store(
+                owner.station_rtl8821ae_host_caps(&self.environment),
+                Ordering::Release,
+            );
             owner.start_station_service(&self.environment).await?;
         }
         if owner.station_phase() == station::Phase::Failed {
@@ -938,32 +951,37 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
     fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
         use narf_wireless::iface::*;
+        // One entry per band with an admitted channel (the RTL8821AE
+        // profile's 5 GHz `NAPC` permissions add the 5000 MHz band).
+        let bands = {
+            let (low, high): (Vec<u32>, Vec<u32>) = self
+                .available_channels()
+                .into_iter()
+                .partition(|&channel| channel < 36);
+            let mut bands = vec![WirelessBand {
+                freq_mhz: 2400,
+                channels: low,
+            }];
+            if !high.is_empty() {
+                bands.push(WirelessBand {
+                    freq_mhz: 5000,
+                    channels: high,
+                });
+            }
+            bands
+        };
+        // VHT is a 5 GHz sband capability only (`_rtl_init_mac80211`).
+        let vht_supported = bands.len() > 1
+            && self.rtl8821ae_caps.load(Ordering::Acquire) & super::rtl8821ae::vht::HOST_VHT_5G
+                != 0;
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.factory.mac,
-            // One entry per band with an admitted channel (the RTL8821AE
-            // profile's 5 GHz `NAPC` permissions add the 5000 MHz band).
-            bands: {
-                let (low, high): (Vec<u32>, Vec<u32>) = self
-                    .available_channels()
-                    .into_iter()
-                    .partition(|&channel| channel < 36);
-                let mut bands = vec![WirelessBand {
-                    freq_mhz: 2400,
-                    channels: low,
-                }];
-                if !high.is_empty() {
-                    bands.push(WirelessBand {
-                        freq_mhz: 5000,
-                        channels: high,
-                    });
-                }
-                bands
-            },
+            bands,
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: self.ht.load(Ordering::Acquire),
-                vht_supported: false,
+                ht_supported: self.ht.load(Ordering::Acquire) || self.rtl8821ae_host_ht(),
+                vht_supported,
                 he_supported: false,
                 eht_supported: false,
             },
@@ -976,6 +994,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                     .available_channels()
                     .iter()
                     .any(|&channel| channel >= 36);
+        // RTL8821AE: per-band HT/VHT from the envelope's admitted points
+        // (`_rtl_init_mac80211`: VHT only on the 5 GHz sband).
+        if band_listed && self.rtl8821ae_host_ht() {
+            return super::rtl8821ae::vht::host_phy(
+                self.rtl8821ae_caps.load(Ordering::Acquire),
+                band,
+            );
+        }
         (band_listed && self.ht.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
                 ht: if self.ht40.load(Ordering::Acquire) {
@@ -1100,6 +1126,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
             self.ht40
                 .store(owner.station_ht40_supported(), Ordering::Release);
+            self.rtl8821ae_caps.store(
+                owner.station_rtl8821ae_host_caps(&self.environment),
+                Ordering::Release,
+            );
         }
         attempt.armed = false;
         result
