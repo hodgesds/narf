@@ -88,6 +88,8 @@ pub(super) struct RadioFeatures {
     wowlan: Option<narf_wireless::WowlanSupport>,
     decap: wmi_runtime::wow::Decap,
     p2p: bool,
+    /// Wiphy P2P advertisement facts; virtual netdevs inherit the home's.
+    combinations: wmi_runtime::CombinationFacts,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
@@ -102,6 +104,7 @@ impl RadioFeatures {
             wowlan: radio.wowlan_support(),
             decap: radio.wow_decap(),
             p2p: radio.p2p_supported(),
+            combinations: radio.combination_facts(),
         }
     }
 }
@@ -169,6 +172,8 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     go: bool,
     /// nl80211 wiphy identity: the home netdev's for a P2P client.
     wiphy: u64,
+    /// The wiphy's P2P advertisement facts (shared by the virtual netdevs).
+    combinations: wmi_runtime::CombinationFacts,
     /// DEL_INTERFACE accepted; the worker retires the client vdev.
     deleting: AtomicBool,
 }
@@ -247,6 +252,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 wowlan: None,
                 decap: wmi_runtime::wow::Decap::Raw,
                 p2p: false,
+                combinations: wmi_runtime::CombinationFacts::NONE,
             });
         let frequencies = radio
             .try_lock()
@@ -322,8 +328,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             client: false,
             go: false,
             wiphy: name_wiphy_id(name),
+            combinations: features.combinations,
             deleting: AtomicBool::new(false),
         }
+    }
+    /// The wiphy advertises P2P (and the home netdev offers its virtual
+    /// interfaces): TLV firmware without NO_P2P.
+    fn p2p_advertised(&self) -> bool {
+        p2p_wdev::P2P_ADVERTISED && self.combinations.p2p()
     }
     /// The radio's AP session exists and belongs to this netdev: a GO
     /// session to the GO netdev, the managed AP to the home netdev.
@@ -1930,6 +1942,24 @@ impl WirelessNetIface for Native {
     fn supports_virtual_interfaces(&self) -> bool {
         p2p_wdev::P2P_ADVERTISED && self.p2p_capable
     }
+    /// `ath10k_mac_register`: P2P_CLIENT and P2P_GO (netdevs) and
+    /// P2P_DEVICE (control-only wdev) for TLV firmware without NO_P2P.
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        if self.p2p_advertised() {
+            alloc::vec![p2p_client::IFTYPE, p2p_go::IFTYPE, 10]
+        } else {
+            Vec::new()
+        }
+    }
+    /// `ath10k_tlv_if_comb`, or `ath10k_tlv_qcs_if_comb` once adaptive QCS
+    /// was enabled (`p2p_combinations`); none without P2P.
+    fn interface_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
+        if self.p2p_advertised() {
+            self.combinations.combinations()
+        } else {
+            Vec::new()
+        }
+    }
     fn new_virtual_interface(
         &self,
         name: &str,
@@ -2093,6 +2123,11 @@ impl WirelessNetIface for Native {
             modes: WirelessModes::STATION
                 | if self.ap_capable {
                     WirelessModes::AP
+                } else {
+                    WirelessModes::empty()
+                }
+                | if self.p2p_advertised() {
+                    WirelessModes::P2P
                 } else {
                     WirelessModes::empty()
                 },

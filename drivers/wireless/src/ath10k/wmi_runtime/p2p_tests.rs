@@ -987,3 +987,37 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid
 );
+
+/// The wiphy advertisement facts: only TLV firmware without NO_P2P
+/// advertises P2P, with `ath10k_tlv_if_comb` (plus the adaptive-QCS entry
+/// once enabled); the fallback facts advertise nothing.
+fn smoke_ath10k_p2p_combination_facts_gate_advertisement() -> TestResult {
+    let facts = |dialect, adaptive_ocs, no_p2p| CombinationFacts {
+        dialect,
+        adaptive_ocs,
+        no_p2p,
+    };
+    if CombinationFacts::NONE.p2p() || !CombinationFacts::NONE.combinations().is_empty() {
+        return TestResult::Fail("fallback facts advertise P2P");
+    }
+    let plain = facts(Dialect::Tlv, false, false);
+    let qcs = facts(Dialect::Tlv, true, false);
+    if !plain.p2p()
+        || plain.combinations() != p2p_combinations(Dialect::Tlv, false, false)
+        || !qcs.p2p()
+        || qcs.combinations().len() != 2
+    {
+        return TestResult::Fail("TLV P2P facts");
+    }
+    if facts(Dialect::Tlv, false, true).p2p()
+        || facts(Dialect::TenFour, false, false).p2p()
+        || !facts(Dialect::Main, true, false).combinations().is_empty()
+    {
+        return TestResult::Fail("P2P advertised outside TLV without NO_P2P");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_combination_facts_gate_advertisement
+);

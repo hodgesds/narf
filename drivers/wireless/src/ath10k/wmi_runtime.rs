@@ -49,6 +49,7 @@ mod p2p_device;
 // Role owners (P2P device/client/GO) bind these codecs in later steps.
 #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 mod p2p;
+pub(in crate::ath10k) use p2p::CombinationFacts;
 mod power_save;
 mod protection;
 pub use protection::Request as StationProtection;

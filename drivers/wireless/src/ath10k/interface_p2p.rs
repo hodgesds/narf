@@ -27,10 +27,10 @@ use narf_wireless::{
     MgmtTxRequest, WirelessIfaceInfo,
 };
 
-/// Whether the P2P_DEVICE WDEV is offered through nl80211. It stays false
-/// until the P2P client/GO roles and their advertisement land
-/// (`drivers/wireless/specification/ath10k.md` §3.8).
-pub(super) const P2P_ADVERTISED: bool = false;
+/// Whether the P2P roles (P2P_DEVICE wdev, P2P client and GO netdevs) are
+/// offered through nl80211; each radio additionally needs TLV firmware
+/// without NO_P2P (`Radio::p2p_supported`, `CombinationFacts::p2p`).
+pub(super) const P2P_ADVERTISED: bool = true;
 /// The P2P Wildcard SSID (`P2P_WILDCARD_SSID` in wpa_supplicant).
 const P2P_WILDCARD_SSID: &[u8] = b"DIRECT-";
 /// `1 << NL80211_IFTYPE_P2P_DEVICE`: the only async control iftype.

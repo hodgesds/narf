@@ -22,6 +22,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn p2p_supported(&self) -> bool {
         self.wire.dialect == Dialect::Tlv && self.features & (1 << 3) == 0
     }
+    /// The wiphy combination facts of this radio generation (read after
+    /// start, which decides adaptive QCS).
+    pub(in crate::ath10k) fn combination_facts(&self) -> p2p::CombinationFacts {
+        p2p::CombinationFacts {
+            dialect: self.wire.dialect,
+            adaptive_ocs: self.adaptive_qcs,
+            no_p2p: self.features & (1 << 3) != 0,
+        }
+    }
     pub(in crate::ath10k) fn p2p_device_vdev(&self) -> Option<u8> {
         self.p2p_device.map(p2p::Vdev::id)
     }

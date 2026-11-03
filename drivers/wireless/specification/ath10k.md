@@ -2314,7 +2314,7 @@ will bind; none of them grants RF, peer, key or data authority.
   (`Radio::vdev_address`: INIT address for the managed vdev, wdev address
   for the P2P_DEVICE vdev). Directed ROC capture filters on the same address.
 - **P2P_DEVICE WDEV** (`interface_p2p.rs`, iftype 10, gated by
-  `P2P_ADVERTISED = false`). `NEW_INTERFACE` (async control mask `1 << 10`,
+  `P2P_ADVERTISED`). `NEW_INTERFACE` (async control mask `1 << 10`,
   `supports_virtual_interfaces` only with `p2p_supported`) publishes a
   control-only child under the netdev's registry Write cap (address: the
   requested one, else the netdev address with the local bit); at most one
@@ -2413,10 +2413,22 @@ will bind; none of them grants RF, peer, key or data authority.
   group is joined with WPA2-PSK credentials (persistent group or
   pre-provisioned PSK).
 
-Remaining before the row can be claimed: a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
-into the beacon publication and `NoaOwner` into P2P_NOA event routing and
-probe-response TX; then advertisement through `P2P_ADVERTISED`,
-`p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
+- **Advertisement.** `P2P_ADVERTISED = true`; each radio further needs
+  the facts `mac.c::ath10k_mac_register` uses (`CombinationFacts`, read
+  after start: WMI dialect, `ATH10K_FW_FEATURE_NO_P2P`, adaptive QCS).
+  For TLV firmware without NO_P2P every netdev of the wiphy (home, P2P
+  client, GO) reports `WirelessModes::P2P`, `p2p_interface_types`
+  `[8, 9, 10]` (P2P_CLIENT and P2P_GO netdevs, P2P_DEVICE wdev) and
+  `interface_combinations` = `p2p_combinations(dialect, adaptive_qcs,
+  no_p2p)` (`ath10k_tlv_if_comb`, or `ath10k_tlv_qcs_if_comb` once
+  `ath10k_wmi_adaptive_qcs(ar, true)` was sent); the home netdev offers
+  NEW_INTERFACE for iftypes 8/9 and the async P2P_DEVICE control. Other
+  dialects and NO_P2P firmware advertise none and refuse every P2P
+  NEW_INTERFACE. Unsupported, explicitly: WPS provisioning on the client
+  netdev, a second P2P client or GO (one slot each, one AP session),
+  host-programmed CTWindow/OppPS (`supports_p2p_go_power_save` false,
+  as Linux ath10k), the MAIN-dialect P2P path, and a P2P_DEVICE scan
+  concurrent with an associated station.
 Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_vdev_create_roles`,
 `smoke_ath10k_p2p_vdev_map_lowest_free`,
@@ -2424,6 +2436,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_noa_event_builds_absence_ie`,
 `smoke_ath10k_p2p_noa_owner_probe_response_only`,
 `smoke_ath10k_p2p_tlv_combinations`,
+`smoke_ath10k_p2p_combination_facts_gate_advertisement`,
 `smoke_ath10k_p2p_vdev_delete_and_roc_vdev`,
 `smoke_ath10k_p2p_device_vdev_nss_on_own_id`,
 `smoke_ath10k_p2p_offchannel_builders_carry_vdev`,

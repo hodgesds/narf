@@ -457,6 +457,32 @@ pub(super) fn p2p_combinations(
     ]
 }
 
+/// The facts `mac.c::ath10k_mac_register` derives the wiphy's P2P
+/// advertisement from: the WMI dialect, `ATH10K_FW_FEATURE_NO_P2P` and
+/// whether adaptive QCS was enabled at start (TLV service 39).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath10k) struct CombinationFacts {
+    pub(super) dialect: Dialect,
+    pub(super) adaptive_ocs: bool,
+    pub(super) no_p2p: bool,
+}
+impl CombinationFacts {
+    /// A radio without P2P interface types (no combinations).
+    pub(in crate::ath10k) const NONE: Self = Self {
+        dialect: Dialect::Main,
+        adaptive_ocs: false,
+        no_p2p: true,
+    };
+    /// P2P interface types exist (`interface_modes` keeps P2P_CLIENT/GO/
+    /// DEVICE only for TLV firmware without NO_P2P).
+    pub(in crate::ath10k) fn p2p(self) -> bool {
+        self.dialect == Dialect::Tlv && !self.no_p2p
+    }
+    pub(in crate::ath10k) fn combinations(self) -> Vec<narf_wireless::InterfaceCombination> {
+        p2p_combinations(self.dialect, self.adaptive_ocs, self.no_p2p)
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "p2p_tests.rs"]
 mod tests;
