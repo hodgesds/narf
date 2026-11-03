@@ -2382,6 +2382,32 @@ exact M4/group terminal state machines. These pure helpers grant no MIC,
 firmware key-install, radio, controlled-port or completion authority. Multiple
 active links and other ciphers remain outside this explicit one-link profile.
 
+### 3.5.2 Reconnection profiles across recovery (`reconnect.rs`)
+
+Linux keeps the `net_device` across `ieee80211_restart_hw`; when a driver
+cannot keep the association (`IEEE80211_SDATA_DISCONNECT_HW_RESTART`),
+mac80211 `ieee80211_sta_restart` reports `ieee80211_sta_connection_lost` and
+wpa_supplicant reconnects from the network block it still holds. A NARF
+recovered generation is a new driver object behind the rebound `wlan%d`
+name, so the in-kernel connection owner keeps that block here, keyed by the
+netdev name:
+
+- `Profile::capture(&AssociateRequest) -> Option<Profile>` keeps BSSID,
+  SSID, frequency/channel, SME elements and the credential (PSK or SAE
+  password in `Zeroizing` storage). `SecurityConfig::External` and an empty
+  SAE password are never captured: an external supplicant owns its own
+  reconnection. Accessors expose only the non-secret identity;
+  `Profile::request()` rebuilds an `AssociateRequest` for the driver's own
+  associate path (no fresh authority: the driver still applies its
+  regulatory, scan and RSNA checks).
+- `retain(name, profile)` after an association completed (replacing an
+  older block), `forget(name)` on operator disconnect,
+  `take(name)` once by the successor generation, `retained(name)`.
+
+Drivers replay with an ordinary scan for the retained SSID/BSS on its
+channel, then association and a fresh RSNA; no keys, PN or peer state cross
+generations. ath10k is the first user (`drivers/wireless/specification/ath10k.md`).
+
 ### 3.5.1 SAE commit entropy (`sae`)
 
 Production `SaeSession::try_build_commit()` and the P-256 `EccGroup` backend

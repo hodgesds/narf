@@ -976,6 +976,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         request: AssociateRequest,
         nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<(), WirelessError> {
+        // wpa_supplicant's network block for this connection, kept for a
+        // recovered generation once the association completes.
+        let profile = narf_wireless::reconnect::Profile::capture(&request);
         if self.mode.load(Ordering::Acquire) != 2 {
             return Err(WirelessError::NotSupported);
         }
@@ -1128,12 +1131,77 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         super::firmware_source::invoke(source.as_ref(), || self.link(Some(link.bssid)))
             .map_err(|_| WirelessError::HardwareError)?;
         attempt.armed = false;
+        match profile {
+            Some(profile) => narf_wireless::reconnect::retain(&self.name, profile),
+            None => narf_wireless::reconnect::forget(&self.name),
+        }
         Ok(())
+    }
+    /// Reconnect a rebound generation from the profile its predecessor
+    /// retained: Linux `ieee80211_sta_restart` reports the connection lost
+    /// after a hardware restart the driver cannot reconfigure, and
+    /// wpa_supplicant scans for and re-associates to the same network with
+    /// the retained PSK/SAE password and a fresh RSNA. One attempt; the
+    /// profile is retained again only by a completed association. `false`
+    /// when nothing was retained or the operator left the netdev down.
+    pub(super) async fn replay_retained(&self) -> Result<bool, WirelessError> {
+        self.replay_retained_inner(|| {
+            let mut nonce = [0; 32];
+            narf_crypto::try_fill_random_bytes(&mut nonce)
+                .ok()
+                .map(|()| nonce)
+        })
+        .await
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) async fn replay_retained_for_test(
+        &self,
+        nonce: [u8; 32],
+    ) -> Result<bool, WirelessError> {
+        self.replay_retained_inner(|| Some(nonce)).await
+    }
+    async fn replay_retained_inner(
+        &self,
+        nonce: impl FnMut() -> Option<[u8; 32]>,
+    ) -> Result<bool, WirelessError> {
+        let Some(profile) = narf_wireless::reconnect::take(&self.name) else {
+            return Ok(false);
+        };
+        if !narf_net::iface::lookup(&self.name).is_some_and(|i| i.link_up) {
+            // wpa_supplicant does not connect a down interface; keep the
+            // block for a later generation.
+            narf_wireless::reconnect::retain(&self.name, profile);
+            return Ok(false);
+        }
+        let found = self
+            .scan(ScanRequest {
+                ssids: alloc::vec![profile.ssid().to_vec()],
+                frequencies_mhz: alloc::vec![profile.frequency_mhz()],
+                channels: alloc::vec![profile.channel()],
+                active: false,
+                random_mac: None,
+                colocated_6ghz: false,
+                duration_tu: None,
+                duration_mandatory: false,
+                extra_ies: Vec::new(),
+            })
+            .await?;
+        if !found.iter().any(|bss| {
+            bss.bssid == profile.bssid()
+                && bss.frequency_mhz == profile.frequency_mhz()
+                && bss.ssid == profile.ssid()
+        }) {
+            return Err(WirelessError::Timeout);
+        }
+        self.associate_inner(profile.request(), nonce).await?;
+        Ok(true)
     }
     pub(super) async fn disassociate(&self) -> Result<(), WirelessError> {
         if self.mode.load(Ordering::Acquire) != 2 {
             return Err(WirelessError::NotSupported);
         }
+        // An operator disconnect ends the network block's automatic reuse.
+        narf_wireless::reconnect::forget(&self.name);
         self.close();
         let mut radio = self.radio.lock().await;
         self.state.lock().await.clear();
@@ -1333,6 +1401,12 @@ fn publish_with_mac(
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_drain(drain);
         narf_wireless::registry::register(device.clone());
+        if rebound && narf_wireless::reconnect::retained(name) {
+            let replay = device.clone();
+            narf_scheduler::spawn(async move {
+                let _ = replay.replay_retained().await;
+            });
+        }
         let (signal, delivered) = wake;
         *device.wake.lock() = Some(signal.clone());
         *device.ap_host.wake.signal.lock() = Some(signal.clone());

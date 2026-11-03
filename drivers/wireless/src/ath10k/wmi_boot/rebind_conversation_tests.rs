@@ -119,3 +119,73 @@ kernel_test_in!(
     "drivers/wireless/ath10k/recovery",
     smoke_ath10k_rebind_name_refused_when_registered_or_never_retired
 );
+
+/// Automatic credential replay: the rebound generation reconnects from the
+/// network block its predecessor retained (Linux `ieee80211_sta_restart`
+/// connection loss after a hardware restart, then wpa_supplicant's scan and
+/// re-association with the retained PSK and a fresh RSNA).
+fn smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation() -> TestResult {
+    for (version, dialect) in [(1, Dialect::Main), (4, Dialect::Tlv)] {
+        let result = (|| {
+            let old = Harness::new(version, dialect, true);
+            old.join()?;
+            let name = old.name.clone();
+            if !narf_wireless::reconnect::retained(&name) {
+                return Err("completed association retained no profile");
+            }
+            old.device.retire_host();
+            interface::remember_rebind(&name);
+            drop(old);
+            let (rebound, rebind) = interface::generation_name();
+            if rebound != name || !rebind {
+                return Err("recovery generation did not rebind the retired name");
+            }
+            *NEXT_NAME.lock() = Some(rebound);
+            let new = Harness::new(version, dialect, true);
+            // An operator-down netdev is not reconnected; the block stays.
+            narf_net::iface::set_link_state(&new.name, false);
+            if drive(new.device.replay_retained_for_test([0x73; 32])) != Poll::Ready(Ok(false))
+                || !narf_wireless::reconnect::retained(&name)
+                || new.device.link_up()
+            {
+                return Err("replay connected a down netdev or dropped the profile");
+            }
+            narf_net::iface::set_link_state(&new.name, true);
+            // The fresh AP has no state: scan, auth/assoc and a new 4-way
+            // with the retained PSK are required before the port opens.
+            if drive(new.device.replay_retained_for_test([0x73; 32])) != Poll::Ready(Ok(true))
+                || !new.device.link_up()
+                || !narf_wireless::reconnect::retained(&name)
+            {
+                return Err("rebound generation did not replay the retained credentials");
+            }
+            let (up, down) = packets();
+            narf_net::iface::send_on(&new.name, &up).map_err(|_| "replayed uplink")?;
+            new.pump();
+            let bytes = new.model(|m| m.data.as_mut().unwrap().downlink(&down));
+            new.model(|m| m.data.as_mut().unwrap().queue.push_back(bytes));
+            new.pump();
+            if !new.received(&down) || !new.model(|m| m.data.as_ref().unwrap().uplink.contains(&up))
+            {
+                return Err("replayed association data path");
+            }
+            // An operator disconnect ends automatic reuse.
+            new.model(|m| teardown_tests::arm_data_disconnect(m, false));
+            let _ = drive(new.device.disassociate());
+            if narf_wireless::reconnect::retained(&name)
+                || drive(new.device.replay_retained_for_test([0x73; 32])) != Poll::Ready(Ok(false))
+            {
+                return Err("operator disconnect left a replayable profile");
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            return TestResult::Fail(e);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation
+);

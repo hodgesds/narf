@@ -741,8 +741,8 @@ actual-device RF/power/interoperability acceptance remain separate.
   It returns `RecoveryScheduled { attempt }` after scheduling, not readiness;
   current controller stage/error metadata and eventual registration report the
   result. Missing policy or deployment assets retain their normal staged waits.
-  No credentials, peer, keys, cached BSS or association are replayed. A successful
-  new generation can be scanned/joined through its newly registered interface.
+  No peer, keys, PN or cached BSS cross generations. The rebound interface
+  replays the retained network block (automatic credential replay below).
   `RecoveryError::Busy` means no retained session is available (including boot
   in progress); Exhausted enforces three attempts per kernel boot. Transport
   failures propagate without reopening the old generation.
@@ -804,8 +804,27 @@ actual-device RF/power/interoperability acceptance remain separate.
   carrier stays down until a new association. The old generation's send
   hook is dropped. A registered or never-retired name is never handed out;
   publication then allocates a fresh `wlan%d`. Rejoin goes through the
-  interface's normal scan/associate path; Linux replay of keys and
-  association is the separate `automatic_credential_replay` work. WMI
+  interface's normal scan/associate path. **Automatic credential replay.**
+  Every completed association retains its network block in
+  `narf_wireless::reconnect` under the netdev name (BSSID, SSID, channel,
+  SME elements, PSK or SAE password in zeroizing storage; never an external
+  supplicant's); an operator `disassociate` forgets it. A `publish_with_mac`
+  that rebound the retired name and finds a block spawns
+  `Device::replay_retained`: it takes the block once, skips (keeping it) an
+  operator-down netdev, scans passively for that SSID/BSSID on its channel
+  and runs the ordinary associate path, i.e. auth/assoc and a fresh RSNA
+  with the retained credential; a completed replay retains the block again.
+  This mirrors Linux when mac80211 cannot reconfigure the restarted device
+  (`ieee80211_sta_restart` → `ieee80211_sta_connection_lost` under
+  `IEEE80211_SDATA_DISCONNECT_HW_RESTART`) and wpa_supplicant reconnects
+  from its network block; mac80211's in-place `ieee80211_reconfig` (re-adding
+  the station and keys without an over-the-air exchange) is not modelled,
+  so PN/replay state and keys restart with the new RSNA. One attempt per
+  generation; no retry/backoff policy. Composed case (written, unexecuted):
+  `smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation`
+  (main and TLV: down netdev skipped, replay with a fresh FakeAp 4-way,
+  bidirectional data, operator disconnect forgets); shared
+  `smoke_wireless_reconnect_profile_retains_credentials_once`. WMI
   command timeouts do not yet trigger recovery: Linux `wmi.c` does that in
   `ath10k_wmi_cmd_send` on `-EAGAIN`, and here those timeouts stay
   fail-stop errors for the caller.
@@ -1953,8 +1972,9 @@ Across the reached rows, concrete remaining software packages are
 contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented);
 DFS qualification; physical acceptance of the §3.4 hardware key offload;
 P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
-DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
-and automatic credential replay after recovery.
+DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented).
+Automatic credential replay after recovery is implemented (§ recovery, rebind)
+and awaits coordinated release/native acceptance.
 The signed indoor installation continuation is implemented in §3.1 and awaits
 coordinated release/native acceptance.
 The native World-layer Beacon continuation is implemented in §3.2 and awaits

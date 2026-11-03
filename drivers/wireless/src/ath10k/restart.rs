@@ -15,9 +15,13 @@
 //! drives the existing `pci::recover()` fresh-generation path (retire with
 //! the DMA-stop proof, chip reset, ROM/firmware/BDF, HTC/WMI/HTT, interface
 //! registration). The bounded per-boot attempt budget is the WEDGED state.
-//! Rejoin is through the newly registered interface; credentials, keys and
-//! association state are not replayed (no `ieee80211_restart_hw`
-//! reconfiguration equivalent exists in the shared wireless crate).
+//! Keys, PN and peer state are not carried over (the fresh firmware has
+//! none, and no `ieee80211_reconfig` reprogramming exists). Instead the
+//! rebound interface replays the network block the last completed
+//! association retained (`narf_wireless::reconnect`): a scan for that BSS,
+//! then association and a fresh RSNA with the retained PSK/SAE password, as
+//! wpa_supplicant does after mac80211 reports the connection lost
+//! (`ieee80211_sta_restart`, `IEEE80211_SDATA_DISCONNECT_HW_RESTART`).
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::future::Future;

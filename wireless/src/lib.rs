@@ -21,6 +21,7 @@ pub mod mlme;
 pub mod monitor;
 pub mod nl80211;
 pub mod packet_key;
+pub mod reconnect;
 pub mod reg;
 pub mod reorder;
 pub mod rsn;
