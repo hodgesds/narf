@@ -83,6 +83,14 @@ and synchronize handlers before releasing their state or vector numbers.
 programmed message or Multi-Message Enable, so a later `msi::enable`
 resumes the same vectors.
 
+`msi::save_msi(&authority, &device) -> Result<SavedMsi, _>` snapshots the
+MSI capability (control, address lo/hi, data, per-vector mask when
+present). `msi::restore_msi(&authority, &device, &SavedMsi)` follows Linux
+`__pci_restore_msi_state`: Enable off, address and data (32- or 64-bit
+layout), mask, then Multi-Message Enable and Enable last; it reads the whole
+capability back and fails unless it equals the snapshot. Drivers use it after
+a D3hot->D0 transition that kept the function owner (e.g. rtw89 WoW).
+
 `pci_express::clear_and_set_link_control(cap, dev, clear, set) -> u16`
 read-modify-writes PCIe Link Control and returns the prior value (Linux
 `pcie_capability_clear_and_set_word(PCI_EXP_LNKCTL)`); `LNKCTL_ASPMC` names
