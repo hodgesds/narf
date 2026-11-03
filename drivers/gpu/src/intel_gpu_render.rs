@@ -26,6 +26,92 @@ const MAX_VMS: usize = 64;
 /// The proto-context's key inside CREATE's private, unshared Namespaces.
 /// It is never a visible name: publication re-keys it to the reserved ID.
 const PROTO_NAME: u32 = u32::MAX;
+/// include/uapi/linux/capability.h.
+const CAP_SYS_ADMIN: u32 = 21;
+const CAP_SYS_NICE: u32 = 23;
+/// I915_SCHEDULER_CAP_ENABLED, _PRIORITY and _PREEMPTION.
+const SCHEDULER_CAP_ENABLED: i32 = 1 << 0;
+const SCHEDULER_CAP_PRIORITY: i32 = 1 << 1;
+const SCHEDULER_CAP_PREEMPTION: i32 = 1 << 2;
+/// I915_CONTEXT_MAX_USER_PRIORITY; I915_CONTEXT_MIN_USER_PRIORITY is its
+/// negation and I915_CONTEXT_DEFAULT_PRIORITY is 0.
+const CONTEXT_MAX_USER_PRIORITY: i64 = 1023;
+
+/// i915->caps.scheduler, as GETPARAM HAS_SCHEDULER reports it and as
+/// validate_priority and proto_context_set_persistence test it. Linux's
+/// intel_engine_user.c::set_scheduler_caps gives every GuC device ENABLED
+/// and PRIORITY (sched_engine->schedule), and PREEMPTION, ENGINE_BUSY_STATS
+/// and STATIC_PRIORITY_MAP from its engine flags; with no uabi engine the
+/// caps are 0. NARF advertises ENABLED and PRIORITY while a live owner
+/// admits submission. LINUX-GAP: the stored PRIORITY reaches no GuC
+/// registration (see Context::priority), and PREEMPTION, BUSY_STATS and
+/// STATIC_PRIORITY_MAP stay clear because no preempt-to-idle cancellation,
+/// busy-stat or priority-map contract exists.
+fn scheduler_caps(info: &DeviceInfo) -> i32 {
+    if info.submission_ready() {
+        SCHEDULER_CAP_ENABLED | SCHEDULER_CAP_PRIORITY
+    } else {
+        0
+    }
+}
+
+/// What set_proto_ctx_param and ctx_setparam consult beyond the argument,
+/// sampled before the namespace's IRQ-safe lock. capable() is asked exactly
+/// where Linux asks it: CAP_SYS_ADMIN for a size-0 BANNABLE (the left
+/// operand of `!capable(CAP_SYS_ADMIN) && !args->value`), CAP_SYS_NICE for
+/// an in-range PRIORITY above I915_CONTEXT_DEFAULT_PRIORITY.
+#[derive(Copy, Clone, Debug)]
+struct ParamFacts {
+    /// set_proto_ctx_param's intel_uc_uses_guc_submission for LOW_LATENCY.
+    low_latency: bool,
+    scheduler: i32,
+    sys_admin: bool,
+    sys_nice: bool,
+}
+
+impl ParamFacts {
+    /// GETPARAM (`set` false) asks no capability.
+    fn sample(info: &DeviceInfo, param: &[u8], set: bool, low_latency: bool) -> Self {
+        let size = u32_at(param, 4);
+        let value = u64_at(param, 16);
+        let (sys_admin, sys_nice) = match u64_at(param, 8) {
+            _ if !set => (false, false),
+            abi::CONTEXT_PARAM_BANNABLE if size == 0 => {
+                (narf_filesystem::caller_capable(CAP_SYS_ADMIN), false)
+            }
+            abi::CONTEXT_PARAM_PRIORITY
+                if size == 0 && (1..=CONTEXT_MAX_USER_PRIORITY).contains(&(value as i64)) =>
+            {
+                (false, narf_filesystem::caller_capable(CAP_SYS_NICE))
+            }
+            _ => (false, false),
+        };
+        Self {
+            low_latency,
+            scheduler: scheduler_caps(info),
+            sys_admin,
+            sys_nice,
+        }
+    }
+}
+
+/// i915_gem_context.c::validate_priority:173, in its order.
+fn validate_priority(size: u32, value: u64, facts: ParamFacts) -> Result<(), FsError> {
+    let priority = value as i64;
+    if size != 0 {
+        return Err(FsError::InvalidData);
+    }
+    if facts.scheduler & SCHEDULER_CAP_PRIORITY == 0 {
+        return Err(FsError::NoDevice);
+    }
+    if !(-CONTEXT_MAX_USER_PRIORITY..=CONTEXT_MAX_USER_PRIORITY).contains(&priority) {
+        return Err(FsError::InvalidData);
+    }
+    if priority > 0 && !facts.sys_nice {
+        return Err(FsError::OperationNotPermitted);
+    }
+    Ok(())
+}
 
 /// A submission profile, deliberately separate from display generation gates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -130,9 +216,19 @@ struct Context {
     no_error_capture: Arc<crate::intel_gpu_user::CapturePolicy>,
     /// Proto/create-only intent, inherited by every retained engine context.
     low_latency: bool,
+    /// LINUX-GAP: stored and reported only. A reset bans every context it
+    /// finds (UserContext::check_epoch), bannable or not.
     bannable: bool,
+    /// LINUX-GAP: stored and reported only. No context is ever recovered
+    /// across a reset, whatever this says.
     recoverable: bool,
+    /// Always true: clearing it needs I915_SCHEDULER_CAP_PREEMPTION, which
+    /// NARF does not advertise (scheduler_caps).
     persistence: bool,
+    /// ctx->sched.priority, I915_CONTEXT_MIN..=MAX_USER_PRIORITY. LINUX-GAP:
+    /// map_i915_prio_to_guc_prio never reaches GuC; every registration keeps
+    /// UserContext's fixed policy, and no SET_CONTEXT_PRIORITY is sent.
+    priority: i32,
 }
 
 impl Context {
@@ -158,6 +254,7 @@ impl Context {
             bannable: true,
             recoverable: false,
             persistence: true,
+            priority: 0,
         }
     }
 
@@ -450,65 +547,22 @@ impl Namespaces {
         Ok(())
     }
 
+    /// GEM_CONTEXT_GETPARAM and SETPARAM on a copied
+    /// drm_i915_gem_context_param, SSEU excepted (sseu_parameter).
+    /// i915_gem_context_getparam_ioctl:2527 and setparam_ioctl:2600 look the
+    /// context up first (-ENOENT); SET then applies set_proto_ctx_param:877
+    /// to a proto-context and ctx_setparam:2190 to a finalized one.
     fn parameter(
         &mut self,
         bytes: &mut [u8],
         set: bool,
         engines: Option<EngineMap>,
-        low_latency_admitted: bool,
+        facts: ParamFacts,
     ) -> Result<(), FsError> {
         let id = u32_at(bytes, 0);
         let size = u32_at(bytes, 4);
         let param = u64_at(bytes, 8);
         let value = u64_at(bytes, 16);
-        if param == 4 {
-            self.initialize();
-            let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
-            if set {
-                if size != 0 {
-                    return Err(FsError::InvalidData);
-                }
-                // Source live SET accepts any nonzero value, including after
-                // finalization/claim. Every retained hardware member sees it.
-                context.no_error_capture.set(value);
-            } else {
-                context.finalized = true;
-                put32(bytes, 4, 0);
-                put64(bytes, 16, u64::from(context.no_error_capture.protected()));
-            }
-            return Ok(());
-        }
-        if param == abi::CONTEXT_PARAM_LOW_LATENCY {
-            self.initialize();
-            let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
-            if !set {
-                // Source lookup finalizes even though LOW_LATENCY has no GET.
-                context.finalized = true;
-                return Err(FsError::InvalidData);
-            }
-            if context.finalized || !low_latency_admitted {
-                return Err(FsError::InvalidData);
-            }
-            // Pinned set_proto_ctx_param ignores size/value for this one-way
-            // enable: even value 0 enables it, with no payload dereference.
-            if context.low_latency {
-                return Ok(());
-            }
-            let users = context.users();
-            if users.iter().any(|user| !user.can_rebind()) {
-                return Err(FsError::Busy);
-            }
-            // No claim-capable UserContext escapes before finalization.
-            // Internal SSEU SET clones immediately refuse without a claim.
-            // This context is either namespace serialized or an unpublished
-            // private proto, so no claim can race the complete preflight and
-            // none of these enables can fail midway.
-            for user in users {
-                user.configure_low_latency()?;
-            }
-            context.low_latency = true;
-            return Ok(());
-        }
         if (param, set) == (abi::CONTEXT_PARAM_ENGINES, true) {
             self.engines_settable(id)?;
             let map = engines.ok_or(FsError::InvalidData)?;
@@ -532,47 +586,149 @@ impl Namespaces {
             );
             return Ok(());
         }
-        if size != 0 {
-            return Err(FsError::InvalidData);
-        }
         self.initialize();
         let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
         if !set {
-            // i915_gem_context_lookup finalizes a proto-context.
+            // i915_gem_context_lookup finalizes a proto-context, even for a
+            // parameter (LOW_LATENCY, ENGINES) that GETPARAM then refuses.
+            // GETPARAM never reads the input size; it reports size 0.
             context.finalized = true;
-        }
-        match (param, set) {
-            (3, false) => put64(bytes, 16, 1 << 48),
-            (5 | 8 | 11, _) => {
-                let target = match param {
-                    5 => &mut context.bannable,
-                    8 => &mut context.recoverable,
-                    _ => &mut context.persistence,
-                };
-                if set {
-                    if value > 1 {
-                        return Err(FsError::InvalidData);
-                    }
-                    // Disabling banning requires authority this UAPI does not grant.
-                    if param == 5 && value == 0 {
-                        return Err(FsError::OperationNotPermitted);
-                    }
-                    if (param == 8 && value == 1) || (param == 11 && value == 0) {
-                        return Err(FsError::NotImplemented);
-                    }
-                    *target = value != 0;
-                } else {
-                    put64(bytes, 16, u64::from(*target));
+            let value = match param {
+                abi::CONTEXT_PARAM_GTT_SIZE => 1 << 48,
+                abi::CONTEXT_PARAM_NO_ERROR_CAPTURE => {
+                    u64::from(context.no_error_capture.protected())
                 }
-            }
-            (6, _) => {
-                // The userspace path currently supports only normal priority.
-                if set && value != 0 {
+                abi::CONTEXT_PARAM_BANNABLE => u64::from(context.bannable),
+                abi::CONTEXT_PARAM_RECOVERABLE => u64::from(context.recoverable),
+                // `args->value = ctx->sched.priority`: an int, sign-extended.
+                abi::CONTEXT_PARAM_PRIORITY => i64::from(context.priority) as u64,
+                abi::CONTEXT_PARAM_VM => {
+                    let vm = context.vm.clone();
+                    let existing = self
+                        .vms
+                        .iter()
+                        .find(|(_, entry)| Arc::ptr_eq(entry, &vm))
+                        .map(|(id, _)| *id);
+                    let id = if let Some(id) = existing {
+                        id
+                    } else {
+                        if self.vms.len() >= MAX_VMS {
+                            return Err(FsError::OutOfMemory);
+                        }
+                        let id = self.next_vm;
+                        self.next_vm = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
+                        self.vms.insert(id, vm);
+                        id
+                    };
+                    u64::from(id)
+                }
+                abi::CONTEXT_PARAM_PERSISTENCE => u64::from(context.persistence),
+                // get_protected: without PXP no context uses protected
+                // content.
+                abi::CONTEXT_PARAM_PROTECTED_CONTENT => 0,
+                // NO_ZEROMAP, BAN_PERIOD, ENGINES, RINGSIZE, CONTEXT_IMAGE,
+                // LOW_LATENCY and unknown parameters.
+                _ => return Err(FsError::InvalidData),
+            };
+            put32(bytes, 4, 0);
+            put64(bytes, 16, value);
+            return Ok(());
+        }
+        let proto = !context.finalized;
+        match param {
+            abi::CONTEXT_PARAM_NO_ERROR_CAPTURE => {
+                if size != 0 {
                     return Err(FsError::InvalidData);
                 }
-                put64(bytes, 16, 0);
+                // Source live SET accepts any nonzero value, including after
+                // finalization/claim. Every retained hardware member sees it.
+                context.no_error_capture.set(value);
             }
-            (9, true) => {
+            abi::CONTEXT_PARAM_BANNABLE => {
+                // Both tables: size, then `!capable(CAP_SYS_ADMIN) &&
+                // !args->value`; any nonzero value sets it. The
+                // uses_protected_content -EPERM for clearing it cannot apply:
+                // no context uses protected content without PXP.
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                if !facts.sys_admin && value == 0 {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                context.bannable = value != 0;
+            }
+            abi::CONTEXT_PARAM_RECOVERABLE => {
+                // Both tables: size, then 0 clears and any other value sets
+                // it (its uses_protected_content -EPERM cannot apply).
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                context.recoverable = value != 0;
+            }
+            abi::CONTEXT_PARAM_PRIORITY => {
+                // set_proto_ctx_param stores it; ctx_setparam's set_priority
+                // also retunes semaphore use, which GuC submission never has.
+                validate_priority(size, value, facts)?;
+                context.priority = value as i64 as i32;
+            }
+            abi::CONTEXT_PARAM_PERSISTENCE => {
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                let persist = value != 0;
+                // __context_set_persistence:1560 returns early when a live
+                // context is already in the requested state.
+                if !proto && context.persistence == persist {
+                    return Ok(());
+                }
+                // Setting it requires i915.enable_hangcheck (-EINVAL without):
+                // NARF's job watchdog is always armed. Clearing it requires
+                // I915_SCHEDULER_CAP_PREEMPTION, then intel_has_reset_engine;
+                // NARF has no preempt-to-idle cancellation and does not
+                // advertise the capability, so the first is -ENODEV.
+                if !persist && facts.scheduler & SCHEDULER_CAP_PREEMPTION == 0 {
+                    return Err(FsError::NoDevice);
+                }
+                context.persistence = persist;
+            }
+            // proto_context_set_protected:253 has no size check: 0 clears
+            // it; anything else needs intel_pxp_is_enabled, which no NARF
+            // i915 device is. ctx_setparam refuses it (-EINVAL).
+            abi::CONTEXT_PARAM_PROTECTED_CONTENT if proto => {
+                if value != 0 {
+                    return Err(FsError::NoDevice);
+                }
+            }
+            // set_proto_ctx_param only; ctx_setparam refuses it (-EINVAL).
+            abi::CONTEXT_PARAM_LOW_LATENCY if proto => {
+                if !facts.low_latency {
+                    return Err(FsError::InvalidData);
+                }
+                // Pinned set_proto_ctx_param ignores size/value for this
+                // one-way enable: even value 0 enables it, with no payload
+                // dereference.
+                if context.low_latency {
+                    return Ok(());
+                }
+                let users = context.users();
+                if users.iter().any(|user| !user.can_rebind()) {
+                    return Err(FsError::Busy);
+                }
+                // No claim-capable UserContext escapes before finalization.
+                // Internal SSEU SET clones immediately refuse without a claim.
+                // This context is either namespace serialized or an
+                // unpublished private proto, so no claim can race the
+                // complete preflight and none of these enables can fail
+                // midway.
+                for user in users {
+                    user.configure_low_latency()?;
+                }
+                context.low_latency = true;
+            }
+            abi::CONTEXT_PARAM_VM => {
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
                 let vm_id = u32::try_from(value).map_err(|_| FsError::NotFound)?;
                 let users = context.users();
                 let mut idle = Vec::new();
@@ -584,26 +740,9 @@ impl Namespaces {
                 }
                 context.vm = self.vms.get(&vm_id).cloned().ok_or(FsError::NotFound)?;
             }
-            (9, false) => {
-                let vm = context.vm.clone();
-                let existing = self
-                    .vms
-                    .iter()
-                    .find(|(_, entry)| Arc::ptr_eq(entry, &vm))
-                    .map(|(id, _)| *id);
-                let id = if let Some(id) = existing {
-                    id
-                } else {
-                    if self.vms.len() >= MAX_VMS {
-                        return Err(FsError::OutOfMemory);
-                    }
-                    let id = self.next_vm;
-                    self.next_vm = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
-                    self.vms.insert(id, vm);
-                    id
-                };
-                put64(bytes, 16, id as u64);
-            }
+            // GTT_SIZE, NO_ZEROMAP, BAN_PERIOD, RINGSIZE and unknown
+            // parameters in both tables; CONTEXT_IMAGE needs
+            // CONFIG_DRM_I915_REPLAY_GPU_HANGS_API (set_context_image).
             _ => return Err(FsError::InvalidData),
         }
         Ok(())
@@ -1342,19 +1481,18 @@ impl RenderFile {
                 };
                 // GRAPHICS_VER >12 finalizes at create in pinned i915. DG2
                 // 12.55 and MTL/ARL 12.70/12.74 still permit late proto SET.
-                // Keep backend callbacks outside the namespace IRQ lock.
+                // Keep backend and credential callbacks outside the namespace
+                // IRQ lock.
                 let low_latency_admitted = matches!(
                     info.platform,
                     GtPlatform::Gen12(_)
                         | GtPlatform::Alchemist
                         | GtPlatform::Integrated(Generation::MeteorLake)
                 ) && crate::intel_gpu_xe::low_latency_supported(info);
-                self.namespaces.lock().parameter(
-                    &mut request,
-                    set,
-                    engines,
-                    low_latency_admitted,
-                )?;
+                let facts = ParamFacts::sample(info, &request, set, low_latency_admitted);
+                self.namespaces
+                    .lock()
+                    .parameter(&mut request, set, engines, facts)?;
                 user.write(arg, &request)
             }
             abi::GEM_VM_CREATE | abi::GEM_VM_DESTROY => {
@@ -1537,7 +1675,8 @@ impl RenderFile {
             }
             _ => None,
         };
-        proto.parameter(param, true, engines, low_latency_admitted)
+        let facts = ParamFacts::sample(info, param, true, low_latency_admitted);
+        proto.parameter(param, true, engines, facts)
     }
 }
 
@@ -1774,9 +1913,9 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
                 -22
             }
         }
-        // Only ENABLED: i915 priority configuration, busy stats, semaphore and
-        // preemption capability bits require their own implemented contracts.
-        41 => i32::from(info.submission_ready()),
+        // ENABLED and PRIORITY while live; busy-stat, semaphore, preemption
+        // and static-map bits require their own implemented contracts.
+        41 => scheduler_caps(info),
         46 | 47 if info.platform.is_gen12() => {
             let topology = observed_topology(info)?;
             if param == 46 {

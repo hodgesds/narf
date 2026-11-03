@@ -1009,9 +1009,23 @@ before their copy; GETPARAM ENGINES is EINVAL. Each map slot is its own
 `UserContext`. Execbuffer's ring field indexes the map, or selects legacy
 DEFAULT/RENDER→RCS0 and BLT→BCS0. Source-qualified Gen12 main-GuC BSD/VEBOX
 use the published dense media selectors described below; absent/unowned engines,
-holes and out-of-range slots return EINVAL. Only normal priority is admitted, disabling banning
-is refused, and no privilege follows from context creation. Recovery is disabled;
-enabling it or disabling persistence returns NotImplemented. VM rebinding
+holes and out-of-range slots return EINVAL. GEM_CONTEXT_GETPARAM/SETPARAM
+look the context up first (ENOENT); SET follows set_proto_ctx_param on a
+proto-context and ctx_setparam on a finalized one. BANNABLE: size EINVAL, then
+value 0 without CAP_SYS_ADMIN EPERM; any nonzero value sets it. RECOVERABLE:
+size EINVAL, then 0 clears and any other value sets it. PRIORITY
+(validate_priority): size EINVAL, ENODEV without I915_SCHEDULER_CAP_PRIORITY,
+EINVAL outside -1023..=1023 as an s64, EPERM above 0 without CAP_SYS_NICE.
+PERSISTENCE: size EINVAL; a finalized context already in the requested state
+succeeds; setting succeeds (the job watchdog is hangcheck); clearing is ENODEV
+(no I915_SCHEDULER_CAP_PREEMPTION). PROTECTED_CONTENT on a proto has no size
+check: 0 succeeds, nonzero is ENODEV (no PXP); finalized, it is EINVAL, as are
+LOW_LATENCY, GTT_SIZE and unknown parameters. capable() is asked only where
+Linux asks it, outside the namespace lock. GETPARAM never reads the input
+size, reports size 0, and returns PROTECTED_CONTENT 0 and the stored,
+sign-extended PRIORITY. LINUX-GAP: BANNABLE, RECOVERABLE and PRIORITY are
+stored and reported only; a reset bans every context it finds, none is
+recovered, and GuC registration keeps the fixed i915 policy. VM rebinding
 requires every engine state of the context to be unused with no concurrent
 submission, preserving each ordered timeline. QUERY has Linux's
 two-pass/per-item signed-length protocol: system memory reports actual RAM;
@@ -1041,8 +1055,9 @@ The i915 compatibility GETPARAM discovery path reports observed PCI revision
 (32), union DSS count (33), actual fused EU count (34) and timestamp frequency
 (51). Missing or mismatched topology/facts return ENODEV, never zero; immutable
 facts survive a stopped GT without MMIO or wake. HAS_SCHEDULER (41) reports
-only ENABLED while live, leaving priority/preemption/semaphore/busy-stat
-capability bits clear. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
+ENABLED|PRIORITY while live and 0 otherwise, leaving
+preemption/semaphore/busy-stat/static-priority-map capability bits clear;
+context PRIORITY and PERSISTENCE checks read the same value. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
 slice/subslice masks 46/47 return EINVAL on Xe_HP-and-later profiles, as in
 Linux; callers use full topology queries.
 

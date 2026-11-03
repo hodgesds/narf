@@ -140,7 +140,8 @@ fn smoke_i915_observed_discovery_and_immutable_facts_after_loss() -> TestResult 
                     },
                 ),
                 (51, 19_200_000),
-                (41, i32::from(live)),
+                // I915_SCHEDULER_CAP_ENABLED | PRIORITY, or 0.
+                (41, if live { 3 } else { 0 }),
             ] {
                 assert_eq!(parameter(&file, &info, &user, param), Ok(value));
             }
@@ -320,4 +321,233 @@ fn smoke_i915_sseu_indexed_engines_refusals_and_copy_rollback() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_render",
     smoke_i915_sseu_indexed_engines_refusals_and_copy_rollback
+);
+
+/// Capabilities the credential fixture grants, and those asked, as masks.
+static GRANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+fn capable(capability: u32) -> bool {
+    ASKED.fetch_or(1 << capability, Ordering::AcqRel);
+    GRANTED.load(Ordering::Acquire) & 1 << capability != 0
+}
+/// Installs `capable` as the caller's credentials; restores the previous
+/// hook on drop.
+struct Credentials(Option<fn(u32) -> bool>);
+impl Credentials {
+    fn install() -> Self {
+        GRANTED.store(0, Ordering::Release);
+        ASKED.store(0, Ordering::Release);
+        Self(narf_filesystem::__test_swap_caller_capable_hook(Some(
+            capable,
+        )))
+    }
+    fn grant(&self, capabilities: &[u32]) {
+        let mask = capabilities.iter().fold(0, |mask, cap| mask | 1 << cap);
+        GRANTED.store(mask, Ordering::Release);
+    }
+    /// The capabilities asked since the last call.
+    fn asked(&self) -> u64 {
+        ASKED.swap(0, Ordering::AcqRel)
+    }
+}
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        let _ = narf_filesystem::__test_swap_caller_capable_hook(self.0);
+    }
+}
+/// One GEM_CONTEXT_GETPARAM/SETPARAM; the reply's size and value.
+#[allow(clippy::too_many_arguments)]
+fn context_param(
+    file: &RenderFile,
+    info: &DeviceInfo,
+    user: &User,
+    set: bool,
+    id: u32,
+    size: u32,
+    param: u64,
+    value: u64,
+) -> Result<(u32, u64), FsError> {
+    let mut wire = [0; 24];
+    put32(&mut wire, 0, id);
+    put32(&mut wire, 4, size);
+    put64(&mut wire, 8, param);
+    put64(&mut wire, 16, value);
+    user.store(64, &wire);
+    let cmd = if set {
+        abi::GEM_CONTEXT_SETPARAM
+    } else {
+        abi::GEM_CONTEXT_GETPARAM
+    };
+    file.dispatch(info, cmd, 64, user).unwrap()?;
+    let wire = user.load(64, 24);
+    Ok((u32_at(&wire, 4), u64_at(&wire, 16)))
+}
+
+/// MIT Linux b90c984d i915_gem_context.c: setparam_ioctl:2600 and
+/// getparam_ioctl:2527 look the context up before any parameter check;
+/// SETPARAM then runs set_proto_ctx_param:877 on a proto-context and
+/// ctx_setparam:2190 on a finalized one, with validate_priority:173,
+/// proto_context_set_persistence:212, __context_set_persistence:1560 and
+/// proto_context_set_protected:253. capable() is asked only where Linux
+/// asks it: CAP_SYS_ADMIN for any size-0 BANNABLE, CAP_SYS_NICE for an
+/// in-range positive PRIORITY.
+fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> TestResult {
+    const ADMIN: u32 = 21;
+    const NICE: u32 = 23;
+    let (info, backend) = observed(GtPlatform::Integrated(Generation::MeteorLake));
+    let file = RenderFile::new();
+    let user = User::new();
+    let credentials = Credentials::install();
+    let set = |id: u32, size: u32, param: u64, value: u64| {
+        context_param(&file, &info, &user, true, id, size, param, value).map(|_| ())
+    };
+    let get = |id: u32, param: u64| {
+        context_param(&file, &info, &user, false, id, 0, param, 0).map(|(_, value)| value)
+    };
+    let neg = |value: i64| value as u64;
+    // I915_SCHEDULER_CAP_ENABLED | PRIORITY while live.
+    assert_eq!(parameter(&file, &info, &user, 41), Ok(3));
+    // The lookup precedes every size and parameter check.
+    for param in [4, 5, 6, 8, 9, 11, 13, u64::MAX] {
+        assert_eq!(set(99, 1, param, 0), Err(FsError::NotFound));
+        assert_eq!(
+            context_param(&file, &info, &user, false, 99, 1, param, 0),
+            Err(FsError::NotFound)
+        );
+    }
+    assert_eq!(credentials.asked(), 0, "capable() before the size check");
+
+    // Context 0 is finalized at open (ctx_setparam); a created context is a
+    // proto-context (set_proto_ctx_param) until GETPARAM looks it up.
+    for live in [false, true] {
+        let id = if live { 0 } else { context(&file, &info, &user) };
+        credentials.grant(&[]);
+        // BANNABLE: size, then `!capable(CAP_SYS_ADMIN) && !args->value`.
+        assert_eq!(set(id, 1, 5, 0), Err(FsError::InvalidData));
+        assert_eq!(credentials.asked(), 0, "capable() before the size check");
+        assert_eq!(set(id, 0, 5, 0), Err(FsError::OperationNotPermitted));
+        assert_eq!(set(id, 0, 5, 2), Ok(()), "any nonzero value sets it");
+        assert_eq!(credentials.asked(), 1 << ADMIN);
+        credentials.grant(&[ADMIN]);
+        assert_eq!(set(id, 0, 5, 0), Ok(()));
+        // RECOVERABLE: size, then 0 clears and anything else sets it.
+        assert_eq!(set(id, 4, 8, 1), Err(FsError::InvalidData));
+        assert_eq!(set(id, 0, 8, 7), Ok(()));
+        // PERSISTENCE: setting needs hangcheck (always armed); clearing
+        // needs I915_SCHEDULER_CAP_PREEMPTION, which is not advertised.
+        assert_eq!(set(id, 1, 11, 1), Err(FsError::InvalidData));
+        assert_eq!(set(id, 0, 11, 0), Err(FsError::NoDevice));
+        assert_eq!(set(id, 0, 11, 5), Ok(()));
+        // PROTECTED_CONTENT: no size check on a proto, 0 clears, anything
+        // else needs PXP (-ENODEV); ctx_setparam refuses it.
+        if live {
+            assert_eq!(set(id, 0, 13, 0), Err(FsError::InvalidData));
+        } else {
+            assert_eq!(set(id, 99, 13, 0), Ok(()));
+            assert_eq!(set(id, 99, 13, 1), Err(FsError::NoDevice));
+        }
+        assert_eq!(credentials.asked(), 1 << ADMIN);
+        // GETPARAM ignores the input size and reports size 0; this lookup
+        // finalizes the proto-context.
+        for (param, expected) in [(5, 0), (8, 1), (11, 1), (13, 0), (6, 0)] {
+            assert_eq!(
+                context_param(&file, &info, &user, false, id, 0xfeed, param, 7),
+                Ok((0, expected))
+            );
+        }
+        assert_eq!(credentials.asked(), 0, "GETPARAM asked capable()");
+        // ctx_setparam: BANNABLE and RECOVERABLE as before; a context
+        // already persistent returns early; PROTECTED_CONTENT is EINVAL.
+        credentials.grant(&[]);
+        assert_eq!(set(id, 0, 5, 0), Err(FsError::OperationNotPermitted));
+        assert_eq!(set(id, 0, 5, 1), Ok(()));
+        assert_eq!(set(id, 0, 8, 0), Ok(()));
+        assert_eq!((get(id, 5), get(id, 8)), (Ok(1), Ok(0)));
+        assert_eq!(set(id, 1, 11, 1), Err(FsError::InvalidData));
+        assert_eq!(set(id, 0, 11, 1), Ok(()));
+        assert_eq!(set(id, 0, 11, 0), Err(FsError::NoDevice));
+        assert_eq!(get(id, 11), Ok(1));
+        assert_eq!(set(id, 0, 13, 0), Err(FsError::InvalidData));
+        assert_eq!(set(id, 99, 13, 0), Err(FsError::InvalidData));
+    }
+
+    // PRIORITY: size, I915_SCHEDULER_CAP_PRIORITY, the s64 range, then
+    // CAP_SYS_NICE above I915_CONTEXT_DEFAULT_PRIORITY.
+    for live in [false, true] {
+        let id = if live { 0 } else { context(&file, &info, &user) };
+        credentials.grant(&[]);
+        credentials.asked();
+        for (size, value, expected) in [
+            (1, 0, FsError::InvalidData),
+            (0, 1024, FsError::InvalidData),
+            (0, neg(-1024), FsError::InvalidData),
+            (0, 1 << 32, FsError::InvalidData),
+            (0, 1, FsError::OperationNotPermitted),
+            (0, 1023, FsError::OperationNotPermitted),
+        ] {
+            assert_eq!(set(id, size, 6, value), Err(expected), "{size} {value:#x}");
+        }
+        assert_eq!(credentials.asked(), 1 << NICE);
+        for value in [0, neg(-1), neg(-1023)] {
+            assert_eq!(set(id, 0, 6, value), Ok(()));
+        }
+        assert_eq!(credentials.asked(), 0, "capable() for a priority <= 0");
+        credentials.grant(&[NICE]);
+        assert_eq!(set(id, 0, 6, 1024), Err(FsError::InvalidData));
+        assert_eq!(credentials.asked(), 0, "capable() before the range check");
+        assert_eq!(set(id, 0, 6, 1023), Ok(()));
+        assert_eq!(credentials.asked(), 1 << NICE);
+        assert_eq!(get(id, 6), Ok(1023));
+        // ctx_setparam's set_priority; GETPARAM sign-extends the int.
+        assert_eq!(set(id, 0, 6, neg(-7)), Ok(()));
+        assert_eq!(get(id, 6), Ok(neg(-7)));
+        credentials.grant(&[]);
+        assert_eq!(set(id, 0, 6, 2), Err(FsError::OperationNotPermitted));
+        assert_eq!(get(id, 6), Ok(neg(-7)));
+    }
+    // With no uabi engine i915->caps.scheduler is 0: PRIORITY is -ENODEV
+    // after the size check, whatever its value.
+    backend.live.store(false, Ordering::Release);
+    assert_eq!(parameter(&file, &info, &user, 41), Ok(0));
+    assert_eq!(set(0, 1, 6, 0), Err(FsError::InvalidData));
+    assert_eq!(set(0, 0, 6, 0), Err(FsError::NoDevice));
+    assert_eq!(set(0, 0, 6, 5000), Err(FsError::NoDevice));
+    backend.live.store(true, Ordering::Release);
+
+    // CREATE_EXT applies the same set_proto_ctx_param at each link.
+    let create_ext = |size: u32, param: u64, value: u64| {
+        let mut ext = [0; 56];
+        put32(&mut ext, 36, size);
+        put64(&mut ext, 40, param);
+        put64(&mut ext, 48, value);
+        user.store(256, &ext);
+        let mut request = [0; 16];
+        put32(&mut request, 4, 1);
+        put64(&mut request, 8, 256);
+        user.store(64, &request);
+        file.dispatch(&info, abi::GEM_CONTEXT_CREATE_EXT, 64, &user)
+            .unwrap()
+            .map(|_| u32_at(&user.load(64, 16), 0))
+    };
+    credentials.grant(&[]);
+    for (size, param, value, expected) in [
+        (0, 5, 0, FsError::OperationNotPermitted),
+        (0, 6, 5, FsError::OperationNotPermitted),
+        (1, 6, 0, FsError::InvalidData),
+        (0, 11, 0, FsError::NoDevice),
+        (7, 13, 1, FsError::NoDevice),
+    ] {
+        assert_eq!(create_ext(size, param, value), Err(expected));
+    }
+    credentials.grant(&[ADMIN, NICE]);
+    for (size, param, value, expected) in [(0, 5, 0, 0), (0, 6, 5, 5), (0, 8, 1, 1), (7, 13, 0, 0)]
+    {
+        let id = create_ext(size, param, value).expect("applied link");
+        assert_eq!(get(id, param), Ok(expected));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_render",
+    smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam
 );

@@ -360,14 +360,16 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
     assert!(info.submission_ready());
     let file = RenderFile::new();
     let user = User::new();
-    for (param, value) in [(8, 1), (11, 0)] {
+    // ctx_setparam on the finalized default context: RECOVERABLE is stored;
+    // clearing PERSISTENCE needs I915_SCHEDULER_CAP_PREEMPTION (-ENODEV).
+    for (param, value, expected) in [(8, 1, Ok(0)), (11, 0, Err(FsError::NoDevice))] {
         let mut request = [0; 24];
         put64(&mut request, 8, param);
         put64(&mut request, 16, value);
         user.store(64, &request);
         assert_eq!(
             file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
-            Some(Err(FsError::NotImplemented))
+            Some(expected)
         );
     }
     // Live engine/version discovery uses Linux's exact sizes and field order.
