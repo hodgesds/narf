@@ -18,6 +18,9 @@ const RECEIVE_BUDGET: usize = 16;
 mod ap;
 #[path = "runtime_pm.rs"]
 mod pm;
+#[path = "runtime_reset.rs"]
+mod reset;
+pub(crate) use reset::Reboot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -79,6 +82,9 @@ pub struct Runtime<T: PacketTransport> {
     suspended: bool,
     /// Linux `sdiodev->wowl_enabled` (`brcmf_bus_wowl_config`).
     wowl_enabled: bool,
+    /// Retained reset/reboot authority (`runtime_reset.rs`); `None`: this
+    /// generation cannot be reset in place.
+    reboot: Option<alloc::boxed::Box<dyn Reboot<T>>>,
 }
 impl<T: PacketTransport> Drop for Runtime<T> {
     fn drop(&mut self) {
@@ -106,8 +112,11 @@ impl<T: PacketTransport> Runtime<T> {
     /// Attach only after the firmware loader completed. Credit begins at
     /// zero: a real firmware SDPCM header must grant the initial TX window.
     pub fn new(transport: T) -> Self {
+        Self::with_transport(Some(transport))
+    }
+    fn with_transport(transport: Option<T>) -> Self {
         Self {
-            transport: Some(transport),
+            transport,
             stopped: false,
             ap_live: Arc::new(AtomicBool::new(true)),
             ap: None,
@@ -127,6 +136,7 @@ impl<T: PacketTransport> Runtime<T> {
             vendor: super::fullmac::FirmwareVendor::Wcc,
             suspended: false,
             wowl_enabled: false,
+            reboot: None,
         }
     }
 

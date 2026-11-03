@@ -171,6 +171,15 @@ pub trait PacketTransport: Transport + Send {
         Err(TransportError::NotReady)
     }
 
+    /// Linux `sdio.c::brcmf_sdio_bus_reset` prelude for a generation whose
+    /// confirmed stop failed: unregister the card interrupt, remove the bus
+    /// best-effort and power the host side off (the first half of
+    /// `mmc_hw_reset`). Success is the host's own read-back receipt; only a
+    /// reset authority may follow it. Transports without one refuse.
+    fn stop_dead(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
     /// Card-interrupt wake raised by the host's oneshot line (Linux
     /// `brcmf_sdiod_intr_register`); `None` keeps the polled service.
     fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {

@@ -346,7 +346,15 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
         Runtime::ap_source(self)
     }
     async fn stop_transport(&mut self) -> Result<(), Error> {
-        Runtime::stop_transport(self)
+        Runtime::stop_for_reset(self)
+    }
+    /// Linux `sdio.c::brcmf_sdio_bus_reset` (`mmc_hw_reset`) and the
+    /// function's re-probe (`runtime_reset.rs`).
+    async fn reset_transport(&mut self) -> Result<(), Error> {
+        Runtime::reset_transport(self)
+    }
+    fn take_generation(&mut self) -> Option<Self> {
+        Runtime::take_generation(self)
     }
     async fn suspend_transport(&mut self) -> Result<(), Error> {
         Runtime::suspend_transport(self).await

@@ -84,6 +84,7 @@ mod sdio_ap_discovery;
 pub(crate) mod sdio_ap_model;
 pub mod sdio_bridge;
 mod sdio_passive;
+pub mod sdio_reset;
 pub mod sdpcm;
 pub mod station;
 pub mod telemetry;

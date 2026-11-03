@@ -91,16 +91,19 @@ impl SdioBound {
         Self::new_capability(b"ap sta wme\0", true)
     }
     fn new_capability(capability: &[u8], enter_ap: bool) -> Result<Self, &'static str> {
-        Self::build(capability, enter_ap, false)
+        Self::build(capability, enter_ap, false, None)
     }
     /// Interface 0 answers as the station model, not a primary AP profile.
     fn new_station(capability: &[u8]) -> Result<Self, &'static str> {
-        Self::build(capability, false, true)
+        Self::build(capability, false, true, None)
     }
+    /// `clm`: retain the production reset authority (`sdio_reset.rs`)
+    /// sharing that CLM slot with the generation publisher.
     fn build(
         capability: &[u8],
         enter_ap: bool,
         station_primary: bool,
+        clm: Option<crate::cyw43439::sdio_reset::Clm>,
     ) -> Result<Self, &'static str> {
         use crate::brcmfmac::provision::{tests::selected_fixture, Family};
         let (selection, assets) = selected_fixture(Family::Sdio43439)?;
@@ -140,7 +143,18 @@ impl SdioBound {
             .map_err(|_| "SDIO AP actual sleep source init")?;
         let database = Arc::new(narf_wireless::reg::db::Database::new());
         database.install(firmware::domain());
-        let runtime = Runtime::new(transport);
+        let mut runtime = Runtime::new(transport);
+        if let Some(clm) = clm {
+            *clm.lock() = assets.clm.clone();
+            let (_, read) = crate::brcmfmac::provision::tests::registry()?;
+            runtime = runtime.with_reboot(Box::new(crate::cyw43439::sdio_reset::Reprovision::new(
+                read,
+                crate::brcmfmac::provision::tests::TEST_MANIFEST,
+                selection.host(),
+                (0x2d0, 0xa9af),
+                clm,
+            )));
+        }
         let station = ready(Station::initialize_live(
             runtime,
             &assets.clm,
@@ -1342,4 +1356,99 @@ fn smoke_cyw_p2p_go_start_client_stop_and_delete_on_actual_sdio() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_cyw_p2p_go_start_client_stop_and_delete_on_actual_sdio
+);
+
+/// Linux `sdio.c::brcmf_sdio_bus_reset` through the shared generation
+/// owner over the actual SDHCI Card, AI/CM3 loader and SDPCM/BCDC: a joined
+/// station whose generation turned terminal stops (native stop), the card
+/// is power-cycled and re-enumerated (`mmc_hw_reset`: CCCR `sdio_reset`,
+/// CMD0/CMD5/CMD3/CMD7), the signed selection is re-run and the firmware
+/// downloaded again; `Station::initialize_live` replays over the fresh
+/// generation, the shell republishes under the same name and the retained
+/// association is rediscovered and rejoined.
+fn sdio_reset_rejoin() -> Result<(), &'static str> {
+    use crate::brcmfmac::runtime_tests::station_model::AP;
+    use crate::cyw43439::fullmac_fixture::{cache, request};
+    use crate::cyw43439::interface::generation::{Generation, Publish, Removal};
+    let clm: crate::cyw43439::sdio_reset::Clm = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+    let mut b = SdioBound::build(b"sta wme\0", false, true, Some(clm.clone()))?;
+    {
+        let mut state = b.device.state.try_lock().ok_or("state")?;
+        let station = &mut state.station;
+        cache(station, AP, 6, narf_wireless::scan::BssSecurity::Open, &[]);
+        ready(station.associate(request(
+            AP,
+            6,
+            narf_wireless::SecurityConfig::Open,
+            Vec::new(),
+        )))?
+        .map_err(|_| "SDIO station join")?;
+        if station.bssid != Some(AP) || !station.runtime.resettable() {
+            return Err("SDIO station not joined under a reset authority");
+        }
+        // A fatal bus error / firmware halt leaves the generation terminal.
+        station.runtime.fail();
+    }
+    *b.device.lifecycle.request.lock() = Some(request(
+        AP,
+        6,
+        narf_wireless::SecurityConfig::Open,
+        Vec::new(),
+    ));
+    let host = b.host.clone().ok_or("SDIO host model")?;
+    let before = host.native_commands().len();
+    let database = b.database.clone();
+    let published = clm.clone();
+    let publish: Publish<SdioRuntime> = Box::new(move |name, runtime| {
+        let database = database.clone();
+        let clm = published.lock().clone();
+        Box::pin(async move {
+            let station = Station::initialize_live(runtime, &clm, database).await?;
+            narf_net::iface::register(name, OWN, sdio_send);
+            Ok(sdio_shell(String::from(name), station))
+        })
+    });
+    let generation = Generation::with_publisher(b.device.clone(), publish);
+    narf_scheduler::block_on(generation.recover())
+        .map_err(|_| "SDIO transport reset did not republish the station")?;
+    let device = generation
+        .current()
+        .ok_or("no generation after SDIO reset")?;
+    let commands: Vec<(u8, u32, u16)> = host.native_commands()[before..].to_vec();
+    let opcodes: Vec<u8> = commands.iter().map(|c| c.0).collect();
+    let enumerated = opcodes
+        .windows(7)
+        .position(|w| w == [52, 52, 0, 5, 5, 3, 7])
+        .ok_or("reset did not power-cycle and re-enumerate the card")?;
+    if !opcodes[enumerated..].contains(&53) {
+        return Err("reset did not download the firmware again");
+    }
+    if Arc::ptr_eq(&device, &b.device)
+        || !b.device.withdrawn()
+        || device.withdrawn()
+        || device.interface_name() != b.name
+        || generation.resets() != 1
+        || device.transport_failed()
+    {
+        return Err("SDIO reset did not publish a fresh generation under the same name");
+    }
+    if WirelessNetIface::connected_bssid(&*device) != Some(AP) {
+        return Err("retained association was not rejoined after the SDIO reset");
+    }
+    if narf_scheduler::block_on(generation.remove()) != Removal::Reclaimed {
+        return Err("rebooted SDIO generation was not stopped and released");
+    }
+    // The harness drop tears down its (withdrawn) original shell.
+    b.device = device;
+    Ok(())
+}
+fn smoke_cyw_sdio_reset_power_cycles_reboots_replays_and_rejoins_same_netdev() -> TestResult {
+    match sdio_reset_rejoin() {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/sdio",
+    smoke_cyw_sdio_reset_power_cycles_reboots_replays_and_rejoins_same_netdev
 );

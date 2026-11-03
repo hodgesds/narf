@@ -100,4 +100,41 @@ impl<F: SdioFunction> SdioTransport<F> {
         self.stopped = true;
         Ok(())
     }
+    /// `brcmf_sdio_bus_reset` before `mmc_hw_reset`:
+    /// `brcmf_sdiod_intr_unregister`, best-effort `brcmf_sdiod_remove`
+    /// (the native stop, attempted only when the generation is still
+    /// qualified), then the host bus power off with its SDHCI read-back
+    /// (`SdioFunction::power_off_host`). The card loses every function
+    /// and receipt; only [`Self::into_function`] plus `hw_reset` follow.
+    pub(super) fn stop_dead(&mut self) -> Result<(), TransportError> {
+        if self.stopped {
+            return Ok(());
+        }
+        let _ = self.func.disable_card_interrupt();
+        self.interrupt = None;
+        if !self.failed {
+            let _ = self.stop_native();
+        }
+        self.failed = true;
+        self.sleep = None;
+        self.rx_pending = false;
+        self.flow_stopped = true;
+        self.func.power_off_host().map_err(map_err)?;
+        self.stopped = true;
+        Ok(())
+    }
+    /// A fatal transport error (as a failed FIFO access records).
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn fail_for_test(&mut self) {
+        self.failed = true;
+    }
+    /// The whole card of a stopped generation, for its reset. A generation
+    /// without a stop is pinned (forgotten) instead.
+    pub(crate) fn into_function(self) -> Option<F> {
+        if !self.stopped {
+            core::mem::forget(self);
+            return None;
+        }
+        Some(self.func)
+    }
 }

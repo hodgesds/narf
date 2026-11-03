@@ -660,6 +660,9 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
     fn confirmed_stop(&mut self) -> Result<(), TransportError> {
         SdioTransport::confirmed_stop(self)
     }
+    fn stop_dead(&mut self) -> Result<(), TransportError> {
+        SdioTransport::stop_dead(self)
+    }
     fn suspend(&mut self, wake: bool) -> Result<(), TransportError> {
         SdioTransport::suspend_bus(self, wake)
     }
