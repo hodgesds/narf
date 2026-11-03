@@ -15,9 +15,13 @@
 //!     consumes this exact seam as the second publisher** — it
 //!     must not grow a second sink. The AMD display-audio gap
 //!     (#778) closes by publishing here too when that lane runs.
-//!   - **Consumers** (HDA codec / ALSA bridge) read the current
-//!     publication with [`current_display_audio`] /
-//!     [`display_audio_snapshot`].
+//!   - **Consumers**: the HDA codec side (`audio/src/hda/hdmi.rs`
+//!     `display_sink`) reads [`display_audio_snapshot`] and exposes
+//!     the selected publication through the HDMI jack + ELD controls
+//!     and the format limits; the ALSA bridge surfaces those controls
+//!     because they are ordinary mixer controls. Per-pin routing stays
+//!     codec-ELD-driven: the table carries no pin↔DDI map, so there is
+//!     no per-port display association yet.
 //!
 //! ## ELD byte layout
 //!

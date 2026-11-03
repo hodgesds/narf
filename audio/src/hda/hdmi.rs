@@ -807,24 +807,33 @@ impl IntelHda {
     /// native PCM mirrors to every routed port): channel ceiling, whether
     /// S32_LE is allowed and the CEA rate bits. Without any ELD: the ATI
     /// converter's own 8 / S32 / every rate (atihdmi_probe's
-    /// SUPPORTED_RATES).
+    /// SUPPORTED_RATES). The display overlay (`display_sink`) joins
+    /// the intersection when selected, so a display publication gates
+    /// formats even where the codec verbs report no ELD; per-port
+    /// routing stays codec-driven (see `display_sink`).
     pub(super) fn hdmi_limits(&self) -> Option<(u8, bool, u8)> {
-        let ports = self.hdmi.lock();
-        if ports.is_empty() {
-            return None;
-        }
-        Some(
+        let codec_sinks: Vec<Sink> = {
+            let ports = self.hdmi.lock();
+            if ports.is_empty() {
+                return None;
+            }
             ports
                 .iter()
                 .filter_map(|p| p.sink.as_ref().filter(|_| p.present))
-                .fold((8, true, 0x7f), |(channels, s32, rates), sink| {
-                    (
-                        channels.min(sink.channels_max),
-                        s32 && sink.s32,
-                        rates & sink.rates,
-                    )
-                }),
-        )
+                .cloned()
+                .collect()
+        };
+        let display = self.display_sink();
+        Some(codec_sinks.iter().chain(display.iter()).fold(
+            (8, true, 0x7f),
+            |(channels, s32, rates), sink| {
+                (
+                    channels.min(sink.channels_max),
+                    s32 && sink.s32,
+                    rates & sink.rates,
+                )
+            },
+        ))
     }
 
     /// Playback rates on a GPU codec: the sinks' common SAD rates the
@@ -850,6 +859,61 @@ impl IntelHda {
         } else {
             rates
         }
+    }
+
+    /// The display publication the primary-scoped HDMI derivations expose,
+    /// if any (issue #1319).
+    ///
+    /// The HDA HDMI controls (jack, ELD, limits, channel-map TLV)
+    /// describe a single primary port, and the display sink table is
+    /// keyed by publisher-assigned ids with no in-tree pin↔DDI map —
+    /// so the overlay follows the primary port, not a per-port
+    /// association. When the primary port has a live codec sink, only
+    /// a publication whose ELD bytes equal the codec ELD is the same
+    /// sink through the display path, and it is the one exposed;
+    /// publications describing other sinks never override a known-good
+    /// codec ELD. When the primary port has no codec sink, a single
+    /// publication is unambiguous; with several, the lowest sink id
+    /// wins deterministically (per-sink association is a follow-on
+    /// needing a pin↔DDI map).
+    /// The publication ELD parses with the codec's own `parse_eld`:
+    /// the sink builds it field-for-field to that layout
+    /// (`drivers/sound/src/display_audio.rs`). With no ports at all
+    /// (e.g. Intel hardware, whose HDMI codec is not modeled
+    /// in-tree) no HDMI controls exist to expose anything, and the
+    /// overlay stays inert — that codec gap is a separate follow-on.
+    /// Values are read live from the sink table on every call; a
+    /// display publish/clear needs no codec re-sense to become
+    /// visible, but no push notification is sent to control
+    /// listeners yet (`refresh_hdmi`'s `control_changed` loop only
+    /// fires on codec sense changes).
+    fn display_sink(&self) -> Option<Sink> {
+        use narf_drivers_sound::display_audio::display_audio_snapshot;
+        // Primary port's live codec ELD, read under the port lock
+        // and released before touching the display table (no lock
+        // nesting: the display table never calls back into the
+        // codec).
+        let primary_eld: Option<Vec<u8>> = {
+            let ports = self.hdmi.lock();
+            let primary = ports
+                .iter()
+                .find(|p| p.present && p.sink.is_some())
+                .or(ports.first())?;
+            if !primary.present {
+                None
+            } else {
+                primary.sink.as_ref().map(|s| s.eld.clone())
+            }
+        };
+        let pubs = display_audio_snapshot();
+        if pubs.is_empty() {
+            return None;
+        }
+        let publication = match &primary_eld {
+            Some(eld) => pubs.iter().find(|(_, p)| p.eld_bytes() == eld.as_slice())?,
+            None => pubs.iter().min_by_key(|(id, _)| id.0)?,
+        };
+        parse_eld(publication.1.eld_bytes())
     }
 
     /// The port the ELD, jack and channel-map controls describe: the first
@@ -914,12 +978,21 @@ impl IntelHda {
         Ok(())
     }
 
-    /// `hdmi_chmap_ctl_tlv` for the primary port's speakers.
+    /// `hdmi_chmap_ctl_tlv` for the primary port's speakers, falling
+    /// back to the display overlay's speaker allocation when the
+    /// primary port has no codec sink (same rule as the jack/ELD
+    /// controls: the TLV must describe the sink the ELD control
+    /// exposes, not a stale stereo default).
     pub(super) fn chmap_tlv(&self) -> Option<Vec<u32>> {
         let spk_alloc = self
             .hdmi_primary()
             .and_then(|o| self.hdmi_sink(o))
             .map_or(0, |s| s.spk_alloc);
+        let spk_alloc = if spk_alloc == 0 {
+            self.display_sink().map_or(0, |s| s.spk_alloc)
+        } else {
+            spk_alloc
+        };
         chmap_tlv(spk_alloc, self.hdmi_paired())
     }
 
@@ -1002,8 +1075,13 @@ impl IntelHda {
     }
 
     /// Jack and ELD control values (Linux reports the jack as AVOUT only
-    /// with presence and a valid ELD). The ELD is the first live port's.
+    /// with presence and a valid ELD). The display overlay wins when
+    /// selected (see `display_sink`); otherwise the ELD is the first
+    /// live port's.
     pub(super) fn hdmi_jack(&self) -> (bool, Vec<u8>) {
+        if let Some(sink) = self.display_sink() {
+            return (true, sink.eld.clone());
+        }
         let ports = self.hdmi.lock();
         ports
             .iter()

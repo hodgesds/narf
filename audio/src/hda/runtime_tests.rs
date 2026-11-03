@@ -783,6 +783,213 @@ kernel_test_in!(
     native_hda_hdmi_sink_drives_eld_routing_and_surround
 );
 
+/// A display publication hand-built to the ELD layout
+/// `drivers/sound/src/display_audio.rs` documents (CEA-861-D §7.5):
+/// version 2, no monitor name, one SAD, DisplayPort connection type.
+/// Returns the valid ELD bytes plus the publication carrying them
+/// (the LPCM summary fields are filled consistently, though the
+/// consumer under test re-parses the ELD bytes rather than trusting
+/// them).
+fn display_publication(
+    sad: [u8; 3],
+    spk: u8,
+    port_id: u64,
+    lpcm: (u8, u8, u8),
+) -> (
+    Vec<u8>,
+    narf_drivers_sound::display_audio::DisplayAudioPublication,
+) {
+    use narf_drivers_sound::display_audio::{DisplayAudioPublication, ELD_MAX_BYTES};
+    let mut eld = [0u8; ELD_MAX_BYTES];
+    eld[0] = 0x10; // ELD version 2, CEA-861-D
+    eld[2] = 6; // (20 fixed + 0 name + 3 SAD) / 4 rounded up
+    eld[4] = 0x60; // CEA-EDID version 3, MNL 0
+    eld[5] = (1 << 4) | (1 << 2); // 1 SAD, DisplayPort
+    eld[7] = spk;
+    eld[8..16].copy_from_slice(&port_id.to_le_bytes());
+    eld[16..20].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    eld[20..23].copy_from_slice(&sad);
+    let bytes = eld[..23].to_vec();
+    (
+        bytes,
+        DisplayAudioPublication {
+            eld,
+            eld_len: 23,
+            lpcm_max_channels: lpcm.0,
+            lpcm_sample_rates: lpcm.1,
+            lpcm_bit_depths: lpcm.2,
+            sad_count: 1,
+        },
+    )
+}
+
+fn native_hda_display_eld_exposes_jack_eld_and_limits() -> TestResult {
+    use narf_drivers_sound::{
+        display_audio::{clear_display_audio, publish_display_audio, DisplaySinkId},
+        format::{ChannelCount, SampleFormat, SampleRate},
+        mixer::{ControlId, ControlKind, ControlValue},
+    };
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let jack = ControlId {
+        index: 3,
+        kind: ControlKind::HdmiJack,
+    };
+    let eld = ControlId {
+        index: 4,
+        kind: ControlKind::Eld,
+    };
+    let id = DisplaySinkId(0xD1319);
+    clear_display_audio(id);
+    // Baseline: no monitor, no publication.
+    if card.get_control(jack) != Ok(ControlValue::boolean(false))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&[]))
+        || card.capabilities(false).channels.len() != 4
+    {
+        return TestResult::Fail("no sink: jack off, empty ELD, 8 channels");
+    }
+    // Publish one 2-channel / 48 kHz / 16-bit display ELD.
+    let (eld_bytes, publication) = display_publication(
+        [0x09, 0x04, 0x01],
+        0x01,
+        0x1111_2222_3333_4444,
+        (2, 0x04, 0x01),
+    );
+    publish_display_audio(id, publication);
+    if card.get_control(jack) != Ok(ControlValue::boolean(true))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&eld_bytes))
+    {
+        return TestResult::Fail("published ELD must drive jack and ELD controls");
+    }
+    let caps = card.capabilities(false);
+    if caps.channels != [ChannelCount::Stereo]
+        || caps.formats.contains(&SampleFormat::S32LE)
+        || caps.rates != [SampleRate::R48000]
+    {
+        return TestResult::Fail("published ELD must gate channels, formats and rates");
+    }
+    // Clearing the publication restores the no-sink state.
+    clear_display_audio(id);
+    if card.get_control(jack) != Ok(ControlValue::boolean(false))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&[]))
+        || card.capabilities(false).channels.len() != 4
+    {
+        return TestResult::Fail("cleared publication must restore the no-sink state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_display_eld_exposes_jack_eld_and_limits
+);
+
+fn native_hda_display_eld_does_not_override_live_codec_sink() -> TestResult {
+    use narf_drivers_sound::{
+        display_audio::{clear_display_audio, publish_display_audio, DisplaySinkId},
+        mixer::{ControlId, ControlKind, ControlValue},
+    };
+    let mut fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let jack = ControlId {
+        index: 3,
+        kind: ControlKind::HdmiJack,
+    };
+    let eld = ControlId {
+        index: 4,
+        kind: ControlKind::Eld,
+    };
+    let id = DisplaySinkId(0xD131A);
+    clear_display_audio(id);
+    // A live codec sink drives jack and ELD first.
+    fixture.model.sink = true;
+    if dev.refresh_jacks().is_err()
+        || card.get_control(jack) != Ok(ControlValue::boolean(true))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&DELL_ELD))
+    {
+        return TestResult::Fail("codec sink must drive jack and ELD first");
+    }
+    // An unrelated display publication must not override it: the
+    // published bytes differ from the codec ELD, so a naive
+    // display-first implementation would flip the ELD control here.
+    let (_, publication) = display_publication(
+        [0x09, 0x04, 0x01],
+        0x01,
+        0x1111_2222_3333_4444,
+        (2, 0x04, 0x01),
+    );
+    publish_display_audio(id, publication);
+    if card.get_control(eld) != Ok(ControlValue::bytes(&DELL_ELD))
+        || card.capabilities(false).channels.len() != 4
+    {
+        return TestResult::Fail("unrelated publication must not override the codec sink");
+    }
+    clear_display_audio(id);
+    if card.get_control(eld) != Ok(ControlValue::bytes(&DELL_ELD)) {
+        return TestResult::Fail(
+            "clearing the unrelated publication must not disturb the codec sink",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_display_eld_does_not_override_live_codec_sink
+);
+
+fn native_hda_display_eld_lowest_sink_id_wins() -> TestResult {
+    use narf_drivers_sound::{
+        display_audio::{clear_display_audio, publish_display_audio, DisplaySinkId},
+        mixer::{ControlId, ControlKind, ControlValue},
+    };
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let eld = ControlId {
+        index: 4,
+        kind: ControlKind::Eld,
+    };
+    let hi = DisplaySinkId(0xD131A);
+    let lo = DisplaySinkId(0xD1319);
+    clear_display_audio(hi);
+    clear_display_audio(lo);
+    // Higher id published first, 2 channels; lower id second, 6.
+    let (_, pub_2ch) = display_publication(
+        [0x09, 0x04, 0x01],
+        0x01,
+        0x1111_2222_3333_4444,
+        (2, 0x04, 0x01),
+    );
+    let (eld_6ch, pub_6ch) = display_publication(
+        [0x0D, 0x14, 0x04],
+        0x0F,
+        0x5555_6666_7777_8888,
+        (6, 0x14, 0x04),
+    );
+    publish_display_audio(hi, pub_2ch);
+    publish_display_audio(lo, pub_6ch);
+    if card.get_control(eld) != Ok(ControlValue::bytes(&eld_6ch)) {
+        return TestResult::Fail("lowest sink id must win without a codec anchor");
+    }
+    clear_display_audio(hi);
+    clear_display_audio(lo);
+    if card.get_control(eld) != Ok(ControlValue::bytes(&[])) {
+        return TestResult::Fail("clearing both publications must empty the ELD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_display_eld_lowest_sink_id_wins);
+
 fn native_hda_hdmi_chmap_and_iec958_helpers_match_linux() -> TestResult {
     use super::super::hdmi::{
         chmap_tlv, default_chmap, manual_allocation, paired_chmap_valid, parse_eld, slot_entries,
