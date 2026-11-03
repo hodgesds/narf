@@ -770,9 +770,10 @@ without changing the request or publishing GPU work; the syscall bridge handles
 signal delivery and SA_RESTART. Completed/failed waits never request a park.
 Finite waits retain their original future/deadline instead of restarting a
 relative timeout on each repoll. Kernel callers without the hook await timers.
-Long-running/fault VMs, broader parallel queues, OA observation and additional
-native Xe query/property families
-remain refused until their ownership and hardware contracts are implemented.
+Long-running/fault VMs, broader parallel queues and additional native Xe
+query/property families remain refused until their ownership and hardware
+contracts are implemented. OA observation is limited to the main-GT OAG
+profile described below.
 
 **BMG and exact LNL EU-stall observation.** The exact boot opt-in
 `narf.intel.eu_stall=1` permits preallocation on qualified physical BMG main
@@ -816,7 +817,56 @@ poisoned collectors block idle admission. Close requests a verified sampler
 stop; full GT reset invalidates old descriptions and releases exposed storage
 only after the existing GuC-reset, DMA-idle and GRDOM_FULL proofs. A busy or
 lost MCR owner cannot prevent escalation to that reset. This profile does not
-advertise OA, media-GT sampling or additional platform support.
+advertise media-GT sampling or additional platform support.
+
+**Main-GT OAG observation (`intel_gpu_oa`).** The exact boot opt-in
+`narf.intel.oa=1` reserves one coherent 16 MiB GGTT OA buffer per card
+before scheduling on DG2 12.55, MTL/Arrow 12.70/12.71/12.74, BMG
+20.01/20.02 and LNL 20.04 main GTs. Its timing follows the EU-stall rule
+above. `UserBackend::oa_device` publishes cached `intel_gpu_oa::Device`
+facts only with the live epoch. These are the card, platform, graphics
+version, OA timestamp frequency, published engines and reservation.
+Query 8 (`drm_xe_query_oa_units`) has zero units until then. After that it
+has one OAG unit (id 0, gt 0) with the published render and compute
+engines. Its capabilities are BASE, OA_BUFFER_SIZE, WAIT_NUM_REPORTS and
+OA_UNIT_GT_ID. SYNCS and OAM are absent.
+
+The observation ioctl reads its 32-byte param and checks extensions. It
+routes type 0 to OA ops 0..2 and type 1 op 0 to EU-stall. Every other type
+or op is EINVAL. The OA ops follow `xe_oa.c`'s errno order and C widths:
+
+- Open, add and remove are ENODEV without the owner.
+- Extensions are E2BIG past sixteen, then EFAULT/EINVAL.
+- An exec queue is ENOENT or EOPNOTSUPP (width).
+- Privilege is EACCES. Current CAP_PERFMON/CAP_SYS_ADMIN is required.
+- A second stream per card is EBUSY.
+- Add returns EADDRINUSE for a duplicate uuid and otherwise the lowest
+  free id from 1. Remove returns ENOENT for an unknown id.
+
+Configurations are validated against the version's flex, boolean-counter
+and mux tables. They are emitted as MI_LOAD_REGISTER_IMM groups of at most
+126 registers. Each privileged kernel ring job holds at most 378
+registers, on the stream's first OAG engine, and retires before the next
+job; the 500 us NOA delay follows.
+
+Stream descriptors are read-only and take ioctls 0x6900..0x6904
+(ENABLE/DISABLE/CONFIG/STATUS/INFO); anything else is EINVAL. Reads copy
+whole reports and clear headers, or whole straddling reports. They then
+advance OAHEADPTR. They are EIO on relevant OASTATUS bits, ENOSPC for
+short buffers and EAGAIN when empty. A 200 Hz owner poll applies the
+source landing rule and WAIT_NUM_REPORTS.
+
+Close, GT stop, reset and suspend disable the unit and undo the metric
+set. Stop, reset and suspend also make open streams terminal (ENODEV). An
+open stream blocks GT idle. The buffer is retained until the existing
+full-reset proofs. NARF limits:
+
+- Sizes above the reservation are ENOMEM.
+- A configuration holds at most 4096 registers, 131072 per card, and a
+  card holds at most 1024 ids.
+- Current authority is rechecked on every read and control.
+- OA syncs and OAR/OAC exec-queue streams are EOPNOTSUPP.
+- OA mmap, sysfs metrics and the paranoid sysctl are absent.
 
 `intel_gpu_eu_stall::Info` retains the exact `GtPlatform`, card, physical
 32-bit DSS union and steering divisor. This is immutable source policy;

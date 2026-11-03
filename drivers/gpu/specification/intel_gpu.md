@@ -2400,7 +2400,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification. Protected queues stay unadvertised: PXP_TYPE, the PXP status query and BO PXP_TYPE now refuse with Linux's no-PXP errnos (HWDRM ENODEV, NONE accepted); PXP needs the GSC proxy's MEI/CSME client, which NARF lacks. GSCCS0 is now a kernel-only (reserved) engine of the MTL/Arrow media GuC under both media and GSC options, never queryable or placeable |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. The MEI GSC proxy client, PXP, GT1 frequency/idle sysfs and silicon acceptance remain |
-| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
+| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; OAR/OAC exec-queue streams, OA syncs, OA mmap, sysfs metrics, media-GT OAM, full devcoredump sections and remaining i915 perf interfaces remain |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -5871,3 +5871,119 @@ uncached BAR2 writes in one GT-worker poll. It happens once at load, off
 any present path. With `media_gt=1` and `gsc=0`, the 0/~0 GSC interrupt pair
 is not written, per the options-off rule. The MEI↔GSC proxy join waits for
 the MEI unit.
+
+### Xe OA streams on the main-GT OAG unit — native fixtures added
+
+Sources are Linux b90c984d `xe_oa.c`, `xe_oa_types.h`, `regs/xe_oa_regs.h`,
+`xe_observation.c`, `xe_query.c::query_oa_units` and `xe_drm.h`. The
+module is `intel_gpu_oa`.
+
+The exact boot opt-in `narf.intel.oa=1` reserves one 16 MiB coherent GGTT
+buffer per card before scheduling starts, the same rule as EU-stall
+sampling. The GT owner keeps it. Writing OACONTROL=0 and the masked
+MMIO-trigger disable follows `__xe_oa_init_oa_units`. The OAG unit is
+published only for main-GT profiles the source qualifies: DG2 12.55,
+MTL/Arrow 12.70/12.71/12.74, BMG 20.01/20.02 and LNL 20.04. Format masks
+follow `xe_oa_init_supported_formats`. The register whitelist follows
+`xe_oa_is_valid_config_reg_addr` for the main GT's graphics version.
+PTL, Gen12 and the media-GT OAM units are not published.
+
+Query 8 returns the source's zero-unit reply until that owner and the
+execution epoch are published. After that it returns one OAG unit (id 0,
+gt 0) with its published render and compute engines in hw-engine order and
+the cached `xe_oa_timestamp_frequency`. On 12.55 that is RPM_CONFIG0's CTC
+shift, read once at publication. Capabilities are BASE, OA_BUFFER_SIZE,
+WAIT_NUM_REPORTS and OA_UNIT_GT_ID. SYNCS and OAM are not advertised.
+
+Observation routing copies the parameter in and checks extensions. It then
+routes type 0 to OA and type 1 to EU-stall, whose nonzero op is EINVAL
+first. Every other type or op is EINVAL. OA open, ADD_CONFIG and
+REMOVE_CONFIG keep the source's check order and C widths:
+
+- ENODEV without the owner.
+- Sixteen-extension E2BIG, then EFAULT and EINVAL on records and
+  properties. Property values are applied in chain order, with u32 unit
+  and metric ids and an int wait count.
+- The exec-queue lookup: ENOENT, then EOPNOTSUPP for width above one.
+- Privilege: EACCES unless current CAP_PERFMON or CAP_SYS_ADMIN (paranoid
+  is always on). Then the sample, engine, format, exponent and wait checks.
+- EBUSY for a second stream on the card. Syncs, then the metric set
+  (EINVAL), then the buffer.
+
+Configurations live in a per-card registry for the card's lifetime. Uuids
+are checked with `uuid_is_valid`, duplicates are EADDRINUSE, and ids are
+the lowest free from 1. Registers are read and checked one at a time.
+
+Open programs the source metric set. On DG2 this includes Wa_1508761755
+DOP gating, and on Xe2 the PEC trigger bits. It writes OA_DEBUG,
+OAGLBCTXCTRL and SQCNT1. The configuration becomes MI_LOAD_REGISTER_IMM
+groups of at most 126 registers. Up to 378 registers go into each
+privileged kernel ring job on the stream's engine. Each job retires before
+the next is queued, then the 500 us NOA delay passes. Only then does the
+stream enable.
+
+Enable follows `xe_oa_init_oa_buffer`'s head, buffer and tail order and
+zeroes the buffer before OACONTROL is set. On Xe2 it also sets PES
+disaggregation, and with sampling the ring is a report-multiple circular
+size. A 200 Hz poll applies the source landing rule: subtract the partial
+report, then walk back until the following report's header has landed. It
+latches pollin at WAIT_NUM_REPORTS.
+
+Reads copy whole reports and clear the id and timestamp. When reports
+straddle the ring end, they zero the whole report instead. Reads then
+write OAHEADPTR. EIO comes from relevant OASTATUS bits, which are cleared
+by RMW. ENOSPC and EIO keep pollin; everything else clears it. Other
+results follow the source:
+
+- Disabled or non-sampling streams and periodless blocking reads are
+  EINVAL. Short buffers are ENOSPC, and an empty ring is EAGAIN.
+- STATUS maps the last OASTATUS to the uapi bits. INFO reports the
+  buffer size.
+- CONFIG accepts only metric set and syncs. It is ENODEV for an unknown
+  set and returns the previous id.
+
+Disable clears OACONTROL and waits for the counter. On 12.55/12.70 it also
+waits for the OA TLB invalidation. Timeouts proceed as the source's
+logged-only waits do.
+
+Close disables the stream and undoes the metric set under the owner, and
+the next exclusive open can follow. An open stream blocks GT idle, so
+runtime park is refused, as the source's stream-lifetime runtime-PM and
+forcewake references do.
+
+GT stop, reset and system suspend make the stream terminal (ENODEV),
+counters are halted and the metric set is undone. A buffer the unit was
+ever pointed at is released only after the existing GuC/DMA/full-GT reset
+proofs. Access loss, an all-ones read or a tail outside the owned ring
+poisons the unit.
+
+NARF bounds and differences from the source:
+
+- Buffer sizes above the 16 MiB reservation return ENOMEM, where the
+  source would allocate.
+- Configurations are capped at 4096 registers (ENOMEM), 131072 registers
+  per card (ENOMEM) and 1024 ids (ENOSPC).
+- Current authority is required at every read and control (EACCES); the
+  source checks only at open and mmap.
+- OA syncs and OAR/OAC exec-queue streams (including NO_PREEMPT) are
+  EOPNOTSUPP after the source's own validation.
+- There is no mmap of the OA buffer, no `metrics/<uuid>/id` sysfs
+  directory and no `observation_paranoid` sysctl.
+- Media-GT OAM, OAM_SAG and MERT units, PTL and Gen12 are not published.
+
+Fixtures, all new and unexecuted in this slice, are in
+`drivers/gpu/intel_gpu_oa`:
+
+- `smoke_oa_query_units_formats_and_timestamp`
+- `smoke_oa_open_property_privilege_and_errno_order`
+- `smoke_oa_config_registry_errno_order_ids_and_whitelists`
+- `smoke_oa_lri_groups_and_ordered_ring_jobs`
+- `smoke_oa_source_register_sequences_per_profile`
+- `smoke_oa_tail_landing_partial_reports_and_wait_threshold`
+- `smoke_oa_read_wrap_clear_enospc_status_eio_and_info`
+- `smoke_oa_descriptor_authority_blocking_config_and_reopen`
+- `smoke_oa_reset_suspend_loss_and_buffer_retention`
+
+They drive real units, sessions and descriptors against a register and
+memory model. The GuC ring-job and runtime wiring has no GT-model fixture
+yet. Silicon and Mesa acceptance remain open.
