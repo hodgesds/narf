@@ -1408,6 +1408,22 @@ pub fn enable_port_pll_owned<M: MmioWindow + ?Sized>(
         return Err(Cx0Error::UnsupportedRate);
     }
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    enable_port_pll_khz(mmio, port, port_clock_khz, lane_count, dp_alt)
+}
+
+/// [`enable_port_pll_owned`] for a DP port clock in kHz, which may be one
+/// of the eDP intermediate rates the C10 eDP table carries (216, 243,
+/// 324, 432 and 675 MHz, `mtl_c10_edp_tables`).
+pub fn enable_port_pll_khz<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    port_clock_khz: u32,
+    lane_count: u8,
+    dp_alt: bool,
+) -> Result<(), Cx0Error> {
+    if !matches!(lane_count, 1 | 2 | 4) {
+        return Err(Cx0Error::UnsupportedRate);
+    }
     let phy = Cx0Phy::new(mmio, port);
     // 1. Port clock control: forward-clock ungate + maxPCLK clock
     //    select + SSC on PLLB (the MPLLB tables are SSC tables).
@@ -1664,6 +1680,16 @@ pub fn reprogram_pll_rate<M: MmioWindow + ?Sized>(
     rate: LinkRate,
 ) -> Result<(), Cx0Error> {
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    reprogram_pll_khz(mmio, port, port_clock_khz)
+}
+
+/// [`reprogram_pll_rate`] for a DP port clock in kHz (eDP intermediate
+/// rates included).
+pub fn reprogram_pll_khz<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    port_clock_khz: u32,
+) -> Result<(), Cx0Error> {
     let phy = Cx0Phy::new(mmio, port);
     set_pclk_pll_request(mmio, port, false)?;
     phy.program_msgbus_timer();
@@ -1849,6 +1875,17 @@ pub fn set_signal_levels<M: MmioWindow + ?Sized>(
     levels: &[(u8, u8); 4],
 ) -> Result<(), Cx0Error> {
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    set_signal_levels_khz(phy, port_clock_khz, lane_count, levels)
+}
+
+/// [`set_signal_levels`] for a DP port clock in kHz (eDP intermediate
+/// rates included).
+pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    port_clock_khz: u32,
+    lane_count: u8,
+    levels: &[(u8, u8); 4],
+) -> Result<(), Cx0Error> {
     let table = trans_table(phy.port.phy());
     phy.program_msgbus_timer();
     phy.msgbus_access_begin(BOTH_LANES)?;
