@@ -1529,7 +1529,8 @@ trusted.
 - Not programmed by this lane: watermark / DBUF allocation and
   PM demand outside a qualified display14.00 all-pipes-off modeset
   (that case runs the display14 resource transaction of §20; other
-  cases retain firmware's allocation), HDMI PLL states, DP 2.0
+  cases retain firmware's allocation), HDMI above 340 MHz and
+  computed (non-table) HDMI PLL states, DP 2.0
   UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe
   enables, TBT-alt tunnels, pin-assignment-D lane ownership,
   CDCLK notifications on the inherited path (display 14
@@ -2302,7 +2303,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; runtime caller, TBT, HDMI, UHBR, multi-pipe and PSR2 open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt runtime-wired, Type-C ownership, owned PICA/south hotplug, display-14 AUX power and HDMI TMDS (<= 340 MHz, not yet service-selected) implemented with native fixtures; DC-state join, TBT, HDMI 2.x scrambling/FRL, UHBR, multi-pipe and PSR2 open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
@@ -3661,3 +3662,49 @@ New native tests: `drivers/gpu/intel_gpu_xelpg` (4),
 `smoke_mtl_failclosed_powered_ddi_current_and_allones_refusal` and
 `smoke_mtl_modeset_tc_ports_refuse_unqualified_route` fixtures were updated
 for the corrected source values or the larger port set.
+
+Follow-up in the same slice:
+
+- Runtime wiring. `poll_dp_hpd_events` (probe) drains Meteor Lake hotplug
+  events before the Gen12 loop, and the runtime actor's `service_external_sst`
+  runs one MTL pass under the display legacy drain guard. Both reach registers
+  only on a probed Meteor Lake display. The glue keeps one scanout allocation
+  per BAR in the pipe-B console GGTT window, so it never remaps the internal
+  pipe-A window, and reuses it whenever the next mode fits. An activated route
+  is published through the ACTIVE + observer protocol under a fresh serial;
+  once no route is live, exactly that serial is withdrawn.
+  `external_routes_stopped` counts the MTL route. KMS suspend and GT-reset
+  retirement also withdraw its publication. A native fixture drives the hook
+  core `mtl_external_pass` with recorded allocation and publication. The
+  `intel_gpu.rs` wrappers that read the probed controller are reviewed, not
+  executed.
+- DC states. Every hardware-touching external entry (hotplug poll, event
+  handling with Type-C connect/disconnect, probe, activate, stop, teardown)
+  runs inside one DC-off bracket in `intel_gpu_xelpg_external`. Until the
+  DC-state reference service is joined, the bracket runs its closure
+  directly. `route_live()` reports a live route for that service's
+  DC-entry refusal.
+- HDMI TMDS (`intel_gpu_xelpg_hdmi`). The 45 `mtl_c10_hdmi_tables` and the
+  five TMDS `mtl_c20_hdmi_tables` entries are generated verbatim from the
+  pinned source. The Cx0 enable now takes an explicit state: per-request SSC,
+  C20 VDR parameters, and the legacy-mode C20 protocol switch, which clears
+  the MPLLB CAL_DONE banks and waits 4 ms; the DP route now uses this for
+  declared legacy ports. HDMI also gets the C10 Wa_13013502646 powerdown
+  toggle and the source HDMI TX levels. The route covers DDC EDID on MTP pin
+  2 for DDI B, the `intel_ddi_pre_enable_hdmi` -> `intel_ddi_enable` ->
+  `intel_ddi_enable_hdmi` order with the AVI infoframe, and the
+  `intel_ddi_post_disable_hdmi` stop. Typed refusals cover clocks above
+  340 MHz (scrambling/SCDC not owned), FRL and the FRL-ambiguous 300/600 MHz
+  clocks, clocks without a source table (the SNPS C10 and computed C20
+  algorithms are not implemented; the latter needs the MTL-U/ARL-S
+  `tx_misc` fact), Type-C DP-alt, and Type-C DDC (pins 9-12 are not
+  representable by the shared Gen12 pin-pair encoder). HDMI is not yet
+  selected by the hotplug service, which still activates DP only.
+- Thunderbolt-alt stays refused. The display side (TBT clock request, TBT
+  DDI clock select, AUX TBT_IO, IO_SELECT_TBT) does not by itself carry a
+  stream: the DP tunnel through the USB4/Thunderbolt router is established
+  by a connection manager this tree does not have.
+
+New native tests: `drivers/gpu/intel_gpu`
+(`smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws`) and
+`drivers/gpu/intel_gpu_xelpg_hdmi` (6).

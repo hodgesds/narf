@@ -123,9 +123,18 @@ long pulse with a low level removes a sink. `intel_gpu_xelpg_tc` exposes the
 source Type-C connect/disconnect and the display-14 AUX power well
 (`aux_power_enable`/`aux_power_disable`). Every display-14 AUX transport
 (`IntelAux::with_base`/`IntelAux::xelpdp`) preserves the AUX power request on
-each control word. The Gen12 `IntelAux::new` encoding is unchanged. The
-periodic runtime caller of `service_mtl_external` and its scanout publication
-are not yet wired.
+each control word. The Gen12 `IntelAux::new` encoding is unchanged.
+`intel_gpu::poll_dp_hpd_events` and the runtime actor's `service_external_sst`
+run the MTL hotplug pass on Meteor Lake only; an activated route is published
+with a session serial and withdrawn by exactly that serial, and
+`external_routes_stopped` counts it. Every hardware-touching entry runs in one
+DC-off bracket, and `route_live()` is the DC-entry refusal predicate.
+
+`intel_gpu_xelpg_hdmi` provides HDMI TMDS (`hdmi_pll_request`, `probe_hdmi`,
+`connect_legacy_tc`, `activate_hdmi`, `MtlHdmiRoute::stop/release`) for DDI B
+and declared legacy Type-C ports up to 340 MHz from the source tables, with an
+AVI infoframe. Scrambling, FRL, non-table clocks, DP-alt and Type-C DDC refuse
+with `HdmiError`. The hotplug service does not yet select HDMI.
 
 The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
 GGTT byte offset. Both display paths reject invalid plane dimensions,
