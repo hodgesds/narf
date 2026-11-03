@@ -6,13 +6,18 @@
 //! (AR9380/AR9390, PCIe `0x0030`): the `AR_SREV` decode and `AR_SREV_9300`
 //! power-on sequence of `hw.c::__ath9k_hw_init`, the compressed
 //! EEPROM/OTP restore of `ar9003_eeprom.c` and the `ar9003_hw.c` INI
-//! selection. No device is matched by `register()` from here: a chip
-//! without a complete native station path is never claimed.
+//! selection, plus the `ar9003_phy.c` 20 MHz channel preparation with
+//! `ath9k_hw_ar9300_set_board_values` and `ath9k_hw_ar9300_set_txpower`
+//! (`phy`, `board`, `power`). No device is matched by `register()` from
+//! here: a chip without a complete native station path is never claimed.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
+pub(super) mod board;
 pub(super) mod eeprom;
 pub(super) mod ini;
 pub(super) mod initvals;
+pub(super) mod phy;
+pub(super) mod power;
 pub(super) mod templates;
 
 use super::identity::{BringUpError, RegisterIo};
@@ -125,6 +130,32 @@ pub(super) struct PoweredOn {
     pub wa: u32,
     /// `ah->hw_version.phyRev` (`AR_PHY_CHIP_ID`).
     pub phy_rev: u32,
+}
+
+/// `REG_RMW(ah, register, set, clear)`: always one read and one write.
+pub(super) fn rmw(
+    io: &mut impl RegisterIo,
+    register: u64,
+    clear: u32,
+    set: u32,
+) -> Result<(), BringUpError> {
+    let value = io.read32(register);
+    if value == u32::MAX || !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    io.write32(register, (value & !clear) | set);
+    Ok(())
+}
+
+/// `REG_RMW_FIELD`: `((value << shift) & mask)` under `mask`.
+pub(super) fn field(
+    io: &mut impl RegisterIo,
+    register: u64,
+    mask: u32,
+    shift: u32,
+    value: u32,
+) -> Result<(), BringUpError> {
+    rmw(io, register, mask, value.wrapping_shl(shift) & mask)
 }
 
 fn wa_write(io: &mut impl RegisterIo, wa: u32) {

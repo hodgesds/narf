@@ -54,6 +54,87 @@ pub(in crate::ath9k) mod field {
     pub const TXRX_MASK: usize = 32;
     pub const OP_FLAGS: usize = 33;
     pub const TXRX_GAIN: usize = 48;
+    // `ar9300_base_eep_hdr`.
+    pub const TUNING_CAPS: usize = 40;
+    pub const FEATURE_ENABLE: usize = 42;
+    pub const MISC_CONFIGURATION: usize = 43;
+    pub const SWREG: usize = 49;
+    // `struct ar9300_eeprom` sections (packed; offsets printed from the
+    // compiled Linux structure).
+    pub const MODAL_2G: usize = 53;
+    pub const EXT1: usize = 124;
+    pub const PIERS_2G: usize = 138;
+    pub const CAL_2G: usize = 141;
+    pub const TARGET_FBIN_CCK: usize = 195;
+    pub const TARGET_FBIN_2G: usize = 197;
+    pub const TARGET_FBIN_2G_HT20: usize = 200;
+    pub const TARGET_CCK: usize = 206;
+    pub const TARGET_2G: usize = 214;
+    pub const TARGET_2G_HT20: usize = 226;
+    pub const CTL_INDEX_2G: usize = 310;
+    pub const CTL_FREQBIN_2G: usize = 322;
+    pub const CTL_POWER_2G: usize = 370;
+    pub const MODAL_5G: usize = 418;
+    pub const EXT2: usize = 489;
+    pub const PIERS_5G: usize = 503;
+    pub const CAL_5G: usize = 511;
+    pub const TARGET_FBIN_5G: usize = 655;
+    pub const TARGET_FBIN_5G_HT20: usize = 663;
+    pub const TARGET_5G: usize = 679;
+    pub const TARGET_5G_HT20: usize = 711;
+    pub const CTL_INDEX_5G: usize = 935;
+    pub const CTL_FREQBIN_5G: usize = 944;
+    pub const CTL_POWER_5G: usize = 1016;
+    // `ar9300_BaseExtension_1` (at `EXT1`).
+    pub const EXT1_MISC_ENABLE: usize = 3;
+    pub const EXT1_TEMPSLOPE_EXTENSION: usize = 4;
+    pub const EXT1_QUICK_DROP_LOW: usize = 12;
+    pub const EXT1_QUICK_DROP_HIGH: usize = 13;
+    // `ar9300_BaseExtension_2` (at `EXT2`).
+    pub const EXT2_TEMP_SLOPE_LOW: usize = 0;
+    pub const EXT2_TEMP_SLOPE_HIGH: usize = 1;
+    pub const EXT2_XATTEN1_DB_LOW: usize = 2;
+    pub const EXT2_XATTEN1_MARGIN_LOW: usize = 5;
+    pub const EXT2_XATTEN1_DB_HIGH: usize = 8;
+    pub const EXT2_XATTEN1_MARGIN_HIGH: usize = 11;
+}
+
+/// `ar9300_modal_eep_header` offsets (71 bytes, at `MODAL_2G`/`MODAL_5G`).
+pub(in crate::ath9k) mod modal {
+    pub const ANT_CTRL_COMMON: usize = 0;
+    pub const ANT_CTRL_COMMON2: usize = 4;
+    pub const ANT_CTRL_CHAIN: usize = 8;
+    pub const XATTEN1_DB: usize = 14;
+    pub const XATTEN1_MARGIN: usize = 17;
+    pub const TEMP_SLOPE: usize = 20;
+    pub const SPUR_CHANS: usize = 22;
+    pub const NOISE_FLOOR_THRESH: usize = 27;
+    pub const QUICK_DROP: usize = 41;
+    pub const XPA_BIAS_LVL: usize = 42;
+    pub const ANTENNA_GAIN: usize = 46;
+    pub const TX_END_TO_XPA_OFF: usize = 49;
+    pub const TX_FRAME_TO_XPA_ON: usize = 51;
+    pub const XLNA_BIAS_STRENGTH: usize = 63;
+}
+
+/// `ar9003_modal_header`: the 2 GHz or 5 GHz modal header base.
+pub(in crate::ath9k) fn modal_base(five: bool) -> usize {
+    if five {
+        field::MODAL_5G
+    } else {
+        field::MODAL_2G
+    }
+}
+
+/// `ath9k_hw_fbin2freq` (`AR5416_BCHAN_UNUSED` 0xff stays 255).
+pub(in crate::ath9k) fn fbin2freq(fbin: u8, two_ghz: bool) -> i32 {
+    if fbin == 0xff {
+        255
+    } else if two_ghz {
+        2300 + i32::from(fbin)
+    } else {
+        4800 + 5 * i32::from(fbin)
+    }
 }
 
 /// `enum CompressAlgorithm`.

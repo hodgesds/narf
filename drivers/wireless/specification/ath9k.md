@@ -1954,13 +1954,60 @@ lowest-ob/db and common defaults; `tx_gain_buffalo` is never set). Smokes
 `smoke_ath9k_ar9300_ini_selection_follows_txrxgain` (FNV-1a oracle over the
 886 default-selected 2 GHz HT20 rows).
 
-Still to port before `ar9300_enablement` can be claimed: `ar9003_phy.c`
-process_ini/set_channel/spur/chain masks and
-`ath9k_hw_ar9300_set_board_values`, `ath9k_hw_ar9300_set_txpower` (targets,
-CTL, PAPRD off), the EDMA TX status ring and RX FIFOs (`ar9003_mac.c`),
-`ar9003_calib.c`, signed AR9300 records and the
-probe/station/retune/reset/periodic/suspend owner. Nothing registers
-`0x0030`.
+AR9003 PHY preparation (step 2). `ar9003/phy.rs::prepare` is the
+inactive full-reset preparation of one 20 MHz AR9300 channel (2412–2472,
+2484, 5180–5825 in a band `opFlags` enables; anything else is
+`Policy` before the first write) in `ath9k_hw_reset` order after the chip
+reset: interrupts/queues/RX off, `ar9003_hw_mark_phy_inactive`,
+`ath9k_hw_init_pll` (`ar9003_hw_compute_pll_control` 0x142c, 100 µs,
+`AR_RTC_FORCE_DERIVED_CLK`), `ar9003_hw_process_ini` (SoC pre, MAC/BB/radio
+core, SoC/MAC/BB/radio post with per-array `regWrites`, column 1 for
+non-modal arrays, modes index 1 / 4; `ar9003_doubler_fix`; RX gain column
+1, TX gain at the modes index, the 5 GHz fast-clock table
+(`ATH9K_HW_CAP_FASTCLOCK`), the Japan 2484 CCK FIR rows;
+`ar9003_hw_override_ini` (RX_DIS|RX_ABORT, `AR_PCU_MISC_MODE2`, the
+`AR_PHY_CL_CAL_ENABLE` → `TX_CL_CAL` fact retained), HT20
+`ar9003_hw_set_channel_regs` (two `AR_PHY_GEN_CTRL` reads, GF detect off,
+`AR_2040_MODE` 0, GTXTO/CST), `ar9003_hw_set_chain_masks` (alt-chain swap
+for mask 5, `ATH9K_HW_CAP_APM` 7 → 3 selfgen) and `ath9k_hw_apply_txpower`),
+`ar9003_hw_set_rfmode` (2 GHz DYNAMIC; 5 GHz OFDM|DYNAMIC|DYN_CCK_DISABLE),
+`ar9003_hw_set_delta_slope`, `ar9003_hw_spur_mitigate` (MRC CCK over the
+fixed 2420/2440/2464/2480 list, OFDM over the band's `spurChans`, HT20
+branch), `set_board_values` and `ar9003_hw_set_channel` (fractional
+`CHANSEL_2G`, doubler-halved `CHANSEL_5G`, `SYNTH4` long shift, the
+`SYNTH7` load toggle); it ends with PHY inactive, IER 0 and `AR_CR_RXD`.
+`ar9003/board.rs` is `ath9k_hw_ar9300_set_board_values` with every helper's
+AR9300 branch (xPA timing on `featureEnable` bit 7, xPA bias with
+MSB/short-to-ground, `AR_SWITCH_TABLE_COM`/`COM2`/per-chain tables for
+rx|tx chains, drive strength, xLNA bias, xatten DB/margin with the 5 GHz
+three-point interpolation, quick drop, the `AR_RTC_REG_CONTROL0/1`
+internal regulator or `AR_RTC_FORCE_SWREG_PRD`, crystal tuning caps,
+minCCApwr, TX-end-to-xPA-off, thermometer). `ar9003/power.rs` is
+`ath9k_hw_ar9300_set_txpower` with PAPRD and TPC off (the Linux
+defaults): CCK/legacy/HT20 targets by `ar9003_hw_power_interpolate`
+(HT40 slots zero), the 11B/11G/HT20 or 11A/HT20 CTL modes with
+`ath9k_hw_get_scaled_power` over the band `antennaGain`, the twelve rate
+words, `ar9003_hw_calibration_apply` (per-chain pier selection, the
+unmasked sign-extended `OLPC_GAIN_DELTA` RMW Linux performs, error-estimate
+mode 3, the AR9300 temperature-slope variants, `THERM_CAL_VALUE`),
+`AR_TPC` and `AR_PHY_PWRTX_MAX` 0; the plan (targets, `max_power_level`,
+correction/temperature/voltage and the `nf_2g`/`nf_5g` cal/power facts) is
+computed before any write. Policy over Linux: a ceiling above
+`MAX_RATE_POWER`, an empty or foreign TX mask and a transmit chain with no
+calibration pier within 1000 MHz (Linux presumes a zero correction) are
+refused. Smokes (written, not executed):
+`smoke_ath9k_ar9300_txpower_matches_linux_oracle` (FNV-1a over 100
+template × channel × CTL cases, plain and with synthetic pier data,
+against the `ar9003_eeprom.c` target/CTL/calibration functions compiled
+verbatim over the five templates), `smoke_ath9k_ar9300_prepare_channel_registers`,
+`smoke_ath9k_ar9300_board_values_follow_eeprom_flags`. Not prepared: HT40,
+half/quarter rate, PAPRD, TPC, `ath9k_hw_set_clockrate`'s fast-clock
+`AR_USEC` (MAC owner).
+
+Still to port before `ar9300_enablement` can be claimed: the EDMA TX
+status ring and RX FIFOs (`ar9003_mac.c`), `ar9003_calib.c`, signed AR9300
+records and the probe/station/retune/reset/periodic/suspend owner.
+Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
