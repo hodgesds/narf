@@ -344,10 +344,15 @@ pub(crate) fn smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack() -> TestResul
         }) => {}
         _ => return TestResult::Fail("idle RX after the batch"),
     }
+    // ee92_quiesce: every TX queue's read point at the host write point
+    // (BE 1/1), the 0x5f8 buffers empty, then the RX DMA pause.
     if owner.stop_packets().is_err()
+        || narf_scheduler::block_on(owner.quiesce()).is_err()
+        || !bus.traced((8, 0x286, 4))
+        || owner.published
         || narf_scheduler::block_on(owner.quiesce()) != Err(Error::State)
     {
-        return TestResult::Fail("stop / 88EE quiescence proof applied to 8192EE");
+        return TestResult::Fail("stop / 8192EE card-disable retirement proof");
     }
     TestResult::Pass
 }
@@ -456,4 +461,96 @@ pub(crate) fn smoke_rtl8192ee_rsvd_page_download_through_beacon_bd() -> TestResu
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192ee_rsvd_page_download_through_beacon_bd
+);
+
+pub(crate) fn smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce() -> TestResult {
+    use super::super::super::super::rtl8192ee::h2c;
+    let bus = Bus::new();
+    let local = [2, 0, 0, 0, 0, 1];
+    let ap = [2, 0, 0, 0, 0, 9];
+    let mut owner = running(&bus, local);
+    // EAPOL (to-DS, non-QoS): rtl_is_tx_report_skb ⇒ SPE_RPT + SW_DEFINE
+    // `(1 & 0x3f) << 2`.
+    let mut eapol = vec![0u8; 40];
+    eapol[0] = 0x08;
+    eapol[1] = 0x01;
+    eapol[4..10].copy_from_slice(&ap);
+    eapol[10..16].copy_from_slice(&local);
+    eapol[16..22].copy_from_slice(&ap);
+    eapol[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    if owner.submit(&eapol, trx::DESC_RATE1M).is_err() {
+        return TestResult::Fail("EAPOL submit");
+    }
+    if word(&owner.tx[11], 8) & 1 << 19 == 0 || word(&owner.tx[11], 24) & 0xfff != 4 {
+        return TestResult::Fail("EAPOL frame without SPE_RPT/SW_DEFINE");
+    }
+    bus.set32(0x3a8, 1 << 16 | 1);
+    if !matches!(owner.poll_delivery(), Ok(Some(_))) {
+        return TestResult::Fail("EAPOL delivery");
+    }
+    // 2T2R HT peer at 20 MHz, INIT level: full mask; refused unless every
+    // mask rate is admitted.
+    let peer = h2c::Peer {
+        legacy: 0xfff,
+        ht: Some([0xff, 0xff]),
+        sgi20: false,
+        sgi40: false,
+    };
+    let full = h2c::mask_rates(&h2c::rate_mask(&peer, false, 0, true)).unwrap();
+    if narf_scheduler::block_on(owner.ee92_install_rate_mask(peer, false, 0, full >> 1))
+        != Err(Error::Power(
+            super::super::super::super::channel_power::Error::Policy,
+        ))
+        || owner.phase() != Phase::Running
+        || owner.packet.ee92.link.is_some()
+    {
+        return TestResult::Fail("RA mask outside the admitted rates installed");
+    }
+    if narf_scheduler::block_on(owner.ee92_install_rate_mask(peer, false, 0, full)).is_err()
+        || owner.packet.ee92.link.map(|l| l.2) != Some(h2c::ARFR_NB)
+        || !bus.traced((8, 0x1d0, u32::from(h2c::H2C_RA_MASK)))
+        || !bus.traced((8, 0x550, 0x1d))
+    {
+        return TestResult::Fail("H2C_92E_RA_MASK / BCN_CTRL BIT(3)");
+    }
+    // Watchdog: PWDB 60 from INIT is HIGH (> 50): refresh at level 1.
+    match narf_scheduler::block_on(owner.ee92_dm_watchdog(60, full)) {
+        Ok(true) if owner.packet.ee92.ratr_state == 1 => {}
+        _ => return TestResult::Fail("watchdog RA state refresh"),
+    }
+    if !bus.traced((8, 0x1d4, u32::from(h2c::H2C_RA_MASK))) {
+        return TestResult::Fail("refreshed mask not sent in the next box");
+    }
+    // Same level: no refresh; a pending RA report is applied.
+    owner.packet.ee92.ra_report = Some((0x14, false));
+    match narf_scheduler::block_on(owner.ee92_dm_watchdog(60, full)) {
+        Ok(false) if owner.packet.ee92.ra_report.is_none() => {}
+        _ => return TestResult::Fail("watchdog without a level change / RA report"),
+    }
+    let (low, high) = super::super::super::super::rtl8192ee::c2h::dynamic_arfb(0x14, false);
+    if !bus.traced((32, 0x430, low)) || !bus.traced((32, 0x434, high)) {
+        return TestResult::Fail("dynamic ARFB pair");
+    }
+    // Leisure: the watchdog does not run.
+    owner.packet.leisure = true;
+    if narf_scheduler::block_on(owner.ee92_dm_watchdog(0, full)) != Ok(false)
+        || owner.packet.ee92.ratr_state != 1
+    {
+        return TestResult::Fail("watchdog ran in LPS");
+    }
+    owner.packet.leisure = false;
+    // A TX queue whose device read point lags keeps every mapping.
+    bus.set32(0x3a8, 1);
+    if owner.stop_packets().is_err()
+        || narf_scheduler::block_on(owner.quiesce()) != Err(Error::PacketTimeout)
+        || !owner.published
+        || bus.traced((8, 0x286, 4))
+    {
+        return TestResult::Fail("lagging read point retired");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce
 );

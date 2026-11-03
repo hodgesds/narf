@@ -47,7 +47,7 @@
 //! (`rtl8192ee/h2c.rs`) and a stopped owner's DMA is released only after
 //! the card-disable retirement proof (`ee92_quiesce`). The owner cannot reach `MacConfigured` until the 8192EE
 //! PHY/RF/channel steps exist, so none of this is reachable from probe.
-use super::super::super::rtl8192ee::{c2h, h2c, mac, rsvd_page, trx};
+use super::super::super::rtl8192ee::{c2h, dm, h2c, mac, rsvd_page, trx};
 use super::{
     extent, queue, Delivery, Error, Io, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep,
     RX_BASE, RX_BUFFER, TX_BASES,
@@ -113,6 +113,11 @@ pub(in super::super) struct State {
     pub(in super::super) ra_report: Option<(u8, bool)>,
     /// `rtlpci->reg_bcn_ctrl_val` (`_rtl92ee_hw_configure` leaves `0x1d`).
     pub(in super::super) bcn_ctrl: u8,
+    /// `p_ra->ratr_state` (`rtl92ee_dm_init_rate_adaptive_mask`: INIT).
+    pub(in super::super) ratr_state: u8,
+    /// Peer and `mac->bw_40` of the installed `H2C_92E_RA_MASK`, with its
+    /// `ratr_index` (`sta_entry->ratr_index`).
+    pub(in super::super) link: Option<(h2c::Peer, bool, u8)>,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -125,6 +130,8 @@ impl State {
             tx_report: None,
             ra_report: None,
             bcn_ctrl: 0x1d,
+            ratr_state: 0,
+            link: None,
         }
     }
     /// `rtl_c2h_content_parsing` for the packets this profile consumes.
@@ -442,6 +449,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         } else {
             &frame[4..10]
         };
+        // rtl_get_tcb_desc `use_spe_rpt` for EAPOL and (QoS) Null frames:
+        // rtl_set_tx_report's SPE_RPT + SW_DEFINE (`rtl_get_tx_report_sn`).
+        let tx_report = super::ae::wants_report(frame).then(|| self.packet.ee92.reports.next_sn());
         let descriptor = trx::TxDesc::fill(&trx::TxParams {
             pkt_size: frame.len() as u16,
             queue_sel: selector,
@@ -459,7 +469,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             multicast: destination[0] & 1 != 0,
             protection: 0,
             rts_rate: 0,
-            tx_report: None,
+            tx_report,
             buffer_addr: address,
         });
         let desc_addr = extent(&self.tx[7 + queue], DEPTH * trx::TX_DESC_SIZE, 256)?
@@ -793,6 +803,75 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Take the latest C2H TX report `(sn, acked, retry)`.
     pub(super) fn ee92_take_tx_report(&mut self) -> Option<(u16, bool, u8)> {
         self.packet.ee92.tx_report.take()
+    }
+
+    /// `rtl92ee_update_hal_rate_mask` (`update_rate_tbl`): the 2T2R
+    /// `H2C_92E_RA_MASK` for `peer` at `level`, then
+    /// `_rtl92ee_set_bcn_ctrl_reg(BIT(3), 0)`. The firmware RA may only pick
+    /// rates whose power the owner's permission admits: a mask that is not
+    /// a non-empty subset of `admitted` (full-order rate bits,
+    /// [`h2c::mask_rates`]) is refused, never narrowed, so the Linux
+    /// mask/`ratr_index` pair stays exact. Skipped in leisure power save
+    /// (the watchdog does not run with `fw_current_inpsmode`).
+    pub(super) async fn ee92_install_rate_mask(
+        &mut self,
+        peer: h2c::Peer,
+        bw40: bool,
+        level: u8,
+        admitted: u32,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        let payload = h2c::rate_mask(&peer, bw40, level, true);
+        let rates = h2c::mask_rates(&payload).ok_or(Error::Packet)?;
+        if rates == 0 || rates & !admitted != 0 {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Policy,
+            ));
+        }
+        self.phase = Phase::Failed;
+        self.packet
+            .ee92
+            .mailbox
+            .fill(&self.io, h2c::H2C_RA_MASK, &payload)
+            .await?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ee92.bcn_ctrl, 1 << 3, 0)?;
+        self.packet.ee92.link = Some((peer, bw40, payload[1] & 0x7f));
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// The composed part of `rtl92ee_dm_watchdog` (only while the firmware
+    /// is out of power save): `rtl92ee_dm_refresh_rate_adaptive_mask` —
+    /// `_rtl92ee_dm_ra_state_check` on the smoothed `undec_sm_pwdb` and,
+    /// on a level change, `update_rate_tbl(sta, ratr_state, true)` — then
+    /// the pending C2H RA report's `rtl92ee_dm_dynamic_arfb_select`
+    /// ([`Self::ee92_apply_ra_report`]). Returns whether the mask was
+    /// refreshed. `use_ldpc`/`lower_rts_rate` are not consumed by this
+    /// profile (no LDPC TX, no protection) and are not tracked.
+    pub(super) async fn ee92_dm_watchdog(
+        &mut self,
+        undec_sm_pwdb: i64,
+        admitted: u32,
+    ) -> Result<bool, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if self.packet.leisure {
+            return Ok(false);
+        }
+        let mut refreshed = false;
+        if let Some((peer, bw40, _)) = self.packet.ee92.link {
+            if let Some(state) = dm::ra_state(undec_sm_pwdb, self.packet.ee92.ratr_state) {
+                self.ee92_install_rate_mask(peer, bw40, state, admitted)
+                    .await?;
+                self.packet.ee92.ratr_state = state;
+                refreshed = true;
+            }
+        }
+        self.ee92_apply_ra_report()?;
+        Ok(refreshed)
     }
 
     /// `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)` for 8192EE

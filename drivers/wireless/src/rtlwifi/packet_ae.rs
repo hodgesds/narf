@@ -117,7 +117,7 @@ impl State {
 /// MAC header and the 6-byte SNAP prefix; with software crypto no
 /// `hw_key` IV is skipped, so a protected frame never matches) or a
 /// (QoS) Null function frame.
-fn wants_report(frame: &[u8]) -> bool {
+pub(super) fn wants_report(frame: &[u8]) -> bool {
     if frame.len() < 24 || frame[0] & 0x0c != 0x08 {
         return false;
     }

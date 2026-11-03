@@ -850,3 +850,91 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_tables_and_check_condition_walk
 );
+
+// ── card disable (`_rtl92ee_poweroff_adapter`) ────────────────────────────
+
+struct OffModel(IrqSafeSpinLock<PwrState>);
+#[async_trait::async_trait]
+impl Io for OffModel {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        Ok(self.0.lock().0[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        Ok(u32::from_le_bytes([
+            g.0[r],
+            g.0[r + 1],
+            g.0[r + 2],
+            g.0[r + 3],
+        ]))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        // The modelled power FSM completes 0x05[1:0] requests immediately.
+        g.0[usize::from(reg)] = if reg == 5 { value & !3 } else { value };
+        g.1.push((reg, value));
+        Ok(())
+    }
+    fn write32(&self, _reg: u16, _value: u32) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+
+/// `_rtl92ee_poweroff_adapter` order on the rebuild owner's power-down:
+/// LPS-enter flow, `REG_RF_CTRL = 0`, firmware self-reset only with
+/// MCUFWDL BIT(7) and ready firmware, MCU reset, MCUFWDL 0, disable flow,
+/// RSV_CTRL+1 BIT(0) pulse, RSV_CTRL `0x0e`.
+fn smoke_rtl8192ee_poweroff_adapter_order() -> TestResult {
+    use crate::rtlwifi::power_runtime::disable_rtl8192ee;
+    let model = |ready_bit: bool| {
+        let mut regs = vec![0u8; 0x800];
+        regs[0x80] = if ready_bit { 0xc6 } else { 0x46 };
+        regs[0x1d] = 1;
+        regs[3] = 0xfc;
+        regs[0x1f] = 7;
+        OffModel(IrqSafeSpinLock::new((regs, Vec::new())))
+    };
+    let io = model(true);
+    if narf_scheduler::block_on(disable_rtl8192ee(&io, true)).is_err() {
+        return TestResult::Fail("8192EE poweroff failed on an idle model");
+    }
+    let g = io.0.lock();
+    let w = &g.1;
+    let at = |reg: u16, value: u8| w.iter().position(|&x| x == (reg, value));
+    let (Some(rf), Some(fw0), Some(mcu0), Some(fwdl), Some(last)) = (
+        at(0x1f, 0),
+        at(0x1d, 0),
+        w.iter().rposition(|&x| x == (3, 0xf8)),
+        at(0x80, 0),
+        w.last().copied(),
+    ) else {
+        return TestResult::Fail("8192EE poweroff write missing");
+    };
+    let selfreset = w.iter().filter(|&&x| x == (3, 0xfc)).count();
+    if !(rf < fw0 && fw0 < mcu0 && mcu0 < fwdl)
+        || selfreset != 1
+        || last != (0x1c, 0x0e)
+        || w[w.len() - 2] != (0x1d, 1)
+        || w[w.len() - 3] != (0x1d, 0)
+        || g.0[5] & 4 == 0
+    {
+        return TestResult::Fail("8192EE poweroff order / final state");
+    }
+    drop(g);
+    let cold = model(false);
+    if narf_scheduler::block_on(disable_rtl8192ee(&cold, true)).is_err()
+        || cold.0.lock().1.contains(&(3, 0xfc))
+    {
+        return TestResult::Fail("self-reset issued without MCUFWDL BIT7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_poweroff_adapter_order
+);

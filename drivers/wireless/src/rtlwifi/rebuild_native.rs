@@ -23,17 +23,24 @@ impl
         io.disable_aspm().map_err(prepare::Error::Access)?;
         self.power_state.store(2, Ordering::Release);
         let ready = firmware.status().stage == Stage::Ready;
-        let rtl8821ae = firmware.device_id() == super::super::regs::RTL_DEV_8821AE;
+        let device = firmware.device_id();
+        let rtl8821ae = device == super::super::regs::RTL_DEV_8821AE;
+        let rtl8192ee = device == super::super::regs::RTL_DEV_8192EE;
         let disabled = if rtl8821ae {
             super::super::power_runtime::disable_rtl8821ae(&io, ready).await
+        } else if rtl8192ee {
+            // `rtl92ee_card_disable` → `_rtl92ee_poweroff_adapter`, after the
+            // owner's `ee92_quiesce` retirement proof.
+            super::super::power_runtime::disable_rtl8192ee(&io, ready).await
         } else {
             super::super::power_runtime::disable(&io, ready).await
         };
         disabled.map_err(prepare::Error::Access)?;
         self.power_state.store(1, Ordering::Release);
-        if rtl8821ae {
-            // ASPM is not composed for 8821AE (`prepare_bus_power`): the
-            // probe's ASPM-disabled link state is kept.
+        if rtl8821ae || rtl8192ee {
+            // ASPM is not composed for 8821AE/8192EE (`prepare_bus_power`;
+            // 8192EE `enable_aspm` is not issued): the probe's
+            // ASPM-disabled link state is kept.
             return Ok(());
         }
         // Card-disable proof is complete. Optional idle-link optimization

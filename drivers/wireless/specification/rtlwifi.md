@@ -2314,6 +2314,28 @@ diagnostic (`pci::bring_up` does not retain it).
   false alarm/DIG/adaptivity/CCK PD/EDCA turbo/ATC/primary CCA are not run
   (as on 88EE). The 8192EE watchdog has no TX-power tracking step
   (`rtl92ee_dm_init_txpower_tracking` only seeds indices).
+  Owner composition (`packet_owner.rs`): `ee92_install_rate_mask` is
+  `rtl92ee_update_hal_rate_mask` (`H2C_92E_RA_MASK`, then BCN_CTRL
+  BIT(3)), refused — never narrowed — unless the mask's rates are a
+  non-empty subset of the caller's admitted rates, and skipped in LPS; it
+  records the peer, `bw_40` and `ratr_index`. `ee92_dm_watchdog(undec_sm_
+  pwdb, admitted)` runs only out of LPS: `_rtl92ee_dm_ra_state_check`
+  against `ratr_state` (INIT at start), on a change `update_rate_tbl(sta,
+  ratr_state, true)` through the same admission check, then the pending
+  RA report's dynamic ARFB (`ee92_apply_ra_report`); `use_ldpc`/
+  `lower_rts_rate` are not consumed (no LDPC TX, no protection). TX
+  reports: `ee92_submit` sets SPE_RPT + SW_DEFINE (`rtl_set_tx_report`,
+  `rtl_get_tx_report_sn`) for EAPOL and (QoS) Null frames
+  (`rtl_is_tx_report_skb`, shared with 8821AE). Power-down:
+  `rebuild_native` `power_down` dispatches `0x818b` to
+  `power_runtime::disable_rtl8192ee` and keeps ASPM disabled; the
+  rebuild's re-enable still refuses `0x818b` (no 8192EE provisioning
+  path yet). The station loop's smoothed PWDB feed and the per-board
+  admitted set come with the station branch (not composed yet). Tests
+  `smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce`,
+  `smoke_rtl8192ee_poweroff_adapter_order` (written, unexecuted);
+  `smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack` now expects the
+  `ee92_quiesce` proof (its earlier `Err(State)` assertion predated it).
 - `rsvd_page` — `fw.c::reserved_page_packet` verbatim (1024 bytes, eight
   128-byte pages: beacon 0..=1, PS-Poll 2, Null 3, probe response 4..=5,
   QoS-Null 6, BT-QoS-Null 7; sha256 `7182a1ec…7ff043` recorded; Linux's
