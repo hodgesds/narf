@@ -152,6 +152,8 @@ mod usb;
 mod usb_firmware;
 #[cfg(feature = "kernel-test")]
 mod usb_firmware_tests;
+/// RTL8821CU USB driver registration (Linux rtw88/rtw8821cu.c).
+mod usb_driver;
 /// RTL8821CU USB packet owner (Linux rtw88/usb.c TX queues, RX split).
 mod usb_packet;
 #[cfg(feature = "kernel-test")]
@@ -190,6 +192,7 @@ pub use regs::{REALTEK_VENDOR, RTL_DEV_8821CE, RTL_DEV_8822BE, RTL_DEV_8822CE};
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    usb_driver::register();
     narf_power::system_pm::register_async_system_pm(
         "rtw88",
         alloc::sync::Arc::new(system_pm::SystemPm),

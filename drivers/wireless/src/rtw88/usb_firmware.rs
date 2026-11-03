@@ -64,7 +64,7 @@ enum State {
     Terminal,
 }
 
-fn usb_error(error: usb::Error) -> Error {
+pub(super) fn usb_error(error: usb::Error) -> Error {
     match error {
         usb::Error::Timeout => Error::Timeout,
         usb::Error::Gone => Error::Gone,

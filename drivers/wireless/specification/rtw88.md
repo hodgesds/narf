@@ -3191,7 +3191,7 @@ MU-MIMO exchange has been run. Written, unexecuted:
 `smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback` now expects
 SU and MU beamformee with STS field 3.
 
-### RTL8821CU USB transport (`usb.rs`) — not admitted
+### RTL8821CU USB transport (`usb.rs`, `usb_driver.rs`)
 
 Linux drives RTL8821CU with rtw88 (`rtw8821cu.c` over `usb.c`), not
 rtl8xxxu. `usb.rs` ports that host interface for the C21 die; the PCI files
@@ -3241,9 +3241,33 @@ owner (`rtl8xxxu::firmware_transport::ControlIo` bound to
 - EFUSE: `efuse_mac` reads the USB map MAC at 0x107
   (`rtw8821cu_efuse_parsing`); `Factory8821c::mac` is the PCI 0xd0 layout.
 
-Not admitted. No USB driver is registered for these IDs (rtl8xxxu's
-detection-only probe still claims 0bda:c811), and no station, band or TX
-grant is published. Remaining blockers, verified against the tree:
+Registration (`usb_driver.rs`, `rtw8821cu.c::rtw_8821cu_driver` over
+`usb.c::rtw_usb_probe`): `RTW8821CU_USB_IDS` registers every
+`RTL8821CU_IDS` entry with the vendor interface triple 0xff/0xff/0xff
+(`USB_DEVICE_AND_INTERFACE_INFO`) through
+`class_registry::register_class_driver_with_unbind` ("rtw8821cu"); 0bda:c811
+is removed from `rtl8xxxu::RTL8XXXU_USB_IDS`, so rtl8xxxu no longer claims
+it. `probe` records the slot and spawns the asynchronous attach:
+`rtw_usb_intf_init` (full configuration descriptor -> `Endpoints::parse`),
+SET_CONFIGURATION and xHCI contexts for the bulk-IN and every bulk-OUT pipe
+(`endpoint_configs`; the interrupt-IN pipe is never used), `Speed::from_port`,
+`usb_firmware::Backend` over `rtl8xxxu::firmware_transport::UsbControl` and
+`rtl8xxxu::packet_transport::UsbIo`, `usb::Registers::power_on` and
+REG_C2HEVT (0x1a0) = 0xfd (`rtw_chip_efuse_enable`), the asynchronous USB
+EFUSE read, `Lifecycle::new(0xc821).on(Interface::Usb { vendor, product })`,
+`interface::Device::new` and `interface::publish` (`rtw8821cu`), then the
+`sibling.rs::Sibling::provision` stage sequence (firmware download, MAC,
+PHY, C21 calibration/operating/station with `Source::Registered`) and
+`Device::activate`, retried as `pci.rs::schedule_owner` (120 x 500 ms) while
+the firmware image or signed records are not registered. The backend stays
+unclaimed in the attach task until an attempt's image is available.
+`rtw_usb_phy_cfg` is a no-op for 8821C (empty `usb2/usb3_param_8821c`) and
+`rtw_usb_switch_mode` does not apply to it. The unbind hook withdraws the
+shell and spawns `Lifecycle::remove`. An unprovisioned RTL8821CU (no signed
+`rtw8821cu-*` N21Q record) stops at `PhyTablesPrepared` and is never
+admitted: no station, band or TX grant is published. Written, unexecuted:
+`smoke_rtw88_usb_driver_id_table_and_endpoint_contexts`.
+Former blockers, verified against the tree:
 
 1. Register contract (resolved: asynchronous `Io`). `firmware_transport::Io`
    `read8/16/32` and `write8/16/32` return `impl Future + Send` (RPITIT, not
@@ -3437,7 +3461,7 @@ grant is published. Remaining blockers, verified against the tree:
    `Factory8821c::on_usb` (MAC at 0x107). Each poll is an EP0 transfer, so
    nothing spins; the PCI `EfuseIo` path is unchanged. Written, unexecuted:
    `smoke_rtw88_usb_efuse_factory_async`.
-   Remaining: USB retune/width/power tracking (below), then registration.
+   Remaining: USB power tracking and TX A-MPDU (above).
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,

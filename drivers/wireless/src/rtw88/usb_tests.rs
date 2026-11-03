@@ -396,3 +396,58 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_interface_cfg_and_rx_agg
 );
+
+/// `rtw8821cu.c::rtw_8821cu_id_table` registration: every Linux entry with
+/// the vendor interface triple, 0bda:c811 no longer in the rtl8xxxu table,
+/// and the xHCI contexts are the bulk-IN plus every bulk-OUT pipe.
+fn smoke_rtw88_usb_driver_id_table_and_endpoint_contexts() -> TestResult {
+    use narf_drivers_usb::xhci::EndpointKind;
+    let table = &super::usb_driver::RTW8821CU_USB_IDS;
+    if table.len() != usb::RTL8821CU_IDS.len()
+        || table.iter().zip(usb::RTL8821CU_IDS).any(|(m, &(v, p))| {
+            m.vendor_id != v
+                || m.product_id != p
+                || m.class != Some(0xff)
+                || m.subclass != Some(0xff)
+                || m.protocol != Some(0xff)
+        })
+    {
+        return TestResult::Fail("rtw8821cu id table differs from rtw_8821cu_id_table");
+    }
+    if crate::rtl8xxxu::RTL8XXXU_USB_IDS
+        .iter()
+        .any(|m| usb::is_rtl8821cu(m.vendor_id, m.product_id))
+    {
+        return TestResult::Fail("rtl8xxxu still claims an rtw8821cu id");
+    }
+    let plan = match Endpoints::parse(&config(&[
+        (0x84, 2, 512),
+        (0x87, 3, 64),
+        (0x05, 2, 512),
+        (0x06, 2, 512),
+        (0x08, 2, 512),
+    ])) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("three-pipe interface refused"),
+    };
+    let contexts = super::usb_driver::endpoint_configs(&plan);
+    let expected = [
+        (0x84u8, EndpointKind::BulkIn),
+        (0x05, EndpointKind::BulkOut),
+        (0x06, EndpointKind::BulkOut),
+        (0x08, EndpointKind::BulkOut),
+    ];
+    if contexts.len() != expected.len()
+        || contexts
+            .iter()
+            .zip(expected)
+            .any(|(c, (addr, kind))| c.ep_addr != addr || c.kind != kind || c.max_packet != 512)
+    {
+        return TestResult::Fail("endpoint contexts differ from the rtw88 pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_driver_id_table_and_endpoint_contexts
+);
