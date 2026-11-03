@@ -2004,9 +2004,34 @@ verbatim over the five templates), `smoke_ath9k_ar9300_prepare_channel_registers
 half/quarter rate, PAPRD, TPC, `ath9k_hw_set_clockrate`'s fast-clock
 `AR_USEC` (MAC owner).
 
-Still to port before `ar9300_enablement` can be claimed: the EDMA TX
-status ring and RX FIFOs (`ar9003_mac.c`), `ar9003_calib.c`, signed AR9300
-records and the probe/station/retune/reset/periodic/suspend owner.
+AR9003 EDMA formats (step 3). `ar9003/edma.rs` is the descriptor and
+queue-register layer of `ar9003_mac.c`, separate from the AR9002
+`descriptor` path: `tx_control` is `ar9003_set_txdesc` for an AR9300
+(`desc_len` 0x17, `AR_DescId` 0x168c, TX/CtrlStat, QCU, four buffer
+pointers/lengths, the `ctl10` pointer checksum; first/last rate series
+tries/rates/durations/RTS-CTS qualifiers/2040/GI/STBC/chain select,
+`AR_Not_Sounding`, per-series TX power; non-first buffers carry only
+`AR_TxMore`), restricted to clear keys and `AGGR_BUF_NONE`; `set_link` is
+`ar9003_hw_set_desc_link`. `StatusRing` is `ath9k_hw_setup_statusring`
+(`AR_Q_STATUS_RING_START`/`END` = start + size × 36),
+`ath9k_hw_reset_txstatus_ring` and `ar9003_hw_proc_txdesc` (pending while
+`AR_TxDone` is clear; otherwise the tail advances and the entry is
+cleared, a foreign `AR_DescId`/`AR_TxRxDesc` is an error, and the decoded
+rate index, sequence, TID, QCU, descriptor id, timestamp, error/underrun
+flags, BA bitmap, retry counts and RSSI are returned). `set_rx_bufsize`,
+`add_rx_buffer` (`AR_HP_RXDP`/`AR_LP_RXDP`, queue depths 16/128) and
+`process_rx` (`ath9k_hw_process_rxdesc_edma` over the 48-byte
+`ar9003_rxs`, including the OFDM-restart-on-non-last-subframe rule) cover
+the receive FIFOs. Smokes (written, not executed):
+`smoke_ath9k_ar9300_edma_tx_control_and_status_ring`,
+`smoke_ath9k_ar9300_edma_rx_status`. Not yet present: the DMA buffer
+owner that allocates the rings and feeds the FIFOs, EDMA interrupt
+status (`ar9003_hw_get_isr`, `AR_ISR_S*`) and the AR9300 `AR_CR_RXE`
+receive enable.
+
+Still to port before `ar9300_enablement` can be claimed: the EDMA DMA
+owner and interrupt path, `ar9003_calib.c`, signed AR9300 records and the
+probe/station/retune/reset/periodic/suspend owner.
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
