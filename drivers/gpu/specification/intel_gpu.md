@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.45** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.46** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -36,8 +36,9 @@
 > transactions with live repartitioning and SAGV, and MTL external
 > DP/HDMI outputs with Type-C ownership, owned hotplug, DC_off join,
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
-> KMS ownership and pipe DMC, and the default-off MTL media GuC pass
-> release native model gates — see §20).
+> KMS ownership and pipe DMC, and the default-off MTL media GuC with
+> VCS/VECS scheduling and native Xe gt_id 1 pass release native model
+> gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3601,8 +3602,25 @@ New fixtures register under `intel_gpu_media_gt`:
   counterpart.
 
 The MediaGuc owner fixture was updated: a booted media GuC now takes its engine
-wakes instead of enabling an idle CT. These fixtures were registered but not
-run in this checkpoint, and they are not physical Intel evidence.
+wakes instead of enabling an idle CT. These are native models, not physical
+Intel evidence.
+
+Integration of the media engines unit: all eight release groups pass 2,077
+unique tests with no failures and no Intel skips; the only skip is the existing
+shared RNG-registration skip. Integration fixed
+`smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable`. It never
+configured GT0's cache policy, so its arena allocations stayed unmapped and
+never flushed; it now seeds the policy as the registered-TLB fixture does.
+Once media submission is on, the arena stops writing the media
+GUC_TLB_INV_CR. The media scheduler's TLB_INVALIDATION (0x7000) around context
+registration and deregistration then covers GT1, as GT0's scheduler does for
+GT0. Linux `xe_ggtt_invalidate` instead sends one CT invalidation per GGTT
+update on each GT, so this is a deliberate NARF policy. Media 13.00 uses AUX
+invalidation (MTL has no flat CCS) at the GSI-adjusted VD0/VE0_AUX_INV
+(0x384218/0x384238), as `emit_aux_table_inv` adds the media `adj_offset`.
+With `narf.intel.media_gt=1` absent, GT0 interrupt routing, scheduling, the
+arena and the UAPI are unchanged. The debug group pass is deferred to the end
+of the current integration wave.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 

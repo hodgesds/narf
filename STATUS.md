@@ -2069,6 +2069,23 @@ btrfs postflights also pass. The debug group pass is deferred to the end of
 this integration wave. Media engines, their interrupts and the gt_id 1 UAPI land
 in the next units. None of this has run on physical Intel hardware.
 
+### MTL/Arrow media engines and native Xe gt_id 1 — release gates recorded
+
+With `narf.intel.media_gt=1`, the media GuC now schedules GT1's video decode
+and video enhance engines. Their interrupts route onto GT0's tiled MSI, and
+native Xe publishes the media GT as gt_id 1: the GT list, the engine query and
+exec queues on VCS/VECS. Unknown GT ids and bad placements are refused in Linux's
+order. Video jobs use the media GT's AUX invalidation registers, and scheduling
+is refused while GSC firmware reports loaded. Without the option, GT0 interrupts,
+scheduling, the GGTT arena and the UAPI are unchanged.
+
+Integration fixed one fixture that never configured GT0's cache policy, so its
+GGTT invalidation checks could not fire. All eight release groups pass 2,077
+unique tests, with no failures and only the existing shared RNG-registration
+skip. The release production boot and both btrfs postflights also pass. The
+debug group pass is deferred to the end of this integration wave. None of this
+has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
