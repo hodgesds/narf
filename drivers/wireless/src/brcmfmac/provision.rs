@@ -15,6 +15,8 @@ const MAX_RECORDS: usize = 16;
 pub enum Family {
     Pcie43602,
     Sdio43439,
+    /// NBSP family 3: another `chip_profile` PCIe chip (CR4 or CA7).
+    PcieFullmac,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -332,7 +334,7 @@ fn string(bytes: &[u8], key: bool) -> Result<String, Error> {
 fn executable_shape(family: Family, length: usize) -> Result<(), Error> {
     if length == 0
         || match family {
-            Family::Pcie43602 => length < 4,
+            Family::Pcie43602 | Family::PcieFullmac => length < 4,
             Family::Sdio43439 => length > crate::cyw43439::firmware::MAX_IMAGE_SIZE,
         }
     {
@@ -360,6 +362,26 @@ fn parse_asset(bytes: &[u8], role: u8) -> Result<Asset, Error> {
         sha256: bytes[8..40].try_into().unwrap(),
     })
 }
+/// Family 3 admission from the Linux tables: a covered chip, a PCI identity
+/// `brcmf_pcie_devid_table` binds with an implemented vendor (WCC/BCA, no
+/// random seed), and one `brcmf_pcie_fwnames` row for every revision in the
+/// record's mask. Returns that row's firmware base name.
+fn fullmac_firmware(
+    chip: u16,
+    revisions: u16,
+    host: &narf_bus::DeviceId,
+) -> Result<&'static str, Error> {
+    let mut base = None;
+    for revision in (0..16u8).filter(|r| revisions & (1 << r) != 0) {
+        let (profile, _) =
+            super::chip_profile::admit(chip, revision, host).ok_or(Error::Invalid)?;
+        if base.is_some_and(|b| b != profile.firmware.base) {
+            return Err(Error::Invalid);
+        }
+        base = Some(profile.firmware.base);
+    }
+    base.ok_or(Error::Invalid)
+}
 fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
     if bytes.len() < HEADER
         || &bytes[..4] != b"NBSP"
@@ -382,6 +404,8 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
         let (family, chip) = match raw[0] {
             1 => (Family::Pcie43602, 43602),
             2 => (Family::Sdio43439, 43439),
+            // BCM43602 keeps its own family; others name the actual chip.
+            3 if half(raw, 2) != 43602 => (Family::PcieFullmac, half(raw, 2)),
             _ => return Err(Error::Invalid),
         };
         if half(raw, 2) != chip || half(raw, 4) == 0 || raw[7] != 0 || raw[96..112] != [0; 16] {
@@ -423,6 +447,14 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
         {
             return Err(Error::Invalid);
         }
+        let firmware = if family == Family::PcieFullmac {
+            Some(fullmac_firmware(chip, half(raw, 4), &host.id)?)
+        } else {
+            None
+        };
+        if family == Family::PcieFullmac && (raw[1] != 0 || raw[28..32] != [0; 4]) {
+            return Err(Error::Invalid);
+        }
         if family == Family::Sdio43439
             && (raw[1] != 1
                 || !matches!(
@@ -443,6 +475,13 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
         assets.push(parse_asset(&raw[112..112 + ASSET], 1)?);
         executable_shape(family, assets[0].length)?;
         assets.push(parse_asset(&raw[112 + ASSET..112 + 2 * ASSET], 2)?);
+        if let Some(base) = firmware {
+            if !super::chip_profile::linux_asset_name(base, &assets[0].key, "bin")
+                || !super::chip_profile::linux_asset_name(base, &assets[1].key, "txt")
+            {
+                return Err(Error::Invalid);
+            }
+        }
         if family == Family::Sdio43439 {
             assets.push(parse_asset(&raw[112 + 2 * ASSET..], 3)?);
         } else if raw[112 + 2 * ASSET..].iter().any(|byte| *byte != 0) {

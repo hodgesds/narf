@@ -21,7 +21,7 @@ static EVENTS: IrqSafeSpinLock<VecDeque<Vec<u8>>> = IrqSafeSpinLock::new(VecDequ
 /// This kernel-only entry does not grant firmware access or override chip
 /// discovery. Multi-device NVRAM and newer Apple OTP selection remain gated.
 pub fn register_board_profile(profile: BoardProfile) -> bool {
-    if profile.chip != 43602
+    if super::chip_profile::covered(profile.chip).is_none()
         || profile.revision_mask == 0
         || profile.pci.vendor != 0x14e4
         || !super::pcie::ALL_DEV_IDS.contains(&profile.pci.device)
@@ -124,7 +124,7 @@ where
 pub(super) fn start(device: &mut BrcmfmacDevice) {
     // BAR mapping and immutable discovery need no board calibration guess.
     // Registry payloads arrive in Stage::Late, after synchronous PCI matching.
-    if device.chip.id != 43602
+    if super::chip_profile::covered(device.chip.id).is_none()
         || device
             .backplane
             .as_ref()
@@ -309,7 +309,11 @@ impl Reprovision {
                 super::provision::select_using(
                     authority,
                     &self.manifest,
-                    super::provision::Family::Pcie43602,
+                    if self.chip == super::chip_profile::BRCM_CC_43602 {
+                        super::provision::Family::Pcie43602
+                    } else {
+                        super::provision::Family::PcieFullmac
+                    },
                     host,
                     None,
                 )

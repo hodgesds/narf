@@ -420,10 +420,14 @@ pub unsafe fn bring_up(
     if bar0.len < 4096 {
         return Err(ProbeError::Bar0TooSmall);
     }
+    // BCM43602 ids as before; other ids only where Linux binds them with a
+    // vendor path the chip profiles implement (no seed, not CYW).
     let bar2 = if matches!(
         device.id.device,
         BRCM_PCIE_43602_DEVICE_ID | BRCM_PCIE_43602_2G_DEVICE_ID | BRCM_PCIE_43602_5G_DEVICE_ID
-    ) {
+    ) || super::chip_profile::pci_match(&device.id)
+        .is_some_and(super::chip_profile::implemented)
+    {
         // BAR2 is both dongle RAM and firmware control metadata; Device mapping
         // preserves the required index/descriptor publication ordering.
         // SAFETY: caller owns this function's BARs/config exclusively and

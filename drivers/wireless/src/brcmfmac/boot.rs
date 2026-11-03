@@ -40,6 +40,15 @@ pub struct BoardProfile {
 impl BoardProfile {
     fn admits(self, chip: &Chip, pci: PciIdentity) -> bool {
         chip_profile::profile(self.chip, chip.revision).is_some()
+            // A trusted registration carries no PCI class; the Linux id row
+            // must still bind with an implemented vendor path.
+            && (self.chip == chip_profile::BRCM_CC_43602
+                || chip_profile::pci_row(
+                    pci.vendor,
+                    pci.device,
+                    (pci.subsystem_vendor, pci.subsystem_device),
+                )
+                .is_some_and(chip_profile::implemented))
             && chip.id == self.chip
             && chip.revision < 16
             && self.revision_mask & (1 << chip.revision) != 0
@@ -127,7 +136,16 @@ impl<B: Bus> Cr4<B> {
     ) -> Result<Self, Refused<B>> {
         let expected = selection.host().id;
         Self::claim_checked(bus, |chip| {
-            selection.family() == super::provision::Family::Pcie43602
+            // Family 3 additionally needs the Linux PCI/vendor admission of
+            // the actual discovered chip and revision.
+            let family = match selection.family() {
+                super::provision::Family::Pcie43602 => true,
+                super::provision::Family::PcieFullmac => {
+                    chip_profile::admit(chip.id, chip.revision, &expected).is_some()
+                }
+                super::provision::Family::Sdio43439 => false,
+            };
+            family
                 && expected.vendor == pci.vendor
                 && expected.device == pci.device
                 && expected.subsystem_vendor == pci.subsystem_vendor

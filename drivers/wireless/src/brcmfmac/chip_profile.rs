@@ -199,15 +199,24 @@ pub const PCI_DEVICES: &[PciMatch] = &[
 
 /// `pci_match_id(brcmf_pcie_devid_table, pdev)` for a full PCI identity.
 pub fn pci_match(id: &narf_bus::DeviceId) -> Option<PciMatch> {
-    if id.vendor != 0x14e4 || id.class & 0xffff00 != 0x028000 {
+    if id.class & 0xffff00 != 0x028000 {
         return None;
     }
-    PCI_DEVICES.iter().copied().find(|row| {
-        row.device == id.device
-            && row
-                .subsystem
-                .is_none_or(|s| s == (id.subsystem_vendor, id.subsystem_id))
-    })
+    pci_row(id.vendor, id.device, (id.subsystem_vendor, id.subsystem_id))
+}
+/// The first table row for vendor/device/subsystem, without the class.
+pub fn pci_row(vendor: u16, device: u16, subsystem: (u16, u16)) -> Option<PciMatch> {
+    if vendor != 0x14e4 {
+        return None;
+    }
+    PCI_DEVICES
+        .iter()
+        .copied()
+        .find(|row| row.device == device && row.subsystem.is_none_or(|s| s == subsystem))
+}
+/// A PCI row whose vendor path NARF implements: WCC/BCA without the seed.
+pub fn implemented(row: PciMatch) -> bool {
+    !row.seed && row.vendor != FwVendor::Cyw
 }
 
 /// `pcie.c::brcmf_pcie_read_otp` reads OTP (Apple board/module selection)
@@ -280,7 +289,7 @@ pub fn profile(chip: u16, chiprev: u8) -> Option<Profile> {
 /// whose path NARF implements (WCC/BCA, no random seed).
 pub fn admit(chip: u16, chiprev: u8, pci: &narf_bus::DeviceId) -> Option<(Profile, FwVendor)> {
     let matched = pci_match(pci)?;
-    if matched.seed || matched.vendor == FwVendor::Cyw {
+    if !implemented(matched) {
         return None;
     }
     Some((profile(chip, chiprev)?, matched.vendor))
