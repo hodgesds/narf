@@ -1165,6 +1165,9 @@ pub(crate) fn start_pending() {
         // its display wakeref from here on: a lit panel keeps the function
         // active even once autosuspend is armed.
         if profile == Ok(display_rpm::Profile::Display) {
+            // The owned panel mode is a lit Pipe A whether or not KMS
+            // install reported it (the report is idempotent).
+            display_rpm::pipe_lit(p.bar.phys.raw(), 0);
             display_rpm::bind(p.bar.phys.raw(), pm.device.clone());
         }
         let runtime_power = crate::intel_gpu_power_controls::runtime::Control::register(
