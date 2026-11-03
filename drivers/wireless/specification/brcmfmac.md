@@ -1198,6 +1198,19 @@ through `ApControlAuthority` with the Program entirely on ifidx 1 (no
 `BRCMF_C_DOWN`/`apsta`, no `nmode`/`vhtmode`/`qtxpower`, `bsscfg:wsec`,
 `event_msgs` still containing the STA events), a peer association
 reaching the shell's NEW_STATION, and STOP leaving the primary joined.
+The SDIO/BCDC AP device model (`sdio_ap_model.rs`,
+`sdio_ap_firmware.rs`) accepts `BCDC_DCMD_IF_SHIFT` ifidx 0/1 and BDC
+`flags2` ifidx 0/1, records each IOCTL's ifidx, and routes ifidx 1 to the
+same per-interface model. `smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one`
+(`ap_native_sdio_tests.rs`, written/unexecuted) runs the secondary AP
+through the actual SDHCI/F2/SDPCM/BCDC stack beside an idle primary
+station with `cap` = `ap sta wme mchan`: Program entirely on ifidx 1 in
+the combo0 form, a bsscfg-1 peer reaching NEW_STATION, STOP retiring only
+that BSS. Still unwritten: a secondary STA join on the SDIO stack, a
+joined primary STA + secondary AP on SDIO (the SDIO firmware adapter's
+primary AP profile intercepts STA security iovars), and unread
+completion-ring entries attributed to an ifidx (they still gate every
+ifidx's Program).
 
 #### Secondary AP role
 

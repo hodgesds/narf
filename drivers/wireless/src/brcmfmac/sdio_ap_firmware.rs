@@ -13,8 +13,10 @@ impl Firmware {
     pub(crate) fn capability(&mut self, bytes: &[u8]) {
         self.1 = bytes.to_vec();
     }
+    /// One BCDC IOCTL; `ifidx` is its `BCDC_DCMD_IF_SHIFT` field.
     pub(crate) fn command(
         &mut self,
+        ifidx: u8,
         id: u32,
         input: &[u8],
         maximum: u16,
@@ -26,8 +28,8 @@ impl Firmware {
             response[..length].copy_from_slice(&caps[..length]);
             return Some((response, 0));
         }
-        let response = self.0.command(id, input, maximum);
-        if id == 26 && self.0.ap.as_ref().is_some_and(|profile| profile.formed) {
+        let response = self.0.command_on(ifidx, id, input, maximum);
+        if ifidx == 0 && id == 26 && self.0.ap.as_ref().is_some_and(|profile| profile.formed) {
             let profile = self.0.ap.as_mut().unwrap();
             profile.event(16, super::OWN, &[]);
             profile.events.back_mut().unwrap()[26..28].copy_from_slice(&1u16.to_be_bytes());
@@ -43,10 +45,33 @@ impl Firmware {
         let ap = self.0.ap.as_mut().unwrap();
         events.extend(ap.events.drain(..));
         data.extend(ap.downlink.drain(..));
+        // The secondary AP's SME events come from ifidx/bsscfg 1.
+        if let Some(vif) = self.0.vif.ap.as_mut() {
+            for mut event in vif.events.drain(..) {
+                event[70] = 1;
+                event[71] = 1;
+                events.push(event);
+            }
+        }
         (events, data)
     }
-    pub(crate) fn transmit(&mut self, bytes: &[u8]) {
-        self.0.ap.as_mut().unwrap().transmit(bytes);
+    /// One BDC data frame; `ifidx` is its `flags2` interface.
+    pub(crate) fn transmit(&mut self, ifidx: u8, bytes: &[u8]) {
+        if ifidx == 0 {
+            self.0.ap.as_mut().unwrap().transmit(bytes);
+        } else if let Some(vif) = self.0.vif.ap.as_mut() {
+            vif.transmit(bytes);
+        }
+    }
+    /// Create ifidx 1 as a firmware-SME AP (as the PCIe model's
+    /// `Handle::enable_vif_ap`).
+    pub(crate) fn enable_vif_ap(&mut self) {
+        let mut ap = ap_model::Profile::default();
+        ap.own = super::VIF;
+        self.0.vif.ap = Some(ap);
+    }
+    pub(crate) fn vif_profile(&mut self) -> &mut ap_model::Profile {
+        self.0.vif.ap.as_mut().unwrap()
     }
     pub(crate) fn profile(&mut self) -> &mut ap_model::Profile {
         self.0.ap.as_mut().unwrap()

@@ -26,6 +26,8 @@ struct State {
     credit: u8,
     drops: usize,
     commands: Vec<(u32, Vec<u8>)>,
+    /// BCDC ifidx of each entry of `commands`.
+    command_ifidx: Vec<u8>,
     packets: usize,
     revoke_after_chunk: Option<Arc<crate::brcmfmac::provision::Proof>>,
     revoke_before_command: Option<Arc<crate::brcmfmac::provision::Proof>>,
@@ -69,12 +71,18 @@ impl State {
                 let id = word(packet, 12);
                 let maximum = word(packet, 16);
                 let flags = word(packet, 20);
-                if flags & 0xf000 != 0 || maximum > 8192 {
+                // BCDC_DCMD_IF_SHIFT: ifidx 0 or the modeled secondary 1.
+                let ifidx = (flags >> 12) & 0xf;
+                if ifidx > 1 || maximum > 8192 {
                     return Err(SdioError::HostError);
                 }
                 let input = &packet[28..];
                 self.commands.push((id, input.to_vec()));
-                if let Some((response, status)) = self.firmware.command(id, input, maximum as u16) {
+                self.command_ifidx.push(ifidx as u8);
+                if let Some((response, status)) =
+                    self.firmware
+                        .command(ifidx as u8, id, input, maximum as u16)
+                {
                     if response.len() > maximum as usize {
                         return Err(SdioError::HostError);
                     }
@@ -88,10 +96,11 @@ impl State {
                 }
             }
             2 => {
-                if packet.len() < 30 || packet[12] != 0x20 || packet[14..16] != [0, 0] {
+                // BDC flags2 carries the interface (0 or 1).
+                if packet.len() < 30 || packet[12] != 0x20 || packet[14] > 1 || packet[15] != 0 {
                     return Err(SdioError::HostError);
                 }
-                self.firmware.transmit(&packet[16..]);
+                self.firmware.transmit(packet[14], &packet[16..]);
                 self.packets += 1;
                 self.packet(0, &[]); // real flow-control credit, never air ACK.
             }
@@ -115,6 +124,21 @@ impl Handle {
     }
     pub(super) fn commands(&self) -> Vec<(u32, Vec<u8>)> {
         self.0.lock().commands.clone()
+    }
+    /// BCDC ifidx of each IOCTL, parallel to [`Self::commands`].
+    pub(super) fn command_ifidx(&self) -> Vec<u8> {
+        self.0.lock().command_ifidx.clone()
+    }
+    /// Create ifidx 1 as a firmware-SME AP.
+    pub(super) fn enable_vif_ap(&self) {
+        self.0.lock().firmware.enable_vif_ap();
+    }
+    /// Apply `action` to the secondary AP model.
+    pub(super) fn vif_change<T>(&self, action: impl FnOnce(&mut Profile) -> T) -> T {
+        let mut state = self.0.lock();
+        let result = action(state.firmware.vif_profile());
+        state.outputs();
+        result
     }
     pub(super) fn physical_packets(&self) -> Vec<Vec<u8>> {
         self.0.lock().physical_packets.clone()
@@ -158,6 +182,7 @@ impl Device {
             credit: 16,
             drops: 0,
             commands: Vec::new(),
+            command_ifidx: Vec::new(),
             packets: 0,
             revoke_after_chunk: None,
             revoke_before_command: None,

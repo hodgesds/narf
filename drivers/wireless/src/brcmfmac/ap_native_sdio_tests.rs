@@ -829,3 +829,117 @@ kernel_test_in!(
     "drivers/wireless/cyw43439/ap",
     smoke_cyw_ap_ordinary_native_rx_final_ring_and_stack_boundaries
 );
+
+/// Secondary firmware-SME AP on the actual SDIO/BCDC CYW43439 stack beside
+/// the primary station (Linux 7.3-rc4 combo0: `brcmf_apsta_add_vif` on
+/// ifidx 1, then `brcmf_cfg80211_start_ap` on that vif). Every Program
+/// IOCTL carries `BCDC_DCMD_IF_SHIFT` ifidx 1; with `mchan` there is no
+/// `BRCMF_C_DOWN`/`apsta 0`, no `nmode`/`vhtmode`/`qtxpower`, and the
+/// security iovars are `bsscfg:` + le32 1. A peer association on bsscfg 1
+/// reaches the AP shell's NEW_STATION, and STOP retires only that BSS.
+fn secondary_ap() -> Result<(), &'static str> {
+    const NAME: &str = "wlsvap7";
+    let b = SdioBound::new_capability(b"ap sta wme mchan\0", false)?;
+    b.bus.enable_vif_ap();
+    let owner = {
+        let mut state = b.device.state.try_lock().ok_or("state")?;
+        let mac = state.station.mac;
+        ready(vif::discover(&mut state.station.runtime, mac))?
+            .map_err(|_| "SDIO cap discovery")?
+            .ok_or("SDIO firmware cap refused")?
+    };
+    if !owner.features().mchan {
+        return Err("SDIO cap tokens not parsed as brcmf_feat_attach");
+    }
+    b.device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    vif::register_primary(&b.device);
+    let result = (|| {
+        let vap = b
+            .device
+            .vif_new(NAME, 3, None)
+            .map_err(|_| "SDIO secondary AP shell admission")?;
+        ready(b.device.vif_worker())?;
+        if vap.ap_sme_capabilities() != Some(0) {
+            return Err("SDIO secondary AP shell not attached after IF ADD");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("SDIO secondary netdev handle")?;
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "SDIO secondary admin authority")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = vap.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            admin,
+            &iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "SDIO AP authority bind")?
+        .reserve()
+        .map_err(|_| "SDIO AP control reservation")?;
+        let vif_mac = crate::brcmfmac::runtime_tests::station_model::VIF;
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[vif_mac, vif_mac].concat());
+        let before = b.bus.commands().len();
+        ready(vap.start_ap_with_settings_async(&authority, ap_config, settings))?
+            .map_err(|_| "SDIO secondary AP START")?;
+        let commands = b.bus.commands();
+        let ifidx = b.bus.command_ifidx();
+        let program: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+        let mut wsec = b"bsscfg:wsec\0".to_vec();
+        wsec.extend_from_slice(&1u32.to_le_bytes());
+        if program.is_empty()
+            || program.iter().any(|(_, index)| **index != 1)
+            || program.iter().any(|((command, body), _)| {
+                *command == 3
+                    || *command == 263
+                        && (body.starts_with(b"apsta\0")
+                            || body.starts_with(b"nmode\0")
+                            || body.starts_with(b"vhtmode\0")
+                            || body.starts_with(b"qtxpower\0")
+                            || body.starts_with(b"wsec\0"))
+            })
+            || !program.iter().any(|((_, body), _)| body.starts_with(&wsec))
+        {
+            return Err("SDIO secondary AP Program not the combo0 bsscfg-1 form");
+        }
+        if !b.bus.vif_change(|p| p.active && p.up && p.formed)
+            || b.bus.change(|p| p.active)
+            || !vap.link_up()
+        {
+            return Err("SDIO secondary AP not running on its own interface");
+        }
+        b.bus
+            .vif_change(|p| p.associate(CLIENT, association(false)));
+        for _ in 0..4 {
+            ready(b.device.vif_worker())?;
+        }
+        if source.count(19) != 1 {
+            return Err("SDIO secondary AP NEW_STATION not observed on its shell");
+        }
+        ready(vap.stop_ap_async(&authority))?.map_err(|_| "SDIO secondary AP STOP")?;
+        if b.bus.vif_change(|p| p.active || !p.peers.is_empty()) || vap.link_up() {
+            return Err("SDIO secondary AP stop kept its BSS");
+        }
+        Ok(())
+    })();
+    vif::withdraw_family(crate::cyw43439::fullmac::Family::Sdio);
+    result
+}
+fn smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one() -> TestResult {
+    match secondary_ap() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one
+);
