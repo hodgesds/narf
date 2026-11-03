@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Retained rtlwifi paged MMIO firmware owner; Linux rtlwifi/rtl8188ee/fw.c
-//! rtl8821ae/fw.c, rtl8192ee/fw.c and rtl8192c/fw_common.c. Profiles:
-//! RTL8188EE, RTL8821AE, RTL8192EE and RTL8192CE/8188CE (normal images).
+//! rtl8821ae/fw.c, rtl8192ee/fw.c, rtl8192c/fw_common.c and
+//! rtl8723com/fw_common.c. Profiles: RTL8188EE, RTL8821AE, RTL8192EE,
+//! RTL8192CE/8188CE (normal images) and RTL8723BE.
 //! PCI bus mastering remains parked. This does not install native packet rings.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -81,6 +82,10 @@ pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
     if super::rtl8192ce::is_8192ce(did) {
         // IS_FW_HEADER_EXIST (0x92c0 / 0x88c0), exact length, max_fw_size.
         return super::rtl8192ce::fw::parse(bytes);
+    }
+    if did == super::regs::RTL_DEV_8723BE {
+        // rtl8723be is_fw_header (0x5300), exact length, max_fw_size.
+        return super::rtl8723be::fw::parse(bytes);
     }
     if did != super::regs::RTL_DEV_8188EE {
         return Err(Error::Unsupported);
@@ -357,6 +362,18 @@ impl<I: Io> Owner<I> {
             let name = self.rtl8192ce_version()?.firmware();
             return self.initialize_registered_from(&authority, name).await;
         }
+        if self.did == super::regs::RTL_DEV_8723BE {
+            // rtl8723be/sw.c fw_name, then rtl_fw_do_work's alt_fw_name
+            // retry only when the primary image is absent.
+            let mut result = Err(Error::Firmware(FirmwareError::NotFound));
+            for name in super::rtl8723be::version::Version::firmware_names() {
+                result = self.initialize_registered_from(&authority, name).await;
+                if result != Err(Error::Firmware(FirmwareError::NotFound)) {
+                    break;
+                }
+            }
+            return result;
+        }
         self.initialize_registered_from(&authority, super::fw::FW_8188EE)
             .await
     }
@@ -399,6 +416,11 @@ impl<I: Io> Owner<I> {
                         super::rtl8821ae::fw::FW_NORMAL | super::rtl8821ae::fw::FW_NORMAL_ALT
                     )
                     | (super::regs::RTL_DEV_8192EE, super::rtl8192ee::fw::FW_NORMAL)
+                    | (
+                        super::regs::RTL_DEV_8723BE,
+                        super::rtl8723be::version::FW_NORMAL
+                            | super::rtl8723be::version::FW_NORMAL_ALT
+                    )
             )
         {
             return Err(Error::Unsupported);
@@ -455,6 +477,9 @@ impl<I: Io> Owner<I> {
         }
         if super::rtl8192ce::is_8192ce(self.did) {
             return self.run_8192ce(info, payload).await;
+        }
+        if self.did == super::regs::RTL_DEV_8723BE {
+            return self.run_8723be(info, payload).await;
         }
         narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
@@ -615,6 +640,48 @@ impl<I: Io> Owner<I> {
             super::rtl8192ce::fw::stop_running(&self.io).await?;
             self.set(Stage::Downloading, None);
             super::rtl8192ce::fw::download(&self.io, payload).await?;
+            Ok(info)
+        })
+        .await
+        .unwrap_or(Err(Error::Deadline))
+    }
+    /// `_rtl8723be_read_chip_version` over this owner's registers.
+    pub(super) fn rtl8723be_version(&self) -> Result<super::rtl8723be::version::Version, Error> {
+        use super::rtl8723be::version::{Version, REG_SYS_CFG, REG_SYS_CFG1};
+        let sys_cfg1 = self.io.read32(REG_SYS_CFG1)?;
+        let sys_cfg = self.io.read32(REG_SYS_CFG)?;
+        if sys_cfg1 == u32::MAX || sys_cfg == u32::MAX {
+            return Err(Error::Gone);
+        }
+        Version::from_registers(sys_cfg1, sys_cfg).map_err(|_| Error::Unsupported)
+    }
+    /// `rtl8723be_hw_init` firmware step with packet engines still closed.
+    /// The chip version is measured first (a part without `CHIP_8723B` is
+    /// refused before any write). Probe has already run the
+    /// `_rtl8723be_init_mac` power prefix and `RTL8723_NIC_ENABLE_FLOW`; the
+    /// `_rtl8723be_init_mac` remainder (`REG_CR = 0x2ff`, LLT, ring bases)
+    /// belongs to the retained ring owner, so the CR DMA/MAC gates are
+    /// cleared as for the other profiles. Then, in Linux order,
+    /// `REG_SYS_CFG &= 0x7f` and `rtl8723_download_fw`, which itself stops a
+    /// still-running RAM image (probe does not power the adapter off).
+    async fn run_8723be(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
+        // 5999 undelayed checksum reads plus 6001 x 5 ms WINTINI polls
+        // (FW_8723B_POLLING_TIMEOUT_COUNT) bound the Linux wait at ~30 s.
+        narf_time::timeout(narf_time::Deadline::after_ms(31_000), async {
+            self.set(Stage::Preparing, None);
+            if self.io.read32(MCU)? == u32::MAX {
+                return Err(Error::Gone);
+            }
+            self.rtl8723be_version()?;
+            let control = self.read8(0x100).await?;
+            self.io.write8(0x100, control & !0xcf)?;
+            if self.read8(0x100).await? & 0xcf != 0 {
+                return Err(Error::Gate);
+            }
+            let sys_cfg = self.read8(0xf0).await?;
+            self.io.write8(0xf0, sys_cfg & 0x7f)?;
+            self.set(Stage::Downloading, None);
+            super::rtl8723be::fw::download(&self.io, payload).await?;
             Ok(info)
         })
         .await

@@ -2971,6 +2971,58 @@ Tests (written, unexecuted): `smoke_rtl8192ce_chip_version_rf_type_and_firmware_
 `smoke_rtl8192ce_linked_ring_profile`,
 `smoke_rtl8192ce_tables_verbatim_geometry`.
 
+### RTL8723BE retained runtime (in progress, not admitted)
+
+`rtl8723be/` holds the Linux `rtl8723be` + `rtl8723com` pieces the native
+RTL8723BE (`0xb723`, 1T1R 2.4 GHz + BT combo) owner is built from. Probe
+keeps the chip diagnostic until admission lands.
+
+- `version` — `_rtl8723be_read_chip_version`: `REG_SYS_CFG1` must carry
+  `CHIP_8723B` (Linux only logs and continues with `VERSION_UNKNOWN`, which
+  selects nothing meaningful; refused here), then `NORMAL_CHIP`, the
+  `REG_SYS_CFG[15:12]` cut and `CHIP_VENDOR_SMIC` when `EXT_VENDOR_ID == 1`.
+  Firmware: `rtl8723befw_36.bin`, then `rtl8723befw.bin` only when the
+  primary is absent (`rtl_fw_do_work` `alt_fw_name`).
+- `adapter` — `rtl8723be_read_eeprom_info` / `_rtl8723be_read_adapter_info`
+  over the 512-byte map: EEPROM boot, autoload failure or a map without
+  `0x8129` is unprovisioned (Linux skips the whole adapter read). MAC `0xd0`,
+  VID/DID/SVID/SMID, channel plan `0xb8`, version, customer id, crystal
+  `0xb9` (`0xff` ⇒ `0x20`), thermal `0xba` (`0xff` ⇒ `0x18`, ignore), the
+  `0xc1[2:0]` regulatory (`0xff` ⇒ 0), the OEM rule (its `0x8176`/`0x8178`
+  DID branches are carried as written) and
+  `rtl8723be_read_bt_coexist_info_from_hwpg`: `btcoexist =
+  REG_MULTI_FUNC_CTRL[18]`, `ant_num = 0xc3[0]` (`ANT_X2 = 0`, `ANT_X1 = 1`),
+  `single_ant_path = 0xc3[6]`; `board_type = ODM_BOARD_BT` for BT boards.
+  `rtlhal->package_type` comes from the physical EFUSE byte `0x1fb`
+  (`efuse::read_physical_byte`: `efuse_power_switch` + `efuse_one_byte_read`,
+  100-read poll; a timeout is value 0 ⇒ `PACKAGE_DEFAULT`).
+- `pwrseq` — PCI rows of every `rtl8723B_*_flow`, generated from
+  `pwrseq.h` (sha256 in the file header). Probe's power table for `0xb723`
+  is now the exact `rtl8723B_card_enable_flow` after the
+  `_rtl8723be_init_mac` prefix (`RSV_CTRL = 0`, `APS_FSMCO+1 &= ~BIT7`),
+  parsed with `PWR_CUT_ALL_MSK` as Linux does (so the test-chip-masked
+  `0x68[3]` row is issued). The former shared rows are kept, unchanged, as
+  `RTL8723AE_PWR_ON` for the diagnostic RTL8723AE.
+- `fw` — `is_fw_header` (`signature & 0xfff0 == 0x5300`), exact RAM-code
+  length (linux-firmware `0x7bf2` / `0x77fa`), whole file at most
+  `max_fw_size = 0x8000` (eight pages). `rtl8723_download_fw(hw, true,
+  6000)`: a running RAM image is reset (`rtl8723be_firmware_selfreset`:
+  `RSV_CTRL+1` BIT0 and `SYS_FUNC_EN+1` BIT2 low for 50 us) and
+  `MCUFWDL = 0`; enable, pages with `rtl_fill_dummy`, close;
+  `FWDL_CHKSUM_RPT` within the first 5999 undelayed reads, `MCUFWDL_RDY` /
+  `~WINTINI_RDY`, the 8723BE self-reset, then `WINTINI_RDY` over 6001 reads
+  x 5 ms. A failed `rtl8723_fw_free_to_go` is an error here (Linux returns
+  0). `firmware_transport::Owner` admits `0xb723` (`run_8723be`, 31 s
+  bound covering Linux's): identify the chip before any write, clear CR
+  DMA/MAC gates instead of `REG_CR = 0x2ff` (ring owner), `REG_SYS_CFG &=
+  0x7f`, download. Tests `smoke_rtl8723be_chip_version_and_firmware_names`,
+  `smoke_rtl8723be_adapter_facts_bt_antenna_and_defaults`,
+  `smoke_rtl8723be_firmware_header_geometry`,
+  `smoke_rtl8723be_firmware_paged_download`,
+  `smoke_rtl8723be_retained_firmware_owner_profile`,
+  `smoke_rtlwifi_8723be_enable_prefix_and_card_enable_flow` (written,
+  unexecuted).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE

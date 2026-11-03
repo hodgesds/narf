@@ -10,8 +10,32 @@
 //! - `rtlwifi/rtl8723be/reg.h`  — register offsets
 //! - `rtlwifi/rtl8723be/def.h`  — chip-version constants
 //! - `rtlwifi/rtl8723ae/reg.h`  — A-cut (device 0x8723), near-identical
+//!
+//! ## Retained runtime (`rtl8723be/`, in progress)
+//!
+//! Exact Linux `rtl8723be` + `rtl8723com` pieces the native RTL8723BE owner
+//! is built from. RTL8723BE is not admitted yet (probe keeps it diagnostic).
+//!
+//! - [`version`] — `_rtl8723be_read_chip_version` (`CHIP_8723B` required;
+//!   every cut, SMIC vendor bit) and the `rtl8723befw_36.bin` /
+//!   `rtl8723befw.bin` names.
+//! - [`adapter`] — `rtl8723be_read_eeprom_info` / `_rtl8723be_read_adapter_info`
+//!   factory facts, the BT-coexist / antenna-number / single-antenna-path
+//!   facts of `rtl8723be_read_bt_coexist_info_from_hwpg`, thermal meter,
+//!   regulatory, package type and the OEM rule.
+//! - [`pwrseq`] — PCI rows of every `rtl8723B_*_flow` (`pwrseq.{c,h}`).
+//! - [`fw`] — header validation and `rtl8723_download_fw` with the
+//!   8723BE 8051 self-reset.
 
 #![allow(dead_code)]
+
+pub mod adapter;
+pub mod fw;
+pub mod pwrseq;
+pub mod version;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
 
 /// PCI device ID for RTL8723BE (B-cut).
 pub const DEV_ID_BE: u16 = super::regs::RTL_DEV_8723BE;

@@ -42,7 +42,7 @@ use super::phy::{BB_BRINGUP_PREAMBLE, BB_RST_VALUE, RF_EN, RF_RSTB, RF_SDMRSTB};
 use super::power::{
     power_on_table_for, WlanPwrCfg, PWR_BASEADDR_MAC, PWR_CMD_END, PWR_CMD_POLLING, PWR_CMD_WRITE,
     PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK, RTL8188EE_PWR_ON, RTL8192CE_PWR_ON,
-    RTL8192EE_PWR_ON, RTL8723BE_PWR_ON, RTL8821AE_PWR_ON,
+    RTL8192EE_PWR_ON, RTL8723AE_PWR_ON, RTL8723BE_PWR_ON, RTL8821AE_PWR_ON,
 };
 use super::regs::*;
 use super::rf::{lssi_pack, RfPath, RF_MASK_12};
@@ -347,7 +347,7 @@ fn smoke_rtlwifi_power_on_tables_present() -> TestResult {
         (RTL_DEV_8188EE, RTL8188EE_PWR_ON),
         (RTL_DEV_8192DE, RTL8192CE_PWR_ON),
         (RTL_DEV_8192EE, RTL8192EE_PWR_ON),
-        (RTL_DEV_8723AE, RTL8723BE_PWR_ON),
+        (RTL_DEV_8723AE, RTL8723AE_PWR_ON),
         (RTL_DEV_8723BE, RTL8723BE_PWR_ON),
         (RTL_DEV_8821AE, RTL8821AE_PWR_ON),
     ];
@@ -400,6 +400,7 @@ fn smoke_rtlwifi_power_on_row_encoding() -> TestResult {
         RTL8188EE_PWR_ON,
         RTL8192CE_PWR_ON,
         RTL8192EE_PWR_ON,
+        RTL8723AE_PWR_ON,
         RTL8723BE_PWR_ON,
         RTL8821AE_PWR_ON,
     ];
