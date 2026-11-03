@@ -352,3 +352,118 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe2lpd_gt",
     smoke_xe2lpd_gt_profile_selection_keeps_headless_flr
 );
+
+/// A native Xe backend that reports only its LNL GT profile.
+#[derive(Debug)]
+struct ProfileBackend(bool);
+impl crate::intel_gpu_user::UserBackend for ProfileBackend {
+    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+        None
+    }
+    fn native_xe(&self) -> bool {
+        true
+    }
+    fn display_preserving(&self) -> bool {
+        self.0
+    }
+    fn submit<'a>(
+        &'a self,
+        _: alloc::sync::Arc<crate::intel_gpu_user::UserContext>,
+        _: crate::intel_gpu_user::UserBatch,
+    ) -> narf_filesystem::FsFuture<'a, alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>>
+    {
+        alloc::boxed::Box::pin(async { Err(narf_filesystem::FsError::NoDevice) })
+    }
+}
+
+/// `DRM_IOCTL_XE_GEM_CREATE` of an 8 KiB system object with `flags` and
+/// `cpu_caching` (1 WB, 2 WC); the new handle.
+fn xe_gem_create(
+    info: &crate::intel_gpu_render::DeviceInfo,
+    gem: &crate::intel_gpu_gem::GemState,
+    flags: u32,
+    caching: u8,
+) -> Result<u32, narf_filesystem::FsError> {
+    use crate::intel_gpu_uapi::{put32, put64, u32_at};
+    let user = crate::intel_gpu_render::tests::User::new();
+    let mut wire = [0u8; 56];
+    put64(&mut wire, 8, 8192);
+    put32(&mut wire, 16, 1);
+    put32(&mut wire, 20, flags);
+    wire[32] = caching;
+    user.store(64, &wire);
+    crate::intel_gpu_xe::XeFile::new()
+        .dispatch(info, crate::intel_gpu_xe_uapi::GEM_CREATE, 64, &user, gem)
+        .expect("native Xe ioctl")?;
+    Ok(u32_at(&user.load(64, 56), 28))
+}
+
+/// `DRM_XE_GEM_CREATE_FLAG_SCANOUT` (2) on Lunar Lake follows the GT
+/// profile: the display-20 route's display-preserving owner creates a WC
+/// system object marked for scanout (xe_bo.c::xe_gem_create_ioctl sets
+/// `XE_BO_FLAG_SCANOUT`; xe_ttm_tt_create keeps the iGPU WC caching) and,
+/// as xe does, refuses SCANOUT with WB caching. The headless profile keeps
+/// refusing the flag, and `NO_COMPRESSION` (8) stays refused on both.
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile() -> TestResult {
+    use crate::intel_gpu::Generation;
+    use narf_filesystem::FsError;
+    let info = |platform, display: Option<bool>| crate::intel_gpu_render::DeviceInfo {
+        device_id: 0x6420,
+        platform,
+        memory_bytes: 0x8000_0000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: display.map(|display| {
+            alloc::sync::Arc::new(ProfileBackend(display))
+                as alloc::sync::Arc<dyn crate::intel_gpu_user::UserBackend>
+        }),
+    };
+    let lnl = GtPlatform::Integrated(Generation::LunarLake);
+    let gem = crate::intel_gpu_gem::GemState::new();
+
+    let display = info(lnl, Some(true));
+    let handle = xe_gem_create(&display, &gem, 2, 2).unwrap();
+    let object = gem.object(handle).unwrap();
+    assert!(object.scanout() && object.is_wc());
+    // Without the flag the object is WC but not marked for scanout.
+    let plain = gem
+        .object(xe_gem_create(&display, &gem, 0, 2).unwrap())
+        .unwrap();
+    assert!(plain.is_wc() && !plain.scanout());
+    // xe: SCANOUT with DRM_XE_GEM_CPU_CACHING_WB is EINVAL.
+    assert_eq!(
+        xe_gem_create(&display, &gem, 2, 1),
+        Err(FsError::InvalidData)
+    );
+    assert_eq!(
+        xe_gem_create(&display, &gem, 8, 2),
+        Err(FsError::InvalidData)
+    );
+    // The headless profile (or no GT owner) has no scanout representation.
+    for headless in [info(lnl, Some(false)), info(lnl, None)] {
+        assert_eq!(
+            xe_gem_create(&headless, &gem, 2, 2),
+            Err(FsError::InvalidData)
+        );
+        assert!(xe_gem_create(&headless, &gem, 0, 2).is_ok());
+    }
+    // Panther Lake keeps refusing it even with a display-reporting backend.
+    let ptl = GtPlatform::from_pci(0x8086, 0xb080).unwrap();
+    assert!(ptl.is_ptl());
+    assert_eq!(
+        xe_gem_create(&info(ptl, Some(true)), &gem, 2, 2),
+        Err(FsError::InvalidData)
+    );
+    // Meteor Lake's display-14 iGPU admission is unchanged.
+    let mtl = info(GtPlatform::Integrated(Generation::MeteorLake), None);
+    let handle = xe_gem_create(&mtl, &gem, 2, 2).unwrap();
+    assert!(gem.object(handle).unwrap().scanout());
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_gt",
+    smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile
+);

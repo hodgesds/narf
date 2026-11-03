@@ -972,6 +972,15 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     fn native_xe(&self) -> bool {
         true
     }
+    fn display_preserving(&self) -> bool {
+        self.owner.upgrade().is_some_and(|owner| {
+            lnl_profile(
+                self.platform,
+                owner.pending.lnl_display,
+                owner.pending.mode.is_some(),
+            ) == Some(LnlProfile::DisplayPreserving)
+        })
+    }
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
         *self.facts.lock()
     }

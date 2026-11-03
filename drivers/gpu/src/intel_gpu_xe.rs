@@ -328,9 +328,24 @@ impl XeFile {
                 // Region bit 0 is system memory, bit 1 the published VRAM.
                 let regions = if info.vram.is_some() { 3 } else { 1 };
                 // SCANOUT (2) is admitted where a WC system object satisfies
-                // it: the iGPU. Arc display is not supported.
+                // it: the iGPU. Arc display is not supported. An integrated
+                // Xe2/Xe3 function has no scanout (or FlatCCS) representation
+                // on its headless profile; the Lunar Lake display-20 route's
+                // display-preserving profile takes XE_BO_FLAG_SCANOUT
+                // (xe_bo.c::xe_gem_create_ioctl) as a WC system object.
                 let supported_flags = match info.platform {
-                    _ if info.platform.is_headless_integrated() => 0, // no scanout/FlatCCS representation
+                    _ if info.platform.is_headless_integrated() => {
+                        if info.platform.is_lnl()
+                            && info
+                                .backend
+                                .as_ref()
+                                .is_some_and(|backend| backend.display_preserving())
+                        {
+                            2
+                        } else {
+                            0
+                        }
+                    }
                     crate::intel_gpu_gt::GtPlatform::Battlemage => {
                         8 | if info.vram.is_some() { 4 } else { 0 }
                     }

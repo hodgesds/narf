@@ -134,6 +134,13 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn native_xe(&self) -> bool {
         false
     }
+    /// This function's GT owner runs beside a display it preserves (the
+    /// Lunar Lake display-20 route's `DisplayPreserving` profile), so its
+    /// objects may be created for scanout. Default: headless or not an
+    /// integrated Xe2 profile.
+    fn display_preserving(&self) -> bool {
+        false
+    }
     fn device_facts(&self) -> Option<DeviceFacts> {
         None
     }
