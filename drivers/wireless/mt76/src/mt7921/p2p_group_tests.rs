@@ -580,30 +580,37 @@ fn group_owner() -> Result<(), &'static str> {
     }
     let (mut session, bss) = super::super::super::ht20_tests::prepared(6, false);
     let vif = Vif::new(1).map_err(|_| "vif")?;
-    if session.open_group_link(Vif::HOME).is_ok() {
+    // mt792x_config_mac_addr_list: the second vif's locally administered address.
+    let own = crate::mt7921::vif_slots::mac_candidates([2, 0x11, 0x22, 0x33, 0x44, 0x55])[1];
+    if session.open_group_link(Vif::HOME, own).is_ok()
+        || session.open_group_link(vif, [1; 6]).is_ok()
+    {
         return Err("group link opened on the home vif");
     }
-    let link = session.open_group_link(vif).map_err(|_| "group link")?;
+    let link = session
+        .open_group_link(vif, own)
+        .map_err(|_| "group link")?;
     if link != Link::new(vif, 2).map_err(|_| "link")?
         || session.group_link() != Some(link)
         || session.station.link != Link::HOME
-        || session.open_group_link(Vif::new(2).map_err(|_| "vif 2")?) != Err(Error::Busy)
+        || session.open_group_link(Vif::new(2).map_err(|_| "vif 2")?, own) != Err(Error::Busy)
     {
         return Err("group link identity / single-group admission");
     }
     // An associated group owner cannot be closed or carried into suspend.
-    session.group.as_mut().unwrap().bss = Some(bss.clone());
-    if !session.group_associated()
+    session.group.as_mut().unwrap().station.bss = Some(bss.clone());
+    if !session.group_published()
         || session.close_group_link(link) != Err(Error::Busy)
         || run(Box::pin(session.suspend())) != Err(Error::Busy)
     {
         return Err("associated group owner was retired in place");
     }
-    session.group.as_mut().unwrap().bss = None;
+    session.group.as_mut().unwrap().station.bss = None;
     session
         .close_group_link(link)
         .map_err(|_| "idle group close")?;
-    if session.group_link().is_some() || session.open_group_link(vif).map_err(|_| "reopen")? != link
+    if session.group_link().is_some()
+        || session.open_group_link(vif, own).map_err(|_| "reopen")? != link
     {
         return Err("group WCID not returned to the shared map");
     }
@@ -619,4 +626,123 @@ fn mt76_p2p_group_link_owner_allocates_shared_wcid() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_p2p_group_link_owner_allocates_shared_wcid
+);
+
+fn group_association() -> Result<(), &'static str> {
+    use crate::mt7921::vif_slots::{Link, Vif, Wtbl};
+    let (mut session, bss) = super::super::super::ht20_tests::prepared(6, true);
+    let home = session.state;
+    let vif = Vif::new(1).map_err(|_| "vif")?;
+    // The fixture AP answers the retained station address; the group vif
+    // reuses it here so the shared AP's MLME/RSNA exchange can complete.
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    // mt7921_add_interface -> uni_add_dev(enable): DEV_INFO then BSS on OMAC 1.
+    let before = session.backend.frames.len();
+    let link = run(Box::pin(session.start_group_link(vif, own))).map_err(|_| "group start")?;
+    let (dev, mut vif_bss) = vif
+        .device_payloads(own, true, true)
+        .map_err(|_| "geometry")?;
+    vif_bss[12..16].copy_from_slice(&INFRA_STA);
+    let started: Vec<_> = session.backend.frames[before..]
+        .iter()
+        .filter_map(|(_, frame)| uni(frame, 1).or_else(|| uni(frame, 2)))
+        .map(<[u8]>::to_vec)
+        .collect();
+    if link != Link::new(vif, 2).map_err(|_| "link")?
+        || started != [dev.to_vec(), vif_bss.to_vec()]
+        || !matches!(session.group_state(), Some(State::ScanReady(_)))
+        || session.close_group_link(link) != Err(Error::Busy)
+    {
+        return Err("group vif DEV_INFO/BSS differ from mt76_connac_mcu_uni_add_dev");
+    }
+    // Association, WPA2 keys and peer records all on the group link.
+    let joined = session.backend.frames.len();
+    let tx = session.backend.tx_vifs.len();
+    run(Box::pin(session.associate_group(
+        link,
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2Psk { psk: [0x55; 32] },
+        test_permission(),
+        &[],
+        Network::P2p,
+    )))
+    .map_err(|_| "group association")?;
+    if session.state != home
+        || session.station.link != Link::HOME
+        || session.station.bss.is_some()
+        || !matches!(session.group_state(), Some(State::Associated { .. }))
+    {
+        return Err("group association changed the home owner");
+    }
+    let frames = &session.backend.frames[joined..];
+    let bss_records: Vec<_> = frames.iter().filter_map(|(_, f)| uni(f, 2)).collect();
+    let sta_records: Vec<_> = frames.iter().filter_map(|(_, f)| uni(f, 3)).collect();
+    if bss_records.is_empty()
+        || bss_records.iter().any(|body| body[0] != 1)
+        || basic_bss(frames).iter().any(|body| body[12..16] != P2P_GC)
+        || sta_records.is_empty()
+        || sta_records.iter().any(|body| body[0] != 1)
+        || !sta_records.iter().any(|body| body[1] == 2)
+        || sta_records.iter().any(|body| body[1] == 1)
+    {
+        return Err("group join records did not use bss_idx 1 / peer WCID 2");
+    }
+    if session.backend.tx_vifs[tx..].is_empty()
+        || session.backend.tx_vifs[tx..].iter().any(|&v| v != 1)
+    {
+        return Err("group management/EAPOL TX left the group vif");
+    }
+    // RX demux: the group peer's WCID belongs to the group owner.
+    if !session.other_owns_wcid(2) || session.other_owns_wcid(1) {
+        return Err("RX WCID demux owner");
+    }
+    // One shared channel context: a different grant is refused.
+    let mut other = test_permission();
+    other.power_dbm -= 1;
+    if !session.shares_channel_context(test_permission()) || session.shares_channel_context(other) {
+        return Err("concurrent join accepted a second channel context");
+    }
+    session
+        .step_group_network(link, None)
+        .map_err(|_| "group data step")?;
+    if run(Box::pin(session.suspend())) != Err(Error::Busy) {
+        return Err("suspend retired an associated group link in place");
+    }
+    let left = session.backend.frames.len();
+    run(Box::pin(session.disassociate_group(link))).map_err(|_| "group leave")?;
+    if session.state != home
+        || !matches!(session.group_state(), Some(State::ScanReady(_)))
+        || basic_bss(&session.backend.frames[left..])
+            .iter()
+            .any(|body| body[0] != 1 || body[12..16] != P2P_GC)
+    {
+        return Err("group teardown left its own vif");
+    }
+    // mt792x_remove_interface -> uni_add_dev(disable): BSS then DEV_INFO.
+    let stop = session.backend.frames.len();
+    run(Box::pin(session.stop_group_link(link))).map_err(|_| "group stop")?;
+    let (dev, mut vif_bss) = vif
+        .device_payloads(own, false, true)
+        .map_err(|_| "geometry")?;
+    vif_bss[12..16].copy_from_slice(&INFRA_STA);
+    let stopped: Vec<_> = session.backend.frames[stop..]
+        .iter()
+        .filter_map(|(_, frame)| uni(frame, 2).or_else(|| uni(frame, 1)))
+        .map(<[u8]>::to_vec)
+        .collect();
+    if stopped != [vif_bss.to_vec(), dev.to_vec()]
+        || session.group_link().is_some()
+        || session.wtbl != Wtbl::default()
+    {
+        return Err("group vif removal differs from mt792x_remove_interface");
+    }
+    Ok(())
+}
+fn mt76_p2p_group_link_drives_association_on_group_vif() -> TestResult {
+    group_association().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_group_link_drives_association_on_group_vif
 );

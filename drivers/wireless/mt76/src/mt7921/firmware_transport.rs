@@ -1527,6 +1527,19 @@ struct StationLink {
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
     rx_fragments: fragment::Cache,
+    /// Captured native packets whose RXD WCID is this link's peer, drained
+    /// from the shared RX ring by the other station owner (Linux
+    /// `mt76_rx` -> `mt792x_rx_get_wcid` -> per-`mt792x_sta` delivery).
+    demuxed: VecDeque<CapturedData>,
+}
+/// The concurrent group vif's station owner and its own role state
+/// (`State::RadioReady` = WCID only, `ScanReady` = DEV_INFO/BSS published,
+/// `Associated`/`Failed` as for the home role). `info.capabilities.mac` is
+/// the group vif's own address.
+#[derive(Debug)]
+struct GroupOwner {
+    station: StationLink,
+    state: State,
 }
 impl StationLink {
     fn new(link: crate::mt7921::vif_slots::Link) -> Self {
@@ -1553,6 +1566,7 @@ impl StationLink {
             rx_ba: ba::Owner::default(),
             received_msdu: VecDeque::new(),
             rx_fragments: fragment::Cache::default(),
+            demuxed: VecDeque::new(),
         }
     }
 }
@@ -1570,8 +1584,9 @@ struct Session<B: Backend> {
     /// The home vif's station owner (BSS0, peer WCID 1).
     station: StationLink,
     /// A concurrent P2P group vif's station owner (Linux mt7921 keeps one
-    /// `mt792x_vif` per vif); opened by `open_group_link`.
-    group: Option<StationLink>,
+    /// `mt792x_vif` per vif); opened by `open_group_link`. While a group
+    /// operation runs (`enter_group`) it holds the swapped-out home owner.
+    group: Option<GroupOwner>,
     /// Peer WCIDs owned by station links (Linux `dev->wcid_mask`).
     wtbl: crate::mt7921::vif_slots::Wtbl,
     /// The wiphy fragmentation threshold (`u32::MAX` = off).

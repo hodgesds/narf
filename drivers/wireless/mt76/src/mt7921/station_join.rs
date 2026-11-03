@@ -459,8 +459,9 @@ impl<B: Backend> Session<B> {
         self.backend.close_receive_capture(self.receive_epoch);
         Ok(())
     }
-    fn sync_receive_capture(&mut self) -> Result<bool, Error> {
-        if self.receive_current(self.receive_epoch)? {
+    /// Open the shared capture while either station owner is current.
+    pub(super) fn sync_receive_capture(&mut self) -> Result<bool, Error> {
+        if self.receive_current(self.receive_epoch)? || self.other_receive_current()? {
             self.backend.open_receive_capture(self.receive_epoch)?;
             Ok(true)
         } else {
@@ -469,12 +470,29 @@ impl<B: Backend> Session<B> {
         }
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {
+        self.owner_receive_current(&self.station, &self.state, epoch)
+    }
+    /// The swapped-out station owner (the group link, or the home link
+    /// while a group operation runs) under the same shared capture epoch.
+    pub(super) fn other_receive_current(&self) -> Result<bool, Error> {
+        match self.group.as_ref() {
+            Some(other) => {
+                self.owner_receive_current(&other.station, &other.state, self.receive_epoch)
+            }
+            None => Ok(false),
+        }
+    }
+    fn owner_receive_current(
+        &self,
+        station: &super::StationLink,
+        state: &State,
+        epoch: u64,
+    ) -> Result<bool, Error> {
         if epoch == 0
             || self.receive_epoch != epoch
-            || self.station.peer_lost
-            || !matches!(self.state, State::Associated { .. })
-            || self
-                .station
+            || station.peer_lost
+            || !matches!(state, State::Associated { .. })
+            || station
                 .security
                 .as_ref()
                 .is_some_and(|security| !security.port_open())
@@ -482,7 +500,7 @@ impl<B: Backend> Session<B> {
             return Ok(false);
         }
         self.backend.check()?;
-        let Some(permission) = self.station.permission else {
+        let Some(permission) = station.permission else {
             return Ok(false);
         };
         self.backend.check_tx_permission(permission)?;
@@ -891,7 +909,9 @@ impl<B: Backend> Session<B> {
         }
         for _ in 0..16 {
             self.backend.check()?;
-            let packet = if let Some(packet) = self.scan_packets.pop_front() {
+            let packet = if let Some(packet) = self.station.demuxed.pop_front() {
+                Some(packet)
+            } else if let Some(packet) = self.scan_packets.pop_front() {
                 Some(packet)
             } else if self.scanning {
                 None
@@ -911,6 +931,12 @@ impl<B: Backend> Session<B> {
             };
             if native.channel != channel {
                 self.clear_aggregate_receive();
+                continue;
+            }
+            // The other station owner's peer WCID: hand the original copy
+            // to that link (Linux `mt792x_rx_get_wcid` -> its `mt792x_sta`).
+            if self.other_owns_wcid(native.wcid) {
+                self.forward_to_other(packet);
                 continue;
             }
             // PMF management admission before any MLME/BA consumer: mac80211
@@ -1739,7 +1765,9 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         let (info, setup) = match self.state {
-            State::RadioReady(info) => (info, true),
+            // A group vif publishes its DEV_INFO/BSS at start_group_link;
+            // the passive scan setup is the home vif's own.
+            State::RadioReady(info) if !self.group_role() => (info, true),
             State::ScanReady(info) => (info, false),
             State::Associated { .. } => return Err(Error::Busy),
             _ => return Err(Error::Busy),
@@ -1759,6 +1787,11 @@ impl<B: Backend> Session<B> {
         };
         if !permission.permits_bss(bss) || permission.band() != Some(band) {
             return Err(Error::Authority);
+        }
+        // One shared channel context (mac80211 chanctx reuse): the other
+        // live station owner's exact channel/width/power grant.
+        if !self.shares_channel_context(permission) {
+            return Err(Error::Busy);
         }
         if !six && info.capabilities.phy.bands & band.capability() == 0 {
             return Err(Error::InvalidIdentity);
@@ -1790,6 +1823,7 @@ impl<B: Backend> Session<B> {
         self.station.control_pending.clear();
         self.station.tx_fragments.clear();
         self.station.received_msdu.clear();
+        self.station.demuxed.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.station.security = None;
         self.station.wmm = None;
@@ -1945,6 +1979,11 @@ impl<B: Backend> Session<B> {
                     || center != permission.center_channel()
                     || plan.transmit_streams() > 1
                 {
+                    // The radio's channel is shared with the other live
+                    // station owner; no single-channel narrowing moves it.
+                    if self.other_station_permission().is_some() {
+                        return Err(Error::Busy);
+                    }
                     self.station.permission = Some(narrower);
                     self.reconfigure_station_channel(
                         info,
@@ -1974,7 +2013,10 @@ impl<B: Backend> Session<B> {
                         id: 0x1d,
                         query: false,
                     },
-                    &parameters.edca_limited(self.station.permission.and_then(|p| p.wmm_rule())),
+                    &crate::mt7921::association::wmm::on_vif(
+                        self.station.link.vif(),
+                        parameters.edca_limited(self.station.permission.and_then(|p| p.wmm_rule())),
+                    ),
                 )
                 .await?;
                 self.confirm_command_progress().await?;
@@ -1994,7 +2036,8 @@ impl<B: Backend> Session<B> {
                     self.check_station_tx()?;
                 }
             }
-            let mut bss_record = crate::mt7921::association::bss_record_ht20(
+            let mut bss_record = crate::mt7921::association::bss_record_ht20_on(
+                self.station.link,
                 bss,
                 plan.wmm().is_some(),
                 plan.ht20().is_some(),
@@ -2119,7 +2162,7 @@ impl<B: Backend> Session<B> {
                             EapolRx::Pairwise1(m1) => {
                                 self.send_management(
                                     &wrap_eapol_frame(own, bss.bssid, &m1.reply),
-                                    1,
+                                    u16::from(self.station.link.peer()),
                                 )
                                 .await?;
                             }
@@ -2136,7 +2179,7 @@ impl<B: Backend> Session<B> {
                                 }
                                 self.send_management(
                                     &wrap_eapol_frame(own, bss.bssid, &m3.reply),
-                                    1,
+                                    u16::from(self.station.link.peer()),
                                 )
                                 .await?;
                                 self.stage(Stage::StaRecord);
@@ -2259,6 +2302,7 @@ impl<B: Backend> Session<B> {
         self.station.control_pending.clear();
         self.station.tx_fragments.clear();
         self.station.received_msdu.clear();
+        self.station.demuxed.clear();
         let peer_lost = self.station.peer_lost;
         self.stage(Stage::StaRecord);
         let result = async {
@@ -2329,7 +2373,10 @@ impl<B: Backend> Session<B> {
                         id: 0x1d,
                         query: false,
                     },
-                    &crate::mt7921::association::wmm::legacy_edca(),
+                    &crate::mt7921::association::wmm::on_vif(
+                        self.station.link.vif(),
+                        crate::mt7921::association::wmm::legacy_edca(),
+                    ),
                 )
                 .await?;
                 self.confirm_command_progress().await?;
@@ -2541,7 +2588,10 @@ impl<B: Backend> Session<B> {
                 id: 0x1d,
                 query: false,
             },
-            &parameters.edca_limited(self.station.permission.and_then(|p| p.wmm_rule())),
+            &crate::mt7921::association::wmm::on_vif(
+                self.station.link.vif(),
+                parameters.edca_limited(self.station.permission.and_then(|p| p.wmm_rule())),
+            ),
         )
         .await?;
         self.check_station_tx()?;

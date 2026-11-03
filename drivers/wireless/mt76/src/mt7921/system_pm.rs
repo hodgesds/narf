@@ -77,8 +77,8 @@ impl<B: Backend> Session<B> {
             self.stop_p2p_device_owned().await?;
         }
         // mac80211 leaves every station vif before a non-WoW suspend; the
-        // group client must already have left (no in-place group teardown).
-        if self.group_associated() {
+        // group vif must already be stopped (no in-place group teardown).
+        if self.group_published() {
             return Err(Error::Busy);
         }
         let (info, vif) = match self.state {
@@ -318,6 +318,7 @@ impl<B: Backend> Session<B> {
         self.station.control_pending.clear();
         self.station.tx_fragments.clear();
         self.station.received_msdu.clear();
+        self.station.demuxed.clear();
         self.station.rx_fragments.clear();
         self.data_pending.clear();
         self.events.clear();

@@ -504,6 +504,11 @@ impl<B: Backend> Session<B> {
     pub(super) async fn scan_setup(&mut self, info: RadioInfo) -> Result<(), Error> {
         // Publish a single unassociated station VIF, not a host netdev: the
         // station owner's own link (the physical interface's HOME vif).
+        // Its NO_IR passive domain would revoke the other live station
+        // owner's shared channel grant.
+        if self.other_station_permission().is_some() {
+            return Err(Error::Busy);
+        }
         let vif = self.station.link.vif();
         let dev = station_device_record_on(vif, info.capabilities.mac, true)?;
         self.exchange(Command::Unified { id: 1 }, &dev).await?;

@@ -111,6 +111,15 @@ impl Parameters {
     }
 }
 
+/// Stamp `vif`'s BSS and WMM-set index into a SET_EDCA_PARMS body built for
+/// BSS0 (Linux `mt7921_mcu_set_tx`: `.bss_idx = mvif->bss_conf.mt76.idx`,
+/// `.wmm_idx = mvif->bss_conf.mt76.wmm_idx`); `Vif::HOME` is unchanged.
+pub(crate) fn on_vif(vif: crate::mt7921::vif_slots::Vif, mut body: [u8; 44]) -> [u8; 44] {
+    body[40] = vif.index();
+    body[42] = vif.wmm();
+    body
+}
+
 pub(crate) fn legacy_edca() -> [u8; 44] {
     Parameters {
         parameter_set_count: 0,
