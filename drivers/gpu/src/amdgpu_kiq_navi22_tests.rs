@@ -236,3 +236,58 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_kiq_maps_compute_and_runs_ring_and_ib_proofs
 );
+
+/// `amdgpu_gfx_enable_kgq`: one KIQ MAP_QUEUES per gfx ring with
+/// ENGINE_SEL 4 and the ME0 encoding (ME field 1), consumed before the KIQ
+/// ring test; only after the compute mapping, and a stopped KIQ is terminal.
+fn kiq_navi22_maps_gfx_queues_with_engine_sel_4() -> TestResult {
+    use crate::amdgpu_cp_navi22::GfxQueueMap;
+    let maps = [
+        GfxQueueMap {
+            pipe: 0,
+            doorbell: doorbell::GFX_RING0,
+            mqd: 0x8000_1000,
+            wptr: 0x8000_2008,
+        },
+        GfxQueueMap {
+            pipe: 1,
+            doorbell: doorbell::GFX_RING1,
+            mqd: 0x8000_3000,
+            wptr: 0x8000_4008,
+        },
+    ];
+    let (_pool, mut e) = engine(enabled());
+    if run(e.map_gfx(&maps)) != Err(Error::Busy) || !e.hw.io.mapped.is_empty() {
+        return TestResult::Fail("gfx queues mapped before the KIQ was mapped");
+    }
+    if run(e.init_kiq()).is_err() || run(e.map_compute()).is_err() {
+        return TestResult::Fail("KIQ/compute bring-up failed");
+    }
+    if run(e.map_gfx(&maps)).is_err() || e.state != State::Mapped {
+        return TestResult::Fail("gfx MAP_QUEUES or KIQ ring test failed");
+    }
+    let gfx: alloc::vec::Vec<_> =
+        e.hw.io
+            .mapped
+            .iter()
+            .filter(|q| q.me == 0)
+            .copied()
+            .collect();
+    if gfx.len() != 2
+        || gfx.iter().zip(&maps).any(|(q, m)| {
+            (q.pipe, q.queue, q.doorbell, q.mqd, q.wptr) != (m.pipe, 0, m.doorbell, m.mqd, m.wptr)
+        })
+    {
+        return TestResult::Fail("gfx MAP_QUEUES fields");
+    }
+    // A KIQ whose ring test cannot complete leaves the owner Failed.
+    e.hw.io.stalled[1] = true;
+    if run(e.map_gfx(&maps)).is_ok() || e.state != State::Failed {
+        return TestResult::Fail("stalled KIQ gfx mapping was not terminal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/kiq-navi22",
+    kiq_navi22_maps_gfx_queues_with_engine_sel_4
+);

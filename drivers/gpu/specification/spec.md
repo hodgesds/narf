@@ -8851,13 +8851,19 @@ non-repeatable state and retains published memory. Register polls are bounded
 by 100 ms and fences by 1 s. `amdgpu_fence_navi22::{notify, notify_all}` are
 the IH hook: an EOP/trap consumer calls them so fence waits re-sample at once;
 without it waits poll every 1 ms. `QueueProof` aggregates the three proofs.
-GC 10.3 has two gfx rings (`GFX10_NUM_GFX_RINGS_Sienna_Cichlid`). As Linux's
-direct path does, `Gfx::start` programs ME0 pipe 1 (`CP_RB1_*`, its own
-24 KiB queue and doorbell `AMDGPU_NAVI10_DOORBELL_GFX_RING1 << 1`, with the
-doorbell control/range and wptr-poll registers written under that pipe's
-`GRBM_GFX_CNTL` selection), switches back to pipe 0, submits CLEAR_STATE to
-ring 1 after ring 0's clear-state preamble, and ring-tests both rings, as
-`gfx_v10_0_cp_resume`. Ring 1 carries no client work and no fences.
+GC 10.3 has two gfx rings (`GFX10_NUM_GFX_RINGS_Sienna_Cichlid`), brought up
+on Linux's default async path (`amdgpu_async_gfx_ring` = 1,
+`gfx_v10_0_cp_async_gfx_ring_resume`), not the direct `CP_RB0/RB1` path.
+`Gfx::prepare_queues` writes a v10 gfx MQD per ring (`gfx_v10_0_gfx_mqd_init`
+under that ring's ME0 pipe selection; ring 1 on pipe 1 is the high-priority
+queue) into the queue's EOP slot (ring 0's MQD slot holds the RLC CSIB) and
+sets the global doorbell range from ring 0 only. `Compute::map_gfx`
+(`amdgpu_gfx_enable_kgq`) flushes HDP, sends one KIQ MAP_QUEUES with
+ENGINE_SEL 4 per ring and ring-tests the KIQ. `Gfx::start_mapped` then runs
+`gfx_v10_0_cp_gfx_start` (CSB on ring 0, CLEAR_STATE on ring 1) and ring-tests
+both rings, as `gfx_v10_0_cp_resume`. Ring 1 (doorbell
+`AMDGPU_NAVI10_DOORBELL_GFX_RING1 << 1`, its own 24 KiB queue) carries no
+client work and no fences. A KIQ mapping failure leaves both owners Failed.
 The cleaner shader is not enabled at bring-up; clock gating and GFXOFF are
 applied later by the power-saving opt-in. These are kernel bring-up rings,
 not a submission API.
@@ -8935,8 +8941,10 @@ reference and never wakes an idle GPU. The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
 advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
 emitted seq=…` once and is retained in `tdr::status()`. Detection is always on.
-After a GFX timeout, the retained owner also samples CP/GRBM, current IB and
-GC10.3 VM fault registers, fence writebacks and a bounded ring window around
+After a GFX timeout, the retained owner also samples CP/GRBM, current IB,
+GC10.3 VM fault registers, CE/DE state (CE header/instruction pointer, CE IB1,
+CE/DE handshake counters, CE and DE ring ROQ status, `CP_ME_CNTL`, the live
+`GRBM_GFX_CNTL` selection, CPF status, `CP_RB1_RPTR`, `RLC_STAT`), fence writebacks and a bounded ring window around
 the hardware read pointer. The snapshot uses live PCI authority and a GFXOFF
 reference; only HDP read-cache invalidation is written. It does not change
 selectors, CP/VM control, queue pointers or submissions. Serial reporting runs

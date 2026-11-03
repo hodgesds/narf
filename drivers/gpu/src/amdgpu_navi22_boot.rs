@@ -433,8 +433,16 @@ impl Queues {
             Stage::Kiq => unsafe { self.compute.init_kiq().await },
             // SAFETY: see above; the KIQ is live.
             Stage::ComputeQueues => unsafe { self.compute.map_compute().await },
-            // SAFETY: see above; KIQ/KCQ precede the gfx ring as in cp_resume.
-            Stage::GfxRing => unsafe { self.gfx.start().await },
+            // SAFETY: see above; KIQ/KCQ precede the gfx rings as in cp_resume.
+            // Linux's default async path: MQDs, KIQ MAP_QUEUES, cp_gfx_start.
+            Stage::GfxRing => unsafe {
+                let maps = self.gfx.prepare_queues()?;
+                if let Err(error) = self.compute.map_gfx(&maps).await {
+                    self.gfx.abandon_mapping();
+                    return Err(error);
+                }
+                self.gfx.start_mapped().await
+            },
             // SAFETY: see above; the SDMA0 proof ring finished and is idle.
             Stage::SdmaQueues => unsafe { self.sdma.start().await },
             Stage::IbTests => {

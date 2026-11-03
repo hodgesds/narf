@@ -210,38 +210,13 @@ impl Model {
     /// HQD registers are banked by GRBM me/pipe/queue, SH_MEM by VMID.
     fn key(&self, address: u64) -> u64 {
         let select = u64::from(self.reg(r(GRBM_GFX_CNTL)));
-        if Self::gfx_pipe_banked(address) && select & 3 != 0 {
-            // ME0 pipe 1's copy (gfx_v10_0_cp_gfx_resume writes these once per
-            // pipe under gfx_v10_0_cp_gfx_switch_pipe).
-            address | ((select & 3) << 40) | (1 << 52)
-        } else if (r(CP_MQD_BASE_ADDR)..=r(CP_HQD_PQ_WPTR_HI)).contains(&address) {
+        if (r(CP_MQD_BASE_ADDR)..=r(CP_HQD_PQ_WPTR_HI)).contains(&address) {
             address | ((select & 0x70f) << 40)
         } else if address == r(SH_MEM_CONFIG) || address == r(SH_MEM_BASES) {
             address | ((select & 0xf0) << 40)
         } else {
             address
         }
-    }
-    /// Gfx-ring registers banked by `GRBM_GFX_CNTL.PIPEID`.
-    fn gfx_pipe_banked(address: u64) -> bool {
-        [
-            CP_RB_DOORBELL_CONTROL,
-            CP_RB_DOORBELL_RANGE_LOWER,
-            CP_RB_DOORBELL_RANGE_UPPER,
-            CP_RB_WPTR_POLL_ADDR_LO,
-            CP_RB_WPTR_POLL_ADDR_HI,
-        ]
-        .iter()
-        .any(|&reg| r(reg) == address)
-    }
-    /// `reg` as ME0 gfx pipe `pipe` sees it.
-    pub(crate) fn gfx_pipe(&self, pipe: u32, reg: Reg) -> u32 {
-        let key = if pipe == 0 {
-            r(reg)
-        } else {
-            r(reg) | (u64::from(pipe) << 40) | (1 << 52)
-        };
-        *self.regs.get(&key).unwrap_or(&0)
     }
     pub(crate) fn hqd(&self, me: u32, pipe: u32, queue: u32, reg: Reg) -> u32 {
         let select = u64::from(pipe | (me << 2) | (queue << 8));
@@ -408,13 +383,27 @@ impl Model {
                 }
                 0xa2 => {
                     assert_eq!(engine, 1, "MAP_QUEUES outside KIQ");
-                    assert_eq!(body[0] & 0x0c00_00f0, 0, "ENGINE_SEL/QUEUE_SEL");
+                    assert_eq!(body[0] & 0x0000_00f0, 0, "QUEUE_SEL/VMID");
                     assert_eq!(body[0] >> 29, 1, "NUM_QUEUES");
+                    // ENGINE_SEL: 0 compute, 4 gfx (gfx10_kiq_map_queues).
+                    let engine_sel = (body[0] >> 26) & 7;
+                    assert!(engine_sel == 0 || engine_sel == 4, "ENGINE_SEL");
+                    if engine_sel == 4 {
+                        assert_ne!(body[0] & (1 << 18), 0, "gfx ME0 is ME field 1");
+                    }
                     let mqd = u64::from(body[2]) | (u64::from(body[3]) << 32);
+                    // v10 compute and gfx MQDs both keep the rptr report
+                    // address at dwords 139/140.
                     let rptr = u64::from(self.word(mqd + 139 * 4))
                         | (u64::from(self.word(mqd + 140 * 4)) << 32);
                     self.mapped.push(Mapped {
-                        me: if body[0] & (1 << 18) != 0 { 2 } else { 1 },
+                        me: if engine_sel == 4 {
+                            0
+                        } else if body[0] & (1 << 18) != 0 {
+                            2
+                        } else {
+                            1
+                        },
                         pipe: (body[0] >> 16) & 3,
                         queue: (body[0] >> 13) & 7,
                         doorbell: body[1] >> 2,
@@ -559,63 +548,39 @@ impl Model {
         if !self.apertures(index) {
             return;
         }
-        // GFX ring 0
-        let control = self.reg(r(CP_RB_DOORBELL_CONTROL));
-        let lower = self.reg(r(CP_RB_DOORBELL_RANGE_LOWER));
-        let upper = self.reg(r(CP_RB_DOORBELL_RANGE_UPPER));
-        if control & (1 << 30) != 0
-            && (control & 0x0fff_fffc) >> 2 == index
-            && (lower..=upper).contains(&(index << 2))
-            && self.reg(r(CP_RB_ACTIVE)) == 1
-            && self.reg(r(CP_ME_CNTL)) & 0x1500_0000 == 0
+        // Gfx rings mapped by the KIQ (ENGINE_SEL 4): the HQD state is the
+        // MQD; the doorbell range registers are global.
+        if let Some(q) = self
+            .mapped
+            .iter()
+            .copied()
+            .find(|q| q.me == 0 && q.doorbell == index)
         {
-            let cntl = self.reg(r(CP_RB0_CNTL));
-            let base = (u64::from(self.reg(r(CP_RB0_BASE)))
-                | (u64::from(self.reg(r(CP_RB0_BASE_HI))) << 32))
-                << 8;
-            let rptr_address = u64::from(self.reg(r(CP_RB0_RPTR_ADDR)))
-                | (u64::from(self.reg(r(CP_RB0_RPTR_ADDR_HI))) << 32);
-            let wptr_address = u64::from(self.reg(r(CP_RB_WPTR_POLL_ADDR_LO)))
-                | (u64::from(self.reg(r(CP_RB_WPTR_POLL_ADDR_HI))) << 32);
+            let field = |m: &Self, i: u64| m.word(q.mqd + i * 4);
+            let control = field(self, 143);
+            if control & (1 << 30) == 0
+                || (control & 0x0fff_fffc) >> 2 != index
+                || !(self.reg(r(CP_RB_DOORBELL_RANGE_LOWER))
+                    ..=self.reg(r(CP_RB_DOORBELL_RANGE_UPPER)))
+                    .contains(&(index << 2))
+                || field(self, 130) != 1
+                || self.reg(r(CP_ME_CNTL)) & 0x1500_0000 != 0
+            {
+                return;
+            }
+            let wptr_address = u64::from(field(self, 141)) | (u64::from(field(self, 142)) << 32);
+            assert_eq!(wptr_address, q.wptr, "MAP_QUEUES wptr vs MQD poll address");
             assert_eq!(shadow(self, wptr_address), value, "gfx wptr shadow");
-            if self.stalled[0] {
+            let slot = if q.pipe == 0 { 0 } else { 7 };
+            if self.stalled[slot] {
                 return;
             }
-            let size = (8u64 << (cntl & 0x3f)) / 4;
-            let words = self.ring(base, size, self.rptr[0], value);
+            let base = (u64::from(field(self, 136)) | (u64::from(field(self, 137)) << 32)) << 8;
+            let size = 2u64 << (field(self, 145) & 0x3f);
+            let words = self.ring(base, size, self.rptr[slot], value);
             self.pm4(&words, 0, false, 0);
-            self.rptr[0] = value;
-            self.regs.insert(r(CP_RB0_RPTR), value as u32);
-            self.put(rptr_address, value as u32);
-            return;
-        }
-        // GFX ring 1 (ME0 pipe 1)
-        let control = self.gfx_pipe(1, CP_RB_DOORBELL_CONTROL);
-        let lower = self.gfx_pipe(1, CP_RB_DOORBELL_RANGE_LOWER);
-        let upper = self.gfx_pipe(1, CP_RB_DOORBELL_RANGE_UPPER);
-        if control & (1 << 30) != 0
-            && (control & 0x0fff_fffc) >> 2 == index
-            && (lower..=upper).contains(&(index << 2))
-            && self.reg(r(CP_RB1_ACTIVE)) == 1
-            && self.reg(r(CP_ME_CNTL)) & 0x1500_0000 == 0
-        {
-            let cntl = self.reg(r(CP_RB1_CNTL));
-            let base = (u64::from(self.reg(r(CP_RB1_BASE)))
-                | (u64::from(self.reg(r(CP_RB1_BASE_HI))) << 32))
-                << 8;
-            let rptr_address = u64::from(self.reg(r(CP_RB1_RPTR_ADDR)))
-                | (u64::from(self.reg(r(CP_RB1_RPTR_ADDR_HI))) << 32);
-            let wptr_address = u64::from(self.gfx_pipe(1, CP_RB_WPTR_POLL_ADDR_LO))
-                | (u64::from(self.gfx_pipe(1, CP_RB_WPTR_POLL_ADDR_HI)) << 32);
-            assert_eq!(shadow(self, wptr_address), value, "gfx ring 1 wptr shadow");
-            if self.stalled[7] {
-                return;
-            }
-            let size = (8u64 << (cntl & 0x3f)) / 4;
-            let words = self.ring(base, size, self.rptr[7], value);
-            self.pm4(&words, 0, false, 0);
-            self.rptr[7] = value;
-            self.put(rptr_address, value as u32);
+            self.rptr[slot] = value;
+            self.put(q.rptr, value as u32);
             return;
         }
         // MEC queues: KIQ through its HQD registers, KCQs through MAP_QUEUES.
@@ -648,7 +613,12 @@ impl Model {
             self.put(rptr_address, value as u32);
             return;
         }
-        if let Some(q) = self.mapped.iter().copied().find(|q| q.doorbell == index) {
+        if let Some(q) = self
+            .mapped
+            .iter()
+            .copied()
+            .find(|q| q.me != 0 && q.doorbell == index)
+        {
             if !mec {
                 return;
             }
@@ -822,6 +792,21 @@ fn gfx(model: Model) -> (Pool, GfxEngine<Model>) {
     )
 }
 
+impl GfxEngine<Model> {
+    /// The boot's GfxRing stage against the model: `prepare_queues`, the
+    /// KIQ's MAP_QUEUES packets (ENGINE_SEL 4) decoded by the model's KIQ,
+    /// then `start_mapped`.
+    pub(crate) async fn start(&mut self) -> Result<(), Error> {
+        let maps = self.prepare_queues()?;
+        let words: Vec<u32> = maps
+            .iter()
+            .flat_map(|m| pm4::map_queues_engine(0, m.pipe, 0, m.doorbell, m.mqd, m.wptr, 4))
+            .collect();
+        self.hw.io.pm4(&words, 1, false, 0);
+        self.start_mapped().await
+    }
+}
+
 /// Boot-test GPU descriptor with the live Navi22 discovery bases.
 pub(crate) fn navi22_gpu() -> AmdGpu {
     use crate::amdgpu_discovery as d;
@@ -974,53 +959,79 @@ kernel_test_in!(
     cp_navi22_gfx_configure_programs_golden_cam_and_constants
 );
 
-/// GC 10.3 has two gfx rings (`GFX10_NUM_GFX_RINGS_Sienna_Cichlid`): Linux's
-/// direct path programs ME0 pipe 1 like pipe 0, with the doorbell / wptr
-/// poll registers written under that pipe's selection, submits a
-/// CLEAR_STATE to it and ring-tests it, then leaves pipe 0 selected.
-fn cp_navi22_gfx_start_programs_and_tests_pipe1() -> TestResult {
+/// Linux's default gfx queue path (`amdgpu_async_gfx_ring` = 1) for GC 10.3's
+/// two gfx rings: a v10 gfx MQD per ring (`gfx_v10_0_gfx_mqd_init`), the
+/// doorbell range set from ring 0 only, KIQ MAP_QUEUES with ENGINE_SEL 4,
+/// then CLEAR_STATE on ring 1 and a ring test of each ring. The direct
+/// CP_RB0/RB1 and CP_RB_DOORBELL_CONTROL registers are never programmed.
+fn cp_navi22_gfx_mqds_map_through_kiq_and_start_both_rings() -> TestResult {
+    use crate::amdgpu_cp_navi22::gfx_mqd_dw as dw;
     let (_pool, mut e) = gfx(enabled());
     if run(e.configure()).is_err() || run(e.start()).is_err() {
         return TestResult::Fail("gfx start failed");
     }
     let m = &e.hw.io;
-    let (ring0, ring1) = (e.queue.address(0), e.pipe1.address(0));
-    let cntl = RB_BUFSZ | ((RB_BUFSZ - 2) << 8);
-    if ring0 == ring1
-        || m.reg(r(CP_RB1_BASE)) != (ring1 >> 8) as u32
-        || m.reg(r(CP_RB1_BASE_HI)) != (ring1 >> 40) as u32
-        || m.reg(r(CP_RB1_CNTL)) != cntl
-        || m.reg(r(CP_RB1_RPTR_ADDR)) != e.pipe1.address(RPTR) as u32
-        || m.reg(r(CP_RB1_ACTIVE)) != 1
-        || m.reg(r(CP_RB0_BASE)) != (ring0 >> 8) as u32
-        || m.reg(r(CP_RB_ACTIVE)) != 1
-    {
-        return TestResult::Fail("gfx ring 1 registers");
+    let gfx: Vec<_> = m.mapped.iter().filter(|q| q.me == 0).copied().collect();
+    if gfx.len() != 2 {
+        return TestResult::Fail("KIQ did not map both gfx queues");
     }
-    for (pipe, q) in [(0, &e.queue), (1, &e.pipe1)] {
-        if m.gfx_pipe(pipe, CP_RB_DOORBELL_CONTROL) & 0x4fff_fffc != (1 << 30) | (q.doorbell << 2)
-            || m.gfx_pipe(pipe, CP_RB_DOORBELL_RANGE_LOWER) != (q.doorbell << 2) & 0xffc
-            || m.gfx_pipe(pipe, CP_RB_DOORBELL_RANGE_UPPER) != 0xffc
-            || m.gfx_pipe(pipe, CP_RB_WPTR_POLL_ADDR_LO) != q.address(WPTR) as u32
+    for (pipe, q, priority) in [(0u32, &e.queue, 0u32), (1, &e.pipe1, 1)] {
+        let mapped = gfx[pipe as usize];
+        let mqd = q.address(GFX_MQD);
+        let f = |i: usize| m.word(mqd + i as u64 * 4);
+        let (base, rptr, wptr) = (q.address(0) >> 8, q.address(RPTR), q.address(WPTR));
+        if mapped.pipe != pipe
+            || mapped.queue != 0
+            || mapped.doorbell != q.doorbell
+            || mapped.mqd != mqd
+            || mapped.wptr != wptr
+            || f(dw::MQD_BASE_ADDR) != mqd as u32
+            || f(dw::MQD_BASE_ADDR_HI) != (mqd >> 32) as u32
+            || f(dw::MQD_CONTROL) & 0x0300_010f != 0x100
+            || f(dw::HQD_ACTIVE) != 1
+            || f(dw::HQD_VMID) != 0
+            || f(dw::HQD_QUEUE_PRIORITY) & 0xf != priority
+            || f(dw::HQD_QUANTUM) & 1 != 1
+            || f(dw::HQD_BASE) != base as u32
+            || f(dw::HQD_BASE_HI) != (base >> 32) as u32
+            || f(dw::HQD_RPTR_ADDR) != rptr as u32
+            || f(dw::RB_WPTR_POLL_ADDR_LO) != wptr as u32
+            || f(dw::HQD_CNTL) & 0x3f3f != RB_BUFSZ | ((RB_BUFSZ - 2) << 8)
+            || f(dw::RB_DOORBELL_CONTROL) & 0x4fff_fffc != (1 << 30) | (q.doorbell << 2)
         {
-            return TestResult::Fail("per-pipe doorbell / wptr poll programming");
+            return TestResult::Fail("gfx MQD differs from gfx_v10_0_gfx_mqd_init");
         }
     }
-    if e.pipe1.doorbell != doorbell::GFX_RING1 || m.reg(r(GRBM_GFX_CNTL)) & 3 != 0 {
-        return TestResult::Fail("pipe 1 doorbell index or final pipe selection");
+    // The global range covers both rings: lower from ring 0.
+    if m.reg(r(CP_RB_DOORBELL_RANGE_LOWER)) != (doorbell::GFX_RING0 << 2) & 0xffc
+        || m.reg(r(CP_RB_DOORBELL_RANGE_UPPER)) != 0xffc
+        || !((doorbell::GFX_RING0 << 2)..=0xffc).contains(&(doorbell::GFX_RING1 << 2))
+    {
+        return TestResult::Fail("gfx doorbell range");
     }
-    // CLEAR_STATE (ring 0 CSB + ring 1) and the ring-1 SET_UCONFIG test.
-    if m.clear_states != 2 || m.rptr[7] == 0 {
-        return TestResult::Fail("ring 1 did not execute CLEAR_STATE and its ring test");
+    let direct = [
+        CP_RB_DOORBELL_CONTROL,
+        CP_RB0_CNTL,
+        CP_RB0_BASE,
+        CP_RB_ACTIVE,
+    ];
+    if m.writes
+        .iter()
+        .any(|&(a, _)| direct.iter().any(|&reg| r(reg) == a))
+    {
+        return TestResult::Fail("async gfx path programmed the direct CP_RB registers");
     }
-    if !e.proof.ring {
-        return TestResult::Fail("ring proof without both gfx ring tests");
+    if m.clear_states != 2 || m.rptr[0] == 0 || m.rptr[7] == 0 || !e.proof.ring {
+        return TestResult::Fail("both gfx rings must run CLEAR_STATE and their ring tests");
+    }
+    if m.reg(r(GRBM_GFX_CNTL)) & 0xfff != 0 {
+        return TestResult::Fail("GRBM selection not restored");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/cp-navi22",
-    cp_navi22_gfx_start_programs_and_tests_pipe1
+    cp_navi22_gfx_mqds_map_through_kiq_and_start_both_rings
 );
 
 fn cp_navi22_gfx_ring_clear_state_ring_and_ib_tests() -> TestResult {
@@ -1060,35 +1071,23 @@ fn cp_navi22_gfx_ring_clear_state_ring_and_ib_tests() -> TestResult {
     if !m.writes[ring..].windows(6).any(|w| w == brake) {
         return TestResult::Fail("GC 10.3 power-brake sequence missing or misordered");
     }
-    let base = e.queue.address(0);
+    // Async gfx path: ring state lives in the MQDs (checked in
+    // cp_navi22_gfx_mqds_map_through_kiq_and_start_both_rings).
     for (reg, value) in [
-        (CP_RB0_CNTL, 0x80a),
-        (CP_RB0_BASE, (base >> 8) as u32),
-        (CP_RB0_BASE_HI, (base >> 40) as u32),
-        (CP_RB_ACTIVE, 1),
-        (CP_RB_DOORBELL_CONTROL, (1 << 30) | (0x116 << 2)),
         (CP_RB_DOORBELL_RANGE_LOWER, 0x458),
         (CP_RB_DOORBELL_RANGE_UPPER, 0xffc),
         (CP_MAX_CONTEXT, 7),
         (CP_DEVICE_ID, 1),
         (CP_ME_CNTL, 0),
-        (CP_RB_VMID, 0),
         (SCRATCH_REG0, 0xdead_beef),
     ] {
         if m.reg(r(reg)) != value {
             return TestResult::Fail("gfx ring register encoding");
         }
     }
-    // CP_RB0_CNTL is written twice around the 1 ms pointer settle delay.
-    let cntl = m
-        .writes
-        .iter()
-        .filter(|&&(a, _)| a == r(CP_RB0_CNTL))
-        .count();
     let order = |a: Reg| m.writes.iter().position(|&(w, _)| w == r(a)).unwrap();
-    if cntl != 2
-        || order(CP_RB0_RPTR_ADDR) > order(CP_RB0_BASE)
-        || order(CP_RB_DOORBELL_CONTROL) > order(CP_ME_CNTL)
+    // The doorbell range is set (kgq_init_queue) before the CP is unhalted.
+    if order(CP_RB_DOORBELL_RANGE_LOWER) > order(CP_ME_CNTL)
         || m.clear_states != 2
         || m.context.get(&0xa00d) != Some(&0x4000_4000)
         || m.context.get(&0xa0d7) != Some(&0)
@@ -1167,7 +1166,8 @@ fn cp_navi22_gfx_failures_are_bounded_and_terminal() -> TestResult {
         };
         let (pool, mut e) = gfx(model);
         if case == 6 {
-            e.hw.io.revoke = Some((r(CP_RB_ACTIVE), 1, e.hw.authority));
+            // Revoked mid-start: on the async path's doorbell-range write.
+            e.hw.io.revoke = Some((r(CP_RB_DOORBELL_RANGE_LOWER), 0x458, e.hw.authority));
         }
         let result = match run(e.configure()) {
             Err(error) => Err(error),
