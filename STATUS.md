@@ -2481,6 +2481,25 @@ prefixes. A follow-up worker is fixing the remaining mismatches: the i915
 context CREATE_EXT apply order, the execbuffer timeline-fence interleaving
 and cap, and the Xe timeslice bound.
 
+### i915 CREATE_EXT order, execbuffer fence arrays and the Xe timeslice bound — targeted release gates recorded
+
+These close the mismatches left open by the extension-walker unit. UAPI
+changes:
+- i915 GEM_CONTEXT_CREATE_EXT applies each SETPARAM at its own link, as
+  `create_setparam` does. A create-time SSEU payload of 32 bytes or more is
+  now ENODEV.
+- i915 execbuffer fence arrays are resolved entry by entry, in Linux's errno
+  order. The 4096-entry caps are gone; only arrays beyond 131072 entries
+  (KMALLOC_MAX_SIZE) are ENOMEM.
+- The Xe exec-queue timeslice is bounded to Linux's Kconfig defaults,
+  1..10000000 µs.
+
+Both this unit and the extension-walker integration corrected the same
+self-referencing LOW_LATENCY fixture to E2BIG. One version is kept, with this
+unit's comment. One targeted release run passed 162 tests with no failures.
+It covered the render, user, i915-balance, i915-async, GuC-GT, GT-IRQ, Xe and
+context prefixes.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
