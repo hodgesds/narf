@@ -1568,9 +1568,25 @@ chain below is composed.
   (secondary above ⇒ `VHT_DATA_SC_20_LOWER_OF_80MHZ` 2, below ⇒ upper 1)
   into `0x483`, `RRFMOD` `0x00300201` and `[5:2]`, `RCCAONSEC[31:28]`,
   1T1R `RL1PEAKTH` 8 (6 when `reg_837` BIT(2)), `RCCK_SYSTEM` BIT(4) for
-  an upper primary, RF `0x18[11:10] = 1` on paths A and B. 5 GHz and
-  80 MHz permissions are still refused (`State`) until the band switch and
-  BW80 programming exist. The station owner requests a 40 MHz permission
+  an upper primary, RF `0x18[11:10] = 1` on paths A and B. 5 GHz
+  permissions (20/40/80 MHz) are programmed too: `switch_wirelessband(5G)`
+  8821AE branch (`RA_RFE_PINMUX` LNA 5 / PAPE 4, `REG_CCK_CHECK` 0x80, the
+  bounded 50 x 50 us `REG_TXPKT_EMPTY[5:4]` wait Linux continues past,
+  `RA_TXSCALE[11:8] = 1`, `RTXPATH[7:4] = 0`, `RCCK_RX[27:24] = 0xf`, the
+  5 GHz swing); the 8821AE branch has no RFE-type programming (the RFE
+  pin tables are 8812AE-only), so no RFE type needs refusing here.
+  `sw_chnl_callback` ranges: `RFC_AREA` 0x494 (36-48) / 0x453 (50-64) /
+  0x452 (100-116) / 0x412 (118+), RF 0x18 band 0x101 / 0x301 / 0x501, RF
+  `RF_APK` 0x114e9 (36-64) / 0x110e9; TXAGC skips CCK at 5 GHz;
+  `set_bw_mode_callback(80)`: `REG_TRXPTCL_CTL` BIT(8) set / BIT(7) clear,
+  `0x483 = sc40 << 4 | sc20` from the primary's position in the 80 MHz
+  block (`channel::data_sc80`), `RRFMOD` `0x00300202` and `[5:2]`,
+  `RADC_BUF_CLK[30] = 1`, `RCCAONSEC`, 1T1R `RL1PEAKTH` 7 (5 when
+  `reg_837` BIT(2)), RF `0x18[11:10] = 0`. IQK runs at the permission's
+  band (`0xc8c` 5 GHz values); at 80 MHz it is refused before any I/O
+  (VDF branch not implemented). `rtl8821ae_phy_lc_calibrate` is empty in
+  Linux. Test `smoke_rtl8821ae_5ghz_band_channel_and_bw80` (written,
+  unexecuted). No station path requests a 5 GHz permission yet. The station owner requests a 40 MHz permission
   for an HT40 AP (HT20/40 station, below). No board values are supplied by the
   format. Tests
   `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`,

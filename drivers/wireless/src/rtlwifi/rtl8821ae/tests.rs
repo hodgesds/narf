@@ -1327,13 +1327,16 @@ fn smoke_rtl8821ae_napc_v2_permission_bw40_and_5ghz() -> TestResult {
     {
         return TestResult::Fail("unmeasured 80 MHz primary admitted");
     }
-    // 5 GHz is not programmed by the 2.4 GHz channel path.
+    // A 5 GHz permission is programmed through the 5 GHz band switch.
     let p = cal
         .permission_for(&domain, op(Band::B5g, Width::W20, 36))
         .unwrap();
     let io = RegFake(IrqSafeSpinLock::new((vec![0u8; 0x1000], Vec::new())));
-    if narf_scheduler::block_on(channel::configure(&io, &p, 0)).is_ok() {
-        return TestResult::Fail("5 GHz permission programmed as 2.4 GHz 20 MHz");
+    if narf_scheduler::block_on(channel::configure(&io, &p, 0)).is_err()
+        || (u32::from_le_bytes(io.0.lock().0[0x860..0x864].try_into().unwrap()) >> 17) & 0xfff
+            != 0x494
+    {
+        return TestResult::Fail("5 GHz permission not programmed as 5 GHz 20 MHz");
     }
     // 2.4 GHz 40 MHz, primary 1 + secondary above: wide channel 3, primary
     // is the lower 20 MHz (data SC 2), reg_837 BIT(2) => L1 peak 6.
@@ -2005,4 +2008,110 @@ fn smoke_rtl8821ae_recovery_poweroff_and_enable_order() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_recovery_poweroff_and_enable_order
+);
+
+// ── 5 GHz band switch, channel and 80 MHz bandwidth ──────────────────────
+
+/// `rtl8821ae_phy_switch_wirelessband(BAND_ON_5G)` (8821AE pins, CCK_CHECK,
+/// AGC table 1, OFDM-only RX path), `sw_chnl_callback` 5 GHz ranges incl.
+/// `RF_APK`, TXAGC without CCK, `set_bw_mode_callback(80)` and the 80 MHz
+/// `_rtl8821ae_phy_get_secondary_chnl` from the primary's position.
+fn smoke_rtl8821ae_5ghz_band_channel_and_bw80() -> TestResult {
+    use envelope::{Band, Operating, Width};
+    use narf_wireless::reg::*;
+    if channel::data_sc80(0) != Some(0xa4)
+        || channel::data_sc80(1) != Some(0xa2)
+        || channel::data_sc80(2) != Some(0x91)
+        || channel::data_sc80(3) != Some(0x93)
+        || channel::data_sc80(4).is_some()
+    {
+        return TestResult::Fail("80 MHz sub-channel mapping");
+    }
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x05],
+        logical: powered_logical_5g(2),
+    };
+    let Ok(cal) = envelope::Calibration::from_verified(
+        &napc_v2(&factory, &[(36, 1, 20, 0), (36, 1, 80, 0)], 30, false),
+        Some([1; 32]),
+        &factory,
+    ) else {
+        return TestResult::Fail("v2 envelope rejected");
+    };
+    let domain = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 5170,
+            freq_end_mhz: 5250,
+            max_bandwidth_mhz: 80,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    };
+    let run = |width| {
+        let p = cal
+            .permission_for(
+                &domain,
+                Operating {
+                    band: Band::B5g,
+                    width,
+                    channel: 36,
+                },
+            )
+            .ok()?;
+        let mut regs = vec![0u8; 0x1000];
+        regs[0x668] = 0xff;
+        regs[0x669] = 0x01;
+        regs[0x41a] = 0x30;
+        regs[0xc20] = 0x5a;
+        let io = RegFake(IrqSafeSpinLock::new((regs, Vec::new())));
+        narf_scheduler::block_on(channel::configure(&io, &p, 0)).ok()?;
+        Some(io)
+    };
+    let Some(io) = run(Width::W80) else {
+        return TestResult::Fail("5 GHz 80 MHz configure failed on model");
+    };
+    let g = io.0.lock();
+    let (r, trace) = (&g.0, &g.1);
+    let r32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+    if r32(0xcb0) & 0xf0f0 != 0x5040
+        || (r32(0xc1c) >> 8) & 0xf != 1
+        || (r32(0x80c) >> 4) & 0xf != 0
+        || (r32(0xa04) >> 24) & 0xf != 0xf
+        || !trace.contains(&(1, 0x454, 0x80))
+    {
+        return TestResult::Fail("switch_wirelessband(5G) effects");
+    }
+    if (r32(0x860) >> 17) & 0xfff != 0x494 || r[0xc20] != 0x5a {
+        return TestResult::Fail("RFC_AREA 5 GHz value / CCK TXAGC written at 5 GHz");
+    }
+    let lssi: Vec<u32> = trace
+        .iter()
+        .filter(|w| w.1 == phy::RA_LSSIWRITE)
+        .map(|w| w.2)
+        .collect();
+    // RF 0x18 band (0x101 at ch 36..64), channel byte = center 42, RF_APK.
+    if lssi.len() != 4
+        || lssi[0] & 0x7_0300 != 0x1_0100
+        || lssi[1] & 0xff != 42
+        || lssi[2] != (0x63 << 20 | 0x114e9)
+        || lssi[3] & (3 << 10) != 0
+    {
+        return TestResult::Fail("RF 0x18 5 GHz band/channel, RF_APK, BW80 bits");
+    }
+    if u16::from_le_bytes([r[0x668], r[0x669]]) & 0x0180 != 0x0100
+        || r[0x483] != 0xa4
+        || r32(0x8ac) & 0x0030_03c3 != 0x0030_0202
+        || (r32(0x8ac) >> 2) & 0xf != 4
+        || r32(0x838) >> 28 != 4
+        || r32(0x8c4) & (1 << 30) == 0
+        || (r32(0x848) >> 22) & 0xf != 7
+    {
+        return TestResult::Fail("set_bw_mode(80 MHz) effects");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_5ghz_band_channel_and_bw80
 );
