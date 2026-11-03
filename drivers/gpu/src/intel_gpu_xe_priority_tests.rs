@@ -72,7 +72,7 @@ fn registered_info(
     (mailbox, info, index)
 }
 // Independently decode pending CT bytes, before the firmware consumes them.
-fn policy(w: &Window, priority: u32) -> bool {
+fn policy(w: &Window, priority: u32, timeslice: u32) -> bool {
     let memory = ct_memory(w);
     let words = memory.borrow();
     let mut head = words[0];
@@ -86,7 +86,7 @@ fn policy(w: &Window, priority: u32) -> bool {
                 .collect();
             assert_eq!(
                 got,
-                [0x20030001, priority, 0x20010001, 1000, 0x20020001, 500000]
+                [0x20030001, priority, 0x20010001, timeslice, 0x20020001, 500000]
             );
             found = true;
         }
@@ -101,11 +101,12 @@ fn run_policy(
     registered: &mut BTreeMap<u32, u32>,
     start: u64,
     priority: u32,
+    timeslice: u32,
 ) {
     let mut observed = false;
     for now in start..start + 100 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
-        observed |= policy(w, priority);
+        observed |= policy(w, priority, timeslice);
         service_contexts(w, registered, true);
         if fence.result().is_some() {
             break;
@@ -321,7 +322,7 @@ fn smoke_xe_priority_real_rcs_copy_policy_and_retained_creator_grant() -> TestRe
                     exec_wire(&user, queue, true, &[]);
                     let (context, fence) = accept(&file, &info, &user, &mailbox, &mut gt, now);
                     let mut registered = BTreeMap::new();
-                    run_policy(&mut gt, &w, &fence, &mut registered, now + 1, firmware);
+                    run_policy(&mut gt, &w, &fence, &mut registered, now + 1, firmware, 1000);
                     assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
                     assert!(!context.busy() && !context.banned());
                     now += 200;
@@ -394,7 +395,7 @@ fn smoke_xe_priority_virtual_and_parallel_migration_preserve_policy_and_gpu_join
             }
             let (context, fence) = accept(&file, &info, &user, &mailbox, &mut gt, now);
             let mut registered = BTreeMap::new();
-            run_policy(&mut gt, &w, &fence, &mut registered, now + 1, 1);
+            run_policy(&mut gt, &w, &fence, &mut registered, now + 1, 1, 1000);
             assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
             if width == 2 {
                 assert_eq!(
@@ -449,7 +450,7 @@ fn smoke_xe_priority_canceled_parallel_ioctl_close_retains_until_full_reset() ->
     let mut observed = false;
     for now in 501..540 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
-        observed |= policy(&w, 1);
+        observed |= policy(&w, 1, 1000);
         service_contexts(&w, &mut registered, false);
     }
     assert!(observed && context.busy() && fence.result().is_none());
@@ -480,4 +481,77 @@ fn smoke_xe_priority_canceled_parallel_ioctl_close_retains_until_full_reset() ->
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_xe_priority_canceled_parallel_ioctl_close_retains_until_full_reset
+);
+
+fn timeslice(user: &Cpu, value: u64) {
+    let mut ext = [0; 48];
+    put32(&mut ext, 16, 1); // DRM_XE_EXEC_QUEUE_SET_PROPERTY_TIMESLICE
+    put64(&mut ext, 24, value);
+    user.wire.store(8192, &ext);
+    user.wire.store(64, &8192u64.to_le_bytes());
+}
+
+/// MIT Linux b90c984d xe_exec_queue.c::exec_queue_set_timeslice:628 takes
+/// its bound from xe_exec_queue_get_prop_minmax:586: the Kconfig.profile
+/// defaults DRM_XE_TIMESLICE_MIN=1 and DRM_XE_TIMESLICE_MAX=10000000 us,
+/// with or without CAP_SYS_NICE, compared inclusively as u64.
+/// xe_guc_submit.c::init_policies then sends the value unchanged as the
+/// EXECUTION_QUANTUM (0x2001) KLV.
+fn smoke_xe_timeslice_bounds_follow_kconfig_defaults() -> TestResult {
+    let _caller = Caller::new(false);
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (mailbox, info, _) = registered_info(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let vm = create_vm(&file, &info, &user);
+    for nice in [false, true] {
+        NICE.store(nice, Ordering::Release);
+        for value in [0, 10_000_001, 1 << 32 | 1000, u64::MAX] {
+            queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
+            timeslice(&user, value);
+            assert_eq!(
+                invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
+                Err(FsError::InvalidData),
+                "timeslice {value}"
+            );
+            assert_eq!(u32_at(&user.wire.load(64, 48), 20), 0);
+        }
+    }
+    NICE.store(false, Ordering::Release);
+    // Both boundaries, and a value past the 100000 us NARF once capped at,
+    // reach GuC unchanged.
+    buffers(&file, &info, &user, vm);
+    let mut now = 500;
+    for value in [1, 100_001, 10_000_000] {
+        queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
+        timeslice(&user, value);
+        assert_eq!(invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE), Ok(0));
+        let queue = u32_at(&user.wire.load(64, 48), 20);
+        exec_wire(&user, queue, true, &[]);
+        let (context, fence) = accept(&file, &info, &user, &mailbox, &mut gt, now);
+        let mut registered = BTreeMap::new();
+        run_policy(&mut gt, &w, &fence, &mut registered, now + 1, 2, value as u32);
+        assert!(!context.busy() && !context.banned());
+        assert_eq!(
+            close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+            Ok(0)
+        );
+        now += 200;
+    }
+    for value in [0, 10_000_001] {
+        assert_eq!(
+            UserContext::new().configure_schedule(2, value),
+            Err(FsError::InvalidData)
+        );
+    }
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_timeslice_bounds_follow_kconfig_defaults
 );

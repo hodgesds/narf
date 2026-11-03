@@ -1555,7 +1555,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 // User HIGH1, KMD_NORMAL2 and NORMAL3; KMD_HIGH0 remains
                 // unavailable to the native userspace queue profile.
                 assert!((1..=3).contains(&request[3]));
-                assert!((1..=100_000).contains(&request[5]));
+                // EXECUTION_QUANTUM: exec_queue_set_timeslice's 1..10000000 us.
+                assert!((1..=10_000_000).contains(&request[5]));
                 assert_eq!(request.len(), 10);
                 // xe_hw_engine.c raises class OTHER's preempt timeout to at
                 // least 600 ms; every other class keeps NARF's 500 ms.

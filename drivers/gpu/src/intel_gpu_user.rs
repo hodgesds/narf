@@ -446,8 +446,14 @@ impl UserContext {
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
     }
+    /// GuC priority 1..3 and the EXECUTION_QUANTUM (0x2001) KLV value in
+    /// microseconds: init_policies passes q->sched_props.timeslice_us
+    /// unchanged, so the whole exec_queue_set_timeslice range reaches GuC.
     pub(crate) fn configure_schedule(&self, priority: u32, timeslice: u32) -> Result<(), FsError> {
-        if !(1..=3).contains(&priority) || !(1..=100_000).contains(&timeslice) {
+        use crate::intel_gpu_xe::{TIMESLICE_MAX_US, TIMESLICE_MIN_US};
+        if !(1..=3).contains(&priority)
+            || !(TIMESLICE_MIN_US..=TIMESLICE_MAX_US).contains(&u64::from(timeslice))
+        {
             return Err(FsError::InvalidData);
         }
         let mut state = self.state.lock();

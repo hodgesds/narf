@@ -112,6 +112,13 @@ const MULTI_QUEUE_PRIORITY: u32 = 5;
 const QUEUE_PROPERTIES: u32 = 6;
 /// XE_EXEC_QUEUE_PRIORITY_HIGH and XE_MULTI_QUEUE_PRIORITY_HIGH.
 const PRIORITY_HIGH: u64 = 2;
+/// xe_hw_engine.h XE_HW_ENGINE_TIMESLICE_MIN/MAX: the Kconfig.profile
+/// defaults DRM_XE_TIMESLICE_MIN=1 and DRM_XE_TIMESLICE_MAX=10000000 (us).
+/// hw_engine_init_early installs them as every class's
+/// sched_props.timeslice_min/max, which NARF exposes no sysfs to retune, so
+/// xe_exec_queue_get_prop_minmax yields them with or without CAP_SYS_NICE.
+pub(crate) const TIMESLICE_MIN_US: u64 = 1;
+pub(crate) const TIMESLICE_MAX_US: u64 = 10_000_000;
 
 /// What an EXEC_QUEUE_CREATE extension chain configured.
 struct QueueProperties {
@@ -188,8 +195,13 @@ fn exec_queue_extensions(
                 }
                 queue.priority = 3 - value as u32;
             }
-            // exec_queue_set_timeslice.
-            TIMESLICE if (1..=100_000).contains(&value) => queue.timeslice = value as u32,
+            // exec_queue_set_timeslice: with the default
+            // CONFIG_DRM_XE_ENABLE_SCHEDTIMEOUT_LIMIT=y the limit is always
+            // enforced, by xe_hw_engine_timeout_in_range's inclusive u64
+            // compare.
+            TIMESLICE if (TIMESLICE_MIN_US..=TIMESLICE_MAX_US).contains(&value) => {
+                queue.timeslice = value as u32
+            }
             TIMESLICE => return Err(FsError::InvalidData),
             // xe_exec_queue.c::exec_queue_set_pxp_type: NONE is the
             // default; only HWDRM is a session type, and without an

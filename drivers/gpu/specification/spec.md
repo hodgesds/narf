@@ -611,8 +611,10 @@ including virtual/parallel execution and credential changes, as in Linux.
 GuC KMD_HIGH (0) is never granted. CONFIG reports max priority 1 or 2 for the
 current caller only on an exact-size payload request; size negotiation and
 invalid-size requests do not sample authority or touch the payload.
-Timeslices are bounded to 1..100000 microseconds; flags, instances and
-malformed reserved fields fail before publication.
+Timeslices follow exec_queue_set_timeslice with Kconfig.profile's default
+DRM_XE_TIMESLICE_MIN/MAX: 1..10000000 microseconds inclusive for every caller
+(EINVAL outside), sent to GuC unchanged as the EXECUTION_QUANTUM KLV; flags,
+instances and malformed reserved fields fail before publication.
 
 Default visible local memory: `RegisterInit` captures stable SG_TILE_ADDR_RANGE(0),
 platform-specific flat-CCS base and GSMBASE. BMG uses the qualified Xe2 range
