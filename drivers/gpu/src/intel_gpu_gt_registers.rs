@@ -601,9 +601,6 @@ impl RegisterInit {
         mmio: &impl MmioWindow,
         now: u64,
     ) -> Poll<Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError>> {
-        if now >= self.deadline {
-            return Poll::Ready(Err(RegisterError::Timeout));
-        }
         if self
             .media_fuse
             .is_some_and(|fuse| mmio.read32(0x9140) != fuse)
@@ -617,7 +614,13 @@ impl RegisterInit {
                 return Poll::Ready(Err(RegisterError::Unavailable));
             }
             if semaphore & 1 == 0 {
-                return Poll::Pending;
+                // mcr_lock's xe_mmio_wait32 reads once more after expiry: a
+                // late poll that is granted the semaphore programs.
+                return if now >= self.deadline {
+                    Poll::Ready(Err(RegisterError::Timeout))
+                } else {
+                    Poll::Pending
+                };
             }
         }
         let selector = if modern { 0xfd4 } else { 0xfdc };

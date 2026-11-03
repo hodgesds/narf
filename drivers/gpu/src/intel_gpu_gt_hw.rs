@@ -556,9 +556,22 @@ impl HardwareInit {
         if !current() {
             return Poll::Ready(Err(HardwareError::Unavailable));
         }
-        if now >= self.deadline {
-            return Poll::Ready(Err(HardwareError::Timeout));
+        // i915 __wait_for / xe_mmio_wait32: the forcewake ACK, GDRST, GuC
+        // status/DMA and steering-semaphore reads below precede the
+        // deadline. A late poll that finds the awaited state progresses;
+        // only a wait that is still unsatisfied fails. Which bound covers
+        // which wait is unchanged.
+        match self.advance(mmio, now, &mut current) {
+            Poll::Pending if now >= self.deadline => Poll::Ready(Err(HardwareError::Timeout)),
+            result => result,
         }
+    }
+    fn advance(
+        &mut self,
+        mmio: &impl MmioWindow,
+        now: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Poll<Result<CachePolicy, HardwareError>> {
         let ack = mmio.read32(0xd84);
         if ack == u32::MAX {
             return Poll::Ready(Err(HardwareError::Unavailable));
@@ -807,11 +820,13 @@ impl HardwareInit {
         if ack == u32::MAX {
             return Poll::Ready(Err(HardwareError::Unavailable));
         }
-        if now >= self.deadline {
-            return Poll::Ready(Err(HardwareError::Timeout));
-        }
         if self.requested && ack & 1 != 0 {
-            return Poll::Pending;
+            // A release ACK that cleared before a late poll is success.
+            return if now >= self.deadline {
+                Poll::Ready(Err(HardwareError::Timeout))
+            } else {
+                Poll::Pending
+            };
         }
         self.requested = false;
         self.ready = false;

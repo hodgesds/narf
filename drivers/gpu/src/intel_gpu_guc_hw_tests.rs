@@ -1238,6 +1238,76 @@ kernel_test_in!(
     smoke_hardware_grdom_full_cleared_before_late_poll_is_not_a_timeout
 );
 
+fn smoke_hardware_late_polls_after_settled_ack_reset_and_semaphore() -> TestResult {
+    // __wait_for / xe_mmio_wait32's final read: HardwareInit's GT ACK
+    // (50 ms) and inherited GRDOM_FULL (5 ms), and RegisterInit's steering
+    // semaphore (50 ms), each settle before a poll delayed past the bound.
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    gt.begin(0).unwrap();
+    w.0.borrow_mut().regs.insert(0xdfc, 1);
+    assert!(gt.poll(1).is_pending());
+    assert_eq!(gt.state(), GtState::PreparingHardware);
+    w.0.borrow_mut().regs.insert(0xd84, 1);
+    let mut now = 1 + 50_000_000 + 3;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(w.0.borrow().regs.get(&0x941c), Some(&8));
+    reset_done(&w);
+    w.0.borrow_mut().regs.insert(0xc314, 0);
+    now += 1;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(w.0.borrow().regs.get(&0x941c), Some(&1));
+    reset_done(&w);
+    now += 5_000_000 + 3;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(gt.state(), GtState::Booting);
+    reset_done(&w);
+    now += 1;
+    assert!(gt.poll(now).is_pending());
+    w.0.borrow_mut().regs.insert(0xc314, 0x10);
+    now += 1;
+    assert!(gt.poll(now).is_pending());
+    w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+    now += 1;
+    assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::Ready)));
+    if gt.has_hwconfig() {
+        gt.begin_hwconfig(now + 1).unwrap();
+        w.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+        assert!(gt.poll(now + 2).is_pending());
+        hwconfig_device_write(&w, &[7, 1, 8]);
+        w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+        assert_eq!(gt.poll(now + 3), Poll::Ready(Ok(GtState::Ready)));
+        now += 3;
+    }
+    now += 1;
+    let start = now;
+    gt.begin_scheduling(start).unwrap();
+    w.0.borrow_mut().regs.insert(0xfd0, 0);
+    assert!(gt.poll(start + 1).is_pending());
+    assert_eq!(gt.state(), GtState::PreparingScheduling);
+    w.0.borrow_mut().regs.insert(0xfd0, 1);
+    now = start + 50_000_000 + 3;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(gt.state(), GtState::StartingScheduling);
+    // The scheduling reload then completes under its own fresh bounds.
+    assert!(gt.poll(now + 1).is_pending());
+    reset_done(&w);
+    assert!(gt.poll(now + 2).is_pending());
+    reset_done(&w);
+    assert!(gt.poll(now + 3).is_pending());
+    w.0.borrow_mut().regs.insert(0xc314, 0x10);
+    assert!(gt.poll(now + 4).is_pending());
+    w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+    assert_eq!(gt.poll(now + 5), Poll::Ready(Ok(GtState::Ready)));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_late_polls_after_settled_ack_reset_and_semaphore
+);
+
 fn smoke_hardware_workaround_ip_change_blocks_reload() -> TestResult {
     let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
     hardware_discovery(&mut gt, &w, 0xdfc);
