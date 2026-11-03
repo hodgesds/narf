@@ -554,3 +554,101 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce
 );
+
+/// Station branch of the 8192EE owner: `rtl_op_add_interface` network type
+/// at start, `prepare_station_peer` (`HW_VAR_BSSID`/`BASIC_RATE`/slot/SIFS/
+/// `set_qos`/`ACK_PREAMBLE`), `complete_station_peer_admitted` (CAM reset,
+/// keep-alive, linked network type, join report), LPS enter/leave through
+/// the 8192EE mailbox, and `leave_station_peer` (NOLINK, MSRRPT
+/// disconnect, zero BSSID) — none of it on the 88EE paths.
+pub(crate) fn smoke_rtl8192ee_station_peer_join_lps_and_leave() -> TestResult {
+    use super::super::super::super::rtl8192ee::{h2c, mac, station as hw};
+    let bus = Bus::new();
+    let local = [2, 0, 0, 0, 0, 1];
+    let ap = [2, 0, 0, 0, 0, 9];
+    bus.0.lock().regs[usize::from(hw::MSR)] = 0x04;
+    let mut owner = running(&bus, local);
+    if bus.0.lock().regs[usize::from(hw::MSR)] != 0x04
+        || bus.read32(mac::REG_RCR).unwrap()
+            != mac::RECEIVE_CONFIG & !(hw::RCR_CBSSID_DATA | hw::RCR_CBSSID_BCN)
+        || !bus.traced((8, 0x541, 0x64))
+        || !bus.traced((8, 0x511, 0x66))
+    {
+        return TestResult::Fail("start: rtl92ee_set_network_type(STATION) NOLINK");
+    }
+    // Basic {1, 2, 5.5, 11}, supported adds OFDM: RRSR from supp_rates.
+    let rates = 0x0fff;
+    let basic = 0x000f;
+    if narf_scheduler::block_on(owner.prepare_station_peer(ap, rates, basic, 0x0421)).is_err() {
+        return TestResult::Fail("8192EE prepare_station_peer");
+    }
+    let rrsr = hw::basic_rate(rates);
+    if rrsr != 0x015d
+        || !bus.traced((8, 0x440, 0x5d))
+        || !bus.traced((8, 0x441, 0x01))
+        || !bus.traced((8, 0x51b, 9))
+        || !bus.traced((8, 0x515, 0x0a))
+        || !bus.traced((8, 0x517, 0x0a))
+        || !bus.traced((8, 0x429, 0x0a))
+        || !bus.traced((8, 0x63b, 0x0a))
+        || !bus.traced((16, 0x63e, 0x0e0e))
+        || !bus.traced((32, 0x50c, 0xa44f))
+        || !bus.traced((32, 0x504, 0x5e_4322))
+        || !bus.traced((32, 0x500, 0x2f_3222))
+        || !bus.traced((8, 0x442, 0x80))
+        || (0..6).any(|i| bus.0.lock().regs[0x618 + i] != ap[i])
+    {
+        return TestResult::Fail("BSSID / RRSR / slot / SIFS / set_qos / ACK preamble");
+    }
+    if narf_scheduler::block_on(owner.prepare_station_peer([1, 0, 0, 0, 0, 0], rates, basic, 0))
+        != Err(Error::Packet)
+    {
+        return TestResult::Fail("multicast BSSID accepted");
+    }
+    let before = owner.packet.ee92.mailbox.next_box();
+    let policy = |_: &Prepared<Bus, Block>| Ok(());
+    if narf_scheduler::block_on(owner.complete_station_peer_admitted(ap, 5, None, policy)).is_err()
+        || owner.phase() != Phase::Running
+        || owner.packet.reserved.is_none()
+    {
+        return TestResult::Fail("8192EE complete_station_peer_admitted");
+    }
+    let keep_alive = 0x1d0 + u16::from(before) * 4;
+    if !bus.traced((32, hw::REG_CAMCMD, hw::CAM_RESET))
+        || !bus.traced((8, keep_alive, u32::from(h2c::H2C_KEEP_ALIVE_CTRL)))
+        || !bus.traced((8, keep_alive + 1, 0xff))
+        || !bus.traced((8, keep_alive + 2, 10))
+        || bus.0.lock().regs[usize::from(hw::MSR)] != 0x04 | hw::MSR_INFRA
+        || bus.read32(mac::REG_RCR).unwrap()
+            != mac::RECEIVE_CONFIG | hw::RCR_CBSSID_DATA | hw::RCR_CBSSID_BCN
+        || bus.0.lock().regs[0x6a8] != 5
+    {
+        return TestResult::Fail("CAM reset / keep-alive / linked network type / AID");
+    }
+    let entered = narf_scheduler::block_on(owner.enter_leisure()).is_ok()
+        && owner.leisure()
+        && !owner.packet.ee92.mailbox.ps_active;
+    let left = narf_scheduler::block_on(owner.leave_leisure()).is_ok()
+        && !owner.leisure()
+        && owner.packet.ee92.mailbox.ps_active;
+    if !entered || !left || !bus.traced((8, 0x3dc, 0x80)) || !bus.traced((8, 0x3dc, 0x00)) {
+        return TestResult::Fail("8192EE fwlps enter/leave");
+    }
+    if narf_scheduler::block_on(owner.leave_station_peer()).is_err()
+        || owner.phase() != Phase::Running
+        || owner.packet.reserved.is_some()
+        || owner.packet.retired.is_empty()
+        || owner.packet.ee92.link.is_some()
+        || bus.0.lock().regs[usize::from(hw::MSR)] != 0x04
+        || bus.read32(mac::REG_RCR).unwrap()
+            != mac::RECEIVE_CONFIG & !(hw::RCR_CBSSID_DATA | hw::RCR_CBSSID_BCN)
+        || (0..6).any(|i| bus.0.lock().regs[0x618 + i] != 0)
+    {
+        return TestResult::Fail("leave_station_peer NOLINK / MSRRPT / BSSID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_station_peer_join_lps_and_leave
+);

@@ -293,6 +293,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8821ae() {
             return self.ae_awake_station();
         }
+        if self.rtl8192ee() {
+            return self.ee92_awake_station();
+        }
         if self.phase != Phase::MacConfigured {
             return Err(Error::State);
         }
@@ -310,6 +313,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<(), Error> {
         if self.rtl8821ae() {
             return self.ae_prepare_peer(peer, rates, basic, capability);
+        }
+        if self.rtl8192ee() {
+            return self.ee92_prepare_peer(peer, rates, basic, capability);
         }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
@@ -340,6 +346,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<(), Error> {
         if self.rtl8821ae() {
             return self.ae_complete_peer(peer, aid, admission, policy).await;
+        }
+        if self.rtl8192ee() {
+            return self.ee92_complete_peer(peer, aid, admission, policy).await;
         }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
@@ -494,6 +503,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         admission: Option<&super::station::Admission>,
     ) -> Result<(), Error> {
         if self.rtl8821ae()
+            || self.rtl8192ee()
             || !self.transmit_ready()
             || self.packet.leisure
             || self.packet.local.is_none()
@@ -532,6 +542,40 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.ae_install_rate_mask(payload, admission).await
     }
+    /// 8192EE `rtl92ee_update_hal_rate_mask` (`H2C_92E_RA_MASK`) for `peer`
+    /// at DM `level`, bounded by the permission's `admitted` rates
+    /// (`packet_owner.rs::ee92_install_rate_mask`). Records the RA link the
+    /// watchdog refreshes and the `ratr_index` the data descriptors carry.
+    pub(crate) async fn install_rtl8192ee_rate_mask(
+        &mut self,
+        peer: super::super::rtl8192ee::h2c::Peer,
+        bw40: bool,
+        level: u8,
+        admitted: u32,
+    ) -> Result<(), Error> {
+        if !self.rtl8192ee() {
+            return Err(Error::State);
+        }
+        self.ee92_install_rate_mask(peer, bw40, level, admitted)
+            .await?;
+        self.packet.rate_mask = self.packet.ee92.link.map(|(_, _, index)| index);
+        Ok(())
+    }
+    /// 8192EE composed `rtl92ee_dm_watchdog` step
+    /// (`packet_owner.rs::ee92_dm_watchdog`). Returns whether the RA mask
+    /// was refreshed.
+    pub(crate) async fn rtl8192ee_dm_watchdog(
+        &mut self,
+        undec_sm_pwdb: i64,
+        admitted: u32,
+    ) -> Result<bool, Error> {
+        if !self.rtl8192ee() {
+            return Err(Error::State);
+        }
+        let refreshed = self.ee92_dm_watchdog(undec_sm_pwdb, admitted).await?;
+        self.packet.rate_mask = self.packet.ee92.link.map(|(_, _, index)| index);
+        Ok(refreshed)
+    }
     /// RTL8821AE: the latest C2H TX report matched to its frame.
     pub(crate) fn take_rtl8821ae_tx_report(&mut self) -> Option<ae::TxReport> {
         if !self.rtl8821ae() {
@@ -567,6 +611,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8821ae() {
             return self.ae_enter_leisure().await;
         }
+        if self.rtl8192ee() {
+            return self.ee92_enter_leisure().await;
+        }
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
@@ -581,6 +628,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     pub(crate) async fn leave_leisure(&mut self) -> Result<(), Error> {
         if self.rtl8821ae() {
             return self.ae_leave_leisure().await;
+        }
+        if self.rtl8192ee() {
+            return self.ee92_leave_leisure().await;
         }
         if self.phase != Phase::Running || !self.packet.leisure {
             return Err(Error::State);
@@ -611,6 +661,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Failed;
         if self.rtl8821ae() {
             self.ae_disconnected().await?;
+        } else if self.rtl8192ee() {
+            self.ee92_disconnected().await?;
         } else {
             if core::mem::take(&mut self.packet.leisure) {
                 self.packet.mailbox.awake(&self.io).await?;
@@ -669,8 +721,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
-        if self.rtl8821ae() {
-            let report = self.ae_disconnected().await;
+        if self.rtl8821ae() || self.rtl8192ee() {
+            let report = if self.rtl8821ae() {
+                self.ae_disconnected().await
+            } else {
+                self.ee92_disconnected().await
+            };
             let stopped = self.stop_packets();
             if stopped.is_ok() {
                 let _ = self.quiesce().await;

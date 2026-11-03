@@ -2361,11 +2361,55 @@ diagnostic (`pci::bring_up` does not retain it).
   `power_runtime::disable_rtl8192ee` and keeps ASPM disabled; the
   rebuild's re-enable still refuses `0x818b` (no 8192EE provisioning
   path yet). The station loop's smoothed PWDB feed and the per-board
-  admitted set come with the station branch (not composed yet). Tests
+  admitted set are composed by the station branch (below). Tests
   `smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce`,
   `smoke_rtl8192ee_poweroff_adapter_order` (written, unexecuted);
   `smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack` now expects the
   `ee92_quiesce` proof (its earlier `Err(State)` assertion predated it).
+- Station branch (`station_power::{Base,Grant}::Rtl8192ee`, `station.rs`,
+  `ht_width.rs`, `rtl8192ee/station.rs`, `packet_owner.rs`): the signed
+  `N92E` calibration is staged as the station power base
+  (`stage_rtl8192ee_calibration`, `regrant` = `permission_for` at the same
+  operating point, `with_current` = the envelope's firmware-asset
+  authority; no 88EE HT/protection/tracking/antenna/fallback grant is
+  admitted, `power_wait` → `station_power::wait_rtl8192ee`) and
+  `station_grant` returns the programmed `rtl8192ee_power`. Every
+  `packet.rs` station path dispatches to an 8192EE arm instead of the 88EE
+  one: `awake_station` (`rtl92ee_hw_init` leaves the firmware awake;
+  `REG_CR != 0xEA`, nothing sent), `prepare_station_peer` (`HW_VAR_BSSID`,
+  `HW_VAR_BASIC_RATE` = `((supp_rates & 0x15f) | 1 | 0xd) & ~BIT(1)` as two
+  RRSR bytes — Linux passes `sta->supp_rates[0]`, not the basic set —,
+  `rtl92ee_update_channel_access_setting` (slot 9/20, SIFS `0x0a0a` /
+  `0x0e0e` with HT, `REG_RESP_SIFS_OFDM` `0x0e0e`), the fixed
+  `rtl92ee_set_qos` BK/VI/VO rows (also for every WMM update) and
+  `HW_VAR_ACK_PREAMBLE` (`REG_RRSR + 2 = cur_40_prime_sc << 5 | short <<
+  7`)), `complete_station_peer_admitted` (`rtl_cam_reset_all_entry`,
+  `HW_VAR_KEEP_ALIVE` 10, `rtl92ee_set_network_type` linked — MSR INFRA,
+  RCR CBSSID_DATA|BCN on the cached `receive_config`, BCN_CTRL BIT(4)
+  cleared — then `ee92_join_report`), `enter/leave_leisure`
+  (`_rtl92ee_fwlps_enter/leave`), `leave_station_peer` /
+  `disconnect_station_peer` (leave LPS, NOLINK network type, MSRRPT
+  disconnect, zero BSSID; the RA link is withdrawn, `ratr_state` kept as
+  Linux). `start_packets` issues `rtl_op_add_interface`'s NOLINK network
+  type with read-back of the CBSSID-clear RCR. The 88EE
+  `install_rate_mask` refuses 8192EE; the association mask is
+  `install_rtl8192ee_rate_mask` (`update_rate_tbl(sta, 0, true)`: peer
+  `supp_rates[0]`, intersected TX MCS, SGI, `bw_40`; the permission's
+  `admitted_rates()` bound) inside the envelope authority, and the station
+  watchdog (`refresh_station_rate_mask`) runs `ee92_dm_watchdog` with the
+  station loop's smoothed `undec_sm_pwdb`, which the RX path now feeds:
+  `ee92_receive_step` decodes `rx_pwdb_all` from the PHY status
+  (`status.physt`, driver info >= 8 bytes; CCK at rates <= 11M with the
+  retained `cck_high_power`). `retune_rtl8192ee` (join and Configuring)
+  re-derives the `N92E` permission for the offered width on the
+  provisioned primary and runs `configure_rtl8192ee_channel` inside it
+  (no frame outstanding, receive epoch retired). Still legacy-only at this
+  step: the join plan offers no HT (`rtl8192ee/ht.rs` holds the 2T2R
+  capability, `admitted`/`two_stream` and the `HW_VAR_AMPDU_FACTOR`
+  timing, not yet composed), DATA keeps the forced legacy rate and
+  `0x818b` is not admitted at probe. Test
+  `smoke_rtl8192ee_station_peer_join_lps_and_leave`
+  (`packet_owner_tests.rs`, written, unexecuted).
 - `rsvd_page` — `fw.c::reserved_page_packet` verbatim (1024 bytes, eight
   128-byte pages: beacon 0..=1, PS-Poll 2, Null 3, probe response 4..=5,
   QoS-Null 6, BT-QoS-Null 7; sha256 `7182a1ec…7ff043` recorded; Linux's

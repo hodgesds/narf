@@ -6,20 +6,24 @@
 //! the permission programmed into the hardware. RTL8188EE uses the `NEPC`
 //! legacy envelope (`channel_power`) plus its optional HT/protection/
 //! tracking/antenna/fallback grants; RTL8821AE uses the `NAPC` envelope
-//! (`rtl8821ae::envelope`) and admits none of those 88EE extensions.
-use super::{channel_power, prepare, rtl8821ae::envelope};
+//! (`rtl8821ae::envelope`) and admits none of those 88EE extensions;
+//! RTL8192EE uses the `N92E` envelope (`rtl8192ee::envelope`), likewise
+//! without any 88EE extension.
+use super::{channel_power, prepare, rtl8192ee::envelope as ee92, rtl8821ae::envelope};
 use alloc::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) enum Base {
     Rtl8188ee(Arc<channel_power::Calibration>),
     Rtl8821ae(Arc<envelope::Calibration>),
+    Rtl8192ee(Arc<ee92::Calibration>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Grant {
     Rtl8188ee(channel_power::Permission),
     Rtl8821ae(envelope::Permission),
+    Rtl8192ee(ee92::Permission),
 }
 
 impl Grant {
@@ -27,13 +31,14 @@ impl Grant {
         match self {
             Self::Rtl8188ee(p) => p.channel(),
             Self::Rtl8821ae(p) => p.channel(),
+            Self::Rtl8192ee(p) => p.channel(),
         }
     }
     /// The 88EE permission the 88EE-only grants are checked against.
     pub(crate) fn ee(&self) -> Option<channel_power::Permission> {
         match self {
             Self::Rtl8188ee(p) => Some(*p),
-            Self::Rtl8821ae(_) => None,
+            Self::Rtl8821ae(_) | Self::Rtl8192ee(_) => None,
         }
     }
 }
@@ -44,14 +49,21 @@ impl Base {
     pub(crate) fn ee(&self) -> Option<&Arc<channel_power::Calibration>> {
         match self {
             Self::Rtl8188ee(base) => Some(base),
-            Self::Rtl8821ae(_) => None,
+            Self::Rtl8821ae(_) | Self::Rtl8192ee(_) => None,
         }
     }
     /// The 8821AE `NAPC` calibration.
     pub(crate) fn rtl8821ae(&self) -> Option<&Arc<envelope::Calibration>> {
         match self {
-            Self::Rtl8188ee(_) => None,
             Self::Rtl8821ae(base) => Some(base),
+            Self::Rtl8188ee(_) | Self::Rtl8192ee(_) => None,
+        }
+    }
+    /// The 8192EE `N92E` calibration.
+    pub(crate) fn rtl8192ee(&self) -> Option<&Arc<ee92::Calibration>> {
+        match self {
+            Self::Rtl8192ee(base) => Some(base),
+            Self::Rtl8188ee(_) | Self::Rtl8821ae(_) => None,
         }
     }
     /// Re-derive `current` under `domain`: the 88EE channel permission, or
@@ -69,7 +81,10 @@ impl Base {
             (Self::Rtl8821ae(base), Grant::Rtl8821ae(p)) => base
                 .permission_for(domain, p.operating())
                 .map(Grant::Rtl8821ae),
-            (Self::Rtl8821ae(_), Grant::Rtl8188ee(_)) => Err(channel_power::Error::Identity),
+            (Self::Rtl8192ee(base), Grant::Rtl8192ee(p)) => base
+                .permission_for(domain, p.operating())
+                .map(Grant::Rtl8192ee),
+            (Self::Rtl8821ae(_) | Self::Rtl8192ee(_), _) => Err(channel_power::Error::Identity),
         }
     }
     pub(crate) fn with_current<T>(
@@ -79,6 +94,7 @@ impl Base {
         match self {
             Self::Rtl8188ee(base) => base.with_current(operation),
             Self::Rtl8821ae(base) => base.with_current(operation),
+            Self::Rtl8192ee(base) => base.with_current(operation),
         }
     }
 }
@@ -89,6 +105,39 @@ impl Base {
 pub(crate) async fn wait_rtl8821ae<F: core::future::Future<Output = Result<(), prepare::Error>>>(
     base: Arc<envelope::Calibration>,
     grant: envelope::Permission,
+    environment: &impl prepare::station::Environment,
+    future: F,
+) -> Result<(), prepare::Error> {
+    let mut future = core::pin::pin!(future);
+    core::future::poll_fn(|cx| {
+        let operation = || {
+            let domain = environment
+                .domain()
+                .map_err(|_| prepare::Error::Power(channel_power::Error::Policy))?;
+            if base
+                .permission_for(&domain, grant.operating())
+                .map_err(prepare::Error::Power)?
+                != grant
+            {
+                return Err(prepare::Error::State);
+            }
+            Ok(future.as_mut().poll(cx))
+        };
+        match base.with_current(operation) {
+            Ok(core::task::Poll::Ready(result)) => core::task::Poll::Ready(result),
+            Ok(core::task::Poll::Pending) => core::task::Poll::Pending,
+            Err(error) => core::task::Poll::Ready(Err(error)),
+        }
+    })
+    .await
+}
+
+/// 8192EE analogue of [`wait_rtl8821ae`]: every poll of `future` runs
+/// inside the `N92E` envelope's current authority after the current host
+/// policy re-derived exactly `grant` (same operating point).
+pub(crate) async fn wait_rtl8192ee<F: core::future::Future<Output = Result<(), prepare::Error>>>(
+    base: Arc<ee92::Calibration>,
+    grant: ee92::Permission,
     environment: &impl prepare::station::Environment,
     future: F,
 ) -> Result<(), prepare::Error> {

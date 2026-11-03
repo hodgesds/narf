@@ -247,6 +247,75 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Hardware::Running;
         self.check_station_policy(environment)
     }
+    /// `cur_40_prime_sc` of the programmed RTL8192EE operating point (0 at
+    /// 20 MHz or without a grant).
+    pub(super) fn rtl8192ee_prime_sc(&self) -> u8 {
+        self.rtl8192ee_power
+            .and_then(|p| p.operating().channel())
+            .map_or(0, |c| c.prime_sc)
+    }
+    /// RTL8192EE `rtl_op_config` channel/width change on the running owner
+    /// (mac80211 sets the BSS chandef before authentication and narrows it
+    /// if the association response does): the `N92E` permission for the
+    /// target operating point (`width` 40 MHz on the provisioned primary,
+    /// else 20 MHz) is re-derived under current host policy, then
+    /// `Prepared::configure_rtl8192ee_channel` (`sw_chnl` at the wide
+    /// channel with the admitted per-path indices, `set_bw_mode`) runs
+    /// inside that permission's authority. No frame may be outstanding; the
+    /// old receive epoch is retired. A failure leaves the owner failed.
+    pub(super) async fn retune_rtl8192ee(
+        &mut self,
+        width: Option<super::super::super::ht::Geometry>,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8192ee::envelope::{Operating, Width};
+        let current = self.rtl8192ee_power.ok_or(Error::State)?;
+        let channel = current.channel();
+        let op = match width {
+            None => Operating::twenty(channel),
+            Some(g) if g.primary() == channel => Operating {
+                width: if g.prime() == 1 {
+                    Width::W40Above
+                } else {
+                    Width::W40Below
+                },
+                channel,
+            },
+            Some(_) => return Err(Error::Profile),
+        };
+        if current.operating() == op && self.packet.width == width {
+            return Ok(());
+        }
+        if !self.transmit_ready()
+            || self.station.pending.is_some()
+            || !matches!(self.station.phase, Phase::Joining | Phase::Configuring)
+        {
+            return Err(Error::State);
+        }
+        self.check_station_policy(environment)?;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ee())
+            .ok_or(Error::Profile)?
+            .clone();
+        let permission = base
+            .permission_for(&environment.domain()?, op)
+            .map_err(|e| Error::Radio(RadioError::Power(e)))?;
+        if width.is_some() && !super::super::super::rtl8192ee::ht::admitted(&permission) {
+            return Err(Error::Profile);
+        }
+        self.station.retire_receive();
+        let owner = &mut *self;
+        super::super::super::station_power::wait_rtl8192ee(base, permission, environment, async {
+            owner.io.authority(true, || Ok(()))?;
+            owner.configure_rtl8192ee_channel(permission).await
+        })
+        .await?;
+        self.packet.width = width;
+        self.check_station_policy(environment)
+    }
     pub(super) async fn select_station_width(
         &mut self,
         width: Option<Geometry>,

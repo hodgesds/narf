@@ -47,7 +47,7 @@
 //! (`rtl8192ee/h2c.rs`) and a stopped owner's DMA is released only after
 //! the card-disable retirement proof (`ee92_quiesce`). The owner cannot reach `MacConfigured` until the 8192EE
 //! PHY/RF/channel steps exist, so none of this is reachable from probe.
-use super::super::super::rtl8192ee::{c2h, dm, h2c, mac, rsvd_page, trx};
+use super::super::super::rtl8192ee::{c2h, dm, h2c, mac, rsvd_page, station as hw, trx};
 use super::{
     extent, queue, Delivery, Error, Io, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep,
     RX_BASE, RX_BUFFER, TX_BASES,
@@ -118,6 +118,8 @@ pub(in super::super) struct State {
     /// Peer and `mac->bw_40` of the installed `H2C_92E_RA_MASK`, with its
     /// `ratr_index` (`sta_entry->ratr_index`).
     pub(in super::super) link: Option<(h2c::Peer, bool, u8)>,
+    /// `rtlpci->receive_config` cache (`HW_VAR_RCR`).
+    pub(in super::super) receive: hw::ReceiveConfig,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -132,6 +134,7 @@ impl State {
             bcn_ctrl: 0x1d,
             ratr_state: 0,
             link: None,
+            receive: hw::ReceiveConfig::default(),
         }
     }
     /// `rtl_c2h_content_parsing` for the packets this profile consumes.
@@ -390,12 +393,171 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         {
             return Err(Error::Readback);
         }
+        // rtl_op_add_interface: rtl92ee_set_network_type(STATION) without
+        // a link (MSR NOLINK, CBSSID off) over the `_rtl92ee_init_mac` RCR.
+        self.packet.ee92.receive = hw::ReceiveConfig::default();
+        hw::network_type_station(
+            &self.io,
+            &mut self.packet.ee92.receive,
+            &mut self.packet.ee92.bcn_ctrl,
+            false,
+        )?;
+        if self.io.read32(mac::REG_RCR)?
+            != mac::RECEIVE_CONFIG & !(hw::RCR_CBSSID_DATA | hw::RCR_CBSSID_BCN)
+        {
+            return Err(Error::Readback);
+        }
         self.packet.next = [0; 7];
         self.packet.receive = 0;
         self.packet.ee92.started = false;
         self.packet.ee92.remained = 0;
         self.phase = Phase::Running;
         Ok(())
+    }
+
+    /// Linux `rtl92ee_hw_init` leaves the firmware awake
+    /// (`fw_current_inpsmode` false, `dot11_psmode` EACTIVE); nothing is
+    /// sent. Only a powered MAC (`REG_CR != 0xEA`) is accepted.
+    pub(super) fn ee92_awake_station(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::MacConfigured {
+            return Err(Error::State);
+        }
+        if self.io.read8(mac::REG_CR)? == 0xea {
+            return Err(Error::RadioOff);
+        }
+        Ok(())
+    }
+
+    /// Authentication-time `BSS_CHANGED_BSSID` / `BASIC_RATES` / ERP and
+    /// `update_channel_access_setting` / `set_qos`
+    /// ([`hw::configure_rates`], `ht_enable` false until the association).
+    pub(super) fn ee92_prepare_peer(
+        &mut self,
+        peer: [u8; 6],
+        rates: u16,
+        basic: u16,
+        capability: u16,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        if peer == [0; 6] || peer[0] & 1 != 0 {
+            return Err(Error::Packet);
+        }
+        // `cur_40_prime_sc` of the programmed operating point (0 at 20 MHz;
+        // MacConfigured implies the channel permission).
+        let prime_sc = self
+            .rtl8192ee_power
+            .and_then(|p| p.operating().channel())
+            .map_or(0, |c| c.prime_sc);
+        self.phase = Phase::Failed;
+        hw::set_bssid(&self.io, peer)?;
+        hw::configure_rates(&self.io, rates, basic, capability, false, prime_sc)?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` for 8192EE:
+    /// `rtl_cam_reset_all_entry`, `HW_VAR_KEEP_ALIVE` (10),
+    /// `rtl92ee_set_network_type` with the link (MSR INFRA, CBSSID on),
+    /// then `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)`
+    /// ([`Self::ee92_join_report`]). The firmware RA mask follows
+    /// separately (`ee92_install_rate_mask`, Linux's `update_rate_tbl`
+    /// in the same branch).
+    pub(super) async fn ee92_complete_peer(
+        &mut self,
+        peer: [u8; 6],
+        aid: u16,
+        admission: Option<&super::super::station::Admission>,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let closed = |a: Option<&super::super::station::Admission>| {
+            a.is_some_and(|c| c.closed.load(core::sync::atomic::Ordering::Acquire))
+        };
+        if !self.transmit_ready() || self.packet.reserved.is_some() || self.packet.leisure {
+            return Err(Error::State);
+        }
+        if !(1..=2007).contains(&aid) || peer == [0; 6] || peer[0] & 1 != 0 {
+            return Err(Error::Packet);
+        }
+        self.phase = Phase::Failed;
+        self.io.write32(hw::REG_CAMCMD, hw::CAM_RESET)?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.packet
+            .ee92
+            .mailbox
+            .fill(&self.io, h2c::H2C_KEEP_ALIVE_CTRL, &[0xff, 10])
+            .await?;
+        hw::network_type_station(
+            &self.io,
+            &mut self.packet.ee92.receive,
+            &mut self.packet.ee92.bcn_ctrl,
+            true,
+        )?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        self.ee92_join_report(peer, aid, admission, &policy).await?;
+        if closed(admission) {
+            self.phase = Phase::Failed;
+            return Err(Error::State);
+        }
+        Ok(())
+    }
+
+    /// `HW_VAR_FW_LPS_ACTION(true)` → `_rtl92ee_fwlps_enter`.
+    pub(super) async fn ee92_enter_leisure(&mut self) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        h2c::fwlps_enter(&self.io, &mut self.packet.ee92.mailbox).await?;
+        self.packet.leisure = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `HW_VAR_FW_LPS_ACTION(false)` → `_rtl92ee_fwlps_leave`.
+    pub(super) async fn ee92_leave_leisure(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || !self.packet.leisure {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        h2c::fwlps_leave(&self.io, &mut self.packet.ee92.mailbox).await?;
+        self.packet.leisure = false;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// Disassociation registers and reports: leave LPS, then
+    /// `rtl92ee_set_network_type(STATION)` without a link (MSR NOLINK,
+    /// CBSSID off), `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)` (MSRRPT
+    /// only; AID and the reserved page are connect-only) and the mac80211
+    /// `BSS_CHANGED_BSSID` zero BSSID. The installed RA link is withdrawn
+    /// (no watchdog refresh without a station) and a pending RA report is
+    /// dropped; `ratr_state` is kept, as Linux never resets it after
+    /// `rtl92ee_dm_init_rate_adaptive_mask`.
+    pub(super) async fn ee92_disconnected(&mut self) -> Result<(), Error> {
+        if core::mem::take(&mut self.packet.leisure) {
+            h2c::fwlps_leave(&self.io, &mut self.packet.ee92.mailbox).await?;
+        }
+        self.packet.ee92.link = None;
+        self.packet.ee92.ra_report = None;
+        hw::network_type_station(
+            &self.io,
+            &mut self.packet.ee92.receive,
+            &mut self.packet.ee92.bcn_ctrl,
+            false,
+        )?;
+        self.packet
+            .ee92
+            .mailbox
+            .fill(&self.io, h2c::H2C_MSRRPT, &h2c::media_status(false))
+            .await?;
+        hw::set_bssid(&self.io, [0; 6])
     }
 
     /// `rtl_pci_tx` for one forced-rate legacy frame: descriptor, BD, then
@@ -604,6 +766,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.packet.ee92.remained = remained;
         }
         let slot = self.packet.receive;
+        // `rtlphy->cck_high_power` for `_rtl92ee_query_rxphystatus`.
+        let cck_highpwr = self
+            .rtl8192ee
+            .as_ref()
+            .is_some_and(|state| state.1.phy.cck_high_power);
         let ring = self.receive.as_mut().ok_or(Error::State)?;
         let buffer = &self.buffers[slot];
         let buffer_addr = extent(buffer, RX_BUFFER, 4)?;
@@ -660,6 +827,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // Software CCMP: protected frames keep IV/ciphertext/MIC.
                 if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted)
                 {
+                    // `_rtl92ee_query_rxphystatus` `rx_pwdb_all` (the
+                    // `rtl_process_phyinfo` sample) from the driver-info
+                    // PHY status that precedes the frame.
+                    let pwdb = if status.physt && status.drvinfo >= 8 {
+                        let mut phy = [0u8; 8];
+                        buffer.read_bytes(trx::RX_DESC_SIZE, &mut phy)?;
+                        dm::rx_pwdb(&phy, status.rate <= trx::DESC_RATE11M, cck_highpwr)
+                    } else {
+                        None
+                    };
                     packet = Some(Mpdu {
                         bytes,
                         channel,
@@ -667,7 +844,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         short_gi: false,
                         width40: false,
                         aggregated: false,
-                        pwdb: None,
+                        pwdb,
                         antenna_mux: None,
                     });
                 }

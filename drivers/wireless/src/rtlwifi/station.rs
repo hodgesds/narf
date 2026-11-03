@@ -310,7 +310,7 @@ fn delba(peer: [u8; 6], own: [u8; 6], tid: u16, reason: u16) -> Vec<u8> {
     frame
 }
 /// `ht::wait` over the chip's signed power base: the 88EE form with its
-/// optional grants, or the 8821AE envelope form (which has none).
+/// optional grants, or the 8821AE / 8192EE envelope forms (which have none).
 #[allow(clippy::too_many_arguments)]
 async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
     base: super::super::station_power::Base,
@@ -341,6 +341,11 @@ async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
             if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
         {
             super::super::station_power::wait_rtl8821ae(base, permission, environment, future).await
+        }
+        (Base::Rtl8192ee(base), Grant::Rtl8192ee(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8192ee(base, permission, environment, future).await
         }
         _ => Err(RadioError::State),
     }
@@ -1108,6 +1113,17 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             domain,
         )
     }
+    /// The 8192EE `N92E` envelope that minted this owner's channel grant.
+    pub(crate) fn stage_rtl8192ee_calibration(
+        &mut self,
+        calibration: super::super::rtl8192ee::envelope::Calibration,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.stage_station_base(
+            super::super::station_power::Base::Rtl8192ee(Arc::new(calibration)),
+            domain,
+        )
+    }
     fn stage_station_base(
         &mut self,
         base: super::super::station_power::Base,
@@ -1132,7 +1148,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::Chip::Rtl8821ae => self
                 .rtl8821ae_power
                 .map(super::super::station_power::Grant::Rtl8821ae),
-            super::Chip::Rtl8192ee | super::Chip::Rtl8192ce => None,
+            super::Chip::Rtl8192ee => self
+                .rtl8192ee_power
+                .map(super::super::station_power::Grant::Rtl8192ee),
+            super::Chip::Rtl8192ce => None,
         }
     }
     /// 88EE calibration for the 88EE-only HT/protection/tracking/antenna/
@@ -1245,6 +1264,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             if self.chip == super::Chip::Rtl8821ae {
                 // rtl8821ae_set_qos ignores the AP's rows (fixed BK/VI/VO).
                 return super::super::rtl8821ae::station::set_qos_all(&self.io);
+            }
+            if self.chip == super::Chip::Rtl8192ee {
+                // rtl92ee_set_qos ignores the AP's rows (fixed BK/VI/VO).
+                return super::super::rtl8192ee::station::set_qos_all(&self.io);
             }
             if self.station.ht_profile.is_some() {
                 return super::super::wmm::program_ht(&self.io, p);
@@ -1875,6 +1898,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.restore_station_tracking(environment).await?;
             if self.chip == super::Chip::Rtl8821ae {
                 self.retune_rtl8821ae(width, eighty, environment).await?;
+            } else if self.chip == super::Chip::Rtl8192ee {
+                self.retune_rtl8192ee(width, environment).await?;
             } else {
                 self.select_station_width(width, environment).await?;
             }
@@ -1952,6 +1977,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .flatten();
                     if self.chip == super::Chip::Rtl8821ae {
                         self.retune_rtl8821ae(width, eighty, environment).await?;
+                    } else if self.chip == super::Chip::Rtl8192ee {
+                        self.retune_rtl8192ee(width, environment).await?;
                     } else {
                         self.select_station_width(width, environment).await?;
                     }
@@ -1970,6 +1997,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 self.station.capability,
                                 self.station.ht_profile.is_some(),
                                 self.rtl8821ae_five_ghz(),
+                            );
+                        }
+                        if self.chip == super::Chip::Rtl8192ee {
+                            return super::super::rtl8192ee::station::configure_rates(
+                                &self.io,
+                                rates,
+                                basic,
+                                self.station.capability,
+                                self.station.ht_profile.is_some(),
+                                self.rtl8192ee_prime_sc(),
                             );
                         }
                         super::super::station_control::configure_rates(
@@ -2680,6 +2717,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .install_rtl8821ae_station_rate_mask(rates, level, environment)
                 .await;
         }
+        if self.chip == super::Chip::Rtl8192ee {
+            return self
+                .install_rtl8192ee_station_rate_mask(rates, level, environment)
+                .await;
+        }
         let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
         let payload = super::super::rate_adaptive::rate_mask_width(
             rates,
@@ -2772,6 +2814,95 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         .await?;
         self.check_station_policy(environment)
     }
+    /// `rtl92ee_update_hal_rate_mask(sta, level, update_bw = true)`
+    /// (`update_rate_tbl`) for the 2.4 GHz peer: `supp_rates[0]` = the
+    /// association's legacy intersection, `ht_cap.mcs.rx_mask` = mac80211's
+    /// intersected TX MCS set (`tx_mcs`, bounded by the local TX selection
+    /// of `rtl8192ee::ht::capability`), SGI where both sides support it,
+    /// `mac->bw_40` = the programmed 40 MHz width. The mask must be a
+    /// non-empty subset of the current `N92E` permission's admitted rates;
+    /// it is installed inside the envelope's current authority.
+    async fn install_rtl8192ee_station_rate_mask(
+        &mut self,
+        rates: u16,
+        level: u8,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::rtl8192ee::h2c;
+        let permission = self.rtl8192ee_power.ok_or(Error::State)?;
+        let ht = self.station.ht_profile;
+        if ht.is_some() && !super::super::rtl8192ee::ht::admitted(&permission) {
+            return Err(Error::Profile);
+        }
+        let peer = h2c::Peer {
+            legacy: rates & 0xfff,
+            ht: ht.map(|p| [p.tx_mcs()[0], p.tx_mcs()[1]]),
+            sgi20: ht.is_some_and(|p| p.tx_sgi20()),
+            sgi40: ht.is_some_and(|p| p.tx_sgi40()),
+        };
+        let bw40 = self.packet.width.is_some();
+        let admitted = permission.admitted_rates() as u32;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let grant = self.station_grant().ok_or(Error::State)?;
+        power_wait(
+            base,
+            None,
+            None,
+            None,
+            None,
+            grant,
+            environment,
+            self.install_rtl8192ee_rate_mask(peer, bw40, level, admitted),
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
+    /// RTL8192EE DM watchdog step (`rtl92ee_dm_watchdog`, every
+    /// `RTL_WATCHDOG_TIME`, only with the firmware out of power save): of
+    /// it only `rtl92ee_dm_refresh_rate_adaptive_mask` (the 8192EE
+    /// `_rtl92ee_dm_ra_state_check` thresholds on the smoothed
+    /// `undec_sm_pwdb`, a level change re-sending the mask with
+    /// `update_bw`) and the pending C2H RA report's
+    /// `rtl92ee_dm_dynamic_arfb_select` are composed
+    /// (`packet_owner.rs::ee92_dm_watchdog`), inside the `N92E` envelope's
+    /// current authority and bounded by its admitted rates. Returns whether
+    /// a mask was sent.
+    async fn rtl8192ee_watchdog(&mut self, environment: &impl Environment) -> Result<bool, Error> {
+        if !self.station.ra.due(environment.now_ms())
+            || self.leisure()
+            || !self.station_linked()
+            || !self.transmit_ready()
+            || self.rate_mask().is_none()
+        {
+            return Ok(false);
+        }
+        self.check_station_policy(environment)?;
+        let permission = self.rtl8192ee_power.ok_or(Error::State)?;
+        let admitted = permission.admitted_rates() as u32;
+        let pwdb = self.station.ra.smoothed();
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let grant = self.station_grant().ok_or(Error::State)?;
+        let mut sent = false;
+        let refreshed = &mut sent;
+        let owner = &mut *self;
+        power_wait(base, None, None, None, None, grant, environment, async {
+            *refreshed = owner.rtl8192ee_dm_watchdog(pwdb, admitted).await?;
+            Ok(())
+        })
+        .await?;
+        self.check_station_policy(environment)?;
+        Ok(sent)
+    }
     /// RTL8821AE DM watchdog step (`rtl8821ae_dm_watchdog`, every
     /// `RTL_WATCHDOG_TIME`, only with the firmware out of power save —
     /// `fw_current_inpsmode` false), in the Linux order:
@@ -2853,6 +2984,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<bool, Error> {
+        if self.chip == super::Chip::Rtl8192ee {
+            let result = self.rtl8192ee_watchdog(environment).await;
+            if result.is_err() {
+                self.abort_station();
+            }
+            return result;
+        }
         if self.chip == super::Chip::Rtl8821ae {
             let result = self.rtl8821ae_watchdog(environment).await;
             if result.is_err() {
