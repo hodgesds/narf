@@ -4,7 +4,7 @@
 //! typed noninitial primaries share this one source order. This is not the
 //! complete BB, IQK/TSSI/DPK channel continuation.
 use super::{
-    operating_channel::Profile,
+    operating_channel::{Profile, Width},
     power,
     rfk::{self, Interface},
 };
@@ -48,6 +48,23 @@ fn band_bits(channel: Profile) -> u32 {
             | ((CFGCH_BAND0_5G << RR_CFGCH_BAND0.trailing_zeros()) & RR_CFGCH_BAND0)
     } else {
         0
+    }
+}
+/// rtw8852b_rfk.c `_bw_setting` RR_CFGCH_BW field per width.
+fn bw_bits(channel: Profile) -> u32 {
+    let bw = match channel.width() {
+        Width::Mhz20 => CFGCH_BW_20M,
+        Width::Mhz40 => CFGCH_BW_40M,
+        Width::Mhz80 => CFGCH_BW_80M,
+    };
+    (bw << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW
+}
+/// rtw8852b_rfk.c `_set_rxbb_bw` RR_LUTWD0 LB value per width.
+const fn rxbb_lb(channel: Profile) -> u32 {
+    match channel.width() {
+        Width::Mhz20 => 0x1b,
+        Width::Mhz40 => 0x13,
+        Width::Mhz80 => 0xb,
     }
 }
 struct Access<'a, I>(&'a mut I);
@@ -154,10 +171,10 @@ impl<I: Interface> Access<'_, I> {
         self.write(p, RR_LCKST, RR_LCKST_BIN, 0).await?;
         self.write(p, RR_LCKST, RR_LCKST_BIN, 1).await
     }
-    async fn bandwidth(&mut self, p: u8, direct: bool) -> Result<(), Error> {
+    async fn bandwidth(&mut self, p: u8, direct: bool, channel: Profile) -> Result<(), Error> {
         let a = if direct { RR_CFGCH_V1 } else { RR_CFGCH };
         let mut v = self.read(p, a, RFREG_MASK).await?;
-        v = (v & !RR_CFGCH_BW) | ((CFGCH_BW_20M << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW);
+        v = (v & !RR_CFGCH_BW) | bw_bits(channel);
         v &= !(RR_CFGCH_POW_LCK | RR_CFGCH_TRX_AH | RR_CFGCH_BCN | RR_CFGCH_BW2) & RFREG_MASK;
         v |= RR_CFGCH_BW2;
         self.write(p, a, RFREG_MASK, v).await
@@ -197,13 +214,14 @@ impl Channel {
         }
         for direct in [false, true] {
             for p in 0..2 {
-                a.bandwidth(p, direct).await?;
+                a.bandwidth(p, direct, channel).await?;
             }
         }
         for p in 0..2 {
             a.write(p, RR_LUTWE2, RR_LUTWE2_RTXBW, 1).await?;
             a.write(p, RR_LUTWA, RR_LUTWA_M2, 0x12).await?;
-            a.write(p, RR_LUTWD0, RR_LUTWD0_LB, 0x1b).await?;
+            a.write(p, RR_LUTWD0, RR_LUTWD0_LB, rxbb_lb(channel))
+                .await?;
             a.write(p, RR_LUTWE2, RR_LUTWE2_RTXBW, 0).await?;
         }
         let mask = RR_CFGCH_CH
@@ -217,7 +235,7 @@ impl Channel {
         let expected = ((u32::from(channel.center()) << RR_CFGCH_CH.trailing_zeros())
             & RR_CFGCH_CH)
             | band_bits(channel)
-            | ((CFGCH_BW_20M << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW)
+            | bw_bits(channel)
             | RR_CFGCH_BW2;
         for direct in [false, true] {
             for p in 0..2 {

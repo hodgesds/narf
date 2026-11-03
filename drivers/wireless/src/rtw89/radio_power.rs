@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact B fixed WW 2.4/5GHz 20MHz power *configuration*, never a dBm authorization.
+//! Exact B fixed WW 2.4/5GHz 20/40/80MHz power *configuration*, never a dBm
+//! authorization.
 //! Final measured peaks and current host policy independently gate emission.
-use super::operating_channel::Profile;
+use super::operating_channel::{Profile, Width};
 use super::{
     radio_assets::{Assets, Element},
     rfk::{Error, Interface},
@@ -20,7 +21,80 @@ pub(super) struct Plan {
     offset: [i8; 5],
     limits: [[i8; 8]; 2],
     ru: [[i8; 3]; 2],
+    /// phy.h `rtw89_txpwr_limit_ax` page bytes 8..40 per ntx (mcs_20m[1..4],
+    /// mcs_40m, mcs_80m, mcs_160m, mcs_40m_0p5/2p5); zero at 20MHz.
+    extra: [[i8; 32]; 2],
+    /// `rtw89_txpwr_limit_ru_ax` ru26/52/106 sections 1..4 per ntx (`[ntx][sec-1][ru]`).
+    ru_extra: [[[i8; 3]; 3]; 2],
     shape: [u8; 2],
+}
+/// Linux `rtw89_phy_read_txpwr_limit` source: firmware TXPWR_LMT/LMT_RU
+/// elements (replacing the static table) or the frozen rtw8852b_table.c rows.
+struct Source<'a> {
+    limit: Option<&'a [u8]>,
+    ru: Option<&'a [u8]>,
+    ghz5: bool,
+}
+impl Source<'_> {
+    /// `[ntx][bf]` limit of (bw, rs, ch) at WW, `rtw89_channel_to_idx(ch)`.
+    fn limit(&self, bw: Width, rs: u8, ch: u8) -> Result<[[i8; 2]; 2], Error> {
+        let index = super::operating_channel::channel_to_idx(ch);
+        if let Some(bytes) = self.limit {
+            let mut out = [[0; 2]; 2];
+            for e in entries(bytes, 7, 7)? {
+                if e[0] == bw as u8 && e[2] == rs && e[4] == 0 && e[5] == index {
+                    out[e[1] as usize][e[3] as usize] = e[6] as i8;
+                }
+            }
+            return Ok(out);
+        }
+        let pick = |row: &[[i8; 8]; 2], base: usize| {
+            core::array::from_fn(|n| [row[n][base], row[n][base + 1]])
+        };
+        let sparse = |rows: &[(u8, [[i8; 2]; 2])]| {
+            rows.iter()
+                .find(|(center, _)| *center == ch)
+                .map_or([[0; 2]; 2], |(_, row)| *row)
+        };
+        Ok(match (bw, rs) {
+            (Width::Mhz20, 0..=2) => {
+                let row = self.channel20(ch)?.limits;
+                pick(&row, [0, 4, 6][usize::from(rs)])
+            }
+            (Width::Mhz40, 0) if !self.ghz5 => pick(&self.channel20(ch)?.limits, 2),
+            (Width::Mhz40, 2) if self.ghz5 => sparse(&channels::MCS40_5GHZ),
+            (Width::Mhz40, 2) => sparse(&channels::MCS40_2GHZ),
+            (Width::Mhz80, 2) if self.ghz5 => sparse(&channels::MCS80_5GHZ),
+            _ => [[0; 2]; 2],
+        })
+    }
+    /// `[ntx][ru26, ru52, ru106]` RU limits of the 20MHz channel `ch`.
+    fn ru(&self, ch: u8) -> Result<[[i8; 3]; 2], Error> {
+        let index = super::operating_channel::channel_to_idx(ch);
+        if let Some(bytes) = self.ru {
+            let mut out = [[0; 3]; 2];
+            for e in entries(bytes, 5, 5)? {
+                if e[0] < 3 && e[2] == 0 && e[3] == index {
+                    out[e[1] as usize][e[0] as usize] = e[4] as i8;
+                }
+            }
+            return Ok(out);
+        }
+        Ok(self.channel20(ch)?.ru)
+    }
+    fn channel20(&self, ch: u8) -> Result<channels::ChannelPower, Error> {
+        if self.ghz5 {
+            let slot = super::operating_channel::GHZ5
+                .iter()
+                .position(|&primary| primary == ch)
+                .ok_or(Error::Policy)?;
+            Ok(channels::CHANNELS_5GHZ[slot])
+        } else if (1..=14).contains(&ch) {
+            Ok(channels::CHANNELS[usize::from(ch - 1)])
+        } else {
+            Err(Error::Policy)
+        }
+    }
 }
 fn selected(elements: &[Element], id: u32, rfe: u8) -> Result<Option<&[u8]>, Error> {
     let mut out: Option<(u8, &[u8])> = None;
@@ -216,6 +290,14 @@ impl Plan {
                 }
             }
         }
+        if channel.width() != Width::Mhz20 {
+            let source = Source {
+                limit: selected(elements, limit_id, rfe)?,
+                ru: selected(elements, ru_id, rfe)?,
+                ghz5: channel.is_5ghz(),
+            };
+            plan.fill_wide(&source)?;
+        }
         if let Some(bytes) = selected(elements, 16, rfe)? {
             plan.shape = [0; 2];
             for e in entries(bytes, 5, 4)? {
@@ -229,10 +311,79 @@ impl Plan {
         }
         Ok(plan)
     }
+    /// phy.c `rtw89_phy_fill_txpwr_limit_{40m,80m}_ax` and
+    /// `rtw89_phy_fill_txpwr_limit_ru_{40m,80m}_ax` for `chan->channel` (center)
+    /// and `chan->primary_channel`; every other page field stays zero
+    /// (`memset`), including CCK on 5GHz and at 80MHz.
+    fn fill_wide(&mut self, source: &Source<'_>) -> Result<(), Error> {
+        let (ch, pri) = (self.channel.center(), self.channel.primary());
+        let mut page = [[0i8; 40]; 2];
+        let mut put = |offset: usize, row: [[i8; 2]; 2]| {
+            for n in 0..2 {
+                page[n][offset..offset + 2].copy_from_slice(&row[n]);
+            }
+        };
+        // Page layout: cck_20m 0, cck_40m 2, ofdm 4, mcs_20m[i] 6+2i,
+        // mcs_40m[i] 22+2i, mcs_80m[i] 30+2i, mcs_160m 34, 0p5 36, 2p5 38.
+        put(4, source.limit(Width::Mhz20, 1, pri)?);
+        let subchannels: alloc::vec::Vec<u8> = self.channel.subchannels().collect();
+        for (i, &sub) in subchannels.iter().enumerate() {
+            put(6 + 2 * i, source.limit(Width::Mhz20, 2, sub)?);
+        }
+        match self.channel.width() {
+            Width::Mhz20 => return Err(Error::Policy),
+            Width::Mhz40 => {
+                put(0, source.limit(Width::Mhz20, 0, ch - 2)?);
+                put(2, source.limit(Width::Mhz40, 0, ch)?);
+                put(22, source.limit(Width::Mhz40, 2, ch)?);
+            }
+            Width::Mhz80 => {
+                let low = source.limit(Width::Mhz40, 2, ch - 4)?;
+                let high = source.limit(Width::Mhz40, 2, ch + 4)?;
+                put(22, low);
+                put(24, high);
+                put(30, source.limit(Width::Mhz80, 2, ch)?);
+                put(
+                    36,
+                    core::array::from_fn(|n| {
+                        core::array::from_fn(|bf| low[n][bf].min(high[n][bf]))
+                    }),
+                );
+            }
+        }
+        for (n, page) in page.iter().enumerate() {
+            self.limits[n].copy_from_slice(&page[..8]);
+            self.extra[n].copy_from_slice(&page[8..]);
+        }
+        self.ru = [[0; 3]; 2];
+        self.ru_extra = [[[0; 3]; 3]; 2];
+        for (i, &sub) in subchannels.iter().enumerate() {
+            let row = source.ru(sub)?;
+            for (n, row) in row.into_iter().enumerate() {
+                if i == 0 {
+                    self.ru[n] = row;
+                } else {
+                    self.ru_extra[n][i - 1] = row;
+                }
+            }
+        }
+        Ok(())
+    }
     /// Bind signed source units and the exact fixed power/response profile. These
     /// bytes make no physical power claim; measured conducted maxima are separate.
     pub fn bind(&self, hash: &mut narf_crypto::sha256::Sha256) {
-        if self.channel == Profile::INITIAL {
+        if self.channel.width() != Width::Mhz20 {
+            hash.update(b"B WW0 native wide40/80 source RF2 MAC1 BB3;equal A/B ref0;actual center/subchannel CCK/OFDM/MCS20/40/80/0p5 and RU sections;no inferred dBm/SAR/antenna offset curves");
+            self.channel.bind(hash);
+            for n in 0..2 {
+                for &v in self.extra[n]
+                    .iter()
+                    .chain(self.ru_extra[n].iter().flatten())
+                {
+                    hash.update(&v.to_le_bytes());
+                }
+            }
+        } else if self.channel == Profile::INITIAL {
             hash.update(b"B WW0 ch1 20 source RF2 MAC1 BB3;equal A/B ref0;CCK+OFDM autoresponse;no SAR/antenna offset curves");
         } else if self.channel.is_5ghz() {
             hash.update(b"B WW0 native5GHz20 source RF2 MAC1 BB3;equal A/B ref0;actual perchannel OFDM/MCS/RU limits, no CCK;OFDM shape only;no inferred dBm/SAR/antenna offset curves");
@@ -278,7 +429,7 @@ impl Plan {
         emit(0x14494, 0x3000000, u32::from(self.shape[1]))?;
         for p in 0..2 {
             let mut page = [0u8; 40];
-            for (i, v) in self.limits[p].iter().enumerate() {
+            for (i, v) in self.limits[p].iter().chain(&self.extra[p]).enumerate() {
                 page[i] = (*v >> 1) as u8;
             }
             for (i, b) in page.chunks_exact(4).enumerate() {
@@ -293,6 +444,11 @@ impl Plan {
             let mut page = [0u8; 24];
             for (i, v) in self.ru[p].iter().enumerate() {
                 page[i * 8] = (*v >> 1) as u8;
+            }
+            for (section, row) in self.ru_extra[p].iter().enumerate() {
+                for (i, v) in row.iter().enumerate() {
+                    page[i * 8 + section + 1] = (*v >> 1) as u8;
+                }
             }
             for (i, b) in page.chunks_exact(4).enumerate() {
                 emit(

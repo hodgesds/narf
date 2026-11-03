@@ -319,8 +319,9 @@ async fn enable<I: Interface>(a: &mut Access<'_, I>) -> Result<(), Error> {
     }
     Ok(())
 }
-/// Linux `_tssi_set_efuse_to_de`: `_tssi_get_{cck,ofdm,trim}_group`; 2.4GHz has
-/// no TSSI_EXTRA_GROUP averaging.
+/// Linux `_tssi_set_efuse_to_de`: `_tssi_get_{cck,ofdm,trim}_group`; a 40/80MHz
+/// 5GHz center in a TSSI_EXTRA_GROUP averages groups idx and idx + 1
+/// (`_tssi_get_ofdm_de`, C integer division); 2.4GHz and B trim have none.
 fn de<I: Interface>(
     a: &mut Access<'_, I>,
     calibration: &Calibration,
@@ -331,7 +332,17 @@ fn de<I: Interface>(
     for (path, value) in values.iter_mut().enumerate() {
         let trim = i16::from(calibration.tssi_trim[path][trim_group]);
         let cck = i16::from(calibration.tssi_cck[path][cck_group]) + trim;
-        let ofdm = i16::from(calibration.tssi_mcs[path][ofdm_group]) + trim;
+        let mcs = &calibration.tssi_mcs[path];
+        let ofdm = if ofdm_group & super::operating_channel::TSSI_EXTRA != 0 {
+            let g = ofdm_group & !super::operating_channel::TSSI_EXTRA;
+            let pair = [mcs.get(g), mcs.get(g + 1)];
+            let [Some(&first), Some(&second)] = pair else {
+                return Err(Error::Policy);
+            };
+            (i16::from(first) + i16::from(second)) / 2
+        } else {
+            i16::from(*mcs.get(ofdm_group).ok_or(Error::Policy)?)
+        } + trim;
         let offset = (path as u32) << 13;
         for address in [0x5858, 0x5860] {
             a.wm(address + offset, 0x3ff000, cck as u32)?;

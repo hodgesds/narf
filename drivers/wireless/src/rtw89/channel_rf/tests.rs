@@ -322,3 +322,45 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary
 );
+/// rtw8852b_rfk.c `rtw8852b_ctrl_bw_ch`: `_ctrl_ch(chan->channel)` tunes the
+/// center channel, `_bw_setting` sets CFGCH_BW_40M/80M on every DAV/DDV word
+/// and `_set_rxbb_bw` writes the per-width RXBB LUT, readback-gated.
+fn smoke_rtw89_b_rf_synth_tunes_wide_center_and_bandwidth_bits() -> TestResult {
+    use super::super::operating_channel::Width;
+    let Some(&(seed, lock, busy, count, _)) = CASES.first() else {
+        return TestResult::Fail("RF frozen reference cases");
+    };
+    let rows = [
+        (Profile::new_2ghz_40(1, true), 0x800),
+        (Profile::new_5ghz(36, Width::Mhz40), 0x800),
+        (Profile::new_5ghz(149, Width::Mhz80), 0x400),
+    ];
+    for (profile, bw) in rows {
+        let Some(profile) = profile else {
+            return TestResult::Fail("wide chandef refused");
+        };
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned RF words; no native caller or grant.
+        let result = ready(unsafe { owner.prepare_for_channel(&mut io, profile) });
+        if result != Some(Ok(())) || owner.state() != State::SynthConfigured || io.count != count {
+            return TestResult::Fail("wide RF synth/readback failed");
+        }
+        for p in 0..2 {
+            for a in [RR_CFGCH, RR_CFGCH_V1] {
+                let word = io.rf[p][Model::slot(a)];
+                if word & RR_CFGCH_CH != u32::from(profile.center())
+                    || word & RR_CFGCH_BW != bw
+                    || word & RR_CFGCH_BW2 == 0
+                {
+                    return TestResult::Fail("RF word lost the wide center/bandwidth bits");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rf_synth_tunes_wide_center_and_bandwidth_bits
+);

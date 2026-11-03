@@ -8,7 +8,7 @@ use super::{
 };
 #[path = "channel_bb/regs.rs"]
 mod regs;
-use super::operating_channel::Profile;
+use super::operating_channel::{Profile, Width};
 use regs::*;
 #[path = "channel_bb/recipe.rs"]
 mod recipe;
@@ -227,8 +227,19 @@ impl Channel {
         }
         self.state = State::Preparing;
         let mut a = Access(io);
-        a.byte(R_AX_WMAC_RFMOD, B_AX_WMAC_RFMOD_MASK as u8, 0)?;
-        a.write(R_AX_TX_SUB_CARRIER_VALUE, 0)?;
+        // `__rtw8852bx_set_channel_mac`: RFMOD 0/BIT(0)/BIT(1) and the
+        // phy.c `rtw89_phy_get_txsc` TX sub-carrier word per width.
+        let (rfmod, sub_carrier) = match channel.width() {
+            Width::Mhz20 => (0, 0),
+            Width::Mhz40 => (1, u32::from(channel.txsc(Width::Mhz20))),
+            Width::Mhz80 => (
+                2,
+                u32::from(channel.txsc(Width::Mhz20))
+                    | (u32::from(channel.txsc(Width::Mhz40)) << 4),
+            ),
+        };
+        a.byte(R_AX_WMAC_RFMOD, B_AX_WMAC_RFMOD_MASK as u8, rfmod)?;
+        a.write(R_AX_TX_SUB_CARRIER_VALUE, sub_carrier)?;
         // `__rtw8852bx_set_channel_mac`: 5GHz clears BAND_MODE and checks CCK.
         let cck = channel.cck_enabled();
         if cck {
@@ -264,11 +275,17 @@ impl Channel {
         a.gain(g, c, bases, channel)?;
         let rx =
             (a.read(0x10000 + R_CHBW_MOD_V1)? & B_ANT_RX_SEG0) >> B_ANT_RX_SEG0.trailing_zeros();
-        a.phy(R_FC0_BW_V1, B_FC0_BW_SET, 0)?;
+        // `rtw8852bx_ctrl_bw`: FC0 BW_SET = width, SBW 0, PRICH = pri_ch_idx.
+        let pri = channel.pri_ch_idx();
+        a.phy(R_FC0_BW_V1, B_FC0_BW_SET, channel.width() as i32)?;
         a.phy(R_CHBW_MOD_V1, B_CHBW_MOD_SBW, 0)?;
-        a.phy(R_CHBW_MOD_V1, B_CHBW_MOD_PRICH, 0)?;
+        a.phy(R_CHBW_MOD_V1, B_CHBW_MOD_PRICH, i32::from(pri))?;
         a.phy(R_P0_RFMODE_ORI_RX, B_P0_RFMODE_ORI_RX_ALL, 0x333)?;
         a.phy(R_P1_RFMODE_ORI_RX, B_P1_RFMODE_ORI_RX_ALL, 0x333)?;
+        if channel.width() == Width::Mhz40 {
+            // CCK primary channel (only the 40MHz branch writes R_RXSC).
+            a.phy(R_RXSC, B_RXSC_EN, i32::from(pri == 1))?;
+        }
         for (address, mask, value) in [
             (0xc0ec, 0x6000, 0),
             (0xc0e4, 0x30, 2),
@@ -301,9 +318,47 @@ impl Channel {
             }
         }
         a.phy(R_MAC_PIN_SEL, B_CH_IDX_SEG0, i32::from(channel.chan_idx()))?;
-        a.phy(R_PATH0_5MDET_V1, B_PATH0_5MDET_EN, 0)?;
-        a.phy(R_PATH1_5MDET_V1, B_PATH1_5MDET_EN, 0)?;
-        a.phy(R_ASSIGN_SBD_OPT_V1, B_ASSIGN_SBD_OPT_EN_V1, 0)?;
+        // `rtw8852bx_5m_mask`: 40MHz always, 80MHz only at UPMOST/LOWEST.
+        let mask_5m = match channel.width() {
+            Width::Mhz20 => None,
+            Width::Mhz40 => Some(pri == 2),
+            Width::Mhz80 => (pri == 3 || pri == 4).then_some(pri == 4),
+        };
+        match mask_5m {
+            None => {
+                a.phy(R_PATH0_5MDET_V1, B_PATH0_5MDET_EN, 0)?;
+                a.phy(R_PATH1_5MDET_V1, B_PATH1_5MDET_EN, 0)?;
+                a.phy(R_ASSIGN_SBD_OPT_V1, B_ASSIGN_SBD_OPT_EN_V1, 0)?;
+            }
+            Some(low) => {
+                for (address, [th, en, sb2, sb0]) in [
+                    (
+                        R_PATH0_5MDET_V1,
+                        [
+                            B_PATH0_5MDET_TH,
+                            B_PATH0_5MDET_EN,
+                            B_PATH0_5MDET_SB2,
+                            B_PATH0_5MDET_SB0,
+                        ],
+                    ),
+                    (
+                        R_PATH1_5MDET_V1,
+                        [
+                            B_PATH1_5MDET_TH,
+                            B_PATH1_5MDET_EN,
+                            B_PATH1_5MDET_SB2,
+                            B_PATH1_5MDET_SB0,
+                        ],
+                    ),
+                ] {
+                    a.phy(address, th, 4)?;
+                    a.phy(address, en, 1)?;
+                    a.phy(address, sb2, i32::from(!low))?;
+                    a.phy(address, sb0, i32::from(low))?;
+                }
+                a.phy(R_ASSIGN_SBD_OPT_V1, B_ASSIGN_SBD_OPT_EN_V1, 1)?;
+            }
+        }
         a.phy(R_S0_HW_SI_DIS, B_S0_HW_SI_DIS_W_R_TRIG, 7)?;
         a.phy(R_S1_HW_SI_DIS, B_S1_HW_SI_DIS_W_R_TRIG, 7)?;
         a.delay(1).await?;
@@ -314,11 +369,15 @@ impl Channel {
         a.phy(R_RSTB_ASYNC, B_RSTB_ASYNC_ALL, 1)?;
         // Source stream plus mandatory actual critical width/channel/reset readback.
         for (address, mask, expected) in [
-            (0x10000 + R_FC0_BW_V1, B_FC0_BW_SET, 0),
+            (
+                0x10000 + R_FC0_BW_V1,
+                B_FC0_BW_SET,
+                bits(B_FC0_BW_SET, channel.width() as i32),
+            ),
             (
                 0x10000 + R_CHBW_MOD_V1,
                 B_CHBW_MOD_SBW | B_CHBW_MOD_PRICH,
-                0,
+                bits(B_CHBW_MOD_PRICH, i32::from(pri)),
             ),
             (
                 0x10000 + R_MAC_PIN_SEL,

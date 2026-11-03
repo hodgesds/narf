@@ -408,3 +408,84 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck
 );
+/// phy.c `rtw89_phy_fill_txpwr_limit_{40m,80m}_ax` and `_ru_{40m,80m}_ax`
+/// over the frozen rtw8852b_table.c rows: center/primary/subchannel sources,
+/// the 0p5 minimum, zero CCK on 5GHz, and the page bytes the plan emits.
+fn smoke_rtw89_b_power_plan_fills_wide_limit_and_ru_pages_like_linux() -> TestResult {
+    use super::super::operating_channel::Width;
+    let c2 = |ch: u8| channels::CHANNELS[usize::from(ch - 1)];
+    let c5 = |ch: u8| {
+        let i = super::super::operating_channel::GHZ5
+            .iter()
+            .position(|&p| p == ch)
+            .unwrap();
+        channels::CHANNELS_5GHZ[i]
+    };
+    // 2.4GHz HT40: primary 1, secondary above, center 3.
+    let Some(ht40) = Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("2.4GHz HT40 profile");
+    };
+    let Ok(plan) = Plan::fixture_defaults_for_channel(ht40) else {
+        return TestResult::Fail("2.4GHz HT40 power fixture");
+    };
+    for n in 0..2 {
+        if plan.limits[n][0..2] != c2(1).limits[n][0..2]
+            || plan.limits[n][2..4] != c2(3).limits[n][2..4]
+            || plan.limits[n][4..6] != c2(1).limits[n][4..6]
+            || plan.limits[n][6..8] != c2(1).limits[n][6..8]
+            || plan.extra[n][0..2] != c2(5).limits[n][6..8]
+            || plan.extra[n][14..16] != channels::MCS40_2GHZ[0].1[n]
+            || plan.ru[n] != c2(1).ru[n]
+            || plan.ru_extra[n][0] != c2(5).ru[n]
+            || plan.ru_extra[n][1] != [0; 3]
+        {
+            return TestResult::Fail("2.4GHz HT40 page differs from Linux fill_40m");
+        }
+    }
+    // 5GHz VHT80: primary 44 (UPPER), center 42, subchannels 36..48.
+    let Some(vht80) = Profile::new_5ghz(44, Width::Mhz80) else {
+        return TestResult::Fail("5GHz 80MHz profile");
+    };
+    let Ok(plan) = Plan::fixture_defaults_for_channel(vht80) else {
+        return TestResult::Fail("5GHz 80MHz power fixture");
+    };
+    let row40 = |c: u8| {
+        channels::MCS40_5GHZ
+            .iter()
+            .find(|(center, _)| *center == c)
+            .unwrap()
+            .1
+    };
+    for n in 0..2 {
+        let (low, high) = (row40(38)[n], row40(46)[n]);
+        if plan.limits[n][0..4] != [0; 4]
+            || plan.limits[n][4..6] != c5(44).limits[n][4..6]
+            || plan.limits[n][6..8] != c5(36).limits[n][6..8]
+            || plan.extra[n][0..2] != c5(40).limits[n][6..8]
+            || plan.extra[n][2..4] != c5(44).limits[n][6..8]
+            || plan.extra[n][4..6] != c5(48).limits[n][6..8]
+            || plan.extra[n][14..16] != low
+            || plan.extra[n][16..18] != high
+            || plan.extra[n][22..24] != channels::MCS80_5GHZ[0].1[n]
+            || plan.extra[n][28..30] != [low[0].min(high[0]), low[1].min(high[1])]
+            || plan.ru[n] != c5(36).ru[n]
+            || plan.ru_extra[n] != [c5(40).ru[n], c5(44).ru[n], c5(48).ru[n]]
+        {
+            return TestResult::Fail("5GHz 80MHz page differs from Linux fill_80m");
+        }
+    }
+    let digest = |plan: &Plan| {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        plan.bind(&mut hash);
+        hash.finalize()
+    };
+    let narrow = Plan::fixture_defaults_for_channel(vht80.narrowed()).unwrap();
+    if digest(&plan) == digest(&narrow) || narrow.extra != [[0; 32]; 2] {
+        return TestResult::Fail("wide plan aliases the 20MHz binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_power_plan_fills_wide_limit_and_ru_pages_like_linux
+);

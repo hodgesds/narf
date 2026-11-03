@@ -10,7 +10,36 @@ use super::{
 use rfk::Error;
 #[path = "dpk/regs.rs"]
 mod regs;
+use super::operating_channel::Width;
 use regs::*;
+// Linux reg.h / rtw8852b_rfk.c registers of the 40/80MHz DPK branches.
+const RFREG_MASKRXBB: u32 = 0x003e0;
+const RFREG_MASKMODE: u32 = 0xf0000;
+const RR_CFGCH_DPK: u32 = 0x18;
+const RR_RSV4: u32 = 0x1f;
+const RR_RXK: u32 = 0x20;
+const RR_RXK_PLLEN: u32 = 1 << 5;
+const RR_TXIQK: u32 = 0x98;
+const RR_TXIQK_ATT1: u32 = 0x7f;
+const RR_XGLNA2: u32 = 0x85;
+const RR_XGLNA2_SW: u32 = 0x3;
+const RR_RXKPLL: u32 = 0x1e;
+const RR_RXKPLL_POW: u32 = 1 << 19;
+const R_MDPK_RX_DCK: u32 = 0x8074;
+const B_MDPK_RX_DCK_EN: u32 = 1 << 31;
+const R_IQK_RES: u32 = 0x8124;
+const B_IQK_RES_RXCFIR: u32 = 0xf;
+const R_IQK_DIF4: u32 = 0x802c;
+const B_IQK_DIF4_RXT: u32 = 0x0fff_0000;
+const R_KPATH_CFG: u32 = 0x80d0;
+const B_KPATH_CFG_ED: u32 = 0x0030_0000;
+const B_LOAD_COEF_DI: u32 = 1 << 1;
+const R_P0_CFCH_BW1: u32 = 0xc0d8;
+const B_P0_CFCH_EX: u32 = 1 << 13;
+const R_PATH1_BW_SEL_V1: u32 = 0xc1d8;
+const B_PATH1_BW_SEL_EX: u32 = 1 << 13;
+/// `enum rtw8852b_dpk_id` `LBK_RXIQK`.
+const LBK_RXIQK: u8 = 0x06;
 pub(super) const RECIPE: [u8; 32] = tssi::RECIPE;
 const BB: [u32; 3] = [0x2344, 0x5800, 0x7800];
 const RF: [u32; 11] = [0xde, 0xdf, 0x8b, 0x90, 0x97, 0x85, 0x1e, 0, 2, 5, 0x10005];
@@ -109,13 +138,25 @@ impl Dpk {
             }
             a.wm(R_P0_TSSI_TRK + ((path as u32) << 13), B_P0_TSSI_TRK_EN, 1)?;
         }
+        let width = channel.width();
         a.table(tables::DPK_AFE_DEFS).await?;
+        // `_dpk_bb_afe_setting`: 80MHz additionally sets the CFCH/BW_SEL EX bits.
+        if width == Width::Mhz80 {
+            a.wm(R_P0_CFCH_BW1, B_P0_CFCH_EX, 1)?;
+            a.wm(R_PATH1_BW_SEL_V1, B_PATH1_BW_SEL_EX, 1)?;
+        }
         let mut results = [Path::default(); 2];
         for path in 0..2 {
-            results[path as usize] = calibrate(&mut a, path, gain, channel.is_5ghz()).await?;
+            results[path as usize] =
+                calibrate(&mut a, path, gain, channel.is_5ghz(), width).await?;
             on(&mut a, path)?;
         }
         a.table(tables::DPK_AFE_RESTORE_DEFS).await?;
+        // `_dpk_bb_afe_restore`.
+        if width == Width::Mhz80 {
+            a.wm(R_P0_CFCH_BW1, B_P0_CFCH_EX, 0)?;
+            a.wm(R_PATH1_BW_SEL_V1, B_PATH1_BW_SEL_EX, 0)?;
+        }
         for (address, value) in BB.into_iter().zip(bb) {
             a.wm(address, u32::MAX, value)?;
         }
@@ -253,10 +294,43 @@ fn pas<I: Interface>(a: &mut Access<'_, I>) -> Result<bool, Error> {
     let energy = |iq: [u32; 2]| iq[0] * iq[0] + iq[1] * iq[1];
     Ok(energy(first) >= energy(last) * 8 / 5)
 }
+/// Linux `_dpk_lbk_rxiqk` (the 80MHz AGC RX-IQK loopback, instead of the
+/// narrower widths' RXCFIR bypass).
+async fn lbk_rxiqk<I: Interface>(a: &mut Access<'_, I>, path: u8) -> Result<(), Error> {
+    let rxbb = a.rr(path, RR_MOD, RFREG_MASKRXBB).await?;
+    a.wm(R_MDPK_RX_DCK, B_MDPK_RX_DCK_EN, 1)?;
+    a.wm(R_IQK_RES + (u32::from(path) << 8), B_IQK_RES_RXCFIR, 0)?;
+    let cfgch = a.rr(path, RR_CFGCH_DPK, 0xfffff).await?;
+    a.wr(path, RR_RSV4, 0xfffff, cfgch).await?;
+    a.wr(path, RR_MOD, RFREG_MASKMODE, 0xd).await?;
+    a.wr(path, RR_RXK, RR_RXK_PLLEN, 1).await?;
+    let att = if rxbb >= 0x11 {
+        0x13
+    } else if rxbb <= 0xa {
+        0
+    } else {
+        5
+    };
+    a.wr(path, RR_TXIQK, RR_TXIQK_ATT1, att).await?;
+    a.wr(path, RR_XGLNA2, RR_XGLNA2_SW, 0).await?;
+    a.wr(path, RR_RXKPLL, RR_RXKPLL_POW, 0).await?;
+    a.wr(path, RR_RXKPLL, 0xfffff, 0x80014).await?;
+    a.delay(70).await?;
+    a.wm(R_P0_RFCTM, B_P0_RFCTM_EN, 1)?;
+    a.wm(R_IQK_DIF4, B_IQK_DIF4_RXT, 0x025)?;
+    one_shot(a, path, LBK_RXIQK).await?;
+    a.wm(R_P0_RFCTM, B_P0_RFCTM_EN, 0)?;
+    a.wr(path, RR_RXK, RR_RXK_PLLEN, 0).await?;
+    a.wm(R_MDPK_RX_DCK, B_MDPK_RX_DCK_EN, 0)?;
+    a.wm(R_KPATH_CFG, B_KPATH_CFG_ED, 0)?;
+    a.wm(R_LOAD_COEF + (u32::from(path) << 8), B_LOAD_COEF_DI, 1)?;
+    a.wr(path, RR_MOD, RFREG_MASKMODE, 5).await
+}
 async fn agc<I: Interface>(
     a: &mut Access<'_, I>,
     path: u8,
     result: &mut Path,
+    width: Width,
 ) -> Result<u8, Error> {
     let (mut step, mut count, mut limited) = (0, 0, false);
     let (mut dgain, mut tx, mut gl) = (0u16, 0x38u8, 0u8);
@@ -277,8 +351,12 @@ async fn agc<I: Interface>(
                 limited |= !(0..=31).contains(&sum);
                 a.wr(path, RR_MOD, 0x3e0, sum.clamp(0, 31) as u32).await?;
                 if offset != 0 || count == 0 {
-                    a.wm(R_RXIQC + (u32::from(path) << 8), B_RXIQC_BYPASS2, 1)?;
-                    a.wm(R_RXIQC + (u32::from(path) << 8), B_RXIQC_BYPASS, 1)?;
+                    if width < Width::Mhz80 {
+                        a.wm(R_RXIQC + (u32::from(path) << 8), B_RXIQC_BYPASS2, 1)?;
+                        a.wm(R_RXIQC + (u32::from(path) << 8), B_RXIQC_BYPASS, 1)?;
+                    } else {
+                        lbk_rxiqk(a, path).await?;
+                    }
                 }
                 step = if !(342..=1922).contains(&dgain) { 0 } else { 2 };
                 count += 1;
@@ -327,6 +405,7 @@ async fn calibrate<I: Interface>(
     path: u8,
     gain: u8,
     a_band: bool,
+    width: Width,
 ) -> Result<Path, Error> {
     let mut result = Path {
         gain,
@@ -354,14 +433,24 @@ async fn calibrate<I: Interface>(
         a.wr(path, RR_IQGEN, 0xfffff, 0x38800).await?;
     }
     a.wr(path, RR_RCKD, RR_RCKD_BW, 1).await?;
-    a.wr(path, RR_BTC, RR_BTC_TXBB, 1).await?;
+    // `_dpk_rf_setting`: TXBB = dpk bw + 1.
+    a.wr(path, RR_BTC, RR_BTC_TXBB, width as u32 + 1).await?;
     a.wr(path, RR_BTC, RR_BTC_RXBB, 0).await?;
     a.wr(path, RR_RXBB2, RR_EN_TIA_IDA, 3).await?;
     a.wr(path, RR_DCK1, RR_DCK1_CLR, 0).await?;
     a.wr(path, RR_DCK, RR_DCK_LV, 0).await?;
     a.wr(path, RR_DCK, RR_DCK_LV, 1).await?;
     a.delay(1000).await?;
-    a.wm(R_TPG_MOD, B_TPG_MOD_F, 1)?;
+    // `_dpk_tpg_sel`: 80MHz clears TPG_MOD_F, 40MHz 2, 20MHz 1.
+    a.wm(
+        R_TPG_MOD,
+        B_TPG_MOD_F,
+        match width {
+            Width::Mhz20 => 1,
+            Width::Mhz40 => 2,
+            Width::Mhz80 => 0,
+        },
+    )?;
     one_shot(a, path, 0x16).await?;
     let mode = a.rr(path, RR_MOD, 0xfffff).await?;
     a.wm(R_KIP_MOD, B_KIP_MOD, mode)?;
@@ -370,14 +459,14 @@ async fn calibrate<I: Interface>(
     a.wm(R_P0_RFCTM, B_P0_RFCTM_EN, 0)?;
     a.wm(R_KIP_RPT1, B_KIP_RPT1_SEL_V1, 8)?;
     table(a, path)?;
-    result.txagc = agc(a, path, &mut result).await?;
+    result.txagc = agc(a, path, &mut result, width).await?;
     for value in [1, 0, 1] {
         a.wr(path, RR_TM, RR_TM_TRI, value).await?;
     }
     a.delay(200).await?;
     result.thermal = a.rr(path, RR_TM, RR_TM_VAL).await? as u8;
     // `_dpk_idl_mpa`: MDPD order 2 for 5GHz below 80MHz, else order 0.
-    if a_band {
+    if a_band && width < Width::Mhz80 {
         a.wm(R_LDL_NORM, B_LDL_NORM_OP, 2)?;
         a.wm(R_LDL_NORM, B_LDL_NORM_PN, 0)?;
         a.wm(R_MDPK_SYNC, B_MDPK_SYNC_MAN, 0)?;

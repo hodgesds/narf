@@ -388,3 +388,101 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx
 );
+/// Linux rtw8852b_common.c `__rtw8852bx_set_channel_mac` RFMOD / TX
+/// sub-carrier (phy.c `rtw89_phy_get_txsc`), `rtw8852bx_ctrl_bw` FC0 BW_SET /
+/// PRICH / 40MHz R_RXSC and `rtw8852bx_5m_mask` for 40/80MHz chandefs, with the
+/// width/PRICH readback gating readiness.
+fn smoke_rtw89_b_channel_bb_programs_wide_width_primary_and_5m_mask() -> TestResult {
+    use super::super::operating_channel::Width;
+    let mac = |io: &Model, a: u32| {
+        u32::from_le_bytes(io.bytes[a as usize..a as usize + 4].try_into().unwrap())
+    };
+    // (profile, rfmod, sub-carrier, prich, rxsc, 5M en, 5M sb0, sbd)
+    let rows = [
+        (Profile::new_2ghz_40(1, true), 1, 2, 2, Some(0), 1, 1, 1),
+        (Profile::new_2ghz_40(9, false), 1, 1, 1, Some(1), 1, 0, 1),
+        (
+            Profile::new_5ghz(36, Width::Mhz40),
+            1,
+            2,
+            2,
+            Some(0),
+            1,
+            1,
+            1,
+        ),
+        (
+            Profile::new_5ghz(36, Width::Mhz80),
+            2,
+            4 | (10 << 4),
+            4,
+            None,
+            1,
+            1,
+            1,
+        ),
+        (
+            Profile::new_5ghz(48, Width::Mhz80),
+            2,
+            3 | (9 << 4),
+            3,
+            None,
+            1,
+            0,
+            1,
+        ),
+        (
+            Profile::new_5ghz(44, Width::Mhz80),
+            2,
+            1 | (9 << 4),
+            1,
+            None,
+            0,
+            0,
+            0,
+        ),
+    ];
+    let (g, c) = inputs(3);
+    for (profile, rfmod, sub, prich, rxsc, en, sb0, sbd) in rows {
+        let Some(profile) = profile else {
+            return TestResult::Fail("wide chandef refused");
+        };
+        let mut io = Model::new(0x5a, 3);
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned MAC/BB words; no native caller or grant.
+        let r = ready(unsafe { owner.prepare_for_channel(&mut io, &g, &c, [-91, 101], profile) });
+        if r != Some(Ok(())) || owner.state() != State::Configured {
+            return TestResult::Fail("wide BB programming/readback failed");
+        }
+        if u32::from(io.bytes[R_AX_WMAC_RFMOD as usize]) & B_AX_WMAC_RFMOD_MASK != rfmod
+            || mac(&io, R_AX_TX_SUB_CARRIER_VALUE) != sub
+            || field(&io, R_FC0_BW_V1, B_FC0_BW_SET) != profile.width() as u32
+            || field(&io, R_CHBW_MOD_V1, B_CHBW_MOD_PRICH) != prich
+            || field(&io, R_CHBW_MOD_V1, B_CHBW_MOD_SBW) != 0
+            || rxsc.is_some_and(|v| field(&io, R_RXSC, B_RXSC_EN) != v)
+            || field(&io, R_PATH0_5MDET_V1, B_PATH0_5MDET_EN) != en
+            || field(&io, R_PATH1_5MDET_V1, B_PATH1_5MDET_EN) != en
+            || (en == 1
+                && (field(&io, R_PATH0_5MDET_V1, B_PATH0_5MDET_SB0) != sb0
+                    || field(&io, R_PATH1_5MDET_V1, B_PATH1_5MDET_SB2) != 1 - sb0
+                    || field(&io, R_PATH0_5MDET_V1, B_PATH0_5MDET_TH) != 4))
+            || field(&io, R_ASSIGN_SBD_OPT_V1, B_ASSIGN_SBD_OPT_EN_V1) != sbd
+            || field(&io, R_MAC_PIN_SEL, B_CH_IDX_SEG0) != u32::from(profile.chan_idx())
+        {
+            return TestResult::Fail("wide MAC/BB width programming differs from Linux");
+        }
+        let mut io = Model::new(0x5a, 3);
+        io.ignore = true;
+        let mut owner = Channel::default();
+        // SAFETY: inert model that ignores writes; readback must refuse readiness.
+        let r = ready(unsafe { owner.prepare_for_channel(&mut io, &g, &c, [-91, 101], profile) });
+        if !matches!(r, Some(Err(_))) {
+            return TestResult::Fail("ignored wide programming became ready");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_channel_bb_programs_wide_width_primary_and_5m_mask
+);

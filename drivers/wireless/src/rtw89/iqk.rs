@@ -54,7 +54,8 @@ pub(super) struct Iqk {
     state: State,
     results: Results,
 }
-struct Access<'a, I>(&'a mut I);
+/// The retained interface plus Linux `iqk_info->iqk_bw` (20/40/80 = 0/1/2).
+struct Access<'a, I>(&'a mut I, u32);
 impl<I: Interface> Access<'_, I> {
     fn bb(&mut self, address: u32, mask: u32) -> Result<u32, Error> {
         self.0.admit()?;
@@ -134,11 +135,13 @@ impl<I: Interface> Access<'_, I> {
             }
             3 => {
                 self.wm(R_P0_RFCTM, B_P0_RFCTM_EN, 0)?;
-                0x808 | (1 << (4 + path))
+                // `ID_TXK`: ((0x8 + iqk_bw) & 0xf) << 8.
+                0x008 | (1 << (4 + path)) | (((0x8 + self.1) & 0xf) << 8)
             }
             5 => {
                 self.wm(R_P0_RFCTM, B_P0_RFCTM_EN, 1)?;
-                0xb08 | (1 << (4 + path))
+                // `ID_RXK`: ((0xb + iqk_bw) & 0xf) << 8.
+                0x008 | (1 << (4 + path)) | (((0xb + self.1) & 0xf) << 8)
             }
             _ => return Err(Error::Table),
         };
@@ -159,7 +162,10 @@ impl<I: Interface> Access<'_, I> {
         self.delay(1).await?;
         self.wm(R_ANAPAR, B_ANAPAR_15, 0x41)
     }
+    /// Linux `_iqk_rxclk_setting`: the 80MHz branch selects RXCK 2 and
+    /// UPD_CLK_ADC_VAL 1, every narrower width RXCK 1 / VAL 0.
     async fn rx_clock(&mut self) -> Result<(), Error> {
+        let wide = u32::from(self.1 == 2);
         self.wm(R_P0_NRBW, B_P0_NRBW_DBG, 1)?;
         self.wm(R_P1_DBGMOD, B_P1_DBGMOD_ON, 1)?;
         self.delay(1).await?;
@@ -169,12 +175,12 @@ impl<I: Interface> Access<'_, I> {
         self.wm(R_ANAPAR, B_ANAPAR_15, 0xa001)?;
         self.delay(1).await?;
         self.wm(R_ANAPAR, B_ANAPAR_15, 0xa041)?;
-        self.wm(R_P0_RXCK, B_P0_RXCK_VAL, 1)?;
+        self.wm(R_P0_RXCK, B_P0_RXCK_VAL, 1 + wide)?;
         self.wm(R_P0_RXCK, B_P0_RXCK_ON, 1)?;
-        self.wm(R_P1_RXCK, B_P1_RXCK_VAL, 1)?;
+        self.wm(R_P1_RXCK, B_P1_RXCK_VAL, 1 + wide)?;
         self.wm(R_P1_RXCK, B_P1_RXCK_ON, 1)?;
         self.wm(R_UPD_CLK_ADC, B_UPD_CLK_ADC_ON, 1)?;
-        self.wm(R_UPD_CLK_ADC, B_UPD_CLK_ADC_VAL, 0)
+        self.wm(R_UPD_CLK_ADC, B_UPD_CLK_ADC_VAL, wide)
     }
     /// Linux `_iqk_txk_setting` (band branch on `iqk_band`).
     async fn tx_setting(&mut self, path: u8, a_band: bool) -> Result<(), Error> {
@@ -428,7 +434,7 @@ impl Iqk {
         io.begin(Kind::Iqk).await?;
         io.admit()?;
         let saved = io.pause().await?;
-        let mut access = Access(io);
+        let mut access = Access(io, channel.width() as u32);
         for path in 0..2 {
             let start = access.0.now_us();
             while access.rr(path, RR_MOD, RR_MOD_MASK).await? == 2 {
@@ -454,7 +460,8 @@ impl Iqk {
                 B_IQKCH_BAND << (path * 16),
                 u32::from(channel.band_index()),
             )?;
-            access.wm(R_IQKCH, B_IQKCH_BW << (path * 16), 0)?;
+            // 20/40/80 = 0/1/2.
+            access.wm(R_IQKCH, B_IQKCH_BW << (path * 16), channel.width() as u32)?;
             access.wm(
                 R_IQKCH,
                 B_IQKCH_CH << (path * 16),
