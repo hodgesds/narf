@@ -2922,11 +2922,14 @@ U-APSD capability is advertised. Four new cases are written, unexecuted:
 `smoke_rtw89_ap_control_peer_lifecycle_allocates_macid_and_cam`,
 `smoke_rtw89_ap_control_beacon_publication_and_fail_closed`.
 
-### RTL8852C retained-runtime groundwork (partial; no native caller)
+### RTL8852C retained runtime (implemented, pending validation)
 
-Chip row `rtl8852c`. These owners are the first chip-specific RTL8852C
-pieces under the retained B architecture; nothing here admits a C station,
-publishes a C radio grant or changes any B byte.
+Chip row `rtl8852c`. These owners are the chip-specific RTL8852C pieces under
+the retained B architecture. Together with the native lifecycle, signed
+N5CB/N5CC records, coex, grant, retune and station admission sections below
+they admit a C station at the RTL8852B chip-row scope (20/40/80/160 MHz per
+admitted records; see the known-gaps paragraph for what stays documented).
+No RTL8852B byte changes; an unprovisioned board stays unadmitted.
 
 **Factory inputs.** `Factory::read` on RTL8852C reads the complete Linux
 PHY-cap window (`rtw8852c_chip_info.phycap_addr` 0x590, `phycap_size` 0x60)
