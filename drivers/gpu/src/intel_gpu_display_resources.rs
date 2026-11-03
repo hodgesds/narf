@@ -261,14 +261,21 @@ impl Profile {
         // (0xffff keeps SAGV masked).
         let held = crate::intel_gpu_pmdemand::Params::decode(req0, req1);
         let need = state.pmdemand;
+        // mbus_ctl_join_update selects the joined pipe when it stays lit
+        // without a modeset (intel_mbus_joined_pipe) and NONE otherwise: the
+        // owned modeset joins with NONE, while a live repartition that
+        // re-joins around a lit Pipe A selects Pipe A. Linux's MBUS readout
+        // takes only MBUS_JOIN, so either select is the joined profile.
+        let mbus = read(io, crate::intel_gpu_xelpg_dbuf::MBUS_CTL)?
+            & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK;
+        let mbus_joined =
+            mbus == state.dbuf.mbus_ctl() || mbus == state.dbuf.mbus_ctl_select(Some(0));
         if held.qclk_gv_bw != need.qclk_gv_bw
             || held.max(&need) != held
             || read(io, 0x44468)? & (1 << 27) != 0
             || read(io, REQUEST1)? & ENABLE != 0
             || read(io, INFLIGHT)? & (1 << 26) != 0
-            || read(io, crate::intel_gpu_xelpg_dbuf::MBUS_CTL)?
-                & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK
-                != state.dbuf.mbus_ctl()
+            || !mbus_joined
             || read(io, crate::intel_gpu_xelpg_dbuf::dbox_ctl(0))? != state.dbuf.dbox(0)
             || read(io, 0x45004)? & (1 << 3) == 0
             || read(io, res::plane_buf_cfg(0, 0))? != state.dbuf.pipes[0].planes[0].reg()

@@ -193,6 +193,39 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_cursor",
     smoke_mtl_cursor_resources_real_modeset_ack_joined_ddb_and_watermarks
 );
+
+/// `mbus_ctl_join_update` selects NONE after the owned modeset but Pipe A
+/// when a live repartition re-joins around the lit panel (an external pipe
+/// was removed). Both are the joined single-pipe profile; another pipe's
+/// select or an unjoined MBUS is not.
+fn smoke_mtl_resource_profile_accepts_either_joined_mbus_select() -> TestResult {
+    let io = Registers::new();
+    io.values.borrow_mut().insert(0x7026c, 5);
+    assert_eq!(io.run(), Ok(Mode::VESA_1024X768_60));
+    let original = io.read32(0x4438c);
+    assert_eq!(original & 0xdc000000, 0xdc000000);
+    let keep = original & !0xdc000000;
+    let before = io.writes.borrow().len();
+    let capture = |mbus: u32| {
+        io.values.borrow_mut().insert(0x4438c, keep | mbus);
+        Profile::capture(&io, &Mode::VESA_1024X768_60).map(|_| ())
+    };
+    assert_eq!(capture(0xdc000000), Ok(()), "joined, select NONE");
+    assert_eq!(capture(0xc0000000), Ok(()), "joined, select Pipe A");
+    for mbus in [0xc4000000, 0xcc000000, 0x9c000000, 0x1c000000, 0] {
+        assert!(
+            matches!(capture(mbus), Err(FsError::Unsupported)),
+            "MBUS_CTL {mbus:#x} is not the joined Pipe-A profile"
+        );
+    }
+    io.values.borrow_mut().insert(0x4438c, original);
+    assert_eq!(io.writes.borrow().len(), before, "capture never writes");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_cursor",
+    smoke_mtl_resource_profile_accepts_either_joined_mbus_select
+);
 fn smoke_mtl_cursor_resources_prewrite_foreign_and_bad_profiles_refused() -> TestResult {
     for (r, v) in [
         (0x71008, 3 << 30),
