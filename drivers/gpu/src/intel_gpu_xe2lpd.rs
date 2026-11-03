@@ -330,6 +330,51 @@ pub(crate) fn display_route(
     Ok(ip)
 }
 
+/// The probe's route decision for one Lunar Lake function: `true` only when
+/// [`display_route`] admits the display. Without the option no register is
+/// touched, so the headless profile's probe runs exactly as before; with it,
+/// the decision reads BAR0 (`GMD_ID_DISPLAY`, `SKL_DFSM`, `TRANSCONF_A`)
+/// and nothing else.
+pub(crate) fn probe_route(
+    device: &narf_bus::BusDevice,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> bool {
+    let lnl = crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .is_some_and(|p| p.is_lnl());
+    if !lnl || !requested(narf_boot::args()) {
+        return false;
+    }
+    let generation = crate::intel_gpu::Generation::LunarLake;
+    if narf_bus::pci::set_command(
+        cap,
+        device,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    // SAFETY: the PCI probe grants exclusive ownership of this function's
+    // BAR0; an identical later mapping reuses the same typed VA.
+    let Ok(bar) = (unsafe { narf_bus::bar::map_bar(device, 0) }) else {
+        return false;
+    };
+    let route = display_route(generation, true, &crate::intel_gpu_edp::BarWindow(&bar));
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "intel-gpu: Lunar Lake display route (PCI {:04x}:{:04x}): {:?}",
+            device.id.vendor,
+            device.id.device,
+            route,
+        );
+    }
+    route.is_ok()
+}
+
 /// The display-20 owned Pipe-A modeset, through the display-14
 /// orchestrator dispatched on Xe2_LPD. Refused read-only unless the
 /// hardware reports display 20.00: the generation alone never selects it
@@ -349,6 +394,33 @@ pub(crate) fn modeset<M: MmioWindow + ?Sized>(
         Some(mode) => ms.modeset_fixed(fb, mode),
         None => ms.modeset(fb, None),
     }
+}
+
+/// Take over the firmware-lit Pipe A at its current surface
+/// (`takeover_display`'s shape), running the display-20 modeset at the
+/// panel's EDID mode.
+pub(crate) fn takeover<M: MmioWindow + ?Sized>(mmio: &M) -> Option<crate::intel_gpu_modeset::Mode> {
+    use crate::intel_gpu_pipes::{
+        Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
+        PLANE_SURF_OFFSET,
+    };
+    let pipe_base = Pipe::A.base();
+    let conf = mmio.read32(pipe_base + PIPECONF_OFFSET);
+    if conf == u32::MAX || conf & PIPECONF_ENABLE == 0 {
+        return None;
+    }
+    let plane_base = pipe_base + PLANE_PRIMARY_OFFSET;
+    let surf = mmio.read32(plane_base + PLANE_SURF_OFFSET);
+    let stride = mmio.read32(plane_base + PLANE_STRIDE_OFFSET);
+    if surf == u32::MAX || stride == u32::MAX {
+        return None;
+    }
+    let fb = crate::intel_gpu_modeset::Framebuffer {
+        phys_addr: u64::from(surf & !0xFFF),
+        stride_bytes: stride.checked_mul(64)?,
+        format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+    };
+    modeset(mmio, &fb, None).ok()
 }
 
 // ── CDCLK and MDCLK ──────────────────────────────────────────────

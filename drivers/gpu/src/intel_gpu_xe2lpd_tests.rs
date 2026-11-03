@@ -906,6 +906,9 @@ fn smoke_xe2lpd_entry_refuses_without_display20_read_only() -> TestResult {
         Err(ModesetError::UnsupportedGeneration)
     );
     assert!(io.writes.borrow().is_empty());
+    // Takeover needs a lit Pipe A and reads only.
+    assert_eq!(takeover(&io), None);
+    assert!(io.writes.borrow().is_empty());
     TestResult::Pass
 }
 kernel_test_in!(

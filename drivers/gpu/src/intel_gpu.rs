@@ -1094,8 +1094,14 @@ pub(crate) fn lnl_boot_scanout_excluded() -> bool {
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-        .is_some_and(|p| p.is_discrete() || p.is_headless_integrated())
+    // A Lunar Lake function whose display-20 route is admitted (requested,
+    // GMD 20.00, Pipe A fused in and lit by firmware) takes the integrated
+    // display path below and never the headless profile's driver FLR;
+    // every other Lunar Lake function keeps the headless profile.
+    let lnl_display = crate::intel_gpu_xe2lpd::probe_route(&device, &cap);
+    if !lnl_display
+        && crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+            .is_some_and(|p| p.is_discrete() || p.is_headless_integrated())
     {
         return crate::intel_gpu_gt_runtime::probe_discrete(device, cap);
     }
@@ -1329,6 +1335,49 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 }
             }
         }
+    } else if lnl_display {
+        // Lunar Lake display 20 (Xe2_LPD), admitted per device: sequence
+        // the eDP panel, then run the display-20 owned modeset on the
+        // firmware's Pipe-A surface. The scanout stays on that surface
+        // (the boot framebuffer console keeps drawing it): without a GT
+        // owner on this function no Xe2 GGTT/PAT policy for a new console
+        // allocation exists, so no KMS owner, GT runtime or PM owner is
+        // installed below (`current_mode` stays empty).
+        let window = crate::intel_gpu_edp::BarWindow(&dev.gtt_mmadr);
+        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&window);
+        pps.init_registers();
+        let mode = match pps.power_on() {
+            Ok(()) => crate::intel_gpu_xe2lpd::takeover(&dev.mode_window()),
+            Err(e) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: eDP panel power sequence failed: {:?} — display 20 skipped",
+                    e,
+                );
+                None
+            }
+        };
+        if mode.is_some() {
+            let _ = pps.backlight_on();
+            let _ = crate::intel_gpu_multipipe::claim_pipe(
+                crate::intel_gpu_pipes::Pipe::A,
+                crate::intel_gpu_multipipe::PipeOwner {
+                    ddi: crate::intel_gpu_ddi::Ddi::A,
+                    used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+                },
+            );
+            log_probe(
+                "display 20 (Xe2_LPD) owned eDP modeset complete on Pipe A",
+                &device,
+            );
+        } else {
+            log_probe(
+                "display 20 (Xe2_LPD) takeover refused; firmware display retained",
+                &device,
+            );
+        }
+        panel_mode = mode;
     } else {
         // PTL: identification is real, but Xe3-LPD is a
         // different display IP generation from both Gen12 and
@@ -1349,7 +1398,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // leaves the panel running plain eDP. Display 14 PSR is not
     // the Gen12 register layout: it is enabled only by the KMS owner
     // (`intel_gpu_psr`), never on the console.
-    if let Some(mode) = panel_mode.filter(|_| dev.chip.generation != Generation::MeteorLake) {
+    if let Some(mode) = panel_mode.filter(|_| {
+        dev.chip.generation.display_supported() && dev.chip.generation != Generation::MeteorLake
+    }) {
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
 
