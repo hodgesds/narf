@@ -714,3 +714,55 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ce",
     smoke_rtl8192ce_linked_ring_profile
 );
+
+// ── tables ────────────────────────────────────────────────────────────────
+
+/// `table.h` lengths and first/last pairs of the generated `table.c` arrays.
+fn smoke_rtl8192ce_tables_verbatim_geometry() -> TestResult {
+    let lens = [
+        tables::PHY_REG_2T.len(),
+        tables::PHY_REG_1T.len(),
+        tables::PHY_REG_PG.len(),
+        tables::RADIOA_2T.len(),
+        tables::RADIOB_2T.len(),
+        tables::RADIOA_1T.len(),
+        tables::RADIOB_1T.len(),
+        tables::MAC_2T.len(),
+        tables::AGCTAB_2T.len(),
+        tables::AGCTAB_1T.len(),
+    ];
+    if lens != [374, 374, 192, 282, 78, 282, 1, 162, 320, 320] {
+        return TestResult::Fail("table.h array lengths");
+    }
+    // Every (address, value) table is pair-aligned; RADIOB_1T (1 word) is
+    // never walked: a 1T1R part has num_total_rfpath = 1.
+    let paired = [
+        &tables::PHY_REG_2T[..],
+        &tables::PHY_REG_1T[..],
+        &tables::PHY_REG_PG[..],
+        &tables::RADIOA_2T[..],
+        &tables::RADIOB_2T[..],
+        &tables::RADIOA_1T[..],
+        &tables::MAC_2T[..],
+        &tables::AGCTAB_2T[..],
+        &tables::AGCTAB_1T[..],
+    ];
+    if paired.iter().any(|t| t.len() % 2 != 0) {
+        return TestResult::Fail("odd-length pair table");
+    }
+    // PHY_REG (incl. the 0x24 AFE row) / AGC rows are MMIO dwords below
+    // 0x1000; MAC rows are bytes in the MAC block.
+    if tables::PHY_REG_2T
+        .chunks(2)
+        .chain(tables::AGCTAB_1T.chunks(2))
+        .any(|r| r[0] >= 0x1000 || r[0] & 3 != 0)
+        || tables::MAC_2T.chunks(2).any(|r| r[0] >= 0x800)
+    {
+        return TestResult::Fail("table address ranges");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_tables_verbatim_geometry
+);

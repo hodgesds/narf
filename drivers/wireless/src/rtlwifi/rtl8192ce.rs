@@ -29,6 +29,8 @@
 //! - [`trx`] — 64-byte linked TX ring entries (40-byte descriptor, next link
 //!   at dword 10) and 32-byte RX descriptors (`trx.{c,h}`); the ring owner
 //!   is `prepare::Chip::Rtl8192ce`.
+//! - [`tables`] — verbatim `table.c` MAC / PHY_REG (1T, 2T) / PHY_REG_PG /
+//!   AGC (1T, 2T) / RADIOA / RADIOB arrays (generated).
 //! - [`llt`] — `_rtl92ce_llt_table_init` (`LLT_CONFIG == 5`).
 //! - [`mac`] — the `_rtl92ce_init_mac` remainder, `_rtl92ce_hw_configure`
 //!   and the station address, with `REG_CR` and ring bases left to the
@@ -41,6 +43,7 @@ pub mod fw;
 pub mod llt;
 pub mod mac;
 pub mod power;
+pub mod tables;
 pub mod trx;
 pub mod version;
 

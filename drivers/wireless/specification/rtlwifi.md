@@ -2399,6 +2399,10 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   the power prefix, clears CR DMA/MAC gates instead of `REG_CR = 0x2ff`
   (ring owner), stops a running image and downloads.
 
+- `tables` — `table.c` arrays generated verbatim (MAC_2T 162, PHY_REG
+  1T/2T 374, PHY_REG_PG 192, AGC 1T/2T 320, RADIOA 1T/2T 282, RADIOB_2T 78,
+  RADIOB_1T 1 word, never walked for a 1T1R part). Selection is
+  `IS_92C_SERIAL` (2T tables) vs 88C (1T); there are no conditional rows.
 - `trx` — legacy linked rings (`trx.{c,h}`): 64-byte TX entries whose
   first 40 bytes (`clear_pci_tx_desc_content` / `TX_DESC_NEXT_DESC_OFFSET`)
   are filled per frame and whose dword 10 is the next link; the
@@ -2437,7 +2441,8 @@ Tests (written, unexecuted): `smoke_rtl8192ce_chip_version_rf_type_and_firmware_
 `smoke_rtl8192ce_tx_descriptor_fields`,
 `smoke_rtl8192ce_rx_descriptor_status_and_arm`,
 `smoke_rtl8192ce_llt_and_init_mac_remainder`,
-`smoke_rtl8192ce_linked_ring_profile`.
+`smoke_rtl8192ce_linked_ring_profile`,
+`smoke_rtl8192ce_tables_verbatim_geometry`.
 
 ## 4. Invariants
 
