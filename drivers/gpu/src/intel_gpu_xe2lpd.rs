@@ -672,8 +672,7 @@ pub(crate) fn program_pkgc_latency(
 
 // ── DMC ──────────────────────────────────────────────────────────
 
-/// `DMC_PATH(xe2lpd)`.
-#[cfg(any(test, feature = "kernel-test"))]
+/// `DMC_PATH(xe2lpd)`, the container the display-20 DC service acquires.
 pub(crate) const XE2LPD_DMC_FIRMWARE: &str = "i915/xe2lpd_dmc.bin";
 /// `XE2LPD_DMC_MAX_FW_SIZE`.
 pub(crate) const XE2LPD_DMC_MAX_FW_SIZE: usize = 0x8000;
