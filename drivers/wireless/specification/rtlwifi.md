@@ -1922,8 +1922,41 @@ diagnostic (`pci::bring_up` does not retain it).
   id (`0xff` ⇒ 0), board type `0xc1[7:5]` (`0xff` ⇒ 0) plus `ODM_BOARD_BT`
   when `[7:5] == 1` (the BT-coexist board), crystal cap `0xb9` (`0xff` ⇒
   `0x20`) and the Lenovo OEM rule.
+- `trx` — new TRX flow (`use_new_trx_flow`): per TX queue a ring of
+  64-byte buffer descriptors (four 16-byte segments, `RTL8192EE_SEG_NUM = 1`)
+  beside a ring of 64-byte TX descriptors; `rtl92ee_pre_fill_tx_bd_desc`
+  (segment 0 = 40-byte descriptor with PSB `ceil((len + 40) / 256)`,
+  segment 1 = frame, the rest zero, DMA32 high words 0) and
+  `rtl92ee_tx_fill_desc` first+last segment fields (no descriptor OWN on
+  this chip; A-MPDU `max_agg_num 0x14`; SPE_RPT/SW_DEFINE TX reports) and
+  `rtl92ee_tx_fill_cmddesc`. Queue ownership is the `REG_*_TXBD_IDX` write
+  pointer (`get_desc_addr_fr_q_idx`; beacon/TXCMD/HCCA alias BE), beacon
+  uses the BD OWN bit; `calc_fifo_space`, `rtl92ee_get_available_desc` and
+  `rtl92ee_is_tx_desc_closed`. RX: 16-byte buffer descriptors prepared with
+  data length `8192 + 24` (`HW_DESC_RX_PREPARE`), the completion predicate
+  of `rtl92ee_rx_check_dma_ok`, `REG_RXQ_TXBD_IDX` 11-bit pointers, and the
+  24-byte RX status at the start of each buffer (`rtl92ee_rx_query_desc`
+  fields incl. `rpt_sel` C2H and wake reasons; payload at `24 + drvinfo +
+  shift`). Ring sizes: 512 per TX queue (beacon 2), 512 RX.
+- `mac` — `_rtl92ee_init_mac` after the power sequence: HWSEQ `0x7f`,
+  SYS_CLKR BIT3, GPIO_MUXCFG+1 BIT4 clear, `_rtl92ee_llt_table_init`
+  (RQPN `0x80e60808`, boundary `0xf7` into TRXFF/DWBCN0/1/BCNQ/BCNQ1/MGQ/
+  `0x45d`, `TRXFF_BNDY+2 = 0x3cff`, PBP `0x31`, DRVINFO 4, auto-LLT BIT0 with
+  Linux's pre-write-value wait), HISR/HISRE W1C, TRXDMA `0xf5b1`,
+  FWHW_TXQ+1 `0x1f`, RCR `0xf000710e`, RXFLTMAP2, TCR `0x8200`, the BD ring
+  bases (BEACON/MGQ/VO/VI/BE/BK/HQ0/RX, DMA32), TSFTIMER_HCI, PCIE_CTRL+3
+  `|= 0xf7`, INT_MIG/MCUTST_1 0, `TXBD_NUM = 0x1200` (14 writes in Linux
+  order, VOQ twice) and `RXBD_NUM = 0xa200`. Deliberate: the `REG_CR` `0xff`
+  / `0x2ff` writes open the DMA engines and are left to the packet owner
+  (`mac::release_cr`); LLT always runs (fresh owner). Not yet composed into
+  `prepare::Prepared` (the linked-ring owner cannot describe BD rings).
 
 Tests (`rtl8192ee/tests.rs`, written, unexecuted):
+`smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb`,
+`smoke_rtl8192ee_tx_descriptor_fields`,
+`smoke_rtl8192ee_rx_buffer_descriptor_and_status`,
+`smoke_rtl8192ee_ring_pointer_arithmetic`,
+`smoke_rtl8192ee_init_mac_llt_ring_bases_and_bd_counts`,
 `smoke_rtl8192ee_init_mac_prefix_and_enable_flow`,
 `smoke_rtl8192ee_all_flows_pci_mac_and_terminated`,
 `smoke_rtl8192ee_firmware_header_geometry`,

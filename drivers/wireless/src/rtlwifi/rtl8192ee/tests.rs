@@ -418,3 +418,338 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_adapter_info_factory_rules
 );
+
+// ── TRX flow ──────────────────────────────────────────────────────────────
+
+fn smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb() -> TestResult {
+    use trx::TxBufferDesc;
+    // 216 + 40 = 256 fits one 256-byte page; 217 needs two.
+    let one = TxBufferDesc::fill(0x1000_0000, 0x2000_0000, 216);
+    let two = TxBufferDesc::fill(0x1000_0040, 0x2000_1000, 217);
+    if one.psb() != 1 || two.psb() != 2 {
+        return TestResult::Fail("PSB page count");
+    }
+    if one.dw[0] & 0x3fff != 40
+        || one.dw[1] != 0x1000_0000
+        || one.dw[2] != 0
+        || one.dw[4] != 216
+        || one.dw[5] != 0x2000_0000
+        || one.dw[6] != 0
+        || one.dw[8..].iter().any(|&w| w != 0)
+        || one.own()
+        || one.frame_addr() != 0x2000_0000
+    {
+        return TestResult::Fail("segment 0/1 layout or stale segments 2/3");
+    }
+    let mut beacon = one;
+    beacon.set_own();
+    if !beacon.own() || trx::TX_BD_SIZE != 64 || trx::RX_BD_SIZE != 16 {
+        return TestResult::Fail("beacon OWN / BD sizes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb
+);
+
+fn smoke_rtl8192ee_tx_descriptor_fields() -> TestResult {
+    use trx::{TxDesc, TxParams};
+    let d = TxDesc::fill(&TxParams {
+        pkt_size: 100,
+        queue_sel: trx::QSLT_MGNT,
+        macid: 0,
+        rate_id: 7,
+        hw_rate: trx::DESC_RATE1M,
+        use_driver_rate: true,
+        disable_fallback: true,
+        seq: 0x123,
+        multicast: true,
+        protection: 1,
+        rts_rate: trx::DESC_RATE24M,
+        tx_report: Some(0x24),
+        buffer_addr: 0x3000_0000,
+        ..TxParams::default()
+    });
+    let w = d.dw;
+    if w[0] & 0xffff != 100
+        || (w[0] >> 16) & 0xff != 40
+        || w[0] & (1 << 24) == 0
+        || w[0] & (3 << 26) != 3 << 26
+        || w[0] & (1 << 31) != 0
+        || (w[1] >> 8) & 0x1f != u32::from(trx::QSLT_MGNT)
+        || (w[1] >> 16) & 0x1f != 7
+        || w[2] & (1 << 19) == 0
+        || w[3] & (1 << 8) == 0
+        || w[3] & (1 << 10) == 0
+        || w[3] & (1 << 12) == 0
+        || w[3] & (1 << 11) != 0
+        || (w[4] >> 8) & 0x1f != 0x1f
+        || (w[4] >> 13) & 0xf != 0xf
+        || (w[4] >> 24) & 0x1f != u32::from(trx::DESC_RATE24M)
+        || w[6] & 0xfff != 0x24
+        || w[7] & 0xffff != 100
+        || (w[9] >> 12) & 0xfff != 0x123
+        || w[10] != 0x3000_0000
+        || w[12] != 0
+    {
+        return TestResult::Fail("rtl92ee_tx_fill_desc field placement");
+    }
+    let ht = TxDesc::fill(&TxParams {
+        pkt_size: 1500,
+        hw_rate: trx::DESC_RATEMCS0 + 7,
+        ampdu: true,
+        ampdu_density: 5,
+        data_bw: 1,
+        sub_carrier: 3,
+        sec_type: 3,
+        ..TxParams::default()
+    });
+    if ht.dw[2] & (1 << 12) == 0
+        || (ht.dw[3] >> 17) & 0x1f != 0x14
+        || (ht.dw[2] >> 20) & 7 != 5
+        || (ht.dw[4] >> 5) & 3 != 1
+        || ht.dw[5] & 0xf != 3
+        || (ht.dw[1] >> 22) & 3 != 3
+    {
+        return TestResult::Fail("A-MPDU / BW40 / CCMP fields");
+    }
+    let c = TxDesc::command(1240, 0x4000_0000);
+    if c.dw[0] & 0xffff != 1240
+        || c.dw[0] & (1 << 31) == 0
+        || (c.dw[1] >> 8) & 0x1f != u32::from(trx::QSLT_BEACON)
+        || (c.dw[1] >> 16) & 0x1f != 7
+        || c.dw[3] & (1 << 8) == 0
+        || c.dw[7] & 0xffff != 1240
+        || c.dw[10] != 0x4000_0000
+    {
+        return TestResult::Fail("rtl92ee_tx_fill_cmddesc");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_tx_descriptor_fields
+);
+
+fn smoke_rtl8192ee_rx_buffer_descriptor_and_status() -> TestResult {
+    use trx::{RxBufferDesc, RxStatus};
+    let bd = RxBufferDesc::prepare(0x5000_0000);
+    if bd.dw[0] != 8192 + 24 || bd.dw[1] != 0x5000_0000 || bd.dw[2] != 0 || bd.dma_done() {
+        return TestResult::Fail("HW_DESC_RX_PREPARE");
+    }
+    let done = RxBufferDesc::from_words([(1 << 15) | (1 << 16) | (300 << 16), 0, 0, 0]);
+    if !done.dma_done() || !done.first_segment() || !done.last_segment() {
+        return TestResult::Fail("BD FS/LS/total length");
+    }
+    let mut b = [0u8; trx::RX_DESC_SIZE];
+    let d0: u32 = 300 | (1 << 14) | (4 << 16) | (2 << 24) | (1 << 26) | (1 << 27);
+    b[..4].copy_from_slice(&d0.to_le_bytes());
+    b[4..8].copy_from_slice(&((1u32 << 15) | 3).to_le_bytes());
+    b[8..12].copy_from_slice(&(1u32 << 28).to_le_bytes());
+    b[12..16].copy_from_slice(&((1u32 << 31) | (1 << 30) | 0x13).to_le_bytes());
+    b[20..24].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    let s = RxStatus::decode(&b);
+    if s.pkt_len != 300
+        || !s.crc
+        || s.icv
+        || s.drvinfo != 32
+        || s.shift != 2
+        || !s.physt
+        || s.decrypted
+        || s.macid != 3
+        || !s.ampdu
+        || !s.c2h
+        || s.rate != 0x13
+        || s.tsfl != 0xdead_beef
+        || s.wake_match != 2
+        || s.payload_offset() != 24 + 32 + 2
+    {
+        return TestResult::Fail("rtl92ee_rx_query_desc decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_rx_buffer_descriptor_and_status
+);
+
+fn smoke_rtl8192ee_ring_pointer_arithmetic() -> TestResult {
+    use trx::*;
+    if fifo_space(0, 0, 512) != 511
+        || fifo_space(5, 3, 512) != 1
+        || fifo_space(3, 5, 512) != 509
+        || available((7 << 16) | 7) != 511
+        || tx_points(0xffff_ffff) != (0xfff, 0xfff)
+        || rx_points(0xffff_ffff) != (0x7ff, 0x7ff)
+    {
+        return TestResult::Fail("calc_fifo_space / index decode");
+    }
+    // wp > rp: [rp, wp) open.
+    if tx_desc_closed(2, 5, 3) || !tx_desc_closed(2, 5, 5) || !tx_desc_closed(2, 5, 1) {
+        return TestResult::Fail("closed, wp > rp");
+    }
+    // wp < rp (wrapped): (wp, rp) closed.
+    if !tx_desc_closed(5, 2, 3) || tx_desc_closed(5, 2, 6) || tx_desc_closed(5, 2, 2) {
+        return TestResult::Fail("closed, wp < rp");
+    }
+    if tx_desc_closed(4, 4, 4) || !tx_desc_closed(4, 4, 3) {
+        return TestResult::Fail("closed, wp == rp");
+    }
+    if Queue::Beacon.index_register() != REG_BEQ_TXBD_IDX
+        || Queue::High.index_register() != REG_HI0Q_TXBD_IDX
+        || Queue::Beacon.entries() != 2
+        || Queue::Be.entries() != 512
+    {
+        return TestResult::Fail("queue index map / ring sizes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_ring_pointer_arithmetic
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    W8(u16, u8),
+    W16(u16, u16),
+    W32(u16, u32),
+}
+#[derive(Clone)]
+struct MacFake(Arc<IrqSafeSpinLock<(Vec<u8>, Vec<Op>)>>);
+#[async_trait::async_trait]
+impl Io for MacFake {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        Ok(self.0.lock().0[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        Ok(u32::from_le_bytes([
+            g.0[r],
+            g.0[r + 1],
+            g.0[r + 2],
+            g.0[r + 3],
+        ]))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.0[usize::from(reg)] = value;
+        g.1.push(Op::W8(reg, value));
+        Ok(())
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.0[r..r + 2].copy_from_slice(&value.to_le_bytes());
+        g.1.push(Op::W16(reg, value));
+        Ok(())
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.0[r..r + 4].copy_from_slice(&value.to_le_bytes());
+        g.1.push(Op::W32(reg, value));
+        Ok(())
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+
+/// `_rtl92ee_init_mac` remainder: no `REG_CR` write, exact LLT boundary
+/// sequence, BD ring bases (not TX descriptor rings) and `TXBD_NUM` counts.
+fn smoke_rtl8192ee_init_mac_llt_ring_bases_and_bd_counts() -> TestResult {
+    let mut regs = vec![0u8; 0x800];
+    regs[0x10c] = 0xff;
+    regs[0x10d] = 0xff;
+    regs[0x41] = 0xff;
+    let io = MacFake(Arc::new(IrqSafeSpinLock::new((regs, Vec::new()))));
+    let rings = mac::Rings {
+        beacon: 0x1000,
+        mgnt: 0x2000,
+        vo: 0x3000,
+        vi: 0x4000,
+        be: 0x5000,
+        bk: 0x6000,
+        high: 0x7000,
+        rx: 0x8000,
+    };
+    if narf_scheduler::block_on(mac::init_mac(&io, &rings)).is_err() {
+        return TestResult::Fail("init_mac failed on the model");
+    }
+    let g = io.0.lock();
+    let ops = &g.1;
+    if ops.iter().any(|o| {
+        matches!(
+            o,
+            Op::W8(0x100..=0x101, _) | Op::W16(0x100, _) | Op::W32(0x100, _)
+        )
+    }) {
+        return TestResult::Fail("REG_CR opened before the packet owner");
+    }
+    let llt = [
+        Op::W32(mac::REG_RQPN, 0x80e6_0808),
+        Op::W8(mac::REG_TRXFF_BNDY, 0xf7),
+        Op::W16(mac::REG_TRXFF_BNDY + 2, 0x3cff),
+    ];
+    let at = match ops.iter().position(|o| *o == llt[0]) {
+        Some(at) => at,
+        None => return TestResult::Fail("LLT RQPN missing"),
+    };
+    if ops[at..at + 3] != llt || ops[0] != Op::W8(mac::REG_HWSEQ_CTRL, 0x7f) {
+        return TestResult::Fail("LLT / HWSEQ order");
+    }
+    if g.0[usize::from(mac::REG_AUTO_LLT) + 2] & 1 == 0
+        || g.0[0x45d] != 0xf7
+        || g.0[usize::from(mac::REG_PBP)] != 0x31
+        || g.0[0x41] & 0x10 != 0
+        || g.0[8] & 8 == 0
+    {
+        return TestResult::Fail("auto LLT / boundaries / clocks");
+    }
+    let word = u16::from_le_bytes([g.0[0x10c], g.0[0x10d]]);
+    if word != 0xf5bf
+        || !ops.contains(&Op::W32(mac::REG_RCR, 0xf000_710e))
+        || !ops.contains(&Op::W32(mac::REG_TCR, 0x8200))
+        || !ops.contains(&Op::W16(mac::REG_RXFLTMAP2, 0xffff))
+    {
+        return TestResult::Fail("TRXDMA_CTRL / RCR / TCR / RXFLTMAP2");
+    }
+    for (reg, base) in [
+        (mac::REG_BCNQ_DESA, 0x1000),
+        (mac::REG_MGQ_DESA, 0x2000),
+        (mac::REG_VOQ_DESA, 0x3000),
+        (mac::REG_VIQ_DESA, 0x4000),
+        (mac::REG_BEQ_DESA, 0x5000),
+        (mac::REG_BKQ_DESA, 0x6000),
+        (mac::REG_HQ0_DESA, 0x7000),
+        (mac::REG_RX_DESA, 0x8000),
+    ] {
+        if !ops.contains(&Op::W32(reg, base)) {
+            return TestResult::Fail("BD ring base missing");
+        }
+    }
+    let txbd = ops
+        .iter()
+        .filter(|o| matches!(o, Op::W16(r, 0x1200) if (0x380..=0x39a).contains(r)))
+        .count();
+    if txbd != 14
+        || !ops.contains(&Op::W16(mac::REG_RX_RXBD_NUM, 0xa200))
+        || ops.last() != Some(&Op::W32(mac::REG_TSFTIMER_HCI, 0xffff_ffff))
+        || g.0[0x303] != 0xf7
+    {
+        return TestResult::Fail("TXBD/RXBD counts / TSFTIMER_HCI / PCIE_CTRL+3");
+    }
+    drop(g);
+    if mac::release_cr(&io).is_err() || io.0.lock().1.last() != Some(&Op::W16(mac::REG_CR, 0x2ff)) {
+        return TestResult::Fail("deferred CR release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_init_mac_llt_ring_bases_and_bd_counts
+);

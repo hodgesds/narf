@@ -19,12 +19,18 @@
 //!   `rtl92ee_download_fw` page/self-reset sequence.
 //! - [`adapter`] — `rtl92ee_read_eeprom_info` / `_rtl92ee_read_adapter_info`
 //!   factory facts; test chips and unprovisioned maps yield none.
+//! - [`trx`] — new-TRX-flow TX/RX buffer descriptors, TX descriptor, RX
+//!   status and the read/write-pointer helpers (`trx.{c,h}`, `pci.c`).
+//! - [`mac`] — the `_rtl92ee_init_mac` remainder (auto LLT, BD ring bases
+//!   and counts) with the `REG_CR` release deferred to the packet owner.
 
 #![allow(dead_code)]
 
 pub mod adapter;
 pub mod fw;
+pub mod mac;
 pub mod pwrseq;
+pub mod trx;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
