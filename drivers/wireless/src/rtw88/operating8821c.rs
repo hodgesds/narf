@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;
-use narf_wireless::reg::{RegFlags, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 type QError = calibration8821c::Error;
 fn denied(error: QError) -> Error {
     Error::Calibration8821c(error)
@@ -282,14 +282,11 @@ impl Envelope {
         }
         let mut limit = self.ceiling.min(80);
         let mut covering = false;
-        for rule in &domain.rules {
+        for (i, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
                 continue;
             }
-            if rule.freq_start_mhz >= rule.freq_end_mhz
-                || rule.max_bandwidth_mhz < 20
-                || rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-            {
+            if !super::channel_policy::plain_rule(domain, i, 20) {
                 return Err(denied(QError::Policy));
             }
             covering |= rule.freq_start_mhz <= 2402 && rule.freq_end_mhz >= 2422;

@@ -2533,8 +2533,16 @@ reference + difference words, C21 OFDM TXAGC; factory bound from
 `Power5g`), band-aware base rate (`rtw_tx_pkt_info_update_rate` OFDM6 /
 `RTW_RATEID_G`, `RRSR_INIT_5G` 0x150, RA `WIRELESS_OFDM`), gate/retune/scan/
 CSA wiring, 5GHz HT, and regulatory admission (DFS rules stay refused: no
-shared beacon-hint/DFS owner has landed; AUTO_BW/NO_160MHZ to be accepted
-via `RegulatoryDomain::max_bandwidth`). Three cases are written and
+shared beacon-hint/DFS owner has landed).
+
+Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
+per-channel, HT40, C22 operating and C21 calibration/operating/station
+power check): a rule may carry only `NO_P2P`, `AUTO_BW` and `NO_160MHZ`;
+its usable bandwidth is `RegulatoryDomain::max_bandwidth`
+(cfg80211 `reg.c::reg_get_max_bandwidth`: an AUTO_BW rule spans its
+adjacent run, NO_160MHZ caps at 80MHz), which must cover the program's
+width. DFS, NO_IR, indoor and unknown bits still refuse. Written,
+unexecuted: `smoke_rtw88_plain_rule_auto_bw_and_no_160mhz`. Three cases are written and
 unexecuted: `smoke_rtw88_band5_linux_groups_and_factory_power`,
 `smoke_rtw8822ce_channel5_bb_mac_rf_program`,
 `smoke_rtw8821ce_channel20_cross_band_readback`.

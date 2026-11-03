@@ -38,6 +38,23 @@ use narf_wireless::reg::{RegFlags, RegulatoryDomain};
 /// Highest admitted noninitial primary.
 pub(super) const LAST: u8 = 13;
 
+/// Flags a plain rule may carry: `NO_P2P` and cfg80211's bandwidth-shaping
+/// `AUTO_BW` / `NO_160MHZ`, whose effect is read through
+/// [`RegulatoryDomain::max_bandwidth`] (`reg.c::reg_get_max_bandwidth`).
+/// Every other bit (DFS, NO_IR, indoor, unknown) refuses the rule.
+const PLAIN: RegFlags = RegFlags::NO_P2P
+    .union(RegFlags::AUTO_BW)
+    .union(RegFlags::NO_160MHZ);
+
+/// Rule `index` of `domain` is a well-formed plain rule allowing `width` MHz.
+pub(super) fn plain_rule(domain: &RegulatoryDomain, index: usize, width: u32) -> bool {
+    domain.rules.get(index).is_some_and(|r| {
+        r.freq_start_mhz < r.freq_end_mhz
+            && r.flags.bits() & !PLAIN.bits() == 0
+            && domain.max_bandwidth(index) >= width
+    })
+}
+
 /// Linux `phy.c::rtw_get_channel_group` for 2.4GHz channels 1..=13.
 pub(super) const fn group(channel: u8) -> Option<usize> {
     match channel {
@@ -200,14 +217,11 @@ pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, 
     }
     let mut limit = record.ceiling.min(80);
     let mut covering = false;
-    for r in &domain.rules {
+    for (i, r) in domain.rules.iter().enumerate() {
         if r.freq_start_mhz >= high || r.freq_end_mhz <= low {
             continue;
         }
-        if r.freq_start_mhz >= r.freq_end_mhz
-            || r.max_bandwidth_mhz < 20
-            || r.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-        {
+        if !plain_rule(domain, i, 20) {
             return Err(Error::Prerequisite);
         }
         covering |= r.freq_start_mhz <= low && r.freq_end_mhz >= high;

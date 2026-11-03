@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use alloc::{format, string::String};
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
-use narf_wireless::reg::{RegFlags, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 
 pub(super) const LENGTH: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,14 +215,11 @@ impl Envelope {
         }
         let mut covering = false;
         let mut limit = self.qualified.min(80);
-        for rule in &domain.rules {
+        for (i, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
                 continue;
             }
-            if rule.freq_start_mhz >= rule.freq_end_mhz
-                || rule.max_bandwidth_mhz < 20
-                || rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-            {
+            if !super::channel_policy::plain_rule(domain, i, 20) {
                 return Err(Error::Policy);
             }
             covering |= rule.freq_start_mhz <= 2402 && rule.freq_end_mhz >= 2422;

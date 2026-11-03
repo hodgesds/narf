@@ -468,3 +468,44 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8821ce_channel20_cross_band_readback
 );
+
+fn smoke_rtw88_plain_rule_auto_bw_and_no_160mhz() -> TestResult {
+    // cfg80211 reg_get_max_bandwidth: AUTO_BW widens a rule to its adjacent
+    // run, NO_160MHZ caps at 80; both are bandwidth shaping, not restrictions.
+    let r22 = match Record::decode(0xc822, &payload(6, true)) {
+        Some(r) => r,
+        None => return TestResult::Fail("valid C22 record refused"),
+    };
+    let mut split = domain(2402, 2412, 30, RegFlags::AUTO_BW);
+    split.rules[0].max_bandwidth_mhz = 10;
+    split.rules.push(RegRule {
+        freq_start_mhz: 2412,
+        freq_end_mhz: 2472,
+        max_bandwidth_mhz: 10,
+        max_power_dbm: 30,
+        flags: RegFlags::AUTO_BW | RegFlags::NO_160MHZ,
+    });
+    if !channel_policy::plain_rule(&split, 1, 40) || channel_policy::policy(&r22, &split) != Ok(76)
+    {
+        return TestResult::Fail("AUTO_BW/NO_160MHZ rule not admitted at its run bandwidth");
+    }
+    let mut narrow = split.clone();
+    narrow.rules[0].flags = RegFlags::empty();
+    narrow.rules[1].flags = RegFlags::empty();
+    if channel_policy::plain_rule(&narrow, 1, 20) || channel_policy::policy(&r22, &narrow).is_ok() {
+        return TestResult::Fail("rule maximum below 20MHz admitted without AUTO_BW");
+    }
+    let mut unknown = split.clone();
+    unknown.rules[1].flags |= RegFlags::DFS;
+    if channel_policy::plain_rule(&unknown, 1, 20)
+        || channel_policy::plain_rule(&split, 5, 20)
+        || channel_policy::policy(&r22, &unknown).is_ok()
+    {
+        return TestResult::Fail("DFS rule or bad index admitted as plain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_plain_rule_auto_bw_and_no_160mhz
+);

@@ -54,7 +54,7 @@ use super::{
     power_policy::Gate,
     qualification::{Kind, PAYLOAD},
 };
-use narf_wireless::reg::{RegFlags, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 
 pub(super) static KIND: Kind = Kind {
     tag: b'B',
@@ -186,14 +186,11 @@ pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, 
     }
     let mut limit = record.ceiling.min(80);
     let mut covering = false;
-    for r in &domain.rules {
+    for (i, r) in domain.rules.iter().enumerate() {
         if r.freq_start_mhz >= high || r.freq_end_mhz <= low {
             continue;
         }
-        if r.freq_start_mhz >= r.freq_end_mhz
-            || r.max_bandwidth_mhz < 40
-            || r.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-        {
+        if !super::channel_policy::plain_rule(domain, i, 40) {
             return Err(Error::Prerequisite);
         }
         covering |= r.freq_start_mhz <= low && r.freq_end_mhz >= high;

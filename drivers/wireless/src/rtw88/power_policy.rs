@@ -1353,14 +1353,13 @@ impl Calibration {
         }
         let mut covering = false;
         let mut ceiling = None;
-        for rule in &domain.rules {
+        for (i, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
                 continue;
             }
             if rule.freq_start_mhz > 2402
                 || rule.freq_end_mhz < 2422
-                || rule.max_bandwidth_mhz < 20
-                || rule.flags.bits() & !narf_wireless::reg::RegFlags::NO_P2P.bits() != 0
+                || !super::channel_policy::plain_rule(domain, i, 20)
             {
                 return Err(Error::Policy);
             }
