@@ -463,6 +463,8 @@ pub(super) struct State {
     rx_idle: bool,
     ht_indices: [u8; 8],
     ht_profile: Option<association::phy::HtNegotiation>,
+    /// RTL8821AE: the negotiated VHT80 peer (`sta->deflink.vht_cap`).
+    vht_profile: Option<association::phy::VhtNegotiation>,
     controls: VecDeque<Vec<u8>>,
     delivered_reply: Option<Pending>,
     epoch: Arc<AtomicU64>,
@@ -521,6 +523,7 @@ impl State {
             rx_idle: false,
             ht_indices: [0; 8],
             ht_profile: None,
+            vht_profile: None,
             controls: VecDeque::new(),
             delivered_reply: None,
             epoch: Arc::new(AtomicU64::new(1)),
@@ -577,6 +580,7 @@ impl State {
         self.capability = 0;
         self.wmm = None;
         self.ht_profile = None;
+        self.vht_profile = None;
         self.protection = None;
         self.erp = false;
         self.rx_idle = false;
@@ -1566,9 +1570,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         };
         // Ordinary DATA may clear DISFB only under a current NEFB grant;
         // without it the base programs' fixed USE_RATE + DISFB applies.
-        // `_rtl_query_shortgi`: SGI40 at 40 MHz (8821AE only), else SGI20.
+        // `_rtl_query_shortgi`: SGI80 at 80 MHz, SGI40 at 40 MHz (8821AE
+        // only), else SGI20.
         let sgi_profile = self.station.ht_profile.is_some_and(|p| {
-            if self.packet.width.is_some() {
+            if self.packet.eighty {
+                self.station.vht_profile.is_some_and(|v| v.tx_sgi80())
+            } else if self.packet.width.is_some() {
                 self.chip == super::Chip::Rtl8821ae && p.tx_sgi40()
             } else {
                 p.tx_sgi20()
@@ -1746,9 +1753,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .is_some();
         let mut plan = if (self.station.ht.is_some() || self.rtl8821ae_ht()) && has_wmm {
             let phy = if self.chip == super::Chip::Rtl8821ae {
-                super::super::rtl8821ae::ht::local(
-                    self.rtl8821ae_wide(&candidate, environment)?.is_some(),
-                )
+                if self.rtl8821ae_vht80(&candidate, environment)?.is_some() {
+                    super::super::rtl8821ae::vht::local()
+                } else {
+                    super::super::rtl8821ae::ht::local(
+                        self.rtl8821ae_wide(&candidate, environment)?.is_some(),
+                    )
+                }
             } else {
                 self.local_ht_for(&candidate)?
             };
@@ -1790,18 +1801,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             armed: true,
         };
         let result = async {
-            let width = self
-                .station
-                .plan
-                .as_ref()
-                .and_then(|p| p.offered_phy())
-                .map(|p| Self::offered_width(p.width(), p.ht().operation()))
+            let offered = self.station.plan.as_ref().and_then(|p| p.offered_phy());
+            let eighty = self.chip == super::Chip::Rtl8821ae
+                && offered.is_some_and(|p| p.width() == association::phy::Width::Eighty);
+            let width = offered
+                .map(|p| Self::rtl8821ae_offered_width(p.width(), p.ht().operation()))
                 .transpose()?
                 .flatten();
             self.restore_station_antenna(environment).await?;
             self.restore_station_tracking(environment).await?;
             if self.chip == super::Chip::Rtl8821ae {
-                self.retune_rtl8821ae(width, environment).await?;
+                self.retune_rtl8821ae(width, eighty, environment).await?;
             } else {
                 self.select_station_width(width, environment).await?;
             }
@@ -1870,16 +1880,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 let idle = self.progress_station_inner(environment)?;
                 if self.station.phase == Phase::Configuring {
                     self.check_station_policy(environment)?;
-                    let width = self
-                        .station
-                        .plan
-                        .as_ref()
-                        .and_then(|p| p.negotiated_phy())
-                        .map(|p| Self::offered_width(p.width(), p.ht().operation()))
+                    let negotiated = self.station.plan.as_ref().and_then(|p| p.negotiated_phy());
+                    let eighty = self.chip == super::Chip::Rtl8821ae
+                        && negotiated.is_some_and(|p| p.width() == association::phy::Width::Eighty);
+                    let width = negotiated
+                        .map(|p| Self::rtl8821ae_offered_width(p.width(), p.ht().operation()))
                         .transpose()?
                         .flatten();
                     if self.chip == super::Chip::Rtl8821ae {
-                        self.retune_rtl8821ae(width, environment).await?;
+                        self.retune_rtl8821ae(width, eighty, environment).await?;
                     } else {
                         self.select_station_width(width, environment).await?;
                     }
@@ -1932,6 +1941,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             self.set_rtl8821ae_min_space_cfg(min_space);
                             self.check_station_policy(environment)?;
                             self.packet.ht = true;
+                            // AC_5G data `hw_rate` from mac80211's
+                            // intersected `vht_mcs.tx_mcs_map`.
+                            self.packet.vht_highest = self.station.vht_profile.map(|v| {
+                                super::super::rtl8821ae::vht::highest_rate(
+                                    super::super::rtl8821ae::vht::intersect(
+                                        v.rx_mcs_map(),
+                                        v.peer_tx_mcs_map(),
+                                    ),
+                                )
+                            });
                         }
                     }
                     if self.station.ht_profile.is_some() && self.chip != super::Chip::Rtl8821ae {
@@ -2455,6 +2474,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             .as_ref()
                             .and_then(|p| p.negotiated_phy())
                             .map(|p| *p.ht());
+                        // VHT is only offered for an 80 MHz BSS (VHT80
+                        // profile); a VHT answer narrowed below 80 MHz is
+                        // refused rather than run as an unadmitted mode.
+                        let negotiated =
+                            self.station.plan.as_ref().and_then(|p| p.negotiated_phy());
+                        self.station.vht_profile = negotiated.and_then(|p| p.vht().copied());
+                        if self.station.vht_profile.is_some()
+                            && (self.chip != super::Chip::Rtl8821ae
+                                || negotiated
+                                    .is_none_or(|p| p.width() != association::phy::Width::Eighty))
+                        {
+                            return Err(Error::Profile);
+                        }
                         if self.station.ht_profile.is_some_and(|p| {
                             self.permission.is_none_or(|permission| {
                                 p.operation().primary() != permission.channel()
@@ -2631,15 +2663,32 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if ht.is_some() && !self.rtl8821ae_ht() {
             return Err(Error::Profile);
         }
-        let bw40 = self.packet.width.is_some();
+        // `sta->deflink.vht_cap`: rx_mcs_map is the peer's RX map within
+        // our TX map (`tx_mcs_map()`), SGI80 only where both support it.
+        let vht = self.station.vht_profile;
+        if vht.is_some()
+            && !(self.packet.eighty
+                && self
+                    .rtl8821ae_power
+                    .is_some_and(|p| super::super::rtl8821ae::vht::admitted(&p)))
+        {
+            return Err(Error::Profile);
+        }
+        let chan_bw = if self.packet.eighty {
+            2
+        } else {
+            u8::from(self.packet.width.is_some())
+        };
         let peer = h2c::Peer {
             legacy: rates & 0xfff,
             ht: ht.map(|p| [p.tx_mcs()[0], 0]),
             sgi20: ht.is_some_and(|p| p.tx_sgi20()),
             sgi40: ht.is_some_and(|p| p.tx_sgi40()),
+            vht: vht.map(|v| v.tx_mcs_map()),
+            sgi80: vht.is_some_and(|v| v.tx_sgi80()),
             five_ghz: self.rtl8821ae_five_ghz(),
         };
-        let payload = h2c::rate_mask(&peer, bw40, level, true);
+        let payload = h2c::rate_mask_at(&peer, chan_bw, level, true);
         let base = self
             .station
             .calibration

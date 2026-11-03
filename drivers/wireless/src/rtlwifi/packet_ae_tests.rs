@@ -386,6 +386,8 @@ fn smoke_rtl8821ae_native_join_rsvd_page_h2c_and_leave() -> TestResult {
         ht: None,
         sgi20: false,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: false,
     };
     if run(owner.install_rtl8821ae_rate_mask(h2c::rate_mask(&g, false, 0, true), None)).is_err()

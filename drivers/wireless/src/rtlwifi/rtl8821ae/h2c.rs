@@ -187,7 +187,9 @@ pub async fn fwlps_enter(io: &impl Io, mailbox: &mut Mailbox) -> Result<(), Erro
 }
 
 /// `sta_entry->wireless_mode` for the station (`core.c::rtl_op_sta_add` /
-/// `rtl_op_bss_info_changed`): B/G/N_24G on 2.4 GHz, A/N_5G on 5 GHz.
+/// `rtl_op_bss_info_changed`): B/G/N_24G on 2.4 GHz, A/N_5G/AC_5G on 5 GHz.
+/// VHT is only advertised on the 5 GHz band (`_rtl_init_hw_vht_capab` is
+/// only applied to the 5 GHz sband), so `AC_24G` never arises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WirelessMode {
     B,
@@ -195,6 +197,7 @@ pub enum WirelessMode {
     N24,
     A,
     N5,
+    Ac5,
 }
 
 /// Peer facts `rtl8821ae_update_hal_rate_mask` reads from `ieee80211_sta`.
@@ -207,6 +210,12 @@ pub struct Peer {
     pub ht: Option<[u8; 2]>,
     pub sgi20: bool,
     pub sgi40: bool,
+    /// `vht_cap.vht_supported` with mac80211's intersected
+    /// `vht_mcs.rx_mcs_map` (`ieee80211_vht_cap_ie_to_sta_vht_cap`: the
+    /// peer's RX map within our TX map).
+    pub vht: Option<u16>,
+    /// `vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_80` (intersected).
+    pub sgi80: bool,
     /// `rtlhal->current_bandtype == BAND_ON_5G`.
     pub five_ghz: bool,
 }
@@ -214,7 +223,9 @@ pub struct Peer {
 impl Peer {
     pub fn mode(&self) -> WirelessMode {
         if self.five_ghz {
-            if self.ht.is_some() {
+            if self.vht.is_some() {
+                WirelessMode::Ac5
+            } else if self.ht.is_some() {
                 WirelessMode::N5
             } else {
                 WirelessMode::A
@@ -235,9 +246,34 @@ impl Peer {
 /// `rssi_level` is the DM level (0 at association). Returns the 7-byte
 /// `H2C_8821AE_RA_MASK` body; the caller then sets `REG_BCN_CTRL` BIT(3).
 pub fn rate_mask(peer: &Peer, bw40: bool, rssi_level: u8, update_bw: bool) -> [u8; 7] {
+    rate_mask_at(peer, u8::from(bw40), rssi_level, update_bw)
+}
+
+/// `_rtl8821ae_rate_to_bitmap_2ssvht`: per NSS (1, 2) of a VHT MCS map,
+/// MCS0-9 / 0-8 / 0-7 as 10-bit groups; "not supported" adds nothing.
+pub fn vht_bitmap(map: u16) -> u32 {
+    let mut bitmap = 0;
+    for (i, j) in [(0, 0), (2, 10)] {
+        bitmap |= match (map >> i) & 3 {
+            2 => 0x3ff << j,
+            1 => 0x1ff << j,
+            0 => 0xff << j,
+            _ => 0,
+        };
+    }
+    bitmap
+}
+
+/// [`rate_mask`] at `rtlphy->current_chan_bw` (0 = 20, 1 = 20/40, 2 = 80
+/// MHz), which is also `rate_mask[2]`'s low bits. A station's `mac->bw_40`
+/// (`curtxbw_40mhz`) is set at 40 and at 80 MHz (`rtl_op_config`).
+pub fn rate_mask_at(peer: &Peer, chan_bw: u8, rssi_level: u8, update_bw: bool) -> [u8; 7] {
+    let bw40 = chan_bw != 0;
     let mode = peer.mode();
     let mut bitmap = u32::from(peer.legacy);
-    if let Some(rx) = peer.ht {
+    if mode == WirelessMode::Ac5 {
+        bitmap |= vht_bitmap(peer.vht.unwrap_or(0xffff)) << 12;
+    } else if let Some(rx) = peer.ht {
         bitmap |= (u32::from(rx[1]) << 20) | (u32::from(rx[0]) << 12);
     }
     // rtl_mrate_idx_to_arfr_id(ratr_index) for a 1T1R PHY.
@@ -273,11 +309,26 @@ pub fn rate_mask(peer: &Peer, bw40: bool, rssi_level: u8, update_bw: bool) -> [u
                 5 // RATR_INX_WIRELESS_NG → RATEID_IDX_GN_N1SS
             }
         }
+        WirelessMode::Ac5 => {
+            // rf_type 1T1R rows, then `_rtl8821ae_set_ra_vht_ratr_bitmap`:
+            // at 20 MHz VHT 1SS MCS9 (BIT21) is dropped.
+            bitmap &= match rssi_level {
+                1 => 0x003f_8000,
+                2 => 0x003f_f000,
+                _ => 0x003f_f010,
+            };
+            if chan_bw == 0 {
+                bitmap &= !(1 << 21);
+            }
+            10 // RATR_INX_WIRELESS_AC_5N → RATEID_IDX_VHT_1SS
+        }
     };
-    let sgi = peer.ht.is_some() && (peer.sgi20 || peer.sgi40);
-    // current_chan_bw | !update_bw << 3 | vht_eni 0 | ldpc 0. A station's
-    // `current_chan_bw` is HT_CHANNEL_WIDTH_20_40 exactly when `mac->bw_40`.
-    let byte2 = u8::from(bw40) | u8::from(!update_bw) << 3;
+    // `_rtl8821ae_get_ra_shortgi`: any of the intersected SGI20/40/80.
+    let sgi = (peer.ht.is_some() || peer.vht.is_some()) && (peer.sgi20 || peer.sgi40 || peer.sgi80);
+    // current_chan_bw | !update_bw << 3 | `_rtl8821ae_get_vht_eni` (AC_5G:
+    // 1 << 4) | ldpc 0 (`_rtl8821ae_get_ra_ldpc` never opens LDPC).
+    let eni = if mode == WirelessMode::Ac5 { 1 << 4 } else { 0 };
+    let byte2 = chan_bw | u8::from(!update_bw) << 3 | eni;
     let b = bitmap.to_le_bytes();
     [
         0,

@@ -143,12 +143,13 @@ fn closed(admission: Option<&super::super::station::Admission>) -> bool {
 /// [`h2c::rate_mask`]: the payload's `arfr_id` identifies the mode.
 fn ratr_index(payload: &[u8; 7]) -> Option<u8> {
     match payload[1] & 0x7f {
-        8 => Some(6), // RATR_INX_WIRELESS_B
-        6 => Some(4), // RATR_INX_WIRELESS_GB
-        1 => Some(0), // RATR_INX_WIRELESS_NGB (WIRELESS_MODE_N_24G)
-        7 => Some(5), // RATR_INX_WIRELESS_G (WIRELESS_MODE_A)
-        5 => Some(1), // RATR_INX_WIRELESS_NG (WIRELESS_MODE_N_5G)
-        _ => None,    // VHT masks are not installed on this profile.
+        8 => Some(6),  // RATR_INX_WIRELESS_B
+        6 => Some(4),  // RATR_INX_WIRELESS_GB
+        1 => Some(0),  // RATR_INX_WIRELESS_NGB (WIRELESS_MODE_N_24G)
+        7 => Some(5),  // RATR_INX_WIRELESS_G (WIRELESS_MODE_A)
+        5 => Some(1),  // RATR_INX_WIRELESS_NG (WIRELESS_MODE_N_5G)
+        10 => Some(8), // RATR_INX_WIRELESS_AC_5N (WIRELESS_MODE_AC_5G)
+        _ => None,
     }
 }
 
@@ -663,7 +664,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             None if adaptive => return Err(Error::State),
             _ => None,
         };
+        // AC_5G: `_rtl_get_vht_highest_n_rate`.
         let hw_rate = match adaptive {
+            Some(8) => self.packet.vht_highest.ok_or(Error::State)?,
             Some(0 | 1) => super::super::super::rtl8821ae::ht::DESC_RATEMCS7,
             Some(6) => 0x03,
             Some(_) => trx::DESC_RATE54M,
@@ -674,7 +677,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // `DESC_RATE24M` RTS/CTS-to-self rate — must hold an admitted
         // measured index in the current `NAPC` permission.
         let permission = self.rtl8821ae_power.ok_or(Error::State)?;
-        if !permission.admits(hw_rate)
+        if !super::super::super::rtl8821ae::vht::admits(&permission, hw_rate)
             || (self.packet.protection != super::super::super::protection::Mode::None
                 && !permission.admits(trx::DESC_RATE24M))
         {
@@ -683,6 +686,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             ));
         }
         let wide40 = self.packet.width.is_some() && !multicast && hw_rate > trx::DESC_RATE54M;
+        // `current_chan_bw` 80: `_rtl_query_bandwidth_mode` /
+        // `rtl8821ae_bw_mapping` / `rtl8821ae_sc_mapping` (`rtl8821ae::vht`).
+        let eighty = if permission.operating().width
+            == super::super::super::rtl8821ae::envelope::Width::W80
+        {
+            let bw = super::super::super::rtl8821ae::vht::data_bw(hw_rate, multicast);
+            let sc = super::super::super::rtl8821ae::vht::sub_carrier(&permission.operating(), bw)
+                .ok_or(Error::State)?;
+            Some((bw, sc))
+        } else {
+            None
+        };
         let tx_report = wants_report(frame).then(|| self.packet.ae.reports.next_sn());
         let params = trx::TxParams {
             pkt_size: frame.len() as u16,
@@ -702,8 +717,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             // `current_chan_bw` 20_40: `_rtl_query_bandwidth_mode` gives a
             // 40 MHz packet for unicast above 54M; a 20 MHz packet names
             // the primary (cur_40_prime_sc LOWER 2 / UPPER 1).
-            data_bw: u8::from(wide40),
+            data_bw: eighty.map_or(u8::from(wide40), |(bw, _)| bw),
             sub_carrier: match self.packet.width {
+                _ if eighty.is_some() => eighty.map_or(0, |(_, sc)| sc),
                 Some(g) if !wide40 => {
                     if g.prime() == 1 {
                         2
@@ -841,6 +857,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let channel = self.rtl8821ae_power.ok_or(Error::State)?.channel();
         let ht = self.packet.ht;
         let forty = self.packet.width.is_some();
+        let eighty = self.rtl8821ae_power.is_some_and(|p| {
+            p.operating().width == super::super::super::rtl8821ae::envelope::Width::W80
+        });
+        let vht = self.packet.vht_highest.is_some();
         let (consumed, packet, report) = self.io.authority(true, || {
             ring.sync();
             let offset = slot * RX_BYTES;
@@ -873,10 +893,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
             // HT link: MCS0-7 (1T1R) and A-MPDU members (the station BA
             // owner gates them) up to a 7935-byte A-MSDU MPDU.
+            // VHT link: VHT 1SS MCS0-9 (`rtl8821ae_get_rx_vht_nss` 1).
             let rate_ok = status.rate <= trx::DESC_RATE54M
                 || ht
                     && status.is_ht()
-                    && status.rate <= super::super::super::rtl8821ae::ht::DESC_RATEMCS7;
+                    && status.rate <= super::super::super::rtl8821ae::ht::DESC_RATEMCS7
+                || vht
+                    && status.is_vht()
+                    && status.vht_nss() == 1
+                    && (super::super::super::rtl8821ae::vht::DESC_RATEVHT1SS_MCS0
+                        ..=super::super::super::rtl8821ae::vht::DESC_RATEVHT1SS_MCS9)
+                        .contains(&status.rate);
             let longest = if ht {
                 26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
             } else {
@@ -886,7 +913,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && !status.hw_error()
                 && (!status.ampdu || ht)
                 && rate_ok
-                && (status.bw == 0 || forty && status.bw == 1)
+                && (status.bw == 0 || forty && status.bw == 1 || eighty && status.bw == 2)
                 && (24..=longest).contains(&length)
             {
                 buffer.sync();

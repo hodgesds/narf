@@ -1920,10 +1920,50 @@ chain below is composed.
     only the fixed 8821AE pairing (36/40 .. 140/144, 149/153, 157/161);
     `rtl8821ae_wide` and `retune_rtl8821ae` build the 5 GHz operating
     point (band of the held permission), and `channel::configure` runs the
-    5 GHz band switch / `sw_chnl` / `set_bw_mode` above. 80 MHz is not
-    requested yet (VHT not implemented; the IQK 80 MHz VDF branch is). Test
+    5 GHz band switch / `sw_chnl` / `set_bw_mode` above. Test
     `smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates`
     (`rtl8821ae/tests.rs`, written, unexecuted).
+  - VHT80 station (8821AE, 5 GHz only; `rtl8821ae/vht.rs`). Capability is
+    `base.c::_rtl_init_hw_vht_capab` for `HARDWARE_TYPE_RTL8821AE`: RX/TX
+    map 1SS MCS0-9 (`0xfffe`), `SHORT_GI_80`, `TXSTBC`, `RXSTBC_1`, A-MPDU
+    exponent 7; no LDPC (`vht_ldpc_cap` 0). TX STBC is advertised as Linux
+    but, as in `rtl8821ae_tx_fill_desc`, no descriptor requests STBC; RX
+    STBC is baseband-decoded. Deliberate omissions (promises not
+    implemented): SU beamformer/beamformee (no sounding code, in Linux or
+    here), `HTC_VHT`, antenna-pattern bits, `MAX_MPDU_LENGTH_11454` (the
+    9100-byte RX buffer cannot hold one; 3895 is advertised) and the
+    `rx/tx_highest` rates. The join offers `vht::local()` (HT20/40 +
+    VHT80) only when `rtl8821ae_vht80` finds an AP VHT80 selection whose
+    80 MHz block matches the `NAPC` v2 W80 permission's wide channel and
+    that permission, under current host policy, admits VHT 1SS MCS0-9 and
+    HT MCS0-7 (`vht::admitted`); otherwise the HT20/40 profile. Width
+    targets reduce an 80 MHz selection to its primary HT40 pair
+    (`rtl8821ae_offered_width`) and `retune_rtl8821ae(.., eighty)` requests
+    the W80 permission (`rtl_op_config` `CHAN_WIDTH_80`: `channel::configure`
+    80 MHz, IQK VDF). A VHT association answer narrowed below 80 MHz is
+    refused (`Error::Profile`), never run as an unadmitted mode. RA:
+    `rtl8821ae_update_hal_rate_mask` `WIRELESS_MODE_AC_5G` —
+    `supp_rates_5g << 4 | _rtl8821ae_rate_to_bitmap_2ssvht(rx_mcs_map) << 12`
+    (mac80211-intersected map), 1T1R rows `0x003f8000`/`0x003ff000`/
+    `0x003ff010`, BIT21 dropped at 20 MHz (`_set_ra_vht_ratr_bitmap`),
+    `RATR_INX_WIRELESS_AC_5N` → `RATEID_IDX_VHT_1SS` (10), SGI from any
+    intersected SGI20/40/80, `rate_mask[2] = current_chan_bw (2) |
+    !update_bw << 3 | vht_eni 1 << 4`; the mask stays a subset of the
+    admitted set (`ae_install_rate_mask`). Data descriptors: RATE_ID
+    `RATR_INX_WIRELESS_AC_5N` (8), `hw_rate` `_rtl_get_vht_highest_n_rate`
+    (1T1R: MCS7/8/9 from the intersected `tx_mcs_map`), admission via the
+    descriptor-to-TXAGC order (`vht::order`: VHT1SS 0x2c..0x35 → 28..37);
+    at `current_chan_bw` 80 `_rtl_query_bandwidth_mode` +
+    `rtl8821ae_bw_mapping` (unicast > MCS15 ⇒ 2, > 54M ⇒ 1, else 0) and
+    `rtl8821ae_sc_mapping` (80: 0; 40: `cur_80_prime_sc` 40-of-80; 20:
+    primary 20-of-80 — the `channel::data_sc80` nibbles); SGI from SGI80
+    (`_rtl_query_shortgi` with `bw_80`). RX accepts VHT 1SS MCS0-9
+    (`rtl8821ae_get_rx_vht_nss` 1) and BW 80 on the 80 MHz channel. C2H RA
+    reports keep `rtl8821ae_dm_update_init_rate` for any reported rate.
+    Interface band advertisement still lists HT only (no VHT capability
+    is published to the host API). Tests
+    `smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping`,
+    `smoke_rtl8821ae_iqk_80mhz_vdf_branch` (written, unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
   Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,

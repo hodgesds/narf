@@ -993,6 +993,8 @@ fn smoke_rtl8821ae_ra_mask_rates_within_napc_admission() -> TestResult {
         ht: None,
         sgi20: false,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: false,
     };
     let n = h2c::Peer {
@@ -1155,6 +1157,8 @@ fn smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission() -> TestResu
         ht: Some([0xff, 0]),
         sgi20: false,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: false,
     };
     let mask = h2c::mask_rates(&h2c::rate_mask(&n, false, 0, true)).unwrap_or(0);
@@ -1673,6 +1677,8 @@ fn smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order() -> TestResult {
         ht: None,
         sgi20: false,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: false,
     };
     let b = h2c::Peer {
@@ -1684,6 +1690,8 @@ fn smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order() -> TestResult {
         ht: Some([0xff, 0]),
         sgi20: true,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: false,
     };
     if h2c::rate_mask(&g, false, 0, true) != [0, 6, 0, 0xf5, 0x0f, 0, 0]
@@ -1831,6 +1839,8 @@ fn smoke_rtl8821ae_ht_capability_timing_and_n_mask() -> TestResult {
         ht: Some([0xff, 0]),
         sgi20: true,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: false,
     };
     let mask = h2c::rate_mask(&n, false, 0, true);
@@ -2225,6 +2235,8 @@ fn smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates() -> TestResult {
         ht: None,
         sgi20: false,
         sgi40: false,
+        vht: None,
+        sgi80: false,
         five_ghz: true,
     };
     let n = h2c::Peer {
@@ -2284,4 +2296,97 @@ fn smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates
+);
+
+/// VHT80 profile pieces: `_rtl_init_hw_vht_capab` (8821AE), the AC_5G
+/// `rtl8821ae_update_hal_rate_mask` payload, `_rtl_get_vht_highest_n_rate`,
+/// the descriptor-rate order and `rtl8821ae_bw_mapping`/`_sc_mapping` at 80.
+fn smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping() -> TestResult {
+    use envelope::{Band, Operating, Width};
+    let cap = vht::capability().capability_body();
+    let info = u32::from_le_bytes([cap[0], cap[1], cap[2], cap[3]]);
+    // SHORT_GI_80 | TXSTBC | RXSTBC_1 | A-MPDU exponent 7; no BF/LDPC/160.
+    if info != (1 << 5 | 1 << 7 | 1 << 8 | 7 << 23)
+        || u16::from_le_bytes([cap[4], cap[5]]) != 0xfffe
+        || u16::from_le_bytes([cap[8], cap[9]]) != 0xfffe
+    {
+        return TestResult::Fail("8821AE VHT capability");
+    }
+    let peer = h2c::Peer {
+        legacy: 0xff0,
+        ht: Some([0xff, 0]),
+        sgi20: true,
+        sgi40: true,
+        vht: Some(vht::intersect(vht::MCS_MAP, 0xfffa)),
+        sgi80: true,
+        five_ghz: true,
+    };
+    if peer.mode() != h2c::WirelessMode::Ac5 || h2c::vht_bitmap(0xfffa) != 0x3ff | 0x3ff << 10 {
+        return TestResult::Fail("AC_5G mode / 2ssvht bitmap");
+    }
+    // 80 MHz, level 0: 6M + VHT 1SS MCS0-9, VHT_1SS (10) + SGI, bw 2 |
+    // vht_eni 1 << 4.
+    if h2c::rate_mask_at(&peer, 2, 0, true) != [0, 0x8a, 0x12, 0x10, 0xf0, 0x3f, 0]
+        || h2c::mask_rates(&h2c::rate_mask_at(&peer, 2, 0, true)) != Some(0x10 | vht::VHT1SS_ORDER)
+    {
+        return TestResult::Fail("AC_5G RA mask at 80 MHz");
+    }
+    // 20 MHz drops MCS9 (BIT21); level 1 / 2 rows; !update_bw BIT(3).
+    if h2c::rate_mask_at(&peer, 0, 0, false) != [0, 0x8a, 0x18, 0x10, 0xf0, 0x1f, 0]
+        || h2c::rate_mask_at(&peer, 2, 1, true)[3..] != [0, 0x80, 0x3f, 0]
+        || h2c::rate_mask_at(&peer, 2, 2, true)[3..] != [0, 0xf0, 0x3f, 0]
+    {
+        return TestResult::Fail("AC_5G RA mask rows");
+    }
+    let n8 = h2c::Peer {
+        vht: Some(0xfffd),
+        ..peer
+    };
+    if h2c::rate_mask_at(&n8, 2, 0, true)[5] != 0x1f {
+        return TestResult::Fail("MCS0-8 peer map");
+    }
+    if vht::highest_rate(0xfffe) != 0x35
+        || vht::highest_rate(0xfffd) != 0x34
+        || vht::highest_rate(0xfffc) != 0x33
+        || vht::intersect(0xfffe, 0xfffc) != 0xfffc
+        || vht::intersect(0xfffe, 0xffff) != 0xffff
+    {
+        return TestResult::Fail("VHT highest rate / map intersection");
+    }
+    if vht::order(0x13) != Some(19)
+        || vht::order(0x2c) != Some(28)
+        || vht::order(0x35) != Some(37)
+        || vht::order(0x36).is_some()
+        || vht::order(0x1c).is_some()
+    {
+        return TestResult::Fail("descriptor rate order");
+    }
+    if vht::data_bw(0x35, false) != 2
+        || vht::data_bw(0x13, false) != 1
+        || vht::data_bw(0x0b, false) != 0
+        || vht::data_bw(0x35, true) != 0
+    {
+        return TestResult::Fail("80 MHz packet bandwidth");
+    }
+    // Primary 36 (lowest of 36-48), 44 (upper 40, lower 20), 48 (upperst).
+    let op = |channel| Operating {
+        band: Band::B5g,
+        width: Width::W80,
+        channel,
+    };
+    if vht::sub_carrier(&op(36), 2) != Some(0)
+        || vht::sub_carrier(&op(36), 1) != Some(10)
+        || vht::sub_carrier(&op(36), 0) != Some(4)
+        || vht::sub_carrier(&op(40), 0) != Some(2)
+        || vht::sub_carrier(&op(44), 1) != Some(9)
+        || vht::sub_carrier(&op(44), 0) != Some(1)
+        || vht::sub_carrier(&op(48), 0) != Some(3)
+    {
+        return TestResult::Fail("80 MHz sub-carrier mapping");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping
 );

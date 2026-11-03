@@ -90,6 +90,13 @@ pub(super) struct State<M: Memory> {
     pub(super) qos: bool,
     pub(super) ht: bool,
     pub(super) width: Option<super::super::ht::Geometry>,
+    /// RTL8821AE: the channel is the 80 MHz VHT channel (`current_chan_bw`
+    /// `HT_CHANNEL_WIDTH_80`, `mac->bw_80`); `width` then holds the
+    /// primary HT40 pair inside it.
+    pub(super) eighty: bool,
+    /// RTL8821AE VHT link: `_rtl_get_vht_highest_n_rate` for the AP (the
+    /// AC_5G data `hw_rate`); `None` without a negotiated VHT peer.
+    pub(super) vht_highest: Option<u8>,
     pub(super) protection: super::super::protection::Mode,
     pub(super) antenna: Option<u8>,
     /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
@@ -122,6 +129,8 @@ impl<M: Memory> State<M> {
             qos: false,
             ht: false,
             width: None,
+            eighty: false,
+            vht_highest: None,
             protection: super::super::protection::Mode::None,
             antenna: None,
             interrupts: false,
@@ -611,6 +620,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.rate_mask = None;
         self.packet.qos = false;
         self.packet.ht = false;
+        self.packet.vht_highest = None;
         if let Some(reserved) = self.packet.reserved.take() {
             self.packet.retired.push(reserved);
         }
@@ -1294,6 +1304,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.interrupts = false;
         self.packet.leisure = false;
         self.packet.rate_mask = None;
+        self.packet.vht_highest = None;
         let mut result = Ok(());
         for operation in [
             self.io.write32(0xb0, 0).map_err(Error::from),

@@ -27,6 +27,64 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             _ => Err(Error::Profile),
         }
     }
+    /// RTL8821AE: [`Self::offered_width`], with an 80 MHz selection
+    /// reduced to its primary HT40 pair (`mac->cur_40_prime_sc` inside the
+    /// 80 MHz channel; the HT Operation secondary must name it).
+    pub(super) fn rtl8821ae_offered_width(
+        width: association::phy::Width,
+        operation: &association::phy::HtOperation,
+    ) -> Result<Option<Geometry>, Error> {
+        match width {
+            association::phy::Width::Eighty => {
+                Self::offered_width(association::phy::Width::Forty, operation)
+            }
+            width => Self::offered_width(width, operation),
+        }
+    }
+    /// RTL8821AE: the AP's offered VHT80 channel with its `NAPC` 80 MHz
+    /// permission, when the envelope measures it, current host policy
+    /// admits it, its 80 MHz block is the AP's (VHT Operation center) and
+    /// it admits every AC_5G RA-mask rate (`rtl8821ae::vht::admitted`).
+    /// `None` keeps the HT20/40 profile.
+    pub(super) fn rtl8821ae_vht80(
+        &self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<Option<super::super::super::rtl8821ae::envelope::Permission>, Error> {
+        use super::super::super::rtl8821ae::envelope::{Band, Operating, Width};
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8821ae())
+        else {
+            return Ok(None);
+        };
+        let offer = association::phy::Offer::from_elements(
+            super::super::super::rtl8821ae::vht::local(),
+            &candidate.bss.information_elements,
+            candidate.bss.channel,
+        )
+        .map_err(Error::Management)?;
+        let Some(offer) = offer else {
+            return Ok(None);
+        };
+        if offer.width() != association::phy::Width::Eighty || offer.vht().is_none() {
+            return Ok(None);
+        }
+        let op = Operating {
+            band: Band::B5g,
+            width: Width::W80,
+            channel: offer.ht().operation().primary(),
+        };
+        if op.channel < 36 || op.wide_channel() != Some(offer.center_channel()) {
+            return Ok(None);
+        }
+        Ok(base
+            .permission_for(&environment.domain()?, op)
+            .ok()
+            .filter(super::super::super::rtl8821ae::vht::admitted))
+    }
     pub(super) fn local_ht_for(
         &self,
         candidate: &Candidate,
@@ -116,16 +174,26 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// policy, then `channel::configure` (`sw_chnl_callback`, TXAGC at the
     /// wide channel, `set_bw_mode_callback`) runs inside that permission's
     /// authority. No frame may be outstanding; the old receive epoch is
-    /// retired. A failure leaves the owner failed.
+    /// retired. A failure leaves the owner failed. `eighty` selects the
+    /// 80 MHz VHT channel around `width`'s primary HT40 pair
+    /// (`rtl_op_config` `NL80211_CHAN_WIDTH_80`), which needs a VHT80-
+    /// admitting permission.
     pub(super) async fn retune_rtl8821ae(
         &mut self,
         width: Option<super::super::super::ht::Geometry>,
+        eighty: bool,
         environment: &impl Environment,
     ) -> Result<(), Error> {
         use super::super::super::rtl8821ae::envelope::{Operating, Width};
         let current = self.rtl8821ae_power.ok_or(Error::State)?;
         let channel = current.channel();
         let op = match width {
+            Some(g) if eighty && g.primary() == channel => Operating {
+                band: current.operating().band,
+                width: Width::W80,
+                channel,
+            },
+            _ if eighty => return Err(Error::Profile),
             None => Operating::twenty(channel),
             Some(g) if g.primary() == channel => Operating {
                 band: current.operating().band,
@@ -138,7 +206,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             },
             Some(_) => return Err(Error::Profile),
         };
-        if current.operating() == op && self.packet.width == width {
+        if current.operating() == op && self.packet.width == width && self.packet.eighty == eighty {
             return Ok(());
         }
         if !self.transmit_ready()
@@ -158,7 +226,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let permission = base
             .permission_for(&environment.domain()?, op)
             .map_err(|e| Error::Radio(RadioError::Power(e)))?;
-        if width.is_some() && !super::super::super::rtl8821ae::ht::admitted(&permission) {
+        if width.is_some() && !super::super::super::rtl8821ae::ht::admitted(&permission)
+            || eighty && !super::super::super::rtl8821ae::vht::admitted(&permission)
+        {
             return Err(Error::Profile);
         }
         let reg_837 = self.rtl8821ae.ok_or(Error::State)?.reg_837;
@@ -173,6 +243,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         .await?;
         self.rtl8821ae_power = Some(permission);
         self.packet.width = width;
+        self.packet.eighty = eighty;
         self.phase = Hardware::Running;
         self.check_station_policy(environment)
     }
