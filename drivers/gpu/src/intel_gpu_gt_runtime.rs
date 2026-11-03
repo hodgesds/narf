@@ -24,6 +24,8 @@ use narf_capabilities::{Cap, Read, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_power::runtime_pm::{RpmError, RpmFuture, RpmStatus, RuntimePmOps, SchedulerEnv};
 
+#[path = "intel_gpu_d3cold.rs"]
+pub(crate) mod d3cold;
 #[path = "intel_gpu_display_rpm.rs"]
 pub(crate) mod display_rpm;
 #[path = "intel_gpu_gt_recovery.rs"]
@@ -1125,7 +1127,8 @@ pub(crate) fn start_pending() {
         let name = alloc::format!("intel-gt-{}", p.index);
         let ops = Arc::new(PmOps(IrqSafeSpinLock::new(Weak::new())));
         // The probe and forbid references keep the function in D0 until a
-        // running, eligible GT explicitly allows autosuspend.
+        // running, eligible GT explicitly allows autosuspend. No platform
+        // power provider exists, so the PCI layer stops at D3hot (`d3cold`).
         let pm = match narf_power::runtime_pm_pci::register_pci_device(
             &name,
             p.cap,
@@ -2735,7 +2738,18 @@ impl Owner {
             // publication after the resume re-verifies the program.
             crate::intel_gpu_dc_states::runtime_suspend_for_bar(&self.pending.bar);
         }
-        log(self.pending.index, "runtime suspended (idle)");
+        // xe_pci_runtime_suspend: D3cold only when xe_pm_d3cold_allowed_toggle
+        // allowed it; this kernel cannot (see `d3cold`), so the PCI layer
+        // stops at D3hot.
+        let d3cold = d3cold::allowed(
+            d3cold::evaluate(&self.pending.device),
+            local.unwrap_or(0),
+            d3cold::DEFAULT_VRAM_THRESHOLD_MB,
+        );
+        log(
+            self.pending.index,
+            &alloc::format!("runtime suspended (idle) to D3hot; D3cold {d3cold:?}"),
+        );
         Ok(())
     }
 
