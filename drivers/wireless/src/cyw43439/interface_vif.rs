@@ -217,7 +217,7 @@ async fn attach_role<R: Fullmac>(
     };
     parked.mac = entry.mac;
     let mut link = Link::new(entry);
-    if shell.role == Role::Ap {
+    if ap_like(shell.role) {
         if !R::SECONDARY_AP {
             return false;
         }
@@ -229,7 +229,13 @@ async fn attach_role<R: Fullmac>(
             ap_tx: None,
         });
         shell.ap.mode.store(3, Ordering::Release);
-        shell.ap.capable.store(true, Ordering::Release);
+        // A P2P GO starts its BSS with `bss` enable on the connection
+        // bsscfg (`brcmf_cfg80211_start_ap` P2P_GO branch), which the
+        // secondary AP program does not issue: its AP host stays off.
+        shell
+            .ap
+            .capable
+            .store(shell.role == Role::Ap, Ordering::Release);
         return true;
     }
     let (mut bound, rest) = parked.rebind(Bsscfg::new(runtime, owner, &mut link));
@@ -383,9 +389,7 @@ impl VifDevice {
     }
     /// A live STA shell (role operations are refused otherwise).
     fn station_role(&self) -> Result<Arc<dyn Roles>, WirelessError> {
-        if self.role != Role::Station
-            || self.phase() != LIVE
-            || self.closing.load(Ordering::Acquire)
+        if !station_like(self.role) || self.phase() != LIVE || self.closing.load(Ordering::Acquire)
         {
             return Err(WirelessError::NotSupported);
         }
@@ -454,8 +458,26 @@ fn role_of(iftype: u32) -> Option<Role> {
     match iftype {
         2 => Some(Role::Station),
         3 => Some(Role::Ap),
+        // `brcmf_p2p_add_vif` CLIENT/GO connection bsscfgs.
+        8 if p2p_device::P2P_ADVERTISED => Some(Role::P2pClient),
+        9 if p2p_device::P2P_ADVERTISED => Some(Role::P2pGo),
         _ => None,
     }
+}
+
+/// A STA-shaped shell (secondary station role on its bsscfg).
+fn station_like(role: Role) -> bool {
+    matches!(role, Role::Station | Role::P2pClient)
+}
+
+/// An AP-shaped shell (secondary-bsscfg AP owner).
+fn ap_like(role: Role) -> bool {
+    matches!(role, Role::Ap | Role::P2pGo)
+}
+
+/// A `p2p_ifadd` connection bsscfg (`create_p2p`/`remove_p2p`).
+fn p2p_connection(role: Role) -> bool {
+    matches!(role, Role::P2pClient | Role::P2pGo)
 }
 
 impl<R: Fullmac + 'static> Device<R> {
@@ -549,7 +571,13 @@ impl<R: Fullmac + 'static> Device<R> {
                 return Err(WirelessError::Busy);
             }
         }
-        let requested = mac.filter(|_| role == Role::Station);
+        // Linux honours the caller address for a STA only; a P2P
+        // connection bsscfg uses `conn_int_addr` (`brcmf_p2p_add_vif`).
+        let requested = if p2p_connection(role) {
+            Some(p2p_device::connection_address(R::FAMILY, primary_mac)?)
+        } else {
+            mac.filter(|_| role == Role::Station)
+        };
         // Provisional address until the IF ADD names the actual one.
         let provisional = requested.unwrap_or_else(|| vif_wire::vif_mac(primary_mac, &mut 0));
         let authority = narf_net::trusted_net_authority()
@@ -655,7 +683,14 @@ impl<R: Fullmac + 'static> Device<R> {
             for shell in pending.iter() {
                 match shell.phase() {
                     CREATING => {
-                        match owner.create(runtime, shell.role, shell.requested).await {
+                        let created = match (p2p_connection(shell.role), shell.requested) {
+                            (true, Some(address)) => {
+                                owner.create_p2p(runtime, shell.role, address).await
+                            }
+                            (true, None) => Err(Error::Malformed),
+                            (false, _) => owner.create(runtime, shell.role, shell.requested).await,
+                        };
+                        match created {
                             Ok(entry) => {
                                 *shell.entry.lock() = Some(entry);
                                 // brcmf_add_if: ifp->mac_addr from the event.
@@ -700,7 +735,27 @@ impl<R: Fullmac + 'static> Device<R> {
                         // brcmf_cfg80211_del_apsta_iface. A refused or
                         // unanswered remove keeps the firmware bsscfg counted
                         // by the owner; the host side still closes its data.
-                        if owner.remove(runtime, entry).await.is_ok() {
+                        // brcmf_p2p_del_vif for CLIENT/GO (`p2p_ifdis`,
+                        // `p2p_ifdel`, IF DEL, ifidx retirement); a GO's
+                        // AP owner retires its flows first.
+                        let removed = if p2p_connection(shell.role) {
+                            if shell.role == Role::P2pGo {
+                                match runtime.ap_leave_on(entry.ifidx) {
+                                    // Still retiring: the next pass retries.
+                                    Ok(false) => continue,
+                                    Ok(true) | Err(Error::Unsupported) => {}
+                                    Err(_) => {
+                                        runtime.fail();
+                                        shell.finish();
+                                        continue;
+                                    }
+                                }
+                            }
+                            owner.remove_p2p(runtime, entry).await.is_ok()
+                        } else {
+                            owner.remove(runtime, entry).await.is_ok()
+                        };
+                        if removed {
                             shell.finish();
                         } else {
                             shell.phase.store(CLOSING, Ordering::Release);
@@ -710,7 +765,7 @@ impl<R: Fullmac + 'static> Device<R> {
                         let ifidx = shell.entry().map(|entry| entry.ifidx);
                         // A secondary AP owner first retires its own
                         // flows/TX terminals (the bsscfg is gone).
-                        if shell.role == Role::Ap {
+                        if ap_like(shell.role) {
                             match ifidx.map(|ifidx| runtime.ap_leave_on(ifidx)) {
                                 Some(Ok(false)) => continue,
                                 Some(Err(_)) => {
@@ -734,7 +789,7 @@ impl<R: Fullmac + 'static> Device<R> {
                         let Some(entry) = shell.entry() else {
                             continue;
                         };
-                        if shell.role == Role::Station {
+                        if station_like(shell.role) {
                             let slot = secondaries
                                 .iter_mut()
                                 .find(|slot| slot.cookie == shell.cookie);
@@ -755,7 +810,7 @@ impl<R: Fullmac + 'static> Device<R> {
                                 continue;
                             }
                         }
-                        if shell.role == Role::Ap {
+                        if ap_like(shell.role) {
                             // The AP Session owns this ifidx's data.
                             let alive = match secondaries
                                 .iter_mut()

@@ -277,6 +277,26 @@ pub(super) fn deliver(family: Family, notices: Vec<Notice>) {
     }
 }
 
+/// `p2p->conn_int_addr` (`brcmf_p2p_generate_bss_mac`): derived from the
+/// P2P Device Address of the family's WDEV, or, without one, from the
+/// address `brcmf_p2p_create_p2pdev` would generate for the primary.
+pub(super) fn connection_address(
+    family: Family,
+    primary: [u8; 6],
+) -> Result<[u8; 6], WirelessError> {
+    let device = WDEVS
+        .lock()
+        .iter()
+        .find(|wdev| wdev.family == family)
+        .map(|wdev| wdev.mac);
+    let mut random = [0; 6];
+    if device.is_none() && primary[0] & 0x02 != 0 {
+        narf_crypto::try_fill_random_bytes(&mut random)
+            .map_err(|_| WirelessError::HardwareError)?;
+    }
+    Ok(p2p_wire::generate_bss_mac(primary, device, random).connection)
+}
+
 /// The primary's generation ended (`brcmf_detach`): its native discovery
 /// bsscfg ended with it, so only the host metadata is withdrawn.
 pub(super) fn withdraw_family(family: Family) {

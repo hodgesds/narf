@@ -1507,9 +1507,29 @@ primary's AP serialization lease (`reserve_radio_control`).
 The whole WDEV is behind `P2P_ADVERTISED = false` (the primary's
 `async_control_interfaces` and `radio_control_generation` stay off).
 
+#### P2P_CLIENT / P2P_GO netdevs (`cyw43439/interface_vif.rs`)
+
+`NEW_INTERFACE` iftypes 8/9 (legacy `new_virtual_interface`, behind
+`P2P_ADVERTISED`) publish a secondary shell like STA/AP, with the
+`conn_int_addr` of `brcmf_p2p_generate_bss_mac` (from the family's
+P2P_DEVICE address, else the address `create_p2pdev` would derive) as
+the requested address; Linux ignores a caller address here. The worker's
+native create is `vif_owner::create_p2p` (`brcmf_p2p_add_vif`:
+`p2p_ifadd`, IF ADD, `roam_off 1`, GO `SET_SCB_TIMEOUT`) and removal
+`remove_p2p` (GO `p2p_ifdis` + disable wait, `p2p_ifdel`, IF DEL, ifidx
+retirement), after a GO's secondary AP owner left its flows. A CLIENT
+shell runs the secondary station role exactly as a STA shell
+(`configure_secondary`, scan/join/disconnect through `Roles`, carrier
+from its correlated link). A GO shell gets the parked AP-shell state but
+its AP host stays incapable: Linux starts a GO BSS through the
+`brcmf_cfg80211_start_ap` P2P_GO branch (`chanspec`, bsscfg `ssid`,
+`bss` enable on the connection bsscfg; stop by `bss` disable), which the
+secondary AP program (`ap_native` `Scope::Secondary`) does not issue, so
+`START_AP` on a GO is refused.
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: P2P_CLIENT and P2P_GO netdevs driving the secondary
-station/AP roles on the `create_p2p` bsscfg, the P2P escan,
+either family: the P2P_GO BSS start/stop (`bss` enable path), the P2P
+escan,
 transport-model (msgbuf/SDIO) fixtures, and P2P iftype/combination
 advertisement, which stays off.
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
