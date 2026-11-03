@@ -8,7 +8,6 @@ ath11k	wcn6750_enablement	WCN6750 native platform profile enablement; Qualcomm S
 ath9k	ar5416_enablement	AR5416/AR5418 (168c:0023/0024) native enablement	chip	drivers/wireless/specification/ath9k.md	1179
 ath9k	ar9160_enablement	AR9160 (168c:0027) native enablement	chip	drivers/wireless/specification/ath9k.md	1181
 ath9k	ar9280_enablement	AR9280 (168c:0029/002a) native enablement	chip	drivers/wireless/specification/ath9k.md	1182
-ath9k	ar9287_enablement	AR9287 (168c:002d/002e) native enablement	chip	drivers/wireless/specification/ath9k.md	1184
 ath9k	ar9300_enablement	AR9380/AR9390 (168c:0030) native enablement	chip	drivers/wireless/specification/ath9k.md	1186
 ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wireless/specification/ath9k.md	1190
 ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	1188
