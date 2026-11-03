@@ -1030,10 +1030,34 @@ One written/unexecuted case: `drivers/wireless/cyw43439/runtime`
 `smoke_cyw_f2_secondary_ifidx_demux`. No PCIe msgbuf secondary-ifidx
 fixture exists yet.
 
+#### Interface create/remove command owner
+
+`brcmfmac::vif_owner::Owner` (one per transport generation) is the
+host `fweh`/`cfg80211` interface owner above the demux. `create(role, mac)`
+mirrors `brcmf_apsta_add_vif`: refuse while a vif event is armed, check
+`brcmf_vif_add_validate` against the `brcmf_setup_ifmodes` combinations
+(`admits`; RSDB not parsed: non-P2P combo0 = 1 STA + 1 AP, P2P combo0 =
+STA <= 1 + mchan, P2P combination = STA 1 + AP 1, MBSS = up to 4 AP only),
+enable secondary listening, issue `brcmf_cfg80211_request_{sta,ap}_if`
+(`interface_create` v1, v2, bsscfg version query, v3; AP-only
+`bsscfg:ssid` fallback at `first_free_bsscfgidx`; a STA's caller MAC is
+used verbatim, otherwise the alternating `vif_mac` per attempt), then wait
+up to `BRCMF_VIF_EVENT_TIMEOUT` (1500 ms) for the native IF ADD and return
+its registry `Entry` (event ifidx/bsscfgidx/address). `remove(entry)`
+mirrors `brcmf_cfg80211_del_apsta_iface`: `bsscfg:interface_remove` on the
+vif's own ifidx, wait for the matching IF DEL, then poll
+`Fullmac::vif_close` until the transport retired every native resource of
+that ifidx. `service` is the secondary event worker: IF events update the
+`Registry`; an unsolicited DEL or a stale-ADD replacement is queued on
+`pop_retired` (fweh default `brcmf_remove_interface`); other events are
+retained per live (bsscfg, generation) entry for `pop_event`. No netdev or
+role is registered by this owner. Three written/unexecuted cases in
+`drivers/wireless/brcmfmac/vif` (`vif_owner_tests.rs`) run over the
+scripted `fullmac_fixture`, which now implements the secondary seam.
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
 either family: a secondary netdev/`WirelessNetIface`
-registration and removal owner, `interface_create`/`interface_remove`
-command owners that wait for the matching native IF event, per-bsscfg role
+registration and removal owner, per-bsscfg role
 owners (the AP `Session` and `Station` are primary-bsscfg only), and for
 P2P the `p2p.c` discovery bsscfg (`p2p_disc`, `p2p_ifadd`/`p2p_ifdel`,
 `bsscfg:p2p_da_override`), action-frame TX/RX and GO negotiation owners.
