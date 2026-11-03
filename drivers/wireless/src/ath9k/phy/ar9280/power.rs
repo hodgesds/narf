@@ -534,4 +534,4 @@ pub(in crate::ath9k) fn program(
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod tests;
+pub(in crate::ath9k) mod tests;

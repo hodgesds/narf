@@ -1529,6 +1529,42 @@ Smokes (written, not executed):
 `smoke_ath9k_ar9280_txpower_5ghz_one_chain_and_table_offset`,
 `smoke_ath9k_ar9280_txpower_refuses_before_writes`.
 
+`calibration/ar9280.rs` is the AR9280 initial calibration for a 20 MHz
+channel in either band (`Calibration::run(identity, image, tune, rx mask,
+aspm, permission)`): the tune must be the permission's center and the RX mask
+a non-empty subset of the identity's two chains. It runs
+`phy::ar9280::power::program` (validated before writes), then
+`ar9002_hw_configpcipowersave(false)` only when `aspm` (Linux
+`ah->aspm_enabled`: the PCIe `0x002a` part with upstream ASPM; the PCI
+`0x0029` part has no SerDes write, `ath9k_hw_disablepcie` being AR5416-only):
+`iniPcieSerdes` (`ar9280PciePhy_clkreq_always_on_L1_9280`), `AR_WA =
+AR9280_WA_DEFAULT & ~AR_WA_D3_L1_DISABLE` (0x0040073b, no bits 6/7, which
+are AR9285/AR9287-only) and `AR_PCIE_PM_CTRL_ENA`; the D3 path
+(`pcie_pm::configure_ar9280(.., true)`) clears bits 6/7 and sets
+`AR_WA_BIT22`. PHY activation waits `RX_DELAY / 10 + 100` us (OFDM in both
+bands). `ar9002_hw_init_cal` for AR9280 2.0 (below AR9287 1.1) clears
+`AR_PHY_ADC_CTL_OFF_PWDADC` and sets `FLTR_CAL` around the AGC offset
+calibration, then restores both; no CLC and no PA calibration (AR9285/AR9271
+only). NF: `ath9k_hw_loadnf` from the band nominal, the -50 maxCCA restore,
+`ath9k_hw_start_nfcal` and `ath9k_hw_nf_sanitize` with
+`ar9002_hw_set_nf_limits` for AR9280 (2.4 GHz -127/-112/-97, 5 GHz
+-122/-112/-102; the def map has no `nf_*g.cal`, so the history starts at the
+nominal). IQ: `iq_cal_single_sample` (`ar9002_hw_init_cal_settings` from
+9280 2.0) over chains `0..numChains` with the AR9280 `AR_SREV` version for
+the all-ones identity check. ADC gain and ADC DC are in `supp_cals` but
+`ar9002_hw_is_cal_supported` runs them on HT40 only, so neither runs here;
+`ar9280_hw_olc_temp_compensation` is `OLC_FOR_AR9280_20_LATER` (open-loop,
+refused). `calibration::ar9280::periodic` is the AR9287 periodic owner
+(`ar9002_hw_calibrate` + `ath_ani_calibrate` without ANI) with the report
+band's limits, the AR9280 version and no temperature step.
+`Permission::from_domain_dual` adds the 5 GHz 20 MHz channels of
+`phy::ar9280::channel_5ghz` under the same span rule, so DFS, NO_IR and
+indoor-only rules refuse the channel. Smokes (written, not executed):
+`smoke_ath9k_ar9280_calibration_pwdadc_agc_two_chain_2ghz`,
+`smoke_ath9k_ar9280_calibration_5ghz_limits_and_pcie_workaround`,
+`smoke_ath9k_ar9280_calibration_refuses_before_writes`,
+`smoke_ath9k_ar9280_dual_band_permission_refuses_dfs_and_no_ir`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

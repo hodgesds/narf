@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9285 PCIe power-save workarounds. Linux ath9k pci.c::ath_pci_aspm_init,
+//! AR9285/AR9287/AR9280 PCIe power-save workarounds. Linux ath9k pci.c::ath_pci_aspm_init,
 //! ar9002_hw.c::ar9002_hw_configpcipowersave and ar9002_initvals.h.
 use super::identity::{BringUpError, RegisterIo};
 
@@ -56,6 +56,38 @@ pub(super) fn configure(
     xe2: bool,
     power_off: bool,
 ) -> Result<(), BringUpError> {
+    let xe2 = if xe2 { 1 << 23 } else { 0 };
+    let d0 = (0x004a_050b & !D3_L1_DISABLE) | D0_WORKAROUND | xe2;
+    apply(io, enabled, power_off, d0, xe2)
+}
+
+/// `ar9002_hw_configpcipowersave` for `AR_SREV_9280`: D0 writes
+/// `AR9280_WA_DEFAULT & ~AR_WA_D3_L1_DISABLE` (no bits 6/7, which Linux
+/// sets only for AR9285/AR9287), D3 clears bits 6/7 and sets `AR_WA_BIT22`.
+/// The SerDes table and `AR_PCIE_PM_CTRL_ENA` handling are shared.
+pub(super) fn configure_ar9280(
+    io: &mut impl RegisterIo,
+    enabled: bool,
+    power_off: bool,
+) -> Result<(), BringUpError> {
+    apply(
+        io,
+        enabled,
+        power_off,
+        0x0040_073b & !D3_L1_DISABLE,
+        1 << 22,
+    )
+}
+
+/// `d0` is the D0 workaround word; `d3_set` the bits Linux ORs into the
+/// live word before D3.
+fn apply(
+    io: &mut impl RegisterIo,
+    enabled: bool,
+    power_off: bool,
+    d0: u32,
+    d3_set: u32,
+) -> Result<(), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -79,12 +111,12 @@ pub(super) fn configure(
         if wa == u32::MAX {
             return Err(BringUpError::DeviceGone);
         }
-        // AR9285_WA_DEFAULT lacks D3_L1_DISABLE, so preserve its prior
-        // value. Clear bits6/7 before D3 to avoid the documented hang.
-        io.write32(WA, (wa & !D0_WORKAROUND) | if xe2 { 1 << 23 } else { 0 });
+        // AR9285_WA_DEFAULT and AR9280_WA_DEFAULT lack D3_L1_DISABLE, so
+        // preserve its prior value. Clear bits6/7 before D3 to avoid the
+        // documented hang.
+        io.write32(WA, (wa & !D0_WORKAROUND) | d3_set);
     } else {
-        let wa = (0x004a_050b & !D3_L1_DISABLE) | D0_WORKAROUND | if xe2 { 1 << 23 } else { 0 };
-        io.write32(WA, wa);
+        io.write32(WA, d0);
         io.write32(PM, pm | L1_ENABLE);
     }
     if !io.authorized() {
@@ -173,6 +205,28 @@ mod tests {
             {
                 return TestResult::Fail("AR9285 D3 bits6/7 or reserved WA preservation");
             }
+        }
+        // AR9280: AR9280_WA_DEFAULT in D0, bits 6/7 cleared and BIT22 set
+        // before D3 (ar9002_hw_configpcipowersave AR_SREV_9280 branches).
+        let mut model = Model::default();
+        model.registers.insert(PM, 0x1234);
+        if configure_ar9280(&mut model, true, false).is_err()
+            || model.ops.len() != 14
+            || model.ops[12] != Op::Write(0x4004, 0x0040073b)
+            || model.ops[13] != Op::Write(0x4014, 0x81234)
+        {
+            return TestResult::Fail("AR9280 D0 PCIe workaround word differs from Linux");
+        }
+        model.ops.clear();
+        model.registers.insert(WA, 0x0000_45cb);
+        if configure_ar9280(&mut model, true, true).is_err()
+            || model.ops.last() != Some(&Op::Write(0x4004, 0x0040_450b))
+        {
+            return TestResult::Fail("AR9280 D3 workaround lacks BIT22 or keeps bits 6/7");
+        }
+        let mut pci = Model::default();
+        if configure_ar9280(&mut pci, false, false).is_err() || !pci.ops.is_empty() {
+            return TestResult::Fail("AR9280 without ASPM touched PCIe SerDes");
         }
         let mut revoked = Model {
             revoked: true,

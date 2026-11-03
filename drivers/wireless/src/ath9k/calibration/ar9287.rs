@@ -37,10 +37,33 @@ use crate::ath9k::{
 
 /// New-format `AR_SREV` version of AR9287 (`AR_SREV_VERSION_9287`).
 const VERSION: u32 = 0x180;
+/// `ath_nf_limits` (`ar9002_phy.c::ar9002_hw_set_nf_limits`); the def and
+/// AR9287 maps carry no `nf_2g.cal`/`nf_5g.cal`, so `nominal` is also the
+/// default NF (`calib.c::ath9k_hw_get_default_nf`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath9k) struct Limits {
+    pub nominal: i16,
+    pub min: i16,
+    pub max: i16,
+}
+impl Limits {
+    /// `ath9k_hw_nf_sanitize` for one reading.
+    fn sanitize(self, raw: i16) -> i16 {
+        if raw > self.max {
+            self.max
+        } else if raw < self.min {
+            self.nominal
+        } else {
+            raw
+        }
+    }
+}
 /// `AR_PHY_CCA_{NOM,MIN_GOOD,MAX_GOOD}_VAL_9287_2GHZ`.
-const NF_NOMINAL: i16 = -112;
-const NF_MIN: i16 = -127;
-const NF_MAX: i16 = -97;
+pub(in crate::ath9k) const LIMITS: Limits = Limits {
+    nominal: -112,
+    min: -127,
+    max: -97,
+};
 /// `ah->nf_regs[0..2]`: `AR_PHY_CCA`, `AR_PHY_CH1_CCA`.
 const NF_REGS: [u64; 2] = [0x9864, 0xa864];
 /// `AR_PHY_CHAIN_OFFSET` on AR9002.
@@ -123,9 +146,9 @@ impl Calibration {
         let delay = read(io, 0x9914)? & 0x3fff;
         write(io, 0x981c, 1)?;
         io.settle(u64::from(delay / 10 + 100)).await;
-        agc(io).await?;
-        let (measured_noise_dbm, noise_dbm) = noise(io, rx_chainmask).await?;
-        let iq = iq(io, rx_chainmask).await?;
+        agc(io, false).await?;
+        let (measured_noise_dbm, noise_dbm) = noise(io, rx_chainmask, LIMITS).await?;
+        let iq = iq(io, rx_chainmask, VERSION).await?;
         if read(io, 8)? & 4 != 0
             || read(io, 0x840)? & 0x3ff != 0
             || read(io, 0x24)? & 1 != 0
@@ -150,13 +173,20 @@ impl Calibration {
     }
 }
 
-/// `ar9002_hw_init_cal` for AR_SREV_9280_20_OR_LATER and 9287 1.1+:
-/// `FLTR_CAL` brackets the AGC offset calibration, polled for
-/// `AH_WAIT_TIMEOUT`.
-async fn agc(io: &mut impl Io) -> Result<(), BringUpError> {
+/// `ar9002_hw_init_cal` for AR_SREV_9280_20_OR_LATER: `FLTR_CAL` brackets
+/// the AGC offset calibration, polled for `AH_WAIT_TIMEOUT`. Below
+/// AR9287 1.1 (`pwdadc`, i.e. AR9280) `AR_PHY_ADC_CTL_OFF_PWDADC` is cleared
+/// before and set again after it.
+pub(super) async fn agc(io: &mut impl Io, pwdadc: bool) -> Result<(), BringUpError> {
+    if pwdadc {
+        modify(io, 0x982c, 0x8000, 0)?;
+    }
     modify(io, 0x9860, 0, 0x10000)?;
     modify(io, 0x9860, 0, 1)?;
     wait(io, 0x9860, 1, 100_000).await?;
+    if pwdadc {
+        modify(io, 0x982c, 0, 0x8000)?;
+    }
     modify(io, 0x9860, 0x10000, 0)
 }
 
@@ -167,14 +197,15 @@ fn nf_field(value: i16) -> u32 {
 /// `ath9k_hw_loadnf` (history at its `nominal` initial value), the -50
 /// maxCCA restore, `ath9k_hw_start_nfcal(update)`, then the completed
 /// `ar9002_hw_do_getnf` readings with `ath9k_hw_nf_sanitize`.
-async fn noise(
+pub(super) async fn noise(
     io: &mut impl Io,
     rx_chainmask: u8,
+    limits: Limits,
 ) -> Result<([Option<i16>; 2], [Option<i16>; 2]), BringUpError> {
     let chains = || (0..2usize).filter(move |c| rx_chainmask & (1 << *c) != 0);
     let initial = read(io, 0x9860)?;
     for chain in chains() {
-        modify(io, NF_REGS[chain], 0x1ff, nf_field(NF_NOMINAL))?;
+        modify(io, NF_REGS[chain], 0x1ff, nf_field(limits.nominal))?;
     }
     if initial & 2 != 0 {
         modify(io, 0x9860, 2, 0)?;
@@ -212,13 +243,7 @@ async fn noise(
             return Err(BringUpError::BadCalibration);
         }
         measured[chain] = Some(raw);
-        applied[chain] = Some(if raw > NF_MAX {
-            NF_MAX
-        } else if raw < NF_MIN {
-            NF_NOMINAL
-        } else {
-            raw
-        });
+        applied[chain] = Some(limits.sanitize(raw));
     }
     Ok((measured, applied))
 }
@@ -227,7 +252,11 @@ async fn noise(
 /// `PER_MAX_LOG_COUNT`, `AR_PHY_CALMODE_IQ`, `DO_CAL`), one collected sample,
 /// then `ar9002_hw_iqcalibrate` over chains `0..numChains` and the chain-0
 /// `IQCORR_ENABLE`.
-async fn iq(io: &mut impl Io, rx_chainmask: u8) -> Result<[Option<(u8, i8)>; 2], BringUpError> {
+pub(super) async fn iq(
+    io: &mut impl Io,
+    rx_chainmask: u8,
+    version: u32,
+) -> Result<[Option<(u8, i8)>; 2], BringUpError> {
     field(io, 0x9920, 0xf000, 12, 10)?;
     write(io, 0x99f0, 0)?;
     modify(io, 0x9920, 0, 0x10000)?;
@@ -237,9 +266,9 @@ async fn iq(io: &mut impl Io, rx_chainmask: u8) -> Result<[Option<(u8, i8)>; 2],
     for (chain, slot) in measured.iter_mut().enumerate().take(chains) {
         let at = chain as u64 * CHAIN;
         *slot = (
-            measurement_for(io, 0x9c10 + at, VERSION)?,
-            measurement_for(io, 0x9c14 + at, VERSION)?,
-            measurement_for(io, 0x9c18 + at, VERSION)?,
+            measurement_for(io, 0x9c10 + at, version)?,
+            measurement_for(io, 0x9c14 + at, version)?,
+            measurement_for(io, 0x9c18 + at, version)?,
         );
     }
     // Validate every chain before the first correction write.
@@ -385,7 +414,11 @@ pub(in crate::ath9k) struct Tick {
 #[derive(Clone, Debug)]
 pub(in crate::ath9k) struct Periodic {
     rx_chainmask: u8,
-    init_pdadc: u8,
+    /// `ah->initPDADC` for `ar9287_hw_olc_temp_compensation`, or `None` for
+    /// a closed-loop map (`OLC_FOR_AR9280_20_LATER` false: no step runs).
+    init_pdadc: Option<u8>,
+    limits: Limits,
+    version: u32,
     hist: [[i16; HIST]; 2],
     index: [usize; 2],
     priv_nf: [i16; 2],
@@ -407,12 +440,31 @@ impl Periodic {
     /// still pending its `ath9k_hw_getnf`, and the IQ calibration that run
     /// completed (`CalValid`).
     pub(in crate::ath9k) fn new(report: &Report, now_ms: u64) -> Self {
+        Self::with(
+            report.rx_chainmask,
+            Some(report.init_pdadc),
+            LIMITS,
+            VERSION,
+            now_ms,
+        )
+    }
+    /// The same initial state for another AR9002 chip's limits and
+    /// `AR_SREV` version (`super::ar9280::Periodic`).
+    pub(super) fn with(
+        rx_chainmask: u8,
+        init_pdadc: Option<u8>,
+        limits: Limits,
+        version: u32,
+        now_ms: u64,
+    ) -> Self {
         Self {
-            rx_chainmask: report.rx_chainmask,
-            init_pdadc: report.init_pdadc,
-            hist: [[NF_NOMINAL; HIST]; 2],
+            rx_chainmask,
+            init_pdadc,
+            limits,
+            version,
+            hist: [[limits.nominal; HIST]; 2],
             index: [0; 2],
-            priv_nf: [NF_NOMINAL; 2],
+            priv_nf: [limits.nominal; 2],
             invalid: [FILTER_WINDOW; 2],
             nfcal_pending: true,
             longcal_pending: false,
@@ -521,7 +573,9 @@ impl Periodic {
             if longcal {
                 self.longcal_pending = false;
                 self.start_nfcal(io)?;
-                tick.temp_delta = olc_temp_compensation(io, image, self.init_pdadc)?;
+                if let Some(init_pdadc) = self.init_pdadc {
+                    tick.temp_delta = olc_temp_compensation(io, image, init_pdadc)?;
+                }
             }
         }
         Ok(!percal_pending)
@@ -584,9 +638,9 @@ impl Periodic {
         let mut out = [None; 2];
         for (chain, slot) in out.iter_mut().enumerate().take(chains) {
             let at = chain as u64 * CHAIN;
-            let i = measurement_for(io, 0x9c10 + at, VERSION)?;
-            let q = measurement_for(io, 0x9c14 + at, VERSION)?;
-            let correlation = measurement_for(io, 0x9c18 + at, VERSION)?;
+            let i = measurement_for(io, 0x9c10 + at, self.version)?;
+            let q = measurement_for(io, 0x9c14 + at, self.version)?;
+            let correlation = measurement_for(io, 0x9c18 + at, self.version)?;
             *slot = iq_coefficients(i, q, correlation).ok();
         }
         for (chain, coefficients) in out.iter().enumerate() {
@@ -615,12 +669,8 @@ impl Periodic {
             let raw = (raw << 7) >> 7;
             *value = if raw == 0 {
                 0
-            } else if raw > NF_MAX {
-                NF_MAX
-            } else if raw < NF_MIN {
-                NF_NOMINAL
             } else {
-                raw
+                self.limits.sanitize(raw)
             };
         }
         self.nfcal_pending = false;
@@ -640,8 +690,8 @@ impl Periodic {
                 self.priv_nf[chain] = sorted[(HIST - 1) >> 1];
             }
             // NFCAL_INTF is never set (no beacon-stuck path on a station).
-            if self.priv_nf[chain] != 0 && self.priv_nf[chain] > NF_MAX {
-                self.priv_nf[chain] = NF_MAX;
+            if self.priv_nf[chain] != 0 && self.priv_nf[chain] > self.limits.max {
+                self.priv_nf[chain] = self.limits.max;
             }
         }
         tick.noise_floor = Some(self.priv_nf[0]);

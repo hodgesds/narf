@@ -114,6 +114,24 @@ impl Permission {
         if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
             return Err(BringUpError::Policy);
         }
+        Self::span(domain, frequency)
+    }
+    /// AR9280 dual-band permission: a 2.4 GHz channel as `from_domain_at`,
+    /// or a 20 MHz 5 GHz channel of `phy::ar9280::channel_5ghz`. The same
+    /// span rule applies, so a DFS, NO_IR or indoor-only rule refuses the
+    /// channel (this station never radiates where it may only listen).
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+    pub(super) fn from_domain_dual(
+        domain: &RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Self, BringUpError> {
+        if super::phy::ar9280::channel_5ghz(frequency).is_some() {
+            Self::span(domain, frequency)
+        } else {
+            Self::from_domain_at(domain, frequency)
+        }
+    }
+    fn span(domain: &RegulatoryDomain, frequency: u16) -> Result<Self, BringUpError> {
         let lower = u32::from(frequency) - 10;
         let upper = u32::from(frequency) + 10;
         // Every admitted primary uses full-rate/20MHz. The entire
@@ -507,3 +525,7 @@ pub(in crate::ath9k) mod wide;
 
 /// AR9287 two-chain AGC/NF/IQ/ADC-DC and open-loop temperature compensation.
 pub(in crate::ath9k) mod ar9287;
+
+/// AR9280 dual-band closed-loop AGC (with `OFF_PWDADC`), per-band NF and
+/// two-chain IQ calibration.
+pub(in crate::ath9k) mod ar9280;

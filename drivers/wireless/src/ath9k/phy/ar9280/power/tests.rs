@@ -23,7 +23,7 @@ impl RegisterIo for Io {
     fn delay_us(&mut self, _: u64) {}
 }
 
-fn identity(minor: u16) -> Identity {
+pub(in crate::ath9k) fn identity(minor: u16) -> Identity {
     Identity {
         revision: 1,
         mac: [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
@@ -41,7 +41,7 @@ fn two(frequency: u16) -> Tune {
 
 /// Synthetic closed-loop dual-band def map: marker values chosen to
 /// exercise each Linux branch, never board data.
-fn image(tx_mask: u8) -> Vec<u8> {
+pub(in crate::ath9k) fn image(tx_mask: u8) -> Vec<u8> {
     let mut b = vec![0u8; MAP_DEF.bytes()];
     b[8] = 0x64; // regDmn[0]: world SKU, NO_CTL minimum walk.
     b[TX_MASK] = tx_mask;

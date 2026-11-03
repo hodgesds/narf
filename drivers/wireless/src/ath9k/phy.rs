@@ -259,6 +259,8 @@ pub(super) fn program_live_power_at(
 pub(in crate::ath9k) mod ar9280;
 pub(in crate::ath9k) mod ar9287;
 mod channel;
+/// The AR9002 channel tune (2.4 GHz geometry or a 5 GHz 20 MHz center).
+pub(in crate::ath9k) use channel::Tune;
 mod modal;
 mod power;
 pub(super) mod rates;
