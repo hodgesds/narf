@@ -67,7 +67,6 @@ rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specificat
 rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	2191
 rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	2194
 rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2196
-rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	2197
 rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	2199
 rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	2201
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	2203

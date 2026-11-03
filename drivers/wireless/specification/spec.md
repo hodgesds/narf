@@ -682,7 +682,7 @@ implementations,78 remain; physical RF/firmware/board acceptance stays separate.
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 11 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, runtime sleep and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset, explicit safe rejoin and retained system suspend/resume are implemented pending validation |
+| rtw88 | 10 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset, explicit safe rejoin and retained system suspend/resume are implemented pending validation |
 | rtw89 | 7 | Additional channels/bands/widths, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor and source-qualified host fragmentation are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 10 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop and native primary-bsscfg SDIO AP are implemented pending validation |
@@ -1727,6 +1727,16 @@ packet, and nothing is retried after issue. Ordinary RX denied at the ring is
 never delivered to the stack. Family `cyw43439.md` lists nine unexecuted cases.
 2026-11-02 recount: 53 open features plus 25 implemented pending validation
 (78 including unvalidated); the full release/native matrix is now due.
+
+### 3.18 RTW88 associated nondeep LPS (validation pending)
+
+RTW88 runtime sleep composes the committed unassociated IPS with associated
+nondeep LPS on C21 CCK1/channel1. LPS H2C commands use a PS-specific mailbox
+submission: after HMEBOX_EXT staging and immediately before the publishing
+low word it re-checks the original PS source and the native Core RX-prefix
+receipt; newly pending input leaves the command unissued for a bounded retry,
+and nothing is retried after publication. Family `rtw88.md` lists the cases.
+2026-11-02 recount: 52 open features plus 26 implemented pending validation.
 
 
 ## 4. Interaction with `narf-wireless`
