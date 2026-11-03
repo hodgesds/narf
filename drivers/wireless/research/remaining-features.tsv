@@ -11,7 +11,6 @@ ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wirele
 ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	1189
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/cyw43439.md	533
 cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	534
-rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	1136
 rtl8xxxu	rtl8192eu	RTL8192EU retained runtime; not an external blocker, unported: the 8192e.c chip runtime (power sequence, gen2 firmware/H2C, MAC/BB/RF tables, 2T IQK, TX desc v2/gen2 rate adaptation via H2C) following the 8188e retained owner, plus per-device signed power artifacts	chip	drivers/wireless/specification/rtl8xxxu.md	1116
 rtl8xxxu	rtl8723bu	RTL8723BU retained runtime; not an external blocker, unported: the 8723b.c chip runtime (power sequence, gen2 firmware/H2C, tables, S0/S1 antenna path, BT mailbox) following the 8188e retained owner, plus per-device signed power artifacts	chip	drivers/wireless/specification/rtl8xxxu.md	1116
 rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes	feature	drivers/wireless/specification/rtlwifi.md	1586
