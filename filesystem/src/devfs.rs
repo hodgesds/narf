@@ -681,11 +681,6 @@ pub fn install_tty_acm_hooks(
         enumerate,
     });
 }
-        lookup,
-        lookup_dir: |_| None,
-        enumerate,
-    });
-}
 
 pub fn install_video_hooks(
     lookup: providers::DeviceLookup,

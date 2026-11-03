@@ -98,9 +98,6 @@ pub fn register_initcalls() {
         );
         InitResult::Ok
     });
-        );
-        InitResult::Ok
-    });
     narf_init::register(Stage::Subsys, "usb-uac", || {
         uac::register_initcalls();
         InitResult::Ok
