@@ -629,7 +629,11 @@ async fn initialize_radio(
             )
         }
     };
-    let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features);
+    // Linux's default `cryptmode=0` (ATH10K_CRYPT_MODE_HW) beside this
+    // RAW decap: station PTK/GTK are offloaded once the firmware confirms
+    // them, with software CCMP/BIP as the per-frame fallback.
+    let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features)
+        .with_hardware_keys(true);
     let result = radio.start_from_hardware().await;
     let owner = RadioSession {
         quarantine: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),

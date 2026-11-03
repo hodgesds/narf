@@ -619,14 +619,14 @@ actual-device RF/power/interoperability acceptance remain separate.
   Device service worker after the synchronous drain (the WMI management path
   cannot be awaited there). A local disconnect under PMF first sends one
   Deauthentication (reason 3, `ieee80211_set_disassoc`) protected with the
-  still-installed PTK; non-PMF teardown still sends none. Because this RAW
-  image disables firmware crypto (`ATH10K_CRYPT_MODE_SW`), the host expects
-  robust unicast frames still encrypted on WMI management RX, whereas Linux
-  `wmi.c::ath10k_wmi_rx_is_decrypted` assumes firmware decryption in
-  hardware-crypto mode; that firmware behaviour needs physical confirmation.
-  PEER_ASSOC carries no `WMI_PEER_PMF`: Linux `mac.c::ath10k_peer_assoc_h_crypto`
-  sets it only with `ATH10K_FW_FEATURE_MFP_SUPPORT`, for firmware-side
-  management crypto that this software-crypto image does not use.
+  still-installed PTK; non-PMF teardown still sends none. In the software
+  key profile (`ATH10K_CRYPT_MODE_SW`) the host expects robust unicast frames
+  still encrypted on WMI management RX and PEER_ASSOC carries no
+  `WMI_PEER_PMF`. The registered PCI radio selects the hardware key profile
+  of §3.4, which sets `WMI_PEER_PMF` where Linux does and then admits
+  firmware-decrypted robust management (`wmi.c::ath10k_wmi_rx_is_decrypted`)
+  through a PN-only check; that firmware behaviour needs physical
+  confirmation.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
@@ -936,7 +936,9 @@ actual-device RF/power/interoperability acceptance remain separate.
   software CCMP, per-key/TID replay, PN and retired-key history. M2/M4/group
   replies use native raw HTT with NO_ENCRYPT and retain their DMA payload and
   fragment owners after CE completion. Only the matching successful terminal
-  HTT ID commits the pending security change. No hardware key receipt is
+  HTT ID commits the pending security change. With the §3.4 hardware key
+  profile each committed PTK/GTK is then programmed and confirmed by the
+  firmware's own HTT security indication; no hardware key receipt is
   fabricated. An early association-era M1 is preserved only after full native
   descriptor/peer/TID/header and unprotected-unicast EAPOL admission; all
   preauthorization IP is discarded. `StationLink { bssid, frequency, protected }`
@@ -1643,6 +1645,79 @@ userspace M1–M4 with real MIC/AES wrap before native keys/port/DATA.
 Compilation, native execution and actual firmware/board/RF interoperability
 acceptance are pending; these cases are not physical evidence.
 
+### 3.4 Station hardware key offload (RAW + `cryptmode=0`)
+
+`Radio::with_hardware_keys(true)` (selected by the PCI radio, as Linux's
+default `cryptmode=0` beside `rawmode=1`) keeps `station_security::Security`
+as the sole RSNA/PN/replay owner, built `with_hardware_keys`, and layers
+firmware key offload over the unchanged software path
+(`wmi_runtime/hw_keys.rs`, `wmi_runtime/data.rs`). The earlier plan to move
+ath10k onto a bare `eapol::Supplicant` (ath11k `mac/sec.rs`) was not taken:
+the retained owner already carries the M4/group-reply commit fence, key-reuse
+history, A-MSDU/SPP and SAE/PMF state the RAW path depends on, so the shared
+crate gained only an opt-in offload surface (`wireless/` spec §3).
+
+- **Install.** Each PTK/GTK whose material changes at a reply's terminal
+  delivery (PTK before GTK; an identical re-delivery installs nothing, as
+  wpa_supplicant "do not reinstall") is queued and programmed one at a time
+  from the async data step with `WMI_VDEV_INSTALL_KEY` (mac.c
+  `ath10k_send_key`/`ath10k_install_key`): vdev 0, BSSID as peer for both,
+  `key_idx`, `WMI_KEY_PAIRWISE` (0) or `WMI_KEY_GROUP` (1),
+  `WMI_CIPHER_AES_CCM` (4), zero RSC/TSC (the host keeps PN/replay), 16-octet
+  key. Main/10.x/10.4 use the packed `wmi_vdev_install_key_cmd` (IDs
+  0x5009/0x901b/0x901a/0x901d, wmi.c `ath10k_wmi_op_gen_vdev_install_key`);
+  TLV wraps the same struct in tag 96 plus an ARRAY_BYTE key TLV (0x5009,
+  wmi-tlv.c `ath10k_wmi_tlv_op_gen_vdev_install_key`). Completion is the HTT
+  `SEC_IND` (0xb, htt_rx.c `install_key_done`) naming an owned peer, AES-CCMP
+  and the matching unicast/group kind. Only then does `Security::key_installed`
+  admit that slot; no indication within Linux's 3 s leaves the slot
+  software-only (mac80211 keeps a key in software when `drv_set_key` fails),
+  and a late/foreign indication confirms nothing. A newer commit returns a
+  slot to pending, so a frame the firmware decrypted under a stale key is
+  dropped rather than checked against the fresh key's replay window. Firmware
+  key state is dropped with the peer at teardown.
+- **TX.** While the current PTK is confirmed, Ethernet DATA uses the
+  header-only form (mac80211 `IEEE80211_KEY_FLAG_GENERATE_IV`: Protected
+  header, CCMP header with a PN from the shared counter, plaintext) plus the
+  8-octet MIC tail htt_tx.c reserves for RAW protected frames, sent without
+  `NO_ENCRYPT`. Otherwise, and for every EAPOL reply, the software CCMP form
+  with `NO_ENCRYPT` is used (`ATH10K_SKB_F_NO_HWCRYPT`); PN order is one
+  counter either way.
+- **RX.** With hardware keys an original MPDU the firmware reports as
+  AES-CCM (enctype 6) with status OK and no FCS/decrypt/peer-index error is
+  `is_decrypted` (htt_rx.c `ath10k_htt_rx_h_mpdu`); `raw_frame` removes the
+  FCS and MIC and keeps Protected plus the CCMP header
+  (`ath10k_htt_rx_h_undecap_raw`, `fill_crypt_header`), and the shared owner
+  applies only the PN check against the same per-key/TID window software
+  CCMP uses (`receive_decrypted_with_nonce`, `receive_amsdu_decrypted_with`).
+  Frames the firmware could not decrypt keep the existing software path.
+- **Management.** PEER_ASSOC sets `peer_flags->pmf` for a PMF association on
+  `ATH10K_FW_FEATURE_MFP_SUPPORT` firmware (0x10000000 main/10.2/10.4,
+  0x08000000 TLV; 10.1 has no map entry and keeps all management crypto in
+  software). On such a peer, once the PTK is confirmed, protected unicast
+  deauth/disassoc/action from WMI management RX are firmware-decrypted
+  (Protected, CCMP header and MIC kept, `ath10k_wmi_rx_is_decrypted`): the MIC
+  is trimmed and only the management PN counter is checked
+  (`receive_management_decrypted`); SA Query responses and the PMF
+  deauthentication use the header-only management form plus MIC space
+  (`GENERATE_IV_MGMT`, wmi.c `ath10k_wmi_op_gen_mgmt_tx`). IGTK/BIP is never
+  programmed: Linux `ath10k_set_key` returns 1 (software) for every BIP
+  suite, so group robust management stays software BIP-CMAC-128.
+- Not offloaded: TKIP/WEP/GCMP (not admitted by the station profile), MLD
+  owners, AP-side keys (§3.3 keeps its software owner) and fragments.
+
+Native cases (written, unexecuted): `smoke_ath10k_hw_keys_install_struct_dialects`,
+`smoke_ath10k_hw_keys_install_tlv`, `smoke_ath10k_hw_keys_peer_pmf_flag_map`,
+`smoke_ath10k_hw_keys_security_indication` (ath10k) and
+`smoke_station_ccmp_offload_header_only_shares_tx_pn`,
+`smoke_station_ccmp_offload_decrypted_receive_keeps_replay`,
+`smoke_station_ccmp_offload_management_uses_management_counter` (shared
+crate). The composed RAW data tests still construct the software profile; a
+composed hardware-key conversation (model firmware decrypting/encrypting with
+installed keys) is not yet written. Coordinated release compilation, native
+execution and physical firmware/board acceptance are pending; no physical
+key-cache behaviour is claimed.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -1861,7 +1936,7 @@ pending. This makes no additional per-chip physical RF or power claim.
 
 Across the reached rows, concrete remaining software packages are
 contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented);
-DFS qualification; hardware key offload;
+DFS qualification; physical acceptance of the §3.4 hardware key offload;
 P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.

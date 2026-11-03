@@ -413,7 +413,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             aid,
             protected: security != SecurityMode::Open,
         };
-        let command = mlme::peer_phy(
+        let mut command = mlme::peer_phy(
             self.wire.dialect,
             associated,
             capability,
@@ -421,6 +421,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             wmm.is_some(),
             ht,
         )?;
+        // Linux ath10k_peer_assoc_h_crypto: `peer_flags->pmf` for an MFP
+        // station on MFP-capable firmware. Only the hardware-key profile
+        // sets it; the software profile keeps robust management on the host.
+        let pmf_offload = if self.hardware_keys {
+            super::hw_keys::management_offload(self.wire.dialect, self.features, plan.pmf())
+        } else {
+            None
+        };
+        if let Some(flag) = pmf_offload {
+            super::hw_keys::mark_peer_pmf(self.wire.dialect, &mut command, flag)?;
+        }
+        self.peer_pmf_offload = pmf_offload.is_some();
         let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
         let contention = wmm
             .or_else(|| {

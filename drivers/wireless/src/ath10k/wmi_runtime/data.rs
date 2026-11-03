@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Retained RAW-mode station packets. Firmware receipts, RSNA and packet keys
 //! have separate ownership; an associated peer alone never admits Ethernet.
+use super::hw_keys;
 use super::*;
 use crate::ath10k::regulatory::Permission;
-use narf_wireless::station_security::{MgmtRx, RawFrame, Rx, Security};
+use narf_wireless::packet_key::AmsduAdmission;
+use narf_wireless::station_security::{KeyInstall, MgmtRx, RawFrame, Rx, Security};
 const RECEIVED_FRAMES: usize = 256;
 const INCOMING_FRAMES: usize = 1024;
 #[path = "rx_ba.rs"]
@@ -21,8 +23,10 @@ pub struct Link {
     pub frequency: u16,
     pub protected: bool,
 }
+/// An original native MPDU; `.1` marks one the firmware decrypted with a
+/// host-installed key (Protected and CCMP header kept, MIC/FCS removed).
 #[derive(Debug)]
-struct Native(Vec<u8>);
+struct Native(Vec<u8>, bool);
 #[derive(Clone, Copy)]
 struct Addresses {
     own: [u8; 6],
@@ -73,6 +77,10 @@ pub(super) struct State {
     /// path (one outstanding; a second request before it is sent is
     /// dropped, as mac80211 answers each request independently).
     management: Option<Vec<u8>>,
+    /// Committed keys awaiting `WMI_VDEV_INSTALL_KEY` (hardware-key profile).
+    keys: VecDeque<KeyInstall>,
+    /// The one install awaiting its HTT security indication.
+    key_in_flight: Option<hw_keys::InFlight>,
 }
 impl State {
     fn host_idle(&self) -> bool {
@@ -81,6 +89,8 @@ impl State {
             && self.received.is_empty()
             && self.wmm_update.is_none()
             && self.protection_update.is_none()
+            && self.keys.is_empty()
+            && self.key_in_flight.is_none()
             && self.rx_ba.host_idle()
     }
     pub(super) fn protection_allowed(&self) -> bool {
@@ -148,7 +158,17 @@ impl State {
         now: u64,
     ) -> Result<(), Error> {
         let data_admitted = self.open();
-        match raw_frame(frame, status, peer, tid, addresses, &mut self.rx_ba, now)? {
+        let hardware = self.security.as_ref().is_some_and(Security::hardware_keys);
+        match raw_frame(
+            frame,
+            status,
+            peer,
+            tid,
+            addresses,
+            &mut self.rx_ba,
+            now,
+            hardware,
+        )? {
             Some(NativeEvent::Data(frame)) => {
                 if !data_admitted && !plaintext_eapol(&frame, addresses) {
                     // Even a valid original FIRST was not admitted in this
@@ -195,6 +215,25 @@ fn plaintext_eapol(frame: &Native, addresses: Addresses) -> bool {
 }
 fn security_error(_: narf_wireless::station_security::Error) -> Error {
     Error::Malformed
+}
+/// Linux with a hardware CCMP key on a `peer_flags->pmf` peer: mac80211
+/// writes only the CCMP header (`IEEE80211_KEY_FLAG_GENERATE_IV_MGMT`) and
+/// wmi.c `ath10k_wmi_op_gen_mgmt_tx` reserves the MIC the firmware writes.
+/// Without the PMF peer flag, or before the firmware confirmed the current
+/// PTK, the host protects the frame completely as in the software profile.
+fn protect_management(
+    security: &mut Security,
+    frame: &[u8],
+    pmf_offload: bool,
+) -> Result<Vec<u8>, Error> {
+    if pmf_offload && security.pairwise_offloaded() {
+        let mut out = security
+            .protect_management_offload(frame)
+            .map_err(security_error)?;
+        out.resize(out.len() + hw_keys::MIC_LEN, 0);
+        return Ok(out);
+    }
+    security.protect_management(frame).map_err(security_error)
 }
 fn element(ies: &[u8], wanted: u8) -> Result<Option<&[u8]>, Error> {
     let mut rest = ies;
@@ -265,10 +304,45 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         frame.extend_from_slice(&own);
         frame.extend_from_slice(&bssid);
         frame.extend_from_slice(&[0, 0, 3, 0]);
-        security
-            .protect_management(&frame)
-            .map(Some)
-            .map_err(security_error)
+        protect_management(security, &frame, self.peer_pmf_offload).map(Some)
+    }
+    /// Program committed keys one at a time (Linux mac.c
+    /// `ath10k_install_key` under `conf_mutex`): `WMI_VDEV_INSTALL_KEY`, then
+    /// the HTT security indication confirms it in `data_event_inner`. No
+    /// indication within Linux's 3 s leaves that slot software-only, as
+    /// mac80211 keeps a key in software when `drv_set_key` fails.
+    async fn send_station_keys(&mut self) -> Result<bool, Error> {
+        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let dialect = self.wire.dialect;
+        let Some(data) = self.data.as_mut() else {
+            return Ok(false);
+        };
+        if let Some(flight) = data.key_in_flight {
+            if !flight.deadline.expired() {
+                return Ok(false);
+            }
+            data.key_in_flight = None;
+            if let Some(security) = data.security.as_mut() {
+                security.key_install_failed(flight.token);
+            }
+        }
+        let Some(key) = data.keys.pop_front() else {
+            return Ok(false);
+        };
+        let command = zeroize::Zeroizing::new(hw_keys::install(dialect, bssid, &key)?);
+        data.key_in_flight = Some(hw_keys::InFlight {
+            token: key.token,
+            pairwise: key.pairwise,
+            deadline: narf_time::Deadline::after_ms(hw_keys::INSTALL_TIMEOUT_MS),
+        });
+        drop(key);
+        self.htt
+            .wmi
+            .htc
+            .send_wmi(&command)
+            .await
+            .map_err(htt::Error::from)?;
+        Ok(true)
     }
     /// Publish a queued protected SA Query Response on the native
     /// management path (the synchronous receive drain cannot await WMI).
@@ -545,6 +619,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     }
                     _ => return Err(Error::Unsupported),
                 }
+                .and_then(|security| {
+                    if self.hardware_keys {
+                        security.with_hardware_keys()
+                    } else {
+                        Ok(security)
+                    }
+                })
                 .map_err(security_error)?,
             )
         } else {
@@ -595,6 +676,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     addresses,
                     &mut rx_ba,
                     narf_time::wall::monotonic_ns(),
+                    false,
                 )? {
                     if plaintext_eapol(&frame, addresses) {
                         if incoming.len() == 64 {
@@ -633,6 +715,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             wmm_update: None,
             protection_update: None,
             management: None,
+            keys: VecDeque::new(),
+            key_in_flight: None,
         });
         self.failed = true;
         let deadline = narf_time::Deadline::after_ms(5000);
@@ -656,9 +740,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         domain: &narf_wireless::reg::RegulatoryDomain,
         bytes: &[u8],
     ) -> Result<u16, Error> {
-        let frame = self.ethernet_frame(domain, bytes)?;
+        let (frame, hardware) = self.ethernet_frame(domain, bytes)?;
         self.failed = true;
-        let id = self.send_data(&frame, false).await?;
+        let id = self.send_data(&frame, false, hardware).await?;
         self.failed = false;
         Ok(id)
     }
@@ -666,7 +750,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
         bytes: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<(Vec<u8>, bool), Error> {
         let link = self.station_link().ok_or(Error::Failed)?;
         self.check_data_policy(domain)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
@@ -681,13 +765,25 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         } else {
             0
         };
+        let mut hardware = false;
         let frame = if let Some(security) = &mut data.security {
-            if data.qos {
-                security.transmit_ethernet_qos(bytes, tid)
+            if security.pairwise_offloaded() {
+                // mac80211 GENERATE_IV with a hardware key: the CCMP header
+                // only; htt_tx.c RAW protected adds the MIC tail the
+                // firmware fills (`skb_put(IEEE80211_CCMP_MIC_LEN)`).
+                hardware = true;
+                let mut frame = security
+                    .transmit_ethernet_offload(bytes, data.qos.then_some(tid))
+                    .map_err(security_error)?;
+                frame.resize(frame.len() + hw_keys::MIC_LEN, 0);
+                frame
+            } else if data.qos {
+                security
+                    .transmit_ethernet_qos(bytes, tid)
+                    .map_err(security_error)?
             } else {
-                security.transmit_ethernet(bytes)
+                security.transmit_ethernet(bytes).map_err(security_error)?
             }
-            .map_err(security_error)?
         } else {
             if !(14..=1514).contains(&bytes.len())
                 || bytes[6..12] != own
@@ -714,7 +810,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             frame.extend_from_slice(&bytes[12..]);
             frame
         };
-        Ok(frame)
+        Ok((frame, hardware))
     }
     pub fn begin_ethernet(
         &mut self,
@@ -727,7 +823,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !self.htt.source_ready()? {
             return Err(Error::Htt(htt::Error::Busy));
         }
-        let frame = self.ethernet_frame(domain, bytes)?;
+        let (frame, hardware) = self.ethernet_frame(domain, bytes)?;
         self.failed = true;
         let tid = tx_qos::descriptor_tid(&frame);
         let id = self.htt.begin_transmit(
@@ -735,7 +831,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 kind: htt::tx::Kind::Raw,
                 vdev: 0,
                 tid,
-                hardware_crypto: false,
+                hardware_crypto: hardware,
             },
             &frame,
         )?;
@@ -826,7 +922,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.failed = false;
         Ok(Vec::new())
     }
-    async fn send_data(&mut self, frame: &[u8], reply: bool) -> Result<u16, Error> {
+    /// `hardware` clears `HTT_DATA_TX_DESC_FLAGS0_NO_ENCRYPT` for a
+    /// header-only MPDU under the firmware's current PTK; software-protected
+    /// data and every EAPOL reply keep it (Linux `ATH10K_SKB_F_NO_HWCRYPT`).
+    async fn send_data(&mut self, frame: &[u8], reply: bool, hardware: bool) -> Result<u16, Error> {
         let tid = tx_qos::descriptor_tid(frame);
         let id = self
             .htt
@@ -835,7 +934,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     kind: htt::tx::Kind::Raw,
                     vdev: 0,
                     tid,
-                    hardware_crypto: false,
+                    hardware_crypto: hardware,
                 },
                 frame,
             )
@@ -901,8 +1000,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let (idle, reply) = self.data_event(event, nonce)?;
         if let Some(reply) = reply {
-            checked_policy(self.send_data(&reply, true), validate).await?;
+            checked_policy(self.send_data(&reply, true, false), validate).await?;
         }
+        checked_policy(self.send_station_keys(), validate).await?;
         checked_policy(self.send_station_management(), validate).await?;
         self.send_station_wmm(validate).await?;
         validate()?;
@@ -1085,20 +1185,37 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     // frames from the AP pass only CCMP (unicast) or BIP
                     // (group) admission once keys are in.
                     if current && f.len() >= 24 && matches!(f[0], 0xa0 | 0xc0 | 0xd0) {
-                        if let MgmtRx::Frame(plain) = security
-                            .receive_management(&Native(f.clone()))
-                            .map_err(security_error)?
-                        {
+                        // wmi.c ath10k_wmi_rx_is_decrypted: on a
+                        // `peer_flags->pmf` peer the firmware decrypts a
+                        // protected unicast deauth/disassoc/action with the
+                        // installed PTK and keeps Protected, the CCMP header
+                        // and the MIC, which mac80211 trims before its PN
+                        // check. Before that PTK is confirmed (or without
+                        // the flag) the host keeps full software CCMP.
+                        let offloaded = self.peer_pmf_offload
+                            && security.pairwise_offloaded()
+                            && f[1] & 0x40 != 0
+                            && f[4] & 1 == 0
+                            && f.len() >= 24 + 8 + hw_keys::MIC_LEN;
+                        let admitted = if offloaded {
+                            security.receive_management_decrypted(&Native(
+                                f[..f.len() - hw_keys::MIC_LEN].to_vec(),
+                                true,
+                            ))
+                        } else {
+                            security.receive_management(&Native(f.clone(), false))
+                        };
+                        if let MgmtRx::Frame(plain) = admitted.map_err(security_error)? {
                             if matches!(plain[0], 0xa0 | 0xc0) && plain.len() == 26 {
                                 return Err(Error::Failed);
                             }
                             if let Some(response) = sa_query_response(&plain, own, bssid) {
                                 if security.port_open() && data.management.is_none() {
-                                    data.management = Some(
-                                        security
-                                            .protect_management(&response)
-                                            .map_err(security_error)?,
-                                    );
+                                    data.management = Some(protect_management(
+                                        security,
+                                        &response,
+                                        self.peer_pmf_offload,
+                                    )?);
                                 }
                             }
                         }
@@ -1113,6 +1230,26 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     && f[16..22] == bssid
                 {
                     return Err(Error::Failed);
+                }
+            }
+            htt::Event::Message(bytes)
+                if bytes.first() == Some(&hw_keys::SECURITY_INDICATION)
+                    && data.security.as_ref().is_some_and(Security::hardware_keys) =>
+            {
+                // htt_rx.c HTT_T2H_MSG_TYPE_SEC_IND completes
+                // install_key_done. Only the outstanding install's own
+                // peer and key kind confirm it; a late or foreign indication
+                // confirms nothing, so that slot stays software-only.
+                if let (Some(flight), Some((id, unicast))) =
+                    (data.key_in_flight, hw_keys::security_indication(&bytes))
+                {
+                    if peer.owns(id) && unicast == flight.pairwise {
+                        data.key_in_flight = None;
+                        data.security
+                            .as_mut()
+                            .ok_or(Error::Failed)?
+                            .key_installed(flight.token);
+                    }
                 }
             }
             htt::Event::Message(bytes) if !matches!(bytes.first(), Some(3 | 4)) => {
@@ -1137,11 +1274,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     // boundary. Firmware BA agreements persist across rekey,
                     // but no retained PPDU PHY proof crosses this boundary.
                     data.rx_ba.discard_ppdu();
-                    data.security
-                        .as_mut()
-                        .ok_or(Error::Failed)?
-                        .reply_delivered(length)
-                        .map_err(security_error)?;
+                    let security = data.security.as_mut().ok_or(Error::Failed)?;
+                    security.reply_delivered(length).map_err(security_error)?;
+                    // mac80211 set_key after the committing reply (PTK
+                    // before GTK); programmed from the async data step.
+                    data.keys.extend(security.take_key_installs());
                     if data.security.as_ref().is_some_and(Security::port_open) {
                         data.authorized = true;
                     }
@@ -1179,7 +1316,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 // the original aggregate once; splitting before MIC/replay
                 // validation would assign authority to unauthenticated bytes.
                 let frames = if let Some(security) = &mut data.security {
-                    security.receive_amsdu(&frame).map_err(security_error)?
+                    if frame.1 {
+                        security
+                            .receive_amsdu_decrypted_with(&frame, AmsduAdmission::new())
+                            .map_err(security_error)?
+                            .map(|r| r.frames)
+                    } else {
+                        security.receive_amsdu(&frame).map_err(security_error)?
+                    }
                 } else if frame.0[1] & 0x40 == 0 {
                     narf_wireless::amsdu::decode(
                         &frame.0[26..],
@@ -1200,10 +1344,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 continue;
             }
             let normalized = if let Some(security) = &mut data.security {
-                match security
-                    .receive_with_nonce(&frame, &mut *nonce)
-                    .map_err(security_error)?
-                {
+                let received = if frame.1 {
+                    security.receive_decrypted_with_nonce(&frame, &mut *nonce)
+                } else {
+                    security.receive_with_nonce(&frame, &mut *nonce)
+                };
+                match received.map_err(security_error)? {
                     Rx::Ignored => None,
                     Rx::Data(frame) => {
                         data.last_peer = narf_time::Deadline::after_ms(5000);
@@ -1270,6 +1416,10 @@ fn sa_query_response(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Option<Vec<u
 /// Linux htt_rx.c::ath10k_htt_rx_h_undecap_raw strips only FCS for software
 /// crypto. Admit a single, complete, original native MPDU and bind both the
 /// indication and descriptor to an owned sparse peer/TID before shared RSNA.
+/// With `hardware` keys an MPDU the firmware decrypted (`is_decrypted`:
+/// AES-CCM, no FCS/decrypt/peer-index error) also loses its MIC, keeping
+/// Protected and the CCMP header for the host PN check (`fill_crypt_header`).
+#[allow(clippy::too_many_arguments)]
 fn raw_frame(
     mut msdu: htt::rx::Msdu,
     status: u8,
@@ -1278,14 +1428,16 @@ fn raw_frame(
     addresses: Addresses,
     ba: &mut rx_ba::Owner,
     now: u64,
+    hardware: bool,
 ) -> Result<Option<NativeEvent>, Error> {
-    let result = raw_frame_inner(&mut msdu, status, peer, tid, addresses, ba, now);
+    let result = raw_frame_inner(&mut msdu, status, peer, tid, addresses, ba, now, hardware);
     if !matches!(&result, Ok(Some(_))) {
         // No malformed header/foreign indication may seed or bridge a PPDU.
         ba.discard_ppdu();
     }
     result
 }
+#[allow(clippy::too_many_arguments)]
 fn raw_frame_inner(
     msdu: &mut htt::rx::Msdu,
     status: u8,
@@ -1294,6 +1446,7 @@ fn raw_frame_inner(
     Addresses { own, bssid }: Addresses,
     ba: &mut rx_ba::Owner,
     now: u64,
+    hardware: bool,
 ) -> Result<Option<NativeEvent>, Error> {
     if msdu.offload.is_some() || !matches!(status, 1 | 6 | 10) || msdu.descriptor.len() < 116 {
         return Ok(None);
@@ -1328,13 +1481,26 @@ fn raw_frame_inner(
     // decrypt preserves the wire MPDU. The software MIC remains authoritative.
     let encrypted = msdu.payload[1] & 0x40 != 0;
     let enctype = start >> 28;
+    // htt_rx.c ath10k_htt_rx_h_mpdu `is_decrypted`: AES_CCM_WPA2 (6) without
+    // DECRYPT_ERR (FCS/peer-index errors were refused above). Only the
+    // hardware-key profile installs keys, so only it may see one.
+    let decrypted = hardware
+        && status == 1
+        && encrypted
+        && enctype == 6
+        && attention & (1 << 29) == 0
+        && msdu.payload.len() >= 24 + 8 + hw_keys::MIC_LEN + 4;
     if status == 10 && !encrypted
-        || encrypted && !(enctype == 7 || enctype == 6 && attention & (1 << 29) != 0)
+        || encrypted && !decrypted && !(enctype == 7 || enctype == 6 && attention & (1 << 29) != 0)
         || !encrypted && enctype != 7
     {
         return Ok(None);
     }
     msdu.payload.truncate(msdu.payload.len() - 4); // native RAW carries FCS
+    if decrypted {
+        // RX_FLAG_MIC_STRIPPED | RX_FLAG_ICV_STRIPPED (CCMP has no ICV).
+        msdu.payload.truncate(msdu.payload.len() - hw_keys::MIC_LEN);
+    }
     let frame = &msdu.payload;
     if let Some((bar_tid, sequence)) = bar(frame, Addresses { own, bssid }) {
         // BAR is a non-QoS control MPDU, with neither DS bit set. Firmware
@@ -1383,19 +1549,15 @@ fn raw_frame_inner(
             return Ok(None);
         }
     }
-    if !ba.phy(
-        peer,
-        tid,
-        descriptor,
-        qos && frame[4] & 1 == 0,
-        frame.len() + 4,
-        now,
-    ) {
+    // The PPDU length proof uses the original on-air MPDU length.
+    let air = frame.len() + 4 + if decrypted { hw_keys::MIC_LEN } else { 0 };
+    if !ba.phy(peer, tid, descriptor, qos && frame[4] & 1 == 0, air, now) {
         return Ok(None);
     }
-    Ok(Some(NativeEvent::Data(Native(core::mem::take(
-        &mut msdu.payload,
-    )))))
+    Ok(Some(NativeEvent::Data(Native(
+        core::mem::take(&mut msdu.payload),
+        decrypted,
+    ))))
 }
 
 /// IEEE compressed, single-TID BAR. RA/TA bind the control to the current

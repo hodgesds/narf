@@ -2,9 +2,10 @@
 //! WPA2-PMF and WPA3-SAE association material. SAE runs on the host over
 //! the initial management transport through the shared `JoinPlan` state
 //! machine (wpa_supplicant `sme_sae_auth` over mac80211 `ieee80211_auth`);
-//! robust management protection is the software CCMP/BIP owner's
-//! (`station_security::Security`), since this RAW image disables firmware
-//! crypto (Linux v7.2 core.c `ATH10K_CRYPT_MODE_SW`).
+//! robust management protection is the CCMP/BIP owner's
+//! (`station_security::Security`): software in the `ATH10K_CRYPT_MODE_SW`
+//! profile, firmware-decrypted unicast CCMP with a host PN check in the
+//! hardware key profile (`hw_keys`), and always software BIP.
 use super::*;
 use alloc::boxed::Box;
 use narf_wireless::association::{AkmSet, JoinOptions, JoinPlan, Pmf, SaeStep, SecurityMode};

@@ -38,6 +38,7 @@ mod coexistence;
 mod data;
 mod host_power;
 mod ht;
+mod hw_keys;
 mod mlme;
 pub(in crate::ath10k) mod offchannel;
 mod power_save;
@@ -120,6 +121,12 @@ pub(super) struct Radio<T> {
     pub htt: htt::Runtime<T>,
     wire: wire::Wire,
     features: u64,
+    /// Linux `cryptmode=0` beside the RAW decap: station PTK/GTK go to the
+    /// firmware key cache (`hw_keys`), software CCMP stays the fallback.
+    hardware_keys: bool,
+    /// The current PEER_ASSOC carried `peer_flags->pmf`: firmware decrypts
+    /// this peer's robust management (`hw_keys::management_offload`).
+    peer_pmf_offload: bool,
     pub ready: Option<ScanReady>,
     channels: Vec<u16>,
     sequence: u16,
@@ -161,6 +168,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             htt,
             wire: wire::Wire::new(dialect),
             features,
+            hardware_keys: false,
+            peer_pmf_offload: false,
             ready: None,
             scan_cache: Vec::new(),
             beacon_hints: beacon_hints::Owner::new(),
@@ -185,6 +194,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             coexistence: None,
             coexistence_epoch: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }
+    }
+    /// Select station hardware key offload (Linux `cryptmode=0`) before the
+    /// first association. Software crypto remains the per-frame fallback.
+    pub fn with_hardware_keys(mut self, enabled: bool) -> Self {
+        self.hardware_keys = enabled;
+        self
     }
     /// No country policy is inferred here: these are receive-only IEEE
     /// channels intersected with the target's actual SERVICE_READY limits.
