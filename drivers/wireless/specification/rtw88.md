@@ -2614,8 +2614,18 @@ Written, unexecuted: `smoke_rtw88_dfs_passive_rule_and_record_admission`
 (plus the class 118/121 rows in
 `smoke_rtw88_band5_station_scan_csa_and_probe`).
 
-Remaining for the row: 5GHz HT20/HT40 (needs 5GHz-qualified continuation
-records).
+Non-QoS DCF on 5GHz (`station_control::commit_peer(.., band5, ..)`):
+rtw88 mac80211.c `rtw_aifsn_to_aifs` AIFS = AIFSN * slot + SIFS with SIFS
+16 on `RTW_BAND_5G` (10 on 2.4GHz), and mac80211 mlme.c
+`ieee80211_handle_bss_capability` forces the short slot (REG_SLOT 9) on
+5GHz whatever the AP's Short Slot Time bit; the base keeps CWmin31.
+Written, unexecuted: the 5GHz rows of
+`smoke_rtw8822ce_station_dcf_matches_original_non_qos_defaults_and_fails_closed`.
+
+Not part of this row: 5GHz HT20/HT40 continuations (WMM/HT/BA/... records
+qualified over the OFDM6 base, 5GHz HT facts and C22 HT/MCS difference
+words) are follow-on work like every per-channel continuation; without
+them a 5GHz primary runs the legacy OFDM base profile.
 
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station

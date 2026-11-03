@@ -2102,7 +2102,8 @@ impl State {
         loop {
             self.poll(io)?;
             if let Some((aid, short)) = self.peer_commit {
-                station_control::commit_peer(io, bssid, aid, short, &self.admission).await?;
+                let band5 = super::band5::primary(self.channel);
+                station_control::commit_peer(io, bssid, aid, short, band5, &self.admission).await?;
                 self.associated_aid = Some(aid);
                 if self.extension.is_some() {
                     super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)

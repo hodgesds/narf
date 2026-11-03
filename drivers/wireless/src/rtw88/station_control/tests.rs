@@ -176,7 +176,7 @@ fn smoke_rtw8822ce_station_controls_bind_source_port_peer_and_real_mailbox_consu
             }
         }
         prepare_peer(&mut io, peer, &admission).await?;
-        commit_peer(&mut io, peer, 42, true, &admission).await
+        commit_peer(&mut io, peer, 42, true, false, &admission).await
     });
     if result.is_err()
         || io.commands != LINUX_MAILBOX
@@ -227,6 +227,19 @@ fn smoke_rtw8822ce_station_dcf_matches_original_non_qos_defaults_and_fails_close
             || io.writes != [0x500, 0x504, 0x508, 0x50c, 0x51b]
         {
             return TestResult::Fail("non-QoS CCK DCF differs from original mac80211/rtw88 output");
+        }
+    }
+    // 5GHz: rtw_aifsn_to_aifs SIFS16 and the mac80211 forced short slot,
+    // whatever the AP's Short Slot Time bit says.
+    for short in [false, true] {
+        let mut io = Model::new();
+        if configure_dcf_in(&mut io, short, true, &Admission::new()).is_err()
+            || [0x500, 0x504, 0x508, 0x50c]
+                .into_iter()
+                .any(|r| io.word(r) & 0x07ff_ffff != (10 << 12) | (5 << 8) | 34)
+            || io.regs[0x51b] != 9
+        {
+            return TestResult::Fail("5GHz DCF must use SIFS16 and the short slot");
         }
     }
     for lost in [0x500, 0x504, 0x508, 0x50c, 0x51b] {
@@ -287,7 +300,7 @@ fn smoke_rtw8822ce_station_control_close_cancel_revocation_and_missing_receipts_
     let mut io = Model::new();
     io.consumed_hold = true;
     io.close = Some(admission.clone());
-    if narf_scheduler::block_on(commit_peer(&mut io, peer, 42, false, &admission))
+    if narf_scheduler::block_on(commit_peer(&mut io, peer, 42, false, false, &admission))
         != Err(Error::State)
         || io.commands != [[1, 1, 0, 0, 0, 0, 0, 0]]
         || !io.pending

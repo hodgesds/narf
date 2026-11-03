@@ -206,12 +206,25 @@ fn mac_valid(mac: [u8; 6]) -> bool {
     mac[0] & 1 == 0 && mac != [0; 6]
 }
 fn configure_dcf(io: &mut impl Io, short: bool, admission: &Admission) -> Result<(), Error> {
+    configure_dcf_in(io, short, false, admission)
+}
+fn configure_dcf_in(
+    io: &mut impl Io,
+    short: bool,
+    band5: bool,
+    admission: &Admission,
+) -> Result<(), Error> {
     // mac80211::ieee80211_set_wmm_default(enable_qos=false) uses AIFSN2,
     // TXOP0 and CWmax1023. Retain the conservative 11b CWmin31 for this
-    // fixed CCK1 profile, including on an ERP AP. rtw88::__rtw_conf_tx
-    // encodes CW exponents and AIFS = AIFSN * slot + 2.4GHz SIFS10.
+    // fixed base profile, including on an ERP or 5GHz AP (mac80211 would
+    // use CWmin15 for OFDM). rtw88 mac80211.c::rtw_aifsn_to_aifs encodes
+    // AIFS = AIFSN * slot + SIFS, SIFS 16 when `current_band_type` is
+    // RTW_BAND_5G and 10 otherwise; mac80211 mlme.c
+    // `ieee80211_handle_bss_capability` forces the short slot on 5GHz.
+    let short = short || band5;
     let slot = if short { 9 } else { 20 };
-    let value = (10 << 12) | (5 << 8) | (2 * u32::from(slot) + 10);
+    let sifs = if band5 { 16 } else { 10 };
+    let value = (10 << 12) | (5 << 8) | (2 * u32::from(slot) + sifs);
     let mask = 0x07ff_ffff; // source TXOP/CWmax/CWmin/AIFS fields
     for register in [0x500, 0x504, 0x508, 0x50c] {
         update(io, register, mask, value, Some(admission))?;
@@ -314,6 +327,7 @@ pub(super) async fn commit_peer(
     peer: [u8; 6],
     aid: u16,
     short_slot: bool,
+    band5: bool,
     admission: &Admission,
 ) -> Result<(), Error> {
     admission.check()?;
@@ -326,7 +340,7 @@ pub(super) async fn commit_peer(
     send(io, [1, 1, 0, 0, 0, 0, 0, 0], Some(admission)).await?;
     send(io, [0x2c, 0, 0, 0, 0, 0, 0, 0], Some(admission)).await?;
     update(io, 0x6a8, 0x7ff, u32::from(aid), Some(admission))?;
-    configure_dcf(io, short_slot, admission)?;
+    configure_dcf_in(io, short_slot, band5, admission)?;
     update(io, 0x100, 0x30000, 2, Some(admission))
 }
 pub(super) async fn disconnect(io: &mut impl Io, _peer: [u8; 6]) -> Result<(), Error> {
