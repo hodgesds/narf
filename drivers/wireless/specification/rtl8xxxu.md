@@ -1181,6 +1181,31 @@ EP0 transfer/executable-cap discipline; chip steps live in
   RX signal: `rtl8192e_cck_rssi` (report-type table 0/1) for CCK, PWDB for
   OFDM/HT.
 
+- Gen2 firmware RA (`rtl8xxxu/rtl8192e_ra.rs`): `H2C_8723B_MACID_CFG_RAID`
+  (8 bytes: macid, RAID|SGI, bandwidth, LE mask), `MEDIA_STATUS_RPT`
+  (connect bit, role in [7:4]) and `RSSI_SETTING` (8 bytes on 8192E).
+  `Ra::new` refuses an empty peer mask, any peer rate outside the admitted
+  set (never narrowed — a 1T board without MCS8..15 refuses a 2SS peer) and
+  40 MHz for a non-HT peer. `level_mask` is the 2.4 GHz
+  `rtl8xxxu_refresh_rate_mask` (B/G/BG/GN/BGN, 1SS and 2SS, 20/40 low
+  masks). `Owner::ra_connect_8192e` is the `BSS_CHANGED_ASSOC` sequence
+  (rate mask with rate id 0, `REG_BCN_MAX_ERR = 0xff`,
+  `rtl8xxxu_stop_tx_beacon`, `REG_BCN_PSR_RPT = 0xc000 | aid`, media-status
+  connect as AP role) and folds the association highest rate into the
+  retained TX-rate report; deviation: the bandwidth sent is the operating
+  width, not the peer's 20/40 capability. `ra_disconnect_8192e` sets
+  `BEACON_DISABLE_TSF_UPDATE` and reports disconnect; `ra_watchdog_8192e`
+  is `rtl8xxxu_ra_iter` (RSSI report, then a mask only on a level change).
+  C2H RA reports for macid 0 inside the admitted set update the TX rate.
+- RF/power (`rtl8xxxu/rtl8192e_power.rs`): `rtl8192e_enable_rf`,
+  `rtl8xxxu_gen2_disable_rf` and `rtl8192eu_power_off` (flush_fifo, TX
+  report timer off, `REG_RF_CTRL = 0`, `active_to_lps`, firmware self
+  reset when running from RAM, MCU reset, `reset_8051`, active→EMU,
+  EMU→disabled). RXDMA-idle and `REG_SCH_TX_CMD` polls are terminal
+  `PowerTimeout` (Linux only warns). The owner's park path
+  (`power_off_stopped`) dispatches RTL8192EU to this sequence. Station PS
+  reuses the shared `ps_null` frames through `rtl8192e_packet::transmit_null`.
+
 The owner reaches `RadioReady` for RTL8192EU after calibration. The production
 probe stays detection-only for this family; no table, calibration, packet
 or station capability is advertised.

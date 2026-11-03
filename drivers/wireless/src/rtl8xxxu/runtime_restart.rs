@@ -103,6 +103,10 @@ impl<I: ControlIo> Owner<I> {
         Ok(())
     }
     async fn power_off_stopped(&self) -> Result<(), Error> {
+        if self.chip == ChipFamily::Rtl8192eu {
+            // 8192e.c::rtl8192eu_power_off; its own flush_fifo retires RX.
+            return crate::rtl8xxxu::rtl8192e_power::power_off(self).await;
+        }
         if self.read16(REG_CR).await? & 0xc0 != 0 {
             return Err(Error::RuntimeState);
         }

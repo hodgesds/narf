@@ -34,6 +34,9 @@ pub(super) struct Model {
     config: Vec<u8>,
     fw_bytes: usize,
     pub(super) mailbox_stuck: bool,
+    /// `REG_APS_FSMCO[9]` (MAC-off request) self-clears on its next 8-bit
+    /// read, as the power FSM does once card-off completes.
+    pub(super) aps_off_completes: bool,
     /// RF register file per path, fed by LSSI writes, read back through the
     /// HSSI address latched in `0x824`/`0x82c`.
     pub(super) rf: [[u32; 256]; 2],
@@ -134,6 +137,7 @@ impl Fake {
             config: configuration(3),
             fw_bytes: 0,
             mailbox_stuck: false,
+            aps_off_completes: false,
             rf: [[0; 256]; 2],
             rf_latch: [0; 2],
             edge_low: false,
@@ -189,6 +193,9 @@ impl ControlIo for Fake {
         }
         if addr == 0x224 && out.len() == 4 {
             g.regs[0x226] &= !1; // auto-LLT completes
+        }
+        if addr == REG_APS_FSMCO + 1 && out.len() == 1 && g.aps_off_completes {
+            g.regs[a] &= !2;
         }
         if addr == REG_HMTFR && g.mailbox_stuck {
             g.regs[a] = 0x0f;
