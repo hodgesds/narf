@@ -2785,27 +2785,60 @@ inert elsewhere):
   `DcUser::ExternalRoute` for a route's lifetime.
 
 `intel_gpu_stolen` decodes display-14 DSM (`layout` from GGC,
-`STOLEN_RESERVED`, the media `GSCPSMI_BASE`, BAR2 and PCI BSM). It excludes
-aperture-reachable DM-PTE pages (`aperture_dsm_pages`). `Dsm::place`
-first-fits a bounded range and proves every page is not system RAM.
+`STOLEN_RESERVED`, the media `GMD_ID` and `GSCPSMI_BASE`, BAR2 and PCI BSM).
+The GSC carve applies only when `wa_14019821291(media_gmd_id)` holds (a
+media GT of version 13.00, 13.01 or 20.00); an all-ones media `GMD_ID` is
+`Unavailable`. It excludes aperture-reachable DM-PTE pages
+(`aperture_dsm_pages`). `Dsm::place` first-fits a bounded range and proves
+every page is not system RAM. `Carve` is the resumable form: `survey` reads
+at most `CARVE_CHUNK_PTES` GGTT entries per call, and `place` (only after a
+complete survey) runs `find_compression_limit` over `Dsm::place`.
+`CarveSlot::poll` never blocks: it returns a finished result for the same
+size and limit floor, or `Pending` after launching (once) the off-path job,
+which reports through `finish` or `abandon`.
 `intel_gpu_fbc` provides display 14's `check_plane`, the CFB
 stride/size/limit helpers and the `Fbc` owner. The owner's
 `enable`/`activate`/`nuke`/`invalidate`/`flush`/`disable` methods never touch
-an FBC it did not activate. KMS uses `Platform::fbc_carve` and
-`fbc_recovery_view` (both inert by default). Every session invalidates; a
+an FBC it did not activate. KMS uses `Platform::fbc_carve` (a non-blocking
+`Poll`: `Pending` leaves FBC off and unrefused until a later latch) and
+`fbc_recovery_view` (both inert by default). Production runs the carve as a
+spawned job whose survey chunks each hold the KMS mutex and yield between
+chunks; the present path never surveys. Every session invalidates; a
 latched `present` flushes; console restore, legacy guards and recovery
 disable.
 
-`intel_gpu_psr` is display 14's PSR1: `Sink::read`, `compute_psr1` (typed
-`Refusal`; `latched()` refusals hold for the card's lifetime) and the `Psr`
-owner (`enable` without activation, `pause`, `resume`, `disable`). KMS reaches
-the panel through three `Platform` hooks, all inert by default:
-`psr_timing`, `psr_aux` and `psr_wm_level_disabled`. A latched `present`
-enables PSR once, disabling FBC first. Every session start pauses and waits
-for idle. The `Guard` drop re-arms once the session's frame changes have
-latched. Console and surface restore, legacy drain and recovery disable it.
-`register_wm_level_disabled(Some(provider))` is the watermark lane's
-Wa_14015648006 input; without it PSR is refused.
+`intel_gpu_psr` is display 14's PSR1: `Sink::read`,
+`compute_psr1(sink, timing, vbt, wm_level_disabled)` (typed `Refusal`;
+`latched()` refusals hold for the card's lifetime; the VBT refusals
+`VbtDisabled` and `VbtPanelByPnpId` come first and are not latched),
+`psr1_tp_time` / `psr1_ctl` and the `Psr` owner (`enable` without
+activation, `pause`, `resume`, `disable`, and `wm_optimization_wa` for a
+watermark change while enabled). `VbtPsr::from_vbt` selects the port-A
+panel's PSR facts (LFP2 for an LFP2 child, index fallback 0, 0xFF refused);
+probe installs them with `install_vbt` (`VbtPsr::Missing` without a VBT,
+which refuses PSR as Linux does) and `installed_vbt` reads them. KMS reaches
+the panel through four `Platform` hooks, all inert by default:
+`psr_timing`, `psr_aux`, `psr_wm_level_disabled` and `psr_vbt`. A latched
+`present` enables PSR once, disabling FBC first. Qualification checks the
+VBT before any sink access and re-proves the programmed Pipe-A watermarks
+before reading the provider. Every session start pauses and waits for idle.
+The `Guard` drop re-arms once the session's frame changes have latched. A
+staged primary image sets `LATENCY_REPORTING_REMOVED` before it latches when
+its `wm_level_disabled` is true; a completed (or rolled-back) one clears it
+when false. Console and surface restore, legacy drain and recovery disable
+it. `register_wm_level_disabled(Some(provider))` installs the Wa_14015648006
+input; without a provider or a proved value PSR is refused.
+
+`intel_gpu_xelpg_wm::check_vblank` returns the pipe's `wm_level_disabled`
+(`skl_wm_check_vblank`), and `wm_level_disabled(timing, latency, wm0_lines)`
+computes it alone. `publish_pipe_a` records the Pipe-A value for the
+watermarks a resource owner just proved programmed (`None` while unproved),
+`pipe_a_wm_level_disabled` is the provider, and `register_psr_provider`
+registers it; display-14 KMS install calls it.
+`intel_gpu_display_resources::Profile` carries `wm_level_disabled`; every
+profile capture and `Primary` check, complete, rollback, stage and restore
+publishes the programmed value or "unknown", and `Primary` exposes
+`wm_level_disabled`, `pending_tile4` and `current_wm_level_disabled`.
 - KMS install creates the service. The GT publication hook acquires, loads
   and releases. `quiesce_for_legacy` brackets system-suspend preparation.
 

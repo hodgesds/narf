@@ -629,7 +629,11 @@ Composition points and named omissions:
   enable is Gen12-only (its PSR2_CTL layout is not display
   14's), and PSR1 is driven by the KMS owner through
   `intel_gpu_psr` (§20, "Display-14 PSR1 under KMS
-  ownership"). Selective fetch and Panel Replay are not
+  ownership"). That owner, unlike this module, reads the
+  VBT: eDP PSR needs the panel's VBT `psr.enable` and
+  takes the VBT TP wake times and idle frames (§20,
+  "Display-14 PSR inputs, VBT gate and off-path FBC
+  carve"). Selective fetch and Panel Replay are not
   offered on display 14.
 - On display 14, `notify_scanout_dirty` takes a DC_off
   reference (§12.1) before `EDP_RUNTIME` and releases it
@@ -973,7 +977,10 @@ guards, display recovery, format refresh, the MTL modeset (a failed DC exit is
 `ModesetError::PowerWellTimeout`), PSR scanout notifications (a failed DC exit
 is `PsrError::Unavailable`) and every full-AUX panel-backlight conversation
 (AUX transaction, PPS gate, relight step; AUX_A is a DC_off domain, and a
-refused reference reads as unavailable). System suspend preparation takes the Suspend
+refused reference reads as unavailable). The off-path FBC carve job (§20) holds
+none: it reads only GGC, `STOLEN_RESERVED`, the media `GMD_ID` and
+`GSCPSMI_BASE` and GGTT PTEs, which are GT-side registers, and each survey
+chunk runs under the KMS mutex. System suspend preparation takes the Suspend
 reference before the external, KMS and backlight quiesce. Once that succeeds it
 disables the program; a failed preparation drops the reference again. The first
 publication after resume reloads the retained container before release. Any
@@ -2366,11 +2373,11 @@ production feature. Unsupported functionality remains unadvertised.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire; GSC-loaded HuC, GT1 engine-cycles/topology queries and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20), gated on the watermark lane's Wa_14015648006 input; TBT, HDMI FRL, UHBR, multi-pipe, PSR2 selective fetch and Panel Replay open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; TBT, HDMI FRL, UHBR, multi-pipe, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region and boot-framebuffer pages, proven outside system RAM; PSR1 wins over FBC while enabled (Wa_14016291713, no stepping readout); color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR1 wins over FBC while enabled (Wa_14016291713, no stepping readout); color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -4299,3 +4306,103 @@ traffic, and no PSR register is written. The Gen12 probe-time PSR now skips
 only display 14. Integration named the Wa_14015648006 provider type
 (`WmLevelProvider`) and two fixture tuple types for Clippy. The debug group
 pass is deferred to the end of the current integration wave.
+
+### Display-14 PSR inputs, VBT gate and off-path FBC carve — release gates recorded
+
+This slice joins the display-14 power pieces so that PSR1 can run on
+hardware, and clears four review follow-ups. It supersedes the "No VBT" and
+"Gated input" bullets of the PSR1 subsection above.
+
+The Wa_14015648006 input now exists. The display-14 watermark code computes
+`skl_wm_check_vblank`'s `wm_level_disabled` where it computes the levels.
+The value is true when the highest level whose prefill fits vblank is below
+level 5. Zero-latency levels are skipped as Linux skips them, so a latency
+table that ends early also reports true. The owned Pipe-A profile records the value for its
+layout (linear/X or Tile4), from the same primary and always-budgeted cursor
+lines the transaction's vblank check used. Every proof that the Pipe-A
+watermarks are programmed publishes the value: profile capture, and the
+retained primary owner's check, complete and rollback. A transaction about
+to write, a pending image or a failed proof publishes "unknown". Display-14
+KMS install registers the publication as PSR's provider, and PSR
+qualification re-proves the programmed watermarks just before reading it, so
+the answer is never stale. While PSR is enabled, a staged Tile4 or linear
+primary image applies `wm_optimization_wa` as Linux's pre- and post-plane
+updates do: the bit is set before a disabling image latches and cleared
+after a full-level one; a rolled-back stage restores the current value.
+
+eDP PSR is now gated on the VBT as `psr_global_enabled` does. The panel is
+`get_panel_type`'s VBT index for the port-A child (`panel_type2` for an LFP2
+handle), falling back to 0. Its `psr.enable` must be set. Without a VBT,
+Linux leaves `psr.enable` false: `init_vbt_missing_defaults` sets no panel
+PSR fact, and the feature blocks that would set it are absent. PSR is
+therefore refused without a VBT, replacing the earlier `psr_safest_params`
+behaviour. A 0xFF panel type
+is refused because PnP-ID matching is not implemented. The refusal comes
+before any sink or source access and is retried at each latch. The TP1 and
+TP2/TP3 wake times and the idle-frame floor now come from the VBT's PSR
+table (`intel_psr1_get_tp_time`, `psr_compute_idle_frames`). With a VBT but
+no PSR block they are Linux's zeroed values. Probe installs these facts on
+Meteor Lake.
+
+PSR therefore enables on hardware when all of the following hold. The part
+is display 14 with the KMS-owned Pipe-A eDP, after its first latched KMS
+framebuffer. The OpRegion VBT enables PSR for the panel. The sink reports
+PSR without the `NO_PSR` quirk and has `SET_POWER_CAP`. The timing is
+progressive with a setup time that fits. The programmed Pipe-A watermarks are
+the ones the owned modeset computes: profile capture needs display 14.00,
+pipes B–D off, and the joined single-pipe DDB, DBUF, MBUS, PM demand and
+CDCLK it expects. No PSR error is latched, `GEN8_DE_EDP_PSR` cannot reach the
+CPU, and no PSR was inherited. With firmware-programmed watermarks that differ
+from NARF's, or with an external pipe lit, PSR stays refused with
+`WmLevelUnknown` and is retried at each latch.
+
+The FBC CFB carve no longer runs in `Guard::present`. A resumable
+`stolen::Carve` reads at most 1024 GGTT entries per step. A spawned job
+holds the KMS mutex for each step and yields between steps, then places the
+CFB outside the mutex. The present path only polls a non-blocking
+`CarveSlot`: while the job runs FBC stays off and is not refused, and the
+next eligible latch after it finishes activates FBC. Lost access abandons the
+job, and the next latch launches it again. The survey stays valid because
+this driver never writes a DM PTE.
+
+The Wa_14019821291 GSC carve now follows Linux's
+`media_gt && XE_GT_WA(media_gt, 14019821291)`. It applies only when the media
+`GMD_ID` names a media GT that `xe_pci.c` would create, in 13.00–20.00
+(13.00, 13.01 or 20.00). Otherwise `GSCPSMI_BASE` is neither read nor used.
+
+The SAGV fixture now pins Linux's uncontrolled case of exactly one QGV point.
+Zero points stays NARF policy and is documented as a divergence. Linux would
+report SAGV as enabled and fail every SAGV-capable state in
+`mtl_find_qgv_points`; NARF keeps SAGV masked, which can cost power but
+never refuses a display configuration.
+
+Fixtures, not executed in this slice. New in `drivers/gpu/intel_gpu_xelpg_wm`:
+`smoke_xelpg_wm_level_disabled_follows_skl_wm_check_vblank`,
+`smoke_xelpg_wm_check_vblank_returns_its_level_decision`,
+`smoke_xelpg_wm_profile_value_matches_transaction_vblank_check` and
+`smoke_xelpg_wm_pipe_a_provider_publishes_and_registers`. New in
+`drivers/gpu/intel_gpu_psr`: `smoke_psr_vbt_gate_precedes_every_other_check`,
+`smoke_psr_vbt_wakeup_times_and_idle_frames_reach_psr_ctl`,
+`smoke_psr_vbt_facts_follow_intel_bios_init_panel`,
+`smoke_psr_wm_optimization_wa_follows_pre_and_post_plane_update`, and on the
+production `Device`/`Guard` path
+`smoke_psr_kms_production_wm_provider_qualifies_and_enables`,
+`smoke_psr_kms_wm_level_disabled_takes_wa_14015648006`,
+`smoke_psr_kms_vbt_refusal_precedes_sink_and_source` and
+`smoke_psr_kms_vbt_wakeup_times_reach_psr_ctl`. New in
+`drivers/gpu/intel_gpu_stolen`:
+`smoke_stolen_carve_survey_is_chunked_and_places_like_one_shot`,
+`smoke_stolen_carve_slot_polls_without_blocking` and
+`smoke_stolen_gsc_carve_follows_media_gt_workaround`. New in
+`drivers/gpu/intel_gpu_fbc`:
+`smoke_fbc_kms_present_only_polls_carve_and_activates_after_it`. The
+existing PSR fixtures now pass a VBT that enables PSR with 2500 µs wake
+times, so their expected `PSR_CTL` values are unchanged.
+`smoke_xelpg_wm_latency_adjust_read_and_sagv_block` now uses one QGV point
+and keeps zero points as the policy case.
+
+Remaining: EDID PnP-ID panel selection, so that a 0xFF VBT panel type can
+enable PSR, and a hardware run of the chain. The production carve job and
+the `Physical` VBT and provider hooks run only on hardware; the native
+fixtures model the `Carve`, `CarveSlot`, provider and VBT facts they
+compose.
