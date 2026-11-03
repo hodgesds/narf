@@ -1167,8 +1167,19 @@ One written/unexecuted case in `drivers/wireless/brcmfmac/vif`
 SDIO and PCIe seam families): create, per-interface dcmds, an Open join
 whose dcmds go to ifidx 2 with `bsscfg:wpa_auth` at bsscfg 3, link
 events from bsscfg 3 only, no primary link/event disturbance, and a
-secondary DEAUTH closing only the secondary port. No real PCIe msgbuf
-secondary-ifidx (flow create/delete, events, IOCTL) fixture exists yet.
+secondary DEAUTH closing only the secondary port. The BCM43602
+CR4/msgbuf model (`station_model.rs`: IF ADD/DEL for ifidx 1 bsscfg 1,
+per-IOCTL `msg.ifidx`, per-flow creating ifidx) backs
+`smoke_brcmf_msgbuf_secondary_ifidx_ioctl_events_flows_and_removal`
+(`vif_msgbuf_tests.rs`, written/unexecuted): IF registration on ifidx 0
+with `BRCMF_E_IF` in the written mask, a secondary IOCTL with
+`msg.ifidx` 1 completed with a zero completion ifidx, a bsscfg-1 event
+reaching only its entry, a secondary flow ring sourced from the VIF
+address, and removal while that flow is live (IF DEL on ifidx 1, flow
+deleted after its TX status). Mock-seam cases (both families, written/
+unexecuted): `smoke_brcmf_vif_event_mask_is_the_union_of_live_owners`
+(primary STA + secondary AP need, roam-policy rewrite, removal) and
+`smoke_brcmf_vif_primary_ap_keeps_secondary_station_events`.
 
 #### Secondary AP role
 

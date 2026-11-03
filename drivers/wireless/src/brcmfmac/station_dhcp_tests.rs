@@ -36,6 +36,8 @@ mod prefix_station_tests;
 mod scan_ies_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
+#[path = "vif_msgbuf_tests.rs"]
+mod vif_msgbuf_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 

@@ -13,6 +13,8 @@ pub(crate) mod sdio_ap;
 
 pub(crate) const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 pub(crate) const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
+/// Address of the modeled secondary interface (IF ADD event address).
+pub(crate) const VIF: [u8; 6] = [6, 6, 7, 8, 9, 10];
 pub(crate) type TestAdapter = Adapter<Model>;
 
 pub(crate) fn network_plan() -> NetworkPlan {
@@ -42,6 +44,8 @@ struct Flow {
     address: u64,
     read: u16,
     depth: u16,
+    /// Creating request's `msg.ifidx`.
+    ifidx: u8,
 }
 pub(super) struct Firmware {
     ap: Option<ap_model::Profile>,
@@ -181,7 +185,10 @@ impl Firmware {
     pub(super) fn flow(&mut self, descriptor: &[u8]) {
         if descriptor[0] == 3 {
             let id = u16::from_le_bytes(descriptor[22..24].try_into().unwrap());
-            if self.ap.is_none() {
+            if descriptor[1] != 0 {
+                // A secondary interface's flow carries its own address.
+                assert_eq!(&descriptor[14..20], &VIF);
+            } else if self.ap.is_none() {
                 assert_eq!(&descriptor[14..20], &OWN);
             } else {
                 assert_ne!(&descriptor[14..20], &[0; 6]);
@@ -197,6 +204,7 @@ impl Firmware {
                     address: u64::from_le_bytes(descriptor[32..40].try_into().unwrap()),
                     read: 0,
                     depth: u16::from_le_bytes(descriptor[28..30].try_into().unwrap()),
+                    ifidx: descriptor[1],
                 },
             );
             self.creates += 1;
@@ -293,6 +301,17 @@ impl Firmware {
                 || input.starts_with(b"txbf_bfr_cap\0")
                     && self.vht.as_ref().is_some_and(|p| p.txbf[1].is_none()));
         match command {
+            // fweh `BRCMF_E_IF` (`struct brcmf_if_event`) for the one
+            // modeled secondary STA interface: ifidx 1, bsscfg 1.
+            262 if input.starts_with(b"interface_create\0") => {
+                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, 0]);
+                Vec::new()
+            }
+            263 if input.starts_with(b"bsscfg:interface_remove\0") => {
+                assert_eq!(&input[24..28], &1u32.to_le_bytes());
+                self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, 0]);
+                Vec::new()
+            }
             1 => 2u32.to_le_bytes().to_vec(),
             23 => {
                 if self.mfp_fault == 3 || self.phy_profile.is_some_and(|p| p.1 == 6) {
@@ -691,6 +710,20 @@ impl Firmware {
                     || self.wide.as_ref().is_some_and(|w| {
                         w.fault == crate::cyw43439::phy_fixture::WideFault::HoldResponse
                     }) && input.starts_with(b"assoc_resp_ies\0"))
+    }
+    /// Event addressed to firmware interface (ifidx, bsscfgidx).
+    pub(super) fn event_on(
+        &mut self,
+        kind: u32,
+        (ifidx, bsscfg): (u8, u8),
+        source: [u8; 6],
+        data: &[u8],
+    ) {
+        self.event(kind, 0, 0, data);
+        let bytes = self.events.back_mut().unwrap();
+        bytes[48..54].copy_from_slice(&source);
+        bytes[70] = ifidx;
+        bytes[71] = bsscfg;
     }
     fn event(&mut self, kind: u32, status: u32, flags: u16, data: &[u8]) {
         let mut bytes = vec![0; 72 + data.len()];
@@ -1103,6 +1136,46 @@ impl Handle {
     }
     pub(crate) fn hold_wide_bandwidth(&self) {
         self.change(|f| f.bandwidth_stuck = true);
+    }
+    /// Secondary-interface event from the firmware (`if_idx`/`bsscfg_idx`).
+    pub(crate) fn secondary_event(&self, kind: u32, flags: u16, source: [u8; 6]) {
+        self.change(|f| {
+            f.event_on(kind, (1, 1), source, &[]);
+            f.events.back_mut().unwrap()[26..28].copy_from_slice(&flags.to_be_bytes());
+        });
+    }
+    /// `msg.ifidx` of each IOCTL request, parallel to [`Self::commands`].
+    pub(crate) fn command_ifidx(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .command_ifidx
+            .clone()
+    }
+    /// Live flow rings as (flow id, creating `msg.ifidx`).
+    pub(crate) fn flow_ifidx(&self) -> Vec<(u16, u8)> {
+        let state = self.0.lock();
+        let station = state.firmware.as_ref().unwrap().station.as_ref().unwrap();
+        station
+            .flows
+            .iter()
+            .map(|(&id, flow)| (id, flow.ifidx))
+            .collect()
+    }
+    /// Uplink frames the firmware consumed, in order.
+    pub(crate) fn uplink_frames(&self) -> Vec<Vec<u8>> {
+        let state = self.0.lock();
+        state
+            .firmware
+            .as_ref()
+            .unwrap()
+            .station
+            .as_ref()
+            .unwrap()
+            .uplink
+            .clone()
     }
     pub(crate) fn commands(&self) -> Vec<(u32, Vec<u8>, u16)> {
         self.0.lock().firmware.as_ref().unwrap().commands.clone()

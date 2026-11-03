@@ -27,6 +27,8 @@ struct Firmware {
     completion_write: u16,
     responses: VecDeque<(u32, u64)>,
     commands: Vec<(u32, Vec<u8>, u16)>,
+    /// `msg.ifidx` of each IOCTL request, parallel to `commands`.
+    command_ifidx: Vec<u8>,
     station: Option<station_model::Firmware>,
 }
 #[derive(Default)]
@@ -418,6 +420,7 @@ fn firmware_step(state: &mut State) {
                 let input_dma = u64::from_le_bytes(descriptor[24..32].try_into().unwrap());
                 let input = state.dma[&input_dma][..usize::from(input_len)].to_vec();
                 firmware.commands.push((command, input.clone(), output_len));
+                firmware.command_ifidx.push(descriptor[1]);
                 let response = if let Some(station) = firmware.station.as_mut() {
                     station.command(command, &input, output_len)
                 } else {
