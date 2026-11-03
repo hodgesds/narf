@@ -364,7 +364,7 @@ fn inherited_ddi_ctl(port: XeLpgPort) -> Option<u64> {
     match port {
         XeLpgPort::A => Some(0x64000),
         XeLpgPort::B => Some(0x64100),
-        XeLpgPort::Tc1 | XeLpgPort::Tc2 => None,
+        XeLpgPort::Tc1 | XeLpgPort::Tc2 | XeLpgPort::Tc3 | XeLpgPort::Tc4 => None,
     }
 }
 
