@@ -26,6 +26,7 @@ pub mod native;
 pub mod pio;
 pub mod sdhci;
 pub mod sdio;
+pub mod source;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

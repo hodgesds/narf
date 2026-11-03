@@ -1942,6 +1942,83 @@ pending. Primary reference: local Linux7.3-rc4
 `mac80211/{tx.c,rx.c}`. Source hashes and exact selected-image evidence are
 preserved with the source handoff.
 
+### Receive-only RTL8852B monitor (implemented, acceptance pending)
+
+The admitted RTL8852B channel1/20MHz full-radio owner now exposes the existing
+shared monitor interface: down-only `SET_INTERFACE` station2/monitor6,
+`SET_WIPHY` with exact2412/20NOHT-or20/center2412 geometry, and AF_PACKET raw
+radiotap ingress. Monitor advertisement appears only after this actual
+owner has completed full-radio admission. Explicit CONTROL/OTHER_BSS flags
+are supported by the receive profile; bad-FCS/bad-PLCP/cooked/active/injection
+requests are refused. Other channels, widths and chips keep their separate
+rows. Station scan/association/configuration, Ethernet TX/rings, power-save,
+packet peers, keys and packet-TX Core cannot become monitor authority.
+
+`monitor::Desired` retains only mode metadata and a monotonic role generation
+in the actual physical supervisor. A down-only mode change closes the old
+admission before changing representation. The supervisor retires the original
+station/key/queue owner, retains uncertain DMA, earns its actual stop/FLR fence
+and starts a fresh qualified physical generation with the same interface
+name. The retiring original shell may acknowledge the exact fixed ch1/20
+channel metadata immediately after the mode ACK, using its retained sealed
+registration/UP event; it cannot follow a replacement registration. No lookup,
+retune, new grant or native readiness is implied by either ACK. DOWN retires capture synchronously;
+UP on that old owner never revives it. A replacement registration must bind
+its own concrete receiver, observe its own actual administrative UP (including
+an actual preserved-UP rebind) and complete independent native receipts.
+
+The same retained `Startup/Firmware/Native` configures firmware role MONITOR7,
+SELF_ROLE_NONE0 and disconnected NoLink, with actual MACID-unpause applied
+state, role/JOININFO/CAM/default-CCTL DONE receipts. Before role, port,
+filter, crypto or PHYSTS changes it proves actual CMAC TX bit29 is disabled;
+it remains disabled through capture and stop. Sniffer mode forwards management,
+control and data to host with address/BSSID/CAM filtering relaxed, error-frame
+and hardware-decryption paths closed, source AX PHYSTS IE09/IE10/IE13/IE20
+page programming and masked/full readbacks. No packet-TX owner is installed.
+The original admission and disabled-CMAC-TX readback also enclose final native
+CH12 descriptor/doorbell publication after credit/command waits. Polled
+capture checks actual HALT/WDT status even without an MSI binding.
+
+The receive-only mode performs no RF retune, new calibration, injection or
+autonomous response. It retains the completed original base full-RFK/channel,
+firmware/device and current host/power proof throughout. Existing N52B/A/T/P
+bytes and program fingerprints are unchanged. No new measured-peak companion
+is required for parsing/capture: this separate nonemitting mode contract
+cannot expand or reinterpret any emitter grant. If a future transition changes
+an emitting/calibration program it needs that actual program's admission.
+
+Before opening its private capture epoch, the Native reads actual pathA/B
+legacy/direct RF channel registers0x18/0x10018 and proves the occupied
+channel1/20MHz configuration, then retires a bounded actual completed RX
+prefix, including partial/dropped progress and pre-start copied events.
+Only that same Native can mint the original fixed capture source. RXBD/RXD
+assembly preserves original MPDUs, strips exactly four actual FCS bytes,
+accepts ten-octet ACKs and keeps protected ciphertext raw. CRC/ICV failures,
+hardware-decrypted/A-MSDU-cut bytes and unsupported PHY layouts are dropped.
+Radiotap includes the sealed actually observed channel and original frame
+flags. Uncorrelated PHY signal/rate/GI/TSF metadata is omitted; PHYSTS from
+another PPDU is never attached to a frame.
+
+The worker begins the existing `MonitorRxToken` only after native receipts
+and a recheck of the original actual registration/UP event outside Native
+locks. It formats copied frames after releasing lifecycle/native locks, then
+reinvokes the fixed original device/base source, role/admission/capture epoch
+and exact provider token immediately around raw ingress. No Ethernet/IP
+fallback or name/namespace rebind occurs. DOWN, mode/source loss, fatal RX,
+removal and cancellation close epochs; nonemitting device-only cleanup remains
+available after RF source loss, and uncertain published mappings stay retained.
+
+Four new source cases cover literal role/filter/PHYSTS/crypto receipts and
+readback/ACK/source failures, actual Native/NativeIo no-TX/owner/queue boundaries,
+actual RXBD/FCS/control/protected/error admission, public monitor flags/channel/
+UP/raw-socket delivery and injection refusal, original source retirement,
+DOWN/UP nonrevival, fresh registration/copy ownership and monotonic role
+selection. Inert RAM, authenticated-record/full-RFK and RF-observation fixture
+boundaries confer no real attach or measurement. All prior registrations are
+retained. Release metadata, native two-architecture and physical validation
+remain pending. Primary source: local Linux7.3-rc4 `rtw89/{mac80211,core,mac,
+phy,fw,cam,txrx,reg}.c/.h`; exact hashes accompany the handoff.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -2069,7 +2146,7 @@ triage above remains separate from implementation.
 | `five_ghz_operation` | RTL8852B supports5GHz, but the retained radio/power recipe and station admission select the channel1 2.4GHz program. Native5GHz RF/BB/power setup, permitted scan/retune and exact signed operating programs remain missing; discovery of the band alone grants no station profile. |
 | `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
 | `fragmentation` | Native packet admission still refuses nonzero fragment numbers/More-Fragments. Host split/reassembly, per-fragment PN and terminal receipt ownership, bounded reassembly lifetimes and matching signed emission programs must be added; the shared fragmentation-threshold control API alone does not implement them. |
-| `monitor_mode` | The retained station facade has no native monitor transition or raw/radiotap publication owner. It needs original MPDUs plus actual PHY-status/PPDU metadata and generation-fenced capture under the shared monitor/AF_PACKET API, with station/key/queue teardown before mode changes. |
+| `monitor_mode` | The admitted RTL8852B receive-only role/native/raw-radiotap owner is implemented in §3 with original source/registration/role/capture epochs, actual RF channel/PHYSTS program and fresh physical transitions. Four source cases and software/native/physical acceptance are pending; no active/injection or other chip/channel/width profile is claimed. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
 | `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |

@@ -80,6 +80,7 @@ pub mod iovar;
 pub mod runtime;
 pub mod sdio;
 pub mod sdio_bridge;
+mod sdio_passive;
 pub mod sdpcm;
 pub mod station;
 pub mod telemetry;

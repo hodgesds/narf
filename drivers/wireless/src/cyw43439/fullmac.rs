@@ -183,6 +183,15 @@ pub trait Fullmac: Send {
     }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
+    async fn stop_transport(&mut self) -> Result<(), Error> {
+        Runtime::stop_transport(self)
+    }
+    fn release_transport(&mut self) -> bool {
+        Runtime::release_transport(self)
+    }
+    fn transport_failed(&self) -> bool {
+        Runtime::is_failed(self)
+    }
     const FAMILY: Family = Family::Sdio;
     const EXTERNAL_CLM: bool = true;
     fn command<'a>(

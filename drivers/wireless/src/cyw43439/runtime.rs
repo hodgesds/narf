@@ -48,7 +48,8 @@ struct Pending {
 /// One interface (firmware ifidx zero), with no aggregation or firmware
 /// signalling offload. A caller serializes access with an async mutex.
 pub struct Runtime<T: PacketTransport> {
-    transport: T,
+    transport: Option<T>,
+    stopped: bool,
     tx_sequence: u8,
     tx_max: u8,
     flow_control: u8,
@@ -62,6 +63,17 @@ pub struct Runtime<T: PacketTransport> {
     data: VecDeque<Vec<u8>>,
     failed: bool,
     vendor: super::fullmac::FirmwareVendor,
+}
+impl<T: PacketTransport> Drop for Runtime<T> {
+    fn drop(&mut self) {
+        if !self.stopped {
+            // A dropped operation/runtime is no native device-stop receipt.
+            // Keep the original host/card/register owner pinned on uncertainty.
+            if let Some(transport) = self.transport.take() {
+                core::mem::forget(transport);
+            }
+        }
+    }
 }
 impl<T: PacketTransport> core::fmt::Debug for Runtime<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -78,7 +90,8 @@ impl<T: PacketTransport> Runtime<T> {
     /// zero: a real firmware SDPCM header must grant the initial TX window.
     pub fn new(transport: T) -> Self {
         Self {
-            transport,
+            transport: Some(transport),
+            stopped: false,
             tx_sequence: 0,
             tx_max: 0,
             flow_control: 0,
@@ -111,6 +124,35 @@ impl<T: PacketTransport> Runtime<T> {
 
     pub fn fail(&mut self) {
         self.failed = true;
+    }
+
+    /// Close ordinary work first and retain the original transport through
+    /// the full actual native receipt chain, even after a protocol failure.
+    pub(crate) fn stop_transport(&mut self) -> Result<(), Error> {
+        self.failed = true;
+        if self.stopped {
+            return Ok(());
+        }
+        self.transport
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .confirmed_stop()?;
+        self.stopped = true;
+        self.pending = None;
+        self.response = None;
+        self.events.clear();
+        self.data.clear();
+        Ok(())
+    }
+    pub(crate) fn release_transport(&mut self) -> bool {
+        if !self.stopped {
+            return false;
+        }
+        // Every native PIO borrow ended before its synchronous command
+        // returned. The complete stop proof, not that fact alone, permits
+        // dropping this original Card/register owner now.
+        drop(self.transport.take());
+        true
     }
 
     /// Install the station's negotiated AC rank map. SDPCM `fc_mask` bits
@@ -148,21 +190,28 @@ impl<T: PacketTransport> Runtime<T> {
         } else {
             // The SDIO IRQ thread re-enables the card interrupt after its
             // function handlers ran; a still-asserted line fires again.
-            self.transport.interrupt_serviced();
+            self.transport
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .interrupt_serviced();
             if result == Ok(0) {
-                self.transport.idle();
+                self.transport.as_mut().ok_or(Error::Failed)?.idle();
             }
         }
         result
     }
     pub fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
-        self.transport.interrupt()
+        self.transport.as_ref()?.interrupt()
     }
 
     fn poll_inner(&mut self) -> Result<usize, Error> {
         let mut bytes = vec![0; MAX_PACKET];
         for count in 0..RECEIVE_BUDGET {
-            let length = self.transport.receive_packet(&mut bytes)?;
+            let length = self
+                .transport
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .receive_packet(&mut bytes)?;
             if length == 0 {
                 return Ok(count);
             }
@@ -354,7 +403,13 @@ impl<T: PacketTransport> Runtime<T> {
             .encode(),
         );
         loop {
-            match transaction.runtime.transport.transmit_packet(&request) {
+            match transaction
+                .runtime
+                .transport
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .transmit_packet(&request)
+            {
                 Ok(()) => break,
                 Err(super::TransportError::Busy) => {
                     transaction.runtime.poll()?;
@@ -418,7 +473,12 @@ impl<T: PacketTransport> Runtime<T> {
         );
         bytes[12..16].copy_from_slice(&[0x20, priority, 0, 0]);
         bytes[16..length].copy_from_slice(ethernet);
-        if let Err(error) = self.transport.transmit_packet(&bytes) {
+        if let Err(error) = self
+            .transport
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .transmit_packet(&bytes)
+        {
             if error == super::TransportError::Busy {
                 return Err(Error::Busy);
             }

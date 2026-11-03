@@ -26,6 +26,27 @@ mod tx_amsdu;
 /// actual hardware publication, including after an asynchronous wait.
 #[async_trait::async_trait]
 pub(super) unsafe trait Io: Send {
+    fn monitor_capable(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    fn monitor_active(&self) -> bool {
+        false
+    }
+    // Default-unsupported receive-only owner. These methods never construct
+    // an ordinary packet Core or permit injection/autonomous responses.
+    async fn monitor_start(
+        &mut self,
+        _: Arc<super::monitor::Desired>,
+        _: Admission,
+    ) -> Result<super::monitor::Source, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn monitor_poll(&mut self) -> Result<Vec<Vec<u8>>, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn monitor_stop(&mut self) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     fn station_allowed(&mut self) -> Result<(), power::Error>;
     fn station_own(&mut self) -> Result<[u8; 6], power::Error>;
     fn station_wmm_allowed(&mut self) -> Result<bool, power::Error> {

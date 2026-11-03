@@ -34,6 +34,11 @@ pub trait Registers {
     fn host_identity(&self) -> Option<HostIdentity> {
         None
     }
+    /// Opaque original native host receipt; no caller validator or lookup.
+    /// Card adds its own actual Controller/Card lifetimes before use.
+    fn source(&self) -> Option<crate::source::Source> {
+        None
+    }
     fn read8(&mut self, offset: u32) -> u8;
     fn read16(&mut self, offset: u32) -> u16;
     fn read32(&mut self, offset: u32) -> u32;
@@ -79,6 +84,12 @@ impl Data<'_> {
 pub struct Controller<R: Registers> {
     io: R,
     failed: bool,
+    live: alloc::sync::Arc<crate::source::Lifetime>,
+}
+impl<R: Registers> Drop for Controller<R> {
+    fn drop(&mut self) {
+        self.live.retire();
+    }
 }
 impl<R: Registers> core::fmt::Debug for Controller<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -92,7 +103,17 @@ impl<R: Registers> Controller<R> {
     /// Caller has exclusively mapped/reset the controller, established
     /// power/clock and left DMA disabled. This value owns every command.
     pub fn new(io: R) -> Self {
-        Self { io, failed: false }
+        Self {
+            io,
+            failed: false,
+            live: crate::source::Lifetime::new(),
+        }
+    }
+    pub(crate) fn source(&self) -> Option<crate::source::Source> {
+        if self.failed {
+            return None;
+        }
+        self.io.source()?.retain_controller(&self.live)
     }
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -170,6 +191,7 @@ impl<R: Registers> Controller<R> {
         }
         let result = self.execute_inner(command, argument, response, &mut data, shape);
         if result.is_err() {
+            self.live.retire();
             self.failed = true;
         }
         result

@@ -1258,6 +1258,22 @@ unsafe impl Registers for Native {
         self.packet_gate = Some(self.packet_gate.as_ref().ok_or(Error::State)?.with_ht(g)?);
         Ok(())
     }
+    fn station_bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        if !self.packets_ready() || self.mailbox_pending || self.command_ring.pending() {
+            return Err(Error::State);
+        }
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_host(host)?,
+        );
+        Ok(())
+    }
     fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
         self.station_allowed()?;
         if self.state != State::Packets || self.mailbox_pending || self.command_ring.pending() {

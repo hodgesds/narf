@@ -18,6 +18,8 @@ pub enum PowerError {
     UnsupportedChip,
     UnknownCut,
     BadCommand,
+    StateReadback,
+    Access,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -30,6 +32,9 @@ pub(super) struct Command {
 }
 
 pub(super) trait Io {
+    fn permission(&mut self) -> bool {
+        true
+    }
     fn read8(&mut self, addr: u64) -> u8;
     fn write8(&mut self, addr: u64, value: u8);
     fn read16(&mut self, addr: u64) -> u16;
@@ -71,6 +76,9 @@ impl Io for Mmio<'_> {
 
 fn commands(io: &mut impl Io, cut: u8, rows: &[Command]) -> Result<(), PowerError> {
     for row in rows {
+        if !io.permission() {
+            return Err(PowerError::Access);
+        }
         if row.op == 4 {
             return Ok(());
         }
@@ -86,17 +94,26 @@ fn commands(io: &mut impl Io, cut: u8, rows: &[Command]) -> Result<(), PowerErro
             }
             2 => {
                 if !io.poll8(addr, row.mask, row.value) {
+                    if !io.permission() {
+                        return Err(PowerError::Access);
+                    }
                     // Linux retries PCI polling after toggling PFM_WOWL.
                     let value = io.read8(REG_SYS_PW_CTRL);
                     io.write8(REG_SYS_PW_CTRL, value | (1 << 3));
                     io.write8(REG_SYS_PW_CTRL, value & !(1 << 3));
                     if !io.poll8(addr, row.mask, row.value) {
+                        if !io.permission() {
+                            return Err(PowerError::Access);
+                        }
                         return Err(PowerError::Timeout);
                     }
                 }
             }
             3 => io.delay_us(addr * if row.value == 0 { 1 } else { 1000 }),
             _ => return Err(PowerError::BadCommand),
+        }
+        if !io.permission() {
+            return Err(PowerError::Access);
         }
     }
     Err(PowerError::BadCommand)
@@ -136,6 +153,18 @@ fn switch(
 }
 
 pub(super) fn power_on_with(io: &mut impl Io, did: u16) -> Result<(), PowerError> {
+    power_on_mode(io, did, false)
+}
+/// Operating recovery must observe an actual active-to-off transition. An
+/// already-off CR cannot supply that receipt. The caller has proved that
+/// the original native DMA/IRQ producers have retired before entering here.
+pub(super) fn reset_with(io: &mut impl Io, did: u16) -> Result<(), PowerError> {
+    power_on_mode(io, did, true)
+}
+fn power_on_mode(io: &mut impl Io, did: u16, reset: bool) -> Result<(), PowerError> {
+    if !io.permission() {
+        return Err(PowerError::Access);
+    }
     let (on1, on2, off1, off2, sys_func) = match did {
         RTL_DEV_8821CE => (
             TRANS_CARDDIS_TO_CARDEMU_8821C,
@@ -169,14 +198,23 @@ pub(super) fn power_on_with(io: &mut impl Io, did: u16) -> Result<(), PowerError
         return Err(PowerError::UnknownCut);
     }
     let cut_mask = 1u8 << (cut + 1);
+    if reset && io.read8(REG_CR) == 0xea {
+        return Err(PowerError::StateReadback);
+    }
     pre_system(io);
     // Linux cycles an already-powered card through the real disable flow
     // before replaying enable; it does not clear arbitrary PMU/CR bytes.
-    if io.read8(REG_CR) != 0xea {
+    if reset || io.read8(REG_CR) != 0xea {
         switch(io, cut_mask, off1, off2)?;
+        if reset && io.read8(REG_CR) != 0xea {
+            return Err(PowerError::StateReadback);
+        }
         pre_system(io);
     }
     switch(io, cut_mask, on1, on2)?;
+    if reset && matches!(io.read8(REG_CR), 0xea | 0xff) {
+        return Err(PowerError::StateReadback);
+    }
     let value = io.read32(0x1080);
     io.write32(0x1080, value | (1 << 16) | (1 << 8));
     let value = io.read8(REG_SYS_FUNC_EN + 1);
@@ -189,6 +227,9 @@ pub(super) fn power_on_with(io: &mut impl Io, did: u16) -> Result<(), PowerError
         let value = io.read32(0x40);
         io.write32(0x40, value & !(1 << 19));
     }
+    if !io.permission() {
+        return Err(PowerError::Access);
+    }
     Ok(())
 }
 
@@ -200,3 +241,125 @@ pub(super) fn power_on_with(io: &mut impl Io, did: u16) -> Result<(), PowerError
 pub unsafe fn power_on(mmio: &MmioRegion, did: u16) -> Result<(), PowerError> {
     power_on_with(&mut Mmio(mmio), did)
 }
+/// Fixed original native source, never a caller-provided validator. Denial
+/// sticks for the entire one-shot transition, including source loss in a wait.
+pub(super) struct RecoveryIo<'a> {
+    mmio: &'a MmioRegion,
+    device: &'a narf_bus::BusDevice,
+    cap: &'a narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    claim: &'a super::functions::ResetClaim,
+    denied: bool,
+}
+impl RecoveryIo<'_> {
+    fn access<T>(&mut self, op: impl FnOnce(&MmioRegion) -> T) -> Option<T> {
+        if self.denied {
+            return None;
+        }
+        let result = super::pci_park::invoke(self.cap, || {
+            self.claim.current()?;
+            let command = narf_bus::pci::read_command(self.cap, self.device).map_err(|_| ())?;
+            use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+            if command == u16::MAX
+                || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE
+            {
+                return Err(());
+            }
+            Ok(op(self.mmio))
+        });
+        match result {
+            Ok(Ok(value)) => Some(value),
+            _ => {
+                self.denied = true;
+                None
+            }
+        }
+    }
+}
+impl<'a> RecoveryIo<'a> {
+    /// # Safety
+    /// Exact exclusively reserved original BAR, following actual retirement.
+    pub(super) unsafe fn new(
+        mmio: &'a MmioRegion,
+        device: &'a narf_bus::BusDevice,
+        cap: &'a narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        claim: &'a super::functions::ResetClaim,
+    ) -> Self {
+        Self {
+            mmio,
+            device,
+            cap,
+            claim,
+            denied: false,
+        }
+    }
+}
+impl super::efuse::EfuseIo for RecoveryIo<'_> {
+    fn read8(&mut self, a: u64) -> u8 {
+        Io::read8(self, a)
+    }
+    fn read32(&mut self, a: u64) -> u32 {
+        Io::read32(self, a)
+    }
+    fn write8(&mut self, a: u64, v: u8) {
+        Io::write8(self, a, v);
+    }
+    fn write32(&mut self, a: u64, v: u32) {
+        Io::write32(self, a, v);
+    }
+}
+impl Io for RecoveryIo<'_> {
+    fn permission(&mut self) -> bool {
+        self.access(|_| ()).is_some()
+    }
+    fn read8(&mut self, a: u64) -> u8 {
+        self.access(|mmio| {
+            // SAFETY: retained exact-function BAR, native current source inside access.
+            unsafe { mmio.read8(a) }
+        })
+        .unwrap_or(u8::MAX)
+    }
+    fn read16(&mut self, a: u64) -> u16 {
+        self.access(|mmio| {
+            // SAFETY: same original bounded BAR and current source.
+            unsafe { mmio.read16(a) }
+        })
+        .unwrap_or(u16::MAX)
+    }
+    fn read32(&mut self, a: u64) -> u32 {
+        self.access(|mmio| {
+            // SAFETY: same original bounded BAR and current source.
+            unsafe { mmio.read32(a) }
+        })
+        .unwrap_or(u32::MAX)
+    }
+    fn write8(&mut self, a: u64, v: u8) {
+        self.access(|mmio| {
+            // SAFETY: same exclusive original BAR; denied sources never reach write.
+            unsafe { mmio.write8(a, v) }
+        });
+    }
+    fn write32(&mut self, a: u64, v: u32) {
+        self.access(|mmio| {
+            // SAFETY: same exclusive original BAR and current source.
+            unsafe { mmio.write32(a, v) }
+        });
+    }
+    fn delay_us(&mut self, us: u64) {
+        narf_scheduler::responsive_spin_until(|| !self.permission(), Deadline::after_us(us));
+    }
+    fn poll8(&mut self, a: u64, mask: u8, target: u8) -> bool {
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                if !self.permission() {
+                    return true;
+                }
+                self.read8(a) & mask == target & mask
+            },
+            Deadline::after_ms(1000),
+        );
+        done && self.permission()
+    }
+}
+#[cfg(feature = "kernel-test")]
+#[path = "power_reset_tests.rs"]
+pub(super) mod reset_tests;

@@ -34,6 +34,10 @@ fn make(protected: bool, mcs: u16, sgi: bool, peer_two: bool) -> Result<Case, &'
     let mut elements = cases::elements(true);
     if peer_two {
         elements[6] = 255;
+    } else {
+        // AP RX1SS, TX2SS: defined unequal TX/RX MCS and max TX NSS2.
+        // Our TX selection must narrow without erasing local RX2SS.
+        elements[17] = 7;
     }
     let beacon = {
         let mut peer = e.h.peer.lock();

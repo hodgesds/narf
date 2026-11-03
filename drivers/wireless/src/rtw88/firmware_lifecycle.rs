@@ -35,6 +35,7 @@ pub(super) struct Lifecycle<I: Io> {
     started: AtomicBool,
     /// Set by `remove`; no owner may be installed afterwards.
     removed: AtomicBool,
+    retirement_claimed: AtomicBool,
     pub(super) retained: Mutex<Option<Owner<I>>>,
     status: IrqSafeSpinLock<Status>,
     did: u16,
@@ -80,6 +81,7 @@ impl<I: Io> Lifecycle<I> {
         Self {
             started: AtomicBool::new(false),
             removed: AtomicBool::new(false),
+            retirement_claimed: AtomicBool::new(false),
             retained: Mutex::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
@@ -94,6 +96,16 @@ impl<I: Io> Lifecycle<I> {
     }
     pub(super) fn removed(&self) -> bool {
         self.removed.load(Ordering::Acquire)
+    }
+    /// A reset consumer may attempt original retirement once. Cancellation or
+    /// an unproven native stop cannot later turn an empty slot into a receipt.
+    pub(super) fn claim_retirement(&self) -> bool {
+        !self.removed()
+            && self
+                .retirement_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            && !self.removed()
     }
     /// Linux v7.2 `pci.c::rtw_pci_remove` for the retained owner: no later
     /// stage or initialization may start, the owner runs `rtw_pci_stop` and

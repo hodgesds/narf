@@ -44,6 +44,81 @@ per-domain IOMMU translation is rejected before allocation or MMIO.
 
 ## 3. Public interface
 
+`reset_function(BusAddr) -> Result<(), OperatingResetError>` recovers the
+original retained RTL8821CE/RTL8822CE station generation. It serializes with
+that function's provisioner, checks the original exact PCI identity/capability,
+then reserves the same BDF against ordinary probes and other resets. The old
+station may already have closed its port, but must still be its retained
+StationReady lifecycle; a previously removed/unproven lifecycle is rejected.
+It synchronously withdraws original admission, waits for unlocked native
+RX/stack callbacks, and uses the actual original lifecycle's TX-index/RXDMA
+idle proof before releasing its buffers. Only successful retirement produces
+the noncopyable one-use `Retired` precondition for native card recovery.
+
+Recovery follows Linux7.3-rc4 `main.c::rtw_core_stop`/`rtw_core_start` and
+`mac.c::rtw_mac_power_switch`: actual chip/cut-filtered card-disable and
+card-enable commands, including real source polls. It requires an active CR
+and refuses an unexpected already-off card before writes, checks CR0xea after
+disable and a non0xea/non0xff CR after enable, and keeps original PCI bus
+mastering and IRQ publication closed. It then rereads physical EFUSE and
+requires the same factory MAC/chip/BDF before constructing a fresh cold
+firmware shell. It grants no power/association right from BME closure alone.
+Every actual recovery power/factory MMIO access invokes the original PCI
+capability and reset reservation with actual parked PCI-command readback.
+Denial sticks for the whole one-shot sequence; waits break on source loss,
+and later retry/system/factory writes cannot proceed after cap revocation
+or hot removal. Existing failure cases revoke the actual cap or request
+function removal during a power poll and require no subsequent enable/setup.
+
+The original function reservation remains held throughout. Cancellation,
+failed native idle/power/identity receipts or hot removal quarantine it and
+prevent a fresh producer; removal racing reset is recorded before publication.
+Success publishes a fresh nonreused endpoint cookie and queues ordinary
+provisioning. That new generation must earn its own current firmware/hardware
+report, calibration, board-policy and optional continuation receipts. No old
+admission, key, PN, BA state, descriptor, interface handle or unlocked callback
+can become authority for it. Late old cleanup cannot remove the replacement.
+The cold shell has a newly reserved netdev name, and success does not await
+provisioning or associate automatically; callers can await `provision_function`
+and explicitly supply fresh association credentials. Stable-name reassociation
+uses `rejoin_function` below; system PM and credential replay remain separate
+work. Six source-written cases
+cover source power/false-state receipts, actual native firmware/CCMP/DHCP owner
+replacement and failed RXDMA, plus exact registry cancellation/hot removal.
+Their release/native execution and physical acceptance remain pending.
+
+`rejoin_function(BusAddr, AssociateRequest) -> Result<(), RejoinError>` adds
+explicit safe rejoin on the admitted C21/C22 channel1 Open/WPA2 profiles. It
+validates the caller's request before reset and keeps its PMK in zeroizing
+storage across pending reset/provisioning. It retires the original netdev for
+rebind only after all old unlocked ingress callbacks finish; the existing
+`net::iface` mechanism retains the exact name, ifindex, operator state,
+addresses and counters. The original endpoint cookie, registration and native
+source retire permanently. Ordinary reset still allocates a new name.
+
+Rejoin uses the confirmed native reset boundary above, then fresh ordinary
+firmware/calibration/policy provisioning and an actual fresh passive scan of
+the caller's BSS. The exact replacement function is checked across awaited
+steps, and its per-function provisioner excludes another reset through the
+new association. A new host key exchange and actual M4 terminal receipts
+open the port. No old credentials, supplicant, key, PN, BA agreement, grant
+object or descriptor is replayed. The caller explicitly supplies its Open or
+WPA2 request; automatic credential replay remains absent.
+
+Before scanning, the exact new registration's original UP observation binds
+a fixed weak, nonreviving native lifetime to its retained power Gate. This
+observation supplies no RF/device grant: original PCI/calibration/policy
+invocations remain mandatory. Actual native packet/batch publication and
+unlocked delivery also check this lifetime, including after descriptor writes.
+An operator DOWN, retirement or replaced registration permanently denies that
+owner even if the name later returns UP. Cancellation or any failed awaited
+step closes only the captured fresh admission and retains ambiguous native
+DMA; late old replies cannot resurrect it. Late old cleanup cannot address
+the new name's carrier. Four native source cases cover Open/WPA2 stable-name
+DHCP, terminal-disconnect recovery/fresh keys, held-M4 cancellation, original
+DOWN between descriptor/doorbell, old ingress and preserved operator DOWN.
+They await release/native batch execution and physical acceptance.
+
 `pci::bring_up(device, cap)` first parks inherited PCI DMA through the shared
 Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
 and read back the command register. Any access failure, retained BME or missing
@@ -2035,12 +2110,12 @@ changes. None is a physical blocker unless stated.
 | `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
 | `multi_stream_ht` | Source-complete for actual2T2R RTL8822CE under separate N22H256v2: cumulative per-path factory ceilings, measured combined-chain envelope, native quiet/parked two-path gains/readbacks, original local RX16/peer TX negotiation and actual RA/TXWD/RXD MCS8..15. C21 is1TX-path hardware. Five native cases are written; release/native and physical acceptance remain pending. |
-| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` generation reset over a retained owner. `dma_stop.rs` now proves a stopped owner idle and releases it, and `Lifecycle::remove` tears one down, but the lifecycle is one-shot. Its `started` latch, the `pci_firmware::allocate` cold-power precondition (`power::power_on` card-disable to enable runs only in `pci::bring_up`) and the interface `Admission`, which never reopens after `close`, all forbid re-running power-on, firmware download, MAC/PHY/radio and station start on the same function and shell. Needs a generation counter across `Lifecycle`/`Firmware`/`Sibling`/`interface::Device`, a re-entrant cold-power path and admission reopen, plus re-qualification of every continuation against the new generation (patterns: ath9k `reset_owner`, iwlwifi `Owner::recover`). |
+| `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
 | `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
 | `runtime_sleep` | No `ps.c` port. LPS needs `H2C_CMD_SET_PWR_MODE` (0x20) in an LPS mode plus the `rtw_leave_lps_core` path; `station_control.rs` only ever sends the ACTIVE/awake form. IPS (`rtw_enter_ips` = `rtw_core_stop` + `rtw_hci_link_ps`, `rtw_leave_ips` = `rtw_ips_pwr_up`) is a full stop/start, so it is blocked on `operating_reset`. |
-| `safe_rejoin` | Rejoin after a terminal disconnect needs a fresh owner generation (§3: one-shot station, closed `Admission`). It is blocked on `operating_reset`; `narf_net::iface::retire_for_rebind`/`rebind_name` now exist for keeping the `wlan` name across generations. |
+| `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
 | `system_suspend` | Linux `rtw_pci_suspend`/`resume` only toggle the CLKREQ pad (8822C RFE 6); the stack stops the radio through mac80211 (`rtw_ops_stop` → `rtw_core_stop`) and restarts it (`rtw_ops_start` → `rtw_core_start`: power-on, firmware download, MAC/PHY init). The DMA-stop proof now covers the stop half, but the resume half is exactly the missing generation reset, so this is blocked on `operating_reset`. |
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |

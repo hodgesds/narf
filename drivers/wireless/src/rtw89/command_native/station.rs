@@ -7,6 +7,7 @@ use alloc::collections::VecDeque;
 
 #[derive(Default)]
 pub(super) struct Runtime {
+    pub(super) monitor: Option<super::monitor::Mode>,
     pub(super) core: Option<packet::Core>,
     pub(super) peer: Option<control::Peer>,
     pub(super) backlog: VecDeque<rx_packet::Event>,
@@ -91,7 +92,7 @@ impl Native {
         own: [u8; 6],
         macid: u8,
     ) -> Result<(), packet::Error> {
-        if self.station_runtime.core.is_some() {
+        if self.station_runtime.monitor.is_some() || self.station_runtime.core.is_some() {
             return Err(packet::Error::State);
         }
         self.ordinary_current()?;
@@ -589,6 +590,10 @@ impl Native {
             Permit::Legacy => self.command_admission(),
             Permit::Station(admission) => {
                 admission.check().map_err(|_| Error::Access)?;
+                if self.station_runtime.monitor.is_some() {
+                    self.monitor_request_current(admission)
+                        .map_err(|_| Error::Access)?;
+                }
                 self.ordinary_current().map_err(|_| Error::Access)
             }
             Permit::Cleanup => self.authority.check_live().map_err(|_| Error::Access),
@@ -647,6 +652,7 @@ impl Native {
         let full = self.full_radio_scope();
         let ordinary = &self.ordinary;
         let sleep_enter = matches!(permit, Permit::SleepEnter(_));
+        let monitoring = self.station_runtime.monitor.is_some();
         let receive = &self.receive;
         let backlog_pending = !self.station_runtime.backlog.is_empty();
         let authority = self.authority;
@@ -660,6 +666,13 @@ impl Native {
             // Busy here is genuinely unpublished and preserves queue state.
             if sleep_enter && (backlog_pending || receive.pending(io).map_err(|_| Error::Access)?) {
                 return Err(Error::Busy);
+            }
+            if monitoring
+                && io.read32(0xc000).map_err(|_| Error::Access)?
+                    & crate::rtw89::monitor_wire::CMAC_TX
+                    != 0
+            {
+                return Err(Error::Access);
             }
             let packet = packet.take().ok_or(Error::Terminal)?;
             match queue.submit(packet, |slot, next, packet| {

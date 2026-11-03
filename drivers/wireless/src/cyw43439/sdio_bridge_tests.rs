@@ -6,6 +6,8 @@ use alloc::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 const CORE: u32 = 0x18011000;
+#[path = "sdio_stop_tests.rs"]
+mod stop;
 #[derive(Default)]
 struct Host {
     window: u32,
@@ -23,9 +25,52 @@ struct Host {
     /// CMD52 register model for save-restore sleep (SLEEPCSR mirrors DEVON
     /// from KSO; CHIPCLKCSR reports HT/ALP available).
     sleep_model: bool,
+    stop_model: bool,
+    refuse_disable: bool,
+    refuse_irq_disable: bool,
+    held_word: Option<u32>,
+    retired: Option<Retirement>,
     regs: BTreeMap<(u8, u32), u8>,
 }
+struct Retirement(alloc::sync::Arc<core::sync::atomic::AtomicUsize>);
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
 impl SdioFunction for Host {
+    fn disable_card_interrupt(&mut self) -> Result<(), SdioError> {
+        if !self.stop_model {
+            return Err(SdioError::Unsupported);
+        }
+        self.notify.take();
+        self.claimed = None;
+        self.ops.push((57, 0, 0, 0));
+        if self.refuse_irq_disable {
+            return Err(SdioError::HostError);
+        }
+        self.cmd52_write(0, 4, 0)?;
+        if self.cmd52_read(0, 4)? != 0 {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
+    }
+    fn disable_func(&mut self, func: u8) -> Result<(), SdioError> {
+        if !self.stop_model {
+            return Err(SdioError::Unsupported);
+        }
+        self.enabled &= !(1 << func);
+        self.ops.push((56, func, 0, 0));
+        if self.refuse_disable {
+            return Err(SdioError::HostError);
+        }
+        let before = self.cmd52_read(0, 2)?;
+        self.cmd52_write(0, 2, before & !(1 << func))?;
+        if self.cmd52_read(0, 3)? & (1 << func) != 0 {
+            return Err(SdioError::NotEnabled);
+        }
+        Ok(())
+    }
     fn enable_card_interrupt(
         &mut self,
         functions: u8,
@@ -55,6 +100,9 @@ impl SdioFunction for Host {
     }
     fn cmd52_write(&mut self, f: u8, a: u32, v: u8) -> Result<(), SdioError> {
         self.ops.push((52, f, a, 1));
+        if self.stop_model && (f, a) == (0, 2) {
+            self.regs.insert((0, 3), v);
+        }
         if self.sleep_model {
             let stored = if (f, a) == (1, 0x1001f) {
                 v | ((v & 1) << 1)
@@ -78,6 +126,10 @@ impl SdioFunction for Host {
         self.ops.push((53, f, a, b.len()));
         if f != 1 || a & 0x8000 == 0 || b.len() != 4 {
             return Err(SdioError::HostError);
+        }
+        if self.held_word == Some(self.window | (a & 0x7fff)) {
+            b.fill(0);
+            return Ok(());
         }
         b.copy_from_slice(
             &self
@@ -143,6 +195,10 @@ impl SdioFunction for Host {
     }
     fn enable_func(&mut self, f: u8) -> Result<(), SdioError> {
         self.enabled |= 1 << f;
+        if self.stop_model {
+            self.regs.insert((0, 2), self.enabled);
+            self.regs.insert((0, 3), self.enabled);
+        }
         Ok(())
     }
     fn set_block_size(&mut self, f: u8, size: u16) -> Result<(), SdioError> {

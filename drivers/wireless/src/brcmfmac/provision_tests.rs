@@ -129,6 +129,12 @@ pub(crate) fn selected_fixture(family: Family) -> Result<(Selection, Assets), &'
     Ok((selection, assets))
 }
 
+/// Revoke the actual selected calibration cap in composed native family
+/// lifecycle fixtures; this exposes no production constructor or authority.
+pub(crate) fn revoke_fixture_calibration(proof: &Proof) {
+    proof.receipts[2].cap.revoke();
+}
+
 fn smoke_brcm_board_selection_real_registry_identity_asset_and_signature_binding() -> TestResult {
     let (write, read) = match registry() {
         Ok(value) => value,

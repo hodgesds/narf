@@ -91,6 +91,8 @@ pub mod mac;
 pub mod mac_init;
 mod mac_runtime;
 mod mac_runtime_regs;
+mod monitor;
+mod monitor_wire;
 mod packet_core;
 mod packet_format;
 pub mod pci;

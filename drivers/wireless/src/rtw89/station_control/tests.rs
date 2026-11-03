@@ -956,3 +956,6 @@ kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile
 );
+
+#[path = "monitor_tests.rs"]
+mod monitor_tests;

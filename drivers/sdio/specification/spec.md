@@ -91,6 +91,19 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   line. `Ok(false)` without a line. `rearm_card_interrupt` unmasks after the
   owner serviced every function source. Dropping the card clears SDHCI
   status/signal enables before the line is masked.
+- `source::Source` is an opaque original native host plus Controller/Card
+  lifetime receipt. `Registers::source` and `SdioFunction::source` default
+  to None; observed identity, a caller validator or a scalar cannot create
+  it. The native PCI owner retains its original capability, device and
+  actual decode/BME-off/INTx policy. Controller/Card privately attach their
+  own nonreviving lifetimes. Only that complete receipt can pass `current`
+  or `invoke`; bare host metadata cannot. Actual PIO poison, destructive
+  function retirement and owner Drop close the corresponding lifetime.
+  Re-enabling a function cannot revive it; a fresh Card initialization owns
+  a distinct generation. Fixed lifetime gates serialize terminal retirement
+  against the final copy; no hardware wait, provider callback or endpoint
+  lookup runs under them. `invoke` is for fixed guard checks/copy after all
+  dynamic preparation, and supplies no RF, peer, key or DATA authority.
 - `native::register_pci_driver` registers class 08:05:00 and 08:05:01.
   `probe` reserves each BDF once, clears inherited BME and memory decode,
   sets INTx disable and verifies all three before sizing/mapping the control

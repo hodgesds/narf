@@ -41,6 +41,7 @@ pub(super) struct Bootstrap {
     reset: Mutex<Option<pci_reset::Reset>>,
     lifecycle: IrqSafeSpinLock<Option<Arc<Lifecycle<startup::Startup>>>>,
     shell: IrqSafeSpinLock<Option<Arc<Device<startup::Startup>>>>,
+    desired: Arc<super::monitor::Desired>,
     stage: AtomicU8,
     error: IrqSafeSpinLock<Option<Error>>,
     request: IrqSafeSpinLock<Option<super::command_native::QualificationRequest>>,
@@ -234,11 +235,13 @@ impl Bootstrap {
         };
         let mut name: Option<String> = None;
         loop {
+            let selected = self.desired.snapshot();
             let result = self.generation(name.as_deref()).await;
+            let role_changed = !self.desired.current(selected);
             let reclaimed = self.retire_generation().await;
             let generation = self.generation.load(Ordering::Acquire);
             let action = supervise(
-                result.is_ok(),
+                result.is_ok() || role_changed,
                 self.removed.load(Ordering::Acquire),
                 reclaimed,
                 self.suspended.load(Ordering::Acquire),
@@ -380,11 +383,12 @@ impl Bootstrap {
         let name = kept
             .and_then(narf_net::iface::rebind_name)
             .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
-        let shell = Arc::new(Device::new(
+        let shell = Arc::new(Device::new_selected(
             name,
             identity.mac(),
             lifecycle.clone(),
             Arc::new(station::NativeEnvironment),
+            self.desired.clone(),
         ));
         *self.shell.lock() = Some(shell.clone());
         // Source factory discovery ended with BME off. The exact same shell
@@ -712,6 +716,7 @@ pub(super) fn probe(
         reset: Mutex::new(Some(reset)),
         lifecycle: IrqSafeSpinLock::new(None),
         shell: IrqSafeSpinLock::new(None),
+        desired: crate::rtw89::monitor::Desired::new(),
         stage: AtomicU8::new(Stage::Reset as u8),
         error: IrqSafeSpinLock::new(None),
         request: IrqSafeSpinLock::new(None),
@@ -768,6 +773,7 @@ pub(super) unsafe fn attach_cold(
         reset: Mutex::new(None),
         lifecycle: IrqSafeSpinLock::new(Some(lifecycle)),
         shell: IrqSafeSpinLock::new(None),
+        desired: crate::rtw89::monitor::Desired::new(),
         stage: AtomicU8::new(Stage::Discovery as u8),
         error: IrqSafeSpinLock::new(None),
         request: IrqSafeSpinLock::new(None),
@@ -841,6 +847,7 @@ mod tests {
             reset: Mutex::new(None),
             lifecycle: IrqSafeSpinLock::new(None),
             shell: IrqSafeSpinLock::new(None),
+            desired: crate::rtw89::monitor::Desired::new(),
             stage: AtomicU8::new(Stage::Reset as u8),
             error: IrqSafeSpinLock::new(None),
             request: IrqSafeSpinLock::new(None),
@@ -880,6 +887,7 @@ mod tests {
             reset: Mutex::new(None),
             lifecycle: IrqSafeSpinLock::new(lifecycle),
             shell: IrqSafeSpinLock::new(None),
+            desired: crate::rtw89::monitor::Desired::new(),
             stage: AtomicU8::new(Stage::Reset as u8),
             error: IrqSafeSpinLock::new(None),
             request: IrqSafeSpinLock::new(None),

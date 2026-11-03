@@ -5,7 +5,7 @@ use crate::rtw89::{packet_core as packet, station::Io, station_control as contro
 use alloc::boxed::Box;
 
 impl Startup {
-    fn station_native(&mut self) -> Result<&mut Native, power::Error> {
+    pub(super) fn station_native(&mut self) -> Result<&mut Native, power::Error> {
         if self.phase == Phase::Terminal {
             return Err(power::Error::Terminal);
         }
@@ -57,7 +57,36 @@ impl Startup {
 // adapters invoke current device authority and sealed full RF/peer receipts at
 // publication; failure closes and retains every published DMA mapping.
 unsafe impl Io for Startup {
+    fn monitor_capable(&mut self) -> Result<bool, power::Error> {
+        if self.phase != Phase::RadioReady {
+            return Ok(false);
+        }
+        self.station_native()?.ordinary_current()?;
+        Ok(self
+            .identity
+            .is_some_and(|identity| identity.chip() == crate::rtw89::mac::ChipId::Rtl8852B))
+    }
+    fn monitor_active(&self) -> bool {
+        self.monitor.is_some()
+    }
+
+    async fn monitor_start(
+        &mut self,
+        desired: alloc::sync::Arc<crate::rtw89::monitor::Desired>,
+        admission: control::Admission,
+    ) -> Result<crate::rtw89::monitor::Source, power::Error> {
+        self.start_monitor(desired, admission).await
+    }
+    fn monitor_poll(&mut self) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, power::Error> {
+        self.poll_monitor()
+    }
+    fn monitor_stop(&mut self) -> Result<(), power::Error> {
+        self.stop_monitor()
+    }
     fn station_allowed(&mut self) -> Result<(), power::Error> {
+        if self.monitor.is_some() {
+            return Err(power::Error::Terminal);
+        }
         if self
             .identity
             .is_none_or(|identity| identity.chip() != super::super::mac::ChipId::Rtl8852B)

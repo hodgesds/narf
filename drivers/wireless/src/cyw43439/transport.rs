@@ -131,6 +131,14 @@ pub trait PacketTransport: Transport + Send {
     /// no longer borrows `packet`; it must not retain a pointer into it.
     fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError>;
 
+    /// Confirm the complete original transport generation stopped. The
+    /// default has no proof. Success must include native MCU/MAC/card and
+    /// original host/IRQ retirement, not just absence of borrowed PIO bytes.
+    /// No reset/resume or physical board-power receipt follows.
+    fn confirmed_stop(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
     /// Card-interrupt wake raised by the host's oneshot line (Linux
     /// `brcmf_sdiod_intr_register`); `None` keeps the polled service.
     fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {

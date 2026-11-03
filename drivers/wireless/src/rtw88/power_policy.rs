@@ -162,6 +162,7 @@ pub struct Permission {
 /// continuation can supply one to the native packet owner.
 #[derive(Clone)]
 pub struct Gate {
+    host: Option<narf_net::native_emission::Lifetime>,
     tracking: Option<alloc::sync::Arc<super::tracking8821c::Grant>>,
     scope: Scope,
     extension: Option<alloc::sync::Arc<super::station_profile::Grant>>,
@@ -305,6 +306,24 @@ enum Scope {
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
 }
 impl Gate {
+    fn host_current(&self) -> Result<(), Error> {
+        if self.host.as_ref().is_some_and(|host| !host.current()) {
+            Err(Error::Authority)
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn with_host(
+        &self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.host.is_some() || !host.current() {
+            return Err(super::firmware_transport::Error::Access);
+        }
+        let mut gate = self.clone();
+        gate.host = Some(host);
+        Ok(gate)
+    }
     pub(super) fn extension_base(&self) -> Option<ExtensionBase> {
         if self.extension.is_some() {
             return None;
@@ -345,6 +364,7 @@ impl Gate {
         own: [u8; 6],
     ) -> Self {
         Self {
+            host: None,
             tracking: None,
             extension: None,
             ht: None,
@@ -363,6 +383,7 @@ impl Gate {
     }
     pub(super) fn c21(grant: alloc::sync::Arc<super::station_power8821c::Grant>) -> Self {
         Self {
+            host: None,
             scope: Scope::C21(grant),
             tracking: None,
             extension: None,
@@ -388,6 +409,7 @@ impl Gate {
         }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
+        self.host_current()?;
         if let Some(g) = &self.tracking {
             g.invoke(|| Ok(())).map_err(|_| Error::Authority)?;
         }
@@ -438,6 +460,8 @@ impl Gate {
         &self,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        self.host_current()
+            .map_err(super::firmware_transport::Error::Power)?;
         if let Some(g) = &self.protection {
             return g.invoke(operation);
         }
@@ -459,6 +483,7 @@ impl Gate {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        self.host_current()?;
         match &self.scope {
             Scope::C22 {
                 calibration,
@@ -704,6 +729,8 @@ impl Gate {
         profile: super::packet_format::DataProfile,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        self.host_current()
+            .map_err(super::firmware_transport::Error::Power)?;
         if !self.allows_profile(profile) {
             return Err(super::firmware_transport::Error::Prerequisite);
         }
@@ -854,6 +881,8 @@ impl Gate {
         domain: Option<&narf_wireless::reg::RegulatoryDomain>,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        self.host_current()
+            .map_err(super::firmware_transport::Error::Power)?;
         match &self.scope {
             Scope::C21(grant) => grant.invoke(operation),
             Scope::C22 { calibration, .. } => {
@@ -897,6 +926,7 @@ impl Gate {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        self.host_current()?;
         if let Some(g) = &self.protection {
             return g.check().map_err(|_| Error::Authority);
         }

@@ -65,6 +65,7 @@ pub struct Startup {
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
     sleep: Option<runtime_sleep::Runtime>,
+    monitor: Option<super::monitor::Controller>,
     pub(super) lifecycle: super::radio_policy::Lifecycle,
 }
 impl core::fmt::Debug for Startup {
@@ -138,6 +139,7 @@ impl Startup {
             station_controller: None,
             station_binding: None,
             sleep: None,
+            monitor: None,
             lifecycle: super::radio_policy::Lifecycle::Initial,
         })
     }
@@ -534,3 +536,6 @@ mod tests {
         smoke_rtw89_cold_claim_revocation_precedes_unmapped_pci_and_dma
     );
 }
+
+#[path = "startup_monitor.rs"]
+mod monitor;

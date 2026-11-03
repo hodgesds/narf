@@ -49,6 +49,8 @@ pub(super) struct Device<I: Io> {
     metadata_retired: AtomicBool,
     deliveries: AtomicUsize,
     withdrawal: AtomicU8,
+    keep_name: AtomicBool,
+    name_retired: AtomicBool,
     activating: AtomicBool,
     admitted: AtomicBool,
     up: AtomicBool,
@@ -127,6 +129,8 @@ impl<I: Io + 'static> Device<I> {
             metadata_retired: AtomicBool::new(false),
             deliveries: AtomicUsize::new(0),
             withdrawal: AtomicU8::new(0),
+            keep_name: AtomicBool::new(false),
+            name_retired: AtomicBool::new(false),
             activating: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
@@ -143,6 +147,23 @@ impl<I: Io + 'static> Device<I> {
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
+    }
+    pub(super) fn cancel_control(&self) {
+        self.close();
+    }
+    pub(super) fn withdraw_for_rebind(self: &Arc<Self>) -> Result<(), Error> {
+        if self.withdrawn() {
+            return Err(Error::State);
+        }
+        self.keep_name.store(true, Ordering::Release);
+        self.withdraw();
+        Ok(())
+    }
+    pub(super) fn rebound_name(&self) -> Option<&'static str> {
+        self.name_retired
+            .load(Ordering::Acquire)
+            .then(|| narf_net::iface::rebind_name(&self.name))
+            .flatten()
     }
     /// Removal (`rtw_unregister_hw` in `rtw_pci_remove`): close every
     /// control and packet path, drop the link and withdraw the registered
@@ -174,7 +195,14 @@ impl<I: Io + 'static> Device<I> {
         {
             return;
         }
-        narf_net::iface::unregister(&self.name);
+        if self.keep_name.load(Ordering::Acquire) {
+            self.name_retired.store(
+                narf_net::iface::retire_for_rebind(&self.name),
+                Ordering::Release,
+            );
+        } else {
+            narf_net::iface::unregister(&self.name);
+        }
         super::endpoints::remove(self as *const Self as *const ());
         self.withdrawal.store(3, Ordering::Release);
     }

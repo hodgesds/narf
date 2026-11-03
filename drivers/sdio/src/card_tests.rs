@@ -44,6 +44,7 @@ impl State {
 pub struct Model(
     Arc<IrqSafeSpinLock<State>>,
     Option<crate::pio::HostIdentity>,
+    Arc<crate::source::Lifetime>,
 );
 impl core::fmt::Debug for Model {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -88,10 +89,17 @@ impl Model {
             }
             s.common[cis + 44] = 0xff;
         }
-        Self(Arc::new(IrqSafeSpinLock::new(s)), None)
+        Self(
+            Arc::new(IrqSafeSpinLock::new(s)),
+            None,
+            crate::source::Lifetime::new(),
+        )
     }
 }
 impl Registers for Model {
+    fn source(&self) -> Option<crate::source::Source> {
+        Some(crate::source::Source::fixture(self.2.clone()))
+    }
     fn enable_intx(&mut self) -> bool {
         true
     }
@@ -546,6 +554,20 @@ fn smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failu
             self.drops.fetch_add(1, Ordering::AcqRel);
         }
     }
+    struct RetiredCallback {
+        owner: alloc::sync::Weak<Subscriber>,
+        drops: Arc<AtomicU32>,
+    }
+    impl Drop for RetiredCallback {
+        fn drop(&mut self) {
+            if let Some(owner) = self.owner.upgrade() {
+                // The original slot is already empty. Reentry must acquire
+                // its guard, so destroying this under clear's lock deadlocks.
+                owner.notify();
+            }
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
     for fault in 0..3 {
         let model = Model::new();
         let shared = model.0.clone();
@@ -566,9 +588,15 @@ fn smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failu
             return TestResult::Fail("interrupt retirement original line attachment");
         }
         let notify = wakes.clone();
+        let callback_drops = Arc::new(AtomicU32::new(0));
+        let retired_callback = RetiredCallback {
+            owner: Arc::downgrade(&subscriber),
+            drops: callback_drops.clone(),
+        };
         if card.enable_card_interrupt(
             6,
             Arc::new(move || {
+                let _retained = &retired_callback;
                 notify.fetch_add(1, Ordering::AcqRel);
             }),
         ) != Ok(true)
@@ -588,6 +616,7 @@ fn smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failu
             || wakes.load(Ordering::Acquire) != 1
             || drops.load(Ordering::Acquire) != 1
             || unmasks.load(Ordering::Acquire) != 1
+            || callback_drops.load(Ordering::Acquire) != 1
         {
             return TestResult::Fail(
                 "interrupt failure revived subscriber/CPU route or invented disable",
@@ -602,7 +631,10 @@ fn smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failu
         drop(state);
         drop(card);
         subscriber.notify();
-        if wakes.load(Ordering::Acquire) != 1 || drops.load(Ordering::Acquire) != 1 {
+        if wakes.load(Ordering::Acquire) != 1
+            || drops.load(Ordering::Acquire) != 1
+            || callback_drops.load(Ordering::Acquire) != 1
+        {
             return TestResult::Fail("late Card drop revived retired callback or line");
         }
     }
@@ -611,4 +643,83 @@ fn smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failu
 kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failure
+);
+
+fn smoke_sdio_native_card_source_never_follows_retirement_or_explicit_reenable() -> TestResult {
+    let model = Model::new();
+    let bare = model.source().unwrap();
+    if bare.current().is_ok() {
+        return TestResult::Fail("native host metadata substituted for actual Card owner");
+    }
+    let Ok(mut card) = Card::initialize(model.clone(), Config::default()) else {
+        return TestResult::Fail("original source actual Card initialization");
+    };
+    if card.enable_func(2).is_err() {
+        return TestResult::Fail("original source actual F2 enable");
+    }
+    let Some(original) = SdioFunction::source(&card) else {
+        return TestResult::Fail("actual original Card source missing");
+    };
+    let mut copies = 0;
+    if original.invoke(|| copies += 1).is_err() || copies != 1 || card.disable_func(2).is_err() {
+        return TestResult::Fail("original source native copy/function retirement");
+    }
+    if original.invoke(|| copies += 1).is_ok()
+        || copies != 1
+        || card.enable_func(2).is_err()
+        || SdioFunction::source(&card).is_some()
+        || original.current().is_ok()
+    {
+        return TestResult::Fail("old Card source followed destructive F2 retirement or re-enable");
+    }
+    drop(card);
+    let Ok(fresh) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("fresh explicit Card generation initialization");
+    };
+    if SdioFunction::source(&fresh).is_none_or(|source| source.current().is_err())
+        || original.current().is_ok()
+    {
+        return TestResult::Fail("fresh native Card rebound original copied source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_native_card_source_never_follows_retirement_or_explicit_reenable
+);
+
+fn smoke_sdio_native_card_source_observes_actual_pio_poison_before_late_copy() -> TestResult {
+    let model = Model::new();
+    let shared = model.0.clone();
+    let Ok(mut card) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("poison source native Card initialization");
+    };
+    if card.enable_func(2).is_err() {
+        return TestResult::Fail("poison source native F2 enable");
+    }
+    let Some(original) = SdioFunction::source(&card) else {
+        return TestResult::Fail("poison source missing actual Card receipt");
+    };
+    if original.current().is_err() {
+        return TestResult::Fail("valid native original source denied");
+    }
+    shared.lock().reject_data = true;
+    if card.cmd53_read(2, 0, &mut [0; 4]).is_ok() || !card.controller.is_failed() {
+        return TestResult::Fail("actual rejected R5 did not poison original PIO owner");
+    }
+    shared.lock().reject_data = false;
+    let mut copied = false;
+    if original.invoke(|| copied = true).is_ok() || copied || SdioFunction::source(&card).is_some()
+    {
+        return TestResult::Fail("cleared model fault revived old controller/source copy");
+    }
+    drop(card);
+    if original.current().is_ok() {
+        return TestResult::Fail("late Drop revived original card source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_native_card_source_observes_actual_pio_poison_before_late_copy
 );

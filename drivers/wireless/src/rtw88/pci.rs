@@ -50,6 +50,7 @@ pub struct Rtw88Device {
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     pub(super) diagnostic_name: &'static str,
     pub(super) provisioning: narf_lib::mutex::Mutex<()>,
+    pub(super) reset_origin: Option<super::operating_reset::Origin>,
 }
 
 impl Rtw88Device {
@@ -444,8 +445,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let mut dev = dev;
     let mac = dev.mac;
     let did = dev.device_id;
-    let firmware = dev.firmware.clone();
-    let sibling = dev.sibling.clone();
     let interface = dev.interface.clone();
     // Registry authority and the one named shell precede the firmware worker
     // and every station packet publication. Diagnostic/controller views share
@@ -470,26 +469,30 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    if (firmware.is_some() || sibling.is_some()) && interface.is_some() {
-        let owner = dev.clone();
-        narf_scheduler::spawn(async move {
-            let result = drive_scheduled(
-                120,
-                || retryable(&owner),
-                || {
-                    let owner = owner.clone();
-                    async move { provision_owner(&owner).await }
-                },
-                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
-            )
-            .await;
-            if let Err(error) = result {
-                narf_console::klog!("rtw88 provisioning: {:?}\n", error);
-            }
-        });
-    }
+    schedule_owner(dev);
 
     Ok(())
+}
+
+pub(super) fn schedule_owner(owner: Arc<Rtw88Device>) {
+    if (owner.firmware.is_none() && owner.sibling.is_none()) || owner.interface.is_none() {
+        return;
+    }
+    narf_scheduler::spawn(async move {
+        let result = drive_scheduled(
+            120,
+            || retryable(&owner),
+            || {
+                let owner = owner.clone();
+                async move { provision_owner(&owner).await }
+            },
+            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+        )
+        .await;
+        if let Err(error) = result {
+            narf_console::klog!("rtw88 provisioning: {:?}\n", error);
+        }
+    });
 }
 
 /// Keep the runtime BAR choice and minimum register extent in one place.
@@ -525,17 +528,45 @@ pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Rtw88Device, ProbeError> {
+    // SAFETY: forwarded exact-function cold probe contract.
+    unsafe { bring_up_mode(device, cap, None, None) }
+}
+/// # Safety
+/// Same exclusive BAR/function ownership as bring_up, plus original native
+/// DMA/IRQ/callback retirement. Only operating_reset owns this contract.
+pub(super) unsafe fn bring_up_reset(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    _retired: super::operating_reset::Retired,
+    claim: &super::functions::ResetClaim,
+    name: Option<&'static str>,
+) -> Result<Rtw88Device, ProbeError> {
+    // SAFETY: forwarded exclusive original-function recovery contract.
+    unsafe { bring_up_mode(device, cap, Some(claim), name) }
+}
+unsafe fn bring_up_mode(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    reset: Option<&super::functions::ResetClaim>,
+    name: Option<&'static str>,
+) -> Result<Rtw88Device, ProbeError> {
     let (registers, mac, factory, sibling_factory) =
         super::pci_park::invoke(cap, || -> Result<_, ProbeError> {
             let registers = map_registers_with(device, |device, index| {
                 super::pci_park::map_bar_control(device, cap, index)
             })?;
 
-            // Run the chip/cut-filtered Linux PCI power sequence. Bus mastering
-            // remains parked throughout power cycling and read-only EFUSE access.
-            // SAFETY: BAR2 control registers mapped + owned.
-            unsafe {
-                power::power_on(&registers, device.id.device).map_err(ProbeError::PowerOn)?;
+            let mut checked = reset.map(|claim| {
+                // SAFETY: original reset reservation and actual producer retirement
+                // precede this complete exclusively owned BAR mapping.
+                unsafe { power::RecoveryIo::new(&registers, device, cap, claim) }
+            });
+            if let Some(io) = checked.as_mut() {
+                power::reset_with(io, device.id.device).map_err(ProbeError::PowerOn)?;
+            } else {
+                // SAFETY: original cold-probe exclusive BAR contract.
+                unsafe { power::power_on(&registers, device.id.device) }
+                    .map_err(ProbeError::PowerOn)?;
             }
 
             // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
@@ -544,8 +575,14 @@ pub unsafe fn bring_up(
                 // SAFETY: the same powered/exclusive BAR2 invocation above owns
                 // this one physical map read, including factory radio identity.
                 Some(
-                    unsafe { efuse::read_factory(&registers, device.id.device) }
-                        .map_err(ProbeError::Efuse)?,
+                    if let Some(io) = checked.as_mut() {
+                        efuse::read_factory_with(io, device.id.device)
+                    } else {
+                        // SAFETY: original cold-probe exclusive powered BAR invocation;
+                        // recovery uses the fixed guarded native backend above.
+                        unsafe { efuse::read_factory(&registers, device.id.device) }
+                    }
+                    .map_err(ProbeError::Efuse)?,
                 )
             } else {
                 None
@@ -554,8 +591,14 @@ pub unsafe fn bring_up(
                 // SAFETY: same current exclusive powered BAR2 invocation. This
                 // one read captures the C21 map; C22 offsets/trims are never used.
                 Some(
-                    unsafe { efuse::read_factory8821c(&registers, device.id.device) }
-                        .map_err(ProbeError::Efuse)?,
+                    if let Some(io) = checked.as_mut() {
+                        efuse::read_factory8821c_with(io, device.id.device)
+                    } else {
+                        // SAFETY: original cold-probe exclusive powered BAR invocation;
+                        // recovery uses the fixed guarded native backend above.
+                        unsafe { efuse::read_factory8821c(&registers, device.id.device) }
+                    }
+                    .map_err(ProbeError::Efuse)?,
                 )
             } else {
                 None
@@ -567,6 +610,13 @@ pub unsafe fn bring_up(
                 None => unsafe { efuse::read_mac(&registers, device.id.device) }
                     .map_err(ProbeError::Efuse)?,
             };
+
+            if checked
+                .as_mut()
+                .is_some_and(|io| !power::Io::permission(io))
+            {
+                return Err(ProbeError::PowerOn(power::PowerError::Access));
+            }
 
             Ok((registers, mac, factory, sibling_factory))
         })
@@ -598,7 +648,7 @@ pub unsafe fn bring_up(
         .map(|firmware| firmware.lifecycle())
         .or_else(|| sibling.as_ref().map(|owner| owner.lifecycle()));
     let interface = station_lifecycle.map(|lifecycle| {
-        let name = narf_net::iface::reserve_name("wlan%d");
+        let name = name.unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
         Arc::new(super::interface::Device::new(
             name,
             mac,
@@ -627,6 +677,7 @@ pub unsafe fn bring_up(
         tx_ring: IrqSafeSpinLock::new(tx_ring),
         diagnostic_name: "",
         provisioning: narf_lib::mutex::Mutex::new(()),
+        reset_origin: Some(super::operating_reset::Origin::new(*device, *cap)),
     })
 }
 
@@ -807,7 +858,7 @@ fn retryable(owner: &Rtw88Device) -> bool {
         .as_ref()
         .is_some_and(|iface| !iface.closed())
 }
-async fn provision_owner(controller: &Rtw88Device) -> Result<(), super::FirmwareError> {
+pub(super) async fn provision_owner(controller: &Rtw88Device) -> Result<(), super::FirmwareError> {
     if let Some(owner) = &controller.sibling {
         let _admission = controller.provisioning.lock().await;
         let interface = controller
@@ -902,6 +953,7 @@ mod provision_tests {
             tx_ring: IrqSafeSpinLock::new(None),
             diagnostic_name: "rtw88-provision-fixture",
             provisioning: narf_lib::mutex::Mutex::new(()),
+            reset_origin: None,
         }
     }
     fn smoke_rtw8822ce_public_provision_retains_bindings_and_cancels_before_admission() -> TestResult

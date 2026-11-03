@@ -26,7 +26,7 @@ impl Drop for Disconnect {
     }
 }
 impl Admission {
-    fn same(&self, other: &Self) -> bool {
+    pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.publication, &other.publication)
     }
     pub(super) fn new() -> Self {
@@ -808,6 +808,9 @@ async fn edca(
     }
     Ok(())
 }
+#[path = "station_control/monitor.rs"]
+mod monitor;
+pub(super) use monitor::initialize as initialize_monitor;
 #[path = "station_control/codec.rs"]
 mod codec;
 pub(super) use codec::{HeRa, HtRa};

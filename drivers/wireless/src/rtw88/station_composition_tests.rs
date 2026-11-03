@@ -5,7 +5,7 @@ use crate::rtw88::{firmware_lifecycle::Lifecycle, interface::Device, station::En
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -16,6 +16,10 @@ use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIface};
 #[path = "station_multi_tests.rs"]
 mod multi_tests;
+#[path = "station_rejoin_tests.rs"]
+mod rejoin_tests;
+#[path = "station_reset_tests.rs"]
+mod reset_tests;
 #[path = "wmm_station_tests.rs"]
 mod wmm_tests;
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
@@ -26,6 +30,7 @@ const ANONCE: [u8; 32] = [0xaa; 32];
 struct Env {
     clock: Arc<AtomicU64>,
     entropy: AtomicBool,
+    nonce_seed: AtomicU8,
 }
 #[async_trait::async_trait]
 impl Environment for Env {
@@ -33,7 +38,9 @@ impl Environment for Env {
         self.clock.load(Ordering::Acquire)
     }
     fn nonce(&self) -> Option<[u8; 32]> {
-        self.entropy.load(Ordering::Acquire).then_some([0x33; 32])
+        self.entropy
+            .load(Ordering::Acquire)
+            .then_some([self.nonce_seed.load(Ordering::Acquire); 32])
     }
     async fn pause(&self) {
         let mut pending = true;
@@ -540,6 +547,15 @@ impl Harness {
         Self::build_paths(protected, own, native_dispatch, false)
     }
     fn build_paths(protected: bool, own: [u8; 6], native_dispatch: bool, ht2: bool) -> Self {
+        Self::build_named(protected, own, native_dispatch, ht2, None)
+    }
+    fn build_named(
+        protected: bool,
+        own: [u8; 6],
+        native_dispatch: bool,
+        ht2: bool,
+        name: Option<&'static str>,
+    ) -> Self {
         if !native_dispatch {
             assert!(ACTIVE_TEST.lock().is_none());
         }
@@ -547,6 +563,7 @@ impl Harness {
         let env = Arc::new(Env {
             clock: io.clock.clone(),
             entropy: AtomicBool::new(true),
+            nonce_seed: AtomicU8::new(0x33),
         });
         let peer = Arc::new(IrqSafeSpinLock::new(Peer::for_station(protected, own)));
         let plan = peer.lock().plan;
@@ -558,7 +575,8 @@ impl Harness {
                 .map_err(|_| crate::rtw88::packet_core::Error::Packet)
         }));
         let lifecycle = Arc::new(Lifecycle::new(0xc822));
-        let name = narf_net::iface::reserve_name("r88-native%d");
+        let rebound = name.is_some();
+        let name = name.unwrap_or_else(|| narf_net::iface::reserve_name("r88-native%d"));
         let device = Arc::new(Device::new(name, own, lifecycle.clone(), env.clone()));
         if native_dispatch {
             crate::rtw88::interface::publish(device.clone()).unwrap();
@@ -567,7 +585,9 @@ impl Harness {
             narf_net::iface::register(name, own, send);
             device.admit_for_test();
         }
-        narf_net::iface::set_link_state(name, true); // operator IFF_UP, not PHY state
+        if !rebound {
+            narf_net::iface::set_link_state(name, true);
+        } // operator IFF_UP
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);

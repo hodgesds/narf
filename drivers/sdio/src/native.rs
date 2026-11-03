@@ -23,6 +23,8 @@ pub struct Mmio {
     identity: crate::pio::HostIdentity,
     /// This owner bound the oneshot INTx line and cleared INTx-disable.
     intx: bool,
+    source_live: alloc::sync::Arc<crate::source::Lifetime>,
+    source_intx: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
 }
 impl core::fmt::Debug for Mmio {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -41,7 +43,16 @@ fn invoke<T>(cap: &Cap<BusDeviceCap, Write>, operation: impl FnOnce() -> T) -> R
     }
     cap.invoke(Operation(operation))
 }
+impl Drop for Mmio {
+    fn drop(&mut self) {
+        self.source_live.retire();
+    }
+}
 impl Mmio {
+    fn close(&mut self) {
+        self.source_live.retire();
+        self.gone = true;
+    }
     fn access<T>(
         &mut self,
         offset: u32,
@@ -49,12 +60,13 @@ impl Mmio {
         operation: impl FnOnce(&MmioRegion) -> T,
     ) -> Option<T> {
         if self.gone
+            || !self.source_live.current()
             || offset % width != 0
             || u64::from(offset)
                 .checked_add(u64::from(width))
                 .is_none_or(|end| end > self.region.len)
         {
-            self.gone = true;
+            self.close();
             return None;
         }
         let intx = self.intx;
@@ -67,15 +79,26 @@ impl Mmio {
         }) {
             Ok(Some(value)) => Some(value),
             _ => {
-                self.gone = true;
+                self.close();
                 None
             }
         }
     }
 }
 impl Registers for Mmio {
+    fn source(&self) -> Option<crate::source::Source> {
+        if self.gone || !self.source_live.current() {
+            return None;
+        }
+        Some(crate::source::Source::pci(
+            self.authority,
+            self.device,
+            self.source_live.clone(),
+            self.source_intx.clone(),
+        ))
+    }
     fn enable_intx(&mut self) -> bool {
-        if self.gone || self.intx {
+        if self.gone || !self.source_live.current() || self.intx {
             return false;
         }
         let cleared = invoke(&self.authority, || {
@@ -86,10 +109,12 @@ impl Registers for Mmio {
         match cleared {
             Ok(Some(command)) if command_live(command, true) => {
                 self.intx = true;
+                self.source_intx
+                    .store(true, core::sync::atomic::Ordering::Release);
                 true
             }
             _ => {
-                self.gone = true;
+                self.close();
                 false
             }
         }
@@ -382,6 +407,8 @@ fn probe_claimed(
             authority,
             device,
             gone: false,
+            source_live: crate::source::Lifetime::new(),
+            source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             identity: crate::pio::HostIdentity {
                 address: device.addr,
                 id: device.id,
@@ -536,9 +563,22 @@ mod tests {
             authority,
             device,
             gone: false,
+            source_live: crate::source::Lifetime::new(),
+            source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             identity,
             intx: false,
         };
+        let original = io
+            .source()
+            .unwrap()
+            .retain_controller(&crate::source::Lifetime::new())
+            .unwrap()
+            .retain_card(&crate::source::Lifetime::new())
+            .unwrap();
+        let mut published = false;
+        if original.invoke(|| published = true).is_ok() || published {
+            return TestResult::Fail("revoked native PCI source supplied final copy authority");
+        }
         let mut entered = false;
         if io
             .access(0x10, 4, |_| {
@@ -553,6 +593,9 @@ mod tests {
             return TestResult::Fail(
                 "revoked SDHCI owner reached PCI configuration or invalid MMIO",
             );
+        }
+        if original.current().is_ok() || io.source().is_some() {
+            return TestResult::Fail("failed native MMIO owner retained copied source");
         }
         io.write8(0x29, 0);
         io.write16(0x2c, 0);

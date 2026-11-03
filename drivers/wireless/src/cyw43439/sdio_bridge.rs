@@ -14,6 +14,9 @@ use narf_drivers_sdio::sdio::function::{SdioError, SdioFunction};
 use super::transport::{Function, PacketTransport, Transport, TransportError};
 use super::{chipclk, sdio};
 
+#[path = "sdio_stop.rs"]
+mod stop;
+
 /// Maximum byte-mode CMD53 command extent (zero count encodes512).
 pub const CYW43439_F2_MAX_BURST: usize = 512;
 
@@ -72,6 +75,7 @@ pub struct SdioTransport<F: SdioFunction> {
     rx_pending: bool,
     flow_stopped: bool,
     failed: bool,
+    stopped: bool,
     /// Card-interrupt wake when the host delivers F1/F2 interrupts.
     interrupt: Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>>,
     /// Save-restore idle dongle sleep (`brcmf_sdio_bus_sleep`), when enabled.
@@ -124,6 +128,7 @@ impl<F: SdioFunction> SdioTransport<F> {
             rx_pending: false,
             flow_stopped: false,
             failed: false,
+            stopped: false,
             interrupt: None,
             sleep: None,
         }
@@ -528,6 +533,9 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
     }
 }
 impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
+    fn confirmed_stop(&mut self) -> Result<(), TransportError> {
+        SdioTransport::confirmed_stop(self)
+    }
     fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
         self.interrupt.clone()
     }

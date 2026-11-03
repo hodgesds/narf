@@ -51,6 +51,11 @@ pub const CMD53_MAX_BLOCK_COUNT: u16 = 511;
 /// tests). The trait carries `&mut self` so adapters may hold mutable
 /// state such as interrupt pending flags without interior mutability.
 pub trait SdioFunction {
+    /// Original fixed native host plus actual Controller/Card generation.
+    /// Defaults None; metadata/function identity supplies no such receipt.
+    fn source(&self) -> Option<crate::source::Source> {
+        None
+    }
     /// Issue CMD52 — read a single byte from (func, addr).
     fn cmd52_read(&mut self, func: u8, addr: u32) -> Result<u8, SdioError>;
 

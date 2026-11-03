@@ -5,7 +5,7 @@ use super::*;
 use crate::rtw88::endpoints;
 const SECOND: [u8; 6] = [2, 4, 6, 8, 10, 14];
 
-fn routed(h: &Harness, body: &[u8]) -> bool {
+pub(super) fn routed(h: &Harness, body: &[u8]) -> bool {
     let ethernet = udp_ipv4(
         AP,
         h.plan.station,

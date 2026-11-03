@@ -24,6 +24,8 @@ mod rf_tracking;
 pub(super) use radio::{QualificationRequest, RadioPreflight};
 #[path = "command_native/lps.rs"]
 mod lps;
+#[path = "command_native/monitor.rs"]
+mod monitor;
 #[path = "command_native/station.rs"]
 mod station;
 
@@ -731,6 +733,9 @@ impl Native {
         mask: u32,
         value: u32,
     ) -> Result<(), super::power::Error> {
+        if self.station_runtime.monitor.is_some() {
+            return Err(super::power::Error::Unsupported);
+        }
         self.radio_access()?;
         // SAFETY: same actual full-aperture/current B radio owner; no parallel
         // producer and outer attempt retains DMA on failure/cancellation.

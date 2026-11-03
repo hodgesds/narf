@@ -621,6 +621,22 @@ adds no completed feature credit. Full release/native gates remain at25 complete
 rows. Counting unvalidated implementations,78 remain; actual signed deployment
 measurements and physical firmware/board acceptance remain separate.
 
+**2026-11-02 — native lifecycle and monitor source recount.** The ledger now
+holds **56 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twenty-two
+source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. Four additional rows now have
+complete bounded source owners: CYW43439 confirmed SDIO stop, RTL8852B
+receive-only monitor, and C21/C22 operating reset and explicit safe rejoin.
+Original native receipts, current device/program/admin generations, old ingress
+retirement and uncertain ownership remain required. The reset path checks its
+original cap/reservation after waits and rejects already-off state; rejoin uses
+fresh caller credentials and key exchange. A separate typed SDIO source helper
+adds no feature credit. Eighteen new feature cases and two helper cases are
+written and unexecuted; scoped formatting and one six-package release metadata
+context pass. Full release/native gates remain at25 completed rows. Counting
+unvalidated implementations,78 remain; physical firmware/board and deployment
+acceptance are separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -630,10 +646,10 @@ measurements and physical firmware/board acceptance remain separate.
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 14 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
-| rtw89 | 9 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking and admitted clock-gated runtime LPS are implemented pending validation; other firmware and AX/BE chips are separate rows |
+| rtw88 | 12 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, runtime/system sleep and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset and explicit safe rejoin are implemented pending validation |
+| rtw89 | 8 | Additional channels/bands/widths, fragmentation, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
-| cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
+| cyw43439 | 11 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop is implemented pending validation |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
 through the common retained FullMAC owner; system suspend, wake offload and
@@ -1603,6 +1619,31 @@ one-stream coding records cannot authorize coded two-stream emission. Family
 unexecuted. The independent default-unsupported SDIO disable helper is specified
 in `drivers/sdio/specification/spec.md` §3 and supplies no standalone Wi-Fi
 stop/reset or feature credit.
+
+### 3.14 Original-owner stop, reset, rejoin and monitor (validation pending)
+
+CYW43439's native PIO transport supplies confirmed-stop success only after the
+actual original host/IRQ, F2, CM3/D11/RAM, clock and F1 receipts; generic or gSPI
+adapters remain unproved. SDPCM Runtime closes work before teardown and pins
+uncertain owners. The separate opaque SDIO source retains actual native PCI and
+nonreviving host/controller/card currentness; it grants no firmware, RF or DATA
+permission. Its fixed-copy scope excludes hardware waits and arbitrary callbacks.
+
+RTL8852B monitor uses fresh role7/NoLink with CMAC TX/autoresponses continuously
+closed. Native source RF/channel observations and completed raw prefix precede
+capture; only original current source/admission/admin/MAC/capture generations
+can publish to AF_PACKET. Pending fixed-channel metadata earns no native receipt,
+and no retune or new RF emitter is introduced. Existing signed v2 bytes remain
+unchanged. Other channels, optional metadata and injection stay unadvertised.
+
+RTW88 `reset_function` serializes its original BDF, retires old ingress and actual
+native DMA, then performs current source card reset and factory identity checks
+before a fresh cold firmware shell. `rejoin_function` preserves the original
+netdev and uses explicit zeroizing pending credentials for fresh provisioning,
+scan and native authentication; original new-UP identity remains a denial fence
+through real publication. No old peer/key/PN or automatic credentials are replayed.
+Family §3 sections are normative. Eighteen feature cases plus two SDIO helper
+cases are written and unexecuted; physical acceptance remains separate.
 
 ## 4. Interaction with `narf-wireless`
 

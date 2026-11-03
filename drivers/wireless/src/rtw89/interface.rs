@@ -118,6 +118,12 @@ pub(super) struct Device<I: Io> {
     sleep_capable: AtomicBool,
     sleep_enabled: AtomicBool,
     sleep_identity: IrqSafeSpinLock<Option<narf_net::native_emission::Lifetime>>,
+    monitor_capable: AtomicBool,
+    desired: Arc<super::monitor::Desired>,
+    selection: super::monitor::Selection,
+    registration: IrqSafeSpinLock<Option<narf_net::iface::OpenStopEvent>>,
+    monitor_admin: IrqSafeSpinLock<Option<narf_net::iface::OpenStopEvent>>,
+    capture: IrqSafeSpinLock<Option<monitor::Capture>>,
 }
 struct SleepWake(Arc<super::irq::Line>);
 impl alloc::task::Wake for SleepWake {
@@ -148,11 +154,22 @@ impl<I: Io + 'static> narf_net::iface::OpenStopTarget for SleepTarget<I> {
         {
             return;
         }
+        // The concrete target was installed only on this original registration;
+        // rebind clears it. Retain its actual current transition, never a fresh
+        // name lookup, so later metadata controls can observe its sealed epoch.
+        *device.registration.lock() = Some(event.clone());
         let identity = identity.filter(|token| {
             token.watch(core::task::Waker::from(Arc::new(SleepWake(
                 device.line.clone(),
             ))))
         });
+        if device.monitor_selected() {
+            if !event.up() {
+                device.retire_capture();
+                device.admission.close();
+            }
+            *device.monitor_admin.lock() = Some(event.clone());
+        }
         *device.sleep_identity.lock() = identity;
         device.line.raise();
     }
@@ -267,6 +284,7 @@ impl<I: Io + 'static> Device<I> {
         else {
             return false;
         };
+        *this.registration.lock() = narf_net::iface::OpenStopEvent::observe(&snapshot);
         let target = Arc::new(SleepTarget(Arc::downgrade(this)));
         if !narf_net::iface::set_open_stop_target(&snapshot, target.clone()) {
             return false;
@@ -318,6 +336,15 @@ impl<I: Io + 'static> Device<I> {
             sleep_capable: AtomicBool::new(false),
             sleep_enabled: AtomicBool::new(false),
             sleep_identity: IrqSafeSpinLock::new(None),
+            monitor_capable: AtomicBool::new(false),
+            desired: super::monitor::Desired::new(),
+            selection: super::monitor::Selection {
+                mode: 2,
+                generation: 1,
+            },
+            registration: IrqSafeSpinLock::new(None),
+            monitor_admin: IrqSafeSpinLock::new(None),
+            capture: IrqSafeSpinLock::new(None),
         }
     }
     /// Bind MSI delivery to this shell's worker after the station started.
@@ -365,6 +392,14 @@ impl<I: Io + 'static> Device<I> {
     /// One worker period: drain, then sleep until an MSI/TX kick or the
     /// mode's fallback period.
     pub(super) async fn service_once(&self) {
+        if self.monitor_selected() {
+            self.monitor_service().await;
+            let seen = self.line.raised();
+            let _ =
+                narf_time::timeout(narf_time::Deadline::after_ms(POLL_MS), self.line.wait(seen))
+                    .await;
+            return;
+        }
         // Line movement is a scheduling hint. Actual original source/native
         // work decides whether RF wake is necessary; own consumed DONE MSIs
         // must not force a wake/enter cycle.
@@ -437,6 +472,29 @@ impl<I: Io + 'static> Device<I> {
             device: self,
             armed: true,
         };
+        let monitor_capable = self
+            .lifecycle
+            .retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .io
+            .monitor_capable()?;
+        self.monitor_capable
+            .store(monitor_capable, Ordering::Release);
+        if self.monitor_selected() {
+            if !monitor_capable {
+                return Err(Error::State);
+            }
+            self.admission.run(|| {
+                self.admitted.store(true, Ordering::Release);
+                Ok(())
+            })?;
+            attempt.armed = false;
+            self.line.raise();
+            return Ok(());
+        }
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
@@ -486,7 +544,9 @@ impl<I: Io + 'static> Device<I> {
         }
     }
     fn control_ready(&self) -> Result<(), WirelessError> {
-        if self.closed() {
+        if self.monitor_selected() {
+            Err(WirelessError::NotSupported)
+        } else if self.closed() {
             Err(WirelessError::HardwareError)
         } else if !self.admitted.load(Ordering::Acquire) {
             Err(WirelessError::Busy)
@@ -548,6 +608,9 @@ impl<I: Io + 'static> Device<I> {
         result.map_err(|_| ())
     }
     fn progress(&self) -> Vec<Vec<u8>> {
+        if self.monitor_selected() {
+            return Vec::new();
+        }
         let Some(mut storage) = self.lifecycle.retained.try_lock() else {
             return Vec::new();
         };
@@ -729,6 +792,45 @@ impl<I: Io + 'static> Interface for Device<I> {
 }
 #[async_trait::async_trait]
 impl<I: Io + 'static> WirelessNetIface for Device<I> {
+    fn current_iftype(&self) -> u32 {
+        self.desired.snapshot().mode
+    }
+    fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        self.select_mode(mode)
+    }
+    fn validate_monitor_flags(&self, flags: u32) -> Result<(), WirelessError> {
+        if super::monitor_wire::flags(flags) {
+            Ok(())
+        } else {
+            Err(WirelessError::NotSupported)
+        }
+    }
+    fn set_monitor_channel(
+        &self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<(), WirelessError> {
+        let original = self
+            .original_snapshot()
+            .ok_or(WirelessError::HardwareError)?;
+        if original.link_up {
+            return Err(WirelessError::Busy);
+        }
+        // Exact fixed-channel metadata can be acknowledged on the retiring
+        // original shell after SET_INTERFACE. No native readiness/RF change is
+        // claimed; only its fresh monitor generation may earn capture.
+        if self.desired.snapshot().mode != super::monitor_wire::IFTYPE
+            || !self.published.load(Ordering::Acquire)
+            || self.retired.load(Ordering::Acquire)
+        {
+            return Err(WirelessError::Busy);
+        }
+        if super::monitor_wire::channel(channel) {
+            Ok(())
+        } else {
+            Err(WirelessError::NotSupported)
+        }
+    }
+
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -782,7 +884,12 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
                 freq_mhz: 2400,
                 channels: vec![1],
             }],
-            modes: WirelessModes::STATION,
+            modes: WirelessModes::STATION
+                | if self.monitor_capable.load(Ordering::Acquire) {
+                    WirelessModes::MONITOR
+                } else {
+                    WirelessModes::empty()
+                },
             hw_caps: HwCaps {
                 ht_supported: false,
                 vht_supported: false,
@@ -855,6 +962,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         result.map_err(error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        if self.monitor_selected() {
+            return Err(WirelessError::NotSupported);
+        }
         let _disconnect = self
             .admission
             .begin_disconnect()
@@ -1051,3 +1161,6 @@ impl<I: Io + 'static> Interface for Registered<I> {
         self.0.tx_ring()
     }
 }
+
+#[path = "interface_monitor.rs"]
+mod monitor;

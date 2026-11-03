@@ -219,6 +219,7 @@ fn smoke_rtw88_unready_control_plane_fails_closed() -> TestResult {
         tx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
         diagnostic_name: "rtw88-unready-fixture",
         provisioning: narf_lib::mutex::Mutex::new(()),
+        reset_origin: None,
     };
     let request = AssociateRequest {
         bssid: [0x02, 0, 0, 0, 0, 1],

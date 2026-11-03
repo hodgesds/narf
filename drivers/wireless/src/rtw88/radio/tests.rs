@@ -402,6 +402,23 @@ unsafe impl Io for RadioIo {
         self.gate = Some(gate);
         Ok(())
     }
+    fn station_bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        if !self.packet_ready() || self.mailbox_pending {
+            return Err(Error::State);
+        }
+        let gate = self.gate.as_ref().ok_or(Error::State)?.with_host(host)?;
+        let current = gate.clone();
+        let policy = self.policy.clone();
+        self.packets.authority = Some(Arc::new(move || {
+            current.current_with_policy_for_test(&policy.lock()).is_ok()
+        }));
+        self.gate = Some(gate);
+        Ok(())
+    }
     fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
         self.station_allowed()?;
         if self.mailbox_pending {

@@ -88,7 +88,10 @@ impl Subscriber {
         *self.0.lock() = Some(notify);
     }
     fn clear(&self) {
-        self.0.lock().take();
+        let previous = { self.0.lock().take() };
+        // Captured state may have its own destructor. Never run it while
+        // the subscription's IRQ guard is held.
+        drop(previous);
     }
 }
 impl core::fmt::Debug for Subscriber {
@@ -115,12 +118,14 @@ pub struct Card<R: Registers> {
     functions: [FunctionInfo; 8],
     block_sizes: [u16; 8],
     enabled: u8,
+    live: alloc::sync::Arc<crate::source::Lifetime>,
     /// Platform card-interrupt line; dropped (masked) after the host's
     /// signal enables are cleared.
     interrupt: Option<Interrupt>,
 }
 impl<R: Registers> Drop for Card<R> {
     fn drop(&mut self) {
+        self.live.retire();
         if let Some(interrupt) = self.interrupt.as_ref() {
             interrupt.subscriber.clear();
         }
@@ -141,6 +146,7 @@ impl<R: Registers> Card<R> {
             functions: [FunctionInfo::default(); 8],
             block_sizes: [0; 8],
             enabled: 0,
+            live: crate::source::Lifetime::new(),
             interrupt: None,
         };
         card.start(config)?;
@@ -502,6 +508,9 @@ fn map_error(error: HostError) -> SdioError {
     }
 }
 impl<R: Registers> SdioFunction for Card<R> {
+    fn source(&self) -> Option<crate::source::Source> {
+        self.controller.source()?.retain_card(&self.live)
+    }
     fn cmd52_read(&mut self, func: u8, addr: u32) -> Result<u8, SdioError> {
         self.direct(false, func, addr, 0)
     }
@@ -646,6 +655,9 @@ impl<R: Registers> SdioFunction for Card<R> {
         if func == 0 || func > self.host.func_count {
             return Err(SdioError::BadFunction);
         }
+        // Destructive native function retirement cannot leave a copied AP
+        // host/Card receipt live, even if a later explicit enable succeeds.
+        self.live.retire();
         let bit = 1 << func;
         // Deny host transfers before any uncertain native transition. CMD52
         // cleanup remains possible; an explicit new enable is a separate act.

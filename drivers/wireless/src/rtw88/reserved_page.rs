@@ -126,6 +126,9 @@ pub(super) unsafe trait Registers: Send {
     fn station_bind_ht(&mut self, _: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_bind_host(&mut self, _: narf_net::native_emission::Lifetime) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
@@ -572,6 +575,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn station_bind_ht(&mut self, g: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
         self.io.station_bind_ht(g)
+    }
+    fn station_bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.io.station_bind_host(host)
     }
     fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
         self.io.station_ht_program_quiet()

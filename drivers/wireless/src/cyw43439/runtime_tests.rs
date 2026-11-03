@@ -126,7 +126,7 @@ fn smoke_cyw_f2_control_correlates_and_demultiplexes() -> TestResult {
     let mut runtime = Runtime::new(bus);
     if ready(runtime.command(ioctl::Direction::Get, 1, &[0; 4], 4)) != Some(Ok(vec![1, 2, 3, 4]))
         || runtime.pop_data() != Some(ethernet())
-        || runtime.transport.tx.len() != 1
+        || runtime.transport.as_mut().unwrap().tx.len() != 1
         || runtime.tx_sequence != 1
         || runtime.pending.is_some()
         || runtime.is_failed()
@@ -159,7 +159,7 @@ fn smoke_cyw_f2_get_query_zero_fills_linux_wire_extent() -> TestResult {
         {
             return TestResult::Fail("query wire fixture did not complete");
         }
-        let bytes = &runtime.transport.tx[0];
+        let bytes = &runtime.transport.as_mut().unwrap().tx[0];
         let length = HwHeader::decode(bytes).unwrap().length as usize;
         let header = BcdcHeader::decode(&bytes[12..]).unwrap();
         if header.cmd != command
@@ -233,6 +233,8 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
     runtime.tx_sequence = 254;
     runtime
         .transport
+        .as_mut()
+        .unwrap()
         .rx
         .push_back(frame(0, CHANNEL_CONTROL, 3, &[]));
     if runtime.poll() != Ok(1) {
@@ -248,7 +250,7 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
     runtime.set_ac_priority([1, 0, 0, 1, 3, 3, 1, 1]);
     if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
         || runtime.send_data(&ethernet(), 6) != Err(Error::Busy)
-        || !runtime.transport.tx.is_empty()
+        || !runtime.transport.as_mut().unwrap().tx.is_empty()
     {
         return TestResult::Fail("TX ignored the precedence-mapped flow stop");
     }
@@ -260,9 +262,9 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
         }
     }
     if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
-        || runtime.transport.tx.len() != 3
-        || runtime.transport.tx[0][4] != 254
-        || runtime.transport.tx[0][12..16] != [0x20, 0, 0, 0]
+        || runtime.transport.as_mut().unwrap().tx.len() != 3
+        || runtime.transport.as_mut().unwrap().tx[0][4] != 254
+        || runtime.transport.as_mut().unwrap().tx[0][12..16] != [0x20, 0, 0, 0]
     {
         return TestResult::Fail("data consumed reserved control credit or invalid BDC header");
     }
@@ -281,17 +283,19 @@ fn smoke_cyw_f2_global_busy_preserves_credit_and_rx() -> TestResult {
     runtime.tx_max = 8;
     runtime
         .transport
+        .as_mut()
+        .unwrap()
         .rx
         .push_back(frame(0, CHANNEL_CONTROL, 8, &[]));
     if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
         || runtime.tx_sequence != 0
         || runtime.is_failed()
         || runtime.poll() != Ok(1)
-        || !runtime.transport.tx.is_empty()
+        || !runtime.transport.as_mut().unwrap().tx.is_empty()
     {
         return TestResult::Fail("global FIFO stop consumed sequence/credit or blocked RX");
     }
-    runtime.transport.busy = false;
+    runtime.transport.as_mut().unwrap().busy = false;
     if runtime.send_data(&ethernet(), 0).is_err() || runtime.tx_sequence != 1 {
         return TestResult::Fail("unblocked FIFO did not resume retained credit");
     }
@@ -308,7 +312,7 @@ fn smoke_cyw_f2_cancel_and_bus_error_fail_session() -> TestResult {
     if ready(runtime.command(ioctl::Direction::Set, 2, &[], 0)).is_some()
         || !runtime.is_failed()
         || ready(runtime.command(ioctl::Direction::Get, 1, &[], 4)) != Some(Err(Error::Failed))
-        || !runtime.transport.tx.is_empty()
+        || !runtime.transport.as_mut().unwrap().tx.is_empty()
     {
         return TestResult::Fail("cancelled control request could be replayed");
     }
@@ -350,10 +354,15 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
     for seq in 0..17 {
         runtime
             .transport
+            .as_mut()
+            .unwrap()
             .rx
             .push_back(frame(seq, CHANNEL_EVENT, 8, &event));
     }
-    if runtime.poll() != Ok(16) || runtime.events.len() != 16 || runtime.transport.rx.len() != 1 {
+    if runtime.poll() != Ok(16)
+        || runtime.events.len() != 16
+        || runtime.transport.as_mut().unwrap().rx.len() != 1
+    {
         return TestResult::Fail("F2 worker exceeded RX budget");
     }
     if runtime.poll() != Ok(1) || runtime.pop_event().map(|e| e.header.event_type) != Some(16) {
@@ -362,6 +371,8 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
     // Repeated sequence does not dispatch the last event twice.
     runtime
         .transport
+        .as_mut()
+        .unwrap()
         .rx
         .push_back(frame(16, CHANNEL_EVENT, 8, &event));
     if runtime.poll() != Ok(1) || runtime.events.len() != 16 {
@@ -373,13 +384,18 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
         frame(0, CHANNEL_GLOM, 8, &[0; 20]),
     ] {
         let mut runtime = Runtime::new(Bus::default());
-        runtime.transport.rx.push_back(bad.clone());
+        runtime
+            .transport
+            .as_mut()
+            .unwrap()
+            .rx
+            .push_back(bad.clone());
         if runtime.poll().is_ok() || !runtime.is_failed() {
             return TestResult::Fail("unsupported or malformed packet admitted");
         }
         bad[2] ^= 1;
         let mut runtime = Runtime::new(Bus::default());
-        runtime.transport.rx.push_back(bad);
+        runtime.transport.as_mut().unwrap().rx.push_back(bad);
         if runtime.poll() != Err(Error::Malformed) {
             return TestResult::Fail("bad checksum accepted");
         }

@@ -998,3 +998,9 @@ kernel_test_in!(
 #[cfg(feature = "kernel-test")]
 #[path = "command_native_lps_tests.rs"]
 pub(in crate::rtw89) mod lps_tests;
+
+#[path = "command_native_monitor_tests.rs"]
+mod monitor_tests;
+pub(in crate::rtw89) fn monitor_boundary() -> Result<(), &'static str> {
+    monitor_tests::run()
+}

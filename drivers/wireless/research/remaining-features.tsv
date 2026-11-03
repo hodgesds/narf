@@ -20,25 +20,24 @@ ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wirele
 ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	1188
 ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	1192
 ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	1189
-brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/cyw43439.md	532
-brcmfmac	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	529
-brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/cyw43439.md	527
-brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	530
-brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	530
-brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	529
-cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	533
-cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	530
-cyw43439	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	526
-cyw43439	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	529
-cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	530
-cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	530
+brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/cyw43439.md	533
+brcmfmac	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	530
+brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/cyw43439.md	528
+brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	531
+brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	531
+brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	530
+cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	534
+cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	531
+cyw43439	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	530
+cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	531
+cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	531
 cyw43439	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	526
-cyw43439	sdio_host_dma	SDIO host DMA operation	feature	drivers/wireless/specification/cyw43439.md	531
-cyw43439	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	528
-cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	528
+cyw43439	sdio_host_dma	SDIO host DMA operation	feature	drivers/wireless/specification/cyw43439.md	532
+cyw43439	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	529
+cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	529
 cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	526
-cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	530
-cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	529
+cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	531
+cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	530
 iwlwifi	mlo	Native single-link non-AP MLD is implemented for admitted EHT Sc/Bz profiles with original FW-link/STA/band/epoch admission, logical SAE/PTK/per-link KDEs, encrypted data/rekeys, exact M4 terminal ownership and default-link restoration. The six native/Session cases are software-accepted at6813a24c6. Multiple simultaneously active links still require separate PHY/STA/queue/power/key/PN/reorder/control owners.	feature	drivers/wireless/specification/iwlwifi.md	4000
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2234
 mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2409
@@ -62,31 +61,28 @@ rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be r
 rtlwifi	rtl8821ae	RTL8821AE retained runtime; blocked on porting the rtl8821ae/8812ae VHT dual-band runtime (C2H RA/TX reports, WoWLAN firmware) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1479
 rtlwifi	vht	VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime	feature	drivers/wireless/specification/rtlwifi.md	1592
 rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend	feature	drivers/wireless/specification/rtlwifi.md	1593
-rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	2032
-rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	2033
-rtw88	dpk_tracking	DPK calibration (rtw8822c_do_dpk) and thermal DPK tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	2034
-rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	2035
-rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	2036
-rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	2038
-rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	2039
-rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2041
-rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	2042
-rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	2043
-rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	2044
-rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	2045
-rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	2046
-rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	2048
-rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	2049
-rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	2068
-rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2020
-rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	2069
-rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	2071
-rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	2072
-rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2079
-rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading and its NHM noise monitoring (support_noise)	chip	drivers/wireless/specification/rtw89.md	2078
-rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw89.md	2080
-rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	2081
-rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/rtw89.md	2075
-rtw89	uapsd	AP-side U-APSD (WIPHY_FLAG_AP_UAPSD) with AP mode; station U-APSD is inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD)	feature	drivers/wireless/specification/rtw89.md	2076
-rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	2070
-rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	2077
+rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	2107
+rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	2108
+rtw88	dpk_tracking	DPK calibration (rtw8822c_do_dpk) and thermal DPK tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	2109
+rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	2110
+rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	2111
+rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	2114
+rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2116
+rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	2117
+rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	2119
+rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	2120
+rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	2121
+rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	2123
+rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	2124
+rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	2145
+rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2097
+rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	2146
+rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	2148
+rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2156
+rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading and its NHM noise monitoring (support_noise)	chip	drivers/wireless/specification/rtw89.md	2155
+rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw89.md	2157
+rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	2158
+rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/rtw89.md	2152
+rtw89	uapsd	AP-side U-APSD (WIPHY_FLAG_AP_UAPSD) with AP mode; station U-APSD is inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD)	feature	drivers/wireless/specification/rtw89.md	2153
+rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	2147
+rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	2154

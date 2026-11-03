@@ -176,6 +176,12 @@ impl<I: Io> Owner<I> {
             .send_prefix(&mut self.io, frames)
     }
     pub(super) fn station_stop(&mut self) -> Result<(), super::station::Error> {
+        if self.io.monitor_active() {
+            return self
+                .io
+                .monitor_stop()
+                .map_err(super::station::Error::Native);
+        }
         match self.station.as_mut() {
             Some(station) => station.stop(&mut self.io),
             None => self

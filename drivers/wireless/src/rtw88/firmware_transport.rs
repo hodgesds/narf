@@ -397,6 +397,9 @@ pub(super) unsafe trait Io: Send {
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
         Err(Error::Unsupported)
     }
+    fn station_bind_host(&mut self, _: narf_net::native_emission::Lifetime) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_tx_ba(
         &mut self,
         _: alloc::sync::Arc<super::tx_ba_power::Grant>,
@@ -706,6 +709,13 @@ impl<I: Io> Owner<I> {
     }
     pub(super) fn dma_reclaimable(&self) -> bool {
         self.io.dma_reclaimable()
+    }
+    pub(super) fn bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.io.station_allowed()?;
+        self.io.station_bind_host(host)
     }
     pub(super) async fn station_scan(
         &mut self,
