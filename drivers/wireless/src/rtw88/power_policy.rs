@@ -772,6 +772,16 @@ impl Gate {
             None => Some(grant.power().indices()),
         }
     }
+    /// B22 `N2BP` measured thermal windows (`operating8822b::Grant::temperature`).
+    pub(super) fn b22_temperature(
+        &self,
+        value: u8,
+    ) -> Result<(), super::firmware_transport::Error> {
+        match &self.scope {
+            Scope::B22(grant, _) => grant.temperature(value),
+            _ => Err(super::firmware_transport::Error::Unsupported),
+        }
+    }
     /// C21 cross-band `rtw8821c_set_channel` facts (None on C22).
     pub(super) fn band_facts(&self) -> Option<super::radio8821c::BandFacts> {
         match &self.scope {

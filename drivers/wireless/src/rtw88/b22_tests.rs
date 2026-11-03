@@ -1012,7 +1012,7 @@ fn smoke_rtw8822be_n2bd_dm_admission_and_phy_status() -> TestResult {
     };
     if dm::bounds(0xb822, &payload(dm::DIG | dm::RA)).is_none()
         || dm::bounds(0xb822, &payload(dm::DIG | dm::CCK_PD)).is_some()
-        || dm::bounds(0xb822, &payload(dm::PWR_TRACK)).is_some()
+        || dm::bounds(0xb822, &payload(dm::PWR_TRACK)).is_none()
         || dm::bounds(0xb822, &payload(dm::EDCCA)).is_some()
         || dm::bounds(0xb822, &payload(dm::PATH_DIV)).is_some()
     {
@@ -1054,4 +1054,108 @@ fn smoke_rtw8822be_n2bd_dm_admission_and_phy_status() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_n2bd_dm_admission_and_phy_status
+);
+
+/// `rtw8822b_pwr_track` under the dm authority: trigger pass, then the
+/// sampled pass writes `rtw8822b_pwrtrack_set_pwr` per path from the 2.4 GHz
+/// OFDM tables and the programmed index; out-of-window samples and swing
+/// deltas beyond the `N2BD` power bounds refuse before any write; threshold 8
+/// reports `rtw_phy_pwrtrack_need_iqk`. The `N2BW` kind binds only its exact
+/// `N2BD`. Written; not yet executed natively.
+fn smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission() -> TestResult {
+    use super::super::dm::Authority;
+    use super::super::firmware_transport::Error;
+    use super::super::tracking8822b::{Limits, Pass, Tracker, KIND};
+    use super::super::{qualification, radio8822b};
+    struct Open;
+    impl Authority for Open {
+        fn run<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+            op()
+        }
+    }
+    let mut payload = [0u8; qualification::PAYLOAD];
+    payload[..32].copy_from_slice(&[5; 32]);
+    payload[32] = 10;
+    payload[33] = 50;
+    let admit = |did: u16, p: &[u8; qualification::PAYLOAD]| (KIND.admit)(did, p);
+    let mut tail = payload;
+    tail[40] = 1;
+    let mut unbound = payload;
+    unbound[..32].copy_from_slice(&[0; 32]);
+    if !admit(0xb822, &payload)
+        || admit(0xc821, &payload)
+        || admit(0xb822, &tail)
+        || admit(0xb822, &unbound)
+    {
+        return TestResult::Fail("8822B N2BW payload admission differs");
+    }
+    let mut io = super::mac_tests::Model::new(3, 2);
+    io.sipi8822b = true;
+    let at = |reg: usize| reg..reg + 4;
+    io.regs[at(0xc1c)].copy_from_slice(&(radio8822b::TXSCALE[24] << 21).to_le_bytes());
+    io.regs[at(0xe1c)].copy_from_slice(&(radio8822b::TXSCALE[24] << 21).to_le_bytes());
+    let meter = |io: &mut super::mac_tests::Model, t: u32| {
+        io.regs[0x2800 + 0x42 * 4..0x2800 + 0x42 * 4 + 4].copy_from_slice(&(t << 10).to_le_bytes())
+    };
+    let limits = Limits {
+        thermal: [10, 50],
+        up: 10,
+        down: 10,
+    };
+    let indices = [[0x20; 12]; 2];
+    let mut tracker = Tracker::new(25, 24);
+    let pass = |io: &mut super::mac_tests::Model, t: &mut Tracker, limits: Limits| {
+        narf_scheduler::block_on(t.pass(io, &Open, indices, |_| Ok(()), limits, 4))
+    };
+    if pass(&mut io, &mut tracker, limits) != Ok(Pass::Triggered) {
+        return TestResult::Fail("8822B power tracking did not trigger RF42 first");
+    }
+    meter(&mut io, 30);
+    if pass(&mut io, &mut tracker, limits)
+        != Ok(Pass::Tracked {
+            thermal: 30,
+            iqk: false,
+        })
+    {
+        return TestResult::Fail("8822B power tracking sample differs");
+    }
+    let r32 = |io: &super::mac_tests::Model, reg: usize| {
+        u32::from_le_bytes(io.regs[at(reg)].try_into().unwrap())
+    };
+    // delta 5: _2ga_p[5] = 3, _2gb_p[5] = 2; offset min(0x3f - 0x20, 0xf).
+    if (r32(&io, 0xc94) >> 25) & 0x1f != 3
+        || (r32(&io, 0xe94) >> 25) & 0x1f != 2
+        || r32(&io, 0xc1c) >> 21 != radio8822b::TXSCALE[24]
+        || tracker.delta_power() != [3, 2]
+    {
+        return TestResult::Fail("8822B pwrtrack_set_pwr differs from rtw8822b_pwrtrack_set");
+    }
+    let mut hot = Tracker::new(25, 24);
+    meter(&mut io, 55);
+    let _ = pass(&mut io, &mut hot, limits);
+    if pass(&mut io, &mut hot, limits) != Err(Error::Prerequisite) {
+        return TestResult::Fail("8822B power tracking admitted a sample outside N2BD");
+    }
+    let mut tight = Tracker::new(25, 24);
+    meter(&mut io, 45);
+    let _ = pass(&mut io, &mut tight, Limits { up: 2, ..limits });
+    if pass(&mut io, &mut tight, Limits { up: 2, ..limits }) != Err(Error::Prerequisite) {
+        return TestResult::Fail("8822B power tracking exceeded the N2BD power bound");
+    }
+    let mut drift = Tracker::new(25, 24);
+    meter(&mut io, 34);
+    let _ = pass(&mut io, &mut drift, limits);
+    if pass(&mut io, &mut drift, limits)
+        != Ok(Pass::Tracked {
+            thermal: 34,
+            iqk: true,
+        })
+    {
+        return TestResult::Fail("8822B need_iqk threshold 8 differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission
 );

@@ -776,10 +776,25 @@ async fn program8822b(
 /// only logs the REG_IQKFAILMSK 0x1bf0 fail/reload bits; this owner refuses
 /// them (as the `N2BQ` IQK does), and refuses a stale done marker.
 pub(super) async fn iqk8822b(io: &mut impl Io) -> Result<(), Error> {
+    iqk8822b_from(io, false).await
+}
+
+/// The same `rtw8822b_do_iqk` from the associated-station `N2BW` maintenance
+/// (`rtw8822b_phy_pwrtrack` re-IQK), after the TX/RX quiet receipts.
+pub(super) async fn iqk8822b_associated(io: &mut impl Io) -> Result<(), Error> {
+    iqk8822b_from(io, true).await
+}
+
+async fn iqk8822b_from(io: &mut impl Io, associated: bool) -> Result<(), Error> {
     if super::radio8822b::rf_read(io, 0, 0x08).await? == 0xabcde {
         return Err(Error::Prerequisite);
     }
-    io.station_retune_iqk().await?;
+    if associated {
+        io.station_b22_iqk(super::tracking8822b::Step::Submit)
+            .await?;
+    } else {
+        io.station_retune_iqk().await?;
+    }
     wait_h2c(io).await?;
     let mut complete = false;
     for attempt in 0..300 {

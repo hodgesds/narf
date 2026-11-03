@@ -30,10 +30,11 @@ pub(super) const DPK: u16 = 1 << 7;
 const C21_MECHANISMS: u16 = DIG | CCK_PD | RA;
 const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDCCA | DPK;
 /// RTL8822BE: `rtw8822b_dig` (0xc50/0xe50), the 8821C-identical
-/// `rtw8822b_false_alarm_statistics` and RA. 8822B has no `cck_pd_set`, no
-/// `config_tx_path`/CFO/DPK hooks; its `rtw8822b_pwr_track`/re-IQK and
-/// `rtw8822b_adaptivity` are not admitted here.
-const B22_MECHANISMS: u16 = DIG | RA;
+/// `rtw8822b_false_alarm_statistics`, RA and `rtw8822b_pwr_track`
+/// ([`super::tracking8822b`]; its re-IQK needs the separate `N2BW`). 8822B
+/// has no `cck_pd_set`, no `config_tx_path`/CFO/DPK hooks; its
+/// `rtw8822b_adaptivity` is not admitted here.
+const B22_MECHANISMS: u16 = DIG | RA | PWR_TRACK;
 /// Linux `RTW_WATCH_DOG_DELAY_TIME`.
 pub(super) const PERIOD_MS: u64 = 2000;
 
@@ -60,7 +61,7 @@ coef 20x 1bd4 tbl, saturate 1000/0fff fallback 1fff/04001fff, txagc-6 1b67, gs d
 enable 1b08/1b60 bit31 gs; dpk_track ewma thermal(10,4) delta-k_delta 1b58[6:0] bounded by payload window; restore dpd off";
 
 /// RTL8822BE dm contract (`N2BD`), hashed with [`SOURCE`] for B22 requests.
-pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track and rtw8822b_adaptivity not admitted";
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track type0 bit5: RF42[17:16]=3 trigger, next pass RF-A 42[15:10] inside N2BD and N2BP windows, EWMA thermal(10,4), init_trigger or avg!=sample, delta=min(|avg-efuse A|,29) one meter both paths, rtw8822b_pwrtrk_2g{a,b}_{p,n}/2g_cck tables bounded by N2BD power_up/down, rtw8822b_pwrtrack_set with the committed channel TXAGC index offset 3f-index, txagc_swing_offset max 0xf upper default+10, c94/e94[29:25] c1c/e1c[31:21] rtw8822b_txscale_tbl, default_ofdm_index from c1c (rtw8822b_get_swing_index else 24), base fields restored; need_iqk threshold 8 only through N2BW; rtw8822b_adaptivity not admitted";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     bounds(did, p).is_some()
@@ -160,6 +161,15 @@ impl Facts {
 /// Runs one register group under the current continuation/base authority.
 pub(super) trait Authority {
     fn run<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error>;
+    /// RTL8822BE committed-channel per-path coded TXAGC indices (DESC_RATE
+    /// 0..11) `rtw8822b_pwrtrack_set` offsets against.
+    fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+        None
+    }
+    /// RTL8822BE `N2BP` measured thermal windows.
+    fn b22_temperature(&self, _: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 
 const DIG_PERF_FA_TH_LOW: u16 = 250;
@@ -537,6 +547,10 @@ pub(super) struct Tracker {
     base_igi: u8,
     base_edcca: u32,
     dpk: Option<super::dpk::Dpk>,
+    /// RTL8822BE `rtw8822b_pwr_track` state and the base TXAGC/scale fields.
+    b22_power: Option<(super::tracking8822b::Tracker, super::tracking8822b::Base)>,
+    /// `rtw_phy_pwrtrack_need_iqk` fired: the caller runs the `N2BW` IQK.
+    iqk_due: bool,
 }
 
 impl Tracker {
@@ -583,7 +597,14 @@ impl Tracker {
             base_edcca: 0,
             dpk: (facts.c22() && bounds.enabled & DPK != 0)
                 .then(|| super::dpk::Dpk::new(bounds.dpk_window, bounds.thermal)),
+            b22_power: None,
+            iqk_due: false,
         }
+    }
+    /// Whether `rtw_phy_pwrtrack_need_iqk` fired in the last period; the
+    /// flag is consumed.
+    pub(super) fn take_iqk(&mut self) -> bool {
+        core::mem::take(&mut self.iqk_due)
     }
     pub(super) fn bounds(&self) -> Bounds {
         self.bounds
@@ -707,10 +728,20 @@ impl Tracker {
             if c22 {
                 self.base_edcca = Self::read(io, 0x84c).await? & 0xffff_0000;
             }
+            if self.facts.b22() && self.bounds.enabled & PWR_TRACK != 0 {
+                // rtw8822b_pwrtrack_init over the retained base program.
+                let default = super::radio8822b::pwrtrack_init(io).await?;
+                let base = super::tracking8822b::Base::capture(io).await?;
+                self.b22_power = Some((
+                    super::tracking8822b::Tracker::new(self.facts.thermal[0], default),
+                    base,
+                ));
+            }
             self.rrsr_init = Self::read(io, 0x440).await?;
             Ok(())
         })
         .await?;
+        self.iqk_due = false;
         self.cck_pd_lv = [[0; 2]; 2];
         self.cck_fa_avg = CCK_FA_AVG_RESET;
         self.crystal = self.facts.crystal;
@@ -1240,6 +1271,38 @@ impl Tracker {
         Ok(())
     }
 
+    /// `rtw8822b_pwr_track` over the retained [`super::tracking8822b`]
+    /// state, for the RA-reported `dm_info->tx_rate`.
+    async fn pwr_track8822b(
+        &mut self,
+        io: &mut impl Io,
+        auth: &impl Authority,
+    ) -> Result<(), Error> {
+        let indices = auth.b22_indices().ok_or(Error::State)?;
+        let limits = super::tracking8822b::Limits {
+            thermal: self.bounds.thermal,
+            up: self.bounds.power_up,
+            down: self.bounds.power_down,
+        };
+        let tx_rate = self.tx_rate;
+        let (tracker, _) = self.b22_power.as_mut().ok_or(Error::State)?;
+        let pass = tracker
+            .pass(
+                io,
+                auth,
+                indices,
+                |t| auth.b22_temperature(t),
+                limits,
+                tx_rate,
+            )
+            .await?;
+        self.delta_power = tracker.delta_power();
+        if let super::tracking8822b::Pass::Tracked { iqk: true, .. } = pass {
+            self.iqk_due = true;
+        }
+        Ok(())
+    }
+
     /// `rtw_update_sta_info(.., false)` RA_INFO refresh from the current
     /// qualified data profile with the RSSI-level mask (`main.c`).
     fn ra_info(&self, profile: DataProfile) -> [u8; 8] {
@@ -1309,6 +1372,10 @@ impl Tracker {
             if c22 && self.on(PWR_TRACK) {
                 Self::mask(io, 0x18a0, 0x7f, 0).await?;
                 Self::mask(io, 0x41a0, 0x7f, 0).await?;
+                self.delta_power = [0; 2];
+            }
+            if let Some((_, base)) = self.b22_power.take() {
+                base.restore(io).await?;
                 self.delta_power = [0; 2];
             }
             if self.on(RA) && self.rrsr_init != 0 {
@@ -1468,6 +1535,9 @@ impl Tracker {
         }
         if c22 && self.on(PWR_TRACK) {
             self.pwr_track(io, auth).await?;
+        }
+        if self.facts.b22() && self.on(PWR_TRACK) && self.facts.power_track_type == 0 {
+            self.pwr_track8822b(io, auth).await?;
         }
         if c22 && self.on(EDCCA) {
             let mode = edcca_mode(period.country);

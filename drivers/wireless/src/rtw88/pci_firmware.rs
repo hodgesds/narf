@@ -719,7 +719,7 @@ unsafe impl Registers for Native {
     fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
         let retune = self.state == State::Packets && self.retune.is_some();
         let mission = self.state == State::Packets && self.tracking_maintenance || retune;
-        let expected = if retune {
+        let expected = if retune || self.device.id.device == 0xb822 {
             self.retune_iqk_packet()
         } else {
             super::command::iqk8821c_associated(self.tracking_sequence)
@@ -1147,8 +1147,10 @@ unsafe impl Registers for Native {
         if self.read16(0x10c)? != 0xc5a0 {
             return Err(Error::Prerequisite);
         }
-        for r in [0x230, 0x234, 0x238, 0x23c] {
-            let n = if r == 0x23c { 14 } else { 16 };
+        for (r, n) in [0x230, 0x234, 0x238, 0x23c]
+            .into_iter()
+            .zip(self.fifo_pages())
+        {
             if self.read16(r)? != n {
                 return Err(Error::Prerequisite);
             }
@@ -1388,6 +1390,81 @@ unsafe impl Registers for Native {
         let packet = self.retune_iqk_packet();
         self.submit_h2c(&packet)
     }
+    /// RTL8822BE associated `rtw8822b_do_iqk` maintenance (`N2BW`). Begin
+    /// holds every queue (TXPAUSE 0xff) and requests the RXDMA park
+    /// (`wow.c::rtw_wow_rx_dma_stop` `BIT_RW_RELEASE`); Quiet reports the
+    /// retune receipts plus `BIT_RXDMA_IDLE`; Submit sends the
+    /// `rtw8822b_do_iqk` H2C (clear 0, segment 0) on the retained ring;
+    /// Finish, after a consumed command and still-quiet hardware, releases
+    /// RXDMA and TXPAUSE with readback.
+    fn station_b22_iqk(&mut self, step: super::tracking8822b::Step) -> Result<bool, Error> {
+        use super::dma_stop::{RW_RELEASE, RXPKT_NUM};
+        use super::tracking8822b::Step;
+        if self.device.id.device != 0xb822 || self.state != State::Packets {
+            return Err(Error::State);
+        }
+        match step {
+            Step::Begin => {
+                if self.tracking_maintenance
+                    || self.retune.is_some()
+                    || self.widening
+                    || self.mailbox_pending
+                    || self.command_ring.pending()
+                {
+                    return Err(Error::State);
+                }
+                let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+                if gate.did() != 0xb822 {
+                    return Err(Error::State);
+                }
+                gate.current().map_err(Error::Power)?;
+                if self.read8(0x522)? != 0 || self.read32(RXPKT_NUM)? & RW_RELEASE != 0 {
+                    return Err(Error::Prerequisite);
+                }
+                self.tracking_maintenance = true;
+                self.write8(0x522, 0xff)?;
+                let rx = self.read32(RXPKT_NUM)?;
+                self.write32(RXPKT_NUM, rx | RW_RELEASE)?;
+                self.b22_iqk_quiet()
+            }
+            Step::Quiet => {
+                if !self.tracking_maintenance {
+                    return Err(Error::State);
+                }
+                self.b22_iqk_quiet()
+            }
+            Step::Submit => {
+                if !self.tracking_maintenance || !self.b22_iqk_quiet()? {
+                    return Err(Error::State);
+                }
+                let packet = self.retune_iqk_packet();
+                self.submit_h2c(&packet)?;
+                Ok(true)
+            }
+            Step::Finish => {
+                if !self.tracking_maintenance
+                    || self.command_ring.pending()
+                    || self.read8(0x522)? != 0xff
+                    || !self.b22_iqk_quiet()?
+                {
+                    return Err(Error::Prerequisite);
+                }
+                self.packet_gate
+                    .as_ref()
+                    .ok_or(Error::State)?
+                    .current()
+                    .map_err(Error::Power)?;
+                let rx = self.read32(RXPKT_NUM)?;
+                self.write32(RXPKT_NUM, rx & !RW_RELEASE)?;
+                self.write8(0x522, 0)?;
+                if self.read32(RXPKT_NUM)? & RW_RELEASE != 0 || self.read8(0x522)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+                self.tracking_maintenance = false;
+                Ok(true)
+            }
+        }
+    }
     fn station_retune_finish(&mut self, channel: u8) -> Result<u64, Error> {
         if self.retune != Some(channel)
             || self.command_ring.pending()
@@ -1559,8 +1636,10 @@ unsafe impl Registers for Native {
         if self.read16(0x10c)? != 0xc5a0 {
             return Err(Error::Prerequisite);
         }
-        for r in [0x230, 0x234, 0x238, 0x23c] {
-            let n = if r == 0x23c { 14 } else { 16 };
+        for (r, n) in [0x230, 0x234, 0x238, 0x23c]
+            .into_iter()
+            .zip(self.fifo_pages())
+        {
             if self.read16(r)? != n {
                 return Err(Error::Prerequisite);
             }
@@ -1860,6 +1939,34 @@ impl Native {
             super::command::iqk8821c(self.tracking_sequence)
         }
     }
+    /// `__priority_queue_cfg` FIFOPAGE_INFO_1..4 (hq/lq/nq/exq) as
+    /// `mac::prepare_on` programmed them for this PCI chip: C21
+    /// `page_table_8821c[1]` 16/16/16/14, C22/B22 `page_table_8822{c,b}[1]`
+    /// 64/64/64/64. Quiet receipts compare the configured and free counts
+    /// against these.
+    fn fifo_pages(&self) -> [u16; 4] {
+        if self.device.id.device == 0xc821 {
+            [16, 16, 16, 14]
+        } else {
+            [64; 4]
+        }
+    }
+    /// B22 associated IQK quiet: TXPAUSE held, the retune receipts and the
+    /// parked RXDMA idle.
+    fn b22_iqk_quiet(&mut self) -> Result<bool, Error> {
+        use super::dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM};
+        if self.read8(0x522)? != 0xff || !self.retune_quiet()? {
+            return Ok(false);
+        }
+        let rx = self.read32(RXPKT_NUM)?;
+        if rx == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if rx & RW_RELEASE == 0 {
+            return Err(Error::Prerequisite);
+        }
+        Ok(rx & RXDMA_IDLE != 0)
+    }
     /// Every TX ring and the packet core have retired and the MAC queues
     /// report their reserved pages free (same receipts as tracking quiet).
     fn retune_quiet(&mut self) -> Result<bool, Error> {
@@ -1883,8 +1990,10 @@ impl Native {
         if self.read16(0x10c)? != 0xc5a0 {
             return Err(Error::Prerequisite);
         }
-        for r in [0x230, 0x234, 0x238, 0x23c] {
-            let n = if r == 0x23c { 14 } else { 16 };
+        for (r, n) in [0x230, 0x234, 0x238, 0x23c]
+            .into_iter()
+            .zip(self.fifo_pages())
+        {
             if self.read16(r)? != n {
                 return Err(Error::Prerequisite);
             }

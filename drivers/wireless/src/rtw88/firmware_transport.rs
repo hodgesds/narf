@@ -679,6 +679,15 @@ pub(super) unsafe trait Io: Send {
     ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
         async move { Err(Error::Unsupported) }
     }
+    /// RTL8822BE associated-station IQK maintenance step
+    /// (`tracking8822b::Step`, PCI `Native`): Begin/Quiet report quiet.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_b22_iqk(
+        &mut self,
+        _: super::tracking8822b::Step,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
+    }
     /// Commit the programmed target, reopen TX and return the new epoch.
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_retune_finish(

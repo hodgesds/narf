@@ -517,11 +517,10 @@ equal `rtw8821c.h`; no channel field). The admitted B22 station is the base
 profile only: channel 1 / 20 MHz legacy, host-only crypto, plus the
 per-channel `N2BO` primaries below. `Gate::b22`
 admits no N2xL extension, HT/VHT, BA, protection, coding/QoS,
-fallback, coex or N2xD tracking record, so retune/width/HT/BA/protection
-continuations refuse, `reserved_page::station_boundary(0xb822)` is None (no
-LPS/firmware swap), and no B22 dm watchdog runs `tracking8822b` or re-IQK:
-`N2BS` qualifies only the static awake profile ("pwr_track only under its
-own record") and no such B22 record family exists. No board's
+fallback or coex record, so retune/width/HT/BA/protection
+continuations refuse and `reserved_page::station_boundary(0xb822)` is None (no
+LPS/firmware swap). `N2BS` qualifies only the static awake profile; thermal
+tracking and re-IQK run only under their own `N2BD` + `N2BW` records (below). No board's
 `N2BP`/`N2BS` asset is provisioned, so on real hardware the shell is
 published but stays unadmitted at `PhyTablesPrepared` until signed records
 exist.
@@ -577,10 +576,10 @@ continuation contracts and the dm watchdog" below) as
 are exactly those `rtw8822b.c` implements and this tree ports: DIG
 (`rtw8822b_dig` 0xc50/0xe50[6:0] both paths, `dig_min` 0x1c) over
 `rtw8822b_false_alarm_statistics` (register-identical to the 8821C one) and
-RA (H2C 0x42/0x58/0x40, RRSR). 8822B has no `cck_pd_set`, tx-path-diversity,
-CFO or DPK hooks, so those bits refuse; `rtw8822b_pwr_track` with
-`rtw_phy_pwrtrack_need_iqk` re-IQK and `rtw8822b_adaptivity` EDCCA are not
-yet admitted (bits 5/6 refuse). RSSI follows `rtw8822b.c::
+RA (H2C 0x42/0x58/0x40, RRSR) and `rtw8822b_pwr_track` (bit 5, below).
+8822B has no `cck_pd_set`, tx-path-diversity, CFO or DPK hooks, so those
+bits refuse; `rtw8822b_adaptivity` EDCCA is not yet admitted (bit 6
+refuses). RSSI follows `rtw8822b.c::
 query_phy_status_page0` (PWDB word0[15:8] − 110, path A) and `_page1`
 (PWDB A/B word0[15:8]/[23:16] − 110, two-path `rtw_phy_rf_power_2_rssi`).
 `Lifecycle::prepare_station8822b` records the dm facts (RFE, crystal,
@@ -588,20 +587,57 @@ path-A thermal). As for C21/C22 the dm grant binds at association on 2.4GHz
 only. Case written, unexecuted:
 `smoke_rtw8822be_n2bd_dm_admission_and_phy_status`.
 
-`tracking8822b::Tracker::pass` ports `rtw8822b_pwr_track` (type 0):
+`tracking8822b::Tracker::pass` ports `rtw8822b_pwr_track` (type 0) and is
+driven by the dm watchdog when the `N2BD` payload enables `dm::PWR_TRACK`:
 alternating RF42[17:16] trigger and RF-A meter sample, `DECLARE_EWMA(thermal,
 10, 4)` average, `rtw_phy_pwrtrack_thermal_changed`/`_get_delta`/`_get_pwridx`
 over the `rtw8822b_pwr_track_type0_tbl` 2.4 GHz rows (CCK tables for DESC_RATE
 ≤ 11M), one meter (path A) for both paths, `rtw8822b_pwrtrack_set` with the
-signed `N2BP` per-path per-rate index in place of `rtw_phy_get_tx_power_index`
-(`offset = 0x3f − index`), `rtw8822b_txagc_swing_offset` (max offset 0xf,
-`default_ofdm_index + 10` upper bound) and the 0xc94/0xe94[29:25] and
-0xc1c/0xe1c[31:21] `rtw8822b_txscale_tbl` writes inside `N2BQ` + `N2BP` +
-policy. An erased meter or a rate outside the measured legacy set is refused
-before any write, as is a sample outside the measured windows;
-`rtw_phy_pwrtrack_need_iqk` (threshold 8) is reported to the caller, which
-must run `rtw8822b_do_iqk` under its own record. No B22 dm watchdog drives it
-yet (no station runtime).
+committed channel's coded per-path per-rate index (`Gate::b22_indices`: the
+`N2BP` indices on channel 1, the bound `N2BO` record's elsewhere) in place of
+`rtw_phy_get_tx_power_index` (`offset = 0x3f − index`),
+`rtw8822b_txagc_swing_offset` (max offset 0xf, `default_ofdm_index + 10`
+upper bound) and the 0xc94/0xe94[29:25] and 0xc1c/0xe1c[31:21]
+`rtw8822b_txscale_tbl` writes, all inside the `N2BD` authority (which nests
+`N2BS`/`N2BP`/`N2BQ` and current policy). dm init takes
+`default_ofdm_index` from 0xc1c (`rtw8822b_get_swing_index`, else 24) and
+captures both paths' TXAGC-index/TX-scale fields; restore (authority loss,
+an out-of-envelope pass) writes them back under the base gate. An erased
+meter or a rate outside the measured legacy set is refused before any
+write, as is a sample outside the `N2BD` thermal window or the `N2BP`
+windows and a table delta beyond the `N2BD` `power_up`/`power_down` bounds
+(C22 clamps; B22 refuses and restores).
+
+`rtw_phy_pwrtrack_need_iqk` (threshold 8 against `thermal_meter_k`, the
+EFUSE thermal from `rtw8822b_read_efuse`) runs `rtw8822b_do_iqk` as an
+associated-station maintenance (`station.rs::iqk8822b`) after the period's
+H2C commands, under the separately signed `N2BW` continuation
+(`tracking8822b::KIND`, generic `qualification.rs` layout, magic `N2BW`,
+`rtw88/rtw8822be-power-track-v1-<mac>.bin`, request also hashing
+`tracking8822b::SOURCE`). Payload: bytes 0..32 the exact `N2BD` request
+identity, 32/33 the thermal window [lo, hi] the associated IQK was measured
+over, zero tail. A B22 `N2BD` enabling `PWR_TRACK` binds at association only
+together with an `N2BW` naming it (`tracking8822b::binds`); without one the
+dm program stays unbound. The maintenance (PCI `Native::station_b22_iqk`,
+`tracking8822b::Step`): Begin refuses unless Packets with no retune/width/
+mailbox/H2C in flight, a current B22 gate, TXPAUSE 0 and RXDMA not parked;
+sets TXPAUSE 0x522 = 0xff and `REG_RXPKT_NUM` `BIT_RW_RELEASE`; Quiet is the
+retune receipt (packet core quiet, every TX ring RP == WP, TXDMA_PQ_MAP
+0xc5a0, FIFOPAGE_INFO_1..4 configured == free) plus `BIT_RXDMA_IDLE`, polled
+1000 × 10 µs; a fresh RF-A meter must lie inside the `N2BW` and `N2BP`
+windows; Submit sends the `rtw8822b_do_iqk` H2C (clear 0, segment 0) on the
+retained ring (`submit_h2c` admits exactly that packet for B22), then
+`channel_policy::iqk8822b_associated` polls the ring, RF08 0xabcde
+300 × 20 ms, clears RF08 and refuses any 0x1bf0 fail/reload bit; Finish
+requires a consumed ring and still-quiet hardware, releases RXDMA and
+TXPAUSE with readback. Copied receive admission is retired around it as for
+N21W. Any failure closes the station (no invented coefficient restore).
+The quiet FIFO receipt now uses the per-chip `__priority_queue_cfg` counts
+`mac::prepare_on` programmed (`Native::fifo_pages`: C21 16/16/16/14,
+C22/B22 64/64/64/64); the former 16/16/16/14 constant refused every
+C22/B22 retune, HT program and IQK quiet on real FIFO geometry. No `N2BD`
+or `N2BW` asset is provisioned for any board. Case written, unexecuted:
+`smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission`.
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 

@@ -264,6 +264,8 @@ enum CoexEvent {
 struct Tracking {
     facts: Option<super::dm::Facts>,
     grant: Option<Arc<super::qualification::Grant>>,
+    /// RTL8822BE `N2BW` associated IQK bound to `grant` (`tracking8822b`).
+    iqk: Option<Arc<super::qualification::Grant>>,
     tracker: Option<Box<super::dm::Tracker>>,
     next: u64,
     tx_bytes: u64,
@@ -282,6 +284,12 @@ impl super::dm::Authority for Live<'_> {
         op: impl FnOnce() -> Result<T, firmware_transport::Error>,
     ) -> Result<T, firmware_transport::Error> {
         self.admission.run(|| self.grant.invoke(self.gate, op))
+    }
+    fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+        self.gate.b22_indices()
+    }
+    fn b22_temperature(&self, value: u8) -> Result<(), firmware_transport::Error> {
+        self.gate.b22_temperature(value)
     }
 }
 /// Base-gate-only authority used to restore the base program.
@@ -755,6 +763,7 @@ impl State {
                 };
                 Box::pin(tracker.restore(io, &base)).await?;
                 self.tracking.grant = None;
+                self.tracking.iqk = None;
                 self.tracking.tracker = None;
                 return match e {
                     firmware_transport::Error::Gone => Err(Error::Native(e)),
@@ -766,8 +775,58 @@ impl State {
             grant.check(&gate)?;
             station_control::send(io, words, Some(&admission)).await?;
         }
+        if tracker.take_iqk() {
+            // `rtw8822b_phy_pwrtrack` -> `rtw8822b_do_iqk`, after the period's
+            // H2C commands as in `rtw_phy_dynamic_mechanism` order.
+            let iqk = self.tracking.iqk.clone().ok_or(Error::State)?;
+            if let Err(e) = Box::pin(Self::iqk8822b(io, &admission, &iqk, &gate)).await {
+                self.fail(io);
+                return Err(e);
+            }
+        }
         self.tracking.ticks += 1;
         Ok(true)
+    }
+    /// RTL8822BE associated `rtw8822b_do_iqk` under the `N2BW` record:
+    /// TXPAUSE and RXDMA park, quiet receipts (TX rings, packet core, FIFO
+    /// pages, RXDMA idle) before the H2C, then the RF08/0x1bf0 completion and
+    /// the TX/RX restore. Copied receive admission is retired around it as
+    /// for C21 N21W maintenance. Any failure closes the station.
+    async fn iqk8822b(
+        io: &mut impl Io,
+        admission: &Admission,
+        iqk: &super::qualification::Grant,
+        gate: &super::power_policy::Gate,
+    ) -> Result<(), Error> {
+        use super::tracking8822b::Step;
+        let run = |op: &mut dyn FnMut() -> Result<Option<bool>, firmware_transport::Error>| {
+            admission.run(|| iqk.invoke(gate, op))
+        };
+        let thermal = super::tracking8822b::window(iqk);
+        admission.retire_receive()?;
+        let mut quiet = firmware_transport::enclosed(run, io.station_b22_iqk(Step::Begin)).await?;
+        for _ in 0..1000 {
+            if quiet {
+                break;
+            }
+            io.delay_us(10).await;
+            quiet = firmware_transport::enclosed(run, io.station_b22_iqk(Step::Quiet)).await?;
+        }
+        if !quiet {
+            return Err(Error::Native(firmware_transport::Error::Timeout));
+        }
+        firmware_transport::enclosed(|op| admission.run(|| iqk.invoke(gate, op)), async {
+            let t = ((super::radio8822b::rf_read(io, 0, 0x42).await? & 0xfc00) >> 10) as u8;
+            if !(thermal[0]..=thermal[1]).contains(&t) {
+                return Err(firmware_transport::Error::Prerequisite);
+            }
+            gate.b22_temperature(t)?;
+            super::channel_policy::iqk8822b_associated(io).await
+        })
+        .await?;
+        firmware_transport::enclosed(run, io.station_b22_iqk(Step::Finish)).await?;
+        admission.retire_receive()?;
+        Ok(())
     }
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
@@ -2716,8 +2775,22 @@ impl State {
             .filter(|_| !super::band5::primary(self.channel))
         {
             let gate = io.station_gate()?;
-            if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
-                self.tracking.grant = Some(g);
+            if let Some(b) =
+                super::dm::bounds(gate.did(), g.payload()).filter(|_| g.check(&gate).is_ok())
+            {
+                // B22 `rtw8822b_pwr_track` re-IQKs at threshold 8: the dm
+                // program binds only together with its exact `N2BW` record.
+                let iqk = if gate.did() == 0xb822 && b.enabled & super::dm::PWR_TRACK != 0 {
+                    io.station_continuation(&super::tracking8822b::KIND)?
+                        .filter(|w| super::tracking8822b::binds(w, &g) && w.check(&gate).is_ok())
+                        .map(Some)
+                } else {
+                    Some(None)
+                };
+                if let Some(iqk) = iqk {
+                    self.tracking.grant = Some(g);
+                    self.tracking.iqk = iqk;
+                }
             }
         }
         if let Some(facts) = self

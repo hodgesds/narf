@@ -282,6 +282,9 @@ pub(super) unsafe trait Registers: Send {
     fn station_retune_iqk(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_b22_iqk(&mut self, _: super::tracking8822b::Step) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_retune_finish(&mut self, _: u8) -> Result<u64, Error> {
         Err(Error::Unsupported)
     }
@@ -692,6 +695,13 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         &mut self,
     ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
         async move { self.io.station_retune_iqk() }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_b22_iqk(
+        &mut self,
+        step: super::tracking8822b::Step,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_b22_iqk(step) }
     }
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_retune_finish(
