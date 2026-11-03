@@ -817,7 +817,10 @@ fn program<M: MmioWindow + ?Sized>(
             });
         }
         // Modeset retry at the trained configuration: the port is stopped
-        // and re-enabled; the pipe keeps its reservation.
+        // and re-enabled; the pipe keeps its reservation. Its PM demand
+        // keeps the reserved port clock: a carried fallback only drops
+        // lanes at that rate (see activate), so this is exact, and a lower
+        // rate would be the documented over-request, never an under-one.
         stop_port(io, route)?;
         let retry = enable_port(io, route, trained.rate, trained.lanes)?;
         if retry.rate != trained.rate || retry.lanes != trained.lanes {

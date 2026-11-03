@@ -618,7 +618,7 @@ fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
     };
     let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
         Ok(route) if route.state() == HdmiRouteState::Live => route,
-        _ => return TestResult::Fail("scrambled 594 MHz HDMI must light pipe A"),
+        _ => return TestResult::Fail("scrambled 594 MHz HDMI must light Pipe B"),
     };
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, true, true);
     if io.read32(TRANS_DDI_FUNC_CTL_B) != func
