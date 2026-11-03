@@ -1728,10 +1728,35 @@ unexecuted): `smoke_rtl8xxxu_gen2_ht20_rx_admission`,
 `smoke_rtl8xxxu_gen2_ba_recipient`, `smoke_rtl8xxxu_gen2_ba_originator`
 (`ba_sessions_tests.rs`).
 
+#### Gen2 administrative park/wake (IFF_UP/IFF_DOWN)
+
+As the RTL8188EU `interface_power`, in `gen2_interface_power.rs`. `attach`
+physically parks the radio before publication (register_netdevice starts
+IFF_DOWN): `Radio::park_idle` starts a never-started `RadioReady` radio so
+its receive claim and the Linux stop sequence retire (`rtl8xxxu_start`,
+then `rtl8xxxu_stop`: TXPAUSE, RX filter maps cleared, host transfers
+retired, `disable_rf`), then `rtl8192eu_power_off`/`rtl8723bu_power_off`.
+The registered netdev is bound with `set_open_stop_target`
+(`OpenStopTarget`); each RTM_SETLINK transition closes admission at once
+(control operations `HardwareError`/`Busy`, worker step and drain idle, RX
+ring withdrawn, carrier metadata withdrawn) and a scheduler-owned task
+applies the latest request under the owner lock: DOWN is station
+`disconnect` (`ra_disconnect_8192e` + `rtl8xxxu_stop`), BA/candidate state
+retired, `park_idle`; every real UP first parks (a coalesced DOWN/UP still
+retires the old association) and then `restart_parked` (fresh
+`rtl8xxxu_init_device` with the gen2 identity check) back to the idle
+`RadioReady` radio, with a fresh RX Narf-Ring generation; scans and joins
+then start it as before (mac80211 `drv_start`). Registration loss during a
+wake parks and closes the device; any failure is terminal. Carrier is
+physical link metadata (`set_link_metadata_for` /
+`withdraw_link_metadata_for` on the bound registration) and never changes
+the operator's IFF_UP (`set_link_state` is only the initial DOWN
+registration). `disassociate` while DOWN is a no-op.
+
 Deviations / not implemented: no HT40 on gen2; a scan or channel change costs a full cold firmware lifecycle per
 transition (Linux retunes live); the retained host TX/RX rings are not
 serviced on away visits (home grace services one Ethernet frame per step);
-no administrative IFF_UP/DOWN park/wake hooks; no station power-save
+no station power-save
 nullfunc beyond the scan PM1/PM0 indications (Linux rtl8xxxu does not set
 `SUPPORTS_PS`); BT-info records are processed only while a station is being
 serviced; one gen2 netdev per boot. Regressions (written, unexecuted):

@@ -864,6 +864,31 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             }
         }
     }
+    /// Administrative IFF_DOWN park (mac80211 `drv_stop` → `rtl8xxxu_stop`,
+    /// then the chip power-off) from any unbound phase. A radio at
+    /// `RadioReady` that never started is started first, so its receive
+    /// claim and the Linux stop sequence retire exactly as for a running
+    /// radio (the owner parks only from `ReceiveStopped`). Parked is a no-op.
+    pub(super) async fn park_idle(&mut self) -> Result<(), Error> {
+        if self.phase() == Phase::Parked {
+            return Ok(());
+        }
+        self.current()?;
+        if self.peer.is_some() || self.ra.is_some() {
+            return Err(Error::State);
+        }
+        if self.phase() == Phase::Prepared {
+            self.start().await?;
+        }
+        if self.phase() == Phase::Receiving {
+            self.stop().await?;
+        }
+        match self.phase() {
+            Phase::Stopped => self.park().await,
+            Phase::Parked => Ok(()),
+            _ => Err(Error::State),
+        }
+    }
     /// Cold channel change of an unbound radio: `stop` (MAC TX/RX and RX
     /// filter maps closed, host transfers retired by USB Stop/SetDeq,
     /// `disable_rf`), the chip power-off and a fresh `rtl8xxxu_init_device`

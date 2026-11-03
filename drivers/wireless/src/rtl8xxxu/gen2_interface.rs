@@ -29,6 +29,9 @@ use narf_wireless::{
 };
 use zeroize::Zeroizing;
 
+#[path = "gen2_interface_power.rs"]
+mod gen2_interface_power;
+
 /// Bound on retained scan candidates.
 const CANDIDATES: usize = 32;
 /// Candidate lifetime (as the RTL8188EU service cache).
@@ -393,6 +396,10 @@ pub struct Device<C: ControlIo, B: PacketIo> {
     up: AtomicBool,
     bssid: AtomicU64,
     failed: AtomicBool,
+    /// Administratively DOWN (or a transition in flight): no control
+    /// operation, worker step or carrier publication.
+    closed: AtomicBool,
+    admin: IrqSafeSpinLock<gen2_interface_power::Admin>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -412,6 +419,7 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
         let mac = radio.local();
         let channel = radio.channel();
         let channels = authority.channels();
+        let parked = radio.phase() == gen2_radio::Phase::Parked;
         Self {
             state: Mutex::new(State {
                 slot: Slot::Idle(Box::new(radio)),
@@ -428,12 +436,22 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
             failed: AtomicBool::new(false),
+            closed: AtomicBool::new(parked),
+            admin: IrqSafeSpinLock::new(gen2_interface_power::Admin::new()),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
         }
     }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.failed.store(true, Ordering::Release);
+        *self.rx.lock() = None;
+        self.link(None);
+    }
     fn link(&self, peer: Option<[u8; 6]>) {
-        let peer = peer.filter(|_| !self.failed.load(Ordering::Acquire));
+        let peer = peer.filter(|_| {
+            !self.closed.load(Ordering::Acquire) && !self.failed.load(Ordering::Acquire)
+        });
         let mut packed = [0; 8];
         if let Some(peer) = peer {
             packed[..6].copy_from_slice(&peer);
@@ -443,10 +461,10 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
             .store(u64::from_le_bytes(packed), Ordering::Release);
         let up = peer.is_some();
         let was_up = self.up.swap(up, Ordering::AcqRel);
-        if was_up != up {
-            narf_net::iface::set_link_state(&self.name, up);
-        }
-        if was_up && !up {
+        // Physical carrier is link metadata on the bound registration; it
+        // never changes the operator's administrative IFF_UP.
+        let published = self.publish_carrier(up);
+        if was_up && !up && published {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
@@ -461,7 +479,7 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
     }
     /// Worker-only: station progress under the owner lock, link publication.
     pub(super) async fn maintain(&self) {
-        if self.failed.load(Ordering::Acquire) {
+        if self.failed.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
             return;
         }
         let Some(mut state) = self.state.try_lock() else {
@@ -479,6 +497,9 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
     /// across the stack callback.
     pub(super) fn drain(&self) -> bool {
         let mut frames = Vec::new();
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
         {
             let Some(mut state) = self.state.try_lock() else {
                 return false;
@@ -572,7 +593,10 @@ pub async fn attach(
     CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| gen2_radio::Error::State)?;
-    let radio = Radio::new(firmware, UsbIo::new(usb), grant)?;
+    let mut radio = Radio::new(firmware, UsbIo::new(usb), grant)?;
+    // register_netdevice starts IFF_DOWN: finish the actual USB/MAC/chip
+    // park before publication rather than leave a powered radio under DOWN.
+    radio.park_idle().await?;
     let name = narf_net::iface::reserve_name("wlan%d");
     let device = Arc::new(Device::new(name, radio, channels));
     narf_net::registry()
@@ -581,6 +605,8 @@ pub async fn attach(
     *ACTIVE.lock() = Some(device.clone());
     narf_net::iface::register(name, device.mac, send);
     narf_net::iface::set_link_state(name, false);
+    let registration = narf_net::iface::lookup(name).ok_or(gen2_radio::Error::State)?;
+    device.bind_admin(registration)?;
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
     let worker = device.clone();
@@ -674,7 +700,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         if self.failed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(false).await?;
         if channels.is_empty() {
             channels = state.authority.channels();
         }
@@ -782,7 +808,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
             SecurityConfig::Wpa2 { psk } => (SecurityMode::Wpa2Psk, Some(Zeroizing::new(psk))),
             _ => return Err(WirelessError::NotSupported),
         };
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(false).await?;
         let Some(mut candidate) = state.candidates().into_iter().find(|b| {
             b.bssid() == request.bssid
                 && b.ssid() == request.ssid
@@ -927,7 +953,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
     /// lifecycle (`restart_parked`) so the next join starts from RadioReady.
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.link(None);
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(true).await?;
         state.clear_transmit();
         let radio = match core::mem::replace(&mut state.slot, Slot::Failed) {
             Slot::Station(mut station) => {
@@ -936,6 +962,11 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
                     return Err(WirelessError::HardwareError);
                 }
                 station.into_radio()
+            }
+            Slot::Idle(radio) if radio.phase() == gen2_radio::Phase::Parked => {
+                // Administratively DOWN: nothing is associated or running.
+                state.slot = Slot::Idle(radio);
+                return Ok(());
             }
             Slot::Idle(radio) => *radio,
             Slot::Failed => return Err(WirelessError::HardwareError),
@@ -974,7 +1005,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
             return Err(WirelessError::HardwareError);
         }
         let channel = cfg.channel as u8;
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(false).await?;
         let grant = state
             .authority
             .grant(channel)
