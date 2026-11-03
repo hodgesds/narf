@@ -5861,10 +5861,10 @@ Review against Linux b90c984d agreed on the following:
 - `MTL GSCCS IDLE MSG enable` applies to MEDIA_VERSION(1300) class OTHER.
 - Class OTHER is reserved (`xe_hw_engine_is_reserved`).
 
-Open item, not caused by this unit: `GuCGt::poll_inner` checks the wake
+Open item, not caused by this unit: `GuCGt::poll_inner` checked the wake
 deadline before the acknowledgement, so a late poll with the ack already
-present times out. Linux's wait checks the condition once more after the
-timeout.
+present timed out. Linux's wait checks the condition once more after the
+timeout. The condition-before-deadline unit closes it.
 
 Known stall: copying the 4 MiB GSC image into stolen memory is about 1M
 uncached BAR2 writes in one GT-worker poll. It happens once at load, off

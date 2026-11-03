@@ -2415,9 +2415,10 @@ unit, which had never been run:
 - The GSC owner fixtures restarted the media GuC on the wrong clock, and
   their model kept stale contexts across restarts.
 
-Open item, not caused by this unit: the GuC GT wake poll checks its deadline
-before the acknowledgement, so a late poll with the ack already present times
-out. Linux re-checks the condition once after the timeout.
+Open item, not caused by this unit: the GuC GT wake poll checked its deadline
+before the acknowledgement, so a late poll with the ack already present timed
+out. Linux re-checks the condition once after the timeout. The
+condition-before-deadline unit below closes this.
 
 One targeted release run passed 198 tests with no failures. It covered the
 media-GT, stolen, FBC, GT-IRQ, engine, RCS, GTT, GGTT-TLB, GuC-GT, Gen12,
@@ -2499,6 +2500,45 @@ self-referencing LOW_LATENCY fixture to E2BIG. One version is kept, with this
 unit's comment. One targeted release run passed 162 tests with no failures.
 It covered the render, user, i915-balance, i915-async, GuC-GT, GT-IRQ, Xe and
 context prefixes.
+
+### Condition before deadline in Intel GPU waits, and the spin helper — targeted release gates recorded
+
+Intel GPU waits now evaluate their condition before treating an expired
+deadline as a timeout. They follow Linux's `__wait_for`, `xe_mmio_wait32`
+and `read_poll_timeout`. A late reply, status or acknowledgement now wins over
+an expired deadline in all of these:
+- the GuC GT wake and GRDOM_FULL waits;
+- GuC boot status and the MMIO mailbox replies;
+- GT hardware-init and register-init waits;
+- driver-FLR and media-quiesce waits;
+- HuC and SLPC CT replies;
+- GuC log-stream sends;
+- display busy-polls;
+- fence busy-waits.
+
+Some limits stay:
+- HuC Send and new SLPC commands are still refused once their total bound
+  has passed.
+- A late GuC boot that shows a firmware error returns Firmware, not Timeout.
+- A late RegisterInit with a changed media identity returns Identity.
+
+This closes the GuCGt wake-deadline open item recorded above.
+
+`narf_scheduler::responsive_spin_until` now evaluates its condition once more
+after the deadline, as `read_poll_timeout` does. Before, a condition that
+became true between the condition read and the deadline read timed out, and
+most display waits go through this helper. It is a free synchronous polling
+helper, not executor core. A new `scheduler/spin` test covers a condition
+that becomes true at the expiry, which must succeed, and one that never
+holds, which must still time out.
+
+Each of the unit's 9 new tests targets the old ordering. Targeted release runs
+passed 660 tests with no failures; the 4 skips were existing environmental
+scheduler skips. The runs covered the `scheduler` prefix, the GuC-GT,
+GuC-boot, GuC-transport, GT, HuC, SLPC, small-BAR, GuC-log, XeLPG, AUX,
+Gen12, media-GT and fence prefixes, and the display prefixes that use the
+spin helper: PSR, display-14 modeset, pcode, Type-C, DSC, resources, WM and
+KMS. The existing true-timeout tests still time out.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
