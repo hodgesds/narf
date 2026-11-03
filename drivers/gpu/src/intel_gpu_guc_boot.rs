@@ -524,6 +524,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.platform
     }
 
+    // Read only by native fixtures until media scheduling uses the role.
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     pub(crate) fn role(&self) -> GuCRole {
         self.role
     }

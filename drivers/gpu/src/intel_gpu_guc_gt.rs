@@ -2245,6 +2245,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     /// Which GuC of the tile this owner boots.
+    // Read only by native fixtures until media scheduling uses the role.
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     pub(crate) fn guc_role(&self) -> crate::intel_gpu_guc_boot::GuCRole {
         self.parts.boot.role()
     }
