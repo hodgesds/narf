@@ -413,7 +413,13 @@ struct DriverModel {
     retunes: Vec<u8>,
     /// Associated (CSA) channel switches requested of the native owner.
     switches: Vec<u8>,
+    /// Host policy snapshot reported to the station (passive-only channels).
+    regulatory: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
+    /// Every passive-TX grant / withdrawal the station requested.
+    passive_grants: Vec<Option<u8>>,
 }
+static NEXT_REGULATORY: IrqSafeSpinLock<Option<Arc<narf_wireless::reg::RegulatoryDomain>>> =
+    IrqSafeSpinLock::new(None);
 /// AX v0 interrupt registers with write-1-clear status, behind the same
 /// `irq::Mask` programs the native binding runs.
 #[derive(Default)]
@@ -471,6 +477,8 @@ impl DriverModel {
             channels: NEXT_CHANNELS.swap(0, Ordering::AcqRel) | (1 << 1),
             retunes: Vec::new(),
             switches: Vec::new(),
+            regulatory: NEXT_REGULATORY.lock().take(),
+            passive_grants: Vec::new(),
             sleep: NEXT_SLEEP.swap(false, Ordering::AcqRel).then(|| {
                 (
                     crate::rtw89::lps::Manager::after_firmware(
@@ -509,6 +517,18 @@ impl DriverModel {
 unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_channels(&mut self) -> Result<u64, crate::rtw89::power::Error> {
         Ok(self.channels)
+    }
+    fn station_regulatory(
+        &mut self,
+    ) -> Result<Option<Arc<narf_wireless::reg::RegulatoryDomain>>, crate::rtw89::power::Error> {
+        Ok(self.regulatory.clone())
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        self.passive_grants.push(grant.map(|(primary, _)| primary));
+        Ok(())
     }
     /// Native retune owner model: refused (nothing published) unless the
     /// primary is admitted and ordinary TX is drained, as `retune_full_radio`.
@@ -3175,6 +3195,70 @@ fn smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted() -> TestResult
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted
+);
+
+/// A DFS (cfg80211 RADAR) 5GHz primary is admitted for passive scan only:
+/// mac80211 `ieee80211_scan_state_decision` dwells there without a probe
+/// request even when an active SSID scan is requested, while a plain 5GHz
+/// primary in the same request is still probed. Nothing is granted TX.
+fn smoke_rtw8852b_dfs_channel_scanned_passively_without_probe() -> TestResult {
+    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    let rule = |start, end, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: 80,
+        max_power_dbm: 23,
+        flags,
+    };
+    *NEXT_REGULATORY.lock() = Some(Arc::new(RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![
+            rule(2402, 2472, RegFlags::empty()),
+            rule(5170, 5250, RegFlags::AUTO_BW),
+            rule(5250, 5330, RegFlags::DFS | RegFlags::AUTO_BW),
+        ],
+    }));
+    // channel36 (slot 16) and channel52 (slot 20).
+    NEXT_CHANNELS.store(1 << 16 | 1 << 20, Ordering::Release);
+    let h = Harness::new(false);
+    let request = |frequencies_mhz: Vec<u32>| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz,
+        channels: Vec::new(),
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    if complete(h.device.scan(request(vec![5260]))).is_err() {
+        return TestResult::Fail("admitted DFS primary not scanned passively");
+    }
+    if h.model(|io| io.retunes.clone()) != vec![52] || !h.peer.lock().probes.is_empty() {
+        return TestResult::Fail("DFS primary retune/probe differs from a passive dwell");
+    }
+    if complete(h.device.scan(request(vec![5180]))).is_err()
+        || h.model(|io| io.retunes.clone()) != vec![52, 36]
+        || h.peer.lock().probes.len() != 1
+    {
+        return TestResult::Fail("plain 5GHz primary not actively probed");
+    }
+    if h.model(|io| io.passive_grants.iter().any(Option::is_some)) {
+        return TestResult::Fail("passive TX granted without association");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_dfs_channel_scanned_passively_without_probe
 );
 
 /// mac80211 station CSA on an open link: an AP on channel6 announces a

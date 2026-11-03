@@ -162,6 +162,22 @@ unsafe impl Io for Startup {
         // CMAC/EDCA/CSA paths are band-aware (`station::ghz5`).
         self.station_native()?.admitted_channels()
     }
+    fn station_regulatory(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_regulatory()
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), power::Error> {
+        // Withdrawal must reach the native gate even while closing.
+        if grant.is_some() {
+            self.station_allowed()?;
+        }
+        self.station_native()?.station_passive_tx(grant)
+    }
     async fn station_retune(
         &mut self,
         primary: u8,

@@ -2,8 +2,10 @@
 //! Signed measured full B radio recipe, separate from basic-calibration v1.
 use super::{factory::Factory, radio_assets::Assets, radio_power::Plan};
 use alloc::format;
+use alloc::sync::Arc;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
+use narf_wireless::reg::RegulatoryDomain;
 const LENGTH: usize = 128;
 #[path = "amsdu_policy.rs"]
 mod amsdu;
@@ -311,8 +313,12 @@ pub(super) struct Qualification {
     channels: alloc::vec::Vec<channel::Channel>,
     /// Primary whose envelope gates every publication (1 = base N52B).
     active: core::sync::atomic::AtomicU8,
+    /// Station TX grant on a passive-only (DFS / NO_IR) primary: the
+    /// primary and the exact policy snapshot under which the station
+    /// client's `narf_wireless::reg::witness::BeaconWitness` admitted it.
+    passive_tx: narf_lib::sync::IrqSafeSpinLock<Option<(u8, Arc<RegulatoryDomain>)>>,
     #[cfg(any(test, feature = "kernel-test"))]
-    model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
+    model_domain: Option<Arc<RegulatoryDomain>>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_revoke_before_publication: bool,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -399,6 +405,7 @@ impl Qualification {
             fragments: None,
             channels: alloc::vec::Vec::new(),
             active: core::sync::atomic::AtomicU8::new(1),
+            passive_tx: narf_lib::sync::IrqSafeSpinLock::new(None),
             antenna_qdb,
             ceiling_qdbm,
             peaks_qdbm,
@@ -496,16 +503,48 @@ impl Qualification {
         if let Some(program) = &self.fragments {
             program.current()?;
         }
+        self.check(&*self.policy()?).map(|_| ())
+    }
+    /// The host regulatory snapshot every envelope check runs against (the
+    /// installed shared policy, bootstrapped from the signed default unless
+    /// WMM-qualified; the inert model in tests). Its `Arc` identity scopes
+    /// station beacon witnesses and passive TX grants.
+    pub(super) fn policy(&self) -> Result<Arc<RegulatoryDomain>, Error> {
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(domain) = self.model_domain.as_ref() {
-            return self.check(domain);
+            return Ok(domain.clone());
         }
-        let domain = if self.wmm {
-            narf_wireless::reg::db::get_domain().ok_or(Error::Policy)?
+        if self.wmm {
+            narf_wireless::reg::db::snapshot().ok_or(Error::Policy)
         } else {
-            narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?
-        };
-        self.check(&domain)
+            narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Policy)
+        }
+    }
+    /// Grant (or with `None` withdraw) station TX on the passive-only
+    /// primary `grant.0`, which the station client admitted under its beacon
+    /// witness taken under exactly the policy `grant.1`. Only the station
+    /// association / CSA path grants; `select` of any other primary drops it.
+    pub(super) fn grant_passive_tx(&self, grant: Option<(u8, Arc<RegulatoryDomain>)>) {
+        let retired = core::mem::replace(&mut *self.passive_tx.lock(), grant);
+        drop(retired);
+    }
+    /// `current` plus the frame-TX rule: on a passive-only (DFS / NO_IR)
+    /// active span a frame may be published only under a passive TX grant
+    /// for this exact primary and current policy snapshot (mac80211 never
+    /// probes there; a station transmits only to an AP it heard).
+    pub(super) fn tx_current(&self) -> Result<(), Error> {
+        self.current()?;
+        let policy = self.policy()?;
+        if !self.check(&policy)? {
+            return Ok(());
+        }
+        let active = self.active();
+        match &*self.passive_tx.lock() {
+            Some((primary, granted)) if *primary == active && Arc::ptr_eq(granted, &policy) => {
+                Ok(())
+            }
+            _ => Err(Error::Policy),
+        }
     }
     /// Keep actual publication inside this exact signed capability invocation.
     /// Metadata/current-policy sampling alone cannot authorize later MMIO.
@@ -531,19 +570,10 @@ impl Qualification {
             type Output = Result<T, super::power::Error>;
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
-                    #[cfg(any(test, feature = "kernel-test"))]
-                    if let Some(domain) = self.qualification.model_domain.as_ref() {
-                        self.qualification
-                            .check(domain)
-                            .map_err(|_| super::power::Error::Access)?;
-                        return self.qualification.invoke_programs(self.operation);
-                    }
-                    let domain = if self.qualification.wmm {
-                        narf_wireless::reg::db::get_domain().ok_or(super::power::Error::Access)?
-                    } else {
-                        narf_wireless::reg::db::ensure_domain()
-                            .map_err(|_| super::power::Error::Access)?
-                    };
+                    let domain = self
+                        .qualification
+                        .policy()
+                        .map_err(|_| super::power::Error::Access)?;
                     self.qualification
                         .check(&domain)
                         .map_err(|_| super::power::Error::Access)?;
@@ -614,18 +644,11 @@ impl Qualification {
             return Ok(true);
         }
         // A 5GHz record is only admitted while the current host rule over
-        // its span permits active emission (no DFS/NO_IR), so a scan never
-        // retunes onto a channel whose envelope `select` would refuse.
-        #[cfg(any(test, feature = "kernel-test"))]
-        if let Some(domain) = self.model_domain.as_ref() {
-            return Ok(Self::check_envelope(domain, record.envelope()).is_ok());
-        }
-        let domain = if self.wmm {
-            narf_wireless::reg::db::get_domain().ok_or(Error::Policy)?
-        } else {
-            narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?
-        };
-        Ok(Self::check_envelope(&domain, record.envelope()).is_ok())
+        // its span passes the envelope (a DFS / NO_IR span is admitted as
+        // passive-only: RX, passive scan, and station TX only under a
+        // witness grant, `tx_current`), so a scan never retunes onto a
+        // channel whose envelope `select` would refuse.
+        Ok(Self::check_envelope(&*self.policy()?, record.envelope()).is_ok())
     }
     /// The signed noninitial record was measured for exactly this freshly
     /// rebuilt identity (before program extension).
@@ -647,6 +670,14 @@ impl Qualification {
                 .ok_or(Error::Policy)?
                 .bound(self)?;
         }
+        {
+            let mut grant = self.passive_tx.lock();
+            if grant.as_ref().is_some_and(|(p, _)| *p != profile.primary()) {
+                let retired = grant.take();
+                drop(grant);
+                drop(retired);
+            }
+        }
         let previous = self
             .active
             .swap(profile.primary(), core::sync::atomic::Ordering::AcqRel);
@@ -660,22 +691,24 @@ impl Qualification {
     pub(super) fn active(&self) -> u8 {
         self.active.load(core::sync::atomic::Ordering::Acquire)
     }
-    fn check(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
+    /// `Ok(passive)`: the active envelope passes; `passive` when its span is
+    /// passive-only (DFS / NO_IR).
+    fn check(&self, domain: &RegulatoryDomain) -> Result<bool, Error> {
         Self::check_envelope(domain, self.envelope()?)
     }
-    /// The host rule over the record's whole occupied span. Any rule flag but
-    /// NO_P2P refuses: 5GHz DFS/NO_IR (radar, passive-only) channels are never
-    /// admitted until shared `narf_wireless::reg` DFS/beacon-gating support
-    /// exists; no passive-scan TX exemption is assumed.
-    fn check_envelope(
-        domain: &narf_wireless::reg::RegulatoryDomain,
-        envelope: Envelope,
-    ) -> Result<(), Error> {
+    /// The host rule over the record's whole occupied span. NO_P2P, AUTO_BW
+    /// and NO_160MHZ restrict nothing at 20MHz. DFS and NO_IR are accepted
+    /// only on a 5GHz span and make it passive-only (`Ok(true)`, cfg80211
+    /// `IEEE80211_CHAN_RADAR` / `NO_IR`): RX, monitor and passive scan; frame
+    /// TX additionally needs the station's witness grant (`tx_current`).
+    /// Every other (or unknown) flag refuses.
+    fn check_envelope(domain: &RegulatoryDomain, envelope: Envelope) -> Result<bool, Error> {
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(Error::Policy);
         }
         let (low, high) = envelope.span;
         let mut ceiling = None;
+        let mut passive = false;
         for (index, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= high || rule.freq_end_mhz <= low {
                 continue;
@@ -686,9 +719,15 @@ impl Qualification {
                 // cap) must allow this 20MHz channel; NO_160MHZ and
                 // AUTO_BW restrict nothing else at 20MHz.
                 || domain.max_bandwidth(index) < 20
-                || rule.flags.bits() & !PLAIN_RULE_FLAGS != 0
+                || rule.flags.bits() & !(PLAIN_RULE_FLAGS | PASSIVE_RULE_FLAGS) != 0
             {
                 return Err(Error::Policy);
+            }
+            if rule.flags.bits() & PASSIVE_RULE_FLAGS != 0 {
+                if low < 5000 {
+                    return Err(Error::Policy);
+                }
+                passive = true;
             }
             let p = i16::from(rule.max_power_dbm) * 4;
             ceiling = Some(ceiling.map_or(p, |old: i16| old.min(p)));
@@ -701,11 +740,14 @@ impl Qualification {
         {
             return Err(Error::Policy);
         }
-        Ok(())
+        Ok(passive)
     }
 }
+/// Rule flags making a 5GHz span passive-only (never on 2.4GHz here).
+const PASSIVE_RULE_FLAGS: u32 =
+    narf_wireless::reg::RegFlags::DFS.bits() | narf_wireless::reg::RegFlags::NO_IR.bits();
 /// Rule flags a plain 20MHz span may carry: NO_P2P, AUTO_BW, NO_160MHZ.
-/// DFS, NO_IR and every other (or unknown) bit is refused.
+/// Every other (or unknown) bit but `PASSIVE_RULE_FLAGS` is refused.
 const PLAIN_RULE_FLAGS: u32 = narf_wireless::reg::RegFlags::NO_P2P.bits()
     | narf_wireless::reg::RegFlags::AUTO_BW.bits()
     | narf_wireless::reg::RegFlags::NO_160MHZ.bits();

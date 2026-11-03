@@ -57,7 +57,7 @@ fn smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio() -> Te
     let cap = authority();
     let legacy = image(base);
     let mut old = Qualification::from_verified(&legacy, Some([3; 32]), base, cap).unwrap();
-    old.model_domain = Some(domain());
+    old.model_domain = Some(alloc::sync::Arc::new(domain()));
     if old.wmm_allowed() != Ok(false) {
         return TestResult::Fail("legacy full-radio qualification silently granted WMM");
     }
@@ -89,7 +89,7 @@ fn smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio() -> Te
         Ok(q) => q,
         Err(_) => return TestResult::Fail("exact signed WMM recipe rejected"),
     };
-    qualified.model_domain = Some(domain());
+    qualified.model_domain = Some(alloc::sync::Arc::new(domain()));
     if !qualified.matches(base)
         || qualified.wmm_allowed() != Ok(true)
         || base.wmm().identity() == base.identity()
@@ -366,7 +366,7 @@ pub(in crate::rtw89) fn revocable_model() -> (Qualification, Cap<FirmwareBlob, R
     let cap = authority();
     let mut calibration =
         Qualification::from_verified(&image(board), Some([3; 32]), board, cap).unwrap();
-    calibration.model_domain = Some(domain());
+    calibration.model_domain = Some(alloc::sync::Arc::new(domain()));
     (calibration, cap)
 }
 pub(in crate::rtw89) fn revoke_on_publication_model() -> (Qualification, Cap<FirmwareBlob, Read>) {
@@ -403,7 +403,7 @@ pub(in crate::rtw89) fn rf_tracking_model(
     bytes[57] = flags;
     let base_cap = authority();
     let mut base = Qualification::from_verified(&bytes, Some([3; 32]), board, base_cap).unwrap();
-    base.model_domain = Some(domain());
+    base.model_domain = Some(alloc::sync::Arc::new(domain()));
     if aggregate {
         let request = amsdu::AmsduRequest::new(&base).unwrap();
         let mut record = expanded_record(&base, b"N52A", request.binding);
@@ -493,11 +493,11 @@ fn smoke_rtw8852b_periodic_dpk_signed_joint_program_window_and_current_caps() ->
             "tracking-only RF envelope silently admitted joint A-MSDU program",
         );
     }
-    base.model_domain.as_mut().unwrap().rules[0].max_power_dbm = 1;
+    alloc::sync::Arc::make_mut(base.model_domain.as_mut().unwrap()).rules[0].max_power_dbm = 1;
     if base.with_current(|| Ok(7)).is_ok() {
         return TestResult::Fail("periodic RF ignored tightened actual host power");
     }
-    base.model_domain = Some(domain());
+    base.model_domain = Some(alloc::sync::Arc::new(domain()));
     tracking_cap.revoke();
     if base.current().is_ok() || base.with_current(|| Ok(7)).is_ok() {
         return TestResult::Fail("actual tracking cap revocation left native RF authority");
@@ -547,7 +547,7 @@ fn smoke_rtw89_b_full_radio_publication_runs_inside_current_signed_scope() -> Te
     {
         return TestResult::Fail("current full radio scope did not publish");
     }
-    grant.model_domain.as_mut().unwrap().rules[0].max_power_dbm = 1;
+    alloc::sync::Arc::make_mut(grant.model_domain.as_mut().unwrap()).rules[0].max_power_dbm = 1;
     if grant
         .with_current(|| {
             published += 1;
@@ -558,7 +558,7 @@ fn smoke_rtw89_b_full_radio_publication_runs_inside_current_signed_scope() -> Te
     {
         return TestResult::Fail("full radio scope ignored current host policy");
     }
-    grant.model_domain = Some(domain());
+    grant.model_domain = Some(alloc::sync::Arc::new(domain()));
     cap.revoke();
     if grant
         .with_current(|| {
@@ -616,7 +616,7 @@ fn smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity() ->
     let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("genuine all-AC record rejected");
     };
-    granted.model_domain = Some(domain());
+    granted.model_domain = Some(alloc::sync::Arc::new(domain()));
     if granted.allows(Program::QosAll) != Ok(true)
         || granted.wmm_allowed() != Ok(true)
         || !granted.matches(base)
@@ -628,7 +628,7 @@ fn smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity() ->
     let Ok(mut wmm_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("WMM record rejected");
     };
-    wmm_only.model_domain = Some(domain());
+    wmm_only.model_domain = Some(alloc::sync::Arc::new(domain()));
     if wmm_only.allows(Program::QosAll) != Ok(false) {
         return TestResult::Fail("WMM record granted all-AC QoS");
     }
@@ -672,7 +672,7 @@ fn smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity() -> TestRe
     let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("genuine HE record rejected");
     };
-    granted.model_domain = Some(domain());
+    granted.model_domain = Some(alloc::sync::Arc::new(domain()));
     if granted.allows(Program::He) != Ok(true) || granted.allows(Program::Ht) != Ok(true) {
         return TestResult::Fail("HE record did not grant HE and HT");
     }
@@ -681,7 +681,7 @@ fn smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity() -> TestRe
     let Ok(mut ht_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("HT record rejected");
     };
-    ht_only.model_domain = Some(domain());
+    ht_only.model_domain = Some(alloc::sync::Arc::new(domain()));
     if ht_only.allows(Program::He) != Ok(false) {
         return TestResult::Fail("HT record granted HE");
     }
@@ -759,7 +759,7 @@ fn smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity() -> Tes
     let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("genuine A-MPDU record rejected");
     };
-    granted.model_domain = Some(domain());
+    granted.model_domain = Some(alloc::sync::Arc::new(domain()));
     if granted.allows(Program::Ampdu) != Ok(true) || granted.allows(Program::He) != Ok(false) {
         return TestResult::Fail("A-MPDU record grants differ");
     }
@@ -783,7 +783,7 @@ fn smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_po
     let base_cap = authority();
     let mut qualified =
         Qualification::from_verified(&bytes, Some([3; 32]), base, base_cap).unwrap();
-    qualified.model_domain = Some(domain());
+    qualified.model_domain = Some(alloc::sync::Arc::new(domain()));
     if qualified.amsdu_allowed() != Ok(false) || qualified.allows(Program::Ampdu) != Ok(true) {
         return TestResult::Fail("old A-MPDU record silently authorizes expanded A-MSDU");
     }
@@ -848,11 +848,11 @@ fn smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_po
     if qualified.amsdu_allowed() != Ok(true) || qualified.with_current(|| Ok(7)) != Ok(7) {
         return TestResult::Fail("genuine expanded program current base/power admission");
     }
-    qualified.model_domain.as_mut().unwrap().rules[0].max_power_dbm = 1;
+    alloc::sync::Arc::make_mut(qualified.model_domain.as_mut().unwrap()).rules[0].max_power_dbm = 1;
     if qualified.with_current(|| Ok(7)).is_ok() {
         return TestResult::Fail("expanded program bypassed tightened actual host power");
     }
-    qualified.model_domain = Some(domain());
+    qualified.model_domain = Some(alloc::sync::Arc::new(domain()));
     cap.revoke();
     if qualified.amsdu_allowed().is_ok() || qualified.with_current(|| Ok(7)).is_ok() {
         return TestResult::Fail("revoked actual companion remained ordinary emission authority");
@@ -1188,13 +1188,13 @@ fn smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_sp
     if base.select(six).is_ok() || base.active() != 1 || base.with_current(|| Ok(1)) != Ok(1) {
         return TestResult::Fail("channel6 selected outside its occupied span");
     }
-    base.model_domain = Some(band_domain());
+    base.model_domain = Some(alloc::sync::Arc::new(band_domain()));
     if base.select(six).is_err() || base.active() != 6 || base.with_current(|| Ok(6)) != Ok(6) {
         return TestResult::Fail("current channel6 record did not gate publication");
     }
     // A record whose peaks exceed the current ceiling is refused at select.
     let (mut hot, _, _, _) = channel_model(9, 80);
-    hot.model_domain = Some(band_domain());
+    hot.model_domain = Some(alloc::sync::Arc::new(band_domain()));
     if hot.select(Profile::new(Band::Ghz2, 9).unwrap()).is_ok() || hot.active() != 1 {
         return TestResult::Fail("channel9 peaks exceeded the host ceiling");
     }
@@ -1214,7 +1214,7 @@ fn smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_sp
     )
     .unwrap();
     joint.channels.push(channel);
-    joint.model_domain = Some(band_domain());
+    joint.model_domain = Some(alloc::sync::Arc::new(band_domain()));
     if joint.channel_allowed(six) != Ok(true)
         || request.binding
             == channel::Request::new(&base, six, board.with_programs(base.flags))
@@ -1243,10 +1243,12 @@ kernel_test_in!(
 );
 
 /// 5GHz N52C: a typed 5GHz primary binds its own record (distinct recipe and
-/// name), is admitted and selectable only while the host rule over its whole
-/// occupied span carries no DFS/NO_IR flag; a DFS span leaves it unadmitted
-/// and `select` refuses, keeping channel1 active (no passive-scan exemption).
-fn smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span() -> TestResult {
+/// name), is admitted and selectable under a plain, AUTO_BW/NO_160MHZ, DFS or
+/// NO_IR host span; an unknown flag refuses and keeps channel1 active. A
+/// DFS / NO_IR span is passive-only: frame TX (`tx_current`) needs a witness
+/// grant for that primary under the current policy snapshot, which `select`
+/// of another primary and a policy replacement both end.
+fn smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span() -> TestResult {
     use super::super::operating_channel::Profile;
     use narf_wireless::association::channel::Band;
     use narf_wireless::reg::{RegFlags, RegRule};
@@ -1286,21 +1288,63 @@ fn smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span() -> TestResu
     unknown
         .rules
         .push(rule(5170, 5250, RegFlags::from_bits_retain(1 << 12)));
-    for (domain, admitted, label) in [
-        (radar, false, "DFS 5GHz span admitted"),
-        (passive, false, "NO_IR 5GHz span admitted"),
-        (unknown, false, "unknown rule flag admitted"),
-        (auto, true, "AUTO_BW/NO_160MHZ 5GHz span refused"),
-        (open, true, "non-DFS 5GHz span refused"),
+    for (domain, admitted, passive_only, label) in [
+        (radar, true, true, "DFS 5GHz span not admitted passively"),
+        (
+            passive,
+            true,
+            true,
+            "NO_IR 5GHz span not admitted passively",
+        ),
+        (unknown, false, false, "unknown rule flag admitted"),
+        (auto, true, false, "AUTO_BW/NO_160MHZ 5GHz span refused"),
+        (open, true, false, "non-DFS 5GHz span refused"),
     ] {
-        base.model_domain = Some(domain);
-        if base.channel_allowed(a36) != Ok(admitted)
+        let policy = alloc::sync::Arc::new(domain);
+        base.model_domain = Some(policy.clone());
+        if base.select(Profile::INITIAL).is_err()
+            || base.channel_allowed(a36) != Ok(admitted)
             || base.select(a36).is_ok() != admitted
             || base.active() != if admitted { 36 } else { 1 }
         {
             return TestResult::Fail(label);
         }
+        if !admitted {
+            continue;
+        }
+        // RX/RF publication stays open; frame TX needs the witness grant.
+        if base.current().is_err() || base.tx_current().is_ok() == passive_only {
+            return TestResult::Fail("passive-only span changed TX admission");
+        }
+        base.grant_passive_tx(Some((36, policy.clone())));
+        if base.tx_current().is_err() {
+            return TestResult::Fail("witness grant did not admit TX");
+        }
+        // Same rules, new snapshot: the grant is bound to its policy.
+        base.model_domain = Some(alloc::sync::Arc::new(policy.as_ref().clone()));
+        if base.tx_current().is_ok() == passive_only {
+            return TestResult::Fail("passive TX grant outlived its policy snapshot");
+        }
+        base.model_domain = Some(policy.clone());
+        // Retuning elsewhere drops it; returning does not revive it.
+        if base.select(Profile::INITIAL).is_err()
+            || base.select(a36).is_err()
+            || base.tx_current().is_ok() == passive_only
+        {
+            return TestResult::Fail("passive TX grant survived a retune");
+        }
+        base.grant_passive_tx(None);
     }
+    // A 2.4GHz span is never passive-admitted: NO_IR still refuses there.
+    let mut low = domain();
+    for r in low.rules.iter_mut() {
+        r.flags |= RegFlags::NO_IR;
+    }
+    base.model_domain = Some(alloc::sync::Arc::new(low));
+    if base.select(Profile::INITIAL).is_ok() {
+        return TestResult::Fail("2.4GHz NO_IR span admitted");
+    }
+    base.model_domain = Some(alloc::sync::Arc::new(domain()));
     if base.select(Profile::INITIAL).is_err() || base.active() != 1 {
         return TestResult::Fail("cross-band return to channel1");
     }
@@ -1308,5 +1352,5 @@ fn smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span() -> TestResu
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span
+    smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span
 );

@@ -8,6 +8,8 @@ use super::{
     station_control::Admission,
 };
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
+use narf_wireless::reg::witness::{self, BeaconWitness, ScanGeneration};
+use narf_wireless::reg::RegulatoryDomain;
 use narf_wireless::{
     association::{self, AkmSet, JoinOptions, JoinPlan, ObservedBss, Pmf, SecurityMode},
     station_security::{self, RawFrame, Security},
@@ -177,6 +179,21 @@ pub(super) unsafe trait Io: Send {
     /// the base record). Default: channel1 only.
     fn station_channels(&mut self) -> Result<u64, power::Error> {
         Ok(1 << 1)
+    }
+    /// The host policy snapshot the native envelope checks run against,
+    /// classifying passive-only (DFS / NO_IR) primaries and scoping the
+    /// station's beacon witnesses. `None` (default): the native side admits
+    /// no passive-only primary, so every admitted primary is active.
+    fn station_regulatory(&mut self) -> Result<Option<Arc<RegulatoryDomain>>, power::Error> {
+        Ok(None)
+    }
+    /// Grant (`Some((primary, policy))`) or withdraw (`None`) native frame
+    /// TX on a passive-only primary the station admitted under a witness.
+    fn station_passive_tx(
+        &mut self,
+        _: Option<(u8, Arc<RegulatoryDomain>)>,
+    ) -> Result<(), power::Error> {
+        Ok(())
     }
     /// `rtw89_core_scan_start`/`_complete` address CAM update: a random scan
     /// SMA, or `None` to restore the own address.
@@ -436,6 +453,14 @@ pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8], channel: u8) 
 pub(super) fn ghz5(primary: u8) -> bool {
     super::operating_channel::GHZ5.contains(&primary)
 }
+/// cfg80211 centre frequency of a typed primary (20 MHz witness key).
+fn center(primary: u8) -> u16 {
+    super::monitor_wire::frequency(primary) as u16
+}
+/// The primary is passive-only (cfg80211 RADAR / NO_IR) under `policy`.
+fn passive_only(policy: Option<&Arc<RegulatoryDomain>>, primary: u8) -> bool {
+    policy.is_some_and(|p| witness::passive_only(p, center(primary)))
+}
 /// A typed 20MHz primary this station may tune: 2.4GHz 1..=13 or 5GHz.
 fn typed(primary: u8) -> bool {
     (1..=13).contains(&primary) || ghz5(primary)
@@ -552,6 +577,12 @@ pub(super) struct State {
     /// `rtw89_track_work` RSSI statistics and dynamic EDCCA.
     track: super::track::Tracker,
     scanning: bool,
+    /// cfg80211 `beacon_found` per 20MHz primary in its latest covering scan
+    /// (shared `reg::witness`): admits association / CSA onto a passive-only
+    /// (DFS / NO_IR) primary.
+    witness: BeaconWitness,
+    /// Witness generation of the dwell in progress, if any.
+    witness_scan: Option<ScanGeneration>,
     /// Actual primary of the retained radio (native retune epoch below).
     channel: u8,
     /// Native retune epoch this state's channel-bound work was built for.
@@ -689,6 +720,8 @@ impl State {
             last_now: 0,
             track: super::track::Tracker::default(),
             scanning: false,
+            witness: BeaconWitness::new(),
+            witness_scan: None,
             channel: 1,
             epoch: None,
             csa: None,
@@ -800,6 +833,9 @@ impl State {
         self.rx_idle = false;
         self.er = false;
         self.scan = None;
+        self.witness.clear();
+        self.witness_scan = None;
+        let _ = io.station_passive_tx(None);
         self.clear_block_ack();
         self.admission.close();
         self.established = false;
@@ -1034,6 +1070,16 @@ impl State {
         let Ok(candidate) = association::observe(frame, self.channel, own, signal) else {
             return;
         };
+        // cfg80211 `beacon_found` for this dwell's witness: an actual Beacon
+        // (not a probe response) observed on the tuned primary.
+        if let Some(generation) = self.witness_scan.filter(|_| self.scanning) {
+            if frame.bytes().first() == Some(&0x80)
+                && candidate.bss.channel == self.channel
+                && candidate.bss.beacon_interval != 0
+            {
+                let _ = self.witness.beacon_found(generation, center(self.channel));
+            }
+        }
         if !basic_ok(self.channel, candidate.basic_rates) {
             return;
         }
@@ -1167,6 +1213,14 @@ impl State {
         if !channel_admitted(io.station_channels()?, primary) {
             return Err(Error::PeerLost);
         }
+        // mac80211 `ieee80211_sta_process_chanswitch` drops the connection
+        // on an unusable target. A passive-only (RADAR / NO_IR) target is
+        // usable here only under a current beacon witness for it.
+        if let Some(policy) = io.station_regulatory()? {
+            if !self.witness.may_associate(&policy, &[center(primary)]) {
+                return Err(Error::PeerLost);
+            }
+        }
         // csa_time_tu = (max(count, 1) - 1) * beacon_int.
         let tu = u64::from(announced.count.max(1) - 1) * u64::from(candidate.bss.beacon_interval);
         self.csa = Some(Switch {
@@ -1213,11 +1267,30 @@ impl State {
             && self.fragment_tx.is_none()
             && self.fragment_wait.is_none()
             && self.delivered_reply.is_none();
+        // Re-check the witness at the switch: the target's passive TX grant
+        // follows only a still-current witness under the current policy.
+        let policy = io.station_regulatory()?;
+        let grant = match &policy {
+            Some(policy) if passive_only(Some(policy), csa.primary) => {
+                if !self.witness.may_associate(policy, &[center(csa.primary)]) {
+                    if !self.admission.teardown_pending() {
+                        self.fail(io);
+                    }
+                    return Err(Error::PeerLost);
+                }
+                Some((csa.primary, policy.clone()))
+            }
+            _ => None,
+        };
         let result = if quiet {
             io.station_switch_channel(csa.primary, &self.admission)
                 .await
         } else {
             Err(power::Error::Busy)
+        };
+        let result = match result {
+            Ok(epoch) if grant.is_some() => io.station_passive_tx(grant).map(|()| epoch),
+            other => other,
         };
         match result {
             Ok(epoch) => {
@@ -2023,6 +2096,10 @@ impl State {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
+        // mac80211 `ieee80211_scan_state_decision`: a RADAR / NO_IR channel
+        // is dwelt passively; no probe request (nor random scan address).
+        let policy = io.station_regulatory()?;
+        let probe = probe.filter(|_| !passive_only(policy.as_ref(), self.channel));
         // ieee80211_send_scan_probe_req: one get_random_u16() per probe,
         // drawn before any address CAM or RF activity so missing entropy
         // fails the scan without a transmission.
@@ -2049,9 +2126,14 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(address))))??;
             self.scan = Some(address);
         }
+        // A new covering scan retracts this primary's earlier witness.
+        self.witness_scan = policy
+            .as_ref()
+            .map(|policy| self.witness.begin_scan(policy, &[center(self.channel)]));
         self.scanning = true;
         let result = self.scan_dwell(io, until, probe, random_sn).await;
         self.scanning = false;
+        self.witness_scan = None;
         // A failed dwell is terminal: the interface stops the station.
         if address.is_some() && result.is_ok() {
             // rtw89_core_scan_complete: restore the own address once the last
@@ -2205,9 +2287,28 @@ impl State {
         {
             return Err(Error::Profile);
         }
+        // A passive-only (RADAR / NO_IR) primary is joined only under its
+        // beacon witness from the latest scan of it (cfg80211 `beacon_found`).
+        let policy = io.station_regulatory()?;
+        let grant = match &policy {
+            Some(policy) => {
+                if !self
+                    .witness
+                    .may_associate(policy, &[center(candidate.bss.channel)])
+                {
+                    return Err(Error::Profile);
+                }
+                passive_only(Some(policy), candidate.bss.channel)
+                    .then(|| (candidate.bss.channel, policy.clone()))
+            }
+            None => None,
+        };
         // mac80211 ieee80211_prep_channel: the station joins on the BSS's
         // own primary; the native owner retunes (signed record required).
         self.retune(io, candidate.bss.channel).await?;
+        if grant.is_some() {
+            io.station_passive_tx(grant)?;
+        }
         // rtw89 sets MFP_CAPABLE: WPA2 offers MFPC (`ieee80211w=1`, PMF and
         // PSK-SHA256 admitted) to an AP that advertises MFPC; otherwise the
         // legacy RSNE is kept. WPA3 is SAE with PMF required.

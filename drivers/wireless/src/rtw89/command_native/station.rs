@@ -169,6 +169,45 @@ impl Native {
                 .as_ref()
                 .is_some_and(packet::Core::ready_aggregate)
     }
+    /// Frame-TX regulatory gate (`Qualification::tx_current`): on a
+    /// passive-only (DFS / NO_IR) active primary only a station witness
+    /// grant admits a frame. Without a full-radio scope only the base
+    /// 2.4GHz channel can be active, which is never passive-admitted.
+    fn station_tx_current(&self) -> Result<(), packet::Error> {
+        match self.full_radio_scope() {
+            Some(qualification) => qualification
+                .tx_current()
+                .map_err(|_| packet::Error::Access),
+            None => Ok(()),
+        }
+    }
+    /// The host policy snapshot the active envelope is checked against.
+    pub(in crate::rtw89) fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, power::Error> {
+        match self.full_radio_scope() {
+            Some(qualification) => qualification
+                .policy()
+                .map(Some)
+                .map_err(|_| power::Error::Access),
+            None => Ok(None),
+        }
+    }
+    /// Grant / withdraw station TX on a witnessed passive-only primary.
+    pub(in crate::rtw89) fn station_passive_tx(
+        &self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), power::Error> {
+        let qualification = self.full_radio_scope();
+        match (qualification, grant) {
+            (Some(qualification), grant) => {
+                qualification.grant_passive_tx(grant);
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(power::Error::Unsupported),
+        }
+    }
     pub(in crate::rtw89) fn submit_packet_agg(
         &mut self,
         bytes: &[u8],
@@ -179,6 +218,7 @@ impl Native {
         if !self.station_ampdu_allowed()? || !self.station_firmware_ra_allowed()? {
             return Err(packet::Error::Access);
         }
+        self.station_tx_current()?;
         self.packet_operation(|core, port| core.submit_agg(port, bytes, report, rate, Some(agg)))
     }
     pub(in crate::rtw89) fn submit_fragment(
@@ -186,6 +226,7 @@ impl Native {
         part: &super::fragment::Part,
         report: bool,
     ) -> Result<u64, packet::Error> {
+        self.station_tx_current()?;
         let mut core = self
             .station_runtime
             .core
@@ -216,6 +257,7 @@ impl Native {
         if self.lowest_rate() != 0 {
             return Err(packet::Error::Access);
         }
+        self.station_tx_current()?;
         self.packet_operation(|core, port| core.submit(port, bytes, report))
     }
     /// core.c `rtw89_core_get_mgmt_rate` band floor of the current typed
@@ -253,6 +295,7 @@ impl Native {
         {
             return Err(packet::Error::Access);
         }
+        self.station_tx_current()?;
         self.packet_operation(|core, port| core.submit_rate(port, bytes, report, rate))
     }
     /// `rtw89_pci_request_irq` + `rtw89_pci_ops_start`: bind one MSI vector

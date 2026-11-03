@@ -2348,13 +2348,19 @@ carries channels only, so it is band-independent.
 its N52C request uses a distinct 5GHz recipe (`recipe_5ghz`) and
 `Board::new_noninitial` a 5GHz domain string; the record format is
 unchanged (`[54..58] = [1,20,primary,flags]`, `rtw8852b-chan-v1-chNN`).
-`Qualification::check_envelope` (and the calibration `check`) refuse any host
-rule flag except NO_P2P, AUTO_BW and NO_160MHZ over the occupied span and
-require cfg80211 `reg_get_max_bandwidth` (`RegulatoryDomain::max_bandwidth`)
->= 20MHz, and `channel_allowed` additionally requires that check for
-a 5GHz record, so DFS and NO_IR 5GHz channels are never admitted: shared
-`narf_wireless::reg` DFS/beacon-gated passive support has not landed, and no
-passive-scan TX exemption is assumed. `Native::admitted_channels` returns the
+`Qualification::check_envelope` refuses any host rule flag except NO_P2P,
+AUTO_BW, NO_160MHZ and, on a 5GHz span only, DFS / NO_IR over the occupied
+span, and requires cfg80211 `reg_get_max_bandwidth`
+(`RegulatoryDomain::max_bandwidth`) >= 20MHz; `channel_allowed` additionally
+requires that check for a 5GHz record. A DFS or NO_IR span is admitted
+passive-only (cfg80211 `IEEE80211_CHAN_RADAR` / `NO_IR`): `current` /
+`with_current` (RF, RX, monitor) pass, but frame TX goes through
+`Qualification::tx_current`, which on a passive-only active span requires a
+station passive-TX grant (`grant_passive_tx`) naming that exact primary and
+the current policy snapshot (`Qualification::policy`, `Arc` identity);
+`select` of any other primary drops the grant. Native `submit_packet`,
+`submit_packet_rate`, `submit_packet_agg` and `submit_fragment` call it
+before publication. The calibration `check` still refuses DFS / NO_IR. `Native::admitted_channels` returns the
 u64 slot mask over 2.4GHz and 5GHz; `preflight_full_radio` loads N52C for
 2..=13 and every 5GHz primary; `retune_full_radio` accepts any admitted
 typed primary (cross-band included). Without provisioned signed records only
@@ -2388,6 +2394,29 @@ unknown class falls back to the CSA element in the current band); a
 cross-band switch updates the peer's band. Scan requests accept 5GHz
 channel numbers and frequencies (5180..=5885).
 
+**DFS / NO_IR passive scanning and client admission.** The station keeps
+the shared `narf_wireless::reg::witness::BeaconWitness` (wireless spec §3.5
+"Station passive-channel witness") against `Io::station_regulatory` (the
+native `Qualification::policy` snapshot; default `None` = no passive-only
+primary). `scan_with` on a passive-only primary drops the probe (no probe
+request, no random scan address: mac80211 `ieee80211_scan_state_decision`
+/ `ieee80211_scan_get_channel_time` passive dwell) and opens a witness scan
+generation for that primary, retracting its earlier witness; an actual
+Beacon (subtype 8, nonzero interval, DS channel = tuned primary) received in
+the dwell records `beacon_found`. `associate` refuses a candidate whose
+primary fails `may_associate` (passive-only needs the witness), and after
+the retune grants passive TX (`Io::station_passive_tx`) before the first
+Authentication frame. CSA (`observe_csa`, mac80211
+`ieee80211_sta_process_chanswitch` `drop_connection` on an unusable target)
+drops the link unless the target passes `may_associate`; `switch_channel`
+re-checks the witness under the current policy, fails the link if it was
+retracted, and grants the target after the native switch. `stop` (and so
+`disconnect`/`fail`) clears the witnesses and withdraws the grant. Linux
+mac80211 lets a STA follow a CSA into any non-disabled channel; requiring a
+witness for a RADAR / NO_IR target is NARF's stricter client rule. Monitor
+is RX only (CMAC TX stays disabled) and simply tunes a passive-only primary.
+Firmware hw_scan offload is not used, so no firmware probe path exists.
+
 **5GHz monitor.** `monitor_wire::channel` accepts an exact NOHT/HT20
 chandef on any typed 5GHz primary (5180..=5885MHz, still signed-admission
 gated), `frequency` is cfg80211 `ieee80211_channel_to_freq_khz`, and
@@ -2403,16 +2432,19 @@ signed-admitted, a 5000MHz band listing exactly those primaries (core.c
 Association requests are checked against the same mask and the cfg80211
 frequency of the primary.
 
-Remaining before `five_ghz_operation` is whole (no row credit): DFS passive
-scanning, and all native two-arch plus physical validation. New unexecuted
-cases: `smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`,
+Remaining before `five_ghz_operation` is whole: only native two-arch
+execution and physical validation (not claimable here). New unexecuted
+cases: `smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span`
+(renamed from `..._admits_only_non_dfs_host_span`),
+`smoke_rtw8852b_dfs_channel_scanned_passively_without_probe`,
+`smoke_reg_witness_classifies_passive_channels`,
+`smoke_reg_witness_scan_generation_retracts_and_scopes`, `smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`,
 `smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted`,
 `smoke_rtw89_b_operating_profile_5ghz_matches_linux_indices_and_groups`,
 `smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx`,
 `smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary`,
 `smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck`,
-`smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan`,
-`smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span`.
+`smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan`.
 
 ## 4. Invariants
 

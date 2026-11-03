@@ -7,9 +7,11 @@
 //! probe request on either (scan.c `ieee80211_scan_state_decision`,
 //! `ieee80211_prep_hw_scan`: `chan->flags & (NO_IR | RADAR)` selects the
 //! passive dwell), and a station joins only a BSS it actually heard
-//! (scan.c `cfg80211_bss_update` keeps the received Beacon; reg.c
-//! `regulatory_hint_found_beacon` sets `beacon_found`). A station performs
-//! no radar detection, so on such a channel it may only follow an AP.
+//! (scan.c `cfg80211_bss_update` keeps the received Beacon). reg.c
+//! `regulatory_hint_found_beacon` sets `beacon_found` only on non-RADAR
+//! channels; the witness here is the stricter NARF client rule: a station
+//! performs no radar detection, so on a RADAR or NO_IR channel it only
+//! follows an AP whose Beacon it heard in the latest scan of that channel.
 //!
 //! `BeaconWitness` is the driver-neutral record of that fact: per 20 MHz
 //! center, whether a Beacon was heard in the *latest* scan generation that
