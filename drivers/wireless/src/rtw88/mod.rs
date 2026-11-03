@@ -134,6 +134,7 @@ pub(super) mod station_control;
 mod station_power8821c;
 mod station_profile;
 mod wmm;
+mod wow;
 pub use calibration8821c::{Error as C21CalibrationError, Request as C21CalibrationRequest};
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};

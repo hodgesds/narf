@@ -114,6 +114,11 @@ pub(super) struct PreparedImage {
     did: u16,
     bytes: alloc::vec::Vec<u8>,
 }
+impl PreparedImage {
+    pub(super) fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
 pub(super) fn preflight_image(
     did: u16,
     bytes: alloc::vec::Vec<u8>,
@@ -132,7 +137,18 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
     }
 }
 pub(super) fn registered_image(did: u16) -> Result<PreparedImage, Error> {
-    let name = filename(did)?;
+    registered_named(did, filename(did)?)
+}
+/// `rtw8822c_hw_spec.wow_fw_name`, opened, authenticated and parsed through
+/// the same firmware registry/signature path as the NIC image (Linux
+/// `main.c::rtw_load_firmware(RTW_WOWLAN_FW)`). RTL8822CE only.
+pub(super) fn registered_wow_image(did: u16) -> Result<PreparedImage, Error> {
+    if did != 0xc822 {
+        return Err(Error::Unsupported);
+    }
+    registered_named(did, super::wow::WOW_FIRMWARE)
+}
+fn registered_named(did: u16, name: &'static str) -> Result<PreparedImage, Error> {
     let loader = narf_firmware::trusted_loader_authority()
         .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
     let authority = loader
@@ -542,6 +558,12 @@ pub(super) unsafe trait Io: Send {
 
     async fn delay_us(&mut self, us: u64) {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(us.saturating_mul(1000))).await;
+    }
+    /// `wow.c::rtw_wow_swap_fw` precondition: the original station's TRX is
+    /// stopped (`rtw_wow_stop_trx`) and the firmware reserved-page channel
+    /// may be reused for a section download. No backend grants this yet.
+    fn claim_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
     }
 }
 #[derive(Debug)]
@@ -1515,6 +1537,22 @@ impl<I: Io> Owner<I> {
         self.info = Some(image.info);
         self.phase = Phase::Ready;
         Ok(image.info)
+    }
+    /// `wow.c::rtw_wow_swap_fw`: download another authenticated image (WoW
+    /// or the normal restore) into the running station's CPU through the
+    /// same section sequence as bring-up. A failure poisons the owner.
+    pub(super) async fn swap_firmware(&mut self, image: &PreparedImage) -> Result<Info, Error> {
+        if self.phase != Phase::Station || self.did != image.did {
+            return Err(Error::State);
+        }
+        self.io.claim_swap()?;
+        self.phase = Phase::Failed;
+        let parsed = parse(self.did, &image.bytes)?;
+        narf_time::timeout(narf_time::Deadline::after_ms(2000), self.run(&parsed))
+            .await
+            .map_err(|_| Error::Deadline)??;
+        self.phase = Phase::Station;
+        Ok(parsed.info)
     }
     fn update8(&mut self, reg: u16, clear: u8, set: u8) -> Result<(), Error> {
         let value = self.io.read8(reg)?;

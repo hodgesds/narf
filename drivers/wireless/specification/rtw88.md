@@ -2193,6 +2193,70 @@ unexecuted at the time of writing:
 `smoke_rtw88_channel_record_admission_and_regulatory_span`,
 `smoke_rtw8821ce_retune_txagc_and_rf18_readback`.
 
+### RTL8822CE Wake-on-WLAN source layer (`wow.rs`) — not advertised
+
+**Scope.** Only `rtw8822c.c` declares `wow_fw_name`
+(`rtw88/rtw8822c_wow_fw.bin`) and `wowlan_stub`; `wow::support(did)` is
+`Some` for `0xc822` only. It mirrors `rtw_wowlan_stub_8822c` minus what is
+not ported: disconnect, magic packet, GTK-rekey wake (`gtk_rekey_failure`,
+`RTW_WOW_RSN_RX_GTK_REKEY`), 12 patterns of 1..=128 bytes at offset 0.
+`WIPHY_WOWLAN_SUPPORTS_GTK_REKEY` is not set because rtw88 has no
+`set_rekey_data`; `WIPHY_WOWLAN_NET_DETECT` is not set because the PNO
+reserved pages, `rtw_fw_set_nlo_info` and `rtw_fw_channel_switch` are not
+ported. `wow::validate` re-checks every retained configuration.
+
+**Firmware.** `firmware_transport::registered_wow_image` opens the WoW
+image through the same firmware registry/signature authority and section
+parser as the NIC image (`registered_image`); the restore uses a freshly
+registered normal image, never a cached copy. `Owner::swap_firmware`
+(`wow.c::rtw_wow_swap_fw`) reuses the exact bring-up section download
+(`Owner::run`) on a `Phase::Station` owner after `Io::claim_swap`, and
+poisons the owner on any failure.
+
+**Sequence (`wow::suspend`/`wow::resume`, managed-linked station).**
+Suspend = `rtw_wow_stop_trx` (100 ms, TXPAUSE 0xff, clear BB_RSTB; set
+RW_RELEASE and require RXDMA_IDLE — Linux only logs a non-idle RX DMA, NARF
+refuses to swap firmware under it) → WoW image download + MEDIA_STATUS_RPT
+→ STA reserved pages (`runtime_ps_wire::Pages::station`, PS-Poll/NULL/
+QoS-NULL) → `rtw_wow_fw_start`: RSVD_PAGE H2C, pattern CAM (`REG_WKFMCAM_*`,
+four mask words + CRC/type/valid word per entry at `id << 3`, polled),
+AOAC_GLOBAL_INFO, DISCONNECT_DECISION (adopt, 30, 5), KEEP_ALIVE (adopt,
+NULL, 5), WOWLAN, REMOTE_WAKE_CTRL, `rtw_wow_check_fw_status(true)` (wake
+reason cleared within 100 ms) → `rtw_hci_stop` → `rtw_wow_bb_start` →
+`rtw_wow_avoid_reset_mac` (`REG_RSV_CTRL` 0x20, 0x60). Patterns follow
+`rtw_wow_pattern_generate` (6-bit mask shift for the LLC offset, Realtek
+CRC16 over masked bytes from offset 12). Resume reads
+`REG_WOWLAN_WAKE_REASON` first (`rtw_wow_show_wakeup_reason` →
+`wow::WakeReport`, a driver accessor as in iwlwifi §3.80 because the shared
+contract has no `ieee80211_report_wowlan_wakeup` event), then
+`rtw_hci_setup`/`start`, `rtw_wow_fw_stop` (disable H2Cs, CAM clear,
+`check_fw_status(false)`), `bb_stop`, normal image + MEDIA_STATUS_RPT,
+normal reserved pages, `rtw_wow_resume_trx`. Any error returns `Err` (resume
+still returns the captured report) and the caller must run the cold
+`system_suspend` resume (full restart, fresh association); `keeps_link`
+additionally drops the link after a disconnect/unknown reason.
+
+**Deliberate differences.** No LPS entry in WoW (`rtw_wow_enter_ps`): the
+WoW firmware stays awake under the station's existing power program, so
+no unqualified sleep program is introduced. `rtw_send_rsvd_page_h2c` is not
+re-sent on resume (Linux sends it only in `rtw_wow_fw_start`). PCI PME /
+wake-enable of the function belongs to the system-PM owner, as for iwlwifi
+WoW (iwlwifi.md §3.80), and is not claimed here.
+
+**Not wired (why the row stays open).** No native backend implements
+`wow::Io` or `firmware_transport::Io::claim_swap` (default `Unsupported`):
+the native reserved-page channel is single-use (`claim_pristine`) and the
+station uses software CCMP, so a WPA2 WoW additionally needs the PTK/GTK in
+the hardware security CAM (`sec.c::rtw_sec_write_cam`) for AOAC to decrypt
+magic/pattern frames, plus a `system_pm_native` branch that keeps D0/the
+retained station instead of card-off. `WirelessNetIface::wowlan_support`
+therefore stays `None` for rtw88. Five fixture cases are written and
+unexecuted: `smoke_rtw88_wow_support_and_validation`,
+`smoke_rtw88_wow_pattern_cam_layout`,
+`smoke_rtw88_wow_suspend_config_sequence`,
+`smoke_rtw88_wow_resume_reason_and_firmware_restore`,
+`smoke_rtw88_wow_failure_requires_full_restart`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -2424,4 +2488,4 @@ changes. None is a physical blocker unless stated.
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
 | `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
-| `wow` | No `rtw8822c` wowlan firmware swap (`wow_fw_name`) or `wow.c` pattern/RF-kill programming is ported. |
+| `wow` | Source layer only (see "RTL8822CE Wake-on-WLAN source layer"): authenticated `wow_fw_name` load, `rtw_wow_swap_fw` download hook, full `wow.c` suspend/resume sequence, pattern CAM, WoW H2Cs and wake-reason decode with five unexecuted fixture cases. Not advertised: no native `wow::Io`/`claim_swap` backend, no hardware security-CAM key install for WPA2 AOAC, and no D0-retaining `system_pm_native` branch. |
