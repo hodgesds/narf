@@ -2370,7 +2370,7 @@ production feature. Unsupported functionality remains unadvertised.
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire; GSC-loaded HuC, GT1 engine-cycles/topology queries and silicon acceptance remain |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology queries; GSC/HuC firmware formats and HECI packets are modelled but unwired; GSCCS, GSC load, MTL HuC DMA/GuC/GSC authentication and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; TBT, HDMI FRL, UHBR, multi-pipe, PSR2 selective fetch and Panel Replay open |
@@ -3628,6 +3628,74 @@ invalidation (MTL has no flat CCS) at the GSI-adjusted VD0/VE0_AUX_INV
 With `narf.intel.media_gt=1` absent, GT0 interrupt routing, scheduling, the
 arena and the UAPI are unchanged. The debug group pass is deferred to the end
 of the current integration wave.
+
+#### GT1 engine cycles and topology, and the GSC/HuC formats
+
+With GT1 published, the last two native Xe queries now cover it, following
+xe_query.c. DRM_XE_DEVICE_QUERY_ENGINE_CYCLES checks size, the input copy and
+the clock ID as before. gt_id 1 then resolves only while GT1 is published,
+every other nonzero gt_id is EINVAL, and the class and logical instance must
+exist on GT1. The media GuC samples RING_TIMESTAMP and its upper dword at the
+engine's absolute base. Media engine bases lie above MEDIA_GT_GSI_LENGTH, so
+xe_mmio_adjusted_addr leaves them unchanged. It uses GT0's sampler, which
+rechecks GT1's GT wake and every held VDBOX/VEBOX wake in place of Linux's
+XE_FORCEWAKE_ALL. The width is 36 bits. A lost GT1 wake returns EIO, unpublishes
+GT1 and starts the media GuC's verified stop. Userspace converts cycles with
+GT1's reference clock from the GT list.
+
+Linux runs xe_gt_topology_init on the media GT as well. Media GT probe
+therefore reads GT1's own GSI-translated geometry DSS, compute DSS and EU enable
+fuses under GT wake. It takes two equal samples and keeps empty masks, since
+real media GTs may have no DSS, and refuses reserved EU bits as unavailable
+MMIO. DRM_XE_DEVICE_QUERY_GT_TOPOLOGY appends GT1's geometry, compute and SIMD8
+EU-per-DSS entries after GT0's, in for_each_gt order. They use GT0's existing
+NARF wire widths. Like GT0, GT1 reports no L3 bank entry, although Linux reports
+one for pre-Xe3 media GTs. With the option off, or before publication, both
+queries are byte-for-byte GT0-only.
+
+The GSC and HuC work starts with a model-only module,
+`intel_gpu_gt::media::gsc`. It covers the MTL firmware identities: the GSC
+image `i915/mtl_gsc_1.bin`, matched on compatibility major 102, and the HuC
+image `i915/mtl_huc_gsc.bin`, which has no version requirement. It covers
+parse_gsc_layout and parse_cpd_header for the GSC image, including the RBE
+partition and RBEP.man release and security version. For the HuC it covers
+parse_headers, where the CSS sw_version overrides the HUCP.man release,
+together with the DMA window and RSA offset. It also covers the GSC HECI header,
+reply and pending-handle rules, the GSC_HECI_CMD_PKT and GSC_FW_LOAD batches,
+the MKHI compatibility query and the PXP 4.3 NEW_HUC_AUTH packet. Each refusal
+carries the errno of its source branch.
+
+Three source facts shape the remaining work.
+- Linux sets the MTL HuC running after a DMA upload from its embedded CSS
+  followed by media-GuC authentication (xe_uc_load_hw). That state is what
+  query_uc_fw_version reports. GSC authentication is a second, PXP-oriented
+  step.
+- huc_auth_via_gsccs runs before xe_gsc_proxy_start and needs only a GSCCS
+  packet to the PXP HECI client. The MEI/PXP/HDCP proxy is therefore out of
+  scope for HuC.
+- Linux's separate huc_firmware_path and gsc_firmware_path parameters make
+  HuC and GSC independently optional.
+
+The next wired slice is the MTL HuC on the media GuC: registry open, staging
+with WOPCM, DMA from the CSS offset, the AUTHENTICATE_HUC action and the
+GSI-adjusted HUC_KERNEL_LOAD_INFO. It should sit behind both the media-GT
+option and the HuC option, and it needs no GSC. GSCCS bring-up, GSC load with
+its stolen private object, Wa_14015076503 when NARF itself loads the GSC, and
+GSC HuC authentication follow, behind a separate GSC option. Until then,
+scheduling still refuses while GSC firmware is loaded, and HuC stays
+unadvertised on MTL.
+
+New fixtures register under `intel_gpu_media_gt`:
+- `smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake` and
+  `smoke_xe_mtl_media_gt1_engine_cycles_and_topology` cover the two queries.
+- `smoke_media_gsc_firmware_identities_and_compatibility_policy`,
+  `smoke_media_gsc_layout_parse_and_every_refusal`,
+  `smoke_media_huc_gsc_image_versions_offsets_and_refusals`,
+  `smoke_media_gsc_heci_packets_follow_xe_gsc_submit` and
+  `smoke_media_huc_auth_modes_read_gt1_registers` cover the formats.
+
+They were registered but not run in this checkpoint, and they are not physical
+Intel evidence.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 
