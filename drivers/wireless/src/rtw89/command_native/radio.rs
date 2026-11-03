@@ -1020,6 +1020,149 @@ impl Native {
         Ok(())
     }
 }
+impl Native {
+    /// RTL8852C counterpart of [`Self::retune_full_radio`] for one typed
+    /// `profile` (2.4GHz 20MHz/HT40, 5GHz 20/40/80/160MHz) on the Ready C
+    /// radio: drain, withhold the C ordinary grant, `select` the profile's
+    /// signed `N5CB`/`N5CC` envelope, `radio_c::Radio::retune` (core.c
+    /// `rtw89_set_channel` -> rtw8852c.c `rtw8852c_set_channel`, then
+    /// `rtw89_chip_rfk_channel` -> `rtw8852c_rfk_channel`), the
+    /// `RF_GET_MCCCH` V0 H2C (fw.c `rtw89_fw_h2c_rf_ntfy_mcc`,
+    /// `RFK_NTFY_MCC_V0`), then reinstall the same grant.
+    ///
+    /// Admission mirrors `prepare_radio_c`: the identity is rebound to this
+    /// exact factory/assets/plan (`radio_policy_c::Board::new` +
+    /// `channel_matches`) and the profile must be `channel_allowed` under
+    /// the current host rule. Refused with nothing withheld (retryable)
+    /// unless ordinary TX, the H2C queue and RX backlog are drained, the
+    /// radio is awake and no monitor or sleep owner exists; `linked` is the
+    /// associated-station channel switch (a peer must exist; otherwise none
+    /// may).
+    ///
+    /// # Safety
+    /// Same retained Startup owner/tables/assets that prepared `owner`. A
+    /// failed or dropped future after the grant is withheld leaves the
+    /// radio non-Ready; the caller's Attempt terminalizes this Native.
+    pub(in crate::rtw89) async unsafe fn retune_radio_c(
+        &mut self,
+        owner: &mut radio_c::Radio,
+        tables: &radio_init::Init,
+        assets: &radio_assets::Assets,
+        profile: operating_channel_c::Profile,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.chip != ChipId::Rtl8852C {
+            return Err(power::Error::Unsupported);
+        }
+        self.radio_profile_current()?;
+        self.ordinary_current()?;
+        if owner.state() != radio_c::State::Ready
+            || self.full_qualification.is_some()
+            || !self.coex_ready
+            || !self.nctl_ready
+        {
+            return Err(power::Error::Terminal);
+        }
+        if !radio_policy_c::admissible(profile) {
+            return Err(power::Error::Unsupported);
+        }
+        if owner.channel() == Some(profile) {
+            return Ok(owner.epoch());
+        }
+        let qualification = self.qualification_c.clone().ok_or(power::Error::Terminal)?;
+        if !self.ordinary.as_ref().is_some_and(
+            |grant| matches!(grant, OrdinaryGrant::C(q) if Arc::ptr_eq(q, &qualification)),
+        ) {
+            return Err(power::Error::Terminal);
+        }
+        if !qualification.channel_allowed(profile).map_err(denied)? {
+            return Err(power::Error::Unsupported);
+        }
+        let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+        let identity = factory.identity().ok_or(power::Error::Unsupported)?;
+        if identity.chip() != ChipId::Rtl8852C {
+            return Err(power::Error::Access);
+        }
+        let rfe = identity.calibration().rfe_type;
+        let cut = identity.cut();
+        let plan = radio_power_c::Plan::from_assets(assets, rfe, profile).map_err(denied)?;
+        let phycap = self.firmware_phycap().ok_or(power::Error::Unsupported)?;
+        let rx_nss = phycap.rx_nss();
+        let board = radio_policy_c::Board::new(
+            self.lifecycle,
+            factory,
+            self.device.id,
+            assets,
+            &plan,
+            phycap,
+        )
+        .map_err(denied)?;
+        if !qualification.channel_matches(board) {
+            return Err(power::Error::Access);
+        }
+        let calibration = *tables.calibration_c().ok_or(power::Error::Unsupported)?;
+        if crate::rtw89::factory_c::Calibration::from_factory(factory) != Some(calibration) {
+            return Err(power::Error::Access);
+        }
+        let gain = tables.gain().ok_or(power::Error::Unsupported)?.clone();
+        let tracking = rfk::c_tssi::Tracking::from_assets(assets).map_err(denied)?;
+        // Drain: rtw89_ops_flush / ieee80211_offchannel_stop_vifs. Busy is a
+        // proven-unpublished refusal; the caller retries after draining.
+        self.poll().map_err(|_| power::Error::Access)?;
+        if self.sleep_blocked
+            || self.sleep_reset.is_some()
+            || self.station_runtime.peer.is_some() != linked
+            || self.station_runtime.monitor.is_some()
+            || self.queue.pending() != 0
+            || !self.station_runtime.backlog.is_empty()
+            || self
+                .station_runtime
+                .core
+                .as_ref()
+                .is_some_and(|core| !core.ready())
+        {
+            return Err(power::Error::Busy);
+        }
+        // rtw89_leave_ps_mode precondition: actual CPWM/MACID0 awake.
+        crate::rtw89::station_control::awake(&mut self.io)?;
+        // Close ordinary publication; RFK and the MCC H2C run inside the
+        // retained C program (`Port`/`calibration_access`) whose envelope is
+        // now the target profile's signed record over its occupied span.
+        let grant = self.ordinary.take().ok_or(power::Error::Terminal)?;
+        self.channel = None;
+        qualification.select(profile).map_err(denied)?;
+        // SAFETY: caller contract; queues drained and grant withheld above.
+        let mcc = unsafe {
+            owner.retune(
+                self,
+                radio_c::Inputs {
+                    gain: &gain,
+                    calibration: &calibration,
+                    power: &plan,
+                    tracking: &tracking,
+                    cut,
+                    rx_nss,
+                },
+            )
+        }
+        .await
+        .map_err(radio_c::error)?;
+        self.runtime_command(2, 0x0a, 2, &mcc, false, super::station::Permit::Legacy)
+            .await?;
+        self.radio_profile_current()?;
+        if owner.state() != radio_c::State::Ready
+            || owner.channel() != Some(profile)
+            || qualification.active() != profile
+        {
+            return Err(power::Error::Terminal);
+        }
+        qualification.current().map_err(denied)?;
+        self.channel = Some((profile.primary(), owner.epoch()));
+        // ieee80211_offchannel_return: queues reopen only on the same grant.
+        self.ordinary = Some(grant);
+        Ok(owner.epoch())
+    }
+}
 /// Pure staged RTL8852C signed records (`Native::preflight_radio_c`).
 pub(in crate::rtw89) struct RadioPreflightC {
     cal_board: crate::rtw89::calibration_policy::Board,

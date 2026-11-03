@@ -346,6 +346,21 @@ impl Startup {
         {
             return Err(power::Error::Terminal);
         }
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C)
+        {
+            // RTL8852C: the 20MHz profile of `primary` (2.4GHz 1..=13 or a
+            // 5GHz primary); wide C profiles go through `retune_channel_c`.
+            let band = if primary <= 14 {
+                super::operating_channel_c::Band::Ghz2
+            } else {
+                super::operating_channel_c::Band::Ghz5
+            };
+            let profile = super::operating_channel_c::Profile::new20(band, primary)
+                .ok_or(power::Error::Unsupported)?;
+            return self.retune_channel_c(profile, linked).await;
+        }
         let mut attempt = Attempt::new(self);
         let result = async {
             let owner = &mut *attempt.owner;
@@ -364,6 +379,55 @@ impl Startup {
                         &owner.rfk,
                         owner.assets.as_ref().ok_or(power::Error::Terminal)?,
                         primary,
+                        linked,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
+        result
+    }
+    /// RTL8852C retune of the Ready radio to one signed-admitted typed
+    /// `profile` (`Native::retune_radio_c`), with `retune_channel`'s
+    /// retry/terminal split: a refusal that withheld nothing (the C ordinary
+    /// grant is still installed) leaves this owner usable.
+    pub(super) async fn retune_channel_c(
+        &mut self,
+        profile: super::operating_channel_c::Profile,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || (linked && self.station_controller.is_none())
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852C)
+        {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: the same retained Startup prepared `radio_c` with these
+            // exact C tables/assets; the Attempt terminalizes on loss.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_radio_c(
+                        &mut owner.radio_c,
+                        &owner.radio,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        profile,
                         linked,
                     )
                     .await

@@ -3318,8 +3318,26 @@ controller and the monitor owner refuse non-B chips. B's grant, accessors
 and bytes are unchanged. Unexecuted case:
 `smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans`.
 
-Remaining for the `rtl8852c` row (no row credit): a native C retune caller
-over the admitted `N5CC` profiles, `command_native`/
+**C retune (`Native::retune_radio_c`, `Startup::retune_channel_c`).** The
+C counterpart of `retune_full_radio` for one typed `operating_channel_c`
+profile admitted by `radio_policy_c::admissible` (never channel 14 or
+6GHz): requires the Ready `radio_c` owner, current C ordinary grant (the
+same `Arc` as `qualification_c`), coex/NCTL ready, a rebound
+`radio_policy_c::Board::new` identity matching the loaded record
+(`channel_matches`) and `channel_allowed(profile)`; drains exactly like B
+(`poll`, no sleep/monitor owner, queue/backlog/core idle, peer iff
+`linked`, actual awake), then withholds the grant, `select`s the profile,
+runs `radio_c::Radio::retune` (core.c `rtw89_set_channel` ->
+`rtw8852c_set_channel`, then `rtw8852c_rfk_channel`) and the
+`RF_GET_MCCCH` V0 H2C, rechecks Ready/channel/active profile and
+`current()`, and reinstalls the same grant. A same-profile request returns
+the current epoch. `Startup::retune_channel(primary, linked)` dispatches C
+to `retune_channel_c` with the 20MHz profile of `primary` (2.4GHz <= 14,
+else 5GHz); B is unchanged. Retry/terminal split matches B: the Attempt
+commits when the ordinary grant (hence `operating_channel`) survives.
+No new test case (the owner needs an actual Ready C radio).
+
+Remaining for the `rtl8852c` row (no row credit): `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:
