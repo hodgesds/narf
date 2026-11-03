@@ -250,16 +250,16 @@ fn clips(rects: &[[u16; 4]]) -> alloc::vec::Vec<u8> {
 fn dirtyfb_request_validation_and_damaged_rows_follow_linux() -> TestResult {
     use super::fb_cmd::DirtyCmd;
     // drm_mode_dirtyfb_ioctl's -EINVAL cases.
-    for (flags, n, ptr) in [
-        (0, 1, 0),
-        (0, 0, 0x1000),
-        (4, 0, 0),
-        (1, 3, 0x1000),
-        (0, 257, 0x1000),
-    ] {
+    for (flags, n, ptr) in [(0, 1, 0), (0, 0, 0x1000), (1, 3, 0x1000), (0, 257, 0x1000)] {
         if DirtyCmd::parse(&dirty(flags, n, ptr)).is_some() {
             return TestResult::Fail("DIRTYFB request Linux refuses was admitted");
         }
+    }
+    // `flags = DRM_MODE_FB_DIRTY_FLAGS & r->flags`: an unknown flag bit is
+    // dropped, never refused.
+    match DirtyCmd::parse(&dirty(4, 0, 0)) {
+        Some(cmd) if cmd.flags == 0 => {}
+        _ => return TestResult::Fail("unknown DIRTYFB flag not masked as Linux masks it"),
     }
     let Some(full) = DirtyCmd::parse(&dirty(0, 0, 0)) else {
         return TestResult::Fail("clipless DIRTYFB refused");
@@ -298,4 +298,119 @@ fn dirtyfb_request_validation_and_damaged_rows_follow_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm/fb_legacy",
     dirtyfb_request_validation_and_damaged_rows_follow_linux
+);
+
+fn dirtyfb_checks_follow_drm_mode_dirtyfb_ioctl_order() -> TestResult {
+    use super::fb_cmd::DirtyCmd;
+    // decode never refuses a full request: the framebuffer lookup (-ENOENT)
+    // runs between it and the -EINVAL checks.
+    for (flags, n, ptr) in [(0, 1, 0), (0, 0, 0x1000), (1, 3, 0x1000), (0, 257, 0x1000)] {
+        let Some(cmd) = DirtyCmd::decode(&dirty(flags, n, ptr)) else {
+            return TestResult::Fail("DIRTYFB decode refused a 24-byte request");
+        };
+        if cmd.validate().is_ok() {
+            return TestResult::Fail("DIRTYFB validate admitted a request Linux refuses");
+        }
+    }
+    if DirtyCmd::decode(&[0; 23]).is_some() {
+        return TestResult::Fail("short DIRTYFB request decoded");
+    }
+    // num_clips is an int in drm_mode_dirtyfb_ioctl: 0x8000_0000 is negative.
+    if DirtyCmd::parse(&dirty(0, 0x8000_0000, 0x1000)).is_some() {
+        return TestResult::Fail("negative clip count admitted");
+    }
+    // The boundary count and an even copy annotation pass; flags are masked.
+    for (flags, n) in [(0, 256), (1, 2), (0xffff_fffe, 1)] {
+        let Some(cmd) = DirtyCmd::parse(&dirty(flags, n, 0x1000)) else {
+            return TestResult::Fail("valid DIRTYFB request refused");
+        };
+        if cmd.flags & !3 != 0 || cmd.clips_len() != n as usize * 8 {
+            return TestResult::Fail("DIRTYFB flags not masked or clip length wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/fb_legacy",
+    dirtyfb_checks_follow_drm_mode_dirtyfb_ioctl_order
+);
+
+fn dirtyfb_damage_follows_drm_atomic_helper_dirtyfb() -> TestResult {
+    use super::fb_cmd::{Damage, DirtyCmd, Rect};
+    // No clips: FB_DAMAGE_CLIPS stays unset, a full-plane update.
+    if DirtyCmd::parse(&dirty(0, 0, 0)).unwrap().damage(&[]) != Damage::Full {
+        return TestResult::Fail("clipless DIRTYFB carried clips");
+    }
+    // Every drm_clip_rect becomes a drm_mode_rect, unsigned 16-bit corners
+    // widened, empty and off-framebuffer rectangles kept for the merge.
+    let cmd = DirtyCmd::parse(&dirty(0, 3, 0x1000)).unwrap();
+    let rects = clips(&[[10, 400, 18, 416], [65535, 0, 65535, 1], [5, 0, 5, 2000]]);
+    if cmd.damage(&rects)
+        != Damage::Clips(alloc::vec![
+            Rect::new(10, 400, 18, 416),
+            Rect::new(65535, 0, 65535, 1),
+            Rect::new(5, 0, 5, 2000),
+        ])
+    {
+        return TestResult::Fail("DIRTYFB clips not converted as convert_clip_rect_to_rect");
+    }
+    // ANNOTATE_COPY: num_clips /= 2 and every second clip (src_inc 2).
+    let copy = DirtyCmd::parse(&dirty(1, 4, 0x1000)).unwrap();
+    let pairs = clips(&[[0, 0, 8, 8], [0, 100, 8, 108], [1, 1, 2, 2], [3, 3, 4, 4]]);
+    if copy.damage(&pairs)
+        != Damage::Clips(alloc::vec![Rect::new(0, 0, 8, 8), Rect::new(1, 1, 2, 2)])
+    {
+        return TestResult::Fail("annotated copy did not take clips 0 and 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/fb_legacy",
+    dirtyfb_damage_follows_drm_atomic_helper_dirtyfb
+);
+
+fn fb_damage_clips_blob_and_merge_follow_drm_damage_helper() -> TestResult {
+    use super::fb_cmd::{Damage, Rect};
+    let blob = |rects: &[[i32; 4]]| -> alloc::vec::Vec<u8> {
+        rects
+            .iter()
+            .flat_map(|r| r.iter().flat_map(|v| v.to_le_bytes()))
+            .collect()
+    };
+    // drm_property_replace_blob_from_id: whole drm_mode_rect elements only.
+    if Damage::from_blob(&[0; 15]).is_ok() || Damage::from_blob(&[0; 17]).is_ok() {
+        return TestResult::Fail("FB_DAMAGE_CLIPS blob of a partial rectangle accepted");
+    }
+    if Damage::from_blob(&[]) != Ok(Damage::Clips(alloc::vec::Vec::new())) {
+        return TestResult::Fail("empty FB_DAMAGE_CLIPS blob not an empty clip list");
+    }
+    let src = Rect::new(0, 0, 64, 32);
+    // No blob, or a source that moved: the whole source.
+    if Damage::Full.merged(&src, &src) != Some(src) {
+        return TestResult::Fail("full damage is not the plane source");
+    }
+    let clips = Damage::from_blob(&blob(&[[2, 3, 4, 5], [-8, 30, 9, 40], [70, 0, 80, 4]])).unwrap();
+    if clips.merged(&Rect::new(1, 0, 65, 32), &src) != Some(src) {
+        return TestResult::Fail("moved source did not damage the whole plane");
+    }
+    // Clips intersected with the source (negative and past-the-edge parts
+    // clamped, a clip outside it dropped), then their bounding box.
+    if clips.merged(&src, &src) != Some(Rect::new(0, 3, 9, 32)) {
+        return TestResult::Fail("drm_atomic_helper_damage_merged bounding box wrong");
+    }
+    // Nothing inside the source: no damage at all.
+    let outside =
+        Damage::from_blob(&blob(&[[70, 0, 80, 4], [0, 32, 8, 40], [3, 3, 3, 9]])).unwrap();
+    if outside.merged(&src, &src).is_some()
+        || Damage::Clips(alloc::vec::Vec::new())
+            .merged(&src, &src)
+            .is_some()
+    {
+        return TestResult::Fail("damage outside the source reported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/fb_legacy",
+    fb_damage_clips_blob_and_merge_follow_drm_damage_helper
 );
