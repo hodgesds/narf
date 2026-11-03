@@ -318,6 +318,10 @@ struct Plan {
     /// The primary plane's frame damage for a [`Action::Present`]: the
     /// FB_DAMAGE_CLIPS blob or DIRTYFB clips, else the whole plane.
     damage: crate::drm::fb_cmd::Damage,
+    /// The request turns the lit crtc inactive (atomic `ACTIVE=0`, or a
+    /// `SETCRTC` without a framebuffer): after the console restore, the
+    /// panel's crtc goes off where the backend can turn it off.
+    off: bool,
 }
 
 fn same_timing(
@@ -463,6 +467,7 @@ impl Plan {
             nonblock: false,
             legacy_store,
             damage: crate::drm::fb_cmd::Damage::Full,
+            off: false,
         };
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
@@ -812,6 +817,11 @@ impl Plan {
                 }
             }
         }
+        // drm_atomic_crtc_check: a crtc that was active and is not any
+        // more is disabled by this commit (intel_atomic_commit_tail runs
+        // hsw_crtc_disable for it). A request that only drops the primary
+        // keeps the crtc active.
+        p.off = p.previous.enabled && !p.next.enabled;
         if !p.next.enabled || fb.is_none() || route.is_none() {
             // Full restoration selects the retained origin-zero console;
             // an inherited panned rectangle must not prevent disabling it.
@@ -1227,6 +1237,19 @@ trait Backend {
     fn copy<'a>(&'a mut self, frame: &'a Framebuffer, mode: &'a ModeState) -> FsFuture<'a, ()> {
         alloc::boxed::Box::pin(copy_frame(frame, mode, self.console_fb()))
     }
+    /// The panel's crtc off; `Unsupported` where the backend keeps it lit
+    /// on the console instead.
+    fn panel_off(&mut self) -> FsFuture<'_, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// The panel's crtc on again (a no-op while it is lit).
+    fn panel_on(&mut self) -> FsFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Whether the panel's crtc is off.
+    fn panel_dark(&self) -> bool {
+        false
+    }
 }
 impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<'_, M> {
     fn valid(&self) -> Result<(), FsError> {
@@ -1297,6 +1320,15 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
+    }
+    fn panel_off(&mut self) -> FsFuture<'_, ()> {
+        Box::pin(crate::intel_gpu_kms::Guard::panel_off(self))
+    }
+    fn panel_on(&mut self) -> FsFuture<'_, ()> {
+        Box::pin(crate::intel_gpu_kms::Guard::panel_on(self))
+    }
+    fn panel_dark(&self) -> bool {
+        crate::intel_gpu_kms::Guard::panel_dark(self)
     }
 }
 
@@ -1481,6 +1513,9 @@ async fn finish_master_release<B: Backend>(
         return Ok(());
     }
     backend.restore().await?;
+    // drm_fb_helper_restore_fbdev_mode_unlocked commits the console's crtc
+    // active, so a panel the master turned off lights again.
+    backend.panel_on().await?;
     backend.valid()?;
     mode.lock().intel_master_restored();
     Ok(())
@@ -1521,6 +1556,7 @@ async fn execute_plan<B: Backend>(
         Action::SetMaster => unreachable!("handled before transaction"),
         Action::DropMaster => {
             backend.restore().await?;
+            backend.panel_on().await?;
         }
         Action::Remove(id) => {
             if plan.previous.primary_fb == Some(*id) {
@@ -1529,9 +1565,24 @@ async fn execute_plan<B: Backend>(
         }
         Action::Restore => {
             backend.restore().await?;
-            stamp = Some(backend.vblank().await?);
+            if backend.panel_dark() {
+                // drm_crtc_send_vblank_event for a crtc that stays off.
+                stamp = Some(FlipStamp {
+                    ns: narf_time::monotonic_ns(),
+                    sequence: 0,
+                });
+            } else {
+                stamp = Some(backend.vblank().await?);
+                if plan.off {
+                    match backend.panel_off().await {
+                        Ok(()) | Err(FsError::Unsupported) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
         }
         Action::Observe => {
+            backend.panel_on().await?;
             backend.surface().await?;
             stamp = Some(backend.vblank().await?);
         }
@@ -1565,6 +1616,8 @@ async fn execute_plan<B: Backend>(
             });
         }
         Action::Present => {
+            // The crtc enable of a commit that lights it again.
+            backend.panel_on().await?;
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
             let direct = fb.intel.as_ref().filter(|i| {
                 fb.format == PixelFormat::Xrgb8888
@@ -1614,7 +1667,10 @@ async fn execute_plan<B: Backend>(
             timing,
         } => {
             let w = words(bytes);
-            if *hardware {
+            if backend.panel_dark() {
+                // The cursor plane of an inactive crtc is state only
+                // (i915's slow path commits it without programming).
+            } else if *hardware {
                 stamp = Some(
                     backend
                         .cursor(

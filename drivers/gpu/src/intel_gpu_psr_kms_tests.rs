@@ -628,3 +628,95 @@ kernel_test_in!(
 
 #[path = "intel_gpu_psr2_kms_tests.rs"]
 mod psr2;
+
+/// The panel's crtc off from a KMS owner (`intel_atomic_commit_tail` with the
+/// crtc inactive) on a PSR panel: PSR is disabled (source, then sink) before
+/// the platform's crtc disable; the dark panel keeps the owner valid without
+/// a console scanout; panel-on lights it again once; a primary flip still
+/// unlatched refuses the off with `Busy` before PSR, FBC or the crtc is
+/// touched.
+fn smoke_kms_mtl_panel_off_disables_psr_first_and_refuses_unlatched_flip() -> TestResult {
+    {
+        let platform = psr_platform();
+        let device = platform.meteor();
+        present_once(&device, object(true).unwrap());
+        assert_eq!(platform.read32(PSR_CTL), ARMED);
+        let mut session = complete(device.session()).unwrap();
+        complete(session.restore_console()).unwrap();
+        let start = platform.all_writes().len();
+        complete(session.panel_off()).unwrap();
+        assert!(session.panel_dark());
+        assert!(psr(&device).is_none());
+        let writes = platform.all_writes()[start..].to_vec();
+        let off = writes.iter().position(|&w| w == (PANEL_LOG, 0)).unwrap();
+        assert_eq!(writes.iter().filter(|&&(r, _)| r == PANEL_LOG).count(), 1);
+        assert_eq!(platform.read32(PSR_CTL) & (1 << 31), 0);
+        if let Some(disable) = writes.iter().position(|&(r, _)| r == PSR_CTL) {
+            assert!(disable < off, "PSR must be disabled before the crtc");
+        }
+        // A dark panel has no console scanout to prove; the owner stays valid.
+        assert!(session.ownership_valid().is_ok());
+        // A second off is a no-op; panel-on lights it once.
+        complete(session.panel_off()).unwrap();
+        complete(session.panel_on()).unwrap();
+        complete(session.panel_on()).unwrap();
+        assert!(!session.panel_dark());
+        let panel: Vec<_> = platform.all_writes()[start..]
+            .iter()
+            .filter(|&&(r, _)| r == PANEL_LOG)
+            .map(|&(_, v)| v)
+            .collect();
+        assert_eq!(panel, [0, 1]);
+    }
+    {
+        // A flip armed but not latched (its future dropped) refuses.
+        let platform = psr_platform();
+        let device = platform.meteor();
+        present_once(&device, object(true).unwrap());
+        let mut session = complete(device.session()).unwrap();
+        {
+            let mut flip = Box::pin(session.present(object(true).unwrap(), geometry()));
+            assert!(once(flip.as_mut()).is_pending());
+        }
+        let start = platform.all_writes().len();
+        assert_eq!(complete(session.panel_off()), Err(FsError::Busy));
+        assert!(!session.panel_dark());
+        assert!(platform.all_writes()[start..].is_empty());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_kms_mtl_panel_off_disables_psr_first_and_refuses_unlatched_flip
+);
+
+/// FBIOBLANK's console DPMS (`drm_client_modeset_dpms`): without a KMS
+/// master the console's crtc goes off (after the console restore) and back
+/// on; with a master nothing happens and the call is `Busy`
+/// (`drm_master_internal_acquire`).
+fn smoke_kms_mtl_console_dpms_follows_master_and_toggles_the_panel() -> TestResult {
+    let platform = psr_platform();
+    let device = platform.meteor();
+    let start = platform.all_writes().len();
+    assert_eq!(
+        complete(device.console_dpms(false, || true)),
+        Err(FsError::Busy)
+    );
+    assert!(platform.all_writes()[start..]
+        .iter()
+        .all(|&(r, _)| r != PANEL_LOG));
+    complete(device.console_dpms(false, || false)).unwrap();
+    complete(device.console_dpms(false, || false)).unwrap();
+    complete(device.console_dpms(true, || false)).unwrap();
+    let panel: Vec<_> = platform.all_writes()[start..]
+        .iter()
+        .filter(|&&(r, _)| r == PANEL_LOG)
+        .map(|&(_, v)| v)
+        .collect();
+    assert_eq!(panel, [0, 1]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_kms_mtl_console_dpms_follows_master_and_toggles_the_panel
+);

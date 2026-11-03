@@ -106,6 +106,9 @@ struct Hardware {
 /// Sink AUX writes are logged in the MMIO write log at this pseudo offset
 /// plus the DPCD address, so register and sink order can be compared.
 pub(crate) const AUX_LOG: u64 = 1 << 40;
+/// The platform's panel-off (value 0) and panel-on (value 1) are logged in
+/// the MMIO write log at this pseudo offset.
+pub(crate) const PANEL_LOG: u64 = 1 << 41;
 #[derive(Clone, Debug)]
 pub(crate) struct MockPlatform(
     Arc<IrqSafeSpinLock<Hardware>>,
@@ -1191,6 +1194,14 @@ impl Platform for MockPlatform {
     }
     fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
         self.0.lock().psr_pci
+    }
+    fn panel_off(&self) -> PanelWait<'_> {
+        self.0.lock().writes.push((PANEL_LOG, 0));
+        Box::pin(async { Ok(()) })
+    }
+    fn panel_on<'a>(&'a self, _console: &'a ActiveScanout) -> PanelWait<'a> {
+        self.0.lock().writes.push((PANEL_LOG, 1));
+        Box::pin(async { Ok(()) })
     }
     fn fbc_carve(&self, size: u64, min_limit: u32) -> Poll<Option<(u32, u64, u32)>> {
         let mut hw = self.0.lock();

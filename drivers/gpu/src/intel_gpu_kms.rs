@@ -29,6 +29,10 @@ use crate::{
 };
 
 type Wait<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type PanelWait<'a> = Pin<Box<dyn Future<Output = Result<(), FsError>> + Send + 'a>>;
+type DisplayWakeref = crate::intel_gpu_gt_runtime::display_rpm::Wakeref;
+type RpmWait<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<DisplayWakeref>, FsError>> + Send + 'a>>;
 
 fn x_tiled_profile(
     io: &impl Platform,
@@ -264,6 +268,22 @@ pub(crate) trait Platform:
     /// `QUIRK_FW_SYNC_LEN` matches. Default: unknown, which refuses PSR2.
     fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
         None
+    }
+    /// `intel_display_rpm_get` for one KMS session
+    /// (`xe_pm_runtime_resume_and_get`): a runtime-PM reference that
+    /// resumes the function first, held for the session. Default: none.
+    fn display_rpm(&self) -> RpmWait<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// The panel's crtc off after the owner's pre-plane update: planes,
+    /// backlight, transcoder, port, PPS, PLL, pipe DMC, post-plane settle.
+    /// Default: the platform cannot turn its panel off.
+    fn panel_off(&self) -> PanelWait<'_> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// The panel's crtc on again at its mode, scanning out `console`.
+    fn panel_on<'a>(&'a self, _console: &'a ActiveScanout) -> PanelWait<'a> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
 }
 
@@ -785,6 +805,111 @@ impl Platform for Physical {
             self.device.id.subsystem_id,
         ))
     }
+    fn display_rpm(&self) -> RpmWait<'_> {
+        Box::pin(async move {
+            crate::intel_gpu_gt_runtime::display_rpm::wakeref_resume(self.bar.phys.raw())
+                .await
+                .map_err(|_| FsError::NoDevice)
+        })
+    }
+    fn panel_off(&self) -> PanelWait<'_> {
+        Box::pin(async move {
+            if self.generation != Generation::MeteorLake {
+                return Err(FsError::Unsupported);
+            }
+            panel_power_off(self).await
+        })
+    }
+    fn panel_on<'a>(&'a self, console: &'a ActiveScanout) -> PanelWait<'a> {
+        Box::pin(async move {
+            if self.generation != Generation::MeteorLake {
+                return Err(FsError::Unsupported);
+            }
+            panel_power_on(self, console).await
+        })
+    }
+}
+
+/// A modeset failure on the panel's crtc disable or enable.
+fn panel_modeset_error(_: crate::intel_gpu_modeset::ModesetError) -> FsError {
+    crate::intel_gpu_user::io_error()
+}
+
+/// The owned display-14 panel's crtc off, after the KMS owner's pre-plane
+/// update: `intel_crtc_disable_planes`, then `intel_ddi_disable_dp`'s
+/// `intel_edp_backlight_off` (the DPCD backlight off and the PPS gate
+/// closed, T9 waited without spinning), then the rest of `hsw_crtc_disable`
+/// and the post-plane settle (`XeLpgModeset::panel_off`).
+async fn panel_power_off(io: &Physical) -> Result<(), FsError> {
+    use crate::intel_gpu_modeset_xelpg::XeLpgModeset;
+    use crate::intel_gpu_xelpg::XeLpgPort;
+    XeLpgModeset::new(io, XeLpgPort::A)
+        .disable_planes()
+        .map_err(panel_modeset_error)?;
+    crate::intel_dpcd_bl::suspend_complete_for_bar(&io.bar)
+        .await
+        .map_err(|_| crate::intel_gpu_user::io_error())?;
+    XeLpgModeset::new(io, XeLpgPort::A)
+        .panel_off()
+        .map(|_| ())
+        .map_err(panel_modeset_error)
+}
+
+/// The panel's crtc on again with `console` scanned out, as the system
+/// resume relight does: the DPCD backlight owner powers the panel with its
+/// gate closed, the owned modeset runs its full enable at the recorded
+/// mode, then the owner relights the backlight after T8. Without a DPCD
+/// owner the PPS gate opens after T8 here (`intel_pps_backlight_on`).
+async fn panel_power_on(io: &Physical, console: &ActiveScanout) -> Result<(), FsError> {
+    use crate::intel_gpu_modeset_xelpg::{panel_off_record, XeLpgModeset};
+    use crate::intel_gpu_pm::PmPlatform as _;
+    use crate::intel_gpu_xelpg::XeLpgPort;
+    let record = panel_off_record().ok_or(FsError::Busy)?;
+    let mode = record
+        .mode
+        .or_else(|| crate::intel_gpu_pm::ProductionPlatform.display_state().0)
+        .ok_or_else(crate::intel_gpu_user::io_error)?;
+    let aux = crate::intel_dpcd_bl::installed(&io.bar);
+    if aux {
+        crate::intel_dpcd_bl::prepare_relight_for_bar(&io.bar)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+    }
+    let fb = crate::intel_gpu_modeset::Framebuffer {
+        phys_addr: u64::from(console.gtt_offset),
+        stride_bytes: console.stride_bytes,
+        format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+    };
+    XeLpgModeset::new(io, XeLpgPort::A)
+        .modeset_fixed(&fb, &mode)
+        .map_err(panel_modeset_error)?;
+    if aux {
+        return crate::intel_dpcd_bl::resume_for_bar(&io.bar)
+            .map_err(|_| crate::intel_gpu_user::io_error());
+    }
+    let delays = crate::intel_gpu_edp::panel_delays();
+    narf_time::SleepUntil::new(
+        narf_time::Deadline::after_ns(u64::from(delays.t8) * 100_000).as_instant(),
+    )
+    .await;
+    crate::intel_gpu_edp::PanelPowerSequencer::with_delays(io, delays)
+        .backlight_on()
+        .map_err(|_| crate::intel_gpu_user::io_error())
+}
+
+/// FBIOBLANK on the Intel console: [`Device::console_dpms`] on the
+/// display of `bar`, with the card's KMS master as the refusal.
+pub(crate) async fn console_dpms_for_bar(
+    bar: &narf_bus::MmioRegion,
+    on: bool,
+) -> Result<(), FsError> {
+    let display = display_for_bar(bar).ok_or(FsError::NoDevice)?;
+    let index = display.platform.index;
+    display
+        .console_dpms(on, || {
+            crate::drm_registry::mode_state(index)
+                .is_some_and(|card| card.lock().current_master.is_some())
+        })
+        .await
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -948,6 +1073,9 @@ struct State<M: Platform> {
     /// Why the last PSR qualification fell back to PSR1 (`None` when it
     /// selected PSR2 or did not reach selective update).
     psr2_refused: Option<crate::intel_gpu_psr::Psr2Refusal>,
+    /// The panel's crtc is off ([`Guard::panel_off`]): Pipe A is dark and
+    /// holds no display wakeref until [`Guard::panel_on`].
+    panel_off: bool,
 }
 
 #[derive(Debug)]
@@ -977,6 +1105,9 @@ pub(crate) struct Guard<'a, M: Platform> {
     state: MutexGuard<'a, State<M>>,
     /// DC_off for the whole session; released after the mutex.
     _power: crate::intel_gpu_dc_states::DcRef,
+    /// The session's runtime-PM reference (`intel_display_rpm_get`),
+    /// released last.
+    _rpm: Option<DisplayWakeref>,
 }
 
 impl<M: Platform> Drop for Guard<'_, M> {
@@ -1107,6 +1238,10 @@ pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoc
     let Some(state) = display.state.try_lock() else {
         return false;
     };
+    if state.panel_off {
+        // Nothing scans out: the formats are qualified again once lit.
+        return true;
+    }
     if state.failed
         || state.blocked
         || state.paused
@@ -1265,6 +1400,7 @@ impl<M: Platform> Device<M> {
                 psr_sink: None,
                 psr_refused: None,
                 psr2_refused: None,
+                panel_off: false,
             }),
         }
     }
@@ -1526,6 +1662,10 @@ impl<M: Platform> Device<M> {
         self.session_for(true).await
     }
     async fn session_for(&self, selective: bool) -> Result<Guard<'_, M>, FsError> {
+        // intel_atomic_commit's intel_display_rpm_get: a runtime-suspended
+        // function (a dark panel let it park) resumes before the session
+        // touches a register, and stays active until the session ends.
+        let rpm = self.platform.display_rpm().await?;
         let mut state = self.state.lock().await;
         if state.blocked || state.failed || self.platform.reset_lost() {
             return Err(FsError::NoDevice);
@@ -1540,6 +1680,7 @@ impl<M: Platform> Device<M> {
             device: self,
             state,
             _power,
+            _rpm: rpm,
         };
         // intel_psr_pause: PSR exits and reaches idle before this session
         // can change any frame (flip, DIRTYFB, cursor, color/DSB, console),
@@ -1561,6 +1702,7 @@ impl<M: Platform> Device<M> {
             device: self,
             state,
             _power,
+            _rpm: None,
         };
         guard.restore_console().await?;
         self.platform.color_restored();
@@ -1568,6 +1710,34 @@ impl<M: Platform> Device<M> {
         Ok(())
     }
 }
+impl<M: Platform> Device<M> {
+    /// `drm_client_modeset_dpms` for the kernel console (Linux b90c984d
+    /// `drm_client_modeset.c`, reached from `drm_fb_helper_blank`): `on` is
+    /// `mode == DRM_MODE_DPMS_ON`. With a KMS master (`master`) the console
+    /// does not own the crtc and nothing changes (`Busy`, as
+    /// `drm_master_internal_acquire` refuses). Otherwise the console's crtc
+    /// goes off (the console restored first, so no KMS surface remains) or
+    /// back on.
+    pub(crate) async fn console_dpms(
+        &self,
+        on: bool,
+        master: impl Fn() -> bool,
+    ) -> Result<(), FsError> {
+        let mut guard = self.session().await?;
+        if master() {
+            return Err(FsError::Busy);
+        }
+        if on {
+            guard.panel_on().await
+        } else {
+            if !guard.panel_dark() {
+                guard.restore_console().await?;
+            }
+            guard.panel_off().await
+        }
+    }
+}
+
 impl<M: Platform> Device<M> {
     /// Stop-only external owner keeps all existing presenters/color/DMA in
     /// place. It cannot arm or adopt them; fresh authority is checked by its IO.
@@ -1678,6 +1848,7 @@ impl<M: Platform> Device<M> {
             device: self,
             state,
             _power,
+            _rpm: None,
         };
         guard.idle_dsb()?;
         let state = &guard.state;
@@ -1889,11 +2060,15 @@ impl<M: Platform> Guard<'_, M> {
     /// Recheck before publishing a hardware transaction. The synchronous GT
     /// loss path can poison a busy session without acquiring this mutex.
     pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
-        if self.state.failed
-            || self.state.blocked
-            || self.device.platform.reset_lost()
-            || !self.device.platform.console_access_ok()
-        {
+        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        // A dark panel has no console scanout to prove: its retained owners
+        // re-prove themselves after the panel is on again.
+        if self.state.panel_off {
+            return Ok(());
+        }
+        if !self.device.platform.console_access_ok() {
             return Err(FsError::NoDevice);
         }
         if let Some(timing) = self.state.xr30_timing {
@@ -2690,6 +2865,65 @@ impl<M: Platform> Guard<'_, M> {
         if let Some(fbc) = self.state.fbc.as_mut() {
             let _ = fbc.flush(&self.device.platform, &plane);
         }
+    }
+    /// Whether the panel's crtc is off.
+    pub(crate) fn panel_dark(&self) -> bool {
+        self.state.panel_off
+    }
+    /// The panel's crtc off (display 14): `intel_atomic_commit_tail` for
+    /// the crtc going inactive. The caller has restored the console, so no
+    /// client surface, cursor, colour or DSB stream remains; a frame change
+    /// still unlatched refuses `Busy` before anything is touched. The
+    /// pre-plane update disables PSR (`intel_psr_pre_plane_update` for a
+    /// modeset) and FBC (`intel_fbc_pre_update`, then `intel_fbc_disable`),
+    /// then the platform runs the crtc disable. Idempotent.
+    pub(crate) async fn panel_off(&mut self) -> Result<(), FsError> {
+        if self.state.panel_off {
+            return Ok(());
+        }
+        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        let state = &self.state;
+        if state.pending.is_some()
+            || state.joint.is_some()
+            || state.presenter.is_some()
+            || state.color_unpublished
+            || state.mixed_unpublished
+            || state.dsb.as_ref().is_some_and(|d| d.armed())
+            || state
+                .cursor
+                .as_ref()
+                .is_some_and(|c| c.active() || c.pending())
+            || state.color.as_ref().is_some_and(|c| c.pending())
+            || state
+                .primary_resources
+                .as_ref()
+                .is_some_and(|p| p.pending())
+        {
+            return Err(FsError::Busy);
+        }
+        psr_disable(&mut self.state, &self.device.platform, None);
+        if let Some(fbc) = self.state.fbc.as_mut() {
+            fbc.disable(&self.device.platform);
+        }
+        self.device.platform.panel_off().await?;
+        self.state.panel_off = true;
+        Ok(())
+    }
+    /// The panel's crtc on again (the owned modeset at the panel's mode
+    /// with the console surface). Idempotent while the panel is lit.
+    pub(crate) async fn panel_on(&mut self) -> Result<(), FsError> {
+        if !self.state.panel_off {
+            return Ok(());
+        }
+        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        let console = self.state.console.clone();
+        self.device.platform.panel_on(&console).await?;
+        self.state.panel_off = false;
+        Ok(())
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
         // Console reclaim: PSR (source, then sink) and FBC are fully

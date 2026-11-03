@@ -1017,6 +1017,28 @@ pub fn kms_console_paused() -> bool {
     KMS_CONSOLE_PAUSED.load(Ordering::Acquire)
 }
 
+/// FBIOBLANK on the Intel console: `drm_fb_helper_blank` →
+/// `drm_client_modeset_dpms` (Linux b90c984d), `on` being
+/// `mode == DRM_MODE_DPMS_ON`. Without a KMS master the display-14 panel's
+/// crtc goes off or back on; with a master nothing changes. Linux's
+/// `drm_fb_helper_blank` ignores the commit's result and the fbdev ioctl
+/// is synchronous here, so the transition runs as a task.
+pub fn fbdev_dpms(on: bool) {
+    let Some(bar) = with_controller(|gpu| gpu.gtt_mmadr) else {
+        return;
+    };
+    if gen_of_bar(&bar) != Some(Generation::MeteorLake) {
+        return;
+    }
+    let _ = narf_scheduler::spawn(async move {
+        let _ = crate::intel_gpu_kms::console_dpms_for_bar(&bar, on).await;
+    });
+}
+
+fn gen_of_bar(bar: &narf_bus::MmioRegion) -> Option<Generation> {
+    with_controller(|gpu| (gpu.gtt_mmadr.phys == bar.phys).then_some(gpu.chip.generation)).flatten()
+}
+
 /// Caller holds the KMS display session, outside CONTROLLER. Pause new
 /// kernel framebuffer access, drain the synchronous log writer, then wait
 /// for every earlier cursor/status/draw view (including its WC fence).

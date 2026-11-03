@@ -410,6 +410,8 @@ const DP_TP_CTL_ENHANCED_FRAME: u32 = 1 << 18;
 const DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
 const DP_TP_CTL_LINK_TRAIN_PAT1: u32 = 0 << 8;
 const DP_TP_CTL_LINK_TRAIN_NORMAL: u32 = 3 << 8;
+/// `DP_SET_POWER_D3`.
+const DP_SET_POWER_D3: u8 = 2;
 
 /// `CHICKEN_TRANS` (`_MTL_CHICKEN_TRANS_A` 0x604e0) and the display-14
 /// bits `intel_enable_transcoder` sets and clears.
@@ -442,6 +444,63 @@ static OWNED_PANEL: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
 /// turns Pipe A off. `None` while Pipe A runs an inherited layout.
 pub fn owned_panel_mode() -> Option<Mode> {
     *OWNED_PANEL.lock()
+}
+
+/// What [`XeLpgModeset::panel_off`] left for the next enable of the panel's
+/// crtc: Linux keeps the same facts in the inactive crtc state and in
+/// `intel_dp->DP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PanelOff {
+    /// The panel's port (DDI A).
+    pub port: XeLpgPort,
+    /// The owned panel mode the crtc ran (`None`: an inherited layout).
+    pub mode: Option<Mode>,
+    /// The `DDI_BUF_CTL` bit `intel_ddi_init_dp_buf_reg` carries into the
+    /// next enable besides the width (`DDI_BUF_PORT_REVERSAL`);
+    /// `DDI_A_4_LANES` is display < 11 only.
+    buf_ctl: u32,
+    /// The post-plane all-off settle ran (no other pipe was lit). When
+    /// another pipe stayed lit, Pipe A's share of the layout stays
+    /// programmed and covered by PM demand.
+    pub settled: bool,
+}
+
+/// The panel's crtc is off by [`XeLpgModeset::panel_off`]; cleared by the
+/// modeset that lights it again.
+static PANEL_OFF: narf_lib::sync::IrqSafeSpinLock<Option<PanelOff>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The panel-off record, while the panel's crtc is off.
+pub fn panel_off_record() -> Option<PanelOff> {
+    *PANEL_OFF.lock()
+}
+
+/// Forget the panel-off record (fixtures that share the process-wide
+/// owned-panel statics).
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn forget_panel_off() {
+    *PANEL_OFF.lock() = None;
+}
+
+/// `CURCNTR(PIPE_A)` and `CURBASE(PIPE_A)`; `MCURSOR_MODE_MASK`.
+const CUR_CTL_A: u64 = 0x7_0080;
+const CUR_BASE_A: u64 = 0x7_0084;
+const CUR_MODE_MASK: u32 = 0x27;
+/// `TRANS_DDI_FUNC_CTL2` relative to the transcoder (display 11+).
+const TRANS_DDI_FUNC_CTL2_OFFSET: u64 = 0x404;
+/// `TGL_TRANS_DDI_PORT_MASK | TRANS_DDI_MODE_SELECT_MASK`.
+const TRANS_DDI_PORT_AND_MODE: u32 = (0xF << 27) | (0x7 << 24);
+/// `DDI_BUF_CTL_ENABLE` and `DDI_BUF_PORT_REVERSAL`.
+const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
+const DDI_BUF_PORT_REVERSAL: u32 = 1 << 16;
+/// `PIPECONF`/`TRANSCONF` of Pipes B-D.
+const OTHER_PIPECONFS: [u64; 3] = [0x7_1008, 0x7_2008, 0x7_3008];
+
+/// `DDI_PORT_WIDTH(lanes)` (`DDI_PORT_WIDTH_MASK` bits 3:1; three lanes
+/// encode as 4). `DDI_BUF_PORT_DATA_10BIT` is 0 on display 14 (8b/10b).
+const fn ddi_port_width(lanes: u8) -> u32 {
+    let field = if lanes == 3 { 4 } else { lanes as u32 - 1 };
+    field << 1
 }
 
 /// Xe-LPG modeset orchestrator for one port + pipe A. Stateless,
@@ -580,10 +639,44 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         crate::intel_gpu_xelpg_tc::aux_power_enable(self.mmio, self.port)
             .map_err(|_| ModesetError::PowerWellTimeout)?;
 
+        // A panel this driver turned off ([`Self::panel_off`]) lights with
+        // the whole `mtl_ddi_pre_enable_dp`: its DDI, port PLL and PPS are
+        // off. `intel_dp_aux_xfer` holds eDP VDD around AUX traffic, so the
+        // planning reads below run with VDD forced on.
+        let cold = self.cold_panel()?;
+        let mut pps = cold.map(|_| {
+            crate::intel_gpu_edp::PanelPowerSequencer::with_delays(
+                self.mmio,
+                crate::intel_gpu_edp::panel_delays(),
+            )
+        });
+        if let Some(pps) = pps.as_mut() {
+            pps.vdd_on().map_err(|_| ModesetError::PanelPowerTimeout)?;
+        }
+
         // intel_edp_init_dpcd + intel_dp_compute_link_config: decide the
         // pipe bpp, the link and DSC before the first destructive write, so
         // a refusal leaves the panel as it was.
-        let plan = self.plan_edp(&mode)?;
+        // A refusal before the first destructive write drops the forced VDD.
+        let plan = self.plan_edp(&mode).and_then(|plan| {
+            // Beside another lit pipe no all-off transaction can run: the
+            // layout must still hold Pipe A's share, as the panel-off
+            // left it.
+            if cold.is_some() && self.other_pipe_lit()? {
+                crate::intel_gpu_display_resources::Profile::capture(self.mmio, &mode)
+                    .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
+            }
+            Ok(plan)
+        });
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Some(pps) = pps.as_mut() {
+                    pps.vdd_off();
+                }
+                return Err(error);
+            }
+        };
         let dsc = match plan {
             EdpPlan::Dsc { plan, .. } => Some(plan),
             _ => None,
@@ -593,18 +686,20 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             _ => crate::intel_gpu_xelpg_dsc::PIPE_BPP,
         };
 
-        // This bounded correction preserves an already-enabled DDI. The
-        // existing PHY helper does not implement a complete DDI-off/on pair;
-        // do not destructively stop an off/unqualified inherited port.
-        self.require_enabled_ddi()?;
-        // Step 3: plane → the single pipe/transcoder CONF → PLL request.
-        // This is not a full DDI/PHY/link retirement receipt. Pipe A is
-        // dark from here: the owned profile no longer describes it, and
-        // its pipe DMC is disabled last, as hsw_crtc_disable ends with
-        // intel_dmc_disable_pipe after the port PLL.
-        *OWNED_PANEL.lock() = None;
-        self.disable_pipeline()?;
-        self.pipe_dmc.disable_pipe(0);
+        if cold.is_none() {
+            // This bounded correction preserves an already-enabled DDI. A
+            // firmware-off or unqualified port is never stopped here; only
+            // a panel this driver turned off takes the full enable.
+            self.require_enabled_ddi()?;
+            // Step 3: plane → the single pipe/transcoder CONF → PLL request.
+            // This is not a full DDI/PHY/link retirement receipt. Pipe A is
+            // dark from here: the owned profile no longer describes it, and
+            // its pipe DMC is disabled last, as hsw_crtc_disable ends with
+            // intel_dmc_disable_pipe after the port PLL.
+            *OWNED_PANEL.lock() = None;
+            self.disable_pipeline()?;
+            self.pipe_dmc.disable_pipe(0);
+        }
         // This is a full owned modeset with the pipe off, not a KMS
         // inheritance path. Establish RGB bypass rather than depend on GOP
         // leaving its per-plane gamma/CSC controls in an admissible state.
@@ -639,6 +734,11 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // intel_dmc_enable_pipe. A later failure leaves it enabled until
         // the next disable, as Linux keeps it for the crtc's lifetime.
         self.pipe_dmc.enable_pipe(0);
+        // mtl_ddi_pre_enable_dp step 4: intel_pps_on, before the port PLL.
+        if let Some(pps) = pps.as_mut() {
+            pps.power_on()
+                .map_err(|_| ModesetError::PanelPowerTimeout)?;
+        }
 
         // Step 5: enable the port PLL. The existing 8 bpc sequence takes
         // the rate this pixel clock needs (the same bandwidth rule the
@@ -670,7 +770,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let program_msa = self.program_pipe_misc(pipe_bpp, matches!(plan, EdpPlan::Link { .. }))?;
 
         // Step 8: bind transcoder A to this port (DP-SST at the pipe bpp).
-        self.program_trans_ddi_func_ctl(lanes, pipe_bpp);
+        // A cold port configures it without ENABLE
+        // (intel_ddi_config_transcoder_func); intel_ddi_enable sets it.
+        if cold.is_some() {
+            self.configure_trans_ddi_func(lanes, pipe_bpp);
+        } else {
+            self.program_trans_ddi_func_ctl(lanes, pipe_bpp);
+        }
 
         // Step 9: program the primary plane.
         self.program_plane(primary_fb, &mode);
@@ -691,6 +797,18 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // Step 11: source pattern generator into TPS1 and run
         // DPCD link training over this port's AUX.
         self.program_dp_tp_ctl(DP_TP_CTL_LINK_TRAIN_PAT1);
+        // mtl_ddi_prepare_link_retrain 6.i on a cold port: DDI_CTL_DE with
+        // intel_ddi_init_dp_buf_reg's value, then the buffer active
+        // (PORT_BUF_CTL1 PHY_IDLE clear), before the DPCD training.
+        if let Some(off) = cold {
+            self.mmio.write32(
+                inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?,
+                off.buf_ctl | ddi_port_width(lanes) | DDI_BUF_CTL_ENABLE,
+            );
+            compiler_fence(Ordering::SeqCst);
+            crate::intel_gpu_xelpg::wait_port_buf_active(self.mmio, self.port)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+        }
         let (trained_khz, trained_lanes, trained_levels) = match plan {
             EdpPlan::Dsc { plan, select } => {
                 // The configuration was computed for the plan's link; a
@@ -736,7 +854,11 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         }
         if trained_lanes != lanes {
             program_port_buf_ctl(self.mmio, self.port, trained_lanes);
-            self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
+            if cold.is_some() {
+                self.configure_trans_ddi_func(trained_lanes, pipe_bpp);
+            } else {
+                self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
+            }
         }
         set_signal_levels_khz(&phy, link_khz, trained_lanes, &trained_levels)
             .map_err(map_cx0_err)?;
@@ -775,10 +897,20 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         if frame == u32::MAX || !self.mmio.display_access_ok() {
             return Err(ModesetError::PipelineEnableUnavailable);
         }
+        // intel_ddi_enable: the transcoder function, then the transcoder.
+        if cold.is_some() {
+            self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
+        }
         self.enable_transcoder()?;
         self.observe_plane(primary_fb, &mode, trained_lanes, pipe_bpp, frame)?;
-        if owned.is_some() {
+        if owned.is_some() || cold.is_some_and(|off| off.mode == Some(mode)) {
             *OWNED_PANEL.lock() = Some(mode);
+        }
+        if let Some(pps) = pps.as_mut() {
+            // The panel holds its own power now; VDD was only forced for
+            // the AUX traffic (the delayed edp_panel_vdd_off in Linux).
+            pps.vdd_off();
+            *PANEL_OFF.lock() = None;
         }
 
         Ok(mode)
@@ -1042,6 +1174,276 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             return Err(ModesetError::PipelineStopUnavailable);
         }
         Ok(())
+    }
+
+    /// The panel-off record when this modeset relights a panel this driver
+    /// turned off: the record names this port and Pipe A, transcoder A and
+    /// the DDI read off. A record whose hardware is not off refuses before
+    /// any write; without a record the existing enabled-DDI path runs.
+    fn cold_panel(&self) -> Result<Option<PanelOff>, ModesetError> {
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+        };
+        let Some(off) = *PANEL_OFF.lock() else {
+            return Ok(None);
+        };
+        if off.port != self.port {
+            return Ok(None);
+        }
+        let ddi = self
+            .mmio
+            .read32(inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?);
+        let conf = self.mmio.read32(PipeIdx::A.base() + PIPECONF_OFFSET);
+        if ddi == u32::MAX || conf == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineEnableUnavailable);
+        }
+        if ddi & DDI_BUF_CTL_ENABLE != 0 || conf & (PIPECONF_ENABLE | PIPECONF_STATE) != 0 {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(Some(off))
+    }
+
+    /// Whether any of Pipes B-D is enabled.
+    fn other_pipe_lit(&self) -> Result<bool, ModesetError> {
+        use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_STATE};
+        let mut lit = false;
+        for reg in OTHER_PIPECONFS {
+            let conf = self.mmio.read32(reg);
+            if conf == u32::MAX || !self.mmio.display_access_ok() {
+                return Err(ModesetError::PipelineEnableUnavailable);
+            }
+            lit |= conf & (PIPECONF_ENABLE | PIPECONF_STATE) != 0;
+        }
+        Ok(lit)
+    }
+
+    /// `intel_ddi_config_transcoder_func`: `TRANS_DDI_FUNC_CTL` with its
+    /// port and mode but without `TRANS_DDI_FUNC_ENABLE`.
+    fn configure_trans_ddi_func(&mut self, lanes: u8, pipe_bpp: u32) {
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET,
+        };
+        let val = dp_sst_func_ctl(self.port, lanes, pipe_bpp) & !TRANS_DDI_FUNC_CTL_ENABLE;
+        self.mmio
+            .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// `intel_crtc_disable_planes` for Pipe A, the first step of the panel's
+    /// crtc disable after the pre-plane update (PSR and FBC off): the
+    /// primary and an enabled cursor go off, each armed by its surface
+    /// register (`PLANE_SURF`, `CURBASE`).
+    pub fn disable_planes(&mut self) -> Result<(), ModesetError> {
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET,
+            PLANE_SURF_OFFSET,
+        };
+        let _power =
+            crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
+                .map_err(|_| ModesetError::PowerWellTimeout)?;
+        let plane = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
+        let ctl = self.mmio.read32(plane + PLANE_CTL_OFFSET);
+        let surf = self.mmio.read32(plane + PLANE_SURF_OFFSET);
+        let cursor = self.mmio.read32(CUR_CTL_A);
+        let base = self.mmio.read32(CUR_BASE_A);
+        if [ctl, surf, cursor, base].contains(&u32::MAX) || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        self.mmio
+            .write32(plane + PLANE_CTL_OFFSET, ctl & !PLANE_CTL_ENABLE);
+        self.mmio.write32(plane + PLANE_SURF_OFFSET, surf);
+        if cursor & CUR_MODE_MASK != 0 {
+            self.mmio.write32(CUR_CTL_A, cursor & !CUR_MODE_MASK);
+            self.mmio.write32(CUR_BASE_A, base);
+        }
+        compiler_fence(Ordering::SeqCst);
+        if !self.mmio.display_access_ok()
+            || self.mmio.read32(plane + PLANE_CTL_OFFSET) & PLANE_CTL_ENABLE != 0
+            || self.mmio.read32(CUR_CTL_A) & CUR_MODE_MASK != 0
+        {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(())
+    }
+
+    /// The rest of the panel's crtc disable after [`Self::disable_planes`]
+    /// and the caller's `intel_edp_backlight_off` (Linux b90c984d
+    /// `intel_display.c::hsw_crtc_disable` and `intel_atomic_commit_tail`
+    /// with the crtc inactive; `intel_ddi.c::intel_ddi_disable_dp`,
+    /// `intel_ddi_post_disable_hdmi_or_sst`, `intel_ddi_post_disable_dp`,
+    /// `intel_ddi_buf_disable`; `intel_pps.c::intel_pps_off_unlocked`):
+    ///
+    /// 1. the PPS backlight gate, if the caller's backlight owner left it
+    ///    open, with its T9 wait; the sink's decompression off;
+    /// 2. `intel_disable_transcoder`, `intel_ddi_disable_transcoder_func`
+    ///    (`TRANS_DDI_FUNC_CTL2` 0; enable, port and mode cleared),
+    ///    `intel_dsc_disable`;
+    /// 3. the PPS SDP off, the sink to D3 (`DP_SET_POWER`, DPCD 1.1+,
+    ///    best effort), `intel_ddi_buf_disable` (DDI_CTL_DE off, PHY idle,
+    ///    D2D off, `DP_TP_CTL` off), `TRANS_CLK_SEL` off;
+    /// 4. `intel_pps_vdd_on` + `intel_pps_off`, `intel_cx0pll_disable`, the
+    ///    Thunderbolt IO deselect;
+    /// 5. `intel_dmc_disable_pipe` (the pipe's display wakeref follows);
+    /// 6. the post-plane update: with no other pipe lit, the all-off settle
+    ///    (`settle_all_off`: WM/DDB, DBUF, CDCLK, PM demand). Beside a lit
+    ///    pipe nothing shared is written: Pipe A's share stays programmed.
+    ///
+    /// Refused before any write unless Pipe A, transcoder A and this DDI are
+    /// lit as the panel and the primary is off. The record is kept for the
+    /// panel-on modeset ([`panel_off_record`]).
+    pub fn panel_off(&mut self) -> Result<PanelOff, ModesetError> {
+        let ddi_reg = inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
+        if !self.port.is_edp() {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
+        let _power =
+            crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
+                .map_err(|_| ModesetError::PowerWellTimeout)?;
+        let checked = CheckedWindow {
+            raw: self.mmio,
+            failed: Cell::new(false),
+        };
+        let result = XeLpgModeset::new(&checked, self.port)
+            .with_pipe_dmc(self.pipe_dmc)
+            .panel_off_checked(ddi_reg);
+        if !checked.display_access_ok() {
+            return Err(result
+                .err()
+                .unwrap_or(ModesetError::PipelineStopUnavailable));
+        }
+        result
+    }
+
+    fn panel_off_checked(&mut self, ddi_reg: u64) -> Result<PanelOff, ModesetError> {
+        use crate::dp_aux::AuxChannel as _;
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+            PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, TRANS_DDI_FUNC_CTL_DDI_SHIFT,
+            TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET,
+        };
+        let stop = ModesetError::PipelineStopUnavailable;
+        let conf_reg = PipeIdx::A.base() + PIPECONF_OFFSET;
+        let func_reg = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let conf = self.mmio.read32(conf_reg);
+        let func = self.mmio.read32(func_reg);
+        let ddi = self.mmio.read32(ddi_reg);
+        let primary = self
+            .mmio
+            .read32(PipeIdx::A.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET);
+        if [conf, func, ddi, primary].contains(&u32::MAX)
+            || !self.mmio.display_access_ok()
+            || conf & (PIPECONF_ENABLE | PIPECONF_STATE) != PIPECONF_ENABLE | PIPECONF_STATE
+            || func & TRANS_DDI_FUNC_CTL_ENABLE == 0
+            || (func >> TRANS_DDI_FUNC_CTL_DDI_SHIFT) & 0xf
+                != u32::from(self.port.func_ctl_index()) + 1
+            || ddi & DDI_BUF_CTL_ENABLE == 0
+            || primary & PLANE_CTL_ENABLE != 0
+        {
+            return Err(stop);
+        }
+        let mode = *OWNED_PANEL.lock();
+        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::with_delays(
+            self.mmio,
+            crate::intel_gpu_edp::panel_delays(),
+        );
+        // intel_ddi_disable_dp: intel_edp_backlight_off's PPS half when no
+        // backlight owner closed the gate (T9 follows), then
+        // intel_dp_sink_disable_decompression (best effort, as in Linux).
+        if pps.backlight_gate_open() {
+            pps.backlight_off();
+        }
+        let compressed =
+            crate::intel_gpu_xelpg_dsc::engines_enabled(self.mmio, PipeIdx::A).map_err(|_| stop)?;
+        if compressed {
+            let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
+            let _ = crate::intel_gpu_xelpg_dsc::set_sink_decompression(&mut aux, false);
+        }
+        // intel_ddi_post_disable_hdmi_or_sst: the transcoder, its function,
+        // then intel_dsc_disable.
+        self.mmio.write32(conf_reg, conf & !PIPECONF_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        if !wait_bit(
+            self.mmio,
+            conf_reg,
+            PIPECONF_ENABLE | PIPECONF_STATE,
+            false,
+            100_000_000,
+        ) {
+            return Err(stop);
+        }
+        self.mmio
+            .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL2_OFFSET, 0);
+        self.mmio.write32(
+            func_reg,
+            func & !(TRANS_DDI_FUNC_CTL_ENABLE | TRANS_DDI_PORT_AND_MODE),
+        );
+        compiler_fence(Ordering::SeqCst);
+        crate::intel_gpu_xelpg_dsc::disable_engines(self.mmio, PipeIdx::A).map_err(|_| stop)?;
+        // intel_ddi_post_disable_dp: intel_dp_set_infoframes(false) clears
+        // the PPS SDP; intel_dp_set_power(D3) for a DPCD 1.1+ sink.
+        crate::intel_gpu_xelpg_dsc::disable_pps_sdp(self.mmio, Transcoder::A).map_err(|_| stop)?;
+        {
+            let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
+            let mut rev = [0u8];
+            if aux.dpcd_read(0x000, &mut rev).is_ok() && rev[0] >= 0x11 {
+                let _ =
+                    aux.dpcd_write(crate::intel_gpu_xelpg_dsc::DP_SET_POWER, &[DP_SET_POWER_D3]);
+            }
+        }
+        // intel_ddi_buf_disable (display 14): DDI_CTL_DE off, the buffer
+        // idle, D2D off, DP_TP_CTL off.
+        self.mmio.write32(ddi_reg, ddi & !DDI_BUF_CTL_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        crate::intel_gpu_xelpg::wait_port_buf_idle(self.mmio, self.port).map_err(|_| stop)?;
+        crate::intel_gpu_xelpg::disable_d2d(self.mmio, self.port).map_err(|_| stop)?;
+        let tp_reg = Transcoder::A.base() + DP_TP_CTL_OFFSET;
+        let tp = self.mmio.read32(tp_reg);
+        self.mmio.write32(tp_reg, tp & !DP_TP_CTL_ENABLE);
+        // intel_ddi_disable_transcoder_clock: TGL_TRANS_CLK_SEL_DISABLED.
+        self.mmio.write32(TRANS_CLK_SEL_A, 0);
+        compiler_fence(Ordering::SeqCst);
+        // intel_pps_vdd_on + intel_pps_off.
+        pps.vdd_on_then_off()
+            .map_err(|_| ModesetError::PanelPowerTimeout)?;
+        // intel_ddi_disable_clock (intel_cx0pll_disable), then the
+        // Thunderbolt IO deselect.
+        crate::intel_gpu_xelpg::disable_port_pll_complete(self.mmio, self.port)
+            .map_err(map_cx0_err)?;
+        let buf = self.mmio.read32(self.port.buf_ctl1());
+        self.mmio.write32(
+            self.port.buf_ctl1(),
+            buf & !crate::intel_gpu_xelpg::PORT_BUF_IO_SELECT_TBT,
+        );
+        compiler_fence(Ordering::SeqCst);
+        if self.mmio.read32(ddi_reg) & DDI_BUF_CTL_ENABLE != 0
+            || self.mmio.read32(self.port.buf_ctl1()) & crate::intel_gpu_xelpg::PORT_BUF_PHY_IDLE
+                == 0
+            || self.mmio.read32(self.port.port_clock_ctl()) & 0xcc00_0000 != 0
+            || !self.mmio.display_access_ok()
+        {
+            return Err(stop);
+        }
+        // hsw_crtc_disable's last step; the crtc's power domains (its
+        // display wakeref) are released after it.
+        *OWNED_PANEL.lock() = None;
+        self.pipe_dmc.disable_pipe(0);
+        // The post-plane update: the all-off settle when every pipe is off.
+        // Best effort; a refusal leaves the clocks and demand raised.
+        let others_lit = OTHER_PIPECONFS
+            .iter()
+            .any(|reg| self.mmio.read32(*reg) & (PIPECONF_ENABLE | PIPECONF_STATE) != 0);
+        let settled = !others_lit
+            && crate::intel_gpu_xelpg_wm::Latency::read(self.mmio).is_ok_and(|latency| {
+                crate::intel_gpu_xelpg_resources::settle_all_off(self.mmio, &latency).is_ok()
+            });
+        let record = PanelOff {
+            port: self.port,
+            mode,
+            buf_ctl: ddi & DDI_BUF_PORT_REVERSAL,
+            settled,
+        };
+        *PANEL_OFF.lock() = Some(record);
+        Ok(record)
     }
 
     /// Observe the existing local stop before any color/resource/clock/PHY
@@ -1607,6 +2009,9 @@ pub mod tests {
         /// Every native DPCD write byte with the register-write count at
         /// its arrival: (address, value, writes so far).
         pub dpcd_writes: RefCell<Vec<(usize, u8, usize)>>,
+        /// When set, `PP_STATUS` follows `PP_CONTROL`: on-idle while the
+        /// power target or VDD force is set, off-idle otherwise.
+        pub pps: Cell<bool>,
     }
 
     const PIPECONF_OFF: u64 = 0x7_0008;
@@ -1643,7 +2048,28 @@ pub mod tests {
                 cr_fails_at: Cell::new(0),
                 refuse_color: Cell::new(u64::MAX),
                 dpcd_writes: RefCell::new(Vec::new()),
+                pps: Cell::new(false),
             }
+        }
+
+        /// Model what a full panel off/on observes: `PP_STATUS` following
+        /// `PP_CONTROL`, `PHY_IDLE` following DDI_CTL_DE and the D2D link
+        /// state following its enable.
+        pub fn model_panel_power(&self) {
+            self.pps.set(true);
+            self.phy.model_ddi_idle.set(true);
+            self.phy.model_d2d.set(true);
+        }
+
+        /// The index of the first write at or after `from` matching `f`.
+        pub fn write_index(&self, from: usize, f: impl Fn(u64, u32) -> bool) -> Option<usize> {
+            self.writes
+                .borrow()
+                .iter()
+                .enumerate()
+                .skip(from)
+                .find(|(_, (o, v))| f(*o, *v))
+                .map(|(i, _)| i)
         }
 
         pub fn writes_to(&self, off: u64) -> Vec<u32> {
@@ -1722,6 +2148,10 @@ pub mod tests {
 
     impl MmioWindow for MtlFake {
         fn read32(&self, off: u64) -> u32 {
+            if self.pps.get() && off == crate::intel_gpu_edp::PP_STATUS {
+                let control = self.phy.read32(crate::intel_gpu_edp::PP_CONTROL);
+                return if control & 1 != 0 { 0x8000_0008 } else { 0 };
+            }
             if off == PWR_WELL_CTL2 || off == PWR_WELL_CTL_AUX2 {
                 if self.wells_dead.get() {
                     return 0;
@@ -2815,6 +3245,272 @@ pub mod tests {
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_color_setup_rejects_live_or_unavailable_pipe_without_writes
     );
+    /// A pipe-DMC sink that logs each report with the register-write count
+    /// at the time: (enable?, pipe, writes so far).
+    struct DmcLog<'a> {
+        fake: &'a MtlFake,
+        log: RefCell<Vec<(bool, u32, usize)>>,
+    }
+    impl crate::intel_gpu_dc_states::PipeDmc for DmcLog<'_> {
+        fn enable_pipe(&self, pipe: u32) {
+            let at = self.fake.writes.borrow().len();
+            self.log.borrow_mut().push((true, pipe, at));
+        }
+        fn disable_pipe(&self, pipe: u32) {
+            let at = self.fake.writes.borrow().len();
+            self.log.borrow_mut().push((false, pipe, at));
+        }
+    }
+
+    /// An MTL panel lit by the owned modeset on DDI A, powered and backlit
+    /// through its PPS, with the PHY's idle and D2D state modelled.
+    fn lit_panel(fake: &MtlFake, dmc: &DmcLog<'_>) -> Result<Mode, &'static str> {
+        forget_panel_off();
+        fake.pps.set(true);
+        fake.phy.model_ddi_idle.set(true);
+        fake.phy.model_d2d.set(true);
+        let mode = Mode::VESA_1024X768_60;
+        if XeLpgModeset::new(fake, XeLpgPort::A)
+            .with_pipe_dmc(dmc)
+            .modeset_fixed(&test_fb(), &mode)
+            != Ok(mode)
+        {
+            return Err("the warm modeset must light the panel");
+        }
+        // A powered panel with its backlight gate open.
+        fake.phy.write32(crate::intel_gpu_edp::PP_CONTROL, 1 | 4);
+        fake.writes.borrow_mut().clear();
+        fake.dpcd_writes.borrow_mut().clear();
+        dmc.log.borrow_mut().clear();
+        Ok(mode)
+    }
+
+    const PP_CONTROL: u64 = crate::intel_gpu_edp::PP_CONTROL;
+
+    fn smoke_mtl_panel_off_follows_hsw_crtc_disable_order() -> TestResult {
+        let fake = MtlFake::new(XeLpgPort::A);
+        let dmc = DmcLog {
+            fake: &fake,
+            log: RefCell::new(Vec::new()),
+        };
+        if let Err(e) = lit_panel(&fake, &dmc) {
+            return TestResult::Fail(e);
+        }
+        let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_pipe_dmc(&dmc);
+        if ms.disable_planes().is_err() {
+            return TestResult::Fail("the planes must go off");
+        }
+        let record = match ms.panel_off() {
+            Ok(record) => record,
+            Err(_) => return TestResult::Fail("the lit panel must turn off"),
+        };
+        let at = |f: &dyn Fn(u64, u32) -> bool| fake.write_index(0, f);
+        // intel_crtc_disable_planes, then intel_edp_backlight_off's PPS gate
+        // (power still on), intel_disable_transcoder, the function cleared,
+        // intel_ddi_buf_disable, TRANS_CLK_SEL off, intel_pps_off, the PLL.
+        let steps = [
+            at(&|o, v| o == 0x70180 && v & (1 << 31) == 0),
+            at(&|o, v| o == PP_CONTROL && v & 4 == 0 && v & 1 != 0),
+            at(&|o, v| o == 0x70008 && v & (1 << 31) == 0),
+            at(&|o, v| o == 0x60404 && v == 0),
+            at(&|o, v| o == 0x60400 && v & (1 << 31) == 0 && v & TRANS_DDI_PORT_AND_MODE == 0),
+            at(&|o, v| o == 0x64000 && v & DDI_BUF_CTL_ENABLE == 0),
+            at(&|o, v| o == 0x60540 && v & DP_TP_CTL_ENABLE == 0),
+            at(&|o, v| o == TRANS_CLK_SEL_A && v == 0),
+            at(&|o, v| o == PP_CONTROL && v & 0xf == 0),
+            at(&|o, _| o == XeLpgPort::A.port_clock_ctl()),
+        ];
+        let mut last = 0;
+        for step in steps {
+            match step {
+                Some(i) if i >= last => last = i,
+                _ => return TestResult::Fail("the crtc disable left hsw_crtc_disable's order"),
+            }
+        }
+        // VDD was forced on for the power-off write (intel_pps_vdd_on).
+        let vdd = at(&|o, v| o == PP_CONTROL && v & 8 != 0);
+        if !vdd.is_some_and(|i| i < steps[8].unwrap()) {
+            return TestResult::Fail("intel_pps_off must follow intel_pps_vdd_on");
+        }
+        // The sink goes to D3 after the transcoder and before the DDI.
+        let d3 = fake
+            .dpcd_writes
+            .borrow()
+            .iter()
+            .find(|(a, v, _)| *a == 0x600 && *v == 2)
+            .map(|(_, _, at)| *at);
+        if !d3.is_some_and(|i| i > steps[2].unwrap() && i <= steps[5].unwrap()) {
+            return TestResult::Fail("DP_SET_POWER D3 must precede the DDI buffer disable");
+        }
+        // intel_dmc_disable_pipe is the last step, after the PLL.
+        let log = dmc.log.borrow().clone();
+        if log.len() != 1 || log[0].0 || log[0].1 != 0 || log[0].2 < steps[9].unwrap() {
+            return TestResult::Fail("the pipe DMC must be disabled once, after the port PLL");
+        }
+        if record.port != XeLpgPort::A
+            || panel_off_record() != Some(record)
+            || owned_panel_mode().is_some()
+        {
+            return TestResult::Fail("the panel-off must record the dark panel");
+        }
+        // A second off finds no lit panel and writes nothing.
+        let before = fake.writes.borrow().len();
+        if XeLpgModeset::new(&fake, XeLpgPort::A).panel_off()
+            != Err(ModesetError::PipelineStopUnavailable)
+            || fake.writes.borrow().len() != before
+        {
+            return TestResult::Fail("a dark panel must refuse a second off before any write");
+        }
+        forget_panel_off();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_panel_off_follows_hsw_crtc_disable_order
+    );
+
+    fn smoke_mtl_panel_on_after_off_runs_full_enable_and_restores_image() -> TestResult {
+        let fake = MtlFake::new(XeLpgPort::A);
+        let dmc = DmcLog {
+            fake: &fake,
+            log: RefCell::new(Vec::new()),
+        };
+        let mode = match lit_panel(&fake, &dmc) {
+            Ok(mode) => mode,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_pipe_dmc(&dmc);
+        if ms.disable_planes().is_err() || ms.panel_off().is_err() {
+            return TestResult::Fail("the lit panel must turn off");
+        }
+        fake.writes.borrow_mut().clear();
+        fake.dpcd_writes.borrow_mut().clear();
+        dmc.log.borrow_mut().clear();
+        // The warm path would refuse the off DDI; the cold path lights it.
+        if XeLpgModeset::new(&fake, XeLpgPort::A)
+            .with_pipe_dmc(&dmc)
+            .modeset_fixed(&test_fb(), &mode)
+            != Ok(mode)
+        {
+            return TestResult::Fail("the panel-on modeset must light the panel");
+        }
+        let at = |from: usize, f: &dyn Fn(u64, u32) -> bool| fake.write_index(from, f);
+        let vdd = at(0, &|o, v| o == PP_CONTROL && v & 8 != 0);
+        let power = at(0, &|o, v| o == PP_CONTROL && v & 1 != 0);
+        let pll = at(0, &|o, _| o == XeLpgPort::A.port_clock_ctl());
+        let tps1 = at(0, &|o, v| o == 0x60540 && v & DP_TP_CTL_ENABLE != 0);
+        let ddi = at(0, &|o, v| {
+            o == 0x64000 && v == (DDI_BUF_CTL_ENABLE | (3 << 1))
+        });
+        let func_off = at(0, &|o, v| o == 0x60400 && v & (1 << 31) == 0 && v != 0);
+        let conf = at(0, &|o, v| o == 0x70008 && v & (1 << 31) != 0);
+        let (Some(vdd), Some(power), Some(pll), Some(tps1), Some(ddi), Some(func_off), Some(conf)) =
+            (vdd, power, pll, tps1, ddi, func_off, conf)
+        else {
+            return TestResult::Fail("the panel-on must run mtl_ddi_pre_enable_dp's writes");
+        };
+        // intel_pps_on precedes the port PLL, after the pipe DMC enable.
+        let log = dmc.log.borrow().clone();
+        if !(vdd <= power && power < pll)
+            || log.len() != 1
+            || !log[0].0
+            || log[0].1 != 0
+            || log[0].2 > power
+        {
+            return TestResult::Fail(
+                "intel_pps_on must follow intel_dmc_enable_pipe, before the PLL",
+            );
+        }
+        // DDI_CTL_DE comes after DP_TP_CTL TPS1 and before the DPCD training.
+        let training = fake
+            .dpcd_writes
+            .borrow()
+            .iter()
+            .find(|(a, _, _)| *a == 0x100)
+            .map(|(_, _, at)| *at);
+        if !(tps1 < ddi && training.is_some_and(|t| t > ddi)) {
+            return TestResult::Fail("DDI_CTL_DE must be enabled between TPS1 and the training");
+        }
+        // The function is configured without ENABLE, enabled before the
+        // transcoder (intel_ddi_enable).
+        let func_on = at(func_off, &|o, v| o == 0x60400 && v & (1 << 31) != 0);
+        if !func_on.is_some_and(|i| i < conf) {
+            return TestResult::Fail("TRANS_DDI_FUNC_CTL must be enabled just before TRANSCONF");
+        }
+        // The console image is back on the plane, VDD no longer forced, and
+        // the record is gone.
+        if fake.writes_to(0x7019c).last() != Some(&(test_fb().phys_addr as u32))
+            || fake.writes_to(PP_CONTROL).last().is_none_or(|v| v & 8 != 0)
+            || panel_off_record().is_some()
+        {
+            return TestResult::Fail("the panel-on must restore the image and forget the record");
+        }
+        forget_panel_off();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_panel_on_after_off_runs_full_enable_and_restores_image
+    );
+
+    fn smoke_mtl_panel_off_beside_lit_pipe_b_writes_only_the_panel() -> TestResult {
+        let fake = MtlFake::new(XeLpgPort::A);
+        let dmc = DmcLog {
+            fake: &fake,
+            log: RefCell::new(Vec::new()),
+        };
+        let mode = match lit_panel(&fake, &dmc) {
+            Ok(mode) => mode,
+            Err(e) => return TestResult::Fail(e),
+        };
+        // An external lit on Pipe B / transcoder B.
+        fake.phy.write32(0x71008, (1 << 31) | (1 << 30));
+        let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_pipe_dmc(&dmc);
+        let record = match ms.disable_planes().and_then(|()| ms.panel_off()) {
+            Ok(record) => record,
+            Err(_) => return TestResult::Fail("the panel must turn off beside a lit external"),
+        };
+        let foreign = |o: u64| {
+            (0x71000..0x74000).contains(&o)
+                || (0x61000..0x64000).contains(&o)
+                || o == 0x64100
+                || (0x45230..=0x45238).contains(&o)
+                || o == 0x46000
+                || o == 0x46070
+        };
+        if record.settled || fake.writes.borrow().iter().any(|(o, _)| foreign(*o)) {
+            return TestResult::Fail("panel off beside a lit pipe must write only the panel");
+        }
+        // Lighting it again needs Pipe A's share of the live layout; with
+        // none proved it refuses before the PLL, the DDI or the transcoder.
+        fake.writes.borrow_mut().clear();
+        let result = XeLpgModeset::new(&fake, XeLpgPort::A)
+            .with_pipe_dmc(&dmc)
+            .modeset_fixed(&test_fb(), &mode);
+        let touched = fake.writes.borrow().iter().any(|(o, _)| {
+            foreign(*o) || *o == 0x64000 || *o == 0x70008 || *o == XeLpgPort::A.port_clock_ctl()
+        });
+        if result != Err(ModesetError::DisplayResourceUnavailable)
+            || touched
+            || fake.read32(0x71008) & (1 << 31) == 0
+            || panel_off_record().is_none()
+            || fake
+                .writes_to(PP_CONTROL)
+                .last()
+                .is_some_and(|v| v & 8 != 0)
+        {
+            return TestResult::Fail(
+                "an unproved panel-on beside the external must refuse cleanly",
+            );
+        }
+        forget_panel_off();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_panel_off_beside_lit_pipe_b_writes_only_the_panel
+    );
+
     fn smoke_mtl_color_readback_failure_aborts_owned_modeset_before_reenable() -> TestResult {
         for (register, _) in CONTROLS {
             let fake = MtlFake::new(XeLpgPort::A);

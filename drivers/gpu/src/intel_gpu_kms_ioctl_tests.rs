@@ -78,6 +78,11 @@ struct Device {
     copies: Arc<AtomicUsize>,
     unsupported: Arc<AtomicBool>,
     invalid: Arc<AtomicBool>,
+    /// The backend can turn its panel's crtc off (display 14).
+    panel_power: Arc<AtomicBool>,
+    dark: Arc<AtomicBool>,
+    /// restore / vblank / off / on, in call order.
+    log: Arc<IrqSafeSpinLock<Vec<&'static str>>>,
 }
 impl Device {
     fn new() -> Self {
@@ -89,6 +94,9 @@ impl Device {
             copies: Arc::new(AtomicUsize::new(0)),
             unsupported: Arc::new(AtomicBool::new(false)),
             invalid: Arc::new(AtomicBool::new(false)),
+            panel_power: Arc::new(AtomicBool::new(false)),
+            dark: Arc::new(AtomicBool::new(false)),
+            log: Arc::new(IrqSafeSpinLock::new(Vec::new())),
         }
     }
 }
@@ -134,10 +142,29 @@ impl Backend for Device {
     }
     fn restore(&mut self) -> FsFuture<'_, ()> {
         self.calls.fetch_add(1, Ordering::AcqRel);
+        self.log.lock().push("restore");
         alloc::boxed::Box::pin(async { Ok(()) })
+    }
+    fn panel_off(&mut self) -> FsFuture<'_, ()> {
+        if !self.panel_power.load(Ordering::Acquire) {
+            return alloc::boxed::Box::pin(async { Err(FsError::Unsupported) });
+        }
+        self.log.lock().push("off");
+        self.dark.store(true, Ordering::Release);
+        alloc::boxed::Box::pin(async { Ok(()) })
+    }
+    fn panel_on(&mut self) -> FsFuture<'_, ()> {
+        if self.dark.swap(false, Ordering::AcqRel) {
+            self.log.lock().push("on");
+        }
+        alloc::boxed::Box::pin(async { Ok(()) })
+    }
+    fn panel_dark(&self) -> bool {
+        self.dark.load(Ordering::Acquire)
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         self.calls.fetch_add(1, Ordering::AcqRel);
+        self.log.lock().push("vblank");
         alloc::boxed::Box::pin(core::future::poll_fn(|_| {
             if self.fail.load(Ordering::Acquire) {
                 Poll::Ready(Err(FsError::TimedOut))
@@ -948,3 +975,157 @@ mod legacy_gamma;
 
 #[path = "intel_gpu_kms_damage_tests.rs"]
 mod damage;
+
+/// Atomic `ACTIVE=0` from the master turns the panel's crtc off where the
+/// backend can (display 14), after the console restore and the event's
+/// vblank stamp: `intel_atomic_commit_tail` disables the crtc and completes
+/// the event. A repeated `ACTIVE=0` on the dark crtc waits for no vblank and
+/// turns nothing off again; the master's release relights it, as
+/// `drm_fb_helper_restore_fbdev_mode_unlocked` commits the console active.
+/// [`mode`] with the panel's connector publishing its fixed mode, so a crtc
+/// left without a mode still stages requests (the fixed timing comes from
+/// the connector).
+fn panel_mode() -> ModeState {
+    let mode = mode();
+    mode.lock().connectors.push(crate::drm::card::Connector {
+        id: 3,
+        connector_type: crate::drm::card::ConnectorType::Edp,
+        connector_type_id: 1,
+        status: crate::drm::card::ConnectorStatus::Connected,
+        encoder_id: None,
+        modes: vec![crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        }],
+    });
+    mode
+}
+
+fn intel_kms_active_off_turns_the_panel_off_and_master_release_relights() -> TestResult {
+    let mode = panel_mode();
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    let out = OutFences::new(Vec::new());
+    let mut device = Device::new();
+    device.panel_power.store(true, Ordering::Release);
+    device.ready.store(true, Ordering::Release);
+    let log = device.log.clone();
+    let run = |device: &mut Device, request| {
+        let mut call = core::pin::pin!(execute(
+            device,
+            &mode,
+            7,
+            request,
+            &cpu,
+            Some(&events),
+            Some(&out)
+        ));
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    };
+    assert_eq!(
+        run(&mut device, disable(EVENT | ALLOW_MODESET)),
+        Poll::Ready(Ok(0))
+    );
+    assert_eq!(*log.lock(), ["restore", "vblank", "off"]);
+    assert!(!mode.lock().crtcs[0].enabled);
+    let mut bytes = [0; 32];
+    assert_eq!(
+        events.lock().read_deliverable_event(1234567000, &mut bytes),
+        Some(32)
+    );
+    assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 77);
+    // The crtc is already inactive: no vblank on a dark pipe, no second off.
+    log.lock().clear();
+    assert_eq!(run(&mut device, disable(ALLOW_MODESET)), Poll::Ready(Ok(0)));
+    assert_eq!(*log.lock(), ["restore"]);
+    assert!(device.panel_dark());
+    // A legacy cursor on the inactive crtc is state only: no backend call.
+    log.lock().clear();
+    let mut cursor = vec![0u8; 28];
+    cursor[0..4].copy_from_slice(&2u32.to_le_bytes());
+    cursor[4..8].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        run(&mut device, Request::Cursor(cursor, None, false)),
+        Poll::Ready(Ok(0))
+    );
+    assert!(log.lock().is_empty());
+    // Dropping master restores the console with its crtc active again.
+    log.lock().clear();
+    assert_eq!(run(&mut device, Request::DropMaster), Poll::Ready(Ok(0)));
+    assert_eq!(*log.lock(), ["restore", "on"]);
+    assert!(!device.panel_dark());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    intel_kms_active_off_turns_the_panel_off_and_master_release_relights
+);
+
+/// A backend that cannot turn its panel off keeps the existing console
+/// restore for `ACTIVE=0`, and a frame presented while the panel is dark
+/// lights it before the surface is touched.
+fn intel_kms_present_on_a_dark_panel_lights_it_first() -> TestResult {
+    let mode = panel_mode();
+    let target = framebuffer(&mode, 7, false).expect("WB framebuffer");
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    let out = OutFences::new(Vec::new());
+    let mut device = Device::new();
+    device.ready.store(true, Ordering::Release);
+    let log = device.log.clone();
+    {
+        let mut call = core::pin::pin!(execute(
+            &mut device,
+            &mode,
+            7,
+            disable(ALLOW_MODESET),
+            &cpu,
+            Some(&events),
+            Some(&out)
+        ));
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(0))
+        );
+    }
+    assert_eq!(*log.lock(), ["restore", "vblank"]);
+    assert!(!device.panel_dark());
+    // The console blanked the panel (FBIOBLANK) while the crtc stays
+    // enabled for KMS; the master's next frame relights it first.
+    {
+        let mut card = mode.lock();
+        card.crtcs[0].enabled = true;
+        card.crtcs[0].mode = Some(crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+    }
+    device.dark.store(true, Ordering::Release);
+    log.lock().clear();
+    {
+        let mut call = core::pin::pin!(execute(
+            &mut device,
+            &mode,
+            7,
+            atomic_frame(target, 0),
+            &cpu,
+            Some(&events),
+            Some(&out)
+        ));
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(0))
+        );
+    }
+    assert_eq!(log.lock().first(), Some(&"on"));
+    assert!(!device.panel_dark());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    intel_kms_present_on_a_dark_panel_lights_it_first
+);

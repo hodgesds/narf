@@ -341,6 +341,25 @@ impl Pipes {
         });
     }
 
+    /// Pipe A belongs to the panel's KMS owner, which turns it off and on
+    /// without this owner (`intel_gpu_modeset_xelpg::XeLpgModeset::panel_off`
+    /// and its panel-on modeset): its lit bit follows the hardware whenever
+    /// the programmed state carries the panel's request. A dark Pipe A keeps
+    /// its share of the layout (its planes are off), as a reserved pipe that
+    /// is not yet enabled does.
+    fn sync_panel(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), PipeEnableError> {
+        if !self.state.is_some_and(|s| s.requests[0].is_some()) {
+            return Ok(());
+        }
+        let conf = read(io, Pipe::A.base() + PIPECONF_OFFSET)?;
+        if conf & (PIPECONF_ENABLE | PIPECONF_STATE) == PIPECONF_ENABLE | PIPECONF_STATE {
+            self.lit |= 1;
+        } else {
+            self.lit &= !1;
+        }
+        Ok(())
+    }
+
     /// Before computing a transition from the programmed state: a lit Pipe
     /// A keeps the primary watermarks of whatever tiling the KMS owner
     /// flipped it to, so the programmed state is retiled to that tiling
@@ -432,14 +451,15 @@ impl Pipes {
             return Err(PipeEnableError::NotReserved);
         }
         let mut fresh = self.clone();
+        fresh.sync_panel(io)?;
         fresh.refresh_panel(io)?;
         if read(io, ext.pipe.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE) != 0 {
             return Err(PipeEnableError::Busy);
         }
         // The transaction's hardware precondition: the lit pipes are lit
         // and every other pipe, plane, cursor, DSB and FBC is idle.
-        if self.lit != 0 {
-            crate::intel_gpu_xelpg_live::check_pipes(io, self.lit)?;
+        if fresh.lit != 0 {
+            crate::intel_gpu_xelpg_live::check_pipes(io, fresh.lit)?;
         } else {
             res::require_idle(io)?;
         }
@@ -467,6 +487,7 @@ impl Pipes {
         dmc: &dyn PipeDmc,
     ) -> Result<(), PipeEnableError> {
         let new = self.check(io, ext)?;
+        self.sync_panel(io)?;
         self.refresh_panel(io)?;
         self.transition(io, new)?;
         let p = ext.pipe as usize;
@@ -688,6 +709,7 @@ impl Pipes {
         if self.lit & (1 << p) != 0 {
             return Err(PipeEnableError::Busy);
         }
+        self.sync_panel(io)?;
         self.refresh_panel(io)?;
         dmc.disable_pipe(p as u32);
         let request = self.request_with(|r| r.pipes[p] = None);

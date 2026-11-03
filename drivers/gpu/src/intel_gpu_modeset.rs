@@ -290,6 +290,9 @@ pub enum ModesetError {
     DisplayResourceUnavailable,
     /// Local pipe/transcoder/DDI stop was not observed; retain all leases.
     PipelineStopUnavailable,
+    /// The eDP panel power sequencer never reached the requested on or off
+    /// state (`intel_pps.c::wait_panel_on` / `wait_panel_off`).
+    PanelPowerTimeout,
     /// MTL source enable, primary image or a fresh common frame was not observed.
     /// This is not evidence of complete sink training or visible pixels.
     PipelineEnableUnavailable,
