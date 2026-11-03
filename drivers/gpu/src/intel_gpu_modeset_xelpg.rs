@@ -377,12 +377,28 @@ fn inherited_ddi_ctl(port: XeLpgPort) -> Option<u64> {
 
 // ── Orchestrator ─────────────────────────────────────────────────
 
+/// The mode the owned Pipe-A modeset last established with its owned
+/// display-14 resource profile, cleared when Pipe A goes dark. The Pipe
+/// B–D owner adopts a lit Pipe A only as this profile.
+static OWNED_PANEL: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The owned panel mode on Pipe A: set by a successful owned modeset (one
+/// whose display-14 resource transaction ran), cleared when the modeset
+/// turns Pipe A off. `None` while Pipe A runs an inherited layout.
+pub fn owned_panel_mode() -> Option<Mode> {
+    *OWNED_PANEL.lock()
+}
+
 /// Xe-LPG modeset orchestrator for one port + pipe A. Stateless,
 /// like its Gen12 counterpart.
 pub struct XeLpgModeset<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
     /// The physical port for this modeset.
     pub port: XeLpgPort,
+    /// Where Pipe A's DMC lifetime is reported (`intel_dmc_enable_pipe` /
+    /// `intel_dmc_disable_pipe` around this modeset's crtc enable/disable).
+    pipe_dmc: &'a dyn crate::intel_gpu_dc_states::PipeDmc,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for XeLpgModeset<'a, M> {
@@ -410,9 +426,20 @@ fn map_cx0_err(e: Cx0Error) -> ModesetError {
 }
 
 impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
-    /// Create an orchestrator for a port + MMIO window pair.
+    /// Create an orchestrator for a port + MMIO window pair, reporting
+    /// Pipe A's DMC lifetime to the display-14 DC service.
     pub fn new(mmio: &'a M, port: XeLpgPort) -> Self {
-        Self { mmio, port }
+        Self {
+            mmio,
+            port,
+            pipe_dmc: &crate::intel_gpu_dc_states::ServicePipeDmc,
+        }
+    }
+
+    /// Report Pipe A's DMC lifetime to `pipe_dmc` instead.
+    pub fn with_pipe_dmc(mut self, pipe_dmc: &'a dyn crate::intel_gpu_dc_states::PipeDmc) -> Self {
+        self.pipe_dmc = pipe_dmc;
+        self
     }
 
     /// Run the MTL modeset. Step order mirrors the Gen12
@@ -467,7 +494,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             raw: self.mmio,
             failed: Cell::new(false),
         };
-        let result = XeLpgModeset::new(&checked, self.port).modeset_checked(primary_fb, mode);
+        let result = XeLpgModeset::new(&checked, self.port)
+            .with_pipe_dmc(self.pipe_dmc)
+            .modeset_checked(primary_fb, mode);
         if !checked.display_access_ok() {
             return Err(result
                 .err()
@@ -502,8 +531,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // do not destructively stop an off/unqualified inherited port.
         self.require_enabled_ddi()?;
         // Step 3: plane → the single pipe/transcoder CONF → PLL request.
-        // This is not a full DDI/PHY/link retirement receipt.
+        // This is not a full DDI/PHY/link retirement receipt. Pipe A is
+        // dark from here: the owned profile no longer describes it, and
+        // its pipe DMC is disabled last, as hsw_crtc_disable ends with
+        // intel_dmc_disable_pipe after the port PLL.
+        *OWNED_PANEL.lock() = None;
         self.disable_pipeline()?;
+        self.pipe_dmc.disable_pipe(0);
         // This is a full owned modeset with the pipe off, not a KMS
         // inheritance path. Establish RGB bypass rather than depend on GOP
         // leaving its per-plane gamma/CSC controls in an admissible state.
@@ -528,6 +562,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         if owned.is_none() {
             program_cdclk_floor(self.mmio, &mode)?;
         }
+        // hsw_crtc_enable's first step, after the pre-plane update:
+        // intel_dmc_enable_pipe. A later failure leaves it enabled until
+        // the next disable, as Linux keeps it for the crtc's lifetime.
+        self.pipe_dmc.enable_pipe(0);
 
         // Step 5: enable the port PLL at the rate this pixel
         // clock needs (the same bandwidth rule the Gen12 path
@@ -589,6 +627,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         }
         self.enable_transcoder()?;
         self.observe_plane(primary_fb, &mode, trained_lanes, frame)?;
+        if owned.is_some() {
+            *OWNED_PANEL.lock() = Some(mode);
+        }
 
         Ok(mode)
     }
@@ -1368,6 +1409,74 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_modeset_ddi_a_full_run
+    );
+
+    /// Records each pipe-DMC report with the fake's write count at the call.
+    struct DmcAt<'a> {
+        fake: &'a MtlFake,
+        events: RefCell<Vec<(u32, bool, usize)>>,
+    }
+
+    impl crate::intel_gpu_dc_states::PipeDmc for DmcAt<'_> {
+        fn enable_pipe(&self, pipe: u32) {
+            let at = self.fake.writes.borrow().len();
+            self.events.borrow_mut().push((pipe, true, at));
+        }
+        fn disable_pipe(&self, pipe: u32) {
+            let at = self.fake.writes.borrow().len();
+            self.events.borrow_mut().push((pipe, false, at));
+        }
+    }
+
+    fn smoke_mtl_modeset_reports_pipe_a_dmc_around_its_crtc() -> TestResult {
+        // Linux hsw_crtc_disable ends with intel_dmc_disable_pipe (after
+        // the transcoder and the port PLL are off); hsw_crtc_enable starts
+        // with intel_dmc_enable_pipe (after the pre-plane update, before
+        // the port PLL). The owned modeset reports Pipe A at exactly those
+        // two points, once each.
+        let fake = MtlFake::new(XeLpgPort::A);
+        let dmc = DmcAt {
+            fake: &fake,
+            events: RefCell::new(Vec::new()),
+        };
+        let mode = Mode::VESA_1024X768_60;
+        if XeLpgModeset::new(&fake, XeLpgPort::A)
+            .with_pipe_dmc(&dmc)
+            .modeset_fixed(&test_fb(), &mode)
+            != Ok(mode)
+        {
+            return TestResult::Fail("the MTL modeset must complete against the MTL fake");
+        }
+        let events = dmc.events.borrow();
+        let &[(0, false, dark), (0, true, lit)] = events.as_slice() else {
+            return TestResult::Fail("Pipe A must be reported dark, then lit, once each");
+        };
+        let writes = fake.writes.borrow();
+        let conf_off = writes
+            .iter()
+            .rposition(|&(r, v)| r == PIPECONF_OFF && v & (1 << 31) == 0);
+        let pll_off = writes
+            .iter()
+            .position(|&(r, _)| r == XeLpgPort::A.port_clock_ctl());
+        let pll_on = writes.iter().position(|&(r, _)| r == 0x6_4030);
+        let conf_on = writes
+            .iter()
+            .rposition(|&(r, v)| r == PIPECONF_OFF && v & (1 << 31) != 0);
+        match (conf_off, pll_off, pll_on, conf_on) {
+            (Some(off), Some(pll), Some(on), Some(enabled))
+                if off < dark && pll < dark && dark <= lit && lit <= on && on < enabled => {}
+            _ => return TestResult::Fail("dark after the crtc stop, lit before the port PLL"),
+        }
+        // The inherited layout (no display-14 resource ownership in this
+        // fake) leaves no owned panel profile behind.
+        if owned_panel_mode().is_some() {
+            return TestResult::Fail("an inherited-layout modeset must not record a panel");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_modeset_reports_pipe_a_dmc_around_its_crtc
     );
 
     fn smoke_mtl_modeset_tc_ports_refuse_unqualified_route() -> TestResult {
