@@ -57,6 +57,7 @@ pub async fn configure(
     io: &impl Io,
     adapter: &Adapter,
     efuse: super::txpower::Efuse,
+    coex: &mut super::coex::Owner,
 ) -> Result<Radio, Error> {
     super::mac::init_mac_post_llt(io)?;
     phy::mac_config(io, &Condition::from_adapter(adapter))?;
@@ -67,6 +68,8 @@ pub async fn configure(
     super::mac::hw_configure(io)?;
     io.write32(REG_CAMCMD, (1 << 31) | (1 << 30))?;
     super::mac::station_identity(io, &adapter.mac)?;
+    // `rtl8723be_bt_hw_init` (`hw.c:1409`): `btc_init_hw_config`.
+    coex.init_hw_config(io).await?;
     super::channel::set_rfpath_switch(io, true)?;
     let iqk = if super::iqk::required(adapter) {
         Some(super::iqk::calibrate(io).await?)

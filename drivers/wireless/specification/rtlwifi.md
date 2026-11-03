@@ -3211,9 +3211,7 @@ keeps the chip diagnostic until admission lands.
   periodical). `b8723b2ant::Rtl8723b` is the `exhalbtc_*` RTL8723B
   dispatch: both algorithms keep state and each notify goes to the 2-ant
   one when `btdm_ant_num == 2`, the 1-ant one when 1. Difference: the BT
-  info row copy is bounded to 10 bytes. Outstanding: owner wiring
-  (C2H `BtInfo`/`BtMp` delivery, `BtLps` from `lps_ctrl`, notify call
-  sites, periodical timer) and admission. Tests
+  info row copy is bounded to 10 bytes. Tests
   `smoke_rtlwifi_btc_bind_bitmask_and_wifi_queries`,
   `smoke_rtlwifi_btc_mp_operation_and_bt_reg`,
   `smoke_rtlwifi_btc_lps_actions_and_aggregation`,
@@ -3224,6 +3222,48 @@ keeps the chip diagnostic until admission lands.
   `smoke_rtlwifi_btc8723b2ant_tables_and_algorithm`,
   `smoke_rtlwifi_btc8723b2ant_power_on_and_init_hw_config`,
   `smoke_rtlwifi_btc8723b2ant_a2dp_tdma_adjust_and_ips` (written,
+  unexecuted).
+- BT coexistence, pass 3 step 1: owner wiring (not admitted).
+  `rtl8723be/coex.rs::Owner` is `rtlpriv->btcoexist` for this chip:
+  `BtCoexist`, the `Rtl8723b` dispatch, the chip's single H2C `Mailbox`
+  and the `ps.c` `LpsGate` (`fwctrl_lps = true`). Each Linux `rtl_btc_ops`
+  call site is one method: `bind` (`pci.c::rtl_pci_start` →
+  `btc_init_variables`, via `Prepared::bind_rtl8723be_coex` in
+  `Allocated`; `prepare` refuses an unbound 8723BE and
+  `configure_rtl8723be` refuses a live adapter re-read whose board info
+  differs), `power_on_setting` (`hw.c:827`, inside `prepare` after the
+  enable flow and before `REG_MULTI_FUNC_CTRL |= BIT(3)`),
+  `init_hw_config` (`hw.c:1409/2708` `rtl8723be_bt_hw_init`, inside
+  `init::configure` after the station address and before the `ERFON`
+  block), `ips` (`ps.c:239/284`), `lps_leave` / `lps_enter`
+  (`rtl_lps_set_psmode`, `ps.c:368/375`: `_rtl8723be_fwlps_{leave,enter}`
+  with `h2c::BtLps` taken from `btc_is_bt_ctrl_lps` / `is_bt_lps_on` /
+  `get_lps_val` / `get_rpwm_val`, `btc_record_pwr_mode` of the body sent,
+  and `btc_lps_notify` after the leave / before the enter), `scan`
+  (`core.c:1425/1478`), `media_status` (`core.c:1181`), `connect`,
+  `special_packet` + `eapol` (`base.c:1455` / `base.c:1539` `in_4way`),
+  `watchdog` (`base.c:2205`: `btc_periodical` at most once per 2 s, then
+  the 30 s `in_4way` timeout), `c2h` (`rtl_c2h_content_parsing`,
+  `base.c:2313` BT info → `btc_btinfo_notify`, `base.c:2319` BT MP →
+  `btc_btmpinfo_notify`; TX reports returned to the caller) and `halt`
+  (`pci.c:1774`, `Prepared::halt_rtl8723be_coex`, unbinds). The real
+  `BtMpSource` is `btc::RxBtMp` over the owner's `C2hSource` (the RX
+  C2H stream): `bt_mp_comp` polls every millisecond up to the wait and
+  returns the first `BT_MP` body; other C2H packets go back through
+  `defer_c2h` (Linux's C2H work item runs after `rtl_c2h_fast_cmd`).
+  Before packet start (power-on, `bt_hw_init`) `NoBtMp` / `NoC2h` stand
+  in: no RX ring runs, so no MP body can arrive. Differences: the
+  re-entrant `btc_lps_notify` that an algorithm-requested LPS change
+  makes in Linux is recorded by `BtcHal` (`LpsNotified`) and replayed
+  after the outer notify (both 8723B handlers only set
+  `coex_sta->under_lps`, read only by debugfs); the watchdog cadence is
+  enforced from the caller's clock. Outstanding: the 8723BE station /
+  packet owner that calls `ips`/`lps_*`/`scan`/`connect`/`media_status`/
+  `special_packet`/`watchdog`/`c2h` and implements `C2hSource` over its
+  RX ring, and admission (signed envelope, probe). Tests
+  `smoke_rtl8723be_coex_owner_lps_c2h_watchdog_halt`, the coexistence
+  order checks added to `smoke_rtl8723be_erfon_block_and_channel_grant`
+  and `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
   unexecuted).
 
 ## 4. Invariants

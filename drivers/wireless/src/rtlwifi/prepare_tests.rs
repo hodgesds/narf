@@ -636,8 +636,51 @@ pub(crate) fn smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt() -> TestRe
     {
         return TestResult::Fail("8723BE ring profile selection (8723AE excluded)");
     }
+    // `rtl_pci_start` → `btc_init_variables` precedes `hw_init`; an unbound
+    // owner refuses before the 0x301 stop's successor writes.
+    {
+        use super::super::btcoex::btc::{ChipInterface, ChipType, HwPg};
+        let pg = HwPg {
+            bt_exist: true,
+            ant_num: 2,
+            single_ant_path: 0,
+            chip_type: ChipType::Rtl8723b,
+            package_type: 0,
+            rfe_type: 0,
+            interface: ChipInterface::Pci,
+        };
+        let unbound_port = Port::new();
+        let mut at = 0x80_0000u64;
+        let mut unbound = Prepared::allocate_for(Chip::Rtl8723be, unbound_port, 4, |bytes| {
+            at = (at + 255) & !255;
+            let block = Block {
+                address: at,
+                bytes: vec![0; bytes],
+                drops: Arc::new(AtomicUsize::new(0)),
+            };
+            at += bytes as u64;
+            Ok(block)
+        })
+        .unwrap();
+        if narf_scheduler::block_on(unbound.prepare()) != Err(Error::State) {
+            return TestResult::Fail("8723BE prepared without its coexistence owner");
+        }
+        drop(unbound);
+        if owner.bind_rtl8723be_coex(pg).is_err() || owner.bind_rtl8723be_coex(pg).is_ok() {
+            return TestResult::Fail("8723BE coexistence bind");
+        }
+    }
     narf_scheduler::block_on(owner.prepare()).unwrap();
     let m = port.0.lock();
+    // `ex_btc8723b2ant_power_on_setting` between the enable flow and
+    // `REG_MULTI_FUNC_CTRL |= BIT(3)` (`hw.c:827`).
+    let coex_on = m.trace.iter().position(|r| *r == (8, 0x67, 0x20));
+    let func_at = m.trace.iter().position(|r| *r == (8, 0x68, 0x08));
+    if !matches!((coex_on, func_at), (Some(c), Some(f)) if c < f)
+        || !m.trace.contains(&(32, 0x948, 0))
+    {
+        return TestResult::Fail("8723BE btc_power_on_setting not at hw.c:827");
+    }
     let at = |row: (u8, u16, u32)| m.trace.iter().position(|r| *r == row);
     let (Some(stop), Some(func), Some(open), Some(hwseq), Some(clkr), Some(close)) = (
         at((8, 0x301, 0xff)),

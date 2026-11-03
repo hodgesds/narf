@@ -50,6 +50,11 @@
 //!   interrupt profile with the HSISR write.
 //! - [`c2h`] — `rtl_c2h_content_parsing` for this chip (BT info / MP to
 //!   the coexistence owner, RA report ignored).
+//! - [`coex`] — the coexistence owner: `btc_coexist`, the RTL8723B
+//!   1-/2-antenna dispatch, the chip's H2C mailbox and every Linux
+//!   `rtl_btc_ops` call site (power-on, `bt_hw_init`, IPS, LPS with the
+//!   BT-controlled `SETPWRMODE`, scan, connect, media status, special
+//!   packet / EAPOL, watchdog, C2H BT info / MP, halt).
 //! - [`dm`] — `_rtl8723be_query_rxphystatus` PWDB and the
 //!   `rtl8723be_dm_refresh_rate_adaptive_mask` thresholds.
 
@@ -59,6 +64,7 @@ pub mod adapter;
 pub mod btc;
 pub mod c2h;
 pub mod channel;
+pub mod coex;
 pub mod dm;
 pub mod fw;
 pub mod h2c;

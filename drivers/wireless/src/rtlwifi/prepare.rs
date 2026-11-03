@@ -179,6 +179,9 @@ pub struct Prepared<I: Io, M: Memory> {
     rtl8192ce_power: Option<super::rtl8192ce::envelope::Permission>,
     /// RTL8723BE factory identity and configured radio (`rtl8723be/init.rs`).
     rtl8723be: Option<alloc::boxed::Box<([u8; 32], super::rtl8723be::init::Radio)>>,
+    /// RTL8723BE coexistence owner (`rtl8723be/coex.rs`), bound before
+    /// [`Self::prepare`] (`rtl_pci_start` → `btc_init_variables`).
+    rtl8723be_coex: Option<alloc::boxed::Box<super::rtl8723be::coex::Owner>>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -287,6 +290,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8192ce: None,
             rtl8192ce_power: None,
             rtl8723be: None,
+            rtl8723be_coex: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
@@ -526,6 +530,11 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             // and parked BME hold host DMA closed while CR is fully open;
             // the deferred `REG_CR = 0x2ff` belongs to packet start, so the
             // DMA/MAC gates are closed again below before the LLT.
+            // `hw.c:827` `btc_power_on_setting` after the enable flow; every
+            // 8723BE runs it (`get_btc_status()` is always true), so an
+            // unbound coexistence owner refuses.
+            let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
+            coex.power_on_setting(&self.io).await?;
             super::rtl8723be::mac::init_mac_pre_cr(&self.io)?;
             self.io.write8(0x100, 0xff)?;
             self.io.delay_us(2000).await;

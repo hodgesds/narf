@@ -792,7 +792,8 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
             a.oem = adapter::Oem::Hp;
         }
         let io = fw_fake(true, true, false);
-        let radio = match narf_scheduler::block_on(init::configure(&io, &a, efuse)) {
+        let mut coex = coex::Owner::bind(crate::rtlwifi::btcoex::btc::HwPg::rtl8723be(&a));
+        let radio = match narf_scheduler::block_on(init::configure(&io, &a, efuse, &mut coex)) {
             Ok(r) => r,
             Err(_) => return TestResult::Fail("8723BE configure failed"),
         };
@@ -822,7 +823,9 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
             || g.regs[0x1f] != 0x07
             || g.regs[0x02] != 0xe3
             || g.regs[0x25] != 0x80
-            || r32(0x4c) & (1 << 23) == 0
+            // `rtl8723be_phy_bb_config` sets 0x4c[23]; the later
+            // `rtl8723be_bt_hw_init` `set_ant_path` clears it again.
+            || !g.writes.iter().any(|x| x.0 == 0x4c && x.2 == 4 && x.1 & (1 << 23) != 0)
             || (r32(0x2c) >> 12) & 0xfff != cap
             || r32(0x670) != 0xc000_0000
             || g.regs[0x610..0x616] != [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe]
@@ -839,7 +842,8 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
         return TestResult::Fail("adapter");
     };
     let io = fw_fake(true, true, false);
-    if narf_scheduler::block_on(init::configure(&io, &aux, efuse)).is_err()
+    let mut coex = coex::Owner::bind(crate::rtlwifi::btcoex::btc::HwPg::rtl8723be(&aux));
+    if narf_scheduler::block_on(init::configure(&io, &aux, efuse, &mut coex)).is_err()
         || !io.0.lock().writes.contains(&(0x948, 0, 4))
     {
         return TestResult::Fail("8723BE ANT_AUX 0x948 write");
@@ -1132,7 +1136,8 @@ fn smoke_rtl8723be_erfon_block_and_channel_grant() -> TestResult {
         };
         let io = fw_fake(true, true, false);
         io.0.lock().regs[usize::from(init::REG_RXDMA_CONTROL)] = 0x06;
-        let radio = match narf_scheduler::block_on(init::configure(&io, &a, efuse)) {
+        let mut coex = coex::Owner::bind(crate::rtlwifi::btcoex::btc::HwPg::rtl8723be(&a));
+        let radio = match narf_scheduler::block_on(init::configure(&io, &a, efuse, &mut coex)) {
             Ok(r) => r,
             Err(_) => return TestResult::Fail("8723BE configure failed"),
         };
@@ -1148,6 +1153,18 @@ fn smoke_rtl8723be_erfon_block_and_channel_grant() -> TestResult {
             return TestResult::Fail("8723BE ERFON rows missing");
         };
         let iqk_at = w((iqk::RFPGA0_IQK, 0x8080_0000, 4));
+        // `rtl8723be_bt_hw_init` (both algorithms set 0x790[5:0] = 5)
+        // between the station address and the `ERFON` block.
+        let bt_init = g
+            .writes
+            .iter()
+            .position(|x| x.0 == 0x0790 && x.1 & 0x3f == 5);
+        if !bt_init.is_some_and(|b| mac < b && b < path)
+            || !coex.btc.initialized
+            || coex.btc.board_info.btdm_ant_num != if iqk { 2 } else { 1 }
+        {
+            return TestResult::Fail("8723BE bt_hw_init order / dispatch");
+        }
         if !(mac < path && path < lck && lck < nav && nav < rx)
             || iqk_at.is_some() != iqk
             || iqk_at.is_some_and(|i| !(path < i && i < lck))
@@ -1502,4 +1519,155 @@ fn smoke_rtl8723be_c2h_irq_and_card_disable() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_c2h_irq_and_card_disable
+);
+
+// ── Coexistence owner (`rtl8723be/coex.rs`) ───────────────────────────────
+
+struct FakeC2h {
+    queue: Vec<Vec<u8>>,
+    deferred: Vec<Vec<u8>>,
+}
+impl btc::C2hSource for FakeC2h {
+    fn poll_c2h(
+        &mut self,
+        out: &mut [u8; btc::C2H_MAX],
+    ) -> Result<Option<usize>, crate::rtlwifi::prepare::Error> {
+        if self.queue.is_empty() {
+            return Ok(None);
+        }
+        let p = self.queue.remove(0);
+        out[..p.len()].copy_from_slice(&p);
+        Ok(Some(p.len()))
+    }
+    fn defer_c2h(&mut self, packet: &[u8]) -> Result<(), crate::rtlwifi::prepare::Error> {
+        self.deferred.push(packet.to_vec());
+        Ok(())
+    }
+}
+
+/// The coexistence owner's Linux call sites: `rtl_lps_set_psmode` with the
+/// BT-controlled `SETPWRMODE` recorded by `btc_record_pwr_mode` and the
+/// `btc_lps_notify` order (`ps.c:368/375`), C2H BT MP / BT info dispatch
+/// (`base.c:2313/2319`), the RX-ring `bt_mp_comp` wait deferring other C2H
+/// packets, the 2 s watchdog with the 30 s `in_4way` timeout and halt.
+fn smoke_rtl8723be_coex_owner_lps_c2h_watchdog_halt() -> TestResult {
+    use crate::rtlwifi::btcoex::btc::{ChipInterface, ChipType, HwPg, BT_SEQ_GET_BT_VERSION};
+    use btc::BtMpSource;
+    let pg = HwPg {
+        bt_exist: true,
+        ant_num: 2,
+        single_ant_path: 0,
+        chip_type: ChipType::Rtl8723b,
+        package_type: 0,
+        rfe_type: 0,
+        interface: ChipInterface::Pci,
+    };
+    let io = reg_log();
+    let mut owner = coex::Owner::bind(pg);
+    // Not linked: no command, no notify.
+    if narf_scheduler::block_on(owner.lps_enter(&io)) != Ok(None) {
+        return TestResult::Fail("8723BE coex LPS enter while unlinked");
+    }
+    owner.lps.linked = true;
+    owner.lps.report_linked = true;
+    owner.lps.enter_allowed = true;
+    owner.btc.bt_info.bt_ctrl_lps = true;
+    owner.btc.bt_info.bt_lps_on = true;
+    owner.btc.bt_info.lps_val = 0x50;
+    owner.btc.bt_info.rpwm_val = 0x04;
+    let before = owner.btc.statistics.cnt_lps_notify;
+    let enter = narf_scheduler::block_on(owner.lps_enter(&io));
+    if enter != Ok(Some([1, 0x00, 2, 0, 0x04, 0x50, 0]))
+        || owner.btc.pwr_mode_val[..7] != [1, 0x00, 2, 0, 0x04, 0x50, 0]
+        || owner.btc.statistics.cnt_lps_notify != before + 1
+        || !owner.algo.two.sta.under_lps
+        || owner.lps.active
+    {
+        return TestResult::Fail("8723BE coex LPS enter (BT form, notify, record)");
+    }
+    let leave = narf_scheduler::block_on(owner.lps_leave(&io));
+    if !matches!(leave, Ok(Some(cmd)) if owner.btc.pwr_mode_val[..7] == cmd)
+        || owner.algo.two.sta.under_lps
+        || !owner.lps.active
+        || narf_scheduler::block_on(owner.lps_leave(&io)) != Ok(None)
+    {
+        return TestResult::Fail("8723BE coex LPS leave");
+    }
+    // C2H BT MP outside a wait: `rtl_btc_btmpinfo_notify` only.
+    let mp = [
+        c2h::C2H_BT_MP,
+        0,
+        1,
+        0,
+        BT_SEQ_GET_BT_VERSION << 4,
+        0x34,
+        0x12,
+        7,
+    ];
+    let mut none = btc::NoC2h;
+    if narf_scheduler::block_on(owner.c2h(&io, &mut none, &mp)) != Ok(coex::C2h::Coex)
+        || owner.btc.bt_info.bt_real_fw_ver != 0x1234
+        || owner.btc.bt_info.bt_fw_ver != 7
+    {
+        return TestResult::Fail("8723BE coex C2H BT MP");
+    }
+    let info = [c2h::C2H_BT_INFO, 0, 0, 7, 0, 0, 0, 0, 0];
+    let n = owner.btc.statistics.cnt_bt_info_notify;
+    if narf_scheduler::block_on(owner.c2h(&io, &mut none, &info)) != Ok(coex::C2h::Coex)
+        || owner.btc.statistics.cnt_bt_info_notify != n + 1
+        || narf_scheduler::block_on(owner.c2h(&io, &mut none, &[c2h::C2H_RA_RPT, 0, 1]))
+            != Ok(coex::C2h::Other)
+    {
+        return TestResult::Fail("8723BE coex C2H BT info / RA report");
+    }
+    // `bt_mp_comp` over the RX ring: BT info deferred, MP returned.
+    let mut src = FakeC2h {
+        queue: vec![info.to_vec(), mp.to_vec()],
+        deferred: Vec::new(),
+    };
+    let got = {
+        let mut wait = btc::RxBtMp {
+            io: &io,
+            source: &mut src,
+        };
+        narf_scheduler::block_on(wait.next_bt_mp(5))
+    };
+    if !matches!(got, Ok(Some(r)) if r.body() == &mp[2..]) || src.deferred != [info.to_vec()] {
+        return TestResult::Fail("8723BE coex RX bt_mp_comp wait");
+    }
+    let timeout = {
+        let mut wait = btc::RxBtMp {
+            io: &io,
+            source: &mut src,
+        };
+        narf_scheduler::block_on(wait.next_bt_mp(3))
+    };
+    if timeout != Ok(None) {
+        return TestResult::Fail("8723BE coex MP wait timeout");
+    }
+    // Watchdog cadence and the `in_4way` timeout.
+    owner.eapol(0);
+    let p = owner.btc.statistics.cnt_periodical;
+    let run = |owner: &mut coex::Owner, now| {
+        narf_scheduler::block_on(owner.watchdog(&io, &mut btc::NoC2h, now))
+    };
+    if run(&mut owner, 0) != Ok(true)
+        || run(&mut owner, 1999) != Ok(false)
+        || run(&mut owner, 2000) != Ok(true)
+        || owner.btc.statistics.cnt_periodical != p + 2
+        || !owner.btc.wifi.in_4way
+    {
+        return TestResult::Fail("8723BE coex watchdog cadence");
+    }
+    if run(&mut owner, 30_001) != Ok(true) || owner.btc.wifi.in_4way {
+        return TestResult::Fail("8723BE coex watchdog / in_4way");
+    }
+    if narf_scheduler::block_on(owner.halt(&io)).is_err() || owner.btc.binded {
+        return TestResult::Fail("8723BE coex halt unbinds");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_coex_owner_lps_c2h_watchdog_halt
 );

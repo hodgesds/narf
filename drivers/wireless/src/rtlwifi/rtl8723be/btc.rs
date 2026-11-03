@@ -41,6 +41,68 @@ impl BtMpSource for NoBtMp {
     }
 }
 
+/// The largest C2H packet the RX path hands over (`C2H_DATA_OFFSET` plus
+/// the 16-byte command buffer `rtl_c2h_content_parsing` reads).
+pub const C2H_MAX: usize = super::c2h::C2H_DATA_OFFSET + 16;
+
+/// The owner's C2H packet stream (`rpt_sel != 0` RX statuses, from the
+/// payload offset, the status length).
+pub trait C2hSource {
+    /// The next pending C2H packet copied into `out`, if one has arrived.
+    fn poll_c2h(&mut self, out: &mut [u8; C2H_MAX]) -> Result<Option<usize>, Error>;
+    /// Hand a C2H packet that is not a `BT_MP` body back to the owner's
+    /// queue (`rtl_c2hcmd_enqueue`: it is processed after the MP wait, as
+    /// Linux's C2H work item runs after `rtl_c2h_fast_cmd`).
+    fn defer_c2h(&mut self, packet: &[u8]) -> Result<(), Error>;
+}
+
+/// No RX ring attached (before packet start): nothing ever arrives.
+#[derive(Debug)]
+pub struct NoC2h;
+
+impl C2hSource for NoC2h {
+    fn poll_c2h(&mut self, _out: &mut [u8; C2H_MAX]) -> Result<Option<usize>, Error> {
+        Ok(None)
+    }
+    fn defer_c2h(&mut self, _packet: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// `bt_mp_comp` over the RX ring: `rtl_c2h_fast_cmd` takes `C2H_BT_MP`
+/// inline (`pci.c` RX → `rtl_c2hcmd_enqueue`), so the wait polls the C2H
+/// stream every millisecond for up to `wait_ms` and returns the first
+/// `BT_MP` body; every other C2H packet goes back through
+/// [`C2hSource::defer_c2h`].
+#[derive(Debug)]
+pub struct RxBtMp<'a, I: Io, S: C2hSource> {
+    pub io: &'a I,
+    pub source: &'a mut S,
+}
+
+impl<I: Io, S: C2hSource> BtMpSource for RxBtMp<'_, I, S> {
+    async fn next_bt_mp(&mut self, wait_ms: u32) -> Result<Option<MpReport>, Error> {
+        let mut buf = [0u8; C2H_MAX];
+        let mut waited = 0u32;
+        loop {
+            while let Some(n) = self.source.poll_c2h(&mut buf)? {
+                let packet = &buf[..n.min(C2H_MAX)];
+                match super::c2h::parse(packet) {
+                    Ok(super::c2h::Event::BtMp(body)) => return Ok(Some(MpReport::new(body))),
+                    Ok(_) => self.source.defer_c2h(packet)?,
+                    // `rtl_c2hcmd_enqueue` drops a malformed packet.
+                    Err(_) => {}
+                }
+            }
+            if waited >= wait_ms {
+                return Ok(None);
+            }
+            self.io.delay_us(1000).await;
+            waited += 1;
+        }
+    }
+}
+
 /// The `ps.c` state `rtl_lps_enter_core` / `rtl_lps_leave_core` /
 /// `rtl_lps_set_psmode` read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +130,41 @@ pub struct BtcHal<'a, I: Io, M: BtMpSource> {
     /// The last `rtl_rx_ampdu_apply` configuration (the station owner
     /// applies it to the RX BA sessions).
     pub ampdu: Option<AmpduCfg>,
+    /// `rtl_lps_set_psmode` calls `btc_lps_notify` on every mode it sends,
+    /// also when the coexistence algorithm itself asked for the LPS change
+    /// (re-entering `exhalbtc_lps_notify`). The algorithm is borrowed at
+    /// that point, so each such notify is recorded here (`true` = EACTIVE)
+    /// and replayed by the owner after the outer notify returns. Both 8723B
+    /// handlers only set `coex_sta->under_lps` there, which nothing but
+    /// debugfs reads, so the deferral is not observable on the air.
+    pub lps_notified: LpsNotified,
+}
+
+/// The re-entrant `btc_lps_notify` calls one borrow made (bounded; the
+/// count keeps the statistic exact when more than [`LpsNotified::CAP`]
+/// arrive, the last ones are kept).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LpsNotified {
+    modes: [bool; Self::CAP],
+    pub count: u32,
+}
+
+impl LpsNotified {
+    pub const CAP: usize = 4;
+    fn push(&mut self, active: bool) {
+        let n = self.count as usize;
+        if n < Self::CAP {
+            self.modes[n] = active;
+        } else {
+            self.modes.copy_within(1.., 0);
+            self.modes[Self::CAP - 1] = active;
+        }
+        self.count = self.count.saturating_add(1);
+    }
+    /// The recorded modes, oldest first.
+    pub fn modes(&self) -> &[bool] {
+        &self.modes[..(self.count as usize).min(Self::CAP)]
+    }
 }
 
 impl<'a, I: Io, M: BtMpSource> BtcHal<'a, I, M> {
@@ -78,7 +175,14 @@ impl<'a, I: Io, M: BtMpSource> BtcHal<'a, I, M> {
             lps,
             mp,
             ampdu: None,
+            lps_notified: LpsNotified::default(),
         }
+    }
+
+    /// `rtl_lps_enter_core`'s gates up to `rtl_lps_set_psmode(EAUTOPS)`
+    /// sending a command.
+    pub fn enter_sends(&self) -> bool {
+        self.lps.fwctrl_lps && self.lps.enter_allowed && self.lps.linked && self.can_set_psmode()
     }
 
     fn bt(ctrl: LpsCtrl) -> Option<BtLps> {
@@ -152,6 +256,7 @@ impl<I: Io, M: BtMpSource> Hal for BtcHal<'_, I, M> {
             return Ok(None);
         }
         let cmd = fwlps_leave(self.io, self.mailbox, Self::bt(ctrl)).await?;
+        self.lps_notified.push(true);
         Ok(Some(cmd))
     }
     /// `rtl_lps_enter_core` → `rtl_lps_set_psmode(EAUTOPS)`.
@@ -163,6 +268,7 @@ impl<I: Io, M: BtMpSource> Hal for BtcHal<'_, I, M> {
         if !self.can_set_psmode() {
             return Ok(None);
         }
+        self.lps_notified.push(false);
         let cmd = fwlps_enter(self.io, self.mailbox, Self::bt(ctrl)).await?;
         Ok(Some(cmd))
     }
