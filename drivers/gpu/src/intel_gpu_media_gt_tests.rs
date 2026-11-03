@@ -1108,6 +1108,18 @@ fn smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable() -> TestResult {
     let cap = Cap::<narf_bus::BusDeviceCap, Write>::bootstrap();
     let arena = SharedArena::new(GgttArena::for_gt(bar, cap, MTL));
     let mut alloc = arena.clone();
+    // An authorized arena publishes PTEs (and flushes) only once GT0's cache
+    // policy is configured; without it no allocation would reach either path.
+    let Ok(mut seed) = alloc.alloc(1) else {
+        return TestResult::Fail("fixture arena refused its seed page");
+    };
+    let policy = crate::intel_gpu_gt_hw::CachePolicy {
+        platform: MTL,
+        ggtt_pat: 3,
+        media: None,
+    };
+    kt_assert!(arena.configure_cache(&mut seed, policy).is_ok());
+    kt_assert_eq!(load(MEDIA_INV), SENTINEL);
     // CT mode needs a registered media GuC.
     kt_assert!(arena.set_media_guc_submission(true).is_err());
     kt_assert!(arena.set_media_guc_tlb(true).is_ok());
@@ -1132,6 +1144,7 @@ fn smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable() -> TestResult {
     kt_assert!(arena.set_media_guc_tlb(false).is_ok());
     kt_assert!(!arena.media_guc_ct());
     alloc.free(second);
+    alloc.free(seed);
     kt_assert_eq!(load(MEDIA_INV), SENTINEL);
     kt_assert_eq!(load(GT0_INV), SENTINEL);
     kt_assert_eq!(arena.live_allocations(), 0);
