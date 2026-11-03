@@ -479,6 +479,34 @@ pub(crate) fn takeover<M: MmioWindow + ?Sized>(mmio: &M) -> Option<crate::intel_
     modeset(mmio, &fb, None).ok()
 }
 
+/// The route's probe-time modeset window (§17 10.5): eDP panel power
+/// sequencing on `pps`, `light` (production: [`takeover`]) on `mode`, and
+/// the PPS backlight gate once the panel is lit. Both windows are
+/// [`Flushed`]: every read in the window follows Wa_15015404425's four
+/// dummy writes, as every Lunar Lake read does in xe
+/// (xe_mmio.c::xe_mmio_read32 → `mmio_flush_pending_writes`). `Err` is a
+/// panel power failure, with nothing lit; `Ok(None)` a refused takeover.
+/// The route decision before it ([`display_route`]) stays read-only.
+pub(crate) fn probe_window<P, M, T>(
+    pps: &P,
+    mode: &M,
+    light: impl FnOnce(&Flushed<'_, M>) -> Option<T>,
+) -> Result<Option<T>, crate::intel_gpu_edp::PpsError>
+where
+    P: MmioWindow + ?Sized,
+    M: MmioWindow + ?Sized,
+{
+    let pps = Flushed(pps);
+    let mut sequencer = crate::intel_gpu_edp::PanelPowerSequencer::new(&pps);
+    sequencer.init_registers();
+    sequencer.power_on()?;
+    let lit = light(&Flushed(mode));
+    if lit.is_some() {
+        let _ = sequencer.backlight_on();
+    }
+    Ok(lit)
+}
+
 // ── CDCLK and MDCLK ──────────────────────────────────────────────
 
 const fn rung(cdclk_khz: u32, ratio: u32, waveform: u16) -> Rung {

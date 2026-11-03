@@ -915,3 +915,79 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe2lpd_modeset",
     smoke_xe2lpd_entry_refuses_without_display20_read_only
 );
+
+/// Every access of a window, in order: `(write, register)`.
+struct Trace<'a>(&'a Lnl, RefCell<Vec<(bool, u64)>>);
+
+impl MmioWindow for Trace<'_> {
+    fn read32(&self, r: u64) -> u32 {
+        self.1.borrow_mut().push((false, r));
+        self.0.read32(r)
+    }
+    fn write32(&self, r: u64, v: u32) {
+        self.1.borrow_mut().push((true, r));
+        self.0.write32(r, v)
+    }
+}
+
+impl Trace<'_> {
+    /// Whether every read follows four writes of 0 to `DUMMY_REG_OFFSET`
+    /// (0x130030); the number of reads.
+    fn flushed_reads(&self) -> Option<usize> {
+        let events = self.1.borrow();
+        let mut reads = 0;
+        for (i, &(write, _)) in events.iter().enumerate() {
+            if !write {
+                if i < 4 || events[i - 4..i].iter().any(|&e| e != (true, 0x130030)) {
+                    return None;
+                }
+                reads += 1;
+            }
+        }
+        Some(reads)
+    }
+}
+
+/// Wa_15015404425 on the route's probe-time window (`probe_window`): every
+/// read of the panel power sequencer, the display-20 modeset and the
+/// backlight gate follows xe_mmio.c::mmio_flush_pending_writes' four dummy
+/// writes, with the gate opened only once the panel is lit. A refused
+/// takeover lights nothing and leaves the gate closed.
+fn smoke_xe2lpd_probe_window_flushes_every_read() -> TestResult {
+    // GOP left the panel powered: PP_STATUS.PP_ON (bit 31).
+    let io = Lnl::new();
+    io.mode.write32(0xc7200, 0x8000_0000);
+    let trace = Trace(&io, RefCell::new(Vec::new()));
+    let lit = probe_window(&trace, &trace, |mmio| {
+        modeset(mmio, &Lnl::fb(), Some(&Mode::VESA_1024X768_60)).ok()
+    });
+    assert_eq!(lit, Ok(Some(Mode::VESA_1024X768_60)));
+    assert!(trace.flushed_reads().is_some_and(|reads| reads > 0));
+    {
+        let events = trace.1.borrow();
+        // The sequencer (PP_STATUS) and the modeset (GMD_ID_DISPLAY,
+        // TRANSCONF_A) both read through the flush.
+        for r in [0xc7200, 0x510a0, 0x70008] {
+            assert!(events.contains(&(false, r)), "{r:#x}");
+        }
+        // The backlight gate (PP_CONTROL) is the window's last write.
+        assert_eq!(events.last(), Some(&(true, 0xc7204)));
+    }
+    assert_ne!(io.mode.read32(0xc7204) & (1 << 2), 0, "EDP_BLC_ENABLE");
+
+    // Pipe A dark: the takeover refuses and the gate stays closed.
+    let io = Lnl::new();
+    io.mode.write32(0xc7200, 0x8000_0000);
+    let trace = Trace(&io, RefCell::new(Vec::new()));
+    assert_eq!(
+        probe_window(&trace, &trace, |mmio| takeover(mmio)),
+        Ok(None)
+    );
+    assert!(trace.flushed_reads().is_some_and(|reads| reads > 0));
+    assert_eq!(io.mode.read32(0xc7204) & (1 << 2), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd_modeset",
+    smoke_xe2lpd_probe_window_flushes_every_read
+);

@@ -1426,12 +1426,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // pattern; `lnl_console_handoff`), which installs the display-20
         // KMS owner below. A refused handoff leaves the firmware surface
         // and no KMS owner. No PM owner is installed: the GT owner, with
-        // the display-preserving profile, is D0-only.
+        // the display-preserving profile, is D0-only. The whole window
+        // (sequencer, modeset, backlight gate) reads through
+        // Wa_15015404425's dummy writes (`probe_window`).
         let window = crate::intel_gpu_edp::BarWindow(&dev.gtt_mmadr);
-        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&window);
-        pps.init_registers();
-        let mode = match pps.power_on() {
-            Ok(()) => crate::intel_gpu_xe2lpd::takeover(&dev.mode_window()),
+        let mode = match crate::intel_gpu_xe2lpd::probe_window(&window, &dev.mode_window(), |io| {
+            crate::intel_gpu_xe2lpd::takeover(io)
+        }) {
+            Ok(mode) => mode,
             Err(e) => {
                 use core::fmt::Write as _;
                 let _ = writeln!(
@@ -1443,7 +1445,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             }
         };
         if let Some(mode) = mode.as_ref() {
-            let _ = pps.backlight_on();
             let _ = crate::intel_gpu_multipipe::claim_pipe(
                 crate::intel_gpu_pipes::Pipe::A,
                 crate::intel_gpu_multipipe::PipeOwner {
