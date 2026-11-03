@@ -41,6 +41,8 @@ pub(super) struct ValidLink {
     max_power: i8,
     /// This link's MLO GTK/IGTK from the latest authenticated delivery.
     pub keys: Option<super::security::LinkGroupKeys>,
+    /// This link's own group RX PN floors (`rx->link->gtk[idx]` rx_pn).
+    pub group_replay: super::frame_api::GroupReplay,
     /// Firmware ownership (link/STA ids and PHY id) while active.
     pub active: Option<(LinkOwner, u8)>,
 }
@@ -191,6 +193,7 @@ impl Admission<'_> {
             qos: Some(qos),
             max_power,
             keys: None,
+            group_replay: Default::default(),
             active: None,
         })
     }

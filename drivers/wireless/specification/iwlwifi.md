@@ -4187,9 +4187,44 @@ through `Binding::confirm_mpdu_beacon` (that link's spec id).
 unexecuted: `smoke_mld_native_owner_request_element_and_link_statuses`,
 `smoke_mld_multi_link_m2_link_kdes_and_per_link_group_keys`.
 
-Still open for a second active link: per-link group RX PN (a further link's
-group data still shares the association link's group replay table, so it
-can only be dropped, never replayed); 6GHz further links; no device/nl80211
+**Multiple-link corrections (pass 5).** The M2/M3 MLO KDE encoding was
+re-verified against w1.fi hostap master (fetched 2026-11-03):
+`src/rsn_supp/wpa.c` `wpa_mlo_link_kde`, `wpa_supplicant_validate_link_kde`,
+`src/common/wpa_common.{h,c}` `RSN_MLO_*`/`wpa_parse_generic`, and hostapd
+`src/ap/wpa_auth.c` `wpa_auth_validate_ml_kdes_m2`/`wpa_auth_ml_kdes`. The
+Link KDE layout (selector 00-0F-AC:19, Link Information = link id with
+RSNE/RSNXE bits clear, station link MAC) was correct; three behaviours were
+not. (1) M2 now names every *requested* further link, accepted or rejected,
+in ascending link id order (`sm->mlo.req_links`); hostapd counts rejected
+links and refused the previous accepted-only M2 whenever the AP rejected a
+link. (2) M3 must carry a Link KDE for every requested link including a
+rejected one (its AP address and beacon RSNE/RSNXE); a rejected link's GTK
+is not consumed. `Session::with_further_links` therefore binds every
+requested link with `FurtherLinkSecurity::accepted`. (3) Per-link KDEs for
+a link that was never requested are ignored (hostapd sends a Link KDE for
+every affiliated AP), and reserved Link-Information/GTK/IGTK bits are
+ignored on receipt as `wpa_parse_generic` does; link id 15 is refused.
+
+Group-addressed data received on an active further link (owner resolved
+from the firmware link, `Binding::receiving_link`) is checked against that
+link's own `frame_api::GroupReplay` (per key index and TID), swapped in
+around the shared RX path: mac80211 resolves a group frame's key on the
+receiving link (`rx->link->gtk[idx]`, rx.c) with its own `rx_pn`. Pairwise
+PN, duplicate and A-MSDU state stay MLD-wide. A changed further-link GTK
+adopts its authenticated KDE floor; an identical retransmission never
+resets it. Multicast stays on fallback queue0.
+
+Linux allocates FW link, link-STA and PHY ids from one device-wide pool
+(`fw_id_to_bss_conf`, `fw_id_to_link_sta`, `used_phy_ids`). A live P2P
+DEVICE session's fixed FW link1, last-station aux id and PHY1 are now
+claimed in `Hardware::mld_fw_ids`/`mld_phy_ids` before a further link
+allocates, and P2P START refuses while a further link is active.
+Written, unexecuted: `smoke_iwl_mld_shared_id_pool_and_per_link_group_replay`
+plus the extended `smoke_mld_multi_link_m2_link_kdes_and_per_link_group_keys`.
+
+Still open for a second active link: group-addressed robust management
+(BIP) received on a further link still uses the association link's IGTK
+replay state; 6GHz further links; no device/nl80211
 caller supplies candidates yet; EMLSR link selection driving activation with
 MLO scan freshness, missed-beacon/ESR_MODE_NOTIF/EMLSR_TRANS_FAIL_NOTIF
 routing, MAC client esr fields; EML OMN, TID-to-link mapping and the

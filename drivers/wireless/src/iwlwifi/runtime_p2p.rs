@@ -269,11 +269,30 @@ impl Drop for State {
 }
 impl Hardware {
     /// The actual FW_NUM_STATIONS/FW_NUM_LINKS facts bounding MLD firmware
-    /// link/station ids (Linux mld.h `IWL_MLD_ALLOC_FN`).
+    /// link/station ids (Linux mld.h `IWL_MLD_ALLOC_FN`). Linux allocates
+    /// every vif's link and station ids from the one device-wide
+    /// `fw_id_to_bss_conf`/`fw_id_to_link_sta` pool, so a live P2P DEVICE
+    /// session's FW link1 and its last-station aux id stay claimed here and
+    /// a further MLD link can never alias them.
     pub(in crate::iwlwifi) fn mld_fw_ids(
         &self,
     ) -> Result<super::super::sc_mlo::FwIds, &'static str> {
-        super::super::sc_mlo::FwIds::new(self.p2p.counts.1, self.p2p.counts.0)
+        let mut ids = super::super::sc_mlo::FwIds::new(self.p2p.counts.1, self.p2p.counts.0)?;
+        if let Some(session) = &self.p2p.session {
+            ids.claim(LINK as u8, session.aux_station)?;
+        }
+        Ok(ids)
+    }
+
+    /// PHY context ids for a further MLD link: PHY0 is the association
+    /// link's, and a live P2P DEVICE session holds PHY1 (Linux shares
+    /// `used_phy_ids` across vifs, `iwl_mld_allocate_fw_phy_id`).
+    pub(in crate::iwlwifi) fn mld_phy_ids(&self) -> super::super::sc_mlo::PhyIds {
+        let mut ids = super::super::sc_mlo::PhyIds::station();
+        if self.p2p.session.is_some() {
+            ids.claim(session::PHY as u8);
+        }
+        ids
     }
 
     /// A credit wait polls only one64-descriptor RFH batch. Consume the
@@ -382,10 +401,16 @@ impl Hardware {
         api: &super::super::firmware_api::FirmwareApi<'_>,
         request: Arc<Request>,
     ) -> Result<(), &'static str> {
+        // P2P owns FW link1/PHY1 by fixed id; an active further MLD link
+        // may hold either, so the shared pool refuses the overlap.
         if self.p2p_started()
             || !self.p2p_supported(api)
             || self.failed
             || !self.resources.data.is_empty()
+            || self
+                .mld_link
+                .as_ref()
+                .is_some_and(|binding| binding.secondary().is_some())
         {
             return Err("P2P START requires its actual idle native adapter");
         }

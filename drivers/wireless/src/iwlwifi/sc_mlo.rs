@@ -34,6 +34,12 @@ impl PhyIds {
     pub fn release(&mut self, id: u8) {
         self.used &= !(1u8 << (id & 7));
     }
+    /// Mark an id another owner already holds.
+    pub fn claim(&mut self, id: u8) {
+        if id < NUM_PHY_CTX {
+            self.used |= 1 << id;
+        }
+    }
 }
 
 /// One physical link's distinct firmware ownership, mirroring Linux
@@ -246,6 +252,11 @@ impl Binding {
         frame[4..10].copy_from_slice(&link.peer_link);
         frame[10..16].copy_from_slice(&link.own_link);
         frame[16..22].copy_from_slice(&link.peer_link);
+    }
+    /// The spec link id of the owner that received `mpdu` (iwl mld
+    /// `iwl_mld_rx_fill_status` link_id from the firmware link).
+    pub fn receiving_link(&self, mpdu: &Mpdu<'_>) -> Option<u8> {
+        self.owner_of(mpdu).map(|link| link.spec_link)
     }
     pub fn owns_mpdu(&self, mpdu: &Mpdu<'_>) -> bool {
         self.owner_of(mpdu).is_some()

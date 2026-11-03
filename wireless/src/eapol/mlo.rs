@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Single-link MLD EAPOL key-data checks. Primary sources: hostap wpa.c
+//! MLD EAPOL key-data checks. Primary sources: hostap wpa.c
 //! blob5a05a991b9f95ae0411bdc136bc3ef6ddd0ecb6a and Android wpa_common.h
 //! commit073b9ad1b7e6876417fe0927c6364245ecf26d8b (BSD-compatible wire defs).
 //! Helpers consume already MIC-authenticated/decrypted M3/group data. They
@@ -60,16 +60,32 @@ fn set<'a>(slot: &mut Option<&'a [u8]>, value: &'a [u8]) -> Result<(), Error> {
     }
     Ok(())
 }
-/// Per-link KDEs (MLO GTK/IGTK/Link) may name only a link in `links`.
+/// Per-link KDEs (MLO GTK/IGTK/Link) for a link outside `links` are
+/// ignored, as hostap wpa_common.c `wpa_parse_generic` records every link
+/// and wpa.c consumes only requested/valid ones: hostapd's
+/// `wpa_auth_ml_kdes` sends an MLO Link KDE for every affiliated AP of the
+/// AP MLD, not only the links this station requested. A link id of 15 is
+/// not a link (`MAX_NUM_MLD_LINKS`).
 fn link_slot<'b, 'a>(
     slots: &'b mut [Option<&'a [u8]>; LINKS],
     link: u8,
     links: u16,
-) -> Result<&'b mut Option<&'a [u8]>, Error> {
-    if usize::from(link) >= LINKS || links & (1 << link) == 0 {
+) -> Result<Option<&'b mut Option<&'a [u8]>>, Error> {
+    if usize::from(link) >= LINKS {
         return Err(Error::Link);
     }
-    Ok(&mut slots[usize::from(link)])
+    Ok((links & (1 << link) != 0).then(|| &mut slots[usize::from(link)]))
+}
+fn set_link<'a>(
+    slots: &mut [Option<&'a [u8]>; LINKS],
+    link: u8,
+    links: u16,
+    value: &'a [u8],
+) -> Result<(), Error> {
+    match link_slot(slots, link, links)? {
+        Some(slot) => set(slot, value),
+        None => Ok(()),
+    }
 }
 fn parse(bytes: &[u8], links: u16) -> Result<Kdes<'_>, Error> {
     if bytes.len() > 4096 {
@@ -97,32 +113,25 @@ fn parse(bytes: &[u8], links: u16) -> Result<Kdes<'_>, Error> {
                         }
                         set(&mut result.mac, data)?;
                     }
+                    // wpa_common.h RSN_MLO_*: reserved bits are ignored on
+                    // receipt, as wpa_parse_generic ignores them.
                     16 => {
                         if data.len() < 7 {
                             return Err(Error::Link);
                         }
-                        if data[0] & 8 != 0 {
-                            return Err(Error::Flags);
-                        }
-                        set(link_slot(&mut result.gtk, data[0] >> 4, links)?, data)?;
+                        set_link(&mut result.gtk, data[0] >> 4, links, data)?;
                     }
                     17 => {
                         if data.len() < 9 {
                             return Err(Error::Link);
                         }
-                        if data[8] & 15 != 0 {
-                            return Err(Error::Flags);
-                        }
-                        set(link_slot(&mut result.igtk, data[8] >> 4, links)?, data)?;
+                        set_link(&mut result.igtk, data[8] >> 4, links, data)?;
                     }
                     19 => {
                         if data.len() < 7 {
                             return Err(Error::Link);
                         }
-                        if data[0] & 0xc0 != 0 {
-                            return Err(Error::Flags);
-                        }
-                        set(link_slot(&mut result.link, data[0] & 15, links)?, data)?;
+                        set_link(&mut result.link, data[0] & 15, links, data)?;
                     }
                     // No mixed legacy group keys, Extended Key ID, or
                     // unnegotiated beacon-protection/BIGTK in this profile.
@@ -187,18 +196,20 @@ pub fn message2(context: Context, association_ies: &[u8]) -> Result<Vec<u8>, Err
     message2_links(context, &[], association_ies)
 }
 /// M2 for a multiple-link association: after the MLD MAC KDE, one MLO Link
-/// KDE (link id, this station's link MAC, no RSNE/RSNXE) per further link
-/// the AP accepted, never for the association link (hostap wpa.c
-/// wpa_supplicant_send_2_of_4 over `mlo.req_links`).
+/// KDE (Link Information = link id with RSNE/RSNXE bits clear, then this
+/// station's link MAC) per further link that was *requested*, accepted or
+/// rejected, in ascending link id order and never for the association link
+/// (hostap wpa.c `wpa_mlo_link_kde` over `sm->mlo.req_links`; hostapd
+/// `wpa_auth_validate_ml_kdes_m2` counts the rejected links too).
 pub fn message2_links(
     context: Context,
-    further: &[Context],
+    requested: &[Context],
     association_ies: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    if association_ies.len() > 4084 - 13 * further.len() {
+    if association_ies.len() > 4084 - 13 * requested.len() {
         return Err(Error::Length);
     }
-    let links = further_mask(context, further.iter())?;
+    let links = further_mask(context, requested.iter())?;
     let parsed = parse(association_ies, links | 1 << context.link_id())?;
     if parsed.mac.is_some() || parsed.any_link_kde() {
         return Err(Error::Profile);
@@ -206,8 +217,11 @@ pub fn message2_links(
     let mut bytes = association_ies.to_vec();
     bytes.extend_from_slice(&[221, 10, 0, 0x0f, 0xac, 3]);
     bytes.extend_from_slice(&context.own_mld());
-    for link in further {
-        bytes.extend_from_slice(&[221, 11, 0, 0x0f, 0xac, 19, link.link_id()]);
+    for link_id in 0..LINKS as u8 {
+        let Some(link) = requested.iter().find(|link| link.link_id() == link_id) else {
+            continue;
+        };
+        bytes.extend_from_slice(&[221, 11, 0, 0x0f, 0xac, 19, link_id & 15]);
         bytes.extend_from_slice(&link.own_link());
     }
     Ok(bytes)
@@ -240,20 +254,23 @@ pub fn authenticated_keys(
     bytes: &[u8],
     profile: Profile<'_>,
 ) -> Result<Keys, Error> {
-    let mut keys = authenticated_link_keys(context, &[], kind, key_info, bytes, profile)?;
+    let mut keys = authenticated_link_keys(context, &[], &[], kind, key_info, bytes, profile)?;
     keys.pop().ok_or(Error::Key)
 }
-/// Multiple-link key delivery (hostap wpa.c
-/// wpa_validate_mlo_ieee8021x_3_of_4_kde and the MLO group-key handler):
-/// every link of the association, the association link first and then
-/// each `further` accepted link with that link's own AP RSNE/RSNXE, needs
-/// its MLO GTK KDE; M3 also needs each link's MLO Link KDE naming that
-/// link's AP address with RSNE (and RSNXE when advertised) identical to
-/// its beacon. A KDE for any link outside the association is refused. The
-/// result is in the same order: association link, then `further`.
+/// Multiple-link key delivery (hostap wpa.c `wpa_supplicant_process_3_of_4`
+/// and the MLO group-key handler): every link of the association, the
+/// association link first and then each `further` accepted link with that
+/// link's own AP RSNE/RSNXE, needs its MLO GTK KDE. M3 also needs an MLO
+/// Link KDE for every *requested* link, including each `rejected` one,
+/// naming that link's AP address with RSNE (and RSNXE when advertised)
+/// identical to its beacon (`wpa_supplicant_validate_link_kde` over
+/// `sm->mlo.req_links`); a rejected link's GTK is not consumed. KDEs for a
+/// link that was never requested are ignored. The result is in the same
+/// order: association link, then `further`.
 pub fn authenticated_link_keys(
     context: Context,
     further: &[(Context, Profile<'_>)],
+    rejected: &[(Context, Profile<'_>)],
     kind: Kind,
     key_info: u16,
     bytes: &[u8],
@@ -274,7 +291,10 @@ pub fn authenticated_link_keys(
     if key_info & required != required {
         return Err(Error::Flags);
     }
-    let links = further_mask(context, further.iter().map(|(link, _)| link))?;
+    let links = further_mask(
+        context,
+        further.iter().chain(rejected).map(|(link, _)| link),
+    )?;
     let parsed = parse(bytes, links | 1 << context.link_id())?;
     if kind == Kind::Pairwise3 && parsed.mac != Some(context.peer_mld().as_slice())
         || parsed
@@ -291,6 +311,13 @@ pub fn authenticated_link_keys(
     if let Some(rsnxe) = parsed.rsnxe {
         if Some(rsnxe) != profile.rsnxe {
             return Err(Error::Profile);
+        }
+    }
+    for (link, profile) in rejected {
+        match parsed.link[usize::from(link.link_id())] {
+            Some(kde) => link_profile(kde, *link, *profile)?,
+            None if kind == Kind::Pairwise3 => return Err(Error::Link),
+            None => {}
         }
     }
     let mut keys = Vec::with_capacity(1 + further.len());

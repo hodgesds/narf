@@ -69,13 +69,16 @@ impl Drop for LinkGroupKeys {
     }
 }
 
-/// A further accepted MLD link's identity and its own AP RSNE/RSNXE bodies
-/// (from that link's beacon), which its M3 MLO Link KDE must repeat.
+/// A further requested MLD link's identity and its own AP RSNE/RSNXE
+/// bodies (from that link's beacon), which its M3 MLO Link KDE must repeat.
+/// A rejected link (`accepted == false`) still appears in M2 and needs its
+/// M3 Link KDE (hostap `sm->mlo.req_links`) but delivers no group keys.
 #[derive(Clone)]
 pub(super) struct FurtherLinkSecurity {
     pub context: narf_wireless::association::mlo::Context,
     pub ap_rsn: Vec<u8>,
     pub ap_rsnxe: Option<Vec<u8>>,
+    pub accepted: bool,
 }
 
 impl core::fmt::Debug for KeyUpdate {
@@ -622,7 +625,8 @@ pub struct Session {
     /// Logical PTK/KDE identity is additive to the physical native peer.
     /// The caller must retain the matching firmware/physical link owner.
     mld: Option<Box<narf_wireless::association::mlo::Context>>,
-    /// Accepted further links of a multiple-link association.
+    /// Requested further links (accepted and rejected) of a multiple-link
+    /// association.
     further: Vec<FurtherLinkSecurity>,
     last_request: Vec<u8>,
     last_response: Vec<u8>,
@@ -709,10 +713,11 @@ impl Session {
         Ok(self)
     }
 
-    /// Bind the further links the AP accepted in a multiple-link
-    /// association response before the 4-way handshake starts. M2 then
-    /// names each with an MLO Link KDE and M3/group messages must deliver
-    /// every link's own GTK (and IGTK with PMF).
+    /// Bind every further link requested in a multiple-link association,
+    /// accepted or rejected, before the 4-way handshake starts. M2 names
+    /// each with an MLO Link KDE, M3 must carry each one's Link KDE, and
+    /// M3/group messages must deliver every accepted link's own GTK (and
+    /// IGTK with PMF).
     pub(super) fn with_further_links(
         &mut self,
         links: Vec<FurtherLinkSecurity>,
@@ -905,8 +910,8 @@ impl Session {
                 reply.key_data.extend_from_slice(station);
             }
             if let Some(context) = self.mld.as_deref() {
-                let further: Vec<_> = self.further.iter().map(|link| link.context).collect();
-                reply.key_data = mlo::message2_links(*context, &further, &reply.key_data)
+                let requested: Vec<_> = self.further.iter().map(|link| link.context).collect();
+                reply.key_data = mlo::message2_links(*context, &requested, &reply.key_data)
                     .map_err(|_| "native MLD M2 association/context mismatch")?;
             }
             self.ptk = Some(ptk);
@@ -992,25 +997,29 @@ impl Session {
                         (rsne, rsnxe)
                     })
                     .collect();
-                let further: Vec<_> = self
-                    .further
-                    .iter()
-                    .zip(&ies)
-                    .map(|(link, (rsne, rsnxe))| {
-                        (
-                            link.context,
-                            mlo::Profile {
-                                rsne,
-                                rsnxe: rsnxe.as_deref(),
-                                gtk_len: 16,
-                                igtk_len: Some(16),
-                            },
-                        )
-                    })
-                    .collect();
+                let profiles = |accepted: bool| -> Vec<_> {
+                    self.further
+                        .iter()
+                        .zip(&ies)
+                        .filter(|(link, _)| link.accepted == accepted)
+                        .map(|(link, (rsne, rsnxe))| {
+                            (
+                                link.context,
+                                mlo::Profile {
+                                    rsne,
+                                    rsnxe: rsnxe.as_deref(),
+                                    gtk_len: 16,
+                                    igtk_len: Some(16),
+                                },
+                            )
+                        })
+                        .collect()
+                };
+                let (further, rejected) = (profiles(true), profiles(false));
                 let mut keys = mlo::authenticated_link_keys(
                     *context,
                     &further,
+                    &rejected,
                     if pairwise_message {
                         mlo::Kind::Pairwise3
                     } else {

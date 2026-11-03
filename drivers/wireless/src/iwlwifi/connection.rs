@@ -913,18 +913,43 @@ impl Connection {
         }
         profile.check_response(&reply[6..])?;
         let mut valid_links = Vec::new();
+        let mut link_security = Vec::new();
+        let candidate_rsnxe: Vec<_> = further
+            .iter()
+            .map(|candidate| {
+                profile
+                    .rsn_extensions(&candidate.beacon.information_elements)
+                    .map(|extensions| extensions.1)
+            })
+            .collect();
         if let Some(plan) = profile.links.as_deref_mut() {
             plan.accept_mld_links(&reply[6..], response.aid)
                 .map_err(|_| "native MLD per-link association response invalid")?;
             let h2e = profile.sae.as_ref().is_some_and(|join| join.h2e());
-            for link in plan.mld_links().iter().filter(|link| link.accepted()) {
-                let candidate = further
+            // Every requested link, accepted or rejected, is named in M2
+            // and needs its M3 Link KDE (hostap wpa.c req_links).
+            for link in plan.mld_links() {
+                let at = further
                     .iter()
-                    .find(|candidate| {
+                    .position(|candidate| {
                         candidate.beacon.bssid == link.context().peer_link()
                             && candidate.own_link == link.context().own_link()
                     })
-                    .ok_or("native MLD accepted link was not requested")?;
+                    .ok_or("native MLD link response names an unrequested link")?;
+                let candidate = &further[at];
+                link_security.push(security::FurtherLinkSecurity {
+                    context: *link.context(),
+                    ap_rsn: candidate
+                        .beacon
+                        .rsn
+                        .clone()
+                        .ok_or("native MLD further link has no RSNE")?,
+                    ap_rsnxe: candidate_rsnxe[at].clone()?,
+                    accepted: link.accepted(),
+                });
+                if !link.accepted() {
+                    continue;
+                }
                 // mlme.c fails the association when an accepted link
                 // cannot be configured.
                 valid_links.push(admission.accept(
@@ -938,25 +963,11 @@ impl Connection {
                 )?);
             }
         }
-        if !valid_links.is_empty() {
-            let links = valid_links
-                .iter()
-                .map(|link| {
-                    Ok(security::FurtherLinkSecurity {
-                        context: link.context,
-                        ap_rsn: link
-                            .beacon
-                            .rsn
-                            .clone()
-                            .ok_or("native MLD further link has no RSNE")?,
-                        ap_rsnxe: profile.rsn_extensions(&link.beacon.information_elements)?.1,
-                    })
-                })
-                .collect::<Result<Vec<_>, &'static str>>()?;
+        if !link_security.is_empty() {
             this.security
                 .as_mut()
                 .ok_or("native MLD further links without a secure session")?
-                .with_further_links(links)?;
+                .with_further_links(link_security)?;
         }
         this.mld_links = valid_links;
         if let Some(client) = &this.client {
@@ -2319,13 +2330,19 @@ impl Connection {
                 return Err("AP disconnected");
             }
         }
-        let Some(ethernet) = frame_api::receive(
-            mpdu,
-            local,
-            peer,
-            self.security.is_some(),
-            self.replay_for(queue),
-        ) else {
+        let secure = self.security.is_some();
+        let received = match self.further_group_link(mpdu, queue) {
+            Some(index) => {
+                self.replay
+                    .swap_group(&mut self.mld_links[index].group_replay);
+                let received = frame_api::receive(mpdu, local, peer, secure, &mut self.replay);
+                self.replay
+                    .swap_group(&mut self.mld_links[index].group_replay);
+                received
+            }
+            None => frame_api::receive(mpdu, local, peer, secure, self.replay_for(queue)),
+        };
+        let Some(ethernet) = received else {
             return Ok(None);
         };
         if self.mld.is_some() && ethernet.get(12..14) == Some(&[0x88, 0x8e]) {
@@ -2340,6 +2357,24 @@ impl Connection {
                 .push_back((self.receive_epoch, hash.finalize()));
         }
         Ok(Some(ethernet))
+    }
+
+    /// The active further link whose own group replay table checks this
+    /// group-addressed MPDU: mac80211 looks a group frame's key up on the
+    /// receiving link (`rx->link->gtk[idx]`, rx.c) with that key's own RX
+    /// PN. Group data stays on fallback queue0.
+    fn further_group_link(&self, mpdu: &scan_api::Mpdu<'_>, queue: usize) -> Option<usize> {
+        let mld = self.mld.as_ref()?;
+        if queue != 0 || mpdu.frame.get(4).is_none_or(|addr1| addr1 & 1 == 0) {
+            return None;
+        }
+        let link = mld.receiving_link(mpdu)?;
+        if link == mld.primary().spec_link {
+            return None;
+        }
+        self.mld_links
+            .iter()
+            .position(|valid| valid.link_id() == link && valid.active.is_some())
     }
 
     /// Pairwise SEC_KEY STA mask: every active link STA.
@@ -2403,6 +2438,17 @@ impl Connection {
                 }
             }
         }
+        // A changed GTK adopts its authenticated floor in this link's own
+        // replay table; an identical retransmission never resets it.
+        if self.mld_links[index]
+            .keys
+            .as_ref()
+            .is_none_or(|old| old.group != keys.group || old.group_id != keys.group_id)
+        {
+            self.mld_links[index]
+                .group_replay
+                .install(keys.group_id, keys.group_rx_pn);
+        }
         self.mld_links[index].keys = Some(keys);
         Ok(())
     }
@@ -2436,7 +2482,7 @@ impl Connection {
         let mut ids = hw.mld_fw_ids()?;
         ids.claim(primary.fw_link, primary.station)?;
         let (fw_link, station) = ids.allocate()?;
-        let phy_id = super::sc_mlo::PhyIds::station().allocate()?;
+        let phy_id = hw.mld_phy_ids().allocate()?;
         let valid = &self.mld_links[index];
         let owner = super::sc_mlo::LinkOwner {
             spec_link: link_id,

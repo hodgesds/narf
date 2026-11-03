@@ -333,13 +333,18 @@ association link's plan state is untouched) and returns the accepted Link
 ID mask; a second call or invalid AID is `Busy`. `MldLink::response_elements()`
 is that accepted link's inherited response view (`None` otherwise).
 
-EAPOL (hostap wpa.c): `eapol::mlo::message2_links(context, further, ies)`
-appends, after the MLD MAC KDE, one MLO Link KDE (link id, own link MAC, no
-RSNE/RSNXE) per accepted further link, never for the association link.
-`eapol::mlo::authenticated_link_keys(context, further, kind, info, data,
-profile)` returns per-link `Keys` (association link first): every link needs
-its MLO GTK KDE, M3 every link's MLO Link KDE with that link's own AP RSNE/
-RSNXE, and a per-link KDE naming any link outside the association is refused.
+EAPOL (hostap wpa.c, re-verified against w1.fi master 2026-11-03):
+`eapol::mlo::message2_links(context, requested, ies)` appends, after the MLD
+MAC KDE, one MLO Link KDE (link id, own link MAC, no RSNE/RSNXE) per
+*requested* further link, accepted or rejected, in ascending link id order
+(`wpa_mlo_link_kde` over `req_links`), never for the association link.
+`eapol::mlo::authenticated_link_keys(context, further, rejected, kind, info,
+data, profile)` returns per-link `Keys` (association link, then `further`):
+every accepted link needs its MLO GTK KDE; M3 needs every requested link's
+MLO Link KDE, including each `rejected` one, with that link's own AP RSNE/
+RSNXE (`wpa_supplicant_validate_link_kde`). Per-link KDEs naming a link
+that was never requested are ignored (hostapd `wpa_auth_ml_kdes` names
+every affiliated AP); link id 15 is refused; reserved bits are ignored.
 MLO BIGTK stays refused (beacon protection is not negotiated).
 
 **UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**

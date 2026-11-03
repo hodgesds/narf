@@ -476,7 +476,7 @@ fn negative_and_rekey() -> Result<(), &'static str> {
             1 => data[link] ^= 1,
             2 => data[link + 1] ^= 2,
             3 => data[link + 9] ^= 1,
-            4 => data[gtk] |= 8,
+            4 => data[gtk] ^= 0x10,
             5 => data[gtk] = 0x42,
             6 => {
                 let copy = data[gtk - 6..gtk + 23].to_vec();
@@ -690,7 +690,9 @@ fn multi_link_kdes() -> Result<(), &'static str> {
         gtk_len: 16,
         igtk_len: Some(16),
     };
-    // M2: MLD MAC KDE, then one MLO Link KDE (no RSNE) per further link.
+    // M2: MLD MAC KDE, then one MLO Link KDE (no RSNE) per requested
+    // further link, accepted or rejected, in ascending link id order
+    // (hostap wpa.c wpa_mlo_link_kde over req_links).
     let m2 = mlo::message2_links(assoc, &[link], &[]).map_err(|_| "multi-link M2")?;
     let mut expected = field(3, &OWN_MLD);
     let mut info = vec![2];
@@ -699,6 +701,14 @@ fn multi_link_kdes() -> Result<(), &'static str> {
     if m2 != expected || mlo::message2_links(assoc, &[assoc], &[]) != Err(E::Profile) {
         return Err("multi-link M2 Link KDE layout or assoc-link exclusion");
     }
+    let m2 = mlo::message2_links(assoc, &[further_context(4), link], &[])
+        .map_err(|_| "multi-link M2 with a rejected link")?;
+    let mut info4 = vec![4];
+    info4.extend_from_slice(&OWN_LINK2);
+    expected.extend_from_slice(&field(19, &info4));
+    if m2 != expected {
+        return Err("multi-link M2 omitted a requested link or broke link order");
+    }
     let flags =
         crate::eapol::KI_ENCRYPTED_KEY_DATA | crate::eapol::KI_INSTALL | crate::eapol::KI_SECURE;
     let mut m3 = keys(assoc, [1; 16], IGTK, true);
@@ -706,6 +716,7 @@ fn multi_link_kdes() -> Result<(), &'static str> {
     let got = mlo::authenticated_link_keys(
         assoc,
         &[(link, profile)],
+        &[],
         Kind::Pairwise3,
         flags,
         &m3,
@@ -730,6 +741,7 @@ fn multi_link_kdes() -> Result<(), &'static str> {
     if mlo::authenticated_link_keys(
         assoc,
         &[(link, profile)],
+        &[],
         Kind::Pairwise3,
         flags,
         &unlinked,
@@ -738,6 +750,7 @@ fn multi_link_kdes() -> Result<(), &'static str> {
         || mlo::authenticated_link_keys(
             assoc,
             &[(link, profile)],
+            &[],
             Kind::Group1,
             crate::eapol::KI_ENCRYPTED_KEY_DATA,
             &group,
@@ -746,21 +759,56 @@ fn multi_link_kdes() -> Result<(), &'static str> {
     {
         return Err("multi-link M3/group accepted a missing per-link KDE");
     }
-    // A KDE for a link outside the association is refused, and the
-    // single-link profile still refuses any affiliated link's KDE.
+    // A requested-but-rejected link still needs its M3 Link KDE (hostap
+    // wpa_supplicant_validate_link_kde over req_links); its GTK is unused.
+    let rejected = mlo::authenticated_link_keys(
+        assoc,
+        &[],
+        &[(link, profile)],
+        Kind::Pairwise3,
+        flags,
+        &m3,
+        profile,
+    )
+    .map_err(|_| "multi-link M3 with a rejected link refused")?;
+    if rejected.len() != 1
+        || rejected[0].link_id != 1
+        || mlo::authenticated_link_keys(
+            assoc,
+            &[],
+            &[(link, profile)],
+            Kind::Pairwise3,
+            flags,
+            &unlinked,
+            profile,
+        ) != Err(E::Link)
+    {
+        return Err("multi-link M3 rejected-link Link KDE not enforced");
+    }
+    // KDEs for a link that was never requested are ignored: hostapd sends
+    // a Link KDE for every affiliated AP (wpa_auth_ml_kdes). A link id of
+    // 15 is not a link.
     let mut stranger = m3.clone();
-    stranger.extend_from_slice(&further_kdes(3, false, [9; 16]));
+    stranger.extend_from_slice(&further_kdes(3, true, [9; 16]));
+    let mut fifteen = m3.clone();
+    fifteen.extend_from_slice(&further_kdes(15, false, [9; 16]));
     if mlo::authenticated_link_keys(
         assoc,
         &[(link, profile)],
+        &[],
         Kind::Pairwise3,
         flags,
         &stranger,
         profile,
-    ) != Err(E::Link)
-        || mlo::authenticated_keys(assoc, Kind::Pairwise3, flags, &m3, profile) != Err(E::Link)
+    )
+    .map(|keys| keys.len())
+        != Ok(2)
+        || mlo::authenticated_keys(assoc, Kind::Pairwise3, flags, &m3, profile)
+            .map(|keys| keys.gtk.key)
+            != Ok(vec![1; 16])
+        || mlo::authenticated_keys(assoc, Kind::Pairwise3, flags, &fifteen, profile) != Err(E::Link)
     {
-        return Err("per-link KDE outside the association accepted");
+        return Err("unrequested-link KDE handling diverges from hostap");
     }
     Ok(())
 }

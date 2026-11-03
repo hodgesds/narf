@@ -2,7 +2,7 @@
 //! ownership and disjoint selectors. Neither inherits Sc/Bz's AUX ROC6.
 //! Linux mvm/{phy-ctxt,link,mld-sta,mld-mac80211,time-event}.c.
 use super::*;
-const PHY: u32 = 1;
+pub(super) const PHY: u32 = 1;
 
 fn link(action: u32, own: [u8; 6], channel: Channel, active: bool) -> [u8; 208] {
     let mut body =

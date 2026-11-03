@@ -66,7 +66,34 @@ pub struct Replay {
     amsdu_key: [u8; 17],
 }
 
+/// One further MLD link's group-key receive floors, per key index and TID.
+/// mac80211 keeps a GTK per link (`rx->link->gtk[idx]`, rx.c) with its own
+/// `rx_pn[queue]` (wpa.c `ieee80211_crypto_ccmp_decrypt`); pairwise PN and
+/// duplicate/A-MSDU tracking stay MLD-wide.
+#[derive(Debug, Default, Clone)]
+pub struct GroupReplay {
+    pub group: [[u64; 17]; 4],
+    pub valid: [bool; 4],
+}
+
+impl GroupReplay {
+    /// Adopt a newly installed GTK's authenticated receive floor.
+    pub fn install(&mut self, key_id: u8, rx_pn: u64) {
+        let id = usize::from(key_id & 3);
+        self.group[id].fill(rx_pn);
+        self.valid[id] = true;
+    }
+}
+
 impl Replay {
+    /// Exchange the group floors with one further link's table, so a group
+    /// frame received on that link is checked (and advances) only that
+    /// link's GTK replay state. Call again to restore.
+    pub fn swap_group(&mut self, link: &mut GroupReplay) {
+        core::mem::swap(&mut self.group, &mut link.group);
+        core::mem::swap(&mut self.group_valid, &mut link.valid);
+    }
+
     pub fn reset_pairwise(&mut self) {
         self.pairwise.fill(0);
         self.reset_subframes();

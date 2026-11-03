@@ -139,3 +139,45 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
     smoke_iwl_mld_further_link_key_queue_baid_bodies
 );
+
+fn smoke_iwl_mld_shared_id_pool_and_per_link_group_replay() -> TestResult {
+    // Linux shares link/STA/PHY id pools across vifs: with a P2P DEVICE
+    // holding FW link1, its last-station aux id and PHY1, a further MLD
+    // link takes link2/STA1/PHY2, never an alias.
+    let Ok(mut ids) = FwIds::new(Some(3), Some(4)) else {
+        return TestResult::Fail("FwIds refused actual counts");
+    };
+    if ids.claim(1, 3).is_err() || ids.claim(0, 0).is_err() || ids.allocate() != Ok((2, 1)) {
+        return TestResult::Fail("further link aliased a reserved P2P link/station id");
+    }
+    let mut full = FwIds::new(Some(2), Some(4)).unwrap();
+    if full.claim(1, 3).is_err() || full.claim(0, 0).is_err() || full.allocate().is_ok() {
+        return TestResult::Fail("exhausted FW link pool still allocated");
+    }
+    let mut phys = PhyIds::station();
+    phys.claim(1);
+    if phys.allocate() != Ok(2) || phys.allocate().is_ok() {
+        return TestResult::Fail("further link PHY aliased P2P PHY1");
+    }
+    // A further link's group frames use only that link's floors.
+    use super::super::frame_api::{GroupReplay, Replay};
+    let mut replay = Replay::default();
+    replay.group[1].fill(100);
+    replay.group_valid[1] = true;
+    let mut link = GroupReplay::default();
+    link.install(1, 5);
+    replay.swap_group(&mut link);
+    if replay.group[1][0] != 5 || !replay.group_valid[1] || replay.group_valid[2] {
+        return TestResult::Fail("further link group floor not selected");
+    }
+    replay.group[1][0] = 6;
+    replay.swap_group(&mut link);
+    if replay.group[1][0] != 100 || link.group[1][0] != 6 || link.group[1][1] != 5 {
+        return TestResult::Fail("per-link group PN leaked across links");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_shared_id_pool_and_per_link_group_replay
+);
