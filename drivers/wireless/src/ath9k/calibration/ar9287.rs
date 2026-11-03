@@ -48,7 +48,7 @@ pub(in crate::ath9k) struct Limits {
 }
 impl Limits {
     /// `ath9k_hw_nf_sanitize` for one reading.
-    pub(super) fn sanitize(self, raw: i16) -> i16 {
+    pub(in crate::ath9k) fn sanitize(self, raw: i16) -> i16 {
         if raw > self.max {
             self.max
         } else if raw < self.min {

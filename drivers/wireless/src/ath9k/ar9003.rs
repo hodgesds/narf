@@ -13,6 +13,7 @@
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 pub(super) mod board;
+pub(super) mod calib;
 pub(super) mod edma;
 pub(super) mod eeprom;
 pub(super) mod ini;

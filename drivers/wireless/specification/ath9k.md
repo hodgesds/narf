@@ -2089,8 +2089,49 @@ and the status ring belong to the EDMA packet owner). `rf_silent` decodes
 is `ath_is_rfkill_set` over the `AR_GPIO_IN` 0x404c bit. Smoke (written,
 not executed): `smoke_ath9k_ar9300_mac_profile_dma_clock_and_rf_silent`.
 
-Still to port before `ar9300_enablement` can be claimed: `ar9003_calib.c`, signed AR9300 records and the
-probe/station/retune/reset/periodic/suspend owner.
+AR9003 calibration (step 4). `ar9003/calib.rs::Calibration::run` is
+`ar9003_hw_init_bb` (`AR_PHY_ACTIVE_EN`, `ath9k_hw_synth_delay` over
+`AR_PHY_RX_DELAY` 0xa254 + `BASE_ACTIVATE_DELAY`) and the PCOEM
+`ar9003_hw_init_cal_pcoem` as it runs on AR9300 (no `ATH9K_HW_CAP_RTT`, no
+MCI, fresh channel calibration data as `ath9k_hw_reset` leaves it): chip
+chain masks (`ar9003_hw_set_chain_masks`, APM-reduced selfgen), `TX_CL_CAL`
+from the INI `AR_PHY_CL_CAL_ENABLE` fact sets `AR_PHY_CL_CAL_CTL` and
+forces the AGC calibration, `TX_IQ_CAL` programs the
+`AR_PHY_TX_IQCAL_CONTROL_1` `DELPT` 32 field (without
+`TX_IQ_ON_AGC_CAL`, which is `AR_SREV_9485_OR_LATER`, Linux never runs
+`ar9003_hw_tx_iq_cal_post_proc` or `_reload` on AR9300), the carrier-leak
+bracket (PHY inactive, 5 µs, `RX_DELAY_DELAY`, PHY active; INI delay
+restored after), the AGC `CAL` poll for `AH_WAIT_TIMEOUT`, the
+`ar9003_hw_manual_peak_cal` CALDAC binary search per receiving chain (run
+whatever the poll returned), the `CLC_SUCCESS` sample of
+`ar9003_hw_cl_cal_post_proc`, runtime chain masks and
+`ar9003_hw_init_cal_common` (IQ mismatch calibration started with
+`PER_MAX_LOG_COUNT`). An AGC timeout fails the attempt (`ath9k_hw_reset`
+`-EIO`). `Periodic::start` is the reset tail's `ath9k_hw_loadnf`
+(result ignored as Linux) + `ath9k_hw_start_nfcal(ah, true)`;
+`Periodic::tick` is `ath_ani_calibrate` without ANI over
+`ar9003_hw_calibrate`: the one-entry circular IQ list (no AR9003
+calibration timeout; `ar9003_hw_iqcal_collect` accumulates the
+`ah->txchainmask` chains of `AR_PHY_CAL_MEAS_0/1/2`,
+`ar9003_hw_iqcalibrate` over `numChains` with the `> 0x80000000` sign
+test, ±63 clamps, 7-bit `AR_PHY_RX_IQCAL_CORR_B0/1/2` fields and the
+chain-0 enable), the 20 min `ath9k_hw_reset_calvalid` restart, and on
+the 30 s long calibration `ath9k_hw_getnf` (`ar9003_hw_do_getnf` over
+`AR_PHY_CCA_0/1/2`, `ath9k_hw_nf_sanitize` with the AR9300 limits
+-110/-125/-60 (2 GHz) and -115/-125/-60 (5 GHz), the five-entry history),
+`ath9k_hw_loadnf` (a 22.2 ms timeout closes the generation, Linux's
+`RESET_TYPE_CALIBRATION`) and `ath9k_hw_start_nfcal(ah, false)`. The IQ
+totals are never cleared in Linux (`ath_hw` lifetime); `IqTotals` is
+carried by the owner across generations. Policy over Linux: the NF history
+is seeded from this channel's interpolated `nf_cal` (Linux reads the
+band's value the previous `ath9k_hw_apply_txpower` left); the
+`caldata->tx_clcal` copy is not kept (only fast channel change, not
+ported, would reload it). Smokes (written, not executed):
+`smoke_ath9k_ar9300_init_and_periodic_calibration`,
+`smoke_ath9k_ar9300_calibration_refusals`.
+
+Still to port before `ar9300_enablement` can be claimed: signed AR9300
+records and the probe/station/retune/reset/periodic/suspend owner.
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
