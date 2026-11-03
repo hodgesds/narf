@@ -65,6 +65,7 @@ pub mod rtl8192e_init;
 mod rtl8192e_iqk;
 pub mod rtl8192e_packet;
 mod rtl8192e_phy;
+pub mod rtl8192e_policy;
 mod rtl8192e_power;
 mod rtl8192e_ra;
 mod rtl8192e_radio;

@@ -1213,6 +1213,55 @@ EP0 transfer/executable-cap discipline; chip steps live in
   wrongly listed as RTL8192EU and are now unbound/Unknown (no RTL8192FU
   owner exists).
 
+#### RTL8192EU signed records (`N92P` v1)
+
+`rtl8192e_policy::Calibration::load_registered(factory, vid, pid)` opens
+only `rtl8xxxu/rtl8192eu-cal-v1-<12 lowercase MAC hex digits>.bin` through
+the current firmware-registry capability, with mandatory signer metadata
+(as N8PC). The private parser cannot mint a permission. Linux
+`8192e.c::rtl8192e_set_tx_power` programs raw factory indices and has no
+dBm conversion or board curve, so the record qualifies exactly the indices
+`rtl8192e_phy::tx_power` programs; no board value ships in the tree.
+Integers are little endian. Header (128 bytes):
+
+| Offset | Value |
+|---|---|
+| 0 | magic `N92P` (distinct from 8188EU `N8PC`/`N8HT`) |
+| 4 | version:u16 = 1 |
+| 6 | header bytes:u16 = 128 |
+| 8 | exact total payload bytes:u32 |
+| 12 | USB VID:u16, 14 PID:u16, 16 chip:u16 = 0x8192 |
+| 18 | cut, 19 profile = 1 (USB 2.4 GHz HT20/40 station, no power tracking), 20 `tx_paths` (1 = RTL8191EU 1T2R, 2), 21 ROM rev |
+| 22 | factory MAC[6] |
+| 28 | path A then B: CCK[6], HT40[5], OFDM/HT20/HT40 diffs[4] each (23 bytes per path, diffs as two's-complement bytes) |
+| 74 | crystal cap, channel plan, thermal, board option, antenna option, PA type, LNA type, IQK/LCK |
+| 82 | envelope:u8 = 1 (whole qualified board operating envelope), 83 reserved = 0 |
+| 84 | maximum antenna gain:i16 quarter-dBi 0..128; 86 board-qualified EIRP:i16 quarter-dBm -512..256 |
+| 88 | rows:u16 1..31, 90 reserved = 0 |
+| 92 | admitted RA mask:u32 (`DESC_RATE` bits 0..27; nonzero; no bit ≥ 28; MCS8..15 refused when `tx_paths = 1`) |
+| 96 | reserved[32] = 0 |
+
+Each 28-byte row: primary channel (1..13), width code (0 = HT20, also used
+for non-HT 20 MHz; 1 = HT40 secondary above, primary 1..9; 2 = below,
+primary 5..13), reserved[2]; then per path A, B: the programmed CCK, OFDM
+and MCS indices (must equal `tx_power` for that EFUSE/channel/width),
+reserved, then CCK/OFDM/MCS conducted upper bounds:i16 quarter-dBm
+(-512..256, or `0x7fff` unknown), reserved:i16. Rows strictly increase by
+(channel, width). A 1T2R board's path-B bounds must all be unknown.
+
+`Calibration::permission(domain, primary, width)`: every regulatory rule
+overlapping the occupied span (center ±10 MHz, or the full 40 MHz pair)
+must cover it entirely, allow that width and carry no flags; the most
+restrictive dBm ceiling (as EIRP) is intersected with the board EIRP. For
+each rate class the admitted mask contains (CCK, OFDM, MCS), every TX
+path's bound must be known; two chains add 13 quarter-dB (≥ 3.0103 dB,
+never rounded down); bound + antenna gain must not exceed the ceiling.
+An unknown or excessive class refuses the channel — the admitted mask is
+never narrowed. The opaque `Permission` carries the primary/width and the
+admitted mask that `Ra::new` takes; `Permission::check` revalidates the
+exact factory/VID/PID/channel/width before programming. Synthetic test
+records validate format/arithmetic only.
+
 The owner reaches `RadioReady` for RTL8192EU after calibration. The production
 probe stays detection-only for this family; no table, calibration, packet
 or station capability is advertised.
