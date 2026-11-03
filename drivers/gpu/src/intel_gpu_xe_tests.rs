@@ -1903,6 +1903,55 @@ kernel_test_in!(
     smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
 );
 
+/// MTL/Arrow standalone media GT1 is initialized beside GT0 but not yet
+/// scheduled: the GT list and engine query stay GT0-only, and every media or
+/// gt_id 1 placement refuses with EINVAL before any queue, context or GGTT
+/// allocation (Linux xe_hw_engine_lookup returns no engine for it).
+fn smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation() -> TestResult {
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (_, info) = setup(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let gts = xe_query(&file, &info, &user, 3);
+    assert_eq!(gts.len(), 8 + 96);
+    assert_eq!(u32_at(&gts, 0), 1, "only GT0 is published");
+    assert_eq!(&gts[8..14], &[0u8; 6], "type MAIN, tile 0, gt_id 0");
+    let engines = xe_query(&file, &info, &user, 0);
+    let count = u32_at(&engines, 0) as usize;
+    assert_eq!(engines.len(), 8 + count * 32);
+    for entry in engines[8..].chunks_exact(32) {
+        let class = u16::from_le_bytes([entry[0], entry[1]]);
+        assert!(!matches!(class, 2 | 3), "no VCS/VECS engine is published");
+        assert_eq!(&entry[4..6], &[0, 0], "every engine is on GT0");
+    }
+    let vm = create_vm(&file, &info, &user);
+    let before = arena.live_allocations();
+    for (class, gt_id) in [(2u8, 1u8), (3, 1), (2, 0), (3, 0), (0, 1), (1, 1), (4, 1)] {
+        user.wire.store(512, &[class, 0, 0, 0, gt_id, 0, 0, 0]);
+        let mut queue = [0; 48];
+        put32(&mut queue, 8, 0x00010001);
+        put32(&mut queue, 12, vm);
+        put64(&mut queue, 24, 512);
+        user.wire.store(64, &queue);
+        assert_eq!(
+            invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
+            Err(FsError::InvalidData)
+        );
+        assert_eq!(u32_at(&user.wire.load(64, 48), 20), 0, "no queue id");
+    }
+    assert_eq!(arena.live_allocations(), before);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation
+);
+
 mod gen12_media {
     include!("intel_gpu_gen12_media_ioctl_tests.rs");
 }
