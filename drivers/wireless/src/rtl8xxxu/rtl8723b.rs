@@ -100,29 +100,10 @@ pub fn channel_valid(channel: u8) -> bool {
     (CHANNEL_MIN..=CHANNEL_MAX).contains(&channel)
 }
 
-// ── BT coexistence wiring ──────────────────────────────────────────
+// ── BT coexistence ─────────────────────────────────────────────────
 
-/// Re-export the BT coex decision logic so callers can drive the 8723BU
-/// PTA from a single namespace.
-pub use super::btcoex::{
-    coex_table_write_for_type, coex_type_for_state, Bt8723b1AntStatus, BtLinkProfile,
-    CoexTableWrite, CoexType, REG_BT_COEX_TABLE1, REG_BT_COEX_TABLE2, REG_BT_COEX_TABLE3,
-    REG_BT_COEX_TABLE4,
-};
-
-/// Apply a BT coex table-write set via the supplied register writers.
-///
-/// Source: `core.c::rtl8723bu_set_coex_with_type` L5867..L5916.
-pub fn apply_coex_table_write<W32: FnMut(u16, u32), W8: FnMut(u16, u8)>(
-    write: &CoexTableWrite,
-    mut write32: W32,
-    mut write8: W8,
-) {
-    write32(REG_BT_COEX_TABLE1, write.table1);
-    write32(REG_BT_COEX_TABLE2, write.table2);
-    write32(REG_BT_COEX_TABLE3, write.table3);
-    write8(REG_BT_COEX_TABLE4, write.table4);
-}
+/// The Linux rtl8xxxu 8723BU coexistence policy (`btcoex`).
+pub use super::btcoex::{coex_table, Action, BtStatus, Coex};
 
 // ── Init function wiring ───────────────────────────────────────────
 

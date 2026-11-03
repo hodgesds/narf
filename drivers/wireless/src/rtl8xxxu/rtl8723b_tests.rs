@@ -766,3 +766,95 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8723bu",
     smoke_rtl8723bu_packet_signal_and_ra
 );
+
+fn smoke_rtl8723bu_bt_coex_policy() -> TestResult {
+    use super::btcoex::{bt_info, coex_table, BtStatus, Coex};
+    if coex_table(0) != Some((0x5555_5555, 0x5555_5555, 0x00ff_ffff))
+        || coex_table(1) != coex_table(3)
+        || coex_table(4) != Some((0x5a5a_5a5a, 0xaaaa_5a5a, 0x00ff_ffff))
+        || coex_table(5) != Some((0x5a5a_5a5a, 0xaa5a_5a5a, 0x00ff_ffff))
+        || coex_table(7) != Some((0xaaaa_aaaa, 0xaaaa_aaaa, 0x00ff_ffff))
+        || coex_table(8).is_some()
+    {
+        return TestResult::Fail("8723bu coex tables");
+    }
+    if bt_info(9, &[0, 0x29]) != Some(0x29)
+        || bt_info(9, &[0]).is_some()
+        || bt_info(8, &[0, 1]).is_some()
+    {
+        return TestResult::Fail("8723bu BT info C2H byte");
+    }
+    let mut c = Coex::default();
+    // Connected, ACL busy, HID only.
+    c.update_link_info(0x01 | 0x08 | 0x20);
+    if c.bt_status != BtStatus::AclBusy || !c.bt_busy || !c.hid_only || c.has_a2dp {
+        return TestResult::Fail("8723bu HID-only link info");
+    }
+    let a = c.info_action(true, 0);
+    if a.tdma != [0x61, 0x20, 0x03, 0x11, 0x11] || a.coex_type != 5 {
+        return TestResult::Fail("8723bu HID-only policy");
+    }
+    // A2DP + PAN: Linux's has_a2dp rewrite clears A2DP (PAN present), so
+    // this falls through to the default busy branch.
+    c.update_link_info(0x01 | 0x08 | 0x40 | 0x80);
+    if c.has_a2dp || c.a2dp_only || !c.has_pan {
+        return TestResult::Fail("8723bu A2DP rewrite quirk");
+    }
+    let a = c.info_action(true, 0);
+    if a.tdma != [0x61, 0x35, 0x03, 0x11, 0x11] || a.coex_type != 4 {
+        return TestResult::Fail("8723bu A2DP+PAN policy");
+    }
+    // SCO busy; idle with high-priority traffic thresholds.
+    c.update_link_info(0x01 | 0x02);
+    if c.bt_status != BtStatus::ScoBusy || !c.has_sco {
+        return TestResult::Fail("8723bu SCO status");
+    }
+    c.update_link_info(0x01);
+    if c.bt_status != BtStatus::ConnectedIdle
+        || c.bt_busy
+        || c.info_action(true, 30 | 30 << 16).coex_type != 2
+        || c.info_action(true, 31 | 30 << 16).coex_type != 7
+        || c.info_action(false, 0).coex_type != 0
+    {
+        return TestResult::Fail("8723bu idle policy");
+    }
+    c.update_link_info(0);
+    if c.bt_status != BtStatus::NonConnectedIdle || c.has_hid {
+        return TestResult::Fail("8723bu disconnected link info");
+    }
+    // Inquiry: connected + PAN while associated.
+    c.update_link_info(0x01 | 0x04 | 0x80);
+    let a = c.inquiry_action(true);
+    if !c.c2h_bt_inquiry || a.tdma != [0x61, 0x3f, 0x03, 0x11, 0x11] || a.coex_type != 4 {
+        return TestResult::Fail("8723bu inquiry policy");
+    }
+    if c.inquiry_action(false).coex_type != 0 {
+        return TestResult::Fail("8723bu inquiry unassociated");
+    }
+    // Owner path: C2H BT info → TDMA H2C → coex table registers.
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    io.0.lock().regs[0x770..0x774].copy_from_slice(&(100u32).to_le_bytes());
+    let mut coex = Coex::default();
+    let record = super::rtl8192e_packet::C2h::Other {
+        id: 9,
+        seq: 0,
+        payload: vec![0, 0x01],
+    };
+    match narf_scheduler::block_on(owner.c2h_bt_8723b(&mut coex, &record, true)) {
+        Ok(Some(a)) if a.coex_type == 7 => {}
+        _ => return TestResult::Fail("8723bu C2H BT info dispatch"),
+    }
+    if h2c_words(&io) != vec![vec![0x60, 0x08, 0, 0]]
+        || io.writes(0x06c0) != vec![0xaaaa_aaaau32.to_le_bytes().to_vec()]
+        || io.writes(0x06cc) != vec![vec![0x03]]
+    {
+        return TestResult::Fail("8723bu coex programming");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_bt_coex_policy
+);

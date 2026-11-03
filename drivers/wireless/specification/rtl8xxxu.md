@@ -1436,8 +1436,25 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   (`rtl8xxxu_gen2_report_rssi` truncates for RTL8723B) in
   `Owner::ra_watchdog_8723b`.
 
-BT coexistence, signed records and the station are not implemented, and
-the production probe does not start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
+- BT coexistence (`rtl8xxxu/btcoex.rs`, replacing an invented decision
+  matrix with zero-valued tables): exactly Linux rtl8xxxu, which has no
+  vendor halbtc engine. `bt_info` takes byte 1 of a `C2H_8723B_BT_INFO`
+  (id 9) body; `Coex::update_link_info` is `rtl8723bu_update_bt_link_info`
+  (status ConnectedIdle/ScoBusy/AclBusy/Max, profile bits, `hid_only`, and
+  Linux's `has_a2dp` rewrite where `a2dp_only` was meant, so `a2dp_only` is
+  never set), `inquiry_action` is `rtl8723bu_handle_bt_inquiry` and
+  `info_action` is `rtl8723bu_handle_bt_info` (associated: busy profile
+  TDMA/table choices, else the `0x770` high-priority TX+RX ≤ 60 → table 2,
+  else 7; unassociated: TDMA `0x08` + table 0). `coex_table` is
+  `rtl8723bu_set_coex_with_type` (types 0..7, TABLE4 `0x03`, others write
+  nothing). `Owner::c2h_bt_8723b` is the BT-info case of
+  `rtl8xxxu_c2hcmd_callback` (update, inquiry or info policy, then
+  `rtl8723bu_set_ps_tdma` and the table); RA reports are left to the
+  caller. `assoc` is `rtl8xxxu_is_assoc` supplied by the station.
+
+Signed records and the station are not implemented, and the production
+probe does not start an RTL8723BU owner; C2H BT-info records are therefore
+not yet routed from a live receive path. USB IDs are exactly Linux `core.c::dev_table`
 `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
