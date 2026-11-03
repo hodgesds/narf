@@ -130,19 +130,31 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
         );
     }
     // There is no create property or dynamic low-latency mutation in Xe.
-    // Unknown properties and the unsupported runtime setter stay refused.
-    // PXP_TYPE (2) follows exec_queue_set_pxp_type: its NONE value is
-    // accepted, and smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos
-    // pins every PXP_TYPE errno.
-    for property in [3, 6] {
+    // Property 6 is past exec_queue_set_property_funcs, so -EINVAL, and the
+    // runtime setter stays refused. PXP_TYPE (2) follows
+    // exec_queue_set_pxp_type: its NONE value is accepted, and
+    // smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos pins every
+    // PXP_TYPE errno. HANG_REPLAY_STATE (3) first vmemdup_user()s
+    // xe_gt_lrc_hang_replay_size bytes, three pages for an Xe2 RCS image:
+    // NULL and an image one byte short of the user range are -EFAULT, and a
+    // readable one reaches NARF's LINUX-GAP refusal (Linux would create the
+    // queue from it); smoke_xe_exec_queue_extensions_follow_linux_check_order
+    // pins the rest of the chain's order.
+    for (property, value, error) in [
+        (6, 0, FsError::InvalidData),
+        (3, 0, FsError::BadAddress),
+        (3, 32768 - 3 * 4096 + 1, FsError::BadAddress),
+        (3, 32768 - 3 * 4096, FsError::NotImplemented),
+    ] {
         queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
         let mut ext = [0; 48];
         put32(&mut ext, 16, property);
+        put64(&mut ext, 24, value);
         user.wire.store(8192, &ext);
         user.wire.store(64, &8192u64.to_le_bytes());
         assert_eq!(
             invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
-            Err(FsError::NotImplemented)
+            Err(error)
         );
     }
     assert_eq!(

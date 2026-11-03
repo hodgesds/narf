@@ -177,14 +177,16 @@ fn smoke_xe_priority_current_authority_config_size_and_refusals() -> TestResult 
         Err(FsError::OperationNotPermitted)
     );
     narf_filesystem::__test_swap_caller_capable_hook(Some(capable));
-    // Pinned platform descriptors do not enable CGP on any qualified card.
+    // Pinned platform descriptors do not enable CGP on any qualified card:
+    // exec_queue_set_multi_group's xe_exec_queue_supports_multi_queue check
+    // makes MULTI_GROUP (4) -ENODEV, not the -ENOSYS once pinned here.
     let mut ext = [0; 48];
     put32(&mut ext, 16, 4);
     put64(&mut ext, 24, 1 << 63);
     user.wire.store(8192, &ext);
     assert_eq!(
         invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
-        Err(FsError::NotImplemented)
+        Err(FsError::NoDevice)
     );
     assert_eq!(
         UserContext::new().configure_schedule(0, 1000),

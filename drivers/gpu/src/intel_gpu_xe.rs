@@ -102,6 +102,130 @@ fn gem_create_extensions(user: &dyn IoctlContext, mut next: u64) -> Result<(), F
     Ok(())
 }
 
+/// DRM_XE_EXEC_QUEUE_SET_PROPERTY_*: the indices of xe_exec_queue.c's
+/// exec_queue_set_property_funcs, whose ARRAY_SIZE is QUEUE_PROPERTIES.
+const PRIORITY: u32 = 0;
+const TIMESLICE: u32 = 1;
+const HANG_REPLAY_STATE: u32 = 3;
+const MULTI_GROUP: u32 = 4;
+const MULTI_QUEUE_PRIORITY: u32 = 5;
+const QUEUE_PROPERTIES: u32 = 6;
+/// XE_EXEC_QUEUE_PRIORITY_HIGH and XE_MULTI_QUEUE_PRIORITY_HIGH.
+const PRIORITY_HIGH: u64 = 2;
+
+/// What an EXEC_QUEUE_CREATE extension chain configured.
+struct QueueProperties {
+    /// GuC priority: Xe LOW/NORMAL/HIGH map to 3/2/1.
+    priority: u32,
+    timeslice: u32,
+    /// DRM_XE_EXEC_QUEUE_SET_HANG_REPLAY_STATE copied an LRC image.
+    replay: bool,
+}
+
+/// xe_lrc.c::xe_gt_lrc_hang_replay_size for a UAPI engine class. A VM_BIND
+/// queue's xe_exec_queue_create_bind queue is a COPY-class queue.
+fn hang_replay_size(class: u16, xe2: bool) -> usize {
+    4096 * match class {
+        0 if xe2 => 3,
+        4 if xe2 => 2,
+        0 | 4 => 13,
+        _ => 1,
+    }
+}
+
+/// xe_exec_queue.c::exec_queue_user_extensions, in its check order. Per
+/// extension (__exec_queue_user_extensions): the MAX_USER_EXTENSIONS bound,
+/// the 16-byte drm_xe_user_extension copy, its pad and name; then
+/// exec_queue_user_ext_set_property: the 48-byte drm_xe_ext_set_property
+/// copy, the property-index bound and its pad (reserved[] is not checked),
+/// then the property's setter. Finally exec_queue_user_ext_check_final.
+fn exec_queue_extensions(
+    user: &dyn IoctlContext,
+    mut next: u64,
+    class: u16,
+    xe2: bool,
+) -> Result<QueueProperties, FsError> {
+    let mut queue = QueueProperties {
+        priority: 2,
+        timeslice: 1000,
+        replay: false,
+    };
+    let mut properties = 0u64;
+    let mut ext_number = 0;
+    while next != 0 {
+        // `if (ext_number >= MAX_USER_EXTENSIONS) return -E2BIG;` before
+        // copy_from_user. Linux keeps no visited set: a chain that revisits
+        // an extension applies it again and ends at this bound.
+        if ext_number >= MAX_USER_EXTENSIONS {
+            return Err(FsError::ArgumentListTooLong);
+        }
+        ext_number += 1;
+        // struct drm_xe_user_extension: next_extension 0, name 8, pad 12.
+        // It is copied and refused on its own, before the property body.
+        let header = read(user, next, 16)?;
+        if u32_at(&header, 12) != 0 || u32_at(&header, 8) >= 1 {
+            return Err(FsError::InvalidData);
+        }
+        // struct drm_xe_ext_set_property: property 16, pad 20, value 24.
+        let ext = read(user, next, 48)?;
+        let property = u32_at(&ext, 16);
+        if property >= QUEUE_PROPERTIES || u32_at(&ext, 20) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        // `*properties |= BIT_ULL(idx)` precedes the setter. Its
+        // exec_queue_user_ext_check concerns multi-queue secondaries, which
+        // no NARF queue can become (MULTI_GROUP below never succeeds).
+        properties |= 1 << property;
+        let value = u64_at(&ext, 24);
+        match property {
+            // exec_queue_set_priority.
+            PRIORITY => {
+                if value > PRIORITY_HIGH {
+                    return Err(FsError::InvalidData);
+                }
+                if value == PRIORITY_HIGH && max_queue_priority() < value {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                queue.priority = 3 - value as u32;
+            }
+            // exec_queue_set_timeslice.
+            TIMESLICE if (1..=100_000).contains(&value) => queue.timeslice = value as u32,
+            TIMESLICE => return Err(FsError::InvalidData),
+            // xe_exec_queue.c::exec_queue_set_pxp_type: NONE is the
+            // default; only HWDRM is a session type, and without an
+            // enabled PXP (xe->pxp is NULL: no MEI GSC proxy, see
+            // xe_pxp_is_supported) it is -ENODEV.
+            PXP_TYPE if value == PXP_TYPE_NONE => {}
+            PXP_TYPE if value != PXP_TYPE_HWDRM => return Err(FsError::InvalidData),
+            PXP_TYPE => return Err(pxp_disabled()),
+            // exec_queue_set_hang_replay_state: vmemdup_user of the class's
+            // replay size, so an unreadable image is -EFAULT here.
+            HANG_REPLAY_STATE => {
+                read(user, value, hang_replay_size(class, xe2))?;
+                queue.replay = true;
+            }
+            // exec_queue_set_multi_group opens with
+            // `if (!xe_exec_queue_supports_multi_queue(q)) return -ENODEV;`
+            // and every pinned graphics descriptor's
+            // multi_queue_engine_class_mask is zero.
+            MULTI_GROUP => return Err(FsError::NoDevice),
+            // exec_queue_set_multi_queue_priority: a creation-time value
+            // (q->xef is still NULL) is range-checked and stored.
+            MULTI_QUEUE_PRIORITY if value > PRIORITY_HIGH => {
+                return Err(FsError::InvalidData);
+            }
+            _ => {}
+        }
+        next = u64_at(&header, 0);
+    }
+    // exec_queue_user_ext_check_final: MULTI_QUEUE_PRIORITY applies only
+    // to a multi-queue group queue.
+    if properties & 1 << MULTI_QUEUE_PRIORITY != 0 && properties & 1 << MULTI_GROUP == 0 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(queue)
+}
+
 #[derive(Debug)]
 struct Queue {
     vm: Arc<Vm>,
@@ -440,46 +564,9 @@ impl XeFile {
             }
             placements = crate::intel_gpu_engine::EngineSet::of(&engines);
         }
-        let mut extensions = u64_at(&wire, 0);
-        let mut ext_number = 0;
-        let (mut priority, mut timeslice) = (2, 1000);
-        while extensions != 0 {
-            // __exec_queue_user_extensions: `if (ext_number >=
-            // MAX_USER_EXTENSIONS) return -E2BIG;` before copy_from_user.
-            // Linux keeps no visited set: a chain that revisits an extension
-            // applies it again and ends at this bound.
-            if ext_number >= MAX_USER_EXTENSIONS {
-                return Err(FsError::ArgumentListTooLong);
-            }
-            ext_number += 1;
-            let ext = read(user, extensions, 48)?;
-            zero(&ext[8..16])?;
-            zero(&ext[20..24])?;
-            zero(&ext[32..48])?;
-            let value = u64_at(&ext, 24);
-            match u32_at(&ext, 16) {
-                0 if value <= 1 => priority = if value == 0 { 3 } else { 2 },
-                0 if value == 2 => {
-                    if max_queue_priority() < value {
-                        return Err(FsError::OperationNotPermitted);
-                    }
-                    priority = 1;
-                }
-                0 => return Err(FsError::InvalidData),
-                1 if (1..=100_000).contains(&value) => timeslice = value as u32,
-                1 => return Err(FsError::InvalidData),
-                // xe_exec_queue.c::exec_queue_set_pxp_type: NONE is the
-                // default; only HWDRM is a session type, and without an
-                // enabled PXP (xe->pxp is NULL: no MEI GSC proxy, see
-                // xe_pxp_is_supported) it is -ENODEV.
-                PXP_TYPE if value == PXP_TYPE_NONE => {}
-                PXP_TYPE if value != PXP_TYPE_HWDRM => return Err(FsError::InvalidData),
-                PXP_TYPE => return Err(pxp_disabled()),
-                _ => return Err(FsError::NotImplemented),
-            }
-            extensions = u64_at(&ext, 0);
-        }
-        let context = if width > 1 {
+        // calc_validate_logical_mask's parallel checks, like the VM lookup
+        // below, precede xe_exec_queue_create and so the extension chain.
+        let lanes = if width > 1 {
             if !matches!(class, 1 | 4) {
                 return Err(FsError::InvalidData);
             }
@@ -505,11 +592,30 @@ impl XeFile {
                     );
                 }
             }
-            UserContext::for_parallel(lanes)?
-        } else if class == 5 {
-            UserContext::new()
+            Some(lanes)
         } else {
-            UserContext::for_placements(placements)?
+            None
+        };
+        // xe_exec_queue_create_ioctl: an unknown VM, or a closed or banned
+        // one, is -ENOENT before xe_exec_queue_create(_bind) runs the
+        // extensions. Publication repeats the lookup under the name lock.
+        self.vm(u32_at(&wire, 12))?.check()?;
+        let QueueProperties {
+            priority,
+            timeslice,
+            replay,
+        } = exec_queue_extensions(user, u64_at(&wire, 0), class, info.platform.is_xe2())?;
+        // LINUX-GAP: xe_lrc_create would initialise each LRC from the copied
+        // hang-replay image. NARF contexts start only from their own golden
+        // state, so a chain that copied one is refused here, after every
+        // check Linux makes on that chain.
+        if replay {
+            return Err(FsError::NotImplemented);
+        }
+        let context = match lanes {
+            Some(lanes) => UserContext::for_parallel(lanes)?,
+            None if class == 5 => UserContext::new(),
+            None => UserContext::for_placements(placements)?,
         };
         context.configure_schedule(priority, timeslice)?;
         if low_latency {

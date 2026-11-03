@@ -511,8 +511,10 @@ retirement or verified reset. A reset does not authorize replay of the old
 context; stale epochs remain refused, and a new queue rewrites the complete
 policy before enable. EXEC_QUEUE_CREATE's PXP_TYPE property accepts NONE;
 HWDRM is ENODEV and any other session type EINVAL, because no NARF device
-enables PXP (see the MTL/Arrow GSC section). CGP, user hang-replay state and
-other new scheduling interfaces remain outside this contract.
+enables PXP (see the MTL/Arrow GSC section). CGP groups, contexts created
+from a user hang-replay image and other new scheduling interfaces remain
+outside this contract; the errnos of their creation properties are given with
+the other EXEC_QUEUE_CREATE extensions below.
 Visible VRAM is advertised only after the platform-qualified pool is published. BMG accepts/reports NO_COMPRESSION because every admitted binding
 uses an uncompressed coherent policy.
 
@@ -527,7 +529,7 @@ DRM_XE_GEM_CREATE_EXTENSION_SET_PROPERTY header is copied before its body, and
 a nonzero name or pad or any property other than PXP_TYPE is EINVAL. PXP_TYPE
 NONE is accepted and HWDRM is ENODEV. The chain's verdict applies only after
 argument, VM and allocation refusals and publishes no handle. A seventeenth
-extension is EINVAL (Linux's E2BIG has no FsError).
+extension is E2BIG before it is read; links may repeat (no visited set).
 
 VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
 per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
@@ -587,8 +589,20 @@ VIDEO classes, and COMPUTE on a GT
 without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
 and engine-cycle queries for an unpublished class return EINVAL after the
-syntax and readiness checks. Property extension
-chains are bounded at 16 unique links. Low/normal/HIGH Xe priorities map to
+syntax and readiness checks. EXEC_QUEUE_CREATE extensions follow
+exec_queue_user_extensions and run, as in xe_exec_queue_create_ioctl, after
+the placement and parallel-row checks and the VM lookup: an unknown or
+destroyed VM is ENOENT whatever the chain holds. A seventeenth link is E2BIG
+before it is read and links may repeat (no visited set). Each link's 16-byte
+header is copied and its nonzero name or pad refused (EINVAL) before the
+48-byte set-property body is copied (EFAULT); a property at or past six or a
+nonzero body pad is EINVAL, and reserved[] is not checked. MULTI_GROUP (4) is
+ENODEV, every pinned descriptor having a zero multi-queue class mask.
+MULTI_QUEUE_PRIORITY (5) above 2 is EINVAL; otherwise the chain continues and
+exec_queue_user_ext_check_final refuses it (EINVAL). HANG_REPLAY_STATE (3)
+copies xe_gt_lrc_hang_replay_size bytes (EFAULT); a chain that passes with one
+is refused ENOSYS, a LINUX-GAP: Linux would build the queue's LRCs from that
+image. Low/normal/HIGH Xe priorities map to
 GuC 3/2/1. HIGH requires current initial-namespace CAP_SYS_NICE (23) when
 copying the property and immediately before publishing the queue name; a
 copyout or authority failure consumes no name. A successfully created queue
@@ -597,8 +611,8 @@ including virtual/parallel execution and credential changes, as in Linux.
 GuC KMD_HIGH (0) is never granted. CONFIG reports max priority 1 or 2 for the
 current caller only on an exact-size payload request; size negotiation and
 invalid-size requests do not sample authority or touch the payload.
-Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,
-instances and malformed reserved fields fail before publication.
+Timeslices are bounded to 1..100000 microseconds; flags, instances and
+malformed reserved fields fail before publication.
 
 Default visible local memory: `RegisterInit` captures stable SG_TILE_ADDR_RANGE(0),
 platform-specific flat-CCS base and GSMBASE. BMG uses the qualified Xe2 range

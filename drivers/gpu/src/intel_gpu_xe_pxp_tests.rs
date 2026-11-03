@@ -224,3 +224,152 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos
 );
+
+// MIT Linux b90c984d xe_exec_queue.c::{xe_exec_queue_create_ioctl,
+// __exec_queue_user_extensions,exec_queue_user_ext_set_property,
+// exec_queue_user_ext_check_final,exec_queue_set_multi_group,
+// exec_queue_set_multi_queue_priority,exec_queue_set_hang_replay_state} and
+// xe_lrc.c::xe_gt_lrc_hang_replay_size, on MTL (GRAPHICS_VER 12).
+fn smoke_xe_exec_queue_extensions_follow_linux_check_order() -> TestResult {
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (_, info) = setup(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let vm = create_vm(&file, &info, &user);
+    let doomed = create_vm(&file, &info, &user);
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, doomed), Ok(0));
+    // RCS0 at 512, VM_BIND at 520 and an RCS0/RCS0 width-two row at 528.
+    user.wire.store(512, &[0u8; 8]);
+    user.wire.store(520, &[5, 0, 0, 0, 0, 0, 0, 0]);
+    user.wire.store(528, &[0u8; 16]);
+    let create = |extensions: u64, vm: u32, instances: u64, width: u32| {
+        let mut wire = [0; 48];
+        put64(&mut wire, 0, extensions);
+        put32(&mut wire, 8, width | 1 << 16);
+        put32(&mut wire, 12, vm);
+        put64(&mut wire, 24, instances);
+        user.wire.store(64, &wire);
+        let result = invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE);
+        (result, u32_at(&user.wire.load(64, 48), 20))
+    };
+    let queue = |extensions: u64| create(extensions, vm, 512, 1);
+    let bind = |extensions: u64| create(extensions, vm, 520, 1);
+    let destroy_queue = |id: u32| {
+        assert_eq!(
+            close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, id),
+            Ok(0)
+        );
+    };
+    let before = arena.live_allocations();
+
+    // __exec_queue_user_extensions copies the 16-byte drm_xe_user_extension
+    // and refuses its pad or name before exec_queue_user_ext_set_property
+    // copies the 48-byte body. At the end of the user range a bad header is
+    // -EINVAL; a good one whose body is unreadable is -EFAULT.
+    let edge = 32768 - 16;
+    for (at, word) in [(8, 1u32), (12, 1)] {
+        let mut header = [0u8; 16];
+        put32(&mut header, at, word);
+        user.wire.store(edge, &header);
+        assert_eq!(queue(edge), (Err(FsError::InvalidData), 0));
+    }
+    user.wire.store(edge, &[0u8; 16]);
+    assert_eq!(queue(edge), (Err(FsError::BadAddress), 0));
+
+    // The property index is bounded by ARRAY_SIZE(exec_queue_set_property_
+    // funcs), six: past it is -EINVAL, never -ENOSYS, as is a nonzero pad.
+    for property in [6, 7, u32::MAX] {
+        pxp_extension(&user, 8192, 0, 0, property, 0);
+        assert_eq!(queue(8192), (Err(FsError::InvalidData), 0));
+    }
+    pxp_extension(&user, 8192, 0, 0, 2, 0);
+    user.wire.store(8192 + 20, &1u32.to_le_bytes());
+    assert_eq!(queue(8192), (Err(FsError::InvalidData), 0));
+    // reserved[2] is copied but never checked: a NONE with nonzero
+    // reserved words creates the queue.
+    pxp_extension(&user, 8192, 0, 0, 2, 0);
+    user.wire.store(8192 + 32, &[0xa5; 16]);
+    let (result, id) = queue(8192);
+    assert_eq!(result, Ok(0));
+    assert_ne!(id, 0);
+    destroy_queue(id);
+
+    // MULTI_GROUP: exec_queue_set_multi_group's first check is
+    // xe_exec_queue_supports_multi_queue, false for every pinned graphics
+    // descriptor, so any value is -ENODEV.
+    for value in [0, 1, 1 << 63] {
+        pxp_extension(&user, 8192, 0, 0, 4, value);
+        assert_eq!(queue(8192), (Err(FsError::NoDevice), 0));
+    }
+    // MULTI_QUEUE_PRIORITY: above XE_MULTI_QUEUE_PRIORITY_HIGH is -EINVAL in
+    // the setter. A valid one is stored, so the chain goes on (a later
+    // extension's error wins) and exec_queue_user_ext_check_final refuses
+    // it without MULTI_GROUP.
+    pxp_extension(&user, 8192, 0, 0, 5, 3);
+    assert_eq!(queue(8192), (Err(FsError::InvalidData), 0));
+    for value in [0, 1, 2] {
+        pxp_extension(&user, 8192, 0, 0, 5, value);
+        assert_eq!(queue(8192), (Err(FsError::InvalidData), 0));
+        pxp_extension(&user, 8192, 8256, 0, 5, value);
+        pxp_extension(&user, 8256, 0, 0, 2, 1);
+        assert_eq!(queue(8192), (Err(FsError::NoDevice), 0));
+        pxp_extension(&user, 8192, 0x10000, 0, 5, value);
+        assert_eq!(queue(8192), (Err(FsError::BadAddress), 0));
+    }
+
+    // HANG_REPLAY_STATE: vmemdup_user of xe_gt_lrc_hang_replay_size. An MTL
+    // RCS image is thirteen pages, more than the fixture's user range, so
+    // even a valid base is -EFAULT. A bind queue is a COPY-class queue,
+    // whose image is one page.
+    for value in [0, 4096] {
+        pxp_extension(&user, 8192, 0, 0, 3, value);
+        assert_eq!(queue(8192), (Err(FsError::BadAddress), 0));
+    }
+    pxp_extension(&user, 8192, 0, 0, 3, 32768 - 4095);
+    assert_eq!(bind(8192), (Err(FsError::BadAddress), 0));
+    // A readable image is accepted by Linux, which goes on with the chain:
+    // the later extension's error wins over NARF's refusal of the image.
+    pxp_extension(&user, 8192, 8256, 0, 3, 16384);
+    pxp_extension(&user, 8256, 0, 0, 6, 0);
+    assert_eq!(bind(8192), (Err(FsError::InvalidData), 0));
+    pxp_extension(&user, 8192, 0x10000, 0, 3, 32768 - 4096);
+    assert_eq!(bind(8192), (Err(FsError::BadAddress), 0));
+    // LINUX-GAP: with a readable image and a clean chain Linux creates the
+    // queue from that LRC image; NARF has no replayed-context creation and
+    // refuses with -ENOSYS, publishing no queue.
+    pxp_extension(&user, 8192, 0, 0, 3, 32768 - 4096);
+    assert_eq!(bind(8192), (Err(FsError::NotImplemented), 0));
+
+    // xe_exec_queue_create_ioctl runs the chain inside xe_exec_queue_create,
+    // after calc_validate_logical_mask and the VM lookup. An RCS0/RCS0 row
+    // is not logically contiguous (-EINVAL) and an unknown or destroyed VM
+    // is -ENOENT, whatever the chain holds.
+    assert_eq!(
+        create(0x10000, vm, 528, 2),
+        (Err(FsError::InvalidData), 0)
+    );
+    assert_eq!(create(0x10000, 99, 528, 2), (Err(FsError::InvalidData), 0));
+    pxp_extension(&user, 8192, 0, 0, 6, 0);
+    for extensions in [8192, 0x10000, edge] {
+        assert_eq!(create(extensions, 99, 512, 1), (Err(FsError::NotFound), 0));
+        assert_eq!(create(extensions, 99, 520, 1), (Err(FsError::NotFound), 0));
+    }
+    assert_eq!(
+        create(8192, doomed, 512, 1),
+        (Err(FsError::NotFound), 0)
+    );
+    assert_eq!(arena.live_allocations(), before);
+
+    drop(file);
+    drop(info);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe",
+    smoke_xe_exec_queue_extensions_follow_linux_check_order
+);
