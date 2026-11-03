@@ -1106,3 +1106,47 @@ mod offchannel_native;
 mod power_save_tests;
 #[path = "wow_native.rs"]
 mod wow_native;
+
+/// cfg80211 keeps one BSS table per wiphy (`scan.c::cfg80211_bss_update`):
+/// a P2P_DEVICE scan merges its GO beside the netdev's results (so the P2P
+/// client's station prepare finds it), while a netdev scan still replaces
+/// the table it observed.
+fn smoke_ath10k_p2p_device_scan_merges_shared_bss_table() -> TestResult {
+    let mut r = radio_boot(4, Dialect::Tlv);
+    let bss = |last: u8, frequency: u16, ie: u8| radio::ScanBss {
+        bssid: [2, 0, 0, 0, 0, last],
+        ssid: b"DIRECT-xy".to_vec(),
+        frequency,
+        snr: 30,
+        capability: 1,
+        beacon_interval: 100,
+        information_elements: vec![ie],
+    };
+    if r.publish_scan_cache(&[bss(1, 2412, 1)], None, false)
+        .is_err()
+    {
+        return TestResult::Fail("netdev scan");
+    }
+    if r.publish_scan_cache(&[bss(9, 2437, 9), bss(1, 2412, 7)], None, true)
+        .is_err()
+    {
+        return TestResult::Fail("p2p device scan");
+    }
+    if r.information_elements([2, 0, 0, 0, 0, 9]) != Some(vec![9])
+        || r.information_elements([2, 0, 0, 0, 0, 1]) != Some(vec![7])
+    {
+        return TestResult::Fail("p2p scan did not merge into the wiphy table");
+    }
+    if r.publish_scan_cache(&[bss(3, 2462, 3)], None, false)
+        .is_err()
+        || r.information_elements([2, 0, 0, 0, 0, 9]).is_some()
+        || r.information_elements([2, 0, 0, 0, 0, 3]) != Some(vec![3])
+    {
+        return TestResult::Fail("netdev scan replaces unbound entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_device_scan_merges_shared_bss_table
+);

@@ -144,6 +144,8 @@ pub(super) struct StationSlot {
 /// Bound on HTT events parked for an idle sibling slot; overflow fails
 /// that slot's data owner rather than growing without limit.
 const SLOT_INBOX: usize = 256;
+/// Bound on the radio's BSS table (a scan report holds at most 64).
+const SCAN_CACHE: usize = 64;
 impl StationSlot {
     const fn new() -> Self {
         Self {
@@ -470,8 +472,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     /// `p2p_device`: run on the P2P_DEVICE vdev (`ath10k_hw_scan` with
     /// `ar->scan.vdev_id = arvif->vdev_id`) instead of the managed role's
-    /// vdev. Its discoveries are returned only; the managed role's scan
-    /// cache (`information_elements`) is left unchanged.
+    /// vdev. Its discoveries are merged into the shared BSS table
+    /// (`publish_scan_cache`), as cfg80211's per-wiphy table.
     async fn scan_run_on(
         &mut self,
         p2p_device: Option<u8>,
@@ -605,16 +607,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                                     }
                                 }
                                 validate()?;
-                                let mut cache = Vec::new();
-                                cache
-                                    .try_reserve_exact(report.bss.len())
-                                    .map_err(|_| Error::NoMemory)?;
-                                for bss in &report.bss {
-                                    cache.push(bss.copy_owned()?);
-                                }
-                                if p2p_device.is_none() {
-                                    self.scan_cache = cache;
-                                }
+                                self.publish_scan_cache(&report.bss, None, p2p_device.is_some())?;
                                 self.scan_pending = None;
                                 self.failed = false;
                                 return Ok(report);
@@ -688,6 +681,67 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             None => Some(event),
         }
+    }
+    /// Publish a scan's BSS table (at most `SCAN_CACHE` entries). cfg80211
+    /// keeps one BSS table per wiphy (`net/wireless/scan.c`
+    /// `cfg80211_bss_update`), so a P2P_DEVICE scan (`merge`) updates
+    /// entries beside the netdev's instead of hiding them, and its GO is
+    /// then visible to the P2P client's station prepare. Every scan keeps
+    /// each station slot's associated BSS (and `keep`) when the scan did
+    /// not observe it.
+    pub(super) fn publish_scan_cache(
+        &mut self,
+        fresh: &[ScanBss],
+        keep: Option<([u8; 6], u16)>,
+        merge: bool,
+    ) -> Result<(), Error> {
+        let bound = |slot: &StationSlot| {
+            slot.peer
+                .as_ref()
+                .map(|p| (p.bssid, p.permission.frequency))
+        };
+        let kept = [
+            keep,
+            bound(&self.station),
+            self.p2p_client.as_deref().and_then(bound),
+        ];
+        let same = |b: &ScanBss, c: &ScanBss| b.bssid == c.bssid && b.frequency == c.frequency;
+        let mut cache: Vec<ScanBss> = Vec::new();
+        cache
+            .try_reserve_exact(SCAN_CACHE)
+            .map_err(|_| Error::NoMemory)?;
+        for (bssid, frequency) in kept.into_iter().flatten() {
+            if fresh
+                .iter()
+                .any(|b| b.bssid == bssid && b.frequency == frequency)
+                || cache
+                    .iter()
+                    .any(|b| b.bssid == bssid && b.frequency == frequency)
+            {
+                continue;
+            }
+            if let Some(b) = self
+                .scan_cache
+                .iter()
+                .find(|b| b.bssid == bssid && b.frequency == frequency)
+            {
+                cache.push(b.copy_owned()?);
+            }
+        }
+        for b in fresh {
+            if cache.len() < SCAN_CACHE && !cache.iter().any(|c| same(b, c)) {
+                cache.push(b.copy_owned()?);
+            }
+        }
+        if merge {
+            for b in &self.scan_cache {
+                if cache.len() < SCAN_CACHE && !cache.iter().any(|c| same(b, c)) {
+                    cache.push(b.copy_owned()?);
+                }
+            }
+        }
+        self.scan_cache = cache;
+        Ok(())
     }
     /// Retain an event for a later step. A sibling slot's event goes to that
     /// slot's inbox (bounded there), never to this owner's queue.

@@ -283,29 +283,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         report: &ScanReport,
         station: Option<&Binding>,
     ) -> Result<(), Error> {
-        let mut cache = Vec::new();
-        cache.try_reserve_exact(64).map_err(|_| Error::NoMemory)?;
-        for bss in &report.bss {
-            cache.push(bss.copy_owned()?);
-        }
-        if let Some(station) = station {
-            let is_home = |b: &ScanBss| {
-                b.bssid == station.bssid && b.frequency == station.permission.frequency
-            };
-            if !cache.iter().any(is_home) {
-                if let Some(home) = self.scan_cache.iter().find(|b| is_home(b)) {
-                    // A requested off-channel scan may never observe home.
-                    // Keep its bound beacon identity so normal station RX can
-                    // continue refreshing liveness and checking HT/WMM facts.
-                    if cache.len() == 64 {
-                        cache.pop();
-                    }
-                    cache.push(home.copy_owned()?);
-                }
-            }
-        }
-        self.scan_cache = cache;
-        Ok(())
+        // A requested off-channel scan may never observe home. Keep its
+        // bound beacon identity so normal station RX can continue refreshing
+        // liveness and checking HT/WMM facts.
+        let home = station.map(|s| (s.bssid, s.permission.frequency));
+        self.publish_scan_cache(&report.bss, home, false)
     }
 }
 

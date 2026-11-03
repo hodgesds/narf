@@ -2256,7 +2256,13 @@ will bind; none of them grants RF, peer, key or data authority.
   On this vdev a P2P Device's Listen Probe Response (neither ESS nor IBSS)
   is admitted when it carries the WFA P2P IE; the P2P Wildcard SSID
   matches every `DIRECT-` SSID. Results and IEs belong to the wdev
-  (`scan_information_elements`); the netdev scan cache is untouched. An
+  (`scan_information_elements`). The radio BSS table is shared as
+  cfg80211's per-wiphy table (`scan.c::cfg80211_bss_update`):
+  `Radio::publish_scan_cache` merges a P2P_DEVICE scan's entries beside the
+  netdev's (bound 64), so a GO found by P2P search is the cached BSS a P2P
+  client's station prepare binds; a netdev scan replaces the table it
+  observed. Either scan keeps every station slot's associated BSS (home
+  and P2P client) that it did not observe. An
   unstarted wdev is `-EIO`; a ROC in flight, a station peer or an AP is
   `-EBUSY` before publication (a P2P scan concurrent with an associated
   station is not supported: the associated dwell owner is vdev0-only).
@@ -2285,7 +2291,9 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
 `smoke_ath10k_p2p_station_slot_parks_bounded`,
-`smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid`.
+`smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid`;
+`wmi_boot/radio_tests.rs`
+`smoke_ath10k_p2p_device_scan_merges_shared_bss_table`.
 
 ## 4. Invariants
 
