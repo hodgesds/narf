@@ -191,7 +191,11 @@ impl Board {
             assets,
             power,
             phycap,
-            b"NARF RTL8852B noninitial full RF 2.4GHz20 legacy20 awake WLAN-only v1;TX-A1M,RX-AB;all automatic CCK/OFDM response paths;no hardwarecrypto;retuned from Ready ch1 program",
+            if power.channel().is_5ghz() {
+                b"NARF RTL8852B 5GHz full RF 20MHz legacy-OFDM20 awake WLAN-only v1;TX-A1M,RX-AB;automatic OFDM response paths, no CCK;no hardwarecrypto;retuned across band from Ready ch1 program"
+            } else {
+                b"NARF RTL8852B noninitial full RF 2.4GHz20 legacy20 awake WLAN-only v1;TX-A1M,RX-AB;all automatic CCK/OFDM response paths;no hardwarecrypto;retuned from Ready ch1 program"
+            },
         )
         .map(|board| board.lifecycle(lifecycle))
     }
@@ -602,10 +606,26 @@ impl Qualification {
         if profile == super::operating_channel::Profile::INITIAL {
             return Ok(true);
         }
-        match self.channel(profile.primary()) {
-            Some(record) => record.bound(self).map(|()| true),
-            None => Ok(false),
+        let Some(record) = self.channel(profile.primary()) else {
+            return Ok(false);
+        };
+        record.bound(self)?;
+        if !profile.is_5ghz() {
+            return Ok(true);
         }
+        // A 5GHz record is only admitted while the current host rule over
+        // its span permits active emission (no DFS/NO_IR), so a scan never
+        // retunes onto a channel whose envelope `select` would refuse.
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(domain) = self.model_domain.as_ref() {
+            return Ok(Self::check_envelope(domain, record.envelope()).is_ok());
+        }
+        let domain = if self.wmm {
+            narf_wireless::reg::db::get_domain().ok_or(Error::Policy)?
+        } else {
+            narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?
+        };
+        Ok(Self::check_envelope(&domain, record.envelope()).is_ok())
     }
     /// The signed noninitial record was measured for exactly this freshly
     /// rebuilt identity (before program extension).
@@ -641,10 +661,19 @@ impl Qualification {
         self.active.load(core::sync::atomic::Ordering::Acquire)
     }
     fn check(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
+        Self::check_envelope(domain, self.envelope()?)
+    }
+    /// The host rule over the record's whole occupied span. Any rule flag but
+    /// NO_P2P refuses: 5GHz DFS/NO_IR (radar, passive-only) channels are never
+    /// admitted until shared `narf_wireless::reg` DFS/beacon-gating support
+    /// exists; no passive-scan TX exemption is assumed.
+    fn check_envelope(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        envelope: Envelope,
+    ) -> Result<(), Error> {
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(Error::Policy);
         }
-        let envelope = self.envelope()?;
         let (low, high) = envelope.span;
         let mut ceiling = None;
         for rule in &domain.rules {

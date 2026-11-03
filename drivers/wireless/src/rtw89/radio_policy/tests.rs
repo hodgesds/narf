@@ -1076,11 +1076,7 @@ pub(in crate::rtw89) fn channel_model(
     Board,
 ) {
     let (mut base, base_cap) = revocable_model();
-    let profile = super::super::operating_channel::Profile::new(
-        narf_wireless::association::channel::Band::Ghz2,
-        primary,
-    )
-    .unwrap();
+    let profile = super::super::operating_channel::Profile::from_primary(primary).unwrap();
     let mut board = board();
     board.identity = [primary; 32];
     let request = channel::Request::new(&base, profile, board.with_programs(base.flags)).unwrap();
@@ -1244,4 +1240,63 @@ fn smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_sp
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span
+);
+
+/// 5GHz N52C: a typed 5GHz primary binds its own record (distinct recipe and
+/// name), is admitted and selectable only while the host rule over its whole
+/// occupied span carries no DFS/NO_IR flag; a DFS span leaves it unadmitted
+/// and `select` refuses, keeping channel1 active (no passive-scan exemption).
+fn smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span() -> TestResult {
+    use super::super::operating_channel::Profile;
+    use narf_wireless::association::channel::Band;
+    use narf_wireless::reg::{RegFlags, RegRule};
+    let a36 = Profile::new(Band::Ghz5, 36).unwrap();
+    let (mut base, _base_cap, _record_cap, board) = channel_model(36, 40);
+    let Ok(request) = channel::Request::new(&base, a36, board.with_programs(base.flags)) else {
+        return TestResult::Fail("N52C refused a typed 5GHz primary");
+    };
+    if !request.name.contains("-ch36-")
+        || channel::Request::new(
+            &base,
+            Profile::new(Band::Ghz5, 40).unwrap(),
+            board.with_programs(base.flags),
+        )
+        .is_ok_and(|other| other.binding == request.binding)
+    {
+        return TestResult::Fail("5GHz N52C name/binding not per primary");
+    }
+    let rule = |start, end, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: 80,
+        max_power_dbm: 20,
+        flags,
+    };
+    let mut open = domain();
+    open.rules.push(rule(5170, 5250, RegFlags::empty()));
+    let mut radar = domain();
+    radar.rules.push(rule(5170, 5250, RegFlags::DFS));
+    let mut passive = domain();
+    passive.rules.push(rule(5170, 5250, RegFlags::NO_IR));
+    for (domain, admitted, label) in [
+        (radar, false, "DFS 5GHz span admitted"),
+        (passive, false, "NO_IR 5GHz span admitted"),
+        (open, true, "non-DFS 5GHz span refused"),
+    ] {
+        base.model_domain = Some(domain);
+        if base.channel_allowed(a36) != Ok(admitted)
+            || base.select(a36).is_ok() != admitted
+            || base.active() != if admitted { 36 } else { 1 }
+        {
+            return TestResult::Fail(label);
+        }
+    }
+    if base.select(Profile::INITIAL).is_err() || base.active() != 1 {
+        return TestResult::Fail("cross-band return to channel1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span
 );

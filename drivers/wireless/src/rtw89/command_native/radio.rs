@@ -62,15 +62,14 @@ impl QualificationRequest {
 fn denied(_: impl core::fmt::Debug) -> power::Error {
     power::Error::Access
 }
-/// Typed 2.4GHz/20MHz primary and its Linux per-channel power plan.
+/// Typed 2.4GHz or 5GHz 20MHz primary and its Linux per-channel power plan.
 fn channel_plan(
     assets: &radio_assets::Assets,
     rfe: u8,
     primary: u8,
 ) -> Result<(operating_channel::Profile, radio_power::Plan), power::Error> {
     let profile =
-        operating_channel::Profile::new(narf_wireless::association::channel::Band::Ghz2, primary)
-            .ok_or(power::Error::Unsupported)?;
+        operating_channel::Profile::from_primary(primary).ok_or(power::Error::Unsupported)?;
     let plan = radio_power::Plan::from_assets_for_channel(assets, rfe, profile).map_err(denied)?;
     Ok((profile, plan))
 }
@@ -335,7 +334,7 @@ impl Native {
             // Optional signed N52C per-channel full programs, loaded last so
             // each binds every installed companion. Absent records leave
             // that primary unadmitted; channel14 is never loaded.
-            for primary in 2..=13 {
+            for primary in (2..=13).chain(operating_channel::GHZ5) {
                 let (profile, plan) =
                     channel_plan(assets, identity.calibration().rfe_type, primary)?;
                 let board = radio_policy::Board::new_noninitial(
@@ -470,18 +469,18 @@ fn mccch(primary: u8) -> [u8; 20] {
     mcc
 }
 impl Native {
-    /// Mask of primaries (bit n) with a current signed full program.
-    pub(in crate::rtw89) fn admitted_channels(&self) -> Result<u16, power::Error> {
+    /// Compact mask (`operating_channel::slot`: 2.4GHz primary n = bit n,
+    /// 5GHz after) of primaries with a current signed full program whose
+    /// host rule currently permits active emission.
+    pub(in crate::rtw89) fn admitted_channels(&self) -> Result<u64, power::Error> {
         let qualification = self.full_radio_scope().ok_or(power::Error::Unsupported)?;
         let mut mask = 0;
-        for primary in 1..=13 {
-            let profile = operating_channel::Profile::new(
-                narf_wireless::association::channel::Band::Ghz2,
-                primary,
-            )
-            .ok_or(power::Error::Unsupported)?;
+        for primary in (1..=13).chain(operating_channel::GHZ5) {
+            let profile = operating_channel::Profile::from_primary(primary)
+                .ok_or(power::Error::Unsupported)?;
+            let bit = operating_channel::slot(primary).ok_or(power::Error::Unsupported)?;
             if qualification.channel_allowed(profile).map_err(denied)? {
-                mask |= 1 << primary;
+                mask |= 1u64 << bit;
             }
         }
         Ok(mask)

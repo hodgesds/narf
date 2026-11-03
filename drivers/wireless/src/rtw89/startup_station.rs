@@ -158,7 +158,10 @@ unsafe impl Io for Startup {
     }
     fn station_channels(&mut self) -> Result<u16, power::Error> {
         self.station_allowed()?;
-        self.station_native()?.admitted_channels()
+        // The station (probe/basic-rate/TX-rate/RA/CSA paths) is still
+        // 2.4GHz-only: expose only the 2.4GHz bits of the admission mask.
+        // 5GHz primaries are admitted for the native retune owner only.
+        Ok((self.station_native()?.admitted_channels()? & 0x3ffe) as u16)
     }
     async fn station_retune(
         &mut self,

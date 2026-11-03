@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! Optional signed per-channel full-program record (N52C) for one noninitial
-//! RTL8852B 2.4GHz/20MHz primary (2..=13). A child of radio_policy.
+//! RTL8852B 20MHz primary (2.4GHz 2..=13 or a typed 5GHz primary). A child
+//! of radio_policy.
 //!
 //! The base N52B v2 record keeps its exact channel1 meaning and is never
 //! reinterpreted for another primary. Each noninitial primary has its own
@@ -32,9 +33,19 @@ pub(super) struct Request {
     pub name: alloc::string::String,
     pub binding: [u8; 32],
 }
-/// Noninitial primaries that may carry a record. 14 stays unadvertised.
+/// Noninitial primaries that may carry a record: 2.4GHz 2..=13 and every
+/// typed 5GHz 20MHz primary. 14 stays unadvertised.
 pub(super) fn admissible(profile: Profile) -> bool {
-    (2..=13).contains(&profile.primary())
+    (2..=13).contains(&profile.primary()) || profile.is_5ghz()
+}
+/// 5GHz cross-band operating program recipe (distinct from the unchanged
+/// 2.4GHz v1 recipe, so no 2.4GHz binding moves).
+fn recipe_5ghz() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"RTL8852B 5GHz/20MHz full operating program v1; Linux core.c __rtw89_set_channel (MAC band mode, BB band select/gain_a/CCK off/BT-share release, RF CFGCH 5G band bits, set_txpwr) then rtw8852b_rfk_band_changed TSSI scan on a band change, then rtw8852b_rfk_channel on a Ready owner; RXDCK pauses prior TSSI; fresh A-band IQK/TSSI/DPK (MDPD order2), DPK reload disabled; RFK MCC slot0");
+    hash.update(b"actual primary WW0 5GHz OFDM/MCS/RU limits, no CCK byrate/DFIR, rtw8852bx_sco_mapping, rtw89_encode_chan_idx, TSSI OFDM/trim groups and subband thermal rows; init-only power reference/trim/RX-AB retained from initial program; no BTC switch-band");
+    hash.update(b"ordinary TX/CMAC/autonomous response drained before retune, reopened only after Ready; worst-case peaks/antenna cover all calibration, packet, response and optional companion emissions on this primary under the current host rule over the whole occupied span; DFS/NO_IR spans refused");
+    hash.finalize()
 }
 fn recipe() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -94,7 +105,11 @@ impl Request {
                 None => None,
             },
         );
-        hash.update(&recipe());
+        hash.update(&if profile.is_5ghz() {
+            recipe_5ghz()
+        } else {
+            recipe()
+        });
         let m = base.board.mac;
         Ok(Self {
             name: format!(

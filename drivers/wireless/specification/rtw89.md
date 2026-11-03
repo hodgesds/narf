@@ -2290,6 +2290,80 @@ two-arch execution and physical validation. Unexecuted new cases:
 `smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon`,
 `smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux`.
 
+### RTL8852B 5GHz 20MHz channel program and admission (partial; station 2.4GHz-only)
+
+**Typed profile.** `operating_channel::Profile` covers 2.4GHz 1..=14 and the
+Linux core.c `rtw89_channels_5ghz` 20MHz primaries (`GHZ5`: 36..64, 100..144,
+149..177). It derives chan.c `rtw89_get_subband_type`, phy.h BB-gain and
+OFDM gain-offset bands, phy.c `rtw89_encode_chan_idx` / `rtw89_channel_to_idx`,
+rtw8852b_common.c `rtw8852bx_sco_mapping` and rtw8852b_rfk.c TSSI OFDM/trim
+groups from the center channel (`center()` = primary at 20MHz, so no 5GHz
+center is a TSSI_EXTRA_GROUP). 2.4GHz bindings are byte-identical to v1; 5GHz
+binds under its own domain. `slot()`/`primaries()` define the compact u64
+admission mask (2.4GHz primary n keeps bit n; 5GHz from bit 16).
+
+**Channel program (5GHz branches, Linux 7.3-rc4).** MAC
+`__rtw8852bx_set_channel_mac` clears BAND_MODE and sets CHECK_CCK_EN|RTS6;
+BB `__rtw8852bx_set_channel_bb`: no SCO CCK thresholds, BAND_SEL 0, 5GHz SCO
+compensation, flat CCK TXFIR (as `rtw8852bx_ctrl_ch`), `gain_a` LNA/TIA
+registers from the BB gain band, subband gain comp/offset (no CCK RPL
+offset), RPL comp of the band, CCK disabled (`rtw8852bx_ctrl_cck_en`), the
+RTL8852B 5GHz BT-share/BTG/DC-est/GNT-weight releases, encoded channel index
+(readback-gated). RF `_ch_setting` sets `CFGCH_BAND1_5G`/`CFGCH_BAND0_5G`
+(readback-gated on all four DAV/DDV words). Power: rtw8852b_table.c
+`rtw89_8852b_txpwr_lmt_5g[20MHz][ntx][rs][bf][WW]` OFDM/MCS rows and
+`_lmt_ru_5g` for all 28 primaries (`operating_power_defaults::CHANNELS_5GHZ`,
+same source hash as the 2.4GHz rows; CCK slots 0), band-1 byrate without
+CCK, firmware elements 11/14 (LMT_5GHZ / LMT_RU_5GHZ, 53 channel indices,
+4 widths), band-1 TX shape, and no CCK DFIR (`rtw8852bx_set_tx_shape`).
+RFK: IQK `_iqk_txk_setting`/`_iqk_lok`/`_lok_res_table`/`_txk_group_sel`/
+`_iqk_rxk_setting`/`_rxk_group_sel` A-band words and `_a_*` groups, R_IQKCH
+band 1 + center; TSSI `_tssi_rf_setting` TXA, `_5g` system/slope tables,
+`_tssi_alignment_default` 5g1/5g2/5g3 all-defs, per-subband thermal rows
+(`Tracking` now parses firmware types 4..7, or Linux 5ga/5gb defaults),
+PMAC `__rtw8852bx_bb_ctrl_rx_path` subband gain offset and no BTG on 5GHz;
+DPK `_dpk_rf_setting` A-band RF words, `_dpk_idl_mpa` MDPD order 2 (<80MHz),
+`Path::a_band`, and `_dpk_track` 5/2 thermal delta. RXDCK is band-agnostic.
+
+**Band change.** `radio_full::Radio::retune` follows core.c
+`__rtw89_set_channel`: when the band changed it runs
+`tssi::band_scan` (`rtw8852b_rfk_band_changed` -> `rtw8852b_tssi_scan`:
+disable, RF setting/system/thermal/default alignment per path, enable, DE)
+after set_channel_done and before `rtw8852b_rfk_channel`. The scan never
+reloads another band's measured alignment. `rtw89_btc_ntfy_switch_band` has
+no counterpart: the one-shot WLAN-only PTA owner keeps BT arbitrated low and
+does not reprogram coex for 5GHz (open gap). RF_GET_MCCCH (non-v0 layout)
+carries channels only, so it is band-independent.
+
+**Admission.** `channel_policy::admissible` accepts every typed 5GHz primary;
+its N52C request uses a distinct 5GHz recipe (`recipe_5ghz`) and
+`Board::new_noninitial` a 5GHz domain string; the record format is
+unchanged (`[54..58] = [1,20,primary,flags]`, `rtw8852b-chan-v1-chNN`).
+`Qualification::check_envelope` refuses any host rule flag except NO_P2P over
+the occupied span, and `channel_allowed` additionally requires that check for
+a 5GHz record, so DFS and NO_IR 5GHz channels are never admitted: shared
+`narf_wireless::reg` DFS/beacon-gated passive support has not landed, and no
+passive-scan TX exemption is assumed. `Native::admitted_channels` returns the
+u64 slot mask over 2.4GHz and 5GHz; `preflight_full_radio` loads N52C for
+2..=13 and every 5GHz primary; `retune_full_radio` accepts any admitted
+typed primary (cross-band included). Without provisioned signed records only
+channel1 is admitted, exactly as before.
+
+Remaining before `five_ghz_operation` is whole (no row credit): the station
+is still 2.4GHz-only (`Startup::station_channels` exposes only the 2.4GHz
+bits): probe/rates IEs and basic-rate checks (`basic_rates & 1`), OFDM-only
+management TX rate, RA/CMAC mode masks, HT/HE 5GHz capability IEs, scan and
+association over 5GHz, ECSA classes 115..=130 / same-band CSA, 5GHz monitor
+chandef/observation (`0x1c00 | primary` readback is 2.4GHz-only), interface
+band advertisement, coex switch-band, DFS passive scanning, and all native
+two-arch plus physical validation. New unexecuted cases:
+`smoke_rtw89_b_operating_profile_5ghz_matches_linux_indices_and_groups`,
+`smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx`,
+`smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary`,
+`smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck`,
+`smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan`,
+`smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
