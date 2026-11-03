@@ -2339,8 +2339,10 @@ carries channels only, so it is band-independent.
 its N52C request uses a distinct 5GHz recipe (`recipe_5ghz`) and
 `Board::new_noninitial` a 5GHz domain string; the record format is
 unchanged (`[54..58] = [1,20,primary,flags]`, `rtw8852b-chan-v1-chNN`).
-`Qualification::check_envelope` refuses any host rule flag except NO_P2P over
-the occupied span, and `channel_allowed` additionally requires that check for
+`Qualification::check_envelope` (and the calibration `check`) refuse any host
+rule flag except NO_P2P, AUTO_BW and NO_160MHZ over the occupied span and
+require cfg80211 `reg_get_max_bandwidth` (`RegulatoryDomain::max_bandwidth`)
+>= 20MHz, and `channel_allowed` additionally requires that check for
 a 5GHz record, so DFS and NO_IR 5GHz channels are never admitted: shared
 `narf_wireless::reg` DFS/beacon-gated passive support has not landed, and no
 passive-scan TX exemption is assumed. `Native::admitted_channels` returns the

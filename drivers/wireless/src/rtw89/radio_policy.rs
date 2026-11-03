@@ -676,14 +676,17 @@ impl Qualification {
         }
         let (low, high) = envelope.span;
         let mut ceiling = None;
-        for rule in &domain.rules {
+        for (index, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= high || rule.freq_end_mhz <= low {
                 continue;
             }
             if rule.freq_start_mhz > low
                 || rule.freq_end_mhz < high
-                || rule.max_bandwidth_mhz < 20
-                || rule.flags.bits() & !narf_wireless::reg::RegFlags::NO_P2P.bits() != 0
+                // cfg80211 reg_get_max_bandwidth (AUTO_BW run, NO_160MHZ
+                // cap) must allow this 20MHz channel; NO_160MHZ and
+                // AUTO_BW restrict nothing else at 20MHz.
+                || domain.max_bandwidth(index) < 20
+                || rule.flags.bits() & !PLAIN_RULE_FLAGS != 0
             {
                 return Err(Error::Policy);
             }
@@ -701,6 +704,11 @@ impl Qualification {
         Ok(())
     }
 }
+/// Rule flags a plain 20MHz span may carry: NO_P2P, AUTO_BW, NO_160MHZ.
+/// DFS, NO_IR and every other (or unknown) bit is refused.
+const PLAIN_RULE_FLAGS: u32 = narf_wireless::reg::RegFlags::NO_P2P.bits()
+    | narf_wireless::reg::RegFlags::AUTO_BW.bits()
+    | narf_wireless::reg::RegFlags::NO_160MHZ.bits();
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "radio_policy/tests.rs"]
 pub(super) mod tests;

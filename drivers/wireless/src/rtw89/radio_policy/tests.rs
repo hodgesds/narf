@@ -1278,9 +1278,19 @@ fn smoke_rtw89_b_5ghz_channel_record_admits_only_non_dfs_host_span() -> TestResu
     radar.rules.push(rule(5170, 5250, RegFlags::DFS));
     let mut passive = domain();
     passive.rules.push(rule(5170, 5250, RegFlags::NO_IR));
+    // wireless-regdb AUTO-BW / NO_160MHZ restrict nothing at 20MHz.
+    let mut auto = domain();
+    auto.rules
+        .push(rule(5170, 5250, RegFlags::AUTO_BW | RegFlags::NO_160MHZ));
+    let mut unknown = domain();
+    unknown
+        .rules
+        .push(rule(5170, 5250, RegFlags::from_bits_retain(1 << 12)));
     for (domain, admitted, label) in [
         (radar, false, "DFS 5GHz span admitted"),
         (passive, false, "NO_IR 5GHz span admitted"),
+        (unknown, false, "unknown rule flag admitted"),
+        (auto, true, "AUTO_BW/NO_160MHZ 5GHz span refused"),
         (open, true, "non-DFS 5GHz span refused"),
     ] {
         base.model_domain = Some(domain);
