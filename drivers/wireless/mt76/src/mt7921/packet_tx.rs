@@ -279,6 +279,32 @@ pub(super) fn on_vif(header: &mut [u8; HEADER], vif: super::vif_slots::Vif) -> R
     Ok(())
 }
 
+/// One station data TXD for `link` (Linux mt76_connac2_mac_write_txwi with
+/// `mvif`/`wcid` of that vif): WCID = the link's peer, then `on_vif`.
+/// `tid` None is the non-QoS BE descriptor. `Link::HOME` reproduces the
+/// historical WCID 1 / OMAC0 / WMM0 bytes exactly.
+pub(super) fn station_data(
+    link: super::vif_slots::Link,
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    protected: bool,
+    tid: Option<u8>,
+    aggregated: bool,
+) -> Result<[u8; HEADER], Error> {
+    let wcid = u16::from(link.peer());
+    let mut header = match tid {
+        Some(tid) if aggregated => {
+            ethernet_tid_aggregated(frame, payload, token, wcid, protected, tid)?
+        }
+        Some(tid) => ethernet_tid(frame, payload, token, wcid, protected, tid)?,
+        None if aggregated => return Err(Error::Bounds),
+        None => ethernet(frame, payload, token, wcid, protected)?,
+    };
+    on_vif(&mut header, link.vif())?;
+    Ok(header)
+}
+
 /// mt76_connac2_mac_write_txwi: `MT_TXD7_HW_AMSDU` (bit 10) when the peer's
 /// `wcid->amsdu` is set; firmware aggregates up to STA_REC_HW_AMSDU's count.
 pub(super) fn set_hw_amsdu(header: &mut [u8; HEADER]) {
@@ -296,16 +322,17 @@ pub(super) fn ethernet_aggregated(
     token: u16,
     protected: bool,
 ) -> Result<[u8; HEADER], Error> {
-    ethernet_tid_aggregated(frame, payload, token, protected, 0)
+    ethernet_tid_aggregated(frame, payload, token, 1, protected, 0)
 }
 pub(super) fn ethernet_tid_aggregated(
     frame: &[u8],
     payload: u64,
     token: u16,
+    wcid: u16,
     protected: bool,
     tid: u8,
 ) -> Result<[u8; HEADER], Error> {
-    let mut out = ethernet_tid(frame, payload, token, 1, protected, tid)?;
+    let mut out = ethernet_tid(frame, payload, token, wcid, protected, tid)?;
     let word = u32::from_le_bytes(out[12..16].try_into().unwrap()) & !(1 << 28);
     out[12..16].copy_from_slice(&word.to_le_bytes());
     Ok(out)

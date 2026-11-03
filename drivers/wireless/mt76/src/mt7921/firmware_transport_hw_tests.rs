@@ -492,7 +492,12 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             let slot = turn % DEPTH;
             let next = (slot + 1) % DEPTH;
             if hw
-                .submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
+                .submit_management(
+                    crate::mt7921::vif_slots::Vif::HOME,
+                    &frame,
+                    19,
+                    crate::mt7921::association::LegacyRate::ONE_MBPS,
+                )
                 .is_err()
                 || words[(TX_DATA + 8) as usize / 4] != next as u32
             {
@@ -503,8 +508,12 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             if ring.word(slot, 1) != (64 << 16) | LAST {
                 return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
             }
-            if hw.submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
-                != Err(Error::Busy)
+            if hw.submit_management(
+                crate::mt7921::vif_slots::Vif::HOME,
+                &frame,
+                19,
+                crate::mt7921::association::LegacyRate::ONE_MBPS,
+            ) != Err(Error::Busy)
                 || !matches!(hw.management_complete(), Ok(None))
             {
                 return TestResult::Fail("pending token allowed reuse");
@@ -558,7 +567,14 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
         frame[..6].fill(0xff);
         frame[6..12].copy_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]);
         frame[12..14].copy_from_slice(&[8, 0]);
-        if hw.submit_data(&frame, protected, true).is_err()
+        if hw
+            .submit_data(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                protected,
+                true,
+            )
+            .is_err()
             || words[(TX_DATA + 8) as usize / 4] != 1
         {
             return TestResult::Fail("QoS descriptor did not reach hardware doorbell");
@@ -576,7 +592,12 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
             || bytes[44..46] != [18, 128]
             || bytes[64..] != frame
             || ring.word(0, 1) != (64 << 16) | LAST
-            || hw.submit_data(&frame, protected, true) != Err(Error::Busy)
+            || hw.submit_data(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                protected,
+                true,
+            ) != Err(Error::Busy)
         {
             return TestResult::Fail("native QoS queue/TID/subtype/security/TXP geometry");
         }
@@ -812,6 +833,7 @@ fn mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies() -> TestRe
     hw.owner.published = true;
     if hw
         .submit_management(
+            crate::mt7921::vif_slots::Vif::HOME,
             &management_frame(),
             1,
             crate::mt7921::association::LegacyRate::ONE_MBPS,

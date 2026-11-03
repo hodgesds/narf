@@ -16,6 +16,7 @@ fn mt76_ap_actual_peer_and_bmc_raw_descriptors_require_both_packet_receipts() ->
             frame[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 3]);
             if Backend::submit_ap_frame(
                 &mut hw,
+                crate::mt7921::vif_slots::Vif::HOME,
                 &frame,
                 wcid,
                 crate::mt7921::association::LegacyRate::ONE_MBPS,
@@ -42,6 +43,7 @@ fn mt76_ap_actual_peer_and_bmc_raw_descriptors_require_both_packet_receipts() ->
             }
             if Backend::submit_ap_frame(
                 &mut hw,
+                crate::mt7921::vif_slots::Vif::HOME,
                 &frame,
                 wcid,
                 crate::mt7921::association::LegacyRate::ONE_MBPS,

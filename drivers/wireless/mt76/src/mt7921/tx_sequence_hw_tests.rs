@@ -50,14 +50,30 @@ fn native() -> Result<(), &'static str> {
             hw.arm_transmit_sequence(tid)
                 .map_err(|_| "native sample reserve")?;
             let frame = super::tx_pipeline_hw_tests::ethernet(0x63);
-            hw.submit_data_txd(&frame, true, true, true, false, tid)
-                .map_err(|_| "native true user MSDU sample")?;
+            hw.submit_data_txd(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                false,
+                tid,
+            )
+            .map_err(|_| "native true user MSDU sample")?;
             let bytes = hw.owner.storage.as_ref().unwrap().data.buffers[0].as_slice();
             if bytes[20..24] != [3, 4, 0, 0]
                 || bytes[28..32] != [0, 0, 0x28, 0]
                 || bytes[12..16] != (1u32 << 28 | 15 << 11 | 2).to_le_bytes()
                 || bytes[64..124] != frame
-                || hw.submit_data_txd(&frame, true, true, true, false, tid) != Err(Error::Busy)
+                || hw.submit_data_txd(
+                    crate::mt7921::vif_slots::Link::HOME,
+                    &frame,
+                    true,
+                    true,
+                    true,
+                    false,
+                    tid,
+                ) != Err(Error::Busy)
             {
                 return Err("native sample HOST/PID/AMSDU/BA/ciphertext owner");
             }
@@ -91,8 +107,16 @@ fn native() -> Result<(), &'static str> {
                     return Err("native TXS or DMA/TX_FREE alone manufactured a sample");
                 }
             }
-            hw.submit_data_txd(&frame, true, true, true, false, tid)
-                .map_err(|_| "normal MSDU after sample")?;
+            hw.submit_data_txd(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                false,
+                tid,
+            )
+            .map_err(|_| "normal MSDU after sample")?;
             let bytes = hw.owner.storage.as_ref().unwrap().data.buffers[1].as_slice();
             if bytes[20..24] != [0; 4]
                 || u32::from_le_bytes(bytes[28..32].try_into().unwrap()) & (1 << 10) == 0
@@ -105,8 +129,16 @@ fn native() -> Result<(), &'static str> {
             terminal(&mut words, &mut hw, 1, 2).map_err(|_| "normal native MSDU terminal")?;
             hw.arm_transmit_sequence(tid)
                 .map_err(|_| "native repeated sample")?;
-            hw.submit_data_txd(&frame, true, true, true, false, tid)
-                .map_err(|_| "second native sample")?;
+            hw.submit_data_txd(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                false,
+                tid,
+            )
+            .map_err(|_| "second native sample")?;
             let bytes = hw.owner.storage.as_ref().unwrap().data.buffers[2].as_slice();
             if bytes[20..24] != [4, 4, 0, 0] {
                 return Err("native PID reused after old receipt");
@@ -141,7 +173,7 @@ fn fragments() -> Result<(), &'static str> {
     first[..2].copy_from_slice(&[0x88, 0x45]);
     first[4] = 2;
     first[24] = 5;
-    hw.submit_fragment(&first, 1)
+    hw.submit_fragment(crate::mt7921::vif_slots::Link::HOME, &first)
         .map_err(|_| "first actual user fragment")?;
     if hw.transmit_sequence_published(5)
         || hw.owner.storage.as_ref().unwrap().data.buffers[0].as_slice()[20..24] != [0; 4]
@@ -152,7 +184,7 @@ fn fragments() -> Result<(), &'static str> {
     let mut last = first;
     last[1] = 0x41;
     last[22] = 1;
-    hw.submit_fragment(&last, 1)
+    hw.submit_fragment(crate::mt7921::vif_slots::Link::HOME, &last)
         .map_err(|_| "final actual user fragment")?;
     if !hw.transmit_sequence_published(5)
         || hw.owner.storage.as_ref().unwrap().data.buffers[1].as_slice()[20..24] != [3, 4, 0, 0]

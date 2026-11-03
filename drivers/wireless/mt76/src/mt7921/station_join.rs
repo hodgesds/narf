@@ -1301,8 +1301,12 @@ impl<B: Backend> Session<B> {
         } else {
             frame
         };
-        self.backend
-            .submit_management(frame, wcid, self.station.management_rate)?;
+        self.backend.submit_management(
+            self.station.link.vif(),
+            frame,
+            wcid,
+            self.station.management_rate,
+        )?;
         let completion = self
             .wait(TIMEOUT_MS, |backend| backend.management_complete())
             .await?;
@@ -1334,7 +1338,7 @@ impl<B: Backend> Session<B> {
                         return Ok(completion);
                     };
                     self.check_station_tx()?;
-                    if let Err(error) = self.backend.submit_fragment(&next, 1) {
+                    if let Err(error) = self.backend.submit_fragment(self.station.link, &next) {
                         return Err(self.fail_data(error));
                     }
                     self.data_pending.push_back(self.backend.now_ns());
@@ -1436,20 +1440,30 @@ impl<B: Backend> Session<B> {
             return self.start_fragments(fragments, tid);
         }
         let result = if self.station.tx_ba.active_tid(tid) {
-            self.backend
-                .submit_data_tid_aggregated(frame, self.station.security.is_some(), tid)
+            self.backend.submit_data_tid_aggregated(
+                self.station.link,
+                frame,
+                self.station.security.is_some(),
+                tid,
+            )
         } else if tid != 0 {
             self.backend.submit_data_tid(
+                self.station.link,
                 frame,
                 self.station.security.is_some(),
                 tid,
                 self.data_capacity() > 1,
             )
         } else if self.data_capacity() > 1 {
-            self.backend
-                .submit_data_pipelined(frame, self.station.security.is_some(), true)
+            self.backend.submit_data_pipelined(
+                self.station.link,
+                frame,
+                self.station.security.is_some(),
+                true,
+            )
         } else {
             self.backend.submit_data(
+                self.station.link,
                 frame,
                 self.station.security.is_some(),
                 self.station.wmm.is_some(),
@@ -1525,7 +1539,7 @@ impl<B: Backend> Session<B> {
         let Some(first) = fragments.pop_front() else {
             return Err(Error::Bounds);
         };
-        match self.backend.submit_fragment(&first, 1) {
+        match self.backend.submit_fragment(self.station.link, &first) {
             Ok(()) => {}
             Err(Error::Busy) => return Err(Error::Busy),
             Err(error) => return Err(self.fail_data(error)),
@@ -1561,7 +1575,7 @@ impl<B: Backend> Session<B> {
                     if let Err(error) = self.check_station_tx() {
                         return Err(self.fail_data(error));
                     }
-                    if let Err(error) = self.backend.submit_fragment(&next, 1) {
+                    if let Err(error) = self.backend.submit_fragment(self.station.link, &next) {
                         return Err(self.fail_data(error));
                     }
                     self.data_pending.push_back(self.backend.now_ns());

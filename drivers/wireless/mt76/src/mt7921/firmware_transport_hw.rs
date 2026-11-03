@@ -381,15 +381,22 @@ impl Hardware {
     // Private until association supplies a verified transmit-capable channel.
     fn submit_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.submit_80211(frame, None, |payload, token| {
-            packet_tx::management(frame, payload, token, wcid, rate)
+            let mut header = packet_tx::management(frame, payload, token, wcid, rate)?;
+            packet_tx::on_vif(&mut header, vif)?;
+            Ok(header)
         })
     }
-    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+    fn submit_fragment(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+    ) -> Result<(), Error> {
         // A final real QoS fragment has the actual MSDU sequence. Every
         // predecessor already retired in the serialized fragment owner.
         let sample_tid = if frame.first() == Some(&0x88)
@@ -400,8 +407,12 @@ impl Hardware {
         } else {
             None
         };
+        // The armed sample owner is the home peer's (`arm` = WCID 1).
+        let sample_tid = sample_tid.filter(|_| link == crate::mt7921::vif_slots::Link::HOME);
         self.submit_80211(frame, sample_tid, |payload, token| {
-            packet_tx::fragment(frame, payload, token, wcid)
+            let mut header = packet_tx::fragment(frame, payload, token, link.peer().into())?;
+            packet_tx::on_vif(&mut header, link.vif())?;
+            Ok(header)
         })
     }
     /// Publish one native 802.11 MPDU with the TXD `encode` builds for its
@@ -465,30 +476,42 @@ impl Hardware {
         dma_barrier();
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
-        self.submit_data_mode(frame, protected, qos, false)
+    fn submit_data(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error> {
+        self.submit_data_mode(link, frame, protected, qos, false)
     }
     fn submit_data_mode(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         qos: bool,
         pipelined: bool,
     ) -> Result<(), Error> {
-        self.submit_data_profile(frame, protected, qos, pipelined, false)
+        self.submit_data_profile(link, frame, protected, qos, pipelined, false)
     }
     fn submit_data_profile(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         qos: bool,
         pipelined: bool,
         aggregated: bool,
     ) -> Result<(), Error> {
-        self.submit_data_txd(frame, protected, qos, pipelined, aggregated, 0)
+        self.submit_data_txd(link, frame, protected, qos, pipelined, aggregated, 0)
     }
+    /// Linux mt76_connac2_mac_write_txwi: WCID = the link's peer, TXD1
+    /// OWN_MAC = omac_idx and LMAC queue = wmm_idx * 4 + ac (`on_vif`).
+    #[allow(clippy::too_many_arguments)]
     fn submit_data_txd(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         qos: bool,
@@ -515,7 +538,8 @@ impl Hardware {
         } else {
             storage.tokens.available()?
         };
-        let sample_pid = if qos {
+        // The armed sample owner is the home peer's (`arm` = WCID 1).
+        let sample_pid = if qos && link == crate::mt7921::vif_slots::Link::HOME {
             storage.tx_sequence.pid(tid)?
         } else {
             None
@@ -532,13 +556,15 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let mut header = if aggregated {
-            packet_tx::ethernet_tid_aggregated(frame, payload, token, protected, tid)?
-        } else if qos {
-            packet_tx::ethernet_tid(frame, payload, token, 1, protected, tid)?
-        } else {
-            packet_tx::ethernet(frame, payload, token, 1, protected)?
-        };
+        let mut header = packet_tx::station_data(
+            link,
+            frame,
+            payload,
+            token,
+            protected,
+            qos.then_some(tid),
+            aggregated,
+        )?;
         if qos && self.hw_amsdu {
             packet_tx::set_hw_amsdu(&mut header);
         }
@@ -1077,29 +1103,45 @@ impl Backend for Hardware {
     }
     fn submit_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
-        self.submit_management(frame, wcid, rate)
+        self.submit_management(vif, frame, wcid, rate)
     }
-    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
-        self.submit_fragment(frame, wcid)
+    fn submit_fragment(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+    ) -> Result<(), Error> {
+        self.submit_fragment(link, frame)
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
-        self.submit_data(frame, protected, qos)
+    fn submit_data(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error> {
+        self.submit_data(link, frame, protected, qos)
     }
     fn submit_ap_frame(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u8,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.submit_80211(frame, None, |payload, token| {
-            super::ap_packet::descriptor(frame, payload, token, wcid, rate)
+            super::ap_packet::descriptor_on(vif, frame, payload, token, wcid, rate)
         })
     }
-    fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error> {
+    fn arm_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        wcid: u8,
+    ) -> Result<(), Error> {
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
@@ -1108,16 +1150,17 @@ impl Backend for Hardware {
         if !storage.tokens.is_empty() {
             return Err(Error::Busy);
         }
-        storage.tx_sequence.arm_ap_management(wcid)
+        storage.tx_sequence.arm_ap_management_on(vif, wcid)
     }
     fn submit_ap_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u8,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.submit_80211(frame, Some(0), |payload, token| {
-            super::ap_packet::descriptor(frame, payload, token, wcid, rate)
+            super::ap_packet::descriptor_on(vif, frame, payload, token, wcid, rate)
         })
     }
     fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error> {
@@ -1179,6 +1222,7 @@ impl Backend for Hardware {
     }
     fn submit_data_pipelined(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         qos: bool,
@@ -1186,21 +1230,28 @@ impl Backend for Hardware {
         if !qos {
             return Err(Error::Bounds);
         }
-        self.submit_data_mode(frame, protected, qos, true)
+        self.submit_data_mode(link, frame, protected, qos, true)
     }
-    fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
-        self.submit_data_profile(frame, protected, true, true, true)
+    fn submit_data_aggregated(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+    ) -> Result<(), Error> {
+        self.submit_data_profile(link, frame, protected, true, true, true)
     }
     fn submit_data_tid_aggregated(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         tid: u8,
     ) -> Result<(), Error> {
-        self.submit_data_txd(frame, protected, true, true, true, tid)
+        self.submit_data_txd(link, frame, protected, true, true, true, tid)
     }
     fn submit_data_tid(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         tid: u8,
@@ -1209,7 +1260,7 @@ impl Backend for Hardware {
         if tid == 0 {
             return Err(Error::Bounds);
         }
-        self.submit_data_txd(frame, protected, true, pipelined, false, tid)
+        self.submit_data_txd(link, frame, protected, true, pipelined, false, tid)
     }
     fn arm_transmit_sequence(&mut self, tid: u8) -> Result<(), Error> {
         self.check()?;

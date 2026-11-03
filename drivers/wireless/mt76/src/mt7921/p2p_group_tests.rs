@@ -453,3 +453,72 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_p2p_vif_link_records_match_connac2
 );
+
+fn backend_link() -> Result<(), &'static str> {
+    use crate::mt7921::{
+        packet_tx,
+        vif_slots::{Link, Vif},
+    };
+    // Station data TXD: HOME is the historical WCID 1 / OMAC0 / WMM0 bytes
+    // for every descriptor variant; a group link changes only TXD0 Q_IDX
+    // (AC queues), TXD1 WLAN_IDX and TXD1 OWN_MAC.
+    let mut ethernet = [0u8; 60];
+    ethernet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    let group = Link::new(Vif::new(1).map_err(|_| "vif")?, 2).map_err(|_| "link")?;
+    for (tid, aggregated) in [
+        (None, false),
+        (Some(0), false),
+        (Some(5), false),
+        (Some(6), true),
+    ] {
+        let legacy = match tid {
+            None => packet_tx::ethernet(&ethernet, 0x1000, 7, 1, true),
+            Some(tid) if aggregated => {
+                packet_tx::ethernet_tid_aggregated(&ethernet, 0x1000, 7, 1, true, tid)
+            }
+            Some(tid) => packet_tx::ethernet_tid(&ethernet, 0x1000, 7, 1, true, tid),
+        }
+        .map_err(|_| "legacy data TXD")?;
+        let home = packet_tx::station_data(Link::HOME, &ethernet, 0x1000, 7, true, tid, aggregated)
+            .map_err(|_| "home data TXD")?;
+        if home != legacy {
+            return Err("HOME station data TXD changed bytes");
+        }
+        let data = packet_tx::station_data(group, &ethernet, 0x1000, 7, true, tid, aggregated)
+            .map_err(|_| "group data TXD")?;
+        let w0 = |b: &[u8; 64]| u32::from_le_bytes(b[0..4].try_into().unwrap());
+        let w1 = |b: &[u8; 64]| u32::from_le_bytes(b[4..8].try_into().unwrap());
+        if w0(&data) >> 25 != 4 + (w0(&legacy) >> 25)
+            || w1(&data) != (w1(&legacy) & !0x3ff) | 2 | 1 << 24
+            || data[8..] != legacy[8..]
+        {
+            return Err("group data TXD differs beyond WCID/OWN_MAC/WMM");
+        }
+    }
+    if packet_tx::station_data(Link::HOME, &ethernet, 0x1000, 7, true, None, true).is_ok() {
+        return Err("non-QoS aggregated data TXD accepted");
+    }
+    // The session's station owner hands its own link to every Backend TX:
+    // a home association and data exchange only ever reach vif 0.
+    let (mut session, bss) = super::super::super::ht20_tests::prepared(6, true);
+    run(Box::pin(session.associate_station_as(
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2Psk { psk: [0x55; 32] },
+        test_permission(),
+        &[],
+        Network::P2p,
+    )))
+    .map_err(|_| "client association")?;
+    if session.backend.tx_vifs.is_empty() || session.backend.tx_vifs.iter().any(|&v| v != 0) {
+        return Err("home station TX left the HOME vif");
+    }
+    Ok(())
+}
+fn mt76_p2p_backend_tx_carries_link() -> TestResult {
+    backend_link().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_backend_tx_carries_link
+);

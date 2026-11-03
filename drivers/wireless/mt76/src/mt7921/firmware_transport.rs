@@ -1347,8 +1347,11 @@ trait Backend {
     fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
     fn wtbl_idle(&mut self) -> Result<bool, Error>;
+    /// Station management on `vif` (TXD1 `OWN_MAC`, mt76_connac2_mac_write_txwi);
+    /// `wcid` is that vif's peer or BMC WCID.
     fn submit_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
@@ -1356,19 +1359,40 @@ trait Backend {
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
-    /// One 802.11 data fragment (`packet_tx::fragment`) on the data ring.
-    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error>;
-    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error>;
-    /// Raw AP frame, with no hardware encryption key or header translation.
+    /// One 802.11 data fragment (`packet_tx::fragment`) on the data ring, to
+    /// `link`'s peer WCID with its vif's OWN_MAC/WMM set.
+    fn submit_fragment(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+    ) -> Result<(), Error>;
+    /// Station data to `link`'s peer WCID; the TXD's OWN_MAC and AC queue
+    /// WMM set follow its vif (`packet_tx::on_vif`). `Link::HOME` is the
+    /// historical WCID 1 / OMAC0 / WMM0 descriptor.
+    fn submit_data(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error>;
+    /// Raw AP frame on the AP BSS `vif`, with no hardware encryption key or
+    /// header translation (`ap_packet::descriptor_on`).
     fn submit_ap_frame(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u8,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error>;
-    fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error>;
+    fn arm_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        wcid: u8,
+    ) -> Result<(), Error>;
     fn submit_ap_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u8,
         rate: crate::mt7921::association::LegacyRate,
@@ -1394,13 +1418,19 @@ trait Backend {
     }
     fn submit_data_pipelined(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         qos: bool,
     ) -> Result<(), Error> {
-        self.submit_data(frame, protected, qos)
+        self.submit_data(link, frame, protected, qos)
     }
-    fn submit_data_aggregated(&mut self, _frame: &[u8], _protected: bool) -> Result<(), Error> {
+    fn submit_data_aggregated(
+        &mut self,
+        _link: crate::mt7921::vif_slots::Link,
+        _frame: &[u8],
+        _protected: bool,
+    ) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
     /// Reserve a currently free, non-quarantined host-TXS PID after every older native packet
@@ -1423,6 +1453,7 @@ trait Backend {
     /// The non-BA path; agreement eligibility is supplied separately.
     fn submit_data_tid(
         &mut self,
+        _link: crate::mt7921::vif_slots::Link,
         _frame: &[u8],
         _protected: bool,
         _tid: u8,
@@ -1434,12 +1465,13 @@ trait Backend {
     /// `tid`. No BA or sequence authority follows from calling this method.
     fn submit_data_tid_aggregated(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         tid: u8,
     ) -> Result<(), Error> {
         if tid == 0 {
-            self.submit_data_aggregated(frame, protected)
+            self.submit_data_aggregated(link, frame, protected)
         } else {
             Err(Error::UnsupportedFirmware)
         }

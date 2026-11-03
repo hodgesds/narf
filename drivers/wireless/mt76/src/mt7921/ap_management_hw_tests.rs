@@ -36,10 +36,11 @@ fn native() -> Result<(), &'static str> {
                 frame[10] = 2;
                 frame[16] = 2;
                 frame[26] = 2;
-                hw.arm_ap_management(wcid)
+                hw.arm_ap_management(crate::mt7921::vif_slots::Vif::HOME, wcid)
                     .map_err(|_| "native AP management report reservation")?;
                 Backend::submit_ap_management(
                     &mut hw,
+                    crate::mt7921::vif_slots::Vif::HOME,
                     &frame,
                     wcid,
                     crate::mt7921::association::LegacyRate::ONE_MBPS,
@@ -83,7 +84,7 @@ fn native() -> Result<(), &'static str> {
     }
     let (mut words, mut hw) = rig().map_err(|_| "native wrong-WCID ACK fixture")?;
     hw.owner.published = true;
-    hw.arm_ap_management(13)
+    hw.arm_ap_management(crate::mt7921::vif_slots::Vif::HOME, 13)
         .map_err(|_| "foreign ACK reservation")?;
     let mut frame = vec![0; 30];
     frame[0] = 0xb0;
@@ -92,6 +93,7 @@ fn native() -> Result<(), &'static str> {
     frame[16] = 2;
     Backend::submit_ap_management(
         &mut hw,
+        crate::mt7921::vif_slots::Vif::HOME,
         &frame,
         13,
         crate::mt7921::association::LegacyRate::ONE_MBPS,

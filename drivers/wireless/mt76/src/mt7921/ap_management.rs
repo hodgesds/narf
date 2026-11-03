@@ -29,7 +29,7 @@ impl<B: Backend> Session<B> {
             .peers
             .get(destination)
             .filter(|p| p.associated)
-            .map_or(19, |p| p.wcid);
+            .map_or(owner.plan.vif.bmc(), |p| p.wcid);
         let rate = owner.plan.rate;
         self.ap_transmit_control_frame(authority, frame, wcid, rate, true)
             .await
@@ -44,7 +44,8 @@ impl<B: Backend> Session<B> {
     ) -> Result<bool, Error> {
         self.check_ap_request(&authority)?;
         let destination: [u8; 6] = frame.get(4..10).ok_or(Error::Bounds)?.try_into().unwrap();
-        super::super::ap_packet::descriptor(frame, 0, 1, wcid, rate)?;
+        let vif = self.ap_owner.as_ref().ok_or(Error::Busy)?.plan.vif;
+        super::super::ap_packet::descriptor_on(vif, frame, 0, 1, wcid, rate)?;
         // No key, peer or port changes here: retain the current copy epoch,
         // including management received while this TX is waiting for ACK.
         self.ap_owner.as_mut().unwrap().pending = Some(authority.clone());
@@ -55,9 +56,9 @@ impl<B: Backend> Session<B> {
             self.check_ap_request(&authority)?;
             let report = destination[0] & 1 == 0 && request_ack;
             if report {
-                self.backend.arm_ap_management(wcid)?;
+                self.backend.arm_ap_management(vif, wcid)?;
             }
-            self.backend.submit_ap_management(frame, wcid, rate)?;
+            self.backend.submit_ap_management(vif, frame, wcid, rate)?;
             self.data_pending.push_back(self.backend.now_ns());
             let terminal = self
                 .wait(super::super::TIMEOUT_MS, |b| b.management_complete())

@@ -109,6 +109,7 @@ impl<B: Backend> Session<B> {
         }
         let owner = self.ap_owner.as_ref().ok_or(Error::Busy)?;
         let own = owner.plan.own;
+        let vif = owner.plan.vif;
         let secure = owner.plan.config.privacy;
         let (header, body) = ap_packet::ethernet(own, ethernet, secure)?;
         // EAPOL belongs to explicit control-port authority, even after the
@@ -127,7 +128,7 @@ impl<B: Backend> Session<B> {
                 return Err(Error::Busy);
             }
             (
-                19,
+                vif.bmc(),
                 if secure {
                     Some(Target::Group(owner.default_group.ok_or(Error::Busy)?))
                 } else {
@@ -163,7 +164,7 @@ impl<B: Backend> Session<B> {
         if !self.ap_receive_current(self.receive_epoch)? {
             return Err(Error::Busy);
         }
-        self.backend.submit_ap_frame(&wire, wcid, rate)?;
+        self.backend.submit_ap_frame(vif, &wire, wcid, rate)?;
         self.data_pending.push_back(self.backend.now_ns());
         Ok(())
     }

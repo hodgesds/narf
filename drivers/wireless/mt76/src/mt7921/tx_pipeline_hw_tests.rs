@@ -19,7 +19,15 @@ fn mt76_native_all_tid_originators_keep_tid_queue_and_packet_ownership() -> Test
     ] {
         let frame = ethernet(tid);
         if hw
-            .submit_data_txd(&frame, true, true, true, true, tid)
+            .submit_data_txd(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                true,
+                tid,
+            )
             .is_err()
         {
             return TestResult::Fail("all-TID native aggregated publication");
@@ -75,7 +83,14 @@ fn mt76_native_originator_txd_eligibility_keeps_per_msdu_tokens_and_no_amsdu() -
     for n in 0..8 {
         let frame = ethernet(n as u8);
         if hw
-            .submit_data_profile(&frame, true, true, true, true)
+            .submit_data_profile(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                true,
+            )
             .is_err()
         {
             return TestResult::Fail("native originator queued packet");
@@ -151,8 +166,14 @@ fn native_order() -> Result<(), &'static str> {
             let first = round * packet_tx::PIPELINE;
             for offset in 0..packet_tx::PIPELINE {
                 let frame = ethernet((first + offset) as u8);
-                hw.submit_data_mode(&frame, true, true, true)
-                    .map_err(|_| "native pipeline publish")?;
+                hw.submit_data_mode(
+                    crate::mt7921::vif_slots::Link::HOME,
+                    &frame,
+                    true,
+                    true,
+                    true,
+                )
+                .map_err(|_| "native pipeline publish")?;
                 let slot = (first + offset) % DEPTH;
                 let ring = &hw.owner.storage.as_ref().unwrap().data;
                 let bytes = ring.buffers[slot].as_slice();
@@ -167,7 +188,13 @@ fn native_order() -> Result<(), &'static str> {
             }
             let cidx = words[(TX_DATA + 8) as usize / 4];
             if cidx != (first + packet_tx::PIPELINE) as u32 % DEPTH as u32
-                || hw.submit_data_mode(&ethernet(99), true, true, true) != Err(Error::Busy)
+                || hw.submit_data_mode(
+                    crate::mt7921::vif_slots::Link::HOME,
+                    &ethernet(99),
+                    true,
+                    true,
+                    true,
+                ) != Err(Error::Busy)
                 || words[(TX_DATA + 8) as usize / 4] != cidx
             {
                 return Err("pipeline overflow advanced native producer");
@@ -231,8 +258,14 @@ fn prefix() -> Result<(), &'static str> {
     let (mut words, mut hw) = rig().map_err(|_| "native prefix allocation")?;
     hw.owner.published = true;
     for n in 0..packet_tx::PIPELINE {
-        hw.submit_data_mode(&ethernet(n as u8), false, true, true)
-            .map_err(|_| "prefix submit")?;
+        hw.submit_data_mode(
+            crate::mt7921::vif_slots::Link::HOME,
+            &ethernet(n as u8),
+            false,
+            true,
+            true,
+        )
+        .map_err(|_| "prefix submit")?;
     }
     let records: Vec<_> = (1..=packet_tx::PIPELINE).map(|n| (n as u16, 0)).collect();
     inject_rx(&mut words, &hw, 1, &free(&records));

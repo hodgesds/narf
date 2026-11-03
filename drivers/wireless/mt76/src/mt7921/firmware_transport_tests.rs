@@ -284,6 +284,8 @@ struct Model {
     link_stall: bool,
     pm: PowerModel,
     data_tids: Vec<u8>,
+    /// The vif index (`OWN_MAC`) of every station/AP TX submission.
+    tx_vifs: Vec<u8>,
     hw_amsdu: bool,
     data_amsdu: Vec<bool>,
     sequence: crate::mt7921::tx_sequence::Owner,
@@ -425,6 +427,7 @@ impl Model {
             link_stall: false,
             pm: PowerModel::default(),
             data_tids: Vec::new(),
+            tx_vifs: Vec::new(),
             hw_amsdu: false,
             data_amsdu: Vec::new(),
             sequence: crate::mt7921::tx_sequence::Owner::new(),
@@ -1022,11 +1025,13 @@ impl Backend for Model {
     }
     fn submit_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         _wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.check()?;
+        self.tx_vifs.push(vif.index());
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
         if frame.first() == Some(&0xc0) {
@@ -1264,9 +1269,14 @@ impl Backend for Model {
         }
         Ok(())
     }
-    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+    fn submit_fragment(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+    ) -> Result<(), Error> {
         self.check()?;
-        let mut header = crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, wcid)?;
+        self.tx_vifs.push(link.bss());
+        let mut header = crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, link.peer().into())?;
         if frame[0] == 0x88 && frame[1] & 4 == 0 {
             let tid = frame[24] & 7;
             if let Some(pid) = self.sequence.pid(tid)? {
@@ -1278,33 +1288,48 @@ impl Backend for Model {
         self.frames.push((false, frame.to_vec()));
         Ok(())
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
+    fn submit_data(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error> {
+        self.tx_vifs.push(link.bss());
         self.model_data(frame, protected, qos, 0)
     }
     fn submit_ap_frame(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u8,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.check()?;
-        let header = super::ap_packet::descriptor(frame, 0x1000, 1, wcid, rate)?;
+        self.tx_vifs.push(vif.index());
+        let header = super::ap_packet::descriptor_on(vif, frame, 0x1000, 1, wcid, rate)?;
         self.data_headers.push(header);
         self.frames.push((false, frame.to_vec()));
         Ok(())
     }
-    fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error> {
+    fn arm_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        wcid: u8,
+    ) -> Result<(), Error> {
         self.check()?;
-        self.sequence.arm_ap_management(wcid)
+        self.sequence.arm_ap_management_on(vif, wcid)
     }
     fn submit_ap_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u8,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.check()?;
-        let mut header = super::ap_packet::descriptor(frame, 0x1000, 1, wcid, rate)?;
+        self.tx_vifs.push(vif.index());
+        let mut header = super::ap_packet::descriptor_on(vif, frame, 0x1000, 1, wcid, rate)?;
         if let Some(pid) = self.sequence.pid(0)? {
             crate::mt7921::tx_sequence::request(&mut header, pid)?;
             self.sequence.begin(0, 1)?;
@@ -1404,6 +1429,7 @@ impl Backend for Model {
     }
     fn submit_data_tid(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         tid: u8,
@@ -1412,17 +1438,31 @@ impl Backend for Model {
         if tid == 0 {
             return Err(Error::Bounds);
         }
+        self.tx_vifs.push(link.bss());
         self.model_data(frame, protected, true, tid)?;
-        let header = crate::mt7921::packet_tx::ethernet_tid(frame, 0x1000, 1, 1, protected, tid)?;
+        let header = crate::mt7921::packet_tx::ethernet_tid(
+            frame,
+            0x1000,
+            1,
+            link.peer().into(),
+            protected,
+            tid,
+        )?;
         self.data_tids.push(tid);
         *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
         Ok(())
     }
-    fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
-        self.submit_data_tid_aggregated(frame, protected, 0)
+    fn submit_data_aggregated(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+    ) -> Result<(), Error> {
+        self.submit_data_tid_aggregated(link, frame, protected, 0)
     }
     fn submit_data_tid_aggregated(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         tid: u8,
@@ -1430,9 +1470,16 @@ impl Backend for Model {
         if tid >= 8 || self.tx_ba_native_tids & (1 << tid) == 0 {
             return Err(Error::Bounds);
         }
+        self.tx_vifs.push(link.bss());
         self.model_data(frame, protected, true, tid)?;
-        let header =
-            crate::mt7921::packet_tx::ethernet_tid_aggregated(frame, 0x1000, 1, protected, tid)?;
+        let header = crate::mt7921::packet_tx::ethernet_tid_aggregated(
+            frame,
+            0x1000,
+            1,
+            link.peer().into(),
+            protected,
+            tid,
+        )?;
         self.data_tids.push(tid);
         *self.data_aggregation.last_mut().unwrap() = true;
         *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
