@@ -431,6 +431,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let _power =
             crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
                 .map_err(|_| ModesetError::PowerWellTimeout)?;
+        // The EDID read below is AUX traffic: raise this port's Xe-LPDP AUX
+        // power request first (intel_dp_aux_xfer holds the AUX power domain
+        // across every transfer). modeset_checked re-asserts it for the
+        // fixed-mode entry, which reaches the AUX channel only from there.
+        crate::intel_gpu_xelpg_tc::aux_power_enable(self.mmio, self.port)
+            .map_err(|_| ModesetError::PowerWellTimeout)?;
 
         // Step 1: pick the mode (EDID over this port's AUX, or
         // the caller's fallback).
