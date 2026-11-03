@@ -8261,8 +8261,9 @@ and Mesa rendering-to-scanout acceptance are separate gates.
 **Intel fixed hardware cursor.** Qualified display14.00 MTL/Arrow owned Pipe-A
 modes admit legacy CURSOR/CURSOR2 with linear 64x64 ARGB8888. This profile does
 not advertise universal cursor planes or HOTSPOT support. Pipe-off setup owns
-and verifies the PM_DEMAND acknowledgement (conservative bandwidth 0xffff,
-no SAGV, computed CDCLK/voltage and DDI/PHY/PLL/scaler resource counts), the
+and verifies the PM_DEMAND acknowledgement (the computed QGV peak bandwidth
+when SAGV is proven safe, otherwise 0xffff with SAGV masked; computed
+CDCLK/voltage and DDI/PHY/PLL/scaler resource counts), the
 computed CDCLK (raised or lowered), four powered DBUF slices, joined
 MBUS/tracker/DBOX credits, IPC, and disjoint primary/cursor DDB allocations
 and display-14 source-latency watermarks. Partial setup failure restores the

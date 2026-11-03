@@ -2284,7 +2284,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
-| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning and the Pipe B-D owner API (no production port caller yet); SAGV/QGV, bigjoiner, DSC and VRR remain |
+| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
@@ -3533,4 +3533,25 @@ caller exists yet, so these entries are reached only by native fixtures.
 Seven more fixtures cover DDB ordering and cycle refusal, MBUS join and
 unjoin sequencing, adding and removing a pipe beside a lit panel, write-free
 refusals, reverse undo and the pipe owner's enable/release and refusals.
-SAGV enablement with QGV derating is still open.
+
+SAGV is now enabled when Linux would enable it (`intel_gpu_xelpg_bw`).
+`MTL_MEM_SS_INFO_GLOBAL` and the QGV point registers describe the DRAM. The
+transcription of `tgl_get_bw_info` with `mtl_sa_info` derives each point's
+derated and peak bandwidth per plane-count group, and `mtl_find_qgv_points`
+selects the point with the least headroom that still carries the summed data
+rate. PM demand `QCLK_GV_BW` then carries that point's peak bandwidth in
+100 MB/s units. SAGV stays masked (0xffff) whenever SAGV is not controllable
+(unsupported DRAM type, fewer than two QGV points), in which case the SAGV
+block time, and so the SAGV watermarks, are zero as in `intel_sagv_init`. It
+also stays masked when any active pipe has an enabled plane, or visible
+cursor, whose post-DDB SAGV watermark is disabled (`tgl_crtc_can_enable_sagv`,
+including the vblank prefill limit). A pipe set that allows SAGV but exceeds
+every point's derated bandwidth is refused as `BandwidthExceeded`, the
+source's -EINVAL. The PM demand bracket orders transitions in both paths:
+masking happens in the pre-plane request and unmasking only in the post-plane
+request, after every plane and DDB update. A failed commit restores the
+original request. The fixed Pipe-A capture now checks the exact computed
+QCLK_GV_BW rather than a constant 0xffff. Three fixtures cover QGV decode
+and bandwidth math, enable/mask/refusal decisions, and all-pipes-off, live
+and failure transitions. One existing latency fixture now expects the zero
+block time without SAGV control. Pipe scalers remain open.
