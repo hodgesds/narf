@@ -1164,6 +1164,23 @@ EP0 transfer/executable-cap discipline; chip steps live in
   before any transfer. Two-path RF reads use `rtl8192e_radio::read_rfreg`
   (path-A edge strobe, path-specific HSSI/LSSI/HSPI readback).
 
+- Packet codec (`rtl8xxxu/rtl8192e_packet.rs`): the 40-byte gen2 TX
+  descriptor from `rtl8xxxu_tx` common fields + `rtl8xxxu_fill_txdesc_v2`
+  (OWN/FS/LS/BMC, queue + macid, AMPDU density with `AGG_ENABLE` only on an
+  operational TID else `AGG_BREAK`, management `USE_DRIVER_RATE` + retry 6,
+  DATA rate 0 with the `0x1f` fallback limit — firmware RA picks the rate —
+  RTS/CTS + HW RTS at 24M for A-MPDU/RTS, CTS-to-self without HW RTS,
+  short preamble, SN in txdw9; checksum over the first 32 bytes only).
+  HW_SEQ_ENABLE stays clear (the station supplies SNs, as on RTL8188EU).
+  `rtl8xxxu_parse_rxdesc24`: records at `roundup(…, 8)` until < 24 bytes
+  remain, every extent checked, CRC/ICV-error MPDUs dropped, 80 MHz `bw`
+  refused, `rpt_sel` records parsed as gen2 C2H (`C2H_8723B_RA_REPORT`
+  rate/SGI/macid/LDPC/TXBF/noisy and the optional `bw`). `Frame::admitted`
+  refuses hardware-decrypted, fragmented, A-MSDU, LDPC/STBC, HT40 without
+  an HT40 admission and A-MPDU members without a recipient BA session.
+  RX signal: `rtl8192e_cck_rssi` (report-type table 0/1) for CCK, PWDB for
+  OFDM/HT.
+
 The owner reaches `RadioReady` for RTL8192EU after calibration. The production
 probe stays detection-only for this family; no table, calibration, packet
 or station capability is advertised.

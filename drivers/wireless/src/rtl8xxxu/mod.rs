@@ -63,6 +63,7 @@ pub mod rtl8188e;
 pub mod rtl8192e;
 pub mod rtl8192e_init;
 mod rtl8192e_iqk;
+pub mod rtl8192e_packet;
 mod rtl8192e_phy;
 mod rtl8192e_radio;
 mod rtl8192e_tables;
@@ -322,3 +323,6 @@ mod rate_adaptation_tests;
 
 #[cfg(feature = "kernel-test")]
 mod rtl8192e_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rtl8192e_packet_tests;
