@@ -20,7 +20,7 @@ pub(super) fn pause(paused: bool) -> [u8; 32] {
 /// `rtw89_fw_h2c_macid_pause` (`struct rtw89_fw_macid_pause_grp`): pause
 /// group `macid >> 5`, bit `macid & 31`, with only that bit in the mask
 /// (mac.c `rtw89_mac_set_macid_pause`).
-pub(super) fn pause_at(macid: u8, paused: bool) -> [u8; 32] {
+pub(in crate::rtw89) fn pause_at(macid: u8, paused: bool) -> [u8; 32] {
     let mut bytes = [0; 32];
     let group = usize::from(macid >> 5);
     let bit = 1u32 << (macid & 31);
@@ -29,7 +29,7 @@ pub(super) fn pause_at(macid: u8, paused: bool) -> [u8; 32] {
     bytes
 }
 /// `R_AX_SS_MACID_PAUSE_0 + 4 * group` and the bit of `macid`.
-pub(super) fn pause_register(macid: u8) -> (u32, u32) {
+pub(in crate::rtw89) fn pause_register(macid: u8) -> (u32, u32) {
     (0x9eb0 + 4 * u32::from(macid >> 5), 1 << (macid & 31))
 }
 pub(super) fn cam(
@@ -152,7 +152,7 @@ pub(super) fn default_cctl() -> [u8; 68] {
 }
 /// fw.c `rtw89_fw_h2c_default_cmac_tbl` for `macid`; `ap` adds the
 /// `NET_TYPE_AP_MODE` `DATA_DCM` 0 setter.
-pub(super) fn default_cctl_at(macid: u8, ap: bool) -> [u8; 68] {
+pub(in crate::rtw89) fn default_cctl_at(macid: u8, ap: bool) -> [u8; 68] {
     let mut bytes = [0; 68];
     word(&mut bytes, 0, u32::from(macid & 0x7f) | 1 << 7); // MACID, operation1
     field(&mut bytes, 5, 0x0000_0e00, 0); // source TX power mode
@@ -188,7 +188,12 @@ pub(super) fn fixed_cctl(ghz5: bool) -> [u8; 68] {
 /// `DATA_DCM` 0 (`NET_TYPE_AP_MODE`) and, for a peer (`Some(true)`), the
 /// non-HE `BSR_QUEUE_SIZE_FORMAT` 0 (`Some(false)` is the AP vif itself,
 /// `rtwsta_link == NULL`).
-pub(super) fn fixed_cctl_at(ghz5: bool, macid: u8, port: u8, ap: Option<bool>) -> [u8; 68] {
+pub(in crate::rtw89) fn fixed_cctl_at(
+    ghz5: bool,
+    macid: u8,
+    port: u8,
+    ap: Option<bool>,
+) -> [u8; 68] {
     let lowest = if ghz5 { 4 } else { 0 }; // RTW89_HW_RATE_OFDM6 / CCK1
     let mut bytes = [0; 68];
     word(&mut bytes, 0, u32::from(macid & 0x7f) | 1 << 7);
@@ -280,7 +285,7 @@ pub(in crate::rtw89) struct HeRa {
     /// Peer DCM RX constellation nonzero (`DCM_MAX_CONST_RX_16_QAM` mask).
     pub(in crate::rtw89) dcm: bool,
 }
-pub(super) fn ra(rates: u16) -> Option<[u8; 16]> {
+pub(in crate::rtw89) fn ra(rates: u16) -> Option<[u8; 16]> {
     ra_ht(rates, None)
 }
 /// `get_mcs_ra_mask(mcs_map, 11, 2)` (phy.c `get_he_ra_mask`): per NSS,
@@ -454,11 +459,19 @@ pub(super) fn wmm_edca(
 /// mac.c `rtw89_mac_dmac_tbl_init` / `rtw89_mac_cmac_tbl_init` (AX,
 /// nonsecure): the indirect `R_AX_FILTER_MODEL_ADDR` window base and the
 /// words written through `R_AX_INDIR_ACCESS_ENTRY` for `macid`.
-pub(super) fn table_init(macid: u8) -> ([u32; 4], u32, [u32; 8]) {
+pub(in crate::rtw89) fn table_init(macid: u8) -> ([u32; 4], u32, [u32; 8]) {
     let dmac = core::array::from_fn(|i| 0x1880_0000 + (u32::from(macid) << 4) + (i as u32) * 4);
     (
         dmac,
         0x1884_0000 + u32::from(macid) * 32,
         [4, 0x400a_0004, 0, 0, 0, 0x0e43_000b, 0, 0x000b_8109],
     )
+}
+/// fw.c `rtw89_fw_h2c_ra`: place `RTW89_H2C_RA_W0_MACID` (bits 15:8) into
+/// an `ra`/`ra_ht`/`ra_he` body built for MACID0.
+pub(in crate::rtw89) fn ra_at(macid: u8, body: [u8; 16]) -> [u8; 16] {
+    let mut body = body;
+    let w0 = u32::from_le_bytes(body[..4].try_into().unwrap()) & !0xff00 | u32::from(macid) << 8;
+    word(&mut body, 0, w0);
+    body
 }

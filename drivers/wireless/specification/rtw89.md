@@ -2748,6 +2748,62 @@ U-APSD capability is advertised. Eight cases are written, unexecuted:
 `smoke_rtw89_ap_wire_beacon_update_tim_offset_and_rate`,
 `smoke_rtw89_ap_wire_hiq_mgmt_and_ac_placement`.
 
+### RTL8852B AP MAC/firmware control owner (partial; no native caller)
+
+`station_control/codec.rs` is now MACID/port parameterised (`pause_at`/
+`pause_register`, `Cam`/`cam_entry` with separate address/BSSID valid,
+`default_cctl_at`, `fixed_cctl_at`, `ba_cam_at`, `ra_at`, `table_init`);
+the station keeps MACID0/port0 and its bytes are unchanged (the old
+builders are the `(0, 0)` wrappers).
+
+`ap_control.rs` (`ApController`) is the AP control-plane owner for one AP
+link on MAC0/port0/MACID0 with address and BSSID CAM 0, running over the
+retained `station_control::Interface` (current device capability around
+each register transaction, exact H2C DONE_ACK, fail-closed admission):
+
+- `initialize` = mac.c `rtw89_mac_vif_init`: `crypto_off`, AX
+  `rtw89_mac_port_update`, nonsecure DMAC/CMAC table init, MACID0 unpause
+  (applied-bit fence), `ROLE_MAINTAIN(CREATE)` `SELF_ROLE_AP`, `JOIN_INFO`
+  (`dis_conn`), address/BSSID CAM, AP default CMAC table.
+- `port_update` follows every `rtw89_mac_port_cfg_*` step in source order:
+  `func_sw` (only with `PORT_FUNC_EN`: `rtw89_mac_bcn_drop` incl. both
+  `rtw89_mac_check_packet_ctrl` BCNQ polls that, like Linux, only warn on
+  timeout, `beacon_int + 1` ms, `TSFTR_RST`, `BCN_CNT_TMR`), TX/RX report
+  off, `NET_TYPE_AP_MODE`, `TBTT_PROHIB_EN|BRK_SETUP`, no BSSID fit/TSF
+  update, `BCNTX_EN`, beacon space, `hiq_win` 16, `UPD_HGQMD|UPD_TIMIE` and
+  `DTIM_NUM`, HIQ drop clear, setup 2/hold 200/mask 0/TBTT early 5/agg 1,
+  BSS colour 0, `PORT_FUNC_EN`, 20 us, beacon early 160 and BCAID 0.
+  `rtw89_mac_port_tsf_resync_all` is a no-op for the single AP vif.
+  Persistent fields are read back; the `TSFTR_RST` strobe and counter
+  reset are not.
+- `start` = `rtw89_ops_start_ap` (port program with the BSS beacon
+  interval/DTIM, vif assoc CMAC table with `ULDL` 0/`DATA_DCM` 0,
+  `TYPE_CHANGE`, `JOIN_INFO`, CAM); `publish_beacon` =
+  `rtw89_fw_h2c_update_beacon` (class 5 function 5).
+- `add_peer`/`associate_peer`/`remove_peer` = core.c AP branches of
+  `rtw89_core_sta_link_add`/`_assoc`/`_disconnect`/`_remove`: lowest-free
+  MACID of 128 (`rtw89_acquire_mac_id`), unpause, `SELF_ROLE_AP_CLIENT`
+  role, default and assoc CMAC tables, address CAM from the 128-entry pool
+  (`acam_num`) with AID, `JOIN_INFO` connected/`NO_LINK`, CAM invalidated
+  before release (vif BSSID CAM stays valid), RA with the peer MACID,
+  `ROLE_MAINTAIN(REMOVE)` and MACID release.
+- `stop` = `rtw89_ops_stop_ap` + `rtw89_mac_vif_deinit`.
+
+Host crypto is retained (`RTW89_ADDR_CAM_SEC_NORMAL`, no security entries,
+TX/RX hardware crypto off), so per-peer keys stay with the host RSNA owner,
+as in the station profile.
+
+Still missing for `uapsd`: a native caller (Native owner selection and
+signed AP channel/power admission including `rtw89_chip_rfk_channel`),
+multi-peer TXWD MACID/port and RX MACID classification, the HIQ/CH9 ring,
+the narf_wireless AP controls, and wiring `ap_ps.rs` (buffering, TIM via
+`publish_beacon` on `set_tim`, PS-Poll, U-APSD EOSP status). No AP or
+U-APSD capability is advertised. Four new cases are written, unexecuted:
+`smoke_rtw89_link_codec_macid_port_keeps_station_bytes`,
+`smoke_rtw89_ap_control_vif_init_and_start_match_linux_order`,
+`smoke_rtw89_ap_control_peer_lifecycle_allocates_macid_and_cam`,
+`smoke_rtw89_ap_control_beacon_publication_and_fail_closed`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -2879,7 +2935,7 @@ triage above remains separate from implementation.
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
 | `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |
-| `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), but no native AP runtime (port/CAM/peer MACIDs/beacon submission/HIQ ring/start_ap) composes them. |
+| `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), and the AP MAC/firmware control owner (`ap_control.rs`: port program, CAM, CMAC/DMAC tables, MACID pause, peer MACIDs, BCN_UPD, start/stop; §3 "RTL8852B AP MAC/firmware control owner") exist, but no native caller, signed AP channel/power admission, multi-peer TXWD/RX MACID path, HIQ/CH9 ring or public AP controls compose them. |
 | `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
 | `rtl8852a` | AX identity, power and firmware scaffolds do not establish this chip's native station. The retained Controller and N52B qualification admit RTL8852B only; A still needs its exact security/firmware, BB/RF/calibration/power and packet/station composition. |
 | `rtl8851b` | Source identifies the1TX/1RX dual-band chip, but the retained B-only operating/qualification owner cannot be reused as its runtime. Complete chip-specific firmware/security, RF/power and packet/station ownership remain missing. |

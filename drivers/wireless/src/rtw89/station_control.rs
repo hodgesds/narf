@@ -768,7 +768,7 @@ impl Controller {
 fn unicast(mac: [u8; 6]) -> bool {
     mac != [0; 6] && mac[0] & 1 == 0
 }
-fn checked<I: Interface, T>(
+pub(super) fn checked<I: Interface, T>(
     io: &mut I,
     admission: Option<&Admission>,
     operation: impl FnOnce(&mut I) -> Result<T, Error>,
@@ -779,7 +779,7 @@ fn checked<I: Interface, T>(
         io.with_current(operation)
     }
 }
-fn read(io: &mut impl Io, register: u32) -> Result<u32, Error> {
+pub(super) fn read(io: &mut impl Io, register: u32) -> Result<u32, Error> {
     let value = io.read32(register)?;
     if value == u32::MAX {
         Err(Error::Gone)
@@ -797,7 +797,7 @@ pub(super) fn awake(io: &mut impl Io) -> Result<(), Error> {
         Ok(())
     }
 }
-fn modify(io: &mut impl Io, register: u32, mask: u32, value: u32) -> Result<(), Error> {
+pub(super) fn modify(io: &mut impl Io, register: u32, mask: u32, value: u32) -> Result<(), Error> {
     let old = read(io, register)?;
     io.write32(register, (old & !mask) | (value & mask))?;
     if read(io, register)? & mask != value & mask {
@@ -811,7 +811,7 @@ fn port(io: &mut impl Io, associated: bool) -> Result<(), Error> {
     let value = (1 << 2) | if associated { (2 << 10) | (1 << 4) } else { 0 };
     modify(io, 0xc400, mask, value)
 }
-fn crypto_off(io: &mut impl Io) -> Result<(), Error> {
+pub(super) fn crypto_off(io: &mut impl Io) -> Result<(), Error> {
     modify(io, 0x9d00, 31, 0)?; // TX encryption and all hardware decryption
     modify(io, 0x9d04, 3, 0) // retain original MPDU: no appended MIC/ICV
 }
@@ -838,7 +838,7 @@ pub(super) fn tables_at(io: &mut impl Io, macid: u8) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn command(
+pub(super) async fn command(
     io: &mut impl Interface,
     class: u8,
     function: u8,
@@ -911,7 +911,7 @@ async fn edca(
 mod monitor;
 pub(super) use monitor::initialize as initialize_monitor;
 #[path = "station_control/codec.rs"]
-mod codec;
+pub(super) mod codec;
 pub(super) use codec::{HeRa, HtRa};
 
 pub(super) fn profile_fingerprint() -> [u8; 32] {
