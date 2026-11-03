@@ -54,7 +54,8 @@ pub(super) fn permits(flags: u8, p: DataProfile) -> bool {
 
 /// Locally advertised RX coding: LDPC only with source `rx_ldpc`.
 pub(super) fn rx_ldpc(did: u16) -> bool {
-    did == 0xc822
+    // `rtw8822c_hw_spec` and `rtw8822b_hw_spec` set `.rx_ldpc = true`.
+    matches!(did, 0xc822 | 0xb822)
 }
 
 /// Source `tx.c`: coding follows the negotiated peer capability and the

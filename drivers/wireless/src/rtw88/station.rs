@@ -285,8 +285,8 @@ impl super::dm::Authority for Live<'_> {
     ) -> Result<T, firmware_transport::Error> {
         self.admission.run(|| self.grant.invoke(self.gate, op))
     }
-    fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
-        self.gate.b22_indices()
+    fn b22_indices(&self) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
+        self.gate.b22_rate_indices()
     }
     fn b22_temperature(&self, value: u8) -> Result<(), firmware_transport::Error> {
         self.gate.b22_temperature(value)

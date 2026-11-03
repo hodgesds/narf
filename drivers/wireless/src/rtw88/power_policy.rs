@@ -391,14 +391,14 @@ impl ExtensionBase {
                 f.cck = b.permission.gains;
                 f
             }),
-            ExtensionChip::B22(_) => None,
+            ExtensionChip::B22(b) => b.ht_facts(),
         };
         let group = |five: bool, g: usize| match &self.chip {
             ExtensionChip::C21(b) if five => b.ht5_group(g).map(|m| (m, None)),
             ExtensionChip::C21(b) => b.ht_group(g).map(|m| (m, None)),
             ExtensionChip::C22(b) if five => b.calibration.board.ht5_groups[g],
             ExtensionChip::C22(b) => b.calibration.board.ht_groups[g],
-            ExtensionChip::B22(_) => None,
+            ExtensionChip::B22(b) => b.power().ht_limits(five, g),
         };
         overlay(self.did(), facts, self.channel.as_deref(), group)
     }
@@ -434,6 +434,18 @@ impl ExtensionBase {
         }
         super::channel_policy::Record::decode(self.did(), self.channel.as_ref()?.payload())?
             .ofdm5_indices()
+    }
+    /// B22 per-path DESC_RATE 0..11 TXAGC indices of this base's primary:
+    /// the bound `N2BO` record's, else the `N2BP` channel-1 ones.
+    pub(super) fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+        let ExtensionChip::B22(b) = &self.chip else {
+            return None;
+        };
+        match &self.channel {
+            Some(g) => super::channel_policy::Record::decode(0xb822, g.payload())
+                .map(|r| [r.indices, r.indices_b]),
+            None => Some(b.power().indices()),
+        }
     }
     pub(super) fn temperature(&self, value: u8) -> Result<(), super::firmware_transport::Error> {
         match &self.chip {
@@ -530,7 +542,7 @@ fn overlay(
     facts.maximum_2ss = maximum_2ss.filter(|_| facts.maximum_2ss.is_some());
     match did {
         0xc822 => facts.cck = record.gains,
-        0xc821 => facts.legacy = record.indices,
+        0xc821 | 0xb822 => facts.legacy = record.indices,
         _ => return None,
     }
     Some(facts)
@@ -781,6 +793,22 @@ impl Gate {
                 .map(|r| [r.indices, r.indices_b]),
             None => Some(grant.power().indices()),
         }
+    }
+    /// B22 per-path TXAGC indices of the committed program for DESC_RATE
+    /// 0..count: [`Self::b22_indices`], plus the bound `N2BH` HT words
+    /// (`ht::Grant::b22_rates`; count 20 for 1SS, 28 for 2SS).
+    pub(super) fn b22_rate_indices(
+        &self,
+    ) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
+        if let Some(g) = &self.ht {
+            return g.b22_rates();
+        }
+        let legacy = self.b22_indices()?;
+        let mut rates = [[0; super::tracking8822b::RATES]; 2];
+        for (r, l) in rates.iter_mut().zip(legacy) {
+            r[..12].copy_from_slice(&l);
+        }
+        Some((rates, 12))
     }
     /// B22 `N2BP` measured thermal windows (`operating8822b::Grant::temperature`).
     pub(super) fn b22_temperature(
@@ -1164,7 +1192,7 @@ impl Gate {
     }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         let facts = match &self.scope {
-            Scope::B22(..) => return None,
+            Scope::B22(b, _) => b.ht_facts(),
             Scope::C21(b) => b.ht_facts(),
             Scope::C22 {
                 calibration,
@@ -1180,7 +1208,7 @@ impl Gate {
             Scope::C21(b) => b.ht_group(g).map(|m| (m, None)),
             Scope::C22 { calibration, .. } if five => calibration.board.ht5_groups[g],
             Scope::C22 { calibration, .. } => calibration.board.ht_groups[g],
-            Scope::B22(..) => None,
+            Scope::B22(b, _) => b.power().ht_limits(five, g),
         };
         overlay(self.did(), facts, self.channel.as_deref(), group)
     }

@@ -23,7 +23,6 @@
 use super::{
     dm::{Authority, Ewma},
     firmware_transport::{enclosed, Error, Io},
-    operating8822b,
     qualification::{Kind, PAYLOAD},
     radio8822b,
 };
@@ -107,6 +106,9 @@ const MAX_OFFSET: u8 = 0xf;
 const MAX_POWER_INDEX: u8 = 0x3f;
 
 /// `rtw_phy_config_swing_table` 2.4 GHz rows: (positive, negative) for one
+/// DESC_RATE 0x00..0x1b: legacy12, HT MCS0..15 (the rates a 2T2R B22
+/// TXAGC program qualifies; VHT is not tracked).
+pub(super) const RATES: usize = 28;
 /// path at one DESC_RATE (CCK rates 0..3 use the CCK tables).
 fn swing(rate: u8, path: usize) -> (&'static [u8; TABLE], &'static [u8; TABLE]) {
     match (rate <= 3, path) {
@@ -176,20 +178,23 @@ impl Tracker {
         self.delta
     }
     /// `rtw8822b_pwr_track` for the current `dm_info->tx_rate` (DESC_RATE).
-    /// `indices` are the committed channel's coded TXAGC indices and
+    /// `indices` are the committed program's per-path coded TXAGC indices
+    /// for DESC_RATE 0..`indices.1` (legacy12, plus HT MCS0..7/0..15 under a
+    /// bound `N2BH`, [`super::power_policy::Gate::b22_rate_indices`]) and
     /// `temperature` the `N2BP` thermal-window check.
     pub(super) async fn pass(
         &mut self,
         io: &mut impl Io,
         auth: &impl Authority,
-        indices: [[u8; operating8822b::LEGACY]; 2],
+        indices: ([[u8; RATES]; 2], usize),
         temperature: impl Fn(u8) -> Result<(), Error>,
         limits: Limits,
         tx_rate: u8,
     ) -> Result<Pass, Error> {
         // rtw8822b_phy_pwrtrack: an erased thermal meter disables tracking;
         // refused here before any write.
-        if self.efuse == 0xff || usize::from(tx_rate) >= operating8822b::LEGACY {
+        let (indices, count) = indices;
+        if self.efuse == 0xff || usize::from(tx_rate) >= count.min(RATES) {
             return Err(Error::Unsupported);
         }
         if !self.triggered {

@@ -285,6 +285,10 @@ impl Grant {
     pub(super) fn ofdm5_indices(&self) -> Option<[u8; 8]> {
         self.base.ofdm5_indices()
     }
+    /// B22 per-path legacy TXAGC indices of the bound primary.
+    pub(super) fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+        self.base.b22_indices()
+    }
     pub(super) fn matches(&self, gate: &Gate) -> bool {
         gate.extension_request().as_ref() == Some(&self.request)
     }

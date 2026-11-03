@@ -665,6 +665,62 @@ record ceiling and the bound channel record's span. The DATA/RA/EDCA program
 is the shared chip-independent one. No `N2BL` asset is provisioned. Case
 written, unexecuted: `smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs`.
 
+#### RTL8822BE HT20 1SS/2SS (`N2BH`)
+
+B22 joins the shared HT20 family (`ht.rs`, "C21/C22 separately qualified
+HT20 and SGI20 station" below) over a bound `N2BL`. Facts
+(`operating8822b::Grant::ht_facts`, `Envelope::ht_limits`): the firmware
+hardware report the `N2BQ` board bound, path A's legacy indices and, per
+group, `phy.c::rtw_phy_get_2g_tx_power_index` HT20 with `txgi_factor` 1
+(`operating8822b::ht20_limit`: `bw40_base[g]` + `ht_1s_diff.bw20`, plus
+`ht_2s_diff.bw20` for 2SS, ≤ `max_power_index` 0x3f) or the 5GHz
+`band5::Power5g::bw20`, intersected over both paths; a bound `N2BO` primary
+supplies its own group and legacy indices. As on C21/C22 local HT needs a
+VHT-protocol (`ptcl` 3) report; 2T2R (two streams and antennas) and complete
+HT2S cells add the two-stream child. RX LDPC is advertised
+(`rtw8822b_hw_spec.rx_ldpc`, `coding::rx_ldpc`).
+
+Requests: `rtw88/rtw8822be-ht20-v1-<mac>.bin` (1SS, the generic 192-byte
+layout with magic `N2BH`) and the child
+`rtw88/rtw8822be-ht20-2ss-v2-<mac>.bin` (preferred when present). The v2
+record is the 256-byte N22H v2 layout with magic `N2BH`, path-A MCS0..15
+indices at 70..86 and path-B MCS8..15 at 174..182 (zero 182..256); every
+index is ≤ the intersected 1S/2S ceiling. There is no path change:
+`rtw8822b_config_trx_mode(AB, AB, false)` already leaves 1SS on path A
+(`REG_CDDTXP` 0x93c[31:20] = 0x001) and 2SS on A+B (`REG_TXPSEL1`
+0x940[15:4] = 0x43), so the C22 TX-pause/RX-park path switch is not used.
+The program (`ht::Grant::program`) takes the C21-style fresh RF42 conversion
+(SIPI 0xc90, 2 s, read 0x2908) inside the `N2BP` windows, then writes the
+`rtw8822b_set_tx_power_index_by_rate` HT words 0x0c..0x1b of both paths
+(0x1d00/0x1d80 + 0xc..0x18): path A MCS0..7, both paths MCS8..15 for v2,
+path-B HT1S zero; legacy words keep the base/`N2BO` values. Readback
+(`readback_b22`) checks 0x93c/0x940, both paths' words 0..6 and host-only
+crypto. Under a bound `N2BH` the `N2BD` power tracker covers DESC_RATE
+0..19/0..27 (`Gate::b22_rate_indices`; path-B HT1S headroom uses path A's
+index); HT40/VHT80 B22 readbacks refuse until the B22 wide records exist. No
+`N2BH` asset is provisioned. Case written, unexecuted:
+`smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl`.
+
+#### RTL8822BE documented gaps: LPS and Bluetooth coexistence
+
+The `rtw88 | rtl8822be` row is scoped to the RTL8822CE chip-row station core.
+LPS and coexistence are separate feature rows on C22 and stay open for B22:
+
+- LPS / runtime PS. `reserved_page::station_boundary(0xb822)` is None, so
+  no B22 reserved-page station layout, `runtime_ps_page` (PS-Poll/null/QoS
+  null pages from the 1996 boundary below H2CQ 2036 and firmware TXBUF 2044,
+  `rsvd_drv_pg_num` 8) or firmware page swap exists. A B22 LPS needs its own
+  channel-scoped `N2BZ` program over the station core (the N2xZ scope of
+  `lps_peer`), with `rtw8822b_hw_spec.lps_deep_mode_supported =
+  BIT(LPS_DEEP_MODE_LCLK)`; none is implemented, so LPS stays refused.
+- Coexistence. No `N2BK` record or B22 coex owner exists: the
+  `rtw8822b_coex_*` chip ops (`coex_set_init`, `_ant_switch`, `_gnt_fix`,
+  `_gnt_debug`, `_rfe_type`, `_wl_tx_power`, `_wl_rx_gain`), the
+  `table_sant_8822b`/`table_nsant_8822b` and `tdma_sant_8822b`/
+  `tdma_nsant_8822b` tables, `rf_para_tx/rx_8822b`, `coex_para_ver`
+  0x20070206 and `bt_desired_ver` 6 are not ported. `coex::record` has no
+  B22 mode table, so a B22 gate never binds coexistence-driven SMPS.
+
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 
 Probe captures `efuse::Factory8821c` from the same single512-byte logical-map

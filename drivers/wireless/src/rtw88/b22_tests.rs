@@ -708,12 +708,17 @@ kernel_test_in!(
 
 /// The admitted B22 station chain fixture: factory, PHY facts, the `N2BS`
 /// grant over `N2BP` + `N2BQ`, and the US rule they are qualified under.
-fn b22_station_fixture() -> Option<(
+type B22Station = (
     super::super::efuse8822b::Factory8822b,
     super::super::phy8822b::Info,
     alloc::sync::Arc<super::super::operating8822b::Grant>,
     narf_wireless::reg::RegulatoryDomain,
-)> {
+);
+fn b22_station_fixture() -> Option<B22Station> {
+    b22_station_fixture_for(b22_features(2))
+}
+/// [`b22_station_fixture`] over an explicit firmware hardware report.
+fn b22_station_fixture_for(features: super::super::hardware::Features) -> Option<B22Station> {
     use super::super::operating8822b::{request, station_request, Info, Source, StationSource};
     use super::super::{calibration8822b, mac, phy8822b, radio8822b};
     use narf_capabilities::Cap;
@@ -727,6 +732,8 @@ fn b22_station_fixture() -> Option<(
             map[at + 6 + group] = bw40 - group as u8;
         }
         map[at + 11] = diff;
+        // HT1S bw20 +0 (high nibble of `diff`), HT2S bw20 -1.
+        map[at + 12] = 0x0f;
     }
     let factory = super::super::efuse8822b::Factory8822b::for_test(map).ok()?;
     let info = mac::Info {
@@ -735,8 +742,8 @@ fn b22_station_fixture() -> Option<(
         h2c_page: 2036,
         firmware_tx_page: 2044,
     };
-    let phy = phy8822b::Info::from_factory(&factory, 1, b22_features(2)).ok()?;
-    let board = calibration8822b::Board::new(&factory, phy, info, b22_features(2), [9; 32]).ok()?;
+    let phy = phy8822b::Info::from_factory(&factory, 1, features).ok()?;
+    let board = calibration8822b::Board::new(&factory, phy, info, features, [9; 32]).ok()?;
     let calibration = alloc::sync::Arc::new(
         calibration8822b::Source::Verified {
             bytes: b22_record(&board.request()),
@@ -1102,7 +1109,7 @@ fn smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission() -> TestResult {
         up: 10,
         down: 10,
     };
-    let indices = [[0x20; 12]; 2];
+    let indices = ([[0x20; super::super::tracking8822b::RATES]; 2], 12);
     let mut tracker = Tracker::new(25, 24);
     let pass = |io: &mut super::mac_tests::Model, t: &mut Tracker, limits: Limits| {
         narf_scheduler::block_on(t.pass(io, &Open, indices, |_| Ok(()), limits, 4))
@@ -1279,4 +1286,150 @@ fn smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs
+);
+
+/// One signed 256-byte B22 `N2BH` v2 record: path-A MCS0..15 at 70..86,
+/// path-B MCS8..15 at 174..182 (`ht::Grant::decode`).
+fn b22_ht_record(r: &super::super::ht::Request, a: [u8; 16], b: [u8; 8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec![0u8; 256];
+    v[..4].copy_from_slice(b"N2BH");
+    v[4..8].copy_from_slice(&[2, 0, 0, 1]);
+    v[8..12].copy_from_slice(&256u32.to_le_bytes());
+    v[12..16].copy_from_slice(&[0xec, 0x10, 0x22, 0xb8]);
+    v[16..48].copy_from_slice(&r.identity);
+    v[48..54].copy_from_slice(&r.mac);
+    v[54..56].copy_from_slice(&[1, 20]);
+    for (at, x) in [(56, 4i16), (58, 76), (60, 60), (62, 40)] {
+        v[at..at + 2].copy_from_slice(&x.to_le_bytes());
+    }
+    v[64..66].copy_from_slice(&[0, 63]);
+    v[66..68].copy_from_slice(&0xffffu16.to_le_bytes());
+    v[68] = 1;
+    v[69] = 2;
+    v[70..86].copy_from_slice(&a);
+    for i in 0..44 {
+        v[86 + i * 2..88 + i * 2].copy_from_slice(&40i16.to_le_bytes());
+    }
+    v[174..182].copy_from_slice(&b);
+    v
+}
+
+/// `N2BH` binds the exact `N2BL` grant on a 2T2R VHT-protocol report: the
+/// v1 proposal carries a B22 two-stream child, MCS indices are bounded by
+/// both paths' `rtw_phy_get_2g_tx_power_index` HT20 ceilings (txgi 1), foreign
+/// magics / over-ceiling path-B indices / a dirty tail refuse, and the bound
+/// grant's tracking table is legacy12 + MCS0..15 per path (path-B HT1S takes
+/// path A's index). Written; not yet executed natively.
+fn smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl() -> TestResult {
+    use super::super::{ht, power_policy::Gate, station_profile};
+    use narf_capabilities::Cap;
+    let features = super::super::hardware::Features {
+        raw: [0; 13],
+        hci: 1,
+        bandwidth: 2,
+        streams: 2,
+        antennas: 2,
+        protocol: 3,
+    };
+    let Some((_, phy, grant, us)) = b22_station_fixture_for(features) else {
+        return TestResult::Fail("8822B 2T2R station fixture rejected");
+    };
+    let legacy = grant.power().indices();
+    let gate = Gate::b22(grant, phy);
+    let Some(f) = gate.ht_facts() else {
+        return TestResult::Fail("8822B gate exposes no HT facts");
+    };
+    // Path A 30/29, path B 29/28 (fixture bytes 6, 11, 12): intersected.
+    if f.maximum != 29 || f.maximum_2ss != Some(28) || f.legacy != legacy[0] || f.local().is_none()
+    {
+        return TestResult::Fail(
+            "8822B HT20 factory facts differ from rtw_phy_get_2g_tx_power_index",
+        );
+    }
+    let db = alloc::sync::Arc::new(narf_wireless::reg::db::Database::new());
+    db.install(us);
+    let Some(lr) = gate.extension_request() else {
+        return TestResult::Fail("8822B N2BL request missing");
+    };
+    let Ok(l) = (station_profile::Source::Verified {
+        bytes: b22_legacy_record(&lr, 0xfff, true),
+        signer: Some([7; 32]),
+        cap: Cap::bootstrap(),
+        policy: db,
+    })
+    .load(gate.clone()) else {
+        return TestResult::Fail("8822B N2BL rejected");
+    };
+    let Ok(gate) = gate.with_extension(l.clone()) else {
+        return TestResult::Fail("8822B N2BL did not bind");
+    };
+    let Ok(r) = ht::request(&l) else {
+        return TestResult::Fail("8822B HT request refused over N2BL");
+    };
+    let Some(r2) = r.two_streams.clone() else {
+        return TestResult::Fail("8822B 2T2R HT request has no two-stream child");
+    };
+    if !r.filename.starts_with("rtw88/rtw8822be-ht20-v1-")
+        || !r2.filename.starts_with("rtw88/rtw8822be-ht20-2ss-v2-")
+        || r2.identity == r.identity
+    {
+        return TestResult::Fail("8822B HT request naming/identity differs");
+    }
+    let a: [u8; 16] = core::array::from_fn(|i| {
+        if i < 8 {
+            29 - i as u8
+        } else {
+            28 - (i as u8 - 8)
+        }
+    });
+    let b: [u8; 8] = core::array::from_fn(|i| 27 - i as u8);
+    let load = |bytes| {
+        ht::Source::Verified {
+            bytes,
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(l.clone())
+    };
+    for fault in 0..4 {
+        let mut v = b22_ht_record(&r2, a, b);
+        match fault {
+            0 => v[..4].copy_from_slice(b"N22H"),
+            1 => v[174] = 29,
+            2 => v[182] = 1,
+            _ => v[70] = 30,
+        }
+        if load(v).is_ok() {
+            return TestResult::Fail("8822B N2BH accepted a foreign or over-ceiling record");
+        }
+    }
+    let Ok(h) = load(b22_ht_record(&r2, a, b)) else {
+        return TestResult::Fail("8822B N2BH rejected its exact record");
+    };
+    if h.mcs() != 0xffff || !h.sgi() {
+        return TestResult::Fail("8822B N2BH selection differs from its record");
+    }
+    let Ok(gate) = gate.with_ht(h) else {
+        return TestResult::Fail("8822B N2BH did not bind over N2BL");
+    };
+    let Some((rates, count)) = gate.b22_rate_indices() else {
+        return TestResult::Fail("8822B HT tracking table missing");
+    };
+    for path in 0..2 {
+        let mut want = [0u8; super::super::tracking8822b::RATES];
+        want[..12].copy_from_slice(&legacy[path]);
+        want[12..20].copy_from_slice(&a[..8]);
+        want[20..].copy_from_slice(if path == 0 { &a[8..] } else { &b });
+        if rates[path] != want {
+            return TestResult::Fail("8822B HT tracking table differs from the programmed words");
+        }
+    }
+    if count != 28 {
+        return TestResult::Fail("8822B 2SS tracking table does not cover MCS0..15");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl
 );

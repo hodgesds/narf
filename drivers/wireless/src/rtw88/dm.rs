@@ -161,9 +161,10 @@ impl Facts {
 /// Runs one register group under the current continuation/base authority.
 pub(super) trait Authority {
     fn run<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error>;
-    /// RTL8822BE committed-channel per-path coded TXAGC indices (DESC_RATE
-    /// 0..11) `rtw8822b_pwrtrack_set` offsets against.
-    fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+    /// RTL8822BE committed per-path coded TXAGC indices `rtw8822b_pwrtrack_set`
+    /// offsets against, for DESC_RATE 0..count
+    /// (`power_policy::Gate::b22_rate_indices`).
+    fn b22_indices(&self) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
         None
     }
     /// RTL8822BE `N2BP` measured thermal windows.

@@ -111,6 +111,32 @@ pub(super) fn band5_limit(raw: &[u8], group: usize) -> Option<u8> {
         .ofdm(group, 1)
         .filter(|v| *v <= 63)
 }
+/// `phy.c::rtw_phy_get_2g_tx_power_index` HT20 over a raw path record for
+/// one 2.4GHz `rtw_get_channel_group` group, `txgi_factor` 1:
+/// `bw40_base[group]` + `ht_1s_diff.bw20` (signed high nibble of byte 11),
+/// plus `ht_2s_diff.bw20` (signed low nibble of byte 12) for two streams,
+/// capped at `max_power_index` 0x3f. Erased or wrapped cells fail.
+pub(super) fn ht20_limit(raw: &[u8], group: usize, two: bool) -> Option<u8> {
+    let nibble = |v: u8| {
+        let n = i16::from(v & 15);
+        if n & 8 != 0 {
+            n - 16
+        } else {
+            n
+        }
+    };
+    if group > 4 || raw.len() < 13 || raw[6 + group] > 63 || raw[11] == 255 {
+        return None;
+    }
+    let mut v = i16::from(raw[6 + group]) + nibble(raw[11] >> 4);
+    if two {
+        if raw[12] == 255 {
+            return None;
+        }
+        v += nibble(raw[12]);
+    }
+    (v >= 0).then_some(v.min(63) as u8)
+}
 /// Both B22 RF paths (`txpwr_idx_table[0]`/`[1]`, `rtw8822b_read_efuse`).
 pub(super) fn board_limits(factory: &Factory8822b) -> Result<[[u8; 2]; 2], QError> {
     let path = |p| factory.power_path(p).ok_or(QError::Factory);
@@ -336,6 +362,24 @@ impl Envelope {
             band5_limit(&self.paths[0], group)?,
             band5_limit(&self.paths[1], group)?,
         ])
+    }
+    /// HT20 `(1S, 2S)` factory ceilings of one channel group (2.4GHz
+    /// [`ht20_limit`], or 5GHz `band5::Power5g::bw20`, factor 1, ≤ 0x3f),
+    /// intersected over both paths. The 2S ceiling is None when either
+    /// path's HT2S cell is erased.
+    pub(super) fn ht_limits(&self, five: bool, group: usize) -> Option<(u8, Option<u8>)> {
+        let one = |p: &[u8], two| {
+            if five {
+                super::band5::Power5g::parse(p)?
+                    .bw20(group, two, 1)
+                    .filter(|v| *v <= 63)
+            } else {
+                ht20_limit(p, group, two)
+            }
+        };
+        let maximum = one(&self.paths[0], false)?.min(one(&self.paths[1], false)?);
+        let two = one(&self.paths[0], true).zip(one(&self.paths[1], true));
+        Some((maximum, two.map(|(a, b)| a.min(b))))
     }
     pub(super) fn calibration(&self) -> &calibration8822b::Envelope {
         &self.calibration
@@ -621,6 +665,19 @@ impl Grant {
             self.power.indices(),
             self.own(),
         )
+    }
+    /// HT20 facts of channel 1 (group 0): the firmware hardware report the
+    /// `N2BQ` board bound, both paths' intersected factory HT20 ceilings and
+    /// path A's `N2BP` legacy indices. No CCK reference exists on B22.
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        let (maximum, maximum_2ss) = self.power.ht_limits(false, 0)?;
+        Some(super::ht::Facts {
+            hardware: self.power.calibration().hardware(),
+            maximum,
+            maximum_2ss,
+            legacy: self.power.indices()[0],
+            cck: [0; 2],
+        })
     }
     /// The current station policy limit under `domain`, inside all three
     /// source invocations (the N2xL extension ceiling input).

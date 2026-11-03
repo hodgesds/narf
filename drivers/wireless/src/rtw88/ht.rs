@@ -238,7 +238,11 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
         h.update(b"5GHz HT20 GN: Power5g bw40_base+ht_1s.bw20(+ht_2s.bw20) group ceilings; rateID GN_N1SS5/N2SS4; C22 OFDM6..54 = min-path N2xO ofdm+diff relative to MCS7 reference (rtw8822c_set_tx_power_index), CCK refs/diffs zero; C21 0x1d0c HT TXAGC over N2xO OFDM TXAGC, CCK zero");
         h.update(&base.ofdm5_indices().unwrap_or([0; 8]));
     }
-    h.update(if base.did()==0xc821 { b"C21 RF-A absolute1d0c/10; retained legacy12; unusedHT/VHTzero; RF18/RF08/IQK; RF42 SIPIc90 maskfffff trigger30000 wait13+2000000us actualread2908" } else { b"C22 TX-A RX-AB equalOFDMrefs=MCS7; source signed7bit per-rate difference; minAB; unusedrates effective0; retainedCCKrefs" });
+    h.update(match base.did() {
+        0xc821 => b"C21 RF-A absolute1d0c/10; retained legacy12; unusedHT/VHTzero; RF18/RF08/IQK; RF42 SIPIc90 maskfffff trigger30000 wait13+2000000us actualread2908".as_slice(),
+        0xb822 => b"B22 config_trx_mode(AB,AB,false): 1SS TX-A CDDTXP93c[31:20]=001, 2SS TX-AB TXPSEL1 940[15:4]=43, RX-AB; rtw8822b_set_tx_power_index_by_rate 1d00/1d80 absolute per-path indices; retained N2BP/N2BO legacy12 A+B; HT1S path-B words0; VHT words0; RF42 SIPIc90 trigger30000 wait13+2000000us actualread2908".as_slice(),
+        _ => b"C22 TX-A RX-AB equalOFDMrefs=MCS7; source signed7bit per-rate difference; minAB; unusedrates effective0; retainedCCKrefs".as_slice(),
+    });
     h.update(b"RX PHYST exact32 at24+shift; C21 RXSC/RFMODE no channel; C22 RXSC/current20/reportedchannel1; absentPHY None plus RXD facts; receive epoch fences callbacks and IPC across actual key/reply/close");
     h.update(b"full static raw thermal0..63 supply/antenna/BT envelope; exact source gain writes/readbacks; no tracking or fabricated calibration; transient/response+legacy+8LGI+8SGI measured peaks");
     h.update(b"bound original HT45/61/WMM response; generated localHT20 MCSff RX/TX SGI20 default3839AMSDU; BGN20_1SS3 RA mask12..19 PTdisabled; fixedDATA12..19 USE_RATE DISDATAFB BW0 SGIbit4; BE/TID0 QoS26 before softwareCCMP; originalRAW AMSDU authenticated once; ADDBA status37 nativeCCX; noTXBA");
@@ -261,6 +265,22 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
         ),
         two_streams: None,
     };
+    if base.did() == 0xb822 && f.hardware.streams >= 2 && f.hardware.antennas >= 2 {
+        if let Some(maximum) = f.maximum_2ss {
+            let mut h = narf_crypto::sha256::Sha256::new();
+            h.update(b"NARF RTL8822BE exact retained HT20 two-stream v2");
+            h.update(&proposal.identity);
+            h.update(&[f.maximum, maximum]);
+            h.update(b"N2BH256v2;MCS16/RXffff;MCS8..15 phy.c bw40_base+ht_1s.bw20+ht_2s.bw20 txgi1 minAB<=3f;path-A MCS0..15 and path-B MCS8..15 absolute indices 1d00/1d80 words 0c..1b;no path change: base config_trx_mode(AB,AB,false) 1SS-A/2SS-AB readback 93c/940");
+            h.update(b"current N2BQ/N2BP/N2BS/N2BL source and policy;fresh RF42 inside N2BP windows;per-path word readback;all2SS LGI/SGI/transient/response/simultaneous-chain measured peaks");
+            proposal.two_streams = Some(Box::new(Request {
+                identity: h.finalize(),
+                mac: proposal.mac,
+                filename: proposal.filename.replace("ht20-v1-", "ht20-2ss-v2-"),
+                two_streams: None,
+            }));
+        }
+    }
     if base.did() == 0xc822 && f.hardware.streams >= 2 && f.hardware.antennas >= 2 {
         if let Some(maximum) = f.maximum_2ss {
             let mut h = narf_crypto::sha256::Sha256::new();
@@ -295,6 +315,8 @@ pub(super) struct Grant {
     cap: Cap<FirmwareBlob, Read>,
     facts: Facts,
     indices: [u8; 16],
+    /// B22 v2 path-B MCS8..15 indices (path A carries [`Self::indices`]).
+    indices_b: [u8; 8],
     peaks: Vec<i16>,
     antenna: i16,
     ceiling: i16,
@@ -376,10 +398,10 @@ impl Grant {
         if signer.is_none()
             || b.len() != length
             || b[..4]
-                != *if base.did() == 0xc821 {
-                    b"N21H"
-                } else {
-                    b"N22H"
+                != *match base.did() {
+                    0xc821 => b"N21H",
+                    0xb822 => b"N2BH",
+                    _ => b"N22H",
                 }
             || b[4..8] != if v2 { [2, 0, 0, 1] } else { [1, 0, 192, 0] }
             || b[8..12] != (length as u32).to_le_bytes()
@@ -389,14 +411,17 @@ impl Grant {
             || b[54..56] != [1, 20]
             || b[64..66] != [0, 63]
             || if v2 {
-                base.did() != 0xc822
+                !matches!(base.did(), 0xc822 | 0xb822)
                     || facts.hardware.streams < 2
                     || facts.hardware.antennas < 2
                     || facts.maximum_2ss.is_none()
                     || b[67] == 0
                     || b[68] & !1 != 0
                     || b[69] != 2
-                    || b[174..].iter().any(|&byte| byte != 0)
+                    // B22 carries path-B MCS8..15 at 174..182.
+                    || b[if base.did() == 0xb822 { 182 } else { 174 }..]
+                        .iter()
+                        .any(|&byte| byte != 0)
             } else {
                 b[66] == 0 || b[67] & !1 != 0 || b[132..].iter().any(|&byte| byte != 0)
             }
@@ -409,6 +434,10 @@ impl Grant {
             indices.copy_from_slice(&b[70..86]);
         } else {
             indices[..8].copy_from_slice(&b[68..76]);
+        }
+        let mut indices_b = [0; 8];
+        if v2 && base.did() == 0xb822 {
+            indices_b.copy_from_slice(&b[174..182]);
         }
         let peaks = (0..if v2 { 46 } else { 30 })
             .map(|i| {
@@ -438,6 +467,7 @@ impl Grant {
             cap,
             facts,
             indices,
+            indices_b,
             peaks,
             antenna: signed(56),
             ceiling: signed(58),
@@ -456,6 +486,7 @@ impl Grant {
             || v2
                 && g.indices[8..]
                     .iter()
+                    .chain(g.indices_b.iter())
                     .any(|&i| i > facts.maximum_2ss.unwrap_or(0))
             || g.peaks.iter().any(|&p| !(-512..=256).contains(&p))
             || g.peaks[1..].iter().any(|&p| p > g.peaks[0])
@@ -646,6 +677,72 @@ impl Grant {
             .try_into()
             .expect("one-stream tracking indices")
     }
+    /// B22 TXAGC words 0..6 (DESC_RATE 0x00..0x1b) per path as
+    /// `rtw8822b_set_tx_power_index_by_rate` packs them: the primary's
+    /// retained legacy12 indices, MCS0..7 on path A (1SS transmits on A
+    /// only under `config_trx_mode(AB, AB, false)`; path-B HT1S zero) and,
+    /// for v2, MCS8..15 on both paths.
+    fn b22_words(&self) -> Result<[[u32; 7]; 2], Error> {
+        let legacy = self.base.b22_indices().ok_or(Error::Unsupported)?;
+        Ok(core::array::from_fn(|path| {
+            let mut rates = [0u8; 28];
+            rates[..12].copy_from_slice(&legacy[path]);
+            if path == 0 {
+                rates[12..20].copy_from_slice(&self.indices[..8]);
+            }
+            if self.two_streams() {
+                rates[20..].copy_from_slice(if path == 0 {
+                    &self.indices[8..]
+                } else {
+                    &self.indices_b
+                });
+            }
+            core::array::from_fn(|w| {
+                u32::from_le_bytes(rates[w * 4..w * 4 + 4].try_into().unwrap())
+            })
+        }))
+    }
+    /// B22 per-path DESC_RATE 0..count table for `rtw8822b_pwrtrack_set`
+    /// headroom: the programmed words, except that path B's HT1S entries
+    /// (programmed zero; 1SS transmits on A) take path A's index, the
+    /// smaller-headroom choice.
+    pub(super) fn b22_rates(&self) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
+        if self.base.did() != 0xb822 {
+            return None;
+        }
+        let words = self.b22_words().ok()?;
+        let mut rates = [[0; super::tracking8822b::RATES]; 2];
+        for (r, w) in rates.iter_mut().zip(words) {
+            for (i, v) in w.into_iter().enumerate() {
+                r[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        rates[1][12..20].copy_from_slice(&self.indices[..8]);
+        Some((rates, if self.two_streams() { 28 } else { 20 }))
+    }
+    /// B22 readback: base 1SS-A/2SS-AB path selection, both paths' words
+    /// 0..6, host-only crypto.
+    async fn readback_b22(
+        &self,
+        read: &mut impl super::firmware_transport::Read32,
+    ) -> Result<(), Error> {
+        if read.read32(0x93c).await? >> 20 != 0x001
+            || read.read32(0x940).await? >> 4 & 0xfff != 0x43
+        {
+            return Err(Error::Prerequisite);
+        }
+        for (base, words) in [0x1d00u16, 0x1d80].into_iter().zip(self.b22_words()?) {
+            for (i, v) in words.into_iter().enumerate() {
+                if read.read32(base + i as u16 * 4).await? != v {
+                    return Err(Error::Prerequisite);
+                }
+            }
+        }
+        if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
     fn words(&self) -> [u32; 16] {
         let mut bytes = [0; 64];
         let reference = i16::from(self.indices[7]);
@@ -675,6 +772,9 @@ impl Grant {
         mut read: impl super::firmware_transport::Read32,
         wide: Option<&Wide>,
     ) -> Result<(), Error> {
+        if wide.is_some() && self.base.did() == 0xb822 {
+            return Err(Error::Unsupported);
+        }
         let r = match wide {
             None => return self.readback(read).await,
             Some(Wide::Forty(r)) => r,
@@ -738,6 +838,9 @@ impl Grant {
         &self,
         mut read: impl super::firmware_transport::Read32,
     ) -> Result<(), Error> {
+        if self.base.did() == 0xb822 {
+            return self.readback_b22(&mut read).await;
+        }
         if self.base.did() == 0xc821 {
             return super::radio8821c::operating_readback_ht(
                 read,
@@ -781,7 +884,9 @@ impl Grant {
         admission: &Admission,
     ) -> Result<(), Error> {
         self.check()?;
-        let parked = if self.two_streams() {
+        // C22 v2 changes TX paths and resets BB; B22 keeps the base path
+        // selection and only rewrites TXAGC words, as C21 does.
+        let parked = if self.two_streams() && self.base.did() == 0xc822 {
             Some(
                 self.guarded(admission, async {
                     io.station_allowed()?;
@@ -838,7 +943,7 @@ impl Grant {
         }
         // Call only after the retained gate encloses this NEW complete program.
         // C21's actual fresh RF42 conversion is required, never a factory byte.
-        if self.base.did() == 0xc821 {
+        if matches!(self.base.did(), 0xc821 | 0xb822) {
             crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
                 io.station_allowed()?;
                 let old = io.read32(0x2908).await?;
@@ -860,14 +965,29 @@ impl Grant {
                 self.base.temperature(((meter >> 10) & 63) as u8)
             })
             .await?;
-            for (i, chunk) in self.indices[..8].chunks_exact(4).enumerate() {
-                let v = u32::from_le_bytes(chunk.try_into().unwrap());
-                crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
-                    io.station_allowed()?;
-                    io.write32(0x1d0c + i as u16 * 4, v).await
-                })
-                .await?;
-                narf_scheduler::yield_now().await;
+            if self.base.did() == 0xb822 {
+                // `rtw8822b_set_tx_power_index_by_rate` HT1S/HT2S words
+                // (0x0c..0x1b) of both paths; legacy words stay as programmed.
+                for (base, words) in [0x1d00u16, 0x1d80].into_iter().zip(self.b22_words()?) {
+                    for (i, v) in words.into_iter().enumerate().skip(3) {
+                        crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+                            io.station_allowed()?;
+                            io.write32(base + i as u16 * 4, v).await
+                        })
+                        .await?;
+                        narf_scheduler::yield_now().await;
+                    }
+                }
+            } else {
+                for (i, chunk) in self.indices[..8].chunks_exact(4).enumerate() {
+                    let v = u32::from_le_bytes(chunk.try_into().unwrap());
+                    crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+                        io.station_allowed()?;
+                        io.write32(0x1d0c + i as u16 * 4, v).await
+                    })
+                    .await?;
+                    narf_scheduler::yield_now().await;
+                }
             }
         } else {
             for r in [0x18e8, 0x41e8] {
