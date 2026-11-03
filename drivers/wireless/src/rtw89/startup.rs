@@ -359,7 +359,7 @@ impl Startup {
             };
             let profile = super::operating_channel_c::Profile::new20(band, primary)
                 .ok_or(power::Error::Unsupported)?;
-            return self.retune_channel_c(profile, linked).await;
+            return self.retune_channel_c(profile, None, linked).await;
         }
         let mut attempt = Attempt::new(self);
         let result = async {
@@ -407,7 +407,7 @@ impl Startup {
         {
             // The same chandef as the C typed profile (unassociated retune).
             let c = super::command_native::c_profile(profile).ok_or(power::Error::Unsupported)?;
-            return self.retune_channel_c(c, false).await;
+            return self.retune_channel_c(c, None, false).await;
         }
         if self.phase != Phase::RadioReady
             || self.monitor.is_some()
@@ -455,6 +455,7 @@ impl Startup {
     pub(super) async fn retune_channel_c(
         &mut self,
         profile: super::operating_channel_c::Profile,
+        six: Option<(super::radio_power_c::SixGhzPower, Option<i8>)>,
         linked: bool,
     ) -> Result<u32, power::Error> {
         if self.phase != Phase::RadioReady
@@ -483,6 +484,7 @@ impl Startup {
                         &owner.radio,
                         owner.assets.as_ref().ok_or(power::Error::Terminal)?,
                         profile,
+                        six,
                         linked,
                     )
                     .await

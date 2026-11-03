@@ -1044,12 +1044,12 @@ impl crate::rtw89::phy_operating::Interface for Native {
 /// byte streams above are untouched; this is the C composition with the
 /// same retained-owner structure and the same fail-closed admission.
 impl Native {
-    /// Typed C channel from a 2.4GHz (1..=14) or 5GHz 20MHz primary, with its
-    /// `rtw8852c_set_txpwr` program. 6GHz stays refused (no 6GHz TPE/regd).
     /// Pure staging of the RTL8852C signed records (no register access):
     /// the C cold calibration record (`N5CB` v1), the base full program
     /// (`N5CB` v2, channel 1/20MHz) and every provisioned noninitial
-    /// `N5CC` record over `radio_policy_c::noninitial`. A profile whose
+    /// `N5CC` record over `radio_policy_c::noninitial`, then every
+    /// provisioned 6GHz `N5CC` record (`noninitial_6ghz` x
+    /// `POWER_TYPES_6GHZ` under the host country). A profile whose
     /// `radio_power_c` plan cannot be built from the actual assets is not
     /// looked up (it stays unadmitted). A missing base or calibration record
     /// is an error before Startup creates its terminal Attempt (retryable).
@@ -1101,6 +1101,41 @@ impl Native {
                     continue;
                 };
                 qualification.load_channel(board(&plan)?).map_err(denied)?;
+            }
+            // 6GHz `N5CC` records, staged lazily by name: regd.c
+            // `rtw89_regd_get`/`rtw89_reg_6ghz_power_recalc` for the host
+            // regulatory country and each client power type
+            // (`SixGhzPower::new`; a blocked/not-applicable context stages
+            // nothing), then only a provisioned record name
+            // (`has_channel_6ghz`) costs a 6GHz plan and identity. No host
+            // policy snapshot: no 6GHz record is staged (unadmitted).
+            if let Ok(policy) = narf_wireless::reg::db::ensure_snapshot() {
+                for power in radio_policy_c::POWER_TYPES_6GHZ {
+                    let Ok(six) = radio_power_c::SixGhzPower::new(
+                        assets.elements(),
+                        policy.country_code,
+                        Some(power),
+                    ) else {
+                        continue;
+                    };
+                    for profile in radio_policy_c::noninitial_6ghz() {
+                        if !qualification
+                            .has_channel_6ghz(profile, six)
+                            .map_err(denied)?
+                        {
+                            continue;
+                        }
+                        // The staged identity is TPE-free (`Plan::bind`).
+                        let Ok(plan) =
+                            radio_power_c::Plan::from_assets_6ghz(assets, rfe, profile, six, None)
+                        else {
+                            continue;
+                        };
+                        qualification
+                            .load_channel_6ghz(board(&plan)?)
+                            .map_err(denied)?;
+                    }
+                }
             }
             qualification.current().map_err(denied)?;
             Ok(RadioPreflightC {
@@ -1283,8 +1318,9 @@ impl Native {
 }
 impl Native {
     /// RTL8852C counterpart of [`Self::retune_full_radio`] for one typed
-    /// `profile` (2.4GHz 20MHz/HT40, 5GHz 20/40/80/160MHz) on the Ready C
-    /// radio: drain, withhold the C ordinary grant, `select` the profile's
+    /// `profile` (2.4GHz 20MHz/HT40, 5GHz 20/40/80/160MHz, or with `six`
+    /// a 6GHz 20/40/80/160MHz profile under its regd.c power context and
+    /// TPE constraint) on the Ready C radio: drain, withhold the C ordinary grant, `select` the profile's
     /// signed `N5CB`/`N5CC` envelope, `radio_c::Radio::retune` (core.c
     /// `rtw89_set_channel` -> rtw8852c.c `rtw8852c_set_channel`, then
     /// `rtw89_chip_rfk_channel` -> `rtw8852c_rfk_channel`), the
@@ -1310,6 +1346,7 @@ impl Native {
         tables: &radio_init::Init,
         assets: &radio_assets::Assets,
         profile: operating_channel_c::Profile,
+        six: Option<(radio_power_c::SixGhzPower, Option<i8>)>,
         linked: bool,
     ) -> Result<u32, power::Error> {
         if self.chip != ChipId::Rtl8852C {
@@ -1324,10 +1361,18 @@ impl Native {
         {
             return Err(power::Error::Terminal);
         }
-        if !radio_policy_c::admissible(profile) {
+        let context = six.map(|(power, _)| power);
+        let admissible = match context {
+            None => radio_policy_c::admissible(profile),
+            Some(_) => radio_policy_c::admissible_6ghz(profile),
+        };
+        if !admissible {
             return Err(power::Error::Unsupported);
         }
-        if owner.channel() == Some(profile) {
+        // A 6GHz program is rebuilt even on the same profile: its regd.c
+        // context or TPE constraint may have changed
+        // (`rtw89_reg_6ghz_recalc` -> `rtw89_core_set_chip_txpwr`).
+        if context.is_none() && owner.channel() == Some(profile) {
             return Ok(owner.epoch());
         }
         let qualification = self.qualification_c.clone().ok_or(power::Error::Terminal)?;
@@ -1336,7 +1381,11 @@ impl Native {
         ) {
             return Err(power::Error::Terminal);
         }
-        if !qualification.channel_allowed(profile).map_err(denied)? {
+        let allowed = match context {
+            None => qualification.channel_allowed(profile),
+            Some(power) => qualification.channel_allowed_6ghz(profile, power),
+        };
+        if !allowed.map_err(denied)? {
             return Err(power::Error::Unsupported);
         }
         let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
@@ -1346,7 +1395,16 @@ impl Native {
         }
         let rfe = identity.calibration().rfe_type;
         let cut = identity.cut();
-        let plan = radio_power_c::Plan::from_assets(assets, rfe, profile).map_err(denied)?;
+        // 6GHz: `rtw8852c_set_txpwr` under the regd.c context and the
+        // intersected STD TPE (`Plan::from_assets_6ghz`); its identity is
+        // the TPE-free staged record's.
+        let plan = match six {
+            None => radio_power_c::Plan::from_assets(assets, rfe, profile),
+            Some((power, tpe)) => {
+                radio_power_c::Plan::from_assets_6ghz(assets, rfe, profile, power, tpe)
+            }
+        }
+        .map_err(denied)?;
         let phycap = self.firmware_phycap().ok_or(power::Error::Unsupported)?;
         let rx_nss = phycap.rx_nss();
         let board = radio_policy_c::Board::new(
@@ -1391,7 +1449,11 @@ impl Native {
         // now the target profile's signed record over its occupied span.
         let grant = self.ordinary.take().ok_or(power::Error::Terminal)?;
         self.channel = None;
-        qualification.select(profile).map_err(denied)?;
+        match context {
+            None => qualification.select(profile),
+            Some(power) => qualification.select_6ghz(profile, power),
+        }
+        .map_err(denied)?;
         // SAFETY: caller contract; queues drained and grant withheld above.
         let mcc = unsafe {
             owner.retune(
@@ -1414,6 +1476,7 @@ impl Native {
         if owner.state() != radio_c::State::Ready
             || owner.channel() != Some(profile)
             || qualification.active() != profile
+            || qualification.active_six_ghz() != context
         {
             return Err(power::Error::Terminal);
         }

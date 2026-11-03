@@ -247,9 +247,6 @@ impl Radio {
         }
         let txrx = txrx_path_fields(Band::Ghz2, input.rx_nss).ok_or(Error::Policy)?;
         let profile = input.power.channel();
-        if profile.band() == Band::Ghz6 {
-            return Err(Error::Policy);
-        }
         self.state = State::Preparing;
         io.admit()?;
         // SAFETY: caller contract; C tables, bb_sethw and NCTL completed.
@@ -307,9 +304,6 @@ impl Radio {
             return Err(Error::Terminal);
         }
         let profile = input.power.channel();
-        if profile.band() == Band::Ghz6 {
-            return Err(Error::Policy);
-        }
         let bases = self.offset_base.ok_or(Error::Terminal)?;
         self.state = State::Preparing;
         let inputs = channel_c::Inputs {

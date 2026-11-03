@@ -3758,11 +3758,28 @@ over the span to admit a client of the record's power type (cfg80211
 `cfg80211_6ghz_power_type_valid`: `NO_6GHZ_VLP_CLIENT`/`NO_6GHZ_AFC_CLIENT`)
 and accepts INDOOR_ONLY only together with the trusted DEPLOYMENT_INDOOR
 assertion; DFS/NO_IR stay passive (no frame TX, as 5GHz). Formats only: no C
-board value is carried. *Not yet implemented (the row stays open):* the
-native 6GHz preflight/retune (`preflight_radio_c` does not stage 6GHz
-records; `retune_radio_c` and `radio_c::Radio::{prepare,retune}` still
-refuse 6GHz, and `Native::channel` is a bare primary number that cannot
-name a 6GHz channel), the station 6GHz path (6GHz scan with PSC/RNR rules,
+board value is carried. *Native:* `Native::channel` is a band-qualified
+`OperatingChannel` (band, primary): 6GHz 1/5/9/13 never read as 2.4GHz;
+B records `OperatingChannel::legacy` (1..=14 2.4GHz, else 5GHz) and its
+OFDM floor (`lowest_rate`, `ghz5`) and monitor retune comparison are
+unchanged. `preflight_radio_c` stages 6GHz records lazily by name: under
+the host policy snapshot's country, for each `POWER_TYPES_6GHZ` whose
+`SixGhzPower::new` context exists, every `noninitial_6ghz` profile is first
+probed with `has_channel_6ghz` and only a provisioned name builds the
+TPE-free `Plan::from_assets_6ghz` and identity for `load_channel_6ghz` (no
+snapshot: nothing staged). `retune_radio_c(.., six, linked)` takes
+`Some((SixGhzPower, tpe))` for a 6GHz profile: `admissible_6ghz`,
+`channel_allowed_6ghz`, the TPE-constrained `Plan::from_assets_6ghz`
+(identity still the staged TPE-free record's), `select_6ghz`, and the
+completion check includes `active_six_ghz`; a 6GHz retune is never skipped
+on the same profile (regd.c `rtw89_reg_6ghz_recalc` ->
+`rtw89_core_set_chip_txpwr` when the context or TPE changes). RX admission
+on 6GHz carries no VHT. `radio_c::Radio::{prepare,retune}` accept a 6GHz
+plan (the C geometry/BB/RF/RFK layers already carry 6GHz);
+`prepare_radio_c` itself still builds only 2.4/5GHz plans (core.c starts on
+the default 2.4GHz chandef). `Startup::retune_channel_c` passes the
+context through (2.4/5GHz callers pass `None`).
+*Not yet implemented (the row stays open):* the station 6GHz path (6GHz scan with PSC/RNR rules,
 `association::six_ghz::admit_with_rule` + `JoinPlan::prepare_6ghz`, HE 6GHz
 Band Capabilities, HE-only RA on `RTW89_BAND_6G`, mac80211 TPE parsing into
 the plan) and 6GHz band advertisement. RTL8922A 6GHz belongs to the
