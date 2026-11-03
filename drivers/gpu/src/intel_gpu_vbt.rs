@@ -389,7 +389,7 @@ impl ChildDevice {
     }
     /// `intel_bios_encoder_supports_typec_usb` (195+).
     pub fn supports_typec_usb(&self) -> bool {
-        self.version >= 195 && self.raw[33] & (1 << 0) != 0
+        self.version >= 195 && self.raw[33] & 1 != 0
     }
     /// `intel_bios_encoder_supports_tbt` (209+).
     pub fn supports_tbt(&self) -> bool {
@@ -407,7 +407,7 @@ impl ChildDevice {
     /// drops its `dp_usb_type_c`, `tbt` and `dyn_port_over_tc` bits.
     pub fn sanitized(mut self) -> Self {
         if self.dedicated_external() {
-            self.raw[33] &= !((1 << 0) | (1 << 1) | (1 << 3));
+            self.raw[33] &= !(1 | (1 << 1) | (1 << 3));
         }
         self
     }
