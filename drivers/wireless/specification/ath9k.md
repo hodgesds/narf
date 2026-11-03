@@ -2155,8 +2155,22 @@ APM chain-mask reduction in `tx_chainmask()`). Step 5b-0:
 `station::Radio<P, E, K: Engine = packet::Packet<P>>` drives; the AR9002
 `packet::Packet<P>` implements it by delegating to its inherent methods
 (mechanical extraction: AR9285/AR9287/AR9280/AR5008 behaviour and
-register streams unchanged). The AR9003 EDMA owner is to implement the
-same trait, so the AR9003 family shares one station.
+register streams unchanged). Step 5b-1: `ar9003/packet/engine.rs` implements `station::Engine` for
+the AR9003 EDMA `ar9003::packet::Packet<P>`: start, the queue-0 legacy
+`submit`/`submit_rates`, `delivery`/`receive` (already the shared
+`Delivery`/`ReceiveStep`), interrupts, `stop`, plus the new inherent
+`check_transmit` (port permission + physical re-proof), `set_peer`
+(`mac::peer_clocked` at the port's band clock, as AR9002) and
+`long_calibration` (Busy while a frame is in flight, then the port's
+step). `service_begin` maps `ar9003_hw_get_isr`'s causes onto the shared
+`irq::Events` (RX = HP | LP, `txqs` 0: EDMA never fills `intr_txqs`, no
+`TIM_TIMER` without power save). The AR9003 engine carries no HT, EDCA,
+QoS, RX/TX block-ack, aggregation or power-save program: every grant is
+`None` (so the station never attempts them) and every direct call returns
+what the AR9002 owner returns when that program is absent (`State`;
+`submit_ht` `Packet`; `set_ht` `Access` after the geometry/phase checks;
+a PM-marked `submit` `State`; `pair_delivery` `None`; the shared HT
+`periodic::Owner` is never bound).
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB

@@ -481,6 +481,42 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// The AR9002 `Packet::check_transmit` without the HT/EDCA/QoS/BA
+    /// programs this owner does not carry: the port's transmit permission
+    /// and its physical re-proof.
+    pub(in crate::ath9k) fn check_transmit(&self) -> Result<(), Error> {
+        self.port.transmit_allowed()?;
+        self.port.access(self.phase != Phase::Prepared, || Ok(()))
+    }
+    /// `ath9k_bss_info_changed` BSSID/AID and slot time
+    /// (`ath9k_hw_write_associd`, `ath9k_hw_setslottime` at the band's
+    /// `ath9k_hw_set_clockrate` clock), as the AR9002 owner does.
+    pub(in crate::ath9k) fn set_peer(
+        &mut self,
+        peer: Option<([u8; 6], u16)>,
+        slot_us: u32,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.pending.is_some() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.port.transmit_allowed()?;
+        crate::ath9k::mac::peer_clocked(&self.port, peer, slot_us, self.port.mac_clock())?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// The port's periodic calibration step of a running owner with no
+    /// transmission in flight (`ath_ani_calibrate` runs from its own timer;
+    /// this owner serializes it against the single queue-0 frame).
+    pub(in crate::ath9k) fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        self.port.long_calibration()
+    }
     /// Legacy frame at `rate` (`descriptor::transmit`).
     pub(in crate::ath9k) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
         let local = self.local;
@@ -871,6 +907,8 @@ impl<P: Port> Packet<P> {
         self.reclaimed = true;
     }
 }
+
+mod engine;
 
 #[cfg(feature = "kernel-test")]
 mod tests;
