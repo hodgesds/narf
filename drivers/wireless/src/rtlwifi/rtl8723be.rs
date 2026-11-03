@@ -33,14 +33,23 @@
 //! - [`mac`] — the `_rtl8723be_init_mac` remainder in its three segments
 //!   around the owner's `REG_CR` writes and LLT, `_rtl8723be_hw_configure`
 //!   and the station address.
+//! - [`tables`] — `table.c` PHY_REG / PHY_REG_PG / RADIOA / MAC / AGCTAB,
+//!   generated verbatim.
+//! - [`phy`] — BB/RF access, `_rtl8723be_check_positive` table walks and
+//!   the MAC / BB / RF6052 configuration.
+//! - [`init`] — the `rtl8723be_hw_init` tail through the station address,
+//!   run by `Prepared::configure_rtl8723be`.
 
 #![allow(dead_code)]
 
 pub mod adapter;
 pub mod fw;
+pub mod init;
 pub mod llt;
 pub mod mac;
+pub mod phy;
 pub mod pwrseq;
+pub mod tables;
 pub mod trx;
 pub mod version;
 

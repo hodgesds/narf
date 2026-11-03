@@ -666,3 +666,179 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_init_mac_and_hw_configure
 );
+
+// ── tables / PHY ──────────────────────────────────────────────────────────
+
+/// `table.c` geometry: pair counts, first/last rows and the conditional
+/// rows (`0x80002000` / `0x90003000` / `0x90004000` / ELSE / ENDIF).
+fn smoke_rtl8723be_tables_verbatim_geometry() -> TestResult {
+    use tables::*;
+    let cond = |t: &[[u32; 2]]| t.iter().filter(|r| r[0] & 0x8000_0000 != 0).count();
+    if PHY_REG.len() != 193
+        || PHY_REG[0] != [0x800, 0x8004_0000]
+        || PHY_REG[192] != [0x800, 0x8304_0000]
+        || PHY_REG_PG.len() != 6
+        || PHY_REG_PG[0] != [0, 0, 0, 0x0e08, 0x0000_ff00, 0x0000_3800]
+        || PHY_REG_PG[5] != [0, 0, 0, 0x0e14, 0xffff_ffff, 0x2630_3436]
+        || RADIOA.len() != 136
+        || RADIOA[0] != [0x000, 0x0001_0000]
+        || MAC.len() != 103
+        || AGCTAB.len() != 131
+        || cond(&PHY_REG) != 0
+        || cond(&MAC) != 0
+        || cond(&AGCTAB) != 0
+        || cond(&RADIOA) != 10
+        || !RADIOA.contains(&[0x8000_2000, 0])
+        || !RADIOA.contains(&[0x4000_0000, 0])
+    {
+        return TestResult::Fail("8723BE table geometry differs from table.c");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_tables_verbatim_geometry
+);
+
+/// `_rtl8723be_check_positive` over the package-type IF / ELSE-IF / ELSE
+/// blocks of RADIOA: TFBGA90 (2), TFBGA80 (3) and TFBGA79 (4) select the
+/// `0x6F10E` rows, QFN68 / default the ELSE `0x6B04E` rows; the BT board
+/// bit and the cut do not take part (cut/board bits are DONTCARE there).
+fn smoke_rtl8723be_check_positive_package_selection() -> TestResult {
+    use phy::{select, Condition};
+    let rf51 = |package_type: u8, board_type: u8| -> Vec<u32> {
+        let c = Condition {
+            cut: 1,
+            package_type,
+            board_type,
+        };
+        select(&tables::RADIOA, &c)
+            .filter(|&(a, _)| a == 0x51)
+            .map(|(_, d)| d)
+            .collect()
+    };
+    for p in [2, 3, 4] {
+        if rf51(p, 0) != [0x6f10e] || rf51(p, 4) != [0x6f10e] {
+            return TestResult::Fail("TFBGA package branch");
+        }
+    }
+    for p in [0, 1] {
+        if rf51(p, 4) != [0x6b04e] {
+            return TestResult::Fail("ELSE branch for QFN68 / default");
+        }
+    }
+    let c = Condition {
+        cut: 0,
+        package_type: 0,
+        board_type: 0,
+    };
+    // Rows after ENDIF are always selected; condition rows never are.
+    let rows: Vec<_> = select(&tables::RADIOA, &c).collect();
+    if rows.iter().any(|&(a, _)| a & 0xc000_0000 != 0)
+        || !rows.contains(&(0x53, 0))
+        || !rows.contains(&(0x73, 0))
+        || rows.len() != 136 - 10 - 6 - 3 * 2 * 2
+    {
+        return TestResult::Fail("8723BE conditional walk");
+    }
+    // cut / package value checks in cond1[27:24] / [15:12].
+    let c = Condition {
+        cut: 2,
+        package_type: 3,
+        board_type: 0,
+    };
+    if c.positive(0x8100_0000, 0)
+        || !c.positive(0x8200_0000, 0)
+        || c.positive(0x8000_2000, 0)
+        || !c.positive(0x8000_3000, 0)
+        || !c.positive(0x8000_0100, 0)
+        || c.positive(0x8000_0200, 0)
+    {
+        return TestResult::Fail("check_positive value / interface checks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_check_positive_package_selection
+);
+
+/// `rtl8723be_hw_init` tail: post-LLT segment, MAC rows + `0x4ca = 0x0b`,
+/// RCR trim, BB enable writes, the `0x948` BT antenna write by
+/// `single_ant_path`, PHY_REG / AGC dword writes, crystal cap, RF6052 3-wire
+/// writes (`(addr << 20) | data` on `0x840`) with the HP extra row, the
+/// `RF_CHNLBW` reads, hw_configure, CAM reset and the station address.
+fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
+    let v = match Version::from_registers(version::CHIP_8723B, 0x1000) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("version"),
+    };
+    let mut map = provisioned();
+    map[0xc3] = 0x00; // ANT_X2, ANT_MAIN
+    let Ok(mut a) = adapter::Adapter::from_hardware(v, adapter::CR9346_AUTOLOAD_OK, 0, &map, 5)
+    else {
+        return TestResult::Fail("adapter");
+    };
+    for hp in [false, true] {
+        if hp {
+            a.oem = adapter::Oem::Hp;
+        }
+        let io = fw_fake(true, true, false);
+        let radio = match narf_scheduler::block_on(init::configure(&io, &a)) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("8723BE configure failed"),
+        };
+        let g = io.0.lock();
+        let w = |row: (u16, u32, u8)| g.writes.iter().position(|x| *x == row);
+        let rf = |addr: u32, data: u32| w((0x840, (addr << 20) | data, 4));
+        let mac0 = tables::MAC[0];
+        let phy0 = tables::PHY_REG[0];
+        let agc0 = tables::AGCTAB[0];
+        let (Some(m0), Some(mac_tail), Some(s948), Some(p0), Some(a0), Some(r0)) = (
+            w((mac0[0] as u16, mac0[1] & 0xff, 1)),
+            w((0x4ca, 0x0b, 1)),
+            w((0x948, 0x280, 4)),
+            w((phy0[0] as u16, phy0[1], 4)),
+            w((agc0[0] as u16, agc0[1], 4)),
+            rf(0x000, 0x1_0000),
+        ) else {
+            return TestResult::Fail("8723BE PHY rows missing");
+        };
+        let cap = 0x22u32 | (0x22 << 6);
+        let r32 =
+            |r: usize| u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]]);
+        if !(m0 < mac_tail && mac_tail < s948 && s948 < p0 && p0 < a0 && a0 < r0)
+            || rf(0x51, 0x6f10e).is_none()
+            || rf(0x51, 0x6b04e).is_some()
+            || rf(0x52, 0x7e4bd).is_some() != hp
+            || g.regs[0x1f] != 0x07
+            || g.regs[0x02] != 0xe3
+            || g.regs[0x25] != 0x80
+            || r32(0x4c) & (1 << 23) == 0
+            || (r32(0x2c) >> 12) & 0xfff != cap
+            || r32(0x670) != 0xc000_0000
+            || g.regs[0x610..0x616] != [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe]
+            || radio.receive_config != mac::RCR & !mac::RCR_ACRC32_AICV
+            || radio.chnlval != [0x0c00, 0]
+        {
+            return TestResult::Fail("8723BE MAC/BB/RF configuration values");
+        }
+    }
+    // ANT_AUX moves the antenna to BT with 0x948 = 0.
+    map[0xc3] = 0x40;
+    let Ok(aux) = adapter::Adapter::from_hardware(v, adapter::CR9346_AUTOLOAD_OK, 0, &map, 5)
+    else {
+        return TestResult::Fail("adapter");
+    };
+    let io = fw_fake(true, true, false);
+    if narf_scheduler::block_on(init::configure(&io, &aux)).is_err()
+        || !io.0.lock().writes.contains(&(0x948, 0, 4))
+    {
+        return TestResult::Fail("8723BE ANT_AUX 0x948 write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_mac_bb_rf_config
+);

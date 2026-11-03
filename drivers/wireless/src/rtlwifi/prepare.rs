@@ -177,6 +177,8 @@ pub struct Prepared<I: Io, M: Memory> {
     rtl8192ce: Option<alloc::boxed::Box<([u8; 32], super::rtl8192ce::init::Radio)>>,
     /// Admitted `N92C` operating point (`rtl8192ce/envelope.rs`).
     rtl8192ce_power: Option<super::rtl8192ce::envelope::Permission>,
+    /// RTL8723BE factory identity and configured radio (`rtl8723be/init.rs`).
+    rtl8723be: Option<alloc::boxed::Box<([u8; 32], super::rtl8723be::init::Radio)>>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -284,6 +286,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8192ee_power: None,
             rtl8192ce: None,
             rtl8192ce_power: None,
+            rtl8723be: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
@@ -647,6 +650,8 @@ impl<I: Io, M: Memory> Drop for Prepared<I, M> {
     }
 }
 
+#[path = "rtl8723be/radio_owner.rs"]
+mod be8723_radio;
 #[path = "rtl8192ce/radio_owner.rs"]
 mod ce92_radio;
 #[path = "packet.rs"]

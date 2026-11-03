@@ -3059,6 +3059,26 @@ keeps the chip diagnostic until admission lands.
   explicitly and `station_grant` is `None`, so no 88EE path can qualify it.
   Test `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
   unexecuted).
+- `tables` / `phy` / `init` — `table.c` PHY_REG / PHY_REG_PG / RADIOA /
+  MAC / AGCTAB generated verbatim (sha256 in the file header);
+  `rtl8723be_phy_config_with_headerfile` + `_rtl8723be_check_positive`
+  over the cut, `rtlhal->package_type`, PCIe and `ODM_BOARD_BT` (`driver2`
+  is 0: RTL8723BE never sets the per-path amplifier types; RADIOA's only
+  conditions are the TFBGA90/80/79 package blocks). `rtl8723_phy_*_bb_reg`
+  and `rtl8723_phy_rf_serial_{read,write}` (one `udelay(120)`, PI/SI
+  read-back), `rtl8723be_phy_mac_config` (+ `0x4ca = 0x0b`),
+  `rtl8723be_phy_bb_config` (`0x948 = 0x280` for `ANT_MAIN`, else 0;
+  `_rtl8723be_config_bb_reg` delay rows; crystal cap into
+  `REG_MAC_PHY_CTRL[23:12]`), `rtl8723be_phy_rf6052_config` (path A; HP
+  OEM `RF 0x52 = 0x7E4BD`) and the `rfreg_chnlval` reads.
+  `Prepared::configure_rtl8723be(factory, efuse_0x1fb)` (Prepared →
+  RadioConfigured) re-qualifies the version and adapter from live
+  registers and the factory map (MAC must equal the factory identity), then
+  runs the `_rtl8723be_init_mac` post-LLT segment and the `rtl8723be_hw_init`
+  tail through `_rtl8723be_hw_configure`, `rtl_cam_reset_all_entry` and
+  the station address. Tests `smoke_rtl8723be_tables_verbatim_geometry`,
+  `smoke_rtl8723be_check_positive_package_selection`,
+  `smoke_rtl8723be_mac_bb_rf_config` (written, unexecuted).
 
 ## 4. Invariants
 
