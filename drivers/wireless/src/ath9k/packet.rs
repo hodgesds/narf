@@ -92,11 +92,12 @@ pub(super) trait Port {
     fn frequency_mhz(&self) -> u16 {
         2412
     }
-    fn channel_mask(&self) -> u16 {
+    /// `channels::bit` mask of the primaries this owner may retune to.
+    fn channel_mask(&self) -> u64 {
         1
     }
     fn geometry(&self) -> super::channel_width::Geometry {
-        super::channel_width::Geometry::from_frequency(self.frequency_mhz())
+        super::channel_width::Geometry::from_frequency_dual(self.frequency_mhz())
             .expect("prepared physical primary")
     }
     fn periodic_grant(&self) -> Option<alloc::sync::Arc<super::periodic::Grant>> {
@@ -572,11 +573,11 @@ impl<P: Port> Packet<P> {
     pub(super) fn frequency_mhz(&self) -> u16 {
         self.port.frequency_mhz()
     }
-    pub(super) fn channel_mask(&self) -> u16 {
+    pub(super) fn channel_mask(&self) -> u64 {
         self.port.channel_mask()
     }
     pub(super) fn channel(&self) -> u8 {
-        ((self.frequency_mhz() - 2407) / 5) as u8
+        super::channels::channel(self.frequency_mhz()).unwrap_or(0)
     }
     pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
         self.port.ht_grant()

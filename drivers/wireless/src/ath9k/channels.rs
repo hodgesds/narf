@@ -38,22 +38,67 @@ struct Work {
     wake: Arc<DriverWake>,
 }
 static WORK: Mutex<Option<Work>> = Mutex::new(None);
+/// IEEE channel of a 20 MHz primary in either band (2.4 GHz 1..=13; the
+/// AR9280 5 GHz set of `phy::ar9280::channel_5ghz`). Whether a radio may
+/// use it is its `channel_mask`, never this numbering.
 pub(super) fn channel(frequency: u16) -> Result<u8, Error> {
+    if let Some(channel) = phy::ar9280::channel_5ghz(frequency) {
+        return Ok(channel);
+    }
     if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
         return Err(Error::Profile);
     }
     Ok(((frequency - 2407) / 5) as u8)
 }
 pub(super) fn frequency(channel: u32) -> Result<u16, Error> {
-    if !(1..=13).contains(&channel) {
-        return Err(Error::Profile);
+    if (1..=13).contains(&channel) {
+        return Ok(2407 + 5 * channel as u16);
     }
-    Ok(2407 + 5 * channel as u16)
+    let channel = u16::try_from(channel).map_err(|_| Error::Profile)?;
+    let frequency = channel
+        .checked_mul(5)
+        .and_then(|f| f.checked_add(5000))
+        .ok_or(Error::Profile)?;
+    phy::ar9280::channel_5ghz(frequency).ok_or(Error::Profile)?;
+    Ok(frequency)
+}
+/// Number of `channel_mask` bits: 13 at 2.4 GHz, then the 25 5 GHz
+/// channels in ascending order.
+pub(super) const CHANNEL_BITS: u32 = 38;
+/// `channel_mask` bit of a 20 MHz primary: 2.4 GHz channel `n` is bit
+/// `n - 1` (the historical AR9285/AR9287 mask), 5 GHz channels follow.
+pub(super) fn bit(frequency: u16) -> Option<u32> {
+    if let Some(channel) = phy::ar9280::channel_5ghz(frequency) {
+        let channel = u32::from(channel);
+        return Some(match channel {
+            36..=64 => 13 + (channel - 36) / 4,
+            100..=144 => 21 + (channel - 100) / 4,
+            _ => 33 + (channel - 149) / 4,
+        });
+    }
+    channel(frequency)
+        .ok()
+        .map(|channel| u32::from(channel) - 1)
+}
+/// The primary of `channel_mask` bit `bit` (inverse of `bit`).
+pub(super) fn bit_frequency(bit: u32) -> Option<u16> {
+    let channel = match bit {
+        0..=12 => return Some(2412 + 5 * bit as u16),
+        13..=20 => 36 + 4 * (bit - 13),
+        21..=32 => 100 + 4 * (bit - 21),
+        33..=37 => 149 + 4 * (bit - 33),
+        _ => return None,
+    };
+    Some(5000 + 5 * channel as u16)
+}
+/// Whether `mask` admits the 20 MHz primary `frequency`.
+pub(super) fn admits(mask: u64, frequency: u16) -> bool {
+    bit(frequency).is_some_and(|bit| mask & (1 << bit) != 0)
 }
 pub(super) fn request(frequency: u16, generation: u32) -> Result<Transition, Error> {
     channel(frequency)?;
     request_geometry(
-        channel_width::Geometry::from_frequency(frequency).map_err(|_| Error::Profile)?,
+        channel_width::Geometry::from_frequency_dual(frequency).map_err(|_| Error::Profile)?,
         generation,
         None,
     )
@@ -76,8 +121,9 @@ pub(super) fn request_geometry(
             work.result.clone()
         } else {
             let ar9285 = CONTROLLER.lock().clone();
+            let has_ar9285 = ar9285.is_some();
             let reset: Pin<Box<dyn Future<Output = Result<(), BringUpError>> + Send>> =
-                if let Some(owner) = ar9285 {
+                if let Some(owner) = ar9285.filter(|_| !geometry.is_5ghz()) {
                     // Count the accepted original request before it waits for
                     // CONTROL; an idle request cannot retire hardware from
                     // under queued work.
@@ -88,7 +134,10 @@ pub(super) fn request_geometry(
                             .await
                             .map(|_| ())
                     })
-                } else if wide.is_none() {
+                } else if has_ar9285 {
+                    // AR9285 has no 5 GHz path.
+                    return Err(Error::Profile);
+                } else if wide.is_none() && !geometry.is_5ghz() {
                     // The chip-generic AR9287 owner (no HT40 owner exists).
                     Box::pin(
                         super::ar9287_owner::transition(geometry.control(), generation)

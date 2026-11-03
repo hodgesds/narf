@@ -93,7 +93,7 @@ pub(super) struct Native {
     bar: MmioRegion,
     active: AtomicBool,
     calibrated: Calibrated,
-    channel_mask: u16,
+    channel_mask: u64,
     powers: Option<InstalledPower>,
     rf_silent: Option<(u8, bool)>,
     ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
@@ -163,7 +163,7 @@ impl Native {
             return Err(Error::Packet);
         }
         let rf_silent = rf_silent(image)?;
-        let mut channel_mask = 1 << ((report.frequency_mhz - 2412) / 5);
+        let mut channel_mask: u64 = 1 << ((report.frequency_mhz - 2412) / 5);
         for channel in 1..=13u16 {
             if super::phy::rates::checked_plan_at(image, 2407 + 5 * channel, 40).is_ok() {
                 channel_mask |= 1 << (channel - 1);
@@ -197,7 +197,7 @@ impl Native {
         cap: Cap<BusDeviceCap, Write>,
         bar: MmioRegion,
         calibrated: Calibrated,
-        channel_mask: u16,
+        channel_mask: u64,
         powers: Option<InstalledPower>,
         rf_silent: Option<(u8, bool)>,
     ) -> Self {
@@ -297,7 +297,7 @@ impl Native {
                     narf_time::monotonic_ns() / 1_000_000,
                 )),
             },
-            channel_mask,
+            u64::from(channel_mask),
             Some(InstalledPower::Twenty(powers)),
             rf_silent,
         ))
@@ -663,14 +663,16 @@ impl Port for Native {
             })
         })
     }
-    fn channel_mask(&self) -> u16 {
+    fn channel_mask(&self) -> u64 {
         self.channel_mask
     }
     fn geometry(&self) -> super::channel_width::Geometry {
         match &self.powers {
             Some(InstalledPower::Forty(actual)) => actual.geometry,
-            _ => super::channel_width::Geometry::from_frequency(self.calibrated.frequency_mhz())
-                .expect("validated native primary"),
+            _ => {
+                super::channel_width::Geometry::from_frequency_dual(self.calibrated.frequency_mhz())
+                    .expect("validated native primary")
+            }
         }
     }
     fn frequency_mhz(&self) -> u16 {

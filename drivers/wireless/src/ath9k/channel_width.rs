@@ -30,6 +30,22 @@ impl Geometry {
         }
         Self::new(((frequency - 2407) / 5) as u8, Width::Twenty)
     }
+    /// A 20 MHz primary in either band: 2.4 GHz as `from_frequency`, or a
+    /// 5 GHz channel of `phy::ar9280::channel_5ghz` (AR9280 only; HT40 and
+    /// every AR9285 constructor stay 2.4 GHz).
+    pub(super) fn from_frequency_dual(frequency: u16) -> Result<Self, BringUpError> {
+        match super::phy::ar9280::channel_5ghz(frequency) {
+            Some(primary) => Ok(Self {
+                primary,
+                width: Width::Twenty,
+            }),
+            None => Self::from_frequency(frequency),
+        }
+    }
+    /// 5 GHz primaries are IEEE channels 36..=165; 2.4 GHz ones 1..=13.
+    pub(super) fn is_5ghz(self) -> bool {
+        self.primary >= 36
+    }
     pub(super) fn primary(self) -> u8 {
         self.primary
     }
@@ -37,7 +53,11 @@ impl Geometry {
         self.width != Width::Twenty
     }
     pub(super) fn control(self) -> u16 {
-        2407 + u16::from(self.primary) * 5
+        if self.is_5ghz() {
+            5000 + u16::from(self.primary) * 5
+        } else {
+            2407 + u16::from(self.primary) * 5
+        }
     }
     pub(super) fn center(self) -> u16 {
         match self.width {

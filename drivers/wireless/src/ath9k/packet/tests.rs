@@ -55,7 +55,7 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) ps_trace: RefCell<Vec<(u64, u32)>>,
     pub(in crate::ath9k) rx_flags: Cell<u32>,
     pub(in crate::ath9k) frequency: Cell<u16>,
-    pub(in crate::ath9k) channels: Cell<u16>,
+    pub(in crate::ath9k) channels: Cell<u64>,
     pub(in crate::ath9k) registers: RefCell<BTreeMap<u64, u32>>,
     pub(in crate::ath9k) regions: RefCell<Vec<Region>>,
     pub(in crate::ath9k) master: Cell<bool>,
@@ -478,7 +478,7 @@ impl Port for Arc<Model> {
     fn frequency_mhz(&self) -> u16 {
         self.frequency.get()
     }
-    fn channel_mask(&self) -> u16 {
+    fn channel_mask(&self) -> u64 {
         self.channels.get()
     }
     fn qos_grant(&self) -> Option<Arc<crate::ath9k::qos::Grant>> {

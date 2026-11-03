@@ -345,7 +345,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn frequency_mhz(&self) -> u16 {
         self.packet.frequency_mhz()
     }
-    pub(super) fn channel_mask(&self) -> u16 {
+    pub(super) fn channel_mask(&self) -> u64 {
         self.packet.channel_mask()
     }
     pub(super) fn channel(&self) -> u8 {
@@ -727,7 +727,13 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 .submit_ba_response(&bytes, self.rates.ok_or(Error::State)?.basic())?
         } else {
             let rate = if kind == Kind::Probe {
-                0
+                // 1 Mbps CCK on 2.4 GHz; 6 Mbps OFDM (`rates::BITRATES[4]`)
+                // on 5 GHz, where CCK does not exist.
+                if self.frequency_mhz() >= 5000 {
+                    4
+                } else {
+                    0
+                }
             } else {
                 self.rates.ok_or(Error::State)?.basic()
             };
@@ -1782,28 +1788,35 @@ impl<P: Port, E: Environment> Radio<P, E> {
             probe.extend_from_slice(&[255; 6]);
             probe.extend_from_slice(&[0, 0, 0, name.len() as u8]);
             probe.extend_from_slice(name);
-            // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
-            probe.extend_from_slice(&[
-                1,
-                4,
-                0x82,
-                0x84,
-                0x8b,
-                0x96,
-                50,
-                8,
-                12,
-                18,
-                24,
-                36,
-                48,
-                72,
-                96,
-                108,
-                3,
-                1,
-                self.channel(),
-            ]);
+            if self.frequency_mhz() >= 5000 {
+                // 5 GHz (AR9280): the eight OFDM rates only and no DS
+                // Parameter Set (`mac80211 ieee80211_build_preq_ies_band`
+                // adds DS params on 2.4 GHz only).
+                probe.extend_from_slice(&[1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]);
+            } else {
+                // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
+                probe.extend_from_slice(&[
+                    1,
+                    4,
+                    0x82,
+                    0x84,
+                    0x8b,
+                    0x96,
+                    50,
+                    8,
+                    12,
+                    18,
+                    24,
+                    36,
+                    48,
+                    72,
+                    96,
+                    108,
+                    3,
+                    1,
+                    self.channel(),
+                ]);
+            }
             {
                 let publication = self.publication.clone();
                 let _publication = publication.lock();

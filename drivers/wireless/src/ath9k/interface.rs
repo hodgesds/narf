@@ -667,17 +667,36 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.own,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: self.radio.try_lock().map_or_else(Vec::new, |radio| {
-                    (1..=13)
-                        .filter(|channel| {
-                            radio.channel_mask() & (1 << (channel - 1)) != 0
-                                && permitted(2407 + 5 * *channel as u16)
-                        })
-                        .collect()
-                }),
-            }],
+            bands: {
+                // The 2.4 GHz band, then 5 GHz only for a radio whose mask
+                // (AR9280) admits a 5 GHz primary.
+                let channels = |five: bool| {
+                    self.radio.try_lock().map_or_else(Vec::new, |radio| {
+                        (0..super::channels::CHANNEL_BITS)
+                            .filter(|bit| radio.channel_mask() & (1 << bit) != 0)
+                            .filter_map(super::channels::bit_frequency)
+                            .filter(|frequency| {
+                                (*frequency >= 5000) == five && permitted(*frequency)
+                            })
+                            .filter_map(|frequency| {
+                                super::channels::channel(frequency).ok().map(u32::from)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let mut bands = vec![WirelessBand {
+                    freq_mhz: 2400,
+                    channels: channels(false),
+                }];
+                let five = channels(true);
+                if !five.is_empty() {
+                    bands.push(WirelessBand {
+                        freq_mhz: 5000,
+                        channels: five,
+                    });
+                }
+                bands
+            },
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self
@@ -805,7 +824,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> ChannelIface for Device
         self.associate_inner(request, force_twenty).await
     }
     fn retune_channel(&self, frequency: u16) -> Result<super::channels::Transition, Error> {
-        let channel = super::channels::channel(frequency)?;
+        super::channels::channel(frequency)?;
         let radio = self.radio.try_lock().ok_or(Error::Busy)?;
         if self.closed.load(Ordering::Acquire)
             || !self.admitted.load(Ordering::Acquire)
@@ -816,7 +835,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> ChannelIface for Device
         {
             return Err(Error::State);
         }
-        if radio.channel_mask() & (1 << (channel - 1)) == 0 || !permitted(frequency) {
+        if !super::channels::admits(radio.channel_mask(), frequency) || !permitted(frequency) {
             return Err(Error::Profile);
         }
         radio.retune(frequency).ok_or(Error::Profile)
@@ -850,14 +869,16 @@ async fn discover(
 }
 fn permitted(frequency: u16) -> bool {
     narf_wireless::reg::db::snapshot().is_some_and(|domain| {
-        super::calibration::Permission::from_domain_at(&domain, frequency).is_ok()
+        // Dual-band span rule (DFS / NO_IR / indoor refuse); a 5 GHz
+        // frequency is only reachable through an AR9280 mask.
+        super::calibration::Permission::from_domain_dual(&domain, frequency).is_ok()
     })
 }
 fn one_scan(request: &ScanRequest, frequency: u16) -> ScanRequest {
     ScanRequest {
         ssids: request.ssids.clone(),
         frequencies_mhz: vec![u32::from(frequency)],
-        channels: vec![u32::from((frequency - 2407) / 5)],
+        channels: vec![u32::from(super::channels::channel(frequency).unwrap_or(0))],
         active: request.active,
         random_mac: request.random_mac,
         colocated_6ghz: request.colocated_6ghz,
@@ -866,7 +887,7 @@ fn one_scan(request: &ScanRequest, frequency: u16) -> ScanRequest {
         extra_ies: request.extra_ies.clone(),
     }
 }
-fn scan_frequencies(request: &ScanRequest, mask: u16) -> Result<Vec<u16>, WirelessError> {
+fn scan_frequencies(request: &ScanRequest, mask: u64) -> Result<Vec<u16>, WirelessError> {
     let explicit = !request.frequencies_mhz.is_empty() || !request.channels.is_empty();
     let selected = if !request.frequencies_mhz.is_empty() {
         request
@@ -881,18 +902,18 @@ fn scan_frequencies(request: &ScanRequest, mask: u16) -> Result<Vec<u16>, Wirele
             .map(|ch| super::channels::frequency(*ch).map_err(wireless))
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        (1..=13)
-            .filter(|ch| mask & (1 << (ch - 1)) != 0)
-            .map(|ch| 2407 + ch * 5)
+        (0..super::channels::CHANNEL_BITS)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .filter_map(super::channels::bit_frequency)
             .collect()
     };
     let mut output = Vec::new();
     for frequency in selected {
-        let channel = super::channels::channel(frequency).map_err(wireless)?;
+        super::channels::channel(frequency).map_err(wireless)?;
         // Retain the original channel1-only selector behavior. The native
         // Port still checks current policy on every actual RF/DMA operation.
         let reference = mask == 1 && frequency == 2412;
-        if mask & (1 << (channel - 1)) == 0 || !reference && !permitted(frequency) {
+        if !super::channels::admits(mask, frequency) || !reference && !permitted(frequency) {
             if explicit {
                 return Err(WirelessError::NotSupported);
             }
