@@ -4954,7 +4954,8 @@ mod tests {
                     initiator_key_distribution: dist_init,
                     responder_key_distribution: dist_resp,
                 }
-                .encode(smp::SMP_PAIRING_REQUEST),
+                .encode(smp::SMP_PAIRING_REQUEST)
+                .encode(),
             ),
         )
     }
@@ -5030,7 +5031,7 @@ mod tests {
     }
 
     /// Bring up the fake controller and open one LE connection.
-    fn smp888_bring_up_connect(fake: &ScriptedTransport) -> Result<(), &'static str> {
+    fn smp888_bring_up_connect(fake: &Arc<ScriptedTransport>) -> Result<(), &'static str> {
         let transport: Arc<dyn HciTransport> = fake.clone();
         crate::transport::register(transport);
         script_successful_bringup(fake);
