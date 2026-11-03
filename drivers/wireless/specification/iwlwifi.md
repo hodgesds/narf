@@ -4222,13 +4222,66 @@ allocates, and P2P START refuses while a further link is active.
 Written, unexecuted: `smoke_iwl_mld_shared_id_pool_and_per_link_group_replay`
 plus the extended `smoke_mld_multi_link_m2_link_kdes_and_per_link_group_keys`.
 
-Still open for a second active link: group-addressed robust management
-(BIP) received on a further link still uses the association link's IGTK
-replay state; 6GHz further links; no device/nl80211
-caller supplies candidates yet; EMLSR link selection driving activation with
-MLO scan freshness, missed-beacon/ESR_MODE_NOTIF/EMLSR_TRANS_FAIL_NOTIF
-routing, MAC client esr fields; EML OMN, TID-to-link mapping and the
-public narf_wireless multiple-link surface.
+**Multiple-link caller, EMLSR runtime and per-link BIP (pass 6).** A fresh
+station CONNECT (`device.rs` `associate_in_domain`, not P2P client, not
+roam) now supplies `MldLinkCandidate`s through
+`sc_mlo_assoc::scan_candidates`: every other affiliated AP of the
+association BSS's AP MLD whose own beacon the most recent scan received
+(`State::scan_seen`, cleared at each scan start; iwl mld
+`iwl_mld_set_link_sel_data` ignores a BSS not seen in the last MLO scan).
+Each must pass cfg80211 `cfg80211_mlme_check_mlo`/`_compat` against the
+association link: Basic MLE with a link id, the same AP MLD address, EML
+capabilities and MLD capabilities/operations, BSSID not our address; one
+entry per link id, ascending. Every link gets a fresh random locally
+administered unicast address (mlme.c `ieee80211_mgd_assoc`
+`eth_random_addr`), distinct from the MLD address, every other link
+address and every scanned AP. Without entropy nothing further is
+requested. Extended MLD capabilities are not compared (not parsed).
+
+A multiple-link request now carries Intel's `IWL_MLD_EMLSR_CAPA`
+(`EmlCapabilities::INTEL_MLD_LOCAL`) as mac80211 copies the station
+`wiphy_iftype_ext_capab`; MLD Capabilities/Operations stay 0 because
+TID-to-link mapping negotiation and link reconfiguration (Linux
+`IWL_MLD_CAPA_OPS`) are not implemented. A single-link MLD request is
+unchanged. The AP MLD's response Basic MLE EML capabilities and medium
+sync delay (mlme.c `vif->cfg.eml_cap`/`eml_med_sync_delay`, default
+0x10ac) fill MAC_CONFIG client `esr_transition_timeout` (clamped to
+64TU) and `medium_sync_delay` at offsets37/38 of the associated MAC
+MODIFY (mld/iface.c `iwl_mld_mac_cmd_fill_sta`). Linux has no station EML
+OMN sender (mac80211 ap.c only handles the AP side); the firmware sends
+it (`iwl_esr_trans_fail_code` names its OMN TX failures), so none is built.
+
+`Connection::receive_packet_checked` routes MLD notifications
+(mld/notif.c): MISSED_BEACONS_NOTIF v5 (link.c
+`iwl_mld_handle_missed_beacon_notif` thresholds 6/19 connection loss,
+5+5 both-link and 15 single-link EMLSR exit), ESR_MODE_NOTIF v2
+recommend-leave and EMLSR_TRANS_FAIL_NOTIF v1. Connection loss is an
+error, so the device performs its ordinary bounded stop; a requested
+single-link set is applied by maintenance (`service_active_links`,
+`ieee80211_set_active_links_async`), which deactivates/activates the
+further link with TX drained. `Emlsr::links_activated` tracks every
+activation. Malformed notifications are dropped.
+`emlsr_capable()` is `iwl_mld_vif_has_emlsr_cap` for the association.
+
+Group-addressed robust management received on an active further link is
+verified with that link's own IGTK/BIP replay store
+(`ValidLink::mfp`), adopted from its authenticated MLO IGTK KDE IPN; an
+identical retransmission keeps the floor (mac80211 rx.c resolves the
+group key on `rx->link`).
+
+Written, unexecuted: `smoke_iwl_mld_scan_candidates_same_ap_mld_fresh_links`,
+`smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss`.
+
+Still open (`mlo` row not complete): automatic EMLSR link selection
+(link.c `iwl_mld_get_link_grade` RSSI/bandwidth/puncturing/channel-load
+grading, the internal MLO scan and its 5s freshness, and the
+`iwl_mld_select_links` triggers) so nothing yet *enters* EMLSR on its
+own; primary-link switching (a set naming only the further link keeps the
+association link alone); the missed-beacon BSS-parameters-changed
+threshold and CQM beacon-loss/MLO-rescan path; advertised TID-to-link
+mapping (dormant links); 6GHz further links; and the public
+narf_wireless/nl80211 multiple-link surface (WIPHY_FLAG_SUPPORTS_MLO,
+EHT MLD iftype capabilities, MLO link reporting). Nothing is advertised.
 
 
 ### 3.67 Complete native6GHz discovery, refinement and live TPE (validation pending)

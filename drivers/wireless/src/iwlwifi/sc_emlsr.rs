@@ -384,6 +384,58 @@ impl Emlsr {
     }
 }
 
+impl Emlsr {
+    /// link.c iwl_mld_handle_missed_beacon_notif (v5). `spec_of_fw` maps
+    /// an owned firmware link id to its spec link id. The connection-quality
+    /// beacon-loss event and the single-link `iwl_mld_int_mlo_scan` switch
+    /// attempt have no counterpart here. The BSS-parameters-changed
+    /// threshold is not applied: the per-link `bss_param_ch_cnt_link_id`
+    /// tracking it depends on is not kept.
+    pub fn missed_beacons(
+        &mut self,
+        payload: &[u8],
+        spec_of_fw: impl Fn(u32) -> Option<u8>,
+        now_ms: u64,
+    ) -> Result<MissedBeacons, &'static str> {
+        let field = |at| word(payload, at).ok_or("missed beacons notification short");
+        let (fw_link, since_rx, missed) = (field(0)?, field(4)?, field(8)?);
+        let (other_fw, other_missed) = (field(12)?, field(16)?);
+        let Some(link) = spec_of_fw(fw_link) else {
+            return Ok(MissedBeacons::Ignored);
+        };
+        if missed >= MISSED_THRESHOLD_LONG {
+            return Ok(if since_rx >= MISSED_SINCE_RX_THOLD {
+                MissedBeacons::Disconnect
+            } else {
+                MissedBeacons::Ignored
+            });
+        }
+        if self.active.count_ones() <= 1 || other_fw == FW_CTXT_ID_INVALID {
+            return Ok(MissedBeacons::Ignored);
+        }
+        if spec_of_fw(other_fw).is_none() {
+            return Ok(MissedBeacons::Ignored);
+        }
+        let keep = if missed >= BCN_LOSS_EXIT_2_LINKS && other_missed >= BCN_LOSS_EXIT_2_LINKS {
+            // Symmetric failure keeps the primary.
+            self.primary_link()
+        } else if missed >= BCN_LOSS_EXIT {
+            // Only this link is sick: keep iwl_mld_get_other_link.
+            let other = self.active & !(1u16 << link);
+            if other == 0 {
+                return Ok(MissedBeacons::Ignored);
+            }
+            other.trailing_zeros() as u8
+        } else {
+            return Ok(MissedBeacons::Ignored);
+        };
+        Ok(match self.exit(exit::MISSED_BEACON, keep, now_ms) {
+            Some(set) => MissedBeacons::Keep(set),
+            None => MissedBeacons::Ignored,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TransitionFailure {
     /// ieee80211_connection_loss: unknown link or failed deactivation.
@@ -401,8 +453,31 @@ pub(super) fn client_mld_fields(
 ) -> (u8, u16) {
     (
         ap.map_or(0, EmlCapabilities::transition_timeout_code),
-        medium_sync.unwrap_or(0),
+        // ieee80211_mle_get_eml_med_sync_delay: absent means the default.
+        medium_sync.unwrap_or(MED_SYNC_DELAY_DEFAULT),
     )
+}
+
+/// ieee80211-eht.h IEEE80211_MED_SYNC_DELAY_DEFAULT.
+pub(super) const MED_SYNC_DELAY_DEFAULT: u16 = 0x10ac;
+
+/// fw/api/mac-cfg.h MISSED_BEACONS_NOTIF (MAC_CONF_GROUP 0xF6), v5.
+pub(super) const MISSED_BEACONS_NOTIF: (u8, u8) = (3, 0xf6);
+/// mld/constants.h missed-beacon thresholds.
+const MISSED_SINCE_RX_THOLD: u32 = 6;
+const MISSED_THRESHOLD_LONG: u32 = 19;
+const BCN_LOSS_EXIT_2_LINKS: u32 = 5;
+const BCN_LOSS_EXIT: u32 = 15;
+/// fw/api FW_CTXT_ID_INVALID.
+const FW_CTXT_ID_INVALID: u32 = 0xffff_ffff;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MissedBeacons {
+    /// ieee80211_connection_loss.
+    Disconnect,
+    /// Leave EMLSR keeping this single link set.
+    Keep(u16),
+    Ignored,
 }
 
 fn word(payload: &[u8], at: usize) -> Option<u32> {

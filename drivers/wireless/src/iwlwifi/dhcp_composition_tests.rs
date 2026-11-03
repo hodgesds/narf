@@ -1894,6 +1894,7 @@ impl Guard {
             scan_uid: 0,
             scheduled: None,
             beacons: Vec::new(),
+            scan_seen: Vec::new(),
             connection: None,
             ap: None,
             ap_probes: VecDeque::new(),

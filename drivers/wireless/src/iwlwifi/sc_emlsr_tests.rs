@@ -150,7 +150,9 @@ fn smoke_iwl_emlsr_block_exit_prevention_and_notifications() -> TestResult {
         return TestResult::Fail("short EMLSR transition failure accepted");
     }
     let ap = Some(EmlCapabilities(1 | (15 << 11)));
-    if client_mld_fields(ap, Some(9)) != (10, 9) || client_mld_fields(None, None) != (0, 0) {
+    if client_mld_fields(ap, Some(9)) != (10, 9)
+        || client_mld_fields(None, None) != (0, MED_SYNC_DELAY_DEFAULT)
+    {
         return TestResult::Fail("MAC client EMLSR timeout clamp differs from mld/iface.c");
     }
     if !capable(true, true, true, ap, false) || capable(true, true, true, ap, true) {
@@ -186,4 +188,70 @@ fn smoke_iwl_mld_fw_link_station_ids_bounded_by_tlvs() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
     smoke_iwl_mld_fw_link_station_ids_bounded_by_tlvs
+);
+
+fn missed(
+    link: u32,
+    since_rx: u32,
+    missed: u32,
+    other: u32,
+    other_missed: u32,
+) -> alloc::vec::Vec<u8> {
+    [link, since_rx, missed, other, other_missed]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect()
+}
+
+/// link.c iwl_mld_handle_missed_beacon_notif thresholds (constants.h).
+fn smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss() -> TestResult {
+    // FW link 0 = spec link 1 (primary), FW link 1 = spec link 2.
+    let spec = |fw: u32| match fw {
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    };
+    let mut emlsr = Emlsr {
+        selected: 0b110,
+        selected_primary: 1,
+        ..Emlsr::default()
+    };
+    emlsr.links_activated(0b110);
+    // Long loss without RX is a connection loss even in EMLSR.
+    if emlsr.missed_beacons(&missed(0, 6, 19, 1, 0), spec, 0) != Ok(MissedBeacons::Disconnect) {
+        return TestResult::Fail("long missed-beacon run did not lose the connection");
+    }
+    // Long loss while data is still received stays connected.
+    if emlsr.missed_beacons(&missed(0, 5, 19, 1, 0), spec, 0) != Ok(MissedBeacons::Ignored) {
+        return TestResult::Fail("long missed-beacon run with RX disconnected");
+    }
+    // Below every threshold, or before the other link is activated.
+    if emlsr.missed_beacons(&missed(1, 0, 14, 0, 4), spec, 0) != Ok(MissedBeacons::Ignored)
+        || emlsr.missed_beacons(&missed(1, 0, 15, u32::MAX, 0), spec, 0)
+            != Ok(MissedBeacons::Ignored)
+    {
+        return TestResult::Fail("EMLSR left below the missed-beacon thresholds");
+    }
+    // Only the further link is sick: keep the other (association) link.
+    if emlsr.missed_beacons(&missed(1, 0, 15, 0, 0), spec, 0) != Ok(MissedBeacons::Keep(0b10)) {
+        return TestResult::Fail("sick link was kept");
+    }
+    // Both links lose beacons: keep the primary.
+    let mut both = Emlsr {
+        selected: 0b110,
+        selected_primary: 2,
+        ..Emlsr::default()
+    };
+    both.links_activated(0b110);
+    if both.missed_beacons(&missed(0, 0, 5, 1, 5), spec, 0) != Ok(MissedBeacons::Keep(0b100)) {
+        return TestResult::Fail("symmetric loss did not keep the primary link");
+    }
+    if both.missed_beacons(&[0; 16], spec, 0).is_ok() {
+        return TestResult::Fail("short v5 notification accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss
 );

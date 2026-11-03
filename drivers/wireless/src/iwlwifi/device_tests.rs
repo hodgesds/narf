@@ -39,6 +39,7 @@ impl Fixture {
                 scan_uid: 0,
                 scheduled: None,
                 beacons: Vec::new(),
+                scan_seen: Vec::new(),
                 connection: Some(connection),
                 ap: None,
                 ap_probes: VecDeque::new(),

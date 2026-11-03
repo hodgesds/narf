@@ -81,6 +81,9 @@ struct State {
     scan_uid: u32,
     scheduled: Option<scheduled::Owner>,
     beacons: Vec<Beacon>,
+    /// `beacons` entries received by the most recent scan (bssid, band,
+    /// channel): the MLO scan freshness further links require.
+    scan_seen: Vec<([u8; 6], super::native_band::Band, u8)>,
     connection: Option<Connection>,
     ap: Option<super::ap_session::Session>,
     ap_probes: VecDeque<Vec<u8>>,
@@ -300,6 +303,7 @@ impl Device {
                 scan_uid: 0,
                 scheduled: None,
                 beacons: Vec::new(),
+                scan_seen: Vec::new(),
                 connection: None,
                 ap: None,
                 ap_probes: VecDeque::new(),
@@ -557,6 +561,7 @@ impl Device {
         state.clear_transmit();
         state.eapol.clear();
         state.beacons.clear();
+        state.scan_seen.clear();
         #[cfg(any(test, feature = "kernel-test"))]
         let model = super::runtime::model::is_model(&state.hardware);
         #[cfg(not(any(test, feature = "kernel-test")))]
@@ -1416,8 +1421,29 @@ impl Device {
                     .map_err(|_| WirelessError::HardwareError)?,
             ))
             .map_err(|_| WirelessError::HardwareError)?;
+        // A fresh station association requests every other affiliated
+        // link of the same AP MLD seen in the latest scan; the native owner
+        // then admits or drops each one (a P2P client never does MLO).
+        let further = if client.is_none() {
+            super::sc_mlo_assoc::scan_candidates(
+                &beacon,
+                &state.beacons,
+                |b| state.scan_seen.contains(&(b.bssid, b.band, b.channel)),
+                self.mac,
+                || {
+                    let bytes = super::security::fresh_nonce()?;
+                    let mut address = [0; 6];
+                    address.copy_from_slice(&bytes[..6]);
+                    Ok(address)
+                },
+            )
+            // Without a link address nothing further is requested.
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let bssid = request.bssid;
-        match Connection::associate_client_in_domain(
+        match Connection::associate_links_in_domain(
             &mut state.hardware,
             self.mac,
             beacon,
@@ -1427,6 +1453,7 @@ impl Device {
             None,
             domain,
             client,
+            further,
         )
         .await
         {
@@ -1941,8 +1968,10 @@ impl WirelessNetIface for Device {
             let State {
                 hardware: hw,
                 beacons,
+                scan_seen,
                 ..
             } = &mut *state;
+            scan_seen.clear();
             let version = hw.version(1, 0xd).ok_or(WirelessError::NotSupported)?.0;
             let mut result: Vec<BssInfo> = Vec::new();
             let mut colocated: Vec<narf_wireless::scan::ColocatedAp> = Vec::new();
@@ -2141,14 +2170,22 @@ impl WirelessNetIface for Device {
                             capabilities: u16::from_le_bytes([body[10], body[11]]),
                             information_elements: body[12..].to_vec(),
                         };
-                        if let Some(old) = beacons.iter_mut().find(|old| {
+                        let stored = if let Some(old) = beacons.iter_mut().find(|old| {
                             old.bssid == bssid
                                 && old.band == channel.band
                                 && old.channel == channel.number
                         }) {
                             *old = record;
+                            true
                         } else if beacons.len() < 256 {
                             beacons.push(record);
+                            true
+                        } else {
+                            false
+                        };
+                        let key = (bssid, channel.band, channel.number);
+                        if stored && !scan_seen.contains(&key) {
+                            scan_seen.push(key);
                         }
                         let security = if channel.band == super::native_band::Band::Six
                             && beacon

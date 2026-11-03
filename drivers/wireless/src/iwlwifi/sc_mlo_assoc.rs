@@ -26,6 +26,82 @@ pub struct MldLinkCandidate {
     pub own_link: [u8; 6],
 }
 
+/// Further-link candidates for a fresh station association, taken from
+/// the driver's own scan table. This is the device-side counterpart of
+/// userspace naming `NL80211_ATTR_MLO_LINKS`: every other affiliated AP of
+/// the association BSS's AP MLD whose own beacon was received in the most
+/// recent scan (`fresh`; iwl mld `iwl_mld_set_link_sel_data` ignores any
+/// BSS not seen in the last MLO scan). Each entry must pass cfg80211
+/// `cfg80211_mlme_check_mlo`/`_compat` against the association link: a
+/// Basic MLE with a link id, the same AP MLD address, EML capabilities and
+/// MLD capabilities/operations, and a BSSID that is not our address. One
+/// entry per link id, ascending; the association link id is excluded. Each
+/// link gets a fresh random local link address (mlme.c
+/// `ieee80211_mgd_assoc` `eth_random_addr` for a link without one), never
+/// equal to the MLD address, another link address or any AP address.
+pub(super) fn scan_candidates(
+    assoc: &Beacon,
+    scanned: &[Beacon],
+    fresh: impl Fn(&Beacon) -> bool,
+    local: [u8; 6],
+    mut random: impl FnMut() -> Result<[u8; 6], &'static str>,
+) -> Result<alloc::vec::Vec<MldLinkCandidate>, &'static str> {
+    use narf_wireless::association::mlo::BasicMultiLink;
+    let mut found = alloc::vec::Vec::new();
+    let Ok(ours) = BasicMultiLink::from_ies(&assoc.information_elements) else {
+        return Ok(found);
+    };
+    let Some(assoc_link) = ours.link_id() else {
+        return Ok(found);
+    };
+    let mut seen = 1u16 << assoc_link;
+    let mut links: alloc::vec::Vec<(u8, &Beacon)> = alloc::vec::Vec::new();
+    for beacon in scanned {
+        if beacon.bssid == assoc.bssid || beacon.bssid == local || !fresh(beacon) {
+            continue;
+        }
+        let Ok(theirs) = BasicMultiLink::from_ies(&beacon.information_elements) else {
+            continue;
+        };
+        let Some(link) = theirs.link_id() else {
+            continue;
+        };
+        if link >= 15
+            || seen & (1 << link) != 0
+            || theirs.address() != ours.address()
+            || theirs.eml_capabilities() != ours.eml_capabilities()
+            || theirs.mld_capabilities() != ours.mld_capabilities()
+        {
+            continue;
+        }
+        seen |= 1 << link;
+        links.push((link, beacon));
+    }
+    links.sort_unstable_by_key(|(link, _)| *link);
+    for (_, beacon) in links {
+        let own_link = (0..8)
+            .find_map(|_| {
+                let mut address = random().ok()?;
+                // eth_random_addr: unicast, locally administered.
+                address[0] = (address[0] & 0xfe) | 0x02;
+                let clash = address == local
+                    || address == ours.address()
+                    || address == [0; 6]
+                    || scanned.iter().any(|b| b.bssid == address)
+                    || found
+                        .iter()
+                        .any(|c: &MldLinkCandidate| c.own_link == address);
+                (!clash).then_some(address)
+            })
+            .ok_or("no random local MLD link address")?;
+        found.push(MldLinkCandidate {
+            beacon: beacon.clone(),
+            own_link,
+        });
+    }
+    Ok(found)
+}
+
 /// A further link the AP accepted (a valid, initially inactive link).
 pub(super) struct ValidLink {
     pub context: Context,
@@ -43,6 +119,9 @@ pub(super) struct ValidLink {
     pub keys: Option<super::security::LinkGroupKeys>,
     /// This link's own group RX PN floors (`rx->link->gtk[idx]` rx_pn).
     pub group_replay: super::frame_api::GroupReplay,
+    /// This link's own IGTK and BIP replay floor (`rx->link` IGTK in
+    /// mac80211 rx.c `ieee80211_rx_h_decrypt` for group management).
+    pub mfp: narf_wireless::mfp::MfpKeyStore,
     /// Firmware ownership (link/STA ids and PHY id) while active.
     pub active: Option<(LinkOwner, u8)>,
 }
@@ -194,6 +273,7 @@ impl Admission<'_> {
             max_power,
             keys: None,
             group_replay: Default::default(),
+            mfp: narf_wireless::mfp::MfpKeyStore::new(),
             active: None,
         })
     }

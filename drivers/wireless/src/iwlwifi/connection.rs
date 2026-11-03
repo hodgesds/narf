@@ -77,6 +77,14 @@ pub struct Connection {
     mld: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
     /// Accepted further links (valid; at most one also active).
     mld_links: Vec<super::sc_mlo_assoc::ValidLink>,
+    /// The AP MLD's EML capabilities and medium sync delay from the
+    /// association response Basic MLE (mlme.c `vif->cfg.eml_cap`).
+    ap_eml: Option<narf_wireless::association::mlo::EmlCapabilities>,
+    ap_med_sync: Option<u16>,
+    /// EMLSR decision state (mld/mlo.c) and a pending active-link set
+    /// (`ieee80211_set_active_links_async`) applied by maintenance.
+    emlsr: super::sc_emlsr::Emlsr,
+    active_request: Option<u16>,
     client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
@@ -190,6 +198,10 @@ impl Connection {
             six: None,
             mld: None,
             mld_links: Vec::new(),
+            ap_eml: None,
+            ap_med_sync: None,
+            emlsr: super::sc_emlsr::Emlsr::default(),
+            active_request: None,
             client: None,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -359,7 +371,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn associate_links_in_domain(
+    pub(super) async fn associate_links_in_domain(
         hw: &mut Hardware,
         local: [u8; 6],
         beacon: Beacon,
@@ -784,6 +796,10 @@ impl Connection {
             six,
             mld,
             mld_links: Vec::new(),
+            ap_eml: None,
+            ap_med_sync: None,
+            emlsr: super::sc_emlsr::Emlsr::default(),
+            active_request: None,
             client,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -912,6 +928,11 @@ impl Connection {
             return Err("AP rejected association");
         }
         profile.check_response(&reply[6..])?;
+        if this.mld.is_some() {
+            let mle = narf_wireless::association::mlo::BasicMultiLink::from_ies(&reply[6..]).ok();
+            this.ap_eml = mle.and_then(|mle| mle.eml_capabilities());
+            this.ap_med_sync = mle.and_then(|mle| mle.medium_sync_delay());
+        }
         let mut valid_links = Vec::new();
         let mut link_security = Vec::new();
         let candidate_rsnxe: Vec<_> = further
@@ -970,6 +991,7 @@ impl Connection {
                 .with_further_links(link_security)?;
         }
         this.mld_links = valid_links;
+        this.emlsr.links_activated(this.mld_active_links());
         if let Some(client) = &this.client {
             client.plan.response(&reply[6..])?;
         }
@@ -1182,6 +1204,10 @@ impl Connection {
         }
         if let Some(mld) = &this.mld {
             mld.apply_mac(&mut mac);
+            // mld/iface.c iwl_mld_mac_cmd_fill_sta: MLD client esr fields.
+            let (timeout, sync) = super::sc_emlsr::client_mld_fields(this.ap_eml, this.ap_med_sync);
+            mac[37] = timeout;
+            put16(&mut mac, 38, sync);
         }
         hw.command(3, 8, &mac).await?;
         if let Some(client) = &this.client {
@@ -1643,6 +1669,7 @@ impl Connection {
             || self.six.as_ref().is_some_and(|six| six.pending())
             || self.client.as_ref().is_some_and(|client| client.pending())
             || self.amsdu_memory_pending()
+            || self.active_request.is_some()
             || !self.actions.is_empty()
             || (0..super::aggregation::MAX_TIDS)
                 .any(|tid| self.ba_expired(tid, narf_time::now_cycles()))
@@ -1770,6 +1797,9 @@ impl Connection {
         }
         self.amsdu_feedback(packet);
         if packet.header.group_id != 0 {
+            if self.mld.is_some() {
+                self.mlo_notification(packet)?;
+            }
             return Ok(output);
         }
         if packet.receive_epoch != Some(self.receive_epoch)
@@ -2023,8 +2053,10 @@ impl Connection {
         self.service_power(hw).await?;
         if !self.authorized {
             self.actions.clear();
+            self.active_request = None;
             return Ok(());
         }
+        self.service_active_links(hw).await?;
         self.prepare_amsdu_memory(hw).await?;
         while let Some(body) = self.actions.pop_front() {
             // 802.11w SA Query Request: echo the authenticated transaction
@@ -2301,9 +2333,13 @@ impl Connection {
                         let Some(body) = mpdu.body(24, 0).filter(|body| body.len() == 20) else {
                             return Ok(None);
                         };
-                        if narf_wireless::mfp::verify_inbound(&mut self.mfp, &frame[..24], body)
-                            .is_err()
-                        {
+                        // A further link's group management uses that
+                        // link's own IGTK and replay floor.
+                        let store = match self.further_group_link(mpdu, queue) {
+                            Some(index) => &mut self.mld_links[index].mfp,
+                            None => &mut self.mfp,
+                        };
+                        if narf_wireless::mfp::verify_inbound(store, &frame[..24], body).is_err() {
                             return Ok(None);
                         }
                     } else if super::sc_security::robust_unicast_body(
@@ -2394,6 +2430,113 @@ impl Connection {
         self.mld.as_ref().map_or(0, |mld| mld.active_links())
     }
 
+    /// mlo.h `iwl_mld_vif_has_emlsr_cap` for this association: authorized,
+    /// our request advertised IWL_MLD_EMLSR_CAPA and the AP MLD's response
+    /// advertised EMLSR. Admitted Sc/Bz profiles are never CDB.
+    pub(super) fn emlsr_capable(&self) -> bool {
+        super::sc_emlsr::capable(
+            self.authorized,
+            self.client.is_none(),
+            self.mld_eml_advertised(),
+            self.ap_eml,
+            false,
+        )
+    }
+
+    /// Whether our association request carried EMLSR capabilities: only a
+    /// multiple-link request does (see `sc_security::Profile::negotiate_links`).
+    fn mld_eml_advertised(&self) -> bool {
+        self.mld.is_some() && !self.mld_links.is_empty()
+    }
+
+    /// The spec link of an owned firmware link (`iwl_mld_fw_id_to_link_conf`).
+    fn spec_of_fw_link(&self, fw_link: u32) -> Option<u8> {
+        let binding = self.mld.as_ref()?;
+        core::iter::once(binding.primary())
+            .chain(binding.secondary())
+            .find(|owner| u32::from(owner.fw_link) == fw_link)
+            .map(|owner| owner.spec_link)
+    }
+
+    /// MLO firmware notifications (mld/notif.c): MISSED_BEACONS_NOTIF
+    /// (link.c `iwl_mld_handle_missed_beacon_notif`), ESR_MODE_NOTIF and
+    /// EMLSR_TRANS_FAIL_NOTIF (mlo.c). A connection loss is an error so the
+    /// device performs its ordinary bounded stop; a requested single link
+    /// is applied by maintenance (`ieee80211_set_active_links_async`). A
+    /// notification of the wrong size is dropped, as notif.c's size check.
+    fn mlo_notification(&mut self, packet: &super::runtime::Packet) -> Result<(), &'static str> {
+        use super::sc_emlsr::{self, MissedBeacons, TransitionFailure};
+        let key = (packet.header.group_id, packet.header.cmd);
+        let now_ms = narf_time::wall::monotonic_ns() / 1_000_000;
+        let capable = self.emlsr_capable();
+        let payload = &packet.payload;
+        let mut emlsr = self.emlsr;
+        let request = if key == sc_emlsr::MISSED_BEACONS_NOTIF {
+            match emlsr.missed_beacons(payload, |fw| self.spec_of_fw_link(fw), now_ms) {
+                Ok(MissedBeacons::Disconnect) => return Err("MLD beacon loss"),
+                Ok(MissedBeacons::Keep(set)) => Some(set),
+                _ => None,
+            }
+        } else if key == sc_emlsr::ESR_MODE_NOTIF {
+            emlsr
+                .mode_notification(payload, capable, now_ms)
+                .ok()
+                .flatten()
+        } else if key == sc_emlsr::EMLSR_TRANS_FAIL_NOTIF {
+            match emlsr.transition_failure(payload, |fw| self.spec_of_fw_link(fw), now_ms) {
+                Ok(TransitionFailure::Disconnect) => return Err("MLD EMLSR transition failure"),
+                Ok(TransitionFailure::Keep(set)) => Some(set),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.emlsr = emlsr;
+        if request.is_some() {
+            self.active_request = request;
+        }
+        Ok(())
+    }
+
+    /// Apply a pending active-link set (`_ieee80211_set_active_links`).
+    /// The association link stays the firmware primary owner: a set that
+    /// names only a further link keeps the association link alone, since
+    /// primary-link switching is not implemented. Activation drains TX
+    /// first (`activate_mld_link`).
+    async fn service_active_links(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        let Some(target) = self.active_request.take() else {
+            return Ok(());
+        };
+        let Some(binding) = self.mld.clone() else {
+            return Ok(());
+        };
+        let primary = binding.primary().spec_link;
+        let wanted = if target & (1 << primary) != 0 {
+            target & !(1u16 << primary)
+        } else {
+            0
+        };
+        let current = binding.secondary().map(|owner| owner.spec_link);
+        if let Some(link) = current {
+            if wanted & (1 << link) == 0 {
+                self.deactivate_mld_link(hw, link).await?;
+            }
+        }
+        let link = wanted.trailing_zeros() as u8;
+        // Only a valid link holding its group keys can be added; any other
+        // request is dropped before a device-visible command.
+        if wanted != 0
+            && current.is_none_or(|current| wanted & (1 << current) == 0)
+            && self
+                .mld_links
+                .iter()
+                .any(|valid| valid.link_id() == link && valid.keys.is_some())
+        {
+            self.activate_mld_link(hw, link).await?;
+        }
+        Ok(())
+    }
+
     /// Adopt one further link's authenticated MLO GTK/IGTK. An inactive
     /// link keeps them for its activation (mac80211 installs keys of a
     /// link only when it becomes active, `ieee80211_key_switch_links`);
@@ -2448,6 +2591,24 @@ impl Connection {
             self.mld_links[index]
                 .group_replay
                 .install(keys.group_id, keys.group_rx_pn);
+        }
+        // Likewise a changed IGTK adopts its authenticated IPN in this
+        // link's own BIP store; an identical retransmission keeps the floor.
+        if let Some((igtk, id, ipn)) = &keys.igtk {
+            let link = &mut self.mld_links[index];
+            if link
+                .keys
+                .as_ref()
+                .and_then(|old| old.igtk.as_ref())
+                .is_none_or(|(old, old_id, _)| old != igtk || old_id != id)
+            {
+                link.mfp
+                    .install_active(*igtk, *id)
+                    .map_err(|_| "invalid MLD further-link IGTK")?;
+                if let Some(active) = link.mfp.active.as_mut() {
+                    active.rx_pn = *ipn;
+                }
+            }
         }
         self.mld_links[index].keys = Some(keys);
         Ok(())
@@ -2515,6 +2676,7 @@ impl Connection {
         hw.install_mld_link(next.clone())?;
         self.mld = Some(next);
         self.mld_links[index].active = Some((owner, phy_id));
+        self.emlsr.links_activated(self.mld_active_links());
         Ok(())
     }
 
@@ -2547,6 +2709,7 @@ impl Connection {
         hw.install_mld_link(next.clone())?;
         self.mld = Some(next);
         self.mld_links[index].active = None;
+        self.emlsr.links_activated(self.mld_active_links());
         Ok(())
     }
 

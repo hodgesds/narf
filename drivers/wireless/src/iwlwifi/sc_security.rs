@@ -264,8 +264,17 @@ impl Profile {
         {
             return Err("native MLD multiple-link request requires SAE/PMF");
         }
+        // mac80211 copies the station `wiphy_iftype_ext_capab` into every
+        // MLD request; iwl mld publishes IWL_MLD_EMLSR_CAPA for an 11be NVM
+        // (admitted here: this path requires the native EHT PHY). Its
+        // TID-to-link negotiation and link reconfiguration capability bits
+        // are not advertised: neither negotiation is implemented.
         let mld = narf_wireless::association::mlo::Local::single_link(context.own_mld())
-            .map_err(|_| "native MLD local address invalid")?;
+            .map_err(|_| "native MLD local address invalid")?
+            .with_capabilities(
+                0,
+                narf_wireless::association::mlo::EmlCapabilities::INTEL_MLD_LOCAL,
+            );
         let options = JoinOptions::default()
             .with_akms(AkmSet::ALL)
             .with_pmf(Pmf::Optional);
