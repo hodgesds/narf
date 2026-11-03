@@ -49,6 +49,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         // This happens before any await, including receive quiescence. A
         // cancelled waiter can never restore association or replay DELETE.
+        // A P2P client slot (`client_scope`) restores the radio only after
+        // the whole retirement below succeeded.
+        let client_slot = self.in_client_scope && !failed_scan && !self.failed;
         self.failed = true;
         if let Some(data) = &mut self.station.data {
             data.fail();
@@ -82,13 +85,43 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(htt::Error::from)?;
         self.wait_vdev_stopped(vdev, prepared.bssid).await?;
         self.station.peer = None;
-        // Keep failed/closed set even after success: neither peer retirement
-        // nor vdev STOP is the whole-device reset/DMA reclamation proof.
+        if client_slot {
+            // `mac.c::ath10k_remove_interface` tears only this vif down and
+            // the other vifs keep running. Every peer id of this slot was
+            // unmapped, its delete acknowledged and its vdev STOPPED; the HTT
+            // TX table (`htt_runtime::tx`) still owns the DMA of any MSDU id
+            // the dropped data owner published until firmware completes it
+            // (a completion no slot owns is foreign and only frees that DMA),
+            // so the slot's data owner is dropped and the radio resumes.
+            self.drop_client_data()?;
+            self.station.peer_pmf_offload = false;
+            self.failed = false;
+        }
+        // Otherwise keep failed/closed set even after success: for the home
+        // station neither peer retirement nor vdev STOP is the whole-device
+        // reset/DMA reclamation proof.
         Ok(Disconnected {
             bssid: prepared.bssid,
             frequency: prepared.frequency,
             synchronous_delete,
         })
+    }
+
+    /// Drop the P2P client slot's data owner after its vif was retired. Each
+    /// MSDU id it still has in flight is disowned at the HTT layer unless a
+    /// sibling already handed its receipt to this slot (then its DMA is
+    /// already free).
+    fn drop_client_data(&mut self) -> Result<(), Error> {
+        let Some(data) = self.station.data.take() else {
+            return Ok(());
+        };
+        for id in data.pending_ids() {
+            if !self.station.receipts.iter().any(|r| r.id == id) {
+                self.htt.orphan_tx(id)?;
+            }
+        }
+        self.station.receipts.clear();
+        Ok(())
     }
 
     async fn drain_before_delete(&mut self) -> Result<(), Error> {

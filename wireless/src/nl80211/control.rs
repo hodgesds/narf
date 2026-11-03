@@ -2410,12 +2410,18 @@ fn virtual_interface_handle(
             iface
                 .delete_virtual_interface()
                 .map_err(virtual_interface_errno)?;
-            station::unregister_wdev(iface.name());
-            CACHE.lock().retain(|cache| cache.name != iface.name());
+            forget_interface(iface.name());
             Ok(Vec::new())
         }
         _ => Err(EOPNOTSUPP),
     }
+}
+
+/// Drop the nl80211 per-netdev state of a removed interface (its station
+/// wdev and cached connect state).
+pub(super) fn forget_interface(name: &str) {
+    station::unregister_wdev(name);
+    CACHE.lock().retain(|cache| cache.name != name);
 }
 
 /// `NEW_INTERFACE`/`DEL_INTERFACE` routing: the async control path is taken

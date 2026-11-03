@@ -139,6 +139,10 @@ impl State {
         self.received.clear();
     }
     /// Whether MSDU `id` is in this data owner's TX pipeline.
+    /// Every native MSDU id still awaiting its terminal TX indication.
+    pub(super) fn pending_ids(&self) -> Vec<u16> {
+        self.pending.ids()
+    }
     pub(super) fn owns_msdu(&self, id: u16) -> bool {
         self.pending.owns(id)
     }

@@ -442,6 +442,49 @@ kernel_test_in!(
     smoke_ath10k_htt_tx_cancel_and_duplicate_batch_preserve_dma
 );
 
+/// A deleted P2P client vif's in-flight MSDU: its completion still frees
+/// the DMA but is never delivered to a surviving owner, and a receipt that
+/// was already queued is consumed at once.
+fn smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently() -> TestResult {
+    let p = htt::tx::Parameters {
+        kind: htt::tx::Kind::Ethernet,
+        vdev: 1,
+        tid: 16,
+        hardware_crypto: false,
+    };
+    let frame = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 8, 0];
+    let mut r = htt_boot(HwRev::Qca6174, Dialect::Tlv, 4, 3, false);
+    assert!(matches!(once(r.start()), Poll::Ready(Ok(_))));
+    assert_eq!(once(r.transmit(p, &frame)), Poll::Ready(Ok(0)));
+    if r.orphan_tx(0).is_err()
+        || r.complete_tx(&[7, 0, 1, 0, 0, 0]) != Ok(0)
+        || r.wmi.htc.transport.storage.as_ref().unwrap().tx.pending() != 0
+        || r.take_tx_receipt().is_some()
+    {
+        return TestResult::Fail("orphaned MSDU completion leaked a receipt or kept its DMA");
+    }
+    // Completed before the owner was dropped: the queued receipt goes now
+    // and a later reuse of the id is delivered normally.
+    assert_eq!(once(r.transmit(p, &frame)), Poll::Ready(Ok(1)));
+    if r.complete_tx(&[7, 0, 1, 0, 1, 0]) != Ok(0)
+        || r.orphan_tx(1).is_err()
+        || r.take_tx_receipt().is_some()
+    {
+        return TestResult::Fail("queued receipt of a dropped owner was delivered");
+    }
+    assert_eq!(once(r.transmit(p, &frame)), Poll::Ready(Ok(2)));
+    if r.complete_tx(&[7, 0, 1, 0, 2, 0]) != Ok(0)
+        || r.take_tx_receipt().map(|receipt| receipt.id) != Some(2)
+    {
+        return TestResult::Fail("a live owner's completion was swallowed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htt-runtime",
+    smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently
+);
+
 fn legacy_rx_literal() -> Vec<u8> {
     let mut body = vec![0; 52];
     body[..8].copy_from_slice(&[1, 16, 7, 0, 0, 0, 0, 1]);

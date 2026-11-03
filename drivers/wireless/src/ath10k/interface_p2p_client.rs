@@ -15,9 +15,13 @@
 //! scan and data run on the client vdev and its station slot, and the HTT
 //! demultiplexing parks the home netdev's events in the home slot.
 //!
-//! A vdev whose station was associated cannot be deleted cleanly: station
-//! retirement keeps the radio failed until a whole-device reset (as for the
-//! home netdev), so that DEL ends in radio recovery.
+//! Deleting the netdev tears down only its vif, as
+//! `ath10k_remove_interface`: a joined client is disassociated on its own
+//! slot (peer delete, vdev down/stop; the radio resumes, see
+//! `Radio::disconnect_station`), then the vdev is deleted, and the home
+//! station keeps running. Only a genuine firmware failure (a missing or
+//! malformed response, a timeout) or a cancelled retirement leaves the radio
+//! failed for whole-device recovery.
 use super::*;
 
 /// `NL80211_IFTYPE_P2P_CLIENT`.
@@ -282,6 +286,10 @@ async fn serve(device: Arc<Native>, signal: Arc<super::super::irq::Signal>, deli
     if let Err(cause) = device.create_client_vdev().await {
         device.close();
         if !device.deleting.swap(true, Ordering::AcqRel) {
+            // NEW_INTERFACE already returned this netdev: tell userspace it
+            // is gone (`nl80211_notify_iface(.., NL80211_CMD_DEL_INTERFACE)`)
+            // before it is unpublished.
+            narf_wireless::nl80211::notify_interface_removed(device.as_ref());
             device.unpublish_client();
         }
         forget(&device);

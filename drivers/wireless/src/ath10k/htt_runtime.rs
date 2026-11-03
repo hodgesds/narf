@@ -198,6 +198,11 @@ pub(super) struct Runtime<T> {
     pub early_htt: VecDeque<Vec<u8>>,
     pub wmi_events: VecDeque<Vec<u8>>,
     tx_receipts: VecDeque<TxReceipt>,
+    /// MSDU ids whose host owner (a deleted vif's data owner) is gone while
+    /// the TX slot still owns their DMA: the completion only frees that
+    /// DMA and is never delivered (`txrx.c::ath10k_txrx_tx_unref` with no
+    /// vif left).
+    orphaned: Vec<u16>,
     pfc: Option<Box<pfc::Owner>>,
     failed: bool,
 }
@@ -210,6 +215,7 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             early_htt: VecDeque::new(),
             wmi_events: VecDeque::new(),
             tx_receipts: VecDeque::new(),
+            orphaned: Vec::new(),
             pfc: config
                 .pfc
                 .then(|| Box::new(pfc::Owner::new(config.pending))),
@@ -551,7 +557,30 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         Ok(status)
     }
     pub fn take_tx_receipt(&mut self) -> Option<TxReceipt> {
-        self.tx_receipts.pop_front()
+        loop {
+            let receipt = self.tx_receipts.pop_front()?;
+            match self.orphaned.iter().position(|id| *id == receipt.id) {
+                Some(at) => {
+                    self.orphaned.swap_remove(at);
+                }
+                None => return Some(receipt),
+            }
+        }
+    }
+    /// Disown in-flight MSDU `id` (its host owner was dropped). A receipt
+    /// already queued is consumed now; otherwise the id's slot stays
+    /// occupied until its completion, which is then swallowed, so the id
+    /// cannot be reused before that.
+    pub fn orphan_tx(&mut self, id: u16) -> Result<(), Error> {
+        if let Some(at) = self.tx_receipts.iter().position(|r| r.id == id) {
+            self.tx_receipts.remove(at);
+            return Ok(());
+        }
+        if !self.orphaned.contains(&id) {
+            self.orphaned.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            self.orphaned.push(id);
+        }
+        Ok(())
     }
     pub fn take_tx_receipt_for(&mut self, id: u16) -> Option<TxReceipt> {
         let at = self.tx_receipts.iter().position(|r| r.id == id)?;

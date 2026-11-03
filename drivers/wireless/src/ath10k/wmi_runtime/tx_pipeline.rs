@@ -171,7 +171,6 @@ impl Pipeline {
     pub(super) fn counters(&self, tid: u8) -> TidCounters {
         self.counters[usize::from(tid.min(8))]
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn ids(&self) -> Vec<u16> {
         self.entries.iter().map(|e| e.id).collect()
     }

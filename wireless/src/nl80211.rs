@@ -223,6 +223,33 @@ pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
     );
 }
 
+/// Report a netdev the driver removed on its own after `NEW_INTERFACE`
+/// returned (e.g. its deferred firmware vif creation failed):
+/// `_cfg80211_unregister_wdev` -> `nl80211_notify_iface(rdev, wdev,
+/// NL80211_CMD_DEL_INTERFACE)` on the `config` group, with the
+/// `nl80211_send_iface` attributes. Call while the netdev is still
+/// registered (its ifindex resolves), then unpublish it; this also drops
+/// the nl80211 per-netdev state a user `DEL_INTERFACE` would.
+pub fn notify_interface_removed(iface: &dyn crate::WirelessNetIface) {
+    let name = iface.name();
+    let published = narf_net::iface::lookup(name);
+    if let (Some(net), Some(wiphy)) = (published, crate::registry::wiphy_index(iface.wiphy_id())) {
+        let attrs = interface_attrs(wiphy, iface, iface.current_iftype());
+        if !attrs.is_empty() {
+            narf_net::netlink_generic::publish_event(
+                NL80211_FAMILY_ID,
+                17,
+                net.net_ns_id,
+                GenlReply {
+                    command: NL80211_CMD_DEL_INTERFACE,
+                    attrs,
+                },
+            );
+        }
+    }
+    control::forget_interface(name);
+}
+
 /// Report a driver-completed roam (`cfg80211_roamed` →
 /// `nl80211_send_roamed`, NL80211_CMD_ROAM = 47): the new BSSID, its
 /// operating frequency and the (re)association request/response elements.

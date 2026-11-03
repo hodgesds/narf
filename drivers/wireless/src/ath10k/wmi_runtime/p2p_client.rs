@@ -114,6 +114,24 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.failed = false;
         Ok(())
     }
+    /// Test fixture: make the associated home slot the P2P client slot
+    /// (vdev 0 keeps the vdev0 goldens) and enter its client scope.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn associated_slot_as_client_for_test(&mut self) -> ClientScope<'_, T> {
+        let mut slot = core::mem::replace(&mut self.station, StationSlot::new());
+        slot.vdev = Some(self.primary.id());
+        slot.own = self.ready.map(|r| r.mac);
+        self.p2p_client = Some(alloc::boxed::Box::new(slot));
+        self.client_scope().expect("client slot")
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn failed_for_test(&self) -> bool {
+        self.failed
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn station_data_for_test(&self) -> bool {
+        self.station.data.is_some()
+    }
     /// One-channel rule (`ath10k_tlv_if_limit`, `num_different_channels`
     /// 1): a station slot may bind a BSS only on the sibling slot's primary
     /// channel while the sibling has a peer. Once adaptive QCS was enabled

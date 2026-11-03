@@ -2302,11 +2302,26 @@ will bind; none of them grants RF, peer, key or data authority.
   `DEL_INTERFACE` (`delete_virtual_interface`) closes and unpublishes the
   netdev at once; the worker then disassociates a joined client (best
   effort deauthentication) and deletes the vdev (`stop_p2p_client`), and
-  only then frees the client slot. Because station retirement keeps the
-  radio failed until a whole-device reset (as for the home netdev), DEL of
-  a client that associated, or any ambiguous VDEV_CREATE/DELETE, ends in
+  only then frees the client slot. As `mac.c::ath10k_remove_interface`
+  this tears down only the client's vif and the home station keeps
+  running: `disconnect_station` inside the client scope runs the same
+  DOWN/PEER_DELETE/all-UNMAP/(SYNC_DELETE ACK)/STOP/VDEV_STOPPED proof on
+  the client vdev and, once it completed, drops the slot's data owner and
+  clears the radio's failed latch (the home station's retirement still
+  keeps it). The client data owner's in-flight MSDU ids are disowned at
+  the HTT layer (`htt::Runtime::orphan_tx`): their TX slots keep the DMA
+  until the firmware's completion, which then only frees it and is never
+  delivered (`txrx.c::ath10k_txrx_tx_unref`), so no id is reused early;
+  an already-queued receipt is consumed at once. A genuine firmware
+  failure (missing/malformed/foreign receipt, timeout, late MAP), a
+  cancelled retirement, or an ambiguous VDEV_CREATE/DELETE still ends in
   radio recovery, which retires the client netdev with the generation
-  (it is not recreated; userspace re-forms the group). WPS provisioning
+  (it is not recreated; userspace re-forms the group). When the deferred
+  VDEV_CREATE fails after NEW_INTERFACE returned, the netdev is withdrawn
+  with an nl80211 `DEL_INTERFACE` event on the `config` group
+  (`narf_wireless::nl80211::notify_interface_removed`, as
+  `_cfg80211_unregister_wdev` -> `nl80211_notify_iface`) before it is
+  unpublished. WPS provisioning
   over the client netdev is not supported (no host EAP-WSC path), so a
   group is joined with WPA2-PSK credentials (persistent group or
   pre-provisioned PSK).
@@ -2333,7 +2348,11 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_station_slot_parks_bounded`,
 `smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid`;
 `wmi_boot/radio_tests.rs`
-`smoke_ath10k_p2p_device_scan_merges_shared_bss_table`.
+`smoke_ath10k_p2p_device_scan_merges_shared_bss_table`;
+`wmi_boot/teardown_tests.rs`
+`smoke_ath10k_p2p_client_disconnect_keeps_radio_running`;
+`wmi_boot/htt_tests.rs`
+`smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently`.
 
 ## 4. Invariants
 

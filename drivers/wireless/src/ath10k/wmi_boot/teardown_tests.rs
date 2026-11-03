@@ -309,6 +309,55 @@ kernel_test_in!(
     smoke_ath10k_disconnect_native_commands_events_and_sparse_ids_all_dialects
 );
 
+/// `mac.c::ath10k_remove_interface` tears down only the P2P client's vif:
+/// the same DOWN/DELETE/UNMAP/ACK/STOP/STOPPED proof on the client slot
+/// drops that slot's peer and data and leaves the radio running for the
+/// home station; a missing receipt still leaves it failed.
+fn smoke_ath10k_p2p_client_disconnect_keeps_radio_running() -> TestResult {
+    for sync in [false, true] {
+        let mut radio = prepared(4, Dialect::Tlv, HwRev::Qca6174, sync);
+        let mut client = radio.associated_slot_as_client_for_test();
+        let receipt = radio::StationDisconnected {
+            bssid: [2, 8, 9, 10, 11, 12],
+            frequency: 2412,
+            synchronous_delete: sync,
+        };
+        if drive(client.disconnect_station()) != Poll::Ready(Ok(receipt))
+            || client
+                .htt
+                .wmi
+                .htc
+                .transport
+                .teardown
+                .as_ref()
+                .unwrap()
+                .phase
+                != 3
+            || client.prepared_peer().is_some()
+            || client.tx_in_flight() != 0
+            || client.failed_for_test()
+            || client.station_data_for_test()
+        {
+            return TestResult::Fail("P2P client retirement failed the radio or kept its owner");
+        }
+        drop(client);
+        if radio.failed_for_test() || radio.p2p_client_vdev().is_none() {
+            return TestResult::Fail("P2P client retirement did not leave the radio running");
+        }
+    }
+    let mut radio = prepared(4, Dialect::Tlv, HwRev::Qca6174, true);
+    radio.htt.wmi.htc.transport.teardown.as_mut().unwrap().fault = Fault::MissingAck;
+    let mut client = radio.associated_slot_as_client_for_test();
+    if drive(client.disconnect_station()) != Poll::Pending || !client.failed_for_test() {
+        return TestResult::Fail("a missing firmware receipt resumed the radio");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi-runtime",
+    smoke_ath10k_p2p_client_disconnect_keeps_radio_running
+);
+
 fn smoke_ath10k_disconnect_missing_or_foreign_receipts_never_retire() -> TestResult {
     for fault in [
         Fault::MissingUnmap,
