@@ -61,6 +61,27 @@ pub(super) enum Calibrated {
         profile: super::mac::Profile,
         periodic: narf_lib::mutex::Mutex<super::calibration::ar5008::Periodic>,
     },
+    /// AR9380/AR9390 (either band `opFlags` enables): the signed `N93A`
+    /// per-channel record, the host permission calibration ran under
+    /// (country, frequency and the signed ceiling the power plan used),
+    /// the band's `ath9k_hw_set_clockrate` clock, `ah->txchainmask`,
+    /// `ATH9K_HW_CAP_APM`, the `EEP_RF_SILENT` input and the
+    /// `ar9003::calib::Periodic` owner. `totals` is the owner's copy of the
+    /// `ath_hw`-lifetime IQ accumulators, refreshed after every step so
+    /// the next generation continues them.
+    // Composed by the AR9300 owner (next step).
+    #[allow(dead_code)]
+    Ar9300 {
+        report: super::ar9003::calib::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        permission: super::calibration::Permission,
+        clock: super::mac::Clock,
+        tx_chainmask: u8,
+        apm: bool,
+        rf_kill: Option<super::ar9003::mac::RfKill>,
+        periodic: narf_lib::mutex::Mutex<super::ar9003::calib::Periodic>,
+        totals: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<super::ar9003::calib::IqTotals>>,
+    },
 }
 /// Raw BAR access for the AR9287 long calibration, only inside `access`.
 struct LongCal<'a> {
@@ -96,6 +117,7 @@ impl Calibrated {
             Self::Ar9287 { report, .. } => report.frequency_mhz,
             Self::Ar9280 { report, .. } => report.frequency_mhz,
             Self::Ar5008 { report, .. } => report.frequency_mhz,
+            Self::Ar9300 { report, .. } => report.frequency_mhz,
         }
     }
     /// `AR_PHY_SYNTH_CONTROL & 0x3fffffff` the channel preparation wrote
@@ -106,7 +128,9 @@ impl Calibrated {
     /// re-proved.
     fn synth(&self, center: u16) -> Option<u32> {
         match self {
-            Self::Ar5008 { .. } => None,
+            // AR9003 programs `AR_PHY_65NM_CH0_SYNTH7` with a load toggle
+            // (`ar9003_hw_set_channel`); its rate words are re-proved.
+            Self::Ar5008 { .. } | Self::Ar9300 { .. } => None,
             Self::Ar9280 {
                 tune: super::phy::Tune::Five { frequency, frac_n },
                 ..
@@ -128,6 +152,19 @@ impl Calibrated {
                 .invoke(|| Ok(grant.ceiling(permission.budget())))
                 .is_ok_and(|ceiling| permission.allows_ar9280(report, ceiling));
         }
+        if let Self::Ar9300 {
+            grant, permission, ..
+        } = self
+        {
+            // Same country, frequency and a host ceiling at least the one
+            // the power plan was computed under; the signed record must
+            // still be current and not lower it.
+            let ceiling = permission.budget();
+            return permission.current_dual_in(domain)
+                && grant
+                    .invoke(|| Ok(grant.ceiling(ceiling)))
+                    .is_ok_and(|signed| signed >= ceiling);
+        }
         if let Self::Ar5008 { report, grant, .. } = self {
             let Ok(permission) =
                 super::calibration::Permission::from_domain_dual(domain, report.frequency_mhz)
@@ -148,7 +185,7 @@ impl Calibrated {
             Self::Ar9287 { report, grant, .. } => grant
                 .invoke(|| Ok(grant.ceiling(permission.budget())))
                 .is_ok_and(|ceiling| permission.allows_ar9287(report, ceiling)),
-            Self::Ar9280 { .. } | Self::Ar5008 { .. } => false,
+            Self::Ar9280 { .. } | Self::Ar5008 { .. } | Self::Ar9300 { .. } => false,
         }
     }
 }
@@ -451,6 +488,117 @@ impl Native {
         ))
     }
     /// # Safety
+    /// Caller retains the sole AR9380/AR9390 function and exact mapped BAR
+    /// after `ar9003::phy::prepare` for `prepared` (its power plan computed
+    /// at `permission`'s ceiling, which `grant` may only lower) and
+    /// `ar9003::calib::Calibration::run` produced `report`; no packet DMA
+    /// was published. `channel_mask` (`channels::bit`) names the primaries
+    /// whose signed `N93A` record verified.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(super) unsafe fn new_ar9300(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        report: super::ar9003::calib::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        permission: super::calibration::Permission,
+        identity: &super::ar9003::eeprom::Identity,
+        image: &super::ar9003::power::Image,
+        prepared: &super::ar9003::phy::Prepared,
+        periodic: super::ar9003::calib::Periodic,
+        totals: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<super::ar9003::calib::IqTotals>>,
+        channel_mask: u64,
+    ) -> Result<Self, Error> {
+        let request = grant.request();
+        let frequency = report.frequency_mhz;
+        let primary = super::channels::bit(frequency).ok_or(Error::Packet)?;
+        let tx = identity.tx_chainmask;
+        // hw.c::ath9k_hw_fill_cap_info: ATH9K_HW_CAP_APM from
+        // EEP_CHAIN_MASK_REDUCE (miscConfiguration bit 3).
+        let apm = image[super::ar9003::eeprom::field::MISC_CONFIGURATION] & 0x8 != 0;
+        if device.id.vendor != 0x168c
+            || super::ar9003::Chip::for_device(device.id.device)
+                != Some(super::ar9003::Chip::Ar9300)
+            || request.device != device.id.device
+            || request.frequency_mhz != frequency
+            || request.mac != identity.mac
+            || prepared.frequency != frequency
+            || prepared.power.frequency != frequency
+            || prepared.power.tx_chainmask != tx
+            || prepared.power.max_power_level > permission.budget()
+            || prepared.selfgen_mask != if apm && tx == 7 { 3 } else { tx }
+            || report.five_ghz != (frequency >= 4800)
+            || report.rx_chainmask != identity.rx_chainmask
+            || report.tx_chainmask != tx
+            || channel_mask >> super::channels::CHANNEL_BITS != 0
+            || channel_mask & (1 << primary) == 0
+        {
+            return Err(Error::Packet);
+        }
+        let rf_kill = super::ar9003::mac::rf_silent(image)?;
+        // The twelve rate words the plan programmed are re-proved by every
+        // physical readback.
+        let powers = super::ar9003::power::rate_words(&prepared.power.targets).to_vec();
+        Ok(Self::assemble(
+            device,
+            cap,
+            bar,
+            Calibrated::Ar9300 {
+                report,
+                grant,
+                permission,
+                clock: super::ar9003::mac::clock(report.five_ghz),
+                tx_chainmask: tx,
+                apm,
+                rf_kill,
+                periodic: narf_lib::mutex::Mutex::new(periodic),
+                totals,
+            },
+            channel_mask,
+            Some(InstalledPower::Rates(powers)),
+            None,
+        ))
+    }
+    /// The `ath9k_hw_reset` tail for `AR_SREV_9300_20_OR_LATER` after the
+    /// MAC profile, before packet DMA: `AR_CFG_LED` = `saveLedState |
+    /// AR_CFG_SCLK_32KHZ` (`led` is the pre-reset `AR_CFG_LED` the owner
+    /// read), `ath9k_hw_loadnf` + `ath9k_hw_start_nfcal(ah, true)`
+    /// (`Periodic::start`) and `ar9003_hw_bb_watchdog_config` at the AR9300
+    /// `bb_watchdog_timeout_ms` 25 (`ar9003_hw_attach_ops`): IRQ on, chip
+    /// reset off, non-idle watchdog with `idle_count` 100 * 25 / 74.
+    /// `ar9003_hw_disable_phy_restart` (`HW_PHYRESTART_CLC_WAR`, AR9300 2.2)
+    /// is a no-op here: a fresh generation has no `bb_watchdog_last_status`
+    /// and a watchdog event closes the generation.
+    #[allow(dead_code)]
+    pub(super) fn ar9300_reset_tail(&self, led: u32) -> Result<(), Error> {
+        let Calibrated::Ar9300 { periodic, .. } = &self.calibrated else {
+            return Err(Error::State);
+        };
+        let mut periodic = periodic.try_lock().ok_or(Error::Busy)?;
+        self.write(0x1f04, (led & 0xff8) | 0x3)?;
+        self.access(false, || {
+            let mut io = LongCal {
+                native: self,
+                lost: false,
+            };
+            let started = periodic.start(&mut io);
+            if io.lost {
+                return Err(Error::Access);
+            }
+            started.map_err(|_| Error::Descriptor)
+        })?;
+        const CTL_1: u64 = 0xa7c4;
+        const CTL_2: u64 = 0xa7c8;
+        let ctl2 = self.read(CTL_2)? & 0xffff_fff9;
+        self.write(CTL_2, (ctl2 | 0x4) & !0x2)?;
+        let idle_count: u32 = (100 * 25) / 74;
+        self.write(CTL_1, 0x1 | 0xffff_0000 | (0xfffc & (idle_count << 2)))?;
+        if self.read(CTL_1)? != 0x1 | 0xffff_0000 | (0xfffc & (idle_count << 2)) {
+            return Err(Error::Descriptor);
+        }
+        Ok(())
+    }
+    /// # Safety
     /// Caller retains the sole AR5416/AR5418/AR9160 function and exact
     /// mapped BAR after `phy::ar5008::prepare` for `tune` and
     /// `calibration::ar5008` ran under `grant`'s ceiling for `report`'s
@@ -662,7 +810,11 @@ impl Native {
                     return Err(Error::Descriptor);
                 }
             }
-            if read(0x9804)? & 0x7ff != geometry.turbo() {
+            // `AR_PHY_TURBO` is an AR5008/AR9002 register; the AR9003
+            // baseband has no register at 0x9804 to re-prove.
+            if !matches!(self.calibrated, Calibrated::Ar9300 { .. })
+                && read(0x9804)? & 0x7ff != geometry.turbo()
+            {
                 return Err(Error::Descriptor);
             }
             for (register, value) in powers.registers() {
@@ -686,6 +838,20 @@ impl Native {
             // invocation, without recursively entering this access helper.
             let value = unsafe { self.bar.read32(0x4048) };
             if value == u32::MAX || (value & (1 << (12 + gpio)) != 0) == polarity {
+                return Err(Error::Access);
+            }
+        }
+        if let Calibrated::Ar9300 {
+            rf_kill: Some(kill),
+            ..
+        } = &self.calibrated
+        {
+            // `ath_is_rfkill_set` over the AR9300 `AR_GPIO_IN` (0x404c).
+            self.extent(0x404c)?;
+            // SAFETY: checked full input-register extent in current PCI
+            // invocation, without recursively entering this access helper.
+            let value = unsafe { self.bar.read32(0x404c) };
+            if value == u32::MAX || (value & (1 << kill.gpio) != 0) == kill.polarity {
                 return Err(Error::Access);
             }
         }
@@ -927,6 +1093,7 @@ impl Port for Native {
             Calibrated::Ar9287 { profile, .. }
             | Calibrated::Ar9280 { profile, .. }
             | Calibrated::Ar5008 { profile, .. } => profile.clock,
+            Calibrated::Ar9300 { clock, .. } => *clock,
         }
     }
     fn tx_chainmask(&self) -> u8 {
@@ -935,9 +1102,48 @@ impl Port for Native {
             Calibrated::Ar9287 { profile, .. }
             | Calibrated::Ar9280 { profile, .. }
             | Calibrated::Ar5008 { profile, .. } => profile.tx_chainmask,
+            // xmit.c::ath_txchainmask_reduction: every legacy rate is below
+            // 0x90, so an APM board on a 5 GHz channel sends on chains 0|1.
+            Calibrated::Ar9300 {
+                report,
+                tx_chainmask,
+                apm,
+                ..
+            } => {
+                if *apm && report.five_ghz && *tx_chainmask == 0x7 {
+                    0x3
+                } else {
+                    *tx_chainmask
+                }
+            }
         }
     }
     fn long_calibration(&self) -> Result<Option<i32>, Error> {
+        if let Calibrated::Ar9300 {
+            periodic, totals, ..
+        } = &self.calibrated
+        {
+            let mut periodic = periodic.try_lock().ok_or(Error::Busy)?;
+            // `ath_ani_calibrate` without ANI over `ar9003_hw_calibrate`,
+            // after the same access() re-proof; no temperature step.
+            let result = self.access(self.active.load(Ordering::Acquire), || {
+                let mut io = LongCal {
+                    native: self,
+                    lost: false,
+                };
+                let tick = periodic.tick(&mut io, narf_time::monotonic_ns() / 1_000_000);
+                if io.lost {
+                    return Err(Error::Access);
+                }
+                match tick {
+                    Ok(_) => Ok(None),
+                    Err(super::identity::BringUpError::Timeout) => Err(Error::Timeout),
+                    Err(_) => Err(Error::Descriptor),
+                }
+            });
+            *totals.lock() = periodic.totals();
+            return result;
+        }
         if let Calibrated::Ar5008 { periodic, .. } = &self.calibrated {
             let mut periodic = periodic.try_lock().ok_or(Error::Busy)?;
             // Same access() re-proof as below; `ar9002_hw_calibrate` on the

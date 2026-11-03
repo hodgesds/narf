@@ -256,7 +256,7 @@ fn limit(
 
 /// `ar9003_hw_tx_power_regwrite`'s twelve `AR_PHY_POWER_TX_RATE` words in
 /// write order (rates 0, 1, 2, 3, 8, 4, 5, 9, 10, 6, 7, 11).
-fn rate_words(p: &[u8; RATES]) -> [(u64, u32); 12] {
+pub(in crate::ath9k) fn rate_words(p: &[u8; RATES]) -> [(u64, u32); 12] {
     let pow = |values: [usize; 4]| -> u32 {
         values
             .iter()

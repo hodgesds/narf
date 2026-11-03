@@ -2171,6 +2171,32 @@ what the AR9002 owner returns when that program is absent (`State`;
 `submit_ht` `Packet`; `set_ht` `Access` after the geometry/phase checks;
 a PM-marked `submit` `State`; `pair_delivery` `None`; the shared HT
 `periodic::Owner` is never bound).
+Step 5b-2: `packet_native::Calibrated::Ar9300` (`Native::new_ar9300`)
+retains the signed `N93A` grant, the dual-band host `Permission` the
+power plan was computed under (`permitted` requires the same country and
+frequency, a host ceiling at least that one and the record not lowering
+it), the band clock (`ar9003::mac::clock`), `ah->txchainmask`,
+`ATH9K_HW_CAP_APM` (`miscConfiguration` bit 3, cross-checked against the
+prepared `AR_SELFGEN_MASK`), the AR9300 `EEP_RF_SILENT` input (re-proved
+on `AR_GPIO_IN` 0x404c in every physical readback; the AR9002 0x4048
+input is not used) and the `ar9003::calib::Periodic` owner. Its physical
+readback re-proves the twelve `AR_PHY_POWER_TX_RATE` words
+(`ar9003::power::rate_words`); the AR9002 `AR_PHY_SYNTH_CONTROL`/
+`AR_PHY_TURBO` checks are skipped for this variant only.
+`long_calibration` is `Periodic::tick` under `access()` (timeout →
+`Timeout`, which closes the generation as Linux's
+`RESET_TYPE_CALIBRATION`); after every step the `IqTotals` are copied to
+an owner-held cell so the next generation continues them.
+`tx_chainmask()` is `xmit.c::ath_txchainmask_reduction` for legacy
+rates (all below 0x90): 0x3 on a 5 GHz channel of an APM board whose
+`txchainmask` is 0x7. `ar9300_reset_tail` is the `ath9k_hw_reset` tail:
+`AR_CFG_LED` = pre-reset `saveLedState` | `AR_CFG_SCLK_32KHZ`,
+`Periodic::start` (`ath9k_hw_loadnf` + `ath9k_hw_start_nfcal(ah, true)`)
+and `ar9003_hw_bb_watchdog_config` at the AR9300 25 ms timeout (IRQ on,
+chip reset off, `AR_PHY_WATCHDOG_CTL_1` 0xffff0085 with readback);
+`ar9003_hw_disable_phy_restart` is a no-op for a fresh generation (no
+`bb_watchdog_last_status`). AR5008/AR9002 variants, readbacks and
+register streams are unchanged.
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
