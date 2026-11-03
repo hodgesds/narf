@@ -12,10 +12,21 @@
 //! 8821AE interrupt profile.
 //!
 //! Station profile: 2.4 GHz legacy (CCK/OFDM) 20 MHz, MACID 0, software
-//! CCMP (`SECR = 0`), forced driver rate with fallback disabled. No HT,
-//! A-MPDU, short GI, protection or firmware rate fallback is admitted on
-//! this profile; those 88EE grants are never minted for it.
-use super::super::super::rtl8821ae::{h2c, mac, station as hw, trx};
+//! CCMP (`SECR = 0`). Ordinary unicast DATA runs with firmware rate
+//! adaptation inside the installed RA mask exactly as `rtl_get_tcb_desc`
+//! (no `USE_RATE`, fallback enabled, highest legacy rate); everything else
+//! keeps the forced driver rate with fallback disabled. The `NAPC` envelope
+//! admits a measured TXAGC index for every station rate, so any rate the
+//! firmware picks inside the mask is power-admitted (unlike 88EE, whose
+//! fixed-rate NEPC needs the separate NEFB continuation). No HT, A-MPDU,
+//! short GI or protection is admitted on this profile.
+//!
+//! C2H packets (`rpt_sel`) are parsed as `rtl_c2h_content_parsing`: V1 TX
+//! reports complete the `SPE_RPT` request of the outstanding EAPOL/Null
+//! frame (`rtl_set_tx_report`), RA reports record `rtldm->tx_rate`
+//! (`rtl8821ae_c2h_ra_report_handler`) for the DM step's
+//! `rtl8821ae_dm_update_init_rate`.
+use super::super::super::rtl8821ae::{c2h, h2c, mac, station as hw, trx};
 use super::{
     extent, queue, Delivery, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, OWN,
     RX_BASE, RX_BUFFER, RX_BYTES, TX_BASES, TX_BYTES,
@@ -32,9 +43,30 @@ const BCN_VALID_POLLS: usize = 20;
 /// `_rtl8821ae_hw_configure`: `reg_bcn_ctrl_val = 0x1d`.
 const BCN_CTRL_AFTER_INIT: u8 = 0x1d;
 
+/// One C2H TX report matched to the frame whose descriptor requested it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TxReport {
+    /// Delivery id of the reported frame.
+    pub id: u64,
+    /// `st == 0` (`rtl_tx_status(hw, skb, st == 0)`).
+    pub acked: bool,
+    pub retry: u8,
+}
+
 pub(in super::super) struct State {
     pub(super) mailbox: h2c::Mailbox,
     pub(super) receive: mac::ReceiveConfig,
+    /// `rtlpriv->tx_report` sequence state.
+    reports: c2h::TxReportState,
+    /// `SW_DEFINE` and delivery id of frames awaiting their TX report
+    /// (`tx_report->queue`); bounded, oldest dropped as Linux's 3 s purge.
+    waiting: Vec<(u16, u64)>,
+    /// Latest matched TX report.
+    report: Option<TxReport>,
+    /// `rtldm->tx_rate` from the last RA report (0xff in Linux until one
+    /// arrives) and whether `rtl8821ae_dm_update_init_rate` is still due.
+    ra_rate: Option<u8>,
+    ra_due: bool,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -44,9 +76,58 @@ impl State {
                 rcr: mac::RCR,
                 bcn_ctrl: BCN_CTRL_AFTER_INIT,
             },
+            reports: c2h::TxReportState::default(),
+            waiting: Vec::new(),
+            report: None,
+            ra_rate: None,
+            ra_due: false,
+        }
+    }
+    /// `rtl_c2h_content_parsing` for the packets this profile consumes.
+    /// BT info/MP reports are ignored: boards with the BT function are not
+    /// admitted, so `btc_ops` never runs.
+    fn c2h(&mut self, packet: &[u8]) {
+        match c2h::parse(packet) {
+            Ok(c2h::Event::TxReport { sn, st, retry }) => {
+                self.reports.record(sn);
+                if let Some(at) = self.waiting.iter().position(|(s, _)| *s == sn) {
+                    let (_, id) = self.waiting.remove(at);
+                    self.report = Some(TxReport {
+                        id,
+                        acked: st == 0,
+                        retry,
+                    });
+                }
+            }
+            Ok(c2h::Event::RaReport { hw_rate, .. }) => {
+                self.ra_rate = Some(hw_rate);
+                self.ra_due = true;
+            }
+            _ => {}
         }
     }
 }
+
+/// `rtl_is_tx_report_skb`: an EAPOL frame (`ether_type` read after the
+/// MAC header and the 6-byte SNAP prefix; with software crypto no
+/// `hw_key` IV is skipped, so a protected frame never matches) or a
+/// (QoS) Null function frame.
+fn wants_report(frame: &[u8]) -> bool {
+    if frame.len() < 24 || frame[0] & 0x0c != 0x08 {
+        return false;
+    }
+    let subtype = frame[0] & 0xf0;
+    if subtype == 0x40 || subtype == 0xc0 {
+        return true;
+    }
+    let header = if frame[0] & 0x80 != 0 { 26 } else { 24 };
+    frame.len() >= header + 8 && frame[header + 6..header + 8] == [0x88, 0x8e]
+}
+
+/// Bound on outstanding TX-report requests (the 6-bit `SW_DEFINE` space).
+const REPORT_WAIT: usize = 64;
+/// Maximum C2H bytes inspected (`C2H_DATA_OFFSET` plus the V1 TX report).
+const C2H_BYTES: usize = 16;
 
 fn closed(admission: Option<&super::super::station::Admission>) -> bool {
     admission.is_some_and(|control| control.closed.load(Ordering::Acquire))
@@ -373,6 +454,41 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(())
     }
 
+    /// Take the latest C2H TX report (`rtl_tx_report_handler` match).
+    pub(super) fn ae_take_tx_report(&mut self) -> Option<TxReport> {
+        self.packet.ae.report.take()
+    }
+
+    /// `rtl_check_tx_report_acked` without the 3 s timeout (the caller's
+    /// deadline owns it): every requested report has arrived.
+    pub(super) fn ae_tx_reports_settled(&self) -> bool {
+        self.packet.ae.reports.all_acked()
+    }
+
+    /// `rtldm->tx_rate` (`DESC_RATE*`) from the last C2H RA report.
+    pub(super) fn ae_ra_rate(&self) -> Option<u8> {
+        self.packet.ae.ra_rate
+    }
+
+    /// `rtl8821ae_dm_update_init_rate` for a pending RA report, run by the
+    /// DM step inside the envelope's current authority (Linux runs it from
+    /// `c2hcmd_wq`). Returns whether a report was applied.
+    pub(super) fn ae_update_init_rate(&mut self) -> Result<bool, Error> {
+        if !self.packet.ae.ra_due {
+            return Ok(false);
+        }
+        let rate = self.packet.ae.ra_rate.ok_or(Error::State)?;
+        let swing = self.rtl8821ae_power.ok_or(Error::State)?.swing();
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        super::super::super::rtl8821ae::channel::update_init_rate(&self.io, swing, rate)?;
+        self.packet.ae.ra_due = false;
+        self.phase = Phase::Running;
+        Ok(true)
+    }
+
     /// `HW_VAR_FW_LPS_ACTION(true)` → `_rtl8821ae_fwlps_enter`.
     pub(super) async fn ae_enter_leisure(&mut self) -> Result<(), Error> {
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
@@ -447,9 +563,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
 
     /// `rtl8821ae_tx_fill_desc` for one legacy first+last MPDU (no early
-    /// mode): forced `hw_rate`, fallback disabled, BW 20, no SGI/AGG/RTS,
-    /// no hardware key, HWSEQ for non-QoS frames, MACID 0 and RATE_ID the
-    /// installed `ratr_index` for unicast (MC otherwise).
+    /// mode): forced `hw_rate` with fallback disabled, or (`adaptive`,
+    /// ordinary unicast DATA with an installed mask) firmware RA with
+    /// fallback; BW 20, no SGI/AGG/RTS, no hardware key, HWSEQ for non-QoS
+    /// frames, MACID 0, RATE_ID the installed `ratr_index` for unicast (MC
+    /// otherwise) and `SPE_RPT`/`SW_DEFINE` for EAPOL and Null frames.
     pub(super) fn ae_submit(
         &mut self,
         frame: &[u8],
@@ -461,7 +579,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
-        if aggregate.is_some() || adaptive || short_gi || rate > trx::DESC_RATE54M {
+        if aggregate.is_some() || short_gi || rate > trx::DESC_RATE54M {
             return Err(Error::Packet);
         }
         let (queue, poll, selector) = queue(
@@ -490,17 +608,40 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             &frame[4..10]
         };
         let multicast = destination[0] & 1 != 0;
+        // rtl_get_tcb_desc: ordinary unicast DATA (rates[0].idx != 0, not
+        // Null) leaves use_driver_rate/disable_ratefallback clear and sets
+        // hw_rate to the mode's highest rate (11M for B, 54M otherwise);
+        // the firmware RA owns the rate inside the installed mask.
+        // `sta` is the AP addressed by addr1, so RATE_ID is its
+        // `ratr_index` whatever the DA.
+        let adaptive = match self.packet.rate_mask {
+            Some(index) if adaptive => {
+                if frame[4] & 1 != 0 || frame[0] & 0x0c != 0x08 || frame[0] & 0x40 != 0 {
+                    return Err(Error::Packet);
+                }
+                Some(index)
+            }
+            None if adaptive => return Err(Error::State),
+            _ => None,
+        };
+        let hw_rate = match adaptive {
+            Some(6) => 0x03,
+            Some(_) => trx::DESC_RATE54M,
+            None => rate,
+        };
+        let tx_report = wants_report(frame).then(|| self.packet.ae.reports.next_sn());
         let params = trx::TxParams {
             pkt_size: frame.len() as u16,
             queue_sel: selector,
             macid: 0,
-            rate_id: match self.packet.rate_mask {
-                Some(index) if !multicast => index,
+            rate_id: match (adaptive, self.packet.rate_mask) {
+                (Some(index), _) => index,
+                (None, Some(index)) if !multicast => index,
                 _ => RATR_INX_WIRELESS_MC,
             },
-            hw_rate: rate,
-            use_driver_rate: true,
-            disable_fallback: true,
+            hw_rate,
+            use_driver_rate: adaptive.is_none(),
+            disable_fallback: adaptive.is_none(),
             short: false,
             data_bw: 0,
             sub_carrier: 0,
@@ -510,7 +651,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             qos_data: frame[0] == 0x88,
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
             multicast,
-            tx_report: None,
+            tx_report,
             buffer_len: frame.len() as u16,
             buffer_addr: address,
         };
@@ -532,6 +673,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             prefix,
         });
         self.packet.serial = id;
+        if let Some(sn) = tx_report {
+            let waiting = &mut self.packet.ae.waiting;
+            if waiting.len() == REPORT_WAIT {
+                waiting.remove(0);
+            }
+            waiting.try_reserve(1).map_err(|_| Error::Memory)?;
+            waiting.retain(|(s, _)| *s != sn);
+            waiting.push((sn, id));
+        }
         self.phase = Phase::Failed;
         let ring = &mut self.tx[queue];
         self.io.authority(true, || {
@@ -603,9 +753,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
 
     /// One `_rtl_pci_rx_interrupt` step with `rtl8821ae_rx_query_desc`
-    /// fields. C2H report buffers (`rpt_sel`) and frames outside the legacy
-    /// 20 MHz profile are consumed and dropped. No 8821AE PHY-status PWDB is
-    /// decoded (`pwdb` stays `None`).
+    /// fields. C2H report buffers (`rpt_sel`) are parsed and consumed
+    /// (`rtl_c2hcmd_enqueue`); frames outside the legacy 20 MHz profile are
+    /// consumed and dropped. With PHYST the `query_rxphystatus` PWDB is
+    /// decoded from the PHY status at `rx_bufshift` (Linux's `p_drvinfo`).
     pub(super) fn ae_receive_step(&mut self) -> Result<ReceiveStep, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
@@ -615,7 +766,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let ring = self.receive.as_mut().ok_or(Error::State)?;
         let buffer = &self.buffers[slot];
         let channel = self.rtl8821ae_power.ok_or(Error::State)?.channel();
-        let (consumed, packet) = self.io.authority(true, || {
+        let (consumed, packet, report) = self.io.authority(true, || {
             ring.sync();
             let offset = slot * RX_BYTES;
             let mut dw = [0u32; 8];
@@ -623,7 +774,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 *value = ring.read32(offset + word * 4)?;
             }
             let Some(status) = trx::RxStatus::parse(&dw) else {
-                return Ok((false, None));
+                return Ok((false, None, None));
             };
             let end = if slot + 1 == self.depth { 1 << 30 } else { 0 };
             if dw[0] & (1 << 30) != end || dw[6] != extent(buffer, RX_BUFFER, 4)? || dw[7] != 0 {
@@ -637,6 +788,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 return Err(Error::Descriptor);
             }
             let mut packet = None;
+            let mut report = None;
+            if status.c2h && length >= c2h::C2H_DATA_OFFSET && start + length <= RX_BUFFER {
+                buffer.sync();
+                let mut bytes = [0u8; C2H_BYTES];
+                let take = length.min(C2H_BYTES);
+                buffer.read_bytes(start, &mut bytes[..take])?;
+                report = Some((bytes, take));
+            }
             if !status.c2h
                 && !status.hw_error()
                 && !status.ampdu
@@ -656,6 +815,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // hardware never decrypts (SWDEC set).
                 if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted)
                 {
+                    let pwdb = if status.physt {
+                        if status.drvinfo_size < trx::PHY_STATUS_PWDB_BYTES {
+                            return Err(Error::Descriptor);
+                        }
+                        let mut phy = [0u8; trx::PHY_STATUS_PWDB_BYTES];
+                        buffer.read_bytes(status.shift, &mut phy)?;
+                        Some(trx::rx_pwdb(&phy, trx::is_cck(status.rate)))
+                    } else {
+                        None
+                    };
                     packet = Some(Mpdu {
                         bytes,
                         channel,
@@ -663,7 +832,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         short_gi: false,
                         width40: false,
                         aggregated: false,
-                        pwdb: None,
+                        pwdb,
                         antenna_mux: None,
                     });
                 }
@@ -675,8 +844,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             ring.sync();
             ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
             ring.sync();
-            Ok((true, packet))
+            Ok((true, packet, report))
         })?;
+        if let Some((bytes, take)) = report {
+            self.packet.ae.c2h(&bytes[..take]);
+        }
         if consumed {
             self.packet.receive = (slot + 1) % self.depth;
         }

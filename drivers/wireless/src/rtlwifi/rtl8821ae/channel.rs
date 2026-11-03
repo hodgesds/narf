@@ -124,3 +124,61 @@ pub async fn configure(io: &impl Io, permission: &Permission) -> Result<(), Erro
     set_txpower(io, permission)?;
     set_bw20(io).await
 }
+
+/// `rtl8821ae/dm.c` `txscaling_tbl` (`TXSCALE_TABLE_SIZE` 37, -12 dB to
+/// +6 dB in 0.5 dB steps).
+pub const TXSCALING: [u32; 37] = [
+    0x081, 0x088, 0x090, 0x099, 0x0a2, 0x0ac, 0x0b6, 0x0c0, 0x0cc, 0x0d8, 0x0e5, 0x0f2, 0x101,
+    0x110, 0x120, 0x131, 0x143, 0x156, 0x16a, 0x180, 0x197, 0x1af, 0x1c8, 0x1e3, 0x200, 0x21e,
+    0x23e, 0x261, 0x285, 0x2ab, 0x2d3, 0x2fe, 0x32b, 0x35c, 0x38e, 0x3c4, 0x3fe,
+];
+
+/// `rtl8821ae_dm_initialize_txpower_tracking_thermalmeter`
+/// `default_ofdm_index`: the table index of the programmed BB swing, 24
+/// (0 dB) when it is not a table entry.
+pub fn default_ofdm_index(swing: u32) -> u8 {
+    TXSCALING
+        .iter()
+        .position(|&v| v == swing)
+        .map_or(24, |i| i as u8)
+}
+
+/// `rtl8821ae_dm_txpwr_track_set_pwr` `pwr_tracking_limit` for
+/// `rtl8821ae_hw_rate_to_mrate(tx_rate)` (`MGN_*`).
+pub fn pwr_tracking_limit(mgn: u8) -> u8 {
+    // Linux tests `MGN_1M..=MGN_11M` first as a numeric range, which also
+    // covers MGN_6M (0x0c) and MGN_9M (0x12); kept.
+    match mgn {
+        0x02..=0x16 => 32,
+        0x17..=0x60 => 30,
+        0x6c => 28,
+        0x80..=0x82 => 34,
+        0x83..=0x84 => 30,
+        0x85..=0x87 => 28,
+        0x90..=0x92 => 34,
+        0x93..=0x94 => 30,
+        0x95..=0x96 => 28,
+        0x97 => 26,
+        0x98 => 24,
+        0x99 => 22,
+        _ => 24,
+    }
+}
+
+/// `rtl8821ae_c2h_ra_report_handler` → `rtl8821ae_dm_update_init_rate`
+/// → `rtl8821ae_dm_txpwr_track_set_pwr(MIX_MODE, RF90_PATH_A)` without
+/// thermal tracking (`absolute_ofdm_swing_idx` 0, `modify_txagc_flag_path_a`
+/// false): the final index is `default_ofdm_index`; within the rate's
+/// limit Linux rewrites `RA_TXSCALE[31:21]` with its table value (the swing
+/// already programmed). Above the limit Linux would lower the swing and
+/// re-run `rtl8821ae_phy_set_txpower_level_by_path` with a remnant; no
+/// admitted profile reaches that (only VHT1SS MCS8/9 have a limit below
+/// 24), so it is refused.
+pub fn update_init_rate(io: &impl Io, swing: u32, hw_rate: u8) -> Result<(), Error> {
+    let index = default_ofdm_index(swing);
+    let limit = pwr_tracking_limit(super::c2h::hw_rate_to_mrate(hw_rate));
+    if index > limit {
+        return Err(Error::Packet);
+    }
+    set_bb(io, RA_TXSCALE, 0xffe0_0000, TXSCALING[usize::from(index)])
+}

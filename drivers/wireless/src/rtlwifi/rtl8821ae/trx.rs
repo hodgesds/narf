@@ -256,6 +256,45 @@ impl RxStatus {
     }
 }
 
+/// Bytes of the RX PHY status (`rx_fwinfo_8821ae` / `phy_status_rpt`
+/// overlay) read for the station PWDB: `pwdb_all` (byte 4) and
+/// `cfosho[0]` (byte 5, the CCK AGC report).
+pub const PHY_STATUS_PWDB_BYTES: usize = 6;
+
+/// `rtl8821ae/trx.c::query_rxphystatus` `rx_pwdb_all` for the RTL8821AE
+/// (`hw_type != HARDWARE_TYPE_RTL8812AE`). `phy` starts at
+/// `skb->data + rx_bufshift` (Linux's `p_drvinfo`); `cck` is
+/// `RTL8821AE_RX_HAL_IS_CCK_RATE(rate)`.
+///
+/// CCK: `cck_agc_rpt = p_phystrpt->cfosho[0]`, LNA `[7:5]`, VGA `[4:0]`,
+/// `pout = -6`; LNA 3, 6 and 7 have no case, so `rx_pwr_all` keeps its
+/// initial 0 (percentage 100) exactly as Linux. The 8821 branch applies no
+/// `cck_high_power` correction. OFDM/HT/VHT: `((pwdb_all >> 1) & 0x7f) - 110`.
+/// Both go through `rtl_query_rxpwrpercentage`.
+pub fn rx_pwdb(phy: &[u8; PHY_STATUS_PWDB_BYTES], cck: bool) -> u8 {
+    use crate::rtlwifi::rate_adaptive::rx_power_percentage;
+    if !cck {
+        return rx_power_percentage(i32::from((phy[4] >> 1) & 0x7f) - 110);
+    }
+    let agc = phy[5];
+    let vga = i32::from(agc & 0x1f);
+    let pout = -6;
+    let power = match (agc & 0xe0) >> 5 {
+        5 => pout - 32 - 2 * vga,
+        4 => pout - 24 - 2 * vga,
+        2 => pout - 11 - 2 * vga,
+        1 => pout + 5 - 2 * vga,
+        0 => pout + 21 - 2 * vga,
+        _ => 0,
+    };
+    rx_power_percentage(power)
+}
+
+/// `RTL8821AE_RX_HAL_IS_CCK_RATE`: `DESC_RATE1M..=DESC_RATE11M`.
+pub const fn is_cck(rate: u8) -> bool {
+    rate <= 3
+}
+
 /// Re-arm an RX descriptor (`rtl8821ae_set_desc` HW_DESC_RXBUFF_ADDR /
 /// RXPKT_LEN / RXOWN, plus EOR on the last entry).
 pub fn rx_arm(dw: &mut [u32; 8], buffer: u32, len: u16, last: bool) {

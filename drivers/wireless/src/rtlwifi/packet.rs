@@ -516,6 +516,31 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.ae_install_rate_mask(payload, admission).await
     }
+    /// RTL8821AE: the latest C2H TX report matched to its frame.
+    pub(crate) fn take_rtl8821ae_tx_report(&mut self) -> Option<ae::TxReport> {
+        if !self.rtl8821ae() {
+            return None;
+        }
+        self.ae_take_tx_report()
+    }
+    /// RTL8821AE: every `SPE_RPT` request has its C2H report.
+    pub(crate) fn rtl8821ae_tx_reports_settled(&self) -> bool {
+        !self.rtl8821ae() || self.ae_tx_reports_settled()
+    }
+    /// RTL8821AE: firmware RA's current rate (`DESC_RATE*`) from C2H.
+    pub(crate) fn rtl8821ae_ra_rate(&self) -> Option<u8> {
+        if !self.rtl8821ae() {
+            return None;
+        }
+        self.ae_ra_rate()
+    }
+    /// RTL8821AE: apply a pending RA report (`rtl8821ae_dm_update_init_rate`).
+    pub(crate) fn update_rtl8821ae_init_rate(&mut self) -> Result<bool, Error> {
+        if !self.rtl8821ae() {
+            return Err(Error::State);
+        }
+        self.ae_update_init_rate()
+    }
     /// True while the firmware is in leisure power save.
     pub(crate) fn leisure(&self) -> bool {
         self.packet.leisure
@@ -1280,7 +1305,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 }
 
 #[path = "packet_ae.rs"]
-mod ae;
+pub(crate) mod ae;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "packet_tests.rs"]

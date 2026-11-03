@@ -446,3 +446,140 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_bt_function_board_refused_at_admission
 );
+
+/// Deliver one RX buffer: `bytes` at offset 0, descriptor dwords 0 and 2..4.
+fn rx_buffer(
+    owner: &mut Prepared<AePort, Block>,
+    bytes: &[u8],
+    dw0: u32,
+    dw2: u32,
+    dw3: u32,
+) -> Result<super::super::ReceiveStep, Error> {
+    let rx = owner.packet.receive;
+    owner.buffers[rx].write_bytes(0, bytes).unwrap();
+    let ring = owner.receive.as_mut().unwrap();
+    ring.write32(rx * 32, dw0).unwrap();
+    ring.write32(rx * 32 + 8, dw2).unwrap();
+    ring.write32(rx * 32 + 12, dw3).unwrap();
+    owner.poll_receive_step()
+}
+
+fn retire(owner: &mut Prepared<AePort, Block>, queue: usize, slot: usize) -> Option<u64> {
+    let dw0 = tx_word(owner, queue, slot, 0);
+    owner.tx[queue].write32(slot * 64, dw0 & !OWN).unwrap();
+    owner.poll_delivery().ok().flatten().map(|d| d.id)
+}
+
+fn smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation() -> TestResult {
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("start_packets");
+    }
+    // Association mask installed (RATR_INX_WIRELESS_GB).
+    owner.packet.rate_mask = Some(4);
+    // EAPOL (unprotected, ToDS): forced rate with SPE_RPT, SW_DEFINE 4.
+    let mut eapol = vec![0u8; 40];
+    eapol[0] = 0x08;
+    eapol[1] = 0x01;
+    eapol[4..10].copy_from_slice(&PEER);
+    eapol[10..16].copy_from_slice(&MAC);
+    eapol[16..22].copy_from_slice(&PEER);
+    eapol[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    let slot = owner.packet.next[4];
+    let Ok(id) = owner.submit(&eapol, 4) else {
+        return TestResult::Fail("EAPOL submit");
+    };
+    if tx_word(&owner, 4, slot, 2) & (1 << 19) == 0
+        || tx_word(&owner, 4, slot, 6) & 0xfff != 4
+        || tx_word(&owner, 4, slot, 3) & ((1 << 8) | (1 << 10)) != (1 << 8) | (1 << 10)
+        || tx_word(&owner, 4, slot, 4) & 0x7f != 4
+    {
+        return TestResult::Fail("rtl_set_tx_report / forced EAPOL descriptor");
+    }
+    if retire(&mut owner, 4, slot) != Some(id) || owner.rtl8821ae_tx_reports_settled() {
+        return TestResult::Fail("EAPOL receipt / report still outstanding");
+    }
+    // C2H_TX_REPORT V1: st byte0[7:6] 0, retry byte2[5:0] 2, sn byte6 4.
+    let report = [3u8, 0, 0, 0, 2, 0, 0, 0, 4];
+    match rx_buffer(&mut owner, &report, report.len() as u32, 1 << 28, 0) {
+        Ok(s) if s.consumed && s.packet.is_none() => {}
+        _ => return TestResult::Fail("C2H TX report not consumed"),
+    }
+    match owner.take_rtl8821ae_tx_report() {
+        Some(r) if r.id == id && r.acked && r.retry == 2 => {}
+        _ => return TestResult::Fail("TX report not matched to the EAPOL frame"),
+    }
+    if !owner.rtl8821ae_tx_reports_settled() {
+        return TestResult::Fail("rtl_check_tx_report_acked after the report");
+    }
+    // Ordinary DATA under firmware RA: no USE_RATE/DISFB, 54M, ratr_index.
+    let mut data = eapol.clone();
+    data[30..32].copy_from_slice(&[0x08, 0x00]);
+    let slot = owner.packet.next[4];
+    let Ok(id) = owner.submit_aggregate(&data, 4, None, true, false) else {
+        return TestResult::Fail("adaptive DATA refused");
+    };
+    if tx_word(&owner, 4, slot, 3) & ((1 << 8) | (1 << 10)) != 0
+        || tx_word(&owner, 4, slot, 4) & 0x7f != 0x0b
+        || (tx_word(&owner, 4, slot, 1) >> 16) & 0x1f != 4
+        || tx_word(&owner, 4, slot, 2) & (1 << 19) != 0
+    {
+        return TestResult::Fail("rtl_get_tcb_desc firmware-RA DATA descriptor");
+    }
+    if retire(&mut owner, 4, slot) != Some(id) {
+        return TestResult::Fail("DATA receipt");
+    }
+    let mut null = data[..24].to_vec();
+    null[0] = 0x48;
+    if owner.submit_aggregate(&null, 4, None, true, false).is_ok() {
+        return TestResult::Fail("Null frame given firmware RA");
+    }
+    // C2H_RA_RPT: 54M; the DM step rewrites RA_TXSCALE with the default
+    // swing's table entry (54M limit 28 >= index).
+    let swing = owner.rtl8821ae_power.unwrap().swing();
+    port.set32(0xc1c, 0x0000_0123);
+    match rx_buffer(&mut owner, &[12, 0, 0x0b], 3, 1 << 28, 0) {
+        Ok(s) if s.consumed => {}
+        _ => return TestResult::Fail("C2H RA report not consumed"),
+    }
+    if owner.rtl8821ae_ra_rate() != Some(0x0b)
+        || !matches!(owner.update_rtl8821ae_init_rate(), Ok(true))
+        || !matches!(owner.update_rtl8821ae_init_rate(), Ok(false))
+    {
+        return TestResult::Fail("RA report not applied exactly once");
+    }
+    let index =
+        usize::from(super::super::super::super::rtl8821ae::channel::default_ofdm_index(swing));
+    let table = super::super::super::super::rtl8821ae::channel::TXSCALING[index];
+    if port.reg32(0xc1c) != (table << 21) | 0x123 {
+        return TestResult::Fail("dm_update_init_rate MIX_MODE RA_TXSCALE");
+    }
+    // PHY status: OFDM 6M beacon with drvinfo 8 bytes, pwdb_all 0x8c -> 60.
+    let mut buffer = vec![0u8; 8 + 28];
+    buffer[4] = 0x8c;
+    buffer[8] = 0x80;
+    buffer[12..18].copy_from_slice(&[0xff; 6]);
+    buffer[24..30].copy_from_slice(&PEER);
+    match rx_buffer(&mut owner, &buffer, 28 | (1 << 16) | (1 << 26), 0, 4) {
+        Ok(s) if s.packet.as_ref().and_then(|p| p.pwdb()) == Some(60) => {}
+        _ => return TestResult::Fail("OFDM PWDB not decoded"),
+    }
+    // CCK 1M: cfosho[0] LNA1 VGA3 -> -7 dBm -> 93.
+    buffer[4] = 0;
+    buffer[5] = (1 << 5) | 3;
+    match rx_buffer(&mut owner, &buffer, 28 | (1 << 16) | (1 << 26), 0, 0) {
+        Ok(s) if s.packet.as_ref().and_then(|p| p.pwdb()) == Some(93) => {}
+        _ => return TestResult::Fail("CCK PWDB not decoded"),
+    }
+    // PHYST without room for the PHY status is a descriptor error.
+    if rx_buffer(&mut owner, &buffer[8..], 28 | (1 << 26), 0, 0).is_ok() {
+        return TestResult::Fail("PHYST without drvinfo accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation
+);

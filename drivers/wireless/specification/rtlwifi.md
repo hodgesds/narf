@@ -1625,19 +1625,43 @@ chain below is composed.
   - TX: `rtl8821ae_tx_fill_desc` first+last segment, no early mode, through
     `trx::TxDesc::fill`: descriptor dwords 0..=9 plus the buffer in dword 10,
     dword 12's next pointer untouched; Linux queue selection and doorbells
-    as 88EE; forced `hw_rate` with fallback disabled, BW 20, HWSEQ for
-    non-QoS frames, MACID 0, RATE_ID the installed `ratr_index` for unicast
-    and `RATR_INX_WIRELESS_MC` otherwise (`_rtl_txrate_selectmode`, 8821AE
-    has no `RTL_SPEC_NEW_RATEID`). Only legacy rates are admitted (no HT,
-    A-MPDU, SGI, RTS/CTS protection or firmware fallback: those 88EE grants
-    are never minted over the 8821AE envelope). The host receipt checks
-    OWN clear with dwords 0/1/7, the buffer in dword 10, dword 11/13 zero
-    and the linked next pointer.
-  - RX: `rtl8821ae_rx_query_desc` fields; C2H report buffers (`rpt_sel`)
-    and anything outside the legacy 20 MHz profile (CRC/ICV, A-MPDU, HT/VHT
-    rate, BW ≠ 20) are consumed and dropped; payload at drvinfo + shift (the
-    PCI buffer holds no descriptor); FCS stripped; protected frames require
-    SWDEC (software CCMP). No 8821AE PHY-status PWDB is decoded.
+    as 88EE; BW 20, HWSEQ for non-QoS frames, MACID 0. Ordinary unicast
+    DATA once the RA mask is installed follows `rtl_get_tcb_desc` for a
+    non-zero rix: `USE_RATE` and `DISABLE_FB` clear, `hw_rate` the mode's
+    highest rate (11M for B, 54M otherwise) and RATE_ID the AP's
+    `ratr_index` (addr1 is the AP, whatever the DA), so the firmware RA
+    picks and falls back inside the mask. This needs no separate
+    continuation: the `NAPC` permission admits a measured TXAGC index for
+    every station rate (CCK, OFDM, MCS0-7, VHT1SS0-9), unlike 88EE's
+    fixed-rate NEPC (NEFB). Every other frame keeps the forced `hw_rate`
+    with fallback disabled and RATE_ID the installed `ratr_index` for
+    unicast, `RATR_INX_WIRELESS_MC` otherwise (`_rtl_txrate_selectmode`,
+    8821AE has no `RTL_SPEC_NEW_RATEID`). EAPOL (unprotected; software
+    crypto has no `hw_key` IV to skip) and Null frames carry `SPE_RPT` +
+    `SW_DEFINE` (`rtl_is_tx_report_skb`/`rtl_set_tx_report`, `(++sn &
+    0x3f) << 2`). Only legacy rates are admitted (no HT, A-MPDU, SGI or
+    RTS/CTS protection yet). The host receipt checks OWN clear with dwords
+    0/1/7, the buffer in dword 10, dword 11/13 zero and the linked next
+    pointer.
+  - RX: `rtl8821ae_rx_query_desc` fields; anything outside the legacy
+    20 MHz profile (CRC/ICV, A-MPDU, HT/VHT rate, BW ≠ 20) is consumed and
+    dropped; payload at drvinfo + shift (the PCI buffer holds no
+    descriptor); FCS stripped; protected frames require SWDEC (software
+    CCMP). With PHYST the `trx.c::query_rxphystatus` PWDB is decoded from
+    the PHY status at `rx_bufshift` (`trx::rx_pwdb`): OFDM `((pwdb_all >> 1)
+    & 0x7f) - 110`; CCK the 8821 `cfosho[0]` LNA/VGA table with `pout = -6`
+    (LNA 3/6/7 leave `rx_pwr_all` 0 as Linux; no `cck_high_power` step on
+    8821), both through `rtl_query_rxpwrpercentage`. PHYST with drvinfo
+    shorter than the 6 read bytes is a descriptor error. The station feeds
+    BSSID-matching frames to `rtl_process_pwdb` (zeroed `undec_sm_pwdb`).
+  - C2H (`rpt_sel`, `rtl_c2hcmd_enqueue` → `rtl_c2h_content_parsing`):
+    V1 TX reports (`rtl_tx_report_handler`) record `last_recv_sn` and
+    complete the matching outstanding `SW_DEFINE` with `st == 0` as the
+    ACK and the retry count (`take_rtl8821ae_tx_report`,
+    `rtl8821ae_tx_reports_settled` = `rtl_check_tx_report_acked` without
+    the 3 s timeout, which the caller's deadline owns); RA reports
+    (`rtl8821ae_c2h_ra_report_handler`) record `rtldm->tx_rate`. BT
+    info/MP reports are ignored (BT boards are not admitted).
   - Join (`rtl_op_bss_info_changed`): authentication-time BSSID, RRSR
     (`supp_rates & 0x15f`), `rtl8821ae_update_channel_access_setting`
     (slot, SIFS `0x0a` for mode G else `0x0e`, R2T `0x0a`), the fixed
@@ -1657,9 +1681,22 @@ chain below is composed.
     Disassociation: leave LPS, `set_network_type` without link, MSRRPT
     disconnect and zero BSSID (AID left as Linux does); rings stay live.
   - DM watchdog (`refresh_station_rate_mask` slot, every
-    `RTL_WATCHDOG_TIME`, firmware awake): `iqk::LinkedInterval` and
-    `calibrate_rtl8821ae_iqk` inside the envelope's current authority. The
-    RA mask is not refreshed (no 8821AE PWDB source).
+    `RTL_WATCHDOG_TIME`, firmware awake), in `rtl8821ae_dm_watchdog`
+    order: `rtl8821ae_dm_refresh_rate_adaptive_mask` (linked station; high
+    threshold 50, low `low2high_rssi_thresh_for_ra40m`, which dm init never
+    sets, so 0; `go_up_gap` 5 raises high from MIDDLE and both from LOW) —
+    a level change re-sends `rtl8821ae_update_hal_rate_mask(level,
+    update_bw)` inside the envelope's authority; then a pending RA
+    report's `rtl8821ae_dm_update_init_rate` →
+    `rtl8821ae_dm_txpwr_track_set_pwr(MIX_MODE, path A)` without thermal
+    tracking: `RA_TXSCALE[31:21] = txscaling_tbl[default_ofdm_index]`
+    (the swing's table index, 24 when absent) when within the rate's
+    `pwr_tracking_limit` (Linux's `MGN_1M..MGN_11M` numeric range, which
+    also covers 6M/9M, is kept); above the limit (only VHT1SS MCS8/9 can
+    be) Linux would re-run TXAGC with a remnant, which is refused. Linux
+    runs the report from `c2hcmd_wq`; here it is deferred to this step so
+    the BB write happens inside the current authority. Then
+    `iqk::LinkedInterval` and `calibrate_rtl8821ae_iqk`.
   - Station power base: the station re-derives the channel grant from the
     `NAPC` envelope (`station_power::Base`/`Grant`) at every publication and
     wait, as it does from `NEPC` for 88EE.
@@ -1671,8 +1708,11 @@ chain below is composed.
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
   Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,
   `smoke_rtl8821ae_native_join_rsvd_page_h2c_and_leave`,
-  `smoke_rtl8821ae_bt_function_board_refused_at_admission`
-  (`packet_ae_tests.rs`; written, unexecuted).
+  `smoke_rtl8821ae_bt_function_board_refused_at_admission`,
+  `smoke_rtl8821ae_c2h_tx_ra_reports_pwdb_and_firmware_rate_adaptation`
+  (`packet_ae_tests.rs`) and
+  `smoke_rtl8821ae_pwdb_ra_hysteresis_and_init_rate_match_linux`
+  (`rate_adaptive.rs`) (written, unexecuted).
 
 Tests in `rtl8821ae/tests.rs` and `packet_ae_tests.rs` are written and
 unexecuted. Physical-board qualification (signed `NAPC` envelope

@@ -1547,17 +1547,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.protection = protection;
         // Even MCS0's LGI descriptor must stay fixed when its firmware RA
         // mask advertises SGI. NEFB v1 did not qualify that firmware mode.
-        let fallback = matches!(kind, Kind::Data)
-            && self.station.tracking.is_none()
-            && self.station.antenna.is_none()
-            && protection == super::super::protection::Mode::None
-            && !sgi_profile
-            && self
-                .station
-                .ht
-                .as_ref()
-                .is_none_or(|g| g.geometry().is_none())
-            && self.station.fallback_current();
+        // RTL8821AE: rtl_get_tcb_desc firmware RA for ordinary DATA once the
+        // mask is installed; the NAPC permission admits every station rate.
+        let fallback = if self.chip == super::Chip::Rtl8821ae {
+            matches!(kind, Kind::Data)
+                && protection == super::super::protection::Mode::None
+                && self.rate_mask().is_some()
+        } else {
+            matches!(kind, Kind::Data)
+                && self.station.tracking.is_none()
+                && self.station.antenna.is_none()
+                && protection == super::super::protection::Mode::None
+                && !sgi_profile
+                && self
+                    .station
+                    .ht
+                    .as_ref()
+                    .is_none_or(|g| g.geometry().is_none())
+                && self.station.fallback_current()
+        };
         let protection_source = self.station.protection.clone();
         let tracking_source = self.station.tracking.as_ref().map(|s| s.grant.clone());
         let antenna_source = self.station.antenna.as_ref().map(|s| s.grant.clone());
@@ -2547,21 +2555,55 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.check_station_policy(environment)
     }
     /// RTL8821AE DM watchdog step (`rtl8821ae_dm_watchdog`, every
-    /// `RTL_WATCHDOG_TIME`): `rtl8821ae_dm_iq_calibrate` runs path-A IQK on
-    /// the second linked period, only with the firmware out of power save
-    /// (`fw_current_inpsmode` false); the IQK itself pauses the queues. The RA
-    /// mask refresh needs the 8821AE PHY-status PWDB, which is not decoded,
-    /// so the association mask (`DM_RATR_STA_INIT`) stays installed.
-    async fn rtl8821ae_watchdog(&mut self, environment: &impl Environment) -> Result<(), Error> {
+    /// `RTL_WATCHDOG_TIME`, only with the firmware out of power save —
+    /// `fw_current_inpsmode` false), in the Linux order:
+    /// `rtl8821ae_dm_refresh_rate_adaptive_mask` (linked station whose
+    /// smoothed PWDB crossed the 8821AE hysteresis re-sends the mask with
+    /// `update_bw`), then the pending C2H RA report's
+    /// `rtl8821ae_dm_update_init_rate` (Linux runs it from `c2hcmd_wq`; here
+    /// it is deferred to this step so it executes inside the envelope's
+    /// current authority), then `rtl8821ae_dm_iq_calibrate` (path-A IQK on
+    /// the second linked period; the IQK pauses the queues itself).
+    /// Returns whether a mask was sent.
+    async fn rtl8821ae_watchdog(&mut self, environment: &impl Environment) -> Result<bool, Error> {
         if !self.station.ra.due(environment.now_ms()) {
-            return Ok(());
+            return Ok(false);
         }
         if self.leisure() {
-            return Ok(());
+            return Ok(false);
         }
         let linked = self.station_linked();
+        let mut sent = false;
+        if linked && self.transmit_ready() && self.rate_mask().is_some() {
+            if let Some(level) = self.station.ra.refresh_rtl8821ae() {
+                self.install_station_rate_mask(level, environment).await?;
+                self.station.ra.commit(level);
+                sent = true;
+            }
+        }
+        if self.transmit_ready() && self.rtl8821ae_ra_rate().is_some() {
+            self.check_station_policy(environment)?;
+            let base = self
+                .station
+                .calibration
+                .as_ref()
+                .ok_or(Error::State)?
+                .clone();
+            let permission = self.station_grant().ok_or(Error::State)?;
+            power_wait(
+                base,
+                None,
+                None,
+                None,
+                None,
+                permission,
+                environment,
+                async { self.update_rtl8821ae_init_rate().map(|_| ()) },
+            )
+            .await?;
+        }
         if !self.station.iqk.tick(linked) {
-            return Ok(());
+            return Ok(sent);
         }
         self.check_station_policy(environment)?;
         let base = self
@@ -2582,7 +2624,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             async { self.calibrate_rtl8821ae_iqk().await.map(|_| ()) },
         )
         .await?;
-        self.check_station_policy(environment)
+        self.check_station_policy(environment)?;
+        Ok(sent)
     }
     /// `rtl88e_dm_watchdog` → `rtl88e_dm_refresh_rate_adaptive_mask`: every
     /// `RTL_WATCHDOG_TIME`, outside firmware LPS, a linked station whose
@@ -2597,7 +2640,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             if result.is_err() {
                 self.abort_station();
             }
-            return result.map(|()| false);
+            return result;
         }
         // Each watchdog pass re-proves the fallback grant (revocation
         // returns DATA to the fixed rate without touching the link).
