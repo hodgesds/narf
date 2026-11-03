@@ -2147,10 +2147,7 @@ power, temperature slope). The factory antenna gain is the band's
 supplied in-tree. Smoke (written, not executed):
 `smoke_ath9k_ar9300_admission_records_bind_channel_ctl_and_magic`.
 
-Still to port before `ar9300_enablement` can be claimed: the
-probe/station/retune/reset/periodic/suspend owner (`0x0030` registration,
-`Calibrated::Ar9300` with the EDMA packet owner and MAC profile, the 5 GHz
-APM chain-mask reduction in `tx_chainmask()`). Step 5b-0:
+AR9300 owner (`ar9300_enablement`, steps 5b-0..5b-4). Step 5b-0:
 `station::Engine` (`station/engine.rs`) is the packet-engine trait
 `station::Radio<P, E, K: Engine = packet::Packet<P>>` drives; the AR9002
 `packet::Packet<P>` implements it by delegating to its inherent methods
@@ -2208,7 +2205,59 @@ NativeEnvironment, Dispatch<Native>>` (`interface::Device` and the
 AR9002 packet owner for fixtures). The AR9285/AR9287/AR9280/AR5008 owners
 pass `packet.into()` (the `Ar9002` arm): behaviour and register streams
 unchanged.
-Nothing registers `0x0030`.
+Step 5b-4 (`ar9300_owner.rs`, modelled on the AR9280 owner): `0x0030`
+(`ath9k-ar9300`) is registered in the ath9k PCI table with remove and
+device-PM hooks. Probe: singleton reservation and PCI parking, BAR0 of at
+least 0x16bd8 (the last `ar9300_2p2_radio_core` row), `ar9003::identify`
+(power-on, `AR_SREV`, EEPROM/OTP restore), the pre-reset `AR_CFG_LED`
+(`ath9k_hw_reset` reads it from the awake chip after `ath9k_hw_init`),
+`ar9003::phy::prepare` at 2412 MHz with `ath9k_regd_get_ctl` over
+`Factory::from_eeprom(regDmn[0])` (`initial_ctl` | `CTL_11G`, 5 GHz
+`initial_ctl_5ghz` | `CTL_11A`) and a zero power limit (no TX power above
+zero is programmed before the host ceiling is known), cross-checked
+against `ar9003::phy::expected`, then the `N93A` load; an absent or
+foreign record leaves the chip unadmitted (`ar9003::disable_and_sleep`).
+`ar9003::phy::expected` derives `prepare`'s result with no register access
+(same checks and plan, modes index, APM selfgen mask, gain-array
+`regWrites`, `TX_CL_CAL` from the last INI row writing `AR_PHY_CL_CAL_CTL`
+in `ar9003_hw_process_ini` order; no such row refuses), so records for
+other channels and the admitted channel mask are computed without touching
+the chip. Initialize: `Permission::from_domain_dual` with the signed
+ceiling, PCI BME off, `ar9003::power::plan` + `program` at that ceiling
+(`ath9k_hw_apply_txpower`), `ar9003::calib::Calibration::run` under the
+grant and a live dual-band permission, `Native::new_ar9300` (with
+`Periodic::new` over the carried `IqTotals`), `ar9003::mac::prepare`,
+`ar9300_reset_tail` with the saved LED, MSI arm, EDMA `Packet::prepare`,
+`station::Radio::new(packet.into(), ..)` (noise = chain-0 default NF,
+`ath9k_hw_getchan_noise` before any history) and `interface::publish`.
+Retune (`channels` routes non-AR9285 20 MHz requests after AR9280),
+recovery and resume share one generation reset: the target record and
+permission first, retire with proven DMA stop and BME off,
+`ar9003::set_power_awake` only after FULL_SLEEP (`ath9k_hw_setpower` is a
+no-op on an awake chip), the new `AR_CFG_LED`, `ar9003::reset_reg`
+(`ath9k_hw_set_reset_reg`) COLD when `chip_fullsleep` or `AR_Q_TXE` != 0
+or `AR_CR & AR_CR_RXE(0xc)` (`ath9k_hw_chip_reset`), else WARM; an
+`AR_SREV` that must decode to the probe's revision; `prepare` at the
+target equal to `expected`; then initialize. The `ath9k_hw_init_pll` that
+`ath9k_hw_chip_reset` runs is `prepare`'s PLL write (Linux marks the PHY
+inactive before the chip reset; here the reset precedes `prepare`'s
+`mark_phy_inactive`, which the chip reset already left inactive). The
+supervisor polls every 500 ms: a terminal station is reset (three
+failures, `DeviceGone` or `BadState` stop it); otherwise
+`long_calibration` runs the due `Periodic` steps. Suspend
+(`ath_pci_suspend`): retire, then `ar9003::disable_and_sleep` =
+`ath9k_hw_disable` (COLD `set_reset_reg`, `ath9k_hw_init_pll`) +
+`ath9k_set_power_sleep` for AR9300 without MCI (`AR_STA_ID1_PWR_SAV` set,
+`AR_RTC_FORCE_WAKE_EN` and `AR_RTC_RESET_EN` cleared, 2 µs, `AR_WA`
+without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write). `ar9003_hw_configpcipowersave`
+is not called (Linux calls it from `ath9k_stop`, not `ath_pci_suspend`).
+Resume clears PCI config 0x41 and runs the generation reset (COLD).
+The owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
+program, matching the AR9280 station scope; ANI is not ported. Smokes
+(written, not executed):
+`smoke_ath9k_ar9300_expected_preparation_matches_prepare`,
+`smoke_ath9k_ar9300_disable_and_full_sleep`. No physical AR9380/AR9390
+board record or receipt exists in-tree.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

@@ -9,7 +9,8 @@
 //! selection, plus the `ar9003_phy.c` 20 MHz channel preparation with
 //! `ath9k_hw_ar9300_set_board_values` and `ath9k_hw_ar9300_set_txpower`
 //! (`phy`, `board`, `power`). No device is matched by `register()` from
-//! here: a chip without a complete native station path is never claimed.
+//! here: `ar9300_owner` composes the native station path and registers
+//! the device.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 pub(super) mod board;
@@ -53,6 +54,12 @@ const AR_RTC_STATUS_SHUTDOWN: u32 = 1;
 const AR_RTC_FORCE_WAKE: u64 = 0x704c;
 const AR_RTC_FORCE_WAKE_EN: u32 = 1;
 const AR_RTC_FORCE_WAKE_ON_INT: u32 = 2;
+const AR_RTC_PLL_CONTROL: u64 = 0x7014;
+const AR_RTC_SLEEP_CLK: u64 = 0x7048;
+const AR_RTC_FORCE_DERIVED_CLK: u32 = 0x2;
+const AR_RTC_RESET_EN: u32 = 0x1;
+/// `hw.h::RTC_PLL_SETTLE_DELAY` (µs).
+const RTC_PLL_SETTLE_DELAY: u64 = 100;
 const AR_STA_ID1: u64 = 0x8004;
 const AR_STA_ID1_PWR_SAV: u32 = 0x0004_0000;
 const AR_PHY_CHIP_ID: u64 = 0x9818;
@@ -210,6 +217,63 @@ pub(super) fn set_reset(io: &mut impl RegisterIo, wa: u32, cold: bool) -> Result
     io.write32(AR_RTC_RC, 0);
     io.wait_us(AR_RTC_RC, 3, 0, AH_WAIT_TIMEOUT)?;
     io.write32(AR_RC, 0);
+    Ok(())
+}
+
+/// `hw.c::ath9k_hw_set_reset_reg(ATH9K_RESET_COLD | ATH9K_RESET_WARM)`
+/// once `ah->reset_power_on` holds (after `identify`): `AR_WA`, force wake,
+/// then `ath9k_hw_set_reset`.
+pub(super) fn reset_reg(io: &mut impl RegisterIo, wa: u32, cold: bool) -> Result<(), BringUpError> {
+    wa_write(io, wa);
+    io.write32(
+        AR_RTC_FORCE_WAKE,
+        AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT,
+    );
+    set_reset(io, wa, cold)
+}
+
+/// `AR_SREV` decoded for `expected` (`ath9k_hw_read_revisions`).
+pub(super) fn revision(io: &mut impl RegisterIo, expected: Chip) -> Result<Revision, BringUpError> {
+    let srev = io.read32(AR_SREV);
+    if srev == u32::MAX || !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    Revision::decode(srev, expected).ok_or(BringUpError::UnsupportedRevision)
+}
+
+/// `hw.c::ath9k_hw_init_pll(ah, NULL)` for an AR9300:
+/// `ar9003_hw_compute_pll_control` (REFDIV 5, DIV 0x2c), the
+/// `RTC_PLL_SETTLE_DELAY` and `AR_RTC_FORCE_DERIVED_CLK`.
+fn init_pll(io: &mut impl RegisterIo) {
+    io.write32(AR_RTC_PLL_CONTROL, (5 << 10) | 0x2c);
+    io.delay_us(RTC_PLL_SETTLE_DELAY);
+    io.write32(AR_RTC_SLEEP_CLK, AR_RTC_FORCE_DERIVED_CLK);
+}
+
+/// `hw.c::ath9k_set_power_sleep` for an AR9300 without MCI: set
+/// `AR_STA_ID1_PWR_SAV`, clear `AR_RTC_FORCE_WAKE_EN` (no `AR_RC` write
+/// on `AR_SREV_9300_20_OR_LATER`), clear `AR_RTC_RESET_EN` (active-low
+/// shutdown) and write `AR_WA` without `AR_WA_D3_L1_DISABLE`.
+fn full_sleep(io: &mut impl RegisterIo, wa: u32) -> Result<(), BringUpError> {
+    rmw(io, AR_STA_ID1, 0, AR_STA_ID1_PWR_SAV)?;
+    rmw(io, AR_RTC_FORCE_WAKE, AR_RTC_FORCE_WAKE_EN, 0)?;
+    rmw(io, AR_RTC_RESET, AR_RTC_RESET_EN, 0)?;
+    io.delay_us(2);
+    io.write32(AR_WA, wa & !AR_WA_D3_L1_DISABLE);
+    Ok(())
+}
+
+/// `pci.c::ath_pci_suspend` on an awake AR9300: `ath9k_hw_disable` (its
+/// `ath9k_hw_setpower(AWAKE)` is a no-op on an awake chip, then the COLD
+/// `ath9k_hw_set_reset_reg` and `ath9k_hw_init_pll`) followed by
+/// `ath9k_hw_setpower(ATH9K_PM_FULL_SLEEP)`.
+pub(super) fn disable_and_sleep(io: &mut impl RegisterIo, wa: u32) -> Result<(), BringUpError> {
+    reset_reg(io, wa, true)?;
+    init_pll(io);
+    full_sleep(io, wa)?;
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
     Ok(())
 }
 

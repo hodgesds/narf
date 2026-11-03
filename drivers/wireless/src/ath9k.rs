@@ -14,6 +14,7 @@ mod ar5008_owner;
 mod ar9003;
 mod ar9280_owner;
 mod ar9287_owner;
+mod ar9300_owner;
 mod calibration;
 mod channel_width;
 mod channels;
@@ -1044,6 +1045,17 @@ pub fn register() {
         });
         narf_bus::register_pci_remove(name, ar9280_owner::remove);
     }
+    for (device, name) in ar9300_owner::DEVICES {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: ATHEROS_PCI_VENDOR,
+                device,
+            },
+            probe: ar9300_owner::probe,
+        });
+        narf_bus::register_pci_remove(name, ar9300_owner::remove);
+    }
     for (device, name) in ar5008_owner::DEVICES {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,
@@ -1065,6 +1077,11 @@ pub fn register() {
         "ath9k-ar9280",
         ar9280_owner::pm_suspend,
         ar9280_owner::pm_resume,
+    );
+    narf_power::device_pm::register_device_pm(
+        "ath9k-ar9300",
+        ar9300_owner::pm_suspend,
+        ar9300_owner::pm_resume,
     );
     narf_power::device_pm::register_device_pm(
         "ath9k-ar5008",

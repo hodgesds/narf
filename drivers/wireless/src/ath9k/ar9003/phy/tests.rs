@@ -320,3 +320,78 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_board_values_follow_eeprom_flags
 );
+
+/// `expected` derives exactly what `prepare` returns (INI-defined
+/// `TX_CL_CAL`, gain-array `regWrites`, APM selfgen mask, power plan) on
+/// both bands, without a single register access, and refuses an
+/// unsupported channel the same way.
+fn smoke_ath9k_ar9300_expected_preparation_matches_prepare() -> TestResult {
+    let revision = Revision {
+        chip: Chip::Ar9300,
+        mac_rev: 3,
+        pcie: true,
+    };
+    let image = AR9300_DEFAULT;
+    let id = identity(&image);
+    for frequency in [2412u16, 2437, 2484, 5180, 5825] {
+        if !channel_supported(&id, frequency) {
+            continue;
+        }
+        let mut io = Regs::default();
+        let (Ok(prepared), Ok(facts)) = (
+            prepare(&mut io, &revision, &id, &image, frequency, 0xe0, 0),
+            expected(&revision, &id, &image, frequency, 0xe0, 0),
+        ) else {
+            return TestResult::Fail("AR9300 preparation or its expected facts refused");
+        };
+        if prepared != facts {
+            return TestResult::Fail("AR9300 expected preparation differs from prepare");
+        }
+    }
+    if expected(&revision, &id, &image, 2467, 0xe0, 0) != Err(BringUpError::Policy) {
+        return TestResult::Fail("AR9300 expected preparation admitted an off-raster channel");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_expected_preparation_matches_prepare
+);
+
+/// `ath_pci_suspend` on an awake AR9300: COLD `ath9k_hw_set_reset_reg`
+/// (`AR_RTC_RC` 3 then 0), `ath9k_hw_init_pll`, then
+/// `ath9k_set_power_sleep` (PWR_SAV set, force wake and `AR_RTC_RESET_EN`
+/// cleared, `AR_WA` without `D3_L1_DISABLE`), in that order.
+fn smoke_ath9k_ar9300_disable_and_full_sleep() -> TestResult {
+    let mut io = Regs::default();
+    io.regs.insert(0x704c, 0x3);
+    io.regs.insert(0x7040, 0x1);
+    // AR_CFG_HALT_ACK already set: the DMA halt handshake completes.
+    io.regs.insert(0x0014, 0x1000);
+    let wa = 0x0002_4000 | 0x40;
+    if super::super::disable_and_sleep(&mut io, wa).is_err() {
+        return TestResult::Fail("AR9300 disable/full sleep refused");
+    }
+    let at = |w: (u64, u32)| io.writes.iter().position(|x| *x == w);
+    let (Some(cold), Some(pll), Some(clk), Some(sav), Some(wake), Some(rtc), Some(l1)) = (
+        at((0x7000, 3)),
+        at((0x7014, 0x142c)),
+        at((0x7048, 2)),
+        at((0x8004, 0x0004_0000)),
+        at((0x704c, 0x2)),
+        at((0x7040, 0)),
+        at((0x4004, wa & !0x4000)),
+    ) else {
+        return TestResult::Fail("AR9300 disable/full-sleep write missing");
+    };
+    if !(cold < pll && pll < clk && clk < sav && sav < wake && wake < rtc && rtc < l1) {
+        return TestResult::Fail("AR9300 disable/full-sleep order differs from Linux");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_disable_and_full_sleep
+);

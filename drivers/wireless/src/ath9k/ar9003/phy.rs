@@ -261,6 +261,72 @@ pub(in crate::ath9k) fn channel_supported(identity: &Identity, frequency: u16) -
     }
 }
 
+/// The last `AR_PHY_CL_CAL_CTL` value `rows` writes in `column`
+/// (`prog_ini`'s column rule).
+fn last_cl<const C: usize>(rows: &[[u32; C]], column: usize, seen: &mut Option<u32>) {
+    let column = if column >= C { 1 } else { column };
+    for row in rows {
+        if u64::from(row[0]) == AR_PHY_CL_CAL_CTL {
+            *seen = Some(row[column]);
+        }
+    }
+}
+
+/// The facts [`prepare`] returns at `frequency`, derived without touching
+/// the chip: the same channel and power-plan checks, the modes index, the
+/// APM selfgen mask, the shared `regWrites` count of the RX/TX gain and
+/// fast-clock arrays, and `TX_CL_CAL` from the last INI row (in
+/// `ar9003_hw_process_ini` order) that writes `AR_PHY_CL_CAL_CTL`. No later
+/// step of `prepare` before its readback writes that register; without
+/// such a row the readback is a hardware default and the facts are
+/// refused.
+pub(in crate::ath9k) fn expected(
+    revision: &Revision,
+    identity: &Identity,
+    image: &Image,
+    frequency: u16,
+    ctl: u16,
+    power_limit: u8,
+) -> Result<Prepared, BringUpError> {
+    if !channel_supported(identity, frequency) {
+        return Err(BringUpError::Policy);
+    }
+    let plan = power::plan(image, frequency, ctl, power_limit, identity.tx_chainmask)?;
+    let tables = Tables::ar9300(revision, identity);
+    let five = frequency >= 4800;
+    let modes_index = if five { 1 } else { 4 };
+    let mut cl = None;
+    last_cl(tables.soc_pre, modes_index, &mut cl);
+    last_cl(tables.mac_core, modes_index, &mut cl);
+    last_cl(tables.bb_core, modes_index, &mut cl);
+    last_cl(tables.radio_core, modes_index, &mut cl);
+    last_cl(tables.soc_post, modes_index, &mut cl);
+    last_cl(tables.mac_post, modes_index, &mut cl);
+    last_cl(tables.bb_post, modes_index, &mut cl);
+    last_cl(tables.radio_post, modes_index, &mut cl);
+    last_cl(tables.rx_gain, 1, &mut cl);
+    last_cl(tables.tx_gain, modes_index, &mut cl);
+    let mut writes = (tables.rx_gain.len() as u16).wrapping_add(tables.tx_gain.len() as u16);
+    if five {
+        last_cl(tables.fast_clock, modes_index, &mut cl);
+        writes = writes.wrapping_add(tables.fast_clock.len() as u16);
+    }
+    if frequency == 2484 {
+        last_cl(tables.cck_fir_japan_2484, 1, &mut cl);
+    }
+    let cl = cl.ok_or(BringUpError::BadState)?;
+    let apm = image[super::eeprom::field::MISC_CONFIGURATION] & 0x8 != 0;
+    let tx = identity.tx_chainmask;
+    Ok(Prepared {
+        frequency,
+        modes_index,
+        carrier_leak_cal: cl & 0x2 != 0,
+        selfgen_mask: if apm && tx == 7 { 3 } else { tx },
+        power: plan,
+        ini_writes: writes,
+    })
+}
+
 /// Inactive full-reset preparation of one 20 MHz AR9300 channel after a
 /// chip reset (`ar9003::set_reset` + `set_power_awake`). `ctl` and
 /// `power_limit` are `ath9k_hw_apply_txpower`'s inputs. The power plan is

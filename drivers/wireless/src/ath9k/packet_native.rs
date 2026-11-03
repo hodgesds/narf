@@ -69,8 +69,6 @@ pub(super) enum Calibrated {
     /// `ar9003::calib::Periodic` owner. `totals` is the owner's copy of the
     /// `ath_hw`-lifetime IQ accumulators, refreshed after every step so
     /// the next generation continues them.
-    // Composed by the AR9300 owner (next step).
-    #[allow(dead_code)]
     Ar9300 {
         report: super::ar9003::calib::Report,
         grant: alloc::sync::Arc<super::admission::Grant>,
@@ -494,7 +492,7 @@ impl Native {
     /// `ar9003::calib::Calibration::run` produced `report`; no packet DMA
     /// was published. `channel_mask` (`channels::bit`) names the primaries
     /// whose signed `N93A` record verified.
-    #[allow(clippy::too_many_arguments, dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn new_ar9300(
         device: BusDevice,
         cap: Cap<BusDeviceCap, Write>,
@@ -569,7 +567,6 @@ impl Native {
     /// `ar9003_hw_disable_phy_restart` (`HW_PHYRESTART_CLC_WAR`, AR9300 2.2)
     /// is a no-op here: a fresh generation has no `bb_watchdog_last_status`
     /// and a watchdog event closes the generation.
-    #[allow(dead_code)]
     pub(super) fn ar9300_reset_tail(&self, led: u32) -> Result<(), Error> {
         let Calibrated::Ar9300 { periodic, .. } = &self.calibrated else {
             return Err(Error::State);
