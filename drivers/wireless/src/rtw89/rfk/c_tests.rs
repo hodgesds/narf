@@ -423,3 +423,68 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_c_tssi_channel_follows_rtw8852c_tables_and_de
 );
+
+fn smoke_rtw89_c_dpk_channel_follows_rtw8852c_agc_and_bypass() -> TestResult {
+    use super::super::super::operating_channel_c::{Band, Profile};
+    use super::super::c_dpk::Dpk;
+    let mut io = Model::new();
+    // R_RPT_COM: corr 0xff, DC I 0 / Q -1 (sync passes), GL 0xf (>= 7) and
+    // equal PAS sums (GT): the AGC steps TX power 15 -> 12 -> 9 -> 7 dBm
+    // and stops at the lower bound. K set 0 on both paths.
+    io.words[(0x10000 + 0x80fc) / 4] = 0x0000_ffff;
+    io.words[(0x10000 + 0x81fc) / 4] = 1 << 29;
+    io.words[(0x10000 + 0x82fc) / 4] = 1 << 29;
+    let mut dpk = Dpk::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { dpk.run(&mut io, Profile::INITIAL, 1, [true; 2]) }) != Some(Ok(())) {
+        return TestResult::Fail("C DPK did not complete on a ready model");
+    }
+    let Some(paths) = dpk.results() else {
+        return TestResult::Fail("C DPK published no results");
+    };
+    if dpk.bypassed
+        || paths
+            .iter()
+            .any(|p| !p.path_ok || p.mdpd_en != 1 || p.gs != 0x5b)
+    {
+        return TestResult::Fail("C DPK path results differ from _dpk_on");
+    }
+    let txagc: Vec<u32> = io
+        .trace
+        .iter()
+        .filter(|t| t.0 == 4 && t.1 == 0x10000 + 0x56cc)
+        .map(|t| (t.2 >> 19) & 0x1ff)
+        .collect();
+    // `_dpk_txpwr_bb_force(true)` first writes ON with the old (0) value.
+    if !txagc.starts_with(&[0, 15 << 2, 12 << 2, 9 << 2, 7 << 2]) {
+        return TestResult::Fail("C DPK AGC TX power steps differ from _dpk_agc");
+    }
+    let notes: Vec<_> = io.trace.iter().filter(|t| t.0 >= 48).copied().collect();
+    let d = Kind::Dpk as u32;
+    if notes != [(48, d, 0), (56, 0, 0), (60, 0, 0), (48, d, 1)] {
+        return TestResult::Fail("C DPK coexistence/TX-pause order differs");
+    }
+    // MDPD enabled on both paths (B_DPD_MEN at 0x81bc / 0x82bc).
+    if io.word(0x81bc) >> 28 != 1 || io.word(0x82bc) >> 28 != 1 {
+        return TestResult::Fail("C DPK did not enable MDPD");
+    }
+    // CAV cut outside 2.4GHz: forced bypass, no one-shot, MDPD off.
+    let mut io = Model::new();
+    let mut dpk = Dpk::default();
+    let Some(five) = Profile::new20(Band::Ghz5, 36) else {
+        return TestResult::Fail("5GHz channel 36 profile missing");
+    };
+    // SAFETY: private inert model.
+    if ready(unsafe { dpk.run(&mut io, five, 0, [false; 2]) }) != Some(Ok(()))
+        || !dpk.bypassed
+        || io.trace.iter().any(|t| t.0 == 4 && t.1 == 0x10000 + 0x8000)
+        || io.word(0x81bc) >> 28 != 0
+    {
+        return TestResult::Fail("C DPK CAV bypass differs from _dpk_force_bypass");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_c_dpk_channel_follows_rtw8852c_agc_and_bypass
+);

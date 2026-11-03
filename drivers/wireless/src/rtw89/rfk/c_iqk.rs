@@ -254,7 +254,7 @@ pub(in super::super) struct Iqk {
 
 impl<I: Interface> Access<'_, I> {
     /// `rtw8852c_rxck_force`.
-    fn c_rxck(&mut self, path: u8, force: bool, ck: u32) -> Result<(), Error> {
+    pub(super) fn c_rxck(&mut self, path: u8, force: bool, ck: u32) -> Result<(), Error> {
         let rxck = R_P0_RXCK | (u32::from(path) << 13);
         self.wm(rxck, B_P0_RXCK_ON, 0)?;
         if !force {
@@ -272,14 +272,14 @@ impl<I: Interface> Access<'_, I> {
         self.wm(R_ADCMOD | off, B_ADCMOD_LP, lp)
     }
     /// `rtw8852c_txck_force(path, true, ck)`.
-    fn c_txck_force(&mut self, path: u8, ck: u32) -> Result<(), Error> {
+    pub(super) fn c_txck_force(&mut self, path: u8, ck: u32) -> Result<(), Error> {
         let address = R_P0_RXCK | (u32::from(path) << 13);
         self.wm(address, B_P0_TXCK_ON, 0)?;
         self.wm(address, B_P0_TXCK_VAL, ck)?;
         self.wm(address, B_P0_TXCK_ON, 1)
     }
     /// `rtw8852c_disable_rxagc`.
-    fn c_rxagc(&mut self, path: u8, enable: u32) -> Result<(), Error> {
+    pub(super) fn c_rxagc(&mut self, path: u8, enable: u32) -> Result<(), Error> {
         let address = if path == 0 {
             R_P0_AGC_CTL
         } else {

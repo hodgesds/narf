@@ -309,7 +309,7 @@ impl<I: Interface> Access<'_, I> {
         self.wr(path, RR_DCK, RR_DCK_LV, 0).await
     }
     /// `_set_rx_dck`.
-    async fn c_set_rx_dck(&mut self, path: u8) -> Result<(), Error> {
+    pub(super) async fn c_set_rx_dck(&mut self, path: u8) -> Result<(), Error> {
         self.wr(path, RR_DCK1, RR_DCK1_CLR, 0).await?;
         self.c_rx_dck_toggle(path).await?;
         if self.rr(path, RR_DCKC, RR_DCKC_CHK).await? == 0 {
@@ -377,7 +377,7 @@ impl<I: Interface> Access<'_, I> {
     /// `_rx_dck(PHY_0, is_afe, retry_limit = 1)`: with one try the
     /// `rek_cnt == retry_limit - 1` branch always runs `_rx_dck_recover`
     /// and `_rx_dck_rek_check` is never reached. `dbcc_en` = 0 for LO_SEL.
-    async fn c_rx_dck(&mut self, tssi_mode: [bool; 2]) -> Result<(), Error> {
+    pub(super) async fn c_rx_dck(&mut self, tssi_mode: [bool; 2]) -> Result<(), Error> {
         for path in 0..2u8 {
             let saved = self.rr(path, RR_RSV1, RFREG_MASK).await?;
             let trk = R_P0_TSSI_TRK + (u32::from(path) << 13);

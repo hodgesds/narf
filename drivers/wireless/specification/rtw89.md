@@ -2954,12 +2954,38 @@ notification; the `Kind::Tssi` bracket is the I/O-free RFK exclusivity
 used by B. Unexecuted case:
 `smoke_rtw89_c_tssi_channel_follows_rtw8852c_tables_and_de`.
 
+**Channel DPK (`rfk::c_dpk`).** `Dpk::run(profile, cut, tssi_mode)` is
+`rtw8852c_dpk(PHY_0)` with the `rtw8852c_dpk_init` state (enabled, reload
+off, so `cur_idx` = 0): `BTC_WRFKT_DPK` START, TX pause, `_wait_rx_mode`,
+`_dpk_bypass_check` (CHIP_CAV outside 2.4GHz; RTL8852C has no external-PA
+FEM flags) -> `_dpk_force_bypass`, else `_dpk_cal_select`: KIP (`kip_reg`)
+and RF backup, TSSI pause when `is_tssi_mode`, per path RX AGC off, BBDC,
+`_dpk_bb_afe_setting`, `_dpk_main` (`_dpk_rf_setting`, `_set_rx_dck`, KIP
+power/clock on, `_dpk_kip_preset_8852c` with DPD_SEL 0x01 on CAV else
+0x0c, TX power force, 15 dBm, `_dpk_tpg_sel`, the `_dpk_agc` state machine
+with `_dpk_sync_check` thresholds 200/200/170, dgain resync, 2.4GHz RXIQC
+bypass or `_dpk_lbk_rxiqk`, gain loss + `_dpk_pas_read`, 7..24 dBm steps,
+RXBB adjust; `_dpk_idl_mpa` with the MDPD order tables and the 5x overflow
+re-K; `_dpk_para_query`; `_dpk_on` with `_dpk_order_convert` and
+`_dpk_gain_normalize_8852c(false)`) and `_dpk_onoff`, then per path KIP
+restore one-shot, backup reload, AFE restore, RX AGC on, TSSI resume, KIP
+power/clock off, and the RX DCK when path A `RR_DCKC_CHK` is set. Sync
+failure ("need Check") leaves that path's MDPD off as Linux does. Linux
+only logs a 20ms one-shot timeout and indexes `dpk_par_regs` with an
+unchecked `cur_k_set - 1`; NARF fails both closed. Unexecuted case:
+`smoke_rtw89_c_dpk_channel_follows_rtw8852c_agc_and_bypass`.
+
+These three owners and `rfk::c::Access::c_rx_dck` are the pieces of
+rtw8852c.c `rtw8852c_rfk_channel` (RX DCK, IQK, TSSI, DPK); the composed
+caller with `rtw89_btc_ntfy_conn_rfk`, the 30ms BT preserve and
+`rtw89_fw_h2c_rf_ntfy_mcc` is not wired yet.
+
 Remaining for the `rtl8852c` row (no row credit): the rest of
 `rtw8852c_set_channel_bb` (CCK/CCA enables, spur
 elimination, BTG BT RX, 5M mask, 160MHz P80 RU, CDD EVM, TXPW RSTB, MUIC,
 `rtw8852c_ctrl_tx_path_tmac`, `bb_reset_all`), `rtw8852c_set_channel_rf`
-(`_ctrl_ch`/`_ctrl_bw`/`_rxbb_bw`), C channel RFK
-(`rtw8852c_rfk_channel`: IQK/DPK/TSSI from rtw8852c_rfk.c), C power-table
+(`_ctrl_ch`/`_ctrl_bw`/`_rxbb_bw`), the composed C channel RFK caller
+(its IQK/TSSI/DPK owners exist, see above), C power-table
 composition (`rtw8852c_set_txpwr*`, firmware TXPWR_* elements incl. DA
 limits), C coexistence init, the C `power::Calibration`/qualification
 records (N52x are B-bound), `command_native`/`startup_station` admission
