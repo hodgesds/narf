@@ -38,7 +38,7 @@ impl scheduler_mailbox::Interface for Port<'_> {
         let authority = self.0.authority;
         crate::rtw88::pci_park::invoke(&authority, || {
             if self.0.state != State::Active
-                || self.0.chip != ChipId::Rtl8852B
+                || !matches!(self.0.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
                 || !self.0.phycap_attempted
                 || self.0.phycap.is_some()
                 || self.0.radio_started
@@ -87,8 +87,12 @@ impl Native {
             .phycap(&mut Port(&mut *attempt.native))
             .await?;
         receipt.initial_profile()?;
+        // The receipt must come from this chip's own register block.
+        if receipt.is_c() != (attempt.native.chip == ChipId::Rtl8852C) {
+            return Err(power::Error::Access);
+        }
         attempt.native.phycap = Some(receipt);
-        attempt.native.phy_profile_current()?;
+        attempt.native.radio_profile_current()?;
         attempt.committed = true;
         Ok(())
     }

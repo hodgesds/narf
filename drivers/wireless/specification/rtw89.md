@@ -3083,17 +3083,32 @@ signed current envelope (current calibration record, coexistence ready, then
 `rfk::Interface::admit`), checked before the first write; no C record format
 or C coexistence owner exists, so an actual RTL8852C stays unadmitted and no
 ordinary grant is installed. No Startup caller invokes it; the C native
-lifecycle is also refused upstream (`prepare_mac`, `prepare_receive` and the
-firmware PHY-cap fetch are B-only). Unexecuted cases:
+lifecycle is also refused upstream (`prepare_mac` and `prepare_receive` are
+B-only). Unexecuted cases:
 `smoke_rtw89_c_dm_init_txrx_path_and_power_trim_follow_rtw8852c`,
 `smoke_rtw89_c_radio_owner_starts_new`.
+
+**C firmware PHY-cap (`scheduler_mailbox` V1 block).** The register
+mailbox is chip-selected at `Native::from_cold`
+(`Mailbox::for_chip`): RTL8852C uses rtw8852c.c `rtw8852c_h2c_regs`/
+`rtw8852c_c2h_regs` (`R_AX_H2CREG_DATA0..3_V1` 0x7140.., `R_AX_C2HREG_DATA0..3_V1`
+0x7150..) with `R_AX_H2CREG_CTRL_V1` 0x7160 / `R_AX_C2HREG_CTRL_V1` 0x7164 and
+the shared `R_AX_UDM1 + 1` H2C/C2H counters; B keeps the 0x8140 block. The
+same AX GET_FEATURE part0 exchange (mac.c `rtw89_mac_setup_phycap_part0`)
+decodes identically (C `chip->tx_nss`/`rx_nss` = 2, `rf_path_num` = 2) into a
+C-bound `firmware_phycap::Receipt` (`is_c`, distinct fingerprint label);
+`query_firmware_phycap` admits B or C, refuses a receipt from the other
+chip's block and checks `radio_profile_current` (C requires a C receipt).
+The firmware scheduler H2C (`hw_sch_tx_en_h2c`) uses the same block. Like
+B, the fetch is admitted only after RX polling (`radio_access`), so on C it
+is reachable only once the C `prepare_receive` exists. Unexecuted case:
+`smoke_rtw8852c_phycap_uses_v1_register_block_and_binds_c_receipt`.
 
 Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
 C `power::Calibration`/qualification records (N52x are B-bound), a
 Startup caller of `Native::prepare_radio_c` (which exists, unadmitted), the
-C native MAC/RX/firmware-PHY-cap lifecycle (`prepare_mac`,
-`prepare_receive`, `command_native/phycap.rs` are B-only; C uses the V1
-C2H register block), the C phy.c DM sub-inits, `command_native`/
+C native MAC/RX lifecycle (`prepare_mac`, `prepare_receive` are B-only),
+the C phy.c DM sub-inits, `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:

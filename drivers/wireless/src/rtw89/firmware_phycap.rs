@@ -13,9 +13,17 @@ pub(super) struct Receipt {
     tx_paths: u8,
     rx_paths: u8,
     tx_diversity: bool,
+    /// Earned through the RTL8852C V1 register block (0x7140..0x7164).
+    c: bool,
 }
 impl Receipt {
     pub(in crate::rtw89) fn decode(words: [u32; 4]) -> Result<Self, Error> {
+        Self::decode_for(false, words)
+    }
+    /// mac.c `rtw89_mac_setup_phycap_part0` is chip-independent for AX; the
+    /// RTL8852C `chip->tx_nss`/`rx_nss` (2) and `rf_path_num` (2) equal B's,
+    /// so the decode is shared. `c` only binds the receipt to the V1 block.
+    pub(in crate::rtw89) fn decode_for(c: bool, words: [u32; 4]) -> Result<Self, Error> {
         if words[0] & 0x7f != 3 || (words[0] >> 8) & 15 != 4 || words == [u32::MAX; 4] {
             return Err(Error::Access);
         }
@@ -35,7 +43,11 @@ impl Receipt {
             tx_paths: if tx_ant == 1 || tx_diversity { 2 } else { 3 },
             rx_paths: if rx_ant == 1 { 2 } else { 3 },
             tx_diversity,
+            c,
         })
+    }
+    pub(super) fn is_c(&self) -> bool {
+        self.c
     }
     pub(super) fn words(&self) -> [u32; 4] {
         self.words
@@ -76,7 +88,11 @@ impl Receipt {
     }
     pub(super) fn fingerprint(&self) -> [u8; 32] {
         let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF RTL8852B firmware GET_FEATURE part0 2T2R TXA RXAB v1");
+        hash.update(if self.c {
+            b"NARF RTL8852C firmware GET_FEATURE part0 2T2R TXA RXAB v1"
+        } else {
+            b"NARF RTL8852B firmware GET_FEATURE part0 2T2R TXA RXAB v1"
+        });
         // Counter/ACK nibbles describe the transaction rather than RF facts.
         for (index, value) in self.words.iter().enumerate() {
             hash.update(&(if index == 0 { value & !0xf080 } else { *value }).to_le_bytes());

@@ -282,7 +282,7 @@ impl Native {
             coex_ready: false,
             nctl_ready: false,
             calibrating: None,
-            scheduler: Some(super::scheduler_mailbox::Mailbox::default()),
+            scheduler: Some(super::scheduler_mailbox::Mailbox::for_chip(chip)),
             phycap: None,
             phycap_attempted: false,
             dma_idle: None,

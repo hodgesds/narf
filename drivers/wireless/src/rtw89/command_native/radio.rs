@@ -902,10 +902,12 @@ impl Native {
             {
                 return Err(power::Error::Terminal);
             }
-            self.phycap
-                .as_ref()
-                .ok_or(power::Error::Unsupported)?
-                .initial_profile()
+            let phycap = self.phycap.as_ref().ok_or(power::Error::Unsupported)?;
+            // Only a receipt earned through the V1 (0x7140) block binds C.
+            if !phycap.is_c() {
+                return Err(power::Error::Access);
+            }
+            phycap.initial_profile()
         })
         .map_err(|_| power::Error::Access)?
     }
