@@ -2,7 +2,7 @@
 //!
 //! RTL8723BU: 802.11n 1x1 USB + Bluetooth combo (single 2.4 GHz antenna).
 //! USB IDs: `0x0BDA:0xB720` (native), `0x7392:0xA611` (rebranded).
-//! Firmware: `rtlwifi/rtl8723bufw.bin`.
+//! Firmware: `rtlwifi/rtl8723bu_nic.bin`.
 //!
 //! ## Per-chip integration
 //!
@@ -35,7 +35,7 @@ use super::usb::UsbControlSetup;
 pub const CHIP_NAME: &str = "RTL8723BU";
 
 /// Firmware blob path.
-pub const FIRMWARE_NAME: &str = "rtlwifi/rtl8723bufw.bin";
+pub const FIRMWARE_NAME: &str = "rtlwifi/rtl8723bu_nic.bin";
 
 /// TX total pages. `TX_TOTAL_PAGE_NUM_8723B = 0xF7`.
 pub const TX_TOTAL_PAGES: u8 = TX_TOTAL_PAGE_NUM_8723B;

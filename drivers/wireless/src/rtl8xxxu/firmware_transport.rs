@@ -28,6 +28,7 @@ const CONTROL_CHUNK: usize = 196; // rtl8188eu_fops.writeN_block_size
 fn control_chunk(chip: ChipFamily) -> usize {
     match chip {
         ChipFamily::Rtl8192eu => super::rtl8192e::WRITEN_BLOCK_SIZE,
+        ChipFamily::Rtl8723bu => super::rtl8723b_init::WRITEN_BLOCK_SIZE,
         _ => CONTROL_CHUNK,
     }
 }
@@ -37,6 +38,7 @@ fn firmware_signature(chip: ChipFamily) -> Option<u16> {
     match chip {
         ChipFamily::Rtl8188eu => Some(0x88e0),
         ChipFamily::Rtl8192eu => Some(0x92e0),
+        ChipFamily::Rtl8723bu => Some(super::rtl8723b_init::FIRMWARE_SIGNATURE),
         _ => None,
     }
 }
@@ -222,6 +224,9 @@ pub struct Owner<I: ControlIo> {
     factory_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::Factory>>,
     queues_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
     radio_8192e: IrqSafeSpinLock<Option<Radio8192e>>,
+    // RTL8723BU factory/queue facts (`rtl8723b_init`).
+    factory_8723b: IrqSafeSpinLock<Option<super::rtl8723b_init::Factory>>,
+    queues_8723b: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
     h2c_next: AtomicU8,
     h2c_busy: AtomicBool,
 }
@@ -330,6 +335,8 @@ impl<I: ControlIo> Owner<I> {
             factory_8192e: IrqSafeSpinLock::new(None),
             queues_8192e: IrqSafeSpinLock::new(None),
             radio_8192e: IrqSafeSpinLock::new(None),
+            factory_8723b: IrqSafeSpinLock::new(None),
+            queues_8723b: IrqSafeSpinLock::new(None),
             h2c_next: AtomicU8::new(0),
             h2c_busy: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
@@ -480,13 +487,23 @@ impl<I: ControlIo> Owner<I> {
         *self.queues_8192e.lock()
     }
 
+    /// RTL8723BU identity/EFUSE facts once `FactoryReady` was reached.
+    pub fn factory_8723b(&self) -> Option<super::rtl8723b_init::Factory> {
+        *self.factory_8723b.lock()
+    }
+
+    /// RTL8723BU TX queue to bulk-OUT endpoint map installed before firmware.
+    pub fn queues_8723b(&self) -> Option<super::rtl8192e_init::QueueMap> {
+        *self.queues_8723b.lock()
+    }
+
     pub fn chip(&self) -> ChipFamily {
         self.chip
     }
 
     /// Exclusive gen2 H2C mailbox claim; a concurrent command is refused.
     pub(super) fn h2c_claim(&self) -> Result<super::rtl8192e_init::H2cClaim<'_>, Error> {
-        if self.chip != ChipFamily::Rtl8192eu {
+        if !matches!(self.chip, ChipFamily::Rtl8192eu | ChipFamily::Rtl8723bu) {
             return Err(Error::UnsupportedChip);
         }
         self.h2c_busy
@@ -612,6 +629,9 @@ impl<I: ControlIo> Owner<I> {
             if self.chip == ChipFamily::Rtl8192eu {
                 return self.run_device_8192e(payload, endpoints, info).await;
             }
+            if self.chip == ChipFamily::Rtl8723bu {
+                return self.run_device_8723b(payload, endpoints, info).await;
+            }
             let factory = super::device_init::factory(self).await?;
             if expected.is_some_and(|old| old != (factory, endpoints)) {
                 return Err(Error::BadEfuse);
@@ -672,6 +692,28 @@ impl<I: ControlIo> Owner<I> {
         let post = super::rtl8192e_radio::post_calibration(self).await?;
         *self.radio_8192e.lock() = Some(Radio8192e { iqk, post });
         self.stage(Stage::RadioReady);
+        Ok(info)
+    }
+
+    /// RTL8723BU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
+    /// through power-on, reserved pages/queue priority/RX boundary, firmware
+    /// download/start and the `init_reg_hmtfr` H2C init. The owner stops at
+    /// FirmwareReady: the 8723B table/radio stages are not implemented yet.
+    async fn run_device_8723b(
+        &self,
+        payload: &[u8],
+        endpoints: super::device_init::Endpoints,
+        info: FirmwareInfo,
+    ) -> Result<FirmwareInfo, Error> {
+        let factory = super::rtl8723b_init::factory(self, endpoints).await?;
+        *self.endpoints.lock() = Some(endpoints);
+        *self.factory_8723b.lock() = Some(factory);
+        self.stage(Stage::FactoryReady);
+        self.power_on().await?;
+        let queues = super::rtl8723b_init::pre_firmware(self, factory).await?;
+        *self.queues_8723b.lock() = Some(queues);
+        self.stage(Stage::Powered);
+        self.download(payload).await?;
         Ok(info)
     }
 
@@ -770,6 +812,9 @@ impl<I: ControlIo> Owner<I> {
         if self.chip == ChipFamily::Rtl8192eu {
             return super::rtl8192e_init::power_on(self).await;
         }
+        if self.chip == ChipFamily::Rtl8723bu {
+            return super::rtl8723b_init::power_on(self).await;
+        }
         let value = self.read16(REG_APS_FSMCO).await?;
         self.write16(REG_APS_FSMCO, value & !((1 << 11) | (1 << 12)))
             .await?;
@@ -813,6 +858,9 @@ impl<I: ControlIo> Owner<I> {
     async fn reset_8051(&self) -> Result<(), Error> {
         if self.chip == ChipFamily::Rtl8192eu {
             return super::rtl8192e_init::reset_8051(self).await;
+        }
+        if self.chip == ChipFamily::Rtl8723bu {
+            return super::rtl8723b_init::reset_8051(self).await;
         }
         let value = self.read16(REG_SYS_FUNC).await?;
         self.write16(REG_SYS_FUNC, value & !SYS_FUNC_CPU_ENABLE)
@@ -876,7 +924,12 @@ impl<I: ControlIo> Owner<I> {
             100,
             Error::StartTimeout,
         )
-        .await
+        .await?;
+        // `rtl8xxxu_start_firmware`: `init_reg_hmtfr` (RTL8723BU only here).
+        if self.chip == ChipFamily::Rtl8723bu {
+            self.write8(REG_HMTFR, 0x0f).await?;
+        }
+        Ok(())
     }
 }
 

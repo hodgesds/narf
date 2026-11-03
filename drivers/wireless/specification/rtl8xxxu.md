@@ -1301,6 +1301,57 @@ from a station owner; station PS over `submit_null_8192e`; and
 `restart_parked` (power-off then a fresh owner lifecycle) for RTL8192EU.
 No RTL8192EU netdev is published.
 
+### RTL8723BU native owner (in progress)
+
+RTL8723BU (1T1R WiFi + Bluetooth combo, `8723b.c`) is the third native
+rtl8xxxu chip. It reuses the retained one-shot `firmware_transport::Owner`
+and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
+`rtl8xxxu_init_queue_priority`, PG-header EFUSE decode, gen2 H2C mailbox);
+8723B-specific steps live in `rtl8xxxu/rtl8723b_init.rs`.
+
+- Image: `rtlwifi/rtl8723bu_nic.bin` (`rtl8723bu_load_firmware`; Linux
+  selects no other variant), signature family `0x5300`; an 88E-signed image
+  is rejected before any USB access. Shared download with
+  `writeN_block_size = 1024`, `rtl8723bu_reset_8051` (RSV_CTRL bit 1 /
+  bit 8 bracket around the CPU-enable toggle), then the `init_reg_hmtfr`
+  write `REG_HMTFR = 0x0f` after firmware start. No download retry.
+- Identity (`rtl8723bu_identify_chip`): `REG_SYS_CFG` cut/vendor (test
+  silicon refused), `REG_MULTI_FUNC_CTRL` WiFi/BT/GPS function bits
+  (`is_multi_func`), `REG_GPIO_OUTSTS` ROM rev, TX queues from
+  `REG_NORMAL_SIE_EP_TX` or the bulk-OUT count (a SIE set larger than the
+  descriptor's bulk-OUT endpoints is `BadEndpoints`).
+- EFUSE: the multi-function `rtl8xxxu_read_efuse` selects the WiFi cell
+  (`REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SELECT`) before the shared PG decode
+  (Linux does it after its discarded `REG_9346CR` read; order otherwise
+  identical). `rtl8723bu_parse_efuse`: `0x8129` ID, MAC at `0x107`, path
+  A/B CCK and HT40 bases, `ofdm_diff[0]`/`ht20_diff[0]` from the low/high
+  nibble of `ht20_ofdm_1s_diff`, `ht40_diff[0] = 0`, indices 1..3 from
+  `pwr_diff[]` (signed 4-bit), crystal cap `xtal_k & 0x3f`, plus the raw
+  thermal/IQK-LCK/PA/LNA/board/BT/antenna/RFE/package bytes. Retained as
+  `Owner::factory_8723b()`.
+- Power (`rtl8723bu_power_on`): `rtl8xxxu_disabled_to_emu`,
+  `rtl8723b_emu_to_active` (checked polls; Linux's 8-bit read / 32-bit
+  write of `REG_APS_FSMCO` when clearing SW LPS is kept verbatim), CR with
+  MAC TX/RX + CALTIMER, then the BT-coexistence power-on settings
+  (`PAD_CTRL1+3 = 0x20`, BB resets, `BT_CONTROL+1 = 0x18`,
+  `WLAN_ACT_CONTROL = 0x04`, `S0S1_PATH_SWITCH = 0`, antenna inverse
+  `0xfe08 = 1`, RFE pad enable, `LEDCFG0` DPDT select, `PAD_CTRL1[0]`
+  clear). `rtl8723bu_active_to_emu` is implemented for the power-off path.
+- Pre-firmware (`needs_full_init`, always cold): reserved pages with the
+  8723B budget (HI 0x0c, LO 2, NORM 2 of 0xf7), queue priority (retained
+  as `Owner::queues_8723b()`), `TRXFF_BNDY+2 = 0x3f7f`.
+
+The owner currently stops at `FirmwareReady`; MAC/BB/RF tables, antenna
+selection, calibration, packet codec, RA, BT coexistence, signed records
+and the station are not implemented, and the production probe does not
+start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
+`rtl8723bu_fops` rows (0bda:b720, 7392:a611).
+
+Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
+(`drivers/wireless/rtl8xxxu/8723bu`): identity/EFUSE/page budget,
+power + firmware lifecycle against a register model, no-SIE fallback and
+test-silicon refusal.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -1346,7 +1397,8 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 |---|---|
 | RTL8188EU power + EP0 firmware lifecycle | Implemented; shared-path regressions |
 | RTL8192EU runtime initialization | Identity/EFUSE/power/firmware/H2C and MAC/BB/RF tables + TX power implemented; post-table MAC, gen2 channel/bandwidth, IQK/LCK, TX/RX, RA, signed records and station missing |
-| RTL8723BU / RTL8821CU / RTL8822BU runtime initialization | Missing |
+| RTL8723BU runtime initialization | Identity/EFUSE/power/firmware/HMTFR implemented; tables, antenna, calibration, TX/RX, RA, BT coexistence, signed records and station missing |
+| RTL8821CU / RTL8822BU runtime initialization | Bound by rtw88 (see rtw88.md) |
 | EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented with retained RX filter/MAC activation |
 | MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |

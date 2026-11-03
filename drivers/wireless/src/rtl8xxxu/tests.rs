@@ -251,7 +251,7 @@ fn smoke_rtl8xxxu_firmware_name_resolution() -> TestResult {
     let cases: &[(ChipFamily, Option<&str>)] = &[
         (ChipFamily::Rtl8188eu, Some("rtlwifi/rtl8188eufw.bin")),
         (ChipFamily::Rtl8192eu, Some("rtlwifi/rtl8192eu_nic.bin")),
-        (ChipFamily::Rtl8723bu, Some("rtlwifi/rtl8723bufw.bin")),
+        (ChipFamily::Rtl8723bu, Some("rtlwifi/rtl8723bu_nic.bin")),
         (ChipFamily::Rtl8821cu, Some("rtlwifi/rtl8821cufw.bin")),
         (ChipFamily::Rtl8822bu, Some("rtlwifi/rtl8822bufw.bin")),
         (ChipFamily::Unknown, None),
@@ -271,7 +271,7 @@ fn smoke_rtl8xxxu_firmware_name_resolution() -> TestResult {
     if super::rtl8192e::FIRMWARE_NAME != "rtlwifi/rtl8192eu_nic.bin" {
         return TestResult::Fail("rtl8192e FIRMWARE_NAME mismatch");
     }
-    if super::rtl8723b::FIRMWARE_NAME != "rtlwifi/rtl8723bufw.bin" {
+    if super::rtl8723b::FIRMWARE_NAME != "rtlwifi/rtl8723bu_nic.bin" {
         return TestResult::Fail("rtl8723b FIRMWARE_NAME mismatch");
     }
     if super::rtl8821c::FIRMWARE_NAME != "rtlwifi/rtl8821cufw.bin" {

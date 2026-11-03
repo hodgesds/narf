@@ -185,7 +185,7 @@ impl ChipFamily {
         match self {
             ChipFamily::Rtl8188eu => Some("rtlwifi/rtl8188eufw.bin"),
             ChipFamily::Rtl8192eu => Some("rtlwifi/rtl8192eu_nic.bin"),
-            ChipFamily::Rtl8723bu => Some("rtlwifi/rtl8723bufw.bin"),
+            ChipFamily::Rtl8723bu => Some("rtlwifi/rtl8723bu_nic.bin"),
             ChipFamily::Rtl8821cu => Some("rtlwifi/rtl8821cufw.bin"),
             ChipFamily::Rtl8822bu => Some("rtlwifi/rtl8822bufw.bin"),
             ChipFamily::Unknown => None,
