@@ -20,7 +20,6 @@ rtl8xxxu	rtl8822bu	RTL8822BU retained runtime using its actual upstream transpor
 rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes	feature	drivers/wireless/specification/rtlwifi.md	1586
 rtlwifi	rtl8192ce_family	RTL8192CE retained runtime including exact RTL8188CE RF variant; blocked on porting the rtl8192ce/rtl8192c-common chip runtime (power, firmware, tables, RF-type qualification incl. 8188CE) plus signed per-board envelopes	chip	drivers/wireless/specification/rtlwifi.md	1476
 rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rtl8192de dual-MAC per-function runtime (shared MAC/PHY ownership, dual-band tables) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1477
-rtlwifi	rtl8192ee	RTL8192EE retained runtime; blocked on porting the rtl8192ee runtime (new TRX flow buffer descriptors, 2T2R tables/IQK, C2H packets) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1476
 rtlwifi	rtl8723ae	RTL8723AE retained runtime; blocked on porting the rtl8723ae runtime (firmware event mailbox, BT coexistence) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
 rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be runtime (C2H packets, BT coexistence, antenna path) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
 rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2196
