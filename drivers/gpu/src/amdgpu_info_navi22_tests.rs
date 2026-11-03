@@ -322,7 +322,8 @@ fn navi22_hw_ip_and_submission_switch() -> TestResult {
         && info(w, uapi::AMDGPU_HW_IP_VCN_DEC).available_rings == 0
         && count(w, uapi::AMDGPU_HW_IP_GFX) == 1
         && count(w, uapi::AMDGPU_HW_IP_DMA) == 2
-        && d.ids_flags == u64::from(uapi::AMDGPU_IDS_FLAGS_GANG_SUBMIT);
+        // Single-ring acceleration remains available without gang support.
+        && d.ids_flags & u64::from(uapi::AMDGPU_IDS_FLAGS_GANG_SUBMIT) == 0;
     // Wired but the ring/IB tests failed: still closed.
     let failed = snap(booted(false));
     if !closed || !open || accel(w, &failed) != 0 {

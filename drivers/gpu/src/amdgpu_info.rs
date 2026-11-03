@@ -197,6 +197,19 @@ pub fn rdna2_vram(vbios: &[u8], module: u8) -> Option<(u32, u32)> {
 pub(crate) fn publish_navi22_topology(topology: crate::amdgpu_gfx10_topology::Topology) {
     NAVI22.lock().topology = Some(topology);
 }
+/// `adev->gfx.config.gb_addr_config` as `ReadTopology` sampled it with GFX
+/// powered. Display consumes this cached value (amdgpu_dm_plane.c), never
+/// the live GC register, which reads garbage while GC is in GFXOFF.
+pub(crate) fn navi22_gb_addr_config() -> Option<u32> {
+    NAVI22.lock().topology.as_ref().map(|t| t.gb_addr_config)
+}
+/// Replace the published topology, returning the previous one to restore.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __set_navi22_topology_for_test(
+    topology: Option<crate::amdgpu_gfx10_topology::Topology>,
+) -> Option<crate::amdgpu_gfx10_topology::Topology> {
+    core::mem::replace(&mut NAVI22.lock().topology, topology)
+}
 /// PCI config revision, read by the platform owner before the cold boot.
 pub(crate) fn publish_navi22_pci_revision(revision: u8) {
     NAVI22.lock().pci_revision = Some(revision);

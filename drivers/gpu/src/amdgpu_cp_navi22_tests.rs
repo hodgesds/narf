@@ -77,6 +77,8 @@ pub(crate) struct Mapped {
 pub(crate) struct Model {
     pub regs: BTreeMap<u64, u32>,
     pub writes: Vec<(u64, u32)>,
+    /// Every register read, in order (BAR5 byte offsets).
+    pub reads: Vec<u64>,
     pub mem: BTreeMap<u64, u32>,
     pub doorbells: Vec<(u32, u64)>,
     dirty: bool,
@@ -130,6 +132,7 @@ impl Model {
         Self {
             regs,
             writes: Vec::new(),
+            reads: Vec::new(),
             mem: BTreeMap::new(),
             doorbells: Vec::new(),
             dirty: false,
@@ -179,6 +182,15 @@ impl Model {
     fn engine_wreg(&mut self, dword: u32, value: u32) {
         let address = u64::from(dword) * 4;
         self.regs.insert(address, value);
+        if address == NBIO + 0x106 * 4 {
+            // NBIO2.3's request/done handshake, independent of VM ACKs.
+            assert!(matches!(value, 1 | 4 | 0x400 | 0x800));
+            self.regs.insert(NBIO + 0x107 * 4, value);
+        }
+        if address == HDP + 0xd1 * 4 {
+            assert_eq!(value, 1);
+            self.stale = false;
+        }
         if (INV_REQ..INV_REQ + 18 * 4).contains(&address) {
             let eng = ((address - INV_REQ) / 4) as u32;
             assert_eq!(value & 0xf8_0000, 0xf8_0000, "legacy L1/L2 invalidation");
@@ -314,7 +326,7 @@ impl Model {
                             assert_eq!(
                                 self.reg(u64::from(body[2]) * 4) & body[4],
                                 body[4],
-                                "no invalidate ack"
+                                "no register write-wait acknowledgement"
                             );
                         }
                         _ => panic!("unexpected WAIT_REG_MEM form"),
@@ -322,6 +334,12 @@ impl Model {
                 }
                 0x42 => assert_eq!(engine, 0, "PFP_SYNC_ME on a compute queue"),
                 0x90 => assert_eq!(engine, 0, "FRAME_CONTROL on a compute queue"),
+                0x8b => {
+                    // gfx_v10_0_ring_emit_sb: one zero body dword, kernel ring.
+                    assert_eq!(engine, 0, "SWITCH_BUFFER on a compute queue");
+                    assert!(!ib, "SWITCH_BUFFER inside a client IB");
+                    assert_eq!((n, body[0]), (0, 0), "SWITCH_BUFFER form");
+                }
                 0x49 => {
                     assert_eq!(n, 6);
                     assert_eq!(body[0], 0x0660_3514);
@@ -473,13 +491,25 @@ impl Model {
                 }
                 8 => {
                     assert_eq!((h >> 28) & 7, 3, "POLL_REGMEM equal");
-                    assert!(h & (1 << 31) != 0, "register POLL_REGMEM unexpected");
-                    let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
-                    assert_eq!(
-                        self.word(address) & words[i + 4],
-                        words[i + 3],
-                        "pipeline sync would hang"
-                    );
+                    if h & (1 << 26) != 0 {
+                        assert!(instance < 2);
+                        assert_eq!(h, 0x3400_0008);
+                        assert_eq!(u64::from(words[i + 1]), NBIO + 0x107 * 4);
+                        assert_eq!(u64::from(words[i + 2]), NBIO + 0x106 * 4);
+                        assert_eq!(words[i + 3], 0x400 << instance);
+                        assert_eq!(words[i + 4], words[i + 3]);
+                        assert_eq!(words[i + 5], 0x0fff_000a);
+                        self.engine_wreg(words[i + 2] / 4, words[i + 3]);
+                        assert_eq!(self.reg(u64::from(words[i + 1])), words[i + 3]);
+                    } else {
+                        assert!(h & (1 << 31) != 0, "register POLL_REGMEM unexpected");
+                        let address = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
+                        assert_eq!(
+                            self.word(address) & words[i + 4],
+                            words[i + 3],
+                            "pipeline sync would hang"
+                        );
+                    }
                     6
                 }
                 17 => {
@@ -638,6 +668,7 @@ impl Io for Model {
         Some(16)
     }
     fn read(&mut self, address: u64) -> u32 {
+        self.reads.push(address);
         let address = self.key(self.cam_target(address));
         *self.regs.get(&address).unwrap_or(&0)
     }
@@ -789,6 +820,30 @@ fn cp_navi22_layout_uses_discovery_banks_and_rejects_aliases() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/cp-navi22",
     cp_navi22_layout_uses_discovery_banks_and_rejects_aliases
+);
+
+/// The TDR sampler holds no GFXOFF reference (Linux's fence timeout takes
+/// none): a progress sample may touch only HDP, outside GC, and memory.
+fn cp_navi22_progress_sample_touches_no_gc_register() -> TestResult {
+    let (_pool, mut e) = gfx(enabled());
+    let (reads, writes) = (e.hw.io.reads.len(), e.hw.io.writes.len());
+    if progress(&mut e.hw, &e.queue).is_err() {
+        return TestResult::Fail("progress sample failed");
+    }
+    let invalidate = HDP + 0xd1 * 4;
+    if e.hw.io.reads[reads..].iter().any(|&a| a != invalidate)
+        || e.hw.io.writes[writes..]
+            .iter()
+            .any(|&(a, v)| (a, v) != (invalidate, 1))
+        || e.hw.io.writes.len() == writes
+    {
+        return TestResult::Fail("progress sample touched a register other than HDP invalidate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-navi22",
+    cp_navi22_progress_sample_touches_no_gc_register
 );
 
 fn cp_navi22_gfx_configure_programs_golden_cam_and_constants() -> TestResult {
@@ -1152,8 +1207,8 @@ fn cp_navi22_fence_interrupts_arm_eop_and_both_sdma_traps() -> TestResult {
         return TestResult::Fail("fence interrupt enable failed");
     }
     let expected = [
-        (r(CP_INT_CNTL_RING0), 0x0400_0001),
-        (r(CP_ME1_PIPE0_INT_CNTL), 0x0400_0000),
+        (r(CP_INT_CNTL_RING0), 0x05c0_0001),
+        (r(CP_ME1_PIPE0_INT_CNTL), 0x0580_0000),
         (sdma(0, SDMA0_CNTL), 0x23),
         (sdma(1, SDMA0_CNTL), 0x23),
     ];

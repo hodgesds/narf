@@ -1322,9 +1322,10 @@ const SDMA_TRAP_ENABLE: u32 = 1; // linux: SDMA0_CNTL__TRAP_ENABLE_MASK@gc
 /// The interrupt sources `amdgpu_fence_driver_hw_init` arms through
 /// `amdgpu_irq_get` for the kernel rings created here:
 /// `gfx_v10_0_set_gfx_eop_interrupt_state` (ME0 pipe 0),
-/// `gfx_v10_0_set_compute_eop_interrupt_state` (MEC1 pipe 0) and
-/// `sdma_v5_2_set_trap_irq_state` (both engines). The KIQ's MEC2 pipe is not
-/// armed, as in Linux; its fences stay polled.
+/// EOP/trap completion plus `gfx_v10_0_late_init`'s CP error interrupts on
+/// the owned GFX/MEC1 pipes. Linux enables privileged-instruction faults on
+/// GFX only; privileged-register and bad-opcode faults cover both.
+/// The KIQ's MEC2 pipe stays polled, as in Linux.
 pub(crate) fn enable_fence_irqs<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     enable_fence_irqs_for(io, l, 2)
 }
@@ -1333,8 +1334,16 @@ pub(crate) fn enable_fence_irqs_for<I: Io>(
     l: Layout,
     count: usize,
 ) -> Result<(), Error> {
-    for reg in [CP_INT_CNTL_RING0, CP_ME1_PIPE0_INT_CNTL] {
-        update(io, l.reg(reg), TIME_STAMP_INT_ENABLE, TIME_STAMP_INT_ENABLE)?;
+    // linux: CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE_MASK@gc101 | CP_INT_CNTL_RING0__OPCODE_ERROR_INT_ENABLE_MASK@gc101
+    const COMMON_FAULTS: u32 = 0x0180_0000;
+    // linux: CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE_MASK@gc101
+    const GFX_INSTRUCTION_FAULT: u32 = 0x0040_0000;
+    for (reg, faults) in [
+        (CP_INT_CNTL_RING0, COMMON_FAULTS | GFX_INSTRUCTION_FAULT),
+        (CP_ME1_PIPE0_INT_CNTL, COMMON_FAULTS),
+    ] {
+        let mask = TIME_STAMP_INT_ENABLE | faults;
+        update(io, l.reg(reg), mask, mask)?;
     }
     // Re-armed after SdmaQueues' soft reset cleared the IH proof's enable.
     for instance in 0..count as u32 {

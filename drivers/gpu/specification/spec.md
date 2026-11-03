@@ -2070,9 +2070,13 @@ report). Unpublished inputs leave the corresponding fields zero.
 harvest cannot erase a successfully read chip identity. Unknown CU/RB/TCC
 harvest data remains zero; no board-specific topology is substituted.
 `amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
-`available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
+`available_rings`, HW_IP_COUNT, the DRM minor (3.64.0 vs
 3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
-unless `Boot::queues_verified`. Media IPs additionally need
+unless `Boot::queues_verified`. `DEV_INFO.ids_flags` never claims
+`AMDGPU_IDS_FLAGS_GANG_SUBMIT`: the native backend runs one scheduler entity
+per ioctl, and `amdgpu_navi22_cs` rejects IBs naming different
+`(ip_type, ip_instance, ring)` tuples (even two logical compute rings that
+share hardware ring 1) before dependency waits or placement. Media IPs additionally need
 `Published::media_rings` (`publish_navi22_media_rings`, from
 `amdgpu_vcn_navi22_cs::register`): VCN_DEC/ENC/JPEG report one ring each
 when their rings passed, HW_IP_COUNT(VCN_DEC/ENC) is `num_vcn_inst` (every
@@ -8802,6 +8806,17 @@ once every queue is verified, then subscribes to `GFX_EOP`, `SDMA0_TRAP` and
 `SDMA1_TRAP` and spawns one forwarder per source that calls
 `amdgpu_fence_navi22::notify` for the decoded engine (`notify_all` on a
 terminal IH error). A subscription failure only logs; fences keep polling.
+The same stage enables `gfx_v10_0_late_init`'s CP error interrupts on the
+owned queues — `PRIV_REG_INT_ENABLE`, `OPCODE_ERROR_INT_ENABLE` and (GFX
+`CP_INT_CNTL_RING0` only) `PRIV_INSTR_INT_ENABLE`, beside the existing
+`TIME_STAMP_INT_ENABLE` on `CP_INT_CNTL_RING0` and `CP_ME1_PIPE0_INT_CNTL`
+— and subscribes to GC sources 183 (`CP_BAD_OPCODE_ERROR`), 184
+(`CP_PRIV_REG_FAULT`) and 185 (`CP_PRIV_INSTR_FAULT`). A fault whose
+ME/pipe/queue names the owned GFX or MEC1 pipe 0 queue 0 marks only that
+queue's jobs guilty (`amdgpu_navi22_cs::hung`); other queues or a
+privileged-instruction fault on compute accuse nothing. Callbacks and the
+watchdog carry the fence generation, so a stale source cannot poison a
+recovered submitter. Fault messages are bounded and failure-only.
 
 GC 10.3.2 runs without MES. `amdgpu_cp_navi22::Doorbells::map_navi22(device)`
 (unsafe, boot-time) maps BAR2's first 4 KiB uncached; kernel doorbells use the
@@ -8906,7 +8921,9 @@ with Linux's default `lockup_timeout` of 2 s for every queue. After a boot whose
 queues all verified, a task samples every 250 ms, under the owner lock,
 `Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
 (`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
-after an HDP invalidate; an all-ones read-back is device loss). The per-engine
+after an HDP invalidate; an all-ones read-back is device loss). The sample
+reads no GC register, so like Linux's fence timeout it takes no GFXOFF
+reference and never wakes an idle GPU. The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
 advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
 emitted seq=…` once and is retained in `tdr::status()`. Detection is always on.
@@ -8928,8 +8945,10 @@ logged. Explicit `recover()` calls are not counted.
 
 `amdgpu_navi22_platform::set_recovery_console_hook(fn(bool))` installs the
 fb owner's pause (`true`) / resume (`false`) of every kernel CPU writer of the
-boot framebuffer. `recover()` pauses through it before the reset, withdraws
-the runtime power controls, and after success resets the requested power
+boot framebuffer. Only after `check` accepts the recovery does backend
+quiesce unregister the client submitter, pause the console through it and
+withdraw the runtime power controls; a refused (`Unsupported`) recovery
+leaves clients, console and controls untouched. After success recovery resets the requested power
 opt-in to none, republishes the controls and resumes the console; a lost
 device keeps the console quarantined. User CPU mappings of VRAM are not
 revoked during a reset, as in Linux (their accesses reach an unresponsive BAR
@@ -8938,8 +8957,10 @@ and the contents are lost).
 `unsafe amdgpu_navi22_platform::recover().await` is
 `amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
 stored outside the future). `check` refuses (`Unsupported`, no side effects) a
-boot that needed GDDR6 training (no short-training replay yet) or lacks a board
-table, PSP or IH. Quiesce stops VCN idle work, TDR, telemetry and thermal, disables the IH ring
+boot that needed GDDR6 training or lacks a board table, PSP or IH: the shared
+`gddr6::Trainer::resume` replay exists (RDNA4 wires it), but RDNA2 recovery
+reconstruction drops the trainer, so retention, replay order and
+cancellation are not yet wired for this ASIC. Quiesce stops VCN idle work, TDR, telemetry and thermal, disables the IH ring
 (every subscriber gets `Disabled`) and calls `amdgpu_fence_navi22::abandon_all`,
 which ends every pending fence wait with its error. Reinitialize consumes the
 owner (`ColdBoot::into_recovery`: same snapshot, authority, pool and prepared
@@ -9186,8 +9207,18 @@ gfx 0, compute 4, SDMA 13/14; PFP_SYNC_ME on gfx) when `flush`, the
 `IH_VMID_<vmid>_LUT` ← PASID write (`gmc_v10_0_emit_pasid_mapping`, at the
 queue layout's OSSSYS base) when `map_pasid` — preceded by a pipeline sync
 when the job flushes or its context differs from the ring's previous job's
-(`RingState`), then CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16 IBs with
-the VMID, then the ring fence. `validate` refuses VMID 0/>15,
+(`RingState`), then (as `amdgpu_ib_schedule`) a ring-ordered HDP flush
+(CP: WAIT_REG_MEM write-wait on NBIO `BIF_BX_PF_GPU_HDP_FLUSH_REQ/DONE`, CP0
+on gfx/PFP, CP2 on compute/ME; SDMA0/1: POLL_REGMEM with HDP_FLUSH; SDMA2/3:
+SRBM write of the remapped `HDP_MEM_FLUSH_CNTL` at 0x7f000), then
+CONTEXT_CONTROL/FRAME_CONTROL on gfx, up to 16 IBs with the VMID,
+FRAME_CONTROL end on gfx, an HDP read-cache invalidate
+(`HDP_READ_CACHE_INVALIDATE` ← 1 by WRITE_DATA / SRBM_WRITE), the ring fence,
+and SWITCH_BUFFER on gfx. These engine commands are in addition to the CPU
+HDP flush before the doorbell and the CPU invalidate before fence reads.
+Kernel SDMA jobs (`submit_kernel`, `KernelOp::{Fill, Copy}` for the RDNA2
+VRAM clear/upload/readback paths) carry the same HDP flush before and
+invalidate after their packets, before the fence. `validate` refuses VMID 0/>15,
 empty or oversized IB lists, unaligned or zero-length IBs. At most two
 submissions are outstanding per ring; a third returns `Busy` without
 touching the ring.

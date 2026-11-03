@@ -582,6 +582,39 @@ native presentation after these corrections, post-idle power behavior,
 media self-tests, and trained-board recovery. No successful desktop or
 complete Linux equivalence is claimed from the VM boot matrix.
 
+### GFX-timeout audit, 2026-11-02
+
+On the 2026-11-01 native boot the first client GFX job (seq 1) completed. Seq 2
+passed its VM-programming writeback and then stalled. It was already pending
+at about 96.35 s, before KWin's first real modeset at 96.45 s. No GPU page
+fault was logged. Every client job ran with the default power saving (GFX/SoC
+clock gating and GFXOFF), which the boot IB tests do not exercise. The audit
+compared NARF with Linux and changed these:
+
+- **Ring frame.** CP and SDMA jobs now carry `amdgpu_ib_schedule`'s HDP flush
+  before the IBs and its HDP read-cache invalidate before the fence. Kernel
+  SDMA fill/copy jobs carry them too. GFX jobs end with SWITCH_BUFFER. This
+  adds to the CPU-side HDP flush and invalidate, which were already present.
+- **Gang submission.** `GANG_SUBMIT` is no longer advertised. A job naming
+  more than one `(ip, instance, ring)` is rejected instead of being merged.
+- **CP faults.** Bad-opcode and privileged-register/-instruction interrupts
+  (sources 183–185) are enabled. A fault marks only the owned queue's jobs
+  guilty.
+- **Recovery.** An `Unsupported` recovery no longer pauses the console,
+  unregisters clients or withdraws the power controls.
+- **GFXOFF wakes.** The hang watchdog no longer takes a GFXOFF reference every
+  250 ms, which had woken an idle GPU about four times a second. It reads only
+  fence memory and HDP, as Linux's fence timeout does.
+- **Runtime modesets.** They now use the boot-time `GB_ADDR_CONFIG` sample
+  rather than reading GC without a GFXOFF reference, matching amdgpu_dm.
+
+Clock-gating and power-gating flags and sequences match `nv.c` and
+`gfx_v10_0.c` for GC 10.3.2. NARF enables less than Linux does at runtime.
+The changes above are not proven to cause the seq-2 stall. The next boot's
+timeout snapshot records CP/GRBM/VM state. Booting once with
+`amdgpu.rdna2_pg=none` separates power saving from the stall without a
+rebuild.
+
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must
 be included in the same production image. Complete software checks and

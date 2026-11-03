@@ -433,15 +433,18 @@ pub(crate) fn display_engines_requested() -> bool {
 /// TDR sample of every verified kernel queue, serialized with the owner.
 pub(crate) async fn queue_progress(
 ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, boot::Error> {
-    // The sample reads CP registers: hold GC powered (no-op without GFXOFF).
-    // A failed power lease is terminal, not temporary owner contention;
-    // the watchdog must abandon waiters instead of retrying forever.
-    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::Invalid)?;
+    // The sample reads only fence writeback memory and HDP_READ_CACHE_INVALIDATE
+    // (`amdgpu_cp_navi22::progress`); HDP is outside GC. Like Linux's fence /
+    // drm_sched timeout path it takes no GFXOFF reference, so an idle GPU is
+    // not cycled through Disallow/AllowGfxOff every PERIOD_MS. The timeout
+    // snapshot, which does read GC, keeps its lease (`gfx_hang_snapshot`).
+    let mut owner = OWNER.lock().await;
     owner.as_mut().ok_or(boot::Error::Invalid)?.queue_progress()
 }
 
-/// Sample only after a graphics timeout, under the same ownership and power
-/// rules as queue progress. The caller prints after both guards drop.
+/// Sample only after a graphics timeout. Unlike queue progress this reads GC
+/// registers, so it holds a GFXOFF reference with the owner. The caller
+/// prints after both guards drop.
 pub(crate) async fn gfx_hang_snapshot(
 ) -> Result<crate::amdgpu_cp_navi22::GfxHangSnapshot, boot::Error> {
     let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::Invalid)?;
@@ -471,6 +474,11 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
         }
     }
     async fn quiesce(&mut self) -> Result<(), boot::Error> {
+        // Recovery::run has accepted this owner. Rejection must leave client
+        // admission, CPU console writers and power controls intact.
+        crate::amdgpu_navi22_cs::unregister();
+        console(true);
+        crate::amdgpu_rdna2_power_controls::withdraw();
         crate::amdgpu_vcn_navi22::idle::stop();
         crate::amdgpu_navi22_tdr::stop();
         crate::amdgpu_navi22_thermal::stop();
@@ -550,12 +558,7 @@ fn console(pause: bool) {
 pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recovery::Error> {
     use crate::amdgpu_navi22_recovery::Error;
     let mut recovery = RECOVERY.try_lock().ok_or(Error::Busy)?;
-    crate::amdgpu_navi22_cs::unregister();
     let device = amdgpu::pci_device().ok_or(Error::Busy)?;
-    // Kernel CPU writers stay off the framebuffer for the whole reset; the
-    // runtime power controls refer to the old owner's PMFW state.
-    console(true);
-    crate::amdgpu_rdna2_power_controls::withdraw();
     let result = {
         let mut owner = OWNER.lock().await;
         let mut backend = Recovering {
@@ -2177,6 +2180,80 @@ pub(crate) async fn gfx_off_control(allow: bool) -> Result<(), boot::Error> {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi22_recovery_preflight_preserves_registered_clients() -> TestResult {
+        use crate::amdgpu_cs::{Submission, Submitter};
+        use alloc::{boxed::Box, sync::Arc};
+        use core::{future::Future, pin::Pin};
+        use narf_filesystem::FsError;
+
+        // This fixture exercises rejection by the real platform entry, never
+        // a reset. It must not run against a physical GPU/retained owner.
+        if amdgpu::pci_device().is_some()
+            || narf_scheduler::block_on_spin(async { OWNER.lock().await.is_some() })
+        {
+            return TestResult::Skip("physical GPU owner present");
+        }
+        struct Client;
+        impl Submitter for Client {
+            fn submit<'a>(
+                &'a self,
+                _: &'a crate::amdgpu_vm::VmState,
+                _: &'a Submission,
+                _: &'a Arc<crate::amdgpu_ctx::Health>,
+            ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>> {
+                Box::pin(async { Err(FsError::NoDevice) })
+            }
+            fn signalled(&self, _: u64) -> bool {
+                false
+            }
+            fn ring_for(&self, _: u32, _: u32, _: u32) -> Option<u32> {
+                None
+            }
+            fn wait(
+                &self,
+                _: u64,
+                _: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, FsError>> + Send + '_>> {
+                Box::pin(async { Ok(false) })
+            }
+        }
+        let card = crate::amdgpu_navi22_cs::drm_card().unwrap_or_else(|| {
+            crate::drm_registry::register_drm_card(Arc::new(
+                crate::drm_devfs_bridge::AmdgpuCard::new(
+                    "recovery-preflight".into(),
+                    0x1002,
+                    0x73df,
+                    0,
+                    0,
+                    None,
+                ),
+            ))
+        });
+        if crate::amdgpu_gem::vram_heap_usage(card).is_some() {
+            return TestResult::Skip("existing native heap belongs to another fixture");
+        }
+        let previous = crate::amdgpu_cs::submitter(card);
+        let client: Arc<dyn Submitter> = Arc::new(Client);
+        crate::amdgpu_cs::register_submitter(card, client.clone());
+        // SAFETY: the preconditions above establish that no physical GPU or
+        // boot owner exists; preflight must reject before any teardown/I/O.
+        let result = narf_scheduler::block_on_spin(unsafe { recover() });
+        let retained =
+            crate::amdgpu_cs::submitter(card).is_some_and(|current| Arc::ptr_eq(&current, &client));
+        crate::amdgpu_cs::unregister_submitter(card);
+        if let Some(previous) = previous {
+            crate::amdgpu_cs::register_submitter(card, previous);
+        }
+        if result != Err(crate::amdgpu_navi22_recovery::Error::Busy) || !retained {
+            return TestResult::Fail("rejected platform recovery withdrew registered clients");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-recovery-preflight",
+        navi22_recovery_preflight_preserves_registered_clients
+    );
 
     fn navi22_handoff_distinguishes_primary_and_secondary_apertures() -> TestResult {
         let fb = GenericFb::new(0x1100, 16, 4, 64, 32);

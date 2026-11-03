@@ -21,6 +21,110 @@ const DST_MC: u64 = 0x9_2000_0000;
 
 const PASID: u16 = 0x0042;
 
+fn navi22_client_hdp_commands_bracket_ibs() -> TestResult {
+    let layout = crate::amdgpu_cp_navi22::tests::layout();
+    let ibs = [Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: 0,
+    }; 2];
+    let frame = Frame {
+        gfx: false,
+        engine: 4,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    // Literal Linux gfx_v10_0 / nbio_v2_3 / hdp_v5_0 ABI oracles.
+    // No VM flush or optional cache-sync flag: maintenance is unconditional
+    // even when a subsequent job reuses its already-programmed VMID.
+    for gfx in [false, true] {
+        let words = encode_cp(layout, &Frame { gfx, ..frame });
+        let mask = if gfx { 1 } else { 4 };
+        let flush = [
+            0xc005_3c00,
+            if gfx { 0x143 } else { 0x43 },
+            0xd20 + 0x106,
+            0xd20 + 0x107,
+            mask,
+            mask,
+            0x20,
+        ];
+        let invalidation = [
+            0xc003_3700,
+            if gfx { 0x4010_0000 } else { 0x0010_0000 },
+            0xf20 + 0xd1,
+            0,
+            1,
+        ];
+        let first_ib = if gfx { 12 } else { 7 };
+        let after_ibs = first_ib + 8 + if gfx { 2 } else { 0 };
+        if words.get(..7) != Some(&flush)
+            || words.get(first_ib) != Some(&0xc002_3f00)
+            || words.get(first_ib + 4) != Some(&0xc002_3f00)
+            || words.get(after_ibs..after_ibs + 5) != Some(&invalidation)
+            || words.get(after_ibs + 5) != Some(&0xc006_4900)
+        {
+            return TestResult::Fail(
+                "CP HDP maintenance must bracket all client IBs before the fence",
+            );
+        }
+    }
+    for instance in 0..4 {
+        // Nonzero ring start also checks that HDP packets participate in
+        // SDMA's absolute 8-dword IB alignment.
+        let wptr = 3;
+        let words = encode_sdma(
+            layout,
+            &Frame {
+                engine: 13 + instance,
+                wptr,
+                ..frame
+            },
+        );
+        let flush: alloc::vec::Vec<u32> = if instance < 2 {
+            let mask = 0x400 << instance;
+            alloc::vec![
+                0x3400_0008,
+                (0xd20 + 0x107) * 4,
+                (0xd20 + 0x106) * 4,
+                mask,
+                mask,
+                0x0fff_000a
+            ]
+        } else {
+            alloc::vec![0xf000_000e, 0x7f000 / 4, 0]
+        };
+        let at = flush.len() + ((2u64.wrapping_sub(wptr + flush.len() as u64) & 7) as usize);
+        let second = at + 8;
+        let end = second + 6;
+        if !words.starts_with(&flush)
+            || words.get(at) != Some(&(4 | (u32::from(VMID) << 16)))
+            || words.get(second) != Some(&(4 | (u32::from(VMID) << 16)))
+            || (wptr + at as u64 + 6) & 7 != 0
+            || words.get(end..end + 3) != Some(&[0xf000_000e, 0xf20 + 0xd1, 1])
+            || words.get(end + 3) != Some(&0x0003_0005)
+        {
+            return TestResult::Fail(
+                "SDMA HDP maintenance ordering or IB alignment differs from Linux",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-hdp-order",
+    navi22_client_hdp_commands_bracket_ibs
+);
+
 fn navi22_client_flags_reach_compute_packets() -> TestResult {
     use crate::amdgpu_uapi::{AMDGPU_IB_FLAG_EMIT_MEM_SYNC, AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID};
     let client = crate::amdgpu_cs::Ib {
@@ -54,15 +158,15 @@ fn navi22_client_flags_reach_compute_packets() -> TestResult {
     // compute IB, final job fence. Numeric GCR oracle is independent of
     // the production bit helpers (gfx_v10_0_emit_mem_sync).
     if words.get(8..16) != Some(&[0xc006_5800, 0, 0xffff_ffff, 0x00ff_ffff, 0, 0, 10, 0xc3b1])
-        || words.get(16..19) != Some(&[0xc001_6800, 0x20e8, 1279])
-        || words.get(19..23)
+        || words.get(23..26) != Some(&[0xc001_6800, 0x20e8, 1279])
+        || words.get(26..30)
             != Some(&[
                 0xc002_3f00,
                 IB_VA as u32,
                 (IB_VA >> 32) as u32,
                 8 | (u32::from(VMID) << 24) | (1 << 23),
             ])
-        || words.get(23) != Some(&0xc006_4900)
+        || words.get(35) != Some(&0xc006_4900)
     {
         return TestResult::Fail("client compute sync/GDS requests lost before IB");
     }
@@ -97,7 +201,7 @@ fn navi22_first_ib_requests_sdma_cache_rinse() -> TestResult {
     };
     let words = encode_sdma(crate::amdgpu_cp_navi22::tests::layout(), &frame);
     if words.get(..5) != Some(&[17, 0, 0xc3a1_0000, 0, 0])
-        || words.get(10..14)
+        || words.get(18..22)
             != Some(&[
                 4 | (u32::from(VMID) << 16),
                 IB_VA as u32,
@@ -155,7 +259,13 @@ fn navi22_sync_is_job_wide_and_gds_reset_is_per_compute_ib() -> TestResult {
                 return TestResult::Fail("IB flag scope or ring type changed");
             }
             if !gfx {
-                let sdma = encode_sdma(crate::amdgpu_cp_navi22::tests::layout(), &frame);
+                let sdma = encode_sdma(
+                    crate::amdgpu_cp_navi22::tests::layout(),
+                    &Frame {
+                        engine: 13,
+                        ..frame
+                    },
+                );
                 if sdma
                     .windows(5)
                     .filter(|w| *w == [17, 0, 0xc3a1_0000, 0, 0])
@@ -598,7 +708,7 @@ fn navi22_submit_encodes_linux_vm_flush() -> TestResult {
                 0,
                 u32::from(PASID),
             ]
-        || words[31..34] != [packet3(PACKET3_CONTEXT_CONTROL, 1), 0x8101_8003, 0]
+        || words[38..41] != [packet3(PACKET3_CONTEXT_CONTROL, 1), 0x8101_8003, 0]
     {
         return TestResult::Fail("gfx VM flush / PASID map / context control encoding");
     }
@@ -1283,7 +1393,10 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
             return TestResult::Fail("invalid kernel job mutated ring or MMIO");
         }
     }
+    let layout = engine.hw.layout;
     let words = kernel_words(
+        layout,
+        0,
         &[KernelOp::Fill {
             dst: IB_MC,
             bytes: MAX_PACKET_BYTES + 4,
@@ -1293,7 +1406,31 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         9,
     )
     .unwrap();
-    if words[..10]
+    // amdgpu_ib_schedule brackets kernel copies/fills: SDMA0's NBIO HDP
+    // flush poll first, the HDP read-cache invalidate right before the fence.
+    let fence_words = pm4::sdma_fence(DST_MC, 9);
+    let tail = words.len() - fence_words.len();
+    if words[..6] != sdma_hdp_flush(layout, 0)[..]
+        || words[..6]
+            != [
+                8 | (1 << 26) | (3 << 28),
+                bank_reg(layout.nbio, HDP_FLUSH_DONE) << 2,
+                bank_reg(layout.nbio, HDP_FLUSH_REQ) << 2,
+                0x400,
+                0x400,
+                (0xfff << 16) | 10,
+            ]
+        || words[tail - 3..tail]
+            != [
+                14 | (0xf << 28),
+                bank_reg(layout.hdp, HDP_READ_CACHE_INVALIDATE),
+                1,
+            ]
+        || words[tail..] != fence_words[..]
+    {
+        return TestResult::Fail("kernel SDMA frame lacks Linux's HDP bracket");
+    }
+    if words[6..16]
         != [
             11,
             IB_MC as u32,

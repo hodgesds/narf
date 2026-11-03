@@ -483,8 +483,35 @@ fn fence_engine(iv: &crate::amdgpu_ih_navi22::Iv) -> Option<crate::amdgpu_fence_
     .into_iter()
     .find_map(|(source, engine)| (from == source).then_some(engine))
 }
-/// One task per source forwards entries to fence waiters. A terminal IH
-/// error wakes every waiter so each re-samples and observes device loss.
+/// `gfx_v10_0_handle_priv_fault` for the queues this owner actually runs.
+/// A disabled pipe/queue or another source cannot accuse an active client.
+fn cp_fault_engine(iv: &crate::amdgpu_ih_navi22::Iv) -> Option<crate::amdgpu_fence_navi22::Engine> {
+    use crate::{
+        amdgpu_fence_navi22::Engine,
+        amdgpu_ih_navi22::{source, Source},
+    };
+    let from = Source {
+        client: iv.client,
+        src: iv.src,
+    };
+    if !matches!(
+        from,
+        source::GFX_BAD_OPCODE | source::GFX_PRIV_REG | source::GFX_PRIV_INSTR
+    ) {
+        return None;
+    }
+    let q = iv.cp_queue();
+    match (q.me, q.pipe, q.queue) {
+        (0, 0, 0) => Some(Engine::Gfx),
+        (1, 0, 0) if from != source::GFX_PRIV_INSTR => Some(Engine::Compute),
+        _ => None,
+    }
+}
+static CP_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// One task per source forwards completions or reports CP errors. Subscribe
+/// to every source before unmasking hardware. A terminal IH error wakes all
+/// waiters so each re-samples and observes device loss.
 fn route_fences(
     ih: &crate::amdgpu_ih_navi22::Handle,
 ) -> Result<(), crate::amdgpu_ih_navi22::Error> {
@@ -496,16 +523,45 @@ fn route_fences(
         source::SDMA1_TRAP,
         source::SDMA2_TRAP,
         source::SDMA3_TRAP,
+        source::GFX_BAD_OPCODE,
+        source::GFX_PRIV_REG,
+        source::GFX_PRIV_INSTR,
     ] {
-        subscriptions.push(ih.subscribe(from)?);
+        let fault = matches!(
+            from,
+            source::GFX_BAD_OPCODE | source::GFX_PRIV_REG | source::GFX_PRIV_INSTR
+        );
+        subscriptions.push((fault, ih.subscribe(from)?));
     }
-    for mut subscription in subscriptions {
+    let generation = crate::amdgpu_fence_navi22::generation();
+    for (fault, mut subscription) in subscriptions {
         narf_scheduler::spawn(async move {
             loop {
                 match subscription.wait().await {
                     Ok(iv) => {
                         if let Some(engine) = fence_engine(&iv) {
                             crate::amdgpu_fence_navi22::notify(engine);
+                        } else if fault {
+                            // An old IH task may have waited across a reset.
+                            // Never charge its fault to the replacement owner.
+                            if crate::amdgpu_fence_navi22::generation() != generation {
+                                return;
+                            }
+                            let engine = cp_fault_engine(&iv);
+                            let seen =
+                                CP_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if seen < 16 {
+                                use core::fmt::Write;
+                                let _ = writeln!(narf_console::Writer,
+                                    "amdgpu: navi22 CP fault src={} ring={:#x} vmid={} pasid={} engine={engine:?} epoch={generation} data={:x?}",
+                                    iv.src, iv.ring_id, iv.vmid, iv.pasid, iv.src_data);
+                            }
+                            if let Some(engine) = engine {
+                                // Error completion wakes clients but does not
+                                // retire GPU-reachable memory. The watchdog
+                                // retains responsibility for device recovery.
+                                crate::amdgpu_navi22_cs::hung(engine, generation);
+                            }
                         }
                     }
                     Err(_) => {
@@ -839,6 +895,14 @@ impl Backend for Hardware {
             Stage::FenceInterrupts => {
                 if let (Some(queues), Some(ih)) = (self.queues.as_ref(), self.ih.as_ref()) {
                     if queues.proof().is_some() {
+                        if let Err(error) = route_fences(&ih.handle()) {
+                            use core::fmt::Write;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "amdgpu: navi22 FenceInterrupts: polling only {error:?}"
+                            );
+                            return Ok(());
+                        }
                         // SAFETY: every kernel queue is verified, IH is live and
                         // this owner holds the GPU exclusively.
                         unsafe {
@@ -849,13 +913,6 @@ impl Backend for Hardware {
                             )
                         }
                         .map_err(Error::Queues)?;
-                        if let Err(error) = route_fences(&ih.handle()) {
-                            use core::fmt::Write;
-                            let _ = writeln!(
-                                narf_console::Writer,
-                                "amdgpu: navi22 FenceInterrupts: polling only {error:?}"
-                            );
-                        }
                     }
                 }
             }
@@ -1817,8 +1874,12 @@ impl ColdBoot {
             .map_err(Error::Queues)
     }
     /// Whether `into_recovery` can rebuild this owner: a completed boot with
-    /// a board power table and IH, and no GDDR6 training to replay (Linux
-    /// replays it as `PSP_MEM_TRAIN_RESUME`; NARF has no short training).
+    /// a board power table and IH, and no GDDR6 training to replay. Linux
+    /// replays it as `PSP_MEM_TRAIN_RESUME`; the shared `gddr6::Trainer::resume`
+    /// implements that replay (RDNA4 wires it), but RDNA2 recovery
+    /// reconstruction drops the trainer, so a trained owner stays
+    /// unrecoverable until retention, replay order and cancellation are wired
+    /// and tested here.
     pub fn recoverable(&self) -> bool {
         let h = &self.sequence.backend;
         matches!(self.sequence.state, State::FirmwareReady(_))

@@ -4255,9 +4255,13 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         );
         (r, req)
     };
-    // No VRAM heap yet: the card's own dumb buffers answer.
-    if create(&gem, 200, 100).0.is_some() {
-        return TestResult::Fail("VRAM dumb buffer without a heap");
+    // A native open owns one compact GEM namespace. Without its heap,
+    // allocation must fail rather than aliasing the card-global dumb table.
+    let (result, request) = create(&gem, 200, 100);
+    if result != Some(Err(FsError::NoDevice)) || request.handle != 0 || gem.object(1).is_some() {
+        return TestResult::Fail(
+            "missing native heap allocated or fell through to another handle table",
+        );
     }
     let mut memory = vec![0u8; 1 << 20];
     let map = narf_bus::MmioRegion {

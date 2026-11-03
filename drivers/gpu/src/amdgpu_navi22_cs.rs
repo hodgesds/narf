@@ -68,7 +68,7 @@ pub(crate) fn abandon(error: FsError) {
     }
     crate::amdgpu_fence_navi22::notify_all();
 }
-pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine) {
+pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine, generation: u64) {
     use crate::amdgpu_fence_navi22::Engine;
     let ring = match engine {
         Engine::Gfx => 0,
@@ -80,9 +80,9 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine) {
         _ => return,
     };
     let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
-    if let Some(current) = current {
+    if let Some(current) = current.filter(|current| current.epoch == generation) {
         let _ = current.progress();
-        // Timeout-only evidence, before recovery withdraws this owner.
+        // Failure-only evidence, before recovery withdraws this owner.
         // This is the raw VM-programming writeback, not a completion proof
         // for the client job: a job may reuse a VM without a new VM fence.
         if let Some(slot) = fence_slot(ring) {
@@ -132,6 +132,22 @@ pub fn ring_id(ip_type: u32, ip_instance: u32, ring: u32) -> Option<usize> {
         // VCN decode/encode and JPEG: ids 4..=7 (amdgpu_vcn_navi22_cs).
         _ => crate::amdgpu_vcn_navi22_cs::ring_id(ip_type, ip_instance, ring),
     }
+}
+
+/// RDNA2 has no gang scheduler: all IBs must name exactly one userspace
+/// entity, even when several logical compute rings share a hardware queue.
+/// Run before dependency waits and BO placement, and recheck at submission.
+fn submission_ring(ibs: &[crate::amdgpu_cs::Ib]) -> Result<usize, FsError> {
+    let first = ibs.first().ok_or(FsError::InvalidData)?;
+    let entity = (first.ip_type, first.ip_instance, first.ring);
+    let id = ring_id(entity.0, entity.1, entity.2).ok_or(FsError::InvalidData)?;
+    if ibs.iter().any(|ib| {
+        (ib.ip_type, ib.ip_instance, ib.ring) != entity
+            || ib.flags & (uapi::AMDGPU_IB_FLAGS_SECURE | uapi::AMDGPU_IB_FLAG_CE) != 0
+    }) {
+        return Err(FsError::InvalidData);
+    }
+    Ok(id)
 }
 /// Ticket ring ids: four original kernel queues, four media rings, SDMA2/3.
 pub const RING_IDS: usize = 10; // linux: n/a (NARF ticket ring ids)
@@ -297,8 +313,12 @@ impl Submitter {
 }
 
 impl crate::amdgpu_cs::Submitter for Submitter {
-    fn validate_submission(&self, _: &crate::amdgpu_cs::Submission) -> Result<(), FsError> {
-        self.jobs.lock().terminal.map_or(Ok(()), Err)
+    fn validate_submission(
+        &self,
+        submission: &crate::amdgpu_cs::Submission,
+    ) -> Result<(), FsError> {
+        self.jobs.lock().terminal.map_or(Ok(()), Err)?;
+        submission_ring(&submission.ibs).map(|_| ())
     }
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
         ring_id(ip_type, ip_instance, ring)
@@ -333,25 +353,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             if let Some(error) = health.error().or(self.jobs.lock().terminal) {
                 return Err(error);
             }
-            let first = submission.ibs.first().ok_or(FsError::InvalidData)?;
-            let id = ring_id(first.ip_type, first.ip_instance, first.ring)
-                .ok_or(FsError::InvalidData)?;
-            // One job runs on one ring (amdgpu_cs_pass1's entity check).
-            if submission
-                .ibs
-                .iter()
-                .any(|ib| ring_id(ib.ip_type, ib.ip_instance, ib.ring) != Some(id))
-            {
-                return Err(FsError::InvalidData);
-            }
-            if submission
-                .ibs
-                .iter()
-                .any(|ib| ib.flags & (uapi::AMDGPU_IB_FLAGS_SECURE | uapi::AMDGPU_IB_FLAG_CE) != 0)
-            {
-                // No TMZ and no CE IBs on GC 10.3.
-                return Err(FsError::InvalidData);
-            }
+            let id = submission_ring(&submission.ibs)?;
             if vm.geometry() != crate::amdgpu_vm::Geometry::GMC11 {
                 return Err(FsError::InvalidData);
             }
@@ -586,6 +588,51 @@ pub fn unregister() {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi22_cs_rejects_mixed_entities_before_submission() -> TestResult {
+        let ib = crate::amdgpu_cs::Ib {
+            va_start: 0x10000,
+            length_dw: 8,
+            ip_type: uapi::AMDGPU_HW_IP_COMPUTE,
+            ip_instance: 0,
+            ring: 0,
+            flags: 0,
+        };
+        if submission_ring(&[]) != Err(FsError::InvalidData) || submission_ring(&[ib, ib]) != Ok(1)
+        {
+            return TestResult::Fail("single compute entity submission");
+        }
+        // Both logical compute entities map to hardware ring 1; they still
+        // require gang semantics and cannot silently merge into one job.
+        for (ip_type, ip_instance, ring, flags) in [
+            (uapi::AMDGPU_HW_IP_COMPUTE, 0, 1, 0),
+            (uapi::AMDGPU_HW_IP_GFX, 0, 0, 0),
+            (uapi::AMDGPU_HW_IP_COMPUTE, 1, 0, 0),
+            (uapi::AMDGPU_HW_IP_COMPUTE, 0, 0, uapi::AMDGPU_IB_FLAG_CE),
+            (
+                uapi::AMDGPU_HW_IP_COMPUTE,
+                0,
+                0,
+                uapi::AMDGPU_IB_FLAGS_SECURE,
+            ),
+        ] {
+            let other = crate::amdgpu_cs::Ib {
+                ip_type,
+                ip_instance,
+                ring,
+                flags,
+                ..ib
+            };
+            if submission_ring(&[ib, other]) != Err(FsError::InvalidData) {
+                return TestResult::Fail("RDNA2 accepted an unsupported gang or protected IB");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-single-entity",
+        navi22_cs_rejects_mixed_entities_before_submission
+    );
 
     fn navi22_cs_tickets_name_ring_and_recovery_epoch() -> TestResult {
         let entities = [

@@ -22,7 +22,7 @@
 //!
 //! [`SUBMISSION`] is the one place that decides whether userspace is told the
 //! GPU accepts work: `ACCEL_WORKING`, every `available_rings` mask,
-//! `HW_IP_COUNT` and `AMDGPU_IDS_FLAGS_GANG_SUBMIT` all derive from it, as do
+//! and `HW_IP_COUNT` all derive from it, as do
 //! the DRM version minor and whether `amdgpu_navi22_cs` registers the card's
 //! submitter.
 //!
@@ -60,7 +60,7 @@ pub enum Submission {
 /// `navi22_submit_gfx_user_vmid_ib_executes_and_fences`). Even wired,
 /// nothing is advertised unless the cold boot's ring/IB tests passed
 /// ([`Boot::queues_verified`]). Setting it to `NotWired` withdraws
-/// ACCEL_WORKING, every ring mask, HW_IP_COUNT, GANG_SUBMIT, DRM minor 64 and
+/// ACCEL_WORKING, every ring mask, HW_IP_COUNT, DRM minor 64 and
 /// the render ioctls at once.
 pub const SUBMISSION: Submission = Submission::Wired;
 
@@ -305,7 +305,7 @@ fn ip_version(block: &IpBlock) -> u32 {
 }
 
 /// `AMDGPU_INFO_DEV_INFO`, field for field as `amdgpu_kms.c`.
-fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError> {
+fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let table = snap.gc.ok_or(FsError::InvalidData)?;
     let topology = snap.navi22.topology;
     let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
@@ -353,13 +353,9 @@ fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError>
         num_rb_pipes: table.num_rb_per_se.saturating_mul(table.num_se),
         num_hw_gfx_contexts: MAX_HW_CONTEXTS,
         // Discrete; MCBP and TMZ are off by default on GC 10.3.2 and
-        // CONFORMANT_TRUNC_COORD is GFX11-only. Linux claims GANG_SUBMIT on
-        // every bare-metal device; here only once submissions run.
-        ids_flags: if accepting(&snap.navi22, submission) {
-            u64::from(uapi::AMDGPU_IDS_FLAGS_GANG_SUBMIT)
-        } else {
-            0
-        },
+        // CONFORMANT_TRUNC_COORD is GFX11-only. The native RDNA2 backend
+        // accepts one entity per ioctl, so it cannot claim GANG_SUBMIT.
+        ids_flags: 0,
         virtual_address_offset: va.low_offset,
         virtual_address_max: va.low_max,
         high_va_offset: va.high_offset,
@@ -651,7 +647,7 @@ pub fn query_with(
         uapi::AMDGPU_INFO_ACCEL_WORKING => Ok(u32::from(accepting(&snap.navi22, submission))
             .to_le_bytes()
             .to_vec()),
-        uapi::AMDGPU_INFO_DEV_INFO => dev_info(snap, submission),
+        uapi::AMDGPU_INFO_DEV_INFO => dev_info(snap),
         uapi::AMDGPU_INFO_HW_IP_INFO => hw_ip_info(snap, submission, payload[0], payload[1]),
         uapi::AMDGPU_INFO_HW_IP_COUNT => hw_ip_count(snap, submission, payload[0]),
         uapi::AMDGPU_INFO_FW_VERSION => fw_version(snap, payload),
