@@ -2643,10 +2643,31 @@ association response's legacy intersection the same way and commits a
 N2xO OFDM references, 0x3a04/0x3a08 differences) where 2.4GHz checks the
 CCK references; C21 keeps `operating_readback` at the 5GHz RF18.
 `Gate::allows_profile` without an extension admits the band's own base
-(`LEGACY5` on 5GHz). `ht::request` refuses a band-5 base: 5GHz HT facts
-and continuations are not implemented, so a 5GHz extension runs non-HT
-(legacy OFDM, optional WMM BE). Written, unexecuted: the 5GHz rows of
+(`LEGACY5` on 5GHz). Written, unexecuted: the 5GHz rows of
 `smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units`.
+
+**5GHz HT20 (N2xH over a band-5 N2xL).** Groundwork for 5GHz HT40/VHT.
+`power_policy::overlay` takes a primary's HT ceilings from its 5GHz
+`rtw_get_channel_group` group when the bound N2xO record is 5GHz:
+`Board::ht5_groups` (C22, `Power5g::bw20` 1S/2S, txgi factor 2, min over
+both paths) and `Envelope::ht5_groups` (C21, path A, factor 1, max 0x3f);
+the record's CCK references (C22) / CCK TXAGC indices (C21) are zero. The
+HT request over a band-5 base hashes a 5GHz HT20 line plus the C22 OFDM
+selection. C22 keeps OFDM on 5GHz (management/EAPOL at OFDM6): the HT
+program's 0x3a04/0x3a08 bytes are the N2xO OFDM indices
+`min(ofdm[A] + diff(r), ofdm[B] + diff(r))`
+(`channel_policy::Record::ofdm5_indices`, the per-rate path minimum of
+`rtw8822c_set_tx_power_index`) relative to the MCS7 reference, with CCK
+bytes zero (2.4GHz writes OFDM at index 0); decode refuses a selection
+whose OFDM difference leaves -64..=63. C21 writes the 0x1d0c HT TXAGC
+over the N2xO OFDM TXAGC and reads back at the 5GHz RF18. The HT DATA
+profile carries `band5` (rate id GN 5/4). On 5GHz the station binds the
+extension, N2xF/N2xQ, HT, N2xC and the BA programs; the N2xR RTS program,
+the N2xD dynamic mechanism and N21W tracking stay off (qualified with a
+CCK RTS rate, CCK PD and 2.4GHz swing tables), and N2xB HT40 is refused by
+`ht40::center` (2.4GHz pairs only). Written, unexecuted: the OFDM-selection
+rows of `smoke_rtw88_band5_linux_groups_and_factory_power`; no 5GHz HT
+station case is written.
 
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station

@@ -39,6 +39,9 @@ pub(super) struct Board {
     /// Per-path 5GHz OFDM ceilings per 5GHz channel group
     /// (`band5::Power5g::ofdm`, txgi factor 2, max index 0x7f).
     band5_groups: [Option<[u8; 2]>; 14],
+    /// HT20 one-/two-stream factory ceilings per 5GHz channel group
+    /// (`band5::Power5g::bw20`, txgi factor 2), min over both paths.
+    ht5_groups: [Option<(u8, Option<u8>)>; 14],
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -140,12 +143,23 @@ impl Board {
             }
             Some(limit)
         });
+        let ht5_groups = core::array::from_fn(|group| {
+            let path = |path: u8| super::band5::Power5g::parse(factory.power_path(path)?);
+            let (a, b) = (path(0)?, path(1)?);
+            Some((
+                a.bw20(group, false, 2)?.min(b.bw20(group, false, 2)?),
+                a.bw20(group, true, 2)
+                    .zip(b.bw20(group, true, 2))
+                    .map(|(a, b)| a.min(b)),
+            ))
+        });
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
             maximum,
             groups,
             band5_groups,
+            ht5_groups,
             ht_groups,
             ht40_groups,
             ht: factory
@@ -344,8 +358,10 @@ impl ExtensionBase {
                 f
             }),
         };
-        let group = |g: usize| match &self.chip {
+        let group = |five: bool, g: usize| match &self.chip {
+            ExtensionChip::C21(b) if five => b.ht5_group(g).map(|m| (m, None)),
             ExtensionChip::C21(b) => b.ht_group(g).map(|m| (m, None)),
+            ExtensionChip::C22(b) if five => b.calibration.board.ht5_groups[g],
             ExtensionChip::C22(b) => b.calibration.board.ht_groups[g],
         };
         overlay(self.did(), facts, self.channel.as_deref(), group)
@@ -362,6 +378,17 @@ impl ExtensionBase {
             .as_ref()
             .and_then(|g| super::channel_policy::Record::decode(self.did(), g.payload()))
             .map_or(1, |r| r.channel)
+    }
+    /// C22 5GHz OFDM6..54 TX indices of the bound N2xO record, as one
+    /// both-path selection: `min(ofdm[A] + diff(r), ofdm[B] + diff(r))`
+    /// (`rtw8822c_set_tx_power_index` takes the per-rate minimum of the two
+    /// paths' differences). None off a C22 5GHz record.
+    pub(super) fn ofdm5_indices(&self) -> Option<[u8; 8]> {
+        if self.did() != 0xc822 {
+            return None;
+        }
+        super::channel_policy::Record::decode(self.did(), self.channel.as_ref()?.payload())?
+            .ofdm5_indices()
     }
     pub(super) fn temperature(&self, value: u8) -> Result<(), super::firmware_transport::Error> {
         match &self.chip {
@@ -436,14 +463,20 @@ fn overlay(
     did: u16,
     facts: Option<super::ht::Facts>,
     channel: Option<&super::qualification::Grant>,
-    group: impl Fn(usize) -> Option<(u8, Option<u8>)>,
+    group: impl Fn(bool, usize) -> Option<(u8, Option<u8>)>,
 ) -> Option<super::ht::Facts> {
     let mut facts = facts?;
     let Some(g) = channel else {
         return Some(facts);
     };
     let record = super::channel_policy::Record::decode(did, g.payload())?;
-    let (maximum, maximum_2ss) = group(super::channel_policy::group(record.channel)?)?;
+    // 5GHz: `rtw_phy_get_5g_tx_power_index` HT20 of the primary's 5GHz
+    // group; the record's CCK references / TXAGC CCK indices are zero.
+    let (maximum, maximum_2ss) = if record.band5() {
+        group(true, super::band5::group(record.channel)?)?
+    } else {
+        group(false, super::channel_policy::group(record.channel)?)?
+    };
     facts.maximum = maximum;
     facts.maximum_2ss = maximum_2ss.filter(|_| facts.maximum_2ss.is_some());
     match did {
@@ -912,8 +945,10 @@ impl Gate {
                 f
             }),
         };
-        let group = |g: usize| match &self.scope {
+        let group = |five: bool, g: usize| match &self.scope {
+            Scope::C21(b) if five => b.ht5_group(g).map(|m| (m, None)),
             Scope::C21(b) => b.ht_group(g).map(|m| (m, None)),
+            Scope::C22 { calibration, .. } if five => calibration.board.ht5_groups[g],
             Scope::C22 { calibration, .. } => calibration.board.ht_groups[g],
         };
         overlay(self.did(), facts, self.channel.as_deref(), group)

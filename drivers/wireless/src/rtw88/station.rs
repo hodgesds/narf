@@ -1888,11 +1888,8 @@ impl State {
                     && g.channel() == self.channel
             });
         let proposed = match &extension {
-            // 5GHz HT continuations are not qualified yet: the band-5
-            // extension runs non-HT (legacy OFDM, optional WMM).
             Some(g)
                 if g.wmm()
-                    && !g.band5()
                     && narf_wireless::wmm::Parameters::parse(
                         &candidate.bss.information_elements,
                     )
@@ -2067,14 +2064,21 @@ impl State {
                 super::tx_ba::program(io)?;
                 self.tx_ba_grant = Some(g);
             }
-            if let Some(g) = io.station_protection_extension()? {
+            // The RTS program (N2xR), the dynamic mechanism (N2xD) and N21W
+            // thermal tracking are qualified on 2.4GHz only (CCK RTS rate,
+            // CCK PD, 2.4GHz swing tables): a 5GHz association runs without.
+            let band5 = super::band5::primary(self.channel);
+            if let Some(g) = io.station_protection_extension()?.filter(|_| !band5) {
                 self.admission
                     .run(|| io.station_bind_protection(g.clone()))?;
                 self.protection = Some(g);
             }
             self.ht = Some(h);
         }
-        if let Some(g) = io.station_continuation(&super::dm::KIND)? {
+        if let Some(g) = io
+            .station_continuation(&super::dm::KIND)?
+            .filter(|_| !super::band5::primary(self.channel))
+        {
             let gate = io.station_gate()?;
             if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
                 self.tracking.grant = Some(g);
@@ -2087,7 +2091,7 @@ impl State {
         {
             // N21W tracks the HT20 TXAGC selection; it is not qualified for
             // the N2xB HT40 selection, so a 40MHz association runs without it.
-            if self.ht.is_some() && self.ht40.is_none() {
+            if self.ht.is_some() && self.ht40.is_none() && !super::band5::primary(self.channel) {
                 if let Some(g) = io.station_power_tracking_extension(
                     facts.thermal[0],
                     self.tracking.grant.clone(),

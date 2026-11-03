@@ -201,8 +201,7 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
         .ht_facts()
         .filter(|f| f.local().is_some())
         .ok_or(Error::Unsupported)?;
-    // 5GHz HT facts/groups are not part of this program yet.
-    if !base.wmm() || base.band5() {
+    if !base.wmm() || base.band5() && base.did() == 0xc822 && base.ofdm5_indices().is_none() {
         return Err(Error::Unsupported);
     }
     let (recipe, digest) = base.ht_identity();
@@ -215,6 +214,13 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
     h.update(&[f.maximum]);
     h.update(&f.legacy);
     h.update(&f.cck);
+    if base.band5() {
+        // 5GHz HT20 variant: the ceilings above are this primary's
+        // `rtw_phy_get_5g_tx_power_index` HT20 group values; C22 keeps the
+        // N2xO OFDM selection under the MCS7 reference.
+        h.update(b"5GHz HT20 GN: Power5g bw40_base+ht_1s.bw20(+ht_2s.bw20) group ceilings; rateID GN_N1SS5/N2SS4; C22 OFDM6..54 = min-path N2xO ofdm+diff relative to MCS7 reference (rtw8822c_set_tx_power_index), CCK refs/diffs zero; C21 0x1d0c HT TXAGC over N2xO OFDM TXAGC, CCK zero");
+        h.update(&base.ofdm5_indices().unwrap_or([0; 8]));
+    }
     h.update(if base.did()==0xc821 { b"C21 RF-A absolute1d0c/10; retained legacy12; unusedHT/VHTzero; RF18/RF08/IQK; RF42 SIPIc90 maskfffff trigger30000 wait13+2000000us actualread2908" } else { b"C22 TX-A RX-AB equalOFDMrefs=MCS7; source signed7bit per-rate difference; minAB; unusedrates effective0; retainedCCKrefs" });
     h.update(b"RX PHYST exact32 at24+shift; C21 RXSC/RFMODE no channel; C22 RXSC/current20/reportedchannel1; absentPHY None plus RXD facts; receive epoch fences callbacks and IPC across actual key/reply/close");
     h.update(b"full static raw thermal0..63 supply/antenna/BT envelope; exact source gain writes/readbacks; no tracking or fabricated calibration; transient/response+legacy+8LGI+8SGI measured peaks");
@@ -433,6 +439,10 @@ impl Grant {
                     .any(|&i| i > facts.maximum_2ss.unwrap_or(0))
             || g.peaks.iter().any(|&p| !(-512..=256).contains(&p))
             || g.peaks[1..].iter().any(|&p| p > g.peaks[0])
+            || g.base.ofdm5_indices().is_some_and(|o| {
+                o.iter()
+                    .any(|&v| !(-64..=63).contains(&(i16::from(v) - i16::from(g.indices[7]))))
+            })
             || g.base.did() == 0xc822
                 && (g.indices[7] > 64
                     || g.indices
@@ -485,7 +495,7 @@ impl Grant {
             acs: 0,
             fallback: false,
             bw40: false,
-            band5: false,
+            band5: self.base.band5(),
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);
@@ -569,9 +579,13 @@ impl Grant {
     fn words(&self) -> [u32; 16] {
         let mut bytes = [0; 64];
         let reference = i16::from(self.indices[7]);
+        // 5GHz keeps the N2xO OFDM selection (management/EAPOL at OFDM6).
+        let ofdm = self.base.ofdm5_indices();
         for (rate, b) in bytes.iter_mut().enumerate() {
             let index = if (12..if self.two_streams() { 28 } else { 20 }).contains(&rate) {
                 i16::from(self.indices[rate - 12])
+            } else if let (Some(o), 4..=11) = (ofdm, rate) {
+                i16::from(o[rate - 4])
             } else {
                 0
             };

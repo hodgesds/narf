@@ -370,6 +370,30 @@ fn smoke_rtw88_band5_linux_groups_and_factory_power() -> TestResult {
     {
         return TestResult::Fail("5GHz factory index differs from rtw_phy_get_5g_tx_power_index");
     }
+    // C22 5GHz HT keeps the N2xO OFDM selection: per-rate path minimum.
+    let mut r = crate::rtw88::channel_policy::Record {
+        channel: 36,
+        antenna: 0,
+        ceiling: 0,
+        peaks: [0; 3],
+        gains: [0; 2],
+        indices: [0; 12],
+        ofdm: [40, 38],
+        // 6M +2, 9M -1, 12M 0, 18M +63; 24M -30, 36..54M 0.
+        diffs: [0x3f00_7f02, 0x0000_0062],
+    };
+    if r.ofdm5_indices() != Some([40, 37, 38, 101, 8, 38, 38, 38]) {
+        return TestResult::Fail("5GHz OFDM selection is not the per-rate path minimum");
+    }
+    r.ofdm = [127, 127];
+    if r.ofdm5_indices().is_some() {
+        return TestResult::Fail("5GHz OFDM selection above index 127 accepted");
+    }
+    r.channel = 6;
+    r.ofdm = [40, 38];
+    if r.ofdm5_indices().is_some() {
+        return TestResult::Fail("2.4GHz record produced a 5GHz OFDM selection");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

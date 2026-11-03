@@ -243,6 +243,10 @@ impl Grant {
     pub(super) fn band5(&self) -> bool {
         super::band5::primary(self.channel())
     }
+    /// C22 5GHz OFDM indices of the bound record (`ExtensionBase::ofdm5_indices`).
+    pub(super) fn ofdm5_indices(&self) -> Option<[u8; 8]> {
+        self.base.ofdm5_indices()
+    }
     pub(super) fn matches(&self, gate: &Gate) -> bool {
         gate.extension_request().as_ref() == Some(&self.request)
     }

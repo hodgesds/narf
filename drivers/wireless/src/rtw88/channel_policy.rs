@@ -228,6 +228,26 @@ impl Record {
         let byte = (self.diffs[rate / 4] >> (8 * (rate % 4))) as u8;
         ((byte << 1) as i8) >> 1
     }
+    /// C22 5GHz OFDM6..54 indices as one both-path selection:
+    /// `min(ofdm[A] + diff(r), ofdm[B] + diff(r))` per rate
+    /// (`rtw8822c_set_tx_power_index` writes the per-rate minimum of the two
+    /// paths' differences). None for a 2.4GHz record or an index outside
+    /// 0..=127.
+    pub(super) fn ofdm5_indices(&self) -> Option<[u8; 8]> {
+        if !self.band5() || self.indices != [0; 12] {
+            return None;
+        }
+        let mut out = [0; 8];
+        for (rate, slot) in out.iter_mut().enumerate() {
+            let index = self
+                .ofdm
+                .iter()
+                .map(|o| i16::from(*o) + i16::from(self.diff(rate)))
+                .min()?;
+            *slot = u8::try_from(index).ok().filter(|v| *v <= 127)?;
+        }
+        Some(out)
+    }
     /// Center frequency of the 20MHz primary on either band.
     pub(super) fn frequency(&self) -> Option<u16> {
         frequency(self.channel).or(super::band5::frequency(self.channel))
