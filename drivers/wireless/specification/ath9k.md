@@ -1580,6 +1580,23 @@ exactly as Linux reads them back. The 5 GHz values equal the
 Smoke (written, not executed):
 `smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs`.
 
+AR9280 admission (`admission::Facts::new_ar9280`): no AR9280 board has been
+measured in this tree, so each channel needs a signed `N80A` v1 record with
+the `N87A` layout (length 128, PCI vendor/device `0x0029`/`0x002a`, identity,
+MAC, `[channel, 20, rx mask, tx mask]`, measured antenna gain in half-dBi at
+least the factory `EEP_ANTENNA_GAIN_2G/5G` — max of the band's three
+`antennaGainCh` — and at most 128, conducted ceiling at most 40 half-dBm,
+reserved bytes zero). The channel byte is the IEEE number (2.4 GHz 1..13,
+5 GHz 36..165; disjoint). The identity hashes the PCI IDs, revision, EEPROM
+version, INI row count, frequency, band, masks, MAC, the whole def map and
+the closed-loop def plan at 40 half-dB (PD gains, per-chain TPCRG5 + PDADC,
+rate registers; `overlap` is the live TPCRG5 overlap below minor 2). The
+request filename is `ath9k/ar9280-admit-v1-ch<N>-<mac>.bin`. Format only:
+no record or board value is supplied. 5 GHz DFS/NO_IR/indoor channels never
+reach a record: `Permission::from_domain_dual` refuses them first. Smoke
+(written, not executed):
+`smoke_ath9k_ar9280_admission_records_bind_band_channel_and_magic`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

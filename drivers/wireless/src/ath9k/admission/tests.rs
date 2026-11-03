@@ -317,3 +317,82 @@ kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar9287_records_are_keyed_per_channel
 );
+
+fn ar9280_facts(id: u16, frequency: u16) -> Result<Facts, BringUpError> {
+    use crate::ath9k::phy::{ar9280, Tune};
+    let tune = match ar9280::channel_5ghz(frequency) {
+        Some(_) => Tune::Five {
+            frequency,
+            frac_n: false,
+        },
+        None => Tune::Two(Geometry::from_frequency(frequency)?),
+    };
+    let prepared = ar9280::Prepared {
+        tune,
+        ini_writes: if tune.is_5ghz() { 560 } else { 547 },
+    };
+    Facts::new_ar9280(
+        &device(id),
+        &Revision::decode(0x0008_01ff).ok_or(BringUpError::UnsupportedRevision)?,
+        &crate::ath9k::phy::ar9280::power::tests::identity(0x10),
+        &prepared,
+        &crate::ath9k::phy::ar9280::power::tests::image(3),
+        frequency,
+        0,
+    )
+}
+
+/// Format-only synthetic N80A record; the measured fields are markers.
+fn ar9280_record(facts: &Facts, channel: u8, antenna: u8, ceiling: u8) -> Vec<u8> {
+    let mut b = record(facts, antenna, ceiling);
+    b[..4].copy_from_slice(b"N80A");
+    b[54] = channel;
+    b
+}
+
+fn smoke_ath9k_ar9280_admission_records_bind_band_channel_and_magic() -> TestResult {
+    let (Ok(two), Ok(five)) = (ar9280_facts(0x002a, 2412), ar9280_facts(0x0029, 5180)) else {
+        return TestResult::Fail("AR9280 admission facts refused");
+    };
+    if two.request().filename != "ath9k/ar9280-admit-v1-ch1-02aabbccddee.bin"
+        || five.request().filename != "ath9k/ar9280-admit-v1-ch36-02aabbccddee.bin"
+        || two.request().identity == five.request().identity
+    {
+        return TestResult::Fail("AR9280 records are not keyed per band and channel");
+    }
+    // Synthetic map: 2 GHz antennaGainCh max 4, 5 GHz all zero.
+    let Ok(grant) = load(five.clone(), ar9280_record(&five, 36, 2, 30), true) else {
+        return TestResult::Fail("well-formed signed 5 GHz N80A record refused");
+    };
+    if grant.ceiling(40) != 30 || grant.ceiling(20) != 18 {
+        return TestResult::Fail("AR9280 measured antenna gain not removed from host limit");
+    }
+    for bytes in [
+        record(&two, 4, 30),            // AR9287 magic
+        ar9280_record(&two, 36, 4, 30), // wrong channel byte
+        ar9280_record(&two, 1, 3, 30),  // antenna below factory
+        ar9280_record(&two, 1, 4, 41),  // ceiling above 40
+        ar9280_record(&five, 36, 0, 30)[..127].to_vec(),
+    ] {
+        if load(two.clone(), bytes, true).is_ok() {
+            return TestResult::Fail("malformed or foreign N80A record admitted");
+        }
+    }
+    if load(two.clone(), ar9280_record(&two, 1, 4, 30), false).is_ok()
+        || load(two.clone(), ar9280_record(&two, 1, 4, 30), true).is_err()
+    {
+        return TestResult::Fail("AR9280 signer requirement differs");
+    }
+    // Wrong device, band/tune mismatch and non-channels are refused.
+    if ar9280_facts(0x002e, 2412).is_ok()
+        || ar9280_facts(0x002a, 5185).is_ok()
+        || ar9280_facts(0x002a, 2484).is_ok()
+    {
+        return TestResult::Fail("AR9280 facts accepted a foreign device or channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9280_admission_records_bind_band_channel_and_magic
+);

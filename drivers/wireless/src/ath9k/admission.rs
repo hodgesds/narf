@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9287 (`0x002d`/`0x002e`) signed board admission record `N87A` v1.
+//! AR9287 (`0x002d`/`0x002e`) signed board admission record `N87A` v1 and
+//! the AR9280 (`0x0029`/`0x002a`) dual-band record `N80A` v1.
 //!
 //! The AR9287 software path (map decode, INI/board values, open-loop
 //! transmit power, two-chain calibration, async-FIFO MAC clock, descriptor
@@ -9,12 +10,18 @@
 //! measured radiated envelope (antenna gain and conducted ceiling). This
 //! module defines that format only: no record or board value is supplied or
 //! inferred, and an unprovisioned device is never calibrated or opened.
+//! The AR9280 record has the same layout with magic `N80A`; its channel
+//! byte is the IEEE channel number (2.4 GHz 1..13 or 5 GHz 36..165, the two
+//! sets are disjoint) and it binds the closed-loop def plan of that channel.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{
     chips::{Chip, Revision, MAP_9287},
     identity::{BringUpError, Identity},
-    phy::ar9287::{power, Prepared},
+    phy::{
+        ar9280,
+        ar9287::{power, Prepared},
+    },
 };
 #[cfg(feature = "kernel-test")]
 use alloc::vec::Vec;
@@ -44,6 +51,9 @@ pub(super) struct Facts {
     factory_antenna: u8,
     rx_chainmask: u8,
     tx_chainmask: u8,
+    /// Record magic (`N87A` / `N80A`) and the record's channel byte.
+    magic: [u8; 4],
+    channel: u8,
 }
 impl Facts {
     pub(super) fn new(
@@ -119,6 +129,111 @@ impl Facts {
             factory_antenna: image[96 + 12].max(image[96 + 13]),
             rx_chainmask: identity.rx_chainmask,
             tx_chainmask: identity.tx_chainmask,
+            magic: *b"N87A",
+            channel: ((frequency - 2407) / 5) as u8,
+        })
+    }
+    /// AR9280 facts for one 20 MHz channel in either band: the PCI
+    /// function, revision, def map, the `phy::ar9280::prepare` result for
+    /// `frequency` and the closed-loop def plan at the 40 half-dB maximum
+    /// (`overlap` is the live `AR_PHY_TPCRG5` overlap Linux reads below
+    /// minor 2, else ignored).
+    pub(super) fn new_ar9280(
+        id: &narf_bus::DeviceId,
+        revision: &Revision,
+        identity: &Identity,
+        prepared: &ar9280::Prepared,
+        image: &[u8],
+        frequency: u16,
+        overlap: u8,
+    ) -> Result<Self, BringUpError> {
+        let channel = if let Some(channel) = ar9280::channel_5ghz(frequency) {
+            channel
+        } else if (2412..=2472).contains(&frequency) && (frequency - 2412) % 5 == 0 {
+            ((frequency - 2407) / 5) as u8
+        } else {
+            return Err(BringUpError::BadIdentity);
+        };
+        if id.vendor != 0x168c
+            || !matches!(id.device, ar9280::DEVID_PCI | ar9280::DEVID_PCIE)
+            || Chip::for_device(id.device) != Some(Chip::Ar9280)
+            || revision.chip != Chip::Ar9280
+            || image.len() != super::chips::MAP_DEF.bytes()
+            || prepared.tune.is_wide()
+            || prepared.tune.center() != frequency
+            || prepared.tune.is_5ghz() != (channel >= 36)
+            || !(1..=3).contains(&identity.rx_chainmask)
+            || !(1..=3).contains(&identity.tx_chainmask)
+        {
+            return Err(BringUpError::BadIdentity);
+        }
+        let plan = ar9280::power::plan(identity, image, prepared.tune, 40, overlap)?;
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(
+            b"NARF AR9280 N80A two-chain closed-loop def legacy20 dual-band board admission v1",
+        );
+        h.update(b"eeprom_def map at word 64; ar9002 AR9280_2 INI modes column 1 (5G) / 4 (2G), rxgain/txgain by type, common, 5G fast clock; set_board_values; closed-loop def set_txpower; AR9280 init_cal OFF_PWDADC AGC/NF/IQ; ChainSel = txchainmask");
+        for v in [
+            id.vendor,
+            id.device,
+            id.subsystem_vendor,
+            id.subsystem_id,
+            identity.eeprom_version,
+            prepared.ini_writes,
+            frequency,
+        ] {
+            h.update(&v.to_le_bytes());
+        }
+        h.update(&revision.mac_version.to_le_bytes());
+        h.update(&[
+            revision.mac_rev,
+            identity.rx_chainmask,
+            identity.tx_chainmask,
+            u8::from(prepared.tune.is_5ghz()),
+        ]);
+        h.update(&identity.mac);
+        h.update(image);
+        for gain in plan.gains {
+            h.update(&gain.to_le_bytes());
+        }
+        h.update(&[plan.count as u8, plan.max_power]);
+        for chain in plan.chains.iter().flatten() {
+            h.update(&chain.tpcrg5.to_le_bytes());
+            for word in chain.pdadc {
+                h.update(&word.to_le_bytes());
+            }
+        }
+        for (register, value) in &plan.registers[..plan.register_count] {
+            h.update(&register.to_le_bytes());
+            h.update(&value.to_le_bytes());
+        }
+        let modal = if prepared.tune.is_5ghz() {
+            ar9280::MODAL_5G
+        } else {
+            ar9280::MODAL_2G
+        };
+        let mac = identity.mac;
+        Ok(Self {
+            request: Request {
+                identity: h.finalize(),
+                mac,
+                device: id.device,
+                frequency_mhz: frequency,
+                filename: format!(
+                    "ath9k/ar9280-admit-v1-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    channel, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ),
+            },
+            // EEP_ANTENNA_GAIN_2G/5G: max over the three antennaGainCh.
+            factory_antenna: image[modal + 16..modal + 19]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0),
+            rx_chainmask: identity.rx_chainmask,
+            tx_chainmask: identity.tx_chainmask,
+            magic: *b"N80A",
+            channel,
         })
     }
     pub(super) fn request(&self) -> Request {
@@ -191,18 +306,13 @@ impl Grant {
         let [device_lo, device_hi] = r.device.to_le_bytes();
         if signer.is_none()
             || b.len() != LENGTH
-            || b[..8] != [b'N', b'8', b'7', b'A', 1, 0, LENGTH as u8, 0]
+            || b[..4] != facts.magic
+            || b[4..8] != [1, 0, LENGTH as u8, 0]
             || b[8..12] != (LENGTH as u32).to_le_bytes()
             || b[12..16] != [0x8c, 0x16, device_lo, device_hi]
             || b[16..48] != r.identity
             || b[48..54] != r.mac
-            || b[54..58]
-                != [
-                    ((r.frequency_mhz - 2407) / 5) as u8,
-                    20,
-                    facts.rx_chainmask,
-                    facts.tx_chainmask,
-                ]
+            || b[54..58] != [facts.channel, 20, facts.rx_chainmask, facts.tx_chainmask]
             || b[60..] != [0; LENGTH - 60]
         {
             return Err(BringUpError::Policy);
