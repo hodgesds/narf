@@ -16,6 +16,7 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    pub host: super::phy8821c::Host,
 }
 pub(super) fn request(power: operating8821c::Info, mac: [u8; 6]) -> Request {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -43,9 +44,16 @@ pub(super) fn request(power: operating8821c::Info, mac: [u8; 6]) -> Request {
         identity: hash.finalize(),
         mac,
         filename: format!(
-            "rtw88/rtw8821ce-station-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "rtw88/{}-station-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            power.host.family(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         ),
+        host: power.host,
     }
 }
 pub(super) enum Source {
@@ -149,6 +157,10 @@ impl Grant {
     pub(super) fn ht5_group(&self, group: usize) -> Option<u8> {
         self.power.ht5_group(group)
     }
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        self.request.host
+    }
     /// Factory CCK/OFDM index ceilings for one 2.4GHz channel group.
     pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
         self.power.group_limits(group)
@@ -166,7 +178,7 @@ impl Grant {
             || &raw[..4] != b"N21S"
             || raw[4..8] != [1, 0, 128, 0]
             || raw[8..12] != 128u32.to_le_bytes()
-            || raw[12..16] != [0xec, 0x10, 0x21, 0xc8]
+            || raw[12..16] != request.host.header()
             || raw[54..56] != [1, 20]
             || &raw[68..70] != b"US"
             || raw[70..] != [0; 58]
@@ -224,6 +236,7 @@ impl Grant {
             self.digest,
             self.indices(),
             self.own(),
+            self.host(),
         )
     }
     pub(super) fn extension_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {

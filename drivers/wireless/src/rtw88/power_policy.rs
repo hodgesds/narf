@@ -404,6 +404,13 @@ impl ExtensionBase {
             ExtensionChip::C21(_) => 0xc821,
         }
     }
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        match &self.chip {
+            ExtensionChip::C22(_) => super::phy8821c::Host::PCI_C22,
+            ExtensionChip::C21(b) => b.host(),
+        }
+    }
     /// Operating primary of this base: 1, or the bound N2xO record's.
     pub(super) fn channel(&self) -> u8 {
         self.channel
@@ -767,6 +774,13 @@ impl Gate {
         match &self.scope {
             Scope::C22 { .. } => 0xc822,
             Scope::C21(_) => 0xc821,
+        }
+    }
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        match &self.scope {
+            Scope::C22 { .. } => super::phy8821c::Host::PCI_C22,
+            Scope::C21(grant) => grant.host(),
         }
     }
     pub(super) fn own(&self) -> [u8; 6] {

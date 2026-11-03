@@ -26,6 +26,7 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    pub host: super::phy8821c::Host,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
@@ -33,6 +34,7 @@ pub struct Info {
     pub thermal: u8,
     pub response_rates: u16,
     pub identity: [u8; 32],
+    pub host: super::phy8821c::Host,
 }
 pub(super) fn request(
     calibration: calibration8821c::Request,
@@ -56,9 +58,16 @@ pub(super) fn request(
         identity: hash.finalize(),
         mac: m,
         filename: format!(
-            "rtw88/rtw8821ce-power-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            "rtw88/{}-power-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            calibration.host.family(),
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
         ),
+        host: calibration.host,
     }
 }
 pub(super) enum Source {
@@ -284,7 +293,7 @@ impl Envelope {
             || &raw[..4] != b"N21P"
             || raw[4..8] != [1, 0, 160, 0]
             || raw[8..12] != 160u32.to_le_bytes()
-            || raw[12..16] != [0xec, 0x10, 0x21, 0xc8]
+            || raw[12..16] != request.host.header()
             || raw[54..56] != [1, 20]
             || &raw[66..68] != b"US"
             || raw[104..] != [0; 56]
@@ -455,6 +464,7 @@ impl Envelope {
                 thermal,
                 response_rates: 0x15f,
                 identity: self.request.identity,
+                host: self.request.host,
             })
         })
         .await

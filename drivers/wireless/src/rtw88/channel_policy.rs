@@ -15,7 +15,8 @@
 //!
 //! Channel 1 remains the base program and its N22Cv2/N21S qualification.
 //! A noninitial channel N (2..=13) is admitted only by an optional signed
-//! `rtw88/rtw882{1,2}ce-channelNN-v1-<mac>.bin` record (tag `O`) whose
+//! `rtw88/rtw882{1,2}ce-channelNN-v1-<mac>.bin` record (tag `O`; an RTL8821CU
+//! board's own `rtw88/rtw8821cu-...` record keyed by its USB VID/PID) whose
 //! identity binds the exact base. The record supplies the measured envelope
 //! (antenna gain, qualified ceiling and peaks) and the TX power selection for
 //! that channel: C22 per-path CCK references, C21 twelve CCK/OFDM TXAGC
@@ -479,12 +480,13 @@ pub(super) fn passive_in(g: &Grant, did: u16, domain: &RegulatoryDomain) -> Resu
 }
 
 /// Per-channel filename of a program qualified over a channel-scoped base:
-/// `rtw88/rtw882Xce-<stem>...` becomes `rtw88/rtw882Xce-chNN-<stem>...`.
-/// Channel 1 keeps the original name.
+/// `rtw88/<family>-<stem>...` becomes `rtw88/<family>-chNN-<stem>...`
+/// (`phy8821c::Host::family`: `rtw882Xce` or `rtw8821cu`). Channel 1 keeps
+/// the original name.
 pub(super) fn scoped_filename(name: &str, channel: u8) -> String {
-    match name.find("ce-") {
+    match name.find('-') {
         Some(at) if channel != 1 => {
-            format!("{}ce-ch{:02}-{}", &name[..at], channel, &name[at + 3..])
+            format!("{}-ch{:02}-{}", &name[..at], channel, &name[at + 1..])
         }
         _ => name.into(),
     }

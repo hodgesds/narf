@@ -49,6 +49,7 @@ pub(super) fn request_c21(
     qualification: [u8; 32],
     indices: [u8; 12],
     mac: [u8; 6],
+    host: super::phy8821c::Host,
 ) -> Request {
     let mut h = narf_crypto::sha256::Sha256::new();
     h.update(b"NARF RTL8821CE ch1/20 RF-A static legacy12 DATA and response-bound WMM BE/TID0 v1");
@@ -63,8 +64,14 @@ pub(super) fn request_c21(
         identity: h.finalize(),
         mac,
         filename: format!(
-            "rtw88/rtw8821ce-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "rtw88/{}-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            host.family(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         ),
     }
 }
@@ -154,8 +161,7 @@ impl Grant {
                 }
             || raw[4..8] != [1, 0, 128, 0]
             || raw[8..12] != 128u32.to_le_bytes()
-            || raw[12..14] != [0xec, 0x10]
-            || raw[14..16] != base.did().to_le_bytes()
+            || raw[12..16] != base.host().header()
             || raw[54..56] != [1, 20]
             || raw[90] & !1 != 0
             || raw[91..] != [0; 37]
@@ -231,6 +237,9 @@ impl Grant {
     }
     pub(super) fn did(&self) -> u16 {
         self.base.did()
+    }
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        self.base.host()
     }
     /// Operating primary this extension was qualified for.
     pub(super) fn channel(&self) -> u8 {

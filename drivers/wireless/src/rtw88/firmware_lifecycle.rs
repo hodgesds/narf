@@ -39,6 +39,9 @@ pub(super) struct Lifecycle<I: Io> {
     pub(super) retained: Mutex<Option<Owner<I>>>,
     status: IrqSafeSpinLock<Status>,
     did: u16,
+    /// C21 host interface handed to the owner (`phy8821c::Interface`):
+    /// PCIe by default, the claimed VID/PID for RTL8821CU.
+    interface: super::phy8821c::Interface,
 }
 impl<I: Io> core::fmt::Debug for Lifecycle<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -89,7 +92,14 @@ impl<I: Io> Lifecycle<I> {
                 error: None,
             }),
             did,
+            interface: super::phy8821c::Interface::Pcie,
         }
+    }
+    /// The same lifecycle behind another C21 host interface. Only before
+    /// any owner exists; every signed C21 record is then keyed by
+    /// `interface.host()`.
+    pub(super) fn on(self, interface: super::phy8821c::Interface) -> Self {
+        Self { interface, ..self }
     }
     pub(super) fn status(&self) -> Status {
         *self.status.lock()
@@ -614,7 +624,7 @@ impl<I: Io> Lifecycle<I> {
         };
         let _attempt = Attempt(self);
         let result = async {
-            let owner = Owner::new(allocate()?, self.did);
+            let owner = Owner::new(allocate()?, self.did).on(self.interface);
             let mut retained = self.retained.lock().await;
             if retained.is_some() || self.removed.load(Ordering::Acquire) {
                 return Err(Error::State);

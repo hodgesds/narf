@@ -27,6 +27,8 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub host: phy8821c::Host,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Board {
@@ -38,6 +40,9 @@ pub(super) struct Board {
     /// `rfe_btg`, raw factory swing bytes); covered by the identity through
     /// the factory map and the hashed filters.
     band: super::radio8821c::BandFacts,
+    /// `phy8821c::Info::interface`'s host: PCI 0x10ec:0xc821 or the claimed
+    /// RTL8821CU VID/PID. Covered by the identity (USB binds it).
+    host: phy8821c::Host,
 }
 impl Board {
     pub(super) fn new(
@@ -80,6 +85,8 @@ impl Board {
             hash.update(&value.to_le_bytes());
         }
         phy8821c::bind_tables(&mut hash, phy).map_err(|_| Error::Identity)?;
+        let host = phy.interface.host();
+        host.bind(&mut hash);
         super::radio8821c::bind_recipe(&mut hash);
         Ok(Self {
             identity: hash.finalize(),
@@ -92,6 +99,7 @@ impl Board {
                 swing_2g: factory.swing_2g(),
                 swing_5g: factory.swing_5g(),
             },
+            host,
         })
     }
     pub(super) fn request(self) -> Request {
@@ -100,9 +108,16 @@ impl Board {
             identity: self.identity,
             mac: m,
             filename: format!(
-                "rtw88/rtw8821ce-iqk-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                m[0], m[1], m[2], m[3], m[4], m[5]
+                "rtw88/{}-iqk-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                self.host.family(),
+                m[0],
+                m[1],
+                m[2],
+                m[3],
+                m[4],
+                m[5]
             ),
+            host: self.host,
         }
     }
 }
@@ -177,6 +192,9 @@ impl Envelope {
     pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
         self.board.band
     }
+    pub(super) fn host(&self) -> phy8821c::Host {
+        self.board.host
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,
@@ -190,8 +208,7 @@ impl Envelope {
             || half(raw, 4) != 1
             || half(raw, 6) != 128
             || u32::from_le_bytes(raw[8..12].try_into().unwrap()) != 128
-            || half(raw, 12) != 0x10ec
-            || half(raw, 14) != 0xc821
+            || raw[12..16] != board.host.header()
             || raw[54] != 1
             || raw[55] != 20
             || &raw[64..66] != b"US"

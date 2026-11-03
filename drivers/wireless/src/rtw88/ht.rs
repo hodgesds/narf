@@ -248,8 +248,8 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
         mac,
         filename: super::channel_policy::scoped_filename(
             &format!(
-                "rtw88/rtw882{}ce-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                if base.did() == 0xc821 { 1 } else { 2 },
+                "rtw88/{}-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                base.host().family(),
                 mac[0],
                 mac[1],
                 mac[2],
@@ -380,8 +380,7 @@ impl Grant {
                 }
             || b[4..8] != if v2 { [2, 0, 0, 1] } else { [1, 0, 192, 0] }
             || b[8..12] != (length as u32).to_le_bytes()
-            || b[12..14] != [0xec, 0x10]
-            || b[14..16] != base.did().to_le_bytes()
+            || b[12..16] != base.host().header()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [1, 20]
@@ -598,6 +597,10 @@ impl Grant {
     }
     pub(super) fn rx_ba_identity(&self) -> ([u8; 32], [u8; 32], u16) {
         (self.request.identity, self.digest, self.base.did())
+    }
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        self.base.host()
     }
     pub(super) fn rx_ba_limit(&self) -> Result<i16, Error> {
         let domain = self.base.current_domain()?;

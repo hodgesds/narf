@@ -758,6 +758,8 @@ pub(super) struct Owner<I: Io> {
     hardware: Option<super::hardware::Features>,
     phy: Option<super::phy::Info>,
     phy8821c: Option<super::phy8821c::Info>,
+    /// C21 host interface; keys the PHY rows and every signed C21 record.
+    interface: super::phy8821c::Interface,
     calibration8821c: Option<super::radio8821c::Info>,
     envelope8821c: Option<alloc::sync::Arc<super::calibration8821c::Envelope>>,
     operating8821c: Option<super::operating8821c::Info>,
@@ -793,6 +795,7 @@ impl<I: Io> Owner<I> {
             hardware: None,
             phy: None,
             phy8821c: None,
+            interface: super::phy8821c::Interface::Pcie,
             calibration8821c: None,
             envelope8821c: None,
             operating8821c: None,
@@ -806,6 +809,10 @@ impl<I: Io> Owner<I> {
             station: None,
             tracking_facts: None,
         }
+    }
+    /// The same owner behind another C21 host interface (before any stage).
+    pub(super) fn on(self, interface: super::phy8821c::Interface) -> Self {
+        Self { interface, ..self }
     }
     pub fn phase(&self) -> Phase {
         self.phase
@@ -1611,12 +1618,18 @@ impl<I: Io> Owner<I> {
         if self.phase != Phase::MacPrepared {
             return Err(Error::State);
         }
+        // The factory map layout (MAC at 0xd0 or USB 0x107) must belong to
+        // the same host interface that keys the rows and records.
+        if factory.usb() != matches!(self.interface, super::phy8821c::Interface::Usb { .. }) {
+            return Err(Error::Unsupported);
+        }
         self.phase = Phase::Failed;
         let info = super::phy8821c::Info::from_factory(
             factory,
             self.mac.ok_or(Error::State)?.cut,
             self.hardware.ok_or(Error::State)?,
-        )?;
+        )?
+        .on(self.interface);
         self.io.begin_phy()?;
         // The firmware antenna report can narrow a physical two-path chip in
         // Linux. This continuation admits only genuine one-path C21 silicon,

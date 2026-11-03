@@ -28,6 +28,10 @@ pub enum EfuseError {
 #[derive(Clone)]
 pub struct Factory8821c {
     logical: [u8; 512],
+    /// RTL8821CU logical map (`rtw8821cu_efuse_parsing`): the MAC sits at
+    /// 0x107 (`struct rtw8821cu_efuse`) instead of the PCI 0xd0; every other
+    /// C21 field (`rtw8821c_efuse`) is shared.
+    usb: bool,
 }
 impl core::fmt::Debug for Factory8821c {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -41,7 +45,10 @@ impl core::fmt::Debug for Factory8821c {
 impl Factory8821c {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn for_test(logical: [u8; 512]) -> Result<Self, EfuseError> {
-        let factory = Self { logical };
+        let factory = Self {
+            logical,
+            usb: false,
+        };
         if !mac_is_valid(factory.mac()) {
             return Err(EfuseError::MacUninitialized);
         }
@@ -49,7 +56,22 @@ impl Factory8821c {
     }
 
     pub fn mac(&self) -> [u8; 6] {
+        if self.usb {
+            return super::usb::efuse_mac(&self.logical);
+        }
         self.logical[0xd0..0xd6].try_into().unwrap()
+    }
+    /// The same logical map read through the RTL8821CU USB host interface:
+    /// the MAC moves to 0x107 and must itself be a valid unicast address.
+    pub(super) fn usb(&self) -> bool {
+        self.usb
+    }
+    pub(super) fn on_usb(self) -> Result<Self, EfuseError> {
+        let factory = Self { usb: true, ..self };
+        if !mac_is_valid(factory.mac()) {
+            return Err(EfuseError::MacUninitialized);
+        }
+        Ok(factory)
     }
     pub fn rfe(&self) -> u8 {
         self.logical[0xca] & 0x1f
@@ -391,6 +413,7 @@ pub(super) fn read_factory8821c_with(
     let map = read_map_with(io, geometry(did)?)?;
     let factory = Factory8821c {
         logical: map[..512].try_into().unwrap(),
+        usb: false,
     };
     if !mac_is_valid(factory.mac()) {
         return Err(EfuseError::MacUninitialized);

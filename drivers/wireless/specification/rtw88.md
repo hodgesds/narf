@@ -3063,11 +3063,34 @@ grant is published. Remaining blockers, verified against the tree:
    Open: the station worker. `interface.rs`/`pci_firmware.rs` still drive
    `packet_core::Core` and `ready_now`; a USB station needs an async worker
    owning `usb_packet::Owner` plus the async register `Io`.
-3. Identity and records. The firmware owner, the N21Q/N21P/N21S/N2x*
-   records and the `power_policy` board identity are keyed by PCI
-   VID/DID 0x10ec/0xc821. RTL8821CU needs its own USB VID/PID-bound signed
-   records. No RTL8821CU board/power measurement exists, and none is
-   invented.
+3. Identity and records (resolved: host-keyed records).
+   `phy8821c::Interface::Usb { vendor, product }` carries the claimed
+   VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,
+   `Host::PCI_C22` for C22). `Lifecycle::on(interface)` /
+   `firmware_transport::Owner::on` hand it to the owner, whose
+   `prepare_phy8821c` applies `Info::on(interface)` and refuses a factory
+   map of the other layout (`Factory8821c::on_usb`: MAC at 0x107,
+   `rtw8821cu_efuse_parsing`). The calibration `Board` retains the host and,
+   for USB only, binds `host-usb` + VID/PID into its identity (after the
+   `intf-usb` table binding), so every downstream identity differs. Each C21
+   record decoder compares header bytes 12..16 with `Host::header()` (vendor
+   LE, device LE) and names its file `rtw88/<Host::family()>-...`
+   (`rtw8821ce`/`rtw8822ce` on PCI, `rtw8821cu` on USB): N21Q
+   (`calibration8821c`), N21P (`operating8821c`), N21S
+   (`station_power8821c`), N21L (`station_profile`), N21W
+   (`tracking8821c`), N21H (`ht`), N21R (`rx_ba_power`), N21T
+   (`tx_ba_power`), N21X (`protection`) and every N2x* continuation
+   (`qualification`, which also carries channel/HT40/VHT80/coding/QoS/
+   fallback/dm/LPS kinds). The host flows Board -> `calibration8821c::Request`
+   -> `operating8821c::{Request, Info}` -> `station_power8821c::Request` ->
+   `Gate::host`/`ExtensionBase::host` -> `station_profile::Grant::host` ->
+   `ht::Grant::host`. `channel_policy::scoped_filename` splits at the first
+   `-` so per-channel USB names stay distinct. PCI identities, headers and
+   filenames are byte-identical to the PCI-only encoding. No RTL8821CU
+   board/power measurement or record exists and none is invented: an
+   unprovisioned 8821CU fails `Source::Registered` at N21Q and stays
+   unadmitted before any radio TX. Written, unexecuted:
+   `smoke_rtw8821cu_calibration_records_keyed_by_usb_host`.
 4. Tables (resolved). Linux selects rows with `cond.intf = INTF_USB`
    (`phy.c::rtw_phy_setup_phy_cond`, `check_positive`).
    `phy/rtl8821c.rs::Info::interface` (`Interface::{Pcie, Usb}`, set with

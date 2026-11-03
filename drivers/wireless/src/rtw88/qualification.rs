@@ -42,7 +42,8 @@ pub(super) const PAYLOAD: usize = 64;
 pub(super) struct Kind {
     /// Fourth magic byte and kind-version tag.
     pub(super) tag: u8,
-    /// Filename stem: `rtw88/rtw882{1,2}ce-<stem>-v1-<mac>.bin`.
+    /// Filename stem: `rtw88/<family>-<stem>-v1-<mac>.bin`, family
+    /// `rtw882{1,2}ce` (PCI) or `rtw8821cu` (USB, `phy8821c::Host`).
     pub(super) stem: &'static str,
     /// Exact upstream source contract hashed into the identity.
     pub(super) source: &'static [u8],
@@ -55,6 +56,8 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Host identity keying the record header (`phy8821c::Host`).
+    pub host: super::phy8821c::Host,
 }
 
 /// N2xO channel records bind the unscoped base; every other kind binds the
@@ -86,8 +89,8 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
         mac,
         filename: super::channel_policy::scoped_filename(
             &format!(
-                "rtw88/rtw882{}ce-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                if did == 0xc821 { 1 } else { 2 },
+                "rtw88/{}-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                gate.host().family(),
                 kind.stem,
                 mac[0],
                 mac[1],
@@ -98,6 +101,7 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
             ),
             if kind.tag == b'O' { 1 } else { gate.channel() },
         ),
+        host: gate.host(),
     })
 }
 
@@ -222,8 +226,7 @@ impl Grant {
             || b[..4] != [b'N', b'2', chip, kind.tag]
             || b[4..8] != [1, 0, LENGTH as u8, 0]
             || b[8..12] != (LENGTH as u32).to_le_bytes()
-            || b[12..14] != [0xec, 0x10]
-            || b[14..16] != did.to_le_bytes()
+            || b[12..16] != request.host.header()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [kind.tag, 1]

@@ -10,11 +10,83 @@ mod tables;
 
 /// Host interface of `phy.c::rtw_phy_setup_phy_cond` (`cond.intf`:
 /// `INTF_PCIE` BIT(0), `INTF_USB` BIT(1); SDIO is not supported here).
+/// USB carries the claimed device's VID/PID (`rtw8821cu.c::rtw_8821cu_id_table`),
+/// which keys every signed C21 record of that board ([`Host`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Interface {
     #[default]
     Pcie,
-    Usb,
+    Usb {
+        vendor: u16,
+        product: u16,
+    },
+}
+impl Interface {
+    pub(super) fn host(self) -> Host {
+        match self {
+            Self::Pcie => Host::PCI_C21,
+            Self::Usb { vendor, product } => Host {
+                vendor,
+                device: product,
+                usb: true,
+            },
+        }
+    }
+}
+/// Host identity that keys a signed C21/C22 board record: the record header
+/// (bytes 12..16, vendor LE then device LE), the per-board filename family
+/// and, for USB only, the board identity hash. PCI keys stay the historical
+/// 0x10ec:0xc821 / 0x10ec:0xc822 with `rtw882xce-*` filenames, so every PCI
+/// identity, filename and header is byte-identical to the PCI-only encoding.
+/// No RTL8821CU record is provisioned; a USB board without its own records
+/// stays unadmitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Host {
+    pub vendor: u16,
+    pub device: u16,
+    pub usb: bool,
+}
+impl Host {
+    pub const PCI_C21: Self = Self {
+        vendor: 0x10ec,
+        device: 0xc821,
+        usb: false,
+    };
+    pub const PCI_C22: Self = Self {
+        vendor: 0x10ec,
+        device: 0xc822,
+        usb: false,
+    };
+    /// The PCI host of chip `did` (0xc821 or 0xc822).
+    pub(in crate::rtw88) fn pci(did: u16) -> Self {
+        if did == 0xc822 {
+            Self::PCI_C22
+        } else {
+            Self::PCI_C21
+        }
+    }
+    /// Record header bytes 12..16.
+    pub(in crate::rtw88) fn header(self) -> [u8; 4] {
+        let [v0, v1] = self.vendor.to_le_bytes();
+        let [d0, d1] = self.device.to_le_bytes();
+        [v0, v1, d0, d1]
+    }
+    /// Filename family: `rtw8821ce`/`rtw8822ce` (PCI) or `rtw8821cu` (USB),
+    /// matching Linux's `rtw8821ce.c`/`rtw8821cu.c` driver names.
+    pub(in crate::rtw88) fn family(self) -> &'static str {
+        match (self.usb, self == Self::PCI_C22) {
+            (true, _) => "rtw8821cu",
+            (false, true) => "rtw8822ce",
+            (false, false) => "rtw8821ce",
+        }
+    }
+    /// USB boards bind their VID/PID; PCI binds nothing (hash unchanged).
+    pub(in crate::rtw88) fn bind(self, hash: &mut narf_crypto::sha256::Sha256) {
+        if self.usb {
+            hash.update(b"host-usb");
+            hash.update(&self.header());
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Info {
@@ -38,7 +110,9 @@ pub(super) struct Info {
 /// same frozen tables; SDIO would not and stays refused.
 pub(super) fn rows(info: Info, kind: usize) -> Option<&'static [(u16, u32)]> {
     match info.interface {
-        Interface::Pcie | Interface::Usb => tables::select(info.cut, info.package, info.rfe, kind),
+        Interface::Pcie | Interface::Usb { .. } => {
+            tables::select(info.cut, info.package, info.rfe, kind)
+        }
     }
 }
 impl Info {
@@ -71,7 +145,7 @@ impl Info {
 }
 pub(super) fn bind_tables(hash: &mut narf_crypto::sha256::Sha256, info: Info) -> Result<(), Error> {
     // PCIe hashes stay byte-identical; USB binds its interface first.
-    if info.interface == Interface::Usb {
+    if matches!(info.interface, Interface::Usb { .. }) {
         hash.update(b"intf-usb");
     }
     for kind in 0..5 {

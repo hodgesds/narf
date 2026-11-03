@@ -90,8 +90,8 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
         mac,
         filename: super::channel_policy::scoped_filename(
             &format!(
-                "rtw88/rtw882{}ce-rts-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                if did == 0xc821 { 1 } else { 2 },
+                "rtw88/{}-rts-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                h.host().family(),
                 mac[0],
                 mac[1],
                 mac[2],
@@ -200,8 +200,7 @@ impl Grant {
             || b[..4] != *if did == 0xc821 { b"N21X" } else { b"N22X" }
             || b[4..8] != [1, 0, 128, 0]
             || b[8..12] != 128u32.to_le_bytes()
-            || b[12..14] != [0xec, 0x10]
-            || b[14..16] != did.to_le_bytes()
+            || b[12..16] != base.ht().host().header()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [1, 20]

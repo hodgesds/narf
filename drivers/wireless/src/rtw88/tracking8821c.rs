@@ -104,8 +104,14 @@ pub(super) fn request(
         mac,
         filename: super::channel_policy::scoped_filename(
             &format!(
-                "rtw88/rtw8821ce-power-track-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                "rtw88/{}-power-track-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                gate.host().family(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
             ),
             gate.channel(),
         ),
@@ -209,7 +215,7 @@ impl Grant {
             || b[..4] != *b"N21W"
             || b[4..8] != [1, 0, 192, 0]
             || b[8..12] != 192u32.to_le_bytes()
-            || b[12..16] != [0xec, 0x10, 0x21, 0xc8]
+            || b[12..16] != base.host().header()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [1, 20]

@@ -309,7 +309,10 @@ fn smoke_rtw8821cu_phy_usb_interface_rows_match_linux_references() -> TestResult
         for (package, rfes) in packages.iter().enumerate() {
             for (rfe_index, kinds) in rfes.iter().enumerate() {
                 let pcie = info(cut as u8, package as u8, (rfe_index * 2) as u8);
-                let usb = pcie.on(phy8821c::Interface::Usb);
+                let usb = pcie.on(phy8821c::Interface::Usb {
+                    vendor: 0x0bda,
+                    product: 0xc811,
+                });
                 for (kind, expected) in kinds.iter().enumerate() {
                     if phy8821c::rows(usb, kind) != phy8821c::rows(pcie, kind) {
                         return TestResult::Fail("INTF_USB selected different C21 rows");
