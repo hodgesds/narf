@@ -3301,7 +3301,8 @@ chunks; the present path never surveys. Every session invalidates; a
 latched `present` flushes; console restore, legacy guards and recovery
 disable.
 
-`intel_gpu_psr` is display 14's PSR1: `Sink::read`,
+`intel_gpu_psr` is display 14's PSR1 and PSR2 with selective fetch:
+`Sink::read`,
 `compute_psr1(sink, timing, vbt, wm_level_disabled)` (typed `Refusal`;
 `latched()` refusals hold for the card's lifetime; the VBT refusals
 `VbtDisabled` and `VbtPanelByPnpId` come first and are not latched),
@@ -3322,6 +3323,25 @@ its `wm_level_disabled` is true; a completed (or rolled-back) one clears it
 when false. Console and surface restore, legacy drain and recovery disable
 it. `register_wm_level_disabled(Some(provider))` installs the Wa_14015648006
 input; without a provider or a proved value PSR is refused.
+After PSR1 qualifies, `psr2_source(regs, aux, sink, pci)` reads the live
+Pipe-A facts (`Psr2Source`: display stepping, pipe bpp, lanes, the sink's
+trained link rate, set context latency, DSC/joiner/splitter, and the
+`QUIRK_FW_SYNC_LEN` identity from the `Platform::psr_pci_ids` hook, inert by
+default) and `compute_psr2(sink, timing, panel, source)` returns a `Psr2` or
+a typed `Psr2Refusal`, which KMS records and answers with PSR1.
+`Psr::enable_su(regs, aux, psr1, psr2, commit)` enables PSR2 (sink ALPM and
+PSR2 configuration, the commit's selective fetch, then the source);
+`psr2_ctl`, `sink_cfg_psr2`, `man_trk_ctl`, `man_trk_ctl_full_frame_update`
+and `sel_fetch_update(psr2, commit, previous_areas)` give the register values
+(`SuCommit`: damage, plane source, scaler, `CursorPlane`). On a PSR2 owner,
+`pause`, `resume`, `idle`, `wait_idle` and `disable` use the PSR2 registers;
+`ready_for_update`, `sel_fetch` and `program_sel_fetch_noarm` / `_arm` /
+`_cursor` drive one selective update, and `frame_change_event` writes
+`CURSURFLIVE`. `intel_gpu_kms::Device::selective_session` leaves an active
+PSR2 running, and `Guard::present_damaged(object, geometry, damage)`
+programs the commit's selective fetch around the arm (frame-change event,
+bounded deep-sleep wait whose timeout exits PSR2); the KMS worker uses both
+for every primary present. Every other session exits PSR2 as it exits PSR1.
 
 `intel_gpu_xelpg_wm::check_vblank` returns the pipe's `wm_level_disabled`
 (`skl_wm_check_vblank`), and `wm_level_disabled(timing, latency, wm0_lines)`
@@ -6149,9 +6169,16 @@ relit in it by the monitor, like a mode request, and a failed relight
 returns every display to XRGB8888 with its preferred mode, as does the last
 DRM file closing. `DRM_IOCTL_MODE_DIRTYFB` (DRM master) presents a dumb
 framebuffer again on every CRTC showing it; a GEM framebuffer is scanned in
-place and needs nothing. `drm::fb_cmd::DirtyCmd` decodes the request and
-refuses `drm_mode_dirtyfb_ioctl`'s -EINVAL cases (clip count without clips or
-the reverse, unknown flags, unpaired ANNOTATE_COPY, over 256 clips);
+place and needs nothing. The request is copied (EFAULT) before the master
+check (EACCES), as `drm_ioctl` does. `drm::fb_cmd::DirtyCmd::decode` masks
+unknown flag bits as `drm_mode_dirtyfb_ioctl` does; the framebuffer lookup
+(ENOENT) precedes `DirtyCmd::validate`'s -EINVAL cases (clip count without
+clips or the reverse, unpaired ANNOTATE_COPY, a count that is negative as
+`int` or over 256), and the clip copy (EFAULT) comes last.
+`DirtyCmd::damage` builds `drm_atomic_helper_dirtyfb`'s damage
+(`drm::fb_cmd::Damage`: whole plane without clips, every second clip under
+ANNOTATE_COPY), and `Damage::from_blob` / `Damage::merged` are the
+FB_DAMAGE_CLIPS blob check and `drm_atomic_helper_damage_merged`;
 `DirtyCmd::rows` reduces the clips to the rows they cover (copy annotations
 count destinations only) and a request covering none presents nothing. A
 native linear 8888 frame goes to `amdgpu_native_kms::present_damaged(display,
@@ -8853,7 +8880,13 @@ is removed by RMFB or `Card::release_file_framebuffers`; `gem_owner` is
 the shared owner test. A registered owned Intel internal panel installs
 `intel_gpu_kms`. Its per-card bounded FIFO (`intel_gpu_kms_queue`, at most
 32 waiting jobs) serializes SETCRTC, PAGE_FLIP, SETPLANE, atomic/property
-updates, DIRTYFB, master changes, cursor updates and removal. Foreground
+updates, DIRTYFB, master changes, cursor updates and removal. DIRTYFB
+admission copies the request, checks master, looks the framebuffer up, then
+validates and copies the clips (Linux's errno order); its clips, and the
+primary plane's FB_DAMAGE_CLIPS blob (looked up as u32; an unknown blob or a
+length that is not whole `drm_mode_rect`s is EINVAL; it reads back 0),
+become the planned present's damage, which `Backend::present_damaged`
+carries to the display owner. Foreground
 admission copies all user arrays, resolves input fences, retains GEM/dumb
 backing, reserves event capacity and installs any native out-fence fd before
 publishing the owned job. No user address or ioctl context enters the worker.
@@ -8955,8 +8988,10 @@ Before takeover, the console/cursor pumps and cached CPU framebuffer views
 are paused and old scanout epochs drained. The original contiguous console
 allocation stays retained and remains the fbdev mapping; scattered GEM pages
 are never published as a contiguous framebuffer. PSR1/2 is disabled and
-verified idle at takeover. On display 14 the owner itself re-enables PSR1
-after a latched GEM framebuffer and exits it at every session start. Restoring the
+verified idle at takeover. On display 14 the owner itself re-enables PSR1,
+or PSR2 with selective fetch, after a latched GEM framebuffer, and exits it
+at every session start except a primary present's, which keeps PSR2 running
+as a selective update. Restoring the
 console uses the same fresh flip-done/SURFLIVE/frame-count proof before GEM
 PTEs and owners are retired; `shutdown_restored_console` then restores only
 owned interrupt-mask/enable bits. Legacy modeset/HPD and display PM acquire

@@ -639,8 +639,12 @@ Composition points and named omissions:
   VBT: eDP PSR needs the panel's VBT `psr.enable` and
   takes the VBT TP wake times and idle frames (§20,
   "Display-14 PSR inputs, VBT gate and off-path FBC
-  carve"). Selective fetch and Panel Replay are not
-  offered on display 14.
+  carve"). The same owner runs PSR2 with selective
+  fetch on display 14, including the primary's
+  `SEL_FETCH_PLANE_*` and the cursor's
+  `SEL_FETCH_CUR_CTL`, from each commit's frame damage
+  (§20, "Display-14 PSR2 selective update and frame
+  damage"). Panel Replay is not offered on display 14.
 - On display 14, `notify_scanout_dirty` takes a DC_off
   reference (§12.1) before `EDP_RUNTIME` and releases it
   after, so a PSR2 SU write never reaches a power-gated
@@ -2402,11 +2406,11 @@ a late poll that finds the condition met progresses instead of timing out.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. The MEI GSC proxy client, PXP, GT1 frequency/idle sysfs and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap (read-only private PFN mapping with VM_DONTCOPY/VM_DONTEXPAND semantics in the syscall layer), `metrics/<uuid>/id`, `dev.xe.observation_paranoid` and i915 GETPARAM 57 implemented; OAR/OAC exec-queue streams, OA syncs, media-GT OAM, steered manual capture, coredump process/time facts and remaining i915 perf interfaces (PERF_OPEN, ADD/REMOVE_CONFIG, query item 3, PERF_REVISION) remain |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); PSR2 with selective fetch on that panel implemented (§20), driven by FB_DAMAGE_CLIPS and DIRTYFB damage and falling back to PSR1 with a typed reason; TBT, HDMI FRL, UHBR, a second concurrent external route and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR1 wins over FBC while enabled (Wa_14016291713, no stepping readout); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR wins over FBC while enabled (PSR1: Wa_14016291713, no stepping readout; PSR2: selective update refuses FBC); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -6287,3 +6291,119 @@ Fixtures, all unexecuted in this slice:
 - `smoke_i915_observed_discovery_and_immutable_facts_after_loss` and
   `smoke_i915_discovery_missing_cross_platform_and_faulted_copies` now also
   cover GETPARAM 57.
+
+### Display-14 PSR2 selective update and frame damage — native fixtures added
+
+This slice adds PSR2 with selective fetch to the KMS-owned MTL/Arrow Pipe-A
+eDP, and the frame damage that drives it. It supersedes the Remaining bullet
+of "Display-14 PSR1 under KMS ownership". Sources are Linux b90c984d:
+`intel_psr.c`, `intel_psr_regs.h`, `intel_alpm.c`,
+`intel_dp_aux.c::intel_dp_aux_fw_sync_len`, `intel_quirks.c`,
+`intel_display_device.c` (display stepping), `intel_display.c`,
+`intel_crtc.c::intel_pipe_update_start`, `skl_universal_plane.c`,
+`intel_cursor.c`, `intel_fbc.c`, `drm_framebuffer.c::drm_mode_dirtyfb_ioctl`,
+`drm_damage_helper.c`, `drm_atomic_uapi.c` and `drm_property.c`.
+
+**Damage.** DIRTYFB now checks in Linux's order: the request copy (EFAULT),
+the master check (EACCES), the framebuffer lookup (ENOENT), the clip count
+(EINVAL), then the clip copy (EFAULT). Unknown flag bits are masked, not
+refused, so the existing fixture that expected a refusal now asserts the mask.
+On the Intel KMS card the clips become the re-present's damage as
+`drm_atomic_helper_dirtyfb` builds it: every second clip under ANNOTATE_COPY,
+and no clips for the whole plane. i915 instead ignores the clips and flushes
+the whole frontbuffer, but every Intel KMS change here is a commit, so the
+helper's semantics apply. The Intel primary plane now carries
+FB_DAMAGE_CLIPS. Its blob id is looked up as a u32, an unknown blob or a
+length that is not whole `drm_mode_rect`s is EINVAL, and the property reads
+back 0. A present merges the damage as `drm_atomic_helper_damage_merged`
+does: clamped to the plane source, and the whole plane when the source moved.
+
+**Qualification.** Once PSR1 qualifies, `compute_psr2` runs
+`intel_sel_update_config_valid` for display 14 with Linux's defaults. The
+sink must support SU and `pipe_bpp` must be at most 30. The IO and fast wake
+lines come from `intel_alpm_compute_params`: 42 µs, or 44 µs under the
+`QUIRK_FW_SYNC_LEN` laptop, at most 12 lines and at least 7. The PSR2
+block-count lines must fit the vblank, then the SDP prior-scanline
+indication (in Linux's u32 arithmetic) and `psr2_granularity_check` (display
+14 keeps the sink's Y granularity), then the late vblank check. The live
+facts are the `GMD_ID_DISPLAY` stepping, `PIPE_MISC`, `TRANS_DDI_FUNC_CTL`,
+`TRANS_SET_CONTEXT_LATENCY`, the pipe DSS registers, the PCI identity and the
+sink's trained link rate (`DP_LINK_BW_SET`, or the eDP 1.4 rate-select
+table). A refusal is a typed `Psr2Refusal`, recorded on the owner, and PSR1
+runs instead. Two choices are stricter than Linux. DSC, a joiner or the MSO
+splitter refuses PSR2, because the slice alignment and Wa_14014971492 are not
+modelled. The late check uses the live set context latency where Linux
+computes 0.
+
+**Enable and activation.** The sink gets `DP_RECEIVER_ALPM_CONFIG` (enable,
+lock-error IRQ), then the PSR2 `DP_PSR_EN_CFG` (with SU-region scanline
+capture when the indication is required), then `DP_SET_POWER` D0. Next comes
+the qualifying commit's selective fetch over the whole plane, then the
+source: `PSR_MASK`, `psr_irq_control`, Wa_14015648006 and, on display 14.00
+A0..A3, Wa_16014451276 and Wa_16012604467. `hsw_activate_psr2` writes
+`EDP_PSR_CTL` 0, then `EDP_PSR2_CTL` with the idle frames, frames before SU,
+the VBT PSR2 TP2 time, the block count and the wake lines. Every refusal
+precedes the first write. Disable clears PSR2, undoes the two A-step and
+watermark workarounds, and clears the sink's PSR and ALPM configuration.
+
+**Selective update.** The KMS worker runs a primary present in a selective
+session, which leaves an active PSR2 running. The commit computes
+`intel_psr2_sel_fetch_update`. The damage gives the SU rows, aligned to the
+granularity. A failed calculation, a scaler or an unsupported cursor gives a
+continuous full frame instead. Every visible plane that crosses the SU area
+fetches its rows: always the primary, and the cursor when it crosses (its
+fetch is disabled when it leaves). Without early transport the area is not
+grown to the cursor. The primary's no-arm registers are written first, then
+the PSR frame-change event, a `CURSURFLIVE` write. Linux uses that event on
+its DSB path; its MMIO path relies on the vblank interrupt, which this driver
+does not have. PSR2 then has 50 ms to leave deep sleep. On timeout Linux
+proceeds; here PSR2 also exits, and the session end re-arms it.
+`PSR2_MAN_TRK_CTL` and `SEL_FETCH_PLANE_CTL` precede the plane arm.
+`SEL_FETCH_CUR_CTL`, with `CURBASE` rewritten unchanged, follows it. Single
+full frame (`intel_psr_configure_full_frame_update`) is modelled but never
+written, because no frontbuffer origin exists here.
+
+**Everything else is unchanged.** Cursor, color, DSB, console and legacy
+sessions and the external pass exit PSR2 and wait for its idle exactly as
+for PSR1, and the guard re-arms it. FBC stays refused while PSR2 is enabled
+("Selective update enabled"). DC handling is unchanged: PSR2 holds no DC_off
+reference, and every conversation runs inside the session's.
+
+**Remaining.** Panel Replay stays refused. Not covered: PSR2 with DSC, a
+joiner or the splitter; early transport and DC3CO (display 20+, or disabled
+in Linux); and hardware validation of the frame-change wake on display 14.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `drivers/gpu/drm/fb_legacy`: `dirtyfb_checks_follow_drm_mode_dirtyfb_ioctl_order`,
+  `dirtyfb_damage_follows_drm_atomic_helper_dirtyfb` and
+  `fb_damage_clips_blob_and_merge_follow_drm_damage_helper`.
+- `drivers/gpu/intel_gpu_kms`: `intel_kms_dirtyfb_errnos_follow_drm_mode_dirtyfb_ioctl_order`,
+  `intel_kms_dirtyfb_clips_become_the_present_damage`,
+  `intel_kms_fb_damage_clips_validates_like_drm_atomic_set_property` and
+  `intel_kms_commit_damage_reaches_the_display_owner`.
+- `drivers/gpu/intel_gpu_psr`, register and sink models:
+  `smoke_psr2_qualifies_like_intel_sel_update_config_valid`,
+  `smoke_psr2_refusals_fall_back_with_typed_reasons`,
+  `smoke_psr2_source_reads_the_live_pipe_and_link`,
+  `smoke_psr2_ctl_and_sink_bytes_follow_hsw_activate_psr2`,
+  `smoke_psr2_enable_programs_alpm_sink_then_sel_fetch_then_source`,
+  `smoke_psr2_exit_resume_and_disable_use_the_psr2_registers`,
+  `smoke_psr2_su_area_follows_intel_psr2_sel_fetch_update`,
+  `smoke_psr2_cursor_joins_the_su_area_commit` and
+  `smoke_psr2_sel_fetch_registers_follow_the_plane_and_cursor_arms`.
+- `drivers/gpu/intel_gpu_psr`, the production `Device`/`Guard` path (x86_64):
+  `smoke_psr2_kms_enables_selective_fetch_after_latch`,
+  `smoke_psr2_kms_damaged_present_runs_a_selective_update`,
+  `smoke_psr2_kms_deep_sleep_timeout_exits_before_the_arm`,
+  `smoke_psr2_kms_cursor_joins_the_selective_fetch`,
+  `smoke_psr2_kms_unqualified_falls_back_to_psr1_with_typed_reason`,
+  `smoke_psr2_kms_external_pass_brackets_psr2` and
+  `smoke_psr2_kms_fbc_stays_off_and_disable_precedes_console`.
+
+Changed fixture: `dirtyfb_request_validation_and_damaged_rows_follow_linux`
+expected an unknown DIRTYFB flag to be refused; it now asserts that Linux
+masks it. The KMS mock treats a `CURSURFLIVE` write as the frame-change event
+(read-only register, wakes a deep-sleeping PSR2), lets a cleared
+`EDP_PSR2_ENABLE` idle the PSR2 status, and reports a PCI identity.
+
