@@ -1191,8 +1191,8 @@ descriptor/runtime variants before they can be claimed supported. The Linux
   ath10k currently rejects this ID as wrong-driver.
 - `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI).
 
-Every chip row shares these tree blockers (partly lifted for AR9287 by the
-profile foundation below): `identity.rs::identify` rejects
+Every chip row shares these tree blockers (lifted for AR9287 by the profile
+foundation and native owner below): `identity.rs::identify` rejects
 any `AR_SREV` macro version other than 0xC0 (AR9285) before the first write;
 `decode_identity` accepts only the 376-byte `ar5416_eeprom_4k` map with chain
 masks 1/1; `initvals.rs` carries only the AR9285_1_2 tables; `phy/` and
@@ -1208,8 +1208,7 @@ AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
 `eeprom_9003.c`, per-chip `ar9003_*_initvals.h`, `ar9003_calib.c`, plus MCI
 for AR9462/AR9565.
 
-**Per-chip profile foundation (`ar9287_enablement`, in progress — not
-admitted).** `chips.rs` decodes `AR_SREV` exactly as
+**Per-chip profile foundation (`ar9287_enablement`).** `chips.rs` decodes `AR_SREV` exactly as
 `hw.c::ath9k_hw_read_revisions` (new `0xff` format: `(srev & 0xfffc0000) >> 12`
 plus `AR_SREV_REVISION2`; legacy format: `MS(AR_SREV_VERSION)` plus
 `AR_SREV_REVISION`) into `Chip::{Ar5416, Ar9160, Ar9280, Ar9285, Ar9287}`,
@@ -1351,14 +1350,59 @@ foreign or out-of-envelope record leaves the device unadmitted. Smokes
 `smoke_ath9k_ar9287_admission_record_binds_device_map_and_envelope`,
 `smoke_ath9k_ar9287_unprovisioned_or_foreign_record_stays_unadmitted`.
 
-Still missing before `0x002d`/`0x002e` can be matched: the probe
-(`identify_chip` → `phy::ar9287::prepare` → `admission::Source::Registered`
-→ `calibration::ar9287` under `Grant::ceiling`), and the native station
-wiring — the MAC/packet/station/interface owners are typed on the 4k map
-and the AR9285 calibration `Report`, so they need a chip-generic profile
-(AR9287 `Clock::AsyncFifo`/`async_fifo_pcu`/`dma_txbuf(0x700)`,
-`select_chains`, two-chain factory MAC/mask checks). No AR9287 device is
-matched.
+**AR9287 native station (`ar9287_enablement`).** The MAC, packet,
+station and interface owners are generic over the calibrated chip.
+`mac::Profile` carries the factory masks, MAC clock and `AR_PCU_TXBUF_CTRL`
+size: `Profile::AR9285` (1/1, `Clock::Ofdm2g`, 0x380) keeps
+`mac::prepare` byte-identical, `Profile::ar9287` uses the factory two-chain
+masks, `Clock::AsyncFifo` on 1.3+ and 0x700; `prepare_chip` runs
+`async_fifo_pcu` immediately before `ath9k_hw_set_dma` as `ath9k_hw_reset`
+does, and requires the retained map's rxMask/txMask (base header offsets
+18/19, shared by the 4k and AR9287 maps) to equal the profile. `packet::Port`
+gains `mac_clock` (used by `set_peer`) and `tx_chainmask`
+(`descriptor::select_chains` on every single-descriptor submission when it
+is not 1). `packet_native::Native` holds a `Calibrated::{Ar9285, Ar9287}`
+profile; `Native::new_ar9287` binds the PCI ID `0x002d`/`0x002e` to the
+grant's device and primary, the exact map length and masks, the factory
+`rfSilent` input, a single-channel mask (the record binds one primary) and
+the open-loop rate registers `phy::ar9287::power::plan` derives at the
+calibrated ceiling, which every physical readback re-checks.
+`Calibrated::permitted` re-proves the host permission and, for AR9287,
+the signed record (`Grant::invoke`) with `Grant::ceiling(host)` no lower
+than the calibrated power. HT, BA, QoS, PS, the AR9285 periodic/ANI
+receipts and retuning stay AR9285-only (no `ht::Facts`, the AR9285
+`channels` controller is absent so retune requests fail closed).
+
+`ar9287_owner.rs` registers `0x002d` (`ath9k-ar9287`) and `0x002e`
+(`ath9k-ar9287e`) with the same singleton address reservation as AR9285.
+Probe: `identity::identify_chip(Chip::Ar9287)` →
+`phy::ar9287::prepare` at 2412 MHz → `admission::Facts::new` →
+`Source::Registered.load`; a missing, unsigned or foreign record parks the
+chip (`disable_and_sleep`), logs the request filename and refuses the bind.
+Bring-up (scheduled retries on `Policy`): `calibration::ar9287` runs under
+`Permission::with_ceiling(Grant::ceiling(host))` with the record and the
+host permission re-checked on every poll; then `Native::new_ar9287` →
+`mac::prepare_chip` → optional MSI → `Packet::prepare` → `station::Radio`
+(noise seed: chain-0 sanitized NF) → `interface::publish`. Periodic:
+every `ATH_LONG_CALINTERVAL` (30 s, `link.c::ath_ani_calibrate`) the
+supervisor runs the `ar9002_hw_calibrate(longcal)` AR9287 step,
+`ar9287_hw_olc_temp_compensation`, through `Station::long_calibration` →
+`Packet::long_calibration` (no transmission in flight) → `Native` under
+`access` (PCI, physical readback, permission, record). PA offset
+calibration is AR9285/AR9271-only on Linux and ADC DC is an HT40
+per-calibration, so neither runs on this 20 MHz owner. Remove retires the
+station, proves DMA stopped and only then releases the address; system
+suspend retires the station and FULL_SLEEPs the chip, and resume does not
+republish (no generation reset on this profile). Smokes (written, not
+executed): `smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo`,
+`smoke_ath9k_ar9287_native_profile_binds_admission_and_chains`.
+
+Known AR9287 gaps: the station is fixed to the recorded 2412 MHz primary
+(no retune, no generation reset/resume republish); periodic NF/IQ
+per-calibration is not run (only the long-calibration temperature
+compensation); HT20/HT40 TX power and every HT owner are out of scope as for
+the AR9285 legacy base; closed-loop maps stay refused. No physical AR9287
+receipt exists.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

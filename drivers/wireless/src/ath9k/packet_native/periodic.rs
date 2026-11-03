@@ -101,9 +101,13 @@ impl Native {
         ),
         Error,
     > {
+        // Periodic HT/ANI sources are AR9285 receipts only.
+        let super::Calibrated::Ar9285(report) = self.calibrated else {
+            return Err(Error::State);
+        };
         self.periodic_invoke(|| {
             Ok((
-                self.report,
+                report,
                 match &self.powers {
                     Some(InstalledPower::Forty(actual)) => Some(*actual),
                     _ => None,

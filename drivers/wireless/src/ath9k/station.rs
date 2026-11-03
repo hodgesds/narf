@@ -413,6 +413,14 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
         self.packet.interrupt()
     }
+    /// Periodic long calibration of a live station (AR9287 open-loop
+    /// temperature compensation); a closed station has none.
+    pub(super) fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
+        if self.terminal() {
+            return Err(Error::State);
+        }
+        self.packet.long_calibration().map_err(Error::Transport)
+    }
     /// Stop (if still running) and report whether the packet owner proved
     /// DMA quiescence and released its storage.
     pub(super) fn retire(&mut self) -> bool {

@@ -84,6 +84,21 @@ impl Permission {
     pub(super) fn budget(self) -> u8 {
         self.ceiling
     }
+    /// Current permission for an AR9287 report whose signed grant lowered
+    /// the host ceiling (`admission::Grant::ceiling`).
+    pub(super) fn allows_ar9287(self, report: &ar9287::Report, ceiling: u8) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == self.frequency
+            && ceiling <= self.ceiling
+            && ceiling >= report.max_power_half_dbm
+    }
+    /// Same country and frequency with the given (lower) signed ceiling.
+    pub(super) fn with_ceiling(self, ceiling: u8) -> Self {
+        Self {
+            ceiling: ceiling.min(self.ceiling),
+            ..self
+        }
+    }
     pub(super) fn current_in(self, domain: &RegulatoryDomain) -> bool {
         Self::from_domain_at(domain, self.frequency)
             .is_ok_and(|p| p.country == self.country && p.ceiling >= self.ceiling)

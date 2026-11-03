@@ -75,6 +75,19 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Port {
+    /// MAC clock of the prepared chip (`ath9k_hw_set_clockrate`).
+    fn mac_clock(&self) -> super::mac::Clock {
+        super::mac::Clock::Ofdm2g
+    }
+    /// Factory `txMask` used for `set11nChainSel`; single-chain by default.
+    fn tx_chainmask(&self) -> u8 {
+        1
+    }
+    /// One AR9287 long-calibration step (`ar9287_hw_olc_temp_compensation`)
+    /// under the current physical source; other profiles have none.
+    fn long_calibration(&self) -> Result<Option<i32>, Error> {
+        Err(Error::State)
+    }
     /// Actual fresh calibrated physical owner. RXD has no channel field.
     fn frequency_mhz(&self) -> u16 {
         2412
@@ -864,7 +877,7 @@ impl<P: Port> Packet<P> {
         }
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
-        super::mac::peer(&self.port, peer, slot_us)?;
+        super::mac::peer_clocked(&self.port, peer, slot_us, self.port.mac_clock())?;
         self.slot_us = slot_us;
         self.phase = Phase::Running;
         Ok(())
@@ -1214,8 +1227,14 @@ impl<P: Port> Packet<P> {
         }
         let slot = self.next_tx;
         let storage = self.storage.as_ref().ok_or(Error::State)?;
-        let words =
+        let mut words =
             encode(u64::from(storage.tx_bytes[slot].address())).map_err(|_| Error::Packet)?;
+        // `xmit.c::ath_buf_set_rate`: multi-chain parts select their chains;
+        // the single-chain encoding is left byte-identical.
+        let chains = self.port.tx_chainmask();
+        if chains != 1 {
+            descriptor::select_chains(&mut words, chains).map_err(|_| Error::Packet)?;
+        }
         let dma = descriptor::dma_bytes(frame).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
@@ -1434,6 +1453,17 @@ impl<P: Port> Packet<P> {
         self.port.deliver(true)?;
         self.phase = Phase::Running;
         Ok(true)
+    }
+    /// `ar9002_hw_calibrate` long-calibration continuation of a running owner
+    /// with no transmission in flight.
+    pub(super) fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if self.pending.is_some() || self.pair.is_some() {
+            return Err(Error::Busy);
+        }
+        self.port.long_calibration()
     }
     /// The wake source, only while chip interrupts are programmed.
     pub(super) fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {

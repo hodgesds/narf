@@ -21,12 +21,75 @@ impl InstalledPower {
         }
     }
 }
+/// The calibrated chip this native owner was built from. The AR9285 report
+/// carries the historical single-chain owner; AR9287 additionally retains
+/// its signed board admission and MAC profile.
+pub(super) enum Calibrated {
+    Ar9285(super::calibration::Report),
+    Ar9287 {
+        report: super::calibration::ar9287::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        profile: super::mac::Profile,
+        /// Retained factory map for temperature compensation.
+        image: alloc::boxed::Box<[u8]>,
+    },
+}
+/// Raw BAR access for the AR9287 long calibration, only inside `access`.
+struct LongCal<'a> {
+    native: &'a Native,
+    lost: bool,
+}
+impl super::identity::RegisterIo for LongCal<'_> {
+    fn authorized(&self) -> bool {
+        !self.lost
+    }
+    fn read32(&mut self, offset: u64) -> u32 {
+        if self.lost || self.native.extent(offset).is_err() {
+            self.lost = true;
+            return u32::MAX;
+        }
+        // SAFETY: aligned, in-bounds BAR dword inside the current PCI and
+        // physical-readback invocation of this sole native owner.
+        unsafe { self.native.bar.read32(offset) }
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        if self.lost || self.native.extent(offset).is_err() {
+            self.lost = true;
+            return;
+        }
+        // SAFETY: same checked extent and current invocation as read32.
+        unsafe { self.native.bar.write32(offset, value) }
+    }
+}
+impl Calibrated {
+    fn frequency_mhz(&self) -> u16 {
+        match self {
+            Self::Ar9285(report) => report.frequency_mhz,
+            Self::Ar9287 { report, .. } => report.frequency_mhz,
+        }
+    }
+    /// Current host permission for the calibrated program; AR9287 also
+    /// re-proves its signed record and the signed ceiling under it.
+    fn permitted(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> bool {
+        let Ok(permission) =
+            super::calibration::Permission::from_domain_at(domain, self.frequency_mhz())
+        else {
+            return false;
+        };
+        match self {
+            Self::Ar9285(report) => permission.allows_report(*report),
+            Self::Ar9287 { report, grant, .. } => grant
+                .invoke(|| Ok(grant.ceiling(permission.budget())))
+                .is_ok_and(|ceiling| permission.allows_ar9287(report, ceiling)),
+        }
+    }
+}
 pub(super) struct Native {
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     bar: MmioRegion,
     active: AtomicBool,
-    report: super::calibration::Report,
+    calibrated: Calibrated,
     channel_mask: u16,
     powers: Option<InstalledPower>,
     rf_silent: Option<(u8, bool)>,
@@ -48,6 +111,23 @@ struct Msi {
     config: narf_bus::msi::MsiConfig,
     vector: u8,
     signal: alloc::sync::Arc<super::irq::Signal>,
+}
+/// Factory `rfSilent` (base header offset 20 in both the 4k and AR9287 maps):
+/// GPIO input and polarity, never a guessed board output.
+fn rf_silent(image: &[u8]) -> Result<Option<(u8, bool)>, Error> {
+    let bytes = [image[20], image[21]];
+    let rf = if image[7] & 1 != 0 {
+        u16::from_be_bytes(bytes)
+    } else {
+        u16::from_le_bytes(bytes)
+    };
+    if rf & 1 == 0 {
+        return Ok(None);
+    }
+    if rf & !31 != 0 {
+        return Err(Error::Packet);
+    }
+    Ok(Some((((rf >> 2) & 7) as u8, rf & 2 != 0)))
 }
 static SIGNAL: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::irq::Signal>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -79,20 +159,7 @@ impl Native {
         {
             return Err(Error::Packet);
         }
-        let bytes = [image[20], image[21]];
-        let rf = if image[7] & 1 != 0 {
-            u16::from_be_bytes(bytes)
-        } else {
-            u16::from_le_bytes(bytes)
-        };
-        let rf_silent = if rf & 1 != 0 {
-            if rf & !31 != 0 {
-                return Err(Error::Packet);
-            }
-            Some((((rf >> 2) & 7) as u8, rf & 2 != 0))
-        } else {
-            None
-        };
+        let rf_silent = rf_silent(image)?;
         let mut channel_mask = 1 << ((report.frequency_mhz - 2412) / 5);
         for channel in 1..=13u16 {
             if super::phy::rates::checked_plan_at(image, 2407 + 5 * channel, 40).is_ok() {
@@ -112,12 +179,31 @@ impl Native {
                 .registers,
             ))
         };
-        Ok(Self {
+        Ok(Self::assemble(
+            device,
+            cap,
+            bar,
+            Calibrated::Ar9285(report),
+            channel_mask,
+            powers,
+            rf_silent,
+        ))
+    }
+    fn assemble(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        calibrated: Calibrated,
+        channel_mask: u16,
+        powers: Option<InstalledPower>,
+        rf_silent: Option<(u8, bool)>,
+    ) -> Self {
+        Self {
             device,
             cap,
             bar,
             active: AtomicBool::new(false),
-            report,
+            calibrated,
             channel_mask,
             powers,
             rf_silent,
@@ -132,7 +218,7 @@ impl Native {
             ps_failed: AtomicBool::new(false),
             periodic: narf_lib::sync::IrqSafeSpinLock::new(live_calibration::Slot::default()),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
-        })
+        }
     }
     /// # Safety
     /// Same sole calibrated function as new(); this distinct constructor
@@ -152,6 +238,57 @@ impl Native {
         native.powers = Some(InstalledPower::Forty(actual));
         *native.ht.lock() = Some(super::ht::Grant::from_wide(grant, actual)?);
         Ok(native)
+    }
+    /// # Safety
+    /// Caller retains the sole AR9287 function and exact mapped BAR after
+    /// `phy::ar9287::prepare` and `calibration::ar9287` ran under `grant`'s
+    /// ceiling for `report`'s primary; no packet DMA was published.
+    pub(super) unsafe fn new_ar9287(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        report: super::calibration::ar9287::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        image: &[u8],
+        profile: super::mac::Profile,
+    ) -> Result<Self, Error> {
+        let request = grant.request();
+        if device.id.vendor != 0x168c
+            || !matches!(device.id.device, 0x002d | 0x002e)
+            || request.device != device.id.device
+            || request.frequency_mhz != report.frequency_mhz
+            || !(2412..=2472).contains(&report.frequency_mhz)
+            || (report.frequency_mhz - 2412) % 5 != 0
+            || image.len() != super::chips::MAP_9287.bytes()
+            || image[18..20] != [profile.rx_chainmask, profile.tx_chainmask]
+            || report.rx_chainmask != profile.rx_chainmask
+            || profile.txbuf != 0x700
+        {
+            return Err(Error::Packet);
+        }
+        let rf_silent = rf_silent(image)?;
+        // The signed record binds exactly this primary: no other channel.
+        let channel_mask = 1 << ((report.frequency_mhz - 2412) / 5);
+        // The exact open-loop rate registers calibration programmed under
+        // the signed ceiling are retained for every physical readback.
+        let powers =
+            super::phy::ar9287::power::plan(image, report.frequency_mhz, report.max_power_half_dbm)
+                .map_err(|_| Error::Packet)?
+                .registers;
+        Ok(Self::assemble(
+            device,
+            cap,
+            bar,
+            Calibrated::Ar9287 {
+                report,
+                grant,
+                profile,
+                image: image.into(),
+            },
+            channel_mask,
+            Some(InstalledPower::Twenty(powers)),
+            rf_silent,
+        ))
     }
     /// Discover, program and install one MSI vector while delivery stays
     /// disabled. Any failure leaves the owner on scheduled polling; a vector
@@ -254,10 +391,7 @@ impl Native {
             return Err(Error::Access);
         }
         let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
-        let permission =
-            super::calibration::Permission::from_domain_at(&domain, self.report.frequency_mhz)
-                .map_err(|_| Error::Access)?;
-        if !permission.allows_report(self.report) {
+        if !self.calibrated.permitted(&domain) {
             return Err(Error::Access);
         }
         if let Some(powers) = &self.powers {
@@ -523,12 +657,46 @@ impl Port for Native {
     fn geometry(&self) -> super::channel_width::Geometry {
         match &self.powers {
             Some(InstalledPower::Forty(actual)) => actual.geometry,
-            _ => super::channel_width::Geometry::from_frequency(self.report.frequency_mhz)
+            _ => super::channel_width::Geometry::from_frequency(self.calibrated.frequency_mhz())
                 .expect("validated native primary"),
         }
     }
     fn frequency_mhz(&self) -> u16 {
-        self.report.frequency_mhz
+        self.calibrated.frequency_mhz()
+    }
+    fn mac_clock(&self) -> super::mac::Clock {
+        match &self.calibrated {
+            Calibrated::Ar9285(_) => super::mac::Clock::Ofdm2g,
+            Calibrated::Ar9287 { profile, .. } => profile.clock,
+        }
+    }
+    fn tx_chainmask(&self) -> u8 {
+        match &self.calibrated {
+            Calibrated::Ar9285(_) => 1,
+            Calibrated::Ar9287 { profile, .. } => profile.tx_chainmask,
+        }
+    }
+    fn long_calibration(&self) -> Result<Option<i32>, Error> {
+        let Calibrated::Ar9287 { report, image, .. } = &self.calibrated else {
+            return Err(Error::State);
+        };
+        // Physical readback, current regulatory permission and the signed
+        // record are re-proved by access() before the compensation runs.
+        self.access(self.active.load(Ordering::Acquire), || {
+            let mut io = LongCal {
+                native: self,
+                lost: false,
+            };
+            let delta = super::calibration::ar9287::olc_temp_compensation(
+                &mut io,
+                image,
+                report.init_pdadc,
+            );
+            if io.lost {
+                return Err(Error::Access);
+            }
+            delta.map_err(|_| Error::Descriptor)
+        })
     }
     fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
         if let Some(g) = self.qos.lock().clone() {
@@ -572,10 +740,7 @@ impl Port for Native {
     }
     fn transmit_allowed(&self) -> Result<(), Error> {
         let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
-        let permission =
-            super::calibration::Permission::from_domain_at(&domain, self.report.frequency_mhz)
-                .map_err(|_| Error::Access)?;
-        if !permission.allows_report(self.report) {
+        if !self.calibrated.permitted(&domain) {
             return Err(Error::Access);
         }
         // Includes physical per-channel synth/mode/power readbacks in the

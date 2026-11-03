@@ -146,3 +146,107 @@ kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar9287_unprovisioned_or_foreign_record_stays_unadmitted
 );
+
+/// The AR9287 native owner binds the admitted device, primary, factory chain
+/// masks and MAC profile, and every access (including long calibration)
+/// stops at a revoked PCI capability.
+fn smoke_ath9k_ar9287_native_profile_binds_admission_and_chains() -> TestResult {
+    use crate::ath9k::{
+        calibration::ar9287::Report,
+        mac::{Clock, Profile},
+        packet::{Error as PacketError, Port},
+        packet_native::Native,
+    };
+    use narf_bus::{BarKind, BusAddr, BusDevice, BusDeviceCap, BusKind, MmioRegion, PcieAddr};
+    use narf_capabilities::Write;
+    let mut map = image(3);
+    map[18..20].copy_from_slice(&[3, 3]);
+    let Ok(facts) = facts_for(0x002e, &map) else {
+        return TestResult::Fail("facts");
+    };
+    let bytes = record(&facts, facts.factory_antenna, 34);
+    let Ok(grant) = load(facts, bytes, true) else {
+        return TestResult::Fail("verified record refused");
+    };
+    let address = PcieAddr::new(0, 0, 9, 0);
+    let bus = |id: u16| BusDevice {
+        addr: BusAddr::Pcie(address),
+        id: device(id),
+        kind: BusKind::Pcie {
+            addr: address,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    let bar = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: crate::ath9k::phy::REQUIRED_BAR,
+        kind: BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let report = |frequency_mhz| Report {
+        country: *b"US",
+        frequency_mhz,
+        max_power_half_dbm: 34,
+        rx_chainmask: 3,
+        init_pdadc: 0,
+        iq: [Some((0, 0)), Some((0, 0))],
+        measured_noise_dbm: [Some(-112), Some(-112)],
+        noise_dbm: [Some(-112), Some(-112)],
+    };
+    let profile = Profile::ar9287(3, 3, true);
+    let build = |id, frequency, profile, map: &[u8]| {
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        cap.revoke();
+        // SAFETY: the revoked fixture capability makes every config, DMA and
+        // BAR path unreachable; no physical device is touched.
+        unsafe {
+            Native::new_ar9287(
+                bus(id),
+                cap,
+                bar,
+                report(frequency),
+                grant.clone(),
+                map,
+                profile,
+            )
+        }
+    };
+    for (id, frequency, profile) in [
+        (0x002b, 2422, profile),
+        (0x002d, 2422, profile),
+        (0x002e, 2412, profile),
+        (0x002e, 2422, Profile::ar9287(1, 1, true)),
+        (0x002e, 2422, Profile::AR9285),
+    ] {
+        if build(id, frequency, profile, &map).is_ok() {
+            return TestResult::Fail("AR9287 owner accepted a foreign device/primary/profile");
+        }
+    }
+    if build(0x002e, 2422, profile, &map[..map.len() - 2]).is_ok() {
+        return TestResult::Fail("AR9287 owner accepted a short map");
+    }
+    let Ok(native) = build(0x002e, 2422, profile, &map) else {
+        return TestResult::Fail("admitted AR9287 owner refused");
+    };
+    if native.tx_chainmask() != 3
+        || native.mac_clock() != Clock::AsyncFifo
+        || native.channel_mask() != 1 << 2
+        || native.frequency_mhz() != 2422
+        || native.ht_grant().is_some()
+    {
+        return TestResult::Fail("AR9287 native profile differs");
+    }
+    if native.long_calibration() != Err(PacketError::Access)
+        || native.read(0x4020) != Err(PacketError::Access)
+        || native.master(true) != Err(PacketError::Access)
+    {
+        return TestResult::Fail("revoked AR9287 authority reached the BAR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9287_native_profile_binds_admission_and_chains
+);

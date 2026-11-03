@@ -30,7 +30,7 @@ fn modify(io: &impl Port, reg: u64, clear: u32, set: u32) -> Result<(), Error> {
     let value = io.read(reg)?;
     write(io, reg, (value & !clear) | set)
 }
-fn word(image: &[u8; EEPROM_4K_BYTES], offset: usize) -> u16 {
+fn word(image: &[u8], offset: usize) -> u16 {
     let bytes = [image[offset], image[offset + 1]];
     if image[7] & 1 != 0 {
         u16::from_be_bytes(bytes)
@@ -38,12 +38,66 @@ fn word(image: &[u8; EEPROM_4K_BYTES], offset: usize) -> u16 {
         u16::from_le_bytes(bytes)
     }
 }
+/// Chip-specific pieces of the parked station MAC preparation. The factory
+/// base header (MAC at 12, rxMask/txMask at 18/19, rfSilent at 20) is shared
+/// by `ar5416_eeprom_4k` and `ar9287_eeprom`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Profile {
+    /// Factory `rxMask`/`txMask` the retained map must carry.
+    pub rx_chainmask: u8,
+    pub tx_chainmask: u8,
+    pub clock: Clock,
+    /// `AR_PCU_TXBUF_CTRL` usable size for `ath9k_hw_set_dma`.
+    pub txbuf: u32,
+}
+impl Profile {
+    /// The unchanged single-chain AR9285 profile.
+    pub(super) const AR9285: Self = Self {
+        rx_chainmask: 1,
+        tx_chainmask: 1,
+        clock: Clock::Ofdm2g,
+        txbuf: 0x380,
+    };
+    /// AR9287 with its factory two-chain masks; 1.3+ runs the async FIFO.
+    pub(super) fn ar9287(rx_chainmask: u8, tx_chainmask: u8, async_fifo: bool) -> Self {
+        Self {
+            rx_chainmask,
+            tx_chainmask,
+            clock: if async_fifo {
+                Clock::AsyncFifo
+            } else {
+                Clock::Ofdm2g
+            },
+            txbuf: 0x700,
+        }
+    }
+}
 pub(super) fn prepare(
     io: &impl Port,
     image: &[u8; EEPROM_4K_BYTES],
     local: [u8; 6],
 ) -> Result<(), Error> {
-    if local[0] & 1 != 0 || local == [0; 6] || image[12..18] != local || image[18..20] != [1, 1] {
+    prepare_chip(io, image, local, Profile::AR9285)
+}
+/// `ath9k_hw_reset` station PCU/queue preparation for `profile`. The
+/// AR9285 profile is byte-identical to the historical single-chain path.
+pub(super) fn prepare_chip(
+    io: &impl Port,
+    image: &[u8],
+    local: [u8; 6],
+    profile: Profile,
+) -> Result<(), Error> {
+    if image.len() < 22
+        || !(1..=3).contains(&profile.rx_chainmask)
+        || !(1..=3).contains(&profile.tx_chainmask)
+    {
+        return Err(Error::Packet);
+    }
+    if local[0] & 1 != 0
+        || local == [0; 6]
+        || image[12..18] != local
+        || image[18..20] != [profile.rx_chainmask, profile.tx_chainmask]
+    {
         return Err(Error::Packet);
     }
     if io.read(8)? & 4 != 0
@@ -75,7 +129,7 @@ pub(super) fn prepare(
     write(io, 0x80e4, 0xffff)?;
     let antenna = io.read(0x8058)?;
     write(io, 0x8058, if antenna == 0 { 1 } else { antenna })?;
-    peer(io, None, 20)?;
+    peer_clocked(io, None, 20, profile.clock)?;
     io.write(0x80, u32::MAX)?; // ISR is W1C; this is not an ordinary readback.
     write(io, 0x8018, 0x700)?;
     opmode(io)?;
@@ -107,7 +161,11 @@ pub(super) fn prepare(
         modify(io, 0x404c, 3 << (pin * 2), 0)?;
     }
     modify(io, 0x8004, 0, 0x2000_0000)?;
-    dma(io)?;
+    // `ath9k_hw_reset`: the AR9287 1.3+ PCU block precedes `set_dma`.
+    if profile.clock == Clock::AsyncFifo {
+        async_fifo_pcu(io)?;
+    }
+    dma_txbuf(io, profile.txbuf)?;
     // Explicitly reject stale enable/configuration state before a packet
     // owner can publish any DMA base. The signed policy remains separate.
     if io.read(8)? & 4 != 0
@@ -138,6 +196,7 @@ impl Clock {
         }
     }
 }
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn peer(
     io: &impl Port,
     bssid: Option<([u8; 6], u16)>,
@@ -265,6 +324,7 @@ pub(super) fn qos(io: &impl Port) -> Result<(), Error> {
     }
     Ok(())
 }
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn dma(io: &impl Port) -> Result<(), Error> {
     // Linux ath9k_hw_set_dma, AR9285's2KiB TX FIFO workaround and128B bursts.
     dma_txbuf(io, 0x380)

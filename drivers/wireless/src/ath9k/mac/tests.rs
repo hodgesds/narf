@@ -258,3 +258,73 @@ kernel_test_in!(
     "drivers/wireless/ath9k/mac",
     smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu
 );
+
+/// `prepare_chip` with the AR9285 profile is the historical trace; the AR9287
+/// profile adds the two-chain factory masks, 117 MHz clock, the 1.3+ PCU block
+/// before `set_dma` and the 0x700 TX buffer.
+fn smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo() -> TestResult {
+    let historical = Model::new(0x5a93a5c3);
+    historical.parked();
+    let generic = Model::new(0x5a93a5c3);
+    generic.parked();
+    if prepare(&historical, &image(), LOCAL).is_err()
+        || prepare_chip(&generic, &image(), LOCAL, Profile::AR9285).is_err()
+        || historical.hash() != generic.hash()
+    {
+        return TestResult::Fail("AR9285 profile is not byte-identical");
+    }
+    let mut map = alloc::vec![0u8; crate::ath9k::chips::MAP_9287.bytes()];
+    map[12..18].copy_from_slice(&LOCAL);
+    map[18..20].copy_from_slice(&[3, 3]);
+    let io = Model::new(0);
+    io.parked();
+    if prepare_chip(&io, &map, LOCAL, Profile::ar9287(3, 3, true)).is_err() {
+        return TestResult::Fail("AR9287 two-chain profile refused");
+    }
+    let trace = io.trace.borrow();
+    let pcu = trace.iter().position(|w| w.0 == 0x8264);
+    let txbuf = trace.iter().position(|w| w.0 == 0x8340);
+    if pcu.is_none() || txbuf.is_none() || pcu > txbuf {
+        return TestResult::Fail("async-FIFO PCU block does not precede set_dma");
+    }
+    drop(trace);
+    if io.raw(0x8340) != 0x700
+        || io.raw(0x1070) != 20 * 117
+        || io.raw(0x10b0) != 363 * 117
+        || io.raw(0x801c) & 0x1fff_c07f != 0x12e0_0074
+        || io.raw(0x8344) & 0x2_0000 == 0
+    {
+        return TestResult::Fail("AR9287 MAC clock/PCU/TX buffer differs from hw.c");
+    }
+    let early = Model::new(0);
+    early.parked();
+    if prepare_chip(&early, &map, LOCAL, Profile::ar9287(3, 3, false)).is_err()
+        || early.raw(0x8340) != 0x700
+        || early
+            .trace
+            .borrow()
+            .iter()
+            .any(|w| w.0 == 0x8264 || w.0 == 0x10b0)
+    {
+        return TestResult::Fail("AR9287 1.1/1.2 used the async-FIFO path");
+    }
+    for (masks, profile) in [
+        ([3, 3], Profile::AR9285),
+        ([1, 1], Profile::ar9287(3, 3, true)),
+        ([3, 1], Profile::ar9287(3, 3, true)),
+    ] {
+        map[18..20].copy_from_slice(&masks);
+        let io = Model::new(0);
+        io.parked();
+        if prepare_chip(&io, &map, LOCAL, profile) != Err(Error::Packet)
+            || !io.trace.borrow().is_empty()
+        {
+            return TestResult::Fail("factory chain masks not bound to the MAC profile");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo
+);
