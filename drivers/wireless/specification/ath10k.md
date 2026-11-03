@@ -1791,6 +1791,47 @@ channel-list rows (`station_ht40_channels`, the associated-scan home row) are
 neither does this one. Test (written, unexecuted):
 `smoke_ath10k_dfs_client_needs_radar_beacon_in_current_scan`.
 
+**AP radar detection, CAC/NOP and radar-triggered CSA are gated out of
+upstream ath10k (steps 2–6 inapplicable).** Every ath10k path that would let
+this device *initiate* radiation on a radar channel is compiled only under
+`CONFIG_ATH10K_DFS_CERTIFIED` (`ath10k/Kconfig`: "DFS support for certified
+platforms", `depends on ATH10K && CFG80211_CERTIFICATION_ONUS`, `default n`;
+`CFG80211_CERTIFICATION_ONUS` itself `depends on EXPERT`, `default n`):
+
+- `mac.c` iface combinations set `radar_detect_widths` only inside
+  `#ifdef CONFIG_ATH10K_DFS_CERTIFIED`. Without it mac80211
+  `chan.c::ieee80211_link_use_channel` (radar_detect_width =
+  BIT(width) when `cfg80211_chandef_dfs_required`) fails
+  `ieee80211_check_combinations`, nl80211 START_RADAR_DETECTION (CAC) has no
+  admissible combination, and `chan.c::_cfg80211_reg_can_beacon` refuses
+  START_AP until `cfg80211_chandef_dfs_available` — which only a finished
+  CAC can make true. An uncertified Linux ath10k AP therefore never beacons
+  on a radar channel, exactly as this AP (`ap_wire` keeps
+  `profile_frequency`, AP receipts never carry radar) already refuses.
+- `mac.c::ath10k_mac_register` creates `ar->dfs_detector` only when
+  `IS_ENABLED(CONFIG_ATH10K_DFS_CERTIFIED)`, and
+  `ath/dfs_pattern_detector.c::dfs_pattern_detector_init` additionally
+  returns NULL without `CONFIG_CFG80211_CERTIFICATION_ONUS`; the FCC/ETSI/JP
+  `radar_types` tables and `dfs_pri_detector.c` are unreachable otherwise.
+- `wmi.c::ath10k_wmi_event_dfs` returns early on `!IS_ENABLED(
+  CONFIG_ATH10K_DFS_CERTIFIED)` and again on `!ar->dfs_detector`, so
+  `PHY_ERROR_RADAR` pulses are never decoded into `pulse_event`s and
+  `ieee80211_radar_detected` is never called; mac80211
+  `util.c::ieee80211_dfs_radar_detected_work` (CSA or stop) is unreachable.
+- `mac.c::ath10k_regd_update` passes a DFS region to PDEV_SET_REGDOMAIN only
+  under the same gate (else `WMI_UNINIT_DFS_DOMAIN`), and no ath10k code
+  sends `pdev_dfs_enable_cmdid`/`pdev_dfs_disable_cmdid` at all — those
+  command IDs exist only in the per-dialect tables.
+
+`CFG80211_CERTIFICATION_ONUS` exists for an integrator who certifies the
+final system; NARF can never claim physical DFS certification, so it builds
+the upstream default configuration and implements no radar detector, CAC
+timer owner or radar CSA for ath10k. The station client (above) is the
+whole of upstream's default ath10k DFS behaviour. A shared cfg80211-style
+DFS channel-state machine (USABLE/UNAVAILABLE/AVAILABLE, CAC, NOP) belongs to
+`narf_wireless::reg` when a driver whose upstream enables radar detection by
+default needs it; it is not an ath10k obligation.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
