@@ -200,8 +200,17 @@ pub enum DcUser {
     /// One full-AUX panel-backlight conversation (AUX transaction, PPS
     /// gate, relight step): AUX_A is a DC_off domain on display 14.
     Aux = 6,
+    /// An external display route, held from activation until its stop is
+    /// verified. The Type-C/DDI lanes, AUX_B and pipes B-D are DC_off
+    /// domains (`xelpd_pwdoms_dc_off`), and `intel_cx0_phy.c` holds
+    /// `POWER_DOMAIN_DC_OFF` around every PHY message-bus transaction:
+    /// while this reference lives, DC5/DC6 are never re-entered.
+    ExternalRoute = 7,
+    /// One hotplug/HPD service pass, or one external AUX or PHY
+    /// transaction outside a held route (probe, connect, disconnect).
+    Hotplug = 8,
 }
-const USER_COUNT: usize = 7;
+const USER_COUNT: usize = 9;
 
 /// Why a DC transition could not be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,7 +263,10 @@ pub enum ProgramState {
 /// Inputs to the re-entry decision that live outside this module.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArmGates {
-    /// An external display route is live on this function.
+    /// A pre-existing (Gen12-model) DP/HDMI/MST session is live on this
+    /// function. Defensive only: an external route owner must hold a
+    /// [`DcUser::ExternalRoute`] reference for its lifetime, which blocks
+    /// re-entry by itself (`ArmBlock::Busy`) whatever this reports.
     pub external_route_active: bool,
 }
 
@@ -853,6 +865,16 @@ pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
 }
 
 /// [`acquire`] for the service of exactly this BAR.
+///
+/// External outputs and hotplug (display 14): a route owner calls this
+/// with [`DcUser::ExternalRoute`] before its first route register access
+/// (PHY message bus, DDI, transcoder, AUX) and keeps the returned
+/// reference in its session until the route's stop is verified; dropping
+/// it is the "route stopped" signal that lets DC5/DC6 re-enter 17 ms
+/// later. HPD service passes and connect-time AUX/PHY probes take a
+/// short [`DcUser::Hotplug`] reference around their register accesses.
+/// `Err` means DC states could not be exited: touch nothing and report
+/// the port unavailable.
 pub(crate) fn acquire_for_bar(bar: &narf_bus::MmioRegion, user: DcUser) -> Result<DcRef, DcError> {
     take(service_for(bar), user)
 }

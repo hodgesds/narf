@@ -729,6 +729,59 @@ kernel_test_in!(
     smoke_dc_states_reference_inert_without_service
 );
 
+fn smoke_dc_states_external_route_guard_blocks_reentry() -> TestResult {
+    let fake = Fake::default();
+    let core = armed(&fake);
+    let mut c = core.lock();
+    // Route activation: DC exit before the first PHY/DDI access.
+    fake.clear_log();
+    if c.get(&fake, DcUser::ExternalRoute) != Ok(()) || fake.get(DC_STATE_EN) & 3 != 0 {
+        return TestResult::Fail("an external route must exit DC states before activation");
+    }
+    if fake.log().first() != Some(&(DC_STATE_EN, 0)) {
+        return TestResult::Fail("the DC exit must precede any route register write");
+    }
+    // HPD passes inside a live route neither exit nor schedule anything.
+    for t in 1..4 {
+        if c.get(&fake, DcUser::Hotplug) != Ok(()) || c.put(DcUser::Hotplug, t).is_some() {
+            return TestResult::Fail("a hotplug pass inside a live route must not schedule");
+        }
+    }
+    // A stray hotplug release can never release the route.
+    if c.put(DcUser::Hotplug, 5).is_some() || c.refs(DcUser::ExternalRoute) != 1 {
+        return TestResult::Fail("an unbalanced hotplug release must not end the route");
+    }
+    // The live route blocks re-entry regardless of the defensive gate.
+    let flip_due = {
+        let _ = c.get(&fake, DcUser::Kms);
+        c.put(DcUser::Kms, 6)
+    };
+    if flip_due.is_some()
+        || c.arm_if_due(&fake, u64::MAX, ArmGates::default()) != Err(ArmBlock::Busy)
+    {
+        return TestResult::Fail("a held route must block DC re-entry");
+    }
+    // Verified route stop: the release schedules re-entry.
+    let Some(due) = c.put(DcUser::ExternalRoute, 10 * MS) else {
+        return TestResult::Fail("the route's release must schedule re-entry");
+    };
+    if c.arm_if_due(&fake, due, ArmGates::default()) != Ok(DC_STATE_EN_UPTO_DC6) {
+        return TestResult::Fail("DC6 must re-enter after the route stopped");
+    }
+    // Hotplug pass with no route: exit, then re-entry after the pass.
+    if c.get(&fake, DcUser::Hotplug) != Ok(()) || fake.get(DC_STATE_EN) & 3 != 0 {
+        return TestResult::Fail("a hotplug pass must exit DC states first");
+    }
+    if c.put(DcUser::Hotplug, 20 * MS) != Some(20 * MS + DC_REENABLE_DELAY_NS) {
+        return TestResult::Fail("a hotplug pass must release like any user");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dc_states",
+    smoke_dc_states_external_route_guard_blocks_reentry
+);
+
 fn smoke_dc_states_audit_unreachable_display_paths_on_mtl() -> TestResult {
     use crate::intel_gpu::Generation;
     // The DC6-safety audit proves these display-MMIO classes unreachable
