@@ -161,6 +161,10 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     /// This netdev is the P2P client (iftype 8, `interface_p2p_client.rs`):
     /// its station paths run on the client slot (`StationGuard`).
     client: bool,
+    /// This netdev is the P2P GO (iftype 9): its AP START runs on its own
+    /// AP/P2P_GO vdev with its own address (`Radio::go_start`) beside the
+    /// managed vdev instead of replacing it.
+    go: bool,
     /// nl80211 wiphy identity: the home netdev's for a P2P client.
     wiphy: u64,
     /// DEL_INTERFACE accepted; the worker retires the client vdev.
@@ -212,6 +216,12 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         frequencies: Vec<u16>,
     ) -> Self {
         Self::with_policy(name, mac, radio, Policy::Installed, features, frequencies)
+    }
+    /// Test fixture: this device's AP controls own a GO vdev.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn into_go_for_test(mut self) -> Self {
+        self.go = true;
+        self
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn for_test(
@@ -307,6 +317,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             net_registration: IrqSafeSpinLock::new(None),
             p2p_wdev: IrqSafeSpinLock::new(None),
             client: false,
+            go: false,
             wiphy: name_wiphy_id(name),
             deleting: AtomicBool::new(false),
         }

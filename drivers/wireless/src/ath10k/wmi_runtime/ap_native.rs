@@ -348,6 +348,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         self.ap_prefix(validate).await
     }
+    /// The managed netdev's AP: it replaces the station discovery role on
+    /// the managed vdev (`Radio::primary`) and restores it at stop.
     pub(in crate::ath10k) async fn ap_start(
         &mut self,
         config: ApConfig,
@@ -356,8 +358,63 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         policy: ap::Policy,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.ap_start_role(None, config, settings, emission, policy, validate)
+            .await
+    }
+    /// A P2P GO on its own AP-type vdev (subtype P2P_GO) beside the
+    /// managed vdev, as `mac.c::ath10k_add_interface` for
+    /// `NL80211_IFTYPE_P2P_GO`: lowest free id of `ar->free_vdev_map`,
+    /// `WMI_VDEV_CREATE` (AP, P2P_GO, `vif->addr` = `own`), the vdev NSS
+    /// parameter and the AP self peer; `Radio::primary` is untouched.
+    /// `ap_cleanup` deletes the self peer and the GO vdev
+    /// (`ath10k_remove_interface`) and returns the id.
+    pub(in crate::ath10k) async fn go_start(
+        &mut self,
+        own: [u8; 6],
+        config: ApConfig,
+        settings: ApStartSettings,
+        emission: ApEmissionAuthority,
+        policy: ap::Policy,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.ap_start_role(Some(own), config, settings, emission, policy, validate)
+            .await
+    }
+    /// Whether the AP session is a GO on its own vdev (not the managed
+    /// netdev's AP on `Radio::primary`).
+    pub(in crate::ath10k) fn ap_is_go(&self) -> bool {
+        self.ap
+            .as_ref()
+            .is_some_and(|ap| ap.plan.role == super::p2p::Role::P2pGo)
+    }
+    /// The AP-type vdev the session owns: the GO's own vdev, else the
+    /// managed vdev the AP replaced.
+    pub(super) fn ap_owned_vdev(&self) -> Result<super::p2p::Vdev, Error> {
+        let ap = self.ap.as_ref().ok_or(Error::Failed)?;
+        Ok(match ap.plan.role {
+            super::p2p::Role::P2pGo => super::p2p::Vdev::new(ap.plan.vdev, ap.plan.role),
+            _ => self.primary,
+        })
+    }
+    /// The GO's vdev and address while a GO session exists.
+    pub(in crate::ath10k) fn go_identity(&self) -> Option<(u8, [u8; 6])> {
+        self.ap
+            .as_ref()
+            .filter(|ap| ap.plan.role == super::p2p::Role::P2pGo)
+            .map(|ap| (ap.plan.vdev, ap.own.mac))
+    }
+    async fn ap_start_role(
+        &mut self,
+        go: Option<[u8; 6]>,
+        config: ApConfig,
+        settings: ApStartSettings,
+        emission: ApEmissionAuthority,
+        policy: ap::Policy,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
         validate()?;
         let domain = policy.domain();
+        let init = self.ready.ok_or(Error::Failed)?.mac;
         if !policy.current()
             || !self.ap_supported()
             || self.failed
@@ -370,22 +427,60 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Unsupported);
         }
-        let own = self.ready.ok_or(Error::Failed)?.mac;
-        let plan = ap_wire::Plan::new(self.primary.id(), config, settings, own, self.ap_uapsd())?;
-        if self.ap_staging.as_ref().is_some_and(|staging| {
-            !staging.current() || !plan.config.privacy && !staging.keys.is_empty()
-        }) {
-            self.ap_staging = None;
-            return Err(Error::Unsupported);
+        if let Some(own) = go {
+            // TLV P2P firmware; the GO address is its own unicast vif
+            // address, never another vdev's.
+            if !self.p2p_supported()
+                || self.in_client_scope
+                || self.p2p_client.is_some()
+                || own == [0; 6]
+                || own[0] & 1 != 0
+                || own == init
+                || self.p2p_device.is_some() && own == self.p2p_device_mac
+            {
+                return Err(Error::Unsupported);
+            }
         }
-
-        let templates = ap_wire::templates(&plan)?;
-        let max = self.htt.wmi.htc.wmi_max_payload();
-        if templates.iter().any(|command| command.len() > max) {
-            return Err(Error::Unsupported);
-        }
-        let permission =
-            self.hinted_permission(domain, plan.config.frequency_mhz as u16, None, false)?;
+        let own = go.unwrap_or(init);
+        let staging_stale = |plan: &ap_wire::Plan, radio: &Self| {
+            radio.ap_staging.as_ref().is_some_and(|staging| {
+                !staging.current() || !plan.config.privacy && !staging.keys.is_empty()
+            })
+        };
+        let (plan, templates, permission) = {
+            let (vdev, role) = match go {
+                Some(_) => (
+                    self.vdev_map.as_mut().ok_or(Error::Failed)?.allocate()?,
+                    super::p2p::Role::P2pGo,
+                ),
+                None => (self.primary.id(), super::p2p::Role::Ap),
+            };
+            let prepared = (|| {
+                let plan =
+                    ap_wire::Plan::new_role(vdev, role, config, settings, own, self.ap_uapsd())?;
+                if staging_stale(&plan, self) {
+                    self.ap_staging = None;
+                    return Err(Error::Unsupported);
+                }
+                let templates = ap_wire::templates(&plan)?;
+                let max = self.htt.wmi.htc.wmi_max_payload();
+                if templates.iter().any(|command| command.len() > max) {
+                    return Err(Error::Unsupported);
+                }
+                let permission =
+                    self.hinted_permission(domain, plan.config.frequency_mhz as u16, None, false)?;
+                Ok((plan, templates, permission))
+            })();
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    if go.is_some() {
+                        self.vdev_map.as_mut().ok_or(Error::Failed)?.release(vdev)?;
+                    }
+                    return Err(e);
+                }
+            }
+        };
         self.htt.wmi.htc.transport.runtime_idle(false);
         if self.ap_history.is_none() {
             self.ap_history = Some(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
@@ -409,20 +504,31 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             permission.check(domain)
         };
         self.ap_prefix(&current).await?;
-        self.ap_publish(
-            &ap_wire::delete(self.primary)?,
-            ap::Publication::Vdev(Vdev::DeleteSent),
-            &current,
-        )
-        .await?;
-        self.ap_wait(|ap| ap.vdev_deleted, &current).await?;
-        self.ap.as_mut().unwrap().vdev = Vdev::Absent;
-        self.ap_prefix(&current).await?;
-        self.ap.as_mut().unwrap().vdev = Vdev::CreateSent;
-        // The AP replaces the station discovery role on the same id.
-        self.primary = super::p2p::Vdev::new(self.primary.id(), super::p2p::Role::Ap);
-        self.ap_command(&ap_wire::create(self.primary, own)?, &current)
+        if go.is_none() {
+            self.ap_publish(
+                &ap_wire::delete(self.primary)?,
+                ap::Publication::Vdev(Vdev::DeleteSent),
+                &current,
+            )
             .await?;
+            self.ap_wait(|ap| ap.vdev_deleted, &current).await?;
+            self.ap.as_mut().unwrap().vdev = Vdev::Absent;
+            self.ap_prefix(&current).await?;
+            // The AP replaces the station discovery role on the same id.
+            self.primary = super::p2p::Vdev::new(self.primary.id(), super::p2p::Role::Ap);
+        }
+        self.ap.as_mut().unwrap().vdev = Vdev::CreateSent;
+        self.ap_command(&ap_wire::create(self.ap_owned_vdev()?, own)?, &current)
+            .await?;
+        if go.is_some() {
+            // `ath10k_add_interface`: the vdev NSS parameter follows every
+            // VDEV_CREATE (`cfg_tx_chainmask`), as on the P2P client vdev.
+            let nss = self
+                .chains
+                .ok_or(Error::Failed)?
+                .vdev_nss_for(self.wire.dialect, self.ap_vdev()?)?;
+            self.ap_command(&nss, &current).await?;
+        }
         self.ap_barrier(&current).await?;
         self.ap.as_mut().unwrap().vdev = Vdev::Created;
         self.ap_create_peer(own, &current).await?;

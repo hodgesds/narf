@@ -450,8 +450,13 @@ impl Session {
     pub fn peer_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
         match bytes.first() {
             Some(3) => {
-                if bytes.len() != 12 || bytes[1] != 0 {
+                if bytes.len() != 12 {
                     return Err(Error::Malformed);
+                }
+                // `htt_rx.c::ath10k_peer_map_event` binds the peer to the
+                // MAP's vdev (byte 1): another vdev's peer is not this AP's.
+                if bytes[1] != self.plan.vdev {
+                    return Ok(());
                 }
                 let id = u16::from_le_bytes([bytes[2], bytes[3]]);
                 if id >= 2048 {

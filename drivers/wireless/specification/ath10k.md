@@ -2138,8 +2138,26 @@ will bind; none of them grants RF, peer, key or data authority.
   NoA to the firmware probe template). The AP session decodes 0xd002 into
   its `NoaOwner` only for a GO plan's own vdev, and its host-transmitted
   Probe Responses (`ap_tx_management`) carry that NoA
-  (`ath10k_tx_h_add_p2p_noa_ie`). No GO session is created yet: the GO
-  role on its own vdev beside the home station is the remaining step.
+  (`ath10k_tx_h_add_p2p_noa_ie`).
+- **GO vdev.** `Radio::go_start` (`ap_native.rs`; the AP START of a device
+  marked GO, `Device::go`) follows `mac.c::ath10k_add_interface` for
+  `NL80211_IFTYPE_P2P_GO`: TLV P2P firmware, the same AP admission as
+  `ap_start`, no P2P client slot, an own unicast address other than the
+  INIT and P2P Device addresses, then the lowest free id of the vdev map,
+  `WMI_VDEV_CREATE` (`WMI_VDEV_TYPE_AP`, subtype P2P_GO, the GO address),
+  the vdev NSS parameter and the AP self peer on that id; the plan is
+  `Plan::new_role(.., P2pGo, ..)`. `Radio::primary` is neither deleted nor
+  replaced (`ap_is_go`, `ap_owned_vdev`, `go_identity`; `vdev_address`
+  answers the GO vdev with its address). `ap_cleanup` on a GO runs the
+  AP teardown (DOWN, client peer deletes, the AP self-peer delete of
+  `ath10k_remove_interface`, STOP/VDEV_STOPPED) then `WMI_VDEV_DELETE` of
+  the GO vdev with its genuine 0x5006, returns the id to the map and does
+  not recreate a station vdev; a start refused before any publication
+  returns the id at once. The AP session's PEER_MAP must carry its own
+  vdev (byte 1, `ath10k_peer_map_event`); another vdev's MAP is not its
+  peer and is ignored (before, any non-zero vdev was malformed). Concurrency with the home station is the
+  routing step below; until then a GO start still needs the home slot
+  idle.
 - **NoA / opportunistic PS.** Linux ath10k never programs CTWindow/OppPS or
   a NoA schedule from the host; firmware owns both and reports them.
   `Noa::tlv_event` decodes `WMI_TLV_P2P_NOA_EVENTID` (0xd002, tags 223
@@ -2354,6 +2372,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_offchannel_builders_carry_vdev`,
 `smoke_ath10k_p2p_station_builders_carry_vdev`,
 `smoke_ath10k_p2p_ap_builders_carry_vdev`,
+`wmi_boot/ap_native_tests.rs` `smoke_ath10k_p2p_go_own_vdev_start_and_teardown`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
 `smoke_ath10k_p2p_client_scan_on_client_vdev`,

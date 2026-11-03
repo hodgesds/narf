@@ -9,6 +9,10 @@ use narf_net::Interface;
 use narf_wireless::{ap_control::ApControlAuthority, WirelessNetIface};
 const OWN: [u8; 6] = [2, 3, 4, 5, 6, 7];
 const PEER: [u8; 6] = [2, 0x73, 2, 3, 4, 5];
+/// The P2P GO netdev's own (interface) address.
+const GO: [u8; 6] = [6, 3, 4, 5, 0x86, 7];
+/// A minimal WFA P2P IE (P2P Capability attribute) for the GO beacon.
+const P2P_IE: [u8; 11] = [221, 9, 0x50, 0x6f, 0x9a, 0x09, 2, 2, 0, 0, 0];
 const TK: [u8; 16] = [0x31; 16];
 const GTK: [u8; 16] = [0x32; 16];
 fn word(bytes: &[u8], at: usize) -> u32 {
@@ -42,6 +46,12 @@ pub(super) struct Fixture {
     hold_map: bool,
     held: Vec<(u16, bool)>,
     ps: Vec<(u32, u32)>,
+    /// The AP-type vdev under test (0: the managed vdev the AP replaces).
+    vdev: u32,
+    /// A GO's own address (`None`: the INIT address OWN).
+    own: Option<[u8; 6]>,
+    /// The GO's P2P IE reached firmware (0xd003) before its beacon.
+    p2p_ie: bool,
 }
 fn event_body(m: &mut RadioModel, id: u32, tag: u16, body: &[u8]) {
     let mut out = Vec::new();
@@ -49,7 +59,9 @@ fn event_body(m: &mut RadioModel, id: u32, tag: u16, body: &[u8]) {
     add_event(m, id, &out);
 }
 fn peer_map(m: &mut RadioModel, mac: [u8; 6], id: u16) {
-    let mut out = vec![3, 0];
+    // PEER_MAP byte 1 is the peer's vdev (`ath10k_peer_map_event`).
+    let vdev = m.ap.as_ref().map_or(0, |f| f.vdev as u8);
+    let mut out = vec![3, vdev];
     out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(&mac);
     out.extend_from_slice(&[0, 0]);
@@ -90,6 +102,14 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
     let id = word(b, 0);
     let tag = word(b, 4) >> 16;
     m.ap.as_mut().unwrap().commands.push(b.to_vec());
+    // The AP-type vdev and its address: the managed vdev 0 with OWN, or a
+    // GO's own vdev and address beside it.
+    let (vdev, own) = {
+        let f = m.ap.as_ref().unwrap();
+        (f.vdev, f.own.unwrap_or(OWN))
+    };
+    let go = vdev != 0;
+    let at = vdev.to_le_bytes();
     // Actual HTC credits replenish only the command endpoint. They never
     // complete a management/DATA DMA ID or fabricate a firmware response.
     m.inner.inner.rx.push_back((
@@ -118,31 +138,31 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             require(
                 tag == 86
                     && b.len() == 28
-                    && word(b, 8) == 0
-                    && b[20..26] == OWN
-                    && word(b, 16) == 0,
+                    && word(b, 8) == vdev
+                    && b[20..26] == own
+                    && word(b, 16) == if go { 3 } else { 0 },
             )?;
             require(matches!(word(b, 12), 1 | 2))?;
             m.ap.as_mut().unwrap().active = word(b, 12) == 1;
         }
         0x5002 => {
-            require(tag == 87 && b.len() == 12 && word(b, 8) == 0)?;
+            require(tag == 87 && b.len() == 12 && word(b, 8) == vdev)?;
             m.ap.as_mut().unwrap().active = false;
             add_event(m, 0x5006, &[]);
         }
         0x6001 => {
-            require(tag == 97 && b.len() == 24 && word(b, 8) == 0 && word(b, 20) == 0)?;
+            require(tag == 97 && b.len() == 24 && word(b, 8) == vdev && word(b, 20) == 0)?;
             let mac: [u8; 6] = b[12..18].try_into().unwrap();
             let f = m.ap.as_mut().unwrap();
             require(f.active && !f.peers.iter().any(|(old, _)| *old == mac))?;
-            let id = if mac == OWN { 2 } else { 1800 };
+            let id = if mac == own { 2 } else { 1800 };
             f.peers.push((mac, id));
             if !f.hold_map {
                 peer_map(m, mac, id);
             }
         }
         0x6002 => {
-            require(tag == 98 && b.len() == 20 && word(b, 8) == 0)?;
+            require(tag == 98 && b.len() == 20 && word(b, 8) == vdev)?;
             let mac: [u8; 6] = b[12..18].try_into().unwrap();
             let f = m.ap.as_mut().unwrap();
             let index = f
@@ -153,6 +173,7 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             let (_, id) = f.peers.remove(index);
             unmap(m, id);
             let mut body = vec![0; 12];
+            body[..4].copy_from_slice(&at);
             body[4..10].copy_from_slice(&mac);
             event_body(m, 0x6007, 451, &body);
         }
@@ -160,7 +181,7 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             require(
                 tag == 88
                     && b.len() == 112
-                    && word(b, 8) == 0
+                    && word(b, 8) == vdev
                     && word(b, 16) == 100
                     && word(b, 20) == 2
                     && word(b, 28) == 4
@@ -168,13 +189,15 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
                     && word(b, 84) == 2412
                     && word(b, 88) == 2412,
             )?;
-            event_body(m, 0x5001, 40, &[0; 16]);
+            let mut response = [0; 16];
+            response[..4].copy_from_slice(&at);
+            event_body(m, 0x5001, 40, &response);
         }
         0x7003 => {
             require(
                 tag == 103
                     && b.len() >= 72
-                    && word(b, 8) == 0
+                    && word(b, 8) == vdev
                     && word(b, 20) == (105 << 16 | 8)
                     && word(b, 32) >> 16 == 17,
             )?;
@@ -184,20 +207,39 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             require(
                 template[0] == 0x80
                     && template[4..10] == [255; 6]
-                    && template[10..16] == OWN
+                    && template[10..16] == own
                     && template.get(tim..tim + 6) == Some(&[5, 4, 0, 2, 0, 0]),
             )?;
+            // `ath10k_mac_remove_vendor_ie`: the GO's P2P IE went to
+            // firmware in 0xd003 and is not in the template.
+            require(
+                !template
+                    .windows(6)
+                    .any(|w| w[0] == 221 && w[2..6] == [0x50, 0x6f, 0x9a, 0x09])
+                    && (!go || m.ap.as_ref().unwrap().p2p_ie),
+            )?;
             m.ap.as_mut().unwrap().beacon = true;
+        }
+        0xd003 => {
+            // WMI_TLV_P2P_GO_SET_BEACON_IE: tag 90 {vdev, ie_len}, tag 17.
+            require(
+                go && tag == 90
+                    && word(b, 8) == vdev
+                    && word(b, 12) as usize == P2P_IE.len()
+                    && word(b, 16) >> 16 == 17
+                    && b.get(20..20 + P2P_IE.len()) == Some(&P2P_IE[..]),
+            )?;
+            m.ap.as_mut().unwrap().p2p_ie = true;
         }
         0x7007 => {
             require(
                 tag == 104
                     && b.len() >= 68
-                    && word(b, 8) == 0
+                    && word(b, 8) == vdev
                     && word(b, 16) == (105 << 16 | 8)
                     && word(b, 28) >> 16 == 17
                     && b[32] == 0x50
-                    && b[42..48] == OWN,
+                    && b[42..48] == own,
             )?;
             m.ap.as_mut().unwrap().probe = true;
         }
@@ -206,29 +248,31 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             require(
                 tag == 92
                     && b.len() == 24
-                    && word(b, 8) == 0
+                    && word(b, 8) == vdev
                     && word(b, 12) == 0
-                    && b[16..22] == OWN
+                    && b[16..22] == own
                     && f.beacon
                     && f.probe
-                    && f.peers.iter().any(|(mac, _)| *mac == OWN),
+                    && f.peers.iter().any(|(mac, _)| *mac == own),
             )?;
             f.up = true;
-            event_body(m, 0x7004, 222, &[0; 8]);
+            let mut status = [0; 8];
+            status[..4].copy_from_slice(&at);
+            event_body(m, 0x7004, 222, &status);
         }
         0x5007 => {
-            require(tag == 94 && word(b, 8) == 0)?;
+            require(tag == 94 && word(b, 8) == vdev)?;
             m.ap.as_mut().unwrap().up = false;
         }
         0x5006 => {
-            require(tag == 93 && word(b, 8) == 0 && !m.ap.as_ref().unwrap().up)?;
-            event_body(m, 0x5002, 41, &[0; 4]);
+            require(tag == 93 && word(b, 8) == vdev && !m.ap.as_ref().unwrap().up)?;
+            event_body(m, 0x5002, 41, &at);
         }
         0x6005 => {
             require(
                 tag == 101
                     && b.len() >= 112
-                    && word(b, 16) == 0
+                    && word(b, 16) == vdev
                     && word(b, 24) == 1
                     && word(b, 36) == 10
                     && word(b, 56) == 1
@@ -242,13 +286,13 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             )?;
         }
         0xe001 => {
-            require(tag == 130 && b.len() == 28 && word(b, 8) == 0 && b[12..18] == PEER)?;
+            require(tag == 130 && b.len() == 28 && word(b, 8) == vdev && b[12..18] == PEER)?;
             m.ap.as_mut().unwrap().ps.push((word(b, 20), word(b, 24)));
         }
         0x6004 => require(
             tag == 100
                 && b.len() == 28
-                && word(b, 8) == 0
+                && word(b, 8) == vdev
                 && b[12..18] == PEER
                 && word(b, 20) == 3
                 && word(b, 24) <= 1,
@@ -291,7 +335,7 @@ pub(super) fn command(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
         }
         0x4001 | 0x4003 | 0x3003 => {} // existing factory/power/channel codecs have independent old goldens
         0x5008 => {
-            require(tag == 95 && b.len() == 20 && word(b, 8) == 0)?;
+            require(tag == 95 && b.len() == 20 && word(b, 8) == vdev)?;
             let (id, value) = (word(b, 12), word(b, 16));
             require(matches!(
                 (id, value),
@@ -627,6 +671,12 @@ struct Bound {
 }
 impl Bound {
     fn new() -> Self {
+        Self::with(false)
+    }
+    /// `go`: the device is a P2P GO netdev with address GO, whose AP owns
+    /// its own vdev 1 beside the managed vdev 0.
+    fn with(go: bool) -> Self {
+        let mac = if go { GO } else { OWN };
         let mut radio = radio_boot_source_ap(
             4,
             Dialect::Tlv,
@@ -649,18 +699,24 @@ impl Bound {
         ));
         let model = &mut radio.htt.wmi.htc.transport;
         model.ce = Some(crate::ath10k::boot::CeFixture::new(HwRev::Qca6174));
-        model.ap = Some(Fixture::default());
+        model.ap = Some(Fixture {
+            vdev: u32::from(go),
+            own: go.then_some(GO),
+            ..Fixture::default()
+        });
         let name: String = narf_net::iface::reserve_name("wlan%d").into();
-        narf_net::iface::register_with_context(&name, OWN, 0, |_, _, _| Err(()));
+        narf_net::iface::register_with_context(&name, mac, 0, |_, _, _| Err(()));
         narf_net::iface::set_link_state(&name, false);
         let database = Arc::new(narf_wireless::reg::db::Database::new());
         database.install(station_tests::policy());
-        let device = Arc::new(Device::for_test(
-            &name,
-            OWN,
-            Arc::new(Mutex::new(radio)),
-            || Some(station_tests::policy()),
-        ));
+        let device = Device::for_test(&name, mac, Arc::new(Mutex::new(radio)), || {
+            Some(station_tests::policy())
+        });
+        let device = Arc::new(if go {
+            device.into_go_for_test()
+        } else {
+            device
+        });
         device.ap_database_for_test(database.clone());
         assert!(device.supports_ap());
         assert_eq!(device.set_iftype(3), Ok(()));
@@ -704,7 +760,11 @@ impl Bound {
         f(&mut self.device.radio.try_lock().unwrap().htt.wmi.htc.transport)
     }
     fn start(&self, secure: bool) -> Result<(), narf_wireless::WirelessError> {
-        let (config, settings) = config(secure);
+        let (config, settings) = if self.model(|m| m.ap.as_ref().unwrap().vdev != 0) {
+            go_config()
+        } else {
+            config(secure)
+        };
         let authority = self.authority();
         match drive(
             self.device
@@ -798,6 +858,14 @@ fn config(secure: bool) -> (narf_wireless::ApConfig, narf_wireless::ApStartSetti
             no_preauth: false,
         };
     }
+    (config, settings)
+}
+/// An open GO beacon from GO carrying the WFA P2P IE in its tail.
+fn go_config() -> (narf_wireless::ApConfig, narf_wireless::ApStartSettings) {
+    let (mut config, settings) = config(false);
+    config.beacon_head[10..16].copy_from_slice(&GO);
+    config.beacon_head[16..22].copy_from_slice(&GO);
+    config.beacon_tail = P2P_IE.to_vec();
     (config, settings)
 }
 fn station(secure: bool) -> narf_wireless::StationConfig {
@@ -1666,4 +1734,87 @@ fn smoke_ath10k_ap_userspace_rsn_exchange_uses_native_eapol_air_receipts_before_
 kernel_test_in!(
     "drivers/wireless/ath10k/ap",
     smoke_ath10k_ap_userspace_rsn_exchange_uses_native_eapol_air_receipts_before_key_and_port
+);
+
+/// `mac.c::ath10k_add_interface` for `NL80211_IFTYPE_P2P_GO`: the GO's
+/// AP START creates its own AP/P2P_GO vdev 1 (no delete or replacement of
+/// the managed vdev 0), sends its NSS parameter and self peer, publishes
+/// 0xd003 before the P2P-IE-stripped beacon; STOP deletes its self peer
+/// and vdev 1 (`ath10k_remove_interface`) without recreating a station
+/// vdev, and the id is free again for a second GO start.
+fn smoke_ath10k_p2p_go_own_vdev_start_and_teardown() -> TestResult {
+    let b = Bound::with(true);
+    if b.start(false).is_err() || !b.device.link_up() {
+        return TestResult::Fail("GO start on its own vdev");
+    }
+    let started = b.model(|m| {
+        let commands = &m.ap.as_ref().unwrap().commands;
+        let create = commands
+            .iter()
+            .position(|c| word(c, 0) == 0x5001)
+            .is_some_and(|at| word(&commands[at], 8) == 1);
+        let nss = commands
+            .iter()
+            .any(|c| word(c, 0) == 0x5008 && word(c, 8) == 1 && word(c, 12) == 0x22);
+        let primary_untouched = !commands
+            .iter()
+            .any(|c| matches!(word(c, 0), 0x5001 | 0x5002) && word(c, 8) == 0);
+        create && nss && primary_untouched && m.ap.as_ref().unwrap().p2p_ie
+    });
+    if !started {
+        return TestResult::Fail("GO VDEV_CREATE/NSS on vdev 1, vdev 0 untouched");
+    }
+    {
+        let radio = b.device.radio.try_lock().unwrap();
+        if !radio.ap_is_go() || radio.primary_vdev() != 0 || radio.go_identity() != Some((1, GO)) {
+            return TestResult::Fail("GO session identity");
+        }
+    }
+    let stop = |b: &Bound| {
+        let authority = b.authority();
+        matches!(
+            drive(b.device.stop_ap_async(&authority)),
+            Poll::Ready(Ok(()))
+        )
+    };
+    if !stop(&b) || b.device.link_up() {
+        return TestResult::Fail("GO stop");
+    }
+    let stopped = b.model(|m| {
+        let f = m.ap.as_ref().unwrap();
+        let self_peer = f
+            .commands
+            .iter()
+            .position(|c| word(c, 0) == 0x6002 && word(c, 8) == 1 && c[12..18] == GO);
+        let delete = f
+            .commands
+            .iter()
+            .rposition(|c| word(c, 0) == 0x5002 && word(c, 8) == 1);
+        let recreated =
+            delete.is_some_and(|at| f.commands[at..].iter().any(|c| word(c, 0) == 0x5001));
+        !f.active
+            && f.peers.is_empty()
+            && self_peer.zip(delete).is_some_and(|(p, d)| p < d)
+            && !recreated
+    });
+    if !stopped {
+        return TestResult::Fail("GO self-peer delete, vdev 1 delete, no station restore");
+    }
+    if b.device.radio.try_lock().unwrap().ap_exists() {
+        return TestResult::Fail("GO session retired");
+    }
+    b.model(|m| {
+        let f = m.ap.as_mut().unwrap();
+        f.beacon = false;
+        f.probe = false;
+        f.p2p_ie = false;
+    });
+    if b.start(false).is_err() || !stop(&b) {
+        return TestResult::Fail("GO vdev 1 reused after release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_go_own_vdev_start_and_teardown
 );

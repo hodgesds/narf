@@ -263,6 +263,17 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         current().map_err(error)?;
         let mut terminal = None;
         let result = match operation {
+            Operation::Start(config, settings) if self.go => radio
+                .go_start(
+                    self.mac,
+                    *config,
+                    *settings,
+                    emission.clone(),
+                    policy.clone(),
+                    &current,
+                )
+                .await
+                .map(|()| true),
             Operation::Start(config, settings) => radio
                 .ap_start(
                     *config,

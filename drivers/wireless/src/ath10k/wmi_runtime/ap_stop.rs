@@ -62,9 +62,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate()?;
         // No command was even staged in Original. There cannot be a native
         // AP buffer; prove the shared pool is quiet before removing metadata.
+        let go = self.go_identity().map(|(vdev, _)| vdev);
         if original == Vdev::Original {
             self.ap_quiet(validate).await?;
             self.ap = None;
+            // Nothing was published on the GO's allocated id.
+            if let Some(vdev) = go {
+                self.vdev_map.as_mut().ok_or(Error::Failed)?.release(vdev)?;
+            }
             return Ok(());
         }
         if original == Vdev::StartSent {
@@ -117,8 +122,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             // CREATE may have been only partially published. A genuine delete
             // response is mandatory here; silence/timeout is never success.
+            // A GO deletes its own vdev (`ath10k_remove_interface`: the AP
+            // self peer above, then `WMI_VDEV_DELETE` + SYNC_DELETE wait).
             self.ap_publish(
-                &ap_wire::delete(self.primary)?,
+                &ap_wire::delete(self.ap_owned_vdev()?)?,
                 Publication::Vdev(Vdev::DeleteSent),
                 validate,
             )
@@ -129,6 +136,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.ap.as_mut().unwrap().vdev = Vdev::Absent;
         }
         self.ap_prefix(validate).await?;
+        if let Some(vdev) = go {
+            // The managed vdev was never replaced: nothing to restore. The
+            // id returns to the map only after the genuine delete response.
+            if self.htt.wmi.htc.transport.pending_htt_tx()? != 0 {
+                return Err(Error::Failed);
+            }
+            self.ap.as_mut().unwrap().vdev = Vdev::Retired;
+            self.ap = None;
+            self.vdev_map.as_mut().ok_or(Error::Failed)?.release(vdev)?;
+            self.failed = false;
+            return Ok(());
+        }
         // Reconstruct the original inactive station discovery vdev only after
         // actual AP destruction. No AP/STA role alias or new DATA port exists.
         let own = self.ap.as_ref().unwrap().own.mac;

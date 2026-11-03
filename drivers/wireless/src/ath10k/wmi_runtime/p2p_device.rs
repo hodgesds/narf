@@ -139,6 +139,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Ok(own);
             }
         }
+        if let Some((id, own)) = self.go_identity() {
+            if id == vdev {
+                return Ok(own);
+            }
+        }
         Err(Error::Failed)
     }
     /// `mac.c::ath10k_hw_scan` on the P2P_DEVICE vif (P2P search): the
