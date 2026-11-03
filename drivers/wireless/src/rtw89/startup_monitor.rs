@@ -24,8 +24,12 @@ impl Startup {
             .firmware
             .as_ref()
             .and_then(|firmware| firmware.transport().operating_channel())
-            .map(|(primary, _)| primary);
-        if current != Some(primary) {
+            .map(|(channel, _)| channel);
+        if current
+            != Some(crate::rtw89::command_native::OperatingChannel::legacy(
+                primary,
+            ))
+        {
             self.retune_channel(primary, false).await?;
         }
         let controller = monitor::Controller::prepare(desired.clone(), admission.clone())?;

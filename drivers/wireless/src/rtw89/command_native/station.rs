@@ -293,7 +293,7 @@ impl Native {
     pub(in crate::rtw89) fn lowest_rate(&self) -> u8 {
         if self
             .operating_channel()
-            .is_some_and(|(primary, _)| primary > 14)
+            .is_some_and(|(channel, _)| channel.ofdm_only())
         {
             crate::rtw89::packet_format::OFDM6
         } else {
@@ -510,7 +510,7 @@ impl control::Interface for Access<'_> {
     fn ghz5(&mut self) -> bool {
         self.native
             .operating_channel()
-            .is_some_and(|(primary, _)| primary > 14)
+            .is_some_and(|(channel, _)| channel.ofdm_only())
     }
     fn preflight(&mut self, indirect: bool) -> Result<(), power::Error> {
         if self.native.state != State::Active {

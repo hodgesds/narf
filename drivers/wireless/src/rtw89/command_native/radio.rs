@@ -607,7 +607,7 @@ impl Native {
             let input = owner.tracking_inputs().ok_or(power::Error::Terminal)?;
             self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
         }
-        self.channel = Some((1, owner.epoch()));
+        self.channel = Some((OperatingChannel::legacy(1), owner.epoch()));
         self.ordinary = Some(OrdinaryGrant::B(qualification));
         Ok(())
     }
@@ -710,8 +710,9 @@ impl Native {
         }
         Ok(admitted)
     }
-    /// Typed primary and retune epoch of the last completed full program.
-    pub(in crate::rtw89) fn operating_channel(&self) -> Option<(u8, u32)> {
+    /// Band-qualified channel and retune epoch of the last completed full
+    /// program.
+    pub(in crate::rtw89) fn operating_channel(&self) -> Option<(OperatingChannel, u32)> {
         self.ordinary.as_ref()?;
         self.channel
     }
@@ -909,7 +910,7 @@ impl Native {
             let input = owner.tracking_inputs().ok_or(power::Error::Terminal)?;
             self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
         }
-        self.channel = Some((primary, owner.epoch()));
+        self.channel = Some((OperatingChannel::legacy(primary), owner.epoch()));
         // RX admission follows the programmed width: up to this channel's
         // bandwidth, and VHT rates only on a 5GHz 40/80MHz channel.
         if let Some(core) = self.station_runtime.core.as_mut() {
@@ -1272,7 +1273,10 @@ impl Native {
         if qualification.active() != profile {
             return Err(power::Error::Access);
         }
-        self.channel = Some((profile.primary(), owner.epoch()));
+        self.channel = Some((
+            OperatingChannel::new(profile.band(), profile.primary()),
+            owner.epoch(),
+        ));
         self.ordinary = Some(OrdinaryGrant::C(qualification));
         Ok(())
     }
@@ -1414,7 +1418,10 @@ impl Native {
             return Err(power::Error::Terminal);
         }
         qualification.current().map_err(denied)?;
-        self.channel = Some((profile.primary(), owner.epoch()));
+        self.channel = Some((
+            OperatingChannel::new(profile.band(), profile.primary()),
+            owner.epoch(),
+        ));
         // RX admission follows the programmed width (as the B retune): up to
         // this channel's bandwidth (C: 160MHz = RTW89_CHANNEL_WIDTH_160 only
         // when programmed at 160), VHT rates only on a 5GHz wide channel.

@@ -103,6 +103,41 @@ impl OrdinaryGrant {
         }
     }
 }
+/// Band-qualified identity of the programmed operating channel (mac80211
+/// `cfg80211_chan_def.chan`: band + channel number). A bare primary number
+/// cannot name a 6GHz channel (6GHz 1/5/9/13 collide with 2.4GHz), so the
+/// native owner records the band the program was built for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct OperatingChannel {
+    band: super::operating_channel_c::Band,
+    primary: u8,
+}
+impl OperatingChannel {
+    pub(in crate::rtw89) const fn new(band: super::operating_channel_c::Band, primary: u8) -> Self {
+        Self { band, primary }
+    }
+    /// The RTL8852B / 2.4+5GHz numbering: 1..=14 is 2.4GHz, every other
+    /// primary 5GHz (6GHz is never named by a bare primary).
+    pub(in crate::rtw89) const fn legacy(primary: u8) -> Self {
+        let band = if primary <= 14 {
+            super::operating_channel_c::Band::Ghz2
+        } else {
+            super::operating_channel_c::Band::Ghz5
+        };
+        Self { band, primary }
+    }
+    pub(in crate::rtw89) const fn band(self) -> super::operating_channel_c::Band {
+        self.band
+    }
+    pub(in crate::rtw89) const fn primary(self) -> u8 {
+        self.primary
+    }
+    /// No CCK on this band (5/6GHz): core.c `rtw89_core_get_mgmt_rate`
+    /// floors at `RTW89_HW_RATE_OFDM6` off 2.4GHz.
+    pub(in crate::rtw89) const fn ofdm_only(self) -> bool {
+        !matches!(self.band, super::operating_channel_c::Band::Ghz2)
+    }
+}
 pub struct Native {
     io: NativeIo,
     bdram: super::bdram::Bdram,
@@ -149,9 +184,10 @@ pub struct Native {
     dma_reclaimed: bool,
     /// Observed-FLR lifecycle that selects the signed radio identity.
     lifecycle: super::radio_policy::Lifecycle,
-    /// Primary and retune epoch of the completed full program; cleared while
-    /// a retune runs. Consumers compare the epoch they were built against.
-    channel: Option<(u8, u32)>,
+    /// Band-qualified channel and retune epoch of the completed full
+    /// program; cleared while a retune runs. Consumers compare the epoch
+    /// they were built against.
+    channel: Option<(OperatingChannel, u32)>,
     /// Open reversible WoW TRX window (`command_native/wow.rs`).
     wow_trx: Option<wow::Trx>,
 }
