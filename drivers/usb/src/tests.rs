@@ -8911,6 +8911,60 @@ fn smoke_uac_dispatch_unbind_reaches_unbind() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uac", smoke_uac_dispatch_unbind_reaches_unbind);
 
+fn smoke_uac_pm_suspend_refuses_live_lease() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    crate::uac::__reset_uac_for_test();
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(9, &topo, &choices, &BindOutcome::default());
+    let (out_dci, in_dci) = crate::uac::find_audio_streaming_iso_eps(&cfg);
+    crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        slot_id: 9,
+        ac_iface: 0,
+        iso_out_dci: out_dci,
+        iso_in_dci: in_dci,
+        card: Some(state.clone()),
+        card_error: None,
+    });
+    // Idle: no lease open, so suspend is Ok — even though the
+    // bind-time default alt is already non-zero, which is why the
+    // busy signal is the live lease and not `active_alt`.
+    if crate::uac::suspend_uac_devices().is_err() {
+        return TestResult::Fail("suspend idle UAC");
+    }
+    if crate::uac::resume_uac_devices().is_err() {
+        return TestResult::Fail("resume idle UAC");
+    }
+    // An open playback lease makes suspend Busy; dropping the
+    // lease clears the live pump and suspend is Ok again.
+    let lease = match crate::uac_card::UacStream::with_iso(
+        state.clone(),
+        false,
+        alloc::boxed::Box::new(FakeIso(FakeIsoState::new())),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("playback lease"),
+    };
+    if !matches!(
+        crate::uac::suspend_uac_devices(),
+        Err(narf_power::device_pm::DeviceSuspendError::Busy)
+    ) {
+        return TestResult::Fail("suspend must refuse a live lease");
+    }
+    drop(lease);
+    if crate::uac::suspend_uac_devices().is_err() {
+        return TestResult::Fail("suspend after lease drop");
+    }
+    crate::uac::__reset_uac_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_pm_suspend_refuses_live_lease);
+
 fn smoke_uac_pump_generation_stop_start() -> TestResult {
     use crate::uac::{BindOutcome, UacTopology};
     use narf_drivers_sound::hardware::PcmHardware;

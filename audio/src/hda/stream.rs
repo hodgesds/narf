@@ -272,6 +272,9 @@ impl PcmDevice for Card {
         &self,
         id: narf_drivers_sound::mixer::ControlId,
     ) -> Result<narf_drivers_sound::mixer::ControlValue, SoundError> {
+        // JackSense reads send pin-sense verbs; wake a parked
+        // controller first so the read is live, not a timeout.
+        self.0.ensure_active().map_err(|_| SoundError::BadState)?;
         self.0.get_mixer(id)
     }
     fn control_tlv(
@@ -291,6 +294,10 @@ impl PcmDevice for Card {
         id: narf_drivers_sound::mixer::ControlId,
         value: narf_drivers_sound::mixer::ControlValue,
     ) -> Result<(), SoundError> {
+        // Mixer changes send verbs (volume, mute, SPDIF, chmap);
+        // a parked controller cannot take them, and volume keys
+        // are used with no stream playing — so wake first.
+        self.0.ensure_active().map_err(|_| SoundError::BadState)?;
         self.0.set_mixer(id, value)
     }
     fn open(&self, capture: bool, device: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
@@ -327,6 +334,8 @@ struct Pcm {
 }
 impl PcmHardware for Pcm {
     fn configure(&mut self, params: HwParams) -> Result<(), SoundError> {
+        // A parked controller cannot take verbs or program streams.
+        self.dev.ensure_active().map_err(|_| SoundError::BadState)?;
         if !self.capture {
             self.dev.latch_non_pcm();
         }
@@ -345,6 +354,8 @@ impl PcmHardware for Pcm {
         Ok(())
     }
     fn prepare(&mut self) -> Result<(), SoundError> {
+        // A parked controller cannot take verbs or program streams.
+        self.dev.ensure_active().map_err(|_| SoundError::BadState)?;
         // GPU ports take the IEC958 non-audio bit at prepare, as Linux's
         // snd_hda_hdmi_generic_pcm_prepare does: redo the codec setup with
         // it before the controller's format.
@@ -369,6 +380,8 @@ impl PcmHardware for Pcm {
         Ok(())
     }
     fn start(&mut self) -> Result<(), SoundError> {
+        // A parked controller cannot program streams.
+        self.dev.ensure_active().map_err(|_| SoundError::BadState)?;
         self.dev.streams[usize::from(self.capture)]
             .lock()
             .start(&self.dev)
@@ -376,7 +389,10 @@ impl PcmHardware for Pcm {
     fn stop(&mut self) -> Result<(), SoundError> {
         self.dev.streams[usize::from(self.capture)]
             .lock()
-            .stop(&self.dev)
+            .stop(&self.dev)?;
+        // Last stop parks the controller (best-effort idle, #779).
+        self.dev.maybe_idle_quiesce();
+        Ok(())
     }
     fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
         let mut state = self.dev.streams[usize::from(self.capture)].lock();

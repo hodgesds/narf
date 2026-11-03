@@ -1405,3 +1405,242 @@ kernel_test_in!(
     "audio/hda",
     native_hda_navi22_binds_ab28_and_routes_the_dcn30_endpoint
 );
+
+// ── Power management (#779) ──────────────────────────────────────────
+
+fn native_hda_pm_quiesce_reinit_parks_and_restores() -> TestResult {
+    let fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().iter().find(|c| c.afg_node_id.is_some()) else {
+        return TestResult::Fail("fixture has no AFG codec");
+    };
+    let (addr, nid) = (codec.addr, codec.afg_node_id.unwrap());
+    let d3 = make_verb(addr, nid, crate::hda_codec::verb::SET_POWER_STATE | 3);
+    let d0 = make_verb(addr, nid, crate::hda_codec::verb::SET_POWER_STATE);
+    let base = fixture.model.verbs.len();
+    if dev.quiesce().is_err() {
+        return TestResult::Fail("quiesce idle controller");
+    }
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    let (gctl, corbctl, rirbctl) = unsafe {
+        (
+            dev.bar0.read32(REG_GCTL),
+            dev.bar0.read8(REG_CORBCTL),
+            dev.bar0.read8(REG_RIRBCTL),
+        )
+    };
+    if !dev.suspended.load(Ordering::Acquire)
+        || gctl != 0
+        || corbctl != 0
+        || rirbctl != 0
+        || !fixture.model.verbs[base..].contains(&d3)
+    {
+        return TestResult::Fail("quiesce parks engines and sends D3");
+    }
+    // Idempotent: a second quiesce is Ok and changes nothing.
+    if dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("quiesce idempotent");
+    }
+    let base = fixture.model.verbs.len();
+    if dev.reinit().is_err() {
+        return TestResult::Fail("reinit parked controller");
+    }
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    let (gctl, corbctl, rirbctl) = unsafe {
+        (
+            dev.bar0.read32(REG_GCTL),
+            dev.bar0.read8(REG_CORBCTL),
+            dev.bar0.read8(REG_RIRBCTL),
+        )
+    };
+    if dev.suspended.load(Ordering::Acquire)
+        || gctl & 1 == 0
+        || corbctl != CORBCTL_RUN | CORBCTL_CMEIE
+        || rirbctl != RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC
+        || !fixture.model.verbs[base..].contains(&d0)
+    {
+        return TestResult::Fail("reinit restores engines and sends D0");
+    }
+    if dev.reinit().is_err() || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("reinit idempotent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_pm_quiesce_reinit_parks_and_restores);
+
+fn native_hda_pm_busy_while_stream_runs_or_prepared() -> TestResult {
+    let fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let mut playback = match card.open(false, 0) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("open"),
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure/prepare playback");
+    }
+    // Prepared-but-idle still blocks quiesce: the BDL is published.
+    if dev.quiesce().is_ok() {
+        return TestResult::Fail("quiesce must refuse a prepared stream");
+    }
+    if playback.write(&[0x5a; 512]) != Ok(512) || playback.start().is_err() {
+        return TestResult::Fail("start playback");
+    }
+    if dev.quiesce().is_ok() {
+        return TestResult::Fail("quiesce must refuse a running stream");
+    }
+    // Layer 1: the PCM stop path parks the controller itself.
+    if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("stop parks the controller");
+    }
+    // And the next start transparently re-inits it.
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+        || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("start re-inits a parked controller");
+    }
+    if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("second stop re-parks the controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_pm_busy_while_stream_runs_or_prepared
+);
+
+fn native_hda_pm_system_fanout_suspends_and_resumes() -> TestResult {
+    let _pm = narf_power::device_pm::__test_isolate_registry();
+    let fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    // Restore the controller table on every exit, including early
+    // failure returns: other smokes share this global.
+    struct ControllersGuard {
+        len: usize,
+    }
+    impl Drop for ControllersGuard {
+        fn drop(&mut self) {
+            CONTROLLERS.lock().truncate(self.len);
+        }
+    }
+    let _cguard = ControllersGuard {
+        len: CONTROLLERS.lock().len(),
+    };
+    CONTROLLERS.lock().push((
+        narf_bus::BusAddr::Mmio(narf_memory::PhysAddr::new(0xFEDC_0000)),
+        dev.clone(),
+        0,
+    ));
+    narf_power::device_pm::register_device_pm_ops("hda", Arc::new(HdaSystemPm));
+    if !narf_power::device_pm::suspend_all_devices().ok() || !dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("fanout suspend parks the controller");
+    }
+    if !narf_power::device_pm::resume_all_devices().ok() || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("fanout resume re-inits the controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_pm_system_fanout_suspends_and_resumes
+);
+
+/// Minimal PCI power-state model for the `PciRuntimePm` wrapper
+/// test: no real config space, and the settle delay completes
+/// immediately (the default delay awaits a timer, which the
+/// spin-driven test loop must not depend on).
+struct FakePciPmIo {
+    state: IrqSafeSpinLock<narf_bus::pci::PciPowerState>,
+    saved: AtomicBool,
+    restored: AtomicBool,
+}
+impl narf_power::runtime_pm_pci::PciPmIo for FakePciPmIo {
+    fn power_state(&self) -> Result<Option<narf_bus::pci::PciPowerState>, narf_bus::pci::PciError> {
+        Ok(Some(*self.state.lock()))
+    }
+    fn set_power_state(
+        &self,
+        state: narf_bus::pci::PciPowerState,
+    ) -> Result<(), narf_bus::pci::PciError> {
+        *self.state.lock() = state;
+        Ok(())
+    }
+    fn save_state(&self) -> Result<(), narf_bus::pci::PciError> {
+        self.saved.store(true, Ordering::Release);
+        Ok(())
+    }
+    fn restore_state(&self) -> Result<(), narf_bus::pci::PciError> {
+        self.restored.store(true, Ordering::Release);
+        Ok(())
+    }
+    fn delay_ms(&self, _ms: u64) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+fn native_hda_pm_runtime_ops_and_pci_wrapper() -> TestResult {
+    use narf_power::runtime_pm::RuntimePmOps;
+    let fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let ops = HdaRuntimePm { dev: dev.clone() };
+    if narf_scheduler::block_on_spin(ops.runtime_suspend()).is_err()
+        || !dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("runtime suspend parks the controller");
+    }
+    if narf_scheduler::block_on_spin(ops.runtime_resume()).is_err()
+        || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("runtime resume re-inits the controller");
+    }
+    // The PCI wrapper moves the function state around the same
+    // driver core: suspend saves config and lands in D3hot,
+    // resume restores config, returns to D0, and re-inits.
+    let io = Arc::new(FakePciPmIo {
+        state: IrqSafeSpinLock::new(narf_bus::pci::PciPowerState::D0),
+        saved: AtomicBool::new(false),
+        restored: AtomicBool::new(false),
+    });
+    let pci = narf_power::runtime_pm_pci::PciRuntimePm::new(
+        io.clone(),
+        Some(Arc::new(HdaRuntimePm { dev: dev.clone() })),
+        None,
+    );
+    if narf_scheduler::block_on_spin(pci.runtime_suspend()).is_err()
+        || !dev.suspended.load(Ordering::Acquire)
+        || *io.state.lock() != narf_bus::pci::PciPowerState::D3Hot
+        || !io.saved.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("wrapper suspend saves and moves to D3hot");
+    }
+    if narf_scheduler::block_on_spin(pci.runtime_resume()).is_err()
+        || dev.suspended.load(Ordering::Acquire)
+        || *io.state.lock() != narf_bus::pci::PciPowerState::D0
+        || !io.restored.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("wrapper resume restores and returns to D0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_pm_runtime_ops_and_pci_wrapper);

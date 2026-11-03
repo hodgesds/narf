@@ -7,7 +7,7 @@ use crate::{
     native_pcm::Ring,
 };
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_drivers_sound::{
@@ -67,6 +67,11 @@ struct Controller {
     irq: Arc<State>,
     route: Option<Route>,
     capture: IrqSafeSpinLock<Capture>,
+    /// Power-management park flag (#779): set by quiesce once the
+    /// capture engine is stopped and IRQs are off, cleared by
+    /// reinit. The PCM bring-up paths reinit when they see it set;
+    /// the service loop skips work while it is set.
+    suspended: AtomicBool,
 }
 fn wait(predicate: impl FnMut() -> bool) -> bool {
     narf_scheduler::responsive_spin_until(predicate, Deadline::after_ms(100))
@@ -93,15 +98,17 @@ impl Controller {
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         wait(|| unsafe { mmio.read32(RESET) } == 0)
     }
-    fn init(mmio: MmioRegion) -> Result<Self, SoundError> {
-        if mmio.len < SCRATCH + 64 {
-            return Err(SoundError::NoSuchDevice);
-        }
+    /// Block power-up + reset sequence shared by `init` and
+    /// `reinit` (#779): power the block up if its status says
+    /// otherwise, enable the block, reset it, and leave IRQs off.
+    /// The power-down direction is deliberately NOT written here:
+    /// the ACP power register semantics are not pinned by an
+    /// in-tree source, and guessing a power-down value could wedge
+    /// the block. Real power saving comes from the PCI D3hot move
+    /// in the runtime-PM wrapper (follow-up) and platform S3.
+    fn power_up_and_reset(mmio: MmioRegion) -> Result<(), SoundError> {
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         let state = unsafe { mmio.read32(POWER_STATUS) };
-        if state == u32::MAX {
-            return Err(SoundError::NoSuchDevice);
-        }
         if state != 0 {
             if state & 3 != 1 {
                 // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
@@ -128,11 +135,25 @@ impl Controller {
             mmio.write32(INTR_STATUS, u32::MAX);
             mmio.write32(ZSC, 0);
         }
+        Ok(())
+    }
+
+    fn init(mmio: MmioRegion) -> Result<Self, SoundError> {
+        if mmio.len < SCRATCH + 64 {
+            return Err(SoundError::NoSuchDevice);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        let state = unsafe { mmio.read32(POWER_STATUS) };
+        if state == u32::MAX {
+            return Err(SoundError::NoSuchDevice);
+        }
+        Self::power_up_and_reset(mmio)?;
         Ok(Self {
             mmio,
             irq: State::new(mmio, Kind::Acp),
             route: None,
             capture: IrqSafeSpinLock::new(Capture::default()),
+            suspended: AtomicBool::new(false),
         })
     }
     fn count(&self) -> Result<u64, SoundError> {
@@ -195,6 +216,152 @@ impl Controller {
             ring.xrun = true;
             let _ = self.stop(state);
         }
+    }
+
+    // ── Power management (#779) ──────────────────────────────────
+    // Same two layers as HDA (see `hda::runtime`): system PM via
+    // `AcpSystemPm` registered at probe, runtime PM via
+    // `AcpRuntimePm` over this core, fixture-proven directly with
+    // `block_on_spin` (the generic `PciRuntimePm` wrapper around
+    // the same trait is proven by the HDA test). Production probe
+    // registration of the PCI node is the same follow-up as HDA
+    // (PCM start is sync and cannot await a framework resume).
+    // The live idle path is the PCM stop hook below: engine
+    // stopped, IRQs off, PCI stays D0.
+    // There is no codec verb here: PDM capture has no codec, and
+    // the SDW manager on this function is a separate binding with
+    // its own quiesce still to land — PDM and SDW probes are
+    // mutually exclusive, so the SDW case never shares this
+    // controller, and leaving it unregistered preserves today's
+    // behavior for it rather than suspending under a live manager.
+
+    /// True when no capture can move samples: no ring, or a ring
+    /// that is neither running nor prepared. A prepared-but-idle
+    /// ring still blocks quiesce, for the same BDL-staleness reason
+    /// as HDA: its ATU programming would go stale across a reset.
+    fn capture_idle(&self) -> bool {
+        let state = self.capture.lock();
+        state
+            .ring
+            .as_ref()
+            .is_none_or(|r| !r.running && !r.prepared)
+    }
+
+    /// Power-management quiesce: stop the capture engine, IRQs
+    /// off, park flag set. Idempotent. Refuses with BadState when
+    /// capture is running or prepared; the owner must stop it
+    /// first — suspend never discards capture state. No ACP power
+    /// register is written: the power-down direction is not pinned
+    /// by an in-tree source (see `power_up_and_reset`).
+    fn quiesce(&self) -> Result<(), SoundError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut state = self.capture.lock();
+        if state.ring.as_ref().is_some_and(|r| r.running || r.prepared) {
+            return Err(SoundError::BadState);
+        }
+        self.stop(&mut state)?;
+        // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
+        unsafe {
+            self.mmio.write32(INTR_ENABLE, 0);
+        }
+        self.suspended.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reverse of quiesce: restore the block to its post-`init`
+    /// baseline (power-up, enable, reset, IRQs off) and clear the
+    /// sticky IRQ failure: the reset re-establishes the block, so
+    /// a pre-suspend engine failure must not poison post-resume
+    /// starts. Stream state is NOT restored: suspend refused
+    /// running or prepared capture, so capture needs a fresh
+    /// prepare after resume. Idempotent.
+    fn reinit(&self) -> Result<(), SoundError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Self::power_up_and_reset(self.mmio)?;
+        self.irq.failed.store(false, Ordering::Release);
+        self.suspended.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// PCM bring-up entry: reinit a parked block before any path
+    /// that programs the capture engine.
+    fn ensure_active(&self) -> Result<(), SoundError> {
+        self.reinit()
+    }
+
+    /// Best-effort idle transition for the PCM stop path: quiesce
+    /// when capture is stopped, ignore failures (the next stop
+    /// retries; the block simply stays powered).
+    fn maybe_idle_quiesce(&self) {
+        if self.suspended.load(Ordering::Acquire) || !self.capture_idle() {
+            return;
+        }
+        let _ = self.quiesce();
+    }
+}
+
+/// System-PM ops for the ACP 6.3 PDM controller (#779). The
+/// device_pm registry holds one entry per name; the single
+/// CONTROLLER static is fanned out here. Suspend refuses (Busy)
+/// while capture is running or prepared; resume restores the
+/// post-`init` baseline.
+struct AcpSystemPm;
+impl narf_power::device_pm::DevicePmOps for AcpSystemPm {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use narf_power::device_pm::DeviceSuspendError as E;
+        let dev = CONTROLLER.lock().as_ref().map(|(dev, _)| dev.clone());
+        if let Some(dev) = dev {
+            // Precise reason: a running or prepared capture is
+            // Busy; a quiesce failure (engine will not stop) is a
+            // driver error. Either way S3 aborts.
+            if !dev.capture_idle() {
+                return Err(E::Busy);
+            }
+            dev.quiesce().map_err(|_| E::DriverError)?;
+        }
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use narf_power::device_pm::DeviceSuspendError as E;
+        let dev = CONTROLLER.lock().as_ref().map(|(dev, _)| dev.clone());
+        if let Some(dev) = dev {
+            dev.reinit().map_err(|_| E::DriverError)?;
+        }
+        Ok(())
+    }
+}
+
+/// Runtime-PM ops for one ACP 6.3 PDM controller (#779). The core
+/// is synchronous (see above), so the async callbacks simply run
+/// it; the PCI D3hot move belongs to the `PciRuntimePm` wrapper.
+/// Constructed by kernel tests today; production probe
+/// registration is the same follow-up as HDA (it needs an
+/// async-aware PCM start path), so the non-test build does not
+/// construct it yet.
+#[allow(dead_code)]
+struct AcpRuntimePm {
+    dev: Arc<Controller>,
+}
+impl narf_power::runtime_pm::RuntimePmOps for AcpRuntimePm {
+    fn runtime_suspend(&self) -> narf_power::runtime_pm::RpmFuture<'_> {
+        let dev = self.dev.clone();
+        Box::pin(async move {
+            dev.quiesce()
+                .map_err(|_| narf_power::runtime_pm::RpmError::Failed)
+        })
+    }
+
+    fn runtime_resume(&self) -> narf_power::runtime_pm::RpmFuture<'_> {
+        let dev = self.dev.clone();
+        Box::pin(async move {
+            dev.reinit()
+                .map_err(|_| narf_power::runtime_pm::RpmError::Failed)
+        })
     }
 }
 impl Drop for Controller {
@@ -267,6 +434,8 @@ impl PcmHardware for Pcm {
         {
             return Err(SoundError::InvalidParams);
         }
+        // A parked block cannot program the capture engine.
+        self.0.ensure_active()?;
         let ring = Ring::new(params)?;
         let mut state = self.0.capture.lock();
         self.0.stop(&mut state)?;
@@ -274,6 +443,8 @@ impl PcmHardware for Pcm {
         Ok(())
     }
     fn prepare(&mut self) -> Result<(), SoundError> {
+        // A parked block cannot program the capture engine.
+        self.0.ensure_active()?;
         let mut state = self.0.capture.lock();
         self.0.stop(&mut state)?;
         if self.0.irq.failed.load(Ordering::Acquire) {
@@ -305,6 +476,8 @@ impl PcmHardware for Pcm {
         Ok(())
     }
     fn start(&mut self) -> Result<(), SoundError> {
+        // A parked block cannot program the capture engine.
+        self.0.ensure_active()?;
         let mut state = self.0.capture.lock();
         if !state
             .ring
@@ -342,7 +515,10 @@ impl PcmHardware for Pcm {
         Ok(())
     }
     fn stop(&mut self) -> Result<(), SoundError> {
-        self.0.stop(&mut self.0.capture.lock())
+        self.0.stop(&mut self.0.capture.lock())?;
+        // Last stop parks the block (best-effort idle, #779).
+        self.0.maybe_idle_quiesce();
+        Ok(())
     }
     fn reset(&mut self) -> Result<(), SoundError> {
         let mut state = self.0.capture.lock();
@@ -490,8 +666,10 @@ fn probe_63(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf
             let Some(dev) = weak.upgrade() else {
                 break;
             };
-            dev.irq.service();
-            dev.update(&mut dev.capture.lock());
+            if !dev.suspended.load(Ordering::Acquire) {
+                dev.irq.service();
+                dev.update(&mut dev.capture.lock());
+            }
         }
     });
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -501,6 +679,10 @@ fn probe_63(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf
         pci_did: Some(DEVICE),
         domain: narf_drivers::BoundKind::Audio.default_domain(),
     });
+    // System power management (#779): one registry entry for the
+    // single PDM controller. Registration is idempotent on the
+    // name, so re-probe is safe.
+    narf_power::device_pm::register_device_pm_ops("acp63-pdm", Arc::new(AcpSystemPm));
     Ok(())
 }
 pub fn register_pci_driver() {
@@ -753,4 +935,162 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/acp63", native_acp_generation_dispatch);
+
+    // ── Power management (#779) ──────────────────────────────
+
+    fn native_acp63_pm_quiesce_reinit_parks_and_restores() -> TestResult {
+        let fixture = match Fixture::new() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("ACP init"),
+        };
+        let dev = fixture.dev.as_ref().unwrap().clone();
+        if dev.quiesce().is_err() {
+            return TestResult::Fail("quiesce idle block");
+        }
+        // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+        let intr_enable = unsafe { dev.mmio.read32(INTR_ENABLE) };
+        if !dev.suspended.load(Ordering::Acquire) || intr_enable != 0 {
+            return TestResult::Fail("quiesce parks and gates IRQs");
+        }
+        // Idempotent: a second quiesce is Ok and changes nothing.
+        if dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("quiesce idempotent");
+        }
+        if dev.reinit().is_err() {
+            return TestResult::Fail("reinit parked block");
+        }
+        // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+        let (control, intr_control, intr_enable, intr_status) = unsafe {
+            (
+                dev.mmio.read32(CONTROL),
+                dev.mmio.read32(INTR_CONTROL),
+                dev.mmio.read32(INTR_ENABLE),
+                dev.mmio.read32(INTR_STATUS),
+            )
+        };
+        if dev.suspended.load(Ordering::Acquire)
+            || control != 1
+            || intr_control != 0
+            || intr_enable != 0
+            || intr_status != u32::MAX
+        {
+            return TestResult::Fail("reinit restores the post-init baseline");
+        }
+        if dev.reinit().is_err() || dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("reinit idempotent");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/acp63",
+        native_acp63_pm_quiesce_reinit_parks_and_restores
+    );
+
+    fn native_acp63_pm_busy_while_capture_runs_or_prepared() -> TestResult {
+        let fixture = match Fixture::new() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("ACP init"),
+        };
+        let dev = fixture.dev.as_ref().unwrap().clone();
+        let card = Card(dev.clone());
+        let mut pcm = match card.open(true, 0) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("ACP open"),
+        };
+        if pcm.configure(card.default_params(true)).is_err() || pcm.prepare().is_err() {
+            return TestResult::Fail("ACP PCM setup");
+        }
+        // Prepared-but-idle still blocks quiesce: the ATU window is
+        // programmed and would go stale across a reset.
+        if dev.quiesce().is_ok() {
+            return TestResult::Fail("quiesce must refuse prepared capture");
+        }
+        if pcm.start().is_err() {
+            return TestResult::Fail("ACP capture start");
+        }
+        if dev.quiesce().is_ok() {
+            return TestResult::Fail("quiesce must refuse running capture");
+        }
+        // Layer 1: the PCM stop path parks the block itself.
+        if pcm.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("stop parks the block");
+        }
+        // And the next start transparently re-inits it.
+        if pcm.configure(card.default_params(true)).is_err()
+            || pcm.prepare().is_err()
+            || pcm.start().is_err()
+            || dev.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("start re-inits a parked block");
+        }
+        if pcm.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("second stop re-parks the block");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/acp63",
+        native_acp63_pm_busy_while_capture_runs_or_prepared
+    );
+
+    fn native_acp63_pm_system_fanout_suspends_and_resumes() -> TestResult {
+        let _pm = narf_power::device_pm::__test_isolate_registry();
+        let fixture = match Fixture::new() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("ACP init"),
+        };
+        let dev = fixture.dev.as_ref().unwrap().clone();
+        // Restore the controller static on every exit, including
+        // early failure returns: other smokes share this global.
+        struct ControllerGuard {
+            old: Option<(Arc<Controller>, u32)>,
+        }
+        impl Drop for ControllerGuard {
+            fn drop(&mut self) {
+                *CONTROLLER.lock() = self.old.take();
+            }
+        }
+        let _cguard = ControllerGuard {
+            old: CONTROLLER.lock().clone(),
+        };
+        *CONTROLLER.lock() = Some((dev.clone(), 0));
+        narf_power::device_pm::register_device_pm_ops("acp63-pdm", Arc::new(AcpSystemPm));
+        if !narf_power::device_pm::suspend_all_devices().ok()
+            || !dev.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("fanout suspend parks the block");
+        }
+        if !narf_power::device_pm::resume_all_devices().ok()
+            || dev.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("fanout resume re-inits the block");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/acp63",
+        native_acp63_pm_system_fanout_suspends_and_resumes
+    );
+
+    fn native_acp63_pm_runtime_ops() -> TestResult {
+        use narf_power::runtime_pm::RuntimePmOps;
+        let fixture = match Fixture::new() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("ACP init"),
+        };
+        let dev = fixture.dev.as_ref().unwrap().clone();
+        let ops = AcpRuntimePm { dev: dev.clone() };
+        if narf_scheduler::block_on_spin(ops.runtime_suspend()).is_err()
+            || !dev.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("runtime suspend parks the block");
+        }
+        if narf_scheduler::block_on_spin(ops.runtime_resume()).is_err()
+            || dev.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("runtime resume re-inits the block");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp63", native_acp63_pm_runtime_ops);
 }
