@@ -1565,10 +1565,45 @@ chain below is composed.
   `smoke_rtl8821ae_iqk_rx_fail_retries_and_untouched`,
   `smoke_rtl8821ae_iqk_linked_interval_and_agreement` (written, unexecuted).
 
+- `h2c` / `mac::ReceiveConfig` — firmware command, LPS and interrupt
+  pieces for the station owner (not yet composed). `h2c::Mailbox::fill` is
+  `fw.c::_rtl8821ae_fill_h2c_command`: `REG_CR == 0xEA` (MAC off) ⇒ the
+  `REG_SYS_CFG1+3 = 0xff` side effect and `RadioOff`; HMETFR polled one
+  plus 99 × 10 us; byte-wise writes, 4–7-byte commands writing the
+  zero-padded 4-byte extension box first; `last_hmeboxnum` rotation. A
+  timeout or MAC-off box is an error that poisons the mailbox (Linux drops
+  the command silently). Builders: `media_status` (`MSRRPT`, INFRA MACID
+  0), `pwrmode` (`SETPWRMODE`, ACTIVE = switch default rlbm 2/interval 4/
+  `FW_PWR_STATE_ACTIVE`; MAX from `reg_fwctrl_lps = 2`; smart_ps 1,
+  byte5 `0x40`), `rsvdpage_location`, `rate_mask`
+  (`rtl8821ae_update_hal_rate_mask` for a 2.4 GHz B/G/N 1T1R station on a
+  20 MHz channel: `rtl_op_sta_add` mode selection, RSSI-level masks,
+  `rtl_mrate_idx_to_arfr_id`, short-GI, `!update_bw << 3`), `set_bcn_ctrl`,
+  `set_rpwm` (`HW_VAR_SET_RPWM` toggle), `fwlps_enter`/`fwlps_leave`
+  (`low_power_enable` false). These are the `bt_ctrl_lps == false` forms:
+  Linux 8821AE reports `get_btc_status() == true`, but coex only takes LPS
+  control on boards with the BT function (`REG_MULTI_FUNC_CTRL[18]`); BT
+  coexistence is not implemented, so such boards must not be admitted.
+  Interrupts: `enable_interrupt` with `int_clear` (HISR/HISRE/HSISR
+  write-back, then HIMR/HIMRE/HSIMR; no `REG_C2HEVT_CLEAR` write on this
+  chip), `disable_interrupt`, `service_interrupt` (disable → recognize W1C
+  under `irq_mask` → enable, as `_rtl_pci_interrupt`; the 88EE/8723BE-only
+  HSISR handler is not run). `mac::ReceiveConfig::set_check_bssid` is
+  `rtl8821ae_set_check_bssid` with the software `receive_config` and cached
+  `reg_bcn_ctrl_val`: the first call settles the hardware RCR, whose
+  `0x608`/`0x609` bytes the MAC table rewrote after `_rtl8821ae_init_mac`.
+  Tests `smoke_rtl8821ae_h2c_box_bytes_extension_first_and_rotation`,
+  `smoke_rtl8821ae_h2c_busy_box_and_powered_off_mac_fail_closed`,
+  `smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order`,
+  `smoke_rtl8821ae_interrupt_profile_masks_and_w1c`,
+  `smoke_rtl8821ae_rcr_settles_after_mac_table_rewrite` (written,
+  unexecuted).
+
 Remaining for the `rtl8821ae` chip row: calling IQK from the station owner
-on `LinkedInterval` (the owner does not exist yet), H2C (media status, RA
-mask, PS), interrupt delivery, the native packet/station owner and probe
-wiring. Tests in `rtl8821ae/tests.rs` are written and unexecuted.
+on `LinkedInterval` (the owner does not exist yet); composing `h2c` and the
+interrupt profile into that owner (reserved-page upload, MSI vector
+binding); the native packet/station owner over the 8821AE TX/RX
+descriptors; and probe wiring. Tests in `rtl8821ae/tests.rs` are written and unexecuted.
 
 ## 4. Invariants
 

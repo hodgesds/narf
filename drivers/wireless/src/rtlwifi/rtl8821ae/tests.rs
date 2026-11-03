@@ -1144,3 +1144,204 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_iqk_linked_interval_and_agreement
 );
+
+// ── H2C mailbox, commands and interrupt profile ──────────────────────────
+
+fn h2c_model() -> RegFake {
+    RegFake(IrqSafeSpinLock::new((vec![0u8; 0x1000], Vec::new())))
+}
+
+fn smoke_rtl8821ae_h2c_box_bytes_extension_first_and_rotation() -> TestResult {
+    let io = h2c_model();
+    let mut mb = h2c::Mailbox::default();
+    let ra = [1, 2, 3, 4, 5, 6, 7];
+    if narf_scheduler::block_on(mb.fill(&io, h2c::H2C_RA_MASK, &ra)).is_err()
+        || narf_scheduler::block_on(mb.fill(&io, h2c::H2C_MSRRPT, &h2c::media_status(true)))
+            .is_err()
+    {
+        return TestResult::Fail("fill failed on idle mailbox");
+    }
+    let g = io.0.lock();
+    let writes: Vec<(u16, u32)> = g.1.iter().map(|w| (w.1, w.2)).collect();
+    let expect: [(u16, u32); 12] = [
+        (0x1f0, 4),
+        (0x1f1, 5),
+        (0x1f2, 6),
+        (0x1f3, 7),
+        (0x1d0, 0x40),
+        (0x1d1, 1),
+        (0x1d2, 2),
+        (0x1d3, 3),
+        (0x1d4, 0x01),
+        (0x1d5, 1),
+        (0x1d6, 0),
+        (0x1d7, 0),
+    ];
+    if writes != expect || g.1.iter().any(|w| w.0 != 1) {
+        return TestResult::Fail("byte-wise ext-then-box order or box rotation");
+    }
+    if mb.next_box() != 2 {
+        return TestResult::Fail("last_hmeboxnum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_h2c_box_bytes_extension_first_and_rotation
+);
+
+fn smoke_rtl8821ae_h2c_busy_box_and_powered_off_mac_fail_closed() -> TestResult {
+    let io = h2c_model();
+    io.0.lock().0[0x1cc] = 1;
+    let mut mb = h2c::Mailbox::default();
+    if !matches!(
+        narf_scheduler::block_on(mb.fill(&io, h2c::H2C_MSRRPT, &[1, 0, 0])),
+        Err(crate::rtlwifi::prepare::Error::CommandTimeout)
+    ) || !mb.failed
+        || !io.0.lock().1.is_empty()
+    {
+        return TestResult::Fail("busy HMETFR must time out without writing");
+    }
+    let io = h2c_model();
+    {
+        let mut g = io.0.lock();
+        g.0[0x100] = 0xea;
+        g.0[0x210] = 0xea;
+    }
+    let mut mb = h2c::Mailbox::default();
+    if !matches!(
+        narf_scheduler::block_on(mb.fill(&io, h2c::H2C_MSRRPT, &[1, 0, 0])),
+        Err(crate::rtlwifi::prepare::Error::RadioOff)
+    ) || io.0.lock().1 != [(1, 0xff, 0xff)]
+    {
+        return TestResult::Fail("REG_CR 0xEA path (SYS_CFG1+3 = 0xff, no box write)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_h2c_busy_box_and_powered_off_mac_fail_closed
+);
+
+fn smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order() -> TestResult {
+    if h2c::pwrmode(h2c::PsMode::Active) != [0, 0x12, 4, 0, 0x0c, 0x40, 0]
+        || h2c::pwrmode(h2c::PsMode::Max) != [1, 0x11, 2, 0, 0, 0x40, 0]
+    {
+        return TestResult::Fail("SETPWRMODE bytes");
+    }
+    let g = h2c::Peer {
+        legacy: 0x0ff5,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+    };
+    let b = h2c::Peer {
+        legacy: 0x000f,
+        ..g
+    };
+    let n = h2c::Peer {
+        legacy: 0x0fff,
+        ht: Some([0xff, 0]),
+        sgi20: true,
+        sgi40: false,
+    };
+    if h2c::rate_mask(&g, false, 0, true) != [0, 6, 0, 0xf5, 0x0f, 0, 0]
+        || h2c::rate_mask(&b, false, 0, true) != [0, 8, 0, 0x0d, 0, 0, 0]
+        || h2c::rate_mask(&n, false, 0, false) != [0, 0x81, 8, 0x05, 0xf0, 0x0f, 0]
+        || h2c::rate_mask(&n, true, 0, true)[3] != 0x15
+        || h2c::rate_mask(&n, false, 1, true)[3..] != [0, 0, 0x0f, 0]
+    {
+        return TestResult::Fail("RA mask payloads");
+    }
+    let io = h2c_model();
+    io.0.lock().0[0x361] = 0x80;
+    let mut mb = h2c::Mailbox::default();
+    if narf_scheduler::block_on(h2c::fwlps_enter(&io, &mut mb)).is_err()
+        || narf_scheduler::block_on(h2c::fwlps_leave(&io, &mut mb)).is_err()
+    {
+        return TestResult::Fail("LPS enter/leave on model");
+    }
+    let gl = io.0.lock();
+    let rpwm: Vec<(usize, u32)> =
+        gl.1.iter()
+            .enumerate()
+            .filter(|(_, w)| w.1 == 0x361)
+            .map(|(i, w)| (i, w.2))
+            .collect();
+    let first_box = gl.1.iter().position(|w| w.1 == 0x1d0).unwrap_or(usize::MAX);
+    // HRPWM bit7 set ⇒ value written unchanged (0), then toggled (0x80).
+    if rpwm.len() != 2 || rpwm[0].1 != 0 || rpwm[1].1 != 0x80 || first_box > rpwm[0].0 {
+        return TestResult::Fail("enter: PWRMODE then RPWM; leave: RPWM toggle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_h2c_pwrmode_rate_mask_and_lps_order
+);
+
+fn smoke_rtl8821ae_interrupt_profile_masks_and_w1c() -> TestResult {
+    let io = h2c_model();
+    {
+        let mut g = io.0.lock();
+        g.0[0xb4..0xb8].copy_from_slice(&0xffff_fffeu32.to_le_bytes());
+        g.0[0xbc..0xc0].copy_from_slice(&0x0000_0f00u32.to_le_bytes());
+    }
+    let (a, b) = match h2c::service_interrupt(&io) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("service failed"),
+    };
+    if a != h2c::IRQ_MASK0 & 0xffff_fffe || b != 0x300 {
+        return TestResult::Fail("recognized bits under irq_mask");
+    }
+    let g = io.0.lock();
+    let w: Vec<(u16, u32)> = g.1.iter().map(|w| (w.1, w.2)).collect();
+    if w[..4] != [(0xb0, 0), (0xb8, 0), (0xb4, a), (0xbc, b)]
+        || !w.ends_with(&[
+            (0xb0, h2c::IRQ_MASK0),
+            (0xb8, h2c::IRQ_MASK1),
+            (0x58, h2c::SYS_IRQ_MASK),
+        ])
+        || w.iter().any(|x| x.0 == 0x1af)
+    {
+        return TestResult::Fail("disable, W1C, clear, enable order (no C2HEVT_CLEAR)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_interrupt_profile_masks_and_w1c
+);
+
+fn smoke_rtl8821ae_rcr_settles_after_mac_table_rewrite() -> TestResult {
+    let io = h2c_model();
+    {
+        let mut g = io.0.lock();
+        // Hardware RCR after the MAC table's 0x608/0x609 byte rows.
+        g.0[0x608..0x60c].copy_from_slice(&0xf400_2a0eu32.to_le_bytes());
+    }
+    let mut rc = mac::ReceiveConfig::default();
+    if rc.set_check_bssid(&io, true).is_err() {
+        return TestResult::Fail("check_bssid(true)");
+    }
+    {
+        let g = io.0.lock();
+        if u32::from_le_bytes(g.0[0x608..0x60c].try_into().unwrap()) != mac::RCR | 0xc0
+            || g.1 != [(4, 0x608, mac::RCR | 0xc0), (1, 0x550, 0)]
+        {
+            return TestResult::Fail("linked: RCR = receive_config | CBSSID, then BCN_CTRL");
+        }
+    }
+    io.0.lock().1.clear();
+    if rc.set_check_bssid(&io, false).is_err()
+        || rc.rcr != mac::RCR
+        || io.0.lock().1 != [(1, 0x550, 0x10), (4, 0x608, mac::RCR)]
+    {
+        return TestResult::Fail("unlinked: BCN_CTRL BIT4 first, then RCR without CBSSID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_rcr_settles_after_mac_table_rewrite
+);

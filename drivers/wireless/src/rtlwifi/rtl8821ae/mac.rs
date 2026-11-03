@@ -163,3 +163,49 @@ pub async fn configure(
     station_identity(io, mac)?;
     Ok(report)
 }
+
+/// `RCR_CBSSID_DATA` / `RCR_CBSSID_BCN` (`rtl8821ae/reg.h`).
+pub const RCR_CBSSID_DATA: u32 = 1 << 6;
+pub const RCR_CBSSID_BCN: u32 = 1 << 7;
+
+/// Software `rtlpci->receive_config` plus the cached `reg_bcn_ctrl_val`.
+///
+/// `_rtl8821ae_init_mac` writes `receive_config` ([`RCR`]) to `REG_RCR`,
+/// then the MAC table rewrites the `0x608`/`0x609` bytes behind it, so the
+/// hardware RCR differs from the software value until the first
+/// `HW_VAR_RCR` write. [`Self::set_check_bssid`] is that write in the
+/// station flow (`rtl8821ae_set_network_type` → `rtl8821ae_set_check_bssid`),
+/// and settles RCR back to the software value (plus/minus CBSSID).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveConfig {
+    pub rcr: u32,
+    pub bcn_ctrl: u8,
+}
+
+impl Default for ReceiveConfig {
+    fn default() -> Self {
+        Self {
+            rcr: RCR,
+            bcn_ctrl: 0,
+        }
+    }
+}
+
+impl ReceiveConfig {
+    /// `rtl8821ae_set_check_bssid` (caller guarantees `rfpwr_state == ERFON`).
+    pub fn set_check_bssid(&mut self, io: &impl Io, check: bool) -> Result<(), Error> {
+        let mut rcr = self.rcr;
+        if check {
+            rcr |= RCR_CBSSID_DATA | RCR_CBSSID_BCN;
+            dword(io, REG_RCR, rcr)?;
+            self.rcr = rcr;
+            super::h2c::set_bcn_ctrl(io, &mut self.bcn_ctrl, 0, 1 << 4)
+        } else {
+            rcr &= !(RCR_CBSSID_DATA | RCR_CBSSID_BCN);
+            super::h2c::set_bcn_ctrl(io, &mut self.bcn_ctrl, 1 << 4, 0)?;
+            dword(io, REG_RCR, rcr)?;
+            self.rcr = rcr;
+            Ok(())
+        }
+    }
+}
