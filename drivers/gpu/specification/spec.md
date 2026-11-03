@@ -336,6 +336,43 @@ caller. `intel_gpu_pipes::TranscoderProgram::vblank_display13` is the
 display 13+ `TRANS_VBLANK` value both display-14 writers and the display-13
 Gen12 orchestrator use.
 
+### Lunar Lake display 20 (Xe2_LPD)
+
+`intel_gpu_xe2lpd` (crate-private) identifies and drives display 20.
+`DisplayIp::{Xelpdp, Xe2Lpd}` comes from `decode`/`read` of
+`GMD_ID_DISPLAY`. Every other IP is a typed `IpError`: `Absent`,
+`Unqualified { ver, rel }` or `NoDevice`. `DeCap` decodes
+`XE2LPD_DE_CAP`. `display_route(generation, requested, io)` returns the
+admitted IP or a `RouteRefusal` (`NotLunarLake`, `NotRequested`, `Ip`,
+`PipeAFused`, `PipeADark`). It is read-only. `requested` parses
+`narf.intel.lnl_display=1`, and `probe_route` is the probe's decision.
+`modeset(io, fb, mode)` is the display-20 owned Pipe-A modeset. It refuses
+read-only unless the GMD is 20.00. `takeover(io)` runs that modeset on the
+firmware-lit Pipe A.
+
+The module also holds the display-20 facts: `CDCLK_TABLE`,
+`mdclk_cdclk_ratio`, `mbus_throttle`, `dbuf_min_tracker`, `dbuf_ctl`,
+`dbox`, `program_mdclk_ratio`, `raise_cdclk_floor`, `pkgc_latency`,
+`program_pkgc_latency`, `enable_d2d`, `pipe_dmc_enable_prologue` and
+`pipe_dmc_disable_epilogue`.
+
+Display-14 interfaces gained version dispatch. Their display-14 wrappers
+behave exactly as before:
+
+- `intel_gpu_xelpg_cdclk`: `table`, `calc_cdclk_ip`, `ctl_value_ip`,
+  `Current::read_ip`, `plan_ip`, `program_ip` and `restore_ip`.
+- `intel_gpu_xelpg_resources`: `compute_ip`, `require_idle_ip`,
+  `State::ip`, and `State::{dbuf_ctl, dbuf_ctl_mask, dbox,
+  mbus_ctl_select, mbus_ctl_mask}`.
+- `XeLpgModeset::with_display_ip`.
+- `intel_gpu_dmc`: `DmcPlatform::Xe2Lpd` and `parse_dmc_firmware_xe2lpd`.
+
+`intel_gpu::probe` sends an admitted Lunar Lake function to the
+integrated display path instead of `probe_discrete`. There it runs
+`takeover` and installs no KMS, GT runtime, PM or DC owner.
+`Generation::display_supported` and `modeset_display` still refuse Lunar
+Lake.
+
 ### Fixed opaque XR30 primary input
 
 The owned fixed MTL/Arrow display14.00 internal Pipe-A/DDI-A profile accepts
@@ -2879,6 +2916,8 @@ clients; install-once `install_lnl_boot_scanout_exclusion` defaults to refusal
 and permanently closes both boot-framebuffer and graphics-console publication
 before reset. Ever-published/paused/withdrawn boot graphics cannot pass this
 contract. Initial graphical boot and owned display handoff remain refused.
+An LNL function admitted to the display-20 route (`intel_gpu_xe2lpd`,
+above) never enters this profile or its driver FLR.
 Fresh PF/PCI command/D0/BAR, graphics/media identity, wake, GuC/DMA/full-reset
 and cache proofs replace every pre-reset observation. Secondary display-status
 checks are refusal probes, not substitutes for whole-display reset retirement.

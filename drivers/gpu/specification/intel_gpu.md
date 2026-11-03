@@ -246,9 +246,11 @@ silently into the same `BadDevice` used for dead hardware.
 Internal display programming admits Gen12 (Tiger Lake / Alder Lake /
 Raptor Lake) and the separate Meteor/Arrow Lake Xe-LPG sequence.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
-display descriptor. Lunar Lake and Panther Lake refuse display programming;
-their headless execution profiles do not qualify their display engines.
-External sessions and PWM retain their separate generation gates below.
+display descriptor. Panther Lake refuses display programming. Lunar Lake
+keeps its headless execution profile unless a per-device display-20 route
+is requested and admitted (§17, "Xe2_LPD"); the generation-level gates
+still refuse it. External sessions and PWM retain their separate
+generation gates below.
 
 ## 6. Out of scope
 
@@ -318,7 +320,8 @@ surface and publishes no synthetic 1024×768 display. The owned scanout
 becomes active only after its primary-plane register program is armed.
 
 Takeover and relight share generation dispatch (Gen12 versus Xe-LPG),
-with Lunar Lake and Panther Lake refused before MMIO. Restore uses `modeset_fixed` on
+with Lunar Lake and Panther Lake refused before MMIO (an admitted Lunar
+Lake display takes its own display-20 entry instead, §17). Restore uses `modeset_fixed` on
 the selected orchestrator, preserving the saved timing used to size the
 new allocation even if EDID now advertises a different preferred mode.
 Plane geometry, pitch and the complete 32-bit GGTT surface extent are
@@ -1592,9 +1595,10 @@ trusted.
 ### 10.4 Gates and named remainders
 
 - `display_supported()`: Gen12 + Meteor Lake. **Lunar Lake and Panther Lake
-  stay off** — their display IPs require independently qualified
-  clock-select fields, PLL tables and DDI arrangements; the MTL sequence
-  must not claim them.
+  stay off at this generation-level gate** — their display IPs require
+  independently qualified clock-select fields, PLL tables and DDI
+  arrangements; the MTL sequence must not claim them by generation. Lunar
+  Lake's display 20 is reached only through its per-device route (10.5).
 - `backlight_supported()`: Gen12 only. MTL's PWM path belongs
   to the backlight composition lane (PR #1037); the modeset
   shipping first must not claim a backlight it cannot drive.
@@ -1647,6 +1651,63 @@ trusted.
   (`intel_gpu_xelpg_scaler`) but not wired into a modeset.
 - §5's device table is unchanged by this lane: the MTL DIDs
   were already in the census; only their display gate moved.
+
+### 10.5 Xe2_LPD — Lunar Lake display 20 (`intel_gpu_xe2lpd`)
+
+Lunar Lake's display is version 20.00 (`xe2_lpd_display`: the display-14
+`XE_LPDP_FEATURES` plus FBC on all four pipes and DBUF overlap detection).
+`INTEL_LNL_IDS` binds 6420/64a0/64b0 to `lnl_desc`, which names no display:
+the IP is known only from `GMD_ID_DISPLAY`. `DisplayIp` decodes it; 14.00
+and 20.00 are dispatched, while an absent display (GMD zero), 14.01 (BMG),
+30.00/30.02 (PTL/WCL) and 35.00 are typed refusals. Display 20 runs the
+display-14 code with version dispatch, not a copy of it.
+
+Admission and the headless profile. Lunar Lake's existing profile is the
+headless main GT, which owns the function through a driver FLR
+(`__xe_driver_flr`). That reset includes display and would tear down the
+panel a display takeover adopts, so the display route never runs it. Probe
+takes the display route only with `narf.intel.lnl_display=1`, a display
+20.00, Pipe A not fused off (`SKL_DFSM`) and Pipe A lit by firmware. The
+decision is read-only, and nothing is read without the option. Every other
+Lunar Lake function keeps the headless profile unchanged. That profile
+still refuses while a boot framebuffer or KMS display exists, so the two
+owners are exclusive per function.
+
+On an admitted function, probe sequences the eDP panel and runs the
+display-20 owned modeset on the firmware's Pipe-A surface (EDID mode).
+Scanout stays on that surface, which the boot framebuffer console keeps
+drawing. No GT owner exists on a display-owning Lunar Lake, so there is no
+verified Xe2 GGTT/PAT scanout policy, no GEM arena and no DMC acquisition.
+No KMS owner, GT runtime, PM owner or DC service is installed. The
+generation-level dispatch (`modeset_display`, relight, KMS install) keeps
+refusing Lunar Lake.
+
+Display-20 deltas, each with its pinned source branch:
+
+| Area | Display 20 against display 14 | Source |
+| ---- | ----------------------------- | ------ |
+| Power wells | Same PW_1/PW_A and per-channel AUX requests for DDI A; adds the `PICA_TC` well (`XE2LPD_PICA_PW_CTL` 0x16fe04, Type-C only, modeled) and a wider DC_off domain set | `intel_display_power_map.c::xe2lpd_power_wells`, `intel_display_power_well.c::xe2lpd_pica_power_well_*` |
+| CDCLK | `xe2lpd_cdclk_table` (21 rungs, 153.6–652.8 MHz, squash on every rung); `CDCLK_CTL` carries `MDCLK_SOURCE_SEL_CDCLK_PLL` instead of the decimal field; same crawl/squash midpoint and wa_15010685871 | `intel_cdclk.c::bxt_cdclk_ctl`, `intel_init_cdclk_hooks`, `pll_enable_wa_needed` |
+| MDCLK, DBUF and MBUS | Ratio `DIV_ROUND_UP(vco, cdclk)` into `MBUS_TRANSLATION_THROTTLE_MIN` and each slice's minimum tracker (doubled when joined), before lowering and after raising the clock; tracker state service not written; no 14.00 DBOX BW credits | `bxt_set_cdclk`, `skl_watermark.c::intel_dbuf_mdclk_cdclk_ratio_update`, `pipe_mbus_dbox_ctl` |
+| Package C | `LNL_PKG_C_LATENCY` = level-1+ maximum latency rounded up to the pipeline time | `skl_watermark.c::intel_program_dpkgc_latency` |
+| PM demand | Same pre-Xe3 fields; completion polled (Wa_14024400148), as the display-14 owner already does | `intel_pmdemand.c::intel_pmdemand_wait` |
+| PHY | DDI A/B are C10 as on MTL (shared PLL tables) | `intel_cx0_phy.c::intel_encoder_is_c10phy` |
+| DDI | D2D link enable/state in `DDI_BUF_CTL` bits 29/28 | `intel_ddi.c::mtl_ddi_enable_d2d` |
+| Transcoder | `CHICKEN_TRANS` clears `DP_DSC_INSERT_SF_AT_EOL_WA` only (no FEC jitter WA) | `intel_display.c::intel_enable_transcoder` |
+| Planes | No `PLANE_CHICKEN` no-DPT bit, so only the linear primary is owned; FBC on all four pipes | `intel_dpt_common.c::intel_dpt_configure`, `skl_universal_plane.c::skl_plane_has_fbc` |
+| DSC | `XE2LPD_DE_CAP` may remove DSC; a stream that needs it is refused before any write | `intel_display_device.c::__intel_display_device_info_runtime_init` |
+| DMC | `xe2lpd_dmc.bin`, 0x8000 ceiling, no Wa_16015201720, no pipe-MMIO restore, `DMC_FQ_W2_PTS_CFG_SEL` after load, flip-queue reset and `PIPEDMC_INTERRUPT` around pipe enable/disable; DC6 cap (no DC3CO) | `intel_dmc.c`, `intel_display_power.c::get_allowed_dc_mask` |
+
+The shipped `xe2lpd_dmc.bin` (v2.29) loads main and pipes A–C inside the
+display-14 program windows, so the display-14 window checks apply unchanged.
+
+Refused or not wired on display 20: PSR (no max-sleep field, entry setup
+frames, Wa_16025596647 package-C blocking and the SRD_STATUS set-context
+latency are unimplemented), PSR2 and panel replay, FBC, tiled and
+compressed primaries, the KMS owner and GEM flips, DC5/DC6, external
+outputs (Type-C/PICA, TCSS pin assignment and HDMI), multi-pipe layouts,
+the VBT and backlight PWM. Panther Lake (display 30.00) stays refused; its
+recorded deltas are in the `intel_gpu_xe2lpd` module header.
 ## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
 
 The Gen12 media engines brought to the §8 (RCS0) standard.
@@ -2463,7 +2524,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
-| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
+| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; LNL display 20 has an opted-in owned eDP Pipe-A modeset with display-20 resources and DMC rules (native fixtures added, unexecuted); LNL KMS/PSR/FBC/DC states/externals and all PTL display remain |
 
 The first four workstreams form the initial integration checkpoint. They do
 not close the broader rows. Changes to memory/VM or other TCB members carry
@@ -6630,3 +6691,63 @@ Changed fixture: `smoke_mtl_edp_planned_link_retries_at_max_params` asserted
 that a failure at the maximum parameters failed the modeset. It now asserts
 that the ladder reaches HBR x4, and that a sink failing every link walks
 rate, then lanes, to `LinkTrainingExhausted`.
+
+### Lunar Lake display 20 (Xe2_LPD) — native fixtures added
+
+This slice starts the display part of the Additional platforms workstream.
+Lunar Lake's display 20.00 now has an owned eDP Pipe-A modeset. The
+display-14 chain is dispatched on a typed display IP instead of copied
+(§17, 10.5). The modeset is reached only through an opted-in, read-only
+per-device route (`narf.intel.lnl_display=1`). Every other Lunar Lake
+function keeps the headless main-GT profile, and that profile's driver FLR
+is never run on a display-owning function.
+
+What changed, by file. `intel_gpu_xe2lpd` (new) holds the GMD decode, the
+route, `XE2LPD_DE_CAP`, the CDCLK table, the MDCLK-ratio,
+DBUF/MBUS/DBOX and package-C values, the PICA well model, the display-20
+D2D link and the pipe-DMC flip-queue and interrupt programming. The
+display-14 files gained version dispatch: `intel_gpu_xelpg_cdclk` `_ip`
+variants; `intel_gpu_xelpg_resources` `compute_ip`, `State::ip` and the
+IP-aware DBUF/MBUS/DBOX images, ratio ordering and restoration;
+`intel_gpu_display_resources` IP reads, no no-DPT chicken on display 20 and
+the running-clock proof; `intel_gpu_modeset_xelpg::with_display_ip`;
+`intel_gpu_dmc` `DmcPlatform::Xe2Lpd`; and probe routing in `intel_gpu`.
+Display-14 register conversations are unchanged: no display-14 path gains
+a read or a write.
+
+What a real Lunar Lake would complete, opted in, with GOP lighting the
+panel: route admission, panel power sequencing, EDID, the display-20
+resource transaction (PM demand, CDCLK, MDCLK ratio, DBUF, MBUS,
+watermarks), the C10 port PLL, link training on DDI A, the transcoder and
+primary enable on the firmware surface and the package-C latency. The
+console keeps drawing on that surface. Nothing past that runs: no KMS or
+DRM flips (no GT owner, no Xe2 scanout PAT policy), no DMC load or
+DC5/DC6, no PSR or FBC, no backlight PWM or VBT, and no external outputs.
+None of this has run on silicon.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `drivers/gpu/intel_gpu_xe2lpd`:
+  `smoke_xe2lpd_gmd_decode_and_typed_refusals`,
+  `smoke_xe2lpd_route_is_read_only_and_keeps_headless_otherwise`,
+  `smoke_xe2lpd_source_facts`, `smoke_xe2lpd_cdclk_table_decode_and_ctl`,
+  `smoke_xe2lpd_cdclk_plan_squash_crawl_midpoints`,
+  `smoke_xe2lpd_mdclk_ratio_dbuf_mbus_and_dbox`,
+  `smoke_xe2lpd_pkgc_latency` and `smoke_xe2lpd_pica_well_and_d2d_link`.
+- `drivers/gpu/intel_gpu_xe2lpd_resources`:
+  `smoke_xe2lpd_resources_compute_dispatch_keeps_display14`.
+- `drivers/gpu/intel_gpu_xe2lpd_modeset`:
+  `smoke_xe2lpd_owned_modeset_lights_pipe_a_with_display20_resources`,
+  `smoke_xe2lpd_owned_modeset_lowers_known_clock_ratio_first`,
+  `smoke_xe2lpd_owned_modeset_failure_restores_clock_and_ratio`,
+  `smoke_xe2lpd_raising_floor_programs_ratio_after_clock` and
+  `smoke_xe2lpd_entry_refuses_without_display20_read_only`.
+- `drivers/gpu/intel_gpu_xe2lpd_dmc`:
+  `smoke_xe2lpd_dmc_parse_ceiling_and_load_order` and
+  `smoke_xe2lpd_pipe_dmc_flip_queue_and_interrupts`.
+
+Remaining for the workstream, in order: a display-preserving Lunar Lake GT
+owner (it gives KMS its arena, the Xe2 scanout PAT and the DMC
+acquisition), the KMS owner's display-20 resource profile and FBC count,
+PSR1's display-20 deltas, then Type-C/PICA externals. Panther Lake's
+display 30 deltas are recorded in the `intel_gpu_xe2lpd` header.
