@@ -212,10 +212,15 @@ fn secondary_station<const PCIE: bool>() -> Result<(), &'static str> {
     let log = &fw.vif_log[before..];
     let mut wpa_auth = b"bsscfg:wpa_auth\0".to_vec();
     wpa_auth.extend_from_slice(&3u32.to_le_bytes());
+    let mut wsec = b"bsscfg:wsec\0".to_vec();
+    wsec.extend_from_slice(&3u32.to_le_bytes());
     if log.iter().any(|(ifidx, _)| *ifidx != 2)
-        || ![86u32, 20, 22, 134, 26]
+        || ![86u32, 20, 22, 26]
             .iter()
             .all(|dcmd| log.iter().any(|(_, c)| c.command == *dcmd))
+        // brcmf_set_wsec_mode: bsscfg-prefixed "wsec", never WLC_SET_WSEC.
+        || log.iter().any(|(_, c)| c.command == 134)
+        || !log.iter().any(|(_, c)| c.body.starts_with(&wsec))
         || !log.iter().any(|(_, c)| c.body.starts_with(&wpa_auth))
         || log
             .iter()

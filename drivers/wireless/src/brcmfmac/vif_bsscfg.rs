@@ -178,6 +178,7 @@ impl<R: Fullmac> Fullmac for Bsscfg<'_, R> {
     const EXTERNAL_CLM: bool = R::EXTERNAL_CLM;
     const BAND_5GHZ: bool = R::BAND_5GHZ;
     const VHT80: bool = R::VHT80;
+    const BSSCFG: bool = true;
     // PRIMARY_AP / PRIMARY_MONITOR / VIF_DEMUX stay false: those owners are
     // interface-0 (or interface-owner) authorities, never per bsscfg.
 

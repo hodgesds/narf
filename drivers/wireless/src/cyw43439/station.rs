@@ -680,7 +680,18 @@ impl<R: Fullmac> Station<R> {
                 .to_le_bytes(),
             )
             .await?;
-            self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
+            let wsec: u32 = if secure { 4 } else { 0 };
+            if R::BSSCFG {
+                // cfg80211.c brcmf_set_wsec_mode: brcmf_fil_bsscfg_int_set
+                // "wsec" (the adapter adds the `bsscfg:` prefix for its
+                // nonzero bsscfgidx); a WLC_SET_WSEC dcmd on the vif ifidx
+                // has no Linux counterpart for a secondary interface.
+                self.tx_var(grant, "wsec", &wsec.to_le_bytes()).await?;
+            } else {
+                // Primary bsscfg 0: brcmf_create_bsscfg sends plain "wsec";
+                // the established BRCMF_C_SET_WSEC path is kept unchanged.
+                self.tx_int(grant, 134, wsec).await?;
+            }
             if self.mfp_supported {
                 // WSEC can overwrite MFP state: Linux cfg80211.c places
                 // this after cipher configuration, including NONE on Open.

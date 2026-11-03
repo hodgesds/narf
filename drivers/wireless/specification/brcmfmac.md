@@ -1132,6 +1132,10 @@ capabilities, `roam_off`, PHY) with every per-interface record empty
 it to a `Bsscfg` and issues the per-interface dcmds the primary issues at
 initialization on that ifidx (`BRCMF_C_SET_PM` 0, `BRCMF_C_SET_INFRA` 1,
 `BRCMF_C_SET_AUTH` 0); a refusal unpublishes and removes the interface.
+Join security over the adapter (`Fullmac::BSSCFG`) sets `wsec` as Linux
+`brcmf_set_wsec_mode` does, with `brcmf_fil_bsscfg_int_set` (wire
+`bsscfg:wsec` + bsscfgidx on the vif ifidx); the primary keeps its
+established `BRCMF_C_SET_WSEC` (bsscfg0, plain-iovar equivalent) path.
 `scan`/`associate`/`disassociate` on the shell reach the primary through
 the type-erased `interface_vif::Roles` (registered per wiphy at
 publication) and run the unchanged station state machine rebound to the

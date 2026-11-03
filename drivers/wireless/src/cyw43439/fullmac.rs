@@ -139,6 +139,11 @@ pub trait Fullmac: Send {
     /// per-(ifidx, tid, da) flow rings and message ifidx on PCIe. Interface
     /// 0 behaviour of every method above is unchanged by it.
     const VIF_DEMUX: bool = false;
+    /// This runtime is the `struct brcmf_if` view of a secondary bsscfg
+    /// (`brcmfmac::vif_bsscfg::Bsscfg`). Role owners then issue the
+    /// `brcmf_fil_bsscfg_*` form Linux uses where the primary keeps its
+    /// established dcmd (e.g. `wsec` instead of `BRCMF_C_SET_WSEC`).
+    const BSSCFG: bool = false;
     /// Retain `BRCMF_E_IF` and secondary-bsscfg events for
     /// [`Self::pop_vif_event`] (otherwise they are dropped, as Linux does
     /// for a bsscfg without `brcmf_if`). Disabling purges them.
