@@ -1186,9 +1186,9 @@ pub(crate) fn install(
         recovering: false,
         fbc_carve: Arc::new(crate::intel_gpu_stolen::CarveSlot::new()),
     };
-    // Lunar Lake is owned only as display 20.00 (§17 10.5): linear primary
-    // flips on the console's Pipe A. Cursor, color, DSB, tiled/XR30, FBC
-    // and PSR stay unadvertised and refused on display 20.
+    // Lunar Lake is owned only as display 20.00 (§17 10.5): primary flips
+    // on the console's Pipe A, with the display-14 cursor, CTM/LUTs and DSB
+    // transactions. XR30, FBC and PSR stay unadvertised and refused.
     if generation == Generation::LunarLake
         && crate::intel_gpu_xe2lpd::DisplayIp::read(&platform)
             != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd)
@@ -1221,7 +1221,7 @@ pub(crate) fn install(
         let mut card = card.lock();
         card.native_atomic = true;
         card.intel_display = true;
-        if generation == Generation::MeteorLake {
+        if matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
             if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
                 card.intel_ctm = true;
                 if card.crtc_color(crtc).is_none() {
@@ -3186,7 +3186,10 @@ impl<M: Platform> Guard<'_, M> {
         self.ownership_valid()?;
         if !matches!(
             self.device.generation,
-            Generation::MeteorLake | Generation::TigerLake | Generation::AlderLake
+            Generation::MeteorLake
+                | Generation::LunarLake
+                | Generation::TigerLake
+                | Generation::AlderLake
         ) || !timing.valid()
         {
             return Err(FsError::Unsupported);
@@ -3221,7 +3224,10 @@ impl<M: Platform> Guard<'_, M> {
                 .check(&self.device.platform, family)?;
             None
         } else {
-            if self.device.generation != Generation::MeteorLake {
+            if !matches!(
+                self.device.generation,
+                Generation::MeteorLake | Generation::LunarLake
+            ) {
                 return Err(FsError::Unsupported);
             }
             Some(crate::intel_gpu_display_resources::Profile::capture_timing(
@@ -3239,10 +3245,11 @@ impl<M: Platform> Guard<'_, M> {
                     family,
                 )?
             } else {
-                crate::intel_gpu_cursor::Owner::new(
+                crate::intel_gpu_cursor::Owner::new_for(
                     self.device.platform.clone(),
                     self.device.bar_len,
                     timing,
+                    self.device.generation,
                 )?
             };
             self.state.cursor = Some(cursor);
@@ -3260,9 +3267,10 @@ impl<M: Platform> Guard<'_, M> {
                     gen12_display13(&self.device.platform),
                 )
             } else {
-                crate::intel_gpu_dsb::Owner::reserve(
+                crate::intel_gpu_dsb::Owner::reserve_for(
                     self.device.platform.clone(),
                     self.device.bar_len,
+                    self.device.generation,
                 )
             };
             match reserved {
@@ -3703,12 +3711,14 @@ impl<M: Platform> Guard<'_, M> {
         // Gen12 joint qualification is fixed linear/origin-zero only. The
         // worker still acquires exact family, route, DDB/WM and console proofs;
         // a Card capability alone cannot authorize a command or scanout write.
-        if self.device.generation != Generation::MeteorLake
-            && (self.device.platform.gen12_family().is_none()
-                || primary.as_ref().is_some_and(|target| {
-                    target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
-                        || target.view.input != crate::intel_gpu_scanout::InputFormat::Xrgb8888
-                }))
+        if !matches!(
+            self.device.generation,
+            Generation::MeteorLake | Generation::LunarLake
+        ) && (self.device.platform.gen12_family().is_none()
+            || primary.as_ref().is_some_and(|target| {
+                target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
+                    || target.view.input != crate::intel_gpu_scanout::InputFormat::Xrgb8888
+            }))
         {
             return Err(FsError::Unsupported);
         }
@@ -3805,9 +3815,10 @@ impl<M: Platform> Guard<'_, M> {
                             gen12_display13(&self.device.platform),
                         )
                     } else {
-                        crate::intel_gpu_dsb::Owner::reserve(
+                        crate::intel_gpu_dsb::Owner::reserve_for(
                             self.device.platform.clone(),
                             self.device.bar_len,
+                            self.device.generation,
                         )
                     }
                     .map_err(|error| {

@@ -59,6 +59,24 @@ pub(crate) const fn display_pte(generation: Generation) -> Option<(PteFormat, u8
     }
 }
 
+/// Whether the GT owner has programmed the PAT entry behind
+/// [`display_pte`]'s index, read through `io`: MTL `PAT_INDEX(1)` (0x4804)
+/// holds `XELPG_PAT_1_WT` (4); Xe2 `PAT_INDEX(3)` (0x480c) holds
+/// `XE2_PAT(0, 0, 0, 3, 3, 0)` (0x3c, xe_pat.c `xe2_pat_table`). Gen12 GGTT
+/// PTEs carry no PAT field, so nothing is read. Every display owner that
+/// maps GGTT pages (primary, cursor, DSB) gates on this.
+pub(crate) fn display_pat_programmed(
+    io: &(impl MmioWindow + ?Sized),
+    generation: Generation,
+) -> bool {
+    match generation {
+        Generation::TigerLake | Generation::AlderLake => true,
+        Generation::MeteorLake => io.read32(0x4804) == 4,
+        Generation::LunarLake => io.read32(0x480c) == 0x3c,
+        Generation::PantherLake => false,
+    }
+}
+
 /// Current PCI capability invocation plus retained D0/display-well ownership.
 ///
 /// # Safety
