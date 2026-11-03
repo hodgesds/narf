@@ -842,6 +842,8 @@ pub mod intel_gpu_uapi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_user;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_vbt;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_vram;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
