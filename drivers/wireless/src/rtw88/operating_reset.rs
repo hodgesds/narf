@@ -39,14 +39,14 @@ pub enum Error {
 /// Retained at the original cold probe, never supplied by a reset caller.
 #[derive(Clone, Copy)]
 pub(super) struct Origin {
-    device: BusDevice,
-    authority: Cap<BusDeviceCap, Write>,
+    pub(super) device: BusDevice,
+    pub(super) authority: Cap<BusDeviceCap, Write>,
 }
 impl Origin {
     pub(super) fn new(device: BusDevice, authority: Cap<BusDeviceCap, Write>) -> Self {
         Self { device, authority }
     }
-    fn current(&self, owner: &Rtw88Device) -> Result<(), Error> {
+    pub(super) fn current(&self, owner: &Rtw88Device) -> Result<(), Error> {
         if owner.bus_addr != self.device.addr || owner.device_id != self.device.id.device {
             return Err(Error::Identity);
         }

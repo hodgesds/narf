@@ -404,7 +404,7 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         );
     });
 }
-async fn remove_owner(owner: &Rtw88Device) -> bool {
+pub(super) async fn remove_owner(owner: &Rtw88Device) -> bool {
     match &owner.interface {
         Some(interface) => {
             interface.withdraw();
@@ -542,12 +542,37 @@ pub(super) unsafe fn bring_up_reset(
     name: Option<&'static str>,
 ) -> Result<Rtw88Device, ProbeError> {
     // SAFETY: forwarded exclusive original-function recovery contract.
-    unsafe { bring_up_mode(device, cap, Some(claim), name) }
+    unsafe { bring_up_mode(device, cap, Some(Recovery::Reset(claim)), name) }
+}
+enum Recovery<'a> {
+    Reset(&'a super::functions::ResetClaim),
+    Resume(&'a super::functions::ResetClaim, super::power::OffReceipt),
+}
+impl<'a> Recovery<'a> {
+    fn claim(&self) -> &'a super::functions::ResetClaim {
+        match self {
+            Self::Reset(claim) | Self::Resume(claim, _) => claim,
+        }
+    }
+}
+/// # Safety
+/// Same actual retired original function/BAR contract as bring_up_reset;
+/// off is the original native card-off receipt, retained across system sleep.
+pub(super) unsafe fn bring_up_resume(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    _retired: super::operating_reset::Retired,
+    claim: &super::functions::ResetClaim,
+    name: &'static str,
+    off: super::power::OffReceipt,
+) -> Result<Rtw88Device, ProbeError> {
+    // SAFETY: forwarded original reserved native resume ownership above.
+    unsafe { bring_up_mode(device, cap, Some(Recovery::Resume(claim, off)), Some(name)) }
 }
 unsafe fn bring_up_mode(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
-    reset: Option<&super::functions::ResetClaim>,
+    mut reset: Option<Recovery<'_>>,
     name: Option<&'static str>,
 ) -> Result<Rtw88Device, ProbeError> {
     let (registers, mac, factory, sibling_factory) =
@@ -556,13 +581,17 @@ unsafe fn bring_up_mode(
                 super::pci_park::map_bar_control(device, cap, index)
             })?;
 
-            let mut checked = reset.map(|claim| {
+            let mut checked = reset.as_ref().map(|mode| {
                 // SAFETY: original reset reservation and actual producer retirement
                 // precede this complete exclusively owned BAR mapping.
-                unsafe { power::RecoveryIo::new(&registers, device, cap, claim) }
+                unsafe { power::RecoveryIo::new(&registers, device, cap, mode.claim()) }
             });
             if let Some(io) = checked.as_mut() {
-                power::reset_with(io, device.id.device).map_err(ProbeError::PowerOn)?;
+                match reset.take().expect("retained native recovery mode") {
+                    Recovery::Reset(_) => power::reset_with(io, device.id.device),
+                    Recovery::Resume(_, off) => power::resume_with(io, device.id.device, off),
+                }
+                .map_err(ProbeError::PowerOn)?;
             } else {
                 // SAFETY: original cold-probe exclusive BAR contract.
                 unsafe { power::power_on(&registers, device.id.device) }

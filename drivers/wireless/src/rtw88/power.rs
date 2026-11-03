@@ -161,6 +161,62 @@ pub(super) fn power_on_with(io: &mut impl Io, did: u16) -> Result<(), PowerError
 pub(super) fn reset_with(io: &mut impl Io, did: u16) -> Result<(), PowerError> {
     power_on_mode(io, did, true)
 }
+/// Consumed only by a fresh owner after this exact chip/cut reached card-off.
+pub(super) struct OffReceipt {
+    did: u16,
+    cut: u8,
+}
+pub(super) fn off_with(io: &mut impl Io, did: u16) -> Result<OffReceipt, PowerError> {
+    if !io.permission() {
+        return Err(PowerError::Access);
+    }
+    let (first, second) = match did {
+        RTL_DEV_8821CE => (TRANS_ACT_TO_CARDEMU_8821C, TRANS_CARDEMU_TO_CARDDIS_8821C),
+        RTL_DEV_8822CE => (TRANS_ACT_TO_CARDEMU_8822C, TRANS_CARDEMU_TO_CARDDIS_8822C),
+        _ => return Err(PowerError::UnsupportedChip),
+    };
+    let config = io.read32(SYS_CFG1);
+    if config == u32::MAX {
+        return Err(PowerError::DeviceGone);
+    }
+    let cut = ((config >> 12) & 15) as u8;
+    if cut > 6 {
+        return Err(PowerError::UnknownCut);
+    }
+    if io.read8(REG_CR) == 0xea {
+        return Err(PowerError::StateReadback);
+    }
+    switch(io, 1u8 << (cut + 1), first, second)?;
+    if !io.permission() {
+        return Err(PowerError::Access);
+    }
+    if io.read8(REG_CR) != 0xea {
+        return Err(PowerError::StateReadback);
+    }
+    Ok(OffReceipt { did, cut })
+}
+pub(super) fn resume_with(io: &mut impl Io, did: u16, off: OffReceipt) -> Result<(), PowerError> {
+    if !io.permission() {
+        return Err(PowerError::Access);
+    }
+    if did != off.did || io.read32(SYS_CFG1) >> 12 & 15 != u32::from(off.cut) {
+        return Err(PowerError::StateReadback);
+    }
+    let cr = io.read8(REG_CR);
+    if cr == u8::MAX {
+        return Err(PowerError::DeviceGone);
+    }
+    // Firmware may have powered an S3 endpoint back up. Use an actual new
+    // disable/enable cycle in that case; a still-off card needs enable only.
+    power_on_mode(io, did, cr != 0xea)?;
+    if !io.permission() {
+        return Err(PowerError::Access);
+    }
+    if matches!(io.read8(REG_CR), 0xea | 0xff) {
+        return Err(PowerError::StateReadback);
+    }
+    Ok(())
+}
 fn power_on_mode(io: &mut impl Io, did: u16, reset: bool) -> Result<(), PowerError> {
     if !io.permission() {
         return Err(PowerError::Access);
@@ -305,6 +361,15 @@ impl super::efuse::EfuseIo for RecoveryIo<'_> {
     }
     fn write32(&mut self, a: u64, v: u32) {
         Io::write32(self, a, v);
+    }
+}
+impl super::system_pm_wire::Registers for RecoveryIo<'_> {
+    fn write16(&mut self, address: u64, value: u16) {
+        self.access(|mmio| {
+            // SAFETY: exact exclusively retained original BAR and source;
+            // the DBI caller supplies its bounded aligned flag word.
+            unsafe { mmio.write16(address, value) }
+        });
     }
 }
 impl Io for RecoveryIo<'_> {

@@ -637,6 +637,19 @@ context pass. Full release/native gates remain at25 completed rows. Counting
 unvalidated implementations,78 remain; physical firmware/board and deployment
 acceptance are separate.
 
+**2026-11-02 — retained system-PM source recount.** The ledger now holds
+**55 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twenty-three
+source-complete implementations await batch acceptance in
+`research/implemented-pending-validation.tsv`. C21/C22 system suspend/resume now
+retains the original family snapshot and uncancelled hardware workers through
+actual old DMA retirement, source card-off, PCI D3hot/D0/config receipts and
+fresh cold provisioning on the preserved netdev. Cancellation requests rollback;
+old keys and credentials are not replayed. Six native source cases are written
+and unexecuted. Scoped formatting and one release metadata context pass; a small
+shared plaintext-management fragment continuation adds no feature credit. Full
+release/native validation remains at25 completed rows. Counting unvalidated
+implementations,78 remain; physical S3/firmware/board acceptance stays separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -646,7 +659,7 @@ acceptance are separate.
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 12 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, runtime/system sleep and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset and explicit safe rejoin are implemented pending validation |
+| rtw88 | 11 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, runtime sleep and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset, explicit safe rejoin and retained system suspend/resume are implemented pending validation |
 | rtw89 | 8 | Additional channels/bands/widths, fragmentation, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 11 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop is implemented pending validation |
@@ -1644,6 +1657,19 @@ scan and native authentication; original new-UP identity remains a denial fence
 through real publication. No old peer/key/PN or automatic credentials are replayed.
 Family §3 sections are normative. Eighteen feature cases plus two SDIO helper
 cases are written and unexecuted; physical acceptance remains separate.
+
+### 3.15 Retained system suspend and cold resume (validation pending)
+
+The RTW88 async family hook retains the original function barrier and hardware
+worker through foreground cancellation. Only actual callback/DMA retirement,
+card-off, PCI power-state/config and original-source DBI receipts permit a fresh
+cold generation on the original netdev. Operating owners must earn new firmware,
+calibration and policy before resume succeeds; unqualified cold shells gain no
+RF admission. Old keys, PN/BA and queued packets stay retired, with fresh explicit
+association afterward. Six cases remain unexecuted. The independent shared
+management-fragment continuation preserves the original four-slot/key/PMF owner
+and grants no native or Wi-Fi feature credit. Family and wireless §3 contain
+the complete contracts; physical system sleep acceptance remains external.
 
 ## 4. Interaction with `narf-wireless`
 

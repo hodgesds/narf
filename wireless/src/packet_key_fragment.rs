@@ -353,6 +353,38 @@ impl Reassembly {
         self.push_inner(part, now_ms)
             .map(|frame| frame.map(Reassembled::into_bytes))
     }
+    /// Original plaintext unicast management fragments share the SAME four
+    /// slots. Only Security applies pre-key/nonrobust/PMF admission afterward;
+    /// no authenticated-fragment token is produced for plaintext input.
+    pub(crate) fn push_plain_management(
+        &mut self,
+        header: &[u8],
+        body: &[u8],
+        color: Option<KeyIdentity>,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if header.len() != 24
+            || header[0] & 15 != 0
+            || header[1] & 0xc3 != 0
+            || header[4] & 1 != 0
+            || body.is_empty()
+            || header[22] & 15 == 0 && header[1] & 4 == 0
+        {
+            return Err(Error::Header);
+        }
+        self.push_inner(
+            Part {
+                header: header.to_vec(),
+                body: Zeroizing::new(body.to_vec()),
+                color,
+                pn: None,
+                index: MGMT,
+                management: true,
+            },
+            now_ms,
+        )
+        .map(|frame| frame.map(Reassembled::into_bytes))
+    }
     fn push_inner(&mut self, part: Part, now_ms: u64) -> Result<Option<Reassembled>, Error> {
         self.expire(now_ms);
         let Part {

@@ -68,6 +68,10 @@ mod ht;
 pub mod operating_reset;
 pub use operating_reset::{reset_function, Error as OperatingResetError};
 mod rejoin;
+mod system_pm;
+mod system_pm_native;
+mod system_pm_wire;
+mod system_pm_worker;
 pub use rejoin::{rejoin_function, Error as RejoinError};
 mod rx_ba;
 mod rx_ba_power;
@@ -149,6 +153,10 @@ pub use regs::{REALTEK_VENDOR, RTL_DEV_8821CE, RTL_DEV_8822BE, RTL_DEV_8822CE};
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    narf_power::system_pm::register_async_system_pm(
+        "rtw88",
+        alloc::sync::Arc::new(system_pm::SystemPm),
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

@@ -305,12 +305,53 @@ impl Security {
         }
         self.receive_fragment_with_nonce(mpdu, now_ms, fresh_snonce)
     }
-    /// Authenticated unicast PMF fragments; group/BIP fragmentation is denied.
+    /// Original unicast management fragments under the SAME pre-key/nonrobust
+    /// and PMF policy as receive_management. Protected robust fragments must
+    /// authenticate with the original pair key; group/BIP fragments are denied.
+    /// Plaintext reassembly never fabricates an original native RawFrame.
     pub fn receive_management_fragment(
         &mut self,
         mpdu: &impl RawFrame,
         now_ms: u64,
     ) -> Result<MgmtRx, Error> {
+        if self.failed {
+            return Err(Error::State);
+        }
+        let bytes = mpdu.bytes();
+        if self.mld.is_some()
+            || !self.admitted_link(mpdu)
+            || !mpdu.unmodified()
+            || !(25..=4096).contains(&bytes.len())
+            || bytes[0] & 15 != 0
+            || bytes[1] & 0x83 != 0
+            || bytes[4..10] != self.own
+            || bytes[10..16] != self.peer
+            || bytes[16..22] != self.peer
+            || bytes[22] & 15 == 0 && bytes[1] & 4 == 0
+        {
+            return Ok(MgmtRx::Ignored);
+        }
+        if bytes[1] & 0x40 == 0 {
+            let key = self
+                .pair
+                .as_mut()
+                .map(|pair| pair.key.fragment_key_identity())
+                .transpose()
+                .map_err(Error::Crypto)?;
+            let cache = self
+                .fragment_rx
+                .get_or_insert_with(|| Box::new(Receive::default()));
+            let Ok(Some(frame)) =
+                cache.push_plain_management(&bytes[..24], &bytes[24..], key, now_ms)
+            else {
+                return Ok(MgmtRx::Ignored);
+            };
+            return Ok(if self.pmf && self.pair.is_some() && Self::robust(&frame) {
+                MgmtRx::Ignored
+            } else {
+                MgmtRx::Frame(frame)
+            });
+        }
         let Some(frame) = self.fragment_input(mpdu, now_ms, true)? else {
             return Ok(MgmtRx::Ignored);
         };

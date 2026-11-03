@@ -103,6 +103,19 @@ pub(in crate::rtw88) fn cycle(
 ) -> Result<(), PowerError> {
     reset_with(&mut Silicon::new(), RTL_DEV_8822CE)
 }
+pub(in crate::rtw88) struct ParkedPower {
+    io: Silicon<'static>,
+    off: OffReceipt,
+}
+pub(in crate::rtw88) fn park() -> Result<ParkedPower, PowerError> {
+    let mut io = Silicon::new();
+    let off = off_with(&mut io, RTL_DEV_8822CE)?;
+    Ok(ParkedPower { io, off })
+}
+pub(in crate::rtw88) fn resume(parked: ParkedPower) -> Result<(), PowerError> {
+    let ParkedPower { mut io, off } = parked;
+    resume_with(&mut io, RTL_DEV_8822CE, off)
+}
 fn smoke_rtw88_operating_reset_native_card_disable_enable_receipts() -> TestResult {
     for did in [RTL_DEV_8821CE, RTL_DEV_8822CE] {
         for cold_looking in [false, true] {

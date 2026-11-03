@@ -13,12 +13,15 @@ struct Entry {
     resetting: bool,
     remove_requested: bool,
 }
-struct Registry(Vec<Entry>);
-static FUNCTIONS: IrqSafeSpinLock<Registry> = IrqSafeSpinLock::new(Registry(Vec::new()));
+struct Registry(Vec<Entry>, bool);
+static FUNCTIONS: IrqSafeSpinLock<Registry> = IrqSafeSpinLock::new(Registry(Vec::new(), false));
 pub(super) struct Claim(BusAddr);
 impl Claim {
     pub(super) fn acquire(addr: BusAddr) -> Result<Option<Self>, ProbeError> {
         let mut registry = FUNCTIONS.lock();
+        if registry.1 {
+            return Err(ProbeError::BadDevice);
+        }
         if let Some(entry) = registry.0.iter().find(|entry| entry.addr == addr) {
             return if entry.owner.is_some() && !entry.removing {
                 Ok(None)
@@ -109,7 +112,23 @@ pub(super) struct ResetClaim {
 }
 impl ResetClaim {
     pub(super) fn acquire(owner: &Arc<Rtw88Device>) -> Result<Self, ()> {
+        Self::acquire_inner(owner, None)
+    }
+    pub(super) fn acquire_system(owner: &Arc<Rtw88Device>, barrier: &Barrier) -> Result<Self, ()> {
+        Self::acquire_inner(owner, Some(barrier))
+    }
+    fn acquire_inner(owner: &Arc<Rtw88Device>, barrier: Option<&Barrier>) -> Result<Self, ()> {
         let mut registry = FUNCTIONS.lock();
+        if registry.1 != barrier.is_some()
+            || barrier.is_some_and(|barrier| {
+                !barrier
+                    .owners
+                    .iter()
+                    .any(|original| Arc::ptr_eq(original, owner))
+            })
+        {
+            return Err(());
+        }
         let entry = registry
             .0
             .iter_mut()
@@ -169,6 +188,40 @@ impl ResetClaim {
         Ok(())
     }
 }
+/// Pins the exact family snapshot and excludes new probe/reset producers
+/// until every durable suspend worker has resumed or reached terminal state.
+pub(super) struct Barrier {
+    owners: Vec<Arc<Rtw88Device>>,
+}
+impl Barrier {
+    pub(super) fn begin() -> Result<Arc<Self>, ()> {
+        let mut registry = FUNCTIONS.lock();
+        if registry.1
+            || registry
+                .0
+                .iter()
+                .any(|entry| entry.owner.is_none() || entry.removing)
+        {
+            return Err(());
+        }
+        registry.1 = true;
+        let owners = registry
+            .0
+            .iter()
+            .filter_map(|entry| entry.owner.clone())
+            .filter(|owner| owner.firmware.is_some() || owner.sibling.is_some())
+            .collect();
+        Ok(Arc::new(Self { owners }))
+    }
+    pub(super) fn owners(&self) -> &[Arc<Rtw88Device>] {
+        &self.owners
+    }
+}
+impl Drop for Barrier {
+    fn drop(&mut self) {
+        FUNCTIONS.lock().1 = false;
+    }
+}
 impl Drop for ResetClaim {
     fn drop(&mut self) {
         if let Some(entry) = FUNCTIONS.lock().0.iter_mut().find(|entry| {
@@ -191,7 +244,9 @@ pub(super) fn reclaimed(owner: &Arc<Rtw88Device>) {
 }
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn reset_for_test() {
-    FUNCTIONS.lock().0.clear();
+    let mut registry = FUNCTIONS.lock();
+    registry.0.clear();
+    registry.1 = false;
 }
 #[cfg(feature = "kernel-test")]
 #[path = "function_reset_tests.rs"]

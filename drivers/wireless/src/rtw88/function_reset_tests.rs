@@ -104,3 +104,32 @@ kernel_test_in!(
     "drivers/wireless/rtw88/reset",
     smoke_rtw88_operating_reset_cancel_and_hot_remove_quarantine_original_bdf
 );
+fn smoke_rtw88_system_pm_barrier_excludes_new_function_and_reset_producers() -> TestResult {
+    let old = owner(0);
+    let extra = owner(1);
+    let _cleanup = Cleanup(alloc::vec![old.clone(), extra.clone()]);
+    let claim = match Claim::acquire(old.bus_addr) {
+        Ok(Some(claim)) => claim,
+        _ => return TestResult::Skip("no spare isolated RTW88 function slot"),
+    };
+    claim.publish(old.clone());
+    let barrier = match Barrier::begin() {
+        Ok(barrier) => barrier,
+        _ => return TestResult::Skip("other RTW88 function currently changing"),
+    };
+    if Claim::acquire(extra.bus_addr).is_ok()
+        || ResetClaim::acquire(&old).is_ok()
+        || Barrier::begin().is_ok()
+    {
+        return TestResult::Fail("system suspend admitted competing probe/reset/session");
+    }
+    drop(barrier);
+    if ResetClaim::acquire(&old).is_err() {
+        return TestResult::Fail("released PM barrier retained stale exclusion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/system_pm",
+    smoke_rtw88_system_pm_barrier_excludes_new_function_and_reset_producers
+);

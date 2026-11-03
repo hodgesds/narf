@@ -20,6 +20,8 @@ mod multi_tests;
 mod rejoin_tests;
 #[path = "station_reset_tests.rs"]
 mod reset_tests;
+#[path = "station_system_pm_tests.rs"]
+mod system_pm_tests;
 #[path = "wmm_station_tests.rs"]
 mod wmm_tests;
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];

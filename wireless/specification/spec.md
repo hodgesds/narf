@@ -1375,7 +1375,7 @@ Rate/NAV/descriptor sequencing, qualification and actual interface controls
 remain native responsibilities.
 
 The boxed opt-in RX cache shares FOUR total round-robin slots across plaintext
-EAPOL, protected DATA and PMF management. It keeps a two-second first-fragment
+EAPOL, protected DATA and original unicast management. It keeps a two-second first-fragment
 lifetime, 4096-byte complete bound, exact TA/RA/A3/frame-type/TID/SN/next-fragment
 identity, and no group fragments. Protected fragments additionally require
 one original current key identity and consecutive PN values. Plaintext and
@@ -1384,8 +1384,12 @@ initial-key installation or a changed-key epoch. `receive_fragment_with_nonce`
 requires each ORIGINAL `RawFrame` native peer/channel/profile/CRC/copy-epoch
 proof and passes a completed frame through the SAME retained EAPOL verifier:
 plaintext reassembly never opens a data port, nonce/MIC/replay/RSN checks and
-terminal reply/key installation remain mandatory. Protected management keeps
-its retained PTK rules during rekey. `fragment_pending(now_ms)` is only a work
+terminal reply/key installation remain mandatory. `receive_management_fragment`
+reassembles original plaintext management under the same pre-key/nonrobust PMF
+policy without fabricating a new original `RawFrame`: an installed PTK still
+denies every plaintext robust frame. Protected management authenticates with
+its retained PTK during rekey; plaintext and protected management share those
+same four slots and cannot mix. `fragment_pending(now_ms)` is only a work
 observation for the native worker/LPS owner. Native association/source changes
 must retire caches; these helpers grant no source, DMA, capture, port or RF
 authority. Corrupt, foreign, timed-out, mixed-key or nonconsecutive fragments

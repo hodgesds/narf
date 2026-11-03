@@ -304,12 +304,57 @@ kernel_test_in!(
     "wireless/station_security/fragment",
     smoke_station_fragment_plain_initial_eapol_keeps_nonce_mic_and_terminal_authority
 );
+fn plain_management_parts(kind: u8, category: u8, sequence: u16) -> Vec<Vec<u8>> {
+    (0..2u16)
+        .map(|number| {
+            let mut frame = vec![kind, if number == 0 { 4 } else { 0 }, 0, 0];
+            frame.extend_from_slice(&OWN);
+            frame.extend_from_slice(&AP);
+            frame.extend_from_slice(&AP);
+            frame.extend_from_slice(&((sequence << 4) | number).to_le_bytes());
+            frame.extend_from_slice(&[category; 20]);
+            frame
+        })
+        .collect()
+}
+fn receive_plain_management(
+    s: &mut Security,
+    kind: u8,
+    category: u8,
+    sequence: u16,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let mut complete = None;
+    for (number, bytes) in plain_management_parts(kind, category, sequence)
+        .into_iter()
+        .enumerate()
+    {
+        match s
+            .receive_management_fragment(&mpdu(bytes), 10 + number as u64)
+            .map_err(|_| "plaintext management fragment policy")?
+        {
+            MgmtRx::Ignored => {}
+            MgmtRx::Frame(bytes) if number == 1 => complete = Some(bytes),
+            _ => return Err("plaintext management partial delivered"),
+        }
+    }
+    Ok(complete)
+}
 fn pmf_fragments() -> Result<(), &'static str> {
     let mut rsn = crate::rsn::RsnIe::wpa2_psk_ccmp();
     rsn.rsn_capabilities = crate::rsn::RSN_CAP_MFP_CAPABLE;
     let rsn = rsn.encode_body();
     let mut s =
         Security::new(OWN, AP, &PMK, &rsn, &rsn, None, 2).map_err(|_| "PMF fragment RSNE")?;
+    let prekey = receive_plain_management(&mut s, 0x10, 0, 0x101)?
+        .ok_or("pre-PTK original association fragment admission")?;
+    if prekey.len() != 64
+        || prekey[1] & 0x44 != 0
+        || prekey[22..24] != 0x1010u16.to_le_bytes()
+        || s.port_open()
+        || s.pair.is_some()
+    {
+        return Err("pre-key management reassembly gained key/port or changed header");
+    }
     let p = ptk(AN, SN);
     if s.receive(&mpdu(native(&key_frame(0x8a, 1, AN, &[], None), false)), SN) != Ok(Rx::ReplyReady)
     {
@@ -329,6 +374,16 @@ fn pmf_fragments() -> Result<(), &'static str> {
         return Err("PMF fragment authenticated real IGTK M3");
     }
     deliver(&mut s);
+    if receive_plain_management(&mut s, 0xd0, 3, 0x102)?.is_some()
+        || receive_plain_management(&mut s, 0xc0, 3, 0x103)?.is_some()
+    {
+        return Err("installed PMF accepted plaintext robust management train");
+    }
+    let public = receive_plain_management(&mut s, 0xd0, 4, 0x104)?
+        .ok_or("nonrobust public action fragments denied")?;
+    if public[24..] != [4; 40] || !s.port_open() {
+        return Err("nonrobust fragment normalization changed authenticated owner");
+    }
     let mut action = vec![0xd0, 0, 0, 0];
     action.extend_from_slice(&AP);
     action.extend_from_slice(&OWN);

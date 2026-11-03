@@ -119,6 +119,53 @@ DHCP, terminal-disconnect recovery/fresh keys, held-M4 cancellation, original
 DOWN between descriptor/doorbell, old ingress and preserved operator DOWN.
 They await release/native batch execution and physical acceptance.
 
+The `rtw88` asynchronous system-PM hook covers the retained C21/C22 identity-DMA
+profiles with an actual PCI PM capability in D0. A family barrier retains the
+exact original function snapshot and excludes new probe/reset producers until
+all suspend workers finish resume or reach terminal state. Busy provisioning
+and unsupported PM state are refused before withdrawing the original shell.
+Diagnostic C22B chip rows do not gain a runtime from this hook.
+
+Each durable worker, independent of the foreground suspend waiter, owns the
+original function reservation through actual callback/native DMA retirement,
+source card-disable with CR0xea receipt, saved parked PCI configuration and
+real PMCSR D3hot entry/readback. It waits the bus API's10ms settle interval
+without config or MMIO access. Source cap/removal loss stops later operations;
+an unproven old DMA owner stays pinned and cannot produce a parked receipt.
+Cancelling or failing foreground preparation requests rollback; it does not
+drop the in-flight native retire future. The family barrier stays retained
+until the workers complete that rollback. Suspend status never constructs a
+hardware, reset, DMA, power or RF grant.
+
+Resume checks actual D0 after its settle interval, restores original BAR/ROM
+and command state with bus mastering off and INTx disabled, and verifies the
+restored values. For actual C22 RFE6, Linux `rtw_pci_clkreq_pad_low` is ported
+as an original-source DBI byte transaction at0x719: exact0x718 read address,
+byte1 WREN0x2718, actual busy-flag completion and final readback. Suspend clears
+CLKREQ_N_PAD, resume sets it, preserving all other bits. No DBI transaction is
+inferred from an iteration count or silently treated as successful.
+
+The real retained card-off receipt is consumed by fresh cold bring-up on the
+same factory MAC/chip/cut/BDF and original netdev name/ifindex. A still-off
+card runs enable; firmware that powered it during S3 must complete a new
+observed disable/enable cycle. A previously operating station must finish
+fresh firmware/hardware/calibration/policy provisioning before resume reports
+success. A previously unqualified cold shell may retain only an actual stable
+parked checkpoint while deployment assets remain absent; it gains no RF or
+packet admission. Failed fresh startup
+is withdrawn and quiesced, with uncertain DMA pinned. Old admission, cookies,
+keys, PN/BA state and queued frames never reopen. Resume leaves a fresh passive
+station; the SME explicitly supplies a new association. WoW, D3cold board
+power-resource discovery and automatic credential replay remain separate.
+The framework supplies the platform sleep/wake transition.
+
+Six native source cases cover actual old-DMA/card-off/fresh-firmware and
+explicit WPA2/DHCP on the preserved ifindex, foreground cancellation during
+old ingress, failed RXDMA/token reuse, literal DBI/readback/source loss, and
+the real family probe/reset barrier. They are written pending release/native
+batch execution; actual S3, PCI/clock behavior and deployment RF acceptance
+still require physical validation.
+
 `pci::bring_up(device, cap)` first parks inherited PCI DMA through the shared
 Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
 and read back the command register. Any access failure, retained BME or missing
@@ -2117,7 +2164,7 @@ changes. None is a physical blocker unless stated.
 | `runtime_sleep` | No `ps.c` port. LPS needs `H2C_CMD_SET_PWR_MODE` (0x20) in an LPS mode plus the `rtw_leave_lps_core` path; `station_control.rs` only ever sends the ACTIVE/awake form. IPS (`rtw_enter_ips` = `rtw_core_stop` + `rtw_hci_link_ps`, `rtw_leave_ips` = `rtw_ips_pwr_up`) is a full stop/start, so it is blocked on `operating_reset`. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
-| `system_suspend` | Linux `rtw_pci_suspend`/`resume` only toggle the CLKREQ pad (8822C RFE 6); the stack stops the radio through mac80211 (`rtw_ops_stop` → `rtw_core_stop`) and restarts it (`rtw_ops_start` → `rtw_core_start`: power-on, firmware download, MAC/PHY init). The DMA-stop proof now covers the stop half, but the resume half is exactly the missing generation reset, so this is blocked on `operating_reset`. |
+| `system_suspend` | Source-complete for actual C21/C22 identity-DMA PCI-PM D0 profiles: retained uncancelled native retirement/card-off/D3hot receipts, original-source C22 RFE6 DBI pad, D0/config restoration and fresh cold provisioning on the original netdev. Foreground cancellation rolls workers back; old keys/cookies never revive and fresh association stays explicit. Six native cases are written; release/native and physical S3 acceptance remain pending. |
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
 | `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
