@@ -1293,13 +1293,9 @@ retained factory/VID/PID and the exact primary/width before any transfer, and
 return the admitted RA mask. A retune therefore needs a separately granted
 permission for the new channel/width; there is no default.
 
-Remaining for a native RTL8192EU station (not implemented): the station
-composition (`receive_runtime`/`station_runtime`/`service_runtime` and the
-netdev are RTL8188EU-specific: host RA, rxdesc16 admission, N8PC gain
-tokens); routing C2H RA reports and `ra_connect_8192e`/`ra_watchdog_8192e`
-from a station owner; station PS over `submit_null_8192e`; and
-`restart_parked` (power-off then a fresh owner lifecycle) for RTL8192EU.
-No RTL8192EU netdev is published.
+The RTL8192EU station is the shared gen2 station composition below
+(`### Gen2 station (RTL8192EU, RTL8723BU)`); the probe publishes its netdev
+after `wait_admit`.
 
 ### RTL8723BU native owner (in progress)
 
@@ -1512,13 +1508,9 @@ channel; `Owner::tune_8723b(permission, primary, width)` is
 `rtl8xxxu_config`'s `rtl8723b_set_tx_power` + `config_channel`, refused
 before any transfer without an exact permission.
 
-Remaining for a native RTL8723BU station (not implemented): the station
-composition (`receive_runtime`/`station_runtime`/`service_runtime` and the
-netdev are RTL8188EU-specific), so C2H BT-info and RA records are not yet
-routed from a live receive path into `Owner::c2h_bt_8723b` /
-`ra_watchdog_8723b`, and `restart_parked` is not wired for RTL8723BU. No
-RTL8723BU netdev is published. USB IDs are exactly Linux `core.c::dev_table`
-`rtl8723bu_fops` rows (0bda:b720, 7392:a611).
+The RTL8723BU station, its C2H BT-info/RA routing and `restart_parked` are
+the shared gen2 station composition below. USB IDs are exactly Linux
+`core.c::dev_table` `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
 (`drivers/wireless/rtl8xxxu/8723bu`): identity/EFUSE/page budget,
@@ -1529,6 +1521,72 @@ statistics, LCK/IQK H2C/BT-grant/RF sequence and candidate, a failed
 IQK being terminal after Linux's restore tail, the enable_rf H2C/BT
 sequence, 1T 20/40 MHz channel writes and geometry refusal, and power-off
 order plus a stuck-queue timeout.
+
+### Gen2 station (RTL8192EU, RTL8723BU)
+
+One composition serves both gen2 chips (`gen2_radio.rs`,
+`gen2_station.rs`, `gen2_interface.rs`); the RTL8188EU chain
+(`receive_runtime`/`station_runtime`/`service_runtime`/`interface`) is
+unchanged. `gen2_radio::Grant` carries the chip's admitted initial-channel
+`Permission` (`rtl8192e_policy`/`rtl8723b_policy`), the only channel and
+rate authority.
+
+- Radio (`gen2_radio::Radio`): `packet_transport::Owner::new_8192e` over
+  the chip's retained queue map (`queues_8192e`/`queues_8723b`). `start`
+  is `rtl8xxxu_start`: `start_8192e`/`start_8723b` (enable_rf + admitted
+  channel; the returned mask must equal the grant), the one receive claim,
+  the persistent RX transfer, `REG_RXFLTMAP2`/`REG_RXFLTMAP0 = 0xffff`, IGI
+  `0x1e`. `prepare_station` is `rtl8xxxu_add_interface(STATION, port 0)`
+  (`stop_tx_beacon`, `BEACON_ATIM | FUNCTION_ENABLE | DISABLE_TSF_UPDATE`,
+  `set_linktype`, `set_mac`) + `set_bssid` + slot time, then TSF updates
+  re-enabled (Linux: `sw_scan_complete`). `poll` parses rxdesc24
+  (`poll_receive_8192e`): only `Frame::admitted(false, false, false)`
+  MPDUs (legacy 20 MHz plaintext) become `Mpdu`s; bound-BSS frames feed the
+  `ewma_rssi` (`rtl8192e_packet::signal` with `cck_agc_report_type`, or
+  `rtl8723b_packet::signal`); C2H RA reports fold into `Ra::report`;
+  `C2H_8723B_BT_INFO` records (8723BU only) queue (bound 8) for the async
+  path (`route_c2h`). `associate(aid, peer)` is `BSS_CHANGED_ASSOC`:
+  `Ra::new(peer, grant.admitted(), tx_paths, false)` (refused, never
+  narrowed) then `ra_connect_8192e` (shared gen2 `update_rate_mask` +
+  `report_connect`). `maintain` runs `rtl8xxxu_ra_iter` every 2 s
+  (`ra_watchdog_8192e`/`ra_watchdog_8723b` with `-ewma_rssi_read`) and the
+  queued BT records through `Owner::c2h_bt_8723b(coex, record, assoc)`
+  where `assoc` (`rtl8xxxu_is_assoc`) is the station's association.
+  `stop` is `ra_disconnect_8192e` then `rtl8xxxu_stop` (`REG_TXPAUSE`,
+  RX filter maps cleared, host transfers retired, `REG_TXPAUSE`,
+  `disable_rf`); `park` is `park_stopped` (`rtl8192eu_power_off` /
+  `rtl8723bu_power_off`); `restart_parked` is a fresh
+  `rtl8xxxu_init_device` lifecycle back to `RadioReady` (the RTL8188EU
+  identity check is replaced for gen2 by `run_device_8192e`/`_8723b`
+  refusing an EFUSE/endpoint change with `BadEfuse` and a queue-map change
+  with `BadEndpoints`), after which `start` is permitted again.
+- Station (`gen2_station::Station`): `Join::prepare(..).without_wmm()`
+  (legacy, no WMM Information element: the packet owner sends only
+  non-QoS DATA), Authentication/Association through the shared join plan,
+  firmware RA at association over the negotiated `supp_rates[0]`, then the
+  shared RSNA supplicant (`Security`, software CCMP, private EAPOL epoch
+  rule and reply-delivery receipt as `station_runtime`) or the open port.
+  TX DATA is non-QoS txdesc40 on the BE pipe with firmware RA rates.
+- Netdev (`gen2_interface`): `attach` after `wait_admit` publishes one
+  `wlan%d` per boot (shared singleton like RTL8188EU); `scan` is a passive
+  dwell on the admitted channel only (active probes and other channels are
+  `NotSupported`); `associate` is Open or WPA2-PSK on that channel against a
+  scanned candidate; a failed join is terminal for the owner (as
+  RTL8188EU). `disassociate` is station stop, park and `restart_parked`
+  before the radio returns idle.
+
+Deviations / not implemented: no HT/WMM/A-MPDU/BA on gen2 (legacy rates
+only; HT needs the `wide`/HT RX admission the 8188EU chain proves per
+board); no retune or multi-channel scan (each needs a separately granted
+permission, and `tune_8192e`/`tune_8723b` require `RadioReady`); no
+administrative IFF_UP/DOWN park/wake hooks; no station power-save nullfunc
+(Linux rtl8xxxu does not set `SUPPORTS_PS`; mac80211's nullfunc PM frames
+only bracket off-channel scans, which this single-channel owner never
+runs); BT-info records are processed only while a station is being
+serviced; one gen2 netdev per boot. Regressions (written, unexecuted):
+`gen2_radio_tests.rs` (C2H routing, RSSI match, rxdesc24 → `Mpdu`) and
+`gen2_station_tests.rs` (legacy RA peer and admission refusal, open DATA
+header) in `drivers/wireless/rtl8xxxu/gen2station`.
 
 ## 4. Invariants
 

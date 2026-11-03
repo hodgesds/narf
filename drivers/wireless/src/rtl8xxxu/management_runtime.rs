@@ -238,6 +238,12 @@ impl Join {
     pub fn phase(&self) -> Phase {
         self.plan.phase()
     }
+    /// A non-QoS station (no WMM Information element, no EDCA state): the
+    /// gen2 packet owner sends only non-QoS DATA.
+    pub(super) fn without_wmm(mut self) -> Self {
+        self.wmm = None;
+        self
+    }
     pub(super) fn wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
         self.wmm
     }

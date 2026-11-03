@@ -42,6 +42,9 @@ pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
 pub mod fw;
+mod gen2_interface;
+mod gen2_radio;
+mod gen2_station;
 mod ht_runtime;
 pub mod interface;
 pub mod intr;
@@ -272,6 +275,20 @@ pub fn rtl8xxxu_probe(
                 "  rtl8192eu: admission {:?}",
                 admitted.as_ref().map(|a| a.permission)
             );
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            // Netdev publication only after admission (RTL8188EU order).
+            let device = gen2_interface::attach(
+                firmware.clone(),
+                gen2_radio::Grant::Rtl8192e(admitted.permission),
+            )
+            .await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8192eu: station {:?}",
+                device.as_ref().map(|_| ())
+            );
         });
     } else if family == regs::ChipFamily::Rtl8723bu {
         let _ = writeln!(
@@ -297,12 +314,24 @@ pub fn rtl8xxxu_probe(
                 );
             }
             // Unprovisioned (no record/policy/authority) stays unadmitted.
-            // Admission alone publishes no netdev and opens no MAC TX/RX.
             let admitted = rtl8723b_admission::wait_admit(firmware.clone()).await;
             let _ = writeln!(
                 narf_console::Writer,
                 "  rtl8723bu: admission {:?}",
                 admitted.as_ref().map(|a| a.permission)
+            );
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            let device = gen2_interface::attach(
+                firmware.clone(),
+                gen2_radio::Grant::Rtl8723b(admitted.permission),
+            )
+            .await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8723bu: station {:?}",
+                device.as_ref().map(|_| ())
             );
         });
     }

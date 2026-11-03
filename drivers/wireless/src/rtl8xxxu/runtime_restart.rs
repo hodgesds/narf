@@ -56,10 +56,27 @@ impl<I: ControlIo> Owner<I> {
         if self.status().stage != Stage::Parked || !self.runtime_taken.load(Ordering::Acquire) {
             return Err(Error::RuntimeState);
         }
-        let expected = (
-            self.factory().ok_or(Error::RuntimeState)?,
-            self.endpoints().ok_or(Error::RuntimeState)?,
-        );
+        // RTL8192EU/RTL8723BU retain their gen2 identity; the cold re-run
+        // (`run_device_8192e`/`run_device_8723b`) refuses any EFUSE, endpoint
+        // or queue-map change against it before programming past FactoryReady.
+        let gen2 = match self.chip {
+            ChipFamily::Rtl8192eu => {
+                self.factory_8192e().is_some() && self.queues_8192e().is_some()
+            }
+            ChipFamily::Rtl8723bu => {
+                self.factory_8723b().is_some() && self.queues_8723b().is_some()
+            }
+            _ => false,
+        };
+        let expected = if gen2 {
+            self.endpoints().ok_or(Error::RuntimeState)?;
+            None
+        } else {
+            Some((
+                self.factory().ok_or(Error::RuntimeState)?,
+                self.endpoints().ok_or(Error::RuntimeState)?,
+            ))
+        };
         let image = self
             .runtime_image
             .lock()
@@ -78,13 +95,9 @@ impl<I: ControlIo> Owner<I> {
         self.stage(Stage::Restarting);
         let result = executable
             .fence(async {
-                self.run_device_expected(
-                    &image,
-                    narf_time::Deadline::after_ms(30_000),
-                    Some(expected),
-                )
-                .await
-                .map(|_| ())
+                self.run_device_expected(&image, narf_time::Deadline::after_ms(30_000), expected)
+                    .await
+                    .map(|_| ())
             })
             .await;
         attempt.complete = true;

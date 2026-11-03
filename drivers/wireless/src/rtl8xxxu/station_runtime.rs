@@ -1432,7 +1432,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
 }
 /// A complete private authenticator EAPOL-Key original may cross only the
 /// M2/terminal-reply receive epoch. It never inherits captured DATA admission.
-fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
+pub(super) fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
     if b.len() < 24
         || !matches!(b[0], 8 | 0x88)
         || b[1] & 0xc7 != 2
@@ -1463,7 +1463,7 @@ fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
     }
     usize::from(u16::from_be_bytes([payload[10], payload[11]])) + 12 == payload.len()
 }
-fn ethernet(frame: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     if frame.len() < 24
         || !matches!(frame[0], 8 | 0x88)
         || frame[1] & 0xc7 != 2

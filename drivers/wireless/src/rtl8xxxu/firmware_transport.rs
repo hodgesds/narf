@@ -687,11 +687,21 @@ impl<I: ControlIo> Owner<I> {
         info: FirmwareInfo,
     ) -> Result<FirmwareInfo, Error> {
         let factory = super::rtl8192e_init::factory(self, endpoints).await?;
+        // A parked restart (`restart_parked`) keeps the retained identity:
+        // a different EFUSE or endpoint geometry is terminal.
+        if let Some(old) = self.factory_8192e() {
+            if old != factory || self.endpoints() != Some(endpoints) {
+                return Err(Error::BadEfuse);
+            }
+        }
         *self.endpoints.lock() = Some(endpoints);
         *self.factory_8192e.lock() = Some(factory);
         self.stage(Stage::FactoryReady);
         self.power_on().await?;
         let queues = super::rtl8192e_init::pre_firmware(self, factory).await?;
+        if self.queues_8192e().is_some_and(|old| old != queues) {
+            return Err(Error::BadEndpoints);
+        }
         *self.queues_8192e.lock() = Some(queues);
         self.stage(Stage::Powered);
         self.download(payload).await?;
@@ -723,11 +733,20 @@ impl<I: ControlIo> Owner<I> {
         info: FirmwareInfo,
     ) -> Result<FirmwareInfo, Error> {
         let factory = super::rtl8723b_init::factory(self, endpoints).await?;
+        // As RTL8192EU: a parked restart keeps the retained identity.
+        if let Some(old) = self.factory_8723b() {
+            if old != factory || self.endpoints() != Some(endpoints) {
+                return Err(Error::BadEfuse);
+            }
+        }
         *self.endpoints.lock() = Some(endpoints);
         *self.factory_8723b.lock() = Some(factory);
         self.stage(Stage::FactoryReady);
         self.power_on().await?;
         let queues = super::rtl8723b_init::pre_firmware(self, factory).await?;
+        if self.queues_8723b().is_some_and(|old| old != queues) {
+            return Err(Error::BadEndpoints);
+        }
         *self.queues_8723b.lock() = Some(queues);
         self.stage(Stage::Powered);
         self.download(payload).await?;
