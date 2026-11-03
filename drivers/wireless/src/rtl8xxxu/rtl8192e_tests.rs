@@ -248,7 +248,7 @@ impl ControlIo for Fake {
     async fn delay_us(&self, _us: u64) {}
 }
 
-fn image(payload: usize) -> Vec<u8> {
+pub(super) fn image(payload: usize) -> Vec<u8> {
     let mut blob = vec![0u8; 32 + payload];
     blob[0..2].copy_from_slice(&0x92e1u16.to_le_bytes());
     blob[4..6].copy_from_slice(&35u16.to_le_bytes());

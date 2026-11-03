@@ -61,6 +61,7 @@ pub mod receive_runtime;
 pub mod regs;
 pub mod rtl8188e;
 pub mod rtl8192e;
+pub mod rtl8192e_admission;
 pub mod rtl8192e_init;
 mod rtl8192e_iqk;
 pub mod rtl8192e_packet;
@@ -152,8 +153,9 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
 /// USB class probe function. Called by the class registry when a
 /// newly-enumerated USB device matches `RTL8XXXU_USB_IDS`. Stores
 /// the `Arc<USBDevice>` in the global device table and logs the
-/// chip family. RTL8188EU starts a retained async factory/power/firmware/table owner;
-/// other families remain detection-only until their runtime is implemented.
+/// chip family. RTL8188EU and RTL8192EU start a retained async
+/// factory/power/firmware/table owner; RTL8192EU then waits for its signed
+/// record and deployment policy. Other families remain detection-only.
 ///
 /// Linux analogue: `rtl8xxxu_probe` in
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7692).
@@ -229,6 +231,38 @@ pub fn rtl8xxxu_probe(
                     service
                 );
             }
+        });
+    } else if family == regs::ChipFamily::Rtl8192eu {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8192eu:   firmware required at /firmware/rtlwifi/rtl8192eu_nic.bin"
+        );
+        narf_scheduler::spawn(async move {
+            let result = firmware.wait_initialize_registered().await;
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8192eu: firmware attempt {:?}",
+                result
+            );
+            if result.is_err() {
+                return;
+            }
+            if let Some(factory) = firmware.factory_8192e() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  {}:   signed record required at /firmware/{}",
+                    factory.identity.name(),
+                    rtl8192e_policy::Calibration::asset_name(&factory),
+                );
+            }
+            // Unprovisioned (no record/policy/authority) stays unadmitted.
+            let admitted = rtl8192e_admission::wait_admit(firmware.clone()).await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8192eu: admission {:?}",
+                admitted.as_ref().map(|a| a.permission)
+            );
         });
     }
 

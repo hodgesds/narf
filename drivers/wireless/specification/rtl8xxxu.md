@@ -1263,8 +1263,15 @@ exact factory/VID/PID/channel/width before programming. Synthetic test
 records validate format/arithmetic only.
 
 The owner reaches `RadioReady` for RTL8192EU after calibration. The production
-probe stays detection-only for this family; no table, calibration, packet
-or station capability is advertised.
+probe (`rtl8xxxu_probe`) now starts the RTL8192EU owner like RTL8188EU:
+`wait_initialize_registered()` waits for `rtlwifi/rtl8192eu_nic.bin`, then
+`rtl8192e_admission::wait_admit` waits for the signed `N92P` record, the
+signed `wireless-regulatory.bin` policy and the network authority. Missing
+assets keep the radio unadmitted and retry every 500 ms; unsigned, invalid,
+mismatched-identity or unqualified-initial-channel records are terminal
+(`Profile`). Admission yields the record, domain and the channel-1 HT20
+`Permission` (with the admitted RA mask); it does not by itself publish a
+netdev or open MAC TX/RX.
 
 ## 4. Invariants
 

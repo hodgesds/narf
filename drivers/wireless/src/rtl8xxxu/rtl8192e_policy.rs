@@ -424,4 +424,4 @@ impl Calibration {
 
 #[cfg(feature = "kernel-test")]
 #[path = "rtl8192e_policy_tests.rs"]
-mod tests;
+pub(super) mod tests;
