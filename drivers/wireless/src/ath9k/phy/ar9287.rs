@@ -199,3 +199,6 @@ pub(in crate::ath9k) fn prepare(
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+/// `ath9k_hw_ar9287_set_txpower` (open-loop, 20 MHz).
+pub(in crate::ath9k) mod power;

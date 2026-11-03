@@ -13,7 +13,8 @@ struct Plan {
     values: [u8; 128],
     overlap: u8,
 }
-fn indices(target: u8, list: &[u8]) -> (usize, usize) {
+/// `eeprom.c::ath9k_hw_get_lower_upper_index`.
+pub(in crate::ath9k) fn indices(target: u8, list: &[u8]) -> (usize, usize) {
     if target <= list[0] {
         return (0, 0);
     }

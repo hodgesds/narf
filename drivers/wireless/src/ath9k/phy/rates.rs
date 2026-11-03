@@ -12,8 +12,10 @@ use crate::{
 pub(in crate::ath9k) struct Plan {
     pub(in crate::ath9k) registers: [(u64, u32); 7],
 }
-fn target<const N: usize>(
-    image: &[u8; EEPROM_4K_BYTES],
+/// `eeprom.c::ath9k_hw_get_legacy_target_powers`/`_get_target_powers` over
+/// three `{bChannel, tPow2x[N]}` rows; shared by the 4k and AR9287 maps.
+pub(in crate::ath9k) fn target<const N: usize>(
+    image: &[u8],
     at: usize,
     frequency: u16,
 ) -> Result<[u8; N], BringUpError> {
@@ -64,7 +66,10 @@ fn target<const N: usize>(
     }))
 }
 fn edge(image: &[u8; EEPROM_4K_BYTES], index: usize, frequency: u16) -> Result<u8, BringUpError> {
-    let edges = &image[279 + index * 8..279 + (index + 1) * 8];
+    edge_power(&image[279 + index * 8..279 + (index + 1) * 8], frequency)
+}
+/// `eeprom.c::ath9k_hw_get_max_edge_power` over four `{bChannel, ctl}` edges.
+pub(in crate::ath9k) fn edge_power(edges: &[u8], frequency: u16) -> Result<u8, BringUpError> {
     let count = edges.chunks_exact(2).position(|r| r[0] == 255).unwrap_or(4);
     for i in 1..count {
         if edges[(i - 1) * 2] >= edges[i * 2] {
@@ -92,18 +97,30 @@ fn limit(
     mode: u16,
     ceiling: u8,
 ) -> Result<u8, BringUpError> {
+    limit_with(
+        &image[267..279],
+        |i| edge(image, i, frequency),
+        cfg_ctl,
+        mode,
+        ceiling,
+    )
+}
+/// The CMP_CTL / CMP_NO_CTL walk of the per-family `set_power_per_rate_table`
+/// over `indices` (`ctlIndex[]`), with `edge(i)` the matching edge power.
+pub(in crate::ath9k) fn limit_with(
+    indices: &[u8],
+    mut edge: impl FnMut(usize) -> Result<u8, BringUpError>,
+    cfg_ctl: u16,
+    mode: u16,
+    ceiling: u8,
+) -> Result<u8, BringUpError> {
     let mut power = 63;
     let wanted = (cfg_ctl & !15) | (mode & 15);
-    for (i, index) in image[267..279]
-        .iter()
-        .copied()
-        .take_while(|n| *n != 0)
-        .enumerate()
-    {
+    for (i, index) in indices.iter().copied().take_while(|n| *n != 0).enumerate() {
         if wanted != u16::from(index) && wanted != (u16::from(index) & 15) | 0xe0 {
             continue;
         }
-        let p = edge(image, i, frequency)?;
+        let p = edge(i)?;
         if cfg_ctl & !15 == 0xe0 {
             power = power.min(p);
         } else {
@@ -154,7 +171,7 @@ fn plan(
         ],
     })
 }
-fn initial_ctl(factory: Factory) -> u16 {
+pub(in crate::ath9k) fn initial_ctl(factory: Factory) -> u16 {
     // ath_regd_get_band_ctl, initial DFS region unset. World SKUs take the
     // minimum across matching EEPROM regulatory groups rather than NO_CTL.
     let rd = factory.eeprom & !0x4000;

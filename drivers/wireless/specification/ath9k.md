@@ -1254,10 +1254,32 @@ oracle over the 711 Linux INI rows),
 `smoke_ath9k_ar9287_board_values_follow_eeprom_9287` and
 `smoke_ath9k_ar9287_preparation_refuses_wrong_inputs`.
 
-Still missing before `0x002d`/`0x002e` can be matched: AR9287 transmit power
-(`ath9k_hw_ar9287_set_txpower` with its open-loop `ath9k_olc_init`/
-`ar9287_eeprom_olpc_set_pdadcs` and closed-loop PDADC paths, per-rate targets
-and two-chain CTL limits), AR9287 calibration (`ar9002_calib.c` non-AR9285
+`phy/ar9287/power.rs` is `eeprom_9287.c::ath9k_hw_ar9287_set_txpower` for
+a 20 MHz channel: CCK/OFDM/HT20 targets at `calTargetPower*` (the shared
+`rates::target` interpolation), `ath9k_hw_get_scaled_power` with
+`max_t(u8, antennaGainCh[0], antennaGainCh[1])` plus
+`POWER_CORRECTION_FOR_TWO_CHAIN` when both TX chains are set, and the
+CMP_CTL/NO_CTL walk over `ctlIndex[12]` reading
+`ctlData[i].ctlEdges[ntxchains - 1]` (`rates::limit_with`/`edge_power`).
+`ath9k_hw_set_ar9287_power_cal_table` writes the `xpdGain` PD gains to
+`AR_PHY_TPCRG1` and, per `txMask` chain, `ar9287_eeprom_olpc_set_pdadcs`
+(both chains' `0xa270`/`0xb270` OLPC enables, then the chain's `0xa398`/
+`0xb398` reference power from `ar9287_eeprom_get_tx_gain_index`: the matching
+pier's signed `pwrPdg[0][0]`, or the C-truncated mean of the bracketing
+piers); `initPDADC` (chain 0, pier 0 `vpdPdg[0][0]`) is kept for temperature
+compensation. Rate registers follow with `AR9287_PWR_TABLE_OFFSET_DB * 2`
+removed and TPC disabled (`AR_PHY_POWER_TX_RATE_MAX = 63`). The whole plan is
+validated before the first write; the ceiling is at most 40 half-dB, so the
+six-bit fields never wrap. Closed-loop maps (`openLoopPwrCntl == 0`) are
+refused: with `AR9287_PD_GAIN_ICEPTS == 1` Linux's
+`ath9k_hw_fill_vpd_table` indexes `pPwrList[(u16)-1]` and
+`ath9k_hw_get_gain_boundaries_pdadcs` reads past a one-entry VPD table, so
+there is no defined detector table to mirror. Smokes (written, not
+executed): `smoke_ath9k_ar9287_txpower_two_chain_open_loop_and_ctl`,
+`smoke_ath9k_ar9287_txpower_one_chain_uses_first_edge_set`,
+`smoke_ath9k_ar9287_txpower_refuses_before_writes`.
+
+Still missing before `0x002d`/`0x002e` can be matched: AR9287 calibration (`ar9002_calib.c` non-AR9285
 AGC/NF/IQ/ADC path and `ar9002_hw_olc_temp_compensation_9287`), the
 `AR_SREV_9287_13_OR_LATER` async-FIFO MAC settings (117 MHz clock,
 `AR_USEC_ASYNC_FIFO`, AHB custom burst, AGGWEP), two-chain TX descriptor
