@@ -2620,6 +2620,9 @@ inert elsewhere):
   exit is `ModesetError::PowerWellTimeout`.
 - `intel_gpu_edp::notify_scanout_dirty` holds a reference; a failed DC exit
   is `PsrError::Unavailable`.
+- The full-AUX panel-backlight transport (`PanelAccess::power`) holds a
+  reference for each AUX transaction, availability probe, PPS gate access and
+  relight step; a refused reference reads as unavailable.
 - KMS install creates the service. The GT publication hook acquires, loads
   and releases. `quiesce_for_legacy` brackets system-suspend preparation.
 

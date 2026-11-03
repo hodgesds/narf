@@ -728,3 +728,28 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dc_states",
     smoke_dc_states_reference_inert_without_service
 );
+
+fn smoke_dc_states_audit_unreachable_display_paths_on_mtl() -> TestResult {
+    use crate::intel_gpu::Generation;
+    // The DC6-safety audit proves these display-MMIO classes unreachable
+    // on display 14 rather than referencing them. Pin the gates it relies
+    // on: if any of them opens, those paths need a DC_off reference.
+    if Generation::MeteorLake.backlight_supported() {
+        return TestResult::Fail("MTL PWM backlight would run without DC_off");
+    }
+    if Generation::MeteorLake.external_display_supported() {
+        return TestResult::Fail("MTL external DP/HDMI/MST/HPD would run without DC_off");
+    }
+    if !Generation::MeteorLake.display_supported() {
+        return TestResult::Fail("the audited internal-panel path must stay admitted");
+    }
+    // An inert reference (every non-display-14 platform) holds nothing.
+    if DcRef::none(DcUser::Kms).service.is_some() {
+        return TestResult::Fail("an inert reference must hold no service");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dc_states",
+    smoke_dc_states_audit_unreachable_display_paths_on_mtl
+);
