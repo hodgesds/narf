@@ -77,6 +77,7 @@ pub mod ringbuf;
 pub mod runtime;
 pub mod shared;
 pub mod station_transport;
+pub mod vif_demux;
 pub mod vif_wire;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};

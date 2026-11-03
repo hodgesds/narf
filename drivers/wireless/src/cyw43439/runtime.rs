@@ -47,6 +47,8 @@ struct Pending {
     command: u32,
     direction: ioctl::Direction,
     maximum: usize,
+    /// BCDC `BCDC_DCMD_IF_SHIFT` ifidx of the request; the reply must echo it.
+    if_idx: u8,
 }
 
 /// One interface (firmware ifidx zero), with no aggregation or firmware
@@ -67,6 +69,8 @@ pub struct Runtime<T: PacketTransport> {
     response: Option<Result<Vec<u8>, Error>>,
     events: VecDeque<Event>,
     data: VecDeque<Vec<u8>>,
+    /// Secondary-ifidx records; interface 0 keeps `events`/`data` above.
+    vif: crate::brcmfmac::vif_demux::Demux,
     failed: bool,
     vendor: super::fullmac::FirmwareVendor,
 }
@@ -111,6 +115,7 @@ impl<T: PacketTransport> Runtime<T> {
             response: None,
             events: VecDeque::new(),
             data: VecDeque::new(),
+            vif: crate::brcmfmac::vif_demux::Demux::new(),
             failed: false,
             vendor: super::fullmac::FirmwareVendor::Wcc,
         }
@@ -134,6 +139,7 @@ impl<T: PacketTransport> Runtime<T> {
     pub fn fail(&mut self) {
         self.ap_live.store(false, Ordering::Release);
         self.failed = true;
+        self.vif.clear();
     }
     pub(crate) fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
         if self.failed || self.stopped {
@@ -158,6 +164,7 @@ impl<T: PacketTransport> Runtime<T> {
         self.response = None;
         self.events.clear();
         self.data.clear();
+        self.vif.clear();
         Ok(())
     }
     pub(crate) fn release_transport(&mut self) -> bool {
@@ -273,17 +280,30 @@ impl<T: PacketTransport> Runtime<T> {
             CHANNEL_EVENT | CHANNEL_DATA => {
                 // BDC data header, distinct from the 16-byte IOCTL header.
                 let bdc = payload.get(..4).ok_or(Error::Malformed)?;
-                if bdc[0] >> 4 != 2 || bdc[2] & 15 != 0 {
+                if bdc[0] >> 4 != 2 {
                     return Err(Error::Malformed);
                 }
+                // `BCDC_GET_IF_IDX`: flags2 low nibble names the interface.
+                let if_idx = bdc[2] & 15;
                 let body = payload
                     .get(4 + usize::from(bdc[3]) * 4..)
                     .ok_or(Error::Malformed)?;
                 if sw.channel == CHANNEL_EVENT {
                     let event = events::parse_event(body).map_err(|_| Error::Malformed)?;
                     let header = event.header;
-                    if header.if_idx != 0 || header.bsscfg_idx != 0 {
-                        return Ok(());
+                    use crate::brcmfmac::vif_demux::{route, Route};
+                    match route(header.event_type, header.if_idx, header.bsscfg_idx) {
+                        Route::Primary => {}
+                        Route::Secondary => {
+                            return self
+                                .vif
+                                .push_event(Event {
+                                    header,
+                                    payload: event.payload.to_vec(),
+                                })
+                                .map_err(|_| Error::EventOverflow);
+                        }
+                        Route::Invalid => return Ok(()),
                     }
                     if self.events.len() == QUEUE_DEPTH {
                         return Err(Error::EventOverflow);
@@ -301,6 +321,12 @@ impl<T: PacketTransport> Runtime<T> {
                     // Firmware events may not escape on the Ethernet path.
                     if body[12..14] == [0x88, 0x6c] {
                         return Err(Error::Malformed);
+                    }
+                    if if_idx != 0 {
+                        // `brcmf_proto_bcdc_hdrpull`: an ifidx without a
+                        // registered interface is dropped, not fatal.
+                        self.vif.push_data(if_idx, body.to_vec());
+                        return Ok(());
                     }
                     if self.data.len() == QUEUE_DEPTH {
                         self.data.pop_front();
@@ -321,7 +347,7 @@ impl<T: PacketTransport> Runtime<T> {
         // Stale, foreign-interface and wrong-command replies cannot affect
         // the current operation, including replies carrying an ERROR flag.
         if header.xact_id() != pending.id
-            || header.if_idx() != 0
+            || header.if_idx() != pending.if_idx
             || header.cmd != pending.command
             || header.is_set() != (pending.direction == ioctl::Direction::Set)
         {
@@ -357,11 +383,29 @@ impl<T: PacketTransport> Runtime<T> {
         payload: &[u8],
         maximum: usize,
     ) -> Result<Vec<u8>, Error> {
-        self.command_scoped(direction, command, payload, maximum, None)
+        self.command_scoped(0, direction, command, payload, maximum, None)
+            .await
+    }
+    /// [`Self::command`] addressed to firmware interface `if_idx`
+    /// (`brcmf_proto_bcdc_msg` `BCDC_DCMD_IF_SHIFT`). Interface 0 is the
+    /// ordinary [`Self::command`]; a secondary ifidx carries no AP scope.
+    pub async fn command_on(
+        &mut self,
+        if_idx: u8,
+        direction: ioctl::Direction,
+        command: u32,
+        payload: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if if_idx >= crate::brcmfmac::vif_wire::MAX_IFS {
+            return Err(Error::Malformed);
+        }
+        self.command_scoped(if_idx, direction, command, payload, maximum, None)
             .await
     }
     async fn command_scoped(
         &mut self,
+        if_idx: u8,
         direction: ioctl::Direction,
         command: u32,
         payload: &[u8],
@@ -383,6 +427,7 @@ impl<T: PacketTransport> Runtime<T> {
             command,
             direction,
             maximum,
+            if_idx,
         };
         self.pending = Some(pending);
         self.response = None;
@@ -414,7 +459,7 @@ impl<T: PacketTransport> Runtime<T> {
         let mut request = zeroize::Zeroizing::new(ioctl::build_request(
             transaction.runtime.tx_sequence,
             pending.id,
-            0,
+            if_idx,
             direction,
             command,
             &body,
@@ -495,10 +540,43 @@ impl<T: PacketTransport> Runtime<T> {
         if self.ap.is_some() {
             return Err(Error::Authority);
         }
-        self.send_data_inner(ethernet, priority, None)
+        self.send_data_inner(0, ethernet, priority, None)
+    }
+    /// Transmit on secondary firmware interface `if_idx` (BDC
+    /// `BCDC_SET_IF_IDX`). Only an ifidx its owner opened is admitted; the
+    /// primary AP session keeps exclusive SDPCM data ownership.
+    pub fn send_data_on(&mut self, if_idx: u8, ethernet: &[u8], priority: u8) -> Result<(), Error> {
+        if self.ap.is_some() {
+            return Err(Error::Authority);
+        }
+        if !self.vif.is_open(if_idx) {
+            return Err(Error::Authority);
+        }
+        self.send_data_inner(if_idx, ethernet, priority, None)
+    }
+    pub fn vif_listen(&mut self, on: bool) {
+        self.vif.listen(on);
+    }
+    pub fn vif_open(&mut self, if_idx: u8) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        self.vif.open(if_idx)
+    }
+    /// BCDC holds no per-interface native resource; closing is immediate.
+    pub fn vif_close(&mut self, if_idx: u8) -> bool {
+        self.vif.close(if_idx);
+        true
+    }
+    pub fn pop_vif_event(&mut self) -> Option<Event> {
+        self.vif.pop_event()
+    }
+    pub fn pop_vif_data(&mut self, if_idx: u8) -> Option<Vec<u8>> {
+        self.vif.pop_data(if_idx)
     }
     fn send_data_inner(
         &mut self,
+        if_idx: u8,
         ethernet: &[u8],
         priority: u8,
         original: Option<&crate::brcmfmac::ap_scope::Capture>,
@@ -537,7 +615,7 @@ impl<T: PacketTransport> Runtime<T> {
             }
             .encode(),
         );
-        bytes[12..16].copy_from_slice(&[0x20, priority, 0, 0]);
+        bytes[12..16].copy_from_slice(&[0x20, priority, if_idx & 15, 0]);
         bytes[16..length].copy_from_slice(ethernet);
         let transport = self.transport.as_mut().ok_or(Error::Failed)?;
         let result = match original {

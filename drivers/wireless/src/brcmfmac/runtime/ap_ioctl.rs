@@ -132,6 +132,7 @@ impl<B: Bus> Runtime<B> {
                     id,
                     command,
                     maximum: logical,
+                    ifidx: 0,
                 });
                 *response = None;
                 let offset = usize::from(ring.write) * ring.size;

@@ -163,6 +163,9 @@ struct Flow<M: Memory> {
     destination: [u8; 6],
     priority: u8,
     outstanding: usize,
+    /// Firmware interface of this (ifidx, tid, da) flow ring
+    /// (`msgbuf.c` `create->msg.ifidx`); TX posts and status carry it.
+    ifidx: u8,
 }
 struct Tx<M: Memory> {
     memory: M,
@@ -174,6 +177,8 @@ struct Data<M: Memory> {
     flows: Vec<Flow<M>>,
     tx: Vec<Tx<M>>,
     received: VecDeque<Vec<u8>>,
+    /// Secondary-ifidx received frames (interface 0 keeps `received`).
+    vif: super::vif_demux::Demux,
     receipts: VecDeque<TxReceipt>,
     dropped: usize,
     monitor: Option<alloc::boxed::Box<MonitorOwner>>,
@@ -188,6 +193,8 @@ struct Pending {
     id: u16,
     command: u32,
     maximum: usize,
+    /// Request `msg.ifidx`; the IOCTL completion must echo it.
+    ifidx: u8,
 }
 #[derive(Debug)]
 pub struct Ticket {
@@ -464,7 +471,18 @@ impl<B: Bus> Runtime<B> {
         input: &[u8],
         maximum: usize,
     ) -> Result<Vec<u8>, Error> {
-        let ticket = self.begin_ioctl(command, input, maximum)?;
+        self.command_on(0, command, input, maximum).await
+    }
+    /// [`Self::command`] on firmware interface `ifidx` (`brcmf_fil_cmd_data`
+    /// passes `ifp->ifidx` into `brcmf_msgbuf_query_dcmd`'s `msg.ifidx`).
+    pub async fn command_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let ticket = self.begin_ioctl_on(ifidx, command, input, maximum)?;
         let mut transaction = Transaction {
             runtime: self,
             retired: false,
@@ -595,6 +613,18 @@ impl<B: Bus> Runtime<B> {
         input: &[u8],
         maximum: usize,
     ) -> Result<Ticket, Error> {
+        self.begin_ioctl_on(0, command, input, maximum)
+    }
+    pub fn begin_ioctl_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: usize,
+    ) -> Result<Ticket, Error> {
+        if ifidx >= super::vif_wire::MAX_IFS {
+            return Err(Error::Bounds);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -620,7 +650,7 @@ impl<B: Bus> Runtime<B> {
         let request = IoctlReq {
             hdr: CommonHdr {
                 msgtype: 9,
-                ifidx: 0,
+                ifidx,
                 flags: 0,
                 request_id: 0xfffe,
             },
@@ -638,6 +668,7 @@ impl<B: Bus> Runtime<B> {
             id,
             command,
             maximum: logical,
+            ifidx,
         });
         self.response = None;
         if let Err(error) = self.publish(0, &entry) {
@@ -751,12 +782,25 @@ impl<B: Bus> Runtime<B> {
     fn control_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
         // IOCTL cmd ends at byte20; the final word of the 24-byte control
         // slot is reserved. Admission proved the complete used field span.
-        if entry.len() < 20 || entry[1] != 0 {
+        if entry.len() < 20 {
             return Err(Error::Protocol);
         }
         let kind = entry[0];
         if matches!(kind, 4 | 6) {
             return self.flow_completion(entry);
+        }
+        // IOCTL completions echo the pending request's ifidx and events
+        // carry their bsscfg in the event body (`fweh.c` dispatch); every
+        // other control completion stays interface 0.
+        let ifidx_ok = match kind {
+            0xc => self
+                .pending
+                .is_some_and(|pending| pending.ifidx == entry[1]),
+            0xe => entry[1] < super::vif_wire::MAX_IFS,
+            _ => entry[1] == 0,
+        };
+        if !ifidx_ok {
+            return Err(Error::Protocol);
         }
         let status = i16::from_le_bytes(entry[8..10].try_into().unwrap());
         if matches!(kind, 1 | 2 | 0xa) {
@@ -914,6 +958,7 @@ impl<B: Bus> Runtime<B> {
             flows: Vec::new(),
             tx: Vec::new(),
             received: VecDeque::new(),
+            vif: super::vif_demux::Demux::new(),
             receipts: VecDeque::new(),
             dropped: 0,
             monitor: None,
@@ -962,6 +1007,21 @@ impl<B: Bus> Runtime<B> {
         destination: [u8; 6],
         priority: u8,
     ) -> Result<FlowToken, Error> {
+        self.open_flow_on(0, source, destination, priority)
+    }
+    /// Create a flow ring for firmware interface `ifidx`. Linux keys flow
+    /// rings by (ifidx, tid/fifo, da) (`flowring.c::brcmf_flowring_lookup`)
+    /// and the create request carries `msg.ifidx`.
+    pub fn open_flow_on(
+        &mut self,
+        ifidx: u8,
+        source: [u8; 6],
+        destination: [u8; 6],
+        priority: u8,
+    ) -> Result<FlowToken, Error> {
+        if ifidx >= super::vif_wire::MAX_IFS {
+            return Err(Error::Protocol);
+        }
         if self.monitor_reserved() {
             return Err(Error::Busy);
         }
@@ -979,6 +1039,7 @@ impl<B: Bus> Runtime<B> {
         };
         if data.flows.iter().any(|f| {
             f.state != FlowState::Closed
+                && f.ifidx == ifidx
                 && f.source == source
                 && f.destination == destination
                 && f.priority == priority
@@ -1039,6 +1100,7 @@ impl<B: Bus> Runtime<B> {
                     destination,
                     priority,
                     outstanding: 0,
+                    ifidx,
                 });
         }
         let flow = &mut self
@@ -1065,11 +1127,13 @@ impl<B: Bus> Runtime<B> {
         flow.source = source;
         flow.destination = destination;
         flow.priority = priority;
+        flow.ifidx = ifidx;
         let address = flow.ring.memory.address();
         let wptr = flow.ring.wptr;
         let rptr = flow.ring.rptr;
         let mut entry = [0; 40];
         entry[0] = 3;
+        entry[1] = ifidx;
         entry[8..14].copy_from_slice(&destination);
         entry[14..20].copy_from_slice(&source);
         entry[20] = priority;
@@ -1147,6 +1211,7 @@ impl<B: Bus> Runtime<B> {
         flow.deadline = Some(narf_time::Deadline::after_ms(2000));
         let mut entry = [0; 40];
         entry[0] = 5;
+        entry[1] = flow.ifidx;
         entry[8..10].copy_from_slice(&token.id.to_le_bytes());
         if let Err(e) = self.publish(0, &entry) {
             self.fail();
@@ -1168,6 +1233,10 @@ impl<B: Bus> Runtime<B> {
             .flows
             .get_mut(usize::from(id.checked_sub(2).ok_or(Error::Protocol)?))
             .ok_or(Error::Protocol)?;
+        // The completion echoes the request's msg.ifidx.
+        if entry[1] != flow.ifidx {
+            return Err(Error::Protocol);
+        }
         match (entry[0], flow.state) {
             (4, FlowState::Creating) => {
                 flow.state = if status == 0 {
@@ -1253,6 +1322,7 @@ impl<B: Bus> Runtime<B> {
             Some(p) if p <= 7 && fifo(p) == fifo(flow.priority) => p,
             Some(_) => return Err(Error::Protocol),
         };
+        let flow_ifidx = flow.ifidx;
         let id = self.next_id()?;
         let mut memory = allocate(&mut self.bus, frame.len() - 14)?;
         memory.write(0, &frame[14..])?;
@@ -1260,7 +1330,7 @@ impl<B: Bus> Runtime<B> {
         let descriptor = msgbuf::TxPost {
             hdr: CommonHdr {
                 msgtype: 0xf,
-                ifidx: 0,
+                ifidx: flow_ifidx,
                 flags: 0,
                 request_id: id,
             },
@@ -1296,7 +1366,7 @@ impl<B: Bus> Runtime<B> {
     }
     fn tx_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
         let status = msgbuf::TxStatus::decode(entry).ok_or(Error::Protocol)?;
-        if status.hdr.ifidx != 0 || status.metadata_len != 0 {
+        if status.metadata_len != 0 {
             return Err(Error::Protocol);
         }
         let data = self
@@ -1317,7 +1387,8 @@ impl<B: Bus> Runtime<B> {
                 status.flow_ring_id.checked_sub(2).ok_or(Error::Protocol)?,
             ))
             .ok_or(Error::Protocol)?;
-        if flow.state != FlowState::Open || flow.outstanding == 0 {
+        if flow.state != FlowState::Open || flow.outstanding == 0 || flow.ifidx != status.hdr.ifidx
+        {
             return Err(Error::Protocol);
         }
         flow.outstanding -= 1;
@@ -1331,7 +1402,7 @@ impl<B: Bus> Runtime<B> {
     }
     fn rx_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
         let complete = msgbuf::RxComplete::decode(entry).ok_or(Error::Protocol)?;
-        if complete.hdr.ifidx != 0
+        if complete.hdr.ifidx >= super::vif_wire::MAX_IFS
             || complete.status != 0
             || complete.metadata_len != 0
             || !matches!(complete.flags & 7, 0..=2)
@@ -1359,7 +1430,7 @@ impl<B: Bus> Runtime<B> {
         };
         let length = usize::from(complete.data_len);
         let raw = complete.flags & 7 == 2;
-        if raw && data.monitor.is_none() {
+        if raw && (data.monitor.is_none() || complete.hdr.ifidx != 0) {
             return Err(Error::Protocol);
         }
         let admitted_length = if raw {
@@ -1399,6 +1470,11 @@ impl<B: Bus> Runtime<B> {
         if data.monitor.is_some() {
             return Ok(());
         }
+        if complete.hdr.ifidx != 0 {
+            // `brcmf_msgbuf_process_rx_complete`: no `brcmf_if` -> drop.
+            data.vif.push_data(complete.hdr.ifidx, frame);
+            return Ok(());
+        }
         if data.received.len() == 32 {
             data.dropped += 1;
         } else {
@@ -1408,6 +1484,40 @@ impl<B: Bus> Runtime<B> {
     }
     pub fn pop_received(&mut self) -> Option<Vec<u8>> {
         self.resources.as_mut()?.data.as_mut()?.received.pop_front()
+    }
+    /// Admit received data for secondary `ifidx` (its owner's link is up).
+    pub fn vif_rx_open(&mut self, ifidx: u8) -> Result<(), Error> {
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        data.vif.open(ifidx).map_err(|_| Error::Protocol)
+    }
+    pub fn vif_rx_close(&mut self, ifidx: u8) {
+        if let Some(data) = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+        {
+            data.vif.close(ifidx);
+        }
+    }
+    pub fn pop_vif_received(&mut self, ifidx: u8) -> Option<Vec<u8>> {
+        self.resources.as_mut()?.data.as_mut()?.vif.pop_data(ifidx)
+    }
+    /// Firmware interface of a live flow token.
+    pub fn flow_ifidx(&self, token: FlowToken) -> Result<u8, Error> {
+        let index = token.id.checked_sub(2).ok_or(Error::Protocol)?;
+        self.resources
+            .as_ref()
+            .unwrap()
+            .data
+            .as_ref()
+            .and_then(|d| d.flows.get(usize::from(index)))
+            .filter(|f| f.generation == token.generation)
+            .map(|f| f.ifidx)
+            .ok_or(Error::Protocol)
     }
     pub fn pop_tx_receipt(&mut self) -> Option<TxReceipt> {
         self.resources.as_mut()?.data.as_mut()?.receipts.pop_front()
@@ -1438,6 +1548,7 @@ impl<B: Bus> Runtime<B> {
             || !data.tx.is_empty()
             || !data.receipts.is_empty()
             || !data.received.is_empty()
+            || data.vif.has_data()
             || data
                 .flows
                 .iter()

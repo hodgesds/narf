@@ -995,10 +995,43 @@ live nonzero ifidx reports the detached old entry for authority retirement
 bsscfg and DEL of bsscfg0 are ignored, a P2P device bsscfg gets no ifidx
 data mapping, and `first_free_bsscfgidx` skips the P2P-reserved bsscfg1.
 
+#### Per-ifidx transport demultiplexing
+
+`Fullmac` now carries secondary firmware interfaces (ifidx
+1..`BRCMF_MAX_IFS`) beside, never through, the interface-0 methods:
+`VIF_DEMUX`, `vif_listen`, `vif_open`/`vif_close`, `pop_vif_event`,
+`pop_vif_data`, `send_vif_data` and `command_vif`. Both native transports
+implement it over `brcmfmac::vif_demux` (`Demux`, `route`).
+
+- SDIO BCDC (`cyw43439::runtime`): RX data uses `BCDC_GET_IF_IDX` (BDC
+  `flags2` low nibble), TX sets it (`BCDC_SET_IF_IDX`), and IOCTLs carry
+  `BCDC_DCMD_IF_SHIFT`; the reply must echo the pending ifidx.
+- PCIe msgbuf (`brcmfmac::runtime` + `station_transport::Adapter`): flow
+  rings are keyed by (ifidx, fifo, da) with `create->msg.ifidx`
+  (`msgbuf.c::brcmf_msgbuf_flowring_create_worker`), TX posts carry the
+  flow's ifidx and TX status/flow create/delete completions must echo it;
+  IOCTL requests carry `msg.ifidx` and the completion must echo it; RX
+  completions and events accept ifidx < 16. A secondary close deletes only
+  that ifidx's flows and reports `Ok(true)` after every delete completion.
+- Events: `BRCMF_E_IF` and any event whose header names a nonzero ifidx or
+  bsscfg route to the secondary queue (`fweh.c::brcmf_fweh_event_worker`
+  handles IF before per-bsscfg dispatch); indices >= 16 are dropped (SDIO)
+  or fail-stop (PCIe, unchanged). Secondary events are retained only while
+  an owner listens; otherwise they are dropped as Linux drops events for a
+  bsscfg without `brcmf_if`.
+- Data for an ifidx that its owner has not opened is dropped
+  (`brcmf_proto_bcdc_hdrpull` `-EBADE`, msgbuf `brcmf_get_ifp` NULL);
+  previously any nonzero ifidx was a fatal protocol error. Interface-0
+  queues, flows, AP and monitor ownership are unchanged; the primary AP
+  owner and secondary data are mutually exclusive, and PCIe suspend is
+  refused while a secondary interface is open or owns flows.
+
+One written/unexecuted case: `drivers/wireless/cyw43439/runtime`
+`smoke_cyw_f2_secondary_ifidx_demux`. No PCIe msgbuf secondary-ifidx
+fixture exists yet.
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: per-ifidx demultiplexing in the `Fullmac` seam
-(`pop_data`/`send_data`/events are interface0-only; msgbuf flow rings are
-created for ifidx0 only), a secondary netdev/`WirelessNetIface`
+either family: a secondary netdev/`WirelessNetIface`
 registration and removal owner, `interface_create`/`interface_remove`
 command owners that wait for the matching native IF event, per-bsscfg role
 owners (the AP `Session` and `Station` are primary-bsscfg only), and for

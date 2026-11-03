@@ -30,7 +30,7 @@ impl<T: PacketTransport> Runtime<T> {
             return Err(Error::Authority);
         }
         original.current().map_err(|_| Error::Authority)?;
-        self.command_scoped(direction, command, input, maximum, Some(original))
+        self.command_scoped(0, direction, command, input, maximum, Some(original))
             .await
     }
     pub(crate) fn ap_enter(&mut self, original: Capture) -> Result<(), Error> {
@@ -132,7 +132,7 @@ impl<T: PacketTransport> Runtime<T> {
             .checked_add(1)
             .filter(|value| *value < u32::MAX)
             .ok_or(Error::Failed)?;
-        self.send_data_inner(bytes, priority, Some(original))?;
+        self.send_data_inner(0, bytes, priority, Some(original))?;
         self.ap.as_mut().ok_or(Error::Failed)?.next = next;
         // Only the actual fully copied PIO packet yields this terminal. It
         // releases the host byte borrow; no air ACK/MAC/FIFO claim follows.

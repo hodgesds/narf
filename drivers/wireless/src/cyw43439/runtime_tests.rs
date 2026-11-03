@@ -406,3 +406,115 @@ kernel_test_in!(
     "drivers/wireless/cyw43439/runtime",
     smoke_cyw_f2_bounded_events_and_bad_packets
 );
+
+fn vif_event_body(event_type: u32, if_idx: u8, bsscfg_idx: u8) -> Vec<u8> {
+    let mut bytes = event_body();
+    let e = &mut bytes[4..];
+    e[28..32].copy_from_slice(&event_type.to_be_bytes());
+    e[70] = if_idx;
+    e[71] = bsscfg_idx;
+    bytes
+}
+
+/// Linux `bcdc.c` `BCDC_GET_IF_IDX`/`BCDC_SET_IF_IDX` and
+/// `BCDC_DCMD_IF_SHIFT`; `fweh.c` routes `BRCMF_E_IF` and secondary-bsscfg
+/// events away from interface 0. Interface-0 queues stay unchanged.
+fn smoke_cyw_f2_secondary_ifidx_demux() -> TestResult {
+    use crate::brcmfmac::vif_demux::{route, Route};
+    if route(54, 0, 0) != Route::Secondary
+        || route(16, 0, 0) != Route::Primary
+        || route(16, 1, 1) != Route::Secondary
+        || route(16, 0, 16) != Route::Invalid
+    {
+        return TestResult::Fail("event route differs from fweh dispatch");
+    }
+    let mut runtime = Runtime::new(Bus::default());
+    let mut data = vec![0x20, 0, 1, 0];
+    data.extend_from_slice(&ethernet());
+    let rx = |runtime: &mut Runtime<Bus>, packet| {
+        runtime.transport.as_mut().unwrap().rx.push_back(packet);
+        runtime.poll()
+    };
+    // Unregistered ifidx: dropped like brcmf_proto_bcdc_hdrpull -EBADE.
+    if rx(&mut runtime, frame(0, CHANNEL_DATA, 8, &data)) != Ok(1)
+        || runtime.is_failed()
+        || runtime.pop_data().is_some()
+        || runtime.pop_vif_data(1).is_some()
+    {
+        return TestResult::Fail("unopened secondary ifidx data not dropped");
+    }
+    if runtime.vif_open(1).is_err()
+        || runtime.vif_open(0).is_ok()
+        || runtime.vif_open(16).is_ok()
+        || rx(&mut runtime, frame(1, CHANNEL_DATA, 8, &data)) != Ok(1)
+        || runtime.pop_data().is_some()
+        || runtime.pop_vif_data(2).is_some()
+        || runtime.pop_vif_data(1) != Some(ethernet())
+    {
+        return TestResult::Fail("secondary ifidx data not demultiplexed");
+    }
+    // Secondary events are retained only while an owner listens.
+    if rx(
+        &mut runtime,
+        frame(2, CHANNEL_EVENT, 8, &vif_event_body(16, 1, 1)),
+    ) != Ok(1)
+        || runtime.pop_vif_event().is_some()
+        || runtime.pop_event().is_some()
+    {
+        return TestResult::Fail("unlistened secondary event retained");
+    }
+    runtime.vif_listen(true);
+    if rx(
+        &mut runtime,
+        frame(3, CHANNEL_EVENT, 8, &vif_event_body(54, 0, 0)),
+    ) != Ok(1)
+        || rx(
+            &mut runtime,
+            frame(4, CHANNEL_EVENT, 8, &vif_event_body(16, 1, 1)),
+        ) != Ok(1)
+        || rx(
+            &mut runtime,
+            frame(5, CHANNEL_EVENT, 8, &vif_event_body(16, 0, 0)),
+        ) != Ok(1)
+        || runtime.pop_vif_event().map(|e| e.header.event_type) != Some(54)
+        || runtime.pop_vif_event().map(|e| e.header.bsscfg_idx) != Some(1)
+        || runtime.pop_vif_event().is_some()
+        || runtime.pop_event().map(|e| e.header.event_type) != Some(16)
+    {
+        return TestResult::Fail("IF/secondary events not separated from interface 0");
+    }
+    // TX carries BDC flags2 ifidx; an unopened ifidx is refused.
+    if runtime.send_data_on(1, &ethernet(), 5).is_err()
+        || runtime.send_data_on(2, &ethernet(), 5) != Err(Error::Authority)
+        || runtime.send_data(&ethernet(), 5).is_err()
+    {
+        return TestResult::Fail("secondary transmit admission");
+    }
+    let tx = &runtime.transport.as_mut().unwrap().tx;
+    if tx.len() != 2 || tx[0][12..16] != [0x20, 5, 1, 0] || tx[1][12..16] != [0x20, 5, 0, 0] {
+        return TestResult::Fail("BDC flags2 ifidx not encoded");
+    }
+    // IOCTL ifidx is BCDC_DCMD_IF_SHIFT and the echoed reply completes it.
+    runtime.transport.as_mut().unwrap().auto_reply = true;
+    if ready(runtime.command_on(1, ioctl::Direction::Get, 262, b"ver\0", 4))
+        != Some(Ok(vec![1, 2, 3, 4]))
+        || BcdcHeader::decode(&runtime.transport.as_mut().unwrap().tx[2][12..])
+            .unwrap()
+            .if_idx()
+            != 1
+    {
+        return TestResult::Fail("secondary IOCTL ifidx not encoded/correlated");
+    }
+    // Close discards queued data; failure clears every secondary record.
+    if rx(&mut runtime, frame(9, CHANNEL_DATA, 8, &data)) != Ok(1) || !runtime.vif_close(1) {
+        return TestResult::Fail("close");
+    }
+    if runtime.pop_vif_data(1).is_some() || runtime.send_data_on(1, &ethernet(), 0).is_ok() {
+        return TestResult::Fail("closed ifidx kept data authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/runtime",
+    smoke_cyw_f2_secondary_ifidx_demux
+);

@@ -13,6 +13,8 @@ use crate::{
 };
 use alloc::{collections::VecDeque, vec::Vec};
 struct Flow {
+    /// Firmware interface; 0 is the primary station/AP owner's flows.
+    ifidx: u8,
     source: [u8; 6],
     destination: [u8; 6],
     priority: u8,
@@ -44,6 +46,10 @@ pub struct Adapter<B: Bus> {
     /// A reset bus whose last download was refused, kept for a retry.
     parked: Option<B>,
     ap: Option<alloc::boxed::Box<super::ap_tx::Owner>>,
+    /// Secondary-interface events and data admission (ifidx != 0).
+    vif: super::vif_demux::Demux,
+    /// Secondary ifidx whose flows are being deleted (bit per ifidx).
+    vif_closing: u16,
 }
 impl<B: Bus> core::fmt::Debug for Adapter<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -74,6 +80,8 @@ where
             reboot: None,
             parked: None,
             ap: None,
+            vif: super::vif_demux::Demux::new(),
+            vif_closing: 0,
         })
     }
     /// Retain the firmware authority that a transport reset reboots with.
@@ -96,7 +104,21 @@ where
                 break;
             };
             let event = events::parse_event(&bytes).map_err(|_| Error::Malformed)?;
-            if event.header.if_idx != 0 || event.header.bsscfg_idx != 0 || self.events.len() == 32 {
+            let header = event.header;
+            match super::vif_demux::route(header.event_type, header.if_idx, header.bsscfg_idx) {
+                super::vif_demux::Route::Primary => {}
+                super::vif_demux::Route::Secondary => {
+                    self.vif
+                        .push_event(Event {
+                            header,
+                            payload: event.payload.to_vec(),
+                        })
+                        .map_err(|_| Error::EventOverflow)?;
+                    continue;
+                }
+                super::vif_demux::Route::Invalid => return Err(Error::EventOverflow),
+            }
+            if self.events.len() == 32 {
                 return Err(Error::EventOverflow);
             }
             self.events.push_back(Event {
@@ -130,7 +152,7 @@ where
         }
         if self.closing {
             let mut closed = true;
-            for flow in &self.flows {
+            for flow in self.flows.iter().filter(|flow| flow.ifidx == 0) {
                 match inner.flow_state(flow.token).map_err(map)? {
                     FlowState::Open => {
                         closed = false;
@@ -144,8 +166,32 @@ where
                 }
             }
             if closed {
-                self.flows.clear();
+                self.flows.retain(|flow| flow.ifidx != 0);
                 self.closing = false;
+            }
+        }
+        // Secondary interfaces retire only their own (ifidx, tid, da) flows.
+        for ifidx in 1..super::vif_wire::MAX_IFS {
+            if self.vif_closing & (1 << ifidx) == 0 {
+                continue;
+            }
+            let mut closed = true;
+            for flow in self.flows.iter().filter(|flow| flow.ifidx == ifidx) {
+                match inner.flow_state(flow.token).map_err(map)? {
+                    FlowState::Open => {
+                        closed = false;
+                        match inner.close_flow(flow.token) {
+                            Ok(()) | Err(runtime::Error::Busy) => {}
+                            Err(e) => return Err(map(e)),
+                        }
+                    }
+                    FlowState::Closed => {}
+                    FlowState::Creating | FlowState::Deleting => closed = false,
+                }
+            }
+            if closed {
+                self.flows.retain(|flow| flow.ifidx != ifidx);
+                self.vif_closing &= !(1 << ifidx);
             }
         }
         if self.peer.is_none() && self.ap.is_none() || self.closing {
@@ -296,7 +342,7 @@ where
             return Err(Error::Busy);
         }
         self.ap.as_ref().ok_or(Error::Failed)?.admits(original)?;
-        let id = self.begin_data(bytes, priority, Some(original))?;
+        let id = self.begin_data(0, bytes, priority, Some(original))?;
         let (ticket, terminal) = super::ap_tx::Ticket::new(id, original.clone());
         self.tx
             .iter_mut()
@@ -477,6 +523,11 @@ where
         if self.failed {
             return Err(Error::Failed);
         }
+        // Secondary interfaces are torn down by their owners first; this
+        // primary path never retires another interface's flows.
+        if self.vif.any_open() || self.flows.iter().any(|flow| flow.ifidx != 0) {
+            return Err(Error::Busy);
+        }
         self.set_link(None);
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
@@ -526,6 +577,8 @@ where
         self.flows.clear();
         self.tx.clear();
         self.events.clear();
+        self.vif.clear();
+        self.vif_closing = 0;
         self.failed = true;
         let inner = self.inner.as_mut().ok_or(Error::Failed)?;
         if inner.is_reclaimable() {
@@ -582,6 +635,8 @@ where
                 self.tx.clear();
                 self.peer = None;
                 self.closing = false;
+                self.vif.clear();
+                self.vif_closing = 0;
                 self.failed = false;
                 Ok(())
             }
@@ -608,6 +663,8 @@ where
             reboot: self.reboot.take(),
             parked: None,
             ap: None,
+            vif: super::vif_demux::Demux::new(),
+            vif_closing: 0,
         })
     }
     fn transport_failed(&self) -> bool {
@@ -633,6 +690,7 @@ where
     fn fail(&mut self) {
         self.failed = true;
         self.peer = None;
+        self.vif.clear();
         if let Some(inner) = self.inner.as_mut() {
             inner.fail();
         }
@@ -650,7 +708,91 @@ where
         if self.failed || self.peer.is_none() || self.ap.is_some() {
             return Err(Error::Failed);
         }
-        self.begin_data(frame, priority, None).map(|_| ())
+        self.begin_data(0, frame, priority, None).map(|_| ())
+    }
+    const VIF_DEMUX: bool = true;
+    fn vif_listen(&mut self, on: bool) {
+        self.vif.listen(on);
+    }
+    fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
+        // The primary AP owner keeps exclusive msgbuf data publication.
+        if self.failed || self.ap.is_some() {
+            return Err(Error::Failed);
+        }
+        if ifidx == 0 || ifidx >= super::vif_wire::MAX_IFS {
+            return Err(Error::Malformed);
+        }
+        if self.vif_closing & (1 << ifidx) != 0 {
+            return Err(Error::Busy);
+        }
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .vif_rx_open(ifidx)
+            .map_err(map)?;
+        self.vif.open(ifidx)
+    }
+    fn vif_close(&mut self, ifidx: u8) -> Result<bool, Error> {
+        if ifidx == 0 || ifidx >= super::vif_wire::MAX_IFS {
+            return Err(Error::Malformed);
+        }
+        self.vif.close(ifidx);
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
+        inner.vif_rx_close(ifidx);
+        if self.flows.iter().any(|flow| flow.ifidx == ifidx) {
+            self.vif_closing |= 1 << ifidx;
+            self.poll()?;
+        }
+        Ok(self.vif_closing & (1 << ifidx) == 0
+            && !self.flows.iter().any(|flow| flow.ifidx == ifidx))
+    }
+    fn pop_vif_event(&mut self) -> Option<Event> {
+        self.vif.pop_event()
+    }
+    fn pop_vif_data(&mut self, ifidx: u8) -> Option<Vec<u8>> {
+        if !self.vif.is_open(ifidx) {
+            return None;
+        }
+        self.inner.as_mut()?.pop_vif_received(ifidx)
+    }
+    fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
+        if self.failed || self.ap.is_some() || !self.vif.is_open(ifidx) {
+            return Err(Error::Failed);
+        }
+        self.begin_data(ifidx, frame, priority, None).map(|_| ())
+    }
+    async fn command_vif<'a>(
+        &'a mut self,
+        ifidx: u8,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        let extent = if direction == Direction::Set {
+            input.len()
+        } else {
+            maximum
+        };
+        let mut response = self
+            .inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .command_on(ifidx, command, input, extent)
+            .await
+            .map_err(map)?;
+        if direction == Direction::Set {
+            response.clear();
+        } else {
+            response.truncate(maximum);
+        }
+        Ok(response)
     }
     fn set_link(&mut self, peer: Option<[u8; 6]>) {
         if self.ap.is_some()
@@ -680,11 +822,12 @@ where
 {
     fn begin_data(
         &mut self,
+        ifidx: u8,
         frame: &[u8],
         priority: u8,
         original: Option<&super::ap_scope::Capture>,
     ) -> Result<u32, Error> {
-        if self.closing {
+        if (ifidx == 0 && self.closing) || self.vif_closing & (1u16 << (ifidx & 15)) != 0 {
             return Err(Error::Busy);
         }
         if frame.len() < 14 || priority > 7 {
@@ -699,7 +842,8 @@ where
         let token = if let Some(flow) = self.flows.iter().find(|f| {
             // Linux brcmf_flowring_lookup: a station keeps one flow per
             // FIFO; its firmware TID is the priority that created it.
-            f.source == source
+            f.ifidx == ifidx
+                && f.source == source
                 && f.destination == destination
                 && wmm::fifo(f.priority) == wmm::fifo(priority)
         }) {
@@ -707,10 +851,10 @@ where
         } else {
             let opened = if let Some(original) = original {
                 original
-                    .publish(|| inner.open_flow(source, destination, priority))
+                    .publish(|| inner.open_flow_on(ifidx, source, destination, priority))
                     .map_err(|_| Error::Authority)?
             } else {
-                inner.open_flow(source, destination, priority)
+                inner.open_flow_on(ifidx, source, destination, priority)
             };
             let token = match opened {
                 Ok(token) => token,
@@ -732,6 +876,7 @@ where
                 Err(error) => return Err(map(error)),
             };
             self.flows.push(Flow {
+                ifidx,
                 source,
                 destination,
                 priority,

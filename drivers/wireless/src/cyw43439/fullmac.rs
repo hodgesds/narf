@@ -134,6 +134,47 @@ pub trait Fullmac: Send {
     fn pop_event(&mut self) -> Option<Event>;
     fn pop_data(&mut self) -> Option<Vec<u8>>;
     fn send_data(&mut self, frame: &[u8], priority: u8) -> Result<(), Error>;
+    /// The transport demultiplexes secondary firmware interfaces (ifidx
+    /// 1..`vif_wire::MAX_IFS`): BCDC `flags2`/`BCDC_DCMD_IF_SHIFT` on SDIO,
+    /// per-(ifidx, tid, da) flow rings and message ifidx on PCIe. Interface
+    /// 0 behaviour of every method above is unchanged by it.
+    const VIF_DEMUX: bool = false;
+    /// Retain `BRCMF_E_IF` and secondary-bsscfg events for
+    /// [`Self::pop_vif_event`] (otherwise they are dropped, as Linux does
+    /// for a bsscfg without `brcmf_if`). Disabling purges them.
+    fn vif_listen(&mut self, _on: bool) {}
+    /// Admit data on a secondary ifidx; only its interface owner calls
+    /// this, after its own link lifecycle allows traffic.
+    fn vif_open(&mut self, _ifidx: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Stop admitting data on `ifidx` and start retiring its native
+    /// resources. `Ok(true)` only once none remain owned (PCIe flow delete
+    /// completions); callers keep polling until then.
+    fn vif_close(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn pop_vif_event(&mut self) -> Option<Event> {
+        None
+    }
+    fn pop_vif_data(&mut self, _ifidx: u8) -> Option<Vec<u8>> {
+        None
+    }
+    fn send_vif_data(&mut self, _ifidx: u8, _frame: &[u8], _priority: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Control command addressed to firmware interface `ifidx`
+    /// (`brcmf_fil_cmd_data` uses `ifp->ifidx`). Never carries AP scope.
+    fn command_vif<'a>(
+        &'a mut self,
+        _ifidx: u8,
+        _direction: Direction,
+        _command: u32,
+        _input: &'a [u8],
+        _maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        core::future::ready(Err(Error::Unsupported))
+    }
     /// Only a station's correlated link/key lifecycle calls this method.
     /// Transport completion alone must never call it or open a controlled port.
     fn set_link(&mut self, peer: Option<[u8; 6]>);
@@ -282,6 +323,35 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
         Runtime::send_data(self, frame, priority)
     }
     fn set_link(&mut self, _: Option<[u8; 6]>) {}
+    const VIF_DEMUX: bool = true;
+    fn vif_listen(&mut self, on: bool) {
+        Runtime::vif_listen(self, on)
+    }
+    fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
+        Runtime::vif_open(self, ifidx)
+    }
+    fn vif_close(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Ok(Runtime::vif_close(self, ifidx))
+    }
+    fn pop_vif_event(&mut self) -> Option<Event> {
+        Runtime::pop_vif_event(self)
+    }
+    fn pop_vif_data(&mut self, ifidx: u8) -> Option<Vec<u8>> {
+        Runtime::pop_vif_data(self, ifidx)
+    }
+    fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
+        Runtime::send_data_on(self, ifidx, frame, priority)
+    }
+    fn command_vif<'a>(
+        &'a mut self,
+        ifidx: u8,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        Runtime::command_on(self, ifidx, direction, command, input, maximum)
+    }
     fn set_ac_priority(&mut self, ac_priority: [u8; 8]) {
         Runtime::set_ac_priority(self, ac_priority)
     }
