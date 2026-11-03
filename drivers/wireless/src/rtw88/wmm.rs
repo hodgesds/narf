@@ -125,20 +125,23 @@ pub(super) async fn commit(
     })
 }
 /// Source `fw.c::rtw_fw_send_ra_info`: RATE_ID 20:16, INIT_RA_LVL1, SGI_EN
-/// bit23, BW_MODE 25:24 (N2xB 40MHz), LDPC bit26 (`si->ldpc_en`, separately qualified N2xC), DIS_PT bit30.
+/// bit23, BW_MODE 25:24 (N2xB 40MHz, N2xV 80MHz), LDPC bit26, VHT_EN 29:28
+/// (N2xV `si->vht_enable`, mask `RA_MASK_VHT_RATES | RA_MASK_OFDM_IN_VHT`) (`si->ldpc_en`, separately qualified N2xC), DIS_PT bit30.
 pub(super) async fn ra_info(
     io: &mut impl Io,
     profile: DataProfile,
     admission: &Admission,
 ) -> Result<(), Error> {
-    let rates = (u32::from(profile.rates) | (u32::from(profile.mcs) << 12)).to_le_bytes();
+    let rates = profile.ra_mask().to_le_bytes();
     super::station_control::send(
         io,
         [
             0x40,
             0,
             profile.rate_id() | (1 << 5) | (u8::from(profile.sgi) << 7),
-            0x40 | (u8::from(profile.ldpc) << 2) | u8::from(profile.bw40),
+            0x40 | (u8::from(profile.vht.is_some()) << 4)
+                | (u8::from(profile.ldpc) << 2)
+                | profile.bw_mode(),
             rates[0],
             rates[1],
             rates[2],

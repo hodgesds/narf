@@ -2723,8 +2723,8 @@ unchanged with these 5GHz differences:
 `radio::wide5_to`/`radio8821c::wide5` also carry the BW80 branch for
 `vht`.
 
-**5GHz VHT80 record and program (`N2xV`, `vht.rs`) — not bound.** Partial
-`vht` groundwork; no VHT capability is advertised. Separately signed
+**5GHz VHT80 (`N2xV`, `vht.rs`).** VHT is advertised only for an
+association bound to an N2xV record (below). Separately signed
 continuation `rtw88/rtw882{1,2}ce-chNN-vht80-v1-<mac>.bin` (tag `V`, stem
 `vht80`) over the primary's band-5 N2xL scope. Payload: primary, center
 (`band5::center80`: Annex E class 128 blocks 42/58/106/122/138/155;
@@ -2751,13 +2751,43 @@ builds a VHT-only HT/VHT ra_mask); C21 `radio8821c::wide5(center,
 Eighty(sc))` (ADCCLK `&0xfcffcf00 | 0x40040000 | sc<<2 | 2`, RF18 bit10,
 `_rxdfir` BW80 ACBBRXFIR 1 / TXDFIR 0 / CHFIR 1), IQK, VHT words
 0x1d2c..0x1d34; readbacks `verify_wide5` + `vht::check_power`; RRSR 0x10.
-Remaining for `vht`: station binding/widening at 80MHz (`station.rs`,
-`Gate::with_continuation`, VHT operation parsing, witness of all four
-constituents via `Station::wide_witnessed`), `rtw_init_vht_cap` in the
-association PHY, RA_INFO VHT rate id (`ARFR1_AC_1SS` 10 / `ARFR0_AC_2SS`
-9) and mask, BW_MODE 2, TX descriptor VHT rate/BW 2/SGI, PHY-status 80MHz
-RXSC, C21 HT/VHT readback at 80MHz (`operating_readback_rf18` expects the
-VHT words zero). Written, unexecuted:
+Station binding (`station.rs::associate`, `Gate::with_continuation`):
+the AP's VHT Operation (192, `vht::vht_operation`) has channel width 1 and
+CCFS0 the Annex E center of the primary (`band5::center80`), `hw_cap.bw` is
+0 or 7, the three other constituents are admitted channels (loadable N2xO
+records) and `Station::wide_witnessed` holds over all four constituents
+(passive-only spans need all four passive and beacon-witnessed); then the
+N2xV record for this primary/center (identity only) over the HT program is
+preferred over N2xB (never both: `with_continuation` refuses N2xV next to
+N2xB). The association PHY is `LocalPhy::vht80` = `rtw_init_ht_cap` 20/40
+(RX SGI40, no HT TX SGI40, no N2xC TX coding advertised) + `rtw_init_vht_cap`
+narrowed (`vht::local`): maximum MPDU 3895, SHORT_GI_80 (TX per record
+flag), RXSTBC_1, RXLDPC per chip, A-MPDU exponent 0, RX MCS0..9 on the HT
+program's streams, TX map = record streams x highest MCS; no TX STBC/LDPC,
+HTC-VHT or beamforming. The offer must be 80MHz with VHT on the record's
+center (else `Profile`); `widen(Wide::Eighty)` binds and runs
+`vht::program` under the retune owner, `station_width_begin` sets PHY
+admission width 2 (`query_phy_status_page1` RXSC 13+ / RXSC0 = current).
+Association response: negotiated width 80 on the record's center with VHT
+negotiation, data profile `vht = VhtRates { tx: get_vht_ra_mask(negotiated
+TX map) & record mask, rx: rtw_init_vht_cap RX }`, SGI = peer SHORT_GI_80 and
+record SGI80, uncoded (`DataProfile::vht`; `Gate::allows_profile` bounds it
+by the live N2xV record). Data path: `get_rate_id` WIRELESS_OFDM|VHT
+`ARFR1_AC_1SS` 10 / `ARFR0_AC_2SS` 9, RA_INFO mask `RA_MASK_VHT_RATES |
+RA_MASK_OFDM_IN_VHT` (HT dropped), VHT_EN 1 and BW_MODE 2
+(`DataProfile::{ra_mask,bw_mode}`), TX descriptor W5_DATA_BW 2, SHORT =
+SGI80, DATARATE `get_highest_vht_tx_rate` (0x2c + highest stream/MCS); RX
+admits VHT rates 0x2c.. within the advertised RX set and MPDUs up to 3895
+bytes (`receive_rates`). Readback at 80MHz (`ht::Wide::Eighty`): C22
+`vht::check_power` over the CCK/2SS checks, C21
+`operating_readback_vht` (legacy + HT20 words unchanged, VHT words
+0x1d2c..0x1d34 from the record, RF18 BW80 bit10 on the center). A beacon/
+probe VHT Operation leaving the block (width 0, other CCFS0) or an HT
+Operation on another primary drops the connection; CSA cannot carry N2xV.
+Not covered: VHT at 20/40MHz, 160/80+80, VHT TX coding/beamforming, the
+dm/N21W/RTS programs on 5GHz. No N2xV record is provisioned for any board.
+Written, unexecuted:
+`smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback`,
 `smoke_rtw88_vht80_record_span_and_bw80_program`. Written, unexecuted:
 `smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span`. No 5GHz N2xB
 record is provisioned for any board.

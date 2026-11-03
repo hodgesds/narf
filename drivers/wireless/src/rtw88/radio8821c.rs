@@ -62,7 +62,7 @@ pub(super) fn operating_readback_ht(
     mcs: [u8; 8],
     channel: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, rf18_for(channel, 20))
+    operating_readback_rf18(read, indices, mcs, [0; 12], rf18_for(channel, 20))
 }
 /// [`operating_readback_ht`] at the N2xB 40MHz pair: HT words are the HT40
 /// selection and RF18 is BW40 (bit11) on the center channel.
@@ -72,12 +72,25 @@ pub(super) fn operating_readback_wide(
     mcs: [u8; 8],
     center: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, rf18_for(center, 40))
+    operating_readback_rf18(read, indices, mcs, [0; 12], rf18_for(center, 40))
+}
+/// [`operating_readback_ht`] at the N2xV 80MHz block: HT words keep the HT20
+/// selection, the VHT words 0x1d2c..0x1d34 carry the record's VHT1SS
+/// MCS0..9 (`vht::write_power`) and RF18 is BW80 (bit10) on the center.
+pub(super) fn operating_readback_vht(
+    read: impl FnMut(u16) -> Result<u32, Error>,
+    indices: [u8; 12],
+    mcs: [u8; 8],
+    vht: [u8; 12],
+    center: u8,
+) -> Result<(), Error> {
+    operating_readback_rf18(read, indices, mcs, vht, rf18_for(center, 80))
 }
 fn operating_readback_rf18(
     mut read: impl FnMut(u16) -> Result<u32, Error>,
     indices: [u8; 12],
     mcs: [u8; 8],
+    vht: [u8; 12],
     rf18: u32,
 ) -> Result<(), Error> {
     for (slot, reg) in TXAGC.into_iter().enumerate() {
@@ -94,7 +107,11 @@ fn operating_readback_rf18(
                     .map_err(|_| Error::State)?,
             )
         } else {
-            0
+            u32::from_le_bytes(
+                vht[(slot - 5) * 4..(slot - 5) * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
         };
         if read(reg)? != expected {
             return Err(Error::Prerequisite);

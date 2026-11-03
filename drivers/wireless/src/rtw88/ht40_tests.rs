@@ -534,3 +534,171 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_vht80_record_span_and_bw80_program
 );
+
+fn smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback() -> TestResult {
+    use crate::rtw88::{packet_format::VhtRates, vht};
+    // VHT Operation (192): channel width 1, CCFS0 42, CCFS1 0.
+    let ies = [0, 1, b'x', 192, 5, 1, 42, 0, 0xfc, 0xff];
+    if vht::vht_operation(&ies) != Some((1, 42, 0)) || vht::vht_operation(&ies[..9]).is_some() {
+        return TestResult::Fail("VHT Operation element not parsed");
+    }
+    let (Some(two), Some(one)) = (
+        vht::Record::decode(0xc822, &vht_payload(44, 42, 2)),
+        vht::Record::decode(0xc821, &vht_payload(44, 42, 1)),
+    ) else {
+        return TestResult::Fail("valid VHT80 records refused");
+    };
+    // rtw_init_vht_cap maps narrowed to the record; get_vht_ra_mask.
+    if two.tx_mask() != 0xfffff
+        || two.tx_map() != 0xfffa
+        || one.tx_mask() != 0x3ff
+        || one.tx_map() != 0xfffe
+        || vht::rx_map(2) != 0xfffa
+        || VhtRates::from_map(0xfff4) != (0xff | 0x1ff << 10)
+        || VhtRates::from_map(0xfffe) != 0x3ff
+    {
+        return TestResult::Fail("VHT MCS map / ra mask differs from get_vht_ra_mask");
+    }
+    let Some(local) = vht::local(0xc822, 2, &two) else {
+        return TestResult::Fail("VHT80 local capability refused");
+    };
+    let cap = local.capability_body();
+    let info = u32::from_le_bytes([cap[0], cap[1], cap[2], cap[3]]);
+    // SHORT_GI_80 bit5, RXSTBC_1 bit8, RXLDPC bit4 per chip, MPDU 3895.
+    if info & (1 << 5 | 1 << 8) != (1 << 5 | 1 << 8)
+        || info & 3 != 0
+        || info & (1 << 7 | 1 << 11 | 1 << 12 | 1 << 19) != 0
+        || cap[4..6] != [0xfa, 0xff]
+        || cap[8..10] != [0xfa, 0xff]
+    {
+        return TestResult::Fail("VHT capability differs from rtw_init_vht_cap");
+    }
+    let p = DataProfile {
+        rates: 0xff0,
+        qos: true,
+        mcs: 0xffff,
+        rx_mcs: 0xffff,
+        sgi: true,
+        band5: true,
+        vht: Some(VhtRates {
+            tx: 0xfffff,
+            rx: 0xfffff,
+        }),
+        ..DataProfile::LEGACY
+    };
+    let one_ss = DataProfile {
+        vht: Some(VhtRates {
+            tx: 0x1ff,
+            rx: 0xfffff,
+        }),
+        ..p
+    };
+    // get_rate_id ARFR0_AC_2SS 9 / ARFR1_AC_1SS 10; get_highest_vht_tx_rate;
+    // RA mask RA_MASK_VHT_RATES | RA_MASK_OFDM_IN_VHT; bw_mode 80.
+    if !p.valid()
+        || p.rate_id() != 9
+        || one_ss.rate_id() != 10
+        || p.rate() != 0x3f
+        || one_ss.rate() != 0x34
+        || p.bw_mode() != 2
+        || p.ra_mask() != (0xff0 | 0xfffff << 12)
+        || DataProfile::vht_rx_for(0xff) != 0x3ff
+        || (DataProfile { band5: false, ..p }).valid()
+        || (DataProfile { bw40: true, ..p }).valid()
+        || (DataProfile {
+            vht: Some(VhtRates {
+                tx: 0x7f,
+                rx: 0x3ff,
+            }),
+            ..p
+        })
+        .valid()
+        || (DataProfile {
+            vht: Some(VhtRates {
+                tx: 0xfffff,
+                rx: 0x3ff,
+            }),
+            ..p
+        })
+        .valid()
+    {
+        return TestResult::Fail("VHT80 profile rate id/mask/validity wrong");
+    }
+    let own = crate::rtw88::ht_tests::OWN;
+    let mut frame = vec![0x88, 1, 0, 0];
+    frame.extend_from_slice(&[2, 0, 0, 0, 0, 1]);
+    frame.extend_from_slice(&own);
+    frame.extend_from_slice(&[2, 0, 0, 0, 0, 1]);
+    frame.extend_from_slice(&[0x10, 0, 0, 0]);
+    frame.extend_from_slice(&[0; 32]);
+    let Ok((d, _)) = packet_format::transmit_profile(&frame, own, 0, None, p) else {
+        return TestResult::Fail("VHT80 QoS DATA descriptor refused");
+    };
+    let w = |at: usize| u32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]);
+    // W5 SHORT bit4 + DATA_BW 2; W1 RATE_ID 9; W4 DATARATE VHT2SS MCS9.
+    if w(20) != (1 << 4 | 2 << 5) || (w(4) >> 16) & 31 != 9 || w(16) & 127 != 0x3f {
+        return TestResult::Fail("descriptor BW/SGI/rate not at VHT80");
+    }
+    // RX admission of the advertised VHT set and the 3895-byte VHT MPDU.
+    let rx = |rate: u8, length: u32, vht: u32| {
+        let mut d = [0u8; packet_format::RX_DESC];
+        d[..4].copy_from_slice(&(length | 4 << 16 | 1 << 26).to_le_bytes());
+        d[12] = rate;
+        packet_format::receive_rates(&d, 0xff, vht).is_ok()
+    };
+    if !rx(0x35, 100, 0x3ff)
+        || rx(0x36, 100, 0x3ff)
+        || rx(0x2c, 100, 0)
+        || !rx(0x2c, 3895, 0x3ff)
+        || rx(0x2c, 3896, 0x3ff)
+        || rx(0x0c, 3890, 0)
+        || rx(0x1c, 100, 0xfffff)
+    {
+        return TestResult::Fail("VHT RX rate/length admission wrong");
+    }
+    // query_phy_status_page1: RXSC 13 is an 80MHz PPDU; RXSC 0 at the
+    // committed 80MHz width.
+    let mut s = [0u8; 32];
+    s[0] = 1;
+    s[6] = 44;
+    s[5] = 13 << 4;
+    let e = packet_phy::parse_at(packet_phy::Chip::C22, 0x2d, &s, 2).ok();
+    s[5] = 0;
+    let z = packet_phy::parse_at(packet_phy::Chip::C22, 0x2d, &s, 2).ok();
+    if !e.is_some_and(|e| e.bandwidth == 2 && e.on_operating(44, 2) && !e.on_operating(44, 1))
+        || z.is_none_or(|e| e.bandwidth != 2)
+    {
+        return TestResult::Fail("80MHz PHY status not admitted at the committed width");
+    }
+    // C21 readback at 80MHz: HT words unchanged, VHT words from the record,
+    // RF18 BW80 on the center.
+    let legacy = [30; 12];
+    let mcs = [28; 8];
+    let mut vwords = [0u8; 12];
+    vwords[..10].copy_from_slice(&one.indices[..10]);
+    let mut regs = alloc::collections::BTreeMap::new();
+    for reg in [0x1d00u16, 0x1d04, 0x1d08] {
+        regs.insert(reg, u32::from_le_bytes([30; 4]));
+    }
+    regs.insert(0x1d0c, u32::from_le_bytes([28; 4]));
+    regs.insert(0x1d10, u32::from_le_bytes([28; 4]));
+    for (i, reg) in [0x1d2cu16, 0x1d30, 0x1d34].into_iter().enumerate() {
+        regs.insert(
+            reg,
+            u32::from_le_bytes(vwords[i * 4..i * 4 + 4].try_into().unwrap()),
+        );
+    }
+    regs.insert(0x2860, radio8821c::rf18_for(42, 80));
+    let read = |r: u16| Ok(regs.get(&r).copied().unwrap_or(0));
+    if radio8821c::operating_readback_vht(read, legacy, mcs, vwords, 42).is_err()
+        || radio8821c::operating_readback_wide(read, legacy, mcs, 42).is_ok()
+        || radio8821c::operating_readback_vht(read, legacy, mcs, [0; 12], 42).is_ok()
+    {
+        return TestResult::Fail("C21 VHT80 readback differs from the 80MHz program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback
+);

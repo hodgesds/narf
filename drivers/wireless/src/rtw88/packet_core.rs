@@ -486,7 +486,11 @@ impl Core {
         }
         let descriptor = port.rx_bytes(slot, 0, format::RX_DESC)?;
         if let Ok(descriptor) = <&[u8; format::RX_DESC]>::try_from(descriptor.as_slice()) {
-            if let Ok(metadata) = format::receive_mcs(descriptor, self.data_profile.rx_mcs) {
+            if let Ok(metadata) = format::receive_rates(
+                descriptor,
+                self.data_profile.rx_mcs,
+                self.data_profile.vht.map_or(0, |v| v.rx),
+            ) {
                 let mut body =
                     port.rx_bytes(slot, metadata.payload.start, metadata.payload.len())?;
                 if body.len() != metadata.payload.len() {

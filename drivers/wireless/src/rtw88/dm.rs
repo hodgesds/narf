@@ -1155,7 +1155,7 @@ impl Tracker {
     /// `rtw_update_sta_info(.., false)` RA_INFO refresh from the current
     /// qualified data profile with the RSSI-level mask (`main.c`).
     fn ra_info(&self, profile: DataProfile) -> [u8; 8] {
-        let bak = u32::from(profile.rates) | (u32::from(profile.mcs) << 12);
+        let bak = profile.ra_mask();
         let cck_only = profile.mcs == 0 && profile.rates & !0xf == 0;
         let level_mask: u32 = if cck_only {
             u32::MAX
@@ -1182,7 +1182,7 @@ impl Tracker {
             0,
             profile.rate_id() | (u8::from(profile.sgi) << 7),
             // DIS_PT | NO_UPDATE | BW_MODE (`si->bw_mode`, N2xB 40MHz).
-            0x48 | u8::from(profile.bw40),
+            0x48 | (u8::from(profile.vht.is_some()) << 4) | profile.bw_mode(),
             m[0],
             m[1],
             m[2],

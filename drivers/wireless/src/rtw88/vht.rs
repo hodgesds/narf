@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Separately qualified 5GHz VHT80 record (`N2xV`) and its 80MHz program.
 //!
-//! Groundwork for the `vht` row: record format, factory/regulatory
-//! admission and the Linux `rtw_set_channel(center, BW80, sc)` program with
-//! the record's VHT TX power. The record is not yet bound by the station or
-//! advertised (`rtw_init_vht_cap`, RA VHT rate ids/masks and VHT TX
-//! descriptor fields remain), so no VHT capability is claimed.
+//! Record format, factory/regulatory admission, the Linux
+//! `rtw_set_channel(center, BW80, sc)` program with the record's VHT TX
+//! power, and the station-side pieces (`rtw_init_vht_cap` narrowed to the
+//! record, VHT Operation parsing). The station binds it over the HT program
+//! for an 80MHz BSS (`station.rs::associate`); VHT DATA then uses
+//! `DataProfile::vht` (RA VHT rate ids/mask, BW_MODE 2, descriptor BW 2).
 //!
 //! Linux 7.3-rc4 sources:
 //! - `main.c::rtw_update_channel`: 80MHz `primary_channel_idx`
@@ -122,6 +123,17 @@ impl Record {
     pub(super) fn width(&self) -> Width {
         Width::Eighty(self.sc())
     }
+    /// The record's VHT TX selection in the `get_vht_ra_mask` layout
+    /// (`VhtRates::tx`): MCS0..`max_mcs` on each qualified stream.
+    pub(super) fn tx_mask(&self) -> u32 {
+        let group = 0x3ff >> (9 - self.max_mcs);
+        (0..u32::from(self.streams)).fold(0, |m, s| m | group << (10 * s))
+    }
+    /// The VHT TX MCS map advertised for the record (`rtw_init_vht_cap`
+    /// narrowed to the qualified streams and highest MCS).
+    pub(super) fn tx_map(&self) -> u16 {
+        mcs_map(self.streams, self.max_mcs - 7)
+    }
     /// The four 20MHz constituents' center frequencies.
     pub(super) fn constituents(&self) -> Option<[u16; 4]> {
         let c = band5::constituents80(self.center);
@@ -132,6 +144,66 @@ impl Record {
             band5::frequency(c[3])?,
         ])
     }
+}
+
+/// A VHT MCS map with `streams` streams at support code `code`
+/// (0: MCS0..7, 1: 0..8, 2: 0..9) and the rest `NOT_SUPPORTED`.
+fn mcs_map(streams: u8, code: u8) -> u16 {
+    (0..8).fold(0, |m, s| {
+        m | (if s < streams { u16::from(code) } else { 3 }) << (2 * s)
+    })
+}
+
+/// `rtw_init_vht_cap` RX MCS map: MCS0..9 on each of `streams` streams.
+pub(super) fn rx_map(streams: u8) -> u16 {
+    mcs_map(streams, 2)
+}
+
+/// `rtw_init_vht_cap` for the bound N2xV association: SGI80 (RX always,
+/// TX per the record), RX STBC, RX LDPC per chip (`rtw_chip_has_rx_ldpc`),
+/// A-MPDU exponent 0 like the HT capability, maximum MPDU 3895, MCS0..9 RX
+/// on the HT program's streams and the record's TX selection. TX STBC, TX
+/// LDPC, HTC-VHT and beamforming are not advertised (no separately
+/// qualified VHT coding or sounding program).
+pub(super) fn local(
+    did: u16,
+    streams: u8,
+    record: &Record,
+) -> Option<narf_wireless::association::phy::LocalVht> {
+    narf_wireless::association::phy::LocalVht::new(
+        rx_map(streams),
+        record.tx_map(),
+        true,
+        record.sgi,
+        0,
+    )
+    .ok()
+    .map(|v| {
+        v.with_rx_stbc(true)
+            .with_ldpc(super::coding::rx_ldpc(did), false)
+    })
+}
+
+/// VHT Operation element (192) in `ies`: `(channel width, CCFS0, CCFS1)`.
+/// Channel width 1 with CCFS0 the 80MHz center is an 80MHz (or wider,
+/// CCFS1 nonzero) BSS. `None` if absent or malformed.
+pub(super) fn vht_operation(ies: &[u8]) -> Option<(u8, u8, u8)> {
+    let mut at = 0;
+    while at + 2 <= ies.len() {
+        let len = usize::from(ies[at + 1]);
+        let body = ies.get(at + 2..at + 2 + len)?;
+        if ies[at] == 192 && len == 5 {
+            return Some((body[0], body[1], body[2]));
+        }
+        at += 2 + len;
+    }
+    None
+}
+
+/// Live check of a bound N2xV record under the installed regulatory domain.
+pub(super) fn current(g: &super::qualification::Grant, gate: &Gate) -> Result<(), Error> {
+    let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Prerequisite)?;
+    current_in(g, gate, &domain)
 }
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {

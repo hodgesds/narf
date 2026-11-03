@@ -156,6 +156,7 @@ fn period(linked: bool) -> Period {
             fallback: false,
             bw40: false,
             band5: false,
+            vht: None,
         },
         tx_bytes: 0,
         rx_bytes: 0,

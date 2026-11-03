@@ -80,10 +80,12 @@ pub(super) struct Native {
     /// publication is refused and hardware TX stays paused until finish;
     /// cancellation leaves it set (fail closed, non-Ready).
     retune: Option<u8>,
-    /// `station_width_begin` started the current retune (N2xB widening).
+    /// `station_width_begin` started the current retune (N2xB / N2xV
+    /// widening).
     widening: bool,
-    /// The N2xB 40MHz program is committed (`station_retune_finish` after
-    /// widening); HT readbacks then expect the HT40 selection.
+    /// The N2xB 40MHz or N2xV 80MHz program is committed
+    /// (`station_retune_finish` after widening); HT readbacks then expect
+    /// the HT40 / VHT80 selection.
     wide: bool,
     /// State `halt_packets` left; `restart_packets` returns to it.
     halted_from: Option<State>,
@@ -919,7 +921,7 @@ unsafe impl Registers for Native {
             .as_ref()
             .and_then(super::power_policy::Gate::ht_grant)
         {
-            let wide = self.committed_ht40()?;
+            let wide = self.committed_wide()?;
             return g.readback_at(|r| self.read32(r), wide.as_ref());
         }
         if let Some((indices, channel)) = self
@@ -1323,17 +1325,22 @@ unsafe impl Registers for Native {
                 return Err(Error::State);
             }
             let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
-            let record = gate.ht40_record().ok_or(Error::State)?;
-            if record.primary != self.channel || gate.channel() != self.channel {
+            // N2xV (80MHz, RTW bandwidth code 2) or N2xB (40MHz, code 1).
+            let (primary, width) = match (gate.vht_record(), gate.ht40_record()) {
+                (Some(v), None) => (v.primary, 2),
+                (None, Some(r)) => (r.primary, 1),
+                _ => return Err(Error::State),
+            };
+            if primary != self.channel || gate.channel() != self.channel {
                 return Err(Error::State);
             }
             gate.current().map_err(Error::Power)?;
             // From here no new TX is published (the retune owner), and RX PHY
-            // admission follows `query_phy_status_page1` at BW40.
+            // admission follows `query_phy_status_page1` at BW40 / BW80.
             self.retune = Some(self.channel);
             self.widening = true;
             self.with_packet(|core, _| {
-                core.set_operating_width(1);
+                core.set_operating_width(width);
                 Ok(())
             })
             .map_err(|_| Error::State)?;
@@ -1857,13 +1864,18 @@ impl Native {
         }
         Ok(true)
     }
-    /// The N2xB record whose 40MHz program is committed in hardware, if any.
-    fn committed_ht40(&self) -> Result<Option<super::ht40::Record>, Error> {
+    /// The N2xB (40MHz) or N2xV (80MHz) record whose program is committed
+    /// in hardware, if any.
+    fn committed_wide(&self) -> Result<Option<super::ht::Wide>, Error> {
         if !self.wide {
             return Ok(None);
         }
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
-        gate.ht40_record().map(Some).ok_or(Error::State)
+        match (gate.vht_record(), gate.ht40_record()) {
+            (Some(v), None) => Ok(Some(super::ht::Wide::Eighty(v))),
+            (None, Some(r)) => Ok(Some(super::ht::Wide::Forty(r))),
+            _ => Err(Error::State),
+        }
     }
     pub(super) fn retune_active(&self) -> bool {
         self.retune.is_some()

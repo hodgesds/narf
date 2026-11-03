@@ -186,7 +186,11 @@ pub(super) struct State {
     /// Bound N2xB HT40 record (identity loaded before the association
     /// request, bound with the HT program).
     ht40: Option<(Arc<super::qualification::Grant>, super::ht40::Record)>,
-    /// Hardware runs the N2xB 40MHz pair (`ht40::program` committed).
+    /// Bound N2xV VHT80 record (identity loaded before the association
+    /// request, bound with the HT program; never together with N2xB).
+    vht: Option<(Arc<super::qualification::Grant>, super::vht::Record)>,
+    /// Hardware runs the N2xB 40MHz pair or the N2xV 80MHz block
+    /// (`ht40::program` / `vht::program` committed).
     wide: bool,
     /// cfg80211 `beacon_found` for passive-only (RADAR / NO_IR) primaries
     /// (shared `narf_wireless::reg::witness`): admits association / CSA
@@ -298,6 +302,7 @@ impl State {
             rfk_channel: Some(1),
             retuning: false,
             ht40: None,
+            vht: None,
             wide: false,
             switch: None,
             switch_wait_beacon: false,
@@ -617,6 +622,7 @@ impl State {
         self.fallback = None;
         self.qos = None;
         self.ht40 = None;
+        self.vht = None;
         self.witness.clear();
         self.witness_scan = None;
         let _ = io.station_passive_tx(None);
@@ -1112,6 +1118,7 @@ impl State {
                                 fallback: false,
                                 bw40: false,
                                 band5,
+                                vht: None,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -1124,7 +1131,40 @@ impl State {
                                 // protection modes are admitted unchanged.
                                 // The response must keep the programmed width:
                                 // 40MHz exactly on the bound N2xB pair.
+                                // 80MHz exactly on the bound N2xV block with VHT.
+                                if let Some((_, v)) = &self.vht {
+                                    let vht = negotiated.vht().ok_or(Error::Profile)?;
+                                    if negotiated.width() != association::phy::Width::Eighty
+                                        || negotiated.center_channel() != v.center
+                                        || !self.wide
+                                    {
+                                        return Err(Error::Profile);
+                                    }
+                                    // rtw_update_sta_info: VHT ra_mask from the
+                                    // negotiated TX map (the peer's RX map within
+                                    // the N2xV selection), bw_mode 80, SGI from
+                                    // the peer's SHORT_GI_80 and N2xV's SGI80;
+                                    // TX uncoded (no VHT coding qualification).
+                                    let tx =
+                                        super::packet_format::VhtRates::from_map(vht.tx_mcs_map())
+                                            & v.tx_mask();
+                                    let mcs = u16::from_le_bytes(
+                                        negotiated.ht().tx_mcs()[..2].try_into().unwrap(),
+                                    );
+                                    self.data_profile = super::packet_format::DataProfile {
+                                        sgi: vht.tx_sgi80(),
+                                        vht: Some(super::packet_format::VhtRates {
+                                            tx,
+                                            rx: h.vht_rx(),
+                                        }),
+                                        ..h.profile(rates, mcs, false)?
+                                    };
+                                    if !self.data_profile.valid() {
+                                        return Err(Error::Profile);
+                                    }
+                                }
                                 let wide = match (negotiated.width(), &self.ht40) {
+                                    _ if self.vht.is_some() => true,
                                     (association::phy::Width::Twenty, _) => false,
                                     (association::phy::Width::Forty, Some((_, r)))
                                         if negotiated.occupied_channels()
@@ -1143,7 +1183,9 @@ impl State {
                                 let mcs = u16::from_le_bytes(
                                     negotiated.ht().tx_mcs()[..2].try_into().unwrap(),
                                 );
-                                self.data_profile = if wide {
+                                self.data_profile = if self.vht.is_some() {
+                                    self.data_profile
+                                } else if wide {
                                     // rtw_update_sta_info: bw_mode 40, SGI from
                                     // the peer's SGI_40 (and N2xB's SGI40).
                                     super::packet_format::DataProfile {
@@ -1154,7 +1196,9 @@ impl State {
                                 } else {
                                     h.profile(rates, mcs, negotiated.ht().tx_sgi20())?
                                 };
-                                if let Some((_, flags)) = &self.coding {
+                                if let Some((_, flags)) =
+                                    self.coding.as_ref().filter(|_| self.vht.is_none())
+                                {
                                     self.data_profile = super::coding::apply(
                                         *flags,
                                         self.data_profile,
@@ -1225,7 +1269,12 @@ impl State {
                         }
                     }
                     if self.extension.is_some()
-                        && (if frame.rate >= 12 {
+                        && (if frame.rate >= 0x2c {
+                            // VHT only within the advertised N2xV RX set.
+                            self.data_profile.vht.is_none_or(|v| {
+                                frame.rate >= 0x40 || v.rx >> (frame.rate - 0x2c) & 1 == 0
+                            })
+                        } else if frame.rate >= 12 {
                             self.ht.is_none() || frame.rate >= 20
                         } else {
                             self.data_profile.rates & (1 << frame.rate) == 0
@@ -1606,12 +1655,17 @@ impl State {
         self.retuning = false;
         Ok(())
     }
-    /// `rtw_set_channel(center, BW40, sc)` for the bound N2xB pair, then the
-    /// pre-association IQK and HT40 TX power (`rtw_ops_mgd_prepare_tx`), under
-    /// the retune owner: TX refused, TXPAUSE, drained, readbacks, epoch.
-    /// Failure is terminal like a retune failure.
-    async fn widen(&mut self, io: &mut impl Io, record: &super::ht40::Record) -> Result<(), Error> {
-        if self.phase() != Phase::Passive || record.primary != self.channel {
+    /// `rtw_set_channel(center, BW40/BW80, sc)` for the bound N2xB pair or
+    /// N2xV block, then the pre-association IQK and HT40 / VHT80 TX power
+    /// (`rtw_ops_mgd_prepare_tx`), under the retune owner: TX refused,
+    /// TXPAUSE, drained, readbacks, epoch. Failure is terminal like a retune
+    /// failure.
+    async fn widen(&mut self, io: &mut impl Io, wide: &super::ht::Wide) -> Result<(), Error> {
+        let primary = match wide {
+            super::ht::Wide::Forty(r) => r.primary,
+            super::ht::Wide::Eighty(v) => v.primary,
+        };
+        if self.phase() != Phase::Passive || primary != self.channel {
             return Err(Error::State);
         }
         self.retuning = true;
@@ -1630,10 +1684,20 @@ impl State {
         self.phase = Phase::Failed;
         self.rfk_channel = None;
         let gate = self.admission.run(|| io.station_gate())?;
-        if gate.ht40_record().as_ref() != Some(record) {
-            return Err(Error::State);
+        match wide {
+            super::ht::Wide::Forty(record) => {
+                if gate.ht40_record().as_ref() != Some(record) || gate.vht_record().is_some() {
+                    return Err(Error::State);
+                }
+                super::ht40::program(io, &gate, record).await?;
+            }
+            super::ht::Wide::Eighty(record) => {
+                if gate.vht_record().as_ref() != Some(record) || gate.ht40_record().is_some() {
+                    return Err(Error::State);
+                }
+                super::vht::program(io, &gate, record).await?;
+            }
         }
-        super::ht40::program(io, &gate, record).await?;
         let channel = self.channel;
         self.admission.run(|| io.station_retune_finish(channel))?;
         self.rfk_channel = Some(channel);
@@ -1675,6 +1739,18 @@ impl State {
                 return Err(Error::PeerLost);
             }
         }
+        // Likewise at 80MHz: a VHT Operation no longer naming the bound
+        // block (channel width 0 or another CCFS0), or an HT Operation on
+        // another primary, drops the connection.
+        if let Some((_, v)) = self.vht.as_ref().filter(|_| self.wide) {
+            if super::vht::vht_operation(&bytes[36..])
+                .is_some_and(|(width, ccfs0, _)| width != 1 || ccfs0 != v.center)
+                || super::ht40::ht_operation(&bytes[36..])
+                    .is_some_and(|(primary, _)| primary != v.primary)
+            {
+                return Err(Error::PeerLost);
+            }
+        }
         let Some(ie) = super::channel_policy::switch_ie(&bytes[36..]) else {
             return Ok(());
         };
@@ -1694,7 +1770,8 @@ impl State {
             && self.fallback.is_none()
             && self.tracking.grant.is_none()
             && self.power_tracking.is_none()
-            && self.ht40.is_none();
+            && self.ht40.is_none()
+            && self.vht.is_none();
         let channel = ie.channel.ok_or(Error::PeerLost)?;
         if !carried || !super::channel_policy::tunable(channel) {
             return Err(Error::PeerLost);
@@ -1901,6 +1978,40 @@ impl State {
             }
             _ => None,
         };
+        // VHT80 (N2xV): the AP's VHT Operation names this primary's Annex E
+        // 80MHz block (channel width 1, CCFS0 the center; mac80211
+        // `ieee80211_chandef_vht_oper`), the firmware reports `hw_cap.bw` 80
+        // (`hw_bw_cap_to_bitamp`), the three other 20MHz constituents are
+        // admitted channels (loadable N2xO records), and a passive-only span
+        // is passive and beacon-witnessed on all four constituents
+        // (`wide_witnessed`). Preferred over N2xB; otherwise HT40 or 20MHz.
+        let center80 = match (
+            super::band5::center80(self.channel),
+            super::vht::vht_operation(&candidate.bss.information_elements),
+        ) {
+            (Some(center), Some((1, ccfs0, _)))
+                if ccfs0 == center
+                    && io
+                        .station_ht_facts()
+                        .is_some_and(|f| super::vht::hardware_allows(f.hardware.bandwidth)) =>
+            {
+                let channels = super::band5::constituents80(center);
+                let mut admitted = true;
+                for c in channels {
+                    if c != self.channel
+                        && self
+                            .admission
+                            .run(|| io.station_channel_grant(c))?
+                            .is_none()
+                    {
+                        admitted = false;
+                        break;
+                    }
+                }
+                (admitted && self.wide_witnessed(io, &channels)?).then_some(center)
+            }
+            _ => None,
+        };
         // Off channel 1 every program below loads only its own per-channel
         // record over the channel-scoped base (`channel_policy::scope_request`);
         // absent records leave the base legacy CCK1 profile.
@@ -1947,8 +2058,19 @@ impl State {
         let flags = coding.as_ref().map_or(0, |c| c.1);
         // N2xB HT40 needs the HT program (same MCS set), this primary and the
         // AP's admitted secondary. Identity only here, like N2xC.
+        // N2xV VHT80 needs the HT program, this primary and the AP's block.
+        // Identity only here, like N2xB.
+        let vht = match (&proposed, center80) {
+            (Some(_), Some(center)) => io.station_continuation(&super::vht::KIND)?.and_then(|g| {
+                let gate = io.station_gate().ok()?;
+                let r = super::vht::Record::decode(gate.did(), g.payload())?;
+                (g.matches(&gate) && r.primary == self.channel && r.center == center)
+                    .then_some((g, r))
+            }),
+            _ => None,
+        };
         let ht40 = match (&proposed, secondary) {
-            (Some(h), Some(secondary)) => io
+            (Some(h), Some(secondary)) if vht.is_none() => io
                 .station_continuation(super::ht40::kind(self.channel))?
                 .and_then(|g| {
                     let gate = io.station_gate().ok()?;
@@ -1962,6 +2084,16 @@ impl State {
             _ => None,
         };
         let mut plan = match (&proposed, &ht40) {
+            // rtw_init_ht_cap + rtw_init_vht_cap; VHT DATA is uncoded, so no
+            // N2xC TX coding is advertised.
+            (Some(h), _) if vht.is_some() => JoinPlan::prepare_with_phy(
+                &candidate.bss,
+                self.own,
+                ssid,
+                mode,
+                h.local_vht80(0, &vht.as_ref().ok_or(Error::State)?.1)
+                    .ok_or(Error::State)?,
+            )?,
             (Some(h), Some((_, r))) => JoinPlan::prepare_with_phy(
                 &candidate.bss,
                 self.own,
@@ -1981,12 +2113,21 @@ impl State {
         let ht = proposed.filter(|_| plan.offered_phy().is_some());
         // Upstream rtw88 takes no HT protection-mode action (ht_protection_modes).
         // 40MHz only as the exact N2xB pair.
-        let wide = match plan
-            .offered_phy()
-            .map(|p| (p.width(), p.occupied_channels()))
-        {
-            None | Some((association::phy::Width::Twenty, _)) => false,
-            Some((association::phy::Width::Forty, channels)) => match &ht40 {
+        let wide = match plan.offered_phy().map(|p| {
+            (
+                p.width(),
+                p.occupied_channels(),
+                p.center_channel(),
+                p.vht().is_some(),
+            )
+        }) {
+            None | Some((association::phy::Width::Twenty, ..)) => false,
+            // 80MHz only as the exact N2xV block with VHT.
+            Some((association::phy::Width::Eighty, _, center, true)) => match &vht {
+                Some((_, v)) if ht.is_some() && center == v.center => true,
+                _ => return Err(Error::Profile),
+            },
+            Some((association::phy::Width::Forty, channels, ..)) => match &ht40 {
                 Some((_, r))
                     if ht.is_some()
                         && channels == [r.primary.min(r.secondary), r.primary.max(r.secondary)] =>
@@ -1998,6 +2139,10 @@ impl State {
             Some(_) => return Err(Error::Profile),
         };
         let ht40 = ht40.filter(|_| wide);
+        let vht = vht.filter(|_| wide);
+        if vht.is_some() && ht40.is_some() {
+            return Err(Error::State);
+        }
         plan.append_sme_ies(ies)?;
         if let Some(pmk) = pmk {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
@@ -2073,8 +2218,14 @@ impl State {
             if let Some((g, r)) = ht40 {
                 self.admission
                     .run(|| io.station_bind_continuation(g.clone()))?;
-                self.widen(io, &r).await?;
+                self.widen(io, &super::ht::Wide::Forty(r)).await?;
                 self.ht40 = Some((g, r));
+            }
+            if let Some((g, v)) = vht {
+                self.admission
+                    .run(|| io.station_bind_continuation(g.clone()))?;
+                self.widen(io, &super::ht::Wide::Eighty(v)).await?;
+                self.vht = Some((g, v));
             }
             // RX may arrive at negotiated HT rates immediately after the AP's
             // association response, before the awaited native peer commit.
@@ -2085,6 +2236,17 @@ impl State {
                 h.mcs(),
                 false,
             )?;
+            // At 80MHz the RX bound also admits the advertised VHT set.
+            let p = super::packet_format::DataProfile {
+                vht: self
+                    .vht
+                    .as_ref()
+                    .map(|(_, v)| super::packet_format::VhtRates {
+                        tx: v.tx_mask(),
+                        rx: h.vht_rx(),
+                    }),
+                ..p
+            };
             self.admission.run(|| io.packet_profile(p))?;
             if let Some(g) = io.station_rx_ba_extension(h.clone())? {
                 self.admission.run(|| io.station_bind_rx_ba(g.clone()))?;

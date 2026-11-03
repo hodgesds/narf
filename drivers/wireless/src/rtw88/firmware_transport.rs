@@ -494,9 +494,9 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
-    /// Begin widening the committed primary to the bound N2xB 40MHz pair:
-    /// same TX refusal/TXPAUSE/drain as a retune, gate unchanged, packet-core
-    /// RX admission set to 40MHz. Re-entrant; returns whether TX drained.
+    /// Begin widening the committed primary to the bound N2xB 40MHz pair or
+    /// N2xV 80MHz block: same TX refusal/TXPAUSE/drain as a retune, gate
+    /// unchanged, packet-core RX admission set to 40MHz / 80MHz. Re-entrant; returns whether TX drained.
     /// Completed by [`Io::station_retune_finish`] on the same primary.
     fn station_width_begin(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)

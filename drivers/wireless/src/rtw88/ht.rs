@@ -79,6 +79,22 @@ fn local_width(
     coding: u8,
     wide: Option<bool>,
 ) -> Option<LocalPhy> {
+    local_ht(tx, rx_mask, sgi, did, coding, wide).and_then(|h| {
+        if wide.is_some() {
+            LocalPhy::ht40(h).ok()
+        } else {
+            LocalPhy::ht20(h).ok()
+        }
+    })
+}
+fn local_ht(
+    tx: u16,
+    rx_mask: u16,
+    sgi: bool,
+    did: u16,
+    coding: u8,
+    wide: Option<bool>,
+) -> Option<LocalHt> {
     let mut rx = [0; 10];
     rx[..2].copy_from_slice(&rx_mask.to_le_bytes());
     let mut transmit = [0; 10];
@@ -112,13 +128,14 @@ fn local_width(
     })
     .and_then(|h| h.with_tx_selection(transmit))
     .ok()
-    .and_then(|h| {
-        if wide.is_some() {
-            LocalPhy::ht40(h).ok()
-        } else {
-            LocalPhy::ht20(h).ok()
-        }
-    })
+}
+/// The committed wide program the HT readback must expect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Wide {
+    /// N2xB 40MHz pair.
+    Forty(super::ht40::Record),
+    /// N2xV 80MHz block.
+    Eighty(super::vht::Record),
 }
 pub(super) fn factory_limit(p: &[u8], factor: i16, max: u8) -> Option<u8> {
     factory_limit_group(p, 0, factor, max)
@@ -483,6 +500,25 @@ impl Grant {
         )
         .expect("validated native HT facts")
     }
+    /// `rtw_init_ht_cap` (20/40MHz, RX SGI40, no HT TX SGI40) plus
+    /// `rtw_init_vht_cap` for a bound N2xV record (`LocalPhy::vht80`).
+    pub(super) fn local_vht80(&self, coding: u8, record: &super::vht::Record) -> Option<LocalPhy> {
+        let ht = local_ht(
+            self.mcs,
+            self.rx_mask(),
+            self.sgi,
+            self.base.did(),
+            coding,
+            Some(false),
+        )?;
+        let streams = if self.two_streams() { 2 } else { 1 };
+        let vht = super::vht::local(self.base.did(), streams, record)?;
+        LocalPhy::vht80(ht, vht).ok()
+    }
+    /// The locally advertised VHT RX set (`VhtRates::rx`).
+    pub(super) fn vht_rx(&self) -> u32 {
+        DataProfile::vht_rx_for(self.rx_mask())
+    }
     pub(super) fn profile(&self, rates: u16, mcs: u16, sgi: bool) -> Result<DataProfile, Error> {
         let p = DataProfile {
             rates,
@@ -496,6 +532,7 @@ impl Grant {
             fallback: false,
             bw40: false,
             band5: self.base.band5(),
+            vht: None,
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);
@@ -603,10 +640,12 @@ impl Grant {
     pub(super) fn readback_at(
         &self,
         mut read: impl FnMut(u16) -> Result<u32, Error>,
-        wide: Option<&super::ht40::Record>,
+        wide: Option<&Wide>,
     ) -> Result<(), Error> {
-        let Some(r) = wide else {
-            return self.readback(read);
+        let r = match wide {
+            None => return self.readback(read),
+            Some(Wide::Forty(r)) => r,
+            Some(Wide::Eighty(v)) => return self.readback_vht(read, v),
         };
         if self.base.did() == 0xc821 {
             let mcs: [u8; 8] = r.indices[..8].try_into().expect("one-stream HT40 indices");
@@ -630,6 +669,43 @@ impl Grant {
             }
         }
         super::ht40::check_power(&mut read, 0xc822, r, self.base.ofdm5_indices())?;
+        if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    /// [`Self::readback`] at the N2xV 80MHz block: C22 difference words
+    /// are the VHT selection (`vht::check_power`), C21 keeps the HT20 words
+    /// and carries the VHT words with RF18 BW80 on the center.
+    fn readback_vht(
+        &self,
+        mut read: impl FnMut(u16) -> Result<u32, Error>,
+        v: &super::vht::Record,
+    ) -> Result<(), Error> {
+        if self.base.did() == 0xc821 {
+            let mut vht = [0; 12];
+            vht[..10].copy_from_slice(&v.indices[..10]);
+            return super::radio8821c::operating_readback_vht(
+                read,
+                self.facts.legacy,
+                self.tracking_indices(),
+                vht,
+                v.center,
+            );
+        }
+        if self.two_streams()
+            && (read(0x820)? & 255 != 0x31
+                || read(0x1e2c)? & 0xffff != 0x400
+                || read(0x1a04)? & 0xf0000000 != 0x80000000)
+        {
+            return Err(Error::Prerequisite);
+        }
+        for (reg, c) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
+            if read(reg)? >> 16 & 127 != u32::from(c) {
+                return Err(Error::Prerequisite);
+            }
+        }
+        super::vht::check_power(&mut read, 0xc822, v, self.base.ofdm5_indices())?;
         if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }

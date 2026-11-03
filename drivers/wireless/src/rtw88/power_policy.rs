@@ -300,6 +300,10 @@ pub struct Gate {
     /// live regulatory/capability/factory check is part of `current` and
     /// every `invoke`.
     ht40: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    /// Separately signed N2xV 5GHz VHT80 program over the bound HT program
+    /// on the same primary; like N2xB there is no in-place downgrade, so its
+    /// live check is part of `current` and every `invoke`.
+    vht: Option<alloc::sync::Arc<super::qualification::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -600,6 +604,7 @@ impl Gate {
             fallback: None,
             channel: None,
             ht40: None,
+            vht: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -622,6 +627,7 @@ impl Gate {
             fallback: None,
             channel: None,
             ht40: None,
+            vht: None,
         }
     }
     /// Current operating 2.4GHz primary: 1 for the base, else the bound
@@ -648,6 +654,7 @@ impl Gate {
             && self.fallback.is_none()
             && self.tracking.is_none()
             && self.ht40.is_none()
+            && self.vht.is_none()
     }
     pub(super) fn without_channel(&self) -> Self {
         let mut gate = self.clone();
@@ -776,6 +783,9 @@ impl Gate {
         if let Some(g) = &self.ht40 {
             super::ht40::current(g, self).map_err(|_| Error::Policy)?;
         }
+        if let Some(g) = &self.vht {
+            super::vht::current(g, self).map_err(|_| Error::Policy)?;
+        }
         if let Some(g) = &self.tracking {
             g.invoke(|| Ok(())).map_err(|_| Error::Authority)?;
         }
@@ -831,6 +841,9 @@ impl Gate {
         if let Some(g) = &self.ht40 {
             super::ht40::current(g, self)?;
         }
+        if let Some(g) = &self.vht {
+            super::vht::current(g, self)?;
+        }
         if let Some(g) = &self.protection {
             return g.invoke(operation);
         }
@@ -858,6 +871,9 @@ impl Gate {
         }
         if let Some(g) = &self.ht40 {
             super::ht40::current_in(g, self, domain).map_err(|_| Error::Policy)?;
+        }
+        if let Some(g) = &self.vht {
+            super::vht::current_in(g, self, domain).map_err(|_| Error::Policy)?;
         }
         match &self.scope {
             Scope::C22 {
@@ -960,13 +976,32 @@ impl Gate {
         {
             return false;
         }
-        // At 40MHz the SGI bit is SGI40, admitted by N2xB above; the HT
-        // program admits the remaining HT20-qualified fields.
+        // VHT at 80MHz: the TX set within the bound N2xV selection, the RX
+        // set exactly `rtw_init_vht_cap` on the HT program's streams, SGI80
+        // only under the record's SGI80 qualification; uncoded.
+        if let Some(v) = p.vht {
+            let rx = super::packet_format::DataProfile::vht_rx_for(p.rx_mcs);
+            if p.ldpc
+                || p.stbc
+                || v.rx != rx
+                || !self.vht.as_ref().is_some_and(|g| {
+                    super::vht::Record::decode(self.did(), g.payload())
+                        .is_some_and(|r| v.tx & !r.tx_mask() == 0 && (!p.sgi || r.sgi))
+                        && super::vht::current(g, self).is_ok()
+                })
+            {
+                return false;
+            }
+        }
+        // At 40MHz the SGI bit is SGI40, admitted by N2xB above, and at 80MHz
+        // SGI80 by N2xV; the HT program admits the remaining HT20-qualified
+        // fields.
         let p = super::packet_format::DataProfile {
             acs: 0,
             fallback: false,
             bw40: false,
-            sgi: p.sgi && !p.bw40,
+            vht: None,
+            sgi: p.sgi && !p.bw40 && p.vht.is_none(),
             ..p.uncoded()
         };
         if let Some(g) = &self.ht {
@@ -1123,12 +1158,25 @@ impl Gate {
                     && r.primary == self.channel()
                     && super::ht40::within_factory(self, &r)
             });
-        if !coding && !qos && !fallback && !ht40 {
+        // N2xV VHT80: over the bound HT program on the gate's own 5GHz
+        // primary, never together with N2xB, within the center group's
+        // factory BW80 base.
+        let vht = g.is(&super::vht::KIND)
+            && self.vht.is_none()
+            && self.ht40.is_none()
+            && self.ht.is_some()
+            && super::vht::Record::decode(self.did(), g.payload()).is_some_and(|r| {
+                r.primary == self.channel() && super::vht::within_factory(self, &r)
+            });
+        if !coding && !qos && !fallback && !ht40 && !vht {
             return Err(super::firmware_transport::Error::State);
         }
         g.check(self)?;
         if ht40 {
             super::ht40::current(&g, self)?;
+        }
+        if vht {
+            super::vht::current(&g, self)?;
         }
         let mut gate = self.clone();
         if coding {
@@ -1137,8 +1185,10 @@ impl Gate {
             gate.qos = Some(g);
         } else if fallback {
             gate.fallback = Some(g);
-        } else {
+        } else if ht40 {
             gate.ht40 = Some(g);
+        } else {
+            gate.vht = Some(g);
         }
         Ok(gate)
     }
@@ -1147,6 +1197,12 @@ impl Gate {
         self.ht40
             .as_ref()
             .and_then(|g| super::ht40::Record::decode(self.did(), g.payload()))
+    }
+    /// The bound N2xV VHT80 record, if any.
+    pub(super) fn vht_record(&self) -> Option<super::vht::Record> {
+        self.vht
+            .as_ref()
+            .and_then(|g| super::vht::Record::decode(self.did(), g.payload()))
     }
     pub(super) fn coding_grant(&self) -> Option<alloc::sync::Arc<super::qualification::Grant>> {
         self.coding.clone()
