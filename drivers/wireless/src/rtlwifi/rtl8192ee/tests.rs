@@ -753,3 +753,100 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_init_mac_llt_ring_bases_and_bd_counts
 );
+
+// ── tables / headerfile ───────────────────────────────────────────────────
+
+fn selected(rows: &[[u32; 2]], board: u8) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let condition = headerfile::Condition { board_type: board };
+    headerfile::walk::<()>(rows, &condition, |a, d| {
+        out.push((a, d));
+        Ok(())
+    })
+    .unwrap();
+    out
+}
+
+/// Independent reading of the shipped tables: every `0xFF010718` branch
+/// condition names platform `0x01`, which `_check_condition`'s `_platform
+/// 0x08` never matches, so only unconditional rows and `else` parts apply.
+fn else_only(rows: &[[u32; 2]]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut emit = true;
+    for &[a, d] in rows {
+        match (a >= headerfile::CONDITION_ROW, d) {
+            (true, 0xabcd) => emit = false,
+            (true, 0xcdcd) => emit = true,
+            (true, 0xdead) => emit = true,
+            (true, _) => panic!("unexpected condition row"),
+            (false, _) if emit => out.push((a, d)),
+            _ => {}
+        }
+    }
+    out
+}
+
+pub(crate) fn smoke_rtl8192ee_tables_and_check_condition_walk() -> TestResult {
+    if tables::PHY_REG.len() * 2 != 448
+        || tables::PHY_REG_PG.len() * 6 != 168
+        || tables::RADIOA.len() * 2 != 238
+        || tables::RADIOB.len() * 2 != 198
+        || tables::MAC.len() * 2 != 202
+        || tables::AGC.len() * 2 != 532
+        || tables::SOURCE_SHA256
+            != "d3bc9536614b71b471b440e0f770e2651f906f224d2f1f0b70488e3e4807937e"
+    {
+        return TestResult::Fail("table geometry / source digest");
+    }
+    let c = |board| headerfile::Condition { board_type: board };
+    if c(0x18).check(0xff01_0718)
+        || !c(0).check(headerfile::CONDITION_ROW)
+        || !c(5).check(0x000f_0705)
+        || c(6).check(0x000f_0705)
+        || c(5).check(0x000f_0105)
+        || !c(9).check(0x000f_07ff)
+    {
+        return TestResult::Fail("_check_condition board/interface/platform masks");
+    }
+    for rows in [tables::PHY_REG, tables::AGC, tables::RADIOA, tables::RADIOB] {
+        for board in [0, 0x18, 0xff] {
+            if selected(rows, board) != else_only(rows) {
+                return TestResult::Fail("walk differs from the else-branch reading");
+            }
+        }
+    }
+    let phy = selected(tables::PHY_REG, 0);
+    if !phy.contains(&(0xc50, 0x0034_0020)) || phy.contains(&(0xc50, 0x0034_0220)) {
+        return TestResult::Fail("PHY_REG 0xc50 branch");
+    }
+    // A discarded branch without `else`: Linux re-examines the DEAD row as a
+    // condition and discards forward from it; the last row is then data.
+    let quirk = [
+        [0x000f_0705, 0xabcd],
+        [0x800, 1],
+        [0x000f_0705, 0xdead],
+        [0x804, 2],
+        [0x808, 3],
+    ];
+    if selected(&quirk, 6) != vec![(0x808, 3)]
+        || selected(&quirk, 5) != vec![(0x800, 1), (0x804, 2), (0x808, 3)]
+    {
+        return TestResult::Fail("terminator re-examination arithmetic");
+    }
+    if headerfile::bb_action(0xfe, 0) != headerfile::BbAction::DelayUs(50_000)
+        || headerfile::bb_action(0xf9, 0) != headerfile::BbAction::DelayUs(1)
+        || headerfile::bb_action(0x800, 7)
+            != (headerfile::BbAction::Write {
+                addr: 0x800,
+                data: 7,
+            })
+        || headerfile::rf_action(0xffe, 0) != headerfile::RfAction::DelayUs(50_000)
+    {
+        return TestResult::Fail("bb/rf row actions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_tables_and_check_condition_walk
+);

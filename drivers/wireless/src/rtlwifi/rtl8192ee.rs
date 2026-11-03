@@ -31,8 +31,10 @@
 
 pub mod adapter;
 pub mod fw;
+pub mod headerfile;
 pub mod mac;
 pub mod pwrseq;
+pub mod tables;
 pub mod trx;
 
 #[cfg(any(test, feature = "kernel-test"))]

@@ -2031,6 +2031,21 @@ diagnostic (`pci::bring_up` does not retain it).
   disagreement fails the owner. IRQ unmask/recognition is refused (polled
   until the 8192EE IRQ profile exists); the 88EE quiescence registers are
   not accepted as an 8192EE retirement proof, so its DMA stays pinned.
+- `tables` / `headerfile` — all six `rtl8192ee/table.c` arrays (MAC,
+  PHY_REG, PHY_REG_PG, AGC, RADIOA, RADIOB; lengths from `table.h`, source
+  sha256 `d3bc9536…7937e` recorded), generated verbatim. The 8192EE walker is
+  `_check_condition` — not the 8821AE `check_positive` form: board type
+  `[7:0]` (`0xff` any), interface `[15:8]` against `INTF_PCI` 0 (`0x07`
+  any), platform `[23:16]` against `0x08` (`0x0f` any), `0xCDCDCDCD`
+  always true — with the exact `phy_config_bb_with_hdr_file` /
+  `rtl92ee_phy_config_rf_with_headerfile` index arithmetic (a discarded
+  branch's terminator row is re-examined as a condition). Every shipped
+  branch condition is `0xFF010718` (platform `0x01`), which never matches,
+  so the else rows apply on every board. `bb_action`/`rf_action` are
+  `_rtl92ee_config_bb_reg`/`_rtl92ee_config_rf_reg` row decodes (delay
+  markers; the RF `0xb6`/`0xb2` read-back retries belong to the RF writer).
+  Test `smoke_rtl8192ee_tables_and_check_condition_walk` (written,
+  unexecuted).
 
 Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb`,
