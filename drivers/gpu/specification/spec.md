@@ -94,7 +94,38 @@ DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
 that gate before register access. This necessary generation gate does not
 qualify every physical port: combo-B HPD/retained SST additionally needs the
 exact source family and observed PCH facts described below. Meteor/Arrow Lake
-internal-panel support does not admit the Gen12 external port sequence.
+internal-panel support does not admit the Gen12 external port sequence; the
+separate display-14 external contract follows.
+
+### Meteor/Arrow Lake external DP SST, Type-C and hotplug
+
+`intel_gpu_xelpg_external` owns at most one external DisplayPort SST route on
+pipe/transcoder A for `Generation::MeteorLake`:
+`probe_sink(io, generation, port, legacy_port)` returns an `MtlSinkProbe`
+that holds the Type-C connection and the AUX power request.
+`activate(io, probe, fb)` returns a Live `MtlExternalRoute`, or
+`ActivateError::Refused` (the probe comes back with nothing programmed) or
+`ActivateError::Failed` (the route comes back Stopped or Quarantined).
+`MtlExternalRoute::stop`/`release`/`link_ok` and `MtlExternalService::handle`
+complete the lifecycle. `service_mtl_external(io, generation, alloc)` polls
+the process-wide hotplug owner once and returns a `ServiceOutcome`
+(Activated with the mode/framebuffer to publish, Refused, Withdrawn, Retained
+or Unchanged). `teardown_mtl_external` runs from the KMS suspend and GT-reset
+retirement paths. Other generations, DDI A, TBT-alt sinks, Type-C pin
+assignment D, over-budget streams, a lit pipe A and an active DDI refuse with
+typed `ExternalError`s before any affected register write. A stop that cannot
+be observed quarantines the route and keeps its Type-C/AUX/framebuffer leases.
+
+`intel_gpu_xelpg_hpd` publishes `ConnectorStatus` per owned pin (DDI B and
+TC1-TC4) and `MtlHpdEvent`s (Connected(mode), Disconnected, ShortPulse,
+Redetect). Owned sources are IER-enabled with IMR masked, and only a latched
+long pulse with a low level removes a sink. `intel_gpu_xelpg_tc` exposes the
+source Type-C connect/disconnect and the display-14 AUX power well
+(`aux_power_enable`/`aux_power_disable`). Every display-14 AUX transport
+(`IntelAux::with_base`/`IntelAux::xelpdp`) preserves the AUX power request on
+each control word. The Gen12 `IntelAux::new` encoding is unchanged. The
+periodic runtime caller of `service_mtl_external` and its scanout publication
+are not yet wired.
 
 The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
 GGTT byte offset. Both display paths reject invalid plane dimensions,

@@ -1449,15 +1449,23 @@ those programs from the shared `intel_gpu_pipes` codecs.
 
 | Port | BAR0 block | PHY | TRANS_CLK_SEL idx | TRANS_DDI_FUNC_CTL idx | AUX well (AUX2) |
 | ---- | ---------- | --- | ----------------- | ---------------------- | --------------- |
-| DDI A | 0x64000 | C10 | 0 | 0 | AUX_A (0) |
-| DDI B | 0x64100 | C10 | 1 | 1 | AUX_B (1) |
-| TC1 | 0x16F200 | C20 | 2 | 9 | AUX_USBC1 (3) |
-| TC2 | 0x16F400 | C20 | 3 | 10 | AUX_USBC2 (4) |
+| DDI A | 0x64000 | C10 | 0 | 0 | AUX CTL 0x64010 bit 19 |
+| DDI B | 0x64100 | C10 | 1 | 1 | AUX CTL 0x64110 bit 19 |
+| TC1 | 0x16F200 | C20 | 5 (PHY_F) | 3 | AUX CTL 0x16F210 bit 19 |
+| TC2 | 0x16F400 | C20 | 6 (PHY_G) | 4 | AUX CTL 0x16F410 bit 19 |
+| TC3 | 0x16F600 | C20 | 7 (PHY_H) | 5 | AUX CTL 0x16F610 bit 19 |
+| TC4 | 0x16F800 | C20 | 8 (PHY_I) | 6 | AUX CTL 0x16F810 bit 19 |
 
 Port register offsets are per-port absolutes, not a uniform
 stride (e.g. the message-bus timer sits at +0xD8 on DDI A/B but
-+0x58 on the TC ports). `DDI_CLK_VALFREQ` exists only on the
-C10 ports; C20 carries its rate in the PHY's serdes-rate VDR.
++0x58 on the TC ports). `TRANS_CLK_SEL` takes `intel_port_to_phy`
+and `TRANS_DDI_FUNC_CTL` takes i915 `enum port` (PORT_TC1 = 3).
+`DDI_CLK_VALFREQ(port)` and `DDI_BUF_CTL(port)` (DDI_CTL_DE) are
+`_MMIO_PORT` registers for every port (TC1 = 0x64330 / 0x64300).
+Type-C ports also use TCSS_DDI_STATUS (0x161500 + 4·tc), the
+modular FIA `PORT_TX_DFLEXPA1` (FIA1 0x163880 for TC1/2, FIA2
+0x16E880 for TC3/4), `XELPDP_PORT_HOTPLUG_CTL` (0x16F270 + 0x200·tc)
+and the PICA interrupt block at 0x16FE50.
 
 ### 10.2 PHY programming (C10 / C20)
 
@@ -1483,10 +1491,13 @@ unconditionally in the retrain preamble.
 
 ### 10.3 Power wells and CDCLK
 
-Xe-LPD well topology (`PWR_WELL_CTL2` = 0x45404,
-`PWR_WELL_CTL_AUX2` = 0x45444, HSW request/state encoding):
-PW_1 (idx 0, transcoder A + DDI A/B) → PW_A (idx 5, pipe A) →
-the port's AUX well. CDCLK runs on the fixed 38.4 MHz MTL
+Xe-LPD well topology (`PWR_WELL_CTL2` = 0x45404, HSW
+request/state encoding): PW_1 (idx 0, transcoder A + DDI A/B) →
+PW_2 (idx 1, TC1–4 DDI lanes, owned external TC routes only) →
+PW_A (idx 5, pipe A) → the port's AUX well, which on display 14 is
+the channel's `XELPDP_DP_AUX_CH_CTL` power request (bit 19) with a
+fixed 600 µs settle (`xelpdp_aux_power_well_enable`), never the ICL
+`PWR_WELL_CTL_AUX2` request. CDCLK runs on the fixed 38.4 MHz MTL
 reference: six rungs (172.8–652.8 MHz), the two lowest reached
 by squash waveforms programmed in `CDCLK_SQUASH_CTL`. A qualified
 display14.00 modeset with every pipe off programs the CDCLK its
@@ -1511,12 +1522,17 @@ trusted.
   0x40000/0x40000 plus the TC block at 0x16F000/0x1000, and
   **no DPLL region** (Xe-LPG has no DPLL block; Gen12's DPLL
   range is the TC block here).
+- External DP SST on DDI B and TC1–TC4 (Type-C ownership, owned
+  PICA/south hotplug) is owned by `intel_gpu_xelpg_external` (§20,
+  "MTL external outputs"); the inherited internal path still
+  refuses direct TC routes.
 - Not programmed by this lane: watermark / DBUF allocation and
   PM demand outside a qualified display14.00 all-pipes-off modeset
   (that case runs the display14 resource transaction of §20; other
   cases retain firmware's allocation), HDMI PLL states, DP 2.0
   UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe
-  enables, CDCLK notifications on the inherited path (display 14
+  enables, TBT-alt tunnels, pin-assignment-D lane ownership,
+  CDCLK notifications on the inherited path (display 14
   has no PCODE CDCLK mailbox; only the owned transaction sends
   PM demand), and
   per-iteration TX-level updates inside the DPCD training loop
@@ -2286,7 +2302,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; runtime caller, TBT, HDMI, UHBR, multi-pipe and PSR2 open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
@@ -3572,3 +3588,76 @@ request after a clock decrease. Group 6 now also selects `drivers/gpu/intel_gpu_
 `drivers/gpu/intel_gpu_display_resources`, `drivers/gpu/intel_gpu_xelpg_live`,
 `drivers/gpu/intel_gpu_xelpg_pipes` and `drivers/gpu/intel_gpu_xelpg_bw`. The
 debug group pass is deferred to the end of the current integration wave.
+
+### MTL external outputs: Type-C ownership, owned hotplug and DP SST admission
+
+This slice advances the Output support row for display version 14 (Meteor/Arrow
+Lake). Sources are Linux b90c984d `intel_tc.c` (`xelpdp_tc_phy_ops`),
+`intel_hotplug_irq.c`/`intel_display_irq.c` (PICA and MTP south hotplug),
+`intel_display_power_well.c`/`intel_display_power_map.c` (Xe-LPDP AUX wells),
+`intel_ddi.c`, `intel_cx0_phy.c`, `intel_dp_aux.c` and the register headers.
+
+- Port map. TC1-TC4 use the source C20 blocks (0x16F200 + 0x200 per port).
+  TC routes now carry the source indices: `TRANS_CLK_SEL` uses
+  `intel_port_to_phy` (PHY_F-I), `TRANS_DDI_FUNC_CTL` uses enum port 3-6, and
+  `DDI_CLK_VALFREQ` is written for every Cx0 port. The previous TC values (PHY
+  2/3, select 9/10, no VALFREQ) were unqualified and are corrected.
+- AUX power correction. Every display-14 AUX well, including DDI A eDP, is the
+  channel's `XELPDP_DP_AUX_CH_CTL` bit-19 power request. The source
+  `xelpdp_aux_power_well_enable`/`_disable` sequence is followed: no LT PHY,
+  fixed 600 us after the request and 10 us after release. The ICL
+  `PWR_WELL_CTL_AUX2` (0x45444) request the MTL modeset used before is
+  removed. Display-14 AUX transports write the `skl_get_aux_send_ctl` word,
+  which preserves bit 19, sets TBT_IO only for TBT-alt and polls without the
+  done interrupt. The Gen12 control word is unchanged and pinned. The fixtures
+  that pinned the AUX2 write now pin the corrected register.
+- Type-C ownership (`intel_gpu_xelpg_tc`). Follows the source sequence: live
+  mode from PICA/SDE, legacy-flag fixup, TCSS power request with IOM ready
+  (500 ms) and power-state (5 ms) waits, PHY ownership, `PORT_TX_DFLEXPA1` pin
+  assignment with the MTL lane table, DP-alt verification, the source rollback
+  paths and disconnect. TBT-alt and pin assignment D (display gets only PHY
+  lane 0) refuse with typed errors. Legacy mode is implemented but needs a VBT
+  `legacy_port` fact this tree does not parse, so production declares none.
+- Owned hotplug (`intel_gpu_xelpg_hpd`). PICA DP-alt/TBT sources cover TC1-TC4
+  and the on-die south source covers DDI B. DDI A is never owned. Setup
+  installs and reads back IMR before IER, ACKs owned IIR (PICA before SDE),
+  enables per-port detection, and writes SHPD_FILTER_CNT_250 and the MTP HPD
+  inversion. The per-port latches decode long and short pulses. Connector
+  status is published as Connected(mode), Disconnected, ShortPulse or
+  Redetect. Foreign W1C status is preserved. Authority loss makes the monitor
+  uncertain. Teardown withdraws every owned source for reset/suspend. As with
+  the Gen12 monitor, owned IMR bits stay masked because there is no display
+  IRQ consumer.
+- External DP SST (`intel_gpu_xelpg_external`). Covers DDI B (C10) and TC1-TC4
+  in DP-alt or a declared legacy mode, on pipe/transcoder A. The probe connects
+  Type-C, powers AUX, reads caps and the full EDID, and negotiates against HBR3
+  and the TC lane limit. Over-budget streams refuse. Activation follows
+  `mtl_ddi_pre_enable_dp`/`mtl_ddi_prepare_link_retrain` order through the
+  shared training and ends with a fresh-frame LIVE-surface witness. A training
+  fallback stops locally and retries once at the trained configuration, or
+  refuses if that configuration cannot carry the stream. Stop follows
+  `intel_ddi_post_disable_dp` order with every step observed. A failed stop
+  quarantines the route and retains every lease. A busy pipe A (lit internal
+  panel) or an active DDI refuses before any write. `MtlExternalService`
+  composes hotplug handling: connect, withdraw, short-pulse revalidation and
+  retrain, and re-detect. KMS suspend and GT-reset retirement tear down the
+  route and the hotplug sources.
+
+Remaining: the periodic runtime caller of `service_mtl_external` and
+scanout publication still need to be added to the display runtime glue,
+because this slice does not own `intel_gpu.rs`. Also open: concurrent
+multi-pipe external use (DBUF/watermark repartition), UHBR (C20 MPLLA tables
+and 128b/132b), HDMI TMDS/FRL on C10/C20, MST, DSC/FEC, audio, lane
+reversal, TBT-alt tunnels, pin-assignment-D lane-0 ownership, a VBT
+legacy-port source, the PW_2/PW_A fuse-distribution waits, per-iteration
+source pattern/level updates during training, and PSR2/panel replay (worker
+D). Native fixtures cover these paths. They are not physical Type-C, sink or
+visible-pixel acceptance.
+
+New native tests: `drivers/gpu/intel_gpu_xelpg` (4),
+`drivers/gpu/intel_gpu_xelpg_tc` (8), `drivers/gpu/intel_gpu_xelpg_hpd` (7),
+`drivers/gpu/intel_gpu_xelpg_external` (8) and `drivers/gpu/intel_gpu_aux`
+(1). The existing `smoke_port_register_map`, `smoke_mtl_modeset_ddi_a_full_run`,
+`smoke_mtl_failclosed_powered_ddi_current_and_allones_refusal` and
+`smoke_mtl_modeset_tc_ports_refuse_unqualified_route` fixtures were updated
+for the corrected source values or the larger port set.
