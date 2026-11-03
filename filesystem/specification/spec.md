@@ -1459,13 +1459,24 @@ caller can distinguish policy exhaustion from exhausted backing storage.
 `FsError::FileTooLarge` is a size past what the filesystem can represent
 (`s_maxbytes`: `inode_newsize_ok`, `ext4_insert_range`) and maps to Linux
 `EFBIG`, distinct from a malformed range (`InvalidData`/`EINVAL`).
+`FsError::ArgumentListTooLong` is a well-formed caller-supplied list or record
+longer than the interface accepts and maps to Linux `E2BIG` (7 on every
+architecture, `include/uapi/asm-generic/errno-base.h`) — for example an Xe
+user-extension chain past `MAX_USER_EXTENSIONS`
+(`xe_bo.c::gem_create_user_extensions`,
+`xe_exec_queue.c::__exec_queue_user_extensions`). It stays distinct from
+`InvalidData`/`EINVAL`, a malformed request. Every `FsError` → errno
+translator in the syscall layer (the direct and relayed ioctl paths, open/
+create, copy, unlink/rmdir/rename, xattr, metadata, mount, quota) and the
+ALSA PCM translator pass it through as `E2BIG`; a FUSE daemon's `-E2BIG`
+reply maps to it.
 `FsError::OperationNotPermitted` represents an operation prohibited by object
 state and maps to Linux `EPERM`; it remains distinct from access-mode or
 credential denial (`PermissionDenied`/`EACCES`) and a read-only filesystem
 (`ReadOnly`/`EROFS`). Memfd seal violations use this variant.
 Device ioctl implementations may also return `BadAddress` (`EFAULT`),
-`OutOfMemory` (`ENOMEM`), `NotImplemented` (`ENOSYS`), and `AlreadyExists`
-(`EEXIST`). These remain distinct from `InvalidData` (`EINVAL`) and
+`OutOfMemory` (`ENOMEM`), `NotImplemented` (`ENOSYS`), `AlreadyExists`
+(`EEXIST`), and `ArgumentListTooLong` (`E2BIG`). These remain distinct from `InvalidData` (`EINVAL`) and
 `Unsupported`, whose direct-ioctl meaning is an unknown command (`ENOTTY`), so
 Linux UAPI error precedence survives the `FileOps` boundary.
 

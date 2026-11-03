@@ -2134,6 +2134,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     // reporting a missing qgroup.
                     ctx.set_return(errno_ret(ENOTCONN));
                 }
+                Some(Err(narf_filesystem::FsError::ArgumentListTooLong)) => {
+                    ctx.set_return(errno_ret(E2BIG));
+                }
                 _ => ctx.set_return(errno_ret(EINVAL)),
             }
         }
@@ -2167,6 +2170,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
             ctx.set_return(errno_ret(EPERM));
+        }
+        // E2BIG: a well-formed request past an interface bound, e.g. an Xe
+        // user-extension chain longer than MAX_USER_EXTENSIONS. Without this
+        // arm it would fold into the blanket -EINVAL below.
+        Err(narf_filesystem::FsError::ArgumentListTooLong) => {
+            ctx.set_return(errno_ret(E2BIG));
         }
         Err(narf_filesystem::FsError::NotFound)
             if matches!(

@@ -2053,6 +2053,7 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::OutOfMemory => 12,
                         narf_filesystem::FsError::QuotaExceeded => 122,
                         narf_filesystem::FsError::FileTooLarge => 27, // EFBIG
+                        narf_filesystem::FsError::ArgumentListTooLong => 7, // E2BIG
                         // ENOTCONN. No `open` path produces it today — it is
                         // the qgroup ioctls' answer for "quotas are off" — but
                         // translating it truthfully costs nothing and is
@@ -3947,6 +3948,7 @@ fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,
         FsError::QuotaExceeded => -EDQUOT,
         FsError::Io(_) => -EIO,
+        FsError::ArgumentListTooLong => -E2BIG,
         _ => -EPERM,  // `if (!dir->i_op->unlink)`
     };
     code as u64
@@ -3977,6 +3979,7 @@ fn bind_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::PermissionDenied => -EPERM,
         FsError::ReadOnly => -EROFS,
         FsError::Busy => -EBUSY,
+        FsError::ArgumentListTooLong => -E2BIG,
         // do_loopback's `err = -EINVAL` default: a source that resolves but
         // may not be bound.
         _ => -EINVAL,
@@ -4002,6 +4005,7 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,  // from ->rmdir
         FsError::QuotaExceeded => -EDQUOT,  // ditto
         FsError::Io(_) => -EIO,
+        FsError::ArgumentListTooLong => -E2BIG,
         FsError::Unsupported => -EPERM,  // `if (!dir->i_op->rmdir)`
         _ => -EPERM,
     };
@@ -4036,6 +4040,7 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::SymlinkLoop => -ELOOP,
         FsError::NoSpace => -ENOSPC,
         FsError::Io(_) => -EIO,
+        FsError::ArgumentListTooLong => -E2BIG,
         // "everything else → EPERM", per the doc comment above.
         _ => -EPERM,
     };
@@ -5028,6 +5033,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::OutOfMemory => 12,
         narf_filesystem::FsError::QuotaExceeded => 122,
         narf_filesystem::FsError::FileTooLarge => 27, // EFBIG
+        narf_filesystem::FsError::ArgumentListTooLong => 7, // E2BIG
         // ENOTCONN — see `FsError::NotConnected`.
         narf_filesystem::FsError::NotConnected => 107,
         narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun => 32,
@@ -7778,6 +7784,7 @@ fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
         FsError::QuotaExceeded => XE_DQUOT,
         FsError::InvalidData => XE_INVAL,
         FsError::ReadOnly => XE_ROFS,
+        FsError::ArgumentListTooLong => XE_2BIG,
         _ => XE_IO,
     })
 }

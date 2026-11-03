@@ -976,6 +976,7 @@ fn errno_to_fs_error(neg_errno: i32) -> FsError {
     match -neg_errno {
         1 => FsError::OperationNotPermitted,  // EPERM
         2 => FsError::NotFound,               // ENOENT
+        7 => FsError::ArgumentListTooLong,    // E2BIG
         13 => FsError::PermissionDenied,      // EACCES
         11 | 16 | 17 | 39 => FsError::Busy,   // EAGAIN / EBUSY / EEXIST / ENOTEMPTY
         20 | 21 | 36 => FsError::InvalidPath, // ENOTDIR / EISDIR / ENAMETOOLONG

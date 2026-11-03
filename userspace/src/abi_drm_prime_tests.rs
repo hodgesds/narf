@@ -529,3 +529,77 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_drm_virtgpu_execbuffer_out_fence_emfile_before_submit
 );
+
+/// `DRM_IOCTL_XE_GEM_CREATE`: `_IOWR('d', 0x41, struct drm_xe_gem_create)`,
+/// a 56-byte payload.
+const DRM_IOCTL_XE_GEM_CREATE: u64 = 0xC038_6441;
+
+/// A render node whose driver refuses every ioctl with one fixed `FsError`,
+/// so only the syscall layer's `FsError` → errno translation is observed.
+struct RefusingRenderNode(narf_filesystem::FsError);
+impl FileOps for RefusingRenderNode {
+    fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+        let n = b.len();
+        Box::pin(async move { Ok(n) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
+    }
+    fn as_drm_render_index(&self) -> Option<u32> {
+        Some(0)
+    }
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        Err(self.0)
+    }
+}
+
+// A driver's E2BIG reaches userspace as -E2BIG. Xe's GEM_CREATE returns it for
+// an extension chain past MAX_USER_EXTENSIONS (xe_bo.c::
+// gem_create_user_extensions); before FsError could carry it the driver
+// answered -EINVAL, and an unmapped variant would still fold into the direct
+// ioctl path's blanket -EINVAL. InvalidData is the control: still -EINVAL.
+fn smoke_abi_drm_driver_e2big_reaches_userspace() -> TestResult {
+    with_setup(|| {
+        for (error, errno, what) in [
+            (
+                narf_filesystem::FsError::ArgumentListTooLong,
+                E2BIG,
+                "a driver's ArgumentListTooLong must reach userspace as -E2BIG",
+            ),
+            (
+                narf_filesystem::FsError::InvalidData,
+                EINVAL,
+                "a driver's InvalidData must stay -EINVAL",
+            ),
+        ] {
+            let render_fd =
+                install_ops(Arc::new(RefusingRenderNode(error))).ok_or("install render node")?;
+            let mut request = [0u8; 56];
+            let r = call(
+                Syscall::Ioctl.raw(),
+                a3(
+                    render_fd as u64,
+                    DRM_IOCTL_XE_GEM_CREATE,
+                    request.as_mut_ptr() as u64,
+                    0,
+                ),
+            );
+            if r != Some(errno) {
+                return Err(what);
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/drm_prime",
+    smoke_abi_drm_driver_e2big_reaches_userspace
+);

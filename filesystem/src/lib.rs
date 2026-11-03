@@ -778,6 +778,18 @@ pub enum FsError {
     /// Maps to Linux `EFBIG`, distinct from a range the caller got wrong
     /// (`EINVAL`).
     FileTooLarge,
+    /// A caller-supplied list or record is longer than the interface accepts.
+    /// Maps to Linux `E2BIG` (7 on every architecture,
+    /// `include/uapi/asm-generic/errno-base.h`).
+    ///
+    /// Linux uses it well beyond `execve`'s argument list: a user extension
+    /// chain past its bound (`xe_bo.c::gem_create_user_extensions`:
+    /// `if (ext_number >= MAX_USER_EXTENSIONS) return -E2BIG;`), an xattr
+    /// value over `XATTR_SIZE_MAX`, an extensible struct with a non-zero
+    /// tail. Distinct from [`FsError::InvalidData`] on purpose: `EINVAL` says
+    /// the request is malformed, `E2BIG` says it is well-formed but too long,
+    /// and callers that probe a limit branch on exactly that.
+    ArgumentListTooLong,
     /// A subsystem the operation depends on is not switched on for this
     /// filesystem. Maps to Linux `ENOTCONN`, which btrfs returns from every
     /// qgroup ioctl when quotas are disabled (`fs/btrfs/ioctl.c`:

@@ -23,6 +23,7 @@ fn metadata_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::QuotaExceeded => EDQUOT,
         narf_filesystem::FsError::ReadOnly => EROFS,
         narf_filesystem::FsError::Unsupported => EOPNOTSUPP,
+        narf_filesystem::FsError::ArgumentListTooLong => E2BIG,
         _ => EIO,
     }
 }

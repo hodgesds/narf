@@ -17,6 +17,7 @@ fn umount_errno(e: narf_filesystem::FsError) -> i64 {
         FsError::Busy => EBUSY,             // propagate_mount_busy() → -EBUSY
         FsError::PermissionDenied => EPERM, // a revoked mount handle
         FsError::OperationNotPermitted => EPERM,
+        FsError::ArgumentListTooLong => E2BIG,
         _ => EINVAL,
     }
 }
