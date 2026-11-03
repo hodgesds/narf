@@ -137,7 +137,14 @@ pub(super) fn request_geometry(
                 } else if has_ar9285 {
                     // AR9285 has no 5 GHz path.
                     return Err(Error::Profile);
-                } else if wide.is_none() && !geometry.is_5ghz() {
+                } else if wide.is_some() {
+                    return Err(Error::Profile);
+                } else if let Some(reset) =
+                    super::ar9280_owner::transition(geometry.control(), generation)
+                {
+                    // The dual-band AR9280 owner (either band, 20 MHz).
+                    Box::pin(reset)
+                } else if !geometry.is_5ghz() {
                     // The chip-generic AR9287 owner (no HT40 owner exists).
                     Box::pin(
                         super::ar9287_owner::transition(geometry.control(), generation)

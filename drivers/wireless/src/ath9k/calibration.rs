@@ -92,6 +92,19 @@ impl Permission {
             && ceiling <= self.ceiling
             && ceiling >= report.max_power_half_dbm
     }
+    /// Current dual-band permission for an AR9280 report whose signed
+    /// `N80A` grant lowered the host ceiling.
+    pub(super) fn allows_ar9280(self, report: &ar9280::Report, ceiling: u8) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == self.frequency
+            && ceiling <= self.ceiling
+            && ceiling >= report.max_power_half_dbm
+    }
+    /// `current_in` under the dual-band (`from_domain_dual`) rule.
+    pub(super) fn current_dual_in(self, domain: &RegulatoryDomain) -> bool {
+        Self::from_domain_dual(domain, self.frequency)
+            .is_ok_and(|p| p.country == self.country && p.ceiling >= self.ceiling)
+    }
     /// Same country and frequency with the given (lower) signed ceiling.
     pub(super) fn with_ceiling(self, ceiling: u8) -> Self {
         Self {
@@ -120,7 +133,6 @@ impl Permission {
     /// or a 20 MHz 5 GHz channel of `phy::ar9280::channel_5ghz`. The same
     /// span rule applies, so a DFS, NO_IR or indoor-only rule refuses the
     /// channel (this station never radiates where it may only listen).
-    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     pub(super) fn from_domain_dual(
         domain: &RegulatoryDomain,
         frequency: u16,

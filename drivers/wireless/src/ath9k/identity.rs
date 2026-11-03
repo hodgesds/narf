@@ -195,6 +195,13 @@ fn read_eeprom_word(
 }
 
 fn reset(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
+    reset_with(io, false)
+}
+
+/// Power-on reset finished by `hw.c::ath9k_hw_set_reset`: WARM
+/// (`AR_RTC_RC_MAC_WARM`), or with `cold` also `AR_RTC_RC_MAC_COLD`, the
+/// type `ath9k_hw_chip_reset` always selects for a closed-loop AR9280.
+fn reset_with(io: &mut impl RegisterIo, cold: bool) -> Result<(), BringUpError> {
     if io.read32(AR_SREV) == u32::MAX {
         return Err(BringUpError::DeviceGone);
     }
@@ -211,7 +218,7 @@ fn reset(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
     io.write32(AR_RTC_FORCE_WAKE, 3);
     let timeout = io.read32(AR_INTR_SYNC_CAUSE) & 0x3000;
     io.write32(AR_RC, if timeout != 0 { 0x101 } else { 1 });
-    io.write32(AR_RTC_RC, 1);
+    io.write32(AR_RTC_RC, if cold { 3 } else { 1 });
     io.delay_us(100);
     io.write32(AR_RTC_RC, 0);
     io.wait(AR_RTC_RC, 3, 0)?;
@@ -224,7 +231,6 @@ fn reset(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
 /// followed by the forced `hw.c::ath9k_set_power_sleep` FULL_SLEEP entry:
 /// STA_ID1 PWR_SAV, RTC force-wake clear, AR_RC AHB|HOSTIF held in reset and
 /// the active-low RTC reset asserted. Resume needs a full power-on reset.
-#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn disable_and_sleep(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
     disable_and_sleep_with_pcie(io, None)
 }
@@ -233,13 +239,24 @@ fn disable_and_sleep_with_pcie(
     io: &mut impl RegisterIo,
     pcie_xe2: Option<bool>,
 ) -> Result<(), BringUpError> {
+    disable_and_sleep_with(io, false, |io| match pcie_xe2 {
+        Some(xe2) => super::pcie_pm::configure(io, true, xe2, true),
+        None => Ok(()),
+    })
+}
+
+/// `disable_and_sleep` with the reset type (`cold`) and the D3
+/// `ath9k_hw_configpcipowersave(ah, true)` step of the chip.
+fn disable_and_sleep_with<R: RegisterIo>(
+    io: &mut R,
+    cold: bool,
+    pcie: impl FnOnce(&mut R) -> Result<(), BringUpError>,
+) -> Result<(), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
-    reset(io)?;
-    if let Some(xe2) = pcie_xe2 {
-        super::pcie_pm::configure(io, true, xe2, true)?;
-    }
+    reset_with(io, cold)?;
+    pcie(io)?;
     let id1 = io.read32(AR_STA_ID1);
     let wake = io.read32(AR_RTC_FORCE_WAKE);
     let rtc = io.read32(AR_RTC_RESET);
@@ -260,6 +277,19 @@ pub(super) fn sleep(
     pcie_xe2: Option<bool>,
 ) -> Result<(), BringUpError> {
     disable_and_sleep_with_pcie(&mut Registers::new(mmio, cap), pcie_xe2)
+}
+
+/// AR9280 `ath_pci_suspend`: COLD reset (`ath9k_hw_chip_reset`), the
+/// AR9280 D3 PCIe word (`pcie_pm::configure_ar9280(.., true)`, ASPM parts
+/// only) and FULL_SLEEP.
+pub(super) fn sleep_ar9280(
+    mmio: narf_bus::MmioRegion,
+    cap: Cap<BusDeviceCap, Write>,
+    aspm: bool,
+) -> Result<(), BringUpError> {
+    disable_and_sleep_with(&mut Registers::new(mmio, cap), true, |io| {
+        super::pcie_pm::configure_ar9280(io, aspm, true)
+    })
 }
 
 fn decode_identity(
@@ -361,7 +391,9 @@ pub(in crate::ath9k) fn identify_chip(
         Some(revision) if revision.chip == expected => revision,
         _ => return Err(BringUpError::UnsupportedRevision),
     };
-    reset(io)?;
+    // AR9280 (closed loop; open-loop maps are refused at preparation) takes
+    // the COLD reset every `ath9k_hw_reset` gives it.
+    reset_with(io, expected == Chip::Ar9280)?;
     let map = expected.eeprom_map();
     let magic = read_eeprom_word(io, 0, EEPROM_WINDOW_WORDS)?;
     let mut image = alloc::vec![0u8; map.bytes()].into_boxed_slice();

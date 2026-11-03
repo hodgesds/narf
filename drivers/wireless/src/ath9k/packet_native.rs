@@ -11,12 +11,15 @@ use narf_capabilities::{Cap, Write};
 mod live_calibration;
 enum InstalledPower {
     Twenty([(u64, u32); 7]),
+    /// AR9280 closed-loop def rate registers (`phy::ar9280::power::plan`).
+    Rates(alloc::vec::Vec<(u64, u32)>),
     Forty(super::calibration::wide::WideReport),
 }
 impl InstalledPower {
     fn registers(&self) -> &[(u64, u32)] {
         match self {
             Self::Twenty(powers) => powers,
+            Self::Rates(powers) => powers,
             Self::Forty(actual) => &actual.powers.registers,
         }
     }
@@ -34,6 +37,17 @@ pub(super) enum Calibrated {
         image: alloc::boxed::Box<[u8]>,
         /// `ath_ani_calibrate` NF/IQ/long-calibration state of this
         /// generation. A regular mutex: the NF load may poll for 22.2 ms.
+        periodic: narf_lib::mutex::Mutex<super::calibration::ar9287::Periodic>,
+    },
+    /// AR9280 (either band): the signed `N80A` per-channel record, the
+    /// band's MAC profile, the prepared tune (5 GHz synthesizer readback)
+    /// and the AR9002 periodic owner with the band's NF limits.
+    Ar9280 {
+        report: super::calibration::ar9280::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        profile: super::mac::Profile,
+        tune: super::phy::Tune,
+        image: alloc::boxed::Box<[u8]>,
         periodic: narf_lib::mutex::Mutex<super::calibration::ar9287::Periodic>,
     },
 }
@@ -69,11 +83,34 @@ impl Calibrated {
         match self {
             Self::Ar9285(report) => report.frequency_mhz,
             Self::Ar9287 { report, .. } => report.frequency_mhz,
+            Self::Ar9280 { report, .. } => report.frequency_mhz,
+        }
+    }
+    /// `AR_PHY_SYNTH_CONTROL & 0x3fffffff` the channel preparation wrote
+    /// (`ar9002_hw_set_channel`).
+    fn synth(&self, center: u16) -> u32 {
+        match self {
+            Self::Ar9280 {
+                tune: super::phy::Tune::Five { frequency, frac_n },
+                ..
+            } => super::phy::synth_5ghz(*frequency, *frac_n).0,
+            _ => 0x3000_0000 | (u32::from(center) * 0x10000 / 15),
         }
     }
     /// Current host permission for the calibrated program; AR9287 also
     /// re-proves its signed record and the signed ceiling under it.
     fn permitted(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> bool {
+        if let Self::Ar9280 { report, grant, .. } = self {
+            // Dual-band span rule: a DFS, NO_IR or indoor-only rule refuses.
+            let Ok(permission) =
+                super::calibration::Permission::from_domain_dual(domain, report.frequency_mhz)
+            else {
+                return false;
+            };
+            return grant
+                .invoke(|| Ok(grant.ceiling(permission.budget())))
+                .is_ok_and(|ceiling| permission.allows_ar9280(report, ceiling));
+        }
         let Ok(permission) =
             super::calibration::Permission::from_domain_at(domain, self.frequency_mhz())
         else {
@@ -84,6 +121,7 @@ impl Calibrated {
             Self::Ar9287 { report, grant, .. } => grant
                 .invoke(|| Ok(grant.ceiling(permission.budget())))
                 .is_ok_and(|ceiling| permission.allows_ar9287(report, ceiling)),
+            Self::Ar9280 { .. } => false,
         }
     }
 }
@@ -302,6 +340,89 @@ impl Native {
             rf_silent,
         ))
     }
+    /// # Safety
+    /// Caller retains the sole AR9280 function and exact mapped BAR after
+    /// `phy::ar9280::prepare` for `tune` and `calibration::ar9280` ran under
+    /// `grant`'s ceiling for `report`'s primary; no packet DMA was published.
+    /// `channel_mask` (`channels::bit`) names the primaries of both bands
+    /// whose signed per-channel `N80A` record and closed-loop plan the owner
+    /// verified; a cold retune re-loads the target record before retiring.
+    /// `overlap` is the live `AR_PHY_TPCRG5` overlap below EEPROM minor 2.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn new_ar9280(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        report: super::calibration::ar9280::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        identity: &super::identity::Identity,
+        image: &[u8],
+        profile: super::mac::Profile,
+        tune: super::phy::Tune,
+        overlap: u8,
+        channel_mask: u64,
+    ) -> Result<Self, Error> {
+        let request = grant.request();
+        let clock = if tune.is_5ghz() {
+            super::mac::Clock::Fast5g
+        } else {
+            super::mac::Clock::Ofdm2g
+        };
+        let primary = super::channels::bit(report.frequency_mhz).ok_or(Error::Packet)?;
+        if device.id.vendor != 0x168c
+            || !matches!(
+                device.id.device,
+                super::phy::ar9280::DEVID_PCI | super::phy::ar9280::DEVID_PCIE
+            )
+            || request.device != device.id.device
+            || request.frequency_mhz != report.frequency_mhz
+            || tune.is_wide()
+            || tune.center() != report.frequency_mhz
+            || tune.is_5ghz() != report.five_ghz
+            || image.len() != super::chips::MAP_DEF.bytes()
+            || image[18..20] != [profile.rx_chainmask, profile.tx_chainmask]
+            || identity.rx_chainmask != profile.rx_chainmask
+            || identity.tx_chainmask != profile.tx_chainmask
+            || report.rx_chainmask != profile.rx_chainmask
+            || profile.txbuf != 0x700
+            || profile.clock != clock
+            || channel_mask >> super::channels::CHANNEL_BITS != 0
+            || channel_mask & (1 << primary) == 0
+        {
+            return Err(Error::Packet);
+        }
+        let rf_silent = rf_silent(image)?;
+        // The exact closed-loop rate registers calibration programmed under
+        // the signed ceiling are retained for every physical readback.
+        let plan = super::phy::ar9280::power::plan(
+            identity,
+            image,
+            tune,
+            report.max_power_half_dbm,
+            overlap,
+        )
+        .map_err(|_| Error::Packet)?;
+        let powers = plan.registers[..plan.register_count].to_vec();
+        Ok(Self::assemble(
+            device,
+            cap,
+            bar,
+            Calibrated::Ar9280 {
+                report,
+                grant,
+                profile,
+                tune,
+                image: image.into(),
+                periodic: narf_lib::mutex::Mutex::new(super::calibration::ar9280::periodic(
+                    &report,
+                    narf_time::monotonic_ns() / 1_000_000,
+                )),
+            },
+            channel_mask,
+            Some(InstalledPower::Rates(powers)),
+            rf_silent,
+        ))
+    }
     /// Discover, program and install one MSI vector while delivery stays
     /// disabled. Any failure leaves the owner on scheduled polling; a vector
     /// whose source cannot be proven disabled stays quarantined.
@@ -416,8 +537,7 @@ impl Native {
                 Ok(unsafe { self.bar.read32(register) })
             };
             let geometry = self.geometry();
-            if read(0x9874)? & 0x3fff_ffff
-                != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
+            if read(0x9874)? & 0x3fff_ffff != self.calibrated.synth(geometry.center())
                 || read(0x9804)? & 0x7ff != geometry.turbo()
             {
                 return Err(Error::Descriptor);
@@ -681,19 +801,26 @@ impl Port for Native {
     fn mac_clock(&self) -> super::mac::Clock {
         match &self.calibrated {
             Calibrated::Ar9285(_) => super::mac::Clock::Ofdm2g,
-            Calibrated::Ar9287 { profile, .. } => profile.clock,
+            Calibrated::Ar9287 { profile, .. } | Calibrated::Ar9280 { profile, .. } => {
+                profile.clock
+            }
         }
     }
     fn tx_chainmask(&self) -> u8 {
         match &self.calibrated {
             Calibrated::Ar9285(_) => 1,
-            Calibrated::Ar9287 { profile, .. } => profile.tx_chainmask,
+            Calibrated::Ar9287 { profile, .. } | Calibrated::Ar9280 { profile, .. } => {
+                profile.tx_chainmask
+            }
         }
     }
     fn long_calibration(&self) -> Result<Option<i32>, Error> {
-        let Calibrated::Ar9287 {
+        let (Calibrated::Ar9287 {
             image, periodic, ..
-        } = &self.calibrated
+        }
+        | Calibrated::Ar9280 {
+            image, periodic, ..
+        }) = &self.calibrated
         else {
             return Err(Error::State);
         };

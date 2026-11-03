@@ -1597,6 +1597,90 @@ reach a record: `Permission::from_domain_dual` refuses them first. Smoke
 (written, not executed):
 `smoke_ath9k_ar9280_admission_records_bind_band_channel_and_magic`.
 
+**AR9280 dual-band native station (`ar9280_enablement`).** Channel
+plumbing: `channel_width::Geometry::from_frequency_dual` adds the 20 MHz
+5 GHz primaries of `phy::ar9280::channel_5ghz` (`primary` is the IEEE
+channel, `control() = 5000 + 5 * primary`; `Geometry::new` and every HT40
+constructor stay 2.4 GHz). `Port::channel_mask` is a `u64` over
+`channels::bit`: 2.4 GHz channel `n` is bit `n - 1` (the unchanged
+AR9285/AR9287 mask) and the 25 5 GHz channels (36..64, 100..144, 149..165)
+are bits 13..37 (`CHANNEL_BITS` 38). `channels::channel`/`frequency`
+number both bands; interface scan, `set_config`, retune and
+`get_wireless_info` (a 5000 MHz band appears only when the mask has a
+5 GHz bit) use `channels::admits` and the dual-band host permission
+(`Permission::from_domain_dual`, so DFS, NO_IR and indoor-only channels are
+never offered). AR9285 and AR9287 retunes refuse a 5 GHz geometry. On
+5 GHz a probe request carries the eight OFDM rates and no DS Parameter Set
+(`mac80211 ieee80211_build_preq_ies_band`) and goes out at 6 Mbps
+(`rates::BITRATES[4]`); 2.4 GHz probes are unchanged.
+
+`ar9280_owner.rs` registers `0x0029` (`ath9k-ar9280`) and `0x002a`
+(`ath9k-ar9280e`) with the shared singleton address reservation. Probe:
+`aspm` = PCIe part with upstream ASPM (`pcie_pm::enabled`,
+`ath_pci_aspm_init`) → `identity::identify_chip(Chip::Ar9280)` (power-on,
+then the `ATH9K_RESET_COLD` `ath9k_hw_set_reset` that
+`hw.c::ath9k_hw_chip_reset` selects for a closed-loop AR9280:
+`AR_RTC_RC = WARM | COLD`) → `phy::ar9280::prepare` at 2412 MHz → the live
+`AR_PHY_TPCRG5` overlap (bits 0..3, read only below EEPROM minor 2,
+`ath9k_hw_def_set_power_cal_table`) → `admission::Facts::new_ar9280` →
+`Source::Registered.load`; a missing, unsigned or foreign channel-1 record
+parks the chip and refuses the bind. Bring-up (scheduled `Policy`
+retries): `calibration::ar9280` under
+`Permission::from_domain_dual(..).with_ceiling(Grant::ceiling(host))`, with
+`Permission::current_dual_in` and `Grant::invoke` re-checked on every poll;
+then `Native::new_ar9280` → `mac::prepare_chip` (profile
+`mac::Profile::ar9280(rx, tx, tune.is_5ghz())`, so `Clock::Fast5g` on
+5 GHz) → optional MSI → `Packet::prepare` → `station::Radio` →
+`interface::publish`. `packet_native::Calibrated::Ar9280` retains the
+report, the signed grant, the profile, the prepared `Tune`, the map and
+`calibration::ar9280::periodic`; `Native::new_ar9280` binds the PCI ID to
+the grant's device and primary, the tune/band to the report, the def map's
+rxMask/txMask to the profile and identity, the band's MAC clock, a mask
+inside `CHANNEL_BITS` that names the primary, and retains the closed-loop
+rate registers `phy::ar9280::power::plan` derives at the calibrated ceiling
+and overlap (`InstalledPower::Rates`). Every access re-proves the PCI
+capability, `Calibrated::permitted` (`from_domain_dual` +
+`Grant::invoke` + `Permission::allows_ar9280`), the synthesizer
+(`AR_PHY_SYNTH_CONTROL` from `phy::synth_5ghz` on 5 GHz, the 2.4 GHz
+formula otherwise), `AR_PHY_TURBO` and the rate registers. `mac_clock`,
+`tx_chainmask` and `long_calibration` are shared with AR9287.
+
+Retunes: `channels::request_geometry` routes a 20 MHz request in either
+band to `ar9280_owner::transition` when no AR9285 controller exists
+(HT40 fails closed). `ar9280_owner::reset` (under `CONTROL`, while the
+requesting generation is current) proves the dual-band permission at the
+target and loads the target's own `N80A` record before retiring the
+station; requires the DMA-stop proof and bus mastering off; repeats
+`identify_chip` (power-on + COLD) with identical revision, identity and
+map; runs `phy::ar9280::prepare` at the target and requires the record's
+preparation (`tune`, `ini_rows`) and the probe's live TPCRG5 overlap; then
+bumps the generation and runs the same `initialize`. Every retune,
+recovery and resume is this cold reset: Linux `ath9k_hw_do_fastcc`
+refuses the PCI AR9280 and this owner uses no fast channel change for
+either part. The mask (`admitted_mask`) is the primary plus every 2.4 GHz
+and 5 GHz primary the map's `opCapFlags` enables whose record verifies.
+Linux `serialize_regmode` (`SER_REG_MODE_ON` for the non-PCIe `0x0029`
+part on SMP, `hw.c::ath9k_hw_init_config`) is met structurally: every BAR
+access of a generation runs under `CONTROL` or the station mutex and the
+MSI handler never touches the BAR. Supervisor, periodic calibration
+(AR9002 `ar9002_hw_calibrate` with the band's NF limits, no temperature
+step) and remove follow the AR9287 owner. Suspend retires the station,
+then `identity::sleep_ar9280`: COLD reset, `pcie_pm::configure_ar9280(..,
+true)` (D3 word, ASPM parts only; `ath9k_stop` →
+`ath9k_hw_configpcipowersave(ah, true)`) and FULL_SLEEP; resume
+(`ath_pci_resume`) re-disables RETRY_TIMEOUT and spawns the reset.
+Smokes (written, not executed):
+`smoke_ath9k_ar9280_native_profile_binds_band_admission_and_chains`,
+`smoke_ath9k_dual_band_channel_bits_roundtrip`.
+
+Known AR9280 gaps: no AR9280 board has been measured, so no `N80A` record
+exists in-tree and every probe stays unadmitted until one is provisioned;
+the probe requires the channel-1 record as the initial primary (a
+5 GHz-only map cannot bind); ANI is not run; HT20/HT40 TX power and every
+HT owner are out of scope; open-loop maps stay refused; DFS, NO_IR and
+indoor-only channels are refused (no radar detection or passive-only
+handling). No physical AR9280 receipt exists.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

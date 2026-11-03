@@ -255,7 +255,8 @@ pub(super) struct Grant {
 
 pub(super) enum Source {
     /// The trusted firmware loader's record for `Facts::request().filename`.
-    /// Only the AR9287 probe (`ar9287_owner::probe`) constructs it.
+    /// Only the AR9287 and AR9280 owners (`ar9287_owner`, `ar9280_owner`)
+    /// construct it.
     Registered,
     #[cfg(feature = "kernel-test")]
     Verified {

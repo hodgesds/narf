@@ -396,3 +396,223 @@ kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar9280_admission_records_bind_band_channel_and_magic
 );
+
+/// The dual-band AR9280 native owner binds the admitted device, primary,
+/// band (tune, report and MAC clock), def-map chain masks and a
+/// `channels::bit` mask over both bands, and every access (including the
+/// AR9002 periodic calibration) stops at a revoked PCI capability.
+fn smoke_ath9k_ar9280_native_profile_binds_band_admission_and_chains() -> TestResult {
+    use crate::ath9k::{
+        calibration::ar9280::Report,
+        channels,
+        mac::{Clock, Profile},
+        packet::{Error as PacketError, Port},
+        packet_native::Native,
+        phy::{ar9280, Tune},
+    };
+    use narf_bus::{BarKind, BusAddr, BusDevice, BusDeviceCap, BusKind, MmioRegion, PcieAddr};
+    use narf_capabilities::Write;
+    let identity = ar9280::power::tests::identity(0x10);
+    let mut map = ar9280::power::tests::image(3);
+    map[18] = 3;
+    let five = Tune::Five {
+        frequency: 5180,
+        frac_n: false,
+    };
+    let prepared = ar9280::Prepared {
+        tune: five,
+        ini_writes: 560,
+    };
+    let Some(revision) = Revision::decode(0x0008_01ff) else {
+        return TestResult::Fail("AR9280 revision");
+    };
+    let Ok(facts) = Facts::new_ar9280(
+        &device(0x002a),
+        &revision,
+        &identity,
+        &prepared,
+        &map,
+        5180,
+        0,
+    ) else {
+        return TestResult::Fail("AR9280 5 GHz facts refused");
+    };
+    let Ok(grant) = load(facts.clone(), ar9280_record(&facts, 36, 0, 30), true) else {
+        return TestResult::Fail("signed 5 GHz N80A record refused");
+    };
+    let address = PcieAddr::new(0, 0, 9, 0);
+    let bus = |id: u16| BusDevice {
+        addr: BusAddr::Pcie(address),
+        id: device(id),
+        kind: BusKind::Pcie {
+            addr: address,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    let bar = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: crate::ath9k::phy::REQUIRED_BAR,
+        kind: BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let report = |frequency_mhz, five_ghz| Report {
+        country: *b"US",
+        frequency_mhz,
+        five_ghz,
+        max_power_half_dbm: 30,
+        rx_chainmask: 3,
+        iq: [Some((0, 0)), Some((0, 0))],
+        measured_noise_dbm: [Some(-112), Some(-112)],
+        noise_dbm: [Some(-112), Some(-112)],
+    };
+    let (Some(bit36), Some(bit1)) = (channels::bit(5180), channels::bit(2412)) else {
+        return TestResult::Fail("dual-band channel bits");
+    };
+    let build = |id, report: Report, profile, tune, mask: u64| {
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        cap.revoke();
+        // SAFETY: the revoked fixture capability makes every config, DMA and
+        // BAR path unreachable; no physical device is touched.
+        unsafe {
+            Native::new_ar9280(
+                bus(id),
+                cap,
+                bar,
+                report,
+                grant.clone(),
+                &identity,
+                &map,
+                profile,
+                tune,
+                0,
+                mask,
+            )
+        }
+    };
+    let profile = Profile::ar9280(3, 3, true);
+    let Ok(two) = Geometry::from_frequency(2412) else {
+        return TestResult::Fail("2.4 GHz geometry");
+    };
+    for (id, report, profile, tune, mask) in [
+        (0x002e, report(5180, true), profile, five, 1 << bit36),
+        (0x0029, report(5180, true), profile, five, 1 << bit36),
+        (0x002a, report(5180, false), profile, five, 1 << bit36),
+        (
+            0x002a,
+            report(5180, true),
+            Profile::ar9280(3, 3, false),
+            five,
+            1 << bit36,
+        ),
+        (
+            0x002a,
+            report(5180, true),
+            Profile::ar9280(1, 1, true),
+            five,
+            1 << bit36,
+        ),
+        (
+            0x002a,
+            report(2412, false),
+            profile,
+            Tune::Two(two),
+            1 << bit1,
+        ),
+        (0x002a, report(5180, true), profile, five, 1 << bit1),
+        (
+            0x002a,
+            report(5180, true),
+            profile,
+            five,
+            (1 << bit36) | (1 << 38),
+        ),
+    ] {
+        if build(id, report, profile, tune, mask).is_ok() {
+            return TestResult::Fail("AR9280 owner accepted a foreign device/band/profile/mask");
+        }
+    }
+    let mask = (1 << bit36) | (1 << bit1);
+    let Ok(native) = build(0x002a, report(5180, true), profile, five, mask) else {
+        return TestResult::Fail("admitted 5 GHz AR9280 owner refused");
+    };
+    let geometry = native.geometry();
+    if native.tx_chainmask() != 3
+        || native.mac_clock() != Clock::Fast5g
+        || native.channel_mask() != mask
+        || native.frequency_mhz() != 5180
+        || !geometry.is_5ghz()
+        || geometry.control() != 5180
+        || geometry.is_wide()
+        || native.ht_grant().is_some()
+    {
+        return TestResult::Fail("AR9280 5 GHz native profile differs");
+    }
+    if native.long_calibration() != Err(PacketError::Access)
+        || native.read(0x4020) != Err(PacketError::Access)
+        || native.master(true) != Err(PacketError::Access)
+    {
+        return TestResult::Fail("revoked AR9280 authority reached the BAR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9280_native_profile_binds_band_admission_and_chains
+);
+
+/// `channels::bit` numbers 2.4 GHz channel `n` as bit `n - 1` (the
+/// historical mask) and the 25 AR9280 5 GHz channels as bits 13..37;
+/// numbering, frequency and the 5 GHz `Geometry` round-trip.
+fn smoke_ath9k_dual_band_channel_bits_roundtrip() -> TestResult {
+    use crate::ath9k::channels;
+    let mut seen = 0u64;
+    for bit in 0..channels::CHANNEL_BITS {
+        let Some(frequency) = channels::bit_frequency(bit) else {
+            return TestResult::Fail("channel bit without a primary");
+        };
+        let Ok(channel) = channels::channel(frequency) else {
+            return TestResult::Fail("primary without an IEEE channel");
+        };
+        let Ok(geometry) = Geometry::from_frequency_dual(frequency) else {
+            return TestResult::Fail("primary without a 20 MHz geometry");
+        };
+        if channels::bit(frequency) != Some(bit)
+            || channels::frequency(u32::from(channel)) != Ok(frequency)
+            || geometry.control() != frequency
+            || geometry.center() != frequency
+            || geometry.primary() != channel
+            || geometry.is_5ghz() != (frequency >= 5000)
+            || !channels::admits(1 << bit, frequency)
+        {
+            return TestResult::Fail("dual-band channel numbering does not round-trip");
+        }
+        seen |= 1 << bit;
+    }
+    if seen != (1 << 38) - 1
+        || channels::bit_frequency(38).is_some()
+        || channels::bit(2412) != Some(0)
+        || channels::bit(2472) != Some(12)
+        || channels::bit(5180) != Some(13)
+        || channels::bit(5825) != Some(37)
+    {
+        return TestResult::Fail("dual-band channel mask layout differs");
+    }
+    // Non-channels: 2484 (channel 14), 5 GHz off-raster, 5170, 5260+2.
+    for frequency in [2484, 2417 + 1, 5170, 5185, 5262, 5845, 4920] {
+        if channels::bit(frequency).is_some() || Geometry::from_frequency_dual(frequency).is_ok() {
+            return TestResult::Fail("a non-channel received a mask bit or geometry");
+        }
+    }
+    for channel in [0, 14, 34, 68, 96, 148, 169, 255, 1 << 20] {
+        if channels::frequency(channel).is_ok() {
+            return TestResult::Fail("a non-channel number mapped to a frequency");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_dual_band_channel_bits_roundtrip
+);
