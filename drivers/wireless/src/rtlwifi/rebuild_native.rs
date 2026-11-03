@@ -12,6 +12,7 @@ impl
         match self.power_state.load(Ordering::Acquire) {
             1 => return Ok(()),
             0 => {}
+            3 => self.wow_resume_prologue().await?,
             _ => return Err(Error::State),
         }
         let firmware = self.firmware();
@@ -41,6 +42,25 @@ impl
             .native()
             .idle_aspm(PCIE_ASPM.load(Ordering::Acquire))
             .await;
+        Ok(())
+    }
+    fn wowlan_image(&self) -> Result<Vec<u8>, Error> {
+        if self.firmware().device_id() != super::super::regs::RTL_DEV_8821AE {
+            return Err(Error::State);
+        }
+        super::super::firmware_transport::registered_wowlan_image()
+            .map_err(|e| Error::Radio(super::super::prepare::Error::Access(e)))
+    }
+    fn wow_parked(&self, mailbox: super::super::rtl8821ae::h2c::Mailbox) -> Result<(), Error> {
+        if self.firmware().device_id() != super::super::regs::RTL_DEV_8821AE
+            || self
+                .power_state
+                .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(Error::State);
+        }
+        *self.wow_mailbox.lock() = Some(mailbox);
         Ok(())
     }
     async fn rebuild(
@@ -88,6 +108,52 @@ impl
         )
         .await?;
         firmware.native().arm_msi();
+        Ok(())
+    }
+}
+impl NativeEnvironment {
+    /// `_rtl8821ae_wowlan_initialize_adapter` up to its disable commands,
+    /// over the parked (bus-mastering-off) control window: record
+    /// `_rtl8821ae_get_wakeup_reason`, then `set_fw_wowlan_mode(false)` and
+    /// `set_fw_remote_wake_ctrl_cmd(0)` continuing the armed firmware's H2C
+    /// boxes. The PCIe DMA-hang patch, TRX descriptor addresses and RX DMA
+    /// release that follow in Linux serve its warm `simple_initialize`
+    /// path; here the caller continues with the cold card-disable/enable
+    /// rebuild (fresh rings), so they are not issued. `REG_FTISR` is read
+    /// by Linux for a debug print only. The armed state is consumed even on
+    /// error (the cold disable then resets the 8051 regardless).
+    async fn wow_resume_prologue(&self) -> Result<(), Error> {
+        use super::super::{firmware_transport::Io as _, prepare, rtl8821ae::wow};
+        let mut mailbox = self.wow_mailbox.lock().take().unwrap_or_default();
+        self.power_state.store(0, Ordering::Release);
+        let io = self
+            .firmware()
+            .native()
+            .parked_control()
+            .map_err(prepare::Error::Access)?;
+        let reason = wow::wake_reason(
+            io.read8(wow::REG_MCUTST_WOWLAN)
+                .map_err(prepare::Error::Access)?,
+        );
+        if let Some(device) = self.device.lock().upgrade() {
+            *device.lifecycle.wakeup.lock() = Some(reason);
+        }
+        let disabled = async {
+            mailbox
+                .fill(&io, wow::H2C_WO_WLAN, &wow::wowlan_mode(false))
+                .await?;
+            mailbox
+                .fill(
+                    &io,
+                    wow::H2C_REMOTE_WAKE_CTRL,
+                    &wow::remote_wake_ctrl(false),
+                )
+                .await
+        }
+        .await;
+        // A firmware that never takes the disable commands is still reset
+        // by the cold card-disable that follows.
+        let _ = disabled;
         Ok(())
     }
 }

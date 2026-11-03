@@ -341,3 +341,176 @@ pub fn wake_reason(fw_reason: u8) -> WakeReason {
         other => WakeReason::Unknown(other),
     }
 }
+
+/// `rtl8821ae/reg.h` registers of the WoWLAN card-disable branch.
+pub const REG_APS_FSMCO: u16 = 0x0004;
+pub const REG_SYS_CLKR: u16 = 0x0008;
+pub const REG_SYS_FUNC_EN: u16 = 0x0002;
+pub const REG_RSV_CTRL: u16 = 0x001c;
+pub const REG_CR: u16 = 0x0100;
+pub const REG_RXDMA_CONTROL: u16 = 0x0286;
+pub const REG_PCIE_CTRL_REG: u16 = 0x0300;
+pub const REG_TXPKT_EMPTY: u16 = 0x041a;
+pub const REG_TXPKTBUF_WMAC_LBK_BF_HD: u16 = 0x045d;
+pub const REG_TXPAUSE: u16 = 0x0522;
+pub const REG_DUAL_TSF_RST: u16 = 0x0553;
+pub const REG_SCH_TXCMD: u16 = 0x05f8;
+/// `LAST_ENTRY_OF_TX_PKT_BUFFER_8821A`.
+pub const LAST_ENTRY_OF_TX_PKT_BUFFER: u8 = 255;
+/// `rtl8821ae_card_disable`: `_rtl8821ae_dynamic_rqpn(hw, 0xE0, 0x3,
+/// 0x80c20d0d)` reserves 30 pages for the whole-packet upload.
+pub const WOW_BOUNDARY: u8 = 0xe0;
+pub const WOW_NPQ_RQPN: u16 = 0x0003;
+pub const WOW_RQPN: u32 = 0x80c2_0d0d;
+
+/// `_rtl8821ae_llt_write` (`POLLING_LLT_THRESHOLD` 20).
+fn llt_write(io: &impl Io, address: u8, data: u8) -> Result<(), Error> {
+    io.write32(
+        super::llt::REG_LLT_INIT,
+        super::llt::llt_word(address, data),
+    )?;
+    for _ in 0..=21 {
+        let value = io.read32(super::llt::REG_LLT_INIT)?;
+        if value == u32::MAX {
+            return Err(Error::Access(
+                crate::rtlwifi::firmware_transport::Error::Gone,
+            ));
+        }
+        if (value >> 30) & 3 == 0 {
+            return Ok(());
+        }
+    }
+    Err(Error::LltTimeout)
+}
+
+/// `_rtl8821ae_init_llt_table(hw, boundary)`.
+pub fn init_llt(io: &impl Io, boundary: u8) -> Result<(), Error> {
+    for i in 0..boundary - 1 {
+        llt_write(io, i, i + 1)?;
+    }
+    llt_write(io, boundary - 1, 0xff)?;
+    for i in boundary..LAST_ENTRY_OF_TX_PKT_BUFFER {
+        llt_write(io, i, i + 1)?;
+    }
+    llt_write(io, LAST_ENTRY_OF_TX_PKT_BUFFER, boundary)
+}
+
+/// `_rtl8821ae_dynamic_rqpn`. Linux only logs the TX FIFO / scheduler /
+/// RX DMA polling timeouts and continues; so does this. An LLT failure
+/// returns the error before RQPN, TX pause and PCIe DMA are released
+/// (Linux returns `false` there too, leaving them as they are).
+pub async fn dynamic_rqpn(
+    io: &impl Io,
+    boundary: u8,
+    npq_rqpn: u16,
+    rqpn: u32,
+) -> Result<(), Error> {
+    // 1. stop PCIe DMA; 2. TXFF empty (0x41a[10:0] == 0x7ff, 1000 x 100 us).
+    io.write8(REG_PCIE_CTRL_REG + 1, 0xfe)?;
+    for _ in 0..1000 {
+        if (io.read32(REG_TXPKT_EMPTY - 2)? >> 16) & 0x07ff == 0x07ff {
+            break;
+        }
+        io.delay_us(100).await;
+    }
+    // 3. TX pause; 4. TX state machine (500 x 100 us).
+    io.write8(REG_TXPAUSE, 0xff)?;
+    for _ in 0..500 {
+        if io.read8(REG_SCH_TXCMD)? == 0 {
+            break;
+        }
+        io.delay_us(100).await;
+    }
+    // 5./6. stop RX DMA and wait for RXDMA_IDLE (100 x 10 us).
+    let tmp = io.read8(REG_RXDMA_CONTROL)?;
+    io.write8(REG_RXDMA_CONTROL, tmp | 1 << 2)?;
+    for _ in 0..100 {
+        let tmp = io.read8(REG_RXDMA_CONTROL)?;
+        io.delay_us(10).await;
+        if tmp & 1 << 1 != 0 {
+            break;
+        }
+    }
+    // 7. reset BB; 8. reset TRX MAC; 9. MAC security engine off.
+    let tmp = io.read8(REG_SYS_FUNC_EN)?;
+    io.write8(REG_SYS_FUNC_EN, tmp & !1)?;
+    io.write8(REG_CR, 0x00)?;
+    io.delay_us(1000).await;
+    let tmp = io.read8(REG_CR + 1)?;
+    io.write8(REG_CR + 1, tmp & !(1 << 1))?;
+    // 10. DD-Tim circuit; 11. security engine on; 12. TRX MAC; 13. BB.
+    let tmp = io.read8(REG_DUAL_TSF_RST)?;
+    io.write8(REG_DUAL_TSF_RST, tmp | 1 << 5)?;
+    let tmp = io.read8(REG_CR + 1)?;
+    io.write8(REG_CR + 1, tmp | 1 << 1)?;
+    io.write8(REG_CR, 0xff)?;
+    io.delay_us(1000).await;
+    let tmp = io.read8(REG_SYS_FUNC_EN)?;
+    io.write8(REG_SYS_FUNC_EN, tmp | 1)?;
+    // 14..16. beacon head pages and WMAC loopback boundary.
+    io.write8(super::llt::REG_TDECTRL + 1, boundary)?;
+    io.write8(super::llt::REG_TXPKTBUF_BCNQ_BDNY, boundary)?;
+    io.write8(super::llt::REG_TXPKTBUF_MGQ_BDNY, boundary)?;
+    io.write8(REG_TXPKTBUF_WMAC_LBK_BF_HD, boundary)?;
+    io.write16(super::llt::REG_TRXFF_BNDY, u16::from(boundary))?;
+    // 17. LLT; 18. RQPN.
+    init_llt(io, boundary)?;
+    io.write16(super::llt::REG_RQPN_NPQ, npq_rqpn)?;
+    io.write32(super::llt::REG_RQPN, rqpn)?;
+    // 19. release TX pause; 20./21. release PCIe DMA and RX DMA.
+    io.write8(REG_TXPAUSE, 0x00)?;
+    io.write8(REG_PCIE_CTRL_REG + 1, 0x00)?;
+    let tmp = io.read8(REG_RXDMA_CONTROL)?;
+    io.write8(REG_RXDMA_CONTROL, tmp & !(1 << 2))?;
+    Ok(())
+}
+
+/// `rtl8821ae_card_disable` WoWLAN `<3> Hw Configurations` RX half:
+/// stop RX DMA and wait (100 x 10 us) for RXDMA_IDLE. Linux continues on a
+/// timeout; here the idle bit is the host RX retirement proof, so a timeout
+/// is an error and the caller takes the cold path.
+pub async fn drain_rx_dma(io: &impl Io) -> Result<(), Error> {
+    io.write8(REG_RXDMA_CONTROL, 1 << 2)?;
+    let mut tmp = io.read8(REG_RXDMA_CONTROL)?;
+    let mut count = 0;
+    while tmp & 1 << 1 == 0 && count < 100 {
+        count += 1;
+        io.delay_us(10).await;
+        tmp = io.read8(REG_RXDMA_CONTROL)?;
+    }
+    if tmp & 1 << 1 == 0 {
+        return Err(Error::PacketTimeout);
+    }
+    Ok(())
+}
+
+/// `rtl8821ae_card_disable` after `reset_trx_ring`: `REG_APS_FSMCO + 1 =
+/// 0`, (PME status, cleared by the PCI wake arm), `SYS_CLKR |= BIT(3)`,
+/// `RSV_CTRL = 0x20` then `0x60` (8051 not reset by PERST).
+pub fn hold_mcu(io: &impl Io) -> Result<(), Error> {
+    io.write8(REG_APS_FSMCO + 1, 0)?;
+    let tmp = io.read8(REG_SYS_CLKR)?;
+    io.write8(REG_SYS_CLKR, tmp | 1 << 3)?;
+    io.write8(REG_RSV_CTRL, 0x20)?;
+    io.write8(REG_RSV_CTRL, 0x60)?;
+    Ok(())
+}
+
+/// `rtl8821ae_card_disable` last step: stop PCIe TX DMA (`0x301 = 0xff`)
+/// and wait (100 x 10 us) for `REG_PCIE_CTRL_REG` to read 0. Linux
+/// continues on a timeout; here it is the host TX retirement proof.
+pub async fn stop_tx_dma(io: &impl Io) -> Result<(), Error> {
+    io.write8(REG_PCIE_CTRL_REG + 1, 0xff)?;
+    let mut count = 0;
+    loop {
+        let tmp = io.read8(REG_PCIE_CTRL_REG)?;
+        io.delay_us(10).await;
+        count += 1;
+        if tmp == 0 {
+            return Ok(());
+        }
+        if count >= 100 {
+            return Err(Error::PacketTimeout);
+        }
+    }
+}

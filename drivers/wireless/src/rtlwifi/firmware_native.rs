@@ -240,6 +240,41 @@ impl PciIo {
         }
         Ok(())
     }
+    /// RTL8821AE WoWLAN PCI wake (`rtl_op_suspend`'s
+    /// `device_set_wakeup_enable(true)` → PCI core `pci_prepare_to_sleep`):
+    /// the endpoint PME → ACPI `_PRW` GPE route admitted for `target` from
+    /// D3hot. Only this endpoint's Write authority is used; the platform
+    /// Power grant is the `narf_power::pci_wake` owner's.
+    pub(super) fn wake_route(
+        &self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<narf_power::pci_wake::PciWake, Error> {
+        if self.quarantined.load(Ordering::Acquire) {
+            return Err(Error::Gate);
+        }
+        let route = narf_power::pci_wake::PciWake::discover(&self.cap, self.device)
+            .map_err(|_| Error::Access)?;
+        route
+            .admits(target, narf_bus::pci::pme::WakeState::D3Hot)
+            .map_err(|_| Error::Access)?;
+        Ok(route)
+    }
+    /// PMCSR power-state write of this exact function (config space only).
+    pub(super) fn set_pci_power(&self, state: narf_bus::pci::PciPowerState) -> Result<(), Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_function_identity()?;
+            narf_bus::pci::set_power_state(&self.cap, &self.device, state)
+                .map_err(|_| Error::Access)
+        })
+        .map_err(|_| Error::Access)?
+    }
+    pub(super) fn pci_power(&self) -> Result<Option<narf_bus::pci::PciPowerState>, Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_function_identity()?;
+            narf_bus::pci::power_state(&self.cap, &self.device).map_err(|_| Error::Access)
+        })
+        .map_err(|_| Error::Access)?
+    }
     pub(super) fn suspend_config(&self) -> Result<narf_bus::pci::SavedPciConfig, Error> {
         if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
             return Err(Error::Gate);

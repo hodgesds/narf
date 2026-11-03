@@ -936,6 +936,28 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn supports_scan_dwell(&self) -> bool {
         true
     }
+    /// RTL8821AE `base.c::_rtl_init_mac80211` WoWLAN capability
+    /// (`rtl8821ae::wow::support`); the system suspend/resume owner is
+    /// `system_sleep.rs` (WoWLAN `rtl8821ae_card_disable` branch).
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.lifecycle
+            .wowlan_capable
+            .load(Ordering::Acquire)
+            .then(super::rtl8821ae::wow::support)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        if !self.lifecycle.wowlan_capable.load(Ordering::Acquire) {
+            return Err(narf_wireless::EOPNOTSUPP);
+        }
+        if let Some(config) = &config {
+            super::rtl8821ae::wow::validate(config).map_err(|_| -22)?; // EINVAL
+        }
+        *self.lifecycle.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.lifecycle.wowlan.lock().clone()
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if self.admission.closed.load(Ordering::Acquire) {
             return None;
@@ -1344,8 +1366,12 @@ pub(super) struct NativeEnvironment {
     admission: Arc<station::Admission>,
     firmware: IrqSafeSpinLock<Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>>,
     device: IrqSafeSpinLock<Weak<Native>>,
-    /// 0 active, 1 verified card-disabled, 2 unacknowledged transition.
+    /// 0 active, 1 verified card-disabled, 2 unacknowledged transition,
+    /// 3 RTL8821AE WoWLAN firmware armed (`rtl8821ae_card_disable`'s
+    /// WoWLAN branch; MAC powered, host DMA retired).
     power_state: AtomicU8,
+    /// H2C box state of the armed WoWLAN firmware (state 3 only).
+    wow_mailbox: IrqSafeSpinLock<Option<super::rtl8821ae::h2c::Mailbox>>,
 }
 /// Live station work consumes only the current installation. The explicit
 /// native preparation boundary owns signed-policy bootstrap.
@@ -1365,6 +1391,7 @@ impl NativeEnvironment {
             admission: Arc::new(station::Admission::new()),
             device: IrqSafeSpinLock::new(Weak::new()),
             power_state: AtomicU8::new(0),
+            wow_mailbox: IrqSafeSpinLock::new(None),
         }
     }
     pub(super) fn firmware(
@@ -1629,6 +1656,12 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
         .ok_or(Error::Profile)?;
     let cookie = device.attach_route()?;
     *device.environment.device.lock() = Arc::downgrade(&device);
+    if device.environment.firmware().device_id() == super::regs::RTL_DEV_8821AE {
+        device
+            .lifecycle
+            .wowlan_capable
+            .store(true, Ordering::Release);
+    }
     if narf_net::registry()
         .register(&authority, Registered(device.clone()))
         .is_err()
@@ -1647,6 +1680,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     let pm = Arc::new(system_sleep::SystemPm {
         device: Arc::downgrade(&device),
         config: IrqSafeSpinLock::new(None),
+        wake: IrqSafeSpinLock::new(None),
     });
     narf_power::system_pm::register_async_system_pm(&device.name, pm.clone());
     narf_power::device_pm::register_device_pm_ops(&device.name, pm);

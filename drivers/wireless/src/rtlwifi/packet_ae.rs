@@ -28,7 +28,7 @@
 //! frame (`rtl_set_tx_report`), RA reports record `rtldm->tx_rate`
 //! (`rtl8821ae_c2h_ra_report_handler`) for the DM step's
 //! `rtl8821ae_dm_update_init_rate`.
-use super::super::super::rtl8821ae::{c2h, h2c, mac, station as hw, trx};
+use super::super::super::rtl8821ae::{c2h, h2c, mac, station as hw, trx, wow};
 use super::{
     extent, queue, Delivery, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, OWN,
     RX_BASE, RX_BUFFER, RX_BYTES, TX_BASES, TX_BYTES,
@@ -326,7 +326,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .await?;
         hw::network_type_station(&self.io, &mut self.packet.ae.receive, true)?;
         hw::set_aid(&self.io, aid)?;
-        self.ae_download_rsvd_page(address, pages.len() as u16, admission, &policy)
+        self.ae_download_rsvd_page(address, pages.len() as u16, admission, &policy, false)
             .await?;
         if closed(admission) {
             return Err(Error::State);
@@ -349,12 +349,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// `rtl_cmd_send_packet` on BEACON_QUEUE descriptor 0
     /// (`rtl8821ae_tx_fill_cmddesc`, `rtl8821ae_tx_polling` BIT(4)) and the
     /// `H2C_8821AE_RSVDPAGE` location command after every upload.
+    /// `whole` is the `enter_pnp_sleep` WoWLAN form
+    /// (`_rtl8821ae_download_rsvd_page(hw, true)`): the AOAC location
+    /// command follows each upload, a station that was sending beacons
+    /// repeats the upload as `b_dl_finished`, and `REG_CR + 1` BIT(0) stays
+    /// set.
     async fn ae_download_rsvd_page(
         &mut self,
         address: u32,
         length: u16,
         admission: Option<&super::super::station::Admission>,
         policy: &impl Fn(&Self) -> Result<(), Error>,
+        whole: bool,
     ) -> Result<(), Error> {
         let cr = self.io.read8(0x101)?;
         self.io.write8(0x101, cr | 1)?;
@@ -410,6 +416,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     ),
                 )
                 .await?;
+            if whole {
+                self.packet
+                    .ae
+                    .mailbox
+                    .fill(&self.io, wow::H2C_AOAC_RSVDPAGE, &wow::aoac_rsvdpage())
+                    .await?;
+            }
             for poll in 0..=BCN_VALID_POLLS {
                 if poll != 0 {
                     self.io.delay_us(10).await;
@@ -427,6 +440,50 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 break;
             }
         }
+        if valid && whole && txq & (1 << 6) != 0 {
+            // `send_beacon`: the same packet again as `b_dl_finished`
+            // (no location commands).
+            valid = false;
+            for _ in 0..RSVD_ATTEMPTS {
+                let status = self.io.read8(hw::REG_TDECTRL + 2)?;
+                self.io.write8(hw::REG_TDECTRL + 2, status | 1)?;
+                {
+                    let _publication = admission.map(|control| control.publication.lock());
+                    if closed(admission) {
+                        return Err(Error::State);
+                    }
+                    policy(self)?;
+                    let ring = &mut self.tx[0];
+                    self.io.authority(true, || {
+                        ring.sync();
+                        for (word, value) in descriptor.into_iter().enumerate() {
+                            ring.write32(word * 4, value)?;
+                        }
+                        ring.sync();
+                        ring.write32(0, descriptor[0] | OWN)?;
+                        ring.sync();
+                        Ok(())
+                    })?;
+                    self.io.kick(1 << 4)?;
+                }
+                for poll in 0..=BCN_VALID_POLLS {
+                    if poll != 0 {
+                        self.io.delay_us(10).await;
+                    }
+                    let status = self.io.read8(hw::REG_TDECTRL + 2)?;
+                    if status == 0xff {
+                        return Err(Error::Access(super::super::AccessError::Gone));
+                    }
+                    if status & 1 != 0 {
+                        valid = true;
+                        break;
+                    }
+                }
+                if valid {
+                    break;
+                }
+            }
+        }
         if valid {
             self.io.write8(hw::REG_TDECTRL + 2, 1)?;
         }
@@ -435,8 +492,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if txq & (1 << 6) != 0 {
             self.io.write8(hw::REG_FWHW_TXQ_CTRL + 2, txq)?;
         }
-        let cr = self.io.read8(0x101)?;
-        self.io.write8(0x101, cr & !1)?;
+        if !whole {
+            let cr = self.io.read8(0x101)?;
+            self.io.write8(0x101, cr & !1)?;
+        }
         if valid {
             Ok(())
         } else {
@@ -556,6 +615,142 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .fill(&self.io, h2c::H2C_MSRRPT, &h2c::media_status(false))
             .await?;
         hw::set_bssid(&self.io, [0; 6])
+    }
+
+    /// `rtl_op_suspend` → `rtl_op_stop` → `rtl_pci_stop` →
+    /// `rtl8821ae_card_disable` with `support_remote_wakeup &&
+    /// enter_pnp_sleep` on the linked station, in Linux order: WKFM CAM
+    /// patterns (`_rtl_add_wowlan_patterns`), `rtl_lps_leave`,
+    /// `disable_interrupt`, clear `REG_MCUTST_WOWLAN`,
+    /// `rtl8821ae_set_fw_related_for_wowlan(true)` (WoWLAN image, H2C box
+    /// and FW PS state reset), `_rtl8821ae_dynamic_rqpn(0xE0, 0x3,
+    /// 0x80c20d0d)`, `rtl8821ae_set_fw_global_info_cmd`,
+    /// `_rtl8821ae_download_rsvd_page(true)`, `HW_VAR_AID`, MSRRPT connect,
+    /// `set_fw_wowlan_mode(true)`, keep-alive, disconnect decision, the RX
+    /// DMA drain, the APS/SYS_CLKR/RSV_CTRL MCU hold,
+    /// `set_fw_remote_wake_ctrl_cmd(1)` (last H2C) and the PCIe TX DMA stop.
+    ///
+    /// `pairwise`/`group` are the `rt_enc_alg` values Linux records in
+    /// `rtlpriv->sec`; this software-CCMP profile is Linux's `sw_crypto`
+    /// case (`rtl_op_set_key` returns before setting them), so the caller
+    /// passes `NO_ENCRYPTION`. `reset_trx_ring` only rewinds host ring
+    /// indices for the next normal start; here the stopped rings are
+    /// retired and the resume is a fresh generation, so there is nothing to
+    /// rewind. On success the RX-idle and TX-DMA-idle polls plus cleared bus
+    /// mastering are the host DMA retirement proof (`Stopped`, unpublished)
+    /// and the MAC/firmware are left running. Any error leaves `Failed`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn ae_wow_card_disable(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        image: &[u8],
+        bssid: [u8; 6],
+        aid: u16,
+        pairwise: u8,
+        group: u8,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let own = self.local().ok_or(Error::State)?;
+        if !self.transmit_ready() || self.packet.reserved.is_none() {
+            return Err(Error::State);
+        }
+        wow::validate(config)?;
+        let pages = wow::whole_reserved_pages(own, bssid, aid)?;
+        self.phase = Phase::Failed;
+        wow::program_patterns(&self.io, config, own).await?;
+        if core::mem::take(&mut self.packet.leisure) {
+            h2c::fwlps_leave(&self.io, &mut self.packet.ae.mailbox).await?;
+        }
+        self.packet.interrupts = false;
+        self.io.write32(0xb0, 0)?;
+        self.io.write32(0xb8, 0)?;
+        self.io.write8(wow::REG_MCUTST_WOWLAN, 0)?;
+        super::super::super::rtl8821ae::fw::load(&self.io, image, true)
+            .await
+            .map_err(|_| Error::CommandTimeout)?;
+        self.packet.ae.mailbox = h2c::Mailbox::default();
+        wow::dynamic_rqpn(
+            &self.io,
+            wow::WOW_BOUNDARY,
+            wow::WOW_NPQ_RQPN,
+            wow::WOW_RQPN,
+        )
+        .await?;
+        self.packet
+            .ae
+            .mailbox
+            .fill(
+                &self.io,
+                wow::H2C_AOAC_GLOBAL_INFO,
+                &wow::global_info(pairwise, group),
+            )
+            .await?;
+        // The joined body stays retained beside the whole-packet body: the
+        // beacon descriptor may still name it until this upload is proven.
+        let mut buffer = self.io.allocate_packet(pages.len())?;
+        let address = extent(&buffer, pages.len(), 4)?;
+        let end = u64::from(address) + pages.len() as u64;
+        if self
+            .tx
+            .iter()
+            .chain(self.receive.iter())
+            .chain(self.buffers.iter())
+            .chain(self.packet.reserved.iter())
+            .any(|other| {
+                u64::from(address) < other.address() + other.len() as u64 && other.address() < end
+            })
+        {
+            return Err(Error::Address);
+        }
+        self.io.authority(true, || {
+            buffer.write_bytes(0, &pages)?;
+            buffer.sync();
+            Ok(())
+        })?;
+        if let Some(joined) = self.packet.reserved.replace(buffer) {
+            self.packet.retired.push(joined);
+        }
+        self.ae_download_rsvd_page(address, pages.len() as u16, None, &policy, true)
+            .await?;
+        hw::set_aid(&self.io, aid)?;
+        let mailbox = &mut self.packet.ae.mailbox;
+        mailbox
+            .fill(&self.io, h2c::H2C_MSRRPT, &h2c::media_status(true))
+            .await?;
+        mailbox
+            .fill(&self.io, wow::H2C_WO_WLAN, &wow::wowlan_mode(true))
+            .await?;
+        mailbox
+            .fill(&self.io, wow::H2C_KEEP_ALIVE_CTRL, &wow::keep_alive(true))
+            .await?;
+        mailbox
+            .fill(
+                &self.io,
+                wow::H2C_DISCONNECT_DECISION,
+                &wow::disconnect_decision(true),
+            )
+            .await?;
+        wow::drain_rx_dma(&self.io).await?;
+        wow::hold_mcu(&self.io)?;
+        self.packet
+            .ae
+            .mailbox
+            .fill(
+                &self.io,
+                wow::H2C_REMOTE_WAKE_CTRL,
+                &wow::remote_wake_ctrl(true),
+            )
+            .await?;
+        wow::stop_tx_dma(&self.io).await?;
+        if self.io.read8(wow::REG_RXDMA_CONTROL)? & 1 << 1 == 0 {
+            return Err(Error::PacketTimeout);
+        }
+        self.io.master(false)?;
+        self.packet.rate_mask = None;
+        self.packet.vht_highest = None;
+        self.phase = Phase::Stopped;
+        self.published = false;
+        Ok(())
     }
 
     /// `rtl8821ae_enable_interrupt` (with `int_clear`) on a running owner.

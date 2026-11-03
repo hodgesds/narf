@@ -4,7 +4,7 @@
 //! drain them before its frontend can admit a replacement hardware owner.
 use super::station::{Admission, Error};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use narf_lib::mutex::Mutex;
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 pub(super) struct Lifecycle {
     pub(super) control: Mutex<()>,
@@ -19,6 +19,14 @@ pub(super) struct Lifecycle {
     pub(super) pm_requests: Mutex<()>,
     pub(super) pm_preparing: AtomicBool,
     pub(super) pm_rollback: AtomicBool,
+    /// RTL8821AE `wiphy->wowlan_config` (cfg80211 keeps it across the
+    /// fresh generations this device publishes).
+    pub(super) wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// Set once for a published native RTL8821AE (`wo_wlan_mode` is
+    /// static in `rtl8821ae/sw.c`); every other chip advertises nothing.
+    pub(super) wowlan_capable: AtomicBool,
+    /// The last WoWLAN resume's `_rtl8821ae_get_wakeup_reason`.
+    pub(super) wakeup: IrqSafeSpinLock<Option<super::super::rtl8821ae::wow::WakeReason>>,
 }
 
 impl Lifecycle {
@@ -36,6 +44,9 @@ impl Lifecycle {
             pm_requests: Mutex::new(()),
             pm_preparing: AtomicBool::new(false),
             pm_rollback: AtomicBool::new(false),
+            wowlan: IrqSafeSpinLock::new(None),
+            wowlan_capable: AtomicBool::new(false),
+            wakeup: IrqSafeSpinLock::new(None),
         }
     }
     pub(super) fn generation(&self) -> u64 {

@@ -2689,3 +2689,72 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_wowlan_payloads_patterns_and_wake_reason
 );
+
+fn smoke_rtl8821ae_wowlan_card_disable_register_order() -> TestResult {
+    let mut regs = vec![0u8; 0x1000];
+    regs[0x002] = 0x03;
+    regs[0x008] = 0x01;
+    regs[0x101] = 0x00;
+    regs[0x286] = 0x02; // RXDMA_IDLE
+    regs[0x41a] = 0xff;
+    regs[0x41b] = 0x07; // TXFF empty
+    let io = RegFake(IrqSafeSpinLock::new((regs, Vec::new())));
+    // The model never clears _LLT_OP, so the prefix up to the first LLT
+    // write is checked and the LLT failure is returned before RQPN.
+    if narf_scheduler::block_on(wow::dynamic_rqpn(
+        &io,
+        wow::WOW_BOUNDARY,
+        wow::WOW_NPQ_RQPN,
+        wow::WOW_RQPN,
+    )) != Err(crate::rtlwifi::prepare::Error::LltTimeout)
+    {
+        return TestResult::Fail("dynamic_rqpn LLT failure");
+    }
+    let writes: Vec<(u8, u16, u32)> = io.0.lock().1.clone();
+    let expect: [(u8, u16, u32); 16] = [
+        (1, 0x301, 0xfe),
+        (1, 0x522, 0xff),
+        (1, 0x286, 0x06),
+        (1, 0x002, 0x02),
+        (1, 0x100, 0x00),
+        (1, 0x101, 0x00),
+        (1, 0x553, 0x20),
+        (1, 0x101, 0x02),
+        (1, 0x100, 0xff),
+        (1, 0x002, 0x03),
+        (1, 0x209, 0xe0),
+        (1, 0x424, 0xe0),
+        (1, 0x425, 0xe0),
+        (1, 0x45d, 0xe0),
+        (2, 0x114, 0xe0),
+        (4, 0x1e0, (1 << 30) | 1),
+    ];
+    if writes.len() != expect.len() || writes[..] != expect[..] {
+        return TestResult::Fail("dynamic_rqpn register order");
+    }
+    io.0.lock().1.clear();
+    if wow::hold_mcu(&io).is_err() || narf_scheduler::block_on(wow::stop_tx_dma(&io)).is_err() {
+        return TestResult::Fail("card-disable tail");
+    }
+    let writes: Vec<(u8, u16, u32)> = io.0.lock().1.clone();
+    let expect: [(u8, u16, u32); 5] = [
+        (1, 0x005, 0x00),
+        (1, 0x008, 0x09),
+        (1, 0x01c, 0x20),
+        (1, 0x01c, 0x60),
+        (1, 0x301, 0xff),
+    ];
+    if writes[..] != expect[..] {
+        return TestResult::Fail("card-disable tail order");
+    }
+    // RXDMA never idle (the model keeps the written BIT(2) only): the
+    // retirement proof fails where Linux only logs.
+    if narf_scheduler::block_on(wow::drain_rx_dma(&io)).is_ok() {
+        return TestResult::Fail("RX DMA idle proof");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_wowlan_card_disable_register_order
+);

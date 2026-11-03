@@ -12,6 +12,9 @@ use core::{
 pub(crate) enum Operation {
     Recover,
     Suspend,
+    /// System suspend that may take the RTL8821AE WoWLAN branch (the
+    /// caller has admitted a PCI wake route for the actual target).
+    WowSuspend,
     Resume,
     Idle,
     Retune(u8),
@@ -57,8 +60,11 @@ where
                     future: Box::pin(async move {
                         match operation {
                             Operation::Recover => device.recover_once().await,
-                            Operation::Suspend => device.sleep_once(true, None).await,
-                            Operation::Idle => device.sleep_once(false, Some(activity)).await,
+                            Operation::Suspend => device.sleep_once(true, None, false).await,
+                            Operation::WowSuspend => device.sleep_once(true, None, true).await,
+                            Operation::Idle => {
+                                device.sleep_once(false, Some(activity), false).await
+                            }
                             Operation::Retune(channel) => device.retune_once(channel).await,
                             Operation::Resume => {
                                 device.lifecycle.suspended.store(false, Ordering::Release);

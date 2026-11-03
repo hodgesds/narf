@@ -1428,6 +1428,49 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Hardware::MacConfigured;
         Ok(())
     }
+    /// `rtl_op_suspend` with a retained WoWLAN configuration on the
+    /// associated, open RTL8821AE station (`mac->link_state >=
+    /// MAC80211_LINKED`, station opmode): `wow_card_disable` with the
+    /// current BSSID/AID under the current channel/power policy. On success
+    /// the station is retired (no host frame may follow; the firmware owns
+    /// the association until resume). On error the caller takes the cold
+    /// card-disable path.
+    pub(crate) async fn wow_suspend(
+        &mut self,
+        environment: &impl Environment,
+        config: &narf_wireless::WowlanConfig,
+        image: &[u8],
+    ) -> Result<(), Error> {
+        if self.chip != super::Chip::Rtl8821ae || self.station_phase() != Phase::Open {
+            return Err(Error::State);
+        }
+        let bssid = self
+            .station
+            .candidate
+            .as_ref()
+            .map(|c| c.bss.bssid)
+            .ok_or(Error::State)?;
+        let aid = self.station.aid.ok_or(Error::State)?;
+        self.check_station_policy(environment)?;
+        use super::super::rtl8821ae::wow::NO_ENCRYPTION;
+        let result = self
+            .wow_card_disable(
+                config,
+                image,
+                bssid,
+                aid,
+                NO_ENCRYPTION,
+                NO_ENCRYPTION,
+                |owner| {
+                    owner
+                        .check_station_policy(environment)
+                        .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))
+                },
+            )
+            .await;
+        self.station.fail();
+        result.map_err(Error::Radio)
+    }
     pub(crate) fn abort_station(&mut self) {
         self.station.fail();
         if self.phase != Hardware::Stopped {

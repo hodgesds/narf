@@ -639,6 +639,30 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase == Phase::Running && self.packet.pending.is_none()
     }
+    /// The RTL8821AE H2C box state, handed to the parked WoWLAN firmware
+    /// owner after `wow_card_disable`.
+    pub(crate) fn take_ae_mailbox(&mut self) -> super::super::rtl8821ae::h2c::Mailbox {
+        core::mem::take(&mut self.packet.ae.mailbox)
+    }
+    /// RTL8821AE only: the WoWLAN `rtl8821ae_card_disable` branch
+    /// (`packet_ae.rs::ae_wow_card_disable`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn wow_card_disable(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        image: &[u8],
+        bssid: [u8; 6],
+        aid: u16,
+        pairwise: u8,
+        group: u8,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !self.rtl8821ae() || self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        self.ae_wow_card_disable(config, image, bssid, aid, pairwise, group, policy)
+            .await
+    }
     pub(crate) async fn disconnect_station_peer(&mut self) -> Result<(), Error> {
         if !matches!(self.phase, Phase::Running | Phase::Failed) {
             return Err(Error::State);

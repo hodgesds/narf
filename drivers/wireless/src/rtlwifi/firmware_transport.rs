@@ -3,7 +3,7 @@
 //! rtl8821ae/fw.c and rtl8192ee/fw.c. Profiles: RTL8188EE, RTL8821AE and
 //! RTL8192EE (normal images).
 //! PCI bus mastering remains parked. This does not install native packet rings.
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_firmware::FirmwareError;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -49,6 +49,26 @@ pub struct Info {
 }
 /// Exact PCI firmware header, authenticated by the profile-selected filename.
 /// 88E1 alone cannot distinguish an EE image from an EU image.
+/// `rtl8821ae/sw.c` `wowlan_firmware`: `rtl8821aefw_wowlan.bin` opened
+/// through the trusted registry authority (as the normal image) and its
+/// header validated; the bytes are downloaded later by the WoWLAN
+/// card-disable branch (`rtl8821ae_set_fw_related_for_wowlan(true)`).
+pub(crate) fn registered_wowlan_image() -> Result<Vec<u8>, Error> {
+    let loader = narf_firmware::trusted_loader_authority()
+        .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
+    let authority = loader
+        .derive()
+        .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
+    let asset = crate::firmware_asset::load(
+        &authority,
+        super::rtl8821ae::fw::FW_WOWLAN,
+        HEADER + MAX_PAYLOAD,
+        false,
+    )
+    .map_err(Error::Firmware)?;
+    parse(super::regs::RTL_DEV_8821AE, &asset.bytes)?;
+    Ok(asset.bytes.to_vec())
+}
 pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
     if did == super::regs::RTL_DEV_8821AE {
         // IS_FW_HEADER_EXIST_8821 plus exact RAM-code length (rtl8821ae/fw.rs).

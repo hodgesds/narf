@@ -10,6 +10,18 @@ pub(crate) trait Rebuild<I: Port<Buffer = M>, M: Memory>: Environment {
     fn power_down(&self) -> impl Future<Output = Result<(), Error>> + Send {
         core::future::ready(Err(Error::State))
     }
+    /// The registered `rtl8821aefw_wowlan.bin` (`fw::Image::Wowlan`), read
+    /// through the same trusted registry authority as the normal image.
+    fn wowlan_image(&self) -> Result<Vec<u8>, Error> {
+        Err(Error::State)
+    }
+    /// The WoWLAN card-disable branch completed instead of `power_down`:
+    /// the MAC and WoWLAN firmware stay powered, `mailbox` is the H2C box
+    /// state the resume's disable commands continue from. A later
+    /// `power_down` first runs the WoWLAN resume prologue.
+    fn wow_parked(&self, _mailbox: super::super::rtl8821ae::h2c::Mailbox) -> Result<(), Error> {
+        Err(Error::State)
+    }
     fn rebuild(
         &self,
         retained: Arc<Mutex<Option<Prepared<I, M>>>>,

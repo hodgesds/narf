@@ -1981,8 +1981,8 @@ chain below is composed.
     `smoke_rtl8821ae_host_vht_capability_per_band`,
     `smoke_rtl8821ae_vht80_capability_ra_mask_and_tx_mapping`,
     `smoke_rtl8821ae_iqk_80mhz_vdf_branch` (written, unexecuted).
-  - WoWLAN pieces (8821AE, `rtl8821ae/wow.rs`; groundwork, no capability
-    is advertised to the host yet). Capability as Linux
+  - WoWLAN pieces (8821AE, `rtl8821ae/wow.rs`; used by the suspend/resume
+    path below). Capability as Linux
     `base.c::_rtl_init_mac80211` with `sw.c` `wo_wlan_mode = MAGIC |
     PATTERN`: magic packet, 16 patterns of 13..=128 bytes, no offset; no
     disconnect / GTK-rekey trigger (Linux never sets `gtk_offload_enable`
@@ -2003,6 +2003,56 @@ chain below is composed.
     0x8812, `rtl8812aefw_wowlan.bin`) is not a supported chip here: its
     probe is not bound, so its WoWLAN is out of scope. Test
     `smoke_rtl8821ae_wowlan_payloads_patterns_and_wake_reason` (written,
+    unexecuted).
+  - WoWLAN system suspend/resume (8821AE, whole path; the host capability
+    is advertised). Interface: `wowlan_support` returns `wow::support()`
+    only for a published native RTL8821AE (`Lifecycle::wowlan_capable`),
+    `set_wowlan` re-validates (`wow::validate`, EINVAL) and retains the
+    configuration in `Lifecycle::wowlan` across generations,
+    `wowlan_config` returns it; other chips keep `EOPNOTSUPP`.
+    Suspend (`system_sleep.rs`): `prepare_suspend_target(target)` first
+    admits the endpoint PME → `_PRW` GPE route from D3hot
+    (`PciIo::wake_route`, `narf_power::pci_wake`); without one (or with the
+    target-less `prepare_suspend`) the normal card-disable runs. With a
+    route, `Operation::WowSuspend` → `sleep_once(.., wow)`: under the
+    prepared mutex, before admission closes, the associated `Open`
+    station runs `Prepared::wow_suspend` → `packet_ae::ae_wow_card_disable`
+    in Linux order: `_rtl_add_wowlan_patterns` (WKFM CAM),
+    `rtl_lps_leave`, `disable_interrupt`, `REG_MCUTST_WOWLAN = 0`,
+    `rtl8821ae_set_fw_related_for_wowlan(true)` (`rtl8821aefw_wowlan.bin`
+    from the trusted registry, `firmware_transport::
+    registered_wowlan_image`; H2C box and FW PS state reset),
+    `_rtl8821ae_dynamic_rqpn(0xE0, 0x3, 0x80c20d0d)` (`wow::dynamic_rqpn`,
+    `wow::init_llt`), `set_fw_global_info_cmd` (`NO_ENCRYPTION` both: this
+    software-CCMP profile is Linux's `sw_crypto` case, so the firmware
+    only matches magic packets / patterns in unprotected frames),
+    `_rtl8821ae_download_rsvd_page(true)` (the whole-packet body, AOAC
+    location H2C after each upload, `send_beacon` repeat, `REG_CR + 1`
+    BIT(0) kept), `HW_VAR_AID`, MSRRPT connect, `set_fw_wowlan_mode(1)`,
+    keep-alive, disconnect decision, RX DMA drain, `REG_APS_FSMCO + 1 =
+    0`, `SYS_CLKR |= BIT(3)`, `RSV_CTRL = 0x20, 0x60`,
+    `set_fw_remote_wake_ctrl_cmd(1)` (last H2C), PCIe TX DMA stop.
+    Divergences: Linux continues after the RXDMA-idle and TX-DMA-idle
+    poll timeouts; here they (with cleared bus mastering) are the host DMA
+    retirement proof, so a timeout fails the branch and the owner takes
+    the existing cold card-disable. `reset_trx_ring` is not needed (the
+    rings are retired; resume is a fresh generation). PME status is
+    cleared by the PME arm's PMCSR write. Then `wow_parked` (power state
+    3, H2C box retained), config save, PME/GPE arm, D3hot + 10 ms settle.
+    The host link is reported down when admission closes at suspend.
+    Resume: `resume_from_suspend` D0 + settle + config restore + route
+    disarm (a failed disarm quarantines the route and fails resume), then
+    `Operation::Resume`; the rebuild's `power_down` in state 3 first runs
+    `_rtl8821ae_wowlan_initialize_adapter`'s `_get_wakeup_reason`
+    (recorded in `Lifecycle::wakeup`), `set_fw_wowlan_mode(0)` and
+    `set_fw_remote_wake_ctrl_cmd(0)` over the parked control window, then
+    the existing cold card-disable/enable rebuild (instead of Linux's warm
+    `_rtl8821ae_simple_initialize_adapter`); the station stays
+    disconnected as Linux `rtl_op_resume`'s `ieee80211_resume_disconnect`.
+    A WoWLAN branch failure falls back to the cold path; a route that
+    cannot be armed keeps D0 (no wake source) with the same resume.
+    No board receipt exists for any of this. Test
+    `smoke_rtl8821ae_wowlan_card_disable_register_order` (written,
     unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
