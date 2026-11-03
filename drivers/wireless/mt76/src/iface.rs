@@ -24,6 +24,8 @@ pub(crate) mod ap_tests;
 mod monitor;
 #[path = "iface_p2p.rs"]
 pub(crate) mod p2p;
+#[path = "iface_p2p_go.rs"]
+pub(crate) mod p2p_go;
 #[path = "iface_p2p_group.rs"]
 pub(crate) mod p2p_group;
 #[path = "iface_wowlan.rs"]
@@ -70,6 +72,8 @@ pub struct Mt76Iface {
     p2p_device: IrqSafeSpinLock<Option<Arc<p2p::P2pDeviceIface>>>,
     /// The one concurrent P2P-client group netdev (`NEW_INTERFACE` type 8).
     p2p_group: IrqSafeSpinLock<Option<Arc<p2p_group::P2pGroupIface>>>,
+    /// The concurrent P2P GO netdev (one group netdev: client or GO).
+    p2p_go: IrqSafeSpinLock<Option<Arc<p2p_go::P2pGoIface>>>,
     vif_slots: IrqSafeSpinLock<crate::mt7921::vif_slots::Slots>,
     scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -115,6 +119,7 @@ impl Mt76Iface {
             registration_cap: IrqSafeSpinLock::new(None),
             p2p_device: IrqSafeSpinLock::new(None),
             p2p_group: IrqSafeSpinLock::new(None),
+            p2p_go: IrqSafeSpinLock::new(None),
             vif_slots: IrqSafeSpinLock::new(crate::mt7921::vif_slots::Slots::default()),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
             rx_ring: IrqSafeSpinLock::new(None),
@@ -275,6 +280,7 @@ impl Mt76Iface {
         }
         if !self.sleeping.load(Ordering::Acquire) {
             self.poll_p2p_group().await;
+            self.poll_p2p_go().await;
         }
         if self.ap_owned.load(Ordering::Acquire) || self.ap_role() {
             return self.poll_ap().await;
@@ -755,12 +761,60 @@ impl WirelessNetIface for Mt76Iface {
     fn supports_virtual_interfaces(&self) -> bool {
         self.p2p_profile.is_some()
     }
+    /// P2P_CLIENT (group netdev or physical role), P2P_GO (group netdev
+    /// beside the home station or physical role) and P2P_DEVICE.
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        if self.p2p_profile.is_some() {
+            vec![8, 9, 10]
+        } else {
+            Vec::new()
+        }
+    }
+    /// The combination NARF enforces: Linux `if_comb_chanctx_base`
+    /// (mt792x_core.c) limits — at most two STATION|P2P_CLIENT, one
+    /// AP|P2P_GO, one P2P_DEVICE, three interfaces — but on ONE channel.
+    /// Linux advertises `num_different_channels = 2` for the GO set (CNM
+    /// multi-channel concurrency); NARF keeps every owner on the home
+    /// station's channel context (`shares_channel_context`,
+    /// `shares_go_channel`), so it advertises 1. NARF also admits only one
+    /// concurrent group netdev (client or GO) beside the home interface.
+    fn interface_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
+        if self.p2p_profile.is_none() {
+            return Vec::new();
+        }
+        vec![narf_wireless::InterfaceCombination {
+            limits: vec![
+                narf_wireless::InterfaceTypeLimit {
+                    max: 2,
+                    iftypes: vec![2, 8],
+                },
+                narf_wireless::InterfaceTypeLimit {
+                    max: 1,
+                    iftypes: vec![3, 9],
+                },
+                narf_wireless::InterfaceTypeLimit {
+                    max: 1,
+                    iftypes: vec![10],
+                },
+            ],
+            max_interfaces: 3,
+            max_channels: 1,
+            sta_ap_beacon_interval_match: false,
+            beacon_interval_min_gcd: None,
+            radar_detect_widths: None,
+        }]
+    }
     fn new_virtual_interface(
         &self,
         name: &str,
         iftype: u32,
         mac: Option<[u8; 6]>,
     ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if iftype == 9 {
+            return self
+                .new_p2p_go(name, mac)
+                .map(|go| go as Arc<dyn WirelessNetIface>);
+        }
         self.new_p2p_group(name, iftype, mac)
             .map(|group| group as Arc<dyn WirelessNetIface>)
     }
@@ -949,7 +1003,14 @@ impl WirelessNetIface for Mt76Iface {
             base_name: self.name.clone(),
             base_mac: self.mac(),
             bands: self.bands(),
-            modes: WirelessModes::STATION | WirelessModes::AP | WirelessModes::MONITOR,
+            modes: WirelessModes::STATION
+                | WirelessModes::AP
+                | WirelessModes::MONITOR
+                | if self.p2p_profile.is_some() {
+                    WirelessModes::P2P
+                } else {
+                    WirelessModes::empty()
+                },
             hw_caps: HwCaps {
                 ht_supported: self.radio.capabilities.phy.ht,
                 vht_supported: crate::mt7921::vht::qualified(self.radio),
@@ -1460,6 +1521,7 @@ pub(crate) fn remove_scan_iface() {
     };
     iface.lose_link();
     iface.withdraw_p2p_group();
+    iface.withdraw_p2p_go();
     iface.withdraw_p2p_metadata();
     iface.scan_cache.lock().clear();
     narf_wireless::registry::unregister(&iface.name);

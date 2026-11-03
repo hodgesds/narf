@@ -15,8 +15,7 @@ impl<B: Backend> Session<B> {
         self.check_ap_request(authority)?;
         self.renew_receive_epoch()?;
         let result = self
-            .backend
-            .open_receive_capture(self.receive_epoch)
+            .open_ap_capture()
             .and_then(|_| self.check_ap_request(authority));
         if let Err(error) = result {
             return Err(self.quarantine_ap_request(authority, error));
@@ -91,7 +90,7 @@ impl<B: Backend> Session<B> {
             let owner = self.ap_owner.as_mut().ok_or(Error::Busy)?;
             let (info, frequency_mhz) = (owner.info, owner.plan.config.frequency_mhz);
             owner.peers.commit(peer)?;
-            self.backend.open_receive_capture(self.receive_epoch)?;
+            self.open_ap_capture()?;
             self.check_ap_request(&authority)?;
             self.state = State::AccessPoint {
                 info,
@@ -148,7 +147,7 @@ impl<B: Backend> Session<B> {
             .authorized = Some(authorized);
         let result = self
             .check_ap_request(authority)
-            .and_then(|_| self.backend.open_receive_capture(self.receive_epoch))
+            .and_then(|_| self.open_ap_capture())
             .and_then(|_| self.check_ap_request(authority));
         if let Err(error) = result {
             return Err(self.quarantine_ap_request(authority, error));
@@ -156,7 +155,7 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
     fn quarantine_ap_request(&mut self, authority: &ApControlAuthority, error: Error) -> Error {
-        self.backend.close_receive_capture(0);
+        self.close_ap_capture(0);
         if let Some(owner) = self.ap_owner.as_mut() {
             owner.activated = false;
             owner.pending = Some(Arc::new(authority.clone()));
@@ -201,7 +200,7 @@ impl<B: Backend> Session<B> {
         authority: &ApControlAuthority,
     ) -> Result<(), Error> {
         self.check_ap_request(authority)?;
-        self.backend.open_receive_capture(self.receive_epoch)?;
+        self.open_ap_capture()?;
         self.check_ap_request(authority)?;
         let owner = self.ap_owner.as_mut().ok_or(Error::Busy)?;
         self.state = State::AccessPoint {
@@ -214,14 +213,20 @@ impl<B: Backend> Session<B> {
     }
     /// TX_FREE and native DMA retirement are both required by the backend's
     /// completion owner. Closing a host queue is not a packet receipt.
-    pub(super) async fn ap_drain_packets(&mut self) -> Result<(), Error> {
+    pub(in crate::mt7921::firmware_transport) async fn ap_drain_packets(
+        &mut self,
+    ) -> Result<(), Error> {
+        self.settle_go_credit()?;
         while !self.data_pending.is_empty() {
             let completion = self
                 .wait(super::super::TIMEOUT_MS, |backend| {
                     backend.management_complete()
                 })
                 .await?;
-            self.data_pending.pop_front();
+            // A home station entry (GO role) is credited to the home link.
+            let Some(completion) = self.retire_ap_completion(completion) else {
+                continue;
+            };
             if completion.status != 0 {
                 return Err(Error::Rejected(completion.status));
             }

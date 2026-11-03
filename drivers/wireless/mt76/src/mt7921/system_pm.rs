@@ -308,6 +308,7 @@ impl<B: Backend> Session<B> {
         self.station.bss = None;
         self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.retire_group_link();
+        self.retire_go();
         self.station.wmm = None;
         self.station.wmm_pending = None;
         self.station.ht20_rx = None;

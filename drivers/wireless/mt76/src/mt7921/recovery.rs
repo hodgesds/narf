@@ -20,7 +20,10 @@ impl<B: Backend> Session<B> {
         &mut self,
         expected_mac: Option<[u8; 6]>,
     ) -> Result<RadioInfo, Error> {
-        if self.state == State::Prepared {
+        // A GO operation never resets in place: the WFSYS reset would
+        // retire the live home association. The GO role stays `Failed`
+        // until the home owner's verified recovery retires both.
+        if self.state == State::Prepared || self.go_role() {
             return Err(Error::Busy);
         }
         // Keep the original request's serialization lease through the
@@ -113,6 +116,7 @@ impl<B: Backend> Session<B> {
         self.p2p_next = 1;
         // The verified reset retired every vif's native BSS/WTBL state.
         self.retire_group_link();
+        self.retire_go();
         self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;

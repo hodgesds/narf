@@ -2132,4 +2132,50 @@ impl Transport {
     pub(crate) fn group_state(&self) -> Option<State> {
         self.session.group_state()
     }
+    /// Reserve the concurrent GO vif (`go_link::open_go`).
+    pub(crate) fn open_go(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        own: [u8; 6],
+    ) -> Result<(), Error> {
+        self.session.open_go(vif, own)
+    }
+    /// START the GO beside the home station; returns its receive epoch.
+    pub(crate) async fn start_go(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<u64, Error> {
+        self.session.start_go(authority, config, settings).await
+    }
+    /// STOP the GO without a reset (`go_link::stop_go`).
+    pub(crate) async fn stop_go(&mut self) -> Result<(), Error> {
+        self.session.stop_go().await
+    }
+    pub(crate) fn close_go(&mut self) -> Result<(), Error> {
+        self.session.close_go()
+    }
+    pub(crate) async fn go_request(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        request: super::boot_ap::Request,
+    ) -> Result<super::boot_ap::Reply, Error> {
+        self.session.go_request(authority, request).await
+    }
+    pub(crate) fn step_go_network(
+        &mut self,
+        tx: Option<&[u8]>,
+    ) -> Result<(super::PacketStep, Vec<super::ApRxEvent>), Error> {
+        self.session.step_go_network(tx)
+    }
+    pub(crate) fn go_receive_current(&self, epoch: u64) -> Result<bool, Error> {
+        self.session.go_receive_current(epoch)
+    }
+    pub(crate) fn go_state(&self) -> Option<(crate::mt7921::vif_slots::Vif, State)> {
+        self.session.go_state()
+    }
+    pub(crate) fn go_station_macs(&self) -> Vec<[u8; 6]> {
+        self.session.go_station_macs()
+    }
 }

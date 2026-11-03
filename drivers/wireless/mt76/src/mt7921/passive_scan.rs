@@ -506,7 +506,8 @@ impl<B: Backend> Session<B> {
         // station owner's own link (the physical interface's HOME vif).
         // Its NO_IR passive domain would revoke the other live station
         // owner's shared channel grant.
-        if self.other_station_permission().is_some() {
+        // A live GO beacons on the shared channel; no NO_IR scan domain.
+        if self.other_station_permission().is_some() || self.go_plan().is_some() {
             return Err(Error::Busy);
         }
         let vif = self.station.link.vif();

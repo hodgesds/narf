@@ -167,16 +167,23 @@ fn lifecycle() -> Result<(), &'static str> {
             .admin
             .authorize_interface(concrete.child.name(), 0)
             .is_ok()
-        || concrete
-            .binding
-            .iface
-            .get_wireless_info()
-            .modes
-            .contains(narf_wireless::iface::WirelessModes::P2P)
     {
-        return Err(
-            "concrete metadata invented a started owner/netdev/UP/parent grant/advertised role",
-        );
+        return Err("concrete metadata invented a started owner/netdev/UP/parent grant");
+    }
+    // The physical wiphy advertises the P2P roles it implements: CLIENT,
+    // GO and DEVICE, in one single-channel combination.
+    let iface = &concrete.binding.iface;
+    let combinations = iface.interface_combinations();
+    if !iface
+        .get_wireless_info()
+        .modes
+        .contains(narf_wireless::iface::WirelessModes::P2P)
+        || iface.p2p_interface_types() != [8, 9, 10]
+        || combinations.len() != 1
+        || combinations[0].max_channels != 1
+        || combinations[0].max_interfaces != 3
+    {
+        return Err("P2P wiphy advertisement differs from the implemented roles");
     }
     let first = session.backend.frames.len();
     execute(&mut session, &concrete, P2pRequest::Start).map_err(|_| "concrete native START")?;

@@ -23,6 +23,18 @@ pub(super) struct Owner {
     /// Actual request authority survives a dropped borrowed waiter until
     /// host publication or verified cleanup. It grants no new frame owner.
     pub pending: Option<Arc<ApControlAuthority>>,
+    /// A concurrent GO's receive floor (`go_link`): the shared capture
+    /// epoch of its own last fence. The home AP admits only the current
+    /// epoch; a GO admits `floor..=current`, since the live home station's
+    /// fences move the shared epoch without fencing the GO.
+    pub floor: u64,
+    /// The GO renewed while the shared capture stayed open for the home
+    /// station; it renews again before its port reopens.
+    pub fenced: bool,
+    /// Copies of this GO drained from the shared ring by the home station.
+    pub demuxed: alloc::collections::VecDeque<super::CapturedData>,
+    /// Terminal TX statuses of this GO's entries retired by the home owner.
+    pub tx_credit: alloc::collections::VecDeque<u8>,
 }
 
 impl<B: Backend> Session<B> {
@@ -32,37 +44,7 @@ impl<B: Backend> Session<B> {
         config: ApConfig,
         settings: narf_wireless::ApStartSettings,
     ) -> Result<(), Error> {
-        if settings.auth_type.is_some_and(|kind| kind != 0)
-            || settings.control_port.ethertype != 0x888e
-        {
-            return Err(Error::UnsupportedFirmware);
-        }
-        if config.privacy {
-            if settings.wpa_versions.is_some_and(|v| v != 2)
-                || settings
-                    .pairwise_ciphers
-                    .as_ref()
-                    .is_some_and(|v| v.as_slice() != [0x000fac04])
-                || settings.group_cipher.is_some_and(|v| v != 0x000fac04)
-                || settings
-                    .akms
-                    .as_ref()
-                    .is_some_and(|v| v.as_slice() != [0x000fac02])
-                || !settings.control_port.enabled
-                || !settings.control_port.over_nl80211
-            {
-                return Err(Error::UnsupportedFirmware);
-            }
-        } else if settings.wpa_versions.is_some_and(|v| v != 0)
-            || settings
-                .pairwise_ciphers
-                .as_ref()
-                .is_some_and(|v| !v.is_empty())
-            || settings.group_cipher.is_some_and(|v| v != 0)
-            || settings.akms.as_ref().is_some_and(|v| !v.is_empty())
-        {
-            return Err(Error::UnsupportedFirmware);
-        }
+        validate_settings(&config, &settings)?;
         self.start_ap(authority.clone(), config).await?;
         if let Err(error) = self.check_ap_request(&authority) {
             return Err(self.ap_peer_failure(error).await);
@@ -75,7 +57,8 @@ impl<B: Backend> Session<B> {
         authority: Arc<ApControlAuthority>,
         config: ApConfig,
     ) -> Result<(), Error> {
-        if self.p2p_rf_busy() {
+        // The home AP's takeover reset would retire a concurrent GO.
+        if self.p2p_rf_busy() || self.go.is_some() {
             return Err(Error::Busy);
         }
         let info = match self.state {
@@ -120,11 +103,15 @@ impl<B: Backend> Session<B> {
             start_settings: None,
             activated: false,
             pending: Some(authority.clone()),
+            floor: 0,
+            fenced: false,
+            demuxed: alloc::collections::VecDeque::new(),
+            tx_credit: alloc::collections::VecDeque::new(),
         });
         self.stage(Stage::ApStart);
         self.boot_started = Some(self.backend.now_ns());
         let result = self
-            .start_ap_inner(info, &plan, &authority)
+            .start_ap_inner(info, &plan, &authority, true)
             .await
             .and_then(|_| self.check_ap_request(&authority));
         self.boot_started = None;
@@ -143,11 +130,17 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    async fn start_ap_inner(
+    /// `tune` = false for a GO beside a live home station on the same
+    /// channel: the device-global MAC init, RX path, CE country/power,
+    /// channel switch and slot timing stay the home owner's (Linux
+    /// `mt7921_start_ap` touches only the vif's BSS/BMC/beacon; the shared
+    /// chanctx is not re-tuned).
+    pub(super) async fn start_ap_inner(
         &mut self,
         info: RadioInfo,
         plan: &Plan,
         authority: &ApControlAuthority,
+        tune: bool,
     ) -> Result<(), Error> {
         let mut dev = [0; 16];
         cmd::encode_uni_dev_info_update(plan.vif.omac(), 0, true, plan.own, &mut dev)
@@ -160,97 +153,99 @@ impl<B: Backend> Session<B> {
             &role_bss(plan, false)?,
         )
         .await?;
-        self.ap_exchange(
-            authority,
-            Command::Extended {
-                id: 0x46,
-                query: false,
-            },
-            &[1, 0, 0, 0],
-        )
-        .await?;
         let mut receive = [0; 76];
         receive[0] = 1;
         receive[1] = 1;
         receive[3] = info.capabilities.phy.spatial_streams.min(2);
         receive[4] = (1 << receive[3]) - 1;
-        self.ap_exchange(
-            authority,
-            Command::Extended {
-                id: 0x4e,
-                query: false,
-            },
-            &receive,
-        )
-        .await?;
+        if tune {
+            self.ap_exchange(
+                authority,
+                Command::Extended {
+                    id: 0x46,
+                    query: false,
+                },
+                &[1, 0, 0, 0],
+            )
+            .await?;
+            self.ap_exchange(
+                authority,
+                Command::Extended {
+                    id: 0x4e,
+                    query: false,
+                },
+                &receive,
+            )
+            .await?;
 
-        let band = if plan.five_ghz {
-            channel::Band::Ghz5
-        } else {
-            channel::Band::Ghz2
-        };
-        let mut domain = vec![0; 20];
-        domain[..2].copy_from_slice(&plan.permission.country);
-        domain[4..7].fill(1);
-        domain[7 + usize::from(band.scan_tag())] = 1;
-        domain[12..14].copy_from_slice(&u16::from(plan.channel).to_le_bytes());
-        self.ap_notify(
-            authority,
-            Command::Ce {
-                id: 0x0f,
-                query: false,
-            },
-            &domain,
-        )
-        .await?;
-        let limits = plan
-            .permission
-            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
-            .ok_or(Error::Authority)?;
-        self.ap_notify(
-            authority,
-            Command::Ce {
-                id: 0x5d,
-                query: false,
-            },
-            &limits,
-        )
-        .await?;
-        self.confirm_command_progress().await?;
-        self.check_ap_request(authority)?;
-        let mut switch = [0; cmd::CHANNEL_SWITCH_SIZE];
-        cmd::encode_channel_switch(
-            plan.channel,
-            plan.channel,
-            0,
-            1,
-            receive[4],
-            band.switch_tag(),
-            &mut switch,
-        )
-        .ok_or(Error::Bounds)?;
-        self.ap_exchange(
-            authority,
-            Command::Extended {
-                id: crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH,
-                query: false,
-            },
-            &switch,
-        )
-        .await?;
-        self.check_ap_request(authority)?;
-        self.backend.pause_ap_timing()?;
-        let paused = self.backend.now_ns();
-        self.wait(20, |backend| {
-            Ok((backend.now_ns().saturating_sub(paused) >= 1_000).then_some(()))
-        })
-        .await?;
-        self.check_ap_request(authority)?;
-        let short_slot = u16::from_le_bytes(plan.config.beacon_head[34..36].try_into().unwrap())
-            & (1 << 10)
-            != 0;
-        self.backend.finish_ap_timing(plan.five_ghz, short_slot)?;
-        self.check_ap_request(authority)?;
+            let band = if plan.five_ghz {
+                channel::Band::Ghz5
+            } else {
+                channel::Band::Ghz2
+            };
+            let mut domain = vec![0; 20];
+            domain[..2].copy_from_slice(&plan.permission.country);
+            domain[4..7].fill(1);
+            domain[7 + usize::from(band.scan_tag())] = 1;
+            domain[12..14].copy_from_slice(&u16::from(plan.channel).to_le_bytes());
+            self.ap_notify(
+                authority,
+                Command::Ce {
+                    id: 0x0f,
+                    query: false,
+                },
+                &domain,
+            )
+            .await?;
+            let limits = plan
+                .permission
+                .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+                .ok_or(Error::Authority)?;
+            self.ap_notify(
+                authority,
+                Command::Ce {
+                    id: 0x5d,
+                    query: false,
+                },
+                &limits,
+            )
+            .await?;
+            self.confirm_command_progress().await?;
+            self.check_ap_request(authority)?;
+            let mut switch = [0; cmd::CHANNEL_SWITCH_SIZE];
+            cmd::encode_channel_switch(
+                plan.channel,
+                plan.channel,
+                0,
+                1,
+                receive[4],
+                band.switch_tag(),
+                &mut switch,
+            )
+            .ok_or(Error::Bounds)?;
+            self.ap_exchange(
+                authority,
+                Command::Extended {
+                    id: crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH,
+                    query: false,
+                },
+                &switch,
+            )
+            .await?;
+            self.check_ap_request(authority)?;
+            self.backend.pause_ap_timing()?;
+            let paused = self.backend.now_ns();
+            self.wait(20, |backend| {
+                Ok((backend.now_ns().saturating_sub(paused) >= 1_000).then_some(()))
+            })
+            .await?;
+            self.check_ap_request(authority)?;
+            let short_slot =
+                u16::from_le_bytes(plan.config.beacon_head[34..36].try_into().unwrap()) & (1 << 10)
+                    != 0;
+            self.backend.finish_ap_timing(plan.five_ghz, short_slot)?;
+            self.check_ap_request(authority)?;
+        }
         let bss = role_bss(plan, true)?;
         self.ap_exchange(authority, Command::Unified { id: 2 }, &bss)
             .await?;
@@ -353,7 +348,7 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    fn check_ap_request(&self, authority: &ApControlAuthority) -> Result<(), Error> {
+    pub(super) fn check_ap_request(&self, authority: &ApControlAuthority) -> Result<(), Error> {
         if self.p2p_rf_busy() {
             return Err(Error::Busy);
         }
@@ -430,9 +425,48 @@ pub(crate) enum ApEvent {
     },
 }
 
+/// The supported START settings: open system, CCMP-128/PSK WPA2 or open,
+/// EAPOL over nl80211 when protected.
+pub(super) fn validate_settings(
+    config: &ApConfig,
+    settings: &narf_wireless::ApStartSettings,
+) -> Result<(), Error> {
+    if settings.auth_type.is_some_and(|kind| kind != 0) || settings.control_port.ethertype != 0x888e
+    {
+        return Err(Error::UnsupportedFirmware);
+    }
+    if config.privacy {
+        if settings.wpa_versions.is_some_and(|v| v != 2)
+            || settings
+                .pairwise_ciphers
+                .as_ref()
+                .is_some_and(|v| v.as_slice() != [0x000fac04])
+            || settings.group_cipher.is_some_and(|v| v != 0x000fac04)
+            || settings
+                .akms
+                .as_ref()
+                .is_some_and(|v| v.as_slice() != [0x000fac02])
+            || !settings.control_port.enabled
+            || !settings.control_port.over_nl80211
+        {
+            return Err(Error::UnsupportedFirmware);
+        }
+    } else if settings.wpa_versions.is_some_and(|v| v != 0)
+        || settings
+            .pairwise_ciphers
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+        || settings.group_cipher.is_some_and(|v| v != 0)
+        || settings.akms.as_ref().is_some_and(|v| !v.is_empty())
+    {
+        return Err(Error::UnsupportedFirmware);
+    }
+    Ok(())
+}
+
 /// Linux mt76_connac_mcu_uni_add_bss for the AP vif: the infrastructure AP
 /// BSS-basic request, with `vif->p2p` selecting CONNECTION_P2P_GO.
-fn role_bss(plan: &Plan, enable: bool) -> Result<[u8; 44], Error> {
+pub(super) fn role_bss(plan: &Plan, enable: bool) -> Result<[u8; 44], Error> {
     let mut bss = ap_wire::bss_on(
         plan.vif,
         plan.own,

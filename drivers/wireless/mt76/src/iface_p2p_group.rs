@@ -83,6 +83,7 @@ impl Mt76Iface {
             || self.ap_owned.load(Ordering::Acquire)
             || self.monitor_started.load(Ordering::Acquire)
             || self.p2p_group.lock().is_some()
+            || self.p2p_go.lock().is_some()
         {
             return Err(WirelessError::Busy);
         }

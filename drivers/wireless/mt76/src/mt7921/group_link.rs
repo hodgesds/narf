@@ -23,13 +23,23 @@ use core::ops::{Deref, DerefMut};
 /// Captured packets one link may hold for its owner before the oldest drop.
 const DEMUX_DEPTH: usize = 64;
 
+/// Which owner a `data_pending` entry belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingOwner {
+    /// A station owner's frame (home or group link).
+    Station(Link),
+    /// The concurrent P2P GO's frame (`go_link`).
+    Go,
+    /// A non-station owner's frame (home AP, P2P device).
+    Other,
+}
+
 /// One device-wide data/management TX FIFO (`data_pending`) whose entries
-/// carry their owner: `Some(link)` for a station owner's frame, `None` for
-/// a non-station owner (AP, P2P device). The native token pipeline retires
-/// in submission order, so the front entry owns the next completion.
+/// carry their owner. The native token pipeline retires in submission
+/// order, so the front entry owns the next completion.
 #[derive(Debug, Default)]
 pub(super) struct DataPending {
-    entries: alloc::collections::VecDeque<(u64, Option<Link>)>,
+    entries: alloc::collections::VecDeque<(u64, PendingOwner)>,
 }
 impl DataPending {
     pub(super) fn is_empty(&self) -> bool {
@@ -45,32 +55,57 @@ impl DataPending {
     pub(super) fn front(&self) -> Option<&u64> {
         self.entries.front().map(|(started, _)| started)
     }
+    /// The oldest entry's owner.
+    pub(super) fn front_owner(&self) -> Option<PendingOwner> {
+        self.entries.front().map(|(_, owner)| *owner)
+    }
     pub(super) fn pop_front(&mut self) -> Option<u64> {
         self.entries.pop_front().map(|(started, _)| started)
     }
-    pub(super) fn pop_owner(&mut self) -> Option<Option<Link>> {
+    pub(super) fn pop_owner(&mut self) -> Option<PendingOwner> {
         self.entries.pop_front().map(|(_, owner)| owner)
     }
     /// A non-station owner's entry.
     pub(super) fn push_back(&mut self, started: u64) {
-        self.entries.push_back((started, None));
+        self.entries.push_back((started, PendingOwner::Other));
     }
     /// A station owner's entry.
     pub(super) fn push_owned(&mut self, started: u64, link: Link) {
-        self.entries.push_back((started, Some(link)));
+        self.entries
+            .push_back((started, PendingOwner::Station(link)));
+    }
+    /// The concurrent GO's entry.
+    pub(super) fn push_go(&mut self, started: u64) {
+        self.entries.push_back((started, PendingOwner::Go));
     }
     /// The oldest entry `link` waits on (its own or a non-station one).
     pub(super) fn oldest_for(&self, link: Link) -> Option<u64> {
         self.entries
             .iter()
-            .find(|(_, owner)| owner.is_none_or(|owner| owner == link))
+            .find(|(_, owner)| {
+                matches!(owner, PendingOwner::Other) || *owner == PendingOwner::Station(link)
+            })
+            .map(|(started, _)| *started)
+    }
+    /// The GO's oldest entry.
+    pub(super) fn oldest_go(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(_, owner)| *owner == PendingOwner::Go)
             .map(|(started, _)| *started)
     }
     /// Entries a station owner still owns.
     pub(super) fn owned_by(&self, link: Link) -> usize {
         self.entries
             .iter()
-            .filter(|(_, owner)| *owner == Some(link))
+            .filter(|(_, owner)| *owner == PendingOwner::Station(link))
+            .count()
+    }
+    /// Entries the concurrent GO still owns.
+    pub(super) fn go_owned(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, owner)| *owner == PendingOwner::Go)
             .count()
     }
 }
@@ -166,7 +201,8 @@ impl<B: Backend> Session<B> {
         if own == [0; 6] || own[0] & 1 != 0 {
             return Err(Error::Bounds);
         }
-        if self.group.is_some() {
+        // One concurrent group vif: a client link or a GO, never both.
+        if self.group.is_some() || self.go.is_some() {
             return Err(Error::Busy);
         }
         let mut info = match self.state {
@@ -308,11 +344,14 @@ impl<B: Backend> Session<B> {
     /// True while the group owner holds native state: a published vif, an
     /// association (BSS or key) or a failed role awaiting recovery.
     pub(super) fn group_published(&self) -> bool {
-        self.group.as_ref().is_some_and(|group| {
-            !matches!(group.state, State::RadioReady(_))
-                || group.station.bss.is_some()
-                || group.station.security.is_some()
-        })
+        // A GO owner past RadioReady holds a native BSS/beacon too.
+        self.go_state()
+            .is_some_and(|(_, state)| !matches!(state, State::RadioReady(_)))
+            || self.group.as_ref().is_some_and(|group| {
+                !matches!(group.state, State::RadioReady(_))
+                    || group.station.bss.is_some()
+                    || group.station.security.is_some()
+            })
     }
     /// Retire the group owner after a verified MAC/firmware reset or once
     /// it is idle: its WCID returns to the shared map. Recovery never runs
@@ -344,6 +383,7 @@ impl<B: Backend> Session<B> {
         }
         self.other_station_permission()
             .is_none_or(|live| live == permission)
+            && self.shares_go_channel(permission)
     }
     /// Whether a decoded copy belongs to the other (swapped-out) station
     /// owner (`owns_rx`).
@@ -379,10 +419,14 @@ impl<B: Backend> Session<B> {
         mut f: impl FnMut(&mut B, &[u8]) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
         let own = self.own_rx_identity();
-        self.wait_split(ms, |backend, other| {
+        self.wait_split(ms, |backend, other, go| {
             for _ in 0..16 {
                 let Some(packet) = backend.receive_data_captured()? else {
                     break;
+                };
+                // The concurrent GO's copy goes to its demux queue.
+                let Some(packet) = Session::<B>::split_go(go, packet) else {
+                    continue;
                 };
                 if let Some(other) = other.as_mut() {
                     if super::scan::rx_native_with_amsdu(&packet.bytes)
@@ -420,7 +464,7 @@ impl<B: Backend> Session<B> {
         completion: crate::mt7921::packet_tx::Completion,
     ) -> Option<crate::mt7921::packet_tx::Completion> {
         match self.data_pending.pop_owner() {
-            Some(Some(link)) if link != self.station.link => {
+            Some(PendingOwner::Station(link)) if link != self.station.link => {
                 if let Some(other) = self
                     .group
                     .as_mut()
@@ -430,6 +474,10 @@ impl<B: Backend> Session<B> {
                         other.station.tx_credit.push_back(completion.status);
                     }
                 }
+                None
+            }
+            Some(PendingOwner::Go) => {
+                self.credit_go(completion.status);
                 None
             }
             _ => Some(completion),

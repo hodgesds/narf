@@ -907,3 +907,148 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_p2p_group_link_drives_association_on_group_vif
 );
+
+/// A P2P GO on a non-home AP vif beside a live home station (Linux
+/// `mt7921_add_interface` + `mt7921_start_ap` on a second vif of the shared
+/// chanctx): START publishes DEV_INFO/BSS (CONNECTION_P2P_GO), BMC and
+/// beacon on vif 1 without re-tuning the radio or resetting it; the home
+/// association is untouched; RX/TX completions are attributed per owner;
+/// STOP retires the GO vif in place (BSS then DEV_INFO disable).
+fn go_beside_station() -> Result<(), &'static str> {
+    use crate::mt7921::packet_tx::Completion;
+    use crate::mt7921::vif_slots::{Link, Vif};
+    let (mut session, bss) = super::super::super::ht20_tests::prepared(6, true);
+    let home = session.state;
+    if !matches!(home, State::Associated { channel: 6, .. }) {
+        return Err("home station fixture is not associated on channel 6");
+    }
+    let (_physical, binding, source) = super::concrete()?;
+    binding
+        .iface
+        .set_iftype(9)
+        .map_err(|_| "GO-mode authority interface")?;
+    narf_net::iface::set_link_state(binding.iface.name(), true);
+    let authority = super::bound(&binding, &source)?;
+    let own = binding.iface.mac();
+    let vif = Vif::new(1).map_err(|_| "vif")?;
+    session.open_go(vif, own).map_err(|_| "GO reservation")?;
+    if session.open_go(vif, own) != Err(Error::Busy)
+        || session.open_group_link(Vif::new(2).map_err(|_| "vif 2")?, [2, 9, 9, 9, 9, 9])
+            != Err(Error::Busy)
+        || !matches!(session.go_state(), Some((v, State::RadioReady(_))) if v == vif)
+    {
+        return Err("a second GO or a client link opened beside the GO");
+    }
+    let before = session.backend.frames.len();
+    let epoch = run(Box::pin(session.start_go(
+        authority.clone(),
+        config(own),
+        narf_wireless::ApStartSettings::default(),
+    )))
+    .map_err(|_| "GO START beside the home station")?;
+    let frames = &session.backend.frames[before..];
+    let started = basic_bss(frames);
+    if session.state != home
+        || session.station.link != Link::HOME
+        || session.ap_owner.is_some()
+        || !matches!(session.go_state(), Some((_, State::AccessPoint { .. })))
+        || started.is_empty()
+        || started
+            .iter()
+            .any(|body| body[0] != vif.index() || body[12..16] != P2P_GO)
+    {
+        return Err("GO START left its own vif or disturbed the home role");
+    }
+    // The shared chanctx is the home owner's: no channel switch.
+    if frames
+        .iter()
+        .any(|(_, frame)| ext_id(frame) == Some(crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH))
+    {
+        return Err("GO START re-tuned the home station's channel");
+    }
+    if session.go_receive_current(epoch) != Ok(true)
+        || session.receive_current(session.receive_epoch) != Ok(true)
+    {
+        return Err("GO and home station are not both receive-current");
+    }
+    // RX demux in the home role: a copy to the GO address is the GO's,
+    // the home peer's WCID stays home.
+    let go_rx = rx_copy(&bss, own, 0x3ff);
+    let home_rx = rx_copy(
+        &bss,
+        session.station.bss.as_ref().ok_or("home BSS")?.bssid,
+        1,
+    );
+    let owns = |session: &NativeSession, packet: &[u8]| {
+        super::super::super::super::scan::rx_native_with_amsdu(packet)
+            .is_some_and(|native| session.go_owns_rx(&native))
+    };
+    if !owns(&session, &go_rx) || owns(&session, &home_rx) {
+        return Err("GO RX demux owner");
+    }
+    // Same channel only: a home grant on another channel is refused.
+    if !session.shares_channel_context(test_permission())
+        || session.shares_channel_context(test_permission_for(11))
+    {
+        return Err("home join accepted a channel other than the GO's");
+    }
+    // A home wait credits the GO's completion to the GO.
+    session.data_pending.clear();
+    session.data_pending.push_go(1);
+    session.data_pending.push_owned(2, Link::HOME);
+    let done = |token| Completion { token, status: 0 };
+    if session.data_pending.oldest_for(Link::HOME) != Some(2)
+        || session.retire_data(done(1)).is_some()
+        || session.retire_data(done(2)).map(|c| c.token) != Some(2)
+    {
+        return Err("a home wait consumed the GO's TX completion");
+    }
+    session
+        .step_go_network(None)
+        .map_err(|_| "GO data step with a credited completion")?;
+    if session.close_go() != Err(Error::Busy)
+        || run(Box::pin(session.suspend())) != Err(Error::Busy)
+    {
+        return Err("a started GO closed or suspended in place");
+    }
+    let stop = session.backend.frames.len();
+    run(Box::pin(session.stop_go())).map_err(|_| "GO STOP")?;
+    let stopped = &session.backend.frames[stop..];
+    let bss_off = basic_bss(stopped);
+    let dev_off: Vec<_> = stopped
+        .iter()
+        .filter_map(|(_, frame)| uni(frame, 1))
+        .collect();
+    if session.state != home
+        || !matches!(session.go_state(), Some((_, State::RadioReady(_))))
+        || bss_off
+            .iter()
+            .any(|body| body[0] != vif.index() || body[12..16] != P2P_GO)
+        || bss_off.is_empty()
+        || dev_off.is_empty()
+    {
+        return Err("GO STOP differs from mt7921_stop_ap + mt792x_remove_interface");
+    }
+    session.close_go().map_err(|_| "idle GO close")?;
+    narf_net::iface::set_link_state(binding.iface.name(), false);
+    binding
+        .iface
+        .set_iftype(2)
+        .map_err(|_| "authority interface did not return to STATION")?;
+    Ok(())
+}
+/// The extended MCU command id of a native command frame, if any.
+fn ext_id(frame: &[u8]) -> Option<u8> {
+    // `station::Command::encode`: cid 0xed marks an extended command and
+    // byte 41 carries its ext_cid.
+    (frame.get(36) == Some(&0xed))
+        .then(|| frame.get(41).copied())
+        .flatten()
+}
+fn mt76_p2p_go_beside_station_owns_vif_rx_tx() -> TestResult {
+    go_beside_station().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_go_beside_station_owns_vif_rx_tx
+);

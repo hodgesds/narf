@@ -8,23 +8,14 @@ impl<B: Backend> Session<B> {
         &self,
         epoch: u64,
     ) -> Result<bool, Error> {
-        self.backend.check()?;
         let Some(owner) = self.ap_owner.as_ref() else {
+            self.backend.check()?;
             return Ok(false);
         };
-        if !matches!(self.state, State::AccessPoint { .. })
-            || !owner.activated
-            || epoch == 0
-            || epoch != self.receive_epoch
-        {
-            return Ok(false);
-        }
-        owner.identity.current().map_err(|_| Error::Authority)?;
-        self.backend.check_tx_permission(owner.plan.permission)?;
-        Ok(true)
+        self.owner_ap_receive_current(owner, &self.state, epoch)
     }
     fn ap_data_failure(&mut self, error: Error) -> Error {
-        self.backend.close_receive_capture(self.receive_epoch);
+        self.close_ap_capture(self.receive_epoch);
         if let Some(owner) = self.ap_owner.as_mut() {
             owner.activated = false;
         }
@@ -47,14 +38,24 @@ impl<B: Backend> Session<B> {
         {
             return Err(Error::Busy);
         }
-        if let Some(started) = self.data_pending.front().copied() {
+        if let Err(error) = self.settle_go_credit() {
+            return Err(self.ap_data_failure(error));
+        }
+        // A GO measures its timeout from its own oldest entry; a home
+        // station entry ahead of it is credited to the home link.
+        let oldest = if self.go_role() {
+            self.data_pending.oldest_go()
+        } else {
+            self.data_pending.front().copied()
+        };
+        if let Some(started) = oldest {
             match self.backend.management_complete() {
-                Ok(Some(completion)) if completion.status == 0 => {
-                    self.data_pending.pop_front();
-                }
-                Ok(Some(completion)) => {
-                    return Err(self.ap_data_failure(Error::Rejected(completion.status)));
-                }
+                Ok(Some(completion)) => match self.retire_ap_completion(completion) {
+                    Some(completion) if completion.status != 0 => {
+                        return Err(self.ap_data_failure(Error::Rejected(completion.status)));
+                    }
+                    _ => (),
+                },
                 Ok(None)
                     if self.backend.now_ns().saturating_sub(started)
                         >= super::super::TIMEOUT_MS * 1_000_000 =>
@@ -66,7 +67,13 @@ impl<B: Backend> Session<B> {
             }
         }
         let mut transmitted = false;
-        if self.data_pending.is_empty() {
+        let idle = if self.go_role() {
+            self.data_pending.go_owned() == 0
+                && self.data_pending.len() < crate::mt7921::packet_tx::PIPELINE
+        } else {
+            self.data_pending.is_empty()
+        };
+        if idle {
             if let Some(frame) = tx {
                 match self.ap_transmit(frame) {
                     Ok(()) => transmitted = true,
@@ -77,12 +84,17 @@ impl<B: Backend> Session<B> {
         }
         let mut received = alloc::vec::Vec::new();
         for _ in 0..16 {
-            let captured = match self.backend.receive_data_captured() {
+            let captured = match self.next_ap_copy() {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
                 Err(e) => return Err(self.ap_data_failure(e)),
             };
-            if !captured.port_open || captured.epoch != self.receive_epoch {
+            if !captured.port_open
+                || !self
+                    .ap_owner
+                    .as_ref()
+                    .is_some_and(|owner| self.ap_epoch_admits(owner, captured.epoch))
+            {
                 continue;
             }
             if !self
@@ -165,7 +177,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         self.backend.submit_ap_frame(vif, &wire, wcid, rate)?;
-        self.data_pending.push_back(self.backend.now_ns());
+        self.push_ap_pending();
         Ok(())
     }
     pub(in crate::mt7921::firmware_transport) fn pop_ap_event(
@@ -181,7 +193,11 @@ impl<B: Backend> Session<B> {
             .events
             .pop_front()
         {
-            if event.epoch == self.receive_epoch {
+            if self
+                .ap_owner
+                .as_ref()
+                .is_some_and(|owner| self.ap_epoch_admits(owner, event.epoch))
+            {
                 return Ok(Some(event));
             }
         }

@@ -16,6 +16,7 @@ impl Drop for Binding {
         drop(active);
         self.iface.close_ap_host();
         self.iface.withdraw_p2p_group();
+        self.iface.withdraw_p2p_go();
         self.iface.withdraw_p2p_metadata();
         narf_wireless::registry::unregister(self.iface.name());
         narf_net::registry().unregister(self.iface.name());

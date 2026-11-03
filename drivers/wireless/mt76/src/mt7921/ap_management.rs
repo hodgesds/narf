@@ -59,7 +59,7 @@ impl<B: Backend> Session<B> {
                 self.backend.arm_ap_management(vif, wcid)?;
             }
             self.backend.submit_ap_management(vif, frame, wcid, rate)?;
-            self.data_pending.push_back(self.backend.now_ns());
+            self.push_ap_pending();
             let terminal = self
                 .wait(super::super::TIMEOUT_MS, |b| b.management_complete())
                 .await?;

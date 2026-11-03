@@ -444,6 +444,10 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
 
 impl<B: Backend> Session<B> {
     pub(super) fn renew_receive_epoch(&mut self) -> Result<(), Error> {
+        // A GO fence leaves the home station owner untouched.
+        if self.go_role() {
+            return self.renew_go_receive_epoch();
+        }
         self.cancel_transmit_ba_restart();
         // No partial MSDU survives a key or association change.
         self.station.rx_fragments.clear();
@@ -515,12 +519,14 @@ impl<B: Backend> Session<B> {
     /// The swapped-out station owner (the group link, or the home link
     /// while a group operation runs) under the same shared capture epoch.
     pub(super) fn other_receive_current(&self) -> Result<bool, Error> {
-        match self.group.as_ref() {
+        let group = match self.group.as_ref() {
             Some(other) => {
-                self.owner_receive_current(&other.station, &other.state, self.receive_epoch)
+                self.owner_receive_current(&other.station, &other.state, self.receive_epoch)?
             }
-            None => Ok(false),
-        }
+            None => false,
+        };
+        // A live concurrent GO keeps the shared capture open too.
+        Ok(group || self.go_receive_current(self.receive_epoch)?)
     }
     pub(super) fn owner_receive_current(
         &self,
@@ -967,12 +973,21 @@ impl<B: Backend> Session<B> {
             // original to that link before this owner's epoch/channel
             // gates (Linux `mt792x_rx_get_wcid` -> its `mt792x_sta`); that
             // owner applies its own gates when it drains the queue.
-            if self.group.is_some()
-                && super::scan::rx_native_with_amsdu(&packet.bytes)
-                    .is_some_and(|native| self.other_owns_rx(&native))
-            {
-                self.forward_to_other(packet);
-                continue;
+            if self.group.is_some() || self.go.is_some() {
+                let (group, go) = super::scan::rx_native_with_amsdu(&packet.bytes)
+                    .map_or((false, false), |native| {
+                        (self.other_owns_rx(&native), self.go_owns_rx(&native))
+                    });
+                if group {
+                    self.forward_to_other(packet);
+                    continue;
+                }
+                // The concurrent GO's copy (a GO peer WCID, the GO address
+                // or a broadcast probe request): queued for the GO step.
+                if go {
+                    self.forward_to_go(packet);
+                    continue;
+                }
             }
             if !self.epoch_admits(&self.station, packet.epoch) {
                 self.clear_aggregate_receive();
@@ -2044,7 +2059,7 @@ impl<B: Backend> Session<B> {
                 {
                     // The radio's channel is shared with the other live
                     // station owner; no single-channel narrowing moves it.
-                    if self.other_station_permission().is_some() {
+                    if self.other_station_permission().is_some() || self.go_plan().is_some() {
                         return Err(Error::Busy);
                     }
                     self.station.permission = Some(narrower);

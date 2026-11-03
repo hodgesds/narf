@@ -309,6 +309,19 @@ pub(super) async fn run_session<B: Backend>(
     Ok(reply)
 }
 
+/// A GO control request: START/STOP have their own no-reset owners
+/// (`go_link::start_go`/`stop_go`); everything else is the AP owner's.
+pub(super) async fn apply_go<B: Backend>(
+    session: &mut Session<B>,
+    authority: Arc<ApControlAuthority>,
+    operation: Request,
+) -> Result<Reply, Error> {
+    match operation {
+        Request::Start(_) | Request::Stop => Err(Error::Bounds),
+        operation => apply(session, authority, operation).await,
+    }
+}
+
 async fn apply<B: Backend>(
     session: &mut Session<B>,
     authority: Arc<ApControlAuthority>,

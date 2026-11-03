@@ -43,6 +43,8 @@ mod p2p_management_wire;
 mod p2p_profile;
 pub(crate) use p2p_profile::P2pProfile;
 
+#[path = "go_link.rs"]
+mod go_link;
 #[path = "group_link.rs"]
 mod group_link;
 #[path = "station_mcu.rs"]
@@ -769,6 +771,79 @@ pub(crate) fn boot_group_link() -> Option<(crate::mt7921::vif_slots::Link, State
     let owner = BOOT_OWNER.try_lock()?;
     let owner = owner.as_ref()?;
     Some((owner.group_link()?, owner.group_state()?))
+}
+
+/// Reserve the concurrent P2P GO vif `vif` with own address `own` on the
+/// retained boot owner (no native command).
+pub(crate) fn open_boot_go(vif: crate::mt7921::vif_slots::Vif, own: [u8; 6]) -> Result<(), Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.open_go(vif, own)
+}
+/// Close an idle reserved GO that never sent a native command.
+pub(crate) fn close_boot_go() -> Result<(), Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.close_go()
+}
+/// START the GO beside the home station (`mt7921_add_interface` +
+/// `mt7921_start_ap` on the GO vif, no reset); returns its receive epoch.
+pub(crate) async fn start_boot_go(
+    authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+    config: narf_wireless::ApConfig,
+    settings: narf_wireless::ApStartSettings,
+) -> Result<u64, Error> {
+    boot_owner_call!(owner => owner.start_go(authority, config, settings))
+}
+/// STOP the GO (`mt7921_stop_ap` + `mt792x_remove_interface`, no reset).
+pub(crate) async fn stop_boot_go() -> Result<(), Error> {
+    boot_owner_call!(owner => owner.stop_go())
+}
+/// One AP control request on the GO (beacon, stations, keys, TX).
+pub(crate) async fn boot_go_request(
+    authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+    request: boot_ap::Request,
+) -> Result<boot_ap::Reply, Error> {
+    boot_owner_call!(owner => owner.go_request(authority, request))
+}
+/// One bounded GO data step after pending home/group key work, exactly as
+/// `step_boot_group_network`.
+pub(crate) fn step_boot_go_network(
+    tx: Option<&[u8]>,
+) -> Result<(PacketStep, Vec<ApRxEvent>), Error> {
+    prepare_boot_keys()?;
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match poll_boot_keys(&mut cx) {
+        Poll::Ready(result) => result?,
+        Poll::Pending => return Err(Error::Busy),
+    }
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.step_go_network(tx)
+}
+/// Whether a GO batch epoch is still current (`go_receive_current`).
+pub(crate) fn boot_go_receive_current(epoch: u64) -> Result<bool, Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Ok(false);
+    };
+    owner
+        .as_ref()
+        .map_or(Ok(false), |owner| owner.go_receive_current(epoch))
+}
+/// The retained boot owner's GO vif and role state.
+pub(crate) fn boot_go_state() -> Option<(crate::mt7921::vif_slots::Vif, State)> {
+    let owner = BOOT_OWNER.try_lock()?;
+    owner.as_ref()?.go_state()
+}
+/// The GO's peer addresses.
+pub(crate) fn boot_go_stations() -> Vec<[u8; 6]> {
+    BOOT_OWNER
+        .try_lock()
+        .and_then(|owner| owner.as_ref().map(|owner| owner.go_station_macs()))
+        .unwrap_or_default()
 }
 
 /// Recovery owns its transport across polls, including after caller
@@ -1700,6 +1775,9 @@ struct Session<B: Backend> {
     /// `mt792x_vif` per vif); opened by `open_group_link`. While a group
     /// operation runs (`enter_group`) it holds the swapped-out home owner.
     group: Option<GroupOwner>,
+    /// A concurrent P2P GO vif's AP owner (`go_link`); while a GO
+    /// operation runs (`enter_go`) it holds the swapped-out home role.
+    go: Option<go_link::GoOwner>,
     /// Peer WCIDs owned by station links (Linux `dev->wcid_mask`).
     wtbl: crate::mt7921::vif_slots::Wtbl,
     /// The wiphy fragmentation threshold (`u32::MAX` = off).
@@ -1734,6 +1812,7 @@ impl<B: Backend> Session<B> {
             data_pending: group_link::DataPending::default(),
             station: StationLink::new(crate::mt7921::vif_slots::Link::HOME),
             group: None,
+            go: None,
             wtbl: crate::mt7921::vif_slots::Wtbl::default(),
             frag_threshold: u32::MAX,
             receive_epoch: 0,
@@ -1756,7 +1835,7 @@ impl<B: Backend> Session<B> {
         ms: u64,
         mut f: impl FnMut(&mut B) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
-        self.wait_split(ms, |backend, _| f(backend)).await
+        self.wait_split(ms, |backend, _, _| f(backend)).await
     }
     /// `wait` whose poll also borrows the swapped-out station owner, so a
     /// station wait can hand the other owner's frames and TX completions
@@ -1764,7 +1843,11 @@ impl<B: Backend> Session<B> {
     async fn wait_split<T>(
         &mut self,
         ms: u64,
-        mut f: impl FnMut(&mut B, &mut Option<GroupOwner>) -> Result<Option<T>, Error>,
+        mut f: impl FnMut(
+            &mut B,
+            &mut Option<GroupOwner>,
+            &mut Option<go_link::GoOwner>,
+        ) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
         let start = self.backend.now_ns();
         poll_fn(|cx| {
@@ -1834,7 +1917,7 @@ impl<B: Backend> Session<B> {
             {
                 return Poll::Ready(Err(Error::Timeout));
             }
-            match f(&mut self.backend, &mut self.group) {
+            match f(&mut self.backend, &mut self.group, &mut self.go) {
                 Ok(Some(value)) => Poll::Ready(Ok(value)),
                 Err(error) => Poll::Ready(Err(error)),
                 Ok(None) => {
