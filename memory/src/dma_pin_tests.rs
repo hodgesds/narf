@@ -14,12 +14,18 @@
 mod x86_64 {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    // The racing-pin test drives `swap::__test_after_swap_commit`, which
+    // exists only with the kernel-test feature, so it and the items only it
+    // uses are built only with that feature.
+    #[cfg(feature = "kernel-test")]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use narf_kernel_test::{kernel_test_in, TestResult};
+    #[cfg(feature = "kernel-test")]
     use narf_lib::sync::IrqSafeSpinLock;
 
     use crate::address_space::{AddressSpace, Region, RegionPerms, UserPagePin};
+    #[cfg(feature = "kernel-test")]
     use crate::mmu_notifier::{
         MmuInterval, MmuIntervalNotifier, MmuIntervalNotifierOps, MmuNotifierRange,
     };
@@ -94,7 +100,9 @@ mod x86_64 {
     }
 
     /// Counts invalidations; allocation-free, as callbacks must be.
+    #[cfg(feature = "kernel-test")]
     struct Count(AtomicUsize);
+    #[cfg(feature = "kernel-test")]
     impl MmuIntervalNotifierOps for Count {
         fn invalidate(&self, _: &MmuInterval, _: &MmuNotifierRange, _: u64) {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -178,11 +186,14 @@ mod x86_64 {
     }
     kernel_test_in!("memory", smoke_dma_pin_swap_out_skips_pinned_page);
 
+    #[cfg(feature = "kernel-test")]
     static RACE_TARGET: IrqSafeSpinLock<Option<(Arc<AddressSpace>, u64)>> =
         IrqSafeSpinLock::new(None);
+    #[cfg(feature = "kernel-test")]
     static RACE_PIN: IrqSafeSpinLock<Option<UserPagePin>> = IrqSafeSpinLock::new(None);
 
     /// Runs inside the swap batch after its PTE commit, with no lock held.
+    #[cfg(feature = "kernel-test")]
     fn pin_after_swap_commit() {
         let target = RACE_TARGET.lock().clone();
         if let Some((space, at)) = target {
@@ -195,6 +206,7 @@ mod x86_64 {
     /// before it published them refuses that page: its exact leaf comes back,
     /// its slot is released, no invalidation fires for it, and the device's
     /// writes stay visible. The other page of the batch is swapped.
+    #[cfg(feature = "kernel-test")]
     fn smoke_dma_pin_swap_commit_refuses_racing_pin() -> TestResult {
         const BASE: u64 = 0x0000_0080_6f20_0000;
         if let Err(result) = swap_ready() {
@@ -258,6 +270,7 @@ mod x86_64 {
         }
         TestResult::Pass
     }
+    #[cfg(feature = "kernel-test")]
     kernel_test_in!("memory", smoke_dma_pin_swap_commit_refuses_racing_pin);
 
     /// Lazy-free never discards a page a device may have written through a
