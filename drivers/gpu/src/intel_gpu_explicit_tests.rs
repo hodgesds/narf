@@ -318,15 +318,14 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
     put64(&mut wire, 40, abi::EXEC_FENCE_IN);
     put64(&mut wire, 56, 99);
     assert!(matches!(
-        SyncRequest::read(&user, &wire),
+        SyncRequest::read(&user, &wire, &file.syncobjs),
         Err(FsError::InvalidData)
     ));
     // A sync_file containing the signalled stub has zero leaf dependencies.
     user.files.lock().insert(99, Vec::new());
-    let resolved = SyncRequest::read(&user, &wire)
+    let resolved = SyncRequest::read(&user, &wire, &file.syncobjs)
         .unwrap()
-        .resolve(&file.syncobjs)
-        .unwrap();
+        .resolve();
     narf_scheduler::block_on_spin(resolved.wait());
     wire = [0; 64];
     put64(&mut wire, 40, abi::EXEC_FENCE_ARRAY);
@@ -341,7 +340,7 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
         put32(&mut entry, 0, object);
         put32(&mut entry, 4, flags);
         user.user.store(1024, &entry);
-        let result = SyncRequest::read(&user, &wire).and_then(|s| s.resolve(&file.syncobjs));
+        let result = SyncRequest::read(&user, &wire, &file.syncobjs).map(SyncRequest::resolve);
         assert!(matches!(result,Err(e) if e==error));
         assert!(core.fence().is_none());
     }
@@ -351,7 +350,7 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
         abi::EXEC_FENCE_ARRAY | abi::EXEC_USE_EXTENSIONS,
     );
     assert!(matches!(
-        SyncRequest::read(&user, &wire),
+        SyncRequest::read(&user, &wire, &file.syncobjs),
         Err(FsError::InvalidData)
     ));
     put32(&mut wire, 28, 0);
@@ -364,7 +363,7 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
     put64(&mut extension, 0, 1536);
     user.user.store(1536, &extension);
     assert!(matches!(
-        SyncRequest::read(&user, &wire),
+        SyncRequest::read(&user, &wire, &file.syncobjs),
         Err(FsError::ArgumentListTooLong)
     ));
     // Only DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES (0) is in the table.
@@ -372,7 +371,7 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
     put32(&mut extension, 8, 1);
     user.user.store(1536, &extension);
     assert!(matches!(
-        SyncRequest::read(&user, &wire),
+        SyncRequest::read(&user, &wire, &file.syncobjs),
         Err(FsError::InvalidData)
     ));
     put32(&mut extension, 8, 0);
@@ -387,23 +386,162 @@ fn smoke_explicit_wire_failures_leave_syncobjs_untouched() -> TestResult {
     user.user.store(1024, &entry);
     user.user.store(2048, &7u64.to_le_bytes());
     assert!(
-        matches!(SyncRequest::read(&user, &wire), Err(FsError::InvalidData)),
+        matches!(SyncRequest::read(&user, &wire, &file.syncobjs), Err(FsError::InvalidData)),
         "waiting and signalling the same timeline point creates a cycle"
     );
-    put32(&mut entry, 4, 2);
-    user.user.store(1024, &entry);
-    put64(&mut extension, 32, 4097);
-    user.user.store(1536, &extension);
-    assert!(matches!(
-        SyncRequest::read(&user, &wire),
-        Err(FsError::InvalidData)
-    ));
     assert!(core.fence().is_none());
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_explicit_wire_failures_leave_syncobjs_untouched
+);
+
+/// MIT Linux b90c984d i915_gem_execbuffer.c::add_timeline_fence_array:2786
+/// and add_fence_array:2919: overflow bound (EINVAL), access_ok of each
+/// array (EFAULT) and the eb->fences krealloc (ENOMEM above KMALLOC_MAX_SIZE)
+/// precede the entries; then each entry is copied, flag-checked, its point
+/// read, its syncobj found (ENOENT) and its fence resolved before the next
+/// entry is copied. i915_gem_do_execbuffer parses the IN/SUBMIT sync_file
+/// only after both arrays. There is no other fence-count bound.
+fn smoke_explicit_fence_arrays_resolve_entry_by_entry() -> TestResult {
+    use crate::intel_gpu_exec_sync::SyncRequest;
+    const END: u64 = 32768; // first unreadable fixture byte
+    const USER_LIMIT: u64 = 1 << 47; // NARF's user half, as access_ok's
+    let file = RenderFile::new();
+    let user = Fds::new();
+    let handle = file.syncobjs.lock().create(0).unwrap();
+    let core = file.syncobjs.lock().get(handle).unwrap().core().clone();
+    let bad = handle + 100;
+    let entry = |at: u64, handle: u32, flags: u32| {
+        let mut bytes = [0; 8];
+        put32(&mut bytes, 0, handle);
+        put32(&mut bytes, 4, flags);
+        user.user.store(at, &bytes);
+    };
+    // A TIMELINE_FENCES link at `at`.
+    let link = |at: u64, next: u64, count: u64, handles: u64, values: u64| {
+        let mut extension = [0; 56];
+        put64(&mut extension, 0, next);
+        put64(&mut extension, 32, count);
+        put64(&mut extension, 40, handles);
+        put64(&mut extension, 48, values);
+        user.user.store(at, &extension);
+    };
+    let timeline = |chain: u64| {
+        let mut wire = [0; 64];
+        put64(&mut wire, 40, abi::EXEC_USE_EXTENSIONS);
+        put64(&mut wire, 32, chain);
+        SyncRequest::read(&user, &wire, &file.syncobjs).map(|_| ())
+    };
+    let binary = |flags: u64, count: u32, array: u64, fd: u64| {
+        let mut wire = [0; 64];
+        put64(&mut wire, 40, abi::EXEC_FENCE_ARRAY | flags);
+        put32(&mut wire, 28, count);
+        put64(&mut wire, 32, array);
+        put64(&mut wire, 56, fd);
+        SyncRequest::read(&user, &wire, &file.syncobjs).map(|_| ())
+    };
+    user.user.store(2048, &[0; 16]); // two readable zero points
+    let cases: [(u32, u32, u64, FsError, &str); 4] = [
+        (bad, 0, 2048, FsError::NotFound, "drm_syncobj_find before entry 1"),
+        (handle, 4, END, FsError::InvalidData, "flags before the point"),
+        (bad, 0, END, FsError::BadAddress, "the point before the find"),
+        (handle, 1, 2048, FsError::InvalidData, "WAIT with no fence"),
+    ];
+    for (object, flags, values, expected, why) in cases {
+        // Entry 1 of the handles array is past the readable fixture.
+        entry(END - 8, object, flags);
+        link(1536, 0, 2, END - 8, values);
+        assert_eq!(timeline(1536), Err(expected), "{why}");
+    }
+    // The same-point WAIT|SIGNAL refusal follows drm_syncobj_find.
+    entry(1024, bad, 3);
+    user.user.store(2048, &7u64.to_le_bytes());
+    link(1536, 0, 1, 1024, 2048);
+    assert_eq!(timeline(1536), Err(FsError::NotFound));
+    entry(1024, handle, 3);
+    assert_eq!(timeline(1536), Err(FsError::InvalidData));
+    user.user.store(2048, &[0; 8]);
+
+    // Preamble: access_ok of values precedes entry 0's ENOENT; the
+    // overflow bound is EINVAL; past it access_ok fails; the krealloc of
+    // (num_fences + nfences) * 32 bytes fails above 4 MiB.
+    entry(1024, bad, 0);
+    for (count, values, expected) in [
+        (2, USER_LIMIT - 8, FsError::BadAddress),
+        (1 << 59, 2048, FsError::InvalidData),
+        ((1 << 59) - 1, 2048, FsError::BadAddress),
+        (131_073, 2048, FsError::OutOfMemory),
+        (131_072, 2048, FsError::NotFound),
+    ] {
+        link(1536, 0, count, 1024, values);
+        assert_eq!(timeline(1536), Err(expected), "preamble {count}");
+    }
+    // eb->num_fences spans the chain's extensions; a skipped (fence-less,
+    // flag-less) entry is not added, an added SIGNAL entry is.
+    for (flags, expected) in [(0, FsError::NotFound), (2, FsError::OutOfMemory)] {
+        entry(4096, handle, flags);
+        link(1536, 1600, 1, 4096, 2048);
+        link(1600, 0, 131_072, 1024, 2048);
+        assert_eq!(timeline(1536), Err(expected), "accumulated {flags}");
+    }
+
+    // add_timeline_fence_array's `err` survives a tolerated SIGNAL
+    // find_seqno failure into a later fence-less entry of the same
+    // extension, but not into the next extension.
+    let binary_payload = file.syncobjs.lock().create(0).unwrap();
+    file.syncobjs
+        .lock()
+        .get(binary_payload)
+        .unwrap()
+        .core()
+        .replace_fence(Some(so::stub()));
+    entry(4096, binary_payload, 2);
+    entry(4104, handle, 0);
+    user.user.store(8192, &5u64.to_le_bytes());
+    user.user.store(8200, &[0; 8]);
+    link(1536, 0, 2, 4096, 8192);
+    assert_eq!(timeline(1536), Err(FsError::InvalidData));
+    link(1536, 1600, 1, 4096, 8192);
+    link(1600, 0, 1, 4104, 8200);
+    assert_eq!(timeline(1536), Ok(()));
+
+    // No 4096-entry cap: five links of 1000 SIGNAL entries, 5000 fences.
+    for n in 0..1000 {
+        entry(4096 + n * 8, handle, 2);
+    }
+    user.user.store(12288, &[0; 8000]);
+    for n in 0..5 {
+        let next = if n == 4 { 0 } else { 1600 + n * 64 };
+        link(1536 + n * 64, next, 1000, 4096, 12288);
+    }
+    assert_eq!(timeline(1536), Ok(()));
+
+    // FENCE_ARRAY: the same per-entry order and krealloc bound.
+    entry(END - 8, bad, 0);
+    assert_eq!(binary(0, 2, END - 8, 0), Err(FsError::NotFound));
+    entry(END - 8, handle, 1);
+    assert_eq!(binary(0, 2, END - 8, 0), Err(FsError::InvalidData));
+    entry(1024, bad, 0);
+    assert_eq!(binary(0, 131_073, 1024, 0), Err(FsError::OutOfMemory));
+    assert_eq!(binary(0, 131_072, 1024, 0), Err(FsError::NotFound));
+    assert_eq!(binary(0, 2, USER_LIMIT - 8, 0), Err(FsError::BadAddress));
+    assert_eq!(binary(0, 1000, 4096, 0), Ok(()));
+    // The array is parsed before the IN/SUBMIT sync_file and its checks.
+    for inputs in [
+        abi::EXEC_FENCE_IN,
+        abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT,
+    ] {
+        assert_eq!(binary(inputs, 1, 1024, 99), Err(FsError::NotFound));
+        assert_eq!(binary(inputs, 1, 4096, 99), Err(FsError::InvalidData));
+    }
+    assert!(core.fence().is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_explicit_fence_arrays_resolve_entry_by_entry
 );
 
 mod submit {

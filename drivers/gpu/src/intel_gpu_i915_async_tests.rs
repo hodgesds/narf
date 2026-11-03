@@ -696,7 +696,7 @@ kernel_test_in!(
 );
 
 fn request(file: &RenderFile, user: &User) -> ExecRequest {
-    ExecRequest::read_submission(user, 64, &file.gem).unwrap().0
+    ExecRequest::read_submission(user, 64, &file.gem, &file.syncobjs).unwrap().0
 }
 fn smoke_i915_object_async_publication_output_failure_and_exact_fence() -> TestResult {
     let platform = GtPlatform::Battlemage;

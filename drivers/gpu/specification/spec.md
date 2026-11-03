@@ -1187,8 +1187,17 @@ SIGNAL=2. Timeline extensions use the 32-byte i915 base, count:u64,
 handles_ptr:u64 and values_ptr:u64. Arrays and extensions are mutually
 exclusive; flags, reserved fields, unknown extensions and same-point
 timeline WAIT|SIGNAL fail before publication. A cycle is walked to the 513th
-link (E2BIG), as is any longer chain. Limits are 512 extension links and 4096
-entries/dependencies per request. Existing timeline payloads preserve
+link (E2BIG), as is any longer chain. Each array follows
+add_fence_array/add_timeline_fence_array: the overflow bound (EINVAL), access_ok
+of each user array (EFAULT) and the eb->fences krealloc (ENOMEM once more than
+KMALLOC_MAX_SIZE/32 = 131072 entries are added across the request; skipped
+timeline entries do not count) precede the entries. Each entry is then copied
+(EFAULT), flag-checked (EINVAL), its point read (EFAULT), its syncobj found
+(ENOENT), retained and its fence resolved (EINVAL: WAIT with no fence, an
+unfound point without SIGNAL, then same-point WAIT|SIGNAL) before the next is
+copied. The IN/SUBMIT sync_file and its checks follow both arrays. There is no
+other fence or dependency count bound; NARF allocation failure is ENOMEM.
+Existing timeline payloads preserve
 ordering, including when a SIGNAL point has not yet been submitted.
 Explicit waits use timer awaits without holding IRQ-safe locks or restarting
 a copied ioctl. After admission, output syncobjs reference the exact terminal

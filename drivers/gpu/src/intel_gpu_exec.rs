@@ -184,10 +184,11 @@ impl ExecRequest {
         user: &dyn IoctlContext,
         address: u64,
         gem: &GemState,
+        syncobjs: &narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
     ) -> Result<(Self, crate::intel_gpu_exec_sync::SyncRequest), FsError> {
         let mut request = [0; 64];
         user.read(address, &mut request)?;
-        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &request)?;
+        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &request, syncobjs)?;
         Ok((Self::read_wire(user, &request, gem, true)?, sync))
     }
 

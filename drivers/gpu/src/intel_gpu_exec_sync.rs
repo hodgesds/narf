@@ -9,23 +9,41 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use narf_filesystem::{DrmFence, FsError, IoctlContext};
 use narf_lib::sync::IrqSafeSpinLock;
 
-const MAX_FENCES: usize = 4096;
-#[derive(Debug)]
-struct Entry {
-    handle: u32,
-    flags: u32,
-    point: u64,
-    timeline: bool,
-}
+/// I915_EXEC_FENCE_WAIT / I915_EXEC_FENCE_SIGNAL; every other bit is
+/// __I915_EXEC_FENCE_UNKNOWN_FLAGS.
+const FENCE_WAIT: u32 = 1;
+const FENCE_SIGNAL: u32 = 2;
+/// sizeof(struct eb_fence): syncobj, dma_fence, value and chain_fence.
+const EB_FENCE_BYTES: u64 = 32;
+/// add_{timeline_,}fence_array's overflow bound, `min(ULONG_MAX /
+/// sizeof(struct drm_i915_gem_exec_fence), SIZE_MAX / sizeof(*f))` on a
+/// 64-bit kernel: more entries than this, less those already added, are
+/// -EINVAL.
+const FENCE_ENTRIES_MAX: u64 = u64::MAX / EB_FENCE_BYTES;
+/// KMALLOC_MAX_SIZE, `1 << (MAX_PAGE_ORDER + PAGE_SHIFT)` with the x86_64
+/// and 4K-page arm64 MAX_PAGE_ORDER of 10. The eb->fences krealloc of
+/// `(num_fences + nfences) * sizeof(*f)` returns NULL above it (-ENOMEM),
+/// so at most 131072 entries are ever added: the only fence bound Linux
+/// has, and the one NARF keeps. Allocation failure below it is -ENOMEM too.
+const KMALLOC_MAX_SIZE: u64 = 1 << 22;
+/// The first address above the user half: NARF's split, as
+/// drm_ioctl_bridge's USER_VA_LIMIT.
+const USER_VA_LIMIT: u64 = 1 << 47;
+
 struct Dependency {
     fence: Arc<dyn DrmFence>,
     submit: bool,
 }
+/// The parsed request: like Linux's eb->fences, every syncobj and payload
+/// is retained as its entry is parsed, before any wait or publication, so
+/// handle destruction/replacement in another thread cannot retarget them.
 pub(crate) struct SyncRequest {
     pub output: bool,
     pub input_word: u32,
-    entries: Vec<Entry>,
+    /// eb->num_fences: entries added so far (a skipped entry is not).
+    fences: u64,
     dependencies: Vec<Dependency>,
+    signals: Vec<(Arc<SyncObjCore>, u64)>,
 }
 pub(crate) struct Resolved {
     dependencies: Vec<Dependency>,
@@ -43,13 +61,47 @@ fn read(user: &dyn IoctlContext, address: u64, bytes: usize) -> Result<Vec<u8>, 
     user.read(address, &mut data)?;
     Ok(data)
 }
+
+/// `__get_user`/`__copy_from_user` of the `n`th 8-byte array element.
+fn element(user: &dyn IoctlContext, array: u64, n: u64) -> Result<[u8; 8], FsError> {
+    let mut bytes = [0; 8];
+    let address = array.checked_add(n * 8).ok_or(FsError::BadAddress)?;
+    user.read(address, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// x86_64 `__access_ok` for a non-constant size: `ptr + size` must not wrap
+/// and must stay a user address. Null passes, as in Linux; its first
+/// element copy faults instead.
+fn access_ok(address: u64, size: u64) -> bool {
+    address
+        .checked_add(size)
+        .is_some_and(|end| end <= USER_VA_LIMIT)
+}
+
+/// drm_syncobj_find: the object behind `handle`, referenced; -ENOENT.
+fn find(table: &IrqSafeSpinLock<SyncObjTable>, handle: u32) -> Result<Arc<SyncObjCore>, FsError> {
+    let core = table.lock().get(handle).map(|object| object.core().clone());
+    core.map_err(|_| FsError::NotFound)
+}
+
 impl SyncRequest {
-    pub fn read(user: &dyn IoctlContext, wire: &[u8; 64]) -> Result<Self, FsError> {
+    /// The fence half of i915_gem_do_execbuffer, in its order:
+    /// parse_execbuf2_extensions (TIMELINE_FENCES), add_fence_array, then
+    /// the IN/SUBMIT sync_file.
+    pub fn read(
+        user: &dyn IoctlContext,
+        wire: &[u8; 64],
+        table: &IrqSafeSpinLock<SyncObjTable>,
+    ) -> Result<Self, FsError> {
         let flags = u64_at(wire, 40);
         let array = flags & abi::EXEC_FENCE_ARRAY != 0;
         let extensions = flags & abi::EXEC_USE_EXTENSIONS != 0;
-        let count = u32_at(wire, 28) as usize;
+        let count = u32_at(wire, 28);
         let pointer = u64_at(wire, 32);
+        // i915_gem_check_execbuffer refuses cliprects without either flag;
+        // parse_execbuf2_extensions refuses FENCE_ARRAY or num_cliprects
+        // beside USE_EXTENSIONS.
         if (array && extensions)
             || (!array && count != 0)
             || (!array && !extensions && pointer != 0)
@@ -57,36 +109,13 @@ impl SyncRequest {
             return Err(FsError::InvalidData);
         }
         let input_word = u64_at(wire, 56) as u32;
-        let inputs = flags & (abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT);
-        if inputs == abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT {
-            return Err(FsError::InvalidData);
-        }
         let mut result = Self {
             output: flags & abi::EXEC_FENCE_OUT != 0,
             input_word,
-            entries: Vec::new(),
+            fences: 0,
             dependencies: Vec::new(),
+            signals: Vec::new(),
         };
-        if inputs != 0 {
-            let fences = user
-                .sync_file_fences(input_word as i32)
-                .ok_or(FsError::InvalidData)?;
-            if fences.len() > MAX_FENCES {
-                return Err(FsError::OutOfMemory);
-            }
-            result.dependencies = fences
-                .into_iter()
-                .map(|fence| Dependency {
-                    fence,
-                    submit: inputs == abi::EXEC_FENCE_SUBMIT,
-                })
-                .collect();
-        } else if !result.output && u64_at(wire, 56) != 0 {
-            return Err(FsError::InvalidData);
-        }
-        if array {
-            result.array(user, pointer, count, None)?;
-        }
         if extensions {
             // parse_execbuf2_extensions: i915_user_extensions over
             // execbuf_extensions[], whose only entry is
@@ -98,96 +127,169 @@ impl SyncRequest {
                 // parse_timeline_fences copies the whole 56-byte
                 // drm_i915_gem_execbuffer_ext_timeline_fences.
                 let ext = read(user, address, 56)?;
-                let count = usize::try_from(u64_at(&ext, 32)).map_err(|_| FsError::InvalidData)?;
-                result.array(user, u64_at(&ext, 40), count, Some(u64_at(&ext, 48)))
+                result.timeline(user, table, &ext)
             })?;
+        }
+        if array {
+            result.binary(user, table, pointer, count)?;
+        }
+        let inputs = flags & (abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT);
+        if inputs != 0 {
+            if inputs == abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT {
+                return Err(FsError::InvalidData);
+            }
+            // sync_file_get_fence: a bad fd and a non-sync_file are -EINVAL.
+            let fences = user
+                .sync_file_fences(input_word as i32)
+                .ok_or(FsError::InvalidData)?;
+            result.depend(fences, inputs == abi::EXEC_FENCE_SUBMIT)?;
+        } else if !result.output && u64_at(wire, 56) != 0 {
+            return Err(FsError::InvalidData);
         }
         Ok(result)
     }
-    fn array(
-        &mut self,
-        user: &dyn IoctlContext,
-        address: u64,
-        count: usize,
-        values: Option<u64>,
-    ) -> Result<(), FsError> {
-        if count > MAX_FENCES - self.entries.len() {
+
+    /// The common add_{timeline_,}fence_array preamble: the overflow bound
+    /// (-EINVAL), access_ok of each user array (-EFAULT), then the
+    /// eb->fences krealloc (-ENOMEM), all before any element is copied.
+    fn reserve(&self, entries: u64, arrays: &[u64]) -> Result<(), FsError> {
+        if entries > FENCE_ENTRIES_MAX - self.fences {
             return Err(FsError::InvalidData);
         }
-        let entries = read(user, address, count * 8)?;
-        let points = match values {
-            Some(address) => read(user, address, count * 8)?,
-            None => Vec::new(),
-        };
-        for (i, entry) in entries.chunks_exact(8).enumerate() {
-            let flags = u32_at(entry, 4);
-            let point = if values.is_some() {
-                u64_at(&points, i * 8)
-            } else {
-                0
-            };
-            if flags & !3 != 0 || (point != 0 && flags == 3) {
-                return Err(FsError::InvalidData);
+        for array in arrays {
+            if !access_ok(*array, entries * 8) {
+                return Err(FsError::BadAddress);
             }
-            self.entries.push(Entry {
-                handle: u32_at(entry, 0),
-                flags,
-                point,
-                timeline: values.is_some(),
-            });
+        }
+        if (self.fences + entries) * EB_FENCE_BYTES > KMALLOC_MAX_SIZE {
+            return Err(FsError::OutOfMemory);
         }
         Ok(())
     }
-    pub fn resolve(self, table: &IrqSafeSpinLock<SyncObjTable>) -> Result<Resolved, FsError> {
-        let mut result = Resolved {
-            dependencies: self.dependencies,
-            signals: Vec::new(),
-        };
-        // Retain objects and exact input payloads before any wait or publication;
-        // handle destruction/replacement in another thread cannot retarget them.
-        for entry in self.entries {
-            let core = table
-                .lock()
-                .get(entry.handle)
-                .map_err(|_| FsError::NotFound)?
-                .core()
-                .clone();
-            let payload = core.fence();
-            let dependency = if entry.timeline {
-                if payload.is_none() && entry.flags != 0 && entry.flags & 2 == 0 {
-                    return Err(FsError::InvalidData);
+
+    /// Retain `fences` as dependencies; allocation failure is -ENOMEM.
+    fn depend(&mut self, fences: Vec<Arc<dyn DrmFence>>, submit: bool) -> Result<(), FsError> {
+        self.dependencies
+            .try_reserve(fences.len())
+            .map_err(|_| FsError::OutOfMemory)?;
+        self.dependencies
+            .extend(fences.into_iter().map(|fence| Dependency { fence, submit }));
+        Ok(())
+    }
+
+    /// One eb_fence: await_fence_array waits on every present fence, and
+    /// signal_fence_array signals every SIGNAL entry (point 0: replace).
+    fn add(
+        &mut self,
+        core: Arc<SyncObjCore>,
+        flags: u32,
+        fence: Option<Arc<dyn so::DmaFence>>,
+        point: u64,
+    ) -> Result<(), FsError> {
+        if let Some(fence) = fence {
+            self.depend(so::to_drm_leaves(&fence), false)?;
+        }
+        if flags & FENCE_SIGNAL != 0 {
+            self.signals
+                .try_reserve(1)
+                .map_err(|_| FsError::OutOfMemory)?;
+            self.signals.push((core, point));
+        }
+        self.fences += 1;
+        Ok(())
+    }
+
+    /// i915_gem_execbuffer.c::add_timeline_fence_array, entry by entry.
+    fn timeline(
+        &mut self,
+        user: &dyn IoctlContext,
+        table: &IrqSafeSpinLock<SyncObjTable>,
+        ext: &[u8],
+    ) -> Result<(), FsError> {
+        let entries = u64_at(ext, 32);
+        if entries == 0 {
+            return Ok(());
+        }
+        let (handles, values) = (u64_at(ext, 40), u64_at(ext, 48));
+        self.reserve(entries, &[handles, values])?;
+        // Linux's `err` is function-scoped and assigned only while a fence
+        // is present, so a find_seqno failure a SIGNAL entry tolerated is
+        // still set at a later fence-less entry of this extension.
+        let mut seqno_error = false;
+        for n in 0..entries {
+            let entry = element(user, handles, n)?;
+            let (handle, flags) = (u32_at(&entry, 0), u32_at(&entry, 4));
+            if flags & !(FENCE_WAIT | FENCE_SIGNAL) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let point = u64::from_le_bytes(element(user, values, n)?);
+            let core = find(table, handle)?;
+            let mut fence = core.fence();
+            if fence.is_none() && flags != 0 && flags & FENCE_SIGNAL == 0 {
+                return Err(FsError::InvalidData);
+            }
+            if let Some(payload) = fence.clone() {
+                // dma_fence_chain_find_seqno leaves the payload on -EINVAL.
+                match so::find_seqno(Some(payload), point) {
+                    Ok(found) => {
+                        fence = found;
+                        seqno_error = false;
+                    }
+                    Err(()) => seqno_error = true,
                 }
-                match so::find_seqno(payload.clone(), entry.point) {
-                    Ok(fence) => fence,
-                    Err(()) if payload.is_none() && entry.flags == 0 => None,
-                    Err(()) if entry.flags & 2 != 0 => payload,
-                    Err(()) => return Err(FsError::InvalidData),
-                }
-            } else if entry.flags & 1 != 0 {
-                Some(payload.ok_or(FsError::InvalidData)?)
+            }
+            if seqno_error && flags & FENCE_SIGNAL == 0 {
+                return Err(FsError::InvalidData);
+            }
+            // A signalled, collected point is ignored.
+            if fence.is_none() && flags & FENCE_SIGNAL == 0 {
+                continue;
+            }
+            // Waiting and signalling the same nonzero point would break the
+            // timeline.
+            if point != 0 && flags & FENCE_SIGNAL != 0 && flags & FENCE_WAIT != 0 {
+                return Err(FsError::InvalidData);
+            }
+            self.add(core, flags, fence, point)?;
+        }
+        Ok(())
+    }
+
+    /// i915_gem_execbuffer.c::add_fence_array, entry by entry.
+    fn binary(
+        &mut self,
+        user: &dyn IoctlContext,
+        table: &IrqSafeSpinLock<SyncObjTable>,
+        array: u64,
+        count: u32,
+    ) -> Result<(), FsError> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.reserve(u64::from(count), &[array])?;
+        for n in 0..u64::from(count) {
+            let entry = element(user, array, n)?;
+            let (handle, flags) = (u32_at(&entry, 0), u32_at(&entry, 4));
+            if flags & !(FENCE_WAIT | FENCE_SIGNAL) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let core = find(table, handle)?;
+            let fence = if flags & FENCE_WAIT != 0 {
+                Some(core.fence().ok_or(FsError::InvalidData)?)
             } else {
                 None
             };
-            if let Some(fence) = dependency {
-                result
-                    .dependencies
-                    .extend(
-                        so::to_drm_leaves(&fence)
-                            .into_iter()
-                            .map(|fence| Dependency {
-                                fence,
-                                submit: false,
-                            }),
-                    );
-                if result.dependencies.len() > MAX_FENCES {
-                    return Err(FsError::OutOfMemory);
-                }
-            }
-            if entry.flags & 2 != 0 {
-                result.signals.push((core, entry.point));
-            }
+            self.add(core, flags, fence, 0)?;
         }
-        Ok(result)
+        Ok(())
+    }
+
+    /// Every syncobj and payload was retained while parsing.
+    pub fn resolve(self) -> Resolved {
+        Resolved {
+            dependencies: self.dependencies,
+            signals: self.signals,
+        }
     }
 }
 impl Resolved {

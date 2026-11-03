@@ -806,15 +806,21 @@ impl RenderFile {
         user: &dyn IoctlContext,
     ) -> Result<u64, FsError> {
         use crate::intel_gpu_user::{OutputError, UserOutput};
-        let (request, sync) =
-            crate::intel_gpu_exec::ExecRequest::read_submission(user, arg, &self.gem)?;
+        // Syncobjs and payloads are found and retained while the fence
+        // arrays are parsed, as i915_gem_do_execbuffer's eb->fences are.
+        let (request, sync) = crate::intel_gpu_exec::ExecRequest::read_submission(
+            user,
+            arg,
+            &self.gem,
+            &self.syncobjs,
+        )?;
         request.validate_for_gt(info.platform)?;
         if request.has_async() && !info.object_async_ready() {
             return Err(FsError::NoDevice);
         }
         let output = sync.output;
         let input_word = sync.input_word;
-        let sync = sync.resolve(&self.syncobjs)?;
+        let sync = sync.resolve();
         let context = {
             let mut namespaces = self.namespaces.lock();
             namespaces.initialize();
