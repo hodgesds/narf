@@ -414,10 +414,14 @@ fn smoke_oa_query_units_formats_and_timestamp() -> TestResult {
     );
     assert_eq!(Profile::Xe2.decode(A24U40), None);
     assert_eq!(FORMATS[11].wire(), 5 | 1 << 8 | 1 << 16 | 1 << 24);
-    // xe_oa_timestamp_frequency: 12.55 scales by 3 - CTC shift.
+    // xe_oa_timestamp_frequency: Wa_18013179988 scales by 3 - CTC shift.
     assert_eq!(timestamp_frequency(1255, 19_200_000, 1 << 1), 76_800_000);
     assert_eq!(timestamp_frequency(1255, 19_200_000, 3 << 1), 19_200_000);
-    assert_eq!(timestamp_frequency(1270, 19_200_000, 3 << 1), 19_200_000);
+    // The workaround's continuation covers MTL/Arrow 12.70..12.74.
+    assert_eq!(timestamp_frequency(1270, 19_200_000, 1 << 1), 76_800_000);
+    assert_eq!(timestamp_frequency(1274, 19_200_000, 2 << 1), 38_400_000);
+    assert_eq!(timestamp_frequency(1260, 19_200_000, 1 << 1), 19_200_000);
+    assert_eq!(timestamp_frequency(2001, 19_200_000, 1 << 1), 19_200_000);
     TestResult::Pass
 }
 kernel_test_in!(

@@ -269,10 +269,15 @@ impl Device {
     }
 }
 
-/// xe_oa_timestamp_frequency: Wa_18013179988/Wa_14015568240 (12.55) scale
-/// the reference clock by RPM_CONFIG0's CTC shift; otherwise it is unchanged.
+/// Wa_18013179988 (12.55 and 12.70..12.74, xe_wa_oob.rules continuation)
+/// and Wa_14015568240 (12.55..12.60): the OA unit ignores CTC_SHIFT.
+pub(crate) fn ctc_shift_applies(graphics: u16) -> bool {
+    graphics == 1255 || (1270..=1274).contains(&graphics)
+}
+/// xe_oa_timestamp_frequency: scale the reference clock by RPM_CONFIG0's
+/// CTC shift where the workaround applies; otherwise it is unchanged.
 pub(crate) fn timestamp_frequency(graphics: u16, reference: u32, rpm_config0: u32) -> u32 {
-    if graphics == 1255 {
+    if ctc_shift_applies(graphics) {
         reference << (3 - ((rpm_config0 >> 1) & 3))
     } else {
         reference
@@ -1790,7 +1795,7 @@ pub(crate) fn enabled() -> bool {
     values.next() == Some("1") && values.next().is_none() && !args.has_flag("narf.intel.oa")
 }
 
-/// RPM_CONFIG0, read once at publication for the 12.55 timestamp scaling.
+/// RPM_CONFIG0, read once at publication for the CTC-shift workaround.
 pub(crate) const RPM_CONFIG0_REG: u64 = RPM_CONFIG0;
 /// Current OA authority, shared with EU-stall observation.
 pub(crate) fn capable() -> bool {

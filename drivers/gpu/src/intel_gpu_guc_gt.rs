@@ -829,7 +829,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         facts: &crate::intel_gpu_user::DeviceFacts,
     ) -> Option<crate::intel_gpu_oa::Device> {
         let unit = self.parts.oa.as_ref()?;
-        let rpm = if facts.graphics_version == 1255 {
+        let rpm = if crate::intel_gpu_oa::ctc_shift_applies(facts.graphics_version) {
             let rpm = self
                 .parts
                 .boot
