@@ -16,6 +16,8 @@ struct Model {
     trace: Vec<(u8, u32, u32)>,
     now: u64,
     stuck: Option<u32>,
+    /// BB offset and bits OR-ed into every read of it.
+    or: Option<(u32, u32)>,
 }
 impl Model {
     fn new() -> Self {
@@ -25,6 +27,7 @@ impl Model {
             trace: Vec::new(),
             now: 0,
             stuck: None,
+            or: None,
         }
     }
     fn word(&self, address: u32) -> u32 {
@@ -56,7 +59,15 @@ impl Io for Model {
             }
             0xc048 | 0xc06c => v = (r & 0x3ff) << 2,
             0xc060 | 0xc084 => v = ((r & 0xff) + 1) << 24,
+            // IQK NCTL done byte and R_RPT_COM ready.
+            0xbff8 => v = 0x55,
+            0x80fc => v |= 0x8000,
             _ => {}
+        }
+        if let Some((offset, bits)) = self.or {
+            if offset == r {
+                v |= bits;
+            }
         }
         if self.stuck == Some(r) {
             v = 0;
@@ -236,4 +247,132 @@ fn smoke_rtw89_n51_rfk_init_aack_rck_dack_rxdck_follow_rtw8851b() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_n51_rfk_init_aack_rck_dack_rxdck_follow_rtw8851b
+);
+
+/// rtw8851b_rfk.c `rtw8851b_iqk(PHY_0)`: path-A wideband `_doiqk` with
+/// the 2/5GHz LOK grams, TX/RX group selections, `_iqk_sram` on an RX
+/// failure, restore and BB/RF backup restore.
+fn smoke_rtw89_n51_iqk_lok_group_select_and_restore_follow_rtw8851b() -> TestResult {
+    use super::super::super::operating_channel::{Profile, Width};
+    use super::super::n51_iqk::Iqk;
+    use narf_wireless::association::channel::Band;
+    let shots = |io: &Model, command: u32| {
+        io.trace
+            .iter()
+            .filter(|t| **t == (4, 0x18000, command))
+            .count()
+    };
+    let Some(g1) = Profile::new(Band::Ghz2, 1) else {
+        return TestResult::Fail("channel 1 profile refused");
+    };
+    let mut io = Model::new();
+    io.words[(0x10000 + 0xc0d4) / 4] = 0x1234_5678;
+    io.rf[0][0xde] = 0x5_a5a5;
+    let mut iqk = Iqk::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { iqk.run(&mut io, g1) }) != Some(Ok(())) {
+        return TestResult::Fail("RTL8851B 2.4GHz IQK did not complete on a ready model");
+    }
+    let Some(path) = iqk.results().copied() else {
+        return TestResult::Fail("RTL8851B IQK published no result");
+    };
+    if path.tx_fail || path.rx_fail || path.lok_fail || !path.is_wb_txiqk {
+        return TestResult::Fail("RTL8851B IQK result flags differ on a passing model");
+    }
+    if iqk.times != 1 || iqk.version != 0x14 {
+        return TestResult::Fail("RTL8851B IQK times/version differ");
+    }
+    // 20MHz: TXK 0x819, RXK 0xc19, NBTXK 0x419, NBRXK 0x619, RXAGC 0x719,
+    // LOK coarse 0x119 / fine 0x319 (ten grams each), restore 0x1219.
+    if shots(&io, 0x119) != 10
+        || shots(&io, 0x319) != 10
+        || shots(&io, 0x419) != 1
+        || shots(&io, 0x819) != 1
+        || shots(&io, 0x719) != 4
+        || shots(&io, 0x619) != 4
+        || shots(&io, 0xc19) != 4
+        || shots(&io, 0x1219) != 1
+    {
+        return TestResult::Fail("RTL8851B 2.4GHz IQK one-shot command stream differs");
+    }
+    if io.word(0xc0d4) != 0x1234_5678
+        || io.rf[0][0xde] != 0x5_a5a5
+        || io.word(0x8138) != 0x4000_0000
+        || io.word(0x813c) != 0x4000_0000
+        || io.word(0x8088) != 0x8000_0000
+        || io.word(0x810c) != 0
+    {
+        return TestResult::Fail("RTL8851B IQK restore / wideband CFIR differs");
+    }
+    if io.trace.iter().any(|t| t.0 == 17) {
+        return TestResult::Fail("RTL8851B IQK touched RF path B");
+    }
+    let order: Vec<_> = io.trace.iter().filter(|t| t.0 >= 48).copied().collect();
+    if order
+        != [
+            (48, Kind::Iqk as u32, 0),
+            (56, 0, 0),
+            (48, Kind::IqkPath as u32, 0),
+            (48, Kind::IqkPath as u32, 1),
+            (60, 0, 0),
+            (48, Kind::Iqk as u32, 1),
+        ]
+    {
+        return TestResult::Fail("RTL8851B IQK BTC/TX-pause bracket differs");
+    }
+    // 5GHz 80MHz with B_NCTL_RPT_FLG set: narrowband fallback, SRAM dump,
+    // RXCFIR clear and the 0x17/0x37 LUT bracket.
+    let Some(a80) = Profile::new_5ghz(36, Width::Mhz80) else {
+        return TestResult::Fail("channel 36/80 profile refused");
+    };
+    let mut io = Model::new();
+    io.or = Some((0x8008, 1 << 26));
+    let mut iqk = Iqk::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { iqk.run(&mut io, a80) }) != Some(Ok(())) {
+        return TestResult::Fail("RTL8851B 5GHz IQK did not complete on a ready model");
+    }
+    let Some(path) = iqk.results().copied() else {
+        return TestResult::Fail("RTL8851B 5GHz IQK published no result");
+    };
+    if !path.tx_fail || !path.rx_fail || path.is_wb_txiqk {
+        return TestResult::Fail("RTL8851B IQK group failure was not recorded");
+    }
+    // 80MHz: TXK 0xa19 (two groups), RXK 0xe19 (four groups).
+    if shots(&io, 0xa19) != 2 || shots(&io, 0xe19) != 4 || shots(&io, 0x419) != 2 {
+        return TestResult::Fail("RTL8851B 5GHz IQK one-shot command stream differs");
+    }
+    if !io.trace.contains(&(4, 0x180d8, 0x1009f))
+        || !io.trace.contains(&(16, 0x3f, 0x17))
+        || !io.trace.contains(&(16, 0x3f, 0x37))
+        || io.word(0x810c) != 0x3333_2222
+        || io.word(0x813c) != path.nb_rxcfir | 2
+        || io.word(0x8138) != path.nb_txcfir | 2
+    {
+        return TestResult::Fail("RTL8851B 5GHz IQK fallback / SRAM / LUT bracket differs");
+    }
+    // 160MHz is refused before any access; a stuck NCTL fails closed.
+    if let Some(c160) = Profile::new_5ghz_160(36) {
+        let mut io = Model::new();
+        // SAFETY: private inert register/RF model; no hardware or DMA.
+        if ready(unsafe { Iqk::default().run(&mut io, c160) }) != Some(Err(Error::Policy))
+            || !io.trace.is_empty()
+        {
+            return TestResult::Fail("RTL8851B IQK accepted 160MHz");
+        }
+    }
+    let mut io = Model::new();
+    io.stuck = Some(0xbff8);
+    let mut iqk = Iqk::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { iqk.run(&mut io, g1) }) != Some(Err(Error::Register(power::Error::Timeout)))
+        || iqk.results().is_some()
+    {
+        return TestResult::Fail("stuck RTL8851B IQK NCTL did not fail closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_n51_iqk_lok_group_select_and_restore_follow_rtw8851b
 );

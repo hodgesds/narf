@@ -3991,7 +3991,32 @@ pause. Linux only logs the poll timeouts; NARF fails closed and the owner is
 terminal. Unexecuted case:
 `smoke_rtw89_n51_rfk_init_aack_rck_dack_rxdck_follow_rtw8851b`.
 
-**Remaining for the row.** Channel IQK/TSSI/DPK (rtw8851b_rfk.c), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+**Channel IQK (`rfk::n51_iqk`).** `n51_iqk::Iqk::run` is rtw8851b_rfk.c
+`rtw8851b_iqk(PHY_0)` on RF path A: `BTC_WRFKT_IQK` START,
+`rtw89_chip_stop_sch_tx`, `_wait_rx_mode(RF_A)`, then `_doiqk` between
+ONESHOT START/STOP (`iqk_times`++, `RTW8851B_IQK_VER` 0x14; the seven
+`rtw8851b_backup_bb_regs` and eight `rtw8851b_backup_rf_regs` backed up
+and restored), `_iqk_macbb_setting` (`rtw8851b_iqk_macbb_defs`,
+`_txck_force(DAC_960M)`, `_rxck_force(ADC_1920M)` with the 8851B
+`ck1920_8851b` row incl. `B_P0_RXCK_ADJ`, `rtw8851b_iqk_macbb_bh_defs`),
+`_iqk_preset`, wideband `_iqk_by_path` (`is_nbiqk` stays false, so the
+`_iqk_{2g,5g}_nb{tx,rx}k` variants are unreachable): `_iqk_txk_setting`
+(`rtw8851b_iqk_txk_{2,5}ghz_defs`), the ten-gram `_iqk_{2g,5g}_lok`
+(0x109/0x309 commands), `_txk_{2g,5g}_group_sel` (NBTXK then TXK per group,
+`R_CFIR_COEF` 0 / 0x33332222), `_iqk_rxclk_setting`
+(`rtw8851b_iqk_rxclk_{80,others}_defs`), `_iqk_rxk_setting`,
+`_adc_fifo_rst`, `_rxk_{2g,5g}_group_sel` (RXAGC, NBRXK, RXK per group;
+5GHz LUT 0x17/0x37 bracket), then `_iqk_restore` (0x1219) and
+`rtw8851b_iqk_afebb_restore_defs`, all tables verbatim. A
+`B_NCTL_RPT_FLG` group failure takes Linux's narrowband-CFIR fallback
+(incl. the `_iqk_sram` dump and 5GHz `B_IQK_RES_RXCFIR` clear) and is
+recorded in `Path::{tx,rx}_fail`; Linux only logs `_iqk_check_cal`
+timeouts, NARF fails closed. 160MHz is refused before any access.
+Diagnostic-only reads in `rtw89_debug` arguments are not issued.
+Unexecuted case:
+`smoke_rtw89_n51_iqk_lok_group_select_and_restore_follow_rtw8851b`.
+
+**Remaining for the row.** Channel TSSI/DPK (rtw8851b_rfk.c), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)
