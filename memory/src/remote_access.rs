@@ -196,7 +196,7 @@ impl AddressSpace {
                 // Same exclusion `pin_user_page` takes: a cross-address-space
                 // shared-page migration must not swap the frame under us.
                 let _shared = lock_address_space_shared_mapping_transaction(self.identity());
-                let regions = self.regions.lock();
+                let mut regions = self.regions.lock();
                 if let Some(region) = regions.containing(page) {
                     let perms = region.perms;
                     if perms.contains(RegionPerms::STACK_GUARD) {
@@ -220,6 +220,15 @@ impl AddressSpace {
                                 prot_none: perms.prot_only().0 == 0,
                             }
                         } else {
+                            // This store bypasses the owner's leaf. A swap-out
+                            // batch holding the page may already have taken
+                            // its backend snapshot, so make it keep the page
+                            // (Linux: GUP refaults the swap-cache folio and
+                            // reclaim keeps it). A read leaves it alone: the
+                            // frame stays allocated while this lock is held.
+                            if access.write {
+                                regions.refuse_swap_out(page);
+                            }
                             op(
                                 perms,
                                 PhysAddr::new(phys.raw() + in_page).kernel_mut_ptr::<u8>(),

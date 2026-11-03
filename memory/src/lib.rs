@@ -81,6 +81,9 @@ mod memtype_tests;
 mod mmu_notifier_tests;
 mod pageattr_tests;
 mod remote_access_tests;
+// Drives the swap-out kernel-test seam, which exists only with this feature.
+#[cfg(feature = "kernel-test")]
+mod swap_order_tests;
 mod tests;
 
 pub use address_space::{

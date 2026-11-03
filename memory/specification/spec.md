@@ -442,10 +442,13 @@ impl UserPagePin {
 /// folio_maybe_dma_pinned; NARF's pin count is exact, `cow::is_pinned`):
 ///   - swap_out_private_batch skips it and swaps the rest of the batch; the
 ///     collect_anon_reclaim_candidates scan never offers it. A pin landing
-///     between the PTE commit and publication refuses that victim under the
-///     region lock: its exact leaf is restored, its slot discarded and
-///     uncharged, its frame kept, no Clear fires for it, and the count
-///     excludes it (try_to_unmap_one's anon-exclusive back-off).
+///     while the batch holds the page (`Evicting`, from selection to
+///     publication) marks its record under the region lock and refuses that
+///     victim at publication, even if the pin was dropped again in between
+///     (the backend snapshot may predate the device's writes): its exact
+///     leaf is restored, its slot discarded and uncharged, its frame kept,
+///     no Clear fires for it, and the count excludes it (try_to_unmap_one's
+///     anon-exclusive back-off). An access_remote write does the same.
 ///   - madvise_free does not mark it; pin_user_page drops an existing
 ///     LAZYFREE mark (follow_page_pte's FOLL_TOUCH folio_mark_dirty); and
 ///     discard_lazyfree_pages keeps a pinned page and clears its mark
@@ -903,7 +906,10 @@ impl AddressSpace {
     /// and hardware-huge VMAs. Base-page index capacity, sparse-backing
     /// boundary windows, and swap state are preflighted before any permission
     /// or huge-leaf change; allocation failure leaves the VMA tree unchanged,
-    /// and internal VMA flags survive a successful split.
+    /// and internal VMA flags survive a successful split. A page in the range
+    /// that a swap-in or swap-out batch holds (`Loading`/`Evicting`) refuses
+    /// the call with `NotImplemented` (as `change_perms_range` does): the
+    /// batch has captured leaf flags it may republish.
     pub fn mprotect_range(
         &self, base: VirtAddr, len: u64, new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError>;
@@ -1615,7 +1621,9 @@ x86_64 is rejected at runtime.
   device writes through its pin is always the frame the mapping shows
   (Linux `folio_maybe_dma_pinned`). Pins are taken under the region lock,
   and each path decides under that lock: swap at selection and again at
-  publication (a late pin restores the committed leaf and frees no frame),
+  publication, where a pin taken at any point while the batch held the page
+  refuses it even if already dropped (the committed leaf comes back and no
+  frame is freed),
   lazy-free at mark, pin and discard time (no pinned page carries an
   unconsumed `LAZYFREE` mark), and multi-owner migration per owner before
   its repoint. The frame itself was already safe (the pin holds a
@@ -2089,14 +2097,28 @@ x86_64 is rejected at runtime.
   intermediate descriptor only after proving the destination leaf absent;
   requirements are derived independently per leaf, failed maps leave existing
   permissions unchanged, and leaf flags remain the final authority.
-- A swap-out batch reserves one contiguous slot run, performs one backend
-  vector write, validates every same-root leaf before publishing any swap PTE,
-  and retires stale translations once before returning any victim frame to the
-  allocator. Failure before PTE publication leaves every mapping resident and
-  releases the complete slot run. A victim its owner refuses at publication
-  (a pin arrived) gets its recorded leaf back under the root lock while its
-  transition record still excludes every other mutator, and only its slot
-  is released; the rest of the batch completes.
+- **A swap-out batch snapshots a victim only once no CPU can store to it.**
+  It reserves one contiguous slot run, validates every same-root leaf before
+  publishing any swap PTE, replaces each leaf with an atomic exchange that
+  keeps every hardware A/D update in the recorded old leaf, and completes one
+  TLB shootdown for the batch; only then does it perform its one backend
+  vector write, and it frees a victim frame only after that write succeeded
+  and the owner published (Linux `shrink_folio_list`: `try_to_unmap`,
+  `try_to_unmap_flush_dirty`, `pageout`, free). A store that raced the unmap
+  through a stale translation is therefore in the swapped copy. Failure
+  before the commit leaves every mapping resident and releases the complete
+  slot run; a failed backend write restores every victim's exact leaf (no
+  frame was freed, so no store is lost) and releases the run. A victim its
+  owner refuses at publication (a pin is held, or a pin or kernel write
+  reached its frame through `Region::phys` while the batch held it) gets its
+  exact leaf back under the root lock and only its slot is released; the
+  rest of the batch completes. Every restore happens while the page's
+  `Evicting` record makes mprotect, munmap, MADV_DONTNEED, mremap, fork,
+  compaction and NUMA migration (`Pinned`, move_pages -EBUSY) refuse it, so
+  the restored leaf's permissions are still the VMA's. Nothing else frees or
+  remaps an in-flight victim's frame: the OOM reaper returns `Blocked` while
+  any page is `Evicting`, and `remap_page` (NUMA-hint restore, COW break)
+  never installs a leaf over a swap entry.
 - A swap-in batch validates and reads every requested slot into unpublished
   frames before atomically replacing the same-root swap leaves. Failure leaves
   all PTEs and slots unchanged. Backend I/O runs without the global swap-device
@@ -2106,9 +2128,13 @@ x86_64 is rejected at runtime.
   the fault path restores `Loading -> Swapped`, parks, and retries the batch
   only after that ticket's kswapd cycle completes.
 - Live anonymous-private x86_64 swap uses region-table transitions
-  `Evicting -> Swapped -> Loading -> Resident`. PTE publication transfers the
-  corresponding `Region::phys` ownership before TLB invalidation/free; page-in
-  republishes Region ownership before retiring slots. A fault on `Swapped`
+  `Evicting -> Swapped -> Loading -> Resident`. Publication transfers the
+  corresponding `Region::phys` ownership after the backend write and before
+  any frame is freed; page-in republishes Region ownership before retiring
+  slots. A fault on `Evicting` (its swap entry may be committed with the
+  write still pending, so its slot is unreadable) or `Loading` neither reads
+  a slot nor maps a page: it returns for a retry until the batch publishes
+  or restores the leaf. A fault on `Swapped`
   collects consecutive leaves ahead of the fault for one vector read/PTE
   commit. Teardown atomically clears all stable swap leaves and discards their
   slots as one backend batch. Shared, COW, file-backed, and locked pages are
