@@ -381,11 +381,14 @@ fn smoke_i915_context_freq_hint_raw_proto_phase_and_create_rollback() -> TestRes
             file.dispatch_card(card, abi::GEM_CONTEXT_CREATE_EXT, 64, &user),
             Some(Err(FsError::InvalidData))
         );
+        // A self-referencing extension is not refused as a revisit:
+        // i915_user_extensions applies it until its 512-link stack depth
+        // runs out, then returns -E2BIG.
         create_wire(&user, &[hint_param(0, 0, 1)]);
         user.wire.store(12_000, &12_000u64.to_le_bytes());
         assert_eq!(
             file.dispatch_card(card, abi::GEM_CONTEXT_CREATE_EXT, 64, &user),
-            Some(Err(FsError::InvalidData))
+            Some(Err(FsError::ArgumentListTooLong))
         );
         user.fail_report
             .store(true, core::sync::atomic::Ordering::Relaxed);
