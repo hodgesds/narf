@@ -369,9 +369,49 @@ behave exactly as before:
 
 `intel_gpu::probe` sends an admitted Lunar Lake function to the
 integrated display path instead of `probe_discrete`. There it runs
-`takeover` and installs no KMS, GT runtime, PM or DC owner.
+`takeover`, claims Pipe A (`route_owns_pipe_a` reports that claim) and
+moves the console to an owned surface whose GGTT entries use the firmware
+surface's PAT index, which must be 0 (`firmware_pte_pat`, `console_pat`). A
+refused handoff installs no KMS owner. `Flushed` wraps a display-20 window
+with Wa_15015404425 (four writes to `MMIO_FLUSH_DUMMY` before every read).
 `Generation::display_supported` and `modeset_display` still refuse Lunar
-Lake.
+Lake. No PM owner is installed.
+
+The function's GT owner uses the display-preserving profile:
+
+- `intel_gpu_gt_runtime::{LnlProfile, lnl_profile}` select `Headless` for
+  every LNL/PTL function without the route and `DisplayPreserving` only for
+  Lunar Lake with the route and a lit mode. `install_lnl_display` installs
+  that owner and refuses everything else. `system_suspend_admitted` refuses
+  system suspend for the display profile and BMG small-BAR.
+- `intel_gpu_gt::lnl::Receipt::admit_display(device, bar, mmio, current)`
+  replaces the driver FLR on that profile. It refuses `Unavailable` without
+  current authority, before any MMIO; `Unsupported` for anything but Lunar
+  Lake, a VF, a display other than 20.00 or a fused Pipe A; `Busy` for an
+  FLR in flight or an inherited display producer; `State` for a dark Pipe A
+  or a stale FLR status that does not clear. Its only write is that W1C. The
+  receipt satisfies `GgttArena::for_lnl_gt` and `lnl_takeover_ready`, and
+  `matches` then requires no FLR in flight or completed and the same display
+  IP for every PTE write. `HardwareInit` still runs the GT-only
+  `GRDOM_GUC`/`GRDOM_FULL` reset before the first PTE.
+
+KMS and DC services on display 20:
+
+- `intel_gpu_scanout_io::display_pte(generation)` gives the GEM scanout PTE
+  format and PAT index (Gen12/0, MTL `XeLpg`/1, LNL `Xe2`/3, PTL none), and
+  `owned_status(generation)` the owned DE pipe status (display 20 drops the
+  PIPEDMC faults). `PollIo::new` accepts Lunar Lake through them.
+- `intel_gpu_kms::install` admits Lunar Lake only when `GMD_ID_DISPLAY`
+  reads 20.00. Its `access_ok` requires the GT owner's Xe2 PAT3 (0x3c). The
+  presenter refuses tiled layouts on `PteFormat::Xe2`. Cursor, color, DSB
+  transactions, panning, XR30, FBC and PSR stay unadvertised and return
+  `Unsupported` on display 20.
+- `intel_gpu_dc_states::service_profile(generation)` gives `(DmcPlatform,
+  allowed DC mask, read flush)` for MTL and LNL; `XE2LPD_ALLOWED_DC_MASK`
+  is DC6. `DcCore::new_for(platform, allowed)` and `DcCore::platform`
+  carry the container rules; `load_and_verify_for` and `open_firmware_for`
+  take the platform. The display-14 `new`, `load_and_verify` and
+  `open_firmware` are unchanged.
 
 ### Fixed opaque XR30 primary input
 
@@ -2917,7 +2957,8 @@ and permanently closes both boot-framebuffer and graphics-console publication
 before reset. Ever-published/paused/withdrawn boot graphics cannot pass this
 contract. Initial graphical boot and owned display handoff remain refused.
 An LNL function admitted to the display-20 route (`intel_gpu_xe2lpd`,
-above) never enters this profile or its driver FLR.
+above) never enters this profile or its driver FLR; its GT owner takes the
+display-preserving profile instead.
 Fresh PF/PCI command/D0/BAR, graphics/media identity, wake, GuC/DMA/full-reset
 and cache proofs replace every pre-reset observation. Secondary display-status
 checks are refusal probes, not substitutes for whole-display reset retirement.

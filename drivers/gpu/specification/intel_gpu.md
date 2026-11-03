@@ -1674,13 +1674,88 @@ still refuses while a boot framebuffer or KMS display exists, so the two
 owners are exclusive per function.
 
 On an admitted function, probe sequences the eDP panel and runs the
-display-20 owned modeset on the firmware's Pipe-A surface (EDID mode).
-Scanout stays on that surface, which the boot framebuffer console keeps
-drawing. No GT owner exists on a display-owning Lunar Lake, so there is no
-verified Xe2 GGTT/PAT scanout policy, no GEM arena and no DMC acquisition.
-No KMS owner, GT runtime, PM owner or DC service is installed. The
-generation-level dispatch (`modeset_display`, relight, KMS install) keeps
-refusing Lunar Lake.
+display-20 owned modeset on the firmware's Pipe-A surface (EDID mode). The
+generation-level dispatch (`modeset_display`, relight) keeps refusing Lunar
+Lake; everything below is reached only through the route.
+
+Display-preserving GT owner. After a successful modeset probe installs the
+function's GT owner with the `DisplayPreserving` profile
+(`intel_gpu_gt_runtime::install_lnl_display`; `lnl_profile` selects it only
+for Lunar Lake with the route and a lit mode, and keeps `Headless` for every
+other LNL/PTL function). Linux xe never runs `__xe_driver_flr` at probe: it
+arms it for `xe_driver_flr_fini`, `xe_device_shutdown` and wedging only.
+Probe freshens the GT through `xe_uc_sanitize_reset` → `xe_guc_reset`
+(`GDRST` = `GRDOM_GUC`), and `xe_gt.c::do_gt_reset` (`GRDOM_FULL`) is the
+reset `gt_reset_worker` and `xe_gt_shutdown` run while display keeps
+scanning out. NARF's `HardwareInit` already runs `GRDOM_GUC` then
+`GRDOM_FULL` on the primary GT, and `MediaQuiesce` the same pair on the
+media GT, before its cache policy may publish a GGTT PTE. That GT-only reset
+meets the headless FLR's inherited-GT rationale (GuC, engines, contexts);
+Wa_14015076503 around `do_gt_reset` is media 13.00 only. What the FLR also
+gave is proved by `lnl::Receipt::admit_display`, which replaces the driver
+FLR on this profile and is read-only except for one W1C: no FLR in flight
+(`GU_CNTL`), a stale `GU_DEBUG.DRIVERFLR_STATUS` acknowledged so that any
+later FLR fails every PTE write's receipt check, display 20.00 with Pipe A
+fused in and lit, and no inherited display DMA outside the route's primary
+(Pipes B–D dark, other planes and every cursor off, every DSB idle, FBC A–D
+off, no pipe-DMC flip queue armed, no pipe B–D DMC enabled). Stolen memory
+is not wiped and the GT arena never maps DSM, so the boot framebuffer stays
+valid; neither the headless boot-scanout exclusion nor its client gate
+applies. A BIOS-set `DRIVERINT_FLR_DIS` does not refuse this profile. The profile
+is D0-only: system suspend is refused (`system_suspend_admitted`) because
+display-20 relight after S3 is not owned, and the panel's mode keeps runtime
+autosuspend off.
+
+KMS owner. Probe then moves the console onto an owned surface in the Pipe-A
+console window (the MTL probe pattern, `lnl_console_handoff`). Its GGTT
+entries carry the PAT index of the firmware's own lit surface PTE
+(`xelpg_ggtt_pte_flags` bits 52/53, used on Xe2), which must be 0: the GT
+owner never redefines Xe2 PAT0, so the console keeps the firmware's scanout
+policy. Any other index or a failed allocation keeps the firmware surface
+and installs no KMS owner. `intel_gpu_kms::install` admits Lunar Lake only
+after reading `GMD_ID_DISPLAY` 20.00. GEM flips then map with
+`intel_gpu_scanout_io::display_pte`: `PteFormat::Xe2` and xe_pat.c's display
+`idx[XE_CACHE_NONE]` = 3 (`XE2_PAT(0, 0, 0, 3, 3, 0)`, the index
+xe_fb_pin.c encodes), admitted only while the GT owner's PAT3 reads back
+0x3c. Display-20 deltas the owner uses: the DE pipe status it owns drops
+both PIPEDMC faults and keeps the plane ATS fault
+(`gen8_de_pipe_fault_mask`, display >= 20); the fetcher inventory covers FBC
+A–D and five universal planes per pipe; a tiled primary needs a DPT this
+owner does not build (`intel_dpt_configure` sets the no-DPT chicken on
+display 14 only), so only the linear XRGB8888 primary flips; and every KMS
+register read is preceded by Wa_15015404425's four dummy writes
+(xe_mmio.c::mmio_flush_pending_writes, `PLATFORM(LUNARLAKE)`). Fixed-mode
+flips, console restoration and GT-reset recovery run through the display-14
+owner unchanged. The cursor, CTM, LUTs, DSB transactions, panning, X/Tile4,
+XR30 and FBC are not offered on display 20 yet. The pinned tree has no
+display-20 register delta for the cursor (`intel_cursor.c`), the color
+pipeline before display 30 (`intel_color.c`) or DSB (`intel_dsb.c`), but
+the cursor and DSB owners still map their GGTT pages in the display-14
+format and PAT1, which they must take from `display_pte` before they can be
+admitted. `PLANE_AUX_DIST` is absent on display 20 (`HAS_AUX_DIST`); the
+presenter's read of it as zero is unchanged.
+
+DC service. KMS install creates the DC service for display 20
+(`intel_gpu_dc_states::service_profile`) under `DmcPlatform::Xe2Lpd`: after
+each GT publication it acquires `i915/xe2lpd_dmc.bin`, loads and verifies it
+under the display-20 rules (0x8000 ceiling, no Wa_16015201720,
+`DMC_FQ_W2_PTS_CFG_SEL` after the load, the flip-queue reset and
+`PIPEDMC_INTERRUPT` programming around each pipe-DMC enable/disable),
+enables Pipe A's DMC and enters DC6 17 ms after the last DC_off release, with
+Wa_15015404425 on its register view. `get_allowed_dc_mask` caps display 20
+at `max_dc` 2, so DC6 is the target and DC3CO is never allowed.
+
+PSR1 stays refused on display 20: the KMS owner offers PSR only on display
+14. The display >= 20 branches of intel_psr.c that are not implemented are
+`hsw_activate_psr1` (no `EDP_PSR_MAX_SLEEP_TIME`,
+`LNL_EDP_PSR_ENTRY_SETUP_FRAMES`), `intel_psr_entry_setup_frames` (a setup
+time longer than vblank takes one entry setup frame instead of refusing,
+and Wa_18037818876 then refuses PSR1 without selective update),
+`_intel_psr_min_set_context_latency` (SRD_STATUS needs
+`TRANS_SET_CONTEXT_LATENCY` > 0, which the display-20 modeset does not
+program) and Wa_16025596647 (with DC5/DC6 blocked by non-PSR pipes the DMC
+starts package-C exit at the undelayed vblank, plus
+`intel_psr_set_non_psr_pipes`).
 
 Display-20 deltas, each with its pinned source branch:
 
@@ -1701,13 +1776,15 @@ Display-20 deltas, each with its pinned source branch:
 The shipped `xe2lpd_dmc.bin` (v2.29) loads main and pipes A–C inside the
 display-14 program windows, so the display-14 window checks apply unchanged.
 
-Refused or not wired on display 20: PSR (no max-sleep field, entry setup
-frames, Wa_16025596647 package-C blocking and the SRD_STATUS set-context
-latency are unimplemented), PSR2 and panel replay, FBC, tiled and
-compressed primaries, the KMS owner and GEM flips, DC5/DC6, external
-outputs (Type-C/PICA, TCSS pin assignment and HDMI), multi-pipe layouts,
-the VBT and backlight PWM. Panther Lake (display 30.00) stays refused; its
-recorded deltas are in the `intel_gpu_xe2lpd` module header.
+Refused or not wired on display 20: PSR1 (above), PSR2 and panel replay,
+FBC, tiled and compressed primaries, the cursor, color and DSB
+transactions, system suspend and relight, external outputs (Type-C/PICA,
+TCSS pin assignment and HDMI), multi-pipe layouts, the VBT and backlight
+PWM. The display route's own probe-time modeset window does not yet apply
+Wa_15015404425; the KMS owner and the DC service do. The Xe GEM_CREATE
+`SCANOUT` flag stays refused on LNL, so userspace flips WC objects that a
+framebuffer creation marked scanout. Panther Lake (display 30.00) stays
+refused; its recorded deltas are in the `intel_gpu_xe2lpd` module header.
 ## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
 
 The Gen12 media engines brought to the §8 (RCS0) standard.
@@ -2524,7 +2601,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
-| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; LNL display 20 has an opted-in owned eDP Pipe-A modeset with display-20 resources and DMC rules (native fixtures added, unexecuted); LNL KMS/PSR/FBC/DC states/externals and all PTL display remain |
+| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; opted-in LNL display 20 has an owned eDP Pipe-A modeset with display-20 resources, a display-preserving GT owner (no driver FLR; GT-only GuC/full reset; D0-only), an owned console with the KMS owner's linear Pipe-A flips at Xe2 PAT3, and the DC service loading `xe2lpd_dmc.bin` into DC6 (native fixtures added, unexecuted); LNL cursor/color/DSB, tiled primaries, PSR1 (refused), FBC, suspend, externals and all PTL display remain |
 
 The first four workstreams form the initial integration checkpoint. They do
 not close the broader rows. Changes to memory/VM or other TCB members carry
@@ -6751,3 +6828,61 @@ owner (it gives KMS its arena, the Xe2 scanout PAT and the DMC
 acquisition), the KMS owner's display-20 resource profile and FBC count,
 PSR1's display-20 deltas, then Type-C/PICA externals. Panther Lake's
 display 30 deltas are recorded in the `intel_gpu_xe2lpd` header.
+
+### Lunar Lake display 20: GT owner, KMS flips and DC6 — native fixtures added
+
+This slice continues the Lunar Lake display-20 route (§17, 10.5). Everything
+stays behind `narf.intel.lnl_display=1`, and every Lunar Lake function
+without the route keeps the headless main-GT profile and its driver FLR
+unchanged.
+
+The route's function now has a GT owner. Linux xe never runs a driver FLR at
+probe; it makes a GT fresh with the GuC reset and, on reset and shutdown,
+`do_gt_reset`'s `GRDOM_FULL`, while display keeps running. NARF's GT
+bring-up already issues that pair on the primary and media GTs before its
+first GGTT PTE, so the display-preserving profile replaces only the FLR. A
+read-only admission proves no FLR is in flight, display 20.00 with Pipe A
+lit, and no inherited display DMA outside the route's primary. It clears one
+stale FLR status bit so that any later FLR fails every PTE write. The
+profile refuses system suspend, because display-20 relight is not owned.
+
+Probe then moves the console onto an owned surface mapped at the firmware
+surface's own PAT index, which must be 0, and installs the KMS owner for
+display 20. Linear fixed-mode Pipe-A flips map GEM pages with Xe2 PAT3, the
+uncached display index of Linux xe, admitted only once the GT owner has
+programmed it. The owner keeps the display-20 pipe status bits, the FBC A–D
+and five-plane fetcher inventory, and the LNL dummy-write workaround before
+every read. Console restoration and GT-reset recovery run through the
+existing owner. The DC service also runs on display 20: after GT
+publication it loads `xe2lpd_dmc.bin` under the display-20 rules, enables
+Pipe A's DMC and enters DC6. PSR1 stays refused, with its display-20 deltas
+recorded in §17. The cursor, color, DSB transactions, tiled primaries and FBC
+are not offered yet.
+
+What a real Lunar Lake would do, opted in, beyond the previous slice: start
+its GT (GuC, engines, private VMs and the startup execution proofs) beside
+the lit panel and publish render/compute to userspace, move the console to
+the owned surface, flip linear WC framebuffers on Pipe A, and enter DC6
+when idle if `xe2lpd_dmc.bin` is present. None of this has run on silicon.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `drivers/gpu/intel_gpu_xe2lpd_gt`:
+  `smoke_xe2lpd_gt_display_admission_reads_display_only_and_never_flrs`,
+  `smoke_xe2lpd_gt_hardware_init_resets_gt_only` and
+  `smoke_xe2lpd_gt_profile_selection_keeps_headless_flr`.
+- `drivers/gpu/intel_gpu_xe2lpd_kms`:
+  `smoke_xe2lpd_kms_pte_profile_and_owned_status`,
+  `smoke_xe2lpd_kms_linear_flip_maps_pat3_and_restores_console`,
+  `smoke_xe2lpd_kms_fetcher_inventory_and_refused_services` and
+  `smoke_xe2lpd_kms_psr1_refused_on_display20`.
+- `drivers/gpu/intel_gpu_xe2lpd_dc`:
+  `smoke_xe2lpd_dc_service_profile_and_firmware` and
+  `smoke_xe2lpd_dc_service_loads_xe2lpd_dmc_and_enters_dc6`.
+
+Remaining for the workstream, in order: the cursor and DSB owners' display
+PTE profile (their GGTT pages still use the display-14 format and PAT1),
+then cursor, color and DSB on display 20; the Xe `SCANOUT` create flag on
+the display profile; Wa_15015404425 on the route's probe-time modeset
+window; display-20 relight and suspend; PSR1's display-20 deltas; FBC on the
+HDR planes; and Type-C/PICA externals.
