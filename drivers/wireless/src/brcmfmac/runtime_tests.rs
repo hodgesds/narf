@@ -32,6 +32,8 @@ struct Firmware {
 #[derive(Default)]
 struct State {
     ap_authority: Option<Rc<core::sync::atomic::AtomicBool>>,
+    ap_program_down_at_control_read: Option<narf_net::AdminHandle>,
+    ap_program_fail_index_once: bool,
     registers: BTreeMap<u32, u32>,
     tcm: BTreeMap<u32, u8>,
     dma: BTreeMap<u64, Vec<u8>>,
@@ -168,9 +170,20 @@ impl boot::Bus for Model {
         BASE + SIZE
     }
     fn read_tcm(&mut self, at: u32, bytes: &mut [u8]) -> Result<(), boot::Error> {
-        let s = self.0.lock();
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = *s.tcm.get(&(at + i as u32)).unwrap_or(&0);
+        let down = {
+            let mut s = self.0.lock();
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = *s.tcm.get(&(at + i as u32)).unwrap_or(&0);
+            }
+            if at == H2DR {
+                s.ap_program_down_at_control_read.take()
+            } else {
+                None
+            }
+        };
+        // Actual admin retirement after setup, outside the model IRQ guard.
+        if let Some(admin) = down {
+            admin.set_link(false).map_err(|_| boot::Error::Access)?;
         }
         Ok(())
     }
@@ -183,6 +196,11 @@ impl boot::Bus for Model {
             return Err(boot::Error::Access);
         }
         put(&mut s, at, bytes);
+        if at == H2DW && s.ap_program_fail_index_once {
+            s.ap_program_fail_index_once = false;
+            // The posted index may already be visible. No completion is made.
+            return Err(boot::Error::Access);
+        }
         if at == 0 && bytes.len() == 4 {
             s.writes
                 .push((0, u32::from_le_bytes(bytes.try_into().unwrap())));

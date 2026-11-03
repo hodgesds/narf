@@ -813,6 +813,16 @@ saved zero or restoration value. A supported write-only disable remains
 disabled on restoration; an observed enabled but undisablable engine refuses
 AP admission. Missing native evidence never becomes an affirmative receipt.
 
+Every AP Program IOCTL retains its original fixed native/source/policy/role
+capture through input DMA, control-ring descriptor, native write pointer and
+doorbell publication. Ring setup and the actual native consumer-index read
+precede that final scope. A source retired during setup cannot publish an
+old command; a possibly issued index/doorbell failure closes the owner and
+pins its original DMA until actual whole-device stop. Ordinary station
+commands and denial-only AP Stop cleanup retain their existing paths. An
+additional native case covers real admin retirement at the setup boundary
+and a possibly visible native index failure; execution remains pending.
+
 Firmware is the AP SME. Actual ASSOC_IND/REASSOC_IND payload IEs and matching
 native `sta_info` authentication/association/rate/MAC observations establish
 one of at most8 peers. The frontend advertises `DEVICE_AP_SME` value0 and uses

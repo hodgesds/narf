@@ -891,6 +891,13 @@ fn scan_result(
 #[derive(Clone)]
 pub(crate) struct Handle(Rc<IrqSafeSpinLock<State>>);
 impl Handle {
+    pub(crate) fn ap_program_down_after_setup(&self, admin: narf_net::AdminHandle) {
+        self.0.lock().ap_program_down_at_control_read = Some(admin);
+    }
+    pub(crate) fn ap_program_fail_index(&self) {
+        self.0.lock().ap_program_fail_index_once = true;
+    }
+
     pub(crate) fn enable_monitor(&self, profile: monitor_model::Profile) {
         let mut state = self.0.lock();
         state.ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));

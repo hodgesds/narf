@@ -11,6 +11,8 @@ use super::{
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "runtime/ap_ioctl.rs"]
+mod ap_ioctl;
 #[path = "runtime/mailbox.rs"]
 pub mod mailbox;
 #[path = "runtime/quiesce.rs"]

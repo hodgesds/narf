@@ -370,6 +370,36 @@ where
             && !self.flows.iter().any(|flow| flow.destination == peer)
             && inner.ap_completed_idle().map_err(map)?)
     }
+    async fn command_ap<'a>(
+        &'a mut self,
+        original: &'a super::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        let extent = if direction == Direction::Set {
+            input.len()
+        } else {
+            maximum
+        };
+        let mut response = self
+            .inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .command_ap(command, input, extent, original)
+            .await
+            .map_err(map)?;
+        if direction == Direction::Set {
+            response.clear();
+        } else {
+            response.truncate(maximum);
+        }
+        Ok(response)
+    }
     async fn command<'a>(
         &'a mut self,
         direction: Direction,

@@ -41,7 +41,16 @@ pub(super) async fn command<R: Fullmac>(
     maximum: usize,
 ) -> Result<Vec<u8>, Error> {
     guard.current()?;
-    let mut future = pin!(runtime.command(direction, command, input, maximum));
+    let mut future = pin!(async {
+        match guard {
+            Guard::Program(original) => {
+                runtime
+                    .command_ap(original, direction, command, input, maximum)
+                    .await
+            }
+            Guard::Stop(_) => runtime.command(direction, command, input, maximum).await,
+        }
+    });
     poll_fn(|cx| {
         if let Err(error) = guard.current() {
             return Poll::Ready(Err(error));

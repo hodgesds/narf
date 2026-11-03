@@ -111,6 +111,19 @@ pub trait Fullmac: Send {
         input: &'a [u8],
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a;
+    /// Original fixed AP Program scope reaches actual native publication.
+    /// Unsupported backends deny by default. Stop/source-only cleanup uses
+    /// ordinary command and never obtains new AP Program authority.
+    fn command_ap<'a>(
+        &'a mut self,
+        _original: &'a crate::brcmfmac::ap_scope::Capture,
+        _direction: Direction,
+        _command: u32,
+        _input: &'a [u8],
+        _maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        core::future::ready(Err(Error::Unsupported))
+    }
     fn configure_bus(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
     /// Consumed transport records, bounded per call. Positive progress may
     /// leave more RX/events beyond the budget. Zero requires an actual current

@@ -817,3 +817,83 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/ap",
     smoke_brcmf_ap_native_policy_replacement_and_system_pm_retire_original_bss
 );
+
+fn program_publication() -> Result<(), &'static str> {
+    use crate::cyw43439::{fullmac::Fullmac, ioctl::Direction};
+    {
+        let b = Bound::new()?;
+        b.start(false)?;
+        let original = {
+            let state = b.device.state.try_lock().ok_or("AP Program capture lock")?;
+            state
+                .ap
+                .as_ref()
+                .ok_or("AP Program owner")?
+                .publication()
+                .map_err(|_| "AP Program original proof")?
+        };
+        let before = b.bus.commands().len();
+        b.bus.ap_program_down_after_setup(b.admin.clone());
+        let result = ready(async {
+            let mut state = b.device.state.lock().await;
+            state
+                .station
+                .runtime
+                .command_ap(&original, Direction::Get, 117, &[], 4)
+                .await
+        })?;
+        if result.is_ok()
+            || b.bus.commands().len() != before
+            || b.device.transport_failed()
+            || b.device.link_up()
+        {
+            return Err(
+                "AP Program retired after setup published IOCTL or poisoned unissued owner",
+            );
+        }
+    }
+    {
+        let b = Bound::new()?;
+        b.start(false)?;
+        let original = {
+            let state = b.device.state.try_lock().ok_or("AP Program issue lock")?;
+            state
+                .ap
+                .as_ref()
+                .ok_or("AP Program issue owner")?
+                .publication()
+                .map_err(|_| "AP Program issue original proof")?
+        };
+        let before = b.bus.mappings();
+        b.bus.ap_program_fail_index();
+        let (result, failed) = ready(async {
+            let mut state = b.device.state.lock().await;
+            let result = state
+                .station
+                .runtime
+                .command_ap(&original, Direction::Get, 117, &[], 4)
+                .await;
+            (result, state.station.runtime.transport_failed())
+        })?;
+        if result.is_ok()
+            || !failed
+            || b.bus.dma_enabled()
+            || b.bus.mappings().1 != before.1
+            || original.current().is_ok()
+        {
+            return Err("AP Program uncertain native index granted credit or released DMA");
+        }
+    }
+    Ok(())
+}
+fn smoke_brcmf_ap_program_publication_rechecks_original_after_setup_and_pins_uncertain_index(
+) -> TestResult {
+    match program_publication() {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/ap",
+    smoke_brcmf_ap_program_publication_rechecks_original_after_setup_and_pins_uncertain_index
+);

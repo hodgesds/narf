@@ -650,6 +650,16 @@ shared plaintext-management fragment continuation adds no feature credit. Full
 release/native validation remains at25 completed rows. Counting unvalidated
 implementations,78 remain; physical S3/firmware/board acceptance stays separate.
 
+**2026-11-02 — native AP control-publication correction.** Counts remain
+**55 `feature`**, **31 `chip`**, **0 `unknown`** and **23 source-complete
+implementations pending validation**. BCM AP Program IOCTLs now preserve their
+original authority through actual native control-ring publication after setup.
+Unissued refusal grants no command or DMA credit; uncertain index/doorbell
+issue closes and pins the original owner. One additional native case is written
+and unexecuted; scoped formatting and one release metadata context pass. This
+repair earns no completed-feature credit. Full release/native validation remains
+at25 completed rows; physical hardware acceptance stays separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -1583,7 +1593,11 @@ through final callbacks. Host staging, IOCTL completion or dropped waiters never
 supply native packet/ACK/PN credit. Failure/cancellation drives retained original
 physical teardown and pins uncertain mappings. Family `brcmfmac.md` §3 defines
 the bounded legacy20 Open/WPA2 CCMP profile and explicit unsupported features;
-CYW43439 keeps its independent AP row open. Nine native cases are unexecuted.
+CYW43439 keeps its independent AP row open. AP Program IOCTLs additionally
+retain the original `Capture` through input/descriptor/index/doorbell publication
+after native ring setup; definitely unissued refusal stays distinct from
+entered uncertain issue. Ordinary station and physical Stop paths are unchanged.
+Ten native cases are unexecuted.
 
 ### 3.11 Original-owner runtime LPS (validation pending)
 
