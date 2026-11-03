@@ -191,6 +191,11 @@ impl Board {
         if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {
             h.update(&super::station_control::wide_fingerprint());
         }
+        // A 160MHz record binds the C 160MHz station capability and RA
+        // recipe (`station_control::wide160_fingerprint`) instead.
+        if profile.width() == Width::Mhz160 {
+            h.update(&super::station_control::wide160_fingerprint());
+        }
         power.bind(&mut h);
         h.update(&[
             profile.band() as u8,

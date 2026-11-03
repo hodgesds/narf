@@ -132,8 +132,9 @@ pub(super) struct Device<I: Io> {
     /// (channel1 = base N52B; others N52C). Sampled at activation.
     channels: core::sync::atomic::AtomicU64,
     /// Bands with a signed-admitted 40/80MHz operating channel the station
-    /// may offer its wide capability on (bit0 2.4GHz, bit1 5GHz; requires
-    /// the HT program). Sampled at activation; 0 advertises no width.
+    /// may offer its wide capability on (bit0 2.4GHz, bit1 5GHz, bit2 an
+    /// RTL8852C 5GHz 160MHz channel; requires the HT program). Sampled at
+    /// activation; 0 advertises no width.
     wide: core::sync::atomic::AtomicU8,
     fragments_capable: AtomicBool,
     desired: Arc<super::monitor::Desired>,
@@ -679,7 +680,14 @@ impl<I: Io + 'static> Device<I> {
                 Vec::new()
             };
             profiles.iter().fold(0u8, |mask, profile| {
-                mask | if profile.is_5ghz() { 2 } else { 1 }
+                // bit2: an admitted 5GHz 160MHz profile (RTL8852C only;
+                // RTL8852B `admitted_wide` never lists one).
+                let c160 = if profile.width() == super::operating_channel::Width::Mhz160 {
+                    4
+                } else {
+                    0
+                };
+                mask | c160 | if profile.is_5ghz() { 2 } else { 1 }
             })
         };
         self.wide.store(wide, Ordering::Release);
@@ -1188,7 +1196,8 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             .station_information_elements(bssid)
     }
     /// The wide station capability (`station_control::local_ht40`, and on
-    /// 5GHz `local_vht80`) of a band with an admitted 40/80MHz operating
+    /// 5GHz `local_vht80`, or `local_vht160` when an RTL8852C 160MHz channel
+    /// is admitted) of a band with an admitted 40/80MHz operating
     /// channel: core.c `rtw89_init_ht_cap`/`rtw89_init_vht_cap` as restricted
     /// for this profile. Bands without one advertise nothing (no width is
     /// promised that no signed record can program).
@@ -1199,7 +1208,14 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             2400 if wide & 1 != 0 => Some(narf_wireless::iface::PhyCapabilities { ht, vht: None }),
             5000 if wide & 2 != 0 => Some(narf_wireless::iface::PhyCapabilities {
                 ht,
-                vht: Some(super::station_control::local_vht80()?.capability_body()),
+                vht: Some(
+                    if wide & 4 != 0 {
+                        super::station_control::local_vht160()?
+                    } else {
+                        super::station_control::local_vht80()?
+                    }
+                    .capability_body(),
+                ),
             }),
             _ => None,
         }

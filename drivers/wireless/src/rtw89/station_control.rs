@@ -1143,14 +1143,68 @@ pub(super) fn local_vht80() -> Option<narf_wireless::association::phy::LocalVht>
         .ok()
         .map(|vht| vht.with_ldpc(true, true).with_rx_stbc(true))
 }
+/// RTL8852C local VHT160 capability: `local_vht80` plus the core.c
+/// `rtw89_init_vht_cap` bits RTL8852C gets from `support_bandwidths &
+/// BIT(NL80211_CHAN_WIDTH_160)`: `SUPP_CHAN_WIDTH_160MHZ` (Supported Channel
+/// Width Set 1, contiguous 160 only; no 80+80) and `SHORT_GI_160`. VHT has
+/// one MCS map for every width, so the 160MHz rates are the same
+/// VHT-MCS0..9 RX two-stream / TX one-stream maps. Offered only for an
+/// admitted C 160MHz chandef (`wide_phy`); never on RTL8852B.
+pub(super) fn local_vht160() -> Option<narf_wireless::association::phy::LocalVht> {
+    local_vht80().map(|vht| vht.with_160mhz(true, true))
+}
+/// RTL8852C 5GHz HE160 capability: `local_he_wide(true)` plus the core.c
+/// `rtw89_init_he_cap` `support_bandwidths & BIT(NL80211_CHAN_WIDTH_160)`
+/// bits: PHY cap0 `CHANNEL_WIDTH_SET_160MHZ_IN_5G`, cap8
+/// `20MHZ_IN_160MHZ_HE_PPDU | 80MHZ_IN_160MHZ_HE_PPDU` and the 160MHz
+/// HE-MCS/NSS set (`rx_mcs_160`/`tx_mcs_160` = the 80MHz maps, restricted
+/// like them: RX MCS0..11 on both paths, TX on one). cap4
+/// `BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4` stays clear with the rest of the
+/// beamformee bits (no sounding feedback owner).
+pub(super) fn local_he160() -> Option<narf_wireless::association::he::LocalHe> {
+    use narf_wireless::association::he::LocalHe;
+    let base = local_he_wide(true)?;
+    let wide = base.capability();
+    let mut phy = wide.phy_capability();
+    phy[8] |= 0x04 | 0x08;
+    LocalHe::new(wide.mac_capability(), phy, 0xfffa, 0xfffe)
+        .ok()?
+        .with_160mhz(0xfffa, 0xfffe)
+        .ok()
+}
+/// RTL8852C 160MHz station capability bound by every C 160MHz record
+/// identity (`radio_policy_c::Board::new`): the exact HT40/VHT160/HE160
+/// bodies `wide_phy` may offer on such a channel and the 160MHz RA recipe.
+pub(super) fn wide160_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"C 160MHz station v1; rtw89_init_vht_cap SUPP_CHAN_WIDTH_160MHZ SHORT_GI_160 (same MCS maps); rtw89_init_he_cap PHY cap0 160MHz-5G cap8 20/80MHz-in-160 HE PPDU, mcs_160 = mcs_80; offered only on the admitted C 160MHz chandef");
+    hash.update(b"RA rtw89_phy_ra_sta_update IEEE80211_STA_RX_BW_160 BW_CAP RTW89_CHANNEL_WIDTH_160 SGI VHT SHORT_GI_160; HE fix_giltf RTL8852C 160 SGI_4XHE08 if peer SU/MU 4xLTF 0.8us else 2XHE08; RX bound RTW89_CHANNEL_WIDTH_160");
+    if let Some(ht) = local_ht40() {
+        hash.update(&ht.capability_body());
+    }
+    if let Some(vht) = local_vht160() {
+        hash.update(&vht.capability_body());
+    }
+    hash.update(
+        &local_he160()
+            .map(|he| he.capability_body())
+            .unwrap_or_default(),
+    );
+    hash.finalize()
+}
 /// Local PHY for joining the AP at `primary` over an admitted 40/80MHz
-/// operating channel, and that exact channel. Mirrors mac80211
-/// `ieee80211_determine_ap_chan` (the chandef is the narrower of the AP's
-/// HT/VHT/HE operation and the local capability): candidates are tried from
-/// widest (5GHz VHT80, then HT40), and one is used only when its selected
-/// chandef is exactly a profile in `admitted` (a signed wide record whose
-/// host rule currently permits it). `None` keeps the 20MHz join unchanged.
-/// HE is added (`local_he_wide`) only when `he` (the signed HE program).
+/// (RTL8852C: also 5GHz 160MHz) operating channel, and that exact channel.
+/// Mirrors mac80211 `ieee80211_determine_ap_chan` (the chandef is the
+/// narrower of the AP's HT/VHT/HE operation and the local capability):
+/// candidates are tried from widest (5GHz VHT160, VHT80, then HT40), and one
+/// is used only when its selected chandef is exactly a profile in
+/// `admitted` (a signed wide record whose host rule currently permits it).
+/// The VHT160/HE160 candidate exists only when `admitted` holds a 160MHz
+/// profile containing `primary` (only the RTL8852C `admitted_wide` lists
+/// one) and is used only when its selected chandef is that 160MHz profile;
+/// otherwise the 80MHz/40MHz candidates are tried unchanged. `None` keeps
+/// the 20MHz join unchanged. HE is added (`local_he_wide`/`local_he160`)
+/// only when `he` (the signed HE program).
 pub(super) fn wide_phy(
     ies: &[u8],
     primary: u8,
@@ -1160,34 +1214,52 @@ pub(super) fn wide_phy(
     narf_wireless::association::phy::LocalPhy,
     super::operating_channel::Profile,
 )> {
+    use super::operating_channel::Width as Bw;
     use narf_wireless::association::phy::{LocalPhy, Offer, Width};
     if admitted.is_empty() {
         return None;
     }
     let ghz5 = primary > 14;
     let ht = local_ht40()?;
+    let c160 = ghz5
+        && admitted
+            .iter()
+            .any(|p| p.width() == Bw::Mhz160 && p.subchannels().any(|ch| ch == primary));
     let mut candidates = alloc::vec::Vec::new();
-    if ghz5 {
-        candidates.push(LocalPhy::vht80(ht, local_vht80()?).ok()?);
-    }
-    candidates.push(LocalPhy::ht40(ht).ok()?);
-    for mut local in candidates {
+    if c160 {
+        let mut local = LocalPhy::vht160(ht, local_vht160()?).ok()?;
         if he {
+            local = local.with_he(local_he160()?).ok()?;
+        }
+        candidates.push((local, true));
+    }
+    if ghz5 {
+        candidates.push((LocalPhy::vht80(ht, local_vht80()?).ok()?, false));
+    }
+    candidates.push((LocalPhy::ht40(ht).ok()?, false));
+    for (mut local, wide160) in candidates {
+        if he && !wide160 {
             local = local.with_he(local_he_wide(ghz5)?).ok()?;
         }
         let Ok(Some(offer)) = Offer::from_elements(local, ies, primary) else {
             continue;
         };
+        if offer.discontiguous() {
+            continue;
+        }
         let width = match offer.width() {
-            Width::Forty => super::operating_channel::Width::Mhz40,
-            Width::Eighty => super::operating_channel::Width::Mhz80,
+            Width::Forty if !wide160 => Bw::Mhz40,
+            Width::Eighty if !wide160 => Bw::Mhz80,
+            Width::OneSixty if wide160 => Bw::Mhz160,
             _ => continue,
         };
         let center = offer.center_channel();
-        let Some(profile) =
+        let profile = if width == Bw::Mhz160 {
+            super::operating_channel::Profile::new_5ghz_160(primary)
+        } else {
             super::operating_channel::Profile::new_wide(primary, width, center > primary)
-                .filter(|p| p.center() == center)
-        else {
+        };
+        let Some(profile) = profile.filter(|p| p.center() == center) else {
             continue;
         };
         if admitted.contains(&profile) {

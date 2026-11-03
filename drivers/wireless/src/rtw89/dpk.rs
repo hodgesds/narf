@@ -117,6 +117,10 @@ impl Dpk {
         if cut > 15 || !matches!(gain, 0x5b | 0x7f) || tssi.results().is_none() {
             return Err(Error::Table);
         }
+        // rtw8852b.c `support_bandwidths` has no 160MHz.
+        if channel.width() == super::operating_channel::Width::Mhz160 {
+            return Err(Error::Policy);
+        }
         io.admit()?;
         self.state = State::Calibrating;
         io.begin(rfk::Kind::Dpk).await?;
@@ -449,6 +453,8 @@ async fn calibrate<I: Interface>(
             Width::Mhz20 => 1,
             Width::Mhz40 => 2,
             Width::Mhz80 => 0,
+            // Refused by `prepare_for_channel` before any calibration.
+            Width::Mhz160 => return Err(Error::Policy),
         },
     )?;
     one_shot(a, path, 0x16).await?;

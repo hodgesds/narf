@@ -221,7 +221,7 @@ pub(super) struct Core {
     /// RX bandwidth bound (`enum rtw89_bandwidth`) of the programmed
     /// operating channel (`set_operating_width`); 0 = 20MHz.
     rx_width: u8,
-    /// VHT PPDUs admitted (an HT-program owner on a 5GHz 40/80MHz channel).
+    /// VHT PPDUs admitted (an HT-program owner on a 5GHz wide channel).
     rx_vht: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
@@ -889,12 +889,15 @@ impl Core {
         self.pending.remove(index);
         Ok(())
     }
-    /// The programmed operating channel's RX bound: `width` (0/1/2 =
-    /// 20/40/80MHz) and whether VHT rates are admitted (RTL8852B 5GHz wide
-    /// channel). Linux rtw89 reports every PPDU the tuned BB decodes; this
-    /// owner additionally never admits a bandwidth the radio was not tuned to.
+    /// The programmed operating channel's RX bound: `width` (0/1/2/3 =
+    /// 20/40/80/160MHz; 160MHz only on RTL8852C, whose `support_bandwidths`
+    /// has it, RTL8852B is clamped to 80MHz) and whether VHT rates are
+    /// admitted (5GHz wide channel). Linux rtw89 reports every PPDU the tuned
+    /// BB decodes; this owner additionally never admits a bandwidth the radio
+    /// was not tuned to.
     pub(super) fn set_operating_width(&mut self, width: u8, vht: bool) {
-        self.rx_width = width.min(2);
+        let max = if self.chip == ChipId::Rtl8852C { 3 } else { 2 };
+        self.rx_width = width.min(max);
         self.rx_vht = vht && self.rx_width != 0;
     }
     fn admits_rate(&self, rate: u16) -> bool {

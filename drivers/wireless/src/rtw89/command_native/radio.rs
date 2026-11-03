@@ -97,6 +97,15 @@ pub(in crate::rtw89) fn wide_profiles() -> impl Iterator<Item = operating_channe
     });
     ghz2.chain(ghz5)
 }
+/// The RTL8852C-only 5GHz 160MHz station chandefs (rtw8852c.c
+/// `support_bandwidths` has `NL80211_CHAN_WIDTH_160`; rtw8852b.c does not),
+/// one per primary of every IEEE 160MHz block wholly inside core.c
+/// `rtw89_channels_5ghz`. Never offered to an RTL8852B owner.
+pub(in crate::rtw89) fn wide_profiles_c160() -> impl Iterator<Item = operating_channel::Profile> {
+    operating_channel::GHZ5
+        .into_iter()
+        .filter_map(operating_channel::Profile::new_5ghz_160)
+}
 /// The RTL8852C typed profile of a shared station profile (`wide_profiles`
 /// or a 20MHz narrowing): same primary, center and width.
 pub(in crate::rtw89) fn c_profile(
@@ -116,6 +125,7 @@ pub(in crate::rtw89) fn c_profile(
         }
         Width::Mhz40 => Profile::new_wide(band, profile.primary(), WidthC::Mhz40),
         Width::Mhz80 => Profile::new_wide(band, profile.primary(), WidthC::Mhz80),
+        Width::Mhz160 => Profile::new_wide(band, profile.primary(), WidthC::Mhz160),
     }?;
     (c.center() == profile.center()).then_some(c)
 }
@@ -661,21 +671,23 @@ impl Native {
         }
         Ok(mask)
     }
-    /// Every 40/80MHz operating channel with a current signed full program
+    /// Every 40/80MHz (RTL8852C: also 5GHz 160MHz) operating channel with a
+    /// current signed full program
     /// whose host rule currently permits it (scan/association may widen to
     /// exactly these; nothing wider than a record is ever programmed).
     pub(in crate::rtw89) fn admitted_wide(
         &self,
     ) -> Result<alloc::vec::Vec<operating_channel::Profile>, power::Error> {
         if self.c_ordinary()? {
-            // RTL8852C: the same 40/80MHz chandefs, each with a loaded signed
-            // `N5CC` record wholly active under the host rule.
+            // RTL8852C: the same 40/80MHz chandefs plus the C-only 5GHz
+            // 160MHz ones, each with a loaded signed `N5CC` record wholly
+            // active under the host rule.
             let qualification = self
                 .qualification_c
                 .as_ref()
                 .ok_or(power::Error::Terminal)?;
             let mut admitted = alloc::vec::Vec::new();
-            for profile in wide_profiles() {
+            for profile in wide_profiles().chain(wide_profiles_c160()) {
                 let Some(c) = c_profile(profile) else {
                     continue;
                 };
@@ -1404,7 +1416,8 @@ impl Native {
         qualification.current().map_err(denied)?;
         self.channel = Some((profile.primary(), owner.epoch()));
         // RX admission follows the programmed width (as the B retune): up to
-        // this channel's bandwidth, VHT rates only on a 5GHz 40/80MHz channel.
+        // this channel's bandwidth (C: 160MHz = RTW89_CHANNEL_WIDTH_160 only
+        // when programmed at 160), VHT rates only on a 5GHz wide channel.
         if let Some(core) = self.station_runtime.core.as_mut() {
             let width = profile.width() as u8;
             core.set_operating_width(

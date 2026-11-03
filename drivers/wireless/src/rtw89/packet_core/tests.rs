@@ -1182,6 +1182,29 @@ fn smoke_rtw89_b_packet_rx_width_follows_programmed_channel() -> TestResult {
     if legacy.admits_rate(0x105) {
         return TestResult::Fail("VHT admitted without the HT program");
     }
+    // RTL8852B never widens past 80MHz; RTL8852C admits 160MHz only when
+    // programmed at RTW89_CHANNEL_WIDTH_160.
+    core.set_operating_width(3, true);
+    if core.rx_width != 2 {
+        return TestResult::Fail("RTL8852B RX bound widened to 160MHz");
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    let Ok(mut c) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("C HT packet preparation");
+    };
+    c.set_operating_width(2, true);
+    if c.rx_width != 2 {
+        return TestResult::Fail("C 80MHz program admitted 160MHz RX");
+    }
+    c.set_operating_width(3, true);
+    if c.rx_width != 3 || !c.admits_rate(0x105) {
+        return TestResult::Fail("C 160MHz program refused 160MHz VHT RX");
+    }
+    c.set_operating_width(0, true);
+    if c.rx_width != 0 || c.admits_rate(0x105) {
+        return TestResult::Fail("C 20MHz retune kept 160MHz RX admission");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

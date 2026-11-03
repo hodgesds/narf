@@ -237,6 +237,8 @@ impl Channel {
                 u32::from(channel.txsc(Width::Mhz20))
                     | (u32::from(channel.txsc(Width::Mhz40)) << 4),
             ),
+            // rtw8852b.c `support_bandwidths` has no 160MHz.
+            Width::Mhz160 => return Err(Error::Policy),
         };
         a.byte(R_AX_WMAC_RFMOD, B_AX_WMAC_RFMOD_MASK as u8, rfmod)?;
         a.write(R_AX_TX_SUB_CARRIER_VALUE, sub_carrier)?;
@@ -323,6 +325,7 @@ impl Channel {
             Width::Mhz20 => None,
             Width::Mhz40 => Some(pri == 2),
             Width::Mhz80 => (pri == 3 || pri == 4).then_some(pri == 4),
+            Width::Mhz160 => return Err(Error::Policy),
         };
         match mask_5m {
             None => {

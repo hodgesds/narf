@@ -355,16 +355,22 @@ pub(in crate::rtw89) struct VhtRa {
     /// Peer RXLDPC intersected with local TX LDPC.
     pub(in crate::rtw89) ldpc: bool,
 }
-/// The 40/80MHz part of `rtw89_phy_ra_sta_update`: `bw_cap` from
+/// The wide part of `rtw89_phy_ra_sta_update`: `bw_cap` from
 /// `link_sta->bandwidth` and the SGI of that bandwidth (40MHz: HT SGI_40;
-/// 80MHz: VHT SHORT_GI_80), plus the VHT facts when VHT (and not HE) was
-/// negotiated.
+/// 80MHz: VHT SHORT_GI_80; 160MHz: VHT SHORT_GI_160), plus the VHT facts
+/// when VHT (and not HE) was negotiated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rtw89) struct WideRa {
-    /// `RTW89_CHANNEL_WIDTH_40` (1) or `RTW89_CHANNEL_WIDTH_80` (2).
+    /// `RTW89_CHANNEL_WIDTH_40` (1), `_80` (2) or, RTL8852C only, `_160` (3).
     pub(in crate::rtw89) bw: u8,
     pub(in crate::rtw89) sgi: bool,
     pub(in crate::rtw89) vht: Option<VhtRa>,
+    /// phy.c `rtw89_phy_ra_gi_ltf` for an HE peer on an RTL8852C 160MHz
+    /// channel: `fix_giltf_en` with `RTW89_GILTF_SGI_4XHE08` (1) when the
+    /// peer has `HE_SU_MU_PPDU_4XLTF_AND_08_US_GI`, else
+    /// `RTW89_GILTF_2XHE08` (3). `None` keeps W3 clear (every 40/80MHz link,
+    /// as the 20MHz HE path).
+    pub(in crate::rtw89) fix_giltf: Option<u8>,
 }
 /// `get_mcs_ra_mask(mcs_map, 9, 1)`: the non-20MHz VHT branch (MCS9/8/7
 /// per NSS at bit 12 + 12 * nss).
@@ -423,11 +429,18 @@ fn ra_vht(rates: u16, vht: VhtRa) -> Option<[u8; 16]> {
     word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
     Some(bytes)
 }
-/// `rtw89_phy_ra_sta_update` on an admitted 40/80MHz channel: the HE, VHT
+/// `rtw89_phy_ra_sta_update` on an admitted wide channel: the HE, VHT
 /// or HT branch body (in that precedence, as Linux), then `BW_CAP[7:6]` =
-/// `wide.bw` and `SGI` = the SGI of that bandwidth.
+/// `wide.bw` and `SGI` = the SGI of that bandwidth. 80/160MHz need VHT;
+/// `fix_giltf` (W3 `FIX_GILTF_EN` BIT(11), `FIX_GILTF` [14:12]) only on an
+/// HE 160MHz link.
 pub(super) fn ra_wide(rates: u16, ht: HtRa, he: Option<HeRa>, wide: WideRa) -> Option<[u8; 16]> {
-    if !matches!(wide.bw, 1 | 2) || wide.bw == 2 && wide.vht.is_none() {
+    if !matches!(wide.bw, 1..=3)
+        || wide.bw >= 2 && wide.vht.is_none()
+        || wide
+            .fix_giltf
+            .is_some_and(|g| wide.bw != 3 || he.is_none() || !matches!(g, 1 | 3))
+    {
         return None;
     }
     let mut bytes = match (he, wide.vht) {
@@ -439,6 +452,9 @@ pub(super) fn ra_wide(rates: u16, ht: HtRa, he: Option<HeRa>, wide: WideRa) -> O
         | u32::from(wide.bw) << 6
         | u32::from(wide.sgi) << 21;
     word(&mut bytes, 0, w0);
+    if let Some(giltf) = wide.fix_giltf {
+        word(&mut bytes, 3, 1 << 11 | u32::from(giltf) << 12);
+    }
     Some(bytes)
 }
 pub(in crate::rtw89) fn ra(rates: u16) -> Option<[u8; 16]> {

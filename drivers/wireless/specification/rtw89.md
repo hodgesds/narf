@@ -3490,13 +3490,30 @@ and no DFS/NO_IR rule over the span), and station retune/CSA go through
 `retune_channel_c`. Unexecuted case:
 `smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1`.
 
-Known gaps for the `rtl8852c` row: native execution on hardware (no C
-board record exists, so actual admission needs a provisioned board);
-VHT, widths above 20MHz, A-MSDU,
-LPS, WoW, monitor and AP are not implemented for C (WMM, all-AC QoS,
-firmware RA, HT20/HE20 and A-MPDU/BA: see below) (C track work covers
-DIG/CFO/EDCCA/IFS-CLM, not `rtw8852c_rfk_track`). The C station widens to admitted 40/80MHz profiles through the
-shared wide path (below); 160MHz is station-unreachable. Unexecuted new cases:
+Known gaps for the `rtl8852c` row (scope: the RTL8852B chip-row
+station scope; B's LPS `runtime_sleep`, RF power tracking
+`rf_power_tracking`, A-MSDU `aggregation`, WoW, monitor and AP are
+separate feature rows, so for C they are documented, not part of this
+row): native execution on hardware (no C board record exists, so actual
+admission needs a provisioned board) and the following documented C
+omissions, each with its reason. *LPS:* rtw8852c.c sets
+`low_power_hci_modes = CLK_GATED | PWR_GATED`, so ps.c
+`rtw89_ps_power_mode_change` takes `rtw89_ps_power_mode_change_with_hci`
+(the PCI HCI low-power handshake) where B (`low_power_hci_modes = 0`)
+takes the plain `rtw89_mac_power_mode_change` the B `runtime_sleep` owner
+implements; the C HCI path is not implemented, so C has no signed sleep
+companion (`Native::sleep_profile` returns no program on C and the
+station never enters LPS). *RF power tracking:* `rtw8852c_rfk_track` is the C
+rtw8852c_rfk.c DPK/TSSI/thermal tracking, a different algorithm and
+register set from B's `rf_power_tracking` owner; C track work covers
+DIG/CFO/EDCCA/IFS-CLM only and `station_rf_tracking` is a no-op on C.
+*A-MSDU:* B's A-MSDU is the separate signed `N52A` companion of the
+`aggregation` row (no `Program` bit); C has no such companion
+(`station_amsdu_allowed` `Ok(false)`, `Core::enable_amsdu` refuses C).
+*WoW, monitor, AP:* each is its own B feature row with no C owner.
+Implemented for C (below): WMM, all-AC QoS, firmware RA, HT20/HE20,
+A-MPDU/BA, 40/80MHz through the shared wide path and 5GHz 160MHz
+(VHT160/HE160, "C 160MHz station"). Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
 `smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.
@@ -3627,10 +3644,68 @@ channel), as the B retune does. `rx_packet` admits bandwidth up to
 Board::new`) now also binds `station_control::wide_fingerprint`, exactly as
 B's `new_noninitial` does. The capability is offered only for the bands with
 an admitted wide profile (`interface.rs`), so an unprovisioned C board stays
-20MHz. 160MHz is not part of this step. B bytes are unchanged. Unexecuted
+20MHz. 160MHz: next paragraph. B bytes are unchanged. Unexecuted
 cases: `smoke_rtw8852c_wide_station_profiles_map_to_c_profiles`,
 `smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner` (C v1
 part).
+
+**C 160MHz station.** rtw8852c.c `support_bandwidths` includes
+`NL80211_CHAN_WIDTH_160` (rtw8852b.c does not). *Geometry:* the shared
+`operating_channel::Width` gains `Mhz160` (= `RTW89_CHANNEL_WIDTH_160`),
+but every B constructor refuses it (`new_5ghz`, `new_wide`, `from_mhz`);
+only `Profile::new_5ghz_160` builds one (the IEEE 5GHz 160MHz blocks
+36..64 / 100..128 / 149..177, centers 50/114/163, every subchannel a
+core.c `rtw89_channels_5ghz` channel). `pri_ch_idx` follows chan.c
+`rtw89_get_primary_chan_idx` (80/160MHz arm), `txsc` phy.c
+`rtw89_phy_get_txsc` (160MHz arm: `tmp` 1..8, dbw40 9/10/11/12, dbw80
+13/14), and `subchannels`/`occupied` the whole 160MHz span; these equal
+the C typed profile's (`command_native::c_profile` maps `Mhz160` to
+`operating_channel_c::Width::Mhz160`). *Admission:*
+`command_native::wide_profiles_c160` lists the 24 chandefs; only the C
+branch of `Native::admitted_wide` chains them, each admitted when its
+loaded signed `N5CC` 160MHz record (`radio_policy_c::noninitial` already
+lists 160MHz profiles) is `channel_active` over the whole span, so the
+B `admitted_wide` never holds a 160MHz profile. The C 160MHz record
+identity (`radio_policy_c::Board::new`) binds
+`station_control::wide160_fingerprint` (the VHT160/HE160 bodies and the
+160MHz RA recipe). Programming is the existing C path
+(`Startup::retune_wide` -> `retune_channel_c`, the N5CC BB/RF/RFK/power
+blocks already carry 160MHz). Defensively the B BB (`channel_bb`), RF
+(`channel_rf` `_bw_setting`/`_set_rxbb_bw`), DPK and power-limit
+(`radio_power::fill_wide`) programs refuse a 160MHz profile before any
+write. *Capability:* `local_vht160` = `local_vht80` +
+`IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ` + `SHORT_GI_160` (core.c
+`rtw89_init_vht_cap`; VHT has one MCS map, so the same RX2SS/TX1SS
+MCS0..9 maps; no 80+80, no ext-NSS-BW); `local_he160` = `local_he_wide(5GHz)`
++ HE PHY cap0 `CHANNEL_WIDTH_SET_160MHZ_IN_5G`, cap8
+`20MHZ_IN_160MHZ_HE_PPDU | 80MHZ_IN_160MHZ_HE_PPDU` and
+`rx/tx_mcs_160` = the restricted 80MHz maps (core.c `rtw89_init_he_cap`;
+cap4 `BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4` stays clear with every other
+beamformee bit). `station_control::wide_phy` adds a VHT160(+HE160)
+candidate first only when `admitted` holds a 160MHz profile containing the
+primary, and uses it only when the selected chandef (`Offer::from_elements`,
+contiguous) is exactly that profile; otherwise the unchanged VHT80/HT40
+candidates run. `phy_capabilities(5000)` returns the VHT160 body only when
+a 160MHz profile was admitted at activation (`wide` bit2). *RA:*
+`rtw89_phy_ra_sta_update` `IEEE80211_STA_RX_BW_160`: `BW_CAP[7:6]` =
+`RTW89_CHANNEL_WIDTH_160` (3), SGI = VHT `SHORT_GI_160`, the VHT branch
+uses the same `get_mcs_ra_mask(map, 9, 1)` mask; an HE 160MHz link also
+needs the HE width at 160 and carries `rtw89_phy_ra_gi_ltf`'s RTL8852C
+160MHz fixed GI/LTF: W3 `FIX_GILTF_EN` + `RTW89_GILTF_SGI_4XHE08` when the
+peer has `HE_SU_MU_PPDU_4XLTF_AND_08_US_GI`, else `RTW89_GILTF_2XHE08`
+(every 40/80MHz and 20MHz HE RA keeps W3 clear, unchanged). *RX:* the v1
+(C) assembler admits descriptor bandwidth up to `RTW89_CHANNEL_WIDTH_160`
+(B stays at 80), and `Core::set_operating_width` clamps the bound to 80MHz
+on B and 160MHz on C, so a C owner admits a 160MHz PPDU only after
+`retune_radio_c` programmed a 160MHz profile. B bytes (20/40/80MHz
+bindings, `wide_fingerprint`, RA, capability bodies) are unchanged.
+Known gaps: 80+80 is never offered; a 160MHz link fails on CSA like every
+wide link; passive-only spans join at 20MHz. Unexecuted cases:
+`smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux`,
+`smoke_rtw8852c_wide_station_profiles_map_to_c_profiles` (160MHz part),
+`smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner` (C
+160MHz part), `smoke_rtw89_b_packet_rx_width_follows_programmed_channel`
+(C 160MHz part).
 
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s

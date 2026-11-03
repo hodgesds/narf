@@ -1245,6 +1245,7 @@ fn smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux() -> TestResult {
         bw: 1,
         sgi: false,
         vht: None,
+        fix_giltf: None,
     };
     let (Some(narrow), Some(body)) = (
         codec::ra_ht(0xfff, Some(ht)),
@@ -1265,6 +1266,7 @@ fn smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux() -> TestResult {
         bw: 2,
         sgi: true,
         vht: Some(vht),
+        fix_giltf: None,
     };
     let Some(body) = codec::ra_wide(0xff0, ht, None, wide) else {
         return TestResult::Fail("VHT80 RA refused");
@@ -1301,4 +1303,185 @@ fn smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux
+);
+
+/// RTL8852C 160MHz: core.c `rtw89_init_vht_cap` / `rtw89_init_he_cap` 160MHz
+/// bits over the restricted wide profile, `wide_phy` offering VHT160/HE160
+/// only for an admitted 160MHz chandef (never on an RTL8852B-only admitted
+/// list), and phy.c `rtw89_phy_ra_sta_update` BW_CAP 160 / SHORT_GI_160 with
+/// `rtw89_phy_ra_gi_ltf`'s RTL8852C 160MHz fixed GI/LTF.
+fn smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux() -> TestResult {
+    use super::super::operating_channel::{Profile, Width};
+    let w = |b: &[u8; 16], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    // VHT160 = VHT80 | SUPP_CHAN_WIDTH_160MHZ (bit2) | SHORT_GI_160 (bit6),
+    // same MCS maps.
+    let (Some(v80), Some(v160)) = (local_vht80(), local_vht160()) else {
+        return TestResult::Fail("VHT160 capability rejected by the shared API");
+    };
+    let (a, b) = (v80.capability_body(), v160.capability_body());
+    if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) != 0x130 | 1 << 2 | 1 << 6 || a[4..] != b[4..] {
+        return TestResult::Fail("VHT160 differs from rtw89_init_vht_cap 160MHz bits");
+    }
+    // HE160: cap0 40/80 + 160MHz-in-5G, cap8 | 20/80MHz-in-160 HE PPDU, then
+    // the 80MHz maps followed by the 160MHz maps (= the 80MHz ones).
+    let (Some(he5), Some(he160)) = (local_he_wide(true), local_he160()) else {
+        return TestResult::Fail("HE160 capability rejected");
+    };
+    let (h5, h160) = (he5.capability_body(), he160.capability_body());
+    if h160[7] != 0x0c
+        || h160[15] != h5[15] | 0x0c
+        || h160[..7] != h5[..7]
+        || h160[8..15] != h5[8..15]
+        || h160.len() != h5.len() + 4
+        || h160[16..h5.len()] != h5[16..]
+        || h160[h5.len()..] != [0xfa, 0xff, 0xfe, 0xff]
+    {
+        return TestResult::Fail("HE160 differs from rtw89_init_he_cap 160MHz bits");
+    }
+    // AP: primary 40, 160MHz BSS 36..64 (VHT cap 160 + SGI160, revised VHT
+    // operation width 1, CCFS0 42 = primary80, CCFS1 50 = the 160 center).
+    let mut ies = wide_ap_ies(40, 3, None);
+    ies.extend_from_slice(&[191, 12, 0x74, 0, 0, 0, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]);
+    ies.extend_from_slice(&[192, 5, 1, 42, 50, 0xfc, 0xff]);
+    let (Some(p160), Some(p80)) = (
+        Profile::new_5ghz_160(40),
+        Profile::new_5ghz(40, Width::Mhz80),
+    ) else {
+        return TestResult::Fail("5GHz 160/80MHz profiles missing");
+    };
+    // chan.c rtw89_get_primary_chan_idx / phy.c rtw89_phy_get_txsc at 160.
+    if p160.center() != 50
+        || p160.pri_ch_idx() != 6
+        || p160.txsc(Width::Mhz20) != 6
+        || p160.txsc(Width::Mhz40) != 12
+        || p160.txsc(Width::Mhz80) != 14
+        || p160.occupied() != (5170, 5330)
+        || Profile::new_5ghz(40, Width::Mhz160).is_some()
+        || Profile::new_wide(40, Width::Mhz160, false).is_some()
+    {
+        return TestResult::Fail("160MHz geometry differs from Linux or B admitted 160MHz");
+    }
+    // An RTL8852B-style admitted list (no 160MHz profile): the 80MHz join,
+    // without any 160MHz capability bit.
+    match wide_phy(&ies, 40, true, &[p80]) {
+        Some((local, p)) if p == p80 => {
+            if local.he().map(|he| he.capability_body()) != Some(h5.clone()) {
+                return TestResult::Fail("80MHz join offered HE160");
+            }
+        }
+        _ => return TestResult::Fail("admitted 80MHz half of a 160MHz BSS not offered"),
+    }
+    // The admitted C 160MHz chandef: VHT160 + HE160, exactly that profile.
+    match wide_phy(&ies, 40, true, &[p80, p160]) {
+        Some((local, p)) if p == p160 => {
+            if local.he().map(|he| he.capability_body()) != Some(h160.clone()) {
+                return TestResult::Fail("160MHz join lacks the HE160 capability");
+            }
+        }
+        _ => return TestResult::Fail("admitted 160MHz chandef not offered"),
+    }
+    // An 80MHz BSS never selects the 160MHz candidate.
+    if !matches!(
+        wide_phy(&wide_ap_ies(40, 3, Some((1, 42))), 40, false, &[p80, p160]),
+        Some((_, p)) if p == p80
+    ) {
+        return TestResult::Fail("80MHz BSS joined at 160MHz");
+    }
+    // RA: BW_CAP 3 and SHORT_GI_160 on the VHT branch.
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0xff, 0, 0],
+        sgi20: true,
+        ldpc: true,
+    };
+    let vht = VhtRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+    };
+    let wide = WideRa {
+        bw: 3,
+        sgi: true,
+        vht: Some(vht),
+        fix_giltf: None,
+    };
+    let Some(body) = codec::ra_wide(0xff0, ht, None, wide) else {
+        return TestResult::Fail("VHT160 RA refused");
+    };
+    if w(&body, 0) != (0xa << 1 | 3 << 6 | 1 << 20 | 1 << 21 | 1 << 22)
+        || w(&body, 1) != 0x3ff010
+        || w(&body, 3) != 0
+    {
+        return TestResult::Fail("VHT160 RA_MACIDCFG differs from rtw89_phy_ra_sta_update");
+    }
+    // HE160: HE branch, BW_CAP 3, W3 FIX_GILTF_EN | FIX_GILTF (SGI_4XHE08 1
+    // or 2XHE08 3).
+    let he = HeRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+        dcm: false,
+    };
+    for giltf in [1u8, 3] {
+        let (Some(narrow), Some(body)) = (
+            codec::ra_he(0xff0, ht, he),
+            codec::ra_wide(
+                0xff0,
+                ht,
+                Some(he),
+                WideRa {
+                    fix_giltf: Some(giltf),
+                    ..wide
+                },
+            ),
+        ) else {
+            return TestResult::Fail("HE160 RA refused");
+        };
+        if w(&body, 0) != (w(&narrow, 0) & !(1 << 21)) | 3 << 6 | 1 << 21
+            || body[4..12] != narrow[4..12]
+            || w(&body, 3) != 1 << 11 | u32::from(giltf) << 12
+        {
+            return TestResult::Fail("HE160 RA differs from the HE branch with bw_cap 160");
+        }
+    }
+    // Fixed GI/LTF only on an HE 160MHz link with a defined value; 160MHz
+    // needs VHT facts; widths above 160 are refused.
+    if codec::ra_wide(
+        0xff0,
+        ht,
+        None,
+        WideRa {
+            fix_giltf: Some(1),
+            ..wide
+        },
+    )
+    .is_some()
+        || codec::ra_wide(
+            0xff0,
+            ht,
+            Some(he),
+            WideRa {
+                bw: 2,
+                fix_giltf: Some(1),
+                ..wide
+            },
+        )
+        .is_some()
+        || codec::ra_wide(
+            0xff0,
+            ht,
+            Some(he),
+            WideRa {
+                fix_giltf: Some(2),
+                ..wide
+            },
+        )
+        .is_some()
+        || codec::ra_wide(0xff0, ht, Some(he), WideRa { vht: None, ..wide }).is_some()
+        || codec::ra_wide(0xff0, ht, None, WideRa { bw: 4, ..wide }).is_some()
+    {
+        return TestResult::Fail("inconsistent 160MHz RA accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux
 );

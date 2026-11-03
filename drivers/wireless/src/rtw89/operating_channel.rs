@@ -10,13 +10,17 @@ pub(super) struct Profile {
     center: u8,
     width: Width,
 }
-/// Linux `enum rtw89_bandwidth` values RTL8852B supports
-/// (rtw8852b.c `support_bandwidths` = 20/40/80MHz; no 160MHz).
+/// Linux `enum rtw89_bandwidth` station widths. RTL8852B supports
+/// 20/40/80MHz (rtw8852b.c `support_bandwidths`): every B constructor
+/// (`new_5ghz`, `new_wide`, `from_mhz`) refuses 160MHz. `Mhz160` exists only
+/// for the RTL8852C station chandef (rtw8852c.c `support_bandwidths` has
+/// `NL80211_CHAN_WIDTH_160`), built by [`Profile::new_5ghz_160`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Width {
     Mhz20 = 0,
     Mhz40 = 1,
     Mhz80 = 2,
+    Mhz160 = 3,
 }
 impl Width {
     pub(super) const fn mhz(self) -> u32 {
@@ -192,6 +196,19 @@ impl Profile {
     /// a Linux core.c `rtw89_channels_5ghz` channel, so a block leaving the
     /// set is refused (never narrowed).
     pub(super) const fn new_5ghz(primary: u8, width: Width) -> Option<Self> {
+        if matches!(width, Width::Mhz160) {
+            return None;
+        }
+        Self::block_5ghz(primary, width)
+    }
+    /// The RTL8852C 5GHz 160MHz chandef containing `primary` (IEEE blocks
+    /// 36..64, 100..128 and 149..177, every subchannel a core.c
+    /// `rtw89_channels_5ghz` channel). Never an RTL8852B profile: only the
+    /// C station path (`command_native::wide_profiles_c160`) builds it.
+    pub(super) const fn new_5ghz_160(primary: u8) -> Option<Self> {
+        Self::block_5ghz(primary, Width::Mhz160)
+    }
+    const fn block_5ghz(primary: u8, width: Width) -> Option<Self> {
         if !ghz5_contains(primary) {
             return None;
         }
@@ -262,7 +279,7 @@ impl Profile {
                     2
                 }
             }
-            Width::Mhz80 => {
+            Width::Mhz80 | Width::Mhz160 => {
                 // MHz distances are 5 * channel distances.
                 if p > c {
                     1 + 2 * ((5 * (p - c) - 10) / 20) as u8
@@ -272,7 +289,7 @@ impl Profile {
             }
         }
     }
-    /// phy.c `rtw89_phy_get_txsc(chan, dbw)` for 20/40/80MHz.
+    /// phy.c `rtw89_phy_get_txsc(chan, dbw)` for 20/40/80/160MHz.
     pub(super) const fn txsc(self, dbw: Width) -> u8 {
         let (p, c) = (self.primary, self.center);
         if self.width as u8 == dbw as u8 || matches!(self.width, Width::Mhz20) {
@@ -284,6 +301,30 @@ impl Profile {
                     1
                 } else {
                     2
+                }
+            }
+            Width::Mhz160 => {
+                let tmp = if p > c {
+                    (p - c) >> 1
+                } else {
+                    ((c - p) >> 1) + 1
+                };
+                match dbw {
+                    Width::Mhz20 => tmp,
+                    Width::Mhz40 => match tmp {
+                        1 | 3 => 9,
+                        5 | 7 => 11,
+                        2 | 4 => 10,
+                        6 | 8 => 12,
+                        _ => 0xff,
+                    },
+                    _ => {
+                        if p > c {
+                            13
+                        } else {
+                            14
+                        }
+                    }
                 }
             }
             _ => {

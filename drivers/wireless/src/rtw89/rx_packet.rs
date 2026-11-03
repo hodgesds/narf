@@ -362,10 +362,11 @@ impl Assembler {
                     || descriptor.icv_error
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
-                    // Up to RTW89_CHANNEL_WIDTH_80 (B `support_bandwidths`;
-                    // C's station widths); the packet owner bounds it by the
-                    // programmed width.
-                    || descriptor.bandwidth > 2
+                    // Up to RTW89_CHANNEL_WIDTH_80 (B `support_bandwidths`)
+                    // or, on the v1 (RTL8852C) descriptor, _160 (C
+                    // `support_bandwidths`); the packet owner bounds it by
+                    // the programmed width.
+                    || descriptor.bandwidth > if self.bw_v1 { 3 } else { 2 }
                     // Legacy CCK1..OFDM54, HT MCS0..15 (RTW89_HW_RATE_MCS0),
                     // VHT NSS1/NSS2 MCS0..9 (RTW89_HW_RATE_VHT_NSS1_MCS0)
                     // or HE NSS1/NSS2 MCS0..11 with a defined GI/LTF

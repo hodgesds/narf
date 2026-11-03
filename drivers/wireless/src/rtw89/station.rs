@@ -2743,17 +2743,25 @@ impl State {
                         self.er = he.is_some_and(|(_, er)| er);
                         let he = he.map(|(he, _)| he);
                         match self.wide {
-                            // rtw89_phy_ra_sta_update on the tuned 40/80MHz
-                            // chandef: bw_cap, bandwidth SGI, VHT branch.
+                            // rtw89_phy_ra_sta_update on the tuned wide
+                            // chandef: bw_cap, bandwidth SGI, VHT branch
+                            // (160MHz: RTL8852C only, `admitted_wide`).
                             Some(profile) => {
                                 let phy = plan.negotiated_phy().ok_or(Error::Profile)?;
                                 let bw = match phy.width() {
                                     association::phy::Width::Forty => 1,
                                     association::phy::Width::Eighty => 2,
+                                    association::phy::Width::OneSixty if !phy.discontiguous() => 3,
                                     _ => return Err(Error::Profile),
                                 };
+                                // IEEE80211_STA_RX_BW_160 needs the HE
+                                // width (when HE) at 160MHz too.
                                 if bw != profile.width() as u8
                                     || phy.center_channel() != profile.center()
+                                    || bw == 3
+                                        && phy.he().is_some_and(|he| {
+                                            he.width() != association::phy::Width::OneSixty
+                                        })
                                 {
                                     return Err(Error::Profile);
                                 }
@@ -2761,14 +2769,25 @@ impl State {
                                     peer_rx_mcs: vht.tx_mcs_map(),
                                     ldpc: vht.tx_ldpc(),
                                 });
+                                // phy.c rtw89_phy_ra_gi_ltf: RTL8852C at
+                                // RTW89_CHANNEL_WIDTH_160 fixes SGI_4XHE08
+                                // for a SU/MU 4xLTF+0.8us peer, else 2XHE08.
+                                let fix_giltf = (bw == 3).then(|| phy.he()).flatten().map(|he| {
+                                    if he.peer_capability().phy_capability()[7] & 0x04 != 0 {
+                                        1
+                                    } else {
+                                        3
+                                    }
+                                });
                                 let wide = super::station_control::WideRa {
                                     bw,
-                                    sgi: if bw == 2 {
-                                        phy.vht().is_some_and(|vht| vht.tx_sgi80())
-                                    } else {
-                                        phy.ht().tx_sgi40()
+                                    sgi: match bw {
+                                        3 => phy.vht().is_some_and(|vht| vht.tx_sgi160()),
+                                        2 => phy.vht().is_some_and(|vht| vht.tx_sgi80()),
+                                        _ => phy.ht().tx_sgi40(),
                                     },
                                     vht,
+                                    fix_giltf,
                                 };
                                 io.station_configure_ra_wide(
                                     rates,

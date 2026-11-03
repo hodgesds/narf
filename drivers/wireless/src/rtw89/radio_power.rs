@@ -331,7 +331,8 @@ impl Plan {
             put(6 + 2 * i, source.limit(Width::Mhz20, 2, sub)?);
         }
         match self.channel.width() {
-            Width::Mhz20 => return Err(Error::Policy),
+            // 160MHz: rtw8852b.c `support_bandwidths` has none.
+            Width::Mhz20 | Width::Mhz160 => return Err(Error::Policy),
             Width::Mhz40 => {
                 put(0, source.limit(Width::Mhz20, 0, ch - 2)?);
                 put(2, source.limit(Width::Mhz40, 0, ch)?);

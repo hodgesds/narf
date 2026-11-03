@@ -354,13 +354,28 @@ kernel_test_in!(
     smoke_rtw8852c_base_record_programs_follow_b_program_layout
 );
 
-/// The shared station 40/80MHz chandefs map onto the C typed profiles with
-/// the same primary/center/width (`command_native::c_profile`); every one is
-/// a profile a C record may admit.
+/// The shared station 40/80MHz chandefs and the C-only 5GHz 160MHz ones map
+/// onto the C typed profiles with the same primary/center/width and the
+/// same chan.c `rtw89_get_primary_chan_idx` / phy.c `rtw89_phy_get_txsc`
+/// (`command_native::c_profile`); every one is a profile a C record may
+/// admit. The B list (`wide_profiles`) never holds a 160MHz chandef.
 fn smoke_rtw8852c_wide_station_profiles_map_to_c_profiles() -> TestResult {
-    use crate::rtw89::command_native::{c_profile, wide_profiles};
+    use crate::rtw89::command_native::{c_profile, wide_profiles, wide_profiles_c160};
+    use crate::rtw89::operating_channel::Width as Bw;
+    if wide_profiles().any(|p| p.width() == Bw::Mhz160) {
+        return TestResult::Fail("RTL8852B wide list holds a 160MHz chandef");
+    }
+    // 36..64 (center 50), 100..128 (114), 149..177 (163): 8 primaries each.
+    let c160: alloc::vec::Vec<_> = wide_profiles_c160().collect();
+    if c160.len() != 24
+        || c160
+            .iter()
+            .any(|p| p.width() != Bw::Mhz160 || !matches!(p.center(), 50 | 114 | 163))
+    {
+        return TestResult::Fail("C 160MHz chandef set differs from the IEEE 5GHz blocks");
+    }
     let mut count = 0;
-    for profile in wide_profiles() {
+    for profile in wide_profiles().chain(wide_profiles_c160()) {
         let Some(c) = c_profile(profile) else {
             return TestResult::Fail("shared wide profile without a C typed profile");
         };
@@ -368,6 +383,11 @@ fn smoke_rtw8852c_wide_station_profiles_map_to_c_profiles() -> TestResult {
             || c.center() != profile.center()
             || c.width() as u8 != profile.width() as u8
             || (c.band() == Band::Ghz5) != profile.is_5ghz()
+            || c.occupied() != profile.occupied()
+            || c.pri_ch_idx() != profile.pri_ch_idx()
+            || c.txsc(Width::Mhz20) != profile.txsc(Bw::Mhz20)
+            || c.txsc(Width::Mhz40) != profile.txsc(Bw::Mhz40)
+            || c.txsc(Width::Mhz80) != profile.txsc(Bw::Mhz80)
             || !admissible(c)
         {
             return TestResult::Fail("C typed profile differs from the shared chandef");

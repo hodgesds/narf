@@ -408,15 +408,17 @@ fn smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner() -> TestRes
             return TestResult::Fail("RTL8852B PPDU outside 20/40/80MHz VHT0..9 surfaced");
         }
     }
-    // RTL8852C: the same 20/40/80MHz and VHT rule over the v1 descriptor
-    // bandwidth (`AX_RXD_BW_v1_MASK` [31:29]); 160MHz stays dropped here.
+    // RTL8852C: the same VHT rule over the v1 descriptor bandwidth
+    // (`AX_RXD_BW_v1_MASK` [31:29]) up to RTW89_CHANNEL_WIDTH_160 (C
+    // `support_bandwidths`; the packet owner bounds it by the programmed
+    // width); 80+80/320 (4, 5) stay dropped.
     let c = || Assembler::for_chip(crate::rtw89::mac::ChipId::Rtl8852C);
     let with_v1 = |rate: u32, bw: u32| {
         let mut bytes = packet(0, &payload, false, 0);
         bytes[8..12].copy_from_slice(&(rate << 16 | bw << 29).to_le_bytes());
         bytes
     };
-    for (rate, bw) in [(0x105, 2), (0x119, 1), (0x87, 0)] {
+    for (rate, bw) in [(0x105, 2), (0x119, 1), (0x87, 0), (0x105, 3), (0x18b, 3)] {
         if !matches!(
             c().segment(&with_v1(rate, bw), false),
             Ok(Some(Event::Wifi(meta, _))) if meta.bandwidth == bw as u8 && meta.rate == rate as u16
@@ -424,8 +426,10 @@ fn smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner() -> TestRes
             return TestResult::Fail("RTL8852C wide/VHT PPDU not surfaced with its v1 bandwidth");
         }
     }
-    if c().segment(&with_v1(0x105, 3), false) != Ok(Some(Event::Dropped)) {
-        return TestResult::Fail("RTL8852C assembler admitted 160MHz");
+    for bw in [4, 5] {
+        if c().segment(&with_v1(0x105, bw), false) != Ok(Some(Event::Dropped)) {
+            return TestResult::Fail("RTL8852C assembler admitted a width above 160MHz");
+        }
     }
     TestResult::Pass
 }
