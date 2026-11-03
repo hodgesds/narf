@@ -71,6 +71,44 @@ impl Protocol51 {
             .then_some(Self)
     }
 }
+impl Protocol51 {
+    /// `rtw89_fw_h2c_cxdrv_init` (`fcxinit` 0) from `rtw8851b_btc_set_rfe`:
+    /// rfe_type 3n+1 is one shared antenna (`ant.type` SHARED, `ant.num` 1,
+    /// `bt0_pos` BTG, `wa_type` 1), 3n+3 two dedicated antennas (`ant.type`
+    /// DEDICATED, `ant.num` 2, `bt0_pos` ALONE, `bt0_sw_type` EXTERNAL);
+    /// both: isolation 10, `ant_info` = `stream_cnt` 1 with single/BTG
+    /// position S0 and no diversity, `mod_adie_kt` = `hal.acv`, chip
+    /// `afh_guard_ch` 6, WL-only + init ok. rfe_type 0 (Linux returns
+    /// before any antenna field) and 3n+2 (diversity) have no encoding.
+    pub fn init(self, rfe: u8, cut: u8, acv: u8) -> Option<[u8; 14]> {
+        let shared = match rfe % 3 {
+            _ if rfe == 0 => return None,
+            1 => true,
+            0 => false,
+            _ => return None,
+        };
+        Some([
+            0,
+            12,
+            u8::from(!shared),
+            if shared { 1 } else { 2 },
+            10,
+            1 << 4,
+            rfe,
+            cut,
+            if shared { (1 << 1) | (1 << 3) } else { 1 << 2 },
+            acv & 0xf,
+            6,
+            3,
+            0,
+            0,
+        ])
+    }
+    /// `_fw_set_policy(BTC_CXP_OFF_BT)` on the B-identical row.
+    pub fn off_policy(self) -> [u8; 26] {
+        Protocol.off_policy()
+    }
+}
 /// RTL8852C coex.c `rtw89_btc_ver_defs` rows: every C row has `fcxinit` 0
 /// and `fcxctrl` 1 (B's init/ctrl encodings); 0.27.0..0.27.97 use
 /// `fcxtdma` 3 / `fcxslots` 1 (B's policy encoding) and 0.27.97 onward
@@ -305,6 +343,84 @@ impl Coex {
             return Err(power::Error::Access.into());
         }
         enforce_c(a.0).await?;
+        a.cmd(3, &protocol.off_policy(), true).await?;
+        self.state = State::WlanOnly;
+        Ok(())
+    }
+}
+impl Coex {
+    /// RTL8851B coex.c `rtw89_btc_ntfy_init` for the same WLAN-only owner:
+    /// `rtw8851b_btc_set_rfe` ([`Protocol51::init`]), `rtw8851b_btc_init_cfg`
+    /// (mac.c `rtw89_mac_coex_init` RTK/inner PTA without the
+    /// RTL8851B-skipped `B_AX_PTA_WL_TX_EN` and `B_AX_RSP_CHK_BTCCA` steps,
+    /// `rtw8851b_btc_set_wl_pri` TX_RESP/BEACON, then for the one stream
+    /// path S0 only: RR_WLSEL 0, RR_LUTWE BIT(17), `rtw8851b_set_trx_mask`
+    /// SS 0x5ff / RX 0x5df / TX (0x55f on the shared BTG path, else 0x5ff)
+    /// with the Tx=1/Rx=2 group remap and +3 on a shared antenna, RR_LUTWE
+    /// 0, PTA break table, BT counter enable/reset), `_write_scbd`
+    /// (ACTIVE|ON|BTLOG), `_set_init_info` (INIT, CTRL), the default WL TX
+    /// power control (`rtw8851b_btc_set_wl_txpwr_ctrl`, B's registers and
+    /// masks), then `_action_wl_only` (`_set_ant(WONLY)` on the generic AX
+    /// `rtw89_mac_cfg_gnt`/ctrl path/PLUT exactly as B, OFF_BT policy).
+    /// `acv` is `hal.acv` (core.c `rtw89_read_chip_ver`: XTAL_SI_CV[3:0]).
+    ///
+    /// # Safety
+    /// Same retained exact RTL8851B radio owner, current signed RTL8851B
+    /// records, no independent BT/PTA producer, PHY0/SCC and CMAC TX closed.
+    pub async unsafe fn prepare_51(
+        &mut self,
+        io: &mut impl Interface,
+        rfe: u8,
+        cut: u8,
+        acv: u8,
+        protocol: Protocol51,
+    ) -> Result<(), Error> {
+        if self.state != State::New {
+            return Err(Error::Terminal);
+        }
+        let init = protocol.init(rfe, cut, acv).ok_or(Error::Profile)?;
+        let shared = rfe % 3 == 1;
+        self.state = State::Preparing;
+        let mut a = Access(io);
+        // rtw89_mac_coex_init: no PTA_WL_TX_EN / RSP_CHK_BTCCA on RTL8851B.
+        a.m8(0x40, 0, 0x20)?;
+        a.m8(0xda35, 0, 1)?;
+        a.m8(0xda40, 0, 12)?;
+        a.m8(0xda42, 0, 1)?;
+        a.m16(0xc340, 0x200, 0x20)?;
+        let value = a.lte_read(0x3c).await? & 0x100;
+        a.lte_write(0x3c, value).await?;
+        a.m8(0x40, 0xc0, 0)?;
+        a.m8(0xda4c, 0, 1)?;
+        a.m8(0xda6c, 0x3f, 5)?;
+        a.m8(0x41, 4, 2)?;
+        // rtw8851b_btc_set_wl_pri(TX_RESP), (BEACON).
+        a.m32(0xda30, 0, 8)?;
+        a.m32(0xda10, 0, 0x100)?;
+        // One stream at S0 (path_min == path_max == RF_PATH_A).
+        let base = if shared { 3 } else { 0 };
+        a.rf(0, 2, 0).await?;
+        a.rf(0, 0xef, 1 << 17).await?;
+        for (group, value) in [
+            (0, 0x5ff),
+            (2, 0x5df),
+            (1, if shared { 0x55f } else { 0x5ff }),
+        ] {
+            a.rf(0, 0x33, base + group).await?;
+            a.rf(0, 0x3f, value).await?;
+        }
+        a.rf(0, 0xef, 0).await?;
+        a.w32(0xda2c, 0xf0ffffff)?;
+        a.m32(0xda40, 0, 0x10004)?;
+        scoreboard(a.0, 0x4003).await?;
+        a.cmd(5, &init, false).await?;
+        a.cmd(5, &[6, 4, 0, 0, 0, 0], false).await?;
+        a.m32(0xd200, 0x3ff, 0)?;
+        a.m32(0xd220, 0xffa, 0)?;
+        if a.r32(0xd200)? & 0x3ff != 0 || a.r32(0xd220)? & 0xffa != 0 {
+            return Err(power::Error::Access.into());
+        }
+        enforce(a.0).await?;
         a.cmd(3, &protocol.off_policy(), true).await?;
         self.state = State::WlanOnly;
         Ok(())

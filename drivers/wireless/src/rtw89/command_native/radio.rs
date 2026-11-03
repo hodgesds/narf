@@ -998,26 +998,40 @@ pub(super) struct Port<'a> {
     io: &'a mut NativeIo,
     basic: Option<&'a crate::rtw89::calibration_policy::Calibration>,
     full: Option<Arc<radio_policy::Qualification>>,
-    c: Option<Arc<radio_policy_c::Qualification>>,
+    chip: Option<ChipProgram>,
+}
+/// The chip-specific signed full program (RTL8852C `N5CB` v2 + `N5CC`,
+/// RTL8851B `N51B` v2 + `N51C`) that encloses the calibration scope.
+#[derive(Clone)]
+pub(super) enum ChipProgram {
+    C(Arc<radio_policy_c::Qualification>),
+    N51(Arc<crate::rtw89::radio_policy_51::Qualification>),
 }
 impl<'a> Port<'a> {
     pub(super) fn new(
         io: &'a mut NativeIo,
         basic: Option<&'a crate::rtw89::calibration_policy::Calibration>,
         full: Option<Arc<radio_policy::Qualification>>,
-        c: Option<Arc<radio_policy_c::Qualification>>,
+        chip: Option<ChipProgram>,
     ) -> Self {
-        Self { io, basic, full, c }
+        Self {
+            io,
+            basic,
+            full,
+            chip,
+        }
     }
     fn current<T>(
         &mut self,
         operation: impl FnOnce(&mut NativeIo) -> Result<T, power::Error>,
     ) -> Result<T, power::Error> {
-        // RTL8852C: the signed C full program encloses the calibration scope.
-        if let Some(c) = self.c.clone() {
-            return c.with_current(|| self.current_b(operation));
+        // RTL8852C / RTL8851B: the signed chip full program encloses the
+        // calibration scope.
+        match self.chip.clone() {
+            Some(ChipProgram::C(c)) => c.with_current(|| self.current_b(operation)),
+            Some(ChipProgram::N51(n51)) => n51.with_current(|| self.current_b(operation)),
+            None => self.current_b(operation),
         }
-        self.current_b(operation)
     }
     fn current_b<T>(
         &mut self,
@@ -1067,14 +1081,22 @@ impl Native {
             .clone()
             .or_else(|| self.ordinary.as_ref().and_then(|g| g.b().cloned()))
     }
+    /// The installed chip full program, if any (C or RTL8851B).
+    pub(super) fn chip_program(&self) -> Option<ChipProgram> {
+        self.qualification_c
+            .clone()
+            .map(ChipProgram::C)
+            .or_else(|| self.qualification_51.clone().map(ChipProgram::N51))
+    }
     pub(super) fn radio_io(&mut self) -> Result<Port<'_>, power::Error> {
         self.register_access()?;
         let full = self.full_radio_scope();
+        let chip = self.chip_program();
         Ok(Port::new(
             &mut self.io,
             self.calibration.as_ref(),
             full,
-            self.qualification_c.clone(),
+            chip,
         ))
     }
 }

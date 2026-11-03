@@ -321,3 +321,61 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_wlan_only_coex_init_follows_btc_init_cfg_and_gnt_v1
 );
+/// RTL8851B `rtw8851b_btc_set_rfe`/`rtw8851b_btc_init_cfg` on one RF path:
+/// the cxinit encoding per antenna layout, path-A-only trx masks with the
+/// group remap, no B-only PTA_WL_TX_EN/RSP_CHK_BTCCA write, and B's generic
+/// AX `_set_ant(WONLY)` grant.
+fn smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg() -> TestResult {
+    let p = Protocol51;
+    if p.init(1, 2, 0x13) != Some([0, 12, 0, 1, 10, 0x10, 1, 2, 0x0a, 3, 6, 3, 0, 0])
+        || p.init(3, 2, 1) != Some([0, 12, 1, 2, 10, 0x10, 3, 2, 0x04, 1, 6, 3, 0, 0])
+        || p.init(0, 2, 1).is_some()
+        || p.init(2, 2, 1).is_some()
+        || p.init(5, 2, 1).is_some()
+        || p.off_policy() != Protocol.off_policy()
+    {
+        return TestResult::Fail(
+            "RTL8851B cxinit/policy encoding differs from rtw8851b_btc_set_rfe",
+        );
+    }
+    for rfe in [1u8, 3] {
+        let mut io = Model::new(0);
+        let mut owner = Coex::default();
+        // SAFETY: inert owned bytes and explicit model qualification.
+        if ready(unsafe { owner.prepare_51(&mut io, rfe, 2, 1, p) }) != Some(Ok(()))
+            || owner.state() != State::WlanOnly
+        {
+            return TestResult::Fail("RTL8851B coex owner did not reach WlanOnly");
+        }
+        let r32 = |a: usize| u32::from_le_bytes(io.bytes[a..a + 4].try_into().unwrap());
+        if io.bytes[0xda20] & 2 != 0
+            || io.bytes[0xcc07] & 2 != 0
+            || r32(0xda30) & 8 == 0
+            || r32(0xda10) & 0x100 == 0
+            || r32(0xda2c) != 0xf0ff_ffff
+            || r32(0xda40) & 0x10004 != 0x10004
+            || io.lte[0x38 / 4] != 0x7700_7700
+            || io.bytes[0x73] & 4 == 0
+            || r32(0xac) & 0x80ff_ffff != 0x8000_4003
+        {
+            return TestResult::Fail("RTL8851B PTA/grant state differs from Linux");
+        }
+    }
+    // The diversity and rfe 0 layouts never touch the device.
+    for rfe in [0u8, 2] {
+        let mut io = Model::new(0);
+        let mut owner = Coex::default();
+        // SAFETY: same inert model.
+        if ready(unsafe { owner.prepare_51(&mut io, rfe, 2, 1, p) }) != Some(Err(Error::Profile))
+            || io.operations != 0
+            || owner.state() != State::New
+        {
+            return TestResult::Fail("RTL8851B coex admitted an unencoded antenna layout");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg
+);

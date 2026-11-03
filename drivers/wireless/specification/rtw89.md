@@ -4197,15 +4197,54 @@ RTL8851B at `RadioTablesLoaded` (no B basic/full calibration ever runs on
 it) until the RTL8851B radio step composes `radio_51`. Unexecuted case:
 `smoke_rtw8851b_post_wcpu_mac_is_b_with_rtw8851b_branches`.
 
-**Remaining for the row.** the native radio composition
-(`Native::preflight_radio_51`/`prepare_radio_51` over the signed records, a
-`qualification_51` gate on every Port/calibration access, `Startup::
-prepare_radio_51` and its bootstrap arm; terminal RF shutdown `finish` for
-one path), coex (`rtw8851b_btc_*`,
-single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
-the one-path antenna-diversity tracker (`hal->ant_diversity` from
-`rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)
-remain; the row is not complete.
+**RTL8851B native radio composition and WLAN-only coex
+(`command_native/radio_51.rs`).** `Native::preflight_radio_51` stages,
+with no register access, the `N51B` v1 calibration record
+(`calibration_policy::Board::new_51`), the `N51B` v2 base and every
+provisioned `N51C` record over `radio_policy_51::noninitial` (a profile
+whose `Plan::from_elements_51` cannot be built from the actual container is
+not looked up). `Native::prepare_radio_51` rebinds both identities to the
+exact Native/assets/plan/PHY-cap receipt, requires the staged record to
+admit exactly `profile` under the current host rule, `select`s it, installs
+the calibration record and `qualification_51`, and only then touches the
+device. `qualification_51` gates every access: `calibration_access` checks
+it beside the calibration record, and `radio::Port` now carries a
+`ChipProgram` (C or RTL8851B) whose `with_current` encloses every MMIO
+transaction (read_rf/write_rf/radio_io). Order is core.c
+`rtw89_core_start`: `rtw89_btc_ntfy_init` before `rtw89_phy_dm_init`.
+`coex_native::Coex::prepare_51` is rtw8851b.c `rtw8851b_btc_set_rfe` +
+`rtw8851b_btc_init_cfg`: mac.c `rtw89_mac_coex_init` without the two
+RTL8851B-skipped steps (`B_AX_PTA_WL_TX_EN`, `B_AX_RSP_CHK_BTCCA`),
+`rtw8851b_btc_set_wl_pri` TX_RESP/BEACON, path S0 only (`stream_cnt` 1):
+RR_WLSEL 0, RR_LUTWE BIT(17), `rtw8851b_set_trx_mask` SS 0x5ff / RX 0x5df
+/ TX 0x55f (shared BTG path) or 0x5ff with the Tx=1/Rx=2 remap and +3 on a
+shared antenna, RR_LUTWE 0, break table, BT counter; then `_write_scbd`
+0x4003, cxinit v0 (`Protocol51::init`: rfe 3n+1 shared/num 1/BTG/wa 1, 3n+3
+dedicated/num 2/alone/external, `ant_info` stream 1 at S0,
+`mod_adie_kt` = `hal.acv` read from XTAL_SI_CV[3:0] as core.c
+`rtw89_read_chip_ver`), cxctrl v1, txpwr ctrl off and B's generic AX
+`_set_ant(WONLY)` + OFF_BT policy. rfe_type 0 (Linux returns before any
+antenna field, leaving `stream_cnt` 0 and a two-path loop) and 3n+2
+(diversity) have no encoding and no calibration identity; the bound
+`N51_COEX_RECIPE` text states exactly this. The radio then runs
+`radio_51::Radio::prepare_controls` (bb_sethw, DM sub-inits, NCTL from
+container table 4) and `prepare` at the default chandef, with
+`factory_51::Calibration` rechecked against the factory, and records the
+channel/epoch. `Startup::prepare_radio_51` + the bootstrap
+`RadioTablesLoaded` arm replace the refusal and reach `RadioReady` with
+**no ordinary grant** (station/TX stay closed). `finish_radio_shutdown`
+admits RTL8851B on B's `finish` (`rtw8851b_mac_disable_bb_rf` is
+byte-identical to `__rtw8852bx_mac_disable_bb_rf`, clearing RF00S_EN at
+S0 and RF10S_EN at S1 even on the one-path chip). Unexecuted case:
+`smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg`.
+
+**Remaining for the row.** the RTL8851B ordinary grant
+(`OrdinaryGrant` arm), retune, tx_transport/packet_core chip checks,
+station admission, HT/HE + 40/80 on the shared wide path, RF tracking
+wiring of `radio_51::Radio::track`, and the one-path antenna-diversity
+tracker (`hal->ant_diversity` from `rtw89_mac_setup_phycap`
+`rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`) remain; the row is not
+complete.
 
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 

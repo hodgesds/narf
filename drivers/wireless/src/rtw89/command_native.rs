@@ -19,6 +19,8 @@ const DEVICE_DMA_MASK: u64 = (1u64 << 36) - 1;
 mod phycap;
 #[path = "command_native/radio.rs"]
 mod radio;
+#[path = "command_native/radio_51.rs"]
+mod radio_51;
 pub(in crate::rtw89) use radio::{c_profile, SixGhzChannel};
 #[cfg(any(test, feature = "kernel-test"))]
 pub(in crate::rtw89) use radio::{wide_profiles, wide_profiles_c160};
@@ -176,6 +178,9 @@ pub struct Native {
     /// RTL8852C signed full program (N5CB v2 + N5CC records) gating every
     /// C radio access together with the C calibration record.
     qualification_c: Option<alloc::sync::Arc<super::radio_policy_c::Qualification>>,
+    /// RTL8851B signed full program (N51B v2 + N51C records) gating every
+    /// RTL8851B radio access together with the N51B calibration record.
+    qualification_51: Option<alloc::sync::Arc<super::radio_policy_51::Qualification>>,
     operating: Option<super::phy_operating::Operating>,
     irq: Option<super::irq::Binding>,
     /// RTL8852B HCI DMA-stop proof earned by the terminal closure.
@@ -363,6 +368,7 @@ impl Native {
             ordinary: None,
             full_qualification: None,
             qualification_c: None,
+            qualification_51: None,
             operating: Some(super::phy_operating::Operating::default()),
             irq: None,
         })
@@ -558,6 +564,9 @@ impl Native {
     fn calibration_access(&mut self) -> Result<(), super::power::Error> {
         if let Some(c) = self.qualification_c.as_ref() {
             c.current().map_err(|_| super::power::Error::Access)?;
+        }
+        if let Some(n51) = self.qualification_51.as_ref() {
+            n51.current().map_err(|_| super::power::Error::Access)?;
         }
         if let Some(full) = self.full_radio_scope() {
             full.current().map_err(|_| super::power::Error::Access)?;
@@ -837,12 +846,8 @@ impl Native {
     ) -> Result<u32, super::power::Error> {
         self.radio_access()?;
         let full = self.full_radio_scope();
-        let mut io = radio::Port::new(
-            &mut self.io,
-            self.calibration.as_ref(),
-            full,
-            self.qualification_c.clone(),
-        );
+        let chip = self.chip_program();
+        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full, chip);
         // SAFETY: actual cold/MAC/RX owner, complete B aperture and current
         // signed register scope; retained outer attempt handles cancellation.
         let result = unsafe { self.radio.read(&mut io, path, address, mask).await };
@@ -867,12 +872,8 @@ impl Native {
         // SAFETY: same actual full-aperture/current B radio owner; no parallel
         // producer and outer attempt retains DMA on failure/cancellation.
         let full = self.full_radio_scope();
-        let mut io = radio::Port::new(
-            &mut self.io,
-            self.calibration.as_ref(),
-            full,
-            self.qualification_c.clone(),
-        );
+        let chip = self.chip_program();
+        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full, chip);
         // SAFETY: same retained analog owner with current signed MMIO scope.
         let result = unsafe { self.radio.write(&mut io, path, address, mask, value).await };
         if result.is_err() {
@@ -968,11 +969,18 @@ impl Native {
     pub(super) async fn finish_radio_shutdown(&mut self) -> Result<(), super::power::Error> {
         if self.sleep_reset.is_some()
             || self.state != State::Terminal
-            || !matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
+            || !matches!(
+                self.chip,
+                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
         {
             return Err(super::power::Error::Terminal);
         }
         self.fail();
+        // RTL8851B: rtw8851b.c `rtw8851b_mac_disable_bb_rf` is byte-identical
+        // to `__rtw8852bx_mac_disable_bb_rf` (RF00S_EN at XTAL_SI_WL_RFC_S0
+        // and RF10S_EN at S1 are both cleared even on the one-path chip), so
+        // it takes B's `finish`.
         // SAFETY: same retained exclusively owned exact B/C function, closed
         // producers and uncertain DMA kept alive; NativeIo invokes current
         // device authority for every actual shutdown register transaction.
