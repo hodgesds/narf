@@ -2178,6 +2178,13 @@ impl Owner {
             return;
         }
         if state.media.is_none() {
+            if state.media_guc.is_some() {
+                // An earlier media GuC is still stopping or retained (for
+                // example after a refused park): drive it, and never reset or
+                // re-initialize GT1 underneath it.
+                self.service_media_guc(state, now);
+                return;
+            }
             let Some(facts) = *self.user_facts.lock() else {
                 return;
             };
