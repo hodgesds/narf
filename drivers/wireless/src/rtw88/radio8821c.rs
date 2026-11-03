@@ -999,6 +999,16 @@ where
         self.envelope
             .invoke(&self.policy, || self.io.finish_calibration8821c())
     }
+    // The B22 awake-station program (`radio8822b::prepare_station`) runs
+    // through this adapter enclosed by its `N2BS` grant.
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        self.envelope
+            .invoke(&self.policy, || self.io.begin_station8821c())
+    }
+    fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        self.envelope
+            .invoke(&self.policy, || self.io.finish_station8821c(gate))
+    }
     async fn delay_us(&mut self, us: u64) {
         self.io.delay_us(us).await;
     }

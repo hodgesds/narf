@@ -640,7 +640,8 @@ unsafe impl Registers for Native {
         Ok(())
     }
     fn begin_station8821c(&mut self) -> Result<(), Error> {
-        if self.device.id.device != 0xc821
+        // C21 `radio8821c::prepare_station` and B22 `radio8822b::prepare_station`.
+        if !matches!(self.device.id.device, 0xc821 | 0xb822)
             || self.state != State::Operating8821cPrepared
             || self.command_ring.pending()
         {
@@ -652,9 +653,9 @@ unsafe impl Registers for Native {
         Ok(())
     }
     fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.device.id.device != 0xc821
+        if !matches!(self.device.id.device, 0xc821 | 0xb822)
             || self.state != State::Configuring
-            || gate.did() != 0xc821
+            || gate.did() != self.device.id.device
         {
             return Err(Error::State);
         }

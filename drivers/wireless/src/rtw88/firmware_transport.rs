@@ -872,7 +872,9 @@ pub(super) struct Owner<I: Io> {
     operating8821c: Option<super::operating8821c::Info>,
     operating_envelope8821c: Option<alloc::sync::Arc<super::operating8821c::Envelope>>,
     station_grant8821c: Option<alloc::sync::Arc<super::station_power8821c::Grant>>,
+    /// C21 or B22 (`radio8822b::prepare_station`) awake-station receipt.
     station_radio8821c: Option<super::radio8821c::StationInfo>,
+    station_grant8822b: Option<alloc::sync::Arc<super::operating8822b::Grant>>,
     image_digest: Option<[u8; 32]>,
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
@@ -916,6 +918,7 @@ impl<I: Io> Owner<I> {
             operating_envelope8821c: None,
             station_grant8821c: None,
             station_radio8821c: None,
+            station_grant8822b: None,
             image_digest: None,
             power: None,
             radio: None,
@@ -1966,6 +1969,44 @@ impl<I: Io> Owner<I> {
         )?;
         grant.invoke(&|| Ok(domain.clone()), || Ok(()))?;
         Ok(grant)
+    }
+    /// RTL8822BE awake-station radio program (`radio8822b::prepare_station`)
+    /// inside `N2BQ` + `N2BP` + `N2BS` and current policy, bounded to four
+    /// seconds like C21's. Success earns `Radio8821cPrepared` with the B22
+    /// packet gate retained by the PCI transport.
+    pub(super) async fn prepare_station8822b<F>(
+        &mut self,
+        factory: &super::efuse8822b::Factory8822b,
+        grant: alloc::sync::Arc<super::operating8822b::Grant>,
+        policy: F,
+    ) -> Result<super::radio8821c::StationInfo, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.did != 0xb822
+            || self.phase != Phase::Operating8821cPrepared
+            || !grant.matches(&self.station_request8822b(factory)?)
+        {
+            return Err(Error::State);
+        }
+        grant.invoke(&policy, || Ok(()))?;
+        self.phase = Phase::Failed;
+        self.station_grant8822b = Some(grant.clone());
+        let result = narf_time::timeout(
+            narf_time::Deadline::after_ms(4000),
+            super::radio8822b::prepare_station(
+                &mut self.io,
+                factory,
+                self.phy8822b.ok_or(Error::State)?,
+                grant,
+                policy,
+            ),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.station_radio8821c = Some(result);
+        self.phase = Phase::Radio8821cPrepared;
+        Ok(result)
     }
     pub(super) async fn prepare_phy8821c(
         &mut self,

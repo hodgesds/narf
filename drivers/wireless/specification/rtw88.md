@@ -470,10 +470,34 @@ station response masks, and `rtw88/rtw8822be-station-v1-<mac>.bin`. `N2BS` v1
 is the 128-byte `N21S` layout with B22 magic/header (antenna 56, ceiling 58,
 ordinary/automatic-response/complete-program peaks 60/62/64, thermal 66/67 that
 must be exactly 0/63, `US` 68, zero 70..128); `Grant::invoke` nests the `N2BQ`,
-`N2BP` and `N2BS` source invocations and current policy. The decoder and
-preflight exist; the B22 awake station radio program, the station shell and
-packet path are not ported yet, so the chain ends at
-`Stage::Operating8821cPrepared`. No board's `N2BP`/`N2BS` asset is provisioned.
+`N2BP` and `N2BS` source invocations and current policy (it implements
+`calibration8821c::Enclosure`, so `radio8821c::Checked` encloses every native
+operation in it).
+
+`radio8822b::prepare_station` is the B22 awake-station radio program (the
+counterpart of `radio8821c::prepare_station`; `Lifecycle::prepare_station8822b`,
+`Operating8821cPrepared → PreparingRadio8821c → Radio8821cPrepared`, 4 s
+deadline, the stage names shared with C21 and the owner keyed by `0xb822`). The
+PCI transport's `begin_station8821c`/`finish_station8821c` arms now admit
+`0xb822` with a gate whose `did()` equals the function. The program keeps the
+`N2BQ` channel program (`rtw8822b_set_channel` is not replayed), verifies RF18
+on both paths and 0x8ac at ch1/20, closed CR/TXPAUSE, the cut, RF08 clear,
+0x1bf0 clean, the factory MAC against the grant and both paths' measured
+`N2BP` TXAGC words; takes a fresh RF42 conversion (2 s) inside both `N2BP`
+thermal windows; writes the conservative CCK response mask `0x440 = 0x1f`;
+invalidates the 32 CAM entries with host-only crypto and native RCR
+(`radio::software_crypto`, shared with C21/C22); wakes the firmware through
+RPWM/CPWM (`radio::awake`); re-verifies geometry, TXAGC, RRSR, PCIe 0x303 stop
+bits and zero HIMR 0xb0/0xb8/0x10b8; and hands the transport
+`power_policy::Gate::b22`. No beacon/BCN_CTRL write is part of it (Linux arms
+beacon functions only for AP/IBSS ports). The `N2BS` request identity hashes
+this literal recipe. `Gate::b22` (`Scope::B22`) is keyed by `10ec:b822`
+(`phy8821c::Host::PCI_B22`, family `rtw8822be`), binds the grant's MAC and
+re-invokes `N2BS` + current policy on every `current`/`invoke`; it has no
+N2xO/N2xL/HT/BA/protection base, so every extension accessor returns None.
+No B22 station shell, packet path or published Device consumes the awake
+radio yet, so `Owner8822b::provision` ends at `Radio8821cPrepared`. No board's
+`N2BP`/`N2BS` asset is provisioned.
 
 `tracking8822b::Tracker::pass` ports `rtw8822b_pwr_track` (type 0):
 alternating RF42[17:16] trigger and RF-A meter sample, `DECLARE_EWMA(thermal,
@@ -3867,7 +3891,7 @@ changes. None is a physical blocker unless stated.
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
 | `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
-| `rtl8822be` | In progress: B22 identity, factory map, authenticated `rtw8822b_fw.bin` loading into a retained native owner and the inactive `rtw8822b_mac_init`, the complete `rtw8822b_phy_set_param` (PCIe `rtw8822b_table.c` tables, TRX mode, `rtw_phy_init`, RFE/power-track/BF init), `rtw8822b_set_channel` and the signed `N2BQ` calibration-only ch1/20 firmware IQK (ending at `Stage::Calibrated`) are implemented (see "RTL8822BE retained native B22 owner" and "RTL8822BE signed calibration-only IQK"); `rtw8822b_pwr_track`, an operating/station record family and the station runtime are not yet ported. |
+| `rtl8822be` | In progress: B22 identity, factory map, authenticated `rtw8822b_fw.bin` loading into a retained native owner and the inactive `rtw8822b_mac_init`, the complete `rtw8822b_phy_set_param` (PCIe `rtw8822b_table.c` tables, TRX mode, `rtw_phy_init`, RFE/power-track/BF init), `rtw8822b_set_channel` the signed `N2BQ` calibration-only ch1/20 firmware IQK, the signed `N2BP` parked 2T2R operating power, the signed `N2BS` awake-station radio program (ending at `Stage::Radio8821cPrepared` with the B22 packet gate parked in the PCI transport) and `tracking8822b` (`rtw8822b_pwr_track`, not yet driven) are implemented (see "RTL8822BE retained native B22 owner", "RTL8822BE signed calibration-only IQK" and "RTL8822BE parked operating power (`N2BP`) and awake-station grant (`N2BS`)"); the station shell, PCI packet path, Device publish and dm watchdog are not yet ported. |
 | `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Source-complete for C22 under N22K `MIMO_PS` (see "Coexistence-driven static SMPS"): `rtw_coex_mimo_ps` -> `config_trx_mode(A, A)` with exact field restore, dm path diversity held on A, 1SS RA mask / STBC off, SM Power Save static/disabled action. Three register-model cases written, unexecuted; no signed N22K MIMO_PS record or BT-active measurement. |

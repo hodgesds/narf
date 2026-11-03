@@ -646,3 +646,103 @@ pub(super) async fn calibrate(
         iqk_status: status,
     })
 }
+
+/// B22 ch1/20 geometry retained from the `N2BQ` IQK channel program
+/// (`rtw8822b_set_channel_rf` RF18 on both paths, `_bb` 20 MHz 0x8ac) with the
+/// MAC still closed (CR TX/RX DMA and MAC TX/RX clear, TXPAUSE 0xff).
+async fn verify_station_geometry(io: &mut impl Io) -> Result<(), Error> {
+    let rf18 = rf18(0, 1, Width::Twenty) & 0x70fff;
+    for path in 0..2 {
+        if rf_read(io, path, 0x18).await? & 0x70fff != rf18 {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x8ac).await? & !0xffcffc00 != 0
+        || io.read8(0x100).await? & 0xcc != 0
+        || io.read8(0x522).await? != 255
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// Both paths' measured `N2BP` TXAGC words (`rtw8822b_set_tx_power_index_by_rate`).
+async fn verify_txagc(io: &mut impl Io, tables: [[u8; 64]; 2]) -> Result<(), Error> {
+    for (path, table) in tables.iter().enumerate() {
+        let base = if path == 0 { 0x1d00 } else { 0x1d80 };
+        for (word, rates) in table.chunks_exact(4).enumerate() {
+            if (7..11).contains(&word) {
+                continue;
+            }
+            let value = u32::from_le_bytes([rates[0], rates[1], rates[2], rates[3]]);
+            if read(io, base + word as u16 * 4).await? != value {
+                return Err(Error::Prerequisite);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// B22 awake-station radio program, the counterpart of
+/// `radio8821c::prepare_station`, entirely inside `N2BQ` + `N2BP` + `N2BS` and
+/// current policy. It keeps the IQK channel/RFE program (`rtw8822b_set_channel`
+/// is not replayed: it would not restore the measured TXAGC), re-checks the cut,
+/// RF08/0x1bf0 IQK receipts and both paths' measured TXAGC, takes a fresh
+/// RF42 conversion (`rtw8822b_pwr_track` trigger + 2 s interval), programs the
+/// conservative CCK response mask 0x1f, invalidates the 32 CAM entries with
+/// host-only crypto (`radio::software_crypto`), wakes firmware through
+/// RPWM/CPWM (`radio::awake`, `ps.c::rtw_power_mode_change` active), and hands
+/// the PCI transport the B22 packet gate with every MAC/DMA/IRQ gate still
+/// closed. Linux `rtw_core_start` opens those later through mac80211.
+pub(super) async fn prepare_station<F>(
+    io: &mut impl Io,
+    factory: &super::efuse8822b::Factory8822b,
+    phy: Info,
+    grant: alloc::sync::Arc<super::operating8822b::Grant>,
+    policy: F,
+) -> Result<super::radio8821c::StationInfo, Error>
+where
+    F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+{
+    let mut io = super::radio8821c::Checked {
+        io,
+        envelope: &*grant,
+        policy,
+    };
+    io.begin_station8821c()?;
+    verify_station_geometry(&mut io).await?;
+    if (read(&mut io, 0xf0).await? >> 12) & 15 != u32::from(phy.cut)
+        || rf_read(&mut io, 0, 0x08).await? != 0
+        || read(&mut io, 0x1bf0).await? & 0x100ff != 0
+        || factory.mac() != grant.own()
+    {
+        return Err(Error::Prerequisite);
+    }
+    let tables = [grant.power().txagc(0), grant.power().txagc(1)];
+    verify_txagc(&mut io, tables).await?;
+    rf(&mut io, 0, 0x42, 3 << 16, 3).await?;
+    io.delay_us(2_000_000).await;
+    let thermal = ((rf_read(&mut io, 0, 0x42).await? & 0xfc00) >> 10) as u8;
+    grant.temperature(thermal)?;
+    io.write32(0x440, 0x1f).await?;
+    super::radio::software_crypto(&mut io).await?;
+    super::radio::awake(&mut io).await?;
+    verify_station_geometry(&mut io).await?;
+    verify_txagc(&mut io, tables).await?;
+    if read(&mut io, 0x440).await? != 0x1f
+        || io.read8(0x303).await? & 0xf7 != 0xf7
+        || io.read32(0xb0).await.ok() != Some(0)
+        || io.read32(0xb8).await.ok() != Some(0)
+        || io.read32(0x10b8).await.ok() != Some(0)
+    {
+        return Err(Error::Prerequisite);
+    }
+    grant.temperature(((rf_read(&mut io, 0, 0x42).await? & 0xfc00) >> 10) as u8)?;
+    io.finish_station8821c(super::power_policy::Gate::b22(grant.clone()))?;
+    Ok(super::radio8821c::StationInfo {
+        channel: 1,
+        bandwidth_mhz: 20,
+        thermal,
+        response_rates: 0x1f,
+        identity: grant.identity(),
+    })
+}

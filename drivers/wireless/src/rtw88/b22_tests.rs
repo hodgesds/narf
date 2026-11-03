@@ -705,3 +705,139 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_pwr_track_swing_offset_follows_linux
 );
+
+/// The admitted B22 station chain fixture: factory, PHY facts, the `N2BS`
+/// grant over `N2BP` + `N2BQ`, and the US rule they are qualified under.
+fn b22_station_fixture() -> Option<(
+    super::super::efuse8822b::Factory8822b,
+    super::super::phy8822b::Info,
+    alloc::sync::Arc<super::super::operating8822b::Grant>,
+    narf_wireless::reg::RegulatoryDomain,
+)> {
+    use super::super::operating8822b::{request, station_request, Info, Source, StationSource};
+    use super::super::{calibration8822b, mac, phy8822b, radio8822b};
+    use narf_capabilities::Cap;
+    let mut map = *b22_board_factory(3, 25).logical();
+    for (path, cck, bw40, diff) in [(0usize, 32u8, 30u8, 0x02u8), (1, 31, 29, 0x0f)] {
+        let at = 0x10 + path * 42;
+        map[at] = cck;
+        map[at + 6] = bw40;
+        map[at + 11] = diff;
+    }
+    let factory = super::super::efuse8822b::Factory8822b::for_test(map).ok()?;
+    let info = mac::Info {
+        cut: 1,
+        reserved_boundary: 1996,
+        h2c_page: 2036,
+        firmware_tx_page: 2044,
+    };
+    let phy = phy8822b::Info::from_factory(&factory, 1, b22_features(2)).ok()?;
+    let board = calibration8822b::Board::new(&factory, phy, info, b22_features(2), [9; 32]).ok()?;
+    let calibration = alloc::sync::Arc::new(
+        calibration8822b::Source::Verified {
+            bytes: b22_record(&board.request()),
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(board)
+        .ok()?,
+    );
+    let receipt = radio8822b::Calibration {
+        channel: 1,
+        bandwidth_mhz: 20,
+        thermal_before: 25,
+        thermal_after: 25,
+        iqk_status: 0,
+    };
+    let req = request(board.request(), receipt);
+    let envelope = alloc::sync::Arc::new(
+        Source::Verified {
+            bytes: b22_power_record(&req),
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(req.clone(), &factory, calibration)
+        .ok()?,
+    );
+    let power = Info {
+        indices: envelope.indices(),
+        thermal: 25,
+        response_rates: 0x15f,
+        identity: req.identity,
+    };
+    let sreq = station_request(power, factory.mac());
+    let mut station = alloc::vec![0u8; 128];
+    station[..4].copy_from_slice(b"N2BS");
+    for (at, value) in [(4, 1u16), (6, 128), (12, 0x10ec), (14, 0xb822)] {
+        station[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    station[8..12].copy_from_slice(&128u32.to_le_bytes());
+    station[16..48].copy_from_slice(&sreq.identity);
+    station[48..54].copy_from_slice(&sreq.mac);
+    station[54] = 1;
+    station[55] = 20;
+    for (at, value) in [(56, 4i16), (58, 76), (60, 50), (62, 40), (64, 60)] {
+        station[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    station[67] = 63;
+    station[68..70].copy_from_slice(b"US");
+    let grant = StationSource::Verified {
+        bytes: station,
+        signer: Some([7; 32]),
+        cap: Cap::bootstrap(),
+    }
+    .load(sreq, envelope)
+    .ok()?;
+    let us = narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: alloc::vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2422,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 20,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    };
+    Some((factory, phy, grant, us))
+}
+
+/// The B22 base packet gate is keyed by `10ec:b822`, binds the `N2BS` MAC and
+/// exposes no C21/C22 continuation family; the awake-station program refuses
+/// before any register access when the transport has no B22 station arm.
+fn smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm() -> TestResult {
+    use super::super::{phy8821c::Host, power_policy::Gate, radio8822b};
+    let Some((factory, phy, grant, us)) = b22_station_fixture() else {
+        return TestResult::Fail("8822B station fixture rejected");
+    };
+    let gate = Gate::b22(grant.clone());
+    if gate.did() != 0xb822
+        || gate.host() != Host::PCI_B22
+        || Host::PCI_B22.family() != "rtw8822be"
+        || gate.own() != factory.mac()
+        || gate.extension_base().is_some()
+        || gate.calibrated_base().is_some()
+        || gate.base_request().is_some()
+        || gate.ht_facts().is_some()
+        || gate.c21_indices().is_some()
+        || !gate.base_only()
+        || gate.current_with_policy_for_test(&us).is_err()
+    {
+        return TestResult::Fail("8822B station gate differs from its N2BS base");
+    }
+    let mut io = super::mac_tests::Model::new(1, 1);
+    let result = narf_scheduler::block_on(radio8822b::prepare_station(
+        &mut io,
+        &factory,
+        phy,
+        grant,
+        move || Ok(us.clone()),
+    ));
+    if result.is_ok() || !io.trace.is_empty() {
+        return TestResult::Fail("8822B station program touched hardware without a station arm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm
+);

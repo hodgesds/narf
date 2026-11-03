@@ -556,6 +556,57 @@ impl<I: Io> Lifecycle<I> {
         })
         .await
     }
+    /// RTL8822BE awake station radio (`radio8822b::prepare_station`):
+    /// `Operating8821cPrepared → PreparingRadio8821c → Radio8821cPrepared`
+    /// (stage names shared with C21; owner keyed by `0xb822`). A missing,
+    /// unsigned, mismatched or policy-refused `N2BS` record leaves the pure
+    /// `Operating8821cPrepared` checkpoint without register access.
+    pub(super) async fn prepare_station8822b_with<F>(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::operating8822b::StationSource,
+        policy: F,
+    ) -> Result<super::radio8821c::StationInfo, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Operating8821cPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let grant = owner.preflight_station8822b(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::PreparingRadio8821c;
+        let _attempt = Attempt(self);
+        let result = owner.prepare_station8822b(factory, grant, policy).await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Radio8821cPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_station8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::radio8821c::StationInfo, Error> {
+        self.prepare_station8822b_with(
+            factory,
+            super::operating8822b::StationSource::Registered,
+            || {
+                narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8822b(
+                    super::calibration8822b::Error::Policy,
+                ))
+            },
+        )
+        .await
+    }
     pub(super) async fn prepare_phy8821c(
         &self,
         factory: &super::efuse::Factory8821c,

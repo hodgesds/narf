@@ -57,6 +57,11 @@ impl Host {
         device: 0xc822,
         usb: false,
     };
+    pub const PCI_B22: Self = Self {
+        vendor: 0x10ec,
+        device: 0xb822,
+        usb: false,
+    };
     /// The PCI host of chip `did` (0xc821 or 0xc822).
     pub(in crate::rtw88) fn pci(did: u16) -> Self {
         if did == 0xc822 {
@@ -74,10 +79,11 @@ impl Host {
     /// Filename family: `rtw8821ce`/`rtw8822ce` (PCI) or `rtw8821cu` (USB),
     /// matching Linux's `rtw8821ce.c`/`rtw8821cu.c` driver names.
     pub(in crate::rtw88) fn family(self) -> &'static str {
-        match (self.usb, self == Self::PCI_C22) {
+        match (self.usb, self.device) {
             (true, _) => "rtw8821cu",
-            (false, true) => "rtw8822ce",
-            (false, false) => "rtw8821ce",
+            (false, 0xc822) => "rtw8822ce",
+            (false, 0xb822) => "rtw8822be",
+            (false, _) => "rtw8821ce",
         }
     }
     /// USB boards bind their VID/PID; PCI binds nothing (hash unchanged).

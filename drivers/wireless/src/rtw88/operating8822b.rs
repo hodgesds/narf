@@ -431,7 +431,10 @@ pub(super) fn station_request(power: Info, mac: [u8; 6]) -> StationRequest {
     hash.update(&power.response_rates.to_le_bytes());
     hash.update(&0x1fu32.to_le_bytes()); // station response mask, distinct from parked 15f
     hash.update(b"static awake measured peaks cover all six-bit thermal values 0..63; pwr_track only under its own record");
-    hash.update(b"source B22 channel/RFE; fresh RF42; CAM32 invalidate; host CCMP no HW keys; source US static PHY; no C21/C22 callbacks");
+    // radio8822b::prepare_station, literally.
+    hash.update(b"radio8822b::prepare_station v1: retained N2BQ ch1/20 rtw8822b_set_channel RF18 A+B 8ac; cut f0; RF08 clear; 1bf0 low8/reload16 zero; N2BP 1d00/1d80 readback");
+    hash.update(b"RF42[17:16]=3 2000000us RF-A RF42[15:10] in N2BP windows; RRSR440=1f; CAM32 invalidate 670/674; CR sec off; SECCFG 680 &~cf; RCR 608; RPWM 3d9/CPWM 3da awake");
+    hash.update(b"re-verify geometry TXAGC RRSR; PCIe 303 stop f7; HIMR b0 b8 10b8 zero; CR cc and TXPAUSE ff closed; B22 Gate to PCI transport; no C21/C22 callbacks");
     hash.update(b"shared rtw88 PCI TXDESC48 TXBD16 RXDESC24 RXBD8; port0 MAC610 BSSID618 AID6a8; H2C ACTIVE/RA/media; conservative DCF");
     StationRequest {
         identity: hash.finalize(),
@@ -542,6 +545,17 @@ impl Grant {
     pub(super) fn power(&self) -> &Envelope {
         &self.power
     }
+    /// The factory MAC the record is bound to.
+    pub(super) fn own(&self) -> [u8; 6] {
+        self.request.mac
+    }
+    pub(super) fn identity(&self) -> [u8; 32] {
+        self.request.identity
+    }
+    /// Both `N2BP` thermal windows (`N2BS` itself must cover 0..63).
+    pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
+        self.power.temperature(value)
+    }
     pub(super) fn policy_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
         let limit = policy_limit(domain, self.ceiling)?;
         if self.peaks.iter().any(|&p| p + self.antenna > limit) {
@@ -581,5 +595,14 @@ impl Grant {
                 })
                 .map_err(|_| denied(QError::Authority))?
         })
+    }
+}
+impl super::calibration8821c::Enclosure for Grant {
+    fn invoke<T, F, Op>(&self, policy: &F, operation: Op) -> Result<T, Error>
+    where
+        F: Fn() -> Result<RegulatoryDomain, Error>,
+        Op: FnOnce() -> Result<T, Error>,
+    {
+        Grant::invoke(self, policy, operation)
     }
 }
