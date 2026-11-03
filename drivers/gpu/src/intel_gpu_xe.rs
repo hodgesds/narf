@@ -54,7 +54,8 @@ pub(crate) fn low_latency_supported(info: &DeviceInfo) -> bool {
 const PXP_TYPE: u32 = 2;
 const PXP_TYPE_NONE: u64 = 0;
 const PXP_TYPE_HWDRM: u64 = 1;
-/// MAX_USER_EXTENSIONS of xe_bo.c::gem_create_user_extensions.
+/// MAX_USER_EXTENSIONS of xe_bo.c::gem_create_user_extensions and
+/// xe_exec_queue.c::__exec_queue_user_extensions (each defines it as 16).
 const MAX_USER_EXTENSIONS: usize = 16;
 
 /// xe_pxp_is_enabled(xe->pxp) is false on every NARF device: Linux enables
@@ -65,17 +66,19 @@ fn pxp_disabled() -> FsError {
 }
 
 /// xe_bo.c::gem_create_user_extensions over DRM_XE_GEM_CREATE_EXTENSION_
-/// SET_PROPERTY chains, in its check order: the user extension header
-/// (copy, pad, name), the set-property body (copy, property, pad), then
-/// gem_create_set_pxp_type. The result is applied after the object exists,
-/// as xe_gem_create_ioctl runs the chain after xe_bo_create_user. More than
-/// MAX_USER_EXTENSIONS is Linux's -E2BIG, which `FsError` cannot carry, so
-/// it is -EINVAL here.
+/// SET_PROPERTY chains, in its check order: the extension-count bound, the
+/// user extension header (copy, pad, name), the set-property body (copy,
+/// property, pad), then gem_create_set_pxp_type. The result is applied after
+/// the object exists, as xe_gem_create_ioctl runs the chain after
+/// xe_bo_create_user.
 fn gem_create_extensions(user: &dyn IoctlContext, mut next: u64) -> Result<(), FsError> {
     let mut count = 0;
     while next != 0 {
+        // `if (ext_number >= MAX_USER_EXTENSIONS) return -E2BIG;` comes
+        // before copy_from_user, so the seventeenth extension is refused
+        // without being read: its address, header and body never matter.
         if count >= MAX_USER_EXTENSIONS {
-            return Err(FsError::InvalidData);
+            return Err(FsError::ArgumentListTooLong);
         }
         let base = read(user, next, 16)?;
         // struct drm_xe_user_extension: name 8, pad 12.
@@ -438,12 +441,17 @@ impl XeFile {
             placements = crate::intel_gpu_engine::EngineSet::of(&engines);
         }
         let mut extensions = u64_at(&wire, 0);
-        let mut seen = BTreeSet::new();
+        let mut ext_number = 0;
         let (mut priority, mut timeslice) = (2, 1000);
         while extensions != 0 {
-            if seen.len() == 16 || !seen.insert(extensions) {
-                return Err(FsError::InvalidData);
+            // __exec_queue_user_extensions: `if (ext_number >=
+            // MAX_USER_EXTENSIONS) return -E2BIG;` before copy_from_user.
+            // Linux keeps no visited set: a chain that revisits an extension
+            // applies it again and ends at this bound.
+            if ext_number >= MAX_USER_EXTENSIONS {
+                return Err(FsError::ArgumentListTooLong);
             }
+            ext_number += 1;
             let ext = read(user, extensions, 48)?;
             zero(&ext[8..16])?;
             zero(&ext[20..24])?;

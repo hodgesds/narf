@@ -16,6 +16,18 @@ fn pxp_extension(user: &Cpu, at: u64, next: u64, name: u32, property: u32, value
     user.wire.store(at, &ext);
 }
 
+/// `len` chained PXP_TYPE NONE extensions at 8192, 8256, ... (64 apart).
+fn none_chain(user: &Cpu, len: u64, property: u32) {
+    for index in 0..len {
+        let next = if index + 1 == len {
+            0
+        } else {
+            8192 + (index + 1) * 64
+        };
+        pxp_extension(user, 8192 + index * 64, next, 0, property, 0);
+    }
+}
+
 fn smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos() -> TestResult {
     let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
     let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
@@ -79,16 +91,42 @@ fn smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos() -> TestResult {
     pxp_extension(&user, 8192, 8256, 0, 2, 0);
     pxp_extension(&user, 8256, 0, 0, 2, 1);
     assert_eq!(queue(8192), (Err(FsError::NoDevice), 0));
+    // __exec_queue_user_extensions: `if (ext_number >= MAX_USER_EXTENSIONS)
+    // return -E2BIG;`, MAX_USER_EXTENSIONS being 16. A seventeenth extension
+    // is -E2BIG, not the -EINVAL this used to fold into.
+    none_chain(&user, 17, 2);
+    assert_eq!(queue(8192), (Err(FsError::ArgumentListTooLong), 0));
+    // The bound precedes copy_from_user: a seventeenth at an unreadable
+    // address is -E2BIG, never -EFAULT.
+    pxp_extension(&user, 8192 + 15 * 64, 0x10000, 0, 2, 0);
+    assert_eq!(queue(8192), (Err(FsError::ArgumentListTooLong), 0));
+    // The sixteenth (ext_number 15) is still copied and applied in full: its
+    // HWDRM is -ENODEV although a seventeenth follows.
+    pxp_extension(&user, 8192 + 15 * 64, 8192 + 16 * 64, 0, 2, 1);
+    assert_eq!(queue(8192), (Err(FsError::NoDevice), 0));
+    // Linux keeps no visited set: an extension that names itself is applied
+    // sixteen times and the seventeenth visit is -E2BIG.
+    pxp_extension(&user, 8192, 8192, 0, 2, 0);
+    assert_eq!(queue(8192), (Err(FsError::ArgumentListTooLong), 0));
     assert_eq!(arena.live_allocations(), before);
+    let destroy_queue = |id: u32| {
+        let mut destroy = [0; 24];
+        put32(&mut destroy, 0, id);
+        user.wire.store(64, &destroy);
+        assert_eq!(invoke(&file, &info, &user, xe::EXEC_QUEUE_DESTROY), Ok(0));
+    };
     // NONE alone is the default and creates the queue.
     pxp_extension(&user, 8192, 0, 0, 2, 0);
     let (result, id) = queue(8192);
     assert_eq!(result, Ok(0));
     assert_ne!(id, 0);
-    let mut destroy = [0; 24];
-    put32(&mut destroy, 0, id);
-    user.wire.store(64, &destroy);
-    assert_eq!(invoke(&file, &info, &user, xe::EXEC_QUEUE_DESTROY), Ok(0));
+    destroy_queue(id);
+    // Sixteen chained extensions are within the bound.
+    none_chain(&user, 16, 2);
+    let (result, id) = queue(8192);
+    assert_eq!(result, Ok(0));
+    assert_ne!(id, 0);
+    destroy_queue(id);
 
     // DRM_XE_GEM_CREATE_SET_PROPERTY_PXP_TYPE on a system object.
     let gem = |extensions: u64, vm: u32, size: u64| {
@@ -141,18 +179,32 @@ fn smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos() -> TestResult {
     pxp_extension(&user, 8192, 8256, 0, 0, 0);
     pxp_extension(&user, 8256, 0, 0, 0, 1);
     assert_eq!(gem(8192, 0, 4096), (Err(FsError::NoDevice), 0));
-    // Sixteen NONE extensions are accepted; a seventeenth is Linux's
-    // -E2BIG, which FsError carries as -EINVAL.
-    for index in 0..17u64 {
-        let next = if index == 16 {
-            0
-        } else {
-            8192 + (index + 1) * 64
-        };
-        pxp_extension(&user, 8192 + index * 64, next, 0, 0, 0);
-    }
-    assert_eq!(gem(8192, 0, 4096), (Err(FsError::InvalidData), 0));
-    pxp_extension(&user, 8192 + 15 * 64, 0, 0, 0, 0);
+    // gem_create_user_extensions: `if (ext_number >= MAX_USER_EXTENSIONS)
+    // return -E2BIG;`, MAX_USER_EXTENSIONS being 16. This pinned -EINVAL
+    // while FsError had no E2BIG; Linux's answer is -E2BIG.
+    none_chain(&user, 17, 0);
+    assert_eq!(gem(8192, 0, 4096), (Err(FsError::ArgumentListTooLong), 0));
+    // Like every extension verdict it lands only once the object exists, so
+    // the ioctl argument and VM refusals still come first.
+    assert_eq!(gem(8192, 0, 4095), (Err(FsError::InvalidData), 0));
+    assert_eq!(gem(8192, 99, 4096), (Err(FsError::NotFound), 0));
+    // The bound precedes copy_from_user: the seventeenth is never read, so
+    // neither its bad name nor its HWDRM matters, and an unreadable address
+    // is -E2BIG rather than -EFAULT.
+    pxp_extension(&user, 8192 + 16 * 64, 0, 1, 0, 1);
+    assert_eq!(gem(8192, 0, 4096), (Err(FsError::ArgumentListTooLong), 0));
+    pxp_extension(&user, 8192 + 15 * 64, 0x10000, 0, 0, 0);
+    assert_eq!(gem(8192, 0, 4096), (Err(FsError::ArgumentListTooLong), 0));
+    // The sixteenth (ext_number 15) is still copied and applied in full: its
+    // HWDRM is -ENODEV although a seventeenth follows.
+    pxp_extension(&user, 8192 + 15 * 64, 8192 + 16 * 64, 0, 0, 1);
+    assert_eq!(gem(8192, 0, 4096), (Err(FsError::NoDevice), 0));
+    // No visited set: a self-referencing NONE is applied sixteen times and
+    // the seventeenth visit is -E2BIG.
+    pxp_extension(&user, 8192, 8192, 0, 0, 0);
+    assert_eq!(gem(8192, 0, 4096), (Err(FsError::ArgumentListTooLong), 0));
+    // Sixteen NONE extensions are accepted.
+    none_chain(&user, 16, 0);
     let (result, handle) = gem(8192, 0, 4096);
     assert_eq!(result, Ok(0));
     assert!(file.gem.object(handle).is_ok());
