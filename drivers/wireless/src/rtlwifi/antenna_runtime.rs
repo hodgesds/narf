@@ -21,12 +21,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<(), Error> {
-        let base = self
-            .station
-            .calibration
-            .as_ref()
-            .ok_or(Error::State)?
-            .clone();
+        // 88EE-only grant: the 8821AE profile installs no antenna program.
+        let Some(base) = self.ee_base()? else {
+            return Ok(());
+        };
         let tracking = self.station.tracking.as_ref().map(|s| s.grant.clone());
         let grant = environment.antenna(
             base.clone(),

@@ -40,6 +40,8 @@ pub const REG_BCN_CTRL: u16 = 0x0550;
 /// `enum rtl8821a_h2c_cmd` ids used by the station owner.
 pub const H2C_RSVDPAGE: u8 = 0x00;
 pub const H2C_MSRRPT: u8 = 0x01;
+/// `H2C_8821AE_KEEP_ALIVE_CTRL` (`HW_VAR_KEEP_ALIVE`: `[0xff, period]`).
+pub const H2C_KEEP_ALIVE_CTRL: u8 = 0x03;
 pub const H2C_SETPWRMODE: u8 = 0x20;
 pub const H2C_RA_MASK: u8 = 0x40;
 

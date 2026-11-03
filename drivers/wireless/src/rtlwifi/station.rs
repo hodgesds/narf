@@ -285,9 +285,45 @@ fn delba(peer: [u8; 6], own: [u8; 6], tid: u16, reason: u16) -> Vec<u8> {
     frame.extend_from_slice(&reason.to_le_bytes());
     frame
 }
+/// `ht::wait` over the chip's signed power base: the 88EE form with its
+/// optional grants, or the 8821AE envelope form (which has none).
+#[allow(clippy::too_many_arguments)]
+async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
+    base: super::super::station_power::Base,
+    ht: Option<Arc<super::super::ht::Grant>>,
+    protection: Option<Arc<super::super::protection::Grant>>,
+    tracking: Option<Arc<super::super::tracking::Grant>>,
+    antenna: Option<Arc<super::super::antenna::Grant>>,
+    grant: super::super::station_power::Grant,
+    environment: &impl Environment,
+    future: F,
+) -> Result<(), RadioError> {
+    use super::super::station_power::{Base, Grant};
+    match (base, grant) {
+        (Base::Rtl8188ee(base), Grant::Rtl8188ee(permission)) => {
+            super::super::ht::wait(
+                base,
+                ht,
+                protection,
+                tracking,
+                antenna,
+                permission,
+                environment,
+                future,
+            )
+            .await
+        }
+        (Base::Rtl8821ae(base), Grant::Rtl8821ae(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8821ae(base, permission, environment, future).await
+        }
+        _ => Err(RadioError::State),
+    }
+}
 pub(crate) struct Publication {
     pci: super::packet::Publication,
-    base: Arc<super::super::channel_power::Calibration>,
+    base: super::super::station_power::Base,
     ht: Option<Arc<super::super::ht::Grant>>,
     protection: Option<Arc<super::super::protection::Grant>>,
     tracking: Option<(
@@ -298,7 +334,7 @@ pub(crate) struct Publication {
         Arc<super::super::antenna::Grant>,
         super::super::tracking::Gains,
     )>,
-    permission: super::super::channel_power::Permission,
+    permission: super::super::station_power::Grant,
     indices: [u8; 8],
     epoch: Arc<AtomicU64>,
     expected: u64,
@@ -319,25 +355,27 @@ impl Publication {
         let op = || {
             if self
                 .base
-                .permission(domain, self.permission.channel())
+                .grant(domain, self.permission.channel())
                 .map_err(RadioError::Power)?
                 != self.permission
             {
                 return Err(RadioError::State);
             }
+            // The 88EE-only grants exist only over an 88EE permission.
+            let ee = || self.permission.ee().ok_or(RadioError::State);
             if let Some(ht) = &self.ht {
-                if self.tracking.is_none() && ht.gains(domain, self.permission)? != self.indices {
+                if self.tracking.is_none() && ht.gains(domain, ee()?)? != self.indices {
                     return Err(RadioError::State);
                 }
             }
             if let Some(protection) = &self.protection {
-                protection.check(domain, self.permission)?;
+                protection.check(domain, ee()?)?;
             }
             if let Some((tracking, gains)) = &self.tracking {
-                tracking.check(domain, self.permission, *gains)?;
+                tracking.check(domain, ee()?, *gains)?;
             }
             if let Some((antenna, gains)) = &self.antenna {
-                antenna.check(domain, self.permission, *gains)?;
+                antenna.check(domain, ee()?, *gains)?;
             }
             let publish = || {
                 self.pci.invoke(|| {
@@ -369,7 +407,9 @@ impl Publication {
 pub(super) struct State {
     phase: Phase,
     failed: Arc<AtomicBool>,
-    calibration: Option<Arc<super::super::channel_power::Calibration>>,
+    calibration: Option<super::super::station_power::Base>,
+    /// RTL8821AE `rtl8821ae_dm_iq_calibrate` linked-interval counter.
+    iqk: super::super::rtl8821ae::iqk::LinkedInterval,
     cache: Vec<Entry>,
     candidate: Option<Candidate>,
     plan: Option<JoinPlan>,
@@ -429,6 +469,7 @@ impl State {
             phase: Phase::Dormant,
             failed: Arc::new(AtomicBool::new(false)),
             calibration: None,
+            iqk: Default::default(),
             cache: Vec::new(),
             candidate: None,
             plan: None,
@@ -879,13 +920,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         &self,
         firmware: super::super::firmware_transport::Identity,
     ) -> Result<super::super::ProtectionRequest, Error> {
-        let base = self.station.calibration.as_ref().ok_or(Error::State)?;
+        let base = self.ee_base()?.ok_or(Error::Profile)?;
         base.with_current(|| firmware.invoke(|| Ok(())))?;
         if let Some(ht) = &self.station.ht {
             ht.invoke(|| Ok(()))?;
         }
         Ok(super::super::protection::request(
-            base,
+            &base,
             firmware,
             self.permission.ok_or(Error::State)?.channel(),
             self.station.ht.as_deref(),
@@ -896,7 +937,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         firmware: super::super::firmware_transport::Identity,
         environment: &impl Environment,
     ) -> Result<super::super::ThermalTrackingRequest, Error> {
-        let base = self.station.calibration.as_ref().ok_or(Error::State)?;
+        let base = &self.ee_base()?.ok_or(Error::Profile)?;
         let permission = self.permission.ok_or(Error::State)?;
         if !(1..=63).contains(&base.factory().logical[0xba]) {
             return Err(Error::Profile);
@@ -925,12 +966,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         firmware: super::super::firmware_transport::Identity,
         environment: &impl Environment,
     ) -> Result<super::super::AntennaDiversityRequest, Error> {
-        let base = self
-            .station
-            .calibration
-            .as_ref()
-            .ok_or(Error::State)?
-            .clone();
+        let base = self.ee_base()?.ok_or(Error::Profile)?;
         base.with_current(|| firmware.invoke(|| Ok(())))?;
         if let Some(ht) = &self.station.ht {
             ht.invoke(|| Ok(()))?;
@@ -993,18 +1029,63 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         calibration: super::super::channel_power::Calibration,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        self.stage_station_base(
+            super::super::station_power::Base::Rtl8188ee(Arc::new(calibration)),
+            domain,
+        )
+    }
+    /// The 8821AE `NAPC` envelope that minted this owner's channel grant.
+    pub(crate) fn stage_rtl8821ae_calibration(
+        &mut self,
+        calibration: super::super::rtl8821ae::envelope::Calibration,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.stage_station_base(
+            super::super::station_power::Base::Rtl8821ae(Arc::new(calibration)),
+            domain,
+        )
+    }
+    fn stage_station_base(
+        &mut self,
+        base: super::super::station_power::Base,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        let current = self.station_grant().ok_or(Error::State)?;
         if self.phase != Hardware::MacConfigured
             || self.station.phase != Phase::Dormant
-            || Some(
-                calibration
-                    .permission(domain, self.permission.ok_or(Error::State)?.channel())
-                    .map_err(|_| Error::Profile)?,
-            ) != self.permission
+            || base
+                .grant(domain, current.channel())
+                .map_err(|_| Error::Profile)?
+                != current
         {
             return Err(Error::Profile);
         }
-        self.station.calibration = Some(Arc::new(calibration));
+        self.station.calibration = Some(base);
         Ok(())
+    }
+    /// The programmed channel grant of this owner's chip profile.
+    pub(crate) fn station_grant(&self) -> Option<super::super::station_power::Grant> {
+        match self.chip {
+            super::Chip::Rtl8188ee => self
+                .permission
+                .map(super::super::station_power::Grant::Rtl8188ee),
+            super::Chip::Rtl8821ae => self
+                .rtl8821ae_power
+                .map(super::super::station_power::Grant::Rtl8821ae),
+        }
+    }
+    /// 88EE calibration for the 88EE-only HT/protection/tracking/antenna/
+    /// fallback grants; `None` on the 8821AE profile, which admits none.
+    pub(super) fn ee_base(
+        &self,
+    ) -> Result<Option<Arc<super::super::channel_power::Calibration>>, Error> {
+        Ok(self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .ee()
+            .cloned())
     }
     pub(crate) fn station_peer(&self) -> Option<[u8; 6]> {
         if self.station_phase() != Phase::Open
@@ -1034,16 +1115,24 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         let domain = environment.domain()?;
-        let permission = self
+        let grant = self
             .station
             .calibration
             .as_ref()
             .ok_or(Error::Profile)?
-            .permission(&domain, self.permission.ok_or(Error::State)?.channel())
+            .grant(&domain, self.station_grant().ok_or(Error::State)?.channel())
             .map_err(|_| Error::Profile)?;
-        if Some(permission) != self.permission {
+        if Some(grant) != self.station_grant() {
             return Err(Error::Profile);
         }
+        if self.station.ht.is_none()
+            && self.station.tracking.is_none()
+            && self.station.antenna.is_none()
+            && self.station.protection.is_none()
+        {
+            return Ok(());
+        }
+        let permission = grant.ee().ok_or(Error::Profile)?;
         if let Some(ht) = &self.station.ht {
             if self.station.tracking.is_none()
                 && ht.gains(&domain, permission).map_err(Error::Radio)? != self.station.ht_indices
@@ -1092,6 +1181,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     fn program_station_edca(&self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
         let calibration = self.station.calibration.as_ref().ok_or(Error::Profile)?;
         let program = || {
+            if self.chip == super::Chip::Rtl8821ae {
+                // rtl8821ae_set_qos ignores the AP's rows (fixed BK/VI/VO).
+                return super::super::rtl8821ae::station::set_qos_all(&self.io);
+            }
             if self.station.ht_profile.is_some() {
                 return super::super::wmm::program_ht(&self.io, p);
             }
@@ -1209,7 +1302,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .antenna
                 .as_ref()
                 .map(|s| (s.grant.clone(), operating_gains)),
-            permission: self.permission.ok_or(Error::State)?,
+            permission: self.station_grant().ok_or(Error::State)?,
             indices: self.station.ht_indices,
             epoch: self.station.epoch.clone(),
             expected: self.station.epoch.load(Ordering::Acquire),
@@ -1240,12 +1333,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.station.ht.is_some() {
             return self.check_station_policy(environment);
         }
-        let base = self
-            .station
-            .calibration
-            .as_ref()
-            .ok_or(Error::Profile)?
-            .clone();
+        if self.station.calibration.is_none() {
+            return Err(Error::Profile);
+        }
+        // HT20/HT40 grants are 88EE programs; the 8821AE profile stays legacy.
+        let Some(base) = self.ee_base()? else {
+            return Ok(());
+        };
         let wide = environment.ht40(base.clone())?;
         let legacy = environment.ht20(base.clone())?;
         let Some(grant) = wide.first().cloned().or(legacy) else {
@@ -1292,7 +1386,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.station.phase = Phase::Starting;
         let result = async {
             self.check_station_policy(environment)?;
-            super::super::ht::wait(
+            power_wait(
                 self.station
                     .calibration
                     .as_ref()
@@ -1302,7 +1396,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.station.protection.clone(),
                 self.station.tracking.as_ref().map(|s| s.grant.clone()),
                 self.station.antenna.as_ref().map(|s| s.grant.clone()),
-                self.permission.ok_or(Error::State)?,
+                self.station_grant().ok_or(Error::State)?,
                 environment,
                 self.awake_station(),
             )
@@ -1544,7 +1638,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         let bytes = super::super::probe_scan::request(
             self.local().ok_or(Error::State)?,
-            self.permission.ok_or(Error::State)?.channel(),
+            self.station_grant().ok_or(Error::State)?.channel(),
             ssid,
             self.station_ht_capability(),
         )?;
@@ -1639,16 +1733,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.restore_station_antenna(environment).await?;
             self.restore_station_tracking(environment).await?;
             self.select_station_width(width, environment).await?;
-            let base = self
-                .station
-                .calibration
-                .as_ref()
-                .ok_or(Error::State)?
-                .clone();
-            let protection = environment.protection(base.clone(), self.station.ht.clone())?;
-            if let Some(grant) = &protection {
+            let protection = match self.ee_base()? {
+                Some(base) => environment
+                    .protection(base.clone(), self.station.ht.clone())?
+                    .map(|grant| (grant, base)),
+                None => None,
+            };
+            if let Some((grant, base)) = &protection {
                 if !grant.matches(
-                    &base,
+                    base,
                     self.station.ht.as_ref(),
                     self.permission.ok_or(Error::State)?.channel(),
                 ) {
@@ -1670,10 +1763,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             {
                 return Err(Error::Profile);
             }
-            self.station.protection = protection;
+            self.station.protection = protection.map(|(grant, _)| grant);
             self.install_station_tracking(environment)?;
             self.install_station_antenna(environment).await?;
-            super::super::ht::wait(
+            power_wait(
                 self.station
                     .calibration
                     .as_ref()
@@ -1683,7 +1776,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.station.protection.clone(),
                 self.station.tracking.as_ref().map(|s| s.grant.clone()),
                 self.station.antenna.as_ref().map(|s| s.grant.clone()),
-                self.permission.ok_or(Error::State)?,
+                self.station_grant().ok_or(Error::State)?,
                 environment,
                 self.prepare_station_peer(bssid, rates, basic, capability),
             )
@@ -1720,6 +1813,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .ok_or(Error::State)?
                         .legacy_rates();
                     self.station_publication(environment, || {
+                        if self.chip == super::Chip::Rtl8821ae {
+                            return super::super::rtl8821ae::station::configure_rates(
+                                &self.io,
+                                rates,
+                                basic,
+                                self.station.capability,
+                            );
+                        }
                         super::super::station_control::configure_rates(
                             &self.io,
                             rates,
@@ -1762,8 +1863,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .clone();
                     let base_for_fallback = base.clone();
                     let ht = self.station.ht.clone();
-                    let permission = self.permission.ok_or(Error::State)?;
-                    super::super::ht::wait(
+                    let permission = self.station_grant().ok_or(Error::State)?;
+                    power_wait(
                         base,
                         ht,
                         self.station.protection.clone(),
@@ -1786,9 +1887,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.check_station_policy(environment)?;
                     self.station.native_associated = true;
                     self.station.fallback = None;
-                    if let Some(grant) = environment.fallback(base_for_fallback.clone())? {
+                    if let Some(grant) = match base_for_fallback.ee() {
+                        Some(ee) => environment.fallback(ee.clone())?,
+                        None => None,
+                    } {
                         if !grant.matches(
-                            &base_for_fallback,
+                            base_for_fallback.ee().ok_or(Error::Profile)?,
                             self.permission.ok_or(Error::State)?.channel(),
                         ) {
                             return Err(Error::Profile);
@@ -2368,6 +2472,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .as_ref()
             .ok_or(Error::State)?
             .legacy_rates();
+        if self.chip == super::Chip::Rtl8821ae {
+            return self
+                .install_rtl8821ae_station_rate_mask(rates, level, environment)
+                .await;
+        }
         let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
         let payload = super::super::rate_adaptive::rate_mask_width(
             rates,
@@ -2383,8 +2492,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .ok_or(Error::State)?
             .clone();
         let ht = self.station.ht.clone();
-        let permission = self.permission.ok_or(Error::State)?;
-        super::super::ht::wait(
+        let permission = self.station_grant().ok_or(Error::State)?;
+        power_wait(
             base,
             ht,
             self.station.protection.clone(),
@@ -2397,6 +2506,84 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         .await?;
         self.check_station_policy(environment)
     }
+    /// `rtl8821ae_update_hal_rate_mask(sta, level, update_bw = true)` for
+    /// the legacy 2.4 GHz peer (`supp_rates[0]` = the association's legacy
+    /// intersection), installed inside the envelope's current authority.
+    async fn install_rtl8821ae_station_rate_mask(
+        &mut self,
+        rates: u16,
+        level: u8,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::rtl8821ae::h2c;
+        if self.station.ht_profile.is_some() {
+            return Err(Error::Profile);
+        }
+        let peer = h2c::Peer {
+            legacy: rates & 0xfff,
+            ht: None,
+            sgi20: false,
+            sgi40: false,
+        };
+        let payload = h2c::rate_mask(&peer, false, level, true);
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let permission = self.station_grant().ok_or(Error::State)?;
+        power_wait(
+            base,
+            None,
+            None,
+            None,
+            None,
+            permission,
+            environment,
+            self.install_rtl8821ae_rate_mask(payload, environment.admission().map(Arc::as_ref)),
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
+    /// RTL8821AE DM watchdog step (`rtl8821ae_dm_watchdog`, every
+    /// `RTL_WATCHDOG_TIME`): `rtl8821ae_dm_iq_calibrate` runs path-A IQK on
+    /// the second linked period, only with the firmware out of power save
+    /// (`fw_current_inpsmode` false); the IQK itself pauses the queues. The RA
+    /// mask refresh needs the 8821AE PHY-status PWDB, which is not decoded,
+    /// so the association mask (`DM_RATR_STA_INIT`) stays installed.
+    async fn rtl8821ae_watchdog(&mut self, environment: &impl Environment) -> Result<(), Error> {
+        if !self.station.ra.due(environment.now_ms()) {
+            return Ok(());
+        }
+        if self.leisure() {
+            return Ok(());
+        }
+        let linked = self.station_linked();
+        if !self.station.iqk.tick(linked) {
+            return Ok(());
+        }
+        self.check_station_policy(environment)?;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let permission = self.station_grant().ok_or(Error::State)?;
+        power_wait(
+            base,
+            None,
+            None,
+            None,
+            None,
+            permission,
+            environment,
+            async { self.calibrate_rtl8821ae_iqk().await.map(|_| ()) },
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
     /// `rtl88e_dm_watchdog` → `rtl88e_dm_refresh_rate_adaptive_mask`: every
     /// `RTL_WATCHDOG_TIME`, outside firmware LPS, a linked station whose
     /// smoothed PWDB crossed its hysteresis re-sends the mask at the new
@@ -2405,6 +2592,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<bool, Error> {
+        if self.chip == super::Chip::Rtl8821ae {
+            let result = self.rtl8821ae_watchdog(environment).await;
+            if result.is_err() {
+                self.abort_station();
+            }
+            return result.map(|()| false);
+        }
         // Each watchdog pass re-proves the fallback grant (revocation
         // returns DATA to the fixed rate without touching the link).
         self.station.fallback_current();

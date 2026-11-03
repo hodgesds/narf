@@ -273,7 +273,21 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         {
             return Err(Error::State);
         }
-        if matches!(
+        if owner.chip() == super::prepare::Chip::Rtl8821ae {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8821ae(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
+        } else if matches!(
             owner.phase(),
             Phase::RadioConfigured | Phase::ChannelConfigured
         ) {
@@ -288,6 +302,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             owner.stage_station_calibration(calibration, &domain)?;
         }
         if owner.phase() == Phase::MacConfigured && !owner.station_calibration_present() {
+            if owner.chip() == super::prepare::Chip::Rtl8821ae {
+                return Err(Error::Profile);
+            }
             let calibration = super::channel_power::Calibration::load_registered(&self.factory)
                 .map_err(|_| Error::Profile)?;
             owner.stage_station_calibration(calibration, &self.environment.domain()?)?;
@@ -1307,6 +1324,11 @@ impl NativeEnvironment {
 }
 impl Environment for NativeEnvironment {
     async fn prepare_bus_power(&self) -> Result<(), Error> {
+        if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
+            // `_rtl8821ae_enable_aspm_back_door` / ASPM are not composed for
+            // this profile: probe's ASPM-disabled link state is kept.
+            return Ok(());
+        }
         self.firmware()
             .native()
             .prepare_aspm(PCIE_ASPM.load(Ordering::Acquire))
@@ -1316,6 +1338,11 @@ impl Environment for NativeEnvironment {
     }
 
     fn allow_channel(&self, factory: &Factory, channel: u8) -> Result<(), Error> {
+        if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
+            // Retuning rebuilds through the 88EE power-up flow; the 8821AE
+            // owner keeps the channel it was provisioned on.
+            return Err(Error::Profile);
+        }
         let calibration = super::channel_power::Calibration::load_registered(factory)
             .map_err(|_| Error::Profile)?;
         calibration

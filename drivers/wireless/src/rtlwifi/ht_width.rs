@@ -79,12 +79,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.check_station_policy(environment)?;
-        let base = self
-            .station
-            .calibration
-            .as_ref()
-            .ok_or(Error::State)?
-            .clone();
+        let base = self.ee_base()?.ok_or(Error::Profile)?;
         let permission = self.permission.ok_or(Error::State)?;
         let gains = target.gains(&environment.domain()?, permission)?;
         if target.geometry().is_none() || width.is_some_and(|g| g.primary() != permission.channel())

@@ -40,6 +40,11 @@ impl
         channel: u8,
     ) -> Result<(), Error> {
         use super::super::{firmware_transport::Owner, prepare, regs::RTL_DEV_8188EE};
+        // The fresh-generation rebuild is the 88EE card-disable/enable flow;
+        // the 8821AE owner has no recovery rebuild yet and stays failed.
+        if self.firmware().device_id() != RTL_DEV_8188EE {
+            return Err(Error::State);
+        }
         self.power_down().await?;
         let old = self.firmware();
         let io = old

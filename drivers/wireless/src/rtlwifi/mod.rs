@@ -24,7 +24,8 @@
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
 //! 5. TX descriptor layout (BE queue) + RX descriptor layout.
-//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner.
+//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner,
+//!    and the RTL8821AE 2.4 GHz legacy station profile (no BT coexistence).
 //!    Other silicon profiles remain diagnostic.
 //!
 //! ## Deferred
@@ -89,6 +90,7 @@ pub mod regs;
 pub mod rf;
 pub mod rx;
 mod station_control;
+mod station_power;
 pub mod tx;
 pub mod vht;
 pub(crate) mod wmm;

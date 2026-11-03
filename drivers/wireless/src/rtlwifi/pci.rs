@@ -500,16 +500,21 @@ pub unsafe fn bring_up(
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<RtlwifiDevice, ProbeError> {
     let did = device.id.device;
+    // Retained native station profiles: RTL8188EE and (2.4 GHz, no BT
+    // coexistence) RTL8821AE. Every other matched chip stays diagnostic.
+    let retained = matches!(did, RTL_DEV_8188EE | RTL_DEV_8821AE);
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
             .map_err(|_| ProbeError::RegisterBarMapFailed)?;
         if registers.len < REG_EFUSE_ACCESS + 1
             || (device.id.device == RTL_DEV_8188EE && registers.len < 0x2000)
+            || (device.id.device == RTL_DEV_8821AE
+                && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
         {
             return Err(ProbeError::RegisterBarMapFailed);
         }
 
-        if did == RTL_DEV_8188EE {
+        if retained {
             // SAFETY: this exact exclusive function owns the validated BAR2;
             // its packet DMA is parked before any power/EFUSE access.
             let control = unsafe { PciIo::new(*device, *cap, registers) };
@@ -542,12 +547,12 @@ pub unsafe fn bring_up(
     })
     .map_err(|_| ProbeError::PciAccess)??;
     let mac = factory.mac;
-    let factory = (did == RTL_DEV_8188EE).then(|| Arc::new(factory));
+    let factory = retained.then(|| Arc::new(factory));
 
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
-    let firmware = if did == RTL_DEV_8188EE {
+    let firmware = if retained {
         // SAFETY: probe parked this exact function and exclusively owns BAR2.
         // PciIo rechecks current authority and parked BME at every access.
         let io = unsafe { PciIo::new(*device, *cap, registers) };

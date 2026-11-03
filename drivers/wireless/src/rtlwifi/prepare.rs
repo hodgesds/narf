@@ -64,7 +64,7 @@ const TX_BYTES: usize = 64;
 const RX_BYTES: usize = 32;
 // Linux rtlwifi/pci.c uses 9100-byte slots for the 7935-byte HT A-MSDU
 // body plus raw QoS/CCMP/FCS and native driver-info/shift prefixes.
-const RX_BUFFER: usize = 9100;
+pub(super) const RX_BUFFER: usize = 9100;
 // Exact RTL8188EE linked-ring map. The unused generic mac.rs/dma.rs
 // scaffolds carry the different RTL8192EE TXBD map and cannot authorize
 // this retained EE transport. Every queue has a distinct linked ring.
@@ -133,6 +133,8 @@ fn extent(memory: &impl Memory, needed: usize, alignment: u64) -> Result<u32, Er
     }
     Ok(base as u32)
 }
+/// `REG_MULTI_FUNC_CTRL` BIT(18): the combo board's Bluetooth function.
+pub const RTL8821AE_BT_FUNCTION: u32 = 1 << 18;
 pub struct Prepared<I: Io, M: Memory> {
     io: I,
     chip: Chip,
@@ -374,6 +376,40 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         super::rtl8821ae::channel::configure(&self.io, &permission).await?;
         self.rtl8821ae_power = Some(permission);
         self.phase = Phase::ChannelConfigured;
+        Ok(())
+    }
+    /// Continue the retained 8821AE owner from the admitted channel to the
+    /// operational MAC (ChannelConfigured → MacConfigured). `configure_rtl8821ae`
+    /// already wrote the station address (`HW_VAR_ETHER_ADDR`); the factory
+    /// identity must be the one the channel permission was minted for.
+    /// Boards with the Bluetooth function strapped on (`REG_MULTI_FUNC_CTRL`
+    /// BIT(18), Linux `_rtl8821ae_read_bt_coexist_info_from_hwpg`) are
+    /// refused: BT coexistence would take LPS/antenna control and is not
+    /// implemented. Packet DMA, CR gates and IRQs stay closed.
+    pub fn configure_rtl8821ae_mac(
+        &mut self,
+        factory: &super::efuse::Factory,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::ChannelConfigured || self.chip != Chip::Rtl8821ae {
+            return Err(Error::State);
+        }
+        let identity = super::radio::factory_identity(factory);
+        if self.rtl8821ae_identity != Some(identity)
+            || self.rtl8821ae_power.map(|p| p.identity()) != Some(identity)
+        {
+            return Err(Error::Power(super::channel_power::Error::Identity));
+        }
+        let strap = self
+            .io
+            .read32(super::rtl8821ae::headerfile::REG_MULTI_FUNC_CTRL)?;
+        if strap == u32::MAX {
+            return Err(Error::Access(AccessError::Gone));
+        }
+        if strap & RTL8821AE_BT_FUNCTION != 0 {
+            return Err(Error::State);
+        }
+        self.packet.local = Some(factory.mac);
+        self.phase = Phase::MacConfigured;
         Ok(())
     }
     /// `rtl8821ae_phy_iq_calibrate` on the admitted 20 MHz channel of this

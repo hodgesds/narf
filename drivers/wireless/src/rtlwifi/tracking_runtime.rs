@@ -14,12 +14,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<(), Error> {
-        let base = self
-            .station
-            .calibration
-            .as_ref()
-            .ok_or(Error::State)?
-            .clone();
+        // 88EE-only grant: the 8821AE profile installs no tracking.
+        let Some(base) = self.ee_base()? else {
+            return Ok(());
+        };
         let grant = environment.tracking(
             base.clone(),
             self.station.ht.clone(),

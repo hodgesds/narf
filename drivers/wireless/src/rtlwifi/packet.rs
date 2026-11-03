@@ -96,6 +96,8 @@ pub(super) struct State<M: Memory> {
     interrupts: bool,
     /// Firmware leisure power save (fw_current_inpsmode) is active.
     leisure: bool,
+    /// RTL8821AE mailbox and receive/beacon-control cache (`packet_ae`).
+    pub(super) ae: ae::State,
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
     /// rate fallback is only enabled while the firmware owns this mask
     /// and the caller holds a current `NEFB` grant.
@@ -122,6 +124,7 @@ impl<M: Memory> State<M> {
             antenna: None,
             interrupts: false,
             leisure: false,
+            ae: ae::State::new(),
             rate_mask: None,
             retired: Vec::new(),
         }
@@ -262,9 +265,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.local
     }
     pub(crate) fn transmit_ready(&self) -> bool {
-        self.phase == Phase::Running && self.packet.pending.is_none() && !self.packet.mailbox.failed
+        self.phase == Phase::Running
+            && self.packet.pending.is_none()
+            && !self.packet.mailbox.failed
+            && !self.packet.ae.mailbox.failed
+    }
+    fn rtl8821ae(&self) -> bool {
+        self.chip == super::Chip::Rtl8821ae
     }
     pub(crate) async fn awake_station(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_awake_station();
+        }
         if self.phase != Phase::MacConfigured {
             return Err(Error::State);
         }
@@ -280,6 +292,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         basic: u16,
         capability: u16,
     ) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_prepare_peer(peer, rates, basic, capability);
+        }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
         }
@@ -307,6 +322,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         admission: Option<&super::station::Admission>,
         policy: impl Fn(&Self) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_complete_peer(peer, aid, admission, policy).await;
+        }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
         }
@@ -459,7 +477,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         payload: [u8; 5],
         admission: Option<&super::station::Admission>,
     ) -> Result<(), Error> {
-        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+        if self.rtl8821ae()
+            || !self.transmit_ready()
+            || self.packet.leisure
+            || self.packet.local.is_none()
+        {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
@@ -482,6 +504,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// 8821AE `rtl8821ae_update_hal_rate_mask` (`H2C_8821AE_RA_MASK`, 7
+    /// bytes from [`super::super::rtl8821ae::h2c::rate_mask`]).
+    pub(crate) async fn install_rtl8821ae_rate_mask(
+        &mut self,
+        payload: [u8; 7],
+        admission: Option<&super::station::Admission>,
+    ) -> Result<(), Error> {
+        if !self.rtl8821ae() {
+            return Err(Error::State);
+        }
+        self.ae_install_rate_mask(payload, admission).await
+    }
     /// True while the firmware is in leisure power save.
     pub(crate) fn leisure(&self) -> bool {
         self.packet.leisure
@@ -489,6 +523,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl_lps_set_psmode(EAUTOPS)` → HW_VAR_FW_LPS_ACTION(true):
     /// only a running, idle owner may hand the radio to firmware LPS.
     pub(crate) async fn enter_leisure(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_enter_leisure().await;
+        }
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
@@ -501,6 +538,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl_lps_set_psmode(EACTIVE)` → HW_VAR_FW_LPS_ACTION(false):
     /// `_rtl88ee_fwlps_leave` RPWM ALL_ON then H2C FW_PS_ACTIVE_MODE.
     pub(crate) async fn leave_leisure(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_leave_leisure().await;
+        }
         if self.phase != Phase::Running || !self.packet.leisure {
             return Err(Error::State);
         }
@@ -528,11 +568,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .try_reserve(1)
             .map_err(|_| Error::Memory)?;
         self.phase = Phase::Failed;
-        if core::mem::take(&mut self.packet.leisure) {
-            self.packet.mailbox.awake(&self.io).await?;
+        if self.rtl8821ae() {
+            self.ae_disconnected().await?;
+        } else {
+            if core::mem::take(&mut self.packet.leisure) {
+                self.packet.mailbox.awake(&self.io).await?;
+            }
+            self.packet.mailbox.send(&self.io, 1, &[0]).await?;
+            super::super::station_control::disconnected(&self.io)?;
         }
-        self.packet.mailbox.send(&self.io, 1, &[0]).await?;
-        super::super::station_control::disconnected(&self.io)?;
         self.packet.rate_mask = None;
         self.packet.qos = false;
         self.packet.ht = false;
@@ -559,6 +603,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        if self.rtl8821ae() {
+            let report = self.ae_disconnected().await;
+            let stopped = self.stop_packets();
+            if stopped.is_ok() {
+                let _ = self.quiesce().await;
+            }
+            return report.and(stopped);
+        }
         // mac80211 disassociation leaves PS before the join report clears.
         let awake = if core::mem::take(&mut self.packet.leisure) {
             self.packet.mailbox.awake(&self.io).await
@@ -650,6 +702,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// factory IQ/LC calibration and opaque channel/power grant are required.
     /// Device interrupts remain masked; no native netdev is raised here.
     pub(crate) fn start_packets(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_start_packets();
+        }
         if self.phase != Phase::MacConfigured
             || self.packet.local.is_none()
             || self.permission.is_none()
@@ -693,6 +748,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// fallback keeps every mask clear.
     pub(crate) fn enable_interrupts(&mut self) -> Result<(), Error> {
         use super::super::irq::*;
+        if self.rtl8821ae() {
+            return self.ae_enable_interrupts();
+        }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);
         }
@@ -732,6 +790,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// the function vanished and is terminal.
     pub(crate) fn recognize_interrupts(&mut self) -> Result<super::super::irq::Recognized, Error> {
         use super::super::irq::*;
+        if self.rtl8821ae() {
+            return self.ae_recognize_interrupts();
+        }
         if self.phase != Phase::Running || !self.packet.interrupts {
             return Err(Error::State);
         }
@@ -812,6 +873,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         adaptive: bool,
         short_gi: bool,
     ) -> Result<u64, Error> {
+        if self.rtl8821ae() {
+            return self.ae_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
@@ -947,6 +1011,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(id)
     }
     fn delivery(&mut self) -> Result<Option<Delivery>, Error> {
+        if self.rtl8821ae() {
+            return self.ae_delivery();
+        }
         let Some(pending) = self.packet.pending.as_ref() else {
             return Ok(None);
         };
@@ -1019,6 +1086,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.poll_receive_step().map(|step| step.packet)
     }
     pub(crate) fn poll_receive_step(&mut self) -> Result<ReceiveStep, Error> {
+        if self.rtl8821ae() {
+            return self.ae_receive_step();
+        }
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -1208,6 +1278,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         result
     }
 }
+
+#[path = "packet_ae.rs"]
+mod ae;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "packet_tests.rs"]

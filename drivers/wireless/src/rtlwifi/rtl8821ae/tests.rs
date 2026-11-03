@@ -784,7 +784,7 @@ kernel_test_in!(
 
 // ── 2.4 GHz power-by-rate, limits, TX power index, envelope, channel ──────
 
-fn powered_logical(diff: u8, option: u8) -> [u8; 512] {
+pub(crate) fn powered_logical(diff: u8, option: u8) -> [u8; 512] {
     let mut map = provisioned_logical();
     map[0x10..0x16].copy_from_slice(&[0x20, 0x21, 0x22, 0x23, 0x24, 0x25]);
     map[0x16..0x1b].copy_from_slice(&[0x28, 0x29, 0x2a, 0x2b, 0x2c]);
@@ -879,7 +879,11 @@ kernel_test_in!(
     smoke_rtl8821ae_txpower_index_arithmetic
 );
 
-fn napc(factory: &crate::rtlwifi::efuse::Factory, channels: &[u8], output: i16) -> Vec<u8> {
+pub(crate) fn napc(
+    factory: &crate::rtlwifi::efuse::Factory,
+    channels: &[u8],
+    output: i16,
+) -> Vec<u8> {
     let row = 4 + 3 * 64 * 2;
     let total = 96 + channels.len() * row;
     let mut b = vec![0u8; total];

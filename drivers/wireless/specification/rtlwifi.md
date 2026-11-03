@@ -1482,7 +1482,7 @@ chain below is composed.
   `_rtl8821ae_llt_table_init` over an exact-width `Io::write16`.
   `prepare_native::prepare_rtl8821ae` composes firmware, the one-shot packet
   claim, DMA32 rings and LLT; EE radio qualification refuses the 8821AE
-  profile. Probe does not call it.
+  profile. Native provisioning reaches it (see the station owner below).
 
 - `mac` / `phy` — parked `rtl8821ae_hw_init` hardware steps, reached by
   `Prepared::configure_rtl8821ae` (Prepared → RadioConfigured; the EE
@@ -1599,11 +1599,84 @@ chain below is composed.
   `smoke_rtl8821ae_rcr_settles_after_mac_table_rewrite` (written,
   unexecuted).
 
-Remaining for the `rtl8821ae` chip row: calling IQK from the station owner
-on `LinkedInterval` (the owner does not exist yet); composing `h2c` and the
-interrupt profile into that owner (reserved-page upload, MSI vector
-binding); the native packet/station owner over the 8821AE TX/RX
-descriptors; and probe wiring. Tests in `rtl8821ae/tests.rs` are written and unexecuted.
+- Native station owner, 8821AE branch (`packet_ae.rs`,
+  `rtl8821ae/station.rs`, `rtl8821ae/rsvd_page.rs`, `station_power.rs`).
+  The retained `Prepared` packet/station owner dispatches on its chip
+  profile; every 88EE path is unchanged. Probe now retains `0x8821` like
+  `0x8179` (firmware owner, factory map, native `Device`, ASPM disabled,
+  BAR2 at least `MMIO_SIZE`), and `prepare_native::prepare_rtl8821ae`
+  (reached from `initialize_registered_on_channel`, i.e. native
+  provisioning) continues Prepared → RadioConfigured → ChannelConfigured
+  (permission from the signed `NAPC` envelope under current host policy) →
+  MacConfigured (`Prepared::configure_rtl8821ae_mac`) and stages the
+  envelope for the station. The MSI vector binding is the shared native
+  one (`interface::publish` → `arm_msi`), with the 8821AE interrupt profile.
+  - Admission refuses boards with the Bluetooth function strapped on
+    (`REG_MULTI_FUNC_CTRL` BIT(18)): Linux would run BT coexistence, which
+    takes LPS/antenna control; it is not implemented here.
+  - `start_packets`: proves `SECR = 0`, `TXPAUSE = 0` and clear IMRs, opens
+    bus mastering, then the `rtl8821ae_hw_init` DMA release (`REG_CR` word
+    `0x2ff`, `REG_PCIE_CTRL_REG + 1 = 0`) and `rtl8821ae_set_network_type
+    (STATION)` without a link (`_rtl8821ae_set_media_status`: BCN_CTRL dword
+    0, stop TX beacon, beacon sub-function, MSR INFRA, BCNTCFG+1 `0x66`;
+    then `set_check_bssid(false)`, which settles the MAC-table-rewritten
+    RCR). The RCR/BCN_CTRL software cache starts at `receive_config` /
+    `0x1d` (`_rtl8821ae_hw_configure`).
+  - TX: `rtl8821ae_tx_fill_desc` first+last segment, no early mode, through
+    `trx::TxDesc::fill`: descriptor dwords 0..=9 plus the buffer in dword 10,
+    dword 12's next pointer untouched; Linux queue selection and doorbells
+    as 88EE; forced `hw_rate` with fallback disabled, BW 20, HWSEQ for
+    non-QoS frames, MACID 0, RATE_ID the installed `ratr_index` for unicast
+    and `RATR_INX_WIRELESS_MC` otherwise (`_rtl_txrate_selectmode`, 8821AE
+    has no `RTL_SPEC_NEW_RATEID`). Only legacy rates are admitted (no HT,
+    A-MPDU, SGI, RTS/CTS protection or firmware fallback: those 88EE grants
+    are never minted over the 8821AE envelope). The host receipt checks
+    OWN clear with dwords 0/1/7, the buffer in dword 10, dword 11/13 zero
+    and the linked next pointer.
+  - RX: `rtl8821ae_rx_query_desc` fields; C2H report buffers (`rpt_sel`)
+    and anything outside the legacy 20 MHz profile (CRC/ICV, A-MPDU, HT/VHT
+    rate, BW ≠ 20) are consumed and dropped; payload at drvinfo + shift (the
+    PCI buffer holds no descriptor); FCS stripped; protected frames require
+    SWDEC (software CCMP). No 8821AE PHY-status PWDB is decoded.
+  - Join (`rtl_op_bss_info_changed`): authentication-time BSSID, RRSR
+    (`supp_rates & 0x15f`), `rtl8821ae_update_channel_access_setting`
+    (slot, SIFS `0x0a` for mode G else `0x0e`, R2T `0x0a`), the fixed
+    `rtl8821ae_set_qos` BK/VI/VO rows and the ACK preamble; at association
+    CAM reset, `HW_VAR_KEEP_ALIVE` (10), `set_network_type` with the link
+    (CBSSID on), then `HW_VAR_H2C_FW_JOINBSSRPT(CONNECT)`: `HW_VAR_AID`,
+    `_rtl8821ae_download_rsvd_page(false)` (CR+1 BIT0, BCN_CTRL BIT3/BIT4,
+    TXQ BIT6, up to five uploads of `rtl8821ae_set_fw_rsvdpagepkt(false,
+    false)` — the verbatim `reserved_page_packet_8821` pages 0..4 with the
+    Linux A1/A2/A3/AID substitutions, 1240 bytes, `rtl8821ae_tx_fill_cmddesc`
+    on BEACON descriptor 0 and BIT(4) polling — each followed by the
+    `H2C_8821AE_RSVDPAGE` location command, 20 × 10 us BCN_VALID polls) and
+    the MSRRPT connect report. A BCN_VALID timeout (Linux logs and goes on)
+    is terminal. The RA mask (`rtl8821ae_update_hal_rate_mask`, level
+    `DM_RATR_STA_INIT`, `update_bw`) follows; its `ratr_index` is kept for
+    data descriptors. LPS uses `_rtl8821ae_fwlps_{enter,leave}`.
+    Disassociation: leave LPS, `set_network_type` without link, MSRRPT
+    disconnect and zero BSSID (AID left as Linux does); rings stay live.
+  - DM watchdog (`refresh_station_rate_mask` slot, every
+    `RTL_WATCHDOG_TIME`, firmware awake): `iqk::LinkedInterval` and
+    `calibrate_rtl8821ae_iqk` inside the envelope's current authority. The
+    RA mask is not refreshed (no 8821AE PWDB source).
+  - Station power base: the station re-derives the channel grant from the
+    `NAPC` envelope (`station_power::Base`/`Grant`) at every publication and
+    wait, as it does from `NEPC` for 88EE.
+  - Not composed for 8821AE: ASPM (kept disabled), channel retune and the
+    fresh-generation recovery rebuild (both refused; the owner keeps its
+    provisioned channel and a failed owner stays failed), WMM EDCA from the
+    AP (Linux 8821AE ignores it too), HT/VHT, 5 GHz, BT coexistence.
+  - Fixed a shared native allocation: RX slots are now allocated with the
+    9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
+  Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,
+  `smoke_rtl8821ae_native_join_rsvd_page_h2c_and_leave`,
+  `smoke_rtl8821ae_bt_function_board_refused_at_admission`
+  (`packet_ae_tests.rs`; written, unexecuted).
+
+Tests in `rtl8821ae/tests.rs` and `packet_ae_tests.rs` are written and
+unexecuted. Physical-board qualification (signed `NAPC` envelope
+measurements, silicon association) remains external.
 
 ## 4. Invariants
 

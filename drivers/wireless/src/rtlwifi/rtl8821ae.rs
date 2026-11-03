@@ -10,8 +10,10 @@
 //!
 //! ## Retained-runtime foundation (`rtl8821ae/`)
 //!
-//! Exact Linux-derived pieces the retained RTL8821AE owner is built from;
-//! none of them is wired to probe or advertises a capability by itself:
+//! Exact Linux-derived pieces the retained RTL8821AE owner is built from.
+//! Probe retains `0x8821` and native provisioning composes them into the
+//! 2.4 GHz legacy station owner (`prepare_native::prepare_rtl8821ae`,
+//! `packet_ae.rs`); boards with the BT function strapped on are refused:
 //!
 //! - [`pwrseq`] — PCI rows of every `rtl8821A_*_flow` (`pwrseq.{c,h}`).
 //! - [`tables`] / [`headerfile`] — MAC/BB/AGC/RF-A/power-by-rate arrays and
@@ -35,6 +37,10 @@
 //!   commands, LPS RPWM and the PCI interrupt profile.
 //! - [`iqk`] — path-A IQ calibration (`_rtl8821ae_phy_iq_calibrate`) and
 //!   the DM linked-interval trigger (`rtl8821ae_dm_iq_calibrate`).
+//! - [`station`] / [`rsvd_page`] — station MAC registers
+//!   (`rtl8821ae_set_network_type`, BSSID/RRSR/slot/SIFS/AID, fixed
+//!   `set_qos` rows) and the `rtl8821ae_set_fw_rsvdpagepkt` page bodies used
+//!   by the native packet owner (`rtlwifi/packet_ae.rs`).
 //! - [`c2h`] — C2H packet parsing (`rtl_c2h_content_parsing`): TX reports
 //!   (`rtl_tx_report_handler` V1) and RA reports
 //!   (`rtl8821ae_c2h_ra_report_handler`).
@@ -53,12 +59,14 @@ pub mod mac;
 pub mod phy;
 pub mod power_limit;
 pub mod pwrseq;
+pub mod rsvd_page;
+pub mod station;
 pub(crate) mod tables;
 pub mod trx;
 pub mod txpower;
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod tests;
+pub(crate) mod tests;
 
 /// PCI device ID.
 pub const DEV_ID: u16 = super::regs::RTL_DEV_8821AE;

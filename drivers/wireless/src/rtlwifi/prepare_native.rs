@@ -138,7 +138,9 @@ pub(super) fn allocate(owner: Arc<Owner<PciIo>>, depth: usize) -> Result<NativeP
         .map_err(|_| Error::Memory)?;
     for bytes in core::iter::repeat_n(depth * 64, 7)
         .chain(core::iter::once(depth * 32))
-        .chain(core::iter::repeat_n(4096, depth))
+        // Each RX slot must hold Linux's 9100-byte rxbuffersize; the shared
+        // builder rejects a shorter block (`prepare::RX_BUFFER`).
+        .chain(core::iter::repeat_n(super::prepare::RX_BUFFER, depth))
     {
         blocks.push(Coherent(port.with_io(|io| io.allocate_dma(bytes))?));
     }
@@ -153,31 +155,78 @@ pub(super) type Retained = narf_lib::mutex::Mutex<Option<NativePrepared>>;
 /// cancellation releases the async guard while retaining the terminal owner.
 pub(super) use super::prepare::retain_and_prepare as prepare_retained;
 
-/// RTL8821AE retained continuation up to `Prepared`: registry firmware
-/// (`rtl8821aefw_29.bin`, then `rtl8821aefw.bin`), the one-shot packet claim,
-/// DMA32 rings, the exact 8821AE LLT and the parked MAC/BB/RF hardware init.
-/// Channel/power/station admission are not reachable for this profile yet;
-/// probe does not call this.
+/// RTL8821AE retained continuation to an admitted 2.4 GHz station owner:
+/// registry firmware (`rtl8821aefw_29.bin`, then `rtl8821aefw.bin`), the
+/// one-shot packet claim, DMA32 rings, the exact 8821AE LLT, the parked
+/// MAC/BB/RF hardware init, then the channel from the signed per-board
+/// `NAPC` envelope under current host policy, the operational MAC (boards
+/// with the BT function strapped on are refused) and the staged envelope
+/// the station re-proves at every publication. Packet DMA, CR gates and
+/// IRQs stay closed until the station service starts.
 pub(super) async fn prepare_rtl8821ae(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
     factory: Arc<super::efuse::Factory>,
+    channel: u8,
 ) -> Result<(), Error> {
-    if firmware.device_id() != super::regs::RTL_DEV_8821AE
-        || firmware.status().stage != super::firmware_transport::Stage::Detected
-    {
+    if !(1..=11).contains(&channel) || firmware.device_id() != super::regs::RTL_DEV_8821AE {
         return Err(Error::State);
     }
-    firmware.initialize_registered().await?;
-    let prepared = allocate(firmware, 128)?;
-    prepare_retained(&retained, prepared).await?;
+    if firmware.status().stage == super::firmware_transport::Stage::Detected {
+        firmware.initialize_registered().await?;
+        let prepared = allocate(firmware, 128)?;
+        prepare_retained(&retained, prepared).await?;
+        let mut storage = retained.lock().await;
+        storage
+            .as_mut()
+            .ok_or(Error::State)?
+            .configure_rtl8821ae(&factory)
+            .await?;
+    } else if firmware.status().stage != super::firmware_transport::Stage::Ready {
+        return Err(Error::State);
+    }
     let mut storage = retained.lock().await;
-    storage
-        .as_mut()
-        .ok_or(Error::State)?
-        .configure_rtl8821ae(&factory)
-        .await
-        .map(|_| ())
+    let prepared = storage.as_mut().ok_or(Error::State)?;
+    if prepared.phase() == super::prepare::Phase::MacConfigured && prepared.station_transmit_ready()
+    {
+        return Ok(());
+    }
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+    admit_rtl8821ae(prepared, &factory, &domain, channel).await
+}
+
+/// RadioConfigured/ChannelConfigured → MacConfigured with a staged `NAPC`
+/// envelope; a MacConfigured owner without one only stages it. Shared by
+/// native provisioning and the interface's readiness path.
+pub(super) async fn admit_rtl8821ae<I: super::firmware_transport::Io, M: Memory>(
+    prepared: &mut Prepared<I, M>,
+    factory: &super::efuse::Factory,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+) -> Result<(), Error> {
+    use super::prepare::Phase;
+    let calibration =
+        super::rtl8821ae::envelope::Calibration::load_registered(factory).map_err(Error::Power)?;
+    if matches!(
+        prepared.phase(),
+        Phase::RadioConfigured | Phase::ChannelConfigured
+    ) {
+        let permission = calibration
+            .permission(domain, channel)
+            .map_err(Error::Power)?;
+        prepared.configure_rtl8821ae_channel(permission).await?;
+        prepared.configure_rtl8821ae_mac(factory)?;
+    }
+    if prepared.phase() != Phase::MacConfigured {
+        return Err(Error::State);
+    }
+    if prepared.station_calibration_present() {
+        return Ok(());
+    }
+    prepared
+        .stage_rtl8821ae_calibration(calibration, domain)
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))
 }
 pub(super) async fn initialize_registered(
     firmware: Arc<Owner<PciIo>>,
@@ -194,6 +243,9 @@ pub(super) async fn initialize_registered_on_channel(
 ) -> Result<(), Error> {
     if !(1..=11).contains(&channel) {
         return Err(Error::State);
+    }
+    if firmware.device_id() == super::regs::RTL_DEV_8821AE {
+        return prepare_rtl8821ae(firmware, retained, factory, channel).await;
     }
     if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);

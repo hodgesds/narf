@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! RTL8821AE branch of the retained native packet/station owner.
+//!
+//! The 88EE owner in `packet.rs` dispatches here for the 8821AE profile; the
+//! linked rings, one-outstanding-frame rule, host receipts, stop and
+//! quiescence are shared. Chip-specific: 64-byte `rtl8821ae/trx.h` TX ring
+//! entries (descriptor dwords 0..=9, buffer dword 10, next dword 12), the
+//! 8821AE RX status fields, `rtl8821ae_hw_init`'s DMA release (`REG_CR` word
+//! `0x2ff`, `REG_PCIE_CTRL_REG + 1 = 0`), the `rtl8821ae/fw.c` H2C mailbox
+//! and LPS commands, `_rtl8821ae_download_rsvd_page` /
+//! `rtl8821ae_set_fw_rsvdpagepkt`, `rtl8821ae_set_network_type` and the
+//! 8821AE interrupt profile.
+//!
+//! Station profile: 2.4 GHz legacy (CCK/OFDM) 20 MHz, MACID 0, software
+//! CCMP (`SECR = 0`), forced driver rate with fallback disabled. No HT,
+//! A-MPDU, short GI, protection or firmware rate fallback is admitted on
+//! this profile; those 88EE grants are never minted for it.
+use super::super::super::rtl8821ae::{h2c, mac, station as hw, trx};
+use super::{
+    extent, queue, Delivery, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, OWN,
+    RX_BASE, RX_BUFFER, RX_BYTES, TX_BASES, TX_BYTES,
+};
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
+
+/// `RATR_INX_WIRELESS_MC`: descriptor RATE_ID for frames without a station
+/// mask (`_rtl_txrate_selectmode`; 8821AE has no `RTL_SPEC_NEW_RATEID`).
+const RATR_INX_WIRELESS_MC: u8 = 7;
+/// `_rtl8821ae_download_rsvd_page`: up to five uploads, 20 × 10 us polls.
+const RSVD_ATTEMPTS: usize = 5;
+const BCN_VALID_POLLS: usize = 20;
+/// `_rtl8821ae_hw_configure`: `reg_bcn_ctrl_val = 0x1d`.
+const BCN_CTRL_AFTER_INIT: u8 = 0x1d;
+
+pub(in super::super) struct State {
+    pub(super) mailbox: h2c::Mailbox,
+    pub(super) receive: mac::ReceiveConfig,
+}
+impl State {
+    pub(super) fn new() -> Self {
+        Self {
+            mailbox: h2c::Mailbox::default(),
+            receive: mac::ReceiveConfig {
+                rcr: mac::RCR,
+                bcn_ctrl: BCN_CTRL_AFTER_INIT,
+            },
+        }
+    }
+}
+
+fn closed(admission: Option<&super::super::station::Admission>) -> bool {
+    admission.is_some_and(|control| control.closed.load(Ordering::Acquire))
+}
+
+/// `rtl8821ae_update_hal_rate_mask` `ratr_index` (stored as
+/// `sta_entry->ratr_index`) for an H2C payload built by
+/// [`h2c::rate_mask`]: the payload's `arfr_id` identifies the mode.
+fn ratr_index(payload: &[u8; 7]) -> Option<u8> {
+    match payload[1] & 0x7f {
+        8 => Some(6), // RATR_INX_WIRELESS_B
+        6 => Some(4), // RATR_INX_WIRELESS_GB
+        _ => None,    // HT is not admitted on this profile.
+    }
+}
+
+impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
+    fn ae_validate_rings(&self) -> Result<(), Error> {
+        for (queue, ring) in self.tx.iter().enumerate() {
+            ring.sync();
+            let base = extent(ring, self.depth * TX_BYTES, 256)?;
+            if self.io.read32(TX_BASES[queue])? != base {
+                return Err(Error::Readback);
+            }
+            for slot in 0..self.depth {
+                let at = slot * TX_BYTES;
+                if ring.read32(at)? & OWN != 0
+                    || ring.read32(at + 40)? != 0
+                    || ring.read32(at + 44)? != 0
+                    || ring.read32(at + 48)? != base + (((slot + 1) % self.depth) * TX_BYTES) as u32
+                    || ring.read32(at + 52)? != 0
+                {
+                    return Err(Error::Descriptor);
+                }
+            }
+        }
+        // RX ring: shared 32-byte layout, buffer at dword 6 (as 88EE).
+        let receive = self.receive.as_ref().ok_or(Error::State)?;
+        receive.sync();
+        if self.io.read32(RX_BASE)? != extent(receive, self.depth * RX_BYTES, 256)? {
+            return Err(Error::Readback);
+        }
+        for (slot, buffer) in self.buffers.iter().enumerate() {
+            let end = if slot + 1 == self.depth { 1 << 30 } else { 0 };
+            if receive.read32(slot * RX_BYTES)? != RX_BUFFER as u32 | OWN | end
+                || receive.read32(slot * RX_BYTES + 24)? != extent(buffer, RX_BUFFER, 4)?
+                || receive.read32(slot * RX_BYTES + 28)? != 0
+            {
+                return Err(Error::Descriptor);
+            }
+        }
+        Ok(())
+    }
+
+    /// `rtl8821ae_hw_init` tail on the retained owner: software crypto
+    /// (`SECR` 0), queues unpaused and IRQ masks clear are proven, bus
+    /// mastering is opened, then `REG_CR` word `0x2ff` and
+    /// `REG_PCIE_CTRL_REG + 1 = 0`. `rtl_op_add_interface` then runs
+    /// `rtl8821ae_set_network_type(STATION)` without a link, which is the
+    /// first `HW_VAR_RCR` write and settles the MAC-table-rewritten RCR.
+    pub(super) fn ae_start_packets(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::MacConfigured
+            || self.packet.local.is_none()
+            || self.rtl8821ae_power.is_none()
+        {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.authority(false, || self.ae_validate_rings())?;
+        if self.io.read8(0x680)? != 0
+            || self.io.read8(0x522)? != 0
+            || self.io.read32(0xb0)? != 0
+            || self.io.read32(0xb8)? != 0
+        {
+            return Err(Error::Readback);
+        }
+        self.io.master(true)?;
+        self.io.write16(0x100, mac::CR_RUNNING)?;
+        self.io.write8(0x301, 0)?;
+        if self.io.read8(0x100)? != 0xff
+            || self.io.read8(0x101)? != 0x02
+            || self.io.read8(0x301)? != 0
+        {
+            return Err(Error::Readback);
+        }
+        hw::network_type_station(&self.io, &mut self.packet.ae.receive, false)?;
+        if self.io.read32(mac::REG_RCR)? != mac::RCR & !(mac::RCR_CBSSID_DATA | mac::RCR_CBSSID_BCN)
+        {
+            return Err(Error::Readback);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// Linux `rtl8821ae_hw_init` leaves `fw_current_inpsmode = false` and
+    /// `fw_ps_state = FW_PS_STATE_ALL_ON_8821AE`; nothing is sent. Only a
+    /// powered MAC (`REG_CR != 0xEA`) is accepted.
+    pub(super) fn ae_awake_station(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::MacConfigured {
+            return Err(Error::State);
+        }
+        if self.io.read8(0x100)? == 0xea {
+            return Err(Error::RadioOff);
+        }
+        Ok(())
+    }
+
+    /// Authentication-time `BSS_CHANGED_BSSID` / `BASIC_RATES` / ERP and
+    /// `set_channel_access`: BSSID, RRSR, slot, SIFS, `set_qos` rows and
+    /// preamble.
+    pub(super) fn ae_prepare_peer(
+        &mut self,
+        peer: [u8; 6],
+        rates: u16,
+        basic: u16,
+        capability: u16,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        if peer == [0; 6] || peer[0] & 1 != 0 {
+            return Err(Error::Packet);
+        }
+        self.phase = Phase::Failed;
+        hw::set_bssid(&self.io, peer)?;
+        hw::configure_rates(&self.io, rates, basic, capability)?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` for 8821AE: CAM reset,
+    /// `HW_VAR_KEEP_ALIVE` (10), `rtl8821ae_set_network_type` with the link
+    /// (CBSSID on), then `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)`:
+    /// `HW_VAR_AID`, `_rtl8821ae_download_rsvd_page(false)` and the MSRRPT
+    /// connect report. The firmware RA mask follows separately
+    /// (`install_rate_mask`). Linux logs and continues when BCN_VALID never
+    /// sets; here that is a terminal `CommandTimeout`.
+    pub(super) async fn ae_complete_peer(
+        &mut self,
+        peer: [u8; 6],
+        aid: u16,
+        admission: Option<&super::super::station::Admission>,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        let pages = hw::reserved_pages(self.local().ok_or(Error::State)?, peer, aid)?;
+        let mut buffer = self.io.allocate_packet(pages.len())?;
+        let address = extent(&buffer, pages.len(), 4)?;
+        let end = u64::from(address) + pages.len() as u64;
+        if self
+            .tx
+            .iter()
+            .chain(self.receive.iter())
+            .chain(self.buffers.iter())
+            .any(|other| {
+                u64::from(address) < other.address() + other.len() as u64 && other.address() < end
+            })
+        {
+            return Err(Error::Address);
+        }
+        self.io.authority(true, || {
+            buffer.write_bytes(0, &pages)?;
+            buffer.sync();
+            Ok(())
+        })?;
+        self.packet.reserved = Some(buffer);
+        self.phase = Phase::Failed;
+        // core.c: rtl_cam_reset_all_entry before the link is marked.
+        self.io.write32(hw::REG_CAMCMD, 0xc000_0000)?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.packet
+            .ae
+            .mailbox
+            .fill(&self.io, h2c::H2C_KEEP_ALIVE_CTRL, &[0xff, 10])
+            .await?;
+        hw::network_type_station(&self.io, &mut self.packet.ae.receive, true)?;
+        hw::set_aid(&self.io, aid)?;
+        self.ae_download_rsvd_page(address, pages.len() as u16, admission, &policy)
+            .await?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        policy(self)?;
+        self.packet
+            .ae
+            .mailbox
+            .fill(&self.io, h2c::H2C_MSRRPT, &h2c::media_status(true))
+            .await?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `_rtl8821ae_download_rsvd_page(hw, false)` with
+    /// `rtl8821ae_set_fw_rsvdpagepkt(hw, false, false)` /
+    /// `rtl_cmd_send_packet` on BEACON_QUEUE descriptor 0
+    /// (`rtl8821ae_tx_fill_cmddesc`, `rtl8821ae_tx_polling` BIT(4)) and the
+    /// `H2C_8821AE_RSVDPAGE` location command after every upload.
+    async fn ae_download_rsvd_page(
+        &mut self,
+        address: u32,
+        length: u16,
+        admission: Option<&super::super::station::Admission>,
+        policy: &impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let cr = self.io.read8(0x101)?;
+        self.io.write8(0x101, cr | 1)?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ae.receive.bcn_ctrl, 0, 1 << 3)?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ae.receive.bcn_ctrl, 1 << 4, 0)?;
+        let txq = self.io.read8(hw::REG_FWHW_TXQ_CTRL + 2)?;
+        self.io.write8(hw::REG_FWHW_TXQ_CTRL + 2, txq & !(1 << 6))?;
+        let descriptor = hw::command_descriptor(length, address);
+        // A rejoin reuses the descriptor whose earlier upload BCN_VALID
+        // proved; within one download Linux overwrites descriptor 0 too.
+        let mut proven = !self.packet.retired.is_empty();
+        let mut valid = false;
+        for _ in 0..RSVD_ATTEMPTS {
+            let status = self.io.read8(hw::REG_TDECTRL + 2)?;
+            if status == 0xff {
+                return Err(Error::Access(super::super::AccessError::Gone));
+            }
+            self.io.write8(hw::REG_TDECTRL + 2, status | 1)?;
+            {
+                let _publication = admission.map(|control| control.publication.lock());
+                if closed(admission) {
+                    return Err(Error::State);
+                }
+                policy(self)?;
+                let ring = &mut self.tx[0];
+                self.io.authority(true, || {
+                    ring.sync();
+                    if ring.read32(0)? & OWN != 0 && !proven {
+                        return Err(Error::Descriptor);
+                    }
+                    for (word, value) in descriptor.into_iter().enumerate() {
+                        ring.write32(word * 4, value)?;
+                    }
+                    ring.sync();
+                    ring.write32(0, descriptor[0] | OWN)?;
+                    ring.sync();
+                    Ok(())
+                })?;
+                self.io.kick(1 << 4)?;
+            }
+            proven = true;
+            self.packet
+                .ae
+                .mailbox
+                .fill(
+                    &self.io,
+                    h2c::H2C_RSVDPAGE,
+                    &h2c::rsvdpage_location(
+                        hw::PSPOLL_PG,
+                        hw::NULL_PG,
+                        hw::QOSNULL_PG,
+                        hw::BT_QOSNULL_PG,
+                    ),
+                )
+                .await?;
+            for poll in 0..=BCN_VALID_POLLS {
+                if poll != 0 {
+                    self.io.delay_us(10).await;
+                }
+                let status = self.io.read8(hw::REG_TDECTRL + 2)?;
+                if status == 0xff {
+                    return Err(Error::Access(super::super::AccessError::Gone));
+                }
+                if status & 1 != 0 {
+                    valid = true;
+                    break;
+                }
+            }
+            if valid {
+                break;
+            }
+        }
+        if valid {
+            self.io.write8(hw::REG_TDECTRL + 2, 1)?;
+        }
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ae.receive.bcn_ctrl, 1 << 3, 0)?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ae.receive.bcn_ctrl, 0, 1 << 4)?;
+        if txq & (1 << 6) != 0 {
+            self.io.write8(hw::REG_FWHW_TXQ_CTRL + 2, txq)?;
+        }
+        let cr = self.io.read8(0x101)?;
+        self.io.write8(0x101, cr & !1)?;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::CommandTimeout)
+        }
+    }
+
+    /// `rtl8821ae_update_hal_rate_mask`: `H2C_8821AE_RA_MASK` then
+    /// `_rtl8821ae_set_bcn_ctrl_reg(BIT(3), 0)`; `sta_entry->ratr_index`
+    /// is retained for the data descriptors' RATE_ID.
+    pub(super) async fn ae_install_rate_mask(
+        &mut self,
+        payload: [u8; 7],
+        admission: Option<&super::super::station::Admission>,
+    ) -> Result<(), Error> {
+        let index = ratr_index(&payload).ok_or(Error::Packet)?;
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.packet
+            .ae
+            .mailbox
+            .fill(&self.io, h2c::H2C_RA_MASK, &payload)
+            .await?;
+        h2c::set_bcn_ctrl(&self.io, &mut self.packet.ae.receive.bcn_ctrl, 1 << 3, 0)?;
+        self.packet.rate_mask = Some(index);
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `HW_VAR_FW_LPS_ACTION(true)` → `_rtl8821ae_fwlps_enter`.
+    pub(super) async fn ae_enter_leisure(&mut self) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        h2c::fwlps_enter(&self.io, &mut self.packet.ae.mailbox).await?;
+        self.packet.leisure = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `HW_VAR_FW_LPS_ACTION(false)` → `_rtl8821ae_fwlps_leave`.
+    pub(super) async fn ae_leave_leisure(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || !self.packet.leisure {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        h2c::fwlps_leave(&self.io, &mut self.packet.ae.mailbox).await?;
+        self.packet.leisure = false;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// Disassociation registers and reports: leave LPS, then
+    /// `rtl8821ae_set_network_type(STATION)` without a link (CBSSID off),
+    /// `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)` (MSRRPT only) and the
+    /// mac80211 `BSS_CHANGED_BSSID` zero BSSID. Linux leaves AID alone.
+    pub(super) async fn ae_disconnected(&mut self) -> Result<(), Error> {
+        if core::mem::take(&mut self.packet.leisure) {
+            h2c::fwlps_leave(&self.io, &mut self.packet.ae.mailbox).await?;
+        }
+        hw::network_type_station(&self.io, &mut self.packet.ae.receive, false)?;
+        self.packet
+            .ae
+            .mailbox
+            .fill(&self.io, h2c::H2C_MSRRPT, &h2c::media_status(false))
+            .await?;
+        hw::set_bssid(&self.io, [0; 6])
+    }
+
+    /// `rtl8821ae_enable_interrupt` (with `int_clear`) on a running owner.
+    pub(super) fn ae_enable_interrupts(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.authority(true, || Ok(()))?;
+        self.packet.interrupts = true;
+        h2c::enable_interrupt(&self.io)?;
+        if self.io.read32(h2c::REG_HIMR)? != h2c::IRQ_MASK0
+            || self.io.read32(h2c::REG_HIMRE)? != h2c::IRQ_MASK1
+            || self.io.read32(h2c::REG_HSIMR)? != h2c::SYS_IRQ_MASK
+        {
+            return Err(Error::Readback);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// One `_rtl_pci_interrupt` recognition pass for the 8821AE profile.
+    pub(super) fn ae_recognize_interrupts(
+        &mut self,
+    ) -> Result<super::super::super::irq::Recognized, Error> {
+        if self.phase != Phase::Running || !self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let (inta, intb) = h2c::service_interrupt(&self.io)?;
+        self.phase = Phase::Running;
+        Ok(super::super::super::irq::Recognized { inta, intb })
+    }
+
+    /// `rtl8821ae_tx_fill_desc` for one legacy first+last MPDU (no early
+    /// mode): forced `hw_rate`, fallback disabled, BW 20, no SGI/AGG/RTS,
+    /// no hardware key, HWSEQ for non-QoS frames, MACID 0 and RATE_ID the
+    /// installed `ratr_index` for unicast (MC otherwise).
+    pub(super) fn ae_submit(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        aggregate: Option<(u8, bool)>,
+        adaptive: bool,
+        short_gi: bool,
+    ) -> Result<u64, Error> {
+        if self.phase != Phase::Running || self.packet.pending.is_some() {
+            return Err(Error::State);
+        }
+        if aggregate.is_some() || adaptive || short_gi || rate > trx::DESC_RATE54M {
+            return Err(Error::Packet);
+        }
+        let (queue, poll, selector) = queue(
+            frame,
+            self.packet.local.ok_or(Error::State)?,
+            self.packet.qos,
+        )?;
+        let id = self.packet.serial.checked_add(1).ok_or(Error::State)?;
+        let mut buffer = self.io.allocate_packet(frame.len())?;
+        let address = extent(&buffer, frame.len(), 4)?;
+        let end = u64::from(address) + frame.len() as u64;
+        if self
+            .tx
+            .iter()
+            .chain(self.receive.iter())
+            .chain(self.buffers.iter())
+            .any(|other| {
+                u64::from(address) < other.address() + other.len() as u64 && other.address() < end
+            })
+        {
+            return Err(Error::Address);
+        }
+        let destination = if (2..=5).contains(&queue) {
+            &frame[16..22]
+        } else {
+            &frame[4..10]
+        };
+        let multicast = destination[0] & 1 != 0;
+        let params = trx::TxParams {
+            pkt_size: frame.len() as u16,
+            queue_sel: selector,
+            macid: 0,
+            rate_id: match self.packet.rate_mask {
+                Some(index) if !multicast => index,
+                _ => RATR_INX_WIRELESS_MC,
+            },
+            hw_rate: rate,
+            use_driver_rate: true,
+            disable_fallback: true,
+            short: false,
+            data_bw: 0,
+            sub_carrier: 0,
+            ampdu: false,
+            ampdu_density: 0,
+            sec_type: 0,
+            qos_data: frame[0] == 0x88,
+            seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
+            multicast,
+            tx_report: None,
+            buffer_len: frame.len() as u16,
+            buffer_addr: address,
+        };
+        let descriptor = trx::TxDesc::fill(&params);
+        let mut prefix = [0u32; 10];
+        prefix.copy_from_slice(&descriptor.dw[..10]);
+        let slot = self.packet.next[queue];
+        self.io.authority(true, || {
+            buffer.write_bytes(0, frame)?;
+            buffer.sync();
+            Ok(())
+        })?;
+        self.packet.pending = Some(Pending {
+            buffer,
+            id,
+            queue,
+            slot,
+            length: frame.len(),
+            prefix,
+        });
+        self.packet.serial = id;
+        self.phase = Phase::Failed;
+        let ring = &mut self.tx[queue];
+        self.io.authority(true, || {
+            ring.sync();
+            let offset = slot * TX_BYTES;
+            if ring.read32(offset)? & OWN != 0 {
+                return Err(Error::Descriptor);
+            }
+            // clear_pci_tx_desc_content covers the 40-byte descriptor; the
+            // buffer address is dword 10 and dword 12's next pointer stays.
+            for (word, value) in descriptor.dw[..11].iter().copied().enumerate() {
+                ring.write32(offset + word * 4, value)?;
+            }
+            ring.sync();
+            ring.write32(offset, descriptor.dw[0] | OWN)?;
+            ring.sync();
+            Ok(())
+        })?;
+        self.io.kick(poll)?;
+        self.phase = Phase::Running;
+        Ok(id)
+    }
+
+    /// Host receipt of the pending 8821AE descriptor: OWN clear with the
+    /// stable size/queue/buffer words and the linked next pointer intact.
+    pub(super) fn ae_delivery(&mut self) -> Result<Option<Delivery>, Error> {
+        let Some(pending) = self.packet.pending.as_ref() else {
+            return Ok(None);
+        };
+        let ring = &self.tx[pending.queue];
+        let address = extent(&pending.buffer, pending.length, 4)?;
+        let delivery = self.io.authority(true, || {
+            ring.sync();
+            let offset = pending.slot * TX_BYTES;
+            if ring.read32(offset)? & OWN != 0 {
+                return Ok(None);
+            }
+            for word in [0, 1, 7] {
+                if ring.read32(offset + word * 4)? != pending.prefix[word] {
+                    return Err(Error::Descriptor);
+                }
+            }
+            if ring.read32(offset + 40)? != address
+                || ring.read32(offset + 44)? != 0
+                || ring.read32(offset + 48)?
+                    != ring.address() as u32 + (((pending.slot + 1) % self.depth) * TX_BYTES) as u32
+                || ring.read32(offset + 52)? != 0
+            {
+                return Err(Error::Descriptor);
+            }
+            pending.buffer.sync();
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(pending.length)
+                .map_err(|_| Error::Memory)?;
+            bytes.resize(pending.length, 0);
+            pending.buffer.read_bytes(0, &mut bytes)?;
+            Ok(Some(Delivery {
+                id: pending.id,
+                bytes,
+            }))
+        })?;
+        if delivery.is_some() {
+            let queue = pending.queue;
+            self.packet.next[queue] = (pending.slot + 1) % self.depth;
+            self.packet.pending = None;
+        }
+        Ok(delivery)
+    }
+
+    /// One `_rtl_pci_rx_interrupt` step with `rtl8821ae_rx_query_desc`
+    /// fields. C2H report buffers (`rpt_sel`) and frames outside the legacy
+    /// 20 MHz profile are consumed and dropped. No 8821AE PHY-status PWDB is
+    /// decoded (`pwdb` stays `None`).
+    pub(super) fn ae_receive_step(&mut self) -> Result<ReceiveStep, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let slot = self.packet.receive;
+        let ring = self.receive.as_mut().ok_or(Error::State)?;
+        let buffer = &self.buffers[slot];
+        let channel = self.rtl8821ae_power.ok_or(Error::State)?.channel();
+        let (consumed, packet) = self.io.authority(true, || {
+            ring.sync();
+            let offset = slot * RX_BYTES;
+            let mut dw = [0u32; 8];
+            for (word, value) in dw.iter_mut().enumerate() {
+                *value = ring.read32(offset + word * 4)?;
+            }
+            let Some(status) = trx::RxStatus::parse(&dw) else {
+                return Ok((false, None));
+            };
+            let end = if slot + 1 == self.depth { 1 << 30 } else { 0 };
+            if dw[0] & (1 << 30) != end || dw[6] != extent(buffer, RX_BUFFER, 4)? || dw[7] != 0 {
+                return Err(Error::Descriptor);
+            }
+            let length = usize::from(status.length);
+            let start = status.drvinfo_size + status.shift;
+            if !status.c2h
+                && (length < 4 || start.checked_add(length).is_none_or(|n| n > RX_BUFFER))
+            {
+                return Err(Error::Descriptor);
+            }
+            let mut packet = None;
+            if !status.c2h
+                && !status.hw_error()
+                && !status.ampdu
+                && status.rate <= trx::DESC_RATE54M
+                && status.bw == 0
+                && (24..=2304 + 4).contains(&length)
+            {
+                buffer.sync();
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(length - 4)
+                    .map_err(|_| Error::Memory)?;
+                bytes.resize(length - 4, 0);
+                buffer.read_bytes(start, &mut bytes)?;
+                let fc = u16::from_le_bytes([bytes[0], bytes[1]]);
+                // Protected frames keep IV/ciphertext/MIC: SECR 0 means the
+                // hardware never decrypts (SWDEC set).
+                if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted)
+                {
+                    packet = Some(Mpdu {
+                        bytes,
+                        channel,
+                        ht: false,
+                        short_gi: false,
+                        width40: false,
+                        aggregated: false,
+                        pwdb: None,
+                        antenna_mux: None,
+                    });
+                }
+            }
+            for word in 1..6 {
+                ring.write32(offset + word * 4, 0)?;
+            }
+            buffer.sync();
+            ring.sync();
+            ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
+            ring.sync();
+            Ok((true, packet))
+        })?;
+        if consumed {
+            self.packet.receive = (slot + 1) % self.depth;
+        }
+        self.phase = Phase::Running;
+        Ok(ReceiveStep { consumed, packet })
+    }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "packet_ae_tests.rs"]
+mod tests;
