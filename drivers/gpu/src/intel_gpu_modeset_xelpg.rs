@@ -775,7 +775,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);
         self.mmio.write32(base + TRANS_HSYNC_OFFSET, prog.hsync);
         self.mmio.write32(base + TRANS_VTOTAL_OFFSET, prog.vtotal);
-        self.mmio.write32(base + TRANS_VBLANK_OFFSET, prog.vblank);
+        // Display 13+ clears VBLANK_START (intel_set_transcoder_timings).
+        self.mmio
+            .write32(base + TRANS_VBLANK_OFFSET, prog.vblank_display13());
         self.mmio.write32(base + TRANS_VSYNC_OFFSET, prog.vsync);
         compiler_fence(Ordering::SeqCst);
     }
@@ -1477,6 +1479,28 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_modeset_reports_pipe_a_dmc_around_its_crtc
+    );
+
+    fn smoke_mtl_modeset_trans_vblank_start_field_is_zero() -> TestResult {
+        // intel_set_transcoder_timings, DISPLAY_VER >= 13: VBLANK_START is
+        // cleared (crtc_vblank_start = 1). 1024x768 ends its vblank at
+        // vtotal 806: TRANS_VBLANK = (806 - 1) << 16, written once.
+        let fake = MtlFake::new(XeLpgPort::A);
+        let mode = Mode::VESA_1024X768_60;
+        if XeLpgModeset::new(&fake, XeLpgPort::A).modeset_fixed(&test_fb(), &mode) != Ok(mode) {
+            return TestResult::Fail("the MTL modeset must complete against the MTL fake");
+        }
+        if fake.writes_to(0x6_0010) != [805 << 16] {
+            return TestResult::Fail("Pipe A's TRANS_VBLANK must carry VBLANK_END only");
+        }
+        if fake.writes_to(0x6_000c) != [(805 << 16) | 767] {
+            return TestResult::Fail("TRANS_VTOTAL keeps its active field");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_modeset_trans_vblank_start_field_is_zero
     );
 
     fn smoke_mtl_modeset_tc_ports_refuse_unqualified_route() -> TestResult {

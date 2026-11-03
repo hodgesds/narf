@@ -433,6 +433,17 @@ pub struct TranscoderProgram {
     pub vsync: u32,
 }
 
+impl TranscoderProgram {
+    /// `TRANS_VBLANK` for display 13+: `intel_set_transcoder_timings`
+    /// sets `crtc_vblank_start = 1` there (the hardware ignores
+    /// VBLANK_START; `TRANS_SET_CONTEXT_LATENCY` places the pipe vblank),
+    /// so the start field is 0 and only VBLANK_END is kept. Display 12
+    /// keeps [`TranscoderProgram::vblank`] (start at vactive − 1 + SCL).
+    pub const fn vblank_display13(&self) -> u32 {
+        self.vblank & 0xFFFF_0000
+    }
+}
+
 /// One programmed pipe.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PipeProgram {

@@ -81,9 +81,17 @@ impl Timing {
             return Err(FsError::Unsupported);
         }
         let packed = |high: u16, low: u16| (u32::from(high) - 1) << 16 | (u32::from(low) - 1);
+        // Display 14 (no Gen12 table) writes TRANS_VBLANK's start field 0:
+        // intel_set_transcoder_timings clears it on display 13+, where the
+        // hardware ignores it. Only VBLANK_END is proved there.
+        let vblank_mask = if gen12_latencies.is_some() {
+            u32::MAX
+        } else {
+            0xFFFF_0000
+        };
         if io.read32(0x60000) != packed(self.htotal, self.width)
             || io.read32(0x6000c) != packed(self.vtotal, self.height)
-            || io.read32(0x60010) != packed(self.vtotal, self.height)
+            || io.read32(0x60010) & vblank_mask != packed(self.vtotal, self.height) & vblank_mask
             || io.read32(0x60420) & (ENABLE | (1 << 28) | (1 << 27)) != 0
             || io.read32(0x70008) & ((3 << 21) | (3 << 30)) != 3 << 30
             || io.read32(0x60800) & ENABLE != 0

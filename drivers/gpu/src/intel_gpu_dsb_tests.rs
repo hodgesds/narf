@@ -316,3 +316,39 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dsb",
     smoke_gen12_dsb_reserved_ats_state_and_unsafe_timing_refuse_before_dma
 );
+
+fn smoke_dsb_display14_timing_proves_vblank_end_only() -> TestResult {
+    // intel_set_transcoder_timings clears TRANS_VBLANK's start field on
+    // display 13+ (the hardware ignores it), so the display-14 proof (no
+    // Gen12 latency table) compares VBLANK_END alone. The Gen12 proof keeps
+    // the full value the Gen12 orchestrator writes.
+    let p = MockPlatform::new();
+    let t = p.dsb_timing();
+    let inherited = t.check(&p, None);
+    if inherited.is_err() {
+        return TestResult::Fail("the inherited display-14 timing must prove");
+    }
+    p.set(0x60010, 76 << 16);
+    if t.check(&p, None) != inherited {
+        return TestResult::Fail("a cleared VBLANK_START must prove on display 14");
+    }
+    p.set(0x60010, 75 << 16);
+    if t.check(&p, None) != Err(FsError::Unsupported) {
+        return TestResult::Fail("a moved VBLANK_END must still refuse on display 14");
+    }
+    let lat = [6, 8, 10, 12, 14, 16];
+    let g = MockPlatform::new();
+    let timing = g.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::AlderLakeP);
+    if timing.check(&g, Some(lat)) != Ok(31) {
+        return TestResult::Fail("the Gen12 timing must prove");
+    }
+    g.set(0x60010, 76 << 16);
+    if timing.check(&g, Some(lat)) != Err(FsError::Unsupported) {
+        return TestResult::Fail("Gen12 keeps proving VBLANK_START");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dsb",
+    smoke_dsb_display14_timing_proves_vblank_end_only
+);

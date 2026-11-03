@@ -601,3 +601,38 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_pipes",
     smoke_xelpg_pipes_crtc_enable_programs_linetime_chicken_and_frame_start
 );
+
+fn smoke_xelpg_pipes_trans_vblank_start_field_is_zero_on_display14() -> TestResult {
+    // intel_set_transcoder_timings, DISPLAY_VER >= 13: crtc_vblank_start = 1,
+    // so TRANS_VBLANK = VBLANK_START(0) | VBLANK_END(vblank_end - 1). The
+    // 1280x720 route ends its vblank at vtotal 750: (750 - 1) << 16.
+    // TRANS_VTOTAL keeps VACTIVE: (750 - 1) << 16 | (720 - 1).
+    for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+        let trans = 0x60000 + pipe as u64 * 0x1000;
+        let hw = lit_panel();
+        hw.set(trans + 0x10, 0xdead_beef);
+        let Ok(mut pipes) = Pipes::adopt_panel(&hw, &Mode::VESA_1024X768_60) else {
+            return TestResult::Fail("the owned panel must be adopted");
+        };
+        if pipes.reserve(&hw, &external(pipe), &NoPipeDmc).is_err()
+            || pipes.program_timings(&hw, pipe).is_err()
+        {
+            return TestResult::Fail("the external pipe must be reserved and programmed");
+        }
+        if hw.get(trans + 0x10) != 749 << 16 {
+            return TestResult::Fail("TRANS_VBLANK must carry VBLANK_END only on display 14");
+        }
+        if hw.get(trans + 0xc) != (749 << 16) | 719 {
+            return TestResult::Fail("TRANS_VTOTAL keeps its active field");
+        }
+        // Pipe A's transcoder belongs to the panel.
+        if hw.wrote(0x60010) {
+            return TestResult::Fail("the panel's TRANS_VBLANK is never touched");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_pipes",
+    smoke_xelpg_pipes_trans_vblank_start_field_is_zero_on_display14
+);

@@ -516,7 +516,8 @@ impl Pipes {
             (TRANS_HBLANK_OFFSET, trans.hblank),
             (TRANS_HSYNC_OFFSET, trans.hsync),
             (TRANS_VTOTAL_OFFSET, trans.vtotal),
-            (TRANS_VBLANK_OFFSET, trans.vblank),
+            // Display 13+ clears VBLANK_START (intel_set_transcoder_timings).
+            (TRANS_VBLANK_OFFSET, trans.vblank_display13()),
             (TRANS_VSYNC_OFFSET, trans.vsync),
         ] {
             checked(io, base + off, v)?;
