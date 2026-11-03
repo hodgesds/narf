@@ -38,7 +38,6 @@ cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wirele
 cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	531
 cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	530
 iwlwifi	mlo	Native single-link non-AP MLD is implemented for admitted EHT Sc/Bz profiles with original FW-link/STA/band/epoch admission, logical SAE/PTK/per-link KDEs, encrypted data/rekeys, exact M4 terminal ownership and default-link restoration. The six native/Session cases are software-accepted at6813a24c6. Multiple simultaneously active links still require separate PHY/STA/queue/power/key/PN/reorder/control owners.	feature	drivers/wireless/specification/iwlwifi.md	4000
-iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2234
 mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2409
 mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2293
 mt76	p2p_mode	Independent device/CNM/finite ROC, control NEW/DEL, management RX and current-ROC management TX are software-validated at aa6b98463. Private native management ROC and requested NO_CCK, including their four additional native cases, are software-accepted at6813a24c6. Qualified6GHz emission and independent client/GO peer/key/data contexts remain.	feature	drivers/wireless/specification/mt7921.md	544
