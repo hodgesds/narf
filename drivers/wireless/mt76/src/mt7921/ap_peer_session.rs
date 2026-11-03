@@ -48,12 +48,20 @@ impl<B: Backend> Session<B> {
             owner.plan.basic_rates,
             owner.plan.rates,
         );
+        // Station links' peer WCIDs: a group client link, and the home
+        // link's WCID 1 once this AP runs on a non-home (GO) vif.
+        let foreign = self.group_link().map_or(0, |link| 1u16 << link.peer())
+            | if owner.plan.vif == crate::mt7921::vif_slots::Vif::HOME {
+                0
+            } else {
+                1 << crate::mt7921::vif_slots::Link::HOME.peer()
+            };
         let mut peer = self
             .ap_owner
             .as_mut()
             .unwrap()
             .peers
-            .reserve(own, config, five, basic)?;
+            .reserve(foreign, own, config, five, basic)?;
         peer.rates &= supported;
         if peer.rates & basic != basic {
             return Err(Error::Bounds);

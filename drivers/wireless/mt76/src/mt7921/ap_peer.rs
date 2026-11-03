@@ -34,6 +34,10 @@ impl Peers {
     pub fn addresses(&self) -> alloc::vec::Vec<[u8; 6]> {
         self.peers.keys().copied().collect()
     }
+    /// WCIDs this AP owner reserved in the shared WTBL namespace.
+    pub fn reserved(&self) -> u16 {
+        self.reserved
+    }
     pub fn any_authorized(&self) -> bool {
         self.peers
             .values()
@@ -45,8 +49,11 @@ impl Peers {
     pub fn get_mut(&mut self, mac: [u8; 6]) -> Option<&mut Peer> {
         self.peers.get_mut(&mac)
     }
+    /// `foreign`: WCIDs station links own in the shared WTBL namespace
+    /// (Linux one `dev->wcid_mask` for every vif's `mt76_wcid_alloc`).
     pub fn reserve(
         &mut self,
+        foreign: u16,
         own: [u8; 6],
         config: StationConfig,
         five: bool,
@@ -64,7 +71,7 @@ impl Peers {
             return Err(Error::Bounds);
         }
         let wcid = (ap_wire::FIRST_PEER..=ap_wire::LAST_PEER)
-            .find(|index| self.reserved & (1 << index) == 0)
+            .find(|index| (self.reserved | foreign) & (1 << index) == 0)
             .ok_or(Error::Busy)?;
         self.reserved |= 1 << wcid;
         Ok(Peer { wcid, ..peer })

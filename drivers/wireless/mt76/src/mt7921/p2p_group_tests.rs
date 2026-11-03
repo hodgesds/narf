@@ -570,3 +570,53 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_p2p_station_vif_records_match_connac2
 );
+
+fn group_owner() -> Result<(), &'static str> {
+    use crate::mt7921::vif_slots::{Link, Vif, Wtbl};
+    // mt76_wcid_alloc: lowest free peer WCID; home WCID 1 permanently owned.
+    let mut wtbl = Wtbl::default();
+    if wtbl.alloc(0) != Ok(2) || wtbl.alloc(1 << 3) != Ok(4) || wtbl.free(1) || !wtbl.free(2) {
+        return Err("shared WTBL allocation differs from mt76_wcid_alloc");
+    }
+    let (mut session, bss) = super::super::super::ht20_tests::prepared(6, false);
+    let vif = Vif::new(1).map_err(|_| "vif")?;
+    if session.open_group_link(Vif::HOME).is_ok() {
+        return Err("group link opened on the home vif");
+    }
+    let link = session.open_group_link(vif).map_err(|_| "group link")?;
+    if link != Link::new(vif, 2).map_err(|_| "link")?
+        || session.group_link() != Some(link)
+        || session.station.link != Link::HOME
+        || session.open_group_link(Vif::new(2).map_err(|_| "vif 2")?) != Err(Error::Busy)
+    {
+        return Err("group link identity / single-group admission");
+    }
+    // An associated group owner cannot be closed or carried into suspend.
+    session.group.as_mut().unwrap().bss = Some(bss.clone());
+    if !session.group_associated()
+        || session.close_group_link(link) != Err(Error::Busy)
+        || run(Box::pin(session.suspend())) != Err(Error::Busy)
+    {
+        return Err("associated group owner was retired in place");
+    }
+    session.group.as_mut().unwrap().bss = None;
+    session
+        .close_group_link(link)
+        .map_err(|_| "idle group close")?;
+    if session.group_link().is_some() || session.open_group_link(vif).map_err(|_| "reopen")? != link
+    {
+        return Err("group WCID not returned to the shared map");
+    }
+    session.retire_group_link();
+    if session.wtbl != Wtbl::default() {
+        return Err("retired group link kept its WCID");
+    }
+    Ok(())
+}
+fn mt76_p2p_group_link_owner_allocates_shared_wcid() -> TestResult {
+    group_owner().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_group_link_owner_allocates_shared_wcid
+);

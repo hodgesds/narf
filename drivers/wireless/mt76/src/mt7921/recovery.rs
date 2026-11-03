@@ -111,6 +111,8 @@ impl<B: Backend> Session<B> {
         self.ap_owner = None;
         self.p2p_owner = None;
         self.p2p_next = 1;
+        // The verified reset retired every vif's native BSS/WTBL state.
+        self.retire_group_link();
         self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;

@@ -76,6 +76,11 @@ impl<B: Backend> Session<B> {
         if self.p2p_owner.is_some() {
             self.stop_p2p_device_owned().await?;
         }
+        // mac80211 leaves every station vif before a non-WoW suspend; the
+        // group client must already have left (no in-place group teardown).
+        if self.group_associated() {
+            return Err(Error::Busy);
+        }
         let (info, vif) = match self.state {
             State::Suspended(_) => return Ok(()),
             State::Associated { info, .. } => {
@@ -302,6 +307,7 @@ impl<B: Backend> Session<B> {
         self.station.permission = None;
         self.station.bss = None;
         self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
+        self.retire_group_link();
         self.station.wmm = None;
         self.station.wmm_pending = None;
         self.station.ht20_rx = None;

@@ -43,6 +43,8 @@ mod p2p_management_wire;
 mod p2p_profile;
 pub(crate) use p2p_profile::P2pProfile;
 
+#[path = "group_link.rs"]
+mod group_link;
 #[path = "station_mcu.rs"]
 mod station;
 pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
@@ -1567,9 +1569,11 @@ struct Session<B: Backend> {
     data_pending: VecDeque<u64>,
     /// The home vif's station owner (BSS0, peer WCID 1).
     station: StationLink,
-    /// A concurrent P2P group vif's station owner; unused until the
-    /// group netdev lands (Linux mt7921 keeps one `mt792x_vif` per vif).
+    /// A concurrent P2P group vif's station owner (Linux mt7921 keeps one
+    /// `mt792x_vif` per vif); opened by `open_group_link`.
     group: Option<StationLink>,
+    /// Peer WCIDs owned by station links (Linux `dev->wcid_mask`).
+    wtbl: crate::mt7921::vif_slots::Wtbl,
     /// The wiphy fragmentation threshold (`u32::MAX` = off).
     frag_threshold: u32,
     receive_epoch: u64,
@@ -1602,6 +1606,7 @@ impl<B: Backend> Session<B> {
             data_pending: VecDeque::with_capacity(crate::mt7921::packet_tx::PIPELINE),
             station: StationLink::new(crate::mt7921::vif_slots::Link::HOME),
             group: None,
+            wtbl: crate::mt7921::vif_slots::Wtbl::default(),
             frag_threshold: u32::MAX,
             receive_epoch: 0,
             scan_packets: VecDeque::new(),

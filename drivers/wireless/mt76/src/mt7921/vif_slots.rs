@@ -120,6 +120,45 @@ pub(crate) fn on_bss<T: AsMut<[u8]>>(vif: Vif, mut body: T) -> T {
 /// Highest peer WCID (`MT792x_WTBL_STA` - 1, mt792x.h).
 pub(crate) const LAST_PEER_WCID: u8 = 14;
 
+/// The shared peer-WCID map (Linux `mt76_wcid_alloc(dev->wcid_mask,
+/// MT792x_WTBL_STA)`): lowest free index in 1..=`LAST_PEER_WCID`. WCID 0 is
+/// the global WCID and 15..=19 the per-vif BMC WCIDs. The home station
+/// link's peer WCID 1 is permanently owned by the physical interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Wtbl {
+    used: u16,
+}
+impl Default for Wtbl {
+    fn default() -> Self {
+        Self {
+            used: 1 << Link::HOME.peer,
+        }
+    }
+}
+impl Wtbl {
+    /// Allocate the lowest free peer WCID that is also absent from
+    /// `foreign` (WCIDs another owner, e.g. an AP peer table, reserved).
+    pub(crate) fn alloc(&mut self, foreign: u16) -> Result<u8, Error> {
+        let index = (1..=LAST_PEER_WCID)
+            .find(|index| (self.used | foreign) & (1 << index) == 0)
+            .ok_or(Error::Busy)?;
+        self.used |= 1 << index;
+        Ok(index)
+    }
+    /// `mt76_wcid_free`; the home peer is never released.
+    pub(crate) fn free(&mut self, index: u8) -> bool {
+        if index == Link::HOME.peer || !(1..=LAST_PEER_WCID).contains(&index) {
+            return false;
+        }
+        let owned = self.used & (1 << index) != 0;
+        self.used &= !(1 << index);
+        owned
+    }
+    pub(crate) fn used(&self) -> u16 {
+        self.used
+    }
+}
+
 /// Metadata allocation identity; no start, packet, RF or current grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Allocation {
