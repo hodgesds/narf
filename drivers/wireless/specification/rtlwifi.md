@@ -3043,10 +3043,22 @@ keeps the chip diagnostic until admission lands.
   `0x577 = 3`, the eight `rtl_set_bbreg` DPDT/fixed-board RMWs, RXDMA
   release), the RCR `ACRC32|AICV` trim, `_rtl8723be_hw_configure` and the
   station address (software crypto). `btc_power_on_setting` belongs to the
-  coexistence owner. Not yet wired: no `prepare::Chip` profile for
-  `0xb723`. Tests `smoke_rtl8723be_tx_rx_descriptor_layout`,
+  coexistence owner. Tests `smoke_rtl8723be_tx_rx_descriptor_layout`,
   `smoke_rtl8723be_llt_table`, `smoke_rtl8723be_init_mac_and_hw_configure`
   (written, unexecuted).
+- ring profile — `prepare::Chip::Rtl8723be` (`0xb723` only; the 8723AE has
+  none): the 88EE linked-ring geometry with the next link at byte 48, the
+  88EE IMR map (`REG_HIMR` 0xb0 / `REG_HIMRE` 0xb8) and the 0x301 DMA stop.
+  `Prepared::prepare` issues, behind that stop and parked BME, the
+  `_rtl8723be_init_mac` pre-CR segment, `REG_CR = 0xff` with its 2 ms, the
+  clock segment (its own 2 ms), then closes the CR DMA/MAC gates again
+  (`REG_CR = 0x2ff` is deferred to packet start), masks both IMRs, runs
+  `rtl8723be::llt::init` and publishes the `REG_*_DESA` bases. The
+  post-LLT segment belongs to the later radio step. Packet start,
+  interrupt enable, awake and the interface's admission refuse the chip
+  explicitly and `station_grant` is `None`, so no 88EE path can qualify it.
+  Test `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
+  unexecuted).
 
 ## 4. Invariants
 

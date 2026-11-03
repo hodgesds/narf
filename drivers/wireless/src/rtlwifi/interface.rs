@@ -341,6 +341,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 )
                 .await?;
             }
+        } else if owner.chip() == super::prepare::Chip::Rtl8723be {
+            // RTL8723BE is not admitted: its radio/channel/BT-coexistence
+            // owner is incomplete, so no 88EE calibration may qualify it.
+            return Err(Error::Profile);
         } else if matches!(
             owner.phase(),
             Phase::RadioConfigured | Phase::ChannelConfigured

@@ -296,6 +296,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     fn rtl8192ce(&self) -> bool {
         self.chip == super::Chip::Rtl8192ce
     }
+    /// RTL8723BE owns prepared rings only; no packet path is admitted.
+    fn rtl8723be(&self) -> bool {
+        self.chip == super::Chip::Rtl8723be
+    }
     pub(crate) async fn awake_station(&mut self) -> Result<(), Error> {
         if self.rtl8821ae() {
             return self.ae_awake_station();
@@ -305,6 +309,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_awake_station();
+        }
+        if self.rtl8723be() {
+            return Err(Error::State);
         }
         if self.phase != Phase::MacConfigured {
             return Err(Error::State);
@@ -893,6 +900,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_start_packets();
         }
+        if self.rtl8723be() {
+            return Err(Error::State);
+        }
         if self.phase != Phase::MacConfigured
             || self.packet.local.is_none()
             || self.permission.is_none()
@@ -944,6 +954,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_enable_interrupts();
+        }
+        if self.rtl8723be() {
+            return Err(Error::State);
         }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);

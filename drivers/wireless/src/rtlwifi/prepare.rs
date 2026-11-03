@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Exact linked PCI descriptor/FIFO prerequisite for the retained rtlwifi
-//! profiles (RTL8188EE, RTL8821AE). Linux rtl8188ee/ and rtl8821ae/ hw.c/trx.h.
+//! profiles (RTL8188EE, RTL8821AE, RTL8192CE, RTL8723BE). Linux
+//! rtl8188ee/, rtl8821ae/, rtl8192ce/ and rtl8723be/ hw.c/trx.h.
 //! Ordinary DMA/MAC remain closed; this is below RF and station admission.
 use super::firmware_transport::{Error as AccessError, Io};
 use alloc::vec::Vec;
@@ -92,6 +93,11 @@ pub enum Chip {
     /// RTL8192CE / RTL8188CE linked rings (`rtl8192ce/trx.h`): 88EE ring
     /// geometry, `_rtl92ce_llt_table_init` and the 92C IMR map.
     Rtl8192ce,
+    /// RTL8723BE linked rings (`rtl8723be/trx.h`): 88EE ring geometry with
+    /// the next link at dword 12 (byte 48), `_rtl8723be_llt_table_init`,
+    /// the 88EE IMR map (`REG_HIMR` 0xb0 / `REG_HIMRE` 0xb8) and the
+    /// `REG_PCIE_CTRL_REG + 1` (0x301) DMA stop.
+    Rtl8723be,
 }
 impl Chip {
     pub const fn from_device(did: u16) -> Option<Self> {
@@ -100,6 +106,7 @@ impl Chip {
             super::regs::RTL_DEV_8821AE => Some(Self::Rtl8821ae),
             super::regs::RTL_DEV_8192EE => Some(Self::Rtl8192ee),
             did if super::rtl8192ce::is_8192ce(did) => Some(Self::Rtl8192ce),
+            super::regs::RTL_DEV_8723BE => Some(Self::Rtl8723be),
             _ => None,
         }
     }
@@ -112,6 +119,7 @@ impl Chip {
             Self::Rtl8821ae => Some(48),
             // TX_DESC_NEXT_DESC_OFFSET.
             Self::Rtl8192ce => Some(super::rtl8192ce::trx::TX_DESC_NEXT_DESC_OFFSET),
+            Self::Rtl8723be => Some(super::rtl8723be::trx::NEXT_DESC_BYTE),
             Self::Rtl8192ee => None,
         }
     }
@@ -507,6 +515,19 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 return Err(Error::Readback);
             }
         }
+        if self.chip == Chip::Rtl8723be {
+            // `_rtl8723be_init_mac` between the enable flow and the LLT
+            // (`btc_power_on_setting` belongs to the coexistence owner):
+            // `REG_CR = 0xff` with its `mdelay(2)`, then the clock segment
+            // (`HWSEQ_CTRL |= 0x7f` and its own 2 ms). The 0x301 stop above
+            // and parked BME hold host DMA closed while CR is fully open;
+            // the deferred `REG_CR = 0x2ff` belongs to packet start, so the
+            // DMA/MAC gates are closed again below before the LLT.
+            super::rtl8723be::mac::init_mac_pre_cr(&self.io)?;
+            self.io.write8(0x100, 0xff)?;
+            self.io.delay_us(2000).await;
+            super::rtl8723be::mac::init_mac_clocks(&self.io).await?;
+        }
         let cr = self.io.read8(0x100)?;
         self.io.write8(0x100, cr & !0xcf)?;
         if self.io.read8(0x100)? & 0xcf != 0 {
@@ -556,6 +577,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         if self.chip == Chip::Rtl8821ae {
             // Exact rtl8821ae/hw.c::_rtl8821ae_llt_table_init.
             return super::rtl8821ae::llt::init(&LltRegs(&self.io)).map_err(|e| match e {
+                AccessError::Deadline => Error::LltTimeout,
+                e => Error::Access(e),
+            });
+        }
+        if self.chip == Chip::Rtl8723be {
+            // Exact rtl8723be/hw.c::_rtl8723be_llt_table_init (boundary 245).
+            return super::rtl8723be::llt::init(&LltRegs(&self.io)).map_err(|e| match e {
                 AccessError::Deadline => Error::LltTimeout,
                 e => Error::Access(e),
             });

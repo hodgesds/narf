@@ -1249,6 +1249,8 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::Chip::Rtl8192ce => self
                 .rtl8192ce_power
                 .map(super::super::station_power::Grant::Rtl8192ce),
+            // Not admitted: no RTL8723BE channel grant exists yet.
+            super::Chip::Rtl8723be => None,
         }
     }
     /// 88EE calibration for the 88EE-only HT/protection/tracking/antenna/
