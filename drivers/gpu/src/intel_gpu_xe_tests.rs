@@ -9,14 +9,39 @@ struct Cpu {
     mapping: IrqSafeSpinLock<Option<MmapBacking>>,
     fail_report: core::sync::atomic::AtomicBool,
     pin_calls: core::sync::atomic::AtomicU32,
+    /// The process's VMAs: 0x4000 read/write and 0x6000 read-only. USERPTR
+    /// intervals register here, so the real address-space operations on it
+    /// (munmap, mprotect, MADV_DONTNEED) fire them.
+    space: narf_memory::AddressSpace,
+    /// Collections that fire an invalidation of 0x4000 before returning,
+    /// modelling a racing munmap/remap during the pin.
+    invalidate_on_pin: core::sync::atomic::AtomicU32,
+}
+fn cpu_vma(base: u64, perms: narf_memory::RegionPerms) -> narf_memory::Region {
+    narf_memory::Region {
+        base: narf_memory::VirtAddr::new(base),
+        len: 4096,
+        perms,
+        phys: alloc::vec![narf_memory::PhysAddr::new(0)].into(),
+    }
 }
 impl Cpu {
     fn new() -> Self {
+        use narf_memory::RegionPerms;
+        let space = narf_memory::AddressSpace::empty();
+        space
+            .map_region(cpu_vma(0x4000, RegionPerms::READ | RegionPerms::WRITE))
+            .unwrap();
+        space
+            .map_region(cpu_vma(0x6000, RegionPerms::READ))
+            .unwrap();
         Self {
             wire: User::new(),
             mapping: IrqSafeSpinLock::new(None),
             fail_report: core::sync::atomic::AtomicBool::new(false),
             pin_calls: core::sync::atomic::AtomicU32::new(0),
+            space,
+            invalidate_on_pin: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -33,23 +58,46 @@ impl IoctlContext for Cpu {
     fn nonblocking(&self) -> bool {
         false
     }
-    // Modeled process: 0x4000 is the writable CPU mapping, 0x6000 a read-only
-    // alias of the same page, everything else unmapped.
+    // Modeled process: the VMAs in `space` (0x4000 writable, 0x6000 a
+    // read-only alias of the same page), each backed by `mapping`'s frame.
     fn pin_user_pages(
         &self,
         address: u64,
         pages: u64,
         writable: bool,
     ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+        use narf_memory::RegionPerms;
         self.pin_calls
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let racing = self
+            .invalidate_on_pin
+            .fetch_update(
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+                |left| left.checked_sub(1),
+            )
+            .is_ok();
+        if racing {
+            self.space
+                .madvise_dontneed(narf_memory::VirtAddr::new(0x4000), 4096)
+                .unwrap();
+        }
+        let perms: Vec<_> = (0..pages)
+            .map(|page| {
+                self.space
+                    .lookup(narf_memory::VirtAddr::new(address + page * 4096))
+                    .map(|vma| vma.perms)
+            })
+            .collect();
         let mapping = self.mapping.lock();
         let frame = mapping.as_ref().ok_or(FsError::BadAddress)?.frames[0];
-        (0..pages)
-            .map(|page| match address + page * 4096 {
-                0x4000 => Ok(()),
-                0x6000 if writable => Err(FsError::OperationNotPermitted),
-                0x6000 => Ok(()),
+        perms
+            .into_iter()
+            .map(|perms| match perms {
+                Some(perms) if writable && !perms.contains(RegionPerms::WRITE) => {
+                    Err(FsError::OperationNotPermitted)
+                }
+                Some(perms) if perms.contains(RegionPerms::READ) => Ok(()),
                 _ => Err(FsError::BadAddress),
             })
             .map(|page| {
@@ -64,6 +112,18 @@ impl IoctlContext for Cpu {
                 })
             })
             .collect()
+    }
+    fn mmu_interval_notifier(
+        &self,
+        address: u64,
+        length: u64,
+        ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, FsError> {
+        narf_memory::mmu_notifier::MmuIntervalNotifier::insert(&self.space, address, length, ops)
+            .map_err(|_| FsError::BadAddress)
+    }
+    fn address_space_identity(&self) -> Option<u64> {
+        Some(self.space.identity())
     }
     fn read_u64_acquire(&self, address: u64) -> Result<u64, FsError> {
         if address & 7 != 0 {
@@ -761,6 +821,204 @@ fn smoke_xe_userptr_bind_exec_validation_and_retirement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_xe_userptr_bind_exec_validation_and_retirement
+);
+
+/// One EXEC on `queue` from `user`: an immediate refusal is returned as is;
+/// an admitted job is accepted, retired, and reported as `Ok(0)`.
+#[allow(clippy::too_many_arguments)]
+fn userptr_exec(
+    file: &RenderFile,
+    info: &DeviceInfo,
+    user: &Cpu,
+    queue: u32,
+    batch: bool,
+    mailbox: &Mailbox,
+    gt: &mut GuCGt<Window, Arena>,
+    w: &Window,
+    registered: &mut BTreeMap<u32, u32>,
+    now: u64,
+) -> Result<u64, FsError> {
+    exec_wire(user, queue, batch, &[]);
+    let mut call = core::pin::pin!(file.dispatch_user(info, xe::EXEC, 64, user));
+    if let Poll::Ready(result) = call.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        return result.expect("native ioctl handled");
+    }
+    let (_, fence) = mailbox.accept(gt, now);
+    assert_eq!(
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Some(Ok(0)))
+    );
+    finish(gt, w, &fence, registered, now + 1);
+    Ok(0)
+}
+
+/// MAP_USERPTR against CPU mapping changes (xe_userptr.c, xe_vm_userptr_pin):
+/// an unchanged binding is not re-collected; munmap + remap makes the next
+/// exec re-collect and the store reach only the new page; a writable binding
+/// over memory made read-only fails the exec with EPERM and stays
+/// invalidated; another process cannot re-collect it; a range that is gone
+/// loses its GPU mapping while the exec proceeds; and a collection raced by
+/// an invalidation is retried, ENOMEM once every round is raced.
+fn smoke_xe_userptr_invalidation_repins_zaps_and_refuses() -> TestResult {
+    use core::sync::atomic::Ordering::Relaxed;
+    use narf_memory::{mmu_notifier::registered_intervals, RegionPerms, VirtAddr};
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let ack = 0xdfc;
+    let pat = 3;
+    let (w, arena, mut gt) = hardware_model(platform, ack);
+    prime(&mut gt, &w, ack);
+    let (mailbox, info) = setup(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let baseline = registered_intervals();
+    let vm = create_vm(&file, &info, &user);
+    let queue = create_queue(&file, &info, &user, vm, 0);
+    let _ = buffers(&file, &info, &user, vm);
+    let host = create_bo(&file, &info, &user, 4096, 0);
+    let host_object = file.gem.object(host).unwrap();
+    *user.mapping.lock() = Some(host_object.backing(0, 4096).unwrap());
+    let mut registered = BTreeMap::new();
+    let mut exec = |user: &Cpu, batch: bool, now: u64, gt: &mut GuCGt<Window, Arena>| {
+        userptr_exec(
+            &file,
+            &info,
+            user,
+            queue,
+            batch,
+            &mailbox,
+            gt,
+            &w,
+            &mut registered,
+            now,
+        )
+    };
+
+    // The batch's store targets 0x2345_0000_0080: bind the process page there.
+    bind_wire(
+        &user,
+        vm,
+        &[userptr_op(0x2345_0000_0000, 0x4000, 4096, pat, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+    assert_eq!(registered_intervals(), baseline + 1);
+    let pins = user.pin_calls.load(Relaxed);
+    assert_eq!(exec(&user, true, 100, &mut gt), Ok(0));
+    assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+    assert_eq!(
+        user.pin_calls.load(Relaxed),
+        pins,
+        "an unchanged binding was re-collected"
+    );
+
+    // munmap + mmap of a new page at the bound CPU address.
+    host_object.write(0x80, &[0; 8]).unwrap();
+    let fresh = create_bo(&file, &info, &user, 4096, 0);
+    let fresh_object = file.gem.object(fresh).unwrap();
+    user.space.punch_fixed(VirtAddr::new(0x4000), 4096).unwrap();
+    user.space
+        .map_region(cpu_vma(0x4000, RegionPerms::READ | RegionPerms::WRITE))
+        .unwrap();
+    *user.mapping.lock() = Some(fresh_object.backing(0, 4096).unwrap());
+    assert_eq!(exec(&user, true, 200, &mut gt), Ok(0));
+    assert_eq!(user.pin_calls.load(Relaxed), pins + 1);
+    let mut value = [0; 4];
+    fresh_object.read(0x80, &mut value).unwrap();
+    assert_eq!(u32::from_le_bytes(value), 0x4e415246);
+    host_object.read(0x80, &mut value).unwrap();
+    assert_eq!(value, [0; 4], "the GPU reached the unmapped page");
+    assert_eq!(
+        registered_intervals(),
+        baseline + 1,
+        "the re-collected binding kept its old interval"
+    );
+
+    // mprotect(PROT_READ) under a writable binding: EPERM, still invalidated.
+    user.space
+        .mprotect_range(VirtAddr::new(0x4000), 4096, RegionPerms::READ)
+        .unwrap();
+    assert_eq!(
+        exec(&user, false, 300, &mut gt),
+        Err(FsError::OperationNotPermitted)
+    );
+    assert_eq!(user.pin_calls.load(Relaxed), pins + 2);
+    user.space
+        .mprotect_range(
+            VirtAddr::new(0x4000),
+            4096,
+            RegionPerms::READ | RegionPerms::WRITE,
+        )
+        .unwrap();
+    assert_eq!(exec(&user, false, 400, &mut gt), Ok(0));
+    assert_eq!(user.pin_calls.load(Relaxed), pins + 3);
+
+    // Another process executing on the shared VM cannot re-collect it.
+    user.space
+        .madvise_dontneed(VirtAddr::new(0x4000), 4096)
+        .unwrap();
+    let other = Cpu::new();
+    assert_eq!(
+        exec(&other, false, 500, &mut gt),
+        Err(FsError::NotImplemented)
+    );
+    assert_eq!(other.pin_calls.load(Relaxed), 0);
+
+    // munmap without a replacement: the binding loses its GPU mapping and
+    // its interval, and the exec proceeds; later execs do not retry it.
+    user.space.punch_fixed(VirtAddr::new(0x4000), 4096).unwrap();
+    assert_eq!(exec(&user, false, 600, &mut gt), Ok(0));
+    assert_eq!(user.pin_calls.load(Relaxed), pins + 4);
+    assert_eq!(registered_intervals(), baseline);
+    assert_eq!(exec(&user, false, 700, &mut gt), Ok(0));
+    assert_eq!(user.pin_calls.load(Relaxed), pins + 4);
+
+    // A collection raced by an invalidation is retried under a fresh
+    // read_begin; one raced in every round is ENOMEM.
+    user.space
+        .map_region(cpu_vma(0x4000, RegionPerms::READ | RegionPerms::WRITE))
+        .unwrap();
+    user.invalidate_on_pin.store(1, Relaxed);
+    bind_wire(
+        &user,
+        vm,
+        &[userptr_op(0x3000_0000_0000, 0x4000, 4096, pat, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+    assert_eq!(user.pin_calls.load(Relaxed), pins + 6);
+    user.invalidate_on_pin
+        .store(crate::intel_gpu_xe_vm::USERPTR_PIN_ROUNDS as u32, Relaxed);
+    bind_wire(
+        &user,
+        vm,
+        &[userptr_op(0x3100_0000_0000, 0x4000, 4096, pat, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&file, &info, &user), Err(FsError::OutOfMemory));
+    assert_eq!(
+        user.pin_calls.load(Relaxed),
+        pins + 6 + crate::intel_gpu_xe_vm::USERPTR_PIN_ROUNDS as u32
+    );
+    assert_eq!(registered_intervals(), baseline + 1);
+
+    drop(exec);
+    drop(host_object);
+    drop(fresh_object);
+    user.mapping.lock().take();
+    assert_eq!(
+        close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+        Ok(0)
+    );
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    hardware_stop(&mut gt, &w, ack);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    assert_eq!(registered_intervals(), baseline);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_userptr_invalidation_repins_zaps_and_refuses
 );
 
 fn xe_query(file: &RenderFile, info: &DeviceInfo, user: &Cpu, id: u32) -> Vec<u8> {

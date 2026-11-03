@@ -965,6 +965,13 @@ impl XeFile {
             user.write_u64_release(address, value)?;
         }
         state.publish(mappings);
+        // Adopt the new MAP_USERPTR bindings and forget the replaced ones
+        // under the same VM lock, so exec always checks what it maps.
+        let fresh = binds
+            .iter_mut()
+            .filter_map(|bind| bind.mirror.take())
+            .collect();
+        vm.adopt_userptrs(&state.mappings, fresh);
         sync.publish(so::stub());
         Ok(())
     }
@@ -1022,6 +1029,9 @@ impl XeFile {
         let mut state = queue.vm.state.lock().await;
         loop {
             queue.check()?;
+            // xe_vm_userptr_pin: re-collect invalidated MAP_USERPTR bindings
+            // before this job's private tables are built from the mappings.
+            queue.vm.revalidate_userptrs(&mut state, user)?;
             let status = backend
                 .status()
                 .filter(|s| s.platform == info.platform)
@@ -1054,6 +1064,12 @@ impl XeFile {
                     sync.user_fence,
                 )?
             };
+            // __xe_vm_userptr_needs_repin at the point of no return: a binding
+            // invalidated while the tables were built is re-collected and the
+            // tables rebuilt (xe_exec_ioctl's -EAGAIN retry).
+            if queue.vm.userptrs_stale() {
+                continue;
+            }
             match backend
                 .submit(queue.context.clone(), UserBatch(resident))
                 .await

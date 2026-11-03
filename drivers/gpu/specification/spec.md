@@ -890,15 +890,31 @@ partial-object mappings, overlap replacement and split ranges with retained
 object offsets. Ops above PREFETCH are EINVAL; PREFETCH is NotImplemented.
 MAP_USERPTR follows vm_bind_ioctl_check_args: no object, not NULL, an admitted
 (coherent, uncompressed) PAT and page-aligned address/range, all checked for
-every op before any page is faulted. `IoctlContext::pin_user_pages` then faults
-and pins the range, resolving private COW copies unless READONLY (unmapped
-EFAULT, write over a read-only mapping EPERM), into a VM-private handle-less
-`GemObject` charged like owned storage. Mappings and jobs retain it as any BO.
-Fork copies pinned pages for the child (memory/ page_needs_cow_for_dma), so
-the pins keep aliasing the binder's memory. LINUX-GAP (shared with amdgpu
-GEM_USERPTR): Xe faults through HMM and repins via an MMU interval notifier.
-These pins are snapshots, so a later munmap or remap leaves the GPU on the
-pinned frames, never on freed memory.
+every op before any page is faulted. `IoctlContext::mmu_interval_notifier`
+then registers a memory/ interval notifier over the CPU range
+(`xe_userptr_setup`), and `IoctlContext::pin_user_pages` faults and pins the
+range inside the interval's `read_begin`/`read_retry`, resolving private COW
+copies unless READONLY (unmapped EFAULT, write over a read-only mapping EPERM),
+into a VM-private handle-less `GemObject` charged like owned storage. A
+collection raced by an invalidation is repeated; eight raced rounds are
+`drm_gpusvm_get_pages`' -EBUSY, which bind reports as ENOMEM (`new_vma`) and
+EXEC returns as EBUSY. Mappings and jobs retain the object as any BO, so the GPU never
+reaches freed memory. Fork copies pinned pages for the child (memory/
+page_needs_cow_for_dma), so the pins keep aliasing the binder's memory.
+Once munmap, MAP_FIXED, mremap, mprotect removing READ/WRITE, MADV_DONTNEED,
+truncate, a COW break, swap-out, migration or exit changes the range, EXEC
+re-collects every mapping slice of the invalidated binding under a fresh
+interval before building the job (`xe_vm_userptr_pin`), and rebuilds the job
+if another invalidation lands before submission (`__xe_vm_userptr_needs_repin`).
+A slice whose range is gone (EFAULT, or the binder exited) loses its GPU
+mapping and the exec proceeds, as Linux invalidates the VMA; EPERM, ENOMEM and EBUSY
+fail the exec and the binding stays invalidated. Deviations: the notifier
+callback runs under memory/'s non-blocking locks, so jobs already submitted
+finish on their retained pins instead of being waited for in the callback;
+only the binder's own address space re-collects (another process's EXEC is
+ENOSYS, where Linux uses the binder's mm); an address + length overflow is
+EFAULT rather than -EOVERFLOW. LINUX-GAP: amdgpu GEM_USERPTR and i915
+GEM_USERPTR do not yet use the notifier.
 All handles and synchronization payloads are retained before waiting. A bind
 prepares a replacement mapping set without mutating the published VM, waits for
 its prior GPU users and then commits under an async VM mutex. Cancelled waits,

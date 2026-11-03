@@ -1,20 +1,37 @@
 //! Persistent Xe VM metadata. Each execution receives private immutable tables;
 //! binds serialize with prior submissions before publishing a new mapping set.
+//!
+//! MAP_USERPTR bindings mirror a CPU range (MIT Linux
+//! b90c984d615e8ce2af96f5b1411a962d83fed2ad `xe_userptr.c`): each binding
+//! registers a `narf_memory::mmu_notifier` interval over its CPU range before
+//! pinning, and the pins it publishes carry the interval sequence they were
+//! collected under. Exec re-collects every binding invalidated since
+//! (`xe_vm_userptr_pin`) before building a job's private tables.
 use crate::{
     intel_gpu_exec::VmMapping,
     intel_gpu_fence::CompletionFence,
-    intel_gpu_gem::GemState,
+    intel_gpu_gem::{GemObject, GemState},
     intel_gpu_gt::GtPlatform,
     intel_gpu_uapi::{u32_at, u64_at},
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_filesystem::{FsError, IoctlContext};
-use narf_lib::mutex::Mutex;
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+use narf_memory::mmu_notifier::{
+    MmuInterval, MmuIntervalNotifier, MmuIntervalNotifierOps, MmuNotifierRange,
+};
 
 static NEXT_VM: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_MAPPINGS: usize = 4096;
 pub(crate) const MAX_VA: u64 = 1 << 48;
+/// `read_begin`/`read_retry` rounds for one USERPTR collection. Linux
+/// `drm_gpusvm_get_pages` retries until `HMM_RANGE_DEFAULT_TIMEOUT` and then
+/// fails `-EBUSY`, which bind reports as `-ENOMEM`.
+pub(crate) const USERPTR_PIN_ROUNDS: usize = 8;
 
 #[derive(Debug)]
 pub(crate) struct Vm {
@@ -22,6 +39,12 @@ pub(crate) struct Vm {
     pub scratch: bool,
     pub dead: AtomicBool,
     pub state: Mutex<State>,
+    /// Published MAP_USERPTR bindings. Changed only with `state` held; the
+    /// lock is held only to move the list in or out, never across a pin.
+    userptrs: IrqSafeSpinLock<Vec<Userptr>>,
+    /// The VM's interval-notifier consumer; holds no VM reference, so the
+    /// registry never keeps a destroyed VM alive.
+    userptr_ops: Arc<UserptrNotifier>,
 }
 #[derive(Debug)]
 pub(crate) struct State {
@@ -41,6 +64,8 @@ impl Vm {
                 mappings: Vec::new(),
                 active: Vec::new(),
             }),
+            userptrs: IrqSafeSpinLock::new(Vec::new()),
+            userptr_ops: Arc::new(UserptrNotifier),
         }))
     }
     pub fn check(&self) -> Result<(), FsError> {
@@ -50,6 +75,187 @@ impl Vm {
             Ok(())
         }
     }
+
+    /// Track the MAP_USERPTR bindings a bind just published and forget every
+    /// binding no published mapping names any more. A forgotten binding's
+    /// interval is removed; jobs that still hold its pins keep them, and so
+    /// its frames, until they retire. Call with `state` held, after
+    /// [`State::publish`]; it does not await.
+    pub fn adopt_userptrs(&self, mappings: &[VmMapping], fresh: Vec<Userptr>) {
+        let mut records = core::mem::take(&mut *self.userptrs.lock());
+        records.extend(fresh);
+        records.retain(|record| mappings.iter().any(|mapping| record.names(mapping)));
+        *self.userptrs.lock() = records;
+    }
+
+    /// `__xe_vm_userptr_needs_repin`: some binding was invalidated after its
+    /// pins were collected. Exec checks this after building a job's tables
+    /// and rebuilds them if so (`xe_exec_ioctl`'s `-EAGAIN` retry).
+    pub fn userptrs_stale(&self) -> bool {
+        self.userptrs.lock().iter().any(Userptr::stale)
+    }
+
+    /// `xe_vm_userptr_pin` and the rebind that follows it (non-fault VM),
+    /// with `state` held: re-collect every invalidated binding before a job
+    /// is built from the published mappings. Each mapping slice naming an
+    /// invalidated binding is re-collected over exactly its CPU range under a
+    /// fresh interval, as Linux splits a USERPTR VMA's notifier with the VMA.
+    ///
+    /// A slice whose range is gone (`EFAULT`: unmapped, or the binder's
+    /// address space has exited) is removed from the mappings, as
+    /// `xe_vm_userptr_pin` invalidates the VMA's GPU mapping, and the exec
+    /// proceeds. Any other error (`EPERM` for a writable binding over memory
+    /// made read-only, `ENOMEM`, `EBUSY` when every collection round was
+    /// raced) fails the exec with nothing republished; the
+    /// bindings stay invalidated and the next exec retries. Linux collects
+    /// through the binder's mm from any caller; here only the binder's own
+    /// address space can (`ENOSYS` from another process).
+    pub fn revalidate_userptrs(
+        &self,
+        state: &mut State,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        if !self.userptrs_stale() {
+            return Ok(());
+        }
+        // Bindings change only under `state`, which the caller holds, so the
+        // list is worked on unlocked (pins fault user memory) and put back.
+        let mut records = core::mem::take(&mut *self.userptrs.lock());
+        let outcome = self
+            .recollect(&records, &state.mappings, user)
+            .map(|(mappings, fresh)| {
+                state.publish(mappings);
+                records.extend(fresh);
+                records.retain(|record| state.mappings.iter().any(|m| record.names(m)));
+            });
+        *self.userptrs.lock() = records;
+        outcome
+    }
+
+    /// The replacement mapping set and bindings for every invalidated
+    /// binding in `records`; see [`Self::revalidate_userptrs`].
+    fn recollect(
+        &self,
+        records: &[Userptr],
+        published: &[VmMapping],
+        user: &dyn IoctlContext,
+    ) -> Result<(Vec<VmMapping>, Vec<Userptr>), FsError> {
+        let caller = user.address_space_identity();
+        let mut mappings = published.to_vec();
+        let mut gone = Vec::new();
+        let mut fresh = Vec::new();
+        for record in records.iter().filter(|record| record.stale()) {
+            for (index, mapping) in mappings.iter_mut().enumerate() {
+                if !record.names(mapping) {
+                    continue;
+                }
+                let released = record.notifier.is_released();
+                if !released && caller != Some(record.notifier.address_space_id()) {
+                    return Err(FsError::NotImplemented);
+                }
+                let collected = if released {
+                    Err(FsError::BadAddress)
+                } else {
+                    pin_userptr(
+                        self,
+                        user,
+                        record.address + mapping.offset,
+                        mapping.length,
+                        record.writable,
+                    )
+                };
+                match collected {
+                    Ok((object, mirror)) => {
+                        mapping.object = Some(object);
+                        mapping.offset = 0;
+                        fresh.push(mirror);
+                    }
+                    Err(FsError::BadAddress) => gone.push(index),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let mut index = 0;
+        mappings.retain(|_| {
+            index += 1;
+            !gone.contains(&(index - 1))
+        });
+        Ok((mappings, fresh))
+    }
+}
+
+/// The VM's interval-notifier consumer (`vma_userptr_invalidate`). It runs
+/// under the CPU address space's IRQ-masked mapping locks and must not block,
+/// so it cannot wait for the VM's jobs as Linux does, and it has nothing
+/// else to do: the registry has already published the new sequence, which
+/// exec compares before building and again before submitting a job (the
+/// `invalidated` list Linux moves the VMA to), and every running job holds
+/// the pins it was built with until it retires, so the GPU never reaches a
+/// released frame. Jobs submitted before the invalidation finish against
+/// those retained frames instead of being waited for.
+#[derive(Debug, Default)]
+pub(crate) struct UserptrNotifier;
+
+impl MmuIntervalNotifierOps for UserptrNotifier {
+    fn invalidate(&self, _interval: &MmuInterval, _range: &MmuNotifierRange, _cur_seq: u64) {}
+}
+
+/// One published MAP_USERPTR binding: the interval over its CPU range and
+/// the pinned object every mapping slice of the binding names.
+#[derive(Debug)]
+pub(crate) struct Userptr {
+    notifier: MmuIntervalNotifier,
+    /// CPU address of the object's first page.
+    address: u64,
+    /// Interval sequence the object's pins were collected under.
+    seq: u64,
+    object: Weak<GemObject>,
+    writable: bool,
+}
+
+impl Userptr {
+    fn names(&self, mapping: &VmMapping) -> bool {
+        mapping
+            .object
+            .as_ref()
+            .is_some_and(|object| core::ptr::eq(Arc::as_ptr(object), self.object.as_ptr()))
+    }
+
+    fn stale(&self) -> bool {
+        self.notifier.read_retry(self.seq)
+    }
+}
+
+/// `xe_vma_userptr_pin_pages`: register an interval over
+/// `[address, address + length)` of the caller's address space, then collect
+/// the range inside `read_begin`/`read_retry` until no invalidation raced
+/// the collection.
+fn pin_userptr(
+    vm: &Vm,
+    user: &dyn IoctlContext,
+    address: u64,
+    length: u64,
+    writable: bool,
+) -> Result<(Arc<GemObject>, Userptr), FsError> {
+    let notifier = user.mmu_interval_notifier(address, length, vm.userptr_ops.clone())?;
+    for _ in 0..USERPTR_PIN_ROUNDS {
+        let seq = notifier.read_begin();
+        let pins = user.pin_user_pages(address, length / 4096, writable)?;
+        if notifier.read_retry(seq) {
+            continue;
+        }
+        let object = GemObject::from_user_pins(pins, vm.identity)?;
+        let mirror = Userptr {
+            notifier,
+            address,
+            seq,
+            object: Arc::downgrade(&object),
+            writable,
+        };
+        return Ok((object, mirror));
+    }
+    // drm_gpusvm_get_pages' -EBUSY: exec returns it; bind maps it to ENOMEM.
+    Err(FsError::Busy)
 }
 
 #[derive(Debug)]
@@ -62,6 +268,8 @@ pub(crate) struct Bind {
     /// MAP_USERPTR source address, pinned only after every op's arguments
     /// validate (Linux checks all ops before faulting any pages).
     pub userptr: Option<u64>,
+    /// The collected MAP_USERPTR binding, adopted when the bind publishes.
+    pub mirror: Option<Userptr>,
 }
 
 /// PAT indices coherent with CPU caches that this driver programs.
@@ -120,6 +328,7 @@ impl Bind {
                 op,
                 mapping: None,
                 userptr: None,
+                mirror: None,
             });
         }
         if address % 4096 != 0
@@ -140,6 +349,7 @@ impl Bind {
                 op,
                 mapping: None,
                 userptr: None,
+                mirror: None,
             });
         }
         if op == 2 {
@@ -164,6 +374,7 @@ impl Bind {
                     pat: pat as u8,
                 }),
                 userptr: Some(offset),
+                mirror: None,
             });
         }
         if op != 0 {
@@ -215,22 +426,31 @@ impl Bind {
                 pat: pat as u8,
             }),
             userptr: None,
+            mirror: None,
         })
     }
 
     /// Fault in and pin a MAP_USERPTR range (write-resolving unless READONLY)
-    /// as a VM-private object. Pins are snapshot lifetime holds: jobs and
-    /// mappings retain them, so the GPU never reaches freed memory.
+    /// as a VM-private object, under an interval notifier registered first
+    /// (`xe_userptr_setup` then `xe_vma_userptr_pin_pages`). Pins are lifetime
+    /// holds: jobs and mappings retain them, so the GPU never reaches freed
+    /// memory; the notifier makes exec re-collect the range once the CPU
+    /// mapping changes. An invalidation racing every collection round is
+    /// `-EBUSY` from `drm_gpusvm_get_pages`, which bind reports as `ENOMEM`.
     pub fn pin(&mut self, vm: &Vm, user: &dyn IoctlContext) -> Result<(), FsError> {
         let Some(address) = self.userptr else {
             return Ok(());
         };
         let mapping = self.mapping.as_mut().expect("userptr mapping");
-        let pins = user.pin_user_pages(address, mapping.length / 4096, mapping.writable)?;
-        mapping.object = Some(crate::intel_gpu_gem::GemObject::from_user_pins(
-            pins,
-            vm.identity,
-        )?);
+        // new_vma: "-EBUSY ... can only fail with -EBUSY if we are low on
+        // memory so convert this to -ENOMEM".
+        let (object, mirror) = pin_userptr(vm, user, address, mapping.length, mapping.writable)
+            .map_err(|error| match error {
+                FsError::Busy => FsError::OutOfMemory,
+                error => error,
+            })?;
+        mapping.object = Some(object);
+        self.mirror = Some(mirror);
         Ok(())
     }
 }
@@ -393,6 +613,7 @@ mod tests {
             op: 1,
             mapping: None,
             userptr: None,
+            mirror: None,
         };
         let mapped = state.prepare(&[unmap], true).unwrap();
         assert_eq!(
@@ -423,6 +644,7 @@ mod tests {
                 pat: 0,
             }),
             userptr: None,
+            mirror: None,
         };
         let mapped = state.prepare(&[replace], true).unwrap();
         assert_eq!(mapped.len(), 3);
@@ -437,6 +659,7 @@ mod tests {
             op: 3,
             mapping: None,
             userptr: None,
+            mirror: None,
         };
         gem.close(handle).unwrap();
         let mapped = state.prepare(&[all], true).unwrap();

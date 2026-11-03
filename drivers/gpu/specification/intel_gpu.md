@@ -2485,9 +2485,10 @@ Xe MAP_USERPTR is admitted with snapshot pins: the syscall boundary faults the
 range, resolves write COW copies and retains `UserPagePin`s that every mapping
 and job holds through retirement, so the GPU never reaches freed memory. Fork
 copies pinned private pages for the child (`page_needs_cow_for_dma`), so the
-pins keep aliasing the binder's memory. Linux parity still needs
-`xe_userptr.c`'s invalidation/repin/rebind against unmap and replacement,
-which requires a memory-layer MMU notifier. amdgpu GEM_USERPTR shares this gap.
+pins keep aliasing the binder's memory. Each binding also registers a
+memory-layer interval notifier, and EXEC re-collects or drops an invalidated
+binding (`xe_userptr.c` invalidation/repin/rebind; see the USERPTR subsection
+of §20). amdgpu GEM_USERPTR still uses snapshot pins only.
 
 iGPU `DRM_XE_GEM_CPU_CACHING_WC` objects are admitted (MIT Linux
 b90c984d615e8ce2af96f5b1411a962d83fed2ad `xe_ttm_tt_create`,
@@ -2584,7 +2585,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Native gamma activation/bypass | 1024-entry Pipe-A LUT, owned copies/blobs, safe inactive preload, preserved flips and later-frame restoration | Implemented; native fixtures pass |
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
-| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/VM dependency |
+| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20); i915 GEM_USERPTR, fault-mode/CPU-mirror VMs, long-running VMs and VRAM CPU-mapping revocation remain |
 | Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; bounded BMG allocation does not close migration/alias ownership |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
@@ -7068,3 +7069,78 @@ Changed fixtures:
   priority 3 for every default i915 registration and now asserts 2.
 - The GuC model accepts a 4-word priority-only UPDATE_CONTEXT_POLICIES only
   for a registered context, and records it.
+
+### Xe MAP_USERPTR invalidation over memory/ interval notifiers — native fixtures added
+
+Sources are Linux b90c984d: `mm/mmu_notifier.c` (the interval API),
+`xe_userptr.c` (`xe_userptr_setup`, `vma_userptr_invalidate`,
+`xe_vm_userptr_pin`, `__xe_vm_userptr_needs_repin`), `xe_exec.c`
+(`xe_exec_ioctl`'s pin and `-EAGAIN` retry), `xe_vm.c::new_vma` and
+`drm_gpusvm.c::drm_gpusvm_get_pages`. This is TCB-class work: the
+notifier is new memory/ code (`memory/specification/spec.md` §3 and §4,
+`safety-argument.toml`).
+
+**Memory layer.** `narf_memory::mmu_notifier::MmuIntervalNotifier::insert`
+registers `[start, start + length)` of one address space. Each operation
+that changes the frame a VA translates to, or removes READ/WRITE, calls the
+registry while it still holds the lock that serializes the change and before
+it frees anything. That covers munmap/MAP_FIXED/brk shrink, mremap and
+MREMAP_DONTUNMAP sources, truncate zaps, MADV_DONTNEED and GUARD_INSTALL, COW
+breaks, swap-out, lazy-free discard, mprotect downgrades, migration, the OOM
+reaper, exit and final drop. The registry stores a fresh odd sequence before
+calling the consumer, so the Linux `read_begin`/`read_retry` protocol holds;
+pins take the same lock, so `read_begin` need not wait. Callbacks are
+non-blocking (`blockable()` is always false). The lock order is mapping
+locks, then a registry shard, then the consumer's leaf lock, and nothing in
+the registry takes a mapping lock.
+
+**Consumer.** Bind registers the interval before pinning and repeats a
+collection that an invalidation raced; eight raced rounds are ENOMEM at bind
+and EBUSY at EXEC, as in Linux. EXEC
+compares each binding's pin sequence and re-collects every slice of an
+invalidated binding over its own CPU range under a fresh interval. It
+rebuilds the job if a binding goes stale before submission. A slice whose
+range is gone (EFAULT, or the binder exited) is dropped from the VM, and the
+exec proceeds with that range unmapped or on scratch, as Linux invalidates
+the VMA. EPERM (a writable binding over memory made read-only), ENOMEM and EBUSY
+fail the exec; the binding stays invalidated, and the next EXEC retries.
+
+**Deviations, with the safety argument.** Linux's `vma_userptr_invalidate`
+waits for the VM's bookkeeping fences because HMM pages are not pinned. NARF
+invokes callbacks under IRQ-masked mapping locks, where waiting for a GPU
+job could deadlock the mm. The callback therefore does no work. The
+snapshot-pin invariant is kept: every job holds the pins it was built with
+until it retires, so the GPU never reaches a frame that was released or
+reused. The notifier adds that no job built after the invalidation uses the
+old pins. A job submitted before an unmap returns may still finish against
+the retained old frames afterwards. Only the binder's own address space can
+re-collect: another process's EXEC on a shared VM is ENOSYS, where Linux
+pins through the binder's mm. An address + length overflow stays EFAULT
+(Linux: -EOVERFLOW). The memory/ swap-out batch and lazy-free discard
+primitives do not refuse a pinned page, and multi-owner compaction
+(`migrate_frame_multi`) repoints a COW-shared pinned page; Linux refuses
+pinned folios on all three paths. The notifier now makes EXEC re-collect
+after those changes, but the paths themselves are unchanged.
+
+**VRAM CPU-mapping revocation** (revoke a device-frame set, then refault after
+runtime resume) is not part of this slice. Autosuspend with live VRAM
+mappings stays refused.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `memory`: `smoke_mmu_notifier_registration_range_filter_and_removal`,
+  `smoke_mmu_notifier_sorted_scan_and_per_space_cap`,
+  `smoke_mmu_notifier_seq_read_begin_retry_protocol`,
+  `smoke_mmu_notifier_fires_for_each_mapping_operation`,
+  `smoke_mmu_notifier_invalidates_before_frame_release`,
+  `smoke_mmu_notifier_fork_cow_break_and_child_isolation`,
+  `smoke_mmu_notifier_exit_and_drop_release_intervals`,
+  `smoke_mmu_notifier_racing_reader_every_interleaving` and, on x86_64,
+  `smoke_mmu_notifier_migration_refuses_pins_and_fires_on_move` and
+  `smoke_mmu_notifier_lazyfree_discard_fires_clear`.
+- `drivers/gpu/intel_gpu_user`:
+  `smoke_xe_userptr_invalidation_repins_zaps_and_refuses`. Its `Cpu`
+  fixture now models the process's VMAs in a real `AddressSpace`, so
+  munmap, mprotect and MADV_DONTNEED on it fire the production notifier
+  path. The existing `smoke_xe_userptr_bind_exec_validation_and_retirement`
+  keeps its expectations.
