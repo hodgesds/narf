@@ -82,6 +82,8 @@ pub mod vif_bsscfg;
 pub mod vif_demux;
 pub mod vif_owner;
 pub mod vif_wire;
+pub mod p2p_wire;
+pub mod p2p;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 
@@ -140,3 +142,6 @@ mod vif_owner_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod vif_bsscfg_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod p2p_tests;

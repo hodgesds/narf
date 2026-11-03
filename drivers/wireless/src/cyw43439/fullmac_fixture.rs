@@ -122,12 +122,24 @@ impl Firmware {
     /// Native `BRCMF_E_IF` (`struct brcmf_if_event`) for the secondary
     /// queue; dropped unless the host listens, as the transports do.
     pub fn if_event(&mut self, action: u8, ifidx: u8, bsscfgidx: u8, role: u8, mac: [u8; 6]) {
+        self.if_event_flags(action, ifidx, bsscfgidx, 0, role, mac);
+    }
+    /// `brcmf_if_event` with explicit `flags` (e.g. `BRCMF_E_IF_FLAG_NOIF`).
+    pub fn if_event_flags(
+        &mut self,
+        action: u8,
+        ifidx: u8,
+        bsscfgidx: u8,
+        flags: u8,
+        role: u8,
+        mac: [u8; 6],
+    ) {
         self.secondary_event(
             54,
             ifidx,
             bsscfgidx,
             mac,
-            &[ifidx, action, 0, bsscfgidx, role],
+            &[ifidx, action, flags, bsscfgidx, role],
         );
     }
     pub fn secondary_event(
@@ -138,6 +150,20 @@ impl Firmware {
         source: [u8; 6],
         payload: &[u8],
     ) {
+        self.secondary_event_status(kind, ifidx, bsscfgidx, source, 0, 0, payload);
+    }
+    /// Secondary event with native `status`/`reason` header fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn secondary_event_status(
+        &mut self,
+        kind: u32,
+        ifidx: u8,
+        bsscfgidx: u8,
+        source: [u8; 6],
+        status: u32,
+        reason: u32,
+        payload: &[u8],
+    ) {
         if !self.vif_listening {
             return;
         }
@@ -146,8 +172,8 @@ impl Firmware {
                 version: 2,
                 flags: 0,
                 event_type: kind,
-                status: 0,
-                reason: 0,
+                status,
+                reason,
                 auth_type: 0,
                 datalen: payload.len() as u32,
                 source_mac: source,

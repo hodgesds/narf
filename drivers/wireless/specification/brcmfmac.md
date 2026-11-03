@@ -1383,10 +1383,82 @@ without a write; the next writer drops those bits. A primary AP stop
 restores the firmware mask it saved at start as the primary need, so
 bits that were live then stay set until the next station write.
 
+#### P2P firmware owners (groundwork)
+
+`brcmfmac::p2p_wire` holds the `p2p.c`/`fwil_types.h` encodings:
+`brcmf_p2p_disc_st_le` (`p2p_state`, packed 5 bytes), `brcmf_fil_p2p_if_le`
+(`p2p_ifadd`, 10 bytes, CLIENT 0 / GO 1), `brcmf_fil_af_params_le`
+(1828 bytes, built from an 802.11 action frame as
+`brcmf_cfg80211_mgmt_tx` does: channel, dwell = `wait`, BSSID, DA, body
+length, `packet_id` = low 32 cookie bits), `brcmf_rx_mgmt_data` (strict:
+a short or truncated `BRCMF_E_ACTION_FRAME_RX` payload is refused),
+`brcmf_p2p_generate_bss_mac` (device, connection and connection2
+addresses), the `brcmf_p2p_is_{pub,dpp_pub,p2p,gas}_action` classifiers
+and the `brcmf_p2p_pub_af_tx`/GAS dwell, next-subtype, search, MPC and
+GO-negotiation-phase policy.
+
+`vif_owner::Owner` gains the P2P roles (`Role::P2pDevice`, `P2pClient`,
+`P2pGo`) and `admits_counts`, the full `brcmf_setup_ifmodes` table with
+P2P limits (combo0: P2P_DEVICE <= 1, P2P_CLIENT|P2P_GO <= 1, `max` = its
+limit count; P2P combination: STA 1, AP 1, P2P_CLIENT 1, P2P_DEVICE 1;
+no P2P iftype without `p2p`). `create_p2p_device` is
+`brcmf_p2p_create_p2pdev` (`brcmf_p2p_set_firmware`: `BRCMF_C_DOWN`,
+`apsta 1`, `BRCMF_C_UP`, `p2p_disc 0`, `p2p_da_override`; then, with the
+vif event armed and `p2pdev_setup_ongoing` passed to `classify`,
+`p2p_disc 1`, the NOIF IF ADD wait and the `p2p_dev` bsscfg check — Linux
+only WARNs on a mismatch, NARF disables the discovery bsscfg and fails).
+`remove_p2p_device` is the device branch of `brcmf_p2p_del_vif`
+(`p2p_state` SCAN, `p2p_disc 0`, IF DEL wait; a missed DEL still drops the
+host entry and reports the error, as `brcmf_remove_interface` runs in
+Linux). `create_p2p`/`remove_p2p` are the CLIENT/GO branches:
+`p2p_ifadd` with `brcmf_p2p_get_current_chanspec` (primary
+`BRCMF_C_GET_BSSID` + `BRCMF_C_GET_BSS_INFO` chanspec, else channel 11
+20 MHz), IF ADD wait, `roam_off 1` and for a GO
+`BRCMF_C_SET_SCB_TIMEOUT 20` on the new ifidx; removal issues GO
+`p2p_ifdis` and waits up to `BRCMF_P2P_DISABLE_TIMEOUT` for the GO
+bsscfg's `BRCMF_E_LINK`/`LINK_BSSCFG_DIS` (`vif_disabled`), then
+`p2p_ifdel` with the interface address, the IF DEL and the ifidx
+retirement. `Owner::create` now refuses P2P roles (they never use
+`interface_create`).
+
+`brcmfmac::p2p::Device` is the discovery bsscfg owner
+(`struct brcmf_p2p_info` subset): `start`/`stop`
+(`brcmf_p2p_enable_discovery`: `p2p_disc 1`, bsscfg `p2p_state` SCAN,
+bsscfg `wsec` AES; the P2P handler events 55/60/70/72/75 join the
+composed mask as the device ifidx's need), `remain_on_channel` /
+`cancel_remain_on_channel` (bsscfg `p2p_state` LISTEN with the 20 MHz
+chanspec and dwell; `BRCMF_E_P2P_DISC_LISTEN_COMPLETE` or cancel yields
+`Notice::RocExpired`; a listen in progress is re-reported under the new
+cookie as Linux's WAR does), `send_action_frame`
+(`brcmf_p2p_send_action_frame`: unknown frames are not sent and report
+no ACK; bsscfg `actframe` up to five attempts, 40 ms apart on a nonzero
+channel, each waiting up to 2 s for `BRCMF_E_ACTION_FRAME_COMPLETE` and,
+off the listen channel, `..._OFF_CHAN_COMPLETE`; `mpc` off/on per policy;
+`CUSTOM_RETRY_MASK` dwell overflow; GO-negotiation phase, next-subtype
+wait, `actframe_abort` from `brcmf_p2p_stop_wait_next_action_frame` and
+the `brcmf_p2p_gon_req_collision` address tie-break) and event service
+(`brcmf_p2p_notify_action_frame_rx`: requires the action registration,
+rebuilds the 802.11 frame with DA = device address, SA = event source,
+BSSID from the bsscfg's `BRCMF_C_GET_BSSID` or zero;
+`brcmf_p2p_notify_rx_mgmt_p2p_probereq`: bsscfg 0 and GO-negotiation
+phase filtered, needs the probe-request registration). Not mirrored, and
+unreachable in Linux as well without the P2P escan: the peer-channel
+search (needs saved P2P probe-request IEs) and the extra-listen WAR
+(needs `my_listen_chan`); the P2P escan (`p2p_scan` 'E', `DIRECT-`
+wildcard, social channels) itself is not implemented.
+
+Three written/unexecuted cases in `drivers/wireless/brcmfmac/p2p`
+(`p2p_tests.rs`, both fixture families):
+`smoke_brcmf_p2p_wire_layouts_and_action_policy`,
+`smoke_brcmf_p2p_device_discovery_listen_and_action_frames` and
+`smoke_brcmf_p2p_connection_bsscfg_ifadd_and_ifdel`.
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: secondary-ifidx fixtures and advertisement, and for
-P2P the `p2p.c` discovery bsscfg (`p2p_disc`, `p2p_ifadd`/`p2p_ifdel`,
-`bsscfg:p2p_da_override`), action-frame TX/RX and GO negotiation owners.
+either family: the nl80211 surface over these owners (P2P_DEVICE control
+WDEV with start/stop, ROC, management TX/RX registration; P2P_CLIENT and
+P2P_GO netdevs driving the secondary station/AP roles on the
+`create_p2p` bsscfg), the P2P escan, transport-model (msgbuf/SDIO)
+fixtures, and P2P iftype/combination advertisement, which stays off.
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
 written for this foundation.
 

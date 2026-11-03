@@ -543,8 +543,10 @@ impl<R: Fullmac + 'static> Device<R> {
         info.base_name = name.into();
         info.base_mac = provisional;
         info.modes = match role {
-            Role::Station => narf_wireless::iface::WirelessModes::STATION,
-            Role::Ap => narf_wireless::iface::WirelessModes::AP,
+            Role::Station | Role::P2pClient | Role::P2pDevice => {
+                narf_wireless::iface::WirelessModes::STATION
+            }
+            Role::Ap | Role::P2pGo => narf_wireless::iface::WirelessModes::AP,
         };
         let (rx_producer, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx_consumer) = narf_ipc::channel();
@@ -953,6 +955,9 @@ impl WirelessNetIface for VifDevice {
         match self.role {
             Role::Station => 2,
             Role::Ap => 3,
+            Role::P2pClient => 8,
+            Role::P2pGo => 9,
+            Role::P2pDevice => 10,
         }
     }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {

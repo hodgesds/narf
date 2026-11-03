@@ -43,13 +43,48 @@ pub const EVENT_DEPTH: usize = 32;
 pub enum Role {
     Station,
     Ap,
+    /// Non-netdev P2P device (discovery) bsscfg (`p2p.c` `P2PAPI_BSSCFG_DEVICE`).
+    P2pDevice,
+    /// `NL80211_IFTYPE_P2P_CLIENT` connection bsscfg (`p2p_ifadd` CLIENT).
+    P2pClient,
+    /// `NL80211_IFTYPE_P2P_GO` connection bsscfg (`p2p_ifadd` GO).
+    P2pGo,
 }
 impl Role {
     fn kind(self) -> CreateKind {
         match self {
-            Self::Station => CreateKind::Station,
-            Self::Ap => CreateKind::Ap,
+            Self::Ap | Self::P2pGo => CreateKind::Ap,
+            _ => CreateKind::Station,
         }
+    }
+}
+
+/// Interface counts of one candidate set (requested interface included).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Counts {
+    pub stations: u8,
+    pub aps: u8,
+    pub p2p_devices: u8,
+    pub p2p_clients: u8,
+    pub p2p_gos: u8,
+}
+impl Counts {
+    pub fn add(&mut self, role: Role) {
+        let slot = match role {
+            Role::Station => &mut self.stations,
+            Role::Ap => &mut self.aps,
+            Role::P2pDevice => &mut self.p2p_devices,
+            Role::P2pClient => &mut self.p2p_clients,
+            Role::P2pGo => &mut self.p2p_gos,
+        };
+        *slot = slot.saturating_add(1);
+    }
+    fn total(self) -> u8 {
+        self.stations
+            .saturating_add(self.aps)
+            .saturating_add(self.p2p_devices)
+            .saturating_add(self.p2p_clients)
+            .saturating_add(self.p2p_gos)
     }
 }
 
@@ -57,16 +92,53 @@ impl Role {
 /// (RSDB absent). `stations`/`aps` include the requested interface.
 /// Monitor interfaces are not counted: none is created through this owner.
 pub fn admits(features: Features, stations: u8, aps: u8) -> bool {
+    admits_counts(
+        features,
+        Counts {
+            stations,
+            aps,
+            ..Counts::default()
+        },
+    )
+}
+
+/// [`admits`] with the P2P iftypes: combo0 with `p2p` adds P2P_DEVICE <= 1
+/// and P2P_CLIENT|P2P_GO <= 1 (`max_interfaces` = its limit count); the P2P
+/// combination is STA 1, AP 1, P2P_CLIENT 1, P2P_DEVICE 1 (max 4). Without
+/// `p2p` no P2P iftype exists (`interface_modes` lacks them).
+pub fn admits_counts(features: Features, counts: Counts) -> bool {
+    let p2p_roles = counts.p2p_devices + counts.p2p_clients + counts.p2p_gos;
+    if !features.p2p && p2p_roles != 0 {
+        return false;
+    }
     let mon = u8::from(features.monitor_flag);
-    let total = stations.saturating_add(aps);
+    let total = counts.total();
+    let Counts {
+        stations,
+        aps,
+        p2p_devices,
+        p2p_clients,
+        p2p_gos,
+    } = counts;
     let combo0 = if features.p2p {
-        // c0: STA <= 1 + mchan, P2P limits, no AP entry.
-        stations <= 1 + u8::from(features.mchan) && aps == 0 && total <= 3 + mon
+        // c0 limits: STA (1 + mchan), [MONITOR], P2P_DEVICE 1,
+        // P2P_CLIENT|P2P_GO 1; max_interfaces = number of limits.
+        stations <= 1 + u8::from(features.mchan)
+            && aps == 0
+            && p2p_devices <= 1
+            && p2p_clients + p2p_gos <= 1
+            && total <= 3 + mon
     } else {
         stations <= 1 && aps <= 1 && total <= 2 + mon
     };
-    let p2p = features.p2p && stations <= 1 && aps <= 1 && total <= 4;
-    let mbss = features.mbss && stations == 0 && aps <= 4 && total <= 4 + mon;
+    let p2p = features.p2p
+        && stations <= 1
+        && aps <= 1
+        && p2p_clients <= 1
+        && p2p_gos == 0
+        && p2p_devices <= 1
+        && total <= 4;
+    let mbss = features.mbss && p2p_roles == 0 && stations == 0 && aps <= 4 && total <= 4 + mon;
     combo0 || p2p || mbss
 }
 
@@ -93,6 +165,8 @@ pub struct Owner {
     /// replacement or unsolicited DEL); their owners must retire them.
     retired: VecDeque<Entry>,
     events: VecDeque<(u64, Event)>,
+    /// `fweh->p2pdev_setup_ongoing` (`brcmf_fweh_p2pdev_setup`).
+    p2pdev_setup: bool,
 }
 
 impl Owner {
@@ -108,6 +182,7 @@ impl Owner {
             observed: None,
             retired: VecDeque::new(),
             events: VecDeque::new(),
+            p2pdev_setup: false,
         }
     }
     pub fn features(&self) -> Features {
@@ -124,32 +199,28 @@ impl Owner {
     /// change to `role` beside the live secondary interfaces (combinations
     /// are checked only when another interface exists).
     pub fn can_change_primary(&self, role: Role) -> bool {
-        let (mut stations, mut aps) = (u8::from(role == Role::Station), u8::from(role == Role::Ap));
+        let mut counts = Counts::default();
+        counts.add(role);
         let mut concurrent = false;
         for current in self.roles.iter().flatten() {
             concurrent = true;
-            match current {
-                Role::Station => stations += 1,
-                Role::Ap => aps += 1,
-            }
+            counts.add(*current);
         }
-        !concurrent || admits(self.features, stations, aps)
+        !concurrent || admits_counts(self.features, counts)
     }
     /// Whether an additional interface of `role` fits a combination now.
     pub fn can_add(&self, role: Role) -> bool {
-        let mut stations = u8::from(self.primary_role == Role::Station);
-        let mut aps = u8::from(self.primary_role == Role::Ap);
+        let mut counts = Counts::default();
+        counts.add(self.primary_role);
         for current in self.roles.iter().flatten() {
-            match current {
-                Role::Station => stations += 1,
-                Role::Ap => aps += 1,
-            }
+            counts.add(*current);
         }
-        match role {
-            Role::Station => stations += 1,
-            Role::Ap => aps += 1,
-        }
-        admits(self.features, stations, aps)
+        counts.add(role);
+        admits_counts(self.features, counts)
+    }
+    /// The live role of secondary bsscfg `bsscfgidx`.
+    pub fn role(&self, bsscfgidx: u8) -> Option<Role> {
+        *self.roles.get(bsscfgidx as usize)?
     }
     pub fn pop_retired(&mut self) -> Option<Entry> {
         self.retired.pop_front()
@@ -202,7 +273,8 @@ impl Owner {
             else {
                 continue;
             };
-            let Disposition::Apply { event, p2p_device } = classify(parsed, false) else {
+            let Disposition::Apply { event, p2p_device } = classify(parsed, self.p2pdev_setup)
+            else {
                 continue;
             };
             match self.registry.apply(event, p2p_device, header.source_mac) {
@@ -262,7 +334,7 @@ impl Owner {
         if self.armed.is_some() {
             return Err(Error::Busy);
         }
-        if !self.can_add(role) {
+        if !matches!(role, Role::Station | Role::Ap) || !self.can_add(role) {
             return Err(Error::Unsupported);
         }
         runtime.vif_listen(true);
@@ -389,6 +461,342 @@ impl Owner {
         }
         Ok(())
     }
+}
+
+impl Owner {
+    /// `p2p.c::brcmf_p2p_create_p2pdev` from `brcmf_p2p_set_firmware` on:
+    /// `BRCMF_C_DOWN`, `apsta 1`, `BRCMF_C_UP`, `p2p_disc 0`,
+    /// `p2p_da_override` (their results are not checked, as in Linux),
+    /// then with the vif event armed and `p2pdev_setup_ongoing` set,
+    /// `p2p_disc 1` and the wait for the NOIF IF ADD of the discovery
+    /// bsscfg, verified against the `p2p_dev` iovar. The entry carries no
+    /// data mapping; `device` is the P2P Device Address.
+    pub async fn create_p2p_device<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        device: [u8; 6],
+    ) -> Result<Entry, Error> {
+        if !R::VIF_DEMUX {
+            return Err(Error::Unsupported);
+        }
+        if self.armed.is_some() || self.roles.contains(&Some(Role::P2pDevice)) {
+            // `-ENOSPC` for a second discovery vif.
+            return Err(Error::Busy);
+        }
+        if !self.can_add(Role::P2pDevice) {
+            return Err(Error::Unsupported);
+        }
+        if device == self.primary_mac || device == [0; 6] {
+            // "discovery vif must be different from primary interface".
+            return Err(Error::Malformed);
+        }
+        // brcmf_p2p_set_firmware.
+        firmware_result(set_cmd(runtime, super::fwil::BRCMF_C_DOWN, 1).await)?;
+        firmware_result(set_plain(runtime, b"apsta", &1u32.to_le_bytes()).await)?;
+        firmware_result(set_cmd(runtime, super::fwil::BRCMF_C_UP, 1).await)?;
+        firmware_result(set_plain(runtime, b"p2p_disc", &0u32.to_le_bytes()).await)?;
+        firmware_result(set_plain(runtime, b"p2p_da_override", &device).await)?;
+        runtime.vif_listen(true);
+        self.armed = Some(IfAction::Add);
+        self.observed = None;
+        self.p2pdev_setup = true;
+        let result: Result<Entry, Error> = async {
+            listen_events(runtime).await?;
+            set_plain(runtime, b"p2p_disc", &1u32.to_le_bytes()).await?;
+            match self.wait(runtime).await? {
+                Observed::Added(entry) if entry.p2p_device && entry.bsscfgidx != 0 => Ok(entry),
+                _ => Err(Error::Malformed),
+            }
+        }
+        .await;
+        self.armed = None;
+        self.observed = None;
+        self.p2pdev_setup = false;
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.withdraw_listener(runtime);
+                return Err(error);
+            }
+        };
+        self.roles[entry.bsscfgidx as usize] = Some(Role::P2pDevice);
+        // "verify bsscfg index for P2P discovery" (Linux only WARNs; NARF
+        // refuses an unverified discovery bsscfg and disables it again).
+        let verified = match get(runtime, b"p2p_dev", &[0; 4]).await {
+            Ok(reply) if reply.len() >= 4 => {
+                u32::from_le_bytes([reply[0], reply[1], reply[2], reply[3]])
+                    == u32::from(entry.bsscfgidx)
+            }
+            Ok(_) => false,
+            Err(Error::Firmware(_)) => false,
+            Err(error) => return Err(error),
+        };
+        if !verified {
+            let _ = self.remove_p2p_device(runtime, entry).await;
+            return Err(Error::Malformed);
+        }
+        Ok(entry)
+    }
+
+    /// `p2p.c::brcmf_p2p_del_vif` for the device: `brcmf_p2p_deinit_discovery`
+    /// (`p2p_state` SCAN on the discovery bsscfg, `p2p_disc 0` on the
+    /// primary) and the wait for its IF DEL. The caller cancelled any
+    /// listen first (`brcmf_p2p_cancel_remain_on_channel`). A missing IF
+    /// DEL still removes the host entry, as `brcmf_remove_interface` runs
+    /// regardless in Linux.
+    pub async fn remove_p2p_device<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        entry: Entry,
+    ) -> Result<(), Error> {
+        if self.armed.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.registry.by_bsscfgidx(entry.bsscfgidx) != Some(entry) || !entry.p2p_device {
+            return Err(Error::Authority);
+        }
+        self.armed = Some(IfAction::Del);
+        self.observed = None;
+        let result: Result<(), Error> = async {
+            let state = super::p2p_wire::disc_state(super::p2p_wire::DiscState::Scan, 0, 0);
+            let input = vif_wire::bsscfg_iovar(entry.bsscfgidx, b"p2p_state", &state)?;
+            firmware_result(
+                runtime
+                    .command_vif(entry.ifidx, Direction::Set, SET_VAR, &input, input.len())
+                    .await,
+            )?;
+            firmware_result(set_plain(runtime, b"p2p_disc", &0u32.to_le_bytes()).await)?;
+            match self.wait(runtime).await? {
+                Observed::Removed(removed) if removed == entry => Ok(()),
+                _ => Err(Error::Malformed),
+            }
+        }
+        .await;
+        self.armed = None;
+        self.observed = None;
+        if result.is_err() && self.registry.by_bsscfgidx(entry.bsscfgidx) == Some(entry) {
+            // brcmf_remove_interface after a timed-out wait.
+            let _ = self.registry.apply(
+                IfEvent {
+                    ifidx: entry.ifidx,
+                    action: IfAction::Del,
+                    flags: vif_wire::IF_FLAG_NOIF,
+                    bsscfgidx: entry.bsscfgidx,
+                    role: vif_wire::IfRole::Station,
+                },
+                true,
+                entry.mac,
+            );
+            self.retire(entry);
+        }
+        runtime.events_compose(Need::Secondary(entry.ifidx), [0; event_mask::LEN]);
+        self.withdraw_listener(runtime);
+        result
+    }
+
+    /// `p2p.c::brcmf_p2p_add_vif` for CLIENT/GO: `p2p_ifadd` on the primary
+    /// (`brcmf_p2p_request_p2p_if`: connection address, type and the
+    /// current chanspec from `brcmf_p2p_get_current_chanspec`), the IF ADD
+    /// wait, then `roam_off 1` and for a GO `BRCMF_C_SET_SCB_TIMEOUT`.
+    pub async fn create_p2p<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        role: Role,
+        address: [u8; 6],
+    ) -> Result<Entry, Error> {
+        let kind = match role {
+            Role::P2pClient => super::p2p_wire::P2pIfType::Client,
+            Role::P2pGo => super::p2p_wire::P2pIfType::Go,
+            _ => return Err(Error::Unsupported),
+        };
+        if !R::VIF_DEMUX {
+            return Err(Error::Unsupported);
+        }
+        if self.armed.is_some() {
+            return Err(Error::Busy);
+        }
+        if !self.can_add(role) {
+            return Err(Error::Unsupported);
+        }
+        runtime.vif_listen(true);
+        self.armed = Some(IfAction::Add);
+        self.observed = None;
+        let result: Result<Entry, Error> = async {
+            listen_events(runtime).await?;
+            let chanspec = current_chanspec(runtime).await?;
+            let request = super::p2p_wire::p2p_if(address, kind, chanspec);
+            set_plain(runtime, b"p2p_ifadd", &request).await?;
+            match self.wait(runtime).await? {
+                Observed::Added(entry) if !entry.p2p_device && entry.bsscfgidx != 0 => Ok(entry),
+                _ => Err(Error::Malformed),
+            }
+        }
+        .await;
+        self.armed = None;
+        self.observed = None;
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.withdraw_listener(runtime);
+                return Err(error);
+            }
+        };
+        self.roles[entry.bsscfgidx as usize] = Some(role);
+        // Results ignored, as in brcmf_p2p_add_vif.
+        let input = vif_wire::bsscfg_iovar(0, b"roam_off", &1u32.to_le_bytes())?;
+        firmware_result(
+            runtime
+                .command_vif(entry.ifidx, Direction::Set, SET_VAR, &input, input.len())
+                .await,
+        )?;
+        if role == Role::P2pGo {
+            let value = super::p2p_wire::SCB_TIMEOUT_VALUE.to_le_bytes();
+            firmware_result(
+                runtime
+                    .command_vif(entry.ifidx, Direction::Set, SET_SCB_TIMEOUT, &value, 4)
+                    .await,
+            )?;
+        }
+        Ok(entry)
+    }
+
+    /// `p2p.c::brcmf_p2p_del_vif` for CLIENT/GO after the role stopped:
+    /// GO `p2p_ifdis` (then `BRCMF_P2P_DISABLE_TIMEOUT` for the disable),
+    /// `p2p_ifdel` with the interface address on the primary, the IF DEL
+    /// wait and the transport retirement of the ifidx.
+    pub async fn remove_p2p<R: Fullmac>(
+        &mut self,
+        runtime: &mut R,
+        entry: Entry,
+    ) -> Result<(), Error> {
+        let role = self.role(entry.bsscfgidx);
+        if !matches!(role, Some(Role::P2pClient | Role::P2pGo)) {
+            return Err(Error::Authority);
+        }
+        if self.armed.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.registry.by_bsscfgidx(entry.bsscfgidx) != Some(entry) {
+            return Err(Error::Authority);
+        }
+        self.armed = Some(IfAction::Del);
+        self.observed = None;
+        let result: Result<(), Error> = async {
+            if role == Some(Role::P2pGo)
+                && firmware_result(set_plain(runtime, b"p2p_ifdis", &entry.mac).await)?
+            {
+                // wait_for_completion_timeout(&cfg->vif_disabled,
+                // BRCMF_P2P_DISABLE_TIMEOUT): completed by the GO bsscfg's
+                // BRCMF_E_LINK with BRCMF_E_REASON_LINK_BSSCFG_DIS
+                // (`brcmf_notify_connect_status_ap`); the timeout is not an
+                // error. Other events of the stopped role are dropped.
+                let deadline = narf_time::Deadline::after_ms(super::p2p_wire::DISABLE_TIMEOUT_MS);
+                'disable: while !deadline.expired() {
+                    runtime.poll()?;
+                    self.service(runtime)?;
+                    while let Some(event) = self.pop_event(&entry) {
+                        if event.header.event_type == E_LINK
+                            && event.header.reason == REASON_LINK_BSSCFG_DIS
+                        {
+                            break 'disable;
+                        }
+                    }
+                    if self.registry.by_bsscfgidx(entry.bsscfgidx) != Some(entry) {
+                        break;
+                    }
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                }
+            }
+            set_plain(runtime, b"p2p_ifdel", &entry.mac).await?;
+            match self.wait(runtime).await? {
+                Observed::Removed(removed) if removed == entry => Ok(()),
+                _ => Err(Error::Malformed),
+            }
+        }
+        .await;
+        self.armed = None;
+        self.observed = None;
+        result?;
+        let deadline = narf_time::Deadline::after_ms(2000);
+        while !runtime.vif_close(entry.ifidx)? {
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        }
+        runtime.events_compose(Need::Secondary(entry.ifidx), [0; event_mask::LEN]);
+        self.withdraw_listener(runtime);
+        Ok(())
+    }
+
+    fn withdraw_listener<R: Fullmac>(&mut self, runtime: &mut R) {
+        if !self.live() {
+            runtime.vif_listen(false);
+            runtime.events_compose(Need::Interfaces, [0; event_mask::LEN]);
+        }
+    }
+}
+
+/// `BRCMF_C_SET_SCB_TIMEOUT`.
+const SET_SCB_TIMEOUT: u32 = 158;
+/// `BRCMF_E_LINK` / `BRCMF_E_REASON_LINK_BSSCFG_DIS`.
+const E_LINK: u32 = 16;
+const REASON_LINK_BSSCFG_DIS: u32 = 4;
+
+/// `brcmf_p2p_get_current_chanspec`: the primary's BSS chanspec when it is
+/// associated (`BRCMF_C_GET_BSSID` + `BRCMF_C_GET_BSS_INFO`), otherwise
+/// `BRCMF_P2P_TEMP_CHAN` (11) at 20 MHz.
+pub async fn current_chanspec<R: Fullmac>(runtime: &mut R) -> Result<u16, Error> {
+    let fallback = super::p2p_wire::chanspec20(11).ok_or(Error::Malformed)?;
+    match runtime
+        .command(Direction::Get, super::fwil::BRCMF_C_GET_BSSID, &[0; 6], 6)
+        .await
+    {
+        Ok(_) => {}
+        Err(Error::Firmware(_)) => return Ok(fallback),
+        Err(error) => return Err(error),
+    }
+    match runtime
+        .command(
+            Direction::Get,
+            super::fwil::BRCMF_C_GET_BSS_INFO,
+            &2048u32.to_le_bytes(),
+            2048,
+        )
+        .await
+    {
+        // buf + 4 is `struct brcmf_bss_info_le`; chanspec at offset 72.
+        Ok(reply) if reply.len() >= 78 => Ok(u16::from_le_bytes([reply[76], reply[77]])),
+        Ok(_) | Err(Error::Firmware(_)) => Ok(fallback),
+        Err(error) => Err(error),
+    }
+}
+
+/// A firmware refusal is reported as `Ok(false)` (Linux ignores or logs
+/// these results); transport failures end the operation.
+fn firmware_result<T>(result: Result<T, Error>) -> Result<bool, Error> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(Error::Firmware(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// `brcmf_fil_iovar_data_set` on the primary interface.
+async fn set_plain<R: Fullmac>(runtime: &mut R, name: &[u8], data: &[u8]) -> Result<(), Error> {
+    let input = vif_wire::bsscfg_iovar(0, name, data)?;
+    runtime
+        .command(Direction::Set, SET_VAR, &input, input.len())
+        .await
+        .map(|_| ())
+}
+
+/// `brcmf_fil_cmd_int_set` on the primary interface.
+async fn set_cmd<R: Fullmac>(runtime: &mut R, command: u32, value: u32) -> Result<(), Error> {
+    runtime
+        .command(Direction::Set, command, &value.to_le_bytes(), 4)
+        .await
+        .map(|_| ())
 }
 
 /// `brcmf_fweh_activate_events` always enables `BRCMF_E_IF`; here the
