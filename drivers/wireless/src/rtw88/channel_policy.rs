@@ -741,6 +741,12 @@ pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BO: rtw8822b.c rtw8822b_set_
 /// indices (`rtw8822b_set_tx_power_index_by_rate`), the band's response mask
 /// and, before association (`rtw_ops_mgd_prepare_tx`), `rtw8822b_do_iqk`.
 /// The B22 base channel 1 replays the same program with the `N2BP` indices.
+///
+/// The written tables carry only the legacy12 indices (every HT/VHT word
+/// zero), so the program refuses a gate with any extension bound (an
+/// `N2BL`/`N2BH`/wide record would otherwise lose its HT/VHT words). The
+/// retune owners (`station_retune_begin` on PCI) already require a base-only
+/// gate, as on C21/C22; this re-checks it on the gate the program runs under.
 async fn program8822b(
     io: &mut impl Io,
     gate: &Gate,
@@ -748,6 +754,9 @@ async fn program8822b(
     rfk: bool,
     rrsr: u32,
 ) -> Result<(), Error> {
+    if !gate.base_only() {
+        return Err(Error::State);
+    }
     let phy = gate.b22_phy().ok_or(Error::State)?;
     let indices = gate.b22_indices().ok_or(Error::State)?;
     let tables = indices.map(|path| {

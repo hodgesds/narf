@@ -1226,7 +1226,8 @@ fn b22_legacy_record(
 /// `N2BL` binds the exact `N2BS` grant (identity hashes its record digest
 /// and both paths' `N2BP` indices) under the B22 magic/header; C21/C22
 /// magics, a foreign identity or MAC refuse, and a bound record admits
-/// exactly its legacy12/WMM DATA profile. Written; not yet executed natively.
+/// exactly its legacy12/WMM DATA profile; the legacy-only retune program
+/// refuses the bound gate. Written; not yet executed natively.
 fn smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs() -> TestResult {
     use super::super::{packet_format::DataProfile, power_policy::Gate, station_profile::Source};
     use narf_capabilities::Cap;
@@ -1280,6 +1281,17 @@ fn smoke_rtw8822be_n2bl_legacy_wmm_binds_n2bs() -> TestResult {
         || !bound.allows_profile(DataProfile::LEGACY)
     {
         return TestResult::Fail("8822B N2BL binding differs from the C21/C22 family");
+    }
+    // program8822b writes legacy-only tables: refused over a bound extension.
+    let mut io = super::mac_tests::Model::new(3, 2);
+    io.sipi8822b = true;
+    if !matches!(
+        narf_scheduler::block_on(super::super::channel_policy::program(
+            &mut io, &bound, false
+        )),
+        Err(super::super::firmware_transport::Error::State)
+    ) {
+        return TestResult::Fail("8822B retune program ran over a bound N2BL");
     }
     TestResult::Pass
 }
