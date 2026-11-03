@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Original-controller idle and retained cold wake, distinct from station PS.
-use super::identity::RegisterIo as _;
 use super::*;
 use alloc::{boxed::Box, task::Wake, vec::Vec};
 use core::{

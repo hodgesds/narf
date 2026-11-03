@@ -3,6 +3,7 @@
 //! helper and fresh reset/EEPROM/PHY/calibration/MAC generation. Model
 //! register behavior and synthetic H assets are not physical qualification.
 use super::*;
+use crate::ath9k::identity::RegisterIo as _;
 use crate::ath9k::{
     calibration::tests::{channel_receipt_image, wide_image, ChannelReceipt},
     interface::Device,
