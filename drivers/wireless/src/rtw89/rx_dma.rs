@@ -308,6 +308,38 @@ impl Rx {
         }
         result
     }
+    /// WoW halt: the RXQ/RPQ host half of `rtw89_pci_reset_trx_rings`
+    /// (`wp = rp = 0`, no partial delivery or target RX tag). Unreaped
+    /// buffers are dropped as Linux drops them; every buffer stays mapped and
+    /// referenced by its descriptor. Returns the bases to re-publish.
+    pub(super) fn wow_rewind(&mut self) -> Result<[(RxRingRegs, u64, u16); 2], Error> {
+        if self.state != State::Polling {
+            return Err(Error::Terminal);
+        }
+        let rings = self.rings.as_mut().ok_or(Error::Terminal)?;
+        let mut bases = [(rings[0].regs, 0, 0); 2];
+        for (ring, base) in rings.iter_mut().zip(bases.iter_mut()) {
+            let address = ring
+                .descriptors
+                .as_ref()
+                .ok_or(Error::Terminal)?
+                .dma_addr()
+                .raw();
+            for buffer in &ring.buffers {
+                // SAFETY: the caller stopped RX HCI (INIT_CFG1) and observed
+                // TX/RX DMA idle; the four-byte RXBD-info header of every
+                // owned buffer is rewritten before the ring is re-published.
+                unsafe {
+                    core::ptr::write_bytes(buffer.as_mut_ptr(), 0, 4);
+                }
+                buffer.sync(0, BUFFER_SIZE);
+            }
+            ring.wp = 0;
+            ring.assembler = Assembler::default();
+            *base = (ring.regs, address, ring.buffers.len() as u16);
+        }
+        Ok(bases)
+    }
     pub fn fail(&mut self) {
         self.state = State::Terminal;
     }

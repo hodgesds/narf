@@ -117,6 +117,7 @@ impl Fixture {
             dma_reclaimed: false,
             lifecycle: super::super::radio_policy::Lifecycle::Initial,
             channel: None,
+            wow_trx: None,
         };
         Ok(Self { native, words })
     }

@@ -161,6 +161,17 @@ impl<T> CommandQueue<T> {
         }
         Ok(slot)
     }
+    /// `rtw89_pci_ops_reset` host half for CH12 (`bd_ring->wp = rp = 0`)
+    /// during a reversible WoW halt. Only a fully consumed live queue may
+    /// rewind; the retired-buffer quarantine is kept unchanged.
+    pub fn rewind(&mut self) -> Result<(), Error> {
+        if self.terminal || self.pending() != 0 || self.slots.iter().any(Option::is_some) {
+            return Err(Error::Busy);
+        }
+        self.wp = 0;
+        self.rp = 0;
+        Ok(())
+    }
     pub fn observe(&mut self, rp: u16) -> Result<Vec<T>, Error> {
         if self.terminal {
             return Err(Error::Terminal);

@@ -33,6 +33,8 @@ mod lps;
 mod monitor;
 #[path = "command_native/station.rs"]
 mod station;
+#[path = "command_native/wow.rs"]
+mod wow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -117,6 +119,8 @@ pub struct Native {
     /// Primary and retune epoch of the completed full program; cleared while
     /// a retune runs. Consumers compare the epoch they were built against.
     channel: Option<(u8, u32)>,
+    /// Open reversible WoW TRX window (`command_native/wow.rs`).
+    wow_trx: Option<wow::Trx>,
 }
 /// Current-authority BAR/config adapter for the DMA-stop proof.
 struct StopPort<'a> {
@@ -283,6 +287,7 @@ impl Native {
             dma_reclaimed: false,
             lifecycle: super::radio_policy::Lifecycle::Initial,
             channel: None,
+            wow_trx: None,
             gain_bases: None,
             radio_started: false,
             radio_shutdown: super::radio_shutdown::Shutdown::default(),

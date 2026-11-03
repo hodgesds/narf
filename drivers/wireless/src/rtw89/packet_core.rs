@@ -98,6 +98,8 @@ pub(super) unsafe trait Port: power::Io {
 enum Phase {
     Prepared,
     Running,
+    /// Reversible WoW halt: rings published, producers refused.
+    Halted,
     Stopped,
     Failed,
 }
@@ -854,6 +856,51 @@ impl Core {
                 .rings
                 .iter()
                 .all(|ring| !ring.armed && ring.descriptors.is_none())
+    }
+    /// `rtw89_wow_enable_trx_pre` host half: only a running, transmit-quiet
+    /// owner (no published frame awaiting BD consumption or RPQ release)
+    /// halts. Submission and polling are refused until [`Self::wow_resume`].
+    pub(super) fn wow_halt(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || !self.pending.is_empty() {
+            return Err(Error::Busy);
+        }
+        self.phase = Phase::Halted;
+        Ok(())
+    }
+    /// `rtw89_pci_ops_reset` host half: every TX ring back to index zero
+    /// with zeroed descriptors; returns (channel, regs, base, depth) for
+    /// `rtw89_pci_reset_trx_rings`.
+    pub(super) fn wow_rewind(
+        &mut self,
+    ) -> Result<Vec<(usize, super::dma::TxRingRegs, u64, u16)>, Error> {
+        if self.phase != Phase::Halted {
+            return Err(Error::State);
+        }
+        let mut bases = Vec::new();
+        for ring in &mut self.rings {
+            ring.queue.rewind()?;
+            let memory = ring.descriptors.as_ref().ok_or(Error::State)?;
+            copy_to(memory, 0, &alloc::vec![0; usize::from(format::DEPTH) * 8])?;
+            bases.push((
+                usize::from(ring.kind.channel()),
+                ring.kind.regs(),
+                memory.dma_addr().raw(),
+                format::DEPTH,
+            ));
+        }
+        Ok(bases)
+    }
+    /// Halted -> Running once the restart sequence re-opened the channels.
+    pub(super) fn wow_resume(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Halted {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// The exact TX stop bits of the rings this owner published.
+    pub(super) fn stop_mask(&self) -> u32 {
+        self.stop
     }
     pub(super) fn stop(&mut self, port: &mut impl Port) -> Result<(), Error> {
         self.phase = Phase::Stopped;

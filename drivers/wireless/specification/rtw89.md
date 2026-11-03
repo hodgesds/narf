@@ -1835,9 +1835,58 @@ image on resume must call `firmware_registry::load` again.
   from the AOAC report) and the `rtw89_c2h_wow_aoac_report` decoder (C2H
   class 3 function 0; GTK/IGTK material is not retained).
 
-**Not wired (why `wow` stays open).** No native owner sequences these yet.
-The whole row still needs, in Linux order (`rtw89_wow_suspend`/`resume`):
-1. Reversible TRX halt/restart on the retained station:
+**Reversible TRX halt/restart (`wow_trx.rs`, `command_native/wow.rs`) —
+implemented, unexecuted.** `wow_trx` holds the RTL8852B register sequences
+of `wow.c::rtw89_wow_enable_trx_pre/post` and `disable_trx_pre/post`
+(PCI info from `rtw8852be.c`): `enter_pre` snapshots the awake values
+(STOP1, MGNT/CTRL/DATA filters, `RX_FLTR_OPT`, `PPDU_STAT`, `HW_RPT_FWD`,
+`ACTION_FWD0/1`, `TF_FWD`), requires an awake SCC station (HCI on, CH12
+open, `HDR_RX_STOP` clear, `PLE_QTA6` = `ple_qt18`/`ple_qt58` 89/229,
+`QTA7` 0), sets `B_AX_TX_STOP1_MASK_V1` then re-opens CH12, waits up to
+50 ms for `mac_is_txq_empty_ax` (WDE DFI QEMPTY groups 0..3 all-ones,
+MGQ group 4 bits 2..4, `R_AX_DLE_EMPTY0` mask `0x07ff0780`), polls
+`DMA_BUSY1_CHECK_V1` idle (10/100 us), drops all frame types and clears
+`B_AX_PPDU_STAT_RPT_EN`. `enter_post` clears TX/RX HCI, polls idle, runs
+`rtw89_wow_config_mac_ax(true)` up to its `NO_WOW_CPU_IO_RX` return
+(`QTA6` = 89/133 `ple_qt_52b_wow`, `QTA7` 0, `HDR_RX_STOP`, sniffer off,
+PPDU off, FWD registers 0), returns the filters to host and runs the
+RTL8852B `rtw89_pci_reset_trx_rings` (BD-RAM partitions of
+`rtw89_bd_ram_table_single` for ACH0..3/CH8/CH9/CH12; NUM/DESA only for
+rings this owner published, read back). `leave_pre` runs `clr_idx_all`
+(`0x1014` |= `0x70f`, `0x1018` |= 3), `rst_bdram` (1 us x 100),
+`ctrl_trxhci(true)`, re-opens exactly the pre-halt channels, writes the
+SCC quota, clears `HDR_RX_STOP`, restores the forwarding/sniffer values
+and proves every published index zero; `leave_post` restores PPDU status
+and the filters. `CpuIoRx::for_8852b` derives `NO_WOW_CPU_IO_RX`
+(`fw.c`: RTL8852B < 0.29.30.0, which covers every admitted 0.29.29.x
+image); a `Required` image is refused before any write because
+`WOW_CPUIO_RX_CTRL` is not ported.
+
+`Native` composes it as `Trx::{Quiesced, Parked, Restarted}`:
+`wow_trx_enter_pre` (8852B, `State::Active`, started station, no
+monitor/LPS/FLR, a transmit-quiet `packet_core` -> `Phase::Halted`),
+`wow_trx_enter_post(cpu_io_rx)` (HIMR off via `irq::Mask::disable`, CH12
+drained for at most 10 ms, then host rewinds: `TxQueue::rewind` and zeroed
+TXBDs per ring, `CommandQueue::rewind`, `rx_dma::Rx::wow_rewind` = wp 0,
+fresh assembler, RXBD-info headers zeroed, every buffer still mapped and
+referenced), `wow_trx_leave_pre` (sequence, then `Binding::start` =
+`rtw89_hci_enable_intr`) and `wow_trx_leave_post` (`Phase::Running`).
+BME, MSI, the vector and every mapping are kept throughout. While a window
+is open `packets_ready` is false and station RX polling returns an empty
+batch; while `Parked` every CH12 command is refused (`Busy`). Any register
+failure clears the window and calls `fail`, whose terminal closure earns
+the `dma_stop` proof for the existing cold path. Deliberate differences:
+no `H2C_PKT_DROP` (a busy WDE queue after 50 ms fails), pending TX frames
+or unconsumed H2Cs are not released but refuse the halt, resume re-opens
+only the pre-halt channels and restores the observed forwarding/PPDU
+values instead of the init defaults, and no beacon filter exists to
+re-enable. Unexecuted cases: `smoke_rtw89_wow_trx_halt_restart_reversible`,
+`smoke_rtw89_wow_trx_refusals_fail_closed`.
+
+**Not wired (why `wow` stays open).** The whole row still needs, in Linux
+order (`rtw89_wow_suspend`/`resume`):
+1. (Done above: `wow_trx`/`command_native/wow.rs`.) Reversible TRX
+   halt/restart on the retained station:
    `rtw89_wow_enable_trx_pre` (`ctrl_txdma_ch(false)` with the CH12 FW
    channel kept, `ptk_drop_by_band_and_wait`, `poll_txdma_ch_idle`, RX
    filters to "don't care", PPDU status off) and `enable_trx_post`

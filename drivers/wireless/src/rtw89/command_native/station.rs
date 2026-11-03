@@ -72,6 +72,13 @@ impl Native {
             if self.state != State::Active {
                 return Err(rx_dma::Error::Terminal);
             }
+            if self.wow_trx_open() {
+                // WoW window: unreaped RX is dropped by the ring rewind.
+                return Ok(rx_dma::Batch {
+                    events: alloc::vec::Vec::new(),
+                    consumed: false,
+                });
+            }
             if self.station_runtime.started {
                 self.ordinary_current()?;
                 // SAFETY: same retained RXQ/RPQ owner, whole actual current
@@ -154,6 +161,7 @@ impl Native {
     pub(in crate::rtw89) fn packets_ready(&self) -> bool {
         self.state == State::Active
             && !self.sleep_blocked
+            && !self.wow_trx_open()
             && self
                 .station_runtime
                 .core
@@ -752,6 +760,10 @@ impl Native {
     fn command_permitted(&mut self, permit: Permit<'_>) -> Result<(), Error> {
         if self.state != State::Active {
             return Err(Error::Terminal);
+        }
+        if self.wow_parked() {
+            // HCI DMA is off until `wow_trx_leave_pre`.
+            return Err(Error::Busy);
         }
         if self.sleep_blocked && matches!(permit, Permit::Legacy | Permit::Station(_)) {
             return Err(Error::Busy);

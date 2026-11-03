@@ -89,6 +89,17 @@ impl<T> TxQueue<T> {
     pub fn write_pointer(&self) -> u16 {
         self.wp
     }
+    /// `rtw89_pci_reset_trx_rings` host half (`bd_ring->wp = rp = 0`) for a
+    /// reversible WoW halt. Only a queue with no reserved, published or
+    /// unreleased slot may rewind; Linux would release pending skbs instead.
+    pub(crate) fn rewind(&mut self) -> Result<(), Error> {
+        if self.slots.iter().any(Option::is_some) {
+            return Err(Error::Full);
+        }
+        self.wp = 0;
+        self.rp = 0;
+        Ok(())
+    }
     pub fn is_full(&self) -> bool {
         (self.wp + 1) % self.slots.len() as u16 == self.rp || self.slots[self.wp as usize].is_some()
     }
