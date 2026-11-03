@@ -255,6 +255,38 @@ unsafe impl Io for Startup {
         admission.check()?;
         Ok(epoch)
     }
+    fn station_six_ghz_channels(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::rtw89::command_native::SixGhzChannel>, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.admitted_six_ghz()
+    }
+    fn station_six_ghz_regulatory(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.six_ghz_regulatory()
+    }
+    async fn station_retune_6ghz(
+        &mut self,
+        channel: crate::rtw89::command_native::SixGhzChannel,
+        tpe: Option<i8>,
+        linked: bool,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        self.station_allowed()?;
+        admission.check()?;
+        let profile = crate::rtw89::operating_channel_c::Profile::new20(
+            crate::rtw89::operating_channel_c::Band::Ghz6,
+            channel.primary,
+        )
+        .ok_or(power::Error::Unsupported)?;
+        let epoch = self
+            .retune_channel_c(profile, Some((channel.six, tpe)), linked)
+            .await?;
+        admission.check()?;
+        Ok(epoch)
+    }
     fn station_sleep_capable(&mut self) -> Result<bool, power::Error> {
         self.sleep_prepare()
     }

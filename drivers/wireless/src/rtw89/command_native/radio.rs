@@ -625,6 +625,17 @@ fn mccch(primary: u8) -> [u8; 20] {
     }
     mcc
 }
+/// One admitted RTL8852C 6GHz 20MHz operating channel under one regd.c
+/// power context (`Native::admitted_six_ghz`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct SixGhzChannel {
+    pub(in crate::rtw89) primary: u8,
+    pub(in crate::rtw89) six: crate::rtw89::radio_power_c::SixGhzPower,
+    /// The cfg80211 client power type the record admits.
+    pub(in crate::rtw89) power: narf_wireless::reg::PowerType6Ghz,
+    /// No DFS/NO_IR rule over the span: probe/association frames may follow.
+    pub(in crate::rtw89) active: bool,
+}
 impl Native {
     /// Compact mask (`operating_channel::slot`: 2.4GHz primary n = bit n,
     /// 5GHz after) of primaries with a current signed full program whose
@@ -709,6 +720,63 @@ impl Native {
             }
         }
         Ok(admitted)
+    }
+    /// RTL8852C 6GHz 20MHz operating channels: every typed 6GHz primary
+    /// whose 20MHz profile has a loaded signed `N5CC` record under a regd.c
+    /// power context (`six_ghz_contexts`) the current host rule admits
+    /// (`channel_allowed_6ghz`), with whether that span is also active
+    /// (`channel_active_6ghz`: no DFS/NO_IR rule, so frame TX may follow).
+    /// Anything but a current C ordinary owner admits none.
+    pub(in crate::rtw89) fn admitted_six_ghz(
+        &self,
+    ) -> Result<alloc::vec::Vec<SixGhzChannel>, power::Error> {
+        let mut admitted = alloc::vec::Vec::new();
+        if !self.c_ordinary()? {
+            return Ok(admitted);
+        }
+        let qualification = self
+            .qualification_c
+            .as_ref()
+            .ok_or(power::Error::Terminal)?;
+        for primary in (1..=233).filter(|&p| operating_channel_c::is_6ghz_primary(p)) {
+            let Some(profile) =
+                operating_channel_c::Profile::new20(operating_channel_c::Band::Ghz6, primary)
+            else {
+                continue;
+            };
+            for six in qualification.six_ghz_contexts(profile) {
+                if !qualification
+                    .channel_allowed_6ghz(profile, six)
+                    .map_err(denied)?
+                {
+                    continue;
+                }
+                admitted.push(SixGhzChannel {
+                    primary,
+                    six,
+                    power: crate::rtw89::radio_policy_c::client_type(six),
+                    active: qualification
+                        .channel_active_6ghz(profile, six)
+                        .map_err(denied)?,
+                });
+            }
+        }
+        Ok(admitted)
+    }
+    /// The host policy snapshot the RTL8852C 6GHz records are checked
+    /// against (the rule a 6GHz join is planned under). `None` off C.
+    pub(in crate::rtw89) fn six_ghz_regulatory(
+        &self,
+    ) -> Result<Option<Arc<narf_wireless::reg::RegulatoryDomain>>, power::Error> {
+        if !self.c_ordinary()? {
+            return Ok(None);
+        }
+        self.qualification_c
+            .as_ref()
+            .ok_or(power::Error::Terminal)?
+            .policy()
+            .map(Some)
+            .map_err(denied)
     }
     /// Band-qualified channel and retune epoch of the last completed full
     /// program.

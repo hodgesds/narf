@@ -524,6 +524,23 @@ pub(super) fn ra_he(rates: u16, ht: HtRa, he: HeRa) -> Option<[u8; 16]> {
     word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
     Some(bytes)
 }
+/// The HE branch of `rtw89_phy_ra_sta_update` on `RTW89_BAND_6G`: a 6GHz
+/// peer has no HT capability, so `ra_mask` is `supp_rates[NL80211_BAND_6GHZ]
+/// << 4` (OFDM only, `mode = HE|OFDM`), 20MHz SGI is
+/// `ht_cap.ht_supported && ...` = false, and LDPC/DCM come from the HE PHY
+/// capabilities as on the other bands. The RTL8852C (`RTW89_CHIP_AX`) RA
+/// H2C is version 0 (fw.c `rtw89_fw_h2c_ra`), which carries no band field.
+pub(super) fn ra_he6(rates: u16, he: HeRa) -> Option<[u8; 16]> {
+    if rates & 0xf != 0 || rates & 0xff0 == 0 {
+        return None;
+    }
+    let no_ht = HtRa {
+        peer_rx_mcs: [0; 4],
+        sgi20: false,
+        ldpc: false,
+    };
+    ra_he(rates, no_ht, he)
+}
 /// HT branch: `mode |= HT`, MCS mask from the peer RX bitmap, then masked
 /// to this profile's one TX stream (`rtw89_ra_mask_ht_rates[0]`) plus
 /// `RA_MASK_SUBOFDM_RATES`/`RA_MASK_SUBCCK_RATES`.

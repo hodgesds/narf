@@ -657,7 +657,8 @@ impl Controller {
     ) -> Result<(), Error> {
         let body = match (ht, he) {
             (Some(ht), Some(he)) => codec::ra_he(rates, ht, he),
-            (_, Some(_)) => None,
+            // 6GHz: HE without HT (`link_sta->ht_cap` absent).
+            (None, Some(he)) => codec::ra_he6(rates, he),
             (ht, None) => codec::ra_ht(rates, ht),
         }
         .ok_or(Error::Unsupported)?;

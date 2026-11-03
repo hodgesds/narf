@@ -136,6 +136,11 @@ pub(super) struct Device<I: Io> {
     /// RTL8852C 5GHz 160MHz channel; requires the HT program). Sampled at
     /// activation; 0 advertises no width.
     wide: core::sync::atomic::AtomicU8,
+    /// RTL8852C 6GHz primaries (bit `(primary - 1) / 4`) with an admitted
+    /// signed 20MHz record under some power context, sampled at activation
+    /// only under the WMM/HT/HE programs (6GHz is HE-only). 0 advertises,
+    /// scans and joins no 6GHz channel.
+    six: core::sync::atomic::AtomicU64,
     fragments_capable: AtomicBool,
     desired: Arc<super::monitor::Desired>,
     selection: super::monitor::Selection,
@@ -241,8 +246,13 @@ impl<I: Io + 'static> Device<I> {
         request: ScanRequest,
         flags: narf_wireless::scan::ScanFlags,
     ) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
-        let channels = scan_channels(&request, self.channels.load(Ordering::Acquire))?;
+        let six_admitted = self.six.load(Ordering::Acquire);
+        let dwell = scan_dwell(&request, six_admitted != 0)?;
+        let (channels, six_frequencies) = split_scan(
+            &request,
+            self.channels.load(Ordering::Acquire),
+            six_admitted,
+        )?;
         self.control_ready()?;
         let mut attempt = Attempt {
             device: self,
@@ -267,7 +277,46 @@ impl<I: Io + 'static> Device<I> {
                 random_sn: flags.random_sn,
             })
         };
-        let result = owner.station_scan_channels(&channels, dwell, probe).await;
+        let result = async {
+            if !channels.is_empty() {
+                owner.station_scan_channels(&channels, dwell, probe).await?;
+            }
+            if !six_frequencies.is_empty() {
+                // cfg80211 `cfg80211_scan_6ghz`: colocated APs from the
+                // 2.4/5GHz results (RNR), then PSC/target planning.
+                let colocated: Vec<narf_wireless::scan::ColocatedAp> = owner
+                    .station_candidates()
+                    .iter()
+                    .filter(|c| c.bss.band != Some(narf_wireless::association::channel::Band::Ghz6))
+                    .flat_map(|c| {
+                        narf_wireless::scan::parse_colocated_aps(&c.bss.information_elements)
+                    })
+                    .collect();
+                let six_request = with_frequencies(&request, six_frequencies, Vec::new());
+                let planned = narf_wireless::scan::plan_6ghz_scan(&six_request, &colocated, None);
+                let admitted = owner.io.station_six_ghz_channels()?;
+                let six: Vec<_> = planned
+                    .frequencies_mhz
+                    .iter()
+                    .filter_map(|&f| six_frequency_primary(f))
+                    .filter_map(|primary| {
+                        // One power context per primary, an active one first.
+                        admitted
+                            .iter()
+                            .filter(|c| c.primary == primary)
+                            .max_by_key(|c| c.active)
+                            .copied()
+                    })
+                    .collect();
+                if !six.is_empty() {
+                    owner
+                        .station_scan_six_ghz(&six, dwell, |c| probe().filter(|_| c.active))
+                        .await?;
+                }
+            }
+            Ok::<_, station::Error>(owner.station_candidates())
+        }
+        .await;
         attempt.armed = false;
         if result.is_err() {
             self.close();
@@ -371,6 +420,7 @@ impl<I: Io + 'static> Device<I> {
             monitor_capable: AtomicBool::new(false),
             channels: core::sync::atomic::AtomicU64::new(CHANNEL1),
             wide: core::sync::atomic::AtomicU8::new(0),
+            six: core::sync::atomic::AtomicU64::new(0),
             fragments_capable: AtomicBool::new(false),
             desired: super::monitor::Desired::new(),
             selection: super::monitor::Selection {
@@ -691,6 +741,24 @@ impl<I: Io + 'static> Device<I> {
             })
         };
         self.wide.store(wide, Ordering::Release);
+        // 6GHz: an admitted RTL8852C 20MHz record under the HE programs
+        // (`station::six_ghz_join` requires them); a failed sample admits none.
+        let six = {
+            let mut retained = self.lifecycle.retained.lock().await;
+            let io = &mut retained.as_mut().ok_or(Error::State)?.io;
+            let programs = io.station_wmm_allowed().unwrap_or(false)
+                && io.station_ht_allowed().unwrap_or(false)
+                && io.station_he_allowed().unwrap_or(false);
+            if programs {
+                io.station_six_ghz_channels()
+                    .unwrap_or_default()
+                    .iter()
+                    .fold(0u64, |mask, channel| mask | six_bit(channel.primary))
+            } else {
+                0
+            }
+        };
+        self.six.store(six, Ordering::Release);
         if self.monitor_selected() {
             if !monitor_capable {
                 return Err(Error::State);
@@ -1249,6 +1317,14 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
                         channels: five,
                     });
                 }
+                // `rtw89_sband_6ghz` only with an admitted 6GHz record.
+                let six = six_primaries(self.six.load(Ordering::Acquire));
+                if !six.is_empty() {
+                    bands.push(WirelessBand {
+                        freq_mhz: 6000,
+                        channels: six.into_iter().map(u32::from).collect(),
+                    });
+                }
                 bands
             },
             modes: WirelessModes::STATION
@@ -1486,8 +1562,11 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
         let primary = u8::try_from(request.channel).map_err(|_| WirelessError::NotSupported)?;
-        if !station::channel_admitted(self.channels.load(Ordering::Acquire), primary)
-            || Some(request.frequency_mhz) != primary_frequency(primary)
+        let six = six_frequency_primary(request.frequency_mhz)
+            .filter(|&p| p == primary && self.six.load(Ordering::Acquire) & six_bit(p) != 0);
+        if six.is_none()
+            && (!station::channel_admitted(self.channels.load(Ordering::Acquire), primary)
+                || Some(request.frequency_mhz) != primary_frequency(primary))
         {
             return Err(WirelessError::NotSupported);
         }
@@ -1643,14 +1722,92 @@ fn scan_channels(request: &ScanRequest, admitted: u64) -> Result<Vec<u8>, Wirele
     }
     Ok(super::operating_channel::primaries(mask).collect())
 }
-fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
+/// Bit of an RTL8852C 6GHz 20MHz primary in `Device::six` (0 otherwise).
+fn six_bit(primary: u8) -> u64 {
+    if super::operating_channel_c::is_6ghz_primary(primary) {
+        1u64 << ((primary - 1) / 4)
+    } else {
+        0
+    }
+}
+/// The 6GHz primaries of a `Device::six` mask, ascending.
+fn six_primaries(mask: u64) -> Vec<u8> {
+    (0..59u8)
+        .filter(|bit| mask & (1u64 << bit) != 0)
+        .map(|bit| 1 + 4 * bit)
+        .collect()
+}
+/// cfg80211 `ieee80211_freq_khz_to_channel` on `NL80211_BAND_6GHZ`
+/// (5955 + 5 * (n - 1)) restricted to typed 20MHz primaries.
+fn six_frequency_primary(frequency: u32) -> Option<u8> {
+    let channel = u8::try_from(frequency.checked_sub(5950)? / 5).ok()?;
+    (5950 + 5 * u32::from(channel) == frequency
+        && super::operating_channel_c::is_6ghz_primary(channel))
+    .then_some(channel)
+}
+/// The 2.4/5GHz primaries (`scan_channels`) and the 6GHz frequencies of a
+/// request. An empty request covers every admitted channel of every band
+/// (cfg80211's all-channels default); a requested 6GHz frequency must be
+/// admitted, like the 2.4/5GHz ones, and `channels` names 2.4/5GHz only.
+fn split_scan(
+    request: &ScanRequest,
+    admitted: u64,
+    six: u64,
+) -> Result<(Vec<u8>, Vec<u32>), WirelessError> {
+    if request.channels.is_empty() && request.frequencies_mhz.is_empty() {
+        let all = six_primaries(six)
+            .into_iter()
+            .map(|p| 5950 + 5 * u32::from(p))
+            .collect();
+        return Ok((scan_channels(request, admitted)?, all));
+    }
+    let mut six_frequencies = Vec::new();
+    let mut legacy_frequencies = Vec::new();
+    for &frequency in &request.frequencies_mhz {
+        match six_frequency_primary(frequency) {
+            Some(primary) if six & six_bit(primary) != 0 => {
+                if !six_frequencies.contains(&frequency) {
+                    six_frequencies.push(frequency);
+                }
+            }
+            Some(_) => return Err(WirelessError::NotSupported),
+            None => legacy_frequencies.push(frequency),
+        }
+    }
+    let legacy = with_frequencies(request, legacy_frequencies, request.channels.clone());
+    let channels = if legacy.channels.is_empty() && legacy.frequencies_mhz.is_empty() {
+        Vec::new()
+    } else {
+        scan_channels(&legacy, admitted)?
+    };
+    Ok((channels, six_frequencies))
+}
+/// `request` with only `frequencies_mhz`/`channels` replaced.
+fn with_frequencies(
+    request: &ScanRequest,
+    frequencies: Vec<u32>,
+    channels: Vec<u32>,
+) -> ScanRequest {
+    ScanRequest {
+        ssids: request.ssids.clone(),
+        frequencies_mhz: frequencies,
+        channels,
+        active: request.active,
+        random_mac: request.random_mac,
+        colocated_6ghz: request.colocated_6ghz,
+        duration_tu: request.duration_tu,
+        duration_mandatory: request.duration_mandatory,
+        extra_ies: request.extra_ies.clone(),
+    }
+}
+fn scan_dwell(request: &ScanRequest, six: bool) -> Result<u64, WirelessError> {
     // cfg80211 `nl80211_parse_random_mac`: the mask must keep the group bit
     // from a unicast base address.
     if request
         .random_mac
         .as_ref()
         .is_some_and(|r| r.mask[0] & 1 == 0 || r.addr[0] & 1 != 0)
-        || request.colocated_6ghz
+        || request.colocated_6ghz && !six
         || (!request.active && !request.extra_ies.is_empty())
         || !probe_ies_valid(&request.extra_ies)
         || request.active && request.ssids.len() > 8
@@ -1778,3 +1935,62 @@ impl<I: Io + 'static> Interface for Registered<I> {
 mod ap;
 #[path = "interface_monitor.rs"]
 mod monitor;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod six_ghz_scan_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// 6GHz frequency/primary mapping and the 2.4/5 + 6GHz split of a
+    /// cfg80211 scan request: only admitted 6GHz primaries are scanned or
+    /// advertised; an unadmitted requested 6GHz frequency is refused.
+    fn smoke_rtw8852c_6ghz_scan_split_admits_only_signed_primaries() -> TestResult {
+        let six = six_bit(5) | six_bit(37);
+        if six_frequency_primary(5975) != Some(5)
+            || six_frequency_primary(6135) != Some(37)
+            || six_frequency_primary(5960).is_some()
+            || six_frequency_primary(2412).is_some()
+            || six_primaries(six) != [5, 37]
+            || six_bit(2) != 0
+        {
+            return TestResult::Fail("6GHz frequency/primary mapping");
+        }
+        let request = |frequencies: Vec<u32>| ScanRequest {
+            ssids: Vec::new(),
+            frequencies_mhz: frequencies,
+            channels: Vec::new(),
+            active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        // Everything: every admitted channel of both bands.
+        if split_scan(&request(Vec::new()), CHANNEL1, six) != Ok((vec![1], vec![5975, 6135])) {
+            return TestResult::Fail("6GHz all-channels scan");
+        }
+        // 6GHz only: no 2.4/5GHz retune.
+        if split_scan(&request(vec![6135]), CHANNEL1, six) != Ok((Vec::new(), vec![6135])) {
+            return TestResult::Fail("6GHz-only scan");
+        }
+        // Mixed, and an unadmitted 6GHz primary.
+        if split_scan(&request(vec![2412, 5975]), CHANNEL1, six) != Ok((vec![1], vec![5975]))
+            || split_scan(&request(vec![5995]), CHANNEL1, six).is_ok()
+            || split_scan(&request(vec![5975]), CHANNEL1, 0).is_ok()
+        {
+            return TestResult::Fail("6GHz mixed/unadmitted scan");
+        }
+        // Colocated (RNR) 6GHz scanning is offered only with a 6GHz record.
+        let mut colocated = request(Vec::new());
+        colocated.colocated_6ghz = true;
+        if scan_dwell(&colocated, false).is_ok() || scan_dwell(&colocated, true).is_err() {
+            return TestResult::Fail("6GHz colocated scan gating");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89",
+        smoke_rtw8852c_6ghz_scan_split_admits_only_signed_primaries
+    );
+}

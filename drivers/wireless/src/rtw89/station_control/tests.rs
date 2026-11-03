@@ -1485,3 +1485,34 @@ kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux
 );
+
+/// phy.c `rtw89_phy_ra_sta_update` on `RTW89_BAND_6G` for a 6GHz HE peer
+/// (no HT): `mode = HE|OFDM`, SGI clear, OFDM-only legacy, LDPC/DCM from
+/// HE; any CCK rate or no OFDM rate is refused.
+fn smoke_rtw8852c_6ghz_ra_is_he_only_ofdm() -> TestResult {
+    let he = codec::HeRa {
+        peer_rx_mcs: 0xfffa,
+        ldpc: true,
+        dcm: false,
+    };
+    let Some(bytes) = codec::ra_he6(0xff0, he) else {
+        return TestResult::Fail("6GHz HE-only RA refused");
+    };
+    let w0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // MODE[5:1] = HE (0x10) | OFDM (0x2); SGI BIT(21) clear; LDPC BIT(22).
+    if (w0 >> 1) & 0x1f != 0x12 || w0 & 1 << 21 != 0 || w0 & 1 << 22 == 0 {
+        return TestResult::Fail("6GHz RA mode/SGI/LDPC");
+    }
+    let mask = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if mask & 0xf != 0 || mask & 0xfff000 == 0 {
+        return TestResult::Fail("6GHz RA mask carries CCK or no HE MCS");
+    }
+    if codec::ra_he6(0xfff, he).is_some() || codec::ra_he6(0, he).is_some() {
+        return TestResult::Fail("6GHz RA admitted CCK or empty legacy rates");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_6ghz_ra_is_he_only_ofdm
+);

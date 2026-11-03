@@ -3712,7 +3712,7 @@ wide link; passive-only spans join at 20MHz. Unexecuted cases:
 160MHz part), `smoke_rtw89_b_packet_rx_width_follows_programmed_channel`
 (C 160MHz part).
 
-**C 6GHz power and records (`six_ghz_operation`, partial).** RTL8852C
+**C 6GHz power, records and station (`six_ghz_operation`).** RTL8852C
 `support_bands` includes 6GHz; the C channel geometry, `channel_c` BB/MAC
 (MUIC, CDD, RF_B TX path at 6GHz), `rfk::c_channel` RF and the IQK/TSSI/DPK
 6GHz tables already carry it. *Power:*
@@ -3782,13 +3782,75 @@ plan (the C geometry/BB/RF/RFK layers already carry 6GHz);
 `prepare_radio_c` itself still builds only 2.4/5GHz plans (core.c starts on
 the default 2.4GHz chandef). `Startup::retune_channel_c` passes the
 context through (2.4/5GHz callers pass `None`).
-*Not yet implemented (the row stays open):* the station 6GHz path (6GHz scan with PSC/RNR rules,
-`association::six_ghz::admit_with_rule` + `JoinPlan::prepare_6ghz`, HE 6GHz
-Band Capabilities, HE-only RA on `RTW89_BAND_6G`, mac80211 TPE parsing into
-the plan) and 6GHz band advertisement. RTL8922A 6GHz belongs to the
-separate open RTL8922A chip row. Unexecuted cases:
+*Station (closes `six_ghz_operation` for RTL8852C).* `Native::admitted_six_ghz`
+lists every typed 6GHz primary whose 20MHz profile has a loaded `N5CC`
+record under a power context (`six_ghz_contexts`) that `channel_allowed_6ghz`
+admits, with its cfg80211 client power type (`client_type`) and whether
+`channel_active_6ghz` holds (no DFS/NO_IR rule); `six_ghz_regulatory` is the
+host policy those records are checked under. `station::Io` adds
+`station_six_ghz_channels`, `station_six_ghz_regulatory` and
+`station_retune_6ghz(channel, tpe, linked)` (`Startup::retune_channel_c(
+profile, Some((six, tpe)), linked)`); the defaults admit nothing, so
+RTL8852B is unchanged. Station `State` records the 6GHz context/TPE beside
+the band-qualified `OperatingChannel`; `retune` compares band-qualified
+(a 2.4GHz retune after 6GHz channel 1 is never skipped) and clears it;
+`basic_ok` reads the band's OFDM floor. Beacons/probe responses on a 6GHz
+tuning are observed by the shared `association::observe_6ghz` (`Bss.band =
+Some(Ghz6)`; the WMM/CSA/cache observers share `observe_tuned`). *Scan:*
+`interface::split_scan` separates 6GHz frequencies (5955 + 5(n-1), typed
+primaries, each admitted) from the 2.4/5GHz primaries; an all-channels
+request covers both. After the 2.4/5GHz pass, the RNR colocated APs
+(`scan::parse_colocated_aps` of non-6GHz results) and the request go
+through `scan::plan_6ghz_scan` (cfg80211 `cfg80211_scan_6ghz`: PSC-only blind
+scanning under `colocated_6ghz`, targets added); `colocated_6ghz` is
+accepted only with an admitted 6GHz record. `State::scan_six_ghz` tunes each
+planned primary TPE-free under one context (an active one first) and dwells;
+a probe request follows only on an active record (`ieee80211_scan_state_decision`;
+no beacon witness/passive TX grant exists on C). The 6GHz probe content is
+mac80211 `ieee80211_build_preq_ies_band` on 6GHz (`station_six_ghz::
+probe_request`): OFDM Supported Rates only, no Extended Rates/DS/HT/VHT,
+HE Capabilities (`local_he`, 20MHz) and HE 6GHz Band Capabilities (SMPS
+off). *Join:* `six_ghz_join` requires SAE (H2E; `prepare_6ghz` refuses other
+AKMs) and the signed WMM/HT/HE programs, takes the rule covering the
+primary from `six_ghz_regulatory`, admits the BSS with
+`six_ghz::admit_with_rule` (power type), builds `JoinPlan::prepare_6ghz`
+with `SixGhzLocal::new(local_he(), capability(), rule)` capped at
+`SixGhzWidth::Twenty` (the station's 6GHz records are 20MHz), checks the
+selected width/primary/power type, picks the admitted *active* record of
+that client power type, computes the TPE, then `retune_6ghz` before
+authentication. HE 6GHz Band Capabilities (`station_six_ghz::capability`):
+core.c `rtw89_init_he_cap` MIN_MPDU_START 0 and MAX_AMPDU_LEN_EXP 7, with
+MAX_MPDU_LEN restricted to 3895 (no RX A-MSDU on this C profile, so
+`rtw8852c_chip_info.max_vht_mpdu_cap` 11454 is not promised). *TPE:*
+`station_six_ghz::tpe` is mac80211 `ieee80211_parse_tpe` (after
+`ieee80211_valid_tpe_element`) + `ieee80211_rearrange_tpe` to the used
+20MHz chandef inside the AP's HE 6GHz channel (EIRP: 20MHz entry; PSD: the
+primary's subchannel via `ieee80211_calc_chandef_subchan_offset`), then
+regd.c `rtw89_calculate_tpe` on the default category (`tpe_get_constraint`
+(raw - 19) / 2, PSD + 13), min over local/regulatory-client EIRP/PSD; only
+for `RTW89_REG_6GHZ_POWER_STD`; below -10 dBm refuses the join (regd.c
+`-EINVAL`); an 80+80MHz AP channel is refused. *RA:* `configure_ra` with HE
+and no HT is `codec::ra_he6`: phy.c `rtw89_phy_ra_sta_update` on
+`RTW89_BAND_6G` (`supp_rates[6GHz] << 4` OFDM only, `mode = HE|OFDM`, 20MHz
+SGI from the absent HT cap = 0); the AX RA H2C (version 0) has no band
+field. CMAC/EDCA/management rate read the band through `ofdm_only`. *Band
+advertisement:* `Device::six` is sampled at activation only under the
+WMM/HT/HE programs; the 6000MHz band lists exactly the admitted primaries
+(`rtw89_sband_6ghz`), and `associate` accepts a 6GHz frequency only for one.
+*Known limits (not claimed):* 6GHz joins are HE20 only (no 6GHz 40..160MHz
+station width; wide 6GHz records exist but the station does not select
+them); a CSA on a 6GHz link drops it (no native 6GHz switch owner, as a
+wide link); a beacon TPE change after association is not re-applied
+(mac80211 `BSS_CHANGED_TPE` -> `rtw89_reg_6ghz_recalc`): the join-time TPE
+from the scanned beacon/probe response stays; the scan ignores
+`psc_no_listen`/unsolicited-probe target hints (every planned channel is
+dwelt); no TX A-MPDU on 6GHz (`self.ht` stays false). RTL8922A 6GHz
+belongs to the separate open RTL8922A chip row. Unexecuted cases:
 `smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g`,
-`smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`.
+`smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`,
+`smoke_rtw8852c_6ghz_tpe_follows_mac80211_rearrange_and_regd`,
+`smoke_rtw8852c_6ghz_ra_is_he_only_ofdm`,
+`smoke_rtw8852c_6ghz_scan_split_admits_only_signed_primaries`.
 
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s
@@ -4068,7 +4130,7 @@ triage above remains separate from implementation.
 | `monitor_mode` | The admitted RTL8852B receive-only role/native/raw-radiotap owner is implemented in §3 with original source/registration/role/capture epochs, actual RF channel/PHYSTS program and fresh physical transitions. Four source cases and software/native/physical acceptance are pending; no active/injection or other chip/channel/width profile is claimed. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
 | `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |
-| `six_ghz_operation` | Only RTL8852C/RTL8922A have 6GHz applicability. RTL8852C: the 6GHz TX power program (regd.c 6GHz policy, `reg_6ghz_power`, TPE) and the signed 6GHz `N5CC` records with per-power-type client admission exist and the native 6GHz record staging/retune with band-qualified channel identity exist ("C 6GHz power and records"); the station 6GHz scan/association (`JoinPlan::prepare_6ghz`, HE 6GHz capability, HE-only RA, TPE parsing) and band advertisement remain missing. RTL8922A 6GHz is part of the open RTL8922A chip row. The retained B profile is 2.4GHz-only in software. |
+| `six_ghz_operation` | Only RTL8852C/RTL8922A have 6GHz applicability. RTL8852C: implemented ("C 6GHz power, records and station"): 6GHz TX power program (regd.c policy, `reg_6ghz_power`, TPE), signed 6GHz `N5CC` records with per-power-type client admission, native staging/retune with band-qualified channel identity, the HE20 station 6GHz scan (PSC/RNR planning, active only on active records), SAE-H2E join through `admit_with_rule` + `JoinPlan::prepare_6ghz`, HE 6GHz Band Capabilities, AP TPE into the plan, HE-only RA and 6GHz band advertisement of admitted primaries only. Native/physical validation pending; HE20 only, 6GHz CSA disconnects, post-association TPE changes not re-applied. RTL8922A 6GHz is part of the open RTL8922A chip row. The retained B profile is 2.4GHz-only in software. |
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), and the AP MAC/firmware control owner (`ap_control.rs`: port program, CAM, CMAC/DMAC tables, MACID pause, peer MACIDs, BCN_UPD, start/stop; §3 "RTL8852B AP MAC/firmware control owner") exist, but no native caller, signed AP channel/power admission, multi-peer TXWD/RX MACID path, HIQ/CH9 ring or public AP controls compose them. |
 | `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
 | `rtl8852a` | AX identity, power and firmware scaffolds do not establish this chip's native station. The retained Controller and N52B qualification admit RTL8852B only; A still needs its exact security/firmware, BB/RF/calibration/power and packet/station composition. |

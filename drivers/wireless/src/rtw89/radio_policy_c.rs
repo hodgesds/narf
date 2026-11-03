@@ -173,7 +173,7 @@ pub(super) const POWER_TYPES_6GHZ: [narf_wireless::reg::PowerType6Ghz; 3] = [
     narf_wireless::reg::PowerType6Ghz::Sp,
 ];
 /// `reg_6ghz_power` back to the cfg80211 client power type it admits.
-fn client_type(six: SixGhzPower) -> narf_wireless::reg::PowerType6Ghz {
+pub(super) fn client_type(six: SixGhzPower) -> narf_wireless::reg::PowerType6Ghz {
     use narf_wireless::reg::PowerType6Ghz;
     match six.power() {
         1 => PowerType6Ghz::Lpi,
@@ -765,7 +765,7 @@ impl Qualification {
         record.current()?;
         Ok(record.envelope)
     }
-    fn policy(&self) -> Result<alloc::sync::Arc<RegulatoryDomain>, Error> {
+    pub(super) fn policy(&self) -> Result<alloc::sync::Arc<RegulatoryDomain>, Error> {
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(domain) = self.model_domain.as_ref() {
             return Ok(domain.clone());
