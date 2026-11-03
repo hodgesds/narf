@@ -92,7 +92,7 @@ fn smoke_iwl_emlsr_block_exit_prevention_and_notifications() -> TestResult {
         selected_primary: 2,
         ..Emlsr::default()
     };
-    state.links_activated(0b110);
+    state.links_activated(0b110, 0);
     if !state.emlsr_active() || state.primary_link() != 2 {
         return TestResult::Fail("selected EMLSR primary not retained");
     }
@@ -120,7 +120,7 @@ fn smoke_iwl_emlsr_block_exit_prevention_and_notifications() -> TestResult {
         return TestResult::Fail("EMLSR prevention timing differs from 30s");
     }
     // Second FW-request exit inside 400s gets the 300s prevention.
-    state.links_activated(0b110);
+    state.links_activated(0b110, 0);
     let _ = state.mode_notification(&leave, true, 40_000);
     if state.prevention_tick(true, 339_000) || !state.prevention_tick(true, 340_000) {
         return TestResult::Fail("repeated FW-request exit lacks short prevention");
@@ -128,7 +128,7 @@ fn smoke_iwl_emlsr_block_exit_prevention_and_notifications() -> TestResult {
     // Transition failure: unknown fw link or failed deactivation disconnects.
     let mut fail = [0u8; 12];
     fail[4] = 1;
-    state.links_activated(0b110);
+    state.links_activated(0b110, 0);
     let spec = |fw: u32| match fw {
         0 => Some(1),
         1 => Some(2),
@@ -216,7 +216,7 @@ fn smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss() -> TestResult {
         selected_primary: 1,
         ..Emlsr::default()
     };
-    emlsr.links_activated(0b110);
+    emlsr.links_activated(0b110, 0);
     // Long loss without RX is a connection loss even in EMLSR.
     if emlsr.missed_beacons(&missed(0, 6, 19, 1, 0), spec, 0) != Ok(MissedBeacons::Disconnect) {
         return TestResult::Fail("long missed-beacon run did not lose the connection");
@@ -242,7 +242,7 @@ fn smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss() -> TestResult {
         selected_primary: 2,
         ..Emlsr::default()
     };
-    both.links_activated(0b110);
+    both.links_activated(0b110, 0);
     if both.missed_beacons(&missed(0, 0, 5, 1, 5), spec, 0) != Ok(MissedBeacons::Keep(0b100)) {
         return TestResult::Fail("symmetric loss did not keep the primary link");
     }
@@ -254,4 +254,143 @@ fn smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
     smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss
+);
+
+fn smoke_iwl_mld_link_grade_tables_chan_load_and_puncturing() -> TestResult {
+    let idle = 0;
+    // link.c tables: 5GHz uses the high-band RSSI column, 2.4GHz the low.
+    if link_grade(Band::Five, 20, -60, chan_load(Band::Five, None, 0), 0) != Some(219) {
+        return TestResult::Fail("5GHz 20MHz grade or default load wrong");
+    }
+    if link_grade(Band::Two, 20, -60, chan_load(Band::Two, None, 0), 0) != Some(181) {
+        return TestResult::Fail("2.4GHz 20MHz grade or default load wrong");
+    }
+    if link_grade(Band::Five, 20, -40, idle, 0) != Some(345) {
+        return TestResult::Fail("RSSI above the table did not keep the top grade");
+    }
+    if link_grade(Band::Five, 20, 0, idle, 0) != Some(9) {
+        return TestResult::Fail("missing RSSI did not take the lowest line");
+    }
+    if link_grade(Band::Five, 80, -61, idle, 0) != Some(824)
+        || link_grade(Band::Five, 80, -61, idle, 0b1) != Some(618)
+        || link_grade(Band::Five, 40, -61, idle, 0b1) != link_grade(Band::Five, 40, -61, idle, 0)
+    {
+        return TestResult::Fail("80MHz grade or puncturing penalty wrong");
+    }
+    if link_grade(Band::Six, 20, -60, idle, 0).is_some()
+        || link_grade(Band::Five, 60, -60, idle, 0).is_some()
+    {
+        return TestResult::Fail("ungraded band or width produced a grade");
+    }
+    if chan_load(Band::Five, Some(100), 10) != 75 || chan_load(Band::Five, Some(10), 10) != 10 {
+        return TestResult::Fail("channel load by others wrong");
+    }
+    if bss_load_channel_util(&[0, 0, 11, 5, 1, 0, 77, 0, 0]) != Some(77)
+        || bss_load_channel_util(&[11, 4, 1, 0, 77, 0]).is_some()
+    {
+        return TestResult::Fail("BSS Load element parse wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_link_grade_tables_chan_load_and_puncturing
+);
+
+fn smoke_iwl_mld_stats_tpt_and_internal_mlo_scan_selection() -> TestResult {
+    if stats_command(true, false) != [2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0]
+        || stats_command(false, true) != [0, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0]
+        || stats_command(false, false) != [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    {
+        return TestResult::Fail("SYSTEM_STATISTICS_CMD bodies wrong");
+    }
+    for (size, stride) in [(492usize, 104usize), (444, 88)] {
+        let mut notif = alloc::vec![0u8; size];
+        let at = 4 + 112 + stride;
+        notif[at + 4] = 7;
+        notif[at + 8] = 40;
+        if per_phy_loads(&notif).map(|l| l[1]) != Ok((7, 40)) {
+            return TestResult::Fail("per-PHY channel load offsets wrong");
+        }
+    }
+    if per_phy_loads(&[0; 400]).is_ok() {
+        return TestResult::Fail("odd statistics size accepted");
+    }
+    let mut measure = Measurements::default();
+    measure.update_phys(&[(0, 0), (5, 40), (0, 0)], &[1]);
+    measure.update_phys(&[(0, 0), (6, 40), (0, 0)], &[1]);
+    measure.update_phys(&[(0, 0), (9, 101), (0, 0)], &[1]);
+    measure.update_phys(&[(0, 0), (8, 0xffff_ffff), (0, 0)], &[1]);
+    if measure.avg_not_by_us[1] != 30 || measure.load_by_us[1] != 8 {
+        return TestResult::Fail("PHY load averaging wrong");
+    }
+    for n in 1..=401u32 {
+        let crossed = measure.count_mpdus(0, 1, 1, false, true, 100);
+        if crossed != (n == 400) {
+            return TestResult::Fail("TPT threshold crossing wrong");
+        }
+    }
+    if measure.count_mpdus(0, 1, 1, false, true, 5_200) {
+        return TestResult::Fail("expired TPT window not cleared");
+    }
+    let mut emlsr = Emlsr::default();
+    emlsr.links_activated(0b11, 0);
+    if emlsr.check_tpt(&mut Measurements::default(), Some(1), true, 10_000) != TptCheck::Block(0b1)
+    {
+        return TestResult::Fail("idle EMLSR not blocked for TPT");
+    }
+    let channels = [
+        super::super::native_band::Channel {
+            band: Band::Five,
+            number: 36,
+        },
+        super::super::native_band::Channel {
+            band: Band::Two,
+            number: 6,
+        },
+    ];
+    let body = match Selector::scan_body(17, &channels, 2) {
+        Ok(body) => body,
+        Err(_) => return TestResult::Fail("internal MLO scan body refused"),
+    };
+    if body[..4] != MLO_SCAN_UID.to_le_bytes()
+        || u16::from_le_bytes([body[8], body[9]]) & (1 << 9) == 0
+        || body[11] != 2
+        || body[36..40] != 4u32.to_le_bytes()
+    {
+        return TestResult::Fail("internal MLO scan body fields wrong");
+    }
+    let mut selector = Selector {
+        scan_requested: true,
+        last_activation_ms: Some(1_000),
+        ..Selector::default()
+    };
+    if selector.may_start_scan(5_999) || !selector.may_start_scan(6_000) {
+        return TestResult::Fail("MLO scan blockout wrong");
+    }
+    selector.scan_running = true;
+    let seen = Seen {
+        spec_link: 1,
+        signal_dbm: -60,
+        util: None,
+    };
+    selector.observe(seen);
+    if !selector.seen.is_empty()
+        || selector.scan_started(&[1, 0, 0, 0, 0, 0, 0, 0], 7_000)
+        || !selector.scan_started(&[0; 8], 7_000)
+    {
+        return TestResult::Fail("scan start gating wrong");
+    }
+    selector.observe(seen);
+    if selector.seen != [seen] || !selector.scan_completed(&[0; 16]) || selector.scan_running {
+        return TestResult::Fail("scan completion or observation wrong");
+    }
+    if !selector.fresh(12_000) || selector.fresh(12_001) {
+        return TestResult::Fail("link-selection freshness wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_stats_tpt_and_internal_mlo_scan_selection
 );

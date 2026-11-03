@@ -1182,9 +1182,11 @@ impl Device {
                     hardware,
                     connection,
                     eapol,
+                    scheduled,
                     ..
                 } = &mut *state;
                 if let Some(connection) = connection {
+                    connection.set_scheduled_scan_busy(scheduled.is_some());
                     for _ in 0..16 {
                         let Some(frame) = eapol.pop_front() else {
                             break;

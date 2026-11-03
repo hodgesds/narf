@@ -195,8 +195,13 @@ impl Device {
         let associated = state.connection.is_some();
         if associated
             && (!state.hardware.uses_mld_station_protocol()
-                || state.connection.as_ref().is_some_and(|c| !c.authorized))
+                || state
+                    .connection
+                    .as_ref()
+                    .is_some_and(|c| !c.authorized || c.mlo_scan_running()))
         {
+            // An internal MLO scan holds the firmware scan slot (Linux
+            // returns EBUSY for a second scan of the same type slot).
             // Linux mvm/mac80211 requires cfg.idle. Only the admitted MLD
             // consumer supports concurrent serving-link periodic scanning.
             return Err(16);

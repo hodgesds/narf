@@ -4272,11 +4272,51 @@ group key on `rx->link`).
 Written, unexecuted: `smoke_iwl_mld_scan_candidates_same_ap_mld_fresh_links`,
 `smoke_iwl_mld_missed_beacons_exit_emlsr_and_connection_loss`.
 
-Still open (`mlo` row not complete): automatic EMLSR link selection
-(link.c `iwl_mld_get_link_grade` RSSI/bandwidth/puncturing/channel-load
-grading, the internal MLO scan and its 5s freshness, and the
-`iwl_mld_select_links` triggers) so nothing yet *enters* EMLSR on its
-own; primary-link switching (a set naming only the further link keeps the
+**Link grading and automatic selection (pass 7).** `sc_emlsr::link_grade`
+is link.c `iwl_mld_get_link_grade` for 2.4/5GHz links: the five
+bandwidth RSSI-to-grade tables (2.4GHz/5GHz columns at 20/40MHz), a zero
+RSSI taking the lowest line, scaled by the available channel load and
+`iwl_mld_apply_puncturing_penalty` (punctured EHT operation is refused at
+admission, so accepted links pass 0). Channel load is
+`iwl_mld_get_chan_load`: the beacon's five-byte BSS Load utilisation minus
+our own PHY load, else the 30/15/0 percent band default. 6GHz links are not
+graded (duplicated-beacon and TPE PSD/EIRP RSSI adjustments not kept; no
+6GHz further link is requested).
+
+A multiple-link station, once authorized, sends SYSTEM_STATISTICS_CMD
+(group 2, 0xf) clear and periodic-5s bodies (mac80211.c
+BSS_CHANGED_ASSOC, stats.c), and blocks EMLSR for TPT (mac80211.c
+AUTHORIZED). STATISTICS_OPER_NOTIF v3/v4 (exact 444/492 bytes) per-PHY
+loads update `channel_load_by_us` and the halved running
+`avg_channel_load_not_by_us` of every PHY with a channel context
+(`iwl_mld_fill_chanctx_stats`, >100 dropped, unknown keeps the average).
+RX data MPDUs are counted per RX queue and firmware link
+(`iwl_mld_count_mpdu_rx`, 5s window while TPT-blocked); crossing 400
+unblocks TPT. While unblocked, `iwl_mld_emlsr_check_tpt` runs every 5s:
+fewer than 400 TX and RX MPDUs re-block TPT, and after a full EMLSR window
+a secondary link under 10% (TX>3000 or RX>400) exits for LINK_USAGE.
+Prevention expiry (`iwl_mld_emlsr_prevent_done_wk`) and a full TPT unblock
+request the internal MLO scan (`iwl_mld_unblock_emlsr`).
+
+The internal MLO scan (`iwl_mld_int_mlo_scan`) is a passive UMAC scan of
+every usable link's channel with NTF_START, priority EXT_4, the serving
+firmware link and the associated low-load timing, firmware UID0; it waits
+5s after a link activation and never overlaps a periodic scan (each refuses
+the other). Its scan-start notification sets the selection time; beacons
+or probe responses from an affiliated AP on its own channel received after
+it record that link's RSSI and BSS Load. On completion (aborted too)
+`_iwl_mld_select_links` grades every seen valid link within 5s of the
+start and requests the best single link or EMLSR pair (`Emlsr::select`,
+pair state with real PHY loads); `service_active_links` applies it with
+TX drained, so EMLSR is now entered automatically when Linux's rules allow.
+Not consumed: BT-coex notifications (BT treated inactive), low-latency
+classification, CSA state on links, TX MPDU counting (TX completions are
+not attributed per link; RX alone can unblock as in Linux's per-direction
+check) and the channel-load level rescan (`iwl_mld_emlsr_check_chan_load`).
+Written, unexecuted: `smoke_iwl_mld_link_grade_tables_chan_load_and_puncturing`,
+`smoke_iwl_mld_stats_tpt_and_internal_mlo_scan_selection`.
+
+Still open (`mlo` row not complete): primary-link switching (a set naming only the further link keeps the
 association link alone); the missed-beacon BSS-parameters-changed
 threshold and CQM beacon-loss/MLO-rescan path; advertised TID-to-link
 mapping (dormant links); 6GHz further links; and the public

@@ -84,6 +84,8 @@ pub struct Connection {
     /// EMLSR decision state (mld/mlo.c) and a pending active-link set
     /// (`ieee80211_set_active_links_async`) applied by maintenance.
     emlsr: super::sc_emlsr::Emlsr,
+    /// Internal MLO scan, measurements and link-selection triggers.
+    mlo_select: super::sc_emlsr::Selector,
     active_request: Option<u16>,
     client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
@@ -201,6 +203,7 @@ impl Connection {
             ap_eml: None,
             ap_med_sync: None,
             emlsr: super::sc_emlsr::Emlsr::default(),
+            mlo_select: super::sc_emlsr::Selector::default(),
             active_request: None,
             client: None,
             mld_eapol: VecDeque::new(),
@@ -799,6 +802,7 @@ impl Connection {
             ap_eml: None,
             ap_med_sync: None,
             emlsr: super::sc_emlsr::Emlsr::default(),
+            mlo_select: super::sc_emlsr::Selector::default(),
             active_request: None,
             client,
             mld_eapol: VecDeque::new(),
@@ -991,7 +995,8 @@ impl Connection {
                 .with_further_links(link_security)?;
         }
         this.mld_links = valid_links;
-        this.emlsr.links_activated(this.mld_active_links());
+        this.emlsr
+            .links_activated(this.mld_active_links(), now_ms());
         if let Some(client) = &this.client {
             client.plan.response(&reply[6..])?;
         }
@@ -1802,6 +1807,20 @@ impl Connection {
             }
             return Ok(output);
         }
+        if self.mlo_select.scan_running
+            && matches!(
+                packet.header.cmd,
+                super::sc_emlsr::SCAN_START_NOTIF | super::sc_emlsr::SCAN_COMPLETE_NOTIF
+            )
+        {
+            let now = now_ms();
+            if packet.header.cmd == super::sc_emlsr::SCAN_START_NOTIF {
+                self.mlo_select.scan_started(&packet.payload, now);
+            } else if self.mlo_select.scan_completed(&packet.payload) {
+                self.select_links(now);
+            }
+            return Ok(output);
+        }
         if packet.receive_epoch != Some(self.receive_epoch)
             && (matches!(packet.header.cmd, 0xc2 | 0xc3)
                 || packet.header.cmd == 0xc1
@@ -1816,6 +1835,9 @@ impl Connection {
                 let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
                     return Ok(output);
                 };
+                if self.mlo_select.scan_running {
+                    self.observe_mlo_beacon(&mpdu);
+                }
                 if !self.admits_channel(&mpdu) {
                     return Ok(output);
                 }
@@ -1846,6 +1868,9 @@ impl Connection {
                 }
                 if !self.admits_data_header(&mpdu) {
                     return Ok(output);
+                }
+                if frame.len() >= 24 && frame[0] & 12 == 8 {
+                    self.count_mpdu(queue, mpdu.raw_fw_link, false);
                 }
                 if frame.len() >= 24
                     && frame[0] == 0xd0
@@ -2056,6 +2081,7 @@ impl Connection {
             self.active_request = None;
             return Ok(());
         }
+        self.service_link_selection(hw).await?;
         self.service_active_links(hw).await?;
         self.prepare_amsdu_memory(hw).await?;
         while let Some(body) = self.actions.pop_front() {
@@ -2482,6 +2508,13 @@ impl Connection {
                 .mode_notification(payload, capable, now_ms)
                 .ok()
                 .flatten()
+        } else if key == sc_emlsr::STATISTICS_OPER_NOTIF {
+            // stats.c iwl_mld_process_per_phy_stats over existing PHYs.
+            if let Ok(loads) = sc_emlsr::per_phy_loads(payload) {
+                let phys = self.active_phy_ids();
+                self.mlo_select.measure.update_phys(&loads, &phys);
+            }
+            None
         } else if key == sc_emlsr::EMLSR_TRANS_FAIL_NOTIF {
             match emlsr.transition_failure(payload, |fw| self.spec_of_fw_link(fw), now_ms) {
                 Ok(TransitionFailure::Disconnect) => return Err("MLD EMLSR transition failure"),
@@ -2495,6 +2528,239 @@ impl Connection {
         if request.is_some() {
             self.active_request = request;
         }
+        Ok(())
+    }
+
+    /// Firmware PHY ids with a channel context: the association link's
+    /// PHY0 and an active further link's PHY.
+    fn active_phy_ids(&self) -> Vec<u8> {
+        let mut phys = alloc::vec![0u8];
+        phys.extend(
+            self.mld_links
+                .iter()
+                .filter_map(|l| l.active.map(|(_, p)| p)),
+        );
+        phys
+    }
+
+    /// A periodic scan owns the firmware scan slot (no internal MLO scan
+    /// starts); conversely `mlo_scan_running` refuses a periodic start.
+    pub(super) fn set_scheduled_scan_busy(&mut self, busy: bool) {
+        self.mlo_select.scheduled_busy = busy;
+    }
+    pub(super) fn mlo_scan_running(&self) -> bool {
+        self.mlo_select.scan_running
+    }
+
+    /// Whether this association can select links: a native MLD with at
+    /// least one further valid link (`hweight16(valid_links) > 1`).
+    fn multi_link(&self) -> bool {
+        self.mld.is_some() && !self.mld_links.is_empty() && self.client.is_none()
+    }
+
+    /// sta.c `iwl_mld_count_mpdu_rx`/`_tx` for the AP MLD station (Linux
+    /// keeps MPDU counters only for an MLO connection). Crossing the TPT
+    /// threshold while blocked unblocks EMLSR (`unblock_tpt_wk`), which
+    /// requests an internal MLO scan once nothing else blocks.
+    fn count_mpdu(&mut self, queue: usize, fw_link: u8, tx: bool) {
+        if !self.multi_link() || !self.emlsr_capable() {
+            return;
+        }
+        let blocked = self.emlsr.blocked & super::sc_emlsr::blocked::TPT != 0;
+        let now = now_ms();
+        if self
+            .mlo_select
+            .measure
+            .count_mpdus(queue, fw_link, 1, tx, blocked, now)
+            && self.emlsr.unblock(super::sc_emlsr::blocked::TPT, true)
+        {
+            self.mlo_select.scan_requested = true;
+        }
+    }
+
+    /// Record an affiliated AP's beacon received while the internal MLO
+    /// scan runs: its signal and BSS Load feed `iwl_mld_get_link_grade`.
+    fn observe_mlo_beacon(&mut self, mpdu: &scan_api::Mpdu<'_>) {
+        let frame = mpdu.frame;
+        if frame.len() < 36 || !matches!(frame[0], 0x80 | 0x50) {
+            return;
+        }
+        let Some(binding) = self.mld.as_ref() else {
+            return;
+        };
+        let bssid = &frame[16..22];
+        let primary = binding.primary();
+        let spec_link = if bssid == primary.peer_link && mpdu.channel == primary.channel.number {
+            primary.spec_link
+        } else if let Some(link) = self
+            .mld_links
+            .iter()
+            .find(|l| l.beacon.bssid == bssid && l.channel().number == mpdu.channel)
+        {
+            link.link_id()
+        } else {
+            return;
+        };
+        let util = mpdu
+            .body(24, 0)
+            .and_then(|body| body.get(12..))
+            .and_then(super::sc_emlsr::bss_load_channel_util);
+        self.mlo_select.observe(super::sc_emlsr::Seen {
+            spec_link,
+            signal_dbm: mpdu.rssi,
+            util,
+        });
+    }
+
+    /// mlo.c `_iwl_mld_select_links` after an internal MLO scan: grade
+    /// every valid link seen since that scan started (link.c
+    /// `iwl_mld_get_link_grade`), pick the best single link or EMLSR pair
+    /// and request it (`ieee80211_set_active_links_async`).
+    fn select_links(&mut self, now: u64) {
+        use super::sc_emlsr::{self, Candidate};
+        if !self.authorized || !self.multi_link() || !self.mlo_select.fresh(now) {
+            return;
+        }
+        let Some(binding) = self.mld.as_ref() else {
+            return;
+        };
+        let primary = *binding.primary();
+        let active = self.mld_active_links();
+        let mut candidates = Vec::new();
+        for seen in &self.mlo_select.seen {
+            let (channel, phy, phy_id) = if seen.spec_link == primary.spec_link {
+                (primary.channel, &self.phy, Some(0u8))
+            } else if let Some(valid) = self
+                .mld_links
+                .iter()
+                .find(|l| l.link_id() == seen.spec_link && l.keys.is_some())
+            {
+                (
+                    valid.channel(),
+                    valid.negotiated_phy(),
+                    valid.active.map(|(_, phy)| phy),
+                )
+            } else {
+                continue;
+            };
+            let width_mhz = 20u32 << phy.width.min(3);
+            let center = if phy.center == 0 {
+                channel
+            } else {
+                super::native_band::Channel {
+                    band: channel.band,
+                    number: phy.center,
+                }
+            };
+            let measure = &self.mlo_select.measure;
+            let by_us = phy_id.map_or(0, |p| measure.load_by_us[usize::from(p)]);
+            let chan_load = sc_emlsr::chan_load(channel.band, seen.util, by_us);
+            // Punctured EHT operation is refused at admission (shared
+            // association/eht.rs), so no accepted link is punctured.
+            let Some(grade) = sc_emlsr::link_grade(
+                channel.band,
+                width_mhz,
+                i32::from(seen.signal_dbm),
+                chan_load,
+                0,
+            ) else {
+                continue;
+            };
+            candidates.push(Candidate {
+                spec_link: seen.spec_link,
+                band: channel.band,
+                primary_mhz: channel.frequency(),
+                center_mhz: center.frequency(),
+                width_mhz,
+                signal_dbm: seen.signal_dbm,
+                // Channel switch announcements are not followed natively.
+                csa_active: false,
+                grade,
+                chan_load,
+                active: active & (1 << seen.spec_link) != 0,
+                load_not_by_us: phy_id.map_or(0, |p| measure.avg_not_by_us[usize::from(p)]),
+            });
+        }
+        // BT coexistence notifications are not consumed and no low-latency
+        // classification exists: BT is treated as inactive.
+        let capable = self.emlsr_capable();
+        if let Some(selection) = self.emlsr.select(&candidates, capable, false, false) {
+            self.active_request = Some(selection.active);
+        }
+    }
+
+    /// Link-selection maintenance: the authorized-station setup
+    /// (mac80211.c BSS_CHANGED_ASSOC clear + periodic statistics,
+    /// AUTHORIZED's TPT block), EMLSR prevention expiry, the periodic TPT
+    /// check and starting a requested internal MLO scan.
+    async fn service_link_selection(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        use super::sc_emlsr::{self, TptCheck};
+        if !self.multi_link() || hw.is_mvm89() {
+            return Ok(());
+        }
+        let now = now_ms();
+        let capable = self.emlsr_capable();
+        if !self.mlo_select.authorized_setup {
+            self.mlo_select.authorized_setup = true;
+            let (group, cmd) = sc_emlsr::SYSTEM_STATISTICS_CMD;
+            hw.command(group, cmd, &sc_emlsr::stats_command(true, false))
+                .await?;
+            hw.command(group, cmd, &sc_emlsr::stats_command(false, true))
+                .await?;
+            if let Some(set) = self.emlsr.block(
+                sc_emlsr::blocked::TPT,
+                self.emlsr.primary_link(),
+                capable,
+                now,
+            ) {
+                self.active_request = Some(set);
+            }
+        }
+        if self.emlsr.prevention_tick(capable, now) {
+            self.mlo_select.scan_requested = true;
+        }
+        if self.emlsr.blocked & sc_emlsr::blocked::TPT == 0 && capable {
+            let due = *self
+                .mlo_select
+                .next_tpt_ms
+                .get_or_insert(now + sc_emlsr::MLO_SCAN_FRESH_MS);
+            if now >= due {
+                self.mlo_select.next_tpt_ms = Some(now + sc_emlsr::MLO_SCAN_FRESH_MS);
+                let secondary = self
+                    .mld
+                    .as_ref()
+                    .and_then(|b| b.secondary())
+                    .map(|owner| owner.fw_link);
+                match self
+                    .emlsr
+                    .check_tpt(&mut self.mlo_select.measure, secondary, capable, now)
+                {
+                    TptCheck::Block(set) | TptCheck::Exit(set) => self.active_request = Some(set),
+                    TptCheck::Continue => {}
+                }
+            }
+        } else {
+            self.mlo_select.next_tpt_ms = None;
+        }
+        if !self.mlo_select.may_start_scan(now) {
+            return Ok(());
+        }
+        let Some(binding) = self.mld.as_ref() else {
+            return Ok(());
+        };
+        let primary = *binding.primary();
+        let mut channels = alloc::vec![primary.channel];
+        for link in &self.mld_links {
+            if link.keys.is_some() && !channels.contains(&link.channel()) {
+                channels.push(link.channel());
+            }
+        }
+        let version = hw.version(1, 0xd).ok_or("scan command version absent")?.0;
+        let body = sc_emlsr::Selector::scan_body(version, &channels, primary.fw_link)?;
+        self.mlo_select.scan_requested = false;
+        self.mlo_select.scan_running = true;
+        self.mlo_select.scan_started_ms = None;
+        hw.command(1, 0xd, &body).await?;
         Ok(())
     }
 
@@ -2676,7 +2942,9 @@ impl Connection {
         hw.install_mld_link(next.clone())?;
         self.mld = Some(next);
         self.mld_links[index].active = Some((owner, phy_id));
-        self.emlsr.links_activated(self.mld_active_links());
+        self.mlo_select.last_activation_ms = Some(now_ms());
+        self.emlsr
+            .links_activated(self.mld_active_links(), now_ms());
         Ok(())
     }
 
@@ -2709,7 +2977,8 @@ impl Connection {
         hw.install_mld_link(next.clone())?;
         self.mld = Some(next);
         self.mld_links[index].active = None;
-        self.emlsr.links_activated(self.mld_active_links());
+        self.emlsr
+            .links_activated(self.mld_active_links(), now_ms());
         Ok(())
     }
 
@@ -3324,3 +3593,8 @@ mod tests;
 
 #[path = "connection_tx_amsdu.rs"]
 pub(super) mod tx_amsdu;
+
+/// Boot-time monotonic milliseconds for EMLSR timing.
+fn now_ms() -> u64 {
+    narf_time::wall::monotonic_ns() / 1_000_000
+}

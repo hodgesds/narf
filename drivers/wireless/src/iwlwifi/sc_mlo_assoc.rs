@@ -283,6 +283,10 @@ impl ValidLink {
     pub fn link_id(&self) -> u8 {
         self.context.link_id()
     }
+    /// This link's negotiated PHY (width/center for link grading).
+    pub fn negotiated_phy(&self) -> &super::ht_vht::Negotiated {
+        &self.phy
+    }
     pub fn channel(&self) -> Channel {
         Channel {
             band: self.beacon.band,

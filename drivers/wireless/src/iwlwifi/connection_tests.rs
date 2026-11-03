@@ -65,6 +65,7 @@ fn connection() -> Connection {
         ap_eml: None,
         ap_med_sync: None,
         emlsr: super::super::sc_emlsr::Emlsr::default(),
+        mlo_select: super::super::sc_emlsr::Selector::default(),
         active_request: None,
         client: None,
         mld_eapol: VecDeque::new(),
