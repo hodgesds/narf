@@ -395,9 +395,11 @@ fn install(model: &mut Model, sdma: bool, value: u32) -> Ib {
 fn gfx_engine() -> (crate::amdgpu_vram::Pool, GfxEngine<Model>) {
     let pool = pool(1 << 20);
     let queue = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx).unwrap();
+    let pipe1 = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING1, fence::Engine::Gfx).unwrap();
     let mut e = GfxEngine {
         hw: hw(enabled()),
         queue,
+        pipe1,
         state: GfxState::Prepared,
         proof: GfxProof::default(),
         golden: false,

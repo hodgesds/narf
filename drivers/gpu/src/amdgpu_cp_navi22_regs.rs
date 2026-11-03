@@ -90,6 +90,15 @@ pub const CP_RB_WPTR_POLL_ADDR_LO: Reg = Reg(0, 0x1e8b); // linux: mmCP_RB_WPTR_
 pub const CP_RB_WPTR_POLL_ADDR_HI: Reg = Reg(0, 0x1e8c); // linux: mmCP_RB_WPTR_POLL_ADDR_HI@gc101
 pub const CP_RB_DOORBELL_CONTROL: Reg = Reg(0, 0x1e8d); // linux: mmCP_RB_DOORBELL_CONTROL@gc101
 pub const CP_RB_ACTIVE: Reg = Reg(0, 0x1f40); // linux: mmCP_RB_ACTIVE@gc101
+                                              // GFX ring 1 (ME0 pipe 1), gfx_v10_0_cp_gfx_resume with num_gfx_rings > 1.
+pub const CP_RB1_WPTR: Reg = Reg(0, 0x1df6); // linux: mmCP_RB1_WPTR@gc101
+pub const CP_RB1_WPTR_HI: Reg = Reg(0, 0x1df7); // linux: mmCP_RB1_WPTR_HI@gc101
+pub const CP_RB1_BASE: Reg = Reg(0, 0x1e00); // linux: mmCP_RB1_BASE@gc101
+pub const CP_RB1_CNTL: Reg = Reg(0, 0x1e01); // linux: mmCP_RB1_CNTL@gc101
+pub const CP_RB1_RPTR_ADDR: Reg = Reg(0, 0x1e02); // linux: mmCP_RB1_RPTR_ADDR@gc101
+pub const CP_RB1_RPTR_ADDR_HI: Reg = Reg(0, 0x1e03); // linux: mmCP_RB1_RPTR_ADDR_HI@gc101
+pub const CP_RB1_BASE_HI: Reg = Reg(0, 0x1e52); // linux: mmCP_RB1_BASE_HI@gc101
+pub const CP_RB1_ACTIVE: Reg = Reg(0, 0x1f41); // linux: mmCP_RB1_ACTIVE@gc101
 
 // MEC HQD, GRBM-selected (kiq_init_register, compute_mqd_init)
 pub const CP_PQ_WPTR_POLL_CNTL: Reg = Reg(0, 0x1e23); // linux: mmCP_PQ_WPTR_POLL_CNTL@gc101

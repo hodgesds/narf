@@ -8851,8 +8851,16 @@ non-repeatable state and retains published memory. Register polls are bounded
 by 100 ms and fences by 1 s. `amdgpu_fence_navi22::{notify, notify_all}` are
 the IH hook: an EOP/trap consumer calls them so fence waits re-sample at once;
 without it waits poll every 1 ms. `QueueProof` aggregates the three proofs.
-Clock gating, GFXOFF, the cleaner shader and Linux's second gfx ring are not
-enabled. These are kernel bring-up rings, not a submission API.
+GC 10.3 has two gfx rings (`GFX10_NUM_GFX_RINGS_Sienna_Cichlid`). As Linux's
+direct path does, `Gfx::start` programs ME0 pipe 1 (`CP_RB1_*`, its own
+24 KiB queue and doorbell `AMDGPU_NAVI10_DOORBELL_GFX_RING1 << 1`, with the
+doorbell control/range and wptr-poll registers written under that pipe's
+`GRBM_GFX_CNTL` selection), switches back to pipe 0, submits CLEAR_STATE to
+ring 1 after ring 0's clear-state preamble, and ring-tests both rings, as
+`gfx_v10_0_cp_resume`. Ring 1 carries no client work and no fences.
+The cleaner shader is not enabled at bring-up; clock gating and GFXOFF are
+applied later by the power-saving opt-in. These are kernel bring-up rings,
+not a submission API.
 
 ### Navi 22 runtime power, thermal and recovery
 

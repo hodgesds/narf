@@ -10,8 +10,9 @@ use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_fence_navi22 as fence,
     amdgpu_pm4_defs::{
-        packet3, PACKET3_INDIRECT_BUFFER, PACKET3_MAP_QUEUES, PACKET3_NOP, PACKET3_RELEASE_MEM,
-        PACKET3_SET_BASE, PACKET3_SET_RESOURCES, PACKET3_SET_UCONFIG_REG, PACKET3_WRITE_DATA,
+        packet3, PACKET3_CLEAR_STATE, PACKET3_INDIRECT_BUFFER, PACKET3_MAP_QUEUES, PACKET3_NOP,
+        PACKET3_RELEASE_MEM, PACKET3_SET_BASE, PACKET3_SET_RESOURCES, PACKET3_SET_UCONFIG_REG,
+        PACKET3_WRITE_DATA,
     },
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
@@ -46,6 +47,7 @@ pub mod doorbell {
     pub const MEC_RING0: u32 = 0x003 << 1; // linux: AMDGPU_NAVI10_DOORBELL_MEC_RING0 << 1
     pub const USERQUEUE_END: u32 = 0x08a; // linux: AMDGPU_NAVI10_DOORBELL_USERQUEUE_END
     pub const GFX_RING0: u32 = 0x08b << 1; // linux: AMDGPU_NAVI10_DOORBELL_GFX_RING0 << 1
+    pub const GFX_RING1: u32 = 0x08c << 1; // linux: AMDGPU_NAVI10_DOORBELL_GFX_RING1 << 1
     pub const SDMA0: u32 = 0x100 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 << 1
     pub const SDMA1: u32 = 0x10a << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1 << 1
     pub const SDMA2: u32 = 0x114 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE2 << 1
@@ -699,6 +701,86 @@ pub(crate) async fn wait_fence<I: Io>(
 }
 /// `gfx_v10_0_ring_test_ring`: SCRATCH_REG0 0xCAFEDEAD -> SET_UCONFIG_REG
 /// 0xDEADBEEF, polled through MMIO for at most `adev->usec_timeout`.
+/// One gfx ring's `CP_RB<n>_*` registers (`gfx_v10_0_cp_gfx_resume`).
+pub(crate) struct GfxRingRegs {
+    pub pipe: u32,
+    pub cntl: Reg,
+    pub wptr: Reg,
+    pub wptr_hi: Reg,
+    pub rptr_addr: Reg,
+    pub rptr_addr_hi: Reg,
+    pub base: Reg,
+    pub base_hi: Reg,
+    pub active: Reg,
+}
+pub(crate) const GFX_RING_REGS: [GfxRingRegs; 2] = [
+    GfxRingRegs {
+        pipe: 0,
+        cntl: CP_RB0_CNTL,
+        wptr: CP_RB0_WPTR,
+        wptr_hi: CP_RB0_WPTR_HI,
+        rptr_addr: CP_RB0_RPTR_ADDR,
+        rptr_addr_hi: CP_RB0_RPTR_ADDR_HI,
+        base: CP_RB0_BASE,
+        base_hi: CP_RB0_BASE_HI,
+        active: CP_RB_ACTIVE,
+    },
+    GfxRingRegs {
+        pipe: 1,
+        cntl: CP_RB1_CNTL,
+        wptr: CP_RB1_WPTR,
+        wptr_hi: CP_RB1_WPTR_HI,
+        rptr_addr: CP_RB1_RPTR_ADDR,
+        rptr_addr_hi: CP_RB1_RPTR_ADDR_HI,
+        base: CP_RB1_BASE,
+        base_hi: CP_RB1_BASE_HI,
+        active: CP_RB1_ACTIVE,
+    },
+];
+/// One pipe of `gfx_v10_0_cp_gfx_resume` with that pipe selected: ring
+/// size, pointers, writeback addresses, base, ACTIVE, then
+/// `gfx_v10_0_cp_gfx_set_doorbell`. `CP_RB_WPTR_POLL_ADDR_*` and the
+/// doorbell control/range registers are written per selected pipe, as Linux
+/// writes them once for each ring under `gfx_v10_0_cp_gfx_switch_pipe`.
+async fn resume_gfx_ring<I: Io>(hw: &mut Hw<I>, q: &Queue, r: &GfxRingRegs) -> Result<(), Error> {
+    let (base, rptr, wptr, index) = (q.address(0), q.address(RPTR), q.address(WPTR), q.doorbell);
+    let cntl = RB_BUFSZ | ((RB_BUFSZ - 2) << 8); // linux-lit: 8=CP_RB0_CNTL__RB_BLKSZ__SHIFT
+    hw.access(|io, l| {
+        update(io, l.reg(GRBM_GFX_CNTL), 3, r.pipe)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
+        io.write(l.reg(r.cntl), cntl);
+        io.write(l.reg(r.wptr), 0);
+        io.write(l.reg(r.wptr_hi), 0);
+        io.write(l.reg(r.rptr_addr), rptr as u32);
+        // linux-lit: 0xffff=CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK
+        io.write(l.reg(r.rptr_addr_hi), (rptr >> 32) as u32 & 0xffff);
+        io.write(l.reg(CP_RB_WPTR_POLL_ADDR_LO), wptr as u32);
+        io.write(l.reg(CP_RB_WPTR_POLL_ADDR_HI), (wptr >> 32) as u32);
+        Ok(())
+    })?;
+    delay(1000).await; // linux: n/a (mdelay(1) in gfx_v10_0_cp_gfx_resume)
+    hw.access(|io, l| {
+        io.write(l.reg(r.cntl), cntl);
+        // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
+        io.write(l.reg(r.base), (base >> 8) as u32);
+        // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
+        io.write(l.reg(r.base_hi), (base >> 40) as u32);
+        io.write(l.reg(r.active), 1);
+        // gfx_v10_0_cp_gfx_set_doorbell, Sienna Cichlid range fields
+        update(
+            io,
+            l.reg(CP_RB_DOORBELL_CONTROL),
+            // linux: CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK | CP_RB_DOORBELL_CONTROL__DOORBELL_EN_MASK
+            0x4fff_fffc,
+            // linux-lit: 30=CP_RB_DOORBELL_CONTROL__DOORBELL_EN__SHIFT; 2=CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT
+            (1 << 30) | (index << 2),
+        )?;
+        // linux-lit: 2=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT; 0xffc=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK
+        io.write(l.reg(CP_RB_DOORBELL_RANGE_LOWER), (index << 2) & 0xffc);
+        // linux-lit: 0xffc=CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK
+        io.write(l.reg(CP_RB_DOORBELL_RANGE_UPPER), 0xffc);
+        Ok(())
+    })
+}
 pub(crate) async fn ring_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<(), Error> {
     hw.access(|io, l| {
         // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_ring_test_ring)
@@ -856,6 +938,11 @@ const FIRST_KFD_VMID: u32 = 8; // linux: n/a (literal in gmc_v10_0.c:gmc_v10_0_s
 pub(crate) struct GfxEngine<I: Io> {
     pub hw: Hw<I>,
     pub queue: Queue,
+    /// GFX ring 1 on ME0 pipe 1. GC 10.3.x has `num_gfx_rings` = 2, so
+    /// `gfx_v10_0_cp_gfx_resume` programs it and `cp_gfx_start` submits a
+    /// CLEAR_STATE to it ("copy state 0 to next available state"); it is
+    /// ring-tested like ring 0 and carries no client work.
+    pub pipe1: Queue,
     pub state: GfxState,
     pub proof: GfxProof,
     /// The ASIC's golden sequence already applied (`golden`), so `configure`
@@ -923,16 +1010,19 @@ impl<I: Io> GfxEngine<I> {
     async fn configure_inner(&mut self) -> Result<(), Error> {
         let csb = crate::amdgpu_clearstate_gfx10::csb(self.hw.layout.segment(1), 0)
             .ok_or(Error::Unsupported)?;
-        let queue = &mut self.queue;
+        let (queue, pipe1) = (&mut self.queue, &mut self.pipe1);
         self.hw.access(|io, l| {
             checked(io.read(l.reg(GRBM_CNTL)))?;
             queue.clear(io);
             queue.write(io, MQD, &csb);
+            pipe1.clear(io);
             flush(io, l);
             Ok(())
         })?;
-        // Published before the RLC can learn the CSIB address.
+        // Published before the RLC can learn the CSIB address, and before
+        // `start` gives ME0 pipe 1 its ring base.
         self.queue.memory.publish();
+        self.pipe1.memory.publish();
         let golden = !self.golden;
         self.golden = true;
         let cam = self.hw.access(|io, l| {
@@ -1044,55 +1134,24 @@ impl<I: Io> GfxEngine<I> {
         self.proof.csb_dwords = csb.len() as u32;
         Ok(())
     }
-    /// `gfx_v10_0_cp_gfx_resume` + `cp_gfx_start` + gfx ring test. Linux's
-    /// second gfx ring (pipe 1) is not created.
+    /// `gfx_v10_0_cp_gfx_resume` (both GC 10.3 gfx rings: ME0 pipe 0, then
+    /// pipe 1) + `cp_gfx_start` + `cp_resume`'s ring test of each gfx ring.
     pub(crate) async fn start(&mut self) -> Result<(), Error> {
         self.begin(GfxState::Configured, GfxState::Starting)?;
         let result = self.start_inner().await;
         self.finish(result, GfxState::Running)
     }
     async fn start_inner(&mut self) -> Result<(), Error> {
-        let q = &self.queue;
-        let (base, rptr, wptr, index) =
-            (q.address(0), q.address(RPTR), q.address(WPTR), q.doorbell);
-        let cntl = RB_BUFSZ | ((RB_BUFSZ - 2) << 8); // linux-lit: 8=CP_RB0_CNTL__RB_BLKSZ__SHIFT
         self.hw.access(|io, l| {
             io.write(l.reg(CP_RB_WPTR_DELAY), 0);
             io.write(l.reg(CP_RB_VMID), 0);
-            update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
-            io.write(l.reg(CP_RB0_CNTL), cntl);
-            io.write(l.reg(CP_RB0_WPTR), 0);
-            io.write(l.reg(CP_RB0_WPTR_HI), 0);
-            io.write(l.reg(CP_RB0_RPTR_ADDR), rptr as u32);
-            // linux-lit: 0xffff=CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK
-            io.write(l.reg(CP_RB0_RPTR_ADDR_HI), (rptr >> 32) as u32 & 0xffff);
-            io.write(l.reg(CP_RB_WPTR_POLL_ADDR_LO), wptr as u32);
-            io.write(l.reg(CP_RB_WPTR_POLL_ADDR_HI), (wptr >> 32) as u32);
             Ok(())
         })?;
-        delay(1000).await; // linux: n/a (mdelay(1) in gfx_v10_0_cp_gfx_resume)
+        resume_gfx_ring(&mut self.hw, &self.queue, &GFX_RING_REGS[0]).await?;
+        resume_gfx_ring(&mut self.hw, &self.pipe1, &GFX_RING_REGS[1]).await?;
         self.hw.access(|io, l| {
-            io.write(l.reg(CP_RB0_CNTL), cntl);
-            // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
-            io.write(l.reg(CP_RB0_BASE), (base >> 8) as u32);
-            // linux: n/a (literal in gfx_v10_0_cp_gfx_resume)
-            io.write(l.reg(CP_RB0_BASE_HI), (base >> 40) as u32);
-            io.write(l.reg(CP_RB_ACTIVE), 1);
-            // gfx_v10_0_cp_gfx_set_doorbell, Sienna Cichlid range fields
-            update(
-                io,
-                l.reg(CP_RB_DOORBELL_CONTROL),
-                // linux: CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK | CP_RB_DOORBELL_CONTROL__DOORBELL_EN_MASK
-                0x4fff_fffc,
-                // linux-lit: 30=CP_RB_DOORBELL_CONTROL__DOORBELL_EN__SHIFT; 2=CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT
-                (1 << 30) | (index << 2),
-            )?;
-            // linux-lit: 2=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT; 0xffc=CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK
-            io.write(l.reg(CP_RB_DOORBELL_RANGE_LOWER), (index << 2) & 0xffc);
-            // linux-lit: 0xffc=CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK
-            io.write(l.reg(CP_RB_DOORBELL_RANGE_UPPER), 0xffc);
+            // Switch to pipe 0, then gfx_v10_0_cp_gfx_start.
             update(io, l.reg(GRBM_GFX_CNTL), 3, 0)?; // linux-lit: 3=GRBM_GFX_CNTL__PIPEID_MASK
-                                                     // gfx_v10_0_cp_gfx_start
                                                      // linux: n/a (max_hw_contexts literal 8 in gfx_v10_0_gpu_early_init)
             io.write(l.reg(CP_MAX_CONTEXT), 8 - 1);
             io.write(l.reg(CP_DEVICE_ID), 1);
@@ -1110,14 +1169,18 @@ impl<I: Io> GfxEngine<I> {
             .await;
         let csb = crate::amdgpu_clearstate_gfx10::csb(self.hw.layout.segment(1), 0)
             .ok_or(Error::Unsupported)?;
-        let queue = &mut self.queue;
+        let (queue, pipe1) = (&mut self.queue, &mut self.pipe1);
         self.hw.access(|io, l| {
             queue.emit(io, &csb)?;
             queue.emit(io, &pm4::ce_partition_base())?;
             queue.commit(io, l);
+            // num_gfx_rings > 1: copy state 0 to the next available state.
+            pipe1.emit(io, &[packet3(PACKET3_CLEAR_STATE, 0), 0])?;
+            pipe1.commit(io, l);
             Ok(())
         })?;
         ring_test(&mut self.hw, &mut self.queue).await?;
+        ring_test(&mut self.hw, &mut self.pipe1).await?;
         self.proof.ring = true;
         // gfx_v10_0_hw_init ends with gfx_v10_3_set_power_brake_sequence for
         // GC >= 10.3 after cp_resume; the KIQ/KCQ halves ran before this ring.
@@ -1192,6 +1255,9 @@ impl Gfx {
                     authority,
                 },
                 queue: Queue::new(pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx)?,
+                // No fence is emitted on pipe 1; the Gfx slot only times its
+                // ring-test register poll.
+                pipe1: Queue::new(pool, Kind::Cp, doorbell::GFX_RING1, fence::Engine::Gfx)?,
                 state: GfxState::Prepared,
                 proof: GfxProof::default(),
                 golden: false,
