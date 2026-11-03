@@ -102,18 +102,27 @@ impl<B: Bus> Runtime<B> {
         if next == peer {
             return Err(Error::Busy);
         }
+        // Only the target interface's retained records gate its Program:
+        // `brcmf_fweh_event_worker` dispatches each event to the `brcmf_if`
+        // of its own ifidx, so another interface's pending record is not
+        // part of this AP's prefix. An unparsable record names no
+        // interface and still blocks every one.
         if write
             && (self
                 .events
                 .iter()
                 .any(|bytes| match crate::cyw43439::events::parse_event(bytes) {
-                    Ok(event) => original.program_event_blocks(&event.header),
+                    Ok(event) => {
+                        event.header.if_idx == ifidx && original.program_event_blocks(&event.header)
+                    }
                     Err(_) => true,
                 })
                 || !self.ap_completed_idle()?)
         {
             // Records and native producer positions remain owned. No
             // input/descriptor/index/doorbell may step over that prefix.
+            // Unconsumed completion-ring entries are not yet attributed to
+            // an interface, so they still gate every ifidx.
             return Err(Error::Busy);
         }
         let resources = self.resources.as_mut().ok_or(Error::Failed)?;

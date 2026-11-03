@@ -1180,7 +1180,11 @@ prefix is that ifidx's unconsumed demux records. PCIe msgbuf
 (`station_transport.rs`) keeps a per-ifidx owner whose leave/quiet/peer
 retirement touch only that ifidx's (ifidx, fifo, da) flows and TX, and
 whose IOCTLs carry `msg.ifidx` (`runtime/ap_ioctl.rs`
-`command_ap_on`). Interface-0 ownership is unchanged. While a secondary
+`command_ap_on`). A Program SET is refused only for retained raw event
+records of the target ifidx that the original capture says block it
+(`brcmf_fweh_event_worker` dispatches by ifidx) or that do not parse;
+unconsumed completion-ring entries are not yet attributed and still gate
+every ifidx. Interface-0 ownership is unchanged. While a secondary
 AP owns an ifidx, `send_vif_data`/`send_data_on` refuse it and
 `vif_close` waits for its leave. `vif_bsscfg::Bsscfg` delegates the AP
 methods to its entry's ifidx, applying the bsscfg iovar rewrite to AP
