@@ -2,8 +2,8 @@
 //!
 //! The owned Pipe-A panel is adopted, never stopped or replaned; this
 //! owner adds and removes Pipes B–D around it. Its caller is the MTL
-//! external route, which owns the port side; until that route moves onto
-//! this owner, only native fixtures exercise it.
+//! external route ([`crate::intel_gpu_xelpg_external`] for DP,
+//! [`crate::intel_gpu_xelpg_hdmi`] for HDMI), which owns the port side.
 //! Sequence (MIT Linux b90c984d `intel_display.c::intel_atomic_commit_tail`,
 //! `skl_commit_modeset_enables`, `hsw_crtc_enable` / `hsw_crtc_disable`,
 //! `intel_update_crtc`, `intel_crtc.c::intel_pipe_update_start` / `_end`),
@@ -33,7 +33,6 @@
 //!    without the pipe.
 //!
 //! Only linear XRGB8888 full-pipe primaries, unscaled, are admitted.
-#![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dc_states::PipeDmc;

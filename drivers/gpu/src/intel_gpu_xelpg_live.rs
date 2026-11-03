@@ -26,9 +26,8 @@
 //! full PLL relock), live FBC/DSB activity, and a DDB order with no
 //! non-overlapping step. Pipes that are not lit are programmed directly;
 //! the caller turns a removed pipe off before, and enables an added pipe
-//! after, this transaction. Its production caller is
-//! [`crate::intel_gpu_xelpg_pipes`], itself awaiting the port owner.
-#![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+//! after, this transaction. Its caller is the Pipe B–D owner
+//! [`crate::intel_gpu_xelpg_pipes`], driven by the MTL external route.
 
 use alloc::vec::Vec;
 

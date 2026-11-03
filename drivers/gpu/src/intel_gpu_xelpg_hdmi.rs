@@ -1,8 +1,11 @@
 //! Intel Xe-LPDP (Meteor Lake / Arrow Lake) HDMI TMDS output.
 //!
 //! The HDMI counterpart of [`crate::intel_gpu_xelpg_external`]: one
-//! owned TMDS stream on pipe/transcoder A over DDI B (C10) or a Type-C
-//! port in legacy mode (C20).
+//! owned TMDS stream on a Pipe B–D and its transcoder over DDI B (C10) or
+//! a Type-C port in legacy mode (C20), next to the lit internal panel. The
+//! pipe side (power wells, resource transaction, pipe DMC, timings, plane
+//! arm, release) is the shared Pipe B–D owner
+//! ([`crate::intel_gpu_xelpg_pipes`]) through the DP route's helpers.
 //!
 //! ## Sources (Linux b90c984d)
 //!
@@ -56,8 +59,11 @@
 //! would select FRL clocking), clocks above the 600 MHz source maximum
 //! or without a source table (the SNPS C10 and computed C20 algorithms
 //! are not implemented; the latter also needs the MTL-U / ARL-S
-//! `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy port), a
-//! busy pipe A or an active DDI. Linux only logs an SCDC failure; here a
+//! `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy port), an
+//! active DDI, no free Pipe B–D, a lit Pipe A that is not the owned panel
+//! profile, and the Pipe B–D owner's resource refusals (all before the
+//! first write). PM demand runs at the TMDS clock (Linux's
+//! `crtc_state->port_clock` for HDMI). Linux only logs an SCDC failure; here a
 //! stream that needs the sink scrambling fails activation instead (and
 //! is locally stopped). Audio, deep color, YCbCr and HDMI 2.1 FRL remain
 //! out of scope.
@@ -73,17 +79,18 @@ use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
-use crate::intel_gpu_modeset_xelpg::{
-    acknowledged_cdclk, mtl_cdclk_for_pixel_clock, program_cdclk_floor, XeLpgModeset,
-};
-use crate::intel_gpu_pipes::Transcoder;
+use crate::intel_gpu_pipes::Pipe;
 use crate::intel_gpu_xelpg::{
     disable_d2d, disable_port_pll_complete, enable_d2d, enable_port_pll_state, port_width,
     set_signal_levels_hdmi, wait_port_buf_active, wait_port_buf_idle, C10PllState, C20PllState,
     C20Vdr, Cx0Error, Cx0Phy, Cx0PllState, PhyKind, PllRequest, XeLpgPort, PORT_BUF_PHY_IDLE,
     PORT_BUF_REVERSAL, PORT_WIDTH_MASK,
 };
-use crate::intel_gpu_xelpg_external::{preflight_idle, request_well, wait_bit, ExternalError};
+use crate::intel_gpu_xelpg_external::{
+    external_pipe, preflight, request_pipe_wells, reserve_pipe, trans_clk_sel, trans_clk_sel_port,
+    trans_ddi_func_ctl, ExternalError, MtlDisplay, PipeRefusal, RoutePipe,
+};
+use crate::intel_gpu_xelpg_pipes::PipeEnableError;
 use crate::intel_gpu_xelpg_tc::{
     connect as tc_connect, connection_intact, disconnect as tc_disconnect, TcConnection, TcMode,
 };
@@ -98,21 +105,14 @@ pub const MIN_TMDS_KHZ: u32 = 25_000;
 /// `intel_hdmi_is_frl` clocks.
 const FRL_CLOCKS_KHZ: [u32; 5] = [300_000, 600_000, 800_000, 1_000_000, 1_200_000];
 
-const PWR_1: u32 = 0;
-const PWR_2: u32 = 1;
-const PWR_A: u32 = 5;
-const PIPECONF_A: u64 = 0x7_0008;
-const PIPE_FRMCOUNT_A: u64 = 0x7_0040;
-const PLANE_CTL_1_A: u64 = 0x7_0180;
-const PLANE_SURF_1_A: u64 = 0x7_019C;
-const PLANE_SURFLIVE_1_A: u64 = 0x7_01AC;
-const TRANS_DDI_FUNC_CTL_A: u64 = 0x6_0400;
-const TRANS_CLK_SEL_A: u64 = 0x4_6140;
+/// `PIPE_FRMCOUNT_G4X`, primary `PLANE_SURF` / `PLANE_SURFLIVE`, relative
+/// to [`Pipe::base`].
+const FRMCOUNT: u64 = 0x040;
+const PLANE_SURF_1: u64 = 0x19C;
+const PLANE_SURFLIVE_1: u64 = 0x1AC;
 const TRANS_DDI_FUNC_ENABLE: u32 = 1 << 31;
 const TRANS_DDI_PORT_AND_MODE: u32 = (0xF << 27) | (0x7 << 24);
 const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
-const ENABLE: u32 = 1 << 31;
-const STATE: u32 = 1 << 30;
 /// HDMI TMDS always drives four lanes.
 const HDMI_LANES: u8 = 4;
 
@@ -503,7 +503,7 @@ pub enum HdmiRouteState {
     Quarantined,
 }
 
-/// One owned HDMI route on pipe A.
+/// One owned HDMI route on a Pipe B–D.
 #[derive(Clone, Debug)]
 pub struct MtlHdmiRoute {
     /// The probe.
@@ -511,6 +511,10 @@ pub struct MtlHdmiRoute {
     /// The scanned-out framebuffer.
     pub fb: Framebuffer,
     state: HdmiRouteState,
+    /// The Pipe B–D (and transcoder) the route was activated on.
+    pipe: Pipe,
+    /// The pipe's reservation until its post-plane release is proven.
+    reservation: Option<RoutePipe>,
 }
 
 fn wr<M: MmioWindow + ?Sized>(io: &M, off: u64, value: u32) -> Result<(), HdmiError> {
@@ -532,39 +536,75 @@ fn rd<M: MmioWindow + ?Sized>(io: &M, off: u64) -> Result<u32, HdmiError> {
     }
 }
 
-/// Program and light the HDMI route in `intel_ddi_pre_enable_hdmi` →
-/// `intel_ddi_enable` → `intel_ddi_enable_hdmi` order. Refusals return the
-/// probe; programming failures return a `Stopped` or `Quarantined` route.
+impl From<PipeEnableError> for HdmiError {
+    fn from(e: PipeEnableError) -> Self {
+        HdmiError::Route(e.into())
+    }
+}
+
+/// Program and light the HDMI route on a free Pipe B–D next to what Pipe A
+/// runs (`display`), in `intel_atomic_commit_tail` (pre-plane resources)
+/// → `hsw_crtc_enable` (pipe DMC, `intel_ddi_pre_enable_hdmi`, pipe and
+/// transcoder) → `intel_ddi_enable` → `intel_ddi_enable_hdmi` →
+/// `intel_update_crtc` order. Every refusal precedes the first write and
+/// returns the probe; programming failures return a `Stopped` or
+/// `Quarantined` route.
 // Refusal hands the owned probe/route back inline: it must not allocate.
 #[allow(clippy::result_large_err)]
 pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     io: &M,
     probe: MtlHdmiProbe,
     fb: Framebuffer,
+    display: &MtlDisplay,
 ) -> Result<MtlHdmiRoute, (Result<MtlHdmiRoute, MtlHdmiProbe>, HdmiError)> {
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err((Err(probe), ExternalError::Modeset(e).into()));
     }
-    if let Err(e) = preflight_idle(io, probe.port) {
-        return Err((Err(probe), e.into()));
-    }
+    let choice = match preflight(io, probe.port, display) {
+        Ok(choice) => choice,
+        Err(e) => return Err((Err(probe), e.into())),
+    };
     if let Some(conn) = probe.tc {
         if connection_intact(io, &conn) != Ok(true) {
             return Err((Err(probe), HdmiError::NotLegacy));
         }
     }
+    // crtc_state->port_clock is the TMDS clock for HDMI.
+    let ext = match external_pipe(
+        &choice,
+        probe.port,
+        &probe.mode,
+        &fb,
+        probe.pll.port_clock_khz,
+    ) {
+        Ok(ext) => ext,
+        Err(e) => return Err((Err(probe), e.into())),
+    };
+    if let Err(e) = choice.pipes.admit(io, &ext) {
+        return Err((Err(probe), e.into()));
+    }
     let mut route = MtlHdmiRoute {
         probe,
         fb,
         state: HdmiRouteState::Stopped,
+        pipe: choice.pipe,
+        reservation: None,
     };
-    match program_hdmi(io, &route) {
+    let dmc = display.pipe_dmc;
+    let result = request_pipe_wells(io, ext.pipe)
+        .and_then(|()| reserve_pipe(io, choice, &ext, dmc))
+        .map_err(HdmiError::from)
+        .and_then(|rp| {
+            route.reservation = Some(rp);
+            program_hdmi(io, &mut route)
+        });
+    match result {
         Ok(()) => {
             route.state = HdmiRouteState::Live;
             Ok(route)
         }
         Err(e) => {
-            route.state = match stop_hdmi_local(io, &route) {
+            route.state = match stop_hdmi_local(io, &mut route) {
                 Ok(()) => HdmiRouteState::Stopped,
                 Err(_) => HdmiRouteState::Quarantined,
             };
@@ -573,60 +613,50 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     }
 }
 
-fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Result<(), HdmiError> {
+fn reservation(route: &mut MtlHdmiRoute) -> Result<&mut RoutePipe, HdmiError> {
+    route
+        .reservation
+        .as_mut()
+        .ok_or(HdmiError::Route(ExternalError::Pipe(PipeRefusal::Sequence)))
+}
+
+fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Result<(), HdmiError> {
     let port = route.probe.port;
     let mode = route.probe.mode;
-    request_well(io, PWR_1)?;
-    if port.tc_index().is_some() {
-        request_well(io, PWR_2)?;
-    }
-    request_well(io, PWR_A)?;
-    crate::intel_gpu_color::initialize_rgb_bypass(io)
-        .map_err(|_| ExternalError::Modeset(ModesetError::ColorPipelineUnavailable))?;
-    let current = acknowledged_cdclk(io).map_err(ExternalError::Modeset)?;
-    let target = mtl_cdclk_for_pixel_clock(mode.pixel_clock_khz)
-        .map_or(current, |entry| current.max(entry.cdclk_khz));
-    crate::intel_gpu_display_resources::initialize(io, &mode, target)
-        .map_err(|_| ExternalError::Modeset(ModesetError::DisplayResourceUnavailable))?;
-    program_cdclk_floor(io, &mode).map_err(ExternalError::Modeset)?;
+    let link = route.probe.link;
+    let (scrambling, ddc, pll) = (
+        route.probe.sink.scrambling,
+        route.probe.ddc,
+        route.probe.pll,
+    );
+    let rp = reservation(route)?;
+    let (pipe, trans) = (rp.pipe, rp.transcoder());
     // intel_ddi_pre_enable_hdmi: PLL, transcoder clock, infoframes.
-    enable_port_pll_state(io, port, &route.probe.pll).map_err(phy_err)?;
-    wr(io, TRANS_CLK_SEL_A, (port.phy_index() + 1) << 28)?;
-    let mut ms = XeLpgModeset::new(io, port);
-    ms.program_transcoder(&mode);
-    ms.program_pipe(&mode);
+    enable_port_pll_state(io, port, &pll).map_err(phy_err)?;
+    wr(io, trans_clk_sel(trans), trans_clk_sel_port(port))?;
     crate::intel_gpu_hdmi::write_avi_infoframe(
         io,
-        Transcoder::A,
+        trans,
         &crate::intel_gpu_hdmi::pack_avi_infoframe(&mode),
     );
-    ms.program_plane(&route.fb, &mode);
+    // hsw_crtc_enable: source size, timings, RGB bypass (pipe off).
+    rp.pipes.program_timings(io, pipe)?;
     // intel_ddi_enable: transcoder function, then the transcoder.
-    let link = route.probe.link;
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(
         port.func_ctl_index(),
         link.scrambling,
         link.high_tmds_clock_ratio,
     );
-    wr(io, TRANS_DDI_FUNC_CTL_A, func)?;
-    let start = rd(io, PIPE_FRMCOUNT_A)?;
-    let conf = rd(io, PIPECONF_A)?;
-    wr(io, PIPECONF_A, conf | ENABLE)?;
-    if !wait_bit(io, PIPECONF_A, ENABLE | STATE, true, 100_000_000) {
-        return Err(ExternalError::Modeset(ModesetError::PipelineEnableUnavailable).into());
-    }
+    wr(io, trans_ddi_func_ctl(trans), func)?;
+    let start = rd(io, pipe.base() + FRMCOUNT)?;
+    rp.pipes.enable(io, pipe)?;
     // intel_ddi_enable_hdmi (display 14): sink scrambling/ratio over
     // SCDC (only for a scrambling-capable sink), D2D, levels,
     // PORT_BUF_CTL1 width, DDI_CTL_DE with the TMDS lane width, buffer
     // active. Linux only logs an SCDC failure; a stream that needs the
     // sink scrambling cannot work without it, so that failure stops here.
-    if route.probe.sink.scrambling {
-        let scdc = sink_scrambling(
-            io,
-            route.probe.ddc,
-            link.high_tmds_clock_ratio,
-            link.scrambling,
-        );
+    if scrambling {
+        let scdc = sink_scrambling(io, ddc, link.high_tmds_clock_ratio, link.scrambling);
         if scdc.is_err() && (link.scrambling || link.high_tmds_clock_ratio) {
             return scdc;
         }
@@ -645,6 +675,8 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Result<
         port_width(HDMI_LANES) | DDI_BUF_CTL_ENABLE,
     )?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
+    // intel_update_crtc: the primary, armed under vblank evasion.
+    rp.pipes.arm_primary(io, pipe)?;
     observe_hdmi(io, route, func, start)
 }
 
@@ -656,6 +688,7 @@ fn observe_hdmi<M: MmioWindow + ?Sized>(
 ) -> Result<(), HdmiError> {
     let port = route.probe.port;
     let mode = route.probe.mode;
+    let (base, trans) = (route.pipe.base(), route.pipe.transcoder());
     let plane = crate::intel_gpu_pipes::build_primary_plane(
         mode.h_active,
         mode.v_active,
@@ -664,15 +697,15 @@ fn observe_hdmi<M: MmioWindow + ?Sized>(
         crate::intel_gpu_pipes::PixelFormat::Argb8888,
     )
     .map_err(|_| ExternalError::Modeset(ModesetError::InvalidFramebuffer))?;
-    let dip = Transcoder::A.base() + crate::intel_gpu_hdmi::VIDEO_DIP_CTL_OFFSET;
+    let dip = trans.base() + crate::intel_gpu_hdmi::VIDEO_DIP_CTL_OFFSET;
     let mut refused = false;
     let done = narf_scheduler::responsive_spin_until(
         || {
-            let frame = io.read32(PIPE_FRMCOUNT_A);
-            let surf = io.read32(PLANE_SURF_1_A);
-            let live = io.read32(PLANE_SURFLIVE_1_A);
-            let route_now = io.read32(TRANS_DDI_FUNC_CTL_A);
-            let clock = io.read32(TRANS_CLK_SEL_A);
+            let frame = io.read32(base + FRMCOUNT);
+            let surf = io.read32(base + PLANE_SURF_1);
+            let live = io.read32(base + PLANE_SURFLIVE_1);
+            let route_now = io.read32(trans_ddi_func_ctl(trans));
+            let clock = io.read32(trans_clk_sel(trans));
             let infoframes = io.read32(dip);
             let buf = io.read32(port.buf_ctl1());
             let ddi = io.read32(port.ddi_buf_ctl());
@@ -682,7 +715,7 @@ fn observe_hdmi<M: MmioWindow + ?Sized>(
                     && surf == plane.plane_surf
                     && live == surf
                     && route_now == func
-                    && clock == (port.phy_index() + 1) << 28
+                    && clock == trans_clk_sel_port(port)
                     && infoframes & crate::intel_gpu_hdmi::VIDEO_DIP_ENABLE_AVI != 0
                     && buf & PORT_BUF_PHY_IDLE == 0
                     && ddi & DDI_BUF_CTL_ENABLE != 0)
@@ -695,52 +728,58 @@ fn observe_hdmi<M: MmioWindow + ?Sized>(
     Ok(())
 }
 
-/// Local stop: plane, transcoder, function deselect, then
+/// Local stop in `hsw_crtc_disable` order: plane off
+/// (`intel_crtc_disable_planes`), sink scrambling reset
+/// (`intel_ddi_disable_hdmi`), transcoder off, function deselect, then
 /// `intel_ddi_post_disable_hdmi` (infoframes off, DDI_CTL_DE off + PHY
-/// idle, D2D off, transcoder clock off, `intel_cx0pll_disable`).
-fn stop_hdmi_local<M: MmioWindow + ?Sized>(io: &M, route: &MtlHdmiRoute) -> Result<(), HdmiError> {
+/// idle, D2D off, transcoder clock off, `intel_cx0pll_disable`), the pipe
+/// DMC disable and the post-plane repartition without the pipe. A route
+/// that failed before its reservation has nothing to stop: its port is
+/// programmed only after it.
+fn stop_hdmi_local<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &mut MtlHdmiRoute,
+) -> Result<(), HdmiError> {
     let port = route.probe.port;
+    let (scrambling, ddc) = (route.probe.sink.scrambling, route.probe.ddc);
     let stop_failed: HdmiError =
         ExternalError::Modeset(ModesetError::PipelineStopUnavailable).into();
-    let ctl = rd(io, PLANE_CTL_1_A)?;
-    wr(io, PLANE_CTL_1_A, ctl & !ENABLE)?;
-    let surf = rd(io, PLANE_SURF_1_A)?;
-    wr(io, PLANE_SURF_1_A, surf)?;
+    let Some(rp) = route.reservation.as_mut() else {
+        return Ok(());
+    };
+    let (pipe, trans) = (rp.pipe, rp.transcoder());
+    rp.pipes.disable_primary(io, pipe)?;
     // intel_ddi_disable_hdmi (encoder disable, before the transcoder):
     // reset sink scrambling and the 1/10 ratio, best effort as in Linux
     // (an SCDC NACK never replaces the local stop proof).
-    if route.probe.sink.scrambling {
-        let _ = sink_scrambling(io, route.probe.ddc, false, false);
+    if scrambling {
+        let _ = sink_scrambling(io, ddc, false, false);
     }
-    let conf = rd(io, PIPECONF_A)?;
-    wr(io, PIPECONF_A, conf & !ENABLE)?;
-    if !wait_bit(io, PIPECONF_A, ENABLE | STATE, false, 100_000_000) {
-        return Err(stop_failed);
-    }
-    let func = rd(io, TRANS_DDI_FUNC_CTL_A)?;
+    rp.pipes.disable(io, pipe).map_err(|e| match e {
+        PipeEnableError::Timeout => stop_failed,
+        e => e.into(),
+    })?;
+    let func = rd(io, trans_ddi_func_ctl(trans))?;
     wr(
         io,
-        TRANS_DDI_FUNC_CTL_A,
+        trans_ddi_func_ctl(trans),
         func & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE),
     )?;
-    crate::intel_gpu_hdmi::disable_infoframes(io, Transcoder::A);
+    crate::intel_gpu_hdmi::disable_infoframes(io, trans);
     let ddi = rd(io, port.ddi_buf_ctl())?;
     wr(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
     wait_port_buf_idle(io, port).map_err(|_| stop_failed)?;
     disable_d2d(io, port).map_err(|_| stop_failed)?;
-    wr(io, TRANS_CLK_SEL_A, 0)?;
+    wr(io, trans_clk_sel(trans), 0)?;
     disable_port_pll_complete(io, port).map_err(|_| stop_failed)?;
-    let conf = rd(io, PIPECONF_A)?;
     let ddi = rd(io, port.ddi_buf_ctl())?;
     let buf = rd(io, port.buf_ctl1())?;
     let clock = rd(io, port.port_clock_ctl())?;
-    if conf & (ENABLE | STATE) != 0
-        || ddi & DDI_BUF_CTL_ENABLE != 0
-        || buf & PORT_BUF_PHY_IDLE == 0
-        || clock & 0xCC00_0000 != 0
-    {
+    if ddi & DDI_BUF_CTL_ENABLE != 0 || buf & PORT_BUF_PHY_IDLE == 0 || clock & 0xCC00_0000 != 0 {
         return Err(stop_failed);
     }
+    rp.pipes.release(io, pipe, rp.dmc)?;
+    route.reservation = None;
     Ok(())
 }
 
@@ -753,6 +792,16 @@ impl MtlHdmiRoute {
     /// The external port.
     pub fn port(&self) -> XeLpgPort {
         self.probe.port
+    }
+
+    /// The Pipe B–D (and same-index transcoder) the route was activated on.
+    pub fn pipe(&self) -> Pipe {
+        self.pipe
+    }
+
+    /// Whether the pipe's display resources are still reserved.
+    pub fn reserved(&self) -> bool {
+        self.reservation.is_some()
     }
 
     /// Locally stop; a failed stop quarantines the route.

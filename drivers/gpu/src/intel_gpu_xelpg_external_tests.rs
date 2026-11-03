@@ -218,14 +218,53 @@ fn edid_1080() -> Vec<u8> {
     edid_for(148_500, 1920, 280, 88, 44, 1080, 45, 4, 5)
 }
 
-const PIPECONF: u64 = 0x7_0008;
 const CDCLK_PLL: u64 = 0x4_6070;
+
+// Pipe/transcoder registers of the route. With Pipe A dark or lit by the
+// panel, the route takes Pipe B: the external route never drives Pipe A.
+/// `TRANSCONF(A)`, the internal panel's pipe.
+pub const PIPECONF_A: u64 = 0x7_0008;
+/// `TRANSCONF(B)`.
+pub const PIPECONF_B: u64 = 0x7_1008;
+/// Primary `PLANE_CTL` / `PLANE_SURF` of Pipe A.
+pub const PLANE_CTL_1_A: u64 = 0x7_0180;
+pub const PLANE_SURF_1_A: u64 = 0x7_019C;
+/// Primary `PLANE_CTL` / `PLANE_SURF` of Pipe B.
+pub const PLANE_CTL_1_B: u64 = 0x7_1180;
+pub const PLANE_SURF_1_B: u64 = 0x7_119C;
+/// `TRANS_DDI_FUNC_CTL(B)`, `TRANS_CLK_SEL(B)`, `TGL_DP_TP_CTL(B)`.
+pub const TRANS_DDI_FUNC_CTL_B: u64 = 0x6_1400;
+pub const TRANS_CLK_SEL_B: u64 = 0x4_6144;
+pub const DP_TP_CTL_B: u64 = 0x6_1540;
+/// The Pipe A/transcoder A function control and clock select.
+pub const TRANS_DDI_FUNC_CTL_A: u64 = 0x6_0400;
+pub const TRANS_CLK_SEL_A: u64 = 0x4_6140;
+/// `XELPDP_INITIATE_PMDEMAND_REQUEST(1)`.
+pub const PMDEMAND_REQUEST1: u64 = 0x4_5234;
+/// The lit panel's scanout surface (distinct from the external's).
+pub const PANEL_SURFACE: u32 = 0x0080_0000;
+
+/// `TRANSCONF(pipe)` when `off` is one, with the pipe.
+fn conf_pipe(off: u64) -> Option<usize> {
+    (0..4).find(|p| off == 0x7_0008 + *p as u64 * 0x1000)
+}
+/// `PIPE_FRMCOUNT_G4X(pipe)` when `off` is one.
+fn frame_pipe(off: u64) -> Option<usize> {
+    (0..4).find(|p| off == 0x7_0040 + *p as u64 * 0x1000)
+}
+/// Primary `PLANE_SURFLIVE(pipe)` when `off` is one.
+fn surflive_pipe(off: u64) -> Option<usize> {
+    (0..4).find(|p| off == 0x7_01AC + *p as u64 * 0x1000)
+}
 
 /// MTL display model for one external port: `FakePhy` (message bus, PLL
 /// acks, BUF_CTL1 D2D/PHY_IDLE/TCSS mirrors), HSW-encoded power wells,
-/// the CDCLK PLL lock, pipe A state and frame counter, the LIVE surface,
-/// Type-C IOM/FIA facts, PICA/SDE levels and W1C latches, and a DP sink
-/// behind the port's Xe-LPDP AUX channel.
+/// the CDCLK PLL lock and crawl ACK, the display-14 resource ACKs (PM
+/// demand completion, DBUF slice power state) and WM latencies, every
+/// pipe's TRANSCONF state, frame counter and LIVE surface, Type-C IOM/FIA
+/// facts, PICA/SDE levels and W1C latches, and a DP sink behind the port's
+/// Xe-LPDP AUX channel. [`ExtFake::with_panel`] lights the owned panel
+/// profile on Pipe A.
 #[derive(Debug)]
 pub struct ExtFake {
     pub phy: FakePhy,
@@ -236,9 +275,13 @@ pub struct ExtFake {
     pub pin: Cell<u8>,
     pub ready: Cell<bool>,
     cdclk_pll: Cell<u32>,
-    pipeconf: Cell<u32>,
+    confs: [Cell<u32>; 4],
+    /// No TRANSCONF ever acknowledges a disable.
     pub pipeconf_stuck: Cell<bool>,
-    frame: Cell<u32>,
+    frames: [Cell<u32>; 4],
+    /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
+    /// primary `PLANE_SURF` write: (register, enabled).
+    pub irq_log: RefCell<Vec<(u64, bool)>>,
     pub sink: RefCell<Sink>,
     aux_data: RefCell<[u32; 5]>,
     aux_reply: RefCell<Vec<u8>>,
@@ -263,6 +306,15 @@ impl ExtFake {
         phy.model_tcss.set(true);
         let pica = port.tc_index().map_or(0, pica_dp_alt_hotplug);
         let sde = if port == XeLpgPort::B { 1 << 17 } else { 0 };
+        // MTL_LATENCY_LP0_LP1..LP4_LP5 (the live/pipes fixture's values).
+        for (r, v) in [
+            (0x4_5780, 6 | (8 << 16)),
+            (0x4_5784, 10 | (12 << 16)),
+            (0x4_5788, 14 | (16 << 16)),
+        ] {
+            phy.write32(r, v);
+        }
+        phy.writes.borrow_mut().clear();
         Self {
             phy,
             port,
@@ -272,9 +324,10 @@ impl ExtFake {
             pin: Cell::new(PIN_ASSIGNMENT_C),
             ready: Cell::new(true),
             cdclk_pll: Cell::new(0),
-            pipeconf: Cell::new(0),
+            confs: Default::default(),
             pipeconf_stuck: Cell::new(false),
-            frame: Cell::new(0),
+            frames: Default::default(),
+            irq_log: RefCell::new(Vec::new()),
             sink: RefCell::new(sink),
             aux_data: RefCell::new([0; 5]),
             aux_reply: RefCell::new(Vec::new()),
@@ -292,6 +345,46 @@ impl ExtFake {
             .filter(|(o, _)| *o == off)
             .map(|(_, v)| *v)
             .collect()
+    }
+    /// Force `pipe`'s TRANSCONF (as firmware or another owner left it).
+    pub fn set_conf(&self, pipe: usize, value: u32) {
+        self.confs[pipe].set(value & !STATE);
+    }
+    /// Index of the first logged write matching `f`.
+    pub fn first_write(&self, f: impl Fn(u64, u32) -> bool) -> Option<usize> {
+        self.writes.borrow().iter().position(|&(o, v)| f(o, v))
+    }
+    /// Index of the last logged write matching `f`.
+    pub fn last_write(&self, f: impl Fn(u64, u32) -> bool) -> Option<usize> {
+        self.writes.borrow().iter().rposition(|&(o, v)| f(o, v))
+    }
+    /// Light the owned 1024x768 internal panel on Pipe A exactly as the
+    /// owned MTL modeset leaves it: display 14.00, IPC on, the computed
+    /// display-14 resource state committed, TRANSCONF and the linear
+    /// primary on. The write log is cleared; the panel mode is returned
+    /// (`None` if the fixture could not commit it).
+    pub fn light_panel(&self) -> Option<Mode> {
+        let mode = Mode::VESA_1024X768_60;
+        self.phy.write32(0x5_10A0, 14 << 22);
+        self.phy.write32(0x4_5004, 1 << 3);
+        let latency = crate::intel_gpu_xelpg_wm::Latency::read(self).ok()?;
+        let state = crate::intel_gpu_xelpg_resources::compute(
+            &crate::intel_gpu_display_resources::request(
+                &mode,
+                crate::intel_gpu_xelpg_wm::Tiling::Linear,
+                0,
+            ),
+            &latency,
+        )
+        .ok()?;
+        crate::intel_gpu_xelpg_resources::commit(self, &state).ok()?;
+        self.write32(PIPECONF_A, ENABLE);
+        self.write32(PLANE_CTL_1_A, ENABLE);
+        self.write32(PLANE_SURF_1_A, PANEL_SURFACE);
+        self.writes.borrow_mut().clear();
+        self.phy.writes.borrow_mut().clear();
+        self.irq_log.borrow_mut().clear();
+        Some(mode)
     }
     fn w1c(&self, off: u64) -> u32 {
         if off == PICA_IIR || off == SDE_IIR {
@@ -334,30 +427,43 @@ impl MmioWindow for ExtFake {
             return s | ((s & 0xAAAA_AAAA) >> 1);
         }
         if off == CDCLK_PLL {
-            let s = self.cdclk_pll.get();
-            return if s & ENABLE != 0 { s | STATE } else { s };
+            // LOCK follows ENABLE; FREQ_REQ_ACK follows FREQ_REQ (crawl).
+            let mut s = self.cdclk_pll.get();
+            if s & ENABLE != 0 {
+                s |= STATE;
+            }
+            if s & (1 << 23) != 0 {
+                s |= 1 << 22;
+            }
+            return s;
         }
-        let enabled = self.pipeconf.get() & ENABLE != 0;
-        if off == PIPECONF {
-            let s = self.pipeconf.get();
-            return if enabled || self.pipeconf_stuck.get() {
+        if let Some(pipe) = conf_pipe(off) {
+            let s = self.confs[pipe].get();
+            return if s & ENABLE != 0 || self.pipeconf_stuck.get() {
                 s | STATE
             } else {
                 s
             };
         }
-        if off == PIPE_FRMCOUNT_A {
-            if enabled {
-                self.frame.set(self.frame.get().wrapping_add(1));
+        if let Some(pipe) = frame_pipe(off) {
+            if self.confs[pipe].get() & ENABLE != 0 {
+                self.frames[pipe].set(self.frames[pipe].get().wrapping_add(1));
             }
-            return self.frame.get();
+            return self.frames[pipe].get();
         }
-        if off == PLANE_SURFLIVE_1_A {
-            return if enabled {
-                self.phy.read32(PLANE_SURF_1_A)
+        if let Some(pipe) = surflive_pipe(off) {
+            return if self.confs[pipe].get() & ENABLE != 0 {
+                self.phy.read32(off - 0x10)
             } else {
                 0
             };
+        }
+        if (0..4).any(|p| off == 0x7_0000 + p * 0x1000) {
+            // PIPEDSL: line 0, outside every evasion window.
+            self.irq_log
+                .borrow_mut()
+                .push((off, narf_arch::interrupts_enabled()));
+            return 0;
         }
         if is_gmbus(off) {
             return self.ddc.read32(off);
@@ -418,11 +524,27 @@ impl MmioWindow for ExtFake {
             return;
         }
         if off == CDCLK_PLL {
-            self.cdclk_pll.set(value);
+            self.cdclk_pll.set(value & !(STATE | (1 << 22)));
             return;
         }
-        if off == PIPECONF {
-            self.pipeconf.set(value & !STATE);
+        if let Some(pipe) = conf_pipe(off) {
+            self.confs[pipe].set(value & !STATE);
+            return;
+        }
+        if (0..4).any(|p| off == PLANE_SURF_1_A + p * 0x1000) {
+            self.irq_log
+                .borrow_mut()
+                .push((off, narf_arch::interrupts_enabled()));
+        }
+        if off == PMDEMAND_REQUEST1 {
+            // The PM demand request completes at once.
+            self.phy.write32(off, value & !ENABLE);
+            return;
+        }
+        if [0x4_5008, 0x4_4FE8, 0x4_4300, 0x4_4304].contains(&off) {
+            // DBUF_CTL_S(n): POWER_STATE follows POWER_REQUEST.
+            self.phy
+                .write32(off, (value & !STATE) | ((value >> 1) & STATE));
             return;
         }
         if off == self.port.aux_ctl() {
@@ -455,7 +577,7 @@ fn live_route(io: &ExtFake, port: XeLpgPort) -> Result<MtlExternalRoute, &'stati
     let probe =
         probe_sink(io, Generation::MeteorLake, port, false).map_err(|_| "probe must succeed")?;
     let fb = fb_for(&probe.mode).unwrap();
-    match activate(io, probe, fb) {
+    match activate(io, probe, fb, &MtlDisplay::NONE) {
         Ok(route) if route.state() == RouteState::Live => Ok(route),
         _ => Err("activation must produce a live route"),
     }
@@ -498,18 +620,32 @@ fn smoke_mtl_external_tc_dp_alt_full_route() -> TestResult {
         return TestResult::Fail("AUX writes must keep power and never select TBT IO");
     }
     drop(aux);
-    // PW_1, PW_2 (TC DDI lanes) and PW_A.
+    // The route runs on Pipe B (not Pipe A, which stays the panel's): PW_1,
+    // PW_2 (pipes B–D and the TC DDI lanes) and PW_B.
+    if route.pipe() != Pipe::B || !route.reserved() {
+        return TestResult::Fail("the route must hold a Pipe B reservation");
+    }
     let wells = io.read32(PWR_WELL_CTL2);
-    for idx in [PW_1_IDX, PW_2_IDX, PW_A_IDX] {
+    for idx in [PW_1_IDX, PW_2_IDX, pipe_well(Pipe::B)] {
         if wells & pwr_well_req(idx) == 0 {
-            return TestResult::Fail("PW_1/PW_2/PW_A must be requested");
+            return TestResult::Fail("PW_1/PW_2/PW_B must be requested");
+        }
+    }
+    for off in [
+        PIPECONF_A,
+        PLANE_CTL_1_A,
+        TRANS_DDI_FUNC_CTL_A,
+        TRANS_CLK_SEL_A,
+    ] {
+        if !io.writes_to(off).is_empty() {
+            return TestResult::Fail("the external route must never program Pipe A");
         }
     }
     // Source port/PHY numbering: PHY_G for TC2, PORT_TC2 = 4.
-    if io.writes_to(TRANS_CLK_SEL_A).first() != Some(&0x7000_0000) {
+    if io.writes_to(TRANS_CLK_SEL_B).first() != Some(&0x7000_0000) {
         return TestResult::Fail("TRANS_CLK_SEL must select PHY_G for TC2");
     }
-    let func = io.writes_to(TRANS_DDI_FUNC_CTL_A);
+    let func = io.writes_to(TRANS_DDI_FUNC_CTL_B);
     let want = crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
         4,
         crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
@@ -527,7 +663,7 @@ fn smoke_mtl_external_tc_dp_alt_full_route() -> TestResult {
     if io.phy.writes_to(0x6_4430) != [162_000] {
         return TestResult::Fail("DDI_CLK_VALFREQ(TC2) must carry the RBR port clock");
     }
-    let tp = io.writes_to(DP_TP_CTL_A);
+    let tp = io.writes_to(DP_TP_CTL_B);
     if tp.first() != Some(&(DP_TP_CTL_ENABLE | DP_TP_CTL_ENHANCED_FRAME))
         || tp.last()
             != Some(&(DP_TP_CTL_ENABLE | DP_TP_CTL_ENHANCED_FRAME | DP_TP_CTL_LINK_TRAIN_NORMAL))
@@ -564,23 +700,30 @@ fn smoke_mtl_external_ddi_b_route_stop_and_release() -> TestResult {
         Ok(route) => route,
         Err(e) => return TestResult::Fail(e),
     };
-    if route.probe.tc.is_some() || io.writes_to(TRANS_CLK_SEL_A).first() != Some(&0x2000_0000) {
+    if route.probe.tc.is_some() || io.writes_to(TRANS_CLK_SEL_B).first() != Some(&0x2000_0000) {
         return TestResult::Fail("DDI B route must use PHY_B without Type-C ownership");
     }
-    if io.read32(PWR_WELL_CTL2) & pwr_well_req(PW_2_IDX) != 0 {
-        return TestResult::Fail("DDI B must not request the TC lane well");
+    // Pipe B needs PW_2 even on DDI B: on Xe-LPDP it carries pipes and
+    // transcoders B–D (XELPDP_PW_2_POWER_DOMAINS), not only the TC lanes.
+    // Pipe A's well is the panel's and is not requested by the route.
+    let wells = io.read32(PWR_WELL_CTL2);
+    if wells & pwr_well_req(PW_2_IDX) == 0
+        || wells & pwr_well_req(pipe_well(Pipe::B)) == 0
+        || wells & pwr_well_req(PW_A_IDX) != 0
+    {
+        return TestResult::Fail("DDI B on Pipe B must request PW_2 and PW_B, not PW_A");
     }
-    if route.stop(&io).is_err() || route.state() != RouteState::Stopped {
-        return TestResult::Fail("local stop must be proven");
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped || route.reserved() {
+        return TestResult::Fail("local stop must be proven and release the pipe");
     }
     let port = XeLpgPort::B;
-    if io.read32(PIPECONF) & (ENABLE | STATE) != 0
+    if io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
         || io.read32(port.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
         || io.read32(port.buf_ctl1()) & PORT_BUF_PHY_IDLE == 0
         || io.read32(port.port_clock_ctl()) & 0xCC00_0000 != 0
-        || io.read32(TRANS_CLK_SEL_A) != 0
-        || io.read32(TRANS_DDI_FUNC_CTL_A) & (TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE) != 0
-        || io.read32(DP_TP_CTL_A) & DP_TP_CTL_ENABLE != 0
+        || io.read32(TRANS_CLK_SEL_B) != 0
+        || io.read32(TRANS_DDI_FUNC_CTL_B) & (TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE) != 0
+        || io.read32(DP_TP_CTL_B) & DP_TP_CTL_ENABLE != 0
     {
         return TestResult::Fail("stop must leave pipe, DDI, PLL, clock and transport off");
     }
@@ -594,10 +737,10 @@ fn smoke_mtl_external_ddi_b_route_stop_and_release() -> TestResult {
     let writes = io.writes.borrow();
     let last_plane_off = writes
         .iter()
-        .rposition(|&(o, v)| o == PLANE_CTL_1_A && v & ENABLE == 0);
+        .rposition(|&(o, v)| o == PLANE_CTL_1_B && v & ENABLE == 0);
     let pipe_off = writes
         .iter()
-        .rposition(|&(o, v)| o == PIPECONF && v & ENABLE == 0);
+        .rposition(|&(o, v)| o == PIPECONF_B && v & ENABLE == 0);
     let ddi_off = writes
         .iter()
         .rposition(|&(o, v)| o == port.ddi_buf_ctl() && v & DDI_BUF_CTL_ENABLE == 0);
@@ -624,14 +767,14 @@ fn smoke_mtl_external_refuses_busy_pipe_or_port_before_programming() -> TestResu
             Err(_) => return TestResult::Fail("probe must succeed"),
         };
         if busy_pipe {
-            io.pipeconf.set(ENABLE);
+            io.set_conf(0, ENABLE);
         } else {
             io.phy
                 .write32(XeLpgPort::Tc1.ddi_buf_ctl(), DDI_BUF_CTL_ENABLE);
         }
         let before = io.writes.borrow().len();
         let fb = fb_for(&probe.mode).unwrap();
-        let probe = match activate(&io, probe, fb) {
+        let probe = match activate(&io, probe, fb, &MtlDisplay::NONE) {
             Err(ActivateError::Refused(probe, ExternalError::PipeBusy)) if busy_pipe => probe,
             Err(ActivateError::Refused(probe, ExternalError::PortBusy)) if !busy_pipe => probe,
             _ => {
@@ -675,7 +818,7 @@ fn smoke_mtl_external_lane_fallback_retries_at_trained_width() -> TestResult {
         crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
         2,
     );
-    if io.read32(TRANS_DDI_FUNC_CTL_A) != want
+    if io.read32(TRANS_DDI_FUNC_CTL_B) != want
         || io.read32(XeLpgPort::Tc3.ddi_buf_ctl()) != DDI_BUF_CTL_ENABLE | (1 << 1)
     {
         return TestResult::Fail("retry must program a two-lane function and DDI width");
@@ -689,7 +832,7 @@ fn smoke_mtl_external_lane_fallback_retries_at_trained_width() -> TestResult {
         Err(_) => return TestResult::Fail("1080p probe must succeed"),
     };
     let fb = fb_for(&probe.mode).unwrap();
-    match activate(&io, probe, fb) {
+    match activate(&io, probe, fb, &MtlDisplay::NONE) {
         Err(ActivateError::Failed(route, ExternalError::OverBudget { .. }))
             if route.state() == RouteState::Stopped =>
         {
@@ -734,7 +877,13 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
         } => {}
         _ => return TestResult::Fail("TBT connect event must be refused without MMIO"),
     }
-    if service_mtl_external(&NoAccess, Generation::AlderLake, &mut fb_for).is_some()
+    if service_mtl_external(
+        &NoAccess,
+        Generation::AlderLake,
+        &MtlDisplay::NONE,
+        &mut fb_for,
+    )
+    .is_some()
         || !teardown_mtl_external(&NoAccess, Generation::TigerLake)
     {
         return TestResult::Fail("non-MTL process entries must not touch registers");
@@ -786,7 +935,7 @@ fn smoke_mtl_external_unplug_mid_activation_and_failed_stop() -> TestResult {
     };
     io.sink.borrow_mut().nack_all = true;
     let fb = fb_for(&probe.mode).unwrap();
-    match activate(&io, probe, fb) {
+    match activate(&io, probe, fb, &MtlDisplay::NONE) {
         Err(ActivateError::Failed(route, ExternalError::Link(_)))
             if route.state() == RouteState::Stopped =>
         {
@@ -1283,14 +1432,14 @@ fn smoke_mtl_external_service_ddi_b_hdmi_lifecycle() -> TestResult {
         } if mode.h_active == 1024 => {}
         _ => return TestResult::Fail("DDI B without DPCD must light the HDMI route"),
     }
-    // The DP attempt released its AUX power; HDMI owns pipe A on DDI B.
+    // The DP attempt released its AUX power; HDMI owns Pipe B on DDI B.
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false);
     if io.aux_power.get()
-        || io.read32(TRANS_DDI_FUNC_CTL_A) != func
+        || io.read32(TRANS_DDI_FUNC_CTL_B) != func
         || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE == 0
         || service.route().map(MtlRoute::protocol) != Some(MtlProtocol::Hdmi)
         || service.route().map(MtlRoute::live) != Some(true)
-        || !io.writes_to(DP_TP_CTL_A).is_empty()
+        || !io.writes_to(DP_TP_CTL_B).is_empty()
     {
         return TestResult::Fail("HDMI route must own DDI B in TMDS mode without DP state");
     }
@@ -1330,7 +1479,7 @@ fn smoke_mtl_external_service_ddi_b_hdmi_lifecycle() -> TestResult {
     }
     if service.route().is_some()
         || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
-        || io.read32(PIPECONF_A) & (ENABLE | STATE) != 0
+        || io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
         || io.read32(XeLpgPort::B.port_clock_ctl()) & 0xCC00_0000 != 0
     {
         return TestResult::Fail("withdrawn HDMI route must leave DDI, pipe and PLL off");
@@ -1533,7 +1682,7 @@ fn smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin() -> TestResult {
     let buf = io.read32(XeLpgPort::Tc2.buf_ctl1());
     if buf & (TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP) != TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP
         || io.ddc.writes_to(crate::intel_gpu_gmbus::GMBUS0).first() != Some(&10)
-        || io.read32(TRANS_CLK_SEL_A) != 0x7000_0000
+        || io.read32(TRANS_CLK_SEL_B) != 0x7000_0000
         || io.aux_power.get()
     {
         return TestResult::Fail("legacy HDMI must own the PHY, use pin 10 and PHY_G clocking");
@@ -1901,4 +2050,420 @@ fn smoke_mtl_no_vbt_install_keeps_missing_defaults() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_no_vbt_install_keeps_missing_defaults
+);
+
+// ── External on Pipe B next to the lit panel (Pipe B–D owner join) ──────
+
+/// A `'static` pipe-DMC sink recording (pipe, enabled) in call order.
+#[derive(Debug)]
+pub struct DmcEvents(narf_lib::sync::IrqSafeSpinLock<Vec<(u32, bool)>>);
+
+impl PipeDmc for DmcEvents {
+    fn enable_pipe(&self, pipe: u32) {
+        self.0.lock().push((pipe, true));
+    }
+    fn disable_pipe(&self, pipe: u32) {
+        self.0.lock().push((pipe, false));
+    }
+}
+
+impl DmcEvents {
+    /// A fresh sink that lives for the rest of the run (one per test).
+    pub fn leak() -> &'static Self {
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(Self(
+            narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+        )))
+    }
+    /// The events so far.
+    pub fn events(&self) -> Vec<(u32, bool)> {
+        self.0.lock().clone()
+    }
+}
+
+/// The display context of a lit owned panel with `dmc` as its sink.
+fn beside(panel: Mode, dmc: &'static DmcEvents) -> MtlDisplay {
+    MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: dmc,
+    }
+}
+
+/// The panel stayed lit and was never replaned: no write turned Pipe A's
+/// transcoder or primary off or moved it, and both still read on.
+fn panel_never_blanked(io: &ExtFake) -> bool {
+    io.writes_to(PIPECONF_A).is_empty()
+        && io.writes_to(PLANE_CTL_1_A).is_empty()
+        && io
+            .writes_to(PLANE_SURF_1_A)
+            .iter()
+            .all(|v| *v == PANEL_SURFACE)
+        && io.read32(PIPECONF_A) & (ENABLE | STATE) == ENABLE | STATE
+        && io.read32(PLANE_CTL_1_A) & ENABLE != 0
+        && io.read32(PLANE_SURF_1_A) == PANEL_SURFACE
+}
+
+/// Pipe A and the global resources hold exactly the owned panel profile
+/// again (the KMS fixed-profile contract), with Pipe B's image cleared.
+fn panel_profile_restored(io: &ExtFake, mode: &Mode) -> bool {
+    let Ok(latency) = crate::intel_gpu_xelpg_wm::Latency::read(io) else {
+        return false;
+    };
+    let Ok(state) = crate::intel_gpu_xelpg_resources::compute(
+        &crate::intel_gpu_display_resources::request(
+            mode,
+            crate::intel_gpu_xelpg_wm::Tiling::Linear,
+            0,
+        ),
+        &latency,
+    ) else {
+        return false;
+    };
+    let Some(image) = state.plane_registers() else {
+        return false;
+    };
+    image.iter().all(|&(r, v)| io.read32(r) == v)
+        && crate::intel_gpu_display_resources::Profile::capture(io, mode).is_ok()
+        && crate::intel_gpu_pmdemand::Params::decode(
+            io.read32(0x4_5230),
+            io.read32(PMDEMAND_REQUEST1),
+        ) == state.pmdemand
+}
+
+fn smoke_mtl_external_dp_on_pipe_b_beside_lit_panel() -> TestResult {
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1080()));
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let dmc = DmcEvents::leak();
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe must succeed"),
+    };
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &beside(panel, dmc)) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("DP must light Pipe B next to the lit panel"),
+    };
+    // The route owns Pipe B / transcoder B; the panel's pipe was adopted.
+    let want = crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+        3,
+        crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+        route.trained.lanes,
+    );
+    if route.pipe() != Pipe::B
+        || io.read32(TRANS_DDI_FUNC_CTL_B) != want
+        || io.read32(TRANS_CLK_SEL_B) != 0x6000_0000
+        || io.read32(PIPECONF_B) & (ENABLE | STATE) != ENABLE | STATE
+        || io.read32(PLANE_SURF_1_B) != 0x100_0000
+        || !io.writes_to(TRANS_DDI_FUNC_CTL_A).is_empty()
+    {
+        return TestResult::Fail("the DP route must run on Pipe B and transcoder B");
+    }
+    if !panel_never_blanked(&io) {
+        return TestResult::Fail("adding the external must keep the panel lit and unplaned");
+    }
+    // Linux order: the live resource transaction (MBUS unjoined for two
+    // pipes) precedes the port PLL; then pipe source size and timings, the
+    // transcoder function, the transcoder, and the primary arm last.
+    let unjoin = io.first_write(|o, _| o == crate::intel_gpu_xelpg_dbuf::MBUS_CTL);
+    let pll = io.first_write(|o, _| o == XeLpgPort::Tc1.port_clock_ctl());
+    let timings = io.first_write(|o, _| o == 0x6_101C);
+    let func_on =
+        io.first_write(|o, v| o == TRANS_DDI_FUNC_CTL_B && v & TRANS_DDI_FUNC_ENABLE != 0);
+    let pipe_on = io.first_write(|o, v| o == PIPECONF_B && v & ENABLE != 0);
+    let arm = io.first_write(|o, _| o == PLANE_SURF_1_B);
+    match (unjoin, pll, timings, func_on, pipe_on, arm) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f))
+            if a < b && b < c && c < d && d < e && e < f => {}
+        _ => return TestResult::Fail("resources, PLL, timings, function, pipe, arm order"),
+    }
+    if io.read32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL) & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK
+        != 0
+        || crate::intel_gpu_display_resources::Profile::capture(&io, &panel).is_ok()
+    {
+        return TestResult::Fail("two lit pipes must leave the joined single-pipe profile");
+    }
+    if dmc.events() != [(1, true)] {
+        return TestResult::Fail("Pipe B's DMC must be enabled once for its crtc");
+    }
+    // Remove: the external stops and Pipe A gets its whole profile back.
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped || route.reserved() {
+        return TestResult::Fail("the stop must be proven and release Pipe B");
+    }
+    if io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
+        || io.read32(TRANS_CLK_SEL_B) != 0
+        || dmc.events() != [(1, true), (1, false)]
+    {
+        return TestResult::Fail("Pipe B must be off with its DMC disabled");
+    }
+    if !panel_never_blanked(&io) || !panel_profile_restored(&io, &panel) {
+        return TestResult::Fail("removal must restore the panel profile without blanking it");
+    }
+    if route.release(&io).is_err() {
+        return TestResult::Fail("the stopped route must release Type-C and AUX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_on_pipe_b_beside_lit_panel
+);
+
+fn smoke_mtl_external_hdmi_on_pipe_b_beside_lit_panel() -> TestResult {
+    let io = hdmi_on_ddi_b(edid_1024());
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let dmc = DmcEvents::leak();
+    let mut service = MtlExternalService::new();
+    service.set_display(beside(panel, dmc));
+    let event = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    match service.handle(&io, event, &mut fb_for) {
+        ServiceOutcome::Activated {
+            port: XeLpgPort::B,
+            protocol: MtlProtocol::Hdmi,
+            pipe: Pipe::B,
+            ..
+        } => {}
+        _ => return TestResult::Fail("HDMI must light Pipe B next to the lit panel"),
+    }
+    let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false);
+    let dip =
+        crate::intel_gpu_pipes::Transcoder::B.base() + crate::intel_gpu_hdmi::VIDEO_DIP_CTL_OFFSET;
+    if io.read32(TRANS_DDI_FUNC_CTL_B) != func
+        || io.read32(TRANS_CLK_SEL_B) != 0x2000_0000
+        || io.read32(dip) & crate::intel_gpu_hdmi::VIDEO_DIP_ENABLE_AVI == 0
+        || service.route().map(MtlRoute::pipe) != Some(Pipe::B)
+        || !panel_never_blanked(&io)
+    {
+        return TestResult::Fail("HDMI must own transcoder B with the panel kept lit");
+    }
+    // intel_ddi_enable then intel_ddi_enable_hdmi: transcoder before
+    // DDI_CTL_DE, the primary armed last.
+    let pipe_on = io.first_write(|o, v| o == PIPECONF_B && v & ENABLE != 0);
+    let ddi_on =
+        io.first_write(|o, v| o == XeLpgPort::B.ddi_buf_ctl() && v & DDI_BUF_CTL_ENABLE != 0);
+    let arm = io.first_write(|o, _| o == PLANE_SURF_1_B);
+    match (pipe_on, ddi_on, arm) {
+        (Some(a), Some(b), Some(c)) if a < b && b < c => {}
+        _ => return TestResult::Fail("HDMI order must be transcoder, DDI, then the arm"),
+    }
+    // Unplug withdraws it and repartitions back to the panel alone.
+    match service.handle(&io, ddi_b_event(MtlHpdKind::Disconnected), &mut fb_for) {
+        ServiceOutcome::Withdrawn { port: XeLpgPort::B } => {}
+        _ => return TestResult::Fail("the HDMI route must withdraw"),
+    }
+    if io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
+        || io.read32(dip) & crate::intel_gpu_hdmi::VIDEO_DIP_ENABLE_AVI != 0
+        || dmc.events() != [(1, true), (1, false)]
+        || !panel_never_blanked(&io)
+        || !panel_profile_restored(&io, &panel)
+    {
+        return TestResult::Fail("HDMI removal must restore the panel profile unblanked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_hdmi_on_pipe_b_beside_lit_panel
+);
+
+fn smoke_mtl_external_no_free_pipe_or_resources_refuse_before_mmio() -> TestResult {
+    // Pipes B–D all lit: NoFreePipe before any write, probe handed back.
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let dmc = DmcEvents::leak();
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe must succeed"),
+    };
+    for pipe in 1..4 {
+        io.set_conf(pipe, ENABLE);
+    }
+    let before = io.writes.borrow().len();
+    let fb = fb_for(&probe.mode).unwrap();
+    let probe = match activate(&io, probe, fb, &beside(panel, dmc)) {
+        Err(ActivateError::Refused(probe, ExternalError::NoFreePipe)) => probe,
+        _ => return TestResult::Fail("no free Pipe B–D must refuse NoFreePipe"),
+    };
+    if io.writes.borrow().len() != before || !dmc.events().is_empty() {
+        return TestResult::Fail("the no-pipe refusal must precede every write");
+    }
+    // A free pipe but no resources for the mode: the resource owner's
+    // typed refusal, still before any write.
+    for pipe in 1..4 {
+        io.set_conf(pipe, 0);
+    }
+    let mut huge = probe;
+    huge.mode.pixel_clock_khz = 1_400_000;
+    let fb = fb_for(&huge.mode).unwrap();
+    let probe = match activate(&io, huge, fb, &beside(panel, dmc)) {
+        Err(ActivateError::Refused(probe, ExternalError::Pipe(_))) => probe,
+        _ => return TestResult::Fail("unsatisfiable resources must refuse typed"),
+    };
+    if io.writes.borrow().len() != before || !dmc.events().is_empty() {
+        return TestResult::Fail("the resource refusal must precede every write");
+    }
+    // An unowned lit Pipe A (no panel profile in the context) refuses too.
+    let fb = fb_for(&probe.mode).unwrap();
+    let probe = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Err(ActivateError::Refused(probe, ExternalError::PipeBusy)) => probe,
+        _ => return TestResult::Fail("an unowned lit Pipe A must refuse PipeBusy"),
+    };
+    if io.writes.borrow().len() != before || !panel_never_blanked(&io) {
+        return TestResult::Fail("refusals must leave the panel untouched");
+    }
+    if release_probe(&io, &probe).is_err() {
+        return TestResult::Fail("the refused probe must release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_no_free_pipe_or_resources_refuse_before_mmio
+);
+
+fn smoke_mtl_external_failed_activation_repartitions_back() -> TestResult {
+    // The sink vanishes after probe: training fails with Pipe B already
+    // reserved next to the lit panel. The local stop disables Pipe B's
+    // DMC and repartitions back; the panel never blanks.
+    let io = ExtFake::new(XeLpgPort::Tc2, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let dmc = DmcEvents::leak();
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc2, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe must succeed"),
+    };
+    io.sink.borrow_mut().nack_all = true;
+    let fb = fb_for(&probe.mode).unwrap();
+    let route = match activate(&io, probe, fb, &beside(panel, dmc)) {
+        Err(ActivateError::Failed(route, ExternalError::Link(_)))
+            if route.state() == RouteState::Stopped =>
+        {
+            route
+        }
+        _ => return TestResult::Fail("training loss must fail with a stopped route"),
+    };
+    // The reservation did happen (MBUS unjoined, then rejoined) and was
+    // undone by the post-plane release.
+    if io.writes_to(crate::intel_gpu_xelpg_dbuf::MBUS_CTL).len() < 2
+        || route.reserved()
+        || dmc.events() != [(1, true), (1, false)]
+    {
+        return TestResult::Fail("the failed activation must reserve, then release Pipe B");
+    }
+    if io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
+        || !panel_never_blanked(&io)
+        || !panel_profile_restored(&io, &panel)
+    {
+        return TestResult::Fail("the repartition must return the panel profile, unblanked");
+    }
+    if route.release(&io).is_err() {
+        return TestResult::Fail("the stopped route must release Type-C ownership");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_failed_activation_repartitions_back
+);
+
+fn smoke_mtl_external_pm_demand_at_route_port_clock() -> TestResult {
+    use crate::intel_gpu_pmdemand::Params;
+    let demand = |io: &ExtFake| Params::decode(io.read32(0x4_5230), io.read32(PMDEMAND_REQUEST1));
+    // No panel: the DP route's PM demand carries its negotiated RBR port
+    // clock (162 MHz), not the HBR3 reservation of the panel profile.
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let route = match live_route(&io, XeLpgPort::Tc1) {
+        Ok(route) => route,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if route.trained.rate != TrainRate::Rbr || demand(&io).ddiclk_max != 162 {
+        return TestResult::Fail("DP PM demand must run at the trained RBR port clock");
+    }
+    // A lane fallback retrains at the same rate on the same reservation:
+    // the demand stays exact.
+    let mut sink = Sink::new(0x14, edid_1024());
+    sink.max_good_lanes = 2;
+    let io = ExtFake::new(XeLpgPort::Tc3, sink);
+    let route = match live_route(&io, XeLpgPort::Tc3) {
+        Ok(route) => route,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if route.trained.lanes != 2 || demand(&io).ddiclk_max != 162 {
+        return TestResult::Fail("a lane fallback must keep the trained-rate demand");
+    }
+    // HDMI: the TMDS clock (65 MHz).
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(
+            &io,
+            ddi_b_event(MtlHpdKind::Connected(LiveMode::Native)),
+            &mut fb_for
+        ),
+        ServiceOutcome::Activated { .. }
+    ) || demand(&io).ddiclk_max != 65
+    {
+        return TestResult::Fail("HDMI PM demand must run at the TMDS clock");
+    }
+    // Next to the lit panel the panel's HBR3 reservation still bounds the
+    // maximum (the documented over-request the KMS profile requires).
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe must succeed"),
+    };
+    let fb = fb_for(&probe.mode).unwrap();
+    match activate(&io, probe, fb, &beside(panel, DmcEvents::leak())) {
+        Ok(_) if demand(&io).ddiclk_max == 810 => {}
+        _ => return TestResult::Fail("the panel's HBR3 reservation must bound the demand"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_pm_demand_at_route_port_clock
+);
+
+fn smoke_mtl_external_route_arm_runs_inside_irq_masked_evasion() -> TestResult {
+    // The live update of the panel and the arm of Pipe B both sample the
+    // scanline and write PLANE_SURF with local interrupts masked.
+    let irqs = narf_arch::interrupts_enabled();
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe must succeed"),
+    };
+    let fb = fb_for(&probe.mode).unwrap();
+    if activate(&io, probe, fb, &beside(panel, DmcEvents::leak())).is_err() {
+        return TestResult::Fail("the route must light");
+    }
+    let log = io.irq_log.borrow();
+    let regs: Vec<u64> = log.iter().map(|(r, _)| *r).collect();
+    // PIPEDSL(A) + the panel's SURF re-arm, then PIPEDSL(B) + Pipe B's SURF.
+    if regs != [0x7_0000, PLANE_SURF_1_A, 0x7_1000, PLANE_SURF_1_B] {
+        return TestResult::Fail("each arm must follow its own evasion sample");
+    }
+    if irqs && log.iter().any(|(_, enabled)| *enabled) {
+        return TestResult::Fail("evasion samples and arms must run IRQ-masked");
+    }
+    if narf_arch::interrupts_enabled() != irqs {
+        return TestResult::Fail("the local interrupt state must be restored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_route_arm_runs_inside_irq_masked_evasion
 );

@@ -9,21 +9,29 @@
 //! 1. [`probe_sink`] — Type-C connect ([`crate::intel_gpu_xelpg_tc`]), the
 //!    Xe-LPDP AUX power well, DPCD capabilities, complete EDID and
 //!    negotiation against the source envelope (HBR3 × the TC lane limit).
-//! 2. [`activate`] — `mtl_ddi_pre_enable_dp` order: power wells, RGB
-//!    bypass, display resources + CDCLK floor, Cx0 PLL enable
-//!    (`intel_cx0pll_enable`), `TRANS_CLK_SEL`, transcoder timings and
-//!    `TRANS_DDI_FUNC_CTL` (configured, not yet enabled), primary plane,
-//!    `mtl_ddi_prepare_link_retrain` (DP_TP_CTL TPS1, D2D enable, signal
-//!    levels, PORT_BUF_CTL1 width, DDI_CTL_DE enable + PHY_IDLE clear),
-//!    shared DPCD link training, trained levels and M/N, DP_TP_CTL normal,
-//!    `TRANS_DDI_FUNC_CTL` enable, transcoder enable and a fresh-frame
-//!    primary witness. A training fallback runs the local stop and one
-//!    full retry at the trained configuration (i915's modeset retry);
-//!    a second mismatch refuses.
-//! 3. [`MtlExternalRoute::stop`] — `intel_ddi_post_disable_dp` order:
-//!    plane off, transcoder off, function deselect, sink D3 (best effort),
-//!    DDI_CTL_DE off + PHY_IDLE, D2D off, DP_TP_CTL off, TRANS_CLK_SEL
-//!    off, `intel_cx0pll_disable`, TBT IO deselect.
+//! 2. [`activate`] — on the lowest free Pipe B–D with its transcoder, in
+//!    `intel_atomic_commit_tail` / `hsw_crtc_enable` /
+//!    `mtl_ddi_pre_enable_dp` / `intel_ddi_enable` order: the pipe's power
+//!    wells (PW_1, PW_2, PW_B..D), the Pipe B–D owner's pre-plane resource
+//!    transaction with the internal panel kept lit and the pipe DMC enable
+//!    ([`crate::intel_gpu_xelpg_pipes::Pipes::reserve`]), Cx0 PLL enable
+//!    (`intel_cx0pll_enable`), `TRANS_CLK_SEL`, `TRANS_DDI_FUNC_CTL`
+//!    (configured, not yet enabled), `mtl_ddi_prepare_link_retrain`
+//!    (DP_TP_CTL TPS1, D2D enable, signal levels, PORT_BUF_CTL1 width,
+//!    DDI_CTL_DE enable + PHY_IDLE clear), shared DPCD link training,
+//!    trained levels, DP_TP_CTL normal (`intel_dp_stop_link_train`), M/N,
+//!    pipe source size, timings and RGB bypass, `TRANS_DDI_FUNC_CTL`
+//!    enable, transcoder enable, the primary armed under vblank evasion and
+//!    a fresh-frame witness. A training fallback stops the port and runs
+//!    one retry at the trained configuration (i915's modeset retry) on the
+//!    same reservation; a second mismatch refuses.
+//! 3. [`MtlExternalRoute::stop`] — `hsw_crtc_disable` /
+//!    `intel_ddi_post_disable_dp` order: plane off, transcoder off,
+//!    function deselect, sink D3 (best effort), DDI_CTL_DE off + PHY_IDLE,
+//!    D2D off, DP_TP_CTL off, TRANS_CLK_SEL off, `intel_cx0pll_disable`,
+//!    TBT IO deselect, then the pipe DMC disable and the post-plane
+//!    repartition back to the panel alone
+//!    ([`crate::intel_gpu_xelpg_pipes::Pipes::release`]).
 //! 4. [`MtlExternalRoute::release`] — AUX power off and Type-C disconnect,
 //!    only after a proven local stop.
 //!
@@ -51,10 +59,18 @@
 //!
 //! ## Qualified profile
 //!
-//! Pipe A / transcoder A only, and only while pipe A, its primary plane,
-//! transcoder A's DDI function and the target DDI are all off (an
-//! internal panel lit on pipe A refuses `PipeBusy`; concurrent multi-pipe
-//! needs DBUF/watermark repartition this slice does not own). 8 bpc RGB,
+//! Pipes B–D with their transcoders, never Pipe A: the lowest Pipe B–D
+//! whose `TRANSCONF`, primary plane and `TRANS_DDI_FUNC_CTL` are off
+//! ([`ExternalError::NoFreePipe`] otherwise), and only while the target
+//! DDI and its PLL are off. Pipe A lit is adopted, never stopped or
+//! replaned, and only as the owned panel profile of the display context's
+//! panel mode ([`MtlDisplay`]); any other lit Pipe A refuses `PipeBusy`.
+//! The resource transaction keeps the panel lit; its refusals are typed
+//! ([`ExternalError::Pipe`]) and, like every refusal above, precede the
+//! first write. PM demand is computed with the route's chosen port clock
+//! (the negotiated DP link rate or the HDMI TMDS clock), as Linux's
+//! `crtc_state->port_clock`; the owned panel keeps its HBR3 reservation
+//! (the KMS fixed profile requires it). 8 bpc RGB,
 //! DP 1.4 rates RBR–HBR3 with the C10/C20 tables in
 //! [`crate::intel_gpu_xelpg`]; a stream whose demand exceeds the
 //! negotiated ceiling refuses (no DSC). UHBR (128b/132b, C20 MPLLA),
@@ -69,7 +85,9 @@
 //! `intel_ddi_buf_enable`/`_disable`, `intel_ddi_post_disable_dp`,
 //! `intel_ddi_enable_transcoder_clock`, `intel_ddi_disable_transcoder_func`),
 //! `intel_cx0_phy.c`, `intel_tc.c`, `intel_display_power_map.c`
-//! (`xelpdp_pwdoms_pw_2` carries the TC1–4 DDI lanes).
+//! (`xelpdp_pwdoms_pw_2` carries pipes B–D and the TC1–4 DDI lanes),
+//! `intel_display.c` (`intel_atomic_commit_tail`, `hsw_crtc_enable`,
+//! `hsw_crtc_disable`, `hsw_configure_cpu_transcoder`).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -81,11 +99,10 @@ use crate::dp_link_training::{
 };
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
+use crate::intel_gpu_dc_states::{NoPipeDmc, PipeDmc, ServicePipeDmc};
 use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
-use crate::intel_gpu_modeset_xelpg::{
-    acknowledged_cdclk, mtl_cdclk_for_pixel_clock, program_cdclk_floor, XeLpgModeset,
-};
+use crate::intel_gpu_pipes::{Pipe, Transcoder};
 use crate::intel_gpu_vbt::{dp_ssc_enabled, Vbt, VbtEncoder, VbtPlatform, DP_MAX_DOWNSPREAD};
 use crate::intel_gpu_xelpg::{
     disable_d2d, disable_port_pll_complete, dp_pll_request, enable_d2d, enable_port_pll_state,
@@ -96,6 +113,8 @@ use crate::intel_gpu_xelpg_hdmi::{
     activate_hdmi, probe_hdmi, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
 };
 use crate::intel_gpu_xelpg_hpd::{LiveMode, MtlHpdConfig, MtlHpdEvent, MtlHpdKind, MtlHpdPin};
+use crate::intel_gpu_xelpg_pipes::{ExternalPipe, PipeEnableError, Pipes};
+use crate::intel_gpu_xelpg_resources::ResourceError;
 use crate::intel_gpu_xelpg_tc::{
     aux_power_disable, aux_power_enable, connect as tc_connect, connection_intact,
     disconnect as tc_disconnect, TcConnection, TcError, TcMode,
@@ -108,22 +127,21 @@ const DPCD_RECEIVER_CAP_BYTES: usize = 16;
 /// Largest EDID retained (base + three extensions).
 pub const EDID_CAPACITY: usize = 512;
 
-// Registers this route owns on pipe/transcoder A (`intel_display_regs.h`).
+// Registers this route owns on its pipe/transcoder (`intel_display_regs.h`).
 const PWR_WELL_CTL2: u64 = 0x4_5404;
 const PW_1_IDX: u32 = 0;
-/// `ICL_PW_CTL_IDX_PW_2` — on Xe-LPDP it powers the TC1–4 DDI lanes.
+/// `ICL_PW_CTL_IDX_PW_2` — on Xe-LPDP it powers pipes/transcoders B–D and
+/// the TC1–4 DDI lanes (`XELPDP_PW_2_POWER_DOMAINS`).
 const PW_2_IDX: u32 = 1;
-/// `XELPD_PW_CTL_IDX_PW_A`.
+/// `XELPD_PW_CTL_IDX_PW_A`; `XELPD_PW_CTL_IDX_PW_B..D` follow (6..8).
 const PW_A_IDX: u32 = 5;
-const PIPECONF_A: u64 = 0x7_0008;
-const PIPE_FRMCOUNT_A: u64 = 0x7_0040;
-const PLANE_CTL_1_A: u64 = 0x7_0180;
-const PLANE_SURF_1_A: u64 = 0x7_019C;
-const PLANE_SURFLIVE_1_A: u64 = 0x7_01AC;
-const TRANS_DDI_FUNC_CTL_A: u64 = 0x6_0400;
-const TRANS_CLK_SEL_A: u64 = 0x4_6140;
-/// `TGL_DP_TP_CTL(A)`.
-const DP_TP_CTL_A: u64 = 0x6_0540;
+/// `TRANSCONF`, `PIPE_FRMCOUNT_G4X`, primary `PLANE_CTL` / `PLANE_SURF` /
+/// `PLANE_SURFLIVE`, relative to [`Pipe::base`].
+const CONF: u64 = 0x008;
+const FRMCOUNT: u64 = 0x040;
+const PLANE_CTL_1: u64 = 0x180;
+const PLANE_SURF_1: u64 = 0x19C;
+const PLANE_SURFLIVE_1: u64 = 0x1AC;
 const DP_TP_CTL_ENABLE: u32 = 1 << 31;
 const DP_TP_CTL_ENHANCED_FRAME: u32 = 1 << 18;
 const DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
@@ -144,6 +162,26 @@ const fn pwr_well_req(idx: u32) -> u32 {
 }
 const fn pwr_well_state(idx: u32) -> u32 {
     0x1 << (idx * 2)
+}
+/// The pipe's own power well (`XELPD_PW_CTL_IDX_PW_A..D`).
+pub(crate) const fn pipe_well(pipe: Pipe) -> u32 {
+    PW_A_IDX + pipe as u32
+}
+/// `TRANS_DDI_FUNC_CTL(trans)`.
+pub(crate) const fn trans_ddi_func_ctl(trans: Transcoder) -> u64 {
+    trans.base() + 0x400
+}
+/// `TRANS_CLK_SEL(trans)` (`_TRANS_CLK_SEL_A` 0x46140, stride 4).
+pub(crate) const fn trans_clk_sel(trans: Transcoder) -> u64 {
+    0x4_6140 + 4 * trans as u64
+}
+/// `TGL_DP_TP_CTL(trans)`.
+pub(crate) const fn dp_tp_ctl(trans: Transcoder) -> u64 {
+    trans.base() + 0x540
+}
+/// `TGL_TRANS_CLK_SEL_PORT(phy)`.
+pub(crate) const fn trans_clk_sel_port(port: XeLpgPort) -> u32 {
+    (port.phy_index() + 1) << 28
 }
 /// `DDI_PORT_WIDTH(lanes)` (bits 3:1, 3 lanes encode as 4).
 const fn ddi_port_width(lanes: u8) -> u32 {
@@ -171,8 +209,15 @@ pub enum ExternalError {
         /// Best mutually supported payload in kbps.
         payload_kbps: u64,
     },
-    /// Pipe A, its primary plane or transcoder A is already active.
+    /// Pipe A is lit (or mid-transition) without an owned panel profile
+    /// this route can adopt.
     PipeBusy,
+    /// Every Pipe B–D is lit, has its primary enabled or has its
+    /// transcoder function selected.
+    NoFreePipe,
+    /// The Pipe B–D owner refused before any write, or failed (its
+    /// resource transaction restored what it touched).
+    Pipe(PipeRefusal),
     /// The target DDI or its PHY PLL is already active.
     PortBusy,
     /// A fallback retry trained at yet another configuration.
@@ -201,6 +246,247 @@ impl From<ModesetError> for ExternalError {
     fn from(e: ModesetError) -> Self {
         ExternalError::Modeset(e)
     }
+}
+
+/// Why the Pipe B–D owner ([`crate::intel_gpu_xelpg_pipes`]) and its
+/// display-14 resource transaction refused or failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PipeRefusal {
+    /// The mode or surface is outside the owner's qualified profile.
+    Unsupported,
+    /// No watermark level fits the vblank budget.
+    VblankTooShort,
+    /// The DDB cannot hold level 0 of every plane.
+    DdbExhausted,
+    /// The required CDCLK exceeds the 652.8 MHz maximum.
+    CdclkUnsatisfiable,
+    /// SAGV is allowed but no QGV point carries the display data rate.
+    BandwidthExceeded,
+    /// A pipe, plane, cursor, DSB or FBC that must stay idle is live.
+    Busy,
+    /// The hardware no longer holds the adopted resource state.
+    Diverged,
+    /// A lit pipe's configuration would change (that needs its modeset).
+    LivePipeChanged,
+    /// No lit pipe can take its new DDB without overlapping another.
+    DdbOrdering,
+    /// The firmware CDCLK is unknown: the change needs every pipe off.
+    RequiresPipesOff,
+    /// A hardware acknowledgement did not arrive.
+    Timeout,
+    /// A written value did not read back.
+    Readback,
+    /// The CDCLK change failed.
+    Clock,
+    /// The owner's reserve → enable → disable → release order was broken.
+    Sequence,
+}
+
+impl From<ResourceError> for ExternalError {
+    fn from(e: ResourceError) -> Self {
+        ExternalError::Pipe(match e {
+            ResourceError::NoDevice => return ExternalError::AccessLost,
+            ResourceError::Unsupported => PipeRefusal::Unsupported,
+            ResourceError::VblankTooShort => PipeRefusal::VblankTooShort,
+            ResourceError::DdbExhausted => PipeRefusal::DdbExhausted,
+            ResourceError::CdclkUnsatisfiable => PipeRefusal::CdclkUnsatisfiable,
+            ResourceError::BandwidthExceeded => PipeRefusal::BandwidthExceeded,
+            ResourceError::Busy => PipeRefusal::Busy,
+            ResourceError::Timeout => PipeRefusal::Timeout,
+            ResourceError::Readback => PipeRefusal::Readback,
+            ResourceError::Clock(_) => PipeRefusal::Clock,
+            ResourceError::DdbOrdering => PipeRefusal::DdbOrdering,
+            ResourceError::LivePipeChanged => PipeRefusal::LivePipeChanged,
+            ResourceError::RequiresPipesOff => PipeRefusal::RequiresPipesOff,
+            ResourceError::Diverged => PipeRefusal::Diverged,
+        })
+    }
+}
+
+impl From<PipeEnableError> for ExternalError {
+    fn from(e: PipeEnableError) -> Self {
+        match e {
+            PipeEnableError::NoDevice => ExternalError::AccessLost,
+            PipeEnableError::Unsupported => ExternalError::Pipe(PipeRefusal::Unsupported),
+            PipeEnableError::Busy => ExternalError::Pipe(PipeRefusal::Busy),
+            PipeEnableError::NotReserved | PipeEnableError::NotLit => {
+                ExternalError::Pipe(PipeRefusal::Sequence)
+            }
+            PipeEnableError::Timeout => ExternalError::Pipe(PipeRefusal::Timeout),
+            PipeEnableError::Resource(r) => r.into(),
+        }
+    }
+}
+
+/// What an external activation shares the display with. The display
+/// runtime builds one per pass ([`MtlDisplay::production`]); fixtures use
+/// [`MtlDisplay::NONE`] or their own pipe-DMC sink.
+#[derive(Clone, Copy)]
+pub struct MtlDisplay {
+    /// The owned internal panel's mode on Pipe A
+    /// ([`crate::intel_gpu_modeset_xelpg::owned_panel_mode`]). A lit Pipe A
+    /// is adopted only as this mode's owned resource profile.
+    pub panel: Option<Mode>,
+    /// Where each external pipe's DMC lifetime is reported.
+    pub pipe_dmc: &'static (dyn PipeDmc + Sync),
+}
+
+impl MtlDisplay {
+    /// No owned panel, no pipe-DMC reporting.
+    pub const NONE: Self = Self {
+        panel: None,
+        pipe_dmc: &NoPipeDmc,
+    };
+
+    /// The production context: the owned panel (if any) and the display-14
+    /// DC service's pipe-DMC sink.
+    pub const fn production(panel: Option<Mode>) -> Self {
+        Self {
+            panel,
+            pipe_dmc: &ServicePipeDmc,
+        }
+    }
+}
+
+impl core::fmt::Debug for MtlDisplay {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MtlDisplay")
+            .field("panel", &self.panel)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The Pipe B–D a route drives, the owner that reserved it and the sink
+/// its pipe DMC was reported to.
+#[derive(Clone)]
+pub(crate) struct RoutePipe {
+    pub(crate) pipe: Pipe,
+    pub(crate) pipes: Pipes,
+    pub(crate) dmc: &'static (dyn PipeDmc + Sync),
+}
+
+impl core::fmt::Debug for RoutePipe {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RoutePipe")
+            .field("pipe", &self.pipe)
+            .field("pipes", &self.pipes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RoutePipe {
+    /// The transcoder this route's port feeds.
+    pub(crate) fn transcoder(&self) -> Transcoder {
+        self.pipe.transcoder()
+    }
+
+    /// The pipe's register block base.
+    pub(crate) fn base(&self) -> u64 {
+        self.pipe.base()
+    }
+}
+
+/// The Pipe B–D [`activate`] would take for a route and the owner holding
+/// what Pipe A runs, chosen without a write.
+#[derive(Clone, Debug)]
+pub(crate) struct PipeChoice {
+    pub(crate) pipe: Pipe,
+    pub(crate) pipes: Pipes,
+}
+
+/// `intel_modeset_get_crtc_power_domains` for an external pipe, enabled top
+/// to bottom: PW_1, PW_2 (pipes B–D, TC1–4 DDI lanes), the pipe's well.
+pub(crate) fn request_pipe_wells<M: MmioWindow + ?Sized>(
+    io: &M,
+    pipe: Pipe,
+) -> Result<(), ExternalError> {
+    request_well(io, PW_1_IDX)?;
+    request_well(io, PW_2_IDX)?;
+    request_well(io, pipe_well(pipe))
+}
+
+/// The lowest Pipe B–D whose transcoder, primary plane and transcoder
+/// function are all off (Linux assigns CRTCs; Pipe A stays the panel's).
+fn free_pipe<M: MmioWindow + ?Sized>(io: &M) -> Result<Pipe, ExternalError> {
+    for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+        let conf = read(io, pipe.base() + CONF)?;
+        let plane = read(io, pipe.base() + PLANE_CTL_1)?;
+        let func = read(io, trans_ddi_func_ctl(pipe.transcoder()))?;
+        if conf & (ENABLE | STATE) == 0 && plane & ENABLE == 0 && func & TRANS_DDI_FUNC_ENABLE == 0
+        {
+            return Ok(pipe);
+        }
+    }
+    Err(ExternalError::NoFreePipe)
+}
+
+/// No-write preflight: the target DDI and its PLL are off, a Pipe B–D is
+/// free, and whatever Pipe A runs is adopted — nothing when it is off, the
+/// owned panel profile for `display.panel` when it is lit.
+pub(crate) fn preflight<M: MmioWindow + ?Sized>(
+    io: &M,
+    port: XeLpgPort,
+    display: &MtlDisplay,
+) -> Result<PipeChoice, ExternalError> {
+    if !io.display_access_ok() {
+        return Err(ExternalError::AccessLost);
+    }
+    let ddi = read(io, port.ddi_buf_ctl())?;
+    let clock = read(io, port.port_clock_ctl())?;
+    if ddi & DDI_BUF_CTL_ENABLE != 0 || clock & 0xCC00_0000 != 0 {
+        return Err(ExternalError::PortBusy);
+    }
+    let pipe = free_pipe(io)?;
+    let panel = read(io, Pipe::A.base() + CONF)? & (ENABLE | STATE);
+    let pipes = match (panel, display.panel) {
+        (0, _) => Pipes::adopt(None, 0),
+        (lit, Some(mode)) if lit == ENABLE | STATE => Pipes::adopt_panel(io, &mode)?,
+        _ => return Err(ExternalError::PipeBusy),
+    };
+    Ok(PipeChoice { pipe, pipes })
+}
+
+/// The Pipe B–D request for a route on `choice`: the scanout surface and
+/// the port clock it runs at (`crtc_state->port_clock`).
+pub(crate) fn external_pipe(
+    choice: &PipeChoice,
+    port: XeLpgPort,
+    mode: &Mode,
+    fb: &Framebuffer,
+    port_clock_khz: u32,
+) -> Result<ExternalPipe, ExternalError> {
+    let surface = u32::try_from(fb.phys_addr)
+        .map_err(|_| ExternalError::Modeset(ModesetError::InvalidFramebuffer))?;
+    Ok(ExternalPipe {
+        pipe: choice.pipe,
+        mode: *mode,
+        surface,
+        stride_bytes: fb.stride_bytes,
+        port_clock_khz,
+        combo_phy: port.tc_index().is_none().then_some(port.phy_index() as u8),
+    })
+}
+
+/// The pre-plane update and pipe DMC enable for `ext` on `choice` (after
+/// the pipe's wells are up): the route's [`RoutePipe`].
+pub(crate) fn reserve_pipe<M: MmioWindow + ?Sized>(
+    io: &M,
+    choice: PipeChoice,
+    ext: &ExternalPipe,
+    dmc: &'static (dyn PipeDmc + Sync),
+) -> Result<RoutePipe, ExternalError> {
+    let mut pipes = choice.pipes;
+    pipes.reserve(io, ext, dmc)?;
+    Ok(RoutePipe {
+        pipe: choice.pipe,
+        pipes,
+        dmc,
+    })
+}
+
+/// The DP port clock of `rate` in kHz (`crtc_state->port_clock`).
+fn link_clock_khz(rate: TrainRate) -> u32 {
+    crate::intel_gpu_modeset::to_pll_rate(rate).megabits_per_sec() * 100
 }
 
 fn phy_err(e: Cx0Error) -> ExternalError {
@@ -348,7 +634,7 @@ pub enum RouteState {
     Quarantined,
 }
 
-/// One owned external SST route on pipe A.
+/// One owned external SST route on a Pipe B–D.
 #[derive(Clone, Debug)]
 pub struct MtlExternalRoute {
     /// The probe (Type-C/AUX ownership, caps, EDID, mode).
@@ -358,6 +644,10 @@ pub struct MtlExternalRoute {
     /// The trained link.
     pub trained: TrainedLink,
     state: RouteState,
+    /// The Pipe B–D (and transcoder) the route was activated on.
+    pipe: Pipe,
+    /// The pipe's reservation until its post-plane release is proven.
+    reservation: Option<RoutePipe>,
 }
 
 /// Why [`activate`] did not produce a live route.
@@ -424,44 +714,26 @@ pub(crate) fn request_well<M: MmioWindow + ?Sized>(io: &M, idx: u32) -> Result<(
     }
 }
 
-/// No-write preflight: pipe A, its primary plane, transcoder A's DDI
-/// function and the target DDI/PLL must all be off.
-pub(crate) fn preflight_idle<M: MmioWindow + ?Sized>(
-    io: &M,
-    port: XeLpgPort,
-) -> Result<(), ExternalError> {
-    if !io.display_access_ok() {
-        return Err(ExternalError::AccessLost);
-    }
-    let conf = read(io, PIPECONF_A)?;
-    let plane = read(io, PLANE_CTL_1_A)?;
-    let func = read(io, TRANS_DDI_FUNC_CTL_A)?;
-    if conf & (ENABLE | STATE) != 0 || plane & ENABLE != 0 || func & TRANS_DDI_FUNC_ENABLE != 0 {
-        return Err(ExternalError::PipeBusy);
-    }
-    let ddi = read(io, port.ddi_buf_ctl())?;
-    let clock = read(io, port.port_clock_ctl())?;
-    if ddi & DDI_BUF_CTL_ENABLE != 0 || clock & 0xCC00_0000 != 0 {
-        return Err(ExternalError::PortBusy);
-    }
-    Ok(())
-}
-
-/// Phase 2: program and light the route. See the module header for the
-/// sequence. The probe must come from [`probe_sink`] on this window.
+/// Phase 2: program and light the route on a free Pipe B–D next to what
+/// Pipe A runs (`display`). See the module header for the sequence. The
+/// probe must come from [`probe_sink`] on this window. Every refusal
+/// (framebuffer, busy port, no free pipe, unadoptable Pipe A, Type-C
+/// loss, resource admission) precedes the first write.
 // Refusal hands the owned probe/route back inline: it must not allocate.
 #[allow(clippy::result_large_err)]
 pub fn activate<M: MmioWindow + ?Sized>(
     io: &M,
     probe: MtlSinkProbe,
     fb: Framebuffer,
+    display: &MtlDisplay,
 ) -> Result<MtlExternalRoute, ActivateError> {
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
-    if let Err(e) = preflight_idle(io, probe.port) {
-        return Err(ActivateError::Refused(probe, e));
-    }
+    let choice = match preflight(io, probe.port, display) {
+        Ok(choice) => choice,
+        Err(e) => return Err(ActivateError::Refused(probe, e)),
+    };
     if let Some(conn) = probe.tc {
         match connection_intact(io, &conn) {
             Ok(true) => {}
@@ -475,6 +747,24 @@ pub fn activate<M: MmioWindow + ?Sized>(
         }
     }
     let negotiated = probe.negotiated;
+    // intel_pmdemand_atomic_check takes crtc_state->port_clock, chosen
+    // before training: here the negotiated rate. negotiate() picks the
+    // lowest rate that carries the stream and the fallback ladder never
+    // raises it, so a fallback that still carries the stream trains at
+    // this same rate (fewer lanes) and the reservation is exact.
+    let ext = match external_pipe(
+        &choice,
+        probe.port,
+        &probe.mode,
+        &fb,
+        link_clock_khz(negotiated.rate),
+    ) {
+        Ok(ext) => ext,
+        Err(e) => return Err(ActivateError::Refused(probe, e)),
+    };
+    if let Err(e) = choice.pipes.admit(io, &ext) {
+        return Err(ActivateError::Refused(probe, e.into()));
+    }
     let mut route = MtlExternalRoute {
         probe,
         fb,
@@ -484,14 +774,16 @@ pub fn activate<M: MmioWindow + ?Sized>(
             vswing_pe: Default::default(),
         },
         state: RouteState::Stopped,
+        pipe: choice.pipe,
+        reservation: None,
     };
-    match program(io, &mut route, negotiated.rate, negotiated.lanes, true) {
+    match program(io, &mut route, choice, &ext, display.pipe_dmc) {
         Ok(()) => {
             route.state = RouteState::Live;
             Ok(route)
         }
         Err(e) => {
-            route.state = match stop_local(io, &route) {
+            route.state = match stop_local(io, &mut route) {
                 Ok(()) => RouteState::Stopped,
                 Err(_) => RouteState::Quarantined,
             };
@@ -503,29 +795,62 @@ pub fn activate<M: MmioWindow + ?Sized>(
 fn program<M: MmioWindow + ?Sized>(
     io: &M,
     route: &mut MtlExternalRoute,
+    choice: PipeChoice,
+    ext: &ExternalPipe,
+    dmc: &'static (dyn PipeDmc + Sync),
+) -> Result<(), ExternalError> {
+    // 1. Power wells (intel_modeset_get_crtc_power_domains), then the
+    // pre-plane update and the first step of hsw_crtc_enable
+    // (intel_dmc_enable_pipe). 2. PM demand is part of the reservation.
+    request_pipe_wells(io, ext.pipe)?;
+    route.reservation = Some(reserve_pipe(io, choice, ext, dmc)?);
+    let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
+    let mut trained = enable_port(io, route, rate, lanes)?;
+    if trained.rate != rate || trained.lanes != lanes {
+        // The fallback link must still carry the stream (no DSC).
+        let demand_kbps = stream_demand_kbps(route.probe.mode.pixel_clock_khz, 24);
+        let payload_kbps = trained.rate.payload_kbps(trained.lanes);
+        if payload_kbps < demand_kbps {
+            return Err(ExternalError::OverBudget {
+                demand_kbps,
+                payload_kbps,
+            });
+        }
+        // Modeset retry at the trained configuration: the port is stopped
+        // and re-enabled; the pipe keeps its reservation.
+        stop_port(io, route)?;
+        let retry = enable_port(io, route, trained.rate, trained.lanes)?;
+        if retry.rate != trained.rate || retry.lanes != trained.lanes {
+            return Err(ExternalError::TrainingMismatch);
+        }
+        trained = retry;
+    }
+    finish(io, route, &trained)?;
+    route.trained = trained;
+    Ok(())
+}
+
+/// The route's pipe (present from the reservation on).
+fn route_pipe(route: &MtlExternalRoute) -> Result<&RoutePipe, ExternalError> {
+    route
+        .reservation
+        .as_ref()
+        .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))
+}
+
+/// `mtl_ddi_pre_enable_dp` steps 5–6.k for the route's transcoder: port
+/// PLL, `TRANS_CLK_SEL`, `TRANS_DDI_FUNC_CTL` configured without ENABLE,
+/// `mtl_ddi_prepare_link_retrain` and DPCD link training. Returns what the
+/// link trained at.
+fn enable_port<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &MtlExternalRoute,
     rate: TrainRate,
     lanes: u8,
-    allow_fallback: bool,
-) -> Result<(), ExternalError> {
+) -> Result<TrainedLink, ExternalError> {
     let port = route.probe.port;
-    let mode = route.probe.mode;
+    let trans = route_pipe(route)?.transcoder();
     let pll_rate = crate::intel_gpu_modeset::to_pll_rate(rate);
-    // 1. Power wells: PW_1, PW_2 (TC DDI lanes), PW_A (pipe A).
-    request_well(io, PW_1_IDX)?;
-    if port.tc_index().is_some() {
-        request_well(io, PW_2_IDX)?;
-    }
-    request_well(io, PW_A_IDX)?;
-    // Pipe off: own the color pipeline instead of inheriting it.
-    crate::intel_gpu_color::initialize_rgb_bypass(io)
-        .map_err(|_| ExternalError::Modeset(ModesetError::ColorPipelineUnavailable))?;
-    // Pipe A resources and the CDCLK floor (shared MTL transaction).
-    let current = acknowledged_cdclk(io)?;
-    let target = mtl_cdclk_for_pixel_clock(mode.pixel_clock_khz)
-        .map_or(current, |entry| current.max(entry.cdclk_khz));
-    crate::intel_gpu_display_resources::initialize(io, &mode, target)
-        .map_err(|_| ExternalError::Modeset(ModesetError::DisplayResourceUnavailable))?;
-    program_cdclk_floor(io, &mode)?;
     // 5. Port PLL (intel_cx0pll_enable) for the planned width.
     // A legacy-mode C20 port also clears the MPLLB CAL_DONE banks first
     // (intel_c20_protocol_switch_valid).
@@ -540,18 +865,10 @@ fn program<M: MmioWindow + ?Sized>(
     .map_err(phy_err)?;
     enable_port_pll_state(io, port, &request).map_err(phy_err)?;
     // 6.a TRANS_CLK_SEL = TGL_TRANS_CLK_SEL_PORT(phy).
-    write(io, TRANS_CLK_SEL_A, (port.phy_index() + 1) << 28)?;
-    // Timings, then 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
-    let mut ms = XeLpgModeset::new(io, port);
-    ms.program_transcoder(&mode);
-    ms.program_pipe(&mode);
-    let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
-        port.func_ctl_index(),
-        crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
-        lanes,
-    );
-    write(io, TRANS_DDI_FUNC_CTL_A, func & !TRANS_DDI_FUNC_ENABLE)?;
-    ms.program_plane(&route.fb, &mode);
+    write(io, trans_clk_sel(trans), trans_clk_sel_port(port))?;
+    // 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
+    let func = dp_func(port, lanes);
+    write(io, trans_ddi_func_ctl(trans), func & !TRANS_DDI_FUNC_ENABLE)?;
     // mtl_ddi_prepare_link_retrain: 6.d DP_TP_CTL TPS1 (SST), 6.f D2D,
     // 6.g levels, 6.h PORT_BUF_CTL1, 6.i DDI_CTL_DE + buffer active.
     let enhanced = if route.probe.caps.enhanced_framing {
@@ -561,7 +878,7 @@ fn program<M: MmioWindow + ?Sized>(
     };
     write(
         io,
-        DP_TP_CTL_A,
+        dp_tp_ctl(trans),
         DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_PAT1 | enhanced,
     )?;
     enable_d2d(io, port).map_err(phy_err)?;
@@ -576,55 +893,86 @@ fn program<M: MmioWindow + ?Sized>(
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // 6.k DisplayPort training over the owned AUX channel.
     let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
-    let trained = train_link(&mut aux, rate, lanes, |us| {
+    train_link(&mut aux, rate, lanes, |us| {
         let _ = narf_scheduler::responsive_spin_until(
             || false,
             narf_time::Deadline::after_ns(us as u64 * 1_000),
         );
     })
-    .map_err(ExternalError::Link)?;
-    if trained.rate != rate || trained.lanes != lanes {
-        if !allow_fallback {
-            return Err(ExternalError::TrainingMismatch);
-        }
-        // The fallback link must still carry the stream (no DSC).
-        let demand_kbps = stream_demand_kbps(mode.pixel_clock_khz, 24);
-        let payload_kbps = trained.rate.payload_kbps(trained.lanes);
-        if payload_kbps < demand_kbps {
-            return Err(ExternalError::OverBudget {
-                demand_kbps,
-                payload_kbps,
-            });
-        }
-        // Modeset retry at the trained configuration.
-        stop_local(io, route)?;
-        return program(io, route, trained.rate, trained.lanes, false);
-    }
+    .map_err(ExternalError::Link)
+}
+
+/// `TRANS_DDI_FUNC_CTL` for DP SST on `port` at `lanes`.
+fn dp_func(port: XeLpgPort, lanes: u8) -> u32 {
+    crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+        port.func_ctl_index(),
+        crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+        lanes,
+    )
+}
+
+/// `intel_cpu_transcoder_set_m1_n1` for `trans` (8 bpc RGB); `LINK_N1`
+/// last, it triggers the update.
+fn program_mn<M: MmioWindow + ?Sized>(
+    io: &M,
+    trans: Transcoder,
+    mode: &Mode,
+    rate: crate::intel_gpu_pll::LinkRate,
+    lanes: u8,
+) -> Result<(), ExternalError> {
+    use crate::intel_gpu_pipes::{
+        dp_mn, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
+    };
+    let ls_khz = rate.megabits_per_sec() * 100;
+    let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, u32::from(lanes), 3);
+    let base = trans.base();
+    write(io, base + PIPE_DATA_M1_OFFSET, dm)?;
+    write(io, base + PIPE_DATA_N1_OFFSET, dn)?;
+    write(io, base + PIPE_LINK_M1_OFFSET, lm)?;
+    write(io, base + PIPE_LINK_N1_OFFSET, ln)
+}
+
+/// The rest of `mtl_ddi_pre_enable_dp` (trained levels, 6.n DP_TP_CTL
+/// normal), `hsw_crtc_enable` (M/N, source size, timings, RGB bypass),
+/// `intel_ddi_enable` (`TRANS_DDI_FUNC_CTL` enable, transcoder enable) and
+/// `intel_update_crtc` (the primary armed under vblank evasion), then the
+/// route witness.
+fn finish<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &mut MtlExternalRoute,
+    trained: &TrainedLink,
+) -> Result<(), ExternalError> {
+    let port = route.probe.port;
+    let mode = route.probe.mode;
+    let pll_rate = crate::intel_gpu_modeset::to_pll_rate(trained.rate);
+    let lanes = trained.lanes;
     let mut levels = [(0u8, 0u8); 4];
     for (i, lane) in trained.vswing_pe.lanes.iter().enumerate() {
         levels[i] = (lane.swing, lane.pre_emph);
     }
-    set_signal_levels(&phy, pll_rate, lanes, &levels).map_err(phy_err)?;
-    ms.program_mn(&mode, pll_rate, lanes);
-    // 6.n DP_TP_CTL normal, then function and transcoder enable.
-    let tp = read(io, DP_TP_CTL_A)?;
+    set_signal_levels(&Cx0Phy::new(io, port), pll_rate, lanes, &levels).map_err(phy_err)?;
+    let rp = route
+        .reservation
+        .as_mut()
+        .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
+    let (pipe, trans) = (rp.pipe, rp.transcoder());
+    let tp = read(io, dp_tp_ctl(trans))?;
     write(
         io,
-        DP_TP_CTL_A,
+        dp_tp_ctl(trans),
         (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | DP_TP_CTL_LINK_TRAIN_NORMAL,
     )?;
-    write(io, TRANS_DDI_FUNC_CTL_A, func)?;
-    let start = read(io, PIPE_FRMCOUNT_A)?;
-    let conf = read(io, PIPECONF_A)?;
-    write(io, PIPECONF_A, conf | ENABLE)?;
-    if !wait_bit(io, PIPECONF_A, ENABLE | STATE, true, 100_000_000) {
-        return Err(ExternalError::Modeset(
-            ModesetError::PipelineEnableUnavailable,
-        ));
-    }
-    observe_live(io, route, func, start)?;
-    route.trained = trained;
-    Ok(())
+    // hsw_configure_cpu_transcoder: M/N with the timings; the transcoder
+    // is off, so nothing here latches before its enable.
+    program_mn(io, trans, &mode, pll_rate, lanes)?;
+    rp.pipes.program_timings(io, pipe)?;
+    // intel_ddi_enable: function, then the transcoder.
+    let func = dp_func(port, lanes);
+    write(io, trans_ddi_func_ctl(trans), func)?;
+    let start = read(io, pipe.base() + FRMCOUNT)?;
+    rp.pipes.enable(io, pipe)?;
+    rp.pipes.arm_primary(io, pipe)?;
+    observe_live(io, route, func, start)
 }
 
 /// Bounded fresh-frame witness: the primary LIVE surface equals the
@@ -638,6 +986,8 @@ fn observe_live<M: MmioWindow + ?Sized>(
 ) -> Result<(), ExternalError> {
     let port = route.probe.port;
     let mode = route.probe.mode;
+    let rp = route_pipe(route)?;
+    let (base, trans) = (rp.base(), rp.transcoder());
     let plane = crate::intel_gpu_pipes::build_primary_plane(
         mode.h_active,
         mode.v_active,
@@ -649,12 +999,12 @@ fn observe_live<M: MmioWindow + ?Sized>(
     let mut refused = false;
     let done = narf_scheduler::responsive_spin_until(
         || {
-            let frame = io.read32(PIPE_FRMCOUNT_A);
-            let surf = io.read32(PLANE_SURF_1_A);
-            let live = io.read32(PLANE_SURFLIVE_1_A);
-            let route_now = io.read32(TRANS_DDI_FUNC_CTL_A);
-            let clock = io.read32(TRANS_CLK_SEL_A);
-            let tp = io.read32(DP_TP_CTL_A);
+            let frame = io.read32(base + FRMCOUNT);
+            let surf = io.read32(base + PLANE_SURF_1);
+            let live = io.read32(base + PLANE_SURFLIVE_1);
+            let route_now = io.read32(trans_ddi_func_ctl(trans));
+            let clock = io.read32(trans_clk_sel(trans));
+            let tp = io.read32(dp_tp_ctl(trans));
             let buf = io.read32(port.buf_ctl1());
             let ddi = io.read32(port.ddi_buf_ctl());
             refused = !io.display_access_ok() || frame == u32::MAX || ddi == u32::MAX;
@@ -663,7 +1013,7 @@ fn observe_live<M: MmioWindow + ?Sized>(
                     && surf == plane.plane_surf
                     && live == surf
                     && route_now == func
-                    && clock == (port.phy_index() + 1) << 28
+                    && clock == trans_clk_sel_port(port)
                     && tp & (DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_MASK)
                         == DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_NORMAL
                     && buf & PORT_BUF_PHY_IDLE == 0
@@ -679,30 +1029,21 @@ fn observe_live<M: MmioWindow + ?Sized>(
     Ok(())
 }
 
-/// Local stop in `intel_ddi_post_disable_dp` order. Every step is
-/// observed; any failure leaves the remaining state for quarantine.
-fn stop_local<M: MmioWindow + ?Sized>(
+/// The port side of `intel_ddi_post_disable_dp`, with the transcoder off:
+/// function deselect, sink D3, `intel_ddi_buf_disable`, `TRANS_CLK_SEL`
+/// off, `intel_cx0pll_disable` and TBT IO deselect, each observed.
+fn stop_port<M: MmioWindow + ?Sized>(
     io: &M,
     route: &MtlExternalRoute,
 ) -> Result<(), ExternalError> {
     let port = route.probe.port;
+    let trans = route_pipe(route)?.transcoder();
     let stop_failed = ExternalError::Modeset(ModesetError::PipelineStopUnavailable);
-    // Plane off with a SURF write to latch it.
-    let ctl = read(io, PLANE_CTL_1_A)?;
-    write(io, PLANE_CTL_1_A, ctl & !ENABLE)?;
-    let surf = read(io, PLANE_SURF_1_A)?;
-    write(io, PLANE_SURF_1_A, surf)?;
-    // Transcoder/pipe off.
-    let conf = read(io, PIPECONF_A)?;
-    write(io, PIPECONF_A, conf & !ENABLE)?;
-    if !wait_bit(io, PIPECONF_A, ENABLE | STATE, false, 100_000_000) {
-        return Err(stop_failed);
-    }
     // intel_ddi_disable_transcoder_func (TGL+ SST): enable, port, mode.
-    let func = read(io, TRANS_DDI_FUNC_CTL_A)?;
+    let func = read(io, trans_ddi_func_ctl(trans))?;
     write(
         io,
-        TRANS_DDI_FUNC_CTL_A,
+        trans_ddi_func_ctl(trans),
         func & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE),
     )?;
     // Sink to D3 before the port goes down (a NACK never replaces the
@@ -717,26 +1058,51 @@ fn stop_local<M: MmioWindow + ?Sized>(
     write(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
     wait_port_buf_idle(io, port).map_err(|_| stop_failed)?;
     disable_d2d(io, port).map_err(|_| stop_failed)?;
-    let tp = read(io, DP_TP_CTL_A)?;
-    write(io, DP_TP_CTL_A, tp & !DP_TP_CTL_ENABLE)?;
+    let tp = read(io, dp_tp_ctl(trans))?;
+    write(io, dp_tp_ctl(trans), tp & !DP_TP_CTL_ENABLE)?;
     // TRANS_CLK_SEL: no clock to the transcoder.
-    write(io, TRANS_CLK_SEL_A, 0)?;
+    write(io, trans_clk_sel(trans), 0)?;
     // intel_cx0pll_disable, then deselect Thunderbolt IO.
     disable_port_pll_complete(io, port).map_err(|_| stop_failed)?;
     let buf = read(io, port.buf_ctl1())?;
     write(io, port.buf_ctl1(), buf & !PORT_BUF_IO_SELECT_TBT)?;
-    // Final observation of every stopped resource.
-    let conf = read(io, PIPECONF_A)?;
+    // Final observation of every stopped port resource.
     let ddi = read(io, port.ddi_buf_ctl())?;
     let buf = read(io, port.buf_ctl1())?;
     let clock = read(io, port.port_clock_ctl())?;
-    if conf & (ENABLE | STATE) != 0
-        || ddi & DDI_BUF_CTL_ENABLE != 0
-        || buf & PORT_BUF_PHY_IDLE == 0
-        || clock & 0xCC00_0000 != 0
-    {
+    if ddi & DDI_BUF_CTL_ENABLE != 0 || buf & PORT_BUF_PHY_IDLE == 0 || clock & 0xCC00_0000 != 0 {
         return Err(stop_failed);
     }
+    Ok(())
+}
+
+/// Local stop in `hsw_crtc_disable` / `intel_ddi_post_disable_dp` order:
+/// primary off, transcoder off, the port side ([`stop_port`]), then the
+/// pipe DMC disable and the post-plane repartition without the pipe. Every
+/// step is observed; any failure leaves the remaining state (and the
+/// pipe's reservation) for quarantine. A route that failed before its
+/// reservation has nothing to stop: its port is programmed only after it.
+fn stop_local<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &mut MtlExternalRoute,
+) -> Result<(), ExternalError> {
+    let stop_failed = ExternalError::Modeset(ModesetError::PipelineStopUnavailable);
+    let Some(rp) = route.reservation.as_mut() else {
+        return Ok(());
+    };
+    let pipe = rp.pipe;
+    rp.pipes.disable_primary(io, pipe)?;
+    rp.pipes.disable(io, pipe).map_err(|e| match e {
+        PipeEnableError::Timeout => stop_failed,
+        e => e.into(),
+    })?;
+    stop_port(io, route)?;
+    let rp = route
+        .reservation
+        .as_mut()
+        .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
+    rp.pipes.release(io, rp.pipe, rp.dmc)?;
+    route.reservation = None;
     Ok(())
 }
 
@@ -749,6 +1115,17 @@ impl MtlExternalRoute {
     /// The external port.
     pub fn port(&self) -> XeLpgPort {
         self.probe.port
+    }
+
+    /// The Pipe B–D (and same-index transcoder) the route was activated on.
+    pub fn pipe(&self) -> Pipe {
+        self.pipe
+    }
+
+    /// Whether the pipe's display resources are still reserved (live, or
+    /// retained by a stop that did not complete its release).
+    pub fn reserved(&self) -> bool {
+        self.reservation.is_some()
     }
 
     /// Locally stop the route. A stopped route stays stopped; a failed
@@ -1079,6 +1456,14 @@ impl MtlRoute {
         }
     }
 
+    /// The Pipe B–D (CRTC) and same-index transcoder the route drives.
+    pub fn pipe(&self) -> Pipe {
+        match self {
+            MtlRoute::Dp(r) => r.pipe(),
+            MtlRoute::Hdmi(r) => r.pipe(),
+        }
+    }
+
     /// Scanning out.
     pub fn live(&self) -> bool {
         match self {
@@ -1119,12 +1504,14 @@ impl MtlRoute {
 /// What one service pass did.
 #[derive(Clone, Debug)]
 pub enum ServiceOutcome {
-    /// A new route is live; the caller publishes `fb` at `mode`.
+    /// A new route is live; the caller publishes `fb` at `mode` on `pipe`.
     Activated {
         /// The external port.
         port: XeLpgPort,
         /// The protocol driving it.
         protocol: MtlProtocol,
+        /// The Pipe B–D (CRTC) scanning it out.
+        pipe: Pipe,
         /// The scanned-out mode.
         mode: Mode,
         /// The scanned-out framebuffer.
@@ -1160,6 +1547,8 @@ pub struct MtlExternalService {
     /// The live mode the retained route was connected in (for `Redetect`).
     live: LiveMode,
     policy: MtlPortPolicy,
+    /// What activations share the display with (panel, pipe-DMC sink).
+    display: MtlDisplay,
 }
 
 impl Default for MtlExternalService {
@@ -1180,7 +1569,20 @@ impl MtlExternalService {
             route: None,
             live: LiveMode::Native,
             policy,
+            display: MtlDisplay::NONE,
         }
+    }
+
+    /// What activations share the display with.
+    pub fn display(&self) -> MtlDisplay {
+        self.display
+    }
+
+    /// Replace the display context (the owned panel, the pipe-DMC sink)
+    /// used by later activations; a live route keeps the pipe-DMC sink it
+    /// reported to.
+    pub fn set_display(&mut self, display: MtlDisplay) {
+        self.display = display;
     }
 
     /// The port policy.
@@ -1261,11 +1663,12 @@ impl MtlExternalService {
                 };
             }
         };
-        match activate(io, probe, fb) {
+        match activate(io, probe, fb, &self.display) {
             Ok(route) => {
                 let outcome = ServiceOutcome::Activated {
                     port,
                     protocol: MtlProtocol::Dp,
+                    pipe: route.pipe(),
                     mode: route.probe.mode,
                     fb,
                 };
@@ -1314,11 +1717,12 @@ impl MtlExternalService {
                 };
             }
         };
-        match activate_hdmi(io, probe, fb) {
+        match activate_hdmi(io, probe, fb, &self.display) {
             Ok(route) => {
                 let outcome = ServiceOutcome::Activated {
                     port,
                     protocol: MtlProtocol::Hdmi,
+                    pipe: route.pipe(),
                     mode: route.probe.mode,
                     fb,
                 };
@@ -1440,13 +1844,14 @@ impl MtlExternalService {
             };
         }
         let fb = route.fb;
-        match activate(io, route.probe.clone(), fb) {
+        match activate(io, route.probe.clone(), fb, &self.display) {
             Ok(live) => {
-                let mode = live.probe.mode;
+                let (mode, pipe) = (live.probe.mode, live.pipe());
                 self.route = Some(MtlRoute::Dp(live));
                 ServiceOutcome::Activated {
                     port,
                     protocol: MtlProtocol::Dp,
+                    pipe,
                     mode,
                     fb,
                 }
@@ -1553,14 +1958,17 @@ pub fn installed_mtl_port_policy() -> Option<MtlPortPolicy> {
     SERVICE.try_lock().map(|service| service.policy())
 }
 
-/// Act on one hotplug event with the process-wide service. `None` when a
-/// concurrent pass owns the service (never waits).
+/// Act on one hotplug event with the process-wide service, activating
+/// next to `display` (the owned panel and the pipe-DMC sink). `None` when
+/// a concurrent pass owns the service (never waits).
 pub fn handle_mtl_event<M: MmioWindow + ?Sized>(
     io: &M,
     event: MtlHpdEvent,
+    display: &MtlDisplay,
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
     let mut service = SERVICE.try_lock()?;
+    service.set_display(*display);
     let port = event.pin.port();
     // A refused DC exit is protocol-neutral; it is reported through the
     // DP route error that carries ExternalError::DisplayPower.
@@ -1595,10 +2003,11 @@ pub fn poll_mtl_event<M: MmioWindow + ?Sized>(
 pub fn service_mtl_external<M: MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
+    display: &MtlDisplay,
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
     let event = poll_mtl_event(io, generation)?;
-    handle_mtl_event(io, event, alloc)
+    handle_mtl_event(io, event, display, alloc)
 }
 
 /// Whether the process-wide MTL route is absent or locally stopped (its

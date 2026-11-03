@@ -4,6 +4,7 @@ extern crate alloc;
 use super::*;
 use crate::intel_gpu_gmbus::tests::FakeGmbus;
 use crate::intel_gpu_modeset::PixelFormat;
+use crate::intel_gpu_pipes::{Transcoder, PIPECONF_ENABLE as ENABLE, PIPECONF_STATE as STATE};
 use crate::intel_gpu_xelpg::tests::FakePhy;
 use crate::intel_gpu_xelpg::{
     c10_vdr_cmn, c10_vdr_tx, cx0_vdrovrd_ctl, lane_powerdown_new_state, lane_powerdown_update,
@@ -12,7 +13,9 @@ use crate::intel_gpu_xelpg::{
     DDI_CLOCK_SELECT_MASK, DDI_CLOCK_SELECT_MAXPCLK, P2_STATE_READY, POWERDOWN_NEW_STATE_MASK_BOTH,
     SSC_ENABLE_PLLB,
 };
-use crate::intel_gpu_xelpg_external::tests::{edid_for, ExtFake, Sink};
+use crate::intel_gpu_xelpg_external::tests::{
+    edid_for, ExtFake, Sink, PIPECONF_B, PLANE_CTL_1_A, TRANS_CLK_SEL_B, TRANS_DDI_FUNC_CTL_B,
+};
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -282,19 +285,19 @@ fn smoke_mtl_hdmi_ddi_b_route_activate_and_stop() -> TestResult {
         XeLpgPort::B,
         Sink::new(0x14, edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6)),
     );
-    let mut route = match activate_hdmi(&io, hdmi_probe_b(), hdmi_fb()) {
+    let mut route = match activate_hdmi(&io, hdmi_probe_b(), hdmi_fb(), &MtlDisplay::NONE) {
         Ok(route) if route.state() == HdmiRouteState::Live => route,
-        _ => return TestResult::Fail("DDI B HDMI must light pipe A"),
+        _ => return TestResult::Fail("DDI B HDMI must light Pipe B"),
     };
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false);
-    if io.read32(TRANS_DDI_FUNC_CTL_A) != func
+    if io.read32(TRANS_DDI_FUNC_CTL_B) != func
         || io.read32(XeLpgPort::B.ddi_buf_ctl()) != DDI_BUF_CTL_ENABLE | (3 << 1)
         || io.read32(XeLpgPort::B.buf_ctl1()) & PORT_WIDTH_MASK != 3 << 1
-        || io.read32(TRANS_CLK_SEL_A) != 0x2000_0000
+        || io.read32(TRANS_CLK_SEL_B) != 0x2000_0000
     {
         return TestResult::Fail("HDMI function, DDI width or transcoder clock wrong");
     }
-    let dip = Transcoder::A.base() + crate::intel_gpu_hdmi::VIDEO_DIP_CTL_OFFSET;
+    let dip = Transcoder::B.base() + crate::intel_gpu_hdmi::VIDEO_DIP_CTL_OFFSET;
     if io.read32(dip) & crate::intel_gpu_hdmi::VIDEO_DIP_ENABLE_AVI == 0 {
         return TestResult::Fail("AVI infoframe must be enabled");
     }
@@ -305,7 +308,7 @@ fn smoke_mtl_hdmi_ddi_b_route_activate_and_stop() -> TestResult {
     let writes = io.writes.borrow();
     let pipe_on = writes
         .iter()
-        .position(|&(o, v)| o == PIPECONF_A && v & ENABLE != 0);
+        .position(|&(o, v)| o == PIPECONF_B && v & ENABLE != 0);
     let ddi_on = writes
         .iter()
         .position(|&(o, v)| o == XeLpgPort::B.ddi_buf_ctl() && v & DDI_BUF_CTL_ENABLE != 0);
@@ -319,22 +322,35 @@ fn smoke_mtl_hdmi_ddi_b_route_activate_and_stop() -> TestResult {
     }
     if io.read32(dip) & crate::intel_gpu_hdmi::VIDEO_DIP_ENABLE_AVI != 0
         || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
-        || io.read32(TRANS_CLK_SEL_A) != 0
+        || io.read32(TRANS_CLK_SEL_B) != 0
         || io.phy.writes_to(0x6_4130).last() != Some(&0)
-        || io.read32(PIPECONF_A) & (ENABLE | STATE) != 0
+        || io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
     {
         return TestResult::Fail("HDMI stop must clear infoframes, DDI, clock and PLL");
     }
     if route.release(&io).is_err() {
         return TestResult::Fail("stopped DDI B route must release");
     }
-    // A busy pipe refuses before any write and returns the probe.
+    // A foreign fetcher on a dark Pipe A refuses before any write and
+    // returns the probe. It is now the Pipe B–D owner's admission (every
+    // pipe the all-off commit reprograms must be idle) that refuses, with
+    // its typed Busy, rather than the old "pipe A busy" preflight: the
+    // route no longer takes Pipe A, but its resource transaction would
+    // repartition it.
     let busy = ExtFake::new(XeLpgPort::B, Sink::new(0x14, alloc::vec::Vec::new()));
     busy.phy.write32(PLANE_CTL_1_A, ENABLE);
-    match activate_hdmi(&busy, hdmi_probe_b(), hdmi_fb()) {
-        Err((Err(_), HdmiError::Route(ExternalError::PipeBusy)))
+    match activate_hdmi(&busy, hdmi_probe_b(), hdmi_fb(), &MtlDisplay::NONE) {
+        Err((Err(_), HdmiError::Route(ExternalError::Pipe(PipeRefusal::Busy))))
             if busy.writes.borrow().is_empty() => {}
         _ => return TestResult::Fail("busy pipe must refuse before programming"),
+    }
+    // A lit Pipe A that is not the owned panel profile refuses PipeBusy.
+    let lit = ExtFake::new(XeLpgPort::B, Sink::new(0x14, alloc::vec::Vec::new()));
+    lit.set_conf(0, ENABLE);
+    match activate_hdmi(&lit, hdmi_probe_b(), hdmi_fb(), &MtlDisplay::NONE) {
+        Err((Err(_), HdmiError::Route(ExternalError::PipeBusy)))
+            if lit.writes.borrow().is_empty() => {}
+        _ => return TestResult::Fail("an unowned lit Pipe A must refuse before programming"),
     }
     TestResult::Pass
 }
@@ -600,12 +616,12 @@ fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
         stride_bytes: 3840 * 4,
         format: PixelFormat::Xrgb8888,
     };
-    let mut route = match activate_hdmi(&io, probe, fb) {
+    let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
         Ok(route) if route.state() == HdmiRouteState::Live => route,
         _ => return TestResult::Fail("scrambled 594 MHz HDMI must light pipe A"),
     };
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, true, true);
-    if io.read32(TRANS_DDI_FUNC_CTL_A) != func
+    if io.read32(TRANS_DDI_FUNC_CTL_B) != func
         || func & (1 << 4 | 1) != (1 << 4 | 1)
         || io.phy.writes_to(0x6_4130) != [594_000]
         || io.ddc.scdc_at(SCDC_TMDS_CONFIG)
@@ -619,7 +635,7 @@ fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
     if scdc_writes(&io) != [0x0220, 0x0320] {
         return TestResult::Fail("SCDC must set the ratio first, then scrambling");
     }
-    let pipe_on = position(&io, |o, v| o == PIPECONF_A && v & ENABLE != 0);
+    let pipe_on = position(&io, |o, v| o == PIPECONF_B && v & ENABLE != 0);
     let scdc = position(&io, |o, v| {
         o == crate::intel_gpu_gmbus::GMBUS1 && (v >> 1) & 0x7F == 0x54
     });
@@ -646,7 +662,7 @@ fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
         .iter()
         .enumerate()
         .skip(before)
-        .position(|(_, &(o, v))| o == PIPECONF_A && v & ENABLE == 0)
+        .position(|(_, &(o, v))| o == PIPECONF_B && v & ENABLE == 0)
         .map(|p| p + before);
     let last_scdc = io
         .writes
@@ -687,12 +703,12 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
         stride_bytes: 1920 * 4,
         format: PixelFormat::Xrgb8888,
     };
-    match activate_hdmi(&io, probe, fb) {
+    match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
         Ok(route) if route.state() == HdmiRouteState::Live => {}
         _ => return TestResult::Fail("1080p HDMI route must light"),
     }
     if io.ddc.scdc_at(SCDC_TMDS_CONFIG) != 0
-        || io.read32(TRANS_DDI_FUNC_CTL_A)
+        || io.read32(TRANS_DDI_FUNC_CTL_B)
             != crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false)
     {
         return TestResult::Fail("stale sink scrambling must be cleared at 1/10");
@@ -709,12 +725,12 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("low-rate scrambling sink must probe"),
     };
-    match activate_hdmi(&io, probe, fb) {
+    match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
         Ok(route) if route.state() == HdmiRouteState::Live => {}
         _ => return TestResult::Fail("low-rate scrambled route must light"),
     }
     if io.ddc.scdc_at(SCDC_TMDS_CONFIG) != SCDC_SCRAMBLING_ENABLE
-        || io.read32(TRANS_DDI_FUNC_CTL_A)
+        || io.read32(TRANS_DDI_FUNC_CTL_B)
             != crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, true, false)
     {
         return TestResult::Fail("low-rate scrambling must set bit 0 only, both sides");
@@ -752,11 +768,11 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
         stride_bytes: 3840 * 4,
         format: PixelFormat::Xrgb8888,
     };
-    match activate_hdmi(&io, probe, fb) {
+    match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
         Err((Ok(route), HdmiError::Scdc(_))) if route.state() == HdmiRouteState::Stopped => {
             if route.release(&io).is_err()
                 || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
-                || io.read32(PIPECONF_A) & (ENABLE | STATE) != 0
+                || io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
             {
                 return TestResult::Fail("failed SCDC activation must leave DDI B stopped");
             }

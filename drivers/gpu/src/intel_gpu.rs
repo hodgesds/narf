@@ -2318,7 +2318,9 @@ pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
 // the serial-matched publication. The GTT allocator has no free path, so
 // one allocation is retained per BAR and reused whenever the next mode
 // fits; it lives in the pipe-B console GGTT window so it can never remap
-// the internal panel's pipe-A window. Gen12 never reaches this glue: every
+// the internal panel's pipe-A window (the route runs on Pipe B, C or D next
+// to the lit panel; only it uses those pipes on display 14, so the one
+// retained window is never shared). Gen12 never reaches this glue: every
 // entry returns before register access unless the probed generation is
 // Meteor Lake.
 
@@ -2326,27 +2328,50 @@ pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
 static MTL_SCANOUT: IrqSafeSpinLock<Option<(u64, ScanoutAllocation)>> = IrqSafeSpinLock::new(None);
 /// Serial of the published MTL external image (0 = none published).
 static MTL_PUBLISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The pipe (CRTC) scanning out the published MTL external image, as
+/// `pipe + 1` (0 = none published).
+static MTL_PUBLISHED_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// Upper bound on hotplug events one probe-time drain acts on.
 const MTL_EVENTS_PER_DRAIN: usize = 8;
+
+/// The pipe (CRTC) scanning out the active Intel publication when it is
+/// the MTL external route's image ([`active_scanout_generic`]); `None` for
+/// the internal console or when nothing external is published.
+pub fn active_external_pipe() -> Option<crate::intel_gpu_pipes::Pipe> {
+    let serial = ACTIVE_GENERIC.lock().0;
+    if serial == 0 || serial != MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let pipe = MTL_PUBLISHED_PIPE
+        .load(core::sync::atomic::Ordering::Acquire)
+        .checked_sub(1)?;
+    crate::intel_gpu_pipes::Pipe::try_from(pipe).ok()
+}
 
 /// Publication requests one MTL pass makes of its caller.
 #[derive(Copy, Clone, Debug)]
 enum MtlPublication {
-    /// Publish this image under this serial.
-    Publish(narf_graphics_driver::generic::GenericFb, u64),
+    /// Publish this image under this serial; it scans out on this pipe.
+    Publish(
+        narf_graphics_driver::generic::GenericFb,
+        u64,
+        crate::intel_gpu_pipes::Pipe,
+    ),
     /// Withdraw the image published under this serial (only if current).
     Withdraw(u64),
 }
 
 /// One MTL external hotplug pass: poll the owned hotplug source; when an
 /// event arrives run `before_event` (the caller suspends fixed internal
-/// flips), let the route owner act on it with a retained-or-new scanout
-/// allocation, then publish an activated image or withdraw the image of a
-/// route that is no longer live. Returns whether an event was handled.
+/// flips), let the route owner act on it next to `display` with a
+/// retained-or-new scanout allocation, then publish an activated image
+/// (with the pipe it scans out on) or withdraw the image of a route that is
+/// no longer live. Returns whether an event was handled.
 fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
     bar: u64,
+    display: &crate::intel_gpu_xelpg_external::MtlDisplay,
     before_event: &mut dyn FnMut(),
     alloc: &mut dyn FnMut(u64) -> Option<ScanoutAllocation>,
     publication: &mut dyn FnMut(MtlPublication),
@@ -2376,8 +2401,9 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         })
     };
-    let outcome = crate::intel_gpu_xelpg_external::handle_mtl_event(io, event, &mut alloc_fb);
-    if let Some(ServiceOutcome::Activated { mode, fb, .. }) = outcome {
+    let outcome =
+        crate::intel_gpu_xelpg_external::handle_mtl_event(io, event, display, &mut alloc_fb);
+    if let Some(ServiceOutcome::Activated { mode, fb, pipe, .. }) = outcome {
         let phys = (*MTL_SCANOUT.lock())
             .filter(|(owner, retained)| {
                 *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
@@ -2401,6 +2427,7 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
                     32,
                 ),
                 serial,
+                pipe,
             ));
         }
     }
@@ -2414,16 +2441,21 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
 }
 
 /// Production publication: the same ACTIVE + observer protocol and exact
-/// serial-matched withdrawal the Gen12 SST owner uses.
+/// serial-matched withdrawal the Gen12 SST owner uses; the image's pipe is
+/// recorded for [`active_external_pipe`] before it becomes ACTIVE.
 fn mtl_publish(request: MtlPublication) {
     match request {
-        MtlPublication::Publish(fb, serial) => publish_scanout_owned(Some(fb), serial),
+        MtlPublication::Publish(fb, serial, pipe) => {
+            MTL_PUBLISHED_PIPE.store(pipe as u8 + 1, core::sync::atomic::Ordering::Release);
+            publish_scanout_owned(Some(fb), serial)
+        }
         MtlPublication::Withdraw(serial) => {
             let withdrew = {
                 let mut active = ACTIVE_GENERIC.lock();
                 external_stop::withdraw(&mut active, serial)
             };
             if withdrew {
+                MTL_PUBLISHED_PIPE.store(0, core::sync::atomic::Ordering::Release);
                 let observer = *SCANOUT_OBSERVER.lock();
                 if let Some(observer) = observer {
                     observer(None);
@@ -2442,10 +2474,16 @@ fn service_mtl_display(before_event: &mut dyn FnMut()) -> bool {
         }
         let window = gpu.mode_window();
         let gtt = gpu.gtt_mmadr;
+        // The owned panel the route adopts next to it, and the display-14
+        // DC service's pipe-DMC sink.
+        let display = crate::intel_gpu_xelpg_external::MtlDisplay::production(
+            crate::intel_gpu_modeset_xelpg::owned_panel_mode(),
+        );
         mtl_external_pass(
             &window,
             gpu.chip.generation,
             gtt.phys.raw(),
+            &display,
             before_event,
             &mut |size| {
                 let alloc = crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
@@ -3173,6 +3211,7 @@ pub mod tests {
             &io,
             Generation::TigerLake,
             BAR,
+            &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
             &mut alloc,
             &mut |p| published.push(p),
@@ -3186,13 +3225,18 @@ pub mod tests {
             &io,
             Generation::MeteorLake,
             BAR,
+            &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
             &mut alloc,
             &mut |p| published.push(p),
         );
+        // The image is reported on Pipe B: with Pipe A dark the route still
+        // never takes it (it stays the internal panel's).
         let first = match published.as_slice() {
-            [MtlPublication::Publish(fb, serial)] => (*fb, *serial),
-            _ => return TestResult::Fail("activation must publish exactly one image"),
+            [MtlPublication::Publish(fb, serial, crate::intel_gpu_pipes::Pipe::B)] => {
+                (*fb, *serial)
+            }
+            _ => return TestResult::Fail("activation must publish exactly one Pipe B image"),
         };
         if !handled
             || events != 1
@@ -3211,6 +3255,7 @@ pub mod tests {
             &io,
             Generation::MeteorLake,
             BAR,
+            &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
             &mut alloc,
             &mut |p| published.push(p),
@@ -3229,6 +3274,7 @@ pub mod tests {
             &io,
             Generation::MeteorLake,
             BAR,
+            &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
             &mut alloc,
             &mut |p| published.push(p),
@@ -3252,12 +3298,13 @@ pub mod tests {
             &io,
             Generation::MeteorLake,
             BAR,
+            &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
             &mut alloc,
             &mut |p| published.push(p),
         );
         let reused = sizes.borrow().len() == 1
-            && matches!(published.as_slice(), [MtlPublication::Publish(fb, s)]
+            && matches!(published.as_slice(), [MtlPublication::Publish(fb, s, _)]
                 if fb.addr == 0x7_0000_0000 && *s != first.1);
         // Leave the process-wide owners and the retained slot fresh.
         let torn =
@@ -3307,17 +3354,18 @@ pub mod tests {
             &io,
             Generation::MeteorLake,
             BAR,
+            &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || {},
             &mut alloc,
             &mut |p| published.push(p),
         );
         let serial = match published.as_slice() {
-            [MtlPublication::Publish(fb, serial)]
+            [MtlPublication::Publish(fb, serial, crate::intel_gpu_pipes::Pipe::B)]
                 if fb.addr == 0x7_1000_0000 && fb.width == 1024 && fb.height == 768 =>
             {
                 *serial
             }
-            _ => return TestResult::Fail("HDMI activation must publish exactly one image"),
+            _ => return TestResult::Fail("HDMI activation must publish exactly one Pipe B image"),
         };
         if !handled
             || !crate::intel_gpu_xelpg_external::route_live()
