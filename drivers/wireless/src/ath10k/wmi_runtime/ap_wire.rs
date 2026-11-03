@@ -384,10 +384,10 @@ pub(super) fn command(id: u32, tag: u32, values: &[u32]) -> Result<Vec<u8>, Erro
     }
     Ok(bytes)
 }
+/// The ordinary TLV AP vdev: vdev0, VDEV_TYPE_AP, subtype NONE.
 pub(super) fn create(own: [u8; 6]) -> Result<Vec<u8>, Error> {
-    let mut bytes = command(0x5001, 86, &[0, 1, 0, 0, 0])?;
-    bytes[20..26].copy_from_slice(&own);
-    Ok(bytes)
+    let tlv = wire::Wire::new(crate::ath10k::wmi_boot::Dialect::Tlv);
+    super::p2p::Vdev::new(0, super::p2p::Role::Ap).create(&tlv, own)
 }
 pub(super) fn beacon(plan: &Plan) -> Result<Vec<u8>, Error> {
     let mut out = command(0x7003, 103, &[0, plan.tim as u32, plan.beacon.len() as u32])?;

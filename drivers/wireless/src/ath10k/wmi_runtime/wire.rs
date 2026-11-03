@@ -105,21 +105,9 @@ impl Wire {
             management_event,
         }
     }
+    /// The managed station vdev: vdev0, VDEV_TYPE_STA, subtype NONE.
     pub fn create(&self, mac: [u8; 6]) -> Result<Vec<u8>, Error> {
-        if mac[0] & 1 != 0 || mac == [0; 6] {
-            return Err(Error::Malformed);
-        }
-        let tlv = self.dialect == Dialect::Tlv;
-        let mut out = packet(self.create, 20 + usize::from(tlv) * 4)?;
-        let at = if tlv {
-            header(&mut out, 86, 20);
-            8
-        } else {
-            4
-        };
-        put(&mut out, at + 4, 2); // VDEV_TYPE_STA, vdev0/subtypeNONE.
-        out[at + 12..at + 18].copy_from_slice(&mac);
-        Ok(out)
+        super::p2p::Vdev::new(0, super::p2p::Role::Station).create(self, mac)
     }
     pub fn channels(&self, channels: &[u16]) -> Result<Vec<u8>, Error> {
         validate_channels(channels)?;

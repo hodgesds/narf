@@ -2043,6 +2043,71 @@ native-WiFi MSDUs. Release compilation passed clippy on both arches; native
 execution and physical QCA6174/QCA9377 acceptance are pending, and no
 physical native-WiFi behaviour is claimed.
 
+### 3.8 P2P roles (groundwork; not advertised)
+
+**Status: partial. No P2P interface type, combination or control opt-in is
+advertised; the ledger row stays open.** `wmi_runtime/p2p.rs` holds the
+per-vdev identity and native P2P codecs that the P2P device/client/GO owners
+will bind; none of them grants RF, peer, key or data authority.
+
+- **Vdev roles.** `Role` maps nl80211 STATION2/AP3/P2P_CLIENT8/P2P_GO9/
+  P2P_DEVICE10 to `WMI_VDEV_TYPE_*` and subtype exactly as
+  `mac.c::ath10k_add_interface` (P2P_DEVICE and P2P client are TYPE_STA,
+  GO is TYPE_AP); every dialect's `get_vdev_subtype` numbers NONE0,
+  P2P_DEV1, P2P_CLI2, P2P_GO3. `Vdev::create` is the single
+  `WMI_VDEV_CREATE` builder for all dialects (`wmi.c::ath10k_wmi_op_gen_vdev_create`,
+  TLV tag 86); the existing station (`Wire::create`) and TLV AP
+  (`ap_wire::create`) vdev0 builders now delegate to it byte-identically
+  (the AP builder additionally refuses a zero/multicast own address).
+- **Vdev ids.** `VdevMap` mirrors `ar->free_vdev_map` (INIT `num_vdevs`,
+  lowest free bit as `__ffs64`); exhaustion is `Exhausted` (Linux
+  `-EBUSY`), double or out-of-range release is an error. The running
+  station and AP owners still use vdev0 only; the per-vdev refactor of
+  `Radio` (`peer`, `data`, `ap`, HTT vdev routing) is not done.
+- **GO beacon P2P IE.** `go_beacon_ie` follows
+  `mac.c::ath10k_mac_setup_bcn_p2p_ie` + `ath10k_mac_remove_vendor_ie`:
+  for a GO vdev the first WFA P2P vendor IE after the beacon fixed fields
+  becomes `WMI_TLV_P2P_GO_SET_BEACON_IE` (0xd003; tag 90 {vdev, ie_len},
+  tag 17 padded bytes) and is removed from the template, because firmware
+  inserts it with its own NoA. Ordinary AP beacons are unchanged.
+- **NoA / opportunistic PS.** Linux ath10k never programs CTWindow/OppPS or
+  a NoA schedule from the host; firmware owns both and reports them.
+  `Noa::tlv_event` decodes `WMI_TLV_P2P_NOA_EVENTID` (0xd002, tags 223
+  vdev and 69 `wmi_p2p_noa_info`, both required as
+  `ath10k_wmi_tlv_event_p2p_noa`), rejecting more than
+  `WMI_P2P_MAX_NOA_DESCRIPTORS` (Linux does not bound it).
+  `Noa::information_element` is `p2p.c::ath10k_p2p_noa_ie_fill` (OppPS
+  moves from wire bit0 to IEEE bit7; no IE without a descriptor or OppPS).
+  `NoaOwner` keeps the IE for its own GO vdev only and appends it to Probe
+  Responses only (`mac.c::ath10k_tx_h_add_p2p_noa_ie`). Consequently
+  `supports_p2p_go_power_save` stays false: nl80211 CTWindow/OPPPS
+  settings have no Linux ath10k host path. MAIN-dialect SWBA NoA
+  (`wmi.c::ath10k_wmi_update_noa`) is out of scope because no MAIN AP/GO
+  owner exists.
+- **Admission.** `p2p_combinations` reproduces `ath10k_tlv_if_comb`
+  (STA≤2; AP/P2P_CLIENT/P2P_GO≤2; P2P_DEVICE≤1; 4 interfaces, 1 channel)
+  or `ath10k_tlv_qcs_if_comb` with TLV service 39 ADAPTIVE_OCS (2
+  channels), minus the IBSS combination, and nothing for non-TLV dialects
+  or `ATH10K_FW_FEATURE_NO_P2P` (bit 3). It is not yet returned from
+  `interface_combinations`.
+
+Remaining before the row can be claimed: per-vdev `Radio` refactor so a
+second vdev can coexist with the managed/AP vdev0; a control-only
+P2P_DEVICE WDEV owning its own vdev for discovery ROC/FRAME
+(`async_p2p_device_control`, `async_p2p_management_{rx,tx}_control`); a
+P2P client netdev role (iftype 8, STA vdev subtype P2P_CLI) reusing the
+station owner; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring
+`go_beacon_ie` into the beacon publication and `NoaOwner` into P2P_NOA
+event routing and probe-response TX; then advertisement through
+`p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
+Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
+`smoke_ath10k_p2p_vdev_create_roles`,
+`smoke_ath10k_p2p_vdev_map_lowest_free`,
+`smoke_ath10k_p2p_go_beacon_ie_moves_to_firmware`,
+`smoke_ath10k_p2p_noa_event_builds_absence_ie`,
+`smoke_ath10k_p2p_noa_owner_probe_response_only`,
+`smoke_ath10k_p2p_tlv_combinations`.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
