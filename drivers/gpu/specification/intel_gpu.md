@@ -2374,6 +2374,9 @@ code portability. This iteration policy follows the maintainer's direction
 to avoid redundant aarch64 test runs.
 A query bit, codec, read-only audit or register model alone does not close a
 production feature. Unsupported functionality remains unadvertised.
+Every deadline-polled wait evaluates its condition before enforcing the
+deadline, as i915 `__wait_for`, `xe_mmio_wait32` and `read_poll_timeout` do:
+a late poll that finds the condition met progresses instead of timing out.
 
 | Workstream | Software exit condition | State |
 | --- | --- | --- |
