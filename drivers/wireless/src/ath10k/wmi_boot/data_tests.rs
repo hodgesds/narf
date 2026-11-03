@@ -131,6 +131,15 @@ pub(super) struct Fixture {
     group_replay: u64,
     /// Firmware key cache of the hardware-key profile (Linux `cryptmode=0`).
     pub(super) hw: Option<Box<HwKeyCache>>,
+    /// Native-WiFi decap firmware (INIT `rx_decap_mode` 1): data TX arrives
+    /// as native-WiFi MSDUs, decryptable data RX leaves as native-WiFi
+    /// MSDUs with the original header in `rx_hdr_status`.
+    pub(super) native_wifi: bool,
+    /// The firmware's own pairwise TX PN under native WiFi.
+    pub(super) native_pn: u64,
+    /// Native-WiFi MSDUs transmitted / delivered.
+    pub(super) native_tx: usize,
+    pub(super) native_rx: usize,
 }
 /// Source-derived VHT expectations: the exact association-request VHT
 /// Capabilities body and the native PEER_ASSOC/VDEV_START VHT words.
@@ -206,6 +215,10 @@ impl Fixture {
             qos_frames: 0,
             group_replay: 3,
             hw: None,
+            native_wifi: false,
+            native_pn: 0,
+            native_tx: 0,
+            native_rx: 0,
             group_replies: 0,
             pfc_responses: Vec::new(),
             server: DhcpServer::new(network()),
@@ -819,7 +832,7 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         || bytes[2..4] != (bytes.len() as u16 - 8).to_le_bytes()
         || body.len() < 16
         || body[0] != 1
-        || !matches!(body[1], 1 | 5)
+        || !matches!(body[1], 1 | 5 | 0x21 | 0x25)
         || body[12..16] != [0xff, 0xff, 0, 0]
     {
         return Err(BmiError::BadResponse);
@@ -845,10 +858,26 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         }
     }
     let fixture = m.data.as_mut().unwrap();
+    // PKT_TYPE native WiFi (flags0 bit 5): only native-WiFi firmware, and
+    // the firmware rebuilds QoS from the descriptor TID and, without
+    // NO_ENCRYPT, inserts its own CCMP header.
+    let native;
+    let frame = if body[1] & 0x20 != 0 {
+        if !fixture.native_wifi {
+            return Err(BmiError::BadResponse);
+        }
+        let flags1 = u16::from_le_bytes([body[2], body[3]]);
+        native = fixture.native_frame(frame, (flags1 >> 6) as u8 & 31, body[1] & 4 == 0)?;
+        &native[..]
+    } else if fixture.native_wifi {
+        return Err(BmiError::BadResponse);
+    } else {
+        frame
+    };
     // flags0 without HTT_DATA_TX_DESC_FLAGS0_NO_ENCRYPT: the firmware
     // encrypts the header-only MPDU with its installed pairwise key.
     let encrypted;
-    let frame = if body[1] == 1 {
+    let frame = if body[1] & 4 == 0 {
         encrypted = fixture.firmware_encrypt(frame)?;
         &encrypted[..]
     } else {
@@ -960,8 +989,19 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         u16::from_le_bytes([frame[22], frame[23]]) >> 4
     };
     let per_frame = fixture.rx_descriptors.pop_front();
-    frame.extend_from_slice(&[0; 4]);
     let mut descriptor = [0u8; 300];
+    // htt_rx.c: a native-WiFi firmware decaps data it could decrypt (or
+    // that was never protected); anything else stays RAW with its FCS.
+    let native = fixture.native_wifi
+        && !control
+        && matches!(frame[0], 8 | 0x88)
+        && (!protected || decrypted)
+        && !(frame[0] == 0x88 && frame[24] & 0x80 != 0);
+    if native {
+        frame = fixture.native_rx_msdu(&frame, &mut descriptor);
+    } else {
+        frame.extend_from_slice(&[0; 4]);
+    }
     u32at(
         &mut descriptor,
         4,
@@ -985,10 +1025,15 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         u32::from(if tid == 16 { 0 } else { tid }) << 28,
     );
     u32at(&mut descriptor, 24, frame.len() as u32);
+    // rx_msdu_start_common.info1 DECAP_FORMAT (after flow_id_crc).
     u32at(
         &mut descriptor,
-        28,
-        core::mem::take(&mut fixture.next_decap) << 8,
+        32,
+        if native {
+            1 << 8
+        } else {
+            core::mem::take(&mut fixture.next_decap) << 8
+        },
     );
     u32at(&mut descriptor, 56, 0xc000);
     u32at(&mut descriptor, 104, 0x0400000b); // legacy OFDM6
@@ -1505,6 +1550,57 @@ impl Fixture {
         );
         hw.hardware_tx += 1;
         Ok(out)
+    }
+    /// Native-WiFi TX (mac.c `ath10k_tx_h_nwifi` reversed): QoS Control
+    /// from the descriptor TID, then, when the firmware encrypts, a CCMP
+    /// header at its own PN plus MIC space for `firmware_encrypt`.
+    fn native_frame(&mut self, frame: &[u8], tid: u8, encrypt: bool) -> Result<Vec<u8>, BmiError> {
+        if frame.len() < 24 || frame[0] != 8 || frame[1] & 0x03 != 1 {
+            return Err(BmiError::BadResponse);
+        }
+        let protected = frame[1] & 0x40 != 0;
+        if protected != encrypt {
+            return Err(BmiError::BadResponse);
+        }
+        let mut out = frame[..24].to_vec();
+        if tid < 16 {
+            out[0] = 0x88;
+            out.extend_from_slice(&[tid, 0]);
+        }
+        if encrypt {
+            self.native_pn += 1;
+            let pn = self.native_pn.to_le_bytes();
+            out.extend_from_slice(&[pn[0], pn[1], 0, 0x20, pn[2], pn[3], pn[4], pn[5]]);
+        }
+        out.extend_from_slice(&frame[24..]);
+        if encrypt {
+            out.extend_from_slice(&[0; 8]);
+        }
+        self.native_tx += 1;
+        Ok(out)
+    }
+    /// Native-WiFi RX (`ath10k_htt_rx_h_undecap_nwifi` reversed): the
+    /// original header (+CCMP header at 4-byte alignment) in
+    /// `rx_hdr_status`, the MSDU as `[nwifi header][LLC...]` without MIC/FCS.
+    fn native_rx_msdu(&mut self, frame: &[u8], descriptor: &mut [u8; 300]) -> Vec<u8> {
+        let header = if frame[0] == 0x88 { 26 } else { 24 };
+        let protected = frame[1] & 0x40 != 0;
+        let mut status = frame[..header].to_vec();
+        let mut body = &frame[header..];
+        if protected {
+            status.resize(header.next_multiple_of(4), 0);
+            status.extend_from_slice(&body[..8]);
+            body = &body[8..body.len() - 8];
+        }
+        descriptor[236..236 + status.len()].copy_from_slice(&status);
+        let mut native = vec![8, frame[1] & 0x03, 0, 0];
+        native.extend_from_slice(&frame[4..10]);
+        native.extend_from_slice(&frame[10..16]);
+        native.extend_from_slice(&frame[16..22]);
+        native.extend_from_slice(&frame[22..24]);
+        native.extend_from_slice(body);
+        self.native_rx += 1;
+        native
     }
     /// RX: an MPDU under a programmed key leaves the firmware decrypted with
     /// Protected, CCMP header and MIC kept (htt_rx.c `is_decrypted`); any

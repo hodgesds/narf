@@ -1896,9 +1896,10 @@ firmware feature `ATH10K_FW_FEATURE_WOWLAN_SUPPORT` (bit 6), TLV service
 `WMI_TLV_SERVICE_WOW` (13, Linux's 4-bits-per-word service map) and the
 retained station data owner. Of the installed images only QCA6174 hw3.0
 firmware-4/-6, QCA9377 firmware-6 and WCN3990 carry bit 6, and none of them
-carries `RAW_MODE_SUPPORT` (bit 10) that the NARF station requires, so no
-installed image currently reaches an advertised WoWLAN interface; a TLV image
-with both bits does. The interface advertises disconnect and magic packet
+carries `RAW_MODE_SUPPORT` (bit 10); those PCI images (QCA6174/QCA9377) now
+run the station in native-WiFi decap (§3.7), which is the data owner that
+makes WoWLAN reachable there, with native-WiFi patterns. WCN3990 is SNOC, not
+a NARF PCI profile. The interface advertises disconnect and magic packet
 (`ath10k_wowlan_support`); GTK rekey/failure, EAP/4-way triggers and
 net-detect are not advertised and `set_wowlan` re-validates every
 configuration (`-EOPNOTSUPP` without support, `-EINVAL` otherwise).
@@ -1968,6 +1969,79 @@ command order and a post-resume CCMP uplink accepted by the FakeAp's
 PN/replay check, deauth wake requesting restart, no advertisement without
 the firmware feature) under `drivers/wireless/ath10k/wow`. No physical WoW
 entry, wake latency, PME routing or power measurement is claimed.
+
+### 3.7 Native-WiFi decap station (implementation; validation pending)
+
+Linux's default ath10k frame mode is `ATH10K_HW_TXRX_NATIVE_WIFI`
+(`rawmode=0`, core.c `ath10k_core_init_firmware_features`: INIT
+`rx_decap_mode` 1, `max_num_amsdu` 3); RAW is only taken with
+`RAW_MODE_SUPPORT`. NARF keeps RAW wherever bit 10 exists and otherwise, on
+TLV firmware (`wmi_boot::Runtime::native_wifi`), runs the station in native
+WiFi: `htt_runtime::data_profile` admits it (no PFC), `Radio::data_supported`
+additionally requires the hardware-key profile (core.c: software crypto
+needs RAW, so this decap has no software data crypto), and the AP owner
+(`ap_protocol`, `ap_native`) still requires RAW. The INIT word already left
+decap at 1 without bit 10; the HTT aggregation config sends 64/3. The chip
+identity (QCA6174 hw2.1/hw3.0, QCA9377 hw1.0 profiles in `profile.rs`) is
+unchanged; no board fact is added.
+
+- **TX** (`wmi_runtime/nwifi.rs::transmit`, mac.c `ath10k_tx_h_nwifi`):
+  data and EAPOL replies leave as HTT PKT_TYPE native WiFi (flags0 0x21):
+  the three-address ToDS header without QoS Control and with the QoS
+  subtype cleared; the TID (taken before stripping, htt_tx.c
+  `ath10k_htt_tx_get_tid`) rides in the descriptor. Data needs the
+  confirmed PTK (`Security::transmit_ethernet_device`: Protected header +
+  plaintext, no CCMP header, no host PN consumed; the firmware owns the TX
+  PN) and is sent without `NO_ENCRYPT`; until the PTK is confirmed data is
+  `Busy`. EAPOL replies use `Security::pending_frame_device`: plaintext
+  with `NO_ENCRYPT` before a PTK, or Protected plaintext encrypted by the
+  firmware under the confirmed current PTK (`ath10k_tx_h_use_hwcrypto`);
+  terminal delivery is reported with `reply_delivered_device`. A reply
+  under a PTK the firmware has not confirmed is not sent.
+  `WMI_VDEV_PARAM_TX_ENCAP_TYPE` (mac.c `ath10k_mac_op_update_vif_offload`)
+  is not sent in either decap; the per-MSDU PKT_TYPE selects native WiFi.
+- **RX** (`nwifi::undecap`, htt_rx.c `ath10k_htt_rx_h_mpdu` with
+  `fill_crypt_header` and `ath10k_htt_rx_h_undecap_nwifi`): MSDUs whose
+  `rx_msdu_start.info1` DECAP_FORMAT is 1 are grouped FIRST..LAST
+  (`rx_msdu_end.info0` bits 14/15). The original header (QoS kept) and, for
+  a protected frame, the ExtIV CCMP header at the 4-byte decap alignment come
+  from the first MSDU's `rx_hdr_status`; each MSDU contributes
+  `[nwifi header][LLC...]`. A single MSDU regains DA/SA from its nwifi
+  header; an A-MSDU (QoS A-MSDU present) is rebuilt as one aggregate with
+  padded subframe headers. MIC/FCS space is appended and the descriptor is
+  rewritten to one RAW first+last MSDU (attention ORed across MSDUs), so the
+  unchanged RAW admission (`raw_frame`: peer/TID/sequence binding, BA/PHY,
+  `is_decrypted`) and the shared owner's PN/replay check
+  (`receive_decrypted_with_nonce`, `receive_amsdu_decrypted_with`) run over
+  it. The host therefore checks PN on both the legacy indication and the
+  in-order path, where Linux trusts the firmware (`fill_crypt_header`
+  false). RAW-decapped MSDUs (control/BAR, frames the firmware could not
+  decrypt) pass unchanged and abandon a partial group.
+- **Management** keeps the existing path (`management::path`: TLV
+  by-reference WMI management TX with feature bit 18, else HTT), as Linux.
+- **WoW** (§3.6): the native-WiFi owner satisfies `wowlan_support`, so
+  QCA6174 hw3.0 firmware-4/-6 and QCA9377 firmware-6 advertise
+  disconnect/magic plus 22 native-WiFi patterns (`WOW_MAX_REDUCE`).
+- **Descriptor offset fix.** DECAP_FORMAT is `rx_msdu_start_common.info1`
+  (byte 32, after `flow_id_crc`); the RAW station and AP admissions read
+  byte 28 before and now read 32, as does the data fixture.
+
+Tests (written, unexecuted): `wmi_runtime/nwifi_tests.rs`
+(`smoke_ath10k_nwifi_transmit_strips_qos_control`,
+`smoke_ath10k_nwifi_undecap_single_decrypted_msdu`,
+`smoke_ath10k_nwifi_undecap_amsdu_aggregate`) and the composed
+`wmi_boot/nwifi_conversation_tests.rs`
+(`smoke_ath10k_nwifi_composed_wpa2_data_and_group_rekey`: QCA6174 TLV
+without bit 10, WPA2 join with native-WiFi EAPOL, PTK/GTK install, a
+firmware-encrypted native uplink opened by the FakeAp, a decrypted native
+downlink admitted and its replay dropped, a group rekey whose reply the
+firmware encrypts, and a group frame under the new GTK;
+`smoke_ath10k_nwifi_wowlan_advertised_with_patterns`). The model firmware
+(`data_tests.rs` `native_frame`/`native_rx_msdu`) rebuilds QoS from the
+descriptor TID and encrypts at its own PN, and delivers decryptable data as
+native-WiFi MSDUs. Release compilation passed clippy on both arches; native
+execution and physical QCA6174/QCA9377 acceptance are pending, and no
+physical native-WiFi behaviour is claimed.
 
 ## 4. Invariants
 

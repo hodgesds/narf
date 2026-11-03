@@ -36,6 +36,7 @@ pub(in crate::ath10k) mod beacon_hints;
 mod chains;
 mod coexistence;
 mod data;
+mod nwifi;
 mod host_power;
 mod ht;
 mod hw_keys;

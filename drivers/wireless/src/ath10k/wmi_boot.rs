@@ -587,6 +587,12 @@ impl<T: Hif + HostMemory> Runtime<T> {
     pub fn raw_mode(&self) -> bool {
         self.ready.is_some() && self.features & (1 << 10) != 0
     }
+    /// Linux's default `ATH10K_HW_TXRX_NATIVE_WIFI` decap (`rawmode=0`,
+    /// INIT `rx_decap_mode` 1) on TLV firmware without `RAW_MODE_SUPPORT`;
+    /// it requires hardware crypto (core.c: `cryptmode=1` needs RAW).
+    pub fn native_wifi(&self) -> bool {
+        self.ready.is_some() && self.features & (1 << 10) == 0 && self.dialect == Dialect::Tlv
+    }
     pub fn new(htc: Session<T>, dialect: Dialect, hardware: HwRev, features: u64) -> Self {
         Self {
             htc,

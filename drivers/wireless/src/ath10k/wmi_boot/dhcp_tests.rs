@@ -24,6 +24,8 @@ mod ht_conversation_tests;
 mod hw_keys_conversation_tests;
 #[path = "indoor_conversation_tests.rs"]
 mod indoor_conversation_tests;
+#[path = "nwifi_conversation_tests.rs"]
+mod nwifi_conversation_tests;
 #[path = "offchannel_conversation_tests.rs"]
 mod offchannel_conversation_tests;
 #[path = "pmf_conversation_tests.rs"]

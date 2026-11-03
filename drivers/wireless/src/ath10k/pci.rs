@@ -694,9 +694,10 @@ async fn initialize_radio(
             )
         }
     };
-    // Linux's default `cryptmode=0` (ATH10K_CRYPT_MODE_HW) beside this
-    // RAW decap: station PTK/GTK are offloaded once the firmware confirms
-    // them, with software CCMP/BIP as the per-frame fallback.
+    // Linux's default `cryptmode=0` (ATH10K_CRYPT_MODE_HW): station
+    // PTK/GTK are offloaded once the firmware confirms them. Under RAW decap
+    // software CCMP/BIP stays the per-frame fallback; native-WiFi decap (TLV
+    // firmware without RAW_MODE_SUPPORT) has no software data crypto.
     let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features)
         .with_hardware_keys(true);
     let result = radio.start_from_hardware().await;

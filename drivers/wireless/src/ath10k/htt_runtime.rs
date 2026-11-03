@@ -607,10 +607,17 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             && !self.config.continuous
             && !self.config.pfc
             && self.ready.is_some_and(|ready| ready.major >= 3)
+            && self.wmi.raw_mode()
             && self.data_profile()
     }
+    /// A station data decap: RAW (with PFC where the transport has it), or
+    /// native WiFi on TLV firmware without PFC.
     pub fn data_profile(&self) -> bool {
-        self.wmi.raw_mode() && (!self.config.pfc || self.wmi.htc.transport.supports_htt_pfc())
+        if self.config.pfc {
+            self.wmi.raw_mode() && self.wmi.htc.transport.supports_htt_pfc()
+        } else {
+            self.wmi.raw_mode() || self.wmi.native_wifi()
+        }
     }
     pub async fn start(&mut self) -> Result<Ready, Error> {
         if self.failed || self.ready.is_some() || self.wmi.ready.is_none() {

@@ -2227,6 +2227,13 @@ after keys exist). The owner stays the RSNA, PN and replay authority:
   `protect_management_offload(frame)` emit the mac80211
   `IEEE80211_KEY_FLAG_GENERATE_IV{,_MGMT}` form (Protected header + CCMP
   header + plaintext, PN from the shared counter; the device appends the MIC).
+- For a device that owns the transmit PN and has no software data crypto
+  (ath10k native-WiFi decap, `ath10k.md` §3.7): `transmit_ethernet_device(eth,
+  tid)` emits the Protected header + plaintext (no CCMP header, no PN
+  consumed) for the confirmed PTK, `pending_frame_device()` the pending
+  EAPOL reply in that form (plaintext before any PTK; Protected plaintext
+  only while the current PTK is confirmed, else `None`), and
+  `reply_delivered_device(native_bytes)` records its terminal delivery.
 - `receive_decrypted_with_nonce`, `receive_amsdu_decrypted_with` and
   `receive_management_decrypted` admit a device-decrypted MPDU (Protected and
   CCMP header kept, MIC removed by the driver) only for a confirmed slot, and

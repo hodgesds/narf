@@ -81,6 +81,38 @@ pub(super) struct State {
     keys: VecDeque<KeyInstall>,
     /// The one install awaiting its HTT security indication.
     key_in_flight: Option<hw_keys::InFlight>,
+    /// Native-WiFi decap (`nwifi.rs`): TX native-WiFi frames under firmware
+    /// crypto, RX rebuilt to the RAW-equivalent original MPDU.
+    native_wifi: bool,
+    /// Native-WiFi MSDUs of the A-MSDU being received (first..last).
+    amsdu: Vec<htt::rx::Msdu>,
+}
+/// htt_rx.c `ath10k_htt_rx_h_undecap`: native-WiFi MSDUs are grouped
+/// first..last and rebuilt (`nwifi::undecap`); a RAW-decapped MSDU (control
+/// frames, or a frame the firmware could not decrypt) passes unchanged and
+/// abandons any partial group. RAW decap passes everything unchanged.
+fn native_wifi_msdu(
+    native_wifi: bool,
+    group: &mut Vec<htt::rx::Msdu>,
+    msdu: htt::rx::Msdu,
+) -> Result<Option<htt::rx::Msdu>, Error> {
+    if !native_wifi || msdu.offload.is_some() || nwifi::decap_format(&msdu.descriptor) != 1 {
+        group.clear();
+        return Ok(Some(msdu));
+    }
+    if group.len() == 31 {
+        group.clear();
+        return Ok(None);
+    }
+    let last = nwifi::last_msdu(&msdu.descriptor);
+    group.try_reserve(1).map_err(|_| Error::NoMemory)?;
+    group.push(msdu);
+    if !last {
+        return Ok(None);
+    }
+    let rebuilt = nwifi::undecap(group);
+    group.clear();
+    Ok(rebuilt)
 }
 impl State {
     fn host_idle(&self) -> bool {
@@ -157,6 +189,9 @@ impl State {
         addresses: Addresses,
         now: u64,
     ) -> Result<(), Error> {
+        let Some(frame) = native_wifi_msdu(self.native_wifi, &mut self.amsdu, frame)? else {
+            return Ok(());
+        };
         let data_admitted = self.open();
         let hardware = self.security.as_ref().is_some_and(Security::hardware_keys);
         match raw_frame(
@@ -439,8 +474,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Option<(u16, u8, usize, Option<u16>)> {
         self.data.as_ref()?.rx_ba.state(tid)
     }
+    /// Native WiFi has no software-crypto data path (core.c: `cryptmode=1`
+    /// requires RAW), so it needs the hardware-key profile.
     pub fn data_supported(&self) -> bool {
-        self.htt.data_profile()
+        self.htt.data_profile() && (self.htt.wmi.raw_mode() || self.hardware_keys)
     }
     pub fn station_publishable(&self) -> Result<[u8; 6], Error> {
         self.htt
@@ -564,9 +601,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<Link, Error> {
         validate()?;
         let associated = self.associated_station().ok_or(Error::Failed)?;
-        if self.data.is_some() || !self.htt.data_profile() {
+        if self.data.is_some() || !self.data_supported() {
             return Err(Error::Unsupported);
         }
+        let native_wifi = !self.htt.wmi.raw_mode();
         let rsn = self.peer.as_ref().and_then(|p| p.rsn.as_deref());
         let sae = rsn.is_some_and(|r| r.sae_pmk.is_some());
         // SAE derives its own PMK; a caller PMK is then refused.
@@ -642,6 +680,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             own,
             bssid: associated.bssid,
         };
+        let mut group = Vec::new();
         for event in core::mem::take(&mut self.pending) {
             let frames = match event {
                 htt::Event::Rx(batch) if security.is_some() && peer.owns(batch.peer) => batch
@@ -668,6 +707,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             };
             for (status, id, tid, frame) in frames {
+                let Some(frame) = native_wifi_msdu(native_wifi, &mut group, frame)? else {
+                    continue;
+                };
                 if let Some(NativeEvent::Data(frame)) = raw_frame(
                     frame,
                     status,
@@ -717,6 +759,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             management: None,
             keys: VecDeque::new(),
             key_in_flight: None,
+            native_wifi,
+            amsdu: Vec::new(),
         });
         self.failed = true;
         let deadline = narf_time::Deadline::after_ms(5000);
@@ -740,17 +784,21 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         domain: &narf_wireless::reg::RegulatoryDomain,
         bytes: &[u8],
     ) -> Result<u16, Error> {
-        let (frame, hardware) = self.ethernet_frame(domain, bytes)?;
+        let (frame, parameters) = self.ethernet_frame(domain, bytes)?;
         self.failed = true;
-        let id = self.send_data(&frame, false, hardware).await?;
+        let id = self.send_data(&frame, false, parameters).await?;
         self.failed = false;
         Ok(id)
     }
+    /// The MSDU and its HTT descriptor parameters. RAW sends the full
+    /// 802.11 frame; native WiFi (`nwifi.rs`) the frame without QoS
+    /// Control, firmware-encrypted under the confirmed PTK, with the TID
+    /// taken before QoS Control is removed (htt_tx.c `ath10k_htt_tx_get_tid`).
     fn ethernet_frame(
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
         bytes: &[u8],
-    ) -> Result<(Vec<u8>, bool), Error> {
+    ) -> Result<(Vec<u8>, htt::tx::Parameters), Error> {
         let link = self.station_link().ok_or(Error::Failed)?;
         self.check_data_policy(domain)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
@@ -767,7 +815,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let mut hardware = false;
         let frame = if let Some(security) = &mut data.security {
-            if security.pairwise_offloaded() {
+            if data.native_wifi {
+                // No software-crypto data path exists in this decap; until
+                // the PTK is confirmed in the firmware, data waits.
+                if !security.pairwise_offloaded() {
+                    return Err(Error::Htt(htt::Error::Busy));
+                }
+                hardware = true;
+                security
+                    .transmit_ethernet_device(bytes, data.qos.then_some(tid))
+                    .map_err(security_error)?
+            } else if security.pairwise_offloaded() {
                 // mac80211 GENERATE_IV with a hardware key: the CCMP header
                 // only; htt_tx.c RAW protected adds the MIC tail the
                 // firmware fills (`skb_put(IEEE80211_CCMP_MIC_LEN)`).
@@ -810,7 +868,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             frame.extend_from_slice(&bytes[12..]);
             frame
         };
-        Ok((frame, hardware))
+        let parameters = htt::tx::Parameters {
+            kind: htt::tx::Kind::Raw,
+            vdev: 0,
+            tid: tx_qos::descriptor_tid(&frame),
+            hardware_crypto: hardware,
+        };
+        if data.native_wifi {
+            let frame = nwifi::transmit(frame).ok_or(Error::Unsupported)?;
+            return Ok((
+                frame,
+                htt::tx::Parameters {
+                    kind: htt::tx::Kind::Native,
+                    ..parameters
+                },
+            ));
+        }
+        Ok((frame, parameters))
     }
     pub fn begin_ethernet(
         &mut self,
@@ -823,21 +897,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !self.htt.source_ready()? {
             return Err(Error::Htt(htt::Error::Busy));
         }
-        let (frame, hardware) = self.ethernet_frame(domain, bytes)?;
+        let (frame, parameters) = self.ethernet_frame(domain, bytes)?;
         self.failed = true;
-        let tid = tx_qos::descriptor_tid(&frame);
-        let id = self.htt.begin_transmit(
-            htt::tx::Parameters {
-                kind: htt::tx::Kind::Raw,
-                vdev: 0,
-                tid,
-                hardware_crypto: hardware,
-            },
-            &frame,
-        )?;
+        let id = self.htt.begin_transmit(parameters, &frame)?;
         self.data.as_mut().ok_or(Error::Failed)?.pending.push(
             id,
-            Role::Data { tid },
+            Role::Data {
+                tid: parameters.tid,
+            },
             frame.len(),
         )?;
         self.failed = false;
@@ -890,15 +957,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             })?;
             if let Some(reply) = reply {
                 if self.htt.source_ready()? {
-                    let id = self.htt.begin_transmit(
-                        htt::tx::Parameters {
-                            kind: htt::tx::Kind::Raw,
-                            vdev: 0,
-                            tid: 16,
-                            hardware_crypto: false,
-                        },
-                        &reply,
-                    )?;
+                    let parameters = self.reply_parameters(&reply)?;
+                    let id = self.htt.begin_transmit(parameters, &reply)?;
                     self.data.as_mut().ok_or(Error::Failed)?.pending.push(
                         id,
                         Role::Reply,
@@ -925,24 +985,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// `hardware` clears `HTT_DATA_TX_DESC_FLAGS0_NO_ENCRYPT` for a
     /// header-only MPDU under the firmware's current PTK; software-protected
     /// data and every EAPOL reply keep it (Linux `ATH10K_SKB_F_NO_HWCRYPT`).
-    async fn send_data(&mut self, frame: &[u8], reply: bool, hardware: bool) -> Result<u16, Error> {
-        let tid = tx_qos::descriptor_tid(frame);
-        let id = self
-            .htt
-            .transmit(
-                htt::tx::Parameters {
-                    kind: htt::tx::Kind::Raw,
-                    vdev: 0,
-                    tid,
-                    hardware_crypto: hardware,
-                },
-                frame,
-            )
-            .await?;
+    async fn send_data(
+        &mut self,
+        frame: &[u8],
+        reply: bool,
+        parameters: htt::tx::Parameters,
+    ) -> Result<u16, Error> {
+        let id = self.htt.transmit(parameters, frame).await?;
         let role = if reply {
             Role::Reply
         } else {
-            Role::Data { tid }
+            Role::Data {
+                tid: parameters.tid,
+            }
         };
         self.data
             .as_mut()
@@ -950,6 +1005,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .pending
             .push(id, role, frame.len())?;
         Ok(id)
+    }
+    /// An EAPOL reply is non-QoS (`HTT_DATA_TX_EXT_TID_NON_QOS_MCAST_BCAST`
+    /// 16). RAW sends the software form with `NO_ENCRYPT`; native WiFi sends
+    /// `pending_frame_device`, firmware-encrypted exactly when Protected
+    /// (`ath10k_tx_h_use_hwcrypto`).
+    fn reply_parameters(&self, reply: &[u8]) -> Result<htt::tx::Parameters, Error> {
+        let native_wifi = self.data.as_ref().ok_or(Error::Failed)?.native_wifi;
+        Ok(htt::tx::Parameters {
+            kind: if native_wifi {
+                htt::tx::Kind::Native
+            } else {
+                htt::tx::Kind::Raw
+            },
+            vdev: 0,
+            tid: 16,
+            hardware_crypto: native_wifi && reply.get(1).is_some_and(|fc| fc & 0x40 != 0),
+        })
     }
     /// Consume the same retained HTC/HTT owner used for join/teardown. Receive
     /// quiescence and a still-owned peer precede exposing any Ethernet batch.
@@ -1000,7 +1072,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let (idle, reply) = self.data_event(event, nonce)?;
         if let Some(reply) = reply {
-            checked_policy(self.send_data(&reply, true, false), validate).await?;
+            let parameters = self.reply_parameters(&reply)?;
+            checked_policy(self.send_data(&reply, true, parameters), validate).await?;
         }
         checked_policy(self.send_station_keys(), validate).await?;
         checked_policy(self.send_station_management(), validate).await?;
@@ -1275,7 +1348,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     // but no retained PPDU PHY proof crosses this boundary.
                     data.rx_ba.discard_ppdu();
                     let security = data.security.as_mut().ok_or(Error::Failed)?;
-                    security.reply_delivered(length).map_err(security_error)?;
+                    if data.native_wifi {
+                        security.reply_delivered_device(length)
+                    } else {
+                        security.reply_delivered(length)
+                    }
+                    .map_err(security_error)?;
                     // mac80211 set_key after the committing reply (PTK
                     // before GTK); programmed from the async data step.
                     data.keys.extend(security.take_key_installs());
@@ -1382,7 +1460,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let reply = if data.pending.reply_admissible() {
             data.security
                 .as_ref()
-                .and_then(Security::pending_frame)
+                .and_then(|security| {
+                    if data.native_wifi {
+                        security.pending_frame_device()
+                    } else {
+                        security.pending_frame()
+                    }
+                })
                 .map(wire::owned)
                 .transpose()?
         } else {
@@ -1467,7 +1551,7 @@ fn raw_frame_inner(
     let start = word(12);
     if attention & (1 << 31) == 0
         || attention & errors != 0
-        || word(28) & 0x300 != 0
+        || word(32) & 0x300 != 0
         || word(56) & 0xc000 != 0xc000
         || (word(24) & 0x3fff) as usize != msdu.payload.len()
         || start & 0x7ff != u32::from(peer)

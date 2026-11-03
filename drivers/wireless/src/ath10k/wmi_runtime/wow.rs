@@ -383,8 +383,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
     }
     /// `ath10k_wow_init`: TLV dialect, firmware WOWLAN feature and service.
-    /// The only NARF station owner is the RAW data owner, so that owner is
-    /// also required before anything is advertised.
+    /// The station data owner (RAW, or native WiFi with hardware keys on
+    /// TLV firmware without `RAW_MODE_SUPPORT`) is also required before
+    /// anything is advertised.
     pub(in crate::ath10k) fn wowlan_support(&self) -> Option<WowlanSupport> {
         let caps = self.htt.wmi.caps.as_ref()?;
         (self.wire.dialect == Dialect::Tlv

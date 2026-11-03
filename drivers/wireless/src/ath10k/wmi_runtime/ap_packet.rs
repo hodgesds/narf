@@ -85,7 +85,7 @@ impl Session {
             || start & 0x7ff != u32::from(id)
             || start & 0x1800 != 0x1000
             || attention & (1 << 9) != 0
-            || word(28) & 0x300 != 0
+            || word(32) & 0x300 != 0
             || word(56) & 0xc000 != 0xc000
             || (word(24) & 0x3fff) as usize != msdu.payload.len()
             || word(20) >> 28 != u32::from(if tid == 16 { 0 } else { tid })
