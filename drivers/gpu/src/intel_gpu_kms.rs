@@ -327,10 +327,19 @@ impl Physical {
         else {
             return Ok(None);
         };
+        // detect_bar2_integrated reads GSCPSMI_BASE only for a media GT
+        // that takes Wa_14019821291 (media_gt && XE_GT_WA(media_gt, ..)).
+        let media_gmd_id = self.read32(dsm::MEDIA_GMD_ID);
+        let gscpsmi_base = if dsm::wa_14019821291(media_gmd_id) == Ok(true) {
+            self.read64(dsm::MEDIA_GSCPSMI_BASE)
+        } else {
+            0
+        };
         let layout = dsm::layout(dsm::Facts {
             ggc: self.read32(dsm::GGC),
             stolen_reserved_lo: self.read32(dsm::STOLEN_RESERVED),
-            gscpsmi_base: self.read64(dsm::MEDIA_GSCPSMI_BASE),
+            media_gmd_id,
+            gscpsmi_base,
             gmadr_base,
             gmadr_len,
             bsm_dw0,

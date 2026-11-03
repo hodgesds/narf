@@ -10,11 +10,17 @@
 //!   DSM begins 8 MiB above GSMBASE (`io_base` = BAR2 + 8 MiB); GMS 0..4
 //!   gives 32 MiB units, 0xF0..0xFE 4 MiB units; the WOPCM at the top is
 //!   carved off by `STOLEN_RESERVED` (0x1082C0) bits 9:7
-//!   (`get_wopcm_size`); and when the BIOS applied Wa_14019821291
-//!   (`MEDIA_VERSION_RANGE(1300, 2000)`, MTL media 13.00), everything from
-//!   the media GT's `GSCPSMI_BASE` (0x880C + GSI offset 0x380000, low six
-//!   bits masked) up is carved off too. `xe_stolen_insert_node_in_range`
-//!   never places below 4 KiB.
+//!   (`get_wopcm_size`); and when the BIOS applied Wa_14019821291,
+//!   everything from the media GT's `GSCPSMI_BASE` (0x880C + GSI offset
+//!   0x380000, low six bits masked) up is carved off too. Linux checks the
+//!   workaround as `media_gt && XE_GT_WA(media_gt, 14019821291)`
+//!   (`xe_wa_oob.rules`: `MEDIA_VERSION_RANGE(1300, 2000)`, inclusive per
+//!   `xe_rtp.h`): `xe_pci.c::handle_gmdid` / `alloc_media_gt` create a
+//!   media GT only for a non-zero media `GMD_ID` (read at 0xD8C + GSI
+//!   offset) whose version is a known `media_ips` entry, so the carve
+//!   applies exactly for media 13.00, 13.01 and 20.00 ([`wa_14019821291`]);
+//!   otherwise `GSCPSMI_BASE` is never read or used.
+//!   `xe_stolen_insert_node_in_range` never places below 4 KiB.
 //! - `arch/x86/kernel/early-quirks.c::gen11_stolen_base` and
 //!   `include/drm/intel/i915_drm.h`: the DSM physical base is PCI config
 //!   `INTEL_GEN11_BSM_DW0/1` (0xC0/0xC4), DW0 masked to 1 MiB.
@@ -63,6 +69,10 @@ pub const WOPCM_SIZE_SHIFT: u32 = 7;
 pub const MEDIA_GT_GSI_OFFSET: u64 = 0x380000;
 /// `GSCPSMI_BASE` as the media GT addresses it (0x880C + GSI offset).
 pub const MEDIA_GSCPSMI_BASE: u64 = MEDIA_GT_GSI_OFFSET + 0x880C;
+/// The media GT's `GMD_ID` (0xD8C + GSI offset, `read_gmdid`).
+pub const MEDIA_GMD_ID: u64 = MEDIA_GT_GSI_OFFSET + 0xD8C;
+/// `xe_pci.c::media_ips` versions (verx100).
+const MEDIA_IPS: [u16; 7] = [1300, 1301, 2000, 3000, 3002, 3500, 3503];
 /// DSMBASE = GSMBASE + 8 MiB.
 pub const DSM_GSM_OFFSET: u64 = 8 << 20;
 /// `INTEL_GEN11_BSM_DW0` / `DW1` (PCI config).
@@ -129,12 +139,28 @@ pub fn wopcm_bytes(stolen_reserved_lo: u32) -> Result<u64, StolenError> {
     }
 }
 
+/// `media_gt && XE_GT_WA(media_gt, 14019821291)` from the media
+/// `GMD_ID`: a media GT exists for a non-zero, known media IP version
+/// (`handle_gmdid`, `alloc_media_gt`), and the workaround matches media
+/// 13.00..=20.00. An all-ones read is `Unavailable`.
+pub fn wa_14019821291(media_gmd_id: u32) -> Result<bool, StolenError> {
+    if media_gmd_id == u32::MAX {
+        return Err(StolenError::Unavailable);
+    }
+    let version = crate::intel_gpu_gt::media::MediaIp::decode(media_gmd_id).version;
+    Ok(MEDIA_IPS.contains(&version) && (1300..=2000).contains(&version))
+}
+
 /// The register facts discovery consumes (all read by the caller).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Facts {
     pub ggc: u32,
     pub stolen_reserved_lo: u32,
-    /// `GSCPSMI_BASE`, 64-bit, as read through the media GT window.
+    /// The media GT's `GMD_ID` ([`MEDIA_GMD_ID`]); 0 when media is fused
+    /// off.
+    pub media_gmd_id: u32,
+    /// `GSCPSMI_BASE`, 64-bit, as read through the media GT window; only
+    /// consulted when [`wa_14019821291`] applies.
     pub gscpsmi_base: u64,
     /// BAR2 (GMADR) bus base and length.
     pub gmadr_base: u64,
@@ -167,11 +193,13 @@ pub fn layout(facts: Facts) -> Result<Layout, StolenError> {
     let wopcm = wopcm_bytes(facts.stolen_reserved_lo)?;
     let mut usable = total.checked_sub(wopcm).ok_or(StolenError::NoSpace)?;
     let io_base = facts.gmadr_base + DSM_GSM_OFFSET;
-    let gsc_base = facts.gscpsmi_base & !0x3F;
     let mut gsc = 0;
-    if gsc_base >= io_base && gsc_base < io_base + usable {
-        gsc = io_base + usable - gsc_base;
-        usable = gsc_base - io_base;
+    if wa_14019821291(facts.media_gmd_id)? {
+        let gsc_base = facts.gscpsmi_base & !0x3F;
+        if gsc_base >= io_base && gsc_base < io_base + usable {
+            gsc = io_base + usable - gsc_base;
+            usable = gsc_base - io_base;
+        }
     }
     if usable + DSM_GSM_OFFSET > facts.gmadr_len {
         return Err(StolenError::ApertureTooSmall);

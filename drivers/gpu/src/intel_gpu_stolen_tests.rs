@@ -6,12 +6,16 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 const MIB: u64 = 1 << 20;
 const GMADR: u64 = 0x40_0000_0000;
+/// Media GMD_ID 13.00 (Xe_LPM+, Meteor/Arrow Lake), revid 4: arch 31:22,
+/// release 21:14.
+const MEDIA_13_00: u32 = (13 << 22) | 4;
 
 /// GGMS=3, GMS=0x02 (64 MiB); WOPCM field 2 (4 MiB); no GSC carve-out.
 fn facts() -> Facts {
     Facts {
         ggc: (0x02 << GMS_SHIFT) | GGMS_MASK,
         stolen_reserved_lo: 2 << WOPCM_SIZE_SHIFT,
+        media_gmd_id: MEDIA_13_00,
         gscpsmi_base: 0,
         gmadr_base: GMADR,
         gmadr_len: 256 * MIB,
@@ -83,6 +87,7 @@ fn smoke_stolen_discovery_decodes_pinned_fields() -> TestResult {
     if GGC != 0x108040
         || STOLEN_RESERVED != 0x1082C0
         || MEDIA_GSCPSMI_BASE != 0x38880C
+        || MEDIA_GMD_ID != 0x380D8C
         || PCI_BSM_DW0 != 0xC0
         || GGTT_PTE_DM != 2
     {
@@ -284,4 +289,52 @@ fn smoke_stolen_carve_slot_polls_without_blocking() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_stolen",
     smoke_stolen_carve_slot_polls_without_blocking
+);
+
+fn smoke_stolen_gsc_carve_follows_media_gt_workaround() -> TestResult {
+    // A BIOS-applied GSC region at DSM + 52 MiB.
+    let gsc = GMADR + DSM_GSM_OFFSET + 52 * MIB;
+    let usable = |media_gmd_id| {
+        layout(Facts {
+            media_gmd_id,
+            gscpsmi_base: gsc,
+            ..facts()
+        })
+        .map(|l| (l.usable, l.gsc))
+    };
+    // XE_GT_WA(media_gt, 14019821291): MEDIA_VERSION_RANGE(1300, 2000),
+    // inclusive, on a media GT xe_pci.c creates (a known media_ips
+    // version). Revid bits never matter.
+    for (gmd, carved) in [
+        (MEDIA_13_00, true),
+        ((13 << 22) | (1 << 14), true),   // 13.01 Xe2_HPM
+        (20 << 22, true),                 // 20.00 Xe2_LPM
+        (0, false),                       // media fused off: no media GT
+        (30 << 22, false),                // 30.00: outside the range
+        ((13 << 22) | (50 << 14), false), // 13.50: no media_ips entry
+        ((12 << 22) | (55 << 14), false), // 12.55: below MEDIA_VER 13
+    ] {
+        if wa_14019821291(gmd) != Ok(carved) {
+            return TestResult::Fail("Wa_14019821291 must follow the media GT version");
+        }
+        let want = if carved {
+            (52 * MIB, 8 * MIB)
+        } else {
+            (60 * MIB, 0)
+        };
+        if usable(gmd) != Ok(want) {
+            return TestResult::Fail("without a qualifying media GT GSCPSMI_BASE is ignored");
+        }
+    }
+    // An unreadable media GMD_ID cannot decide the carve.
+    if wa_14019821291(u32::MAX) != Err(StolenError::Unavailable)
+        || usable(u32::MAX) != Err(StolenError::Unavailable)
+    {
+        return TestResult::Fail("an all-ones media GMD_ID must refuse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_stolen",
+    smoke_stolen_gsc_carve_follows_media_gt_workaround
 );
