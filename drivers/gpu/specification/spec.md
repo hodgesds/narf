@@ -8262,10 +8262,12 @@ and Mesa rendering-to-scanout acceptance are separate gates.
 modes admit legacy CURSOR/CURSOR2 with linear 64x64 ARGB8888. This profile does
 not advertise universal cursor planes or HOTSPOT support. Pipe-off setup owns
 and verifies the PM_DEMAND acknowledgement (conservative bandwidth 0xffff,
-no SAGV, current CDCLK/voltage and DDI/PHY/PLL/scaler resource counts), four
-powered DBUF slices, joined MBUS/tracker/DBOX credits, IPC, and disjoint
-primary/cursor DDB allocations and source-latency watermarks. Partial setup
-failure aborts before pipe enable; unqualified modes retain cursor refusal.
+no SAGV, computed CDCLK/voltage and DDI/PHY/PLL/scaler resource counts), the
+computed CDCLK (raised or lowered), four powered DBUF slices, joined
+MBUS/tracker/DBOX credits, IPC, and disjoint primary/cursor DDB allocations
+and display-14 source-latency watermarks. Partial setup failure restores the
+captured resource registers and aborts before pipe enable; unqualified modes
+retain cursor refusal.
 Runtime capture rechecks exact resources, fixed timing and every other pipe,
 including an active blank pipe, before using this ownership proof.
 

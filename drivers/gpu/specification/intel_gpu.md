@@ -1487,9 +1487,12 @@ Xe-LPD well topology (`PWR_WELL_CTL2` = 0x45404,
 PW_1 (idx 0, transcoder A + DDI A/B) → PW_A (idx 5, pipe A) →
 the port's AUX well. CDCLK runs on the fixed 38.4 MHz MTL
 reference: six rungs (172.8–652.8 MHz), the two lowest reached
-by squash waveforms programmed in `CDCLK_SQUASH_CTL`; the
-modeset raises CDCLK to the `pixel_clock ≤ 2 × CDCLK` floor
-and never lowers a faster firmware setting. The current-CDCLK
+by squash waveforms programmed in `CDCLK_SQUASH_CTL`. A qualified
+display14.00 modeset with every pipe off programs the CDCLK its
+resource transaction computes, raising or lowering it (§20,
+"Display14 resource transactions"); the inherited path raises CDCLK
+to the `pixel_clock ≤ 2 × CDCLK` floor and never lowers a faster
+firmware setting. The current-CDCLK
 readback decodes ratio + divider + squash popcount — under
 squash the CDCLK_CTL decimal field is nominal and is not
 trusted.
@@ -1507,11 +1510,14 @@ trusted.
   0x40000/0x40000 plus the TC block at 0x16F000/0x1000, and
   **no DPLL region** (Xe-LPG has no DPLL block; Gen12's DPLL
   range is the TC block here).
-- Not programmed by this lane: watermark / DBUF allocation
-  (i915 computes MTL allocations from pcode latency tables;
-  firmware's allocation is retained), HDMI PLL states, DP 2.0
-  UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe,
-  DVFS/pcode notifications around CDCLK changes, and
+- Not programmed by this lane: watermark / DBUF allocation and
+  PM demand outside a qualified display14.00 all-pipes-off modeset
+  (that case runs the display14 resource transaction of §20; other
+  cases retain firmware's allocation), HDMI PLL states, DP 2.0
+  UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe
+  enables, CDCLK notifications on the inherited path (display 14
+  has no PCODE CDCLK mailbox; only the owned transaction sends
+  PM demand), and
   per-iteration TX-level updates inside the DPCD training loop
   (would need a source-side callback in the shared
   `dp_link_training`; levels are staged before training and
@@ -2278,7 +2284,7 @@ production feature. Unsupported functionality remains unadvertised.
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
-| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; modeset resource transactions |
+| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 all-pipes-off resource transaction landed (owned single-pipe entry, four-pipe computation); live-pipe repartitioning, SAGV/QGV, bigjoiner, DSC, VRR and multi-pipe enables remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
@@ -3461,3 +3467,44 @@ skips. The only skip is the existing shared RNG-registration skip. Group 6 now
 also selects `drivers/gpu/intel_gpu_dc_states`. The release production boot and
 both btrfs postflights pass. The debug group pass is deferred to the end of the
 current integration wave.
+
+### Display14 resource transactions — software slice
+
+Qualified display14.00 (Meteor/Arrow Lake) modesets now compute and own
+their display resources instead of reusing a fixed profile. The computation
+transcribes Linux b90c984d: display-14 watermark latencies and SAGV block
+time from the MTL latency registers (read latency 6 µs, 255-line limit),
+linear/X/Tile4 levels, transition and SAGV watermarks, the 256-pixel
+cursor DDB budget and the vblank prefill limit; DBUF slice selection and
+MBUS joining from the ADL-P/MTL table for up to four pipes, hdisplay-weighted
+pipe DDB, proportional plane DDB with level search, post-allocation checks and
+the disabled-level copy workaround; minimum CDCLK from pixel rate, plane,
+pipe-bandwidth and DBUF-bandwidth floors with port voltage levels; and PM
+demand parameters. Gen12 watermark results are unchanged.
+
+The commit requires every pipe, plane, cursor, DSB and FBC to be off. It
+follows the source order: PM demand at max(old, new), the final CDCLK
+(crawl, squash or crawl+squash through the 307.2 MHz midpoint, or a full PLL
+relock when the firmware clock is unknown), DBUF slice power, MBUS join with
+DBOX credits and trackers, every plane/cursor WM and DDB register, then the
+new PM demand. Each step is checked by readback or acknowledgement. Any
+failure restores the touched registers in reverse order, the original clock
+before its PM demand; if restoration fails, the raised PM demand stays. The
+pipe stays off either way. The owned modeset uses a single Pipe-A request
+(primary plus budgeted hidden cursor) and reserves the HBR3 port clock it
+may enable before training, which also sets voltage level 1. CDCLK may now
+fall below a faster firmware clock. The multi-pipe
+computation is real, but a modeset that enables several pipes is not yet
+wired. Nothing is advertised beyond the existing single-pipe profile.
+
+Refused or not implemented: repartitioning with any pipe live (Linux's
+vblank-ordered DDB updates), enabling SAGV (QGV peak bandwidth stays 0xffff,
+so DRAM QGV derating is not modelled), scalers, planar formats, async-flip
+minimum watermarks, bigjoiner, DSC, VRR and Xe2+ clock/MDCLK changes.
+Requests outside the qualified bounds are refused before any write and keep the
+inherited path. Thirteen new native fixtures cover latency decoding, levels
+and refusals, vblank limiting, DBUF tables, multi-pipe DDB, CDCLK plans and
+crawl acknowledgement, PM demand bracketing, a two-pipe commit, restoration and
+the production modeset. One existing fail-closed fixture now pins the full
+source CDCLK relock and its restoration instead of the old raise-only
+writes. These are native register models; silicon acceptance is unrun.
