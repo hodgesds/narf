@@ -196,6 +196,43 @@ pub fn capture() {
 // unaccounted for. The entries below are updated to the verified set;
 // the fixture still asserts exact-set, exact-order equality.
 //
+// CORRECTION (2026-11-03, rebase onto origin/main c3e2bc171): the
+// baseline again predates merges that landed on main after the
+// 2026-10-31 refresh — Subsys recorded 157 where the snapshot
+// composes 160, and Late recorded 70 where the snapshot composes
+// 73. Each delta name is accounted for by a named, already-merged
+// PR, verified against the registration sites on main and the
+// crate call order in frame's boot sequence: PR #1238 (#920,
+// commit 1350fc662) added `usb-fp-devfs` at Subsys (directly after
+// `usb-ccid-devfs`, its registration order in
+// `drivers/usb/src/lib.rs`); PR #1189 (CDC-ACM bundle, merge
+// c3e2bc171) added `usb-cdc-acm-devfs` at Subsys (directly after
+// `usb-fp-devfs`); PR #1239 (#922, commit 97e566fba) added
+// `usb-fp-lifecycle` at Subsys (directly after `usb-msc`);
+// PR #1278 (Ethernet Realtek stream, commits 37c71b536/783c6e38f)
+// added `rtl8125-phy-firmware` and `rtl8126-phy-firmware` at Late
+// (directly after `rtl8127-phy-firmware`, in
+// `register_late_firmware_initcalls` order in
+// `drivers/net/src/lib.rs` — both are net-group-owned, so they
+// join `NET_GROUP_NAMES` below); PR #1344 (#1214, commit
+// 82c36d0e8) added `amdgpu-dp-bridge` at Late (directly after
+// `amdgpu-usbc`, its registration order in
+// `drivers/gpu/src/lib.rs`, under the `amdgpu` feature that the
+// default/all build enables). The delta was verified three ways:
+// a full-tree multiset diff of all three registration shapes
+// (`narf_init::register`, multi-line `register`, and
+// `register_with_budget`) between the refresh base (09349c2e)
+// and the current tip (exactly these six additions, no removals
+// or renames), a per-file ordered register-call diff over every
+// registration-site file (only `drivers/usb`, `drivers/net`, and
+// `drivers/gpu` changed, each by pure insertion), and a bare_main
+// call-order diff (identical). No other stage diverged, and no
+// delta name is unaccounted for. The entries below are updated to
+// the verified set; the fixture still asserts exact-set,
+// exact-order equality. CI on the rebased head is the judge: if
+// the census smoke fails there, this correction is wrong, not
+// the snapshot.
+//
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -278,12 +315,15 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "usb-serial-devfs",
         "usb-serial-pm",
         "usb-ccid-devfs",
+        "usb-fp-devfs",
+        "usb-cdc-acm-devfs",
         "usb-uac",
         "usb-uvc",
         "usb-r8152",
         "usb-cdc-ncm",
         "usb-cdc-ecm",
         "usb-msc",
+        "usb-fp-lifecycle",
         "usb-xpad",
         "xhci",
         "ehci",
@@ -373,7 +413,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "itco_wdt",
         "pl011",
         "psmouse",
-    ], // subsys: 157
+    ], // subsys: 160
     &[
         "modules-sysfs",
         "devfs-mount",
@@ -427,6 +467,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "intel-gpu-dp-bridge",
         "intel-gpu-gt",
         "amdgpu-usbc",
+        "amdgpu-dp-bridge",
         "virtio-gpu-drm-card",
         "bochs-drm-card",
         "drm-devfs-bridge",
@@ -459,6 +500,8 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "firmware-scan-rootfs",
         "btintel-pcie-firmware",
         "rtl8127-phy-firmware",
+        "rtl8125-phy-firmware",
+        "rtl8126-phy-firmware",
         "bluetooth-bringup",
         "measured-boot",
         "fb-console-install",
@@ -477,7 +520,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "virtio-gpu-splash",
         "mt76-firmware",
         "amdgpu-discrete-firmware",
-    ], // late: 70
+    ], // late: 73
 ];
 
 /// The recorded baseline for the running arch, if one has been
@@ -492,8 +535,9 @@ const BASELINE: Option<&[&[&str]; 8]> = None;
 /// Names the net facade registers when frame's `drivers-net` group
 /// is selected: the fifteen per-driver Subsys registrations from
 /// `narf_drivers_net::register_initcalls` (in the facade's own
-/// order) plus the Late RTL8127 PHY-firmware patch from
-/// `register_late_firmware_initcalls`. Must follow the facade; if a
+/// order) plus the Late Realtek PHY-firmware patches from
+/// `register_late_firmware_initcalls` (rtl8127, then rtl8125, then
+/// rtl8126, in that function's order). Must follow the facade; if a
 /// driver is added there, add its name here *and* regenerate the
 /// baseline in the same change — the fixture failing is the
 /// reminder. (`qemu-static-ipv4` is absent on purpose: only QEMU
@@ -515,6 +559,8 @@ const NET_GROUP_NAMES: &[&str] = &[
     "bnxt",
     "enic",
     "rtl8127-phy-firmware",
+    "rtl8125-phy-firmware",
+    "rtl8126-phy-firmware",
 ];
 
 /// Names the storage facade registers when frame's
