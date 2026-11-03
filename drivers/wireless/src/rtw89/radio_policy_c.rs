@@ -35,7 +35,7 @@ const BASE_FLAGS: u8 = 3;
 /// Optional operating programs a C base record may enable (byte 57, the
 /// B `radio_policy::Program` bit layout and dependencies). Only programs
 /// whose whole C path exists are admitted; the others stay refused.
-pub(super) const PROGRAMS: [Program; 2] = [Program::Wmm, Program::FirmwareRa];
+pub(super) const PROGRAMS: [Program; 3] = [Program::Wmm, Program::QosAll, Program::FirmwareRa];
 fn programs_valid(flags: u8) -> bool {
     let known = PROGRAMS.iter().fold(BASE_FLAGS, |m, p| m | p.bit());
     Program::valid(flags) && flags & !known == 0
@@ -52,6 +52,13 @@ fn extend(program: Program, identity: [u8; 32]) -> [u8; 32] {
             );
             hash.update(&identity);
             hash.update(&super::station_control::wmm_fingerprint());
+        }
+        Program::QosAll => {
+            hash.update(
+                b"NARF RTL8852C WMM all-AC TID0..7 optional operating recipe v1;txwd_body_v1;ach0..3_v1",
+            );
+            hash.update(&identity);
+            hash.update(&super::station_control::qos_all_fingerprint());
         }
         Program::FirmwareRa => {
             hash.update(

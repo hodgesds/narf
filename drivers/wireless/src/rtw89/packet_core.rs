@@ -195,7 +195,7 @@ struct Submission<'a> {
 }
 pub(super) struct Core {
     phase: Phase,
-    /// RTL8852B or RTL8852C (ordinary BE/MGMT station only).
+    /// RTL8852B or RTL8852C (ordinary station rings only).
     chip: ChipId,
     own: [u8; 6],
     mac_id: u8,
@@ -344,8 +344,12 @@ impl Core {
             || own[0] & 1 != 0
             || mac_id != 0
             || !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
-            // C: only the ordinary BE0/MGMT8 station rings (no AP/QoS program).
-            || chip == ChipId::Rtl8852C && (ap || queues != format::Queue::ordinary(false))
+            // C: the ordinary station rings only (BE0/MGMT8, plus ACH1..3
+            // under the signed C all-AC QoS program); no AP role.
+            || chip == ChipId::Rtl8852C
+                && (ap
+                    || queues != format::Queue::ordinary(false)
+                        && queues != format::Queue::ordinary(true))
         {
             return Err(Error::Packet);
         }

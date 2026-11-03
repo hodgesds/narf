@@ -259,7 +259,7 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans
 );
-fn smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only() -> TestResult {
+fn smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra() -> TestResult {
     let exact = board(Profile::INITIAL, 7);
     let cap = authority();
     let flags = Program::FirmwareRa.flags();
@@ -295,9 +295,26 @@ fn smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only() -> TestRes
         bad[57] = flags;
         bad[16..48].copy_from_slice(&exact.with_programs(flags).identity);
         let accepted = Qualification::from_verified(&bad, Some([3; 32]), exact, cap).is_ok();
-        if accepted != (flags == Program::Wmm.flags()) {
+        if accepted != (flags == Program::Wmm.flags() || flags == Program::QosAll.flags()) {
             return TestResult::Fail("C program flag admission differs");
         }
+    }
+    // All-AC QoS (requires WMM) extends after WMM and before firmware RA.
+    let all = Program::QosAll.flags() | Program::FirmwareRa.bit();
+    let mut qos = base_image(exact);
+    qos[57] = all;
+    qos[16..48].copy_from_slice(&exact.with_programs(all).identity);
+    match Qualification::from_verified(&qos, Some([3; 32]), exact, cap) {
+        Ok(mut q) => {
+            q.model_domain = base(cap).model_domain;
+            if q.allows(Program::QosAll) != Ok(true) || !q.matches(exact) {
+                return TestResult::Fail("signed C all-AC QoS program not allowed");
+            }
+        }
+        Err(_) => return TestResult::Fail("signed C WMM + all-AC QoS + RA record refused"),
+    }
+    if exact.with_programs(all).identity == exact.with_programs(flags).identity {
+        return TestResult::Fail("all-AC QoS did not extend the C identity");
     }
     let plain = base(cap);
     if plain.allows(Program::Wmm) != Ok(false) {
@@ -311,5 +328,5 @@ fn smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only() -> TestRes
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only
+    smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra
 );

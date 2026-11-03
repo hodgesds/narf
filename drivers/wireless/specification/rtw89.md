@@ -3441,8 +3441,9 @@ and no DFS/NO_IR rule over the span), and station retune/CSA go through
 
 Known gaps for the `rtl8852c` row: native execution on hardware (no C
 board record exists, so actual admission needs a provisioned board);
-HT/VHT/HE, A-MPDU/BA (C `bacam_num` 8 dynamic BA CAM), firmware RA, WMM,
-LPS, WoW, monitor and AP are not implemented for C (C track work covers
+HT/VHT/HE, A-MPDU/BA (C `bacam_num` 8 dynamic BA CAM),
+LPS, WoW, monitor and AP are not implemented for C (WMM, all-AC QoS and
+firmware RA: see below) (C track work covers
 DIG/CFO/EDCCA/IFS-CLM, not `rtw8852c_rfk_track`). The C station uses 20MHz only (wide C profiles are reachable
 only through `retune_channel_c`, not from the station). Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
@@ -3498,11 +3499,11 @@ C-domain recipe (`radio_policy_c::extend`, the common AX station
 `wmm_fingerprint`/`firmware_ra_fingerprint`), so a record authorizes
 exactly the programs it was measured with; `Qualification::matches`
 compares against the extended identity and `allows(program)` reports the
-signed flag under current authority. HT/HE/A-MPDU/all-AC QoS bits are
-refused on C, as are unknown bits and unmet dependencies; `N5CC` channel
+signed flag under current authority. HT/HE/A-MPDU bits are
+refused on C (all-AC QoS: below), as are unknown bits and unmet dependencies; `N5CC` channel
 records keep flags 3 and bind to the (extended) base identity.
 `Native::station_{wmm,firmware_ra}_allowed` on C read these flags
-(`c_program`); HT/HE/A-MPDU/A-MSDU/all-AC QoS stay `Ok(false)`. The WMM
+(`c_program`); HT/HE/A-MPDU/A-MSDU stay `Ok(false)`. The WMM
 station TX path on C is QoS BE/TID0 data: `tx_transport::prepare_header`
 admits QoS data on C without A-MSDU (no +HTC), and
 `packet_format::transmit_c` builds it with `rtw89_core_fill_txdesc_v1`
@@ -3511,9 +3512,28 @@ v0 positions; no aggregation). EDCA (`H2C_FUNC_USR_EDCA`) and the RA H2C
 (`rtw89_fw_h2c_ra`, `chip_gen` AX) are the same AX formats as B. An
 unprovisioned board, or a C record without the bits, keeps the legacy
 station. Unexecuted case:
-`smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only`
+`smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra`
 (plus the extended `smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info`
 and `smoke_rtw89_native_rejects_unsupported_extents`).
+
+**C all-AC QoS (`Program::QosAll` on C).** `radio_policy_c::PROGRAMS` now
+also admits bit 3 `QosAll` (requires `Wmm`), extended between WMM and
+firmware RA with the C recipe over `station_control::qos_all_fingerprint`.
+With the signed bit, `Native::station_qos_all_allowed` on C reads
+`c_program(QosAll)` and `packet_core::Core::prepare_role` accepts C's
+`Queue::ordinary(true)` set: ACH1..3 (BK/VI/VO) at the
+`rtw89_pci_ch_dma_addr_set_v1` DESA `R_AX_ACH{1,2,3}_TXBD_DESA_L_V1`
+(0x1238/0x1240/0x1248) with the shared `R_AX_ACHn_TXBD_NUM`; the C HFC
+(`rtw8852c_hfc_chcfg_pcie`) already gives every ACH0..3 13/1614 pages, C's
+`tx_dma_ch_mask` is 0 and `R_AX_HAXI_DMA_STOP1` (0x1010) carries the same
+ACH0..3/CH8/WPDMA bits, so `STOP_ALL` and the open mask are unchanged.
+TID -> AC/QSEL/CH_DMA, `TID_INDICATE` (v1 body2 with `sec_en` false), the
+strict-priority drain and `admit_all_tids` are the B code: core.c
+`rtw89_core_get_qsel`/`rtw89_core_get_ch_dma` are not chip-specific for AX.
+An unprovisioned board or a record without bit 3 keeps BE/TID0. B bytes are
+unchanged. Unexecuted cases:
+`smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra`,
+`smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs`.
 
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s
