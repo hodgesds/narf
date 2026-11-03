@@ -784,3 +784,52 @@ kernel_test_in!(
 
 #[path = "station_security_fragment_tests.rs"]
 mod fragment_tests;
+
+fn smoke_station_suspend_floors_match_keys_and_consume_nothing() -> TestResult {
+    if security().suspend_floors().is_some() || security().suspend_keys().is_some() {
+        return TestResult::Fail("unsettled port produced a suspend snapshot");
+    }
+    let mut s = established();
+    let p = ptk(AN, SN);
+    let (Some(keys), Some(before)) = (s.suspend_keys(), s.suspend_floors()) else {
+        return TestResult::Fail("settled port refused the suspend snapshot");
+    };
+    let key_ids: Vec<u8> = keys.groups.iter().map(|(id, _)| *id).collect();
+    let floor_ids: Vec<u8> = before.groups.iter().map(|(id, _)| *id).collect();
+    if key_ids != floor_ids || key_ids != [2] || before.pairwise_tx != 0 || before.pairwise_rx != 0
+    {
+        return TestResult::Fail("floors do not name the key set");
+    }
+    let group_floor = before.groups[0].1;
+    let mut plain = native(&[0x45; 20], false);
+    plain[30..32].copy_from_slice(&0x0800u16.to_be_bytes());
+    if !matches!(
+        s.receive(&mpdu(encrypt(&plain, &p.tk, 7, 0)), [0; 32]),
+        Ok(Rx::Data(_))
+    ) {
+        return TestResult::Fail("valid PTK data refused");
+    }
+    let mut eth = vec![2, 0, 0, 0, 0, 3];
+    eth.extend_from_slice(&OWN);
+    eth.extend_from_slice(&[0x08, 0x00, 1, 2, 3]);
+    if s.transmit_ethernet(&eth).map(|w| w[24..32].to_vec()) != Ok(vec![1, 0, 0, 0x20, 0, 0, 0, 0])
+    {
+        return TestResult::Fail("first transmit PN");
+    }
+    let Some(after) = s.suspend_floors() else {
+        return TestResult::Fail("floors vanished after traffic");
+    };
+    if after.pairwise_rx != 7 || after.pairwise_tx != 1 || after.groups != [(2, group_floor)] {
+        return TestResult::Fail("floors do not track the highest accepted/used PN");
+    }
+    // Reading the snapshot consumed no PN: the next frame still uses 2.
+    if s.transmit_ethernet(&eth).map(|w| w[24..32].to_vec()) != Ok(vec![2, 0, 0, 0x20, 0, 0, 0, 0])
+    {
+        return TestResult::Fail("suspend snapshot consumed a transmit PN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_suspend_floors_match_keys_and_consume_nothing
+);

@@ -13,6 +13,7 @@ use crate::rtw89::{
     power,
     secure::Blacklist,
     station_control::Admission,
+    wow_security::Keys,
 };
 
 /// State that lives exactly as long as the WoW image runs.
@@ -134,6 +135,8 @@ impl Startup {
         controller
             .restore(&mut native.station_access(), cam, admission)
             .await?;
+        // `rtw89_mac_hw_mgnt_sec(rtwdev, wow)` closes `rtw89_wow_swap_fw`.
+        native.wow_mgnt_sec(wow)?;
         if !wow {
             // The normal image's general packets are the LPS owner's to
             // reinstall in the fresh namespace (`rtw89_fw_h2c_general_pkt`
@@ -148,5 +151,69 @@ impl Startup {
         native.wow_general_packets(&mut packets, admission).await?;
         self.wow = Some(Window { packets });
         Ok(())
+    }
+    /// The security CAM entries of the snapshot, written by the running
+    /// normal image after `wow_trx_enter_pre` and before `wow_swap_in`, as
+    /// Linux's keys reached the CAM at association (`rtw89_cam_sec_key_add`).
+    /// The WoW address CAM passed to `wow_swap_in` then attaches them.
+    pub(in crate::rtw89) async fn wow_keys_in(
+        &mut self,
+        keys: &Keys,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        self.wow_station_ready()?;
+        if self.wow.is_some() {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            attempt
+                .owner_mut()
+                .station_native()?
+                .wow_sec_cam(&keys.entries, false, admission)
+                .await
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    /// After `wow_swap_out` (plain associated CAM, management decryption
+    /// off): overwrite every written entry with a zero key and prove
+    /// `B_AX_{UC,BMC}_MGNT_DEC` clear again, so host CCMP/BIP alone sees
+    /// RX once `wow_trx_leave_post` reopens the filters. Linux keeps its
+    /// hardware keys; NARF's awake path never had any.
+    pub(in crate::rtw89) async fn wow_keys_out(
+        &mut self,
+        keys: &Keys,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = attempt.owner_mut();
+            if owner.wow.is_some() {
+                return Err(power::Error::Terminal);
+            }
+            owner.wow_station_ready()?;
+            let native = owner.station_native()?;
+            native.wow_sec_cam(&keys.entries, true, admission).await?;
+            native.wow_mgnt_sec(false)
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    /// The WoW address CAM (`rtw89_cam_fill_addr_cam_info` with
+    /// `wowlan_pattern`/`wowlan_magic` and the security entries) on the
+    /// plain associated body `commit_peer` installed.
+    pub(in crate::rtw89) fn wow_cam(
+        &self,
+        keys: &Keys,
+        pattern: bool,
+        magic: bool,
+    ) -> Option<[u8; 60]> {
+        let base = self.station_controller.as_ref()?.associated_cam()?;
+        Some(crate::rtw89::wow_security::wow_cam(
+            &base, keys, pattern, magic,
+        ))
     }
 }

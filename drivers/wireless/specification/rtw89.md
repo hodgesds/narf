@@ -1919,6 +1919,29 @@ attempt (Linux retries five times); any failure after resolving the plan
 terminalizes the Startup for the cold path. Unexecuted case:
 `smoke_rtw89_wcpu_wow_swap_requires_swappable_running_owner`.
 
+**WoW security CAM (`wow_security.rs`) — implemented, unexecuted.**
+`wow_security::plan(suspend_keys, suspend_floors)` mirrors
+`cam.c::rtw89_cam_sec_key_install` for the snapshot as the keys reached
+the hardware at association: the PTK at security CAM 0 / address slot 0
+(key id 0), each GTK at the next CAM index and the next `SEC_NORMAL` group
+slot 2..=4 with its key id; IGTK never (BIP stays on the host). The
+`KeyInfo` of `rtw89_wow_construct_key_info` takes CCMP-128 IVs from the
+floors (`ptk_tx_iv`, `ptk_rx_iv`, `gtk_rx_iv[keyidx]`), `gtk_keyidx` from
+the last group key, `RTW89_WOW_VALID_CHECK` and both symbol checks; an
+open BSS writes nothing (`ptk_alg`/`gtk_alg` 0). `wow_security::wow_cam`
+fills `rtw89_cam_fill_addr_cam_info` words 9..=11 (`WOL_PATTERN`,
+`WOL_MAGIC`, `SEC_ENTn_KEYID`, `SEC_ENT_VALID`, `SEC_ENTn`) on the plain
+associated body (`Startup::wow_cam`). `Startup::wow_keys_in` writes the
+`H2C_FUNC_MAC_SEC_UPD` entries through the normal image after
+`wow_trx_enter_pre` (RECV_ACK, as `cam.c`), `wow_swap` ends with
+`rtw89_mac_hw_mgnt_sec(wow)` (`Native::wow_mgnt_sec`, read-back proven),
+and `Startup::wow_keys_out` after `wow_swap_out` overwrites every written
+entry with a zero key and re-proves `B_AX_{UC,BMC}_MGNT_DEC` clear before
+`wow_trx_leave_post` reopens RX. Deliberate difference: Linux keeps its
+hardware keys after resume; NARF's awake path never had any. Unexecuted
+cases: `smoke_rtw89_wow_security_cam_entries_and_addr_cam`,
+`smoke_station_suspend_floors_match_keys_and_consume_nothing`.
+
 **Not wired (why `wow` stays open).** The whole row still needs, in Linux
 order (`rtw89_wow_suspend`/`resume`):
 1. (Done above: `wow_trx`/`command_native/wow.rs`.) Reversible TRX
@@ -1944,9 +1967,8 @@ order (`rtw89_wow_suspend`/`resume`):
    (PTK + live GTKs, never IGTK), write `sec_cam_ccmp` entries, attach them
    through the addr-CAM `SEC_ENT*` fields with `WOL_MAGIC`/`WOL_PATTERN`,
    enable the engine with `rtw89_mac_hw_mgnt_sec`, and clear/disable and
-   re-prove host crypto before RX is restarted on resume. The `KeyInfo` RX
-   IVs come from `station_security::Security::suspend_floors` (added;
-   wireless spec section 3.4.2); the CAM writes are not wired yet.
+   re-prove host crypto before RX is restarted on resume. (Done above:
+   `wow_security.rs`.)
 4. Keep-alive as an unprotected NULL data general packet (Linux uses an
    ARP-response packet that is protected under `ptk_alg`; protected
    firmware transmissions would need the AOAC `ptk_tx_iv` written back into

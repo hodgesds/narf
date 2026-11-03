@@ -10,7 +10,9 @@ use crate::rtw89::{
     lps_packets::{Packets, Stage},
     power, radio_init, rx_packet,
     station_control::Admission,
+    wow_security,
     wow_trx::{self, CpuIoRx, Ring, Snapshot},
+    wow_wire,
 };
 use alloc::vec::Vec;
 
@@ -341,5 +343,93 @@ impl Native {
                 self.retain_event(event)?;
             }
         }
+    }
+}
+
+/// `H2C_CL_MAC_ADDR_CAM_UPDATE` / `H2C_FUNC_MAC_ADDR_CAM_UPD`.
+const H2C_CL_MAC_ADDR_CAM: u8 = 0x6;
+
+impl Native {
+    /// One `H2C_CAT_MAC` command inside an open WoW window while CH12 runs
+    /// (`Quiesced` or `Restarted`), under station admission. `done` is the
+    /// Linux DONE_ACK flag of that command.
+    pub(in crate::rtw89) async fn wow_command(
+        &mut self,
+        class: u8,
+        function: u8,
+        body: &[u8],
+        done: bool,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        if !matches!(self.wow_trx, Some(Trx::Quiesced(_) | Trx::Restarted(_))) {
+            return Err(power::Error::Terminal);
+        }
+        self.runtime_command(
+            1,
+            class,
+            function,
+            body,
+            done,
+            station::Permit::Station(admission),
+        )
+        .await
+    }
+    /// `rtw89_fw_h2c_cam(RTW89_ROLE_INFO_CHANGE)` (AX v0 body, DONE_ACK).
+    pub(in crate::rtw89) async fn wow_addr_cam(
+        &mut self,
+        cam: &[u8; 60],
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        self.wow_command(H2C_CL_MAC_ADDR_CAM, 0, cam, true, admission)
+            .await
+    }
+    /// `rtw89_cam_send_sec_key_cmd` for each entry (RECV_ACK only), or the
+    /// zero-key overwrite of each when `clear`.
+    pub(in crate::rtw89) async fn wow_sec_cam(
+        &mut self,
+        entries: &[wow_security::Entry],
+        clear: bool,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        for entry in entries {
+            let body = if clear { entry.cleared() } else { entry.body() };
+            self.wow_command(
+                wow_wire::H2C_CL_MAC_SEC_CAM,
+                wow_wire::H2C_FUNC_MAC_SEC_UPD,
+                &body[..],
+                false,
+                admission,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    /// `rtw89_mac_hw_mgnt_sec`: set or clear `B_AX_{UC,BMC}_MGNT_DEC` and
+    /// prove the result by read-back. Clearing re-proves the awake
+    /// host-crypto state (no management decryption by the MAC).
+    pub(in crate::rtw89) fn wow_mgnt_sec(&mut self, enable: bool) -> Result<(), power::Error> {
+        use crate::rtw89::mac_runtime_regs::R_AX_SEC_ENG_CTRL;
+        if self.wow_trx.is_none() {
+            return Err(power::Error::Terminal);
+        }
+        let result = (|| {
+            let value = self.read32(R_AX_SEC_ENG_CTRL)?;
+            let next = if enable {
+                value | wow_security::MGNT_DEC
+            } else {
+                value & !wow_security::MGNT_DEC
+            };
+            self.write32(R_AX_SEC_ENG_CTRL, next)?;
+            let mask = self.read32(R_AX_SEC_ENG_CTRL)? & wow_security::MGNT_DEC;
+            if mask != if enable { wow_security::MGNT_DEC } else { 0 } {
+                return Err(power::Error::Access);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.wow_trx = None;
+            self.fail();
+        }
+        result
     }
 }
