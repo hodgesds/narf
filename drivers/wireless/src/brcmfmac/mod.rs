@@ -77,6 +77,7 @@ pub mod ringbuf;
 pub mod runtime;
 pub mod shared;
 pub mod station_transport;
+pub mod vif_bsscfg;
 pub mod vif_demux;
 pub mod vif_owner;
 pub mod vif_wire;
@@ -135,3 +136,6 @@ mod vif_wire_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod vif_owner_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod vif_bsscfg_tests;

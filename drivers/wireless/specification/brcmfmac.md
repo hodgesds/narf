@@ -1094,6 +1094,32 @@ gated on the shell carrier. No per-bsscfg role owner raises that carrier
 yet, so the shell refuses scan/join/AP and `supports_virtual_interfaces`
 stays false (`VIF_ROLES`); nothing is advertised.
 
+#### Per-bsscfg Fullmac adapter
+
+`brcmfmac::vif_bsscfg::Bsscfg` is the `struct brcmf_if` view of one live
+secondary registry `Entry` over the primary transport; it implements
+`Fullmac` so the unchanged role state machines can drive that bsscfg.
+It borrows the primary runtime, the generation's `vif_owner::Owner` and
+a persistent `Link` (entry, bsscfg-local failure, `set_link` peer).
+`command` always goes to `command_vif(entry.ifidx)`; a GET/SET_VAR whose
+name is one Linux issues through `brcmf_fil_bsscfg_{int,data}_{get,set}`
+(`BSSCFG_IOVARS`: actframe, actframe_abort, auth, bip,
+interface_remove, join, mfp, p2p_scan, p2p_state, ssid, vndr_ie,
+wme_bss_disable, wpa_auth, wsec, wsec_key) is rewritten with
+`vif_wire::bsscfg_iovar` (`fwil.c::brcmf_create_bsscfg`); every other
+iovar and direct dcmd is sent unchanged to the ifidx (`brcmf_fil_iovar_*`,
+`brcmf_fil_cmd_*`). `poll` is the shared transport poll followed by
+`Owner::service`; `pop_event` is `Owner::pop_event(entry)` (only that
+(bsscfg, generation)); `pop_data`/`send_data` are
+`pop_vif_data`/`send_vif_data(entry.ifidx)`. Interface-0 queues are never
+read through it. `fail` and a lost entry (IF DEL, stale-ADD replacement)
+fail-stop only that bsscfg; queue overflow in `service` fail-stops the
+transport as the primary worker does. AP Program, monitor, PM, reset and
+stop methods keep their refusing defaults. `Parked<R>` is the inert
+runtime a persistent secondary role is held over between operations.
+One written/unexecuted case in `drivers/wireless/brcmfmac/vif`:
+`smoke_brcmf_vif_bsscfg_adapter_addresses_its_own_interface`.
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
 either family: per-bsscfg role
 owners (the AP `Session` and `Station` are primary-bsscfg only), and for
