@@ -202,6 +202,11 @@ impl Native {
         if let Some(c) = self.qualification_c.as_ref() {
             return c.tx_current().map_err(|_| packet::Error::Access);
         }
+        // RTL8851B (`radio_policy_51::Qualification::tx_current`): likewise
+        // no witness grant.
+        if let Some(n51) = self.qualification_51.as_ref() {
+            return n51.tx_current().map_err(|_| packet::Error::Access);
+        }
         match self.full_radio_scope() {
             Some(qualification) => qualification
                 .tx_current()
@@ -519,6 +524,7 @@ impl control::Interface for Access<'_> {
         match self.native.chip {
             ChipId::Rtl8852B => self.native.io.b_station_window(indirect)?,
             ChipId::Rtl8852C => self.native.io.c_station_window(indirect)?,
+            ChipId::Rtl8851B => self.native.io.n51_station_window(indirect)?,
             _ => return Err(power::Error::Terminal),
         }
         if self.cleanup {
@@ -717,7 +723,8 @@ unsafe impl packet::Port for Access<'_> {
                 // CH12/RX/RPQ and both HCI directions must still be this owner's.
                 // RTL8852C: `B_AX_RXHCI_EN_V1` and `R_AX_HCI_FUNC_EN_V1`
                 // (rtw8852ce.c `rtw8852c_pci_info`) with `B_AX_TXHCI_EN_V1`,
-                // which the CH12 download already opened.
+                // which the CH12 download already opened. RTL8851B takes
+                // B's (rtw8851be.c `rtw8851b_pci_info` == rtw8852be.c's).
                 let (hci, function) = if native.chip == ChipId::Rtl8852C {
                     (1 << 15 | 1 << 7, 0x7880)
                 } else {

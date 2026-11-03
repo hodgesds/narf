@@ -75,6 +75,15 @@ impl NativeIo {
         }
         Ok(())
     }
+    /// RTL8851B station window: its PHY window plus, for the nonsecure
+    /// table init, `R_AX_INDIR_ACCESS_ENTRY` words (common AX code).
+    pub(super) fn n51_station_window(&self, indirect: bool) -> Result<(), Error> {
+        self.n51_phy_window()?;
+        if indirect {
+            self.checked(0x4001c, 4, |_, _| ())?;
+        }
+        Ok(())
+    }
     /// RTL8852C station window: the same PHY window plus, for the
     /// nonsecure table init, `R_AX_INDIR_ACCESS_ENTRY` (0x40000) words
     /// (mac.c `rtw89_mac_{d,c}mac_tbl_init` are common AX code).

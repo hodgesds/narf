@@ -21,9 +21,11 @@
 //! rule over the profile's whole occupied span exactly as the C family
 //! (`radio_policy_c::check_envelope`: overlapping rules must cover the span
 //! without a gap, each must allow the width incl. AUTO_BW/NO_160MHZ, and
-//! DFS/NO_IR are accepted, passive-only, only at 5GHz). No RTL8851B station
-//! program (WMM/QoS/RA/HT/HE/A-MPDU) path exists yet, so the profile flag
-//! byte must be the base set exactly. These are formats only: NARF carries
+//! DFS/NO_IR are accepted, passive-only, only at 5GHz). The base record's
+//! profile flag byte may enable the RTL8851B station programs
+//! (WMM/QoS/RA/HT/HE/A-MPDU, [`PROGRAMS`]), each extending the identity;
+//! a 40/80MHz record binds the one-stream wide station capability. These
+//! are formats only: NARF carries
 //! no RTL8851B board value, and an unprovisioned board stays unadmitted.
 use super::operating_channel::{Profile, Width};
 pub(super) use super::radio_policy::Lifecycle;
@@ -39,9 +41,56 @@ const LENGTH: usize = 128;
 /// Profile byte 57: the B base flags with no optional program bit.
 const BASE_FLAGS: u8 = 3;
 /// Optional operating programs an RTL8851B base record may enable (byte 57,
-/// the B `radio_policy::Program` bit layout). None has a whole RTL8851B path
-/// yet, so every program bit is refused.
-pub(super) const PROGRAMS: [Program; 0] = [];
+/// the B `radio_policy::Program` bit layout): WMM, all-AC QoS, firmware RA,
+/// HT, HE and originator A-MPDU, the common AX station programs RTL8851B
+/// runs on B's v0 TXWD (`packet_format::transmit_51`) with one-stream
+/// capability bodies. No A-MSDU, fragment, sleep or WoW companion.
+pub(super) const PROGRAMS: [Program; 6] = [
+    Program::Wmm,
+    Program::QosAll,
+    Program::FirmwareRa,
+    Program::Ht,
+    Program::He,
+    Program::Ampdu,
+];
+/// Extend an RTL8851B identity by one enabled program (domain-separated
+/// from B's `Program::extend` and C's; the station H2C/TXWD programs are
+/// the common AX code the B fingerprints measure, on B's v0 TXWD path, with
+/// the one-stream HE body).
+fn extend(program: Program, identity: [u8; 32]) -> [u8; 32] {
+    use super::station_control as sc;
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    let (recipe, fingerprint): (&[u8], [u8; 32]) = match program {
+        Program::Wmm => (
+            b"NARF RTL8851B WMM BE/TID0 legacy12 optional operating recipe v1;txwd_body_v0",
+            sc::wmm_fingerprint(),
+        ),
+        Program::QosAll => (
+            b"NARF RTL8851B WMM all-AC TID0..7 optional operating recipe v1;txwd_body_v0;ach0..3",
+            sc::qos_all_fingerprint(),
+        ),
+        Program::FirmwareRa => (
+            b"NARF RTL8851B firmware RA legacy optional operating recipe v1;txwd_info0_v0;SS1",
+            sc::firmware_ra_fingerprint(),
+        ),
+        Program::Ht => (
+            b"NARF RTL8851B HT20 optional operating recipe v1;rx_desc_v0;bacam_v0 2;MCS0..7",
+            sc::ht_fingerprint(),
+        ),
+        Program::He => (
+            b"NARF RTL8851B HE20 optional operating recipe v1;txwd_info0_v0 DATA_ER;rx_nss 1",
+            sc::he_fingerprint_1ss(),
+        ),
+        Program::Ampdu => (
+            b"NARF RTL8851B originator BA TX A-MPDU optional operating recipe v1;txwd_body3/info1/info2 v0 agg;h2c_ampdu_cmac_tbl NULL on 8851B",
+            sc::ampdu_fingerprint(),
+        ),
+    };
+    hash.update(recipe);
+    hash.update(&identity);
+    hash.update(&fingerprint);
+    hash.finalize()
+}
 fn programs_valid(flags: u8) -> bool {
     let known = PROGRAMS.iter().fold(BASE_FLAGS, |m, p| m | p.bit());
     Program::valid(flags) && flags & !known == 0
@@ -132,7 +181,7 @@ impl Board {
         // A 40/80MHz record also binds the shared wide station capability
         // its channel lets the station offer (`station_control::wide_phy`).
         if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {
-            h.update(&super::station_control::wide_fingerprint());
+            h.update(&super::station_control::wide_fingerprint_1ss());
         }
         h.update(POWER);
         power.bind(&mut h);
@@ -160,10 +209,14 @@ impl Board {
     pub fn identity(&self) -> [u8; 32] {
         self.identity
     }
-    /// Extend the identity by every RTL8851B program enabled in `flags`
-    /// (none exists yet; see [`PROGRAMS`]).
-    pub(super) fn with_programs(self, flags: u8) -> Self {
-        let _ = flags;
+    /// Extend the identity by every RTL8851B program enabled in `flags`, in
+    /// the fixed [`PROGRAMS`] order.
+    pub(super) fn with_programs(mut self, flags: u8) -> Self {
+        for program in PROGRAMS {
+            if flags & program.bit() != 0 {
+                self.identity = extend(program, self.identity);
+            }
+        }
         self
     }
     pub fn profile(&self) -> Profile {
@@ -307,7 +360,7 @@ pub(super) struct Qualification {
     envelope: Envelope,
     record_digest: [u8; 32],
     record_signer: [u8; 32],
-    /// Byte 57 of the base record (the base flags exactly).
+    /// Byte 57 of the base record: base flags plus enabled `PROGRAMS`.
     flags: u8,
     channels: alloc::vec::Vec<Channel>,
     /// Profile whose envelope gates every publication.

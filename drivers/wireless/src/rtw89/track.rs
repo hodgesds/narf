@@ -112,6 +112,24 @@ pub(super) const LAYOUT_C: Layout = Layout {
     dcfo_comp_mask: B_DCFO_COMP_S0_V1_MSK,
     dcfo_comp_sft: 12,
 };
+// rtw8851b_dcfo_comp (reg.h R_DCFO_COMP_S0_V2 / B_DCFO_COMP_S0_MSK_V2).
+const R_DCFO_COMP_S0_V2: u32 = BB + 0x4b20;
+const B_DCFO_COMP_S0_MSK_V2: u32 = 0x3fff;
+/// `rtw8851b_dig_regs` / `rtw8851b_edcca_regs` (byte-identical to
+/// RTL8852B's) with `rtw8851b_dcfo_comp` and `dcfo_comp_sft` 12
+/// (`rtw8851b_chip_info`: `cfo_src_fd`/`cfo_hw_comp` true as B).
+pub(super) const LAYOUT_51: Layout = Layout {
+    dcfo_comp: R_DCFO_COMP_S0_V2,
+    dcfo_comp_mask: B_DCFO_COMP_S0_MSK_V2,
+    dcfo_comp_sft: 12,
+    ..LAYOUT_B
+};
+/// RTL8851B counterpart of [`REGISTERS`]: B's with the V2 DCFO comp.
+pub(super) const REGISTERS_51: [u32; 20] = {
+    let mut registers = REGISTERS;
+    registers[19] = R_DCFO_COMP_S0_V2;
+    registers
+};
 /// RTL8852C counterpart of [`REGISTERS`].
 pub(super) const REGISTERS_C: [u32; 20] = [
     R_CCX,

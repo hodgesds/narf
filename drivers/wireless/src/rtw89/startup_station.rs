@@ -87,13 +87,16 @@ unsafe impl Io for Startup {
         if self.monitor.is_some() {
             return Err(power::Error::Terminal);
         }
-        // RTL8852B, or RTL8852C once its signed C program installed the
-        // C ordinary grant (`Native::prepare_radio_c`): legacy 2.4/5GHz
-        // 20MHz station without B companion programs.
+        // RTL8852B, or RTL8852C / RTL8851B once its signed program
+        // installed its ordinary grant (`Native::prepare_radio_c` /
+        // `prepare_radio_51`): 2.4/5GHz station without B companion
+        // programs.
         if self.identity.is_none_or(|identity| {
             !matches!(
                 identity.chip(),
-                super::super::mac::ChipId::Rtl8852B | super::super::mac::ChipId::Rtl8852C
+                super::super::mac::ChipId::Rtl8852B
+                    | super::super::mac::ChipId::Rtl8852C
+                    | super::super::mac::ChipId::Rtl8851B
             )
         }) {
             return Err(power::Error::Unsupported);
@@ -352,6 +355,10 @@ unsafe impl Io for Startup {
     async fn station_track_crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
         self.station_allowed()?;
         self.station_native()?.station_track_crystal(cap).await
+    }
+    fn station_single_stream(&mut self) -> bool {
+        self.identity
+            .is_some_and(|identity| identity.chip() == super::super::mac::ChipId::Rtl8851B)
     }
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         self.station_allowed()?;

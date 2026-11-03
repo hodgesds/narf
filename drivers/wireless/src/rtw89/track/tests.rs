@@ -462,3 +462,27 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_track_uses_c_dig_edcca_dcfo_layout_and_5g_fa_thresholds
 );
+/// RTL8851B track work: `rtw8851b_dig_regs`/`rtw8851b_edcca_regs` are
+/// RTL8852B's; only `rtw8851b_dcfo_comp` (R_DCFO_COMP_S0_V2 [13:0],
+/// `dcfo_comp_sft` 12) differs, and the register allow-list follows it.
+fn smoke_rtw8851b_track_layout_is_b_with_v2_dcfo_comp() -> TestResult {
+    let (b, n) = (LAYOUT_B, LAYOUT_51);
+    if n.pd != b.pd
+        || n.pd_spatial_reuse != b.pd_spatial_reuse
+        || n.pagcugc != b.pagcugc
+        || n.edcca != b.edcca
+        || n.dcfo_comp != BB + 0x4b20
+        || n.dcfo_comp_mask != 0x3fff
+        || n.dcfo_comp_sft != 12
+        || REGISTERS_51[..19] != REGISTERS[..19]
+        || REGISTERS_51[19] != n.dcfo_comp
+        || REGISTERS_51.contains(&R_DCFO_COMP_S0)
+    {
+        return TestResult::Fail("RTL8851B track layout differs from rtw8851b_chip_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_track_layout_is_b_with_v2_dcfo_comp
+);

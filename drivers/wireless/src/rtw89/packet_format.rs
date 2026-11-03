@@ -309,6 +309,40 @@ pub(super) fn transmit_profile(
         fragments: false,
     })
 }
+/// RTL8851B ordinary station TXWD (rtw8851b.c `rtw8851b_chip_info`:
+/// `txwd_body_size` = sizeof(`rtw89_txwd_body`), the RTL8852B v0 layout,
+/// and rtw8851be.c `rtw89_pci_fill_txaddr_info`): management, non-QoS and
+/// (under the signed RTL8851B programs) QoS data at a fixed rate or firmware
+/// RA, with HE +HTC, `DATA_ER` and originator A-MPDU; no A-MSDU (no
+/// RTL8851B A-MSDU program) and no fragments.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn transmit_51(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+    agg: Option<Agg>,
+) -> Result<(Vec<u8>, Queue), Error> {
+    if amsdu(frame) {
+        return Err(Error::Frame);
+    }
+    transmit_profile_inner(Tx {
+        chip: ChipId::Rtl8851B,
+        frame,
+        own,
+        mac_id,
+        sequence,
+        address,
+        report,
+        rate,
+        agg,
+        limit: None,
+        fragments: false,
+    })
+}
 /// New full native fragment emitter always fixes CCK1/no aggregation and host
 /// sequence mode, including management. Original SW_SN/fragno stays on air.
 pub(super) fn transmit_fragment(
@@ -426,6 +460,10 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
     let c = match chip {
         ChipId::Rtl8852B => false,
         ChipId::Rtl8852C if !fragments && limit.is_none() => true,
+        // RTL8851B: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
+        // RTL8852B, pci.c `rtw89_pci_fill_txaddr_info`); no A-MSDU or
+        // fragment program.
+        ChipId::Rtl8851B if !fragments && limit.is_none() => false,
         _ => return Err(Error::Metadata),
     };
     let prepare = if fragments {

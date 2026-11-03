@@ -226,7 +226,10 @@ impl Controller {
     pub(super) fn new(factory: &Factory) -> Result<Self, Error> {
         let identity = factory.identity().ok_or(Error::Terminal)?;
         let chip = identity.chip();
-        if chip != ChipId::Rtl8852B && chip != ChipId::Rtl8852C {
+        // RTL8851B takes B's station codec: `rtw8851b_chip_info` has the
+        // same `h2c_cctl_func_id` (CCTLINFO_UD), `bacam_num` 2 /
+        // `bacam_ver` RTW89_BACAM_V0 and `addrcam_ver` 0 as RTL8852B.
+        if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B) {
             return Err(Error::Unsupported);
         }
         Ok(Self {
@@ -1079,6 +1082,85 @@ pub(super) fn local_he_wide(ghz5: bool) -> Option<narf_wireless::association::he
     phy[0] = if ghz5 { 0x04 } else { 0x02 };
     LocalHe::new(narrow.mac_capability(), phy, 0xfffa, 0xfffe).ok()
 }
+/// One-stream (RTL8851B, `hal->rx_nss` = `tx_nss` = 1) HE/VHT MCS maps:
+/// MCS0..11 (HE) / MCS0..9 (VHT) on NSS1 only (core.c `rtw89_init_he_cap`
+/// / `rtw89_init_vht_cap` fill `rx_nss` streams, the rest "not supported").
+const ONE_STREAM_MAP: u16 = 0xfffe;
+/// `local_he` on the one-path RTL8851B: the same restricted MAC/PHY bits
+/// with HE-MCS0..11 RX and TX on NSS1 only.
+pub(super) fn local_he_1ss() -> Option<narf_wireless::association::he::LocalHe> {
+    use narf_wireless::association::he::LocalHe;
+    let he = local_he()?;
+    let base = he.capability();
+    LocalHe::new(
+        base.mac_capability(),
+        base.phy_capability(),
+        ONE_STREAM_MAP,
+        ONE_STREAM_MAP,
+    )
+    .ok()
+}
+/// `local_he_wide` on the one-path RTL8851B (rtw8851b.c
+/// `support_bandwidths` 20/40/80MHz, no 160MHz), NSS1 maps.
+pub(super) fn local_he_wide_1ss(ghz5: bool) -> Option<narf_wireless::association::he::LocalHe> {
+    use narf_wireless::association::he::LocalHe;
+    let he = local_he_wide(ghz5)?;
+    let wide = he.capability();
+    LocalHe::new(
+        wide.mac_capability(),
+        wide.phy_capability(),
+        ONE_STREAM_MAP,
+        ONE_STREAM_MAP,
+    )
+    .ok()
+}
+/// `local_vht80` on the one-path RTL8851B: VHT-MCS0..9 RX and TX on NSS1.
+pub(super) fn local_vht80_1ss() -> Option<narf_wireless::association::phy::LocalVht> {
+    let factor = local_ht().capability_body()[2] & 3;
+    narf_wireless::association::phy::LocalVht::new(
+        ONE_STREAM_MAP,
+        ONE_STREAM_MAP,
+        true,
+        true,
+        factor,
+    )
+    .ok()
+    .map(|vht| vht.with_ldpc(true, true).with_rx_stbc(true))
+}
+/// RTL8851B HE20 emitter program: [`he_fingerprint`]'s recipe over the
+/// one-stream capability body (`local_he_1ss`).
+pub(super) fn he_fingerprint_1ss() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(
+        b"RTL8851B HE20 v1; he_fingerprint recipe with RX 1SS TX 1SS HE-MCS0..11 (rx_nss 1)",
+    );
+    hash.update(&he_fingerprint());
+    hash.update(
+        &local_he_1ss()
+            .map(|he| he.capability_body())
+            .unwrap_or_default(),
+    );
+    hash.finalize()
+}
+/// RTL8851B wide-channel station capability bound by every RTL8851B
+/// 40/80MHz record identity: the HT40 / one-stream VHT80 / HE-wide bodies
+/// `wide_phy` offers on the one-path chip.
+pub(super) fn wide_fingerprint_1ss() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"RTL8851B wide station v1; wide_fingerprint recipe with rtw89_init_vht_cap / rtw89_init_he_cap RX 1SS TX 1SS (rx_nss 1); no 160MHz");
+    hash.update(&wide_fingerprint());
+    if let Some(vht) = local_vht80_1ss() {
+        hash.update(&vht.capability_body());
+    }
+    for ghz5 in [false, true] {
+        hash.update(
+            &local_he_wide_1ss(ghz5)
+                .map(|he| he.capability_body())
+                .unwrap_or_default(),
+        );
+    }
+    hash.finalize()
+}
 /// Wide-channel station capability bound by every 40/80MHz record identity
 /// (`radio_policy::Board::new_noninitial`): the exact HT40/VHT80/HE-wide
 /// bodies `wide_phy` may offer on such a channel.
@@ -1205,11 +1287,14 @@ pub(super) fn wide160_fingerprint() -> [u8; 32] {
 /// one) and is used only when its selected chandef is that 160MHz profile;
 /// otherwise the 80MHz/40MHz candidates are tried unchanged. `None` keeps
 /// the 20MHz join unchanged. HE is added (`local_he_wide`/`local_he160`)
-/// only when `he` (the signed HE program).
+/// only when `he` (the signed HE program). `one_stream` (RTL8851B) offers
+/// the NSS1 VHT/HE bodies (`local_vht80_1ss`/`local_he_wide_1ss`); its
+/// `admitted_wide` never lists a 160MHz profile.
 pub(super) fn wide_phy(
     ies: &[u8],
     primary: u8,
     he: bool,
+    one_stream: bool,
     admitted: &[super::operating_channel::Profile],
 ) -> Option<(
     narf_wireless::association::phy::LocalPhy,
@@ -1227,7 +1312,7 @@ pub(super) fn wide_phy(
             .iter()
             .any(|p| p.width() == Bw::Mhz160 && p.subchannels().any(|ch| ch == primary));
     let mut candidates = alloc::vec::Vec::new();
-    if c160 {
+    if c160 && !one_stream {
         let mut local = LocalPhy::vht160(ht, local_vht160()?).ok()?;
         if he {
             local = local.with_he(local_he160()?).ok()?;
@@ -1235,12 +1320,22 @@ pub(super) fn wide_phy(
         candidates.push((local, true));
     }
     if ghz5 {
-        candidates.push((LocalPhy::vht80(ht, local_vht80()?).ok()?, false));
+        let vht = if one_stream {
+            local_vht80_1ss()?
+        } else {
+            local_vht80()?
+        };
+        candidates.push((LocalPhy::vht80(ht, vht).ok()?, false));
     }
     candidates.push((LocalPhy::ht40(ht).ok()?, false));
     for (mut local, wide160) in candidates {
         if he && !wide160 {
-            local = local.with_he(local_he_wide(ghz5)?).ok()?;
+            let he = if one_stream {
+                local_he_wide_1ss(ghz5)?
+            } else {
+                local_he_wide(ghz5)?
+            };
+            local = local.with_he(he).ok()?;
         }
         let Ok(Some(offer)) = Offer::from_elements(local, ies, primary) else {
             continue;

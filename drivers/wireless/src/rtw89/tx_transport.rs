@@ -414,7 +414,8 @@ fn prepare_header_profile(
         || fragments
             && (fc & 0x0400 == 0 && frame[22] & 15 == 0 || fc & 0x0400 != 0 && frame[22] & 15 == 15)
         || fc & 0x8000 != 0
-            && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) || fc & 0xfc != 0x88)
+            && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
+                || fc & 0xfc != 0x88)
         || fc & 0x0300 == 0x0300
         || !fragments && frame[22] & 0xf != 0
     {
@@ -425,8 +426,10 @@ fn prepare_header_profile(
     }
     let header_length = if fc & 0xfc == 0x88 {
         // TID0..7, normal ack policy; EOSP belongs to the HE +HTC form.
-        // RTL8852C carries QoS data only without A-MSDU (WMM program).
-        if !(chip == ChipId::Rtl8852B || chip == ChipId::Rtl8852C && !amsdu)
+        // RTL8852C and RTL8851B carry QoS data only without A-MSDU (WMM
+        // program).
+        if !(chip == ChipId::Rtl8852B
+            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && !amsdu)
             || frame.get(24).is_none_or(|control| {
                 control & if amsdu { 0x68 } else { 0xe8 } != 0
                     || (control & 0x10 != 0) != (fc & 0x8000 != 0)
@@ -447,7 +450,7 @@ fn prepare_header_profile(
         24
     };
     if fc & 0x4000 != 0
-        && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
+        && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
             // Host-CCMP data to the AP, or (PMF) a robust disassociation,
             // deauthentication or Action frame with no DS bits.
             || !(matches!(fc & 0x00fc, 8 | 0x88) && fc & 0x0300 == 0x0100
@@ -536,7 +539,8 @@ fn encode_header(
 ) -> Result<Vec<u8>, Error> {
     // B uses the AX baseline descriptor encoding, but its retained/native
     // device mask is36 bits. Encoding capacity is not device DMA authority.
-    let dma_mask = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) {
+    // RTL8851B shares B's AX v0 body and pci.c's 36-bit mask.
+    let dma_mask = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B) {
         0xf_ffff_ffff
     } else {
         0xff_ffff_ffff

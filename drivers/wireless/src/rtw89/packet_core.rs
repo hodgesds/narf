@@ -348,10 +348,10 @@ impl Core {
         if own == [0; 6]
             || own[0] & 1 != 0
             || mac_id != 0
-            || !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
-            // C: the ordinary station rings only (BE0/MGMT8, plus ACH1..3
-            // under the signed C all-AC QoS program); no AP role.
-            || chip == ChipId::Rtl8852C
+            || !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
+            // C and RTL8851B: the ordinary station rings only (BE0/MGMT8,
+            // plus ACH1..3 under the signed all-AC QoS program); no AP role.
+            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
                 && (ap
                     || queues != format::Queue::ordinary(false)
                         && queues != format::Queue::ordinary(true))
@@ -428,7 +428,10 @@ impl Core {
     pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
-            || !matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
+            || !matches!(
+                self.chip,
+                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
         {
             return Err(Error::State);
         }
@@ -472,8 +475,9 @@ impl Core {
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
             || !self.aggregate
-            // No C A-MSDU path (`transmit_c` refuses A-MSDU subframes).
-            || self.chip == ChipId::Rtl8852C
+            // No C or RTL8851B A-MSDU path (`transmit_c`/`transmit_51`
+            // refuse A-MSDU subframes).
+            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
             || limit == 0
             || limit > super::tx_amsdu::MAX_BODY
         {
@@ -564,7 +568,9 @@ impl Core {
         if self.phase != Phase::Running || self.ap {
             return Err(Error::State);
         }
-        if agg.is_some() && !self.aggregate || self.chip == ChipId::Rtl8852C && fragment.is_some() {
+        if agg.is_some() && !self.aggregate
+            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && fragment.is_some()
+        {
             return Err(Error::Packet);
         }
         // HE extended-range SU TX belongs to the signed HE program only.
@@ -641,6 +647,17 @@ impl Core {
             let preparation = (|| {
                 let (mut header, actual) = if self.chip == ChipId::Rtl8852C {
                     format::transmit_c(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                        agg,
+                    )?
+                } else if self.chip == ChipId::Rtl8851B {
+                    format::transmit_51(
                         bytes,
                         source,
                         self.mac_id,

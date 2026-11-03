@@ -103,8 +103,8 @@ fn smoke_rtw8851b_full_radio_base_record_is_n51b_v2_exact_and_revocable() -> Tes
             return TestResult::Fail("altered RTL8851B full-radio record accepted");
         }
     }
-    // Neither the B nor the C base magic admits RTL8851B, and no program
-    // bit (no RTL8851B station path yet) is accepted.
+    // Neither the B nor the C base magic admits RTL8851B, and a program
+    // bit the signed identity does not cover is refused.
     for magic in [b"N52B", b"N5CB"] {
         let mut other = bytes;
         other[..4].copy_from_slice(magic);
@@ -118,6 +118,37 @@ fn smoke_rtw8851b_full_radio_base_record_is_n51b_v2_exact_and_revocable() -> Tes
         if Qualification::from_verified(&programs, Some([3; 32]), exact, cap).is_ok() {
             return TestResult::Fail("RTL8851B base record admitted a program bit");
         }
+    }
+    // A record whose identity covers the WMM + firmware-RA + HT + HE
+    // programs (`Board::with_programs`) admits exactly those; A-MPDU and
+    // all-AC QoS stay "no program".
+    let flags = BASE_FLAGS
+        | Program::Wmm.bit()
+        | Program::FirmwareRa.bit()
+        | Program::Ht.bit()
+        | Program::He.bit();
+    let mut programs = bytes;
+    programs[16..48].copy_from_slice(&exact.with_programs(flags).identity);
+    programs[57] = flags;
+    match Qualification::from_verified(&programs, Some([3; 32]), exact, cap) {
+        Ok(mut q) => {
+            q.model_domain = Some(domain(vec![rule(2400, 2484, 40, RegFlags::empty())]));
+            if !q.matches(exact)
+                || !matches!(q.allows(Program::Ht), Ok(true))
+                || !matches!(q.allows(Program::He), Ok(true))
+                || !matches!(q.allows(Program::Ampdu), Ok(false))
+                || !matches!(q.allows(Program::QosAll), Ok(false))
+            {
+                return TestResult::Fail("RTL8851B program record admitted the wrong programs");
+            }
+        }
+        Err(_) => return TestResult::Fail("RTL8851B program record refused"),
+    }
+    if exact.with_programs(flags).identity == exact.identity
+        || exact.with_programs(Program::Wmm.bit()).identity
+            == exact.with_programs(Program::Ht.bit()).identity
+    {
+        return TestResult::Fail("RTL8851B programs not bound into the identity");
     }
     let ch6 = Profile::new_wide(6, Width::Mhz20, false).unwrap();
     if Qualification::from_verified(&bytes, Some([3; 32]), board(ch6, 7), cap).is_ok() {

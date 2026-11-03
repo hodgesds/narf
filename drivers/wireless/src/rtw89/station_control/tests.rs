@@ -1174,14 +1174,14 @@ fn smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef() -> TestResul
     let Some(plus) = Profile::new_2ghz_40(1, true) else {
         return TestResult::Fail("HT40+ profile missing");
     };
-    if wide_phy(&ies, 1, true, &[]).is_some() {
+    if wide_phy(&ies, 1, true, false, &[]).is_some() {
         return TestResult::Fail("wide PHY offered without an admitted profile");
     }
     let other = Profile::new_2ghz_40(5, false).unwrap();
-    if wide_phy(&ies, 1, true, &[other]).is_some() {
+    if wide_phy(&ies, 1, true, false, &[other]).is_some() {
         return TestResult::Fail("wide PHY offered for a different admitted chandef");
     }
-    match wide_phy(&ies, 1, true, &[other, plus]) {
+    match wide_phy(&ies, 1, true, false, &[other, plus]) {
         Some((local, profile)) if profile == plus => {
             if local.he().map(|he| he.capability_body()) != Some(b2.clone()) {
                 return TestResult::Fail("2.4GHz HT40 join lacks the 40MHz HE capability");
@@ -1190,7 +1190,7 @@ fn smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef() -> TestResul
         _ => return TestResult::Fail("admitted HT40+ chandef not offered"),
     }
     // A 20MHz AP never maps to a wide profile.
-    if wide_phy(&wide_ap_ies(1, 0, None), 1, false, &[plus]).is_some() {
+    if wide_phy(&wide_ap_ies(1, 0, None), 1, false, false, &[plus]).is_some() {
         return TestResult::Fail("20MHz BSS offered a wide PHY");
     }
     // 5GHz VHT80 at center 42 (primary 40): 80MHz when admitted, else the
@@ -1202,15 +1202,16 @@ fn smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef() -> TestResul
     ) else {
         return TestResult::Fail("5GHz wide profiles missing");
     };
-    if !matches!(wide_phy(&ies, 40, true, &[p40, p80]), Some((_, p)) if p == p80) {
+    if !matches!(wide_phy(&ies, 40, true, false, &[p40, p80]), Some((_, p)) if p == p80) {
         return TestResult::Fail("admitted VHT80 chandef not offered");
     }
-    if !matches!(wide_phy(&ies, 40, false, &[p40]), Some((_, p)) if p == p40) {
+    if !matches!(wide_phy(&ies, 40, false, false, &[p40]), Some((_, p)) if p == p40) {
         return TestResult::Fail("admitted 40MHz half of a VHT80 BSS not offered");
     }
     if wide_phy(
         &ies,
         40,
+        false,
         false,
         &[Profile::new_5ghz(44, Width::Mhz40).unwrap()],
     )
@@ -1363,7 +1364,7 @@ fn smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux() -> TestResult
     }
     // An RTL8852B-style admitted list (no 160MHz profile): the 80MHz join,
     // without any 160MHz capability bit.
-    match wide_phy(&ies, 40, true, &[p80]) {
+    match wide_phy(&ies, 40, true, false, &[p80]) {
         Some((local, p)) if p == p80 => {
             if local.he().map(|he| he.capability_body()) != Some(h5.clone()) {
                 return TestResult::Fail("80MHz join offered HE160");
@@ -1372,7 +1373,7 @@ fn smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux() -> TestResult
         _ => return TestResult::Fail("admitted 80MHz half of a 160MHz BSS not offered"),
     }
     // The admitted C 160MHz chandef: VHT160 + HE160, exactly that profile.
-    match wide_phy(&ies, 40, true, &[p80, p160]) {
+    match wide_phy(&ies, 40, true, false, &[p80, p160]) {
         Some((local, p)) if p == p160 => {
             if local.he().map(|he| he.capability_body()) != Some(h160.clone()) {
                 return TestResult::Fail("160MHz join lacks the HE160 capability");
@@ -1382,7 +1383,7 @@ fn smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux() -> TestResult
     }
     // An 80MHz BSS never selects the 160MHz candidate.
     if !matches!(
-        wide_phy(&wide_ap_ies(40, 3, Some((1, 42))), 40, false, &[p80, p160]),
+        wide_phy(&wide_ap_ies(40, 3, Some((1, 42))), 40, false, false, &[p80, p160]),
         Some((_, p)) if p == p80
     ) {
         return TestResult::Fail("80MHz BSS joined at 160MHz");
@@ -1515,4 +1516,56 @@ fn smoke_rtw8852c_6ghz_ra_is_he_only_ofdm() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_6ghz_ra_is_he_only_ofdm
+);
+/// RTL8851B (`rx_nss` = `tx_nss` = 1): the NSS1 HE/VHT bodies differ from
+/// the B/C ones only in the MCS maps, and the one-stream wide join offers
+/// them, never a 160MHz candidate.
+fn smoke_rtw8851b_station_offers_one_stream_he_vht() -> TestResult {
+    use super::super::operating_channel::{Profile, Width};
+    let (Some(he), Some(he1), Some(vht), Some(vht1)) =
+        (local_he(), local_he_1ss(), local_vht80(), local_vht80_1ss())
+    else {
+        return TestResult::Fail("one-stream capability rejected by the shared API");
+    };
+    let (b, b1) = (he.capability_body(), he1.capability_body());
+    let (v, v1) = (vht.capability_body(), vht1.capability_body());
+    if b1.len() != b.len()
+        || b1[..18] != b[..18]
+        || b1[18..22] != [0xfe, 0xff, 0xfe, 0xff]
+        || v1[..4] != v[..4]
+        || v1[4..6] != [0xfe, 0xff]
+        || v1[8..10] != [0xfe, 0xff]
+    {
+        return TestResult::Fail("one-stream bodies are not the NSS1 restriction");
+    }
+    for ghz5 in [false, true] {
+        let (Some(w), Some(w1)) = (local_he_wide(ghz5), local_he_wide_1ss(ghz5)) else {
+            return TestResult::Fail("one-stream wide HE rejected");
+        };
+        let (w, w1) = (w.capability_body(), w1.capability_body());
+        if w1[..18] != w[..18] || w1[18..22] != [0xfe, 0xff, 0xfe, 0xff] {
+            return TestResult::Fail("one-stream wide HE is not the NSS1 restriction");
+        }
+    }
+    if he_fingerprint_1ss() == he_fingerprint() || wide_fingerprint_1ss() == wide_fingerprint() {
+        return TestResult::Fail("one-stream programs share the two-stream identity");
+    }
+    let ies = wide_ap_ies(40, 3, Some((1, 42)));
+    let (Some(p80), Some(p160)) = (
+        Profile::new_5ghz(40, Width::Mhz80),
+        Profile::new_5ghz_160(40),
+    ) else {
+        return TestResult::Fail("5GHz wide profiles missing");
+    };
+    if !matches!(wide_phy(&ies, 40, true, true, &[p80]), Some((_, p)) if p == p80) {
+        return TestResult::Fail("one-stream VHT80 chandef not offered");
+    }
+    if wide_phy(&ies, 40, true, true, &[p160]).is_some() {
+        return TestResult::Fail("one-stream station offered a 160MHz chandef");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_station_offers_one_stream_he_vht
 );

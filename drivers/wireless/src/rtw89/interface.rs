@@ -729,7 +729,10 @@ impl<I: Io + 'static> Device<I> {
             } else {
                 Vec::new()
             };
-            profiles.iter().fold(0u8, |mask, profile| {
+            // bit3 (only beside a band bit): one RF path (RTL8851B), the
+            // NSS1 VHT body.
+            let one_stream = if io.station_single_stream() { 8 } else { 0 };
+            let mask = profiles.iter().fold(0u8, |mask, profile| {
                 // bit2: an admitted 5GHz 160MHz profile (RTL8852C only;
                 // RTL8852B `admitted_wide` never lists one).
                 let c160 = if profile.width() == super::operating_channel::Width::Mhz160 {
@@ -738,7 +741,12 @@ impl<I: Io + 'static> Device<I> {
                     0
                 };
                 mask | c160 | if profile.is_5ghz() { 2 } else { 1 }
-            })
+            });
+            if mask != 0 {
+                mask | one_stream
+            } else {
+                0
+            }
         };
         self.wide.store(wide, Ordering::Release);
         // 6GHz: an admitted RTL8852C 20MHz record under the HE programs
@@ -1279,6 +1287,8 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
                 vht: Some(
                     if wide & 4 != 0 {
                         super::station_control::local_vht160()?
+                    } else if wide & 8 != 0 {
+                        super::station_control::local_vht80_1ss()?
                     } else {
                         super::station_control::local_vht80()?
                     }

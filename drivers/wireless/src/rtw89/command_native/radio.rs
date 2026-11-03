@@ -266,6 +266,8 @@ impl Native {
         crate::rtw89::station_control::awake(&mut self.io)?;
         let registers: &[u32] = if self.chip == ChipId::Rtl8852C {
             &crate::rtw89::track::REGISTERS_C
+        } else if self.chip == ChipId::Rtl8851B {
+            &crate::rtw89::track::REGISTERS_51
         } else {
             &crate::rtw89::track::REGISTERS
         };
@@ -278,9 +280,11 @@ impl Native {
     /// Chip dispatch of `operating_current` for track work. C: the current
     /// C ordinary grant, the C factory/PHY-capability receipt and the C
     /// operating owner `phy_operating::Operating::prepare_c` prepared from
-    /// the same identity (`support_cckpd` true on every C cut).
+    /// the same identity (`support_cckpd` true on every C cut). RTL8851B:
+    /// likewise its own ordinary grant, factory/receipt and the B-sequence
+    /// operating owner (`support_cckpd` true on every RTL8851B cut).
     fn track_operating_current(&self) -> Result<(), power::Error> {
-        if self.chip != ChipId::Rtl8852C {
+        if !matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) {
             return self.operating_current();
         }
         self.radio_profile_current()?;
@@ -309,6 +313,15 @@ impl Native {
     pub(in crate::rtw89) fn station_track_layout(
         &self,
     ) -> Result<(crate::rtw89::track::Layout, bool), power::Error> {
+        if self.chip == ChipId::Rtl8851B {
+            self.track_operating_current()?;
+            let active = self
+                .qualification_51
+                .as_ref()
+                .ok_or(power::Error::Unsupported)?
+                .active();
+            return Ok((crate::rtw89::track::LAYOUT_51, active.is_5ghz()));
+        }
         if self.chip != ChipId::Rtl8852C {
             return Ok((crate::rtw89::track::LAYOUT_B, false));
         }
@@ -369,6 +382,9 @@ impl Native {
         if cap > 0x7f {
             return Err(power::Error::Access);
         }
+        if self.chip == ChipId::Rtl8851B {
+            return self.station_track_crystal_51(cap);
+        }
         let mut port = self.radio_io()?;
         // SAFETY: the retained exclusive B owner serializes every XTAL SI
         // transaction (track work runs under the station's retained lock);
@@ -383,6 +399,31 @@ impl Native {
             }
             Ok(xi)
         }
+    }
+    /// phy.c `rtw89_phy_cfo_set_crystal_cap` RTL8851B branch
+    /// (`rtw8851b_xtal_info`): `R_AX_XTAL_ON_CTRL3` (0x28c) SC_XO
+    /// [14:8] then SC_XI [6:0] masked writes, then read both back.
+    fn station_track_crystal_51(&mut self, cap: u8) -> Result<u8, power::Error> {
+        use power::Io as _;
+        const R_AX_XTAL_ON_CTRL3: u32 = 0x028c;
+        const SC_XO: u32 = 0x7f00;
+        const SC_XI: u32 = 0x007f;
+        let mut port = self.radio_io()?;
+        for mask in [SC_XO, SC_XI] {
+            let old = port.read32(R_AX_XTAL_ON_CTRL3)?;
+            if old == u32::MAX {
+                return Err(power::Error::Gone);
+            }
+            let new = (old & !mask) | ((u32::from(cap) << mask.trailing_zeros()) & mask);
+            port.write32(R_AX_XTAL_ON_CTRL3, new)?;
+        }
+        let value = port.read32(R_AX_XTAL_ON_CTRL3)?;
+        let xo = ((value & SC_XO) >> SC_XO.trailing_zeros()) as u8;
+        let xi = (value & SC_XI) as u8;
+        if value == u32::MAX || xo != cap || xi != cap {
+            return Err(power::Error::Terminal);
+        }
+        Ok(xi)
     }
     pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
         if self.c_ordinary()? {

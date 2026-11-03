@@ -208,6 +208,11 @@ pub(super) unsafe trait Io: Send {
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
+    /// One RF path (RTL8851B `rx_nss` = `tx_nss` = 1): the station offers
+    /// the NSS1 VHT/HE capability bodies.
+    fn station_single_stream(&mut self) -> bool {
+        false
+    }
     /// Retune the Ready radio to `primary` (2.4GHz or 5GHz 20MHz, signed
     /// N52C record required except channel1) and return the new retune epoch. `Busy` is a
     /// proven-unpublished refusal while TX/RX work is still pending.
@@ -2692,12 +2697,14 @@ impl State {
             // A 40/80MHz join needs an admitted wide record for exactly the
             // chandef the AP and local capability select, wholly active (no
             // passive-only subchannel: no beacon witness covers a wide span).
+            let one_stream = io.station_single_stream();
             let wide = if ht_allowed {
                 let admitted = io.station_wide_channels()?;
                 super::station_control::wide_phy(
                     &candidate.bss.information_elements,
                     candidate.bss.channel,
                     he_allowed,
+                    one_stream,
                     &admitted,
                 )
                 .filter(|(_, profile)| {
@@ -2758,7 +2765,12 @@ impl State {
                         // HE is offered only under the signed HE20 program
                         // (which itself requires HT20).
                         if he_allowed {
-                            let he = super::station_control::local_he().ok_or(Error::Profile)?;
+                            let he = if one_stream {
+                                super::station_control::local_he_1ss()
+                            } else {
+                                super::station_control::local_he()
+                            }
+                            .ok_or(Error::Profile)?;
                             local = local.with_he(he).map_err(|_| Error::Profile)?;
                         }
                         local
