@@ -34,3 +34,44 @@ kernel_test_in!(
     "drivers/wireless/ath10k/vht160",
     smoke_ath10k_vht160_profile_primary80_and_second_center
 );
+
+fn wide(contiguous: bool, nss: u8) -> Wide {
+    Wide {
+        center2: if contiguous { 5290 } else { 5775 },
+        contiguous,
+        nss,
+        rx_nss: nss,
+        rx_sgi: false,
+    }
+}
+
+/// Linux `chan_to_phymode` (VDEV_START) and `ath10k_mac_get_phymode_vht`
+/// (PEER_ASSOC) for 160 MHz, and the 10.4 `peer_bw_rxnss_override` word.
+/// The modes and `bw160` peer flag are the same in every WMI dialect map.
+fn smoke_ath10k_vht160_phymodes_and_nss_override() -> TestResult {
+    let c = wide(true, 2);
+    let d = wide(false, 2);
+    if c.start_mode() != 15 || d.start_mode() != 14 {
+        return TestResult::Fail("VDEV_START VHT160 / VHT80_80 channel mode");
+    }
+    // Peer width set after the own-width intersection: 160-only (4) or
+    // none (ext NSS) stays VHT160; 160+80+80 (8) is VHT80_80 in Linux.
+    if c.peer_mode(4) != 15 || c.peer_mode(0) != 15 || c.peer_mode(8) != 14 || d.peer_mode(4) != 14
+    {
+        return TestResult::Fail("PEER_ASSOC VHT160 / VHT80_80 peer mode");
+    }
+    // NSS_MAP_ENABLE | (nss-1) in bits 0..2; bits 3..5 only for VHT80_80.
+    if c.nss_override(15) != Some(0x8000_0001)
+        || c.nss_override(14) != Some(0x8000_0009)
+        || wide(true, 1).nss_override(15) != Some(0x8000_0000)
+        || wide(true, 3).nss_override(15).is_some()
+        || wide(true, 0).nss_override(15).is_some()
+    {
+        return TestResult::Fail("10.4 160 MHz NSS override word");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/vht160",
+    smoke_ath10k_vht160_phymodes_and_nss_override
+);

@@ -391,7 +391,10 @@ impl Profile {
     /// (0x10000) from the masked peer LDPC bit and STBC (0x8000) whenever a
     /// masked STBC direction remains. Identical in all six dialect maps.
     /// `ath10k_peer_assoc_h_vht` adds `WMI_PEER_VHT` (0x0200_0000) and, for
-    /// an 80 MHz peer, `WMI_PEER_80MHZ` (0x0400_0000): equal in every map.
+    /// an 80 MHz peer, `WMI_PEER_80MHZ` (0x0400_0000), or for a 160 MHz
+    /// (contiguous or 80+80) peer `bw160` = 0x2000_0000 (wmi.c main/10.x/
+    /// 10.2 maps, 10.4 reusing 10.2; wmi-tlv.c `WMI_TLV_PEER_160MHZ`):
+    /// equal in every map.
     pub(super) fn peer_flags(self) -> u32 {
         (if self.transmit_ldpc { 0x1_0000 } else { 0 })
             | if self.peer_tx_stbc || self.capabilities & 0x300 != 0 {
@@ -443,10 +446,11 @@ impl Profile {
         })
     }
     /// PEER_ASSOC `peer_phymode` (Linux `ath10k_peer_assoc_h_phymode`): a
-    /// VHT peer is `MODE_11AC_VHT20/40/80` (8/9/10) by its bandwidth.
+    /// VHT peer is `MODE_11AC_VHT20/40/80` (8/9/10) by its bandwidth, and a
+    /// 160 MHz peer VHT160/VHT80_80 (15/14) per `wide::Wide::peer_mode`.
     pub(super) fn mode(self, frequency: u16) -> u32 {
         match self.vht {
-            Some(v) if v.wide.is_some() => 14,
+            Some(v) if v.wide.is_some() => v.wide.map_or(14, |w| w.peer_mode(v.capabilities)),
             Some(v) if v.eighty => 10,
             Some(_) if self.secondary.is_some() => 9,
             Some(_) => 8,
@@ -458,8 +462,8 @@ impl Profile {
     /// 5GHz20/40 uses MODE_11NA_HT20/HT40 (4/6) even for a VHT peer;
     /// only80 MHz selects MODE_11AC_VHT80 (10).
     pub(super) fn start_mode(self, frequency: u16) -> u32 {
-        if self.vht.is_some_and(|v| v.wide.is_some()) {
-            14
+        if let Some(wide) = self.vht.and_then(|v| v.wide) {
+            wide.start_mode()
         } else if self.vht.is_some_and(|v| v.eighty) {
             10
         } else if self.secondary.is_some() {

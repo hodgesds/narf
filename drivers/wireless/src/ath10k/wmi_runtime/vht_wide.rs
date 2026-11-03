@@ -13,6 +13,39 @@ pub(in crate::ath10k::wmi_runtime) struct Wide {
     pub rx_nss: u8,
     pub rx_sgi: bool,
 }
+impl Wide {
+    /// VDEV_START channel mode, Linux `mac.c::chan_to_phymode`:
+    /// `NL80211_CHAN_WIDTH_160` is `MODE_11AC_VHT160` (15), `_80P80`
+    /// `MODE_11AC_VHT80_80` (14) (wmi.h `enum wmi_phy_mode`).
+    pub(in crate::ath10k::wmi_runtime) fn start_mode(self) -> u32 {
+        if self.contiguous {
+            15
+        } else {
+            14
+        }
+    }
+    /// PEER_ASSOC `peer_phymode`, Linux `ath10k_mac_get_phymode_vht` for a
+    /// 160 MHz peer: the bound peer VHT width set (`capabilities`, already
+    /// our own-width intersection) picks VHT80_80 when it is 160+80+80 and
+    /// VHT160 otherwise; an 80+80 channel is only reached with that set.
+    pub(in crate::ath10k::wmi_runtime) fn peer_mode(self, capabilities: u32) -> u32 {
+        if self.contiguous && capabilities & 12 != 8 {
+            15
+        } else {
+            14
+        }
+    }
+    /// 10.4 `peer_bw_rxnss_override` (Linux `ath10k_peer_assoc_h_vht`):
+    /// `WMI_PEER_NSS_MAP_ENABLE` with the 160 MHz NSS-1 field, plus the
+    /// 80+80 field only for a `MODE_11AC_VHT80_80` peer.
+    pub(in crate::ath10k::wmi_runtime) fn nss_override(self, peer_mode: u32) -> Option<u32> {
+        if !(1..=2).contains(&self.nss) {
+            return None;
+        }
+        let nss = u32::from(self.nss - 1);
+        Some(0x8000_0000 | nss | if peer_mode == 14 { nss << 3 } else { 0 })
+    }
+}
 /// Linux ath10k mac.c::get_160mhz_nss_from_maxrate. Its TX override
 /// conservatively uses one for an unrecognized peer RX hint. An unknown
 /// peer TX highest-rate field does not erase a valid advertised receive map.
