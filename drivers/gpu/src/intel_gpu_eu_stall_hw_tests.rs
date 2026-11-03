@@ -318,7 +318,7 @@ fn smoke_lnl_eu_stall_raw_query_open_cancel_reopen_and_full_reset_owner() -> Tes
         ALLOWED.store(false, Ordering::Release);
         assert_eq!(
             ready(file.dispatch_user(&info, xe::OBSERVATION, 32, &cpu)),
-            Some(Err(FsError::OperationNotPermitted))
+            Some(Err(FsError::PermissionDenied))
         );
         assert!(backend.pending.lock().is_none());
         ALLOWED.store(true, Ordering::Release);
@@ -336,7 +336,7 @@ fn smoke_lnl_eu_stall_raw_query_open_cancel_reopen_and_full_reset_owner() -> Tes
             denied
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Some(Err(FsError::OperationNotPermitted)))
+            Poll::Ready(Some(Err(FsError::PermissionDenied)))
         );
         drop(denied);
         gt.poll_eu_stall(399, || true);

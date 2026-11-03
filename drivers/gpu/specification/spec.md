@@ -782,7 +782,9 @@ startup's acknowledged heavy GGTT invalidations. Query 10
 is available only after that owner and the execution epoch are published.
 Xe OBSERVATION type 1/open 0 returns a disabled sampling description; current
 CAP_PERFMON or CAP_SYS_ADMIN is required at open and every read/control, including
-after an awaited operation. The property chain follows
+after an awaited operation. As in `xe_eu_stall_stream_open`, open returns ENODEV
+without the published owner before EACCES for missing privilege. Later
+read/control refusals are EPERM. The property chain follows
 xe_eu_stall_user_extensions: at most five links (a sixth is E2BIG before it is
 read; links may repeat), each a 16-byte header copied and checked (name, pad:
 EINVAL) before the 48-byte set-property body (EFAULT; reserved[] unchecked),

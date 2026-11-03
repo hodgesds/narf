@@ -820,7 +820,7 @@ fn smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close() -
     ALLOWED.store(false, Ordering::Release);
     assert_eq!(
         ready(open_with_gate(backend.clone(), 32, &wire, gate)),
-        Err(FsError::OperationNotPermitted)
+        Err(FsError::PermissionDenied)
     );
     assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     ALLOWED.store(true, Ordering::Release);

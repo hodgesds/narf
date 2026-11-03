@@ -104,11 +104,12 @@ struct Gate {
 }
 impl Gate {
     const PHYSICAL: Self = Self { capable };
+    /// xe_eu_stall_stream_open: paranoid && !perfmon_capable() is EACCES.
     fn check(self) -> Result<(), FsError> {
         if (self.capable)() {
             Ok(())
         } else {
-            Err(FsError::OperationNotPermitted)
+            Err(FsError::PermissionDenied)
         }
     }
 }
@@ -377,11 +378,10 @@ async fn open_with_gate(
     user: &dyn IoctlContext,
     gate: Gate,
 ) -> Result<u64, FsError> {
+    // xe_eu_stall_stream_open: platform support (ENODEV), then privilege.
+    let info = backend.eu_stall_info().ok_or(FsError::NoDevice)?;
     gate.check()?;
-    let info = backend
-        .eu_stall_info()
-        .ok_or(FsError::NoDevice)?
-        .validate()?;
+    let info = info.validate()?;
     let mut wire = [0; 32];
     user.read(address, &mut wire)?;
     let value = |at| u64::from_le_bytes(wire[at..at + 8].try_into().unwrap());
