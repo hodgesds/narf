@@ -1185,6 +1185,8 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     let driver = match (device.lifecycle.device_id(), usb, I::SYNCHRONOUS) {
         (0xc821, false, true) => "rtw8821ce",
         (0xc822, false, true) => "rtw8822ce",
+        // Linux `rtw8822be.c` `rtw_8822be_driver.name`.
+        (0xb822, false, true) => "rtw8822be",
         // Linux `rtw8821cu.c` `rtw_8821cu_driver.name`; the USB backend is
         // asynchronous, so the worker drives it.
         (0xc821, true, false) => "rtw8821cu",

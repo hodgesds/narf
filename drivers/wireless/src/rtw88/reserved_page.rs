@@ -962,7 +962,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         self.io.begin_station8821c()
     }
     fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != PageState::Continued || !self.completed || gate.did() != 0xc821 {
+        // C21 and B22 (`radio8822b::prepare_station`) both arrive parked.
+        if self.state != PageState::Continued
+            || !self.completed
+            || !matches!(gate.did(), 0xc821 | 0xb822)
+        {
             return Err(Error::State);
         }
         self.state = PageState::Terminal;

@@ -44,7 +44,7 @@ pub struct Rtw88Device {
     /// The exact post-power native owner, shared by controller and interface.
     pub(super) firmware: Option<Arc<super::firmware_native::Firmware>>,
     pub(super) sibling: Option<Arc<super::sibling::Sibling>>,
-    /// Retained RTL8822BE native owner (firmware continuation; no station shell yet).
+    /// Retained RTL8822BE native owner; its lifecycle backs `interface`.
     pub(super) b22: Option<Arc<super::native8822b::Owner8822b>>,
     pub(super) interface: Option<Arc<super::interface::Native>>,
     pub link_up: AtomicBool,
@@ -484,32 +484,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 }
 
 pub(super) fn schedule_owner(owner: Arc<Rtw88Device>) {
-    if owner.b22.is_some() {
-        // The diagnostic RTL8822BE shell has no station interface yet; only
-        // its retained firmware continuation runs. Retry while the trusted
-        // firmware registry has not yet supplied the authenticated image.
-        narf_scheduler::spawn(async move {
-            let result = drive_scheduled(
-                120,
-                || {
-                    owner.b22.as_ref().is_some_and(|b22| {
-                        b22.status().stage == super::firmware_lifecycle::Stage::Detected
-                    })
-                },
-                || {
-                    let owner = owner.clone();
-                    async move { provision_owner(&owner).await }
-                },
-                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
-            )
-            .await;
-            if let Err(error) = result {
-                narf_console::klog!("rtw88 8822be provisioning: {:?}\n", error);
-            }
-        });
-        return;
-    }
-    if (owner.firmware.is_none() && owner.sibling.is_none()) || owner.interface.is_none() {
+    if (owner.firmware.is_none() && owner.sibling.is_none() && owner.b22.is_none())
+        || owner.interface.is_none()
+    {
         return;
     }
     narf_scheduler::spawn(async move {
@@ -732,7 +709,8 @@ unsafe fn bring_up_mode(
     let station_lifecycle = firmware
         .as_ref()
         .map(|firmware| firmware.lifecycle())
-        .or_else(|| sibling.as_ref().map(|owner| owner.lifecycle()));
+        .or_else(|| sibling.as_ref().map(|owner| owner.lifecycle()))
+        .or_else(|| b22.as_ref().map(|owner| owner.lifecycle()));
     let interface = station_lifecycle.map(|lifecycle| {
         let name = name.unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
         Arc::new(super::interface::Device::new(
@@ -931,24 +909,51 @@ fn retryable(owner: &Rtw88Device) -> bool {
         .firmware
         .as_ref()
         .map(|fw| fw.status().stage)
-        .or_else(|| owner.sibling.as_ref().map(|fw| fw.status().stage));
-    matches!(
-        stage,
-        Some(
-            Stage::Detected
-                | Stage::PhyTablesPrepared
-                | Stage::Calibration8821cPrepared
-                | Stage::Operating8821cPrepared
-        )
-    ) && owner
-        .interface
-        .as_ref()
-        .is_some_and(|iface| !iface.closed())
+        .or_else(|| owner.sibling.as_ref().map(|fw| fw.status().stage))
+        .or_else(|| owner.b22.as_ref().map(|fw| fw.status().stage));
+    // Each is a pure checkpoint awaiting the next genuine asset (firmware,
+    // calibration/operating/station records). B22 `Calibrated` awaits `N2BP`
+    // (`Owner8822b::provision`); on C22 it is the admitted radio.
+    let b22_power = owner.b22.is_some() && stage == Some(Stage::Calibrated);
+    let pending = b22_power
+        || matches!(
+            stage,
+            Some(
+                Stage::Detected
+                    | Stage::PhyTablesPrepared
+                    | Stage::Calibration8821cPrepared
+                    | Stage::Operating8821cPrepared
+            )
+        );
+    pending
+        && owner
+            .interface
+            .as_ref()
+            .is_some_and(|iface| !iface.closed())
 }
 pub(super) async fn provision_owner(controller: &Rtw88Device) -> Result<(), super::FirmwareError> {
     if let Some(owner) = &controller.b22 {
         let _admission = controller.provisioning.lock().await;
-        return owner.provision().await;
+        let interface = controller
+            .interface
+            .as_ref()
+            .ok_or(super::FirmwareError::State)?;
+        if interface.closed() {
+            return Err(super::FirmwareError::Cancelled);
+        }
+        owner.provision().await?;
+        if interface.closed() {
+            return Err(super::FirmwareError::Cancelled);
+        }
+        // `rtw_core_start` counterpart: only the admitted awake B22 radio
+        // (all three signed records current) starts the station shell.
+        if owner.status().stage == super::firmware_lifecycle::Stage::Radio8821cPrepared {
+            interface
+                .activate()
+                .await
+                .map_err(|_| super::FirmwareError::Prerequisite)?;
+        }
+        return Ok(());
     }
     if let Some(owner) = &controller.sibling {
         let _admission = controller.provisioning.lock().await;

@@ -222,7 +222,9 @@ unsafe impl Port for Native {
     }
     fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, packet::Error> {
         match self.device.id.device {
-            0xc821 => Ok(crate::rtw88::packet_phy::Chip::C21),
+            // rtw8822b.h GET_PHY_STAT_P0/P1_* (page, RXSC, RF_MODE word 3
+            // bits 29:28) equal rtw8821c.h; 8822B also reports no channel.
+            0xc821 | 0xb822 => Ok(crate::rtw88::packet_phy::Chip::C21),
             0xc822 => Ok(crate::rtw88::packet_phy::Chip::C22),
             _ => Err(packet::Error::Packet),
         }

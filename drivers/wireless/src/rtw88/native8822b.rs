@@ -77,7 +77,8 @@ impl Owner8822b {
     /// `rtw_mac_init` + `rtw8822b_mac_init`, complete `rtw8822b_phy_set_param`,
     /// the signed `N2BQ` ch1/20 firmware IQK, the signed `N2BP` parked TXAGC,
     /// then the signed `N2BS` awake-station radio; host DMA parked, TXPAUSE
-    /// closed). An unprovisioned board stops at `PhyTablesPrepared`.
+    /// closed). A `StationReady` request is a no-op. An unprovisioned board
+    /// stops at `PhyTablesPrepared`.
     pub(super) async fn provision(&self) -> Result<(), Error> {
         let _admission = self.admission.lock().await;
         loop {
@@ -108,9 +109,9 @@ impl Owner8822b {
                     // pure and keeps this checkpoint retryable.
                     self.lifecycle.prepare_station8822b(&self.factory).await?;
                 }
-                // The awake B22 radio is parked behind closed MAC/DMA gates;
-                // no station shell consumes it yet.
-                Stage::Radio8821cPrepared => return Ok(()),
+                // The awake B22 radio is parked behind closed MAC/DMA gates
+                // until `pci::provision_owner` activates the station shell.
+                Stage::Radio8821cPrepared | Stage::StationReady => return Ok(()),
                 _ => return Err(Error::State),
             }
         }
