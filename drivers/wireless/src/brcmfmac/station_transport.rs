@@ -22,6 +22,8 @@ struct Flow {
 }
 struct Tx {
     id: u32,
+    /// Firmware interface whose flow published this packet.
+    ifidx: u8,
     deadline: narf_time::Deadline,
     ap_terminal: Option<alloc::sync::Weak<super::ap_tx::Terminal>>,
 }
@@ -272,12 +274,16 @@ where
         if !original.lifecycle() {
             return Err(Error::Authority);
         }
+        // msgbuf flow rings are per (ifidx, fifo, da) (`flowring.c`
+        // brcmf_flowring_lookup/create): the primary AP needs only
+        // interface 0 free of station flows and TX. Secondary interfaces
+        // keep their own flows (Linux combo0: 1 STA + 1 AP).
         if self.failed
             || self.peer.is_some()
             || self.ap.is_some()
             || self.closing
-            || !self.tx.is_empty()
-            || !self.flows.is_empty()
+            || self.tx.iter().any(|tx| tx.ifidx == 0)
+            || self.flows.iter().any(|flow| flow.ifidx == 0)
         {
             return Err(Error::Busy);
         }
@@ -357,7 +363,10 @@ where
         }
         self.closing = true;
         self.progress()?;
-        if self.closing || !self.tx.is_empty() || !self.flows.is_empty() {
+        if self.closing
+            || self.tx.iter().any(|tx| tx.ifidx == 0)
+            || self.flows.iter().any(|flow| flow.ifidx == 0)
+        {
             return Ok(false);
         }
         self.ap = None;
@@ -381,7 +390,9 @@ where
         if !self.events.is_empty() {
             return Ok(false);
         }
-        Ok(self.tx.is_empty()
+        // Only the AP interface's own TX; secondary traffic is not
+        // part of this owner's terminal set.
+        Ok(!self.tx.iter().any(|tx| tx.ifidx == 0)
             && self
                 .inner
                 .as_mut()
@@ -396,7 +407,11 @@ where
         self.progress()?;
         let inner = self.inner.as_mut().ok_or(Error::Failed)?;
         let mut pending = false;
-        for flow in self.flows.iter().filter(|flow| flow.destination == peer) {
+        for flow in self
+            .flows
+            .iter()
+            .filter(|flow| flow.ifidx == 0 && flow.destination == peer)
+        {
             match inner.flow_state(flow.token).map_err(map)? {
                 FlowState::Open => {
                     pending = true;
@@ -413,7 +428,10 @@ where
         // native completion. Refused DELETE now fail-stops rather than
         // granting a false success/reuse fence (independent baseline repair).
         Ok(!pending
-            && !self.flows.iter().any(|flow| flow.destination == peer)
+            && !self
+                .flows
+                .iter()
+                .any(|flow| flow.ifidx == 0 && flow.destination == peer)
             && inner.ap_completed_idle().map_err(map)?)
     }
     async fn command_ap<'a>(
@@ -715,8 +733,9 @@ where
         self.vif.listen(on);
     }
     fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
-        // The primary AP owner keeps exclusive msgbuf data publication.
-        if self.failed || self.ap.is_some() {
+        // The primary AP owns only interface 0's flows; a secondary ifidx
+        // has its own (Linux combo0: primary AP + secondary STA).
+        if self.failed {
             return Err(Error::Failed);
         }
         if ifidx == 0 || ifidx >= super::vif_wire::MAX_IFS {
@@ -759,7 +778,7 @@ where
         self.inner.as_mut()?.pop_vif_received(ifidx)
     }
     fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
-        if self.failed || self.ap.is_some() || !self.vif.is_open(ifidx) {
+        if self.failed || !self.vif.is_open(ifidx) {
             return Err(Error::Failed);
         }
         self.begin_data(ifidx, frame, priority, None).map(|_| ())
@@ -894,6 +913,7 @@ where
         let id = published.map_err(map)?;
         self.tx.push(Tx {
             id,
+            ifidx,
             deadline: narf_time::Deadline::after_ms(2000),
             ap_terminal: None,
         });

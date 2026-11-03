@@ -119,6 +119,21 @@ impl Owner {
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
+    /// `cfg80211.c::brcmf_vif_change_validate`: whether the primary may
+    /// change to `role` beside the live secondary interfaces (combinations
+    /// are checked only when another interface exists).
+    pub fn can_change_primary(&self, role: Role) -> bool {
+        let (mut stations, mut aps) = (u8::from(role == Role::Station), u8::from(role == Role::Ap));
+        let mut concurrent = false;
+        for current in self.roles.iter().flatten() {
+            concurrent = true;
+            match current {
+                Role::Station => stations += 1,
+                Role::Ap => aps += 1,
+            }
+        }
+        !concurrent || admits(self.features, stations, aps)
+    }
     /// Whether an additional interface of `role` fits a combination now.
     pub fn can_add(&self, role: Role) -> bool {
         let mut stations = u8::from(self.primary_role == Role::Station);

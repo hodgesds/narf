@@ -253,6 +253,21 @@ impl<R: Fullmac + 'static> Device<R> {
                 .current()
                 .map_err(|_| WirelessError::Denied)?;
         }
+        // cfg80211.c brcmf_cfg80211_change_iface -> brcmf_vif_change_validate:
+        // the primary's new type must fit a combination beside the live
+        // secondary interfaces (combo0: primary AP + one secondary STA).
+        let primary_role = if mode == 3 {
+            crate::brcmfmac::vif_owner::Role::Ap
+        } else {
+            crate::brcmfmac::vif_owner::Role::Station
+        };
+        if state
+            .vif
+            .as_ref()
+            .is_some_and(|owner| !owner.can_change_primary(primary_role))
+        {
+            return Err(WirelessError::Busy);
+        }
         if self.ap_mode() == mode {
             return Ok(());
         }
@@ -276,6 +291,9 @@ impl<R: Fullmac + 'static> Device<R> {
             .ok_or(WirelessError::Denied)?;
         self.lifecycle.ap.generation.store(next, Ordering::Release);
         self.lifecycle.ap.mode.store(mode as u8, Ordering::Release);
+        if let Some(owner) = state.vif.as_mut() {
+            owner.set_primary_role(primary_role);
+        }
         self.lifecycle.monitor.clear_selection();
         *self.lifecycle.ap.staging.lock() = Staging::default();
         self.lifecycle.ap.events.lock().take();

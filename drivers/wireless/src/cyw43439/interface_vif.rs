@@ -504,7 +504,7 @@ impl<R: Fullmac + 'static> Device<R> {
 
     /// The primary worker's secondary pass: IF events, pending native
     /// create/remove, retirement and the live shells' data pump.
-    pub(super) async fn vif_worker(&self, station_mode: bool) {
+    pub(super) async fn vif_worker(&self) {
         if !R::VIF_DEMUX {
             return;
         }
@@ -525,11 +525,10 @@ impl<R: Fullmac + 'static> Device<R> {
             };
             // Role state of a STA shell whose native create runs this pass
             // (one create is in flight at a time).
-            let mut template = (station_mode
-                && pending
-                    .iter()
-                    .any(|shell| shell.phase() == CREATING && shell.role == Role::Station))
-            .then(|| station.secondary([0; 6]));
+            let mut template = pending
+                .iter()
+                .any(|shell| shell.phase() == CREATING && shell.role == Role::Station)
+                .then(|| station.secondary([0; 6]));
             let runtime = &mut station.runtime;
             if owner.service(runtime).is_err() {
                 // A bounded event queue overflowed: fail closed.
@@ -545,7 +544,7 @@ impl<R: Fullmac + 'static> Device<R> {
             }
             for shell in pending.iter() {
                 match shell.phase() {
-                    CREATING if station_mode => {
+                    CREATING => {
                         match owner.create(runtime, shell.role, shell.requested).await {
                             Ok(entry) => {
                                 *shell.entry.lock() = Some(entry);
@@ -684,7 +683,7 @@ impl<R: Fullmac + 'static> Roles for Device<R> {
         request: ScanRequest,
     ) -> Result<Vec<BssInfo>, WirelessError> {
         let mut state = self.state.lock().await;
-        if self.withdrawn() || self.ap_mode() != 2 {
+        if self.withdrawn() || !matches!(self.ap_mode(), 2 | 3) {
             return Err(WirelessError::NotSupported);
         }
         with_secondary!(state, cookie, |station| station.scan(request).await)
@@ -696,7 +695,7 @@ impl<R: Fullmac + 'static> Roles for Device<R> {
         request: AssociateRequest,
     ) -> Result<Option<[u8; 6]>, WirelessError> {
         let mut state = self.state.lock().await;
-        if self.withdrawn() || self.ap_mode() != 2 {
+        if self.withdrawn() || !matches!(self.ap_mode(), 2 | 3) {
             return Err(WirelessError::NotSupported);
         }
         let result = with_secondary!(state, cookie, |station| {

@@ -102,6 +102,11 @@ fn smoke_brcmf_vif_create_waits_for_if_add_and_remove_for_if_del() -> TestResult
     {
         return TestResult::Fail("combination limit not enforced before request");
     }
+    // brcmf_vif_change_validate: beside the live secondary AP the primary
+    // may stay a STA (combo0) but may not also become an AP.
+    if !owner.can_change_primary(Role::Station) || owner.can_change_primary(Role::Ap) {
+        return TestResult::Fail("primary change not validated against live roles");
+    }
     // Secondary non-IF events stay with their live bsscfg entry.
     runtime.fw.secondary_event(16, 1, 2, VIF, &[]);
     runtime.fw.secondary_event(16, 3, 3, VIF, &[]);

@@ -896,14 +896,16 @@ impl<R: Fullmac + 'static> Device<R> {
             } else if self.ap_mode() == 3 {
                 self.ap_worker().await;
                 self.ap_drain();
-                self.vif_worker(false).await;
+                // Primary AP + secondary STA is Linux combo0; the secondary
+                // keeps its own ifidx data and bsscfg events.
+                self.vif_worker().await;
             } else {
                 self.deliver_received(self.step());
                 self.apply_roam().await;
                 self.apply_external().await;
                 self.apply_power_save().await;
                 self.apply_pmksa().await;
-                self.vif_worker(true).await;
+                self.vif_worker().await;
             }
             match (&wake, seen) {
                 (Some((signal, delivered)), Some(seen)) => {

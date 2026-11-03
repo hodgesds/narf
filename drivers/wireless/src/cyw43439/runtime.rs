@@ -544,13 +544,12 @@ impl<T: PacketTransport> Runtime<T> {
         self.send_data_inner(0, ethernet, priority, None)
     }
     /// Transmit on secondary firmware interface `if_idx` (BDC
-    /// `BCDC_SET_IF_IDX`). Only an ifidx its owner opened is admitted; the
-    /// primary AP session keeps exclusive SDPCM data ownership.
+    /// `BCDC_SET_IF_IDX`). Only an ifidx its owner opened is admitted. The
+    /// primary AP session owns interface 0 data only: BCDC addresses every
+    /// packet by ifidx (`brcmf_proto_bcdc_hdrpush`), so a secondary
+    /// interface keeps its own data beside it (Linux combo0).
     pub fn send_data_on(&mut self, if_idx: u8, ethernet: &[u8], priority: u8) -> Result<(), Error> {
-        if self.ap.is_some() {
-            return Err(Error::Authority);
-        }
-        if !self.vif.is_open(if_idx) {
+        if if_idx == 0 || !self.vif.is_open(if_idx) {
             return Err(Error::Authority);
         }
         self.send_data_inner(if_idx, ethernet, priority, None)

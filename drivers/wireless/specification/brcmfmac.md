@@ -1030,9 +1030,15 @@ implement it over `brcmfmac::vif_demux` (`Demux`, `route`).
 - Data for an ifidx that its owner has not opened is dropped
   (`brcmf_proto_bcdc_hdrpull` `-EBADE`, msgbuf `brcmf_get_ifp` NULL);
   previously any nonzero ifidx was a fatal protocol error. Interface-0
-  queues, flows, AP and monitor ownership are unchanged; the primary AP
-  owner and secondary data are mutually exclusive, and PCIe suspend is
-  refused while a secondary interface is open or owns flows.
+  queues, flows, AP and monitor ownership are unchanged, and PCIe suspend
+  is refused while a secondary interface is open or owns flows.
+- Exclusivity is per ifidx, as Linux keys msgbuf flow rings by
+  (ifidx, fifo, da) (`flowring.c`) and BCDC data by `flags2` ifidx: the
+  primary AP owner needs only interface 0 free of station flows/TX
+  (`ap_enter`), its leave/quiet/peer-retire wait only for interface 0
+  flows and TX (`Tx.ifidx`), and `vif_open`/`send_vif_data` (PCIe) and
+  `send_data_on` (SDIO) stay available during a primary AP. Monitor
+  reservation remains device-wide.
 
 One written/unexecuted case: `drivers/wireless/cyw43439/runtime`
 `smoke_cyw_f2_secondary_ifidx_demux`. No PCIe msgbuf secondary-ifidx
@@ -1145,12 +1151,17 @@ secondary (its own bsscfg events only) and makes its correlated
 `set_link` peer the shell carrier (drop queued frames and
 `notify_disconnect` on loss). A fail-stopped secondary (adapter `fail`,
 cancelled operation) retires its interface via `interface_remove`; the
-role ends with its shell. The primary AP owner and secondary data stay
-mutually exclusive on both transports (PCIe `ap_enter` requires no flows
-at all; SDIO `send_data_on` refuses during an AP), so secondary stations
-are created and driven only while the primary is a station; with the
-`brcmf_setup_ifmodes` table that admits a second STA only for `p2p`
-firmware (`p2p`+`mchan` combo0, or the P2P combination).
+role ends with its shell. Secondary interfaces are created and driven
+while the primary is a station or an AP (`ap_mode` 2 or 3; the AP worker
+pass also runs `vif_worker`); a primary mode change is validated against
+the live secondaries as `brcmf_vif_change_validate` does
+(`Owner::can_change_primary`, then `set_primary_role`), so non-P2P
+firmware admits primary AP + secondary STA (combo0) and refuses a
+primary AP beside a secondary AP without MBSS. STA+STA needs `p2p`
+firmware (`p2p`+`mchan` combo0, or the P2P combination). Like Linux
+(`num_different_channels` = 1 without mchan), channel agreement between
+the primary AP and a secondary STA is left to the firmware; no host
+multi-channel scheduling exists.
 One written/unexecuted case in `drivers/wireless/brcmfmac/vif`
 (`smoke_brcmf_vif_secondary_station_joins_on_its_own_bsscfg`, both the
 SDIO and PCIe seam families): create, per-interface dcmds, an Open join
