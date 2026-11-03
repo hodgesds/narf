@@ -1323,8 +1323,16 @@ custom burst 3, MISC_MODE2 AGGWEP) and `dma_txbuf` takes the chip's
 (written, not executed): `smoke_ath9k_ar9287_13_enables_async_fifo_before_ini`,
 `smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu`.
 
-Still missing before `0x002d`/`0x002e` can be matched: two-chain TX descriptor
-chain selection in the packet owner, signed board records naming the AR9287
+`descriptor::select_chains` is `xmit.c::ath_buf_set_rate`'s chain selection
+for multi-chain AR9002 parts: on 2.4 GHz `ath_txchainmask_reduction` returns
+`ah->txchainmask` unchanged, encoded as `set11nChainSel` (ctl7
+`AR_ChainSel0..3`) for each populated series; series-less aggregate
+middle/last descriptors are untouched, masks outside 1..=3 are refused and
+a one-chain mask leaves the AR9285 encoding byte-identical. Smoke (written,
+not executed): `smoke_ath9k_two_chain_descriptor_chain_selection`.
+
+Still missing before `0x002d`/`0x002e` can be matched: applying
+`select_chains` in the packet owner, signed board records naming the AR9287
 devices, and the probe/station wiring. No AR9287 device is matched.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB

@@ -473,6 +473,27 @@ fn encode_series(
     Ok(words)
 }
 
+/// `xmit.c::ath_buf_set_rate` chain selection for a multi-chain AR9002
+/// part: on 2.4 GHz `ath_txchainmask_reduction` returns `ah->txchainmask`
+/// unchanged (its reductions are APM 5 GHz and AR9462 BT-coex CCK only), and
+/// `ar9002_set_txdesc` encodes it as `set11nChainSel` (ctl7 `AR_ChainSel0..3`)
+/// for every populated series. Aggregate middle/last descriptors, which carry
+/// no series, are left untouched as `ar9002_set_txdesc` never writes their
+/// ctl7.
+pub(super) fn select_chains(words: &mut [u32; WORDS], tx_chainmask: u8) -> Result<(), Error> {
+    if !(1..=3).contains(&tx_chainmask) {
+        return Err(Error::Profile);
+    }
+    for slot in 0..4 {
+        if (words[4] >> (16 + slot * 4)) & 0xf == 0 {
+            break;
+        }
+        let shift = 2 + slot * 5;
+        words[9] = (words[9] & !(7 << shift)) | (u32::from(tx_chainmask) << shift);
+    }
+    Ok(())
+}
+
 pub(super) fn receive_descriptor(address: u64, next: u64) -> Result<[u32; WORDS], Error> {
     if address == 0
         || address & 3 != 0
