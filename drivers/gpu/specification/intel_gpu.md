@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.43** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.44** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -35,8 +35,8 @@
 > DC_off and lit-panel DC5/DC6 services, and display14 resource
 > transactions with live repartitioning and SAGV, and MTL external
 > DP/HDMI outputs with Type-C ownership, owned hotplug, DC_off join,
-> HDMI 2.0 scrambling and VBT port policy, and display-14 FBC pass
-> release native model gates — see §20).
+> HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
+> KMS ownership and pipe DMC pass release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -4010,7 +4010,7 @@ The four GMBUS transport fixtures that failed after the pin renumbering alone
 pass with the `do_gmbus_xfer` rewrite. The debug group pass is deferred to the
 end of the current integration wave.
 
-### Display-14 PSR1 under KMS ownership
+### Display-14 PSR1 under KMS ownership — release gates recorded
 
 The fixed MTL/Arrow Pipe-A KMS owner no longer leaves PSR off for the whole
 ownership period. `intel_gpu_psr` implements display 14's PSR1 from the
@@ -4079,7 +4079,7 @@ were not executed in this slice. Six are register/sink models:
 `smoke_psr_kms_wins_over_fbc_in_both_directions` and
 `smoke_psr_kms_refusals_leave_zero_psr_traffic`.
 
-### Display-14 pipe DMC
+### Display-14 pipe DMC — release gates recorded
 
 Display 14 now loads and enables the per-pipe DMC programs as the pinned
 `intel_dmc.c` does, instead of skipping them and refusing DC re-entry on any
@@ -4087,7 +4087,11 @@ pipe DMC enable.
 
 - **Load:** `intel_gpu_dmc` parses the pipe programs of `mtl_dmc.bin`. Each
   must keep its MMIO table in `ADLP_PIPE_MMIO` and its payload in its slot
-  window, the windows the shipped container uses. Every accepted program is
+  window (A 0x90000, B 0x98000, C 0x52000, D 0x59000). The windows are NARF
+  policy. They come from the shipped `mtl_dmc.bin` v2.23, whose
+  `DMC_SSP_BASE` stack tops sit 0x40 below each window end; the pinned tree
+  bounds no program RAM. An out-of-window pipe program is skipped, its pipe
+  DMC is never enabled, and DC behaviour stays as before. Every accepted program is
   streamed with the main program, pipe events disabled, behind
   Wa_16015201720, and verified.
 - **Enable and disable:** `pipe_lit_for_bar` and `pipe_dark_for_bar` are the
@@ -4107,11 +4111,22 @@ pipe DMC enable.
   blocking, flip queues) is display 20+ or unused here. The Pipe B–D and
   modeset owners must call the hooks before their pipes are DC-safe.
 
-Fixtures, registered and not executed in this slice. In
-`drivers/gpu/intel_gpu_dmc`, `smoke_xelpdp_dmc_parse_skips_pipe_programs` is
+Fixtures: in `drivers/gpu/intel_gpu_dmc`, `smoke_xelpdp_dmc_parse_skips_pipe_programs` is
 replaced by `smoke_xelpdp_dmc_parse_bounds_pipe_programs`;
 `smoke_xelpdp_dmc_load_conversation` and
 `smoke_xelpdp_dmc_disable_and_geometry` now expect the pipe programs; and
 `smoke_xelpdp_pipe_dmc_enable_disable` is new. In
 `drivers/gpu/intel_gpu_dc_states`, `smoke_dc_states_pipe_dmc_follows_pipe_lifetime`
 is new.
+
+Integration of the PSR1 and pipe-DMC slices: all eight release groups pass
+2,066 unique tests with no failures and no Intel skips; the only skip is the
+existing shared RNG-registration skip. Group 7 now also selects
+`drivers/gpu/intel_gpu_psr`, and all twelve PSR fixtures pass, including the
+six on the production `Device`/`Guard` path. With no
+`register_wm_level_disabled` provider, `compute_psr1` refuses with
+`WmLevelUnknown` before `Psr::enable`. The one-time sink read is AUX DPCD
+traffic, and no PSR register is written. The Gen12 probe-time PSR now skips
+only display 14. Integration named the Wa_14015648006 provider type
+(`WmLevelProvider`) and two fixture tuple types for Clippy. The debug group
+pass is deferred to the end of the current integration wave.

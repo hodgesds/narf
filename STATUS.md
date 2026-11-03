@@ -2027,6 +2027,29 @@ this integration wave. Remaining: VBT panel consumers (PPS, eDP link, PSR,
 backlight), VBT AUX remap and lane reversal, HDMI 2.1 FRL, and computed HDMI
 PLLs. None of this has run on physical Intel hardware.
 
+### Display-14 PSR1 and pipe DMC — release gates recorded
+
+Meteor Lake and Arrow Lake run panel self-refresh (PSR1) on the KMS-owned
+Pipe-A eDP panel. It follows Linux's enable, exit and re-arm order around
+flips, DIRTYFB, cursor and color updates, and it is turned off before console
+reclaim, legacy guards, suspend and reset. PSR takes precedence over FBC. PSR
+holds no DC_off reference while active, as Linux PSR1 with DC5/DC6 does. Until
+the watermark lane supplies the Wa_14015648006 input, PSR is refused on
+hardware and no PSR register is written. The console-time PSR path now skips
+display 14; Gen12 is unchanged.
+
+The pipe DMC programs are now loaded and enabled for lit pipes, following
+Linux. Each program must fit its slot window, a NARF limit taken from the
+shipped `mtl_dmc.bin` because Linux sets no bound. A program outside its
+window is skipped, and DC behaviour is then as before.
+
+All eight release groups pass 2,066 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Still to do: the watermark provider for PSR, PSR2
+selective fetch, Panel Replay, and the Pipe B-D and modeset calls into the
+pipe-DMC lifetime hooks. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
