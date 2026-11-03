@@ -5,6 +5,8 @@ use super::{monitor_wire, power, station_control::Admission};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
+/// `NL80211_IFTYPE_AP`: the host AP role (`interface_ap.rs`).
+pub(super) const AP_IFTYPE: u32 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Selection {
     pub mode: u32,
@@ -45,7 +47,7 @@ impl Desired {
         *self.0.lock()
     }
     pub(super) fn select(&self, original: Selection, mode: u32) -> Option<Selection> {
-        if !matches!(mode, 2 | 6) {
+        if !matches!(mode, 2 | 6 | AP_IFTYPE) {
             return None;
         }
         let mut selected = self.0.lock();

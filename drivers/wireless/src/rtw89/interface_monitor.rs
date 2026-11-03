@@ -34,11 +34,20 @@ impl<I: Io + 'static> Device<I> {
     pub(super) fn monitor_selected(&self) -> bool {
         self.selection.mode == wire::IFTYPE
     }
+    pub(super) fn ap_selected(&self) -> bool {
+        self.selection.mode == crate::rtw89::monitor::AP_IFTYPE
+    }
     pub(super) fn select_mode(&self, mode: u32) -> Result<(), WirelessError> {
-        if !self.monitor_capable.load(Ordering::Acquire) {
-            return Err(WirelessError::NotSupported);
-        }
-        if !matches!(mode, 2 | 6) {
+        let capable = match mode {
+            2 => {
+                self.monitor_capable.load(Ordering::Acquire)
+                    || self.ap_capable.load(Ordering::Acquire)
+            }
+            wire::IFTYPE => self.monitor_capable.load(Ordering::Acquire),
+            crate::rtw89::monitor::AP_IFTYPE => self.ap_capable.load(Ordering::Acquire),
+            _ => false,
+        };
+        if !capable {
             return Err(WirelessError::NotSupported);
         }
         let original = self

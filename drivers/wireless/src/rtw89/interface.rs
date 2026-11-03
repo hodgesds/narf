@@ -137,6 +137,13 @@ pub(super) struct Device<I: Io> {
     registration: IrqSafeSpinLock<Option<narf_net::iface::OpenStopEvent>>,
     monitor_admin: IrqSafeSpinLock<Option<narf_net::iface::OpenStopEvent>>,
     capture: IrqSafeSpinLock<Option<monitor::Capture>>,
+    /// RTL8852B AP owner composable on this generation (sampled at
+    /// activation, before any station owner exists).
+    ap_capable: AtomicBool,
+    /// Host AP session (`interface_ap.rs`); never held across an await.
+    ap: IrqSafeSpinLock<super::ap_host::Host>,
+    /// Synchronous AP control serialization (`reserve_ap_control`).
+    ap_serial: Arc<narf_wireless::ap_control::ExclusiveControl>,
 }
 struct SleepWake(Arc<super::irq::Line>);
 impl alloc::task::Wake for SleepWake {
@@ -368,6 +375,9 @@ impl<I: Io + 'static> Device<I> {
             registration: IrqSafeSpinLock::new(None),
             monitor_admin: IrqSafeSpinLock::new(None),
             capture: IrqSafeSpinLock::new(None),
+            ap_capable: AtomicBool::new(false),
+            ap: IrqSafeSpinLock::new(super::ap_host::Host::default()),
+            ap_serial: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
         }
     }
     /// Bind MSI delivery to this shell's worker after the station started.
@@ -417,6 +427,14 @@ impl<I: Io + 'static> Device<I> {
     pub(super) async fn service_once(&self) {
         if self.wow_armed.load(Ordering::Acquire) {
             // The WoW image owns the radio until `wow_resume`.
+            let seen = self.line.raised();
+            let _ =
+                narf_time::timeout(narf_time::Deadline::after_ms(POLL_MS), self.line.wait(seen))
+                    .await;
+            return;
+        }
+        if self.ap_selected() {
+            self.ap_service().await;
             let seen = self.line.raised();
             let _ =
                 narf_time::timeout(narf_time::Deadline::after_ms(POLL_MS), self.line.wait(seen))
@@ -618,6 +636,18 @@ impl<I: Io + 'static> Device<I> {
             .monitor_capable()?;
         self.monitor_capable
             .store(monitor_capable, Ordering::Release);
+        // No station owner exists yet: the AP owner is exclusive with it.
+        let ap_capable = self
+            .lifecycle
+            .retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .io
+            .ap_allowed()
+            .is_ok();
+        self.ap_capable.store(ap_capable, Ordering::Release);
         // Admitted primaries; a failed sample keeps only channel1.
         let channels = self
             .lifecycle
@@ -632,6 +662,19 @@ impl<I: Io + 'static> Device<I> {
         self.channels.store(channels | CHANNEL1, Ordering::Release);
         if self.monitor_selected() {
             if !monitor_capable {
+                return Err(Error::State);
+            }
+            self.admission.run(|| {
+                self.admitted.store(true, Ordering::Release);
+                Ok(())
+            })?;
+            attempt.armed = false;
+            self.line.raise();
+            return Ok(());
+        }
+        if self.ap_selected() {
+            // Radio Ready without a station owner; START_AP composes the AP.
+            if !ap_capable {
                 return Err(Error::State);
             }
             self.admission.run(|| {
@@ -703,12 +746,12 @@ impl<I: Io + 'static> Device<I> {
         // Physical carrier is independent of administrative IFF_UP. In
         // particular, do not invoke ndo_open/ndo_stop under retained locks.
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
-        if was && !up {
+        if was && !up && !self.ap_selected() {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
     fn control_ready(&self) -> Result<(), WirelessError> {
-        if self.monitor_selected() {
+        if self.monitor_selected() || self.ap_selected() {
             Err(WirelessError::NotSupported)
         } else if self.closed() {
             Err(WirelessError::HardwareError)
@@ -719,6 +762,9 @@ impl<I: Io + 'static> Device<I> {
         }
     }
     pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+        if self.ap_selected() {
+            return self.ap_enqueue(bytes, meta);
+        }
         if !self.admitted.load(Ordering::Acquire)
             || self.closed()
             || !self.up.load(Ordering::Acquire)
@@ -862,6 +908,9 @@ impl<I: Io + 'static> Device<I> {
         }
     }
     pub(super) fn drain(&self) -> bool {
+        if self.ap_selected() {
+            return self.ap_drain();
+        }
         let frames = self.progress();
         let progressed = !frames.is_empty();
         // All retained-owner/ring/admission guards have dropped before the
@@ -1151,6 +1200,12 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
                     WirelessModes::MONITOR
                 } else {
                     WirelessModes::empty()
+                }
+                // core.c `rtw89_core_register_hw`: interface_modes AP.
+                | if self.ap_capable.load(Ordering::Acquire) {
+                    WirelessModes::AP
+                } else {
+                    WirelessModes::empty()
                 },
             hw_caps: HwCaps {
                 ht_supported: false,
@@ -1197,6 +1252,168 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         self.sleep_enabled.store(enabled, Ordering::Release);
         self.line.raise();
         Ok(())
+    }
+    // Host AP (`interface_ap.rs`, `ap_host.rs`): advertised only when this
+    // generation composes the RTL8852B AP owner. rtw89 `WIPHY_FLAG_AP_UAPSD`
+    // (core.c `rtw89_core_register_hw`) is backed by the wired host AP PS
+    // owner (`ap_ps.rs`); `uapsd_max_sp_len = SP_ALL` has no nl80211 form,
+    // and each peer's own Max SP is honoured.
+    fn supports_ap(&self) -> bool {
+        self.ap_capable.load(Ordering::Acquire)
+    }
+    fn supports_ap_uapsd(&self) -> bool {
+        self.supports_ap()
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        self.supports_ap()
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        self.supports_ap()
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        self.supports_ap()
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        self.supports_ap()
+    }
+    // Native AP controls (`interface_ap.rs`). Only the selected AP role of
+    // a live generation has a control generation.
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.ap_serial.try_reserve().map(Some)
+    }
+    fn ap_station_macs(&self) -> Vec<[u8; 6]> {
+        self.ap
+            .lock()
+            .peers()
+            .iter()
+            .map(|peer| peer.addr)
+            .collect()
+    }
+    fn ap_station_info(&self, peer: [u8; 6]) -> Option<narf_wireless::StationInfo> {
+        self.ap
+            .lock()
+            .peer(peer)
+            .map(|_| narf_wireless::StationInfo::default())
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_start(authority, config, settings).await
+    }
+    async fn start_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_start(authority, config, Default::default()).await
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_stop(authority).await
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        _probe_resp: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        // No probe-response offload: hostapd answers probes itself.
+        self.ap_set_beacon(authority, head, tail).await
+    }
+    async fn add_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_add_station(authority, station).await
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_set_station(authority, station).await
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        _reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_del_station(authority, peer).await
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_add_key(authority, key).await
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_del_key(authority, index, pairwise, peer).await
+    }
+    async fn key_sequence_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        self.ap_key_sequence(authority, index, pairwise, peer).await
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_default_key(authority, index, unicast, multicast, management, beacon)
+            .await
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.ap_management(authority, request).await
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        frame_type: u16,
+        match_prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        self.ap_register_frame(authority, frame_type, match_prefix)
+            .await
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control_tx(authority, request).await
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         self.scan_flagged(request, narf_wireless::scan::ScanFlags::default())
@@ -1500,5 +1717,7 @@ impl<I: Io + 'static> Interface for Registered<I> {
     }
 }
 
+#[path = "interface_ap.rs"]
+mod ap;
 #[path = "interface_monitor.rs"]
 mod monitor;

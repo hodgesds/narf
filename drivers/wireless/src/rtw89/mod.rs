@@ -48,6 +48,8 @@
 extern crate alloc;
 
 mod ap_control;
+mod ap_crypto;
+mod ap_host;
 mod ap_ps;
 mod ap_wire;
 mod bdram;

@@ -34,6 +34,40 @@ impl Startup {
         }
         self.station_native()?.ordinary_current()
     }
+    /// Signed AP channel/power admission and program. Linux reaches the AP
+    /// channel through chanctx assignment before `rtw89_ops_start_ap`:
+    /// chan.c `rtw89_chanctx_ops_assign_vif` -> core.c `rtw89_set_channel`
+    /// and `rtw89_chip_rfk_channel` (rtw8852b.c `rtw8852b_rfk_channel`).
+    /// Here that is the same signed full-radio retune the station uses
+    /// (`Native::retune_full_radio`), so only a primary with a current
+    /// signed full program (N52B channel 1, N52C otherwise) whose host rule
+    /// permits active emission is admitted. rtw89 registers no
+    /// `radar_detect_widths` (core.c `rtw89_iface_combs`), so cfg80211
+    /// (`cfg80211_reg_can_beacon`) never lets it beacon on a RADAR or NO_IR
+    /// channel; such a primary is refused here as well. Runs before
+    /// `ap_prepare`, with no AP packet owner or peer.
+    pub(super) async fn ap_channel(
+        &mut self,
+        primary: u8,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        self.ap_admissible()?;
+        if self.ap_controller.is_some() {
+            return Err(power::Error::Terminal);
+        }
+        let native = self.station_native()?;
+        if !crate::rtw89::station::channel_admitted(native.admitted_channels()?, primary) {
+            return Err(power::Error::Unsupported);
+        }
+        if crate::rtw89::station::passive_only(native.station_regulatory()?.as_ref(), primary) {
+            return Err(power::Error::Unsupported);
+        }
+        admission.check()?;
+        let epoch = self.retune_channel(primary, false).await?;
+        admission.check()?;
+        self.ap_admissible()?;
+        Ok(epoch)
+    }
     /// `rtw89_ops_add_interface` (AP): `rtw89_mac_vif_init`, then the AP
     /// packet owner with the CH9 high queue published.
     pub(super) async fn ap_prepare(

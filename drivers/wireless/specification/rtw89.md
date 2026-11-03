@@ -2970,6 +2970,96 @@ cases are written, unexecuted:
 `smoke_rtw89_ap_txwd_macid_qsel_port_and_rates`,
 `smoke_rtw89_ap_txwd_refuses_station_and_misplaced_frames`.
 
+### RTL8852B host AP: interface controls, signed AP channel, AP PS wiring and U-APSD advertisement
+
+Row `uapsd`. `interface_ap.rs` opts into native terminal-completion AP
+controls: `ap_control_generation` is the selected AP role's
+`monitor::Selection` generation (`AP_IFTYPE` 3, `Desired::select` admits
+2/3/6) of a published, live generation; `reserve_ap_control` is an
+`ExclusiveControl` lease; every operation re-proves the exact request,
+its reservation, UP and `ApEmissionAuthority::matches_role` before and
+after the retained-owner work. Selecting AP needs `ap_capable`
+(`Io::ap_allowed`, sampled at activation before any station owner);
+the AP generation activates with the radio Ready and no station owner.
+
+`start_ap_with_settings_async` follows the Linux order: signed AP
+channel/power admission and program (`Io::ap_channel` =
+`Startup::ap_channel`: the primary must be in `admitted_channels` -- a
+current signed full program whose host rule permits active emission --
+and is refused when `station::passive_only` (RADAR/NO_IR): rtw89
+registers no `radar_detect_widths` in core.c `rtw89_iface_combs`, so
+cfg80211 `cfg80211_reg_can_beacon` never lets it beacon there; then the
+same `Native::retune_full_radio` the station uses, i.e. core.c
+`rtw89_set_channel` + `rtw89_chip_rfk_channel`, before the vif exists),
+then `ap_prepare` (`rtw89_mac_vif_init`, AP packet owner with CH9),
+`ap_start` (`rtw89_ops_start_ap` with the BSS beacon interval/DTIM) and
+the first `rtw89_fw_h2c_update_beacon`. Only 20 MHz (`_20_NOHT`/`_20`)
+host-CCMP-128 BSSes are admitted; MBSSID/EMA, FILS, unsolicited probe,
+FTM, TWT, HE OBSS/colour, P2P GO PS, TKIP/GCMP and MFP are refused, never
+dropped. A beacon head carrying its own TIM is refused. `stop_ap_async`
+runs `rtw89_ops_stop_ap` + `rtw89_mac_vif_deinit` and closes the
+generation: the supervisor composes a fresh one (fresh FLR) in the
+still-selected AP role before another START_AP.
+
+Peers: NEW_STATION = `rtw89_core_sta_link_add` (MACID from
+`ApController::add_peer`, packet binding); a nonzero AID (NEW or SET)
+= `rtw89_core_sta_link_assoc` with an RA body over the peer's legacy
+`supp_rates` (`legacy_rates`; 5 GHz OFDM-only as phy.c
+`rtw89_phy_ra_sta_update`) placed at its MACID (`codec::ra_at`);
+DEL_STATION withdraws host state before `ap_remove_peer`. Host RSNA is
+per peer (`ap_crypto.rs`, the mt7921 AP CCMP owner shape: pairwise key
+per peer address, GTK index 0..3 with a default, retained key history so
+no TK returns with a reset PN, GET_KEY = consumed TX PN). The CCMP shape
+admits EOSP because `ccmp_special_blocks` masks it (and MoreData) out of
+the AAD.
+
+`ap_host.rs` is the mac80211 host path for one vif: tx.c
+`ieee80211_build_hdr` (FromDS, A1 DA, A2 BSSID, A3 SA; QoS only for a
+WME peer, never for group frames), `ccmp_encrypt_skb`, control-port TX
+(`ieee80211_tx_control_port`, protected once a PTK exists unless
+`no_encrypt`); RX classified by the long-RXD `AX_RXD_MAC_ID` (a peer
+frame is accepted only when that MACID is the peer's own), rx.c
+`ieee80211_rx_h_uapsd_and_pspoll` before decryption, ToDS-only data,
+`ieee80211_drop_unencrypted` (only EAPOL/pre-auth in the clear under
+privacy), `ieee80211_data_to_8023`, the control-port split
+(`ieee80211_frame_allowed`, `no_preauth`), unauthorized-peer drop and
+`ieee80211_deliver_skb` intra-BSS forwarding (group frames up and back
+to the BSS, unicast to another authorized peer forwarded only).
+Management frames to the BSSID or broadcast reach the registered SME
+subscriptions (`register_mgmt_frame_ap_async`, 16 max); protected
+management (MFP) is not in this profile. `mgmt_tx_ap_async` and
+`tx_control_port_ap_async` submit on-channel at the band floor rate
+(refusing `no_cck` on 2.4 GHz) and report the actual RPQ TX status.
+
+AP power save (`ap_ps.rs`) is now wired: unicast frames to an associated
+peer pass `ApPs::transmit` (`ieee80211_tx_h_unicast_ps_buf`); a TIM change
+from buffering, a PM transition, expiry (`ApPs::expire` each worker pass)
+or DEL_STATION marks the beacon dirty and the AP worker republishes it
+(`rtw89_ops_set_tim` -> `update_beacon_work`); PS-Poll and U-APSD trigger
+releases go out ahead of the backlog with a TX report, and their terminal
+RPQ release -- acknowledged or the AP no-ack status -- ends the service
+period (`ApPs::tx_status`, status.c EOSP); group frames while any peer
+dozes are `SEND_AFTER_DTIM` on the CH9 high queue of the vif port.
+
+Advertisement: `supports_ap`, AP in `WirelessModes`, AP userspace MLME,
+the host AP authenticator (control port over nl80211 with TX status,
+`no_preauth`) and `supports_ap_uapsd` (`NL80211_ATTR_SUPPORT_AP_UAPSD`,
+Linux `WIPHY_FLAG_AP_UAPSD`) only when this generation is AP-capable.
+`hw->uapsd_max_sp_len = IEEE80211_WMM_IE_STA_QOSINFO_SP_ALL` is a
+mac80211 station-side limit with no nl80211 attribute; the AP side honours
+each peer's own Max SP (0 = all) in `ApPs`.
+
+Known gaps (not claimed): management frames from `mgmt_tx_ap_async` to a
+dozing peer are sent immediately rather than PS-buffered; unicast data
+uses the band floor rate (no firmware RA rate on AP TX); peers are
+legacy-rate only (no HT/HE peer programming); one AP vif on port 0; no
+MFP/BIP; no native or physical execution. New cases, written and
+unexecuted:
+`smoke_rtw89_ap_host_plan_admits_only_the_20mhz_ccmp_profile`,
+`smoke_rtw89_ap_host_ccmp_fromds_tx_and_macid_bound_rx`,
+`smoke_rtw89_ap_host_control_port_and_unencrypted_drop`,
+`smoke_rtw89_ap_host_dozing_peer_tim_and_pspoll_release`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before

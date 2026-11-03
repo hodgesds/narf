@@ -298,6 +298,10 @@ pub(super) unsafe trait Io: Send {
     fn ap_allowed(&mut self) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Signed AP channel admission and retune (before `ap_prepare`).
+    async fn ap_channel(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
     async fn ap_prepare(&mut self, _: [u8; 6], _: &Admission) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
@@ -542,7 +546,7 @@ fn center(primary: u8) -> u16 {
     super::monitor_wire::frequency(primary) as u16
 }
 /// The primary is passive-only (cfg80211 RADAR / NO_IR) under `policy`.
-fn passive_only(policy: Option<&Arc<RegulatoryDomain>>, primary: u8) -> bool {
+pub(super) fn passive_only(policy: Option<&Arc<RegulatoryDomain>>, primary: u8) -> bool {
     policy.is_some_and(|p| witness::passive_only(p, center(primary)))
 }
 /// A typed 20MHz primary this station may tune: 2.4GHz 1..=13 or 5GHz.

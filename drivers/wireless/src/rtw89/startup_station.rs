@@ -500,6 +500,13 @@ unsafe impl Io for Startup {
     fn ap_allowed(&mut self) -> Result<(), power::Error> {
         self.ap_admissible()
     }
+    async fn ap_channel(
+        &mut self,
+        primary: u8,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        Startup::ap_channel(self, primary, admission).await
+    }
     async fn ap_prepare(
         &mut self,
         own: [u8; 6],
