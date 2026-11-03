@@ -820,6 +820,7 @@ pub(super) struct Owner<I: Io> {
     hardware: Option<super::hardware::Features>,
     phy: Option<super::phy::Info>,
     phy8821c: Option<super::phy8821c::Info>,
+    phy8822b: Option<super::phy8822b::Info>,
     /// C21 host interface; keys the PHY rows and every signed C21 record.
     interface: super::phy8821c::Interface,
     calibration8821c: Option<super::radio8821c::Info>,
@@ -859,6 +860,7 @@ impl<I: Io> Owner<I> {
             hardware: None,
             phy: None,
             phy8821c: None,
+            phy8822b: None,
             interface: super::phy8821c::Interface::Pcie,
             calibration8821c: None,
             envelope8821c: None,
@@ -1687,6 +1689,31 @@ impl<I: Io> Owner<I> {
         self.calibration8821c = Some(result);
         self.phase = Phase::Calibration8821cPrepared;
         Ok(result)
+    }
+    /// RTL8822BE `rtw8822b_phy_set_param` table stage over the same retained
+    /// MAC-prepared owner (`phy8822b`). Opens no RF/MAC TX path.
+    pub(super) async fn prepare_phy8822b(
+        &mut self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::phy8822b::Info, Error> {
+        if self.did != 0xb822 {
+            return Err(Error::Unsupported);
+        }
+        if self.phase != Phase::MacPrepared {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let info = super::phy8822b::Info::from_factory(
+            factory,
+            self.mac.ok_or(Error::State)?.cut,
+            self.hardware.ok_or(Error::State)?,
+        )?;
+        self.io.begin_phy()?;
+        let info = super::phy8822b::prepare(&mut self.io, info).await?;
+        self.io.finish_phy()?;
+        self.phy8822b = Some(info);
+        self.phase = Phase::PhyTablesPrepared;
+        Ok(info)
     }
     pub(super) async fn prepare_phy8821c(
         &mut self,

@@ -164,3 +164,84 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_inactive_mac_follows_rtw8822b_mac_init_and_fifo_pages
 );
+
+fn b22_factory(rfe: u8, crystal: u8) -> super::super::efuse8822b::Factory8822b {
+    let mut map = [0xffu8; 768];
+    map[0xd0..0xd6].copy_from_slice(&[0x00, 0xe0, 0x4c, 0x22, 0xb8, 0x02]);
+    map[0xca] = rfe;
+    map[0xb9] = crystal;
+    map[0xc1] = 0x01;
+    super::super::efuse8822b::Factory8822b::for_test(map).unwrap()
+}
+fn b22_features(antennas: u8) -> super::super::hardware::Features {
+    super::super::hardware::Features {
+        raw: [0; 13],
+        hci: 1,
+        bandwidth: 2,
+        streams: 1,
+        antennas,
+        protocol: 2,
+    }
+}
+
+fn smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order() -> TestResult {
+    use super::super::phy8822b::{prepare, Info};
+    // rtw8822b_rfe_defs has only 2/3/5; erased crystal/board and a non-2T2R
+    // report are refused rather than defaulted.
+    for (rfe, crystal, antennas) in [(0, 0x20, 2), (4, 0x20, 2), (2, 0xff, 2), (2, 0x20, 1)] {
+        if Info::from_factory(&b22_factory(rfe, crystal), 0, b22_features(antennas)).is_ok() {
+            return TestResult::Fail("8822B PHY admitted an unsupported factory/hardware facet");
+        }
+    }
+    for (cut, rfe) in [(0u8, 2u8), (1, 3), (2, 5)] {
+        let info = match Info::from_factory(&b22_factory(rfe, 0xa5), cut, b22_features(2)) {
+            Ok(info) => info,
+            Err(_) => return TestResult::Fail("8822B PHY rejected a supported RFE"),
+        };
+        if info.crystal != 0x25 {
+            return TestResult::Fail("8822B crystal cap is not efuse crystal_cap & 0x3f");
+        }
+        let mut io = super::mac_tests::Model::new(cut, cut);
+        if narf_scheduler::block_on(prepare(&mut io, info)).is_err() {
+            return TestResult::Fail("8822B PHY table stage did not complete");
+        }
+        let rows = |kind| super::super::phy8822b::tables_for_test(cut, rfe, kind).unwrap();
+        let w8 = io.trace.iter().filter(|op| op.0 == 1 && op.1 == 8).count();
+        let sipi = |reg: u16| {
+            io.trace
+                .iter()
+                .filter(|op| op.0 == 1 && op.1 == 32 && op.2 == reg)
+                .count()
+        };
+        let rf_rows = |kind| {
+            rows(kind)
+                .iter()
+                .filter(|(a, _)| !matches!(a, 0xffe | 0xfe))
+                .count()
+        };
+        // Two power-on byte RMWs (SYS_FUNC_EN, RF_CTRL) precede the MAC rows.
+        if w8 != rows(0).len() + 2
+            || sipi(0xc90) != rf_rows(3)
+            || sipi(0xe90) != rf_rows(4)
+            || u32::from_le_bytes(io.regs[0x808..0x80c].try_into().unwrap()) & (3 << 28) != 3 << 28
+            || (u32::from_le_bytes(io.regs[0x24..0x28].try_into().unwrap()) >> 25) & 0x3f != 0x25
+            || (u32::from_le_bytes(io.regs[0x28..0x2c].try_into().unwrap()) >> 1) & 0x3f != 0x25
+        {
+            return TestResult::Fail("8822B PHY table writes differ from rtw_phy_load_tables");
+        }
+        let first = io.trace.iter().position(|op| op.0 == 1).unwrap();
+        if io.trace[first].2 != 0x02 {
+            return TestResult::Fail("8822B BB/RF domain power-on is not first");
+        }
+    }
+    if super::super::phy8822b::tables_for_test(0, 4, 0).is_some()
+        || super::super::phy8822b::tables_for_test(0, 2, 5).is_some()
+    {
+        return TestResult::Fail("8822B table selector admitted an undefined RFE/kind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order
+);

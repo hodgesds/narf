@@ -363,9 +363,22 @@ with the `rtw_set_trx_fifo_info` B22 layout (2048 pages, `csi_buf_pg_num` 0,
 PCIe `page_table_8822b[1]` 64/64/64/64 and `rqpn_table_8822b[1]` equal to
 C22's), then `rtw8822b_mac_init` (`mac/rtl8822b.rs`: `BIT_PRE_TX_CMD` clear,
 no 8821C PRECNT/INIRTS/ACKTO_CCK/TRXPTCL writes, no C22 `0x3fc` quirk). As on
-C21/C22, TXPAUSE stays `0xff` and host DMA/MAC TX/RX stay closed. The chain
-currently ends at `FirmwareStage::MacPrepared`; PHY/RF tables, calibration and
-station continuations are not yet ported, so no station shell is published.
+C21/C22, TXPAUSE stays `0xff` and host DMA/MAC TX/RX stay closed. The owner
+then runs the PHY table continuation (`phy8822b`, `Lifecycle::prepare_phy8822b`)
+from `rtw8822b_phy_set_param`: BB/RF domain power-on (`SYS_FUNC_EN` BB bits,
+`RF_CTRL` 7, `WLRF1` BBRF), `RXPSEL` reset hold, `rtw_phy_load_tables` in
+MAC (byte) → BB (delay codes `0xfe..0xf9`) → AGC → RF-A → RF-B order (8822B
+has no `rfk_init_tbl`), RF rows through `rtw_phy_write_rf_reg_sipi` at
+`0xc90`/`0xe90` (13 µs), crystal cap `& 0x3f` into `0x24[30:25]`/`0x28[6:1]`,
+and `RXPSEL` release. Rows are `rtw8822b_table.c` verbatim, preselected by
+`phy/gen_rtl8822b_tables.py` with `rtw_parse_tbl_phy_cond`/`check_positive`
+for PCIe (pkg 15 since 8822B sets no `pkg_type`, cut 0 → 15) over all 16 cuts
+and the only `rtw8822b_rfe_defs` RFEs 2/3/5 (17 distinct tables, 48
+profiles). Other RFEs, an erased crystal/board option or a non-2T2R firmware
+report are refused. The chain ends at `FirmwareStage::PhyTablesPrepared`;
+`rtw8822b_config_trx_mode`, `rtw_phy_init`, RFE/power-track/BF init, channel
+programming, calibration and station continuations are not yet ported, so no
+station shell is published.
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 
@@ -3438,7 +3451,7 @@ station-security and packet-key owners supply bounded MLME, RSNA and CCMP;
 ## 8. Open questions and references
 
 RTL8821CE, RTL8822CE and RTL8822BE (B22) firmware have retained native owners;
-RTL8822BE stops at the inactive MAC stage. BAR2 contains registers, so firmware travels through beacon
+RTL8822BE stops at the inactive PHY-table stage. BAR2 contains registers, so firmware travels through beacon
 host DMA and IDDMA rather than whole-blob BAR writes. The initial hardware
 target is exclusively RTL8822CE, awake channel1/20 MHz, host CCK1 data and
 qualified native legacy responses, Open or WPA2-PSK, software CCMP and bounded
@@ -3606,7 +3619,7 @@ changes. None is a physical blocker unless stated.
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
 | `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
-| `rtl8822be` | In progress: B22 identity, factory map, authenticated `rtw8822b_fw.bin` loading into a retained native owner and the inactive `rtw8822b_mac_init` continuation are implemented (see "RTL8822BE retained native B22 owner"); RTL8822B MAC/PHY/RF tables, calibration, signed records and station runtime are not yet ported. |
+| `rtl8822be` | In progress: B22 identity, factory map, authenticated `rtw8822b_fw.bin` loading into a retained native owner and the inactive `rtw8822b_mac_init` and PCIe `rtw8822b_table.c` PHY-table continuations are implemented (see "RTL8822BE retained native B22 owner"); RTL8822B TRX-mode/phy_init/RFE init, set_channel, calibration, signed records and station runtime are not yet ported. |
 | `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Source-complete for C22 under N22K `MIMO_PS` (see "Coexistence-driven static SMPS"): `rtw_coex_mimo_ps` -> `config_trx_mode(A, A)` with exact field restore, dm path diversity held on A, 1SS RA mask / STBC off, SM Power Save static/disabled action. Three register-model cases written, unexecuted; no signed N22K MIMO_PS record or BT-active measurement. |

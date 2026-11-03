@@ -118,6 +118,7 @@ mod pci_firmware;
 mod phy;
 #[path = "phy/rtl8821c.rs"]
 mod phy8821c;
+mod phy8822b;
 mod power_policy;
 mod probe_guard;
 mod protection;
