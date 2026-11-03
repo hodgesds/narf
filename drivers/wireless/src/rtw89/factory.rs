@@ -70,6 +70,7 @@ pub struct Factory {
     logical: Vec<u8>,
     b_phycap: Option<[u8; 128]>,
     c_phycap: Option<[u8; C_PHYCAP_SIZE]>,
+    n51_phycap: Option<[u8; 128]>,
 }
 /// rtw8852c.c `rtw8852c_chip_info.{phycap_addr,phycap_size}`.
 pub(super) const C_PHYCAP_ADDR: u16 = 0x590;
@@ -82,6 +83,7 @@ impl Default for Factory {
             logical: Vec::new(),
             b_phycap: None,
             c_phycap: None,
+            n51_phycap: None,
         }
     }
 }
@@ -105,6 +107,14 @@ impl Factory {
     pub(super) fn c_phycap(&self) -> Option<&[u8; C_PHYCAP_SIZE]> {
         (self.state == State::Ready)
             .then_some(self.c_phycap.as_ref())
+            .flatten()
+    }
+    /// The complete RTL8851B PHY-cap window (`rtw8851b_chip_info.phycap_addr`
+    /// 0x580, `phycap_size` 128), present only after a completed read. Kept
+    /// apart from the RTL8852B window so no B owner can consume it.
+    pub(super) fn n51_phycap(&self) -> Option<&[u8; 128]> {
+        (self.state == State::Ready)
+            .then_some(self.n51_phycap.as_ref())
             .flatten()
     }
     /// A single completed native DDV lifecycle supplies every input. No erased
@@ -138,8 +148,9 @@ impl Factory {
         }
         // Linux physical power-k marker0x5e9, ECV0x5ea, secure0x5ec/5ed.
         let mut extra = [0; 5];
-        let b_phycap = if chip == ChipId::Rtl8852B {
-            // The PHY-cap map is separate from the1216-byte sparse map.
+        let window = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8851B) {
+            // The PHY-cap map is separate from the1216-byte sparse map
+            // (rtw8852b/rtw8851b `phycap_addr` 0x580, `phycap_size` 128).
             // Read every byte before exposing trim/TSSI or secure inputs.
             let mut bytes = [0; 128];
             io.physical(0x580, &mut bytes).await?;
@@ -147,6 +158,11 @@ impl Factory {
             Some(bytes)
         } else {
             None
+        };
+        let (b_phycap, n51_phycap) = if chip == ChipId::Rtl8851B {
+            (None, window)
+        } else {
+            (window, None)
         };
         let c_phycap = if chip == ChipId::Rtl8852C {
             // C's PHY-cap window 0x590..0x5f0 contains the same 0x5e9..0x5ee
@@ -157,7 +173,7 @@ impl Factory {
             extra.copy_from_slice(&bytes[start..start + 5]);
             Some(bytes)
         } else {
-            if chip != ChipId::Rtl8852B {
+            if window.is_none() {
                 io.physical(0x5e9, &mut extra).await?;
             }
             None
@@ -184,6 +200,7 @@ impl Factory {
         self.logical = logical;
         self.b_phycap = b_phycap;
         self.c_phycap = c_phycap;
+        self.n51_phycap = n51_phycap;
         self.identity = Some(identity);
         self.state = State::Ready;
         Ok(())

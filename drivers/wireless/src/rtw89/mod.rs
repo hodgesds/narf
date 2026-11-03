@@ -77,6 +77,7 @@ mod dpk;
 pub mod efuse;
 mod endpoints;
 mod factory;
+mod factory_51;
 mod factory_b;
 mod factory_c;
 mod fifo;

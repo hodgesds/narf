@@ -135,7 +135,11 @@ only after both actual DDV bytes are read. Indexed and formatted signatures
 use the Linux AX selection/stride rules, checked bitmap dimensions/rank and
 pool extents. Secure hardware requires a matching signature and a host
 blacklist at least as new as the image's version; B/C have the upstream
-version0 empty policy, while A/51 require an authenticated board policy.
+version0 empty policy; RTL8851B takes Linux's exact NULL `fw_blacklist`
+policy (`Blacklist::upstream(Rtl8851B)` has no chip list: fw.c
+`__check_secure_blacklist` -ENOENT is only `WARN_ONCE`d, so the matching MSS
+signature is the whole secure policy, still required); A requires an
+authenticated board policy.
 No missing policy or signature falls back to an unsecured transfer.
 
 The plan couples v1 ignored-security descriptor compaction/count with the
@@ -677,8 +681,8 @@ and exclusive function claim: BME-off, MAC-OFF and these retained receipts do
 not establish reclamation. It is private and does not run in the diagnostic
 probe, enable MSI/IRQ delivery or register a network interface. Only its explicit
 B receive continuation publishes RX rings.
-A/51 programmed secure boot still needs authenticated board blacklist-policy
-loading; B/C retain Linux's version0 policy. B's retained MAC sys/TRX preparation
+A programmed secure boot still needs authenticated board blacklist-policy
+loading; B/C retain Linux's version0 policy and 51 Linux's NULL chip list. B's retained MAC sys/TRX preparation
 does not complete other AX profiles. Initial B's retained full radio path is
 separate from this cold/WCPU receipt; it requires actual firmware PHY topology,
 static operating state and the signed measured v2 continuation. Physical

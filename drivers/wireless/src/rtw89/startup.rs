@@ -660,8 +660,9 @@ impl Startup {
         }
         let identity = self.identity.ok_or(Error::Terminal)?;
         // Selection follows ECV-corrected physical cut and actual secure fuses.
-        // A/51 programmed secure boot still requires authenticated host board
-        // blacklist policy; no all-clear default is created for those chips.
+        // RTL8852A programmed secure boot still requires authenticated host
+        // board blacklist policy. RTL8851B takes Linux's exact NULL
+        // `fw_blacklist` policy (signature selection only; secure.rs).
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
         // radio_assets admits the RTL8852B and RTL8852C element layouts.
