@@ -687,6 +687,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             None
         };
         self.failed = true;
+        // Events a sibling slot parked for this one (its own early EAPOL or
+        // PEER_MAP polled while the sibling owned the radio) precede the
+        // radio queue.
+        let mut retained = VecDeque::new();
+        while let Some(event) = self.station.inbox.pop_front() {
+            retained.push_back(self.slot_event(event)?);
+        }
+        retained.extend(core::mem::take(&mut self.pending));
+        let primary = self.primary.id();
         let mut incoming = VecDeque::new();
         // An AP may send M1 before PEER_ASSOC/UP's receive drain ends. Retain
         // only exact descriptor-bound, unprotected unicast EAPOL for the new
@@ -698,7 +707,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             bssid: associated.bssid,
         };
         let mut group = Vec::new();
-        for event in core::mem::take(&mut self.pending) {
+        for event in retained {
             let frames = match event {
                 htt::Event::Rx(batch) if security.is_some() && peer.owns(batch.peer) => batch
                     .frames
@@ -717,7 +726,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         .map(|frame| (1, i.peer, i.tid, frame))
                         .collect()
                 }
-                htt::Event::Rx(_) | htt::Event::InOrder(_, _) => Vec::new(),
+                // Another slot's RX is that slot's (`htt_rx.c` by peer/vdev),
+                // never this owner's to discard.
+                rx @ (htt::Event::Rx(_) | htt::Event::InOrder(_, _)) => {
+                    if let Some(sibling) = self
+                        .p2p_client
+                        .as_deref_mut()
+                        .filter(|s| s.claims(&rx, primary, None))
+                    {
+                        sibling.park(rx);
+                    }
+                    Vec::new()
+                }
                 other => {
                     self.pending.push_back(other);
                     Vec::new()
@@ -951,7 +971,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.failed = true;
         for _ in 0..64 {
             self.data_check()?;
-            let event = match self.pending.pop_front() {
+            let parked = match self.station.inbox.pop_front() {
+                Some(e) => Some(self.slot_event(e)?),
+                None => None,
+            };
+            let event = match parked.or_else(|| self.pending.pop_front()) {
                 Some(e) => e,
                 None => {
                     // This optional host-vote hint is narrower than DATA
@@ -1293,11 +1317,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 // A sibling station's BSS management (A2 or A3 its BSSID)
                 // is its own: wmi.c ath10k_wmi_event_mgmt_rx hands it to
                 // mac80211, which matches the frame to that vif.
-                if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| {
-                    s.peer.as_ref().is_some_and(|p| {
-                        f.len() >= 22 && (f[10..16] == p.bssid || f[16..22] == p.bssid)
-                    })
-                }) {
+                // A frame of this slot's own BSS stays here, so a parked
+                // copy is never handed back.
+                let primary = self.primary.id();
+                let mine = f.len() >= 22 && (f[10..16] == bssid || f[16..22] == bssid);
+                if let Some(sibling) = self
+                    .p2p_client
+                    .as_deref_mut()
+                    .filter(|s| !mine && s.claims(&htt::Event::Wmi(Vec::new()), primary, Some(f)))
+                {
                     sibling.park(htt::Event::Wmi(bytes.clone()));
                 }
                 if management.status & !0x40 == 0
@@ -1426,15 +1454,30 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             htt::Event::Message(bytes) if !matches!(bytes.first(), Some(3 | 4)) => {
-                // BA/fragment/PFC notes name a peer id; each slot filters by
-                // its own peer, so the sibling sees a copy.
-                if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| s.peer.is_some()) {
-                    sibling.park(htt::Event::Message(bytes.clone()));
-                }
-                let ba = data.rx_ba.note(&bytes, |id| peer.owns(id))?;
-                // Fragment/PFC and their additional ownership remain separate.
-                if !ba && matches!(bytes.first(), Some(0xb | 0xc | 0xd | 0x16 | 0x17 | 0x18)) {
-                    return Err(Error::Unsupported);
+                // An ADDBA/DELBA note names its peer id (`htt_rx.c`
+                // ath10k_htt_rx_addba/delba); the sibling's goes to it alone,
+                // so a parked note is never handed back.
+                // Peer ids are unique, so a claimed note is never this slot's.
+                let primary = self.primary.id();
+                let event = htt::Event::Message(bytes);
+                match self
+                    .p2p_client
+                    .as_deref_mut()
+                    .filter(|s| s.claims(&event, primary, None))
+                {
+                    Some(sibling) => sibling.park(event),
+                    None => {
+                        let htt::Event::Message(bytes) = event else {
+                            return Err(Error::Failed);
+                        };
+                        let ba = data.rx_ba.note(&bytes, |id| peer.owns(id))?;
+                        // Fragment/PFC and their additional ownership remain separate.
+                        if !ba
+                            && matches!(bytes.first(), Some(0xb | 0xc | 0xd | 0x16 | 0x17 | 0x18))
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                    }
                 }
             }
             _ => {}

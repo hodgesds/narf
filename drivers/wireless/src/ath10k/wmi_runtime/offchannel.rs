@@ -400,9 +400,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let idle = matches!(event, htt::Event::Idle);
         self.observe_roc(&event)?;
         match event {
-            htt::Event::Rx(_) | htt::Event::InOrder(_, _) => {}
+            // A P2P client slot's RX (by peer/vdev) is parked for it; only
+            // the polling owner's offchannel DATA is discarded.
+            rx @ (htt::Event::Rx(_) | htt::Event::InOrder(_, _)) => {
+                let _ = self.route_sibling(rx);
+            }
             other => {
-                let _ = self.station_event(other)?;
+                let other = self.station_event(other)?;
+                let _ = self.route_sibling(other);
             }
         }
         self.observe_roc_action_completion()?;

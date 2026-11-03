@@ -187,6 +187,35 @@ impl StationSlot {
     fn owns_msdu(&self, id: u16) -> bool {
         self.data.as_ref().is_some_and(|d| d.owns_msdu(id))
     }
+    /// Whether this slot owns an HTT event, wherever it was polled.
+    /// `htt_rx.c` delivers a legacy RX batch by its peer id
+    /// (`ath10k_htt_rx_h_ppdu` -> `peer->vif`), an in-order indication by
+    /// its vdev and peer, and an ADDBA/DELBA note names a peer id
+    /// (`ath10k_htt_rx_addba`/`ath10k_htt_rx_delba`, info `>> 4`);
+    /// mac80211 hands WMI management RX (`frame`, already decoded) to the
+    /// vif whose BSSID is its A2 or A3. Every other event is radio-level or
+    /// filtered by each owner itself.
+    pub(super) fn claims(&self, event: &htt::Event, primary: u8, frame: Option<&[u8]>) -> bool {
+        match event {
+            htt::Event::Rx(batch) => self.owns_peer(batch.peer),
+            htt::Event::InOrder(i, _) => {
+                !i.offload
+                    && !i.fragment
+                    && i.vdev == self.vdev.unwrap_or(primary)
+                    && self.owns_peer(i.peer)
+            }
+            htt::Event::Message(b) if b.len() == 4 && matches!(b[0], 5 | 6) => {
+                self.owns_peer(u16::from_le_bytes([b[2], b[3]]) >> 4)
+            }
+            htt::Event::Wmi(_) => match (frame, &self.peer) {
+                (Some(f), Some(p)) => {
+                    f.len() >= 22 && (f[10..16] == p.bssid || f[16..22] == p.bssid)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 /// Runs the radio's station paths on the P2P client slot: the slots are
 /// exchanged for the guard's lifetime and restored on drop, including when
@@ -623,7 +652,49 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
     }
+    /// Hand an event the sibling station slot owns (and the current slot
+    /// does not) to that slot's inbox, so no wait loop of this owner queues
+    /// or consumes it; return every other event unchanged. With no P2P
+    /// client slot this is the identity.
+    pub(super) fn route_sibling(&mut self, event: htt::Event) -> Option<htt::Event> {
+        if self.p2p_client.is_none() {
+            return Some(event);
+        }
+        let frame = match &event {
+            htt::Event::Wmi(bytes)
+                if bytes.len() > 4
+                    && wire::word(bytes, 0)
+                        .is_ok_and(|w| w & 0xffffff == self.wire.management_event) =>
+            {
+                self.wire
+                    .management(&bytes[4..], self.features)
+                    .ok()
+                    .map(|m| m.frame)
+            }
+            _ => None,
+        };
+        let primary = self.primary.id();
+        if self.station.claims(&event, primary, frame.as_deref()) {
+            return Some(event);
+        }
+        match self
+            .p2p_client
+            .as_deref_mut()
+            .filter(|s| s.claims(&event, primary, frame.as_deref()))
+        {
+            Some(sibling) => {
+                sibling.park(event);
+                None
+            }
+            None => Some(event),
+        }
+    }
+    /// Retain an event for a later step. A sibling slot's event goes to that
+    /// slot's inbox (bounded there), never to this owner's queue.
     fn queue(&mut self, event: htt::Event) -> Result<(), Error> {
+        let Some(event) = self.route_sibling(event) else {
+            return Ok(());
+        };
         if self.pending.len() == 64 {
             return Err(Error::Malformed);
         }

@@ -20,6 +20,34 @@ pub(super) struct Peer {
     pub(super) rsn: Option<alloc::boxed::Box<pmf::Rsn>>,
 }
 impl Peer {
+    /// A BSS peer created on `vdev` and mapped to HTT peer id `id` through
+    /// its own PEER_MAP, for slot-routing tests.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn mapped_for_test(
+        vdev: u8,
+        permission: Permission,
+        bssid: [u8; 6],
+        id: u16,
+    ) -> Result<Self, Error> {
+        let mut peer = Self {
+            vdev,
+            permission,
+            bssid,
+            ids: [0; 32],
+            exchange_stage: 0,
+            associated: None,
+            wmm: None,
+            ht: None,
+            rsn: None,
+        };
+        let mut map = [3, vdev, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        map[2..4].copy_from_slice(&id.to_le_bytes());
+        map[4..10].copy_from_slice(&bssid);
+        if !peer.record(&map)? {
+            return Err(Error::Malformed);
+        }
+        Ok(peer)
+    }
     pub(super) fn owns(&self, id: u16) -> bool {
         id < 2048 && self.ids[usize::from(id) / 64] & (1u64 << (id % 64)) != 0
     }
@@ -652,7 +680,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
                 htt::Event::Idle => narf_scheduler::yield_now().await,
                 htt::Event::Progress => {}
-                other => self.queue(other)?,
+                // The radio observers and a sibling slot's PEER_MAP/UNMAP see
+                // the event once here (`station_event` parks the sibling's),
+                // instead of reaching a later data step that skips them.
+                other => match self.station_event(other)? {
+                    htt::Event::Idle | htt::Event::Progress => {}
+                    other => self.queue(other)?,
+                },
             }
         }
         if !started {
@@ -895,7 +929,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn take_management_completion(&mut self) -> Option<ManagementCompletion> {
         self.management_done.pop_front()
     }
+    /// The current slot's next event: one a sibling slot parked for it
+    /// (its own PEER_MAP, RX, BA note or BSS management polled while the
+    /// sibling owned the radio), else a fresh poll. Every station wait loop
+    /// (prepare START/PEER_MAP, association, MLME, protection/flush,
+    /// disconnect, WoW) therefore sees its own parked events.
     pub(super) async fn station_progress(&mut self) -> Result<htt::Event, Error> {
+        if let Some(event) = self.station.inbox.pop_front() {
+            return self.slot_event(event);
+        }
         let event = self.htt.poll().await?;
         self.station_event(event)
     }

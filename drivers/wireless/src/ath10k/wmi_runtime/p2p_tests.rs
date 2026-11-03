@@ -803,3 +803,102 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_station_slot_parks_bounded
 );
+
+/// A slot claims exactly its own peer's legacy RX, its vdev+peer in-order
+/// indication, its peer's ADDBA/DELBA note and its BSS's management
+/// (A2/A3), so a sibling-polled event is parked for the owning slot and a
+/// note it parks is never handed back to the slot that polled it.
+fn smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid() -> TestResult {
+    use super::super::station::Peer;
+    use super::super::StationSlot;
+    use crate::ath10k::htt_runtime::{self as htt, rx};
+    use crate::ath10k::regulatory::{Factory, Permission};
+    const HOME_BSSID: [u8; 6] = [2, 1, 1, 1, 1, 1];
+    const GO_BSSID: [u8; 6] = [2, 9, 9, 9, 9, 9];
+    let Ok(factory) = Factory::from_eeprom(0x64) else {
+        return TestResult::Fail("factory");
+    };
+    let permission = Permission {
+        center: 2412,
+        secondary: None,
+        width80: false,
+        center2: None,
+        factory,
+        country: *b"US",
+        frequency: 2412,
+        half_dbm: 34,
+        radar: 0,
+        hint: None,
+    };
+    let mut home = StationSlot::client(0, [2, 0, 0, 0, 0, 7]);
+    let mut client = StationSlot::client(1, OWN);
+    let (Ok(home_peer), Ok(client_peer)) = (
+        Peer::mapped_for_test(0, permission.clone(), HOME_BSSID, 5),
+        Peer::mapped_for_test(1, permission, GO_BSSID, 9),
+    ) else {
+        return TestResult::Fail("peer map");
+    };
+    home.peer = Some(home_peer);
+    client.peer = Some(client_peer);
+    let rx = |peer| {
+        htt::Event::Rx(htt::RxBatch {
+            peer,
+            tid: 0,
+            frames: Vec::new(),
+        })
+    };
+    let in_order = |vdev, peer| {
+        htt::Event::InOrder(
+            rx::InOrder {
+                peer,
+                vdev,
+                tid: 0,
+                offload: false,
+                fragment: false,
+                pointers: Vec::new(),
+            },
+            Vec::new(),
+        )
+    };
+    // ADDBA (5) / DELBA (6): info = peer << 4 | tid.
+    let note = |kind: u8, peer: u16| {
+        let info = (peer << 4) | 3;
+        htt::Event::Message(vec![kind, 8, info as u8, (info >> 8) as u8])
+    };
+    let mut frame = vec![0xd0, 0, 0, 0];
+    frame.extend_from_slice(&OWN);
+    frame.extend_from_slice(&GO_BSSID);
+    frame.extend_from_slice(&GO_BSSID);
+    frame.extend_from_slice(&[0, 0]);
+    let wmi = htt::Event::Wmi(Vec::new());
+    if !client.claims(&rx(9), 0, None) || home.claims(&rx(9), 0, None) {
+        return TestResult::Fail("legacy RX by peer id");
+    }
+    if !client.claims(&in_order(1, 9), 0, None)
+        || client.claims(&in_order(0, 9), 0, None)
+        || home.claims(&in_order(1, 9), 0, None)
+    {
+        return TestResult::Fail("in-order RX by vdev and peer");
+    }
+    if !client.claims(&note(5, 9), 0, None)
+        || !client.claims(&note(6, 9), 0, None)
+        || home.claims(&note(5, 9), 0, None)
+        || !home.claims(&note(5, 5), 0, None)
+    {
+        return TestResult::Fail("BA note by peer id");
+    }
+    if !client.claims(&wmi, 0, Some(&frame)) || home.claims(&wmi, 0, Some(&frame)) {
+        return TestResult::Fail("management by BSSID");
+    }
+    if client.claims(&htt::Event::Message(vec![3; 12]), 0, None)
+        || client.claims(&htt::Event::Idle, 0, None)
+        || client.claims(&wmi, 0, None)
+    {
+        return TestResult::Fail("radio-level event claimed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid
+);

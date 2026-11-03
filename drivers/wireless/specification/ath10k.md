@@ -2171,6 +2171,19 @@ will bind; none of them grants RF, peer, key or data authority.
   id to the slot that queued it (`txrx.c::ath10k_txrx_tx_unref`), also on
   the protection, coexistence and data-start receipt drains. Radio-level
   observers (scan, ROC, beacon hints) see each event once, when polled.
+  The same ownership rule (`StationSlot::claims`: legacy RX by peer id,
+  in-order RX by vdev and peer, ADDBA/DELBA by the note's peer id
+  (`ath10k_htt_rx_addba`/`delba`), WMI management by A2/A3 BSSID) governs
+  every HTT poll outside the data step: `Radio::queue` (station prepare
+  START/PEER_MAP and association waits, MLME, protection/flush,
+  disconnect, WoW, host power, scan, P2P vdev delete) and the loops that
+  discard (associated-scan stop, ROC progress, ROC action delete) hand a
+  sibling-owned event to the sibling's inbox (`route_sibling`) instead of
+  queueing it for, or discarding it as, the polling owner. The VDEV_START
+  wait runs `station_event`, so a sibling PEER_MAP polled there is parked.
+  `station_progress`, the data start's early-EAPOL retention and
+  `poll_ethernet_now` drain the slot's inbox first; a parked note or
+  management frame is never handed back to the slot that polled it.
 - **P2P client vdev (radio owner).** `wmi_runtime/p2p_client.rs`
   `start_p2p_client` follows `ath10k_add_interface` for
   `NL80211_IFTYPE_P2P_CLIENT`: TLV P2P firmware, no client yet, no
@@ -2253,9 +2266,7 @@ Remaining before the row can be claimed: the P2P client netdev role
 by NEW_INTERFACE and removed by DEL_INTERFACE, whose scan/CONNECT/data
 paths drive the radio inside a `ClientScope` and whose create/delete call
 `start_p2p_client`/`stop_p2p_client` (the radio owner, slots and demux are
-in place); other event consumers that still poll HTT outside the data step
-(station prepare, flush and protection loops) queue rather than park
-sibling events and must be audited for a concurrent client; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
+in place); a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
 into the beacon publication and `NoaOwner` into P2P_NOA event routing and
 probe-response TX; then advertisement through `P2P_ADVERTISED`,
 `p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
@@ -2273,7 +2284,8 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_ap_builders_carry_vdev`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
-`smoke_ath10k_p2p_station_slot_parks_bounded`.
+`smoke_ath10k_p2p_station_slot_parks_bounded`,
+`smoke_ath10k_p2p_slot_claims_by_peer_vdev_and_bssid`.
 
 ## 4. Invariants
 

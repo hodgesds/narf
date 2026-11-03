@@ -565,7 +565,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         .delete_ack = true;
                 }
             }
-            let _ = self.station_event(event)?;
+            let event = self.station_event(event)?;
+            // A P2P client slot's event is parked for it, not discarded.
+            let _ = self.route_sibling(event);
             self.observe_roc_action_completion()?;
             narf_scheduler::yield_now().await;
         }
