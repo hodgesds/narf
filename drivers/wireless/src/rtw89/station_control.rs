@@ -661,6 +661,31 @@ impl Controller {
             (ht, None) => codec::ra_ht(rates, ht),
         }
         .ok_or(Error::Unsupported)?;
+        self.configure_ra_body(io, body, he.is_some(), admission)
+            .await
+    }
+    /// [`Self::configure_ra`] on an admitted 40/80MHz channel
+    /// (`codec::ra_wide`: `bw_cap`, bandwidth SGI and the VHT branch).
+    pub(super) async fn configure_ra_wide(
+        &mut self,
+        io: &mut impl Interface,
+        rates: u16,
+        ht: codec::HtRa,
+        he: Option<codec::HeRa>,
+        wide: codec::WideRa,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let body = codec::ra_wide(rates, ht, he, wide).ok_or(Error::Unsupported)?;
+        self.configure_ra_body(io, body, he.is_some(), admission)
+            .await
+    }
+    async fn configure_ra_body(
+        &mut self,
+        io: &mut impl Interface,
+        body: [u8; 16],
+        he: bool,
+        admission: &Admission,
+    ) -> Result<(), Error> {
         if self.phase() != Phase::Associated
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
         {
@@ -682,7 +707,7 @@ impl Controller {
         admission.run(|| {
             peer.current()?;
             self.ra = Some(body);
-            peer.he.store(he.is_some(), Ordering::Release);
+            peer.he.store(he, Ordering::Release);
             self.phase = Phase::Associated;
             Ok(())
         })?;
@@ -960,7 +985,7 @@ mod monitor;
 pub(super) use monitor::initialize as initialize_monitor;
 #[path = "station_control/codec.rs"]
 pub(super) mod codec;
-pub(super) use codec::{HeRa, HtRa};
+pub(super) use codec::{HeRa, HtRa, VhtRa, WideRa};
 
 pub(super) fn profile_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -1059,6 +1084,7 @@ pub(super) fn local_he_wide(ghz5: bool) -> Option<narf_wireless::association::he
 pub(super) fn wide_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
     hash.update(b"B wide station v1; rtw89_init_ht_cap SUP_WIDTH_20_40 DSSSCCK40 SGI40; rtw89_init_vht_cap 5GHz SGI80 RXLDPC RXSTBC1 RX2SS TX1SS MCS0..9; HE PHY cap0 40MHz-2G / 40-80MHz-5G; offered only on the admitted chandef");
+    hash.update(b"RA rtw89_phy_ra_sta_update HE>VHT>HT branch; BW_CAP link bandwidth 40/80; SGI HT SGI_40 / VHT SHORT_GI_80; VHT mask get_mcs_ra_mask(9,1) & VHT1SS|SUBOFDM|SUBCCK; LDPC peer; STBC0 SS1");
     if let Some(ht) = local_ht40() {
         hash.update(&ht.capability_body());
     }

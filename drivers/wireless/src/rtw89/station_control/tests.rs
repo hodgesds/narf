@@ -1224,3 +1224,81 @@ kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef
 );
+
+fn smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux() -> TestResult {
+    let w = |b: &[u8; 16], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0xff, 0, 0],
+        sgi20: true,
+        ldpc: true,
+    };
+    // get_mcs_ra_mask(map, 9, 1): MCS0..9 / 0..8 / 0..7 per NSS.
+    if codec::vht_mcs_mask(0xfffe) != 0x3ff000
+        || codec::vht_mcs_mask(0xfffd) != 0x1ff000
+        || codec::vht_mcs_mask(0xfffa) != 0x3ff_3ff000
+        || codec::vht_mcs_mask(0xffff) != 0
+    {
+        return TestResult::Fail("VHT MCS mask differs from get_mcs_ra_mask(.., 9, 1)");
+    }
+    // HT40 on 2.4GHz: HT branch body with BW_CAP=1 and SGI = HT SGI_40.
+    let wide = WideRa {
+        bw: 1,
+        sgi: false,
+        vht: None,
+    };
+    let (Some(narrow), Some(body)) = (
+        codec::ra_ht(0xfff, Some(ht)),
+        codec::ra_wide(0xfff, ht, None, wide),
+    ) else {
+        return TestResult::Fail("HT40 RA refused");
+    };
+    if w(&body, 0) != (w(&narrow, 0) & !(1 << 21)) | 1 << 6 || body[4..] != narrow[4..] {
+        return TestResult::Fail("HT40 RA differs from the HT branch with bw_cap 40");
+    }
+    // VHT80 on 5GHz (OFDM legacy 0xff0): mode VHT|OFDM, mask VHT1SS|SUBOFDM,
+    // BW_CAP=2, SGI80, LDPC from the peer RXLDPC, STBC0.
+    let vht = VhtRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+    };
+    let wide = WideRa {
+        bw: 2,
+        sgi: true,
+        vht: Some(vht),
+    };
+    let Some(body) = codec::ra_wide(0xff0, ht, None, wide) else {
+        return TestResult::Fail("VHT80 RA refused");
+    };
+    if w(&body, 0) != (0xa << 1 | 2 << 6 | 1 << 20 | 1 << 21 | 1 << 22)
+        || w(&body, 1) != 0x3ff010
+        || w(&body, 2) != 0
+    {
+        return TestResult::Fail("VHT80 RA_MACIDCFG differs from rtw89_phy_ra_sta_update");
+    }
+    // HE takes precedence over VHT (HE branch body, BW_CAP=2).
+    let he = HeRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+        dcm: false,
+    };
+    let (Some(narrow), Some(body)) = (
+        codec::ra_he(0xff0, ht, he),
+        codec::ra_wide(0xff0, ht, Some(he), wide),
+    ) else {
+        return TestResult::Fail("HE80 RA refused");
+    };
+    if w(&body, 0) != w(&narrow, 0) | 2 << 6 || body[4..] != narrow[4..] {
+        return TestResult::Fail("HE80 RA differs from the HE branch with bw_cap 80");
+    }
+    // 80MHz without VHT facts and a 20MHz "wide" RA are refused.
+    if codec::ra_wide(0xff0, ht, Some(he), WideRa { vht: None, ..wide }).is_some()
+        || codec::ra_wide(0xff0, ht, None, WideRa { bw: 0, ..wide }).is_some()
+    {
+        return TestResult::Fail("inconsistent wide RA accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux
+);

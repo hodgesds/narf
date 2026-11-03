@@ -346,6 +346,101 @@ pub(in crate::rtw89) struct HeRa {
     /// Peer DCM RX constellation nonzero (`DCM_MAX_CONST_RX_16_QAM` mask).
     pub(in crate::rtw89) dcm: bool,
 }
+/// Negotiated VHT facts consumed by `rtw89_phy_ra_sta_update`'s VHT branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct VhtRa {
+    /// Peer RX VHT-MCS map intersected with the local TX map (mac80211
+    /// `ieee80211_vht_cap_ie_to_sta_vht_cap` `rx_mcs_map`).
+    pub(in crate::rtw89) peer_rx_mcs: u16,
+    /// Peer RXLDPC intersected with local TX LDPC.
+    pub(in crate::rtw89) ldpc: bool,
+}
+/// The 40/80MHz part of `rtw89_phy_ra_sta_update`: `bw_cap` from
+/// `link_sta->bandwidth` and the SGI of that bandwidth (40MHz: HT SGI_40;
+/// 80MHz: VHT SHORT_GI_80), plus the VHT facts when VHT (and not HE) was
+/// negotiated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct WideRa {
+    /// `RTW89_CHANNEL_WIDTH_40` (1) or `RTW89_CHANNEL_WIDTH_80` (2).
+    pub(in crate::rtw89) bw: u8,
+    pub(in crate::rtw89) sgi: bool,
+    pub(in crate::rtw89) vht: Option<VhtRa>,
+}
+/// `get_mcs_ra_mask(mcs_map, 9, 1)`: the non-20MHz VHT branch (MCS9/8/7
+/// per NSS at bit 12 + 12 * nss).
+pub(super) fn vht_mcs_mask(map: u16) -> u64 {
+    (0..4).fold(0u64, |mask, i| {
+        let top = match (map >> (2 * i)) & 3 {
+            2 => 9,
+            1 => 8,
+            0 => 7,
+            _ => return mask,
+        };
+        mask | ((1u64 << (top + 1)) - 1) << (12 + 12 * i)
+    })
+}
+/// VHT branch of `rtw89_phy_ra_sta_update` (`mode = VHT|OFDM[|CCK]`, mask
+/// from the intersected peer RX map, masked to this profile's one TX stream
+/// `rtw89_ra_mask_vht_rates[0]` plus SUBOFDM/SUBCCK, LDPC from the peer
+/// RXLDPC, STBC0 like HT: no local TX STBC).
+fn ra_vht(rates: u16, vht: VhtRa) -> Option<[u8; 16]> {
+    const CCK: u64 = 0xf;
+    const OFDM: u64 = 0xff0;
+    const SUBCCK: u64 = 0x5;
+    let legacy = u64::from(rates) & (CCK | OFDM);
+    if legacy == 0 {
+        return None;
+    }
+    let mut mode = 0x8u32; // RTW89_RA_MODE_VHT
+    if legacy & CCK != 0 {
+        mode |= 1;
+    }
+    if legacy & OFDM != 0 {
+        mode |= 2;
+    }
+    let backup = legacy | vht_mcs_mask(vht.peer_rx_mcs);
+    let mut allowed = 0x3ff000; // RA_MASK_VHT_1SS_RATES
+    if mode & 2 != 0 {
+        allowed |= 0x10; // RA_MASK_SUBOFDM_RATES
+    }
+    if mode & 1 != 0 {
+        allowed |= SUBCCK;
+    }
+    let mut mask = backup & allowed;
+    if mask & !(CCK | OFDM) == 0 {
+        mask |= backup & !(CCK | OFDM);
+    }
+    if mask == 0 {
+        mask |= backup & (CCK | OFDM);
+    }
+    let mut bytes = [0; 16];
+    word(
+        &mut bytes,
+        0,
+        mode << 1 | 1 << 20 | u32::from(vht.ldpc) << 22,
+    );
+    word(&mut bytes, 1, mask as u32);
+    word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
+    Some(bytes)
+}
+/// `rtw89_phy_ra_sta_update` on an admitted 40/80MHz channel: the HE, VHT
+/// or HT branch body (in that precedence, as Linux), then `BW_CAP[7:6]` =
+/// `wide.bw` and `SGI` = the SGI of that bandwidth.
+pub(super) fn ra_wide(rates: u16, ht: HtRa, he: Option<HeRa>, wide: WideRa) -> Option<[u8; 16]> {
+    if !matches!(wide.bw, 1 | 2) || wide.bw == 2 && wide.vht.is_none() {
+        return None;
+    }
+    let mut bytes = match (he, wide.vht) {
+        (Some(he), _) => ra_he(rates, ht, he)?,
+        (None, Some(vht)) => ra_vht(rates, vht)?,
+        (None, None) => ra_ht(rates, Some(ht))?,
+    };
+    let w0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & !(3 << 6 | 1 << 21)
+        | u32::from(wide.bw) << 6
+        | u32::from(wide.sgi) << 21;
+    word(&mut bytes, 0, w0);
+    Some(bytes)
+}
 pub(in crate::rtw89) fn ra(rates: u16) -> Option<[u8; 16]> {
     ra_ht(rates, None)
 }

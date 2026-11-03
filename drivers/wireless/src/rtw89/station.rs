@@ -71,6 +71,17 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// [`Self::station_configure_ra`] on an admitted 40/80MHz channel.
+    async fn station_configure_ra_wide(
+        &mut self,
+        _: u16,
+        _: super::station_control::HtRa,
+        _: Option<super::station_control::HeRa>,
+        _: super::station_control::WideRa,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// `rtw89_fw_h2c_ba_cam` for a recipient session start/stop.
     async fn station_configure_ba(
         &mut self,
@@ -2730,8 +2741,49 @@ impl State {
                             .map_or(0, |phy| phy.ht().peer_mpdu_density());
                         self.ampdu = self.ht && io.station_ampdu_allowed()?;
                         self.er = he.is_some_and(|(_, er)| er);
-                        io.station_configure_ra(rates, ht, he.map(|(he, _)| he), &self.admission)
-                            .await?;
+                        let he = he.map(|(he, _)| he);
+                        match self.wide {
+                            // rtw89_phy_ra_sta_update on the tuned 40/80MHz
+                            // chandef: bw_cap, bandwidth SGI, VHT branch.
+                            Some(profile) => {
+                                let phy = plan.negotiated_phy().ok_or(Error::Profile)?;
+                                let bw = match phy.width() {
+                                    association::phy::Width::Forty => 1,
+                                    association::phy::Width::Eighty => 2,
+                                    _ => return Err(Error::Profile),
+                                };
+                                if bw != profile.width() as u8
+                                    || phy.center_channel() != profile.center()
+                                {
+                                    return Err(Error::Profile);
+                                }
+                                let vht = phy.vht().map(|vht| super::station_control::VhtRa {
+                                    peer_rx_mcs: vht.tx_mcs_map(),
+                                    ldpc: vht.tx_ldpc(),
+                                });
+                                let wide = super::station_control::WideRa {
+                                    bw,
+                                    sgi: if bw == 2 {
+                                        phy.vht().is_some_and(|vht| vht.tx_sgi80())
+                                    } else {
+                                        phy.ht().tx_sgi40()
+                                    },
+                                    vht,
+                                };
+                                io.station_configure_ra_wide(
+                                    rates,
+                                    ht.ok_or(Error::Profile)?,
+                                    he,
+                                    wide,
+                                    &self.admission,
+                                )
+                                .await?;
+                            }
+                            None => {
+                                io.station_configure_ra(rates, ht, he, &self.admission)
+                                    .await?
+                            }
+                        }
                     }
                 }
                 self.admission.run(|| {

@@ -348,6 +348,31 @@ unsafe impl Io for Startup {
             .submit_packet_agg(bytes, report, rate, agg)
     }
 
+    async fn station_configure_ra_wide(
+        &mut self,
+        rates: u16,
+        ht: control::HtRa,
+        he: Option<control::HeRa>,
+        wide: control::WideRa,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        if !self.station_ht_allowed()?
+            || he.is_some() && !self.station_he_allowed()?
+            || !self.station_firmware_ra_allowed()?
+        {
+            return Err(power::Error::Unsupported);
+        }
+        let native = self
+            .firmware
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .transport_mut();
+        self.station_controller
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .configure_ra_wide(&mut native.station_access(), rates, ht, he, wide, admission)
+            .await
+    }
     async fn station_configure_ra(
         &mut self,
         rates: u16,
