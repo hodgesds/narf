@@ -1025,9 +1025,10 @@ Linux asks it, outside the namespace lock. GETPARAM never reads the input
 size, reports size 0, and returns PROTECTED_CONTENT 0 and the stored,
 sign-extended PRIORITY. LINUX-GAP: BANNABLE, RECOVERABLE and PRIORITY are
 stored and reported only; a reset bans every context it finds, none is
-recovered, and GuC registration keeps the fixed i915 policy. VM rebinding
-requires every engine state of the context to be unused with no concurrent
-submission, preserving each ordered timeline. QUERY has Linux's
+recovered, and GuC registration keeps the fixed i915 policy. VM is settable
+only on a proto-context (set_proto_ctx_vm: size EINVAL, then upper_32_bits and
+the lookup ENOENT), whose engine states are never claimed; a finalized
+context's VM is immutable (ctx_setparam EINVAL). QUERY has Linux's
 two-pass/per-item signed-length protocol: system memory reports actual RAM;
 engine info reports the live engine set with HAS_LOGICAL_INSTANCE, including
 physical COPY8 mapped to logical COPY1 on BMG, otherwise zero engines; a nonzero input

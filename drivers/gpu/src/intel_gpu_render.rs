@@ -725,11 +725,17 @@ impl Namespaces {
                 }
                 context.low_latency = true;
             }
-            abi::CONTEXT_PARAM_VM => {
+            // set_proto_ctx_vm:366: size, then upper_32_bits and the lookup
+            // (-ENOENT). ctx_setparam refuses VM (-EINVAL): a finalized
+            // context's VM is immutable.
+            abi::CONTEXT_PARAM_VM if proto => {
                 if size != 0 {
                     return Err(FsError::InvalidData);
                 }
                 let vm_id = u32::try_from(value).map_err(|_| FsError::NotFound)?;
+                // Defensive only: no claim-capable UserContext of a
+                // proto-context exists (select() finalizes before claiming,
+                // under this lock), so this preflight never refuses.
                 let users = context.users();
                 let mut idle = Vec::new();
                 for user in &users {
@@ -741,7 +747,8 @@ impl Namespaces {
                 context.vm = self.vms.get(&vm_id).cloned().ok_or(FsError::NotFound)?;
             }
             // GTT_SIZE, NO_ZEROMAP, BAN_PERIOD, RINGSIZE and unknown
-            // parameters in both tables; CONTEXT_IMAGE needs
+            // parameters in both tables (and VM in ctx_setparam's);
+            // CONTEXT_IMAGE needs
             // CONFIG_DRM_I915_REPLAY_GPU_HANGS_API (set_context_image).
             _ => return Err(FsError::InvalidData),
         }
@@ -2752,7 +2759,12 @@ pub(crate) mod tests {
             {
                 return Err("destroyed VM handle invalidated the context VM owner");
             }
-            put32(&mut parameter, 0, 0);
+            // A proto-context of the other open, which is the only kind
+            // whose VM is settable, cannot name this open's VM.
+            user.store(64, &[0; 8]);
+            invoke(&other, &user, abi::GEM_CONTEXT_CREATE).map_err(|_| "other create")?;
+            put32(&mut parameter, 0, u32_at(&user.load(64, 8), 0));
+            put64(&mut parameter, 16, u64::from(new_vm));
             user.store(64, &parameter);
             if invoke(&other, &user, abi::GEM_CONTEXT_SETPARAM) != Err(FsError::NotFound) {
                 return Err("foreign VM resolved");
@@ -2763,6 +2775,65 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_context_vm_lifetime_and_foreign_ids
+    );
+
+    /// MIT Linux b90c984d i915_gem_context.c: set_proto_ctx_vm:366 checks
+    /// size (-EINVAL), upper_32_bits and the lookup (-ENOENT) on a
+    /// proto-context; ctx_setparam:2190 refuses VM on a finalized one
+    /// (-EINVAL) before reading size or value.
+    fn smoke_i915_setparam_vm_only_on_a_proto_context() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+            user.store(64, &[0; 16]);
+            invoke(&file, &user, abi::GEM_VM_CREATE).map_err(|_| "VM create")?;
+            let vm = u64::from(u32_at(&user.load(64, 16), 12));
+            user.store(64, &[0; 8]);
+            invoke(&file, &user, abi::GEM_CONTEXT_CREATE).map_err(|_| "create")?;
+            let proto = u32_at(&user.load(64, 8), 0);
+            let set = |id: u32, size: u32, value: u64| {
+                let mut parameter = [0; 24];
+                put32(&mut parameter, 0, id);
+                put32(&mut parameter, 4, size);
+                put64(&mut parameter, 8, abi::CONTEXT_PARAM_VM);
+                put64(&mut parameter, 16, value);
+                user.store(64, &parameter);
+                invoke(&file, &user, abi::GEM_CONTEXT_SETPARAM)
+            };
+            // Context 0 is finalized at open.
+            for (size, value) in [(0, vm), (1, vm), (0, vm + 1), (0, 1 << 32)] {
+                if set(0, size, value) != Err(FsError::InvalidData) {
+                    return Err("ctx_setparam accepted VM");
+                }
+            }
+            for (size, value, expected, why) in [
+                (1, vm, Err(FsError::InvalidData), "proto size"),
+                (0, vm | 1 << 32, Err(FsError::NotFound), "upper_32_bits"),
+                (0, vm + 1, Err(FsError::NotFound), "lookup"),
+                (0, vm, Ok(0), "proto VM"),
+            ] {
+                if set(proto, size, value) != expected {
+                    return Err(why);
+                }
+            }
+            // GETPARAM's lookup finalizes the proto: its VM is now fixed.
+            let mut get = [0; 24];
+            put32(&mut get, 0, proto);
+            put64(&mut get, 8, abi::CONTEXT_PARAM_VM);
+            user.store(64, &get);
+            invoke(&file, &user, abi::GEM_CONTEXT_GETPARAM).map_err(|_| "get VM")?;
+            if u64_at(&user.load(64, 24), 16) != vm {
+                return Err("bound VM");
+            }
+            if set(proto, 0, vm) != Err(FsError::InvalidData) {
+                return Err("finalized context rebound its VM");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_setparam_vm_only_on_a_proto_context
     );
 
     fn smoke_intel_extension_validation_is_transactional() -> TestResult {

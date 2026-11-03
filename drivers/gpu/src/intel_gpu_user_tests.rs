@@ -447,12 +447,13 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
         fence.result().is_none(),
         "ioctl acceptance is not GPU completion"
     );
+    // ctx_setparam refuses VM on the finalized default context, busy or not.
     let mut rebind = [0; 24];
     put64(&mut rebind, 8, 9);
     user.store(64, &rebind);
     assert_eq!(
         file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
-        Some(Err(FsError::Busy))
+        Some(Err(FsError::InvalidData))
     );
     exec(&user, handles, 0);
     // A second submission on the same context waits before backend publication;
