@@ -84,6 +84,7 @@ pub(super) fn request_b22(
     qualification: [u8; 32],
     indices: [[u8; 12]; 2],
     mac: [u8; 6],
+    host: super::phy8821c::Host,
 ) -> Request {
     let mut h = narf_crypto::sha256::Sha256::new();
     h.update(b"NARF RTL8822BE ch1/20 2T2R static legacy12 DATA and response-bound WMM BE/TID0 v1");
@@ -99,8 +100,14 @@ pub(super) fn request_b22(
         identity: h.finalize(),
         mac,
         filename: format!(
-            "rtw88/rtw8822be-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "rtw88/{}-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            host.family(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         ),
     }
 }

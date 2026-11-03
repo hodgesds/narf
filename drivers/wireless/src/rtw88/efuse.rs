@@ -431,7 +431,38 @@ pub(super) fn read_factory8821c_with(
 pub(super) async fn read_factory8821c_usb(
     io: &mut impl super::firmware_transport::Io,
 ) -> Result<Factory8821c, EfuseError> {
-    let chip = geometry(RTL_DEV_8821CE)?;
+    let logical = read_logical_usb(io, RTL_DEV_8821CE).await?;
+    Factory8821c {
+        logical: logical[..512]
+            .try_into()
+            .map_err(|_| EfuseError::MalformedMap)?,
+        usb: false,
+    }
+    .on_usb()
+}
+/// RTL8822BU factory map over the asynchronous register `Io`: the same
+/// physical dump and logical decode as the PCI RTL8822BE
+/// ([`read_logical8822b_with`]) issued as EP0 transfers, parsed as
+/// `rtw8822b.c::rtw8822b_read_efuse` -> `rtw8822bu_efuse_parsing`
+/// (`efuse8822b::Factory8822b::usb_map`, MAC at 0x107).
+pub(super) async fn read_factory8822b_usb(
+    io: &mut impl super::firmware_transport::Io,
+) -> Result<super::efuse8822b::Factory8822b, EfuseError> {
+    let logical = read_logical_usb(io, RTL_DEV_8822BE).await?;
+    super::efuse8822b::Factory8822b::usb_map(
+        logical[..768]
+            .try_into()
+            .map_err(|_| EfuseError::MalformedMap)?,
+    )
+}
+/// `efuse.c::rtw_dump_physical_efuse_map` + `rtw_dump_logical_efuse_map`
+/// for chip `did` over the asynchronous register `Io` (bank 0, programming
+/// LDO off, one REG_EFUSE_CTRL address write and VALID poll per byte).
+async fn read_logical_usb(
+    io: &mut impl super::firmware_transport::Io,
+    did: u16,
+) -> Result<alloc::vec::Vec<u8>, EfuseError> {
+    let chip = geometry(did)?;
     let access = |_| EfuseError::Timeout;
     let bank = io.read32(REG_LDO_EFUSE_CTRL as u16).await.map_err(access)?;
     io.write32(REG_LDO_EFUSE_CTRL as u16, bank & !EFUSE_BANK_MASK)
@@ -466,13 +497,7 @@ pub(super) async fn read_factory8821c_usb(
     }
     let mut logical = alloc::vec![0xffu8; chip.logical];
     decode_map(&physical, &mut logical)?;
-    Factory8821c {
-        logical: logical[..512]
-            .try_into()
-            .map_err(|_| EfuseError::MalformedMap)?,
-        usb: false,
-    }
-    .on_usb()
+    Ok(logical)
 }
 /// # Safety
 /// Same powered, exclusive BAR2 ownership contract as `read_mac`.

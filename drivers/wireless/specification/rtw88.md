@@ -4205,6 +4205,95 @@ policy and serialize disconnect against synchronous workers. Administrative
 IFF_UP remains independent of physical carrier. These are software/model
 results; no fixture creates deployable board measurements or physical evidence.
 
+### RTL8822BU: the B22 die over the USB transport (`usb_driver.rs`)
+
+Linux binds RTL8822BU with rtw88 (`rtw8822bu.c::rtw_8822bu_driver`, the
+`rtw8822b_hw_spec` B22 die over `usb.c`), not rtl8xxxu. As RTL8821CU is
+C21 over USB, RTL8822BU is the retained RTL8822BE B22 runtime above over the
+RTL8821CU USB transport; no PCI byte, record or filename changes.
+
+- Registration: `usb::RTL8822BU_IDS` = `rtw_8822bu_id_table` (35 entries,
+  table order) registered as `usb_driver::RTW8822BU_USB_IDS` with the vendor
+  interface triple 0xff/0xff/0xff ("rtw8822bu",
+  `register_class_driver_with_unbind`). The table is disjoint from
+  `rtw_8821cu_id_table`; `usb_driver::chip` maps the claimed VID/PID to
+  0xc821 or 0xb822 (`id->driver_info`). 0bda:b82c is removed from
+  `rtl8xxxu::RTL8XXXU_USB_IDS` (rtl8xxxu's detection-only probe no longer
+  claims an RTL8822BU); `rtl8xxxu::regs::REALTEK_USB_IDS` keeps it as an
+  identification row only.
+- Host identity: `phy8821c::Host` gains `chip`; `Interface::host_of(did)`
+  keys B22 records by the claimed VID/PID (header bytes 12..16, the
+  `host-usb` identity binding) with the filename family `rtw8822bu`
+  (`Host::family`). `calibration8822b::Board`/`Request`,
+  `operating8822b::Request`/`Info`/`StationRequest` and
+  `station_profile::request_b22` carry that host, and `power_policy` returns
+  the `N2BS` grant's host for B22, so every later B22 record (`N2BO`,
+  `N2BD`, `N2BW`, `N2BL`, `N2BH`, `N2BB`/`N2BV`, `N2BC`, `N2BF`, `N2BR`/
+  `N2BT`, `N2BX`) is `rtw88/rtw8822bu-*` with the USB header. PCI keeps
+  `Host::PCI_B22` (10ec:b822, `rtw8822be-*`, no host binding), byte-identical.
+- Power: `usb::Registers::for_chip(io, 0xb822)` runs `card_enable_flow_8822b`
+  / `card_disable_flow_8822b` filtered to `RTW_PWR_INTF_USB_MSK`
+  (`*_8822B_USB`, with the cut-C-only 0x10a8..0x10aa rows and the USB-base
+  0xff1a row) and `__rtw_mac_init_system_cfg` with `sys_func_en` 0xdc; the
+  rest of `rtw_mac_power_on`/`rtw_power_off` is the C21 USB path.
+- EFUSE: `efuse::read_factory8822b_usb` is the asynchronous physical dump +
+  logical decode of the PCI B22 map, parsed as `rtw8822bu_efuse_parsing`
+  (`Factory8822b::usb_map`, MAC at 0x107 = `rtw8822bu_efuse::mac_addr`);
+  `prepare_phy8822b` refuses a factory whose layout does not match the
+  lifecycle's host interface.
+- Probe tail (`rtw_usb_probe` after `rtw_chip_info_setup`):
+  `Registers::phy_cfg(cut)` = `rtw_usb_phy_cfg` HIGH (empty
+  `usb2_param_8822b`) then SUPER (`usb3_param_8822b`: PHY offset 0x01 =
+  0xa841 for `RTW_INTF_PHY_CUT_D` only, through `rtw_usb_phy_write` 0xff0d/
+  0xff0e/0xff0c); `Registers::switch_mode(usb_mode_switch)` =
+  `rtw_usb_switch_mode_new` (8822B is `rtw_usb3_chip_new`; the factory
+  `usb_mode` bit 7, module parameter default on). When it asks the chip to
+  re-enumerate as USB 3 no shell is published (Linux skips
+  `rtw_register_hw`) and the new function probes fresh.
+- MAC: `mac::prepare_on(0xb822, Hci::Usb { .. })` uses the bulk-out-count
+  `rqpn_table_8822b` (row-for-row equal to `rqpn_table_8821c`) and
+  `page_table_8822b` (64/64/64/64, 64/64/0/0 for two pipes, 64/64/64/0 for
+  three) with the B22 boundary 1996, plus the USB tails already described
+  for C21; USB stays refused for C22.
+- PHY: the `rtw8822b_table.c` rows are interface-independent:
+  `phy/gen_rtl8822b_tables.py` with `cond.intf = INTF_USB` (BIT(1)) emits
+  the same 17 frozen tables as `INTF_PCIE`, so `phy8822b::rows` serves both.
+- Backend (`usb_firmware::Backend::new_for(0xb822, ..)`): the page row
+  check, firmware-page boundary restore (1996), `transmit_quiet` FIFO pages
+  and `finish_station8821c`'s gate chip follow the claimed die. The B22
+  retune/widening H2C is `command::iqk8821c` at the running sequence, as on
+  PCI (`retune_iqk_packet`). `station_b22_iqk` mirrors
+  `pci_firmware.rs::station_b22_iqk` over EP0: Begin requires an open,
+  non-retuning station with no H2C/mailbox outstanding and a current B22
+  gate, writes TXPAUSE 0xff and RXPKT_NUM `BIT_RW_RELEASE`; Quiet is
+  `b22_iqk_quiet` (TXPAUSE held, no queued/in-flight/awaiting frame or H2C
+  receipt, the `rqpn_table_8822b` map and every `page_table_8822b` page free,
+  `BIT_RXDMA_IDLE`); Submit sends the `rtw8822b_do_iqk` H2C on the H2C pipe;
+  Finish needs the completed receipt and still-quiet hardware and releases
+  RXDMA and TXPAUSE with readback. `dynamic_rx_agg` is
+  `rtw_usb_dynamic_rx_agg_v1` (`RTW_CHIP_TYPE_8822B` too). The receive PHY
+  status parser is C21's (`packet_phy::Chip::C21`), as on PCI 8822BE.
+- Provisioning (`usb_driver::provision8822b`): firmware
+  (`rtw88/rtw8822b_fw.bin`), MAC, `prepare_phy8822b`,
+  `prepare_calibration8822b` (`N2BQ`), `prepare_operating8822b` (`N2BP`),
+  `prepare_station8822b` (`N2BS`), then `Device::activate`; retried as
+  `pci.rs::schedule_owner` while the image or a record is missing (B22
+  `Calibrated` counts as pending). The shell is published as `rtw8822bu`
+  (`interface::publish`), the bound record is `rtw88-8822bu`.
+- Recovery/idle/sleep: `Origin` records the die; `usb_recovery` powers the
+  card off with the B22 rows and `power_up` re-reads the B22 USB map
+  (`Identity` on a MAC change), so reset, rejoin, runtime idle and system
+  sleep follow the RTL8821CU USB path unchanged and re-earn every stage
+  through the `rtw8822bu-*` records.
+
+Scope equals the RTL8822BE row: LPS and Bluetooth coexistence stay open as
+documented for B22 (`ps_page` refuses a non-C21 source). No `rtw8822bu-*`
+record is provisioned: an unprovisioned RTL8822BU stops at
+`PhyTablesPrepared` and is never admitted (no station, band or TX grant).
+Written, unexecuted: `smoke_rtw88_usb_8822bu_id_table_host_and_fifo`,
+`smoke_rtw88_usb_8822bu_power_phy_cfg_and_switch`,
+`smoke_rtw88_usb_8822bu_backend_mac_efuse_and_iqk`.
+
 ### Upstream applicability triage (2026-10-27)
 
 This subsection resolves the former `unknown` inventory rows against Linux

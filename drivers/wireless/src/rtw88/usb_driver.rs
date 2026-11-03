@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8821CU USB driver registration (Linux 7.3-rc4 `rtw88/rtw8821cu.c`
-//! `rtw_8821cu_driver` over `usb.c::rtw_usb_probe`).
+//! RTL8821CU and RTL8822BU USB driver registration (Linux 7.3-rc4
+//! `rtw88/rtw8821cu.c` `rtw_8821cu_driver` and `rtw88/rtw8822bu.c`
+//! `rtw_8822bu_driver`, both over `usb.c::rtw_usb_probe`).
+//!
+//! RTL8822BU is the B22 die (`rtw8822b_hw_spec`) behind the same USB host
+//! interface: `usb::Registers` runs the `rtw8822b.c` USB power rows and
+//! `sys_func_en` 0xdc, the factory map is parsed as
+//! `rtw8822bu_efuse_parsing` (MAC 0x107), `rtw_usb_phy_cfg` writes the one
+//! cut-D `usb3_param_8822b` row and `rtw_usb_switch_mode` may ask the chip
+//! to re-enumerate as USB 3 (no shell is then published). Provisioning then
+//! runs the B22 stages of `native8822b.rs` (firmware, MAC, PHY, `N2BQ`
+//! IQK, `N2BP` parked power, `N2BS` awake station) keyed by the claimed
+//! VID/PID (`rtw8822bu-*` records).
 //!
 //! The class registry hands a matching function to [`probe`], which only
 //! records the claim and spawns the asynchronous attach (every register
@@ -24,6 +35,7 @@
 //! record) stops at the calibration stage and is never admitted for radio TX.
 use super::{
     efuse::{self, Factory8821c},
+    efuse8822b::Factory8822b,
     firmware_lifecycle::{Lifecycle, Stage},
     firmware_transport::Error,
     interface,
@@ -50,13 +62,15 @@ const CONFIG_MAX: usize = 4096;
 const ATTEMPTS: usize = 120;
 
 const N: usize = usb::RTL8821CU_IDS.len();
-/// `rtw_8821cu_id_table`: `USB_DEVICE_AND_INTERFACE_INFO(vid, pid, 0xff,
-/// 0xff, 0xff)` for every entry.
-const fn id_table() -> [UsbClassMatch; N] {
-    let mut out = [UsbClassMatch::vid_pid(0xffff, 0xffff); N];
+const N22B: usize = usb::RTL8822BU_IDS.len();
+/// `rtw_8821cu_id_table` / `rtw_8822bu_id_table`:
+/// `USB_DEVICE_AND_INTERFACE_INFO(vid, pid, 0xff, 0xff, 0xff)` for every
+/// entry.
+const fn id_table<const M: usize>(ids: &[(u16, u16)]) -> [UsbClassMatch; M] {
+    let mut out = [UsbClassMatch::vid_pid(0xffff, 0xffff); M];
     let mut i = 0;
-    while i < N {
-        let (vendor_id, product_id) = usb::RTL8821CU_IDS[i];
+    while i < M {
+        let (vendor_id, product_id) = ids[i];
         out[i] = UsbClassMatch {
             vendor_id,
             product_id,
@@ -68,7 +82,34 @@ const fn id_table() -> [UsbClassMatch; N] {
     }
     out
 }
-pub(super) static RTW8821CU_USB_IDS: [UsbClassMatch; N] = id_table();
+pub(super) static RTW8821CU_USB_IDS: [UsbClassMatch; N] = id_table(usb::RTL8821CU_IDS);
+pub(super) static RTW8822BU_USB_IDS: [UsbClassMatch; N22B] = id_table(usb::RTL8822BU_IDS);
+
+/// The factory map of one claimed function: `rtw8821cu_efuse_parsing` or
+/// `rtw8822bu_efuse_parsing` (both with the MAC at 0x107).
+#[derive(Clone, Debug)]
+pub(super) enum Factory {
+    C21(alloc::boxed::Box<Factory8821c>),
+    B22(alloc::boxed::Box<Factory8822b>),
+}
+impl Factory {
+    pub(super) fn mac(&self) -> [u8; 6] {
+        match self {
+            Self::C21(f) => f.mac(),
+            Self::B22(f) => f.mac(),
+        }
+    }
+}
+/// The die behind a claimed USB function (`id->driver_info`).
+pub(super) fn chip(vendor: u16, product: u16) -> Option<u16> {
+    if usb::is_rtl8821cu(vendor, product) {
+        Some(0xc821)
+    } else if usb::is_rtl8822bu(vendor, product) {
+        Some(0xb822)
+    } else {
+        None
+    }
+}
 
 struct Bound {
     device: Arc<USBDevice>,
@@ -85,6 +126,8 @@ struct Bound {
 /// and the factory MAC); `usb_recovery.rs` restarts over it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Origin {
+    /// 0xc821 (RTL8821CU) or 0xb822 (RTL8822BU).
+    pub(super) did: u16,
     pub(super) endpoints: Endpoints,
     pub(super) speed: Speed,
     pub(super) mac: [u8; 6],
@@ -99,7 +142,8 @@ pub(super) struct Current {
 }
 static BOUND: IrqSafeSpinLock<Vec<Bound>> = IrqSafeSpinLock::new(Vec::new());
 
-/// `module_usb_driver(rtw_8821cu_driver)`.
+/// `module_usb_driver(rtw_8821cu_driver)` and
+/// `module_usb_driver(rtw_8822bu_driver)`.
 pub(super) fn register() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "rtw88-8821cu-usb-ids", || {
@@ -111,14 +155,24 @@ pub(super) fn register() {
         );
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "rtw88-8822bu-usb-ids", || {
+        let _ = narf_drivers_usb::class_registry::register_class_driver_with_unbind(
+            "rtw8822bu",
+            &RTW8822BU_USB_IDS,
+            probe,
+            unbind,
+        );
+        InitResult::Ok
+    });
 }
 
-/// `rtw_8821cu_probe`: claim the function and start the asynchronous
-/// `rtw_usb_probe` body; a second probe of the same handle is a no-op.
+/// `rtw_8821cu_probe` / `rtw_8822bu_probe`: claim the function and start
+/// the asynchronous `rtw_usb_probe` body; a second probe of the same handle
+/// is a no-op.
 pub(super) fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
-    if !usb::is_rtl8821cu(device.vendor_id(), device.product_id()) {
+    let Some(did) = chip(device.vendor_id(), device.product_id()) else {
         return Err(UsbProbeError::UnsupportedVariant);
-    }
+    };
     {
         let mut bound = BOUND.lock();
         if bound.iter().any(|b| b.device.slot_id() == device.slot_id()) {
@@ -133,9 +187,10 @@ pub(super) fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
         });
     }
     narf_scheduler::spawn(async move {
-        if let Err(error) = attach(device.clone()).await {
+        if let Err(error) = attach(device.clone(), did).await {
             narf_console::klog!(
-                "rtw8821cu {:04x}:{:04x}: {:?}\n",
+                "{} {:04x}:{:04x}: {:?}\n",
+                driver_name(did),
                 device.vendor_id(),
                 device.product_id(),
                 error
@@ -167,7 +222,16 @@ fn unbind(slot_id: u8) -> Result<(), ()> {
     Ok(())
 }
 
-/// The published RTL8821CU station shell claimed on USB `slot_id`.
+/// Linux driver name of chip `did` on USB.
+fn driver_name(did: u16) -> &'static str {
+    if did == 0xb822 {
+        "rtw8822bu"
+    } else {
+        "rtw8821cu"
+    }
+}
+
+/// The published RTL8821CU/RTL8822BU station shell claimed on USB `slot_id`.
 pub(super) fn station(slot_id: u8) -> Option<Arc<Station>> {
     BOUND
         .lock()
@@ -280,6 +344,44 @@ pub(super) async fn power_and_factory<
 >(
     backend: &mut usb_firmware::Backend<C, P>,
 ) -> Result<Factory8821c, Error> {
+    power_on(backend).await?;
+    efuse::read_factory8821c_usb(backend)
+        .await
+        .map_err(factory_error)
+}
+/// [`power_and_factory`] for the claimed chip `did`.
+pub(super) async fn power_and_factory_for<
+    C: crate::rtl8xxxu::firmware_transport::ControlIo,
+    P: crate::rtl8xxxu::packet_transport::Io + Clone,
+>(
+    backend: &mut usb_firmware::Backend<C, P>,
+    did: u16,
+) -> Result<Factory, Error> {
+    if did != 0xb822 {
+        return power_and_factory(backend)
+            .await
+            .map(|f| Factory::C21(alloc::boxed::Box::new(f)));
+    }
+    power_on(backend).await?;
+    efuse::read_factory8822b_usb(backend)
+        .await
+        .map(|f| Factory::B22(alloc::boxed::Box::new(f)))
+        .map_err(factory_error)
+}
+fn factory_error(error: efuse::EfuseError) -> Error {
+    match error {
+        efuse::EfuseError::Timeout => Error::Timeout,
+        // Erased/invalid USB map (no unicast MAC at 0x107) or a malformed
+        // record: the function cannot be identified or keyed.
+        _ => Error::Prerequisite,
+    }
+}
+async fn power_on<
+    C: crate::rtl8xxxu::firmware_transport::ControlIo,
+    P: crate::rtl8xxxu::packet_transport::Io + Clone,
+>(
+    backend: &mut usb_firmware::Backend<C, P>,
+) -> Result<(), Error> {
     let registers = backend.registers();
     registers
         .power_on()
@@ -288,28 +390,51 @@ pub(super) async fn power_and_factory<
     registers
         .write8(0x1a0, 0xfd)
         .await
-        .map_err(usb_firmware::usb_error)?;
-    efuse::read_factory8821c_usb(backend)
-        .await
-        .map_err(|error| match error {
-            efuse::EfuseError::Timeout => Error::Timeout,
-            // Erased/invalid USB map (no unicast MAC at 0x107) or a malformed
-            // record: the function cannot be identified or keyed.
-            _ => Error::Prerequisite,
-        })
+        .map_err(usb_firmware::usb_error)
 }
 
-async fn attach(device: Arc<USBDevice>) -> Result<(), Error> {
+async fn attach(device: Arc<USBDevice>, did: u16) -> Result<(), Error> {
     let endpoints = interface_init(&device).await?;
     let speed = Speed::from_port(device.speed());
-    let mut backend = Backend::new(
+    let mut backend = Backend::new_for(
+        did,
         UsbControl::new(device.clone()),
         UsbIo::new(device.clone()),
         endpoints,
         speed,
     )?;
-    let factory = power_and_factory(&mut backend).await?;
+    let factory = power_and_factory_for(&mut backend, did).await?;
+    if let Factory::B22(f) = &factory {
+        // `rtw_usb_probe` after `rtw_chip_info_setup`: `rtw_usb_phy_cfg`
+        // (HIGH, then SUPER) at the chip cut, then `rtw_usb_switch_mode`.
+        let registers = backend.registers();
+        let cut = (registers
+            .read32(0xf0)
+            .await
+            .map_err(usb_firmware::usb_error)?
+            >> 12
+            & 15) as u8;
+        registers
+            .phy_cfg(cut)
+            .await
+            .map_err(usb_firmware::usb_error)?;
+        if registers
+            .switch_mode(f.usb_mode_switch())
+            .await
+            .map_err(usb_firmware::usb_error)?
+        {
+            // "switching to USB 3 mode": the chip re-enumerates; Linux
+            // skips `rtw_register_hw` and the new function probes fresh.
+            narf_console::klog!(
+                "rtw8822bu {:04x}:{:04x}: switching to USB 3 mode\n",
+                device.vendor_id(),
+                device.product_id()
+            );
+            return Ok(());
+        }
+    }
     let origin = Origin {
+        did,
         endpoints,
         speed,
         mac: factory.mac(),
@@ -326,14 +451,19 @@ async fn attach(device: Arc<USBDevice>) -> Result<(), Error> {
     let generation = Generation::publish(&device, None, name, factory, backend)?;
     // `pci.rs::probe`'s bound-driver record (no PCI IDs on USB).
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("rtw88-8821cu"),
+        name: alloc::string::String::from(if did == 0xb822 {
+            "rtw88-8822bu"
+        } else {
+            "rtw88-8821cu"
+        }),
         kind: narf_drivers::BoundKind::Net,
         pci_vid: None,
         pci_did: None,
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     narf_console::klog!(
-        "rtw8821cu {:04x}:{:04x} {} {:?} {} bulk-out\n",
+        "{} {:04x}:{:04x} {} {:?} {} bulk-out\n",
+        driver_name(did),
         device.vendor_id(),
         device.product_id(),
         name,
@@ -351,7 +481,7 @@ pub(super) struct Generation {
     device: Arc<USBDevice>,
     pub(super) lifecycle: Arc<Lifecycle<Backend>>,
     pub(super) station: Arc<Station>,
-    factory: Factory8821c,
+    factory: Factory,
     /// The backend moves into the lifecycle on the first attempt whose
     /// firmware image is registered; until then it stays here, unclaimed.
     pending: IrqSafeSpinLock<Option<Backend>>,
@@ -365,13 +495,16 @@ impl Generation {
         device: &Arc<USBDevice>,
         old: Option<&Arc<Station>>,
         name: &'static str,
-        factory: Factory8821c,
+        factory: Factory,
         backend: Backend,
     ) -> Result<Self, Error> {
         let (vendor, product) = (device.vendor_id(), device.product_id());
-        let lifecycle: Arc<Lifecycle<Backend>> = Arc::new(
-            Lifecycle::new(0xc821).on(super::phy8821c::Interface::Usb { vendor, product }),
-        );
+        let did = match factory {
+            Factory::C21(_) => 0xc821,
+            Factory::B22(_) => 0xb822,
+        };
+        let lifecycle: Arc<Lifecycle<Backend>> =
+            Arc::new(Lifecycle::new(did).on(super::phy8821c::Interface::Usb { vendor, product }));
         let station = Arc::new(Station::new(
             name,
             factory.mac(),
@@ -452,16 +585,17 @@ impl Generation {
 pub(super) async fn power_up(
     device: &Arc<USBDevice>,
     origin: &Origin,
-) -> Result<(Backend, Factory8821c), super::operating_reset::Error> {
+) -> Result<(Backend, Factory), super::operating_reset::Error> {
     use super::operating_reset::Error as Reset;
-    let mut backend = Backend::new(
+    let mut backend = Backend::new_for(
+        origin.did,
         UsbControl::new(device.clone()),
         UsbIo::new(device.clone()),
         origin.endpoints,
         origin.speed,
     )
     .map_err(|_| Reset::Unsupported)?;
-    let factory = power_and_factory(&mut backend)
+    let factory = power_and_factory_for(&mut backend, origin.did)
         .await
         .map_err(|_| Reset::Power)?;
     if factory.mac() != origin.mac {
@@ -470,15 +604,17 @@ pub(super) async fn power_up(
     Ok((backend, factory))
 }
 
-/// `pci.rs::retryable` for the USB owner.
+/// `pci.rs::retryable` for the USB owner: B22 `Calibrated` awaits `N2BP`.
 fn retryable(lifecycle: &Lifecycle<Backend>, station: &Station) -> bool {
-    matches!(
-        lifecycle.status().stage,
+    let stage = lifecycle.status().stage;
+    (matches!(
+        stage,
         Stage::Detected
             | Stage::PhyTablesPrepared
             | Stage::Calibration8821cPrepared
             | Stage::Operating8821cPrepared
-    ) && !station.closed()
+    ) || lifecycle.device_id() == 0xb822 && stage == Stage::Calibrated)
+        && !station.closed()
 }
 
 /// `sibling.rs::Sibling::provision` + `pci.rs::provision_owner`'s station
@@ -486,9 +622,13 @@ fn retryable(lifecycle: &Lifecycle<Backend>, station: &Station) -> bool {
 async fn provision(
     lifecycle: &Lifecycle<Backend>,
     station: &Station,
-    factory: &Factory8821c,
+    factory: &Factory,
     pending: &IrqSafeSpinLock<Option<Backend>>,
 ) -> Result<(), Error> {
+    let factory = match factory {
+        Factory::C21(f) => f,
+        Factory::B22(f) => return provision8822b(lifecycle, station, f, pending).await,
+    };
     loop {
         if station.closed() {
             return Err(Error::Cancelled);
@@ -515,6 +655,51 @@ async fn provision(
                 lifecycle
                     .prepare_station8821c(factory, super::station_power8821c::Source::Registered)
                     .await?;
+            }
+            Stage::Radio8821cPrepared => {
+                return station.activate().await.map_err(|_| Error::Prerequisite);
+            }
+            Stage::StationReady => return Ok(()),
+            _ => return Err(Error::State),
+        }
+    }
+}
+
+/// `native8822b.rs::Owner8822b::provision` + `pci.rs::provision_owner`'s
+/// B22 station activation, over the USB backend. An unprovisioned
+/// RTL8822BU (no `rtw8822bu-*` N2BQ/N2BP/N2BS record) stops at the pure
+/// `PhyTablesPrepared` / `Calibrated` / `Operating8821cPrepared`
+/// checkpoints and is never admitted for radio TX.
+async fn provision8822b(
+    lifecycle: &Lifecycle<Backend>,
+    station: &Station,
+    factory: &Factory8822b,
+    pending: &IrqSafeSpinLock<Option<Backend>>,
+) -> Result<(), Error> {
+    loop {
+        if station.closed() {
+            return Err(Error::Cancelled);
+        }
+        match lifecycle.status().stage {
+            Stage::Detected => {
+                lifecycle
+                    .initialize_registered(|| pending.lock().take().ok_or(Error::State))
+                    .await?;
+            }
+            Stage::Ready => {
+                lifecycle.prepare_mac().await?;
+            }
+            Stage::MacPrepared => {
+                lifecycle.prepare_phy8822b(factory).await?;
+            }
+            Stage::PhyTablesPrepared => {
+                lifecycle.prepare_calibration8822b(factory).await?;
+            }
+            Stage::Calibrated => {
+                lifecycle.prepare_operating8822b(factory).await?;
+            }
+            Stage::Operating8821cPrepared => {
+                lifecycle.prepare_station8822b(factory).await?;
             }
             Stage::Radio8821cPrepared => {
                 return station.activate().await.map_err(|_| Error::Prerequisite);

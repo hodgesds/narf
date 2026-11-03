@@ -3,7 +3,8 @@
 //! firmware-offloaded `rtw8822b_do_iqk` program on channel 1 / 20 MHz, 2T2R.
 //!
 //! The signed `N2BQ` record mirrors the C21 `N21Q` format (same 128-byte
-//! layout, B22 magic and PCI `10ec:b822` header) and is bound to a distinct
+//! layout, B22 magic and the host header: PCI `10ec:b822`, or the claimed
+//! VID/PID of an RTL8822BU (`phy8821c::Host`)) and is bound to a distinct
 //! B22 board identity: the 768-byte `Factory8822b` map, the authenticated
 //! `rtw8822b_fw.bin` digest, the firmware hardware report, the selected
 //! `rtw8822b_table.c` rows and this recipe. It carries only measured facts a
@@ -21,14 +22,14 @@ use narf_firmware::FirmwareBlob;
 use narf_wireless::reg::RegulatoryDomain;
 
 pub(super) const LENGTH: usize = 128;
-/// Record bytes 12..16: PCI vendor/device little-endian.
-pub(super) const HEADER: [u8; 4] = [0xec, 0x10, 0x22, 0xb8];
 /// Metadata to measure/sign for this exact retained calibration program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Host keying every B22 record of this board (header, filename family).
+    pub host: super::phy8821c::Host,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Board {
@@ -36,6 +37,7 @@ pub(super) struct Board {
     mac: [u8; 6],
     thermal: u8,
     hardware: Features,
+    host: super::phy8821c::Host,
 }
 /// Recipe text bound into the identity; changing the program changes it.
 pub(super) fn bind_recipe(hash: &mut narf_crypto::sha256::Sha256) {
@@ -50,7 +52,13 @@ impl Board {
         mac: mac::Info,
         hardware: Features,
         firmware: [u8; 32],
+        host: super::phy8821c::Host,
     ) -> Result<Self, Error> {
+        // A B22 board is keyed by the PCI RTL8822BE identity or by a claimed
+        // RTL8822BU VID/PID; no other host keys this record family.
+        if host.chip != 0xb822 || !host.usb && host != super::phy8821c::Host::PCI_B22 {
+            return Err(Error::Identity);
+        }
         let expected = phy8822b::Info::from_factory(factory, phy.cut, hardware)
             .map_err(|_| Error::Identity)?;
         if (phy.cut, phy.rfe, phy.crystal) != (expected.cut, expected.rfe, expected.crystal)
@@ -79,11 +87,14 @@ impl Board {
             }
         }
         bind_recipe(&mut hash);
+        // USB boards bind their VID/PID; the PCI identity is unchanged.
+        host.bind(&mut hash);
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
             thermal: factory.thermal(),
             hardware,
+            host,
         })
     }
     pub(super) fn request(self) -> Request {
@@ -92,9 +103,16 @@ impl Board {
             identity: self.identity,
             mac: m,
             filename: format!(
-                "rtw88/rtw8822be-iqk-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                m[0], m[1], m[2], m[3], m[4], m[5]
+                "rtw88/{}-iqk-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                self.host.family(),
+                m[0],
+                m[1],
+                m[2],
+                m[3],
+                m[4],
+                m[5]
             ),
+            host: self.host,
         }
     }
 }
@@ -179,7 +197,7 @@ impl Envelope {
             || half(raw, 4) != 1
             || half(raw, 6) != 128
             || u32::from_le_bytes(raw[8..12].try_into().unwrap()) != 128
-            || raw[12..16] != HEADER
+            || raw[12..16] != board.host.header()
             || raw[54] != 1
             || raw[55] != 20
             || &raw[64..66] != b"US"

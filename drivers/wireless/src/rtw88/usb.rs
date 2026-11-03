@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTW88 USB host-interface transport for the RTL8821C die (RTL8821CU).
+//! RTW88 USB host-interface transport for the RTL8821C die (RTL8821CU) and
+//! the RTL8822B die (RTL8822BU, `rtw8822bu.c`).
 //!
 //! Port of Linux 7.3-rc4 `rtw88/usb.c`, `usb.h` and `rtw8821cu.c` plus the
 //! USB branches of `mac.c` (`rtw_mac_pre_system_cfg`, `rtw_mac_power_switch`,
@@ -75,8 +76,25 @@ const REG_CR_EXT: u16 = 0x1100;
 const BIT_RXDMA_ARBBW_EN: u8 = 1 << 0;
 const BIT_RXDMA_AGG_EN: u8 = 1 << 2;
 const BIT_DROP_DATA_EN: u16 = 1 << 9;
+// reg.h: `rtw_usb_switch_mode_new` / `rtw_usb_phy_write` registers.
+const REG_SYS_PW_CTRL: u16 = 0x04;
+const BIT_APFM_OFFMAC: u16 = 1 << 9;
+const REG_PAD_CTRL2: u16 = 0xc4;
+const BIT_RSM_EN_V1: u32 = 1 << 16;
+const BIT_NO_PDN_CHIPOFF_V1: u32 = 1 << 17;
+const MASK_USB23_SW_MODE_V1: u32 = 3 << 18;
+const BIT_USB3_USB2_TRANSITION: u32 = 1 << 20;
+const USB_MODE_U3: u32 = 2;
+const REG_SYS_CFG2: u16 = 0xfc;
+const REG_SW_MDIO: u16 = 0x10c0;
+const REG_USB3_PHY_ADR: u16 = 0xff0c;
+const REG_USB3_PHY_DAT_L: u16 = 0xff0d;
+const REG_USB3_PHY_DAT_H: u16 = 0xff0e;
+const BIT_USB3_PHY_ADR_WR: u8 = 1 << 7;
 /// `rtw8821c_hw_spec.sys_func_en`.
 const SYS_FUNC_EN_8821C: u8 = 0xd8;
+/// `rtw8822b_hw_spec.sys_func_en`.
+const SYS_FUNC_EN_8822B: u8 = 0xdc;
 /// `main.h`: `RTW_PWR_POLLING_CNT`; `do_pwr_poll_cmd` polls every 50us.
 const POLLING_CNT: u32 = 20000;
 
@@ -128,6 +146,49 @@ pub(super) const RTL8821CU_IDS: &[(u16, u16)] = &[
 ];
 pub(super) fn is_rtl8821cu(vid: u16, pid: u16) -> bool {
     RTL8821CU_IDS.contains(&(vid, pid))
+}
+/// `rtw8822bu.c::rtw_8822bu_id_table` (all entries bind
+/// `rtw8822b_hw_spec`, vendor-specific interface 0xff/0xff/0xff), in table
+/// order.
+pub(super) const RTL8822BU_IDS: &[(u16, u16)] = &[
+    (0x0bda, 0xb812),
+    (0x0bda, 0xb82c),
+    (0x0bda, 0x2102),
+    (0x7392, 0xb822),
+    (0x7392, 0xc822),
+    (0x7392, 0xd822),
+    (0x7392, 0xe822),
+    (0x7392, 0xf822),
+    (0x0bda, 0xb81a),
+    (0x0b05, 0x1841),
+    (0x0b05, 0x184c),
+    (0x0b05, 0x19aa),
+    (0x0b05, 0x1870),
+    (0x0b05, 0x1874),
+    (0x2001, 0x331e),
+    (0x2001, 0x331c),
+    (0x2001, 0x331f),
+    (0x13b1, 0x0043),
+    (0x13b1, 0x0045),
+    (0x2357, 0x012d),
+    (0x2357, 0x0138),
+    (0x2357, 0x0115),
+    (0x2357, 0x012e),
+    (0x2357, 0x0116),
+    (0x2357, 0x0117),
+    (0x0846, 0x9055),
+    (0x0e66, 0x0025),
+    (0x04ca, 0x8602),
+    (0x20f4, 0x808a),
+    (0x20f4, 0x805a),
+    (0x056e, 0x4011),
+    (0x2c4e, 0x0107),
+    (0x2c4e, 0x010a),
+    (0x2001, 0x3322),
+    (0x0411, 0x03d1),
+];
+pub(super) fn is_rtl8822bu(vid: u16, pid: u16) -> bool {
+    RTL8822BU_IDS.contains(&(vid, pid))
 }
 
 /// Bus speed as `rtw_usb_init_burst_pkt_len` / `rtw_usb_dynamic_rx_agg`
@@ -226,11 +287,31 @@ pub(super) const PAGES_8821C: [Pages; 5] = [
     pages(16, 16, 16, 0, 1),
     pages(16, 16, 16, 14, 1),
 ];
+/// `rtw8822b.c::page_table_8822b`; index is the bulk-out endpoint count.
+/// `rtw8822b.c::rqpn_table_8822b` is row-for-row equal to
+/// [`RQPN_8821C`], so the queue mapping and `qsel_to_ep` are shared.
+pub(super) const PAGES_8822B: [Pages; 5] = [
+    pages(64, 64, 64, 64, 1),
+    pages(64, 64, 64, 64, 1),
+    pages(64, 64, 0, 0, 1),
+    pages(64, 64, 64, 0, 1),
+    pages(64, 64, 64, 64, 1),
+];
 /// USB rows only exist for two, three or four bulk-out pipes
 /// (`txdma_queue_mapping` / `priority_queue_cfg` return -EINVAL otherwise).
 pub(super) fn usb_tables(bulkout: usize) -> Result<(Rqpn, Pages), Error> {
+    usb_tables_for(0xc821, bulkout)
+}
+/// [`usb_tables`] for chip `did`: RTL8821C or RTL8822B (any other die has
+/// no USB rows here).
+pub(super) fn usb_tables_for(did: u16, bulkout: usize) -> Result<(Rqpn, Pages), Error> {
+    let pages = match did {
+        0xc821 => PAGES_8821C,
+        0xb822 => PAGES_8822B,
+        _ => return Err(Error::BulkOut),
+    };
     match bulkout {
-        2..=4 => Ok((RQPN_8821C[bulkout], PAGES_8821C[bulkout])),
+        2..=4 => Ok((RQPN_8821C[bulkout], pages[bulkout])),
         _ => Err(Error::BulkOut),
     }
 }
@@ -619,10 +700,70 @@ pub(super) const CARDEMU_TO_CARDDIS_8821C_USB: &[Command] = &[
     cmd(0x0090, 1, 0x02, 0x00),
     cmd(0xffff, 4, 0x00, 0x00),
 ];
+/// `rtw8822b.c` power sequences filtered to `RTW_PWR_INTF_USB_MSK`
+/// (`card_enable_flow_8822b` / `card_disable_flow_8822b`; every USB row is
+/// `RTW_PWR_ADDR_MAC` or `_USB`, so offsets are used as-is). Cut masks are
+/// kept (0x10a8..0x10aa are `RTW_PWR_CUT_C_MSK` only).
+pub(super) const CARDDIS_TO_CARDEMU_8822B_USB: &[Command] = &[
+    cmd(0x004a, 1, 0x01, 0x00),
+    cmd(0x0005, 1, 0x98, 0x00),
+    cmd(0xffff, 4, 0x00, 0x00),
+];
+pub(super) const CARDEMU_TO_ACT_8822B_USB: &[Command] = &[
+    cmd(0x0012, 1, 0x02, 0x00),
+    cmd(0x0012, 1, 0x01, 0x01),
+    cmd(0x0020, 1, 0x01, 0x01),
+    cmd(0x0001, 3, 0x01, 0x01),
+    cmd(0x0000, 1, 0x20, 0x00),
+    cmd(0x0005, 1, 0x1c, 0x00),
+    cmd(0x0006, 2, 0x02, 0x02),
+    cmd(0xff1a, 1, 0xff, 0x00),
+    cmd(0x0006, 1, 0x01, 0x01),
+    cmd(0x0005, 1, 0x80, 0x00),
+    cmd(0x0005, 1, 0x18, 0x00),
+    cmd(0x10c3, 1, 0x01, 0x01),
+    cmd(0x0005, 1, 0x01, 0x01),
+    cmd(0x0005, 2, 0x01, 0x00),
+    cmd(0x0020, 1, 0x08, 0x08),
+    cut_cmd(0x10a8, 0x08, 1, 0xff, 0x00),
+    cut_cmd(0x10a9, 0x08, 1, 0xff, 0xef),
+    cut_cmd(0x10aa, 0x08, 1, 0xff, 0x0c),
+    cmd(0x0029, 1, 0xff, 0xf9),
+    cmd(0x0024, 1, 0x04, 0x00),
+    cmd(0x00af, 1, 0x20, 0x20),
+    cmd(0xffff, 4, 0x00, 0x00),
+];
+pub(super) const ACT_TO_CARDEMU_8822B_USB: &[Command] = &[
+    cmd(0x0093, 1, 0x08, 0x00),
+    cmd(0x001f, 1, 0xff, 0x00),
+    cmd(0x00ef, 1, 0xff, 0x00),
+    cmd(0xff1a, 1, 0xff, 0x30),
+    cmd(0x0049, 1, 0x02, 0x00),
+    cmd(0x0006, 1, 0x01, 0x01),
+    cmd(0x0002, 1, 0x02, 0x00),
+    cmd(0x10c3, 1, 0x01, 0x00),
+    cmd(0x0005, 1, 0x02, 0x02),
+    cmd(0x0005, 2, 0x02, 0x00),
+    cmd(0x0020, 1, 0x08, 0x00),
+    cmd(0x0000, 1, 0x20, 0x20),
+    cmd(0xffff, 4, 0x00, 0x00),
+];
+pub(super) const CARDEMU_TO_CARDDIS_8822B_USB: &[Command] = &[
+    cmd(0x0007, 1, 0xff, 0x20),
+    cmd(0x0067, 1, 0x20, 0x00),
+    cmd(0x004a, 1, 0x01, 0x00),
+    cmd(0x0081, 1, 0xc0, 0x00),
+    cmd(0x0005, 1, 0x18, 0x08),
+    cmd(0x0090, 1, 0x02, 0x00),
+    cmd(0xffff, 4, 0x00, 0x00),
+];
 const fn cmd(offset: u16, op: u8, mask: u8, value: u8) -> Command {
+    cut_cmd(offset, 0xff, op, mask, value)
+}
+const fn cut_cmd(offset: u16, cut: u8, op: u8, mask: u8, value: u8) -> Command {
     Command {
         offset,
-        cut: 0xff,
+        cut,
         op,
         mask,
         value,
@@ -636,10 +777,23 @@ const fn cmd(offset: u16, op: u8, mask: u8, value: u8) -> Command {
 /// first byte to 0x4e0.
 pub(super) struct Registers<C: ControlIo> {
     io: C,
+    /// The die (0xc821 RTL8821C, 0xb822 RTL8822B): power rows and
+    /// `sys_func_en`.
+    did: u16,
 }
 impl<C: ControlIo> Registers<C> {
     pub(super) fn new(io: C) -> Self {
-        Self { io }
+        Self { io, did: 0xc821 }
+    }
+    /// Registers of chip `did` (0xc821 or 0xb822).
+    pub(super) fn for_chip(io: C, did: u16) -> Result<Self, Error> {
+        if !matches!(did, 0xc821 | 0xb822) {
+            return Err(Error::Command);
+        }
+        Ok(Self { io, did })
+    }
+    pub(super) fn did(&self) -> u16 {
+        self.did
     }
     pub(super) fn control(&self) -> &C {
         &self.io
@@ -773,7 +927,8 @@ impl<C: ControlIo> Registers<C> {
         self.update32(REG_WLRF1, 7 << 24, 0).await
     }
 
-    /// `mac.c::rtw_mac_power_switch` on USB for RTL8821C.
+    /// `mac.c::rtw_mac_power_switch` on USB for RTL8821C / RTL8822B (both
+    /// 3081-WCPU chips; only the power rows differ).
     pub(super) async fn power_switch(&self, on: bool) -> Result<(), Error> {
         let config = self.read32(REG_SYS_CFG1).await?;
         if config == u32::MAX {
@@ -794,10 +949,11 @@ impl<C: ControlIo> Registers<C> {
             return Err(Error::Already);
         }
         let mask = 1u8 << (cut + 1);
-        let (first, second) = if on {
-            (CARDDIS_TO_CARDEMU_8821C_USB, CARDEMU_TO_ACT_8821C_USB)
-        } else {
-            (ACT_TO_CARDEMU_8821C_USB, CARDEMU_TO_CARDDIS_8821C_USB)
+        let (first, second) = match (self.did, on) {
+            (0xb822, true) => (CARDDIS_TO_CARDEMU_8822B_USB, CARDEMU_TO_ACT_8822B_USB),
+            (0xb822, false) => (ACT_TO_CARDEMU_8822B_USB, CARDEMU_TO_CARDDIS_8822B_USB),
+            (_, true) => (CARDDIS_TO_CARDEMU_8821C_USB, CARDEMU_TO_ACT_8821C_USB),
+            (_, false) => (ACT_TO_CARDEMU_8821C_USB, CARDEMU_TO_CARDDIS_8821C_USB),
         };
         self.commands(mask, first).await?;
         self.commands(mask, second).await?;
@@ -821,8 +977,12 @@ impl<C: ControlIo> Registers<C> {
             result => result?,
         }
         self.update32(REG_CPU_DMEM_CON, 0, 1 << 16 | 1 << 8).await?;
-        self.update8(REG_SYS_FUNC_EN + 1, 0, SYS_FUNC_EN_8821C)
-            .await?;
+        let sys_func_en = if self.did == 0xb822 {
+            SYS_FUNC_EN_8822B
+        } else {
+            SYS_FUNC_EN_8821C
+        };
+        self.update8(REG_SYS_FUNC_EN + 1, 0, sys_func_en).await?;
         self.update8(REG_CR_EXT + 3, 0x0f, 0x0c).await?;
         let mcu = self.read32(REG_MCUFW_CTRL).await?;
         if mcu & (1 << 20) != 0 {
@@ -830,6 +990,60 @@ impl<C: ControlIo> Registers<C> {
             self.update32(REG_GPIO_MUXCFG, 1 << 19, 0).await?;
         }
         Ok(())
+    }
+
+    /// `usb.c::rtw_usb_phy_cfg` for `USB_SPEED_HIGH` then `USB_SPEED_SUPER`
+    /// at chip cut `cut` (`hal.cut_version`). `usb2_param_8821c`,
+    /// `usb3_param_8821c` and `usb2_param_8822b` hold only the terminator;
+    /// `usb3_param_8822b` has one `RTW_IP_SEL_PHY` row, offset 0x01 =
+    /// 0xa841 for `RTW_INTF_PHY_CUT_D` (cut 3), written through
+    /// `rtw_usb_phy_write(USB_SPEED_SUPER)` (no page switch on SuperSpeed).
+    pub(super) async fn phy_cfg(&self, cut: u8) -> Result<(), Error> {
+        if self.did != 0xb822 || cut != 3 {
+            return Ok(());
+        }
+        let (offset, value): (u8, u16) = (0x01, 0xa841);
+        self.write8(REG_USB3_PHY_DAT_L, value as u8).await?;
+        self.write8(REG_USB3_PHY_DAT_H, (value >> 8) as u8).await?;
+        self.write8(REG_USB3_PHY_ADR, offset | BIT_USB3_PHY_ADR_WR)
+            .await
+    }
+
+    /// `usb.c::rtw_usb_switch_mode` -> `rtw_usb_switch_mode_new` (8822B is
+    /// `rtw_usb3_chip_new`; 8821C does not switch). `usb_mode_switch` is the
+    /// factory map's `usb_mode` bit 7; the `switch_usb_mode` module
+    /// parameter defaults to true. `Ok(true)` means the chip was told to
+    /// re-enumerate as USB 3 and the caller must not register the device
+    /// (Linux skips `rtw_register_hw`).
+    pub(super) async fn switch_mode(&self, usb_mode_switch: bool) -> Result<bool, Error> {
+        if self.did != 0xb822 || !usb_mode_switch {
+            return Ok(false);
+        }
+        if self.read8(REG_SYS_CFG2 + 3).await? == 0x20 {
+            return Ok(false); // already USB_SPEED_SUPER
+        }
+        let mut pad = self.read32(REG_PAD_CTRL2).await?;
+        if pad == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if pad & (MASK_USB23_SW_MODE_V1 | BIT_USB3_USB2_TRANSITION) == 0 {
+            return Ok(false); // "Switching to USB 3 mode unsupported by the chip"
+        }
+        // Already tried: a USB 2 port.
+        if (pad & MASK_USB23_SW_MODE_V1) >> 18 == USB_MODE_U3 {
+            return Ok(false);
+        }
+        // Enable IO wrapper timeout (8822B/8821C).
+        self.update8(REG_SW_MDIO + 3, 1, 0).await?;
+        pad = pad & !MASK_USB23_SW_MODE_V1 | USB_MODE_U3 << 18 | BIT_RSM_EN_V1;
+        self.write32(REG_PAD_CTRL2, pad).await?;
+        self.write8(REG_PAD_CTRL2 + 1, 4).await?;
+        let pw = self.read16(REG_SYS_PW_CTRL).await?;
+        self.write16(REG_SYS_PW_CTRL, pw | BIT_APFM_OFFMAC).await?;
+        self.io.delay_us(1000).await;
+        self.update32(REG_PAD_CTRL2, 0, BIT_NO_PDN_CHIPOFF_V1)
+            .await?;
+        Ok(true)
     }
 
     /// `main.c::rtw_power_off` on USB: `rtw_hci_stop` (`usb.c::rtw_usb_stop`

@@ -874,7 +874,8 @@ pub(super) struct Owner<I: Io> {
     envelope8822b: Option<alloc::sync::Arc<super::calibration8822b::Envelope>>,
     operating8822b: Option<super::operating8822b::Info>,
     operating_envelope8822b: Option<alloc::sync::Arc<super::operating8822b::Envelope>>,
-    /// C21 host interface; keys the PHY rows and every signed C21 record.
+    /// C21/B22 host interface; keys the PHY rows and every signed C21/B22
+    /// record (`Interface::host_of`).
     interface: super::phy8821c::Interface,
     calibration8821c: Option<super::radio8821c::Info>,
     envelope8821c: Option<alloc::sync::Arc<super::calibration8821c::Envelope>>,
@@ -937,7 +938,8 @@ impl<I: Io> Owner<I> {
             coex_facts: None,
         }
     }
-    /// The same owner behind another C21 host interface (before any stage).
+    /// The same owner behind another C21/B22 host interface (before any
+    /// stage).
     pub(super) fn on(self, interface: super::phy8821c::Interface) -> Self {
         Self { interface, ..self }
     }
@@ -1766,6 +1768,16 @@ impl<I: Io> Owner<I> {
         if self.phase != Phase::MacPrepared {
             return Err(Error::State);
         }
+        // The factory map layout (MAC at 0xd0 or USB 0x107) must belong to
+        // the same host interface that keys the B22 records. The
+        // `rtw8822b_table.c` rows are interface-independent: no branch
+        // header in the MAC/BB/AGC/RF-A/RF-B tables carries an `intf`
+        // condition that differs between INTF_PCIE and INTF_USB, so
+        // `phy/gen_rtl8822b_tables.py` with `intf = INTF_USB` emits the same
+        // 17 frozen tables (`phy8822b::rows`).
+        if factory.usb() != matches!(self.interface, super::phy8821c::Interface::Usb { .. }) {
+            return Err(Error::Unsupported);
+        }
         self.phase = Phase::Failed;
         let info = super::phy8822b::Info::from_factory(
             factory,
@@ -1792,6 +1804,7 @@ impl<I: Io> Owner<I> {
             self.mac.ok_or(Error::State)?,
             self.hardware.ok_or(Error::State)?,
             self.image_digest.ok_or(Error::State)?,
+            self.interface.host_of(0xb822),
         )
         .map_err(Error::Calibration8822b)
     }

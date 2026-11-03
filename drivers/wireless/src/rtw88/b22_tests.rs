@@ -381,7 +381,14 @@ fn smoke_rtw8822be_n2bq_envelope_binds_board_and_refuses_unprovisioned() -> Test
     let board = |rfe, thermal, mac: mac::Info| {
         let factory = b22_board_factory(rfe, thermal);
         let phy = Info::from_factory(&factory, 1, b22_features(2)).unwrap();
-        Board::new(&factory, phy, mac, b22_features(2), [9; 32])
+        Board::new(
+            &factory,
+            phy,
+            mac,
+            b22_features(2),
+            [9; 32],
+            crate::rtw88::phy8821c::Host::PCI_B22,
+        )
     };
     // An erased thermal meter or a non-B22 FIFO geometry never qualifies.
     if board(3, 0xff, mac) != Err(E::Factory)
@@ -557,8 +564,15 @@ fn smoke_rtw8822be_n2bp_n2bs_records_bind_board_and_factory_limits() -> TestResu
         firmware_tx_page: 2044,
     };
     let phy = phy8822b::Info::from_factory(&factory, 1, b22_features(2)).unwrap();
-    let board =
-        calibration8822b::Board::new(&factory, phy, info, b22_features(2), [9; 32]).unwrap();
+    let board = calibration8822b::Board::new(
+        &factory,
+        phy,
+        info,
+        b22_features(2),
+        [9; 32],
+        crate::rtw88::phy8821c::Host::PCI_B22,
+    )
+    .unwrap();
     let calibration = match (calibration8822b::Source::Verified {
         bytes: b22_record(&board.request()),
         signer: Some([7; 32]),
@@ -629,6 +643,7 @@ fn smoke_rtw8822be_n2bp_n2bs_records_bind_board_and_factory_limits() -> TestResu
         thermal: 25,
         response_rates: 0x15f,
         identity: req.identity,
+        host: req.host,
     };
     let sreq = station_request(power, factory.mac());
     if sreq.filename != "rtw88/rtw8822be-station-v1-00e04c22b802.bin" {
@@ -743,7 +758,15 @@ fn b22_station_fixture_for(features: super::super::hardware::Features) -> Option
         firmware_tx_page: 2044,
     };
     let phy = phy8822b::Info::from_factory(&factory, 1, features).ok()?;
-    let board = calibration8822b::Board::new(&factory, phy, info, features, [9; 32]).ok()?;
+    let board = calibration8822b::Board::new(
+        &factory,
+        phy,
+        info,
+        features,
+        [9; 32],
+        crate::rtw88::phy8821c::Host::PCI_B22,
+    )
+    .ok()?;
     let calibration = alloc::sync::Arc::new(
         calibration8822b::Source::Verified {
             bytes: b22_record(&board.request()),
@@ -775,6 +798,7 @@ fn b22_station_fixture_for(features: super::super::hardware::Features) -> Option
         thermal: 25,
         response_rates: 0x15f,
         identity: req.identity,
+        host: req.host,
     };
     let sreq = station_request(power, factory.mac());
     let mut station = alloc::vec![0u8; 128];

@@ -1390,9 +1390,10 @@ packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
 EU descriptor/register helpers cannot establish those VHT runtimes. The
-rtw88 USB host interface now exists as an unadmitted transport (rtw88.md
-"RTL8821CU USB transport"). RTL8821CU still needs the retained C21 stages
-to run over it. RTL8822BU still needs the 8822B chip runtime. No
+rtw88 USB host interface carries both: RTL8821CU (rtw88.md "RTL8821CU USB
+transport") and RTL8822BU (rtw88.md "RTL8822BU: the B22 die over the USB
+transport", `rtw_8822bu_id_table`, 0bda:b82c no longer in
+`RTL8XXXU_USB_IDS`) run their retained rtw88 stages there. No
 unsupported initial profile is marked hardware-inapplicable here.
 
 Source-proven inapplicability (rows removed from the remaining inventory):

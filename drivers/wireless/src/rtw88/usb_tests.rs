@@ -491,3 +491,156 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_power_off_sequence
 );
+
+/// `rtw_8822bu_id_table` registration (vendor interface triple, disjoint
+/// from `rtw_8821cu_id_table`, 0bda:b82c no longer in the rtl8xxxu bind
+/// table), the B22 host identity (`rtw8822bu` family, VID/PID header) and
+/// `page_table_8822b` USB rows.
+fn smoke_rtw88_usb_8822bu_id_table_host_and_fifo() -> TestResult {
+    let table = &super::usb_driver::RTW8822BU_USB_IDS;
+    if table.len() != usb::RTL8822BU_IDS.len()
+        || table.iter().zip(usb::RTL8822BU_IDS).any(|(m, &(v, p))| {
+            m.vendor_id != v
+                || m.product_id != p
+                || m.class != Some(0xff)
+                || m.subclass != Some(0xff)
+                || m.protocol != Some(0xff)
+        })
+    {
+        return TestResult::Fail("rtw8822bu id table differs from rtw_8822bu_id_table");
+    }
+    if usb::RTL8822BU_IDS
+        .iter()
+        .any(|&(v, p)| usb::is_rtl8821cu(v, p))
+        || super::usb_driver::chip(0x0bda, 0xb82c) != Some(0xb822)
+        || super::usb_driver::chip(0x0bda, 0xc811) != Some(0xc821)
+        || super::usb_driver::chip(0x0bda, 0xb822).is_some()
+    {
+        return TestResult::Fail("8821CU/8822BU tables overlap or chip map wrong");
+    }
+    if crate::rtl8xxxu::RTL8XXXU_USB_IDS
+        .iter()
+        .any(|m| usb::is_rtl8822bu(m.vendor_id, m.product_id))
+    {
+        return TestResult::Fail("rtl8xxxu still claims an rtw8822bu id");
+    }
+    let host = super::phy8821c::Interface::Usb {
+        vendor: 0x2357,
+        product: 0x012d,
+    }
+    .host_of(0xb822);
+    let c21 = super::phy8821c::Interface::Usb {
+        vendor: 0x0bda,
+        product: 0xc811,
+    };
+    if host.family() != "rtw8822bu"
+        || host.header() != [0x57, 0x23, 0x2d, 0x01]
+        || super::phy8821c::Interface::Pcie.host_of(0xb822) != super::phy8821c::Host::PCI_B22
+        || super::phy8821c::Host::PCI_B22.family() != "rtw8822be"
+        || c21.host().family() != "rtw8821cu"
+    {
+        return TestResult::Fail("B22 host identity");
+    }
+    let rows: Vec<_> = (2..=4)
+        .map(|n| usb::usb_tables_for(0xb822, n).map(|(_, p)| (p.hq, p.nq, p.lq, p.exq)))
+        .collect();
+    if rows
+        != [
+            Ok((64, 64, 0, 0)),
+            Ok((64, 64, 64, 0)),
+            Ok((64, 64, 64, 64)),
+        ]
+        || usb::usb_tables_for(0xc822, 3).is_ok()
+        || usb::usb_tables_for(0xb822, 1).is_ok()
+    {
+        return TestResult::Fail("page_table_8822b USB rows");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_8822bu_id_table_host_and_fifo
+);
+
+/// `rtw8822b.c` USB power rows: `sys_func_en` 0xdc, the USB-only 0xff1a
+/// row, the cut-C-only 0x10a8..0x10aa rows skipped on cut B, and the
+/// 0x29/0xaf tail; then `rtw_usb_phy_cfg` (one cut-D `usb3_param_8822b`
+/// row) and `rtw_usb_switch_mode_new`.
+fn smoke_rtw88_usb_8822bu_power_phy_cfg_and_switch() -> TestResult {
+    let regs = match Registers::for_chip(
+        Fake::with(&[(0xf1, 0x10), (0x100, 0xea), (0x06, 0x02), (0x4a, 1)]),
+        0xb822,
+    ) {
+        Ok(regs) => regs,
+        Err(_) => return TestResult::Fail("B22 registers refused"),
+    };
+    if complete(regs.power_on()).is_err() {
+        return TestResult::Fail("RTL8822BU power-on refused");
+    }
+    let fake = regs.control();
+    if fake.reg(0x03) & 0xdc != 0xdc
+        || !fake.wrote(0xff1a)
+        || fake.wrote(0x10a8)
+        || fake.reg(0x29) != 0xf9
+        || fake.reg(0xaf) & 0x20 == 0
+        || fake.reg(0x4a) & 1 != 0
+    {
+        return TestResult::Fail("RTL8822BU card-enable receipts");
+    }
+    if Registers::for_chip(Fake::default(), 0xc822).is_ok() {
+        return TestResult::Fail("USB registers accepted for C22");
+    }
+    let Ok(regs) = Registers::for_chip(Fake::default(), 0xb822) else {
+        return TestResult::Fail("B22 registers refused");
+    };
+    if complete(regs.phy_cfg(1)).is_err() || !regs.control().ops.lock().is_empty() {
+        return TestResult::Fail("usb3_param_8822b row outside cut D");
+    }
+    if complete(regs.phy_cfg(3)).is_err()
+        || regs.control().reg(0xff0d) != 0x41
+        || regs.control().reg(0xff0e) != 0xa8
+        || regs.control().reg(0xff0c) != 0x81
+    {
+        return TestResult::Fail("usb3_param_8822b cut-D row");
+    }
+    let c21 = Registers::new(Fake::default());
+    if complete(c21.phy_cfg(3)).is_err() || complete(c21.switch_mode(true)) != Ok(false) {
+        return TestResult::Fail("RTL8821CU phy cfg/switch");
+    }
+    // SuperSpeed already (SYS_CFG2+3 = 0x20), efuse switch off, or no
+    // switch capability: no switch.
+    for (regs, efuse) in [
+        (&[(0xff, 0x20), (0xc6, 0x10)][..], true),
+        (&[(0xc6, 0x10)][..], false),
+        (&[][..], true),
+        (&[(0xc6, 0x18)][..], true), // already U3 mode: a USB 2 port
+    ] {
+        let Ok(r) = Registers::for_chip(Fake::with(regs), 0xb822) else {
+            return TestResult::Fail("B22 registers refused");
+        };
+        if complete(r.switch_mode(efuse)) != Ok(false) {
+            return TestResult::Fail("USB 3 switch without capability");
+        }
+    }
+    let Ok(r) = Registers::for_chip(Fake::with(&[(0xc6, 0x10), (0x10c3, 1)]), 0xb822) else {
+        return TestResult::Fail("B22 registers refused");
+    };
+    if complete(r.switch_mode(true)) != Ok(true)
+        || r.control().reg(0xc6) != 0x1b
+        || r.control().reg(0xc5) != 0x04
+        || r.control().reg(0x10c3) & 1 != 0
+        || !r
+            .control()
+            .ops
+            .lock()
+            .iter()
+            .any(|(w, a, d)| *w && *a == 0x04 && d.len() == 2 && d[1] & 2 != 0)
+    {
+        return TestResult::Fail("rtw_usb_switch_mode_new sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_8822bu_power_phy_cfg_and_switch
+);

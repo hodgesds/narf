@@ -9,7 +9,7 @@
 //! (`phy.c::rtw_phy_get_2g_tx_power_index`, `txgi_factor` 1,
 //! `max_power_index` 0x3f; 8822B has no BTG path substitution). `N2BS` is the
 //! awake-station grant (counterpart of C21 `N21S`). Both are keyed by the B22
-//! PCI identity `10ec:b822`, bound to the exact retained `N2BQ` board and
+//! host header (PCI `10ec:b822` or the claimed RTL8822BU VID/PID), bound to the exact retained `N2BQ` board and
 //! carry only provisioner-measured facts; no value here is inferred from
 //! factory dBm or substituted from C21/C22 assets. Neither record alone
 //! grants packet, peer or station authority.
@@ -18,6 +18,7 @@ use super::{
     calibration8822b,
     efuse8822b::Factory8822b,
     firmware_transport::{Error, Io},
+    phy8821c::Host,
     radio8822b,
 };
 #[cfg(any(test, feature = "kernel-test"))]
@@ -39,22 +40,31 @@ pub(super) const RRSR_INIT_2G: u32 = 0x15f;
 /// The twelve legacy DESC_RATE indices (CCK1..11, OFDM6..54) per path.
 pub(super) const LEGACY: usize = 12;
 
-fn filename(kind: &str, m: [u8; 6]) -> String {
+/// `rtw88/<family>-<kind>-v1-<mac>.bin`: `rtw8822be` on PCI, `rtw8822bu`
+/// for a claimed RTL8822BU (`phy8821c::Host::family`).
+fn filename(host: Host, kind: &str, m: [u8; 6]) -> String {
     format!(
-        "rtw88/rtw8822be-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-        kind, m[0], m[1], m[2], m[3], m[4], m[5]
+        "rtw88/{}-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+        host.family(),
+        kind,
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
     )
 }
 fn signed(raw: &[u8], at: usize) -> i16 {
     i16::from_le_bytes([raw[at], raw[at + 1]])
 }
-fn header(raw: &[u8], magic: &[u8; 4], length: usize) -> bool {
+fn header(raw: &[u8], magic: &[u8; 4], length: usize, host: Host) -> bool {
     raw.len() == length
         && &raw[..4] == magic
         && raw[4..6] == [1, 0]
         && raw[6..8] == (length as u16).to_le_bytes()
         && raw[8..12] == (length as u32).to_le_bytes()
-        && raw[12..16] == calibration8822b::HEADER
+        && raw[12..16] == host.header()
         && raw[54..56] == [1, 20]
 }
 /// Current US policy plainly covering 2402..2422 MHz at 20 MHz; returns the
@@ -168,6 +178,7 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    pub host: Host,
 }
 /// One completed parked operating-power program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +188,8 @@ pub struct Info {
     pub thermal: u8,
     pub response_rates: u32,
     pub identity: [u8; 32],
+    /// The `N2BQ` board's host (keys `N2BS` and every later record).
+    pub host: Host,
 }
 pub(super) fn request(
     calibration: calibration8822b::Request,
@@ -195,7 +208,8 @@ pub(super) fn request(
     Request {
         identity: hash.finalize(),
         mac: calibration.mac,
-        filename: filename("power", calibration.mac),
+        filename: filename(calibration.host, "power", calibration.mac),
+        host: calibration.host,
     }
 }
 
@@ -311,7 +325,7 @@ impl Envelope {
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| denied(QError::Authority))?;
         signer.ok_or_else(|| denied(QError::Unsigned))?;
-        if !header(raw, b"N2BP", POWER_LENGTH)
+        if !header(raw, b"N2BP", POWER_LENGTH, request.host)
             || &raw[66..68] != b"US"
             || raw[116..].iter().any(|&b| b != 0)
         {
@@ -544,6 +558,7 @@ impl Envelope {
                 thermal,
                 response_rates: RRSR_INIT_2G,
                 identity: self.request.identity,
+                host: self.request.host,
             })
         })
         .await
@@ -556,6 +571,7 @@ pub struct StationRequest {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    pub host: Host,
 }
 pub(super) fn station_request(power: Info, mac: [u8; 6]) -> StationRequest {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -575,7 +591,8 @@ pub(super) fn station_request(power: Info, mac: [u8; 6]) -> StationRequest {
     StationRequest {
         identity: hash.finalize(),
         mac,
-        filename: filename("station", mac),
+        filename: filename(power.host, "station", mac),
+        host: power.host,
     }
 }
 pub(super) enum StationSource {
@@ -649,7 +666,7 @@ impl Grant {
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| denied(QError::Authority))?;
         signer.ok_or_else(|| denied(QError::Unsigned))?;
-        if !header(raw, b"N2BS", STATION_LENGTH)
+        if !header(raw, b"N2BS", STATION_LENGTH, request.host)
             || &raw[68..70] != b"US"
             || raw[70..].iter().any(|&b| b != 0)
         {
@@ -694,6 +711,10 @@ impl Grant {
     pub(super) fn identity(&self) -> [u8; 32] {
         self.request.identity
     }
+    /// Host keying every B22 continuation record of this board.
+    pub(super) fn host(&self) -> Host {
+        self.request.host
+    }
     /// The exact `N2BS` request: the base every B22 continuation record
     /// (`N2BO` channel records first) binds.
     pub(super) fn request(&self) -> &StationRequest {
@@ -711,6 +732,7 @@ impl Grant {
             self.digest,
             self.power.indices(),
             self.own(),
+            self.request.host,
         )
     }
     /// HT20 facts of channel 1 (group 0): the firmware hardware report the

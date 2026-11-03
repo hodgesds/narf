@@ -39,8 +39,8 @@ pub(super) struct Lifecycle<I: Io> {
     pub(super) retained: Mutex<Option<Owner<I>>>,
     status: IrqSafeSpinLock<Status>,
     did: u16,
-    /// C21 host interface handed to the owner (`phy8821c::Interface`):
-    /// PCIe by default, the claimed VID/PID for RTL8821CU.
+    /// C21/B22 host interface handed to the owner (`phy8821c::Interface`):
+    /// PCIe by default, the claimed VID/PID for RTL8821CU/RTL8822BU.
     interface: super::phy8821c::Interface,
 }
 impl<I: Io> core::fmt::Debug for Lifecycle<I> {
@@ -95,9 +95,9 @@ impl<I: Io> Lifecycle<I> {
             interface: super::phy8821c::Interface::Pcie,
         }
     }
-    /// The same lifecycle behind another C21 host interface. Only before
-    /// any owner exists; every signed C21 record is then keyed by
-    /// `interface.host()`.
+    /// The same lifecycle behind another C21/B22 host interface. Only before
+    /// any owner exists; every signed C21/B22 record is then keyed by
+    /// `interface.host_of(did)`.
     pub(super) fn on(self, interface: super::phy8821c::Interface) -> Self {
         Self { interface, ..self }
     }

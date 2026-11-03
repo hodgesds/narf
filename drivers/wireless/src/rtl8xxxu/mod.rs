@@ -108,8 +108,9 @@ pub use crate::iwlwifi::mlme::{
 /// Linux analogue: `struct usb_device_id rtl8xxxu_dev_table[]` in
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7942).
 /// RTL8821CU (0bda:c811 and the rest of `rtw8821cu.c::rtw_8821cu_id_table`)
-/// is bound by rtw88 (`rtw88::usb_driver`), as in Linux; it is not listed
-/// here.
+/// and RTL8822BU (0bda:b82c and the rest of
+/// `rtw8822bu.c::rtw_8822bu_id_table`) are bound by rtw88
+/// (`rtw88::usb_driver`), as in Linux; they are not listed here.
 pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] = {
     use narf_drivers_usb::class_registry::UsbClassMatch;
     use regs::*;
@@ -120,7 +121,6 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID_ALT),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8723BU_ID),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8822BU_ID),
         // RTL8710BU / RTL8188GU
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, 0xB711),
         // RTL8188EU rosewill ffef

@@ -101,6 +101,9 @@ impl Backlog {
 
 pub(super) struct Backend<C: ControlIo, P: Bulk + Clone> {
     registers: Registers<C>,
+    /// The die behind the USB function: 0xc821 (RTL8821CU) or 0xb822
+    /// (RTL8822BU). Selects the FIFO page rows and the B22 hooks.
+    did: u16,
     bulk: P,
     endpoints: Endpoints,
     speed: Speed,
@@ -140,7 +143,8 @@ pub(super) struct Backend<C: ControlIo, P: Bulk + Clone> {
 }
 impl<C: ControlIo, P: Bulk + Clone> core::fmt::Debug for Backend<C, P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Rtw8821cuFirmware")
+        f.debug_struct("Rtw88UsbFirmware")
+            .field("did", &self.did)
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -154,10 +158,27 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
         endpoints: Endpoints,
         speed: Speed,
     ) -> Result<Self, Error> {
-        usb::usb_tables(usize::from(endpoints.out_count)).map_err(usb_error)?;
-        let boundary = super::reserved_page::station_boundary(0xc821).ok_or(Error::State)?;
+        Self::new_for(0xc821, control, bulk, endpoints, speed)
+    }
+    /// [`Self::new`] for chip `did` (0xc821 RTL8821CU, 0xb822 RTL8822BU):
+    /// the chip's `page_table_*` USB row must exist for the pipe count, and
+    /// each firmware page restores that chip's `fifo.rsvd_boundary`
+    /// (`mac::Info`: C21 460, B22 1996).
+    pub(super) fn new_for(
+        did: u16,
+        control: C,
+        bulk: P,
+        endpoints: Endpoints,
+        speed: Speed,
+    ) -> Result<Self, Error> {
+        usb::usb_tables_for(did, usize::from(endpoints.out_count)).map_err(usb_error)?;
+        let boundary = match did {
+            0xb822 => 1996,
+            _ => super::reserved_page::station_boundary(0xc821).ok_or(Error::State)?,
+        };
         Ok(Self {
-            registers: Registers::new(control),
+            registers: Registers::for_chip(control, did).map_err(usb_error)?,
+            did,
             bulk,
             endpoints,
             speed,
@@ -369,8 +390,8 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
         {
             return Ok(false);
         }
-        let (rqpn, pages) =
-            usb::usb_tables(usize::from(self.endpoints.out_count)).map_err(usb_error)?;
+        let (rqpn, pages) = usb::usb_tables_for(self.did, usize::from(self.endpoints.out_count))
+            .map_err(usb_error)?;
         let r = &self.registers;
         let map = r.read16(0x10c).await.map_err(usb_error)?;
         if map == u16::MAX {
@@ -410,7 +431,9 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
     /// `rtw8821c_do_iqk` at the running sequence, on the H2C pipe with MAC
     /// TX/RX already open (no CR rewrite).
     fn retune_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
-        let expected = if self.tracking {
+        // B22 sends the same pre-association `iqk8821c` H2C from its
+        // associated `N2BW` maintenance (`pci_firmware.rs::submit_h2c`).
+        let expected = if self.tracking && self.did == 0xc821 {
             super::command::iqk8821c_associated(self.h2c_sequence)
         } else {
             super::command::iqk8821c(self.h2c_sequence)
@@ -444,6 +467,28 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             return Err(Error::State);
         }
         self.transmit_quiet().await
+    }
+    /// `pci_firmware.rs::b22_iqk_quiet` over EP0: TXPAUSE held,
+    /// [`Self::transmit_quiet`] (no queued/in-flight/awaiting frame, no H2C
+    /// receipt, the `rqpn_table_8822b` map and every `page_table_8822b`
+    /// page free), and the requested RXDMA park reporting idle.
+    async fn b22_iqk_quiet(&mut self) -> Result<bool, Error> {
+        use super::dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM};
+        let r = &self.registers;
+        if r.read8(0x522).await.map_err(usb_error)? != 0xff {
+            return Ok(false);
+        }
+        if self.outstanding.is_some() || !self.transmit_quiet().await? {
+            return Ok(false);
+        }
+        let rx = self.registers.read32(RXPKT_NUM).await.map_err(usb_error)?;
+        if rx == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if rx & RW_RELEASE == 0 {
+            return Err(Error::Prerequisite);
+        }
+        Ok(rx & RXDMA_IDLE != 0)
     }
     /// `pci_firmware.rs::station_ps_rx_quiet` over EP0: an open, idle
     /// station (no retune, power-tracking continuation, H2C or mailbox
@@ -740,7 +785,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         self.step(State::Operating8821cPrepared, State::Configuring)
     }
     fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != State::Configuring || gate.did() != 0xc821 {
+        if self.state != State::Configuring || gate.did() != self.did {
             return Err(Error::State);
         }
         let result = gate.current().map_err(Error::Power);
@@ -1312,6 +1357,108 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             self.fail(result)
         }
     }
+    /// RTL8822BU associated `rtw8822b_do_iqk` maintenance (`N2BW`), the
+    /// `pci_firmware.rs::station_b22_iqk` sequence over EP0: Begin holds
+    /// every queue (TXPAUSE 0xff) and requests the RXDMA park
+    /// (`BIT_RW_RELEASE`); Quiet is [`Self::b22_iqk_quiet`] with the B22
+    /// `page_table_8822b` FIFO geometry; Submit sends the `rtw8822b_do_iqk`
+    /// H2C on the H2C pipe; Finish, after the H2C receipt completed and the
+    /// hardware is still quiet, releases RXDMA and TXPAUSE with readback.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_b22_iqk(
+        &mut self,
+        step: super::tracking8822b::Step,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        use super::dma_stop::{RW_RELEASE, RXPKT_NUM};
+        use super::tracking8822b::Step;
+        async move {
+            if self.did != 0xb822 || self.state != State::Packets {
+                return Err(Error::State);
+            }
+            match step {
+                Step::Begin => {
+                    if self.tracking
+                        || self.retune.is_some()
+                        || self.widening
+                        || self.mailbox_pending
+                        || self.outstanding.is_some()
+                    {
+                        return Err(Error::State);
+                    }
+                    let gate = self.gate_ref()?;
+                    if gate.did() != 0xb822 {
+                        return Err(Error::State);
+                    }
+                    gate.current().map_err(Error::Power)?;
+                    let r = &self.registers;
+                    let result = async {
+                        if r.read8(0x522).await? != 0
+                            || r.read32(RXPKT_NUM).await? & RW_RELEASE != 0
+                        {
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    }
+                    .await
+                    .map_err(usb_error);
+                    if !self.fail(result)? {
+                        return Err(Error::Prerequisite);
+                    }
+                    self.tracking = true;
+                    let r = &self.registers;
+                    let result = async {
+                        r.write8(0x522, 0xff).await?;
+                        let rx = r.read32(RXPKT_NUM).await?;
+                        r.write32(RXPKT_NUM, rx | RW_RELEASE).await
+                    }
+                    .await
+                    .map_err(usb_error);
+                    self.fail(result)?;
+                    let result = self.b22_iqk_quiet().await;
+                    self.fail(result)
+                }
+                Step::Quiet => {
+                    if !self.tracking {
+                        return Err(Error::State);
+                    }
+                    let result = self.b22_iqk_quiet().await;
+                    self.fail(result)
+                }
+                Step::Submit => {
+                    if !self.tracking || !self.b22_iqk_quiet().await? {
+                        return Err(Error::State);
+                    }
+                    let packet = super::command::iqk8821c(self.h2c_sequence);
+                    self.retune_h2c(&packet)?;
+                    Ok(true)
+                }
+                Step::Finish => {
+                    if !self.tracking || self.outstanding.is_some() || !self.b22_iqk_quiet().await?
+                    {
+                        return Err(Error::Prerequisite);
+                    }
+                    self.gate_current()?;
+                    let r = &self.registers;
+                    let result = async {
+                        let rx = r.read32(RXPKT_NUM).await?;
+                        r.write32(RXPKT_NUM, rx & !RW_RELEASE).await?;
+                        r.write8(0x522, 0).await?;
+                        Ok((
+                            r.read32(RXPKT_NUM).await? & RW_RELEASE == 0,
+                            r.read8(0x522).await? == 0,
+                        ))
+                    }
+                    .await
+                    .map_err(usb_error);
+                    if self.fail(result)? != (true, true) {
+                        return self.fail(Err(Error::Prerequisite));
+                    }
+                    self.tracking = false;
+                    Ok(true)
+                }
+            }
+        }
+    }
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_retune_iqk(
         &mut self,
@@ -1644,7 +1791,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         }
     }
     /// `usb.c::rtw_usb_dynamic_rx_agg` -> `rtw_usb_dynamic_rx_agg_v1`
-    /// (`RTW_CHIP_TYPE_8821C`). Only with packets open; a failed EP0
+    /// (`RTW_CHIP_TYPE_8821C` and `RTW_CHIP_TYPE_8822B`). Only with packets open; a failed EP0
     /// transfer leaves the backend terminal.
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn dynamic_rx_agg(

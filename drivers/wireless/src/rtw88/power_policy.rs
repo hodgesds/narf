@@ -414,7 +414,7 @@ impl ExtensionBase {
         match &self.chip {
             ExtensionChip::C22(_) => super::phy8821c::Host::PCI_C22,
             ExtensionChip::C21(b) => b.host(),
-            ExtensionChip::B22(_) => super::phy8821c::Host::PCI_B22,
+            ExtensionChip::B22(b) => b.host(),
         }
     }
     /// Operating primary of this base: 1, or the bound N2xO record's.
@@ -932,7 +932,7 @@ impl Gate {
         match &self.scope {
             Scope::C22 { .. } => super::phy8821c::Host::PCI_C22,
             Scope::C21(grant) => grant.host(),
-            Scope::B22(..) => super::phy8821c::Host::PCI_B22,
+            Scope::B22(grant, _) => grant.host(),
         }
     }
     pub(super) fn own(&self) -> [u8; 6] {

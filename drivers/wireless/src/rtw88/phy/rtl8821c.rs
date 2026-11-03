@@ -23,12 +23,19 @@ pub(super) enum Interface {
 }
 impl Interface {
     pub(super) fn host(self) -> Host {
+        self.host_of(0xc821)
+    }
+    /// Host identity of chip `did` (0xc821 C21 or 0xb822 B22) behind this
+    /// interface: the historical PCI key, or the claimed USB VID/PID.
+    pub(in crate::rtw88) fn host_of(self, did: u16) -> Host {
         match self {
+            Self::Pcie if did == 0xb822 => Host::PCI_B22,
             Self::Pcie => Host::PCI_C21,
             Self::Usb { vendor, product } => Host {
                 vendor,
                 device: product,
                 usb: true,
+                chip: did,
             },
         }
     }
@@ -45,22 +52,29 @@ pub struct Host {
     pub vendor: u16,
     pub device: u16,
     pub usb: bool,
+    /// The die behind the host (0xc821, 0xc822, 0xb822). On PCI it equals
+    /// `device`; on USB it selects the filename family only (`rtw8821cu` or
+    /// `rtw8822bu`), never the header or the identity hash.
+    pub chip: u16,
 }
 impl Host {
     pub const PCI_C21: Self = Self {
         vendor: 0x10ec,
         device: 0xc821,
         usb: false,
+        chip: 0xc821,
     };
     pub const PCI_C22: Self = Self {
         vendor: 0x10ec,
         device: 0xc822,
         usb: false,
+        chip: 0xc822,
     };
     pub const PCI_B22: Self = Self {
         vendor: 0x10ec,
         device: 0xb822,
         usb: false,
+        chip: 0xb822,
     };
     /// The PCI host of chip `did` (0xc821 or 0xc822).
     pub(in crate::rtw88) fn pci(did: u16) -> Self {
@@ -76,10 +90,13 @@ impl Host {
         let [d0, d1] = self.device.to_le_bytes();
         [v0, v1, d0, d1]
     }
-    /// Filename family: `rtw8821ce`/`rtw8822ce` (PCI) or `rtw8821cu` (USB),
-    /// matching Linux's `rtw8821ce.c`/`rtw8821cu.c` driver names.
+    /// Filename family: `rtw8821ce`/`rtw8822ce`/`rtw8822be` (PCI) or
+    /// `rtw8821cu`/`rtw8822bu` (USB), matching Linux's `rtw8821ce.c`,
+    /// `rtw8822ce.c`, `rtw8822be.c`, `rtw8821cu.c` and `rtw8822bu.c` driver
+    /// names.
     pub(in crate::rtw88) fn family(self) -> &'static str {
         match (self.usb, self.device) {
+            (true, _) if self.chip == 0xb822 => "rtw8822bu",
             (true, _) => "rtw8821cu",
             (false, 0xc822) => "rtw8822ce",
             (false, 0xb822) => "rtw8822be",

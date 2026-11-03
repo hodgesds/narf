@@ -98,7 +98,8 @@ pub(super) async fn park(slot_id: u8, mode: Mode) -> Result<Parked, Error> {
     if !usb_driver::is_current(&current.device, &station) {
         return Err(Error::Removed);
     }
-    super::usb::Registers::new(UsbControl::new(current.device.clone()))
+    super::usb::Registers::for_chip(UsbControl::new(current.device.clone()), current.origin.did)
+        .map_err(|_| Error::Power)?
         .power_off()
         .await
         .map_err(|_| Error::Power)?;

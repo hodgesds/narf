@@ -1190,6 +1190,8 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
         // Linux `rtw8821cu.c` `rtw_8821cu_driver.name`; the USB backend is
         // asynchronous, so the worker drives it.
         (0xc821, true, false) => "rtw8821cu",
+        // Linux `rtw8822bu.c` `rtw_8822bu_driver.name`.
+        (0xb822, true, false) => "rtw8822bu",
         _ => return Err(Error::State),
     };
     let authority = narf_net::trusted_net_authority()

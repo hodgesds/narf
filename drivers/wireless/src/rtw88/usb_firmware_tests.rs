@@ -554,3 +554,78 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_lps_mailbox_preconditions
 );
+
+fn backend8822b(fake: &Fake) -> Backend<Fake, Fake> {
+    let eps = endpoints();
+    let beacon = eps.out_for(QSEL_BEACON).expect("beacon pipe");
+    fake.0.lock().beacon_dci = narf_drivers_usb::bulk::dci_for(beacon);
+    Backend::new_for(0xb822, fake.clone(), fake.clone(), eps, Speed::High).expect("backend")
+}
+
+/// RTL8822BU over the same USB backend: `rtw_mac_init` uses the
+/// `page_table_8822b[3]` 64/64/64/0 row with the B22 reserved boundary 1996
+/// (public queue 1996 - 192 - 1), the factory map is parsed as
+/// `rtw8822bu_efuse_parsing` (MAC 0x107), the C22 die still has no USB rows
+/// and the associated B22 IQK hook refuses outside an open station.
+fn smoke_rtw88_usb_8822bu_backend_mac_efuse_and_iqk() -> TestResult {
+    use super::tracking8822b::Step;
+    const MAC: [u8; 6] = [0x02, 0x88, 0x22, 0xb0, 0x55, 0x01];
+    let fake = Fake::default();
+    fake.0.lock().regs.insert(0xf1, 0x10); // SYS_CFG1 cut 1
+    let mut b = backend8822b(&fake);
+    if Backend::new_for(0xc822, fake.clone(), fake.clone(), endpoints(), Speed::High).is_ok() {
+        return TestResult::Fail("USB backend accepted for C22");
+    }
+    let hci = Hci::Usb {
+        bulkout: 3,
+        speed: Speed::High,
+    };
+    if complete(mac::prepare_on(&mut b, 0xb822, hci)) != Err(Error::Prerequisite) {
+        return TestResult::Fail("B22 fifo walk");
+    }
+    {
+        let m = fake.0.lock();
+        let value = |addr: u16| {
+            m.writes
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, v)| v.clone())
+        };
+        if m.writes.first() != Some(&(0x10c, vec![0xa0, 0xf5])) {
+            return TestResult::Fail("B22 TXDMA_PQ_MAP row");
+        }
+        for (reg, pages) in [
+            (0x230u16, 64u16),
+            (0x234, 64),
+            (0x238, 64),
+            (0x23c, 0),
+            (0x240, 1803),
+        ] {
+            if value(reg) != Some(pages.to_le_bytes().to_vec()) {
+                return TestResult::Fail("B22 FIFOPAGE_INFO rows");
+            }
+        }
+    }
+    let fake = Fake::default();
+    let mut b = backend8822b(&fake);
+    fake.0.lock().efuse = vec![
+        0x0f, 0x47, 0x00, MAC[0], 0x2f, 0x48, MAC[1], MAC[2], MAC[3], MAC[4], MAC[5], 0x00, 0xff,
+    ];
+    match complete(super::efuse::read_factory8822b_usb(&mut b)) {
+        Ok(factory) if factory.usb() && factory.mac() == MAC => {}
+        _ => return TestResult::Fail("RTL8822BU factory map"),
+    }
+    if complete(b.station_b22_iqk(Step::Begin)) != Err(Error::State) {
+        return TestResult::Fail("B22 IQK outside an open station");
+    }
+    let fake = Fake::default();
+    let mut c21 = backend(&fake);
+    if complete(c21.station_b22_iqk(Step::Begin)) != Err(Error::State) {
+        return TestResult::Fail("B22 IQK hook on an RTL8821CU backend");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_8822bu_backend_mac_efuse_and_iqk
+);

@@ -63,8 +63,9 @@ async fn u32(io: &mut impl Io, reg: u16, clear: u32, set: u32) -> Result<(), Err
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Hci {
     Pcie,
-    /// RTL8821CU: `rtwdev->hci.bulkout_num` selects the `rqpn_table_8821c` /
-    /// `page_table_8821c` rows; `speed` feeds `rtw_usb_interface_cfg`.
+    /// RTL8821CU / RTL8822BU: `rtwdev->hci.bulkout_num` selects the
+    /// `rqpn_table_8821c`/`page_table_8821c` or `rqpn_table_8822b`/
+    /// `page_table_8822b` rows; `speed` feeds `rtw_usb_interface_cfg`.
     Usb {
         bulkout: u8,
         speed: super::usb::Speed,
@@ -73,12 +74,13 @@ pub(super) enum Hci {
 async fn fifo(io: &mut impl Io, info: Info, did: u16, hci: Hci) -> Result<(), Error> {
     let usb = match hci {
         Hci::Pcie => None,
-        Hci::Usb { bulkout, .. } => {
-            Some(super::usb::usb_tables(usize::from(bulkout)).map_err(|_| Error::Unsupported)?)
-        }
+        Hci::Usb { bulkout, .. } => Some(
+            super::usb::usb_tables_for(did, usize::from(bulkout))
+                .map_err(|_| Error::Unsupported)?,
+        ),
     };
     // mac.c::txdma_queue_mapping: PCIe uses rqpn_table[1]; USB the
-    // bulk-out-count row of rqpn_table_8821c.
+    // bulk-out-count row of rqpn_table_8821c / rqpn_table_8822b (equal).
     let map = match usb {
         Some((rqpn, _)) => u32::from(super::usb::txdma_pq_map(rqpn)),
         None => 0xc5a0,
@@ -334,10 +336,10 @@ pub(super) async fn prepare(io: &mut impl Io) -> Result<Info, Error> {
 pub(super) async fn prepare_for(io: &mut impl Io, did: u16) -> Result<Info, Error> {
     prepare_on(io, did, Hci::Pcie).await
 }
-/// `mac.c::rtw_mac_init` for `hci`. USB exists only for the C21 die
-/// (RTL8821CU); the PCIe byte stream is unchanged.
+/// `mac.c::rtw_mac_init` for `hci`. USB exists for the C21 (RTL8821CU) and
+/// B22 (RTL8822BU) dies; the PCIe byte stream is unchanged.
 pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<Info, Error> {
-    if !matches!(did, 0xc821 | 0xc822 | 0xb822) || did != 0xc821 && hci != Hci::Pcie {
+    if !matches!(did, 0xc821 | 0xc822 | 0xb822) || did == 0xc822 && hci != Hci::Pcie {
         return Err(Error::Unsupported);
     }
     let cfg = io.read32(0xf0).await?;
