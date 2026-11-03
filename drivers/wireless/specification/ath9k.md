@@ -1565,6 +1565,21 @@ indoor-only rules refuse the channel. Smokes (written, not executed):
 `smoke_ath9k_ar9280_calibration_refuses_before_writes`,
 `smoke_ath9k_ar9280_dual_band_permission_refuses_dfs_and_no_ir`.
 
+AR9280 MAC profile: `mac::Profile::ar9280(rx, tx, five_ghz)` binds the def
+map's base-header rxMask/txMask (offsets 18/19, shared with the 4k/AR9287
+maps), `AR_PCU_TXBUF_CTRL_USABLE_SIZE` 0x700 and the band's clock:
+`Clock::Ofdm2g` on 2.4 GHz and `Clock::Fast5g` on 5 GHz
+(`ath9k_hw_set_clockrate` with `ATH9K_HW_CAP_FASTCLOCK`: 44 MHz).
+`peer_clocked` follows `ath9k_hw_init_global_settings` at full rate: SIFS
+16 us on 5 GHz (10 on 2.4), the slot (5 GHz accepts only the 9 us short
+slot), ACK/CTS timeouts `slot + SIFS` on 5 GHz (the 64/48 us workaround is
+2 GHz-only) and `AR_USEC_USEC = clockrate - 1`; the USEC latencies (the
+fast-clock INI carries `rx_lat` 41) and EIFS stay as the INI wrote them,
+exactly as Linux reads them back. The 5 GHz values equal the
+`ar9280Modes_fast_clock_9280_2` 5G_HT20 rows (0x268, 0x18c, 0x044c044c).
+Smoke (written, not executed):
+`smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

@@ -71,6 +71,21 @@ impl Profile {
             txbuf: 0x700,
         }
     }
+    /// AR9280 (two-chain def map) for one band: `ATH9K_CLOCK_RATE_2GHZ_OFDM`
+    /// on 2.4 GHz, the fast 5 GHz clock (`ATH9K_HW_CAP_FASTCLOCK` is always
+    /// set for AR9280) on 5 GHz, `AR_PCU_TXBUF_CTRL_USABLE_SIZE`.
+    pub(super) fn ar9280(rx_chainmask: u8, tx_chainmask: u8, five_ghz: bool) -> Self {
+        Self {
+            rx_chainmask,
+            tx_chainmask,
+            clock: if five_ghz {
+                Clock::Fast5g
+            } else {
+                Clock::Ofdm2g
+            },
+            txbuf: 0x700,
+        }
+    }
 }
 pub(super) fn prepare(
     io: &impl Port,
@@ -129,7 +144,13 @@ pub(super) fn prepare_chip(
     write(io, 0x80e4, 0xffff)?;
     let antenna = io.read(0x8058)?;
     write(io, 0x8058, if antenna == 0 { 1 } else { antenna })?;
-    peer_clocked(io, None, 20, profile.clock)?;
+    // ah->slottime starts at 20 us; 5 GHz has only the short slot.
+    let slot = if profile.clock == Clock::Fast5g {
+        9
+    } else {
+        20
+    };
+    peer_clocked(io, None, slot, profile.clock)?;
     io.write(0x80, u32::MAX)?; // ISR is W1C; this is not an ordinary readback.
     write(io, 0x8018, 0x700)?;
     opmode(io)?;
@@ -178,7 +199,7 @@ pub(super) fn prepare_chip(
     Ok(())
 }
 /// MAC clock of `hw.c::ath9k_hw_set_clockrate` for a full-rate 20 MHz
-/// 2.4 GHz channel, as used by `ath9k_hw_init_global_settings`.
+/// channel, as used by `ath9k_hw_init_global_settings`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Clock {
     /// `ATH9K_CLOCK_RATE_2GHZ_OFDM` (44 MHz); USEC latencies stay as the INI
@@ -187,12 +208,24 @@ pub(super) enum Clock {
     /// `AR_SREV_9287_13_OR_LATER`: async FIFO at 117 MHz with
     /// `AR_USEC_ASYNC_FIFO` latencies and `AR_D_GBL_IFS_EIFS_ASYNC_FIFO`.
     AsyncFifo,
+    /// `ATH9K_CLOCK_FAST_RATE_5GHZ_OFDM` (44 MHz) on a 5 GHz channel
+    /// (`IS_CHAN_A_FAST_CLOCK`): SIFS 16 us and no 2 GHz ACK/CTS
+    /// workaround; USEC latencies (the fast-clock INI's `rx_lat` 41) and
+    /// EIFS stay as the INI left them, as for `Ofdm2g`.
+    Fast5g,
 }
 impl Clock {
     pub(super) fn rate(self) -> u32 {
         match self {
-            Self::Ofdm2g => 44,
+            Self::Ofdm2g | Self::Fast5g => 44,
             Self::AsyncFifo => 117,
+        }
+    }
+    /// `sifstime` of `ath9k_hw_init_global_settings`.
+    pub(super) fn sifs_us(self) -> u32 {
+        match self {
+            Self::Fast5g => 16,
+            Self::Ofdm2g | Self::AsyncFifo => 10,
         }
     }
 }
@@ -210,7 +243,7 @@ pub(super) fn peer_clocked(
     slot_us: u32,
     clock: Clock,
 ) -> Result<(), Error> {
-    if !matches!(slot_us, 9 | 20) {
+    if !matches!(slot_us, 9 | 20) || (clock == Clock::Fast5g && slot_us != 9) {
         return Err(Error::Packet);
     }
     let (bssid, aid) = bssid.unwrap_or(([0; 6], 0));
@@ -227,14 +260,21 @@ pub(super) fn peer_clocked(
         0x800c,
         u32::from(u16::from_le_bytes([bssid[4], bssid[5]])) | (u32::from(aid) << 16),
     )?;
-    // Full-rate 2.4 GHz, zero coverage class: Linux's 2 GHz 64us ACK/48us
-    // CTS workaround is independent of the selected slot time.
+    // Full rate, zero coverage class: Linux's 2 GHz 64us ACK/48us CTS
+    // workaround is independent of the selected slot time; on 5 GHz
+    // ACK and CTS timeouts are slot + SIFS.
     let rate = clock.rate();
-    write(io, 0x1030, (10 - 2) * rate)?;
+    let sifs = clock.sifs_us();
+    let (ack, cts) = if clock == Clock::Fast5g {
+        (slot_us + sifs, slot_us + sifs)
+    } else {
+        (64, 48)
+    };
+    write(io, 0x1030, (sifs - 2) * rate)?;
     write(io, 0x1070, slot_us * rate)?;
-    modify(io, 0x8014, 0x3fff_3fff, (64 * rate) | ((48 * rate) << 16))?;
+    modify(io, 0x8014, 0x3fff_3fff, (ack * rate) | ((cts * rate) << 16))?;
     match clock {
-        Clock::Ofdm2g => modify(io, 0x801c, 0x7f, rate - 1)?,
+        Clock::Ofdm2g | Clock::Fast5g => modify(io, 0x801c, 0x7f, rate - 1)?,
         Clock::AsyncFifo => {
             write(io, 0x10b0, 363 * rate)?;
             // TX_LAT | RX_LAT | USEC = AR_USEC_ASYNC_FIFO (USEC = 117 - 1).

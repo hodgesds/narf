@@ -328,3 +328,49 @@ kernel_test_in!(
     "drivers/wireless/ath9k/mac",
     smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo
 );
+
+/// AR9280: 2.4 GHz is the 44 MHz OFDM profile; 5 GHz is the fast 44 MHz
+/// clock with SIFS 16 and slot + SIFS ACK/CTS (`ath9k_hw_init_global_settings`),
+/// whose values equal the Linux `ar9280Modes_fast_clock_9280_2` 5G_HT20 INI.
+fn smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs() -> TestResult {
+    let mut map = alloc::vec![0u8; crate::ath9k::chips::MAP_DEF.bytes()];
+    map[12..18].copy_from_slice(&LOCAL);
+    map[18..20].copy_from_slice(&[3, 3]);
+    let five = Model::new(0);
+    five.parked();
+    if prepare_chip(&five, &map, LOCAL, Profile::ar9280(3, 3, true)).is_err() {
+        return TestResult::Fail("AR9280 5 GHz MAC profile refused");
+    }
+    for (reg, value) in [(0x1030, 0x268), (0x1070, 0x18c), (0x8340, 0x700)] {
+        if five.raw(reg) != value {
+            return TestResult::Fail("AR9280 5 GHz SIFS/slot/TX buffer differs from Linux");
+        }
+    }
+    if five.raw(0x8014) & 0x3fff_3fff != 0x044c_044c
+        || five.raw(0x801c) & 0x7f != 43
+        || five
+            .trace
+            .borrow()
+            .iter()
+            .any(|w| w.0 == 0x10b0 || w.0 == 0x8264)
+    {
+        return TestResult::Fail("AR9280 5 GHz ACK/CTS/USEC differs from the fast-clock INI");
+    }
+    if peer_clocked(&five, None, 20, Clock::Fast5g) != Err(Error::Packet) {
+        return TestResult::Fail("AR9280 5 GHz accepted a long slot");
+    }
+    let two = Model::new(0);
+    two.parked();
+    if prepare_chip(&two, &map, LOCAL, Profile::ar9280(3, 3, false)).is_err()
+        || two.raw(0x1030) != 8 * 44
+        || two.raw(0x1070) != 20 * 44
+        || two.raw(0x8014) & 0x3fff_3fff != (64 * 44) | ((48 * 44) << 16)
+    {
+        return TestResult::Fail("AR9280 2.4 GHz MAC profile differs from the OFDM clock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs
+);
