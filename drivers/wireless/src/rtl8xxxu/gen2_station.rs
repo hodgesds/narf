@@ -95,6 +95,23 @@ pub(super) fn open_data(
     Some(h)
 }
 
+/// A plaintext Ethernet frame as a ToDS QoS DATA MPDU (TID, normal ACK).
+pub(super) fn open_qos_data(
+    frame: &[u8],
+    own: [u8; 6],
+    bssid: [u8; 6],
+    sequence: u16,
+    tid: u8,
+) -> Option<Vec<u8>> {
+    if tid > 7 {
+        return None;
+    }
+    let mut native = open_data(frame, own, bssid, sequence)?;
+    native[0] = 0x88;
+    drop(native.splice(24..24, [tid, 0]));
+    Some(native)
+}
+
 pub struct Station<C: ControlIo, B: packet_transport::Io> {
     radio: Radio<C, B>,
     plan: Join,
@@ -113,6 +130,12 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     /// Associated-scan capture of home-channel BSS observations
     /// `(candidate, seen, receive generation)`, bounded like the cache.
     observed: Option<Vec<(Candidate, u64, u64)>>,
+    /// EDCA rows last programmed through `configure_edca` (WMM peer).
+    edca: Option<narf_wireless::wmm::Parameters>,
+    /// A bound-AP beacon's changed WMM Parameter Set awaiting `conf_tx`.
+    edca_pending: Option<narf_wireless::wmm::Parameters>,
+    /// Open-station per-TID QoS DATA sequence spaces.
+    qos_sequence: [u16; 8],
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -134,9 +157,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if candidate.channel() != radio.channel() || mode.is_wpa2() != pmk.is_some() {
             return Err(Error::Profile);
         }
-        let plan = Join::prepare(candidate, radio.local(), ssid, mode)
-            .map_err(Error::Management)?
-            .without_wmm();
+        // A WMM AP selects the optional QoS station: the join plan appends
+        // the Information IE (no U-APSD) and requires valid response rows.
+        let plan =
+            Join::prepare(candidate, radio.local(), ssid, mode).map_err(Error::Management)?;
         Ok(Self {
             radio,
             plan,
@@ -153,6 +177,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             last_peer: 0,
             sequence: 2,
             observed: None,
+            edca: None,
+            edca_pending: None,
+            qos_sequence: [0; 8],
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -269,6 +296,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if self.radio.maintenance_pending(now) {
             self.radio.maintain(now).await.map_err(Error::Radio)?;
         }
+        if let Some(p) = self.edca_pending.take() {
+            self.program_edca(p).await?;
+        }
         if !self.progress(now)? {
             return Ok(());
         }
@@ -287,6 +317,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 }
                 if beacon.bssid() == self.peer() && beacon.ssid() == self.plan.candidate().ssid() {
                     self.last_peer = now;
+                    self.observe_wmm(beacon.information_elements())?;
                 }
                 continue;
             }
@@ -323,6 +354,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     /// `BSS_CHANGED_ASSOC`: firmware RA over the negotiated legacy rates
     /// within the signed admitted mask, then the RSNA owner or the open port.
     async fn associated(&mut self, aid: u16, now: u64) -> Result<(), Error> {
+        // mac80211 `ieee80211_assoc_success`: `ieee80211_sta_wmm_params`
+        // (`drv_conf_tx` per AC) precedes `BSS_CHANGED_ASSOC`.
+        if let Some(p) = self.plan.wmm() {
+            self.program_edca(p).await?;
+        }
         let (legacy, _, _) = self.plan.rate_mask_inputs();
         self.radio
             .associate(aid, legacy_peer(legacy), now)
@@ -351,6 +387,42 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             self.phase = Phase::Open;
             self.last_peer = now;
         }
+        Ok(())
+    }
+    /// `rtl8xxxu_conf_tx` for all four ACs through the radio's checked
+    /// EDCA/ACM writes; host classification then follows the new rows.
+    async fn program_edca(&mut self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
+        let short_slot = self.plan.candidate().capability() & 0x400 != 0;
+        self.radio
+            .configure_edca(p, short_slot)
+            .await
+            .map_err(Error::Radio)?;
+        self.edca = Some(p);
+        Ok(())
+    }
+    /// mac80211 `ieee80211_sta_wmm_params`: a bound-AP beacon whose WMM
+    /// Parameter Set Count differs from the installed rows carries new rows
+    /// (an unchanged count is ignored even if the bytes differ). Losing WMM
+    /// after a WMM association, or rows this profile cannot program, is
+    /// terminal before any EP0 write.
+    fn observe_wmm(&mut self, information_elements: &[u8]) -> Result<(), Error> {
+        let Some(current) = self.edca_pending.or(self.edca) else {
+            return Ok(());
+        };
+        let fresh = narf_wireless::wmm::Parameters::parse(information_elements)
+            .ok()
+            .flatten()
+            .ok_or(Error::PeerLost)?;
+        if fresh.parameter_set_count == current.parameter_set_count {
+            return Ok(());
+        }
+        super::wmm_runtime::words_profile(
+            fresh,
+            self.plan.candidate().capability() & 0x400 != 0,
+            false,
+        )
+        .map_err(|_| Error::Profile)?;
+        self.edca_pending = Some(fresh);
         Ok(())
     }
     /// Deadlines, TX completion, one RX transfer into the batch and
@@ -487,8 +559,15 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if !self.transmit_ready() {
             return Err(Error::State);
         }
+        // `cfg80211_classify8021d` + `ieee80211_downgrade_queue` over the
+        // installed AP rows choose the TID; the codec maps its AC to the
+        // txdesc40 queue and the queue-map bulk-OUT pipe.
+        let tid = self.edca.map(|p| crate::rtlwifi::wmm::priority(frame, &p));
         let native = if let Some(security) = &mut self.security {
-            match security.transmit_ethernet(frame) {
+            match match tid {
+                Some(tid) => security.transmit_ethernet_qos(frame, tid),
+                None => security.transmit_ethernet(frame),
+            } {
                 Ok(frame) => frame,
                 Err(error) => {
                     if !security.port_open() {
@@ -497,6 +576,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                     return Err(Error::Security(error));
                 }
             }
+        } else if let Some(tid) = tid {
+            let (own, peer) = (self.radio.local(), self.peer());
+            let counter = &mut self.qos_sequence[usize::from(tid)];
+            let native = open_qos_data(frame, own, peer, *counter, tid).ok_or(Error::Profile)?;
+            *counter = (*counter + 1) & 4095;
+            native
         } else {
             let native = open_data(frame, self.radio.local(), self.peer(), self.sequence)
                 .ok_or(Error::Profile)?;
@@ -599,9 +684,19 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     /// (rtl8xxxu sets no `REPORTS_TX_ACK_STATUS`); the USB receipt is the
     /// only completion tracked.
     pub(super) fn send_null(&mut self, asleep: bool, now: u64) -> Result<(), Error> {
-        let sequence = self.reserve_sequence()?;
+        // `ieee80211_nullfunc_get`: QoS Null TID7/SN0 for a WMM peer (no
+        // DATA sequence consumed), otherwise the non-QoS Null.
+        let qos = self.edca.is_some();
+        let sequence = if qos {
+            if !self.scan_admissible() {
+                return Err(Error::State);
+            }
+            0
+        } else {
+            self.reserve_sequence()?
+        };
         let null =
-            super::ps_null::Prepared::new(self.radio.local(), self.peer(), asleep, false, sequence)
+            super::ps_null::Prepared::new(self.radio.local(), self.peer(), asleep, qos, sequence)
                 .map_err(|_| Error::State)?;
         if let Err(error) = self.radio.submit_null(&null) {
             self.fail();
@@ -646,6 +741,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 .prepare_station(bssid, short_slot)
                 .await
                 .map_err(Error::Radio)?;
+            if let Some(p) = self.edca {
+                self.radio
+                    .configure_edca(p, short_slot)
+                    .await
+                    .map_err(Error::Radio)?;
+            }
             let (legacy, _, _) = self.plan.rate_mask_inputs();
             self.radio
                 .associate(aid, legacy_peer(legacy), now)

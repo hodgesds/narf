@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::{legacy_peer, open_data};
+use super::{legacy_peer, open_data, open_qos_data};
 use crate::rtl8xxxu::rtl8192e_ra::Ra;
 
 const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];
@@ -69,4 +69,51 @@ fn smoke_rtl8xxxu_gen2_open_data_header() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/gen2station",
     smoke_rtl8xxxu_gen2_open_data_header
+);
+
+/// `rtl8xxxu_queue_select` / `rtl8xxxu_80211_to_rtl_queue` on txdesc40 QoS
+/// DATA: BK2, BE0, VI5, VO7 in txdw1 QSEL; the QoS control carries the TID.
+fn smoke_rtl8xxxu_gen2_wmm_qos_data_queues() -> TestResult {
+    use crate::rtl8xxxu::packet_codec::Kind;
+    use crate::rtl8xxxu::rtl8192e_packet::{transmit, TxControl};
+    let mut eth = Vec::new();
+    eth.extend_from_slice(&[0x10; 6]);
+    eth.extend_from_slice(&OWN);
+    eth.extend_from_slice(&[0x08, 0x00, 1, 2, 3]);
+    if open_qos_data(&eth, OWN, BSSID, 0, 8).is_some() {
+        return TestResult::Fail("TID 8 admitted");
+    }
+    for (tid, queue) in [
+        (0u8, 0u32),
+        (1, 2),
+        (2, 2),
+        (3, 0),
+        (4, 5),
+        (5, 5),
+        (6, 7),
+        (7, 7),
+    ] {
+        let Some(mpdu) = open_qos_data(&eth, OWN, BSSID, 9, tid) else {
+            return TestResult::Fail("QoS DATA refused");
+        };
+        if mpdu[..2] != [0x88, 1]
+            || mpdu[22..24] != [0x90, 0]
+            || mpdu[24..26] != [tid, 0]
+            || mpdu[26..34] != [0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]
+        {
+            return TestResult::Fail("QoS ToDS header");
+        }
+        let Ok(packet) = transmit(&mpdu, Kind::Data, TxControl::default()) else {
+            return TestResult::Fail("txdesc40 refused QoS DATA");
+        };
+        let txdw1 = u32::from_le_bytes(packet[4..8].try_into().unwrap());
+        if (txdw1 >> 8) & 0x1f != queue {
+            return TestResult::Fail("txdesc40 AC queue");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/gen2station",
+    smoke_rtl8xxxu_gen2_wmm_qos_data_queues
 );

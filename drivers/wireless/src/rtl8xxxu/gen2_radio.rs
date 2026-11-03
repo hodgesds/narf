@@ -142,6 +142,7 @@ pub const WATCHDOG_MS: u64 = 2000;
 const BT_QUEUE: usize = 8;
 
 const REG_TXPAUSE: u16 = 0x522;
+const REG_ACM_HW_CTRL: u16 = 0x5c0;
 const REG_RXFLTMAP0: u16 = 0x6a0;
 const REG_RXFLTMAP2: u16 = 0x6a4;
 const REG_OFDM0_XA_AGC_CORE1: u16 = 0xc50;
@@ -771,6 +772,56 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             self.start().await?;
         }
         Ok(())
+    }
+    /// `rtl8xxxu_conf_tx` for BE/BK/VI/VO (`REG_EDCA_*_PARAM` 0x508/0x50c/
+    /// 0x504/0x500 with `rtl8xxxu_set_aifs` SIFS 10 (legacy 2.4 GHz) plus
+    /// AIFSN slots, via `wmm_runtime::words_profile`), each with an exact
+    /// readback, then `REG_ACM_HW_CTRL` mirroring each AC's ACM. Rows this
+    /// profile cannot program (BE ACM, ECW/AIFSN geometry, 8-bit AIFS) are
+    /// refused before any write. Only afterwards may QoS DATA (txdesc40 AC
+    /// queue/pipe per `rtl8xxxu_queue_select`) be submitted.
+    pub(super) async fn configure_edca(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short_slot: bool,
+    ) -> Result<(), Error> {
+        self.current()?;
+        if self.phase() != Phase::Receiving || self.peer.is_none() {
+            return Err(Error::State);
+        }
+        let values =
+            super::wmm_runtime::words_profile(p, short_slot, false).map_err(|_| Error::Profile)?;
+        let mut attempt = self.attempt();
+        let result = async {
+            let f = &self.firmware;
+            for (reg, value) in [0x508u16, 0x50c, 0x504, 0x500].into_iter().zip(values) {
+                f.write32(reg, value).await.map_err(Error::Control)?;
+                if f.read32(reg).await.map_err(Error::Control)? != value {
+                    return Err(Error::State);
+                }
+            }
+            let acm = (f.read8(REG_ACM_HW_CTRL).await.map_err(Error::Control)? & !0x0f)
+                | super::wmm_runtime::acm_bits(p);
+            f.write8(REG_ACM_HW_CTRL, acm)
+                .await
+                .map_err(Error::Control)?;
+            if f.read8(REG_ACM_HW_CTRL).await.map_err(Error::Control)? != acm {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        match result {
+            Ok(()) => {
+                self.packets.qos = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail_terminal();
+                Err(error)
+            }
+        }
     }
     /// The prepared broadcast Probe Request on the management pipe of an
     /// unbound receiving radio (`probe_runtime::Prepared` is the only

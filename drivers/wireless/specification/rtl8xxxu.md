@@ -1560,13 +1560,14 @@ rate authority.
   identity check is replaced for gen2 by `run_device_8192e`/`_8723b`
   refusing an EFUSE/endpoint change with `BadEfuse` and a queue-map change
   with `BadEndpoints`), after which `start` is permitted again.
-- Station (`gen2_station::Station`): `Join::prepare(..).without_wmm()`
-  (legacy, no WMM Information element: the packet owner sends only
-  non-QoS DATA), Authentication/Association through the shared join plan,
+- Station (`gen2_station::Station`): `Join::prepare(..)` (a WMM AP
+  selects the optional QoS station below; otherwise legacy non-QoS),
+  Authentication/Association through the shared join plan,
   firmware RA at association over the negotiated `supp_rates[0]`, then the
   shared RSNA supplicant (`Security`, software CCMP, private EAPOL epoch
   rule and reply-delivery receipt as `station_runtime`) or the open port.
-  TX DATA is non-QoS txdesc40 on the BE pipe with firmware RA rates.
+  TX DATA is txdesc40 with firmware RA rates (non-QoS on the BE pipe for a
+  legacy peer).
 - Netdev (`gen2_interface`): `attach` after `wait_admit` publishes one
   `wlan%d` per boot (shared singleton like RTL8188EU); a failed join is
   terminal for the owner (as RTL8188EU). `disassociate` is station stop,
@@ -1633,7 +1634,34 @@ advances `Radio::generation`. Any failure is terminal.
   probe response is probed again, directed), waiting at most 2 s, never an
   old entry's age.
 
-Deviations / not implemented: no HT/WMM/A-MPDU/BA on gen2 (legacy rates
+#### Gen2 optional WMM (all ACs/TIDs)
+
+As the RTL8188EU WMM program: a valid AP WMM Parameter element makes the
+join plan append the driver Information IE (no U-APSD) and require valid
+rows in the peer-bound Association Response (missing/malformed/BE-ACM rows
+are terminal). Before `BSS_CHANGED_ASSOC` (mac80211
+`ieee80211_assoc_success` order) `Radio::configure_edca` is
+`rtl8xxxu_conf_tx` for every AC: `REG_EDCA_BE/BK/VI/VO_PARAM`
+0x508/0x50c/0x504/0x500 from `wmm_runtime::words_profile` (`rtl8xxxu_set_aifs`
+SIFS 10 for this legacy 2.4 GHz profile + AIFSN x 9/20 us slot; BE kept
+conservative), each with exact readback, then `REG_ACM_HW_CTRL` 0x5c0
+BK0/BE1/VI2/VO3 from each AC's ACM. Unprogrammable rows are refused before
+any write. Only then does the packet owner admit QoS DATA. `send_ethernet`
+classifies with `cfg80211_classify8021d` + `ieee80211_downgrade_queue`
+(`rtlwifi::wmm::priority`) over the installed rows; WPA2 uses
+`transmit_ethernet_qos` (TID in the CCMP nonce, per-TID PN/SN), Open uses
+per-TID SN spaces (`open_qos_data`). txdesc40 QSEL follows
+`rtl8xxxu_queue_select` (BK2, BE0, VI5, VO7, MGNT 0x12) and the pipe the
+chip queue map (`rtl8xxxu_init_queue_priority`); txdesc40 has no separate
+QoS bit (`rtl8xxxu_fill_txdesc_v2`). A bound-AP beacon with a changed WMM
+Parameter Set Count is checked and applied in the next `step` through the
+same writes (unchanged count ignored; WMM loss is peer loss). Scan Nulls use
+QoS Null TID7/SN0 for a WMM peer; a scan `rejoin` reprograms the installed
+EDCA rows after the cold restart. TSPEC/U-APSD stay inapplicable as for
+RTL8188EU. Regression (written, unexecuted):
+`smoke_rtl8xxxu_gen2_wmm_qos_data_queues`.
+
+Deviations / not implemented: no HT/A-MPDU/BA on gen2 (legacy rates
 only; HT needs the `wide`/HT RX admission the 8188EU chain proves per
 board); a scan or channel change costs a full cold firmware lifecycle per
 transition (Linux retunes live); the retained host TX/RX rings are not
