@@ -104,6 +104,28 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     ) -> FsFuture<'_, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
+    /// Cached main-GT OAG facts for this live epoch; no read-triggered I/O.
+    fn oa_device(&self) -> Option<crate::intel_gpu_oa::Device> {
+        None
+    }
+    /// The GT owner serializes OA programming and configuration jobs with
+    /// reset, power and its other DMA owners.
+    fn oa_control(
+        &self,
+        _session: Arc<crate::intel_gpu_oa::Session>,
+        _request: crate::intel_gpu_oa::Request,
+    ) -> FsFuture<'_, ()> {
+        Box::pin(async { Err(FsError::NoDevice) })
+    }
+    /// Copy landed OA reports under the GT owner and advance the head.
+    fn oa_read<'a>(
+        &'a self,
+        _session: Arc<crate::intel_gpu_oa::Session>,
+        _output: &'a mut [u8],
+        _blocking: bool,
+    ) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::NoDevice) })
+    }
     /// Stable ABI selection for this card, independent of temporary readiness.
     fn native_xe(&self) -> bool {
         false

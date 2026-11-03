@@ -316,6 +316,8 @@ fn query_wire(
             }
             reply
         }
+        // query_oa_units: zero units unless the OAG owner is published.
+        8 => crate::intel_gpu_oa::query(info.backend.as_ref().and_then(|b| b.oa_device())),
         // xe_query.c::query_pxp_status: size negotiation, an exact
         // drm_xe_query_pxp_status size, then xe_pxp_get_readiness_status,
         // which is -ENODEV while xe->pxp is NULL. PXP needs the GSC proxy's

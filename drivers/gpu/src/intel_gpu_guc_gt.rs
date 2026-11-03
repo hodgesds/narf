@@ -97,6 +97,7 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
     scheduler: Option<GuCScheduler<A>>,
     topology: Option<Arc<GtTopology>>,
     eu_stall: Option<crate::intel_gpu_eu_stall::Collector<A>>,
+    oa: Option<crate::intel_gpu_oa::Unit<A>>,
     mert: Option<crate::intel_gpu_slpc::mert::Mert>,
 }
 
@@ -294,6 +295,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 scheduler: None,
                 topology: None,
                 eu_stall: None,
+                oa: None,
                 mert: None,
             }),
             state: GtState::Staged,
@@ -790,6 +792,186 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
     }
 
+    /// Preallocate the OAG buffer before scheduling, as EU-stall sampling
+    /// does, and leave the unit's counters and MMIO trigger disabled.
+    pub(crate) fn prepare_oa(&mut self) -> Result<(), narf_filesystem::FsError>
+    where
+        A: Clone,
+    {
+        use narf_filesystem::FsError;
+        if self.state != GtState::Ready || self.parts.scheduler.is_some() || self.parts.oa.is_some()
+        {
+            return Err(FsError::Unsupported);
+        }
+        self.awake().map_err(|_| FsError::NoDevice)?;
+        let hardware = self.hardware.as_ref();
+        let platform = self.parts.boot.platform();
+        let window = self.parts.boot.window();
+        if !observation_awake(window, platform, hardware) {
+            return Err(FsError::NoDevice);
+        }
+        let ip = crate::intel_gpu_gt::GraphicsIp::read(window, platform)
+            .map_err(|_| FsError::NoDevice)?;
+        let unit = crate::intel_gpu_oa::Unit::new(
+            self.parts.boot.diagnostic_allocator(),
+            platform,
+            ip.version,
+            window,
+            || observation_awake(window, platform, hardware),
+        )?;
+        self.parts.oa = Some(unit);
+        Ok(())
+    }
+    /// Cached OAG facts for publication with the live user epoch.
+    pub(crate) fn oa_device(
+        &self,
+        card: u32,
+        facts: &crate::intel_gpu_user::DeviceFacts,
+    ) -> Option<crate::intel_gpu_oa::Device> {
+        let unit = self.parts.oa.as_ref()?;
+        let rpm = if facts.graphics_version == 1255 {
+            let rpm = self
+                .parts
+                .boot
+                .window()
+                .read32(crate::intel_gpu_oa::RPM_CONFIG0_REG);
+            if rpm == u32::MAX {
+                return None;
+            }
+            rpm
+        } else {
+            0
+        };
+        unit.device(card, self.engines()?, facts.reference_clock, rpm)
+    }
+    fn oa_unit(
+        &mut self,
+        mut access: impl FnMut() -> bool,
+        light: bool,
+    ) -> Result<(), narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        if !access() {
+            if let Some(unit) = self.parts.oa.as_mut() {
+                unit.lost();
+            }
+            return Err(FsError::NoDevice);
+        }
+        if light {
+            if self.state != GtState::SchedulingReady || self.awake().is_err() {
+                return Err(FsError::NoDevice);
+            }
+        } else {
+            self.admit_scheduling().map_err(|_| FsError::NoDevice)?;
+        }
+        if self.parts.oa.is_none() {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
+    /// The register phase of an OA stream request under the GT owner.
+    pub(crate) fn oa_begin(
+        &mut self,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        request: &crate::intel_gpu_oa::Request,
+        now: u64,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<alloc::vec::Vec<crate::intel_gpu_oa::Job>, narf_filesystem::FsError> {
+        self.oa_unit(&mut access, false)?;
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        let window = parts.boot.window();
+        let unit = parts.oa.as_mut().expect("checked OA unit");
+        unit.begin(window, session, request, now, || {
+            access() && observation_awake(window, platform, hardware)
+        })
+    }
+    /// Queue one ordered configuration job on the stream's OAG engine.
+    pub(crate) fn submit_oa_job(
+        &mut self,
+        now: u64,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        job: &crate::intel_gpu_oa::Job,
+    ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        if !self
+            .parts
+            .oa
+            .as_ref()
+            .is_some_and(|unit| unit.owns(session))
+        {
+            return Err(FsError::NoDevice);
+        }
+        self.admit_scheduling().map_err(|_| FsError::NoDevice)?;
+        let scheduler = self.parts.scheduler.as_mut().ok_or(FsError::NoDevice)?;
+        // SAFETY: Jobs are built only by intel_gpu_oa from source LRI groups
+        // whose addresses passed xe_oa_is_valid_config_reg_addr: OA/NOA
+        // flex, boolean-counter and mux registers, never GGTT, PPGTT, ring,
+        // context, access-policy or breadcrumb state.
+        match unsafe { scheduler.submit_commands(now, session.engine(), job.words()) } {
+            Ok((_, fence)) => Ok(fence),
+            Err(SchedulingError::Busy | SchedulingError::Full) => Err(FsError::WouldBlock),
+            Err(_) => Err(FsError::NoDevice),
+        }
+    }
+    /// The register phase after the configuration jobs retired.
+    pub(crate) fn oa_finish(
+        &mut self,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        request: &crate::intel_gpu_oa::Request,
+        now: u64,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<(), narf_filesystem::FsError> {
+        self.oa_unit(&mut access, false)?;
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        let window = parts.boot.window();
+        let unit = parts.oa.as_mut().expect("checked OA unit");
+        unit.finish(window, session, request, now, || {
+            access() && observation_awake(window, platform, hardware)
+        })
+    }
+    /// Copy landed reports and advance the hardware head.
+    pub(crate) fn oa_read(
+        &mut self,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        output: &mut [u8],
+        blocking: bool,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<usize, narf_filesystem::FsError> {
+        self.oa_unit(&mut access, true)?;
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        let window = parts.boot.window();
+        let unit = parts.oa.as_mut().expect("checked OA unit");
+        unit.read(window, session, output, blocking, || {
+            access() && observation_awake(window, platform, hardware)
+        })
+    }
+    /// The 200 Hz tail check and close teardown.
+    pub(crate) fn poll_oa(&mut self, now: u64, mut access: impl FnMut() -> bool) {
+        if self.parts.oa.is_none() {
+            return;
+        }
+        if !access() || self.awake().is_err() {
+            if let Some(unit) = self.parts.oa.as_mut() {
+                unit.lost();
+            }
+            return;
+        }
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        if let Some(unit) = parts.oa.as_mut() {
+            let window = parts.boot.window();
+            unit.poll(window, now, || {
+                access() && observation_awake(window, platform, hardware)
+            });
+        }
+    }
+
     /// Caller has checked this unpublished allocation against this card's
     /// retained VRAM pool. Only the trusted CCS-clear factory is executable.
     pub(crate) fn clear_vram(
@@ -1201,7 +1383,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.media_power_down();
         // Stop observation first; a busy MCR semaphore is retried by poll,
         // with all DMA owners retained and wake still held.
-        if self.parts.eu_stall.is_some() && self.parts.boot.state() != BootState::Stopping {
+        if (self.parts.eu_stall.is_some() || self.parts.oa.is_some())
+            && self.parts.boot.state() != BootState::Stopping
+        {
             self.deadline = now.saturating_add(WAKE_NS);
             self.state = GtState::Stopping;
             return Ok(());
@@ -1245,6 +1429,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.log_stream.take();
         if let Some(collector) = self.parts.eu_stall.as_mut() {
             collector.invalidate();
+        }
+        if let Some(unit) = self.parts.oa.as_mut() {
+            unit.invalidate();
         }
         if let Some(mert) = &mut self.parts.mert {
             mert.closing();
@@ -1592,6 +1779,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 .eu_stall
                 .as_ref()
                 .is_none_or(|collector| collector.idle())
+            && self.parts.oa.as_ref().is_none_or(|unit| unit.idle())
             && self
                 .parts
                 .scheduler
@@ -1865,6 +2053,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             // precede release of all observation GGTT storage.
             unsafe { collector.release_after_reset() };
         }
+        if let Some(unit) = self.parts.oa.take() {
+            // SAFETY: the same proofs stop the OA unit's buffer writes.
+            unsafe { unit.release_after_reset() };
+        }
         if let Some(scheduler) = self.parts.scheduler.take() {
             // SAFETY: GuC reset/DMA idle preceded GRDOM_FULL self-clear.
             // Admission is closed and no child scheduler escapes.
@@ -1928,6 +2120,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
             if let Some(collector) = self.parts.eu_stall.as_mut() {
                 collector.lost();
+            }
+            if let Some(unit) = self.parts.oa.as_mut() {
+                unit.lost();
             }
         }
         result
@@ -2251,6 +2446,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                             Ok(()) => {}
                         }
                     }
+                    if let Some(unit) = parts.oa.as_mut() {
+                        let window = parts.boot.window();
+                        unit.halt(window, || observation_awake(window, platform, hardware));
+                    }
                     // A lost/stuck steering owner cannot prevent whole-GT
                     // reset escalation. Storage stays retained through GuC
                     // stop, GRDOM_FULL and the existing DMA-idle proofs.
@@ -2363,6 +2562,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             ct,
             scheduler,
             eu_stall,
+            oa,
             mert,
             ..
         } = unsafe { ManuallyDrop::take(&mut self.parts) };
@@ -2373,6 +2573,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if let Some(collector) = eu_stall {
             // SAFETY: the caller's full graphics-GT/DMA reset proof covers it.
             unsafe { collector.release_after_reset() };
+        }
+        if let Some(unit) = oa {
+            // SAFETY: the same full-reset proof stops OA buffer writes.
+            unsafe { unit.release_after_reset() };
         }
         if let Some(scheduler) = scheduler {
             // SAFETY: the external full-reset proof covers HWS and engines too.

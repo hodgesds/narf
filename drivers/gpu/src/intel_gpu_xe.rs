@@ -693,11 +693,50 @@ impl XeFile {
             ),
             abi::EXEC => Some(self.exec(info, address, user, syncobjs).await.map(|_| 0)),
             abi::WAIT_USER_FENCE => Some(self.wait_user(address, user).await.map(|_| 0)),
-            abi::OBSERVATION => Some(match info.backend.clone() {
+            abi::OBSERVATION => Some(self.observation(info, address, user).await),
+            _ => self.dispatch(info, cmd, address, user, gem),
+        }
+    }
+
+    /// xe_observation_ioctl: the copied-in param's extensions, then type and
+    /// op routing. OA streams may name this file's exec queues.
+    async fn observation(
+        &self,
+        info: &DeviceInfo,
+        address: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<u64, FsError> {
+        let wire = read(user, address, 32)?;
+        if u64_at(&wire, 0) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let op = u64_at(&wire, 16);
+        match u64_at(&wire, 8) {
+            0 => {
+                let queues = |id: u32| {
+                    self.names.lock().queues.get(&id).map(|queue| {
+                        let context = &queue.context;
+                        (
+                            context.engine().xe_class(),
+                            context.parallel().map_or(1, <[_]>::len),
+                        )
+                    })
+                };
+                crate::intel_gpu_oa::observation(
+                    info.backend.clone(),
+                    op,
+                    u64_at(&wire, 24),
+                    user,
+                    &queues,
+                )
+                .await
+            }
+            1 if op != 0 => Err(FsError::InvalidData),
+            1 => match info.backend.clone() {
                 Some(backend) => crate::intel_gpu_eu_stall::open(backend, address, user).await,
                 None => Err(FsError::NoDevice),
-            }),
-            _ => self.dispatch(info, cmd, address, user, gem),
+            },
+            _ => Err(FsError::InvalidData),
         }
     }
 

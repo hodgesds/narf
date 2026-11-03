@@ -939,6 +939,25 @@ impl<A: BootAllocator> GuCScheduler<A> {
         self.submit(now, engine, Some(batch), None)
     }
 
+    /// Privileged ring-only kernel commands before the owned breadcrumb.
+    ///
+    /// # Safety
+    /// `words` must be trusted source MI_LOAD_REGISTER_IMM groups whose
+    /// registers cannot alter GGTT, page tables, rings, register access
+    /// policy, context/transport state or completion evidence.
+    pub(crate) unsafe fn submit_commands(
+        &mut self,
+        now: u64,
+        engine: Engine,
+        words: &[u32],
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        if words.is_empty() || !self.engines.contains(engine) {
+            return Err(SchedulingError::Address);
+        }
+        self.submit(now, engine, None, Some(words.to_vec()))
+    }
+
     fn submit(
         &mut self,
         now: u64,

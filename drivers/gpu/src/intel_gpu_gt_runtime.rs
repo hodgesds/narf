@@ -218,6 +218,7 @@ struct Owner {
     user_media: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::MediaGtStatus>>>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     eu_info: IrqSafeSpinLock<Option<crate::intel_gpu_eu_stall::Info>>,
+    oa_info: IrqSafeSpinLock<Option<crate::intel_gpu_oa::Device>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
     hwmon: Option<Arc<crate::intel_gpu_hwmon::Monitor>>,
     ccs_control: Option<Arc<crate::intel_gpu_ccs_control::Control>>,
@@ -301,6 +302,76 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 narf_scheduler::yield_now().await;
                 narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
             }
+        })
+    }
+    fn oa_device(&self) -> Option<crate::intel_gpu_oa::Device> {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        let device = *owner.oa_info.lock();
+        device.filter(|device| device.platform == self.platform)
+    }
+    fn oa_control(
+        &self,
+        session: Arc<crate::intel_gpu_oa::Session>,
+        request: crate::intel_gpu_oa::Request,
+    ) -> narf_filesystem::FsFuture<'_, ()> {
+        Box::pin(async move {
+            use narf_filesystem::FsError;
+            let owner = self.owner.upgrade().ok_or(FsError::NoDevice)?;
+            let _awake = Awake::take(&owner).await?;
+            let epoch = owner.user_epoch.load(Ordering::Acquire);
+            let jobs = owner
+                .oa_locked(epoch, &session, |gt, now, access| {
+                    gt.oa_begin(&session, &request, now, access)
+                })
+                .await?;
+            let configured = !jobs.is_empty();
+            // xe_oa_emit_oa_config: each job retires before the next queues.
+            for job in &jobs {
+                let fence = owner
+                    .oa_locked(epoch, &session, |gt, now, _| {
+                        gt.submit_oa_job(now, &session, job)
+                    })
+                    .await?;
+                if fence.wait().await.is_err() {
+                    session.fail(FsError::NoDevice);
+                    return Err(FsError::NoDevice);
+                }
+            }
+            if configured {
+                // NOA_PROGRAM_ADDITIONAL_DELAY_US after the job fence.
+                narf_time::SleepUntil::new(
+                    narf_time::Deadline::after_us(crate::intel_gpu_oa::NOA_DELAY_NS / 1000)
+                        .as_instant(),
+                )
+                .await;
+            }
+            owner
+                .oa_locked(epoch, &session, |gt, now, access| {
+                    gt.oa_finish(&session, &request, now, access)
+                })
+                .await
+        })
+    }
+    fn oa_read<'a>(
+        &'a self,
+        session: Arc<crate::intel_gpu_oa::Session>,
+        output: &'a mut [u8],
+        blocking: bool,
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let epoch = owner.user_epoch.load(Ordering::Acquire);
+            owner
+                .oa_locked(epoch, &session, |gt, _, access| {
+                    gt.oa_read(&session, &mut *output, blocking, access)
+                })
+                .await
         })
     }
     fn huc_version(&self) -> narf_filesystem::FsFuture<'_, (u8, u8, u8)> {
@@ -1291,6 +1362,7 @@ pub(crate) fn start_pending() {
             user_media: Arc::new(IrqSafeSpinLock::new(None)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             eu_info: IrqSafeSpinLock::new(None),
+            oa_info: IrqSafeSpinLock::new(None),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
             hwmon,
             ccs_control,
@@ -1806,6 +1878,10 @@ impl Owner {
                 narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
                     == Ok(Some(narf_bus::pci::PciPowerState::D0))
             });
+            gt.poll_oa(now, || {
+                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+            });
         }
         let current = match polled {
             core::task::Poll::Pending => return Ok(()),
@@ -1833,6 +1909,10 @@ impl Owner {
                     // Optional allocation precedes every heavy startup GGTT
                     // invalidate. No observation address is rebound while live.
                     let _ = gt.prepare_eu_stall(self.pending.index);
+                }
+                if crate::intel_gpu_oa::enabled() {
+                    // The OA buffer is reserved under the same rule.
+                    let _ = gt.prepare_oa();
                 }
                 gt.begin_scheduling_with_ccs_mode(now, state.ccs_mode?)
                     .map_err(RuntimeError::Gt)?;
@@ -1889,7 +1969,9 @@ impl Owner {
                         }
                         gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
                     }
-                    *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
+                    let facts = gt.device_facts().map_err(RuntimeError::Gt)?;
+                    *self.user_facts.lock() = Some(facts);
+                    *self.oa_info.lock() = gt.oa_device(self.pending.index, &facts);
                     *self.eu_info.lock() = gt.eu_stall_info();
                     // Before the epoch: discovery sees VRAM with the engines.
                     if !self.pending.smallbar {
@@ -2979,6 +3061,53 @@ impl Owner {
 
     /// The state, once any runtime-resume bring-up has finished or failed.
     /// The lock is released between polls so the worker can progress.
+    /// One OA step under the running GT owner and current D0/authority,
+    /// retried while a previous close, quiesce or job admission is pending.
+    async fn oa_locked<T>(
+        &self,
+        epoch: u64,
+        session: &crate::intel_gpu_oa::Session,
+        mut step: impl FnMut(
+            &mut ProductionGt,
+            u64,
+            &mut dyn FnMut() -> bool,
+        ) -> Result<T, narf_filesystem::FsError>,
+    ) -> Result<T, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        let deadline = narf_time::monotonic_ns().saturating_add(50_000_000);
+        loop {
+            let mut state = self.lock_running().await;
+            if !crate::intel_gpu_oa::capable() {
+                session.fail(FsError::PermissionDenied);
+                return Err(FsError::PermissionDenied);
+            }
+            if epoch == 0
+                || epoch != self.user_epoch.load(Ordering::Acquire)
+                || state.phase != Phase::Running
+                || self.suspended.load(Ordering::Acquire)
+                || session.device().card != self.pending.index
+            {
+                return Err(FsError::NoDevice);
+            }
+            let gt = state.gt.as_mut().ok_or(FsError::NoDevice)?;
+            let mut access = || {
+                crate::intel_gpu_oa::capable()
+                    && narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                        == Ok(Some(narf_bus::pci::PciPowerState::D0))
+            };
+            let result = step(gt, narf_time::monotonic_ns(), &mut access);
+            if result.as_ref().err() != Some(&FsError::WouldBlock) {
+                return result;
+            }
+            drop(state);
+            if narf_time::monotonic_ns() >= deadline {
+                return Err(FsError::Busy);
+            }
+            narf_scheduler::yield_now().await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+        }
+    }
+
     async fn lock_running(&self) -> narf_lib::mutex::MutexGuard<'_, State> {
         loop {
             let state = self.state.lock().await;
