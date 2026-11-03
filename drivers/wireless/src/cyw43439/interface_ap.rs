@@ -13,7 +13,7 @@ use narf_wireless::ap_control::{
 };
 
 pub(super) struct WakeOwner {
-    signal: IrqSafeSpinLock<Option<Arc<crate::brcmfmac::irq::Signal>>>,
+    pub(super) signal: IrqSafeSpinLock<Option<Arc<crate::brcmfmac::irq::Signal>>>,
 }
 impl alloc::task::Wake for WakeOwner {
     fn wake(self: Arc<Self>) {
@@ -25,25 +25,25 @@ impl alloc::task::Wake for WakeOwner {
         }
     }
 }
-struct Staged {
-    key: narf_wireless::OwnedKey,
-    source: ApEmissionAuthority,
+pub(super) struct Staged {
+    pub(super) key: narf_wireless::OwnedKey,
+    pub(super) source: ApEmissionAuthority,
 }
 #[derive(Default)]
-struct Staging {
-    keys: Vec<Staged>,
-    default: Option<(u8, ApEmissionAuthority)>,
+pub(super) struct Staging {
+    pub(super) keys: Vec<Staged>,
+    pub(super) default: Option<(u8, ApEmissionAuthority)>,
 }
 pub(super) struct Host {
     pub(super) capable: AtomicBool,
     pub(super) mode: AtomicU8,
     pub(super) generation: Arc<AtomicU64>,
-    serial: AtomicU64,
+    pub(super) serial: AtomicU64,
     pub(super) control: Arc<ExclusiveControl>,
-    wake: Arc<WakeOwner>,
-    events: IrqSafeSpinLock<Option<ApEventAuthority>>,
-    staging: IrqSafeSpinLock<Staging>,
-    history: Arc<IrqSafeSpinLock<crate::brcmfmac::ap_key::History>>,
+    pub(super) wake: Arc<WakeOwner>,
+    pub(super) events: IrqSafeSpinLock<Option<ApEventAuthority>>,
+    pub(super) staging: IrqSafeSpinLock<Staging>,
+    pub(super) history: Arc<IrqSafeSpinLock<crate::brcmfmac::ap_key::History>>,
     pub(super) identity: IrqSafeSpinLock<Option<narf_net::iface::NetIfaceSnapshot>>,
     #[cfg(any(test, feature = "kernel-test"))]
     database: IrqSafeSpinLock<Option<Arc<narf_wireless::reg::db::Database>>>,
@@ -327,7 +327,18 @@ impl<R: Fullmac + 'static> Device<R> {
         Ok(source)
     }
     fn stage(&self, operation: Operation, source: ApEmissionAuthority) -> Result<(), Error> {
-        let mut staged = self.lifecycle.ap.staging.lock();
+        self.lifecycle.ap.stage(operation, source)
+    }
+}
+impl Host {
+    /// Keys/default staged before the BSS exists (`brcmf_cfg80211_add_key`
+    /// before `start_ap`); installed by the Session at START.
+    pub(super) fn stage(
+        &self,
+        operation: Operation,
+        source: ApEmissionAuthority,
+    ) -> Result<(), Error> {
+        let mut staged = self.staging.lock();
         if !source.current() {
             return Err(Error::Authority);
         }
@@ -370,6 +381,8 @@ impl<R: Fullmac + 'static> Device<R> {
         }
         Ok(())
     }
+}
+impl<R: Fullmac + 'static> Device<R> {
     pub(super) fn ap_carrier(&self, up: bool) {
         let _publication = self.publication.lock();
         self.bssid.store(0, Ordering::Release);
@@ -464,7 +477,10 @@ impl<R: Fullmac + 'static> Device<R> {
         let serial = self.lifecycle.ap.serial.load(Ordering::Acquire);
         let result = match operation {
             Operation::Start(config, settings) => {
-                if state.ap.is_some() || state.station.ap_station_busy() {
+                if state.ap.is_some()
+                    || state.station.ap_station_busy()
+                    || super::vif::secondary_ap_running(&state.secondaries)
+                {
                     return Err(WirelessError::Busy);
                 }
                 let session = Session::prepare(

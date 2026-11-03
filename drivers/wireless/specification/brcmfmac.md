@@ -1170,9 +1170,60 @@ events from bsscfg 3 only, no primary link/event disturbance, and a
 secondary DEAUTH closing only the secondary port. No real PCIe msgbuf
 secondary-ifidx (flow create/delete, events, IOCTL) fixture exists yet.
 
+#### Secondary AP role
+
+Both transports hold one firmware-SME AP owner per firmware interface
+(`Fullmac::SECONDARY_AP` and the `*_on` AP methods). SDIO BCDC
+(`cyw43439/runtime_ap.rs`) addresses the AP's dcmds with
+`BCDC_DCMD_IF_SHIFT` and its data with BDC `flags2`; its completed
+prefix is that ifidx's unconsumed demux records. PCIe msgbuf
+(`station_transport.rs`) keeps a per-ifidx owner whose leave/quiet/peer
+retirement touch only that ifidx's (ifidx, fifo, da) flows and TX, and
+whose IOCTLs carry `msg.ifidx` (`runtime/ap_ioctl.rs`
+`command_ap_on`). Interface-0 ownership is unchanged. While a secondary
+AP owns an ifidx, `send_vif_data`/`send_data_on` refuse it and
+`vif_close` waits for its leave. `vif_bsscfg::Bsscfg` delegates the AP
+methods to its entry's ifidx, applying the bsscfg iovar rewrite to AP
+Program dcmds and checking its own retained bsscfg records.
+
+`ap_native::Scope::Secondary` mirrors `cfg80211.c`
+`brcmf_cfg80211_start_ap`/`brcmf_cfg80211_stop_ap` for a non-`mbss`
+AP vif: `BRCMF_C_DOWN` + `apsta 0` only when the firmware has neither
+RSDB nor MCHAN (RSDB, the `rsdb_mode` iovar, is not parsed and is
+treated as absent), `mbss 1` before `SET_AP` and `mbss 0` on stop with
+`BRCMF_FEAT_MBSS`, and no `nmode`, `vhtmode` or `qtxpower` writes;
+`wsec`/`wpa_auth`/`auth`/`mfp`/`wsec_key`/`vndr_ie`/`wme_bss_disable` go
+out as bsscfg iovars. Linux never writes `event_msgs` in `start_ap`
+(fweh enables every handled event device-wide); the secondary scope only
+ORs the AP SME events into the current mask and leaves it on stop.
+`Session::prepare_secondary` builds such an AP; the primary Program is
+unchanged and refuses to run through a bsscfg view (`Scope::admits`).
+
+An AP shell (`interface_vif_ap.rs`) owns its own `interface_ap::Host`
+(mode generation, control reservation, staged keys, event source) and,
+after the IF ADD, the same parked secondary `Station` as a STA shell (no
+dcmds: Linux issues none for an AP vif before `start_ap`). Its
+`WirelessNetIface` AP methods reach the primary through
+`Roles::vif_ap_control`, which applies the primary frontend's
+request/emission/fixed-capture checks with the shell as receiver and
+runs the unchanged `Session` operations (start with staged keys, stop,
+beacon, station authorize/delete, key ops, control port TX) on the
+station rebound to the `Bsscfg`. The carrier is up between a committed
+START and STOP/failure. Each worker pass services the session, sends one
+retained shell frame under its original data capture, and delivers
+received data/events after the state lock, each behind the bsscfg's
+completed-prefix final check. Removal stops a running AP first; a failed
+stop fail-stops the bsscfg and the ifidx's AP owner retires its own
+flows/TX (`ap_leave_on`) before `vif_close`. Only one AP may run: a
+secondary START is refused beside the primary or another secondary AP
+(Linux `vif->mbss` path not implemented), and a primary START is refused
+while a secondary AP runs. Known gaps: a primary station roam-policy
+change rewrites the shared `event_msgs` without the secondary AP bits;
+channel agreement with a primary STA is left to the firmware (no mchan
+scheduling).
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: per-bsscfg role
-owners (the AP `Session` and `Station` are primary-bsscfg only), and for
+either family: secondary-ifidx fixtures and advertisement, and for
 P2P the `p2p.c` discovery bsscfg (`p2p_disc`, `p2p_ifadd`/`p2p_ifdel`,
 `bsscfg:p2p_da_override`), action-frame TX/RX and GO negotiation owners.
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are

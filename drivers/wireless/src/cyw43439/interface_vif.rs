@@ -25,8 +25,10 @@
 //! parked over `vif_bsscfg::Parked` and rebound to a
 //! `vif_bsscfg::Bsscfg` for each scan/join/disconnect (under the primary
 //! state mutex, through [`Roles`]) and for each worker pass (`poll`). Its
-//! correlated `set_link` peer is the shell carrier. An AP shell has no
-//! per-bsscfg AP owner yet and keeps refusing every role operation.
+//! correlated `set_link` peer is the shell carrier. An AP shell owns a
+//! secondary-bsscfg firmware-SME AP (`interface_vif_ap.rs`): the same
+//! parked station rebound to the adapter carries a `brcmfmac::ap::Session`
+//! in the secondary scope, and AP control reaches it through [`Roles`].
 
 use super::{wireless_error, Device, Fullmac, State};
 use crate::brcmfmac::{
@@ -70,6 +72,15 @@ const GONE: u8 = 4;
 static SHELLS: IrqSafeSpinLock<Vec<Arc<VifDevice>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_COOKIE: AtomicU64 = AtomicU64::new(1);
 
+#[path = "interface_vif_ap.rs"]
+mod vif_ap;
+
+/// Some secondary bsscfg runs a firmware-SME AP. The primary AP Program
+/// (device-wide DOWN/apsta/PHY modes) must not start beside it.
+pub(super) fn secondary_ap_running<R: Fullmac>(secondaries: &[Secondary<R>]) -> bool {
+    secondaries.iter().any(|slot| slot.ap.is_some())
+}
+
 /// Persistent secondary station role of one live STA shell (`struct
 /// brcmf_cfg80211_vif` of a `NL80211_IFTYPE_STATION` additional interface).
 pub(super) struct Secondary<R: Fullmac> {
@@ -78,6 +89,9 @@ pub(super) struct Secondary<R: Fullmac> {
     /// `None` only while an operation holds it rebound, or after such an
     /// operation was cancelled mid-flight (the role is then retired).
     station: Option<Station<Parked<R>>>,
+    /// AP shell: its secondary-bsscfg firmware-SME AP between START/STOP.
+    ap: Option<Box<crate::brcmfmac::ap::Session>>,
+    ap_tx: vif_ap::PendingTx,
 }
 
 /// Type-erased primary role entry points for the non-generic shell.
@@ -96,6 +110,14 @@ pub(super) trait Roles: Send + Sync {
         request: AssociateRequest,
     ) -> Result<Option<[u8; 6]>, WirelessError>;
     async fn vif_disassociate(&self, cookie: u64) -> Result<(), WirelessError>;
+    /// AP control of an AP shell (`brcmf_cfg80211_start_ap` etc. on its
+    /// secondary `ifp`).
+    async fn vif_ap_control(
+        &self,
+        shell: Arc<VifDevice>,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        operation: vif_ap::Operation,
+    ) -> Result<bool, WirelessError>;
 }
 
 /// Published primaries, for a shell to reach its wiphy's role owner.
@@ -164,7 +186,9 @@ fn secondary_poll<R: Fullmac>(
 
 /// `brcmf_cfg80211_add_iface` role attach after the IF ADD: a STA shell
 /// gets its secondary station with the per-interface dcmds issued on its
-/// own ifidx; an AP shell has no per-bsscfg owner (it stays refusing).
+/// own ifidx; an AP shell gets the same parked role state (Linux issues no
+/// dcmd for an AP vif before `start_ap`) and its AP host becomes capable
+/// when the transport has per-ifidx AP owners.
 async fn attach_role<R: Fullmac>(
     runtime: &mut R,
     owner: &mut Owner,
@@ -173,14 +197,26 @@ async fn attach_role<R: Fullmac>(
     entry: Entry,
     template: Option<Station<Parked<R>>>,
 ) -> bool {
-    if shell.role == Role::Ap {
-        return true;
-    }
     let Some(mut parked) = template else {
         return false;
     };
     parked.mac = entry.mac;
     let mut link = Link::new(entry);
+    if shell.role == Role::Ap {
+        if !R::SECONDARY_AP {
+            return false;
+        }
+        secondaries.push(Secondary {
+            cookie: shell.cookie,
+            link,
+            station: Some(parked),
+            ap: None,
+            ap_tx: None,
+        });
+        shell.ap.mode.store(3, Ordering::Release);
+        shell.ap.capable.store(true, Ordering::Release);
+        return true;
+    }
     let (mut bound, rest) = parked.rebind(Bsscfg::new(runtime, owner, &mut link));
     let configured = bound.configure_secondary().await.is_ok();
     let (parked, _) = bound.rebind(rest);
@@ -189,6 +225,8 @@ async fn attach_role<R: Fullmac>(
             cookie: shell.cookie,
             link,
             station: Some(parked),
+            ap: None,
+            ap_tx: None,
         });
     }
     configured
@@ -247,6 +285,10 @@ pub struct VifDevice {
     rx_producer: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     tx_consumer: IrqSafeSpinLock<Option<Consumer<Frame, TX_RING_N>>>,
     pending: IrqSafeSpinLock<Option<Frame>>,
+    /// AP shell host state (mode generation, control, staging, events).
+    ap: super::ap::Host,
+    /// Last AP data generation whose queued frames are current.
+    ap_data: AtomicU64,
 }
 
 impl core::fmt::Debug for VifDevice {
@@ -293,6 +335,7 @@ impl VifDevice {
     /// every publication (`unregister_netdev`; the name is not retained for
     /// a rebind: a secondary interface is not recreated by a reset).
     fn unpublish(&self) {
+        self.ap.retire();
         {
             let _publication = self.publication.lock();
             self.closing.store(true, Ordering::Release);
@@ -481,6 +524,8 @@ impl<R: Fullmac + 'static> Device<R> {
             rx_producer: IrqSafeSpinLock::new(Some(rx_producer)),
             tx_consumer: IrqSafeSpinLock::new(Some(tx_consumer)),
             pending: IrqSafeSpinLock::new(None),
+            ap: super::ap::Host::new(),
+            ap_data: AtomicU64::new(0),
         });
         if narf_net::iface::lookup(name).is_some()
             || narf_wireless::registry::list()
@@ -510,6 +555,7 @@ impl<R: Fullmac + 'static> Device<R> {
         }
         let pending = shells(R::FAMILY);
         let mut delivered: Vec<(Arc<VifDevice>, Vec<u8>)> = Vec::new();
+        let mut ap_delivered: Vec<vif_ap::Delivery> = Vec::new();
         {
             let Some(mut state) = self.state.try_lock() else {
                 return;
@@ -527,7 +573,7 @@ impl<R: Fullmac + 'static> Device<R> {
             // (one create is in flight at a time).
             let mut template = pending
                 .iter()
-                .any(|shell| shell.phase() == CREATING && shell.role == Role::Station)
+                .any(|shell| shell.phase() == CREATING)
                 .then(|| station.secondary([0; 6]));
             let runtime = &mut station.runtime;
             if owner.service(runtime).is_err() {
@@ -579,6 +625,14 @@ impl<R: Fullmac + 'static> Device<R> {
                             shell.finish();
                             continue;
                         };
+                        // brcmf_cfg80211_del_ap_iface: a running AP is
+                        // stopped on its bsscfg before the interface goes.
+                        if let Some(slot) = secondaries
+                            .iter_mut()
+                            .find(|slot| slot.cookie == shell.cookie && slot.ap.is_some())
+                        {
+                            vif_ap::secondary_ap_stop(runtime, owner, slot).await;
+                        }
                         // brcmf_cfg80211_del_apsta_iface. A refused or
                         // unanswered remove keeps the firmware bsscfg counted
                         // by the owner; the host side still closes its data.
@@ -590,6 +644,19 @@ impl<R: Fullmac + 'static> Device<R> {
                     }
                     CLOSING => {
                         let ifidx = shell.entry().map(|entry| entry.ifidx);
+                        // A secondary AP owner first retires its own
+                        // flows/TX terminals (the bsscfg is gone).
+                        if shell.role == Role::Ap {
+                            match ifidx.map(|ifidx| runtime.ap_leave_on(ifidx)) {
+                                Some(Ok(false)) => continue,
+                                Some(Err(_)) => {
+                                    runtime.fail();
+                                    shell.finish();
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         match ifidx.map(|ifidx| runtime.vif_close(ifidx)) {
                             Some(Ok(false)) => {}
                             Some(Err(_)) => {
@@ -624,6 +691,35 @@ impl<R: Fullmac + 'static> Device<R> {
                                 continue;
                             }
                         }
+                        if shell.role == Role::Ap {
+                            // The AP Session owns this ifidx's data.
+                            let alive = match secondaries
+                                .iter_mut()
+                                .find(|slot| slot.cookie == shell.cookie)
+                            {
+                                Some(slot) => {
+                                    vif_ap::secondary_ap_pass(
+                                        runtime,
+                                        owner,
+                                        slot,
+                                        shell,
+                                        &mut ap_delivered,
+                                    )
+                                    .await
+                                }
+                                None => false,
+                            };
+                            if !alive
+                                && owner.registry().by_bsscfgidx(entry.bsscfgidx) == Some(entry)
+                            {
+                                shell.unpublish();
+                                shell.phase.store(REMOVING, Ordering::Release);
+                            } else if !alive {
+                                shell.unpublish();
+                                shell.phase.store(CLOSING, Ordering::Release);
+                            }
+                            continue;
+                        }
                         let up = shell.up.load(Ordering::Acquire);
                         for _ in 0..PUMP_BUDGET {
                             let Some(frame) = runtime.pop_vif_data(entry.ifidx) else {
@@ -648,6 +744,7 @@ impl<R: Fullmac + 'static> Device<R> {
             });
         }
         // No state or ring guard survives the stack callback.
+        self.secondary_ap_deliver(ap_delivered);
         for (shell, mut bytes) in delivered {
             let epoch = shell.epoch.load(Ordering::Acquire);
             let frame = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
@@ -715,6 +812,15 @@ impl<R: Fullmac + 'static> Roles for Device<R> {
     async fn vif_disassociate(&self, cookie: u64) -> Result<(), WirelessError> {
         let mut state = self.state.lock().await;
         with_secondary!(state, cookie, |station| station.disconnect().await).map_err(wireless_error)
+    }
+    async fn vif_ap_control(
+        &self,
+        shell: Arc<VifDevice>,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        operation: vif_ap::Operation,
+    ) -> Result<bool, WirelessError> {
+        self.secondary_ap_control(&shell, authority, operation)
+            .await
     }
 }
 
@@ -870,5 +976,151 @@ impl WirelessNetIface for VifDevice {
     }
     async fn set_config(&self, _: WirelessConfig) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
+    }
+    // An AP shell: firmware-SME AP on its own bsscfg (`vif_ap`).
+    fn supports_ap(&self) -> bool {
+        self.ap_capable()
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        false
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        self.ap_capable()
+    }
+    fn ap_sme_capabilities(&self) -> Option<u32> {
+        self.ap_capable().then_some(0)
+    }
+    fn max_ap_assoc_sta(&self) -> u32 {
+        if self.ap_capable() {
+            8
+        } else {
+            0
+        }
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        if !self.ap_capable() {
+            return Err(WirelessError::NotSupported);
+        }
+        self.ap.control.try_reserve().map(Some)
+    }
+    async fn start_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), WirelessError> {
+        self.start_ap_with_settings_async(
+            authority,
+            config,
+            narf_wireless::ApStartSettings::default(),
+        )
+        .await
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_operation(
+            authority,
+            vif_ap::Operation::Start(Box::new(config), Box::new(settings)),
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_operation(authority, vif_ap::Operation::Stop)
+            .await
+            .map(|_| ())
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_operation(authority, vif_ap::Operation::Beacon(head, tail, probe))
+            .await
+            .map(|_| ())
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_operation(authority, vif_ap::Operation::Set(station))
+            .await
+            .map(|_| ())
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_operation(authority, vif_ap::Operation::Delete(peer, reason))
+            .await
+            .map(|_| ())
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_operation(authority, vif_ap::Operation::Key(key))
+            .await
+            .map(|_| ())
+            .map_err(super::ap::errno)
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_operation(
+            authority,
+            vif_ap::Operation::DeleteKey(index, pairwise, peer),
+        )
+        .await
+        .map(|_| ())
+        .map_err(super::ap::errno)
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_operation(
+            authority,
+            vif_ap::Operation::DefaultKey(index, (unicast, multicast, management, beacon)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(super::ap::errno)
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_operation(authority, vif_ap::Operation::Control(request))
+            .await
+            .map_err(super::ap::errno)
     }
 }
