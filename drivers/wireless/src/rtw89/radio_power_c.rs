@@ -254,6 +254,10 @@ impl SixGhzPower {
     pub(super) fn regd(self) -> u8 {
         self.regd
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn for_test(regd: u8, power: u8) -> Self {
+        Self { regd, power }
+    }
     pub(super) fn power(self) -> u8 {
         self.power
     }

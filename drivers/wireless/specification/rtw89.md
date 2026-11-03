@@ -3171,7 +3171,9 @@ state is Linux's default without a country: regd `RTW89_WW`, no SAR, no
 DA tables, no 6GHz TPE. NARF has no static rtw8852c_table.c power tables:
 missing BYRATE, LMT_{2,5}GHZ, LMT_RU_{2,5}GHZ or TX_SHAPE_LMT is refused
 (the shipped rtw8852c_fw-{1,2}.bin carry all, fw-2 also RFE-5 limit and
-shape elements); 6GHz and RFE 255 are refused (`Policy`). It is register
+shape elements); RFE 255 is refused (`Policy`), and `from_elements` refuses a
+6GHz profile (6GHz needs `from_elements_6ghz`, "C 6GHz power and records"
+below). It is register
 configuration only, never a conducted-power or regulatory claim.
 Unexecuted cases:
 `smoke_rtw89_c_txpwr_selection_follows_rtw89_fw_recognize_txpwr_from_elm`,
@@ -3710,6 +3712,64 @@ wide link; passive-only spans join at 20MHz. Unexecuted cases:
 160MHz part), `smoke_rtw89_b_packet_rx_width_follows_programmed_channel`
 (C 160MHz part).
 
+**C 6GHz power and records (`six_ghz_operation`, partial).** RTL8852C
+`support_bands` includes 6GHz; the C channel geometry, `channel_c` BB/MAC
+(MUIC, CDD, RF_B TX path at 6GHz), `rfk::c_channel` RF and the IQK/TSSI/DPK
+6GHz tables already carry it. *Power:*
+`radio_power_c::Plan::from_elements_6ghz(elements, rfe, profile, power, tpe)`
+is `rtw8852c_set_txpwr` on a typed 6GHz profile: byrate `byr[RTW89_BAND_6G][0]`
+(CCK still from 2.4GHz), TXPWR_LMT_6GHZ (id 12, 8-byte
+`rtw89_fw_txpwr_lmt_6ghz_entry`, `fw_txpwr_lmt_6ghz_entry_valid` with
+`RTW89_6G_BW_NUM` 5 and `RTW89_6G_CH_NUM` 120) and LMT_RU_6GHZ (id 15)
+read as phy.c `rtw89_phy_read_txpwr_limit{,_ru}` for `RTW89_BAND_6G`:
+`[regd][reg_6ghz_power][rtw89_channel_6g_to_idx]`, else
+`[RTW89_WW][RTW89_REG_6GHZ_POWER_DFLT]`, then `min3(rf_to_mac, 63, cstr)`;
+TX shape uses the 6GHz regd and `reg6_pwr` (`rtw89_get_tx_shape_idx`); no
+CCK DFIR on 6GHz (`rtw8852c_set_tx_shape`). `SixGhzPower::new(elements,
+country, ap_power_type)` is regd.c for a PCIe device whose rtw89 ACPI DSM
+calls all fail: the country map is the container's last REGD element (id
+20, fw.c `rtw89_recognize_regd_from_elm`, at most
+`RTW89_REGD_MAX_COUNTRY_NUM` entries; the shipped `rtw8852c_fw-2.bin`
+carries 242); NARF has no static `rtw89_regd_map`, so a container without
+one admits no 6GHz (`Table`). An unknown country is `rtw89_ww_regd`
+(`regd_is_6ghz_blocked`) and a 6GHz rule of `RTW89_NA` is
+`regd_is_6ghz_not_applicable`: both refused. `rtw89_regd_get` maps UK to
+ETSI (`txpwr_uk_follow_etsi` true without ACPI). VLP/LPI/SP map to
+`RTW89_REG_6GHZ_POWER_{VLP,LPI,STD}`; VLP is blocked for US/CA
+(`rtw89_regd_setup_policy_6ghz_vlp` default), SP is not blocked
+(`block_6ghz_sp` stays clear without ACPI), an unset AP type is DFLT. The
+TPE constraint (regd.c `rtw89_reg_6ghz_tpe_recalc`, STD only, below
+`RTW89_MIN_VALID_POWER_CONSTRAINT` refused) enters as phy.c
+`rtw89_phy_get_tpe_constraint` (`dbm_without_tolerance`, `dbm_to_mac`).
+`Plan::bind` is unchanged for 2.4/5GHz; a 6GHz plan binds its regd/power
+and the TPE-free pages (a TPE only lowers `min3`). *Records:*
+`radio_policy_c` adds the 6GHz `N5CC` v1 record
+(`rtw89/rtw8852c-chan-v1-6g-ch<primary>-bw<width>-regd<NN>-<vlp|lpi|sp>-<mac>.bin`,
+B's 128-byte layout with band 2, bytes 70/71 = `reg_6ghz_power`/regd) for
+every typed 6GHz profile (`noninitial_6ghz`: 59 primaries x 20/40/80/160MHz)
+and power type (`POWER_TYPES_6GHZ`; unset is never admitted, as cfg80211
+refuses it before a 6GHz BSS is usable). The identity (`Board::new`, 6GHz
+domain string) binds the 6GHz plan and an HE-only 6GHz station recipe
+instead of the HT/VHT wide fingerprints; the binding adds power/regd. Records
+are keyed by (profile, `SixGhzPower`): `channel_{allowed,active}_6ghz`,
+`select_6ghz`, `active_six_ghz`, `six_ghz_contexts`; the 2.4/5GHz methods
+and bytes are unchanged. The 6GHz envelope additionally requires every rule
+over the span to admit a client of the record's power type (cfg80211
+`cfg80211_6ghz_power_type_valid`: `NO_6GHZ_VLP_CLIENT`/`NO_6GHZ_AFC_CLIENT`)
+and accepts INDOOR_ONLY only together with the trusted DEPLOYMENT_INDOOR
+assertion; DFS/NO_IR stay passive (no frame TX, as 5GHz). Formats only: no C
+board value is carried. *Not yet implemented (the row stays open):* the
+native 6GHz preflight/retune (`preflight_radio_c` does not stage 6GHz
+records; `retune_radio_c` and `radio_c::Radio::{prepare,retune}` still
+refuse 6GHz, and `Native::channel` is a bare primary number that cannot
+name a 6GHz channel), the station 6GHz path (6GHz scan with PSC/RNR rules,
+`association::six_ghz::admit_with_rule` + `JoinPlan::prepare_6ghz`, HE 6GHz
+Band Capabilities, HE-only RA on `RTW89_BAND_6G`, mac80211 TPE parsing into
+the plan) and 6GHz band advertisement. RTL8922A 6GHz belongs to the
+separate open RTL8922A chip row. Unexecuted cases:
+`smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g`,
+`smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`.
+
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s
 `rtw89_fw_h2c_init_ba_cam` -> fw.c `rtw89_fw_h2c_init_dynamic_ba_cam_v0_ext`:
@@ -3988,7 +4048,7 @@ triage above remains separate from implementation.
 | `monitor_mode` | The admitted RTL8852B receive-only role/native/raw-radiotap owner is implemented in §3 with original source/registration/role/capture epochs, actual RF channel/PHYSTS program and fresh physical transitions. Four source cases and software/native/physical acceptance are pending; no active/injection or other chip/channel/width profile is claimed. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
 | `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |
-| `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |
+| `six_ghz_operation` | Only RTL8852C/RTL8922A have 6GHz applicability. RTL8852C: the 6GHz TX power program (regd.c 6GHz policy, `reg_6ghz_power`, TPE) and the signed 6GHz `N5CC` records with per-power-type client admission exist ("C 6GHz power and records"); the native 6GHz preflight/retune, the station 6GHz scan/association (`JoinPlan::prepare_6ghz`, HE 6GHz capability, HE-only RA, TPE parsing) and band advertisement remain missing. RTL8922A 6GHz is part of the open RTL8922A chip row. The retained B profile is 2.4GHz-only in software. |
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), and the AP MAC/firmware control owner (`ap_control.rs`: port program, CAM, CMAC/DMAC tables, MACID pause, peer MACIDs, BCN_UPD, start/stop; §3 "RTL8852B AP MAC/firmware control owner") exist, but no native caller, signed AP channel/power admission, multi-peer TXWD/RX MACID path, HIQ/CH9 ring or public AP controls compose them. |
 | `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
 | `rtl8852a` | AX identity, power and firmware scaffolds do not establish this chip's native station. The retained Controller and N52B qualification admit RTL8852B only; A still needs its exact security/firmware, BB/RF/calibration/power and packet/station composition. |

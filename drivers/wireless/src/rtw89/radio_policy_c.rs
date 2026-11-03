@@ -10,8 +10,16 @@
 //!   128 bytes): one noninitial typed `operating_channel_c::Profile` (band,
 //!   primary, width, centre). Every 2.4GHz 20MHz primary 2..=13, 2.4GHz HT40
 //!   either side and every 5GHz 20/40/80/160MHz block may carry one; channel
-//!   14 (CCK-only) and 6GHz (refused by `radio_power_c`) never do. Its
-//!   binding covers the base record digest/signer, which must also sign it.
+//!   14 (CCK-only) never does. Its binding covers the base record
+//!   digest/signer, which must also sign it.
+//! * 6GHz `N5CC` v1 (`rtw89/rtw8852c-chan-v1-6g-ch<primary>-bw<width>-regd<NN>-
+//!   <vlp|lpi|sp>-<mac>.bin`): one typed 6GHz profile (20/40/80/160MHz)
+//!   under one `radio_power_c::SixGhzPower` (the country's rtw89 6GHz regd
+//!   and `reg_6ghz_power`), bytes 70/71 = power/regd. The envelope check
+//!   additionally requires every rule over the span to admit a client of
+//!   that power type (cfg80211 `cfg80211_6ghz_power_type_valid`:
+//!   `NO_6GHZ_VLP_CLIENT`/`NO_6GHZ_AFC_CLIENT`), and accepts INDOOR_ONLY
+//!   only with the trusted DEPLOYMENT_INDOOR assertion.
 //!
 //! Each record's peaks/antenna/ceiling are checked against the current host
 //! rule over the profile's whole occupied span: every overlapping rule must
@@ -24,7 +32,11 @@
 //! and an unprovisioned board stays unadmitted.
 use super::operating_channel_c::{Band, Profile, Width};
 use super::radio_policy::{Lifecycle, Program};
-use super::{factory::Factory, radio_assets::Assets, radio_power_c::Plan};
+use super::{
+    factory::Factory,
+    radio_assets::Assets,
+    radio_power_c::{Plan, SixGhzPower},
+};
 use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
@@ -114,6 +126,8 @@ fn domain(profile: Profile) -> &'static [u8] {
         b"NARF RTL8852C initial full RF ch1 20MHz awake WLAN-only v1;TX-A,RX-AB;no hardwarecrypto;onefreshPCI lifecycle"
     } else if profile.band() == Band::Ghz5 {
         b"NARF RTL8852C 5GHz full RF awake WLAN-only v1;TX-A,RX-AB;no CCK;no hardwarecrypto;retuned across band from Ready ch1 program"
+    } else if profile.band() == Band::Ghz6 {
+        b"NARF RTL8852C 6GHz full RF awake WLAN-only v1;TX path RF_B (rtw8852c_ctrl_tx_path_tmac),RX-AB;no CCK;no hardwarecrypto;HE-only;retuned across band from Ready ch1 program"
     } else {
         b"NARF RTL8852C noninitial full RF 2.4GHz awake WLAN-only v1;TX-A,RX-AB;no hardwarecrypto;retuned from Ready ch1 program"
     }
@@ -133,6 +147,38 @@ pub(super) fn admissible(profile: Profile) -> bool {
         Band::Ghz2 => profile.primary() != 14,
         Band::Ghz5 => true,
         Band::Ghz6 => false,
+    }
+}
+/// Typed 6GHz profiles a 6GHz `N5CC` record may admit (with a power
+/// context): every 6GHz 20/40/80/160MHz block (`operating_channel_c`).
+pub(super) fn admissible_6ghz(profile: Profile) -> bool {
+    profile.band() == Band::Ghz6
+}
+/// Every typed 6GHz profile, in a fixed order.
+pub(super) fn noninitial_6ghz() -> alloc::vec::Vec<Profile> {
+    let mut out = alloc::vec::Vec::new();
+    for primary in (1..=233).filter(|&p| super::operating_channel_c::is_6ghz_primary(p)) {
+        out.extend(Profile::new20(Band::Ghz6, primary));
+        for width in [Width::Mhz40, Width::Mhz80, Width::Mhz160] {
+            out.extend(Profile::new_wide(Band::Ghz6, primary, width));
+        }
+    }
+    out
+}
+/// The power types a 6GHz record may be measured for (an unset AP type is
+/// refused by cfg80211 before a 6GHz BSS is usable).
+pub(super) const POWER_TYPES_6GHZ: [narf_wireless::reg::PowerType6Ghz; 3] = [
+    narf_wireless::reg::PowerType6Ghz::Vlp,
+    narf_wireless::reg::PowerType6Ghz::Lpi,
+    narf_wireless::reg::PowerType6Ghz::Sp,
+];
+/// `reg_6ghz_power` back to the cfg80211 client power type it admits.
+fn client_type(six: SixGhzPower) -> narf_wireless::reg::PowerType6Ghz {
+    use narf_wireless::reg::PowerType6Ghz;
+    match six.power() {
+        1 => PowerType6Ghz::Lpi,
+        2 => PowerType6Ghz::Sp,
+        _ => PowerType6Ghz::Vlp,
     }
 }
 /// Every noninitial admissible profile, in a fixed order.
@@ -160,6 +206,8 @@ pub(super) struct Board {
     mac: [u8; 6],
     device: u16,
     profile: Profile,
+    /// 6GHz only: the power context the record identity binds.
+    six: Option<SixGhzPower>,
 }
 impl Board {
     /// Identity of the full C program on `power.channel()`: the C cold
@@ -175,7 +223,13 @@ impl Board {
         phycap: &super::firmware_phycap::Receipt,
     ) -> Result<Self, Error> {
         let profile = power.channel();
-        if !admissible(profile) || !phycap.is_c() {
+        let six = power.six_ghz().map(|(p, _)| p);
+        let admitted = if six.is_some() {
+            admissible_6ghz(profile)
+        } else {
+            admissible(profile)
+        };
+        if !admitted || !phycap.is_c() {
             return Err(Error::Identity);
         }
         phycap.initial_profile().map_err(|_| Error::Identity)?;
@@ -186,15 +240,23 @@ impl Board {
         h.update(&base.identity());
         h.update(&phycap.fingerprint());
         h.update(RECIPE);
-        // A 40/80MHz record also binds the shared wide station capability
-        // its channel lets the station offer (`station_control::wide_phy`).
-        if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {
-            h.update(&super::station_control::wide_fingerprint());
-        }
-        // A 160MHz record binds the C 160MHz station capability and RA
-        // recipe (`station_control::wide160_fingerprint`) instead.
-        if profile.width() == Width::Mhz160 {
-            h.update(&super::station_control::wide160_fingerprint());
+        if six.is_some() {
+            // A 6GHz record binds the HE-only 6GHz station recipe: HE
+            // Capabilities + HE 6GHz Band Capabilities, no HT/VHT element
+            // (mac80211 `ieee80211_add_link_elems` on 6GHz).
+            h.update(SIX_GHZ_STATION);
+        } else {
+            // A 40/80MHz record also binds the shared wide station
+            // capability its channel lets the station offer
+            // (`station_control::wide_phy`).
+            if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {
+                h.update(&super::station_control::wide_fingerprint());
+            }
+            // A 160MHz record binds the C 160MHz station capability and RA
+            // recipe (`station_control::wide160_fingerprint`) instead.
+            if profile.width() == Width::Mhz160 {
+                h.update(&super::station_control::wide160_fingerprint());
+            }
         }
         power.bind(&mut h);
         h.update(&[
@@ -215,7 +277,11 @@ impl Board {
             mac: base.mac(),
             device: device.device,
             profile,
+            six,
         })
+    }
+    pub(super) fn six_ghz(&self) -> Option<SixGhzPower> {
+        self.six
     }
     pub fn identity(&self) -> [u8; 32] {
         self.identity
@@ -235,9 +301,14 @@ impl Board {
     }
 }
 
+/// The 6GHz station recipe a 6GHz record identity binds.
+const SIX_GHZ_STATION: &[u8] = b"NARF RTL8852C HE-only 6GHz station v1;HE cap + HE 6GHz band cap (ieee80211_he_6ghz_capa);no HT/VHT;RA HE-only (rtw89_phy_ra_sta_update, RTW89_BAND_6G)";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Envelope {
     span: (u32, u32),
+    /// 6GHz only: the client power type every overlapping rule must admit.
+    client: Option<narf_wireless::reg::PowerType6Ghz>,
     width: u32,
     antenna_qdb: i16,
     ceiling_qdbm: i16,
@@ -250,10 +321,11 @@ impl CapOp<FirmwareBlob, Read> for Current {
         Ok(())
     }
 }
-fn envelope(bytes: &[u8], profile: Profile) -> Result<Envelope, Error> {
+fn envelope(bytes: &[u8], profile: Profile, six: Option<SixGhzPower>) -> Result<Envelope, Error> {
     let signed = |at: usize| i16::from_le_bytes([bytes[at], bytes[at + 1]]);
     let e = Envelope {
         span: profile.occupied(),
+        client: six.map(client_type),
         width: profile.width().mhz(),
         antenna_qdb: signed(58),
         ceiling_qdbm: signed(60),
@@ -281,7 +353,9 @@ struct Channel {
     envelope: Envelope,
 }
 fn channel_recipe(profile: Profile) -> &'static [u8] {
-    if profile.band() == Band::Ghz5 {
+    if profile.band() == Band::Ghz6 {
+        b"RTL8852C 6GHz noninitial full operating program v1; __rtw89_set_channel with btc switch band and rtw8852c_tssi_scan on a band change, then rtw8852c_rfk_channel on a Ready owner; actual primary/width 6GHz regd/reg_6ghz_power limits and RU limits (TPE only lowers them), no CCK; worst-case peaks/antenna cover all calibration emissions on this profile under the current host rule and client power type over the whole occupied span"
+    } else if profile.band() == Band::Ghz5 {
         b"RTL8852C 5GHz noninitial full operating program v1; __rtw89_set_channel with btc switch band and rtw8852c_tssi_scan on a band change, then rtw8852c_rfk_channel on a Ready owner; actual primary/width WW0 limits and RU limits, no CCK; worst-case peaks/antenna cover all calibration emissions on this profile under the current host rule over the whole occupied span"
     } else {
         b"RTL8852C 2.4GHz noninitial full operating program v1; __rtw89_set_channel then rtw8852c_rfk_channel on a Ready owner; same band, no band-change TSSI scan; actual primary/width WW0 CCK/OFDM limits, SCO CCK and TX shape; worst-case peaks/antenna cover all calibration emissions on this profile under the current host rule over the whole occupied span"
@@ -289,8 +363,12 @@ fn channel_recipe(profile: Profile) -> &'static [u8] {
 }
 fn binding(base: &Qualification, board: Board) -> Result<[u8; 32], Error> {
     let profile = board.profile;
+    let admitted = match board.six {
+        Some(_) => admissible_6ghz(profile),
+        None => admissible(profile),
+    };
     if profile == Profile::INITIAL
-        || !admissible(profile)
+        || !admitted
         || board.mac != base.board.mac
         || board.device != base.board.device
     {
@@ -309,6 +387,9 @@ fn binding(base: &Qualification, board: Board) -> Result<[u8; 32], Error> {
     hash.update(&base.record_digest);
     hash.update(&base.record_signer);
     hash.update(channel_recipe(profile));
+    if let Some(six) = board.six {
+        hash.update(&[six.power(), six.regd()]);
+    }
     Ok(hash.finalize())
 }
 /// Firmware name of the `N5CC` record for `profile` on `mac`.
@@ -319,6 +400,31 @@ pub(super) fn channel_name(profile: Profile, mac: [u8; 6]) -> alloc::string::Str
         if profile.band() == Band::Ghz5 { 5 } else { 2 },
         profile.primary(),
         width_mhz(profile.width()),
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
+    )
+}
+/// Firmware name of the 6GHz `N5CC` record for `profile` under `six`.
+pub(super) fn channel_name_6ghz(
+    profile: Profile,
+    six: SixGhzPower,
+    mac: [u8; 6],
+) -> alloc::string::String {
+    let m = mac;
+    format!(
+        "rtw89/rtw8852c-chan-v1-6g-ch{:03}-bw{}-regd{:02}-{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+        profile.primary(),
+        width_mhz(profile.width()),
+        six.regd(),
+        match six.power() {
+            1 => "lpi",
+            2 => "sp",
+            _ => "vlp",
+        },
         m[0],
         m[1],
         m[2],
@@ -349,7 +455,8 @@ impl Channel {
             || bytes[14..16] != base.board.device.to_le_bytes()
             || bytes[54..58] != [1, width_mhz(p.width()), p.primary(), BASE_FLAGS]
             || bytes[68..70] != [p.band() as u8, p.center()]
-            || bytes[70..] != [0; 58]
+            || bytes[70..72] != board.six.map_or([0, 0], |s| [s.power(), s.regd()])
+            || bytes[72..] != [0; 56]
         {
             return Err(Error::Format);
         }
@@ -360,7 +467,7 @@ impl Channel {
             authority,
             board,
             binding,
-            envelope: envelope(bytes, p)?,
+            envelope: envelope(bytes, p, board.six)?,
         })
     }
     fn current(&self) -> Result<(), Error> {
@@ -400,8 +507,9 @@ pub(super) struct Qualification {
     /// Byte 57 of the base record: base flags plus enabled `PROGRAMS`.
     flags: u8,
     channels: alloc::vec::Vec<Channel>,
-    /// Profile whose envelope gates every publication.
-    active: narf_lib::sync::IrqSafeSpinLock<Profile>,
+    /// Profile (and 6GHz power context) whose envelope gates every
+    /// publication.
+    active: narf_lib::sync::IrqSafeSpinLock<(Profile, Option<SixGhzPower>)>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<alloc::sync::Arc<RegulatoryDomain>>,
 }
@@ -456,7 +564,7 @@ impl Qualification {
         if bytes[16..48] != extended.identity || bytes[48..54] != board.mac {
             return Err(Error::Identity);
         }
-        let envelope = envelope(bytes, Profile::INITIAL)?;
+        let envelope = envelope(bytes, Profile::INITIAL, None)?;
         let mut digest = narf_crypto::sha256::Sha256::new();
         digest.update(bytes);
         Ok(Self {
@@ -467,7 +575,7 @@ impl Qualification {
             record_signer,
             flags,
             channels: alloc::vec::Vec::new(),
-            active: narf_lib::sync::IrqSafeSpinLock::new(Profile::INITIAL),
+            active: narf_lib::sync::IrqSafeSpinLock::new((Profile::INITIAL, None)),
             #[cfg(any(test, feature = "kernel-test"))]
             model_domain: None,
         })
@@ -485,9 +593,37 @@ impl Qualification {
     /// Load the optional `N5CC` record for `board.profile()` (a noninitial
     /// identity from [`Board::new`]). Absent: `Ok(false)`, unadmitted.
     pub(super) fn load_channel(&mut self, board: Board) -> Result<bool, Error> {
+        if board.six.is_some() {
+            return Err(Error::Identity);
+        }
         binding(self, board)?;
         let name = channel_name(board.profile, self.board.mac);
-        let cap = match narf_firmware::open(&name, &loader()?) {
+        self.load_named(&name, board)
+    }
+    /// Whether a 6GHz `N5CC` record for `profile` under `six` is
+    /// provisioned (named lookup only; nothing is decoded or installed).
+    pub(super) fn has_channel_6ghz(
+        &self,
+        profile: Profile,
+        six: SixGhzPower,
+    ) -> Result<bool, Error> {
+        let name = channel_name_6ghz(profile, six, self.board.mac);
+        match narf_firmware::open(&name, &loader()?) {
+            Ok(_) => Ok(true),
+            Err(FirmwareError::NotFound) => Ok(false),
+            Err(error) => Err(Error::Firmware(error)),
+        }
+    }
+    /// Load the 6GHz `N5CC` record for a 6GHz `board` (built from a
+    /// `radio_power_c` 6GHz plan). Absent: `Ok(false)`, unadmitted.
+    pub(super) fn load_channel_6ghz(&mut self, board: Board) -> Result<bool, Error> {
+        let six = board.six.ok_or(Error::Identity)?;
+        binding(self, board)?;
+        let name = channel_name_6ghz(board.profile, six, self.board.mac);
+        self.load_named(&name, board)
+    }
+    fn load_named(&mut self, name: &str, board: Board) -> Result<bool, Error> {
+        let cap = match narf_firmware::open(name, &loader()?) {
             Ok(cap) => cap,
             Err(FirmwareError::NotFound) => return Ok(false),
             Err(error) => return Err(Error::Firmware(error)),
@@ -509,29 +645,55 @@ impl Qualification {
         Ok(true)
     }
     fn install(&mut self, record: Channel) {
-        let profile = record.board.profile;
-        self.channels.retain(|c| c.board.profile != profile);
+        let key = (record.board.profile, record.board.six);
+        self.channels
+            .retain(|c| (c.board.profile, c.board.six) != key);
         self.channels.push(record);
     }
-    fn channel(&self, profile: Profile) -> Option<&Channel> {
-        self.channels.iter().find(|c| c.board.profile == profile)
+    fn channel(&self, profile: Profile, six: Option<SixGhzPower>) -> Option<&Channel> {
+        self.channels
+            .iter()
+            .find(|c| c.board.profile == profile && c.board.six == six)
     }
     /// The loaded record for `profile` was measured for exactly `board`.
     pub(super) fn channel_matches(&self, board: Board) -> bool {
         if board.profile == Profile::INITIAL {
             return self.matches(board);
         }
-        self.channel(board.profile)
+        self.channel(board.profile, board.six)
             .is_some_and(|record| record.board == board)
+    }
+    /// The 6GHz power contexts with a loaded record for `profile`.
+    pub(super) fn six_ghz_contexts(&self, profile: Profile) -> alloc::vec::Vec<SixGhzPower> {
+        self.channels
+            .iter()
+            .filter(|c| c.board.profile == profile)
+            .filter_map(|c| c.board.six)
+            .collect()
     }
     /// Current signed admission of `profile`: a record exists, is bound to
     /// this base, and the current host rule over its span passes.
     pub(super) fn channel_allowed(&self, profile: Profile) -> Result<bool, Error> {
+        self.channel_allowed_in(profile, None)
+    }
+    /// [`Self::channel_allowed`] for a 6GHz profile under `six`.
+    pub(super) fn channel_allowed_6ghz(
+        &self,
+        profile: Profile,
+        six: SixGhzPower,
+    ) -> Result<bool, Error> {
+        self.channel_allowed_in(profile, Some(six))
+    }
+    fn channel_allowed_in(
+        &self,
+        profile: Profile,
+        six: Option<SixGhzPower>,
+    ) -> Result<bool, Error> {
         self.current()?;
-        let envelope = if profile == Profile::INITIAL {
+        let envelope = if profile == Profile::INITIAL && six.is_none() {
             self.envelope
         } else {
-            let Some(record) = self.channel(profile) else {
+            let Some(record) = self.channel(profile, six) else {
                 return Ok(false);
             };
             record.bound(self)?;
@@ -542,11 +704,22 @@ impl Qualification {
     /// `channel_allowed` restricted to spans the host rule leaves active
     /// (no DFS/NO_IR rule), where frame TX (`tx_current`) is admitted.
     pub(super) fn channel_active(&self, profile: Profile) -> Result<bool, Error> {
+        self.channel_active_in(profile, None)
+    }
+    /// [`Self::channel_active`] for a 6GHz profile under `six`.
+    pub(super) fn channel_active_6ghz(
+        &self,
+        profile: Profile,
+        six: SixGhzPower,
+    ) -> Result<bool, Error> {
+        self.channel_active_in(profile, Some(six))
+    }
+    fn channel_active_in(&self, profile: Profile, six: Option<SixGhzPower>) -> Result<bool, Error> {
         self.current()?;
-        let envelope = if profile == Profile::INITIAL {
+        let envelope = if profile == Profile::INITIAL && six.is_none() {
             self.envelope
         } else {
-            let Some(record) = self.channel(profile) else {
+            let Some(record) = self.channel(profile, six) else {
                 return Ok(false);
             };
             record.bound(self)?;
@@ -557,10 +730,19 @@ impl Qualification {
     /// Switch the gating envelope to `profile` before its first emission.
     /// No register access happens here.
     pub(super) fn select(&self, profile: Profile) -> Result<(), Error> {
-        if profile != Profile::INITIAL {
-            self.channel(profile).ok_or(Error::Policy)?.bound(self)?;
+        self.select_in(profile, None)
+    }
+    /// [`Self::select`] for a 6GHz profile under `six`.
+    pub(super) fn select_6ghz(&self, profile: Profile, six: SixGhzPower) -> Result<(), Error> {
+        self.select_in(profile, Some(six))
+    }
+    fn select_in(&self, profile: Profile, six: Option<SixGhzPower>) -> Result<(), Error> {
+        if profile != Profile::INITIAL || six.is_some() {
+            self.channel(profile, six)
+                .ok_or(Error::Policy)?
+                .bound(self)?;
         }
-        let previous = core::mem::replace(&mut *self.active.lock(), profile);
+        let previous = core::mem::replace(&mut *self.active.lock(), (profile, six));
         let result = self.current();
         if result.is_err() {
             *self.active.lock() = previous;
@@ -568,14 +750,18 @@ impl Qualification {
         result
     }
     pub(super) fn active(&self) -> Profile {
-        *self.active.lock()
+        self.active.lock().0
+    }
+    /// The 6GHz power context of the active profile (`None` off 6GHz).
+    pub(super) fn active_six_ghz(&self) -> Option<SixGhzPower> {
+        self.active.lock().1
     }
     fn active_envelope(&self) -> Result<Envelope, Error> {
-        let active = self.active();
-        if active == Profile::INITIAL {
+        let (active, six) = *self.active.lock();
+        if active == Profile::INITIAL && six.is_none() {
             return Ok(self.envelope);
         }
-        let record = self.channel(active).ok_or(Error::Policy)?;
+        let record = self.channel(active, six).ok_or(Error::Policy)?;
         record.current()?;
         Ok(record.envelope)
     }
@@ -626,9 +812,9 @@ impl Qualification {
                         .active_envelope()
                         .map_err(|_| super::power::Error::Access)?;
                     check_envelope(&domain, envelope).map_err(|_| super::power::Error::Access)?;
-                    match q.active() {
-                        active if active == Profile::INITIAL => (self.operation)(),
-                        active => match q.channel(active) {
+                    match *q.active.lock() {
+                        (active, None) if active == Profile::INITIAL => (self.operation)(),
+                        (active, six) => match q.channel(active, six) {
                             Some(record) => record.invoke(self.operation),
                             None => Err(super::power::Error::Access),
                         },
@@ -663,11 +849,29 @@ fn check_envelope(domain: &RegulatoryDomain, envelope: Envelope) -> Result<bool,
     rules.sort_by_key(|&i| domain.rules[i].freq_start_mhz);
     for index in rules {
         let rule = &domain.rules[index];
+        let allowed = match envelope.client {
+            Some(_) => PLAIN_RULE_FLAGS | PASSIVE_RULE_FLAGS | SIX_GHZ_RULE_FLAGS,
+            None => PLAIN_RULE_FLAGS | PASSIVE_RULE_FLAGS,
+        };
         if rule.freq_start_mhz > covered
             || domain.max_bandwidth(index) < envelope.width
-            || rule.flags.bits() & !(PLAIN_RULE_FLAGS | PASSIVE_RULE_FLAGS) != 0
+            || rule.flags.bits() & !allowed != 0
         {
             return Err(Error::Policy);
+        }
+        if let Some(client) = envelope.client {
+            use narf_wireless::reg::RegFlags;
+            // cfg80211_6ghz_power_type_valid over every rule of the span;
+            // an indoor-only rule needs the trusted indoor deployment.
+            if low < 5925
+                || !rule.allows_6ghz_client(client)
+                || (rule.flags.contains(RegFlags::INDOOR_ONLY)
+                    && !rule.flags.contains(RegFlags::DEPLOYMENT_INDOOR))
+                || (rule.flags.contains(RegFlags::DEPLOYMENT_INDOOR)
+                    && !rule.flags.contains(RegFlags::INDOOR_ONLY))
+            {
+                return Err(Error::Policy);
+            }
         }
         covered = covered.max(rule.freq_end_mhz);
         if rule.flags.bits() & PASSIVE_RULE_FLAGS != 0 {
@@ -694,6 +898,11 @@ fn check_envelope(domain: &RegulatoryDomain, envelope: Envelope) -> Result<bool,
 }
 const PASSIVE_RULE_FLAGS: u32 =
     narf_wireless::reg::RegFlags::DFS.bits() | narf_wireless::reg::RegFlags::NO_IR.bits();
+/// Rule flags only a 6GHz envelope may carry (each checked above).
+const SIX_GHZ_RULE_FLAGS: u32 = narf_wireless::reg::RegFlags::NO_6GHZ_VLP_CLIENT.bits()
+    | narf_wireless::reg::RegFlags::NO_6GHZ_AFC_CLIENT.bits()
+    | narf_wireless::reg::RegFlags::INDOOR_ONLY.bits()
+    | narf_wireless::reg::RegFlags::DEPLOYMENT_INDOOR.bits();
 const PLAIN_RULE_FLAGS: u32 = narf_wireless::reg::RegFlags::NO_P2P.bits()
     | narf_wireless::reg::RegFlags::AUTO_BW.bits()
     | narf_wireless::reg::RegFlags::NO_160MHZ.bits();

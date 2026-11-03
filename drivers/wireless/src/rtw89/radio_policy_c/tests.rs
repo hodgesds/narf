@@ -23,6 +23,7 @@ fn board(profile: Profile, seed: u8) -> Board {
         mac: [2, 4, 6, 8, 10, 12],
         device: 0xc852,
         profile,
+        six: None,
     }
 }
 fn header(b: &mut [u8; LENGTH], magic: &[u8; 4], version: u8) {
@@ -52,6 +53,9 @@ fn channel_image(base: &Qualification, board: Board) -> [u8; LENGTH] {
     b[16..48].copy_from_slice(&binding(base, board).unwrap());
     b[54..58].copy_from_slice(&[1, width_mhz(p.width()), p.primary(), BASE_FLAGS]);
     b[68..70].copy_from_slice(&[p.band() as u8, p.center()]);
+    if let Some(six) = board.six {
+        b[70..72].copy_from_slice(&[six.power(), six.regd()]);
+    }
     b
 }
 fn rule(start: u32, end: u32, bw: u32, flags: RegFlags) -> RegRule {
@@ -406,4 +410,129 @@ fn smoke_rtw8852c_wide_station_profiles_map_to_c_profiles() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_wide_station_profiles_map_to_c_profiles
+);
+
+fn smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule() -> TestResult {
+    let mut q = base(authority());
+    let he160 = Profile::new_wide(Band::Ghz6, 37, Width::Mhz160).unwrap();
+    let ch37 = Profile::new20(Band::Ghz6, 37).unwrap();
+    // 59 6GHz primaries; every 6GHz profile only through the 6GHz key.
+    let six = noninitial_6ghz();
+    if six.iter().filter(|p| p.width() == Width::Mhz20).count() != 59
+        || !six.contains(&he160)
+        || six.iter().any(|p| admissible(*p) || !admissible_6ghz(*p))
+        || noninitial().iter().any(|p| p.band() == Band::Ghz6)
+    {
+        return TestResult::Fail("C 6GHz profile set wrong");
+    }
+    let lpi = SixGhzPower::for_test(2, 1);
+    let sp = SixGhzPower::for_test(2, 2);
+    let b = Board {
+        six: Some(lpi),
+        ..board(he160, 0x61)
+    };
+    let bytes = channel_image(&q, b);
+    // Bytes 70/71 carry power/regd; a 2/5GHz-shaped (no context) board or
+    // another power type is refused.
+    for at in [70, 71, 72] {
+        let mut bad = bytes;
+        bad[at] ^= 1;
+        if Channel::from_verified(&q, b, &bad, Some([3; 32]), authority()).is_ok() {
+            return TestResult::Fail("altered C 6GHz channel record accepted");
+        }
+    }
+    let other = Board { six: Some(sp), ..b };
+    if Channel::from_verified(&q, other, &bytes, Some([3; 32]), authority()).is_ok()
+        || binding(&q, board(he160, 0x61)).is_ok()
+        || channel_name_6ghz(he160, lpi, [2, 4, 6, 8, 10, 12])
+            != "rtw89/rtw8852c-chan-v1-6g-ch037-bw160-regd02-lpi-020406080a0c.bin"
+    {
+        return TestResult::Fail("C 6GHz record bound to another power type or name");
+    }
+    let Ok(record) = Channel::from_verified(&q, b, &bytes, Some([3; 32]), authority()) else {
+        return TestResult::Fail("exact C 6GHz channel record refused");
+    };
+    q.install(record);
+    let indoor = RegFlags::INDOOR_ONLY | RegFlags::DEPLOYMENT_INDOOR;
+    let six_rule = |flags| rule(5925, 7125, 320, flags);
+    let mut rules = vec![six_rule(indoor)];
+    rules.extend(q.model_domain.as_ref().unwrap().rules.iter().cloned());
+    q.model_domain = Some(domain(rules));
+    if !q.channel_matches(b)
+        || q.six_ghz_contexts(he160) != vec![lpi]
+        || !matches!(q.channel_active_6ghz(he160, lpi), Ok(true))
+        || !matches!(q.channel_allowed_6ghz(he160, sp), Ok(false))
+        || !matches!(q.channel_allowed_6ghz(ch37, lpi), Ok(false))
+        || q.select_6ghz(he160, lpi).is_err()
+        || q.active() != he160
+        || q.active_six_ghz() != Some(lpi)
+        || q.current().is_err()
+    {
+        return TestResult::Fail("signed C 6GHz record refused under a passing LPI rule");
+    }
+    // INDOOR_ONLY without the deployment assertion, or an SP-only client
+    // rule refusing this type, refuses; NO_IR stays passive (no frame TX).
+    // INDOOR_ONLY without the deployment assertion refuses; NO_IR stays
+    // passive: tuning admitted, no frame TX (`tx_current`).
+    for (flags, passive) in [
+        (RegFlags::INDOOR_ONLY, false),
+        (RegFlags::NO_IR | indoor, true),
+    ] {
+        if q.select(Profile::INITIAL).is_err() {
+            return TestResult::Fail("C initial profile reselect refused");
+        }
+        let mut rules = vec![six_rule(flags)];
+        rules.extend(
+            base(authority())
+                .model_domain
+                .unwrap()
+                .rules
+                .iter()
+                .cloned(),
+        );
+        q.model_domain = Some(domain(rules));
+        let allowed = q.channel_allowed_6ghz(he160, lpi);
+        let active = q.channel_active_6ghz(he160, lpi);
+        let ok = if passive {
+            matches!((allowed, active), (Ok(true), Ok(false)))
+                && q.select_6ghz(he160, lpi).is_ok()
+                && q.tx_current().is_err()
+        } else {
+            matches!((allowed, active), (Ok(false), Ok(false)))
+        };
+        if !ok {
+            return TestResult::Fail("C 6GHz envelope ignored an indoor/NO_IR rule");
+        }
+    }
+    if q.select(Profile::INITIAL).is_err() {
+        return TestResult::Fail("C initial profile reselect refused");
+    }
+    let b_sp = Board {
+        six: Some(sp),
+        ..board(he160, 0x62)
+    };
+    let bytes = channel_image(&q, b_sp);
+    if let Ok(record) = Channel::from_verified(&q, b_sp, &bytes, Some([3; 32]), authority()) {
+        q.install(record);
+    }
+    let mut rules = vec![six_rule(indoor | RegFlags::NO_6GHZ_AFC_CLIENT)];
+    rules.extend(
+        base(authority())
+            .model_domain
+            .unwrap()
+            .rules
+            .iter()
+            .cloned(),
+    );
+    q.model_domain = Some(domain(rules));
+    if !matches!(q.channel_allowed_6ghz(he160, sp), Ok(false))
+        || !matches!(q.channel_allowed_6ghz(he160, lpi), Ok(true))
+    {
+        return TestResult::Fail("C 6GHz SP record admitted under NO_6GHZ_AFC_CLIENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule
 );
