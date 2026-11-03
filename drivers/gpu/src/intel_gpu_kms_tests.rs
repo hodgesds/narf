@@ -516,6 +516,8 @@ impl MockPlatform {
     pub(crate) fn allow_frames(&self, enabled: bool) {
         self.0.lock().frames = enabled;
     }
+    /// Only the x86_64 multi-pipe fixtures tick on a register read.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn step_on_read(&self, register: Option<u64>) {
         self.0.lock().step_on_read = register;
     }
