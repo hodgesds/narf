@@ -493,3 +493,57 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_kms_mtl_external_pass_idles_in_flight_dsb_before_repartition
 );
+
+/// The runtime actor's MTL external pass (`service_mtl_external_for_bar`,
+/// whose body is [`crate::intel_gpu::mtl_runtime_pass`]) leaves the panel's
+/// KMS owner open: after a pass whose hotplug poll found nothing and one that
+/// handled an event, a session still opens and the cursor still updates.
+/// The pass used to take the owner through `legacy_drain`, which set
+/// `blocked` for good on the first runtime iteration, so every later session
+/// failed with NoDevice, with or without a monitor.
+fn smoke_kms_mtl_runtime_pass_leaves_the_panel_owner_open() -> TestResult {
+    {
+        let platform = MockPlatform::new();
+        let (timing, _) = beside_external(&platform);
+        let device = platform.meteor();
+        let gem = crate::intel_gpu_gem::GemState::new();
+        let handle = gem.create(16384, |_, _| Ok(())).unwrap();
+        // The post-update waits for a Pipe-A frame boundary.
+        platform.step_on_read(Some(FRAME));
+        let mut events = 0;
+        let idle = crate::intel_gpu::mtl_runtime_pass(Some(&device), |_, _| false);
+        let handled = crate::intel_gpu::mtl_runtime_pass(Some(&device), |before, after| {
+            before();
+            after();
+            events += 1;
+            true
+        });
+        platform.step_on_read(None);
+        if idle || !handled || events != 1 {
+            reset_published_layout();
+            return TestResult::Fail("both runtime passes must run with the owner held");
+        }
+        for _ in 0..2 {
+            let Ok(mut session) = complete(device.session()) else {
+                reset_published_layout();
+                return TestResult::Fail("the runtime pass left the panel's KMS owner blocked");
+            };
+            let cursor = drive(session.cursor(
+                Some(gem.object(handle).unwrap()),
+                true,
+                Some((3, 4)),
+                timing,
+            ));
+            if cursor.is_err() {
+                reset_published_layout();
+                return TestResult::Fail("the panel cursor must update after the runtime pass");
+            }
+        }
+        reset_published_layout();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_mtl_runtime_pass_leaves_the_panel_owner_open
+);

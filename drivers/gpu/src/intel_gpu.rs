@@ -2526,26 +2526,42 @@ fn service_mtl_external_for_bar(bar: &MmioRegion) {
         return;
     }
     let display = crate::intel_gpu_kms::display_for_bar(bar);
-    let pass = match display.as_ref() {
+    let _ = mtl_runtime_pass(display.as_deref(), |before, after| {
+        service_mtl_display(before, after)
+    });
+}
+
+/// The runtime MTL pass's hold on the panel's KMS owner, around `pass` (the
+/// hotplug poll and its event, given the pre- and post-update hooks):
+/// [`crate::intel_gpu_kms::Device::external_pass`], which brackets FBC and
+/// PSR around the event and never blocks the owner. A busy owner skips the
+/// pass (`false`) before its poll; without a KMS owner the pass runs
+/// unbracketed. Generic over the KMS platform so the native fixtures drive
+/// exactly the body the runtime actor runs.
+pub(crate) fn mtl_runtime_pass<M: crate::intel_gpu_kms::Platform>(
+    display: Option<&crate::intel_gpu_kms::Device<M>>,
+    pass: impl FnOnce(&mut dyn FnMut(), &mut dyn FnMut()) -> bool,
+) -> bool {
+    let owner = match display {
         Some(display) => match display.external_pass() {
-            Ok(pass) => Some(pass),
-            Err(_) => return,
+            Ok(owner) => Some(owner),
+            Err(_) => return false,
         },
         None => None,
     };
-    let pass = core::cell::RefCell::new(pass);
-    let _ = service_mtl_display(
+    let owner = core::cell::RefCell::new(owner);
+    pass(
         &mut || {
-            if let Some(pass) = pass.borrow_mut().as_mut() {
-                pass.pre_update();
+            if let Some(owner) = owner.borrow_mut().as_mut() {
+                owner.pre_update();
             }
         },
         &mut || {
-            if let Some(pass) = pass.borrow_mut().as_mut() {
-                pass.post_update();
+            if let Some(owner) = owner.borrow_mut().as_mut() {
+                owner.post_update();
             }
         },
-    );
+    )
 }
 
 /// Suspend/GT-reset retirement of the MTL route and its hotplug sources,
