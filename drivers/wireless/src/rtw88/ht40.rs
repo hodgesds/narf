@@ -47,8 +47,18 @@
 //! | 6..8 | qualified EIRP ceiling, quarter dBm |
 //! | 8..14 | measured 40MHz peaks (IQK/calibration, response, data), quarter dBm |
 //! | 14..16 | qualified TX MCS mask (equal to the bound HT program's) |
-//! | 16..32 | HT40 TXAGC index for MCS0..15 (zero outside the mask; C21 1S) |
-//! | 32..64 | zero |
+//! | 16..32 | HT40 TXAGC index for MCS0..15 (zero outside the mask; C21 1S; B22 path A) |
+//! | 32..40 | B22 only: path-B HT40 TXAGC index for MCS8..15 (zero outside the mask) |
+//! | 40..64 | zero (32..64 on C21/C22) |
+//!
+//! RTL8822BE (`N2BB`, header `10ec:b822`): `rtw8822b_set_channel(center,
+//! BW40, sc)` (`radio8822b::set_channel`), then `rtw_phy_set_tx_power_level`
+//! as `rtw8822b_set_tx_power_index_by_rate` absolute per-path words
+//! 0x1d00/0x1d80 + rate (legacy12 kept at the bound `N2BO`/`N2BP`
+//! indices, path-A MCS0..7, both paths' MCS8..15 for two streams, path-B
+//! HT1S zero as for `N2BH`), then `rtw8822b_do_iqk`. Ceilings are both
+//! paths' `bw40_base` (+ `ht_2s_diff.bw40`) at `txgi_factor` 1
+//! (`operating8822b::Envelope::ht40_limits`).
 use super::{
     firmware_transport::{Error, Io},
     power_policy::Gate,
@@ -74,6 +84,10 @@ pub(super) static KIND5: Kind = Kind {
     admit: admit5,
 };
 
+/// RTL8822BE `N2BB` program contract, hashed into every B22 N2xB request
+/// in addition to the band's shared kind source.
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BB: rtw8822b.c rtw8822b_set_channel(center, BW40, sc) = _bb BW40 RXSB0xa00[4] ADCCLK0x8ac ff3ff300|sc<<2|1 ADC160[30]1, rtw_set_channel_mac DATA_SC0x483 RFMOD_40M 0x668[7], _rf RF18 A+B BW40 bit11, _rxdfir BW40, toggle_igi, _cca BW40, _rfe; rtw8822b_set_tx_power_index_by_rate 1d00/1d80 absolute: legacy12 at the bound N2BO/N2BP indices, path-A MCS0..7, path-A/B MCS8..15 (2SS), path-B HT1S zero, VHT words zero; rtw8822b_do_iqk clear0 segment0 RF08 abcde 300x20ms RF08 clear 1bf0 low8/reload16 zero; ceilings both paths bw40_base[group(center)] + ht_2s_diff.bw40, txgi 1, max 0x3f; readback RF18 A+B 8ac a00 483 668 RRSR TXAGC";
+
 /// The N2xB kind for a primary's band.
 pub(super) fn kind(primary: u8) -> &'static Kind {
     if super::band5::primary(primary) {
@@ -94,6 +108,8 @@ pub(super) struct Record {
     pub(super) peaks: [i16; 3],
     pub(super) mcs: u16,
     pub(super) indices: [u8; 16],
+    /// B22 path-B MCS8..15 (zero on C21/C22).
+    pub(super) indices_b: [u8; 8],
 }
 
 impl Record {
@@ -108,13 +124,17 @@ impl Record {
             peaks: [signed(8), signed(10), signed(12)],
             mcs: u16::from_le_bytes([p[14], p[15]]),
             indices: p[16..32].try_into().ok()?,
+            indices_b: p[32..40].try_into().ok()?,
         };
-        let (max, streams) = match did {
-            0xc822 => (127, 0xffff),
-            0xc821 => (63, 0xff),
+        let (max, streams, tail) = match did {
+            0xc822 => (127, 0xffff, 32),
+            0xc821 => (63, 0xff, 32),
+            // rtw8822b_hw_spec.max_power_index 0x3f, absolute per-path index.
+            0xb822 => (63, 0xffff, 40),
             _ => return None,
         };
-        let unused_zero = (0..16).all(|i| record.mcs & (1 << i) != 0 || record.indices[i] == 0);
+        let unused_zero = (0..16).all(|i| record.mcs & (1 << i) != 0 || record.indices[i] == 0)
+            && (0..8).all(|i| record.mcs & (1 << (8 + i)) != 0 || record.indices_b[i] == 0);
         // rtw8822c_set_tx_power_index: per-rate TXAGC is a signed 7-bit
         // difference from the MCS7 reference (as for the HT20 program).
         let c22_reference = did != 0xc822
@@ -132,11 +152,15 @@ impl Record {
             && (0..=128).contains(&record.antenna)
             && (-512..=256).contains(&record.ceiling)
             && record.peaks.iter().all(|v| (-512..=256).contains(v))
-            && record.indices.iter().all(|i| *i <= max)
+            && record
+                .indices
+                .iter()
+                .chain(&record.indices_b)
+                .all(|i| *i <= max)
             && unused_zero
             && c22_reference
-            && p[32..] == [0; PAYLOAD - 32])
-            .then_some(record)
+            && p[tail..].iter().all(|b| *b == 0))
+        .then_some(record)
     }
     pub(super) fn center(&self) -> u8 {
         center(self.primary, self.secondary).expect("validated HT40 pair")
@@ -225,9 +249,95 @@ pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
         } else if i < 8 {
             v <= one
         } else {
-            two.is_some_and(|two| v <= two)
+            two.is_some_and(|two| v <= two && record.indices_b[i - 8] <= two)
         }
     })
+}
+
+/// B22 TXAGC words 0..6 (DESC_RATE 0x00..0x1b) per path at BW40, packed as
+/// `rtw8822b_set_tx_power_index_by_rate` does: `legacy` (the committed
+/// primary's legacy12), path-A MCS0..7 (1SS transmits on A only under
+/// `config_trx_mode(AB, AB, false)`; path-B HT1S zero) and, for two
+/// streams, MCS8..15 per path.
+pub(super) fn b22_words(legacy: [[u8; 12]; 2], record: &Record) -> [[u32; 7]; 2] {
+    core::array::from_fn(|path| {
+        let mut rates = [0u8; 28];
+        rates[..12].copy_from_slice(&legacy[path]);
+        if path == 0 {
+            rates[12..20].copy_from_slice(&record.indices[..8]);
+        }
+        if record.two_streams() {
+            rates[20..].copy_from_slice(if path == 0 {
+                &record.indices[8..]
+            } else {
+                &record.indices_b
+            });
+        }
+        core::array::from_fn(|w| u32::from_le_bytes(rates[w * 4..w * 4 + 4].try_into().unwrap()))
+    })
+}
+
+/// B22 HT40 power program: words 0..6 of both paths ([`b22_words`]); the
+/// VHT words stay zero from the retune.
+async fn write8822b(io: &mut impl Io, legacy: [[u8; 12]; 2], record: &Record) -> Result<(), Error> {
+    for (base, words) in [0x1d00u16, 0x1d80]
+        .into_iter()
+        .zip(b22_words(legacy, record))
+    {
+        for (i, v) in words.into_iter().enumerate() {
+            io.write32(base + i as u16 * 4, v).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Readback of [`write8822b`] over any register view.
+pub(super) async fn check8822b(
+    read: &mut impl super::firmware_transport::Read32,
+    legacy: [[u8; 12]; 2],
+    record: &Record,
+) -> Result<(), Error> {
+    for (base, words) in [0x1d00u16, 0x1d80]
+        .into_iter()
+        .zip(b22_words(legacy, record))
+    {
+        for (i, v) in words.into_iter().enumerate() {
+            if read.read32(base + i as u16 * 4).await? != v {
+                return Err(Error::Prerequisite);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// B22 [`program`] on either band: `rtw_set_channel(center, BW40, sc)`
+/// (`rtw8822b_set_channel` over the retained PHY facts), the HT40 TX power
+/// level, `rtw8822b_do_iqk` (`rtw_ops_mgd_prepare_tx`), then the RF18/BB/
+/// MAC, TXAGC and response-mask readbacks (RRSR 0x1f on 2.4GHz, 0x10 on
+/// 5GHz, as the `N2BO` retune left it).
+async fn program8822b(io: &mut impl Io, gate: &Gate, record: &Record) -> Result<(), Error> {
+    let phy = gate.b22_phy().ok_or(Error::State)?;
+    let legacy = gate.b22_indices().ok_or(Error::State)?;
+    let (center, width) = (record.center(), super::band5::Width::Forty(record.sc()));
+    let rrsr = if record.band5() {
+        super::radio::RRSR_OFDM6_5G
+    } else {
+        0x1f
+    };
+    super::radio8822b::set_channel(io, phy, center, width).await?;
+    write8822b(io, legacy, record).await?;
+    super::channel_policy::iqk8822b(io).await?;
+    super::radio8822b::verify_channel(io, center, width).await?;
+    check8822b(
+        &mut super::firmware_transport::RadioRead32(io),
+        legacy,
+        record,
+    )
+    .await?;
+    if super::radio::read(io, 0x440).await? != rrsr {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 
 /// Regulatory admission of the 40MHz span (`center +/- 20MHz`): every
@@ -451,6 +561,9 @@ pub(super) async fn check_power(
 /// `rtw_set_channel(center, BW40, sc)` + IQK + HT40 TX power after
 /// `station_width_begin` paused and drained TX on the HT-bound gate.
 pub(super) async fn program(io: &mut impl Io, gate: &Gate, record: &Record) -> Result<(), Error> {
+    if gate.did() == 0xb822 {
+        return program8822b(io, gate, record).await;
+    }
     if record.band5() {
         return program5(io, gate, record).await;
     }

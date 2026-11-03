@@ -1445,3 +1445,132 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl
 );
+
+/// B22 `N2BB`/`N2BV` wide records: the decoders admit the B22 layouts
+/// (path-B HT40 MCS8..15 at payload 32..40, path-B VHT80 2SS at 36..46)
+/// and refuse dirty tails / foreign-chip shapes, `Gate::ht40_limits` is
+/// both paths' `bw40_base[group]` (+ `ht_2s_diff.bw40`) at txgi 1, the
+/// HT40/VHT80 TXAGC tables follow `rtw8822b_set_tx_power_index_by_rate`
+/// (path-B 1SS zero), and `rtw8822b_set_channel` at BW40 reads back with
+/// BIT_RFMOD_40M while another sideband/width refuses. Written; not yet
+/// executed natively.
+fn smoke_rtw8822be_n2bb_n2bv_wide_records_limits_and_bw40_readback() -> TestResult {
+    use super::super::{
+        band5::Width, ht40, power_policy::Gate, qualification::PAYLOAD, radio8822b, vht,
+    };
+    let Some((_, phy, grant, _)) = b22_station_fixture() else {
+        return TestResult::Fail("8822B station fixture rejected");
+    };
+    let legacy = grant.power().indices();
+    let gate = Gate::b22(grant, phy);
+    // Center 3 = group 1: path A bw40 29, path B 28; ht_2s_diff.bw40 +0.
+    if gate.ht40_limits(3) != Some((28, Some(28))) {
+        return TestResult::Fail(
+            "8822B HT40 ceilings differ from rtw_phy_get_2g_tx_power_index BW40",
+        );
+    }
+    let mut p = [0u8; PAYLOAD];
+    p[0] = 1;
+    p[1] = 5;
+    p[2] = 40;
+    p[3] = 1;
+    for (at, v) in [(4, 4i16), (6, 76), (8, 44), (10, 40), (12, 40)] {
+        p[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    p[14..16].copy_from_slice(&0xffffu16.to_le_bytes());
+    let a: [u8; 16] = core::array::from_fn(|i| 28 - (i as u8 & 7));
+    p[16..32].copy_from_slice(&a);
+    p[32..40].copy_from_slice(&[27; 8]);
+    let Some(r) = ht40::Record::decode(0xb822, &p) else {
+        return TestResult::Fail("8822B N2BB payload rejected");
+    };
+    let mut over = p;
+    over[32] = 29;
+    let mut tail = p;
+    tail[40] = 1;
+    let mut c22 = p;
+    c22[32..40].fill(0);
+    c22[32] = 1;
+    if r.indices_b != [27; 8]
+        || r.center() != 3
+        || r.sc() != 2
+        || !ht40::within_factory(&gate, &r)
+        || ht40::Record::decode(0xb822, &over).is_some_and(|o| ht40::within_factory(&gate, &o))
+        || ht40::Record::decode(0xb822, &tail).is_some()
+        || ht40::Record::decode(0xc822, &c22).is_some()
+    {
+        return TestResult::Fail("8822B N2BB decode/ceiling admission differs");
+    }
+    let words = ht40::b22_words(legacy, &r);
+    for path in 0..2 {
+        let mut want = [0u8; 28];
+        want[..12].copy_from_slice(&legacy[path]);
+        if path == 0 {
+            want[12..].copy_from_slice(&a);
+        } else {
+            want[20..].copy_from_slice(&[27; 8]);
+        }
+        for (w, v) in words[path].iter().enumerate() {
+            if v.to_le_bytes() != want[w * 4..w * 4 + 4] {
+                return TestResult::Fail("8822B HT40 words differ from set_tx_power_index_by_rate");
+            }
+        }
+    }
+    // N2BV: two streams, MCS0..9, path-B 2SS at 36..46.
+    let mut v = [0u8; PAYLOAD];
+    v[0] = 36;
+    v[1] = 42;
+    v[2] = 80;
+    for (at, x) in [(4, 4i16), (6, 76), (8, 44), (10, 40), (12, 40)] {
+        v[at..at + 2].copy_from_slice(&x.to_le_bytes());
+    }
+    v[14] = 2;
+    v[15] = 9;
+    v[16..36].fill(20);
+    v[36..46].fill(19);
+    let Some(vr) = vht::Record::decode(0xb822, &v) else {
+        return TestResult::Fail("8822B N2BV payload rejected");
+    };
+    let mut one = v;
+    one[14] = 1;
+    one[26..36].fill(0);
+    let mut vtail = v;
+    vtail[46] = 1;
+    if vr.indices_b != [19; 10]
+        || vht::Record::decode(0xb822, &one).is_some()
+        || vht::Record::decode(0xb822, &vtail).is_some()
+        || vht::Record::decode(0xc821, &v).is_some()
+    {
+        return TestResult::Fail("8822B N2BV decode differs");
+    }
+    let tables = vht::b22_tables([[0; 12]; 2], &vr);
+    if tables[0][0x2c..] != [20; 20]
+        || tables[1][0x2c..0x36] != [0; 10]
+        || tables[1][0x36..] != [19; 10]
+        || tables.iter().any(|t| t[12..0x2c] != [0; 32])
+    {
+        return TestResult::Fail("8822B VHT80 tables differ from set_tx_power_index_by_rate");
+    }
+    // rtw8822b_set_channel(3, BW40, SC_20_LOWER) and its readback.
+    let mut io = super::mac_tests::Model::new(3, 2);
+    io.sipi8822b = true;
+    if narf_scheduler::block_on(radio8822b::set_channel(&mut io, phy, 3, Width::Forty(2))).is_err()
+    {
+        return TestResult::Fail("8822B set_channel 3/40 failed");
+    }
+    let r668 = u32::from_le_bytes(io.regs[0x668..0x66c].try_into().unwrap());
+    if r668 & 0x180 != 0x80
+        || io.regs[0x483] != 2
+        || narf_scheduler::block_on(radio8822b::verify_channel(&mut io, 3, Width::Forty(2)))
+            .is_err()
+        || narf_scheduler::block_on(radio8822b::verify_channel(&mut io, 3, Width::Forty(1))).is_ok()
+        || narf_scheduler::block_on(radio8822b::verify_channel(&mut io, 3, Width::Twenty)).is_ok()
+    {
+        return TestResult::Fail("8822B BW40 MAC/BB/RF readback differs from rtw8822b_set_channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bb_n2bv_wide_records_limits_and_bw40_readback
+);

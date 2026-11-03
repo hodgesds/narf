@@ -40,8 +40,17 @@
 //! | 14 | spatial streams 1 or 2 (C21 1) |
 //! | 15 | highest VHT MCS 7, 8 or 9 (`IEEE80211_VHT_MCS_SUPPORT_0_{7,8,9}`) |
 //! | 16..26 | VHT80 TXAGC index for 1SS MCS0..9 (zero above the highest) |
-//! | 26..36 | VHT80 TXAGC index for 2SS MCS0..9 (zero for one stream) |
-//! | 36..64 | zero |
+//! | 26..36 | VHT80 TXAGC index for 2SS MCS0..9 (zero for one stream; B22 path A) |
+//! | 36..46 | B22 only: path-B VHT80 2SS MCS0..9 (zero for one stream) |
+//! | 46..64 | zero (36..64 on C21/C22) |
+//!
+//! RTL8822BE (`N2BV`): `rtw8822b_set_channel(center80, BW80, sc)`
+//! (`radio8822b::set_channel`), `rtw8822b_set_tx_power_index_by_rate`
+//! absolute per-path words 0x1d00/0x1d80 (legacy12 at the bound 5GHz `N2BO`
+//! indices, HT words zero as on C22, path-A VHT1SS MCS0..9 at 0x2c..0x35,
+//! both paths' VHT2SS at 0x36..0x3f; path-B VHT1SS zero, 1SS transmits on A
+//! under `config_trx_mode(AB, AB, false)`), then `rtw8822b_do_iqk`.
+//! Ceilings are both paths' `band5::Power5g::bw80` at `txgi_factor` 1.
 use super::{
     band5::{self, Width},
     firmware_transport::{Error, Io},
@@ -57,6 +66,10 @@ pub(super) static KIND: Kind = Kind {
     admit,
 };
 
+/// RTL8822BE `N2BV` program contract, hashed into every B22 N2xV request in
+/// addition to the shared kind source.
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BV: rtw8822b.c rtw8822b_set_channel(center80, BW80, sc) = _bb 5G BW80 ADCCLK0x8ac fcefcf00|sc<<2|2 ADC160[30]1 rfe2/3 0x840[15:12]6 0x8c8[10]1, rtw_set_channel_mac DATA_SC0x483 txsc20|txsc40<<4 RFMOD_80M 0x668[8], _rf RF18 A+B BW80 bit10 RFSI, _rxdfir BW80, toggle_igi, _cca, _rfe; rtw8822b_set_tx_power_index_by_rate 1d00/1d80 absolute: legacy12 at the bound 5GHz N2BO indices (CCK zero), HT words zero, path-A VHT1SS MCS0..9 0x2c..0x35, path-A/B VHT2SS 0x36..0x3f, path-B VHT1SS zero; rtw8822b_do_iqk clear0 segment0; ceilings both paths avg(bw40_base[g],[g+1]) + vht_1s_diff.bw80 (+ vht_2s_diff.bw80), txgi 1, max 0x3f; RRSR_INIT_5G OFDM6 0x10; readback RF18 A+B 8ac 483 668 RRSR TXAGC";
+
 /// Decoded N2xV payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Record {
@@ -70,6 +83,8 @@ pub(super) struct Record {
     pub(super) max_mcs: u8,
     /// 1SS MCS0..9 then 2SS MCS0..9.
     pub(super) indices: [u8; 20],
+    /// B22 path-B 2SS MCS0..9 (zero on C21/C22).
+    pub(super) indices_b: [u8; 10],
 }
 
 impl Record {
@@ -85,15 +100,19 @@ impl Record {
             streams: p[14],
             max_mcs: p[15],
             indices: p[16..36].try_into().ok()?,
+            indices_b: p[36..46].try_into().ok()?,
         };
-        let (max, streams) = match did {
-            0xc822 => (127, 2),
-            0xc821 => (63, 1),
+        let (max, streams, tail) = match did {
+            0xc822 => (127, 2, 36),
+            0xc821 => (63, 1, 36),
+            // rtw8822b_hw_spec.max_power_index 0x3f, absolute per-path index.
+            0xb822 => (63, 2, 46),
             _ => return None,
         };
         let used =
             |i: usize| i % 10 <= usize::from(record.max_mcs) && i / 10 < record.streams.into();
-        let unused_zero = (0..20).all(|i| used(i) || record.indices[i] == 0);
+        let unused_zero = (0..20).all(|i| used(i) || record.indices[i] == 0)
+            && (0..10).all(|i| used(10 + i) || record.indices_b[i] == 0);
         // rtw8822c_set_tx_power_diff: 7-bit signed difference from the
         // reference (VHT1SS MCS7 here).
         let reference = i16::from(record.indices[7]);
@@ -110,11 +129,15 @@ impl Record {
             && (0..=128).contains(&record.antenna)
             && (-512..=256).contains(&record.ceiling)
             && record.peaks.iter().all(|v| (-512..=256).contains(v))
-            && record.indices.iter().all(|i| *i <= max)
+            && record
+                .indices
+                .iter()
+                .chain(&record.indices_b)
+                .all(|i| *i <= max)
             && unused_zero
             && c22_reference
-            && p[36..] == [0; PAYLOAD - 36])
-            .then_some(record)
+            && p[tail..].iter().all(|b| *b == 0))
+        .then_some(record)
     }
     /// `rtw_update_channel` 80MHz sub-channel index.
     pub(super) fn sc(&self) -> u8 {
@@ -252,7 +275,51 @@ pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
         } else {
             *v == 0 || two.is_some_and(|two| *v <= two)
         }
+    }) && record
+        .indices_b
+        .iter()
+        .all(|v| *v == 0 || two.is_some_and(|two| *v <= two))
+}
+
+/// B22 per-path DESC_RATE 0x00..0x3f table at BW80 (`rtw8822b_set_tx_power_index_by_rate`):
+/// `legacy` (the 5GHz primary's legacy12, CCK zero), HT zero, path-A VHT1SS
+/// MCS0..9 and, for two streams, VHT2SS per path. HT3S/HT4S (words 7..10)
+/// are never written ([`super::radio8822b::write_txagc`]).
+pub(super) fn b22_tables(legacy: [[u8; 12]; 2], record: &Record) -> [[u8; 64]; 2] {
+    core::array::from_fn(|path| {
+        let mut rates = [0u8; 64];
+        rates[..12].copy_from_slice(&legacy[path]);
+        if path == 0 {
+            rates[0x2c..0x36].copy_from_slice(&record.indices[..10]);
+            rates[0x36..].copy_from_slice(&record.indices[10..]);
+        } else {
+            rates[0x36..].copy_from_slice(&record.indices_b);
+        }
+        rates
     })
+}
+
+/// B22 [`program`]: `rtw_set_channel(center80, BW80, sc)`, the VHT80 TX
+/// power level over both paths, `rtw8822b_do_iqk`, then the RF18/BB/MAC,
+/// TXAGC and RRSR 0x10 readbacks.
+async fn program8822b(io: &mut impl Io, gate: &Gate, record: &Record) -> Result<(), Error> {
+    let phy = gate.b22_phy().ok_or(Error::State)?;
+    let legacy = gate.b22_indices().ok_or(Error::State)?;
+    if legacy.iter().any(|path| path[..4] != [0; 4]) {
+        return Err(Error::State);
+    }
+    let tables = b22_tables(legacy, record);
+    super::radio8822b::set_channel(io, phy, record.center, record.width()).await?;
+    for (path, table) in tables.iter().enumerate() {
+        super::radio8822b::write_txagc(io, path as u8, table).await?;
+    }
+    super::channel_policy::iqk8822b(io).await?;
+    super::radio8822b::verify_channel(io, record.center, record.width()).await?;
+    super::radio8822b::verify_txagc(io, tables).await?;
+    if super::radio::read(io, 0x440).await? != super::radio::RRSR_OFDM6_5G {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 
 /// Regulatory admission of the 80MHz span (`center +/- 40MHz`): every
@@ -409,6 +476,9 @@ pub(super) async fn check_power(
 /// `rtw_set_channel(center80, BW80, sc)` + IQK + VHT80 TX power on a
 /// quiet, drained gate bound to the record's primary (5GHz N2xO).
 pub(super) async fn program(io: &mut impl Io, gate: &Gate, record: &Record) -> Result<(), Error> {
+    if gate.did() == 0xb822 {
+        return program8822b(io, gate, record).await;
+    }
     let (did, center, width) = (gate.did(), record.center, record.width());
     let rrsr = super::radio::RRSR_OFDM6_5G;
     match did {

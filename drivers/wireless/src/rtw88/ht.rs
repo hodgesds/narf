@@ -743,6 +743,50 @@ impl Grant {
         }
         Ok(())
     }
+    /// [`Self::readback_b22`] at the committed width: under `N2BB` words
+    /// 0..6 are the HT40 selection (`ht40::check8822b`), under `N2BV` the
+    /// whole 0x1d00/0x1d80 tables are the VHT80 ones (`vht::b22_tables`,
+    /// HT zero).
+    async fn readback_b22_at(
+        &self,
+        read: &mut impl super::firmware_transport::Read32,
+        wide: Option<&Wide>,
+    ) -> Result<(), Error> {
+        let legacy = self.base.b22_indices().ok_or(Error::Unsupported)?;
+        let tables = match wide {
+            None => return self.readback_b22(read).await,
+            Some(Wide::Forty(r)) => {
+                if r.mcs != self.mcs {
+                    return Err(Error::State);
+                }
+                super::ht40::check8822b(read, legacy, r).await?;
+                None
+            }
+            Some(Wide::Eighty(v)) => Some(super::vht::b22_tables(legacy, v)),
+        };
+        if read.read32(0x93c).await? >> 20 != 0x001
+            || read.read32(0x940).await? >> 4 & 0xfff != 0x43
+        {
+            return Err(Error::Prerequisite);
+        }
+        if let Some(tables) = tables {
+            for (base, table) in [0x1d00u16, 0x1d80].into_iter().zip(tables) {
+                for (w, rates) in table.chunks_exact(4).enumerate() {
+                    if (7..11).contains(&w) {
+                        continue;
+                    }
+                    let v = u32::from_le_bytes([rates[0], rates[1], rates[2], rates[3]]);
+                    if read.read32(base + w as u16 * 4).await? != v {
+                        return Err(Error::Prerequisite);
+                    }
+                }
+            }
+        }
+        if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
     fn words(&self) -> [u32; 16] {
         let mut bytes = [0; 64];
         let reference = i16::from(self.indices[7]);
@@ -772,8 +816,8 @@ impl Grant {
         mut read: impl super::firmware_transport::Read32,
         wide: Option<&Wide>,
     ) -> Result<(), Error> {
-        if wide.is_some() && self.base.did() == 0xb822 {
-            return Err(Error::Unsupported);
+        if self.base.did() == 0xb822 {
+            return self.readback_b22_at(&mut read, wide).await;
         }
         let r = match wide {
             None => return self.readback(read).await,

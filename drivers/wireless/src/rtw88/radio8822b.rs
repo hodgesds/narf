@@ -417,7 +417,9 @@ async fn channel_bb(io: &mut impl Io, info: Info, ch: u8, width: Width) -> Resul
 async fn channel_mac(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
     io.write8(0x483, width.data_sc()).await?;
     let trx = read(io, 0x668).await? & !(3 << 7);
-    io.write32(0x668, trx | width.rfmod()).await?;
+    // BIT_RFMOD_40M BIT(7) / BIT_RFMOD_80M BIT(8) (`Width::rfmod` is the
+    // unshifted field).
+    io.write32(0x668, trx | width.rfmod() << 7).await?;
     // BIT_MAC_CLK_SEL = MAC_CLK_HW_DEF_80M (0).
     let afe = read(io, 0x24).await? & !(3 << 20);
     io.write32(0x24, afe).await?;
@@ -684,6 +686,43 @@ pub(super) async fn verify_channel20(io: &mut impl Io, ch: u8) -> Result<(), Err
         || (cck & 0x80 != 0) != (ch > 14)
     {
         return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// Readback of `rtw8822b_set_channel(center, BW40/BW80, sc)`: RF18
+/// band/channel/BW on both paths, RF-A 0xbe[17:15], `_bb` 0x8ac (cleared
+/// fields plus `sc << 2 | bw`) and, at 40MHz, REG_RXSB 0xa00[4] (set for
+/// `RTW_SC_20_UPPER`), `rtw_set_channel_mac` REG_DATA_SC 0x483 and 0x668
+/// BIT_RFMOD, and CCK_CHECK 0x454 bit7 on 5GHz only. 20MHz is
+/// [`verify_channel20`].
+pub(super) async fn verify_channel(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
+    let (keep, set) = match width {
+        Width::Twenty => return verify_channel20(io, ch).await,
+        Width::Forty(_) => (0xff3ff300u32, 1u32),
+        Width::Eighty(_) => (0xfcefcf00, 2),
+    };
+    let expect = rf18(0, ch, width) & 0x70fff;
+    for path in 0..2 {
+        if rf_read(io, path, 0x18).await? & 0x70fff != expect {
+            return Err(Error::Prerequisite);
+        }
+    }
+    let be = rf_be(ch).filter(|&v| v != 0xff).ok_or(Error::Unsupported)?;
+    let sc = u32::from(width.sc() & 0xf) << 2;
+    let cck = io.read8(0x454).await?;
+    if (rf_read(io, 0, 0xbe).await? >> 15) & 7 != u32::from(be)
+        || read(io, 0x8ac).await? & !keep != sc | set
+        || io.read8(0x483).await? != width.data_sc()
+        || (read(io, 0x668).await? >> 7) & 3 != width.rfmod()
+        || cck == 255
+        || (cck & 0x80 != 0) != (ch > 14)
+    {
+        return Err(Error::Prerequisite);
+    }
+    if let Width::Forty(sc20) = width {
+        if (read(io, 0xa00).await? & 1 << 4 != 0) != (sc20 == 1) {
+            return Err(Error::Prerequisite);
+        }
     }
     Ok(())
 }

@@ -796,12 +796,30 @@ impl Gate {
     }
     /// B22 per-path TXAGC indices of the committed program for DESC_RATE
     /// 0..count: [`Self::b22_indices`], plus the bound `N2BH` HT words
-    /// (`ht::Grant::b22_rates`; count 20 for 1SS, 28 for 2SS).
+    /// (`ht::Grant::b22_rates`; count 20 for 1SS, 28 for 2SS), or under a
+    /// bound `N2BB` the HT40 words that replace them (`ht40::b22_words`).
+    /// Under a bound `N2BV` the program zeroes the HT words
+    /// (`vht::b22_words`), so only legacy12 is covered (VHT is not tracked).
     pub(super) fn b22_rate_indices(
         &self,
     ) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
         if let Some(g) = &self.ht {
-            return g.b22_rates();
+            if let Some(r) = self.ht40_record() {
+                let words = super::ht40::b22_words(self.b22_indices()?, &r);
+                let mut rates = [[0; super::tracking8822b::RATES]; 2];
+                for (rate, w) in rates.iter_mut().zip(words) {
+                    for (i, v) in w.into_iter().enumerate() {
+                        rate[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                // Path-B HT1S is programmed zero (1SS transmits on A):
+                // headroom uses path A's index, as for `N2BH`.
+                rates[1][12..20].copy_from_slice(&r.indices[..8]);
+                return Some((rates, if r.mcs & 0xff00 != 0 { 28 } else { 20 }));
+            }
+            if self.vht.is_none() {
+                return g.b22_rates();
+            }
         }
         let legacy = self.b22_indices()?;
         let mut rates = [[0; super::tracking8822b::RATES]; 2];
@@ -857,7 +875,7 @@ impl Gate {
                     calibration.board.ht40_groups.get(group).copied().flatten()
                 }
                 Scope::C21(g) => g.ht40_group(group).map(|m| (m, None)),
-                Scope::B22(..) => None,
+                Scope::B22(grant, _) => grant.power().ht40_limits(false, group),
             };
         }
         let group = super::band5::group(center)?;
@@ -869,7 +887,7 @@ impl Gate {
                 .copied()
                 .flatten(),
             Scope::C21(g) => g.ht40_5_group(group).map(|m| (m, None)),
-            Scope::B22(..) => None,
+            Scope::B22(grant, _) => grant.power().ht40_limits(true, group),
         }
     }
     /// Factory VHT80 `(1S, 2S)` index ceilings for an 80MHz `center`
@@ -885,7 +903,7 @@ impl Gate {
                 calibration.board.vht80_groups.get(group).copied().flatten()
             }
             Scope::C21(g) => g.vht80_group(group).map(|m| (m, None)),
-            Scope::B22(..) => None,
+            Scope::B22(grant, _) => grant.power().vht80_limits(group),
         }
     }
     /// C22 5GHz OFDM6..54 both-path selection of the bound 5GHz N2xO

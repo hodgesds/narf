@@ -697,9 +697,59 @@ path-B HT1S zero; legacy words keep the base/`N2BO` values. Readback
 (`readback_b22`) checks 0x93c/0x940, both paths' words 0..6 and host-only
 crypto. Under a bound `N2BH` the `N2BD` power tracker covers DESC_RATE
 0..19/0..27 (`Gate::b22_rate_indices`; path-B HT1S headroom uses path A's
-index); HT40/VHT80 B22 readbacks refuse until the B22 wide records exist. No
-`N2BH` asset is provisioned. Case written, unexecuted:
+index). No `N2BH` asset is provisioned. Case written, unexecuted:
 `smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl`.
+
+The B22 retune (`channel_policy::program8822b`) writes legacy12-only TXAGC
+tables, so it refuses a gate with any extension bound
+(`Gate::base_only`); the PCI retune owner (`station_retune_begin`) already
+required that, as on C21/C22, so a retune or CSA never zeroes bound HT/VHT
+words.
+
+#### RTL8822BE HT40 (`N2BB`) and VHT80 (`N2BV`) widening
+
+B22 joins the shared N2xB/N2xV families (`ht40.rs`, `vht.rs`; "Separately
+qualified HT40" / "VHT80" below) with the generic continuation layout and
+magics `N2BB`/`N2BV` (`qualification`, chip byte `B`); every B22 request
+additionally hashes `ht40::SOURCE8822B` / `vht::SOURCE8822B`. Payload
+differences: indices are absolute `rtw8822b_set_tx_power_index_by_rate`
+values ≤ `max_power_index` 0x3f (no C22 MCS7 reference); `N2BB` bytes
+16..32 are path-A MCS0..15 and 32..40 path-B MCS8..15 (zero outside the MCS
+mask, 40..64 zero); `N2BV` bytes 16..36 are path-A VHT1SS/2SS MCS0..9 and
+36..46 path-B VHT2SS MCS0..9 (zero for one stream, 46..64 zero).
+
+Ceilings (`operating8822b::Envelope::ht40_limits`/`vht80_limits`, reached
+through `Gate::ht40_limits`/`vht80_limits`): `phy.c::
+rtw_phy_get_2g_tx_power_index` at BW40 is `bw40_base[group(center)]` ("bw40
+is the base power") plus `ht_2s_diff.bw40` (signed high nibble of byte 12)
+for 2SS (`operating8822b::ht40_limit`); 5GHz uses `band5::Power5g::bw40`
+and, at BW80, `Power5g::bw80` (the average of `bw40_base[g]` and `[g+1]`
+plus `vht_1s_diff.bw80` (+ `vht_2s_diff.bw80`)); `txgi_factor` 1, both
+paths intersected. Path-B indices must also be within the 2S ceiling.
+
+Programs (inside `station_width_begin`'s TX pause/drain, as for C21/C22):
+`ht40::program8822b` runs `radio8822b::set_channel(center, BW40, sc)`
+(`rtw8822b_set_channel`), writes words 0..6 of both paths
+(`ht40::b22_words`: legacy12 at the committed `N2BO`/`N2BP` indices,
+path-A MCS0..7, MCS8..15 per path for two streams, path-B HT1S zero),
+runs `rtw8822b_do_iqk` (`channel_policy::iqk8822b`), then reads back
+`radio8822b::verify_channel` (RF18 A+B, RF 0xbe, 0x8ac `sc << 2 | bw`,
+0xa00[4] at 40MHz, 0x483 DATA_SC, 0x668 BIT_RFMOD, CCK_CHECK), the words
+and RRSR (0x1f 2.4GHz, 0x10 5GHz). `vht::program8822b` does the same at
+`(center80, BW80, sc)` with the whole per-path DESC_RATE tables
+(`vht::b22_tables`: legacy12 with CCK zero, HT zero as on C22, path-A
+VHT1SS MCS0..9 at 0x2c..0x35, VHT2SS per path at 0x36..0x3f) and RRSR
+0x10. `rtw_set_channel_mac` BIT_RFMOD was written unshifted by the B22
+`channel_mac` (harmless at 20MHz only); it is now `BIT_RFMOD_40M` BIT(7) /
+`_80M` BIT(8). The operating readback (`ht::Grant::readback_at` →
+`readback_b22_at`) checks the 1SS-A/2SS-AB path selection, the committed
+width's words and host-only crypto. Under a bound `N2BB` the `N2BD` power
+tracker offsets against the HT40 words (`Gate::b22_rate_indices`); under
+`N2BV` only legacy12 (VHT is not tracked). RX bandwidth follows the 8821C
+page-1 RXSC/RF_MODE layout (`pci_packet::receive_chip` C21 for B22,
+`rtw8822b.c::query_phy_status_page1`). No `N2BB`/`N2BV` asset is
+provisioned. Case written, unexecuted:
+`smoke_rtw8822be_n2bb_n2bv_wide_records_limits_and_bw40_readback`.
 
 #### RTL8822BE documented gaps: LPS and Bluetooth coexistence
 

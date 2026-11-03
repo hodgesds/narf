@@ -137,6 +137,25 @@ pub(super) fn ht20_limit(raw: &[u8], group: usize, two: bool) -> Option<u8> {
     }
     (v >= 0).then_some(v.min(63) as u8)
 }
+/// `phy.c::rtw_phy_get_2g_tx_power_index` HT40 over a raw path record for
+/// one 2.4GHz `rtw_get_channel_group` group of the 40MHz center,
+/// `txgi_factor` 1: `bw40_base[group]` ("bw40 is the base power"), plus
+/// `ht_2s_diff.bw40` (signed high nibble of byte 12) for two streams,
+/// capped at `max_power_index` 0x3f. Erased or wrapped cells fail.
+pub(super) fn ht40_limit(raw: &[u8], group: usize, two: bool) -> Option<u8> {
+    if group > 4 || raw.len() < 13 || raw[6 + group] > 63 {
+        return None;
+    }
+    let mut v = i16::from(raw[6 + group]);
+    if two {
+        if raw[12] == 255 {
+            return None;
+        }
+        let n = i16::from(raw[12] >> 4);
+        v += if n & 8 != 0 { n - 16 } else { n };
+    }
+    (v >= 0).then_some(v.min(63) as u8)
+}
 /// Both B22 RF paths (`txpwr_idx_table[0]`/`[1]`, `rtw8822b_read_efuse`).
 pub(super) fn board_limits(factory: &Factory8822b) -> Result<[[u8; 2]; 2], QError> {
     let path = |p| factory.power_path(p).ok_or(QError::Factory);
@@ -368,7 +387,7 @@ impl Envelope {
     /// intersected over both paths. The 2S ceiling is None when either
     /// path's HT2S cell is erased.
     pub(super) fn ht_limits(&self, five: bool, group: usize) -> Option<(u8, Option<u8>)> {
-        let one = |p: &[u8], two| {
+        self.intersect(|p, two| {
             if five {
                 super::band5::Power5g::parse(p)?
                     .bw20(group, two, 1)
@@ -376,7 +395,35 @@ impl Envelope {
             } else {
                 ht20_limit(p, group, two)
             }
-        };
+        })
+    }
+    /// HT40 `(1S, 2S)` factory ceilings of the 40MHz center's group
+    /// (2.4GHz [`ht40_limit`], or 5GHz `band5::Power5g::bw40`, factor 1,
+    /// ≤ 0x3f), intersected over both paths.
+    pub(super) fn ht40_limits(&self, five: bool, group: usize) -> Option<(u8, Option<u8>)> {
+        self.intersect(|p, two| {
+            if five {
+                super::band5::Power5g::parse(p)?
+                    .bw40(group, two, 1)
+                    .filter(|v| *v <= 63)
+            } else {
+                ht40_limit(p, group, two)
+            }
+        })
+    }
+    /// VHT80 `(1S, 2S)` factory ceilings of the 80MHz center's 5GHz group
+    /// (`phy.c::rtw_phy_get_5g_tx_power_index` BW80 = `band5::Power5g::bw80`,
+    /// factor 1, ≤ 0x3f), intersected over both paths.
+    pub(super) fn vht80_limits(&self, group: usize) -> Option<(u8, Option<u8>)> {
+        self.intersect(|p, two| {
+            super::band5::Power5g::parse(p)?
+                .bw80(group, two, 1)
+                .filter(|v| *v <= 63)
+        })
+    }
+    /// `(1S, 2S)` of `one` intersected over both paths; the 2S ceiling is
+    /// None when either path's cell is erased.
+    fn intersect(&self, one: impl Fn(&[u8], bool) -> Option<u8>) -> Option<(u8, Option<u8>)> {
         let maximum = one(&self.paths[0], false)?.min(one(&self.paths[1], false)?);
         let two = one(&self.paths[0], true).zip(one(&self.paths[1], true));
         Some((maximum, two.map(|(a, b)| a.min(b))))

@@ -91,6 +91,8 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
             b'O' => hash.update(super::channel_policy::SOURCE8822B),
             b'D' => hash.update(super::dm::SOURCE8822B),
             b'W' => hash.update(super::tracking8822b::SOURCE),
+            b'B' => hash.update(super::ht40::SOURCE8822B),
+            b'V' => hash.update(super::vht::SOURCE8822B),
             _ => {}
         }
     }
