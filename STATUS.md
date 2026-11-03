@@ -1830,7 +1830,7 @@ registry/physical PCI power callbacks or S3 executions. Physical Intel, Mesa,
 codec and performance acceptance remain unrun. No silicon or full physical
 owner result is claimed; OA and all ten broad workstreams remain open.
 
-### MTL legacy modeset failure correction — debug checkpoint; release gates pending
+### MTL legacy modeset failure correction — software gates recorded
 
 This corrects false success in the existing MTL/Arrow legacy modeset path; it
 adds no feature row. The ledger remains at 65 rows with all ten broad workstreams
@@ -1852,7 +1852,7 @@ retains 1,086 names unchanged plus the replacement. All prior 152 cumulative new
 labels remain; four additions and one replacement make 157 new-or-replacement
 labels, not five added tests. Group 3 grows to 189; group 5 stays at 197.
 
-All seven debug groups pass 1,912 unique tests with zero failures or duplicates, no Intel skips and the one existing shared RNG-registration skip. The four additions, exact TC replacement, preserved baseline/cumulative inventories and 31 backlight regressions pass. Release native, production/btrfs and remaining cross-target/host/format gates are pending.
+All seven debug and release groups each pass 1,912 unique tests with zero failures or duplicate names, no Intel skips and one existing shared RNG-registration skip. The four additions, exact TC replacement, preserved baseline/cumulative inventories and 31 backlight regressions pass. Release production boot and both btrfs postflights, both-target CI Clippy, four host vendor all-target Clippy configurations, both-target changed-package debug/release builds, formatting, diff and exact 119 source/linker hashes pass. aarch64 QEMU is omitted under the existing iteration policy; no aarch64-native execution result is claimed.
 
 The fixtures use actual dispatch and an actual scheduler task over modeled
 hardware. Full physical RuntimeOwner, positive firmware registry, PCI power
