@@ -49,8 +49,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             || self.in_client_scope
             || self.scan_pending.is_some()
             || self.roc.is_some()
-            || self.ap.is_some()
+            || self.ap.is_some() && !self.ap_is_go()
             || self.ap_staging.is_some()
+            || Some(address) == self.go_identity().map(|(_, own)| own)
             || address == [0; 6]
             || address[0] & 1 != 0
             || Some(address) == self.ready.map(|r| r.mac)
@@ -139,10 +140,28 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// channels and firmware schedules them.
     pub(super) fn sibling_channel_admits(&self, frequency: u16) -> bool {
         self.adaptive_qcs
-            || self
+            || (self
                 .p2p_client
                 .as_deref()
                 .and_then(|s| s.peer.as_ref())
                 .is_none_or(|peer| peer.permission.frequency == frequency)
+                && self.go_channel_admits(frequency))
+    }
+    /// A running GO's operating channel is the other vif of the
+    /// one-channel combination.
+    fn go_channel_admits(&self, frequency: u16) -> bool {
+        self.ap
+            .as_ref()
+            .filter(|ap| ap.plan.role == p2p::Role::P2pGo)
+            .is_none_or(|ap| ap.plan.config.frequency_mhz == u32::from(frequency))
+    }
+    /// Every station slot with a peer (home and P2P client) is on
+    /// `frequency`: the one-channel rule for a GO start.
+    pub(super) fn slots_on_channel(&self, frequency: u16) -> bool {
+        [Some(&self.station), self.p2p_client.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|slot| slot.peer.as_ref())
+            .all(|peer| peer.permission.frequency == frequency)
     }
 }

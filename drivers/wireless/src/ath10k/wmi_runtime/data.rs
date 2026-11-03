@@ -1498,10 +1498,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             match data.pending.complete(receipt) {
                 Completion::Foreign => {
+                    // The GO session's own msdu id completes there.
+                    let go = self
+                        .ap
+                        .as_deref_mut()
+                        .is_some_and(|ap| ap.go_receipt(receipt));
                     if let Some(sibling) = self
                         .p2p_client
                         .as_deref_mut()
-                        .filter(|s| s.owns_msdu(receipt.id))
+                        .filter(|s| !go && s.owns_msdu(receipt.id))
                     {
                         sibling.receipts.push_back(receipt);
                     }

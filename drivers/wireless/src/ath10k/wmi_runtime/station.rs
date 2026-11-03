@@ -942,6 +942,20 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.station_event(event)
     }
     pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        // A GO beside this slot consumes the events it owns.
+        if self.ap_is_go() {
+            let frame = self.management_frame(&event);
+            let primary = self.primary.id();
+            if !self.station.claims(&event, primary, frame.as_deref()) {
+                match self.route_go(event, frame.as_deref()) {
+                    Some(event) => return self.station_event_owned(event),
+                    None => return Ok(htt::Event::Progress),
+                }
+            }
+        }
+        self.station_event_owned(event)
+    }
+    fn station_event_owned(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
         self.observe_beacon_hint_event(&event)?;
         self.observe_dwell_scan(&event)?;
         self.observe_roc(&event)?;
@@ -950,16 +964,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
                 if let Some(reports) = management::completions(bytes)? {
+                    let mut ids = Vec::new();
+                    ids.try_reserve_exact(reports.len())
+                        .map_err(|_| Error::NoMemory)?;
+                    ids.extend(reports.iter().map(|r| r.id));
+                    // The GO's own descriptors complete on its session.
+                    let reports = self.route_go_management(reports);
                     if self.management_done.len() + reports.len() > 128 {
                         return Err(Error::Exhausted);
                     }
                     self.management_done
                         .try_reserve(reports.len())
                         .map_err(|_| Error::NoMemory)?;
-                    let mut ids = Vec::new();
-                    ids.try_reserve_exact(reports.len())
-                        .map_err(|_| Error::NoMemory)?;
-                    ids.extend(reports.iter().map(|r| r.id));
                     self.htt.wmi.htc.transport.complete_wmi_management(&ids)?;
                     self.management_done.extend(reports);
                     return Ok(htt::Event::Progress);

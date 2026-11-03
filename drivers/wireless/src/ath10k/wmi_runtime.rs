@@ -741,26 +741,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// or consumes it; return every other event unchanged. With no P2P
     /// client slot this is the identity.
     pub(super) fn route_sibling(&mut self, event: htt::Event) -> Option<htt::Event> {
-        if self.p2p_client.is_none() {
+        if self.p2p_client.is_none() && !self.ap_is_go() {
             return Some(event);
         }
-        let frame = match &event {
-            htt::Event::Wmi(bytes)
-                if bytes.len() > 4
-                    && wire::word(bytes, 0)
-                        .is_ok_and(|w| w & 0xffffff == self.wire.management_event) =>
-            {
-                self.wire
-                    .management(&bytes[4..], self.features)
-                    .ok()
-                    .map(|m| m.frame)
-            }
-            _ => None,
-        };
+        let frame = self.management_frame(&event);
         let primary = self.primary.id();
         if self.station.claims(&event, primary, frame.as_deref()) {
             return Some(event);
         }
+        // A GO beside the station slots consumes what it owns.
+        let event = self.route_go(event, frame.as_deref())?;
         match self
             .p2p_client
             .as_deref_mut()
@@ -901,6 +891,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         loop {
             let receipt = self.htt.take_tx_receipt()?;
+            if !self.station.owns_msdu(receipt.id) && self.route_go_receipt(receipt) {
+                continue;
+            }
             if !self.station.owns_msdu(receipt.id) {
                 if let Some(sibling) = self
                     .p2p_client

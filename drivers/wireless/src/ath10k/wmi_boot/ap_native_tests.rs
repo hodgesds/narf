@@ -1818,3 +1818,41 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_go_own_vdev_start_and_teardown
 );
+/// AP <-> station-slot routing: a GO on vdev 1 shares the radio, so a
+/// PEER_MAP for the managed vdev 0 (a station-side peer,
+/// `ath10k_peer_map_event` byte 1) polled by the GO is not its peer and
+/// does not fail it; the GO keeps running and stops cleanly.
+fn smoke_ath10k_p2p_go_ignores_other_vdev_peer_map() -> TestResult {
+    let b = Bound::with(true);
+    if b.start(false).is_err() {
+        return TestResult::Fail("GO start on its own vdev");
+    }
+    b.model(|m| {
+        let mut out = vec![3, 0];
+        out.extend_from_slice(&7u16.to_le_bytes());
+        out.extend_from_slice(&[2, 0x55, 3, 4, 5, 6]);
+        out.extend_from_slice(&[0, 0]);
+        m.inner
+            .inner
+            .rx
+            .push_back((m.inner.receive_pipe, header(1, &out)));
+    });
+    {
+        let mut radio = b.device.radio.try_lock().unwrap();
+        if radio.ap_poll_now(&station_tests::policy()).is_err() || !radio.ap_running() {
+            return TestResult::Fail("vdev 0 PEER_MAP failed the GO");
+        }
+    }
+    let authority = b.authority();
+    if !matches!(
+        drive(b.device.stop_ap_async(&authority)),
+        Poll::Ready(Ok(()))
+    ) {
+        return TestResult::Fail("GO stop after foreign PEER_MAP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_go_ignores_other_vdev_peer_map
+);

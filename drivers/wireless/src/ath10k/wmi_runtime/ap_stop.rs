@@ -139,7 +139,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let Some(vdev) = go {
             // The managed vdev was never replaced: nothing to restore. The
             // id returns to the map only after the genuine delete response.
-            if self.htt.wmi.htc.transport.pending_htt_tx()? != 0 {
+            // Its own TX all completed (`ap_quiet`); in-flight MSDUs on the
+            // HTT pool belong to the station slots.
+            if self
+                .ap
+                .as_ref()
+                .unwrap()
+                .pending
+                .iter()
+                .any(|packet| packet.status.is_none())
+            {
                 return Err(Error::Failed);
             }
             self.ap.as_mut().unwrap().vdev = Vdev::Retired;

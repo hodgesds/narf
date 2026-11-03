@@ -109,8 +109,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Consume only the one physical runtime's genuine received events. Every
     /// native copied packet retains its original AP/copy/DATA/source epochs.
     pub(super) fn ap_event(&mut self, event: htt::Event) -> Result<bool, Error> {
+        // A GO shares the radio with station slots: what a slot owns (its
+        // peer's RX, BA notes, BSS management) is parked for that slot.
+        let event = match self.park_station_owned(event) {
+            Some(event) => event,
+            None => return Ok(false),
+        };
         if let htt::Event::Wmi(bytes) = &event {
-            if let Some(reports) = self
+            if let Some((reports, foreign)) = self
                 .ap
                 .as_mut()
                 .ok_or(Error::Failed)?
@@ -121,6 +127,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .map_err(|_| Error::NoMemory)?;
                 ids.extend(reports.iter().map(|report| report.id));
                 self.htt.wmi.htc.transport.complete_wmi_management(&ids)?;
+                // A station slot's completions, as `station_event` keeps
+                // them (bounded 128).
+                if self.management_done.len() + foreign.len() > 128 {
+                    return Err(Error::Exhausted);
+                }
+                self.management_done
+                    .try_reserve(foreign.len())
+                    .map_err(|_| Error::NoMemory)?;
+                self.management_done.extend(foreign);
                 return Ok(false);
             }
             let id = wire::word(bytes, 0)? & 0xffffff;
@@ -179,6 +194,107 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .ok_or(Error::Failed)?
             .htt_completions(htt)?;
         Ok(false)
+    }
+    /// The decoded WMI management RX frame of `event`, if it is one.
+    pub(super) fn management_frame(&self, event: &htt::Event) -> Option<Vec<u8>> {
+        match event {
+            htt::Event::Wmi(bytes)
+                if bytes.len() > 4
+                    && wire::word(bytes, 0)
+                        .is_ok_and(|w| w & 0xffffff == self.wire.management_event) =>
+            {
+                self.wire
+                    .management(&bytes[4..], self.features)
+                    .ok()
+                    .map(|m| m.frame)
+            }
+            _ => None,
+        }
+    }
+    /// GO side of the AP <-> station-slot routing: an event the AP poll
+    /// read but a station slot owns (`StationSlot::claims`) goes to that
+    /// slot's inbox. An ordinary AP replaced the station role and has no
+    /// slot beside it, so this is the identity.
+    fn park_station_owned(&mut self, event: htt::Event) -> Option<htt::Event> {
+        if !self.ap_is_go() {
+            return Some(event);
+        }
+        let frame = self.management_frame(&event);
+        let primary = self.primary.id();
+        if self.station.claims(&event, primary, frame.as_deref()) {
+            self.station.park(event);
+            return None;
+        }
+        match self
+            .p2p_client
+            .as_deref_mut()
+            .filter(|s| s.claims(&event, primary, frame.as_deref()))
+        {
+            Some(slot) => {
+                slot.park(event);
+                None
+            }
+            None => Some(event),
+        }
+    }
+    /// Station side of the routing: an event a station owner polled that
+    /// the GO session owns (`Session::claims`) is consumed by the GO now
+    /// (`ap_event` only updates session state and its bounded RX queue).
+    /// A GO that cannot consume it is failed for its own netdev's
+    /// cleanup; the station owner continues.
+    pub(super) fn route_go(
+        &mut self,
+        event: htt::Event,
+        frame: Option<&[u8]>,
+    ) -> Option<htt::Event> {
+        if !self
+            .ap
+            .as_ref()
+            .is_some_and(|ap| ap.plan.role == super::p2p::Role::P2pGo && ap.claims(&event, frame))
+        {
+            return Some(event);
+        }
+        if self.ap_event(event).is_err() {
+            if let Some(ap) = self.ap.as_mut() {
+                ap.failed = true;
+            }
+        }
+        None
+    }
+    /// A station owner's TX completion that belongs to the GO session
+    /// (its HTT msdu id); `false` leaves it to the station owner.
+    pub(super) fn route_go_receipt(&mut self, receipt: htt::TxReceipt) -> bool {
+        self.ap
+            .as_deref_mut()
+            .is_some_and(|ap| ap.go_receipt(receipt))
+    }
+    /// A station owner's WMI management completions minus the GO's own
+    /// (completed on the GO session).
+    pub(super) fn route_go_management(
+        &mut self,
+        reports: Vec<super::ManagementCompletion>,
+    ) -> Vec<super::ManagementCompletion> {
+        let Some(ap) = self
+            .ap
+            .as_mut()
+            .filter(|ap| ap.plan.role == super::p2p::Role::P2pGo)
+        else {
+            return reports;
+        };
+        let mut station = reports;
+        station.retain(|report| {
+            if !ap.owns_token(Token::Wmi(report.id)) {
+                return true;
+            }
+            if ap
+                .terminal(Token::Wmi(report.id), report.status == 0)
+                .is_err()
+            {
+                ap.failed = true;
+            }
+            false
+        });
+        station
     }
     pub(super) async fn ap_wait(
         &mut self,
@@ -343,7 +459,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             validate,
         )
         .await?;
-        if self.htt.wmi.htc.transport.pending_htt_tx()? != 0 {
+        // A GO shares the HTT TX pool with station slots: its own pending
+        // TX all completed above; the slots' in-flight MSDUs are theirs.
+        if !self.ap_is_go() && self.htt.wmi.htc.transport.pending_htt_tx()? != 0 {
             return Err(Error::Failed);
         }
         self.ap_prefix(validate).await
@@ -415,12 +533,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate()?;
         let domain = policy.domain();
         let init = self.ready.ok_or(Error::Failed)?.mac;
+        // The managed netdev's AP replaces the station role, so its slot
+        // must be idle; a GO runs beside the station slots (their events
+        // are routed both ways, `route_go`/`park_station_owned`).
         if !policy.current()
             || !self.ap_supported()
             || self.failed
             || self.ap.is_some()
-            || self.station.peer.is_some()
-            || self.station.data.is_some()
+            || go.is_none() && (self.station.peer.is_some() || self.station.data.is_some())
             || self.roc.is_some()
             || self.scan_pending.is_some()
             || !emission.current()
@@ -429,14 +549,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         if let Some(own) = go {
             // TLV P2P firmware; the GO address is its own unicast vif
-            // address, never another vdev's.
+            // address, never another vdev's. One channel
+            // (`ath10k_tlv_if_limit`) unless adaptive QCS was enabled
+            // (`ath10k_tlv_qcs_if_limit`: AP/P2P_GO <= 1 on two channels).
+            let client = self.p2p_client_identity().map(|(_, own)| own);
+            let frequency = u16::try_from(config.frequency_mhz).unwrap_or(0);
             if !self.p2p_supported()
                 || self.in_client_scope
-                || self.p2p_client.is_some()
                 || own == [0; 6]
                 || own[0] & 1 != 0
                 || own == init
+                || Some(own) == client
                 || self.p2p_device.is_some() && own == self.p2p_device_mac
+                || !self.adaptive_qcs && !self.slots_on_channel(frequency)
             {
                 return Err(Error::Unsupported);
             }

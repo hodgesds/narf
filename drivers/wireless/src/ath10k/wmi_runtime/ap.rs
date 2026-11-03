@@ -230,6 +230,9 @@ pub(super) struct Pending {
     /// DATA is accounted independently from a control's terminal ACK.
     pub control: bool,
 }
+/// A management completion batch: every report, and those another owner
+/// (a station slot beside a GO) must complete.
+pub(super) type ManagementSplit = (Vec<management::Completion>, Vec<management::Completion>);
 pub(in crate::ath10k) struct Session {
     pub(super) policy: Policy,
     pub(super) plan: ap_wire::Plan,
@@ -599,23 +602,125 @@ impl Session {
         }
         Ok(())
     }
+    /// A WMI management TX completion batch. A GO beside station slots
+    /// completes only its own pending ids (`wmi.c` resolves each
+    /// `desc_id` to its skb and vif); the others are returned for the
+    /// station owner. An ordinary AP owns the radio alone, so any unknown
+    /// id stays malformed.
     pub fn management_completions(
         &mut self,
         bytes: &[u8],
-    ) -> Result<Option<Vec<management::Completion>>, Error> {
-        let reports = management::completions(bytes)?;
-        if let Some(reports) = &reports {
-            for report in reports {
-                self.terminal(Token::Wmi(report.id), report.status == 0)?;
+    ) -> Result<Option<ManagementSplit>, Error> {
+        let Some(reports) = management::completions(bytes)? else {
+            return Ok(None);
+        };
+        let go = self.plan.role == super::p2p::Role::P2pGo;
+        let mut foreign = Vec::new();
+        for report in &reports {
+            if go && !self.owns_token(Token::Wmi(report.id)) {
+                foreign.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                foreign.push(*report);
+                continue;
             }
+            self.terminal(Token::Wmi(report.id), report.status == 0)?;
         }
-        Ok(reports)
+        Ok(Some((reports, foreign)))
+    }
+    /// A GO's own HTT TX completion read by a station owner; `false`
+    /// leaves it to that owner. A duplicate fails the GO session only.
+    pub(super) fn go_receipt(&mut self, receipt: htt::TxReceipt) -> bool {
+        if self.plan.role != super::p2p::Role::P2pGo || !self.owns_token(Token::Htt(receipt.id)) {
+            return false;
+        }
+        if self
+            .terminal(Token::Htt(receipt.id), receipt.status == 0)
+            .is_err()
+        {
+            self.failed = true;
+        }
+        true
+    }
+    /// An outstanding TX of this session (`txrx.c::ath10k_txrx_tx_unref`:
+    /// the msdu/desc id names its skb and so its vif).
+    pub(super) fn owns_token(&self, token: Token) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.token == token && pending.status.is_none())
+    }
+    /// Whether this session owns an event another owner polled: legacy RX
+    /// by one of its peer ids (`ath10k_htt_rx_h_ppdu` -> `peer->vif`), an
+    /// in-order indication by its vdev, a PEER_MAP for its vdev
+    /// (`ath10k_peer_map_event`), UNMAP/ADDBA/DELBA by its peer ids, WMI
+    /// management RX addressed to its BSS (A1 or A3 its address, mac80211
+    /// vif matching), and the WMI events naming its vdev (START_RESP,
+    /// STOPPED, beacon TX status, PEER_DELETE_RESP, P2P NoA) or answering
+    /// its outstanding echo or vdev delete.
+    pub(super) fn claims(&self, event: &htt::Event, frame: Option<&[u8]>) -> bool {
+        let owns =
+            |id: u16| self.own.owns(id) || self.peers.iter().any(|peer| peer.record.owns(id));
+        let id_at = |b: &[u8]| u16::from_le_bytes([b[2], b[3]]);
+        match event {
+            htt::Event::Rx(batch) => owns(batch.peer),
+            htt::Event::InOrder(indication, _) => indication.vdev == self.plan.vdev,
+            htt::Event::Message(b) => match b.first() {
+                Some(3) => b.len() == 12 && b[1] == self.plan.vdev,
+                Some(4) => b.len() >= 4 && owns(id_at(b)),
+                Some(5 | 6) => b.len() == 4 && owns(id_at(b) >> 4),
+                _ => false,
+            },
+            htt::Event::Wmi(bytes) => match frame {
+                Some(f) => f.len() >= 22 && (f[4..10] == self.own.mac || f[16..22] == self.own.mac),
+                None => self.claims_wmi(bytes),
+            },
+            _ => false,
+        }
+    }
+    fn claims_wmi(&self, bytes: &[u8]) -> bool {
+        let (Ok(id), Some(body)) = (wire::word(bytes, 0), bytes.get(4..)) else {
+            return false;
+        };
+        let first = |tag: u16| {
+            wire::tag(body, tag)
+                .ok()
+                .and_then(|b| wire::word(b, 0).ok())
+        };
+        let mine = Some(u32::from(self.plan.vdev));
+        match id & 0xffffff {
+            0x1d001 => self.echo != self.echo_seen && first(54) == Some(self.echo),
+            0x5006 => self.vdev == Vdev::DeleteSent,
+            0x5001 => first(40) == mine,
+            0x5002 => first(41) == mine,
+            0x7004 => first(222) == mine,
+            0x6007 => first(451) == mine,
+            0xd002 => first(223) == mine,
+            _ => false,
+        }
     }
     pub fn htt_completions(
         &mut self,
         htt: &mut htt::Runtime<impl super::Hif + super::HostMemory + super::HttMemory>,
     ) -> Result<(), Error> {
-        while let Some(receipt) = htt.take_tx_receipt() {
+        if self.plan.role == super::p2p::Role::P2pGo {
+            // Station slots share the HTT receipt queue: take only this
+            // session's ids and leave the others for their owners.
+            let mut index = 0;
+            while let Some(pending) = self.pending.get(index) {
+                index += 1;
+                let Token::Htt(id) = pending.token else {
+                    continue;
+                };
+                if pending.status.is_some() {
+                    continue;
+                }
+                if let Some(receipt) = htt.take_tx_receipt_for(id) {
+                    self.terminal(Token::Htt(receipt.id), receipt.status == 0)?;
+                }
+            }
+        }
+        while self.plan.role != super::p2p::Role::P2pGo {
+            let Some(receipt) = htt.take_tx_receipt() else {
+                break;
+            };
             self.terminal(Token::Htt(receipt.id), receipt.status == 0)?;
         }
         self.pending

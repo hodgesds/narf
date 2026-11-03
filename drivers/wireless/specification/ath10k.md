@@ -2155,9 +2155,32 @@ will bind; none of them grants RF, peer, key or data authority.
   not recreate a station vdev; a start refused before any publication
   returns the id at once. The AP session's PEER_MAP must carry its own
   vdev (byte 1, `ath10k_peer_map_event`); another vdev's MAP is not its
-  peer and is ignored (before, any non-zero vdev was malformed). Concurrency with the home station is the
-  routing step below; until then a GO start still needs the home slot
-  idle.
+  peer and is ignored (before, any non-zero vdev was malformed).
+- **GO beside station slots (routing).** Unlike the managed netdev's AP,
+  a GO may start while the home station (and a P2P client slot) has a
+  peer and data owner; it must not reuse the client's address. One
+  channel (`ath10k_tlv_if_limit`): every slot with a peer must be on the
+  GO's frequency, and a slot's BSS prepare must be on the running GO's
+  frequency (`slots_on_channel`, `go_channel_admits` in
+  `sibling_channel_admits`), unless adaptive QCS was enabled
+  (`ath10k_tlv_qcs_if_limit`, AP/P2P_GO <= 1 on two channels). Events are
+  handed over by owner both ways. `Session::claims` (legacy RX by the
+  GO's peer ids, in-order RX by its vdev, PEER_MAP for its vdev,
+  UNMAP/ADDBA/DELBA by its peer ids, WMI management whose A1 or A3 is the
+  GO address, START_RESP/STOPPED/beacon status/PEER_DELETE_RESP/NoA naming
+  its vdev, its outstanding echo and vdev delete): `route_sibling` (every
+  station queue and discard loop) and `station_event` (station waits and
+  the data step) give a GO-claimed event to `ap_event` at once; a GO that
+  cannot consume it is failed for its own netdev's cleanup while the
+  station continues. `ap_event` on a GO first parks what a station slot
+  claims in that slot's inbox (`park_station_owned`). TX completions
+  follow the id (`txrx.c::ath10k_txrx_tx_unref`): the GO takes only its
+  own HTT ids (`take_tx_receipt_for`), `take_station_receipt` and the data
+  step's foreign arm hand a GO id to the session (`go_receipt`), and WMI
+  management completion batches are split by descriptor id (the GO's on
+  its session, the rest to the station's bounded `management_done`). A GO
+  teardown proves only its own TX quiet (the HTT pool may hold the
+  slots' MSDUs); the ordinary AP keeps the whole-pool proof.
 - **NoA / opportunistic PS.** Linux ath10k never programs CTWindow/OppPS or
   a NoA schedule from the host; firmware owns both and reports them.
   `Noa::tlv_event` decodes `WMI_TLV_P2P_NOA_EVENTID` (0xd002, tags 223
@@ -2373,6 +2396,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_station_builders_carry_vdev`,
 `smoke_ath10k_p2p_ap_builders_carry_vdev`,
 `wmi_boot/ap_native_tests.rs` `smoke_ath10k_p2p_go_own_vdev_start_and_teardown`,
+`smoke_ath10k_p2p_go_ignores_other_vdev_peer_map`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
 `smoke_ath10k_p2p_client_scan_on_client_vdev`,
