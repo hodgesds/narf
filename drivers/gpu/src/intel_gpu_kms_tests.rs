@@ -78,7 +78,16 @@ struct Hardware {
     xr30_pci: Option<u16>,
     xr30_epoch: u64,
     xr30_epoch_on_read: Option<(u64, u64)>,
+    /// Pipe-A eDP sink DPCD for PSR; `None` answers no AUX at all.
+    psr_dpcd: Option<BTreeMap<u32, u8>>,
+    psr_timing: Option<crate::intel_gpu_dsb::Timing>,
+    psr_wm: Option<bool>,
+    /// DSM offset an FBC CFB is placed at (1:1); `None` places nothing.
+    fbc_offset: Option<u32>,
 }
+/// Sink AUX writes are logged in the MMIO write log at this pseudo offset
+/// plus the DPCD address, so register and sink order can be compared.
+pub(crate) const AUX_LOG: u64 = 1 << 40;
 #[derive(Clone, Debug)]
 pub(crate) struct MockPlatform(
     Arc<IrqSafeSpinLock<Hardware>>,
@@ -152,6 +161,10 @@ impl MockPlatform {
                 xr30_pci: None,
                 xr30_epoch: 0,
                 xr30_epoch_on_read: None,
+                psr_dpcd: None,
+                psr_timing: None,
+                psr_wm: None,
+                fbc_offset: None,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -1063,6 +1076,67 @@ impl Platform for MockPlatform {
     fn recovery_complete(&self) {
         self.1.store(false, Ordering::Release);
     }
+    fn psr_timing(&self) -> Option<crate::intel_gpu_dsb::Timing> {
+        self.0.lock().psr_timing
+    }
+    fn psr_aux<'a>(
+        &self,
+        request: &crate::dp_aux::AuxRequest<'_>,
+        reply: &'a mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
+        use crate::dp_aux::{AuxCommand, AuxError, AuxResponse, AuxStatus};
+        let lost = self.reset_lost() && !self.2;
+        let mut hw = self.0.lock();
+        if lost || !hw.allowed || !hw.powered {
+            return Err(AuxError::ShortReply);
+        }
+        let hw = &mut *hw;
+        let dpcd = hw.psr_dpcd.as_mut().ok_or(AuxError::Nacked)?;
+        match request.cmd {
+            AuxCommand::NativeWrite => {
+                for (i, byte) in request.data.iter().enumerate() {
+                    let address = request.address + i as u32;
+                    dpcd.insert(address, *byte);
+                    hw.writes
+                        .push((AUX_LOG | u64::from(address), u32::from(*byte)));
+                }
+                reply[0] = 0;
+                Ok(AuxResponse {
+                    status: AuxStatus::Ack,
+                    data: &reply[..0],
+                })
+            }
+            AuxCommand::NativeRead => {
+                let n = request.data.len();
+                reply[0] = 0;
+                for i in 0..n {
+                    reply[1 + i] = dpcd
+                        .get(&(request.address + i as u32))
+                        .copied()
+                        .unwrap_or(0);
+                }
+                Ok(AuxResponse {
+                    status: AuxStatus::Ack,
+                    data: &reply[1..1 + n],
+                })
+            }
+            _ => Err(AuxError::UnknownStatus),
+        }
+    }
+    fn psr_wm_level_disabled(&self) -> Option<bool> {
+        self.0.lock().psr_wm
+    }
+    fn fbc_carve(&self, size: u64, min_limit: u32) -> Option<(u32, u64, u32)> {
+        self.0
+            .lock()
+            .fbc_offset
+            .map(|offset| (offset, size, min_limit))
+    }
+    fn fbc_recovery_view(&self) -> Option<Self> {
+        let mut view = self.clone();
+        view.2 = true;
+        view.access_ok().then_some(view)
+    }
     fn tick(&self) -> Wait<'_> {
         let mut yielded = false;
         Box::pin(core::future::poll_fn(move |cx| {
@@ -1786,3 +1860,6 @@ kernel_test_in!(
 
 #[path = "intel_gpu_color_kms_tests.rs"]
 mod color;
+#[cfg(target_arch = "x86_64")]
+#[path = "intel_gpu_psr_kms_tests.rs"]
+mod psr;

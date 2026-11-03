@@ -223,6 +223,60 @@ pub(crate) trait Platform:
     fn fbc_recovery_view(&self) -> Option<Self> {
         None
     }
+    /// Display-14 KMS-owned PSR: the fixed Pipe-A panel timing PSR
+    /// qualifies against. Default: none, so PSR is never offered.
+    fn psr_timing(&self) -> Option<crate::intel_gpu_dsb::Timing> {
+        None
+    }
+    /// One native AUX transaction to the Pipe-A eDP sink, through this
+    /// window. Default: no sink.
+    fn psr_aux<'a>(
+        &self,
+        _request: &crate::dp_aux::AuxRequest<'_>,
+        _reply: &'a mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
+        Err(crate::dp_aux::AuxError::Nacked)
+    }
+    /// Wa_14015648006's Pipe-A `wm_level_disabled`. Default: unknown,
+    /// which refuses PSR.
+    fn psr_wm_level_disabled(&self) -> Option<bool> {
+        None
+    }
+}
+
+/// The Pipe-A eDP sink as an AUX channel over a platform window.
+struct PsrAux<'a, M: Platform>(&'a M);
+impl<M: Platform> crate::dp_aux::AuxChannel for PsrAux<'_, M> {
+    fn transact<'b>(
+        &mut self,
+        request: &crate::dp_aux::AuxRequest<'_>,
+        reply: &'b mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'b>, crate::dp_aux::AuxError> {
+        self.0.psr_aux(request, reply)
+    }
+}
+
+/// `intel_psr_disable_locked` on the KMS-owned PSR through `regs`, then
+/// latch `cause` when it must hold. A sink that reported an error is woken
+/// (`intel_psr_handle_irq`).
+fn psr_disable<M: Platform>(
+    state: &mut State<M>,
+    regs: &M,
+    cause: Option<crate::intel_gpu_psr::Refusal>,
+) {
+    use crate::intel_gpu_psr::{Refusal, PSR_EXIT_TIMEOUT_MS};
+    let mut latch = cause.filter(|c| c.latched());
+    if let Some(mut psr) = state.psr.take() {
+        let wake = cause == Some(Refusal::SinkNotReliable);
+        if let Err(refusal) = psr.disable(regs, &mut PsrAux(regs), PSR_EXIT_TIMEOUT_MS, wake) {
+            if refusal.latched() {
+                latch.get_or_insert(refusal);
+            }
+        }
+    }
+    if latch.is_some() {
+        state.psr_refused = latch;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -593,6 +647,39 @@ impl Platform for Physical {
         view.recovering = true;
         view.access_ok().then_some(view)
     }
+    fn psr_timing(&self) -> Option<crate::intel_gpu_dsb::Timing> {
+        if self.generation != Generation::MeteorLake {
+            return None;
+        }
+        let card = crate::drm_registry::mode_state(self.index)?;
+        let card = card.lock();
+        let mode = card.crtcs.first()?.mode?;
+        let wire = card.mode_wire(&mode);
+        Some(crate::intel_gpu_dsb::Timing {
+            clock: wire.clock,
+            width: wire.hdisplay,
+            height: wire.vdisplay,
+            htotal: wire.htotal,
+            vtotal: wire.vtotal,
+            flags: wire.flags,
+        })
+    }
+    fn psr_aux<'a>(
+        &self,
+        request: &crate::dp_aux::AuxRequest<'_>,
+        reply: &'a mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
+        use crate::dp_aux::AuxChannel as _;
+        if self.generation != Generation::MeteorLake {
+            return Err(crate::dp_aux::AuxError::Nacked);
+        }
+        // XELPDP AUX_A is the DDI A block (XeLpgPort::A.aux_base()).
+        crate::intel_gpu_aux::IntelAux::new(self, crate::intel_gpu_ddi::Ddi::A)
+            .transact(request, reply)
+    }
+    fn psr_wm_level_disabled(&self) -> Option<bool> {
+        crate::intel_gpu_psr::wm_level_disabled()
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -723,6 +810,15 @@ struct State<M: Platform> {
     fbc: Option<crate::intel_gpu_fbc::Fbc>,
     /// No CFB could be placed (or not display 14): never retried.
     fbc_refused: bool,
+    /// Display-14 PSR1 on the KMS-owned Pipe-A eDP: enabled after a
+    /// latched KMS framebuffer, paused at every session start and re-armed
+    /// once the session's frame changes latched; disabled before console
+    /// restore, legacy guards and reset recovery.
+    psr: Option<crate::intel_gpu_psr::Psr>,
+    /// The sink's PSR DPCD, read once.
+    psr_sink: Option<crate::intel_gpu_psr::Sink>,
+    /// A refusal that holds for the card's lifetime.
+    psr_refused: Option<crate::intel_gpu_psr::Refusal>,
 }
 
 #[derive(Debug)]
@@ -752,6 +848,17 @@ pub(crate) struct Guard<'a, M: Platform> {
     state: MutexGuard<'a, State<M>>,
     /// DC_off for the whole session; released after the mutex.
     _power: crate::intel_gpu_dc_states::DcRef,
+}
+
+impl<M: Platform> Drop for Guard<'_, M> {
+    /// `intel_psr_resume` at the end of the session: a PSR the session
+    /// start paused is re-armed only once every frame change it began has
+    /// latched. The DC_off reference and the mutex are still held here.
+    fn drop(&mut self) {
+        if self.state.psr.as_ref().is_some_and(|psr| !psr.active()) && self.psr_quiescent() {
+            self.psr_rearm();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1015,6 +1122,9 @@ impl<M: Platform> Device<M> {
                 gen12_lut_ram_owned: false,
                 fbc: None,
                 fbc_refused: false,
+                psr: None,
+                psr_sink: None,
+                psr_refused: None,
             }),
         }
     }
@@ -1033,6 +1143,14 @@ impl<M: Platform> Device<M> {
             return Ok(());
         }
         let _power = self.platform.display_power()?;
+        // An owned PSR is disabled (source, then sink) through the same
+        // loss-tolerant view before recovery's own PSR handoff runs.
+        if state.psr.is_some() {
+            match self.platform.fbc_recovery_view() {
+                Some(view) => psr_disable(&mut state, &view, None),
+                None => psr_disable(&mut state, &self.platform, None),
+            }
+        }
         // An owned FBC must stop before recovery's fetcher inventory, which
         // refuses any enabled FBC; the loss-blocked window cannot reach it.
         if let Some(fbc) = state.fbc.as_mut() {
@@ -1268,6 +1386,29 @@ impl<M: Platform> Device<M> {
         if let Some(fbc) = state.fbc.as_mut() {
             fbc.invalidate(&self.platform);
         }
+        // intel_psr_pause: PSR exits and reaches idle before this session
+        // can change any frame (flip, DIRTYFB, cursor, color/DSB, console).
+        // A latched error or a failed exit disables PSR instead.
+        if let Some(Err(refusal)) = state.psr.as_mut().map(|psr| psr.pause(&self.platform)) {
+            psr_disable(&mut state, &self.platform, Some(refusal));
+        } else if state.psr.is_some() {
+            use crate::intel_gpu_psr::{idle, Refusal, PSR_EXIT_TIMEOUT_MS};
+            let deadline = self
+                .platform
+                .now()
+                .saturating_add(PSR_EXIT_TIMEOUT_MS * 1_000_000);
+            let exited = loop {
+                match idle(&self.platform) {
+                    Ok(true) => break Ok(()),
+                    Ok(false) if self.platform.now() < deadline => self.platform.tick().await,
+                    Ok(false) => break Err(Refusal::ExitTimeout),
+                    Err(refusal) => break Err(refusal),
+                }
+            };
+            if let Err(refusal) = exited {
+                psr_disable(&mut state, &self.platform, Some(refusal));
+            }
+        }
         Ok(Guard {
             device: self,
             state,
@@ -1294,6 +1435,7 @@ impl<M: Platform> Device<M> {
     pub(crate) fn legacy_drain(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let mut state = self.state.try_lock().ok_or(FsError::Busy)?;
         let _power = self.platform.display_power()?;
+        psr_disable(&mut state, &self.platform, None);
         if let Some(fbc) = state.fbc.as_mut() {
             fbc.disable(&self.platform);
         }
@@ -1784,15 +1926,112 @@ impl<M: Platform> Guard<'_, M> {
             .finish_pending()
             .await?
             .ok_or_else(crate::intel_gpu_user::io_error)?;
-        // __intel_fbc_flush after the latch (flips and DIRTYFB re-presents).
+        // intel_psr_post_plane_update after the latch: enable once (PSR
+        // wins over FBC on display 14; activation waits for the session
+        // end), then __intel_fbc_flush (flips and DIRTYFB re-presents).
+        self.psr_after_latch();
         self.fbc_after_latch(geometry);
         Ok(stamp)
+    }
+    /// Display-14 PSR1 after a latched KMS framebuffer. Enabling disables
+    /// FBC first: Wa_14016291713 refuses FBC with PSR1 and this driver has
+    /// no stepping readout, so PSR wins (intel_fbc_check_plane runs against
+    /// a state whose has_psr was computed first). The Guard's drop
+    /// activates it, so later frame changes in this session still run with
+    /// PSR exited.
+    fn psr_after_latch(&mut self) {
+        if self.device.generation != Generation::MeteorLake
+            || self.state.current.is_none()
+            || self.state.psr.is_some()
+            || self.state.psr_refused.is_some()
+        {
+            return;
+        }
+        let refusal = match self.psr_qualify() {
+            Ok(config) => {
+                if let Some(fbc) = self.state.fbc.as_mut() {
+                    fbc.disable(&self.device.platform);
+                }
+                let platform = &self.device.platform;
+                match crate::intel_gpu_psr::Psr::enable(platform, &mut PsrAux(platform), config) {
+                    Ok(psr) => {
+                        self.state.psr = Some(psr);
+                        return;
+                    }
+                    Err(refusal) => refusal,
+                }
+            }
+            Err(refusal) => refusal,
+        };
+        if refusal.latched() {
+            self.state.psr_refused = Some(refusal);
+        }
+    }
+    /// `intel_psr_compute_config` against the live fixed timing and the
+    /// (cached) sink capability.
+    fn psr_qualify(&mut self) -> Result<crate::intel_gpu_psr::Psr1, crate::intel_gpu_psr::Refusal> {
+        use crate::intel_gpu_psr::{compute_psr1, Refusal, Sink, DRM_MODE_FLAG_INTERLACE};
+        let platform = &self.device.platform;
+        let timing = platform.psr_timing().ok_or(Refusal::NoTiming)?;
+        if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
+            return Err(Refusal::Interlaced);
+        }
+        // The card's mode must be the one transcoder A is running
+        // (TRANS_HTOTAL / TRANS_VTOTAL, active and total minus one).
+        let console = self.console_geometry();
+        let packed = |total: u16, active: u16| {
+            (u32::from(total).wrapping_sub(1) << 16) | u32::from(active).wrapping_sub(1)
+        };
+        if (u32::from(timing.width), u32::from(timing.height)) != (console.width, console.height)
+            || timing.clock == 0
+            || platform.read32(0x60000) != packed(timing.htotal, timing.width)
+            || platform.read32(0x6000c) != packed(timing.vtotal, timing.height)
+        {
+            return Err(Refusal::NoTiming);
+        }
+        let sink = match self.state.psr_sink {
+            Some(sink) => sink,
+            None => {
+                let sink = Sink::read(&mut PsrAux(platform))?;
+                self.state.psr_sink = Some(sink);
+                sink
+            }
+        };
+        compute_psr1(&sink, &timing, platform.psr_wm_level_disabled())
+    }
+    /// `intel_psr_resume`: re-activate a paused PSR from idle; an error
+    /// disables it.
+    fn psr_rearm(&mut self) {
+        let Some(psr) = self.state.psr.as_mut() else {
+            return;
+        };
+        if let Err(refusal) = psr.resume(&self.device.platform) {
+            psr_disable(&mut self.state, &self.device.platform, Some(refusal));
+        }
+    }
+    /// Every frame change this session started has latched, and the
+    /// KMS-owned framebuffer is on screen.
+    fn psr_quiescent(&self) -> bool {
+        let state = &self.state;
+        !state.failed
+            && !state.blocked
+            && state.current.is_some()
+            && state.pending.is_none()
+            && state.joint.is_none()
+            && !state.color_unpublished
+            && !state.mixed_unpublished
+            && !state.dsb.as_ref().is_some_and(|d| d.armed())
+            && !state.cursor.as_ref().is_some_and(|c| c.pending())
+            && !state.color.as_ref().is_some_and(|c| c.pending())
+            && !self.device.platform.reset_lost()
+            && self.device.platform.console_access_ok()
     }
     /// Display-14 FBC on the latched KMS framebuffer: place the CFB once,
     /// then nuke or (re)activate; any ineligible plane disables.
     fn fbc_after_latch(&mut self, geometry: Geometry) {
         use crate::intel_gpu_fbc::{cfb_size, check_plane, min_limit, override_stride, Fbc};
-        let psr = crate::intel_gpu_edp::psr_active();
+        // has_psr (enabled, even while paused) refuses FBC: PSR wins.
+        let psr = self.state.psr.is_some();
         let plane = crate::intel_gpu_fbc::Plane {
             kms_owned: self.state.current.is_some(),
             format: if self.state.xr30_timing.is_some() || self.state.xr30_epoch.is_some() {
@@ -1809,7 +2048,7 @@ impl<M: Platform> Guard<'_, M> {
             rotated_90: false,
             interlaced: false,
             psr1: psr,
-            selective_update: psr,
+            selective_update: false,
         };
         if self.state.fbc.is_none() && !self.state.fbc_refused && check_plane(&plane).is_ok() {
             let size = cfb_size(plane.format, plane.width, plane.height, plane.stride_bytes);
@@ -1834,8 +2073,9 @@ impl<M: Platform> Guard<'_, M> {
         }
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
-        // Console reclaim: FBC is fully disabled before the console
-        // framebuffer is scanned out again.
+        // Console reclaim: PSR (source, then sink) and FBC are fully
+        // disabled before the console framebuffer is scanned out again.
+        psr_disable(&mut self.state, &self.device.platform, None);
         if let Some(fbc) = self.state.fbc.as_mut() {
             fbc.disable(&self.device.platform);
         }
@@ -1858,6 +2098,9 @@ impl<M: Platform> Guard<'_, M> {
         if self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
+        // The console framebuffer is never self-refreshed: PSR (source,
+        // then sink) is disabled before it is scanned out again.
+        psr_disable(&mut self.state, &self.device.platform, None);
         self.restore_surface_inner().await
     }
     async fn restore_surface_inner(&mut self) -> Result<(), FsError> {

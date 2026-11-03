@@ -816,6 +816,8 @@ pub mod intel_gpu_power_controls;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_psr;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_rc6;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_rcs;

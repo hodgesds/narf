@@ -1324,8 +1324,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // PSR bring-up (#1020): only for an eDP panel that powered
     // on and produced a real mode. Every failure path inside
-    // leaves the panel running plain eDP.
-    if let Some(mode) = panel_mode {
+    // leaves the panel running plain eDP. Display 14 PSR is not
+    // the Gen12 register layout: it is enabled only by the KMS owner
+    // (`intel_gpu_psr`), never on the console.
+    if let Some(mode) = panel_mode.filter(|_| dev.chip.generation != Generation::MeteorLake) {
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
 

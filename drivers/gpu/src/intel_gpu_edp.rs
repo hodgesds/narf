@@ -1301,12 +1301,6 @@ pub(crate) fn kms_release_psr() {
     runtime.flip_pending = false;
 }
 
-/// Whether a PSR session is live on the panel (FBC refuses PSR1 and
-/// selective update on display 14).
-pub(crate) fn psr_active() -> bool {
-    EDP_RUNTIME.lock().active.is_some()
-}
-
 /// Notify the PSR session that scanout content changed.
 /// `None` means the whole frame is dirty (the publish path);
 /// `Some(region)` is a region-granular update. This is the
