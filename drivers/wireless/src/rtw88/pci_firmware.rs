@@ -67,6 +67,11 @@ pub(super) struct Native {
     command_ring: super::command::Ring,
     packet: Option<super::packet_core::Core>,
     packet_gate: Option<super::power_policy::Gate>,
+    /// Station TX grant on a passive-only (DFS / NO_IR) 5GHz primary: the
+    /// station admitted it under its `narf_wireless::reg::witness` beacon
+    /// witness taken under exactly this policy snapshot. A retune to any
+    /// other primary drops it.
+    passive_tx: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
     mailbox_cursor: u8,
     mailbox_pending: bool,
     tracking_maintenance: bool,
@@ -185,6 +190,7 @@ impl Native {
             command_ring: super::command::Ring::default(),
             packet: None,
             packet_gate: None,
+            passive_tx: None,
             mailbox_cursor: 0,
             mailbox_pending: false,
             tracking_maintenance: false,
@@ -1228,6 +1234,25 @@ unsafe impl Registers for Native {
             .ok()
             .filter(|g| base.with_channel(g.clone()).is_ok()))
     }
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        // The installed shared snapshot; its `Arc` identity scopes the
+        // station's beacon witnesses and the passive TX grant.
+        Ok(narf_wireless::reg::db::snapshot())
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        if let Some((primary, _)) = &grant {
+            if self.retune.is_some() || *primary != self.channel {
+                return Err(Error::State);
+            }
+        }
+        self.passive_tx = grant;
+        Ok(())
+    }
     fn station_retune_begin(
         &mut self,
         channel: u8,
@@ -1244,6 +1269,9 @@ unsafe impl Registers for Native {
             return Err(Error::State);
         }
         if self.retune.is_none() {
+            if self.passive_tx.as_ref().is_some_and(|(p, _)| *p != channel) {
+                self.passive_tx = None;
+            }
             let current = self.packet_gate.as_ref().ok_or(Error::State)?;
             if !current.base_only() {
                 return Err(Error::State);
@@ -1832,6 +1860,32 @@ impl Native {
     }
     pub(super) fn retune_active(&self) -> bool {
         self.retune.is_some()
+    }
+    /// Frame-TX regulatory rule on top of `check_packet_permission`: on a
+    /// passive-only (DFS / NO_IR) committed primary a frame is published
+    /// only under the station's passive TX grant for this exact primary and
+    /// current policy snapshot (mac80211 never probes there; a station
+    /// transmits only to an AP whose Beacon it heard). RX is unaffected.
+    pub(super) fn passive_tx_allowed(&self) -> Result<(), Error> {
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        // Without an installed policy the gate's own live check (`Core::submit`
+        // -> `transmit_allowed`) already refuses every bound N2xO record.
+        let Some(policy) = narf_wireless::reg::db::snapshot() else {
+            return Ok(());
+        };
+        if !gate.passive_in(&policy).map_err(Error::Power)? {
+            return Ok(());
+        }
+        match &self.passive_tx {
+            Some((primary, granted))
+                if *primary == gate.channel()
+                    && *primary == self.channel
+                    && alloc::sync::Arc::ptr_eq(granted, &policy) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Power(super::power_policy::Error::Policy)),
+        }
     }
     fn check_packet_permission(&mut self) -> Result<(), Error> {
         if let Some(g) = self

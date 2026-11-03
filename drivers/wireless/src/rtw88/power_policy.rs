@@ -769,6 +769,20 @@ impl Gate {
             Scope::C21(_) => self.current(),
         }
     }
+    /// The committed primary's admitted span is passive-only under `domain`
+    /// (a 5GHz N2xO record under a DFS / NO_IR rule, `channel_policy::
+    /// passive_rule`). The base channel 1 never is. Live, like `current_in`.
+    pub(super) fn passive_in(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<bool, Error> {
+        match &self.channel {
+            Some(g) => {
+                super::channel_policy::passive_in(g, self.did(), domain).map_err(|_| Error::Policy)
+            }
+            None => Ok(false),
+        }
+    }
     /// Identity every continuation program is qualified over: the exact
     /// base, channel-scoped by the bound N2xO record off channel 1.
     pub(super) fn extension_request(&self) -> Option<super::station_profile::Request> {

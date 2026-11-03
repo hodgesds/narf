@@ -682,7 +682,7 @@ fn smoke_rtw88_band5_station_scan_csa_and_probe() -> TestResult {
     {
         return TestResult::Fail("5GHz preq not rebuilt for the band");
     }
-    // ECSA 20MHz classes 81/115/124/125; DFS classes 118/121 are not followed.
+    // ECSA 20MHz classes 81/115/118/121/124/125 (Annex E Table E-4).
     for (class, ch, ok) in [
         (81, 6, true),
         (115, 44, true),
@@ -690,8 +690,12 @@ fn smoke_rtw88_band5_station_scan_csa_and_probe() -> TestResult {
         (125, 177, true),
         (124, 165, false),
         (115, 52, false),
-        (118, 52, false),
-        (121, 100, false),
+        (118, 52, true),
+        (118, 48, false),
+        (121, 100, true),
+        (121, 144, true),
+        (121, 102, false),
+        (121, 149, false),
     ] {
         let ie = channel_policy::switch_ie(&[60, 4, 1, class, ch, 5]);
         if ie.map(|i| i.channel) != Some(ok.then_some(ch)) {
@@ -712,4 +716,61 @@ fn smoke_rtw88_band5_station_scan_csa_and_probe() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_band5_station_scan_csa_and_probe
+);
+
+fn smoke_rtw88_dfs_passive_rule_and_record_admission() -> TestResult {
+    // cfg80211 IEEE80211_CHAN_RADAR / NO_IR: a 5GHz DFS or NO_IR span is
+    // admitted passive-only; 2.4GHz and indoor/unknown bits still refuse.
+    let mut c22 = payload(52, true);
+    c22[12..14].copy_from_slice(&[0, 0]);
+    c22[26..28].copy_from_slice(&[40, 38]);
+    let Some(r52) = Record::decode(0xc822, &c22) else {
+        return TestResult::Fail("valid C22 channel52 record refused");
+    };
+    let Some(r6) = Record::decode(0xc822, &payload(6, true)) else {
+        return TestResult::Fail("valid C22 channel6 record refused");
+    };
+    let dfs = domain(5250, 5330, 23, RegFlags::DFS | RegFlags::AUTO_BW);
+    let no_ir = domain(5250, 5330, 23, RegFlags::NO_IR);
+    let plain = domain(5250, 5330, 23, RegFlags::empty());
+    if channel_policy::passive_rule(&dfs, 0, 20) != Some(true)
+        || channel_policy::passive_rule(&plain, 0, 20) != Some(false)
+        || channel_policy::passive_rule(&dfs, 1, 20).is_some()
+        || channel_policy::plain_rule(&dfs, 0, 20)
+    {
+        return TestResult::Fail("passive_rule classification differs");
+    }
+    if channel_policy::admission(&r52, &dfs) != Ok((76, true))
+        || channel_policy::admission(&r52, &no_ir) != Ok((76, true))
+        || channel_policy::admission(&r52, &plain) != Ok((76, false))
+        || channel_policy::policy(&r52, &dfs) != Ok(76)
+    {
+        return TestResult::Fail("5GHz DFS/NO_IR span not admitted passive-only");
+    }
+    let indoor = domain(5250, 5330, 23, RegFlags::DFS | RegFlags::INDOOR_ONLY);
+    let low = domain(2402, 2482, 30, RegFlags::DFS);
+    let low_no_ir = domain(2402, 2482, 30, RegFlags::NO_IR);
+    if channel_policy::admission(&r52, &indoor).is_ok()
+        || channel_policy::admission(&r6, &low).is_ok()
+        || channel_policy::admission(&r6, &low_no_ir).is_ok()
+    {
+        return TestResult::Fail("indoor 5GHz or DFS/NO_IR 2.4GHz span admitted");
+    }
+    // Station scan/join classification: probes are dropped and a witness is
+    // required only on a 5GHz RADAR / NO_IR primary under a policy.
+    let dfs = alloc::sync::Arc::new(dfs);
+    let low = alloc::sync::Arc::new(low);
+    if !crate::rtw88::station::passive_only(Some(&dfs), 52)
+        || !crate::rtw88::station::passive_only(Some(&dfs), 64)
+        || crate::rtw88::station::passive_only(Some(&dfs), 48)
+        || crate::rtw88::station::passive_only(None, 52)
+        || crate::rtw88::station::passive_only(Some(&low), 6)
+    {
+        return TestResult::Fail("station passive-only classification differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_dfs_passive_rule_and_record_admission
 );

@@ -255,6 +255,20 @@ pub(super) unsafe trait Registers: Send {
     ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
         Ok(None)
     }
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        Ok(None)
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        match grant {
+            None => Ok(()),
+            Some(_) => Err(Error::Unsupported),
+        }
+    }
     fn station_retune_begin(
         &mut self,
         _: u8,
@@ -635,6 +649,17 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         channel: u8,
     ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
         self.io.station_channel_grant(channel)
+    }
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        self.io.station_regulatory()
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        self.io.station_passive_tx(grant)
     }
     fn station_retune_begin(
         &mut self,

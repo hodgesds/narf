@@ -464,6 +464,26 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
         Ok(None)
     }
+    /// The installed host regulatory snapshot classifying passive-only
+    /// (DFS / NO_IR) primaries and scoping the station's beacon witnesses
+    /// (`narf_wireless::reg::witness`). `None`: no passive-only primary.
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        Ok(None)
+    }
+    /// Grant (or with `None` withdraw) station frame TX on the committed
+    /// passive-only primary `grant.0`, admitted by the station's witness
+    /// taken under exactly the policy snapshot `grant.1`.
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        match grant {
+            None => Ok(()),
+            Some(_) => Err(Error::Unsupported),
+        }
+    }
     /// Install the target channel gate (base for channel 1), stop new TX
     /// publication and pause hardware TX. Re-entrant for the same target;
     /// returns whether every TX queue has drained.

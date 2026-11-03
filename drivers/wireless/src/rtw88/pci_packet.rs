@@ -64,6 +64,7 @@ impl Native {
         if self.retune_active() {
             return Err(packet::Error::State);
         }
+        self.passive_tx_allowed().map_err(access_error)?;
         self.with_packet(|core, port| core.submit_batch(port, b))
     }
     pub(in crate::rtw88) fn configure_packet_profile(
@@ -153,6 +154,7 @@ impl Native {
         if self.retune_active() {
             return Err(packet::Error::State);
         }
+        self.passive_tx_allowed().map_err(access_error)?;
         self.with_packet(|core, port| core.submit(port, frame, radio_report))
     }
     pub(in crate::rtw88) fn scan_packet_address(
@@ -508,6 +510,7 @@ fn smoke_rtw8822ce_native_packet_revocation_precedes_cpu_dma_config_and_mmio(
         command_ring: Default::default(),
         packet: None,
         packet_gate: None,
+        passive_tx: None,
         mailbox_cursor: 0,
         mailbox_pending: false,
         tracking_maintenance: false,

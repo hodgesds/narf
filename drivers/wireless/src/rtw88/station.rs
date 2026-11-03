@@ -9,6 +9,10 @@ use super::{
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use narf_wireless::{
     association::{self, JoinPlan, ObservedBss, SecurityMode},
+    reg::{
+        witness::{self, BeaconWitness, ScanGeneration},
+        RegulatoryDomain,
+    },
     station_security::{self, RawFrame, Security},
 };
 use zeroize::Zeroizing;
@@ -184,6 +188,13 @@ pub(super) struct State {
     ht40: Option<(Arc<super::qualification::Grant>, super::ht40::Record)>,
     /// Hardware runs the N2xB 40MHz pair (`ht40::program` committed).
     wide: bool,
+    /// cfg80211 `beacon_found` for passive-only (RADAR / NO_IR) primaries
+    /// (shared `narf_wireless::reg::witness`): admits association / CSA
+    /// onto a passive-only primary only after a Beacon heard in its latest
+    /// scan under the current policy snapshot.
+    witness: BeaconWitness,
+    /// Witness generation of the current scan dwell, if one is open.
+    witness_scan: Option<ScanGeneration>,
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -290,6 +301,8 @@ impl State {
             wide: false,
             switch: None,
             switch_wait_beacon: false,
+            witness: BeaconWitness::new(),
+            witness_scan: None,
         }
     }
     /// Exact retained factory/radio facts for the dm watchdog statistics.
@@ -604,6 +617,9 @@ impl State {
         self.fallback = None;
         self.qos = None;
         self.ht40 = None;
+        self.witness.clear();
+        self.witness_scan = None;
+        let _ = io.station_passive_tx(None);
         if self.prepared {
             io.packet_stop()?;
         }
@@ -728,6 +744,19 @@ impl State {
         let Ok(candidate) = observed else {
             return;
         };
+        // cfg80211 `beacon_found` for this dwell's witness: an actual Beacon
+        // (not a Probe Response) with a nonzero interval for the tuned
+        // primary. `scan_inner` opens the generation only for its dwell.
+        if let Some(generation) = self.witness_scan {
+            if frame.bytes().first() == Some(&0x80)
+                && candidate.bss.channel == self.channel
+                && candidate.bss.beacon_interval != 0
+            {
+                if let Some(c) = super::channel_policy::any_frequency(self.channel) {
+                    let _ = self.witness.beacon_found(generation, c);
+                }
+            }
+        }
         if !super::channel_policy::base_rate_ok(self.channel, candidate.basic_rates) {
             return;
         }
@@ -1464,7 +1493,13 @@ impl State {
         channels: &[u8],
     ) -> Result<Vec<ObservedBss>, Error> {
         let home = self.channel;
+        let policy = io.station_regulatory()?;
         if channels.is_empty() || channels == [home] {
+            // mac80211 `ieee80211_scan_state_decision`: a RADAR / NO_IR
+            // channel is dwelt passively, without probe requests.
+            if passive_only(policy.as_ref(), home) {
+                return self.scan_inner(io, dwell_ms, &[], policy.as_ref()).await;
+            }
             if super::band5::primary(home) {
                 // The 5GHz preq carries the OFDM rate set and no DS element.
                 let mut tuned = Vec::new();
@@ -1472,18 +1507,22 @@ impl State {
                     tuned
                         .push(super::channel_policy::probe_for(probe, home).ok_or(Error::Profile)?);
                 }
-                return self.scan_inner(io, dwell_ms, &tuned).await;
+                return self.scan_inner(io, dwell_ms, &tuned, policy.as_ref()).await;
             }
-            return self.scan_inner(io, dwell_ms, probes).await;
+            return self.scan_inner(io, dwell_ms, probes, policy.as_ref()).await;
         }
         let mut result = Ok(Vec::new());
         for channel in channels.iter().copied() {
             let mut tuned = Vec::new();
-            for probe in probes {
-                tuned.push(super::channel_policy::probe_for(probe, channel).ok_or(Error::Profile)?);
+            if !passive_only(policy.as_ref(), channel) {
+                for probe in probes {
+                    tuned.push(
+                        super::channel_policy::probe_for(probe, channel).ok_or(Error::Profile)?,
+                    );
+                }
             }
             result = match self.retune(io, channel, false).await {
-                Ok(()) => self.scan_inner(io, dwell_ms, &tuned).await,
+                Ok(()) => self.scan_inner(io, dwell_ms, &tuned, policy.as_ref()).await,
                 Err(e) => Err(e),
             };
             if result.is_err() {
@@ -1654,6 +1693,11 @@ impl State {
         if !carried || !super::channel_policy::tunable(channel) {
             return Err(Error::PeerLost);
         }
+        // mac80211 `ieee80211_sta_process_chanswitch` drops the connection
+        // on an unusable target. A passive-only (RADAR / NO_IR) target is
+        // usable here only under a current beacon witness for it (NARF's
+        // stricter client rule: the station performs no radar detection).
+        self.passive_grant(io, channel)?;
         let grant = if channel == 1 {
             None
         } else {
@@ -1681,8 +1725,14 @@ impl State {
         if !matches!(resume, Phase::FourWay | Phase::Open) {
             return Err(Error::State);
         }
+        // Re-check the witness at the switch: the target's passive TX grant
+        // follows only a still-current witness under the current policy.
+        let passive = self.passive_grant(io, switch.channel)?;
         self.retune_to(io, switch.channel, switch.grant, false, resume)
             .await?;
+        if passive.is_some() {
+            self.admission.run(|| io.station_passive_tx(passive))?;
+        }
         self.peer.as_mut().ok_or(Error::State)?.bss.channel = switch.channel;
         self.switch = None;
         self.switch_wait_beacon = switch.block;
@@ -1692,7 +1742,50 @@ impl State {
     pub(super) fn channel(&self) -> u8 {
         self.channel
     }
+    /// The passive TX grant for joining or switching onto `channel`: `None`
+    /// for an active primary (or without a policy snapshot, when nothing is
+    /// passive-only), the grant for a passive-only one heard in its latest
+    /// scan (`BeaconWitness::may_associate`), else `PeerLost`/`Profile`
+    /// refusal (an unwitnessed passive-only primary is unusable).
+    fn passive_grant(
+        &self,
+        io: &mut impl Io,
+        channel: u8,
+    ) -> Result<Option<(u8, Arc<RegulatoryDomain>)>, Error> {
+        let Some(policy) = io.station_regulatory()? else {
+            return Ok(None);
+        };
+        if !passive_only(Some(&policy), channel) {
+            return Ok(None);
+        }
+        let center = super::channel_policy::any_frequency(channel).ok_or(Error::Profile)?;
+        if !self.witness.may_associate(&policy, &[center]) {
+            return Err(if self.peer.is_some() {
+                Error::PeerLost
+            } else {
+                Error::Profile
+            });
+        }
+        Ok(Some((channel, policy)))
+    }
+    /// One dwell on the committed primary. Under a policy snapshot the dwell
+    /// is a new witness scan generation for the primary (retracting its
+    /// earlier witness until a Beacon is heard again, cfg80211
+    /// `beacon_found`); the generation closes on every exit.
     async fn scan_inner(
+        &mut self,
+        io: &mut impl Io,
+        dwell_ms: u64,
+        probes: &[Vec<u8>],
+        policy: Option<&Arc<RegulatoryDomain>>,
+    ) -> Result<Vec<ObservedBss>, Error> {
+        let center = super::channel_policy::any_frequency(self.channel).ok_or(Error::State)?;
+        self.witness_scan = policy.map(|p| self.witness.begin_scan(p, &[center]));
+        let result = self.scan_dwell(io, dwell_ms, probes).await;
+        self.witness_scan = None;
+        result
+    }
+    async fn scan_dwell(
         &mut self,
         io: &mut impl Io,
         dwell_ms: u64,
@@ -1739,9 +1832,17 @@ impl State {
         {
             return Err(Error::Profile);
         }
+        // A passive-only (RADAR / NO_IR) primary is joined only under its
+        // beacon witness from the latest scan of it (cfg80211 `beacon_found`).
+        let passive = self.passive_grant(io, candidate.bss.channel)?;
         // rtw_ops_mgd_prepare_tx: tune to the BSS primary and run RF
         // calibration there unless it is already current.
         self.retune(io, candidate.bss.channel, true).await?;
+        // Frame TX on the passive-only primary, before the first
+        // Authentication frame (`Native::passive_tx_allowed`).
+        if passive.is_some() {
+            self.admission.run(|| io.station_passive_tx(passive))?;
+        }
         // 2.4GHz HT40 (N2xB): the AP's HT Operation names a secondary whose
         // 20MHz half is itself an admitted channel (channel 1 or a loadable
         // N2xO record over the still base-only gate), and the firmware
@@ -2177,6 +2278,15 @@ impl State {
 }
 #[path = "station_tx_ba.rs"]
 mod tx;
+/// The primary is passive-only (cfg80211 RADAR / NO_IR) under `policy`.
+/// Only a 5GHz primary can be: 2.4GHz admission refuses DFS / NO_IR rules.
+pub(super) fn passive_only(policy: Option<&Arc<RegulatoryDomain>>, channel: u8) -> bool {
+    super::band5::primary(channel)
+        && policy.is_some_and(|p| {
+            super::channel_policy::any_frequency(channel)
+                .is_some_and(|c| witness::passive_only(p, c))
+        })
+}
 pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
     (14..=1514).contains(&frame.len())
         && frame[6..12] == own

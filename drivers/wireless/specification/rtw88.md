@@ -2576,15 +2576,46 @@ Rates, no Extended Supported Rates, no DS Parameter Set), also for a
 home-channel 5GHz scan. BSS cache and association require the band's base
 rate as basic (`base_rate_ok`: CCK1 on 2.4GHz; OFDM6 and no CCK on 5GHz).
 BssInfo, associate and rejoin map frequencies with `any_frequency`. ECSA
-follows the 20MHz global classes 81, 115, 124 and 125 only. On 5GHz no
+follows the 20MHz global classes 81, 115, 118, 121, 124 and 125 only
+(IEEE 802.11 Annex E Table E-4). On 5GHz no
 continuation program (extension/WMM/HT/BA/...) is bound: they are all
 qualified over a CCK1 base, so the station runs the OFDM6 base profile;
 `Gate::allows_profile` refuses a profile whose band differs from the
 committed primary. PHY-status channel bytes are compared by number on both
 bands. Written, unexecuted: `smoke_rtw88_band5_station_scan_csa_and_probe`.
 
+**DFS / NO_IR passive primaries.** Following rtw89 (rtw89.md "DFS / NO_IR
+passive scanning and client admission") through the shared
+`narf_wireless::reg::witness::BeaconWitness` (wireless spec §3.5):
+`channel_policy::passive_rule` is the 5GHz variant of `plain_rule` that also
+accepts `DFS` / `NO_IR` (cfg80211 reg.c `handle_channel_single_rule` ->
+`IEEE80211_CHAN_RADAR` / `NO_IR`); `channel_policy::admission` admits a 5GHz
+N2xO record under such a rule as passive-only (2.4GHz, indoor and unknown
+bits still refuse). A passive-only primary is admitted for RX, retune and
+passive scan. Frame TX on it (`Native::submit_packet[_batch]` ->
+`Native::passive_tx_allowed`, on top of the live gate check, with
+`Gate::passive_in` re-deciding passivity against the installed snapshot at
+every submission) needs the station's passive TX grant
+(`Io::station_passive_tx`) for exactly the committed primary and the same
+policy `Arc`; a retune to another primary drops it. The station
+(`Io::station_regulatory` = `reg::db::snapshot()`): `scan_channels` sends no
+probe request on a passive-only primary (mac80211
+`ieee80211_scan_state_decision`); every dwell (`scan_inner`) opens a witness
+generation for the tuned 20MHz center and `cache` records `beacon_found`
+only for an actual Beacon (subtype 8, nonzero interval, observed on the
+tuned primary) during it; `associate` refuses an unwitnessed passive-only
+candidate before the retune (`may_associate`) and grants passive TX after it,
+before the first Authentication frame; CSA receipt drops the link
+(`PeerLost`) unless the target is witnessed, and `channel_switch` re-checks
+the witness and grants the target after the switch; `stop` clears the
+witnesses and withdraws the grant. Requiring a witness for a CSA target is
+NARF's stricter client rule (the station performs no radar detection).
+Written, unexecuted: `smoke_rtw88_dfs_passive_rule_and_record_admission`
+(plus the class 118/121 rows in
+`smoke_rtw88_band5_station_scan_csa_and_probe`).
+
 Remaining for the row: 5GHz HT20/HT40 (needs 5GHz-qualified continuation
-records), and DFS primaries (refused by `plain_rule`).
+records).
 
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station
@@ -2592,7 +2623,8 @@ power check): a rule may carry only `NO_P2P`, `AUTO_BW` and `NO_160MHZ`;
 its usable bandwidth is `RegulatoryDomain::max_bandwidth`
 (cfg80211 `reg.c::reg_get_max_bandwidth`: an AUTO_BW rule spans its
 adjacent run, NO_160MHZ caps at 80MHz), which must cover the program's
-width. DFS, NO_IR, indoor and unknown bits still refuse. Written,
+width. DFS, NO_IR, indoor and unknown bits still refuse (a 5GHz N2xO
+record alone may sit under DFS / NO_IR as passive-only, `passive_rule`). Written,
 unexecuted: `smoke_rtw88_plain_rule_auto_bw_and_no_160mhz`. Three cases are written and
 unexecuted: `smoke_rtw88_band5_linux_groups_and_factory_power`,
 `smoke_rtw8822ce_channel5_bb_mac_rf_program`,

@@ -55,6 +55,25 @@ pub(super) fn plain_rule(domain: &RegulatoryDomain, index: usize, width: u32) ->
     })
 }
 
+/// Flags that make a 5GHz span passive-only for the station: cfg80211
+/// `IEEE80211_CHAN_RADAR` (reg.c `handle_channel_single_rule`: `NL80211_RRF_DFS`)
+/// and `IEEE80211_CHAN_NO_IR` (`NL80211_RRF_NO_IR`).
+const PASSIVE: RegFlags = RegFlags::DFS.union(RegFlags::NO_IR);
+
+/// The passive-only variant of [`plain_rule`] for a 5GHz span: `Some(false)`
+/// for a plain rule, `Some(true)` for a rule that additionally carries DFS
+/// and/or NO_IR (RX, passive scan and witness-gated station TX only, see
+/// `narf_wireless::reg::witness`), `None` when the rule refuses (indoor,
+/// unknown bits, malformed, or too narrow for `width`). Never used on
+/// 2.4GHz, where DFS / NO_IR still refuse through [`plain_rule`].
+pub(super) fn passive_rule(domain: &RegulatoryDomain, index: usize, width: u32) -> Option<bool> {
+    let r = domain.rules.get(index)?;
+    (r.freq_start_mhz < r.freq_end_mhz
+        && r.flags.bits() & !(PLAIN.bits() | PASSIVE.bits()) == 0
+        && domain.max_bandwidth(index) >= width)
+        .then(|| r.flags.intersects(PASSIVE))
+}
+
 /// Linux `phy.c::rtw_get_channel_group` for 2.4GHz channels 1..=13.
 pub(super) const fn group(channel: u8) -> Option<usize> {
     match channel {
@@ -360,10 +379,19 @@ pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
 }
 
 /// Regulatory admission of one record: every rule overlapping the primary's
-/// 20MHz occupied span is a plain rule, the span is covered, and every
-/// measured peak plus antenna gain fits the minimum ceiling. Returns the
-/// admitted EIRP ceiling (quarter dBm).
+/// 20MHz occupied span is a plain rule (on 5GHz also a passive-only one,
+/// [`passive_rule`]), the span is covered, and every measured peak plus
+/// antenna gain fits the minimum ceiling. Returns the admitted EIRP ceiling
+/// (quarter dBm).
 pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, Error> {
+    admission(record, domain).map(|(limit, _)| limit)
+}
+
+/// [`policy`] plus whether the admitted span is passive-only (a 5GHz rule
+/// over it carries DFS / NO_IR). A passive-only primary is admitted for
+/// RX, monitor and passive scan; frame TX on it additionally needs the
+/// station's beacon-witness grant (`Native::passive_tx_allowed`).
+pub(super) fn admission(record: &Record, domain: &RegulatoryDomain) -> Result<(i16, bool), Error> {
     let center = u32::from(record.frequency().ok_or(Error::Unsupported)?);
     let (low, high) = (center - 10, center + 10);
     if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
@@ -371,11 +399,14 @@ pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, 
     }
     let mut limit = record.ceiling.min(80);
     let mut covering = false;
+    let mut passive = false;
     for (i, r) in domain.rules.iter().enumerate() {
         if r.freq_start_mhz >= high || r.freq_end_mhz <= low {
             continue;
         }
-        if !plain_rule(domain, i, 20) {
+        if record.band5() {
+            passive |= passive_rule(domain, i, 20).ok_or(Error::Prerequisite)?;
+        } else if !plain_rule(domain, i, 20) {
             return Err(Error::Prerequisite);
         }
         covering |= r.freq_start_mhz <= low && r.freq_end_mhz >= high;
@@ -389,7 +420,7 @@ pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, 
     {
         return Err(Error::Prerequisite);
     }
-    Ok(limit)
+    Ok((limit, passive))
 }
 
 /// Live check of a bound record against the installed regulatory domain,
@@ -412,6 +443,18 @@ pub(super) fn limit_in(g: &Grant, did: u16, domain: &RegulatoryDomain) -> Result
             return Err(Error::State);
         }
         policy(&record, domain)
+    })
+}
+
+/// Whether the bound record's admitted span is passive-only under `domain`
+/// (live, under the record's own current capability, like [`limit_in`]).
+pub(super) fn passive_in(g: &Grant, did: u16, domain: &RegulatoryDomain) -> Result<bool, Error> {
+    g.invoke_source(|| {
+        let record = Record::decode(did, g.payload()).ok_or(Error::State)?;
+        if kind(record.channel).is_none_or(|k| !g.is(k)) {
+            return Err(Error::State);
+        }
+        admission(&record, domain).map(|(_, passive)| passive)
     })
 }
 
@@ -467,8 +510,8 @@ pub(super) struct Switch {
 
 /// Parsed Channel Switch Announcement for a 20MHz BSS. `channel` is None
 /// when the ECSA operating class is not a non-DFS 20MHz class this owner
-/// follows (81: 2.4GHz 1..=13; 115: 36..=48; 124: 149..=161; 125:
-/// 149..=177, IEEE 802.11 Annex E Table E-4), or the channel is not in it.
+/// follows (81: 2.4GHz 1..=13; 115: 36..=48; 118: 52..=64; 121: 100..=144;
+/// 124: 149..=161; 125: 149..=177, IEEE 802.11 Annex E Table E-4), or the channel is not in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SwitchIe {
     pub(super) block: bool,
@@ -513,6 +556,9 @@ fn class_channel(class: u8, channel: u8) -> Option<u8> {
         81 => (1..=13).contains(&channel),
         115 => matches!(channel, 36 | 40 | 44 | 48),
         124 => matches!(channel, 149 | 153 | 157 | 161),
+        // Annex E Table E-4 20MHz DFS classes (U-NII-2A / U-NII-2C).
+        118 => matches!(channel, 52 | 56 | 60 | 64),
+        121 => (100..=144).contains(&channel) && channel % 4 == 0,
         125 => matches!(channel, 149 | 153 | 157 | 161 | 165 | 169 | 173 | 177),
         _ => false,
     };
