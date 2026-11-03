@@ -150,7 +150,8 @@ impl<B: Backend> Session<B> {
         authority: &ApControlAuthority,
     ) -> Result<(), Error> {
         let mut dev = [0; 16];
-        cmd::encode_uni_dev_info_update(0, 0, true, plan.own, &mut dev).ok_or(Error::Bounds)?;
+        cmd::encode_uni_dev_info_update(plan.vif.omac(), 0, true, plan.own, &mut dev)
+            .ok_or(Error::Bounds)?;
         self.ap_exchange(authority, Command::Unified { id: 1 }, &dev)
             .await?;
         self.ap_exchange(
@@ -256,7 +257,10 @@ impl<B: Backend> Session<B> {
         self.ap_exchange(
             authority,
             Command::Unified { id: 2 },
-            &ap_wire::rlm(plan.channel, plan.five_ghz, receive[4]),
+            &crate::mt7921::vif_slots::on_bss(
+                plan.vif,
+                ap_wire::rlm(plan.channel, plan.five_ghz, receive[4]),
+            ),
         )
         .await?;
         // Both CE commands are no-response native submissions. PSE echo
@@ -267,7 +271,7 @@ impl<B: Backend> Session<B> {
                 id: ap_wire::CE_BSS_ABORT,
                 query: false,
             },
-            &[0; 4],
+            &crate::mt7921::vif_slots::on_bss(plan.vif, [0; 4]),
         )
         .await?;
         self.ap_notify(
@@ -276,20 +280,27 @@ impl<B: Backend> Session<B> {
                 id: ap_wire::CE_BSS_CONNECTED,
                 query: false,
             },
-            &ap_wire::bss_connected(
-                plan.config.beacon_interval as u16,
-                plan.config.dtim_period as u8,
+            &crate::mt7921::vif_slots::on_bss(
+                plan.vif,
+                ap_wire::bss_connected(
+                    plan.config.beacon_interval as u16,
+                    plan.config.dtim_period as u8,
+                ),
             ),
         )
         .await?;
         self.confirm_command_progress().await?;
         self.check_ap_request(authority)?;
-        self.ap_exchange(authority, Command::Unified { id: 3 }, &ap_wire::group())
-            .await?;
+        self.ap_exchange(
+            authority,
+            Command::Unified { id: 3 },
+            &ap_wire::group_on(plan.vif),
+        )
+        .await?;
         self.ap_exchange(
             authority,
             Command::Unified { id: 2 },
-            &ap_wire::beacon(&plan.beacon, plan.tim_offset, None, plan.rate)?,
+            &ap_wire::beacon_on(plan.vif, &plan.beacon, plan.tim_offset, None, plan.rate)?,
         )
         .await?;
         Ok(())
@@ -320,7 +331,7 @@ impl<B: Backend> Session<B> {
                     id: ap_wire::CE_BSS_ABORT,
                     query: false,
                 },
-                &[0; 4],
+                &crate::mt7921::vif_slots::on_bss(plan.vif, [0; 4]),
             )
             .await?;
             self.confirm_command_progress().await?;
@@ -422,7 +433,8 @@ pub(crate) enum ApEvent {
 /// Linux mt76_connac_mcu_uni_add_bss for the AP vif: the infrastructure AP
 /// BSS-basic request, with `vif->p2p` selecting CONNECTION_P2P_GO.
 fn role_bss(plan: &Plan, enable: bool) -> Result<[u8; 44], Error> {
-    let mut bss = ap_wire::bss(
+    let mut bss = ap_wire::bss_on(
+        plan.vif,
         plan.own,
         plan.config.beacon_interval as u16,
         plan.config.dtim_period as u8,

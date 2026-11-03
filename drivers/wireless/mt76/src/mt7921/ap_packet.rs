@@ -2,7 +2,7 @@
 //! This path carries software CCMP bytes unchanged: the Protected MAC bit
 //! does not select a hardware key. Linux connac2 TXWI does that only when
 //! mac80211 supplied info->control.hw_key. No TXD3_PROTECT/SN_VALID is set.
-use crate::mt7921::{association::LegacyRate, firmware_transport::Error};
+use crate::mt7921::{association::LegacyRate, firmware_transport::Error, vif_slots::Vif};
 use alloc::{vec, vec::Vec};
 
 pub(super) fn ethernet(
@@ -36,10 +36,24 @@ pub(super) fn descriptor(
     wcid: u8,
     rate: LegacyRate,
 ) -> Result<[u8; 64], Error> {
+    descriptor_on(Vif::HOME, frame, payload, token, wcid, rate)
+}
+/// `descriptor` for an AP BSS on `vif`: its peers or its own BMC WCID
+/// (19 - idx) for group data; TXD1 `OWN_MAC` and the AC queue's WMM set
+/// follow `packet_tx::on_vif` (mt76_connac2_mac_write_txwi).
+pub(super) fn descriptor_on(
+    vif: Vif,
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u8,
+    rate: LegacyRate,
+) -> Result<[u8; 64], Error> {
+    let bmc = vif.bmc();
     if !(24..=4032).contains(&frame.len())
         || token == 0
         || token >= 8192
-        || !(wcid <= 13 || wcid == 19)
+        || !(wcid <= 13 || wcid == bmc)
         || payload
             .checked_add(frame.len() as u64 - 1)
             .is_none_or(|end| end > u64::from(u32::MAX))
@@ -57,7 +71,10 @@ pub(super) fn descriptor(
         || frame[1] & 0x84 != 0
         || frame[22] & 15 != 0
         || if data {
-            !matches!(subtype, 0 | 8) || frame[1] & 3 != 2 || wcid == 0 || multicast != (wcid == 19)
+            !matches!(subtype, 0 | 8)
+                || frame[1] & 3 != 2
+                || wcid == 0
+                || multicast != (wcid == bmc)
         } else {
             kind != 0 || !matches!(subtype, 1 | 3 | 5 | 10 | 11 | 12 | 13) || frame[1] & 0x43 != 0
         }
@@ -97,6 +114,7 @@ pub(super) fn descriptor(
     out[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
     out[40..44].copy_from_slice(&(payload as u32).to_le_bytes());
     out[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
+    crate::mt7921::packet_tx::on_vif(&mut out, vif)?;
     Ok(out)
 }
 

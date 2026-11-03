@@ -30,6 +30,9 @@ pub(crate) struct Plan {
     /// AP or P2P-GO BSS connection type; bound from the START authority's
     /// actual mode, never inferred from beacon/P2P elements.
     pub network: crate::mt7921::p2p_wire::Network,
+    /// The vif this BSS runs on (its BSS/OMAC/BMC identity); fixed for the
+    /// BSS lifetime like `mvif->idx` in Linux mt7921_add_interface.
+    pub vif: crate::mt7921::vif_slots::Vif,
 }
 
 impl core::fmt::Debug for Plan {
@@ -144,6 +147,7 @@ impl Plan {
             tim_offset,
             probe,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
+            vif: crate::mt7921::vif_slots::Vif::HOME,
         })
     }
 

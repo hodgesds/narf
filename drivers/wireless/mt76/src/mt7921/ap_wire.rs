@@ -214,6 +214,19 @@ pub(super) fn beacon(
     csa_counter_offset: Option<usize>,
     rate: LegacyRate,
 ) -> Result<[u8; 530], Error> {
+    beacon_on(Vif::HOME, frame, tim_offset, csa_counter_offset, rate)
+}
+/// `beacon` for `vif`: the request header carries `bss_idx = mvif->idx`
+/// (mt7921_mcu_uni_add_beacon_offload) and the embedded TXD1 `OWN_MAC`
+/// (bits 24..=29) = `omac_idx` (mt76_connac2_mac_write_txwi). The beacon
+/// queue and the global WCID 0 are per band, not per vif.
+pub(super) fn beacon_on(
+    vif: Vif,
+    frame: &[u8],
+    tim_offset: usize,
+    csa_counter_offset: Option<usize>,
+    rate: LegacyRate,
+) -> Result<[u8; 530], Error> {
     if frame.len() < 36
         || frame.len() > 480
         || frame[..2] != [0x80, 0]
@@ -242,6 +255,7 @@ pub(super) fn beacon(
     };
     let packet_length = 32 + frame.len();
     let mut body = [0; 530];
+    body[0] = vif.index();
     body[4..6].copy_from_slice(&7u16.to_le_bytes());
     body[6..8].copy_from_slice(&526u16.to_le_bytes());
     body[8..10].copy_from_slice(&((32 + tim_offset) as u16).to_le_bytes());
@@ -250,7 +264,7 @@ pub(super) fn beacon(
     body[16..18].copy_from_slice(&(packet_length as u16).to_le_bytes());
     let words = [
         packet_length as u32 | (3 << 23) | (0x12 << 25),
-        (1 << 31) | (2 << 16) | (12 << 11),
+        (1 << 31) | (2 << 16) | (12 << 11) | (u32::from(vif.omac()) << 24),
         (1 << 31) | (1 << 13) | (1 << 10) | 8,
         (1 << 28) | (31 << 11) | 1,
         0,

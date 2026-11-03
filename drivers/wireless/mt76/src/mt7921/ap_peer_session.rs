@@ -58,16 +58,20 @@ impl<B: Backend> Session<B> {
         if peer.rates & basic != basic {
             return Err(Error::Bounds);
         }
-        let record = ap_wire::peer(PeerRecord {
-            mac: peer.config.mac,
-            wcid: peer.wcid,
-            aid: peer.config.aid,
-            newly: true,
-            qos: false,
-            five_ghz: five,
-            rates: peer.rates,
-            basic_rates: basic,
-        })?;
+        let vif = self.ap_owner.as_ref().ok_or(Error::Busy)?.plan.vif;
+        let record = ap_wire::peer_on(
+            vif,
+            PeerRecord {
+                mac: peer.config.mac,
+                wcid: peer.wcid,
+                aid: peer.config.aid,
+                newly: true,
+                qos: false,
+                five_ghz: five,
+                rates: peer.rates,
+                basic_rates: basic,
+            },
+        )?;
         self.renew_receive_epoch()?;
         self.ap_owner.as_mut().unwrap().pending = Some(authority.clone());
         self.stage(Stage::ApPeer);
@@ -244,7 +248,8 @@ impl<B: Backend> Session<B> {
                     .peers
                     .get(mac)
                     .ok_or(Error::Bounds)?;
-                let record = ap_wire::delete_peer(mac, peer.wcid, peer.config.aid)?;
+                let vif = self.ap_owner.as_ref().ok_or(Error::Busy)?.plan.vif;
+                let record = ap_wire::delete_peer_on(vif, mac, peer.wcid, peer.config.aid)?;
                 self.ap_exchange(&authority, Command::Unified { id: 3 }, &record)
                     .await?;
                 // Hardware has never owned an AP encryption key. The native

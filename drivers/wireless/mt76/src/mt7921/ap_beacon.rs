@@ -27,6 +27,7 @@ impl<B: Backend> Session<B> {
         let mut plan = Plan::prepare(owner.info, config, &policy)?;
         // The START role is fixed for this BSS (no AP<->GO retargeting).
         plan.network = owner.plan.network;
+        plan.vif = owner.plan.vif;
         let plan = Arc::new(plan);
         if plan.permission != owner.plan.permission
             || plan.rates != owner.plan.rates
@@ -41,7 +42,7 @@ impl<B: Backend> Session<B> {
         if (plan.config.beacon_head[35] ^ owner.plan.config.beacon_head[35]) & 4 != 0 {
             return Err(Error::Bounds);
         }
-        let record = ap_wire::beacon(&plan.beacon, plan.tim_offset, None, plan.rate)?;
+        let record = ap_wire::beacon_on(plan.vif, &plan.beacon, plan.tim_offset, None, plan.rate)?;
         self.begin_ap_peer_request(authority.clone())?;
         self.ap_owner.as_mut().unwrap().pending_plan = Some(plan.clone());
         let result = async {

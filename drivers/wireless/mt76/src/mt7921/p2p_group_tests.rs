@@ -369,6 +369,45 @@ fn vif_link() -> Result<(), &'static str> {
     if record != home {
         return Err("vif AP peer differs beyond bss/MUAR");
     }
+    // Beacon offload: bss_idx header and embedded TXD1 OWN_MAC only.
+    let mut frame = vec![0; 42];
+    frame[0] = 0x80;
+    frame[4..10].fill(0xff);
+    frame[36..38].copy_from_slice(&[5, 4]);
+    let rate = crate::mt7921::association::LegacyRate::ONE_MBPS;
+    let mut home = ap_wire::beacon(&frame, 36, None, rate).map_err(|_| "home beacon")?;
+    let record = ap_wire::beacon_on(vif, &frame, 36, None, rate).map_err(|_| "vif beacon")?;
+    if home[0] != 0 || home[25] & 0x3f != 0 {
+        return Err("HOME beacon left BSS0/OMAC0");
+    }
+    home[0] = 1;
+    home[25] |= 1; // TXD1 bits 24..=29 = omac_idx 1.
+    if record != home {
+        return Err("vif beacon differs beyond bss/OWN_MAC");
+    }
+    // AP data TXD: group data rides the vif's own BMC WCID (18 on vif 1),
+    // never another vif's; the TXD differs only in OWN_MAC and WMM set.
+    use crate::mt7921::firmware_transport::ap_packet::{descriptor, descriptor_on};
+    let mut group = vec![0; 40];
+    group[..2].copy_from_slice(&[0x08, 2]);
+    group[4..10].fill(0xff);
+    let mut home = descriptor(&group, 0x1000, 1, 19, rate).map_err(|_| "home group TXD")?;
+    let record = descriptor_on(vif, &group, 0x1000, 1, 18, rate).map_err(|_| "vif group TXD")?;
+    if descriptor_on(vif, &group, 0x1000, 1, 19, rate).is_ok()
+        || descriptor(&group, 0x1000, 1, 18, rate).is_ok()
+    {
+        return Err("AP group data accepted another vif's BMC WCID");
+    }
+    let queue = u32::from_le_bytes(home[..4].try_into().unwrap()) >> 25;
+    home[4] = 18; // TXD1 WLAN_IDX.
+    home[7] |= 1; // OWN_MAC 1.
+    if queue < 4 {
+        let word0 = u32::from_le_bytes(home[..4].try_into().unwrap()) + (4 << 25);
+        home[..4].copy_from_slice(&word0.to_le_bytes());
+    }
+    if record != home {
+        return Err("vif AP TXD differs beyond WCID/OWN_MAC/WMM");
+    }
     // TXD: HOME no-op; vif 1 OWN_MAC 1 and WMM set 1 on AC queues only.
     let frame = [0u8; 60];
     let mut ethernet = frame;

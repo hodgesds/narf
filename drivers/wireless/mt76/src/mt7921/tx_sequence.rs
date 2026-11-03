@@ -40,7 +40,15 @@ impl Owner {
     /// Same native terminal-report owner for an AP management MPDU. This
     /// does not assert a sequence originator or create a transmit grant.
     pub fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error> {
-        if !(1..=13).contains(&wcid) && wcid != 19 {
+        self.arm_ap_management_on(super::vif_slots::Vif::HOME, wcid)
+    }
+    /// `arm_ap_management` for the AP BSS on `vif`: a peer or its BMC WCID.
+    pub fn arm_ap_management_on(
+        &mut self,
+        vif: super::vif_slots::Vif,
+        wcid: u8,
+    ) -> Result<(), Error> {
+        if !(1..=13).contains(&wcid) && wcid != vif.bmc() {
             return Err(Error::Bounds);
         }
         self.arm_for(0, u16::from(wcid), true)
