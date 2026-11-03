@@ -173,6 +173,12 @@ pub(super) struct State {
     /// A native retune is in progress; the station reports Failed until it
     /// commits, so a cancelled retune never looks Passive again.
     retuning: bool,
+    /// Accepted AP channel switch awaiting its countdown (`channel_policy::
+    /// Switch`, mac80211 software CSA).
+    switch: Option<super::channel_policy::Switch>,
+    /// Block-mode switch done: TX stays blocked until a peer beacon arrives on
+    /// the new primary (`mlme.c::ieee80211_chswitch_post_beacon`).
+    switch_wait_beacon: bool,
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -275,6 +281,8 @@ impl State {
             channel: 1,
             rfk_channel: Some(1),
             retuning: false,
+            switch: None,
+            switch_wait_beacon: false,
         }
     }
     /// Exact retained factory/radio facts for the dm watchdog statistics.
@@ -298,6 +306,17 @@ impl State {
     /// established. Losing the continuation or leaving its measured envelope
     /// restores the base program under the base gate and stops tracking.
     pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
+        let due = match &self.switch {
+            Some(s) if self.established => Some(s.due),
+            _ => None,
+        };
+        if due.is_some_and(|due| self.now().is_ok_and(|now| now >= due)) {
+            if let Err(e) = self.channel_switch(io).await {
+                self.fail(io);
+                return Err(e);
+            }
+            return Ok(true);
+        }
         let mut power_changed = false;
         if self.power_tracking.is_some() && self.established && self.ready() {
             let now = self.now()?;
@@ -416,6 +435,8 @@ impl State {
     }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
+            && !self.switch.as_ref().is_some_and(|s| s.block)
+            && !self.switch_wait_beacon
             && self.pending.is_none()
             && self.delivered_reply.is_none()
             && self.data_pending.is_empty()
@@ -656,8 +677,8 @@ impl State {
             _ => self.own,
         };
         let observed = match &self.local_ht {
-            Some(p) => association::observe_with_phy(frame, 1, own, signal, p),
-            None => association::observe(frame, 1, own, signal),
+            Some(p) => association::observe_with_phy(frame, self.channel, own, signal, p),
+            None => association::observe(frame, self.channel, own, signal),
         };
         let Ok(candidate) = observed else {
             return;
@@ -837,6 +858,9 @@ impl State {
                     };
                 }
                 self.cache(&frame, now);
+                if matches!(self.phase, Phase::FourWay | Phase::Open) {
+                    self.channel_switch_ie(io, frame.bytes(), now)?;
+                }
                 if self.phase != Phase::Passive {
                     if self.incoming.len() == 64 {
                         return Err(Error::State);
@@ -1420,6 +1444,19 @@ impl State {
                     .ok_or(Error::Profile)?,
             )
         };
+        self.retune_to(io, channel, grant, rfk, Phase::Passive)
+            .await
+    }
+    /// Shared retune body: `resume` is the phase restored after commit
+    /// (Passive for scan/association, the associated phase for a CSA).
+    async fn retune_to(
+        &mut self,
+        io: &mut impl Io,
+        channel: u8,
+        grant: Option<Arc<super::qualification::Grant>>,
+        rfk: bool,
+        resume: Phase,
+    ) -> Result<(), Error> {
         self.retuning = true;
         let mut quiet = false;
         for _ in 0..1000 {
@@ -1443,8 +1480,87 @@ impl State {
         if rfk {
             self.rfk_channel = Some(channel);
         }
-        self.phase = Phase::Passive;
+        self.phase = resume;
         self.retuning = false;
+        Ok(())
+    }
+    /// mac80211 software CSA receipt (`mlme.c::ieee80211_sta_process_chanswitch`
+    /// with emulated channel contexts, which set `CHANCTX_STA_CSA`) for the
+    /// associated BSS's own Beacon/Probe Response. Same-channel announcements
+    /// are ignored; another band, an unadmitted primary or a program that
+    /// cannot carry over drops the connection like mac80211's
+    /// `drop_connection`. Runs under the caller's publication.
+    fn channel_switch_ie(&mut self, io: &mut impl Io, bytes: &[u8], now: u64) -> Result<(), Error> {
+        let Some(peer) = &self.peer else {
+            return Ok(());
+        };
+        if bytes.len() < 36
+            || !matches!(bytes[0], 0x80 | 0x50)
+            || bytes[1] & 0xc7 != 0
+            || bytes[16..22] != peer.bss.bssid
+        {
+            return Ok(());
+        }
+        if self.switch_wait_beacon && bytes[0] == 0x80 {
+            // RX already requires the PHY report of the committed primary.
+            self.switch_wait_beacon = false;
+        }
+        let Some(ie) = super::channel_policy::switch_ie(&bytes[36..]) else {
+            return Ok(());
+        };
+        if self.switch.is_some() || self.retuning || ie.channel == Some(self.channel) {
+            return Ok(());
+        }
+        // Programs qualified for the old primary (WMM/HT/BA/RTS/coding/QoS/
+        // fallback/dm/N21W) cannot be carried over in place; the SME
+        // re-associates and loads the new primary's own records.
+        let carried = self.extension.is_none()
+            && self.ht.is_none()
+            && self.rx_ba_grant.is_none()
+            && self.tx_ba_grant.is_none()
+            && self.protection.is_none()
+            && self.coding.is_none()
+            && self.qos.is_none()
+            && self.fallback.is_none()
+            && self.tracking.grant.is_none()
+            && self.power_tracking.is_none();
+        let channel = ie.channel.ok_or(Error::PeerLost)?;
+        if !carried || super::channel_policy::group(channel).is_none() {
+            return Err(Error::PeerLost);
+        }
+        let grant = if channel == 1 {
+            None
+        } else {
+            Some(io.station_channel_grant(channel)?.ok_or(Error::PeerLost)?)
+        };
+        let interval = u64::from(u16::from_le_bytes([bytes[32], bytes[33]]));
+        let wait = u64::from(ie.count.max(1) - 1) * interval * 1024 / 1000;
+        self.switch = Some(super::channel_policy::Switch {
+            channel,
+            grant,
+            due: now.saturating_add(wait),
+            block: ie.block,
+        });
+        Ok(())
+    }
+    /// `ieee80211_chswitch_work` -> `rtw_ops_config(CHANGE_CHANNEL)` ->
+    /// `rtw_set_channel` on the associated station: the native retune owner
+    /// (TX refusal, TXPAUSE, drain, chip `set_channel`, TX power level,
+    /// readback, epoch) without RF calibration, which Linux defers to the
+    /// next `mgd_prepare_tx` (`need_rfk`). Keys, peer/AID and port state are
+    /// unchanged; beacon-loss monitoring restarts on the new primary.
+    async fn channel_switch(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        let switch = self.switch.take().ok_or(Error::State)?;
+        let resume = self.phase;
+        if !matches!(resume, Phase::FourWay | Phase::Open) {
+            return Err(Error::State);
+        }
+        self.retune_to(io, switch.channel, switch.grant, false, resume)
+            .await?;
+        self.peer.as_mut().ok_or(Error::State)?.bss.channel = switch.channel;
+        self.switch = None;
+        self.switch_wait_beacon = switch.block;
+        self.last_peer = self.now()?;
         Ok(())
     }
     pub(super) fn channel(&self) -> u8 {

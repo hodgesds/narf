@@ -227,3 +227,38 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_channel_scoped_filenames_and_group_ht_ceilings
 );
+
+fn smoke_rtw88_channel_switch_announcement_parse() -> TestResult {
+    use channel_policy::{switch_ie, SwitchIe};
+    // SSID, DS(1), CSA mode1 -> 6 count3.
+    let csa = [0, 3, b'l', b'a', b'b', 3, 1, 1, 37, 3, 1, 6, 3];
+    // ECSA (class 81 -> 11, count 0) takes precedence over CSA.
+    let both = [37, 3, 0, 6, 5, 60, 4, 0, 81, 11, 0];
+    // ECSA in a 40MHz class (83) cannot be followed at 20MHz.
+    let wide = [60, 4, 1, 83, 6, 2];
+    if switch_ie(&csa)
+        != Some(SwitchIe {
+            block: true,
+            channel: Some(6),
+            count: 3,
+        })
+        || switch_ie(&both)
+            != Some(SwitchIe {
+                block: false,
+                channel: Some(11),
+                count: 0,
+            })
+        || switch_ie(&wide).map(|s| s.channel) != Some(None)
+        || switch_ie(&[0, 3, b'l', b'a', b'b', 3, 1, 1]).is_some()
+        || switch_ie(&[37, 2, 1, 6]).is_some()
+    {
+        return TestResult::Fail(
+            "CSA/ECSA element parse differs from ieee80211_parse_ch_switch_ie",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_channel_switch_announcement_parse
+);

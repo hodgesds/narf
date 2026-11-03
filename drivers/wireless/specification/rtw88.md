@@ -2157,13 +2157,37 @@ primary (Probe Request DS Parameter Set rewritten per channel), then retunes
 back to the pre-scan channel even after an error. Scan results report each
 BSS's own primary/frequency; association and safe rejoin accept any admitted
 primary. C22 PHY status must report the current primary (`on_channel`); C21
-reports none.
+reports none. The BSS cache observes Beacons and Probe Responses against the
+currently tuned primary (DS Parameter Set must match it), so scan results and
+peer liveness work off channel 1.
+
+Channel switch while associated (`station.rs::channel_switch_ie`/
+`channel_switch`) follows mac80211's software CSA for emulated channel
+contexts (`main.c` sets `CHANCTX_STA_CSA`; `mlme.c::
+ieee80211_sta_process_chanswitch`). The associated BSS's own Beacon/Probe
+Response CSA (37) or ECSA (60, preferred; only class 81 2.4GHz/20MHz) is
+parsed (`channel_policy::switch_ie`). Same-channel announcements are ignored.
+Another band/class, an unadmitted primary, a target without a loadable N2xO
+record, or any bound continuation program (L/H/R/T/X/C/Q/F/D/W, whose records
+are per-channel and cannot be carried in place) drops the connection
+(`Error::PeerLost`, mac80211 `drop_connection`); the SME re-associates and
+loads the new primary's own records. Otherwise the switch is due after
+(max(count,1)-1) beacon intervals; mode 1 blocks host TX (`ready()` false)
+from receipt until a peer Beacon on the new primary
+(`ieee80211_chswitch_post_beacon`). The periodic watchdog runs it like
+`ieee80211_chswitch_work` -> `rtw_ops_config(IEEE80211_CONF_CHANGE_CHANNEL)`
+-> `rtw_set_channel`: the same native retune owner (TX refusal, TXPAUSE,
+drain, chip `set_channel`, TX power level, readbacks, epoch) without RF
+calibration (Linux defers it to `need_rfk`), restoring the associated phase.
+Keys, peer/AID and port state are unchanged and peer-loss monitoring
+restarts. A retune failure is terminal like any other retune failure.
 
 Remaining before physical acceptance (no row closure is claimed here): no
 signed N2xO record exists for any board, so on real hardware only channel 1
 is admitted until per-channel measurements are provisioned. Extension
 programs are per-channel records over the channel-scoped base (above); none
-is provisioned for any channel. Three new cases are written and
+is provisioned for any channel. An in-place channel switch carries only the base
+legacy CCK1 profile; with continuation programs bound it disconnects. Three new cases are written and
 unexecuted at the time of writing:
 `smoke_rtw88_channel_policy_linux_groups_bb_rf_and_probe_ds`,
 `smoke_rtw88_channel_record_admission_and_regulatory_span`,
@@ -2383,7 +2407,7 @@ changes. None is a physical blocker unless stated.
 
 | Row | Blocker |
 |---|---|
-| `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13 (base legacy CCK1 profile off channel 1). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
+| `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13, per-channel continuation records over the channel-scoped base (`scope_request`), Linux-level C22 IQK completion, and associated CSA/ECSA following mac80211 software CSA (base profile in place; bound continuations disconnect). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
 | `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
 | `dpk_tracking` | Source-complete for C22 under N22D bit 7 (`dpk.rs`, §3 dm section): `rtw8822c_do_dpk` + `rtw8822c_dpk_track`. Five register-model cases are written, unexecuted; GAPK, a real signed N22D DPK measurement and physical acceptance remain external. |
 | `five_ghz_operation` | 2.4GHz noninitial retune now exists (N2xO), but 5GHz needs the `rtw8822c_set_channel_bb`/`_rf` 5GHz branches, 5GHz AGC/RF table selection (`rtw_phy_setup_phy_cond` band conditions), 5GHz efuse power groups and a measured 5GHz envelope; `scan.rs` admits 2.4GHz only. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |

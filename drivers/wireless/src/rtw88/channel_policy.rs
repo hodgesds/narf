@@ -287,6 +287,57 @@ pub(super) fn scope_request(
     })
 }
 
+/// Accepted associated channel switch: the target primary and its N2xO
+/// record (none for channel 1), the countdown deadline (ms) and whether TX is
+/// blocked (CSA mode 1).
+pub(super) struct Switch {
+    pub(super) channel: u8,
+    pub(super) grant: Option<alloc::sync::Arc<Grant>>,
+    pub(super) due: u64,
+    pub(super) block: bool,
+}
+
+/// Parsed Channel Switch Announcement for a 2.4GHz/20MHz BSS. `channel` is
+/// None when the ECSA operating class is not 2.4GHz 20MHz (class 81), which
+/// mac80211 treats as a switch this station cannot follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SwitchIe {
+    pub(super) block: bool,
+    pub(super) channel: Option<u8>,
+    pub(super) count: u8,
+}
+
+/// `util.c::ieee80211_parse_ch_switch_ie` subset over Beacon/Probe Response
+/// elements: ECSA (60: mode, operating class, channel, count) takes
+/// precedence over CSA (37: mode, channel, count).
+pub(super) fn switch_ie(ies: &[u8]) -> Option<SwitchIe> {
+    let (mut csa, mut ecsa) = (None, None);
+    let mut at = 0;
+    while at + 2 <= ies.len() {
+        let len = usize::from(ies[at + 1]);
+        let body = ies.get(at + 2..at + 2 + len)?;
+        match (ies[at], body) {
+            (37, [mode, channel, count]) => {
+                csa = Some(SwitchIe {
+                    block: *mode != 0,
+                    channel: Some(*channel),
+                    count: *count,
+                })
+            }
+            (60, [mode, class, channel, count]) => {
+                ecsa = Some(SwitchIe {
+                    block: *mode != 0,
+                    channel: (*class == 81).then_some(*channel),
+                    count: *count,
+                })
+            }
+            _ => {}
+        }
+        at += 2 + len;
+    }
+    ecsa.or(csa)
+}
+
 /// Rewrite the DS Parameter Set of one software-scan Probe Request for
 /// `channel` (`ieee80211_build_preq_ies` uses the scanned channel).
 pub(super) fn probe_for(probe: &[u8], channel: u8) -> Option<alloc::vec::Vec<u8>> {
