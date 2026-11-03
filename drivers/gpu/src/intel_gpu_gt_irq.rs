@@ -463,9 +463,10 @@ impl<M: MmioWindow> Controller<M> {
         if !s.active || !s.tiled || s.gsc_routed {
             return Err(IrqError::Identity);
         }
-        for reg in [GSC_ENABLE, GSC_MASK, HECI2_MASK] {
-            read(&s.mmio, reg)?;
-        }
+        // Access is proven on the enable register alone: all-ones is the
+        // valid gt_irq_reset value of both mask registers (`gsc_reset`), so
+        // reading them as an access probe would refuse every re-route.
+        read(&s.mmio, GSC_ENABLE)?;
         s.gsc = true;
         s.gsc_routed = true;
         let routes = [
