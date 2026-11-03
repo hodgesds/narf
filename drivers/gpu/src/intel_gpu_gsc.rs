@@ -28,11 +28,13 @@
 //!
 //! The HuC parts below are production: `intel_gpu_huc` acquires
 //! `HUC_FIRMWARE`, stages its `HucImage` CSS window on the media GuC and reads
-//! `huc_authenticated(_, HucAuth::Guc)` through GT1's view. The GSC-only parts
-//! (`heci`: the GSC image, its load batch and the HECI protocol, including GSC
-//! HuC authentication) stay formats: no owner loads GSC firmware or brings up
-//! GSCCS, and the media GT path keeps refusing to schedule while GSC firmware
-//! is loaded.
+//! `huc_authenticated(_, HucAuth::Guc)` through GT1's view. So are the
+//! `narf.intel.gsc` opt-in and the Wa_14015076503 helpers the media GuC's stop
+//! uses around GRDOM_FULL. The GSC-only parts (`heci`: the GSC image, its load
+//! batch and the HECI protocol; `load`: the GSC worker that loads the
+//! firmware, authenticates the HuC through the GSC and starts the proxy) run
+//! only on native models: no platform owner supplies GSCCS0, the stolen
+//! private object or a CSME component yet.
 
 use crate::intel_gpu_aux::MmioWindow;
 
@@ -41,6 +43,13 @@ use crate::intel_gpu_aux::MmioWindow;
 mod heci;
 #[cfg_attr(not(feature = "kernel-test"), allow(unused_imports))]
 pub(crate) use heci::*;
+
+/// The GSC worker (load, HuC authentication via the GSC, proxy start). No
+/// platform owner supplies its GSCCS queue, stolen private object or CSME
+/// component yet, so only native models drive it.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+#[path = "intel_gpu_gsc_load.rs"]
+pub(crate) mod load;
 
 /// Default-off opt-in for GSC handling on the MTL/Arrow media GT, with the
 /// shared pre-`--` grammar of `narf.intel.media_gt=1` and `narf.intel.huc=1`.
