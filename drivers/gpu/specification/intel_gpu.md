@@ -2395,8 +2395,8 @@ production feature. Unsupported functionality remains unadvertised.
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
-| Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; GSC HECI packets are modelled but unwired; GSCCS, GSC load, GSC HuC authentication, GT1 frequency/idle sysfs and silicon acceptance remain |
+| Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification. Protected queues stay unadvertised: PXP_TYPE, the PXP status query and BO PXP_TYPE now refuse with Linux's no-PXP errnos (HWDRM ENODEV, NONE accepted); PXP needs the GSC proxy's MEI/CSME client, which NARF lacks |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503 and schedules beside loaded GSC firmware; the GSC worker (load, compatibility query, HuC authentication via the GSC, proxy start to the CSME boundary) runs on native models only; GSCCS0 scheduling, a device-lifetime stolen GSC private object, the MEI GSC proxy, GT1 frequency/idle sysfs and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
@@ -5567,3 +5567,143 @@ they reach the production DC service and now also move the panel's display
 wakeref. QEMU is unaffected.
 
 The debug group pass is deferred to the end of the campaign.
+
+### MTL GSC worker, Wa_14015076503 on the media GuC and the PXP refusals
+
+`narf.intel.gsc=1` is a new default-off option with the shared pre-`--`
+grammar. It is admitted only together with `narf.intel.media_gt=1`: Linux
+keeps the GSC on the media GT (xe_gsc.c::xe_gsc_init) and makes it
+separately optional through `gsc_firmware_path`.
+
+With the option, the media GuC's verified stop honours Wa_14015076503
+(xe_gsc.c::xe_gsc_wa_14015076503, MEDIA_VERSION(1300)) as
+xe_gt.c::do_gt_reset does. When HECI1_FWSTS1 reports INIT_COMPLETE, the stop
+sets HECI_H_GS1 ER_PREP and raises the HECI2 interrupt (IG) with the CSR reset
+bit cleared. It waits 200 ms, writes GRDOM_FULL and clears ER_PREP once the
+reset self-clears; a failed reset still clears it. The media GT recovery owner
+already applied the same bracket, so with the option scheduling is admitted
+beside loaded GSC firmware. This is the only place the deviation is dropped.
+Without the option both refusals stay exactly as before: scheduling is EBUSY
+while GSC firmware is loaded, and a load that appears later keeps the owner
+retained at stop.
+
+`intel_gpu_gt::media::gsc::load` ports Linux's GSC worker. It is generic over
+the three things only the platform can supply: the GSC kernel queue on GSCCS0,
+the 4 MiB GSC private object and the CSME end of the GSC proxy. It covers:
+- xe_gsc_init and xe_gsc_init_post_hwconfig with the xe_uc_fw status machine.
+- xe_gsc_load_start: a GSC that survived a GT reset or D3hot is only
+  re-classified (TRANSFERRED, or RUNNING with PROXY_STATE_NORMAL), and an error
+  state never reloads.
+- gsc_upload: EEXIST for a loaded GSC, which gsc_work records as RUNNING;
+  memcpy_fw into the private object with the tail zeroed; GSC_FW_LOAD with an
+  HZ fence wait (ETIME); INIT_COMPLETE within 500 ms (ETIMEDOUT).
+- query_compatibility_version (MKHI GFX_SRV) and the major-102 requirement
+  (ENOEXEC).
+- xe_huc_auth(XE_HUC_AUTH_VIA_GSC) for a HuC the media GuC authenticated:
+  PXP 4.3 NEW_HUC_AUTH with the whole HuC object, five submissions 50 ms
+  apart while the GSC replies pending (the message handle is handed back),
+  OP_NOT_PERMITTED as already authenticated, then HECI1_FWSTS5 HUC_AUTH_DONE
+  within 100 ms. As in Linux, any failure makes the HuC LOAD_FAIL, so query7
+  type1 would then be ENODEV, but the GSC load continues. A GSC load failure
+  never touches the HuC.
+- xe_gsc_proxy_start, the request handler, proxy_query and
+  validate_proxy_header, up to the CSME send/recv boundary.
+- XE_FW_GSC around each run, the SW_PROXY and GSC_ER_COMPLETE actions, and
+  the ER timer check that declares the GSC wedged.
+
+NARF has no MEI client, so the worker behaves as Linux built without
+CONFIG_INTEL_MEI_GSC_PROXY. xe_gsc_proxy_init's ENODEV is tolerated, the
+firmware loads and authenticates the HuC, and then xe_gsc_proxy_start fails
+with ENODEV after enabling and disabling the proxy interrupt. gsc_work
+records LOAD_FAIL, an error state in which no later GT reset or resume
+reloads the GSC. With a CSME component (a native model only), the proxy
+reaches PROXY_STATE_NORMAL, the GSC is RUNNING, and a GSC lost across resume
+is reloaded in full.
+
+NARF deviations, all fail-closed: lost MMIO (all ones) is never a set bit; an
+unacknowledged GSC wake ends the run (Linux proceeds without it); a GSCCS job
+that never retires blocks later submissions (Linux queues behind it); a
+missing or malformed image or an unavailable private object leaves the GSC
+unavailable where Linux fails the MTL probe.
+
+The worker is not wired into the runtime. Three pieces are missing:
+- GSCCS0 is not a scheduled engine of the media GuC. That needs its
+  xe_hw_engine entry (class OTHER, GuC GSC_OTHER class, instance 6, base
+  0x11a000, XE_FW_GSC wake), its reg_sr (RING_CMD_CCTL and the MTL GSCCS
+  IDLE MSG pair) in the ADS saves, its golden LRC, GUNIT_GSC_INTR_ENABLE/MASK
+  and the 600 ms preemption floor, plus a kernel queue for GGTT jobs.
+- There is no device-lifetime GSC private object. Linux places it in stolen
+  memory (XE_BO_FLAG_STOLEN) because the GSC may touch it after the kernel has
+  suspended the device. The GSC keeps using that memory until an FLR, so its
+  DSM range and its GGTT DM mapping must never be released or reused by a
+  later GT0 incarnation. NARF's DSM placer serves display FBC only, and NARF
+  writes no DM PTE today.
+- There is no MEI GSC proxy component (below).
+Until all three exist, NARF hands no memory to the GSC and submits nothing to
+GSCCS.
+
+PXP stays refused with Linux's errnos. Linux supports PXP only with
+CONFIG_INTEL_MEI_GSC_PROXY (xe_pxp_is_supported); without it xe->pxp is NULL,
+and NARF now matches that case on every native Xe device:
+- DRM_XE_DEVICE_QUERY_PXP_STATUS negotiates sizeof(drm_xe_query_pxp_status)
+  (8). Any other nonzero size is EINVAL, and the exact size is ENODEV with
+  nothing copied out.
+- DRM_XE_EXEC_QUEUE_SET_PROPERTY_PXP_TYPE accepts NONE. HWDRM is ENODEV and
+  any other session type EINVAL (exec_queue_set_pxp_type).
+- GEM_CREATE runs its SET_PROPERTY chain (gem_create_user_extensions): a
+  nonzero name or pad, or a property other than PXP_TYPE, is EINVAL; NONE is
+  accepted; HWDRM is ENODEV (xe_pxp_key_assign on NULL). As in Linux, the
+  chain's result applies only after argument, VM and allocation refusals, and
+  a refused extension publishes no handle. The header is copied before the
+  body, so EFAULT and EINVAL keep Linux's order.
+- VM_BIND already accepted DRM_XE_VM_BIND_FLAG_CHECK_PXP; with no protected
+  object it has no effect, as in Linux.
+More than 16 GEM_CREATE extensions is Linux's E2BIG, which `FsError` cannot
+carry, so it is EINVAL. Before this change PXP_TYPE was ENOSYS, the PXP query
+EINVAL and every GEM_CREATE extension EINVAL. The low-latency queue fixture
+stops asserting ENOSYS for PXP_TYPE NONE, which Linux accepts; the new PXP
+fixture pins every PXP_TYPE errno.
+
+The GSC proxy cannot be completed over GSCCS alone: the GSC asks the driver to
+relay its messages to CSME and back. PXP needs that relay (xe_gsc_proxy_init_done
+gates xe_pxp's readiness), so protected queues stay unadvertised. The missing
+interface is the MEI GSC proxy client (Linux
+drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c, `i915_gsc_proxy_component_ops`):
+- Bind the CSME HECI1 PCI function (MTL-M 0x7E70, ARL-S 0x7F68, ARL-H 0x7770,
+  MEI_ME_PCH15_CFG) to the integrated display device on bus 0.
+- Find the firmware client with UUID f73db04-97ab-4125-b893-e904ad0d5464 by
+  the HBM HOST_CLIENT_PROPERTIES walk and connect to it with per-client flow
+  control (mei_cldev_enable).
+- Provide a blocking `send(buf, len)` (mei_cldev_send) and a
+  `recv(buf, 32 KiB)` (mei_cldev_recv) that return bytes or a negative errno.
+`drivers/platform/src/mei.rs` stops at link bring-up, HOST_START and the client
+enumeration bitmap. The worker's `CsmeProxy` trait is exactly that send/recv
+pair.
+
+Threat assumptions. While PXP is refused, NARF writes no KCR register, starts
+no session, creates no protected object or queue and offers no key to
+invalidate. The GSC firmware is trusted, hardware-authenticated code: NARF
+checks only the image layout and the compatibility major. The private object
+it receives is GSC-owned until an FLR. The proxy relays opaque GSC/CSME
+messages and checks only their headers and sizes. HuC authentication through
+the GSC exercises the PXP firmware client but starts no PXP session.
+
+Fixtures (`drivers/gpu/intel_gpu_media_gt`), all new and unexecuted in this
+slice:
+- `smoke_media_gt_gsc_wa_14015076503_brackets_stop_and_admits_scheduling` and
+  `smoke_media_gt_gsc_without_option_retains_and_failed_reset_clears` (the
+  media GuC model).
+- `smoke_media_gsc_option_grammar_and_wa_14015076503_registers`.
+- `smoke_media_gsc_load_uploads_queries_authenticates_huc_and_stops_at_proxy`,
+  `smoke_media_gsc_load_refusals_leave_the_guc_huc_running`,
+  `smoke_media_gsc_huc_auth_retries_failures_and_skips`,
+  `smoke_media_gsc_proxy_csme_boundary_and_reload_after_resume` and
+  `smoke_media_gsc_er_complete_wedges_only_on_an_expired_timer` (a GSC
+  firmware model behind GSCCS and a CSME model).
+- `smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos` (native Xe on the
+  MTL GuC model).
+
+The existing refusal fixture still pins the option-off sequence, and
+`smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback` no
+longer lists PXP_TYPE among its ENOSYS properties. None of this is physical
+Intel evidence.

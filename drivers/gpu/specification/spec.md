@@ -509,8 +509,10 @@ context image. Caller cancellation, queue/VM/BO/fd close and missing
 acknowledgements retain all GPU-reachable state and reservations until native
 retirement or verified reset. A reset does not authorize replay of the old
 context; stale epochs remain refused, and a new queue rewrites the complete
-policy before enable. PXP, CGP, user hang-replay state and other new scheduling
-interfaces remain outside this contract.
+policy before enable. EXEC_QUEUE_CREATE's PXP_TYPE property accepts NONE;
+HWDRM is ENODEV and any other session type EINVAL, because no NARF device
+enables PXP (see the MTL/Arrow GSC section). CGP, user hang-replay state and
+other new scheduling interfaces remain outside this contract.
 Visible VRAM is advertised only after the platform-qualified pool is published. BMG accepts/reports NO_COMPRESSION because every admitted binding
 uses an uncompressed coherent policy.
 
@@ -520,6 +522,12 @@ system-memory WC request uses WB mappings. VM-attached BOs carry a globally
 unique VM identity, bind only to that VM, and cannot be PRIME-exported. Other
 BOs retain same-card PRIME sharing. MMAP_OFFSET and common GEM_CLOSE preserve
 the common owned-frame lifetime; creation-copy faults publish no handle.
+GEM_CREATE extensions follow gem_create_user_extensions: each
+DRM_XE_GEM_CREATE_EXTENSION_SET_PROPERTY header is copied before its body, and
+a nonzero name or pad or any property other than PXP_TYPE is EINVAL. PXP_TYPE
+NONE is accepted and HWDRM is ENODEV. The chain's verdict applies only after
+argument, VM and allocation refusals and publishes no handle. A seventeenth
+extension is EINVAL (Linux's E2BIG has no FsError).
 
 VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
 per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
@@ -2743,8 +2751,10 @@ per engine from the empty media 13.00 WA job, then runs one private-PPGTT store
 job per engine. GGTT invalidation for GT1 moves to the media CT once submission
 is enabled, with the same retention and fail-closed rules as GT0. Published
 VCS/VECS user interrupts are routed onto GT0's tiled MSI and masked again before
-GT1 stops. Scheduling refuses while GSC firmware reports loaded, because NARF
-has no owner for Wa_14015076503.
+GT1 stops. Without `narf.intel.gsc=1`, scheduling refuses (EBUSY) while GSC
+firmware reports loaded, and a load that appears later keeps the owner retained
+at stop. With it, the stop's GRDOM_FULL is bracketed by Wa_14015076503 (see the
+GSC section below) and scheduling is admitted beside loaded GSC firmware.
 
 Native Xe publishes GT1 only after every engine's private job retired and
 verified, and only while GT0's user epoch is live:
@@ -2801,8 +2811,46 @@ the HuC stays unavailable. Rejection, status timeout, an unusable image, an
 unstageable object and a locked WOPCM unable to host the HuC all leave GT1
 published without HuC. A stuck HuC DMA, a lost status register or an
 unresolved CT request faults the media GuC. With `narf.intel.huc=1` alone, or
-`narf.intel.media_gt=1` alone, nothing HuC-related changes. GSC firmware,
-GSCCS and GSC HuC authentication stay unimplemented.
+`narf.intel.media_gt=1` alone, nothing HuC-related changes. GSC firmware load,
+GSCCS and GSC HuC authentication are not wired (next section).
+
+### Intel MTL/Arrow GSC opt-in and protected content
+
+Default-off `narf.intel.gsc=1` uses the same pre-separator grammar as
+`narf.intel.media_gt=1`: exactly once, value 1, before the first `--`. It is
+admitted only beside an admitted `narf.intel.media_gt=1`, as Linux keeps the
+GSC on the media GT and makes it optional through `gsc_firmware_path`.
+
+With the option the media GuC's verified stop honours Wa_14015076503 as
+xe_gt.c::do_gt_reset does. When HECI1_FWSTS1 (0x116c40) reports INIT_COMPLETE,
+it sets HECI_H_GS1 (0x117c4c) ER_PREP, raises the HECI2 interrupt by setting
+HECI_H_CSR (0x117004) IG with RST cleared, and waits 200 ms. It then writes
+GRDOM_FULL and clears only ER_PREP after the reset, or after a failed one.
+Media scheduling is then admitted beside loaded GSC firmware. Without the
+option nothing changes.
+
+NARF does not load GSC firmware yet. The GSC worker (firmware load over GSCCS,
+the MKHI compatibility query, HuC authentication via the GSC, proxy start) is
+implemented against native models only. Production lacks three things: GSCCS0
+as a scheduled media engine with a kernel queue; a device-lifetime 4 MiB GSC
+private object in stolen memory whose GGTT mapping no later GT0 incarnation
+reuses, retained until an FLR; and the MEI GSC proxy client. No GSC memory is
+handed out and nothing is submitted to GSCCS, so query7 type1 still reports
+only the GuC-authenticated HuC.
+
+PXP stays disabled on every native Xe device, as Linux without
+CONFIG_INTEL_MEI_GSC_PROXY (xe->pxp is NULL):
+- `DRM_XE_DEVICE_QUERY_PXP_STATUS` reports size 8 to a zero-size query. Any
+  other nonzero size is EINVAL, and the exact size is ENODEV with nothing
+  copied out.
+- `DRM_XE_EXEC_QUEUE_SET_PROPERTY_PXP_TYPE` and GEM_CREATE's PXP_TYPE
+  property accept NONE, refuse HWDRM with ENODEV and refuse any other value
+  with EINVAL.
+- `DRM_XE_VM_BIND_FLAG_CHECK_PXP` is accepted and has no effect, since no
+  protected object can exist.
+No KCR register is written and no protected session, queue or object exists.
+Protected queues stay unadvertised until the MEI client lets the GSC proxy
+reach PROXY_STATE_NORMAL.
 
 ### Intel fixed Gen12 views and exact family selection
 
