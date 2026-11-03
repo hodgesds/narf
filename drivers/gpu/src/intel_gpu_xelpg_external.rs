@@ -996,6 +996,8 @@ impl MtlRoute {
         }
     }
 
+    // The retained route returns inline on refusal: it must not allocate.
+    #[allow(clippy::result_large_err)]
     fn release<M: MmioWindow + ?Sized>(self, io: &M) -> Result<(), (MtlRoute, RouteError)> {
         match self {
             MtlRoute::Dp(r) => r
