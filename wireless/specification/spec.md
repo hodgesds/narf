@@ -2400,9 +2400,15 @@ netdev name:
   `Profile::request()` rebuilds an `AssociateRequest` for the driver's own
   associate path (no fresh authority: the driver still applies its
   regulatory, scan and RSNA checks).
-- `retain(name, profile)` after an association completed (replacing an
-  older block), `forget(name)` on operator disconnect,
-  `take(name)` once by the successor generation, `retained(name)`.
+- `Owner { family, permanent_mac }` binds a block to the radio that
+  retained it (mac80211 keeps `wiphy->perm_addr` across
+  `ieee80211_restart_hw`); a name alone is not an identity, since another
+  device or driver may later register the same `wlan%d`.
+- `retain(name, owner, profile)` after an association completed (replacing
+  an older block), `forget(name)` on operator disconnect,
+  `take(name, owner)` once by the successor generation, `retained(name,
+  owner)`. A `take` by a different owner removes and zeroizes the block and
+  returns nothing.
 
 Drivers replay with an ordinary scan for the retained SSID/BSS on its
 channel, then association and a fresh RSNA; no keys, PN or peer state cross

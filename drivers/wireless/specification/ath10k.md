@@ -806,7 +806,8 @@ actual-device RF/power/interoperability acceptance remain separate.
   publication then allocates a fresh `wlan%d`. Rejoin goes through the
   interface's normal scan/associate path. **Automatic credential replay.**
   Every completed association retains its network block in
-  `narf_wireless::reconnect` under the netdev name (BSSID, SSID, channel,
+  `narf_wireless::reconnect` under the netdev name, bound to the owner
+  `ath10k` + the radio's permanent MAC (BSSID, SSID, channel,
   SME elements, PSK or SAE password in zeroizing storage; never an external
   supplicant's); an operator `disassociate` forgets it. A `publish_with_mac`
   that rebound the retired name and finds a block spawns

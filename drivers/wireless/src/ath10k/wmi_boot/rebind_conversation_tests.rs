@@ -130,7 +130,7 @@ fn smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation() ->
             let old = Harness::new(version, dialect, true);
             old.join()?;
             let name = old.name.clone();
-            if !narf_wireless::reconnect::retained(&name) {
+            if !narf_wireless::reconnect::retained(&name, old.device.reconnect_owner()) {
                 return Err("completed association retained no profile");
             }
             old.device.retire_host();
@@ -145,7 +145,7 @@ fn smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation() ->
             // An operator-down netdev is not reconnected; the block stays.
             narf_net::iface::set_link_state(&new.name, false);
             if drive(new.device.replay_retained_for_test([0x73; 32])) != Poll::Ready(Ok(false))
-                || !narf_wireless::reconnect::retained(&name)
+                || !narf_wireless::reconnect::retained(&name, new.device.reconnect_owner())
                 || new.device.link_up()
             {
                 return Err("replay connected a down netdev or dropped the profile");
@@ -155,7 +155,7 @@ fn smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation() ->
             // with the retained PSK are required before the port opens.
             if drive(new.device.replay_retained_for_test([0x73; 32])) != Poll::Ready(Ok(true))
                 || !new.device.link_up()
-                || !narf_wireless::reconnect::retained(&name)
+                || !narf_wireless::reconnect::retained(&name, new.device.reconnect_owner())
             {
                 return Err("rebound generation did not replay the retained credentials");
             }
@@ -172,7 +172,7 @@ fn smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation() ->
             // An operator disconnect ends automatic reuse.
             new.model(|m| teardown_tests::arm_data_disconnect(m, false));
             let _ = drive(new.device.disassociate());
-            if narf_wireless::reconnect::retained(&name)
+            if narf_wireless::reconnect::retained(&name, new.device.reconnect_owner())
                 || drive(new.device.replay_retained_for_test([0x73; 32])) != Poll::Ready(Ok(false))
             {
                 return Err("operator disconnect left a replayable profile");

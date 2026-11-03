@@ -1132,7 +1132,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .map_err(|_| WirelessError::HardwareError)?;
         attempt.armed = false;
         match profile {
-            Some(profile) => narf_wireless::reconnect::retain(&self.name, profile),
+            Some(profile) => {
+                narf_wireless::reconnect::retain(&self.name, self.reconnect_owner(), profile)
+            }
             None => narf_wireless::reconnect::forget(&self.name),
         }
         Ok(())
@@ -1164,13 +1166,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         &self,
         nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<bool, WirelessError> {
-        let Some(profile) = narf_wireless::reconnect::take(&self.name) else {
+        let Some(profile) = narf_wireless::reconnect::take(&self.name, self.reconnect_owner())
+        else {
             return Ok(false);
         };
         if !narf_net::iface::lookup(&self.name).is_some_and(|i| i.link_up) {
             // wpa_supplicant does not connect a down interface; keep the
             // block for a later generation.
-            narf_wireless::reconnect::retain(&self.name, profile);
+            narf_wireless::reconnect::retain(&self.name, self.reconnect_owner(), profile);
             return Ok(false);
         }
         let found = self
@@ -1195,6 +1198,10 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         self.associate_inner(profile.request(), nonce).await?;
         Ok(true)
+    }
+    /// This radio's identity for its retained network block.
+    pub(super) fn reconnect_owner(&self) -> narf_wireless::reconnect::Owner {
+        reconnect_owner(self.mac)
     }
     pub(super) async fn disassociate(&self) -> Result<(), WirelessError> {
         if self.mode.load(Ordering::Acquire) != 2 {
@@ -1294,6 +1301,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Interface for Device<T> {
     }
 }
 type Native = Device<super::boot::PciBoot>;
+/// ath10k's reconnect identity: the family and the radio's permanent MAC
+/// (firmware/OTP `SERVICE_READY` address), unchanged across recovery.
+fn reconnect_owner(mac: [u8; 6]) -> narf_wireless::reconnect::Owner {
+    narf_wireless::reconnect::Owner {
+        family: "ath10k",
+        permanent_mac: mac,
+    }
+}
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
 /// The interface name retired by the last recovery/suspend generation.
 static REBIND: IrqSafeSpinLock<Option<String>> = IrqSafeSpinLock::new(None);
@@ -1401,7 +1416,7 @@ fn publish_with_mac(
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_drain(drain);
         narf_wireless::registry::register(device.clone());
-        if rebound && narf_wireless::reconnect::retained(name) {
+        if rebound && narf_wireless::reconnect::retained(name, reconnect_owner(mac)) {
             let replay = device.clone();
             narf_scheduler::spawn(async move {
                 let _ = replay.replay_retained().await;

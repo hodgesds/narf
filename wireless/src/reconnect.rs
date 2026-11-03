@@ -18,6 +18,13 @@
 //! [`AssociateRequest`] handed back to the driver's own associate path.
 //! External-supplicant associations are never retained: that supplicant
 //! owns its own reconnection, as wpa_supplicant does on Linux.
+//!
+//! A name alone is not an identity: another device or driver may later
+//! register the same `wlan%d`. Each profile is therefore bound to the
+//! [`Owner`] that retained it (driver family + permanent MAC, the identity
+//! mac80211 keeps in `wiphy->perm_addr` across `ieee80211_restart_hw`), and
+//! [`take`] by any other owner destroys (zeroizes) it instead of handing the
+//! credential over.
 use crate::{AssociateRequest, SecurityConfig};
 use alloc::{string::String, vec::Vec};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -93,17 +100,27 @@ impl Profile {
     }
 }
 
-static PROFILES: IrqSafeSpinLock<Vec<(String, Profile)>> = IrqSafeSpinLock::new(Vec::new());
+/// The device a profile belongs to: the retaining driver family and the
+/// radio's permanent MAC address. A rebinding generation of the same radio
+/// presents the same identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner {
+    pub family: &'static str,
+    pub permanent_mac: [u8; 6],
+}
 
-/// Keep `profile` for `name`, replacing an older one.
-pub fn retain(name: &str, profile: Profile) {
+type Entry = (String, Owner, Profile);
+static PROFILES: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Keep `profile` for `name` on behalf of `owner`, replacing an older one.
+pub fn retain(name: &str, owner: Owner, profile: Profile) {
     let old = {
         let mut profiles = PROFILES.lock();
         let old = profiles
             .iter()
-            .position(|(n, _)| n == name)
+            .position(|(n, _, _)| n == name)
             .map(|at| profiles.swap_remove(at));
-        profiles.push((String::from(name), profile));
+        profiles.push((String::from(name), owner, profile));
         old
     };
     drop(old);
@@ -115,22 +132,34 @@ pub fn forget(name: &str) {
         let mut profiles = PROFILES.lock();
         profiles
             .iter()
-            .position(|(n, _)| n == name)
+            .position(|(n, _, _)| n == name)
             .map(|at| profiles.swap_remove(at))
     };
     drop(old);
 }
 
-/// Take the profile for `name`; each retained profile is replayed once.
-pub fn take(name: &str) -> Option<Profile> {
-    let mut profiles = PROFILES.lock();
-    let at = profiles.iter().position(|(n, _)| n == name)?;
-    Some(profiles.swap_remove(at).1)
+/// Take the profile `owner` retained for `name`; each profile is replayed
+/// once. A profile retained by a different owner is removed and zeroized,
+/// never returned.
+pub fn take(name: &str, owner: Owner) -> Option<Profile> {
+    let (_, retained_by, profile) = {
+        let mut profiles = PROFILES.lock();
+        let at = profiles.iter().position(|(n, _, _)| n == name)?;
+        profiles.swap_remove(at)
+    };
+    if retained_by != owner {
+        drop(profile);
+        return None;
+    }
+    Some(profile)
 }
 
-/// Whether a profile is retained for `name`.
-pub fn retained(name: &str) -> bool {
-    PROFILES.lock().iter().any(|(n, _)| n == name)
+/// Whether `owner` has a profile retained for `name`.
+pub fn retained(name: &str, owner: Owner) -> bool {
+    PROFILES
+        .lock()
+        .iter()
+        .any(|(n, o, _)| n == name && *o == owner)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
