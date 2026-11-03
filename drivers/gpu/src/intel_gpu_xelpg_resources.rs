@@ -65,6 +65,9 @@ pub(crate) struct PipeRequest {
     pub(crate) port_clock_khz: u32,
     /// Non-Type-C PHY index driving the pipe, if any.
     pub(crate) combo_phy: Option<u8>,
+    /// The pipe's VDSC term when it compresses (`intel_vdsc_min_cdclk`
+    /// and `intel_vdsc_prefill_lines`).
+    pub(crate) dsc: Option<crate::intel_gpu_xelpg_dsc::DscTerm>,
 }
 
 /// The complete new configuration.
@@ -228,7 +231,7 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
         {
             let mut all: Vec<&mut PlaneWm> = plane_wm.iter_mut().collect();
             all.push(&mut cursor_wm);
-            wm::check_vblank(t, latency, &mut all)?;
+            wm::check_vblank_dsc(t, latency, &mut all, p.dsc.is_some())?;
         }
         let mut crtc_data_rate = 0u64;
         for (i, plane) in p.planes.iter().enumerate() {
@@ -254,8 +257,12 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
             cursor_alloc: wm::cursor_allocation(t, latency, num_active)?,
             cursor_wm,
         });
-        // intel_crtc_min_cdclk: pixel rate and "Maximum Pipe Read Bandwidth".
+        // intel_crtc_min_cdclk: pixel rate, "Maximum Pipe Read Bandwidth"
+        // and intel_vdsc_min_cdclk.
         min_cdclk = min_cdclk.max(cdclk::pixel_rate_to_cdclk(p.pixel_rate_khz));
+        if let Some(dsc) = p.dsc {
+            min_cdclk = min_cdclk.max(dsc.min_cdclk_khz);
+        }
         let bw = (crtc_data_rate * 10).div_ceil(512);
         min_cdclk = min_cdclk.max(bw.min(u64::from(u32::MAX)) as u32);
         min_voltage = min_voltage.max(cdclk::port_min_voltage_level(p.port_clock_khz));

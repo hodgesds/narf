@@ -217,3 +217,36 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_wm",
     smoke_xelpg_wm_pipe_a_provider_publishes_and_registers
 );
+
+fn smoke_xelpg_wm_dsc_prefill_adds_one_and_a_half_lines() -> TestResult {
+    // prefill_lines_nocdclk adds intel_vdsc_prefill_lines (0x18000) before
+    // the CDCLK adjustment: at 100 MHz the adjustment is
+    // ceil(100000 << 16 / 345600) = 18963, so DSC adds
+    // ceil(0x18000 * 18963 / 65536) = 28445 (.16) lines. A 970 us level
+    // (97 lines) fitted the 100-line vblank exactly without DSC and no
+    // longer does; 960 us (96 lines) still fits.
+    let t = ten_us_lines();
+    let lat = latency([6, 10, 100, 500, 900, 970]);
+    if wm_level_disabled_dsc(t, &lat, 0, false) != Ok(false)
+        || wm_level_disabled_dsc(t, &lat, 0, true) != Ok(true)
+        || wm_level_disabled_dsc(t, &latency([6, 10, 100, 500, 900, 960]), 0, true) != Ok(false)
+    {
+        return TestResult::Fail("the DSC prefill must count 1.5 adjusted lines");
+    }
+    // check_vblank_dsc drops the levels that no longer fit.
+    let mut primary = PlaneWm::default();
+    for l in primary.levels.iter_mut() {
+        *l = level(4);
+    }
+    if check_vblank_dsc(t, &lat, &mut [&mut primary], true) != Ok(true)
+        || primary.levels[5].enable
+        || !primary.levels[4].enable
+    {
+        return TestResult::Fail("a compressing pipe loses the top level here");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_wm",
+    smoke_xelpg_wm_dsc_prefill_adds_one_and_a_half_lines
+);

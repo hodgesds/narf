@@ -1745,6 +1745,15 @@ pub fn install_for_probe(
                     crate::intel_gpu_psr::VbtPsr::from_vbt(vbt)
                 }),
         );
+        // The same panel's edp.dsc_disable and edp.max_link_rate for the
+        // eDP DSC decision; without a VBT neither applies.
+        crate::intel_gpu_xelpg_dsc::install_edp_vbt(
+            found
+                .as_ref()
+                .map_or(crate::intel_gpu_xelpg_dsc::EdpVbt::Missing, |(vbt, _)| {
+                    crate::intel_gpu_xelpg_dsc::EdpVbt::from_vbt(vbt)
+                }),
+        );
     }
     let ok = match (generation, &found) {
         (Generation::MeteorLake, Some((vbt, _))) => {

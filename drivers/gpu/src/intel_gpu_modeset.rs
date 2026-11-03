@@ -293,6 +293,9 @@ pub enum ModesetError {
     /// MTL source enable, primary image or a fresh common frame was not observed.
     /// This is not evidence of complete sink training or visible pixels.
     PipelineEnableUnavailable,
+    /// The MTL eDP panel's mode needs a DSC configuration Linux would not
+    /// choose or this driver does not qualify; nothing was stopped.
+    Dsc(crate::intel_gpu_xelpg_dsc::DscRefusal),
 }
 
 /// A negotiated link configuration handed to

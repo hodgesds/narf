@@ -16,7 +16,8 @@
 //! - cursor DDB size: `skl_cursor_allocation` (ARGB8888 linear at
 //!   `mode_config->cursor_width == 256`);
 //! - vblank: `skl_wm_check_vblank` with `skl_prefill.c` for an unscaled,
-//!   non-DSC, non-VRR pipe with `framestart_delay == 1`, including its
+//!   non-VRR pipe with `framestart_delay == 1` (a compressing pipe adds
+//!   `intel_vdsc_prefill_lines`), including its
 //!   `wm_level_disabled` (`skl_max_wm_level_for_vblank` below the top
 //!   level), which `intel_psr.c::wm_optimization_wa` consumes as
 //!   Wa_14015648006. The Pipe-A value of the watermarks proved programmed
@@ -381,7 +382,7 @@ fn usecs_to_lines(timing: Timing, us: u32) -> u64 {
 }
 
 /// `struct skl_prefill_ctx` after `skl_prefill_init` for an unscaled,
-/// non-DSC, non-VRR pipe with `framestart_delay == 1`.
+/// non-VRR pipe with `framestart_delay == 1`.
 struct Prefill {
     timing: Timing,
     /// `prefill.full` (.16 lines).
@@ -392,15 +393,22 @@ struct Prefill {
 
 impl Prefill {
     /// `skl_prefill_init` with `skl_wm0_prefill_lines` = `wm0_lines`, the
-    /// worst level-0 lines of the pipe's planes (`skl_max_wm0_lines`).
-    fn new(timing: Timing, wm0_lines: u16) -> Result<Self, WmError> {
+    /// worst level-0 lines of the pipe's planes (`skl_max_wm0_lines`), and
+    /// `prefill.dsc` = `intel_vdsc_prefill_lines` when the pipe compresses.
+    fn new(timing: Timing, wm0_lines: u16, dsc: bool) -> Result<Self, WmError> {
         if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
             return Err(WmError::Unsupported);
         }
         // prefill_init: framestart_delay 1 + 20 us of translation walks.
         let fixed = (1u64 << 16) + usecs_to_lines(timing, 20);
-        // No DSC/scalers: nocdclk prefill is the worst wm0 lines.
-        let wm0 = u64::from(wm0_lines) << 16;
+        // prefill_lines_nocdclk without scalers: DSC (1.5 lines when
+        // compressing), then the worst wm0 lines.
+        let dsc = if dsc {
+            crate::intel_gpu_xelpg_dsc::PREFILL_LINES
+        } else {
+            0
+        };
+        let wm0 = dsc + (u64::from(wm0_lines) << 16);
         // intel_cdclk_prefill_adjustment(_worst): calc_cdclk at the
         // pixel-rate minimum, ppc 2.
         let cdclk = crate::intel_gpu_xelpg_cdclk::calc_cdclk(
@@ -448,7 +456,17 @@ pub(crate) fn wm_level_disabled(
     latency: &Latency,
     wm0_lines: u16,
 ) -> Result<bool, WmError> {
-    Ok(Prefill::new(timing, wm0_lines)?.max_level(latency)? < LEVELS - 1)
+    wm_level_disabled_dsc(timing, latency, wm0_lines, false)
+}
+
+/// [`wm_level_disabled`] for a pipe that compresses (`dsc`) or not.
+pub(crate) fn wm_level_disabled_dsc(
+    timing: Timing,
+    latency: &Latency,
+    wm0_lines: u16,
+    dsc: bool,
+) -> Result<bool, WmError> {
+    Ok(Prefill::new(timing, wm0_lines, dsc)?.max_level(latency)? < LEVELS - 1)
 }
 
 /// `skl_wm_check_vblank` for a pipe whose planes are `planes`. Levels that
@@ -461,8 +479,18 @@ pub(crate) fn check_vblank(
     latency: &Latency,
     planes: &mut [&mut PlaneWm],
 ) -> Result<bool, WmError> {
+    check_vblank_dsc(timing, latency, planes, false)
+}
+
+/// [`check_vblank`] for a pipe that compresses (`dsc`) or not.
+pub(crate) fn check_vblank_dsc(
+    timing: Timing,
+    latency: &Latency,
+    planes: &mut [&mut PlaneWm],
+    dsc: bool,
+) -> Result<bool, WmError> {
     let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
-    let prefill = Prefill::new(timing, wm0)?;
+    let prefill = Prefill::new(timing, wm0, dsc)?;
     let max_level = prefill.max_level(latency)?;
     for plane in planes.iter_mut() {
         for level in plane.levels.iter_mut().skip(max_level + 1) {

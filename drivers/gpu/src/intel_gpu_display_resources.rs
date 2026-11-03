@@ -14,9 +14,16 @@
 //! ([`crate::intel_gpu_xelpg_wm::publish_pipe_a`]) for PSR's
 //! Wa_14015648006; a transaction about to write, a pending image and a
 //! failed proof publish "unknown".
+//!
+//! A compressing panel (eDP DSC) adds its VDSC term to Pipe A's request:
+//! `intel_vdsc_min_cdclk` and `intel_vdsc_prefill_lines`. The owned
+//! modeset passes the planned term; every later proof reads it back from
+//! Pipe A's engines (`intel_dsc_get_config`), so the KMS owners compute the
+//! same layout the modeset programmed.
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
+    intel_gpu_xelpg_dsc::DscTerm,
     intel_gpu_xelpg_pipes::Layout,
     intel_gpu_xelpg_resources::{self as res, ResourceError},
     intel_gpu_xelpg_wm::{self as wm, Latency, PlaneWm, Tiling},
@@ -83,6 +90,15 @@ fn display14(io: &(impl MmioWindow + ?Sized)) -> Result<bool, FsError> {
 /// The owned modeset's pipe-A configuration: one full-screen XRGB8888
 /// primary, the budgeted hidden cursor and the combo PHY of DDI A/B.
 pub(crate) fn request(mode: &Mode, tiling: Tiling, min_cdclk_khz: u32) -> res::Request {
+    request_dsc(mode, tiling, min_cdclk_khz, None)
+}
+/// [`request`] for a panel compressing with `dsc`.
+pub(crate) fn request_dsc(
+    mode: &Mode,
+    tiling: Tiling,
+    min_cdclk_khz: u32,
+    dsc: Option<DscTerm>,
+) -> res::Request {
     let mut pipes = [None; res::PIPES];
     let mut planes = [None; res::PLANES];
     planes[0] = Some(res::PlaneRequest {
@@ -101,6 +117,7 @@ pub(crate) fn request(mode: &Mode, tiling: Tiling, min_cdclk_khz: u32) -> res::R
         cursor_visible: false,
         port_clock_khz: MAX_PORT_CLOCK_KHZ,
         combo_phy: Some(0),
+        dsc,
     });
     res::Request {
         pipes,
@@ -129,7 +146,12 @@ impl Profile {
     /// Pipe A's share of `state` for `mode`: its primary ends where the
     /// always-budgeted cursor starts, both keep their level-0 watermark and
     /// both images are encodable.
-    fn share(mode: &Mode, latency: &Latency, state: &res::State) -> Result<Self, FsError> {
+    fn share(
+        mode: &Mode,
+        latency: &Latency,
+        state: &res::State,
+        dsc: Option<DscTerm>,
+    ) -> Result<Self, FsError> {
         let alloc = &state.dbuf.pipes[0];
         let timing = wm::Timing {
             pixel_rate_khz: mode.pixel_clock_khz,
@@ -146,7 +168,7 @@ impl Profile {
             cursor_start: alloc.cursor.start,
             cursor_ddb: alloc.cursor.reg(),
             primary_ddb: alloc.planes[0].reg(),
-            wm_level_disabled: wm::wm_level_disabled(timing, latency, wm0)
+            wm_level_disabled: wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
                 .map_err(|_| FsError::Unsupported)?,
         };
         if state.dbuf.active_pipes & 1 == 0
@@ -183,12 +205,13 @@ impl Profile {
         mode: &Mode,
         tiling: Tiling,
         min_cdclk_khz: u32,
+        dsc: Option<DscTerm>,
     ) -> Result<(Self, res::State), FsError> {
         Self::valid_mode(mode)?;
         let latency = Latency::read(io)?;
-        let state = res::compute(&request(mode, tiling, min_cdclk_khz), &latency)
+        let state = res::compute(&request_dsc(mode, tiling, min_cdclk_khz, dsc), &latency)
             .map_err(|_| FsError::Unsupported)?;
-        let profile = Self::share(mode, &latency, &state)?;
+        let profile = Self::share(mode, &latency, &state, dsc)?;
         // The fixed owner's single-pipe layout is the joined one, with the
         // whole DBUF behind Pipe A.
         if !state.dbuf.joined
@@ -209,9 +232,10 @@ impl Profile {
         tiling: Tiling,
         layout: &Layout,
         latency: &Latency,
+        dsc: Option<DscTerm>,
     ) -> Result<res::State, FsError> {
         Self::valid_mode(mode)?;
-        let panel = request(mode, Tiling::Linear, 0).pipes[0];
+        let panel = request_dsc(mode, Tiling::Linear, 0, dsc).pipes[0];
         let mut held = layout.state.requests[0];
         if let Some(plane) = held.as_mut().and_then(|p| p.planes[0].as_mut()) {
             plane.tiling = Tiling::Linear;
@@ -231,13 +255,14 @@ impl Profile {
         mode: &Mode,
         tiling: Tiling,
         layout: Option<&Layout>,
+        dsc: Option<DscTerm>,
     ) -> Result<Self, FsError> {
         match layout {
-            None => Ok(Self::compute_state(io, mode, tiling, 0)?.0),
+            None => Ok(Self::compute_state(io, mode, tiling, 0, dsc)?.0),
             Some(layout) => {
                 let latency = Latency::read(io)?;
-                let state = Self::multi_state(mode, tiling, layout, &latency)?;
-                Self::share(mode, &latency, &state)
+                let state = Self::multi_state(mode, tiling, layout, &latency, dsc)?;
+                Self::share(mode, &latency, &state, dsc)
             }
         }
     }
@@ -272,7 +297,8 @@ impl Profile {
         Self::capture(io, &mode)
     }
     pub(crate) fn capture(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
-        let profile = Self::capture_layout(io, mode)?;
+        let dsc = pipe_a_dsc(io, mode)?;
+        let profile = Self::capture_layout(io, mode, dsc)?;
         Self::check_cdclk(io, mode)?;
         Ok(profile)
     }
@@ -306,18 +332,19 @@ impl Profile {
     fn capture_globals(
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
+        dsc: Option<DscTerm>,
     ) -> Result<(Self, Option<Layout>), FsError> {
         if !display14(io)? {
             return Err(FsError::Unsupported);
         }
-        match Self::capture_single(io, mode) {
+        match Self::capture_single(io, mode, dsc) {
             Ok(profile) => return Ok((profile, None)),
             Err(FsError::Unsupported) => {}
             Err(error) => return Err(error),
         }
         let layout =
             crate::intel_gpu_xelpg_pipes::published_layout().ok_or(FsError::Unsupported)?;
-        Ok((Self::capture_multi(io, mode, &layout)?, Some(layout)))
+        Ok((Self::capture_multi(io, mode, &layout, dsc)?, Some(layout)))
     }
     /// The PM demand, MBUS/DBOX, IPC and DBUF slice proof shared by both
     /// layouts, against `state`.
@@ -363,7 +390,11 @@ impl Profile {
     }
     /// The owned single-pipe layout: every other pipe off, the joined
     /// allocation and one-active-pipe PM demand of Pipe A alone.
-    fn capture_single(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+    fn capture_single(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        dsc: Option<DscTerm>,
+    ) -> Result<Self, FsError> {
         // An enabled blank foreign pipe still consumes global display
         // resources, even when none of its fetchers is enabled.
         for pipe in 1..4 {
@@ -371,7 +402,7 @@ impl Profile {
                 return Err(FsError::Unsupported);
             }
         }
-        let (profile, state) = Self::compute_state(io, mode, Tiling::Linear, 0)?;
+        let (profile, state) = Self::compute_state(io, mode, Tiling::Linear, 0, dsc)?;
         // mbus_ctl_join_update selects the joined pipe when it stays lit
         // without a modeset (intel_mbus_joined_pipe) and NONE otherwise: the
         // owned modeset joins with NONE, while a live repartition that
@@ -396,10 +427,11 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
         layout: &Layout,
+        dsc: Option<DscTerm>,
     ) -> Result<Self, FsError> {
         let latency = Latency::read(io)?;
-        let state = Self::multi_state(mode, Tiling::Linear, layout, &latency)?;
-        let profile = Self::share(mode, &latency, &state)?;
+        let state = Self::multi_state(mode, Tiling::Linear, layout, &latency, dsc)?;
+        let profile = Self::share(mode, &latency, &state, dsc)?;
         for pipe in 1..res::PIPES {
             if state.requests[pipe].is_none()
                 && read(io, 0x70008 + pipe as u64 * 0x1000)? & 0xc0000000 != 0
@@ -434,13 +466,21 @@ impl Profile {
     }
     /// The proved layout, published as Pipe A's programmed
     /// `wm_level_disabled`; any failure publishes "unknown".
-    fn capture_layout(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
-        let profile = Self::capture_layout_inner(io, mode);
+    fn capture_layout(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        dsc: Option<DscTerm>,
+    ) -> Result<Self, FsError> {
+        let profile = Self::capture_layout_inner(io, mode, dsc);
         wm::publish_pipe_a(profile.as_ref().ok().map(|p| p.wm_level_disabled));
         profile
     }
-    fn capture_layout_inner(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
-        let (mut profile, layout) = Self::capture_globals(io, mode)?;
+    fn capture_layout_inner(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        dsc: Option<DscTerm>,
+    ) -> Result<Self, FsError> {
+        let (mut profile, layout) = Self::capture_globals(io, mode, dsc)?;
         // X-tiled takes the linear watermark arithmetic on display >= 10.
         let tiling = match read(io, 0x70180)? & (7 << 10) {
             0 => None,
@@ -449,7 +489,7 @@ impl Profile {
             _ => return Err(FsError::Unsupported),
         };
         if let Some(tiling) = tiling {
-            let share = Self::compute_for_layout(io, mode, tiling, layout.as_ref())?;
+            let share = Self::compute_for_layout(io, mode, tiling, layout.as_ref(), dsc)?;
             profile.primary = share.primary;
             profile.wm_level_disabled = share.wm_level_disabled;
         }
@@ -522,12 +562,14 @@ impl Primary {
     /// Pipe A's linear/X and Tile4 shares of the layout proved programmed
     /// now (globals and CDCLK included).
     fn images(&self, io: &(impl MmioWindow + ?Sized)) -> Result<[Profile; 2], FsError> {
-        let (linear, layout) = Profile::capture_globals(io, &self.mode)?;
+        let dsc = pipe_a_dsc(io, &self.mode)?;
+        let (linear, layout) = Profile::capture_globals(io, &self.mode, dsc)?;
         Profile::check_cdclk(io, &self.mode)?;
         if read(io, 0x7026c)? & (1 << 19) == 0 {
             return Err(FsError::Unsupported);
         }
-        let tile4 = Profile::compute_for_layout(io, &self.mode, Tiling::Tile4, layout.as_ref())?;
+        let tile4 =
+            Profile::compute_for_layout(io, &self.mode, Tiling::Tile4, layout.as_ref(), dsc)?;
         Ok([linear, tile4])
     }
     /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.
@@ -625,6 +667,19 @@ pub(crate) fn initialize(
     mode: &Mode,
     min_cdclk_khz: u32,
 ) -> Result<Option<Profile>, ResourceError> {
+    initialize_dsc(io, mode, min_cdclk_khz, None)
+}
+
+/// [`initialize`] for a panel the modeset will compress with `dsc`: the
+/// transaction carries its VDSC CDCLK and prefill terms. Pipe A's engines
+/// are programmed later in the modeset, so the final proof takes the
+/// planned term instead of reading it back.
+pub(crate) fn initialize_dsc(
+    io: &(impl MmioWindow + ?Sized),
+    mode: &Mode,
+    min_cdclk_khz: u32,
+    dsc: Option<DscTerm>,
+) -> Result<Option<Profile>, ResourceError> {
     if !display14(io)? {
         return Ok(None);
     }
@@ -633,11 +688,12 @@ pub(crate) fn initialize(
         Err(FsError::Unsupported) => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    let (profile, state) = match Profile::compute_state(io, mode, Tiling::Linear, min_cdclk_khz) {
-        Ok(v) => v,
-        Err(FsError::Unsupported) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let (profile, state) =
+        match Profile::compute_state(io, mode, Tiling::Linear, min_cdclk_khz, dsc) {
+            Ok(v) => v,
+            Err(FsError::Unsupported) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
     let irq_enable = read(io, 0x4446c)?;
     let irq_mask = io.read32(0x44464); // all masked is a valid value
     if irq_enable & !irq_mask & ((1 << 3) | (1 << 27)) != 0 || read(io, 0x44468)? & (1 << 27) != 0 {
@@ -667,8 +723,18 @@ pub(crate) fn initialize(
     for r in [0x70080, 0x70088, 0x70084] {
         checked(io, r, 0)?;
     }
-    Profile::capture_layout(io, mode)?;
+    Profile::capture_layout(io, mode, dsc)?;
     Ok(Some(profile))
+}
+
+/// Pipe A's VDSC term as its engines hold it (`intel_dsc_get_config`):
+/// what every proof of an owned panel layout computes with.
+pub(crate) fn pipe_a_dsc(
+    io: &(impl MmioWindow + ?Sized),
+    mode: &Mode,
+) -> Result<Option<DscTerm>, FsError> {
+    crate::intel_gpu_xelpg_dsc::read_term(io, crate::intel_gpu_pipes::Pipe::A, mode)
+        .map_err(|_| FsError::NoDevice)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

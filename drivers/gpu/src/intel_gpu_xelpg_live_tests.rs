@@ -188,6 +188,7 @@ fn pipe_req(
         cursor_visible: false,
         port_clock_khz: port,
         combo_phy: Some(phy),
+        dsc: None,
     }
 }
 

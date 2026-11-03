@@ -191,6 +191,7 @@ fn request(ext: &ExternalPipe) -> PipeRequest {
         cursor_visible: false,
         port_clock_khz: ext.port_clock_khz,
         combo_phy: ext.combo_phy,
+        dsc: None,
     }
 }
 
@@ -318,9 +319,12 @@ impl Pipes {
             }
         }
         let tiling = panel_tiling(io)?;
+        // A compressing panel keeps its VDSC term (read back from Pipe A).
+        let dsc = crate::intel_gpu_display_resources::pipe_a_dsc(io, mode)
+            .map_err(|_| PipeEnableError::Resource(ResourceError::NoDevice))?;
         let state = Self::compute(
             io,
-            &crate::intel_gpu_display_resources::request(mode, tiling, 0),
+            &crate::intel_gpu_display_resources::request_dsc(mode, tiling, 0, dsc),
         )?;
         let lit = read(io, Pipe::A.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE)
             == PIPECONF_ENABLE | PIPECONF_STATE;

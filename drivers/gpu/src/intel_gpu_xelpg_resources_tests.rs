@@ -166,6 +166,7 @@ fn pipe(
         cursor_visible: false,
         port_clock_khz: port,
         combo_phy: Some(phy),
+        dsc: None,
     })
 }
 
@@ -1201,4 +1202,61 @@ fn smoke_xelpg_resources_failed_post_demand_restore_keeps_clock_covered() -> Tes
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_resources",
     smoke_xelpg_resources_failed_post_demand_restore_keeps_clock_covered
+);
+
+fn smoke_xelpg_resources_dsc_pipe_adds_vdsc_cdclk_and_prefill() -> TestResult {
+    // intel_crtc_min_cdclk takes intel_vdsc_min_cdclk: a 2880x1800@120
+    // eDP compressing on one engine needs its whole pixel rate with the
+    // slice bubbles (vdsc_min_cdclk(650016, 2960, 1, 1) = 653091 kHz,
+    // past the 652.8 MHz maximum), on two engines with four slices
+    // 331157 kHz, above the 325008 kHz pixel minimum: the 480 MHz rung.
+    use crate::intel_gpu_xelpg_dsc::{vdsc_min_cdclk, DscTerm};
+    if vdsc_min_cdclk(650_016, 2960, 1, 1) != 653_091
+        || vdsc_min_cdclk(650_016, 2960, 4, 2) != 331_157
+    {
+        return TestResult::Fail("intel_vdsc_min_cdclk adds 14 pixels per slice");
+    }
+    let mut request = Request {
+        pipes: [None; PIPES],
+        min_cdclk_khz: 0,
+    };
+    request.pipes[0] = pipe(650_016, (2880, 2960), (1800, 1830), 810_000, 0);
+    let plain = match compute(&request, &latency()) {
+        Ok(state) => state,
+        Err(_) => return TestResult::Fail("the uncompressed panel must compute"),
+    };
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.dsc = Some(DscTerm {
+            min_cdclk_khz: 331_157,
+        });
+    }
+    let dsc = match compute(&request, &latency()) {
+        Ok(state) => state,
+        Err(_) => return TestResult::Fail("the compressed panel must compute"),
+    };
+    if plain.cdclk.cdclk_khz != 480_000 || dsc.cdclk.cdclk_khz != 480_000 {
+        return TestResult::Fail("both fit the 480 MHz rung");
+    }
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.dsc = Some(DscTerm {
+            min_cdclk_khz: 653_091,
+        });
+    }
+    if compute(&request, &latency()) != Err(ResourceError::CdclkUnsatisfiable) {
+        return TestResult::Fail("a VDSC minimum past 652.8 MHz must refuse");
+    }
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.dsc = Some(DscTerm {
+            min_cdclk_khz: 500_000,
+        });
+    }
+    match compute(&request, &latency()) {
+        Ok(state) if state.cdclk.cdclk_khz == 556_800 && state.requests == request.pipes => {}
+        _ => return TestResult::Fail("the VDSC term raises CDCLK and stays in the request"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_resources",
+    smoke_xelpg_resources_dsc_pipe_adds_vdsc_cdclk_and_prefill
 );
