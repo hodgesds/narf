@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Bounded recipient BA protocol/reorder owner. Source: Linux mt76/agg-rx.c,
 //! mt76_connac_mcu.{c,h}, mt7921/mcu.c; IEEE ADDBA/DELBA/compressed BAR.
+use crate::mt7921::vif_slots::Link;
 use alloc::{collections::VecDeque, vec, vec::Vec};
 
 pub(super) const TIDS: usize = 8; // Native STA_REC_BA.ba_en is one octet.
@@ -76,10 +77,12 @@ impl Request {
         frame[31..33].copy_from_slice(&self.timeout.to_le_bytes());
         frame
     }
-    pub fn wtbl(self, peer: [u8; 6], enable: bool) -> Vec<u8> {
+    /// Linux `mt76_connac_mcu_alloc_sta_req`: `bss_idx = mvif->idx`,
+    /// `wlan_idx` = the link's peer WCID, `muar_idx = omac_idx`.
+    pub fn wtbl(self, link: Link, peer: [u8; 6], enable: bool) -> Vec<u8> {
         // STA_REC_UPDATE: one outer WTBL TLV, WTBL_SET, one WTBL_BA.
         let mut body = vec![0; 48];
-        body[..8].copy_from_slice(&[0, 1, 1, 0, 1, 0, 0, 0]);
+        body[..8].copy_from_slice(&[link.bss(), link.peer(), 1, 0, 1, link.omac(), 0, 0]);
         body[8..20].copy_from_slice(&[13, 0, 40, 0, 1, 2, 1, 0, 0, 0, 0, 0]);
         body[20..24].copy_from_slice(&[8, 0, 28, 0]);
         body[24] = self.tid;
@@ -90,9 +93,9 @@ impl Request {
         body[42] = 1; // rst_ba_sel MAC_TID_MATCH=0; rst_ba_sb=1.
         body
     }
-    pub fn station(self, enable: bool) -> Vec<u8> {
+    pub fn station(self, link: Link, enable: bool) -> Vec<u8> {
         let mut body = vec![0; 20];
-        body[..8].copy_from_slice(&[0, 1, 1, 0, 1, 0, 0, 0]);
+        body[..8].copy_from_slice(&[link.bss(), link.peer(), 1, 0, 1, link.omac(), 0, 0]);
         body[8..12].copy_from_slice(&[6, 0, 12, 0]); // STA_REC_BA.
         body[12] = self.tid;
         body[13] = 2;

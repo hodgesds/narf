@@ -11,6 +11,9 @@ fn wrap(frame: &[u8], channel: u8) -> Vec<u8> {
     packet
 }
 pub(super) fn request_packet(tid: u8, ssn: u16, window: u16, timeout: u16, channel: u8) -> Vec<u8> {
+    wrap(&request_frame(tid, ssn, window, timeout), channel)
+}
+fn request_frame(tid: u8, ssn: u16, window: u16, timeout: u16) -> Vec<u8> {
     let mut frame = vec![0; 33];
     frame[0] = 0xd0;
     frame[4..10].copy_from_slice(&OWN);
@@ -20,7 +23,7 @@ pub(super) fn request_packet(tid: u8, ssn: u16, window: u16, timeout: u16, chann
     frame[27..29].copy_from_slice(&(2 | u16::from(tid) << 2 | window << 6).to_le_bytes());
     frame[29..31].copy_from_slice(&timeout.to_le_bytes());
     frame[31..33].copy_from_slice(&(ssn << 4).to_le_bytes());
-    wrap(&frame, channel)
+    frame
 }
 fn bar(tid: u8, ssn: u16) -> Vec<u8> {
     let mut frame = vec![0; 20];
@@ -1020,4 +1023,49 @@ fn mt76_rx_ba_delayed_policy_is_refused_invalid_qos_for_non_s1g_peer() -> TestRe
 kernel_test_in!(
     "drivers/wireless/mt7921/rx_ba",
     mt76_rx_ba_delayed_policy_is_refused_invalid_qos_for_non_s1g_peer
+);
+
+/// Per-link recipient BA records: Linux mt76_connac_mcu_sta_ba ->
+/// mt76_connac_mcu_alloc_sta_req stamps `bss_idx = mvif->idx`, `wlan_idx`
+/// and `muar_idx = omac_idx`; every TLV byte after the header is the same.
+fn link_headers() -> Result<(), &'static str> {
+    use crate::mt7921::vif_slots::{on_bss, Link, Vif};
+    let request = super::super::ba::Request::parse(&request_frame(3, 10, 32, 0), 64)
+        .ok_or("ADDBA request")?;
+    let group = Link::new(Vif::new(1).map_err(|_| "vif")?, 2).map_err(|_| "link")?;
+    for (home, link) in [
+        (
+            request.wtbl(Link::HOME, AP, true),
+            request.wtbl(group, AP, true),
+        ),
+        (
+            request.station(Link::HOME, true),
+            request.station(group, true),
+        ),
+        (
+            request.wtbl(Link::HOME, AP, false),
+            request.wtbl(group, AP, false),
+        ),
+    ] {
+        if home[..8] != [0, 1, 1, 0, 1, 0, 0, 0]
+            || link[..8] != [1, 2, 1, 0, 1, 1, 0, 0]
+            || home[8..] != link[8..]
+        {
+            return Err("per-link BA STA_REC header");
+        }
+    }
+    let rlm = [0x5a; 20];
+    if on_bss(Vif::HOME, [0; 20]) != [0; 20]
+        || on_bss(Vif::new(2).map_err(|_| "vif")?, rlm)[..2] != [2, 0x5a]
+    {
+        return Err("BSS_INFO bss_idx header");
+    }
+    Ok(())
+}
+fn mt76_p2p_link_ba_and_bss_headers_match_connac2() -> TestResult {
+    link_headers().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_p2p_link_ba_and_bss_headers_match_connac2
 );

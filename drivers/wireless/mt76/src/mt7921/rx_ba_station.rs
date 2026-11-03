@@ -12,10 +12,12 @@ impl<B: Backend> Session<B> {
         own: [u8; 6],
         peer: [u8; 6],
     ) -> bool {
-        if self.station.tx_ba.receive(native) {
+        let peer_wcid = u16::from(self.station.link.peer());
+        if self.station.tx_ba.receive(native, peer_wcid) {
             return true;
         }
-        if self.station.ht20_profile.is_none() || native.ccmp.is_some() || native.wcid != 1 {
+        if self.station.ht20_profile.is_none() || native.ccmp.is_some() || native.wcid != peer_wcid
+        {
             return false;
         }
         let frame = native.frame;
@@ -97,6 +99,8 @@ impl<B: Backend> Session<B> {
         own: [u8; 6],
         peer: [u8; 6],
     ) -> Result<(), Error> {
+        let link = self.station.link;
+        let peer_wcid = u16::from(link.peer());
         if self.station.rx_ba.tick(self.backend.now_ns()) {
             self.clear_aggregate_receive();
         }
@@ -112,11 +116,14 @@ impl<B: Backend> Session<B> {
             };
             match work {
                 ba::Work::Start(..) => {
-                    self.exchange_station(Command::Unified { id: 3 }, &request.wtbl(peer, true))
+                    self.exchange_station(
+                        Command::Unified { id: 3 },
+                        &request.wtbl(link, peer, true),
+                    )
+                    .await?;
+                    self.exchange_station(Command::Unified { id: 3 }, &request.station(link, true))
                         .await?;
-                    self.exchange_station(Command::Unified { id: 3 }, &request.station(true))
-                        .await?;
-                    self.send_management(&request.response(own, peer), 1)
+                    self.send_management(&request.response(own, peer), peer_wcid)
                         .await?;
                     self.check_station_tx()?;
                     if !self
@@ -129,7 +136,7 @@ impl<B: Backend> Session<B> {
                 }
                 ba::Work::Repeat(..) => {
                     if self.station.rx_ba.active(tid) {
-                        self.send_management(&request.response(own, peer), 1)
+                        self.send_management(&request.response(own, peer), peer_wcid)
                             .await?;
                         self.station
                             .rx_ba
@@ -139,13 +146,14 @@ impl<B: Backend> Session<B> {
                 ba::Work::Stop(_, _, notify) => {
                     // Receive/WTBL retirement is non-RF cleanup, including
                     // after policy loss. Current device authority still applies.
-                    self.exchange(Command::Unified { id: 3 }, &request.wtbl(peer, false))
+                    self.exchange(Command::Unified { id: 3 }, &request.wtbl(link, peer, false))
                         .await?;
-                    self.exchange(Command::Unified { id: 3 }, &request.station(false))
+                    self.exchange(Command::Unified { id: 3 }, &request.station(link, false))
                         .await?;
                     self.station.rx_ba.finish_stop(tid, epoch);
                     if notify {
-                        self.send_management(&request.delba(own, peer), 1).await?;
+                        self.send_management(&request.delba(own, peer), peer_wcid)
+                            .await?;
                     }
                 }
             }
@@ -157,12 +165,13 @@ impl<B: Backend> Session<B> {
     /// Close delivery before the first wait and retain each native BA record
     /// until both terminal disable receipts. Key/WCID reuse follows this fence.
     pub(super) async fn retire_receive_ba(&mut self, peer: [u8; 6]) -> Result<(), Error> {
+        let link = self.station.link;
         self.station.rx_ba.fence();
         self.clear_aggregate_receive();
         for (tid, epoch, request) in self.station.rx_ba.records() {
-            self.exchange(Command::Unified { id: 3 }, &request.wtbl(peer, false))
+            self.exchange(Command::Unified { id: 3 }, &request.wtbl(link, peer, false))
                 .await?;
-            self.exchange(Command::Unified { id: 3 }, &request.station(false))
+            self.exchange(Command::Unified { id: 3 }, &request.station(link, false))
                 .await?;
             self.station.rx_ba.finish_stop(tid, epoch);
         }

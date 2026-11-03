@@ -107,6 +107,16 @@ impl Link {
         self.vif.bmc()
     }
 }
+/// Stamp `vif`'s BSS index into a unified BSS_INFO / CE BSS request built
+/// for BSS0. Every such Linux request opens with
+/// `struct { u8 bss_idx; u8 pad[3]; } hdr` = `mvif->idx`
+/// (mt76_connac_mcu_uni_set_chctx, mt76_connac_mcu_uni_add_bss,
+/// mt7921_mcu_uni_add_beacon_offload, mt7921_mcu_set_bss_pm), so a
+/// `Vif::HOME` body is unchanged.
+pub(crate) fn on_bss<T: AsMut<[u8]>>(vif: Vif, mut body: T) -> T {
+    body.as_mut()[0] = vif.index();
+    body
+}
 /// Highest peer WCID (`MT792x_WTBL_STA` - 1, mt792x.h).
 pub(crate) const LAST_PEER_WCID: u8 = 14;
 

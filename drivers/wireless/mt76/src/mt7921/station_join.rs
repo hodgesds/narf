@@ -6,7 +6,7 @@ use super::{
     TIMEOUT_MS,
 };
 use crate::mt7921::{
-    association::{disconnect_record, JoinPlan, Security},
+    association::{disconnect_record_on, JoinPlan, Security},
     cmd, packet_tx,
 };
 use alloc::{collections::VecDeque, vec, vec::Vec};
@@ -586,7 +586,7 @@ impl<B: Backend> Session<B> {
         }
         if self.station.rx_ba.owns(tid as u8)
             && (!self.station.rx_ba.active(tid as u8)
-                || native.wcid != 1
+                || native.wcid != u16::from(self.station.link.peer())
                 || usize::from(native.tid) != tid)
         {
             receiver.clear();
@@ -692,8 +692,13 @@ impl<B: Backend> Session<B> {
         if gtk.rsc[6..] != [0, 0] {
             return Err(Error::MalformedEvent);
         }
-        let record = crate::mt7921::association::key_record(19, gtk.key_id, Some(&gtk.key))
-            .map_err(|_| Error::MalformedEvent)?;
+        let record = crate::mt7921::association::key_record_on(
+            self.station.link,
+            self.station.link.bmc(),
+            gtk.key_id,
+            Some(&gtk.key),
+        )
+        .map_err(|_| Error::MalformedEvent)?;
         self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
@@ -707,8 +712,9 @@ impl<B: Backend> Session<B> {
         igtk: &narf_wireless::eapol::Igtk,
     ) -> Result<(), Error> {
         let (gtk_id, gtk) = security.gtk().ok_or(Error::MalformedEvent)?;
-        let record = crate::mt7921::association::igtk_record(gtk_id, gtk, &igtk.key)
-            .map_err(|_| Error::MalformedEvent)?;
+        let record =
+            crate::mt7921::association::igtk_record_on(self.station.link, gtk_id, gtk, &igtk.key)
+                .map_err(|_| Error::MalformedEvent)?;
         self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
@@ -794,11 +800,19 @@ impl<B: Backend> Session<B> {
                         true,
                     ),
                 };
-                self.send_management(&wrap_eapol_frame(info.capabilities.mac, peer, &reply), 1)
-                    .await?;
+                self.send_management(
+                    &wrap_eapol_frame(info.capabilities.mac, peer, &reply),
+                    u16::from(self.station.link.peer()),
+                )
+                .await?;
                 if let Some(tk) = tk {
-                    let record = crate::mt7921::association::key_record(1, 0, Some(&tk))
-                        .map_err(|_| Error::MalformedEvent)?;
+                    let record = crate::mt7921::association::key_record_on(
+                        self.station.link,
+                        self.station.link.peer(),
+                        0,
+                        Some(&tk),
+                    )
+                    .map_err(|_| Error::MalformedEvent)?;
                     self.exchange_station(Command::Unified { id: 3 }, &record)
                         .await?;
                     security.commit_pairwise();
@@ -1136,7 +1150,7 @@ impl<B: Backend> Session<B> {
             let reordered = tid.is_some_and(|tid| self.station.rx_ba.active(tid));
             if (native.ampdu || tid.is_some_and(|tid| self.station.rx_ba.owns(tid)))
                 && (!reordered
-                    || native.wcid != 1
+                    || native.wcid != u16::from(self.station.link.peer())
                     || tid != Some(native.tid)
                     || header[4..10] != own
                     || header[22] & 15 != 0
@@ -1646,7 +1660,8 @@ impl<B: Backend> Session<B> {
         // Commit, at most the shared plan's MAX_ANTI_CLOGGING (3) token
         // retries, then Confirm; the plan fails any further token request.
         for _ in 0..5 {
-            self.send_management(&frame, 1).await?;
+            self.send_management(&frame, u16::from(self.station.link.peer()))
+                .await?;
             let step = self
                 .wait(3_000, |backend| {
                     for _ in 0..16 {
@@ -1839,12 +1854,15 @@ impl<B: Backend> Session<B> {
 
             // Publish BSSID and an unauthorized AP WCID before management
             // or EAPOL RX; a scan-only BSS has no peer address installed.
-            let mut bss_record = crate::mt7921::association::bss_record_qos(bss, false, false)
-                .map_err(|_| Error::Bounds)?;
+            let mut bss_record =
+                crate::mt7921::association::bss_record_qos_on(self.station.link, bss, false, false)
+                    .map_err(|_| Error::Bounds)?;
             crate::mt7921::p2p_wire::group_bss(&mut bss_record, network)?;
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
-            let peer_record = plan.peer_record(0, false).map_err(|_| Error::Bounds)?;
+            let peer_record = plan
+                .peer_record_on(self.station.link, 0, false)
+                .map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
 
@@ -1858,7 +1876,8 @@ impl<B: Backend> Session<B> {
                 request
             } else {
                 let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
-                self.send_management(auth_req, 1).await?;
+                self.send_management(auth_req, u16::from(self.station.link.peer()))
+                    .await?;
 
                 // 4. Wait for Authentication Response:
                 self.wait(3_000, |backend| {
@@ -1882,7 +1901,8 @@ impl<B: Backend> Session<B> {
 
             // 5. Send Association Request:
             self.stage(Stage::Associate);
-            self.send_management(&assoc_req, 1).await?;
+            self.send_management(&assoc_req, u16::from(self.station.link.peer()))
+                .await?;
 
             // 6. Wait for Association Response:
             let aid = self
@@ -1978,24 +1998,33 @@ impl<B: Backend> Session<B> {
             if let Some(he) = plan.he() {
                 // mt7921_mac_sta_event(ASSOC) -> uni_add_bss(enable = true):
                 // HE_BASIC + BSS_COLOR follow BASIC/QBSS once he_support is set.
-                self.exchange_station(Command::Unified { id: 2 }, &he.bss(true))
-                    .await?;
+                self.exchange_station(
+                    Command::Unified { id: 2 },
+                    &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), he.bss(true)),
+                )
+                .await?;
             }
             if let Some(profile) = plan.vht() {
                 self.exchange_station(
                     Command::Unified { id: 2 },
-                    &profile.rlm(
-                        bss.channel,
-                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    &crate::mt7921::vif_slots::on_bss(
+                        self.station.link.vif(),
+                        profile.rlm(
+                            bss.channel,
+                            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                        ),
                     ),
                 )
                 .await?;
             } else if let Some(profile) = plan.ht20() {
                 self.exchange_station(
                     Command::Unified { id: 2 },
-                    &profile.rlm(
-                        bss.channel,
-                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    &crate::mt7921::vif_slots::on_bss(
+                        self.station.link.vif(),
+                        profile.rlm(
+                            bss.channel,
+                            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                        ),
                     ),
                 )
                 .await?;
@@ -2003,21 +2032,27 @@ impl<B: Backend> Session<B> {
                 // mt76_connac_mcu_uni_set_chctx with band = NL80211_BAND_6GHZ.
                 self.exchange_station(
                     Command::Unified { id: 2 },
-                    &crate::mt7921::six_ghz::rlm(
-                        bss.channel,
-                        permission.center_channel(),
-                        permission.native_width(),
-                        plan.transmit_streams(),
-                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    &crate::mt7921::vif_slots::on_bss(
+                        self.station.link.vif(),
+                        crate::mt7921::six_ghz::rlm(
+                            bss.channel,
+                            permission.center_channel(),
+                            permission.native_width(),
+                            plan.transmit_streams(),
+                            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                        ),
                     ),
                 )
                 .await?;
             }
-            let peer_record = plan.peer_record(aid, true).map_err(|_| Error::Bounds)?;
+            let peer_record = plan
+                .peer_record_on(self.station.link, aid, true)
+                .map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
-            let group_record = crate::mt7921::association::group_record(bss.bssid, aid)
-                .map_err(|_| Error::Bounds)?;
+            let group_record =
+                crate::mt7921::association::group_record_on(self.station.link, bss.bssid, aid)
+                    .map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 3 }, &group_record)
                 .await?;
 
@@ -2026,7 +2061,7 @@ impl<B: Backend> Session<B> {
                 Security::Open => {
                     self.stage(Stage::StaRecord);
                     let sta_rec = plan
-                        .peer_record(aid, true)
+                        .peer_record_on(self.station.link, aid, true)
                         .map_err(|_| Error::MalformedEvent)?;
                     self.exchange_station(Command::Unified { id: 3 }, &sta_rec)
                         .await?;
@@ -2092,7 +2127,11 @@ impl<B: Backend> Session<B> {
                                 .await?;
                                 self.stage(Stage::StaRecord);
                                 let record = plan
-                                    .secure_peer_record(aid, m3.tk.as_deref().unwrap())
+                                    .secure_peer_record_on(
+                                        self.station.link,
+                                        aid,
+                                        m3.tk.as_deref().unwrap(),
+                                    )
                                     .map_err(|_| Error::MalformedEvent)?;
                                 self.exchange_station(Command::Unified { id: 3 }, &record)
                                     .await?;
@@ -2226,38 +2265,48 @@ impl<B: Backend> Session<B> {
                 deauth[24..26].copy_from_slice(&3u16.to_le_bytes());
                 self.backend
                     .check_tx_permission(closing_permission.ok_or(Error::Authority)?)?;
-                match self.transmit_management(&deauth, 1).await {
+                match self
+                    .transmit_management(&deauth, u16::from(self.station.link.peer()))
+                    .await
+                {
                     Ok(_) | Err(Error::Rejected(_)) => {}
                     Err(error) => return Err(error),
                 }
             }
             // Retire keys before removing the station WCIDs. No cleanup ACK
             // is optional: uncertainty cannot become a reusable ready radio.
+            let link = self.station.link;
             if secure {
-                for wcid in [1, 19] {
-                    let record = crate::mt7921::association::key_record(wcid, 0, None)
+                for wcid in [link.peer(), link.bmc()] {
+                    let record = crate::mt7921::association::key_record_on(link, wcid, 0, None)
                         .map_err(|_| Error::Bounds)?;
                     self.exchange(Command::Unified { id: 3 }, &record).await?;
                 }
             }
-            for wcid in [1, 19] {
-                let record = if wcid == 1 {
-                    disconnect_record(peer)
-                } else {
-                    crate::mt7921::association::group_disconnect_record()
-                };
+            for record in [
+                disconnect_record_on(link, peer),
+                crate::mt7921::association::group_disconnect_record_on(link),
+            ] {
                 self.exchange(Command::Unified { id: 3 }, &record).await?;
             }
             if let Some(bss) = &self.station.bss {
-                let mut record = crate::mt7921::association::bss_record_qos(bss, false, false)
-                    .map_err(|_| Error::Bounds)?;
+                let mut record = crate::mt7921::association::bss_record_qos_on(
+                    self.station.link,
+                    bss,
+                    false,
+                    false,
+                )
+                .map_err(|_| Error::Bounds)?;
                 crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
                 self.exchange(Command::Unified { id: 2 }, &record).await?;
                 // mt76_connac_mcu_uni_add_bss(enable = false) still sends the
                 // HE request while he_support is set, with BSS color disabled.
                 if let Some(he) = had_he {
-                    self.exchange(Command::Unified { id: 2 }, &he.bss(false))
-                        .await?;
+                    self.exchange(
+                        Command::Unified { id: 2 },
+                        &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), he.bss(false)),
+                    )
+                    .await?;
                 }
             }
             if had_wmm {
@@ -2432,7 +2481,8 @@ impl<B: Backend> Session<B> {
                 let Some(frame) = self.station.control_pending.pop_front() else {
                     break;
                 };
-                self.send_management(&frame, 1).await?;
+                self.send_management(&frame, u16::from(self.station.link.peer()))
+                    .await?;
             }
             self.check_station_tx()
         }

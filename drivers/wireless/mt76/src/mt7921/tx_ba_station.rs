@@ -62,8 +62,11 @@ impl<B: Backend> Session<B> {
         }
         self.stage(Stage::StaRecord);
         let result = async {
-            self.send_management(&self.station.tx_ba.get(tid)?.request(), 1)
-                .await?;
+            self.send_management(
+                &self.station.tx_ba.get(tid)?.request(),
+                u16::from(self.station.link.peer()),
+            )
+            .await?;
             let started = self.backend.now_ns();
             for _ in 0..2500 {
                 self.check_station_tx()?;
@@ -95,12 +98,16 @@ impl<B: Backend> Session<B> {
             self.station.tx_ba.get_mut(tid)?.configuring(); // retain uncertainty before first native wait.
             self.exchange_station(
                 Command::Unified { id: 3 },
-                &self.station.tx_ba.get(tid)?.wtbl(true),
+                &self.station.tx_ba.get(tid)?.wtbl(self.station.link, true),
             )
             .await?;
             self.exchange_station(
                 Command::Unified { id: 3 },
-                &self.station.tx_ba.get(tid)?.station(true),
+                &self
+                    .station
+                    .tx_ba
+                    .get(tid)?
+                    .station(self.station.link, true),
             )
             .await?;
             self.station
@@ -184,18 +191,25 @@ impl<B: Backend> Session<B> {
         if self.station.tx_ba.get(tid)?.published() {
             self.exchange(
                 Command::Unified { id: 3 },
-                &self.station.tx_ba.get(tid)?.wtbl(false),
+                &self.station.tx_ba.get(tid)?.wtbl(self.station.link, false),
             )
             .await?;
             self.exchange(
                 Command::Unified { id: 3 },
-                &self.station.tx_ba.get(tid)?.station(false),
+                &self
+                    .station
+                    .tx_ba
+                    .get(tid)?
+                    .station(self.station.link, false),
             )
             .await?;
         }
         if self.station.tx_ba.get(tid)?.notify() && self.station.tx_ba.get(tid)?.remote() {
-            self.send_management(&self.station.tx_ba.get(tid)?.delba(), 1)
-                .await?;
+            self.send_management(
+                &self.station.tx_ba.get(tid)?.delba(),
+                u16::from(self.station.link.peer()),
+            )
+            .await?;
         }
         self.station.tx_ba.get_mut(tid)?.fallback();
         Ok(())

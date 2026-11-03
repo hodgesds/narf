@@ -2,6 +2,7 @@
 //! Linux mac80211/agg-tx.c and
 //! mt76_connac_mcu.c::mt76_connac_mcu_{wtbl,sta}_ba_tlv.
 use super::{scan::NativeRx, Error};
+use crate::mt7921::vif_slots::Link;
 use alloc::{vec, vec::Vec};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,9 +152,10 @@ impl Agreement {
         frame[28..30].copy_from_slice(&39u16.to_le_bytes()); // QSTA_TIMEOUT.
         frame
     }
-    pub fn receive(&mut self, native: &NativeRx<'_>) -> bool {
+    /// `peer_wcid` is the owning link's AP WCID (Linux `wcid->idx`).
+    pub fn receive(&mut self, native: &NativeRx<'_>, peer_wcid: u16) -> bool {
         let frame = native.frame;
-        if native.wcid != 1
+        if native.wcid != peer_wcid
             || native.channel != self.channel
             || native.ccmp.is_some()
             || native.ampdu
@@ -270,9 +272,14 @@ impl Agreement {
         self.remote = false;
         self.fallback();
     }
-    pub fn wtbl(&self, enable: bool) -> Vec<u8> {
+    /// Linux `mt76_connac_mcu_alloc_sta_req`: `bss_idx = mvif->idx`,
+    /// `wlan_idx` = the link's peer WCID, `muar_idx = omac_idx`.
+    pub fn wtbl(&self, link: Link, enable: bool) -> Vec<u8> {
         let mut out = vec![0; 48];
         out[..20].copy_from_slice(&[0, 1, 1, 0, 1, 0, 0, 0, 13, 0, 40, 0, 1, 2, 1, 0, 0, 0, 0, 0]);
+        out[0] = link.bss();
+        out[1] = link.peer();
+        out[5] = link.omac();
         out[20..26].copy_from_slice(&[8, 0, 28, 0, 0, 1]);
         out[24] = self.tid;
         // mac80211's TX_OPERATIONAL callback has native SN0; no guessed
@@ -283,9 +290,12 @@ impl Agreement {
         }
         out
     }
-    pub fn station(&self, enable: bool) -> Vec<u8> {
+    pub fn station(&self, link: Link, enable: bool) -> Vec<u8> {
         let mut out = vec![0; 20];
         out[..14].copy_from_slice(&[0, 1, 1, 0, 1, 0, 0, 0, 6, 0, 12, 0, 0, 1]);
+        out[0] = link.bss();
+        out[1] = link.peer();
+        out[5] = link.omac();
         out[12] = self.tid;
         // mt76_connac_mcu_sta_ba_tlv: ba->amsdu = params->amsdu.
         out[14] = u8::from(enable && self.amsdu);
@@ -357,8 +367,10 @@ impl Owner {
     pub fn amsdu_tid(&self, tid: u8) -> bool {
         self.get(tid).is_ok_and(Agreement::amsdu)
     }
-    pub fn receive(&mut self, native: &NativeRx<'_>) -> bool {
-        self.agreements.iter_mut().any(|a| a.receive(native))
+    pub fn receive(&mut self, native: &NativeRx<'_>, peer_wcid: u16) -> bool {
+        self.agreements
+            .iter_mut()
+            .any(|a| a.receive(native, peer_wcid))
     }
     pub fn touch_tid(&mut self, tid: u8, now: u64) {
         if let Ok(a) = self.get_mut(tid) {
