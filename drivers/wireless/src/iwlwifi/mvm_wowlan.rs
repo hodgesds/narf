@@ -166,7 +166,7 @@ impl Owner {
         self.hardware.d3_suspend()
     }
 
-    /// `__iwl_mvm_resume` (notification-based, unified image, 22000 without
+    /// `__iwl_mvm_resume` (notification-based, unified image, 22000 with
     /// `D0I3_END_FIRST`). An `Err` means the transport did not come back and
     /// no report exists; the caller restarts exactly like `Ok(keep: false)`.
     pub(in crate::iwlwifi) async fn wowlan_resume(&mut self) -> Result<Resumed, &'static str> {
@@ -174,6 +174,9 @@ impl Owner {
             return Err("MVM WoWLAN resume without D3");
         }
         self.hardware.d3_resume().await?;
+        // `iwl_mvm_resume_firmware`: 22000 with D0I3_END_FIRST triggers the
+        // resume flow with D0I3_END_CMD before the D3 notifications.
+        self.hardware.command(0, d3::D0I3_END_CMD, &[]).await?;
         let deadline = narf_time::Deadline::after_ms(NOTIF_TIMEOUT_MS);
         let remaining =
             || (narf_time::wall::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000).max(1);

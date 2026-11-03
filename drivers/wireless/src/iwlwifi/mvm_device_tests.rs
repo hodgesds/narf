@@ -75,9 +75,12 @@ fn image() -> Vec<u8> {
     ]);
     let flags = parsed.api.flags | 1 << 16; // NEW_NSOFFL_LARGE
     tlv(&mut bytes, 48, &versions);
-    // Capability 17: consolidated D3/D0 image; API 53: TCP-SYN wake.
-    tlv(&mut bytes, 29, &[0, 0, 0, 0, 0, 0, 0x12, 0x20]);
-    tlv(&mut bytes, 30, &[1, 0, 0, 0, 0, 0, 0x20, 0]);
+    tlv(&mut bytes, 29, &[0, 0, 0, 0, 0, 0, 0x10, 0x20]);
+    // TLV29 API 53: TCP-SYN wake. TLV30 capabilities 17 (consolidated
+    // D3/D0 image) and 41 (D0I3_END_FIRST), as every installed -77 image.
+    tlv(&mut bytes, 29, &[1, 0, 0, 0, 0, 0, 0x20, 0]);
+    tlv(&mut bytes, 30, &[0, 0, 0, 0, 0, 0, 2, 0]);
+    tlv(&mut bytes, 30, &[1, 0, 0, 0, 0, 2, 0, 0]);
     tlv(&mut bytes, 18, &flags.to_le_bytes());
     bytes
 }
@@ -865,6 +868,7 @@ impl Actor {
                 (1, 0xe0) if b.len() >= 4 && b.len() == 4 + usize::from(b[0]) * 152 => vec![],
                 (1, 0xd4) if b.len() == 428 => vec![],
                 (1, 0xd3) if b.len() == 12 => vec![],
+                (1, 0xed) if b.is_empty() => vec![],
                 _ => return Err("unexpected MVM interface control publication"),
             };
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);

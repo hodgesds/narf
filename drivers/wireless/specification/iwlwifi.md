@@ -5015,8 +5015,8 @@ of this complete graph; full native acceptance remains a separate gate.
 MVM station on the 22000 transport (AX200 Cc / AX201 Qu/QuZ, §3.17).
 `mvm_d3.rs::D3Api::admit` parses the retained executable and admits only
 the exact surface every installed API77 image advertises: capability 17
-(`IWL_UCODE_TLV_CAPA_CNSLDTD_D3_D0_IMG`), no capability 41
-(`D0I3_END_FIRST`), API 53 (`WOWLAN_TCP_SYN_WAKE`), TLV18 flag 16
+(`IWL_UCODE_TLV_CAPA_CNSLDTD_D3_D0_IMG`) and capability 41
+(`D0I3_END_FIRST`, set by every installed -77 image), API 53 (`WOWLAN_TCP_SYN_WAKE`), TLV18 flag 16
 (`NEW_NSOFFL_LARGE`, not `SMALL`), LONG_GROUP command versions
 `WOWLAN_CONFIGURATION` 6, `WOWLAN_PATTERNS` 3, `WOWLAN_TSC_RSC_PARAM` 5,
 `PROT_OFFLOAD_CONFIG_CMD` 4, `D3_CONFIG_CMD` 4, and `PROT_OFFLOAD_GROUP`
@@ -5061,7 +5061,8 @@ return) and leaves the station terminal.
 sets `INIT_DONE`, polls `MAC_CLOCK_READY`, re-enables MSI-X (including
 additional RSS vectors), releases MAC access and treats
 `CSR_RESET_REG_FLAG_NEVO_RESET` as "device was reset during suspend".
-`Owner::wowlan_resume` waits at most 333 ms (`IWL_MVM_D3_NOTIF_TIMEOUT`)
+`Owner::wowlan_resume` first sends `D0I3_END_CMD` (`iwl_mvm_resume_firmware`
+for 22000 with `D0I3_END_FIRST`; a failure restarts), then waits at most 333 ms (`IWL_MVM_D3_NOTIF_TIMEOUT`)
 for `WOWLAN_INFO`, the wake packet when a packet reason is set, and
 `D3_END`. The report follows `iwl_mvm_report_wakeup_reasons` and is
 retained as `Device::wowlan_wakeup` (`mvm_d3::WakeReport`). The connection

@@ -26,6 +26,7 @@ fn api(commands: &[u8]) -> FirmwareApi<'_> {
         ..FirmwareApi::default()
     };
     api.capabilities[0] = 1 << 17;
+    api.capabilities[1] = 1 << (41 - 32);
     api.api_changes[1] = 1 << (53 - 32);
     api
 }
@@ -58,10 +59,10 @@ fn smoke_mvm_d3_admits_only_exact_api77_unified_versions() -> TestResult {
         if D3Api::admit(&split).is_ok() {
             return Err("non-unified image admitted without a D3 image");
         }
-        let mut first = api(&commands);
-        first.capabilities[1] = 1 << (41 - 32);
-        if D3Api::admit(&first).is_ok() {
-            return Err("D0I3_END_FIRST resume admitted");
+        let mut late = api(&commands);
+        late.capabilities[1] = 0;
+        if D3Api::admit(&late).is_ok() {
+            return Err("resume without D0I3_END_FIRST admitted");
         }
         let mut small = api(&commands);
         small.flags |= 1 << 15;

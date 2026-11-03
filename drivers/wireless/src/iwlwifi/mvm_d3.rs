@@ -93,15 +93,19 @@ impl D3Api {
     /// Admit only the 22000/API77 unified-image notification-based flow:
     /// WOWLAN_CONFIGURATION v6, WOWLAN_PATTERNS v3 (TCP-SYN-wake layout),
     /// WOWLAN_TSC_RSC_PARAM v5, PROT_OFFLOAD_CONFIG v4 (large NS layout),
-    /// D3_CONFIG v4 and WOWLAN_INFO v1 / WAKE_PKT v1 / D3_END v1. Linux would
+    /// D3_CONFIG v4, D0I3_END_FIRST and WOWLAN_INFO v1 / WAKE_PKT v1 /
+    /// D3_END v1. Linux would
     /// fall back to WOWLAN_GET_STATUSES or older layouts for other images;
     /// those are not implemented and fail closed here.
     pub(super) fn admit(api: &FirmwareApi<'_>) -> Result<Self, &'static str> {
         if !api.has_capability(CAPA_CNSLDTD_D3_D0_IMG) {
             return Err("MVM WoWLAN requires the consolidated D3/D0 image");
         }
-        if api.has_capability(CAPA_D0I3_END_FIRST) {
-            return Err("MVM WoWLAN D0I3_END_FIRST resume is not implemented");
+        // Every installed API77 image sets D0I3_END_FIRST; the 22000 resume
+        // then starts with D0I3_END_CMD (`iwl_mvm_resume_firmware`). The
+        // doorbell/late-D0I3_END variants are not implemented.
+        if !api.has_capability(CAPA_D0I3_END_FIRST) {
+            return Err("MVM WoWLAN requires D0I3_END_FIRST resume");
         }
         let exact = |command, version| api.command_version(0, command) == Some(version);
         if !exact(WOWLAN_CONFIGURATION, 6) {
