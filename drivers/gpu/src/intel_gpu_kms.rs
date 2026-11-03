@@ -867,22 +867,11 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
         lost.store(true, Ordering::Release);
     }
 }
-/// Retire an owned Meteor Lake external route and its hotplug sources
-/// (`intel_gpu_xelpg_external::teardown_mtl_external`) for this BAR. The
-/// window is captured under the controller lock and programmed outside it;
-/// other generations return before any register access.
+/// Retire an owned Meteor Lake external route, its hotplug sources and its
+/// publication for this BAR (`intel_gpu::retire_mtl_external`). Other
+/// generations return before any register access.
 fn retire_mtl_external(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
-    let Some((window, generation)) = crate::intel_gpu::with_controller(|gpu| {
-        (gpu.gtt_mmadr.phys == bar.phys).then(|| (gpu.mode_window(), gpu.chip.generation))
-    })
-    .flatten() else {
-        return Ok(());
-    };
-    if crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, generation) {
-        Ok(())
-    } else {
-        Err(FsError::Busy)
-    }
+    crate::intel_gpu::retire_mtl_external(bar)
 }
 
 pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {

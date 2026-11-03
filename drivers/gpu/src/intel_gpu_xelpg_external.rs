@@ -945,6 +945,40 @@ impl MtlExternalService {
 static SERVICE: narf_lib::mutex::Mutex<MtlExternalService> =
     narf_lib::mutex::Mutex::new(MtlExternalService::new());
 
+/// DC-off bracket for every hardware touch of the MTL external route:
+/// hotplug service, Type-C connect/disconnect, probe, activate, stop and
+/// teardown all run inside it. Display DC5/DC6 must be exited before these
+/// registers are touched. The DC-state reference service is integrated
+/// separately; until it is joined this bracket runs `f` directly, and the
+/// integration replaces the body with a DC_off reference held for the
+/// duration of `f` (user kind: external output).
+fn with_dc_off<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// Act on one hotplug event with the process-wide service. `None` when a
+/// concurrent pass owns the service (never waits).
+pub fn handle_mtl_event<M: MmioWindow + ?Sized>(
+    io: &M,
+    event: MtlHpdEvent,
+    alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+) -> Option<ServiceOutcome> {
+    let mut service = SERVICE.try_lock()?;
+    Some(with_dc_off(|| service.handle(io, event, alloc)))
+}
+
+/// Poll the process-wide MTL hotplug owner once (inside the DC-off
+/// bracket). Non-MTL generations return `None` before any access.
+pub fn poll_mtl_event<M: MmioWindow + ?Sized>(
+    io: &M,
+    generation: Generation,
+) -> Option<MtlHpdEvent> {
+    if generation != Generation::MeteorLake {
+        return None;
+    }
+    with_dc_off(|| crate::intel_gpu_xelpg_hpd::poll_hpd_event(io, generation))
+}
+
 /// Process-wide entry for the display runtime: poll the MTL hotplug owner
 /// once and act on the event. Non-MTL generations return `None` before
 /// any register access; a concurrent service pass returns `None` rather
@@ -954,12 +988,29 @@ pub fn service_mtl_external<M: MmioWindow + ?Sized>(
     generation: Generation,
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
-    if generation != Generation::MeteorLake {
-        return None;
-    }
-    let mut service = SERVICE.try_lock()?;
-    let event = crate::intel_gpu_xelpg_hpd::poll_hpd_event(io, generation)?;
-    Some(service.handle(io, event, alloc))
+    let event = poll_mtl_event(io, generation)?;
+    handle_mtl_event(io, event, alloc)
+}
+
+/// Whether the process-wide MTL route is absent or locally stopped (its
+/// hardware is off). A live or quarantined route, or a service pass in
+/// progress, reports `false`. Never touches registers.
+pub fn routes_stopped() -> bool {
+    SERVICE.try_lock().is_some_and(|service| {
+        service
+            .route()
+            .is_none_or(|r| r.state() == RouteState::Stopped)
+    })
+}
+
+/// Whether the process-wide MTL route is currently live (scanning out).
+/// The DC-state owner must refuse DC entry while this is true.
+pub fn route_live() -> bool {
+    SERVICE.try_lock().is_none_or(|service| {
+        service
+            .route()
+            .is_some_and(|r| r.state() == RouteState::Live)
+    })
 }
 
 /// Process-wide reset/suspend teardown: stop/release the route, then
@@ -971,9 +1022,11 @@ pub fn teardown_mtl_external<M: MmioWindow + ?Sized>(io: &M, generation: Generat
     let Some(mut service) = SERVICE.try_lock() else {
         return false;
     };
-    let route = service.teardown(io);
-    let hpd = crate::intel_gpu_xelpg_hpd::teardown_hpd(io, generation);
-    route && hpd
+    with_dc_off(|| {
+        let route = service.teardown(io);
+        let hpd = crate::intel_gpu_xelpg_hpd::teardown_hpd(io, generation);
+        route && hpd
+    })
 }
 
 /// The pin an external port's hotplug arrives on.

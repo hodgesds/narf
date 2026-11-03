@@ -1773,6 +1773,18 @@ pub fn poll_dp_hpd_events() {
         },
         None => None,
     };
+    // Meteor Lake external outputs drain first; the Gen12 loop below never
+    // reports an event on that generation, and this drain never runs on Gen12.
+    for _ in 0..MTL_EVENTS_PER_DRAIN {
+        let suspended = &mut ownership;
+        if !service_mtl_display(&mut || {
+            if let Some(guard) = suspended.as_mut() {
+                guard.suspend();
+            }
+        }) {
+            break;
+        }
+    }
     loop {
         let event = with_display_info(|gpu| {
             let window = gpu.mode_window();
@@ -2216,6 +2228,7 @@ fn step_external_sst(bar: &MmioRegion, stop: bool) -> Result<bool, narf_filesyst
 }
 /// Existing runtime actor calls this outside the GT mutex. No executor bridge.
 pub(crate) fn service_external_sst(bar: &MmioRegion) {
+    service_mtl_external_for_bar(bar);
     let active = DP_SESSION
         .lock()
         .as_ref()
@@ -2264,6 +2277,214 @@ pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
             .lock()
             .as_ref()
             .is_none_or(|state| state.bar != bar.phys.raw() || state.stopped())
+        && crate::intel_gpu_xelpg_external::routes_stopped()
+}
+
+// ── Meteor Lake external SST (`intel_gpu_xelpg_external`) ───────
+//
+// The display-14 counterpart of the Gen12 glue above. The route itself —
+// Type-C ownership, hotplug, link, local stop — is owned by
+// `intel_gpu_xelpg_external`; this glue owns its scanout allocation and
+// the serial-matched publication. The GTT allocator has no free path, so
+// one allocation is retained per BAR and reused whenever the next mode
+// fits; it lives in the pipe-B console GGTT window so it can never remap
+// the internal panel's pipe-A window. Gen12 never reaches this glue: every
+// entry returns before register access unless the probed generation is
+// Meteor Lake.
+
+/// Retained MTL external scanout allocation: (BAR physical base, allocation).
+static MTL_SCANOUT: IrqSafeSpinLock<Option<(u64, ScanoutAllocation)>> = IrqSafeSpinLock::new(None);
+/// Serial of the published MTL external image (0 = none published).
+static MTL_PUBLISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Upper bound on hotplug events one probe-time drain acts on.
+const MTL_EVENTS_PER_DRAIN: usize = 8;
+
+/// Publication requests one MTL pass makes of its caller.
+#[derive(Copy, Clone, Debug)]
+enum MtlPublication {
+    /// Publish this image under this serial.
+    Publish(narf_graphics_driver::generic::GenericFb, u64),
+    /// Withdraw the image published under this serial (only if current).
+    Withdraw(u64),
+}
+
+/// One MTL external hotplug pass: poll the owned hotplug source; when an
+/// event arrives run `before_event` (the caller suspends fixed internal
+/// flips), let the route owner act on it with a retained-or-new scanout
+/// allocation, then publish an activated image or withdraw the image of a
+/// route that is no longer live. Returns whether an event was handled.
+fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
+    io: &M,
+    generation: Generation,
+    bar: u64,
+    before_event: &mut dyn FnMut(),
+    alloc: &mut dyn FnMut(u64) -> Option<ScanoutAllocation>,
+    publication: &mut dyn FnMut(MtlPublication),
+) -> bool {
+    use crate::intel_gpu_xelpg_external::ServiceOutcome;
+    let Some(event) = crate::intel_gpu_xelpg_external::poll_mtl_event(io, generation) else {
+        return false;
+    };
+    before_event();
+    let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
+        let width = u32::from(mode.h_active);
+        let size = scanout_size_bytes(width, u32::from(mode.v_active));
+        let reuse = (*MTL_SCANOUT.lock())
+            .filter(|(owner, retained)| *owner == bar && retained.size_bytes >= size)
+            .map(|(_, retained)| retained);
+        let allocation = match reuse {
+            Some(retained) => retained,
+            None => {
+                let fresh = alloc(size)?;
+                *MTL_SCANOUT.lock() = Some((bar, fresh));
+                fresh
+            }
+        };
+        Some(crate::intel_gpu_modeset::Framebuffer {
+            phys_addr: u64::from(allocation.gtt_offset),
+            stride_bytes: padded_stride_bytes(width),
+            format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+        })
+    };
+    let outcome = crate::intel_gpu_xelpg_external::handle_mtl_event(io, event, &mut alloc_fb);
+    if let Some(ServiceOutcome::Activated { mode, fb, .. }) = outcome {
+        let phys = (*MTL_SCANOUT.lock())
+            .filter(|(owner, retained)| {
+                *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
+            })
+            .map(|(_, retained)| retained.phys_base);
+        let serial = NEXT_DP_SESSION
+            .fetch_update(
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+                |n| n.checked_add(1),
+            )
+            .ok();
+        if let (Some(phys), Some(serial)) = (phys, serial) {
+            MTL_PUBLISHED.store(serial, core::sync::atomic::Ordering::Release);
+            publication(MtlPublication::Publish(
+                narf_graphics_driver::generic::GenericFb::new(
+                    phys,
+                    u32::from(mode.h_active),
+                    u32::from(mode.v_active),
+                    fb.stride_bytes,
+                    32,
+                ),
+                serial,
+            ));
+        }
+    }
+    if !crate::intel_gpu_xelpg_external::route_live() {
+        let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
+        if serial != 0 {
+            publication(MtlPublication::Withdraw(serial));
+        }
+    }
+    true
+}
+
+/// Production publication: the same ACTIVE + observer protocol and exact
+/// serial-matched withdrawal the Gen12 SST owner uses.
+fn mtl_publish(request: MtlPublication) {
+    match request {
+        MtlPublication::Publish(fb, serial) => publish_scanout_owned(Some(fb), serial),
+        MtlPublication::Withdraw(serial) => {
+            let withdrew = {
+                let mut active = ACTIVE_GENERIC.lock();
+                external_stop::withdraw(&mut active, serial)
+            };
+            if withdrew {
+                let observer = *SCANOUT_OBSERVER.lock();
+                if let Some(observer) = observer {
+                    observer(None);
+                }
+            }
+        }
+    }
+}
+
+/// One production MTL pass for the probed display. Only Meteor Lake
+/// reaches registers; the window is current-authority checked per access.
+fn service_mtl_display(before_event: &mut dyn FnMut()) -> bool {
+    with_display_info(|gpu| {
+        if gpu.chip.generation != Generation::MeteorLake {
+            return false;
+        }
+        let window = gpu.mode_window();
+        let gtt = gpu.gtt_mmadr;
+        mtl_external_pass(
+            &window,
+            gpu.chip.generation,
+            gtt.phys.raw(),
+            before_event,
+            &mut |size| {
+                let alloc = crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+                    &gtt,
+                    crate::intel_gpu_multipipe::scanout_gtt_offset(crate::intel_gpu_pipes::Pipe::B),
+                    size,
+                )
+                .ok()?;
+                Some(ScanoutAllocation {
+                    gtt_offset: alloc.gtt_offset,
+                    phys_base: alloc.phys_base(),
+                    order: alloc.order,
+                    size_bytes: alloc.size_bytes,
+                })
+            },
+            &mut mtl_publish,
+        )
+    })
+    .unwrap_or(false)
+}
+
+/// Runtime-actor MTL pass for `bar`, under the display legacy drain guard
+/// (same discipline as the Gen12 SST service). No-op off Meteor Lake.
+fn service_mtl_external_for_bar(bar: &MmioRegion) {
+    let mtl = with_display_info(|gpu| {
+        gpu.chip.generation == Generation::MeteorLake && gpu.gtt_mmadr.phys == bar.phys
+    })
+    .unwrap_or(false);
+    if !mtl {
+        return;
+    }
+    let display = crate::intel_gpu_kms::display_for_bar(bar);
+    let mut guard = match display.as_ref() {
+        Some(display) => match display.legacy_drain() {
+            Ok(g) => Some(g),
+            Err(_) => return,
+        },
+        None => None,
+    };
+    let _ = service_mtl_display(&mut || {
+        if let Some(guard) = guard.as_mut() {
+            guard.suspend();
+        }
+    });
+}
+
+/// Suspend/GT-reset retirement of the MTL route and its hotplug sources,
+/// then withdrawal of its publication once nothing is live. `Busy` when a
+/// route stays retained (quarantined or a service pass in progress).
+pub(crate) fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
+    let done = with_display_info(|gpu| {
+        if gpu.gtt_mmadr.phys != bar.phys {
+            return true;
+        }
+        let window = gpu.mode_window();
+        crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
+    })
+    .unwrap_or(true);
+    if !crate::intel_gpu_xelpg_external::route_live() {
+        let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
+        if serial != 0 {
+            mtl_publish(MtlPublication::Withdraw(serial));
+        }
+    }
+    if done {
+        Ok(())
+    } else {
+        Err(narf_filesystem::FsError::Busy)
+    }
 }
 /// Caller holds the same display legacy guard used by physical device PM.
 /// Never waits for another executor task or opens admission after Busy.
@@ -2882,4 +3103,149 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_arrowlake_classification);
+
+    fn smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws() -> TestResult {
+        // Drives the production hook core (`mtl_external_pass`) over the
+        // native MTL route model with the real process-wide service and
+        // hotplug owners. Allocation and publication are recorded instead of
+        // touching a real GGTT or the fb-console observer.
+        extern crate alloc;
+        use crate::intel_gpu_aux::MmioWindow as _;
+        use crate::intel_gpu_xelpg::XeLpgPort;
+        use crate::intel_gpu_xelpg_external::tests::{edid_for, ExtFake, Sink};
+        use crate::intel_gpu_xelpg_hpd::{port_hotplug_ctl, DP_ALT_HPD_LONG_DETECT};
+        use alloc::vec::Vec;
+        const BAR: u64 = 0xF00D_0000_0000;
+        let io = ExtFake::new(
+            XeLpgPort::Tc1,
+            Sink::new(0x14, edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6)),
+        );
+        // Fresh process-wide owners; a fresh teardown touches nothing.
+        if !crate::intel_gpu_xelpg_external::teardown_mtl_external(&io, Generation::MeteorLake)
+            || MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("hook test needs fresh MTL owners");
+        }
+        let mut events = 0u32;
+        let sizes: core::cell::RefCell<Vec<u64>> = core::cell::RefCell::new(Vec::new());
+        let mut published: Vec<MtlPublication> = Vec::new();
+        let mut alloc = |size: u64| {
+            sizes.borrow_mut().push(size);
+            Some(ScanoutAllocation {
+                gtt_offset: 0x100_0000,
+                phys_base: 0x7_0000_0000,
+                order: 10,
+                size_bytes: size,
+            })
+        };
+        // Gen12 never reaches the MTL owners.
+        if mtl_external_pass(
+            &io,
+            Generation::TigerLake,
+            BAR,
+            &mut || events += 1,
+            &mut alloc,
+            &mut |p| published.push(p),
+        ) || events != 0
+            || !io.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("non-MTL pass must not touch the MTL owners");
+        }
+        // Plugged DP-alt sink: one event, one allocation, one publication.
+        let handled = mtl_external_pass(
+            &io,
+            Generation::MeteorLake,
+            BAR,
+            &mut || events += 1,
+            &mut alloc,
+            &mut |p| published.push(p),
+        );
+        let first = match published.as_slice() {
+            [MtlPublication::Publish(fb, serial)] => (*fb, *serial),
+            _ => return TestResult::Fail("activation must publish exactly one image"),
+        };
+        if !handled
+            || events != 1
+            || *sizes.borrow() != [scanout_size_bytes(1024, 768)]
+            || first.0.addr != 0x7_0000_0000
+            || first.0.width != 1024
+            || first.0.height != 768
+            || first.0.pitch != padded_stride_bytes(1024)
+            || MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) != first.1
+            || crate::intel_gpu_xelpg_external::routes_stopped()
+        {
+            return TestResult::Fail("connect pass must allocate, activate and publish");
+        }
+        // No pending event: no work, no suspension.
+        if mtl_external_pass(
+            &io,
+            Generation::MeteorLake,
+            BAR,
+            &mut || events += 1,
+            &mut alloc,
+            &mut |p| published.push(p),
+        ) || events != 1
+        {
+            return TestResult::Fail("idle pass must not report work");
+        }
+        // Unplug: the route is withdrawn and exactly its serial is withdrawn.
+        io.pica_isr.set(0);
+        io.phy.write32(
+            port_hotplug_ctl(0),
+            io.phy.read32(port_hotplug_ctl(0)) | DP_ALT_HPD_LONG_DETECT,
+        );
+        published.clear();
+        let handled = mtl_external_pass(
+            &io,
+            Generation::MeteorLake,
+            BAR,
+            &mut || events += 1,
+            &mut alloc,
+            &mut |p| published.push(p),
+        );
+        if !handled
+            || !matches!(published.as_slice(), [MtlPublication::Withdraw(s)] if *s == first.1)
+            || MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) != 0
+            || !crate::intel_gpu_xelpg_external::routes_stopped()
+        {
+            return TestResult::Fail("unplug must withdraw the exact published serial");
+        }
+        // Replug: the retained allocation is reused; a new serial publishes.
+        io.pica_isr
+            .set(crate::intel_gpu_xelpg_hpd::pica_dp_alt_hotplug(0));
+        io.phy.write32(
+            port_hotplug_ctl(0),
+            io.phy.read32(port_hotplug_ctl(0)) | DP_ALT_HPD_LONG_DETECT,
+        );
+        published.clear();
+        let _ = mtl_external_pass(
+            &io,
+            Generation::MeteorLake,
+            BAR,
+            &mut || events += 1,
+            &mut alloc,
+            &mut |p| published.push(p),
+        );
+        let reused = sizes.borrow().len() == 1
+            && matches!(published.as_slice(), [MtlPublication::Publish(fb, s)]
+                if fb.addr == 0x7_0000_0000 && *s != first.1);
+        // Leave the process-wide owners and the retained slot fresh.
+        let torn =
+            crate::intel_gpu_xelpg_external::teardown_mtl_external(&io, Generation::MeteorLake);
+        MTL_PUBLISHED.store(0, core::sync::atomic::Ordering::Release);
+        {
+            let mut slot = MTL_SCANOUT.lock();
+            if slot.is_some_and(|(owner, _)| owner == BAR) {
+                *slot = None;
+            }
+        }
+        if !reused || !torn || !crate::intel_gpu_xelpg_external::routes_stopped() {
+            return TestResult::Fail("replug must reuse the allocation; teardown must complete");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws
+    );
 }
