@@ -32,9 +32,9 @@ const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDC
 /// RTL8822BE: `rtw8822b_dig` (0xc50/0xe50), the 8821C-identical
 /// `rtw8822b_false_alarm_statistics`, RA and `rtw8822b_pwr_track`
 /// ([`super::tracking8822b`]; its re-IQK needs the separate `N2BW`). 8822B
-/// has no `cck_pd_set`, no `config_tx_path`/CFO/DPK hooks; its
-/// `rtw8822b_adaptivity` is not admitted here.
-const B22_MECHANISMS: u16 = DIG | RA | PWR_TRACK;
+/// has no `cck_pd_set`, no `config_tx_path`/CFO/DPK hooks. `rtw8822b_adaptivity`
+/// EDCCA writes 0x8a4 byte0/byte1 (`rtw8822b_edcca_th`, offset 0).
+const B22_MECHANISMS: u16 = DIG | RA | PWR_TRACK | EDCCA;
 /// Linux `RTW_WATCH_DOG_DELAY_TIME`.
 pub(super) const PERIOD_MS: u64 = 2000;
 
@@ -61,7 +61,7 @@ coef 20x 1bd4 tbl, saturate 1000/0fff fallback 1fff/04001fff, txagc-6 1b67, gs d
 enable 1b08/1b60 bit31 gs; dpk_track ewma thermal(10,4) delta-k_delta 1b58[6:0] bounded by payload window; restore dpd off";
 
 /// RTL8822BE dm contract (`N2BD`), hashed with [`SOURCE`] for B22 requests.
-pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track type0 bit5: RF42[17:16]=3 trigger, next pass RF-A 42[15:10] inside N2BD and N2BP windows, EWMA thermal(10,4), init_trigger or avg!=sample, delta=min(|avg-efuse A|,29) one meter both paths, rtw8822b_pwrtrk_2g{a,b}_{p,n}/2g_cck tables bounded by N2BD power_up/down, rtw8822b_pwrtrack_set with the committed channel TXAGC index offset 3f-index, txagc_swing_offset max 0xf upper default+10, c94/e94[29:25] c1c/e1c[31:21] rtw8822b_txscale_tbl, default_ofdm_index from c1c (rtw8822b_get_swing_index else 24), base fields restored; need_iqk threshold 8 only through N2BW; rtw8822b_adaptivity not admitted";
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track type0 bit5: RF42[17:16]=3 trigger, next pass RF-A 42[15:10] inside N2BD and N2BP windows, EWMA thermal(10,4), init_trigger or avg!=sample, delta=min(|avg-efuse A|,29) one meter both paths, rtw8822b_pwrtrk_2g{a,b}_{p,n}/2g_cck tables bounded by N2BD power_up/down, rtw8822b_pwrtrack_set with the committed channel TXAGC index offset 3f-index, txagc_swing_offset max 0xf upper default+10, c94/e94[29:25] c1c/e1c[31:21] rtw8822b_txscale_tbl, default_ofdm_index from c1c (rtw8822b_get_swing_index else 24), base fields restored; need_iqk threshold 8 only through N2BW; rtw8822b_adaptivity bit6: rtw_phy_adaptivity_set_mode ETSI l2h_th_ini_ad -14+50=36, JP l2h_th_ini_cs 10+50=60, else normal; normal l2h=max(igi+8,48) h2l=l2h-8, adaptivity l2h=min(igi,ini) h2l=l2h-7; rtw8822b_edcca_th 8a4 byte0 l2h byte1 h2l offset0; base 8a4[15:0] (rtw8822b_adaptivity_init 7f/7f) restored";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     bounds(did, p).is_some()
@@ -475,18 +475,28 @@ pub(super) enum EdccaMode {
     /// ETSI/JP adaptivity with the chip `l2h_th_ini_{ad,cs}`.
     Adaptivity(i16),
 }
-/// `phy.c::rtw_phy_adaptivity_set_mode` from the regulatory DFS region.
-/// The country→DFS region mapping follows wireless-regdb `DFS-ETSI`/`DFS-JP`.
+/// `phy.c::rtw_phy_adaptivity_set_mode` from the regulatory DFS region with
+/// the RTL8822C `l2h_th_ini_{cs,ad}` (60/45).
 pub(super) fn edcca_mode(country: [u8; 2]) -> EdccaMode {
+    edcca_mode_with(country, 60, 45)
+}
+/// RTL8822B `rtw8822b_hw_spec` `l2h_th_ini_cs` = 10 + `EDCCA_IGI_BASE` and
+/// `l2h_th_ini_ad` = -14 + `EDCCA_IGI_BASE` (50).
+pub(super) fn edcca_mode8822b(country: [u8; 2]) -> EdccaMode {
+    edcca_mode_with(country, 10 + 50, -14 + 50)
+}
+/// The country→DFS region mapping follows wireless-regdb `DFS-ETSI`/`DFS-JP`:
+/// ETSI takes `l2h_th_ini_ad`, JP `l2h_th_ini_cs`, others normal EDCCA.
+fn edcca_mode_with(country: [u8; 2], cs: i16, ad: i16) -> EdccaMode {
     const ETSI: &[[u8; 2]] = &[
         *b"AT", *b"BE", *b"BG", *b"CH", *b"CY", *b"CZ", *b"DE", *b"DK", *b"EE", *b"ES", *b"FI",
         *b"FR", *b"GB", *b"GR", *b"HR", *b"HU", *b"IE", *b"IS", *b"IT", *b"LI", *b"LT", *b"LU",
         *b"LV", *b"MT", *b"NL", *b"NO", *b"PL", *b"PT", *b"RO", *b"SE", *b"SI", *b"SK",
     ];
     if country == *b"JP" {
-        EdccaMode::Adaptivity(60)
+        EdccaMode::Adaptivity(cs)
     } else if ETSI.contains(&country) {
-        EdccaMode::Adaptivity(45)
+        EdccaMode::Adaptivity(ad)
     } else {
         EdccaMode::Normal
     }
@@ -727,6 +737,8 @@ impl Tracker {
             self.base_igi = self.igi_history[0];
             if c22 {
                 self.base_edcca = Self::read(io, 0x84c).await? & 0xffff_0000;
+            } else if self.facts.b22() {
+                self.base_edcca = Self::read(io, 0x8a4).await? & 0xffff;
             }
             if self.facts.b22() && self.bounds.enabled & PWR_TRACK != 0 {
                 // rtw8822b_pwrtrack_init over the retained base program.
@@ -1166,6 +1178,30 @@ impl Tracker {
         Self::mask(io, 0x84c, 0xff00_0000, byte(h2l)).await
     }
 
+    /// `rtw8822b_adaptivity`: normal `max(igi + 8, 48)`/`- 8`, adaptivity
+    /// `min(igi, l2h_th_ini)`/`- 7`, through `rtw_phy_set_edcca_th` over
+    /// `rtw8822b_edcca_th` (0x8a4 byte0 L2H, byte1 H2L, offset 0).
+    pub(super) fn edcca8822b(igi: u8, mode: EdccaMode) -> (u8, u8) {
+        let igi = i16::from(igi);
+        let (l2h, h2l) = match mode {
+            EdccaMode::Normal => {
+                let l2h = (igi + EDCCA_IGI_L2H_DIFF).max(EDCCA_TH_L2H_LB);
+                (l2h, l2h - EDCCA_L2H_H2L_DIFF_NORMAL)
+            }
+            EdccaMode::Adaptivity(ini) => {
+                let l2h = igi.min(ini);
+                (l2h, l2h - EDCCA_L2H_H2L_DIFF)
+            }
+        };
+        // `s8` arguments to `u8 l2h, u8 h2l`.
+        (l2h as i8 as u8, h2l as i8 as u8)
+    }
+    async fn adaptivity8822b(&self, io: &mut impl Io, mode: EdccaMode) -> Result<(), Error> {
+        let (l2h, h2l) = Self::edcca8822b(self.igi_history[0], mode);
+        Self::mask(io, 0x8a4, 0xff, u32::from(l2h)).await?;
+        Self::mask(io, 0x8a4, 0xff00, u32::from(h2l)).await
+    }
+
     fn swing(&self, path: usize) -> (&'static [u8; 30], &'static [u8; 30]) {
         if self.tx_rate <= 3 {
             if path == 0 {
@@ -1360,6 +1396,9 @@ impl Tracker {
             if c22 && self.on(EDCCA) {
                 Self::mask(io, 0x84c, 0xffff_0000, self.base_edcca >> 16).await?;
             }
+            if self.facts.b22() && self.on(EDCCA) {
+                Self::mask(io, 0x8a4, 0xffff, self.base_edcca).await?;
+            }
             if c22 && self.on(CFO) {
                 self.set_crystal(io, self.facts.crystal).await?;
             }
@@ -1544,6 +1583,14 @@ impl Tracker {
             crate::rtw88::firmware_transport::enclosed(
                 |op| auth.run(op),
                 self.adaptivity(io, mode),
+            )
+            .await?;
+        }
+        if self.facts.b22() && self.on(EDCCA) {
+            let mode = edcca_mode8822b(period.country);
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                self.adaptivity8822b(io, mode),
             )
             .await?;
         }

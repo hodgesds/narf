@@ -576,10 +576,17 @@ continuation contracts and the dm watchdog" below) as
 are exactly those `rtw8822b.c` implements and this tree ports: DIG
 (`rtw8822b_dig` 0xc50/0xe50[6:0] both paths, `dig_min` 0x1c) over
 `rtw8822b_false_alarm_statistics` (register-identical to the 8821C one) and
-RA (H2C 0x42/0x58/0x40, RRSR) and `rtw8822b_pwr_track` (bit 5, below).
-8822B has no `cck_pd_set`, tx-path-diversity, CFO or DPK hooks, so those
-bits refuse; `rtw8822b_adaptivity` EDCCA is not yet admitted (bit 6
-refuses). RSSI follows `rtw8822b.c::
+RA (H2C 0x42/0x58/0x40, RRSR), `rtw8822b_pwr_track` (bit 5, below) and
+`rtw8822b_adaptivity` EDCCA (bit 6): `rtw_phy_adaptivity_set_mode` with the
+8822B `l2h_th_ini_ad` −14 + 50 = 36 (ETSI) and `l2h_th_ini_cs` 10 + 50 = 60
+(JP) (`dm::edcca_mode8822b`), normal `l2h = max(igi + 8, 48)`, `h2l = l2h −
+8`, adaptivity `l2h = min(igi, l2h_th_ini)`, `h2l = l2h − 7`, written by
+`rtw_phy_set_edcca_th` over `rtw8822b_edcca_th` (0x8a4 byte0/byte1, offset
+0); dm init captures 0x8a4[15:0] (the `rtw8822b_adaptivity_init` 0x7f/0x7f)
+and restore writes it back. The MAC EDCCA state of
+`rtw8822b_adaptivity_init` is already part of the PHY tail. 8822B has no
+`cck_pd_set`, tx-path-diversity, CFO or DPK hooks, so those bits refuse.
+Case written, unexecuted: `smoke_rtw8822be_edcca_adaptivity_follows_rtw8822b`. RSSI follows `rtw8822b.c::
 query_phy_status_page0` (PWDB word0[15:8] − 110, path A) and `_page1`
 (PWDB A/B word0[15:8]/[23:16] − 110, two-path `rtw_phy_rf_power_2_rssi`).
 `Lifecycle::prepare_station8822b` records the dm facts (RFE, crystal,

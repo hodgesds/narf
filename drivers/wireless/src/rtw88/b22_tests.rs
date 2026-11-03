@@ -1013,7 +1013,7 @@ fn smoke_rtw8822be_n2bd_dm_admission_and_phy_status() -> TestResult {
     if dm::bounds(0xb822, &payload(dm::DIG | dm::RA)).is_none()
         || dm::bounds(0xb822, &payload(dm::DIG | dm::CCK_PD)).is_some()
         || dm::bounds(0xb822, &payload(dm::PWR_TRACK)).is_none()
-        || dm::bounds(0xb822, &payload(dm::EDCCA)).is_some()
+        || dm::bounds(0xb822, &payload(dm::EDCCA)).is_none()
         || dm::bounds(0xb822, &payload(dm::PATH_DIV)).is_some()
     {
         return TestResult::Fail("8822B N2BD mechanism set differs from rtw8822b ops");
@@ -1158,4 +1158,35 @@ fn smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission
+);
+
+/// `rtw8822b_adaptivity` thresholds: `rtw_phy_adaptivity_set_mode` with the
+/// 8822B `l2h_th_ini_{cs,ad}` (60/36) and the normal/adaptivity formulas.
+/// Written; not yet executed natively.
+fn smoke_rtw8822be_edcca_adaptivity_follows_rtw8822b() -> TestResult {
+    use super::super::dm::{edcca_mode, edcca_mode8822b, EdccaMode, Tracker};
+    if edcca_mode8822b(*b"DE") != EdccaMode::Adaptivity(36)
+        || edcca_mode8822b(*b"JP") != EdccaMode::Adaptivity(60)
+        || edcca_mode8822b(*b"US") != EdccaMode::Normal
+        || edcca_mode(*b"DE") != EdccaMode::Adaptivity(45)
+    {
+        return TestResult::Fail("8822B EDCCA mode differs from rtw_phy_adaptivity_set_mode");
+    }
+    let cases = [
+        ((0x20u8, EdccaMode::Normal), (48u8, 40u8)),
+        ((0x40, EdccaMode::Normal), (0x48, 0x40)),
+        ((0x20, EdccaMode::Adaptivity(36)), (0x20, 0x19)),
+        ((0x30, EdccaMode::Adaptivity(36)), (36, 29)),
+        ((0x40, EdccaMode::Adaptivity(60)), (60, 53)),
+    ];
+    for ((igi, mode), expected) in cases {
+        if Tracker::edcca8822b(igi, mode) != expected {
+            return TestResult::Fail("8822B EDCCA thresholds differ from rtw8822b_adaptivity");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_edcca_adaptivity_follows_rtw8822b
 );
