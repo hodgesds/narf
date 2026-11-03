@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.52** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.53** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -39,9 +39,10 @@
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
 > VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
 > queries and the media-GuC HuC, GT0's L3 bank topology entry,
-> shared-GGTT GuC TLB invalidation on both GTs, display-14 PSR on hardware inputs, and MTL external outputs
-> on Pipes B–D beside the lit panel pass release native model gates —
-> see §20).
+> shared-GGTT GuC TLB invalidation on both GTs, display-14 PSR on
+> hardware inputs, and MTL external outputs on Pipes B–D beside the lit
+> panel with the panel's KMS, PSR and FBC services pass release native
+> model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -5000,7 +5001,8 @@ publishes the same value. PSR therefore enables beside a lit external.
 **Pipes B–D crtc registers.** `Pipes::program_timings` now follows
 `hsw_crtc_enable` for display 14, with the pipe off:
 
-- `PIPE_MISC` = `BPC_8 | PIXEL_ROUNDING_TRUNC` after the source size;
+- `PIPE_MISC` = `BPC_8 | PIXEL_ROUNDING_TRUNC | HDR_MODE_PRECISION` after
+  the source size (`is_hdr_mode` holds with only the primary active);
 - then `TRANS_SET_CONTEXT_LATENCY` 0 and `TRANS_VSYNCSHIFT` 0, the timings,
   `TRANS_VRR_CTL` 0 without VRR, `TRANS_MULT` 0, the display-14
   `CHICKEN_TRANS` frame-start delay field 0, and `TRANSCONF` configured
@@ -5062,3 +5064,41 @@ Changed fixtures:
 
 The KMS mock gained a register-read tick for synchronous waiters, and the
 PSR KMS fixture helpers are shared with the new module.
+
+Integration: all eight release groups pass 2,142 tests with no failures and no
+Intel skips; the only skip is the existing shared RNG-registration skip. The
+integration made two follow-up changes, plus a Clippy fix that gates the KMS
+mock's x86_64-only read tick on aarch64.
+
+The first is a regression fixture. No J3 fixture drove the runtime wrapper
+itself; the multi-pipe smokes call `external_pass` directly. The wrapper's
+owner hold is now `crate::intel_gpu::mtl_runtime_pass`, which is generic
+over the KMS platform and called by `service_mtl_external_for_bar`.
+`smoke_kms_mtl_runtime_pass_leaves_the_panel_owner_open` (in
+`drivers/gpu/intel_gpu_kms`) runs passes with and without an event through
+it, beside a lit external, and then requires the panel's session and cursor.
+With the old `legacy_drain` body restored in the helper, it fails with "the
+runtime pass left the panel's KMS owner blocked". The regression it pins came
+in with the MTL runtime wiring (dd1242b9b).
+
+The second sets `PIPE_MISC_HDR_MODE_PRECISION`. `bdw_set_pipe_misc` sets
+bit 23 on display 11 and later whenever `is_hdr_mode` holds, which is
+always true for a primary-only Pipe B–D. The Pipe A paths (MTL owned modeset
+and Gen12) never write `PIPE_MISC` and are unchanged.
+
+Review against Linux b90c984d agreed on the following:
+- The crtc order follows `hsw_crtc_enable` and
+  `hsw_configure_cpu_transcoder`. `intel_enable_transcoder` sets the display-14
+  `CHICKEN_TRANS` bits: `DP_FEC_BS_JITTER_WA` on and
+  `DP_DSC_INSERT_SF_AT_EOL_WA` off.
+- `skl_linetime_wm` is `DIV_ROUND_UP(htotal * 8000, pixel_rate)`, capped at
+  0x1ff.
+- WA #1198 waits a vblank only when FBC was active (`fbc->activated`).
+- The all-off settle runs in Linux's post-plane order: DBUF to S1, then CDCLK
+  to `bxt_calc_cdclk(0)`, then the no-pipe PM demand, as
+  `intel_dbuf_post_plane_update`, `intel_set_cdclk_post_plane_update` and
+  `intel_pmdemand_post_plane_update` run.
+- Deliberate divergence: FBC is always deactivated around a repartition.
+  Linux keeps it when `intel_fbc_can_flip_nuke` allows.
+
+The debug group pass is deferred to the end of the current integration wave.

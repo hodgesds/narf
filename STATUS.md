@@ -2242,6 +2242,50 @@ existing shared RNG-registration skip. The release production boot and both
 btrfs postflights also pass. The debug group pass is deferred to the end of
 this integration wave. None of this has run on physical Intel hardware.
 
+### Panel KMS, PSR and FBC beside a lit MTL external — release gates recorded
+
+This unit closes the follow-ups left by the Pipes B–D join (listed in the
+external-outputs entry above):
+- With an external monitor lit, KMS flips, the cursor and color on the laptop
+  panel now work. Each proves the panel's share of the multi-pipe layout.
+- PSR enables beside a lit external.
+- The external pass brackets the panel's FBC and PSR around each
+  repartition, as Linux's pre- and post-plane updates do. FBC is always
+  deactivated for the repartition, and an in-flight panel DSB stream is retired
+  first.
+- Pipes B–D are now programmed with the crtc registers Linux sets:
+  - PIPE_MISC;
+  - set-context latency, vsync shift, VRR and MULT;
+  - the frame-start delay;
+  - the line-time watermark;
+  - the pipe chicken bits;
+  - the FEC-jitter and DSC-EOL workaround bits.
+- Releasing the last external pipe with no lit panel now lowers DBUF to S1,
+  CDCLK to 172.8 MHz and PM demand to the no-pipe request. If that fails
+  partway, the original demand is re-requested.
+
+**Fixed regression.** Since the MTL external route was wired into the display
+runtime, the runtime actor's MTL pass took the panel's KMS owner through
+`legacy_drain()` on every iteration. That disabled PSR and FBC and blocked the
+owner for good. From the first runtime iteration, every KMS session on Meteor
+Lake failed with NoDevice, whether or not a monitor was attached. Probe-time
+MTL hotplug events also suspended the owner. The pass now holds the owner
+without blocking it. No fixture had driven the runtime wrapper. Integration
+moved its owner hold into a helper that production calls, and added a
+regression fixture that drives it. With the old `legacy_drain` body restored,
+the fixture fails.
+
+Integration also sets PIPE_MISC's HDR mode precision bit on Pipes B–D, as
+Linux does for a primary-only pipe. Pipe A never writes PIPE_MISC, so Gen12
+and the panel path are unchanged. One deliberate difference from Linux
+remains: FBC is always deactivated around a repartition, even where Linux
+could keep it.
+
+All eight release groups pass 2,142 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
