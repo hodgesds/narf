@@ -2713,6 +2713,7 @@ dependencies = [
  "narf-bpf-idle",
  "narf-bpf-leds",
  "narf-bus",
+ "narf-capabilities",
  "narf-console",
  "narf-crypto",
  "narf-drivers",

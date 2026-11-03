@@ -104,6 +104,8 @@ impl TaskHandle {
 /// scheduling-relevant slice of `TaskSpec` plus the slot's `id`.
 #[derive(Copy, Clone, Debug)]
 pub struct TaskMeta {
+    /// Stable RT FIFO position, retained across involuntary preemption.
+    pub rt_order: i64,
     pub wake_reason: Option<WakeReason>,
     pub id: TaskId,
     /// What kind of execution this slot represents. The core copies this from
@@ -157,6 +159,7 @@ impl TaskMeta {
     /// which is more consistent than staggering it across the walk.
     pub(crate) fn from_slot_at(slot: &crate::TaskSlot, now: u64) -> Self {
         Self {
+            rt_order: crate::user_policy::order(slot),
             wake_reason: slot
                 .awake
                 .blocking_wake
@@ -169,7 +172,7 @@ impl TaskMeta {
             deadline_cycles: slot.spec.budget.deadline_cycles,
             budget: slot.spec.budget,
             account: slot.account,
-            budget_state: slot.account.view(now, &slot.spec.budget),
+            budget_state: crate::user_policy::budget_view(slot, now),
             runnable: slot.awake.executor_runnable(),
             affinity: slot.spec.affinity,
             addr_space: slot.addr_space.is_some(),
@@ -434,7 +437,7 @@ impl<'a> RunQueue<'a> {
             handle: TaskHandle::from_id(slot.id),
             class: slot.spec.class,
             priority: slot.spec.priority,
-            eligibility: slot.account.view(now, &slot.spec.budget).eligibility,
+            eligibility: crate::user_policy::budget_view(slot, now).eligibility,
             runnable: slot.awake.executor_runnable(),
             addr_space: slot.addr_space.is_some(),
             vruntime: slot.vruntime,
@@ -806,7 +809,8 @@ impl Scheduler for ClassScheduler {
                         match (meta.deadline_cycles, current.deadline_cycles) {
                             (Some(candidate), Some(incumbent)) => candidate < incumbent,
                             (Some(_), None) => true,
-                            _ => false,
+                            (None, Some(_)) => false,
+                            _ => meta.rt_order < current.rt_order,
                         }
                     } else {
                         false
@@ -1427,10 +1431,13 @@ pub(crate) fn pick_next_slot(
     cpu: CpuId,
     q: &mut VecDeque<crate::TaskSlot>,
 ) -> Option<(TaskHandle, crate::TaskSlot)> {
+    crate::user_policy::refresh_queue(cpu.0 as usize, q);
     // Fuse the built-in class policy into the mandatory validation scan below.
     // External policies remain untrusted and still run their pick followed by
     // the core pass that enforces work conservation and budget eligibility.
     let builtin_class = scheduler.is_some_and(|s| s.type_id() == TypeId::of::<ClassScheduler>());
+    let enforce_rt =
+        crate::has_higher_possible_class(cpu.0 as usize, SchedClass::Interactive.rank());
     let builtin_fifo = scheduler.is_some_and(|s| s.type_id() == TypeId::of::<FifoScheduler>());
     let urgent_id = crate::take_urgent_next(cpu.0);
 
@@ -1447,7 +1454,7 @@ pub(crate) fn pick_next_slot(
     // External schedulers still receive their normal pick callback and use the
     // mandatory validation scan below. Periodic-budget tasks also stay on that
     // path so strict throttle/borrow eligibility remains authoritative.
-    if urgent_id != 0 && (builtin_class || builtin_fifo || scheduler.is_none()) {
+    if urgent_id != 0 && !enforce_rt && (builtin_class || builtin_fifo || scheduler.is_none()) {
         let urgent_pos = q.iter().rposition(|slot| {
             slot.id.raw() == urgent_id
                 && slot.spec.budget.period.is_none()
@@ -1537,12 +1544,16 @@ pub(crate) fn pick_next_slot(
         if !awake {
             return 0u8;
         }
-        let eligibility = match slot.spec.budget.period {
-            None => BudgetEligibility::Eligible,
-            Some(_) => {
-                let timestamp = *now.get_or_insert_with(narf_time::now_cycles);
-                slot.account.view(timestamp, &slot.spec.budget).eligibility
-            }
+        let eligibility = if slot.spec.budget.period.is_none()
+            && slot
+                .user_scheduling
+                .as_ref()
+                .is_none_or(|u| !u.control.is_realtime())
+        {
+            BudgetEligibility::Eligible
+        } else {
+            let timestamp = *now.get_or_insert_with(narf_time::now_cycles);
+            crate::user_policy::budget_view(slot, timestamp).eligibility
         };
         match eligibility {
             BudgetEligibility::Eligible => 2,
@@ -1568,7 +1579,7 @@ pub(crate) fn pick_next_slot(
     let mut wake_next_hit: Option<(usize, u8)> = None;
     let mut wake_request_hit: Option<(usize, u8)> = None;
     let mut dispatchable_count = 0usize;
-    let mut class_pick: Option<(usize, u8, SchedClass, Priority, Option<u64>)> = None;
+    let mut class_pick: Option<(usize, u8, SchedClass, Priority, Option<u64>, i64)> = None;
     // Clear before scanning. A wake that races after this store raises the
     // hint and is never overwritten; a wake that completed before the store
     // has already made its slot awake and is counted by the scan below.
@@ -1595,17 +1606,25 @@ pub(crate) fn pick_next_slot(
         if wake_next_id != 0 && wake_next_id == slot.id.raw() {
             wake_next_hit = Some((index, tier));
         }
-        if builtin_class && tier != 0 {
+        if (builtin_class || enforce_rt) && tier != 0 {
             let candidate = (
                 index,
                 tier,
                 slot.spec.class,
                 slot.spec.priority,
                 slot.spec.budget.deadline_cycles,
+                crate::user_policy::order(slot),
             );
             let replace = match class_pick {
                 None => true,
-                Some((_, current_tier, current_class, current_priority, current_deadline)) => {
+                Some((
+                    _,
+                    current_tier,
+                    current_class,
+                    current_priority,
+                    current_deadline,
+                    current_order,
+                )) => {
                     if tier != current_tier {
                         tier > current_tier
                     } else if slot.spec.class.rank() != current_class.rank() {
@@ -1616,7 +1635,8 @@ pub(crate) fn pick_next_slot(
                         match (slot.spec.budget.deadline_cycles, current_deadline) {
                             (Some(candidate), Some(incumbent)) => candidate < incumbent,
                             (Some(_), None) => true,
-                            _ => false,
+                            (None, Some(_)) => false,
+                            _ => crate::user_policy::order(slot) < current_order,
                         }
                     } else {
                         false
@@ -1628,7 +1648,9 @@ pub(crate) fn pick_next_slot(
             }
         }
     }
-    if let Some((index, tier, ..)) = class_pick {
+    if let Some((index, tier, ..)) =
+        class_pick.filter(|(_, _, class, ..)| builtin_class || *class == SchedClass::Realtime)
+    {
         requested_hit = Some((index, tier));
     }
     if dispatchable_count > 1 {
@@ -1661,12 +1683,15 @@ pub(crate) fn pick_next_slot(
     //   2. the policy's requested pick,
     //   3. the earliest top-tier slot (the default FIFO order).
     let wake_next_class_ok = |wake_pos: usize| {
-        !builtin_class
-            || class_pick.is_some_and(|(_, _, class, priority, deadline)| {
+        !(builtin_class
+            || class_pick.is_some_and(|(_, _, class, ..)| class == SchedClass::Realtime))
+            || class_pick.is_some_and(|(_, _, class, priority, deadline, order)| {
                 let wake = &q[wake_pos].spec;
                 wake.class == class
                     && wake.priority == priority
-                    && (class != SchedClass::Realtime || wake.budget.deadline_cycles == deadline)
+                    && (class != SchedClass::Realtime
+                        || (wake.budget.deadline_cycles == deadline
+                            && crate::user_policy::order(&q[wake_pos]) == order))
             })
     };
     let preferred =

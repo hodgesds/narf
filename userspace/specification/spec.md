@@ -1081,25 +1081,28 @@ security boundary.
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
 calling task's accumulated user and kernel accounting.
 The scheduling-policy syscalls (`sched_setscheduler`, `sched_setparam`,
-`sched_setattr`, their getters, and `sched_rr_get_interval`) keep a per-task
-policy record (policy, RT priority, `reset_on_fork`, `SCHED_DEADLINE`
-reservation, fair-class custom slice) and validate against it in the order of
-Linux's `__sched_setscheduler`, returning Linux's errnos: `EINVAL` for bad
-arguments, policies, priority/policy disagreement and failed
-`__checkparam_dl`; `ESRCH` for a pid naming no task; `EFAULT` for faulting
-buffers; `EPERM` from `user_check_sched_setscheduler` (RLIMIT_RTPRIO,
-RLIMIT_NICE, leaving `SCHED_IDLE`, clearing `reset_on_fork`, any
-`SCHED_DEADLINE` request, another user's task — all overridable only by host
-`CAP_SYS_NICE`); `EBUSY` from deadline bandwidth admission (default 95% per
-online CPU) and from narrowing a deadline task's affinity; `EOPNOTSUPP` for
-util-clamp requests (no uclamp support; `sched_attr` is published at VER0).
-`SCHED_EXT` is recognised by the priority-range queries but is not a settable
-policy. `sched_setattr` writes a fair task's nice through to the value
-`getpriority` reports. `RLIMIT_RTPRIO` defaults to `{0, 0}`. `fork`/`clone`
-inherit policy, RT priority and nice, apply `SCHED_RESET_ON_FORK`, and fail
-with `EAGAIN` from a `SCHED_DEADLINE` task without it. The record is ABI
-state only: the cooperative scheduler does not grant Linux real-time or
-deadline scheduling authority from it.
+`sched_setattr`, getters and `sched_rr_get_interval`) publish accepted policy,
+nice, RT priority and custom fair slice to the live scheduler before committing
+the ABI record. Credential and rlimit validation retains Linux error ordering:
+`EINVAL` for invalid arguments, `ESRCH` for absent tasks, `EFAULT` for bad
+buffers, and `EPERM` for denied ownership, `CAP_SYS_NICE`, `RLIMIT_RTPRIO` or
+`RLIMIT_NICE` checks. `RLIMIT_RTPRIO` defaults to `{0, 0}`. FIFO and RR use
+priorities 1..99; RR reports and enforces a 100 ms CPU quantum. Normal, batch
+and idle policies and nice changes also affect dispatch. The scheduler core
+owns queue position, safe preemption and shared bounded RT runtime; boot
+explicitly delegates existing CPU-budget capabilities to this service.
+Fork/clone inherit actual policy, authority and explicit affinity requests
+before making the child runnable; native bootstrap placement pins remain local.
+`SCHED_RESET_ON_FORK` resets policy, negative nice and custom slice as required.
+Exec retains scheduling state; exit releases its control. `RLIMIT_RTTIME` counts
+RT CPU service in microseconds since actual blocking, sends `SIGXCPU` at its
+soft limit (re-armed every second), and `SIGKILL` at its hard limit. Preemption
+and `sched_yield` do not reset the watchdog. Limits remain process-shared and
+service accounting thread-local.
+Valid privileged `SCHED_DEADLINE` requests return `EOPNOTSUPP` after parameter,
+credential and bandwidth validation: EDF/CBS execution is not implemented.
+Util-clamp also returns `EOPNOTSUPP`; `sched_attr` remains VER0. `SCHED_EXT` is
+recognised by priority-range queries and rejected as a settable policy.
 `ioprio_set(2)` rejects undefined classes and `IOPRIO_CLASS_NONE` with a
 level (`EINVAL`), and applies `set_task_ioprio`'s owner check (`EPERM`).
 `sched_yield(2)` returns success and then uses the common completed-syscall

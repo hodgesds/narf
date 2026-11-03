@@ -23,6 +23,7 @@ narf-console       = { path = "../console" }
 narf-crypto        = { path = "../crypto" }
 narf-time          = { path = "../time" }
 narf-scheduler     = { path = "../scheduler" }
+narf-capabilities  = { path = "../capabilities" }
 narf-interrupts    = { path = "../interrupts" }
 narf-bus           = { path = "../bus" }
 narf-event-bus     = { path = "../event_bus" }

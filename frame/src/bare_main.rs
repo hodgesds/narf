@@ -2711,6 +2711,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // bring-up — APs jump straight into the scheduler
                 // run loop and need their own queue ready.
                 narf_scheduler::init();
+                // Explicit boot delegation: Linux RT syscalls spend these
+                // bounded per-CPU grants; they never mint runtime authority.
+                let rt_budgets = core::array::from_fn(|_| {
+                    narf_capabilities::Cap::<narf_scheduler::CpuBudget, narf_capabilities::Spend>::bootstrap()
+                });
+                narf_userspace::handlers::install_user_scheduling_authority(alloc::sync::Arc::new(
+                    narf_scheduler::UserSchedulingAuthority::new(rt_budgets),
+                ));
 
                 // AP bring-up via INIT-SIPI-SIPI. Trampoline lands at
                 // phys 0x8000; APs enter `_ap_start_rust` after the
@@ -3083,6 +3091,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // bring-up — APs jump straight into the scheduler
                 // run loop and need their own queue ready.
                 narf_scheduler::init();
+                // Explicit boot delegation: Linux RT syscalls spend these
+                // bounded per-CPU grants; they never mint runtime authority.
+                let rt_budgets = core::array::from_fn(|_| {
+                    narf_capabilities::Cap::<narf_scheduler::CpuBudget, narf_capabilities::Spend>::bootstrap()
+                });
+                narf_userspace::handlers::install_user_scheduling_authority(alloc::sync::Arc::new(
+                    narf_scheduler::UserSchedulingAuthority::new(rt_budgets),
+                ));
 
                 // AP bring-up via PSCI CPU_ON. Each AP runs through
                 // smp_entry.S → _ap_start_rust which marks itself

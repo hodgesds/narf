@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "d2aecedd6fab203ceee2504006b71d7b678527dc3d441a730886e1a83c8377d0"
+prompt_hash = "d554969454a9819ebee3c17ea775569922d36154e527e200d6468081c3823fce"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -2117,3 +2117,22 @@ argument = "The blocking-I/O waker aliases a WakeCell only after checking the na
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Kernel-mode timer handling propagates an existing core reschedule request into the current own-stack user's sticky syscall-exit bit, consuming the core request after publication. It does not switch from an unaudited kernel frame. Existing no_preempt, preempt-disable, frame bounds, address-space, TLS, FPU/SIMD and saved PKRS/TCF switch paths remain in force. Runtime events use copied handles and an already-computed cycle span under the current CPU policy lock without a READY lock; callbacks must tolerate policy replacement and may not allocate or re-enter scheduling."
+
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Live Linux user scheduling remains within the existing scheduler/frame TCB. Trusted BSP boot explicitly delegates existing per-CPU CpuBudget/Spend grants. Linux policy setters validate credentials/rlimits and check these grants; they never bootstrap authority. Fork copies an existing parent grant including its revocation state. Native admission reservations remain intact, and the shared Linux RT pool subtracts their reserved CPU utilization from its 95% ceiling. No domain, mapping, user pointer, or new TCB member is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "User policy updates publish copied configuration with generation tracking, without borrowing a live continuation or taking a READY lock. The owner applies it at executor boundaries; pending generations exclude direct handoff. Every dispatch retains affinity, liveness and budget-cap checks. Stable FIFO order and RR CPU credit survive involuntary switches; actual blocking, yield and expiry are distinguished. Shared CPU accounts survive task churn and carry overshoot debt. RT IRQ preemption uses existing switch paths only after EOI and accounting; CPL0 user work is deferred to completed syscall exit. Existing own-stack bounds, preempt-disable, PKRS/TCF, address-space and FP/TLS restore mechanisms remain authoritative. Two maintainer reviews including security and the repository security-review pass remain required before merge; this argument does not claim that review occurred."
+
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Linux policy changes retain the task's original CpuBudget capability as an independent revocation gate and retain its native ResourceBudget/account. RT promotion adds the delegated CPU grant; demotion restores the original cap. Both grants are checked at dispatch and indexed parked maintenance, and abnormal reaping uses the existing userspace exit/observer hook. RT nice changes, same-priority FIFO/RR changes and authority replacement preserve the current FIFO turn; a snapshot reads desired configuration and its generation under one lock. ARM IRQ return invokes the existing signal-delivery hook after EOI/accounting so syscall-free RT loops cannot evade watchdog termination; guarded signal-frame copying and saved domain/FP state remain owned by the existing hook."
+
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Affinity inheritance distinguishes explicit runtime masks from native per-task bootstrap placement. Existing BSP-pinned init/getty/shell tasks retain their execution constraints; their workload children retain the existing SMP default unless a mask was explicitly requested. Requests and inherited descendants carry that marker in the existing affinity registry and prepared user control before runnable publication. Registry locking/generation, online/cgroup intersection and dispatch/migration mask checks remain authoritative. This avoids serializing every workload on the BSP while preserving explicit Linux pinning through fork/clone generations."

@@ -142,7 +142,7 @@ minimum vruntime dispatched, so a long sleeper's credit can be clamped to one
 base slice (Linux `place_entity()`'s lag clamp) and cross-CPU origin skew after a
 steal can be renormalized in core (policy never writes slots).
 
-## 5. EEVDF-lite (the default policy) and its Linux lineage
+## 5. EEVDF-lite and its Linux lineage
 `EevdfScheduler` mirrors Linux EEVDF (`kernel/sched/fair.c`) with equal weights:
 
 - **Virtual deadline** `d = v_eff + BASE_SLICE`, where
@@ -191,3 +191,15 @@ zero-accounting reference and for A/B measurement.
    pipelining is the canonical de-batch canary (a prior wake-next buddy dispatch
    was reverted, #235, for exactly this).
 5. Land behind a flag/selectable first; flip the default only after the A/B.
+
+
+## Live user FIFO/RR policies
+
+The boot default is `ClassScheduler`. Linux policy setters publish core-owned
+user configuration after credential checks. FIFO/RR outrank ordinary work and
+retain a stable `TaskMeta::rt_order`; the core also validates this RT contract
+for external policies. An equal-priority wake cannot jump an older FIFO turn.
+Actual wake/yield and RR exhaustion rotate; involuntary preemption retains the
+turn and RR credit. Shared per-CPU RT budget eligibility is authoritative for
+all policies and cannot be replenished by queue events or callback selection.
+See scheduler `spec.md` §3 for authority, inheritance and migration contracts.

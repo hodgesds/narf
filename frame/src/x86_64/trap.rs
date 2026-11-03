@@ -1331,6 +1331,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 #[cfg(feature = "stall-watchdog")]
                 stall_wd::stage(4);
             }
+            // RT CPU limits also count ticks in a user syscall. Signal
+            // delivery remains at the safe return-to-user boundary.
+            narf_userspace::handlers::realtime_watchdog_tick();
             // (a) Raise any timer-driven signal whose deadline has passed
             // for the currently-running task (e.g. SIGALRM from
             // alarm()/setitimer(ITIMER_REAL)). A CPU-bound task never
@@ -1381,7 +1384,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // when it preempts; the task resumes later via
         // enter_user_mode_resume. It's a no-op (returns) when no polling
         // executor is wired (kernel-test contexts).
-        if is_tick && (frame.cs & 3) == 3 {
+        if (is_tick || narf_scheduler::stackful::realtime_irq_pending()) && (frame.cs & 3) == 3 {
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // Per-task-own-stack model: the user task ran on its own kernel
                 // stack, so this timer trap's frame is on that stack — preempt
