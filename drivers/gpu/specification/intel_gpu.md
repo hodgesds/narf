@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.44** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.45** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -36,7 +36,8 @@
 > transactions with live repartitioning and SAGV, and MTL external
 > DP/HDMI outputs with Type-C ownership, owned hotplug, DC_off join,
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
-> KMS ownership and pipe DMC pass release native model gates — see §20).
+> KMS ownership and pipe DMC, and the default-off MTL media GuC pass
+> release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3395,19 +3396,20 @@ media GMD_ID samples reporting 13.00. Version 0 is reported as an absent
 register. The owner then takes the media GT forcewake domain
 (FORCEWAKE_GT/FORCEWAKE_ACK_GT_MTL), re-reads GMD_ID under wake, derives the
 present VCS0-7/VECS0-3 set from GT_VEBOX_VDBOX_DISABLE with positive polarity
-(GSCCS0 stays absent without loaded GSC firmware), resets the media GuC with a
-GS_MIA_IN_RESET proof, and performs a full media GT reset bracketed by
-Wa_14015076503 when GSC firmware reports loaded. With every present VDBOX/VEBOX
-domain awake it programs the xelpg PAT through the media steering semaphore and
-multicast selector, media 13.00 GT workarounds 22016670082 and per-VDBOX
-16021867713, and the shared `mtl_mocs_desc` global/LNCF tables. It finally
-releases every wake request it made and reports the identity, fuse word and
-engine set.
+(GSCCS0 stays absent without loaded GSC firmware). With every present
+VDBOX/VEBOX domain awake it programs the xelpg PAT through the media steering
+semaphore and multicast selector, media 13.00 GT workarounds 22016670082 and
+per-VDBOX 16021867713, and the shared `mtl_mocs_desc` global/LNCF tables. It
+then resets only the media GuC with a GS_MIA_IN_RESET proof, releases every wake
+request it made and reports the identity, fuse word and engine set.
 
-The full media GT reset follows NARF's GT0 sanitize policy: retire the
-inherited GuC, then reset the GT before programming cache policy. Linux xe's
-probe never full-resets the media GT. It reaches `do_gt_reset` and
-Wa_14015076503 only through GT reset recovery and shutdown.
+Reset policy (since the default-off gate below): probe performs no GT reset,
+as Linux media-GT probe does (`xe_uc_sanitize_reset` after PAT, workaround and
+MOCS setup). The full GRDOM_FULL reset bracketed by Wa_14015076503 runs only in
+the recovery owner (`MediaGt::for_recovery`), once per GT0 incarnation after a
+faulted media GuC has proven its stop. This mirrors `gt_reset_worker`, which
+runs `do_gt_reset` and then `do_gt_restart`. The whole path stays off unless
+`narf.intel.media_gt=1` is given.
 
 Inherited media wake requests or an in-flight GDRST refuse as busy; stale sleep
 acknowledgements from an earlier incarnation are settled within the source's
@@ -3498,8 +3500,7 @@ Four further fixtures register under `intel_gpu_media_gt`:
 - The real shared arena over a RAM-backed BAR, with and without a registered
   media GuC.
 
-They are registered but were not run, and they are not physical Intel
-evidence.
+They are native models, not physical Intel evidence.
 
 #### Default-off gate and media-GT reset policy
 
@@ -3527,6 +3528,14 @@ covers the grammar and its parity with the HuC and small-BAR options, platform
 admission, the MMIO-free retire hook, and an unregistered real arena. The probe,
 reset-failure and GSC fixtures now pin the corrected probe and recovery
 sequences.
+
+Integration of the media GuC and gate unit: all eight release groups pass
+2,071 unique tests with no failures and no Intel skips; the only skip is the
+existing shared RNG-registration skip. The existing TGL HuC fixtures pass under
+the shared `boot_opt_in` grammar. With the option absent, the runtime builds no
+media owner, `media::retire` returns `Done` without MMIO, GT0 install, park,
+suspend and cold-start proceed as before, and the arena registers no second TLB.
+The debug group pass is deferred to the end of the current integration wave.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 

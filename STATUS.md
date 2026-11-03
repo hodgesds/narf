@@ -2050,6 +2050,25 @@ this integration wave. Still to do: the watermark provider for PSR, PSR2
 selective fetch, Panel Replay, and the Pipe B-D and modeset calls into the
 pipe-DMC lifetime hooks. None of this has run on physical Intel hardware.
 
+### MTL/Arrow media GuC, default-off — release gates recorded
+
+The whole media GT path (GT1) is now off unless the kernel command line has
+`narf.intel.media_gt=1`. Without it nothing changes for GT0. With it, probe
+only resets the media GuC after programming the GT, as Linux does; it no
+longer full-resets GT1. The full reset with the GSC workaround is kept for a
+recovery path that runs once per GT0 incarnation, after a failed media GuC has
+proved it stopped. The media GuC boots on its own mailbox with a polled CT
+channel. While it runs, every shared-GGTT update also invalidates the media
+GuC's TLB. GT0 will not rebuild its GGTT, park or suspend until the media GuC's
+stop is proven. The HuC and BMG small-BAR options now share the same option
+parser, with unchanged grammar.
+
+All eight release groups pass 2,071 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Media engines, their interrupts and the gt_id 1 UAPI land
+in the next units. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
