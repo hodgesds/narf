@@ -2560,6 +2560,26 @@ The internal interfaces add ExecObject.asynchronous and retained per-object
 policy; trusted constructors initialize false and native Xe retains its existing
 globally explicit GPU-ordering contract.
 
+### Intel MTL/Arrow standalone media GT opt-in
+
+Default-off `narf.intel.media_gt=1` admits the MTL/Arrow standalone media GT
+(GT1, Xe_LPM+ 13.00) beside a running GT0. It uses the same pre-separator grammar
+as `narf.intel.huc=1` and `narf.intel.bmg_smallbar=1`. The option must occur
+exactly once with value 1 before the first `--`. Bare, malformed or duplicate
+occurrences refuse it, and post-separator init arguments neither enable nor
+negate it. Only MTL-classified devices admit it.
+
+Without the option, no media owner is constructed. GT0's runtime, its
+shared-GGTT arena flushes, runtime park and system suspend behave exactly as
+before. With the option, the media GT probe programs wells, PAT, MOCS and
+workarounds and performs only a GuC sanitize reset. It then boots the media GuC
+with its own mailbox and polled CT and registers it as the arena's second GGTT
+TLB. A full media-GT reset with Wa_14015076503 runs only on the recovery path
+after a media GuC fault. An unproven media-GuC stop keeps its GGTT memory
+retained. It also refuses park, fails suspend preparation and leaves GT0
+failed rather than rebuilding the arena. No GT1, media engine or HuC is
+published to userspace.
+
 ### Intel fixed Gen12 views and exact family selection
 
 Joint primary/CTM/native/legacy LUT atomic commits have a separate capability.

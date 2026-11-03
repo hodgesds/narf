@@ -9,19 +9,7 @@ use alloc::sync::Arc;
 use core::task::Poll;
 
 pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
-    let mut enabled = false;
-    for token in args.tokens().take_while(|token| *token != "--") {
-        if token == "narf.intel.bmg_smallbar" {
-            return false;
-        }
-        if let Some(value) = token.strip_prefix("narf.intel.bmg_smallbar=") {
-            if enabled || value != "1" {
-                return false;
-            }
-            enabled = true;
-        }
-    }
-    enabled
+    crate::intel_gpu_gt::boot_opt_in(args, "narf.intel.bmg_smallbar")
 }
 
 fn read(m: &impl MmioWindow, reg: u64) -> Result<u32, lnl::Error> {

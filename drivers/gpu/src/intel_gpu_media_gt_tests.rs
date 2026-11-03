@@ -344,6 +344,8 @@ kernel_test_in!(
 
 fn smoke_media_gt_start_programs_media_only_and_releases_every_wake() -> TestResult {
     let soc = Soc::new(MEDIA_1300 | 4, SPARSE_FUSE);
+    // Loaded GSC firmware must not make probe touch the GSC or reset the GT.
+    soc.set(0x116c40, 1 << 9);
     let mut owner = MediaGt::new(MTL, 1274);
     let (result, _) = drive(&mut owner, &soc, 1_000, 100_000);
     let Ok(facts) = result else {
@@ -354,19 +356,25 @@ fn smoke_media_gt_start_programs_media_only_and_releases_every_wake() -> TestRes
     kt_assert_eq!(facts.fuse, SPARSE_FUSE);
     kt_assert_eq!(facts.engines, inventory(SPARSE_FUSE));
     kt_assert_eq!(owner.facts(), Some(facts));
-    // Wake ordering: GT before fuse, GuC reset before full reset, wells
-    // before programming, release last.
+    // Linux media-GT probe order: GT wake, identity and fuses, engine wells,
+    // PAT/WA/MOCS, then only the GuC sanitize reset
+    // (xe_uc_sanitize_reset -> xe_guc_reset); release last.
     let gt_wake = soc.first_write(0x38a188, 0x0001_0001);
     let fuse = soc.first_read(0x389140);
-    let guc_reset = soc.first_write(0x38941c, 8);
-    let full_reset = soc.first_write(0x38941c, 1);
     let vcs2_wake = soc.first_write(0x38a548, 0x0001_0001);
     let pat = soc.first_write(0x384800, 0);
+    let guc_reset = soc.first_write(0x38941c, 8);
     let release = soc.first_write(0x38a188, 0x0001_0000);
     kt_assert!(gt_wake.is_some() && gt_wake < fuse);
-    kt_assert!(fuse < guc_reset && guc_reset < full_reset);
-    kt_assert!(full_reset < vcs2_wake && vcs2_wake < pat);
-    kt_assert!(pat < release);
+    kt_assert!(fuse < vcs2_wake && vcs2_wake < pat);
+    kt_assert!(pat < guc_reset && guc_reset < release);
+    // do_gt_reset runs only from gt_reset_worker and xe_gt_shutdown: probe
+    // writes no GRDOM_FULL and no Wa_14015076503 GSC notification.
+    kt_assert!(soc.first_write(0x38941c, 1).is_none());
+    kt_assert!(soc
+        .writes()
+        .iter()
+        .all(|(reg, _)| !matches!(reg, 0x117c4c | 0x117004)));
     // Fused-off VCS1/VECS0 wells are never requested.
     kt_assert!(soc.first_write(0x38a544, 0x0001_0001).is_none());
     kt_assert!(soc.first_write(0x38a560, 0x0001_0001).is_none());
@@ -393,8 +401,6 @@ fn smoke_media_gt_start_programs_media_only_and_releases_every_wake() -> TestRes
     kt_assert_eq!(soc.get(0x1c3f1c), 0x18);
     kt_assert_eq!(soc.get(0x1d3f1c), 0x18);
     kt_assert_eq!(soc.get(0x1c7f1c), 0x10, "fused-off VCS1 untouched");
-    // No VEBOX clock-gating or GSC write without loaded GSC firmware.
-    kt_assert!(soc.first_write(0x117c4c, 1).is_none());
     kt_assert!(soc.gt0_untouched());
     kt_assert_eq!(soc.held_requests(), 0);
     kt_assert_eq!(owner.outstanding_wake(), 0);
@@ -511,13 +517,10 @@ fn smoke_media_gt_wake_refusals_and_timeouts_release_and_spare_gt0() -> TestResu
     // An engine well never acknowledges: GT and requested wells released.
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     let mut owner = MediaGt::new(MTL, 1274);
-    let mut now = 0;
-    while soc.first_write(0x38941c, 1).is_none() {
-        kt_assert!(owner.poll(&soc, now, || true).is_pending());
-        now += 1000;
-    }
+    kt_assert!(owner.poll(&soc, 0, || true).is_pending());
+    kt_assert_eq!(soc.get(0x380dfc) & 1, 1, "GT domain acknowledged");
     soc.wake_ack.set(false);
-    let (result, _) = drive(&mut owner, &soc, now, 10_000_000);
+    let (result, _) = drive(&mut owner, &soc, 1000, 10_000_000);
     kt_assert_eq!(result, Err(MediaError::Timeout));
     kt_assert!(
         soc.first_write(0x384800, 0).is_none(),
@@ -552,14 +555,20 @@ kernel_test_in!(
 );
 
 fn smoke_media_gt_reset_failures_are_typed_and_release_wake() -> TestResult {
-    // A reset already in flight is not ours to own.
-    let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
-    soc.set(0x38941c, 1);
-    let mut owner = MediaGt::new(MTL, 1274);
-    kt_assert_eq!(drive(&mut owner, &soc, 0, 1000).0, Err(MediaError::Busy));
-    kt_assert!(soc.first_write(0x38941c, 8).is_none());
-    kt_assert_eq!(soc.held_requests(), 0);
-    kt_assert!(soc.gt0_untouched());
+    // A reset already in flight is not ours to own, at probe or recovery.
+    for recovery in [false, true] {
+        let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+        soc.set(0x38941c, 1);
+        let mut owner = if recovery {
+            MediaGt::for_recovery(MTL, 1274)
+        } else {
+            MediaGt::new(MTL, 1274)
+        };
+        kt_assert_eq!(drive(&mut owner, &soc, 0, 1000).0, Err(MediaError::Busy));
+        kt_assert!(soc.writes().iter().all(|(reg, _)| *reg != 0x38941c));
+        kt_assert_eq!(soc.held_requests(), 0);
+        kt_assert!(soc.gt0_untouched());
+    }
     // GRDOM_GUC never self-clears within 5 ms.
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     soc.guc_reset_stuck.set(true);
@@ -577,20 +586,26 @@ fn smoke_media_gt_reset_failures_are_typed_and_release_wake() -> TestResult {
     kt_assert_eq!(drive(&mut owner, &soc, 0, 1000).0, Err(MediaError::Reset));
     kt_assert!(soc.first_write(0x38941c, 1).is_none());
     kt_assert_eq!(soc.held_requests(), 0);
-    // GRDOM_FULL never self-clears.
+    // GRDOM_FULL is never issued at probe, so a stuck full reset is moot.
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     soc.full_reset_stuck.set(true);
     let mut owner = MediaGt::new(MTL, 1274);
+    kt_assert!(drive(&mut owner, &soc, 0, 1_000_000).0.is_ok());
+    kt_assert!(soc.first_write(0x38941c, 1).is_none());
+    // Recovery: GRDOM_FULL never self-clears within 5 ms.
+    let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+    soc.full_reset_stuck.set(true);
+    let mut owner = MediaGt::for_recovery(MTL, 1274);
     kt_assert_eq!(
         drive(&mut owner, &soc, 0, 1_000_000).0,
         Err(MediaError::Timeout)
     );
     kt_assert!(soc.first_write(0x38a540, 0x0001_0001).is_none());
     kt_assert_eq!(soc.held_requests(), 0);
-    // A full reset that drops the GT wake is a lost wake, not success.
+    // Recovery: a full reset that drops the GT wake is a lost wake.
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     soc.reset_drops_wake.set(true);
-    let mut owner = MediaGt::new(MTL, 1274);
+    let mut owner = MediaGt::for_recovery(MTL, 1274);
     kt_assert_eq!(
         drive(&mut owner, &soc, 0, 1000).0,
         Err(MediaError::WakeLost)
@@ -616,12 +631,15 @@ kernel_test_in!(
     smoke_media_gt_reset_failures_are_typed_and_release_wake
 );
 
+/// Recovery only (xe_gt.c::gt_reset_worker -> do_gt_reset): loaded GSC
+/// firmware is alerted, 200 ms elapse, GRDOM_FULL completes, the alert is
+/// cleared, and do_gt_restart reprograms the GT and sanitizes the GuC.
 fn smoke_media_gt_loaded_gsc_reset_follows_wa_14015076503() -> TestResult {
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     soc.set(0x116c40, 1 << 9); // HECI1 FWSTS1 INIT_COMPLETE
     soc.set(0x117004, 0x1d); // CSR with RST set
     soc.set(0x117c4c, 0x40);
-    let mut owner = MediaGt::new(MTL, 1274);
+    let mut owner = MediaGt::for_recovery(MTL, 1274);
     let mut now = 0;
     loop {
         kt_assert!(owner.poll(&soc, now, || true).is_pending());
@@ -643,14 +661,28 @@ fn smoke_media_gt_loaded_gsc_reset_follows_wa_14015076503() -> TestResult {
     kt_assert!(result.is_ok());
     let full = soc.first_write(0x38941c, 1);
     let cleared = soc.first_write(0x117c4c, 0x40);
+    let wells = soc.first_write(0x38a540, 0x0001_0001);
+    let pat = soc.first_write(0x384800, 0);
+    let sanitize = soc.first_write(0x38941c, 8);
     kt_assert!(full.is_some() && full < cleared);
+    kt_assert!(cleared < wells && wells < pat && pat < sanitize);
     kt_assert_eq!(soc.get(0x117c4c), 0x40);
+    kt_assert_eq!(soc.held_requests(), 0);
     kt_assert!(soc.gt0_untouched());
+    // Recovery without loaded GSC firmware: no GSC notification at all.
+    let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+    let mut owner = MediaGt::for_recovery(MTL, 1274);
+    kt_assert!(drive(&mut owner, &soc, 0, 100_000).0.is_ok());
+    kt_assert!(soc.first_write(0x38941c, 1).is_some());
+    kt_assert!(soc
+        .writes()
+        .iter()
+        .all(|(reg, _)| !matches!(reg, 0x117c4c | 0x117004)));
     // A failed reset still clears the GSC notification.
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     soc.set(0x116c40, 1 << 9);
     soc.full_reset_stuck.set(true);
-    let mut owner = MediaGt::new(MTL, 1274);
+    let mut owner = MediaGt::for_recovery(MTL, 1274);
     kt_assert_eq!(
         drive(&mut owner, &soc, 0, 50_000_000).0,
         Err(MediaError::Timeout)
@@ -911,4 +943,133 @@ fn smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered() 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered
+);
+
+/// `narf.intel.media_gt=1` is default-off with the shared pre-`--` grammar.
+/// Absent the option the runtime constructs no media owner, so every GT0
+/// teardown hook retires nothing without MMIO and the shared GGTT arena
+/// flushes exactly as before: no second TLB, no GuC invalidation write.
+fn smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged() -> TestResult {
+    use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, GpuBacking, SharedArena};
+    use narf_boot::args::KernelCmdline;
+    use narf_capabilities::{Cap, Write};
+    const REFUSED: [&str; 10] = [
+        "",
+        "quiet",
+        "narf.intel.media_gt",
+        "narf.intel.media_gt=",
+        "narf.intel.media_gt=0",
+        "narf.intel.media_gt=01",
+        "-- narf.intel.media_gt=1",
+        "narf.intel.media_gt=1 narf.intel.media_gt=1",
+        "narf.intel.media_gt=1 narf.intel.media_gt",
+        "narf.intel.media_gt_x=1",
+    ];
+    const ACCEPTED: [&str; 3] = [
+        "narf.intel.media_gt=1",
+        "quiet narf.intel.media_gt=1 -- narf.intel.media_gt",
+        "narf.intel.media_gt=1 -- narf.intel.media_gt=0 narf.intel.media_gt=1",
+    ];
+    for line in REFUSED {
+        kt_assert!(!requested(KernelCmdline::new(line)));
+        kt_assert!(!admitted(Some(MTL), KernelCmdline::new(line)));
+    }
+    for line in ACCEPTED {
+        kt_assert!(requested(KernelCmdline::new(line)));
+        kt_assert!(admitted(Some(MTL), KernelCmdline::new(line)));
+    }
+    // The shared grammar decides the HuC and BMG small-BAR options exactly
+    // as their own parsers did.
+    for line in REFUSED.iter().chain(ACCEPTED.iter()) {
+        let expect = requested(KernelCmdline::new(line));
+        let huc = line.replace("narf.intel.media_gt", "narf.intel.huc");
+        kt_assert_eq!(
+            crate::intel_gpu_huc::opted_in(KernelCmdline::new(&huc)),
+            expect
+        );
+        let smallbar = line.replace("narf.intel.media_gt", "narf.intel.bmg_smallbar");
+        kt_assert_eq!(
+            crate::intel_gpu_gt::smallbar::requested(KernelCmdline::new(&smallbar)),
+            expect
+        );
+    }
+    // Opting in admits only MTL-classified devices (Meteor and Arrow Lake).
+    let on = KernelCmdline::new("narf.intel.media_gt=1");
+    kt_assert!(admitted(GtPlatform::from_pci(0x8086, 0x7d67), on));
+    for platform in [
+        None,
+        Some(GtPlatform::Integrated(Generation::LunarLake)),
+        Some(GtPlatform::Integrated(Generation::PantherLake)),
+        Some(GtPlatform::Battlemage),
+        Some(GtPlatform::Alchemist),
+        Some(GtPlatform::Gen12(
+            crate::intel_gpu_gt::Gen12Platform::TigerLake,
+        )),
+    ] {
+        kt_assert!(!admitted(platform, on));
+    }
+    // No media owner: the retire hook used before a GT0 restart, park,
+    // suspend or fault cleanup is Done and touches no register.
+    let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
+    let mut media = None;
+    let mut guc: Option<
+        MediaGuc<crate::intel_gpu_gt_hw::AuthorizedWindow, crate::intel_gpu_rcs::SharedArena>,
+    > = None;
+    kt_assert_eq!(retire(&mut media, &mut guc, &soc, 0, || true), Retire::Done);
+    kt_assert!(soc.log.borrow().is_empty());
+    // A never-registered arena: GT0 publication/clear write PTEs only.
+    const SENTINEL: u32 = 0x5a5a_5a5a;
+    let mut words = alloc::vec![0u32; 4 * 1024 * 1024];
+    let bar = narf_bus::bar::MmioRegion {
+        // Fixture-unique GGTT ledger key; no real device sits here.
+        phys: narf_memory::PhysAddr::new(0x6_f800_0000),
+        virt: words.as_mut_ptr() as u64,
+        len: 16 << 20,
+        kind: narf_bus::bar::BarKind::Mmio64 {
+            prefetchable: false,
+        },
+    };
+    let load = |reg: u64| {
+        // SAFETY: `words` backs the whole fixture BAR for this test.
+        unsafe { core::ptr::read_volatile((bar.virt + reg) as *const u32) }
+    };
+    for reg in [0x38cee8u64, 0xcee8] {
+        // SAFETY: as above; nothing else accesses the fixture BAR here.
+        unsafe { core::ptr::write_volatile((bar.virt + reg) as *mut u32, SENTINEL) };
+    }
+    let arena = SharedArena::new(GgttArena::for_gt(
+        bar,
+        Cap::<narf_bus::BusDeviceCap, Write>::bootstrap(),
+        MTL,
+    ));
+    let mut alloc = arena.clone();
+    kt_assert!(!arena.media_guc_tlb());
+    let Ok(mut first) = alloc.alloc(1) else {
+        return TestResult::Fail("fixture arena refused its first page");
+    };
+    let policy = crate::intel_gpu_gt_hw::CachePolicy {
+        platform: MTL,
+        ggtt_pat: 3,
+        media: None,
+    };
+    kt_assert!(arena.configure_cache(&mut first, policy).is_ok());
+    let Ok(second) = alloc.alloc(2) else {
+        return TestResult::Fail("fixture arena refused a mapped allocation");
+    };
+    let pte = crate::intel_gpu_gtt::GGTT_ARRAY_BASE + u64::from(second.ggtt_offset()) / 4096 * 8;
+    kt_assert_ne!(load(pte), 0);
+    alloc.free(second);
+    alloc.free(first);
+    kt_assert_eq!(load(pte), 0);
+    kt_assert_eq!(load(0x38cee8), SENTINEL);
+    kt_assert_eq!(load(0xcee8), SENTINEL);
+    kt_assert_eq!(arena.live_allocations(), 0);
+    kt_assert!(!arena.media_guc_tlb());
+    drop((arena, alloc));
+    drop(words);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged
 );

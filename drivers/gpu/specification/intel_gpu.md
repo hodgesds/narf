@@ -3501,6 +3501,33 @@ Four further fixtures register under `intel_gpu_media_gt`:
 They are registered but were not run, and they are not physical Intel
 evidence.
 
+#### Default-off gate and media-GT reset policy
+
+The whole media GT path is default-off behind `narf.intel.media_gt=1`. This
+covers the lifecycle owner, media GuC, CT and second-TLB registration. The
+option uses the shared pre-`--` grammar now also used by `narf.intel.huc` and
+`narf.intel.bmg_smallbar`, via `intel_gpu_gt::boot_opt_in`. Without the option,
+the runtime constructs no media owner. Every GT0 retire, park, suspend and
+cold-start hook then completes with no MMIO, and the arena never registers a
+second TLB.
+
+Reset policy follows Linux media-GT probe. Probe resets only the media GuC
+(xe_uc_sanitize_reset -> xe_guc_reset: GRDOM_GUC and GS_MIA_IN_RESET), after
+programming wells, PAT, workarounds and MOCS. Probe performs no GRDOM_FULL and
+no GSC notification. xe_gt.c::do_gt_reset, which issues GRDOM_FULL bracketed by
+Wa_14015076503, runs only from gt_reset_worker and xe_gt_shutdown. NARF applies
+it only through `MediaGt::for_recovery`. After a faulted media GuC has proven
+its stop, the runtime runs one such recovery owner per GT0 incarnation and then
+restarts the media GuC, mirroring gt_reset_worker's do_gt_reset followed by
+do_gt_restart. Driver shutdown is not modelled.
+
+One new fixture registers under `intel_gpu_media_gt`:
+`smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged`. It
+covers the grammar and its parity with the HuC and small-BAR options, platform
+admission, the MMIO-free retire hook, and an unregistered real arena. The probe,
+reset-failure and GSC fixtures now pin the corrected probe and recovery
+sequences.
+
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 
 This slice gives Meteor Lake and Arrow Lake a production display power path

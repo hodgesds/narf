@@ -20,6 +20,30 @@ pub(crate) mod smallbar;
 #[path = "intel_gpu_media_gt.rs"]
 pub(crate) mod media;
 
+/// The default-off pre-separator Intel opt-in grammar shared by
+/// `narf.intel.huc`, `narf.intel.bmg_smallbar` and `narf.intel.media_gt`:
+/// exactly one `name=1` before the first `--`. A bare, malformed or
+/// duplicate occurrence refuses the option; post-separator init arguments
+/// neither enable nor negate it.
+pub(crate) fn boot_opt_in(args: narf_boot::args::KernelCmdline<'_>, name: &str) -> bool {
+    let mut enabled = false;
+    for token in args.tokens().take_while(|token| *token != "--") {
+        let Some(rest) = token.strip_prefix(name) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        if let Some(value) = rest.strip_prefix('=') {
+            if enabled || value != "1" {
+                return false;
+            }
+            enabled = true;
+        }
+    }
+    enabled
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GraphicsError {
     Unsupported,

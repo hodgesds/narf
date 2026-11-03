@@ -16,9 +16,12 @@
 //! - xe_hw_engine.c::read_media_fuses: GT_VEBOX_VDBOX_DISABLE with positive
 //!   (present) polarity at graphics >= 12.50. check_gsc_availability drops
 //!   GSCCS0 without loaded GSC firmware, which this owner never loads.
-//! - xe_guc.c::xe_guc_reset (GRDOM_GUC, 5 ms, GS_MIA_IN_RESET) and
-//!   xe_gt.c::do_gt_reset (GRDOM_FULL, 5 ms) bracketed by
-//!   xe_gsc.c::xe_gsc_wa_14015076503 (MEDIA_VERSION(1300) in xe_wa_oob.rules).
+//! - Probe resets only the GuC: xe_uc.c::xe_uc_sanitize_reset (from
+//!   xe_uc_init_post_hwconfig/xe_uc_load_hw) -> xe_guc.c::xe_guc_reset
+//!   (GRDOM_GUC, 5 ms, GS_MIA_IN_RESET). xe_gt.c::do_gt_reset (GRDOM_FULL,
+//!   5 ms, bracketed by xe_gsc.c::xe_gsc_wa_14015076503, MEDIA_VERSION(1300))
+//!   runs only from gt_reset_worker and xe_gt_shutdown; here only a recovery
+//!   owner (`MediaGt::for_recovery`) performs it.
 //! - xe_pat.c `xelpg_pat_table` through `xelpg_pat_ops.program_media`
 //!   (program_pat_mcr), xe_gt_mcr.c::{mcr_lock,mcr_unlock,
 //!   xe_gt_mcr_multicast_write} with STEER_SEMAPHORE / MTL_MCR_SELECTOR.
@@ -28,10 +31,11 @@
 //!   xe_rtp.c's standalone-media split: graphics rules never match GT1 and
 //!   media rules never match GT0. xe_tuning.c has no media 13.00 entry.
 //!
-//! This owner establishes the media GT's identity, inventory, wake, reset,
-//! cache and workaround state for one GT0 incarnation and then releases every
-//! wake request it made. The media GuC is left held in reset: no media
-//! firmware, CT, interrupt source, engine or UAPI GT is published here.
+//! This owner establishes the media GT's identity, inventory, wake, cache,
+//! workaround and GuC-sanitize state for one GT0 incarnation and then releases
+//! every wake request it made. The whole media GT path is default-off behind
+//! `narf.intel.media_gt=1` (`requested`). `MediaGuc` below runs the media GuC
+//! and its polled CT; no media engine or UAPI GT is published here.
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
@@ -39,6 +43,22 @@ use crate::intel_gpu_engine::{Engine, EngineSet};
 use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_gt_hw::{MTL_GLOBAL_MOCS, MTL_L3CC};
 use core::task::Poll;
+
+/// Default-off opt-in for the whole MTL/Arrow media GT path (lifecycle owner,
+/// media GuC, CT and second-TLB registration), with the shared pre-`--`
+/// grammar of `narf.intel.huc=1` and `narf.intel.bmg_smallbar=1`.
+pub(crate) fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, "narf.intel.media_gt")
+}
+
+/// Runtime admission: an MTL-classified device and the explicit opt-in.
+/// Absent the option, GT0's runtime never constructs a media owner.
+pub(crate) fn admitted(
+    platform: Option<GtPlatform>,
+    args: narf_boot::args::KernelCmdline<'_>,
+) -> bool {
+    platform.is_some_and(profile_eligible) && requested(args)
+}
 
 /// regs/xe_gt_regs.h MEDIA_GT_GSI_OFFSET / MEDIA_GT_GSI_LENGTH.
 pub(crate) const GSI_OFFSET: u64 = 0x380000;
@@ -310,9 +330,13 @@ pub(crate) struct MediaGt {
     /// Domains whose kernel wake request this owner wrote and not released.
     requested: u16,
     gsc_prepared: bool,
+    /// A GT reset/recovery owner (gt_reset_worker), not a probe owner.
+    recovery: bool,
 }
 
 impl MediaGt {
+    /// Probe-time owner: identity, fuses, wells, PAT/WA/MOCS and the GuC
+    /// sanitize reset, as Linux media-GT probe does. No GT reset.
     pub(crate) fn new(platform: GtPlatform, graphics: u16) -> Self {
         Self {
             platform,
@@ -324,6 +348,17 @@ impl MediaGt {
             engines: EngineSet::default(),
             requested: 0,
             gsc_prepared: false,
+            recovery: false,
+        }
+    }
+
+    /// Media-GT reset/recovery owner after its GuC was stopped, following
+    /// xe_gt.c::gt_reset_worker: do_gt_reset (Wa_14015076503 around
+    /// GRDOM_FULL) and then do_gt_restart's reprogramming and GuC sanitize.
+    pub(crate) fn for_recovery(platform: GtPlatform, graphics: u16) -> Self {
+        Self {
+            recovery: true,
+            ..Self::new(platform, graphics)
         }
     }
 
@@ -435,28 +470,17 @@ impl MediaGt {
                 if self.engines.iter().next().is_none() {
                     return Err(MediaError::NoEngines);
                 }
-                // xe_guc.c::xe_guc_reset. GDRST must be idle before we own it.
+                if !self.recovery {
+                    // Probe: no GT reset (xe_gt.c::do_gt_reset runs only from
+                    // gt_reset_worker and xe_gt_shutdown). The GuC sanitize
+                    // reset follows hardware programming below.
+                    return self.begin_wells(media, now);
+                }
+                // Recovery: xe_gt.c::gt_reset_worker -> do_gt_reset.
                 if read(media, GDRST)? != 0 {
                     return Err(MediaError::Busy);
                 }
-                media.write32(GDRST, GRDOM_GUC);
-                self.deadline = now.checked_add(RESET_NS).ok_or(MediaError::Timeout)?;
-                self.phase = Phase::ResetGuc;
-                Ok(false)
-            }
-            Phase::ResetGuc => {
-                self.gt_awake(media)?;
-                if read(media, GDRST)? & GRDOM_GUC != 0 {
-                    return if now >= self.deadline {
-                        Err(MediaError::Timeout)
-                    } else {
-                        Ok(false)
-                    };
-                }
-                if read(media, GUC_STATUS)? & GS_MIA_IN_RESET == 0 {
-                    return Err(MediaError::Reset);
-                }
-                // xe_gt.c::do_gt_reset -> xe_gsc_wa_14015076503(gt, true).
+                // xe_gsc.c::xe_gsc_wa_14015076503(gt, true).
                 if read(media, HECI1_FWSTS1)? & HECI1_FWSTS1_INIT_COMPLETE != 0 {
                     let gs1 = read(media, HECI2_H_GS1)?;
                     media.write32(HECI2_H_GS1, gs1 | HECI_H_GS1_ER_PREP);
@@ -486,12 +510,10 @@ impl MediaGt {
                 }
                 // xe_gsc_wa_14015076503(gt, false) clears the notification.
                 self.clear_gsc_prepare(media)?;
-                self.gt_awake(media)?;
                 // GT wake survives the GT reset only if the hardware says so.
-                self.deadline = now.checked_add(WAKE_NS).ok_or(MediaError::Timeout)?;
-                let wells = engine_domains(self.engines);
-                self.phase = Phase::SettleEngines;
-                self.request(media, wells, Phase::SettleEngines, Phase::WakeEngines)
+                self.gt_awake(media)?;
+                // do_gt_restart then reprograms the GT as at probe.
+                self.begin_wells(media, now)
             }
             Phase::SettleEngines => {
                 let wells = engine_domains(self.engines);
@@ -510,6 +532,22 @@ impl MediaGt {
                 self.program(media, now)
             }
             Phase::Program => self.program(media, now),
+            Phase::ResetGuc => {
+                self.wells_awake(media)?;
+                if read(media, GDRST)? & GRDOM_GUC != 0 {
+                    return if now >= self.deadline {
+                        Err(MediaError::Timeout)
+                    } else {
+                        Ok(false)
+                    };
+                }
+                if read(media, GUC_STATUS)? & GS_MIA_IN_RESET == 0 {
+                    return Err(MediaError::Reset);
+                }
+                self.begin_release(media, now)?;
+                self.phase = Phase::Release;
+                Ok(false)
+            }
             Phase::Release => {
                 if !self.released(media, now)? {
                     return Ok(false);
@@ -527,6 +565,13 @@ impl MediaGt {
             },
             Phase::Initialized | Phase::Failed(_) | Phase::Stopped => Ok(true),
         }
+    }
+
+    fn begin_wells(&mut self, media: &impl MmioWindow, now: u64) -> Result<bool, MediaError> {
+        self.deadline = now.checked_add(WAKE_NS).ok_or(MediaError::Timeout)?;
+        let wells = engine_domains(self.engines);
+        self.phase = Phase::SettleEngines;
+        self.request(media, wells, Phase::SettleEngines, Phase::WakeEngines)
     }
 
     fn begin_full_reset(&mut self, media: &impl MmioWindow, now: u64) -> Result<bool, MediaError> {
@@ -678,8 +723,14 @@ impl MediaGt {
             );
         }
         self.wells_awake(media)?;
-        self.begin_release(media, now)?;
-        self.phase = Phase::Release;
+        // xe_uc.c::xe_uc_sanitize_reset -> xe_guc.c::xe_guc_reset, the only
+        // reset on the probe path: GRDOM_GUC, 5 ms, then GS_MIA_IN_RESET.
+        if read(media, GDRST)? != 0 {
+            return Err(MediaError::Busy);
+        }
+        media.write32(GDRST, GRDOM_GUC);
+        self.deadline = now.checked_add(RESET_NS).ok_or(MediaError::Timeout)?;
+        self.phase = Phase::ResetGuc;
         Ok(false)
     }
 
@@ -985,6 +1036,48 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     /// any wake/firmware publication (`start` never returns such an owner).
     pub(crate) fn reclaimable(&self) -> bool {
         self.state == MediaGucState::Stopped && !self.registered
+    }
+}
+
+/// Outcome of retiring the media owners before a GT0 transition.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Retire {
+    Done,
+    Pending,
+    /// The media GuC's stop is unproven; its shared-GGTT memory stays held.
+    Retained,
+}
+
+/// Abandon the media GT owner (releasing its own wake requests) and advance
+/// a verified media GuC stop. With no media owner, as when
+/// `narf.intel.media_gt=1` is absent, this is `Done` with no MMIO access.
+pub(crate) fn retire<B, M, A>(
+    media: &mut Option<MediaGt>,
+    guc: &mut Option<MediaGuc<M, A>>,
+    bar: &B,
+    now: u64,
+    current: impl FnMut() -> bool,
+) -> Retire
+where
+    B: MmioWindow + ?Sized,
+    M: MmioWindow + Clone,
+    A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
+{
+    if let Some(mut owner) = media.take() {
+        owner.abandon(bar);
+    }
+    let Some(owner) = guc.as_mut() else {
+        return Retire::Done;
+    };
+    owner.begin_stop(now);
+    let _ = owner.poll(now, current);
+    match owner.state() {
+        MediaGucState::Stopped if owner.reclaimable() => {
+            *guc = None;
+            Retire::Done
+        }
+        MediaGucState::Retained => Retire::Retained,
+        _ => Retire::Pending,
     }
 }
 
