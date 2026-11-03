@@ -905,20 +905,38 @@ Sources are the pinned Linux tree b90c984d615e8ce2af96f5b1411a962d83fed2ad:
 Firmware: `DmcPlatform::Xelpdp` validates `i915/mtl_dmc.bin` with the
 `XELPDP_DMC_MAX_FW_SIZE` ceiling (0x7000), the main v3 MMIO table in
 `TGL_MAIN_MMIO` (0x8F000–0x8FFFF), no TGL/ADL-S event fixups, and pipe event
-handlers at 0x5F000 + 0x400·(id−1). This is stricter than the pinned tree in
-two ways. The main payload must lie in 0x80000–0x8EFFF, because the tree streams
-it to the firmware's own start address without a bound. Pipe programs are
-skipped and recorded in `skipped_mask`, because the tree bounds their MMIO
-tables (`ADLP_PIPE_MMIO`, 0x5F000–0x5FFFF) but not their program RAM. A skipped
-pipe DMC is never enabled; on ADL/MTL the main DMC saves and restores pipe A/B
-DMC state itself. Load follows `intel_dmc_load_program` for display 14:
-Wa_16015201720 (`GEN9_CLKGATE_DIS_0` 0x46530 gains bits 15 and 14), the handler
-sweep, payload, MMIO table and `DC_STATE_DEBUG` masks with a posting read,
-then `verify_loaded`. Disable is the same workaround plus the sweep. Stepping
-selection is wildcard because the driver has no display-stepping readout.
+handlers at 0x5F000 + 0x400·(id−1). Pipe MMIO tables must stay in
+`ADLP_PIPE_MMIO` (0x5F000–0x5FFFF). The tree streams every payload to the
+firmware's own start address without a bound, so this driver is stricter: the
+main payload must lie in 0x80000–0x8EFFF, and each pipe payload in its slot
+window (A 0x90000–0x96FFF, B 0x98000–0x9EFFF, C 0x52000–0x53FFF, D
+0x59000–0x5AFFF). Those are the windows in which the shipped `mtl_dmc.bin`
+(v2.23) places each pipe program and its `DMC_SSP_BASE` stack top. A pipe
+program outside its window is recorded in `skipped_mask` and never loaded or
+enabled. Load follows `intel_dmc_load_program` for display 14:
+Wa_16015201720 (`GEN9_CLKGATE_DIS_0` 0x46530 gains bits 15 and 14), then for
+the main program and every accepted pipe program the handler sweep, payload
+and MMIO table (pipe events written disabled), then the `DC_STATE_DEBUG`
+masks with a posting read, then `verify_loaded`. Disable is the same
+workaround plus every program's sweep. Stepping selection is wildcard because
+the driver has no display-stepping readout.
+
+Pipe DMC follows `intel_dmc_enable_pipe` / `intel_dmc_disable_pipe`. A pipe
+owner reports its pipe lit (`pipe_lit_for_bar`, after enabling it or adopting
+it lit, as `intel_modeset_setup` sanitizes active pipes) and dark
+(`pipe_dark_for_bar`, before disabling it). Each runs under a `PipeDmc`
+reference. With a loaded program, enable re-applies the pipe C/D MMIO table
+(`need_pipedmc_load_mmio`; the main DMC saves and restores pipes A/B), verifies
+the pipe program and sets `PIPEDMC_ENABLE_MTL(pipe)` in `MTL_PIPEDMC_CONTROL`.
+A pipe program that does not verify is not enabled (i915 only warns). Every
+(re)load re-enables the lit pipes before its Load reference drops. Suspend
+clears this driver's enables before the program disable, keeping the pipes
+recorded lit for the post-resume reload. KMS install reports the owned
+internal Pipe A lit. The Pipe B–D owner and the MTL modeset call the two hooks
+for the pipes they light and darken.
 
 The DC_off well: `DcCore` counts references per user (Init, Load, Modeset,
-Kms, Psr, Suspend). The first reference reads `DC_STATE_EN` (0x45504). If any
+Kms, Psr, Suspend, Aux, ExternalRoute, External, PipeDmc). The first reference reads `DC_STATE_EN` (0x45504). If any
 DC field is set, it writes `DC_STATE_DISABLE` with `gen9_write_dc_state`'s
 discipline (rewrite until seven consecutive matching reads, at most 100
 rewrites) before the holder touches hardware. A write that never sticks
@@ -929,12 +947,14 @@ Re-entry runs from a spawned task with no caller lock held, and requires all of
 the following:
 
 - no reference is held, and no `DC_STATE_EN` write failure is latched;
-- the program is loaded and its main program still verifies (a lost program
-  is reloaded first);
+- the program is loaded and its main program still verifies, as
+  `assert_main_dmc_loaded` checks (a lost program is reloaded first; pipe C/D
+  state is not kept across DC6, so pipe programs are not checked here);
 - the sanitized target is nonzero (DC6 on display 14; DC3CO and DC9 are never
   targeted);
 - the utility pin is not in PWM mode;
-- `MTL_PIPEDMC_CONTROL` (0x45250) shows no enabled pipe DMC;
+- `MTL_PIPEDMC_CONTROL` (0x45250) shows no enabled pipe DMC that this driver
+  did not enable;
 - no external route is live.
 
 `gen9_set_dc_state` is mirrored, including display 14's DC6-allowed residency
@@ -962,8 +982,8 @@ never released (only DC_off is reference-counted). The pinned tree powers
 display-14 AUX wells through `XELPDP_DP_AUX_CH_CTL` bit 19 (status bit 18); the
 existing modeset's `PWR_WELL_CTL_AUX2` request is a divergence left to the AUX
 owner. Suspend does not run display-core uninit (DBUF, CDCLK, PW_1 or the
-`HOLD_PHY` latches) or DC9. DC3CO, pipe DMC programs and flip queues, and
-display-stepping selection are not implemented. PCI runtime autosuspend with a
+`HOLD_PHY` latches) or DC9. DC3CO, flip queues, pipe DMC event
+reconfiguration and display-stepping selection are not implemented. PCI runtime autosuspend with a
 lit panel stays refused, as Linux's display wakeref keeps the function in D0;
 DC5/DC6 is the lit-panel idle power path.
 
@@ -3517,7 +3537,8 @@ Refused and remaining work:
   is covered by the next subsection.
 - **Other remaining display power work:** per-well reference counts beyond
   DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
-  at suspend, DC3CO, pipe DMC programs, and display stepping.
+  at suspend, DC3CO, and display stepping. Pipe DMC programs are loaded and
+  enabled with their pipes (§12.1).
 
 Twenty-eight native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc`
 there are four:
@@ -4057,3 +4078,40 @@ were not executed in this slice. Six are register/sink models:
 `smoke_psr_kms_disabled_before_console_legacy_suspend_and_reset`,
 `smoke_psr_kms_wins_over_fbc_in_both_directions` and
 `smoke_psr_kms_refusals_leave_zero_psr_traffic`.
+
+### Display-14 pipe DMC
+
+Display 14 now loads and enables the per-pipe DMC programs as the pinned
+`intel_dmc.c` does, instead of skipping them and refusing DC re-entry on any
+pipe DMC enable.
+
+- **Load:** `intel_gpu_dmc` parses the pipe programs of `mtl_dmc.bin`. Each
+  must keep its MMIO table in `ADLP_PIPE_MMIO` and its payload in its slot
+  window, the windows the shipped container uses. Every accepted program is
+  streamed with the main program, pipe events disabled, behind
+  Wa_16015201720, and verified.
+- **Enable and disable:** `pipe_lit_for_bar` and `pipe_dark_for_bar` are the
+  pipe-lifetime hooks. Enable is `intel_dmc_enable_pipe` for display 14
+  (pipe C/D table re-apply, verify, `PIPEDMC_ENABLE_MTL`); disable clears the
+  bit. KMS install reports the owned Pipe A lit. The Pipe B–D owner and the
+  MTL modeset own their calls; their files are not changed here.
+- **Reload and suspend:** every (re)load re-enables the lit pipes under its
+  Load reference. Suspend clears the enables before the program disable, and
+  the post-resume reload restores them.
+- **DC gate:** re-entry is refused only for a pipe DMC this driver did not
+  enable, and re-entry verifies only the main program
+  (`assert_main_dmc_loaded`).
+- **Stricter than the tree:** the per-slot payload windows, and a pipe
+  program that fails verification is not enabled.
+- **Remaining:** pipe DMC event configuration (DC balance, PKG C-state
+  blocking, flip queues) is display 20+ or unused here. The Pipe B–D and
+  modeset owners must call the hooks before their pipes are DC-safe.
+
+Fixtures, registered and not executed in this slice. In
+`drivers/gpu/intel_gpu_dmc`, `smoke_xelpdp_dmc_parse_skips_pipe_programs` is
+replaced by `smoke_xelpdp_dmc_parse_bounds_pipe_programs`;
+`smoke_xelpdp_dmc_load_conversation` and
+`smoke_xelpdp_dmc_disable_and_geometry` now expect the pipe programs; and
+`smoke_xelpdp_pipe_dmc_enable_disable` is new. In
+`drivers/gpu/intel_gpu_dc_states`, `smoke_dc_states_pipe_dmc_follows_pipe_lifetime`
+is new.
