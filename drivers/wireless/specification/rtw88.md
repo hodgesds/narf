@@ -3147,7 +3147,45 @@ grant is published. Remaining blockers, verified against the tree:
    (`runtime_lps` mailbox/readback, `tracking8821c::program` park/IQK/
    restore, `radio8821c::Checked`) use `enclosed`. The `packet_*` methods
    stay synchronous because `usb_packet::Owner` is already non-blocking.
-   Remaining: the USB `Io` backend and station worker, then step 5.
+   USB `Io` backend (landed, `usb_firmware.rs::Backend`, Linux
+   `rtw_usb_ops`): registers are `usb::Registers` (EP0 vendor requests with
+   the `rtw_usb_reg_sec` mirror); `reserved_page` is
+   `fw.c::rtw_fw_write_data_rsvd_page` without the PCIe-only
+   REG_FWHW_TXQ_CTRL+2 BCNQ_DL toggle (BCN_VALID W1C, ENSWBCN, BCN_CTRL,
+   one BEACON-qsel `reserved_page_packet` on the `qsel_to_ep` pipe,
+   `check_hw_ready` BCN_VALID_V1, boundary/BCN_CTRL/CR+1 restore), so the
+   unchanged `firmware_transport::Owner::download` section/IDDMA sequence
+   runs over USB; `submit_h2c`/`poll_h2c` are `rtw_usb_write_data_h2c` on
+   the H2C-qsel pipe with exact-length completion; the mailbox is
+   `rtw_fw_send_h2c_command` (HMETFR 0x1cc, HMEBOX_EXT 0x1f0, HMEBOX 0x1d0);
+   `lte_*` is the REG_WL_LTECOEX_CTRL indirect access; `packet_*` delegate
+   to `usb_packet::Owner` (one multi-record USB step is replayed one
+   frame/C2H/receipt per `packet_poll`). Every bulk-OUT receipt is retained
+   until its exact completion or `quiesce_dma`'s endpoint stop; any failure
+   leaves the backend terminal. The PCI phase gates that are MAC registers
+   (CR & 0xcf, HIMR 0xb0/0xb8/0x10b8) are kept; PCIe DMA config (0x303) and
+   bus mastering have no USB counterpart. `Io::hci` (default PCIe) feeds
+   `mac::prepare_on`: for `Hci::Usb { bulkout, speed }` the FIFO uses the
+   bulk-out-count `rqpn_table_8821c`/`page_table_8821c` rows, sets
+   BIT_RXDMA_ARBBW_EN after the CR write, writes the AUTO_LLT_V1
+   block-descriptor count and TXDMA_OFFSET_CHK+1 BIT(1) before LLT init
+   (`rtw_set_trx_fifo_info`) and ends with `rtw_usb_init_burst_pkt_len`
+   (`rtw_mac_init` -> `rtw_hci_interface_cfg`); USB is refused for C22 and
+   the PCIe byte stream is unchanged. Not yet bound: `station_*` grant
+   hooks (trait `Unsupported` defaults), the asynchronous CR/TXPAUSE open
+   before `packet_start`, and `packet_stop` (synchronous, so it fails the
+   backend closed and leaves receipt retirement to `quiesce_dma`). Written,
+   unexecuted: `smoke_rtw88_usb_firmware_reserved_page_sequence`,
+   `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`.
+   USB EFUSE (landed): `efuse::read_factory8821c_usb` runs the
+   `rtw_dump_physical_efuse_map` sequence of the synchronous PCI reader
+   (bank 0, programming LDO off, per-byte REG_EFUSE_CTRL address write and
+   VALID poll bounded by `EFUSE_POLL_MS`) over the asynchronous register
+   `Io`, decodes it with the shared `decode_map` and returns
+   `Factory8821c::on_usb` (MAC at 0x107). Each poll is an EP0 transfer, so
+   nothing spins; the PCI `EfuseIo` path is unchanged. Written, unexecuted:
+   `smoke_rtw88_usb_efuse_factory_async`.
+   Remaining: the USB station worker, then step 5.
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,

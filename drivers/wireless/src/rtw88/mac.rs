@@ -50,18 +50,45 @@ async fn u32(io: &mut impl Io, reg: u16, clear: u32, set: u32) -> Result<(), Err
     }
     io.write32(reg, value & !clear | set).await
 }
-async fn fifo(io: &mut impl Io, info: Info, did: u16) -> Result<(), Error> {
-    // PCIe queue mapping from rqpn_table_8822c[1].
-    w16(io, REG_TXDMA_PQ_MAP, 0xc5a0).await?;
+/// Host interface the MAC queue/FIFO programming follows (`rtw_hci_type`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Hci {
+    Pcie,
+    /// RTL8821CU: `rtwdev->hci.bulkout_num` selects the `rqpn_table_8821c` /
+    /// `page_table_8821c` rows; `speed` feeds `rtw_usb_interface_cfg`.
+    Usb {
+        bulkout: u8,
+        speed: super::usb::Speed,
+    },
+}
+async fn fifo(io: &mut impl Io, info: Info, did: u16, hci: Hci) -> Result<(), Error> {
+    let usb = match hci {
+        Hci::Pcie => None,
+        Hci::Usb { bulkout, .. } => {
+            Some(super::usb::usb_tables(usize::from(bulkout)).map_err(|_| Error::Unsupported)?)
+        }
+    };
+    // mac.c::txdma_queue_mapping: PCIe uses rqpn_table[1]; USB the
+    // bulk-out-count row of rqpn_table_8821c.
+    let map = match usb {
+        Some((rqpn, _)) => u32::from(super::usb::txdma_pq_map(rqpn)),
+        None => 0xc5a0,
+    };
+    w16(io, REG_TXDMA_PQ_MAP, map).await?;
     w8(io, REG_CR, 0).await?;
     // Linux MAC_TRX_ENABLE is0xff. Only protocol/scheduler may be enabled
     // here: the existing firmware host rings, MAC and RF remain inactive.
     w8(io, REG_CR, MAC_TRX_ENABLE & !0xcf).await?;
     io.write32(REG_H2CQ_CSR, BIT_H2CQ_FULL).await?;
-    let pages = if did == 0xc821 {
-        [16, 16, 16, 14]
-    } else {
-        [64; 4]
+    if usb.is_some() {
+        // txdma_queue_mapping USB tail: BIT_RXDMA_ARBBW_EN.
+        u8(io, REG_TXDMA_PQ_MAP, 0, 1).await?;
+    }
+    // FIFOPAGE_INFO_1..4 = hq, lq, nq, exq (`__priority_queue_cfg`).
+    let pages = match usb {
+        Some((_, p)) => [p.hq, p.lq, p.nq, p.exq].map(u32::from),
+        None if did == 0xc821 => [16, 16, 16, 14],
+        None => [64; 4],
     };
     for (reg, count) in [
         REG_FIFOPAGE_INFO_1,
@@ -91,6 +118,19 @@ async fn fifo(io: &mut impl Io, info: Info, did: u16) -> Result<(), Error> {
         (if did == 0xc821 { 16384 } else { 24576 }) - C2H_PKT_BUF - 1,
     )
     .await?;
+    if usb.is_some() {
+        // __priority_queue_cfg USB: BLK_DESC_NUM and AUTO_LLT_V1+3 =
+        // usb_tx_agg_desc_num, TXDMA_OFFSET_CHK+1 BIT(1).
+        u8(
+            io,
+            REG_AUTO_LLT_V1,
+            0xf0,
+            u32::from(super::usb::TX_AGG_DESC_NUM) << 4,
+        )
+        .await?;
+        w8(io, REG_AUTO_LLT_V1 + 3, super::usb::TX_AGG_DESC_NUM.into()).await?;
+        u8(io, REG_TXDMA_OFFSET_CHK + 1, 0, 1 << 1).await?;
+    }
     u8(io, REG_AUTO_LLT_V1, 0, BIT_AUTO_INIT_LLT_V1).await?;
     let deadline = narf_time::Deadline::after_ms(10);
     let mut complete = false;
@@ -283,7 +323,12 @@ pub(super) async fn prepare(io: &mut impl Io) -> Result<Info, Error> {
     prepare_for(io, 0xc822).await
 }
 pub(super) async fn prepare_for(io: &mut impl Io, did: u16) -> Result<Info, Error> {
-    if !matches!(did, 0xc821 | 0xc822) {
+    prepare_on(io, did, Hci::Pcie).await
+}
+/// `mac.c::rtw_mac_init` for `hci`. USB exists only for the C21 die
+/// (RTL8821CU); the PCIe byte stream is unchanged.
+pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<Info, Error> {
+    if !matches!(did, 0xc821 | 0xc822) || did != 0xc821 && hci != Hci::Pcie {
         return Err(Error::Unsupported);
     }
     let cfg = io.read32(0xf0).await?;
@@ -295,7 +340,7 @@ pub(super) async fn prepare_for(io: &mut impl Io, did: u16) -> Result<Info, Erro
         return Err(Error::Unsupported);
     }
     let info = Info::new(cut, did);
-    fifo(io, info, did).await?;
+    fifo(io, info, did, hci).await?;
     if did == 0xc821 {
         rtl8821c::chip(io).await?;
     } else {
@@ -307,6 +352,10 @@ pub(super) async fn prepare_for(io: &mut impl Io, did: u16) -> Result<Info, Erro
     u32(io, REG_WMAC_OPTION_FUNCTION + 4, 1 << 8 | 1 << 9, 0).await?;
     if did == 0xc822 && cut >= 3 {
         u32(io, 0x3fc, 0, 1 << 26).await?;
+    }
+    if let Hci::Usb { speed, .. } = hci {
+        // rtw_hci_interface_cfg -> usb.c::rtw_usb_init_burst_pkt_len.
+        super::usb::interface_cfg(io, speed).await?;
     }
     Ok(info)
 }

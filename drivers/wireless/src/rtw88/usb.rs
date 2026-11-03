@@ -874,6 +874,24 @@ impl<C: ControlIo> Registers<C> {
     }
 }
 
+/// `usb.c::rtw_usb_init_burst_pkt_len` over the firmware owner's
+/// asynchronous register `Io` (the same writes as
+/// [`Registers::interface_cfg`]), used by `mac::prepare_on` for USB.
+pub(super) async fn interface_cfg(
+    io: &mut impl super::firmware_transport::Io,
+    speed: Speed,
+) -> Result<(), super::firmware_transport::Error> {
+    let burst: u8 = match speed {
+        Speed::Super => 0,
+        Speed::High => 1,
+        Speed::Full => 2,
+    };
+    io.write8(REG_RXDMA_MODE, 0x0c | 0x02 | burst << 4).await?;
+    let value = io.read16(REG_TXDMA_OFFSET_CHK).await?;
+    io.write16(REG_TXDMA_OFFSET_CHK, value | BIT_DROP_DATA_EN)
+        .await
+}
+
 /// Bulk transport over the enumerated device (`rtw_usb_write_port` /
 /// `rtw_usb_rx_resubmit`). `URB_ZERO_PACKET` is the controller's job; the
 /// reserved-page path avoids the case altogether (see

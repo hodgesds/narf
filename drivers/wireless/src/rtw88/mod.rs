@@ -143,6 +143,10 @@ mod station_power8821c;
 mod station_profile;
 /// RTL8821CU USB host-interface transport (Linux rtw88/usb.c).
 mod usb;
+/// RTL8821CU firmware/register backend (Linux rtw88/usb.c `rtw_usb_ops`).
+mod usb_firmware;
+#[cfg(feature = "kernel-test")]
+mod usb_firmware_tests;
 /// RTL8821CU USB packet owner (Linux rtw88/usb.c TX queues, RX split).
 mod usb_packet;
 #[cfg(feature = "kernel-test")]

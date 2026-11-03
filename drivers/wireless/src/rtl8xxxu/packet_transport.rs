@@ -62,6 +62,7 @@ pub trait Io: Send + Sync {
         Err(UsbError::NotConfigured)
     }
 }
+#[derive(Clone)]
 pub struct UsbIo(Arc<USBDevice>);
 impl core::fmt::Debug for UsbIo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

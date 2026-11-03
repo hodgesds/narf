@@ -420,6 +420,60 @@ pub(super) fn read_factory8821c_with(
     }
     Ok(factory)
 }
+/// RTL8821CU factory map over the asynchronous register `Io` (EP0 vendor
+/// requests on USB): the same `efuse.c::rtw_dump_physical_efuse_map`
+/// sequence as [`read_factory8821c_with`] (bank 0, programming LDO off, one
+/// REG_EFUSE_CTRL address write and VALID poll per byte), decoded with the
+/// same `rtw_dump_logical_efuse_map` and parsed as `rtw8821cu_efuse_parsing`
+/// ([`Factory8821c::on_usb`], MAC at 0x107). Each poll is a USB transfer, so
+/// the wait never spins the CPU; the per-byte bound is `EFUSE_POLL_MS`. The
+/// synchronous PCI path is unchanged.
+pub(super) async fn read_factory8821c_usb(
+    io: &mut impl super::firmware_transport::Io,
+) -> Result<Factory8821c, EfuseError> {
+    let chip = geometry(RTL_DEV_8821CE)?;
+    let access = |_| EfuseError::Timeout;
+    let bank = io.read32(REG_LDO_EFUSE_CTRL as u16).await.map_err(access)?;
+    io.write32(REG_LDO_EFUSE_CTRL as u16, bank & !EFUSE_BANK_MASK)
+        .await
+        .map_err(access)?;
+    let ldo = io.read8(chip.ldo_addr as u16).await.map_err(access)?;
+    io.write8(chip.ldo_addr as u16, ldo & !chip.ldo_mask)
+        .await
+        .map_err(access)?;
+    // Heap-held: this future can be polled on small (aarch64) stacks.
+    let mut physical = alloc::vec![0xffu8; chip.readable];
+    let mut control = io.read32(REG_EFUSE_CTRL as u16).await.map_err(access)?;
+    for (addr, byte) in physical.iter_mut().enumerate() {
+        control &= !(EFUSE_CTRL_DATA_MASK
+            | (EFUSE_CTRL_ADDR_MASK << EFUSE_CTRL_ADDR_SHIFT)
+            | EFUSE_CTRL_VALID);
+        control |= (addr as u32) << EFUSE_CTRL_ADDR_SHIFT;
+        io.write32(REG_EFUSE_CTRL as u16, control)
+            .await
+            .map_err(access)?;
+        let deadline = Deadline::after_ms(EFUSE_POLL_MS);
+        loop {
+            control = io.read32(REG_EFUSE_CTRL as u16).await.map_err(access)?;
+            if control & EFUSE_CTRL_VALID != 0 {
+                break;
+            }
+            if deadline.expired() {
+                return Err(EfuseError::Timeout);
+            }
+        }
+        *byte = (control & EFUSE_CTRL_DATA_MASK) as u8;
+    }
+    let mut logical = alloc::vec![0xffu8; chip.logical];
+    decode_map(&physical, &mut logical)?;
+    Factory8821c {
+        logical: logical[..512]
+            .try_into()
+            .map_err(|_| EfuseError::MalformedMap)?,
+        usb: false,
+    }
+    .on_usb()
+}
 /// # Safety
 /// Same powered, exclusive BAR2 ownership contract as `read_mac`.
 pub unsafe fn read_factory8821c(mmio: &MmioRegion, did: u16) -> Result<Factory8821c, EfuseError> {

@@ -342,6 +342,10 @@ impl<F: FnMut(u16) -> Result<u32, Error> + Send> Read32 for Sampled<F> {
 /// no unrelated command/reset/ring client may race either path.
 #[async_trait::async_trait]
 pub(super) unsafe trait Io: Send {
+    /// Host interface whose MAC queue/FIFO rows `prepare_mac` programs.
+    fn hci(&self) -> super::mac::Hci {
+        super::mac::Hci::Pcie
+    }
     fn claim_pristine(&mut self) -> Result<(), Error>;
     fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send;
     fn read16(&mut self, reg: u16)
@@ -1110,7 +1114,8 @@ impl<I: Io> Owner<I> {
         self.phase = Phase::Failed;
         self.io.begin_mac()?;
         let hardware = super::hardware::Features::read(&mut self.io).await?;
-        let info = super::mac::prepare_for(&mut self.io, self.did).await?;
+        let hci = self.io.hci();
+        let info = super::mac::prepare_on(&mut self.io, self.did, hci).await?;
         self.io.finish_mac()?;
         self.mac = Some(info);
         self.hardware = Some(hardware);
