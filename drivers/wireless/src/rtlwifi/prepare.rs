@@ -144,6 +144,8 @@ pub struct Prepared<I: Io, M: Memory> {
     published: bool,
     radio: Option<super::radio::Report>,
     rtl8821ae: Option<super::rtl8821ae::phy::Report>,
+    rtl8821ae_identity: Option<[u8; 32]>,
+    rtl8821ae_power: Option<super::rtl8821ae::envelope::Permission>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -238,6 +240,8 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             published: false,
             radio: None,
             rtl8821ae: None,
+            rtl8821ae_identity: None,
+            rtl8821ae_power: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
@@ -338,8 +342,39 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::rtl8821ae::mac::configure(&self.io, &condition, &factory.logical, &factory.mac)
                 .await?;
         self.rtl8821ae = Some(report);
+        self.rtl8821ae_identity = Some(super::radio::factory_identity(factory));
         self.phase = Phase::RadioConfigured;
         Ok(report)
+    }
+    /// Admitted 8821AE 2.4 GHz operating point committed by
+    /// [`Self::configure_rtl8821ae_channel`].
+    pub fn rtl8821ae_permission(&self) -> Option<super::rtl8821ae::envelope::Permission> {
+        self.rtl8821ae_power
+    }
+    /// Continue the same retained 8821AE owner through the 2.4 GHz band
+    /// select, channel switch with the admitted per-board TXAGC indices, and
+    /// 20 MHz bandwidth (`rtl8821ae/channel.rs`). The permission must have
+    /// been minted from this owner's factory identity.
+    pub async fn configure_rtl8821ae_channel(
+        &mut self,
+        permission: super::rtl8821ae::envelope::Permission,
+    ) -> Result<(), Error> {
+        if !matches!(
+            self.phase,
+            Phase::RadioConfigured | Phase::ChannelConfigured
+        ) || self.chip != Chip::Rtl8821ae
+        {
+            return Err(Error::State);
+        }
+        if self.rtl8821ae_identity != Some(permission.identity()) {
+            return Err(Error::Power(super::channel_power::Error::Identity));
+        }
+        self.phase = Phase::Failed;
+        self.rtl8821ae_power = None;
+        super::rtl8821ae::channel::configure(&self.io, &permission).await?;
+        self.rtl8821ae_power = Some(permission);
+        self.phase = Phase::ChannelConfigured;
+        Ok(())
     }
     /// Prepare internal SRAM and masked, inactive native rings. The native
     /// Io validates current PCI authority/BME at each actual access. No helper

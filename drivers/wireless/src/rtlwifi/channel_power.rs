@@ -221,30 +221,7 @@ impl Calibration {
         channel: u8,
     ) -> Result<Permission, Error> {
         self.current()?;
-        if !(1..=11).contains(&channel) || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
-            return Err(Error::Policy);
-        }
-        let center = 2407 + u32::from(channel) * 5;
-        let lower = center - 10;
-        let upper = center + 10;
-        let mut limit = None;
-        for rule in &domain.rules {
-            if rule.freq_start_mhz < upper && rule.freq_end_mhz > lower {
-                if rule.freq_start_mhz > lower
-                    || rule.freq_end_mhz < upper
-                    || rule.max_bandwidth_mhz < 20
-                    || !rule.flags.is_empty()
-                {
-                    return Err(Error::Policy);
-                }
-                let ceiling = i16::from(rule.max_power_dbm) * 4;
-                limit = Some(limit.map_or(ceiling, |old: i16| old.min(ceiling)));
-            }
-        }
-        let eirp = limit
-            .ok_or(Error::Policy)?
-            .min(self.qualified)
-            .min(FACTORY_EIRP_QDBM);
+        let eirp = domain_ceiling(domain, channel)?.min(self.qualified);
         let curve = self
             .curves
             .iter()
@@ -305,6 +282,36 @@ impl Calibration {
                     })
                 })
     }
+}
+
+/// Host regulatory ceiling (quarter dBm) for one 2.4 GHz legacy20 channel
+/// 1..=11, capped by the shared Linux `regd.c` channel1-11 EIRP. Any
+/// partially overlapping, narrow or flagged rule refuses the channel.
+pub(super) fn domain_ceiling(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+) -> Result<i16, Error> {
+    if !(1..=11).contains(&channel) || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+        return Err(Error::Policy);
+    }
+    let center = 2407 + u32::from(channel) * 5;
+    let lower = center - 10;
+    let upper = center + 10;
+    let mut limit = None;
+    for rule in &domain.rules {
+        if rule.freq_start_mhz < upper && rule.freq_end_mhz > lower {
+            if rule.freq_start_mhz > lower
+                || rule.freq_end_mhz < upper
+                || rule.max_bandwidth_mhz < 20
+                || !rule.flags.is_empty()
+            {
+                return Err(Error::Policy);
+            }
+            let ceiling = i16::from(rule.max_power_dbm) * 4;
+            limit = Some(limit.map_or(ceiling, |old: i16| old.min(ceiling)));
+        }
+    }
+    Ok(limit.ok_or(Error::Policy)?.min(FACTORY_EIRP_QDBM))
 }
 
 /// Exact pathA factory/PG selection, without Linux scan turbo or thermal

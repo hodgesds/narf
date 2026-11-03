@@ -1504,12 +1504,39 @@ chain below is composed.
   release and IRQ masks (`IRQ_MASK`/`SYS_IRQ_MASK` recorded). Omitted: LED
   refresh, ASPM back door (ASPM stays disabled) and hardware CAM crypto.
 
-Remaining for the `rtl8821ae` chip row: power-by-rate and limit-to-index
-conversion, LCK/IQK `rtl8821ae_phy_iq_calibrate`),
-channel/bandwidth switching (`rtl8821ae_phy_sw_chnl`, `set_bw_mode`), H2C
-(media status, RA mask, PS), interrupt delivery, the native packet/station
-owner and a signed per-board envelope. Tests in `rtl8821ae/tests.rs` are
-written and unexecuted.
+- `txpower` / `envelope` / `channel` — 2.4 GHz path-A power and channel,
+  reached by `Prepared::configure_rtl8821ae_channel` (RadioConfigured →
+  ChannelConfigured, same retained owner, permission bound to the factory
+  identity committed by `configure_rtl8821ae`). `txpower` is the exact Linux
+  arithmetic: `_rtl8821ae_read_power_value_fromprom`/`_from_hwpg` path A
+  (CCK/BW40 groups, 4-bit signed BW20/OFDM diffs, `EEPROM_RF_BOARD_OPTION`
+  regulatory; an autoload-failed or out-of-range map yields no factory power
+  instead of Linux's `0x2D` defaults), `PHY_REG_PG` store/BCD base/relative
+  conversion (Linux's absolute difference kept), `TXPWR_LMT` minimum-of-rows,
+  limit-to-index conversion (including the 2.4 GHz VHT base carry-over) and
+  the `TXPWR_LMT_WW` minimum, `_rtl8821ae_phy_get_txpower_by_rate` and
+  `_rtl8821ae_get_txpower_index` (remnant indices 0, no thermal tracking; a
+  negative sum is refused rather than wrapped to `MAX_POWER_INDEX`).
+  `envelope` admits a channel only from a signed per-board `NAPC` v1 file
+  (`rtlwifi/rtl8821ae-cal-v1-<mac>.bin`: factory identity, MAC, antenna gain,
+  qualified EIRP, per-channel measured CCK/OFDM/1SS output curves for
+  channels 1-11, 20 MHz): each station rate (CCK, OFDM, MCS0-7, VHT1SS0-9)
+  gets the highest measured index not above the Linux index whose output
+  plus antenna gain fits min(host regulatory rule, qualification, `regd.c`
+  ch1-11 EIRP) — the shared `channel_power::domain_ceiling` policy. Unsigned,
+  foreign, unprovisioned or unmeasured ⇒ not admitted. `channel` programs
+  `rtl8821ae_phy_switch_wirelessband(2.4G)` with `phy_get_tx_swing_8812A`
+  (EFUSE `0xC6`, path-B decode wins as in Linux; RA/RB_TXSCALE), then
+  `sw_chnl_callback` (RFC_AREA `0x96a`, RF `0x18`), the admitted per-rate
+  TXAGC byte RMWs and `RA_TXPWRTRAING` (levels saturate at 2 instead of
+  Linux's `u32` wrap), then `set_bw_mode_callback(20 MHz)` incl. the Linux
+  path-B RF bandwidth write. LCK: `rtl8821ae_phy_lc_calibrate` is empty in
+  Linux and `hw_init` comments it out, so there is no 8821AE LCK effect.
+
+Remaining for the `rtl8821ae` chip row: IQK (`rtl8821ae_phy_iq_calibrate`,
+run by Linux DM two watchdog periods after link), H2C (media status, RA
+mask, PS), interrupt delivery, the native packet/station owner and probe
+wiring. Tests in `rtl8821ae/tests.rs` are written and unexecuted.
 
 ## 4. Invariants
 

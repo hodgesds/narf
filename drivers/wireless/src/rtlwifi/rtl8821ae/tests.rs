@@ -781,3 +781,247 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_rfe_type_and_crystal_rules
 );
+
+// ── 2.4 GHz power-by-rate, limits, TX power index, envelope, channel ──────
+
+fn powered_logical(diff: u8, option: u8) -> [u8; 512] {
+    let mut map = provisioned_logical();
+    map[0x10..0x16].copy_from_slice(&[0x20, 0x21, 0x22, 0x23, 0x24, 0x25]);
+    map[0x16..0x1b].copy_from_slice(&[0x28, 0x29, 0x2a, 0x2b, 0x2c]);
+    map[0x1b] = diff;
+    map[txpower::EEPROM_RF_BOARD_OPTION] = option;
+    map[envelope::EEPROM_SWING_2G] = 0x04; // path B decode 1 => -3 dB
+    map
+}
+
+fn smoke_rtl8821ae_power_by_rate_bases_and_relative() -> TestResult {
+    let by_rate = txpower::ByRate::from_table();
+    // CCK 0x32343638: base = BCD(11M byte) 32, |x - 32| per byte.
+    if by_rate.base[0][..3] != [32, 28, 26] || by_rate.base[0][4] != 24 {
+        return TestResult::Fail("PG BCD bases (CCK/OFDM/HT/VHT1SS)");
+    }
+    if by_rate.offset[0][0] != 0x0002_0406
+        || by_rate.offset[0][1] != 0x0808_0a0a
+        // VHT1SS MCS8/9 (bytes 0..1) vs VHT1SS base 24; bytes 2..3 vs the
+        // never-stored VHT2SS base 0.
+        || by_rate.offset[0][9] != 0x0000_0402
+    {
+        return TestResult::Fail("dBm to Linux relative (absolute difference) values");
+    }
+    // Limit conversion: CCK channel 1 under WW is min over regulations of
+    // (limit - CCK base); VHT 2.4 GHz has no rows and stays MAX_POWER_INDEX.
+    let expected = [
+        power_limit::Regulation::Fcc,
+        power_limit::Regulation::Etsi,
+        power_limit::Regulation::Mkk,
+    ]
+    .iter()
+    .filter_map(|r| {
+        power_limit::limit(
+            *r,
+            power_limit::Band::B2g,
+            power_limit::Bandwidth::Bw20,
+            power_limit::Section::Cck,
+            1,
+            1,
+        )
+    })
+    .map(|l| l as i8 - 32)
+    .min()
+    .unwrap_or(63);
+    if by_rate.limit(0, 1) != expected || by_rate.limit(30, 1) != 63 {
+        return TestResult::Fail("WW limit-to-index conversion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_power_by_rate_bases_and_relative
+);
+
+fn smoke_rtl8821ae_txpower_index_arithmetic() -> TestResult {
+    let by_rate = txpower::ByRate::from_table();
+    // bw20 diff -1 (0xf), OFDM diff +2; regulatory 2 skips by-rate/limits.
+    let factory = match txpower::Factory::from_logical(&powered_logical(0xf2, 2)) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("provisioned factory power rejected"),
+    };
+    if factory.bw20_diff != -1 || factory.ofdm_diff != 2 || factory.regulatory != 2 {
+        return TestResult::Fail("4-bit signed diffs / regulatory selector");
+    }
+    let idx = |rate, ch| by_rate.index(&factory, rate, ch);
+    if idx(0, 1) != Ok(0x20)
+        || idx(0, 14) != Ok(0x25)
+        || idx(4, 6) != Ok(0x2a + 2)
+        || idx(12, 11) != Ok(0x2b - 1)
+        || idx(20, 1).is_ok()
+        || idx(0, 36).is_ok()
+    {
+        return TestResult::Fail("regulatory-2 base/diff/channel group selection");
+    }
+    let factory = txpower::Factory::from_logical(&powered_logical(0x00, 0xff)).unwrap();
+    if factory.regulatory != 0 {
+        return TestResult::Fail("0xff board option => regulatory 0");
+    }
+    let expected = 0x20i16 + i16::from(by_rate.by_rate(1, 1, 0));
+    if by_rate.index(&factory, 1, 1) != Ok(expected.min(63) as u8) {
+        return TestResult::Fail("by-rate offset added to the CCK index");
+    }
+    let mut map = powered_logical(0, 0);
+    map[0x11] = 0xff;
+    if txpower::Factory::from_logical(&map).is_ok() {
+        return TestResult::Fail("autoload-fail power map admitted with Linux defaults");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_txpower_index_arithmetic
+);
+
+fn napc(factory: &crate::rtlwifi::efuse::Factory, channels: &[u8], output: i16) -> Vec<u8> {
+    let row = 4 + 3 * 64 * 2;
+    let total = 96 + channels.len() * row;
+    let mut b = vec![0u8; total];
+    b[..4].copy_from_slice(b"NAPC");
+    b[4..6].copy_from_slice(&1u16.to_le_bytes());
+    b[6..8].copy_from_slice(&96u16.to_le_bytes());
+    b[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    b[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    b[14..16].copy_from_slice(&0x8821u16.to_le_bytes());
+    b[16..48].copy_from_slice(&crate::rtlwifi::radio::factory_identity(factory));
+    b[48..54].copy_from_slice(&factory.mac);
+    b[56..58].copy_from_slice(&8i16.to_le_bytes());
+    b[58..60].copy_from_slice(&80i16.to_le_bytes());
+    b[60..62].copy_from_slice(&(channels.len() as u16).to_le_bytes());
+    b[62..64].copy_from_slice(&20u16.to_le_bytes());
+    for (n, ch) in channels.iter().enumerate() {
+        let at = 96 + n * row;
+        b[at] = *ch;
+        for i in 0..192 {
+            // Output rises 1 qdBm per index above `output` at index 0.
+            let v = output + (i % 64) as i16;
+            b[at + 4 + i * 2..at + 6 + i * 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    b
+}
+
+fn smoke_rtl8821ae_signed_envelope_admission() -> TestResult {
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x02],
+        logical: powered_logical(0xf2, 2),
+    };
+    let bytes = napc(&factory, &[1, 6], 30);
+    if envelope::Calibration::from_verified(&bytes, None, &factory).is_ok() {
+        return TestResult::Fail("unsigned envelope admitted");
+    }
+    let mut other = factory.clone();
+    other.mac[5] ^= 1;
+    if envelope::Calibration::from_verified(&bytes, Some([1; 32]), &other).is_ok() {
+        return TestResult::Fail("another board's envelope admitted");
+    }
+    let cal = match envelope::Calibration::from_verified(&bytes, Some([1; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("valid signed envelope rejected"),
+    };
+    let domain = crate::rtlwifi::channel_power::tests::domain(20);
+    let p = match cal.permission(&domain, 1) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("covered channel refused"),
+    };
+    // EIRP min(80 regulatory, 80 qualified, 80 regd) minus antenna 8 => output
+    // <= 72 => index <= 42; Linux CCK ch1 is 0x20 (32) so CCK stays 32 and
+    // OFDM/HT (0x2a, 0x27) stay within the bound too.
+    if p.index(0) != 0x20 || p.index(4) != 0x2a || p.index(12) != 0x27 || p.swing() != 0x16a {
+        return TestResult::Fail("Linux index not kept under a looser envelope");
+    }
+    let tight = crate::rtlwifi::channel_power::tests::domain(15);
+    // 60 - 8 = 52 qdBm => index 22.
+    match cal.permission(&tight, 1) {
+        Ok(p) if p.index(0) == 22 && p.index(4) == 22 && p.eirp_limit_qdbm() == 60 => {}
+        _ => return TestResult::Fail("measured envelope did not lower the index"),
+    }
+    if cal.permission(&domain, 3).is_ok() || cal.permission(&domain, 12).is_ok() {
+        return TestResult::Fail("unmeasured or out-of-plan channel admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_signed_envelope_admission
+);
+
+fn smoke_rtl8821ae_band_channel_bw20_txagc_order() -> TestResult {
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x03],
+        logical: powered_logical(0xf2, 2),
+    };
+    let cal =
+        envelope::Calibration::from_verified(&napc(&factory, &[6], 30), Some([1; 32]), &factory)
+            .unwrap();
+    let p = cal
+        .permission(&crate::rtlwifi::channel_power::tests::domain(20), 6)
+        .unwrap();
+    let mut regs = vec![0u8; 0x1000];
+    regs[0x668] = 0xff;
+    regs[0x669] = 0x01;
+    let io = RegFake(IrqSafeSpinLock::new((regs, Vec::new())));
+    if narf_scheduler::block_on(channel::configure(&io, &p)).is_err() {
+        return TestResult::Fail("channel configure failed on model");
+    }
+    let g = io.0.lock();
+    let (r, trace) = (&g.0, &g.1);
+    let r32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+    if r32(0x808) & 0x3000_0000 != 0x3000_0000
+        || r32(0xcb0) & 0xf0f0 != 0x7070
+        || (r32(0xc1c) >> 8) & 0xf != 0
+        || r32(0xc1c) >> 21 != 0x16a
+        || r32(0xe1c) >> 21 != 0x16a
+        || (r32(0x80c) >> 4) & 0xf != 1
+        || (r32(0xa04) >> 24) & 0xf != 1
+        || !trace.contains(&(1, 0x454, 0))
+    {
+        return TestResult::Fail("switch_wirelessband(2.4G) effects");
+    }
+    if (r32(0x860) >> 17) & 0xfff != 0x96a {
+        return TestResult::Fail("RFC_AREA 2.4 GHz value");
+    }
+    let lssi: Vec<u32> = trace
+        .iter()
+        .filter(|w| w.1 == phy::RA_LSSIWRITE)
+        .map(|w| w.2)
+        .collect();
+    if lssi.len() != 3 || lssi[1] != (0x18 << 20 | 6) || lssi[2] & (3 << 10) != 3 << 10 {
+        return TestResult::Fail("RF 0x18 band clear, channel byte, BW20 bits (path A)");
+    }
+    if !trace.iter().any(|w| w.1 == channel::RB_LSSIWRITE) {
+        return TestResult::Fail("Linux path-B RF bandwidth write missing");
+    }
+    if r[0xc20] != p.index(0)
+        || r[0xc24] != p.index(4)
+        || r[0xc2c] != p.index(12)
+        || r[0xc33] != p.index(19)
+        || r[0xc3c] != p.index(28)
+    {
+        return TestResult::Fail("TXAGC bytes not the admitted indices");
+    }
+    let m7 = i32::from(p.index(19));
+    let t = |v: i32| v.max(2) as u32;
+    if r32(0xc54) & 0xff_ffff != t(m7 - 10) | t(m7 - 18) << 8 | t(m7 - 24) << 16 {
+        return TestResult::Fail("TX power training levels");
+    }
+    if u16::from_le_bytes([r[0x668], r[0x669]]) != 0x007f
+        || r[0x483] != 0
+        || r32(0x8ac) & 0x0030_03c3 != 0x0030_0200
+        || r32(0x8c4) & (1 << 30) != 0
+        || (r32(0x848) >> 22) & 0xf != 8
+    {
+        return TestResult::Fail("set_bw_mode(20 MHz) effects");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_band_channel_bw20_txagc_order
+);
