@@ -218,7 +218,8 @@ impl Peer {
 }
 
 /// `rtl8821ae_update_hal_rate_mask` H2C payload for the INFRA station (MACID
-/// 0, `rf_type` 1T1R, `current_chan_bw` 20 MHz). `bw40` is `mac->bw_40`;
+/// 0, `rf_type` 1T1R, 2.4 GHz). `bw40` is `mac->bw_40` (and the station's
+/// `current_chan_bw`);
 /// `rssi_level` is the DM level (0 at association). Returns the 7-byte
 /// `H2C_8821AE_RA_MASK` body; the caller then sets `REG_BCN_CTRL` BIT(3).
 pub fn rate_mask(peer: &Peer, bw40: bool, rssi_level: u8, update_bw: bool) -> [u8; 7] {
@@ -253,8 +254,9 @@ pub fn rate_mask(peer: &Peer, bw40: bool, rssi_level: u8, update_bw: bool) -> [u
         }
     };
     let sgi = peer.ht.is_some() && (peer.sgi20 || peer.sgi40);
-    // current_chan_bw 0 | !update_bw << 3 | vht_eni 0 | ldpc 0.
-    let byte2 = u8::from(!update_bw) << 3;
+    // current_chan_bw | !update_bw << 3 | vht_eni 0 | ldpc 0. A station's
+    // `current_chan_bw` is HT_CHANNEL_WIDTH_20_40 exactly when `mac->bw_40`.
+    let byte2 = u8::from(bw40) | u8::from(!update_bw) << 3;
     let b = bitmap.to_le_bytes();
     [
         0,

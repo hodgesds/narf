@@ -69,6 +69,8 @@ pub(in super::super) struct State {
     /// arrives) and whether `rtl8821ae_dm_update_init_rate` is still due.
     ra_rate: Option<u8>,
     ra_due: bool,
+    /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` software cache).
+    pub(super) min_space_cfg: u8,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -83,6 +85,7 @@ impl State {
             report: None,
             ra_rate: None,
             ra_due: false,
+            min_space_cfg: 0,
         }
     }
     /// `rtl_c2h_content_parsing` for the packets this profile consumes.
@@ -142,11 +145,19 @@ fn ratr_index(payload: &[u8; 7]) -> Option<u8> {
     match payload[1] & 0x7f {
         8 => Some(6), // RATR_INX_WIRELESS_B
         6 => Some(4), // RATR_INX_WIRELESS_GB
-        _ => None,    // HT is not admitted on this profile.
+        1 => Some(0), // RATR_INX_WIRELESS_NGB (WIRELESS_MODE_N_24G)
+        _ => None,    // 5 GHz / VHT masks are not installed on this profile.
     }
 }
 
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
+    /// `mac->min_space_cfg` for `rtl8821ae::ht::timing`.
+    pub(crate) fn rtl8821ae_min_space_cfg(&self) -> u8 {
+        self.packet.ae.min_space_cfg
+    }
+    pub(crate) fn set_rtl8821ae_min_space_cfg(&mut self, value: u8) {
+        self.packet.ae.min_space_cfg = value;
+    }
     fn ae_validate_rings(&self) -> Result<(), Error> {
         for (queue, ring) in self.tx.iter().enumerate() {
             ring.sync();
@@ -255,7 +266,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase = Phase::Failed;
         hw::set_bssid(&self.io, peer)?;
-        hw::configure_rates(&self.io, rates, basic, capability)?;
+        hw::configure_rates(&self.io, rates, basic, capability, false)?;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -575,10 +586,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(super::super::super::irq::Recognized { inta, intb })
     }
 
-    /// `rtl8821ae_tx_fill_desc` for one legacy first+last MPDU (no early
+    /// `rtl8821ae_tx_fill_desc` for one first+last MPDU (no early
     /// mode): forced `hw_rate` with fallback disabled, or (`adaptive`,
     /// ordinary unicast DATA with an installed mask) firmware RA with
-    /// fallback; BW 20, no SGI/AGG, RTS/CTS or CTS-to-self from the
+    /// fallback; BW 20; on an HT link (`packet.ht`) the data SGI bit for
+    /// `hw_rate > DESC_RATEMCS0` (`_rtl_query_shortgi`), AGG_EN +
+    /// MAX_AGG_NUM 0x1f for an operational BA session's QoS DATA
+    /// (`IEEE80211_TX_CTL_AMPDU`) and the peer's `ampdu_density`; RTS/CTS or
+    /// CTS-to-self from the
     /// selected protection mode, no hardware key, HWSEQ for non-QoS
     /// frames, MACID 0, RATE_ID the installed `ratr_index` for unicast (MC
     /// otherwise) and `SPE_RPT`/`SW_DEFINE` for EAPOL and Null frames.
@@ -593,7 +608,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
-        if aggregate.is_some() || short_gi || rate > trx::DESC_RATE54M {
+        let ht = self.packet.ht;
+        let highest = if ht {
+            super::super::super::rtl8821ae::ht::DESC_RATEMCS7
+        } else {
+            trx::DESC_RATE54M
+        };
+        if !ht && (aggregate.is_some() || short_gi) || rate > highest {
             return Err(Error::Packet);
         }
         let (queue, poll, selector) = queue(
@@ -624,7 +645,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let multicast = destination[0] & 1 != 0;
         // rtl_get_tcb_desc: ordinary unicast DATA (rates[0].idx != 0, not
         // Null) leaves use_driver_rate/disable_ratefallback clear and sets
-        // hw_rate to the mode's highest rate (11M for B, 54M otherwise);
+        // hw_rate to the mode's highest rate (`_rtl_get_highest_n_rate`
+        // MCS7 for a 1T1R HT peer, else 11M for B, 54M otherwise);
         // the firmware RA owns the rate inside the installed mask.
         // `sta` is the AP addressed by addr1, so RATE_ID is its
         // `ratr_index` whatever the DA.
@@ -639,6 +661,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             _ => None,
         };
         let hw_rate = match adaptive {
+            Some(0) => super::super::super::rtl8821ae::ht::DESC_RATEMCS7,
             Some(6) => 0x03,
             Some(_) => trx::DESC_RATE54M,
             None => rate,
@@ -669,11 +692,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             hw_rate,
             use_driver_rate: adaptive.is_none(),
             disable_fallback: adaptive.is_none(),
-            short: false,
+            // hw_rate > DESC_RATEMCS0 ? use_shortgi : use_shortpreamble.
+            short: short_gi && hw_rate > super::super::super::rtl8821ae::ht::DESC_RATEMCS0,
             data_bw: 0,
             sub_carrier: 0,
-            ampdu: false,
-            ampdu_density: 0,
+            ampdu: aggregate.is_some_and(|(_, operational)| operational),
+            ampdu_density: aggregate.map_or(0, |(density, _)| density),
             sec_type: 0,
             qos_data: frame[0] == 0x88,
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
@@ -798,6 +822,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let ring = self.receive.as_mut().ok_or(Error::State)?;
         let buffer = &self.buffers[slot];
         let channel = self.rtl8821ae_power.ok_or(Error::State)?.channel();
+        let ht = self.packet.ht;
         let (consumed, packet, report) = self.io.authority(true, || {
             ring.sync();
             let offset = slot * RX_BYTES;
@@ -828,12 +853,23 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 buffer.read_bytes(start, &mut bytes[..take])?;
                 report = Some((bytes, take));
             }
+            // HT link: MCS0-7 (1T1R) and A-MPDU members (the station BA
+            // owner gates them) up to a 7935-byte A-MSDU MPDU.
+            let rate_ok = status.rate <= trx::DESC_RATE54M
+                || ht
+                    && status.is_ht()
+                    && status.rate <= super::super::super::rtl8821ae::ht::DESC_RATEMCS7;
+            let longest = if ht {
+                26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
+            } else {
+                2304 + 4
+            };
             if !status.c2h
                 && !status.hw_error()
-                && !status.ampdu
-                && status.rate <= trx::DESC_RATE54M
+                && (!status.ampdu || ht)
+                && rate_ok
                 && status.bw == 0
-                && (24..=2304 + 4).contains(&length)
+                && (24..=longest).contains(&length)
             {
                 buffer.sync();
                 let mut bytes = Vec::new();
@@ -857,13 +893,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     } else {
                         None
                     };
+                    // Linux reports `is_short_gi = !SPLCP` for rate
+                    // statistics only; every GI is advertised, so nothing
+                    // is gated on it here.
                     packet = Some(Mpdu {
                         bytes,
                         channel,
-                        ht: false,
+                        ht: status.is_ht(),
                         short_gi: false,
                         width40: false,
-                        aggregated: false,
+                        aggregated: status.ampdu,
                         pwdb,
                         antenna_mux: None,
                     });

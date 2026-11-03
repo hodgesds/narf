@@ -53,6 +53,7 @@ pub mod envelope;
 pub mod fw;
 pub mod h2c;
 pub mod headerfile;
+pub mod ht;
 pub mod iqk;
 pub mod llt;
 pub mod mac;

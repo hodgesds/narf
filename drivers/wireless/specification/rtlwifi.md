@@ -1704,12 +1704,11 @@ chain below is composed.
     `_rtl_query_protection_mode`: RTS/CTS sets `RTS_EN`, CTS-to-self
     `CTS2SELF`, both `RTS_RATE = DESC_RATE24M`, long preamble. No NERT
     continuation is needed: the RTS rate must be in the `NAPC` admitted
-    set (checked per frame, above). Only legacy rates are admitted (no HT, A-MPDU or SGI
-    yet). The host receipt checks OWN clear with dwords
+    set (checked per frame, above). HT is described below. The host receipt checks OWN clear with dwords
     0/1/7, the buffer in dword 10, dword 11/13 zero and the linked next
     pointer.
   - RX: `rtl8821ae_rx_query_desc` fields; anything outside the legacy
-    20 MHz profile (CRC/ICV, A-MPDU, HT/VHT rate, BW ≠ 20) is consumed and
+    20 MHz profile (or, on an HT link, the HT20 profile below) (CRC/ICV, A-MPDU, HT/VHT rate, BW ≠ 20) is consumed and
     dropped; payload at drvinfo + shift (the PCI buffer holds no
     descriptor); FCS stripped; protected frames require SWDEC (software
     CCMP). With PHYST the `trx.c::query_rxphystatus` PWDB is decoded from
@@ -1771,7 +1770,35 @@ chain below is composed.
   - Not composed for 8821AE: ASPM (kept disabled), channel retune and the
     fresh-generation recovery rebuild (both refused; the owner keeps its
     provisioned channel and a failed owner stays failed), WMM EDCA from the
-    AP (Linux 8821AE ignores it too), HT/VHT, 5 GHz, BT coexistence.
+    AP (Linux 8821AE ignores it too), VHT, 5 GHz, BT coexistence.
+  - HT20 station (`rtl8821ae/ht.rs`). HT is offered only when the AP
+    has WMM and the current `NAPC` permission admits every rate of the
+    Linux association RA mask (`ht::admitted`: MCS0-7 measured), so the
+    `RATEID_IDX_BGN_40M_1SS` mask stays a subset of the admitted set.
+    Capability: `base.c::_rtl_init_hw_ht_capab` for 1T1R — SGI20, MAX_AMSDU
+    (7935-byte RX; `disable_amsdu_8k` unset), A-MPDU factor 3 (64K),
+    density 7 (16 us), RX/TX MCS0-7 `TX_DEFINED`, SMPS disabled, no
+    STBC/LDPC; the 20/40 bit with SGI40/DSSSCCK40 only with a 40 MHz
+    permission (HT20 form otherwise, since the station could not follow a
+    40 MHz BSS). Not advertised, deliberately: MCS32 (`rx_mask[4]`) and
+    `rx_highest` (left 0). At association (`BSS_CHANGED_HT`):
+    `HW_VAR_SHORTGI_DENSITY` / `HW_VAR_AMPDU_FACTOR` (8821AE `(0x2000 <<
+    min(peer, 3)) - 1`, `0xffff` at 64K, BIT(31), `0x458`) /
+    `HW_VAR_AMPDU_MIN_SPACE` (density `max(7, peer)` into the
+    `min_space_cfg` cache, `0x45c`), inside the station publication;
+    `mac->mode = WIRELESS_MODE_N_24G` gives SIFS `0x0e`. RA mask: the
+    mac80211 intersection (`tx_mcs`, both-side SGI) into
+    `rtl8821ae_update_hal_rate_mask` (N24 rows, `current_chan_bw`, SGI bit),
+    descriptor RATE_ID `RATR_INX_WIRELESS_NGB` (0) and RA initial rate
+    `DESC_RATEMCS7` (`_rtl_get_highest_n_rate`). TX: data SGI only for
+    `hw_rate > DESC_RATEMCS0`, AGG_EN + MAX_AGG_NUM `0x1f` for an
+    operational originator BA TID, the peer's `ampdu_density`; the shared
+    station BA/ADDBA/reorder owner is unchanged. RX: MCS0-7 and A-MPDU
+    members accepted on the HT link (BW 20 only), MPDUs up to the 7935-byte
+    A-MSDU; Linux's `is_short_gi = !SPLCP` only feeds rate statistics, so
+    no frame is gated on it. An AP with HT protection mode ≠ 0 is refused
+    (as on 88EE). Test `smoke_rtl8821ae_ht_capability_timing_and_n_mask`
+    (written, unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
     9100-byte `prepare::RX_BUFFER` the ring builder requires (it was 4096).
   Tests `smoke_rtl8821ae_native_owner_start_descriptors_receipt_and_rx`,

@@ -1779,3 +1779,63 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_rcr_settles_after_mac_table_rewrite
 );
+
+/// `_rtl_init_hw_ht_capab` 1T1R body, `BSS_CHANGED_HT` A-MPDU registers and
+/// the N-mode RA mask / RATE_ID pairing.
+fn smoke_rtl8821ae_ht_capability_timing_and_n_mask() -> TestResult {
+    use super::ht;
+    // SMPS disabled 0x0c | SGI20 0x20 | MAX_AMSDU 0x800; factor 3, density 7.
+    let narrow = ht::capability(false).capability_body();
+    if narrow[..3] != [0x2c, 0x08, 3 | 7 << 2] || narrow[3] != 0xff || narrow[7] != 0 {
+        return TestResult::Fail("HT20 capability body not the Linux 1T1R form");
+    }
+    // + SUP_WIDTH_20_40 0x2, SGI_40 0x40, DSSSCCK40 0x1000.
+    let wide = ht::capability(true).capability_body();
+    if wide[..2] != [0x6e, 0x18] || wide[15] != 1 {
+        return TestResult::Fail("HT20/40 capability body not the Linux 1T1R form");
+    }
+    let io = RegFake(IrqSafeSpinLock::new((vec![0; 0x1000], Vec::new())));
+    let mut cfg = 0u8;
+    if ht::timing(&io, &mut cfg, 1, 4).is_err() {
+        return TestResult::Fail("timing failed");
+    }
+    // Peer factor 1 lowers the 64K cap; density stays the local 7.
+    let expected = vec![
+        (1, ht::REG_AMPDU_MIN_SPACE, 0),
+        (4, ht::REG_AMPDU_MAX_LENGTH_8812, 0x8000_3fff),
+        (1, ht::REG_AMPDU_MIN_SPACE, 7),
+    ];
+    if io.0.lock().1 != expected || cfg != 7 {
+        return TestResult::Fail("BSS_CHANGED_HT register order/values differ");
+    }
+    io.0.lock().1.clear();
+    if ht::timing(&io, &mut cfg, 3, 0).is_err()
+        || io.0.lock().1
+            != vec![
+                (1, ht::REG_AMPDU_MIN_SPACE, 7),
+                (4, ht::REG_AMPDU_MAX_LENGTH_8812, 0x8000_ffff),
+                (1, ht::REG_AMPDU_MIN_SPACE, 7),
+            ]
+    {
+        return TestResult::Fail("64K factor must program 0xffff | BIT31");
+    }
+    let n = h2c::Peer {
+        legacy: 0xfff,
+        ht: Some([0xff, 0]),
+        sgi20: true,
+        sgi40: false,
+    };
+    let mask = h2c::rate_mask(&n, false, 0, true);
+    // RATR_INX_WIRELESS_NGB -> RATEID_IDX_BGN_40M_1SS (1) | SGI.
+    if mask != [0, 0x81, 0, 0x05, 0xf0, 0x0f, 0] {
+        return TestResult::Fail("HT20 RA mask payload differs from Linux");
+    }
+    if h2c::mask_rates(&mask) != Some(0x5 | (0xff << 12)) || ht::MCS0_7 != 0xff << 12 {
+        return TestResult::Fail("HT mask not mapped onto MCS0-7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_ht_capability_timing_and_n_mask
+);

@@ -183,13 +183,17 @@ pub(crate) struct Candidate {
     pub rsnxe: Option<Vec<u8>>,
 }
 impl Candidate {
-    fn receive(frame: &Mpdu, local: [u8; 6], ht: bool) -> Result<Self, Error> {
+    fn receive(
+        frame: &Mpdu,
+        local: [u8; 6],
+        ht: Option<&association::phy::LocalPhy>,
+    ) -> Result<Self, Error> {
         let channel = frame.channel();
         if !(1..=11).contains(&channel) {
             return Err(Error::Profile);
         }
-        let observed = if ht {
-            association::observe_with_phy(frame, channel, local, None, &super::super::ht::local())
+        let observed = if let Some(phy) = ht {
+            association::observe_with_phy(frame, channel, local, None, phy)
         } else {
             association::observe(frame, channel, local, None)
         }
@@ -1034,6 +1038,14 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             domain,
         )
     }
+    /// RTL8821AE: the current `NAPC` permission admits the HT station
+    /// (every MCS0-7 rate the Linux RA mask names holds a measured index).
+    pub(crate) fn rtl8821ae_ht(&self) -> bool {
+        self.chip == super::Chip::Rtl8821ae
+            && self
+                .rtl8821ae_power
+                .is_some_and(|p| super::super::rtl8821ae::ht::admitted(&p))
+    }
     /// The 8821AE `NAPC` envelope that minted this owner's channel grant.
     pub(crate) fn stage_rtl8821ae_calibration(
         &mut self,
@@ -1694,13 +1706,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let has_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
             .map_err(|_| Error::Profile)?
             .is_some();
-        let mut plan = if self.station.ht.is_some() && has_wmm {
+        let mut plan = if (self.station.ht.is_some() || self.rtl8821ae_ht()) && has_wmm {
+            let phy = if self.chip == super::Chip::Rtl8821ae {
+                super::super::rtl8821ae::ht::local(false)
+            } else {
+                self.local_ht_for(&candidate)?
+            };
             JoinPlan::prepare_with_phy(
                 &candidate.bss,
                 self.local().ok_or(Error::State)?,
                 ssid,
                 mode,
-                self.local_ht_for(&candidate)?,
+                phy,
             )
         } else {
             JoinPlan::prepare(
@@ -1831,6 +1848,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 rates,
                                 basic,
                                 self.station.capability,
+                                self.station.ht_profile.is_some(),
                             );
                         }
                         super::super::station_control::configure_rates(
@@ -1849,6 +1867,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         if self.station.wmm.is_none() || profile.operation().protection() != 0 {
                             return Err(Error::Profile);
                         }
+                        if self.chip == super::Chip::Rtl8821ae {
+                            if !self.rtl8821ae_ht() || self.packet.width.is_some() {
+                                return Err(Error::Profile);
+                            }
+                            let mut min_space = self.rtl8821ae_min_space_cfg();
+                            self.station_publication(environment, || {
+                                super::super::rtl8821ae::ht::timing(
+                                    &self.io,
+                                    &mut min_space,
+                                    profile.peer_ampdu_factor(),
+                                    profile.peer_mpdu_density(),
+                                )
+                            })?;
+                            self.set_rtl8821ae_min_space_cfg(min_space);
+                            self.check_station_policy(environment)?;
+                            self.packet.ht = true;
+                        }
+                    }
+                    if self.station.ht_profile.is_some() && self.chip != super::Chip::Rtl8821ae {
                         let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
                         let timing = || super::super::station_control::ht_timing(&self.io);
                         if let Some(antenna) = &self.station.antenna {
@@ -2091,7 +2128,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.station.ra.sample(pwdb);
                 }
             }
-            if let Ok(candidate) = Candidate::receive(&frame, own, self.station.ht.is_some()) {
+            let observe = if self.station.ht.is_some() {
+                Some(super::super::ht::local())
+            } else if self.rtl8821ae_ht() {
+                Some(super::super::rtl8821ae::ht::local(false))
+            } else {
+                None
+            };
+            if let Ok(candidate) = Candidate::receive(&frame, own, observe.as_ref()) {
                 if self.station.phase == Phase::Passive {
                     self.cache_candidate(candidate, now);
                 } else if Some(candidate.bss.bssid) == peer {
@@ -2531,16 +2575,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         environment: &impl Environment,
     ) -> Result<(), Error> {
         use super::super::rtl8821ae::h2c;
-        if self.station.ht_profile.is_some() {
+        // `sta->deflink.ht_cap` is mac80211's intersection
+        // (`ieee80211_ht_cap_ie_to_sta_ht_cap`): the peer's RX MCS set
+        // within ours, SGI only where both sides support it.
+        let ht = self.station.ht_profile;
+        if ht.is_some() && !self.rtl8821ae_ht() {
             return Err(Error::Profile);
         }
+        let bw40 = self.packet.width.is_some();
         let peer = h2c::Peer {
             legacy: rates & 0xfff,
-            ht: None,
-            sgi20: false,
-            sgi40: false,
+            ht: ht.map(|p| [p.tx_mcs()[0], 0]),
+            sgi20: ht.is_some_and(|p| p.tx_sgi20()),
+            sgi40: ht.is_some_and(|p| p.tx_sgi40()),
         };
-        let payload = h2c::rate_mask(&peer, false, level, true);
+        let payload = h2c::rate_mask(&peer, bw40, level, true);
         let base = self
             .station
             .calibration
