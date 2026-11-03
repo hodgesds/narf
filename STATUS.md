@@ -2335,6 +2335,33 @@ Navi48 prefixes. One Clippy fix was needed. The production boot was not run,
 because the only probe change (VBT eDP facts) cannot be reached in QEMU. None
 of this has run on physical Intel hardware.
 
+### Display runtime-PM wakerefs, integrated autosuspend and D3cold — targeted release gates recorded
+
+Display power now takes part in PCI runtime PM, as Linux's display wakerefs
+do:
+- Every lit pipe, every display-14 `DC_off` reference and the pending DC
+  re-entry hold a usage reference on the function's runtime-PM device.
+- Autosuspend is now armed on MTL/Arrow and Gen12 owners that have a display.
+  The lit panel's wakeref keeps the function in D0. The owned modeset holds a
+  `DC_off` reference across its crtc disable/enable, so the panel's count never
+  reaches zero mid-modeset.
+- While the function is suspended, HPD is polled every 10 s, and each detect
+  takes a wakeref.
+- Display work started during suspend fails closed before any MMIO.
+- Runtime D3cold now names its refusal reason, following Linux's checks: no
+  root port, no PME from D3cold, no `_PR3`, or 300 MiB or more of VRAM in use
+  (rounded up per MiB).
+
+Hardware-test caveat: the `modeset_xelpg` kernel-test fixtures use the default
+pipe-DMC sink. On real MTL hardware they reach the production DC service and
+move the panel's display wakeref. QEMU is unaffected.
+
+Each code commit compiles on its own. One targeted release run with the
+production boot passed 241 tests with no failures, and both btrfs postflights
+passed. The run covered the runtime-power, DC-state, display-14 modeset, pipes
+and external, KMS, HuC and GT prefixes, plus `power/runtime`. None of this has
+run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

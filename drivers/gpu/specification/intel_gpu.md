@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.55** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.56** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -42,8 +42,9 @@
 > bank topology entry, shared-GGTT GuC TLB invalidation on both GTs,
 > display-14 PSR on hardware inputs, and MTL external outputs on Pipes
 > B–D beside the lit panel with the panel's KMS, PSR and FBC services,
-> and display-14 DSC/FEC with the panel-fitter model pass release native
-> model gates — see §20).
+> display-14 DSC/FEC with the panel-fitter model, and display runtime-PM
+> wakerefs with integrated autosuspend pass release native model gates —
+> see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -5513,7 +5514,7 @@ restore path, additional flush consumers and media-GT power management
 remain open. Linux's DMI quirk for BMG on NUC13RNG is not modelled, since
 D3cold is never capable here.
 
-Native fixtures, new and unexecuted in this slice:
+Native fixtures:
 
 - `drivers/gpu/intel_gpu_power`:
   `smoke_display_rpm_lit_panel_keeps_d0_and_dark_panel_autosuspends`,
@@ -5531,3 +5532,38 @@ The fixtures drive the real runtime-PM core and PCI layer over a model
 config space and a fake clock. The GT owner's own park and unpark, the
 polled detect and the system-sleep reference are wired but run only on
 hardware.
+
+Integration: the code applied without conflicts, and each code commit was
+checked to compile on its own (`8dc828941` and `cc7a79c41` as cherry-picked).
+One targeted release run with the production boot passed 241 tests with no
+failures, and both btrfs postflights passed. The run covered these prefixes,
+all under `drivers/gpu/` except the last:
+- `intel_gpu_power` (17 tests)
+- `intel_gpu_dc_states` (17)
+- `intel_gpu_modeset_xelpg` (20)
+- `intel_gpu_xelpg_pipes` (9)
+- `intel_gpu_xelpg_external` (29)
+- `intel_gpu_kms` (116)
+- `intel_gpu_huc` (8)
+- `intel_gpu_gt` (17)
+- `power/runtime` (8)
+
+Review against Linux b90c984d agreed on the following:
+- `xe_pm_pci_d3cold_capable` checks the root port, then PME from D3cold, then
+  `_PR3`, in Linux's order.
+- `xe_pm_d3cold_allowed_toggle` rounds VRAM use up per MiB and allows D3cold
+  only below the 300 MiB `DEFAULT_VRAM_THRESHOLD`.
+- `DRM_OUTPUT_POLL_PERIOD` is 10 s.
+- `pipe_lit` takes `get_noresume` only for a newly lit pipe, and `pipe_dark`
+  puts with autosuspend only for a pipe that was lit.
+- Display-14 `DC_off` references take a wakeref only while the function is
+  runtime-active, and fail closed before MMIO otherwise.
+- The owned modeset holds `DcUser::Modeset` around its crtc dark-then-lit
+  window, so the panel's wakeref never reaches zero inside a modeset.
+
+Hardware-test caveat: the `modeset_xelpg` fixtures build `XeLpgModeset` with
+the default `ServicePipeDmc` sink. On real MTL hardware running kernel tests,
+they reach the production DC service and now also move the panel's display
+wakeref. QEMU is unaffected.
+
+The debug group pass is deferred to the end of the campaign.
