@@ -14,6 +14,9 @@ pub(crate) struct Live {
     regs: RefCell<BTreeMap<u64, u32>>,
     pub(crate) writes: RefCell<Vec<(u64, u32)>>,
     pub(crate) drop_write: Cell<u64>,
+    nth: Cell<(u64, u32)>,
+    seen: Cell<u32>,
+    uncovered: Cell<u32>,
 }
 
 impl Live {
@@ -27,6 +30,33 @@ impl Live {
     }
     pub(crate) fn get(&self, r: u64) -> u32 {
         *self.regs.borrow().get(&r).unwrap_or(&0)
+    }
+    /// Drop only the `n`th write to `r` (1-based).
+    fn drop_nth(&self, r: u64, n: u32) {
+        self.nth.set((r, n));
+    }
+    fn dropped(&self, r: u64) -> bool {
+        let (reg, n) = self.nth.get();
+        if r != reg {
+            return false;
+        }
+        self.seen.set(self.seen.get() + 1);
+        self.seen.get() == n
+    }
+    /// After every CDCLK register write the requested PM demand must cover
+    /// the clock the hardware now runs (frequency and voltage level).
+    fn monitor(&self, r: u64) {
+        if ![0x46070, 0x46008, 0x46000].contains(&r) {
+            return;
+        }
+        let khz = crate::intel_gpu_modeset_xelpg::cdclk_current_khz(self);
+        let held = crate::intel_gpu_pmdemand::Params::decode(self.get(0x45230), self.get(0x45234));
+        if khz != 0
+            && (u32::from(held.cdclk_freq_mhz) * 1000 < khz
+                || held.voltage_index < crate::intel_gpu_xelpg_cdclk::voltage_level(khz))
+        {
+            self.uncovered.set(self.uncovered.get() + 1);
+        }
     }
     pub(crate) fn first(&self, r: u64) -> usize {
         self.writes
@@ -74,7 +104,7 @@ impl MmioWindow for Live {
     }
     fn write32(&self, r: u64, v: u32) {
         self.writes.borrow_mut().push((r, v));
-        if r == self.drop_write.get() {
+        if r == self.drop_write.get() || self.dropped(r) {
             return;
         }
         let mut stored = v;
@@ -100,6 +130,7 @@ impl MmioWindow for Live {
             self.set(r + 0x10, v);
         }
         self.set(r, stored);
+        self.monitor(r);
     }
 }
 
@@ -393,4 +424,37 @@ fn smoke_xelpg_live_failure_undoes_in_reverse_with_panel_lit() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_live",
     smoke_xelpg_live_failure_undoes_in_reverse_with_panel_lit
+);
+
+fn smoke_xelpg_live_failed_post_demand_undo_keeps_clock_covered() -> TestResult {
+    // Removing a 700 MHz pipe lowers CDCLK 480 -> 172.8 MHz after the
+    // planes; the post-plane request then fails with REQUEST1 lowered.
+    let a = state(&[(0, panel())]);
+    let mut fast = panel();
+    fast.pixel_rate_khz = 700_000;
+    let big = state(&[(0, panel()), (1, fast)]);
+    assert!(big.cdclk.cdclk_khz > a.cdclk.cdclk_khz);
+    let hw = programmed(&big, &[0]);
+    hw.drop_nth(0x45230, 1);
+    assert_eq!(
+        commit_live(&hw, &big, &a, 0x1),
+        Err(ResourceError::NoDevice)
+    );
+    // Undo re-raised max(old, new) before raising the clock back.
+    assert_eq!(hw.uncovered.get(), 0, "PM demand covered every clock");
+    assert_eq!(
+        crate::intel_gpu_modeset_xelpg::cdclk_current_khz(&hw),
+        big.cdclk.cdclk_khz
+    );
+    assert_image(&hw, &big.pipe_registers(0, false).unwrap());
+    assert_eq!(
+        Params::decode(hw.get(0x45230), hw.get(0x45234)),
+        big.pmdemand
+    );
+    assert!(!hw.wrote(0x70008) && !hw.wrote(0x70180));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_live",
+    smoke_xelpg_live_failed_post_demand_undo_keeps_clock_covered
 );

@@ -23,6 +23,9 @@ struct Hw {
     no_crawl_ack: Cell<bool>,
     no_lock: Cell<bool>,
     timeout_err: Cell<bool>,
+    nth: Cell<(u64, u32)>,
+    seen: Cell<u32>,
+    uncovered: Cell<u32>,
 }
 
 impl Hw {
@@ -36,6 +39,33 @@ impl Hw {
     }
     fn get(&self, r: u64) -> u32 {
         *self.regs.borrow().get(&r).unwrap_or(&0)
+    }
+    /// Drop only the `n`th write to `r` (1-based).
+    fn drop_nth(&self, r: u64, n: u32) {
+        self.nth.set((r, n));
+    }
+    fn dropped(&self, r: u64) -> bool {
+        let (reg, n) = self.nth.get();
+        if r != reg {
+            return false;
+        }
+        self.seen.set(self.seen.get() + 1);
+        self.seen.get() == n
+    }
+    /// After every CDCLK register write the requested PM demand must cover
+    /// the clock the hardware now runs (frequency and voltage level).
+    fn monitor(&self, r: u64) {
+        if ![0x46070, 0x46008, 0x46000].contains(&r) {
+            return;
+        }
+        let khz = crate::intel_gpu_modeset_xelpg::cdclk_current_khz(self);
+        let held = crate::intel_gpu_pmdemand::Params::decode(self.get(0x45230), self.get(0x45234));
+        if khz != 0
+            && (u32::from(held.cdclk_freq_mhz) * 1000 < khz
+                || held.voltage_index < crate::intel_gpu_xelpg_cdclk::voltage_level(khz))
+        {
+            self.uncovered.set(self.uncovered.get() + 1);
+        }
     }
     fn written(&self, r: u64) -> Vec<u32> {
         self.writes
@@ -78,7 +108,7 @@ impl MmioWindow for Hw {
     }
     fn write32(&self, r: u64, v: u32) {
         self.writes.borrow_mut().push((r, v));
-        if r == self.drop_write.get() {
+        if r == self.drop_write.get() || self.dropped(r) {
             return;
         }
         let mut stored = v;
@@ -100,6 +130,7 @@ impl MmioWindow for Hw {
             stored &= !((1 << 30) | (1 << 22));
         }
         self.set(r, stored);
+        self.monitor(r);
     }
 }
 
@@ -1120,4 +1151,40 @@ fn smoke_xelpg_resources_commit_failure_restores_every_register() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_resources",
     smoke_xelpg_resources_commit_failure_restores_every_register
+);
+
+fn smoke_xelpg_resources_failed_post_demand_restore_keeps_clock_covered() -> TestResult {
+    // Firmware runs a known 652.8 MHz clock with its PM demand; the new
+    // single-pipe state lowers CDCLK to 172.8 MHz.
+    let hw = Hw::new();
+    hw.set(0x46070, 0x8000_0022);
+    hw.set(0x46000, (7 << 19) | 1304);
+    hw.set(0x45230, 3 << 12);
+    hw.set(0x45234, 653 << 20);
+    let mut pipes = [None; PIPES];
+    pipes[0] = pipe(65_000, (1024, 1344), (768, 806), 810_000, 0);
+    let request = Request {
+        pipes,
+        min_cdclk_khz: 0,
+    };
+    let state = compute(&request, &latency()).unwrap();
+    assert_eq!(state.cdclk.cdclk_khz, 172_800);
+    // The post-plane request's REQUEST0 write is refused after REQUEST1
+    // already carries 173 MHz/voltage 1: readback fails at the last step.
+    hw.drop_nth(0x45230, 2);
+    assert_eq!(commit(&hw, &state), Err(ResourceError::NoDevice));
+    // Restoration re-raised max(original, new) before the clock went back
+    // up, so no CDCLK write ever ran above the requested demand.
+    assert_eq!(hw.uncovered.get(), 0, "PM demand covered every clock");
+    assert_eq!(
+        crate::intel_gpu_modeset_xelpg::cdclk_current_khz(&hw),
+        652_800
+    );
+    assert_eq!(hw.get(0x46000), (7 << 19) | 1304);
+    assert_eq!((hw.get(0x45230), hw.get(0x45234)), (3 << 12, 653 << 20));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_resources",
+    smoke_xelpg_resources_failed_post_demand_restore_keeps_clock_covered
 );

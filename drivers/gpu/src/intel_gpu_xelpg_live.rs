@@ -479,6 +479,12 @@ fn undo(
     snap: &Snapshot,
     done: &[Step],
 ) -> Result<(), ResourceError> {
+    // A failed post-plane request may have lowered PM demand to `new`
+    // before undo raises the clock or DBUF back to `old`: re-raise
+    // max(old, new) first, as the forward pre-plane request did.
+    if done.contains(&Step::PmDemandPost) {
+        pmdemand::program(io, &new.pmdemand, Some(&snap.pmdemand))?;
+    }
     let mut i = done.len();
     while i > 0 {
         i -= 1;

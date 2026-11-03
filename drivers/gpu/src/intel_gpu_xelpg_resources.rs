@@ -640,9 +640,18 @@ fn apply(
 
 fn restore(
     io: &(impl MmioWindow + ?Sized),
+    state: &State,
     snap: &Snapshot,
     stage: Stage,
 ) -> Result<(), ResourceError> {
+    // Once the pre-plane superset was acknowledged, a failed post-plane
+    // request may have lowered PM demand to the new state's values. Re-raise
+    // max(original, new) before restoring anything it must cover (DBUF,
+    // MBUS and above all a higher original CDCLK), mirroring the forward
+    // pre-plane request; the original demand follows the original clock.
+    if stage > Stage::PmDemand {
+        pmdemand::program(io, &state.pmdemand, Some(&snap.pmdemand))?;
+    }
     if stage >= Stage::Planes {
         for &(r, v) in &snap.planes {
             checked(io, r, v)?;
@@ -688,7 +697,7 @@ pub(crate) fn commit(io: &(impl MmioWindow + ?Sized), state: &State) -> Result<(
         Ok(()) => Ok(()),
         Err(error) => {
             if io.display_access_ok() {
-                let _ = restore(io, &snap, stage);
+                let _ = restore(io, state, &snap, stage);
             }
             Err(error)
         }
