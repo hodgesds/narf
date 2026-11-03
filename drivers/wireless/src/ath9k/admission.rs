@@ -2,7 +2,8 @@
 //! AR9287 (`0x002d`/`0x002e`) signed board admission record `N87A` v1, the
 //! AR9280 (`0x0029`/`0x002a`) dual-band record `N80A` v1 and the AR5008-PHY
 //! three-chain records `N54A` v1 (AR5416 `0x0023` / AR5418 `0x0024`) and
-//! `N60A` v1 (AR9160 `0x0027`).
+//! `N60A` v1 (AR9160 `0x0027`), and the AR9300 (`0x0030`) record `N93A`
+//! v1.
 //!
 //! The AR9287 software path (map decode, INI/board values, open-loop
 //! transmit power, two-chain calibration, async-FIFO MAC clock, descriptor
@@ -20,6 +21,11 @@
 //! (`fixup_chainmask`, CB71) masks up to 0x7 and their identity binds the
 //! AR5008 preparation, the radio revision and the three-chain closed-loop
 //! def plan.
+//! The AR9300 (`N93A`) record keeps the layout; its channel byte is the
+//! IEEE channel (2.4 GHz 1..14 or 5 GHz 36..165), its chain-mask bytes the
+//! effective masks up to 0x7, and its identity binds the restored
+//! `ar9300_eeprom`, the AR9003 preparation and the AR9300 transmit-power
+//! plan of that channel.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{
@@ -355,6 +361,117 @@ impl Facts {
             channel,
         })
     }
+    /// AR9300 (`0x0030`) facts for one 20 MHz channel in a band the
+    /// map's `opFlags` enables: the PCI function, `AR_SREV` revision and
+    /// host mode, the restored 1088-byte `ar9300_eeprom` (template and
+    /// version bytes included), the effective (`fixup_chainmask`) masks up
+    /// to 0x7, `ar9003::phy::prepare`'s retained facts at `frequency`
+    /// (modes index, `TX_CL_CAL`, APM selfgen mask, gain-array rows) and
+    /// the `ath9k_hw_ar9300_set_txpower` plan at the 40 half-dB maximum
+    /// for `ctl` (`ath9k_regd_get_ctl`). The channel byte is the IEEE
+    /// channel (2.4 GHz 1..14, 5 GHz 36..165); the factory antenna gain is
+    /// the band's `antennaGain` (a negative value counts as zero).
+    pub(super) fn new_ar9300(
+        id: &narf_bus::DeviceId,
+        revision: &super::ar9003::Revision,
+        identity: &super::ar9003::eeprom::Identity,
+        prepared: &super::ar9003::phy::Prepared,
+        image: &super::ar9003::power::Image,
+        frequency: u16,
+        ctl: u16,
+    ) -> Result<Self, BringUpError> {
+        use super::ar9003::{eeprom, phy, power, Chip};
+        if !phy::channel_supported(identity, frequency) {
+            return Err(BringUpError::BadIdentity);
+        }
+        let five = frequency >= 4800;
+        let channel = if five {
+            ((frequency - 5000) / 5) as u8
+        } else if frequency == 2484 {
+            14
+        } else {
+            ((frequency - 2407) / 5) as u8
+        };
+        if id.vendor != 0x168c
+            || Chip::for_device(id.device) != Some(Chip::Ar9300)
+            || revision.chip != Chip::Ar9300
+            || prepared.frequency != frequency
+            || prepared.modes_index != if five { 1 } else { 4 }
+            || !(1..=7).contains(&identity.rx_chainmask)
+            || !(1..=7).contains(&identity.tx_chainmask)
+        {
+            return Err(BringUpError::BadIdentity);
+        }
+        let plan = power::plan(image, frequency, ctl, 40, identity.tx_chainmask)?;
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(b"N93A");
+        h.update(
+            b"NARF AR9300 N93A three-chain ar9300_eeprom legacy20 dual-band board admission v1",
+        );
+        h.update(b"ar9300_eeprom_restore_internal image; ar9003_2p2 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA");
+        for v in [
+            id.vendor,
+            id.device,
+            id.subsystem_vendor,
+            id.subsystem_id,
+            frequency,
+            ctl,
+            prepared.ini_writes,
+            identity.regulatory_domains[0],
+            identity.regulatory_domains[1],
+        ] {
+            h.update(&v.to_le_bytes());
+        }
+        h.update(&revision.chip.mac_version().to_le_bytes());
+        h.update(&[
+            revision.mac_rev,
+            u8::from(revision.pcie),
+            identity.eeprom_version,
+            identity.template_version,
+            identity.op_flags,
+            identity.rx_chainmask,
+            identity.tx_chainmask,
+            identity.tx_gain,
+            identity.rx_gain,
+            u8::from(prepared.carrier_leak_cal),
+            prepared.selfgen_mask,
+        ]);
+        h.update(&identity.mac);
+        h.update(image);
+        h.update(&plan.targets);
+        h.update(&[plan.max_power_level, plan.tx_chainmask]);
+        for values in [
+            plan.correction,
+            plan.temperature,
+            plan.voltage,
+            plan.nf_cal,
+            plan.nf_power,
+        ] {
+            for value in values {
+                h.update(&value.to_le_bytes());
+            }
+        }
+        h.update(&plan.temp_slope.to_le_bytes());
+        let gain = image[eeprom::modal_base(five) + eeprom::modal::ANTENNA_GAIN] as i8;
+        let mac = identity.mac;
+        Ok(Self {
+            request: Request {
+                identity: h.finalize(),
+                mac,
+                device: id.device,
+                frequency_mhz: frequency,
+                filename: format!(
+                    "ath9k/ar9300-admit-v1-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    channel, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ),
+            },
+            factory_antenna: gain.max(0) as u8,
+            rx_chainmask: identity.rx_chainmask,
+            tx_chainmask: identity.tx_chainmask,
+            magic: *b"N93A",
+            channel,
+        })
+    }
     pub(super) fn request(&self) -> Request {
         self.request.clone()
     }
@@ -374,7 +491,7 @@ pub(super) struct Grant {
 
 pub(super) enum Source {
     /// The trusted firmware loader's record for `Facts::request().filename`.
-    /// Only the AR9287, AR9280 and AR5008 owners construct it.
+    /// Only the AR9287, AR9280, AR5008 and AR9300 owners construct it.
     Registered,
     #[cfg(feature = "kernel-test")]
     Verified {

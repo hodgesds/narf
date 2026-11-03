@@ -2130,8 +2130,29 @@ ported, would reload it). Smokes (written, not executed):
 `smoke_ath9k_ar9300_init_and_periodic_calibration`,
 `smoke_ath9k_ar9300_calibration_refusals`.
 
-Still to port before `ar9300_enablement` can be claimed: signed AR9300
-records and the probe/station/retune/reset/periodic/suspend owner.
+AR9300 signed records (step 5a, format only). `admission::Facts::new_ar9300`
+keys the 128-byte `N93A` v1 record (same layout as `N87A`/`N80A`) to one
+20 MHz channel in a band `opFlags` enables (`ar9003::phy::channel_supported`;
+channel byte = IEEE channel, 2.4 GHz 1..14 including 2484, 5 GHz 36..165),
+file `ath9k/ar9300-admit-v1-ch<N>-<mac>.bin`. Its identity hashes the PCI
+function, `AR_SREV` version/revision/host mode, the restored 1088-byte
+`ar9300_eeprom` and its decoded identity (EEPROM/template version,
+`regDmn`, `opFlags`, effective masks up to 0x7, txrxgain), the
+`ar9003::phy::prepare` facts (modes index, `TX_CL_CAL`, APM selfgen mask,
+gain-array rows), the `ath9k_regd_get_ctl` value and the
+`ath9k_hw_ar9300_set_txpower` plan at the 40 half-dB maximum (targets,
+`max_power_level`, per-chain correction/temperature/voltage/NF cal and
+power, temperature slope). The factory antenna gain is the band's
+`antennaGain` (negative counts as zero). No record or board value is
+supplied in-tree. Smoke (written, not executed):
+`smoke_ath9k_ar9300_admission_records_bind_channel_ctl_and_magic`.
+
+Still to port before `ar9300_enablement` can be claimed: the
+probe/station/retune/reset/periodic/suspend owner (`0x0030` registration,
+`Calibrated::Ar9300` with the EDMA packet owner and MAC profile, the 5 GHz
+APM chain-mask reduction in `tx_chainmask()`). `station::Radio` is concrete
+over the AR9002 `packet::Packet`, so the AR9003 EDMA owner needs either a
+packet-engine abstraction there or its own station.
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB

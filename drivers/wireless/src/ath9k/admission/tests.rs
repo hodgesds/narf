@@ -902,3 +902,101 @@ kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar5008_native_profile_binds_chip_band_and_masks
 );
+
+fn ar9300_facts(id: u16, frequency: u16, ctl: u16) -> Result<Facts, BringUpError> {
+    use crate::ath9k::ar9003::{eeprom, phy, power, templates::AR9300_DEFAULT, Chip, Revision};
+    let identity = eeprom::Identity {
+        mac: [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        eeprom_version: 2,
+        template_version: 2,
+        regulatory_domains: [0x3a, 0],
+        op_flags: 3,
+        rx_chainmask: 7,
+        tx_chainmask: 7,
+        tx_gain: 0,
+        rx_gain: 0,
+    };
+    let prepared = phy::Prepared {
+        frequency,
+        modes_index: if frequency >= 4800 { 1 } else { 4 },
+        carrier_leak_cal: true,
+        selfgen_mask: 3,
+        power: power::plan(&AR9300_DEFAULT, frequency, ctl, 40, 7)?,
+        ini_writes: 200,
+    };
+    let revision = Revision {
+        chip: Chip::Ar9300,
+        mac_rev: 3,
+        pcie: true,
+    };
+    Facts::new_ar9300(
+        &device(id),
+        &revision,
+        &identity,
+        &prepared,
+        &AR9300_DEFAULT,
+        frequency,
+        ctl,
+    )
+}
+
+fn ar9300_record(facts: &Facts, channel: u8, antenna: u8, ceiling: u8) -> Vec<u8> {
+    let mut b = record(facts, antenna, ceiling);
+    b[..4].copy_from_slice(b"N93A");
+    b[54..58].copy_from_slice(&[channel, 20, 7, 7]);
+    b
+}
+
+fn smoke_ath9k_ar9300_admission_records_bind_channel_ctl_and_magic() -> TestResult {
+    let (Ok(two), Ok(fourteen), Ok(five)) = (
+        ar9300_facts(0x0030, 2412, 0x12),
+        ar9300_facts(0x0030, 2484, 0x12),
+        ar9300_facts(0x0030, 5180, 0x10),
+    ) else {
+        return TestResult::Fail("AR9300 admission facts refused");
+    };
+    if two.request().filename != "ath9k/ar9300-admit-v1-ch1-02aabbccddee.bin"
+        || fourteen.request().filename != "ath9k/ar9300-admit-v1-ch14-02aabbccddee.bin"
+        || five.request().filename != "ath9k/ar9300-admit-v1-ch36-02aabbccddee.bin"
+        || two.request().identity == five.request().identity
+        || ar9300_facts(0x0030, 2412, 0x32)
+            .is_ok_and(|other| other.request().identity == two.request().identity)
+    {
+        return TestResult::Fail("AR9300 records are not keyed per channel and CTL");
+    }
+    let factory = two.factory_antenna;
+    let Ok(grant) = load(two.clone(), ar9300_record(&two, 1, factory + 2, 30), true) else {
+        return TestResult::Fail("well-formed signed N93A record refused");
+    };
+    if grant.ceiling(40) != 30 || grant.ceiling(20) != 18 {
+        return TestResult::Fail("AR9300 measured antenna gain not removed from host limit");
+    }
+    let mut chains = ar9300_record(&two, 1, factory, 30);
+    chains[56] = 3;
+    for bytes in [
+        ar9280_record(&two, 1, factory, 30),  // AR9280 magic
+        ar9300_record(&two, 36, factory, 30), // wrong channel byte
+        ar9300_record(&two, 1, factory, 41),  // ceiling above 40
+        chains,                               // foreign chain mask
+        ar9300_record(&two, 1, factory, 30)[..127].to_vec(),
+    ] {
+        if load(two.clone(), bytes, true).is_ok() {
+            return TestResult::Fail("malformed or foreign N93A record admitted");
+        }
+    }
+    if load(two.clone(), ar9300_record(&two, 1, factory, 30), false).is_ok() {
+        return TestResult::Fail("unsigned N93A record admitted");
+    }
+    // Foreign device and unsupported channels are refused.
+    if ar9300_facts(0x002a, 2412, 0x12).is_ok()
+        || ar9300_facts(0x0030, 2414, 0x12).is_ok()
+        || ar9300_facts(0x0030, 5170, 0x10).is_ok()
+    {
+        return TestResult::Fail("AR9300 facts accepted a foreign device or channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9300_admission_records_bind_channel_ctl_and_magic
+);
