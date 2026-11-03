@@ -1197,6 +1197,17 @@ EP0 transfer/executable-cap discipline; chip steps live in
   `BEACON_DISABLE_TSF_UPDATE` and reports disconnect; `ra_watchdog_8192e`
   is `rtl8xxxu_ra_iter` (RSSI report, then a mask only on a level change).
   C2H RA reports for macid 0 inside the admitted set update the TX rate.
+- Packet transport (`packet_transport::Owner::new_8192e`): the same
+  persistent-RX/one-TX USB owner with `Codec::Rtl8192e(QueueMap)`. The
+  queue map must address only descriptor bulk-OUT endpoints. RX completions
+  parse with `rtl8192e_packet::receive` (`poll_receive_8192e`: MPDUs and
+  gen2 C2H records); TX uses txdesc40 (`submit_8192e`,
+  `submit_null_8192e`, `submit_probe_8192e`) on the
+  `rtl8xxxu_queue_select` pipe (MGNT, or the TID's VO/VI/BE/BK entry of
+  `rtl8xxxu_init_queue_priority`). A-MPDU density/TID-operational fields
+  come only from the owner's negotiated HT/originator state; a caller-set
+  density is refused. Each codec's entry points refuse the other chip's
+  owner, and the delivered native length subtracts that codec's descriptor.
 - RF/power (`rtl8xxxu/rtl8192e_power.rs`): `rtl8192e_enable_rf`,
   `rtl8xxxu_gen2_disable_rf` and `rtl8192eu_power_off` (flush_fifo, TX
   report timer off, `REG_RF_CTRL = 0`, `active_to_lps`, firmware self

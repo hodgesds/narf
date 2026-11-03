@@ -111,8 +111,18 @@ struct Transmit<R> {
 pub struct Delivered {
     pub native_bytes: usize,
 }
+/// The chip's descriptor codec. RTL8188EU uses `packet_codec` (txdesc32 /
+/// rxdesc16); RTL8192EU uses `rtl8192e_packet` (txdesc40 / rxdesc24) with
+/// the `rtl8xxxu_init_queue_priority` pipe map. Each codec's entry points
+/// refuse the other's owner, so a descriptor format can never cross chips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Codec {
+    Rtl8188e,
+    Rtl8192e(super::rtl8192e_init::QueueMap),
+}
 pub struct Owner<I: Io> {
     io: I,
+    codec: Codec,
     endpoints: Endpoints,
     channel: u8,
     failed: bool,
@@ -151,6 +161,7 @@ impl<I: Io> Owner<I> {
         }
         Ok(Self {
             io,
+            codec: Codec::Rtl8188e,
             endpoints,
             channel,
             failed: false,
@@ -163,6 +174,40 @@ impl<I: Io> Owner<I> {
             halted: (false, false),
             scratch: alloc::vec![0;MAX_TRANSFER],
         })
+    }
+    /// RTL8192EU owner: the queue map must address only descriptor
+    /// bulk-OUT endpoints (Linux indexes `out_ep[]` with it).
+    pub(super) fn new_8192e(
+        io: I,
+        endpoints: Endpoints,
+        queues: super::rtl8192e_init::QueueMap,
+        channel: u8,
+    ) -> Result<Self, Error> {
+        let n = endpoints.output_count;
+        if [queues.vo, queues.vi, queues.be, queues.bk, queues.mgmt]
+            .iter()
+            .any(|&pipe| pipe >= n)
+        {
+            return Err(Error::Endpoints);
+        }
+        let mut owner = Self::new(io, endpoints, channel)?;
+        owner.codec = Codec::Rtl8192e(queues);
+        Ok(owner)
+    }
+    pub(super) fn codec(&self) -> Codec {
+        self.codec
+    }
+    fn queues_8192e(&self) -> Result<super::rtl8192e_init::QueueMap, Error> {
+        match self.codec {
+            Codec::Rtl8192e(queues) => Ok(queues),
+            Codec::Rtl8188e => Err(Error::Packet(packet_codec::Error::Header)),
+        }
+    }
+    fn check_8188e(&self) -> Result<(), Error> {
+        match self.codec {
+            Codec::Rtl8188e => Ok(()),
+            Codec::Rtl8192e(_) => Err(Error::Packet(packet_codec::Error::Header)),
+        }
     }
     pub fn channel(&self) -> u8 {
         self.channel
@@ -289,6 +334,42 @@ impl<I: Io> Owner<I> {
     }
     /// None is indefinite pending, not an instruction to cancel or retry.
     pub fn poll_receive(&mut self) -> Result<Option<Vec<Record>>, Error> {
+        self.check_8188e()?;
+        let Some(length) = self.complete_receive()? else {
+            return Ok(None);
+        };
+        let records = match packet_codec::receive(&self.scratch[..length]) {
+            Ok(records) => records,
+            Err(e) => {
+                self.failed = true;
+                return Err(Error::Packet(e));
+            }
+        };
+        self.post()?;
+        Ok(Some(records))
+    }
+    /// `rtl8xxxu_rx_complete` → `rtl8xxxu_parse_rxdesc24` for RTL8192EU:
+    /// MPDUs and gen2 C2H records from one completed bulk-IN transfer.
+    pub(super) fn poll_receive_8192e(
+        &mut self,
+    ) -> Result<Option<Vec<super::rtl8192e_packet::Record>>, Error> {
+        self.queues_8192e()?;
+        let Some(length) = self.complete_receive()? else {
+            return Ok(None);
+        };
+        let records = match super::rtl8192e_packet::receive(&self.scratch[..length]) {
+            Ok(records) => records,
+            Err(e) => {
+                self.failed = true;
+                return Err(Error::Packet(e));
+            }
+        };
+        self.post()?;
+        Ok(Some(records))
+    }
+    /// One exact terminal bulk-IN completion; the receipt is dropped only
+    /// then, leaving a private CPU copy in `scratch` for the codec.
+    fn complete_receive(&mut self) -> Result<Option<usize>, Error> {
         self.check_pipe(false)?;
         let receipt = self.receive.as_ref().ok_or(Error::NotStarted)?;
         let length = match self.io.poll_receive(receipt, &mut self.scratch) {
@@ -310,15 +391,7 @@ impl<I: Io> Owner<I> {
         // Exact terminal completion released USB's endpoint page. Drop this
         // receipt only now, then parse a private CPU copy before re-posting.
         self.receive = None;
-        let records = match packet_codec::receive(&self.scratch[..length]) {
-            Ok(records) => records,
-            Err(e) => {
-                self.failed = true;
-                return Err(Error::Packet(e));
-            }
-        };
-        self.post()?;
-        Ok(Some(records))
+        Ok(Some(length))
     }
     pub fn submit(&mut self, kind: Kind, frame: &[u8]) -> Result<(), Error> {
         self.submit_rate(kind, frame, 0)
@@ -335,6 +408,7 @@ impl<I: Io> Owner<I> {
         rate: u8,
         adaptive: Option<u8>,
     ) -> Result<(), Error> {
+        self.check_8188e()?;
         self.check_pipe(true)?;
         if adaptive.is_some() && kind != Kind::Data {
             return Err(Error::Packet(packet_codec::Error::Header));
@@ -379,6 +453,7 @@ impl<I: Io> Owner<I> {
         &mut self,
         probe: &super::probe_runtime::Prepared,
     ) -> Result<(), Error> {
+        self.check_8188e()?;
         self.check_pipe(true)?;
         if self.receive.is_none() {
             return Err(Error::NotStarted);
@@ -389,6 +464,7 @@ impl<I: Io> Owner<I> {
         self.submit_encoded(packet_codec::transmit_probe(probe), 0)
     }
     pub(super) fn submit_null(&mut self, null: &super::ps_null::Prepared) -> Result<(), Error> {
+        self.check_8188e()?;
         self.check_pipe(true)?;
         if self.receive.is_none() {
             return Err(Error::NotStarted);
@@ -408,6 +484,75 @@ impl<I: Io> Owner<I> {
             }
         }
         self.submit_encoded(packet, index)
+    }
+    /// RTL8192EU `rtl8xxxu_tx`: txdesc40 with firmware-RA DATA rates.
+    /// QoS DATA needs negotiated QoS; A-MPDU fields only for an HT peer with
+    /// the TID's originator session (`self.ampdu`). The pipe is the queue
+    /// map entry for `rtl8xxxu_queue_select` (MGNT or the TID's AC).
+    pub(super) fn submit_8192e(
+        &mut self,
+        kind: Kind,
+        frame: &[u8],
+        mut control: super::rtl8192e_packet::TxControl,
+    ) -> Result<(), Error> {
+        let queues = self.queues_8192e()?;
+        self.check_pipe(true)?;
+        let qos = kind == Kind::Data && frame.first() == Some(&0x88);
+        if qos && !self.qos || control.ampdu_density.is_some() {
+            return Err(Error::Packet(packet_codec::Error::Header));
+        }
+        self.ready_to_send()?;
+        if let (true, true, Some((density, tids))) = (qos, self.ht, self.ampdu) {
+            control.ampdu_density = Some(density);
+            control.tid_operational = tids & (1 << packet_codec::data_tid(frame)) != 0;
+        }
+        let packet =
+            super::rtl8192e_packet::transmit(frame, kind, control).map_err(Error::Packet)?;
+        let pipe = match kind {
+            Kind::Management => queues.mgmt,
+            Kind::Data => pipe_8192e(queues, packet_codec::data_tid(frame)),
+        };
+        self.submit_encoded(packet, usize::from(pipe))
+    }
+    /// RTL8192EU station power indication: the shared `ps_null` frame in a
+    /// txdesc40 (`rtl8192e_packet::transmit_null`) on its AC's pipe.
+    pub(super) fn submit_null_8192e(
+        &mut self,
+        null: &super::ps_null::Prepared,
+    ) -> Result<(), Error> {
+        let queues = self.queues_8192e()?;
+        self.check_pipe(true)?;
+        if null.qos() != self.qos {
+            return Err(Error::Packet(packet_codec::Error::Header));
+        }
+        self.ready_to_send()?;
+        let pipe = pipe_8192e(queues, if null.qos() { 7 } else { 0 });
+        self.submit_encoded(
+            super::rtl8192e_packet::transmit_null(null),
+            usize::from(pipe),
+        )
+    }
+    /// RTL8192EU broadcast probe on the management pipe.
+    pub(super) fn submit_probe_8192e(
+        &mut self,
+        probe: &super::probe_runtime::Prepared,
+    ) -> Result<(), Error> {
+        let queues = self.queues_8192e()?;
+        self.check_pipe(true)?;
+        self.ready_to_send()?;
+        self.submit_encoded(
+            super::rtl8192e_packet::transmit_probe(probe),
+            usize::from(queues.mgmt),
+        )
+    }
+    fn ready_to_send(&self) -> Result<(), Error> {
+        if self.receive.is_none() {
+            return Err(Error::NotStarted);
+        }
+        if self.transmit.is_some() {
+            return Err(Error::Busy);
+        }
+        Ok(())
     }
     fn submit_encoded(&mut self, packet: Vec<u8>, index: usize) -> Result<(), Error> {
         let endpoint = self.endpoints.output[index];
@@ -469,11 +614,24 @@ impl<I: Io> Owner<I> {
             self.failed = true;
             return Err(Error::ShortTransmit);
         }
+        let descriptor = match self.codec {
+            Codec::Rtl8188e => packet_codec::TX_DESC,
+            Codec::Rtl8192e(_) => super::rtl8192e_packet::TX_DESC,
+        };
         let delivered = Delivered {
-            native_bytes: length - packet_codec::TX_DESC,
+            native_bytes: length - descriptor,
         };
         self.transmit = None;
         Ok(Some(delivered))
+    }
+}
+/// `rtl8xxxu_80211_to_rtl_queue` → `priv->pipe_out[queue]`.
+fn pipe_8192e(queues: super::rtl8192e_init::QueueMap, tid: u8) -> u8 {
+    match packet_codec::access_category(tid).0 {
+        7 => queues.vo,
+        5 => queues.vi,
+        2 => queues.bk,
+        _ => queues.be,
     }
 }
 #[cfg(feature = "kernel-test")]
