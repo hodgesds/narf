@@ -1295,16 +1295,32 @@ fn smoke_sink_pr_swap_responder_accepts_and_becomes_source() -> TestResult {
         return TestResult::Fail("partner PS_RDY did not complete the swap");
     }
     // Wire order pins the sequence: Request, Accept, PS_RDY.
-    let types: Vec<Option<CtrlMsg>> = tcpc
-        .sent_frames()
-        .iter()
-        .filter_map(|f| decode_message(f).map(|(h, _)| CtrlMsg::from_u8(h.msg_type)))
-        .collect();
-    // The Request is a data message (None here); the two control
-    // frames must be Accept then PsRdy, in that order.
-    let ctrls: Vec<CtrlMsg> = types.into_iter().flatten().collect();
+    // The header's type field is namespace-dependent (PD §6.2.1.1):
+    // it indexes the control table only when the message carries
+    // zero data objects, and the data table otherwise — so a data
+    // Request (type 0x02) must NOT be read through CtrlMsg::from_u8,
+    // where it aliases to GotoMin. Split on num_data_objects first.
+    let mut ctrls: Vec<CtrlMsg> = Vec::new();
+    let mut datas: Vec<u8> = Vec::new();
+    for f in tcpc.sent_frames().iter() {
+        let Some((h, _)) = decode_message(f) else {
+            continue;
+        };
+        if h.num_data_objects == 0 {
+            if let Some(c) = CtrlMsg::from_u8(h.msg_type) {
+                ctrls.push(c);
+            }
+        } else {
+            datas.push(h.msg_type);
+        }
+    }
+    // The two control frames must be Accept then PsRdy, in that
+    // order, and the Request must be the only data frame on the wire.
     if ctrls != [CtrlMsg::Accept, CtrlMsg::PsRdy] {
         return TestResult::Fail("expected Accept then PS_RDY on the wire");
+    }
+    if datas != [DataMsg::Request as u8] {
+        return TestResult::Fail("expected only the Request data message on the wire");
     }
     if tcpc.role() != PortRole::Source {
         return TestResult::Fail("CC role did not flip to Source");
