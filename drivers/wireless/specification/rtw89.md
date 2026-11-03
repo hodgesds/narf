@@ -3972,8 +3972,26 @@ paths; B bytes unchanged). Unexecuted cases:
 `smoke_rtw89_n51_set_channel_bb_tail_follows_rtw8851b`,
 `smoke_rtw89_n51_rf_channel_programs_path_a_only`.
 
-**Remaining for the row.** RFK (`rtw8851b_rfk_init` LCK/AACK/RCK/DACK/RX
-DCK; channel RX DCK/IQK/TSSI/DPK), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+**RFK init and channel RX DCK (`rfk::n51`).** `n51::Init::prepare` is
+rtw8851b.c `rtw8851b_rfk_init` on RF path A (`_kpath` = RF_A):
+`is_tssi_mode` false, `rtw8851b_lck_init` (fresh-EWMA thermal 0),
+`rtw8851b_dpk_init` (`rtw8851b_by_rate_dpd`: MAC 0xd230 [17:0] = 0x21861,
+read back), `rtw8851b_aack` (up to four 0x8201e/0x8201f triggers, the 0xd0
+BIT(16) poll and the four `RR_IBD` VCO bands), `_rck(A)` (2us/30us poll),
+`rtw8851b_dack` = `_dac_cal` (`_drck` with the 0x7c00 result,
+`rtw8851b_dack_manual_off_defs`, S0 ADDCK/backup/reload,
+`rtw8851b_dack_s0_1/_2_defs`, MSBK/bias/DADCK(+24) backup and
+`_dack_reload(A)`, `_new_dadck` with `rtw8851b_dadck_setup/_post_defs` and
+the u8 `0x80 - sign_extend32(dc, 11) * 6` correction) with no BTC DACK
+notification, as Linux, then `rtw8851b_rx_dck(PHY_0)` (BTC RXDCK START, TX
+pause, `_wait_rx_mode`, `_rx_dck` with `_set_rx_dck` BIT(8) poll and
+`_rxbb_ofst_swap`, resume, STOP). `n51::ChannelRxDck` is the RX DCK of
+`rtw8851b_rfk_channel` with the retained `is_tssi_mode[A]` TSSI-tracking
+pause. Linux only logs the poll timeouts; NARF fails closed and the owner is
+terminal. Unexecuted case:
+`smoke_rtw89_n51_rfk_init_aack_rck_dack_rxdck_follow_rtw8851b`.
+
+**Remaining for the row.** Channel IQK/TSSI/DPK (rtw8851b_rfk.c), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)
