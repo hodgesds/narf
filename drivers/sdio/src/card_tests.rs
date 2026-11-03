@@ -1,7 +1,10 @@
 use super::*;
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
+
+#[path = "card_endpoint.rs"]
+pub mod endpoint;
 
 struct State {
     registers: [u8; 256],
@@ -16,6 +19,9 @@ struct State {
     retire_on_ready: Option<Arc<crate::source::Lifetime>>,
     pending_card_on_ready: bool,
     gone_on_card_enable_readback: bool,
+    endpoint: Option<alloc::boxed::Box<dyn endpoint::Endpoint>>,
+    endpoint_read: VecDeque<u8>,
+    endpoint_write: Option<endpoint::Write>,
 }
 impl State {
     fn data_commands(&self) -> usize {
@@ -44,6 +50,7 @@ impl State {
     fn moved(&mut self) {
         self.left -= 1;
         if self.left == 0 {
+            endpoint::finish(self);
             self.set32(PRESENT_STATE, PS_CARD_PRESENT);
             self.set32(INT_STATUS, self.get32(INT_STATUS) | INT_DATA_END);
         }
@@ -77,6 +84,9 @@ impl Model {
             retire_on_ready: None,
             pending_card_on_ready: false,
             gone_on_card_enable_readback: false,
+            endpoint: None,
+            endpoint_read: VecDeque::new(),
+            endpoint_write: None,
         };
         s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
         s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
@@ -142,10 +152,21 @@ impl Registers for Model {
                 s.set32(INT_STATUS, status | INT_CARD_INT);
             }
         }
+        if a == INT_STATUS
+            && s.common[CCCR_INT_ENABLE as usize] & 5 == 5
+            && s.get32(INT_ENABLE) & INT_CARD_INT != 0
+            && s.endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.pending())
+        {
+            let status = s.get32(INT_STATUS);
+            s.set32(INT_STATUS, status | INT_CARD_INT);
+        }
         if a == BUFFER {
-            s.words.push(0x44332211);
+            let value = endpoint::read(&mut s);
+            s.words.push(value);
             s.moved();
-            0x44332211
+            value
         } else {
             s.get32(a)
         }
@@ -177,6 +198,9 @@ impl Registers for Model {
         let response = match cmd {
             5 => 0xa0300000,
             3 => 0x12340000,
+            52 if s.endpoint.is_some() && (arg >> 28) & 7 != 0 => {
+                endpoint::direct(&mut s, arg).unwrap_or(0x0200)
+            }
             52 => {
                 let addr = ((arg >> 9) & 0x1ffff) as usize;
                 if arg >> 31 != 0 {
@@ -188,6 +212,14 @@ impl Registers for Model {
                 u32::from(s.common[addr])
             }
             53 if s.reject_data => 0x0200,
+            53 => {
+                let length = usize::from(s.get16(BLOCK_SIZE)) * usize::from(s.get16(BLOCK_COUNT));
+                if endpoint::begin(&mut s, arg, length, mode & TRNS_READ != 0) {
+                    0
+                } else {
+                    0x0200
+                }
+            }
             _ => 0,
         };
         s.set32(RESPONSE, response);
@@ -218,11 +250,17 @@ impl Registers for Model {
             }
         }
         let mut s = self.0.lock();
+        if a == ARGUMENT && value >> 31 != 0 {
+            if let Some(endpoint) = s.endpoint.as_mut() {
+                endpoint.prepare_write(((value >> 28) & 7) as u8);
+            }
+        }
         if a == INT_STATUS {
             let new = s.get32(a) & !value;
             s.set32(a, new);
         } else if a == BUFFER {
             s.words.push(value);
+            endpoint::write(&mut s, value);
             s.moved();
         } else {
             s.set32(a, value);

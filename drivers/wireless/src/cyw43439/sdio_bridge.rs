@@ -14,6 +14,8 @@ use narf_drivers_sdio::sdio::function::{SdioError, SdioFunction};
 use super::transport::{Function, PacketTransport, Transport, TransportError};
 use super::{chipclk, sdio};
 
+#[path = "sdio_ap_packet.rs"]
+mod ap_packet;
 #[path = "sdio_stop.rs"]
 mod stop;
 
@@ -535,6 +537,33 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
     }
 }
 impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
+    fn transmit_ap_packet(
+        &mut self,
+        packet: &[u8],
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        SdioTransport::transmit_ap_packet(self, packet, original)
+    }
+    fn transmit_ap_control(
+        &mut self,
+        packet: &[u8],
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        SdioTransport::transmit_ap_control(self, packet, original)
+    }
+    fn completed_prefix(&mut self) -> Result<bool, TransportError> {
+        self.check_qualification()?;
+        // A sleeping/no-IRQ fast return is not an actual FIFO observation.
+        self.wake()?;
+        self.mailbox()?;
+        Ok(!self.rx_pending)
+    }
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        if self.failed || self.stopped {
+            return None;
+        }
+        crate::brcmfmac::ap_source::Source::sdio(self.func.source()?, self.proof.as_ref()?.clone())
+    }
     fn confirmed_stop(&mut self) -> Result<(), TransportError> {
         SdioTransport::confirmed_stop(self)
     }

@@ -93,6 +93,9 @@ impl Policy {
 pub(super) enum Use {
     Lifecycle,
     Receive,
+    /// Denial-only hold from a real association indication until actual SCB
+    /// verification. It grants no transmit, DATA, installed key or port.
+    EarlyControl,
     Data,
     Control,
 }
@@ -138,10 +141,15 @@ impl Capture {
             Ok(super::ap_wire::Transition::Benign)
         )
     }
-    pub(super) fn lifecycle(&self) -> bool {
+    /// Compare only the retained original native Runtime identity. No raw
+    /// source, firmware registry or other owner's access is exposed.
+    pub(crate) fn belongs_to(&self, live: &Arc<AtomicBool>) -> bool {
+        self.native.belongs_to(live)
+    }
+    pub(crate) fn lifecycle(&self) -> bool {
         matches!(self.purpose, Use::Lifecycle)
     }
-    pub(super) fn transmit(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn transmit(&self, bytes: &[u8]) -> bool {
         if !(14..=1514).contains(&bytes.len())
             || self
                 .target
@@ -168,10 +176,10 @@ impl Capture {
             _ => false,
         }
     }
-    pub(super) fn same_role(&self, other: &Self) -> bool {
+    pub(crate) fn same_role(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.role.word, &other.role.word) && self.role.value == other.role.value
     }
-    pub(super) fn role_current(&self) -> Result<(), Error> {
+    pub(crate) fn role_current(&self) -> Result<(), Error> {
         if !self.source.current()
             || !self.sources.iter().all(ApEmissionAuthority::current)
             || !self.policy.current()

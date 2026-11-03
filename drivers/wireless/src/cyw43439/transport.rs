@@ -125,6 +125,35 @@ pub trait Transport {
 /// `sdio_readsb` for F2 RX and incrementing writes for TX. A host adapter must implement actual
 /// FIFO transactions and readiness detection before attaching a runtime.
 pub trait PacketTransport: Transport + Send {
+    /// A real AP producer's original fixed scope must reach every native
+    /// COMMAND write after waits. Unknown adapters cannot fake this by
+    /// checking a bool before their ordinary transmit operation.
+    fn transmit_ap_packet(
+        &mut self,
+        _packet: &[u8],
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+    /// Same fixed Program boundary for serialized AP IOCTLs. A control
+    /// request is neither a DATA grant nor source-only stop authorization.
+    fn transmit_ap_control(
+        &mut self,
+        _packet: &[u8],
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+    /// Actual consumed native RX/control prefix, not a cached poll count.
+    /// Unknown transports cannot provide a firmware-SME AP Idle receipt.
+    fn completed_prefix(&mut self) -> Result<bool, TransportError> {
+        Err(TransportError::NotReady)
+    }
+    /// Sealed native host/card plus original signed firmware selection.
+    /// A raw receipt carries no live Runtime or AP/peer/key/port grant.
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        None
+    }
     /// Copy one complete SDPCM packet, including its 12-byte bus header.
     /// Zero means no packet is currently available. The adapter consumes
     /// physical bus padding but may include it in the returned byte count.

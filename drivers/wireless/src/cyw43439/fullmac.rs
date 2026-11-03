@@ -196,6 +196,32 @@ pub trait Fullmac: Send {
     }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
+    fn ap_enter(&mut self, original: crate::brcmfmac::ap_scope::Capture) -> Result<(), Error> {
+        Runtime::ap_enter(self, original)
+    }
+    fn ap_send(
+        &mut self,
+        bytes: &[u8],
+        priority: u8,
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Runtime::ap_send(self, bytes, priority, original)
+    }
+    fn ap_leave(&mut self) -> Result<bool, Error> {
+        Runtime::ap_leave(self)
+    }
+    fn ap_completed_prefix(&mut self) -> Result<bool, Error> {
+        Runtime::ap_completed_prefix(self)
+    }
+    fn ap_quiet(&mut self) -> Result<bool, Error> {
+        Runtime::ap_quiet(self)
+    }
+    fn ap_retire_peer(&mut self, peer: [u8; 6]) -> Result<bool, Error> {
+        Runtime::ap_retire_peer(self, peer)
+    }
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        Runtime::ap_source(self)
+    }
     async fn stop_transport(&mut self) -> Result<(), Error> {
         Runtime::stop_transport(self)
     }
@@ -207,6 +233,12 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     }
     const FAMILY: Family = Family::Sdio;
     const EXTERNAL_CLM: bool = true;
+    // Withheld until the whole native SDIO AP composition (Card/F2/SDPCM/
+    // BCDC firmware-SME path, Program ownership, stop/pin, preverification
+    // hold) is reviewed complete. Even when set, metadata still requires an
+    // actual original typed Card/firmware source, exact native `ap`
+    // capability token and GET_AP0 discovery.
+    const PRIMARY_AP: bool = false;
     fn command<'a>(
         &'a mut self,
         direction: Direction,
@@ -215,6 +247,16 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
         Runtime::command(self, direction, command, input, maximum)
+    }
+    fn command_ap<'a>(
+        &'a mut self,
+        original: &'a crate::brcmfmac::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        Runtime::command_ap(self, original, direction, command, input, maximum)
     }
     async fn configure_bus(&mut self) -> Result<(), Error> {
         for name in [b"bus:txglom\0".as_slice(), b"bus:rxglom\0".as_slice()] {

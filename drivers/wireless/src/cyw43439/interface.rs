@@ -307,11 +307,21 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             Err(Error::Unsupported | Error::Malformed | Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
-    let ap_capable = R::PRIMARY_AP
-        && station
+    // No discovery IOCTL is issued for a family that does not advertise AP.
+    let ap_capable = if !R::PRIMARY_AP {
+        false
+    } else if R::FAMILY == Family::Sdio {
+        match super::sdio_ap_discovery::discover(&mut station.runtime).await {
+            Ok(capable) => capable,
+            Err(Error::Unsupported | Error::Malformed | Error::Firmware(_)) => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        station
             .runtime
             .ap_source()
-            .is_some_and(|source| source.current().is_ok());
+            .is_some_and(|source| source.current().is_ok())
+    };
     let telemetry = Arc::new(super::telemetry::Counters::default());
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();

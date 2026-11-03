@@ -15,6 +15,10 @@ enum Owner {
         proof: Option<Arc<Proof>>,
         device: BusDevice,
     },
+    Sdio {
+        native: narf_drivers_sdio::source::Source,
+        proof: Arc<Proof>,
+    },
     #[cfg(any(test, feature = "kernel-test"))]
     Fixture(Arc<AtomicBool>),
 }
@@ -50,11 +54,24 @@ impl Source {
             live: None,
         }
     }
-    pub(super) fn retain(mut self, live: &Arc<AtomicBool>) -> Self {
+    /// Raw fixed native SDIO receipt; Runtime attaches its own actual
+    /// nonreviving service generation before this can pass current/invoke.
+    pub(crate) fn sdio(
+        native: narf_drivers_sdio::source::Source,
+        proof: Arc<Proof>,
+    ) -> Option<Self> {
+        proof.validate().ok()?;
+        native.current().ok()?;
+        Some(Self {
+            owner: Owner::Sdio { native, proof },
+            live: None,
+        })
+    }
+    pub(crate) fn retain(mut self, live: &Arc<AtomicBool>) -> Self {
         self.live = Some(live.clone());
         self
     }
-    pub(super) fn belongs_to(&self, live: &Arc<AtomicBool>) -> bool {
+    pub(crate) fn belongs_to(&self, live: &Arc<AtomicBool>) -> bool {
         self.live.as_ref().is_some_and(|old| Arc::ptr_eq(old, live))
     }
     pub(super) fn same_generation(&self, other: &Self) -> bool {
@@ -98,6 +115,18 @@ impl Source {
                     }
                 })
                 .map_err(|_| Error::Access)?
+            }
+            Owner::Sdio { native, proof } => {
+                proof.validate().map_err(|_| Error::Access)?;
+                native
+                    .invoke(|| {
+                        if !live.load(Ordering::Acquire) {
+                            Err(Error::Failed)
+                        } else {
+                            Ok(copy())
+                        }
+                    })
+                    .map_err(|_| Error::Access)?
             }
             #[cfg(any(test, feature = "kernel-test"))]
             Owner::Fixture(present) => {

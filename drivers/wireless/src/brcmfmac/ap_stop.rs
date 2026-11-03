@@ -130,6 +130,7 @@ impl Session {
         self.peers.clear();
         self.rejected.clear();
         self.received.clear();
+        self.early_control.clear();
         self.selected_group = None;
         self.native_group = None;
         self.default_source = None;

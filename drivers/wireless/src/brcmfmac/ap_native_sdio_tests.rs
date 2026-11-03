@@ -1,0 +1,829 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Actual SDHCI Card -> signed AI/CM3 loader -> F1/F2 -> SDPCM/BCDC ->
+//! public common Device AP controls. Only inert device bytes are modeled.
+use super::*;
+use crate::cyw43439::{
+    firmware::FirmwareLoader, runtime::Runtime, sdio_ap_model, sdio_bridge::SdioTransport,
+};
+use alloc::boxed::Box;
+use narf_drivers_sdio::{
+    card::tests::Model,
+    card::{Card, Config},
+};
+type SdioRuntime = Runtime<SdioTransport<Card<Model>>>;
+type SdioDevice = Device<SdioRuntime>;
+static ACTIVE_SDIO: IrqSafeSpinLock<Option<Arc<SdioDevice>>> = IrqSafeSpinLock::new(None);
+fn sdio_send(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+    let device = ACTIVE_SDIO.lock().clone().ok_or(())?;
+    device.enqueue(bytes)
+}
+fn sdio_shell(name: String, station: Station<SdioRuntime>) -> Arc<SdioDevice> {
+    let channels = station
+        .channels
+        .iter()
+        .map(|&channel| u32::from(channel))
+        .collect();
+    let supplicant = station.supplicant;
+    let mfp_supported = station.supports_management_protection();
+    let sae_offload = station.supports_sae_offload();
+    let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
+    let ht_capabilities = station.ht_capabilities();
+    let vht_capabilities = station.vht_capabilities();
+    let (rx, consumer) = narf_ipc::channel();
+    let (producer, tx) = narf_ipc::channel();
+    let device = Arc::new(Device {
+        state: Mutex::new(State {
+            station,
+            rx,
+            tx,
+            pending: None,
+            telemetry: telemetry.clone(),
+            ap: None,
+            ap_data_generation: 0,
+            ap_epoch_changed: false,
+            monitor: None,
+        }),
+        name: name.clone(),
+        mac: OWN,
+        channels,
+        supplicant,
+        mfp_supported,
+        sae_offload,
+        external_ops: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+        telemetry,
+        pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+        ht_capabilities,
+        vht_capabilities,
+        up: AtomicBool::new(false),
+        power_save: AtomicU8::new(0),
+        bssid: AtomicU64::new(0),
+        roaming: AtomicBool::new(false),
+        epoch: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
+        publication: IrqSafeSpinLock::new(()),
+        receive_hook: IrqSafeSpinLock::new(None),
+        rx: IrqSafeSpinLock::new(Some(consumer)),
+        tx: IrqSafeSpinLock::new(Some(producer)),
+        lifecycle: Default::default(),
+    });
+    *ACTIVE_SDIO.lock() = Some(device.clone());
+    device
+}
+struct SdioBound {
+    device: Arc<SdioDevice>,
+    iface: Arc<dyn WirelessNetIface>,
+    bus: sdio_ap_model::Handle,
+    host: Option<Model>,
+    proof: Arc<crate::brcmfmac::provision::Proof>,
+    admin: narf_net::AdminHandle,
+    source: Arc<Source>,
+    database: Arc<narf_wireless::reg::db::Database>,
+    name: String,
+}
+impl SdioBound {
+    fn new() -> Result<Self, &'static str> {
+        Self::new_capability(b"ap sta wme\0", true)
+    }
+    fn new_capability(capability: &[u8], enter_ap: bool) -> Result<Self, &'static str> {
+        use crate::brcmfmac::provision::{tests::selected_fixture, Family};
+        let (selection, assets) = selected_fixture(Family::Sdio43439)?;
+        let (endpoint, bus) = sdio_ap_model::Device::new();
+        bus.capability(capability);
+        let host = Model::with_endpoint(Box::new(endpoint), Some(selection.host()));
+        let card = Card::initialize(host.clone(), Config::default())
+            .map_err(|_| "SDIO AP actual CCCR/CIS host init")?;
+        let mut transport = SdioTransport::new(card).qualify(assets.proof.clone());
+        transport
+            .prepare()
+            .map_err(|_| "SDIO AP F1/block preparation")?;
+        let nvram = crate::brcmfmac::boot::pack_nvram(&assets.nvram)
+            .map_err(|_| "SDIO AP selected NVRAM")?;
+        let mut loader = FirmwareLoader::new(transport, &assets.firmware, &nvram, 0, false)
+            .require_revisions(selection.revisions());
+        loader
+            .run()
+            .map_err(|_| "SDIO AP actual signed AI/CM3/firmware loader")?;
+        let core = loader
+            .packet_core()
+            .ok_or("SDIO AP actual firmware packet core")?;
+        let revision = loader
+            .packet_core_revision()
+            .ok_or("SDIO AP actual core revision")?;
+        let mut transport = loader
+            .into_transport()
+            .map_err(|_| "SDIO AP loader terminal")?;
+        transport
+            .initialize_packets(core)
+            .map_err(|_| "SDIO AP actual F2/mailbox init")?;
+        transport
+            .initialize_sleep(revision)
+            .map_err(|_| "SDIO AP actual sleep source init")?;
+        let database = Arc::new(narf_wireless::reg::db::Database::new());
+        database.install(firmware::domain());
+        let runtime = Runtime::new(transport);
+        let station = ready(Station::initialize_live(
+            runtime,
+            &assets.clm,
+            database.clone(),
+        ))?
+        .map_err(|_| "SDIO AP actual BCDC/Station initialization")?;
+        let name = narf_net::iface::register("wlan%d", OWN, sdio_send);
+        let device = sdio_shell(name.clone(), station);
+        // Production `attach_runtime` registers the netdev capability and
+        // the kernel iface first, then records the AP identity/capability.
+        // Keep that order so the fixture's original identity is factual.
+        let cap = narf_net::registry()
+            .register(&narf_net::bootstrap_authority(), Registered(device.clone()))
+            .map_err(|_| "SDIO AP original registered netdev")?;
+        ready(device.sdio_ap_fixture_setup(database.clone()))?
+            .map_err(|_| "SDIO AP actual cap/GET_AP discovery")?;
+        narf_net::iface::set_link_state(&name, false);
+        if enter_ap {
+            device
+                .set_iftype(3)
+                .map_err(|_| "SDIO AP admitted public mode3")?;
+        }
+        let daemon = Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap();
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon,
+        })
+        .map_err(|_| "SDIO AP original admin")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = device.clone();
+        narf_wireless::registry::register(iface.clone());
+        narf_net::iface::set_link_state(&name, true);
+        Ok(Self {
+            device,
+            iface,
+            bus,
+            host: Some(host),
+            proof: assets.proof,
+            admin,
+            source: Arc::new(Source::new()),
+            database,
+            name,
+        })
+    }
+    fn authority(&self) -> ApControlAuthority {
+        ApControlAuthority::bind(
+            self.admin.clone(),
+            &self.iface,
+            0,
+            narf_net::iface::lookup(&self.name).unwrap().ifindex,
+            self.source.clone(),
+        )
+        .unwrap()
+        .reserve()
+        .unwrap()
+    }
+    fn start(&self, secure: bool) -> Result<(), &'static str> {
+        let (config, settings) = config(secure);
+        ready(
+            self.device
+                .start_ap_with_settings_async(&self.authority(), config, settings),
+        )?
+        .map_err(|_| "SDIO AP actual START/beacon/rate/BSS receipts")
+    }
+    fn peer(&self, secure: bool) -> Result<(), &'static str> {
+        let before = self.source.count(19);
+        self.bus
+            .change(|profile| profile.associate(CLIENT, association(secure)));
+        ready(self.device.ap_worker())?;
+        self.device.ap_drain();
+        if self.source.count(19) != before + 1 {
+            return Err("SDIO AP actual SCB/NEW_STATION");
+        }
+        Ok(())
+    }
+    fn enqueue(&self) -> Result<(), &'static str> {
+        self.device
+            .enqueue(&ethernet())
+            .map_err(|_| "SDIO AP original Ethernet enqueue")?;
+        for _ in 0..8 {
+            self.device.ap_drain();
+        }
+        Ok(())
+    }
+    fn install(&self, index: u8, peer: Option<[u8; 6]>, material: u8) -> Result<(), &'static str> {
+        ready(
+            self.device
+                .add_key_ap_async(&self.authority(), key(index, peer, material)),
+        )?
+        .map_err(|_| "SDIO AP actual wsec_key terminal")
+    }
+    fn authorize(&self, authorized: bool) -> Result<(), &'static str> {
+        ready(
+            self.device
+                .set_station_async(&self.authority(), station(authorized)),
+        )?
+        .map_err(|_| "SDIO AP actual SCB authorize terminal")
+    }
+    fn data_commands(&self) -> usize {
+        self.host
+            .as_ref()
+            .unwrap()
+            .native_commands()
+            .iter()
+            .filter(|(id, arg, _)| *id == 53 && arg >> 31 != 0 && (arg >> 28) & 7 == 2)
+            .count()
+    }
+    /// Drain the original IPC ring and report whether `expected` was copied.
+    fn ring(&self, expected: &[u8]) -> bool {
+        let mut rx = self.device.rx.lock();
+        let Some(consumer) = rx.as_mut() else {
+            return false;
+        };
+        let mut found = false;
+        for _ in 0..RX_RING_N {
+            let Ok(Some(frame)) = consumer.try_recv() else {
+                break;
+            };
+            found |= frame.payload() == expected;
+        }
+        found
+    }
+    fn rx_packets(&self) -> u64 {
+        narf_net::iface::lookup(&self.name).map_or(0, |iface| iface.stats.rx_packets)
+    }
+}
+impl Drop for SdioBound {
+    fn drop(&mut self) {
+        let _ = ready(self.device.teardown());
+        self.host.take();
+        *ACTIVE_SDIO.lock() = None;
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::unregister(&self.name);
+    }
+}
+
+fn open_and_block() -> Result<(), &'static str> {
+    for caps in [b"apextra sta wme\0".as_slice(), b"sta wme\0"] {
+        let b = SdioBound::new_capability(caps, false)?;
+        b.admin
+            .set_link(false)
+            .map_err(|_| "SDIO negative capability admin DOWN")?;
+        if b.device.ap_capable()
+            || b.device.ap_sme_capabilities().is_some()
+            || b.device.set_iftype(3).is_ok()
+        {
+            return Err("SDIO AP absent/non-token native capability became AP authority");
+        }
+    }
+    let b = SdioBound::new()?;
+    b.start(false)?;
+    b.peer(false)?;
+    let mut large = ethernet();
+    large.resize(1514, 0x73);
+    let before = b.data_commands();
+    b.device
+        .enqueue(&large)
+        .map_err(|_| "SDIO AP maximum actual Ethernet enqueue")?;
+    for _ in 0..8 {
+        b.device.ap_drain();
+    }
+    let packets = b.bus.physical_packets();
+    let wire = packets
+        .iter()
+        .rev()
+        .find(|p| p[5] == 2)
+        .ok_or("SDIO AP actual DATA packet")?;
+    if b.data_commands() != before + 1
+        || wire.len() != 1536
+        || wire[..2] != 1530u16.to_le_bytes()
+        || wire[2..4] != (!1530u16).to_le_bytes()
+        || wire[5] != 2
+        || wire[7] != 12
+        || wire[12..16] != [0x20, 0, 0, 0]
+        || wire[16..1530] != large
+        || wire[1530..].iter().any(|b| *b != 0)
+        || !b.bus.change(|profile| profile.packets.contains(&large))
+        || !b
+            .bus
+            .commands()
+            .iter()
+            .any(|(id, body)| *id == 118 && body == &1u32.to_le_bytes())
+        || b.device.ap_sme_capabilities() != Some(0)
+        || b.device.supports_ap_userspace_mlme()
+        || b.device.supports_control_port_tx_status()
+        || b.device.supports_ap_key_sequence()
+        || b.device.connected_bssid().is_some()
+        || !b.device.link_up()
+    {
+        return Err("SDIO AP one COMMAND/logical length/zero tail/firmware SME contract");
+    }
+    ready(b.device.stop_ap_async(&b.authority()))?.map_err(|_| "SDIO AP native STOP")?;
+    if b.device.link_up() || b.bus.change(|p| p.active || !p.peers.is_empty()) {
+        return Err("SDIO AP native BSS/SCB STOP receipts");
+    }
+    b.start(false)?;
+    b.peer(false)?;
+    Ok(())
+}
+fn smoke_cyw_ap_actual_card_loader_bcdc_sme_and_single_block_packet_stop_successor() -> TestResult {
+    match open_and_block() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_actual_card_loader_bcdc_sme_and_single_block_packet_stop_successor
+);
+
+fn early_control() -> Result<(), &'static str> {
+    let b = SdioBound::new()?;
+    b.start(true)?;
+    let eapol_start = [2, 1, 0, 0];
+    b.bus.change(|p| {
+        p.associate(CLIENT, association(true));
+        p.downlink.push_back(control_frame(&eapol_start));
+    });
+    ready(b.device.ap_worker())?;
+    b.device.ap_drain();
+    if b.source.count(19) != 1
+        || control_pdu(&b.source) != Some(eapol_start.to_vec())
+        || b.authorize(true).is_ok()
+    {
+        return Err("SDIO AP same-drain association/EAPOL lost or sta_info fabricated port");
+    }
+    drop(b);
+    let b = SdioBound::new()?;
+    b.start(true)?;
+    b.bus.change(|p| {
+        p.associate(CLIENT, association(true));
+        p.downlink.push_back(control_frame(&eapol_start));
+        p.remove(CLIENT);
+    });
+    ready(b.device.ap_worker())?;
+    b.device.ap_drain();
+    if b.source.count(19) != 0 || control_pdu(&b.source).is_some() {
+        return Err("SDIO AP native loss before SCB verification published held EAPOL");
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_native_bss_up_queries_and_same_drain_association_eapol_keep_records() -> TestResult
+{
+    match early_control() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_native_bss_up_queries_and_same_drain_association_eapol_keep_records
+);
+
+fn tx_control(b: &SdioBound, pdu: Vec<u8>) -> Result<(), &'static str> {
+    let expected = pdu.clone();
+    if ready(b.device.tx_control_port_ap_async(
+        &b.authority(),
+        narf_wireless::ControlPortTxRequest::new(CLIENT, 0x888e, pdu, true, false),
+    ))? != Ok(false)
+        || !b
+            .bus
+            .change(|p| p.packets.last().is_some_and(|p| p[14..] == expected))
+    {
+        return Err("SDIO AP native EAPOL PIO terminal/body without invented ACK");
+    }
+    Ok(())
+}
+fn rsn_exchange() -> Result<(), &'static str> {
+    use narf_wireless::eapol::*;
+    let b = SdioBound::new()?;
+    b.start(true)?;
+    b.peer(true)?;
+    let pmk = [0x55; 32];
+    let anonce = [0xaa; 32];
+    let snonce = [0x77; 32];
+    let ptk = wpa_pmk_to_ptk(KeyMgmt::Psk, &pmk, &OWN, &CLIENT, &anonce, &snonce, 16);
+    let mut m1 = KeyFrame::empty(16);
+    m1.key_information = KI_VERSION_HMAC_SHA1_AES | KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK;
+    m1.key_length = 16;
+    m1.replay_counter = 1;
+    m1.key_nonce = anonce;
+    let ie = config(true).0.beacon_tail;
+    let mut m2 = KeyFrame::empty(16);
+    m2.key_information = KI_VERSION_HMAC_SHA1_AES | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
+    m2.replay_counter = 1;
+    m2.key_nonce = snonce;
+    m2.key_data = ie.clone();
+    let m2 = signed(m2, &ptk.kck);
+    b.bus
+        .change(|profile| profile.response_on_control = Some(control_frame(&m2)));
+    tx_control(&b, m1.into_eapol())?;
+    b.device.ap_drain();
+    let actual = control_pdu(&b.source).ok_or("AP real native M2 delivery")?;
+    let mut unsigned = actual.clone();
+    unsigned[81..97].fill(0);
+    if actual != m2 || eapol_key_mic(2, &ptk.kck, &unsigned, 16).unwrap() != actual[81..97] {
+        return Err("AP userspace authenticator rejected M2 MIC/body");
+    }
+    let mut clear = ie;
+    clear.extend_from_slice(&[221, 22, 0, 15, 172, 1, 1, 0]);
+    clear.extend_from_slice(&[0x42; 16]);
+    if clear.len() % 8 != 0 {
+        clear.push(221);
+    }
+    while clear.len() % 8 != 0 {
+        clear.push(0);
+    }
+    let mut m3 = KeyFrame::empty(16);
+    m3.key_information = KI_VERSION_HMAC_SHA1_AES
+        | KI_KEY_TYPE_PAIRWISE
+        | KI_KEY_ACK
+        | KI_KEY_MIC
+        | KI_INSTALL
+        | KI_SECURE
+        | KI_ENCRYPTED_KEY_DATA;
+    m3.key_length = 16;
+    m3.replay_counter = 2;
+    m3.key_nonce = anonce;
+    m3.key_data =
+        narf_crypto::aes_kw::aes_wrap(ptk.kek.as_slice().try_into().unwrap(), &clear).unwrap();
+    let m3 = signed(m3, &ptk.kck);
+    let mut m4 = KeyFrame::empty(16);
+    m4.key_information = KI_VERSION_HMAC_SHA1_AES | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC | KI_SECURE;
+    m4.replay_counter = 2;
+    let m4 = signed(m4, &ptk.kck);
+    b.bus
+        .change(|profile| profile.response_on_control = Some(control_frame(&m4)));
+    tx_control(&b, m3.clone())?;
+    let on_wire = b.bus.change(|p| p.packets.last().unwrap()[14..].to_vec());
+    let frame = KeyFrame::decode(&on_wire[4..], 16).ok_or("AP M3 wire key grammar")?;
+    if on_wire != m3
+        || narf_crypto::aes_kw::aes_unwrap(ptk.kek.as_slice().try_into().unwrap(), &frame.key_data)
+            != Some(clear)
+    {
+        return Err("AP actual native M3 AES-wrapped GTK");
+    }
+    b.device.ap_drain();
+    if control_pdu(&b.source) != Some(m4) {
+        return Err("AP actual native M4 before key/port");
+    }
+    let mut pairwise = key(0, Some(CLIENT), 0).params().clone();
+    pairwise.key = ptk.tk;
+    {
+        let a = b.authority();
+        ready(
+            b.device
+                .add_key_ap_async(&a, narf_wireless::OwnedKey::new(pairwise)),
+        )?
+        .map_err(|_| "AP actual derived PTK install")?;
+    }
+    b.install(1, None, 0x42)?;
+    b.authorize(true)?;
+    b.enqueue()?;
+    if b.bus
+        .change(|p| p.keys.iter().filter(|k| k[4] == 16).count())
+        != 2
+    {
+        return Err("AP RSN keys not supplied through actual native transactions");
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_actual_sdpcm_userspace_mic_wrapped_gtk_key_port_and_eapol_terminal() -> TestResult {
+    match rsn_exchange() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_actual_sdpcm_userspace_mic_wrapped_gtk_key_port_and_eapol_terminal
+);
+
+fn prefix_losses() -> Result<(), &'static str> {
+    for late in [false, true] {
+        let b = SdioBound::new()?;
+        b.start(false)?;
+        b.peer(false)?;
+        let before = b.bus.packets();
+        let lost = b.source.count(20);
+        b.device
+            .enqueue(&ethernet())
+            .map_err(|_| "SDIO AP retain original before loss prefix")?;
+        if late {
+            b.bus.loss_before_command(CLIENT);
+        } else {
+            b.bus.change(|p| {
+                for _ in 0..72 {
+                    p.event(23, CLIENT, &[]);
+                }
+                p.remove(CLIENT);
+            });
+        }
+        for _ in 0..12 {
+            b.device.ap_drain();
+        }
+        ready(b.device.ap_worker())?;
+        b.device.ap_drain();
+        if b.bus.packets() != before
+            || b.source.count(20) != lost + 1
+            || b.bus.change(|p| p.peers.contains_key(&CLIENT))
+            || b.device.transport_failed()
+            || !b.device.link_up()
+        {
+            return Err("SDIO AP old DATA crossed long or final-CARD_INT native peer loss");
+        }
+        b.peer(false)?;
+        b.enqueue()?;
+        if b.bus.packets() != before + 1 {
+            return Err("SDIO AP native loss denied fresh successor");
+        }
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_long_native_prefix_and_late_card_interrupt_deny_original_data() -> TestResult {
+    match prefix_losses() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_long_native_prefix_and_late_card_interrupt_deny_original_data
+);
+fn secure() -> Result<(), &'static str> {
+    let b = SdioBound::new()?;
+    b.install(1, None, 0x42)?;
+    if !b.bus.change(|p| p.keys.is_empty()) || b.device.link_up() {
+        return Err("AP staged key invented native install");
+    }
+    {
+        let a = b.authority();
+        ready(
+            b.device
+                .default_key_ap_async(&a, 1, false, true, false, false),
+        )?
+        .map_err(|_| "AP staged default metadata")?;
+    }
+    b.start(true)?;
+    b.peer(true)?;
+    if b.bus.change(|p| p.keys.len()) != 1 {
+        return Err("AP staged key lacks native promotion");
+    }
+    if b.authorize(true).is_ok() {
+        return Err("AP port opened without native PTK");
+    }
+    b.install(0, Some(CLIENT), 0x43)?;
+    b.authorize(true)?;
+    b.enqueue()?;
+    let writes = b.bus.change(|p| p.keys.len());
+    b.install(0, Some(CLIENT), 0x43)?;
+    if b.bus.change(|p| p.keys.len()) != writes {
+        return Err("AP identical retry rewrote native PN/RSC");
+    }
+    let a = b.authority();
+    ready(b.device.del_key_ap_async(&a, 0, true, Some(CLIENT)))?
+        .map_err(|_| "AP PTK deletion requires native SCB/flow absence")?;
+    b.device.ap_drain();
+    if b.source.count(20) != 1 || b.bus.change(|p| p.peers.contains_key(&CLIENT)) {
+        return Err("AP PTK removal synthesized loss or retained native SCB");
+    }
+    drop(a);
+    b.peer(true)?;
+    if b.install(0, Some(CLIENT), 0x43).is_ok() {
+        return Err("AP retired key material reinstalled after SCB replacement");
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_native_staging_key_port_scb_absence_and_material_history() -> TestResult {
+    match secure() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_native_staging_key_port_scb_absence_and_material_history
+);
+
+fn source_publication() -> Result<(), &'static str> {
+    for issued in [false, true] {
+        let mut b = SdioBound::new()?;
+        b.start(false)?;
+        b.peer(false)?;
+        let original = {
+            let state = b
+                .device
+                .state
+                .try_lock()
+                .ok_or("SDIO AP original DATA lock")?;
+            state
+                .ap
+                .as_ref()
+                .ok_or("SDIO AP original DATA owner")?
+                .data_capture(&ethernet())
+                .map_err(|_| "SDIO AP original DATA proof")?
+        };
+        let before = b.bus.packets();
+        if issued {
+            b.bus.revoke_after_chunk(b.proof.clone());
+        } else {
+            b.bus.revoke_before_command(b.proof.clone());
+        }
+        let result = ready(async {
+            let mut state = b.device.state.lock().await;
+            state.station.runtime.ap_send(&ethernet(), 0, &original)
+        })?;
+        if result.is_ok()
+            || b.bus.packets() != before + usize::from(issued)
+            || original.current().is_ok()
+            || b.bus.partial() != 0
+            || b.device.transport_failed() != issued
+        {
+            return Err("SDIO AP late original source loss invented issue/copy/terminal credit");
+        }
+        let count = b.bus.physical_packets().len();
+        b.device.ap_drain();
+        ready(b.device.ap_worker())?;
+        b.device.ap_drain();
+        b.host.take();
+        let _ = ready(b.device.teardown())?;
+        if b.device.link_up() || b.bus.drops() != 0 || b.bus.physical_packets().len() != count {
+            return Err("SDIO AP revoked native source reclaimed/replayed unproved transport");
+        }
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_fixed_source_loss_at_command_and_after_issue_retains_uncertain_card() -> TestResult
+{
+    match source_publication() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_fixed_source_loss_at_command_and_after_issue_retains_uncertain_card
+);
+
+fn cancel_key() -> Result<(), &'static str> {
+    let mut b = SdioBound::new()?;
+    b.start(true)?;
+    b.peer(true)?;
+    b.bus.change(|profile| profile.hold_key = true);
+    let authority = b.authority();
+    {
+        let mut future = pin!(b
+            .device
+            .add_key_ap_async(&authority, key(0, Some(CLIENT), 0x66)));
+        if !matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ) || b.bus.change(|profile| profile.keys.len()) != 1
+        {
+            return Err("SDIO AP cancellation did not own actual accepted wsec_key request");
+        }
+    }
+    drop(authority);
+    ready(b.device.ap_worker())?;
+    if b.device.link_up() || b.device.ap_generation().is_some() {
+        return Err("SDIO AP dropped accepted key waiter kept live AP generation");
+    }
+    b.host.take();
+    if b.bus.drops() != 0 {
+        return Err("SDIO AP cancellation prematurely released original Card");
+    }
+    ready(b.device.teardown())?;
+    if b.bus.drops() != 1 {
+        return Err("SDIO AP actual passive/F2/IRQ/F1 stop failed to release original Card");
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_cancelled_actual_key_waiter_releases_only_after_native_card_stop() -> TestResult {
+    match cancel_key() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_cancelled_actual_key_waiter_releases_only_after_native_card_stop
+);
+
+fn policy_and_pm() -> Result<(), &'static str> {
+    let b = SdioBound::new()?;
+    b.start(false)?;
+    b.peer(false)?;
+    b.device
+        .enqueue(&ethernet())
+        .map_err(|_| "SDIO AP retained queued policy owner")?;
+    let before = b.bus.packets();
+    b.database.install(firmware::domain());
+    b.device.ap_drain();
+    ready(b.device.ap_worker())?;
+    if b.device.link_up() || b.bus.packets() != before || b.bus.change(|profile| profile.active) {
+        return Err(
+            "SDIO AP equal-byte policy replacement revived old source or skipped native STOP",
+        );
+    }
+    b.start(false)?;
+    b.peer(false)?;
+    let original = {
+        let state = b
+            .device
+            .state
+            .try_lock()
+            .ok_or("SDIO AP PM original lock")?;
+        state
+            .ap
+            .as_ref()
+            .ok_or("SDIO AP PM role")?
+            .data_capture(&ethernet())
+            .map_err(|_| "SDIO AP PM capture")?
+    };
+    // SDIO system resume is a separate open feature. Refusal cannot retain
+    // the old AP; no synthetic card-power/reset/resume receipt is supplied.
+    if ready(Endpoint::suspend(&*b.device))?.is_ok()
+        || original.current().is_ok()
+        || b.device.link_up()
+        || b.bus.change(|profile| profile.active)
+    {
+        return Err("SDIO AP unsupported system PM retained/replayed old BSS authority");
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_policy_replacement_and_unsupported_system_pm_close_original_bss() -> TestResult {
+    match policy_and_pm() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_policy_replacement_and_unsupported_system_pm_close_original_bss
+);
+
+fn uplink() -> Vec<u8> {
+    let mut bytes = vec![0; 64];
+    bytes[..6].copy_from_slice(&OWN);
+    bytes[6..12].copy_from_slice(&CLIENT);
+    bytes[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    bytes[14..30].copy_from_slice(b"cyw-ap-ordinary!");
+    bytes
+}
+/// Ordinary peer DATA from the actual SDPCM DATA channel reaches the ring and
+/// stack; a native peer loss newly queued on CARD_INT at either final sink
+/// boundary denies that sink (and, at the ring, the later stack callback).
+fn ordinary_rx() -> Result<(), &'static str> {
+    for point in [
+        ReceivePoint::AfterFrameAllocation,
+        ReceivePoint::BeforeCallback,
+    ] {
+        let b = SdioBound::new()?;
+        b.start(false)?;
+        b.peer(false)?;
+        let frame = uplink();
+        let before = b.rx_packets();
+        b.bus.change(|p| p.downlink.push_back(frame.clone()));
+        ready(b.device.ap_worker())?;
+        b.device.ap_drain();
+        if !b.ring(&frame) || b.rx_packets() != before + 1 {
+            return Err("SDIO AP ordinary native DATA missed its ring or stack");
+        }
+        let hit = Arc::new(AtomicBool::new(false));
+        let once = hit.clone();
+        let bus = b.bus.clone();
+        *b.device.receive_hook.lock() = Some(Arc::new(move |at| {
+            if at == point && !once.swap(true, Ordering::AcqRel) {
+                bus.change(|p| p.remove(CLIENT));
+            }
+        }));
+        let lost = b.source.count(20);
+        let before = b.rx_packets();
+        b.bus.change(|p| p.downlink.push_back(frame.clone()));
+        ready(b.device.ap_worker())?;
+        b.device.ap_drain();
+        *b.device.receive_hook.lock() = None;
+        let ringed = b.ring(&frame);
+        if !hit.load(Ordering::Acquire)
+            || b.rx_packets() != before
+            || (point == ReceivePoint::AfterFrameAllocation && ringed)
+        {
+            return Err("SDIO AP ordinary DATA crossed a newly queued native peer loss");
+        }
+        for _ in 0..4 {
+            ready(b.device.ap_worker())?;
+            b.device.ap_drain();
+        }
+        if b.source.count(20) != lost + 1 || b.device.transport_failed() || b.ring(&frame) {
+            return Err("SDIO AP native loss after denied DATA was not applied once");
+        }
+    }
+    Ok(())
+}
+fn smoke_cyw_ap_ordinary_native_rx_final_ring_and_stack_boundaries() -> TestResult {
+    match ordinary_rx() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/ap",
+    smoke_cyw_ap_ordinary_native_rx_final_ring_and_stack_boundaries
+);

@@ -79,6 +79,9 @@ pub mod ioctl;
 pub mod iovar;
 pub mod runtime;
 pub mod sdio;
+mod sdio_ap_discovery;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod sdio_ap_model;
 pub mod sdio_bridge;
 mod sdio_passive;
 pub mod sdpcm;

@@ -63,6 +63,7 @@ pub(crate) struct Session {
     pub(super) group_data: Epoch,
     pub(super) history: Arc<narf_lib::sync::IrqSafeSpinLock<History>>,
     pub(super) received: VecDeque<Received>,
+    pub(super) early_control: VecDeque<Received>,
     pub(super) generation: u32,
     pub(super) rejected: Vec<super::ap_peer::Rejected>,
     pub(super) pending_template: Option<(Vec<u8>, Vec<u8>)>,
@@ -130,6 +131,7 @@ impl Session {
             group_data: Epoch::new(),
             history,
             received: VecDeque::new(),
+            early_control: VecDeque::new(),
             generation: 0,
             rejected: Vec::new(),
             pending_template: None,
@@ -249,6 +251,7 @@ impl Session {
             let _ = peer.deny(false);
         }
         self.received.clear();
+        self.early_control.clear();
     }
     pub(super) fn generation(&mut self) -> Result<u32, Error> {
         self.generation = self.generation.checked_add(1).ok_or(Error::Failed)?;
@@ -313,6 +316,32 @@ impl Session {
         });
         Ok(())
     }
+    pub(super) fn verified_control(&mut self, mac: [u8; 6]) -> Result<(), Error> {
+        if !self
+            .peers
+            .iter()
+            .any(|peer| peer.mac == mac && peer.associated && !peer.removed)
+        {
+            return Err(Error::Authority);
+        }
+        // Move the original held proof/lease, never capture a new peer/source.
+        // Association notification was queued before this release.
+        for _ in 0..self.early_control.len() {
+            let received = self.early_control.pop_front().ok_or(Error::Failed)?;
+            if received.original.current().is_err() {
+                continue;
+            }
+            if matches!(&received.event, Event::Control { peer, .. } if *peer == mac) {
+                if self.received.len() == 32 {
+                    return Err(Error::EventOverflow);
+                }
+                self.received.push_back(received);
+            } else {
+                self.early_control.push_back(received);
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn take_received(&mut self) -> Vec<Received> {
         self.received.drain(..).collect()
     }
@@ -329,6 +358,8 @@ impl Session {
             while let Some(bytes) = runtime.pop_data() {
                 self.native_data(bytes)?;
             }
+            self.early_control
+                .retain(|held| held.original.current().is_ok());
             if count == 0 && runtime.ap_completed_prefix()? {
                 idle = true;
                 break;
@@ -443,11 +474,51 @@ impl Session {
         let Some(peer) = self
             .peers
             .iter()
-            .find(|peer| peer.mac == mac && peer.associated && !peer.removed)
+            .find(|peer| peer.mac == mac && !peer.removed)
         else {
             return Ok(());
         };
         let protocol = u16::from_be_bytes([bytes[12], bytes[13]]);
+        if !peer.associated {
+            if !peer.verify
+                || protocol != 0x888e
+                || !self.plan.settings.control_port.over_nl80211
+                || bytes[..6] != self.plan.own
+                || bytes.len() < 18
+            {
+                return Ok(());
+            }
+            if self.early_control.len() == 32
+                || self
+                    .early_control
+                    .iter()
+                    .filter(
+                        |held| matches!(&held.event, Event::Control { peer, .. } if *peer == mac),
+                    )
+                    .count()
+                    == 4
+            {
+                // Peer-controlled pre-SCB EAPOL is bounded by dropping the
+                // newest frame (the supplicant/authenticator retransmits);
+                // it never fails the whole firmware-SME BSS session.
+                return Ok(());
+            }
+            let mut original = self.capture(Use::EarlyControl, Some(mac), Some(peer));
+            // This owns no DATA/key/port grant. Verification deliberately
+            // advances the DATA-only epoch before querying actual SCB facts.
+            original.data = None;
+            let lease = Some(peer.copy()?);
+            self.early_control.push_back(Received {
+                event: Event::Control {
+                    peer: mac,
+                    protocol,
+                    pdu: bytes[14..].to_vec(),
+                },
+                original,
+                lease,
+            });
+            return Ok(());
+        }
         // A real M2/M4 can arrive in the same native drain as the outgoing
         // M1/M3 terminal. Control serialization closes ordinary DATA, not
         // firmware-SME EAPOL. Its fixed original peer still gates delivery.

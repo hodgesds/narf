@@ -431,7 +431,17 @@ fn rsn_exchange() -> Result<(), &'static str> {
     use narf_wireless::eapol::*;
     let b = Bound::new()?;
     b.start(true)?;
-    b.peer(true)?;
+    b.bus.ap_change(|profile| {
+        profile.associate(CLIENT, association(true));
+        profile.downlink.push_back(control_frame(&[2, 1, 0, 0]));
+    });
+    ready(b.device.ap_worker())?;
+    b.device.ap_drain();
+    if b.source.count(19) != 1 || control_pdu(&b.source) != Some(vec![2, 1, 0, 0]) {
+        return Err(
+            "AP same-drain native association/EAPOL did not retain original verification hold",
+        );
+    }
     let pmk = [0x55; 32];
     let anonce = [0xaa; 32];
     let snonce = [0x77; 32];
@@ -953,3 +963,6 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/ap",
     smoke_brcmf_ap_program_publication_rechecks_original_after_setup_and_pins_uncertain_index
 );
+
+#[path = "ap_native_sdio_tests.rs"]
+mod sdio;

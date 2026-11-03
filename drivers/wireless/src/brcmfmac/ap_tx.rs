@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Actual msgbuf TX terminal ownership for the AP transport. A native terminal
-//! retires one matching DMA ID; it is not an independently proven air ACK.
+//! Actual AP transport completion ownership. Msgbuf retires matching native
+//! DMA IDs; SDPCM PIO finishes the actual copied host buffer. Neither receipt
+//! independently proves an over-air ACK or firmware MAC/FIFO quiescence.
 use super::{ap_scope::Capture, runtime::TxReceipt};
 use crate::cyw43439::runtime::Error;
 use alloc::sync::{Arc, Weak};
@@ -48,6 +49,19 @@ impl Ticket {
             },
             owned,
         )
+    }
+    /// Producer is the actual synchronous native SDPCM PIO owner, only
+    /// after every source-qualified split transfer completed. This host
+    /// operation ID is not a fabricated firmware TXSTATUS/DMA ID or ACK.
+    pub(crate) fn pio_copied(id: u32, original: Capture) -> Self {
+        Self {
+            id,
+            terminal: Arc::new(Terminal {
+                state: AtomicU8::new(2),
+                status: AtomicU16::new(0),
+            }),
+            original,
+        }
     }
     /// A terminal result says nothing about ACK. Unsupported ACK reporting
     /// remains unadvertised even when this actual DMA terminal succeeds.

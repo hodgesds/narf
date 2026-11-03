@@ -8,6 +8,8 @@ use narf_wifi_fixtures::{DhcpServer, NetworkPlan};
 pub(crate) mod ap_model;
 #[path = "monitor_model.rs"]
 pub(crate) mod monitor_model;
+#[path = "sdio_ap_firmware.rs"]
+pub(crate) mod sdio_ap;
 
 pub(crate) const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 pub(crate) const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];

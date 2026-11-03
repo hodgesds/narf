@@ -201,6 +201,17 @@ impl<R: Fullmac + 'static> Device<R> {
             .capable
             .store(R::PRIMARY_AP, Ordering::Release);
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) async fn sdio_ap_fixture_setup(
+        &self,
+        database: Arc<narf_wireless::reg::db::Database>,
+    ) -> Result<(), Error> {
+        self.ap_fixture_setup(database);
+        let mut state = self.state.lock().await;
+        let capable = super::super::sdio_ap_discovery::discover(&mut state.station.runtime).await?;
+        self.lifecycle.ap.capable.store(capable, Ordering::Release);
+        Ok(())
+    }
     pub(super) fn ap_capable(&self) -> bool {
         R::PRIMARY_AP && self.lifecycle.ap.capable.load(Ordering::Acquire) && !self.withdrawn()
     }
@@ -710,18 +721,35 @@ impl<R: Fullmac + 'static> Device<R> {
                             });
                     #[cfg(any(test, feature = "kernel-test"))]
                     self.receive_hook(ReceivePoint::AfterFrameAllocation);
-                    if self.ap_final(&original) {
-                        let _ = original.publish(|| {
-                            if let (Some(frame), Some(mut state)) = (frame, self.state.try_lock()) {
+                    // Ordinary peer DATA crosses two independent sinks. Both
+                    // re-run the native completed-prefix receipt (a CARD_INT
+                    // newly queuing peer loss/key/port records denies) and
+                    // the original fixed Capture inside its own source
+                    // invocation. A frame denied at the ring boundary is
+                    // never later admitted to the stack callback: denial is
+                    // monotonic for this copied event, mirroring the station
+                    // `deliver_received` break on a failed publication.
+                    let admitted = self.ap_final(&original)
+                        && original
+                            .publish(|| {
+                                let Some(mut state) = self.state.try_lock() else {
+                                    return false;
+                                };
                                 // Retain State through the actual ring copy:
                                 // a concurrent peer/key transition cannot
                                 // finish between its final epoch check and
                                 // this independent IPC publication.
-                                if original.current().is_ok() {
+                                if original.current().is_err() || state.ap.is_none() {
+                                    return false;
+                                }
+                                if let Some(frame) = frame {
                                     let _ = state.rx.try_send(frame);
                                 }
-                            }
-                        });
+                                true
+                            })
+                            .unwrap_or(false);
+                    if !admitted {
+                        continue;
                     }
                     #[cfg(any(test, feature = "kernel-test"))]
                     self.receive_hook(ReceivePoint::BeforeCallback);

@@ -158,6 +158,7 @@ impl Session {
                 },
                 original,
             )?;
+            self.verified_control(mac)?;
         }
         // A copied loss/control event owns a counted lease, so a callback
         // cannot prune its native peer and silently rebind its final proof.

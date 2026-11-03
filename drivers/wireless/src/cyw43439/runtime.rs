@@ -4,7 +4,8 @@
 //! traffic can never satisfy its waiter. Host FIFO access is explicit.
 
 use super::{events, ioctl, sdpcm::*, PacketTransport, TransportError};
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const MAX_CONTROL: usize = 8192;
 // Linux BRCMF_TX_IOCTL_MAX_MSG_SIZE (1518) includes the 16-byte dcmd header.
@@ -12,6 +13,9 @@ const MAX_CONTROL_INPUT: usize = 1502;
 pub const MAX_PACKET: usize = 12 + 16 + MAX_CONTROL;
 pub const QUEUE_DEPTH: usize = 32;
 const RECEIVE_BUDGET: usize = 16;
+
+#[path = "runtime_ap.rs"]
+mod ap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -50,6 +54,8 @@ struct Pending {
 pub struct Runtime<T: PacketTransport> {
     transport: Option<T>,
     stopped: bool,
+    ap_live: Arc<AtomicBool>,
+    ap: Option<alloc::boxed::Box<ap::Owner>>,
     tx_sequence: u8,
     tx_max: u8,
     flow_control: u8,
@@ -66,6 +72,7 @@ pub struct Runtime<T: PacketTransport> {
 }
 impl<T: PacketTransport> Drop for Runtime<T> {
     fn drop(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
         if !self.stopped {
             // A dropped operation/runtime is no native device-stop receipt.
             // Keep the original host/card/register owner pinned on uncertainty.
@@ -92,6 +99,8 @@ impl<T: PacketTransport> Runtime<T> {
         Self {
             transport: Some(transport),
             stopped: false,
+            ap_live: Arc::new(AtomicBool::new(true)),
+            ap: None,
             tx_sequence: 0,
             tx_max: 0,
             flow_control: 0,
@@ -123,13 +132,20 @@ impl<T: PacketTransport> Runtime<T> {
     }
 
     pub fn fail(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
         self.failed = true;
+    }
+    pub(crate) fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        if self.failed || self.stopped {
+            return None;
+        }
+        Some(self.transport.as_ref()?.ap_source()?.retain(&self.ap_live))
     }
 
     /// Close ordinary work first and retain the original transport through
     /// the full actual native receipt chain, even after a protocol failure.
     pub(crate) fn stop_transport(&mut self) -> Result<(), Error> {
-        self.failed = true;
+        self.fail();
         if self.stopped {
             return Ok(());
         }
@@ -186,7 +202,7 @@ impl<T: PacketTransport> Runtime<T> {
         }
         let result = self.poll_inner();
         if result.is_err() {
-            self.failed = true;
+            self.fail();
         } else {
             // The SDIO IRQ thread re-enables the card interrupt after its
             // function handlers ran; a still-asserted line fires again.
@@ -341,6 +357,17 @@ impl<T: PacketTransport> Runtime<T> {
         payload: &[u8],
         maximum: usize,
     ) -> Result<Vec<u8>, Error> {
+        self.command_scoped(direction, command, payload, maximum, None)
+            .await
+    }
+    async fn command_scoped(
+        &mut self,
+        direction: ioctl::Direction,
+        command: u32,
+        payload: &[u8],
+        maximum: usize,
+        original: Option<&crate::brcmfmac::ap_scope::Capture>,
+    ) -> Result<Vec<u8>, Error> {
         if self.failed {
             return Err(Error::Failed);
         }
@@ -403,13 +430,33 @@ impl<T: PacketTransport> Runtime<T> {
             .encode(),
         );
         loop {
-            match transaction
+            if direction == ioctl::Direction::Set
+                && original.is_some_and(|original| {
+                    transaction
+                        .runtime
+                        .events
+                        .iter()
+                        .any(|event| original.program_event_blocks(&event.header))
+                })
+            {
+                // Do not program past a consumed native denial/replacement.
+                // Benign BSS-UP and same-drain EAPOL stay queued, and actual
+                // GET queries can inspect firmware without new RF/key/port
+                // authority. Session still applies every record afterward.
+                transaction.runtime.pending = None;
+                transaction.finished = true;
+                return Err(Error::Busy);
+            }
+            let transport = transaction
                 .runtime
                 .transport
                 .as_mut()
-                .ok_or(Error::Failed)?
-                .transmit_packet(&request)
-            {
+                .ok_or(Error::Failed)?;
+            let result = match original {
+                Some(original) => transport.transmit_ap_control(&request, original),
+                None => transport.transmit_packet(&request),
+            };
+            match result {
                 Ok(()) => break,
                 Err(super::TransportError::Busy) => {
                     transaction.runtime.poll()?;
@@ -417,6 +464,14 @@ impl<T: PacketTransport> Runtime<T> {
                         return Err(Error::Timeout);
                     }
                     delay().await;
+                }
+                Err(super::TransportError::Denied) if original.is_some() => {
+                    // No COMMAND entered. Clear only this unissued waiter;
+                    // preserve sequence, queued native records and transport.
+                    transaction.runtime.pending = None;
+                    transaction.runtime.response = None;
+                    transaction.finished = true;
+                    return Err(Error::Authority);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -437,6 +492,17 @@ impl<T: PacketTransport> Runtime<T> {
     }
 
     pub fn send_data(&mut self, ethernet: &[u8], priority: u8) -> Result<(), Error> {
+        if self.ap.is_some() {
+            return Err(Error::Authority);
+        }
+        self.send_data_inner(ethernet, priority, None)
+    }
+    fn send_data_inner(
+        &mut self,
+        ethernet: &[u8],
+        priority: u8,
+        original: Option<&crate::brcmfmac::ap_scope::Capture>,
+    ) -> Result<(), Error> {
         if self.failed {
             return Err(Error::Failed);
         }
@@ -473,16 +539,19 @@ impl<T: PacketTransport> Runtime<T> {
         );
         bytes[12..16].copy_from_slice(&[0x20, priority, 0, 0]);
         bytes[16..length].copy_from_slice(ethernet);
-        if let Err(error) = self
-            .transport
-            .as_mut()
-            .ok_or(Error::Failed)?
-            .transmit_packet(&bytes)
-        {
+        let transport = self.transport.as_mut().ok_or(Error::Failed)?;
+        let result = match original {
+            Some(original) => transport.transmit_ap_packet(&bytes, original),
+            None => transport.transmit_packet(&bytes),
+        };
+        if let Err(error) = result {
             if error == super::TransportError::Busy {
                 return Err(Error::Busy);
             }
-            self.failed = true;
+            if error == super::TransportError::Denied {
+                return Err(Error::Authority);
+            }
+            self.fail();
             return Err(error.into());
         }
         self.tx_sequence = self.tx_sequence.wrapping_add(1);
@@ -501,7 +570,7 @@ struct Transaction<'a, T: PacketTransport> {
 impl<T: PacketTransport> Drop for Transaction<'_, T> {
     fn drop(&mut self) {
         if !self.finished {
-            self.runtime.failed = true;
+            self.runtime.fail();
         }
     }
 }

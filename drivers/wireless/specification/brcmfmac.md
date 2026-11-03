@@ -794,8 +794,8 @@ and an actual original PCI/firmware source are available. Mode changes require
 an administratively down, disconnected, operation-free physical owner. A
 nonwrapping mode generation and exclusive native-control reservation bind
 each asynchronous public AP request. No virtual bsscfg, P2P or station-BSSID
-alias is created. The common CYW43439 SDIO implementation keeps the default
-false; this PCIe composition does not qualify CYW43439 AP support.
+alias is created. CYW43439 SDIO now has its own native Card/CM3/SDPCM/BCDC composition
+(`cyw43439.md` §3); this PCIe composition itself grants no SDIO authority.
 
 `ap::Session` implements primary interface0/bsscfg0 legacy20 on admitted
 2.4/5GHz channels. It retains the original signed-domain Arc, native channel
@@ -870,6 +870,16 @@ EAPOL can arrive in the same native drain as its outgoing M1/M3 terminal;
 ordinary DATA serialization does not discard that SME response. Ordinary
 0x88c7 preauthentication retains the full original DATA authorization/key
 actors on TX and RX. The unsupported no-preauth endpoint option is refused.
+
+The common Session additionally holds at most4 EAPOL records per pending
+peer (32 total) under the original native/BSS/peer/copy/source proof and a
+counted lease until actual SCB verification; excess peer-controlled frames
+are dropped rather than failing the session. Its distinct preverification
+purpose cannot transmit or grant DATA/key/port authority. NEW_STATION is
+queued first; release moves the same original proof without recapture.
+Loss/reassociation/source retirement and STOP discard stale holds. The
+existing native RSN case now includes actual same-drain association and
+EAPOL-Start, while retaining every later MIC/AES/key/port assertion.
 
 Host receive claims only consumed native descriptor/event plus retained
 BSS/peer/key/port/copy generations. Firmware owns CCMP/replay/SCB internals;

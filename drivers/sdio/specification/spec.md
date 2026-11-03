@@ -146,6 +146,14 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   scope, late original loss after readiness, attempted-command failure and
   independently scoped complete PIO copies. They grant no AP/RF capability
   and have not yet been executed.
+- A `kernel-test`-only Card endpoint can provide inert F1/F2 register/FIFO
+  bytes behind the existing real SDHCI/CCCR/CIS/PIO model. It supplies no
+  source validator, host constructor, completion, AP or RF authority. F0,
+  R5, function/block bounds, original Controller/Card lifetimes, native
+  commands and PIO copy receipts remain the parent model's responsibility.
+  Its setup-boundary transition hook can inject real modeled firmware
+  loss/source changes before COMMAND; pending status is still observed
+  through actual INT_STATUS. Production Card behavior is unchanged.
 - `native::register_pci_driver` registers class 08:05:00 and 08:05:01.
   `probe` reserves each BDF once, clears inherited BME and memory decode,
   sets INTx disable and verifies all three before sizing/mapping the control
