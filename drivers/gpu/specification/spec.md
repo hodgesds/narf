@@ -102,6 +102,49 @@ exact source family and observed PCH facts described below. Meteor/Arrow Lake
 internal-panel support does not admit the Gen12 external port sequence; the
 separate display-14 external contract follows.
 
+### Intel display-14 panel power: ACTIVE=0, SETCRTC off and FBIOBLANK
+
+On Meteor/Arrow Lake the KMS owner can turn the internal panel's crtc off and
+on, as Linux's `intel_atomic_commit_tail` does for an inactive crtc
+(b90c984d `intel_display.c`, `intel_ddi.c`, `intel_pps.c`):
+
+- An atomic commit with `ALLOW_MODESET` that sets the lit crtc's `ACTIVE` to
+  0, or a `SETCRTC` without a framebuffer, first restores the console (the
+  KMS surfaces, cursor and colour retire through one latched console frame)
+  and takes the event's vblank stamp. It then turns the panel off: PSR and
+  FBC off, the planes off, the backlight off (the DPCD owner's disable and
+  the PPS gate, T9 waited), the transcoder and its function, the sink to D3,
+  the DDI buffer, `TRANS_CLK_SEL`, `intel_pps_off`, the port PLL, the pipe
+  DMC disable (which drops the panel's display wakeref) and, with no other
+  pipe lit, the all-off post-plane settle. Errnos and check order are
+  unchanged; the published crtc state is the same disabled crtc as before.
+  Gen12 keeps the console restore (`Unsupported` backend).
+- A commit that lights the crtc again (`Present` or an observe on a dark
+  panel) first runs the owned modeset at the recorded mode with the console
+  surface (`XeLpgModeset::modeset_fixed` takes the full
+  `mtl_ddi_pre_enable_dp`: VDD for the planning AUX, `intel_pps_on`, the
+  PLL, `TRANS_DDI_FUNC_CTL` configured then enabled, `DDI_CTL_DE` between
+  TPS1 and the training), then relights the backlight after T8. A repeated
+  `ACTIVE=0` on the dark crtc waits for no vblank. A legacy cursor on the
+  dark crtc is accepted and not shown. `DROP_MASTER` and the master's last
+  close relight the panel, as `drm_fb_helper_restore_fbdev_mode_unlocked`
+  commits the console active.
+- Every KMS session first takes `intel_display_rpm_get`
+  (`display_rpm::wakeref_resume`), so a commit resumes a function the dark
+  panel let autosuspend.
+- `FBIOBLANK` on `/dev/fb0` returns `EINVAL` above `FB_BLANK_POWERDOWN`
+  and 0 otherwise, as `do_fb_ioctl` and `drm_fb_helper_blank` do.
+  `FB_BLANK_UNBLANK` lights the Intel console's panel and every other level
+  turns it off (`drm_client_modeset_dpms` commits the crtc active only for
+  `DRM_MODE_DPMS_ON`); with a KMS master nothing changes. The transition
+  runs as a task. Other scanouts keep the no-op.
+- A panel off beside a lit external writes nothing of Pipes B–D or the
+  shared layout: Pipe A's share stays programmed and covered by PM demand.
+  Lighting the panel again beside a lit external requires that share to be
+  proved (`Profile::capture`); otherwise it refuses
+  `DisplayResourceUnavailable` before the PLL, the DDI or the transcoder.
+- No connector `DPMS` property is exposed.
+
 ### Meteor/Arrow Lake external DP SST, Type-C and hotplug
 
 `intel_gpu_xelpg_external` owns at most one external DisplayPort SST route on

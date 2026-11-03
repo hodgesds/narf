@@ -2410,11 +2410,11 @@ a late poll that finds the condition met progresses instead of timing out.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. The MEI GSC proxy client, PXP, GT1 frequency/idle sysfs and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap (read-only private PFN mapping with VM_DONTCOPY/VM_DONTEXPAND semantics in the syscall layer), `metrics/<uuid>/id`, `dev.xe.observation_paranoid` and i915 GETPARAM 57 implemented; OAR/OAC exec-queue streams, OA syncs, media-GT OAM, steered manual capture, coredump process/time facts and remaining i915 perf interfaces (PERF_OPEN, ADD/REMOVE_CONFIG, query item 3, PERF_REVISION) remain |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); display-14 6 bpc pipes landed (EDID bpc and VBT `edp.bpp` limits, 18 bpp before DSC, dithered `PIPE_MISC`, BPC_6 and the 6 bpc MSA on Pipe A and Pipes B-D); ADL-P/N write display 13's `TRANS_VBLANK`; the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); PSR2 with selective fetch on that panel implemented (§20), driven by FB_DAMAGE_CLIPS and DIRTYFB damage and falling back to PSR1 with a typed reason; 6 bpc eDP and DP outputs and `DP_LINK_RATE_SET` training of display-14 eDP rate-table panels implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route and Panel Replay open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); PSR2 with selective fetch on that panel implemented (§20), driven by FB_DAMAGE_CLIPS and DIRTYFB damage and falling back to PSR1 with a typed reason; 6 bpc eDP and DP outputs and `DP_LINK_RATE_SET` training of display-14 eDP rate-table panels implemented with native fixtures (§20); the MTL/Arrow panel's full crtc disable and enable (PPS, DDI, PLL) and Linux's link-training fallback ladder on the panel implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR wins over FBC while enabled (PSR1: Wa_14016291713, no stepping readout; PSR2: selective update refuses FBC); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR wins over FBC while enabled (PSR1: Wa_14016291713, no stepping readout; PSR2: selective update refuses FBC); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); MTL/Arrow panel off/on (atomic `ACTIVE=0`, `SETCRTC` off, `FBIOBLANK`, master release) with PSR and FBC disabled first and the backlight sequenced (§20); color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -2462,7 +2462,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; native fixtures pass |
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
-| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel would park with the DMC retained and re-verified and with 10 s polled hotplug, but no panel-off producer exists. System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
+| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
 The first four workstreams form the initial integration checkpoint. They do
@@ -6520,3 +6520,113 @@ refusal smoke's 6 bpc slot now pins the VBT's 18 bpp leaving DSC no input
 range (`NoBppRange`). The external DSC refusal smoke's two-lane case now
 lights at 6 bpc. Existing DSB smokes pass the flag that keeps their
 previous proof.
+
+### Display-14 panel off and on, and the eDP link-training fallback — native fixtures added
+
+The sources are Linux b90c984d: `intel_display.c` (`intel_atomic_commit_tail`,
+`intel_pre_plane_update`, `intel_commit_modeset_disables`,
+`intel_crtc_disable_planes`, `hsw_crtc_disable`), `intel_ddi.c`
+(`intel_ddi_disable_dp`, `intel_ddi_post_disable_hdmi_or_sst`,
+`intel_ddi_post_disable_dp`, `intel_ddi_buf_disable`,
+`intel_ddi_disable_transcoder_func`, `intel_ddi_disable_transcoder_clock`,
+`mtl_ddi_pre_enable_dp`, `mtl_ddi_prepare_link_retrain`,
+`intel_ddi_init_dp_buf_reg`), `intel_pps.c` (`intel_pps_off_unlocked`,
+`intel_pps_on_unlocked`), `intel_dp_link_training.c`
+(`intel_dp_get_link_train_fallback_values`,
+`reduce_link_params_in_rate_lane_order`,
+`intel_dp_can_link_train_fallback_for_edp`), `drm_client_modeset.c`
+(`drm_client_modeset_dpms`), `drm_fb_helper.c` (`drm_fb_helper_blank`) and
+`fb_chrdev.c` (`do_fb_ioctl`).
+
+**Panel off.** `XeLpgModeset::disable_planes` and `XeLpgModeset::panel_off`
+are the crtc disable for the owned eDP on DDI A and Pipe A. The KMS owner
+first restores the console and disables PSR and FBC. The planes go off,
+then the DPCD backlight owner disables the backlight and closes the PPS gate,
+and T9 is waited without spinning. Then come the sink's decompression, the
+transcoder, `TRANS_DDI_FUNC_CTL2` and the function, the VDSC engines, the PPS
+SDP, `DP_SET_POWER` D3, `DDI_CTL_DE` with the PHY idle, D2D and `DP_TP_CTL`,
+`TRANS_CLK_SEL`, VDD on and the single `PP_CONTROL` write of
+`intel_pps_off`, the port PLL (`intel_cx0pll_disable`) and the Thunderbolt
+IO deselect. Last comes the pipe DMC disable, which drops the panel's display
+wakeref. With no other pipe lit, the post-plane all-off settle lowers WM/DDB,
+DBUF, CDCLK and PM demand. A record keeps the mode and the
+`DDI_BUF_CTL` reversal bit for the panel-on.
+
+**Panel on.** The owned modeset takes the full `mtl_ddi_pre_enable_dp` when
+the record names its port and the hardware is off: VDD for the planning AUX
+reads, `intel_pps_on` after the pipe DMC enable and before the PLL,
+`TRANS_DDI_FUNC_CTL` configured without ENABLE, `DDI_CTL_DE` and the buffer
+active between TPS1 and the training, and the function enabled just before
+the transcoder. The existing sequence otherwise runs unchanged. The
+production path is the system-resume relight: the DPCD owner powers the
+panel with its gate closed, the modeset lights the console surface, and the
+owner relights the backlight after T8.
+
+**Producers.** An atomic `ACTIVE=0` or `SETCRTC` off from the master turns
+the panel off after the console restore and the event's vblank. Lighting the
+crtc again (a presented frame, or an observe on a dark panel) runs the
+panel-on first. `DROP_MASTER` and the last close relight it, as the fbdev
+restore commits the console active. `FBIOBLANK` maps the blank levels as
+`drm_fb_helper_blank` does: `EINVAL` above 4, UNBLANK lights the panel and
+every other level turns it off; with a KMS master nothing changes, and the
+ioctl returns 0. The KMS session takes `intel_display_rpm_get` first, so a
+commit resumes an autosuspended function. With the panel dark, the park
+admission sees nothing lit and the function autosuspends after its delay. A
+runtime resume brings the GT back, and the panel stays off until a producer
+lights it.
+
+**Beside a lit external.** Nothing of Pipes B–D, their transcoders, ports or
+the shared layout is written. Pipe A's DDB/WM share stays programmed, and PM
+demand and CDCLK keep covering it. Linux would repartition the external into
+it. The Pipe B–D owner now reads Pipe A's lit bit from the hardware before
+each transition, so a dark panel is a reserved, unlit pipe in its layout.
+Lighting the panel again beside a lit external needs Pipe A's share proved
+(`Profile::capture`). Otherwise it refuses `DisplayResourceUnavailable`
+before the PLL, the DDI or the transcoder, and drops VDD.
+
+**Fallback ladder.** `LinkLimits::fallback` is
+`intel_dp_get_link_train_fallback_values`. eDP first takes
+`use_max_params`. Then the rate steps down the common rates at the same
+lanes. At the lowest rate the lanes halve and the rate returns to the
+maximum. An eDP panel whose fixed mode at 18 bpp no longer fits the reduced
+link keeps its parameters for one more attempt. The panel's planned link
+(6 bpc or rate-table panels) walks it, each step recomputing the link
+(`decide_edp_capped`) and moving the PLL, lanes, port width and function. A
+step that would change the pipe bpp or need DSC refuses
+`Dsc(TrainingFallback)`; an exhausted ladder refuses
+`ModesetError::LinkTrainingExhausted`. Behaviour change: a panel that failed
+its maximum-parameter retry used to fail the modeset, and now steps down.
+
+Remaining: the external DP route still uses the shared training's internal
+ladder and one modeset retry, not this one, and its PM demand and M/N are
+not recomputed per step. Lighting the panel beside a lit external whose
+layout lacks Pipe A's share (an external activated while the panel was dark)
+is refused; adding Pipe A to a live layout is not implemented. The KMS
+surfaces retire through one console frame before the off. A cursor on the
+dark crtc is accepted and not retained. No connector `DPMS` property is
+exposed. Gen12 has no panel-off producer: its conversations need wakerefs
+and its PWM backlight a park. The 8 bpc legacy eDP sequence keeps its
+existing order (D2D and levels before TPS1). Gen12 eDP `DP_LINK_RATE_SET`
+training is not added. None of this is physical Intel evidence.
+
+Native fixtures, new and unexecuted in this slice:
+
+- `drivers/gpu/intel_gpu_modeset_xelpg`:
+  `smoke_mtl_panel_off_follows_hsw_crtc_disable_order`,
+  `smoke_mtl_panel_on_after_off_runs_full_enable_and_restores_image`,
+  `smoke_mtl_panel_off_beside_lit_pipe_b_writes_only_the_panel` and
+  `smoke_link_fallback_ladder_follows_rate_lane_order`.
+- `drivers/gpu/intel_gpu_power`:
+  `smoke_display_rpm_panel_off_parks_and_resume_keeps_the_panel_dark`.
+- `drivers/gpu/intel_gpu_kms`:
+  `intel_kms_active_off_turns_the_panel_off_and_master_release_relights`
+  and `intel_kms_present_on_a_dark_panel_lights_it_first`.
+- `drivers/gpu/intel_gpu_psr`:
+  `smoke_kms_mtl_panel_off_disables_psr_first_and_refuses_unlatched_flip`
+  and `smoke_kms_mtl_console_dpms_follows_master_and_toggles_the_panel`.
+- `fb`: `smoke_fbdev_blank_levels_map_as_drm_fb_helper_blank`.
+
+Changed fixture: `smoke_mtl_edp_planned_link_retries_at_max_params` asserted
+that a failure at the maximum parameters failed the modeset. It now asserts
+that the ladder reaches HBR x4, and that a sink failing every link walks
+rate, then lanes, to `LinkTrainingExhausted`.
