@@ -304,7 +304,7 @@ has an off switch for bring-up:
 | Native HDMI/DP display (retires the GOP) | on | `amdgpu.native_display=0` |
 | Native client submission (radeonsi/RADV, VCN/JPEG) | on | `amdgpu.rdna2_accel=0` |
 | DCN3.0 hardware cursor | on | `amdgpu.rdna2_hw_cursor=0` |
-| Power saving (GFXOFF, CG, hub PG, memory/fabric DPM, deep sleep, PMFW watermarks) | all requested | `amdgpu.rdna2_pg=none`, or a list such as `amdgpu.rdna2_pg=gfxoff,cg` |
+| Power saving (GFXOFF, CG, hub PG, memory/fabric DPM, deep sleep, PMFW watermarks) | all but GFXOFF requested (opt in with `gfxoff` in the list) | `amdgpu.rdna2_pg=none`, or a list such as `amdgpu.rdna2_pg=gfxoff,cg` |
 | Automatic GPU recovery after a hang (mode1, at most 3 per boot) | on | `amdgpu.gpu_recovery=0` |
 | Multi-display (secondary CRTCs) | off | `amdgpu.rdna2_multi` |
 

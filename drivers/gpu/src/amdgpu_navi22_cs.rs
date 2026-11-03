@@ -398,7 +398,12 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let seq = loop {
                 let observed = crate::amdgpu_fence_navi22::change_sequence();
                 let throttle = {
-                    let (gc, mut owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
+                    // amdgpu_ib_schedule takes no GFXOFF reference: a
+                    // submission writes only the ring (system memory) and
+                    // the doorbell, which wakes GC from GFXOFF itself. A
+                    // lease here sent DisallowGfxOff/AllowGfxOff around every
+                    // job, the AllowGfxOff landing while the job ran.
+                    let mut owner = crate::amdgpu_navi22_platform::owner().await;
                     let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
                     if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
                         health.mark_canceled();
@@ -422,7 +427,6 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         // amdgpu_vmid_grab_idle: every client VMID still has
                         // an unfinished job; wait without the owner.
                         drop(owner);
-                        drop(gc);
                         if narf_time::monotonic_ns() >= deadline {
                             return Err(FsError::Busy);
                         }

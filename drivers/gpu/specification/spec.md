@@ -1919,7 +1919,8 @@ dmub_tables, atom_pixclk, connector}`. Switches
 corresponding `amdgpu.navi22_*` spellings remain aliases; the canonical name
 wins. Defaults: native display, accel and hardware cursor on; multi-display
 off (secondary CRTCs cannot present or deliver vblank yet). `power_saving` is
-the `amdgpu.rdna2_pg=` list, or `DEFAULT_POWER_SAVING` (every feature) when
+the `amdgpu.rdna2_pg=` list, or `DEFAULT_POWER_SAVING` (every feature except
+`gfxoff`, which Linux enables only at SMU init alongside its GFX siblings) when
 absent; `=none|off|0` or an empty value applies nothing. The first canonical
 power value takes precedence over the first legacy value, including an empty
 or invalid canonical value; invalid power lists enable nothing. Defaulted
