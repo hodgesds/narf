@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.51** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.52** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -38,8 +38,8 @@
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
 > VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
-> queries and the media-GuC HuC, shared-GGTT GuC TLB invalidation on
-> both GTs, display-14 PSR on hardware inputs, and MTL external outputs
+> queries and the media-GuC HuC, GT0's L3 bank topology entry,
+> shared-GGTT GuC TLB invalidation on both GTs, display-14 PSR on hardware inputs, and MTL external outputs
 > on Pipes B–D beside the lit panel pass release native model gates —
 > see §20).
 >
@@ -4893,5 +4893,30 @@ branch and the platform mapping
 sampling (`smoke_gt_topology_samples_l3_fuses_after_eu_fuses`), and exact
 query bytes on TGL, ADL-P/S/N, DG2, MTL, BMG, LNL and PTL with fused-off banks
 and the PTL omission (`smoke_xe_gt_topology_query_reports_gt0_l3_bank_entry`).
-They were registered but not run in this checkpoint, and none is physical
-Intel or Mesa evidence.
+None is physical Intel or Mesa evidence.
+
+Integration: all eight release groups pass 2,132 tests with no failures and no
+Intel skips; the only skip is the existing shared RNG-registration skip. Group
+4 already selected `drivers/gpu/intel_gpu_topology`. One more fixture pinned
+GT0's topology without L3. `smoke_xe_queries_abi_identity_and_clock_facts`
+expected BMG's 34-byte reply with the EU entry at offset 24. It now expects
+the corrected 50 bytes: L3 bank (type 3, 8 bytes) at 24, and EU per DSS at
+40. Its model's MIRROR_FUSE3 enables no XE2 node, so it also pins the empty
+mask that is still reported.
+
+Review against Linux b90c984d agreed on the following:
+- Every `load_l3_bank_mask` branch matches:
+  - the final branch `~MIRROR_FUSE3` 7:0;
+  - DG2 0xff per `MEML3_EN_MASK` (3:0) node;
+  - 12.70 `GT_L3_EXC_MASK` (`XEHP_FUSE4` 6:4) pairs, four bits per node;
+  - Xe2 `XE2_GT_L3_MODE_MASK` (7:4) per `XE2_NODE_ENABLE_MASK` (31:16) node;
+  - Xe3 all 32 `XE3_L3BANK_ENABLE` bits per node.
+- They expand as `gen_l3_mask_from_pattern` does into the 64-bit
+  `xe_l3_bank_mask_t`.
+- `query_gt_topology` order is geometry, compute, L3, then EU, GT0 before GT1.
+- A PTL node above 1 omits only the L3 entry. Linux has an `xe_assert` there
+  and an undefined shift.
+- The i915 topology queries are unchanged.
+
+The `guc_role` dead-code allowance survives the merge. The debug group pass
+is deferred to the end of the current integration wave.

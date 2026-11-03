@@ -2220,6 +2220,28 @@ relied on a freed range being reused at once. The debug group pass is deferred
 to the end of this integration wave. None of this has run on physical Intel
 hardware.
 
+### GT0 L3 bank topology entry — release gates recorded
+
+The native Xe GT_TOPOLOGY query now includes GT0's L3 bank entry, as Linux
+always does for a primary GT, and Mesa reads it for its L3 bank count. The
+mask follows each platform branch of Linux's `load_l3_bank_mask`:
+- TGL and ADL: inverted MIRROR_FUSE3 bits.
+- DG2: eight banks per node.
+- MTL and Arrow: the pair rule.
+- BMG and LNL: the mode nibble per node.
+- PTL: 32 bank bits per node.
+
+The entry sits between the compute and EU entries. On PTL it is omitted only
+for a node above 1, where Linux's result is undefined. This is an intentional
+ABI correction: GT0's topology reply grows by 16 bytes. The media GT now
+shares the MTL computation, and the i915 topology queries are unchanged.
+Integration updated one more fixture that pinned BMG's topology without L3.
+
+All eight release groups pass 2,132 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
