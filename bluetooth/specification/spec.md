@@ -215,10 +215,22 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   ACL flow control, raw-socket event fan-out, per-connection L2CAP
   dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery
   services, SMP → Just-Works responder, LE + BR/EDR signalling
-  answers). Production `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
+  answers, dynamic CIDs → open channel servers). Production
+  `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
   reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
-  signalling-command codec + iterator, dynamic CID allocator.
+  signalling-command codec + iterator, dynamic CID allocator, LE
+  credit-based connection request/response + flow-control builders
+  with §4.23 result codes.
+- **L2CAP channel servers** (`l2cap_server`): PSM → server registry
+  (SDP + RFCOMM pre-registered on BR/EDR, LE services register
+  explicitly), per-connection LE credit-based channels (credit
+  accounting with top-up grants, K-frame → SDU reassembly with the
+  2-byte length prefix, oversize/over-MPS/overrun → channel drop)
+  and BR/EDR channels (SDP / RFCOMM session / generic staging).
+  Staged payloads drain via `pump::drain_channel_rx` /
+  `pump::drain_rfcomm_rx`; socket/devfs consumer wiring is
+  follow-up work, not part of this surface.
 - **ATT** (`att`): full opcode constant set + error-code constants
   + PDU codec + builders/decoders for Exchange MTU, Read, Write,
   Handle Value Notification/Indication/Confirmation, Error Response.
@@ -266,6 +278,13 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   (ServiceClassIDList, ProtocolDescriptorList, ServiceName, etc.),
   Service Search Request + Service Attribute Request builders.
   PSM 0x0001 surfaced as a constant.
+- **SDP server** (`sdp_server`): request handler against a one-record
+  database (Serial Port Profile record on RFCOMM server channel 1):
+  Service Search / Service Attribute / Service Search Attribute
+  with UUID normalisation through the Bluetooth Base UUID, browse-root
+  matching, attribute ranges, and fail-closed errors (unknown handle,
+  bad syntax, non-empty continuation, oversize attribute list).
+  Never issues continuation state.
 - **HFP** (`hfp`): clean-room AT command codec for HFP 1.8. AT line
   tokenizer (basic / write `=` / read `?` / test `=?` forms), HF
   command builders (BRSF, CIND test/read, CMER, CHLD test, CLCC,
@@ -287,6 +306,12 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   control only for UIH), and a single-DLC initiator state machine
   (Closed → Connecting → Open → Disconnecting). Server-channel ↔ DLCI
   mapping kept as plain const values.
+- **RFCOMM responder session** (`rfcomm_session`): one L2CAP
+  channel's multiplexer — mux SABM/DISC, per-DLCI open/data/close
+  with mirrored DLCIs (no server-channel → DLCI mapping computed),
+  C/R flipped on responses, UIH staging per DLC, DM for data on
+  closed DLCs. Multiplexer-control UIH commands (MSC/PN/RPN/RLS/NSC)
+  are unanswered (peer proceeds with defaults).
 - **HOGP** (`hogp`): HID-over-GATT profile builder. Composes the
   mandatory HID Service layout (HID Information, Report Map, HID
   Control Point + N Reports each with a Report Reference descriptor
@@ -305,11 +330,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Qualcomm loaders live in `narf-drivers-usb::btusb`) and Bluetooth
   policy daemons.
 - Bonding / LTK storage, SMP key distribution, pairing initiation from
-  the kernel (needs an application policy trigger), LE credit-based
-  channel servers, and SDP / RFCOMM channel servers — the pump refuses
-  or negative-replies these explicitly rather than leaving peers to
-  time out.
-- SCO/eSCO isochronous USB transport.
+  the kernel (needs an application policy trigger), and SCO/eSCO
+  isochronous USB transport. Staged channel payloads have no
+  socket/devfs consumer yet (drain APIs exist; wiring is follow-up).
 
 ## Cap surface
 

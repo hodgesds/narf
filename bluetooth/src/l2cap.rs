@@ -665,7 +665,44 @@ pub fn build_le_credit_based_connection_request(
     }
 }
 
-/// Build an LE Flow Control Credit signalling command (§4.24). Data:
+/// LE Credit-Based Connection Response result codes (§4.23).
+/// Only the codes the pump emits are named here.
+pub const LE_COC_RESULT_SUCCESS: u16 = 0x0000;
+pub const LE_COC_RESULT_PSM_NOT_SUPPORTED: u16 = 0x0002;
+pub const LE_COC_RESULT_NO_RESOURCES: u16 = 0x0004;
+/// 0x0009–0x000B are the remaining §4.23 result codes, named for
+/// completeness (invalid source CID, source CID already allocated,
+/// unacceptable parameters). The pump emits 0x0009/0x000A/0x000B for
+/// malformed or duplicate open requests; see `l2cap_server`.
+pub const LE_COC_RESULT_INVALID_SOURCE_CID: u16 = 0x0009;
+pub const LE_COC_RESULT_SOURCE_CID_ALREADY_ALLOCATED: u16 = 0x000A;
+pub const LE_COC_RESULT_UNACCEPTABLE_PARAMETERS: u16 = 0x000B;
+
+/// Build an LE Credit-Based Connection Response (§4.23). Data:
+/// Dest_CID (2 LE) + Source_CID (2 LE) + Result (2 LE) + MTU (2 LE)
+/// + MPS (2 LE) + Initial_Credits (2 LE) = 12 bytes.
+pub fn build_le_credit_based_connection_response(
+    identifier: u8,
+    dest_cid: u16,
+    source_cid: u16,
+    result: u16,
+    mtu: u16,
+    mps: u16,
+    initial_credits: u16,
+) -> SignallingCommand {
+    let mut data = Vec::with_capacity(12);
+    data.extend_from_slice(&dest_cid.to_le_bytes());
+    data.extend_from_slice(&source_cid.to_le_bytes());
+    data.extend_from_slice(&result.to_le_bytes());
+    data.extend_from_slice(&mtu.to_le_bytes());
+    data.extend_from_slice(&mps.to_le_bytes());
+    data.extend_from_slice(&initial_credits.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::LeCreditBasedConnectionResponse as u8,
+        identifier,
+        data,
+    }
+}
 /// CID (2 LE) + Credits (2 LE).
 pub fn build_le_flow_control_credit(identifier: u8, cid: u16, credits: u16) -> SignallingCommand {
     let mut data = Vec::with_capacity(4);

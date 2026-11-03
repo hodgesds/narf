@@ -41,14 +41,17 @@
 //!   GATT / Device Information / Battery services mounted);
 //!   SMP → a per-connection `smp::Responder` driven by the production
 //!   [`NarfSmpCrypto`]; LE signalling → Connection Parameter Update
-//!   accepted, LE credit-based connections refused (no COC servers
-//!   yet); BR/EDR signalling → Echo answered, Information answered,
-//!   Connection Requests refused (no BR/EDR profile servers wired
-//!   yet), Configure / Disconnection answered so peers do not wedge.
-//!   Dynamic CIDs are dropped and counted — SDP / RFCOMM channel
-//!   servers are follow-up work, as is initiating pairing
-//!   (`smp::Initiator` needs an application policy trigger that does
-//!   not exist yet).
+//!   accepted, LE credit-based connections answered from the
+//!   `l2cap_server::ServerRegistry` (open/credit/disconnect flow,
+//!   SDU reassembly, staged receive queues); BR/EDR signalling →
+//!   Echo answered, Information answered, Connection Requests
+//!   answered from the registry (SDP on PSM 0x0001, RFCOMM on PSM
+//!   0x0003, refused otherwise), Configure / Disconnection answered
+//!   so peers do not wedge. Dynamic CIDs route to their channel's
+//!   service (SDP server, RFCOMM session, or staged generic queue);
+//!   frames on unknown dynamic CIDs are dropped and counted, as is
+//!   initiating pairing (`smp::Initiator` needs an application policy
+//!   trigger that does not exist yet).
 //!
 //! ## Lifecycle
 //!
@@ -80,9 +83,15 @@ use crate::event::{
 use crate::gatt_server::GattServer;
 use crate::hci::{AclData, Command, Event};
 use crate::l2cap::{
-    self, BFrame, CidClass, SignallingCode, CID_ATT, CID_LE_SIGNALLING, CID_SIGNALLING, CID_SMP,
+    self, BFrame, CidAllocator, CidClass, SignallingCode, CID_ATT, CID_LE_SIGNALLING,
+    CID_SIGNALLING, CID_SMP,
+};
+use crate::l2cap_server::{
+    BrEdrChannel, Channel, ChannelService, LeCocChannel, LeReceiveOutcome, ServerKind,
+    ServerRegistry, LE_COC_INITIAL_CREDITS, LE_COC_MPS, LE_COC_MTU,
 };
 use crate::opcode as op;
+use crate::sdp_server::SdpServer;
 use crate::services;
 use crate::smp::{self, PairingError, Responder};
 use crate::transport::{HciTransport, TransportError};
@@ -269,6 +278,7 @@ pub struct PumpStats {
     pub commands_sent: u64,
     pub frames_dropped_unknown_handle: u64,
     pub frames_dropped_unrouted_cid: u64,
+    pub frames_dropped_no_credit: u64,
     pub socket_events_dropped: u64,
     pub transport_errors: u64,
 }
@@ -302,6 +312,10 @@ struct Connection {
     /// LTK from a completed pairing (in-memory only; no bond store).
     ltk: Option<[u8; 16]>,
     encrypted: bool,
+    /// Dynamic-CID allocator for this connection's channels.
+    cid_alloc: CidAllocator,
+    /// Open L2CAP channel servers (LE COC + BR/EDR), in open order.
+    channels: Vec<Channel>,
 }
 
 impl Connection {
@@ -314,7 +328,16 @@ impl Connection {
             smp: None,
             ltk: None,
             encrypted: false,
+            cid_alloc: CidAllocator::new(),
+            channels: Vec::new(),
         }
+    }
+
+    /// Position of the open channel with `local_cid`, if any.
+    fn channel_pos(&self, local_cid: u16) -> Option<usize> {
+        self.channels
+            .iter()
+            .position(|c| c.local_cid() == local_cid)
     }
 }
 
@@ -331,6 +354,11 @@ pub struct PumpCore {
     info: ControllerInfo,
     connections: Vec<Connection>,
     gatt: GattServer,
+    /// PSM → channel-server registry (SDP + RFCOMM pre-registered
+    /// on BR/EDR; LE services register explicitly).
+    servers: ServerRegistry,
+    /// SDP record database, shared by all connections.
+    sdp: SdpServer,
     /// Encoded outbound ACL packets awaiting flow-control credits.
     pending_acl: VecDeque<Vec<u8>>,
     /// Controller-wide ACL packets currently with the controller.
@@ -371,6 +399,8 @@ impl PumpCore {
             info,
             connections: Vec::new(),
             gatt,
+            servers: ServerRegistry::new(),
+            sdp: SdpServer::new(),
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
             stats: PumpStats::default(),
@@ -387,6 +417,44 @@ impl PumpCore {
 
     pub fn stats(&self) -> PumpStats {
         self.stats
+    }
+
+    /// Register an LE PSM served by the generic staging server
+    /// (SDUs staged for [`drain_channel_rx`]). The registry is the
+    /// extension point future LE profiles register against.
+    pub fn register_le_psm(&mut self, le_psm: u16) {
+        self.servers.register_le(le_psm, ServerKind::Generic);
+    }
+
+    /// Drain staged SDUs/payloads for an LE COC or generic BR/EDR
+    /// channel. Returns None when no such connection/channel
+    /// exists; an SDP channel drains as an empty vec (its traffic
+    /// is synchronous request/response, never staged), as does an
+    /// RFCOMM channel (use [`drain_rfcomm_rx`] for its DLCs).
+    pub fn drain_channel_rx(&mut self, handle: u16, cid: u16) -> Option<Vec<Vec<u8>>> {
+        let conn = self.connection_mut(handle)?;
+        let pos = conn.channel_pos(cid)?;
+        match &mut conn.channels[pos] {
+            Channel::Le(ch) => Some(ch.take_rx()),
+            Channel::BrEdr(ch) => match &mut ch.service {
+                ChannelService::Generic { rx } => Some(core::mem::take(rx)),
+                ChannelService::Sdp | ChannelService::Rfcomm(_) => Some(Vec::new()),
+            },
+        }
+    }
+
+    /// Drain staged UIH payloads for one RFCOMM DLCI on a channel.
+    /// Returns None when no such connection/channel exists.
+    pub fn drain_rfcomm_rx(&mut self, handle: u16, cid: u16, dlci: u8) -> Option<Vec<Vec<u8>>> {
+        let conn = self.connection_mut(handle)?;
+        let pos = conn.channel_pos(cid)?;
+        match &mut conn.channels[pos] {
+            Channel::BrEdr(ch) => match &mut ch.service {
+                ChannelService::Rfcomm(session) => Some(session.drain_rx(dlci)),
+                _ => Some(Vec::new()),
+            },
+            _ => Some(Vec::new()),
+        }
     }
 
     fn acl_mtu(&self) -> u16 {
@@ -588,7 +656,7 @@ impl PumpCore {
             CidClass::LeSignalling => {
                 let mut out = Vec::new();
                 for cmd in l2cap::iter_signalling(&frame.payload) {
-                    self.answer_le_signalling(&cmd, &mut out);
+                    self.answer_le_signalling(conn_idx, &cmd, &mut out);
                 }
                 if !out.is_empty() {
                     self.queue_frame(handle, le, &BFrame::new(CID_LE_SIGNALLING, out));
@@ -597,16 +665,123 @@ impl PumpCore {
             CidClass::BrEdrSignalling => {
                 let mut out = Vec::new();
                 for cmd in l2cap::iter_signalling(&frame.payload) {
-                    self.answer_bredr_signalling(&cmd, &mut out);
+                    self.answer_bredr_signalling(conn_idx, &cmd, &mut out);
                 }
                 if !out.is_empty() {
                     self.queue_frame(handle, le, &BFrame::new(CID_SIGNALLING, out));
                 }
             }
+            CidClass::Dynamic => {
+                self.route_dynamic(conn_idx, frame);
+            }
             _ => {
                 self.stats.frames_dropped_unrouted_cid += 1;
             }
         }
+    }
+
+    /// Route one reassembled frame on a dynamic CID to its channel's
+    /// service. Responses are collected first, then queued, so no
+    /// borrow of the connection outlives the service call.
+    fn route_dynamic(&mut self, conn_idx: usize, frame: &BFrame) {
+        let handle = self.connections[conn_idx].handle;
+        let le = self.connections[conn_idx].le;
+        let Some(pos) = self.connections[conn_idx].channel_pos(frame.cid) else {
+            self.stats.frames_dropped_unrouted_cid += 1;
+            return;
+        };
+        // SDP's record database lives on the pump, not the
+        // connection: answer it without holding the connection
+        // borrow, then return.
+        let is_sdp = matches!(
+            &self.connections[conn_idx].channels[pos],
+            Channel::BrEdr(ch) if matches!(ch.service, ChannelService::Sdp)
+        );
+        if is_sdp {
+            let rsp = self.sdp.handle(&frame.payload);
+            self.queue_frame(handle, le, &BFrame::new(frame.cid, rsp));
+            return;
+        }
+        let mut responses: Vec<crate::rfcomm::Frame> = Vec::new();
+        let mut top_up = 0u16;
+        let mut no_credit = false;
+        let mut drop_channel = false;
+        {
+            let conn = &mut self.connections[conn_idx];
+            match &mut conn.channels[pos] {
+                Channel::Le(ch) => {
+                    match ch.receive(&frame.payload) {
+                        LeReceiveOutcome::Consumed | LeReceiveOutcome::ConsumedSdu => {}
+                        LeReceiveOutcome::DroppedNoCredit => no_credit = true,
+                        LeReceiveOutcome::Violation => drop_channel = true,
+                    }
+                    top_up = ch.take_top_up();
+                }
+                Channel::BrEdr(ch) => match &mut ch.service {
+                    ChannelService::Rfcomm(session) => {
+                        let mut buf = &frame.payload[..];
+                        while !buf.is_empty() {
+                            match crate::rfcomm::Frame::decode(buf) {
+                                Ok((decoded, n)) => {
+                                    responses.extend(session.feed(&decoded));
+                                    buf = &buf[n..];
+                                }
+                                // Corrupt tail: drop the rest of
+                                // this B-frame's payload.
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    ChannelService::Generic { rx } => rx.push(frame.payload.clone()),
+                    ChannelService::Sdp => {} // handled above
+                },
+            }
+        }
+        if no_credit {
+            self.stats.frames_dropped_no_credit += 1;
+        }
+        if top_up > 0 && !drop_channel {
+            // Flow Control Credit: identifier 0 (no response is
+            // defined for this command); CID is our local CID, the
+            // channel the peer may now send to. Suppressed when the
+            // channel is being dropped below.
+            let cmd = l2cap::build_le_flow_control_credit(0, frame.cid, top_up);
+            let mut payload = Vec::new();
+            cmd.encode(&mut payload);
+            self.queue_frame(handle, le, &BFrame::new(CID_LE_SIGNALLING, payload));
+        }
+        if drop_channel {
+            let (local_cid, peer_cid) = {
+                let ch = &self.connections[conn_idx].channels[pos];
+                (ch.local_cid(), ch.peer_cid())
+            };
+            self.connections[conn_idx].channels.remove(pos);
+            // Disconnection Request: Dest = the peer's CID for the
+            // channel, Source = our local CID.
+            let cmd = l2cap::build_disconnection_request(0, peer_cid, local_cid);
+            let mut payload = Vec::new();
+            cmd.encode(&mut payload);
+            self.queue_frame(handle, le, &BFrame::new(CID_LE_SIGNALLING, payload));
+        }
+        for rsp in responses {
+            self.queue_frame(handle, le, &BFrame::new(frame.cid, rsp.encode()));
+        }
+    }
+
+    /// Parse a (Dest_CID, Source_CID) pair from signalling data;
+    /// short data yields zeros (callers treat CID 0 as no match).
+    fn parse_cid_pair(data: &[u8]) -> (u16, u16) {
+        let a = if data.len() >= 2 {
+            u16::from_le_bytes([data[0], data[1]])
+        } else {
+            0
+        };
+        let b = if data.len() >= 4 {
+            u16::from_le_bytes([data[2], data[3]])
+        } else {
+            0
+        };
+        (a, b)
     }
 
     fn route_smp(&mut self, conn_idx: usize, pdu: &smp::Pdu) {
@@ -649,10 +824,16 @@ impl PumpCore {
         }
     }
 
-    /// LE signalling answers (Vol 3 Part A §4). Only Connection
-    /// Parameter Update is accepted; LE credit-based channels are
-    /// refused until a COC server registers.
-    fn answer_le_signalling(&self, cmd: &l2cap::SignallingCommand, out: &mut Vec<u8>) {
+    /// LE signalling answers (Vol 3 Part A §4). Connection
+    /// Parameter Update is accepted; LE credit-based opens are
+    /// answered from the server registry; Flow Control Credits add
+    /// to our send budget; disconnections free the channel.
+    fn answer_le_signalling(
+        &mut self,
+        conn_idx: usize,
+        cmd: &l2cap::SignallingCommand,
+        out: &mut Vec<u8>,
+    ) {
         match SignallingCode::from_u8(cmd.code) {
             Some(SignallingCode::ConnectionParameterUpdateRequest) => {
                 // §4.20 response: Result(2 LE). 0x0000 = accepted.
@@ -664,27 +845,43 @@ impl PumpCore {
                 .encode(out);
             }
             Some(SignallingCode::LeCreditBasedConnectionRequest) => {
-                // §4.22 response: Dest_CID(2) Source_CID(2) Result(2)
-                // MTU(2) MPS(2) Initial_Credits(2). Result 0x0002 =
-                // LE_PSM not supported (no COC server registered).
-                let source_cid = if cmd.data.len() >= 4 {
-                    u16::from_le_bytes([cmd.data[2], cmd.data[3]])
-                } else {
-                    0
-                };
-                let mut data = Vec::with_capacity(10);
-                data.extend_from_slice(&0u16.to_le_bytes());
-                data.extend_from_slice(&source_cid.to_le_bytes());
-                data.extend_from_slice(&0x0002u16.to_le_bytes());
-                data.extend_from_slice(&0u16.to_le_bytes());
-                data.extend_from_slice(&0u16.to_le_bytes());
-                data.extend_from_slice(&0u16.to_le_bytes());
+                self.answer_le_coc_request(conn_idx, cmd, out);
+            }
+            Some(SignallingCode::FlowControlCredit) => {
+                if cmd.data.len() >= 4 {
+                    let cid = u16::from_le_bytes([cmd.data[0], cmd.data[1]]);
+                    let credits = u16::from_le_bytes([cmd.data[2], cmd.data[3]]);
+                    // CID is the sender's local CID (see the
+                    // l2cap_server credit convention): the peer's
+                    // local CID, i.e. the CID we send data on.
+                    let conn = &mut self.connections[conn_idx];
+                    for ch in conn.channels.iter_mut() {
+                        if let Channel::Le(lech) = ch {
+                            if lech.peer_cid == cid {
+                                lech.grant_credits(credits);
+                            }
+                        }
+                    }
+                }
+                // No response is defined for Flow Control Credit.
+            }
+            Some(SignallingCode::DisconnectionRequest) => {
+                let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                self.connections[conn_idx]
+                    .channels
+                    .retain(|c| c.local_cid() != dest);
                 l2cap::SignallingCommand {
-                    code: SignallingCode::LeCreditBasedConnectionResponse as u8,
+                    code: SignallingCode::DisconnectionResponse as u8,
                     identifier: cmd.identifier,
-                    data,
+                    data: cmd.data.clone(),
                 }
                 .encode(out);
+            }
+            Some(SignallingCode::DisconnectionResponse) => {
+                let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                self.connections[conn_idx]
+                    .channels
+                    .retain(|c| c.local_cid() != dest);
             }
             _ => {
                 // §4.1 Command Reject, reason 0x0000 (not understood).
@@ -698,12 +895,100 @@ impl PumpCore {
         }
     }
 
-    /// BR/EDR signalling answers (Vol 3 Part A §4). No BR/EDR profile
-    /// servers (SDP / RFCOMM channels) are wired yet, so Connection
-    /// Requests are refused with PSM-not-supported instead of being
-    /// left to time out; Echo and Information are answered from the
-    /// fixed-channel set this pump actually serves.
-    fn answer_bredr_signalling(&mut self, cmd: &l2cap::SignallingCommand, out: &mut Vec<u8>) {
+    /// Answer one LE Credit-Based Connection Request (§4.22/§4.23).
+    /// Check order: source-CID validity, duplicate source CID,
+    /// parameters, registry, allocation. Every refusal carries the
+    /// §4.23 result code for the first failing check; the refusal
+    /// shape (Dest 0, peer Source, result, zeros) matches the
+    /// pre-server behaviour for unregistered PSMs.
+    fn answer_le_coc_request(
+        &mut self,
+        conn_idx: usize,
+        cmd: &l2cap::SignallingCommand,
+        out: &mut Vec<u8>,
+    ) {
+        let (le_psm, source_cid, mtu, mps, initial_credits) = if cmd.data.len() >= 10 {
+            (
+                u16::from_le_bytes([cmd.data[0], cmd.data[1]]),
+                u16::from_le_bytes([cmd.data[2], cmd.data[3]]),
+                u16::from_le_bytes([cmd.data[4], cmd.data[5]]),
+                u16::from_le_bytes([cmd.data[6], cmd.data[7]]),
+                u16::from_le_bytes([cmd.data[8], cmd.data[9]]),
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        let mut result = l2cap::LE_COC_RESULT_SUCCESS;
+        let mut local_cid = 0u16;
+        if !(l2cap::CID_DYNAMIC_LE_FIRST..=l2cap::CID_DYNAMIC_LE_LAST).contains(&source_cid) {
+            result = l2cap::LE_COC_RESULT_INVALID_SOURCE_CID;
+        } else if self.connections[conn_idx]
+            .channels
+            .iter()
+            .any(|c| c.peer_cid() == source_cid)
+        {
+            result = l2cap::LE_COC_RESULT_SOURCE_CID_ALREADY_ALLOCATED;
+        } else if mtu == 0 || mps == 0 {
+            result = l2cap::LE_COC_RESULT_UNACCEPTABLE_PARAMETERS;
+        } else {
+            match self.servers.lookup_le(le_psm) {
+                None => result = l2cap::LE_COC_RESULT_PSM_NOT_SUPPORTED,
+                // LE channels stage SDUs regardless of kind today;
+                // kinds exist so future LE profiles can attach
+                // handlers to the registry.
+                Some(_) => match self.connections[conn_idx].cid_alloc.alloc_le() {
+                    None => result = l2cap::LE_COC_RESULT_NO_RESOURCES,
+                    Some(cid) => {
+                        local_cid = cid;
+                        self.connections[conn_idx]
+                            .channels
+                            .push(Channel::Le(LeCocChannel::new(
+                                cid,
+                                source_cid,
+                                le_psm,
+                                mtu,
+                                mps,
+                                initial_credits,
+                            )));
+                    }
+                },
+            }
+        }
+        let (dest, src, rmtu, rmps, rcredits) = if result == l2cap::LE_COC_RESULT_SUCCESS {
+            (
+                source_cid,
+                local_cid,
+                LE_COC_MTU,
+                LE_COC_MPS,
+                LE_COC_INITIAL_CREDITS,
+            )
+        } else {
+            (0, source_cid, 0, 0, 0)
+        };
+        l2cap::build_le_credit_based_connection_response(
+            cmd.identifier,
+            dest,
+            src,
+            result,
+            rmtu,
+            rmps,
+            rcredits,
+        )
+        .encode(out);
+    }
+
+    /// BR/EDR signalling answers (Vol 3 Part A §4). Connection
+    /// Requests are answered from the server registry (SDP on PSM
+    /// 0x0001, RFCOMM on PSM 0x0003, refused otherwise); Echo and
+    /// Information are answered from the fixed-channel set this pump
+    /// actually serves; Configure / Disconnection are answered so
+    /// peers do not wedge.
+    fn answer_bredr_signalling(
+        &mut self,
+        conn_idx: usize,
+        cmd: &l2cap::SignallingCommand,
+        out: &mut Vec<u8>,
+    ) {
         match SignallingCode::from_u8(cmd.code) {
             Some(SignallingCode::EchoRequest) => {
                 l2cap::SignallingCommand {
@@ -745,28 +1030,81 @@ impl PumpCore {
                 .encode(out);
             }
             Some(SignallingCode::ConnectionRequest) => {
-                let source_cid = if cmd.data.len() >= 4 {
-                    u16::from_le_bytes([cmd.data[2], cmd.data[3]])
+                let (psm, source_cid) = Self::parse_cid_pair(&cmd.data);
+                // A peer must not reuse the source CID of an open
+                // channel; refuse with no-resources (no classic
+                // result code names this case).
+                let duplicate = self.connections[conn_idx]
+                    .channels
+                    .iter()
+                    .any(|c| c.peer_cid() == source_cid);
+                let kind = if duplicate {
+                    None
                 } else {
-                    0
+                    self.servers.lookup_bredr(psm)
                 };
-                l2cap::build_connection_response(
-                    cmd.identifier,
-                    0,
-                    source_cid,
-                    l2cap::CONN_RESULT_REFUSED_PSM_NOT_SUPPORTED,
-                    l2cap::CONN_STATUS_NO_INFORMATION,
-                )
-                .encode(out);
+                match kind {
+                    None => {
+                        let result = if duplicate {
+                            l2cap::CONN_RESULT_REFUSED_NO_RESOURCES
+                        } else {
+                            l2cap::CONN_RESULT_REFUSED_PSM_NOT_SUPPORTED
+                        };
+                        l2cap::build_connection_response(
+                            cmd.identifier,
+                            0,
+                            source_cid,
+                            result,
+                            l2cap::CONN_STATUS_NO_INFORMATION,
+                        )
+                        .encode(out);
+                    }
+                    Some(kind) => match self.connections[conn_idx].cid_alloc.alloc_bredr() {
+                        // The BR/EDR allocator wraps and reuses CIDs
+                        // without tracking the open set: refuse
+                        // rather than aliasing an open channel.
+                        Some(local_cid)
+                            if self.connections[conn_idx].channel_pos(local_cid).is_none() =>
+                        {
+                            self.connections[conn_idx].channels.push(Channel::BrEdr(
+                                BrEdrChannel::new(local_cid, source_cid, psm, kind),
+                            ));
+                            l2cap::build_connection_response(
+                                cmd.identifier,
+                                local_cid,
+                                source_cid,
+                                l2cap::CONN_RESULT_SUCCESS,
+                                l2cap::CONN_STATUS_NO_INFORMATION,
+                            )
+                            .encode(out);
+                        }
+                        _ => {
+                            l2cap::build_connection_response(
+                                cmd.identifier,
+                                0,
+                                source_cid,
+                                l2cap::CONN_RESULT_REFUSED_NO_RESOURCES,
+                                l2cap::CONN_STATUS_NO_INFORMATION,
+                            )
+                            .encode(out);
+                        }
+                    },
+                }
             }
             Some(SignallingCode::ConfigureRequest) => {
                 // §4.5 response: Source_CID(2) Flags(2) Result(2)
-                // options(0). Accept with no options.
+                // options(0). Accept with no options; record the
+                // configuration on the channel when it is ours.
                 let dest_cid = if cmd.data.len() >= 2 {
                     u16::from_le_bytes([cmd.data[0], cmd.data[1]])
                 } else {
                     0
                 };
+                if let Some(pos) = self.connections[conn_idx].channel_pos(dest_cid) {
+                    if let Channel::BrEdr(ch) = &mut self.connections[conn_idx].channels[pos] {
+                        ch.configured = true;
+                    }
+                }
                 let mut data = Vec::with_capacity(6);
                 data.extend_from_slice(&dest_cid.to_le_bytes());
                 data.extend_from_slice(&0u16.to_le_bytes());
@@ -779,12 +1117,22 @@ impl PumpCore {
                 .encode(out);
             }
             Some(SignallingCode::DisconnectionRequest) => {
+                let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                self.connections[conn_idx]
+                    .channels
+                    .retain(|c| c.local_cid() != dest);
                 l2cap::SignallingCommand {
                     code: SignallingCode::DisconnectionResponse as u8,
                     identifier: cmd.identifier,
                     data: cmd.data.clone(),
                 }
                 .encode(out);
+            }
+            Some(SignallingCode::DisconnectionResponse) => {
+                let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                self.connections[conn_idx]
+                    .channels
+                    .retain(|c| c.local_cid() != dest);
             }
             _ => {
                 l2cap::SignallingCommand {
@@ -969,6 +1317,31 @@ pub fn connection_count(index: usize) -> Option<usize> {
     let pumps = PUMPS.lock();
     let slot = pumps.iter().find(|s| s.index == index)?;
     slot.core.as_ref().map(|c| c.connection_count())
+}
+
+/// Register an LE PSM on controller `index`'s pump (see
+/// `PumpCore::register_le_psm`). No-op when no pump exists.
+pub fn register_le_psm(index: usize, le_psm: u16) {
+    let mut pumps = PUMPS.lock();
+    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+        if let Some(core) = slot.core.as_mut() {
+            core.register_le_psm(le_psm);
+        }
+    }
+}
+
+/// Drain staged channel payloads (see `PumpCore::drain_channel_rx`).
+pub fn drain_channel_rx(index: usize, handle: u16, cid: u16) -> Option<Vec<Vec<u8>>> {
+    let mut pumps = PUMPS.lock();
+    let slot = find_slot_mut(&mut pumps, index)?;
+    slot.core.as_mut()?.drain_channel_rx(handle, cid)
+}
+
+/// Drain staged RFCOMM DLC payloads (see `PumpCore::drain_rfcomm_rx`).
+pub fn drain_rfcomm_rx(index: usize, handle: u16, cid: u16, dlci: u8) -> Option<Vec<Vec<u8>>> {
+    let mut pumps = PUMPS.lock();
+    let slot = find_slot_mut(&mut pumps, index)?;
+    slot.core.as_mut()?.drain_rfcomm_rx(handle, cid, dlci)
 }
 
 /// Cumulative pump statistics for controller `index`.
@@ -2807,4 +3180,427 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_socket_event_drops_accumulate);
+
+    /// #889 LE fixture: open → data → disconnect on a credit-based
+    /// channel, against the scripted-controller harness. The test LE
+    /// PSM 0x0080 is an arbitrary fixture value, not an assigned
+    /// SPSM — the registry is value-agnostic and both sides are
+    /// fixtures.
+    fn smoke_pump_le_coc_open_data_disconnect() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        fake.enqueue_event(le_connection_complete(
+            handle,
+            [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        ));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("LE connection not tracked");
+        }
+        register_le_psm(0, 0x0080);
+
+        // Open: COC Request (id 0x07, PSM 0x0080, peer CID 0x0041,
+        // MTU 1024, MPS 256, 8 initial credits).
+        let open =
+            l2cap::build_le_credit_based_connection_request(0x07, 0x0080, 0x0041, 1024, 256, 8);
+        let mut payload = Vec::new();
+        open.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_LE_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        // Exact response bytes: code 0x15, id 0x07, len 12, Dest
+        // 0x0041 (peer CID), Source 0x0040 (first LE alloc), result
+        // 0, MTU 1024, MPS 256, credits 16.
+        let expected_rsp: Vec<u8> = alloc::vec![
+            0x15, 0x07, 0x0C, 0x00, 0x41, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01,
+            0x10, 0x00,
+        ];
+        let frames = fake.sent_acl_frames();
+        let rsp_ok = frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_LE_SIGNALLING && f.payload == expected_rsp);
+        if !rsp_ok {
+            reset_all();
+            return TestResult::Fail("LE COC open response bytes mismatch");
+        }
+
+        // Data: single-K-frame SDU "hi" on our local CID 0x0040.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![0x02, 0x00, b'h', b'i']),
+        ));
+        let _ = pump_once(0);
+        if drain_channel_rx(0, handle, 0x0040) != Some(alloc::vec![alloc::vec![b'h', b'i']]) {
+            reset_all();
+            return TestResult::Fail("LE COC SDU not staged");
+        }
+        // Spend the grant down to the top-up threshold: 11 more
+        // single-K-frame SDUs (12 spent of 16 -> 4 left -> top-up).
+        for _ in 0..11 {
+            fake.enqueue_acl(acl_packet(
+                handle,
+                &BFrame::new(0x0040, alloc::vec![0x01, 0x00, b'x']),
+            ));
+        }
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let credit_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_LE_SIGNALLING
+                && f.payload == alloc::vec![0x16, 0x00, 0x04, 0x00, 0x40, 0x00, 0x0C, 0x00]
+        });
+        if !credit_ok {
+            reset_all();
+            return TestResult::Fail("LE COC top-up Flow Control Credit missing");
+        }
+        if drain_channel_rx(0, handle, 0x0040).map(|v| v.len()) != Some(11) {
+            reset_all();
+            return TestResult::Fail("LE COC staged SDU count mismatch");
+        }
+
+        // Disconnect: request on LE signalling, Dest = our CID.
+        let disc = l2cap::build_disconnection_request(0x09, 0x0040, 0x0041);
+        let mut payload = Vec::new();
+        disc.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_LE_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_LE_SIGNALLING
+                && f.payload == alloc::vec![0x07, 0x09, 0x04, 0x00, 0x40, 0x00, 0x41, 0x00]
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("LE COC disconnection response missing");
+        }
+        if drain_channel_rx(0, handle, 0x0040).is_some() {
+            reset_all();
+            return TestResult::Fail("LE COC channel survived disconnect");
+        }
+        // Data on the freed CID is dropped and counted.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![0x01, 0x00, b'z']),
+        ));
+        let _ = pump_once(0);
+        let dropped = stats(0).map(|s| s.frames_dropped_unrouted_cid) == Some(1);
+        reset_all();
+        if !dropped {
+            return TestResult::Fail("data on freed CID not counted as dropped");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_le_coc_open_data_disconnect);
+
+    /// #889 BR/EDR fixture: open → SDP search/attribute → disconnect.
+    fn smoke_pump_sdp_open_search_disconnect() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0041;
+        fake.enqueue_event(Event {
+            code: EventCode::ConnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0x01, 0x00],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("BR/EDR connection not tracked");
+        }
+
+        // Open: Connection Request (id 0x05, PSM 0x0001 SDP, peer
+        // CID 0x0040) -> success, local CID 0x0040 (first BR/EDR
+        // alloc).
+        let open = l2cap::build_connection_request(0x05, 0x0001, 0x0040);
+        let mut payload = Vec::new();
+        open.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let open_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_SIGNALLING
+                && f.payload
+                    == alloc::vec![
+                        0x03, 0x05, 0x08, 0x00, 0x40, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00
+                    ]
+        });
+        if !open_ok {
+            reset_all();
+            return TestResult::Fail("SDP channel open response mismatch");
+        }
+        // Configure -> accept.
+        let cfg = l2cap::build_configure_request(0x06, 0x0040, false, &[]);
+        let mut payload = Vec::new();
+        cfg.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let cfg_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_SIGNALLING
+                && f.payload
+                    == alloc::vec![0x05, 0x06, 0x06, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00]
+        });
+        if !cfg_ok {
+            reset_all();
+            return TestResult::Fail("SDP channel configure response mismatch");
+        }
+
+        // SDP Service Search for Serial Port (0x1101) -> exact
+        // response bytes (total 1, current 1, handle 0x00010000).
+        let spp_uuid = 0x1101u16.to_be_bytes();
+        let search = crate::sdp::build_service_search_request(0x1234, &[&spp_uuid], 0xFFFF);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, search)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let search_ok = frames.iter().any(|(_, f)| {
+            f.cid == 0x0040
+                && f.payload
+                    == alloc::vec![
+                        0x03, 0x12, 0x34, 0x00, 0x09, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+                        0x00, 0x00,
+                    ]
+        });
+        if !search_ok {
+            reset_all();
+            return TestResult::Fail("SDP search response bytes mismatch");
+        }
+        // SDP Service Attribute for the service name.
+        let attr = crate::sdp::build_service_attribute_request(
+            0x0007,
+            0x00010000,
+            0xFFFF,
+            &[0x0100],
+            false,
+        );
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, attr)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let attr_ok = frames.iter().any(|(_, f)| {
+            f.cid == 0x0040
+                && f.payload.len() >= 6
+                && f.payload[0] == 0x05
+                && f.payload[1..3] == [0x00, 0x07]
+                && f.payload.windows(8).any(|w| w == b"NARF SPP")
+                && f.payload.last() == Some(&0)
+        });
+        if !attr_ok {
+            reset_all();
+            return TestResult::Fail("SDP attribute response missing service name");
+        }
+
+        // Disconnect -> response, then data on the freed CID drops.
+        let disc = l2cap::build_disconnection_request(0x08, 0x0040, 0x0040);
+        let mut payload = Vec::new();
+        disc.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_SIGNALLING
+                && f.payload == alloc::vec![0x07, 0x08, 0x04, 0x00, 0x40, 0x00, 0x40, 0x00]
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("SDP channel disconnection response missing");
+        }
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![0x01, 0x02, 0x03]),
+        ));
+        let _ = pump_once(0);
+        let dropped = stats(0).map(|s| s.frames_dropped_unrouted_cid) == Some(1);
+        reset_all();
+        if !dropped {
+            return TestResult::Fail("data on freed SDP CID not counted as dropped");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sdp_open_search_disconnect);
+
+    /// #889 BR/EDR fixture: open → RFCOMM mux + DLC → data →
+    /// disconnect. The peer's DLCIs (mux 0, DLC 2) are the peer's
+    /// choice, mirrored by the session — no server-channel → DLCI
+    /// mapping is computed here.
+    fn smoke_pump_rfcomm_open_data_disconnect() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0041;
+        fake.enqueue_event(Event {
+            code: EventCode::ConnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0x01, 0x00],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("BR/EDR connection not tracked");
+        }
+
+        // Open: Connection Request (id 0x05, PSM 0x0003 RFCOMM,
+        // peer CID 0x0040) -> success, local CID 0x0040.
+        let open = l2cap::build_connection_request(0x05, 0x0003, 0x0040);
+        let mut payload = Vec::new();
+        open.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let open_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_SIGNALLING
+                && f.payload
+                    == alloc::vec![
+                        0x03, 0x05, 0x08, 0x00, 0x40, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00
+                    ]
+        });
+        if !open_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM channel open response mismatch");
+        }
+        // Configure -> accept.
+        let cfg = l2cap::build_configure_request(0x06, 0x0040, false, &[]);
+        let mut payload = Vec::new();
+        cfg.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+
+        // Helper: last payload sent on a CID.
+        let last_on = |frames: &Vec<(u16, BFrame)>, cid: u16| -> Option<Vec<u8>> {
+            frames
+                .iter()
+                .rev()
+                .find(|(_, f)| f.cid == cid)
+                .map(|(_, f)| f.payload.clone())
+        };
+
+        // Mux SABM -> UA, pinned bytes (address 0x01, control
+        // 0x73, length 0x01, FCS 0xB6).
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, crate::rfcomm::Frame::sabm(0, true).encode()),
+        ));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        if last_on(&frames, 0x0040) != Some(alloc::vec![0x01, 0x73, 0x01, 0xB6]) {
+            reset_all();
+            return TestResult::Fail("RFCOMM mux SABM response bytes mismatch");
+        }
+        // DLC SABM -> UA, pinned bytes.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, crate::rfcomm::Frame::sabm(2, true).encode()),
+        ));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        if last_on(&frames, 0x0040) != Some(alloc::vec![0x09, 0x73, 0x01, 0xF3]) {
+            reset_all();
+            return TestResult::Fail("RFCOMM DLC SABM response bytes mismatch");
+        }
+        // UIH data -> staged, no response frame.
+        let before = fake
+            .sent_acl_frames()
+            .iter()
+            .filter(|(_, f)| f.cid == 0x0040)
+            .count();
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(
+                0x0040,
+                crate::rfcomm::Frame::uih(2, true, alloc::vec![b'h', b'e', b'l', b'l', b'o'])
+                    .encode(),
+            ),
+        ));
+        let _ = pump_once(0);
+        let after = fake
+            .sent_acl_frames()
+            .iter()
+            .filter(|(_, f)| f.cid == 0x0040)
+            .count();
+        if before != after {
+            reset_all();
+            return TestResult::Fail("RFCOMM UIH data must not be answered");
+        }
+        if drain_rfcomm_rx(0, handle, 0x0040, 2)
+            != Some(alloc::vec![alloc::vec![b'h', b'e', b'l', b'l', b'o']])
+        {
+            reset_all();
+            return TestResult::Fail("RFCOMM UIH payload not staged");
+        }
+        // DLC DISC -> UA; UIH after close -> DM, pinned bytes.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, crate::rfcomm::Frame::disc(2, true).encode()),
+        ));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        if last_on(&frames, 0x0040) != Some(alloc::vec![0x09, 0x73, 0x01, 0xF3]) {
+            reset_all();
+            return TestResult::Fail("RFCOMM DLC DISC response bytes mismatch");
+        }
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(
+                0x0040,
+                crate::rfcomm::Frame::uih(2, true, alloc::vec![b'x']).encode(),
+            ),
+        ));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        if last_on(&frames, 0x0040) != Some(alloc::vec![0x09, 0x1F, 0x01, 0x12]) {
+            reset_all();
+            return TestResult::Fail("RFCOMM UIH on closed DLC should get DM");
+        }
+
+        // L2CAP disconnect -> response, then data on the freed CID
+        // drops.
+        let disc = l2cap::build_disconnection_request(0x08, 0x0040, 0x0040);
+        let mut payload = Vec::new();
+        disc.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_SIGNALLING
+                && f.payload == alloc::vec![0x07, 0x08, 0x04, 0x00, 0x40, 0x00, 0x40, 0x00]
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM channel disconnection response missing");
+        }
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![0x01, 0x02, 0x03]),
+        ));
+        let _ = pump_once(0);
+        let dropped = stats(0).map(|s| s.frames_dropped_unrouted_cid) == Some(1);
+        reset_all();
+        if !dropped {
+            return TestResult::Fail("data on freed RFCOMM CID not counted as dropped");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_rfcomm_open_data_disconnect);
 }
