@@ -143,9 +143,15 @@ impl DriverFlr {
             return Poll::Ready(Err(Error::Unavailable));
         }
         pf(mmio)?;
-        if now >= self.deadline {
-            return Poll::Ready(Err(Error::Timeout));
+        // __xe_driver_flr waits with xe_mmio_wait32, whose final read after
+        // the loop wins over the timeout: a late poll that finds the phase's
+        // condition met progresses. Each phase re-arms the 3 s bound.
+        match self.advance(mmio, now) {
+            Poll::Pending if now >= self.deadline => Poll::Ready(Err(Error::Timeout)),
+            result => result,
         }
+    }
+    fn advance(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<Receipt, Error>> {
         match self.phase {
             0 => {
                 let control = read(mmio, 0x101010)?;
@@ -292,9 +298,15 @@ impl MediaQuiesce {
             proof.current(mmio)?;
             return Poll::Ready(Ok(proof));
         }
-        if now >= self.deadline {
-            return Poll::Ready(Err(Error::Timeout));
+        // xe_force_wake / xe_mmio_wait32 final read: the media ACK and the
+        // GRDOM_GUC/GRDOM_FULL reads precede the deadline. A late poll that
+        // finds the condition met progresses; each phase re-arms its bound.
+        match self.advance(mmio, now) {
+            Poll::Pending if now >= self.deadline => Poll::Ready(Err(Error::Timeout)),
+            result => result,
         }
+    }
+    fn advance(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<MediaProof, Error>> {
         if read(mmio, 0x380dfc)? & 1 == 0 {
             return Poll::Pending;
         }
@@ -360,11 +372,13 @@ impl MediaQuiesce {
             self.deadline = now.checked_add(50_000_000).ok_or(Error::Timeout)?;
             self.releasing = true;
         }
-        if now >= self.deadline {
-            return Poll::Ready(Err(Error::Timeout));
-        }
         if read(mmio, 0x380dfc)? & 1 != 0 {
-            return Poll::Pending;
+            // A sleep ACK that cleared before a late poll is success.
+            return if now >= self.deadline {
+                Poll::Ready(Err(Error::Timeout))
+            } else {
+                Poll::Pending
+            };
         }
         self.phase = 0;
         Poll::Ready(Ok(()))
@@ -692,6 +706,58 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_lnl_driver_flr_fresh_ack_exclusions_and_media_63_pte
+    );
+    fn smoke_lnl_flr_and_media_late_polls_after_settled_condition() -> TestResult {
+        // __xe_driver_flr's and __domain_wait's xe_mmio_wait32 read once
+        // more after the timeout: a condition met before a poll delayed past
+        // the bound is progress, never Timeout.
+        let (device, bar) = identity();
+        let m = Registers::new();
+        let mut f = DriverFlr::new(device, bar, 0).unwrap();
+        assert!(f.poll(&m, 0, || true).is_pending());
+        m.set(0x101010, 0); // teardown done before a poll past the 3 s bound
+        assert!(f.poll(&m, 3_000_000_005, || true).is_pending());
+        assert!(f.poll(&m, 3_000_000_006, || true).is_pending());
+        m.set(0x101018, 0x80000000); // re-init done before another late poll
+        assert!(matches!(
+            f.poll(&m, 6_000_000_010, || true),
+            Poll::Ready(Ok(_))
+        ));
+        let m = Registers::new();
+        m.set(0x380d8c, 20 << 22);
+        let mut media = MediaQuiesce::new();
+        assert!(media.poll(&m, 0).is_pending());
+        m.set(0x380dfc, 1); // media wake ACK, past its 50 ms bound
+        let mut now = 50_000_005;
+        assert!(media.poll(&m, now).is_pending());
+        assert_eq!(m.read32(0x38941c), 8);
+        m.set(0x38941c, 0);
+        m.set(0x38c000, 1);
+        now += 5_000_005; // GRDOM_GUC, GuC reset and DMA idle, past 5 ms
+        assert!(media.poll(&m, now).is_pending());
+        assert_eq!(m.read32(0x38941c), 1);
+        m.set(0x38941c, 0);
+        now += 5_000_005; // GRDOM_FULL, past 5 ms
+        assert!(matches!(media.poll(&m, now), Poll::Ready(Ok(_))));
+        now += 1;
+        assert!(media.release(&m, now).is_pending());
+        m.set(0x380dfc, 0); // sleep ACK, past its 50 ms bound
+        assert_eq!(media.release(&m, now + 50_000_005), Poll::Ready(Ok(())));
+        // An ACK that never clears still fails at the same bound.
+        let m = Registers::new();
+        m.set(0x380d8c, 20 << 22);
+        let mut media = MediaQuiesce::new();
+        assert!(media.poll(&m, 0).is_pending());
+        assert!(media.poll(&m, 49_999_999).is_pending());
+        assert!(matches!(
+            media.poll(&m, 50_000_000),
+            Poll::Ready(Err(Error::Timeout))
+        ));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_lnl_flr_and_media_late_polls_after_settled_condition
     );
     fn smoke_ptl_driver_flr_profiles_media_steps_and_first_pte_refusal() -> TestResult {
         use narf_graphics::console::BootFramebufferAdmission as Admission;
