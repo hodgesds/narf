@@ -2860,6 +2860,41 @@ Written, unexecuted:
 `smoke_rtw88_tx_ba_addba_amsdu_request_and_no_amsdu`,
 `smoke_rtw88_tx_amsdu_vht_aggregate_airtime_bound`.
 
+
+### VHT SU beamformee (`bf.rs`)
+
+Bound only on an N2xV VHT80 association (Linux reads `vht_cap`):
+
+- **Advertisement** (`vht::local`, `main.c::rtw_init_vht_cap`): SU
+  beamformee (bit12) with Beamformee STS 3 (`hal.bfee_sts_cap`, four NDP
+  STS); the shared request narrows it to the AP's roles. MU beamformee
+  (bit20) is not advertised: Linux needs `rtw_bf_set_gid_table` over VHT
+  Group ID Management for MU, which is not ported.
+- **Association** (`State::bf_assoc`, after the native peer commit like
+  `rtw_ops_bss_info_changed` `BSS_CHANGED_ASSOC` -> `bf.c::rtw_bf_assoc`):
+  when the negotiated VHT `su_beamformee()` holds (local cap and AP SU
+  beamformer bit11), `Bfee::su` takes `sound_dim` from the AP's sounding
+  dimensions field, register index 0 and `nc_index` from the chip's RX paths
+  (C22 2R 1, C21 1R 0). `bf::phy_init` (`rtw_bf_phy_init`, which Linux runs
+  at chip init and the retained init does not) precedes `bf::enable_su`
+  (`rtw_bf_enable_bfee_su`: SND_PTCL_CTRL 0x9b under mask 0x9f, BFMER0
+  address, CSI report parameter coef 3 / codebook 1 / grouping 0 / nr / nc,
+  NDP standby 0x70; C22 `rtw8822c_bf_enable_bfee_su` also sets
+  `BIT_WMAC_USE_NDPARATE`, clears the AP-mode bit12 and writes `CSI_RRSR`
+  0x550). Every word is read back under the station admission.
+- **Cleanup** (`State::stop`, `rtw_bf_disassoc` -> `rtw_bf_remove_bfee_su`):
+  SND_PTCL_CTRL 0x98 and the BFMER0/CSI words cleared, best effort since the
+  owner is already closed; a fresh association reprograms.
+
+Not covered: MU beamformee, SU/MU beamformer (station never sounds),
+`rtw_dynamic_csi_rate` (watchdog `rtw_bf_cfg_csi_rate` needs the dm
+`min_rssi`, and the dm watchdog is not bound on 5GHz; the CSI rate stays at
+`rtw_bf_phy_init`'s OFDM6), HT/VHT20/40 associations. No physical sounding
+exchange has been run. Written, unexecuted:
+`smoke_rtw88_bf_phy_init_and_su_bfee_program`; the VHT capability check in
+`smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback` now expects
+SU beamformee with STS field 3.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -3075,7 +3110,7 @@ changes. None is a physical blocker unless stated.
 | Row | Blocker |
 |---|---|
 | `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13, per-channel continuation records over the channel-scoped base (`scope_request`), Linux-level C22 IQK completion, and associated CSA/ECSA following mac80211 software CSA (base profile in place; bound continuations disconnect). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
-| `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
+| `beamforming` | SU beamformee source-complete on N2xV VHT80 associations (see "VHT SU beamformee"): advertisement, `rtw_bf_assoc`/`rtw_bf_phy_init`/`rtw_bf_enable_bfee_su` with readback, disassoc cleanup. MU beamformee (GID table) and dynamic CSI rate not ported. One case written, unexecuted; physical acceptance pending. |
 | `dpk_tracking` | Source-complete for C22 under N22D bit 7 (`dpk.rs`, §3 dm section): `rtw8822c_do_dpk` + `rtw8822c_dpk_track`. Five register-model cases are written, unexecuted; GAPK, a real signed N22D DPK measurement and physical acceptance remain external. |
 | `five_ghz_operation` | 2.4GHz noninitial retune now exists (N2xO), but 5GHz needs the `rtw8822c_set_channel_bb`/`_rf` 5GHz branches, 5GHz AGC/RF table selection (`rtw_phy_setup_phy_cond` band conditions), 5GHz efuse power groups and a measured 5GHz envelope; `scan.rs` admits 2.4GHz only. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |

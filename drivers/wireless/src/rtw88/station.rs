@@ -195,6 +195,8 @@ pub(super) struct State {
     /// Hardware runs the N2xB 40MHz pair or the N2xV 80MHz block
     /// (`ht40::program` / `vht::program` committed).
     wide: bool,
+    /// Bound SU beamformee entry (`bf.c::rtw_bf_assoc`), N2xV only.
+    bfee: Option<super::bf::Bfee>,
     /// cfg80211 `beacon_found` for passive-only (RADAR / NO_IR) primaries
     /// (shared `narf_wireless::reg::witness`): admits association / CSA
     /// onto a passive-only primary only after a Beacon heard in its latest
@@ -308,6 +310,7 @@ impl State {
             ht40: None,
             vht: None,
             wide: false,
+            bfee: None,
             switch: None,
             switch_wait_beacon: false,
             witness: BeaconWitness::new(),
@@ -627,6 +630,11 @@ impl State {
         self.qos = None;
         self.ht40 = None;
         self.vht = None;
+        // `rtw_bf_disassoc`: best effort, the owner is already closed and a
+        // fresh association reprograms the entry.
+        if self.bfee.take().is_some() {
+            let _ = super::bf::remove_su(io);
+        }
         self.witness.clear();
         self.witness_scan = None;
         let _ = io.station_passive_tx(None);
@@ -2322,6 +2330,7 @@ impl State {
                 let band5 = super::band5::primary(self.channel);
                 station_control::commit_peer(io, bssid, aid, short, band5, &self.admission).await?;
                 self.associated_aid = Some(aid);
+                self.bf_assoc(io, bssid)?;
                 if self.extension.is_some() {
                     super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)
                         .await?;
@@ -2338,6 +2347,37 @@ impl State {
             }
             self.environment.pause().await;
         }
+    }
+    /// `mac80211.c` `BSS_CHANGED_ASSOC` -> `bf.c::rtw_bf_assoc`: SU
+    /// beamformee only on the bound N2xV association when both the local
+    /// advertisement and the AP's SU beamformer bit agree.
+    fn bf_assoc(&mut self, io: &mut impl Io, bssid: [u8; 6]) -> Result<(), Error> {
+        if self.vht.is_none() || self.bfee.is_some() {
+            return Ok(());
+        }
+        let Some(vht) = self
+            .plan
+            .as_ref()
+            .and_then(JoinPlan::negotiated_phy)
+            .and_then(|p| p.vht())
+            .filter(|v| v.su_beamformee())
+        else {
+            return Ok(());
+        };
+        let did = io.station_gate()?.did();
+        let Some(b) = vht
+            .peer_sounding_dimensions()
+            .and_then(|s| super::bf::Bfee::su(did, bssid, s))
+        else {
+            return Ok(());
+        };
+        self.admission.run(|| {
+            io.station_allowed()?;
+            super::bf::phy_init(io)?;
+            super::bf::enable_su(io, did, b)
+        })?;
+        self.bfee = Some(b);
+        Ok(())
     }
     pub(super) fn send(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         let admission = self.admission.clone();
