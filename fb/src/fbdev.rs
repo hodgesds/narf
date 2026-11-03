@@ -26,6 +26,42 @@ const FBIOGET_FSCREENINFO: u32 = 0x4602;
 const FBIOPAN_DISPLAY: u32 = 0x4606;
 const FBIOBLANK: u32 = 0x4611;
 
+// ── FBIOBLANK levels (include/uapi/linux/fb.h) ─────────────────────────
+
+const FB_BLANK_UNBLANK: usize = 0;
+const FB_BLANK_NORMAL: usize = 1;
+const FB_BLANK_VSYNC_SUSPEND: usize = 2;
+const FB_BLANK_HSYNC_SUSPEND: usize = 3;
+const FB_BLANK_POWERDOWN: usize = 4;
+
+/// `DRM_MODE_DPMS_*` (include/uapi/drm/drm_mode.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Dpms {
+    On,
+    Standby,
+    Suspend,
+    Off,
+}
+
+/// The DPMS mode `drm_fb_helper_blank` (Linux b90c984d `drm_fb_helper.c`)
+/// asks for at blank level `arg`, after `do_fb_ioctl`'s `-EINVAL` above
+/// `FB_BLANK_POWERDOWN` (`arg` is the ioctl's unsigned long).
+pub(crate) fn blank_dpms(arg: usize) -> Result<Dpms, FsError> {
+    match arg {
+        FB_BLANK_UNBLANK => Ok(Dpms::On),
+        FB_BLANK_NORMAL | FB_BLANK_HSYNC_SUSPEND => Ok(Dpms::Standby),
+        FB_BLANK_VSYNC_SUSPEND => Ok(Dpms::Suspend),
+        FB_BLANK_POWERDOWN => Ok(Dpms::Off),
+        _ => Err(FsError::InvalidData),
+    }
+}
+
+/// `drm_client_modeset_dpms` on an atomic driver commits the crtc active
+/// only for `DRM_MODE_DPMS_ON`; every other level turns it off.
+pub(crate) fn blank_dpms_on(arg: usize) -> Result<bool, FsError> {
+    blank_dpms(arg).map(|dpms| dpms == Dpms::On)
+}
+
 // ── wire structs (must match Linux UAPI exactly) ──────────────────────
 
 /// `struct fb_bitfield` (12 bytes).
@@ -357,7 +393,16 @@ impl FileOps for DevFb0 {
                 Ok(0)
             }
             FBIOBLANK => {
-                // Blank/unblank: no-op on QEMU bochs/virtio-gpu.
+                // fb_chrdev.c::do_fb_ioctl refuses a level above
+                // FB_BLANK_POWERDOWN before fb_blank runs.
+                let on = blank_dpms_on(arg)?;
+                // drm_fb_helper_blank → drm_client_modeset_dpms: the Intel
+                // console's crtc goes off or on. It returns 0 whatever the
+                // commit did; the other scanouts keep the no-op.
+                #[cfg(feature = "intel")]
+                narf_drivers_gpu::intel_gpu::fbdev_dpms(on);
+                #[cfg(not(feature = "intel"))]
+                let _ = on;
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),

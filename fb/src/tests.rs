@@ -1641,3 +1641,34 @@ fn smoke_fb_no_kernel_pointer_under_a_compositor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fb_no_kernel_pointer_under_a_compositor);
+
+/// FBIOBLANK's levels as `do_fb_ioctl` and `drm_fb_helper_blank` (Linux
+/// b90c984d) map them: above `FB_BLANK_POWERDOWN` is `-EINVAL`; UNBLANK is
+/// `DRM_MODE_DPMS_ON` and the only level that keeps the crtc active
+/// (`drm_client_modeset_dpms` commits `mode == DRM_MODE_DPMS_ON`); NORMAL
+/// and HSYNC_SUSPEND are STANDBY, VSYNC_SUSPEND is SUSPEND, POWERDOWN is OFF.
+fn smoke_fbdev_blank_levels_map_as_drm_fb_helper_blank() -> TestResult {
+    use crate::fbdev::{blank_dpms, blank_dpms_on, Dpms};
+    use narf_filesystem::FsError;
+    let table = [
+        (0, Dpms::On, true),
+        (1, Dpms::Standby, false),
+        (2, Dpms::Suspend, false),
+        (3, Dpms::Standby, false),
+        (4, Dpms::Off, false),
+    ];
+    for (level, dpms, on) in table {
+        if blank_dpms(level) != Ok(dpms) || blank_dpms_on(level) != Ok(on) {
+            return TestResult::Fail("a blank level maps off drm_fb_helper_blank's table");
+        }
+    }
+    for level in [5, 255, usize::MAX] {
+        if blank_dpms(level) != Err(FsError::InvalidData)
+            || blank_dpms_on(level) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("a level above FB_BLANK_POWERDOWN must be EINVAL");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fbdev_blank_levels_map_as_drm_fb_helper_blank);
