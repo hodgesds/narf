@@ -138,6 +138,10 @@ mod station;
 pub(super) mod station_control;
 mod station_power8821c;
 mod station_profile;
+/// RTL8821CU USB host-interface transport (Linux rtw88/usb.c).
+mod usb;
+#[cfg(feature = "kernel-test")]
+mod usb_tests;
 mod wmm;
 mod wow;
 pub use calibration8821c::{Error as C21CalibrationError, Request as C21CalibrationRequest};

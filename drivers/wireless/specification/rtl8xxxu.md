@@ -1156,7 +1156,10 @@ are inapplicable to this family. 8192EU/8723BU first need their own retained pow
 packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
-EU descriptor/register helpers cannot establish those VHT runtimes. No
+EU descriptor/register helpers cannot establish those VHT runtimes. The
+rtw88 USB host interface now exists as an unadmitted transport (rtw88.md
+"RTL8821CU USB transport"). RTL8821CU still needs the retained C21 stages
+to run over it. RTL8822BU still needs the 8822B chip runtime. No
 unsupported initial profile is marked hardware-inapplicable here.
 
 Source-proven inapplicability (rows removed from the remaining inventory):

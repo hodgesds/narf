@@ -2944,6 +2944,101 @@ MU-MIMO exchange has been run. Written, unexecuted:
 `smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback` now expects
 SU and MU beamformee with STS field 3.
 
+### RTL8821CU USB transport (`usb.rs`) — not admitted
+
+Linux drives RTL8821CU with rtw88 (`rtw8821cu.c` over `usb.c`), not
+rtl8xxxu. `usb.rs` ports that host interface for the C21 die; the PCI files
+(`pci*.rs`, `reserved_page.rs`, `power.rs`, `mac.rs`) are unchanged, so the
+PCI path stays byte-identical. Register access reuses the existing async EP0
+owner (`rtl8xxxu::firmware_transport::ControlIo` bound to
+`narf_drivers_usb::device::USBDevice`); bulk data uses
+`narf_drivers_usb::bulk`.
+
+- IDs: `RTL8821CU_IDS` = `rtw_8821cu_id_table` (15 entries, vendor interface
+  0xff/0xff/0xff).
+- `Registers`: `rtw_usb_read`/`rtw_usb_write` (request 0x05, 0xc0/0x40,
+  wValue = address, wIndex 0, exact length) with `rtw_usb_reg_sec`: after an
+  access in 0x00..=0xff or 0x1000..=0x10ff, a one-byte write of the data
+  buffer's first byte to 0x4e0. `write_firmware_page` is the legacy 8051
+  196/8/1-byte block download at 0x1000 (C21's 3081 MCU uses the reserved
+  page instead).
+- Power: `rtw8821c.c` power sequences filtered to `RTW_PWR_INTF_USB_MSK`
+  (`*_8821C_USB`; all rows MAC/USB base). `pre_system` is
+  `rtw_mac_pre_system_cfg` without the PCIe `BIT_USB_SUS_DIS` write;
+  `power_switch` uses RPWM 0xfe58, treats `REG_SYS_STATUS1+1` bit0 as off
+  (as well as CR 0xea), has no PFM_WOWL poll retry, and clears that bit after
+  power-on; `power_on` adds the -EALREADY off/on cycle and
+  `__rtw_mac_init_system_cfg` (sys_func_en 0xd8).
+- Endpoints: `Endpoints::parse` = `rtw_usb_parse` (one bulk-IN, optional
+  interrupt-IN, up to four bulk-OUT in descriptor order) plus `qsel_to_ep`
+  from `rqpn_table_8821c[bulkout]` via `dma_mapping_to_ep`. A mapping that
+  would index past the discovered OUT pipes (one pipe: MGMT -> EXTRA) is
+  refused rather than submitting on an unset `out_ep` slot.
+- Queues: `usb_tables`/`txdma_pq_map`/`public_pages` = `txdma_queue_mapping`
+  and `priority_queue_cfg` USB rows (2/3/4 pipes; 0xfea0/0xf5a0/0xc5a0);
+  `queue_mapping_tail` sets `BIT_RXDMA_ARBBW_EN`; `priority_queue_tail` sets
+  the AUTO_LLT_V1 block-descriptor count 3, byte+3 = 3 and
+  TXDMA_OFFSET_CHK+1 bit1. `interface_cfg` = `rtw_usb_init_burst_pkt_len`;
+  `dynamic_rx_agg` = `rtw_usb_dynamic_rx_agg_v1`.
+- TX: `descriptor` = `rtw_tx_fill_tx_desc` for the firmware/H2C subset;
+  `fill_checksum` = `fill_txdesc_checksum_common(txdesc, 16)` (W7[15:0]);
+  `reserved_page_packet` = `rtw_usb_write_data_rsvd_page` with
+  `send_firmware_pkt`'s +1 byte when descriptor+payload is a multiple of 512;
+  `h2c_packet` = `rtw_usb_write_data_h2c`; `tx_qsel` =
+  `rtw_usb_tx_queue_mapping_to_qsel`; `aggregate` = `rtw_usb_tx_agg_skb`
+  (8-byte aligned, at most 3 packets / 20 KiB, DMA_TXAGG_NUM + checksum).
+- RX: `split_rx` = the `rtw_usb_rx_handler` framing loop (24-byte RXDESC +
+  drv_info*8 + shift + pkt_len, next record at round_up(..., 8), URBs below
+  24 bytes or at 32 KiB dropped). Each record must still pass
+  `packet_format::receive*` admission.
+- EFUSE: `efuse_mac` reads the USB map MAC at 0x107
+  (`rtw8821cu_efuse_parsing`); `Factory8821c::mac` is the PCI 0xd0 layout.
+
+Not admitted. No USB driver is registered for these IDs (rtl8xxxu's
+detection-only probe still claims 0bda:c811), and no station, band or TX
+grant is published. Remaining blockers, verified against the tree:
+
+1. Synchronous register contract. Every retained C21 stage (`mac.rs`,
+   `phy/rtl8821c.rs`, `calibration8821c.rs`, `radio8821c.rs`, `station*.rs`)
+   uses `firmware_transport::Io`, whose `read*`/`write*` are synchronous
+   (MMIO). NARF USB control transfers are async only
+   (`Xhci::control_{in,out}_generation`), and `block_on`/`block_on_spin`
+   panic inside an executor poll (AGENTS.md). Linux's `usb_control_msg`
+   sleeps synchronously. Running those stages over USB needs either an async
+   `Io` or a maintainer-approved synchronous polled EP0 primitive in
+   `drivers/usb`. Neither exists, and hand-rolling a noop-waker spin here is
+   not acceptable.
+2. Packet path. `packet_core::Port` is shaped around PCI TXBD/RXBD rings
+   (`index`, `publish`, `tx_descriptor`, `rx_descriptor`, `rx_repost`). A USB
+   port needs a queue/URB-shaped port built from `aggregate`/`split_rx`, with
+   USB-completion (not CCX) receipts for non-report frames, as
+   `rtw_usb_write_port_tx_complete` does.
+3. Identity and records. The firmware owner, the N21Q/N21P/N21S/N2x*
+   records and the `power_policy` board identity are keyed by PCI
+   VID/DID 0x10ec/0xc821. RTL8821CU needs its own USB VID/PID-bound signed
+   records. No RTL8821CU board/power measurement exists, and none is
+   invented.
+4. Tables. Linux selects BB/AGC/RF rows with `cond.intf = INTF_USB`
+   (`phy.c::rtw_phy_setup_phy_cond`). The retained C21 tables were checked
+   for PCIe only. The USB selection must be re-derived and checked before any
+   PHY stage runs.
+
+RTL8822BU needs the 8822B chip runtime (`rtw88 | rtl8822be` is open: no
+8822B firmware/MAC/PHY/RF tables are ported), so the RTL8822BU row stays
+blocked on the chip, not the transport. RTL8821CU alone would satisfy the
+`rtl8xxxu` `five_ghz_operation`/`vht` rows only once the C21 5 GHz/VHT80
+programs (`band5.rs`, N2xV) run over this transport. Today they run only
+through the PCI owner.
+
+Written, unexecuted: `smoke_rtw88_usb_endpoints_and_qsel_map`,
+`smoke_rtw88_usb_queue_tables_and_tx_qsel`,
+`smoke_rtw88_usb_reserved_page_descriptor_and_checksum`,
+`smoke_rtw88_usb_tx_aggregation_framing`,
+`smoke_rtw88_usb_rx_aggregate_split`,
+`smoke_rtw88_usb_register_section_mirror`,
+`smoke_rtw88_usb_power_on_sequence`,
+`smoke_rtw88_usb_interface_cfg_and_rx_agg`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
