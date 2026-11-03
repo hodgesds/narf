@@ -5,6 +5,10 @@
 use crate::sdhci::regs::*;
 use narf_time::Deadline;
 
+#[path = "pio_publication.rs"]
+mod publication;
+pub use publication::Publication;
+
 const COMMAND_TIMEOUT_US: u64 = 100_000;
 const TRANSFER_TIMEOUT_US: u64 = 1_000_000;
 pub const MAX_TRANSFER: usize = 32 * 1024;
@@ -12,6 +16,8 @@ pub const MAX_TRANSFER: usize = 32 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Invalid,
+    /// Original fixed scope refused before actual COMMAND action.
+    Denied,
     Failed,
     Gone,
     Timeout,
@@ -169,7 +175,23 @@ impl<R: Registers> Controller<R> {
         command: u8,
         argument: u32,
         response: Response,
+        data: Option<Data<'_>>,
+    ) -> Result<u32, Error> {
+        self.execute_published(
+            command,
+            argument,
+            response,
+            data,
+            &mut publication::Immediate,
+        )
+    }
+    pub fn execute_published(
+        &mut self,
+        command: u8,
+        argument: u32,
+        response: Response,
         mut data: Option<Data<'_>>,
+        scope: &mut dyn Publication,
     ) -> Result<u32, Error> {
         if self.failed {
             return Err(Error::Failed);
@@ -189,8 +211,8 @@ impl<R: Registers> Controller<R> {
                 return Err(Error::Invalid);
             }
         }
-        let result = self.execute_inner(command, argument, response, &mut data, shape);
-        if result.is_err() {
+        let result = self.execute_inner(command, argument, response, &mut data, shape, scope);
+        if result.as_ref().is_err_and(|error| *error != Error::Denied) {
             self.live.retire();
             self.failed = true;
         }
@@ -204,6 +226,7 @@ impl<R: Registers> Controller<R> {
         response: Response,
         data: &mut Option<Data<'_>>,
         shape: Option<(usize, u16, bool)>,
+        scope: &mut dyn Publication,
     ) -> Result<u32, Error> {
         let inhibit = PS_CMD_INHIBIT
             | if shape.is_some() || matches!(response, Response::Busy) {
@@ -244,7 +267,7 @@ impl<R: Registers> Controller<R> {
         // SDIO CMD53 never uses the memory-card auto-CMD12/CMD23 paths.
         self.io.write32(ARGUMENT, argument);
         self.io.write16(TRANSFER_MODE, mode);
-        self.io.write16(COMMAND, make_cmd(command, flags));
+        publication::issue(&mut self.io, make_cmd(command, flags), scope)?;
         self.wait(Deadline::after_us(COMMAND_TIMEOUT_US), |io| {
             Ok(Self::status(io)? & INT_RESPONSE != 0)
         })?;

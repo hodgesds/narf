@@ -164,6 +164,7 @@ pub struct Key {
     tx_pn: u64,
     receive: [ReplayWindow; 18],
     spp_amsdu: bool,
+    fragment_color: Option<fragment::KeyIdentity>,
 }
 impl core::fmt::Debug for Key {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -202,6 +203,7 @@ impl Key {
             tx_pn: 0,
             receive: [ReplayWindow { last_seen_pn: rsc }; 18],
             spp_amsdu: false,
+            fragment_color: None,
         })
     }
     /// Bind this pairwise key to a negotiated SPP A-MSDU association: both
@@ -250,6 +252,9 @@ impl Key {
         }
         if *self.tk == *tk {
             return Ok(false);
+        }
+        if let Some(color) = self.fragment_color.take() {
+            color.retire();
         }
         self.tk.zeroize();
         self.tk.copy_from_slice(tk);
@@ -623,3 +628,15 @@ mod amsdu_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "packet_key_tests.rs"]
 mod tests;
+
+/// Additive opt-in fragment crypto/cache; ordinary methods keep their strict
+/// unfragmented header contract and MLD is not admitted by these helpers.
+#[path = "packet_key_fragment.rs"]
+pub mod fragment;
+impl Drop for Key {
+    fn drop(&mut self) {
+        if let Some(color) = self.fragment_color.as_ref() {
+            color.retire();
+        }
+    }
+}

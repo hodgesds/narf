@@ -47,6 +47,8 @@ pub enum TransportError {
     BadFraming,
     /// Complete packet was not submitted; global hardware flow control is active.
     Busy,
+    /// Fixed original publication scope refused before native COMMAND.
+    Denied,
     /// The chip reported an `OVERFLOW` / `UNDERFLOW` status bit.
     ChipFlowError,
     /// Caller asked for an access wider than the transport supports.
@@ -65,6 +67,7 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TransportError::Busy => f.write_str("transport busy"),
+            TransportError::Denied => f.write_str("original native publication denied"),
             TransportError::BadFraming => f.write_str("bad framing"),
             TransportError::ChipFlowError => f.write_str("chip flow error"),
             TransportError::LengthOverflow => f.write_str("length overflow"),

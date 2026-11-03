@@ -9,7 +9,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// Nonreviving original-owner lifetime. Retirement and final copy share this
 /// fixed gate; no native waits or caller callbacks occur under its guard.
-pub(crate) struct Lifetime(IrqSafeSpinLock<bool>);
+pub(crate) struct Lifetime {
+    open: AtomicBool,
+    gate: IrqSafeSpinLock<()>,
+}
 impl core::fmt::Debug for Lifetime {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SdioOwnerLifetime").finish_non_exhaustive()
@@ -17,13 +20,22 @@ impl core::fmt::Debug for Lifetime {
 }
 impl Lifetime {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self(IrqSafeSpinLock::new(true)))
+        Arc::new(Self {
+            open: AtomicBool::new(true),
+            gate: IrqSafeSpinLock::new(()),
+        })
     }
     pub(crate) fn current(&self) -> bool {
-        *self.0.lock()
+        self.open.load(Ordering::Acquire)
     }
     pub(crate) fn retire(&self) {
-        *self.0.lock() = false;
+        let _scope = self.gate.lock();
+        self.deny();
+    }
+    /// Actual MMIO failure may occur inside its own short publication scope.
+    /// Latch permanent denial without recursively acquiring that scope gate.
+    pub(crate) fn deny(&self) {
+        self.open.store(false, Ordering::Release);
     }
 }
 
@@ -106,9 +118,11 @@ impl Source {
     /// dynamic callbacks and retains its independent role/source/RX proof.
     /// The closure must only check fixed guards and copy; no provider lookup.
     pub fn invoke<T>(&self, copy: impl FnOnce() -> T) -> Result<T, Error> {
-        let controller = self.controller.as_ref().ok_or(Error::Retired)?.0.lock();
-        let card = self.card.as_ref().ok_or(Error::Retired)?.0.lock();
-        if !*controller || !*card {
+        let controller = self.controller.as_ref().ok_or(Error::Retired)?;
+        let card = self.card.as_ref().ok_or(Error::Retired)?;
+        let _controller_scope = controller.gate.lock();
+        let _card_scope = card.gate.lock();
+        if !controller.current() || !card.current() {
             return Err(Error::Retired);
         }
         match &self.native {
@@ -118,7 +132,7 @@ impl Source {
                 live,
                 intx,
             } => {
-                let mut live = live.0.lock();
+                let _native_scope = live.gate.lock();
                 struct Operation<F>(F);
                 impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Operation<F> {
                     type Output = T;
@@ -128,7 +142,7 @@ impl Source {
                 }
                 let result = cap
                     .invoke(Operation(|| {
-                        if !*live {
+                        if !live.current() {
                             return Err(Error::Retired);
                         }
                         let identity = narf_bus::pci::read_config32(cap, device, 0)
@@ -149,24 +163,28 @@ impl Source {
                         {
                             return Err(Error::Identity);
                         }
-                        if !*live {
+                        if !live.current() {
                             return Err(Error::Retired);
                         }
-                        Ok(copy())
+                        let value = copy();
+                        if !live.current() {
+                            return Err(Error::Retired);
+                        }
+                        Ok(value)
                     }))
                     .map_err(|_| Error::Authority)
                     .and_then(|result| result);
                 if result.is_err() {
                     // Actual bad native identity/decode/current capability
                     // permanently retires the same original MMIO owner.
-                    *live = false;
+                    live.deny();
                 }
                 result
             }
             #[cfg(any(test, feature = "kernel-test"))]
             Native::Fixture(live) => {
-                let live = live.0.lock();
-                if !*live {
+                let _native_scope = live.gate.lock();
+                if !live.current() {
                     return Err(Error::Retired);
                 }
                 Ok(copy())

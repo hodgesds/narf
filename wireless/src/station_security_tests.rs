@@ -779,3 +779,6 @@ kernel_test_in!(
     "wireless/station_security",
     smoke_station_rsna_forged_m3_and_original_ap_rsne_binding
 );
+
+#[path = "station_security_fragment_tests.rs"]
+mod fragment_tests;

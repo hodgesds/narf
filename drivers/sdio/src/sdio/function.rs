@@ -24,6 +24,8 @@ pub enum SdioError {
     AddressOverflow,
     /// This adapter has no implementation for the requested transfer mode.
     Unsupported,
+    /// Fixed original scope denied before native COMMAND publication.
+    Denied,
 }
 
 impl core::fmt::Display for SdioError {
@@ -36,6 +38,7 @@ impl core::fmt::Display for SdioError {
             SdioError::NotEnabled => f.write_str("function not enabled"),
             SdioError::AddressOverflow => f.write_str("address overflow"),
             SdioError::Unsupported => f.write_str("unsupported transfer mode"),
+            SdioError::Denied => f.write_str("original publication scope retired"),
         }
     }
 }
@@ -67,6 +70,19 @@ pub trait SdioFunction {
 
     /// Issue CMD53 in byte mode — write `buf` (≤ 512 bytes).
     fn cmd53_write(&mut self, func: u8, addr: u32, buf: &[u8]) -> Result<(), SdioError>;
+
+    /// Byte-mode CMD53 write whose original fixed kernel scope encloses
+    /// actual COMMAND publication after inhibit/readiness waits. Defaults
+    /// Unsupported; a pre-call bool is no scoped native issue receipt.
+    fn cmd53_write_published(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _buf: &[u8],
+        _scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 
     /// Issue CMD53 in block mode — read `block_count` blocks into `buf`.
     fn cmd53_block_read(

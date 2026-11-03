@@ -104,6 +104,27 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   against the final copy; no hardware wait, provider callback or endpoint
   lookup runs under them. `invoke` is for fixed guard checks/copy after all
   dynamic preparation, and supplies no RF, peer, key or DATA authority.
+- `pio::Publication` is a kernel producer's fixed original scope around
+  the supplied actual COMMAND action. `Controller::execute_published` and
+  `SdioFunction::cmd53_write_published` validate bounds and finish inhibit/
+  readiness waits first. The producer must enclose exactly one action under
+  its original current authority; no socket/provider callbacks, hardware
+  waits or authority lookup run in that scope. Native Card/controller and
+  per-MMIO capability/device checks remain independently mandatory. A
+  refused scope before action entry returns `Denied` without poisoning the
+  controller or issuing COMMAND/FIFO. Entry followed by failure/duplicate
+  action is potentially issued and terminal; error handling/retirement runs
+  after scope guards release. A split frame requires a new scope for every
+  actual transfer, and an earlier accepted part cannot become retry credit.
+  Unknown adapters default to `Unsupported`. Source lifetimes use a fixed
+  retirement gate plus a nonreviving atomic terminal latch: normal retire
+  serializes against publication, while actual MMIO failure inside its own
+  short action latches denial without recursively acquiring that gate.
+- The `kernel-test` feature also enables bus ECAM fixture support. Four
+  written publication cases exercise actual NativeMmio under its original
+  scope, late original loss after readiness, attempted-command failure and
+  independently scoped complete PIO copies. They grant no AP/RF capability
+  and have not yet been executed.
 - `native::register_pci_driver` registers class 08:05:00 and 08:05:01.
   `probe` reserves each BDF once, clears inherited BME and memory decode,
   sets INTx disable and verifies all three before sizing/mapping the control

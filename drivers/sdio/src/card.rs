@@ -464,6 +464,17 @@ impl<R: Registers> Card<R> {
         block_mode: bool,
         data: Data<'_>,
     ) -> Result<(), SdioError> {
+        self.transfer_published(func, addr, increment, block_mode, data, None)
+    }
+    fn transfer_published(
+        &mut self,
+        func: u8,
+        addr: u32,
+        increment: bool,
+        block_mode: bool,
+        data: Data<'_>,
+        scope: Option<&mut dyn crate::pio::Publication>,
+    ) -> Result<(), SdioError> {
         if func == 0 || func > self.host.func_count {
             return Err(SdioError::BadFunction);
         }
@@ -495,15 +506,23 @@ impl<R: Registers> Card<R> {
             len & 511
         } as u16;
         let argument = cmd53_arg(write, func, block_mode, increment, addr, count);
-        self.controller
-            .execute(53, argument, Response::R5, Some(data))
-            .map(|_| ())
-            .map_err(map_error)
+        match scope {
+            Some(scope) => {
+                self.controller
+                    .execute_published(53, argument, Response::R5, Some(data), scope)
+            }
+            None => self
+                .controller
+                .execute(53, argument, Response::R5, Some(data)),
+        }
+        .map(|_| ())
+        .map_err(map_error)
     }
 }
 fn map_error(error: HostError) -> SdioError {
     match error {
         HostError::Card(flags) => SdioError::ResponseError(flags),
+        HostError::Denied => SdioError::Denied,
         _ => SdioError::HostError,
     }
 }
@@ -541,6 +560,26 @@ impl<R: Registers> SdioFunction for Card<R> {
                 bytes: buf,
                 block_size: size,
             },
+        )
+    }
+    fn cmd53_write_published(
+        &mut self,
+        func: u8,
+        addr: u32,
+        buf: &[u8],
+        scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        let size = u16::try_from(buf.len()).map_err(|_| SdioError::LengthOverflow)?;
+        self.transfer_published(
+            func,
+            addr,
+            true,
+            false,
+            Data::Write {
+                bytes: buf,
+                block_size: size,
+            },
+            Some(scope),
         )
     }
     fn cmd53_read_fixed(&mut self, func: u8, addr: u32, buf: &mut [u8]) -> Result<(), SdioError> {

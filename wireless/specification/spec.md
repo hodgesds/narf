@@ -1346,6 +1346,53 @@ cannot transmit More Fragments frames). A driver that implements the setter
 reports the retained value through `fragmentation_threshold()`, and a wiphy
 that reports one also advertises `SET_WIPHY`.
 
+The additive `packet_key::fragment` and `station_security::fragment` helpers
+implement explicit software fragment cryptography/protocol ownership; they
+advertise no native fragmentation or RF capability. Ordinary `Key` and
+`Security` entry points keep rejecting fragment headers. `Key::protect_fragment`
+and `unprotect_fragment` preserve the ORIGINAL More-Fragments and fragment
+number through CCMP AAD/nonce processing, retain the existing per-key/TID or
+management replay slot, and commit replay only after MIC. Group and MLD
+fragment crypto, A-MSDU/BlockAck/+HTC fragment forms remain refused.
+
+The opaque fixed `KeyIdentity` is denial-only: it exposes no key bytes,
+callbacks or install authority and cannot keep a key installed. Changed-key
+reinstall, drop and terminal `Security::fail` retire it; identical-key retries
+preserve it and PN state. `Security::transmit_ethernet_fragments` allocates and
+validates a complete bounded train before allocating one MSDU SN and a fresh
+PN per original fragment. `protect_management_fragments` uses its caller's
+one assigned management SN, PMF's management nonce and that same PTK TX PN
+namespace. `FragmentTrain` retains immutable ciphertext and its original key
+identity. Its consuming `with_durations(self, &[u16])` builder permits only
+an exact-count projection into CCMP-muted Duration/NAV with bit15 clear;
+it preserves ciphertext, PN/SN and original key identity, invokes no callback,
+and grants no RF emission. The native caller must perform actual current source/peer/profile/
+size/prefix/BA-window admission before crypto, retain bytes across Busy rather
+than regenerate PN/SN, serialize actual per-MPDU terminal ownership, and
+recheck original native/source/port/key proof at publication. Linux's threshold
+bounds plaintext header+body+FCS; CCMP overhead is added after splitting.
+Rate/NAV/descriptor sequencing, qualification and actual interface controls
+remain native responsibilities.
+
+The boxed opt-in RX cache shares FOUR total round-robin slots across plaintext
+EAPOL, protected DATA and PMF management. It keeps a two-second first-fragment
+lifetime, 4096-byte complete bound, exact TA/RA/A3/frame-type/TID/SN/next-fragment
+identity, and no group fragments. Protected fragments additionally require
+one original current key identity and consecutive PN values. Plaintext and
+protected fragments never combine, and a plaintext sequence cannot cross
+initial-key installation or a changed-key epoch. `receive_fragment_with_nonce`
+requires each ORIGINAL `RawFrame` native peer/channel/profile/CRC/copy-epoch
+proof and passes a completed frame through the SAME retained EAPOL verifier:
+plaintext reassembly never opens a data port, nonce/MIC/replay/RSN checks and
+terminal reply/key installation remain mandatory. Protected management keeps
+its retained PTK rules during rekey. `fragment_pending(now_ms)` is only a work
+observation for the native worker/LPS owner. Native association/source changes
+must retire caches; these helpers grant no source, DMA, capture, port or RF
+authority. Corrupt, foreign, timed-out, mixed-key or nonconsecutive fragments
+cannot deliver an MSDU. Exact Linux7.3-rc4 source pins and six unexecuted
+cryptographic/protocol cases accompany the source handoff; native adapters
+and physical acceptance remain separate.
+
 `TxBitrateMask` / `TxBitrateBand` carry the complete nested
 `NL80211_ATTR_TX_RATES` request: the `nl80211_band` ordinal selects one band,
 and optional legacy, ten-byte HT, eight-u16 VHT, GI, eight-u16 HE, HE-GI and

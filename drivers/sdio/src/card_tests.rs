@@ -13,6 +13,7 @@ struct State {
     refuse_commands: bool,
     hold_disabled_ready: bool,
     refuse_irq_mask: bool,
+    retire_on_ready: Option<Arc<crate::source::Lifetime>>,
 }
 impl State {
     fn set32(&mut self, a: u32, v: u32) {
@@ -65,6 +66,7 @@ impl Model {
             refuse_commands: false,
             hold_disabled_ready: false,
             refuse_irq_mask: false,
+            retire_on_ready: None,
         };
         s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
         s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
@@ -114,6 +116,11 @@ impl Registers for Model {
     }
     fn read32(&mut self, a: u32) -> u32 {
         let mut s = self.0.lock();
+        if a == PRESENT_STATE {
+            if let Some(owner) = s.retire_on_ready.take() {
+                owner.retire();
+            }
+        }
         if a == BUFFER {
             s.words.push(0x44332211);
             s.moved();
@@ -722,4 +729,130 @@ fn smoke_sdio_native_card_source_observes_actual_pio_poison_before_late_copy() -
 kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_native_card_source_observes_actual_pio_poison_before_late_copy
+);
+
+fn smoke_sdio_scoped_command_rechecks_original_after_actual_readiness_wait() -> TestResult {
+    struct Scope(crate::source::Source);
+    impl crate::pio::Publication for Scope {
+        fn publish(&mut self, action: &mut dyn FnMut()) -> Result<(), HostError> {
+            self.0.invoke(action).map_err(|_| HostError::Denied)
+        }
+    }
+    let model = Model::new();
+    let shared = model.0.clone();
+    let Ok(mut card) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("publication native card initialization");
+    };
+    if card.enable_func(2).is_err() {
+        return TestResult::Fail("publication F2 enable");
+    }
+    let mut scope = Scope(SdioFunction::source(&card).unwrap());
+    let before = shared.lock().commands.len();
+    shared.lock().retire_on_ready = Some(card.live.clone());
+    if card.cmd53_write_published(2, 0x8000, &[1; 4], &mut scope) != Err(SdioError::Denied)
+        || shared.lock().commands.len() != before
+        || !shared.lock().words.is_empty()
+        || card.controller.is_failed()
+    {
+        return TestResult::Fail(
+            "late original retirement published COMMAND/FIFO or forged issued failure",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_scoped_command_rechecks_original_after_actual_readiness_wait
+);
+
+fn smoke_sdio_scoped_command_issued_scope_failure_keeps_original_native_owner_terminal(
+) -> TestResult {
+    struct Scope(crate::source::Source);
+    impl crate::pio::Publication for Scope {
+        fn publish(&mut self, action: &mut dyn FnMut()) -> Result<(), HostError> {
+            self.0.invoke(action).map_err(|_| HostError::Denied)?;
+            Err(HostError::Denied)
+        }
+    }
+    let model = Model::new();
+    let shared = model.0.clone();
+    let Ok(mut card) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("issued publication native card init");
+    };
+    if card.enable_func(2).is_err() {
+        return TestResult::Fail("issued publication F2 enable");
+    }
+    let original = SdioFunction::source(&card).unwrap();
+    let mut scope = Scope(original.clone());
+    let before = shared.lock().commands.len();
+    if card
+        .cmd53_write_published(2, 0x8000, &[1; 4], &mut scope)
+        .is_ok()
+        || shared.lock().commands.len() != before + 1
+        || !card.controller.is_failed()
+        || original.current().is_ok()
+        || !shared.lock().words.is_empty()
+    {
+        return TestResult::Fail(
+            "entered COMMAND became unissued retry/credit or live original source",
+        );
+    }
+    let before = shared.lock().commands.len();
+    if card.cmd53_write(2, 0x8000, &[2; 4]).is_ok() || shared.lock().commands.len() != before {
+        return TestResult::Fail(
+            "uncertain issued native command replayed after terminal scope loss",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_scoped_command_issued_scope_failure_keeps_original_native_owner_terminal
+);
+
+fn smoke_sdio_scoped_command_actual_copy_and_each_command_scope_stay_distinct() -> TestResult {
+    struct Scope {
+        original: crate::source::Source,
+        count: u32,
+    }
+    impl crate::pio::Publication for Scope {
+        fn publish(&mut self, action: &mut dyn FnMut()) -> Result<(), HostError> {
+            self.original
+                .invoke(action)
+                .map_err(|_| HostError::Denied)?;
+            self.count += 1;
+            Ok(())
+        }
+    }
+    let model = Model::new();
+    let shared = model.0.clone();
+    let Ok(mut card) = Card::initialize(model, Config::default()) else {
+        return TestResult::Fail("copy publication native card init");
+    };
+    if card.enable_func(2).is_err() {
+        return TestResult::Fail("copy publication F2 enable");
+    }
+    let mut scope = Scope {
+        original: SdioFunction::source(&card).unwrap(),
+        count: 0,
+    };
+    for (address, word) in [(0x8000, 0x11223344u32), (0x8200, 0x55667788)] {
+        if card
+            .cmd53_write_published(2, address, &word.to_le_bytes(), &mut scope)
+            .is_err()
+        {
+            return TestResult::Fail("actual scoped CMD53 copy failed");
+        }
+    }
+    if scope.count != 2
+        || shared.lock().words != [0x11223344, 0x55667788]
+        || scope.original.current().is_err()
+    {
+        return TestResult::Fail("split native command reused one scope or invented PIO copy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_scoped_command_actual_copy_and_each_command_scope_stay_distinct
 );

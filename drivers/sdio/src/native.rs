@@ -50,7 +50,7 @@ impl Drop for Mmio {
 }
 impl Mmio {
     fn close(&mut self) {
-        self.source_live.retire();
+        self.source_live.deny();
         self.gone = true;
     }
     fn access<T>(
@@ -523,6 +523,10 @@ fn bind_intx(device: &BusDevice, authority: &Cap<BusDeviceCap, Write>) -> Option
 fn bind_intx(_: &BusDevice, _: &Cap<BusDeviceCap, Write>) -> Option<Bound> {
     None
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "native_publication_tests.rs"]
+mod publication_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {

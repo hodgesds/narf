@@ -28,7 +28,7 @@ narf-time         = { path = "../../time" }
 narf-scheduler    = { path = "../../scheduler" }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-bus/kernel-test"]
 
 [lints]
 workspace = true

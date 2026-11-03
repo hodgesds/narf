@@ -101,6 +101,7 @@ pub struct Security {
     /// EtherType Protocol Discrimination framing (`JoinPlan::epd()`).
     epd: bool,
     mld: Option<Box<crate::association::mlo::Context>>,
+    fragment_rx: Option<Box<fragment::Receive>>,
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -355,6 +356,7 @@ impl Security {
             igtk: crate::mfp::MfpKeyStore::new(),
             epd: false,
             mld: None,
+            fragment_rx: None,
         })
     }
     /// Frame MSDUs with EtherType Protocol Discrimination (IEEE802.11-2020
@@ -440,6 +442,12 @@ impl Security {
     pub fn fail(&mut self) {
         self.failed = true;
         self.established = false;
+        if let Some(cache) = self.fragment_rx.as_mut() {
+            cache.clear();
+        }
+        if let Some(pair) = self.pair.as_ref() {
+            pair.key.retire_fragment_identity();
+        }
     }
     pub fn pending_frame(&self) -> Option<&[u8]> {
         if self.failed {
@@ -620,6 +628,14 @@ impl Security {
         let Some(frame) = self.normalize(mpdu)? else {
             return Ok(Rx::Ignored);
         };
+        self.receive_normalized(frame, protected, fresh_snonce)
+    }
+    fn receive_normalized(
+        &mut self,
+        frame: Vec<u8>,
+        protected: bool,
+        fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
+    ) -> Result<Rx, Error> {
         let offset = if frame[0] == 0x88 { 26 } else { 24 };
         let Some((ethertype, header)) = self.msdu_type(&frame[offset..]) else {
             return Ok(Rx::Ignored);
@@ -1017,6 +1033,15 @@ impl Security {
         }
         let mld = self.mld.as_deref().copied();
         if let Some(material) = pending.change.pair {
+            if self
+                .pair
+                .as_ref()
+                .is_none_or(|old| *old.material != *material)
+            {
+                if let Some(cache) = self.fragment_rx.as_mut() {
+                    cache.clear();
+                }
+            }
             if let Some(old) = &mut self.pair {
                 if *old.material == *material {
                     old.key.reinstall(&material, 0).map_err(Error::Crypto)?;
@@ -1232,3 +1257,6 @@ impl Drop for Security {
 #[cfg(feature = "kernel-test")]
 #[path = "station_security_tests.rs"]
 mod tests;
+
+#[path = "station_security_fragment.rs"]
+pub mod fragment;

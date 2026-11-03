@@ -61,6 +61,7 @@ fn map_err(e: SdioError) -> TransportError {
         SdioError::NotEnabled => TransportError::NotReady,
         SdioError::AddressOverflow => TransportError::AddressOverflow,
         SdioError::Unsupported => TransportError::NotReady,
+        SdioError::Denied => TransportError::Denied,
     }
 }
 
