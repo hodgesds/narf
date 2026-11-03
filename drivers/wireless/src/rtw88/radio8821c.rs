@@ -26,18 +26,42 @@ const TXAGC: [u16; 8] = [
 ];
 /// rtw8821c_set_tx_power_index_by_rate packs four source rate indices per
 /// word at RF-A1d00. C22's reference/difference registers are unrelated.
+/// RF-A RF18 bits under mask 0x70fff that Linux `rtw8821c_set_channel_rf`
+/// programs: band (2.4GHz 0, 5GHz bits 16|8), channel byte, RFSI (bit17 on
+/// 100..=140, bit18 above 140) and BW (20MHz bits 11:10 = 3, 40MHz bit11,
+/// 80MHz bit10). `channel` is the RF center; `bw_mhz` other than 40/80 is 20.
+pub(super) const fn rf18_for(channel: u8, bw_mhz: u8) -> u32 {
+    let band = if channel <= 14 { 0 } else { 1 << 16 | 1 << 8 };
+    let rfsi = if channel >= 100 && channel <= 140 {
+        1 << 17
+    } else if channel > 140 {
+        1 << 18
+    } else {
+        0
+    };
+    let bw = match bw_mhz {
+        40 => 1 << 11,
+        80 => 1 << 10,
+        _ => 3 << 10,
+    };
+    band | rfsi | bw | channel as u32
+}
+/// `channel` is the committed 20MHz primary whose RF18 the retune (or the
+/// channel-1 base program) left in place.
 pub(super) fn operating_readback(
     read: impl FnMut(u16) -> Result<u32, Error>,
     indices: [u8; 12],
+    channel: u8,
 ) -> Result<(), Error> {
-    operating_readback_ht(read, indices, [0; 8])
+    operating_readback_ht(read, indices, [0; 8], channel)
 }
 pub(super) fn operating_readback_ht(
     read: impl FnMut(u16) -> Result<u32, Error>,
     indices: [u8; 12],
     mcs: [u8; 8],
+    channel: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, 0xc01)
+    operating_readback_rf18(read, indices, mcs, rf18_for(channel, 20))
 }
 /// [`operating_readback_ht`] at the N2xB 40MHz pair: HT words are the HT40
 /// selection and RF18 is BW40 (bit11) on the center channel.
@@ -47,7 +71,7 @@ pub(super) fn operating_readback_wide(
     mcs: [u8; 8],
     center: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, 0x800 | u32::from(center))
+    operating_readback_rf18(read, indices, mcs, rf18_for(center, 40))
 }
 fn operating_readback_rf18(
     mut read: impl FnMut(u16) -> Result<u32, Error>,
@@ -204,7 +228,7 @@ async fn channel(
         return Err(Error::Gone);
     }
     io.write8(0x454, cck & !0x80)?;
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | 0xc01;
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(1, 20);
     mask(io, 0x1080, 1 << 16, 1)?;
     mask(io, 0, 1 << 26, 1)?;
     let btg = matches!(phy.rfe, 2 | 4);
@@ -234,7 +258,7 @@ pub(super) async fn retune_channel(io: &mut impl Io, ch: u8) -> Result<(), Error
     if !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | 0xc00 | u32::from(ch);
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(ch, 20);
     rf(io, 0xdf, 1 << 6, 1).await?;
     rf(io, 0x64, 15, 15).await?;
     rf(io, 0x18, 0xfffff, rf18).await?;
@@ -268,7 +292,7 @@ pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
         return Err(Error::Gone);
     }
     io.write8(0x454, cck & !0x80)?;
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | 0x800 | u32::from(center);
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(center, 40);
     rf(io, 0xdf, 1 << 6, 1).await?;
     rf(io, 0x64, 15, 15).await?;
     rf(io, 0x18, 0xfffff, rf18).await?;
@@ -286,7 +310,7 @@ pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
 }
 /// Readback of [`width40`].
 pub(super) fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != 0x800 | u32::from(center)
+    if rf_read(io, 0x18)? & 0x70fff != rf18_for(center, 40)
         || (read(io, 0xa00)? >> 4) & 1 != u32::from(sc == 1)
         || read(io, 0x8ac)? & (!0xff3ff300 | 0x20020000) != 0x20020000 | u32::from(sc) << 2 | 1
         || read(io, 0x8c4)? & (1 << 30) == 0
@@ -321,7 +345,7 @@ pub(super) fn write_txagc(io: &mut impl Io, indices: [u8; 12]) -> Result<(), Err
     Ok(())
 }
 pub(super) fn verify_retune(io: &mut impl Io, ch: u8, indices: [u8; 12]) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != 0xc00 | u32::from(ch) {
+    if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20) {
         return Err(Error::Prerequisite);
     }
     for (slot, reg) in TXAGC.into_iter().enumerate() {
@@ -353,7 +377,7 @@ fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> 
     Ok(())
 }
 fn verify_geometry(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != 0xc01
+    if rf_read(io, 0x18)? & 0x70fff != rf18_for(1, 20)
         || read(io, 0xc1c)? >> 21 != u32::from(swing)
         || read(io, 0x8ac)? & (!0xffcffc00 | 0x10010000) != 0x10010000
         || read(io, 0xcb8)? & 0xf50000 != if btg { 0x10000 } else { 0x700000 }

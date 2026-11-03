@@ -888,12 +888,12 @@ unsafe impl Registers for Native {
             let wide = self.committed_ht40()?;
             return g.readback_at(|r| self.read32(r), wide.as_ref());
         }
-        if let Some(indices) = self
+        if let Some((indices, channel)) = self
             .packet_gate
             .as_ref()
-            .and_then(super::power_policy::Gate::c21_indices)
+            .and_then(|g| Some((g.c21_indices()?, g.channel())))
         {
-            return super::radio8821c::operating_readback(|r| self.read32(r), indices);
+            return super::radio8821c::operating_readback(|r| self.read32(r), indices, channel);
         }
         let gains = self
             .packet_gate

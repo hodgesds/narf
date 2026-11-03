@@ -628,6 +628,7 @@ impl Grant {
                 read,
                 self.facts.legacy,
                 self.tracking_indices(),
+                self.channel(),
             );
         }
         if self.two_streams()

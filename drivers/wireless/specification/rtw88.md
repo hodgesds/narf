@@ -2191,7 +2191,18 @@ legacy CCK1 profile; with continuation programs bound it disconnects. Three new 
 unexecuted at the time of writing:
 `smoke_rtw88_channel_policy_linux_groups_bb_rf_and_probe_ds`,
 `smoke_rtw88_channel_record_admission_and_regulatory_span`,
-`smoke_rtw8821ce_retune_txagc_and_rf18_readback`.
+`smoke_rtw8821ce_retune_txagc_and_rf18_readback`,
+`smoke_rtw8821ce_operating_readback_rf18_tracks_primary`.
+
+C21 RF18 expectations come from one helper, `radio8821c::rf18_for(channel,
+bw)` (`rtw8821c_set_channel_rf`: band, RFSI, BW and channel byte under mask
+0x70fff). The post-program operating readbacks
+(`station_profile_readback` -> `radio8821c::operating_readback{,_ht}`, used
+after the legacy/HT20 programs and by `ht::Grant::readback`) take the
+committed primary (`Gate::channel` / `ht::Grant::channel`), so an HT20 or
+legacy program on a noninitial primary checks that primary's RF18, not
+channel 1's 0xc01. Only the initial channel-1 IQK bring-up and its
+`verify_geometry` stay pinned to channel 1.
 
 ### RTL8822CE Wake-on-WLAN source layer (`wow.rs`) — not advertised
 

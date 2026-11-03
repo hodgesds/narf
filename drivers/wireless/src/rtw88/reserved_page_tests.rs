@@ -1176,14 +1176,14 @@ unsafe impl Registers for Port {
         if let Some(g) = ht {
             return g.readback(|r| self.read32(r));
         }
-        let indices = self
+        let (indices, channel) = self
             .0
             .lock()
             .station_gate
             .as_ref()
-            .and_then(crate::rtw88::power_policy::Gate::c21_indices)
+            .and_then(|g| Some((g.c21_indices()?, g.channel())))
             .ok_or(Error::Unsupported)?;
-        crate::rtw88::radio8821c::operating_readback(|r| self.read32(r), indices)
+        crate::rtw88::radio8821c::operating_readback(|r| self.read32(r), indices, channel)
     }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.station_allowed()?;

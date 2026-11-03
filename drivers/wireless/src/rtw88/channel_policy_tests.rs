@@ -188,6 +188,44 @@ kernel_test_in!(
     smoke_rtw8821ce_retune_txagc_and_rf18_readback
 );
 
+fn smoke_rtw8821ce_operating_readback_rf18_tracks_primary() -> TestResult {
+    // rtw8821c_set_channel_rf: band | RFSI | BW | channel under 0x70fff.
+    if radio8821c::rf18_for(1, 20) != 0xc01
+        || radio8821c::rf18_for(6, 20) != 0xc06
+        || radio8821c::rf18_for(6, 40) != 0x806
+        || radio8821c::rf18_for(36, 20) != 0x10d24
+        || radio8821c::rf18_for(100, 20) != 0x30d64
+        || radio8821c::rf18_for(149, 20) != 0x50d95
+        || radio8821c::rf18_for(42, 80) != 0x1052a
+    {
+        return TestResult::Fail("C21 RF18 encoding differs from rtw8821c_set_channel_rf");
+    }
+    let indices = [30, 30, 30, 30, 28, 28, 28, 28, 26, 26, 26, 26];
+    let mcs = [24; 8];
+    let mut io = RadioIo::new();
+    let setup = (|| {
+        io.write32(0x2860, 0xc06)?;
+        radio8821c::write_txagc(&mut io, indices)?;
+        io.write32(0x1d0c, u32::from_le_bytes([24; 4]))?;
+        io.write32(0x1d10, u32::from_le_bytes([24; 4]))
+    })();
+    if setup.is_err() {
+        return TestResult::Fail("C21 operating fixture rejected");
+    }
+    let mut read = |r: u16| io.read32(r);
+    if radio8821c::operating_readback_ht(&mut read, indices, mcs, 6).is_err() {
+        return TestResult::Fail("C21 HT20 readback refused the committed noninitial primary");
+    }
+    if radio8821c::operating_readback_ht(&mut read, indices, mcs, 1).is_ok() {
+        return TestResult::Fail("C21 HT20 readback accepted channel 1 RF18 on channel 6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw8821ce_operating_readback_rf18_tracks_primary
+);
+
 fn smoke_rtw88_channel_scoped_filenames_and_group_ht_ceilings() -> TestResult {
     // Channel-scoped continuation records never share a channel-1 name.
     let base = "rtw88/rtw8822ce-ht20-v1-001122334455.bin";
