@@ -47,7 +47,10 @@ point.**
   DRD flags, cable speed/type/current, PCIe/DP/TBT3/host-present
   flags, strict on reserved field values.
 - **`tcpc`** — `Tcpc` trait: `set_role`, `cc_status`, `transmit`,
-  `receive`, `hard_reset`. CcState/PortRole enums.
+  `receive`, `hard_reset`. CcState/PortRole enums. SOP*-targeted
+  I/O via `transmit_sop` / `receive_sop` plus `SopTarget` (Sop /
+  SopPrime / SopDoublePrime); the defaults delegate SOP to
+  `transmit` / `receive` and report `Unsupported` for SOP' / SOP''.
 - **`tcpm`** — Sink-role policy-engine state machine
   (Unattached → AttachWait → Attached → Startup → Discovery →
   WaitCaps → EvaluateCaps → SelectCapability → TransitionSink →
@@ -83,6 +86,12 @@ point.**
     support flag, VBUS-through-cable flag).
   - `discover_identity_request_objects` builder for the 1-DWORD
     Discover Identity request that targets a cable plug.
+  - Production driving lives in `drivers/usbpd::cable_discovery`
+    (#1215): a per-port state machine sends Discover Identity to
+    SOP' once the TCPM contract is live (and to SOP'' when an
+    active near plug reports SOP'' support) and exposes the
+    decoded `CableIdentity` to policy and connection-manager
+    layers.
 
 ### Out of scope (deliberate)
 - Thunderbolt Alt Mode (Intel-specific spec, not in this crate's

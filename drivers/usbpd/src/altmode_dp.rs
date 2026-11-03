@@ -190,7 +190,14 @@ impl DpAltModePort {
     /// One Discovery step. Caller drives this from a poll loop.
     pub fn step(&self, cap: &Cap<UsbPd, Grant>) -> Result<DpAltStep, DpAltError> {
         cap.invoke(NoopOp)?;
-        if !self.port.contract_live() {
+        // RX arbitration (#1215): the TCPC RX FIFO has one consumer.
+        // DP discovery must not pop frames while cable discovery is
+        // still awaiting its SOP' / SOP'' answer, or a cable ACK
+        // would be fed to the DP state machine as partner identity
+        // (and vice versa). A connector with no cable port
+        // registered counts as settled, so this can never block DP
+        // on a missing cable task.
+        if !self.port.contract_live() || !crate::cable_discovery::settled_for(self.connector) {
             return Ok(DpAltStep::NotReady);
         }
 

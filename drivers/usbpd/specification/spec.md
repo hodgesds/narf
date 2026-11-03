@@ -65,6 +65,16 @@ exists to avoid competing with firmware for the same controller.
   supply carry across the swap. Sink swap answers are policy-gated by
   the `SinkPolicy` accept flags, wired into the sink engine at
   `TcpmPort` construction (default: reject all).
+- `cable_discovery::CableDiscoveryPort` drives SOP' / SOP'' cable discovery
+  from a live TCPM port: Discover Identity to SOP' post-contract, chaining to
+  SOP'' for an active near plug reporting SOP'' support, with terminal states
+  Done / NotPresent / Failed / Unsupported. Ports are registered in
+  `CABLE_DISCOVERY_PORTS`; `cable_identity()` exposes the decoded
+  `CableIdentity` (near plug plus far plug when obtained) and detach clears
+  it. DP Alt Mode discovery waits for `settled_for(connector)` so the two
+  post-contract discovery tasks never race on the single TCPC RX FIFO.
+  TCPCs with no SOP* transmit path (e.g. firmware-mediated TPS65987) settle
+  as Unsupported.
 
 ## 4. Invariants
 
