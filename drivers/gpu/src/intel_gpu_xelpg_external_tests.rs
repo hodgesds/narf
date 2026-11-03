@@ -891,3 +891,230 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_service_hotplug_lifecycle
 );
+
+// ── DC-state join: the real pass bracket over the display-14 DC core ─────
+
+/// One `DcUser::External` reference taken on `core` and released at `now`
+/// on drop, as the DC service's `DcRef` does; the release deadline is kept.
+struct DcPass<'a> {
+    core: &'a narf_lib::sync::IrqSafeSpinLock<crate::intel_gpu_dc_states::DcCore>,
+    now: u64,
+    released: &'a Cell<Option<u64>>,
+}
+
+impl Drop for DcPass<'_> {
+    fn drop(&mut self) {
+        let due = self
+            .core
+            .lock()
+            .put(crate::intel_gpu_dc_states::DcUser::External, self.now);
+        self.released.set(due);
+    }
+}
+
+/// The DC core on the same register model as the route, past probe with
+/// the MTL DMC program loaded and DC6 entered.
+fn dc6_core(
+    io: &impl MmioWindow,
+) -> Option<narf_lib::sync::IrqSafeSpinLock<crate::intel_gpu_dc_states::DcCore>> {
+    use crate::intel_gpu_dc_states::{
+        publication_step, ArmGates, DcCore, DcUser, DC_STATE_EN_UPTO_DC6, XELPDP_ALLOWED_DC_MASK,
+    };
+    let core = narf_lib::sync::IrqSafeSpinLock::new(DcCore::new(XELPDP_ALLOWED_DC_MASK));
+    {
+        let mut c = core.lock();
+        c.sanitize(io).ok()?;
+        c.get(io, DcUser::Init).ok()?;
+    }
+    let due = publication_step(&core, io, 0, crate::intel_gpu_dc_states::tests::firmware)?;
+    let armed = core.lock().arm_if_due(io, due, ArmGates::default());
+    (armed == Ok(DC_STATE_EN_UPTO_DC6)).then_some(core)
+}
+
+/// Drops every `DC_STATE_EN` write: a DC exit that never sticks.
+struct DcNeverSticks<'a>(&'a ExtFake);
+
+impl MmioWindow for DcNeverSticks<'_> {
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+    fn read32(&self, off: u64) -> u32 {
+        self.0.read32(off)
+    }
+    fn write32(&self, off: u64, value: u32) {
+        if off != crate::intel_gpu_dmc::DC_STATE_EN {
+            self.0.write32(off, value);
+        }
+    }
+}
+
+fn smoke_mtl_external_dc_off_join_brackets_passes_and_blocks_dc6_while_live() -> TestResult {
+    use crate::intel_gpu_dc_states::{
+        ArmBlock, ArmGates, DcUser, DC_REENABLE_DELAY_NS, DC_STATE_EN_UPTO_DC6,
+    };
+    use crate::intel_gpu_dmc::DC_STATE_EN;
+    const MS: u64 = 1_000_000;
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(core) = dc6_core(&io) else {
+        return TestResult::Fail("the DC core must load the program and enter DC6");
+    };
+    let released = Cell::new(None);
+    let pass = |now: u64| {
+        let (core, io, released) = (&core, &io, &released);
+        move || {
+            core.lock().get(io, DcUser::External).map(|()| DcPass {
+                core,
+                now,
+                released,
+            })
+        }
+    };
+    let gates = |service: &MtlExternalService| ArmGates {
+        external_route_active: service_blocks_dc(service),
+    };
+    let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+    let mut service = MtlExternalService::new();
+
+    // Plug-in: the hotplug pass exits DC6 before its first register write,
+    // then the service pass lights the route.
+    io.writes.borrow_mut().clear();
+    let Ok(Some(event)) = pass_bracket(pass(10 * MS), || monitor.poll(&io)) else {
+        return TestResult::Fail("the DP-alt sink must be detected inside a pass");
+    };
+    if io.writes.borrow().first() != Some(&(DC_STATE_EN, 0)) {
+        return TestResult::Fail("DC exit must precede the pass's first register write");
+    }
+    match pass_bracket(pass(20 * MS), || service.handle(&io, event, &mut fb_for)) {
+        Ok(ServiceOutcome::Activated {
+            port: XeLpgPort::Tc1,
+            ..
+        }) => {}
+        _ => return TestResult::Fail("the connect pass must activate the TC1 route"),
+    }
+    let Some(due) = released.get() else {
+        return TestResult::Fail("the last pass reference must schedule re-entry");
+    };
+    // Between passes the live route refuses re-entry and writes nothing.
+    let before = io.writes.borrow().len();
+    if core.lock().arm_if_due(&io, due, gates(&service)) != Err(ArmBlock::ExternalRoute)
+        || io.writes.borrow().len() != before
+    {
+        return TestResult::Fail("a live external route must refuse DC6 without a write");
+    }
+
+    // Unplug: the stop pass withdraws the route; DC6 re-enters 17 ms after
+    // that pass releases, not before.
+    io.pica_isr.set(0);
+    io.phy.write32(
+        port_hotplug_ctl(0),
+        io.phy.read32(port_hotplug_ctl(0)) | DP_ALT_HPD_LONG_DETECT,
+    );
+    let event = match pass_bracket(pass(30 * MS), || monitor.poll(&io)) {
+        Ok(Some(event)) if event.kind == MtlHpdKind::Disconnected => event,
+        _ => return TestResult::Fail("the unplug must be reported inside a pass"),
+    };
+    match pass_bracket(pass(40 * MS), || service.handle(&io, event, &mut fb_for)) {
+        Ok(ServiceOutcome::Withdrawn {
+            port: XeLpgPort::Tc1,
+        }) => {}
+        _ => return TestResult::Fail("the disconnect pass must withdraw the route"),
+    }
+    let stopped = 40 * MS + DC_REENABLE_DELAY_NS;
+    if released.get() != Some(stopped)
+        || core.lock().arm_if_due(&io, stopped - 1, gates(&service))
+            != Err(ArmBlock::NotDue(stopped))
+        || core.lock().arm_if_due(&io, stopped, gates(&service)) != Ok(DC_STATE_EN_UPTO_DC6)
+    {
+        return TestResult::Fail("DC6 must re-enter 17 ms after the verified stop");
+    }
+    if !service.teardown(&io) || !monitor.teardown(&io) {
+        return TestResult::Fail("teardown must report a complete withdrawal");
+    }
+
+    // A quarantined route keeps DC6 refused.
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(core) = dc6_core(&io) else {
+        return TestResult::Fail("the second DC core must enter DC6");
+    };
+    let pass = |now: u64| {
+        let (core, io, released) = (&core, &io, &released);
+        move || {
+            core.lock().get(io, DcUser::External).map(|()| DcPass {
+                core,
+                now,
+                released,
+            })
+        }
+    };
+    let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+    let mut service = MtlExternalService::new();
+    let Ok(Some(event)) = pass_bracket(pass(10 * MS), || monitor.poll(&io)) else {
+        return TestResult::Fail("the second sink must be detected");
+    };
+    if !matches!(
+        pass_bracket(pass(20 * MS), || service.handle(&io, event, &mut fb_for)),
+        Ok(ServiceOutcome::Activated { .. })
+    ) {
+        return TestResult::Fail("the second route must activate");
+    }
+    io.pipeconf_stuck.set(true);
+    io.pica_isr.set(0);
+    io.phy.write32(
+        port_hotplug_ctl(0),
+        io.phy.read32(port_hotplug_ctl(0)) | DP_ALT_HPD_LONG_DETECT,
+    );
+    let Ok(Some(event)) = pass_bracket(pass(30 * MS), || monitor.poll(&io)) else {
+        return TestResult::Fail("the second unplug must be reported");
+    };
+    if !matches!(
+        pass_bracket(pass(40 * MS), || service.handle(&io, event, &mut fb_for)),
+        Ok(ServiceOutcome::Retained { .. })
+    ) || service.route().map(MtlExternalRoute::state) != Some(RouteState::Quarantined)
+    {
+        return TestResult::Fail("an unobserved stop must quarantine the route");
+    }
+    let Some(due) = released.get() else {
+        return TestResult::Fail("the quarantining pass must release its reference");
+    };
+    if core.lock().arm_if_due(&io, due, gates(&service)) != Err(ArmBlock::ExternalRoute) {
+        return TestResult::Fail("a quarantined route must keep DC6 refused");
+    }
+
+    // A DC exit that never sticks refuses the pass before it runs: no route
+    // register is touched.
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let Some(core) = dc6_core(&io) else {
+        return TestResult::Fail("the third DC core must enter DC6");
+    };
+    let stuck = DcNeverSticks(&io);
+    io.writes.borrow_mut().clear();
+    let mut ran = false;
+    let refused = pass_bracket(
+        || {
+            core.lock().get(&stuck, DcUser::External).map(|()| DcPass {
+                core: &core,
+                now: 10 * MS,
+                released: &released,
+            })
+        },
+        || ran = true,
+    );
+    if refused.is_ok() || ran || !io.writes.borrow().is_empty() {
+        return TestResult::Fail("a failed DC exit must refuse the pass and touch nothing");
+    }
+
+    // Production wiring with no display-14 DC service (this kernel): the
+    // bracket is inert, and the registered predicate reads an idle service.
+    let previous =
+        crate::intel_gpu_dc_states::register_external_live(Some(external_route_blocks_dc));
+    let live = crate::intel_gpu_dc_states::external_live();
+    let _ = crate::intel_gpu_dc_states::register_external_live(previous);
+    if live || with_dc_off(|| 7) != Ok(7) {
+        return TestResult::Fail("an idle service must not block DC and the bracket must run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dc_off_join_brackets_passes_and_blocks_dc6_while_live
+);

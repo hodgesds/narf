@@ -1032,4 +1032,4 @@ pub(crate) fn suspend_finish_for_bar(bar: &narf_bus::MmioRegion, prepared: bool)
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_dc_states_tests.rs"]
-mod tests;
+pub(crate) mod tests;

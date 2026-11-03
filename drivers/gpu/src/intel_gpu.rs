@@ -1410,6 +1410,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if let Some(console) = kms_console {
         crate::intel_gpu_kms::install(card_index, kms_generation, gt_bar, device, cap, console);
     }
+    // Display-14 DC service: an MTL external route that stays live or
+    // quarantined between hotplug passes keeps DC5/DC6 re-entry refused.
+    if kms_generation == Generation::MeteorLake {
+        crate::intel_gpu_dc_states::register_external_live(Some(
+            crate::intel_gpu_xelpg_external::external_route_blocks_dc,
+        ));
+    }
     // A retained firmware scanout has not granted us its GGTT reservation.
     // Start automatically only after this driver owns the integrated scanout.
     let guc_owned = if owns_scanout {

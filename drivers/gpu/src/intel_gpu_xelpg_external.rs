@@ -157,6 +157,8 @@ pub enum ExternalError {
     AccessLost,
     /// The route could not be locally stopped and stays quarantined.
     Quarantined,
+    /// Display DC states could not be exited; nothing was touched.
+    DisplayPower,
 }
 
 impl From<TcError> for ExternalError {
@@ -967,13 +969,44 @@ static SERVICE: narf_lib::mutex::Mutex<MtlExternalService> =
 
 /// DC-off bracket for every hardware touch of the MTL external route:
 /// hotplug service, Type-C connect/disconnect, probe, activate, stop and
-/// teardown all run inside it. Display DC5/DC6 must be exited before these
-/// registers are touched. The DC-state reference service is integrated
-/// separately; until it is joined this bracket runs `f` directly, and the
-/// integration replaces the body with a DC_off reference held for the
-/// duration of `f` (user kind: external output).
-fn with_dc_off<R>(f: impl FnOnce() -> R) -> R {
-    f()
+/// teardown all run inside it. One `DcUser::External` reference exits
+/// DC5/DC6 before `f` and is released when `f` returns. A route that stays
+/// live between passes keeps DC5/DC6 refused through
+/// [`external_route_blocks_dc`], registered with the DC service.
+fn with_dc_off<R>(f: impl FnOnce() -> R) -> Result<R, ExternalError> {
+    pass_bracket(
+        || crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::External),
+        f,
+    )
+}
+
+/// The bracket itself: `f` runs only after `acquire` returned its guard,
+/// which is dropped after `f` returns. A refused acquisition runs nothing.
+/// Never call it from interrupt context.
+pub(crate) fn pass_bracket<G, E, R>(
+    acquire: impl FnOnce() -> Result<G, E>,
+    f: impl FnOnce() -> R,
+) -> Result<R, ExternalError> {
+    let _power = acquire().map_err(|_| ExternalError::DisplayPower)?;
+    Ok(f())
+}
+
+/// Whether `service`'s route keeps display DC5/DC6 refused between passes:
+/// any route that is not locally stopped (live or quarantined).
+pub(crate) fn service_blocks_dc(service: &MtlExternalService) -> bool {
+    service
+        .route()
+        .is_some_and(|route| route.state() != RouteState::Stopped)
+}
+
+/// The process-wide predicate registered with the DC service
+/// (`route_live() || !routes_stopped()`): a live or quarantined route, or a
+/// service pass in progress, refuses DC5/DC6 re-entry. Never touches
+/// registers or blocks.
+pub fn external_route_blocks_dc() -> bool {
+    SERVICE
+        .try_lock()
+        .is_none_or(|service| service_blocks_dc(&service))
 }
 
 /// Act on one hotplug event with the process-wide service. `None` when a
@@ -984,7 +1017,11 @@ pub fn handle_mtl_event<M: MmioWindow + ?Sized>(
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
     let mut service = SERVICE.try_lock()?;
-    Some(with_dc_off(|| service.handle(io, event, alloc)))
+    let port = event.pin.port();
+    Some(
+        with_dc_off(|| service.handle(io, event, alloc))
+            .unwrap_or_else(|error| ServiceOutcome::Refused { port, error }),
+    )
 }
 
 /// Poll the process-wide MTL hotplug owner once (inside the DC-off
@@ -997,6 +1034,8 @@ pub fn poll_mtl_event<M: MmioWindow + ?Sized>(
         return None;
     }
     with_dc_off(|| crate::intel_gpu_xelpg_hpd::poll_hpd_event(io, generation))
+        .ok()
+        .flatten()
 }
 
 /// Process-wide entry for the display runtime: poll the MTL hotplug owner
@@ -1047,6 +1086,7 @@ pub fn teardown_mtl_external<M: MmioWindow + ?Sized>(io: &M, generation: Generat
         let hpd = crate::intel_gpu_xelpg_hpd::teardown_hpd(io, generation);
         route && hpd
     })
+    .unwrap_or(false)
 }
 
 /// The pin an external port's hotplug arrives on.

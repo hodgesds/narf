@@ -122,7 +122,9 @@ fn mtl_container(payload: &[u32]) -> Vec<u8> {
     blob
 }
 
-fn firmware() -> Result<Arc<Vec<u8>>, DcRefusal> {
+/// A loadable display-14 container (also used by the external-route join
+/// fixture in `intel_gpu_xelpg_external`).
+pub(crate) fn firmware() -> Result<Arc<Vec<u8>>, DcRefusal> {
     Ok(Arc::new(mtl_container(&[0xD0C0_0001, 0xD0C0_0002])))
 }
 
