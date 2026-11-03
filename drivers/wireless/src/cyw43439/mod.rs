@@ -126,6 +126,29 @@ pub const CYW43439_SDIO_DEVICE: u16 = 0xA9AF;
 /// SDHCI host entry. Firmware initialization precedes network publication.
 pub fn register() {
     bootstrap::register();
+    // Linux `brcmf_sdio_pm_ops`: the bus suspend/resume and the
+    // cfg80211 WoWL exchange are command/interrupt driven, so they run in
+    // the async phase before the interrupt-gated device fan-out.
+    narf_power::system_pm::register_async_system_pm(
+        "cyw43439-sdio",
+        alloc::sync::Arc::new(SdioSystemPm),
+    );
+}
+
+struct SdioSystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SdioSystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async { interface::suspend_sdio().await.map_err(sdio_pm_error) })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async { interface::resume_sdio().await.map_err(sdio_pm_error) })
+    }
+}
+fn sdio_pm_error(error: runtime::Error) -> narf_power::device_pm::DevicePmError {
+    match error {
+        runtime::Error::Busy => narf_power::device_pm::DevicePmError::Busy,
+        _ => narf_power::device_pm::DevicePmError::DriverError,
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

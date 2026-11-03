@@ -277,6 +277,31 @@ pub async fn resume_pcie() -> Result<(), Error> {
         None => Ok(()),
     }
 }
+/// System-suspend prepare for the attached SDIO FullMAC owner (CYW43439),
+/// if any: Linux `brcmf_cfg80211_suspend` (WoWL armed when configured and
+/// offered, else `brcmf_link_down`), then the bus suspend
+/// (`brcmf_ops_sdio_suspend` keep-power branch, `sdio_pm.rs`).
+pub async fn suspend_sdio() -> Result<(), Error> {
+    let active = ACTIVE_SDIO.lock().clone();
+    match active {
+        Some(active) => active.suspend().await,
+        None => Ok(()),
+    }
+}
+/// Paired resume for [`suspend_sdio`] (`brcmf_ops_sdio_resume`, then
+/// `brcmf_cfg80211_resume` reporting the WoWL wake reason).
+pub async fn resume_sdio() -> Result<(), Error> {
+    let active = ACTIVE_SDIO.lock().clone();
+    match active {
+        Some(active) => active.resume().await,
+        None => Ok(()),
+    }
+}
+/// The firmware wake report of the attached SDIO owner's last WoWL resume
+/// (see [`last_wowlan_wakeup_pcie`]).
+pub fn last_wowlan_wakeup_sdio() -> Option<super::station::wowl::Wakeup> {
+    ACTIVE_SDIO.lock().clone()?.wowlan_wakeup()
+}
 static ACTIVE_SDIO: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
 static ACTIVE_PCIE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
 fn active_slot(family: Family) -> &'static IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> {

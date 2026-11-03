@@ -276,7 +276,10 @@ impl<R: Fullmac> Station<R> {
         self.checked_var(grants, &[], "wowl_activate", &1u32.to_le_bytes())
             .await?;
         self.checked_var(grants, &[], "mkeep_alive", &keep_alive())
-            .await
+            .await?;
+        // brcmf_configure_wowl ends with brcmf_bus_wowl_config(true).
+        self.runtime.wowl_config(true);
+        Ok(())
     }
 
     /// `brcmf_cfg80211_resume` with `wowl.active`: the firmware wake
@@ -288,6 +291,8 @@ impl<R: Fullmac> Station<R> {
         let Some(armed) = self.wowl_armed.take() else {
             return Ok(None);
         };
+        // brcmf_cfg80211_resume: brcmf_bus_wowl_config(false).
+        self.runtime.wowl_config(false);
         let wake = match get_var(&mut self.runtime, "wowl_wakeind", WAKEIND_LEN).await {
             Ok(reply) => decode_wakeind(&reply),
             Err(error) => Err(error),

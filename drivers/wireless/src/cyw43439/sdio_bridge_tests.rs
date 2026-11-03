@@ -6,6 +6,8 @@ use alloc::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 const CORE: u32 = 0x18011000;
+#[path = "sdio_pm_tests.rs"]
+mod pm;
 #[path = "sdio_stop_tests.rs"]
 mod stop;
 #[derive(Default)]
@@ -31,6 +33,10 @@ struct Host {
     held_word: Option<u32>,
     retired: Option<Retirement>,
     regs: BTreeMap<(u8, u32), u8>,
+    /// Host PM grant, the held suspend flags and a card that loses power.
+    pm_caps: narf_drivers_sdio::PmFlags,
+    pm_suspended: Option<narf_drivers_sdio::PmFlags>,
+    pm_lost: bool,
 }
 struct Retirement(alloc::sync::Arc<core::sync::atomic::AtomicUsize>);
 impl Drop for Retirement {
@@ -86,7 +92,34 @@ impl SdioFunction for Host {
     fn rearm_card_interrupt(&mut self) {
         self.rearmed += 1;
     }
+    fn host_pm_caps(&mut self) -> narf_drivers_sdio::PmFlags {
+        if self.line {
+            self.pm_caps
+        } else {
+            self.pm_caps
+                .without(narf_drivers_sdio::PmFlags::WAKE_SDIO_IRQ)
+        }
+    }
+    fn suspend_host(&mut self, flags: narf_drivers_sdio::PmFlags) -> Result<(), SdioError> {
+        if self.pm_suspended.is_some() {
+            return Err(SdioError::Busy);
+        }
+        if !self.host_pm_caps().contains(flags) {
+            return Err(SdioError::Unsupported);
+        }
+        self.pm_suspended = Some(flags);
+        Ok(())
+    }
+    fn resume_host(&mut self) -> Result<(), SdioError> {
+        if self.pm_suspended.take().is_none() || self.pm_lost {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
+    }
     fn cmd52_read(&mut self, f: u8, a: u32) -> Result<u8, SdioError> {
+        if self.pm_suspended.is_some() {
+            return Err(SdioError::Busy);
+        }
         self.ops.push((52, f, a, 0));
         if !self.sleep_model {
             return Ok(0);
@@ -99,6 +132,9 @@ impl SdioFunction for Host {
         })
     }
     fn cmd52_write(&mut self, f: u8, a: u32, v: u8) -> Result<(), SdioError> {
+        if self.pm_suspended.is_some() {
+            return Err(SdioError::Busy);
+        }
         self.ops.push((52, f, a, 1));
         if self.stop_model && (f, a) == (0, 2) {
             self.regs.insert((0, 3), v);

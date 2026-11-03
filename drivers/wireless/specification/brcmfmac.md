@@ -790,12 +790,16 @@ and `PerDomain` map/unmap return `NotMapped`.
 ### Wake-on-WLAN and GTK rekey offload (BCM43602)
 
 Shared FullMAC owner `cyw43439/station_wowl.rs` (`Station::wowl_*`),
-mirroring Linux 7.3-rc4 brcmfmac `feature.c`/`cfg80211.c`:
+mirroring Linux 7.3-rc4 brcmfmac `feature.c`/`cfg80211.c`; programming ends
+with `Fullmac::wowl_config(true)` and resume calls `wowl_config(false)`
+(`brcmf_bus_wowl_config`; a no-op on PCIe):
 
 - Probe (`brcmf_feat_attach`): only when the bus reports
   `wowl_supported` — `Fullmac::wowl_supported`, on PCIe
   `runtime::Bus::pme_d3hot`, i.e. `pci_pme_capable(pdev, PCI_D3hot)`
-  (PCI PM capability `PMC.PME_Support` bit for D3hot) — does
+  (PCI PM capability `PMC.PME_Support` bit for D3hot); on CYW43439 SDIO
+  host `MMC_PM_KEEP_POWER` + `MMC_PM_WAKE_SDIO_IRQ` (`cyw43439.md` "SDIO
+  system suspend/resume and Wake-on-WLAN") — does
   `Station::initialize` read `wowl` (`BRCMF_FEAT_WOWL`) and `wowl_cap`
   (`BRCMF_FEAT_WOWL_ARP_ND`; `BRCMF_WOWL_GTK_FAILURE` -> `WOWL_GTK`,
   `BRCMF_WOWL_PFN_FOUND` -> `WOWL_ND`). A firmware error on either leaves

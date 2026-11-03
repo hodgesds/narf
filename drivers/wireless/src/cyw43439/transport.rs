@@ -182,6 +182,24 @@ pub trait PacketTransport: Transport + Send {
 
     /// A service pass found no work (`brcmf_sdio_bus_watchdog` idle path).
     fn idle(&mut self) {}
+
+    /// System suspend of the bus with the dongle kept powered (Linux
+    /// `brcmf_ops_sdio_suspend` keep-power branch). `wake`: WoWL is armed
+    /// (`sdiodev->wowl_enabled`) and the bus must let the dongle wake the
+    /// host. Buses that cannot keep the dongle powered refuse.
+    fn suspend(&mut self, _wake: bool) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
+    /// Paired resume (`brcmf_ops_sdio_resume`). An error is terminal.
+    fn resume(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
+    /// Linux `bus_if->wowl_supported` (`sdio.c::brcmf_sdio_probe_attach`).
+    fn wowl_supported(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

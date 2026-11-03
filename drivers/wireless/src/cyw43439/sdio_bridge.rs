@@ -16,6 +16,8 @@ use super::{chipclk, sdio};
 
 #[path = "sdio_ap_packet.rs"]
 mod ap_packet;
+#[path = "sdio_pm.rs"]
+mod pm;
 #[path = "sdio_stop.rs"]
 mod stop;
 
@@ -84,6 +86,8 @@ pub struct SdioTransport<F: SdioFunction> {
     interrupt: Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>>,
     /// Save-restore idle dongle sleep (`brcmf_sdio_bus_sleep`), when enabled.
     sleep: Option<Sleep>,
+    /// System suspend held (`sdio_pm.rs`); the FIFO is not touched.
+    suspended: Option<pm::Suspended>,
 }
 
 /// `bus->sleeping` plus the watchdog idle accounting.
@@ -135,6 +139,7 @@ impl<F: SdioFunction> SdioTransport<F> {
             stopped: false,
             interrupt: None,
             sleep: None,
+            suspended: None,
         }
     }
     pub(crate) fn qualify(
@@ -567,11 +572,20 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
     fn confirmed_stop(&mut self) -> Result<(), TransportError> {
         SdioTransport::confirmed_stop(self)
     }
+    fn suspend(&mut self, wake: bool) -> Result<(), TransportError> {
+        SdioTransport::suspend_bus(self, wake)
+    }
+    fn resume(&mut self) -> Result<(), TransportError> {
+        SdioTransport::resume_bus(self)
+    }
+    fn wowl_supported(&mut self) -> bool {
+        SdioTransport::wowl_supported(self)
+    }
     fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
         self.interrupt.clone()
     }
     fn interrupt_serviced(&mut self) {
-        if self.interrupt.is_some() && !self.failed {
+        if self.interrupt.is_some() && !self.failed && self.suspended.is_none() {
             self.func.rearm_card_interrupt();
         }
     }
@@ -581,7 +595,11 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
         let Some(sleep) = self.sleep else {
             return;
         };
-        if self.failed || sleep.asleep || now_ms().saturating_sub(sleep.active_ms) < IDLE_MS {
+        if self.failed
+            || self.suspended.is_some()
+            || sleep.asleep
+            || now_ms().saturating_sub(sleep.active_ms) < IDLE_MS
+        {
             return;
         }
         if self.enter_sleep().is_err() {
@@ -591,6 +609,9 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
     fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
         if self.failed {
             return Err(TransportError::NotReady);
+        }
+        if self.suspended.is_some() {
+            return Ok(0);
         }
         // A sleeping dongle raises a card interrupt when it has work; the
         // backstop timer alone must not wake it.
@@ -613,6 +634,9 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
     fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError> {
         if self.failed {
             return Err(TransportError::NotReady);
+        }
+        if self.suspended.is_some() {
+            return Err(TransportError::Busy);
         }
         if packet.len() < 12 || packet.len() > super::runtime::MAX_PACKET || packet.len() % 4 != 0 {
             return Err(TransportError::LengthOverflow);

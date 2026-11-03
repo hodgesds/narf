@@ -274,6 +274,11 @@ pub trait Fullmac: Send {
     fn wowl_supported(&mut self) -> bool {
         false
     }
+    /// Linux `brcmf_bus_wowl_config`: WoWL was armed (`true`, end of
+    /// `brcmf_configure_wowl`) or disarmed (`brcmf_cfg80211_resume`); the
+    /// next [`Self::suspend_transport`] keeps a bus wake path. Buses whose
+    /// suspend does not depend on it ignore it.
+    fn wowl_config(&mut self, _enabled: bool) {}
     /// Bus-match firmware vendor (Linux `bus_if->fwvid`).
     fn firmware_vendor(&self) -> FirmwareVendor {
         FirmwareVendor::Wcc
@@ -342,6 +347,18 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     }
     async fn stop_transport(&mut self) -> Result<(), Error> {
         Runtime::stop_transport(self)
+    }
+    async fn suspend_transport(&mut self) -> Result<(), Error> {
+        Runtime::suspend_transport(self).await
+    }
+    async fn resume_transport(&mut self) -> Result<(), Error> {
+        Runtime::resume_transport(self).await
+    }
+    fn wowl_supported(&mut self) -> bool {
+        Runtime::wowl_supported(self)
+    }
+    fn wowl_config(&mut self, enabled: bool) {
+        Runtime::wowl_config(self, enabled)
     }
     fn release_transport(&mut self) -> bool {
         Runtime::release_transport(self)

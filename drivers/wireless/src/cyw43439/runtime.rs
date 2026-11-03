@@ -16,6 +16,8 @@ const RECEIVE_BUDGET: usize = 16;
 
 #[path = "runtime_ap.rs"]
 mod ap;
+#[path = "runtime_pm.rs"]
+mod pm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -73,6 +75,10 @@ pub struct Runtime<T: PacketTransport> {
     vif: crate::brcmfmac::vif_demux::Demux,
     failed: bool,
     vendor: super::fullmac::FirmwareVendor,
+    /// The bus is system-suspended (`runtime_pm.rs`): no FIFO access.
+    suspended: bool,
+    /// Linux `sdiodev->wowl_enabled` (`brcmf_bus_wowl_config`).
+    wowl_enabled: bool,
 }
 impl<T: PacketTransport> Drop for Runtime<T> {
     fn drop(&mut self) {
@@ -119,6 +125,8 @@ impl<T: PacketTransport> Runtime<T> {
             vif: crate::brcmfmac::vif_demux::Demux::new(),
             failed: false,
             vendor: super::fullmac::FirmwareVendor::Wcc,
+            suspended: false,
+            wowl_enabled: false,
         }
     }
 
@@ -208,6 +216,10 @@ impl<T: PacketTransport> Runtime<T> {
     pub fn poll(&mut self) -> Result<usize, Error> {
         if self.failed {
             return Err(Error::Failed);
+        }
+        if self.suspended {
+            // brcmf_sdiod_freezer: the DPC does not run while suspended.
+            return Ok(0);
         }
         let result = self.poll_inner();
         if result.is_err() {
@@ -421,7 +433,7 @@ impl<T: PacketTransport> Runtime<T> {
         if self.failed {
             return Err(Error::Failed);
         }
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.suspended {
             return Err(Error::Busy);
         }
         if payload.len() > MAX_CONTROL_INPUT || maximum > MAX_CONTROL {
@@ -603,6 +615,9 @@ impl<T: PacketTransport> Runtime<T> {
         priority: u8,
         original: Option<&crate::brcmfmac::ap_scope::Capture>,
     ) -> Result<(), Error> {
+        if self.suspended {
+            return Err(Error::Busy);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
