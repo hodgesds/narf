@@ -75,6 +75,9 @@ pub(in super::super) struct State {
     /// `bss_conf->use_short_preamble` / `use_short_slot` as last programmed
     /// at association, for beacon `BSS_CHANGED_ERP_*` updates.
     pub(in super::super) erp_timing: Option<(bool, bool)>,
+    /// `mac->min_space_cfg` (`_rtl_pci_init_struct`: 0), the
+    /// `HW_VAR_AMPDU_MIN_SPACE` / `_SHORTGI_DENSITY` cache.
+    pub(in super::super) min_space_cfg: u8,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -87,6 +90,7 @@ impl State {
             false_alarm: ps::FalseAlarm::default(),
             receive_config: None,
             erp_timing: None,
+            min_space_cfg: 0,
         }
     }
 }

@@ -1091,6 +1091,44 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .rtl8821ae_power
                 .is_some_and(|p| super::super::rtl8821ae::ht::admitted(&p))
     }
+    /// RTL8192CE / 8188CE: the current `N92C` permission admits the HT
+    /// station (every MCS0-7 rate holds a measured index).
+    pub(crate) fn rtl8192ce_ht(&self) -> bool {
+        self.chip == super::Chip::Rtl8192ce
+            && self
+                .rtl8192ce_power
+                .is_some_and(|p| super::super::rtl8192ce::ht::admitted(&p))
+    }
+    /// RTL8192CE / 8188CE local HT20 PHY for beacon observation and
+    /// scanning (`rtl8192ce::ht::local` at the board's RF type).
+    pub(crate) fn rtl8192ce_local_ht20(&self) -> Option<association::phy::LocalPhy> {
+        let p = self.rtl8192ce_power?;
+        Some(super::super::rtl8192ce::ht::local(
+            p.rf_type(),
+            false,
+            super::super::rtl8192ce::ht::two_stream(&p),
+        ))
+    }
+    /// RTL8192CE / 8188CE: the host-API capability bits
+    /// (`rtl8192ce::ht::host_capabilities`) of the staged `N92C` envelope
+    /// under current host policy; 0 for every other chip, without an
+    /// envelope or without a regulatory domain.
+    pub(crate) fn station_rtl8192ce_host_caps(&self, environment: &impl Environment) -> u8 {
+        if self.chip != super::Chip::Rtl8192ce {
+            return 0;
+        }
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ce())
+        else {
+            return 0;
+        };
+        environment.domain().map_or(0, |domain| {
+            super::super::rtl8192ce::ht::host_capabilities(base, &domain)
+        })
+    }
     /// RTL8192EE: the current `N92E` permission admits the HT station
     /// (every MCS0-7 rate holds a measured index on both paths, so the
     /// `rtl92ee_update_hal_rate_mask` one-stream rows stay admitted).
@@ -1956,10 +1994,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let has_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
             .map_err(|_| Error::Profile)?
             .is_some();
-        let mut plan = if (self.station.ht.is_some() || self.rtl8821ae_ht() || self.rtl8192ee_ht())
+        let mut plan = if (self.station.ht.is_some()
+            || self.rtl8821ae_ht()
+            || self.rtl8192ee_ht()
+            || self.rtl8192ce_ht())
             && has_wmm
         {
-            let phy = if self.chip == super::Chip::Rtl8192ee {
+            let phy = if self.chip == super::Chip::Rtl8192ce {
+                let wide = self.rtl8192ce_wide(&candidate, environment)?;
+                let two = self.rtl8192ce_two_stream(wide.as_ref().map(|(_, p)| p), environment)?;
+                let rf = self.rtl8192ce_power.ok_or(Error::State)?.rf_type();
+                super::super::rtl8192ce::ht::local(rf, wide.is_some(), two)
+            } else if self.chip == super::Chip::Rtl8192ee {
                 let wide = self.rtl8192ee_wide(&candidate, environment)?;
                 let two = self.rtl8192ee_two_stream(wide.as_ref().map(|(_, p)| p), environment)?;
                 super::super::rtl8192ee::ht::local(wide.is_some(), two)
@@ -2025,6 +2071,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.retune_rtl8821ae(width, eighty, environment).await?;
             } else if self.chip == super::Chip::Rtl8192ee {
                 self.retune_rtl8192ee(width, environment).await?;
+            } else if self.chip == super::Chip::Rtl8192ce {
+                self.retune_rtl8192ce(width, environment).await?;
             } else {
                 self.select_station_width(width, environment).await?;
             }
@@ -2103,6 +2151,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         self.retune_rtl8821ae(width, eighty, environment).await?;
                     } else if self.chip == super::Chip::Rtl8192ee {
                         self.retune_rtl8192ee(width, environment).await?;
+                    } else if self.chip == super::Chip::Rtl8192ce {
+                        self.retune_rtl8192ce(width, environment).await?;
                     } else {
                         self.select_station_width(width, environment).await?;
                     }
@@ -2228,10 +2278,36 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             })?;
                             self.check_station_policy(environment)?;
                             self.packet.ht = true;
+                        } else if self.chip == super::Chip::Rtl8192ce {
+                            // `rtl_op_bss_info_changed(BSS_CHANGED_HT)`:
+                            // `HW_VAR_SHORTGI_DENSITY`, `_AMPDU_FACTOR` and
+                            // `_AMPDU_MIN_SPACE` (`rtl8192ce::ht::timing`);
+                            // the HT SIFS came with `mac->mode` at peer
+                            // preparation.
+                            if !self.rtl8192ce_ht() {
+                                return Err(Error::Profile);
+                            }
+                            let mut min_space = self.packet.ce92.min_space_cfg;
+                            self.station_publication(environment, || {
+                                super::super::rtl8192ce::ht::timing(
+                                    &self.io,
+                                    &mut min_space,
+                                    profile.peer_ampdu_factor(),
+                                    profile.peer_mpdu_density(),
+                                )
+                            })?;
+                            self.packet.ce92.min_space_cfg = min_space;
+                            self.check_station_policy(environment)?;
+                            self.packet.ht = true;
                         }
                     }
                     if self.station.ht_profile.is_some()
-                        && !matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee)
+                        && !matches!(
+                            self.chip,
+                            super::Chip::Rtl8821ae
+                                | super::Chip::Rtl8192ee
+                                | super::Chip::Rtl8192ce
+                        )
                     {
                         let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
                         let timing = || super::super::station_control::ht_timing(&self.io);
@@ -2485,6 +2561,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.rtl8192ee_power
                         .is_some_and(|p| super::super::rtl8192ee::ht::two_stream(&p)),
                 ))
+            } else if self.rtl8192ce_ht() {
+                self.rtl8192ce_local_ht20()
             } else {
                 None
             };
@@ -3094,11 +3172,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(sent)
     }
     /// `rtl92ce_update_hal_rate_mask(sta, level)` (`update_rate_tbl`) for
-    /// the 2.4 GHz legacy peer: `supp_rates[0]` = the association's legacy
-    /// intersection, `mac->mode` B when it is at most `0xf`, else G (Linux
-    /// `rtl_op_bss_info_changed`), `mac->bw_40` = the programmed 40 MHz
-    /// width. An HT profile is refused until the CE HT station is admitted.
-    /// The mask must be a non-empty subset of the current `N92C`
+    /// the 2.4 GHz peer: `supp_rates[0]` = the association's legacy
+    /// intersection, `wireless_mode` B when it is at most `0xf`, else G, or
+    /// N_24G for an HT profile (`rx_mask` = mac80211's intersected TX MCS
+    /// set, SGI where both sides support it; refused unless the permission
+    /// admits HT), `mac->bw_40` = the programmed 40 MHz width. The mask must be a non-empty subset of the current `N92C`
     /// permission's admitted rates; it is installed inside the envelope's
     /// current authority.
     async fn install_rtl8192ce_station_rate_mask(
@@ -3109,20 +3187,26 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<(), Error> {
         use super::super::rtl8192ce::h2c;
         let permission = self.rtl8192ce_power.ok_or(Error::State)?;
-        if self.station.ht_profile.is_some() {
+        let ht = self.station.ht_profile;
+        if ht.is_some() && !super::super::rtl8192ce::ht::admitted(&permission) {
             return Err(Error::Profile);
         }
         let supp = rates & 0xfff;
+        // `rtl_op_sta_add` `wireless_mode`: B for `supp_rates[0] <= 0xf`,
+        // else G; N_24G for an HT peer, whose `rx_mask` is mac80211's
+        // intersected TX MCS set (bounded by `rtl8192ce::ht::capability`).
         let peer = h2c::Peer {
-            mode: if supp <= 0xf {
+            mode: if ht.is_some() {
+                h2c::WirelessMode::N24
+            } else if supp <= 0xf {
                 h2c::WirelessMode::B
             } else {
                 h2c::WirelessMode::G
             },
             supp_rates: u32::from(supp),
-            rx_mask: [0; 2],
-            sgi20: false,
-            sgi40: false,
+            rx_mask: ht.map_or([0; 2], |p| [p.tx_mcs()[0], p.tx_mcs()[1]]),
+            sgi20: ht.is_some_and(|p| p.tx_sgi20()),
+            sgi40: ht.is_some_and(|p| p.tx_sgi40()),
         };
         let bw40 = self.packet.width.is_some();
         let admitted = permission.admitted_rates() as u32;

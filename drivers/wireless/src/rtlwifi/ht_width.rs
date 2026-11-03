@@ -397,6 +397,148 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.width = width;
         self.check_station_policy(environment)
     }
+    /// RTL8192CE / RTL8188CE: the `N92C` 40 MHz permission for the AP's
+    /// offered HT40 geometry (as [`Self::rtl8192ee_wide`]), when the
+    /// envelope admits HT there.
+    pub(super) fn rtl8192ce_wide(
+        &self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<
+        Option<(
+            super::super::super::ht::Geometry,
+            super::super::super::rtl8192ce::envelope::Permission,
+        )>,
+        Error,
+    > {
+        use super::super::super::rtl8192ce::{
+            envelope::{Operating, Width},
+            ht,
+        };
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ce())
+        else {
+            return Ok(None);
+        };
+        let two = self.rtl8192ce_power.is_some_and(|p| ht::two_stream(&p));
+        let offer = association::phy::Offer::from_elements(
+            ht::local(base.rf_type(), true, two),
+            &candidate.bss.information_elements,
+            candidate.bss.channel,
+        )
+        .map_err(Error::Management)?;
+        let Some(offer) = offer else {
+            return Ok(None);
+        };
+        let Ok(Some(g)) = Self::offered_width(offer.width(), offer.ht().operation()) else {
+            return Ok(None);
+        };
+        if g.primary() >= 36 {
+            return Ok(None);
+        }
+        let op = Operating {
+            width: if g.prime() == 1 {
+                Width::W40Above
+            } else {
+                Width::W40Below
+            },
+            channel: g.primary(),
+        };
+        Ok(base
+            .permission_for(&environment.domain()?, op)
+            .ok()
+            .filter(ht::admitted)
+            .map(|p| (g, p)))
+    }
+    /// RTL8192CE local TX MCS selection (`rtl8192ce::ht::capability`):
+    /// MCS8-15 only on a 2T2R board whose `N92C` permissions at 20 MHz on
+    /// the provisioned primary and, when offered, at 40 MHz admit every
+    /// two-stream rate on both paths.
+    pub(super) fn rtl8192ce_two_stream(
+        &self,
+        wide: Option<&super::super::super::rtl8192ce::envelope::Permission>,
+        environment: &impl Environment,
+    ) -> Result<bool, Error> {
+        use super::super::super::rtl8192ce::{envelope::Operating, ht::two_stream};
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ce())
+        else {
+            return Ok(false);
+        };
+        let channel = self.rtl8192ce_power.ok_or(Error::State)?.channel();
+        let narrow = base
+            .permission_for(&environment.domain()?, Operating::twenty(channel))
+            .ok();
+        Ok(narrow.as_ref().is_some_and(two_stream) && wide.is_none_or(two_stream))
+    }
+    /// RTL8192CE / RTL8188CE `rtl_op_config` channel/width change on the
+    /// running owner, as [`Self::retune_rtl8192ee`]: the `N92C` permission
+    /// for the target operating point (`width` 40 MHz on the provisioned
+    /// primary, else 20 MHz) is re-derived under current host policy, then
+    /// `Prepared::configure_rtl8192ce_channel` (`rtl92c_phy_sw_chnl` at the
+    /// wide channel with the admitted per-path indices, then
+    /// `rtl92ce_phy_set_bw_mode`) runs inside that permission's authority.
+    /// No frame may be outstanding; the old receive epoch is retired. A
+    /// failure leaves the owner failed.
+    pub(super) async fn retune_rtl8192ce(
+        &mut self,
+        width: Option<super::super::super::ht::Geometry>,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8192ce::envelope::{Operating, Width};
+        let current = self.rtl8192ce_power.ok_or(Error::State)?;
+        let channel = current.channel();
+        let op = match width {
+            None => Operating::twenty(channel),
+            Some(g) if g.primary() == channel => Operating {
+                width: if g.prime() == 1 {
+                    Width::W40Above
+                } else {
+                    Width::W40Below
+                },
+                channel,
+            },
+            Some(_) => return Err(Error::Profile),
+        };
+        if current.operating() == op && self.packet.width == width {
+            return Ok(());
+        }
+        if !self.transmit_ready()
+            || self.station.pending.is_some()
+            || !matches!(self.station.phase, Phase::Joining | Phase::Configuring)
+        {
+            return Err(Error::State);
+        }
+        self.check_station_policy(environment)?;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ce())
+            .ok_or(Error::Profile)?
+            .clone();
+        let permission = base
+            .permission_for(&environment.domain()?, op)
+            .map_err(|e| Error::Radio(RadioError::Power(e)))?;
+        if width.is_some() && !super::super::super::rtl8192ce::ht::admitted(&permission) {
+            return Err(Error::Profile);
+        }
+        self.station.retire_receive();
+        let owner = &mut *self;
+        super::super::super::station_power::wait_rtl8192ce(base, permission, environment, async {
+            owner.io.authority(true, || Ok(()))?;
+            owner.configure_rtl8192ce_channel(permission).await
+        })
+        .await?;
+        self.packet.width = width;
+        self.check_station_policy(environment)
+    }
     pub(super) async fn select_station_width(
         &mut self,
         width: Option<Geometry>,

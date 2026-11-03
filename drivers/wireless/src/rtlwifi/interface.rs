@@ -79,6 +79,9 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     rtl8821ae_caps: AtomicU8,
     /// RTL8192EE `rtl8192ee::ht::host_capabilities` bits (0 otherwise).
     rtl8192ee_caps: AtomicU8,
+    /// RTL8192CE / 8188CE `rtl8192ce::ht::host_capabilities` bits (0
+    /// otherwise).
+    rtl8192ce_caps: AtomicU8,
     rts_threshold: AtomicU32,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
@@ -209,6 +212,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn rtl8192ee_host_ht(&self) -> bool {
         self.rtl8192ee_caps.load(Ordering::Acquire) & super::rtl8192ee::ht::HOST_HT_2G != 0
     }
+    /// The RTL8192CE / 8188CE envelope publishes 2.4 GHz HT.
+    fn rtl8192ce_host_ht(&self) -> bool {
+        self.rtl8192ce_caps.load(Ordering::Acquire) & super::rtl8192ce::ht::HOST_HT_2G != 0
+    }
     pub(crate) fn configured_rts_threshold(&self) -> Option<u16> {
         u16::try_from(self.rts_threshold.load(Ordering::Acquire)).ok()
     }
@@ -218,6 +225,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         self.ht40.store(false, Ordering::Release);
         self.rtl8821ae_caps.store(0, Ordering::Release);
         self.rtl8192ee_caps.store(0, Ordering::Release);
+        self.rtl8192ce_caps.store(0, Ordering::Release);
         *self.rx.lock() = None;
         self.update_link(None);
     }
@@ -253,6 +261,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             ht40: AtomicBool::new(false),
             rtl8821ae_caps: AtomicU8::new(0),
             rtl8192ee_caps: AtomicU8::new(0),
+            rtl8192ce_caps: AtomicU8::new(0),
             rts_threshold: AtomicU32::new(u32::MAX),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
@@ -372,6 +381,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             );
             self.rtl8192ee_caps.store(
                 owner.station_rtl8192ee_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ce_caps.store(
+                owner.station_rtl8192ce_host_caps(&self.environment),
                 Ordering::Release,
             );
             owner.start_station_service(&self.environment).await?;
@@ -1033,7 +1046,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             hw_caps: HwCaps {
                 ht_supported: self.ht.load(Ordering::Acquire)
                     || self.rtl8821ae_host_ht()
-                    || self.rtl8192ee_host_ht(),
+                    || self.rtl8192ee_host_ht()
+                    || self.rtl8192ce_host_ht(),
                 vht_supported,
                 he_supported: false,
                 eht_supported: false,
@@ -1059,6 +1073,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if band_listed && self.rtl8192ee_host_ht() {
             return super::rtl8192ee::ht::host_phy(
                 self.rtl8192ee_caps.load(Ordering::Acquire),
+                band,
+            );
+        }
+        // RTL8192CE / 8188CE: 2.4 GHz HT from the `N92C` envelope's
+        // admitted points at the board's RF type.
+        if band_listed && self.rtl8192ce_host_ht() {
+            return super::rtl8192ce::ht::host_phy(
+                self.rtl8192ce_caps.load(Ordering::Acquire),
                 band,
             );
         }
@@ -1192,6 +1214,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             );
             self.rtl8192ee_caps.store(
                 owner.station_rtl8192ee_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ce_caps.store(
+                owner.station_rtl8192ce_host_caps(&self.environment),
                 Ordering::Release,
             );
         }

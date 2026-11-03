@@ -220,3 +220,60 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ce",
     smoke_rtl8192ce_station_registers
 );
+
+/// `_rtl_init_hw_ht_capab` per RF type (RX MCS0-7 on 1T1R, MCS0-15 on
+/// 2T2R; the 20/40 form only when asked), `BSS_CHANGED_HT`
+/// (`HW_VAR_SHORTGI_DENSITY`, `regtoset_normal` lowered to the peer factor,
+/// `HW_VAR_AMPDU_MIN_SPACE` density 7) and `BSS_CHANGED_ERP_*`.
+fn smoke_rtl8192ce_ht_capability_timing_and_erp() -> TestResult {
+    use super::ht;
+    use super::station as hw;
+    use super::version::RfType;
+    let one = ht::capability(RfType::T1R1, false, true).capability_body();
+    let two = ht::capability(RfType::T2R2, true, true).capability_body();
+    let cap = |b: &[u8; 26]| u16::from_le_bytes([b[0], b[1]]);
+    if one[3] != 0xff
+        || one[4] != 0
+        || cap(&one) & 0x0002 != 0
+        || cap(&one) & 0x0020 == 0
+        || two[3] != 0xff
+        || two[4] != 0xff
+        || cap(&two) & 0x0042 != 0x0042
+        || cap(&two) & 0x1000 == 0
+        || one[2] & 0x1f != 0x1f
+    {
+        return TestResult::Fail("92CE / 88CE HT capability per RF type");
+    }
+    let io = Fake::new();
+    let mut min_space = 0u8;
+    if ht::timing(&io, &mut min_space, 0, 0).is_err() || min_space != 7 {
+        return TestResult::Fail("BSS_CHANGED_HT timing");
+    }
+    {
+        let g = io.0.lock();
+        let r = |a: u16| g.regs[usize::from(a)];
+        if [0u16, 1, 2, 3].map(|i| r(ht::REG_AGGLEN_LMT + i)) != [0x41, 0x44, 0x42, 0x44]
+            || r(ht::REG_AMPDU_MIN_SPACE) != 7
+        {
+            return TestResult::Fail("AGGLEN_LMT / AMPDU_MIN_SPACE");
+        }
+    }
+    if ht::timing(&io, &mut min_space, 3, 7).is_err()
+        || [0u16, 1, 2, 3].map(|i| io.0.lock().regs[usize::from(ht::REG_AGGLEN_LMT + i)])
+            != [0x41, 0xa8, 0x72, 0xb9]
+    {
+        return TestResult::Fail("64K factor keeps regtoset_normal");
+    }
+    if hw::erp_changed(&io, (false, false), (true, true), 1).is_err() {
+        return TestResult::Fail("erp_changed");
+    }
+    let g = io.0.lock();
+    if g.regs[usize::from(hw::REG_RRSR + 2)] != 0xa0 || g.regs[usize::from(hw::REG_SLOT)] != 9 {
+        return TestResult::Fail("ERP preamble / slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_ht_capability_timing_and_erp
+);
