@@ -7,14 +7,16 @@
 //! `rtw89_btc_ntfy_conn_rfk`, RX DCK, IQK, 30ms BT preserve, TSSI, 30ms,
 //! DPK, `rtw89_fw_h2c_rf_ntfy_mcc` V0 body).
 //!
-//! `__rtw89_set_channel`'s `rtw89_chip_set_txpwr` (C power tables) and the
-//! band-change `rtw8852c_tssi_scan` are not part of this owner; no native
-//! caller composes them yet.
+//! `Channel::set_channel` is core.c `__rtw89_set_channel` for this owner:
+//! help enter, `rtw8852c_set_channel`, `rtw8852c_set_txpwr`
+//! (`radio_power_c::Plan`), help exit, then on a band change (or the first
+//! programmed channel, Linux `!entity_active`) `rtw89_btc_ntfy_switch_band`
+//! and `rtw8852c_rfk_band_changed` (`rtw8852c_tssi_scan`).
 use super::super::{
     channel_c,
     factory_c::Calibration,
     operating_channel_c::{Band, Profile, Width},
-    power,
+    power, radio_power_c,
 };
 use super::{
     c_dpk::Dpk,
@@ -276,6 +278,11 @@ pub(in super::super) struct Channel {
     tssi_mode: [bool; 2],
     /// `rtwdev->btc.cx.wl.rfk_info.con_rfk` (state only; no I/O).
     conn_rfk: bool,
+    /// Band of the last completed `set_channel` (`None` = Linux
+    /// `!rtw89_get_entity_state(PHY_0)`).
+    band: Option<Band>,
+    /// Whether the last `set_channel` ran `rtw8852c_tssi_scan`.
+    scanned: bool,
     iqk: Iqk,
     tssi: Tssi,
     dpk: Dpk,
@@ -294,6 +301,10 @@ impl Channel {
     pub fn tssi_mode(&self) -> [bool; 2] {
         self.tssi_mode
     }
+    /// Whether the last channel program ran the band-change TSSI scan.
+    pub fn scanned(&self) -> bool {
+        self.scanned
+    }
     pub fn iqk(&self) -> &Iqk {
         &self.iqk
     }
@@ -311,29 +322,38 @@ impl Channel {
         Ok(())
     }
 
-    /// rtw8852c.c `rtw8852c_set_channel_help(enter)`,
-    /// `rtw8852c_set_channel` (`set_channel_mac`, `set_channel_bb`,
-    /// `set_channel_rf`) and `rtw8852c_set_channel_help(exit)` for MAC_0/
-    /// PHY_0 without DBCC. The exit's `rtw8852c_tssi_cont_en(true)` runs
-    /// `_tssi_set_efuse_to_de(PHY_0)` (both paths) once per path, as Linux.
-    /// `cut` is `hal.cv` (CHIP_CAV = 0).
+    /// core.c `__rtw89_set_channel(MAC_0, PHY_0)` without DBCC:
+    /// rtw8852c.c `rtw8852c_set_channel_help(enter)`, `rtw8852c_set_channel`
+    /// (`set_channel_mac`, `set_channel_bb`, `set_channel_rf`),
+    /// `rtw8852c_set_txpwr` (`power`, which must be built for `profile`),
+    /// `rtw8852c_set_channel_help(exit)`; then, when no channel was
+    /// programmed yet or the band changed, `rtw89_btc_ntfy_switch_band`
+    /// (`Interface::coex_switch_band`) and `rtw8852c_tssi_scan` with the
+    /// retained `is_tssi_mode`. The exit's `rtw8852c_tssi_cont_en(true)`
+    /// runs `_tssi_set_efuse_to_de(PHY_0)` (both paths) once per path, as
+    /// Linux. `cut` is `hal.cv` (CHIP_CAV = 0).
     ///
     /// # Safety
     /// Actual RTL8852C after completed C tables, `controls_c` and
     /// `rfk::c::Init::prepare`, with exclusive radio ownership and a
     /// current channel grant for `profile`; Interface enforces current
-    /// admission at every RFK access. The caller composes
-    /// `rtw89_chip_set_txpwr` between the RF program and the exit only
-    /// once C power tables exist; until then no native caller may use this.
+    /// admission at every RFK access. `tracking` is this container's
+    /// TXPWR_TRK and `power` this container's TXPWR program for `profile`.
     pub async unsafe fn set_channel(
         &mut self,
         io: &mut impl Interface,
         profile: Profile,
         inputs: &channel_c::Inputs<'_>,
+        power: &radio_power_c::Plan,
+        tracking: &Tracking,
         cut: u8,
     ) -> Result<(), Error> {
+        if power.channel() != profile {
+            return Err(Error::Policy);
+        }
         self.begin(&[State::New, State::Programmed, State::Calibrated])?;
         self.channel = None;
+        self.scanned = false;
         io.admit()?;
         let saved = io.pause().await?;
         let mut access = Access(io);
@@ -345,6 +365,8 @@ impl Channel {
         // SAFETY: same window, immediately after `program`.
         unsafe { channel_c::program_tail(access.0, profile, cut == 0) }.await?;
         access.c_set_channel_rf(profile, cut == 0).await?;
+        // `chip->ops->set_txpwr` = `rtw8852c_set_txpwr(chan, PHY_0)`.
+        power.visit(|a, m, v| access.c_step(a, m, v))?;
         access.c_steps(&HELP_EXIT_HEAD).await?;
         for path in 0..2u32 {
             access.c_step(0x1_5818 + (path << 13), 1 << 30, 0)?;
@@ -356,6 +378,20 @@ impl Channel {
         access.c_steps(&help_exit_reset(profile.band())).await?;
         access.0.admit()?;
         access.0.resume(saved).await?;
+        if self.band != Some(profile.band()) {
+            io.admit()?;
+            io.coex_switch_band().await?;
+            // SAFETY: caller contract; the channel was just programmed.
+            self.scanned = unsafe {
+                self.tssi
+                    .scan(io, profile, inputs.calibration, tracking, self.tssi_mode)
+            }
+            .await?;
+            if self.scanned {
+                self.tssi_mode = self.tssi.results().ok_or(Error::Terminal)?.tssi_mode;
+            }
+        }
+        self.band = Some(profile.band());
         self.channel = Some(profile);
         self.state = State::Programmed;
         Ok(())
@@ -372,8 +408,7 @@ impl Channel {
     /// absence, so both BT preserves always wait the full 30ms (as B).
     ///
     /// # Safety
-    /// Same owner as [`Self::set_channel`], directly after it (and after the
-    /// caller's set_txpwr). `calibration`/`tracking` are this device's C
+    /// Same owner as [`Self::set_channel`], directly after it. `calibration`/`tracking` are this device's C
     /// factory snapshot and container TXPWR_TRK; `cut` is `hal.cv`.
     pub async unsafe fn rfk_channel(
         &mut self,

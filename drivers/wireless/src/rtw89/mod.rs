@@ -129,6 +129,7 @@ mod radio_gain;
 mod radio_init;
 mod radio_policy;
 mod radio_power;
+mod radio_power_c;
 mod radio_shutdown;
 mod radio_stop;
 mod radio_table;

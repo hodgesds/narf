@@ -170,13 +170,16 @@ pub(in super::super) struct Tssi {
 }
 
 impl<I: Interface> Access<'_, I> {
-    /// One path of the `rtw8852c_tssi` loop.
+    /// One path of the `rtw8852c_tssi` loop (`full`) or of the
+    /// `rtw8852c_tssi_scan` loop (sys, DCK, tmeter, slope-cal-org and
+    /// alignment default only).
     async fn c_tssi_path(
         &mut self,
         path: u8,
         channel: Profile,
         thermal: u8,
         tracking: &Tracking,
+        full: bool,
     ) -> Result<[u32; 16], Error> {
         let a = path == 0;
         let two = channel.band() == Band::Ghz2;
@@ -198,18 +201,20 @@ impl<I: Interface> Access<'_, I> {
         })
         .await?;
         // `_tssi_ini_txpwr_ctrl_bb` / `_he_tb`.
-        self.table(pick(
-            a,
-            &TSSI_TXPWR_CTRL_BB_DEFS_A,
-            &TSSI_TXPWR_CTRL_BB_DEFS_B,
-        ))
-        .await?;
-        self.table(pick(
-            a,
-            &TSSI_TXPWR_CTRL_BB_HE_TB_DEFS_A,
-            &TSSI_TXPWR_CTRL_BB_HE_TB_DEFS_B,
-        ))
-        .await?;
+        if full {
+            self.table(pick(
+                a,
+                &TSSI_TXPWR_CTRL_BB_DEFS_A,
+                &TSSI_TXPWR_CTRL_BB_DEFS_B,
+            ))
+            .await?;
+            self.table(pick(
+                a,
+                &TSSI_TXPWR_CTRL_BB_HE_TB_DEFS_A,
+                &TSSI_TXPWR_CTRL_BB_HE_TB_DEFS_B,
+            ))
+            .await?;
+        }
         // `_tssi_set_dck`.
         self.table(pick(a, &TSSI_DCK_DEFS_A, &TSSI_DCK_DEFS_B))
             .await?;
@@ -221,8 +226,10 @@ impl<I: Interface> Access<'_, I> {
         })
         .await?;
         // `_tssi_set_bbgain_split`.
-        self.table(pick(a, &TSSI_SET_BBGAIN_SPLIT_A, &TSSI_SET_BBGAIN_SPLIT_B))
-            .await?;
+        if full {
+            self.table(pick(a, &TSSI_SET_BBGAIN_SPLIT_A, &TSSI_SET_BBGAIN_SPLIT_B))
+                .await?;
+        }
         // `_tssi_set_tmeter_tbl`.
         self.wm(tmeter, B_TMETER_DIS, 0)?;
         self.wm(tmeter, B_TMETER_TRK, 1)?;
@@ -261,10 +268,12 @@ impl<I: Interface> Access<'_, I> {
         })
         .await?;
         // `_tssi_set_slope` / `_tssi_run_slope`.
-        self.table(pick(a, &TSSI_SLOPE_DEFS_A, &TSSI_SLOPE_DEFS_B))
-            .await?;
-        self.table(pick(a, &TSSI_RUN_SLOPE_DEFS_A, &TSSI_RUN_SLOPE_DEFS_B))
-            .await?;
+        if full {
+            self.table(pick(a, &TSSI_SLOPE_DEFS_A, &TSSI_SLOPE_DEFS_B))
+                .await?;
+            self.table(pick(a, &TSSI_RUN_SLOPE_DEFS_A, &TSSI_RUN_SLOPE_DEFS_B))
+                .await?;
+        }
         Ok(words)
     }
     /// `_tssi_set_efuse_to_de` for one path; returns (CCK, MCS) DE.
@@ -326,6 +335,46 @@ impl Tssi {
         calibration: &Calibration,
         tracking: &Tracking,
     ) -> Result<(), Error> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.program(io, channel, calibration, tracking, true) }.await
+    }
+
+    /// rtw8852c_rfk.c `rtw8852c_tssi_scan(PHY_0)`, run by core.c
+    /// `__rtw89_set_channel` -> `rtw8852c_rfk_band_changed` after the
+    /// channel help exit when the band changed (or no entity was active):
+    /// returns without I/O unless both paths are in TSSI mode, else
+    /// `_tssi_disable`, per path `_tssi_set_sys`, `_tssi_set_dck`,
+    /// `_tssi_set_tmeter_tbl`, `_tssi_slope_cal_org`,
+    /// `_tssi_set_aligk_default`, then `_tssi_enable` and
+    /// `_tssi_set_efuse_to_de` for the new channel. Returns whether it ran.
+    ///
+    /// # Safety
+    /// Same as [`Self::run`], on the channel just programmed by
+    /// `rfk::c_channel::Channel::set_channel`.
+    pub async unsafe fn scan(
+        &mut self,
+        io: &mut impl Interface,
+        channel: Profile,
+        calibration: &Calibration,
+        tracking: &Tracking,
+        tssi_mode: [bool; 2],
+    ) -> Result<bool, Error> {
+        if !tssi_mode[0] || !tssi_mode[1] {
+            return Ok(false);
+        }
+        // SAFETY: forwarded caller contract.
+        unsafe { self.program(io, channel, calibration, tracking, false) }.await?;
+        Ok(true)
+    }
+
+    async unsafe fn program(
+        &mut self,
+        io: &mut impl Interface,
+        channel: Profile,
+        calibration: &Calibration,
+        tracking: &Tracking,
+        full: bool,
+    ) -> Result<(), Error> {
         self.calibrated = false;
         self.results = Results::default();
         io.admit()?;
@@ -340,6 +389,7 @@ impl Tssi {
                     channel,
                     calibration.thermal[usize::from(path)],
                     tracking,
+                    full,
                 )
                 .await?;
         }

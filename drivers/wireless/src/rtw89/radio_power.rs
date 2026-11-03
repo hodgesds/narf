@@ -316,7 +316,9 @@ pub(super) enum State {
 pub(super) struct Power {
     state: State,
 }
-fn reference(mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>) -> Result<(), Error> {
+pub(super) fn reference(
+    mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>,
+) -> Result<(), Error> {
     emit(0xd200, 0xffffc00, 0)?;
     for a in [0x15804, 0x17804, 0x15808, 0x17808] {
         emit(a, 0x7ffffff, (172 << 18) | (312 << 9))?;

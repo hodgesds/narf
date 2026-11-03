@@ -3015,19 +3015,53 @@ from 0.0.0 (fw.c), so the body is `rtw89_fw_h2c_rf_get_mccch_v0`
 {ch_0 = center, ch_1 = 0, band_0, band_1 = 0, current_channel, current_band}
 (24 bytes; B uses the 20-byte non-V0 layout). The BT preserves always wait
 the full 30ms because the owner cannot assert A2DP absence (as B).
-`__rtw89_set_channel`'s `rtw89_chip_set_txpwr` and band-change
-`rtw8852c_tssi_scan` are not composed: no native caller may use
-`set_channel` until C power tables exist. Unexecuted case:
+`set_channel` now composes core.c `__rtw89_set_channel` order: help
+enter, `rtw8852c_set_channel`, `rtw8852c_set_txpwr` (below; the plan must
+be built for the same profile, else `Policy`), help exit, then -- when no
+channel was programmed yet (Linux `!entity_active`) or the band changed --
+`rtw89_btc_ntfy_switch_band` (`Interface::coex_switch_band`) and
+`rtw8852c_rfk_band_changed` = `rtw8852c_tssi_scan` (`c_tssi::Tssi::scan`):
+no I/O unless both retained `is_tssi_mode` paths are set, else
+`_tssi_disable`, per path `_tssi_set_sys`/`_tssi_set_dck`/
+`_tssi_set_tmeter_tbl`/`_tssi_slope_cal_org`/`_tssi_set_aligk_default`,
+`_tssi_enable`, `_tssi_set_efuse_to_de`. Unexecuted case:
 `smoke_rtw89_c_set_channel_rf_and_help_follow_rtw8852c`.
 
-Remaining for the `rtl8852c` row (no row credit): C power-table
-composition (`rtw8852c_set_txpwr*`, firmware TXPWR_* elements incl. DA
-limits) between `set_channel_rf` and the help exit, band-change
-`rtw8852c_tssi_scan`, C coexistence init, the C
-`power::Calibration`/qualification records (N52x are B-bound), the native
-caller sending the MCC V0 H2C, `command_native`/`startup_station` admission
-(B-only at `Io::station_allowed`, `Startup::start` assets), and native
-execution. Unexecuted new cases:
+**C TX power (`radio_power_c`).** `Plan::from_assets(assets, rfe, profile)`
+selects each TXPWR element by fw.c `rtw89_fw_recognize_txpwr_from_elm`:
+non-matching `aid` never reaches it (`radio_assets` keeps AX aid 0), an
+element whose `rfe_type` equals the efuse RFE (logical 0x2ca) is taken and
+the last such wins, a default (`rfe_type` 0) element is taken only while
+the stored conf is unset or default (last default wins absent an exact
+match). Entries follow `rtw89_fw_load_txpwr_*`: wider-than-struct entries
+only with a zero extension, invalid entries skipped, later entries
+overwrite; a size-inconsistent element header fails closed. The program is
+`rtw8852c_set_txpwr(PHY_0)`: phy.c `rtw89_phy_set_txpwr_byrate_ax` (CCK
+always from `byr[2G][0]`, bw 0 / ofdma 0, rf>>1), `_offset_ax` (0xd204
+[19:0]), `rtw8852c_set_tx_shape` (2.4GHz CCK DFIR flat/sharp/sharp_14 at
+0x45bc.. [23:0], `rtw89_phy_tssi_ctrl_set_bandedge_cfg` with
+`rtw89_8852c_tssi_dbw_table`, DAC_COMP_POST_DPD_EN A/B),
+`rtw89_phy_set_txpwr_limit_ax` / `_limit_ru_ax` for 20/40/80/160MHz
+(`rtw89_phy_fill_txpwr_limit{,_ru}_*m_ax` incl. 0p5/2p5 minima and the
+u8 subchannel arithmetic), `rtw8852c_set_txpwr_diff` (no DAG ->
+`set_txpwr_ref(0)`, the same words as B) and `rtw8852c_set_txpwr_sar_diff`
+(no SAR source: `R_TXPWRB`/`R_P1_TXPWRB` [8:0] = 126). The regulatory
+state is Linux's default without a country: regd `RTW89_WW`, no SAR, no
+DA tables, no 6GHz TPE. NARF has no static rtw8852c_table.c power tables:
+missing BYRATE, LMT_{2,5}GHZ, LMT_RU_{2,5}GHZ or TX_SHAPE_LMT is refused
+(the shipped rtw8852c_fw-{1,2}.bin carry all, fw-2 also RFE-5 limit and
+shape elements); 6GHz and RFE 255 are refused (`Policy`). It is register
+configuration only, never a conducted-power or regulatory claim.
+Unexecuted cases:
+`smoke_rtw89_c_txpwr_selection_follows_rtw89_fw_recognize_txpwr_from_elm`,
+`smoke_rtw89_c_set_txpwr_follows_rtw8852c_and_phy_ax`.
+
+Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
+C `power::Calibration`/qualification records (N52x are B-bound), the native
+caller sending the MCC V0 H2C and invoking `set_channel`/`rfk_channel`,
+`command_native`/`startup_station` admission (B-only at
+`Io::station_allowed`, `Startup::start` assets), and native execution.
+Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
 `smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.
