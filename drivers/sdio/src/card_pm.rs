@@ -11,7 +11,8 @@
 //! (`sdhci_init(host, soft = KEEP_POWER)`: CMD/DATA-line reset and `set_ios`
 //! replay of power, bus width, timing and clock; `sdhci_disable_irq_wakeups`)
 //! followed by `mmc_sdio_resume` (keep power: restore the 4-bit bus; power
-//! off: `mmc_sdio_reinit_card`).
+//! off: `mmc_sdio_reinit_card`). The same power-off/reinit halves serve
+//! `mmc_hw_reset` ([`Card::hw_reset`]).
 
 use super::*;
 use crate::sdio::function::PmFlags;
@@ -130,8 +131,10 @@ impl<R: Registers> Card<R> {
         });
         Ok(())
     }
-    /// `mmc_power_off`: the card loses every function, enable and receipt.
-    fn power_off_for_suspend(&mut self, flags: PmFlags) {
+    /// `mmc_power_off`: SD clock and SDHCI bus power off (`sdhci_set_power`
+    /// clearing `SDHCI_POWER_CONTROL`); the card loses every function,
+    /// enable and receipt.
+    fn power_off(&mut self) {
         self.live.retire();
         self.enabled = 0;
         self.observing = 0;
@@ -143,12 +146,109 @@ impl<R: Registers> Card<R> {
         io.write8(POWER_CONTROL, 0);
         self.host.current_clock_hz = 0;
         self.host.card_selected = false;
+    }
+    fn power_off_for_suspend(&mut self, flags: PmFlags) {
+        self.power_off();
         self.suspend = Some(Suspended {
             flags,
             int_enable: 0,
             signal_enable: 0,
             narrowed: false,
         });
+    }
+    /// Host-side stop of an owned card (Linux `brcmf_sdio_bus_reset`
+    /// before `mmc_hw_reset`, and the power-off half of
+    /// `mmc_power_cycle`): card-interrupt delivery retired, bus power and
+    /// clock off, with the SDHCI registers read back as the receipt. An
+    /// SDIO card cannot master host memory and every PIO/DMA command
+    /// completed synchronously, so nothing of the host remains published.
+    pub(super) fn power_off_host(&mut self) -> Result<(), SdioError> {
+        if self.suspend.is_some() {
+            return Err(SdioError::Busy);
+        }
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.subscriber.clear();
+        }
+        self.power_off();
+        let io = self.controller.registers();
+        let state = io.read32(PRESENT_STATE);
+        if state == u32::MAX
+            || io.read8(POWER_CONTROL) & POWER_ON != 0
+            || io.read16(CLOCK_CONTROL) & CLK_CARD_EN != 0
+            || state & (PS_CMD_INHIBIT | PS_DATA_INHIBIT | PS_DOING_READ | PS_DOING_WRITE) != 0
+        {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
+    }
+    /// Linux `mmc_hw_reset` -> `mmc_sdio_hw_reset` for an exclusively owned
+    /// card: `mmc_power_cycle` (`mmc_power_off`, its 1 ms, at least 1 ms
+    /// more per the SD spec, `mmc_power_up` with `ios.power_delay_ms` 10
+    /// before and after the clock) then `mmc_sdio_reinit_card` (CCCR
+    /// `sdio_reset`, CMD0, CMD5, CMD3, CMD7, CCCR/CIS) requiring the same
+    /// function count and per-function vendor/device (`mmc_sdio_init_card`
+    /// with `oldcard`: `-ENOENT` otherwise). Functions come back disabled
+    /// and every earlier receipt retired. Whether the card's own supply
+    /// follows SDHCI bus power is board wiring this host does not know; the
+    /// CCCR I/O reset is what Linux relies on when it does not. Failure is
+    /// terminal: the card stays powered off and every access is refused.
+    pub(super) fn hw_reset(&mut self) -> Result<(), SdioError> {
+        if self.suspend.is_some() {
+            return Err(SdioError::Busy);
+        }
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.subscriber.clear();
+        }
+        self.power_off();
+        // mmc_power_off: 1 ms; mmc_power_cycle: "at least 1 ms".
+        Self::delay(1_000);
+        Self::delay(1_000);
+        match self.reinit() {
+            Ok(()) => {
+                self.pm_failed = false;
+                Ok(())
+            }
+            Err(error) => {
+                self.pm_failed = true;
+                self.power_off();
+                Err(error)
+            }
+        }
+    }
+    /// Linux `sdio.c::sdio_reset` (SDIO Simplified Specification 4.4): set
+    /// CCCR I/O Abort RES, keeping the read value when it answers. Errors
+    /// are ignored as in `mmc_sdio_pre_init`; an errored command resets the
+    /// host's command/data engines as `sdhci_request_done` does.
+    pub(super) fn sdio_reset(&mut self) {
+        let read = cmd52_arg(false, 0, false, CCCR_IO_ABORT, 0);
+        let abort = match self.controller.execute(52, read, Response::R5, None) {
+            Ok(value) => r5_data(value) | IO_ABORT_RES,
+            Err(_) => {
+                self.recover_command();
+                IO_ABORT_RES
+            }
+        };
+        let write = cmd52_arg(true, 0, false, CCCR_IO_ABORT, abort);
+        if self
+            .controller
+            .execute(52, write, Response::R5, None)
+            .is_err()
+        {
+            self.recover_command();
+        }
+    }
+    fn recover_command(&mut self) {
+        let io = self.controller.registers();
+        io.write8(SOFTWARE_RESET, RESET_CMD | RESET_DATA);
+        let _ = self.controller.wait(Deadline::after_us(100_000), |io| {
+            let value = io.read8(SOFTWARE_RESET);
+            if value == u8::MAX {
+                Err(HostError::Gone)
+            } else {
+                Ok(value & (RESET_CMD | RESET_DATA) == 0)
+            }
+        });
+        self.controller.revive();
     }
     pub(super) fn resume_host(&mut self) -> Result<(), SdioError> {
         if self.pm_failed {
@@ -238,10 +338,17 @@ impl<R: Registers> Card<R> {
     /// the same card (identity per function must match). Functions are
     /// left disabled for their driver to probe again.
     fn resume_reinit(&mut self) -> Result<(), SdioError> {
+        self.reinit()
+    }
+    fn reinit(&mut self) -> Result<(), SdioError> {
         let before = self.functions;
         let count = self.host.func_count;
         self.live = crate::source::Lifetime::new();
-        self.start(self.config).map_err(|_| SdioError::HostError)?;
+        // The power cycle precedes the host RESET_ALL in `start`; no
+        // command of the previous lifetime is in flight.
+        self.controller.revive();
+        self.start(self.config, true)
+            .map_err(|_| SdioError::HostError)?;
         if self.host.func_count != count
             || (0..=usize::from(count)).any(|f| {
                 (before[f].vendor, before[f].device)

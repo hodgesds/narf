@@ -244,6 +244,22 @@ pub trait SdioFunction {
     fn resume_host(&mut self) -> Result<(), SdioError> {
         Err(SdioError::Unsupported)
     }
+
+    /// Host-side stop of the whole card (Linux `brcmf_sdio_bus_reset`
+    /// before `mmc_hw_reset`): card-interrupt delivery retired, SD clock
+    /// and bus power off, read back. Every function and receipt is lost;
+    /// only [`Self::hw_reset`] brings the card back.
+    fn power_off_host(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Linux `mmc_hw_reset` of a card with a single function driver
+    /// (`mmc_sdio_hw_reset`: `mmc_power_cycle` + `mmc_sdio_reinit_card`).
+    /// Success re-enumerated the same card (function count and identities)
+    /// with every function disabled; failure leaves the card terminal.
+    fn hw_reset(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 }
 
 /// Encode a CMD52 argument for a read and validate fields.

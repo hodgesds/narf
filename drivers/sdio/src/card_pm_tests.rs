@@ -187,9 +187,10 @@ fn smoke_sdio_power_off_suspend_reenumerates_on_resume() -> TestResult {
     let enumerated: Vec<u8> = shared.lock().commands[commands..]
         .iter()
         .map(|c| c.0)
-        .take(5)
+        .take(7)
         .collect();
-    if enumerated != [0, 5, 5, 3, 7] {
+    // mmc_sdio_pre_init: sdio_reset (CCCR abort read + RES write) first.
+    if enumerated != [52, 52, 0, 5, 5, 3, 7] {
         return TestResult::Fail("power-off resume did not run mmc_sdio_reinit_card");
     }
     // Functions come back disabled for their driver to probe again.
@@ -201,4 +202,108 @@ fn smoke_sdio_power_off_suspend_reenumerates_on_resume() -> TestResult {
 kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_power_off_suspend_reenumerates_on_resume
+);
+
+fn smoke_sdio_hw_reset_power_cycles_and_reinits_same_card_like_linux() -> TestResult {
+    let Some((mut card, shared, _line)) = powered_card(PmFlags::NONE) else {
+        return TestResult::Fail("powered card unavailable");
+    };
+    let before = card.source();
+    if before.is_none() {
+        return TestResult::Fail("fixture card exposed no source");
+    }
+    // A failed command makes the controller terminal (the reset's reason).
+    shared.lock().refuse_commands = true;
+    if card.cmd52_read(0, CCCR_IO_ENABLE).is_ok() || !card.is_failed() {
+        return TestResult::Fail("refused command did not fail the controller");
+    }
+    shared.lock().refuse_commands = false;
+    if card.power_off_host().is_err() {
+        return TestResult::Fail("host-side power off refused");
+    }
+    {
+        let s = shared.lock();
+        if s.registers[POWER_CONTROL as usize] != 0
+            || s.get16(CLOCK_CONTROL) != 0
+            || s.get32(INT_ENABLE) != 0
+            || s.get32(SIGNAL_ENABLE) != 0
+        {
+            return TestResult::Fail("power off left bus power, clock or interrupts on");
+        }
+    }
+    let commands = shared.lock().commands.len();
+    if card.hw_reset().is_err() {
+        return TestResult::Fail("hw reset did not re-enumerate the same card");
+    }
+    let s = shared.lock();
+    let enumerated: Vec<(u8, u32)> = s.commands[commands..]
+        .iter()
+        .map(|c| (c.0, c.1))
+        .take(7)
+        .collect();
+    let abort_write = cmd52_arg(true, 0, false, CCCR_IO_ABORT, IO_ABORT_RES);
+    if enumerated.iter().map(|c| c.0).collect::<Vec<_>>() != [52, 52, 0, 5, 5, 3, 7]
+        || enumerated[1].1 != abort_write
+    {
+        return TestResult::Fail("hw reset was not sdio_reset + CMD0/CMD5/CMD3/CMD7");
+    }
+    if s.registers[POWER_CONTROL as usize] & POWER_ON == 0 || s.get16(CLOCK_CONTROL) == 0 {
+        return TestResult::Fail("hw reset left the bus unpowered");
+    }
+    drop(s);
+    if card.is_failed() || card.host().func_count != 2 || card.function(1).is_none() {
+        return TestResult::Fail("reset card did not come back with its functions");
+    }
+    // Every function comes back disabled; the old receipt stays retired.
+    if card.cmd53_write(2, 0, &[1; 8]) != Err(SdioError::NotEnabled) {
+        return TestResult::Fail("reset card kept a stale function enable");
+    }
+    if card.enable_func(1).is_err() || card.cmd52_read(0, CCCR_IO_ENABLE).is_err() {
+        return TestResult::Fail("reset card refused a fresh function owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_hw_reset_power_cycles_and_reinits_same_card_like_linux
+);
+
+fn smoke_sdio_hw_reset_of_different_card_fails_closed() -> TestResult {
+    let Some((mut card, shared, _line)) = powered_card(PmFlags::NONE) else {
+        return TestResult::Fail("powered card unavailable");
+    };
+    // mmc_sdio_init_card(oldcard): a different F1 identity is -ENOENT.
+    {
+        let mut s = shared.lock();
+        let cis = 0x1000;
+        s.common[cis + 2] ^= 0xff;
+    }
+    if card.hw_reset() != Err(SdioError::HostError) {
+        return TestResult::Fail("hw reset accepted a different card identity");
+    }
+    {
+        let s = shared.lock();
+        if s.registers[POWER_CONTROL as usize] != 0 || s.get16(CLOCK_CONTROL) != 0 {
+            return TestResult::Fail("failed hw reset left the bus powered");
+        }
+    }
+    if card.cmd52_read(0, CCCR_IO_ENABLE) != Err(SdioError::HostError)
+        || card.enable_func(1).is_ok()
+    {
+        return TestResult::Fail("failed hw reset left the card usable");
+    }
+    // A card that never answers CMD5 after the power cycle (its supply did
+    // not follow bus power and the I/O reset was not honoured) fails too.
+    let Some((mut card, shared, _line)) = powered_card(PmFlags::NONE) else {
+        return TestResult::Fail("second powered card unavailable");
+    };
+    shared.lock().refuse_commands = true;
+    if card.hw_reset().is_ok() || card.cmd52_read(0, CCCR_IO_ENABLE).is_ok() {
+        return TestResult::Fail("unresponsive card passed the hw reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_hw_reset_of_different_card_fails_closed
 );

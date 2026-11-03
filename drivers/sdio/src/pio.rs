@@ -232,6 +232,16 @@ impl<R: Registers> Controller<R> {
     pub fn is_failed(&self) -> bool {
         self.failed
     }
+    /// The caller power-cycled or reset the host's command/data engines
+    /// (Linux `sdhci_do_reset` after an errored request, or the card's
+    /// `mmc_hw_reset`): commands may be issued again under a new lifetime.
+    /// Every receipt of the previous lifetime stays retired.
+    pub(crate) fn revive(&mut self) {
+        self.live.retire();
+        self.live = crate::source::Lifetime::new();
+        self.dma_armed = false;
+        self.failed = false;
+    }
     pub fn registers(&mut self) -> &mut R {
         &mut self.io
     }

@@ -162,6 +162,30 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   enumeration whose per-function identities must match; functions return
   disabled. Arming PCI PME / the ACPI wake route of the host for an S-state
   is the system-PM owner's (`narf-power` `pci_wake`), not this crate's.
+- Hardware reset (`card_pm.rs`, Linux `core.c::mmc_hw_reset` ->
+  `sdio.c::mmc_sdio_hw_reset` for a single-driver card).
+  `SdioFunction::power_off_host()` is the host-side stop
+  `brcmf_sdio_bus_reset` takes before the reset: card-interrupt subscriber
+  cleared, SDHCI signal/status enables, SD clock and bus power
+  (`sdhci_set_power`: `POWER_CONTROL` 0) off and read back with an idle
+  command/data engine; every function enable and receipt is retired.
+  `SdioFunction::hw_reset()` is `mmc_power_cycle` (`mmc_power_off`, 1 ms,
+  1 ms more per the SD spec, `mmc_power_up`: host `RESET_ALL`, 3.3-V bus
+  power, 10 ms `ios.power_delay_ms`, 400 kHz clock, 10 ms) then
+  `mmc_sdio_reinit_card`: `mmc_sdio_pre_init`'s `sdio_reset` (CCCR I/O
+  Abort RES, errors ignored with a CMD/DATA host reset as
+  `sdhci_request_done` does), CMD0, CMD5, CMD3, CMD7 and CCCR/CIS, the
+  function count and every function's vendor/device equal to the old card
+  (`mmc_sdio_init_card(oldcard)`, `-ENOENT` otherwise). It revives a
+  controller left terminal by an errored command (new Controller/Card
+  lifetimes; old receipts stay retired); functions return disabled. The
+  bound card-interrupt line survives unless `disable_card_interrupt` already
+  dropped it. Failure leaves the card powered off and terminal. The
+  power-off resume shares the same reinit, including `sdio_reset`. Whether
+  the card's own supply (vmmc / WL_REG_ON) follows SDHCI bus power is board
+  wiring this crate does not own: with a fixed supply Linux relies on the
+  CCCR I/O reset alone, and a card that then does not re-enumerate fails
+  the reset. `vqmmc`/`pwrseq` regulator and GPIO hooks are not modelled.
 - `source::Source` is an opaque original native host plus Controller/Card
   lifetime receipt. `Registers::source` and `SdioFunction::source` default
   to None; observed identity, a caller validator or a scalar cannot create

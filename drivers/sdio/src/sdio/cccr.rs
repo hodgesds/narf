@@ -24,6 +24,8 @@ pub const CCCR_INT_ENABLE: u32 = 0x04;
 pub const CCCR_INT_PENDING: u32 = 0x05;
 /// I/O Abort (R/W).
 pub const CCCR_IO_ABORT: u32 = 0x06;
+/// CCCR I/O Abort RES: reset the card's I/O portion (`SDIO_CCCR_ABORT` 0x08).
+pub const IO_ABORT_RES: u8 = 0x08;
 /// Bus Interface Control — bus-width, CD disable, … (R/W).
 pub const CCCR_BUS_IFACE: u32 = 0x07;
 /// Card Capability (R).

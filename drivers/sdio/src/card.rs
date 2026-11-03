@@ -171,7 +171,7 @@ impl<R: Registers> Card<R> {
             suspend: None,
             pm_failed: false,
         };
-        card.start(config)?;
+        card.start(config, false)?;
         Ok(card)
     }
     pub fn host(&self) -> &SdhciHost {
@@ -238,7 +238,10 @@ impl<R: Registers> Card<R> {
         self.host.current_clock_hz = self.host.clock_base_hz / divisor;
         Ok(())
     }
-    fn start(&mut self, config: Config) -> Result<(), Error> {
+    /// Linux `mmc_power_up` + `mmc_attach_sdio`/`mmc_sdio_init_card`.
+    /// `reinit`: `mmc_sdio_reinit_card`, whose `mmc_sdio_pre_init` resets
+    /// the card's I/O portion (`sdio_reset`) before CMD0/CMD5.
+    fn start(&mut self, config: Config, reinit: bool) -> Result<(), Error> {
         let io = self.controller.registers();
         io.write32(SIGNAL_ENABLE, 0);
         io.write32(INT_ENABLE, 0);
@@ -285,7 +288,12 @@ impl<R: Registers> Card<R> {
             INT_CMD_MASK | INT_DATA_MASK | INT_ERROR | INT_BUS_POWER | INT_AUTO_CMD_ERR,
         );
         self.set_clock(400_000)?;
-        Self::delay(1_000); // >74 initialization clocks at 400 kHz.
+        // mmc_power_up: "at least 74 clock sizes, or 1 ms, or the time
+        // required to reach a stable voltage" (`ios.power_delay_ms`, 10).
+        Self::delay(10_000);
+        if reinit {
+            self.sdio_reset();
+        }
         self.controller.execute(0, 0, Response::None, None)?;
         let query = self.controller.execute(5, 0, Response::R4, None)?;
         let count = ((query & OCR_FUNC_COUNT_MASK) >> OCR_FUNC_COUNT_SHIFT) as u8;
@@ -893,6 +901,12 @@ impl<R: Registers> SdioFunction for Card<R> {
     }
     fn resume_host(&mut self) -> Result<(), SdioError> {
         Card::resume_host(self)
+    }
+    fn power_off_host(&mut self) -> Result<(), SdioError> {
+        Card::power_off_host(self)
+    }
+    fn hw_reset(&mut self) -> Result<(), SdioError> {
+        Card::hw_reset(self)
     }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), SdioError> {
         if func == 0 || func > self.host.func_count {
