@@ -1009,9 +1009,13 @@ implement it over `brcmfmac::vif_demux` (`Demux`, `route`).
 - PCIe msgbuf (`brcmfmac::runtime` + `station_transport::Adapter`): flow
   rings are keyed by (ifidx, fifo, da) with `create->msg.ifidx`
   (`msgbuf.c::brcmf_msgbuf_flowring_create_worker`), TX posts carry the
-  flow's ifidx and TX status/flow create/delete completions must echo it;
-  IOCTL requests carry `msg.ifidx` and the completion must echo it; RX
-  completions and events accept ifidx < 16. A secondary close deletes only
+  flow's ifidx and IOCTL requests carry `msg.ifidx`. As in Linux, control
+  completions are correlated by flow ring id (flow create/delete,
+  `brcmf_msgbuf_process_flow_ring_{create,delete}_response`), request id +
+  flow ring id (TX status, `brcmf_msgbuf_process_txstatus`) or transaction
+  id (IOCTL, `brcmf_msgbuf_process_ioctl_complete`); their completion
+  `msg.ifidx` is not consulted, so a zeroed or different echo is not a
+  protocol error. RX completions and events accept ifidx < 16. A secondary close deletes only
   that ifidx's flows and reports `Ok(true)` after every delete completion.
 - Events: `BRCMF_E_IF` and any event whose header names a nonzero ifidx or
   bsscfg route to the secondary queue (`fweh.c::brcmf_fweh_event_worker`

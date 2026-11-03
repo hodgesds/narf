@@ -193,8 +193,6 @@ struct Pending {
     id: u16,
     command: u32,
     maximum: usize,
-    /// Request `msg.ifidx`; the IOCTL completion must echo it.
-    ifidx: u8,
 }
 #[derive(Debug)]
 pub struct Ticket {
@@ -668,7 +666,6 @@ impl<B: Bus> Runtime<B> {
             id,
             command,
             maximum: logical,
-            ifidx,
         });
         self.response = None;
         if let Err(error) = self.publish(0, &entry) {
@@ -789,17 +786,14 @@ impl<B: Bus> Runtime<B> {
         if matches!(kind, 4 | 6) {
             return self.flow_completion(entry);
         }
-        // IOCTL completions echo the pending request's ifidx and events
-        // carry their bsscfg in the event body (`fweh.c` dispatch); every
-        // other control completion stays interface 0.
-        let ifidx_ok = match kind {
-            0xc => self
-                .pending
-                .is_some_and(|pending| pending.ifidx == entry[1]),
-            0xe => entry[1] < super::vif_wire::MAX_IFS,
-            _ => entry[1] == 0,
-        };
-        if !ifidx_ok {
+        // Only events address an interface (`brcmf_msgbuf_process_event`
+        // resolves `msg.ifidx` through `brcmf_get_ifp`); out-of-range event
+        // ifidx stays fatal here. Linux ignores the completion header ifidx
+        // of every other control completion: an IOCTL completion is matched
+        // by its transaction/request id (`brcmf_msgbuf_process_ioctl_complete`)
+        // and status messages carry no interface, so firmware that zeroes or
+        // rewrites `msg.ifidx` there is not a protocol error.
+        if kind == 0xe && entry[1] >= super::vif_wire::MAX_IFS {
             return Err(Error::Protocol);
         }
         let status = i16::from_le_bytes(entry[8..10].try_into().unwrap());
@@ -1233,10 +1227,9 @@ impl<B: Bus> Runtime<B> {
             .flows
             .get_mut(usize::from(id.checked_sub(2).ok_or(Error::Protocol)?))
             .ok_or(Error::Protocol)?;
-        // The completion echoes the request's msg.ifidx.
-        if entry[1] != flow.ifidx {
-            return Err(Error::Protocol);
-        }
+        // Correlated by flow ring id only, as
+        // `brcmf_msgbuf_process_flow_ring_{create,delete}_response` do; the
+        // completion `msg.ifidx` is not consulted.
         match (entry[0], flow.state) {
             (4, FlowState::Creating) => {
                 flow.state = if status == 0 {
@@ -1387,8 +1380,11 @@ impl<B: Bus> Runtime<B> {
                 status.flow_ring_id.checked_sub(2).ok_or(Error::Protocol)?,
             ))
             .ok_or(Error::Protocol)?;
-        if flow.state != FlowState::Open || flow.outstanding == 0 || flow.ifidx != status.hdr.ifidx
-        {
+        // Correlated by request id + flow ring id
+        // (`brcmf_msgbuf_process_txstatus`); Linux passes `msg.ifidx` only to
+        // `brcmf_txfinalize` statistics, so a zeroed or different completion
+        // ifidx is not a protocol error.
+        if flow.state != FlowState::Open || flow.outstanding == 0 {
             return Err(Error::Protocol);
         }
         flow.outstanding -= 1;
