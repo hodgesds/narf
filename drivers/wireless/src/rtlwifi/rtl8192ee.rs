@@ -23,6 +23,12 @@
 //!   status and the read/write-pointer helpers (`trx.{c,h}`, `pci.c`).
 //! - [`mac`] — the `_rtl92ee_init_mac` remainder (auto LLT, BD ring bases
 //!   and counts) with the `REG_CR` release deferred to the packet owner.
+//! - [`phy`] — MAC/PHY_REG/AGC/RADIOA/RADIOB configuration with the RF
+//!   serial writer (`0xb6`/`0xb2` read-back retries) and the PHY_REG_PG
+//!   power-by-rate store (`phy.c`, `rf.c`).
+//! - [`txpower`] — factory TX power decode and the TXAGC writes
+//!   (`_rtl92ee_read_txpower_info_from_hwpg`, `rtl92ee_phy_set_txpower_level`).
+//! - [`channel`] — `rtl92ee_phy_sw_chnl` and `rtl92ee_phy_set_bw_mode` (20/40).
 //! - `packet_owner.rs` — the BD-ring profile of the retained owner, mounted
 //!   as `prepare::packet::ee92` (allocation, publication, TXBD_IDX
 //!   doorbells, RXQ_TXBD_IDX consumption and the deferred DMA releases).
@@ -30,13 +36,18 @@
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod channel;
 pub mod fw;
 pub mod headerfile;
 pub mod mac;
+pub mod phy;
 pub mod pwrseq;
 pub mod tables;
 pub mod trx;
+pub mod txpower;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod phy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
 

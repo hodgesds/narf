@@ -2138,6 +2138,42 @@ diagnostic (`pci::bring_up` does not retain it).
   so the else rows apply on every board. `bb_action`/`rf_action` are
   `_rtl92ee_config_bb_reg`/`_rtl92ee_config_rf_reg` row decodes (delay
   markers; the RF `0xb6`/`0xb2` read-back retries belong to the RF writer).
+- `phy` — `rtl92ee_phy_set/query_bb_reg` and `_rtl92ee_phy_rf_serial_
+  write/read` over `phy_init_bb_rf_register_def` (paths A/B: LSSI
+  `0x840/0x844`, HSSI read edge via `0x824` then the path's HSSI2, 20 us,
+  PI/SI read-back by HSSI1 BIT(8)); shifted values are not re-masked, as
+  Linux. `mac_config` writes every MAC row (Linux does not walk conditions
+  on that array). `bb_config` = `rtl92ee_phy_bb_config` (SYS_FUNC_EN word
+  `| BIT13|BIT1|BIT0`, RF_CTRL 7, SYS_FUNC_EN `0xe3`, `AFE_XTAL_CTRL+1 =
+  0x80`, `0x4c |= BIT23`, PHY_REG walk with delays + 1 us, the PHY_REG_PG
+  store into `[rf][txnum][section]` (`_rtl92ee_get_rate_section_index`),
+  `_rtl92ee_phy_store_txpower_by_rate_base` BCD bases and
+  `phy_convert_txpwr_dbm_to_rel_val`, AGC walk, `cck_high_power`, crystal
+  cap `0x2c[23:12]`). `rf_config` = `_rtl92ee_phy_rf6052_config_parafile`
+  for `RF_2T2R` (RFENV save/restore, 3-wire lengths) with
+  `_rtl92ee_config_rf_reg`'s retries: `0xb6` until `[19:8]` matches,
+  `0xb2` until equal with an RF `0x18 = 0x0fc07` per retry, each at most
+  six. `configure` continues with the `rtl92ee_hw_init` RF tail
+  (`rfreg_chnlval` reads, `backup_rf_0x1a`, 20 MHz `RF_CHNLBW` to both
+  paths, CCK/OFDM block on, RF A `0xB1 = 0x54418`).
+- `txpower` — `_rtl8192ee_read_power_value_fromprom` /
+  `_rtl92ee_read_txpower_info_from_hwpg` 2.4 GHz fields (42-byte path
+  stride from `0x10`, channel 14 CCK group 5, signed nibbles, thermal
+  `0xBA`, regulatory `0xC1[2:0]`); a map with `0x11 == 0xff` is Linux's
+  autoload-fail branch (`txpwr_fromeprom` false, TXAGC never written) and is
+  refused. `index` = `_rtl92ee_get_txpower_index` (u8 wrapping, clamp
+  `0x3f`, by-rate diff unless regulatory 2, the Linux rate-section/shift
+  quirks kept); `set_level` = `rtl92ee_phy_set_txpower_level` (A then B;
+  CCK, OFDM, MCS0-7, MCS8-15 byte RMWs of the `_rtl92ee_set_txpower_index`
+  registers). No power-limit table exists for this chip in Linux.
+- `channel` — `rtl_op_config` wide channel (HT40+ = primary + 2 / LOWER,
+  HT40- = primary - 2 / UPPER; 40 MHz pairs outside wide 3..=11 refused),
+  `_rtl92ee_phy_sw_chnl_step_by_step` (TX power at the new width, then
+  `rfreg_chnlval[p] & 0xfffff00 | ch` through the unmasked `0x3ff` RF RMW
+  on both paths, 10 ms), `rtl92ee_phy_set_bw_mode_callback` (BWOPMODE,
+  RRSR+2 sub-channel, RFMOD, `0xce4[31:30]`, CCK sideband, LSTF, `0x818
+  [27:26]`) and `rtl92ee_phy_rf6052_set_bandwidth` (`rfreg_chnlval[0]` to
+  both paths, as Linux).
   Test `smoke_rtl8192ee_tables_and_check_condition_walk` (written,
   unexecuted).
 
