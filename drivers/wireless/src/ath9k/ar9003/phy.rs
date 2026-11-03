@@ -292,7 +292,7 @@ pub(in crate::ath9k) fn expected(
         return Err(BringUpError::Policy);
     }
     let plan = power::plan(image, frequency, ctl, power_limit, identity.tx_chainmask)?;
-    let tables = Tables::ar9300(revision, identity);
+    let tables = Tables::for_revision(revision, identity);
     let five = frequency >= 4800;
     let modes_index = if five { 1 } else { 4 };
     let mut cl = None;
@@ -344,7 +344,7 @@ pub(in crate::ath9k) fn prepare(
         return Err(BringUpError::Policy);
     }
     let plan = power::plan(image, frequency, ctl, power_limit, identity.tx_chainmask)?;
-    let tables = Tables::ar9300(revision, identity);
+    let tables = Tables::for_revision(revision, identity);
     let five = frequency >= 4800;
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);

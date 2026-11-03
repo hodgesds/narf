@@ -19,6 +19,7 @@ pub(super) mod edma;
 pub(super) mod eeprom;
 pub(super) mod ini;
 pub(super) mod initvals;
+pub(super) mod initvals_ar9580;
 pub(super) mod irq;
 pub(super) mod mac;
 pub(super) mod packet;
@@ -32,6 +33,10 @@ use super::identity::{BringUpError, RegisterIo};
 pub(super) const AR_SREV_VERSION_9300: u32 = 0x1c0;
 /// `reg.h::AR_SREV_REVISION_9300_22`.
 pub(super) const AR_SREV_REVISION_9300_22: u8 = 3;
+/// `reg.h::AR_SREV_VERSION_9580`: the AR9580 shares the AR9300 macVersion.
+pub(super) const AR_SREV_VERSION_9580: u32 = 0x1c0;
+/// `reg.h::AR_SREV_REVISION_9580_10`: `AR_SREV_9580` is macRev >= 4.
+pub(super) const AR_SREV_REVISION_9580_10: u8 = 4;
 
 const AR_CFG: u64 = 0x0014;
 const AR_CFG_HALT_REQ: u32 = 0x0800;
@@ -74,6 +79,13 @@ pub(super) enum Chip {
     /// AR9380/AR9390 PCIe (`0x0030`, `hw.h::AR9300_DEVID_PCIE`): three
     /// chains (`hw.c::ath9k_hw_fill_cap_info` chip_chainmask 7).
     Ar9300,
+    /// AR9580 PCIe (`0x0033`, `hw.h::AR9300_DEVID_AR9580`): three chains.
+    /// Linux tells it from an AR9300 only by `AR_SREV_9580` (macVersion
+    /// 0x1c0, macRev >= `AR_SREV_REVISION_9580_10`); `AR_SREV_9300` is
+    /// true for it as well, so every AR9300 branch keyed on the macVersion
+    /// applies, and only the `ar9003_hw.c` INI/gain selection (checked for
+    /// `AR_SREV_9580` before the AR9300 default) differs.
+    Ar9580,
 }
 
 impl Chip {
@@ -81,6 +93,7 @@ impl Chip {
     pub fn for_device(device: u16) -> Option<Self> {
         match device {
             0x0030 => Some(Self::Ar9300),
+            0x0033 => Some(Self::Ar9580),
             _ => None,
         }
     }
@@ -88,13 +101,14 @@ impl Chip {
     pub fn mac_version(self) -> u32 {
         match self {
             Self::Ar9300 => AR_SREV_VERSION_9300,
+            Self::Ar9580 => AR_SREV_VERSION_9580,
         }
     }
 
     /// `ath9k_hw_fill_cap_info`'s `chip_chainmask`.
     pub fn chip_chainmask(self) -> u8 {
         match self {
-            Self::Ar9300 => 0x7,
+            Self::Ar9300 | Self::Ar9580 => 0x7,
         }
     }
 }
@@ -111,8 +125,11 @@ pub(super) struct Revision {
 impl Revision {
     /// `hw.c::ath9k_hw_read_revisions` for the `AR_SREV_ID == 0xff` format
     /// (`(srev & AR_SREV_VERSION2) >> AR_SREV_TYPE2_S`, `AR_SREV_REVISION2`).
-    /// Only the macVersion of `expected` is accepted; the legacy format
-    /// cannot carry an AR9003 version.
+    /// Only the silicon of `expected` is accepted; the legacy format
+    /// cannot carry an AR9003 version. macVersion 0x1c0 is an AR9580 from
+    /// macRev `AR_SREV_REVISION_9580_10` on (`AR_SREV_9580`), so an AR9300
+    /// requires a lower macRev and an AR9580 at least that one: Linux would
+    /// silently run the other chip's tables on a mismatched device ID.
     pub fn decode(srev: u32, expected: Chip) -> Option<Self> {
         if srev == u32::MAX || srev & 0xff != 0xff {
             return None;
@@ -120,9 +137,14 @@ impl Revision {
         if (srev & 0xfffc_0000) >> 12 != expected.mac_version() {
             return None;
         }
+        let mac_rev = ((srev >> 8) & 0xf) as u8;
+        let ar9580 = mac_rev >= AR_SREV_REVISION_9580_10;
+        if ar9580 != (expected == Chip::Ar9580) {
+            return None;
+        }
         Some(Self {
             chip: expected,
-            mac_rev: ((srev >> 8) & 0xf) as u8,
+            mac_rev,
             pcie: srev & AR_SREV_TYPE2_HOST_MODE == 0,
         })
     }
@@ -130,6 +152,11 @@ impl Revision {
     /// `AR_SREV_9300_22`.
     pub fn ar9300_22(&self) -> bool {
         self.chip == Chip::Ar9300 && self.mac_rev == AR_SREV_REVISION_9300_22
+    }
+
+    /// `AR_SREV_9580`.
+    pub fn ar9580(&self) -> bool {
+        self.chip == Chip::Ar9580
     }
 }
 

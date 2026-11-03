@@ -2259,6 +2259,36 @@ program, matching the AR9280 station scope; ANI is not ported. Smokes
 `smoke_ath9k_ar9300_disable_and_full_sleep`. No physical AR9380/AR9390
 board record or receipt exists in-tree.
 
+**AR9580 (`ar9580_enablement`, in progress — not claimed).** Step 1
+(identity and INI): `ar9003::Chip::Ar9580` is PCIe `0x0033`
+(`hw.h::AR9300_DEVID_AR9580`, chip_chainmask 7). Linux tells it from an
+AR9300 only by `reg.h::AR_SREV_9580` (macVersion `AR_SREV_VERSION_9580`
+0x1c0 = the AR9300's, macRev >= `AR_SREV_REVISION_9580_10` 4);
+`AR_SREV_9300` (macVersion only) is true for it too, so every AR9300
+branch keyed on the macVersion applies unchanged (`ar9003_doubler_fix`,
+quick drop, xPA timing, the `hw.c::ath9k_hw_set_reset` DMA halt, the
+`ath9k_gpio_cap_init` AR9300 branch, which precedes the AR9580 one and
+gives the same 16 pins / 0xf4ff) and `AR_SREV_9300_22` is false.
+`Revision::decode` now splits the macVersion: an AR9300 requires macRev
+< 4 and an AR9580 at least 4 (Linux would run the other chip's tables on a
+mismatched device ID; here wrong silicon is refused before the first
+write). The EEPROM restore limits are the AR9300's. `ar9003/initvals_ar9580.rs`
+is every table of `ar9580_1p0_initvals.h` (20 names: 13 own tables of 1253 rows, generated
+verbatim in file order; its seven `#define` aliases onto 2p2 tables are
+aliases of the `ar9003/initvals.rs` constants). `ini::Tables::for_revision`
+dispatches `ar9003_hw_init_mode_regs` on `AR_SREV_9580` before the AR9300
+default: `Tables::ar9580` is the AR9580 branch (no PCIe SerDes arrays,
+RX `ar9580_1p0_rx_gain_table`, TX `ar9580_1p0_low_ob_db_tx_gain_table`
+defaults, 5-row DFS table) plus `ar9003_tx_gain_table_apply` (modes 0..6
+each have an AR9580 table, mode 5 included; mode 7 keeps the low-ob/db
+default; index >= 8 is mode 0) and `ar9003_rx_gain_table_apply` (mode 1
+`ar9580_1p0_wo_xlna_rx_gain_table`; modes 2/3 keep the default);
+`phy::prepare`/`expected` use it. AR9300 tables and streams are
+unchanged. Smoke (written, not executed):
+`smoke_ath9k_ar9580_revision_split_and_ini_selection` (FNV-1a oracle over
+the 886 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
+computed from the local Linux headers).
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,
