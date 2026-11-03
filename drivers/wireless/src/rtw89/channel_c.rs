@@ -366,7 +366,7 @@ fn spur_elimination(profile: Profile, out: &mut alloc::vec::Vec<Field>) {
 }
 
 /// `rtw8852c_ctrl_btg_bt_rx(en, PHY_0)`.
-fn btg_bt_rx(en: bool, out: &mut alloc::vec::Vec<Field>) {
+pub(super) fn btg_bt_rx(en: bool, out: &mut alloc::vec::Vec<Field>) {
     let e = u32::from(en);
     out.push((PHY + 0x4738, 1 << 19, e));
     out.push((PHY + 0x4738, 1 << 22, 0));

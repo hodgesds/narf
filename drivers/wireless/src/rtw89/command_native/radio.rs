@@ -3,8 +3,8 @@
 //! Native. No generic packet adapter can manufacture its ordinary receipt.
 use super::*;
 use crate::rtw89::{
-    operating_channel, power, radio_assets, radio_full, radio_init, radio_policy, radio_power, rfk,
-    tssi,
+    operating_channel, operating_channel_c, power, radio_assets, radio_c, radio_full, radio_init,
+    radio_policy, radio_power, radio_power_c, rfk, tssi,
 };
 use alloc::sync::Arc;
 pub(in crate::rtw89) struct RadioPreflight {
@@ -760,5 +760,153 @@ impl crate::rtw89::phy_operating::Interface for Native {
         // SAFETY: same exact initial owner; no competing power/XTAL producer.
         unsafe { crate::rtw89::radio_shutdown::xtal_write(self, address, value, mask).await }
             .map_err(Into::into)
+    }
+}
+
+/// RTL8852C chip dispatch of the post-table radio owner (`radio_c`). The B
+/// byte streams above are untouched; this is the C composition with the
+/// same retained-owner structure and the same fail-closed admission.
+impl Native {
+    /// Typed C channel from a 2.4GHz (1..=14) or 5GHz 20MHz primary, with its
+    /// `rtw8852c_set_txpwr` program. 6GHz stays refused (no 6GHz TPE/regd).
+    fn channel_plan_c(
+        assets: &radio_assets::Assets,
+        rfe: u8,
+        primary: u8,
+    ) -> Result<(operating_channel_c::Profile, radio_power_c::Plan), power::Error> {
+        use operating_channel_c::{Band, Profile};
+        let band = if primary <= 14 {
+            Band::Ghz2
+        } else {
+            Band::Ghz5
+        };
+        let profile = Profile::new20(band, primary).ok_or(power::Error::Unsupported)?;
+        let plan = radio_power_c::Plan::from_assets(assets, rfe, profile).map_err(denied)?;
+        Ok((profile, plan))
+    }
+    /// The C counterpart of `prepare_basic_rfk` + `prepare_full_radio` for
+    /// the initial primary: `radio_c::Radio::prepare_controls` (bb_sethw,
+    /// NCTL), then `radio_c::Radio::prepare` (`rtw8852c_rfk_init`,
+    /// set_txpwr_ctrl, power trim, cfg_txrx_path, `__rtw89_set_channel`,
+    /// `rtw8852c_rfk_channel`) and the `RF_GET_MCCCH` V0 H2C (category 2,
+    /// class 0x0a, function 2, 24-byte body; fw.c `RFK_NTFY_MCC_V0`).
+    ///
+    /// Admission is the same signed current envelope B uses
+    /// (`calibration_access`/`rfk::Interface::admit`: a current calibration
+    /// record, coexistence and NCTL ready). No C board/qualification record
+    /// format or C coexistence owner exists yet, so an actual RTL8852C stays
+    /// unadmitted and this returns before its first register write. No
+    /// ordinary grant is ever installed for C here.
+    ///
+    /// # Safety
+    /// Same retained Startup owner after C `prepare_radio_tables`; the outer
+    /// Attempt terminalizes this Native and retains DMA on failure/cancel.
+    pub(in crate::rtw89) async unsafe fn prepare_radio_c(
+        &mut self,
+        owner: &mut radio_c::Radio,
+        tables: &radio_init::Init,
+        assets: &radio_assets::Assets,
+        primary: u8,
+    ) -> Result<(), power::Error> {
+        if self.state != State::Active
+            || self.chip != ChipId::Rtl8852C
+            || owner.state() != radio_c::State::New
+            || self.ordinary.is_some()
+            || self.full_qualification.is_some()
+            || self.nctl_ready
+            || tables.state() != radio_init::State::TablesLoaded
+        {
+            return Err(power::Error::Terminal);
+        }
+        self.radio_profile_current()?;
+        // Signed current envelope before any write (fail closed for C).
+        self.calibration
+            .as_ref()
+            .ok_or(power::Error::Access)?
+            .current()
+            .map_err(denied)?;
+        if !self.coex_ready {
+            return Err(power::Error::Access);
+        }
+        self.radio_access()?;
+        let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+        let identity = factory.identity().ok_or(power::Error::Unsupported)?;
+        let calibration = *tables.calibration_c().ok_or(power::Error::Unsupported)?;
+        if identity.chip() != ChipId::Rtl8852C
+            || crate::rtw89::factory_c::Calibration::from_factory(factory) != Some(calibration)
+        {
+            return Err(power::Error::Access);
+        }
+        let rfe = identity.calibration().rfe_type;
+        let cut = identity.cut();
+        let gain = tables.gain().ok_or(power::Error::Unsupported)?.clone();
+        let (_, plan) = Self::channel_plan_c(assets, rfe, primary)?;
+        let tracking = rfk::c_tssi::Tracking::from_assets(assets).map_err(denied)?;
+        let nctl = crate::rtw89::radio_table::program(
+            assets.table(4).ok_or(power::Error::Unsupported)?,
+            rfe,
+            cut,
+        )
+        .map_err(denied)?;
+        let rx_nss = self
+            .firmware_phycap()
+            .ok_or(power::Error::Unsupported)?
+            .rx_nss();
+        self.radio_started = true;
+        // SAFETY: caller contract; admission rechecked by every Port access.
+        unsafe { owner.prepare_controls(self, &nctl) }
+            .await
+            .map_err(radio_c::error)?;
+        self.nctl_ready = true;
+        // SAFETY: same owner after bb_sethw/NCTL; rfk::Interface admits
+        // every access against the retained envelope.
+        let mcc = unsafe {
+            owner.prepare(
+                self,
+                radio_c::Inputs {
+                    gain: &gain,
+                    calibration: &calibration,
+                    power: &plan,
+                    tracking: &tracking,
+                    cut,
+                    rx_nss,
+                },
+            )
+        }
+        .await
+        .map_err(radio_c::error)?;
+        self.runtime_command(2, 0x0a, 2, &mcc, false, super::station::Permit::Legacy)
+            .await?;
+        if owner.state() != radio_c::State::Ready {
+            return Err(power::Error::Terminal);
+        }
+        self.channel = Some((primary, owner.epoch()));
+        Ok(())
+    }
+}
+impl Native {
+    /// Chip dispatch of `phy_profile_current`: B unchanged; C requires the
+    /// actual C factory identity and the same firmware PHY-capability
+    /// receipt topology (two-stream RX-AB; RTL8852C `rx_nss` = 2).
+    pub(super) fn radio_profile_current(&self) -> Result<(), power::Error> {
+        if self.chip != ChipId::Rtl8852C {
+            return self.phy_profile_current();
+        }
+        crate::rtw88::pci_park::invoke(&self.authority, || {
+            if self.state != State::Active
+                || self
+                    .factory
+                    .as_ref()
+                    .and_then(|factory| factory.identity())
+                    .is_none_or(|identity| identity.chip() != ChipId::Rtl8852C)
+            {
+                return Err(power::Error::Terminal);
+            }
+            self.phycap
+                .as_ref()
+                .ok_or(power::Error::Unsupported)?
+                .initial_profile()
+        })
+        .map_err(|_| power::Error::Access)?
     }
 }

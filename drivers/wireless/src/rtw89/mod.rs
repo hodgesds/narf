@@ -124,6 +124,7 @@ mod power_tables;
 mod prepared;
 mod qos;
 mod radio_assets;
+mod radio_c;
 mod radio_full;
 mod radio_gain;
 mod radio_init;

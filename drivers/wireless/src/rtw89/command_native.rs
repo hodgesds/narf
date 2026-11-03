@@ -443,14 +443,29 @@ impl Native {
         result
     }
     fn radio_access(&mut self) -> Result<(), super::power::Error> {
+        // Chip dispatch: B or C with its own factory PHY-cap and window.
+        let phycap = match self.chip {
+            ChipId::Rtl8852B => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.b_phycap().is_some()),
+            ChipId::Rtl8852C => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.c_phycap().is_some()),
+            _ => false,
+        };
         if self.state != State::Active
-            || self.chip != ChipId::Rtl8852B
+            || !phycap
             || self.receive.state() != super::rx_dma::State::Polling
-            || self.factory.as_ref().is_none_or(|f| f.b_phycap().is_none())
         {
             return Err(super::power::Error::Unsupported);
         }
-        self.io.b_phy_window()?;
+        if self.chip == ChipId::Rtl8852C {
+            self.io.c_phy_window()?;
+        } else {
+            self.io.b_phy_window()?;
+        }
         let functions = self.io.read32(0xc000)?;
         if functions == u32::MAX || functions & (1 << 29) != 0 {
             return Err(super::power::Error::Access);
@@ -621,13 +636,18 @@ impl Native {
         owner: &mut super::radio_init::Init,
         assets: &super::radio_assets::Assets,
     ) -> Result<(), super::radio_init::Error> {
-        self.phy_profile_current()?;
+        self.radio_profile_current()?;
         self.radio_access()?;
-        let qualified = super::radio_init::Qualified::from_factory(
-            self.factory
-                .as_ref()
-                .ok_or(super::radio_init::Error::Profile)?,
-        )
+        let factory = self
+            .factory
+            .as_ref()
+            .ok_or(super::radio_init::Error::Profile)?;
+        // Chip dispatch: B or C tables from the matching factory snapshot.
+        let qualified = if self.chip == ChipId::Rtl8852C {
+            super::radio_init::Qualified::from_factory_c(factory)
+        } else {
+            super::radio_init::Qualified::from_factory(factory)
+        }
         .ok_or(super::radio_init::Error::Profile)?;
         // Latch before the first possible BB/RF write; cancellation cannot
         // hide independent PMAC/NCTL state from terminal emission closure.
@@ -642,7 +662,7 @@ impl Native {
         page: u8,
         bytes: &[u8],
     ) -> Result<(), super::radio_init::Error> {
-        self.phy_profile_current()?;
+        self.radio_profile_current()?;
         self.radio_access()?;
         self.transmit_radio_page(path, page, bytes).await
     }

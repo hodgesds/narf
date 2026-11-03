@@ -3056,11 +3056,46 @@ Unexecuted cases:
 `smoke_rtw89_c_txpwr_selection_follows_rtw89_fw_recognize_txpwr_from_elm`,
 `smoke_rtw89_c_set_txpwr_follows_rtw8852c_and_phy_ax`.
 
+**C radio owner and native chip dispatch (`radio_c`).** `radio_c::Radio`
+is the retained C counterpart of `radio_full::Radio`, in phy.c
+`rtw89_phy_dm_init` order after the C tables: `prepare_controls`
+(`rtw8852c_bb_sethw` = `radio_init::controls_c`, keeping both
+`offset_base` bytes; `rtw89_phy_init_rf_nctl` = `nctl_c`; `rfk_hw_init`/
+`rfe_gpio` are NULL for C) before any RFK admission, then `prepare`:
+`rtw8852c_rfk_init` (`rfk::c::Init`), `rtw8852c_set_txpwr_ctrl`
+(`rtw8852c_set_txpwr_ref(0)`, B's reference words), `rtw8852c_power_trim`
+(`power_trim_writes`: RR_TM2 OFF `__thm_setting` per path, then RR_BIASA
+TXG/TXA, each only with programmed PHY-cap trim), `rtw8852c_bb_cfg_txrx_path`
+(`txrx_path_fields`: `rtw8852c_bb_cfg_rx_path(RF_PATH_AB)` with the
+default-chandef 2.4GHz `ctrl_btg_bt_rx`, then the `hal.rx_nss` HT/VHT/HE
+limits; every final bit read back), `Channel::set_channel` with the
+`radio_power_c::Plan` for the initial primary and `rfk_channel`, returning
+the 24-byte MCC V0 body. `retune` is `set_channel` + `rfk_channel` on a Ready
+radio. The phy.c DM sub-inits (PHYSTS/DIG/CFO/EDCCA) stay B-only
+(`phy_operating`). Native dispatch: `radio_access` admits B or C with the
+chip's own factory PHY-cap and PHY window (`NativeIo::c_phy_window`, same
+`rf_base_addr`), `radio_profile_current` dispatches the PHY-profile check
+(C: actual C identity + firmware receipt topology), `prepare_radio_tables`
+selects `Qualified::from_factory_c` for C, and
+`Native::prepare_radio_c(owner, tables, assets, primary)` runs the owner and
+sends `RF_GET_MCCCH` (H2C 2/0x0a/2) with the V0 body. Its admission is B's
+signed current envelope (current calibration record, coexistence ready, then
+`rfk::Interface::admit`), checked before the first write; no C record format
+or C coexistence owner exists, so an actual RTL8852C stays unadmitted and no
+ordinary grant is installed. No Startup caller invokes it; the C native
+lifecycle is also refused upstream (`prepare_mac`, `prepare_receive` and the
+firmware PHY-cap fetch are B-only). Unexecuted cases:
+`smoke_rtw89_c_dm_init_txrx_path_and_power_trim_follow_rtw8852c`,
+`smoke_rtw89_c_radio_owner_starts_new`.
+
 Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
-C `power::Calibration`/qualification records (N52x are B-bound), the native
-caller sending the MCC V0 H2C and invoking `set_channel`/`rfk_channel`,
-`command_native`/`startup_station` admission (B-only at
-`Io::station_allowed`, `Startup::start` assets), and native execution.
+C `power::Calibration`/qualification records (N52x are B-bound), a
+Startup caller of `Native::prepare_radio_c` (which exists, unadmitted), the
+C native MAC/RX/firmware-PHY-cap lifecycle (`prepare_mac`,
+`prepare_receive`, `command_native/phycap.rs` are B-only; C uses the V1
+C2H register block), the C phy.c DM sub-inits, `command_native`/
+`startup_station` admission (B-only at `Io::station_allowed`,
+`Startup::start` assets), and native execution.
 Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
