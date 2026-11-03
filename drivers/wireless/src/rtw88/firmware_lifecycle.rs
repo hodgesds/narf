@@ -143,6 +143,9 @@ impl<I: Io> Lifecycle<I> {
     pub(super) fn device_id(&self) -> u16 {
         self.did
     }
+    pub(super) fn interface(&self) -> super::phy8821c::Interface {
+        self.interface
+    }
     pub(super) async fn ht20_request(&self) -> Result<super::Ht20Request, Error> {
         self.retained
             .lock()

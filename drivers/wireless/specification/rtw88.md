@@ -3249,9 +3249,28 @@ grant is published. Remaining blockers, verified against the tree:
      MPDUs dropped). C2H records also feed CCX matching.
    - Any USB error fails the owner (the 8188EU halt-recovery sequence is not
      ported); `stop` retires every retained receipt through `Io::stop`.
-   Open: the station worker. `interface.rs`/`pci_firmware.rs` still drive
-   `packet_core::Core` and `ready_now`; a USB station needs an async worker
-   owning `usb_packet::Owner` plus the async register `Io`.
+   Station worker (landed): `firmware_transport::Io::SYNCHRONOUS`
+   (default `true`; the USB backend is `false`) selects how
+   `interface::Device` drives the owner. `Device::step` is the single
+   progress turn (poll, publish, one TX slot or batch); each owner future
+   goes through `settle`, which is `ready_now` for a synchronous backend
+   (PCI semantics and byte stream unchanged) and an `.await` otherwise. The
+   synchronous `progress`/`drain` (stack RX drain, endpoint `drain`) are
+   no-ops for USB; `interface::publish`'s spawned loop awaits
+   `Device::drain_async` (`step` + delivery) instead. `set_rts_threshold`
+   on USB records the value (EOPNOTSUPP when RTS is not capable) and the
+   worker applies it through `station_set_rts_threshold` (Busy retries,
+   a newer request supersedes; Linux `rtw_ops_set_rts_threshold` also only
+   records it). `publish` names an RTL8821CU (`Interface::Usb`, C21,
+   asynchronous) `rtw8821cu`. `Io::dynamic_rx_agg` (default no-op =
+   `rtw_pci_ops.dynamic_rx_agg == NULL`) is `rtw_usb_dynamic_rx_agg_v1` on
+   USB; the station watchdog (`station_rx_agg.rs`) counts delivered/sent
+   unicast DATA bytes over each 2 s period and programs
+   `tx_mbps >= 1 || rx_mbps >= 1` (`main.c::rtw_watch_dog_work`,
+   `RTW_TP_SHIFT`) inside the admission, only for `Hci::Usb` and only when
+   the selection changes. Written, unexecuted:
+   `smoke_rtw88_usb_station_worker_dynamic_rx_agg` (also a static `Send`
+   check of the USB worker turn).
    The synchronous register-touching `Io` surface is converted (option
    (b), as blocker 1): `mailbox_ready`/`mailbox_submit`/`mailbox_consumed`,
    `ps_mailbox_submit` (`PsScope` is now `Send`), `submit_h2c`/`poll_h2c`,
@@ -3334,7 +3353,7 @@ grant is published. Remaining blockers, verified against the tree:
    `Factory8821c::on_usb` (MAC at 0x107). Each poll is an EP0 transfer, so
    nothing spins; the PCI `EfuseIo` path is unchanged. Written, unexecuted:
    `smoke_rtw88_usb_efuse_factory_async`.
-   Remaining: the USB station worker, then step 5.
+   Remaining: USB retune/width/power tracking (below), then registration.
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,

@@ -352,6 +352,11 @@ impl<F: FnMut(u16) -> Result<u32, Error> + Send> Read32 for Sampled<F> {
 /// no unrelated command/reset/ring client may race either path.
 #[async_trait::async_trait]
 pub(super) unsafe trait Io: Send {
+    /// Every register future completes in its first poll (PCI MMIO). A
+    /// backend whose accesses are real transfers (USB EP0/bulk) is `false`:
+    /// synchronous `ready_now` shells (`interface::Device::drain`) are then
+    /// no-ops and its station is driven by the asynchronous worker.
+    const SYNCHRONOUS: bool = true;
     /// Host interface whose MAC queue/FIFO rows `prepare_mac` programs.
     fn hci(&self) -> super::mac::Hci {
         super::mac::Hci::Pcie
@@ -737,6 +742,15 @@ pub(super) unsafe trait Io: Send {
     fn packet_close(
         &mut self,
     ) -> impl core::future::Future<Output = Result<(), super::packet_core::Error>> + Send {
+        async move { Ok(()) }
+    }
+    /// Linux `rtw_hci_dynamic_rx_agg` from `rtw_watch_dog_work`: PCI's
+    /// `rtw_pci_ops.dynamic_rx_agg` is NULL (no-op); USB overrides it.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn dynamic_rx_agg(
+        &mut self,
+        _enable: bool,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
         async move { Ok(()) }
     }
     fn packet_ready(&self) -> bool {

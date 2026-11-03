@@ -394,3 +394,52 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_packet_open_close_async
 );
+
+/// Static: the `interface::publish` worker turn over the USB backend is a
+/// `Send` future (it is `narf_scheduler::spawn`ed). Type-checked, not run.
+fn usb_worker_is_send(device: &super::interface::Device<Backend<Fake, Fake>>) {
+    fn send<T: Send>(_: &T) {}
+    let turn = device.drain_async();
+    send(&turn);
+}
+
+/// The USB backend is asynchronous (`Io::SYNCHRONOUS = false`), so the
+/// synchronous shell never `ready_now`s it; `dynamic_rx_agg` is
+/// `rtw_usb_dynamic_rx_agg_v1` (TXDMA_PQ_MAP |= RXDMA_AGG_EN,
+/// RXDMA_AGG_PG_TH+3 &= !BIT7, AGG_PG_TH = size | timeout << 8) and is
+/// refused before packets open.
+fn smoke_rtw88_usb_station_worker_dynamic_rx_agg() -> TestResult {
+    let _static: fn(&super::interface::Device<Backend<Fake, Fake>>) = usb_worker_is_send;
+    if <Backend<Fake, Fake> as super::firmware_transport::Io>::SYNCHRONOUS {
+        return TestResult::Fail("USB backend claims synchronous registers");
+    }
+    let fake = Fake::default();
+    let mut b = backend(&fake);
+    if complete(b.dynamic_rx_agg(true)).is_ok() {
+        return TestResult::Fail("rx agg before packets");
+    }
+    let fake = Fake::default();
+    let mut b = backend(&fake);
+    if b.opened_for_test([0x02, 0, 0, 0, 0, 1]).is_err() {
+        return TestResult::Fail("fixture");
+    }
+    fake.0.lock().regs.insert(0x283, 0x80);
+    for (enable, th) in [(true, 0x2005u16), (false, 0x0100)] {
+        fake.0.lock().writes.clear();
+        if complete(b.dynamic_rx_agg(enable)).is_err() {
+            return TestResult::Fail("rx agg");
+        }
+        let m = fake.0.lock();
+        if m.regs.get(&0x10c).copied().unwrap_or(0) & 1 << 2 == 0
+            || m.regs.get(&0x283).copied().unwrap_or(0) & 0x80 != 0
+            || m.writes.last() != Some(&(0x280, th.to_le_bytes().to_vec()))
+        {
+            return TestResult::Fail("rtw_usb_dynamic_rx_agg_v1 sequence");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_station_worker_dynamic_rx_agg
+);

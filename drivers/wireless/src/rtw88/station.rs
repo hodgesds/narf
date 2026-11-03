@@ -214,6 +214,8 @@ pub(super) struct State {
     coex: Coexistence,
     /// Coexistence-driven `hal.txrx_1ss` (`main.c::rtw_set_txrx_1ss`).
     one_ss: OneSs,
+    /// `rtw_watch_dog_work`'s `rtw_hci_dynamic_rx_agg` traffic window.
+    rx_agg: rx_agg::RxAgg,
 }
 /// `hal.txrx_1ss` as the station follows it: the coexistence owner programs
 /// `config_trx_mode`, the station limits DATA/RA to one stream without STBC
@@ -370,6 +372,7 @@ impl State {
             witness_scan: None,
             coex: Coexistence::default(),
             one_ss: OneSs::default(),
+            rx_agg: rx_agg::RxAgg::default(),
         }
     }
     /// Exact retained efuse antenna facts for the coexistence owner.
@@ -706,6 +709,7 @@ impl State {
                 self.one_ss.ra = false;
             }
         }
+        self.dynamic_rx_agg(io).await?;
         if self.tracking.grant.is_none() || !self.established || !self.ready() {
             return Ok(power_changed);
         }
@@ -1045,6 +1049,7 @@ impl State {
         }
     }
     fn coex_rx(&mut self, len: usize) {
+        self.rx_agg.rx(len);
         let t = &mut self.coex.traffic;
         t.rx_cnt = t.rx_cnt.saturating_add(1);
         t.rx_bytes = t.rx_bytes.saturating_add(len as u64);
@@ -2931,6 +2936,7 @@ impl State {
             return Err(Error::Profile);
         }
         self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
+        self.rx_agg.tx(frame.len());
         self.coex.traffic.tx_cnt = self.coex.traffic.tx_cnt.saturating_add(1);
         self.coex.traffic.tx_bytes = self
             .coex
@@ -2997,6 +3003,8 @@ impl State {
 }
 #[path = "station_tx_amsdu.rs"]
 mod amsdu;
+#[path = "station_rx_agg.rs"]
+mod rx_agg;
 #[path = "station_tx_ba.rs"]
 mod tx;
 /// The primary is passive-only (cfg80211 RADAR / NO_IR) under `policy`.

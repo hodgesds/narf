@@ -321,6 +321,9 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
 // completion or by `quiesce_dma`'s endpoint stop, and every failure poisons
 // the backend before further register or bulk mutation.
 unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C, P> {
+    /// Every register access is an EP0 transfer: the station runs on the
+    /// asynchronous `interface` worker, never through `ready_now`.
+    const SYNCHRONOUS: bool = false;
     fn hci(&self) -> super::mac::Hci {
         super::mac::Hci::Usb {
             bulkout: self.endpoints.out_count,
@@ -909,6 +912,26 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
             }
             self.state = State::Closed;
             Ok(())
+        }
+    }
+    /// `usb.c::rtw_usb_dynamic_rx_agg` -> `rtw_usb_dynamic_rx_agg_v1`
+    /// (`RTW_CHIP_TYPE_8821C`). Only with packets open; a failed EP0
+    /// transfer leaves the backend terminal.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn dynamic_rx_agg(
+        &mut self,
+        enable: bool,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.state != State::Packets || !self.opened() {
+                return Err(Error::State);
+            }
+            let result = self
+                .registers
+                .dynamic_rx_agg(enable)
+                .await
+                .map_err(usb_error);
+            self.fail(result)
         }
     }
     fn packet_ready(&self) -> bool {
