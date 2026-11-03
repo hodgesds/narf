@@ -2,6 +2,7 @@
 //! Retained RTL8852B 2.4GHz/20MHz host station state (channel1 initially;
 //! signed noninitial primaries 2..=13 through the native retune owner). The exact firmware Owner
 //! keeps its native backend; this state never owns or reconstructs hardware.
+use super::command_native::OperatingChannel;
 use super::{
     packet_core::{self as packet, Frame as Mpdu, Receipt},
     power,
@@ -703,8 +704,9 @@ pub(super) struct State {
     witness: BeaconWitness,
     /// Witness generation of the dwell in progress, if any.
     witness_scan: Option<ScanGeneration>,
-    /// Actual primary of the retained radio (native retune epoch below).
-    channel: u8,
+    /// Band-qualified actual channel of the retained radio (native retune
+    /// epoch below); 2.4/5GHz legacy numbering until a 6GHz retune exists.
+    channel: OperatingChannel,
     /// The admitted 40/80MHz operating channel the radio is tuned to around
     /// `channel`, if any (`None`: the 20MHz profile of `channel`).
     wide: Option<super::operating_channel::Profile>,
@@ -845,7 +847,7 @@ impl State {
             scanning: false,
             witness: BeaconWitness::new(),
             witness_scan: None,
-            channel: 1,
+            channel: OperatingChannel::legacy(1),
             wide: None,
             epoch: None,
             csa: None,
@@ -1205,7 +1207,7 @@ impl State {
                 .ok_or(Error::Profile)?
         } else {
             // rtw89_core_get_mgmt_rate: CCK1 on 2.4GHz, OFDM6 on 5GHz.
-            if ghz5(self.channel) {
+            if self.channel.ofdm_only() {
                 super::packet_format::OFDM6
             } else {
                 0
@@ -1238,20 +1240,22 @@ impl State {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
         let own = self.scan.unwrap_or(self.own);
-        let Ok(candidate) = association::observe(frame, self.channel, own, signal) else {
+        let Ok(candidate) = association::observe(frame, self.channel.primary(), own, signal) else {
             return;
         };
         // cfg80211 `beacon_found` for this dwell's witness: an actual Beacon
         // (not a probe response) observed on the tuned primary.
         if let Some(generation) = self.witness_scan.filter(|_| self.scanning) {
             if frame.bytes().first() == Some(&0x80)
-                && candidate.bss.channel == self.channel
+                && candidate.bss.channel == self.channel.primary()
                 && candidate.bss.beacon_interval != 0
             {
-                let _ = self.witness.beacon_found(generation, center(self.channel));
+                let _ = self
+                    .witness
+                    .beacon_found(generation, center(self.channel.primary()));
             }
         }
-        if !basic_ok(self.channel, candidate.basic_rates) {
+        if !basic_ok(self.channel.primary(), candidate.basic_rates) {
             return;
         }
         if self
@@ -1309,7 +1313,7 @@ impl State {
         let (Some(current), Some(peer)) = (self.wmm, &self.peer) else {
             return Ok(());
         };
-        let Some(candidate) = association::observe(frame, self.channel, self.own, None)
+        let Some(candidate) = association::observe(frame, self.channel.primary(), self.own, None)
             .ok()
             .filter(|candidate| candidate.bss.bssid == peer.bss.bssid)
         else {
@@ -1330,7 +1334,7 @@ impl State {
         }
         if self.phase != Phase::Open
             || offered.uapsd != current.uapsd
-            || super::station_control::wmm_admit(offered, self.short_slot, ghz5(self.channel))
+            || super::station_control::wmm_admit(offered, self.short_slot, self.channel.ofdm_only())
                 .is_err()
         {
             return Err(Error::PeerLost);
@@ -1355,13 +1359,13 @@ impl State {
         let Some(peer) = self.peer.as_ref().map(|peer| peer.bss.bssid) else {
             return Ok(());
         };
-        let Some(candidate) = association::observe(frame, self.channel, self.own, None)
+        let Some(candidate) = association::observe(frame, self.channel.primary(), self.own, None)
             .ok()
             .filter(|candidate| candidate.bss.bssid == peer)
         else {
             return Ok(());
         };
-        let announced = channel_switch(&candidate.bss.information_elements, self.channel);
+        let announced = channel_switch(&candidate.bss.information_elements, self.channel.primary());
         if let Some(active) = self.csa {
             if active.switched {
                 self.csa = None;
@@ -1378,7 +1382,7 @@ impl State {
         let Some(primary) = announced.primary else {
             return Err(Error::PeerLost);
         };
-        if primary == self.channel {
+        if primary == self.channel.primary() {
             return Ok(());
         }
         if !channel_admitted(io.station_channels()?, primary) {
@@ -1475,7 +1479,7 @@ impl State {
         };
         match result {
             Ok(epoch) => {
-                self.channel = csa.primary;
+                self.channel = OperatingChannel::legacy(csa.primary);
                 self.epoch = Some(epoch);
                 if let Some(peer) = self.peer.as_mut() {
                     // An ECSA may move the link to the other band.
@@ -2040,15 +2044,15 @@ impl State {
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
                         // mac80211: 5GHz always uses the short slot time.
-                        let short =
-                            ghz5(self.channel) || peer.bss.capability & response_cap & 0x400 != 0;
+                        let short = self.channel.ofdm_only()
+                            || peer.bss.capability & response_cap & 0x400 != 0;
                         if self.wmm.is_some() {
                             let p = narf_wireless::wmm::Parameters::parse(
                                 frame.bytes().get(30..).ok_or(Error::Profile)?,
                             )
                             .map_err(|_| Error::Profile)?
                             .ok_or(Error::Profile)?;
-                            super::station_control::wmm_admit(p, short, ghz5(self.channel))?;
+                            super::station_control::wmm_admit(p, short, self.channel.ofdm_only())?;
                             self.wmm = Some(p);
                         }
                         self.peer_commit = Some((aid, short));
@@ -2280,7 +2284,7 @@ impl State {
         // mac80211 `ieee80211_scan_state_decision`: a RADAR / NO_IR channel
         // is dwelt passively; no probe request (nor random scan address).
         let policy = io.station_regulatory()?;
-        let probe = probe.filter(|_| !passive_only(policy.as_ref(), self.channel));
+        let probe = probe.filter(|_| !passive_only(policy.as_ref(), self.channel.primary()));
         // ieee80211_send_scan_probe_req: one get_random_u16() per probe,
         // drawn before any address CAM or RF activity so missing entropy
         // fails the scan without a transmission.
@@ -2308,9 +2312,10 @@ impl State {
             self.scan = Some(address);
         }
         // A new covering scan retracts this primary's earlier witness.
-        self.witness_scan = policy
-            .as_ref()
-            .map(|policy| self.witness.begin_scan(policy, &[center(self.channel)]));
+        self.witness_scan = policy.as_ref().map(|policy| {
+            self.witness
+                .begin_scan(policy, &[center(self.channel.primary())])
+        });
         self.scanning = true;
         let result = self.scan_dwell(io, until, probe, random_sn).await;
         self.scanning = false;
@@ -2338,7 +2343,7 @@ impl State {
     }
     /// Actual primary of the retained radio.
     pub(super) fn channel(&self) -> u8 {
-        self.channel
+        self.channel.primary()
     }
     /// Retune the unassociated station to `primary` through the native
     /// owner (`Io::station_retune`). Like mac80211 `ieee80211_offchannel_stop_vifs`
@@ -2352,7 +2357,7 @@ impl State {
         if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
             return Err(Error::State);
         }
-        if primary == self.channel && self.wide.is_none() {
+        if primary == self.channel.primary() && self.wide.is_none() {
             return Ok(());
         }
         let deadline = self.now()?.saturating_add(1000);
@@ -2361,7 +2366,7 @@ impl State {
             if self.pending.is_empty() {
                 match io.station_retune(primary, &self.admission).await {
                     Ok(epoch) => {
-                        self.channel = primary;
+                        self.channel = OperatingChannel::legacy(primary);
                         self.wide = None;
                         self.epoch = Some(epoch);
                         // rtw89_track_work statistics belong to the old primary.
@@ -2398,7 +2403,7 @@ impl State {
             if self.pending.is_empty() {
                 match io.station_retune_wide(profile, &self.admission).await {
                     Ok(epoch) => {
-                        self.channel = profile.primary();
+                        self.channel = OperatingChannel::legacy(profile.primary());
                         self.wide = Some(profile);
                         self.epoch = Some(epoch);
                         self.track = super::track::Tracker::default();
@@ -2462,7 +2467,7 @@ impl State {
                     }
                     self.environment.pause().await;
                 }
-                let mut frame = probe_request(source, &ssid, &probe.ies, self.channel);
+                let mut frame = probe_request(source, &ssid, &probe.ies, self.channel.primary());
                 let assign = match random_sn {
                     Some(random) => {
                         // IEEE80211_SN_TO_SEQ(get_random_u16()).
@@ -2712,8 +2717,12 @@ impl State {
                         let plan = self.plan.as_ref().ok_or(Error::State)?;
                         // phy.c rtw89_phy_ra_sta_update: a 5GHz peer's
                         // supp_rates[5GHz] << 4 is OFDM-only (no RA CCK mode).
-                        let rates =
-                            plan.legacy_rates().0 & if ghz5(self.channel) { 0xff0 } else { 0xfff };
+                        let rates = plan.legacy_rates().0
+                            & if self.channel.ofdm_only() {
+                                0xff0
+                            } else {
+                                0xfff
+                            };
                         let ht = plan.negotiated_phy().map(|phy| {
                             let ht = phy.ht();
                             let m = ht.peer_rx_mcs();

@@ -3762,7 +3762,10 @@ board value is carried. *Native:* `Native::channel` is a band-qualified
 `OperatingChannel` (band, primary): 6GHz 1/5/9/13 never read as 2.4GHz;
 B records `OperatingChannel::legacy` (1..=14 2.4GHz, else 5GHz) and its
 OFDM floor (`lowest_rate`, `ghz5`) and monitor retune comparison are
-unchanged. `preflight_radio_c` stages 6GHz records lazily by name: under
+unchanged. The station `State::channel` is the same `OperatingChannel`
+(retune/wide/CSA record `legacy`; the OFDM-only predicates for the
+management rate, short slot, WMM and legacy-rate mask read its band), so
+2.4/5GHz station bytes are unchanged. `preflight_radio_c` stages 6GHz records lazily by name: under
 the host policy snapshot's country, for each `POWER_TYPES_6GHZ` whose
 `SixGhzPower::new` context exists, every `noninitial_6ghz` profile is first
 probed with `has_channel_6ghz` and only a provisioned name builds the
