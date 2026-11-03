@@ -651,7 +651,11 @@ pub struct MtlExternalRoute {
 }
 
 /// Why [`activate`] did not produce a live route.
+///
+/// Both variants hand the owner back by value, once per activation; the
+/// route's size is its retained reservation, not a hot-path copy.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ActivateError {
     /// Refused before any programming; the probe is handed back intact.
     Refused(MtlSinkProbe, ExternalError),
