@@ -885,6 +885,8 @@ pub(crate) mod intel_gpu_xelpg_pipes;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xelpg_resources;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_xelpg_scaler;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg_tc;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xelpg_wm;
