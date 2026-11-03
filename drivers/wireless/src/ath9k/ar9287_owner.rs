@@ -18,7 +18,8 @@
 //! power-on/warm-reset (`hw.c::ath9k_hw_reset`), its revision, identity and
 //! factory map must match, and `phy::ar9287::prepare`, the open-loop power
 //! plan and calibration repeat at the target before a fresh station
-//! generation is published. HT stays AR9285-only.
+//! generation is published. The same reset follows a terminal generation
+//! and system resume. HT stays AR9285-only.
 use super::{
     admission, calibration,
     chips::{Chip, Revision},
@@ -35,6 +36,8 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 const PRIMARY: u16 = 2412;
 /// `ath9k.h::ATH_LONG_CALINTERVAL` (30 s) of `link.c::ath_ani_calibrate`.
 const LONG_CAL_NS: u64 = 30_000_000_000;
+/// Terminal-generation poll interval, the AR9285 supervisor's.
+const SUPERVISE_NS: u64 = 500_000_000;
 /// (PCI device, unique bus-match name). `hw.h::AR9287_DEVID_PCI` and
 /// `AR9287_DEVID_PCIE`.
 pub(super) const DEVICES: [(u16, &str); 2] = [(0x002d, "ath9k-ar9287"), (0x002e, "ath9k-ar9287e")];
@@ -426,39 +429,85 @@ async fn reset(
     initialize(owner).await
 }
 
-/// `link.c::ath_ani_calibrate` long-calibration cadence for the live
-/// station: `ar9002_hw_calibrate(longcal)` runs
-/// `ar9287_hw_olc_temp_compensation` (PA offset calibration is AR9285/AR9271
-/// only; ADC DC is an HT40 per-calibration and this owner is 20 MHz).
-async fn supervise(owner: Arc<Mutex<Owner>>) {
+/// Rejoin supervisor and `link.c::ath_ani_calibrate` long-calibration
+/// cadence. A terminal station generation (disassociation, link loss, fatal
+/// interrupt or failed DMA) is followed by a cold generation reset into a
+/// fresh passive station, exactly as the AR9285 supervisor does; a pinned
+/// or removed owner is never followed. Every `ATH_LONG_CALINTERVAL` the live
+/// station runs `ar9002_hw_calibrate(longcal)`'s AR9287 step,
+/// `ar9287_hw_olc_temp_compensation` (PA offset calibration is
+/// AR9285/AR9271 only; ADC DC is an HT40 per-calibration and this owner is
+/// 20 MHz).
+async fn supervise(owner: Shared) {
+    let mut failures = 0u32;
+    let mut long_due = narf_time::monotonic_ns().saturating_add(LONG_CAL_NS);
     loop {
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(LONG_CAL_NS)).await;
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(SUPERVISE_NS)).await;
         let station = {
             let o = owner.lock().await;
             if o.removed || o.pinned {
                 return;
             }
+            if o.suspended {
+                continue;
+            }
             match o.station.clone() {
                 Some(station) => station,
-                None => return,
+                None => continue,
             }
         };
-        let mut radio = station.lock().await;
-        if radio.terminal() {
-            let _ = writeln!(
-                narf_console::Writer,
-                "ath9k: AR9287 station closed; no generation reset on this profile"
-            );
-            return;
+        let terminal = {
+            let Some(mut radio) = station.try_lock() else {
+                continue;
+            };
+            if radio.terminal() {
+                true
+            } else {
+                let now = narf_time::monotonic_ns();
+                if now >= long_due {
+                    match radio.long_calibration() {
+                        Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
+                        Err(error) => {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "ath9k: AR9287 long calibration closed: {:?}",
+                                error
+                            );
+                        }
+                    }
+                    long_due = now.saturating_add(LONG_CAL_NS);
+                }
+                false
+            }
+        };
+        if !terminal {
+            continue;
         }
-        match radio.long_calibration() {
-            Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
-            Err(error) => {
+        drop(station);
+        match reset(&owner, None, None).await {
+            Ok(_) => {
+                failures = 0;
+                long_due = narf_time::monotonic_ns().saturating_add(LONG_CAL_NS);
+                let generation = owner.lock().await.generation;
                 let _ = writeln!(
                     narf_console::Writer,
-                    "ath9k: AR9287 long calibration closed: {:?}",
+                    "ath9k: AR9287 station generation {} published after reset",
+                    generation
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: AR9287 generation reset closed: {:?}",
                     error
                 );
+                // Bounded retries; a pinned or removed owner never resets.
+                if failures >= 3
+                    || matches!(error, BringUpError::DeviceGone | BringUpError::BadState)
+                {
+                    return;
+                }
             }
         }
     }
@@ -514,10 +563,11 @@ async fn retire(o: &mut Owner) -> bool {
     reclaimed
 }
 
-/// `ath_pci_suspend`: retire the station and its DMA, then FULL_SLEEP. This
-/// profile has no resume republish; the radio stays parked until reprobe.
+/// `ath_pci_suspend`: retire the station and its DMA, then FULL_SLEEP. A
+/// generation reset in flight holds `CONTROL` and reports Busy.
 pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
+    let _control = CONTROL.try_lock().ok_or(DeviceSuspendError::Busy)?;
     let Some(owner) = OWNER.lock().clone() else {
         return Ok(());
     };
@@ -537,12 +587,49 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
         }
     }
     o.station = None;
-    // No later initialization reuses this calibration or generation.
+    // No later initialization reuses this calibration or generation; only
+    // resume's generation reset re-identifies the chip.
+    o.radio = calibration::ar9287::Calibration::default();
     o.attempted = true;
+    o.suspended = true;
     identity::sleep(o.mmio, o.cap, None).map_err(|_| DeviceSuspendError::DriverError)
 }
 
-/// Nothing is republished on resume; the parked owner stays closed.
+/// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
+/// suspend reset, then a generation reset (power-on reset, identical
+/// revision/identity/map, INI/PLL/RF and board values, AR9287 TX power,
+/// calibration) republishes the station at the retained primary.
 pub(super) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let Some(owner) = OWNER.lock().clone() else {
+        return Ok(());
+    };
+    {
+        let mut o = owner.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        if !o.suspended || o.removed {
+            return Ok(());
+        }
+        let (cap, device) = (o.cap, o.device);
+        let value = identity::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40))
+            .map_err(|_| DeviceSuspendError::DriverError)?
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        if value & 0xff00 != 0 {
+            identity::invoke(&cap, || {
+                narf_bus::pci::write_config32(&cap, &device, 0x40, value & 0xffff_00ff)
+            })
+            .map_err(|_| DeviceSuspendError::DriverError)?
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        }
+        o.suspended = false;
+    }
+    narf_scheduler::spawn(async move {
+        if let Err(error) = reset(&owner, None, None).await {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ath9k: AR9287 resume reset closed: {:?}",
+                error
+            );
+        }
+    });
     Ok(())
 }

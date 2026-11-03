@@ -1415,14 +1415,20 @@ supervisor runs the `ar9002_hw_calibrate(longcal)` AR9287 step,
 `Packet::long_calibration` (no transmission in flight) → `Native` under
 `access` (PCI, physical readback, permission, record). PA offset
 calibration is AR9285/AR9271-only on Linux and ADC DC is an HT40
-per-calibration, so neither runs on this 20 MHz owner. Remove retires the
-station, proves DMA stopped and only then releases the address; system
-suspend retires the station and FULL_SLEEPs the chip, and resume does not
-republish (no generation reset on this profile). Smokes (written, not
+per-calibration, so neither runs on this 20 MHz owner. Remove (under
+`CONTROL`) retires the station, proves DMA stopped and only then releases
+the address. Generation reset: the supervisor polls every 500 ms as the
+AR9285 one does and, once the published generation is terminal,
+runs `ar9287_owner::reset` at the retained primary (bounded to three
+failures; `DeviceGone`/`BadState` stop it; a pinned or removed owner is
+never followed). System suspend takes `CONTROL` (Busy while a reset is in
+flight), retires the station and FULL_SLEEPs the chip; `pm_resume`
+(`pci.c::ath_pci_resume`) re-disables PCI RETRY_TIMEOUT (config 0x41) and
+spawns the same reset, which republishes a fresh generation. Smokes (written, not
 executed): `smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo`,
 `smoke_ath9k_ar9287_native_profile_binds_admission_and_chains`.
 
-Known AR9287 gaps: no generation reset/resume republish; periodic NF/IQ
+Known AR9287 gaps: periodic NF/IQ
 per-calibration is not run (only the long-calibration temperature
 compensation); HT20/HT40 TX power and every HT owner are out of scope as for
 the AR9285 legacy base; closed-loop maps stay refused. No physical AR9287
