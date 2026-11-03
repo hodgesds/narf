@@ -31,6 +31,7 @@
 extern crate alloc;
 
 pub mod altmode_dp;
+pub mod altmode_usb4;
 pub mod dp_gpu_bridge;
 pub mod fusb302;
 pub mod i2c_bridge;

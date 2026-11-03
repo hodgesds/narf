@@ -49,6 +49,14 @@ exists to avoid competing with firmware for the same controller.
   handling, EPR exit (re-advertise on SPR contract, Hard Reset on EPR
   contract), and `PortStepOutcome::EprModeEntered` are live on the source
   side; sink-side entry initiation awaits the policy-driven sink engine.
+- `altmode_usb4::Usb4EntryPort` drives USB4 entry on a `TcpmPort`
+  once its contract is live: source-attached (DFP) ports discover
+  the partner and transmit the Enter_USB message on a USB4-capable
+  Identity ACK; sink-attached (UFP) ports answer Discover Identity
+  and record inbound Enter_USB parameters (`usb4_entered` /
+  `entered_eudo`). Production task registration is a follow-up —
+  real entry parameters must come from host capabilities and SOP'
+  cable discovery, not fixture values.
 
 ## 4. Invariants
 

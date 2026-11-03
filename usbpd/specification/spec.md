@@ -42,7 +42,10 @@ point.**
   Acknowledged/Enter Succeeded/Enter Failed/Exit actions, EPR
   Request (0x09) and EPR_Mode (0x0A) data message types, EPR Mode
   Capable bits (Fixed PDO bit 23, RDO bit 22), and 4-bit RDO object
-  positions (SPR 1..=7, EPR 8..=11 per §6.4.2.1).
+  positions (SPR 1..=7, EPR 8..=11 per §6.4.2.1). EnterUsb decodes
+  (0x08) with the Enter_USB Data Object codec (§6.4.9): USB mode,
+  DRD flags, cable speed/type/current, PCIe/DP/TBT3/host-present
+  flags, strict on reserved field values.
 - **`tcpc`** — `Tcpc` trait: `set_role`, `cc_status`, `transmit`,
   `receive`, `hard_reset`. CcState/PortRole enums.
 - **`tcpm`** — Sink-role policy-engine state machine
@@ -55,6 +58,10 @@ point.**
   DP_Capabilities / DP_Status / DP_Configure VDO codecs (VESA DP
   Alt 2.0). `DpAltModeDriver` walks the full alt-mode discovery
   sequence end-to-end and lands a working DP configuration.
+  `Usb4EntryDriver` walks Discover Identity → Enter_USB (§6.4.9)
+  for USB4 entry, keying on the UFP VDO1 USB4 capability bit, and
+  `build_usb4_identity_ack` answers Discover Identity as a
+  USB4-capable UFP.
 - **`sop_prime`** — clean-room SOP' / SOP'' cable-VDM codec.
   Per USB-PD 3.1 §6.2.1.1.6 the Message Target field of the SOP
   packet header chooses between SOP / SOP' (near plug) / SOP''
