@@ -303,6 +303,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ee() {
             return self.ee92_awake_station();
         }
+        if self.rtl8192ce() {
+            return self.ce92_awake_station();
+        }
         if self.phase != Phase::MacConfigured {
             return Err(Error::State);
         }
@@ -323,6 +326,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ee() {
             return self.ee92_prepare_peer(peer, rates, basic, capability);
+        }
+        if self.rtl8192ce() {
+            return self.ce92_prepare_peer(peer, rates, basic, capability);
         }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
@@ -356,6 +362,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ee() {
             return self.ee92_complete_peer(peer, aid, admission, policy).await;
+        }
+        if self.rtl8192ce() {
+            return self.ce92_complete_peer(peer, aid, admission, policy).await;
         }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
@@ -511,6 +520,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<(), Error> {
         if self.rtl8821ae()
             || self.rtl8192ee()
+            || self.rtl8192ce()
             || !self.transmit_ready()
             || self.packet.leisure
             || self.packet.local.is_none()
@@ -567,6 +577,33 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .await?;
         self.packet.rate_mask = self.packet.ee92.link.map(|(_, _, index)| index);
         Ok(())
+    }
+    /// 8192CE / 8188CE `rtl92ce_update_hal_rate_mask` (`H2C_RA_MASK`) for
+    /// `peer` at DM `level`, bounded by the permission's `admitted` rates
+    /// (`packet_owner.rs::ce92_install_rate_mask`). Records the
+    /// `ratr_index` the data descriptors carry.
+    pub(crate) async fn install_rtl8192ce_rate_mask(
+        &mut self,
+        peer: super::super::rtl8192ce::h2c::Peer,
+        bw40: bool,
+        level: u8,
+        admitted: u32,
+    ) -> Result<(), Error> {
+        if !self.rtl8192ce() {
+            return Err(Error::State);
+        }
+        self.ce92_install_rate_mask(peer, bw40, level, admitted)
+            .await?;
+        self.packet.rate_mask = self.packet.ce92.link.map(|(_, _, index)| index);
+        Ok(())
+    }
+    /// 8192CE / 8188CE composed `rtl92c_dm_watchdog` step
+    /// (`packet_owner.rs::ce92_dm_watchdog`).
+    pub(crate) fn rtl8192ce_dm_watchdog(&mut self, undec_sm_pwdb: i64) -> Result<bool, Error> {
+        if !self.rtl8192ce() {
+            return Err(Error::State);
+        }
+        self.ce92_dm_watchdog(undec_sm_pwdb)
     }
     /// 8192EE composed `rtl92ee_dm_watchdog` step
     /// (`packet_owner.rs::ee92_dm_watchdog`). Returns whether the RA mask
@@ -676,6 +713,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.ae_disconnected().await?;
         } else if self.rtl8192ee() {
             self.ee92_disconnected().await?;
+        } else if self.rtl8192ce() {
+            self.ce92_disconnected().await?;
         } else {
             if core::mem::take(&mut self.packet.leisure) {
                 self.packet.mailbox.awake(&self.io).await?;
@@ -734,11 +773,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
-        if self.rtl8821ae() || self.rtl8192ee() {
+        if self.rtl8821ae() || self.rtl8192ee() || self.rtl8192ce() {
             let report = if self.rtl8821ae() {
                 self.ae_disconnected().await
-            } else {
+            } else if self.rtl8192ee() {
                 self.ee92_disconnected().await
+            } else {
+                self.ce92_disconnected().await
             };
             let stopped = self.stop_packets();
             if stopped.is_ok() {

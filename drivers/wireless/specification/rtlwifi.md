@@ -2814,8 +2814,14 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   with `rtl92ce_tx_fill_cmddesc` and the `BIT(4)` doorbell, then
   `H2C_RSVDPAGE {4, 2, 3}` — restores, `H2C_JOINBSSRPT(1)`). The 92C has no
   BCN_VALID receipt (Linux sends the location right after the doorbell);
-  the body is owned by the claim until quiescence. Leave
-  (`ce92_leave_report`): LPS leave, `JOINBSSRPT(0)`, `MSR_NOLINK`, AID 0.
+  the body is owned by the claim until quiescence. The join's media
+  status is `rtl92ce_set_network_type` (media status, then
+  `rtl92ce_set_check_bssid(true)` over the retained `receive_config`).
+  Leave (`ce92_disconnected`, Linux `BSS_CHANGED_ASSOC` `!assoc` order):
+  LPS leave (RPWM `0x0c`, `FW_PS_ACTIVE_MODE`), RA link withdrawn,
+  `rtl92ce_set_network_type` unlinked (MSR NOLINK, CBSSID off),
+  `JOINBSSRPT(RT_MEDIA_DISCONNECT)` (AID / reserved page are connect-only),
+  zero BSSID.
   RA (`ce92_install_rate_mask`): `rtl92ce_update_hal_rate_mask` refused
   unless its rate bits are a non-empty subset of the caller's admitted
   set. DM (`ce92_dm_watchdog`, only out of LPS): `rtl92c_dm_false_alarm_
@@ -2841,9 +2847,33 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   `smoke_rtl8192ce_false_alarm_statistics`,
   `smoke_rtl8192ce_poweroff_adapter`. Owner-level model tests of the
   `ce92` paths are not written yet.
-  Not reachable yet: nothing advances the owner to MacConfigured (no
-  signed envelope / station grant / probe admission), and the station
-  path's peer prepare/associate (`station_control`) is 88EE-only.
+  Station branch (`rtl8192ce/station.rs`, `packet_owner.rs`): exact
+  `rtl92ce_set_hw_reg` `HW_VAR_BSSID`, `HW_VAR_BASIC_RATE` (`(rates &
+  0x15f) | 1` into RRSR and the highest-bit index into
+  `REG_INIRTS_RATE_SEL`; no 92EE `| 0xd`), `HW_VAR_SLOT_TIME` (its
+  `HW_VAR_AC_PARAM` loop writes nothing under `EACMWAY2_SW`),
+  `HW_VAR_SIFS` (`0x0a0a`, `0x1010` with HT), `HW_VAR_ACK_PREAMBLE`,
+  `rtl92ce_set_qos` (fixed BK/VI/VO rows, BE never written). The
+  `station_power` `Base::Rtl8192ce` / `Grant::Rtl8192ce` pair (regrant at
+  the same operating point, `with_current`, `wait_rtl8192ce`),
+  `station_grant`, `stage_rtl8192ce_calibration` and CE arms for every
+  `packet.rs` station path: awake (`REG_CR != 0xEA`; `rtl92ce_hw_init`
+  leaves the firmware awake), prepare peer (BSSID + rates at the
+  permission's `cur_40_prime_sc`), complete peer (`rtl_cam_reset_all_entry`,
+  `HW_VAR_KEEP_ALIVE` via `H2C_92C_KEEP_ALIVE_CTRL` 48, then
+  `ce92_join_report`), LPS enter/leave, leave and terminal disconnect
+  (`ce92_disconnected`), association RA mask
+  (`install_rtl8192ce_station_rate_mask`: `mac->mode` B for
+  `supp_rates[0] <= 0xf` else G, `bw_40` from the programmed width,
+  bounded by the `N92C` admitted rates, inside the envelope's authority;
+  an HT profile is refused here) and the DM watchdog
+  (`rtl8192ce_watchdog`, never re-sends a mask, as Linux). The 88EE
+  `install_rate_mask` path refuses CE. Test (written, unexecuted):
+  `smoke_rtl8192ce_station_registers`.
+  Not reachable yet: probe admission and the native continuation
+  (`prepare_native`) do not run the CE envelope/MAC steps; RX HT/A-MPDU,
+  PHY-status PWDB, RA-adapted TX, the HT20/40 station plan and ERP/RTS
+  protection are not composed for CE.
   Tests (`rtl8192ce/phy_tests.rs`, written, unexecuted):
   `smoke_rtl8192ce_rf_serial_read_write_both_paths`,
   `smoke_rtl8192ce_h2c_rate_mask_and_irq_profile`,

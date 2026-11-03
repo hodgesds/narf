@@ -347,6 +347,11 @@ async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
         {
             super::super::station_power::wait_rtl8192ee(base, permission, environment, future).await
         }
+        (Base::Rtl8192ce(base), Grant::Rtl8192ce(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8192ce(base, permission, environment, future).await
+        }
         _ => Err(RadioError::State),
     }
 }
@@ -1160,6 +1165,18 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             domain,
         )
     }
+    /// The 8192CE / 8188CE `N92C` envelope that minted this owner's channel
+    /// grant.
+    pub(crate) fn stage_rtl8192ce_calibration(
+        &mut self,
+        calibration: super::super::rtl8192ce::envelope::Calibration,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.stage_station_base(
+            super::super::station_power::Base::Rtl8192ce(Arc::new(calibration)),
+            domain,
+        )
+    }
     fn stage_station_base(
         &mut self,
         base: super::super::station_power::Base,
@@ -1187,7 +1204,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::Chip::Rtl8192ee => self
                 .rtl8192ee_power
                 .map(super::super::station_power::Grant::Rtl8192ee),
-            super::Chip::Rtl8192ce => None,
+            super::Chip::Rtl8192ce => self
+                .rtl8192ce_power
+                .map(super::super::station_power::Grant::Rtl8192ce),
         }
     }
     /// 88EE calibration for the 88EE-only HT/protection/tracking/antenna/
@@ -1304,6 +1323,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             if self.chip == super::Chip::Rtl8192ee {
                 // rtl92ee_set_qos ignores the AP's rows (fixed BK/VI/VO).
                 return super::super::rtl8192ee::station::set_qos_all(&self.io);
+            }
+            if self.chip == super::Chip::Rtl8192ce {
+                // rtl92ce_set_qos ignores the AP's rows (fixed BK/VI/VO).
+                return super::super::rtl8192ce::station::set_qos_all(&self.io);
             }
             if self.station.ht_profile.is_some() {
                 return super::super::wmm::program_ht(&self.io, p);
@@ -2099,6 +2122,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 self.rtl8192ee_prime_sc(),
                             );
                         }
+                        if self.chip == super::Chip::Rtl8192ce {
+                            return super::super::rtl8192ce::station::configure_rates(
+                                &self.io,
+                                rates,
+                                basic,
+                                self.station.capability,
+                                self.station.ht_profile.is_some(),
+                                self.rtl8192ce_prime_sc(),
+                            );
+                        }
                         super::super::station_control::configure_rates(
                             &self.io,
                             rates,
@@ -2843,6 +2876,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .install_rtl8192ee_station_rate_mask(rates, level, environment)
                 .await;
         }
+        if self.chip == super::Chip::Rtl8192ce {
+            return self
+                .install_rtl8192ce_station_rate_mask(rates, level, environment)
+                .await;
+        }
         let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
         let payload = super::super::rate_adaptive::rate_mask_width(
             rates,
@@ -3024,6 +3062,93 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.check_station_policy(environment)?;
         Ok(sent)
     }
+    /// `rtl92ce_update_hal_rate_mask(sta, level)` (`update_rate_tbl`) for
+    /// the 2.4 GHz legacy peer: `supp_rates[0]` = the association's legacy
+    /// intersection, `mac->mode` B when it is at most `0xf`, else G (Linux
+    /// `rtl_op_bss_info_changed`), `mac->bw_40` = the programmed 40 MHz
+    /// width. An HT profile is refused until the CE HT station is admitted.
+    /// The mask must be a non-empty subset of the current `N92C`
+    /// permission's admitted rates; it is installed inside the envelope's
+    /// current authority.
+    async fn install_rtl8192ce_station_rate_mask(
+        &mut self,
+        rates: u16,
+        level: u8,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::rtl8192ce::h2c;
+        let permission = self.rtl8192ce_power.ok_or(Error::State)?;
+        if self.station.ht_profile.is_some() {
+            return Err(Error::Profile);
+        }
+        let supp = rates & 0xfff;
+        let peer = h2c::Peer {
+            mode: if supp <= 0xf {
+                h2c::WirelessMode::B
+            } else {
+                h2c::WirelessMode::G
+            },
+            supp_rates: u32::from(supp),
+            rx_mask: [0; 2],
+            sgi20: false,
+            sgi40: false,
+        };
+        let bw40 = self.packet.width.is_some();
+        let admitted = permission.admitted_rates() as u32;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let grant = self.station_grant().ok_or(Error::State)?;
+        power_wait(
+            base,
+            None,
+            None,
+            None,
+            None,
+            grant,
+            environment,
+            self.install_rtl8192ce_rate_mask(peer, bw40, level, admitted),
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
+    /// RTL8192CE / RTL8188CE DM watchdog step (`rtl92c_dm_watchdog`, every
+    /// `RTL_WATCHDOG_TIME`, only with the firmware out of power save): the
+    /// composed false-alarm statistics and 88C dynamic BB power saving
+    /// (`packet_owner.rs::ce92_dm_watchdog`), inside the `N92C` envelope's
+    /// current authority. Linux's watchdog has
+    /// `rtl92c_dm_refresh_rate_adaptive_mask` commented out, so no mask is
+    /// ever re-sent: returns `false`.
+    async fn rtl8192ce_watchdog(&mut self, environment: &impl Environment) -> Result<bool, Error> {
+        if !self.station.ra.due(environment.now_ms())
+            || self.leisure()
+            || !self.station_linked()
+            || !self.transmit_ready()
+            || self.rate_mask().is_none()
+        {
+            return Ok(false);
+        }
+        self.check_station_policy(environment)?;
+        let pwdb = self.station.ra.smoothed();
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let grant = self.station_grant().ok_or(Error::State)?;
+        let owner = &mut *self;
+        power_wait(base, None, None, None, None, grant, environment, async {
+            owner.rtl8192ce_dm_watchdog(pwdb)?;
+            Ok(())
+        })
+        .await?;
+        self.check_station_policy(environment)?;
+        Ok(false)
+    }
     /// RTL8821AE DM watchdog step (`rtl8821ae_dm_watchdog`, every
     /// `RTL_WATCHDOG_TIME`, only with the firmware out of power save —
     /// `fw_current_inpsmode` false), in the Linux order:
@@ -3107,6 +3232,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<bool, Error> {
         if self.chip == super::Chip::Rtl8192ee {
             let result = self.rtl8192ee_watchdog(environment).await;
+            if result.is_err() {
+                self.abort_station();
+            }
+            return result;
+        }
+        if self.chip == super::Chip::Rtl8192ce {
+            let result = self.rtl8192ce_watchdog(environment).await;
             if result.is_err() {
                 self.abort_station();
             }

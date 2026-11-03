@@ -42,6 +42,8 @@ pub const H2C_SETPWRMODE: u8 = 1;
 pub const H2C_JOINBSSRPT: u8 = 2;
 pub const H2C_RSVDPAGE: u8 = 3;
 pub const H2C_RA_MASK: u8 = 6;
+/// `H2C_92C_KEEP_ALIVE_CTRL` (`rtl8192c/fw_common.h`, `HW_VAR_KEEP_ALIVE`).
+pub const H2C_92C_KEEP_ALIVE_CTRL: u8 = 48;
 
 /// `FW_PS_*_MODE`.
 pub const FW_PS_ACTIVE_MODE: u8 = 0;

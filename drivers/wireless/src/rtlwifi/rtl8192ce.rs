@@ -65,6 +65,7 @@ pub mod mac;
 pub mod phy;
 pub mod power;
 pub mod ps;
+pub mod station;
 pub mod tables;
 pub mod trx;
 pub mod txpower;

@@ -166,3 +166,57 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ce",
     smoke_rtl8192ce_poweroff_adapter
 );
+
+/// `rtl92ce_set_hw_reg` station registers: `HW_VAR_BASIC_RATE` (RRSR +
+/// `INIRTS_RATE_SEL`), slot / SIFS (`0x1010` with HT), ACK preamble, the
+/// fixed `set_qos` rows and `rtl92ce_set_network_type` RCR/BCN_CTRL.
+fn smoke_rtl8192ce_station_registers() -> TestResult {
+    use super::mac::REG_RCR;
+    use super::station as hw;
+    if hw::basic_rate(0x0fff) != (0x015f, 8) || hw::basic_rate(0x000f) != (0x000f, 3) {
+        return TestResult::Fail("HW_VAR_BASIC_RATE");
+    }
+    let io = Fake::new();
+    if hw::configure_rates(&io, 0x0fff, 0x0001, 0x0420, true, 1).is_err() {
+        return TestResult::Fail("configure_rates");
+    }
+    {
+        let g = io.0.lock();
+        let r = |a: u16| g.regs[usize::from(a)];
+        if r(hw::REG_RRSR) != 0x5f
+            || r(hw::REG_RRSR + 1) != 0x01
+            || r(hw::REG_INIRTS_RATE_SEL) != 8
+            || r(hw::REG_SLOT) != 9
+            || r(hw::REG_SIFS_CTX + 1) != 0x10
+            || r(hw::REG_RESP_SIFS_OFDM) != 0x10
+            || r(hw::REG_RRSR + 2) != 0xa0
+            || r(hw::REG_EDCA_VI_PARAM + 2) != 0x5e
+        {
+            return TestResult::Fail("rate / SIFS / preamble / EDCA registers");
+        }
+    }
+    if hw::configure_rates(&io, 0x0ffe, 0x0001, 0, false, 0).is_ok() {
+        return TestResult::Fail("basic set without 1M admitted");
+    }
+    let mut rcr = 0xf000_6a0e;
+    let mut bcn = BcnCtrl::default();
+    if hw::network_type_station(&io, &mut rcr, &mut bcn, true).is_err()
+        || rcr != 0xf000_6ace
+        || io.read32(REG_RCR) != Ok(0xf000_6ace)
+        || bcn.0 & (1 << 4) != 0
+    {
+        return TestResult::Fail("linked network type");
+    }
+    if hw::network_type_station(&io, &mut rcr, &mut bcn, false).is_err()
+        || rcr != 0xf000_6a0e
+        || bcn.0 & (1 << 4) == 0
+        || io.read8(ps::REG_MSR).map(|m| m & 3) != Ok(ps::MSR_NOLINK)
+    {
+        return TestResult::Fail("unlinked network type");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_station_registers
+);

@@ -33,7 +33,7 @@
 //!   `H2C_JOINBSSRPT`), preceded by `_rtl92ce_set_media_status(STATION)`.
 //! - DM watchdog: the composed part of `rtl92c_dm_watchdog`.
 //! - Card disable: `rtl92ce_card_disable` with its DMA retirement proof.
-use super::super::super::rtl8192ce::{h2c, ps, trx};
+use super::super::super::rtl8192ce::{h2c, ps, station as hw, trx};
 use super::{
     extent, queue, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, RX_BUFFER,
     RX_BYTES, TX_BYTES,
@@ -67,6 +67,9 @@ pub(in super::super) struct State {
     pub(in super::super) link: Option<(h2c::Peer, bool, u8)>,
     /// Latest `rtl92c_dm_false_alarm_counter_statistics`.
     pub(in super::super) false_alarm: ps::FalseAlarm,
+    /// `rtlpci->receive_config` once `HW_VAR_RCR` changed it (else the
+    /// configured radio's trimmed value).
+    pub(in super::super) receive_config: Option<u32>,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -77,6 +80,7 @@ impl State {
             rf_saving: ps::RfSaving::new(),
             link: None,
             false_alarm: ps::FalseAlarm::default(),
+            receive_config: None,
         }
     }
 }
@@ -518,7 +522,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
 
     /// `rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` hardware order for a
-    /// station: `_rtl92ce_set_media_status(STATION, linked)`, then
+    /// station: `rtl92ce_set_network_type(STATION)` with the link
+    /// (`_rtl92ce_set_media_status` INFRA, `rtl92ce_set_check_bssid(true)`), then
     /// `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)` — `HW_VAR_AID`,
     /// `REG_CR + 1` BIT(0), BCN_CTRL `(0, BIT(3))` / `(BIT(4), 0)`, `0x422`
     /// BIT(6) cleared, `rtl92c_set_fw_rsvdpagepkt` (`rtl_cmd_send_packet` on
@@ -565,7 +570,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let closed = |a: Option<&super::super::station::Admission>| {
             a.is_some_and(|c| c.closed.load(core::sync::atomic::Ordering::Acquire))
         };
-        ps::set_media_status(&self.io, &mut self.packet.ce92.bcn, true)?;
+        self.ce92_network_type(true)?;
         ps::set_aid(&self.io, aid)?;
         let cr = self.io.read8(ps::REG_CR + 1)?;
         self.io.write8(ps::REG_CR + 1, cr | 1)?;
@@ -630,18 +635,130 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(())
     }
 
-    /// `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)` after leaving LPS
-    /// (mac80211 leaves PS before the report), then
-    /// `_rtl92ce_set_media_status(STATION)` with the link down
-    /// (`MSR_NOLINK`) and `HW_VAR_AID` 0. The RA mask is withdrawn.
-    pub(super) async fn ce92_leave_report(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Running {
+    /// `rtl92ce_set_network_type(NL80211_IFTYPE_STATION)` with the cached
+    /// `receive_config`.
+    fn ce92_network_type(&mut self, linked: bool) -> Result<(), Error> {
+        let mut rcr = match self.packet.ce92.receive_config {
+            Some(rcr) => rcr,
+            None => {
+                self.rtl8192ce
+                    .as_deref()
+                    .ok_or(Error::State)?
+                    .1
+                    .receive_config
+            }
+        };
+        let result =
+            hw::network_type_station(&self.io, &mut rcr, &mut self.packet.ce92.bcn, linked);
+        self.packet.ce92.receive_config = Some(rcr);
+        result
+    }
+
+    /// Linux `rtl92ce_hw_init` leaves the firmware awake
+    /// (`fw_current_inpsmode` false); nothing is sent. Only a powered MAC
+    /// (`REG_CR != 0xEA`) is accepted.
+    pub(super) fn ce92_awake_station(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::MacConfigured {
             return Err(Error::State);
         }
-        if self.packet.leisure {
-            self.ce92_leave_leisure().await?;
+        if self.io.read8(ps::REG_CR)? == 0xea {
+            return Err(Error::RadioOff);
+        }
+        Ok(())
+    }
+
+    /// Authentication-time `BSS_CHANGED_BSSID` (`HW_VAR_BSSID`),
+    /// `BASIC_RATES` / ERP and `rtl92ce_update_channel_access_setting` /
+    /// `rtl92ce_set_qos` ([`hw::configure_rates`], `ht_enable` false until
+    /// the association) at the programmed `cur_40_prime_sc`.
+    pub(super) fn ce92_prepare_peer(
+        &mut self,
+        peer: [u8; 6],
+        rates: u16,
+        basic: u16,
+        capability: u16,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        if peer == [0; 6] || peer[0] & 1 != 0 {
+            return Err(Error::Packet);
+        }
+        let prime_sc = self.rtl8192ce_prime_sc();
+        self.phase = Phase::Failed;
+        hw::set_bssid(&self.io, peer)?;
+        hw::configure_rates(&self.io, rates, basic, capability, false, prime_sc)?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` for 8192CE / 8188CE:
+    /// `rtl_cam_reset_all_entry`, `HW_VAR_KEEP_ALIVE` (10,
+    /// `H2C_92C_KEEP_ALIVE_CTRL`), then `rtl92ce_set_network_type` with the
+    /// link and `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_CONNECT)`
+    /// ([`Self::ce92_join_report`]). The firmware RA mask follows
+    /// separately (`ce92_install_rate_mask`, Linux's `update_rate_tbl` in
+    /// the same branch).
+    pub(super) async fn ce92_complete_peer(
+        &mut self,
+        peer: [u8; 6],
+        aid: u16,
+        admission: Option<&super::super::station::Admission>,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let closed = |a: Option<&super::super::station::Admission>| {
+            a.is_some_and(|c| c.closed.load(core::sync::atomic::Ordering::Acquire))
+        };
+        if !self.transmit_ready() || self.packet.reserved.is_some() || self.packet.leisure {
+            return Err(Error::State);
+        }
+        if !(1..=2007).contains(&aid) || peer == [0; 6] || peer[0] & 1 != 0 {
+            return Err(Error::Packet);
         }
         self.phase = Phase::Failed;
+        self.io.write32(hw::REG_CAMCMD, hw::CAM_RESET)?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.packet
+            .ce92
+            .mailbox
+            .fill(&self.io, h2c::H2C_92C_KEEP_ALIVE_CTRL, &[0xff, 10])
+            .await?;
+        if closed(admission) {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        self.ce92_join_report(peer, aid, admission, &policy).await?;
+        if closed(admission) {
+            self.phase = Phase::Failed;
+            return Err(Error::State);
+        }
+        Ok(())
+    }
+
+    /// Disassociation (`BSS_CHANGED_ASSOC` with `!assoc`): leave LPS
+    /// (`rtl_lps_leave`: RPWM RF on, `FW_PS_ACTIVE_MODE`), then
+    /// `rtl92ce_set_network_type(STATION)` without a link (MSR NOLINK,
+    /// CBSSID off), `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)` (only
+    /// the report: AID and the reserved page are connect-only) and the
+    /// mac80211 `BSS_CHANGED_BSSID` zero BSSID. The RA link is withdrawn.
+    /// The caller holds the owner in `Phase::Failed`.
+    pub(super) async fn ce92_disconnected(&mut self) -> Result<(), Error> {
+        if core::mem::take(&mut self.packet.leisure) {
+            h2c::set_rpwm(&self.io, RPWM_RF_ON).await?;
+            self.packet
+                .ce92
+                .mailbox
+                .fill(
+                    &self.io,
+                    h2c::H2C_SETPWRMODE,
+                    &h2c::pwrmode(h2c::FW_PS_ACTIVE_MODE),
+                )
+                .await?;
+        }
+        self.packet.ce92.link = None;
+        self.ce92_network_type(false)?;
         self.packet
             .ce92
             .mailbox
@@ -651,10 +768,6 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 &h2c::joinbss(h2c::MEDIA_DISCONNECT),
             )
             .await?;
-        ps::set_media_status(&self.io, &mut self.packet.ce92.bcn, false)?;
-        ps::set_aid(&self.io, 0)?;
-        self.packet.ce92.link = None;
-        self.phase = Phase::Running;
-        Ok(())
+        hw::set_bssid(&self.io, [0; 6])
     }
 }

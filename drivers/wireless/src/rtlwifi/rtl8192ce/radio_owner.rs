@@ -51,6 +51,14 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.rtl8192ce_power
     }
 
+    /// `mac->cur_40_prime_sc` of the programmed `N92C` operating point (0
+    /// at 20 MHz or without a permission).
+    pub(crate) fn rtl8192ce_prime_sc(&self) -> u8 {
+        self.rtl8192ce_power
+            .and_then(|p| envelope::channel_of(p.operating()))
+            .map_or(0, |c| c.prime_sc)
+    }
+
     /// RadioConfigured/ChannelConfigured/MacConfigured/Running → the same
     /// phase (ChannelConfigured from RadioConfigured): `rtl_op_config`
     /// channel switch at the wide channel with the envelope-admitted
