@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.57** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.58** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -5822,3 +5822,48 @@ Fixtures, all under `drivers/gpu/intel_gpu_media_gt`:
 These fixtures are native models only: none has been run on physical Intel
 hardware. Still open are the MEI GSC proxy client, PXP, GSC ER-timeout
 recovery beyond wedging, and silicon acceptance.
+
+Integration: S2 was written before the media-GT power unit and was never run
+before integration. Its targeted run found two production bugs and one
+fixture defect, each fixed in its own commit:
+- Registering the kernel GSCCS0 context took the UAPI logical mask, which
+  refuses reserved engines, so the first GSC job panicked the kernel.
+  REGISTER_CONTEXT now uses `EngineSet::registration_mask`, which maps a
+  kernel-only engine to `BIT(logical_instance)`, as
+  `xe_gsc_init_post_hwconfig` creates the kernel GSC queue. UAPI admission
+  keeps the filtering mask.
+- `route_gsc` probed both mask registers for lost MMIO, but all-ones is
+  their valid `gt_irq_reset` value, so every re-route after a GT reset
+  failed. Access is now proved on the enable register only.
+- The GSC owner fixtures restarted the media GuC with start time 0 while
+  polling it from the last incarnation's end, which tripped the 50 ms wake
+  deadline. The shared model also kept the last incarnation's executed
+  contexts at the GGTT bases the arena reuses. `start_media_at`,
+  `media_huc::start_at` and `Hw::new_incarnation` fix both; no assertion
+  changed.
+Two more fixes were Clippy only: a block scope instead of `drop` on a
+non-Drop queue, and the stolen claim snapshot type alias. Both intermediate
+code commits compile on their own. One targeted release run passed 198
+tests with no failures. It covered these prefixes, all under `drivers/gpu/`:
+`intel_gpu_media_gt`, `intel_gpu_stolen`, `intel_gpu_fbc`, `intel_gpu_gt_irq`,
+`intel_gpu_engine`, `intel_gpu_rcs`, `intel_gpu_gtt`, `intel_gpu_ggtt_tlb`,
+`intel_gpu_guc_gt`, `intel_gpu_gen12`, `intel_gpu_multi_ccs` and
+`intel_gpu_huc`.
+
+Review against Linux b90c984d agreed on the following:
+- GSCCS0 is at `GSCCS_RING_BASE` 0x11a000, GuC class 5
+  (`GUC_GSC_OTHER_CLASS`), hardware class OTHER 4, `OTHER_GSC_INSTANCE` 6.
+- Its forcewake is `FORCEWAKE_GSC` 0xa618 with ack 0xdf8.
+- `MTL GSCCS IDLE MSG enable` applies to MEDIA_VERSION(1300) class OTHER.
+- Class OTHER is reserved (`xe_hw_engine_is_reserved`).
+
+Open item, not caused by this unit: `GuCGt::poll_inner` checks the wake
+deadline before the acknowledgement, so a late poll with the ack already
+present times out. Linux's wait checks the condition once more after the
+timeout.
+
+Known stall: copying the 4 MiB GSC image into stolen memory is about 1M
+uncached BAR2 writes in one GT-worker poll. It happens once at load, off
+any present path. With `media_gt=1` and `gsc=0`, the 0/~0 GSC interrupt pair
+is not written, per the options-off rule. The MEI↔GSC proxy join waits for
+the MEI unit.

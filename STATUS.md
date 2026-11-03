@@ -2391,6 +2391,38 @@ run passed 188 tests with no failures. It covered the media-GT, media, user,
 Xe, BCS8, GuC-GT, GT, GT-recovery and HuC prefixes. None of this has run on
 physical Intel hardware.
 
+### MTL GSCCS0, the stolen GSC object and the production GSC worker — targeted release gates recorded
+
+With `narf.intel.media_gt=1` and `narf.intel.gsc=1`:
+- GSCCS0 is a kernel-only engine of the media GuC; no UAPI query or
+  placement can name it.
+- The 4 MiB GSC private object lives in stolen memory behind a fixed GGTT
+  DM window, which the FBC carve and the claim registry avoid.
+- The GSC worker runs in production: firmware load, compatibility query, HuC
+  authentication, then proxy start. Proxy start ends at LOAD_FAIL (ENODEV)
+  until the MEI GSC proxy joins, as Linux does without the proxy.
+
+Known stall: the one-time 4 MiB image copy is about 1M uncached BAR2 writes in
+a single GT-worker poll. It is off any present path.
+
+The integration fixed two production bugs and one fixture defect in this
+unit, which had never been run:
+- Registering the kernel GSCCS0 context would have panicked the kernel on
+  the first GSC job. It now registers with its own logical instance, as
+  Linux does.
+- Re-routing GSC interrupts after any GT reset always failed. All-ones was
+  read as lost MMIO, but it is the masks' valid reset value.
+- The GSC owner fixtures restarted the media GuC on the wrong clock, and
+  their model kept stale contexts across restarts.
+
+Open item, not caused by this unit: the GuC GT wake poll checks its deadline
+before the acknowledgement, so a late poll with the ack already present times
+out. Linux re-checks the condition once after the timeout.
+
+One targeted release run passed 198 tests with no failures. It covered the
+media-GT, stolen, FBC, GT-IRQ, engine, RCS, GTT, GGTT-TLB, GuC-GT, Gen12,
+multi-CCS and HuC prefixes. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
