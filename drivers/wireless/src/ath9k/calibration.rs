@@ -233,6 +233,15 @@ fn read(io: &mut impl RegisterIo, register: u64) -> Result<u32, BringUpError> {
     }
 }
 fn measurement(io: &mut impl RegisterIo, register: u64) -> Result<u32, BringUpError> {
+    measurement_for(io, register, 0xc0)
+}
+/// `measurement` for the silicon whose new-format `AR_SREV` version field
+/// (`(srev & 0xfffc0000) >> 12`) is `version`.
+fn measurement_for(
+    io: &mut impl RegisterIo,
+    register: u64,
+    version: u32,
+) -> Result<u32, BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -241,7 +250,7 @@ fn measurement(io: &mut impl RegisterIo, register: u64) -> Result<u32, BringUpEr
         // A full-width IQ correlation of -1 is legitimate. Check immutable
         // silicon identity instead of confusing that data value with removal.
         let revision = read(io, 0x4020)?;
-        if revision & 0xff != 0xff || (revision & 0xfffc0000) >> 12 != 0xc0 {
+        if revision & 0xff != 0xff || (revision & 0xfffc0000) >> 12 != version {
             return Err(BringUpError::DeviceGone);
         }
     }
@@ -480,3 +489,6 @@ pub(super) mod tests;
 
 /// Distinct full40 initial analog/NF/ADC/IQ receipt.
 pub(in crate::ath9k) mod wide;
+
+/// AR9287 two-chain AGC/NF/IQ/ADC-DC and open-loop temperature compensation.
+pub(in crate::ath9k) mod ar9287;

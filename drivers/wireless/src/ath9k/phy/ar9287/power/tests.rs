@@ -24,7 +24,7 @@ impl RegisterIo for Io {
 
 /// Synthetic open-loop map: marker values chosen to exercise each Linux
 /// branch, never board data.
-fn image(tx_mask: u8) -> Vec<u8> {
+pub(in crate::ath9k) fn image(tx_mask: u8) -> Vec<u8> {
     let mut b = vec![0u8; MAP_9287.bytes()];
     b[8] = 0x64; // regDmn[0]: world SKU, NO_CTL minimum walk.
     b[TX_MASK] = tx_mask;

@@ -1279,8 +1279,35 @@ executed): `smoke_ath9k_ar9287_txpower_two_chain_open_loop_and_ctl`,
 `smoke_ath9k_ar9287_txpower_one_chain_uses_first_edge_set`,
 `smoke_ath9k_ar9287_txpower_refuses_before_writes`.
 
-Still missing before `0x002d`/`0x002e` can be matched: AR9287 calibration (`ar9002_calib.c` non-AR9285
-AGC/NF/IQ/ADC path and `ar9002_hw_olc_temp_compensation_9287`), the
+`calibration/ar9287.rs` is the AR9287 initial calibration owner (same
+`State`/cancellation contract and parked-device preconditions as AR9285):
+the signed-ceiling transmit power above, the `ar9280PciePhy` SerDes and
+`AR9285_WA_DEFAULT | BIT6 | BIT7` workaround (`ar9002_hw_configpcipowersave`),
+`ar5008_hw_init_bb` activation, then the non-AR9285 `ar9002_hw_init_cal`
+branch: `FLTR_CAL` set, AGC `CAL` polled for `AH_WAIT_TIMEOUT`, `FLTR_CAL`
+cleared (no `OFF_PWDADC` toggle on 9287 1.1+, no CLC or PA calibration).
+Noise floor is `ath9k_hw_loadnf` on `AR_PHY_CCA`/`AR_PHY_CH1_CCA` for each
+RX chain at the AR9287 nominal -112 (with the Linux NF stop/restart around
+the load), the -50 maxCCA restore, `ath9k_hw_start_nfcal(update)` and
+`ar9002_hw_do_getnf` (chain 0 always, chain 1 when receiving) sanitized to
+`AR_PHY_CCA_{MIN,NOM,MAX}_GOOD_VAL_9287_2GHZ` (-127/-112/-97); a zero reading
+is refused. IQ mismatch is `iq_cal_single_sample` over chains
+`0..popcount(rxchainmask)` (Linux's `numChains` indexing) with every chain
+validated before the first `AR_PHY_TIMING_CTRL4(i)` write and chain-0
+`IQCORR_ENABLE`; ADC gain is never run (`supp_cals &= ~ADC_GAIN_CAL`) and
+ADC DC (`adc_dc`, `ar9002_hw_adc_dccal_calibrate` with its u32 arithmetic)
+is the HT40-only step. `olc_temp_compensation` is
+`ar9287_hw_olc_temp_compensation`: PD average against `initPDADC`, scaled by
+`tempSensSlope` (minor >= 2, otherwise no correction), written to both
+chains' `OLPC_TEMP_COMP`, nothing written before a frame has been sent.
+Smokes (written, not executed):
+`smoke_ath9k_ar9287_calibration_two_chain_agc_nf_iq`,
+`smoke_ath9k_ar9287_calibration_one_chain_leaves_chain1`,
+`smoke_ath9k_ar9287_calibration_refusals`,
+`smoke_ath9k_ar9287_olc_temp_compensation_follows_linux`,
+`smoke_ath9k_ar9287_ht40_adc_dc_offset_correction`.
+
+Still missing before `0x002d`/`0x002e` can be matched: the
 `AR_SREV_9287_13_OR_LATER` async-FIFO MAC settings (117 MHz clock,
 `AR_USEC_ASYNC_FIFO`, AHB custom burst, AGGWEP), two-chain TX descriptor
 chain selection in the packet owner, signed board records naming the AR9287
