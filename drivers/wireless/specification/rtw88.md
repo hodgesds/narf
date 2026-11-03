@@ -44,6 +44,14 @@ per-domain IOMMU translation is rejected before allocation or MMIO.
 
 ## 3. Public interface
 
+`FirmwareInfo` retains the original header `subindex: u8` and
+`features: u32` alongside version/subversion/H2C/section geometry. As in
+Linux7.3-rc4, feature bits are zero unless `FW_FEATURE_SIG` bit0 is present.
+These are authenticated image observations; they confer no sleep/wake or RF
+readiness. The power-mode codec keeps the existing ACTIVE initialization
+bytes unchanged. Its reserved-page and CPWM/RFON/TCR helpers are prerequisites;
+they do not activate native runtime sleep.
+
 `reset_function(BusAddr) -> Result<(), OperatingResetError>` recovers the
 original retained RTL8821CE/RTL8822CE station generation. It serializes with
 that function's provisioner, checks the original exact PCI identity/capability,
@@ -118,6 +126,31 @@ the new name's carrier. Four native source cases cover Open/WPA2 stable-name
 DHCP, terminal-disconnect recovery/fresh keys, held-M4 cancellation, original
 DOWN between descriptor/doorbell, old ingress and preserved operator DOWN.
 They await release/native batch execution and physical acceptance.
+
+`idle_function(BusAddr) -> Result<RuntimeIdle, DevicePmError>` supplies explicit
+unassociated IPS for actual C21/C22 identity-DMA passive stations. The retained
+owner mutex serializes the real passive/no-peer eligibility check, original
+function reservation and admission closure against scan/join. Associated or
+busy stations are refused before withdrawal. The durable worker then withdraws
+original callbacks/endpoints, proves native DMA retirement, and runs actual
+card-disable to CR0xea. It saves the original parked PCI configuration without
+requiring a PCI PM capability or changing to D3. It does not enable ASPM or
+claim a system wake source.
+
+The `RuntimeIdle` handle observes completion and requests resume; its boolean
+status grants no hardware authority. `resume(self).await` and handle Drop
+request the same retained background worker. Cancelling a foreground waiter
+requires no synchronous bridge: both public Futures must be polled in normal
+executor context because neither `block_on` nor `block_on_spin` drives another
+scheduler task. Cancelling a foreground waiter
+cannot drop an in-progress native retirement. Fresh startup consumes the actual
+card-off/retirement receipts and restores the original name/ifindex/operator
+state through ordinary provisioning. No old keys, admission or endpoint revive;
+association remains explicit. Failed native receipts quarantine the original
+function and retain ambiguous DMA. Three native model cases are written for
+passive off/fresh-start/DHCP, associated refusal with preserved DATA, and
+foreground cancellation during original ingress; release/native acceptance
+remains pending. This implements IPS only. Associated LPS is still open.
 
 The `rtw88` asynchronous system-PM hook covers the retained C21/C22 identity-DMA
 profiles with an actual PCI PM capability in D0. A family barrier retains the
@@ -2161,7 +2194,7 @@ changes. None is a physical blocker unless stated.
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
 | `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
-| `runtime_sleep` | No `ps.c` port. LPS needs `H2C_CMD_SET_PWR_MODE` (0x20) in an LPS mode plus the `rtw_leave_lps_core` path; `station_control.rs` only ever sends the ACTIVE/awake form. IPS (`rtw_enter_ips` = `rtw_core_stop` + `rtw_hci_link_ps`, `rtw_leave_ips` = `rtw_ips_pwr_up`) is a full stop/start, so it is blocked on `operating_reset`. |
+| `runtime_sleep` | Prerequisite source now parses original firmware subindex/signature-gated features and supplies Linux7.3-rc4 port0 H2C0x20, nondeep station reserved-page geometry, CPWM toggle and RFON/TCR wake codecs. Three source cases are written, unexecuted. These helpers confer no RF/DMA readiness: native template publication, original peer/key/UP binding and confirmed wake before DATA remain unimplemented. Explicit unassociated IPS is wired through `idle_function` with retained original shutdown/off/fresh-start workers; three additional native cases are written, unexecuted. Associated LPS still needs native template publication, original peer/key/UP binding and confirmed wake before DATA. The whole row remains open. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
 | `system_suspend` | Source-complete for actual C21/C22 identity-DMA PCI-PM D0 profiles: retained uncancelled native retirement/card-off/D3hot receipts, original-source C22 RFE6 DBI pad, D0/config restoration and fresh cold provisioning on the original netdev. Foreground cancellation rolls workers back; old keys/cookies never revive and fresh association stays explicit. Six native cases are written; release/native and physical S3 acceptance remain pending. |

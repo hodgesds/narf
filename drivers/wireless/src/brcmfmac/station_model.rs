@@ -94,6 +94,12 @@ pub(super) struct Firmware {
     statuses: usize,
 }
 impl Firmware {
+    /// Inject one real firmware-SME peer loss at the native control setup
+    /// boundary; parent register model cannot mutate the private AP model.
+    pub(super) fn ap_peer_loss(&mut self, peer: [u8; 6]) {
+        self.ap.as_mut().unwrap().remove(peer);
+    }
+
     fn new(secured: bool) -> Self {
         Self {
             ap: None,
@@ -893,6 +899,9 @@ pub(crate) struct Handle(Rc<IrqSafeSpinLock<State>>);
 impl Handle {
     pub(crate) fn ap_program_down_after_setup(&self, admin: narf_net::AdminHandle) {
         self.0.lock().ap_program_down_at_control_read = Some(admin);
+    }
+    pub(crate) fn ap_program_loss_after_setup(&self, peer: [u8; 6]) {
+        self.0.lock().ap_program_loss_at_control_read = Some(peer);
     }
     pub(crate) fn ap_program_fail_index(&self) {
         self.0.lock().ap_program_fail_index_once = true;

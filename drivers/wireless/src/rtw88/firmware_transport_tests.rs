@@ -15,6 +15,32 @@ mod firmware_metadata {
 }
 include!("firmware/rtl8821c_metadata.rs");
 
+fn smoke_rtw88_firmware_feature_signature_is_not_a_power_receipt() -> TestResult {
+    let mut bytes = narf_wifi_fixtures::firmware::sparse_image(
+        SOURCE_8821C_LENGTH,
+        &[(0, SOURCE_8821C_HEADER)],
+    )
+    .unwrap();
+    for (wire, expected) in [
+        (0u32, 0u32),
+        (0x16, 0),
+        (0x17, 0x17),
+        (0x8000_0001, 0x8000_0001),
+    ] {
+        bytes[0x0c..0x10].copy_from_slice(&wire.to_le_bytes());
+        bytes[7] = 29;
+        match parse(0xc821, &bytes) {
+            Ok(image) if image.info.features == expected && image.info.subindex == 29 => {}
+            _ => return TestResult::Fail("firmware feature signature or subindex parsing"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw88_firmware_feature_signature_is_not_a_power_receipt
+);
+
 fn smoke_rtw8821ce_raw_source_header_and_exact_profile_binding() -> TestResult {
     let bytes = narf_wifi_fixtures::firmware::sparse_image(
         SOURCE_8821C_LENGTH,
@@ -35,6 +61,8 @@ fn smoke_rtw8821ce_raw_source_header_and_exact_profile_binding() -> TestResult {
         != (Info {
             version: 24,
             subversion: 11,
+            subindex: 0,
+            features: 7,
             h2c: 12,
             sections: 3,
         })
@@ -88,6 +116,8 @@ fn smoke_rtw8822ce_raw_source_metadata_parser_golden() -> TestResult {
         != (Info {
             version: 9,
             subversion: 9,
+            subindex: 15,
+            features: 0x1e7,
             h2c: 15,
             sections: 3,
         })

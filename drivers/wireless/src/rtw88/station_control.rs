@@ -256,7 +256,12 @@ pub(super) async fn prepare_initial(
     // Close the MAC's initial WMM/TXOP defaults before ordinary MAC traffic.
     configure_dcf(io, false, admission)?;
     // Source leave_lps_core: ACTIVE, RLBM0/smartPS0/awake1/port0/ALL_ON0xc.
-    send(io, [0x20, 0, 0, 1, 0, 0x0c, 0, 0], Some(admission)).await?;
+    send(
+        io,
+        super::runtime_ps_wire::parameters(false),
+        Some(admission),
+    )
+    .await?;
     // Explicitly disable firmware keep-alive and disconnect-decision frames.
     send(io, [3, 2, 5, 0, 0, 0, 0, 0], Some(admission)).await?;
     send(io, [4, 0, 0, 0, 0, 0, 0, 0], Some(admission)).await?;

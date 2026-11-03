@@ -49,6 +49,10 @@ pub enum Kind {
 pub struct Info {
     pub version: u16,
     pub subversion: u8,
+    pub subindex: u8,
+    /// Linux FW_FEATURE_SIG must be present before feature bits have meaning.
+    /// This is image metadata, not evidence that any power transition ran.
+    pub features: u32,
     pub h2c: u16,
     pub sections: usize,
 }
@@ -179,6 +183,11 @@ fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
         info: Info {
             version: u16::from_le_bytes([bytes[4], bytes[5]]),
             subversion: bytes[6],
+            subindex: bytes[7],
+            features: match word(bytes, 0x0c) {
+                features if features & 1 != 0 => features,
+                _ => 0,
+            },
             h2c: u16::from_le_bytes([bytes[0x1c], bytes[0x1d]]),
             sections: if has_emem { 3 } else { 2 },
         },

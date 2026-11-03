@@ -11,8 +11,9 @@ impl<B: Bus> Runtime<B> {
         input: &[u8],
         maximum: usize,
         original: &Capture,
+        write: bool,
     ) -> Result<Vec<u8>, Error> {
-        let ticket = self.begin_ioctl_ap(command, input, maximum, original)?;
+        let ticket = self.begin_ioctl_ap(command, input, maximum, original, write)?;
         let mut transaction = Transaction {
             runtime: self,
             retired: false,
@@ -36,6 +37,7 @@ impl<B: Bus> Runtime<B> {
         input: &[u8],
         maximum: usize,
         original: &Capture,
+        write: bool,
     ) -> Result<Ticket, Error> {
         if self.failed {
             return Err(Error::Failed);
@@ -56,33 +58,47 @@ impl<B: Bus> Runtime<B> {
             .ok_or(Error::Exhausted)?;
         let logical = maximum.max(input.len());
         let wire_length = logical.min(INPUT);
-        let resources = self.resources.as_mut().ok_or(Error::Failed)?;
-        let ring = &mut resources.rings[0];
+        let ring = &self.resources.as_ref().ok_or(Error::Failed)?.rings[0];
         if !ring.h2d || ring.size != 40 {
             return Err(Error::Protocol);
         }
-        // The real native consumer-index read may service a backend. No
-        // original Program source/key/role/policy proof is consumed before
-        // that setup and then treated as a current publication authority.
-        let peer = match read16(&mut self.bus, ring.rptr) {
+        let (read_pointer, depth, producer) = (ring.rptr, ring.depth, ring.write);
+        // Actual consumer setup precedes the final pending-input boundary.
+        let peer = match read16(&mut self.bus, read_pointer) {
             Ok(peer) => peer,
             Err(error) => {
                 self.fail();
                 return Err(error);
             }
         };
-        if peer >= ring.depth {
+        if peer >= depth {
             self.fail();
             return Err(Error::Protocol);
         }
-        let next = if ring.write + 1 == ring.depth {
+        let next = if producer + 1 == depth {
             0
         } else {
-            ring.write + 1
+            producer + 1
         };
         if next == peer {
             return Err(Error::Busy);
         }
+        if write
+            && (self
+                .events
+                .iter()
+                .any(|bytes| match crate::cyw43439::events::parse_event(bytes) {
+                    Ok(event) => original.program_event_blocks(&event.header),
+                    Err(_) => true,
+                })
+                || !self.ap_completed_idle()?)
+        {
+            // Records and native producer positions remain owned. No
+            // input/descriptor/index/doorbell may step over that prefix.
+            return Err(Error::Busy);
+        }
+        let resources = self.resources.as_mut().ok_or(Error::Failed)?;
+        let ring = &mut resources.rings[0];
         let request = IoctlReq {
             hdr: CommonHdr {
                 msgtype: 9,

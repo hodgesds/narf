@@ -7,6 +7,8 @@ use narf_firmware::{FirmwareBlob, FirmwareError};
 const LENGTH: usize = 128;
 #[path = "amsdu_policy.rs"]
 mod amsdu;
+#[path = "fragment_policy.rs"]
+mod fragment;
 #[path = "lps_policy.rs"]
 mod lps;
 #[path = "rf_tracking_policy.rs"]
@@ -243,6 +245,7 @@ pub(super) struct Qualification {
     amsdu: Option<amsdu::Amsdu>,
     rf_tracking: Option<rf_tracking::Tracking>,
     lps: Option<lps::Sleep>,
+    fragments: Option<fragment::Fragments>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -328,6 +331,7 @@ impl Qualification {
             amsdu: None,
             rf_tracking: None,
             lps: None,
+            fragments: None,
             antenna_qdb,
             ceiling_qdbm,
             peaks_qdbm,
@@ -358,6 +362,14 @@ impl Qualification {
         self.lps = lps::Sleep::optional(self, profile)?;
         self.current()
     }
+    pub(super) fn load_fragments(&mut self) -> Result<(), Error> {
+        self.fragments = fragment::Fragments::optional(self)?;
+        self.current()
+    }
+    pub(super) fn fragments_allowed(&self) -> Result<bool, Error> {
+        self.current()?;
+        Ok(self.fragments.is_some())
+    }
     pub(super) fn sleep_profile(&self) -> Result<Option<super::lps_wire::Profile>, Error> {
         self.current()?;
         Ok(self.lps.as_ref().map(lps::Sleep::profile))
@@ -366,6 +378,10 @@ impl Qualification {
         &self,
         operation: impl FnOnce() -> Result<T, super::power::Error>,
     ) -> Result<T, super::power::Error> {
+        let operation = || match &self.fragments {
+            Some(program) => program.invoke(operation),
+            None => operation(),
+        };
         let operation = || match &self.lps {
             Some(program) => program.invoke(operation),
             None => operation(),
@@ -401,6 +417,9 @@ impl Qualification {
             program.current()?;
         }
         if let Some(program) = &self.lps {
+            program.current()?;
+        }
+        if let Some(program) = &self.fragments {
             program.current()?;
         }
         #[cfg(any(test, feature = "kernel-test"))]

@@ -160,6 +160,21 @@ impl<I: Io> Owner<I> {
             .irq_start(line)
             .map_err(super::station::Error::Native)
     }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn station_model_management(
+        &mut self,
+        bytes: alloc::vec::Vec<u8>,
+    ) -> Result<(), station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(station::Error::State)?
+            .model_management(&mut self.io, bytes)
+    }
+    pub(super) fn station_fragment_policy(&mut self, policy: Option<Arc<super::monitor::Desired>>) {
+        if let Some(station) = self.station.as_mut() {
+            station.set_fragment_policy(policy);
+        }
+    }
     pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
         self.station
             .as_mut()

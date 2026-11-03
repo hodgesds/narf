@@ -318,6 +318,7 @@ impl Native {
             .map_err(denied)?;
             let mut qualification = radio_policy::Qualification::load(board).map_err(denied)?;
             qualification.load_sleep(assets).map_err(denied)?;
+            qualification.load_fragments().map_err(denied)?;
             qualification.current().map_err(denied)?;
             Ok(RadioPreflight {
                 board,

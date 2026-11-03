@@ -26,18 +26,21 @@ impl Runtime {
 pub(in crate::rtw89) struct Access<'a> {
     native: &'a mut Native,
     cleanup: bool,
+    fragment: Option<super::fragment::Part>,
 }
 impl Native {
     pub(in crate::rtw89) fn station_access(&mut self) -> Access<'_> {
         Access {
             native: self,
             cleanup: false,
+            fragment: None,
         }
     }
     pub(in crate::rtw89) fn station_cleanup(&mut self) -> Access<'_> {
         Access {
             native: self,
             cleanup: true,
+            fragment: None,
         }
     }
     pub(in crate::rtw89) fn station_controller(&self) -> Result<control::Controller, power::Error> {
@@ -177,6 +180,31 @@ impl Native {
             return Err(packet::Error::Access);
         }
         self.packet_operation(|core, port| core.submit_agg(port, bytes, report, rate, Some(agg)))
+    }
+    pub(in crate::rtw89) fn submit_fragment(
+        &mut self,
+        part: &super::fragment::Part,
+        report: bool,
+    ) -> Result<u64, packet::Error> {
+        let mut core = self
+            .station_runtime
+            .core
+            .take()
+            .ok_or(packet::Error::State)?;
+        let result = core.submit_fragment(
+            &mut Access {
+                native: self,
+                cleanup: false,
+                fragment: Some(part.clone()),
+            },
+            part,
+            report,
+        );
+        self.station_runtime.core = Some(core);
+        if result.is_err() && result != Err(packet::Error::Busy) {
+            self.fail();
+        }
+        result
     }
     pub(in crate::rtw89) fn submit_packet(
         &mut self,
@@ -325,6 +353,29 @@ impl power::Io for Access<'_> {
             return Err(power::Error::Terminal);
         }
         let rings = addr_set_for_chip(ChipId::Rtl8852B).tx;
+        if let Some(part) = &self.fragment {
+            // This exact part is already issued. A prepared-part predicate
+            // would deny every valid doorbell or tempt an unsafe bypass.
+            let part = part.clone();
+            let queue = crate::rtw89::packet_format::classify_fragment(
+                part.bytes(),
+                part.bytes()
+                    .get(10..16)
+                    .and_then(|a| a.try_into().ok())
+                    .ok_or(power::Error::Terminal)?,
+            )
+            .map_err(|_| power::Error::Terminal)?;
+            if u64::from(a) == queue.regs().idx {
+                return self.native.with_ordinary_current(|native| {
+                    native
+                        .fragment_part_current(&part, part.bytes(), true, true)
+                        .map_err(|_| power::Error::Access)?;
+                    control::awake(&mut native.io)?;
+                    native.io.write16(a, v)
+                });
+            }
+            return Err(power::Error::Unsupported);
+        }
         if u64::from(a) == rings[0].idx || u64::from(a) == rings[8].idx {
             self.native.with_ordinary_current(|native| {
                 native
@@ -475,6 +526,51 @@ unsafe impl packet::Port for Access<'_> {
         } else {
             Ok(None)
         }
+    }
+    fn fragment_ready(&mut self, part: &super::fragment::Part) -> Result<(), packet::Error> {
+        if self
+            .fragment
+            .as_ref()
+            .is_none_or(|original| !original.same(part))
+        {
+            return Err(packet::Error::Access);
+        }
+        self.native
+            .fragment_part_current(part, part.bytes(), true, false)
+    }
+    fn fragment_publish<T>(
+        &mut self,
+        part: &super::fragment::Part,
+        operation: impl FnOnce(&mut Self) -> Result<T, packet::Error>,
+    ) -> Result<T, packet::Error> {
+        if self
+            .fragment
+            .as_ref()
+            .is_none_or(|original| !original.same(part))
+        {
+            return Err(packet::Error::Access);
+        }
+        let authority = self.native.authority;
+        let qualification = self
+            .native
+            .ordinary
+            .as_ref()
+            .ok_or(packet::Error::Access)?
+            .qualification
+            .clone();
+        // Preserve genuine unpublished Busy separately from cap-scope failures.
+        crate::rtw88::pci_park::invoke(&authority, || {
+            qualification.with_current(|| {
+                Ok((|| {
+                    self.native
+                        .fragment_part_current(part, part.bytes(), true, false)?;
+                    control::awake(&mut self.native.io)?;
+                    operation(self)
+                })())
+            })
+        })
+        .map_err(|_| packet::Error::Access)?
+        .map_err(|_| packet::Error::Access)?
     }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, packet::Error> {
         alloc_coherent_masked(length, DomainId::DRIVER_0, DEVICE_DMA_MASK)

@@ -112,6 +112,9 @@ pub(super) struct Peer {
     tids: Arc<core::sync::atomic::AtomicU8>,
 }
 impl Peer {
+    pub(super) fn admission_same(&self, admission: &Admission) -> bool {
+        self.admission.same(admission)
+    }
     pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.valid, &other.valid) && self.own == other.own && self.peer == other.peer
     }

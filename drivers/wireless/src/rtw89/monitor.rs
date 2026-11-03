@@ -3,7 +3,7 @@
 //! Source Linux7.3-rc4 mac80211/core/mac/phy; no enum grants RF or capture.
 use super::{monitor_wire, power, station_control::Admission};
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Selection {
@@ -12,13 +12,29 @@ pub(super) struct Selection {
 }
 /// Physical supervisor-owned selected role, retained across actual generation
 /// rebind. Selection is metadata; only native receipts can open capture.
-pub(super) struct Desired(IrqSafeSpinLock<Selection>);
+pub(super) struct Desired(IrqSafeSpinLock<Selection>, AtomicU32);
 impl Desired {
     pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self(IrqSafeSpinLock::new(Selection {
-            mode: 2,
-            generation: 1,
-        })))
+        Arc::new(Self(
+            IrqSafeSpinLock::new(Selection {
+                mode: 2,
+                generation: 1,
+            }),
+            AtomicU32::new(super::fragment_wire::DISABLED),
+        ))
+    }
+    pub(super) fn fragment_threshold(&self) -> u32 {
+        self.1.load(Ordering::Acquire)
+    }
+    /// A physical policy preference, not a new role/source generation or RF
+    /// grant. Each new MSDU samples it; an already retained train is immutable.
+    pub(super) fn set_fragment_threshold(&self, original: Selection, threshold: u32) -> bool {
+        let selected = self.0.lock();
+        if *selected != original || selected.mode != 2 {
+            return false;
+        }
+        self.1.store(threshold, Ordering::Release);
+        true
     }
     pub(super) fn snapshot(&self) -> Selection {
         *self.0.lock()

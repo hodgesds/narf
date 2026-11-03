@@ -229,6 +229,28 @@ impl<I: Io + 'static> Device<I> {
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
     }
+    /// Freeze actual unassociated IPS eligibility and original closure under
+    /// the real owner mutex. The reservation closure must not await or touch
+    /// station state; a pending join cannot start after this close.
+    pub(super) async fn idle_claim<T>(
+        &self,
+        reserve: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let retained = self.lifecycle.retained.lock().await;
+        if self.closed()
+            || self.lifecycle.removed()
+            || self.lifecycle.status().stage != super::firmware_lifecycle::Stage::StationReady
+            || retained.as_ref().is_none_or(|owner| {
+                owner.station_phase() != Some(station::Phase::Passive)
+                    || owner.station_peer().is_some()
+            })
+        {
+            return Err(Error::Busy);
+        }
+        let claim = reserve()?;
+        self.cancel_control();
+        Ok(claim)
+    }
     /// Linux `rtw_watch_dog_work`: one dynamic-mechanism period under the
     /// retained owner mutex. A failed period closes the shell.
     pub(super) async fn watchdog(&self) -> bool {

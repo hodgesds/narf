@@ -2,6 +2,8 @@
 //! This fixture grants no production full-RF receipt or physical readiness.
 #[path = "station_amsdu_tests.rs"]
 mod amsdu_tests;
+#[path = "station_fragment_tests.rs"]
+mod fragment_tests;
 #[path = "station_htc_tests.rs"]
 mod htc_tests;
 #[path = "station_multi_tests.rs"]
@@ -395,6 +397,7 @@ struct DriverModel {
     he: bool,
     /// Signed originator BA / TX A-MPDU program (`Program::Ampdu`).
     ampdu: bool,
+    fragments: Option<Arc<crate::rtw89::radio_policy::Qualification>>,
     irq: Option<IrqModel>,
     /// HCI DMA stop/busy block behind `dma_stop::stop`.
     dma: crate::rtw89::dma_stop::tests::Model,
@@ -454,6 +457,7 @@ impl DriverModel {
             ht: false,
             he: false,
             ampdu: false,
+            fragments: None,
             irq: None,
             dma: crate::rtw89::dma_stop::tests::Model::new(),
             reclaimed: None,
@@ -536,6 +540,11 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_allowed(&mut self) -> Result<(), crate::rtw89::power::Error> {
         if self.stopped {
             return Err(crate::rtw89::power::Error::Terminal);
+        }
+        if let Some(grant) = &self.fragments {
+            grant
+                .current()
+                .map_err(|_| crate::rtw89::power::Error::Access)?;
         }
         self.packets
             .authority
@@ -764,6 +773,40 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         self.core
             .as_ref()
             .is_some_and(crate::rtw89::packet_core::Core::ready)
+    }
+    fn station_fragments_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        self.fragments.as_ref().map_or(Ok(false), |f| {
+            f.fragments_allowed()
+                .map_err(|_| crate::rtw89::power::Error::Access)
+        })
+    }
+    fn packet_fragment_binding(
+        &mut self,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<crate::rtw89::command_native::FragmentBinding, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        if !self.packet_ready() || self.packets.pending_receive() {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        crate::rtw89::command_native::FragmentBinding::model(
+            self.packets.authority,
+            self.fragments
+                .as_ref()
+                .ok_or(crate::rtw89::power::Error::Unsupported)?
+                .clone(),
+            self.controller
+                .peer()
+                .ok_or(crate::rtw89::power::Error::Terminal)?,
+            admission.clone(),
+        )
+    }
+    fn packet_submit_fragment(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+        report: bool,
+    ) -> Result<u64, crate::rtw89::packet_core::Error> {
+        self.packet(|c, p| c.submit_fragment(p, part, report))
     }
     fn packet_submit(
         &mut self,

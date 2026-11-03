@@ -11,6 +11,7 @@ type Setup<F> = (Arc<Harness>, FreshSlot, Arc<Control>, F);
 struct NativeModel {
     old: Arc<Harness>,
     fresh: FreshSlot,
+    idle: bool,
 }
 struct Parked {
     retired: operating_reset::Retired,
@@ -22,6 +23,13 @@ impl Backend for NativeModel {
     type Parked = Parked;
     async fn prepare(&mut self) -> Result<Parked, narf_power::device_pm::DevicePmError> {
         let error = narf_power::device_pm::DevicePmError::DriverError;
+        if self.idle {
+            self.old
+                .device
+                .idle_claim(|| Ok(()))
+                .await
+                .map_err(|_| narf_power::device_pm::DevicePmError::Busy)?;
+        }
         self.old.device.withdraw_for_rebind().map_err(|_| error)?;
         let retired = operating_reset::retire(&self.old.device, &self.old.lifecycle)
             .await
@@ -54,19 +62,114 @@ impl Backend for NativeModel {
     }
 }
 fn setup() -> Setup<impl Future<Output = ()>> {
+    setup_mode(true, false)
+}
+fn setup_mode(join: bool, idle: bool) -> Setup<impl Future<Output = ()>> {
     let old = Arc::new(Harness::build(true, OWN, true));
-    old.join();
+    if join {
+        old.join();
+    }
     let fresh = Arc::new(IrqSafeSpinLock::new(None));
     let control = Control::new();
     let future = system_pm_worker::run(
         NativeModel {
             old: old.clone(),
             fresh: fresh.clone(),
+            idle,
         },
         control.clone(),
     );
     (old, fresh, control, future)
 }
+fn smoke_rtw8822ce_ips_original_passive_native_off_same_interface_fresh_start() -> TestResult {
+    let (old, fresh, control, future) = setup_mode(false, true);
+    let cookie = endpoints::cookie(old.device.name()).unwrap();
+    let ifindex = narf_net::iface::lookup(old.device.name()).unwrap().ifindex;
+    let idle = crate::rtw88::runtime_idle::RuntimeIdle::new(control.clone());
+    let mut future = Box::pin(future);
+    for _ in 0..16384 {
+        if control.phase() == Phase::Suspended {
+            break;
+        }
+        let _ = poll(future.as_mut());
+    }
+    if !idle.suspended() || !old.lifecycle.removed() || fresh.lock().is_some() {
+        return TestResult::Fail("IPS did not retain actual passive DMA/card-off receipts");
+    }
+    drop(idle);
+    if !poll(future.as_mut()).is_ready() || control.phase() != Phase::Resumed {
+        return TestResult::Fail("IPS handle drop failed to drive durable fresh startup");
+    }
+    let fresh = fresh.lock().clone().unwrap();
+    if fresh.device.name() != old.device.name()
+        || narf_net::iface::lookup(fresh.device.name())
+            .unwrap()
+            .ifindex
+            != ifindex
+        || endpoints::cookie(fresh.device.name()) == Some(cookie)
+        || fresh.device.link_up()
+    {
+        return TestResult::Fail("IPS reused old admission/endpoint or lost original interface");
+    }
+    fresh.join();
+    let lease = narf_net::dhcp::dhcp_acquire(fresh.device.name(), 0).unwrap();
+    if !fresh.plan.matches_lease(&lease) || !multi_tests::routed(&fresh, b"native-IPS-fresh-data") {
+        return TestResult::Fail("IPS fresh firmware/association/CCMP/DHCP path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw8822ce_ips_original_passive_native_off_same_interface_fresh_start
+);
+
+fn smoke_rtw8822ce_ips_associated_owner_refusal_preserves_actual_data_path() -> TestResult {
+    let (old, fresh, control, future) = setup_mode(true, true);
+    let mut future = Box::pin(future);
+    if !poll(future.as_mut()).is_ready()
+        || control.phase() != Phase::Failed
+        || control.error() != narf_power::device_pm::DevicePmError::Busy
+        || old.lifecycle.removed()
+        || old.device.closed()
+        || fresh.lock().is_some()
+        || !multi_tests::routed(&old, b"associated-IPS-refusal-still-live")
+    {
+        return TestResult::Fail("IPS retired or closed an actually associated owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw8822ce_ips_associated_owner_refusal_preserves_actual_data_path
+);
+
+fn smoke_rtw8822ce_ips_cancelled_waiter_preserves_original_retirement_worker() -> TestResult {
+    let (old, fresh, control, future) = setup_mode(false, true);
+    let delivery = old.device.delivery_for_test();
+    let idle = crate::rtw88::runtime_idle::RuntimeIdle::new(control.clone());
+    let mut future = Box::pin(future);
+    if poll(future.as_mut()).is_ready() || control.phase() != Phase::Preparing {
+        return TestResult::Fail("IPS skipped actual original unlocked callback");
+    }
+    drop(idle);
+    if poll(future.as_mut()).is_ready() || fresh.lock().is_some() {
+        return TestResult::Fail("IPS cancellation fabricated original callback retirement");
+    }
+    drop(delivery);
+    for _ in 0..16384 {
+        if poll(future.as_mut()).is_ready() {
+            break;
+        }
+    }
+    if control.phase() != Phase::Resumed || fresh.lock().is_none() || !old.lifecycle.removed() {
+        return TestResult::Fail("IPS foreground cancellation lost real fresh-start worker");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw8822ce_ips_cancelled_waiter_preserves_original_retirement_worker
+);
 fn poll(future: core::pin::Pin<&mut impl Future<Output = ()>>) -> Poll<()> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }

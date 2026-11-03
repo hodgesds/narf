@@ -660,6 +660,19 @@ and unexecuted; scoped formatting and one release metadata context pass. This
 repair earns no completed-feature credit. Full release/native validation remains
 at25 completed rows; physical hardware acceptance stays separate.
 
+**2026-11-02 — native host-fragmentation source recount.** The ledger now holds
+**54 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twenty-four
+source-complete implementations await full batch acceptance. RTL8852B host
+fragmentation now composes the original native peer/device/full joint program,
+immutable SN/PN trains, exact DMA/RPQ terminals and native producer fences
+through the actual doorbell, plus bounded original-source defragmentation and
+public threshold ownership. Eight cases are written, with six separate RTW88
+PS-codec/IPS prerequisite cases and an existing AP-prefix regression strengthened.
+All14 new cases remain unexecuted. Scoped formatting and one release metadata
+context pass; helper and repair work earns no additional row credit. Full
+release/native validation remains at25 completed rows. Counting unvalidated
+implementations,78 remain; physical RF/firmware/board acceptance stays separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -670,7 +683,7 @@ at25 completed rows; physical hardware acceptance stays separate.
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 11 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, runtime sleep and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset, explicit safe rejoin and retained system suspend/resume are implemented pending validation |
-| rtw89 | 8 | Additional channels/bands/widths, fragmentation, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor are implemented pending validation; other firmware and AX/BE chips are separate rows |
+| rtw89 | 7 | Additional channels/bands/widths, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor and source-qualified host fragmentation are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 11 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop is implemented pending validation |
 
@@ -1597,7 +1610,11 @@ CYW43439 keeps its independent AP row open. AP Program IOCTLs additionally
 retain the original `Capture` through input/descriptor/index/doorbell publication
 after native ring setup; definitely unissued refusal stays distinct from
 entered uncertain issue. Ordinary station and physical Stop paths are unchanged.
-Ten native cases are unexecuted.
+Ten native cases are unexecuted. Program SET additionally checks actual
+completed native producers after H2D setup and preserves every queued transition;
+GET remains scoped/read-only, and Session/pending filters share the same
+native transition classifier. The existing case requires genuine loss delivery
+after a denied stale SET and a successful retained-record query.
 
 ### 3.11 Original-owner runtime LPS (validation pending)
 
@@ -1684,6 +1701,21 @@ association afterward. Six cases remain unexecuted. The independent shared
 management-fragment continuation preserves the original four-slot/key/PMF owner
 and grants no native or Wi-Fi feature credit. Family and wireless §3 contain
 the complete contracts; physical system sleep acceptance remains external.
+
+### 3.16 Source-qualified native host fragmentation (validation pending)
+
+RTL8852B may expose the existing fragmentation threshold control only when its
+original full joint N52F emitter is current. A retained native binding precedes
+crypto; every immutable train owns one MSDU SN, per-fragment PN and exact native
+terminal identity. Pre-issue refusal may defer without crypto retries; newly
+pending input after issue denies the actual doorbell while preserving uncertain
+DMA. Only matching DMA plus successful RPQ/body receipts advance the train.
+RX parsing adds no emission permission and retains the original native source,
+peer and cryptographic cache through complete reassembly. Family §3 defines the
+profile and eight unexecuted cases. Independent RTW88 firmware feature/wire and
+unassociated IPS continuations remain partial runtime-sleep work; they grant no
+new RF admission or completed-row credit.
+
 
 ## 4. Interaction with `narf-wireless`
 

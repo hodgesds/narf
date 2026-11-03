@@ -2019,6 +2019,107 @@ retained. Release metadata, native two-architecture and physical validation
 remain pending. Primary source: local Linux7.3-rc4 `rtw89/{mac80211,core,mac,
 phy,fw,cam,txrx,reg}.c/.h`; exact hashes accompany the handoff.
 
+### RTL8852B software fragmentation (implemented; acceptance pending)
+
+The admitted channel1/20MHz RTL8852B station now has explicit native TX and
+RX fragmentation owners. This current contract supersedes the historical
+`fragmentation` blocker notes below. Other chips, channel/width transitions,
+MLD, four-address, A-MSDU/A-MPDU and +HTC fragment forms gain no admission.
+Ordinary unfragmented entry points retain their original fragment rejection;
+only the bound fragment path may publish original More-Fragments/nonzero
+fragment numbers. Existing HT/HE receive A-MSDU promises remain unchanged.
+
+Linux7.3-rc4 `net/mac80211/{tx,rx,wpa}.c` splits plaintext before encryption:
+the threshold includes the plaintext MAC header/body and FCS, then CCMP adds
+16 octets per fragment. One logical MSDU uses one host SN, frag0..15, and a
+fresh PN per protected MPDU. Open DATA/unprotected unicast management use the
+same bounded plaintext split. Protected robust management uses the original
+installed PTK and management CCMP nonce, with the caller's one management SN.
+The actual B TXWD fragment formatter keeps software sequence mode even on
+MGMT8, fixes CCK1/long preamble, leaves hardware crypto disabled and preserves
+all original fragment fields. A2346 plaintext threshold can produce a2358-byte
+protected MPDU excluding FCS; this separate bound is enforced consistently in
+the train binding, descriptor formatter and native fragment RX, without
+broadening the2304-byte ordinary profile.
+
+The separate optional signed `rtw89/rtw8852b-fragment-v1-<MAC>.bin` is N52F:
+128 bytes, version1, exact original device/MAC/channel1/20/TXA1/RXAB profile,
+maximum threshold2346, maximum16 fragments, CCK1 rate0, profile flags3 and host
+management sequence mode1, with all remaining reserved bytes zero. Its binding
+hash includes the unchanged installed N52B record digest, board/firmware/full
+program identity and signer, each actual N52A/N52T companion digest, canonical
+accepted N52P digest when present, and the full fragment/rate/NAV recipe.
+This is a full joint emitter qualification; old flags/enum values cannot
+promote a nonfragment-only measured program. Absence preserves old ordinary TX
+and advertises no fragmentation setter; invalid-present or revoked original
+programs refuse admission. All original device/base/A/T/P/F capability scopes
+stay finite and nonrecursive through actual publication. No new RF measurement
+is invented for receive-only parsing/reassembly under the unchanged original
+base/native PHY/source admission.
+
+The station captures an opaque binding to the SAME actual device capability,
+qualification object, controller peer and source admission before any crypto,
+PN or SN. A management input that encounters a late prefix/credit refusal
+retains its original unprotected logical bytes until that same owner is quiet,
+without assigning SN/PN. The complete immutable train and original key-color denial proof are
+retained once before first issue. Native queue pressure or a final completed
+RX-prefix refusal reuses these exact bytes. Every part is one-shot: prepared
+and issued checks differ, descriptor/ring publication records issued ownership
+before any descriptor write, and the final native doorbell rechecks the
+original issued part AND actual pending RX/backlog inside its actual fixed
+capability scopes. After all other queries/callbacks, the last pre-issue native
+RX/backlog check immediately precedes issue; a strictly unpublished Busy aborts the reservation without
+ring/doorbell/part advancement. New pending input at the final doorbell after
+issue is terminal/retained, never converted to unpublished Busy; failures after
+issue retain uncertain DMA and close admission. Neither TXBD consumption nor firmware RPQ alone advances the
+train. Only the exact same body/identity with BOTH actual DMA consumption and
+successful RPQ release advances to the next original MPDU. Key/peer/source or
+physical owner loss denies future parts; cleanup can retire terminal ownership
+without manufacturing a new emission grant.
+
+The whole logical input is consumed from its FIFO once the driver retains its
+complete train. Later frames/aggregation cannot pass it. An actual operational
+originator BA MPDU remains DONTFRAG, as in mac80211; a partial fragment never
+enters an A-MPDU/A-MSDU. A rekey that closes the port before the first issue
+retires prepared data; an already-started original MSDU can drain its retained
+old-key fragments before serialized M2/M4 while that exact old key remains
+installed. Peer loss is processed before any continuation. A management train
+keeps later MLME input waiting until its actual terminal publication receipts.
+
+Native RX preserves each original descriptor-admitted header and rejects actual
+A-MPDU fragments before BA reorder. Secure DATA/EAPOL and unicast management use
+the original shared Security cache: FOUR total slots, two-second first-fragment
+lifetime,4096-byte complete limit, exact original peer/header/type/TID/SN and
+consecutive fragment numbers; CCMP additionally authenticates each original
+header with the same key color and consecutive PN. Plain/protected/key epochs
+cannot mix. Completed EAPOL runs the same nonce/MIC/replay/RSN verifier and
+requires actual terminal key-install/port receipts. Unprotected management
+retains the same pre-key/nonrobust/PMF rule; installed-PTK plaintext robust
+frames remain denied. Open links have a separate lazily boxed four-slot
+plaintext owner only while no Security owner is active; no plaintext result
+can become a cryptographic proof. Original source/association retirement clears
+these caches. Pending TX trains or RX caches block LPS; ordinary/control/BB
+operations still require completed awake/restore receipts and the original
+full joint program.
+
+`fragmentation_threshold` / `set_fragmentation_threshold` publish the existing
+nl80211 SET_WIPHY contract only with this actual signed native support. Values
+256..2346 round down to even; `u32::MAX` disables future fragmentation. A fixed
+physical preference survives actual supervisor rebind/reset and monitor→station
+replacement, but grants no native readiness or RF operation. Only a fresh
+actually qualified generation uses it; old role/source shells cannot retarget
+its replacement. The station samples one preference for each new logical input;
+changes never rewrite an owned train or consume another PN/SN on retry.
+
+Eight additional source cases cover N52F identity/revocation, actual Native/
+NativeIo/Core descriptor/DMA/RPQ and final-producer fences, public Open/WPA2
+threshold/immutable terminal trains, original RX MIC/PN/timeout with no TX
+companion, actual PMF2346→2358 management/software-SN, operational BA DONTFRAG,
+source retirement, and genuine fragmented initial M1/M3 plus dropped held-M4
+ownership. All old literal registrations are retained. Cases and physical
+acceptance are pending; no native pass or throughput claim is made here. Exact
+local Linux file hashes accompany the source handoff.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -2145,7 +2246,7 @@ triage above remains separate from implementation.
 | `additional_operating_channels` | The retained native radio, scan/association owner and signed N52B/HT/HE operating programs bind channel1/2412MHz. Noninitial operation needs a current per-channel occupied-power qualification and a drain/retune owner for the actual MAC/BB/RF program before queues resume. |
 | `five_ghz_operation` | RTL8852B supports5GHz, but the retained radio/power recipe and station admission select the channel1 2.4GHz program. Native5GHz RF/BB/power setup, permitted scan/retune and exact signed operating programs remain missing; discovery of the band alone grants no station profile. |
 | `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
-| `fragmentation` | Native packet admission still refuses nonzero fragment numbers/More-Fragments. Host split/reassembly, per-fragment PN and terminal receipt ownership, bounded reassembly lifetimes and matching signed emission programs must be added; the shared fragmentation-threshold control API alone does not implement them. |
+| `fragmentation` | The admitted RTL8852B native/host/public owner is now implemented in §3 above, including the separate signed full-joint emitter, per-fragment PN and actual terminal ownership, bounded original-source RX cache and threshold control. Source review, release compilation and native/physical acceptance are pending. Other chip/width profiles remain their explicit separate rows. |
 | `monitor_mode` | The admitted RTL8852B receive-only role/native/raw-radiotap owner is implemented in §3 with original source/registration/role/capture epochs, actual RF channel/PHYSTS program and fresh physical transitions. Four source cases and software/native/physical acceptance are pending; no active/injection or other chip/channel/width profile is claimed. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
 | `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |

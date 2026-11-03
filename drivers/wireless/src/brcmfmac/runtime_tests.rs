@@ -34,6 +34,7 @@ struct State {
     ap_authority: Option<Rc<core::sync::atomic::AtomicBool>>,
     ap_program_down_at_control_read: Option<narf_net::AdminHandle>,
     ap_program_fail_index_once: bool,
+    ap_program_loss_at_control_read: Option<[u8; 6]>,
     registers: BTreeMap<u32, u32>,
     tcm: BTreeMap<u32, u8>,
     dma: BTreeMap<u64, Vec<u8>>,
@@ -176,6 +177,16 @@ impl boot::Bus for Model {
                 *b = *s.tcm.get(&(at + i as u32)).unwrap_or(&0);
             }
             if at == H2DR {
+                if let Some(peer) = s.ap_program_loss_at_control_read.take() {
+                    s.firmware
+                        .as_mut()
+                        .unwrap()
+                        .station
+                        .as_mut()
+                        .unwrap()
+                        .ap_peer_loss(peer);
+                    firmware_step(&mut s);
+                }
                 s.ap_program_down_at_control_read.take()
             } else {
                 None

@@ -966,3 +966,100 @@ pub(in crate::rtw89) fn lps_model(
     base.model_native_before_publication = effect;
     (base, base_cap, cap)
 }
+
+/// Authenticated-record/RFK fixture boundary only, shared by actual Native and
+/// public worker fixtures. Production only loads an actually signed N52F file.
+pub(in crate::rtw89) fn fragment_model(
+    effect: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+) {
+    let (mut base, original, _) = rf_tracking_model(
+        super::super::rf_tracking::Window {
+            low: 100,
+            high: 140,
+        },
+        true,
+    );
+    let profile = super::super::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap();
+    let ps = lps::Request::new(&base, profile).unwrap();
+    let mut record = expanded_record(&base, b"N52P", ps.binding);
+    record[58..62].copy_from_slice(&profile.version);
+    base.lps = Some(
+        lps::Sleep::from_verified(&base, &ps, profile, &record, Some([3; 32]), authority())
+            .unwrap(),
+    );
+    base.model_native_before_publication = effect;
+    let request = fragment::Request::new(&base).unwrap();
+    let record = fragment_record(&base, &request);
+    let companion = authority();
+    base.fragments = Some(
+        fragment::Fragments::from_verified(&base, &request, &record, Some([3; 32]), companion)
+            .unwrap(),
+    );
+    (base, original, companion)
+}
+fn fragment_record(base: &Qualification, request: &fragment::Request) -> [u8; 128] {
+    let mut bytes = expanded_record(base, b"N52F", request.binding);
+    bytes[58..60].copy_from_slice(&2346u16.to_le_bytes());
+    bytes[60..64].copy_from_slice(&[16, 0, 3, 1]);
+    bytes
+}
+fn smoke_rtw8852b_fragment_full_joint_companion_preserves_prior_records_and_current_grants(
+) -> TestResult {
+    let (mut base, original, _) = fragment_model(None);
+    base.fragments = None;
+    let old = fragment::Request::new(&base).unwrap();
+    if base.fragments_allowed() != Ok(false) || base.current().is_err() {
+        return TestResult::Fail("absent fragment record changed prior native program");
+    }
+    let bytes = fragment_record(&base, &old);
+    for offset in [
+        0, 4, 8, 12, 14, 16, 47, 48, 54, 57, 58, 60, 61, 62, 63, 64, 127,
+    ] {
+        let mut bad = bytes;
+        bad[offset] ^= 1;
+        if fragment::Fragments::from_verified(&base, &old, &bad, Some([3; 32]), authority()).is_ok()
+        {
+            return TestResult::Fail("N52F accepted malformed/source/digest/size/sequence program");
+        }
+    }
+    if fragment::Fragments::from_verified(&base, &old, &bytes, None, authority()).is_ok()
+        || fragment::Fragments::from_verified(&base, &old, &bytes, Some([4; 32]), authority())
+            .is_ok()
+    {
+        return TestResult::Fail("N52F bypassed original signer/source");
+    }
+    for kind in 0..3 {
+        let (mut changed, _, _) = fragment_model(None);
+        changed.fragments = None;
+        match kind {
+            0 => changed.lps = None,
+            1 => changed.rf_tracking = None,
+            _ => changed.amsdu = None,
+        }
+        if fragment::Request::new(&changed).unwrap().binding == old.binding {
+            return TestResult::Fail("N52F joint binding lost actual A/T/P optional program");
+        }
+    }
+    original.revoke();
+    if fragment::Fragments::from_verified(&base, &old, &bytes, Some([3; 32]), authority()).is_ok() {
+        return TestResult::Fail("N52F recaptured revoked installed original base");
+    }
+    let (base, original, companion) = fragment_model(None);
+    if base.fragments_allowed() != Ok(true) || base.with_current(|| Ok(3)) != Ok(3) {
+        return TestResult::Fail("N52F actual finite joint current/invoke chain");
+    }
+    companion.revoke();
+    if base.fragments_allowed().is_ok() || base.with_current(|| Ok(3)).is_ok() {
+        return TestResult::Fail("revoked N52F retained fragment emission");
+    }
+    original.revoke();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/fragmentation",
+    smoke_rtw8852b_fragment_full_joint_companion_preserves_prior_records_and_current_grants
+);

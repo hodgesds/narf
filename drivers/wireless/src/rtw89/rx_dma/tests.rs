@@ -612,3 +612,23 @@ pub(in crate::rtw89) fn native_fixture() -> Rx {
     assert!(matches!(ready(prepared), Some(Ok(()))));
     rx
 }
+
+/// Inert device producer writes the ORIGINAL retained next RX buffer. Caller
+/// separately publishes its actual HCI producer index, then actual Native/Rx
+/// consumes/rearms this mapping; no fabricated receive/current-source receipt.
+pub(in crate::rtw89) fn native_publish_one(rx: &mut Rx, mpdu: &[u8]) {
+    let ring = &mut rx.rings.as_mut().unwrap()[0];
+    let buffer = &ring.buffers[usize::from(ring.wp)];
+    let mut wire = alloc::vec![0;20];
+    wire[..4].copy_from_slice(&((20 + mpdu.len() + 4) as u32 | 1 << 15 | 1 << 14).to_le_bytes());
+    wire[4..8].copy_from_slice(&((mpdu.len() + 4) as u32).to_le_bytes());
+    wire.extend_from_slice(mpdu);
+    wire.extend_from_slice(&[0; 4]);
+    assert!(wire.len() <= buffer.len());
+    // SAFETY: exclusive inert retained DMA buffer, exact checked extent; no
+    // real hardware, concurrent Native access, prefetch or Rust memory alias.
+    unsafe {
+        core::ptr::copy_nonoverlapping(wire.as_ptr(), buffer.as_mut_ptr(), wire.len());
+    }
+    buffer.sync(0, wire.len());
+}

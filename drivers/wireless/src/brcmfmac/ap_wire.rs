@@ -23,6 +23,34 @@ pub(super) const GET_BSS: u32 = 136;
 pub(super) const GET_ASSOCIATIONS: u32 = 159;
 pub(super) const DEAUTH_REASON: u32 = 201;
 
+/// One source for Session transitions and pending Program SET barriers.
+/// The event must already be the actual native firmware event envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Transition {
+    Benign,
+    Failed,
+    Associated,
+    Lost,
+    Roamed,
+}
+pub(crate) fn event_transition(
+    header: &crate::cyw43439::events::EventHeader,
+    own: [u8; 6],
+) -> Result<Transition, Error> {
+    if header.if_idx != 0 || header.bsscfg_idx != 0 {
+        return Err(Error::Malformed);
+    }
+    Ok(match header.event_type {
+        63 => Transition::Failed,
+        16 if header.flags & 1 == 0 && header.source_mac == own => Transition::Failed,
+        0 if header.status != 0 => Transition::Failed,
+        8 | 10 if header.status == 0 && header.reason == 0 => Transition::Associated,
+        5 | 6 | 11 | 12 => Transition::Lost,
+        17 => Transition::Roamed,
+        _ => Transition::Benign,
+    })
+}
+
 pub(super) fn unicast(peer: [u8; 6]) -> bool {
     peer != [0; 6] && peer[0] & 1 == 0
 }

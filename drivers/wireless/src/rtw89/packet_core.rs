@@ -71,6 +71,21 @@ pub(super) unsafe trait Port: power::Io {
     fn amsdu_allowed(&mut self) -> Result<Option<usize>, Error> {
         Ok(None)
     }
+    /// Enclose the final quiet-prefix proof, one-shot issue, descriptor writes
+    /// and doorbell in the SAME original device and full joint-program grants.
+    /// A refusal before issue is Busy; failures after issue retain ownership.
+    /// Last exact prefix/current part check AFTER every preceding callback/
+    /// virtual/current query and immediately before the one-shot part issue.
+    fn fragment_ready(&mut self, _part: &super::command_native::FragmentPart) -> Result<(), Error> {
+        Err(Error::Access)
+    }
+    fn fragment_publish<T>(
+        &mut self,
+        _part: &super::command_native::FragmentPart,
+        _operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        Err(Error::Access)
+    }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error>;
     fn receive(&mut self) -> Result<RxStep, Error>;
     /// Clear exactly the `open` DMA stop bits (BE/MGMT/WPDMA, plus BK/VI/VO
@@ -116,6 +131,7 @@ struct Pending {
     report: bool,
     /// Published with TXWD AGG_EN (an operational originator session).
     agg: bool,
+    fragment: Option<super::command_native::FragmentPart>,
 }
 /// Most data MPDUs the aggregate emitter keeps in flight at once
 /// (`radio_policy::Program::Ampdu`). Every other frame is alone in flight.
@@ -156,6 +172,13 @@ pub(super) struct Step {
     pub(super) rssi: Option<u8>,
     /// IE01 CFO for this owner's MACID (`rtw89_phy_cfo_parse`).
     pub(super) cfo: Option<i16>,
+}
+struct Submission<'a> {
+    bytes: &'a [u8],
+    radio_report: bool,
+    rate: u8,
+    agg: Option<format::Agg>,
+    fragment: Option<&'a super::command_native::FragmentPart>,
 }
 pub(super) struct Core {
     phase: Phase,
@@ -426,6 +449,46 @@ impl Core {
         rate: u8,
         agg: Option<format::Agg>,
     ) -> Result<u64, Error> {
+        self.submit_inner(
+            port,
+            Submission {
+                bytes,
+                radio_report,
+                rate,
+                agg,
+                fragment: None,
+            },
+        )
+    }
+    pub(super) fn submit_fragment(
+        &mut self,
+        port: &mut impl Port,
+        part: &super::command_native::FragmentPart,
+        radio_report: bool,
+    ) -> Result<u64, Error> {
+        self.submit_inner(
+            port,
+            Submission {
+                bytes: part.bytes(),
+                radio_report,
+                rate: 0,
+                agg: None,
+                fragment: Some(part),
+            },
+        )
+    }
+    fn submit_inner<P: Port>(
+        &mut self,
+        port: &mut P,
+        submission: Submission<'_>,
+    ) -> Result<u64, Error> {
+        let Submission {
+            bytes,
+            radio_report,
+            rate,
+            agg,
+            fragment,
+        } = submission;
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -451,14 +514,25 @@ impl Core {
             Some(scan) if format::probe_request(bytes, scan) => scan,
             _ => self.own,
         };
-        let kind = format::classify_with(bytes, source, self.amsdu)?;
+        let kind = if fragment.is_some() {
+            format::classify_fragment(bytes, source)?
+        } else {
+            format::classify_with(bytes, source, self.amsdu)?
+        };
         let amsdu = format::amsdu(bytes);
         let a_ctrl = bytes[1] & 0x80 != 0;
         let break_aggregation = a_ctrl != self.last_a_ctrl;
         let id = self.next_id;
         let next_id = id.checked_add(1).ok_or(Error::State)?;
+        let mut issued = false;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
+            if let Some(part) = fragment {
+                part.current().map_err(|_| Error::Access)?;
+                if part.bytes() != bytes {
+                    return Err(Error::Packet);
+                }
+            }
             if amsdu && port.amsdu_allowed()? != self.amsdu {
                 return Err(Error::Access);
             }
@@ -488,17 +562,28 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (mut header, actual) = format::transmit_profile(
-                    bytes,
-                    source,
-                    self.mac_id,
-                    ticket.sequence,
-                    packet.body.dma_addr().raw(),
-                    radio_report,
-                    rate,
-                    agg,
-                    self.amsdu,
-                )?;
+                let (mut header, actual) = if fragment.is_some() {
+                    format::transmit_fragment(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                    )?
+                } else {
+                    format::transmit_profile(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                        agg,
+                        self.amsdu,
+                    )?
+                };
                 if actual != kind {
                     return Err(Error::Packet);
                 }
@@ -519,39 +604,55 @@ impl Core {
                     return Err(error);
                 }
             };
-            port.ordinary_allowed()?;
-            if amsdu && port.amsdu_allowed()? != self.amsdu {
-                return Err(Error::Access);
+            let mut publish = |port: &mut P| {
+                port.ordinary_allowed()?;
+                if amsdu && port.amsdu_allowed()? != self.amsdu {
+                    return Err(Error::Access);
+                }
+                if !format::probe_request(bytes, source) {
+                    port.peer_allowed(bytes)?;
+                }
+                if let Some(part) = fragment {
+                    port.fragment_ready(part)?;
+                    part.issue().map_err(|_| Error::Access)?;
+                }
+                // Issue is recorded before the FIRST descriptor write. No Busy
+                // after this point may release or retry uncertain native DMA.
+                issued = true;
+                ring.queue.publish(ticket)?;
+                self.pending.push(Pending {
+                    id,
+                    ticket,
+                    queue: kind,
+                    started: port.now_us(),
+                    report: false,
+                    agg: agg.is_some(),
+                    fragment: fragment.cloned(),
+                });
+                copy_to(
+                    ring.descriptors.as_ref().ok_or(Error::State)?,
+                    usize::from(ticket.slot) * 8,
+                    &descriptor,
+                )?;
+                barrier();
+                port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
+                if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
+                    return Err(Error::Access);
+                }
+                self.next_id = next_id;
+                self.last_a_ctrl = a_ctrl;
+                Ok(id)
+            };
+            let result = match fragment {
+                Some(part) => port.fragment_publish(part, publish),
+                None => publish(port),
+            };
+            if result.is_err() && !issued {
+                let _ = ring.queue.abort(ticket)?;
             }
-            if !format::probe_request(bytes, source) {
-                port.peer_allowed(bytes)?;
-            }
-            // Before the FIRST descriptor write, the queue holds both DMA maps
-            // as published; every uncertain failure retains them permanently.
-            ring.queue.publish(ticket)?;
-            self.pending.push(Pending {
-                id,
-                ticket,
-                queue: kind,
-                started: port.now_us(),
-                report: false,
-                agg: agg.is_some(),
-            });
-            copy_to(
-                ring.descriptors.as_ref().ok_or(Error::State)?,
-                usize::from(ticket.slot) * 8,
-                &descriptor,
-            )?;
-            barrier();
-            port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
-            if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
-                return Err(Error::Access);
-            }
-            self.next_id = next_id;
-            self.last_a_ctrl = a_ctrl;
-            Ok(id)
+            result
         });
-        if result.is_err() {
+        if result.is_err() && (fragment.is_none() || issued || result != Err(Error::Busy)) {
             self.phase = Phase::Failed;
             let _ = Self::close_dma(port, self.stop);
         }
@@ -574,6 +675,9 @@ impl Core {
             .position(|pending| pending.id == packet.id)
             .ok_or(Error::Packet)?;
         let bytes = copy_from(&packet.body, packet.length)?;
+        if let Some(part) = &self.pending[index].fragment {
+            part.terminal(&bytes).map_err(|_| Error::Packet)?;
+        }
         self.completions.push_back(Receipt {
             id: packet.id,
             bytes,
@@ -627,12 +731,21 @@ impl Core {
                     || meta.bandwidth != 0
                     || !self.rx.admits(meta.rate)
                     || bytes.len() < 24
-                    || bytes.len() > format::MAX_MPDU
+                    || bytes.len()
+                        > if super::fragment_rx::fragmented(&bytes) {
+                            format::FRAGMENT_MAX_MPDU
+                        } else {
+                            format::MAX_MPDU
+                        }
                     || meta.size != bytes.len() + 4
                 {
                     return Err(Error::Packet);
                 }
-                step.frame = Some(Frame { bytes });
+                // An actual A-MPDU subframe is DONTFRAG. Raw fragment
+                // numbers cannot enter ordinary BA reorder as equal-SN DATA.
+                if !meta.ampdu || !super::fragment_rx::fragmented(&bytes) {
+                    step.frame = Some(Frame { bytes });
+                }
             }
             Some(rx_packet::Event::Releases(reports)) => {
                 if reports.is_empty() || reports.len() > 256 {

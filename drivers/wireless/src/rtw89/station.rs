@@ -12,6 +12,8 @@ use narf_wireless::{
     station_security::{self, RawFrame, Security},
 };
 use zeroize::Zeroizing;
+#[path = "station_fragment.rs"]
+mod fragment;
 #[path = "station_tx_amsdu.rs"]
 mod tx_amsdu;
 
@@ -213,6 +215,22 @@ pub(super) unsafe trait Io: Send {
         peer: [u8; 6],
         admission: &Admission,
     ) -> Result<(), power::Error>;
+    fn station_fragments_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    fn packet_fragment_binding(
+        &mut self,
+        _: &Admission,
+    ) -> Result<super::command_native::FragmentBinding, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn packet_submit_fragment(
+        &mut self,
+        _: &super::command_native::FragmentPart,
+        _: bool,
+    ) -> Result<u64, packet::Error> {
+        Err(packet::Error::State)
+    }
     fn packet_prepare(&mut self, own: [u8; 6], macid: u8) -> Result<(), packet::Error>;
     fn packet_start(&mut self) -> Result<(), packet::Error>;
     fn packet_ready(&self) -> bool;
@@ -435,6 +453,11 @@ pub(super) struct State {
     /// Frames in flight, oldest first. More than one only for aggregated
     /// QoS DATA on an operational originator session.
     pending: VecDeque<Pending>,
+    fragment_tx: Option<Box<fragment::Flight>>,
+    fragment_wait: Option<Box<fragment::Deferred>>,
+    fragment_policy: Option<Arc<super::monitor::Desired>>,
+    fragment_plain: Option<Box<super::fragment_rx::Plain>>,
+    fragment_rx_pending: bool,
     delivered_reply: Option<Pending>,
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
@@ -509,6 +532,11 @@ impl State {
             incoming: VecDeque::new(),
             received: VecDeque::new(),
             pending: VecDeque::new(),
+            fragment_tx: None,
+            fragment_wait: None,
+            fragment_policy: None,
+            fragment_plain: None,
+            fragment_rx_pending: false,
             delivered_reply: None,
             initial_nonce: None,
             sequence: 1,
@@ -562,6 +590,9 @@ impl State {
         self.phase == Phase::Open
             && self.ready()
             && self.pending.is_empty()
+            && self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && !self.fragment_rx_pending
             && self.delivered_reply.is_none()
             && self.incoming.is_empty()
             && self.received.is_empty()
@@ -586,6 +617,8 @@ impl State {
     }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
+            && self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
             && self.pending.iter().all(|pending| pending.agg)
             && self.delivered_reply.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
@@ -620,6 +653,10 @@ impl State {
     }
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
         self.sae = None;
+        self.fragment_tx = None;
+        self.fragment_wait = None;
+        self.fragment_plain = None;
+        self.fragment_rx_pending = false;
         self.wmm = None;
 
         self.edca_pending = None;
@@ -661,6 +698,10 @@ impl State {
             Some(self.admission.begin_disconnect()?)
         };
         self.admission.close();
+        self.fragment_tx = None;
+        self.fragment_wait = None;
+        self.fragment_plain = None;
+        self.fragment_rx_pending = false;
         self.established = false;
         self.wmm = None;
         self.edca_pending = None;
@@ -765,7 +806,10 @@ impl State {
                 && self.pending.iter().all(|pending| pending.agg)
                 && self.pending.len() < (usize::from(agg.num) + 1).min(packet::AGG_WINDOW)
         });
-        (self.pending.is_empty() || joins) && self.delivered_reply.is_none()
+        self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && (self.pending.is_empty() || joins)
+            && self.delivered_reply.is_none()
     }
     fn transmit(&mut self, io: &mut impl Io, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
         self.transmit_with(io, bytes, kind, true, None)
@@ -786,6 +830,9 @@ impl State {
         }
         if !self.transmit_room(kind, agg) {
             return Err(Error::Busy);
+        }
+        if self.fragment_management(io, &bytes, kind, assign)? {
+            return Ok(());
         }
         if assign && !matches!(kind, Kind::Security | Kind::Data) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
@@ -1287,6 +1334,7 @@ impl State {
             .iter()
             .position(|pending| pending.id == delivery.id)
             .ok_or(Error::State)?;
+        self.fragment_delivered(delivery.id)?;
         let pending = self.pending.remove(index).ok_or(Error::State)?;
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
@@ -1364,7 +1412,21 @@ impl State {
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
-                let frame = match self.block_ack_rx(frame, now)? {
+                // Every fragment retains its original header until Security
+                // authenticates it. Never collapse equal-SN fragments in BA
+                // reorder/duplicate machinery before defragmentation.
+                let fragment = super::fragment_rx::fragmented(frame.bytes());
+                if fragment
+                    && super::packet_format::qos_tid(frame.bytes())
+                        .is_some_and(|tid| self.ba[usize::from(tid & 7)].is_some())
+                {
+                    continue;
+                }
+                let frame = match if fragment {
+                    Ok(Some(frame))
+                } else {
+                    self.block_ack_rx(frame, now)
+                }? {
                     Some(frame) => frame,
                     None => continue,
                 };
@@ -1391,6 +1453,7 @@ impl State {
         }
         for _ in 0..64 {
             if !self.pending.is_empty()
+                || self.fragment_blocks_incoming()
                 || self.delivered_reply.is_some()
                 || self.peer_commit.is_some()
                 || self
@@ -1471,9 +1534,13 @@ impl State {
                         let handshake_active = security.handshake_active();
                         let environment = &self.environment;
                         let initial = &mut self.initial_nonce;
-                        match security.receive_with_nonce(&frame, || {
-                            initial.take().or_else(|| environment.nonce())
-                        })? {
+                        let nonce = || initial.take().or_else(|| environment.nonce());
+                        let result = if super::fragment_rx::fragmented(frame.bytes()) {
+                            security.receive_fragment_with_nonce(&frame, now, nonce)
+                        } else {
+                            security.receive_with_nonce(&frame, nonce)
+                        }?;
+                        match result {
                             station_security::Rx::Data(bytes) => {
                                 if let Some(bytes) = ethernet(
                                     &bytes,
@@ -1494,23 +1561,42 @@ impl State {
                             }
                             station_security::Rx::Ignored => {}
                         }
-                    } else if let Some(bytes) = ethernet(
-                        frame.bytes(),
-                        self.own,
-                        self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
-                    ) {
-                        self.last_peer = now;
-                        if self.received.len() == 64 {
-                            return Err(Error::State);
+                    } else {
+                        let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        let bytes = if super::fragment_rx::fragmented(frame.bytes()) {
+                            self.fragment_plain
+                                .get_or_insert_with(super::fragment_rx::Plain::boxed)
+                                .push(frame.bytes(), self.own, peer, now)
+                        } else {
+                            Some(frame.bytes().to_vec())
+                        };
+                        if let Some(bytes) =
+                            bytes.as_deref().and_then(|b| ethernet(b, self.own, peer))
+                        {
+                            self.last_peer = now;
+                            if self.received.len() == 64 {
+                                return Err(Error::State);
+                            }
+                            self.received.push_back(bytes);
                         }
-                        self.received.push_back(bytes);
                     }
                 }
                 _ => {}
             }
         }
+        self.fragment_rx_pending = self
+            .security
+            .as_mut()
+            .is_some_and(|s| s.fragment_pending(now))
+            || self
+                .fragment_plain
+                .as_mut()
+                .is_some_and(|cache| cache.pending(now));
         self.block_ack_tick(now)?;
-        if self.pending.is_empty()
+        self.progress_fragments(io)?;
+        if self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && self.pending.is_empty()
             && self.delivered_reply.is_none()
             && self.phase == Phase::Open
             && self
@@ -1537,7 +1623,11 @@ impl State {
                 }
             }
         }
-        if self.pending.is_empty() && self.delivered_reply.is_none() {
+        if self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && self.pending.is_empty()
+            && self.delivered_reply.is_none()
+        {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -1587,13 +1677,28 @@ impl State {
         let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) else {
             return Ok(Some(frame));
         };
-        let Some(security) = self.security.as_mut().filter(|s| s.pmf()) else {
-            return Ok(Some(frame));
-        };
         let bytes = frame.bytes();
         if bytes.first().is_none_or(|fc| fc & 0x0c != 0) || bytes.get(10..16) != Some(&peer[..]) {
             return Ok(Some(frame));
         }
+        if super::fragment_rx::fragmented(bytes) {
+            return Ok(match self.security.as_mut() {
+                Some(security) => {
+                    match security.receive_management_fragment(&frame, self.last_now)? {
+                        station_security::MgmtRx::Ignored => None,
+                        station_security::MgmtRx::Frame(bytes) => Some(Mpdu::new(bytes)),
+                    }
+                }
+                None => self
+                    .fragment_plain
+                    .get_or_insert_with(super::fragment_rx::Plain::boxed)
+                    .push(bytes, self.own, peer, self.last_now)
+                    .map(Mpdu::new),
+            });
+        }
+        let Some(security) = self.security.as_mut().filter(|s| s.pmf()) else {
+            return Ok(Some(frame));
+        };
         Ok(match security.receive_management(&frame)? {
             station_security::MgmtRx::Ignored => None,
             station_security::MgmtRx::Frame(bytes) => Some(Mpdu::new(bytes)),
@@ -1609,6 +1714,7 @@ impl State {
         let peer = self.peer.as_ref().ok_or(Error::State)?;
         let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
         let station_rsnxe = plan.sae().and_then(|sae| sae.station_rsnxe());
+        self.fragment_plain = None;
         self.security = Some(Security::new_sae(
             self.own,
             peer.bss.bssid,
@@ -1845,6 +1951,8 @@ impl State {
         if let Credential::Psk(pmk) = credential {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
             let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
+            self.fragment_plain = None;
+            self.fragment_rx_pending = false;
             self.security = Some(Security::new(
                 self.own,
                 bssid,
@@ -2032,6 +2140,9 @@ impl State {
             || agg.is_none() && !io.packet_ready()
         {
             return Err(Error::Busy);
+        }
+        if self.fragment_data(io, frame, tid, agg)? {
+            return Ok(());
         }
         let htc = self.he && self.htc_rate && super::he_htc::packet_allows(frame);
         let native = if let Some(security) = &mut self.security {

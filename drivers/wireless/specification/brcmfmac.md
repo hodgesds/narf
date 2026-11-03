@@ -823,6 +823,18 @@ commands and denial-only AP Stop cleanup retain their existing paths. An
 additional native case covers real admin retirement at the setup boundary
 and a possibly visible native index failure; execution remains pending.
 
+Program SET also preserves and checks the actual completed native input
+prefix: bounded adapter progress retains every event/data record, and the
+physical owner checks D2H producer positions after control-ring setup before
+final publication. Session and pending SET filters share one native event
+transition classifier. Pending BSS/peer denial or replacement cannot be
+crossed by an old SET. GET-only firmware queries remain under the same
+original final capture and can complete with benign BSS-UP or queued SME
+records retained; no query creates a key/port or suppresses later loss.
+The existing native publication case additionally injects a real peer-loss
+completion during setup, denies stale AUTHORIZE, completes an actual GET
+with that event pending, then requires the genuine DEL_STATION observation.
+
 Firmware is the AP SME. Actual ASSOC_IND/REASSOC_IND payload IEs and matching
 native `sta_info` authentication/association/rate/MAC observations establish
 one of at most8 peers. The frontend advertises `DEVICE_AP_SME` value0 and uses

@@ -36,6 +36,8 @@ pub(in crate::rtw89) struct Submission {
     pub(in crate::rtw89) channel: u8,
     pub(in crate::rtw89) qsel: u8,
     pub(in crate::rtw89) mac_id: u8,
+    pub(in crate::rtw89) host_sequence: u16,
+    pub(in crate::rtw89) hardware_sequence: bool,
     body: u64,
     length: usize,
     next: u16,
@@ -68,6 +70,7 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) amsdu: Option<usize>,
     pub(in crate::rtw89) revoke_amsdu_on_allocate: bool,
     peer_live: bool,
+    fragment: Option<crate::rtw89::command_native::FragmentPart>,
     pub(in crate::rtw89) peer: Option<crate::rtw89::station_control::Peer>,
     deny_after_allocation: Option<bool>,
     pub(in crate::rtw89) now: u64,
@@ -111,6 +114,7 @@ impl Model {
             amsdu: None,
             revoke_amsdu_on_allocate: false,
             peer_live: true,
+            fragment: None,
             peer: None,
             deny_after_allocation: None,
             now: 0,
@@ -298,6 +302,11 @@ impl Model {
             return Err(Error::Packet);
         }
         let body = self.bytes(body_dma, packet_len)?;
+        if let Some(part) = &self.fragment {
+            if part.model_issued_current().is_err() || part.bytes() != body {
+                return Err(Error::Access);
+            }
+        }
         let a_ctrl = body[1] & 0x80 != 0;
         let previous_a_ctrl = self
             .transmitted
@@ -338,7 +347,7 @@ impl Model {
             | u32::from(kind.channel()) << 16
             | header_words << 11
             | 1 << 7
-            | if kind == format::Queue::Management {
+            | if kind == format::Queue::Management && self.fragment.is_none() {
                 5
             } else {
                 0
@@ -396,6 +405,8 @@ impl Model {
             channel: kind.channel(),
             qsel: kind.qsel(),
             mac_id: (word(8) >> 24) as u8,
+            host_sequence: (word(12) & 0xfff) as u16,
+            hardware_sequence: word(0) & 7 != 0,
             body: body_dma,
             length: packet_len,
             next,
@@ -540,6 +551,32 @@ unsafe impl Port for Model {
         } else {
             Err(Error::Access)
         }
+    }
+    fn fragment_ready(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+    ) -> Result<(), Error> {
+        self.guard()?;
+        part.current().map_err(|_| Error::Access)?;
+        if self.pending_receive() {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    fn fragment_publish<T>(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+        operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.fragment.is_some() {
+            return Err(Error::State);
+        }
+        self.fragment = Some(part.clone());
+        let result = part
+            .model_with_current(|| Ok(operation(self)))
+            .map_err(|_| Error::Access);
+        self.fragment = None;
+        result?
     }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error> {
         self.guard()?;
@@ -994,3 +1031,61 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement
 );
+
+/// Inert source/hardware setup for the actual Native publication fixture:
+/// prepare/start and retained mappings are genuine Core operations. Only PCI/
+/// RFK/startup readiness is replaced by this existing exclusive RAM model.
+pub(in crate::rtw89) fn native_fragment_core(
+    own: [u8; 6],
+) -> Result<(Core, Vec<(u32, u32)>), Error> {
+    let mut model = Model::new();
+    let mut core = Core::prepare(&mut model, own, 0)?;
+    core.start(&mut model)?;
+    let mut regs = Vec::new();
+    for queue in format::Queue::ordinary(false) {
+        let r = queue.regs();
+        for address in [r.desa_l, r.desa_h, r.num, r.idx] {
+            regs.push((address as u32, model.word(address as u32)));
+        }
+    }
+    regs.push((0x1010, model.word(0x1010)));
+    regs.push((0xc000, model.word(0xc000)));
+    Ok((core, regs))
+}
+pub(in crate::rtw89) struct FragmentSnapshot {
+    pub id: u64,
+    pub queue: format::Queue,
+    pub ticket: tx_transport::Ticket,
+    pub header: Vec<u8>,
+    pub body: Vec<u8>,
+    pub descriptors: Vec<u8>,
+    pub next: u16,
+}
+impl Core {
+    pub(in crate::rtw89) fn model_fragment(&self) -> Result<Option<FragmentSnapshot>, Error> {
+        let Some(pending) = self.pending.first() else {
+            return Ok(None);
+        };
+        let ring = self
+            .rings
+            .iter()
+            .find(|r| r.kind == pending.queue)
+            .ok_or(Error::State)?;
+        let packet = ring
+            .queue
+            .model_retained(pending.ticket)
+            .ok_or(Error::State)?;
+        Ok(Some(FragmentSnapshot {
+            id: pending.id,
+            queue: pending.queue,
+            ticket: pending.ticket,
+            header: copy_from(&packet.header, format::HEADER)?,
+            body: copy_from(&packet.body, packet.length)?,
+            descriptors: copy_from(
+                ring.descriptors.as_ref().ok_or(Error::State)?,
+                usize::from(format::DEPTH) * 8,
+            )?,
+            next: ring.queue.write_pointer(),
+        }))
+    }
+}

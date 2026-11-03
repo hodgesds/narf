@@ -124,6 +124,20 @@ impl core::fmt::Debug for Capture {
     }
 }
 impl Capture {
+    /// Consumed records remain queued until Session applies them. A native
+    /// GET can inspect firmware without opening a port or publishing RF/key
+    /// state, but Program SET must not step past an unapplied denial or
+    /// association generation transition. Mirrors Session::native_event's
+    /// actual event classes; this classifies no arbitrary BSS metadata.
+    pub(crate) fn program_event_blocks(
+        &self,
+        header: &crate::cyw43439::events::EventHeader,
+    ) -> bool {
+        !matches!(
+            super::ap_wire::event_transition(header, self.own),
+            Ok(super::ap_wire::Transition::Benign)
+        )
+    }
     pub(super) fn lifecycle(&self) -> bool {
         matches!(self.purpose, Use::Lifecycle)
     }

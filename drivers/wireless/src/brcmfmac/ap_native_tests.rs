@@ -855,6 +855,62 @@ fn program_publication() -> Result<(), &'static str> {
     {
         let b = Bound::new()?;
         b.start(false)?;
+        b.peer(false)?;
+        let original = {
+            let state = b.device.state.try_lock().ok_or("AP prefix capture lock")?;
+            state
+                .ap
+                .as_ref()
+                .ok_or("AP prefix owner")?
+                .publication()
+                .map_err(|_| "AP prefix original proof")?
+        };
+        let commands = b.bus.commands().len();
+        let lost = b.source.count(20);
+        b.bus.ap_program_loss_after_setup(CLIENT);
+        let result = ready(async {
+            let mut state = b.device.state.lock().await;
+            state
+                .station
+                .runtime
+                .command_ap(&original, Direction::Set, 121, &CLIENT, 0)
+                .await
+        })?;
+        if result != Err(crate::cyw43439::runtime::Error::Busy)
+            || b.bus.commands().len() != commands
+            || b.device.transport_failed()
+            || original.current().is_err()
+        {
+            return Err(
+                "AP completed native loss before Program SET published stale authorization",
+            );
+        }
+        // An actual GET can complete while this same native event remains
+        // retained, without granting a key/port or discarding its later DEL.
+        let query = ready(async {
+            let mut state = b.device.state.lock().await;
+            state
+                .station
+                .runtime
+                .command_ap(&original, Direction::Get, 117, &[], 4)
+                .await
+        })?;
+        if query != Ok(1u32.to_le_bytes().to_vec()) {
+            return Err("AP queued native loss prevented read-only Program query");
+        }
+        b.device.ap_drain();
+        ready(b.device.ap_worker())?;
+        b.device.ap_drain();
+        if b.source.count(20) != lost + 1
+            || b.bus
+                .ap_change(|profile| profile.peers.contains_key(&CLIENT))
+        {
+            return Err("AP Program barrier discarded genuine native loss or its station event");
+        }
+    }
+    {
+        let b = Bound::new()?;
+        b.start(false)?;
         let original = {
             let state = b.device.state.try_lock().ok_or("AP Program issue lock")?;
             state

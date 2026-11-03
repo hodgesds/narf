@@ -12,7 +12,9 @@ use narf_bus::pci::{PciPowerState, SavedPciConfig};
 use narf_power::device_pm::DevicePmError as Error;
 pub(super) struct Native {
     owner: Arc<Rtw88Device>,
-    barrier: Arc<Barrier>,
+    /// A system transition changes PCI D-state. IPS keeps D0 and reserves
+    /// only its original function; neither path fabricates DMA retirement.
+    barrier: Option<Arc<Barrier>>,
 }
 pub(super) struct Parked {
     claim: ResetClaim,
@@ -25,7 +27,16 @@ pub(super) struct Parked {
 }
 impl Native {
     pub(super) fn new(owner: Arc<Rtw88Device>, barrier: Arc<Barrier>) -> Self {
-        Self { owner, barrier }
+        Self {
+            owner,
+            barrier: Some(barrier),
+        }
+    }
+    pub(super) fn idle(owner: Arc<Rtw88Device>) -> Self {
+        Self {
+            owner,
+            barrier: None,
+        }
     }
     fn origin(&self) -> Result<Origin, Error> {
         self.owner.reset_origin.ok_or(Error::NotImplemented)
@@ -90,16 +101,26 @@ impl super::system_pm_worker::Backend for Native {
             return Err(Error::Busy);
         }
         let operating = lifecycle.status().stage == super::firmware_lifecycle::Stage::StationReady;
-        // Validate real PM capability/state before any irreversible withdrawal.
-        let state = super::pci_park::invoke(&origin.authority, || {
-            narf_bus::pci::power_state(&origin.authority, &origin.device)
-        })
-        .map_err(|_| Error::DriverError)?
-        .map_err(|_| Error::NotImplemented)?;
-        if state != Some(PciPowerState::D0) {
-            return Err(Error::Busy);
-        }
-        let claim = ResetClaim::acquire_system(&owner, &self.barrier).map_err(|_| Error::Busy)?;
+        let claim = if let Some(barrier) = &self.barrier {
+            // Validate real PM capability/state before irreversible withdrawal.
+            let state = super::pci_park::invoke(&origin.authority, || {
+                narf_bus::pci::power_state(&origin.authority, &origin.device)
+            })
+            .map_err(|_| Error::DriverError)?
+            .map_err(|_| Error::NotImplemented)?;
+            if state != Some(PciPowerState::D0) {
+                return Err(Error::Busy);
+            }
+            ResetClaim::acquire_system(&owner, barrier).map_err(|_| Error::Busy)?
+        } else {
+            // IPS is for the actual unassociated passive station only.
+            // Hold its real retained owner across eligibility, reservation
+            // and closure: a scan/join cannot slip between check and close.
+            interface
+                .idle_claim(|| ResetClaim::acquire(&owner).map_err(|_| super::station::Error::Busy))
+                .await
+                .map_err(|_| Error::Busy)?
+        };
         interface
             .withdraw_for_rebind()
             .map_err(|_| Error::DriverError)?;
@@ -114,10 +135,11 @@ impl super::system_pm_worker::Backend for Native {
         if config.command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
             return Err(Error::DriverError);
         }
-        let rfe6 = owner
-            .firmware
-            .as_ref()
-            .is_some_and(|firmware| firmware.factory().rfe() == 6);
+        let rfe6 = self.barrier.is_some()
+            && owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.factory().rfe() == 6);
         let off = {
             // SAFETY: exact original function claim and actual original
             // callback/IRQ/DMA retirement, complete exclusively owned BAR.
@@ -139,6 +161,11 @@ impl super::system_pm_worker::Backend for Native {
             rfe6,
             operating,
         };
+        if self.barrier.is_none() {
+            // ps.c::rtw_enter_ips / main.c::rtw_core_stop: actual card-off
+            // is enough; IPS does not claim PCI D3 or a system wake source.
+            return Ok(parked);
+        }
         let result = self.config(&parked.claim, |origin| {
             narf_bus::pci::set_power_state(&origin.authority, &origin.device, PciPowerState::D3Hot)
         });
@@ -158,11 +185,13 @@ impl super::system_pm_worker::Backend for Native {
     }
     async fn resume(&mut self, parked: Parked) -> Result<(), Error> {
         let origin = self.origin()?;
-        self.config(&parked.claim, |origin| {
-            narf_bus::pci::set_power_state(&origin.authority, &origin.device, PciPowerState::D0)
-        })?;
-        Self::settle().await;
-        self.state(&parked.claim, PciPowerState::D0)?;
+        if self.barrier.is_some() {
+            self.config(&parked.claim, |origin| {
+                narf_bus::pci::set_power_state(&origin.authority, &origin.device, PciPowerState::D0)
+            })?;
+            Self::settle().await;
+            self.state(&parked.claim, PciPowerState::D0)?;
+        }
         self.config(&parked.claim, |origin| {
             use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
             narf_bus::pci::clear_command(

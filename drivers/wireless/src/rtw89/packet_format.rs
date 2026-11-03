@@ -7,6 +7,8 @@ use alloc::vec::Vec;
 
 pub(super) const HEADER: usize = 24 + 24 + 8 + 8;
 pub(super) const MAX_MPDU: usize = 2304;
+/// New TX fragments: maximum2346 plaintext+FCS, then16 CCMP overhead.
+pub(super) const FRAGMENT_MAX_MPDU: usize = 2346 - 4 + 16;
 pub(super) const DMA_MASK: u64 = 0xf_ffff_ffff;
 pub(super) const DEPTH: u16 = 256;
 pub(super) const IDENTITIES: u16 = 512;
@@ -127,6 +129,19 @@ pub(super) fn classify_with(
     own: [u8; 6],
     limit: Option<usize>,
 ) -> Result<Queue, Error> {
+    classify_profile(frame, own, limit, false)
+}
+/// Explicit source-qualified fragment format; original MPDU bytes and fragment
+/// fields remain unchanged. This pure formatter grants no native admission.
+pub(super) fn classify_fragment(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
+    classify_profile(frame, own, None, true)
+}
+fn classify_profile(
+    frame: &[u8],
+    own: [u8; 6],
+    limit: Option<usize>,
+    fragments: bool,
+) -> Result<Queue, Error> {
     let aggregate = amsdu(frame);
     if limit.is_some_and(|body| body == 0 || body > super::tx_amsdu::MAX_BODY) {
         return Err(Error::Frame);
@@ -139,6 +154,8 @@ pub(super) fn classify_with(
             } else {
                 0
             }
+    } else if fragments {
+        FRAGMENT_MAX_MPDU
     } else {
         MAX_MPDU
     };
@@ -152,9 +169,13 @@ pub(super) fn classify_with(
         || !unicast(&own)
         || frame[10..16] != own
         || frame[0] & 3 != 0
-        || frame[1] & (4 | 16 | 32) != 0
+        || frame[1] & (16 | 32) != 0
+        || !fragments && frame[1] & 4 != 0
+        || fragments
+            && (aggregate || frame[1] & 0x80 != 0 || frame[1] & 4 == 0 && frame[22] & 15 == 0)
+        || fragments && frame[1] & 4 != 0 && frame[22] & 15 == 15
         || frame[1] & 128 != 0 && frame[0] != 0x88
-        || frame[22] & 15 != 0
+        || !fragments && frame[22] & 15 != 0
     {
         return Err(Error::Frame);
     }
@@ -256,7 +277,68 @@ pub(super) fn transmit_profile(
     agg: Option<Agg>,
     limit: Option<usize>,
 ) -> Result<(Vec<u8>, Queue), Error> {
-    let queue = classify_with(frame, own, limit)?;
+    transmit_profile_inner(Tx {
+        frame,
+        own,
+        mac_id,
+        sequence,
+        address,
+        report,
+        rate,
+        agg,
+        limit,
+        fragments: false,
+    })
+}
+/// New full native fragment emitter always fixes CCK1/no aggregation and host
+/// sequence mode, including management. Original SW_SN/fragno stays on air.
+pub(super) fn transmit_fragment(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+) -> Result<(Vec<u8>, Queue), Error> {
+    transmit_profile_inner(Tx {
+        frame,
+        own,
+        mac_id,
+        sequence,
+        address,
+        report,
+        rate: 0,
+        agg: None,
+        limit: None,
+        fragments: true,
+    })
+}
+struct Tx<'a> {
+    frame: &'a [u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+    agg: Option<Agg>,
+    limit: Option<usize>,
+    fragments: bool,
+}
+fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
+    let Tx {
+        frame,
+        own,
+        mac_id,
+        sequence,
+        address,
+        report,
+        rate,
+        agg,
+        limit,
+        fragments,
+    } = tx;
+    let queue = classify_profile(frame, own, limit, fragments)?;
     if agg.is_some_and(|agg| agg.density > 7 || qos_tid(frame).is_none() || rate & FIRMWARE_RA == 0)
     {
         return Err(Error::Metadata);
@@ -276,7 +358,9 @@ pub(super) fn transmit_profile(
         return Err(Error::Metadata);
     }
     extent(address, frame.len())?;
-    let prepare = if amsdu(frame) {
+    let prepare = if fragments {
+        tx_transport::prepare_header_fragment
+    } else if amsdu(frame) {
         tx_transport::prepare_header_amsdu
     } else {
         tx_transport::prepare_header
@@ -308,7 +392,13 @@ pub(super) fn transmit_profile(
     put(
         &mut bytes,
         0,
-        body0 | 1 << 22 | if queue == Queue::Management { 5 } else { 0 },
+        body0
+            | 1 << 22
+            | if queue == Queue::Management && !fragments {
+                5
+            } else {
+                0
+            },
     );
     if adaptive {
         // rtw89_build_txwd_info0/1 for data: firmware RA owns the rate;

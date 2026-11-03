@@ -77,6 +77,8 @@ mod fifo_regs;
 mod firmware_boot;
 mod firmware_phycap;
 mod firmware_registry;
+mod fragment_rx;
+mod fragment_wire;
 pub mod fw;
 pub mod fwdl;
 pub mod h2c;

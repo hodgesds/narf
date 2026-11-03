@@ -119,6 +119,7 @@ pub(super) struct Device<I: Io> {
     sleep_enabled: AtomicBool,
     sleep_identity: IrqSafeSpinLock<Option<narf_net::native_emission::Lifetime>>,
     monitor_capable: AtomicBool,
+    fragments_capable: AtomicBool,
     desired: Arc<super::monitor::Desired>,
     selection: super::monitor::Selection,
     registration: IrqSafeSpinLock<Option<narf_net::iface::OpenStopEvent>>,
@@ -337,6 +338,7 @@ impl<I: Io + 'static> Device<I> {
             sleep_enabled: AtomicBool::new(false),
             sleep_identity: IrqSafeSpinLock::new(None),
             monitor_capable: AtomicBool::new(false),
+            fragments_capable: AtomicBool::new(false),
             desired: super::monitor::Desired::new(),
             selection: super::monitor::Selection {
                 mode: 2,
@@ -507,6 +509,15 @@ impl<I: Io + 'static> Device<I> {
             .ok_or(Error::State)?
             .station_sleep_capable()?;
         self.sleep_capable.store(sleep_capable, Ordering::Release);
+        let fragments_capable = {
+            let mut storage = self.lifecycle.retained.lock().await;
+            let owner = storage.as_mut().ok_or(Error::State)?;
+            let capable = owner.io.station_fragments_allowed()?;
+            owner.station_fragment_policy(capable.then(|| self.desired.clone()));
+            capable
+        };
+        self.fragments_capable
+            .store(fragments_capable, Ordering::Release);
         self.admission.run(|| {
             self.admitted.store(true, Ordering::Release);
             Ok(())
@@ -636,6 +647,11 @@ impl<I: Io + 'static> Device<I> {
             return Vec::new();
         }
         let result = (|| -> Result<Vec<Vec<u8>>, Error> {
+            owner.station_fragment_policy(
+                self.fragments_capable
+                    .load(Ordering::Acquire)
+                    .then(|| self.desired.clone()),
+            );
             let frames = owner.station_poll()?;
             self.link(owner.station_peer(), owner.station_ready());
             if self.closed() {
@@ -742,6 +758,22 @@ impl<I: Io + 'static> Device<I> {
         }
     }
     #[cfg(feature = "kernel-test")]
+    pub(super) fn refresh_fragment_model(&self) -> bool {
+        let capable = self
+            .lifecycle
+            .retained
+            .try_lock()
+            .and_then(|mut storage| {
+                let owner = storage.as_mut()?;
+                let capable = owner.io.station_fragments_allowed().ok()?;
+                owner.station_fragment_policy(capable.then(|| self.desired.clone()));
+                Some(capable)
+            })
+            .unwrap_or(false);
+        self.fragments_capable.store(capable, Ordering::Release);
+        capable
+    }
+    #[cfg(feature = "kernel-test")]
     pub(super) fn delivery_for_test(&self) -> impl Drop + '_ {
         self.begin_delivery().expect("live fixture ingress")
     }
@@ -829,6 +861,47 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         } else {
             Err(WirelessError::NotSupported)
         }
+    }
+
+    fn fragmentation_threshold(&self) -> Option<u32> {
+        (self.fragments_capable.load(Ordering::Acquire)
+            && self.desired.current(self.selection)
+            && self.selection.mode == 2
+            && !self.closed())
+        .then(|| self.desired.fragment_threshold())
+    }
+    fn set_fragmentation_threshold(&self, threshold: u32) -> Result<(), i32> {
+        let threshold = super::fragment_wire::threshold(threshold).ok_or(-22)?;
+        if self.fragmentation_threshold().is_none() {
+            return Err(-95);
+        }
+        // Queries/callbacks finish outside the publication/metadata locks.
+        let allowed = {
+            let mut storage = self.lifecycle.retained.try_lock().ok_or(-16)?;
+            storage
+                .as_mut()
+                .ok_or(-19)?
+                .io
+                .station_fragments_allowed()
+                .map_err(|_| -5)?
+        };
+        if !allowed || self.original_snapshot().is_none() {
+            return Err(-19);
+        }
+        self.admission
+            .run(|| {
+                if self.closed()
+                    || !self
+                        .desired
+                        .set_fragment_threshold(self.selection, threshold)
+                {
+                    return Err(super::power::Error::Terminal);
+                }
+                Ok(())
+            })
+            .map_err(|_| -19)?;
+        self.line.raise();
+        Ok(())
     }
 
     fn supports_handshake_offload(&self) -> bool {

@@ -1,3 +1,5 @@
+#[path = "command_native_fragment_tests.rs"]
+mod fragment_tests;
 #[path = "command_native_rf_tracking_tests.rs"]
 mod rf_tracking_tests;
 use super::*;

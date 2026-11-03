@@ -124,6 +124,15 @@ impl<T> TxQueue<T> {
         });
         Ok(ticket)
     }
+    /// Inert hardware fixture's read-only view of one actual retained map.
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn model_retained(&self, ticket: Ticket) -> Option<&T> {
+        let entry = self.slots.get(usize::from(ticket.slot))?.as_ref()?;
+        if entry.ticket != ticket {
+            return None;
+        }
+        entry.resource.as_ref()
+    }
     pub fn reserved_mut(&mut self, ticket: Ticket) -> Result<&mut T, Error> {
         let entry = self
             .slots
@@ -311,7 +320,7 @@ pub fn prepare_header(
     frame_dma: u64,
     frame: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    prepare_header_profile(chip, info, sequence, frame_dma, frame, false)
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, false, false)
 }
 /// TX A-MSDU formatting only. The caller must prove the distinct actual
 /// native RF/peer/key/size program; no other chip or +HTC form is admitted.
@@ -329,7 +338,21 @@ pub(super) fn prepare_header_amsdu(
     {
         return Err(Error::BadFrame);
     }
-    prepare_header_profile(chip, info, sequence, frame_dma, frame, true)
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, true, false)
+}
+/// Explicit RTL8852B software-fragment descriptor path. Ordinary transport
+/// keeps refusing fragments; same actual qualified native owner is mandatory.
+pub(super) fn prepare_header_fragment(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if chip != ChipId::Rtl8852B || frame.get(1).is_none_or(|fc| fc & 0x80 != 0) {
+        return Err(Error::BadFrame);
+    }
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, false, true)
 }
 fn prepare_header_profile(
     chip: ChipId,
@@ -338,6 +361,7 @@ fn prepare_header_profile(
     frame_dma: u64,
     frame: &[u8],
     amsdu: bool,
+    fragments: bool,
 ) -> Result<Vec<u8>, Error> {
     if chip == ChipId::Rtl8922A {
         return Err(Error::BadQueue);
@@ -373,10 +397,12 @@ fn prepare_header_profile(
             | 0x00d0
             | 0x0008
             | 0x0088
-    ) || fc & 0x0400 != 0
+    ) || !fragments && fc & 0x0400 != 0
+        || fragments
+            && (fc & 0x0400 == 0 && frame[22] & 15 == 0 || fc & 0x0400 != 0 && frame[22] & 15 == 15)
         || fc & 0x8000 != 0 && (chip != ChipId::Rtl8852B || fc & 0xfc != 0x88)
         || fc & 0x0300 == 0x0300
-        || frame[22] & 0xf != 0
+        || !fragments && frame[22] & 0xf != 0
     {
         return Err(Error::BadFrame);
     }

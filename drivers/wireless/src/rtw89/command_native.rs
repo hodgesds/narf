@@ -22,6 +22,11 @@ mod radio;
 #[path = "command_native/rf_tracking.rs"]
 mod rf_tracking;
 pub(super) use radio::{QualificationRequest, RadioPreflight};
+#[path = "command_native/fragment.rs"]
+mod fragment;
+pub(super) use fragment::{
+    Binding as FragmentBinding, Part as FragmentPart, Train as FragmentTrain,
+};
 #[path = "command_native/lps.rs"]
 mod lps;
 #[path = "command_native/monitor.rs"]

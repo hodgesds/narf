@@ -381,6 +381,33 @@ where
         if self.failed {
             return Err(Error::Failed);
         }
+        if direction == Direction::Set {
+            let mut idle = false;
+            for _ in 0..4 {
+                let progress = self.progress()?;
+                if self
+                    .events
+                    .iter()
+                    .any(|event| original.program_event_blocks(&event.header))
+                {
+                    return Err(Error::Busy);
+                }
+                if progress == 0
+                    && self
+                        .inner
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .ap_completed_idle()
+                        .map_err(map)?
+                {
+                    idle = true;
+                    break;
+                }
+            }
+            if !idle {
+                return Err(Error::Busy);
+            }
+        }
         let extent = if direction == Direction::Set {
             input.len()
         } else {
@@ -390,7 +417,13 @@ where
             .inner
             .as_mut()
             .ok_or(Error::Failed)?
-            .command_ap(command, input, extent, original)
+            .command_ap(
+                command,
+                input,
+                extent,
+                original,
+                direction == Direction::Set,
+            )
             .await
             .map_err(map)?;
         if direction == Direction::Set {

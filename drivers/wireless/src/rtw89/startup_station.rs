@@ -454,6 +454,24 @@ unsafe impl Io for Startup {
                 )
             })
     }
+    fn station_fragments_allowed(&mut self) -> Result<bool, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_fragments_allowed()
+    }
+    fn packet_fragment_binding(
+        &mut self,
+        admission: &control::Admission,
+    ) -> Result<crate::rtw89::command_native::FragmentBinding, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.fragment_binding(admission)
+    }
+    fn packet_submit_fragment(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+        report: bool,
+    ) -> Result<u64, packet::Error> {
+        self.station_native()?.submit_fragment(part, report)
+    }
     fn packet_submit(&mut self, bytes: &[u8], report: bool) -> Result<u64, packet::Error> {
         self.station_native()?.submit_packet(bytes, report)
     }

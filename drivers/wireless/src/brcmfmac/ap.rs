@@ -339,22 +339,17 @@ impl Session {
     }
     fn native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let header = event.header;
-        if header.if_idx != 0 || header.bsscfg_idx != 0 {
-            return Err(Error::Malformed);
-        }
-        if header.event_type == 63
-            || header.event_type == 16
-                && header.flags & 1 == 0
-                && header.source_mac == self.plan.own
-        {
+        use super::ap_wire::{event_transition, Transition};
+        let transition = event_transition(&header, self.plan.own)?;
+        if transition == Transition::Failed {
             return Err(Error::Failed);
         }
         let mac = header.source_mac;
         if self.rejected.len() == super::ap_peer::MAX_PEERS {
             return Err(Error::EventOverflow);
         }
-        match header.event_type {
-            8 | 10 if header.status == 0 && header.reason == 0 => {
+        match transition {
+            Transition::Associated => {
                 self.group_data.advance().map_err(|_| Error::Failed)?;
                 if let Some(old) = self.rejected.iter_mut().find(|old| old.mac == mac) {
                     old.epoch.advance().map_err(|_| Error::Failed)?;
@@ -386,7 +381,7 @@ impl Session {
                     Err(error) => return Err(error),
                 }
             }
-            5 | 6 | 11 | 12 => {
+            Transition::Lost => {
                 if let Some(index) = self.peers.iter().position(|peer| peer.mac == mac) {
                     let observed = header.status == 0;
                     let notify = observed && self.peers[index].notified;
@@ -412,15 +407,15 @@ impl Session {
                     }
                 }
             }
-            17 => {
+            Transition::Roamed => {
                 if let Some(peer) = self.peers.iter_mut().find(|peer| peer.mac == mac) {
                     peer.deny(false)?;
                     peer.remove_requested = true;
                     self.group_data.advance().map_err(|_| Error::Failed)?;
                 }
             }
-            0 if header.status != 0 => return Err(Error::Failed),
-            _ => {}
+            Transition::Benign => {}
+            Transition::Failed => return Err(Error::Failed),
         }
         Ok(())
     }
