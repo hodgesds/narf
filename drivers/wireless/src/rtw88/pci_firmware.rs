@@ -614,7 +614,8 @@ unsafe impl Registers for Native {
         Ok(())
     }
     fn begin_operating8821c(&mut self) -> Result<(), Error> {
-        if self.device.id.device != 0xc821
+        // C21 N21P and B22 N2BP parked operating power share this gate.
+        if !matches!(self.device.id.device, 0xc821 | 0xb822)
             || self.state != State::Calibration8821cPrepared
             || self.command_ring.pending()
         {
@@ -631,7 +632,7 @@ unsafe impl Registers for Native {
         Ok(())
     }
     fn finish_operating8821c(&mut self) -> Result<(), Error> {
-        if self.device.id.device != 0xc821 || self.state != State::Configuring {
+        if !matches!(self.device.id.device, 0xc821 | 0xb822) || self.state != State::Configuring {
             return Err(Error::State);
         }
         self.finish_mac()?;

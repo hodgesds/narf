@@ -433,10 +433,47 @@ thermal check per sample, clears RF08, refuses any 0x1bf0 fail/reload bit
 at `Stage::Calibrated` with a `radio8822b::Calibration` receipt
 (`calibration_info8822b`). The owner's internal phase reuses
 `Calibration8821cPrepared`; every C21 operating/station continuation checks
-`0xc821` and refuses it. `rtw8822b_pwr_track` (thermal-driven TXAGC/swing
-updates) is not ported: it needs per-rate power indices that only an operating
-record can supply. The chain ends at `Stage::Calibrated`; no operating record,
-station shell or packet path exists for B22 yet.
+`0xc821` and refuses it. The chain continues with the `N2BP` record below.
+
+#### RTL8822BE parked operating power (`N2BP`) and awake-station grant (`N2BS`)
+
+`operating8822b` holds the B22 operating/station record family, keyed by the
+PCI identity `10ec:b822` and bound to the retained `N2BQ` board. From
+`Stage::Calibrated`, `Lifecycle::operating_request8822b` returns the identity
+(the `N2BQ` request identity, the calibration receipt channel/width and the
+literal program recipe) and `rtw88/rtw8822be-power-v1-<mac>.bin`. The signed
+192-byte `N2BP` v1 record is: magic 0, version 1 at 4, header and total length
+192 at 6/8, VID/DID at 12/14, identity at 16, MAC at 48, channel 1 / 20 MHz at
+54/55, antenna gain (quarter-dBi i16) 56, board EIRP ceiling 58,
+complete-program and aggregate automatic-response conducted peaks 60/62
+(quarter-dBm), thermal min/max 64/65, `US` 66, path-A and path-B coded TXAGC
+indices for DESC_RATE 0..11 (CCK1..11, OFDM6..54) at 68 and 80, twelve per-rate
+combined-chain conducted peaks at 92, zero 116..192. Every index must be ≤ 0x3f
+and ≤ that path's factory channel-group-0 base (`txpwr_idx_table[path]`
+`cck_base[0]` and `bw40_base[0] + ofdm_diff`, `txgi_factor` 1, as in
+`phy.c::rtw_phy_get_2g_tx_power_index`; 8822B has no BTG path substitution);
+erased/wrapped factory cells refuse. All peaks plus antenna gain must fit the
+signed ceiling, 20 dBm and every intersecting current US rule; the program peak
+encloses the others. Missing/unsigned/foreign/over-limit records keep the pure
+`Calibrated` checkpoint. The program (inside `N2BQ` + `N2BP` + policy, 3 s
+deadline) re-triggers RF42[17:16] and waits the 2 s `rtw8822b_pwr_track`
+interval, checks the meter against both thermal windows plus RF08 clear and
+0x1bf0 zero, writes both paths through `rtw8822b_set_tx_power_index_by_rate`
+(0x1d00/0x1d80; the three legacy words carry the measured indices, every other
+written 2SS word zero) with readback, and programs `RRSR_INIT_2G` 0x15f.
+Success earns `Operating8821cPrepared` (stage name shared with C21; owner keyed
+by `0xb822`) and `operating_info8822b`; packet gates stay closed.
+
+`station_request8822b` (from `Operating8821cPrepared`) returns the `N2BS`
+identity, binding the `N2BP` identity, both paths' indices, the parked and
+station response masks, and `rtw88/rtw8822be-station-v1-<mac>.bin`. `N2BS` v1
+is the 128-byte `N21S` layout with B22 magic/header (antenna 56, ceiling 58,
+ordinary/automatic-response/complete-program peaks 60/62/64, thermal 66/67 that
+must be exactly 0/63, `US` 68, zero 70..128); `Grant::invoke` nests the `N2BQ`,
+`N2BP` and `N2BS` source invocations and current policy. The decoder and
+preflight exist; the B22 awake station radio program, `rtw8822b_pwr_track`,
+the station shell and packet path are not ported yet, so the chain ends at
+`Stage::Operating8821cPrepared`. No board's `N2BP`/`N2BS` asset is provisioned.
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 

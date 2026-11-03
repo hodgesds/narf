@@ -73,10 +73,11 @@ impl Owner8822b {
             .await
     }
     /// Drive every implemented B22 continuation in order. The chain currently
-    /// ends at `Stage::Calibrated` (authenticated firmware, inactive
-    /// `rtw_mac_init` + `rtw8822b_mac_init`, complete `rtw8822b_phy_set_param`,
-    /// then the signed `N2BQ` ch1/20 firmware IQK; host DMA parked, TXPAUSE
-    /// closed). An unprovisioned board stops at `PhyTablesPrepared`.
+    /// ends at `Stage::Operating8821cPrepared` (authenticated firmware,
+    /// inactive `rtw_mac_init` + `rtw8822b_mac_init`, complete
+    /// `rtw8822b_phy_set_param`, the signed `N2BQ` ch1/20 firmware IQK, then
+    /// the signed `N2BP` parked TXAGC; host DMA parked, TXPAUSE closed). An
+    /// unprovisioned board stops at `PhyTablesPrepared`.
     pub(super) async fn provision(&self) -> Result<(), Error> {
         let _admission = self.admission.lock().await;
         loop {
@@ -97,7 +98,13 @@ impl Owner8822b {
                         .prepare_calibration8822b(&self.factory)
                         .await?;
                 }
-                Stage::Calibrated => return Ok(()),
+                Stage::Calibrated => {
+                    // Missing/unsigned/mismatched N2BP or refused policy is
+                    // pure and keeps the Calibrated checkpoint retryable.
+                    self.lifecycle.prepare_operating8822b(&self.factory).await?;
+                }
+                // No B22 station radio (N2BS-enclosed) program exists yet.
+                Stage::Operating8821cPrepared => return Ok(()),
                 _ => return Err(Error::State),
             }
         }

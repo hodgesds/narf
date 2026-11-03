@@ -499,3 +499,180 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_iqk_commands_and_txagc_follow_linux
 );
+
+fn b22_power_record(request: &super::super::operating8822b::Request) -> alloc::vec::Vec<u8> {
+    let mut bytes = alloc::vec![0; 192];
+    bytes[..4].copy_from_slice(b"N2BP");
+    for (at, value) in [(4, 1u16), (6, 192), (12, 0x10ec), (14, 0xb822)] {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[8..12].copy_from_slice(&192u32.to_le_bytes());
+    bytes[16..48].copy_from_slice(&request.identity);
+    bytes[48..54].copy_from_slice(&request.mac);
+    bytes[54] = 1;
+    bytes[55] = 20;
+    for (at, value) in [(56, 4i16), (58, 76), (60, 60), (62, 40)] {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[64] = 20;
+    bytes[65] = 30;
+    bytes[66..68].copy_from_slice(b"US");
+    for i in 0..12 {
+        bytes[68 + i] = if i < 4 { 30 } else { 28 }; // path A
+        bytes[80 + i] = if i < 4 { 29 } else { 27 }; // path B
+        bytes[92 + 2 * i..94 + 2 * i].copy_from_slice(&50i16.to_le_bytes());
+    }
+    bytes
+}
+
+/// `N2BP`/`N2BS` decode keyed by the B22 PCI identity and the retained N2BQ
+/// board; factory channel-group-0 bases bound every coded index.
+fn smoke_rtw8822be_n2bp_n2bs_records_bind_board_and_factory_limits() -> TestResult {
+    use super::super::operating8822b::{
+        factory_limits, request, station_request, Info, Source, StationSource,
+    };
+    use super::super::{calibration8822b, mac, phy8822b, radio8822b};
+    use narf_capabilities::Cap;
+    let mut map = *b22_board_factory(3, 25).logical();
+    // txpwr_idx_table[0]/[1]: cck_base[0], bw40_base[0], ofdm_diff nibble.
+    for (path, cck, bw40, diff) in [(0usize, 32u8, 30u8, 0x02u8), (1, 31, 29, 0x0f)] {
+        let at = 0x10 + path * 42;
+        map[at] = cck;
+        map[at + 6] = bw40;
+        map[at + 11] = diff;
+    }
+    let factory = super::super::efuse8822b::Factory8822b::for_test(map).unwrap();
+    if factory_limits(factory.power_path(0).unwrap()) != Ok([32, 32])
+        || factory_limits(factory.power_path(1).unwrap()) != Ok([31, 28])
+        || factory_limits(&[0xff; 42]).is_ok()
+    {
+        return TestResult::Fail(
+            "8822B factory TXAGC base differs from rtw_phy_get_2g_tx_power_index",
+        );
+    }
+    let info = mac::Info {
+        cut: 1,
+        reserved_boundary: 1996,
+        h2c_page: 2036,
+        firmware_tx_page: 2044,
+    };
+    let phy = phy8822b::Info::from_factory(&factory, 1, b22_features(2)).unwrap();
+    let board =
+        calibration8822b::Board::new(&factory, phy, info, b22_features(2), [9; 32]).unwrap();
+    let calibration = match (calibration8822b::Source::Verified {
+        bytes: b22_record(&board.request()),
+        signer: Some([7; 32]),
+        cap: Cap::bootstrap(),
+    })
+    .load(board)
+    {
+        Ok(envelope) => alloc::sync::Arc::new(envelope),
+        Err(_) => return TestResult::Fail("8822B N2BQ fixture rejected"),
+    };
+    let receipt = radio8822b::Calibration {
+        channel: 1,
+        bandwidth_mhz: 20,
+        thermal_before: 25,
+        thermal_after: 25,
+        iqk_status: 0,
+    };
+    let req = request(board.request(), receipt);
+    if req.filename != "rtw88/rtw8822be-power-v1-00e04c22b802.bin"
+        || req.identity == board.request().identity
+    {
+        return TestResult::Fail("8822B N2BP request filename/identity differs");
+    }
+    let load = |bytes| {
+        Source::Verified {
+            bytes,
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(req.clone(), &factory, calibration.clone())
+    };
+    let good = b22_power_record(&req);
+    let mut c21 = good.clone();
+    c21[..4].copy_from_slice(b"N21P");
+    let mut over = good.clone();
+    over[80 + 4] = 29; // path-B OFDM above its factory base 28
+    let mut foreign = good.clone();
+    foreign[14..16].copy_from_slice(&0xc821u16.to_le_bytes());
+    if load(c21).is_ok() || load(over).is_ok() || load(foreign).is_ok() {
+        return TestResult::Fail("8822B N2BP admitted a foreign/over-limit record");
+    }
+    let envelope = match load(good) {
+        Ok(envelope) => alloc::sync::Arc::new(envelope),
+        Err(_) => return TestResult::Fail("8822B N2BP rejected its exact signed record"),
+    };
+    let table = envelope.txagc(1);
+    if table[..4] != [29; 4] || table[4..12] != [27; 8] || table[12..].iter().any(|&v| v != 0) {
+        return TestResult::Fail("8822B N2BP TXAGC table differs");
+    }
+    let us = narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: alloc::vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2422,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 20,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    };
+    if envelope.invoke(&|| Ok(us.clone()), || Ok(())).is_err()
+        || envelope.temperature(31).is_ok()
+        || envelope.temperature(25).is_err()
+    {
+        return TestResult::Fail("8822B N2BP policy/thermal checks differ");
+    }
+    let power = Info {
+        indices: envelope.indices(),
+        thermal: 25,
+        response_rates: 0x15f,
+        identity: req.identity,
+    };
+    let sreq = station_request(power, factory.mac());
+    if sreq.filename != "rtw88/rtw8822be-station-v1-00e04c22b802.bin" {
+        return TestResult::Fail("8822B N2BS filename differs");
+    }
+    let mut station = alloc::vec![0u8; 128];
+    station[..4].copy_from_slice(b"N2BS");
+    for (at, value) in [(4, 1u16), (6, 128), (12, 0x10ec), (14, 0xb822)] {
+        station[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    station[8..12].copy_from_slice(&128u32.to_le_bytes());
+    station[16..48].copy_from_slice(&sreq.identity);
+    station[48..54].copy_from_slice(&sreq.mac);
+    station[54] = 1;
+    station[55] = 20;
+    for (at, value) in [(56, 4i16), (58, 76), (60, 50), (62, 40), (64, 60)] {
+        station[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    station[66] = 0;
+    station[67] = 63;
+    station[68..70].copy_from_slice(b"US");
+    let sload = |bytes| {
+        StationSource::Verified {
+            bytes,
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(sreq.clone(), envelope.clone())
+    };
+    let mut narrow = station.clone();
+    narrow[67] = 40; // static awake profile must cover every meter value
+    if sload(narrow).is_ok() {
+        return TestResult::Fail("8822B N2BS admitted a narrow thermal window");
+    }
+    match sload(station) {
+        Ok(grant)
+            if grant.matches(&sreq) && grant.invoke(&|| Ok(us.clone()), || Ok(())).is_ok() =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("8822B N2BS rejected its exact signed record"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bp_n2bs_records_bind_board_and_factory_limits
+);

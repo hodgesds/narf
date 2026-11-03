@@ -112,6 +112,7 @@ mod ht_tests;
 pub(super) mod interface;
 mod mac;
 mod operating8821c;
+mod operating8822b;
 pub(super) mod packet_core;
 pub(super) mod packet_format;
 mod packet_phy;

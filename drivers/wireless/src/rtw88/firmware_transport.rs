@@ -850,6 +850,8 @@ pub(super) struct Owner<I: Io> {
     phy8822b: Option<super::phy8822b::Info>,
     calibration8822b: Option<super::radio8822b::Calibration>,
     envelope8822b: Option<alloc::sync::Arc<super::calibration8822b::Envelope>>,
+    operating8822b: Option<super::operating8822b::Info>,
+    operating_envelope8822b: Option<alloc::sync::Arc<super::operating8822b::Envelope>>,
     /// C21 host interface; keys the PHY rows and every signed C21 record.
     interface: super::phy8821c::Interface,
     calibration8821c: Option<super::radio8821c::Info>,
@@ -892,6 +894,8 @@ impl<I: Io> Owner<I> {
             phy8822b: None,
             calibration8822b: None,
             envelope8822b: None,
+            operating8822b: None,
+            operating_envelope8822b: None,
             interface: super::phy8821c::Interface::Pcie,
             calibration8821c: None,
             envelope8821c: None,
@@ -1835,6 +1839,116 @@ impl<I: Io> Owner<I> {
         self.calibration8822b = Some(result);
         self.phase = Phase::Calibration8821cPrepared;
         Ok(result)
+    }
+
+    /// Metadata a provisioner measures and signs as `N2BP`; grants nothing.
+    pub(super) fn operating_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::Request, Error> {
+        if self.did != 0xb822
+            || !matches!(
+                self.phase,
+                Phase::Calibration8821cPrepared | Phase::Operating8821cPrepared
+            )
+        {
+            return Err(Error::State);
+        }
+        let board = self.calibration_board8822b(factory)?;
+        if !self
+            .envelope8822b
+            .as_ref()
+            .ok_or(Error::State)?
+            .matches(board)
+        {
+            return Err(Error::State);
+        }
+        Ok(super::operating8822b::request(
+            board.request(),
+            self.calibration8822b.ok_or(Error::State)?,
+        ))
+    }
+    pub(super) fn operating_info8822b(&self) -> Option<super::operating8822b::Info> {
+        (self.did == 0xb822 && self.phase == Phase::Operating8821cPrepared)
+            .then_some(self.operating8822b)
+            .flatten()
+    }
+    pub(super) fn preflight_operating8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::operating8822b::Source,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<alloc::sync::Arc<super::operating8822b::Envelope>, Error> {
+        if self.did != 0xb822 || self.phase != Phase::Calibration8821cPrepared {
+            return Err(Error::State);
+        }
+        let envelope = source.load(
+            self.operating_request8822b(factory)?,
+            factory,
+            self.envelope8822b.as_ref().ok_or(Error::State)?.clone(),
+        )?;
+        envelope.invoke(&|| Ok(domain.clone()), || Ok(()))?;
+        Ok(alloc::sync::Arc::new(envelope))
+    }
+    /// RTL8822BE parked `N2BP` operating power after the `N2BQ` IQK
+    /// (`operating8822b::Envelope::prepare`), bounded to three seconds.
+    pub(super) async fn prepare_operating8822b<F>(
+        &mut self,
+        factory: &super::efuse8822b::Factory8822b,
+        envelope: alloc::sync::Arc<super::operating8822b::Envelope>,
+        policy: F,
+    ) -> Result<super::operating8822b::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.did != 0xb822
+            || self.phase != Phase::Calibration8821cPrepared
+            || !envelope.matches(&self.operating_request8822b(factory)?)
+        {
+            return Err(Error::State);
+        }
+        envelope.invoke(&policy, || Ok(()))?;
+        self.phase = Phase::Failed;
+        self.operating_envelope8822b = Some(envelope.clone());
+        let info = narf_time::timeout(
+            narf_time::Deadline::after_ms(3000),
+            envelope.prepare(&mut self.io, policy),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.operating8822b = Some(info);
+        self.phase = Phase::Operating8821cPrepared;
+        Ok(info)
+    }
+    /// Metadata a provisioner measures and signs as `N2BS`; grants nothing.
+    pub(super) fn station_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::StationRequest, Error> {
+        if self.did != 0xb822 || self.phase != Phase::Operating8821cPrepared {
+            return Err(Error::State);
+        }
+        Ok(super::operating8822b::station_request(
+            self.operating8822b.ok_or(Error::State)?,
+            factory.mac(),
+        ))
+    }
+    /// Decode and currently authorize `N2BS` over the retained `N2BP`.
+    pub(super) fn preflight_station8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::operating8822b::StationSource,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<alloc::sync::Arc<super::operating8822b::Grant>, Error> {
+        let grant = source.load(
+            self.station_request8822b(factory)?,
+            self.operating_envelope8822b
+                .as_ref()
+                .ok_or(Error::State)?
+                .clone(),
+        )?;
+        grant.invoke(&|| Ok(domain.clone()), || Ok(()))?;
+        Ok(grant)
     }
     pub(super) async fn prepare_phy8821c(
         &mut self,

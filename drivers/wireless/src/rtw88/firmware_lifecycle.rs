@@ -477,6 +477,84 @@ impl<I: Io> Lifecycle<I> {
         )
         .await
     }
+    pub(super) async fn operating_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .operating_request8822b(factory)
+    }
+    pub(super) async fn operating_info8822b(&self) -> Option<super::operating8822b::Info> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::operating_info8822b)
+    }
+    pub(super) async fn station_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::StationRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_request8822b(factory)
+    }
+    /// RTL8822BE `N2BP` parked operating power: `Calibrated →
+    /// PreparingOperating8821c → Operating8821cPrepared` (stage names are
+    /// shared with C21; the owner is keyed by `0xb822`). A missing, unsigned,
+    /// mismatched or policy-refused record leaves the pure `Calibrated`
+    /// checkpoint without register access.
+    pub(super) async fn prepare_operating8822b_with<F>(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::operating8822b::Source,
+        policy: F,
+    ) -> Result<super::operating8822b::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Calibrated {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let envelope = owner.preflight_operating8822b(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::PreparingOperating8821c;
+        let _attempt = Attempt(self);
+        let result = owner
+            .prepare_operating8822b(factory, envelope, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Operating8821cPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_operating8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::Info, Error> {
+        self.prepare_operating8822b_with(factory, super::operating8822b::Source::Registered, || {
+            narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8822b(
+                super::calibration8822b::Error::Policy,
+            ))
+        })
+        .await
+    }
     pub(super) async fn prepare_phy8821c(
         &self,
         factory: &super::efuse::Factory8821c,
