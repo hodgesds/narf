@@ -140,6 +140,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         public: bool,
         current: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<(), Error> {
+        let vdev = self.primary.id();
+        self.begin_roc_on(vdev, owner, receipt, public, current)
+            .await
+    }
+    /// ROC on an owned vdev: the managed role's, or the P2P_DEVICE vdev
+    /// for discovery (`mac.c::ath10k_remain_on_channel`, `arvif->vdev_id`).
+    pub(in crate::ath10k) async fn begin_roc_on(
+        &mut self,
+        vdev: u8,
+        owner: Owner,
+        receipt: Receipt,
+        public: bool,
+        current: impl Fn() -> Result<RegulatoryDomain, Error>,
+    ) -> Result<(), Error> {
+        if !self.roc_vdev_owned(vdev) {
+            return Err(Error::Unsupported);
+        }
         if self.failed
             || self.ready.is_none()
             || self.scan_pending.is_some()
@@ -189,12 +206,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .checked_add(1)
             .filter(|n| *n <= 4095)
             .ok_or(Error::Exhausted)?;
-        let command = self.wire.roc(
-            self.primary.id(),
-            sequence,
-            receipt.frequency,
-            receipt.duration,
-        )?;
+        let command = self
+            .wire
+            .roc(vdev, sequence, receipt.frequency, receipt.duration)?;
         // Invalidate every copied RX batch before changing physical RF. The
         // shared epoch already fences native40->20; no pre-ROC PPDU or host
         // callback may cross this additional channel-ownership boundary.
@@ -214,7 +228,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.scan_terminal = None;
         let home = plan.station.is_none();
         self.roc = Some(Box::new(Work {
-            vdev: self.primary.id(),
+            vdev,
             owner,
             receipt,
             plan,

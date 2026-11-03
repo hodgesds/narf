@@ -67,6 +67,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let w = self.roc.as_ref().ok_or(Error::Failed)?;
+        // The temporary-peer and WMI MGMT_TX builders still carry the
+        // implicit vdev0 id; a P2P_DEVICE ROC is receive/listen-only.
+        if w.vdev != self.primary.id() {
+            return Err(Error::Unsupported);
+        }
         if request.frequency_mhz != u32::from(w.receipt.frequency)
             || w.public && request.duration != 0
             || w.action.is_some()

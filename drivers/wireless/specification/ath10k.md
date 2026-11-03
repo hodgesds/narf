@@ -2131,9 +2131,24 @@ will bind; none of them grants RF, peer, key or data authority.
   or `ATH10K_FW_FEATURE_NO_P2P` (bit 3). It is not yet returned from
   `interface_combinations`.
 
-Remaining before the row can be claimed: a control-only
-P2P_DEVICE WDEV owning its own vdev for discovery ROC/FRAME
-(`async_p2p_device_control`, `async_p2p_management_{rx,tx}_control`); a
+- **P2P_DEVICE vdev (radio owner only).** `wmi_runtime/p2p_device.rs`
+  `start_p2p_device` follows `mac.c::ath10k_add_interface` for
+  `NL80211_IFTYPE_P2P_DEVICE`: TLV firmware without NO_P2P only
+  (`p2p_supported`), no AP/scan/ROC in flight, lowest free id, then
+  `WMI_VDEV_CREATE` (STA type, subtype P2P_DEV, wdev address) and the
+  vdev NSS parameter on that id (`Chains::vdev_nss_for`). `stop_p2p_device`
+  sends `WMI_VDEV_DELETE` and, with TLV service 92 SYNC_DELETE_CMDS, waits
+  5 s for `WMI_TLV_VDEV_DELETE_RESP` (0x5006) as
+  `ath10k_vdev_delete_sync` before returning the id. `begin_roc_on(vdev)`
+  runs a discovery ROC on the P2P_DEVICE vdev (`ath10k_remain_on_channel`
+  uses `arvif->vdev_id`); ROC action TX is refused on it because the
+  temporary-peer and WMI MGMT_TX builders still encode vdev0. Nothing is
+  bound to an nl80211 WDEV yet.
+
+Remaining before the row can be claimed: the nl80211 control-only
+P2P_DEVICE WDEV binding `start/stop_p2p_device` and ROC/FRAME
+(`async_p2p_device_control`, `async_p2p_management_{rx,tx}_control`),
+which needs per-vdev offchannel peer and MGMT_TX builders; a
 P2P client netdev role (iftype 8, STA vdev subtype P2P_CLI) reusing the
 station owner; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring
 `go_beacon_ie` into the beacon publication and `NoaOwner` into P2P_NOA
@@ -2146,7 +2161,8 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_noa_event_builds_absence_ie`,
 `smoke_ath10k_p2p_noa_owner_probe_response_only`,
 `smoke_ath10k_p2p_tlv_combinations`,
-`smoke_ath10k_p2p_vdev_delete_and_roc_vdev`.
+`smoke_ath10k_p2p_vdev_delete_and_roc_vdev`,
+`smoke_ath10k_p2p_device_vdev_nss_on_own_id`.
 
 ## 4. Invariants
 

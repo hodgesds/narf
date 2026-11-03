@@ -42,6 +42,7 @@ mod hw_keys;
 mod mlme;
 mod nwifi;
 pub(in crate::ath10k) mod offchannel;
+mod p2p_device;
 // Role owners (P2P device/client/GO) bind these codecs in later steps.
 #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 mod p2p;
@@ -132,6 +133,8 @@ pub(super) struct Radio<T> {
     /// it on the same id). Station peer/data and AP owners route by its id;
     /// additional P2P role vdevs are allocated from `vdev_map` beside it.
     primary: p2p::Vdev,
+    /// The control-only P2P_DEVICE vdev (`p2p_device.rs`), if created.
+    p2p_device: Option<p2p::Vdev>,
     features: u64,
     /// Linux `cryptmode=0` beside the RAW decap: station PTK/GTK go to the
     /// firmware key cache (`hw_keys`), software CCMP stays the fallback.
@@ -183,6 +186,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             wire: wire::Wire::new(dialect),
             vdev_map: None,
             primary: p2p::Vdev::new(0, p2p::Role::Station),
+            p2p_device: None,
             features,
             hardware_keys: false,
             peer_pmf_offload: false,

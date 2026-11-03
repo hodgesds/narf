@@ -345,3 +345,34 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_vdev_delete_and_roc_vdev
 );
+
+/// `ath10k_add_interface` sets the vdev NSS on the new vdev's own id; the
+/// managed vdev0 form stays byte-identical to the existing station command.
+fn smoke_ath10k_p2p_device_vdev_nss_on_own_id() -> TestResult {
+    let Ok(chains) = super::super::chains::Chains::new(3) else {
+        return TestResult::Fail("two-chain mask refused");
+    };
+    for dialect in [
+        Dialect::Main,
+        Dialect::TenTwo,
+        Dialect::TenFour,
+        Dialect::Tlv,
+    ] {
+        let at = if dialect == Dialect::Tlv { 8 } else { 4 };
+        let (Ok(zero), Ok(old), Ok(one)) = (
+            chains.vdev_nss_for(dialect, 0),
+            chains.vdev_nss(dialect),
+            chains.vdev_nss_for(dialect, 1),
+        ) else {
+            return TestResult::Fail("nss refused");
+        };
+        if zero != old || wire::word(&one, at) != Ok(1) || wire::word(&one, at + 8) != Ok(2) {
+            return TestResult::Fail("nss vdev layout");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_device_vdev_nss_on_own_id
+);

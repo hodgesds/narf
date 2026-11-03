@@ -50,6 +50,10 @@ impl Chains {
         Ok([command(1)?, command(2)?])
     }
     pub(super) fn vdev_nss(self, dialect: Dialect) -> Result<Vec<u8>, Error> {
+        self.vdev_nss_for(dialect, 0)
+    }
+    /// `WMI_VDEV_SET_PARAM(nss)` for `vdev` (`mac.c::ath10k_add_interface`).
+    pub(super) fn vdev_nss_for(self, dialect: Dialect, vdev: u8) -> Result<Vec<u8>, Error> {
         let (id, parameter) = match dialect {
             Dialect::Main | Dialect::Tlv => (0x5008, 0x22),
             Dialect::TenOne => (0x901a, 0x20),
@@ -63,6 +67,7 @@ impl Chains {
         } else {
             4
         };
+        wire::put(&mut out, at, u32::from(vdev));
         wire::put(&mut out, at + 4, parameter);
         wire::put(&mut out, at + 8, u32::from(self.count()));
         Ok(out)
