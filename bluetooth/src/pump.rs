@@ -32,15 +32,19 @@
 //!
 //! - LE / BR-EDR Connection Complete → connection table entry.
 //! - Disconnection Complete → entry removed (L2CAP state dropped).
-//! - LE Long Term Key Request → LTK Request Negative Reply. There is
-//!   no bonding store yet, so no LTK can ever match; replying with a
-//!   stored key we do not have would be worse than refusing.
+//! - LE Long Term Key Request → answered from the in-progress
+//!   AuthComplete session or the bond store when peer address +
+//!   EDIV/Rand match exactly, else LTK Request Negative Reply.
 //! - Number Of Completed Packets → ACL flow-control credits.
 //! - ACL → per-connection `l2cap::Dispatcher` → CID routing:
 //!   ATT → the per-controller `gatt_server::GattServer` (default GAP /
 //!   GATT / Device Information / Battery services mounted);
-//!   SMP → a per-connection `smp::Responder` driven by the production
-//!   [`NarfSmpCrypto`]; LE signalling → Connection Parameter Update
+//!   SMP → a per-connection SMP session: `smp::Responder` for
+//!   peer-initiated pairings, `smp::Initiator` when the peer sends a
+//!   Security Request or the application calls
+//!   [`smp_initiate_pairing`]; a completed bonded pairing persists in
+//!   the bond store, and an encrypted link starts Phase 3 key
+//!   distribution; LE signalling → Connection Parameter Update
 //!   accepted, LE credit-based connections answered from the
 //!   `l2cap_server::ServerRegistry` (open/credit/disconnect flow,
 //!   SDU reassembly, staged receive queues); BR/EDR signalling →
@@ -49,7 +53,7 @@
 //!   0x0003, refused otherwise), Configure / Disconnection answered
 //!   so peers do not wedge. Dynamic CIDs route to their channel's
 //!   service (SDP server, RFCOMM session, or staged generic queue);
-//!   frames on unknown dynamic CIDs are dropped and counted, as is
+//!   frames on unknown dynamic CIDs are dropped and counted.
 //!   initiating pairing (`smp::Initiator` needs an application policy
 //!   trigger that does not exist yet).
 //! - LE Advertising Report (while scanning) → the central peer table.
@@ -92,6 +96,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::att;
+use crate::bond_store::{Bond, BondStore};
 use crate::controller::ControllerInfo;
 use crate::event::{
     parse_le_advertising_reports, CommandComplete, CommandStatus, DisconnectionComplete, EventCode,
@@ -114,7 +119,7 @@ use crate::l2cap_server::{
 use crate::opcode as op;
 use crate::sdp_server::SdpServer;
 use crate::services;
-use crate::smp::{self, PairingError, Responder};
+use crate::smp::{self, Initiator, PairingError, Responder};
 use crate::transport::{HciTransport, TransportError};
 
 // ── Production SMP crypto ───────────────────────────────────────────
@@ -321,6 +326,18 @@ impl PumpStep {
 
 // ── Per-connection state ────────────────────────────────────────────
 
+/// One side of a pairing: the pump drives a responder for
+/// peer-initiated pairings and an initiator for peer Security
+/// Requests and application triggers. Exactly one session per
+/// connection — a second pairing attempt while one is in flight is
+/// refused by the initiator API and routed into the live session
+/// for inbound PDUs.
+#[derive(Debug)]
+enum SmpSession {
+    Responder(Responder<NarfSmpCrypto>),
+    Initiator(Initiator<NarfSmpCrypto>),
+}
+
 /// One ACL connection tracked by the pump.
 #[derive(Debug)]
 struct Connection {
@@ -329,7 +346,7 @@ struct Connection {
     /// `[address_type, bd_addr(wire order, 6)]` of the peer.
     peer_addr: [u8; 7],
     dispatcher: l2cap::Dispatcher,
-    smp: Option<Responder<NarfSmpCrypto>>,
+    smp: Option<SmpSession>,
     /// GATT client record, present only on central-role
     /// connections (issue #1313). Peripheral-role connections
     /// keep server-only dispatch.
@@ -338,7 +355,10 @@ struct Connection {
     /// connection's peer has been attached as a HID device
     /// (issue #1314, via `hogp_attach`).
     hogp: Option<HogpClient>,
-    /// LTK from a completed pairing (in-memory only; no bond store).
+    /// LTK from a completed pairing. When the pairing was bonded
+    /// the same LTK also lives in the pump's bond store, which is
+    /// what answers reconnects; this field is the live
+    /// connection's copy.
     ltk: Option<[u8; 16]>,
     encrypted: bool,
     /// Dynamic-CID allocator for this connection's channels.
@@ -401,6 +421,10 @@ pub struct PumpCore {
     /// completes, so the controller is never asked to initiate
     /// while it is still scanning.
     pending_connect: Option<gap::CreateConnection>,
+    /// Bonds from completed pairings (driver-domain state, never a
+    /// global, never exposed to userspace). Survives disconnects;
+    /// lost on controller removal or reboot.
+    bonds: BondStore,
     /// Encoded outbound ACL packets awaiting flow-control credits.
     pending_acl: VecDeque<Vec<u8>>,
     /// Controller-wide ACL packets currently with the controller.
@@ -415,6 +439,7 @@ impl fmt::Debug for PumpCore {
             .field("info", &self.info)
             .field("connections", &self.connections.len())
             .field("central_phase", &self.central.phase)
+            .field("bonds", &self.bonds.len())
             .field("pending_acl", &self.pending_acl.len())
             .field("acl_in_flight", &self.acl_in_flight)
             .finish_non_exhaustive()
@@ -452,6 +477,7 @@ impl PumpCore {
             sdp: SdpServer::new(),
             central: gap::Central::new(),
             pending_connect: None,
+            bonds: BondStore::new(),
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
             stats: PumpStats::default(),
@@ -728,6 +754,139 @@ impl PumpCore {
         }
     }
 }
+// ── SMP initiator + bonding ─────────────────────────────────────────
+
+/// Errors starting an initiator pairing on a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmpInitiateError {
+    /// No connection with this handle.
+    UnknownHandle,
+    /// A pairing session is already in flight on this connection.
+    AlreadyPairing,
+    /// SMP initiation here is LE-only; BR/EDR cross-transport
+    /// pairing is out of scope.
+    NotLe,
+}
+
+/// Errors starting encryption from a stored bond.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmpEncryptError {
+    /// No connection with this handle.
+    UnknownHandle,
+    /// A pairing session is in flight; re-encrypting from an old
+    /// bond mid-pairing would leave the new session parked at
+    /// AuthComplete with no EncryptionChange left to trigger it.
+    PairingInProgress,
+    /// No bond for this connection's peer.
+    NoBond,
+    /// The HCI command itself failed to send.
+    Transport,
+}
+
+/// Outcome of feeding one SMP PDU, captured before acting so the
+/// session borrow ends before any `queue_frame` / bond-store call.
+struct SmpFeedOutcome {
+    outs: Vec<smp::Pdu>,
+    /// LTK to record on the connection when the session completed.
+    done_ltk: Option<[u8; 16]>,
+    /// Bond to store when the session completed bonded.
+    bond: Option<Bond>,
+    /// Pairing Failed reason to send when the session errored
+    /// (`None` on the silent PeerFailed path).
+    fail_reason: Option<u8>,
+    /// True when the session must be cleared (Done, or any error).
+    clear: bool,
+    /// LTK to start encryption with when an initiator session just
+    /// entered AuthComplete: the Central starts encryption (the
+    /// Peripheral cannot), and Phase 3 needs the encrypted link.
+    /// `None` for every other outcome.
+    auto_encrypt: Option<[u8; 16]>,
+}
+
+/// Map a state-machine error to its Pairing Failed reason byte
+/// (Vol 3 Part H §3.5.5).
+fn smp_fail_reason(err: &PairingError) -> u8 {
+    match err {
+        PairingError::BadConfirm => smp::SMP_FAILED_CONFIRM_VALUE,
+        PairingError::BadDhKeyCheck => smp::SMP_FAILED_DHKEY_CHECK_FAILED,
+        _ => smp::SMP_FAILED_UNSPECIFIED,
+    }
+}
+
+impl PumpCore {
+    /// Start an initiator pairing on an LE connection: emit the
+    /// Pairing Request and park the new session on the connection.
+    /// This is the application trigger — the kernel side of pairing
+    /// initiation. There is no ATT-triggered path yet: no
+    /// auth-gated attribute exists to produce an
+    /// Insufficient-Authentication error, so nothing today calls
+    /// this from the ATT path.
+    pub fn smp_initiate_pairing(&mut self, handle: u16) -> Result<(), SmpInitiateError> {
+        let local = self.local_addr();
+        let peer = {
+            let conn = self
+                .connections
+                .iter()
+                .find(|c| c.handle == handle)
+                .ok_or(SmpInitiateError::UnknownHandle)?;
+            if !conn.le {
+                return Err(SmpInitiateError::NotLe);
+            }
+            if conn.smp.is_some() {
+                return Err(SmpInitiateError::AlreadyPairing);
+            }
+            conn.peer_addr
+        };
+        let mut initiator = Initiator::new(NarfSmpCrypto, local, peer);
+        let req = initiator.start();
+        let conn = self
+            .connection_mut(handle)
+            .ok_or(SmpInitiateError::UnknownHandle)?;
+        conn.smp = Some(SmpSession::Initiator(initiator));
+        let le = conn.le;
+        self.queue_frame(handle, le, &BFrame::new(CID_SMP, req.encode()));
+        Ok(())
+    }
+
+    /// Re-encrypt a connection from its stored bond: issue HCI LE
+    /// Start Encryption with the bond's EDIV/Rand/LTK (Vol 4 Part E
+    /// §7.8.24). The peer's controller answers with an LE LTK
+    /// Request event, which the pump answers from the same bond.
+    /// Refused while a pairing session is in flight (see
+    /// [`SmpEncryptError::PairingInProgress`]).
+    pub fn smp_start_encryption(&mut self, handle: u16) -> Result<(), SmpEncryptError> {
+        let peer = {
+            let conn = self
+                .connections
+                .iter()
+                .find(|c| c.handle == handle)
+                .ok_or(SmpEncryptError::UnknownHandle)?;
+            if conn.smp.is_some() {
+                return Err(SmpEncryptError::PairingInProgress);
+            }
+            conn.peer_addr
+        };
+        let bond = self.bonds.lookup(&peer).ok_or(SmpEncryptError::NoBond)?;
+        let (ediv, rand, ltk) = (bond.ediv, bond.rand, bond.ltk);
+        let mut params = Vec::with_capacity(26);
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.extend_from_slice(&rand);
+        params.extend_from_slice(&ediv.to_le_bytes());
+        params.extend_from_slice(&ltk);
+        self.send_command(op::HCI_LE_START_ENCRYPTION, &params)
+            .map_err(|_| SmpEncryptError::Transport)
+    }
+
+    /// Forget a peer's bond. Returns true when one was removed.
+    pub fn forget_bond(&mut self, peer_addr: &[u8; 7]) -> bool {
+        self.bonds.forget(peer_addr)
+    }
+
+    /// Number of bonds held for this controller.
+    pub fn bond_count(&self) -> usize {
+        self.bonds.len()
+    }
+}
 
 // ── Event dispatch ──────────────────────────────────────────────────
 
@@ -898,12 +1057,64 @@ impl PumpCore {
                     return;
                 }
                 if let Some(req) = LeLongTermKeyRequest::parse(event) {
-                    // No bonding store: no LTK can match (rand, ediv),
-                    // so refuse explicitly (Vol 4 Part E §7.8.25).
-                    let _ = self.send_command(
-                        op::HCI_LE_LTK_REQUEST_NEGATIVE_REPLY,
-                        &req.handle.to_le_bytes(),
-                    );
+                    // Answer order (Vol 4 Part E §7.8.25, Part H
+                    // §3.6): first an in-progress AuthComplete
+                    // session on this connection — the peer is
+                    // encrypting with the just-derived LTK, and the
+                    // bond is not stored until distribution
+                    // finishes. SC sessions store EDIV 0 / Rand 0,
+                    // so a non-zero event pair cannot match one.
+                    // Then a stored bond matching peer address +
+                    // EDIV/Rand exactly. Anything else gets an
+                    // explicit negative reply — never a guessed key.
+                    let reply = {
+                        let conn = self.connections.iter().find(|c| c.handle == req.handle);
+                        match conn {
+                            Some(conn) => {
+                                let session_ltk = match &conn.smp {
+                                    Some(SmpSession::Responder(r))
+                                        if r.state == smp::ResponderState::AuthComplete =>
+                                    {
+                                        Some(r.ltk)
+                                    }
+                                    Some(SmpSession::Initiator(i))
+                                        if i.state == smp::PairingState::AuthComplete =>
+                                    {
+                                        Some(i.ltk)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(ltk) =
+                                    session_ltk.filter(|_| req.ediv == 0 && req.random_number == 0)
+                                {
+                                    Some(ltk)
+                                } else {
+                                    self.bonds
+                                        .lookup_for_ltk_request(
+                                            &conn.peer_addr,
+                                            req.ediv,
+                                            req.random_number,
+                                        )
+                                        .map(|b| b.ltk)
+                                }
+                            }
+                            None => None,
+                        }
+                    };
+                    match reply {
+                        Some(ltk) => {
+                            let mut params = Vec::with_capacity(18);
+                            params.extend_from_slice(&req.handle.to_le_bytes());
+                            params.extend_from_slice(&ltk);
+                            let _ = self.send_command(op::HCI_LE_LTK_REQUEST_REPLY, &params);
+                        }
+                        None => {
+                            let _ = self.send_command(
+                                op::HCI_LE_LTK_REQUEST_NEGATIVE_REPLY,
+                                &req.handle.to_le_bytes(),
+                            );
+                        }
+                    }
                 }
                 // Discovery reports feed the central peer table while
                 // scanning (§7.7.65.2). Malformed reports parse to
@@ -970,10 +1181,102 @@ impl PumpCore {
             code if code == EventCode::EncryptionChange as u8 => {
                 // §7.7.8: Status(1) Handle(2) Encryption_Enabled(1).
                 let p = &event.params;
-                if p.len() >= 4 && p[0] == 0 {
+                if p.len() >= 4 {
                     let handle = u16::from_le_bytes([p[1], p[2]]) & 0x0FFF;
-                    if let Some(conn) = self.connection_mut(handle) {
-                        conn.encrypted = p[3] != 0;
+                    let ok = p[0] == 0;
+                    let enabled = p[3] != 0;
+                    // Capture distribution output before acting
+                    // (the session borrow must end first).
+                    let (outs, bond) = match self.connection_mut(handle) {
+                        None => (Vec::new(), None),
+                        Some(conn) => {
+                            if ok {
+                                conn.encrypted = enabled;
+                            }
+                            let is_auth_complete = match &conn.smp {
+                                Some(SmpSession::Responder(r)) => {
+                                    r.state == smp::ResponderState::AuthComplete
+                                }
+                                Some(SmpSession::Initiator(i)) => {
+                                    i.state == smp::PairingState::AuthComplete
+                                }
+                                None => false,
+                            };
+                            if !is_auth_complete {
+                                (Vec::new(), None)
+                            } else if ok && enabled {
+                                // The link is encrypted: Phase 3
+                                // may start. On completion the bond
+                                // is stored and the session cleared.
+                                let (outs, bond) = match conn.smp.as_mut().unwrap() {
+                                    SmpSession::Responder(r) => {
+                                        let outs = r.begin_distribution();
+                                        let bond =
+                                            if r.state == smp::ResponderState::Done && r.bonded {
+                                                Some(Bond {
+                                                    peer_addr: conn.peer_addr,
+                                                    ltk: r.ltk,
+                                                    ediv: 0,
+                                                    rand: [0; 8],
+                                                    authenticated: r.method
+                                                        != smp::PairingMethod::JustWorks,
+                                                    peer_irk: r.peer_irk,
+                                                    peer_identity_addr: r.peer_identity_addr,
+                                                    peer_csrk: r.peer_csrk,
+                                                })
+                                            } else {
+                                                None
+                                            };
+                                        (outs, bond)
+                                    }
+                                    SmpSession::Initiator(i) => {
+                                        let outs = i.begin_distribution();
+                                        let bond = if i.state == smp::PairingState::Done && i.bonded
+                                        {
+                                            Some(Bond {
+                                                peer_addr: conn.peer_addr,
+                                                ltk: i.ltk,
+                                                ediv: 0,
+                                                rand: [0; 8],
+                                                authenticated: i.method
+                                                    != smp::PairingMethod::JustWorks,
+                                                peer_irk: i.peer_irk,
+                                                peer_identity_addr: i.peer_identity_addr,
+                                                peer_csrk: i.peer_csrk,
+                                            })
+                                        } else {
+                                            None
+                                        };
+                                        (outs, bond)
+                                    }
+                                };
+                                if bond.is_some() {
+                                    conn.smp = None;
+                                }
+                                (outs, bond)
+                            } else {
+                                // Encryption failed or was switched
+                                // off mid-pairing: no bond forms. The
+                                // pairing already authenticated, so
+                                // this is a silent clear, not a
+                                // Pairing Failed — there is nothing
+                                // left to fail.
+                                conn.smp = None;
+                                (Vec::new(), None)
+                            }
+                        }
+                    };
+                    if let Some(bond) = bond {
+                        self.bonds.store(bond);
+                    }
+                    let le = self
+                        .connections
+                        .iter()
+                        .find(|c| c.handle == handle)
+                        .map(|c| c.le)
+                        .unwrap_or(false);
+                    for out in outs {
+                        self.queue_frame(handle, le, &BFrame::new(CID_SMP, out.encode()));
                     }
                 }
             }
@@ -1172,37 +1475,154 @@ impl PumpCore {
         if self.connections[conn_idx].smp.is_none() {
             let peer = self.connections[conn_idx].peer_addr;
             let local = self.local_addr();
-            self.connections[conn_idx].smp = Some(Responder::new(NarfSmpCrypto, peer, local));
+            if le && pdu.code == smp::SMP_SECURITY_REQUEST {
+                // Part H §3.6.7: the Peripheral asks the Central to
+                // initiate security. The Security Request itself is
+                // consumed by starting the initiator — it is not
+                // fed into the new machine.
+                let mut initiator = Initiator::new(NarfSmpCrypto, local, peer);
+                let req = initiator.start();
+                self.connections[conn_idx].smp = Some(SmpSession::Initiator(initiator));
+                self.queue_frame(handle, le, &BFrame::new(CID_SMP, req.encode()));
+                return;
+            }
+            self.connections[conn_idx].smp = Some(SmpSession::Responder(Responder::new(
+                NarfSmpCrypto,
+                peer,
+                local,
+            )));
         }
-        let responder = self.connections[conn_idx].smp.as_mut().unwrap();
-        match responder.feed(pdu) {
-            Ok(outs) => {
-                if responder.state == smp::ResponderState::Done {
-                    self.connections[conn_idx].ltk = Some(responder.ltk);
-                }
-                for out in outs {
-                    self.queue_frame(handle, le, &BFrame::new(CID_SMP, out.encode()));
-                }
+        // Feed the session; capture the outcome first so the
+        // session borrow ends before any queue/store call.
+        let outcome = {
+            let conn = &mut self.connections[conn_idx];
+            let session = conn.smp.as_mut().unwrap();
+            match session {
+                SmpSession::Responder(r) => match r.feed(pdu) {
+                    Ok(outs) => {
+                        let done = r.state == smp::ResponderState::Done;
+                        SmpFeedOutcome {
+                            outs,
+                            done_ltk: if done { Some(r.ltk) } else { None },
+                            bond: if done && r.bonded {
+                                Some(Bond {
+                                    peer_addr: conn.peer_addr,
+                                    ltk: r.ltk,
+                                    ediv: 0,
+                                    rand: [0; 8],
+                                    authenticated: r.method != smp::PairingMethod::JustWorks,
+                                    peer_irk: r.peer_irk,
+                                    peer_identity_addr: r.peer_identity_addr,
+                                    peer_csrk: r.peer_csrk,
+                                })
+                            } else {
+                                None
+                            },
+                            fail_reason: None,
+                            clear: done,
+                            auto_encrypt: None,
+                        }
+                    }
+                    Err(PairingError::PeerFailed(_)) => SmpFeedOutcome {
+                        outs: Vec::new(),
+                        done_ltk: None,
+                        bond: None,
+                        fail_reason: None,
+                        clear: true,
+                        auto_encrypt: None,
+                    },
+                    Err(err) => SmpFeedOutcome {
+                        outs: Vec::new(),
+                        done_ltk: None,
+                        bond: None,
+                        fail_reason: Some(smp_fail_reason(&err)),
+                        clear: true,
+                        auto_encrypt: None,
+                    },
+                },
+                SmpSession::Initiator(i) => match i.feed(pdu) {
+                    Ok(outs) => {
+                        let done = i.state == smp::PairingState::Done;
+                        SmpFeedOutcome {
+                            outs,
+                            done_ltk: if done { Some(i.ltk) } else { None },
+                            bond: if done && i.bonded {
+                                Some(Bond {
+                                    peer_addr: conn.peer_addr,
+                                    ltk: i.ltk,
+                                    ediv: 0,
+                                    rand: [0; 8],
+                                    authenticated: i.method != smp::PairingMethod::JustWorks,
+                                    peer_irk: i.peer_irk,
+                                    peer_identity_addr: i.peer_identity_addr,
+                                    peer_csrk: i.peer_csrk,
+                                })
+                            } else {
+                                None
+                            },
+                            fail_reason: None,
+                            clear: done,
+                            // The Central starts encryption: an
+                            // initiator parked at AuthComplete
+                            // issues Start Encryption with the
+                            // just-derived LTK (SC: EDIV/Rand 0)
+                            // so Phase 3 can proceed.
+                            auto_encrypt: if i.state == smp::PairingState::AuthComplete {
+                                Some(i.ltk)
+                            } else {
+                                None
+                            },
+                        }
+                    }
+                    Err(PairingError::PeerFailed(_)) => SmpFeedOutcome {
+                        outs: Vec::new(),
+                        done_ltk: None,
+                        bond: None,
+                        fail_reason: None,
+                        clear: true,
+                        auto_encrypt: None,
+                    },
+                    Err(err) => SmpFeedOutcome {
+                        outs: Vec::new(),
+                        done_ltk: None,
+                        bond: None,
+                        fail_reason: Some(smp_fail_reason(&err)),
+                        clear: true,
+                        auto_encrypt: None,
+                    },
+                },
             }
-            Err(PairingError::PeerFailed(_)) => {
-                self.connections[conn_idx].smp = None;
-            }
-            Err(err) => {
-                // SMP failure reasons (Vol 3 Part H §3.5.5):
-                // 0x04 Confirm Value Failed, 0x0B DHKey Check
-                // Failed, 0x08 Unspecified otherwise.
-                let reason = match err {
-                    PairingError::BadConfirm => smp::SMP_FAILED_CONFIRM_VALUE,
-                    PairingError::BadDhKeyCheck => smp::SMP_FAILED_DHKEY_CHECK_FAILED,
-                    _ => smp::SMP_FAILED_UNSPECIFIED,
-                };
-                self.connections[conn_idx].smp = None;
-                let failed = smp::Pdu {
-                    code: smp::SMP_PAIRING_FAILED,
-                    payload: alloc::vec![reason],
-                };
-                self.queue_frame(handle, le, &BFrame::new(CID_SMP, failed.encode()));
-            }
+        };
+        if outcome.clear {
+            self.connections[conn_idx].smp = None;
+        }
+        if let Some(ltk) = outcome.done_ltk {
+            self.connections[conn_idx].ltk = Some(ltk);
+        }
+        if let Some(bond) = outcome.bond {
+            self.bonds.store(bond);
+        }
+        for out in outcome.outs {
+            self.queue_frame(handle, le, &BFrame::new(CID_SMP, out.encode()));
+        }
+        if let Some(ltk) = outcome.auto_encrypt {
+            // SC values: EDIV 0, Rand 0 (Part H §2.4.3.1). A
+            // transport failure here leaves the session parked at
+            // AuthComplete until disconnect — same swallow
+            // discipline as the event-dispatch sends.
+            let mut params = Vec::with_capacity(26);
+            params.extend_from_slice(&handle.to_le_bytes());
+            params.extend_from_slice(&[0u8; 8]);
+            params.extend_from_slice(&0u16.to_le_bytes());
+            params.extend_from_slice(&ltk);
+            let _ = self.send_command(op::HCI_LE_START_ENCRYPTION, &params);
+        }
+        if let Some(reason) = outcome.fail_reason {
+            let failed = smp::Pdu {
+                code: smp::SMP_PAIRING_FAILED,
+                payload: alloc::vec![reason],
+            };
+            self.queue_frame(handle, le, &BFrame::new(CID_SMP, failed.encode()));
         }
     }
 
@@ -1808,6 +2228,47 @@ pub fn central_peers(index: usize) -> Option<Vec<gap::DiscoveredPeer>> {
         .as_ref()
         .map(|c| c.central.peers.clone())
 }
+/// Run `f` against controller `index`'s core, taken out of its slot
+/// for the call (same discipline as [`pump_once`]: no
+/// `IrqSafeSpinLock` held across transport I/O). Returns `None`
+/// when no pump exists for `index` or a step is currently running.
+fn with_core<R>(index: usize, f: impl FnOnce(&mut PumpCore) -> R) -> Option<R> {
+    let mut core = {
+        let mut pumps = PUMPS.lock();
+        let slot = find_slot_mut(&mut pumps, index)?;
+        slot.core.take()?
+    };
+    let r = f(&mut core);
+    let mut pumps = PUMPS.lock();
+    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+        slot.core = Some(core);
+    }
+    Some(r)
+}
+
+/// Start an initiator pairing on controller `index`'s connection
+/// `handle`. See [`PumpCore::smp_initiate_pairing`].
+pub fn smp_initiate_pairing(index: usize, handle: u16) -> Option<Result<(), SmpInitiateError>> {
+    with_core(index, |core| core.smp_initiate_pairing(handle))
+}
+
+/// Re-encrypt controller `index`'s connection `handle` from its
+/// stored bond. See [`PumpCore::smp_start_encryption`].
+pub fn smp_start_encryption(index: usize, handle: u16) -> Option<Result<(), SmpEncryptError>> {
+    with_core(index, |core| core.smp_start_encryption(handle))
+}
+
+/// Forget controller `index`'s bond for `peer_addr`.
+pub fn forget_bond(index: usize, peer_addr: &[u8; 7]) -> Option<bool> {
+    with_core(index, |core| core.forget_bond(peer_addr))
+}
+
+/// Bond count for controller `index`, if it has a pump.
+pub fn bond_count(index: usize) -> Option<usize> {
+    let pumps = PUMPS.lock();
+    let slot = pumps.iter().find(|s| s.index == index)?;
+    slot.core.as_ref().map(|c| c.bond_count())
+}
 
 // ── The step ────────────────────────────────────────────────────────
 
@@ -2285,6 +2746,9 @@ mod tests {
                 .iter()
                 .map(|c| (c.opcode, c.params.clone()))
                 .collect()
+        }
+        fn sent_commands(&self) -> Vec<Command> {
+            self.sent_commands.lock().clone()
         }
         fn sent_acl_frames(&self) -> Vec<(u16, BFrame)> {
             self.sent_acl
@@ -3320,7 +3784,7 @@ mod tests {
             .map_err(|_| "responder rejected the pairing request")?;
         if out.len() != 1
             || out[0].code != smp::SMP_PAIRING_RESPONSE
-            || out[0].payload != [0x01, 0x00, 0x0D, 16, 0, 0]
+            || out[0].payload != [0x01, 0x00, 0x0D, 16, 0x06, 0x06]
         {
             return Err("pairing response payload is not the responder feature set");
         }
@@ -4452,6 +4916,61 @@ mod tests {
         }
     }
 
+    // ── #888: SMP initiator + bonding fixtures ────────────────────
+
+    const SMP888_HANDLE: u16 = 0x0040;
+    const SMP888_PEER6: [u8; 6] = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    const SMP888_PEER_ADDR: [u8; 7] = [0x00, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    const SMP888_LOCAL_ADDR: [u8; 7] = [0x00, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+    const SMP888_PEER_PRIV: &Fe = &[0x5A5A_5A5A_5A5A_5A5A; 4];
+
+    /// One SMP PDU wrapped as a single LE ACL packet.
+    fn smp888_acl(handle: u16, code: u8, payload: &[u8]) -> Vec<u8> {
+        acl_packet(
+            handle,
+            &BFrame::new(
+                CID_SMP,
+                smp::Pdu {
+                    code,
+                    payload: payload.to_vec(),
+                }
+                .encode(),
+            ),
+        )
+    }
+
+    /// Peer Pairing Request (NoInputNoOutput, bonding|SC) as one
+    /// LE ACL packet, with the given distribution bytes.
+    fn smp888_request_acl(handle: u16, dist_init: u8, dist_resp: u8) -> Vec<u8> {
+        acl_packet(
+            handle,
+            &BFrame::new(
+                CID_SMP,
+                smp::PairingFeatureExchange {
+                    io_capability: smp::IoCapability::NoInputNoOutput as u8,
+                    oob_data_flag: 0,
+                    auth_req: smp::AUTH_BONDING | smp::AUTH_SC,
+                    max_encryption_key_size: 16,
+                    initiator_key_distribution: dist_init,
+                    responder_key_distribution: dist_resp,
+                }
+                .encode(smp::SMP_PAIRING_REQUEST),
+            ),
+        )
+    }
+
+    /// LE LTK Request event (LeMeta subevent 0x05).
+    fn smp888_ltk_request_event(handle: u16, rand: u64, ediv: u16) -> Event {
+        let mut params = alloc::vec![0x05u8];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.extend_from_slice(&rand.to_le_bytes());
+        params.extend_from_slice(&ediv.to_le_bytes());
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
     fn central_bring_up(fake: Arc<ScriptedTransport>) -> Result<(), &'static str> {
         let transport: Arc<dyn HciTransport> = fake.clone();
         crate::transport::register(transport);
@@ -4460,6 +4979,70 @@ mod tests {
         let outcomes = crate::controller::bring_up_all(&cap);
         if outcomes.len() != 1 || outcomes[0].result.is_err() {
             return Err("bring-up against fake controller failed");
+        }
+        Ok(())
+    }
+    /// Encryption Change event (§7.7.8: Status, Handle, Enabled).
+    fn smp888_encryption_change_event(handle: u16, status: u8, enabled: u8) -> Event {
+        Event {
+            code: EventCode::EncryptionChange as u8,
+            params: alloc::vec![status, (handle & 0xFF) as u8, (handle >> 8) as u8, enabled],
+        }
+    }
+
+    /// Credit back 8 ACL packets (the bring-up MTU total) so a
+    /// later flush is never credit-starved mid-fixture.
+    fn smp888_replenish(fake: &ScriptedTransport, handle: u16) {
+        fake.enqueue_event(Event {
+            code: EventCode::NumberOfCompletedPackets as u8,
+            params: alloc::vec![1, (handle & 0xFF) as u8, (handle >> 8) as u8, 8, 0],
+        });
+    }
+
+    /// Enqueue `acls`, run one pump step, return the new SMP
+    /// payloads sent on `handle`.
+    fn smp888_step_acls(fake: &ScriptedTransport, acls: &[Vec<u8>], handle: u16) -> Vec<Vec<u8>> {
+        let before = fake.sent_acl_frames().len();
+        for a in acls {
+            fake.enqueue_acl(a.clone());
+        }
+        let _ = pump_once(0);
+        fake.sent_acl_frames()
+            .into_iter()
+            .skip(before)
+            .filter(|(h, f)| *h == handle && f.cid == CID_SMP)
+            .map(|(_, f)| f.payload)
+            .collect()
+    }
+
+    /// Enqueue one event, run one pump step, return the new SMP
+    /// payloads sent on `handle`.
+    fn smp888_step_event(fake: &ScriptedTransport, ev: Event, handle: u16) -> Vec<Vec<u8>> {
+        let before = fake.sent_acl_frames().len();
+        fake.enqueue_event(ev);
+        let _ = pump_once(0);
+        fake.sent_acl_frames()
+            .into_iter()
+            .skip(before)
+            .filter(|(h, f)| *h == handle && f.cid == CID_SMP)
+            .map(|(_, f)| f.payload)
+            .collect()
+    }
+
+    /// Bring up the fake controller and open one LE connection.
+    fn smp888_bring_up_connect(fake: &ScriptedTransport) -> Result<(), &'static str> {
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            return Err("bring-up against fake controller failed");
+        }
+        fake.enqueue_event(le_connection_complete(SMP888_HANDLE, SMP888_PEER6));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            return Err("pump did not track the LE connection");
         }
         Ok(())
     }
@@ -5569,4 +6152,962 @@ mod tests {
         "bluetooth/pump",
         smoke_pump_hogp_client_boot_mouse_and_undecoded
     );
+    /// #888: the pump initiates pairing, completes a Just Works LE
+    /// SC exchange against the independent peer model, auto-starts
+    /// encryption, distributes keys in §3.6.1 order (peer first,
+    /// then host), stores the bond, and answers a reconnect LTK
+    /// Request from the store. The peer-model f5 LTK is pinned
+    /// byte-for-byte in the Start Encryption command and the LTK
+    /// Request reply.
+    fn smoke_pump_smp_initiator_bonding_full_exchange() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            TestResult::Fail(msg)
+        };
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(m) = smp888_bring_up_connect(&fake) {
+            return fail(m);
+        }
+        // API guards: unknown handle, then the real trigger, then
+        // AlreadyPairing while the session is in flight.
+        if smp_initiate_pairing(0, 0x0001) != Some(Err(SmpInitiateError::UnknownHandle)) {
+            return fail("initiate on unknown handle did not fail UnknownHandle");
+        }
+        if smp_initiate_pairing(0, SMP888_HANDLE) != Some(Ok(())) {
+            return fail("initiate pairing failed");
+        }
+        if smp_initiate_pairing(0, SMP888_HANDLE) != Some(Err(SmpInitiateError::AlreadyPairing)) {
+            return fail("second initiate did not fail AlreadyPairing");
+        }
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let req = frames
+            .iter()
+            .find(|(h, f)| *h == SMP888_HANDLE && f.cid == CID_SMP)
+            .map(|(_, f)| f.payload.clone());
+        // Byte-exact Pairing Request: NoInputNoOutput, bonding|SC,
+        // IdKey|Sign offered and requested.
+        if req != Some(alloc::vec![0x01, 0x00, 0x00, 0x09, 16, 0x06, 0x06]) {
+            return fail("initiator Pairing Request bytes wrong");
+        }
+        // Peer (responder) answers: NoInputNoOutput, bonding|SC,
+        // IdKey|Sign both directions.
+        let rsp = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_PAIRING_RESPONSE,
+                &[0x00, 0x00, 0x09, 16, 0x06, 0x06],
+            )],
+            SMP888_HANDLE,
+        );
+        if rsp.len() != 1 || rsp[0].len() != 65 || rsp[0][0] != smp::SMP_PAIRING_PUBLIC_KEY {
+            return fail("initiator did not answer Response with a public key");
+        }
+        let mut pump_pk_x = [0u8; 32];
+        let mut pump_pk_y = [0u8; 32];
+        pump_pk_x.copy_from_slice(&rsp[0][1..33]);
+        pump_pk_y.copy_from_slice(&rsp[0][33..65]);
+        if pump_pk_x == [0u8; 32] {
+            return fail("initiator public key is zero (entropy seam not live)");
+        }
+        let peer_dh = peer_dhkey_wire(SMP888_PEER_PRIV, &pump_pk_x, &pump_pk_y);
+        let (peer_px, peer_py) = peer_public(SMP888_PEER_PRIV);
+        let peer_pk_x = fe_to_wire(&peer_px);
+        let peer_pk_y = fe_to_wire(&peer_py);
+        let mut peer_pk_payload = Vec::with_capacity(64);
+        peer_pk_payload.extend_from_slice(&peer_pk_x);
+        peer_pk_payload.extend_from_slice(&peer_pk_y);
+        let ca_frames = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_PAIRING_PUBLIC_KEY,
+                &peer_pk_payload,
+            )],
+            SMP888_HANDLE,
+        );
+        if ca_frames.len() != 1
+            || ca_frames[0].len() != 17
+            || ca_frames[0][0] != smp::SMP_PAIRING_CONFIRM
+        {
+            return fail("initiator did not answer public key with Confirm");
+        }
+        let ca = &ca_frames[0][1..17];
+        // Peer commits Cb and reveals Nb.
+        let nb: [u8; 16] = [0xBB; 16];
+        let cb = peer_f4(&sbox, &peer_pk_x, &pump_pk_x, &nb, 0);
+        let na_ea = smp888_step_acls(
+            &fake,
+            &[
+                smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_CONFIRM, &cb),
+                smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_RANDOM, &nb),
+            ],
+            SMP888_HANDLE,
+        );
+        if na_ea.len() != 2
+            || na_ea[0].len() != 17
+            || na_ea[0][0] != smp::SMP_PAIRING_RANDOM
+            || na_ea[1].len() != 17
+            || na_ea[1][0] != smp::SMP_PAIRING_DHKEY_CHECK
+        {
+            return fail("initiator did not answer Random with [Random, DHKey Check]");
+        }
+        let mut na = [0u8; 16];
+        na.copy_from_slice(&na_ea[0][1..17]);
+        if na == [0u8; 16] {
+            return fail("initiator nonce is zero (entropy seam not live)");
+        }
+        // Peer verifies Ca and Ea against the independent model —
+        // a wrong production f4/f6 fails the fixture here, not in
+        // a later byte comparison.
+        let want_ca = peer_f4(&sbox, &pump_pk_x, &peer_pk_x, &na, 0);
+        if ca != &want_ca[..] {
+            return fail("Ca mismatch: production f4 disagrees with the peer model");
+        }
+        let mac_key = peer_f5_mac_key(
+            &sbox,
+            &peer_dh,
+            &na,
+            &nb,
+            &SMP888_LOCAL_ADDR,
+            &SMP888_PEER_ADDR,
+        );
+        let want_ltk = peer_f5_ltk(
+            &sbox,
+            &peer_dh,
+            &na,
+            &nb,
+            &SMP888_LOCAL_ADDR,
+            &SMP888_PEER_ADDR,
+        );
+        let iocap_a: [u8; 3] = [0x09, 0x00, 0x00];
+        let want_ea = peer_f6(
+            &sbox,
+            &mac_key,
+            &F6Inputs {
+                n1: &na,
+                n2: &nb,
+                r: &[0u8; 16],
+                iocap: &iocap_a,
+                a1: &SMP888_LOCAL_ADDR,
+                a2: &SMP888_PEER_ADDR,
+            },
+        );
+        if na_ea[1][1..17] != want_ea[..] {
+            return fail("Ea mismatch: production f6 disagrees with the peer model");
+        }
+        // Peer answers with Eb. The initiator parks at
+        // AuthComplete and auto-starts encryption — no bond yet.
+        let iocap_b: [u8; 3] = [0x09, 0x00, 0x00];
+        let eb = peer_f6(
+            &sbox,
+            &mac_key,
+            &F6Inputs {
+                n1: &nb,
+                n2: &na,
+                r: &[0u8; 16],
+                iocap: &iocap_b,
+                a1: &SMP888_PEER_ADDR,
+                a2: &SMP888_LOCAL_ADDR,
+            },
+        );
+        let cmds_before = fake.sent_commands().len();
+        let eb_out = smp888_step_acls(
+            &fake,
+            &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_DHKEY_CHECK, &eb)],
+            SMP888_HANDLE,
+        );
+        if !eb_out.is_empty() {
+            return fail("initiator sent SMP PDUs at AuthComplete (must wait for encryption)");
+        }
+        if bond_count(0) != Some(0) {
+            return fail("bond stored before distribution (must wait for Phase 3)");
+        }
+        let new_cmds = &fake.sent_commands()[cmds_before..];
+        let start_enc = new_cmds
+            .iter()
+            .find(|c| c.opcode == op::HCI_LE_START_ENCRYPTION);
+        let mut want_start_enc = Vec::with_capacity(26);
+        want_start_enc.extend_from_slice(&SMP888_HANDLE.to_le_bytes());
+        want_start_enc.extend_from_slice(&[0u8; 8]);
+        want_start_enc.extend_from_slice(&0u16.to_le_bytes());
+        want_start_enc.extend_from_slice(&want_ltk);
+        match start_enc {
+            Some(cmd) if cmd.params == want_start_enc => {}
+            _ => return fail("initiator did not auto-start encryption with the f5 LTK"),
+        }
+        // Encryption reported: the initiator still sends nothing —
+        // the Peripheral (peer) distributes first (§3.6.1).
+        let after_enc = smp888_step_event(
+            &fake,
+            smp888_encryption_change_event(SMP888_HANDLE, 0, 1),
+            SMP888_HANDLE,
+        );
+        if !after_enc.is_empty() {
+            return fail("initiator distributed before the responder (order is Peripheral first)");
+        }
+        smp888_replenish(&fake, SMP888_HANDLE);
+        // Peer distributes IRK, identity address, CSRK in order;
+        // the first two steps emit nothing, the third releases
+        // the host's own distribution PDUs.
+        let irk_pin: [u8; 16] = [0xC0; 16];
+        let csrk_pin: [u8; 16] = [0xD0; 16];
+        let step1 = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_IDENTITY_INFORMATION,
+                &irk_pin,
+            )],
+            SMP888_HANDLE,
+        );
+        if !step1.is_empty() {
+            return fail("initiator answered Identity Information early");
+        }
+        let step2 = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_IDENTITY_ADDRESS_INFORMATION,
+                &SMP888_PEER_ADDR,
+            )],
+            SMP888_HANDLE,
+        );
+        if !step2.is_empty() {
+            return fail("initiator answered Identity Address early");
+        }
+        let step3 = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_SIGNING_INFORMATION,
+                &csrk_pin,
+            )],
+            SMP888_HANDLE,
+        );
+        if step3.len() != 3
+            || step3[0].len() != 17
+            || step3[0][0] != smp::SMP_IDENTITY_INFORMATION
+            || step3[0][1..17] == [0u8; 16]
+            || step3[1].len() != 8
+            || step3[1][0] != smp::SMP_IDENTITY_ADDRESS_INFORMATION
+            || step3[1][1..8] != SMP888_LOCAL_ADDR
+            || step3[2].len() != 17
+            || step3[2][0] != smp::SMP_SIGNING_INFORMATION
+            || step3[2][1..17] == [0u8; 16]
+        {
+            return fail("initiator distribution PDUs wrong (order/length/address/randomness)");
+        }
+        if bond_count(0) != Some(1) {
+            return fail("bond not stored after distribution completed");
+        }
+        // The stored bond answers a reconnect LTK Request.
+        let cmds_before = fake.sent_commands().len();
+        let _ = smp888_step_event(
+            &fake,
+            smp888_ltk_request_event(SMP888_HANDLE, 0, 0),
+            SMP888_HANDLE,
+        );
+        let new_cmds = &fake.sent_commands()[cmds_before..];
+        let reply = new_cmds
+            .iter()
+            .find(|c| c.opcode == op::HCI_LE_LTK_REQUEST_REPLY);
+        let mut want_reply = Vec::with_capacity(18);
+        want_reply.extend_from_slice(&SMP888_HANDLE.to_le_bytes());
+        want_reply.extend_from_slice(&want_ltk);
+        match reply {
+            Some(cmd) if cmd.params == want_reply => {}
+            _ => return fail("stored bond did not answer LTK Request with the f5 LTK"),
+        }
+        if forget_bond(0, &SMP888_PEER_ADDR) != Some(true) {
+            return fail("forget_bond did not remove the bond");
+        }
+        let cmds_before = fake.sent_commands().len();
+        let _ = smp888_step_event(
+            &fake,
+            smp888_ltk_request_event(SMP888_HANDLE, 0, 0),
+            SMP888_HANDLE,
+        );
+        let new_cmds = &fake.sent_commands()[cmds_before..];
+        if !new_cmds
+            .iter()
+            .any(|c| c.opcode == op::HCI_LE_LTK_REQUEST_NEGATIVE_REPLY)
+        {
+            return fail("forgotten bond still answered LTK Request");
+        }
+        if forget_bond(0, &SMP888_PEER_ADDR) != Some(false) {
+            return fail("forget_bond on unknown peer did not return false");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_initiator_bonding_full_exchange
+    );
+
+    /// #888: responder pairing with distribution. The LTK Request
+    /// that arrives while the session is AuthComplete is answered
+    /// from the session (before any bond exists); after encryption
+    /// the responder distributes first, the peer's keys complete
+    /// the bond, and the bond survives disconnect and answers a
+    /// fresh connection's re-encryption.
+    fn smoke_pump_smp_responder_distribution_and_reencrypt() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            TestResult::Fail(msg)
+        };
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(m) = smp888_bring_up_connect(&fake) {
+            return fail(m);
+        }
+        // Peer requests pairing with IdKey|Sign both directions.
+        let rsp = smp888_step_acls(
+            &fake,
+            &[smp888_request_acl(SMP888_HANDLE, 0x06, 0x06)],
+            SMP888_HANDLE,
+        );
+        // Byte-exact Pairing Response: DisplayYesNo, bonding|SC|
+        // MITM, IdKey|Sign both directions.
+        if rsp.len() != 1 || rsp[0] != alloc::vec![0x02, 0x01, 0x00, 0x0D, 16, 0x06, 0x06] {
+            return fail("responder Pairing Response bytes wrong");
+        }
+        let (peer_px, peer_py) = peer_public(SMP888_PEER_PRIV);
+        let peer_pk_x = fe_to_wire(&peer_px);
+        let peer_pk_y = fe_to_wire(&peer_py);
+        let mut peer_pk_payload = Vec::with_capacity(64);
+        peer_pk_payload.extend_from_slice(&peer_pk_x);
+        peer_pk_payload.extend_from_slice(&peer_pk_y);
+        let pk_out = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_PAIRING_PUBLIC_KEY,
+                &peer_pk_payload,
+            )],
+            SMP888_HANDLE,
+        );
+        if pk_out.len() != 1 || pk_out[0].len() != 65 || pk_out[0][0] != smp::SMP_PAIRING_PUBLIC_KEY
+        {
+            return fail("responder did not answer public key with its public key");
+        }
+        let mut pump_pk_x = [0u8; 32];
+        let mut pump_pk_y = [0u8; 32];
+        pump_pk_x.copy_from_slice(&pk_out[0][1..33]);
+        pump_pk_y.copy_from_slice(&pk_out[0][33..65]);
+        let peer_dh = peer_dhkey_wire(SMP888_PEER_PRIV, &pump_pk_x, &pump_pk_y);
+        // Peer commits Ca and the pump answers [Cb, Nb].
+        let na: [u8; 16] = [0xAA; 16];
+        let ca = peer_f4(&sbox, &peer_pk_x, &pump_pk_x, &na, 0);
+        let cb_nb = smp888_step_acls(
+            &fake,
+            &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_CONFIRM, &ca)],
+            SMP888_HANDLE,
+        );
+        if cb_nb.len() != 2
+            || cb_nb[0].len() != 17
+            || cb_nb[0][0] != smp::SMP_PAIRING_CONFIRM
+            || cb_nb[1].len() != 17
+            || cb_nb[1][0] != smp::SMP_PAIRING_RANDOM
+        {
+            return fail("responder did not answer Confirm with [Confirm, Random]");
+        }
+        let mut nb = [0u8; 16];
+        nb.copy_from_slice(&cb_nb[1][1..17]);
+        let want_cb = peer_f4(&sbox, &pump_pk_x, &peer_pk_x, &nb, 0);
+        if cb_nb[0][1..17] != want_cb[..] {
+            return fail("Cb mismatch: production f4 disagrees with the peer model");
+        }
+        // Peer reveals Na; the responder emits nothing yet.
+        let none = smp888_step_acls(
+            &fake,
+            &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_RANDOM, &na)],
+            SMP888_HANDLE,
+        );
+        if !none.is_empty() {
+            return fail("responder emitted PDUs on the Na step");
+        }
+        let mac_key = peer_f5_mac_key(
+            &sbox,
+            &peer_dh,
+            &na,
+            &nb,
+            &SMP888_PEER_ADDR,
+            &SMP888_LOCAL_ADDR,
+        );
+        let want_ltk = peer_f5_ltk(
+            &sbox,
+            &peer_dh,
+            &na,
+            &nb,
+            &SMP888_PEER_ADDR,
+            &SMP888_LOCAL_ADDR,
+        );
+        let iocap_a: [u8; 3] = [0x09, 0x00, 0x00];
+        let ea = peer_f6(
+            &sbox,
+            &mac_key,
+            &F6Inputs {
+                n1: &na,
+                n2: &nb,
+                r: &[0u8; 16],
+                iocap: &iocap_a,
+                a1: &SMP888_PEER_ADDR,
+                a2: &SMP888_LOCAL_ADDR,
+            },
+        );
+        let eb_out = smp888_step_acls(
+            &fake,
+            &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_DHKEY_CHECK, &ea)],
+            SMP888_HANDLE,
+        );
+        if eb_out.len() != 1
+            || eb_out[0].len() != 17
+            || eb_out[0][0] != smp::SMP_PAIRING_DHKEY_CHECK
+        {
+            return fail("responder did not answer DHKey Check with Eb");
+        }
+        let iocap_b: [u8; 3] = [0x0D, 0x00, 0x01];
+        let want_eb = peer_f6(
+            &sbox,
+            &mac_key,
+            &F6Inputs {
+                n1: &nb,
+                n2: &na,
+                r: &[0u8; 16],
+                iocap: &iocap_b,
+                a1: &SMP888_LOCAL_ADDR,
+                a2: &SMP888_PEER_ADDR,
+            },
+        );
+        if eb_out[0][1..17] != want_eb[..] {
+            return fail("Eb mismatch: production f6 disagrees with the peer model");
+        }
+        // AuthComplete: no bond yet, but the session answers the
+        // peer's LTK Request with the just-derived LTK.
+        if bond_count(0) != Some(0) {
+            return fail("bond stored before distribution (must wait for Phase 3)");
+        }
+        let cmds_before = fake.sent_commands().len();
+        let _ = smp888_step_event(
+            &fake,
+            smp888_ltk_request_event(SMP888_HANDLE, 0, 0),
+            SMP888_HANDLE,
+        );
+        let new_cmds = &fake.sent_commands()[cmds_before..];
+        let reply = new_cmds
+            .iter()
+            .find(|c| c.opcode == op::HCI_LE_LTK_REQUEST_REPLY);
+        let mut want_reply = Vec::with_capacity(18);
+        want_reply.extend_from_slice(&SMP888_HANDLE.to_le_bytes());
+        want_reply.extend_from_slice(&want_ltk);
+        match reply {
+            Some(cmd) if cmd.params == want_reply => {}
+            _ => return fail("AuthComplete session did not answer LTK Request with the f5 LTK"),
+        }
+        // Encryption reported: the responder (Peripheral)
+        // distributes first.
+        smp888_replenish(&fake, SMP888_HANDLE);
+        let dist = smp888_step_event(
+            &fake,
+            smp888_encryption_change_event(SMP888_HANDLE, 0, 1),
+            SMP888_HANDLE,
+        );
+        if dist.len() != 3
+            || dist[0].len() != 17
+            || dist[0][0] != smp::SMP_IDENTITY_INFORMATION
+            || dist[0][1..17] == [0u8; 16]
+            || dist[1].len() != 8
+            || dist[1][0] != smp::SMP_IDENTITY_ADDRESS_INFORMATION
+            || dist[1][1..8] != SMP888_LOCAL_ADDR
+            || dist[2].len() != 17
+            || dist[2][0] != smp::SMP_SIGNING_INFORMATION
+            || dist[2][1..17] == [0u8; 16]
+        {
+            return fail("responder distribution PDUs wrong (order/length/address/randomness)");
+        }
+        // Peer distributes; the responder completes and stores.
+        let irk_pin: [u8; 16] = [0xC0; 16];
+        let csrk_pin: [u8; 16] = [0xD0; 16];
+        let done = smp888_step_acls(
+            &fake,
+            &[
+                smp888_acl(SMP888_HANDLE, smp::SMP_IDENTITY_INFORMATION, &irk_pin),
+                smp888_acl(
+                    SMP888_HANDLE,
+                    smp::SMP_IDENTITY_ADDRESS_INFORMATION,
+                    &SMP888_PEER_ADDR,
+                ),
+                smp888_acl(SMP888_HANDLE, smp::SMP_SIGNING_INFORMATION, &csrk_pin),
+            ],
+            SMP888_HANDLE,
+        );
+        if !done.is_empty() {
+            return fail("responder sent PDUs after distribution completed");
+        }
+        if bond_count(0) != Some(1) {
+            return fail("bond not stored after responder distribution completed");
+        }
+        // Mismatched diversifier must not match the SC bond.
+        let cmds_before = fake.sent_commands().len();
+        let _ = smp888_step_event(
+            &fake,
+            smp888_ltk_request_event(SMP888_HANDLE, 0, 0x1234),
+            SMP888_HANDLE,
+        );
+        let new_cmds = &fake.sent_commands()[cmds_before..];
+        if !new_cmds
+            .iter()
+            .any(|c| c.opcode == op::HCI_LE_LTK_REQUEST_NEGATIVE_REPLY)
+        {
+            return fail("mismatched EDIV answered with an LTK");
+        }
+        // Disconnect: the bond survives. Reconnect on a fresh
+        // handle and re-encrypt from the store.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x40, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(0) || bond_count(0) != Some(1) {
+            return fail("bond did not survive disconnect");
+        }
+        let handle2: u16 = 0x0041;
+        fake.enqueue_event(le_connection_complete(handle2, SMP888_PEER6));
+        let _ = pump_once(0);
+        if smp_start_encryption(0, handle2) != Some(Ok(())) {
+            return fail("re-encrypt from stored bond failed");
+        }
+        let cmds = fake.sent_commands();
+        let start_enc = cmds
+            .iter()
+            .rev()
+            .find(|c| c.opcode == op::HCI_LE_START_ENCRYPTION);
+        let mut want_start_enc = Vec::with_capacity(26);
+        want_start_enc.extend_from_slice(&handle2.to_le_bytes());
+        want_start_enc.extend_from_slice(&[0u8; 8]);
+        want_start_enc.extend_from_slice(&0u16.to_le_bytes());
+        want_start_enc.extend_from_slice(&want_ltk);
+        match start_enc {
+            Some(cmd) if cmd.params == want_start_enc => {}
+            _ => return fail("re-encrypt did not issue Start Encryption with the stored LTK"),
+        }
+        // Unknown handle / unknown peer guards.
+        if smp_start_encryption(0, 0x0001) != Some(Err(SmpEncryptError::UnknownHandle)) {
+            return fail("re-encrypt on unknown handle did not fail UnknownHandle");
+        }
+        let handle3: u16 = 0x0042;
+        fake.enqueue_event(le_connection_complete(
+            handle3,
+            [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5],
+        ));
+        let _ = pump_once(0);
+        if smp_start_encryption(0, handle3) != Some(Err(SmpEncryptError::NoBond)) {
+            return fail("re-encrypt for unbonded peer did not fail NoBond");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_responder_distribution_and_reencrypt
+    );
+
+    /// #888: a peer Security Request starts an initiator pairing
+    /// (Part H §3.6.7), and the live session refuses a second
+    /// application trigger.
+    fn smoke_pump_smp_security_request_starts_initiator() -> TestResult {
+        reset_all();
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            TestResult::Fail(msg)
+        };
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(m) = smp888_bring_up_connect(&fake) {
+            return fail(m);
+        }
+        let out = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_SECURITY_REQUEST,
+                &[0x09],
+            )],
+            SMP888_HANDLE,
+        );
+        if out.len() != 1 || out[0] != alloc::vec![0x01, 0x00, 0x00, 0x09, 16, 0x06, 0x06] {
+            return fail("Security Request did not produce the initiator Pairing Request");
+        }
+        if smp_initiate_pairing(0, SMP888_HANDLE) != Some(Err(SmpInitiateError::AlreadyPairing)) {
+            return fail("initiate during Security-Request session did not fail AlreadyPairing");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_security_request_starts_initiator
+    );
+
+    /// #888, state-machine level: production Initiator against
+    /// production Responder with distribution negotiated both
+    /// ways. The responder distributes first; each side's stored
+    /// peer keys must equal the exact PDU bytes the other side
+    /// emitted (captured bytes, not self-agreement); both sides
+    /// reach Done bonded with identical LTKs.
+    fn smoke_smp_distribution_initiator_responder_exchange() -> TestResult {
+        reset_all();
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            TestResult::Fail(msg)
+        };
+        let mut initiator = Initiator::new(NarfSmpCrypto, SMP_IAT, SMP_RAT);
+        let mut responder = Responder::new(NarfSmpCrypto, SMP_IAT, SMP_RAT);
+        let req = initiator.start();
+        let out = match responder.feed(&req) {
+            Ok(out) => out,
+            Err(_) => return fail("responder rejected the pairing request"),
+        };
+        if out.len() != 1 || out[0].code != smp::SMP_PAIRING_RESPONSE {
+            return fail("responder did not answer with Pairing Response");
+        }
+        let out = match initiator.feed(&out[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("initiator rejected the pairing response"),
+        };
+        if out.len() != 1 || out[0].code != smp::SMP_PAIRING_PUBLIC_KEY {
+            return fail("initiator did not answer with its public key");
+        }
+        let out = match responder.feed(&out[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("responder rejected the initiator public key"),
+        };
+        if out.len() != 1 || out[0].code != smp::SMP_PAIRING_PUBLIC_KEY {
+            return fail("responder did not answer with its public key");
+        }
+        let out = match initiator.feed(&out[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("initiator rejected the responder public key"),
+        };
+        if out.len() != 1 || out[0].code != smp::SMP_PAIRING_CONFIRM {
+            return fail("initiator did not answer with Confirm");
+        }
+        let cb_nb = match responder.feed(&out[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("responder rejected the initiator confirm"),
+        };
+        if cb_nb.len() != 2
+            || cb_nb[0].code != smp::SMP_PAIRING_CONFIRM
+            || cb_nb[1].code != smp::SMP_PAIRING_RANDOM
+        {
+            return fail("responder did not answer Confirm with [Confirm, Random]");
+        }
+        let out = match initiator.feed(&cb_nb[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("initiator rejected the responder confirm"),
+        };
+        if !out.is_empty() {
+            return fail("initiator emitted PDUs on the confirm step");
+        }
+        let na_ea = match initiator.feed(&cb_nb[1]) {
+            Ok(out) => out,
+            Err(_) => return fail("initiator rejected the responder random"),
+        };
+        if na_ea.len() != 2
+            || na_ea[0].code != smp::SMP_PAIRING_RANDOM
+            || na_ea[1].code != smp::SMP_PAIRING_DHKEY_CHECK
+        {
+            return fail("initiator did not answer Random with [Random, DHKey Check]");
+        }
+        let out = match responder.feed(&na_ea[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("responder rejected the initiator random"),
+        };
+        if !out.is_empty() {
+            return fail("responder emitted PDUs on the random step");
+        }
+        let eb = match responder.feed(&na_ea[1]) {
+            Ok(out) => out,
+            Err(_) => return fail("responder rejected the initiator DHKey Check"),
+        };
+        if eb.len() != 1 || eb[0].code != smp::SMP_PAIRING_DHKEY_CHECK {
+            return fail("responder did not answer with Eb");
+        }
+        let out = match initiator.feed(&eb[0]) {
+            Ok(out) => out,
+            Err(_) => return fail("initiator rejected Eb"),
+        };
+        if !out.is_empty() {
+            return fail("initiator emitted PDUs on the Eb step");
+        }
+        if initiator.state != smp::PairingState::AuthComplete
+            || responder.state != smp::ResponderState::AuthComplete
+        {
+            return fail("both sides did not park at AuthComplete with distribution pending");
+        }
+        // Responder distributes first.
+        let r_dist = responder.begin_distribution();
+        if r_dist.len() != 3
+            || r_dist[0].code != smp::SMP_IDENTITY_INFORMATION
+            || r_dist[0].payload.len() != 16
+            || r_dist[1].code != smp::SMP_IDENTITY_ADDRESS_INFORMATION
+            || r_dist[1].payload.len() != 7
+            || r_dist[2].code != smp::SMP_SIGNING_INFORMATION
+            || r_dist[2].payload.len() != 16
+        {
+            return fail("responder distribution PDUs wrong");
+        }
+        if responder.state != smp::ResponderState::WaitDistribution {
+            return fail("responder did not park in WaitDistribution");
+        }
+        // Initiator waits while expecting responder keys.
+        if !initiator.begin_distribution().is_empty()
+            || initiator.state != smp::PairingState::WaitDistribution
+        {
+            return fail("initiator did not wait for responder keys");
+        }
+        let mut i_out = Vec::new();
+        for pdu in &r_dist {
+            match initiator.feed(pdu) {
+                Ok(out) => i_out = out,
+                Err(_) => return fail("initiator rejected a responder distribution PDU"),
+            }
+        }
+        if initiator.state != smp::PairingState::Done || i_out.len() != 3 {
+            return fail("initiator did not complete with its own distribution PDUs");
+        }
+        // Captured-byte checks: stored peer keys equal the PDUs
+        // the responder actually emitted.
+        if initiator.peer_irk
+            != Some({
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&r_dist[0].payload);
+                b
+            })
+            || initiator.peer_identity_addr
+                != Some({
+                    let mut b = [0u8; 7];
+                    b.copy_from_slice(&r_dist[1].payload);
+                    b
+                })
+            || initiator.peer_csrk
+                != Some({
+                    let mut b = [0u8; 16];
+                    b.copy_from_slice(&r_dist[2].payload);
+                    b
+                })
+        {
+            return fail("initiator stored peer keys differ from the emitted PDUs");
+        }
+        // Responder consumes the initiator's PDUs the same way.
+        for pdu in &i_out {
+            match responder.feed(pdu) {
+                Ok(out) => {
+                    if !out.is_empty() {
+                        return fail("responder emitted PDUs on distribution intake");
+                    }
+                }
+                Err(_) => return fail("responder rejected an initiator distribution PDU"),
+            }
+        }
+        if responder.state != smp::ResponderState::Done {
+            return fail("responder did not complete after initiator distribution");
+        }
+        if responder.peer_irk
+            != Some({
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&i_out[0].payload);
+                b
+            })
+            || responder.peer_identity_addr
+                != Some({
+                    let mut b = [0u8; 7];
+                    b.copy_from_slice(&i_out[1].payload);
+                    b
+                })
+            || responder.peer_csrk
+                != Some({
+                    let mut b = [0u8; 16];
+                    b.copy_from_slice(&i_out[2].payload);
+                    b
+                })
+        {
+            return fail("responder stored peer keys differ from the emitted PDUs");
+        }
+        if !initiator.bonded || !responder.bonded || initiator.ltk != responder.ltk {
+            return fail("bonded LTKs disagree between the two sides");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_smp_distribution_initiator_responder_exchange
+    );
+
+    /// #888: distribution before encryption fails the pairing, and
+    /// a failed encryption clears an AuthComplete session — both
+    /// proven by a fresh Pairing Request starting a new pairing
+    /// afterwards (a live session would answer Protocol instead).
+    fn smoke_pump_smp_authcomplete_failure_paths() -> TestResult {
+        // Abbreviated responder drive to AuthComplete: only step
+        // shapes are asserted here; the full byte-verified
+        // exchange is the previous fixture's job. Split so a
+        // fresh request can double as the "session cleared" proof
+        // and the rest of the drive continues from it.
+        fn drive_request(fake: &ScriptedTransport) -> Result<(), &'static str> {
+            smp888_replenish(fake, SMP888_HANDLE);
+            let rsp = smp888_step_acls(
+                fake,
+                &[smp888_request_acl(SMP888_HANDLE, 0x06, 0x06)],
+                SMP888_HANDLE,
+            );
+            if rsp.len() != 1 || rsp[0][0] != smp::SMP_PAIRING_RESPONSE {
+                return Err("responder did not answer Pairing Request");
+            }
+            Ok(())
+        }
+        fn drive_rest(fake: &ScriptedTransport, sbox: &[u8; 256]) -> Result<(), &'static str> {
+            smp888_replenish(fake, SMP888_HANDLE);
+            let (peer_px, peer_py) = peer_public(SMP888_PEER_PRIV);
+            let peer_pk_x = fe_to_wire(&peer_px);
+            let peer_pk_y = fe_to_wire(&peer_py);
+            let mut peer_pk_payload = Vec::with_capacity(64);
+            peer_pk_payload.extend_from_slice(&peer_pk_x);
+            peer_pk_payload.extend_from_slice(&peer_pk_y);
+            let pk_out = smp888_step_acls(
+                fake,
+                &[smp888_acl(
+                    SMP888_HANDLE,
+                    smp::SMP_PAIRING_PUBLIC_KEY,
+                    &peer_pk_payload,
+                )],
+                SMP888_HANDLE,
+            );
+            if pk_out.len() != 1 || pk_out[0].len() != 65 {
+                return Err("responder public key step wrong");
+            }
+            let mut pump_pk_x = [0u8; 32];
+            let mut pump_pk_y = [0u8; 32];
+            pump_pk_x.copy_from_slice(&pk_out[0][1..33]);
+            pump_pk_y.copy_from_slice(&pk_out[0][33..65]);
+            let peer_dh = peer_dhkey_wire(SMP888_PEER_PRIV, &pump_pk_x, &pump_pk_y);
+            let na: [u8; 16] = [0xAA; 16];
+            let ca = peer_f4(sbox, &peer_pk_x, &pump_pk_x, &na, 0);
+            let cb_nb = smp888_step_acls(
+                fake,
+                &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_CONFIRM, &ca)],
+                SMP888_HANDLE,
+            );
+            if cb_nb.len() != 2 {
+                return Err("responder Confirm step wrong");
+            }
+            let mut nb = [0u8; 16];
+            nb.copy_from_slice(&cb_nb[1][1..17]);
+            let _ = smp888_step_acls(
+                fake,
+                &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_RANDOM, &na)],
+                SMP888_HANDLE,
+            );
+            let mac_key = peer_f5_mac_key(
+                sbox,
+                &peer_dh,
+                &na,
+                &nb,
+                &SMP888_PEER_ADDR,
+                &SMP888_LOCAL_ADDR,
+            );
+            let iocap_a: [u8; 3] = [0x09, 0x00, 0x00];
+            let ea = peer_f6(
+                sbox,
+                &mac_key,
+                &F6Inputs {
+                    n1: &na,
+                    n2: &nb,
+                    r: &[0u8; 16],
+                    iocap: &iocap_a,
+                    a1: &SMP888_PEER_ADDR,
+                    a2: &SMP888_LOCAL_ADDR,
+                },
+            );
+            let eb_out = smp888_step_acls(
+                fake,
+                &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_DHKEY_CHECK, &ea)],
+                SMP888_HANDLE,
+            );
+            if eb_out.len() != 1 || eb_out[0][0] != smp::SMP_PAIRING_DHKEY_CHECK {
+                return Err("responder Eb step wrong");
+            }
+            Ok(())
+        }
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            TestResult::Fail(msg)
+        };
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(m) = smp888_bring_up_connect(&fake) {
+            return fail(m);
+        }
+        if let Err(m) = drive_request(&fake).and_then(|_| drive_rest(&fake, &sbox)) {
+            return fail(m);
+        }
+        // Early distribution PDU: Pairing Failed 0x08.
+        let early = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_IDENTITY_INFORMATION,
+                &[0xC0; 16],
+            )],
+            SMP888_HANDLE,
+        );
+        if early.len() != 1
+            || early[0] != alloc::vec![smp::SMP_PAIRING_FAILED, smp::SMP_FAILED_UNSPECIFIED]
+        {
+            return fail("early distribution PDU did not fail the pairing with 0x08");
+        }
+        if bond_count(0) != Some(0) {
+            return fail("bond stored after failed pairing");
+        }
+        // Fresh request starts a new pairing (session cleared),
+        // and the rest of the drive reaches AuthComplete again.
+        if let Err(m) = drive_request(&fake).and_then(|_| drive_rest(&fake, &sbox)) {
+            return fail(m);
+        }
+        // Failed encryption clears the session silently.
+        let cleared = smp888_step_event(
+            &fake,
+            smp888_encryption_change_event(SMP888_HANDLE, 0x01, 1),
+            SMP888_HANDLE,
+        );
+        if !cleared.is_empty() || bond_count(0) != Some(0) {
+            return fail("failed encryption produced PDUs or a bond");
+        }
+        if let Err(m) = drive_request(&fake) {
+            return fail(m);
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_smp_authcomplete_failure_paths);
 }

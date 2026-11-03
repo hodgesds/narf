@@ -36,6 +36,7 @@ extern crate alloc;
 pub mod att;
 pub mod avdtp;
 pub mod avrcp;
+pub mod bond_store;
 /// Intel PCIe-attached Bluetooth controllers (Lunar Lake onward).
 /// Needs the PCIe bus, so x86_64 only for now.
 #[cfg(target_arch = "x86_64")]
