@@ -1103,7 +1103,25 @@ EP0 transfer/executable-cap discipline; chip steps live in
   rotation over 4, exclusive claim. A mailbox still busy after 101 polls is
   `MailboxBusy` (Linux proceeds because its `!retry` test sees -1).
 
-The owner currently stops at `FirmwareReady` for RTL8192EU. The production
+- Tables (`rtl8xxxu/rtl8192e_tables.rs`, generated verbatim by
+  `rtl8xxxu/gen_rtl8192e_tables.py` from `8192e.c`): MAC 101, PHY 212,
+  AGC std/high-PA 130 each, RF A 110, RF B 90 rows (+ Linux sentinel).
+  `hi_pa` is never set for 8192EU, so only the standard AGC table applies.
+- `rtl8192e_phy::mac_bb_rf` (`rtl8xxxu_init_device` init_mac → HIMR):
+  MAC table, `rtl8192eu_init_phy_bb` + PHY/AGC, the RTL8191EU 1T2R path-B
+  patch of `rtl8xxxu_init_phy_bb`, `rtl8723a_set_crystal_cap` (XTAL1/XTAL0
+  of `REG_MAC_PHY_CTRL`, skipped for cap 0 like the zeroed CFO state),
+  `REG_AFE_XTAL_CTRL = 0x000f81fb`, both RF paths via
+  `rtl8xxxu_init_phy_rf` with the RTL8192E `FPGA0_POWER_SAVE` bit-17
+  bracket in `rtl8xxxu_write_rfreg`, RF switch control with PAPE, TX buffer
+  boundary `0xf4`, auto LLT (checked), gen2 USB quirk, no `REG_PBP`,
+  `RX_DRVINFO_SZ = 4`, `HIMR0/1 = 0`.
+- TX power (`rtl8192e_set_tx_power`): gen2 channel groups; path A uses
+  diff index 0 and path B index 1 (Linux's shared `tx_idx`); `u8 += s8`
+  wraps. Implemented as `rtl8192e_phy::{tx_power, set_tx_power}`; it is not
+  yet invoked by the owner (the post-table MAC stage calls it in Linux).
+
+The owner currently stops at `TablesReady` for RTL8192EU. The production
 probe stays detection-only for this family; no table, calibration, packet
 or station capability is advertised.
 
@@ -1151,7 +1169,7 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 | Prerequisite | State |
 |---|---|
 | RTL8188EU power + EP0 firmware lifecycle | Implemented; shared-path regressions |
-| RTL8192EU runtime initialization | Identity/EFUSE/power/firmware/H2C implemented; tables, IQK, TX/RX, RA, signed records and station missing |
+| RTL8192EU runtime initialization | Identity/EFUSE/power/firmware/H2C and MAC/BB/RF tables + TX power implemented; post-table MAC, gen2 channel/bandwidth, IQK/LCK, TX/RX, RA, signed records and station missing |
 | RTL8723BU / RTL8821CU / RTL8822BU runtime initialization | Missing |
 | EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented with retained RX filter/MAC activation |

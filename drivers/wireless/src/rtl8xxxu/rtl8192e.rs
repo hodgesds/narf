@@ -23,8 +23,7 @@
 
 #![allow(dead_code)]
 
-use super::phy::{IqkStep, Reg32Val};
-use super::phy_tables::{MacRow, RfRow};
+use super::phy::IqkStep;
 use super::regs::*;
 use super::usb::UsbControlSetup;
 
@@ -61,26 +60,20 @@ pub const REG_8192E_LDOV12_CTRL: u16 = 0x0014;
 /// LDO 1.2V enable bit.
 pub const LDOV12_ENABLE: u8 = 0x01;
 
-// ── Row-count constants ───────────────────────────────────────────
+// ── Row-count constants (Linux tables, sentinel excluded) ─────────
 
-/// Row count of `rtl8192e_mac_init_table[]` excluding sentinel.
-/// Source: `8192e.c` L19..L48.
-pub const N_MAC_ROWS: usize = 99;
-/// Row count of `rtl8192eu_phy_init_table[]`.
-/// Source: `8192e.c` L49..L180.
-pub const N_PHY_ROWS: usize = 260;
-/// Row count of `rtl8xxx_agc_8192eu_std_table[]`.
-/// Source: `8192e.c` L181..L249.
-pub const N_AGC_STD_ROWS: usize = 135;
-/// Row count of `rtl8xxx_agc_8192eu_highpa_table[]`.
-/// Source: `8192e.c` L250..L318.
-pub const N_AGC_HIGHPA_ROWS: usize = 135;
-/// Row count of `rtl8192eu_radioa_init_table[]`.
-/// Source: `8192e.c` L319..L398.
-pub const N_RF_A_ROWS: usize = 155;
-/// Row count of `rtl8192eu_radiob_init_table[]`.
-/// Source: `8192e.c` L399..L470.
-pub const N_RF_B_ROWS: usize = 140;
+/// Rows of `rtl8192e_mac_init_table[]`.
+pub const N_MAC_ROWS: usize = MAC_INIT_TABLE.len() - 1;
+/// Rows of `rtl8192eu_phy_init_table[]`.
+pub const N_PHY_ROWS: usize = PHY_INIT_TABLE.len() - 1;
+/// Rows of `rtl8xxx_agc_8192eu_std_table[]`.
+pub const N_AGC_STD_ROWS: usize = AGC_STD_TABLE.len() - 1;
+/// Rows of `rtl8xxx_agc_8192eu_highpa_table[]`.
+pub const N_AGC_HIGHPA_ROWS: usize = AGC_HIGHPA_TABLE.len() - 1;
+/// Rows of `rtl8192eu_radioa_init_table[]`.
+pub const N_RF_A_ROWS: usize = RADIO_A_INIT_TABLE.len() - 1;
+/// Rows of `rtl8192eu_radiob_init_table[]`.
+pub const N_RF_B_ROWS: usize = RADIO_B_INIT_TABLE.len() - 1;
 
 /// Stage 0 / 1 register init table for RTL8192EU.
 pub const INIT_TABLE: &[(u16, u8)] = &[
@@ -95,25 +88,12 @@ pub fn stage0_register_bank() -> &'static [(u16, u8)] {
     INIT_TABLE
 }
 
-// ── Per-chip table sentinels (populated from Linux source ranges) ──
+// ── Per-chip tables (generated verbatim from `8192e.c`) ───────────
 
-/// MAC init table. Source: `8192e.c` L19..L48.
-pub const MAC_INIT_TABLE: &[MacRow] = &[MacRow::SENTINEL];
-
-/// PHY/BB init table. Source: `8192e.c` L49..L180.
-pub const PHY_INIT_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
-
-/// Standard AGC table. Source: `8192e.c` L181..L249.
-pub const AGC_STD_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
-
-/// High-PA AGC table. Source: `8192e.c` L250..L318.
-pub const AGC_HIGHPA_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
-
-/// RF path A init table. Source: `8192e.c` L319..L398.
-pub const RADIO_A_INIT_TABLE: &[RfRow] = &[RfRow::SENTINEL];
-
-/// RF path B init table. Source: `8192e.c` L399..L470.
-pub const RADIO_B_INIT_TABLE: &[RfRow] = &[RfRow::SENTINEL];
+pub use super::rtl8192e_tables::{
+    AGC_HIGHPA_TABLE, AGC_STD_TABLE, MAC_INIT_TABLE, PHY_INIT_TABLE, RADIO_A_INIT_TABLE,
+    RADIO_B_INIT_TABLE,
+};
 
 /// Path count for this chip. 8192EU is 2T2R.
 pub const NUM_RF_PATHS: usize = 2;

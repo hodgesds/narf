@@ -638,20 +638,20 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8188eu_per_chip);
 fn smoke_rtl8xxxu_8192eu_per_chip() -> TestResult {
     use super::rtl8192e;
 
-    if rtl8192e::N_MAC_ROWS != 99 {
-        return TestResult::Fail("8192e N_MAC_ROWS != 99");
+    if rtl8192e::N_MAC_ROWS != 101 {
+        return TestResult::Fail("8192e N_MAC_ROWS != 101");
     }
-    if rtl8192e::N_PHY_ROWS != 260 {
-        return TestResult::Fail("8192e N_PHY_ROWS != 260");
+    if rtl8192e::N_PHY_ROWS != 212 {
+        return TestResult::Fail("8192e N_PHY_ROWS != 212");
     }
-    if rtl8192e::N_AGC_STD_ROWS != 135 {
-        return TestResult::Fail("8192e N_AGC_STD_ROWS != 135");
+    if rtl8192e::N_AGC_STD_ROWS != 130 {
+        return TestResult::Fail("8192e N_AGC_STD_ROWS != 130");
     }
-    if rtl8192e::N_RF_A_ROWS != 155 {
-        return TestResult::Fail("8192e N_RF_A_ROWS != 155");
+    if rtl8192e::N_RF_A_ROWS != 110 {
+        return TestResult::Fail("8192e N_RF_A_ROWS != 110");
     }
-    if rtl8192e::N_RF_B_ROWS != 140 {
-        return TestResult::Fail("8192e N_RF_B_ROWS != 140");
+    if rtl8192e::N_RF_B_ROWS != 90 {
+        return TestResult::Fail("8192e N_RF_B_ROWS != 90");
     }
     if rtl8192e::NUM_RF_PATHS != 2 {
         return TestResult::Fail("8192e is 2T2R");
@@ -698,8 +698,8 @@ fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
     if rtl8723b::N_PHY_ROWS != 200 {
         return TestResult::Fail("8723b N_PHY_ROWS != 200");
     }
-    if rtl8723b::N_RF_A_ROWS != 155 {
-        return TestResult::Fail("8723b N_RF_A_ROWS != 155");
+    if rtl8723b::N_RF_A_ROWS != 110 {
+        return TestResult::Fail("8723b N_RF_A_ROWS != 110");
     }
     if rtl8723b::NUM_RF_PATHS != 1 {
         return TestResult::Fail("8723b is 1T1R");

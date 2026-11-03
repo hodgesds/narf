@@ -16,6 +16,10 @@ use super::regs::*;
 use super::rtl8192e_init::{
     self as init, h2c_words, parse_efuse, parse_identity, queue_map, reserved_pages, Queues, Vendor,
 };
+use super::rtl8192e_phy::{channel_group, tx_power, XAB_RF_SW_CTRL};
+use super::rtl8192e_tables::{
+    AGC_STD_TABLE, PHY_INIT_TABLE, RADIO_A_INIT_TABLE, RADIO_B_INIT_TABLE,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Op {
@@ -151,6 +155,9 @@ impl ControlIo for Fake {
             if g.regs[a] & MCU_FW_DL_READY != 0 {
                 g.regs[a] |= MCU_WINT_INIT_READY as u8;
             }
+        }
+        if addr == 0x224 && out.len() == 4 {
+            g.regs[0x226] &= !1; // auto-LLT completes
         }
         if addr == REG_HMTFR && g.mailbox_stuck {
             g.regs[a] = 0x0f;
@@ -361,8 +368,8 @@ fn smoke_rtl8192eu_power_and_firmware() -> TestResult {
         Ok(info) => info,
         Err(_) => return TestResult::Fail("8192eu device lifecycle failed"),
     };
-    if info.signature != 0x92e1 || owner.status().stage != Stage::FirmwareReady {
-        return TestResult::Fail("8192eu firmware stage");
+    if info.signature != 0x92e1 || owner.status().stage != Stage::TablesReady {
+        return TestResult::Fail("8192eu tables stage");
     }
     let factory = match owner.factory_8192e() {
         Some(f) => f,
@@ -372,7 +379,10 @@ fn smoke_rtl8192eu_power_and_firmware() -> TestResult {
         return TestResult::Fail("8192eu retained factory");
     }
     // LDO path: SYS_CFG bit 24 clear raises the 1.2 V rail, then LDO_SW 0x83.
-    if io.writes(0x14) != [vec![0x00, 0x00, 0x50, 0x00]] || io.writes(0x7c) != [vec![0x83]] {
+    // The MAC table's later {0x014, 0x75} row follows the power-on write.
+    if io.writes(0x14) != [vec![0x00, 0x00, 0x50, 0x00], vec![0x75]]
+        || io.writes(0x7c) != [vec![0x83]]
+    {
         return TestResult::Fail("8192eu LDO sequence");
     }
     let cr = io.writes(REG_CR);
@@ -428,3 +438,109 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8192eu",
     smoke_rtl8192eu_rejects_mismatched_sie
 );
+
+fn smoke_rtl8192eu_tables_and_rf() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(64))).is_err() {
+        return TestResult::Fail("8192eu lifecycle failed");
+    }
+    let ops = io.0.lock().ops.clone();
+    let rf = |lssi: u16| -> Vec<u32> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Write(a, v) if *a == lssi && v.len() == 4 => {
+                    Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let expect = |table: &[super::phy_tables::RfRow]| -> Vec<u32> {
+        table
+            .iter()
+            .take_while(|r| !(r.reg == 0xff && r.val == u32::MAX))
+            .filter(|r| !(0xf9..=0xfe).contains(&r.reg))
+            .map(|r| (r.reg as u32) << 20 | (r.val & 0xfffff))
+            .collect()
+    };
+    // The PHY table itself writes 0x00010000 to both LSSI parms first.
+    let (a, b) = (rf(0x840), rf(0x844));
+    if a.first() != Some(&0x0001_0000)
+        || b.first() != Some(&0x0001_0000)
+        || a[1..] != expect(RADIO_A_INIT_TABLE)[..]
+        || b[1..] != expect(RADIO_B_INIT_TABLE)[..]
+    {
+        return TestResult::Fail("8192eu RF table rows/path routing");
+    }
+    // Every RF write is bracketed by the FPGA0_POWER_SAVE bit-17 toggle
+    // (plus the PHY table's own 0x818 row).
+    if io.writes(0x818).len() != 1 + 2 * (a.len() - 1 + b.len() - 1) {
+        return TestResult::Fail("8192eu RF power-save bracket");
+    }
+    // First PHY/AGC rows are applied as 32-bit writes in table order.
+    let first_phy = PHY_INIT_TABLE[0];
+    let first_agc = AGC_STD_TABLE[0];
+    let pos = |reg: u16, val: u32| {
+        ops.iter()
+            .position(|op| matches!(op, Op::Write(a, v) if *a == reg && *v == val.to_le_bytes()))
+    };
+    match (
+        pos(first_phy.reg, first_phy.val),
+        pos(first_agc.reg, first_agc.val),
+    ) {
+        (Some(p), Some(a)) if p < a => {}
+        _ => return TestResult::Fail("8192eu PHY/AGC table order"),
+    }
+    if io.writes(0x24).last() != Some(&0x000f_81fbu32.to_le_bytes().to_vec()) {
+        return TestResult::Fail("8192eu AFE_XTAL_CTRL");
+    }
+    // crystal cap 0x15 into XTAL1/XTAL0 of REG_MAC_PHY_CTRL.
+    let cap = 0x15u32 << 18 | 0x15 << 12;
+    if io.writes(0x2c) != [cap.to_le_bytes().to_vec()] {
+        return TestResult::Fail("8192eu crystal cap");
+    }
+    if !io
+        .writes(0x870)
+        .contains(&XAB_RF_SW_CTRL.to_le_bytes().to_vec())
+    {
+        return TestResult::Fail("8192eu RF switch control");
+    }
+    for reg in [0x424, 0x425, 0x45d, 0x114, 0x209] {
+        if io.writes(reg).last() != Some(&vec![0xf4]) {
+            return TestResult::Fail("8192eu TX buffer boundary");
+        }
+    }
+    if !io.writes(0x104).is_empty() {
+        return TestResult::Fail("8192eu must not program REG_PBP");
+    }
+    if io.writes(0x60f) != [vec![4]] || io.writes(0xb0) != [vec![0; 4]] {
+        return TestResult::Fail("8192eu RX drvinfo / HIMR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_tables_and_rf
+);
+
+fn smoke_rtl8192eu_tx_power() -> TestResult {
+    let id = parse_identity(0, 0, 0, Queues::from_sie(0x0111)).unwrap();
+    let factory = parse_efuse(id, &logical_map()).unwrap();
+    if [1, 2, 3, 6, 9, 11, 12, 14].map(channel_group) != [0, 0, 1, 2, 3, 3, 4, 4] {
+        return TestResult::Fail("8192eu gen2 channel groups");
+    }
+    // Channel 1, HT20: path A ofdm=ht40[0]+0, mcs=ht40[0]+(-2);
+    // path B uses diff index 1: ofdm=0x29+7, mcs=0x29+(-1).
+    let [a, b] = tx_power(&factory, 1, false);
+    if a != (0x20, 0x2828_2828, 0x2626_2626) || b != (0x21, 0x3030_3030, 0x2828_2828) {
+        return TestResult::Fail("8192eu HT20 TX power words");
+    }
+    // HT40 uses ht40_diff: index 0 is zero, path B index 1 is +1.
+    let [a, b] = tx_power(&factory, 1, true);
+    if a.2 != 0x2828_2828 || b.2 != 0x2a2a_2a2a {
+        return TestResult::Fail("8192eu HT40 TX power words");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu/8192eu", smoke_rtl8192eu_tx_power);
