@@ -2024,13 +2024,54 @@ flags, BA bitmap, retry counts and RSSI are returned). `set_rx_bufsize`,
 `ar9003_rxs`, including the OFDM-restart-on-non-last-subframe rule) cover
 the receive FIFOs. Smokes (written, not executed):
 `smoke_ath9k_ar9300_edma_tx_control_and_status_ring`,
-`smoke_ath9k_ar9300_edma_rx_status`. Not yet present: the DMA buffer
-owner that allocates the rings and feeds the FIFOs, EDMA interrupt
-status (`ar9003_hw_get_isr`, `AR_ISR_S*`) and the AR9300 `AR_CR_RXE`
-receive enable.
+`smoke_ath9k_ar9300_edma_rx_status`.
 
-Still to port before `ar9300_enablement` can be claimed: the EDMA DMA
-owner and interrupt path, `ar9003_calib.c`, signed AR9300 records and the
+AR9003 EDMA DMA owner (step 3b). `ar9003/packet.rs` is a packet owner
+parallel to the AR9002 `packet::Packet` over the same `packet::Port`
+(AR9002 code untouched). `prepare` allocates the two `ar9003_txc`
+slots, a 16-entry TX status ring (`ath_tx_edma_init`; any size is valid
+hardware), two payload buffers and 4 HP + 8 LP receive buffers of one
+4 KiB page each (`ath_rx_edma_init`), clears every TXC/TXS/RXS, programs
+`AR_Q_STATUS_RING_START`/`END` (`ath9k_hw_reset_txstatus_ring`) and
+`AR_DATABUF_SIZE` 4048 with readback while BME, both FIFOs, all QCUs and
+IER are off. `start` is `ath_edma_start_recv`: `ar9003_hw_rx_enable`
+(`AR_CR` 0), every HP then LP buffer pushed (`ath_rx_edma_buf_link`),
+BME, then `ath9k_hw_startpcureceive`. A legacy frame is encoded by the
+shared `descriptor::transmit`/`transmit_series` and carried into the
+`ar9003_txc` (`ctl11..18`/`ctl20..22` hold the AR5416 `ctl0..7`/`ctl9..11`
+fields) with the port's reduced TX chain mask in every series;
+`ath9k_hw_puttxbuf` pushes the QCU 0 FIFO with no `AR_Q_TXE`
+(`ath_tx_txqaddbuf` EDMA). `delivery` is `ath_tx_edma_tasklet` on the
+status ring (`ar9003_hw_proc_txdesc`, `ath9k_hw_clear_txstatus`, qid 0,
+TXC and payload unchanged, status words 3 and 8 judged by the shared
+`transmit_status`/`transmit_feedback`, which share the AR5416
+`ds_txstatus1`/`ds_txstatus9` layout). `receive` is `ath_edma_get_buffers`
+HP before LP: `ath9k_hw_process_rxdesc_edma`, the shared legacy
+`descriptor::receive` over `rxs` words 1..5/11 (the AR5416
+`ds_rxstatus0..4`/`8` layout), status cleared and the buffer re-pushed
+to its FIFO. `stop` is `ath_stoprecv` (`AR_DIAG` park, filter 0,
+`AR_CR_RXD`, `AR_CR_RXE(ah)` 0xc poll without the pre-AR9300 DMADBG_7
+hang test), `ath9k_hw_abort_tx_dma`, IRQ kill, BME off and the PCIe
+ordered idle proof before any allocation is released. `ar9003/irq.rs`
+is the EDMA interrupt path: `ath9k_hw_init_interrupt_masks` (AR9300 RX
+mitigation 2000/500, priority routes closed), `ath9k_hw_set_interrupts`
+for the `ath9k_start` EDMA imask (IMR 0x81800175, `AR_IMR_S2` GTT | CST |
+BB_WATCHDOG, QCU 0 TXOK/TXERR via `TXQ_FLAG_TXINT_ENABLE`, no GENTMR under
+`ATH9K_HW_CAP_AUTOSLEEP`), `__ath9k_hw_enable_interrupts` with
+`AR_PCIE_MSI` 0x40a4, `ath9k_hw_kill_interrupts` and `ar9003_hw_get_isr`
+(RAC: `AR_ISR_S2` mapping, `ar9003_hw_bb_watchdog_read`, HP/LP/TX
+decode, `AR_ISR_S5_S` 0xdc, sync causes with the `AR_RC_HOSTIF` pulse);
+FATAL or a BB watchdog (`ath_isr` `goto chip_reset`) fails the owner, and
+RXEOL drops RXEOL|RXORN until `service_end`. Policy over Linux: an
+`rs_more` chain is dropped with its continuation buffers (no
+reassembly), a corrupt RX status or foreign status-ring entry fails the
+owner instead of being skipped, one frame is in flight. Smokes (written,
+not executed): `smoke_ath9k_ar9300_edma_packet_owner_tx_rx_and_stop`,
+`smoke_ath9k_ar9300_edma_interrupt_mask_and_cause`.
+
+Still to port before `ar9300_enablement` can be claimed: the AR9300
+station MAC profile (EDMA `ath9k_hw_set_dma`, `AR_Q_DESC_CRCCHK`, the
+AR9300 RF-silent GPIO), `ar9003_calib.c`, signed AR9300 records and the
 probe/station/retune/reset/periodic/suspend owner.
 Nothing registers `0x0030`.
 
