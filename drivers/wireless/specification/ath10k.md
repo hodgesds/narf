@@ -23,7 +23,9 @@
 > A subsequent 80+80 extension is source complete for the qualified QCA9984/
 > QCA9888 10.4 station owner. Six new cases are written and unexecuted;
 > release compilation, native suites and physical acceptance are pending.
-> Contiguous160 remains open because this profile has no authorized full span.
+> Contiguous VHT160 (ch36–64 / ch100–128) later followed in §3 on top of the
+> station-client DFS witness and the shared AUTO_BW regulatory run; its new
+> cases are written and unexecuted.
 >
 > A later host-bus PM continuation is source complete for MSI-backed
 > QCA6174/6164 and QCA9377 runtime owners. Seven new cases are written and
@@ -505,7 +507,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   `mac.c::ath10k_create_vht_cap` does: MCS0-9 only for selected native streams
   in both maps, SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU
   exponent; TX STBC needs its source bit and multiple selected TX chains; beamforming roles
-  need a sounding owner and are not advertised, and wider operation needs the separate 80+80 owner below; contiguous160 is not offered.
+  need a sounding owner and are not advertised, and wider operation needs the separate 160 MHz owners below (80+80 and contiguous160).
   `Device::phy_capabilities(5000)` and `hw_caps.vht_supported` report it.
   Because the element promises 80 MHz support, VHT is offered only on a
   qualified 5-GHz primary whose whole 80 MHz segment
@@ -578,6 +580,52 @@ actual-device RF/power/interoperability acceptance remain separate.
   those directional NSS bounds before replay/PN. Narrower PPDUs keep their
   own GI/map bounds. Wide SGI uses actual SERVICE_READY bit0x40, separately
   from SGI80 bit0x20, and the original request/response directions.
+- Contiguous VHT160 (`vht_wide.rs::Profile::offer_wide`,
+  `regulatory.rs::Permission::contiguous160_with_hint`, `wire.rs::
+  start_center2`; smokes under `drivers/wireless/ath10k/vht160`) shares the
+  80+80 owner's gates (10.4, SERVICE 8, QCA9984/QCA9888 wide NSS 2/1) and
+  follows the chip's own Supported Channel Width Set as Linux
+  `ath10k_create_vht_cap` copies it: 160-only (`vht_cap_info & 0xc == 4`)
+  advertises and offers contiguous160 alone; 160+80+80 (8) opts into both,
+  and an AP operating contiguous160 then yields a contiguous profile. The
+  spans are VHT160 channel 50 (ch36–64, centre 5250) and 114 (ch100–128,
+  centre 5570) — `Permission::center160`; ch149–177 stays out because
+  ch165–177 are outside the factory/board inventory. The receipt keeps the
+  80+80 shape: `center` is the primary80 half and `center2` the adjacent half
+  (80 MHz away; 802.11 forbids adjacent 80+80 segments, so distance alone
+  separates the shapes and 80+80 now refuses an adjacent segment). Each half
+  is an ordinary 80 MHz receipt, so every radar 20 MHz constituent needs the
+  station client's heard Beacon (§ DFS client below); additionally every rule
+  overlapping the whole 160 MHz block must allow 160
+  (`narf_wireless::reg::RegulatoryDomain::allows_bandwidth`: a direct 160 MHz
+  rule, or an `AUTO_BW` run across the 5250 MHz boundary as wireless-regdb
+  `US` declares it; `NO_160MHZ` closes it), mirroring cfg80211
+  `reg_get_max_bandwidth` and `cfg80211_chandef_usable`. Per-rule bandwidth
+  for every width now follows that effective value. The peer VHT width set is
+  mac80211's own-width intersection (`ieee80211_vht_cap_ie_to_sta_vht_cap`);
+  a 160-only station facing an AP that advertises only 160+80+80 is refused
+  (mac80211 would hold that peer at 80 MHz) and falls back to primary80.
+  Native START uses MODE_11AC_VHT160=15 (`chan_to_phymode`); PEER_ASSOC uses
+  VHT160, or VHT80_80=14 when the bound width set is 160+80+80
+  (`ath10k_mac_get_phymode_vht`), with `WMI_PEER_160MHZ` (0x2000_0000, equal
+  in the main/10.x/10.2/10.4/TLV maps). The 10.4 `peer_bw_rxnss_override`
+  carries the 80+80 NSS field only for a VHT80_80 peer. VDEV_START follows
+  `wmi.c::ath10k_wmi_put_wmi_channel`: `band_center_freq1` the primary80 half,
+  `band_center_freq2` the whole 160 MHz centre (80+80: the other segment), and
+  `WMI_CHAN_FLAG_DFS_CFREQ2` (bit15) when `center2 - 10` is a radar channel;
+  no station START carries `WMI_CHAN_FLAG_DFS`. The channel list lists all
+  eight rows, radar rows `PASSIVE | DFS`. `PeerPrepared` reports the cfg80211
+  chandef (160 MHz centre, no second segment, bandwidth 160). Tests (written,
+  unexecuted): `smoke_ath10k_vht160_contiguous_auto_bw_and_radar_constituents`,
+  `smoke_ath10k_vht160_direct_rule_upper_radar_span`,
+  `smoke_ath10k_vht160_profile_primary80_and_second_center`,
+  `smoke_ath10k_vht160_phymodes_and_nss_override`,
+  `smoke_ath10k_vht160_station_start_channel_centers_and_dfs_cfreq2`, plus
+  `smoke_regulatory_auto_bw_chain_admits_and_refuses_160` and
+  `smoke_regulatory_policy_second_flag_byte` in `narf-wireless`. No
+  end-to-end native association conversation on a contiguous160 BSS is
+  written yet; the 80+80 conversation suite still covers the shared wide
+  owner.
   Deprecated width3 and revised width1 VHT Operation encodings share the
   same strict geometry plan. An association response cannot replace a
   center or occupied segment after native START; it fails before
@@ -1782,7 +1830,8 @@ generation change or radio retirement closes the permission (`check`).
 `NO_IR` without `DFS`, unknown flags, indoor and power/bandwidth limits stay
 as before. HT40 pairs (ch52/56 … ch140/144) and VHT80 segments (centres 5290,
 5530, 5610, 5690) follow; 80+80 remains bounded to the non-DFS centres 5210 /
-5775. `Permission::radar` names the radar constituents; their station
+5775, and contiguous VHT160 (centres 5250 / 5570) admits its radar half under
+the same per-constituent witness (§3 contiguous VHT160). `Permission::radar` names the radar constituents; their station
 channel-list rows (`station_ht40_channels`, the associated-scan home row) are
 `PASSIVE | DFS` exactly as Linux `mac.c::ath10k_update_channel_list`
 (`ch->passive |= ch->chan_radar`). A station VDEV_START carries no DFS flag
@@ -2027,7 +2076,7 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | QCA6174,168c:003e |05020000 / QCA6174/hw3.0 | R; H conditional; actual revision/OTP/image selection retained. |
 | QCA6174,168c:003e |05030000 / QCA6174/hw3.0 | R; H conditional; existing chip-specific PLL sequence precedes native mission startup. |
 | QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, chain/NSS extension is source complete, software execution and physical acceptance pending. |
-| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. Contiguous160 remains open; the bounded10.4 80+80 and chain/NSS extensions await software execution and board qualification. |
+| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. The bounded10.4 80+80, contiguous160 and chain/NSS extensions await software execution and board qualification. |
 | QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
 | QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
 | QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
@@ -2049,8 +2098,8 @@ as described in §3; seven new cases and its release/native validation are
 pending. This makes no additional per-chip physical RF or power claim.
 
 Across the reached rows, concrete remaining software packages are
-contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented);
-DFS qualification; physical acceptance of the §3.4 hardware key offload;
+DFS qualification (VHT20/40/80, the bounded 80+80 owner and contiguous VHT160
+are implemented; contiguous VHT160 awaits release/native validation); physical acceptance of the §3.4 hardware key offload;
 P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented).
 Automatic credential replay after recovery is implemented (§ recovery, rebind)
@@ -2082,10 +2131,13 @@ image; `vht160` (MODE_11AC_VHT160, `WMI_PEER_160MHZ`) and `vht80p80`
 for QCA9984 (1560) and QCA9888 (780). Other reached tuples cannot claim 160 or
 80+80 from a PCI ID. The new80+80 owner implements the second independent
 occupied-power receipt and actual center2 as described in§3. Contiguous160
-remains open: the lower36–64 span crosses unimplemented DFS/CAC channels,
-while the upper149–177 span extends beyond the current admitted inventory
-and has no established per-board/factory/host authority here. A width bit or
-a hypothetical power rule does not fill either blocker.
+is implemented for ch36–64 and ch100–128 (§3 contiguous VHT160): the radar
+half is admitted only by the station client's per-constituent Beacon witness
+and the 5250 MHz rule boundary only by an AUTO_BW run or a direct 160 MHz
+rule. The upper 149–177 span stays out: it extends beyond the current
+admitted inventory and has no established per-board/factory/host authority
+here. Release compilation of the new cases and native/physical validation
+remain pending.
 
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,

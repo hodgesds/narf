@@ -82,14 +82,16 @@ impl Wire {
         put(&mut out, at + 8, u32::from(beacon));
         put(&mut out, at + 12, u32::from(dtim));
         // Legacy 11G, no IBSS/HT/VHT flags, no AP SSID/rate/power or NOA.
+        // A station VDEV_START never sets chan_radar (WMI_CHAN_FLAG_DFS).
+        let (center2, flags) = start_center2(permission);
         put(&mut out, chan, u32::from(permission.frequency));
         put(&mut out, chan + 4, u32::from(permission.center));
+        put(&mut out, chan + 8, center2);
         put(
             &mut out,
-            chan + 8,
-            u32::from(permission.center2.unwrap_or(0)),
+            chan + 12,
+            u32::from(permission.frequency < 3000) | flags,
         );
-        put(&mut out, chan + 12, u32::from(permission.frequency < 3000));
         out[chan + 17] = permission.half_dbm;
         out[chan + 18] = permission.half_dbm;
         out[chan + 21] = permission.half_dbm;

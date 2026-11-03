@@ -603,6 +603,24 @@ pub(super) fn supported(caps: &Capabilities, frequency: u16) -> bool {
     frequency_to_channel(frequency).is_some() && (low..=high).contains(&u32::from(frequency))
 }
 
+/// VDEV_START `band_center_freq2` and the extra channel flag, Linux wmi.c
+/// `ath10k_wmi_put_wmi_channel`. `band_center_freq1` is always the primary80
+/// half (`Permission::center`). VHT80_80 puts the other segment center;
+/// VHT160 puts the whole 160 MHz center. Either sets
+/// `WMI_CHAN_FLAG_DFS_CFREQ2` (1 << 15) when the 20 MHz channel just below
+/// the other segment's center (`center2 - 10`) is a radar channel.
+pub(super) fn start_center2(permission: &crate::ath10k::regulatory::Permission) -> (u32, u32) {
+    let Some(center2) = permission.center2 else {
+        return (0, 0);
+    };
+    let frequency = if permission.contiguous160() {
+        (permission.center + center2) / 2
+    } else {
+        center2
+    };
+    let radar = super::beacon_hints::bit(center2 - 10).is_some_and(|b| permission.radar & b != 0);
+    (u32::from(frequency), if radar { 1 << 15 } else { 0 })
+}
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "tests.rs"]
 mod tests;

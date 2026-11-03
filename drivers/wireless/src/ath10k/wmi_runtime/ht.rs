@@ -100,7 +100,8 @@ pub(super) fn vht_supported(caps: &Capabilities) -> bool {
 /// SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU exponent
 /// (bits23..25) from `vht_cap_info`. TX STBC requires its source bit and
 /// `cfg_tx_chainmask > 1`; beamforming roles need a sounding owner this
-/// driver lacks, and 160/80+80 are not offered (see vht160).
+/// driver lacks; 160/80+80 belong to the separate wide offer
+/// (`vht_wide.rs::Profile::offer_wide`).
 fn local_vht(caps: &Capabilities, chains: Chains) -> Result<LocalVht, association::Error> {
     if u32::from(chains.count()) > caps.rf_chains {
         return Err(association::Error::UnsupportedRates);
@@ -128,11 +129,12 @@ pub(super) fn vht_wide_capability(
     chains: Chains,
     maximum: u8,
 ) -> Option<[u8; 12]> {
-    if caps.vht & 12 != 8 || maximum == 0 {
+    // The chip's own Supported Channel Width Set: 160 (4) or 160+80+80 (8).
+    if !matches!(caps.vht & 12, 4 | 8) || maximum == 0 {
         return None;
     }
     let mut body = vht_capability(caps, chains)?;
-    body[0] |= 8 | if caps.vht & 64 != 0 { 64 } else { 0 };
+    body[0] |= (caps.vht & 12) as u8 | if caps.vht & 64 != 0 { 64 } else { 0 };
     // Linux core.c/mac.c publishes a max-rate hint for the chip's lower
     // wide NSS while preserving the ordinary <=80MHz MCS maps.
     let highest = u16::from(maximum.min(chains.count())) * 780;

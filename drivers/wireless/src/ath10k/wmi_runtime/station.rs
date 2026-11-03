@@ -155,20 +155,36 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .ok_or(Error::Unsupported)?;
         let pair = ht40_pair(frequency);
         if let Some(maximum) = self.htt.wmi.wide_vht_nss() {
-            if let Ok(Some(profile)) = ht::Profile::offer_80p80(caps, cached, own, chains, maximum)
-            {
+            if let Ok(Some(profile)) = ht::Profile::offer_wide(caps, cached, own, chains, maximum) {
                 if let (Some(partner), Some(wide)) =
                     (profile.secondary, profile.vht.and_then(|v| v.wide))
                 {
-                    if let Ok(permission) = Permission::discontiguous_with_hint(
-                        caps,
-                        domain,
-                        frequency,
-                        partner,
-                        wide.center2,
-                        hint.clone(),
-                    ) {
-                        if permission.center == profile.center {
+                    // Contiguous160 needs the whole 160 MHz block (AUTO_BW)
+                    // and the radar witness for each constituent; 80+80
+                    // needs each separate segment. Either falls back.
+                    let permission = if wide.contiguous {
+                        Permission::contiguous160_with_hint(
+                            caps,
+                            domain,
+                            frequency,
+                            partner,
+                            hint.clone(),
+                        )
+                    } else {
+                        Permission::discontiguous_with_hint(
+                            caps,
+                            domain,
+                            frequency,
+                            partner,
+                            wide.center2,
+                            hint.clone(),
+                        )
+                    };
+                    if let Ok(permission) = permission {
+                        if permission.center == profile.center
+                            && permission.center2 == Some(wide.center2)
+                            && permission.contiguous160() == wide.contiguous
+                        {
                             return Ok((permission, Some(profile)));
                         }
                     }
@@ -488,8 +504,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Some(PeerPrepared {
             bssid: peer.bssid,
             frequency: peer.permission.frequency,
-            center_frequency: peer.permission.center,
-            second_center_frequency: peer.permission.center2,
+            center_frequency: chandef(&peer.permission).0,
+            second_center_frequency: chandef(&peer.permission).1,
             bandwidth_mhz: bandwidth(&peer.permission),
             peer_id: peer.mapped()?,
             maximum_power_dbm: peer.permission.half_dbm / 2,
@@ -558,7 +574,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             wire::put(
                 &mut start,
                 channel + 12,
-                ht.start_mode(frequency) | ht.channel_flags(),
+                ht.start_mode(frequency) | ht.channel_flags() | wire::start_center2(&permission).1,
             );
         }
         let inventory = if permission.secondary.is_some() {
@@ -633,8 +649,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         return Ok(PeerPrepared {
                             bssid,
                             frequency,
-                            center_frequency: permission.center,
-                            second_center_frequency: permission.center2,
+                            center_frequency: chandef(&permission).0,
+                            second_center_frequency: chandef(&permission).1,
                             bandwidth_mhz: bandwidth(&permission),
                             peer_id: id,
                             maximum_power_dbm: permission.half_dbm / 2,
@@ -920,6 +936,14 @@ fn ht40_pair(frequency: u16) -> Option<u16> {
         }
         _ => return None,
     })
+}
+/// cfg80211 chandef `center_freq1`/`center_freq2`: a contiguous160
+/// receipt reports its whole 160 MHz center and no second segment.
+fn chandef(permission: &Permission) -> (u16, Option<u16>) {
+    match permission.center2 {
+        Some(second) if permission.contiguous160() => ((permission.center + second) / 2, None),
+        second => (permission.center, second),
+    }
 }
 fn bandwidth(permission: &Permission) -> u8 {
     if permission.center2.is_some() {

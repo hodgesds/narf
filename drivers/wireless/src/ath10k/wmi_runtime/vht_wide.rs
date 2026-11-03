@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Source-qualified 80+80 limits. Linux ath10k/core.c assigns QCA9984 two
+//! Source-qualified 160 MHz (contiguous and 80+80) limits. Linux
+//! ath10k/core.c assigns QCA9984 two
 //! wide streams and QCA9888 one; only10.4 encodes the native NSS override.
 use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,21 +60,6 @@ pub(super) fn maxrate_nss(rate: u16) -> Option<u8> {
     }
 }
 impl Profile {
-    /// Discontiguous 80+80 on a chip whose Supported Channel Width Set is
-    /// 160+80+80 (`vht_cap_info` & 0xc == 8). An AP operating contiguous
-    /// 160 yields a contiguous profile from the same advertisement.
-    pub(in crate::ath10k::wmi_runtime) fn offer_80p80(
-        caps: &Capabilities,
-        cached: &ScanBss,
-        own: [u8; 6],
-        chains: Chains,
-        maximum_nss: u8,
-    ) -> Result<Option<Self>, Error> {
-        if caps.vht & 12 != 8 {
-            return Ok(None);
-        }
-        Self::offer_wide(caps, cached, own, chains, maximum_nss)
-    }
     /// The 160 MHz offer for the chip's own Supported Channel Width Set:
     /// 160+80+80 (8) opts into both shapes, 160-only (4) into contiguous
     /// 160 alone (Linux `ath10k_create_vht_cap` copies `vht_cap_info`).
