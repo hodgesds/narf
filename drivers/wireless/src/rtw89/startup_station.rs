@@ -95,6 +95,32 @@ unsafe impl Io for Startup {
         }
         self.station_native()?.ordinary_current()
     }
+    fn station_wow_capable(&mut self) -> bool {
+        self.station_allowed().is_ok()
+            && self.assets.as_ref().is_some_and(|assets| {
+                crate::rtw89::wow_trx::CpuIoRx::for_8852b(assets.firmware_version())
+                    == crate::rtw89::wow_trx::CpuIoRx::Absent
+            })
+    }
+    async fn station_wow_suspend(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        keys: Option<&narf_wireless::station_security::SuspendKeys>,
+        floors: Option<&narf_wireless::station_security::SuspendFloors>,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        self.station_allowed()?;
+        self.wow_suspend(config, keys, floors, admission).await
+    }
+    async fn station_wow_resume(
+        &mut self,
+        admission: &control::Admission,
+    ) -> (
+        Option<crate::rtw89::wow_wire::WakeReport>,
+        Result<(), power::Error>,
+    ) {
+        self.wow_resume(admission).await
+    }
     fn station_own(&mut self) -> Result<[u8; 6], power::Error> {
         self.station_allowed()?;
         Ok(self.identity.ok_or(power::Error::Terminal)?.mac())

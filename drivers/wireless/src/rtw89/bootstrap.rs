@@ -54,6 +54,16 @@ pub(super) struct Bootstrap {
     generation: AtomicU32,
     /// System suspend requested; the supervisor parks instead of resetting.
     suspended: AtomicBool,
+    /// System suspend took the WoW branch: the generation stays live (D3hot,
+    /// no card-off) with the WoW image owning the radio until resume; the
+    /// config header `pci_save_state` saved before the driver op.
+    wow: IrqSafeSpinLock<Option<narf_bus::pci::SavedPciConfig>>,
+    /// cfg80211 `wiphy->wowlan_config` and the last wake report, carried
+    /// from a retired generation's shell into the next one.
+    wowlan: IrqSafeSpinLock<(
+        Option<narf_wireless::WowlanConfig>,
+        Option<super::wow_wire::WakeReport>,
+    )>,
 }
 /// Reservation precedes any config/reset access. A pinned function keeps
 /// its own entry while unrelated functions may continue to run or bind.
@@ -318,6 +328,9 @@ impl Bootstrap {
             return None;
         }
         let shell = self.shell.lock().take();
+        if let Some(shell) = &shell {
+            *self.wowlan.lock() = shell.wowlan();
+        }
         let kept = shell
             .as_ref()
             .map(|shell| super::interface::withdraw_keep_name(shell));
@@ -390,6 +403,10 @@ impl Bootstrap {
             Arc::new(station::NativeEnvironment),
             self.desired.clone(),
         ));
+        {
+            let (config, wakeup) = self.wowlan.lock().clone();
+            shell.restore_wowlan(config, wakeup);
+        }
         *self.shell.lock() = Some(shell.clone());
         // Source factory discovery ended with BME off. The exact same shell
         // reaches all registries before the first CH12/firmware BME attempt.
@@ -572,11 +589,23 @@ async fn suspend_owner(
     if stage == Stage::Terminal as u8 || !owner.running.load(Ordering::Acquire) {
         return Ok(());
     }
-    owner.suspended.store(true, Ordering::Release);
     let shell = {
         let shell = owner.shell.lock();
         shell.clone()
     };
+    // `rtw89_ops_suspend` with WoWLAN on a WoW-configured, associated,
+    // settled station: the PCI core's `pci_save_state`, the driver op, then
+    // `pci_prepare_to_sleep` to D3hot without card-off (as rtw88). Any
+    // failure falls through to the cold path; PME/wake enable stays with
+    // system PM (iwlwifi.md section 3.80).
+    if stage == Stage::Station as u8 {
+        if let Some(shell) = shell.as_ref() {
+            if wow_suspend_owner(owner, shell).await {
+                return Ok(());
+            }
+        }
+    }
+    owner.suspended.store(true, Ordering::Release);
     if let Some(shell) = shell {
         shell.admission().close();
     }
@@ -596,6 +625,95 @@ async fn suspend_owner(
 /// `rtw89_ops_start` after resume: release the parked supervisor, which
 /// claims a fresh FLR and restarts with the `Repeat` radio identity.
 fn resume_owner(owner: &Bootstrap) {
+    if owner.wow.lock().take().is_some() {
+        // A rolled-back WoW suspend cannot await the D3hot exit delay or
+        // `rtw89_wow_resume` here: return to D0 and close the shell so the
+        // supervisor regenerates the station behind a fresh FLR.
+        let _ = narf_bus::pci::set_power_state(
+            &owner.authority,
+            &owner.device,
+            narf_bus::pci::PciPowerState::D0,
+        );
+        if let Some(shell) = owner.shell.lock().clone() {
+            shell.admission().close();
+        }
+    }
+    owner.suspended.store(false, Ordering::Release);
+}
+async fn pci_settle() {
+    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+        narf_bus::pci::PM_D3HOT_DELAY_MS * 1_000_000,
+    ))
+    .await;
+}
+fn pci_state(owner: &Bootstrap, expected: narf_bus::pci::PciPowerState) -> bool {
+    narf_bus::pci::power_state(&owner.authority, &owner.device) == Ok(Some(expected))
+}
+/// `pci_pm_resume_noirq`: D0, the exit delay, `pci_restore_state`, and a
+/// read-back of the restored BARs and command register.
+async fn pci_wake(owner: &Bootstrap, saved: &narf_bus::pci::SavedPciConfig) -> bool {
+    if narf_bus::pci::set_power_state(
+        &owner.authority,
+        &owner.device,
+        narf_bus::pci::PciPowerState::D0,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    pci_settle().await;
+    pci_state(owner, narf_bus::pci::PciPowerState::D0)
+        && narf_bus::pci::restore_config(&owner.authority, &owner.device, saved).is_ok()
+        && narf_bus::pci::save_config(&owner.authority, &owner.device).is_ok_and(|now| {
+            now.bars == saved.bars
+                && now.expansion_rom_bar == saved.expansion_rom_bar
+                && now.command == saved.command
+        })
+}
+/// The WoW suspend branch; false means the cold path must run (a failed
+/// WoW owner already closed its shell).
+async fn wow_suspend_owner(owner: &Bootstrap, shell: &Arc<Device<startup::Startup>>) -> bool {
+    let Ok(saved) = narf_bus::pci::save_config(&owner.authority, &owner.device) else {
+        return false;
+    };
+    if shell.wow_suspend().await != Ok(true) {
+        return false;
+    }
+    if narf_bus::pci::set_power_state(
+        &owner.authority,
+        &owner.device,
+        narf_bus::pci::PciPowerState::D3Hot,
+    )
+    .is_ok()
+    {
+        pci_settle().await;
+        if pci_state(owner, narf_bus::pci::PciPowerState::D3Hot) {
+            *owner.wow.lock() = Some(saved);
+            return true;
+        }
+    }
+    // Back to D0 and restore the station before the cold path retires it.
+    if pci_wake(owner, &saved).await {
+        let _ = shell.wow_resume().await;
+    }
+    false
+}
+/// `rtw89_ops_resume` -> `rtw89_wow_resume` for a WoW-suspended
+/// generation; a failure closed its shell, so the supervisor regenerates
+/// it (cold path). Cold-suspended owners are released as before.
+async fn resume_owner_async(owner: &Bootstrap) {
+    let saved = owner.wow.lock().take();
+    if let Some(saved) = saved {
+        let shell = owner.shell.lock().clone();
+        if let Some(shell) = shell {
+            let woke = pci_wake(owner, &saved).await;
+            if !woke || shell.wow_resume().await.is_err() {
+                // Any failure closes the shell; the supervisor regenerates.
+                shell.admission().close();
+                narf_console::klog!("rtw8852b: WoW resume failed; regenerating\n");
+            }
+        }
+    }
     owner.suspended.store(false, Ordering::Release);
 }
 /// Cancellation of preparation rolls back every request made so far. Once
@@ -638,10 +756,10 @@ async fn suspend_all(timeout_ms: u64) -> Result<(), narf_power::device_pm::Devic
     attempt.armed = false;
     Ok(())
 }
-fn resume_all() {
+async fn resume_all() {
     let owners = OWNERS.lock().snapshot();
     for owner in owners {
-        resume_owner(&owner);
+        resume_owner_async(&owner).await;
     }
     OWNERS.lock().suspending = false;
 }
@@ -651,7 +769,7 @@ impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     }
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
-            resume_all();
+            resume_all().await;
             Ok(())
         })
     }
@@ -725,6 +843,8 @@ pub(super) fn probe(
         pinned: AtomicBool::new(false),
         generation: AtomicU32::new(0),
         suspended: AtomicBool::new(false),
+        wow: IrqSafeSpinLock::new(None),
+        wowlan: IrqSafeSpinLock::new((None, None)),
     });
     publish_owner(owner, reservation);
     Ok(())
@@ -782,6 +902,8 @@ pub(super) unsafe fn attach_cold(
         pinned: AtomicBool::new(false),
         generation: AtomicU32::new(0),
         suspended: AtomicBool::new(false),
+        wow: IrqSafeSpinLock::new(None),
+        wowlan: IrqSafeSpinLock::new((None, None)),
     });
     publish_owner(owner, reservation);
     Ok(())
@@ -856,6 +978,8 @@ mod tests {
             pinned: AtomicBool::new(false),
             generation: AtomicU32::new(0),
             suspended: AtomicBool::new(false),
+            wow: IrqSafeSpinLock::new(None),
+            wowlan: IrqSafeSpinLock::new((None, None)),
         });
         install(owner.clone());
         if probe(device, authority).is_err() {
@@ -896,6 +1020,8 @@ mod tests {
             pinned: AtomicBool::new(false),
             generation: AtomicU32::new(0),
             suspended: AtomicBool::new(false),
+            wow: IrqSafeSpinLock::new(None),
+            wowlan: IrqSafeSpinLock::new((None, None)),
         })
     }
     fn ready<T>(future: impl core::future::Future<Output = T>) -> Option<T> {
@@ -1108,7 +1234,7 @@ mod tests {
             || second.suspended.load(Ordering::Acquire)
             || OWNERS.lock().suspending
         {
-            resume_all();
+            let _ = ready(resume_all());
             return TestResult::Fail("later suspend failure left an earlier function parked");
         }
         // Cancellation after the first owner parks and the second awaits its
@@ -1126,7 +1252,7 @@ mod tests {
             || second.suspended.load(Ordering::Acquire)
             || OWNERS.lock().suspending
         {
-            resume_all();
+            let _ = ready(resume_all());
             return TestResult::Fail("cancelled multi-function suspend retained requests");
         }
         second.set_stage(Stage::Suspended);
@@ -1135,12 +1261,12 @@ mod tests {
             || !second.suspended.load(Ordering::Acquire)
             || Reservation::claim(other_device(27).addr).is_ok()
         {
-            resume_all();
+            let _ = ready(resume_all());
             return TestResult::Fail(
                 "successful multi-function suspend missed an owner/probe fence",
             );
         }
-        resume_all();
+        let _ = ready(resume_all());
         if first.suspended.load(Ordering::Acquire)
             || second.suspended.load(Ordering::Acquire)
             || Reservation::claim(other_device(27).addr).is_err()

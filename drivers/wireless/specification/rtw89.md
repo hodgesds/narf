@@ -1942,6 +1942,49 @@ hardware keys after resume; NARF's awake path never had any. Unexecuted
 cases: `smoke_rtw89_wow_security_cam_entries_and_addr_cam`,
 `smoke_station_suspend_floors_match_keys_and_consume_nothing`.
 
+**WoW suspend/resume composition (`startup_wow.rs`, `station_lifecycle.rs`,
+`interface.rs`, `bootstrap.rs`) — implemented, unexecuted.**
+`Startup::wow_suspend(config, keys, floors, admission)` is
+`rtw89_wow_suspend` -> `rtw89_wow_enable` in Linux order: every wake input
+is validated first (`wow_wire::validate`, `wow_security::plan`,
+`CpuIoRx::for_8852b(Assets::firmware_version)`), then
+`wow_trx_enter_pre`, `wow_keys_in`, `wow_swap_in(wow_cam)`,
+`fw_start` (pattern CAM writes, `KEEP_ALIVE`, `DISCONNECT_DETECT`,
+`rtw89_wow_cfg_wake(true)` = `WAKEUP_CTRL`, address CAM INFO_CHANGE,
+`WOW_GLOBAL` with the key info; then `R_AX_WOW_CTRL.WOWEN` polled 50us x
+50ms) and `wow_trx_enter_post`. `Startup::wow_resume` is `rtw89_wow_resume`:
+the wake-reason byte, `wow_trx_leave_pre`, the AOAC report by packet on a
+secured link (C2H MAC 3/0; best effort as in Linux; only its pattern index
+is used), `fw_stop` (pattern CAM clear, keep-alive and disconnect detection
+off, `cfg_wake(false)` with zero algorithms/key info, WOWEN clear),
+`wow_swap_out`, `wow_keys_out` and `wow_trx_leave_post`; the
+`wow_wire::WakeReport` is returned even on failure. Any failure
+terminalizes the Startup. `station::State::wow_snapshot` supplies the keys
+and floors only for an Open, ready, settled station (no handshake, CSA,
+scan, management/BA/EDCA work); `Owner::station_wow_resume` keeps the
+association only when `wow_wire::keeps_link` (disconnect/unknown reasons
+drop it) and refreshes the beacon-loss clock. `Device::wow_suspend`
+refuses host control/packets (`admitted` off, `wow_armed` stops the drain
+worker and LPS service), leaves LPS (`rtw89_wow_leave_ps(true)`), then
+runs the owner under the retained mutex; `Device::wow_resume` reopens them
+or closes the shell. The WoWLAN configuration and last wake report are
+carried across generations by `Bootstrap::wowlan` (cfg80211 keeps
+`wiphy->wowlan_config`). `bootstrap::SystemPm` takes the WoW branch for a
+`Stage::Station` generation: `pci_save_state`, the driver op, D3hot without
+card-off (as rtw88; 10 ms exit delay, PMCSR read-back); resume returns to
+D0, restores and re-reads BARs/command, then `wow_resume`. Every failure
+(including a non-D3hot read-back, which resumes the station first) takes
+the existing cold path: the shell is closed and the supervisor retires the
+generation (park on suspend, regenerate behind a fresh FLR on resume).
+A rolled-back multi-function suspend returns a WoW owner to D0 and closes
+its shell without awaiting the exit delay. PCI PME/wake enable stays with
+the system-PM owner. Deliberate differences: no WoW LPS
+(`rtw89_wow_enter_ps`; the radio stays awake), no GTK-offload H2C (no
+rekey data; RTL8852B declares no GTK-rekey wake), no ARP offload, the AOAC
+RX IVs do not advance the host replay floors (host PN state stays in
+`station_security`, as rtw88), and Linux's `rtw89_pci_suspend`/`resume`
+LDO/PERST register writes are not ported.
+
 **Not wired (why `wow` stays open).** The whole row still needs, in Linux
 order (`rtw89_wow_suspend`/`resume`):
 1. (Done above: `wow_trx`/`command_native/wow.rs`.) Reversible TRX
@@ -1978,7 +2021,8 @@ order (`rtw89_wow_suspend`/`resume`):
 5. `bootstrap::SystemPm` branch: a WoW-configured, associated, settled
    station keeps D0 and its generation instead of retiring it; any failure
    falls back to the existing cold retirement/regeneration path. PCI PME
-   stays with the system-PM owner (iwlwifi.md section 3.80).
+   stays with the system-PM owner (iwlwifi.md section 3.80) (Done above: WoW suspend/resume composition; the
+   generation goes to D3hot without card-off instead of staying in D0.)
 6. `WirelessNetIface::wowlan_support`/`set_wowlan` only after 1..5 exist.
 
 Unexecuted cases: `smoke_rtw89_wow_support_patterns_and_cam`,

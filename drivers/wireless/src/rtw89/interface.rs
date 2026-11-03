@@ -116,6 +116,14 @@ pub(super) struct Device<I: Io> {
     line: Arc<super::irq::Line>,
     interrupts: AtomicBool,
     sleep_capable: AtomicBool,
+    /// RTL8852B WoW composed on this generation (sampled at activation).
+    wow_capable: AtomicBool,
+    /// The WoW image owns the radio; host control and packets are refused.
+    wow_armed: AtomicBool,
+    /// cfg80211 `wiphy->wowlan_config`, carried into later generations.
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// The last resume's `rtw89_wow_show_wakeup_reason` subset.
+    wakeup: IrqSafeSpinLock<Option<super::wow_wire::WakeReport>>,
     sleep_enabled: AtomicBool,
     sleep_identity: IrqSafeSpinLock<Option<narf_net::native_emission::Lifetime>>,
     monitor_capable: AtomicBool,
@@ -342,6 +350,10 @@ impl<I: Io + 'static> Device<I> {
             line: super::irq::Line::new(),
             interrupts: AtomicBool::new(false),
             sleep_capable: AtomicBool::new(false),
+            wow_capable: AtomicBool::new(false),
+            wow_armed: AtomicBool::new(false),
+            wowlan: IrqSafeSpinLock::new(None),
+            wakeup: IrqSafeSpinLock::new(None),
             sleep_enabled: AtomicBool::new(false),
             sleep_identity: IrqSafeSpinLock::new(None),
             monitor_capable: AtomicBool::new(false),
@@ -403,6 +415,14 @@ impl<I: Io + 'static> Device<I> {
     /// One worker period: drain, then sleep until an MSI/TX kick or the
     /// mode's fallback period.
     pub(super) async fn service_once(&self) {
+        if self.wow_armed.load(Ordering::Acquire) {
+            // The WoW image owns the radio until `wow_resume`.
+            let seen = self.line.raised();
+            let _ =
+                narf_time::timeout(narf_time::Deadline::after_ms(POLL_MS), self.line.wait(seen))
+                    .await;
+            return;
+        }
         if self.monitor_selected() {
             self.monitor_service().await;
             let seen = self.line.raised();
@@ -438,7 +458,7 @@ impl<I: Io + 'static> Device<I> {
             narf_time::timeout(narf_time::Deadline::after_ms(period), self.line.wait(seen)).await;
     }
     pub(super) async fn sleep_service(&self, allow_enter: bool, kicked: bool) -> bool {
-        if !self.sleep_capable.load(Ordering::Acquire) {
+        if !self.sleep_capable.load(Ordering::Acquire) || self.wow_armed.load(Ordering::Acquire) {
             return false;
         }
         let identity = self.sleep_identity.lock().clone();
@@ -465,6 +485,110 @@ impl<I: Io + 'static> Device<I> {
                 false
             }
         }
+    }
+    /// The retained cfg80211 WoWLAN configuration and last wake report,
+    /// handed to the next generation's shell.
+    pub(super) fn wowlan(
+        &self,
+    ) -> (
+        Option<narf_wireless::WowlanConfig>,
+        Option<super::wow_wire::WakeReport>,
+    ) {
+        (self.wowlan.lock().clone(), *self.wakeup.lock())
+    }
+    pub(super) fn restore_wowlan(
+        &self,
+        config: Option<narf_wireless::WowlanConfig>,
+        wakeup: Option<super::wow_wire::WakeReport>,
+    ) {
+        *self.wowlan.lock() = config;
+        *self.wakeup.lock() = wakeup;
+    }
+    /// The last resume's wake reason (driver accessor; the shared contract
+    /// has no `ieee80211_report_wowlan_wakeup` event, iwlwifi.md 3.80).
+    pub(super) fn wakeup(&self) -> Option<super::wow_wire::WakeReport> {
+        *self.wakeup.lock()
+    }
+    /// mac80211 `ieee80211_suspend` -> `rtw89_ops_suspend` with WoWLAN:
+    /// refuse host control and packets, wake the station out of LPS, then
+    /// `rtw89_wow_suspend` while the retained mutex is held. `Ok(false)`:
+    /// not eligible (no configuration, not associated/settled, WoW not
+    /// composed) and nothing was touched; `Err`: the owner failed and the
+    /// caller must take the cold path (this shell is closed).
+    pub(super) async fn wow_suspend(&self) -> Result<bool, ()> {
+        let Some(config) = self.wowlan.lock().clone() else {
+            return Ok(false);
+        };
+        if !self.wow_capable.load(Ordering::Acquire)
+            || self.closed()
+            || !self.admitted.load(Ordering::Acquire)
+            || self.wow_armed.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let identity = self.sleep_identity.lock().clone();
+        let mut storage = self.lifecycle.retained.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return Ok(false);
+        };
+        if owner.station_peer().is_none() || !owner.station_ready() {
+            return Ok(false);
+        }
+        self.wow_armed.store(true, Ordering::Release);
+        self.admitted.store(false, Ordering::Release);
+        if let Some(mut rings) = self.rings.try_lock() {
+            rings.clear();
+        }
+        *self.wakeup.lock() = None;
+        // `rtw89_wow_leave_ps(true)`: leave LPS before the TRX halt.
+        if self.sleep_capable.load(Ordering::Acquire)
+            && owner
+                .station_sleep_service(identity, false, false, true, &self.admission)
+                .await
+                .is_err()
+        {
+            drop(storage);
+            self.close();
+            return Err(());
+        }
+        if owner
+            .station_wow_suspend(&config, &self.admission)
+            .await
+            .is_err()
+        {
+            drop(storage);
+            self.close();
+            return Err(());
+        }
+        Ok(true)
+    }
+    /// `rtw89_ops_resume` -> `rtw89_wow_resume`. Success reopens host
+    /// control and packets over the same association; any error (including
+    /// a disconnect or unknown wake reason) closes this shell for the cold
+    /// path, which regenerates the station.
+    pub(super) async fn wow_resume(&self) -> Result<(), ()> {
+        if !self.wow_armed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let result = {
+            let mut storage = self.lifecycle.retained.lock().await;
+            match storage.as_mut() {
+                Some(owner) => {
+                    let (report, result) = owner.station_wow_resume(&self.admission).await;
+                    *self.wakeup.lock() = report;
+                    result.is_ok() && !self.closed() && owner.station_peer().is_some()
+                }
+                None => false,
+            }
+        };
+        if !result {
+            self.close();
+            return Err(());
+        }
+        self.wow_armed.store(false, Ordering::Release);
+        self.admitted.store(true, Ordering::Release);
+        self.line.raise();
+        Ok(())
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
@@ -530,6 +654,14 @@ impl<I: Io + 'static> Device<I> {
             .ok_or(Error::State)?
             .station_sleep_capable()?;
         self.sleep_capable.store(sleep_capable, Ordering::Release);
+        let wow_capable = self
+            .lifecycle
+            .retained
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|owner| owner.station_wow_capable());
+        self.wow_capable.store(wow_capable, Ordering::Release);
         let fragments_capable = {
             let mut storage = self.lifecycle.retained.lock().await;
             let owner = storage.as_mut().ok_or(Error::State)?;

@@ -432,4 +432,42 @@ impl Native {
         }
         result
     }
+    /// The copied bytes (C2H header included) of the next firmware message
+    /// `(category, class, function)`, waited for at most 400 ms while CH12
+    /// runs. Used for the AOAC report (`rtw89_mac_c2h_wow_aoac_rpt`).
+    pub(in crate::rtw89) async fn wow_c2h(
+        &mut self,
+        category: u8,
+        class: u8,
+        function: u8,
+    ) -> Result<Vec<u8>, power::Error> {
+        if !matches!(self.wow_trx, Some(Trx::Quiesced(_) | Trx::Restarted(_))) {
+            return Err(power::Error::Terminal);
+        }
+        let start = self.io.now_us();
+        loop {
+            let index = self.station_runtime.backlog.iter().position(|event| {
+                matches!(event, rx_packet::Event::Firmware(m)
+                    if (m.category, m.class, m.function) == (category, class, function))
+            });
+            if let Some(index) = index {
+                if let Some(rx_packet::Event::Firmware(m)) =
+                    self.station_runtime.backlog.remove(index)
+                {
+                    return Ok(m.bytes);
+                }
+            }
+            if self.io.now_us().saturating_sub(start) >= 400_000 {
+                return Err(power::Error::Timeout);
+            }
+            self.io.delay_us(50).await;
+            self.poll().map_err(|_| power::Error::Access)?;
+            let batch = self
+                .rx_hardware_step(32)
+                .map_err(|_| power::Error::Access)?;
+            for event in batch.events {
+                self.retain_event(event)?;
+            }
+        }
+    }
 }

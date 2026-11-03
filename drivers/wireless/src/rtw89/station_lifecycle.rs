@@ -128,6 +128,47 @@ impl<I: Io> Owner<I> {
         }
         Ok(sleeping)
     }
+    /// `rtw89_ops_suspend` -> `rtw89_wow_suspend` on the started station.
+    pub(super) async fn station_wow_suspend(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        admission: &Admission,
+    ) -> Result<(), station::Error> {
+        if !self.active {
+            return Err(station::Error::State);
+        }
+        let station = self.station.as_ref().ok_or(station::Error::State)?;
+        let (keys, floors) = station.wow_snapshot()?;
+        self.io
+            .station_wow_suspend(config, keys.as_ref(), floors.as_ref(), admission)
+            .await
+            .map_err(station::Error::Native)
+    }
+    /// `rtw89_ops_resume` -> `rtw89_wow_resume`. Success keeps the same
+    /// association only when the wake reason keeps the link; an AP-gone or
+    /// unknown reason is an error so the caller drops it (cold path).
+    pub(super) async fn station_wow_resume(
+        &mut self,
+        admission: &Admission,
+    ) -> (
+        Option<super::wow_wire::WakeReport>,
+        Result<(), station::Error>,
+    ) {
+        let (report, result) = self.io.station_wow_resume(admission).await;
+        let result = result.map_err(station::Error::Native).and_then(|()| {
+            if !report.as_ref().is_some_and(super::wow_wire::keeps_link) {
+                return Err(station::Error::State);
+            }
+            self.station
+                .as_mut()
+                .ok_or(station::Error::State)?
+                .wow_resumed()
+        });
+        (report, result)
+    }
+    pub(super) fn station_wow_capable(&mut self) -> bool {
+        self.active && self.io.station_wow_capable()
+    }
     pub(super) fn station_sleep_capable(&mut self) -> Result<bool, station::Error> {
         self.io
             .station_sleep_capable()

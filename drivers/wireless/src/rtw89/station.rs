@@ -140,6 +140,32 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(bool, bool), power::Error> {
         Ok((false, false))
     }
+    /// RTL8852B WoW (`rtw89_wow_suspend`) is possible on this owner.
+    fn station_wow_capable(&mut self) -> bool {
+        false
+    }
+    /// `rtw89_wow_suspend` with the validated configuration and the
+    /// station's key snapshot; any error leaves the owner for the cold path.
+    async fn station_wow_suspend(
+        &mut self,
+        _: &narf_wireless::WowlanConfig,
+        _: Option<&station_security::SuspendKeys>,
+        _: Option<&station_security::SuspendFloors>,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// `rtw89_wow_resume`: the wake report (even on failure) and whether the
+    /// awake station was restored.
+    async fn station_wow_resume(
+        &mut self,
+        _: &Admission,
+    ) -> (
+        Option<super::wow_wire::WakeReport>,
+        Result<(), power::Error>,
+    ) {
+        (None, Err(power::Error::Unsupported))
+    }
     fn station_rf_tracking(&mut self, _: &Admission) -> Result<(), power::Error> {
         Ok(())
     }
@@ -773,6 +799,50 @@ impl State {
             && !self.sleep_timer_due()
             && self.security.as_ref().is_none_or(|s| !s.handshake_active())
             && !self.track.due(self.environment.now_ms())
+    }
+    /// `rtw89_wow_suspend` inputs from the associated, settled station
+    /// (no handshake, CSA, scan or management/packet work in flight): the
+    /// current temporal keys and their PN floors, both `None` for an open
+    /// BSS. Reading them consumes no PN or replay state.
+    pub(super) fn wow_snapshot(
+        &self,
+    ) -> Result<
+        (
+            Option<station_security::SuspendKeys>,
+            Option<station_security::SuspendFloors>,
+        ),
+        Error,
+    > {
+        if self.phase != Phase::Open
+            || self.peer().is_none()
+            || !self.ready()
+            || !self.pending.is_empty()
+            || self.csa.is_some()
+            || self.scanning
+            || self.scan.is_some()
+            || !self.mgmt_out.is_empty()
+            || !self.ba_ops.is_empty()
+            || self.edca_pending.is_some()
+        {
+            return Err(Error::State);
+        }
+        match self.security.as_ref() {
+            None => Ok((None, None)),
+            Some(security) => {
+                let keys = security.suspend_keys().ok_or(Error::State)?;
+                let floors = security.suspend_floors().ok_or(Error::State)?;
+                Ok((Some(keys), Some(floors)))
+            }
+        }
+    }
+    /// The link survived the WoW window (`rtw89_wow_resume` kept the
+    /// association): the AP was heard by the WoW firmware until now.
+    pub(super) fn wow_resumed(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Open || self.peer().is_none() {
+            return Err(Error::State);
+        }
+        self.last_peer = self.now()?;
+        Ok(())
     }
     pub(super) fn sleep_restored(&mut self) {
         self.track.restored();

@@ -16,6 +16,7 @@ use crate::rtw89::{
     wow_security::Keys,
     wow_wire,
 };
+use alloc::vec::Vec;
 
 /// The station's firmware MAC id (`profile_fingerprint`: STA MACID0).
 const STATION_MAC_ID: u8 = 0;
@@ -248,5 +249,266 @@ impl Startup {
                 admission,
             )
             .await
+    }
+}
+
+/// Wake inputs retained from [`Startup::wow_suspend`] to
+/// [`Startup::wow_resume`] (`struct rtw89_wow_param` subset).
+pub(super) struct Armed {
+    keys: Keys,
+    patterns: Vec<wow_wire::Pattern>,
+    magic: bool,
+    disconnect: bool,
+}
+impl core::fmt::Debug for Armed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Rtw89WowArmed")
+            .field("patterns", &self.patterns.len())
+            .field("magic", &self.magic)
+            .field("disconnect", &self.disconnect)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Startup {
+    async fn wow_h2c(
+        &mut self,
+        function: u8,
+        body: &[u8],
+        done: bool,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        self.station_native()?
+            .wow_command(wow_wire::H2C_CL_MAC_WOW, function, body, done, admission)
+            .await
+    }
+    /// `rtw89_wow_cfg_wake`: `WAKEUP_CTRL`, the address CAM
+    /// (`RTW89_ROLE_INFO_CHANGE`; RTL8852B has no `h2c_dctl_sec_cam`) and
+    /// `WOW_GLOBAL`. Disabling follows `rtw89_wow_key_clear`, so the global
+    /// carries zero algorithms and key info, and the CAM drops the WoL bits
+    /// but keeps the security entries until the swap restores the plain one.
+    async fn wow_cfg_wake(
+        &mut self,
+        armed: &Armed,
+        wow: bool,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        let patterns = wow && !armed.patterns.is_empty();
+        let magic = wow && armed.magic;
+        let ctrl = wow_wire::wakeup_ctrl(
+            wow,
+            !armed.patterns.is_empty(),
+            armed.magic,
+            armed.disconnect,
+            STATION_MAC_ID,
+        );
+        self.wow_h2c(wow_wire::H2C_FUNC_WAKEUP_CTRL, &ctrl, true, admission)
+            .await?;
+        let cam = self
+            .wow_cam(&armed.keys, patterns, magic)
+            .ok_or(power::Error::Terminal)?;
+        self.station_native()?.wow_addr_cam(&cam, admission).await?;
+        let global = if wow {
+            wow_wire::wow_global(
+                true,
+                STATION_MAC_ID,
+                armed.keys.pairwise,
+                armed.keys.group,
+                &armed.keys.key_info,
+            )
+        } else {
+            wow_wire::wow_global(
+                false,
+                STATION_MAC_ID,
+                wow_wire::Alg::None,
+                wow_wire::Alg::None,
+                &wow_wire::KeyInfo::default(),
+            )
+        };
+        self.wow_h2c(wow_wire::H2C_FUNC_WOW_GLOBAL, &global, true, admission)
+            .await
+    }
+    /// `rtw89_wow_check_fw_status`: `R_AX_WOW_CTRL` & `B_AX_WOW_WOWEN`
+    /// every 50us for at most 50ms.
+    async fn wow_fw_status(&mut self, enable: bool) -> Result<(), power::Error> {
+        use crate::rtw89::power::Io as _;
+        let native = self.station_native()?;
+        let start = native.now_us();
+        loop {
+            let on = native.read8(wow_wire::R_AX_WOW_CTRL)? & wow_wire::B_AX_WOW_WOWEN != 0;
+            if on == enable {
+                return Ok(());
+            }
+            if native.now_us().saturating_sub(start) >= wow_wire::WOW_STATUS_TIMEOUT_US {
+                return Err(power::Error::Timeout);
+            }
+            native.delay_us(wow_wire::WOW_STATUS_POLL_US).await;
+        }
+    }
+    /// `rtw89_wow_fw_start` (connected): pattern CAM, keep-alive,
+    /// disconnect detection, `rtw89_wow_cfg_wake(true)`, then WOW_EN.
+    /// GTK offload is not sent (no rekey data; RTL8852B declares no
+    /// GTK-rekey wake) and ARP offload stays off.
+    async fn wow_fw_start(
+        &mut self,
+        armed: &Armed,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        for (index, pattern) in armed.patterns.iter().enumerate() {
+            let body = wow_wire::cam_update(index as u8, Some(pattern))
+                .ok_or(power::Error::Unsupported)?;
+            self.wow_h2c(wow_wire::H2C_FUNC_WOW_CAM_UPD, &body, true, admission)
+                .await?;
+        }
+        self.wow_keep_alive(true, admission).await?;
+        let detect = wow_wire::disconnect_detect(true, armed.disconnect, STATION_MAC_ID);
+        self.wow_h2c(
+            wow_wire::H2C_FUNC_DISCONNECT_DETECT,
+            &detect,
+            true,
+            admission,
+        )
+        .await?;
+        self.wow_cfg_wake(armed, true, admission).await?;
+        self.wow_fw_status(true).await
+    }
+    /// `rtw89_wow_fw_stop` (connected): pattern CAM clear, keep-alive and
+    /// disconnect detection off, `rtw89_wow_cfg_wake(false)`, WOW_EN clear.
+    async fn wow_fw_stop(
+        &mut self,
+        armed: &Armed,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        for index in 0..armed.patterns.len() {
+            let body = wow_wire::cam_update(index as u8, None).ok_or(power::Error::Unsupported)?;
+            self.wow_h2c(wow_wire::H2C_FUNC_WOW_CAM_UPD, &body, true, admission)
+                .await?;
+        }
+        self.wow_keep_alive(false, admission).await?;
+        let detect = wow_wire::disconnect_detect(false, armed.disconnect, STATION_MAC_ID);
+        self.wow_h2c(
+            wow_wire::H2C_FUNC_DISCONNECT_DETECT,
+            &detect,
+            true,
+            admission,
+        )
+        .await?;
+        self.wow_cfg_wake(armed, false, admission).await?;
+        self.wow_fw_status(false).await
+    }
+    /// The AOAC report by packet (`rtw89_fw_h2c_wow_request_aoac`, RECV_ACK,
+    /// answered by C2H MAC class 3 function 0), only for a secured link
+    /// (`ptk_alg`). Linux ignores its failure; so does this owner, which
+    /// uses it only for the pattern index (host PN state is not updated).
+    async fn wow_aoac(
+        &mut self,
+        armed: &Armed,
+        admission: &Admission,
+    ) -> Option<wow_wire::AoacReport> {
+        if !armed.keys.secured() {
+            return None;
+        }
+        self.wow_h2c(
+            wow_wire::H2C_FUNC_AOAC_REPORT_REQ,
+            &wow_wire::aoac_request(),
+            false,
+            admission,
+        )
+        .await
+        .ok()?;
+        let bytes = self
+            .station_native()
+            .ok()?
+            .wow_c2h(1, wow_wire::C2H_CLASS_WOW, wow_wire::C2H_FUNC_AOAC_REPORT)
+            .await
+            .ok()?;
+        wow_wire::decode_aoac(bytes.get(8..)?)
+    }
+    /// `rtw89_wow_suspend` -> `rtw89_wow_enable` on the associated,
+    /// settled station: validate every wake input before any write
+    /// (`rtw89_wow_set_wakeups`), then `enable_trx_pre`, the security CAM,
+    /// `swap_fw(true)`, `fw_start` and `enable_trx_post`. Any failure
+    /// terminalizes this owner for the existing cold path. Linux's WoW LPS
+    /// (`rtw89_wow_enter_ps`) is not entered: the radio stays awake.
+    pub(in crate::rtw89) async fn wow_suspend(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        keys: Option<&narf_wireless::station_security::SuspendKeys>,
+        floors: Option<&narf_wireless::station_security::SuspendFloors>,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        self.wow_station_ready()?;
+        if self.wow.is_some() || self.wow_armed.is_some() {
+            return Err(power::Error::Terminal);
+        }
+        let own = self.identity.ok_or(power::Error::Terminal)?.mac();
+        let patterns = wow_wire::validate(config, own).map_err(|_| power::Error::Unsupported)?;
+        let keys = crate::rtw89::wow_security::plan(keys, floors)
+            .map_err(|_| power::Error::Unsupported)?;
+        let cpu_io_rx = crate::rtw89::wow_trx::CpuIoRx::for_8852b(
+            self.assets
+                .as_ref()
+                .ok_or(power::Error::Terminal)?
+                .firmware_version(),
+        );
+        let armed = Armed {
+            keys,
+            patterns,
+            magic: config.magic_packet,
+            disconnect: config.disconnect,
+        };
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = attempt.owner_mut();
+            owner.station_native()?.wow_trx_enter_pre().await?;
+            owner.wow_keys_in(&armed.keys, admission).await?;
+            let cam = owner
+                .wow_cam(&armed.keys, !armed.patterns.is_empty(), armed.magic)
+                .ok_or(power::Error::Terminal)?;
+            owner.wow_swap_in(&cam, admission).await?;
+            owner.wow_fw_start(&armed, admission).await?;
+            owner.station_native()?.wow_trx_enter_post(cpu_io_rx).await
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        if result.is_ok() {
+            attempt.owner_mut().wow_armed = Some(armed);
+        }
+        result
+    }
+    /// `rtw89_wow_resume`: the wake reason (`rtw89_wow_show_wakeup_reason`),
+    /// `disable_trx_pre` with the AOAC report, `fw_stop`, `swap_fw(false)`,
+    /// the security CAM clear and `disable_trx_post`. The report is returned
+    /// even when the restore fails; any failure terminalizes this owner for
+    /// the cold path.
+    pub(in crate::rtw89) async fn wow_resume(
+        &mut self,
+        admission: &Admission,
+    ) -> (Option<wow_wire::WakeReport>, Result<(), power::Error>) {
+        use crate::rtw89::power::Io as _;
+        let Some(armed) = self.wow_armed.take() else {
+            return (None, Err(power::Error::Terminal));
+        };
+        let mut attempt = Attempt::new(self);
+        let mut report = None;
+        let result = async {
+            let owner = attempt.owner_mut();
+            let reason = owner.station_native()?.read8(wow_wire::WAKE_REASON_REG)?;
+            owner.station_native()?.wow_trx_leave_pre().await?;
+            let aoac = owner.wow_aoac(&armed, admission).await;
+            report = Some(wow_wire::decode_reason(reason, aoac.as_ref()));
+            owner.wow_fw_stop(&armed, admission).await?;
+            owner.wow_swap_out(admission).await?;
+            owner.wow_keys_out(&armed.keys, admission).await?;
+            owner.station_native()?.wow_trx_leave_post()
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        (report, result)
+    }
+    /// True while the WoW image owns the radio (between a successful
+    /// [`Self::wow_suspend`] and [`Self::wow_resume`]).
+    pub(in crate::rtw89) fn wow_armed(&self) -> bool {
+        self.wow_armed.is_some()
     }
 }

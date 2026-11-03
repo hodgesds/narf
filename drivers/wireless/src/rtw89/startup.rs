@@ -68,6 +68,8 @@ pub struct Startup {
     monitor: Option<super::monitor::Controller>,
     /// Running WoW image state (`startup_wow.rs`).
     wow: Option<wow::Window>,
+    /// Wake inputs while the WoW image owns the radio.
+    wow_armed: Option<wow::Armed>,
     pub(super) lifecycle: super::radio_policy::Lifecycle,
 }
 impl core::fmt::Debug for Startup {
@@ -143,6 +145,7 @@ impl Startup {
             sleep: None,
             monitor: None,
             wow: None,
+            wow_armed: None,
             lifecycle: super::radio_policy::Lifecycle::Initial,
         })
     }
