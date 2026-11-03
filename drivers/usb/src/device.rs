@@ -463,28 +463,28 @@ pub fn interrupt_out_ep(ep_num: u8, max_packet: u16) -> EndpointConfig {
     }
 }
 
-/// Find the controller, look up the slot for `port`, and wrap the
+/// Look up the slot for root-hub `port` of controller `controller`
+/// ([`xhci::Xhci::id`]; port numbers are per controller) and wrap the
 /// result in a [`USBDevice`]. Used by class drivers that walk root-hub
 /// ports.
-pub fn find_by_port(port: u8) -> Option<USBDevice> {
-    let c = xhci::controller()?;
+pub fn find_by_port(controller: u8, port: u8) -> Option<USBDevice> {
+    let c = xhci::controller_by_id(controller)?;
     let slot_id = c.slot_for_port(port)?;
     let (port, speed, _) = c.device_info(slot_id)?;
     Some(USBDevice::new(c, slot_id, port, speed))
 }
 
-/// Enumerate every currently-bound slot as a [`USBDevice`]. Used by
+/// Enumerate every currently-bound slot on every controller as a
+/// [`USBDevice`] (each carries its own controller). Used by
 /// the rtl8xxxu register hook to find its dongle without going through
 /// the supervisor's attach state machine.
 pub fn enumerate() -> Vec<USBDevice> {
-    let c = match xhci::controller() {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
     let mut out = Vec::new();
-    for slot_id in 1u8..=255 {
-        if let Some((port, speed, _)) = c.device_info(slot_id) {
-            out.push(USBDevice::new(c.clone(), slot_id, port, speed));
+    for c in xhci::controllers() {
+        for slot_id in 1u8..=255 {
+            if let Some((port, speed, _)) = c.device_info(slot_id) {
+                out.push(USBDevice::new(c.clone(), slot_id, port, speed));
+            }
         }
     }
     out

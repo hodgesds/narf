@@ -181,9 +181,18 @@ pub struct UacCardState {
     /// Sound registry index once published.
     pub card_index: IrqSafeSpinLock<Option<u32>>,
     pub detached: AtomicBool,
+    /// Index of the xHCI controller the device is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    /// 0 from [`Self::from_bind`]; the binder sets it before publishing.
+    pub controller: AtomicU8,
 }
 
 impl UacCardState {
+    /// The controller this card's device is on.
+    fn xhci(&self) -> Option<Arc<crate::xhci::Xhci>> {
+        crate::xhci::controller_by_id(self.controller.load(Ordering::Acquire))
+    }
+
     /// Snapshot the negotiated topology after a successful bind
     /// conversation. `outcome` carries the FU volume ranges and
     /// any UAC2 clock rates the conversation learned.
@@ -234,6 +243,7 @@ impl UacCardState {
             capture: choices.iter().find(|c| c.capture).map(build),
             card_index: IrqSafeSpinLock::new(None),
             detached: AtomicBool::new(false),
+            controller: AtomicU8::new(0),
         })
     }
 
@@ -276,7 +286,7 @@ impl UacCardState {
         index: u16,
         data: &[u8],
     ) -> Result<(), SoundError> {
-        let ctrl = crate::xhci::controller().ok_or(SoundError::NoSuchCard)?;
+        let ctrl = self.xhci().ok_or(SoundError::NoSuchCard)?;
         let slot = self.slot_id;
         narf_scheduler::block_on(async move {
             ctrl.control_out(slot, rt, req, value, index, data).await
@@ -293,7 +303,7 @@ impl UacCardState {
         index: u16,
         out: &mut [u8],
     ) -> Result<usize, SoundError> {
-        let ctrl = crate::xhci::controller().ok_or(SoundError::NoSuchCard)?;
+        let ctrl = self.xhci().ok_or(SoundError::NoSuchCard)?;
         let slot = self.slot_id;
         narf_scheduler::block_on(
             async move { ctrl.control_in(slot, rt, req, value, index, out).await },
@@ -579,19 +589,21 @@ pub trait IsoTransfer: Send + Sync + core::fmt::Debug {
 /// directly instead (see `spawn_pump`).
 #[derive(Debug)]
 pub struct XhciIso {
+    /// Controller index ([`crate::xhci::Xhci::id`]) the slot belongs to.
+    pub controller: u8,
     pub slot_id: u8,
     pub dci: u8,
 }
 
 impl IsoTransfer for XhciIso {
     fn isoch_out(&self, data: &[u8]) -> Result<usize, SoundError> {
-        let ctrl = crate::xhci::controller().ok_or(SoundError::NoSuchCard)?;
+        let ctrl = crate::xhci::controller_by_id(self.controller).ok_or(SoundError::NoSuchCard)?;
         let (slot, dci) = (self.slot_id, self.dci);
         narf_scheduler::block_on(async move { ctrl.isoch_out(slot, dci, data).await })
             .map_err(|_| SoundError::BadState)
     }
     fn isoch_in(&self, out: &mut [u8]) -> Result<usize, SoundError> {
-        let ctrl = crate::xhci::controller().ok_or(SoundError::NoSuchCard)?;
+        let ctrl = crate::xhci::controller_by_id(self.controller).ok_or(SoundError::NoSuchCard)?;
         let (slot, dci) = (self.slot_id, self.dci);
         narf_scheduler::block_on(async move { ctrl.isoch_in(slot, dci, out).await })
             .map_err(|_| SoundError::BadState)
@@ -913,6 +925,7 @@ impl PcmDevice for UsbAudioCard {
             dir,
             shared,
             iso: Box::new(XhciIso {
+                controller: self.0.controller.load(Ordering::Acquire),
                 slot_id: self.0.slot_id,
                 dci: choice.dci,
             }),
@@ -1228,7 +1241,7 @@ fn spawn_pump(
     let slot = card.slot_id;
     let dci = dir.choice.dci;
     narf_scheduler::spawn(async move {
-        let ctrl = crate::xhci::controller();
+        let ctrl = card.xhci();
         loop {
             if !shared.is_current(gen) {
                 break;

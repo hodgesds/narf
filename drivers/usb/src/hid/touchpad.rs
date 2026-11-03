@@ -109,9 +109,9 @@ pub struct PtpTouchpad {
     pub(crate) evdev_node: Arc<DeviceNode>,
 }
 
-/// Global registry of bound touchpads. Populated by
+/// Bound touchpads, one registry per xHCI controller. Populated by
 /// [`try_bind_touchpad_already_addressed`]; consumed by [`pump_all`].
-static TOUCHPADS: IrqSafeSpinLock<Vec<Arc<PtpTouchpad>>> = IrqSafeSpinLock::new(Vec::new());
+static TOUCHPADS: crate::xhci::PerController<Vec<Arc<PtpTouchpad>>> = crate::per_controller_vec!();
 
 /// Locate the HID interface in a configuration descriptor and return
 /// `(interface_num, hid_descriptor_offset, interrupt_in_endpoint)`.
@@ -358,34 +358,39 @@ pub async fn try_bind_touchpad_already_addressed(
         evdev_id,
         evdev_node,
     });
-    TOUCHPADS.lock().push(pad);
+    TOUCHPADS.of(xhci_dev.id()).lock().push(pad);
     Ok(())
 }
 
 /// Unregister a touchpad's evdev DeviceNode from the ROUTER.
 /// Call when the device is detached / unplugged.
-pub fn unregister_touchpad_evdev(slot_id: u8) {
-    let mut g = TOUCHPADS.lock();
+pub fn unregister_touchpad_evdev(controller: u8, slot_id: u8) {
+    let mut g = TOUCHPADS.of(controller).lock();
     if let Some(pos) = g.iter().position(|p| p.slot_id == slot_id) {
         let pad = g.remove(pos);
         ROUTER.unregister_device(pad.evdev_id);
     }
 }
 
-/// Unregister every bound touchpad. Called on a controller
-/// recovery epoch change.
-pub fn unregister_all_touchpads() {
-    let slots: alloc::vec::Vec<u8> = TOUCHPADS.lock().iter().map(|p| p.slot_id).collect();
+/// Unregister every touchpad bound on `controller`. Called on a
+/// controller recovery epoch change.
+pub fn unregister_all_touchpads(controller: u8) {
+    let slots: alloc::vec::Vec<u8> = TOUCHPADS
+        .of(controller)
+        .lock()
+        .iter()
+        .map(|p| p.slot_id)
+        .collect();
     for slot in slots {
-        unregister_touchpad_evdev(slot);
+        unregister_touchpad_evdev(controller, slot);
     }
 }
 
 /// Hub contexts of all live touchpad bindings (root-attached
 /// bindings omitted). Aggregated by `hid::hub_ports` for the
 /// supervisor's HID wake step.
-pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
-    let g = TOUCHPADS.lock();
+pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
+    let g = TOUCHPADS.of(controller).lock();
     g.iter().filter_map(|p| p.hub_port).collect()
 }
 
@@ -399,7 +404,7 @@ pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
 /// Boot blob.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let pads: Vec<Arc<PtpTouchpad>> = {
-        let g = TOUCHPADS.lock();
+        let g = TOUCHPADS.of(xhci_dev.id()).lock();
         g.clone()
     };
     let mut total = 0usize;
@@ -424,7 +429,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         // root-attached.
         if reports > 0 {
             if let Some((hub_slot, port)) = pad.hub_port {
-                crate::attach::mark_port_activity(hub_slot, port);
+                crate::attach::mark_port_activity(xhci_dev.id(), hub_slot, port);
             }
         }
     }
@@ -500,5 +505,5 @@ fn emit_events(pad: &PtpTouchpad, r: DecodedReport) -> usize {
 
 /// Number of bound touchpads. Test + diagnostics helper.
 pub fn attached_touchpad_count() -> usize {
-    TOUCHPADS.lock().len()
+    TOUCHPADS.each().map(|(_, pads)| pads.lock().len()).sum()
 }

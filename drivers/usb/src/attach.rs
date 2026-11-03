@@ -170,11 +170,12 @@ pub struct HubBinding {
     pub last_activity_tick: [u64; 64],
 }
 
-/// Global registry of bound hubs, BFS-ordered (the supervisor walks
+/// Registry of bound hubs, one per controller (slot ids are only unique
+/// within a controller), each BFS-ordered (the supervisor walks
 /// it linearly each cycle, and tier-N hubs always appear after every
 /// tier-(N-1) hub that hosts them, so a downstream walk in registry
 /// order always processes a parent before its children).
-pub static HUBS: IrqSafeSpinLock<Vec<HubBinding>> = IrqSafeSpinLock::new(Vec::new());
+pub static HUBS: xhci::PerController<Vec<HubBinding>> = crate::per_controller_vec!();
 
 /// Number of populated 4-bit hops in an xHCI route string. A hub on a
 /// root-hub port has route zero/tier zero; a hub reached through port N
@@ -205,9 +206,9 @@ pub const IDLE_SUSPEND_NS: u64 = 30 * 1_000_000_000;
 /// a cached [`HUBS`] index: hub detach removes entries with
 /// `retain`, which shifts every later index, so a cached index
 /// can silently name the wrong hub after a detach (#892).
-pub fn mark_port_activity(parent_hub_slot: u8, port: u8) {
+pub fn mark_port_activity(controller: u8, parent_hub_slot: u8, port: u8) {
     let now = narf_time::monotonic_ns();
-    let mut g = HUBS.lock();
+    let mut g = HUBS.of(controller).lock();
     let pos = g.iter().position(|h| h.hub.slot_id == parent_hub_slot);
     if let Some(h) = pos.and_then(|p| g.get_mut(p)) {
         if let Some(slot) = h.last_activity_tick.get_mut(port as usize & 63) {
@@ -225,9 +226,9 @@ pub fn mark_port_activity(parent_hub_slot: u8, port: u8) {
 /// for [`IDLE_SUSPEND_NS`] would be suspended on the very next
 /// pass — it never got an idle window (#840). The hub is
 /// resolved by slot id (see [`mark_port_activity`]).
-pub fn mark_ports_bound(parent_hub_slot: u8, bits: u64) {
+pub fn mark_ports_bound(controller: u8, parent_hub_slot: u8, bits: u64) {
     let now = narf_time::monotonic_ns();
-    let mut g = HUBS.lock();
+    let mut g = HUBS.of(controller).lock();
     let pos = g.iter().position(|h| h.hub.slot_id == parent_hub_slot);
     if let Some(h) = pos.and_then(|p| g.get_mut(p)) {
         h.bound_downstream |= bits;
@@ -276,8 +277,8 @@ pub fn mark_ports_bound(parent_hub_slot: u8, bits: u64) {
 ///      A stale live entry would have to survive its occupant's
 ///      detach, which pillar 2 makes impossible: removal strictly
 ///      precedes reuse.
-pub fn hub_index_for_slot(slot_id: u8) -> Option<usize> {
-    let g = HUBS.lock();
+pub fn hub_index_for_slot(controller: u8, slot_id: u8) -> Option<usize> {
+    let g = HUBS.of(controller).lock();
     g.iter().position(|h| h.hub.slot_id == slot_id)
 }
 
@@ -336,7 +337,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
     // neither suspend the wrong hub nor set the wrong hub's
     // suspend bit (#892).
     let work: alloc::vec::Vec<(u8, u8)> = {
-        let g = HUBS.lock();
+        let g = HUBS.of(xhci_dev.id()).lock();
         idle_suspend_candidates(&g[..], now)
     };
     let mut suspended = 0;
@@ -344,7 +345,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
         // Snapshot the bound hub out of the registry lock so we don't
         // hold the IrqSafeSpinLock across the .await.
         let hub_copy: Option<crate::hub::UsbHub> = {
-            let g = HUBS.lock();
+            let g = HUBS.of(xhci_dev.id()).lock();
             g.iter().find(|h| h.hub.slot_id == *slot).map(|h| h.hub)
         };
         let h = match hub_copy {
@@ -352,7 +353,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
             None => continue,
         };
         if h.port_suspend(xhci_dev, *p).await.is_ok() {
-            let mut g = HUBS.lock();
+            let mut g = HUBS.of(xhci_dev.id()).lock();
             if let Some(h) = g.iter_mut().find(|h| h.hub.slot_id == *slot) {
                 h.suspended_downstream |= 1u64 << (*p as u32 & 63);
             }
@@ -373,7 +374,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
 pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_slot: u8, port: u8) {
     let bit = 1u64 << (port as u32 & 63);
     let hub_copy: Option<crate::hub::UsbHub> = {
-        let g = HUBS.lock();
+        let g = HUBS.of(xhci_dev.id()).lock();
         match g.iter().find(|h| h.hub.slot_id == parent_hub_slot) {
             Some(h) if h.suspended_downstream & bit != 0 => Some(h.hub),
             _ => None,
@@ -386,7 +387,7 @@ pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_slot: u8, port
     // Issue CLEAR_FEATURE(PORT_SUSPEND) + ack the change bit without
     // holding the registry lock across the .await.
     if h.port_resume(xhci_dev, port).await.is_ok() {
-        let mut g = HUBS.lock();
+        let mut g = HUBS.of(xhci_dev.id()).lock();
         if let Some(h) = g.iter_mut().find(|h| h.hub.slot_id == parent_hub_slot) {
             h.suspended_downstream &= !bit;
             // Sentinel value: prevent re-suspend on the very next
@@ -402,8 +403,8 @@ pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_slot: u8, port
 /// is a registry read, not a hardware probe (the hardware-side
 /// equivalent is `UsbHub::port_is_suspended`). Resolved by
 /// slot id (see [`mark_port_activity`]).
-pub fn hub_port_is_suspended(parent_hub_slot: u8, port: u8) -> bool {
-    let g = HUBS.lock();
+pub fn hub_port_is_suspended(controller: u8, parent_hub_slot: u8, port: u8) -> bool {
+    let g = HUBS.of(controller).lock();
     match g.iter().find(|h| h.hub.slot_id == parent_hub_slot) {
         Some(h) => h.suspended_downstream & (1u64 << (port as u32 & 63)) != 0,
         None => false,
@@ -448,10 +449,11 @@ pub(crate) async fn release_slot(
 /// into a silent `UnknownClass`: one line per (root port, route, step),
 /// at most [`ATTACH_LOG_LIMIT`] per boot.
 const ATTACH_LOG_LIMIT: usize = 64;
-static ATTACH_LOGGED: IrqSafeSpinLock<alloc::collections::BTreeSet<(u8, u32, &'static str)>> =
+static ATTACH_LOGGED: IrqSafeSpinLock<alloc::collections::BTreeSet<(u8, u8, u32, &'static str)>> =
     IrqSafeSpinLock::new(alloc::collections::BTreeSet::new());
 
 pub(crate) fn note_attach_failure(
+    controller: u8,
     root_port: u8,
     route: u32,
     step: &'static str,
@@ -459,7 +461,8 @@ pub(crate) fn note_attach_failure(
 ) {
     {
         let mut logged = ATTACH_LOGGED.lock();
-        if logged.len() >= ATTACH_LOG_LIMIT || !logged.insert((root_port, route, step)) {
+        if logged.len() >= ATTACH_LOG_LIMIT || !logged.insert((controller, root_port, route, step))
+        {
             return;
         }
     }
@@ -481,25 +484,37 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
     // port_reset → enable_slot → address_device (root-hub topology).
     // Each step runs against the controller's PORTSC register set.
     if let Err(e) = xhci_dev.port_reset(port).await {
-        note_attach_failure(port, 0, "port_reset", &(e, xhci_dev.portsc(port)));
+        note_attach_failure(
+            xhci_dev.id(),
+            port,
+            0,
+            "port_reset",
+            &(e, xhci_dev.portsc(port)),
+        );
         return AttachOutcome::UnknownClass;
     }
     let speed = match xhci_dev.port_speed(port) {
         Some(s) => s,
         None => {
-            note_attach_failure(port, 0, "port_speed", &xhci_dev.portsc(port));
+            note_attach_failure(xhci_dev.id(), port, 0, "port_speed", &xhci_dev.portsc(port));
             return AttachOutcome::UnknownClass;
         }
     };
     let slot_id = match xhci_dev.enable_slot().await {
         Ok(s) => s,
         Err(e) => {
-            note_attach_failure(port, 0, "enable_slot", &e);
+            note_attach_failure(xhci_dev.id(), port, 0, "enable_slot", &e);
             return AttachOutcome::UnknownClass;
         }
     };
     if let Err(e) = xhci_dev.address_device(slot_id, port, speed).await {
-        note_attach_failure(port, 0, "address_device", &(e, speed, slot_id));
+        note_attach_failure(
+            xhci_dev.id(),
+            port,
+            0,
+            "address_device",
+            &(e, speed, slot_id),
+        );
         let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
@@ -525,20 +540,38 @@ pub async fn try_attach_via_hub(
     let child_route =
         xhci::Topology::for_downstream(parent_route, parent_tier, hub_port).route_string;
     if let Err(e) = parent.port_reset(xhci_dev, hub_port).await {
-        note_attach_failure(parent_root_port, child_route, "hub_port_reset", &e);
+        note_attach_failure(
+            xhci_dev.id(),
+            parent_root_port,
+            child_route,
+            "hub_port_reset",
+            &e,
+        );
         return AttachOutcome::UnknownClass;
     }
     let speed = match parent.port_speed(xhci_dev, hub_port).await {
         Ok(s) => s,
         Err(e) => {
-            note_attach_failure(parent_root_port, child_route, "hub_port_speed", &e);
+            note_attach_failure(
+                xhci_dev.id(),
+                parent_root_port,
+                child_route,
+                "hub_port_speed",
+                &e,
+            );
             return AttachOutcome::UnknownClass;
         }
     };
     let slot_id = match xhci_dev.enable_slot().await {
         Ok(s) => s,
         Err(e) => {
-            note_attach_failure(parent_root_port, child_route, "enable_slot", &e);
+            note_attach_failure(
+                xhci_dev.id(),
+                parent_root_port,
+                child_route,
+                "enable_slot",
+                &e,
+            );
             return AttachOutcome::UnknownClass;
         }
     };
@@ -555,6 +588,7 @@ pub async fn try_attach_via_hub(
         .await
     {
         note_attach_failure(
+            xhci_dev.id(),
             parent_root_port,
             child_route,
             "address_device",
@@ -620,21 +654,22 @@ pub async fn try_attach_via_hub(
 /// above, dropping the slot's UAC devices and unregistering their
 /// sound cards (#1318).
 pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
+    let controller = xhci_dev.id();
     // 1. Class bindings.
-    hid::detach_boot_keyboard(slot_id);
-    hid::keyboard::unregister_keyboard_evdev(slot_id);
-    mouse::detach_mouse(slot_id);
-    hid::touchpad::unregister_touchpad_evdev(slot_id);
-    hid::consumer::detach_consumer(slot_id);
-    hid::generic::unregister_generic_evdev(slot_id);
-    crate::cdc_acm::detach_acm(slot_id);
-    crate::serial::port::detach_serial(slot_id);
-    crate::xpad::detach_xpad(slot_id);
-    crate::class_registry::dispatch_unbind(slot_id);
+    hid::detach_boot_keyboard(controller, slot_id);
+    hid::keyboard::unregister_keyboard_evdev(controller, slot_id);
+    mouse::detach_mouse(controller, slot_id);
+    hid::touchpad::unregister_touchpad_evdev(controller, slot_id);
+    hid::consumer::detach_consumer(controller, slot_id);
+    hid::generic::unregister_generic_evdev(controller, slot_id);
+    crate::cdc_acm::detach_acm(controller, slot_id);
+    crate::serial::port::detach_serial(controller, slot_id);
+    crate::xpad::detach_xpad(controller, slot_id);
+    crate::class_registry::dispatch_unbind(controller, slot_id);
 
     // 2. Hub subtree, then the hub's own registry entry.
     let subtree: Vec<u8> = {
-        let g = HUBS.lock();
+        let g = HUBS.of(xhci_dev.id()).lock();
         let mut out = Vec::new();
         if let Some(h) = g.iter().find(|h| h.hub.slot_id == slot_id) {
             for dp in 1..=h.hub.descriptor.num_ports.min(64) {
@@ -654,13 +689,15 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     for child in subtree {
         alloc::boxed::Box::pin(detach_slot(xhci_dev, child)).await;
     }
-    HUBS.lock().retain(|h| h.hub.slot_id != slot_id);
+    HUBS.of(xhci_dev.id())
+        .lock()
+        .retain(|h| h.hub.slot_id != slot_id);
 
     // 3. Controller teardown + DMA reclamation (queue 10).
     let _ = release_slot(xhci_dev, slot_id).await;
 }
 
-/// Drop every binding the supervisor owns, without touching the
+/// Drop every binding on `controller` its supervisor owns, without touching the
 /// controller. Called when the controller recovery epoch changes
 /// (`Xhci::recover_controller` has already invalidated every
 /// generation, dropped every `Device` and reset the slot table, so
@@ -690,23 +727,23 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// entry would make re-enumeration append a second live adapter for
 /// the same BOT device (queue 16, Concern C); the fingerprint clear serves the
 /// same purpose for re-enumerated readers.
-pub fn detach_all_bindings() {
-    hid::clear_boot_keyboards();
-    hid::keyboard::unregister_all_keyboards();
-    mouse::clear_mice();
-    hid::touchpad::unregister_all_touchpads();
-    hid::consumer::clear_consumers();
-    hid::generic::unregister_all_generic();
-    crate::cdc_acm::clear_acm();
-    crate::serial::port::clear_serial();
-    crate::xpad::clear_xpad();
-    crate::msc::unbind_all_msc();
-    crate::fingerprint::unbind_all_fp();
-    crate::cdc_ncm::detach_all_ncm();
-    crate::r8152::detach_all_r8152();
-    crate::cdc_ecm::detach_all_ecm();
-    crate::uvc::detach_all_uvc();
-    HUBS.lock().clear();
+pub fn detach_all_bindings(controller: u8) {
+    hid::clear_boot_keyboards(controller);
+    hid::keyboard::unregister_all_keyboards(controller);
+    mouse::clear_mice(controller);
+    hid::touchpad::unregister_all_touchpads(controller);
+    hid::consumer::clear_consumers(controller);
+    hid::generic::unregister_all_generic(controller);
+    crate::cdc_acm::clear_acm(controller);
+    crate::serial::port::clear_serial(controller);
+    crate::xpad::clear_xpad(controller);
+    crate::msc::unbind_all_msc(controller);
+    crate::fingerprint::unbind_all_fp(controller);
+    crate::cdc_ncm::detach_all_ncm(controller);
+    crate::r8152::detach_all_r8152(controller);
+    crate::cdc_ecm::detach_all_ecm(controller);
+    crate::uvc::detach_all_uvc(controller);
+    HUBS.of(controller).lock().clear();
 }
 
 /// Free function so the dispatcher logic stays one place. `port` is
@@ -741,6 +778,7 @@ async fn dispatch_after_address(
                 let vid = u16::from_le_bytes([d[8], d[9]]);
                 let pid = u16::from_le_bytes([d[10], d[11]]);
                 note_attach_failure(
+                    xhci_dev.id(),
                     root_port,
                     this_route,
                     "addressed (not a failure)",
@@ -750,6 +788,7 @@ async fn dispatch_after_address(
             }
             Err(e) => {
                 note_attach_failure(
+                    xhci_dev.id(),
                     root_port,
                     this_route,
                     "device_descriptor",
@@ -767,7 +806,13 @@ async fn dispatch_after_address(
         let mut head = [0u8; 9];
         let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await;
         if n.is_err() || head.iter().take(2).all(|b| *b == 0) {
-            note_attach_failure(root_port, this_route, "hub_config_head", &(n, head));
+            note_attach_failure(
+                xhci_dev.id(),
+                root_port,
+                this_route,
+                "hub_config_head",
+                &(n, head),
+            );
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
@@ -781,7 +826,7 @@ async fn dispatch_after_address(
         let n2 = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await {
             Ok(n) => n,
             Err(e) => {
-                note_attach_failure(root_port, this_route, "hub_config", &e);
+                note_attach_failure(xhci_dev.id(), root_port, this_route, "hub_config", &e);
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -792,7 +837,13 @@ async fn dispatch_after_address(
         let iface = match hub::find_hub_interface(&full) {
             Some(i) => i,
             None => {
-                note_attach_failure(root_port, this_route, "hub_interface", &full.len());
+                note_attach_failure(
+                    xhci_dev.id(),
+                    root_port,
+                    this_route,
+                    "hub_interface",
+                    &full.len(),
+                );
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -811,7 +862,13 @@ async fn dispatch_after_address(
             )
             .await
         {
-            note_attach_failure(root_port, this_route, "hub_set_configuration", &e);
+            note_attach_failure(
+                xhci_dev.id(),
+                root_port,
+                this_route,
+                "hub_set_configuration",
+                &e,
+            );
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
@@ -819,7 +876,7 @@ async fn dispatch_after_address(
         {
             Ok(b) => b,
             Err(e) => {
-                note_attach_failure(root_port, this_route, "hub_attach", &e);
+                note_attach_failure(xhci_dev.id(), root_port, this_route, "hub_attach", &e);
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -837,7 +894,7 @@ async fn dispatch_after_address(
             )
             .await
         {
-            note_attach_failure(root_port, this_route, "mark_as_hub", &e);
+            note_attach_failure(xhci_dev.id(), root_port, this_route, "mark_as_hub", &e);
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
@@ -860,7 +917,7 @@ async fn dispatch_after_address(
                 bound.descriptor.tt_think_time(),
             );
         }
-        HUBS.lock().push(HubBinding {
+        HUBS.of(xhci_dev.id()).lock().push(HubBinding {
             hub: bound,
             route_string: this_route,
             tier,
@@ -1139,7 +1196,7 @@ async fn dispatch_after_address(
         // configuration descriptor is load-bearing: class-only
         // matches must inspect interface triples, not treat an
         // unknown 0000:0000 VID/PID as a wildcard for every device.
-        if let Some(c) = xhci::controller() {
+        if let Some(c) = xhci::controller_by_id(xhci_dev.id()) {
             use alloc::sync::Arc;
             // Wrap the slot in a USBDevice with the VID/PID we already
             // fetched so dispatch_probe can read vendor/product IDs

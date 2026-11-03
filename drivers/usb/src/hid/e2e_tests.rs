@@ -136,7 +136,7 @@ fn smoke_boot_keyboard_recovery_unpublishes_evdev() -> TestResult {
         return TestResult::Fail("keyboard publication lost USB identity");
     }
     super::__push_keyboard_for_test(keyboard);
-    super::clear_boot_keyboards();
+    super::clear_boot_keyboards(0);
     if ROUTER.device_ids().contains(&id) || reader.is_valid() {
         return TestResult::Fail("controller recovery left a published USB keyboard");
     }
@@ -1166,7 +1166,7 @@ kernel_test_in!(
 
 fn smoke_e2e_detach_removes_boot_keyboard_binding() -> TestResult {
     {
-        let mut g = super::KEYBOARDS.lock();
+        let mut g = super::KEYBOARDS.of(0).lock();
         g.push(super::BootKeyboard::from_configured_endpoint(
             7,
             0,
@@ -1175,13 +1175,13 @@ fn smoke_e2e_detach_removes_boot_keyboard_binding() -> TestResult {
             narf_input::evdev::InputId::new(narf_input::evdev::bus::USB, 0, 0, 0),
         ));
     }
-    if !super::detach_boot_keyboard(7) {
+    if !super::detach_boot_keyboard(0, 7) {
         return TestResult::Fail("detach_boot_keyboard reported no binding for slot 7");
     }
-    if super::KEYBOARDS.lock().iter().any(|k| k.slot_id == 7) {
+    if super::KEYBOARDS.of(0).lock().iter().any(|k| k.slot_id == 7) {
         return TestResult::Fail("boot-keyboard binding survived detach");
     }
-    if super::detach_boot_keyboard(7) {
+    if super::detach_boot_keyboard(0, 7) {
         return TestResult::Fail("second detach_boot_keyboard reported a binding");
     }
     TestResult::Pass

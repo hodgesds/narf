@@ -6,6 +6,11 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// Run `f` on the first bound controller (QEMU tests drive one).
+fn with_first<R>(f: impl FnOnce(&crate::xhci::Xhci) -> R) -> Option<R> {
+    crate::xhci::first_controller().map(|c| f(&c))
+}
+
 // ── xhci ───────────────────────────────────────────────────────────
 
 fn smoke_xhci_bring_up() -> TestResult {
@@ -13,18 +18,18 @@ fn smoke_xhci_bring_up() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    if !xhci::with_controller(|c| c.is_running()).unwrap_or(false) {
+    if !with_first(|c| c.is_running()).unwrap_or(false) {
         return TestResult::Fail("xhci not running after bring_up");
     }
-    let v = xhci::with_controller(|c| c.version()).unwrap_or(0);
+    let v = with_first(|c| c.version()).unwrap_or(0);
     if v == 0 || v == 0xFFFF {
         return TestResult::Fail("xhci HCIVERSION reads garbage");
     }
-    let slots = xhci::with_controller(|c| c.max_slots()).unwrap_or(0);
+    let slots = with_first(|c| c.max_slots()).unwrap_or(0);
     if slots == 0 {
         return TestResult::Fail("xhci max_slots = 0");
     }
-    let ports = xhci::with_controller(|c| c.max_ports()).unwrap_or(0);
+    let ports = with_first(|c| c.max_ports()).unwrap_or(0);
     if ports == 0 {
         return TestResult::Fail("xhci max_ports = 0");
     }
@@ -142,7 +147,7 @@ fn smoke_xhci_enable_slot_command() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let c = match xhci::controller() {
+    let c = match xhci::first_controller() {
         Some(c) => c,
         None => return TestResult::Skip("xhci controller missing"),
     };
@@ -202,7 +207,7 @@ async fn release_fixture_slots(
 
 fn smoke_enumeration_failure_reclaims_slot() -> TestResult {
     use crate::{attach, xhci};
-    let Some(controller) = xhci::controller() else {
+    let Some(controller) = xhci::first_controller() else {
         return TestResult::Skip("xhci not probed");
     };
     let Some((port, _)) = controller.connected_ports().first().copied() else {
@@ -279,7 +284,7 @@ fn smoke_xhci_address_device_qemu() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let c = match xhci::controller() {
+    let c = match xhci::first_controller() {
         Some(c) => c,
         None => return TestResult::Fail("xhci controller missing"),
     };
@@ -371,7 +376,7 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let c = match xhci::controller() {
+    let c = match xhci::first_controller() {
         Some(c) => c,
         None => return TestResult::Fail("xhci controller missing"),
     };
@@ -483,7 +488,7 @@ async fn verify_live_keyboard_evdev(slot: u8, id: narf_input::evdev::DeviceId) -
     // Unplug with a modifier held: both the evdev node and the legacy state
     // must be retired, so neither the compositor nor the console gets stuck.
     hid::feed_keyboard_report_for_test(slot, press);
-    if !hid::detach_boot_keyboard(slot)
+    if !hid::detach_boot_keyboard(0, slot)
         || narf_input::evdev::ROUTER.device_ids().contains(&id)
         || InputEventFile::open(id, DeviceKind::Hardware).is_some()
         || narf_input::current_modifiers().bits() != 0
@@ -530,7 +535,7 @@ fn smoke_msc_attach_via_xhci_qemu() -> TestResult {
         return TestResult::Skip("xhci not probed");
     }
     msc::__reset_msc_for_test();
-    let attached = match xhci::controller() {
+    let attached = match xhci::first_controller() {
         Some(c) => narf_scheduler::block_on(async { msc::enumerate_and_attach_msc(&c).await }),
         None => 0,
     };
@@ -614,7 +619,7 @@ fn smoke_msc_detach_replug_publication() -> TestResult {
 
     // Detach through the registry's unbind dispatch — the same
     // entry the supervisor's detach path calls.
-    class_registry::dispatch_unbind(200);
+    class_registry::dispatch_unbind(0, 200);
     if msc::with_device(idx, |d| d.slot_id).is_some() {
         return TestResult::Fail("MSC entry not tombstoned after detach");
     }
@@ -628,8 +633,8 @@ fn smoke_msc_detach_replug_publication() -> TestResult {
         return TestResult::Fail("partition child still published after detach");
     }
     // Detach is idempotent, including for a never-bound slot.
-    msc::detach_msc(200);
-    msc::detach_msc(201);
+    msc::detach_msc(0, 200);
+    msc::detach_msc(0, 201);
 
     // Replug: tombstone reuse republishes under the same name.
     let idx2 = msc::__insert_msc_for_test(200);
@@ -644,7 +649,7 @@ fn smoke_msc_detach_replug_publication() -> TestResult {
     }
 
     // Clean up so later smokes see an empty MSC registry.
-    msc::detach_msc(200);
+    msc::detach_msc(0, 200);
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_detach_replug_publication);
@@ -675,7 +680,7 @@ fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
     let data = [0xA5u8; 512];
 
     // Unplug A: the tombstone alone already fails the held adapter.
-    msc::detach_msc(202);
+    msc::detach_msc(0, 202);
     if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
         return TestResult::Fail("held adapter read not DeviceRemoved while tombstoned");
     }
@@ -719,7 +724,7 @@ fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
     // fabricated slot — DriverError, never DeviceRemoved. Without
     // a controller the environment cannot distinguish the two, so
     // this half is conditioned on one being present.
-    if crate::xhci::controller().is_some() {
+    if crate::xhci::first_controller().is_some() {
         if fresh.read(0, 1, &mut buf) != Err(BlockIoError::DriverError) {
             return TestResult::Fail("fresh adapter read did not pass the generation gate");
         }
@@ -737,7 +742,7 @@ fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
     // Same disk out and back in (A returns on slot 202): a rebind
     // is a new bind with a new generation, so NEITHER held adapter
     // is resurrected — B's adapter is stale by generation too.
-    msc::detach_msc(203);
+    msc::detach_msc(0, 203);
     let idx_a2 = msc::__insert_msc_for_test(202);
     if idx_a2 != idx {
         return TestResult::Fail("same-disk replug did not reuse the tombstoned index");
@@ -750,7 +755,7 @@ fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
     }
 
     // Clean up so later smokes see an empty MSC registry.
-    msc::detach_msc(202);
+    msc::detach_msc(0, 202);
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_stale_adapter_generation_gate);
@@ -866,25 +871,25 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
         hub_index_for_slot, idle_suspend_candidates, mark_port_activity, mark_ports_bound, HUBS,
         IDLE_SUSPEND_NS,
     };
-    let base = HUBS.lock().len();
-    HUBS.lock().push(fake_hub_binding(0xC0, 2));
+    let base = HUBS.of(0).lock().len();
+    HUBS.of(0).lock().push(fake_hub_binding(0xC0, 2));
     let result = (|| {
-        let idx = match hub_index_for_slot(0xC0) {
+        let idx = match hub_index_for_slot(0, 0xC0) {
             Some(i) => i,
             None => return TestResult::Fail("hub_index_for_slot missed pushed hub"),
         };
         if idx != base {
             return TestResult::Fail("hub index != append position");
         }
-        if hub_index_for_slot(0x3F).is_some() {
+        if hub_index_for_slot(0, 0x3F).is_some() {
             return TestResult::Fail("phantom hub index");
         }
         // Bind port 1 the way the supervisor now does.
         // Hub context is keyed by slot id (#892), so the bind
         // call takes the slot, not the registry index.
-        mark_ports_bound(0xC0, 1 << 1);
+        mark_ports_bound(0, 0xC0, 1 << 1);
         let tick = {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             let h = match g.iter().find(|h| h.hub.slot_id == 0xC0) {
                 Some(h) => h,
                 None => return TestResult::Fail("pushed hub missing"),
@@ -901,7 +906,7 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
         // the port still suspends when genuinely idle. (Contains-
         // checks: the scan covers the whole live registry.)
         {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             if idle_suspend_candidates(&g[..], tick + IDLE_SUSPEND_NS - 1_000_000_000)
                 .contains(&(0xC0, 1u8))
             {
@@ -915,9 +920,9 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
         }
         // A completed transfer feeds activity: tick moves to the
         // feed instant and the deadline moves with it.
-        mark_port_activity(0xC0, 1);
+        mark_port_activity(0, 0xC0, 1);
         let tick2 = {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             match g.iter().find(|h| h.hub.slot_id == 0xC0) {
                 Some(h) => h.last_activity_tick[1],
                 None => return TestResult::Fail("pushed hub missing"),
@@ -927,7 +932,7 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
             return TestResult::Fail("activity feed moved the tick backwards");
         }
         {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             if idle_suspend_candidates(&g[..], tick2 + IDLE_SUSPEND_NS - 1_000_000_000)
                 .contains(&(0xC0, 1u8))
             {
@@ -936,7 +941,7 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
         }
         TestResult::Pass
     })();
-    HUBS.lock().truncate(base);
+    HUBS.of(0).lock().truncate(base);
     result
 }
 kernel_test_in!("drivers/usb/hub_pm", smoke_hub_bind_stamps_activity);
@@ -953,14 +958,14 @@ kernel_test_in!("drivers/usb/hub_pm", smoke_hub_bind_stamps_activity);
 /// panic on a missing entry).
 fn smoke_hub_detach_shift_keeps_activity() -> TestResult {
     use crate::attach::{mark_port_activity, mark_ports_bound, HUBS};
-    let base = HUBS.lock().len();
-    HUBS.lock().push(fake_hub_binding(0xC0, 2));
-    HUBS.lock().push(fake_hub_binding(0xC1, 2));
-    HUBS.lock().push(fake_hub_binding(0xC2, 2));
+    let base = HUBS.of(0).lock().len();
+    HUBS.of(0).lock().push(fake_hub_binding(0xC0, 2));
+    HUBS.of(0).lock().push(fake_hub_binding(0xC1, 2));
+    HUBS.of(0).lock().push(fake_hub_binding(0xC2, 2));
     let result = (|| {
-        mark_ports_bound(0xC1, 1 << 1);
+        mark_ports_bound(0, 0xC1, 1 << 1);
         let bound_tick = {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             match g.iter().find(|h| h.hub.slot_id == 0xC1) {
                 Some(h) => h.last_activity_tick[1],
                 None => return TestResult::Fail("middle hub missing"),
@@ -970,13 +975,13 @@ fn smoke_hub_detach_shift_keeps_activity() -> TestResult {
             return TestResult::Fail("bind did not stamp middle hub tick");
         }
         // Detach the first hub exactly as `detach_slot` does.
-        HUBS.lock().retain(|h| h.hub.slot_id != 0xC0);
+        HUBS.of(0).lock().retain(|h| h.hub.slot_id != 0xC0);
         // Feed activity for the middle hub: must land on it even
         // though its registry index moved 1 -> 0, and must not
         // touch the third hub's tick.
-        mark_port_activity(0xC1, 1);
+        mark_port_activity(0, 0xC1, 1);
         let (mid_tick, third_tick) = {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             let mid = match g.iter().find(|h| h.hub.slot_id == 0xC1) {
                 Some(h) => h.last_activity_tick[1],
                 None => return TestResult::Fail("middle hub lost on detach"),
@@ -994,9 +999,9 @@ fn smoke_hub_detach_shift_keeps_activity() -> TestResult {
             return TestResult::Fail("activity feed stamped the wrong hub after detach shift");
         }
         // Feeding the detached hub's slot must stamp nothing.
-        mark_port_activity(0xC0, 1);
+        mark_port_activity(0, 0xC0, 1);
         let (mid_tick2, third_tick2) = {
-            let g = HUBS.lock();
+            let g = HUBS.of(0).lock();
             let mid = match g.iter().find(|h| h.hub.slot_id == 0xC1) {
                 Some(h) => h.last_activity_tick[1],
                 None => return TestResult::Fail("middle hub lost on detached feed"),
@@ -1012,7 +1017,7 @@ fn smoke_hub_detach_shift_keeps_activity() -> TestResult {
         }
         TestResult::Pass
     })();
-    HUBS.lock().truncate(base);
+    HUBS.of(0).lock().truncate(base);
     result
 }
 kernel_test_in!("drivers/usb/hub_pm", smoke_hub_detach_shift_keeps_activity);
@@ -1098,7 +1103,7 @@ fn smoke_hub_hid_context_collection() -> TestResult {
         ));
         // A second class on a different hub's port.
         hid::consumer::__push_consumer_for_test(14, Some((8, 2)));
-        let got = hid::hub_ports();
+        let got = hid::hub_ports(0);
         if got != alloc::vec![(7u8, 1u8), (8u8, 2u8)] {
             return TestResult::Fail("hub_ports aggregation mismatch");
         }
@@ -1337,7 +1342,7 @@ fn smoke_msc_flush_via_xhci_qemu() -> TestResult {
         return TestResult::Skip("xhci not probed");
     }
     msc::__reset_msc_for_test();
-    let attached = match xhci::controller() {
+    let attached = match xhci::first_controller() {
         Some(c) => narf_scheduler::block_on(async { msc::enumerate_and_attach_msc(&c).await }),
         None => 0,
     };
@@ -2652,7 +2657,7 @@ fn smoke_xhci_sibling_port_pairs_within_overlap() -> TestResult {
     // that on the live controller every USB3 port with a non-zero
     // sibling has a sibling that's marked USB2 (and vice versa),
     // proving the table is self-consistent.
-    let max = xhci::with_controller(|c| {
+    let max = with_first(|c| {
         c.connected_ports()
             .iter()
             .map(|(p, _)| *p)
@@ -2663,7 +2668,7 @@ fn smoke_xhci_sibling_port_pairs_within_overlap() -> TestResult {
     if max == 0 {
         return TestResult::Skip("no connected port to walk");
     }
-    let consistent = xhci::with_controller(|c| {
+    let consistent = with_first(|c| {
         for p in 1..=max {
             let sib = c.sibling_port(p);
             if sib == 0 {
@@ -2699,8 +2704,8 @@ fn smoke_xhci_sibling_port_zero_when_no_sibling() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let result = xhci::with_controller(|c| c.sibling_port(0) == 0 && c.sibling_port(255) == 0)
-        .unwrap_or(false);
+    let result =
+        with_first(|c| c.sibling_port(0) == 0 && c.sibling_port(255) == 0).unwrap_or(false);
     if result {
         TestResult::Pass
     } else {
@@ -2796,7 +2801,7 @@ static UNBIND_TEST_MATCHES: [crate::class_registry::UsbClassMatch; 1] =
         0xFFFE, 0xFFFE,
     )];
 
-fn unbind_hook_record(slot: u8) -> Result<(), ()> {
+fn unbind_hook_record(_controller: u8, slot: u8) -> Result<(), ()> {
     UNBIND_HOOK_LAST_SLOT.store(slot, core::sync::atomic::Ordering::SeqCst);
     UNBIND_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     Ok(())
@@ -2821,7 +2826,7 @@ fn smoke_usb_class_registry_unbind_dispatch() -> TestResult {
         return TestResult::Fail("hooked driver registration failed");
     }
     let before = UNBIND_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
-    let report = dispatch_unbind(9);
+    let report = dispatch_unbind(0, 9);
     if report.invoked == 0 {
         return TestResult::Fail("dispatch_unbind invoked no hooks");
     }
@@ -2845,7 +2850,7 @@ static UNBIND_OK_HOOK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic:
 /// Failing hook for the isolation test: fails ONLY for the
 /// sentinel slot 0xEE, so other dispatches (and other tests'
 /// hooks) are unaffected and the failure count is exact.
-fn unbind_hook_fail_sentinel(slot: u8) -> Result<(), ()> {
+fn unbind_hook_fail_sentinel(_controller: u8, slot: u8) -> Result<(), ()> {
     UNBIND_FAIL_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     if slot == 0xEE {
         Err(())
@@ -2854,7 +2859,7 @@ fn unbind_hook_fail_sentinel(slot: u8) -> Result<(), ()> {
     }
 }
 
-fn unbind_hook_ok_record(slot: u8) -> Result<(), ()> {
+fn unbind_hook_ok_record(_controller: u8, slot: u8) -> Result<(), ()> {
     let _ = slot;
     UNBIND_OK_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     Ok(())
@@ -2862,7 +2867,7 @@ fn unbind_hook_ok_record(slot: u8) -> Result<(), ()> {
 
 /// #893 regression: one failing unbind hook must not abort
 /// dispatch for the remaining hooks. The failing hook is
-/// registered BEFORE the ok hook; after `dispatch_unbind(0xEE)`
+/// registered BEFORE the ok hook; after `dispatch_unbind(0, 0xEE)`
 /// both must have run exactly once more and the report must
 /// count exactly one failure. (A panicking hook cannot be
 /// tested this way — panic is fatal by kernel policy, see
@@ -2892,7 +2897,7 @@ fn smoke_usb_class_registry_unbind_isolation() -> TestResult {
     }
     let fail_before = UNBIND_FAIL_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
     let ok_before = UNBIND_OK_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
-    let report = dispatch_unbind(0xEE);
+    let report = dispatch_unbind(0, 0xEE);
     if UNBIND_FAIL_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != fail_before + 1 {
         return TestResult::Fail("failing hook was not called exactly once");
     }
@@ -4218,7 +4223,7 @@ fn smoke_hid_pump_all_with_no_keyboards_is_noop() -> TestResult {
     hid::__reset_keyboards_for_test();
     let before_pumps = hid::PUMP_ALL_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let before_reports = hid::REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
-    let n = xhci::with_controller(hid::pump_all).unwrap_or(0);
+    let n = with_first(hid::pump_all).unwrap_or(0);
     if n != 0 {
         return TestResult::Fail("pump_all with no kbds returned non-zero events");
     }
@@ -4254,7 +4259,7 @@ fn smoke_hid_pump_counters_monotonic() -> TestResult {
     let baseline_pumps = hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
     // Drive several pumps; each must advance the counter by 1.
     for i in 1..=5u32 {
-        let _ = xhci::with_controller(hid::pump_all);
+        let _ = with_first(hid::pump_all);
         let now = hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
         if now != baseline_pumps + i {
             return TestResult::Fail("PUMP_ALL_CALLS didn't advance monotonically");
@@ -4922,14 +4927,14 @@ fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
     __test_push(__test_make_device(5, FpVendor::Goodix, false));
     __test_push(__test_make_device(7, FpVendor::Synaptics, false));
     // Unknown slot: no-op, occupant flag false.
-    let out = detach_fp(9);
+    let out = detach_fp(0, 9);
     if out.removed != 0 || out.fp0_occupant_removed || attached_fp_count() != 2 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("detach of unknown slot must be a no-op");
     }
     // Owner (index 0) detaches: entry gone, occupant flag true,
     // survivor keeps its slot.
-    let out = detach_fp(5);
+    let out = detach_fp(0, 5);
     if out.removed != 1 || !out.fp0_occupant_removed || attached_fp_count() != 1 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("detach of occupant must remove one entry + occupant flag");
@@ -4939,7 +4944,7 @@ fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
         return TestResult::Fail("survivor must keep its slot after owner detach");
     }
     // Idempotent: second detach of the same slot removes nothing.
-    let out = detach_fp(5);
+    let out = detach_fp(0, 5);
     if out.removed != 0 || out.fp0_occupant_removed || attached_fp_count() != 1 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("detach must be idempotent");
@@ -4964,7 +4969,7 @@ fn smoke_fp_detach_non_owner_keeps_node_flag() -> TestResult {
     crate::fingerprint::__reset_fp_for_test();
     __test_push(__test_make_device(5, FpVendor::Goodix, false));
     __test_push(__test_make_device(7, FpVendor::Synaptics, false));
-    let out = detach_fp(7);
+    let out = detach_fp(0, 7);
     if out.removed != 1 || out.fp0_occupant_removed || attached_fp_count() != 1 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("detach of non-owner must not raise the occupant flag");
@@ -4994,7 +4999,7 @@ fn smoke_fp_detach_via_unbind_dispatch() -> TestResult {
     crate::fingerprint::register_initcalls();
     __test_push(__test_make_device(200, FpVendor::Goodix, false));
     __test_push(__test_make_device(200, FpVendor::Wbdi, false));
-    let _report = crate::class_registry::dispatch_unbind(200);
+    let _report = crate::class_registry::dispatch_unbind(0, 200);
     if attached_fp_count() != 0 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("dispatch_unbind must reach the fingerprint detach hook");
@@ -5529,7 +5534,7 @@ fn smoke_fp_unbind_all_clears() -> TestResult {
     __test_push(__test_make_device(5, FpVendor::Goodix, false));
     __test_push(__test_make_device(7, FpVendor::Synaptics, false));
     __test_push(__test_make_device(9, FpVendor::Wbdi, false));
-    crate::fingerprint::unbind_all_fp();
+    crate::fingerprint::unbind_all_fp(0);
     if crate::fingerprint::attached_fp_count() != 0
         || !crate::fingerprint::enumerate_fp().is_empty()
         || crate::fingerprint::lookup_fp("fp0").is_some()
@@ -5552,11 +5557,11 @@ fn smoke_wbdi_detach_removes_slot() -> TestResult {
     __reset_fp_for_test();
     __test_register_device(5, FpVendor::Wbdi, 3, 2);
     __test_register_device(7, FpVendor::Wbdi, 3, 2);
-    if detach_fp(9).removed != 0 || attached_fp_count() != 2 {
+    if detach_fp(0, 9).removed != 0 || attached_fp_count() != 2 {
         __reset_fp_for_test();
         return TestResult::Fail("WBDI detach of unknown slot must be a no-op");
     }
-    if detach_fp(5).removed != 1 || attached_fp_count() != 1 {
+    if detach_fp(0, 5).removed != 1 || attached_fp_count() != 1 {
         __reset_fp_for_test();
         return TestResult::Fail("WBDI detach must remove only the slot's entry");
     }
@@ -5567,11 +5572,11 @@ fn smoke_wbdi_detach_removes_slot() -> TestResult {
         __reset_fp_for_test();
         return TestResult::Fail("WBDI survivor must keep its slot");
     }
-    if detach_fp(5).removed != 0 || attached_fp_count() != 1 {
+    if detach_fp(0, 5).removed != 0 || attached_fp_count() != 1 {
         __reset_fp_for_test();
         return TestResult::Fail("WBDI detach must be idempotent");
     }
-    if detach_fp(7).removed != 1 || lookup_fp("fp0").is_some() {
+    if detach_fp(0, 7).removed != 1 || lookup_fp("fp0").is_some() {
         __reset_fp_for_test();
         return TestResult::Fail("last WBDI detach must unpublish the provider node");
     }
@@ -7670,6 +7675,7 @@ fn smoke_uac_detach_removes_registry_and_card() -> TestResult {
         iso_in_dci: in_dci,
         card: Some(state),
         card_error: None,
+        controller: 0,
     });
     if crate::uac::attached_uac_count() != 1 {
         return TestResult::Fail("registry holds the bound device");
@@ -8726,7 +8732,7 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
     {
         return TestResult::Fail("both nodes must resolve before detach");
     }
-    crate::uvc::detach_uvc(7);
+    crate::uvc::detach_uvc(0, 7);
     if crate::uvc::attached_uvc_count() != 1 {
         return TestResult::Fail("detach must drop exactly one binding");
     }
@@ -8744,12 +8750,12 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
         return TestResult::Fail("survivor node must keep resolving");
     }
     // Idempotent, and unknown slots are a silent no-op.
-    crate::uvc::detach_uvc(7);
-    crate::uvc::detach_uvc(99);
+    crate::uvc::detach_uvc(0, 7);
+    crate::uvc::detach_uvc(0, 99);
     if crate::uvc::attached_uvc_count() != 1 {
         return TestResult::Fail("repeat/unknown detach must not change the registry");
     }
-    crate::uvc::detach_all_uvc();
+    crate::uvc::detach_all_uvc(0);
     if crate::uvc::attached_uvc_count() != 0 {
         return TestResult::Fail("wholesale detach must clear every binding");
     }
@@ -8795,7 +8801,7 @@ fn smoke_uvc_dispatch_unbind_reaches_detach() -> TestResult {
         Err(e) => return TestResult::Fail(e),
     };
     crate::uvc::register_initcalls();
-    let report = crate::class_registry::dispatch_unbind(7);
+    let report = crate::class_registry::dispatch_unbind(0, 7);
     if report.invoked == 0 {
         return TestResult::Fail("dispatch_unbind invoked no hooks");
     }
@@ -10623,3 +10629,71 @@ fn smoke_msc_fixture_reset_recovery() -> TestResult {
     }
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_reset_recovery);
+
+/// Two controllers number their slots independently: the same slot id
+/// on xhci0 and xhci1 names two different devices. Hub bookkeeping and
+/// class bindings are per controller, so activity, bind marks, lookups
+/// and detach on one controller never touch the other's binding.
+fn smoke_usb_bindings_are_per_controller() -> TestResult {
+    use crate::attach::{
+        hub_index_for_slot, hub_port_is_suspended, mark_port_activity, mark_ports_bound, HUBS,
+    };
+    const SLOT: u8 = 0xC4;
+    let base0 = HUBS.of(0).lock().len();
+    let base1 = HUBS.of(1).lock().len();
+    HUBS.of(0).lock().push(fake_hub_binding(SLOT, 2));
+    let mut other = fake_hub_binding(SLOT, 2);
+    other.suspended_downstream = 1 << 1;
+    other.bound_downstream = 1 << 1;
+    HUBS.of(1).lock().push(other);
+    let result = (|| {
+        if hub_index_for_slot(0, SLOT) != Some(base0) || hub_index_for_slot(1, SLOT) != Some(base1)
+        {
+            return TestResult::Fail("hub lookup crossed controllers");
+        }
+        if hub_port_is_suspended(0, SLOT, 1) || !hub_port_is_suspended(1, SLOT, 1) {
+            return TestResult::Fail("suspend state crossed controllers");
+        }
+        mark_ports_bound(0, SLOT, 1 << 2);
+        mark_port_activity(1, SLOT, 1);
+        let (bound0, tick0) = {
+            let g = HUBS.of(0).lock();
+            (g[base0].bound_downstream, g[base0].last_activity_tick[1])
+        };
+        let (bound1, tick1) = {
+            let g = HUBS.of(1).lock();
+            (g[base1].bound_downstream, g[base1].last_activity_tick[1])
+        };
+        if bound0 != 1 << 2 || bound1 != 1 << 1 {
+            return TestResult::Fail("bind mark crossed controllers");
+        }
+        if tick0 != 0 || tick1 == 0 {
+            return TestResult::Fail("activity crossed controllers");
+        }
+        // Class bindings: one consumer device per controller on the
+        // same slot; detaching xhci1's leaves xhci0's.
+        crate::hid::consumer::__reset_consumers_for_test();
+        crate::hid::consumer::__push_consumer_on_for_test(0, SLOT, Some((0x10, 3)));
+        crate::hid::consumer::__push_consumer_on_for_test(1, SLOT, Some((0x11, 4)));
+        if crate::hid::consumer::hub_ports(0) != alloc::vec![(0x10, 3)]
+            || crate::hid::consumer::hub_ports(1) != alloc::vec![(0x11, 4)]
+        {
+            return TestResult::Fail("consumer registry crossed controllers");
+        }
+        if !crate::hid::consumer::detach_consumer(1, SLOT) {
+            return TestResult::Fail("xhci1 consumer not detached");
+        }
+        if crate::hid::consumer::hub_ports(0) != alloc::vec![(0x10, 3)]
+            || !crate::hid::consumer::hub_ports(1).is_empty()
+            || crate::hid::consumer::attached_consumer_count() != 1
+        {
+            return TestResult::Fail("detach on xhci1 touched xhci0's binding");
+        }
+        TestResult::Pass
+    })();
+    crate::hid::consumer::__reset_consumers_for_test();
+    HUBS.of(0).lock().truncate(base0);
+    HUBS.of(1).lock().truncate(base1);
+    result
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_bindings_are_per_controller);

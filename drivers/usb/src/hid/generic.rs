@@ -93,7 +93,8 @@ pub struct GenericDevice {
 }
 
 /// Global registry of bound Generic HID interfaces.
-static GENERIC_DEVICES: IrqSafeSpinLock<Vec<GenericDevice>> = IrqSafeSpinLock::new(Vec::new());
+static GENERIC_DEVICES: crate::xhci::PerController<Vec<GenericDevice>> =
+    crate::per_controller_vec!();
 
 /// Lock-free count.
 pub static ATTACHED_GENERIC_COUNT: core::sync::atomic::AtomicU32 =
@@ -203,9 +204,8 @@ pub async fn try_bind_generic(
         evdev_node,
     };
     {
-        let mut g = GENERIC_DEVICES.lock();
-        g.push(dev);
-        ATTACHED_GENERIC_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        GENERIC_DEVICES.of(xhci_dev.id()).lock().push(dev);
+        ATTACHED_GENERIC_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     {
         use core::fmt::Write as _;
@@ -222,21 +222,26 @@ pub async fn try_bind_generic(
 
 /// Unregister a generic device's evdev DeviceNode from the ROUTER.
 /// Call when the device is detached / unplugged.
-pub fn unregister_generic_evdev(slot_id: u8) {
-    let mut g = GENERIC_DEVICES.lock();
+pub fn unregister_generic_evdev(controller: u8, slot_id: u8) {
+    let mut g = GENERIC_DEVICES.of(controller).lock();
     if let Some(pos) = g.iter().position(|d| d.slot_id == slot_id) {
         let dev = g.remove(pos);
         ROUTER.unregister_device(dev.evdev_id);
-        ATTACHED_GENERIC_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        crate::hid::saturating_sub(&ATTACHED_GENERIC_COUNT, 1);
     }
 }
 
-/// Unregister every bound generic device. Called on a controller
-/// recovery epoch change.
-pub fn unregister_all_generic() {
-    let slots: alloc::vec::Vec<u8> = GENERIC_DEVICES.lock().iter().map(|d| d.slot_id).collect();
+/// Unregister every generic device bound on `controller`. Called on a
+/// controller recovery epoch change.
+pub fn unregister_all_generic(controller: u8) {
+    let slots: alloc::vec::Vec<u8> = GENERIC_DEVICES
+        .of(controller)
+        .lock()
+        .iter()
+        .map(|d| d.slot_id)
+        .collect();
     for slot in slots {
-        unregister_generic_evdev(slot);
+        unregister_generic_evdev(controller, slot);
     }
 }
 
@@ -245,7 +250,7 @@ pub fn unregister_all_generic() {
 /// Drain reports from all Generic devices, dispatch events. Returns
 /// total events across all devices.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
-    let len = GENERIC_DEVICES.lock().len();
+    let len = GENERIC_DEVICES.of(xhci_dev.id()).lock().len();
     let mut total = 0;
     for idx in 0..len {
         total += pump_one(xhci_dev, idx);
@@ -255,7 +260,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 
 fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     let (slot_id, dci) = {
-        let g = GENERIC_DEVICES.lock();
+        let g = GENERIC_DEVICES.of(xhci_dev.id()).lock();
         match g.get(idx) {
             Some(d) => (d.slot_id, d.interrupt_in_dci),
             None => return 0,
@@ -267,7 +272,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
         let report = &buf[..n.min(MAX_GENERIC_REPORT)];
         // Snapshot descriptor + prev_report + evdev_node under lock.
         let (desc, prev, node) = {
-            let g = GENERIC_DEVICES.lock();
+            let g = GENERIC_DEVICES.of(xhci_dev.id()).lock();
             match g.get(idx) {
                 Some(d) => {
                     let pr = *d.prev_report.lock();
@@ -279,7 +284,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
         total += dispatch_report(&desc, report, &prev[..n.min(MAX_GENERIC_REPORT)], &node);
         // Update prev_report.
         {
-            let g = GENERIC_DEVICES.lock();
+            let g = GENERIC_DEVICES.of(xhci_dev.id()).lock();
             if let Some(d) = g.get(idx) {
                 let mut pr = d.prev_report.lock();
                 let copy_len = n.min(MAX_GENERIC_REPORT);
@@ -587,7 +592,9 @@ fn dispatch_array_usage(page: u16, usage: u32, pressed: bool, node: &DeviceNode)
 
 #[doc(hidden)]
 pub fn __reset_generic_devices_for_test() {
-    GENERIC_DEVICES.lock().clear();
+    for (_, devices) in GENERIC_DEVICES.each() {
+        devices.lock().clear();
+    }
     ATTACHED_GENERIC_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 

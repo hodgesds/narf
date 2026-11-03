@@ -62,6 +62,7 @@
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
@@ -549,6 +550,17 @@ pub struct Xhci {
     /// IDT vector allocated for this controller's interrupter 0,
     /// or `None` if MSI-X wasn't enabled.
     pub irq_vector: Option<u8>,
+    /// Stable controller index (`xhci<N>`, probe order). Every class
+    /// binding records it, because slot IDs and root-port numbers are
+    /// only unique within one controller.
+    id: u8,
+    /// The PCI function this controller drives, so a second probe of
+    /// the same function (exact-ID and class matches both fire) does not
+    /// bring it up twice.
+    bus_addr: narf_bus::BusAddr,
+    /// Waker of this controller's USB supervisor, poked by the demux on a
+    /// Port Status Change Event.
+    supervisor_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
 }
 
 /// Per-slot device state held by the controller after a successful
@@ -1856,7 +1868,31 @@ impl Xhci {
             running: true,
             msix,
             irq_vector,
+            id: 0,
+            bus_addr: device.addr,
+            supervisor_waker: IrqSafeSpinLock::new(None),
         })
+    }
+
+    /// This controller's index (`xhci<N>`); see [`controller_by_id`].
+    pub fn id(&self) -> u8 {
+        self.id
+    }
+
+    /// Install this controller's supervisor waker so the demux can poke
+    /// it on a Port Status Change Event. Replaces any previous waker.
+    pub fn register_supervisor_waker(&self, w: core::task::Waker) {
+        *self.supervisor_waker.lock() = Some(w);
+    }
+
+    /// Wake this controller's supervisor if it registered a waker. The
+    /// lock is dropped before `wake_by_ref` to keep IRQ-context work
+    /// bounded.
+    fn wake_supervisor(&self) {
+        let w = self.supervisor_waker.lock().clone();
+        if let Some(w) = w {
+            w.wake_by_ref();
+        }
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT
@@ -2418,7 +2454,7 @@ impl Xhci {
             // The counter publication is ordered already. Invoke arbitrary
             // registered wakers after releasing the demux reservation.
             drop(_publication);
-            wake_usb_supervisor();
+            self.wake_supervisor();
             return Some(ev);
         }
         let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
@@ -5374,10 +5410,74 @@ fn enqueue_normal_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, 
 /// at the per-resource inner locks the `Xhci` struct already owns
 /// (`cmd_enqueue`, `cmd_pcs`, `cmd_events`, `transfer_events`,
 /// `er_dequeue`, `er_ccs`).
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Xhci>>> = IrqSafeSpinLock::new(None);
+static CONTROLLERS: IrqSafeSpinLock<Vec<Arc<Xhci>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Most xHCI controllers one machine drives (`xhci0`..). Probe refuses
+/// controllers beyond it rather than aliasing their registries.
+pub const MAX_CONTROLLERS: usize = 8;
+
+/// One registry per controller, indexed by [`Xhci::id`]. Slot IDs and
+/// root-port numbers are only unique within a controller, so every
+/// slot- or port-keyed binding registry is split this way: a binding's
+/// controller is the registry it lives in.
+pub struct PerController<T>([IrqSafeSpinLock<T>; MAX_CONTROLLERS]);
+
+impl<T> core::fmt::Debug for PerController<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PerController")
+    }
+}
+
+impl<T> PerController<T> {
+    pub const fn new(locks: [IrqSafeSpinLock<T>; MAX_CONTROLLERS]) -> Self {
+        Self(locks)
+    }
+
+    /// The registry of controller `id`. An out-of-range id (never
+    /// produced by probe) maps to the last registry rather than
+    /// panicking.
+    pub fn of(&self, id: u8) -> &IrqSafeSpinLock<T> {
+        &self.0[usize::from(id).min(MAX_CONTROLLERS - 1)]
+    }
+
+    /// Every controller's registry with its id.
+    pub fn each(&self) -> impl Iterator<Item = (u8, &IrqSafeSpinLock<T>)> {
+        self.0.iter().enumerate().map(|(i, l)| (i as u8, l))
+    }
+}
+
+/// `PerController<Vec<T>>` with every registry empty.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! per_controller_vec {
+    () => {
+        $crate::xhci::PerController::new(
+            [const { narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()) };
+                $crate::xhci::MAX_CONTROLLERS],
+        )
+    };
+}
+
+/// Hook the USB supervisor installs once it starts, so a controller
+/// probed later still gets its own supervisor. Read and written only
+/// under the [`CONTROLLERS`] lock, so no controller is missed between
+/// the supervisor's snapshot and its hook installation.
+static ON_CONTROLLER_BOUND: IrqSafeSpinLock<Option<ControllerHook>> = IrqSafeSpinLock::new(None);
+
+/// Run once for each controller bound after the supervisor started.
+type ControllerHook = fn(Arc<Xhci>);
+
+/// Install the hook run for every controller bound from now on, and
+/// return the controllers already bound (which the caller starts
+/// itself). Called once by the supervisor initcall.
+pub(crate) fn on_controller_bound(hook: ControllerHook) -> Vec<Arc<Xhci>> {
+    let controllers = CONTROLLERS.lock();
+    *ON_CONTROLLER_BOUND.lock() = Some(hook);
+    controllers.clone()
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.bus_addr == device.addr) {
         return Ok(());
     }
     // Every reset, recovery and timeout below is a `Deadline`/sleep in
@@ -5424,14 +5524,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
-    let dev = match unsafe { Xhci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { Xhci::bring_up(&device, &cap) } {
         Ok(d) => d,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+        Err(e) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: {:04x}:{:04x} at {:?} bring-up failed: {:?}",
+                device.id.vendor,
+                device.id.device,
+                device.addr,
+                e
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
     };
-    *CONTROLLER.lock() = Some(Arc::new(dev));
+    let (controller, name, hook) = {
+        let mut controllers = CONTROLLERS.lock();
+        if controllers.len() >= MAX_CONTROLLERS {
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+        let id = controllers.len() as u8;
+        dev.id = id;
+        let controller = Arc::new(dev);
+        controllers.push(controller.clone());
+        let hook = *ON_CONTROLLER_BOUND.lock();
+        (controller, alloc::format!("xhci{id}"), hook)
+    };
     IS_PROBED.store(true, core::sync::atomic::Ordering::Release);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("xhci0"),
+        name,
         kind: narf_drivers::BoundKind::UsbHost,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
@@ -5442,7 +5564,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Real D3 handling for xHCI also needs to save/restore the
     // Operational + Doorbell register windows, which the
     // current shape doesn't do — registered as best-effort.
-    narf_power::device_pm::register_device_pm("xhci0", xhci_suspend_handler, xhci_resume_handler);
+    // One registration covers every controller: the handlers walk the
+    // whole registry (the PM hooks are plain `fn`s with no context).
+    if controller.id() == 0 {
+        narf_power::device_pm::register_device_pm(
+            "xhci",
+            xhci_suspend_handler,
+            xhci_resume_handler,
+        );
+    }
+    if let Some(hook) = hook {
+        hook(controller);
+    }
     Ok(())
 }
 
@@ -5456,12 +5589,12 @@ fn xhci_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErro
     if !is_probed() {
         return Ok(());
     }
-    // Halt: clear USBCMD.R/S. Use with_controller to reach the regs.
-    let halted = with_controller(|c| {
-        // SAFETY: BAR5 mapped, exclusive owner.
-        unsafe { c.halt_for_suspend() }
-    })
-    .unwrap_or(false);
+    // Halt: clear USBCMD.R/S on every bound controller.
+    // Halt every controller even if one fails.
+    let halted = controllers().iter().fold(true, |ok, c| {
+        // SAFETY: BAR mapped, exclusive owner.
+        (unsafe { c.halt_for_suspend() }) && ok
+    });
     if halted {
         Ok(())
     } else {
@@ -5477,11 +5610,10 @@ fn xhci_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError
     if !is_probed() {
         return Ok(());
     }
-    let resumed = with_controller(|c| {
+    let resumed = controllers().iter().fold(true, |ok, c| {
         // SAFETY: same.
-        unsafe { c.run_for_resume() }
-    })
-    .unwrap_or(false);
+        (unsafe { c.run_for_resume() }) && ok
+    });
     if resumed {
         Ok(())
     } else {
@@ -5526,13 +5658,13 @@ pub fn register_pci_driver() {
     });
 }
 
-/// Lock-free probe-status flag. Mirrors `CONTROLLER.is_some()` —
+/// Lock-free probe-status flag: true once any controller is bound —
 /// set once when probe succeeds, never cleared in production
 /// (xhci doesn't unbind today). Diagnostics MUST read this rather
-/// than locking CONTROLLER, because the USB HID supervisor holds
-/// CONTROLLER for tens of ms during port attach on real silicon
+/// than locking the controller registry, because the USB HID supervisor
+/// holds controllers for tens of ms during port attach on real silicon
 /// and IrqSafeSpinLock disables IF on the waiter — a status-panel
-/// paint that locks CONTROLLER freezes the entire CPU until the
+/// paint that locks the registry freezes the entire CPU until the
 /// supervisor releases.
 pub static IS_PROBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -5554,63 +5686,24 @@ pub fn is_probed() -> bool {
 /// for an immediate re-poll.
 pub static USB_PSCE_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Optional supervisor waker. The USB supervisor registers its
-/// `core::task::Waker` via [`register_supervisor_waker`]; the xHCI
-/// ISR / demux calls `wake_by_ref` on it whenever a Port Status
-/// Change Event lands. Stored behind an `IrqSafeSpinLock` so the
-/// ISR (which preempts the supervisor) can install/observe it
-/// without racing.
-///
-/// Semantics: the slot holds at most one waker. A new
-/// `register_supervisor_waker` replaces the previous occupant —
-/// matches `core::task::Waker::will_wake` dedup behaviour but
-/// without the lookup, since we only ever have one supervisor.
-static USB_SUPERVISOR_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> =
-    IrqSafeSpinLock::new(None);
-
-/// Install the USB supervisor's waker so the xHCI demux can poke
-/// it on a Port Status Change Event. Replaces any previously
-/// installed waker. Pass `cx.waker().clone()` from the supervisor's
-/// poll path; the slot caches it across yields.
-pub fn register_supervisor_waker(w: core::task::Waker) {
-    let mut g = USB_SUPERVISOR_WAKER.lock();
-    *g = Some(w);
+/// Every bound controller, in probe order (`xhci0`, `xhci1`, ...). The
+/// registry lock is held only for the clone.
+pub fn controllers() -> Vec<Arc<Xhci>> {
+    CONTROLLERS.lock().clone()
 }
 
-/// Internal: wake the supervisor if a waker is registered.
-/// Called from the ISR / demux path on PSCE. Drops the lock
-/// before invoking `wake_by_ref` to keep IRQ-context work bounded
-/// — the waker only flips the per-task awake flag, but doing it
-/// outside the lock keeps the lock-hold-time predictable.
-fn wake_usb_supervisor() {
-    let w = {
-        let g = USB_SUPERVISOR_WAKER.lock();
-        g.clone()
-    };
-    if let Some(w) = w {
-        w.wake_by_ref();
-    }
+/// The controller with index `id` ([`Xhci::id`]) — what every class
+/// binding uses to reach its own device. Slot IDs and port numbers are
+/// only unique within one controller.
+pub fn controller_by_id(id: u8) -> Option<Arc<Xhci>> {
+    CONTROLLERS.lock().get(usize::from(id)).cloned()
 }
 
-/// Get a cloned `Arc<Xhci>` handle to the bound controller, or
-/// `None` if no controller is bound. The registry lock is held
-/// ONLY for the Arc clone — never across the caller's work. Use
-/// this in preference to [`with_controller`] when the work spans
-/// multiple MMIO ops, command-completion waits, or any path that
-/// would benefit from releasing the lock between sub-steps.
-pub fn controller() -> Option<Arc<Xhci>> {
-    CONTROLLER.lock().clone()
-}
-
-/// Convenience wrapper: clone the Arc, drop the registry lock,
-/// then invoke `f`. Semantically identical to the previous
-/// closure-inside-the-lock shape from the caller's perspective,
-/// but the outer lock is no longer held during `f` — `f` can
-/// take seconds (port reset, command completion) without blocking
-/// every other caller / the ISR.
-pub fn with_controller<R>(f: impl FnOnce(&Xhci) -> R) -> Option<R> {
-    let c = controller()?;
-    Some(f(&c))
+/// The first bound controller. Only for callers with no device context
+/// (diagnostics, status counters); anything acting on a device must use
+/// its binding's controller via [`controller_by_id`].
+pub fn first_controller() -> Option<Arc<Xhci>> {
+    CONTROLLERS.lock().first().cloned()
 }
 
 /// xHCI ISR — runs in IRQ context.
@@ -5639,11 +5732,18 @@ fn xhci_isr() {
     // demux/poll/ack step takes its own per-resource inner lock
     // as needed; that's the right granularity for a shared
     // controller handle.
-    let xhci = match controller() {
-        Some(x) => x,
-        None => return,
-    };
-    let xhci = &*xhci;
+    // The vector may be shared (INTx) and the handler has no context,
+    // so service every controller; one with nothing pending returns
+    // from the demux at once, and the IMAN write only clears IP.
+    // Iterate under the registry lock rather than cloning the list:
+    // the ISR must not allocate.
+    let controllers = CONTROLLERS.lock();
+    for xhci in controllers.iter() {
+        service_interrupt(xhci);
+    }
+}
+
+fn service_interrupt(xhci: &Xhci) {
     // Demux up to N events into the per-class queues so any
     // waiter (await_event) sees its event regardless of
     // whether the ISR or the waiter dequeued it from the ring.

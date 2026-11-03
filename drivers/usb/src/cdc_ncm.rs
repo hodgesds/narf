@@ -1458,6 +1458,7 @@ pub mod tests {
             iface_name: alloc::format!("usb-ncm-model-{}", slot_id),
             pump_running: false,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1518,6 +1519,7 @@ pub mod tests {
             iface_name: alloc::format!("usb-ncm-detach{}", slot_id),
             pump_running: true,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1564,7 +1566,7 @@ pub mod tests {
             let mut g = CDC_NCM_DEVICES.lock();
             g[0].pump_running = false;
         }
-        if detach_ncm_slot(7).is_err() {
+        if detach_ncm_slot(0, 7).is_err() {
             __reset_ncm_for_test();
             return TestResult::Fail("detach must be infallible");
         }
@@ -1581,13 +1583,13 @@ pub mod tests {
             return TestResult::Fail("detach must tombstone exactly one binding");
         }
         // Idempotent, and unknown slots are a silent no-op.
-        let _ = detach_ncm_slot(7);
-        let _ = detach_ncm_slot(99);
+        let _ = detach_ncm_slot(0, 7);
+        let _ = detach_ncm_slot(0, 99);
         if attached_ncm_count() != 1 || tx_target(1) != Some((9, 6)) {
             __reset_ncm_for_test();
             return TestResult::Fail("repeat/unknown detach must not change the registry");
         }
-        detach_all_ncm();
+        detach_all_ncm(0);
         if attached_ncm_count() != 0
             || tx_target(1).is_some()
             || narf_net::iface::lookup(&name9).is_some()
@@ -1620,7 +1622,7 @@ pub mod tests {
             __reset_ncm_for_test();
             return TestResult::Fail("re-bind must not recycle the detached iface name");
         }
-        let _ = detach_ncm_slot(7);
+        let _ = detach_ncm_slot(0, 7);
         if attached_ncm_count() != 0 {
             __reset_ncm_for_test();
             return TestResult::Fail("cleanup detach must leave no live binding");
@@ -1657,10 +1659,11 @@ pub mod tests {
                 iface_name: alloc::format!("usb-ncm-detach{}", 7),
                 pump_running: true,
                 detached: false,
+                controller: 0,
             });
         }
         register_initcalls();
-        let report = crate::class_registry::dispatch_unbind(7);
+        let report = crate::class_registry::dispatch_unbind(0, 7);
         let live = attached_ncm_count();
         __reset_ncm_for_test();
         if report.invoked == 0 {
@@ -1701,6 +1704,7 @@ pub mod tests {
             iface_name: alloc::format!("usb-ncm-detach{}", slot_id),
             pump_running: true,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1730,7 +1734,7 @@ pub mod tests {
             return TestResult::Fail("net ifaces must resolve before detach");
         }
         register_initcalls();
-        let report = crate::class_registry::dispatch_unbind(7);
+        let report = crate::class_registry::dispatch_unbind(0, 7);
         if report.invoked == 0 {
             __reset_ncm_for_test();
             return TestResult::Fail("dispatch_unbind invoked no hooks");
@@ -1782,7 +1786,7 @@ pub mod tests {
             __reset_ncm_for_test();
             return TestResult::Fail("re-bind must publish fresh and keep the old cookie dead");
         }
-        let _ = detach_ncm_slot(7);
+        let _ = detach_ncm_slot(0, 7);
         __reset_ncm_for_test();
         TestResult::Pass
     }
@@ -2023,9 +2027,13 @@ pub struct CdcNcmDevice {
     /// indices — removing a record would retarget every later
     /// device's cookie at the wrong device (the ECM rule).
     pub detached: bool,
+    /// Index of the xHCI controller the device is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
-/// System-wide registry of bound CDC-NCM devices.
+/// System-wide registry of bound CDC-NCM devices (records carry their
+/// controller; indices are the net-registry TX cookies).
 pub static CDC_NCM_DEVICES: IrqSafeSpinLock<Vec<CdcNcmDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Find the first CDC-Comm interface with subclass NCM in `cfg`.
@@ -2411,6 +2419,7 @@ pub async fn try_bind_ncm_already_addressed(
             iface_name: alloc::format!("usb-ncm{}", idx),
             pump_running: false,
             detached: false,
+            controller: xhci_dev.id(),
         });
         idx
     };
@@ -2450,7 +2459,7 @@ async fn ncm_rx_pump(idx: usize) {
             dev.ntb32,
         )
     };
-    let Some(c) = crate::xhci::controller() else {
+    let Some(c) = controller_of(idx) else {
         let mut g = CDC_NCM_DEVICES.lock();
         if let Some(dev) = g.get_mut(idx) {
             dev.pump_running = false;
@@ -2554,6 +2563,13 @@ pub fn find_ncm_bulk_endpoints(
     }
 }
 
+/// The live controller of device record `idx`, if the record is bound
+/// and its controller is present.
+fn controller_of(idx: usize) -> Option<alloc::sync::Arc<crate::xhci::Xhci>> {
+    let controller = CDC_NCM_DEVICES.lock().get(idx)?.controller;
+    crate::xhci::controller_by_id(controller)
+}
+
 /// Resolve a device-record index to its TX target
 /// `(slot_id, bulk_out_dci)`. A detached record resolves to
 /// `None`: a tombstoned index must never retarget a later
@@ -2614,7 +2630,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
     // bulk_out via block_on. Safe here because the trampoline is
     // called from netstack TX paths that are not themselves inside
     // an executor poll.
-    let c = match crate::xhci::controller() {
+    let c = match controller_of(idx) {
         Some(c) => c,
         None => return Err(NcmError::Truncated),
     };
@@ -2667,7 +2683,7 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmEr
     };
     // Sync entry-point on the net RX path; bridge to async bulk_in
     // via block_on. Called from non-executor contexts.
-    let c = match crate::xhci::controller() {
+    let c = match controller_of(idx) {
         Some(c) => c,
         None => return Err(NcmError::Truncated),
     };
@@ -2743,11 +2759,14 @@ fn ncm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<()
 /// Infallible bookkeeping, adapted to the [`UsbUnbindFn`]
 /// contract with an unconditional `Ok(())` (#893: a hook
 /// reports failure with `Err(())`, never by panicking).
-pub fn detach_ncm_slot(slot_id: u8) -> Result<(), ()> {
+pub fn detach_ncm_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
     let ifaces: Vec<alloc::string::String> = {
         let mut g = CDC_NCM_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && d.slot_id == slot_id && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());
@@ -2762,15 +2781,18 @@ pub fn detach_ncm_slot(slot_id: u8) -> Result<(), ()> {
 
 /// Wholesale variant of [`detach_ncm_slot`] for controller
 /// recovery (`attach::detach_all_bindings`): tombstone every
-/// NCM binding and unregister every net iface, regardless of
-/// slot. Infallible and idempotent, same pump-exit and
+/// NCM binding on `controller` and unregister its net iface,
+/// regardless of slot. Infallible and idempotent, same pump-exit and
 /// never-remove reasoning as [`detach_ncm_slot`], and the same
 /// #789 mirror verdict (no clear call owed).
-pub fn detach_all_ncm() {
+pub fn detach_all_ncm(controller: u8) {
     let ifaces: Vec<alloc::string::String> = {
         let mut g = CDC_NCM_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());

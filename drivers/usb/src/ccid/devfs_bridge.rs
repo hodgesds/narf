@@ -128,7 +128,7 @@ pub trait CcidTransport: Send + Sync {
 }
 
 /// Production transport: reader `reader_index` in
-/// `ccid::CCID_READERS`, driven over `xhci::controller()`.
+/// `ccid::CCID_READERS`, driven over the reader's own controller.
 #[derive(Debug)]
 struct XhciTransport {
     reader_index: usize,
@@ -141,7 +141,7 @@ impl XhciTransport {
             .get(self.reader_index)
             .cloned()
             .ok_or(CcidError::Transfer)?;
-        let xhci = crate::xhci::controller().ok_or(CcidError::Transfer)?;
+        let xhci = crate::xhci::controller_by_id(reader.controller).ok_or(CcidError::Transfer)?;
         Ok((reader, xhci))
     }
 }
@@ -581,7 +581,7 @@ pub fn spawn_slot_change_pump() {
         let mut cycle: u32 = 0;
         let mut buf = [0u8; 64];
         loop {
-            if let Some(xhci) = crate::xhci::controller() {
+            if crate::xhci::is_probed() {
                 // Clone the Arc list under a short lock; never hold
                 // the registry lock across the polls below.
                 let readers = ccid::CCID_READERS.lock().clone();
@@ -590,6 +590,10 @@ pub fn spawn_slot_change_pump() {
                 }
                 for (i, reader) in readers.iter().enumerate() {
                     let Some(intr) = reader.intr_in_ep else {
+                        continue;
+                    };
+                    // Each reader is driven over its own controller.
+                    let Some(xhci) = crate::xhci::controller_by_id(reader.controller) else {
                         continue;
                     };
                     if !armed[i] {

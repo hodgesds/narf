@@ -690,8 +690,8 @@ impl TtyUsbFile {
     /// `NoDevice`.
     fn actuation(&self) -> Option<(Arc<crate::xhci::Xhci>, u8)> {
         let idx = self.port.lock().index;
-        let (slot, _, _) = port::binding_for_tty(idx)?;
-        let xhci = crate::xhci::controller()?;
+        let (controller, slot, _, _) = port::binding_for_tty(idx)?;
+        let xhci = crate::xhci::controller_by_id(controller)?;
         Some((xhci, slot))
     }
 

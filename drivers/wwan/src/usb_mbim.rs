@@ -498,6 +498,8 @@ impl WwanPort for UsbMbimControlPort {
 
 /// One bound USB MBIM modem.
 struct UsbMbimDevice {
+    /// xHCI controller index (`Xhci::id`); slot ids are per controller.
+    controller: u8,
     slot_id: u8,
     transport: UsbMbimTransport,
     /// The session owner, in a take/put cell: exactly one driver of
@@ -510,8 +512,9 @@ struct UsbMbimDevice {
 static USB_MBIM_DEVICES: IrqSafeSpinLock<Vec<Arc<UsbMbimDevice>>> =
     IrqSafeSpinLock::new(Vec::new());
 
-/// Slots with a bring-up in flight or completed (probe dedupe).
-static MBIM_CLAIMED_SLOTS: IrqSafeSpinLock<Vec<u8>> = IrqSafeSpinLock::new(Vec::new());
+/// (controller, slot) pairs with a bring-up in flight or completed
+/// (probe dedupe).
+static MBIM_CLAIMED_SLOTS: IrqSafeSpinLock<Vec<(u8, u8)>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Number of bound USB MBIM modems.
 pub fn attached_mbim_count() -> usize {
@@ -522,11 +525,12 @@ pub fn attached_mbim_count() -> usize {
 /// bring-up. Returns `Ok` on claim, mirroring the rtl8xxxu pattern.
 pub fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
     {
+        let key = (device.controller().id(), device.slot_id());
         let mut claimed = MBIM_CLAIMED_SLOTS.lock();
-        if claimed.contains(&device.slot_id()) {
+        if claimed.contains(&key) {
             return Ok(());
         }
-        claimed.push(device.slot_id());
+        claimed.push(key);
     }
     let _ = writeln!(
         narf_console::Writer,
@@ -543,27 +547,30 @@ pub fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
                 device.slot_id(),
                 e
             );
+            let key = (device.controller().id(), device.slot_id());
             let mut claimed = MBIM_CLAIMED_SLOTS.lock();
-            claimed.retain(|s| *s != device.slot_id());
+            claimed.retain(|s| *s != key);
         }
     });
     Ok(())
 }
 
-/// Class-registry unbind hook: drop the binding for `slot_id`.
-/// Infallible: the detach path cannot fail, so it reports `Ok(())`
-/// unconditionally, matching the UsbUnbindFn contract.
-pub fn unbind(slot_id: u8) -> Result<(), ()> {
+/// Class-registry unbind hook: drop the binding for `slot_id` on
+/// `controller`. Infallible: the detach path cannot fail, so it reports
+/// `Ok(())` unconditionally, matching the UsbUnbindFn contract.
+pub fn unbind(controller: u8, slot_id: u8) -> Result<(), ()> {
     let rec = {
         let mut g = USB_MBIM_DEVICES.lock();
-        let pos = g.iter().position(|d| d.slot_id == slot_id);
+        let pos = g
+            .iter()
+            .position(|d| d.controller == controller && d.slot_id == slot_id);
         pos.map(|p| g.remove(p))
     };
     if let Some(rec) = rec {
         bearer::detach_bearer(rec.bearer);
     }
     let mut claimed = MBIM_CLAIMED_SLOTS.lock();
-    claimed.retain(|s| *s != slot_id);
+    claimed.retain(|s| *s != (controller, slot_id));
     Ok(())
 }
 
@@ -706,6 +713,7 @@ async fn bring_up(device: Arc<USBDevice>) -> Result<(), WwanError> {
         max_control_message: function.descriptor.max_control_message,
     }));
     let record = Arc::new(UsbMbimDevice {
+        controller: device.controller().id(),
         slot_id: device.slot_id(),
         transport: transport.clone(),
         modem: IrqSafeSpinLock::new(Some(modem)),

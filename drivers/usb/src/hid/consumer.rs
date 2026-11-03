@@ -145,7 +145,8 @@ pub struct ConsumerDevice {
 }
 
 /// Global registry of bound Consumer Control interfaces.
-static CONSUMER_DEVICES: IrqSafeSpinLock<Vec<ConsumerDevice>> = IrqSafeSpinLock::new(Vec::new());
+static CONSUMER_DEVICES: crate::xhci::PerController<Vec<ConsumerDevice>> =
+    crate::per_controller_vec!();
 
 // ── Usage-page detection in Report Descriptor ─────────────────────
 
@@ -699,9 +700,8 @@ pub async fn try_bind_consumer_already_addressed(
         last_report: IrqSafeSpinLock::new([0u16; 8]),
     };
     {
-        let mut g = CONSUMER_DEVICES.lock();
-        g.push(dev);
-        ATTACHED_CONSUMER_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        CONSUMER_DEVICES.of(xhci_dev.id()).lock().push(dev);
+        ATTACHED_CONSUMER_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     {
         use core::fmt::Write as _;
@@ -721,8 +721,8 @@ pub async fn try_bind_consumer_already_addressed(
 /// Hub contexts of all live consumer bindings (root-attached
 /// bindings omitted). Aggregated by `hid::hub_ports` for the
 /// supervisor's HID wake step.
-pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
-    let g = CONSUMER_DEVICES.lock();
+pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
+    let g = CONSUMER_DEVICES.of(controller).lock();
     g.iter().filter_map(|d| d.hub_port).collect()
 }
 
@@ -733,7 +733,7 @@ pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
 /// Designed to be called from the supervisor's xHCI-IRQ / 100 ms
 /// timeout cycle alongside `hid::pump_all` and `mouse::pump_all`.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
-    let len = CONSUMER_DEVICES.lock().len();
+    let len = CONSUMER_DEVICES.of(xhci_dev.id()).lock().len();
     let mut total = 0usize;
     for idx in 0..len {
         total += pump_one(xhci_dev, idx);
@@ -748,7 +748,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     // Snapshot the fields we need without holding the registry lock
     // across the poll calls (which may access DMA-mapped buffers).
     let (slot_id, dci, report_id, hub_port) = {
-        let g = CONSUMER_DEVICES.lock();
+        let g = CONSUMER_DEVICES.of(xhci_dev.id()).lock();
         match g.get(idx) {
             Some(d) => (d.slot_id, d.interrupt_in_dci, d.report_id, d.hub_port),
             None => return 0,
@@ -764,7 +764,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
                 reports += 1;
                 let cur = decode_report(&buf, report_id);
                 let prev = {
-                    let g = CONSUMER_DEVICES.lock();
+                    let g = CONSUMER_DEVICES.of(xhci_dev.id()).lock();
                     match g.get(idx) {
                         Some(d) => *d.last_report.lock(),
                         None => break,
@@ -772,7 +772,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
                 };
                 let emitted = translate_diff(&prev, &cur);
                 {
-                    let g = CONSUMER_DEVICES.lock();
+                    let g = CONSUMER_DEVICES.of(xhci_dev.id()).lock();
                     if let Some(d) = g.get(idx) {
                         *d.last_report.lock() = cur;
                     }
@@ -790,7 +790,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     // diffed to zero emitted events. No-op when root-attached.
     if reports > 0 {
         if let Some((hub_slot, port)) = hub_port {
-            crate::attach::mark_port_activity(hub_slot, port);
+            crate::attach::mark_port_activity(xhci_dev.id(), hub_slot, port);
         }
     }
     total
@@ -811,33 +811,44 @@ pub fn attached_consumer_count() -> usize {
 /// Consumer devices feed the shared input ring and own no evdev
 /// node, so dropping the binding is the whole detach. Returns true
 /// when a binding was removed.
-pub fn detach_consumer(slot_id: u8) -> bool {
-    let mut g = CONSUMER_DEVICES.lock();
+pub fn detach_consumer(controller: u8, slot_id: u8) -> bool {
+    let mut g = CONSUMER_DEVICES.of(controller).lock();
     let before = g.len();
     g.retain(|d| d.slot_id != slot_id);
-    let removed = g.len() != before;
-    if removed {
-        ATTACHED_CONSUMER_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
-    }
-    removed
+    let removed = before - g.len();
+    crate::hid::saturating_sub(&ATTACHED_CONSUMER_COUNT, removed as u32);
+    removed != 0
 }
 
-/// Drop every consumer-control binding. Called on a controller
-/// recovery epoch change.
-pub fn clear_consumers() {
-    CONSUMER_DEVICES.lock().clear();
-    ATTACHED_CONSUMER_COUNT.store(0, core::sync::atomic::Ordering::Release);
+/// Drop every consumer-control binding on `controller`. Called on a
+/// controller recovery epoch change.
+pub fn clear_consumers(controller: u8) {
+    let removed = {
+        let mut g = CONSUMER_DEVICES.of(controller).lock();
+        let n = g.len();
+        g.clear();
+        n
+    };
+    crate::hid::saturating_sub(&ATTACHED_CONSUMER_COUNT, removed as u32);
 }
 
 #[doc(hidden)]
 pub fn __reset_consumers_for_test() {
-    CONSUMER_DEVICES.lock().clear();
+    for (_, devices) in CONSUMER_DEVICES.each() {
+        devices.lock().clear();
+    }
     ATTACHED_CONSUMER_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 
 #[doc(hidden)]
 pub fn __push_consumer_for_test(slot_id: u8, hub_port: Option<(u8, u8)>) {
-    CONSUMER_DEVICES.lock().push(ConsumerDevice {
+    __push_consumer_on_for_test(0, slot_id, hub_port);
+}
+
+#[doc(hidden)]
+pub fn __push_consumer_on_for_test(controller: u8, slot_id: u8, hub_port: Option<(u8, u8)>) {
+    ATTACHED_CONSUMER_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    CONSUMER_DEVICES.of(controller).lock().push(ConsumerDevice {
         slot_id,
         interrupt_in_dci: 0,
         interface_num: 0,

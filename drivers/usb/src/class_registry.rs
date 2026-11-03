@@ -104,9 +104,11 @@ pub enum UsbProbeError {
 /// the dispatcher continues to the next registered driver.
 pub type UsbProbeFn = fn(device: Arc<USBDevice>) -> Result<(), UsbProbeError>;
 
-/// Unbind function signature — synchronous. Called with the slot id
-/// of a device being detached (unplug / supervisor teardown). The
-/// driver drops any binding it holds for that slot; drivers that
+/// Unbind function signature — synchronous. Called with the controller
+/// index ([`crate::xhci::Xhci::id`]) and slot id of a device being
+/// detached (unplug / supervisor teardown); slot ids are only unique
+/// within a controller. The driver drops any binding it holds for that
+/// controller/slot; drivers that
 /// never bound it must no-op. A driver registers an unbind hook via
 /// [`register_class_driver_with_unbind`]; without one, detach
 /// cannot reach the driver's private state (its slot is still
@@ -123,7 +125,7 @@ pub type UsbProbeFn = fn(device: Arc<USBDevice>) -> Result<(), UsbProbeError>;
 /// paths) and idempotent: registration tolerates duplicates
 /// (defensive test initcalls re-register), so a hook may run
 /// twice for one dispatch and must still leave state consistent.
-pub type UsbUnbindFn = fn(slot_id: u8) -> Result<(), ()>;
+pub type UsbUnbindFn = fn(controller: u8, slot_id: u8) -> Result<(), ()>;
 
 /// Outcome of [`dispatch_unbind`]: how many hooks ran, and how
 /// many reported failure. Detach proceeds regardless of the
@@ -209,7 +211,8 @@ fn register_class_driver_inner(
     Ok(())
 }
 
-/// Invoke every registered driver's unbind hook for `slot_id`
+/// Invoke every registered driver's unbind hook for `slot_id` on
+/// `controller`
 /// (broadcast: hooks self-filter, since the registry does not track
 /// which driver claimed which slot). Hooks run after the registry
 /// lock is released, so a hook may itself touch the registry or
@@ -219,7 +222,7 @@ fn register_class_driver_inner(
 /// `detach_slot` proceeds to disable/reclaim the slot
 /// regardless of this report. (A hook that panics cannot be
 /// contained — see [`UsbUnbindFn`]: panic is fatal by policy.)
-pub fn dispatch_unbind(slot_id: u8) -> UnbindReport {
+pub fn dispatch_unbind(controller: u8, slot_id: u8) -> UnbindReport {
     let hooks: alloc::vec::Vec<UsbUnbindFn> = {
         let g = REGISTRY.lock();
         g.iter().filter_map(|entry| entry.unbind).collect()
@@ -230,7 +233,7 @@ pub fn dispatch_unbind(slot_id: u8) -> UnbindReport {
     };
     for hook in hooks {
         report.invoked += 1;
-        if hook(slot_id).is_err() {
+        if hook(controller, slot_id).is_err() {
             report.failed += 1;
         }
     }

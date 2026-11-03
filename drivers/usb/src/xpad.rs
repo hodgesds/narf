@@ -131,8 +131,8 @@ pub struct XpadBoundDevice {
 }
 
 /// Global registry of bound xpad devices.
-pub static XPAD_DEVICES_BOUND: IrqSafeSpinLock<Vec<Arc<XpadBoundDevice>>> =
-    IrqSafeSpinLock::new(Vec::new());
+pub static XPAD_DEVICES_BOUND: crate::xhci::PerController<Vec<Arc<XpadBoundDevice>>> =
+    crate::per_controller_vec!();
 
 // ── Device-ID table ───────────────────────────────────────────────────
 
@@ -2170,7 +2170,7 @@ pub async fn try_bind_xpad_already_addressed(
         evdev_node,
     });
 
-    XPAD_DEVICES_BOUND.lock().push(bound_dev);
+    XPAD_DEVICES_BOUND.of(xhci_dev.id()).lock().push(bound_dev);
 
     Ok(())
 }
@@ -2178,8 +2178,8 @@ pub async fn try_bind_xpad_already_addressed(
 /// Detach the gamepad bound to `slot_id`: unregister its evdev
 /// node and drop the binding so `pump_all` stops polling the dead
 /// slot. Returns true when a binding was removed.
-pub fn detach_xpad(slot_id: u8) -> bool {
-    let mut g = XPAD_DEVICES_BOUND.lock();
+pub fn detach_xpad(controller: u8, slot_id: u8) -> bool {
+    let mut g = XPAD_DEVICES_BOUND.of(controller).lock();
     if let Some(pos) = g.iter().position(|d| d.slot_id == slot_id) {
         let dev = g.remove(pos);
         narf_input::evdev::ROUTER.unregister_device(dev.evdev_id);
@@ -2188,10 +2188,10 @@ pub fn detach_xpad(slot_id: u8) -> bool {
     false
 }
 
-/// Drop every gamepad binding, unregistering each evdev node.
-/// Called on a controller recovery epoch change.
-pub fn clear_xpad() {
-    let mut g = XPAD_DEVICES_BOUND.lock();
+/// Drop every gamepad binding on `controller`, unregistering each
+/// evdev node. Called on a controller recovery epoch change.
+pub fn clear_xpad(controller: u8) {
+    let mut g = XPAD_DEVICES_BOUND.of(controller).lock();
     for dev in g.drain(..) {
         narf_input::evdev::ROUTER.unregister_device(dev.evdev_id);
     }
@@ -2200,7 +2200,7 @@ pub fn clear_xpad() {
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let mut total = 0;
     let pads: Vec<Arc<XpadBoundDevice>> = {
-        let g = XPAD_DEVICES_BOUND.lock();
+        let g = XPAD_DEVICES_BOUND.of(xhci_dev.id()).lock();
         g.clone()
     };
 

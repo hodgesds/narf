@@ -288,6 +288,9 @@ pub struct FingerprintDevice {
     in_max_packet: u16,
     /// For interrupt-IN (ELAN): `true` after the first arm call.
     armed: AtomicBool,
+    /// Index of the xHCI controller the reader is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
 impl core::fmt::Debug for FingerprintDevice {
@@ -446,6 +449,7 @@ pub fn __test_register_device(
         bulk_out_ep,
         in_max_packet: 64,
         armed: AtomicBool::new(false),
+        controller: 0,
     });
     let mut g = FP_DEVICES.lock();
     g.push(dev);
@@ -487,7 +491,7 @@ pub struct FpDetachOutcome {
 /// (`EndpointConfig` on the disabled slot) rather than dangling;
 /// new lookups resolve against the surviving registry (out-of-range
 /// names resolve to nothing).
-pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
+pub fn detach_fp(controller: u8, slot_id: u8) -> FpDetachOutcome {
     let mut g = FP_DEVICES.lock();
     let mut removed = 0usize;
     let mut owned_node = false;
@@ -495,7 +499,7 @@ pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
     g.retain(|dev| {
         let cur = orig;
         orig += 1;
-        if dev.slot_id == slot_id {
+        if dev.controller == controller && dev.slot_id == slot_id {
             if cur == 0 {
                 owned_node = true;
             }
@@ -512,7 +516,7 @@ pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
     }
 }
 
-/// Controller-recovery teardown: drop every bound reader.
+/// Controller-recovery teardown: drop every reader bound on `controller`.
 /// Called from `attach::detach_all_bindings`
 /// after a recovery epoch change invalidated every slot; stale
 /// entries must not survive to be re-enumerated alongside fresh
@@ -520,8 +524,8 @@ pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
 /// re-enumeration append a second live device for the same reader).
 /// Clearing the registry unpublishes every provider-resolved node
 /// — no separate unregister step exists under #920's provider model.
-pub fn unbind_all_fp() {
-    FP_DEVICES.lock().clear();
+pub fn unbind_all_fp(controller: u8) {
+    FP_DEVICES.lock().retain(|dev| dev.controller != controller);
 }
 
 /// Reset the ELAN interrupt-IN arming flag on every bound device.
@@ -574,7 +578,15 @@ impl narf_power::system_pm::AsyncSystemPm for FpSystemPm {
     }
 
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
-        Box::pin(async { resume_fp_devices(crate::xhci::controller().is_some()) })
+        Box::pin(async {
+            // Every bound reader's controller must have come back.
+            let controllers = crate::xhci::controllers().len();
+            let present = FP_DEVICES
+                .lock()
+                .iter()
+                .all(|dev| usize::from(dev.controller) < controllers);
+            resume_fp_devices(present && controllers > 0)
+        })
     }
 }
 
@@ -608,8 +620,8 @@ pub fn register_initcalls() {
         "usb-fp",
         &[],
         fp_registry_probe,
-        |slot| {
-            detach_fp(slot);
+        |controller, slot| {
+            detach_fp(controller, slot);
             Ok(())
         },
     );
@@ -629,6 +641,7 @@ pub fn __test_make_device(slot_id: u8, vendor: FpVendor, armed: bool) -> Arc<Fin
         bulk_out_ep: 2,
         in_max_packet: 512,
         armed: AtomicBool::new(armed),
+        controller: 0,
     })
 }
 
@@ -690,9 +703,10 @@ pub trait FpTransport: Send + Sync {
 /// Boxed future returned by [`FpTransport`] methods.
 pub type FpFuture<'a, T> = core::pin::Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
 
-/// Production transport: bound reader driven over `xhci::controller()`.
+/// Production transport: a bound reader driven over its own controller
+/// (index into `xhci::controller_by_id`).
 #[derive(Debug)]
-struct XhciFpTransport;
+struct XhciFpTransport(u8);
 
 impl FpTransport for XhciFpTransport {
     fn control_in<'a>(
@@ -705,7 +719,7 @@ impl FpTransport for XhciFpTransport {
         out: &'a mut [u8],
     ) -> FpFuture<'a, Result<usize, FpError>> {
         Box::pin(async move {
-            let xhci = crate::xhci::controller().ok_or(FpError::EndpointConfig)?;
+            let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
             xhci.control_in(slot_id, bm_request_type, b_request, w_value, w_index, out)
                 .await
                 .map_err(|_| FpError::EndpointConfig)
@@ -722,7 +736,7 @@ impl FpTransport for XhciFpTransport {
         data: &'a [u8],
     ) -> FpFuture<'a, Result<usize, FpError>> {
         Box::pin(async move {
-            let xhci = crate::xhci::controller().ok_or(FpError::EndpointConfig)?;
+            let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
             xhci.control_out(slot_id, bm_request_type, b_request, w_value, w_index, data)
                 .await
                 .map_err(|_| FpError::EndpointConfig)
@@ -814,9 +828,9 @@ impl narf_filesystem::FileOps for FpFileNode {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         let dev = self.dev.clone();
         Box::pin(async move {
-            let xhci = crate::xhci::controller().ok_or(narf_filesystem::FsError::Io(
-                narf_block::BlockError::IOError,
-            ))?;
+            let xhci = crate::xhci::controller_by_id(dev.controller).ok_or(
+                narf_filesystem::FsError::Io(narf_block::BlockError::IOError),
+            )?;
             dev.read_response(&xhci, buf)
                 .await
                 .map_err(|_| narf_filesystem::FsError::Io(narf_block::BlockError::IOError))
@@ -829,9 +843,9 @@ impl narf_filesystem::FileOps for FpFileNode {
         // Clone buf into an owned Vec so the future can be 'static.
         let owned: alloc::vec::Vec<u8> = buf.to_vec();
         Box::pin(async move {
-            let xhci = crate::xhci::controller().ok_or(narf_filesystem::FsError::Io(
-                narf_block::BlockError::IOError,
-            ))?;
+            let xhci = crate::xhci::controller_by_id(dev.controller).ok_or(
+                narf_filesystem::FsError::Io(narf_block::BlockError::IOError),
+            )?;
             dev.send_command(&xhci, &owned)
                 .await
                 .map(|()| len)
@@ -1010,9 +1024,10 @@ fn parse_fp_name(name: &str) -> Option<usize> {
 pub fn lookup_fp(name: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
     let idx = parse_fp_name(name)?;
     let dev = FP_DEVICES.lock().get(idx)?.clone();
+    let controller = dev.controller;
     Some(Arc::new(FpFileNode {
         dev,
-        transport: Arc::new(XhciFpTransport),
+        transport: Arc::new(XhciFpTransport(controller)),
     }) as Arc<dyn narf_filesystem::FileOps>)
 }
 
@@ -1057,6 +1072,7 @@ fn device_from_endpoints(slot_id: u8, vendor: FpVendor, eps: &FpEndpoints) -> Fi
         bulk_out_ep: bulk_out_dci,
         in_max_packet,
         armed: AtomicBool::new(false),
+        controller: 0,
     }
 }
 
@@ -1124,7 +1140,9 @@ pub async fn try_bind_fingerprint_already_addressed(
         .map_err(|_| FpError::SetConfiguration)?;
 
     // Build the FingerprintDevice record.
-    let dev = Arc::new(device_from_endpoints(slot_id, vendor, &eps));
+    let mut dev = device_from_endpoints(slot_id, vendor, &eps);
+    dev.controller = xhci_dev.id();
+    let dev = Arc::new(dev);
 
     {
         use core::fmt::Write as _;
@@ -1219,7 +1237,9 @@ pub async fn try_bridge_wbdi_already_addressed(
         .await
         .map_err(|_| FpError::SetConfiguration)?;
 
-    let dev = Arc::new(device_from_endpoints(slot_id, FpVendor::Wbdi, &eps));
+    let mut dev = device_from_endpoints(slot_id, FpVendor::Wbdi, &eps);
+    dev.controller = xhci_dev.id();
+    let dev = Arc::new(dev);
     {
         use core::fmt::Write as _;
         let _ = writeln!(
@@ -1749,6 +1769,7 @@ mod tests {
             bulk_out_ep: 2,
             in_max_packet: 512,
             armed: AtomicBool::new(false),
+            controller: 0,
         })
     }
 

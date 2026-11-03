@@ -332,7 +332,7 @@ impl BotTransport for Xhci {
 
     fn note_hub_activity(&self, hub_port: Option<(u8, u8)>) {
         if let Some((hub_slot, port)) = hub_port {
-            crate::attach::mark_port_activity(hub_slot, port);
+            crate::attach::mark_port_activity(self.id(), hub_slot, port);
         }
     }
 }
@@ -391,6 +391,10 @@ pub struct MscDevice {
     /// after bind: the supervisor idle-suspends its port and
     /// nothing ever resumes it (#840).
     pub hub_port: Option<(u8, u8)>,
+    /// Index of the xHCI controller the device is on
+    /// ([`xhci::Xhci::id`]); `slot_id` is only unique within it. Set by
+    /// the binder after attach (0 for fixtures).
+    pub controller: u8,
 }
 
 /// Walk a Configuration Descriptor (§9.6.3) tree looking for the
@@ -599,6 +603,7 @@ impl MscDevice {
             generation: 0,
             tag: IrqSafeSpinLock::new(1),
             hub_port: None,
+            controller: 0,
         };
         let (block_bytes, last_lba10) = dev.read_capacity_10(t).await?;
         dev.lba_bytes = block_bytes;
@@ -1353,6 +1358,7 @@ pub async fn try_bind_msc_already_addressed(
         // bound ports — the port cannot be suspended yet, so that
         // first transaction needs no resume.
         dev.hub_port = hub_port;
+        dev.controller = xhci_dev.id();
         let idx = insert_device(dev);
         // Register against the block layer + scan partitions. Done
         // inline so the post-bind state (block device visible +
@@ -1447,12 +1453,15 @@ pub fn unregister_msc_block_device(idx: usize) {
 /// keeps its adapter across an unplug/replug is never silently
 /// served by the new disk. Idempotent: detaching an unbound slot
 /// is a no-op.
-pub fn detach_msc(slot_id: u8) {
+pub fn detach_msc(controller: u8, slot_id: u8) {
     let mut indices = Vec::new();
     {
         let mut g = MSC_DEVICES.lock();
         for (idx, slot) in g.iter_mut().enumerate() {
-            if slot.as_ref().is_some_and(|d| d.slot_id == slot_id) {
+            if slot
+                .as_ref()
+                .is_some_and(|d| d.controller == controller && d.slot_id == slot_id)
+            {
                 *slot = None;
                 indices.push(idx);
             }
@@ -1464,16 +1473,16 @@ pub fn detach_msc(slot_id: u8) {
 }
 
 /// Wholesale variant of [`detach_msc`]: tombstone and unpublish
-/// every bound MSC device regardless of slot. This is the MSC half
+/// every MSC device bound on `controller`, regardless of slot. This is the MSC half
 /// of controller-recovery teardown; the supervisor's epoch path
 /// (`attach::detach_all_bindings`) should call it alongside the
 /// pumped classes it already clears.
-pub fn unbind_all_msc() {
+pub fn unbind_all_msc(controller: u8) {
     let mut indices = Vec::new();
     {
         let mut g = MSC_DEVICES.lock();
         for (idx, slot) in g.iter_mut().enumerate() {
-            if slot.is_some() {
+            if slot.as_ref().is_some_and(|d| d.controller == controller) {
                 *slot = None;
                 indices.push(idx);
             }
@@ -1524,8 +1533,8 @@ pub fn register_initcalls() {
         "usb-msc",
         &MSC_CLASS_MATCH,
         msc_registry_probe,
-        |slot| {
-            detach_msc(slot);
+        |controller, slot| {
+            detach_msc(controller, slot);
             Ok(())
         },
     );
@@ -1603,7 +1612,8 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
     .await;
     match result {
         Ok(devs) => {
-            for dev in devs {
+            for mut dev in devs {
+                dev.controller = xhci_dev.id();
                 insert_device(dev);
             }
             Ok(())
@@ -1655,6 +1665,7 @@ pub fn __insert_msc_for_test(slot_id: u8) -> usize {
         generation: 0,
         tag: IrqSafeSpinLock::new(1),
         hub_port: None,
+        controller: 0,
     };
     let idx = insert_device(dev);
     register_msc_block_device(idx);
@@ -1934,6 +1945,7 @@ impl UsbMscBlockDevice {
             cmd16,
             generation,
             hub_port,
+            controller,
         ) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
@@ -1953,9 +1965,10 @@ impl UsbMscBlockDevice {
                 dev.cmd16,
                 dev.generation,
                 dev.hub_port,
+                dev.controller,
             )
         };
-        let c = match xhci::controller() {
+        let c = match xhci::controller_by_id(controller) {
             Some(c) => c,
             None => return Err(narf_block::BlockIoError::DeviceRemoved),
         };
@@ -1973,6 +1986,7 @@ impl UsbMscBlockDevice {
                 generation,
                 tag: IrqSafeSpinLock::new(1),
                 hub_port,
+                controller,
             },
         ))
     }
@@ -2001,13 +2015,13 @@ fn sync_bridge<F: core::future::Future>(fut: F) -> F::Output {
 /// sync callers on different tasks (the supervisor's partition
 /// scan and a FAT volume on the same stick, say) would otherwise
 /// interleave bulk-only-transport phases on the shared endpoints.
-/// The claim is keyed by xHCI **slot**, not by registry index:
+/// The claim is keyed by (controller, xHCI **slot**), not by registry index:
 /// BOT is a one-command-at-a-time protocol per *interface*, and
 /// since #831 a multi-LUN device holds several registry entries
 /// (one per LUN) over the same slot and endpoint pair — keyed by
 /// index, two LUNs of one reader could interleave phases on the
 /// wire. Slots past the table are left unserialised.
-const MSC_IO_SLOTS: usize = 256;
+const MSC_IO_SLOTS: usize = 256 * xhci::MAX_CONTROLLERS;
 static MSC_IO_BUSY: [core::sync::atomic::AtomicBool; MSC_IO_SLOTS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MSC_IO_SLOTS];
 /// A holder can be preempted mid-exchange; each of its xHCI waits is bounded
@@ -2017,9 +2031,9 @@ const MSC_IO_CLAIM_MS: u64 = 2_000;
 struct MscIoClaim(Option<usize>);
 
 impl MscIoClaim {
-    fn acquire(slot_id: u8) -> Option<Self> {
+    fn acquire(controller: u8, slot_id: u8) -> Option<Self> {
         use core::sync::atomic::Ordering;
-        let idx = slot_id as usize;
+        let idx = usize::from(controller) * 256 + usize::from(slot_id);
         let Some(busy) = MSC_IO_BUSY.get(idx) else {
             return Some(Self(None));
         };
@@ -2115,7 +2129,8 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     /// as an error, never as success (#829).
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         let (c, dev_snapshot) = self.transport_snapshot()?;
-        let Some(_claim) = MscIoClaim::acquire(dev_snapshot.slot_id) else {
+        let Some(_claim) = MscIoClaim::acquire(dev_snapshot.controller, dev_snapshot.slot_id)
+        else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         let result = sync_bridge(async { dev_snapshot.synchronize_cache(&*c).await });
@@ -2146,7 +2161,8 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
         let (c, dev_snapshot) = self.transport_snapshot()?;
-        let Some(_claim) = MscIoClaim::acquire(dev_snapshot.slot_id) else {
+        let Some(_claim) = MscIoClaim::acquire(dev_snapshot.controller, dev_snapshot.slot_id)
+        else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         sync_bridge(async {
@@ -2198,6 +2214,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             cmd16,
             generation,
             hub_port,
+            controller,
         ) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
@@ -2217,9 +2234,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.cmd16,
                 dev.generation,
                 dev.hub_port,
+                dev.controller,
             )
         };
-        let c = match xhci::controller() {
+        let c = match xhci::controller_by_id(controller) {
             Some(c) => c,
             None => return Err(narf_block::BlockIoError::DeviceRemoved),
         };
@@ -2235,8 +2253,9 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             generation,
             tag: IrqSafeSpinLock::new(1),
             hub_port,
+            controller,
         };
-        let Some(_claim) = MscIoClaim::acquire(slot_id) else {
+        let Some(_claim) = MscIoClaim::acquire(controller, slot_id) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         sync_bridge(async {
@@ -2278,6 +2297,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             cmd16,
             generation,
             hub_port,
+            controller,
         ) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
@@ -2297,9 +2317,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.cmd16,
                 dev.generation,
                 dev.hub_port,
+                dev.controller,
             )
         };
-        let c = match xhci::controller() {
+        let c = match xhci::controller_by_id(controller) {
             Some(c) => c,
             None => return Err(narf_block::BlockIoError::DeviceRemoved),
         };
@@ -2315,8 +2336,9 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             generation,
             tag: IrqSafeSpinLock::new(1),
             hub_port,
+            controller,
         };
-        let Some(_claim) = MscIoClaim::acquire(slot_id) else {
+        let Some(_claim) = MscIoClaim::acquire(controller, slot_id) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         sync_bridge(async {
