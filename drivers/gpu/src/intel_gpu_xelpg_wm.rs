@@ -295,9 +295,9 @@ pub(crate) fn plane(
     let wp = params(timing, surface)?;
     let mut wm = PlaneWm::default();
     let mut prev = Level::default();
-    for l in 0..LEVELS {
-        wm.levels[l] = level(timing, &wp, u32::from(latency.levels[l]), prev)?;
-        prev = wm.levels[l];
+    for (slot, &lat) in wm.levels.iter_mut().zip(&latency.levels) {
+        *slot = level(timing, &wp, u32::from(lat), prev)?;
+        prev = *slot;
     }
     wm.trans = transition(&wp, wm.levels[0]);
     let sagv_latency = if latency.sagv_block_us == 0 {
@@ -326,10 +326,10 @@ pub(crate) fn cursor_allocation(
     )?;
     let mut wm = Level::default();
     let mut min_ddb_alloc = 0u16;
-    for l in 0..LEVELS {
+    for &lat in &latency.levels {
         // skl_compute_plane_wm(.., &wm, &wm): a rejected level only sets
         // min_ddb_alloc, keeping the prior blocks/lines.
-        let next = level(timing, &wp, u32::from(latency.levels[l]), wm)?;
+        let next = level(timing, &wp, u32::from(lat), wm)?;
         if next.min_ddb_alloc == u16::MAX {
             break;
         }
@@ -373,8 +373,7 @@ pub(crate) fn check_vblank(
     let guardband = u64::from(timing.vtotal - timing.vblank_start) << 16;
     let too_short = |us: u32| guardband < full + usecs_to_lines(timing, us);
     let mut max_level = None;
-    for l in (0..LEVELS).rev() {
-        let lat = latency.levels[l];
+    for (l, &lat) in latency.levels.iter().enumerate().rev() {
         if lat == 0 {
             continue;
         }
@@ -386,8 +385,8 @@ pub(crate) fn check_vblank(
     }
     let max_level = max_level.ok_or(WmError::VblankTooShort)?;
     for plane in planes.iter_mut() {
-        for l in max_level + 1..LEVELS {
-            plane.levels[l].enable = false;
+        for level in plane.levels.iter_mut().skip(max_level + 1) {
+            level.enable = false;
         }
     }
     if latency.sagv_block_us != 0 && too_short(u32::from(latency.sagv_block_us)) {

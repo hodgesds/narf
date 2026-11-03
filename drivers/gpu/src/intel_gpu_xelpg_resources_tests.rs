@@ -373,7 +373,7 @@ fn smoke_xelpg_wm_cursor_allocation_and_vblank_prefill_limit() -> TestResult {
     assert!(!primary.sagv.enable && primary.sagv.blocks == before.sagv.blocks);
     assert_eq!(
         primary.levels[2].encode(0x1fff),
-        Some(u32::from(before.levels[2].lines) << 14 | u32::from(before.levels[2].blocks))
+        Some((u32::from(before.levels[2].lines) << 14) | u32::from(before.levels[2].blocks))
     );
     // Two lines cannot even hold level0 prefill: a typed refusal.
     let t = wm::Timing { vtotal: 770, ..t };

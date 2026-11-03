@@ -281,35 +281,27 @@ fn allocate_planes(input: &PipeInput, alloc_ddb: Entry) -> Result<PipeAlloc, Ddb
             start += blocks;
         }
     }
-    for l in level + 1..LEVELS {
-        for i in 0..PLANES {
-            let ddb = out.planes[i];
-            let wm = &mut out.wm[i];
+    let cursor = out.cursor;
+    let planes = out.planes;
+    let all = out
+        .wm
+        .iter_mut()
+        .zip(planes)
+        .chain(core::iter::once((&mut out.cursor_wm, cursor)));
+    for (wm, ddb) in all {
+        // Levels above the selected one: skl_check_wm_level, then
+        // skl_need_wm_copy_wa keeps disabled levels' blocks/lines sane.
+        for l in level + 1..LEVELS {
             check(&mut wm.levels[l], ddb);
             if !wm.levels[l].enable {
                 wm.levels[l].blocks = wm.levels[l - 1].blocks;
                 wm.levels[l].lines = wm.levels[l - 1].lines;
             }
         }
-        let cursor = out.cursor;
-        let wm = &mut out.cursor_wm;
-        check(&mut wm.levels[l], cursor);
-        if !wm.levels[l].enable {
-            wm.levels[l].blocks = wm.levels[l - 1].blocks;
-            wm.levels[l].lines = wm.levels[l - 1].lines;
-        }
-    }
-    for i in 0..PLANES {
-        let ddb = out.planes[i];
-        let wm = &mut out.wm[i];
         check(&mut wm.trans, ddb);
         check(&mut wm.sagv, ddb);
         check(&mut wm.sagv_trans, ddb);
     }
-    let cursor = out.cursor;
-    check(&mut out.cursor_wm.trans, cursor);
-    check(&mut out.cursor_wm.sagv, cursor);
-    check(&mut out.cursor_wm.sagv_trans, cursor);
     Ok(out)
 }
 
@@ -330,13 +322,13 @@ pub(crate) fn compute(pipes: &[Option<PipeInput>; PIPES]) -> Result<Dbuf, DdbErr
         joined,
         ..Default::default()
     };
-    for pipe in 0..PIPES {
-        out.slices[pipe] = dbuf_slices(pipe, active_pipes, joined);
+    for (pipe, slices) in out.slices.iter_mut().enumerate() {
+        *slices = dbuf_slices(pipe, active_pipes, joined);
     }
     out.enabled_slices = out.slices.iter().fold(S1, |m, s| m | s);
     let weight = |p: usize| pipes[p].map_or(0u32, |p| u32::from(p.hdisplay));
-    for pipe in 0..PIPES {
-        let Some(input) = &pipes[pipe] else { continue };
+    for (pipe, input) in pipes.iter().enumerate() {
+        let Some(input) = input else { continue };
         let mask = out.slices[pipe];
         if mask == 0 || input.hdisplay == 0 {
             return Err(DdbError::Unsupported);
@@ -344,8 +336,8 @@ pub(crate) fn compute(pipes: &[Option<PipeInput>; PIPES]) -> Result<Dbuf, DdbErr
         let range = for_slices(mask);
         let offset = mbus_offset(mask);
         let (mut ws, mut we, mut wt) = (0u32, 0u32, 0u32);
-        for other in 0..PIPES {
-            if out.slices[other] != mask {
+        for (other, slices) in out.slices.iter().enumerate() {
+            if *slices != mask {
                 continue;
             }
             let w = weight(other);
@@ -369,11 +361,12 @@ pub(crate) fn compute(pipes: &[Option<PipeInput>; PIPES]) -> Result<Dbuf, DdbErr
         };
         out.pipes[pipe] = alloc;
     }
-    for a in 0..PIPES {
-        for b in a + 1..PIPES {
-            if out.pipes[a].absolute.overlaps(out.pipes[b].absolute) {
-                return Err(DdbError::Overlap);
-            }
+    for (a, first) in out.pipes.iter().enumerate() {
+        if out.pipes[a + 1..]
+            .iter()
+            .any(|second| first.absolute.overlaps(second.absolute))
+        {
+            return Err(DdbError::Overlap);
         }
     }
     Ok(out)

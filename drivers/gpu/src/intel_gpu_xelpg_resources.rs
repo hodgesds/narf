@@ -326,17 +326,12 @@ impl State {
     /// state for disabled planes; a hidden cursor keeps only its DDB.
     pub(crate) fn plane_registers(&self) -> Option<Vec<(u64, u32)>> {
         let mut regs = Vec::with_capacity(PIPES * (PLANES + 1) * 10);
-        for pipe in 0..PIPES {
-            let alloc = &self.dbuf.pipes[pipe];
+        for (pipe, alloc) in self.dbuf.pipes.iter().enumerate() {
             let active = self.dbuf.active_pipes & (1 << pipe) != 0;
-            for plane in 0..PLANES {
-                let w = if active {
-                    alloc.wm[plane]
-                } else {
-                    PlaneWm::default()
-                };
+            for (plane, (wm, ddb)) in alloc.wm.iter().zip(alloc.planes).enumerate() {
+                let w = if active { *wm } else { PlaneWm::default() };
                 regs.extend(plane_wm_image(pipe, plane, &w)?);
-                let ddb = if active { alloc.planes[plane].reg() } else { 0 };
+                let ddb = if active { ddb.reg() } else { 0 };
                 regs.push((plane_buf_cfg(pipe, plane), ddb));
             }
             let w = if active && self.cursor_visible[pipe] {

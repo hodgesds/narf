@@ -97,10 +97,9 @@ impl Params {
 
     /// Field-wise maximum (`max3(old, new, 0)` when serialized).
     pub(crate) fn max(&self, other: &Self) -> Self {
-        let (a, b) = (self.values(), other.values());
-        let mut v = [0; 10];
-        for i in 0..10 {
-            v[i] = a[i].max(b[i]);
+        let (mut v, b) = (self.values(), other.values());
+        for (a, b) in v.iter_mut().zip(b) {
+            *a = (*a).max(b);
         }
         Self::from_values(v)
     }
