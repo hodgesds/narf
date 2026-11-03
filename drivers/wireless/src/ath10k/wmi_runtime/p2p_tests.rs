@@ -437,3 +437,121 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_offchannel_builders_carry_vdev
 );
+
+/// `ath10k_hw_scan` on the P2P_DEVICE vif: the TLV start-scan is the
+/// netdev's active scan with `vdev_id` (byte 16) set to the P2P_DEVICE
+/// vdev and WMI_SCAN_ADD_CCK_RATES (0x4) cleared from `scan_ctrl_flags`
+/// (byte 64); a passive one only changes `vdev_id`. Non-TLV dialects and
+/// passive probe content are refused.
+fn smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck() -> TestResult {
+    let tlv = Wire::new(Dialect::Tlv);
+    let channels = [2412, 2437, 2462];
+    let ssids = vec![b"DIRECT-".to_vec()];
+    let ies = [221, 8, 0x50, 0x6f, 0x9a, 9, 2, 2, 0, 0x25];
+    let (Ok(netdev), Ok(p2p)) = (
+        tlv.active_scan(7, &channels, &ssids, &ies),
+        tlv.p2p_device_scan(2, 7, &channels, &ssids, &ies),
+    ) else {
+        return TestResult::Fail("active scan refused");
+    };
+    if wire::word(&p2p, 16) != Ok(2)
+        || wire::word(&netdev, 64) != Ok(0x5c)
+        || wire::word(&p2p, 64) != Ok(0x58)
+    {
+        return TestResult::Fail("P2P scan vdev/flags");
+    }
+    let mut patched = p2p.clone();
+    patched[16] = 0;
+    patched[64] = 0x5c;
+    if patched != netdev {
+        return TestResult::Fail("P2P scan changed other fields");
+    }
+    let (Ok(passive), Ok(p2p_passive)) = (
+        tlv.scan(7, &channels),
+        tlv.p2p_device_scan(1, 7, &channels, &[], &[]),
+    ) else {
+        return TestResult::Fail("passive scan refused");
+    };
+    let mut patched = p2p_passive.clone();
+    patched[16] = 0;
+    if wire::word(&p2p_passive, 16) != Ok(1) || patched != passive {
+        return TestResult::Fail("passive P2P scan layout");
+    }
+    if tlv.p2p_device_scan(1, 7, &channels, &[], &ies) != Err(Error::Unsupported)
+        || Wire::new(Dialect::TenTwo).p2p_device_scan(1, 7, &channels, &ssids, &[])
+            != Err(Error::Unsupported)
+    {
+        return TestResult::Fail("P2P scan refusals");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck
+);
+
+fn probe_response(capability: u16, ies: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0; 36];
+    frame[0] = 0x50;
+    frame[4..10].copy_from_slice(&OWN);
+    frame[10..16].copy_from_slice(&[2, 0, 0, 0, 0, 7]);
+    frame[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 7]);
+    frame[32] = 100;
+    frame[34..36].copy_from_slice(&capability.to_le_bytes());
+    frame.extend_from_slice(ies);
+    frame
+}
+
+/// A P2P Device in Listen answers a P2P search with a Probe Response that
+/// is neither ESS nor IBSS; only the P2P_DEVICE scan admits it, and only
+/// with the WFA P2P IE. ESS answers (a GO) are admitted by both scans.
+fn smoke_ath10k_p2p_device_scan_admits_listen_probe_response() -> TestResult {
+    let p2p_ie = [221, 6, 0x50, 0x6f, 0x9a, 9, 2, 0];
+    let mut ies = vec![0, 7];
+    ies.extend_from_slice(b"DIRECT-");
+    ies.extend_from_slice(&[3, 1, 6]);
+    let event = |frame: Vec<u8>| super::super::Management {
+        channel: 6,
+        snr: 30,
+        status: 0,
+        frame,
+    };
+    let mut listen = ies.clone();
+    listen.extend_from_slice(&p2p_ie);
+    let device = event(probe_response(0, &listen));
+    let bare = event(probe_response(0, &ies));
+    let go = event(probe_response(1, &listen));
+    let ibss = event(probe_response(2, &listen));
+    let channels = [2437];
+    let admitted = |m: &super::super::Management, p2p| {
+        super::super::discovered(m, &channels, p2p).is_ok_and(|bss| bss.is_some())
+    };
+    if !admitted(&device, true)
+        || admitted(&device, false)
+        || admitted(&bare, true)
+        || !admitted(&go, true)
+        || !admitted(&go, false)
+        || admitted(&ibss, true)
+    {
+        return TestResult::Fail("listen admission");
+    }
+    let Ok(Some(bss)) = super::super::discovered(&device, &channels, true) else {
+        return TestResult::Fail("listen BSS");
+    };
+    if bss.bssid != [2, 0, 0, 0, 0, 7]
+        || bss.ssid != b"DIRECT-"
+        || bss.information_elements != listen
+    {
+        return TestResult::Fail("listen BSS fields");
+    }
+    let mut beacon = device.frame.clone();
+    beacon[0] = 0x80;
+    if admitted(&event(beacon), true) {
+        return TestResult::Fail("non-ESS beacon admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_device_scan_admits_listen_probe_response
+);

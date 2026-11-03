@@ -2173,9 +2173,25 @@ will bind; none of them grants RF, peer, key or data authority.
   or directed Probe Requests and FRAME may send a directed Probe Response
   whose BSSID is the device address (wpa_supplicant Listen). Netdev
   close/retire withdraws the wdev metadata.
+- **P2P_DEVICE scan (P2P search).** The wdev opts into the shared
+  WDEV-addressed `TRIGGER_SCAN` (`async_p2p_device_scan_control`,
+  `p2p_device_scan_async`; `max_scan_ssids`/`max_scan_ie_len` as the
+  netdev). `mac.c::ath10k_hw_scan` on the P2P_DEVICE vif binds the scan to
+  `arvif->vdev_id`: `Native::p2p_device_scan` validates the request as the
+  netdev's scan and `Radio::p2p_device_scan` runs the TLV start-scan on
+  the P2P_DEVICE vdev (`Wire::p2p_device_scan`: `vdev_id` at byte 16;
+  active flags without WMI_SCAN_ADD_CCK_RATES 0x4, since a P2P probe never
+  offers 11b rates (mac80211 `no_cck`); the caller's P2P/WSC IEs and
+  `DIRECT-` SSID are the probe content). Scan events must carry that vdev.
+  On this vdev a P2P Device's Listen Probe Response (neither ESS nor IBSS)
+  is admitted when it carries the WFA P2P IE; the P2P Wildcard SSID
+  matches every `DIRECT-` SSID. Results and IEs belong to the wdev
+  (`scan_information_elements`); the netdev scan cache is untouched. An
+  unstarted wdev is `-EIO`; a ROC in flight, a station peer or an AP is
+  `-EBUSY` before publication (a P2P scan concurrent with an associated
+  station is not supported: the associated dwell owner is vdev0-only).
 
-Remaining before the row can be claimed: WDEV-routed SCAN for P2P search
-(not wired; the wdev has no scan); a P2P client netdev role (iftype 8,
+Remaining before the row can be claimed: a P2P client netdev role (iftype 8,
 STA vdev subtype P2P_CLI) reusing the station owner, with the remaining
 station WMI builders (peer, vdev start/up/down/stop, params, keys) taking a
 vdev; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
@@ -2191,7 +2207,9 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_tlv_combinations`,
 `smoke_ath10k_p2p_vdev_delete_and_roc_vdev`,
 `smoke_ath10k_p2p_device_vdev_nss_on_own_id`,
-`smoke_ath10k_p2p_offchannel_builders_carry_vdev`.
+`smoke_ath10k_p2p_offchannel_builders_carry_vdev`,
+`smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
+`smoke_ath10k_p2p_device_scan_admits_listen_probe_response`.
 
 ## 4. Invariants
 

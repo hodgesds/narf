@@ -94,6 +94,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             setup: restore.clone(),
             restore,
             station: Some(station),
+            p2p_device: None,
         })
     }
 

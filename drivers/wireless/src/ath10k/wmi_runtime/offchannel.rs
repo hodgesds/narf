@@ -193,6 +193,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 setup: restore.clone(),
                 restore,
                 station: None,
+                p2p_device: None,
             }
         };
         plan.extra_ies.clear();

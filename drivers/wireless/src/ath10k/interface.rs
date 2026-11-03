@@ -817,16 +817,13 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         progressed
     }
-    pub(super) async fn scan(
+    /// Validate a scan request against this radio and resolve its channel
+    /// list (`implicit`: every supported frequency, filtered later by the
+    /// current regulatory domain).
+    pub(super) fn scan_frequencies(
         &self,
-        mut request: ScanRequest,
-    ) -> Result<Vec<BssInfo>, WirelessError> {
-        if self.mode.load(Ordering::Acquire) != 2 {
-            return Err(WirelessError::NotSupported);
-        }
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WirelessError::HardwareError);
-        }
+        request: &mut ScanRequest,
+    ) -> Result<(Vec<u16>, bool), WirelessError> {
         if request.random_mac.is_some()
             || request.colocated_6ghz
             || request.duration_tu.is_some()
@@ -849,7 +846,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             request.ssids.push(Vec::new());
         }
         let implicit = request.frequencies_mhz.is_empty() && request.channels.is_empty();
-        let mut frequencies = if !request.frequencies_mhz.is_empty() {
+        let frequencies = if !request.frequencies_mhz.is_empty() {
             request
                 .frequencies_mhz
                 .iter()
@@ -878,6 +875,19 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         {
             return Err(WirelessError::NotSupported);
         }
+        Ok((frequencies, implicit))
+    }
+    pub(super) async fn scan(
+        &self,
+        mut request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        if self.mode.load(Ordering::Acquire) != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let (mut frequencies, implicit) = self.scan_frequencies(&mut request)?;
         let mut radio = self.radio.lock().await;
         if radio.roc_active() {
             return Err(WirelessError::Busy);
@@ -965,25 +975,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 request.ssids.is_empty()
                     || request.ssids.iter().any(|s| s.is_empty() || *s == b.ssid)
             })
-            .map(|b| {
-                let secured = b.capability & 16 != 0;
-                BssInfo {
-                    bssid: b.bssid,
-                    ssid: b.ssid,
-                    channel: narf_wireless::association::channel::from_frequency(u32::from(
-                        b.frequency,
-                    ))
-                    .map(u32::from)
-                    .unwrap_or(0),
-                    frequency_mhz: u32::from(b.frequency),
-                    rssi: i8::MIN,
-                    security: if secured {
-                        narf_wireless::scan::BssSecurity::Wpa2
-                    } else {
-                        narf_wireless::scan::BssSecurity::Open
-                    },
-                }
-            })
+            .map(bss_info)
             .collect();
         attempt.armed = false;
         Ok(result)
@@ -1335,6 +1327,24 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Interface for Device<T> {
     }
 }
 pub(super) type Native = Device<super::boot::PciBoot>;
+/// The nl80211 view of one scan-report BSS.
+pub(super) fn bss_info(b: wmi_runtime::ScanBss) -> BssInfo {
+    let secured = b.capability & 16 != 0;
+    BssInfo {
+        bssid: b.bssid,
+        ssid: b.ssid,
+        channel: narf_wireless::association::channel::from_frequency(u32::from(b.frequency))
+            .map(u32::from)
+            .unwrap_or(0),
+        frequency_mhz: u32::from(b.frequency),
+        rssi: i8::MIN,
+        security: if secured {
+            narf_wireless::scan::BssSecurity::Wpa2
+        } else {
+            narf_wireless::scan::BssSecurity::Open
+        },
+    }
+}
 /// ath10k's reconnect identity: the family and the radio's permanent MAC
 /// (firmware/OTP `SERVICE_READY` address), unchanged across recovery.
 fn reconnect_owner(mac: [u8; 6]) -> narf_wireless::reconnect::Owner {

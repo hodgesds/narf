@@ -24,6 +24,8 @@ pub(in crate::ath10k) struct Plan {
     pub(super) setup: Vec<Vec<u8>>,
     pub(super) restore: Vec<Vec<u8>>,
     pub(super) station: Option<associated_scan::Binding>,
+    /// Run on the P2P_DEVICE vdev (`Radio::p2p_device_scan`), not vdev0.
+    pub(super) p2p_device: Option<u8>,
 }
 impl Plan {
     /// Own and validate all probe content before reserving an ID or touching HIF.
@@ -159,6 +161,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             setup,
             restore,
             station,
+            p2p_device: None,
         })
     }
 
@@ -182,7 +185,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.check_scan_binding(plan.station.as_ref())?;
         let before = self.sequence;
         let result = self
-            .scan_run(
+            .scan_run_on(
+                plan.p2p_device,
                 &plan.channels,
                 (&plan.ssids, &plan.extra_ies),
                 &plan.setup,

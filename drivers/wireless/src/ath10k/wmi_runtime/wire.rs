@@ -225,6 +225,42 @@ impl Wire {
         validate_probe_ies(extra_ies)?;
         self.scan_mode(sequence, channels, ssids, extra_ies)
     }
+    /// `mac.c::ath10k_hw_scan` on the P2P_DEVICE vif: the scan is bound to
+    /// that vdev (`arg->vdev_id = arvif->vdev_id`), so firmware sources its
+    /// Probe Requests from the P2P Device Address. Probe content is the
+    /// caller's (wpa_supplicant's P2P + WSC IEs and the `DIRECT-` SSID). A
+    /// P2P probe never offers 11b rates (Wi-Fi P2P 2.4.1; mac80211 builds
+    /// the P2P request with `no_cck` and an OFDM-only rate mask), so
+    /// WMI_SCAN_ADD_CCK_RATES (0x4) is cleared from the active flags.
+    /// TLV only (P2P exists only there).
+    pub fn p2p_device_scan(
+        &self,
+        vdev: u8,
+        sequence: u16,
+        channels: &[u16],
+        ssids: &[Vec<u8>],
+        extra_ies: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if self.dialect != Dialect::Tlv {
+            return Err(Error::Unsupported);
+        }
+        let active = !ssids.is_empty();
+        let mut out = if active {
+            self.active_scan(sequence, channels, ssids, extra_ies)?
+        } else if extra_ies.is_empty() {
+            self.scan(sequence, channels)?
+        } else {
+            return Err(Error::Unsupported);
+        };
+        // `wmi_start_scan_common.vdev_id` follows scan_id and scan_req_id.
+        put(&mut out, 16, u32::from(vdev));
+        if active {
+            // `scan_ctrl_flags`, the 15th common word.
+            let flags = word(&out, 8 + 56)? & !0x4;
+            put(&mut out, 8 + 56, flags);
+        }
+        Ok(out)
+    }
     pub fn active_channels(
         &self,
         permissions: &[crate::ath10k::regulatory::Permission],

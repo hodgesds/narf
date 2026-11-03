@@ -340,10 +340,31 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         restore: Option<&[u8]>,
         validate: impl Fn() -> Result<(), Error>,
     ) -> Result<ScanReport, Error> {
+        self.scan_run_on(None, channels, probes, setup, restore, validate)
+            .await
+    }
+    /// `p2p_device`: run on the P2P_DEVICE vdev (`ath10k_hw_scan` with
+    /// `ar->scan.vdev_id = arvif->vdev_id`) instead of the managed role's
+    /// vdev. Its discoveries are returned only; the managed role's scan
+    /// cache (`information_elements`) is left unchanged.
+    async fn scan_run_on(
+        &mut self,
+        p2p_device: Option<u8>,
+        channels: &[u16],
+        probes: (&[Vec<u8>], &[u8]),
+        setup: &[Vec<u8>],
+        restore: Option<&[u8]>,
+        validate: impl Fn() -> Result<(), Error>,
+    ) -> Result<ScanReport, Error> {
         if self.failed || self.ready.is_none() || self.peer.is_some() || self.scan_pending.is_some()
         {
             return Err(Error::Failed);
         }
+        if p2p_device.is_some_and(|vdev| self.p2p_device_vdev() != Some(vdev) || self.roc.is_some())
+        {
+            return Err(Error::Unsupported);
+        }
+        let scan_vdev = p2p_device.map_or_else(|| self.primary_vdev(), u32::from);
         wire::validate_channels(channels)?;
         if channels.iter().any(|f| !self.channels.contains(f)) {
             return Err(Error::Unsupported);
@@ -354,7 +375,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .filter(|n| *n <= 4095)
             .ok_or(Error::Exhausted)?;
         let (ssids, extra_ies) = probes;
-        let command = if ssids.is_empty() {
+        let command = if let Some(vdev) = p2p_device {
+            self.wire
+                .p2p_device_scan(vdev, sequence, channels, ssids, extra_ies)?
+        } else if ssids.is_empty() {
             self.wire.scan(sequence, channels)?
         } else {
             self.wire
@@ -423,7 +447,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         let event = self.wire.scan_event(&bytes[4..])?;
                         if event.sequence != 0xa000 | u32::from(sequence)
                             || event.request != 0xa001
-                            || event.vdev != self.primary_vdev()
+                            || event.vdev != scan_vdev
                         {
                             report.ignored = report.ignored.saturating_add(1);
                             continue;
@@ -460,7 +484,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                                 for bss in &report.bss {
                                     cache.push(bss.copy_owned()?);
                                 }
-                                self.scan_cache = cache;
+                                if p2p_device.is_none() {
+                                    self.scan_cache = cache;
+                                }
                                 self.scan_pending = None;
                                 self.failed = false;
                                 return Ok(report);
@@ -471,7 +497,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     } else if id == self.wire.management_event {
                         let management = self.wire.management(&bytes[4..], self.features)?;
                         report.received = report.received.saturating_add(1);
-                        if let Some(bss) = beacon(&management, channels)? {
+                        if let Some(bss) = discovered(&management, channels, p2p_device.is_some())?
+                        {
                             if let Some(previous) = report
                                 .bss
                                 .iter_mut()
@@ -514,6 +541,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 }
 fn beacon(event: &Management, channels: &[u16]) -> Result<Option<ScanBss>, Error> {
+    discovered(event, channels, false)
+}
+/// A Beacon or Probe Response for the scan cache. On the P2P_DEVICE vdev a
+/// P2P Device in Listen state also answers: its Probe Response is neither
+/// ESS nor IBSS (P2P spec 3.1.2.1.2; BSSID = P2P Device Address) and is
+/// accepted only when it carries the WFA P2P IE (50:6f:9a:09).
+fn discovered(event: &Management, channels: &[u16], p2p: bool) -> Result<Option<ScanBss>, Error> {
     if event.status & !0x40 != 0 {
         return Ok(None);
     }
@@ -538,12 +572,14 @@ fn beacon(event: &Management, channels: &[u16]) -> Result<Option<ScanBss>, Error
         return Ok(None);
     }
     let capability = u16::from_le_bytes([fixed[34], fixed[35]]);
-    if capability & 3 != 1 {
+    let listen = p2p && capability & 3 == 0 && fc & 0x00ff == 0x0050;
+    if capability & 3 != 1 && !listen {
         return Ok(None);
     }
     let mut ssid = None;
     let mut ds = None;
     let mut ht = None;
+    let mut p2p_ie = false;
     let mut ies = &frame[36..];
     while !ies.is_empty() {
         let Some(header) = ies.get(..2) else {
@@ -569,9 +605,13 @@ fn beacon(event: &Management, channels: &[u16]) -> Result<Option<ScanBss>, Error
                     return Ok(None);
                 }
             }
+            221 if body.starts_with(&[0x50, 0x6f, 0x9a, 0x09]) => p2p_ie = true,
             _ => {}
         }
         ies = &ies[2 + length..];
+    }
+    if listen && !p2p_ie {
+        return Ok(None);
     }
     if ds.is_some_and(|c| u32::from(c) != event.channel)
         || ht.is_some_and(|c| u32::from(c) != event.channel)

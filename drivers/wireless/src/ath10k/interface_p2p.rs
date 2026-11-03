@@ -31,6 +31,8 @@ use narf_wireless::{
 /// until the P2P client/GO roles and their advertisement land
 /// (`drivers/wireless/specification/ath10k.md` §3.8).
 pub(super) const P2P_ADVERTISED: bool = false;
+/// The P2P Wildcard SSID (`P2P_WILDCARD_SSID` in wpa_supplicant).
+const P2P_WILDCARD_SSID: &[u8] = b"DIRECT-";
 /// `1 << NL80211_IFTYPE_P2P_DEVICE`: the only async control iftype.
 pub(super) const CONTROL_IFTYPES: u32 = 1 << 10;
 
@@ -54,6 +56,8 @@ pub(in crate::ath10k) struct P2pWdev {
     registration: IrqSafeSpinLock<Option<Registration>>,
     /// The START_P2P_DEVICE request's identity while the vdev exists.
     started: IrqSafeSpinLock<Option<RadioInterfaceIdentity>>,
+    /// IEs of the last WDEV scan's BSSes (`scan_information_elements`).
+    scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
 }
@@ -169,6 +173,7 @@ impl Native {
             )),
             registration: IrqSafeSpinLock::new(None),
             started: IrqSafeSpinLock::new(None),
+            scan_ies: IrqSafeSpinLock::new(Vec::new()),
             rx: IrqSafeSpinLock::new(None),
             tx: IrqSafeSpinLock::new(None),
         });
@@ -184,6 +189,87 @@ impl Native {
             return Err(e);
         }
         Ok(wdev)
+    }
+}
+
+impl Native {
+    /// `mac.c::ath10k_hw_scan` on the started P2P_DEVICE vif (P2P search:
+    /// wpa_supplicant `p2p_find` scans the social channels from the P2P
+    /// device with the `DIRECT-` SSID and its P2P/WSC IEs). The request is
+    /// validated as the netdev's; the WMI scan runs on the P2P_DEVICE vdev
+    /// (`Radio::p2p_device_scan`). A ROC in flight, a prepared/associated
+    /// station peer or an AP on the managed vdev is `Busy` before any
+    /// publication; an ambiguous native failure closes the netdev as its
+    /// own scans do.
+    async fn p2p_device_scan(
+        &self,
+        mut request: ScanRequest,
+    ) -> Result<Vec<wmi_runtime::ScanBss>, WirelessError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let (mut frequencies, implicit) = self.scan_frequencies(&mut request)?;
+        let mut radio = self.radio.lock().await;
+        if radio.p2p_device_vdev().is_none() {
+            return Err(WirelessError::HardwareError);
+        }
+        if radio.roc_active()
+            || radio.prepared_peer().is_some()
+            || radio.station_link().is_some()
+            || radio.ap_exists()
+        {
+            return Err(WirelessError::Busy);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let domain = self.policy.current().map_err(error)?;
+        if implicit {
+            frequencies.retain(|f| {
+                wmi_runtime::receive_permission(&domain, &[*f]).is_ok()
+                    && (!request.active || radio.active_frequency_allowed(&domain, *f))
+            });
+        }
+        wmi_runtime::receive_permission(&domain, &frequencies).map_err(error)?;
+        let plan = if request.active {
+            Some(
+                radio
+                    .prepare_active_scan(&frequencies, &request.ssids, &domain)
+                    .and_then(|plan| plan.with_extra_ies(&request.extra_ies))
+                    .map_err(error)?,
+            )
+        } else {
+            None
+        };
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        let report = radio
+            .p2p_device_scan(plan, &frequencies, || {
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Failed);
+                }
+                self.policy.current()
+            })
+            .await
+            .map_err(error)?;
+        attempt.armed = false;
+        Ok(report
+            .bss
+            .into_iter()
+            .filter(|b| {
+                request.ssids.is_empty()
+                    || request.ssids.iter().any(|s| {
+                        // The P2P Wildcard SSID `DIRECT-` matches every
+                        // P2P SSID (Wi-Fi P2P 3.1.2.1.1); others are exact.
+                        s.is_empty()
+                            || *s == b.ssid
+                            || (s.as_slice() == P2P_WILDCARD_SSID
+                                && b.ssid.starts_with(P2P_WILDCARD_SSID))
+                    })
+            })
+            .collect())
     }
 }
 
@@ -469,6 +555,47 @@ impl WirelessNetIface for P2pWdev {
     }
     fn p2p_interface_types(&self) -> Vec<u32> {
         alloc::vec![10]
+    }
+    /// The netdev's `max_scan_ssids` / `max_scan_ie_len` (one wiphy).
+    fn max_scan_ssids(&self) -> u8 {
+        wmi_runtime::MAX_SCAN_SSIDS as u8
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        wmi_runtime::MAX_SCAN_IE_LEN
+    }
+    fn async_p2p_device_scan_control(&self) -> bool {
+        true
+    }
+    /// `ath10k_hw_scan` on the P2P_DEVICE vif. mac80211 refuses a scan on
+    /// a P2P_DEVICE that is not running (`ieee80211_sdata_running`); here
+    /// an unstarted wdev has no vdev and gets `HardwareError` (`-EIO`).
+    async fn p2p_device_scan_async(
+        &self,
+        authority: &RadioControlAuthority,
+        request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        let parent = self.request_current(authority)?;
+        if !self.started() {
+            return Err(WirelessError::HardwareError);
+        }
+        let results = parent.p2p_device_scan(request).await?;
+        self.request_current(authority)?;
+        let mut bsses = Vec::with_capacity(results.len());
+        let mut ies = Vec::with_capacity(results.len());
+        for mut bss in results {
+            ies.push((bss.bssid, core::mem::take(&mut bss.information_elements)));
+            bsses.push(bss_info(bss));
+        }
+        let replaced = core::mem::replace(&mut *self.scan_ies.lock(), ies);
+        drop(replaced);
+        Ok(bsses)
+    }
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        self.scan_ies
+            .lock()
+            .iter()
+            .find(|(address, _)| *address == bssid)
+            .map(|(_, elements)| elements.clone())
     }
     /// `ieee80211_start_p2p_device` -> `ath10k_add_interface`: the
     /// P2P_DEV vdev with the wdev address.
