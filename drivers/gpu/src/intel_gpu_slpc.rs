@@ -453,11 +453,15 @@ impl Slpc {
             }
             return Ok(());
         }
-        if now >= self.deadline {
-            self.unavailable();
-            return Ok(());
-        }
+        // wait_for_pc_state's poll_timeout_us evaluates the state once more
+        // after expiry, and a reply drained through event() before this poll
+        // is consumed: a late poll that finds either progresses. The bound is
+        // enforced on what is still unsatisfied, and before any new command.
+        let expired = now >= self.deadline;
         if global != 3 {
+            if expired {
+                self.unavailable();
+            }
             return Ok(());
         }
         if self.commands.is_empty() {
@@ -526,6 +530,11 @@ impl Slpc {
             self.range = self.target_range;
             self.profile = self.target_profile;
             self.state = SlpcState::Running;
+            return Ok(());
+        }
+        // A reply still owed, or a command not yet issued, past the bound.
+        if expired {
+            self.unavailable();
             return Ok(());
         }
         if self.pending.is_some() {

@@ -333,9 +333,10 @@ impl Auth {
         if self.pending != Some(m.fence) {
             return Ok(true);
         }
-        if now >= self.deadline {
-            return Err(TransportError::Timeout);
-        }
+        // guc_ct_send_recv's wait_event_timeout reports a fence done when the
+        // timeout expires as success (___wait_cond_timeout): a reply already
+        // received is consumed even past the bound. progress() enforces the
+        // bound only on a request that is still unanswered.
         if self.phase != Phase::Reply || !m.payload.is_empty() {
             return Err(TransportError::Protocol(0x4000));
         }
@@ -363,12 +364,24 @@ impl Auth {
         if matches!(self.phase, Phase::Off | Phase::Running | Phase::Unavailable) {
             return Ok(());
         }
-        if now >= self.deadline {
-            if self.phase == Phase::Status {
-                self.invalidate();
-                return Ok(());
+        let expired = now >= self.deadline;
+        if self.phase == Phase::Status {
+            // xe_huc_auth's xe_mmio_wait32 on HUC_KERNEL_LOAD_INFO reads once
+            // more after its timeout: authentication seen by a late poll is
+            // success; a bit still clear past the bound invalidates.
+            match gsc::huc_authenticated(ct.window(), gsc::HucAuth::Guc) {
+                None => return Err(TransportError::Unavailable),
+                Some(true) => self.phase = Phase::Running,
+                Some(false) if expired => self.invalidate(),
+                Some(false) => {}
             }
-            return Err(TransportError::Timeout); // unresolved request requires full reset
+            return Ok(());
+        }
+        // Replies were drained through event() before this poll. A request
+        // still unanswered, or none issued, within the total bound needs a
+        // full reset; no new request starts once it has passed.
+        if expired {
+            return Err(TransportError::Timeout);
         }
         if self.phase == Phase::Send {
             if !core::mem::replace(&mut self.checked, true) {
@@ -400,12 +413,6 @@ impl Auth {
                 }
                 Err(TransportError::Ct(GuCError::Full)) => {}
                 Err(e) => return Err(e),
-            }
-        } else if self.phase == Phase::Status {
-            match gsc::huc_authenticated(ct.window(), gsc::HucAuth::Guc) {
-                None => return Err(TransportError::Unavailable),
-                Some(true) => self.phase = Phase::Running,
-                Some(false) => {}
             }
         }
         Ok(())

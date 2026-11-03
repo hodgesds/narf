@@ -332,6 +332,37 @@ kernel_test_in!(
     smoke_slpc_ct_full_retries_without_publishing_success
 );
 
+fn smoke_slpc_reply_before_late_poll_completes_update() -> TestResult {
+    // guc_ct_send_recv's wait_event_timeout counts a fence completed by the
+    // time the timeout expires as success: a reply already posted when a
+    // poll arrives past the 1.005 s bound completes the update.
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    hardware_discovery(&mut gt, &w, 0xdfc);
+    hardware_scheduling(&mut gt, &w);
+    SLPC_FIXTURE_MODE.store(0, core::sync::atomic::Ordering::Relaxed);
+    gt.begin_slpc(30).unwrap();
+    drive(&mut gt, &w, 31);
+    gt.begin_slpc_power_profile(PowerProfile::PowerSaving, 100)
+        .unwrap();
+    assert_eq!(gt.poll(101), Poll::Ready(Ok(GtState::SchedulingReady)));
+    assert_eq!(gt.slpc(), SlpcState::Updating);
+    service_contexts(&w, &mut BTreeMap::new(), true);
+    assert_eq!(
+        gt.poll(100 + 1_005_000_000 + 1),
+        Poll::Ready(Ok(GtState::SchedulingReady))
+    );
+    assert_eq!(gt.slpc(), SlpcState::Running);
+    assert_eq!(gt.slpc_status().unwrap().profile, PowerProfile::PowerSaving);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_slpc",
+    smoke_slpc_reply_before_late_poll_completes_update
+);
+
 fn smoke_slpc_stable_ip_qualified_fused_vectors() -> TestResult {
     use crate::intel_gpu_slpc::Limits;
     let (w, _) = model();

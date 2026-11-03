@@ -473,6 +473,54 @@ kernel_test_in!(
     smoke_tgl_huc_auth_ack_and_status_are_independent
 );
 
+fn smoke_tgl_huc_reply_and_status_before_late_poll_authenticate() -> TestResult {
+    // The CT reply wait (wait_event_timeout's final condition check) and
+    // xe_huc_auth's xe_mmio_wait32 on the load-info bit both count a
+    // condition met by expiry as success: a late poll authenticates.
+    for late_status in [false, true] {
+        MODE.store(if late_status { 1 } else { 0 }, Ordering::Relaxed);
+        let (w, arena, mut gt) = model_huc(true);
+        primed(&mut gt, &w);
+        let epoch = gt.user_epoch().unwrap();
+        assert!(!gt.prepare_huc(11_000_000).unwrap());
+        assert_eq!(
+            gt.poll(11_000_001),
+            Poll::Ready(Ok(GtState::SchedulingReady))
+        );
+        service_contexts(&w, &mut BTreeMap::new(), true);
+        if late_status {
+            // ACK consumed in time; the status bit sets before a poll past
+            // the 100 ms authentication wait.
+            assert_eq!(
+                gt.poll(11_000_002),
+                Poll::Ready(Ok(GtState::SchedulingReady))
+            );
+            assert!(gt.huc_version(epoch, || true).is_none());
+            w.0.borrow_mut().regs.insert(0xc1dc, 1);
+            assert_eq!(
+                gt.poll(11_000_002 + 100_000_000 + 5),
+                Poll::Ready(Ok(GtState::SchedulingReady))
+            );
+        } else {
+            // Reply and status both precede a poll past the 1 s bound.
+            assert_eq!(
+                gt.poll(11_000_000 + 1_000_000_000 + 1),
+                Poll::Ready(Ok(GtState::SchedulingReady))
+            );
+        }
+        assert_eq!(gt.huc_version(epoch, || true), Some((7, 9, 3)));
+        stop_gt(&mut gt, &w);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    MODE.store(0, Ordering::Relaxed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_huc",
+    smoke_tgl_huc_reply_and_status_before_late_poll_authenticate
+);
+
 fn smoke_tgl_huc_wopcm_preflight_and_locked_agent() -> TestResult {
     for agent in [0, 2] {
         let (w, arena, mut gt) = model_huc(true);
