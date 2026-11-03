@@ -2169,6 +2169,31 @@ existing shared RNG-registration skip. The release production boot and both
 btrfs postflights also pass. The debug group pass is deferred to the end of
 this integration wave. None of this has run on physical Intel hardware.
 
+### MTL media-GT HuC and GT1's L3 bank entry — release gates recorded
+
+On Meteor Lake and Arrow Lake, the media GuC now loads and authenticates the
+HuC, as Linux xe does without the GSC. The HuC is DMA-loaded before the GuC
+upload, then authenticated through the GuC after the default contexts are
+recorded. The existing HuC owner now serves both GuCs, so TGL keeps its HuC
+on GT0. On MTL the HuC needs both `narf.intel.media_gt=1` and
+`narf.intel.huc=1`. If the image is unusable, allocation fails or
+authentication is rejected, GT1 still publishes, just without a HuC. The Xe
+HuC version query reports the media GT's running HuC, and returns ENODEV
+otherwise. GT1's topology now includes the L3 bank entry Linux reports for
+media versions below 30. The GSC-only formats moved to a separate module. That
+module keeps the temporary dead-code allowance, while the HuC parts are now
+production.
+
+Integration fixed one fixture defect. A HuC smoke restarted GT1 on a model
+whose allocator had just failed, without resetting GGTT placement, so its CT
+model panicked and aborted the group. The fixture's existing reset is now
+called; every assertion is unchanged. All eight release groups pass 2,117
+tests, with no failures and only the existing shared RNG-registration skip.
+The TGL HuC group is unchanged, and the release production boot and both
+btrfs postflights pass. GT0 still has no L3 bank entry; a queued unit adds
+it. The debug group pass is deferred to the end of this integration wave.
+None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

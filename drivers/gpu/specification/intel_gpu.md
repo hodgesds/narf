@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.49** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.50** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -38,9 +38,9 @@
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
 > VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
-> queries, display-14 PSR on hardware inputs, and MTL external outputs
-> on Pipes B–D beside the lit panel pass release native model gates —
-> see §20).
+> queries and the media-GuC HuC, display-14 PSR on hardware inputs,
+> and MTL external outputs on Pipes B–D beside the lit panel pass
+> release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3815,8 +3815,28 @@ The GT1 topology fixtures now include the L3 entry, and the media-staging
 fixtures pass the new HuC argument. The TGL HuC fixtures are unchanged apart
 from routing an MTL-profile AUTHENTICATE_HUC to the media model. The runtime's
 firmware acquisition, staging fallback and adoption bookkeeping were reviewed
-manually. No fixture was run in this checkpoint, and none is physical Intel,
-Mesa or codec evidence.
+manually. None of these fixtures is physical Intel, Mesa or codec evidence.
+
+Integration: all eight release groups pass 2,117 tests with no failures and no
+Intel skips; the only skip is the existing shared RNG-registration skip. The
+TGL HuC fixtures in group 3 are unchanged and pass. One fixture defect was
+fixed. The option-staging smoke restarted GT1 on the model whose HuC
+allocation it had just failed, without the `reclaimed()` placement reset its
+other restarts use. The model's bump allocator then put the ADS past the
+address the CT model reads, and the REGISTER_CONTEXT handler panicked. The
+real arena reuses the freed range, so the reset is now called; every
+assertion is unchanged. Review against Linux found the following:
+- The load order follows `xe_uc_load_hw`: HuC DMA before the GuC upload, and
+  `xe_huc_auth(VIA_GUC)` after the default LRCs.
+- The HuC version query follows `query_uc_fw_version`: pad, pad2 and reserved
+  refuse with EINVAL, as does an unknown type, and a missing GT1 or a HuC that
+  is not running is ENODEV.
+- GT1's L3 bank entry follows `load_l3_bank_mask` for graphics 12.70:
+  `GT_L3_EXC_MASK` (`XEHP_FUSE4` 6:4) pairs per node, repeated for each
+  `MEML3_EN_MASK` (`MIRROR_FUSE3` 3:0) node.
+`intel_gpu_gsc_heci` keeps the temporary dead-code allowance outside
+kernel-test builds; the HuC parts of `intel_gpu_gsc` are production now. The
+debug group pass is deferred to the end of the current integration wave.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 
