@@ -2734,6 +2734,17 @@ an FBC it did not activate. KMS uses `Platform::fbc_carve` and
 `fbc_recovery_view` (both inert by default). Every session invalidates; a
 latched `present` flushes; console restore, legacy guards and recovery
 disable.
+
+`intel_gpu_psr` is display 14's PSR1: `Sink::read`, `compute_psr1` (typed
+`Refusal`; `latched()` refusals hold for the card's lifetime) and the `Psr`
+owner (`enable` without activation, `pause`, `resume`, `disable`). KMS reaches
+the panel through three `Platform` hooks, all inert by default:
+`psr_timing`, `psr_aux` and `psr_wm_level_disabled`. A latched `present`
+enables PSR once, disabling FBC first. Every session start pauses and waits
+for idle. The `Guard` drop re-arms once the session's frame changes have
+latched. Console and surface restore, legacy drain and recovery disable it.
+`register_wm_level_disabled(Some(provider))` is the watermark lane's
+Wa_14015648006 input; without it PSR is refused.
 - KMS install creates the service. The GT publication hook acquires, loads
   and releases. `quiesce_for_legacy` brackets system-suspend preparation.
 
@@ -8343,7 +8354,8 @@ Before takeover, the console/cursor pumps and cached CPU framebuffer views
 are paused and old scanout epochs drained. The original contiguous console
 allocation stays retained and remains the fbdev mapping; scattered GEM pages
 are never published as a contiguous framebuffer. PSR1/2 is disabled and
-verified idle, with re-enable inhibited during GEM ownership. Restoring the
+verified idle at takeover. On display 14 the owner itself re-enables PSR1
+after a latched GEM framebuffer and exits it at every session start. Restoring the
 console uses the same fresh flip-done/SURFLIVE/frame-count proof before GEM
 PTEs and owners are retired; `shutdown_restored_console` then restores only
 owned interrupt-mask/enable bits. Legacy modeset/HPD and display PM acquire
@@ -8472,7 +8484,7 @@ preserving confirmed front/color and the prior marker. Active gamma replacement 
 gamma use an independently retained display state buffer (DSB) owner on the
 fixed progressive MTL/Arrow Pipe-A profile. TEST_ONLY validates the retained
 mode and copies blobs without acquiring the hardware owner. Execution also
-checks live fixed timing, disabled VRR/DCB/interlace, PSR inhibition and source-
+checks live fixed timing, disabled VRR/DCB/interlace, PSR exited and source-
 qualified MTL DEwake latencies; unsupported live state refuses before arming.
 Same-LUT CTM changes and ordinary surface flips do not write palette data.
 

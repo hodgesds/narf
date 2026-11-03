@@ -623,9 +623,12 @@ Composition points and named omissions:
   (PLANE_SEL_FETCH_*) belong to lane 1's plane-programming
   surface; MAN_TRK is the SU discipline implemented here,
   and sel-fetch composition lands with the plane lane.
-  Selective fetch is not qualified on display 14 either:
-  the fixed MTL/Arrow KMS owner inhibits PSR for every
-  takeover, and PSR2 runs only in continuous full frame.
+  On display 14 none of this module's PSR runs: the probe
+  enable is Gen12-only (its PSR2_CTL layout is not display
+  14's), and PSR1 is driven by the KMS owner through
+  `intel_gpu_psr` (§20, "Display-14 PSR1 under KMS
+  ownership"). Selective fetch and Panel Replay are not
+  offered on display 14.
 - On display 14, `notify_scanout_dirty` takes a DC_off
   reference (§12.1) before `EDP_RUNTIME` and releases it
   after, so a PSR2 SU write never reaches a power-gated
@@ -2341,11 +2344,11 @@ production feature. Unsupported functionality remains unadvertised.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; MTL/Arrow GT1 identity, wake, reset, cache and workaround owner runs beside GT0; media GuC/CT, VCS/VECS UAPI and HuC remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner API (no production port caller yet) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join, TBT, HDMI FRL, UHBR, multi-pipe and PSR2 open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service, Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20), gated on the watermark lane's Wa_14015648006 input; TBT, HDMI FRL, UHBR, multi-pipe, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region and boot-framebuffer pages, proven outside system RAM; color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region and boot-framebuffer pages, proven outside system RAM; PSR1 wins over FBC while enabled (Wa_14016291713, no stepping readout); color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -3456,7 +3459,7 @@ that state:
 | Color / LUT / CTM | `Guard` reference; modeset RGB-bypass initialization runs under the modeset reference. |
 | Console restore/pause, display recovery, legacy PM guards | References in `quiesce`, `recover`, `legacy` and `legacy_drain`. |
 | fbcon / legacy fb draws | CPU memory writes only. Scanout publication reaches PSR through `notify_scanout_dirty`, which holds a reference. |
-| PSR enable / KMS inhibit / dirty notify | Enable runs at probe before the service exists, in firmware DC0. Inhibit runs inside a `Guard` takeover or recovery. Notify holds a reference. |
+| PSR enable / KMS inhibit / dirty notify | Gen12 probe enable never runs on display 14. Inhibit runs inside a `Guard` takeover or recovery. Notify holds a reference. KMS-owned PSR1 (`intel_gpu_psr`) enables, pauses, re-arms and disables only inside the `Guard`, `legacy_drain` and `recover` references; it holds none while active, as Linux allows DC5/DC6 with PSR1 active. |
 | PWM backlight | Unreachable: `backlight_supported()` is Gen12-only. |
 | Full-AUX backlight | Fixed in this slice: reference per AUX transaction, availability probe, PPS gate access and relight step. The earlier "owner installed" re-entry gate is removed. |
 | HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. Gen12 external admission and the bridge take `legacy()`. Joined: every MTL external hardware pass (HPD poll, event handling with Type-C connect/disconnect, probe, activate, stop, and the suspend/GT-reset teardown) runs in `intel_gpu_xelpg_external::with_dc_off`, which takes one `DcUser::External` reference before its first register access and runs nothing if DC states cannot be exited. Probe registers `external_route_blocks_dc` with `register_external_live`, so a live or quarantined route, or a pass in progress, refuses re-entry between passes. |
@@ -3510,7 +3513,8 @@ Refused and remaining work:
       that is conservative and loses compression in the meantime.
     - Reading `GSCPSMI_BASE` without media forcewake can return 0. That is
       treated, as xe treats it, as "workaround not applied".
-- **PSR2 selective fetch and panel replay remain unqualified** (§10).
+- **PSR2 selective fetch and panel replay remain unqualified** (§10). PSR1
+  is covered by the next subsection.
 - **Other remaining display power work:** per-well reference counts beyond
   DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
   at suspend, DC3CO, pipe DMC programs, and display stepping.
@@ -3984,3 +3988,72 @@ RNG-registration skip. Group 7 now also selects `drivers/gpu/intel_gpu_vbt`.
 The four GMBUS transport fixtures that failed after the pin renumbering alone
 pass with the `do_gmbus_xfer` rewrite. The debug group pass is deferred to the
 end of the current integration wave.
+
+### Display-14 PSR1 under KMS ownership
+
+The fixed MTL/Arrow Pipe-A KMS owner no longer leaves PSR off for the whole
+ownership period. `intel_gpu_psr` implements display 14's PSR1 from the
+pinned `intel_psr.c`, and the owner drives it through the same session
+discipline as FBC.
+
+- **Enable:** after the first latched KMS GEM framebuffer. The sink is read
+  once: the PSR capability, eDP `SET_POWER_CAP`, the max-resync latency (8
+  when unreadable), ALPM, TPS3 and the `NO_PSR` OUI quirk. Qualification is
+  `intel_psr_compute_config` for display 14: no interlace, a valid setup time
+  within `vtotal - vdisplay - 1` lines of the live transcoder-A timing. The
+  enable is `intel_psr_enable_locked`: an IIR error check, the sink
+  (`DP_PSR_EN_CFG` CRC, then with `DP_PSR_ENABLE`, then `DP_SET_POWER` D0),
+  then the source (`PSR_MASK`, `psr_irq_control`, Wa_14015648006). Every
+  refusal precedes the first write.
+- **Activation and exit:** `hsw_activate_psr1` runs when the session ends
+  (`Guard` drop), and only if every frame change the session began has
+  latched and the KMS framebuffer is on screen. Every session start runs
+  `intel_psr_exit` and waits for idle (2 s bound), so flips, DIRTYFB
+  re-presents, cursor and color/DSB arms never run against self-refresh.
+  Re-arm happens only from an idle status. This replaces Linux's frontbuffer
+  invalidate/flush and pipe-update idle wait with one bracket.
+- **Disable:** `intel_psr_disable_locked` (exit, idle, Wa undo,
+  `DP_PSR_EN_CFG` 0) runs before console restore, surface restore, legacy
+  drain, suspend quiesce and reset recovery. Recovery uses the loss-tolerant
+  view.
+- **Errors:** there is no display interrupt handler, so `TGL_PSR_ERROR` is
+  polled in `TRANS_PSR_IIR` at every pause and re-arm. An error disables PSR,
+  wakes the sink and latches `SinkNotReliable`, as `intel_psr_handle_irq`
+  does. Enable refuses while `GEN8_DE_MISC_IER` could deliver
+  `GEN8_DE_EDP_PSR`.
+- **FBC policy:** PSR wins. Wa_14016291713 refuses FBC with PSR1 on display
+  14.00 A0–C0, and there is no stepping readout, so FBC is disabled before
+  the PSR sink is enabled and stays refused while PSR is enabled. A latched
+  PSR refusal lets the next latch activate FBC.
+- **No VBT:** Linux gates eDP PSR on the VBT's `psr.enable` and takes TP
+  times from it. This driver uses the sink and source qualification, the
+  `psr_safest_params` TP times (2500 µs) and link-off mode
+  (`link_standby` false on display >= 12).
+- **DC states:** PSR holds no DC_off reference while active. Every PSR
+  conversation runs inside the KMS, legacy or recovery reference.
+- **Gated input:** Wa_14015648006 needs `wm_level_disabled` from
+  `skl_wm_check_vblank`, which the watermark lane does not compute yet. Until
+  it calls `intel_gpu_psr::register_wm_level_disabled`, PSR is refused with
+  `WmLevelUnknown` (retried at each latch) rather than guessed. Production
+  PSR is therefore wired but inert on hardware today.
+- **Probe:** Gen12 probe-time PSR no longer runs on display 14; it would
+  have programmed the TGL `PSR2_CTL` layout.
+- **Remaining:** PSR2 selective fetch, early transport and cursor SU; Panel
+  Replay stays refused. DIRTYFB clips are discarded today, so PSR2 would
+  need the clip plumbing first.
+
+Twelve native fixtures are registered under `drivers/gpu/intel_gpu_psr` and
+were not executed in this slice. Six are register/sink models:
+`smoke_psr_sink_caps_decode_and_refusals`,
+`smoke_psr_qualify_follows_compute_config`,
+`smoke_psr_enable_conversation_is_linux_ordered`,
+`smoke_psr_enable_refuses_before_any_write`,
+`smoke_psr_pause_resume_and_disable_sequences` and
+`smoke_psr_wm_level_provider_registry`. Six drive the production
+`Device`/`Guard` path on x86_64:
+`smoke_psr_kms_enables_after_latch_and_activates_at_session_end`,
+`smoke_psr_kms_flip_and_dirtyfb_exit_before_arm_and_rearm_after_latch`,
+`smoke_psr_kms_color_and_cursor_rearm_only_after_their_latch`,
+`smoke_psr_kms_disabled_before_console_legacy_suspend_and_reset`,
+`smoke_psr_kms_wins_over_fbc_in_both_directions` and
+`smoke_psr_kms_refusals_leave_zero_psr_traffic`.
