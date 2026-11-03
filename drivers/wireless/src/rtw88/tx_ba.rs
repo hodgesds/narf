@@ -555,7 +555,7 @@ pub(super) async fn program(io: &mut impl Io) -> Result<(), Error> {
     readback(io).await
 }
 pub(super) async fn readback(io: &mut impl Io) -> Result<(), Error> {
-    io.station_profile_readback()?;
+    io.station_profile_readback().await?;
     if io.read16(0x42a).await? != 0x0808
         || io.read8(0x455).await? != 0x20
         || io.read16(0x4ce).await? != 0x0801

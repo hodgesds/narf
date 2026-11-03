@@ -261,17 +261,26 @@ fn smoke_rtw8822ce_ht2_native_source_loss_and_partial_path_readback() -> TestRes
             if !f
                 .e
                 .h
-                .model(Io::station_ht_program_quiet)
+                .model(|io| {
+                    crate::rtw88::firmware_transport::ready_now(Io::station_ht_program_quiet(io))
+                })
                 .map_err(|_| "H2 quiet owner")?
             {
                 return Err("actual drained H2 owner not quiet");
             }
             f.e.h
-                .model(|io| Io::mailbox_submit(io, [1, 0, 0, 0, 0, 0, 0, 0]))
+                .model(|io| {
+                    crate::rtw88::firmware_transport::ready_now(Io::mailbox_submit(
+                        io,
+                        [1, 0, 0, 0, 0, 0, 0, 0],
+                    ))
+                })
                 .map_err(|_| "H2 native pending mailbox")?;
             if f.e
                 .h
-                .model(Io::station_ht_program_quiet)
+                .model(|io| {
+                    crate::rtw88::firmware_transport::ready_now(Io::station_ht_program_quiet(io))
+                })
                 .map_err(|_| "H2 pending receipt")?
             {
                 return Err("unconsumed original mailbox admitted path mutation");

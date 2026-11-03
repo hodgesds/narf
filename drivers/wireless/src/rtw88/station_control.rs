@@ -120,7 +120,7 @@ pub(super) async fn send(
     }
     if admission.is_none() && io.mailbox_pending() {
         for attempt in 0..=30 {
-            if io.mailbox_consumed()? {
+            if io.mailbox_consumed().await? {
                 break;
             }
             if attempt < 30 {
@@ -133,7 +133,7 @@ pub(super) async fn send(
     }
     let mut ready = false;
     for attempt in 0..=30 {
-        if io.mailbox_ready()? {
+        if io.mailbox_ready().await? {
             ready = true;
             break;
         }
@@ -150,14 +150,14 @@ pub(super) async fn send(
     if let Some(a) = admission {
         crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
             io.station_allowed()?;
-            io.mailbox_submit(words)
+            io.mailbox_submit(words).await
         })
         .await?;
     } else {
-        io.mailbox_submit(words)?;
+        io.mailbox_submit(words).await?;
     }
     for attempt in 0..=30 {
-        if io.mailbox_consumed()? {
+        if io.mailbox_consumed().await? {
             return Ok(());
         }
         if attempt < 30 {

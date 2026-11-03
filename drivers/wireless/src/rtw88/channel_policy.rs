@@ -641,7 +641,7 @@ pub(super) fn probe_for(probe: &[u8], channel: u8) -> Option<alloc::vec::Vec<u8>
 
 async fn wait_h2c(io: &mut impl Io) -> Result<(), Error> {
     for _ in 0..1000 {
-        if io.poll_h2c()? {
+        if io.poll_h2c().await? {
             return Ok(());
         }
         io.delay_us(10).await;

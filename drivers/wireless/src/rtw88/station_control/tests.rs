@@ -147,35 +147,49 @@ unsafe impl Io for Model {
     fn mailbox_pending(&self) -> bool {
         self.pending
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        if self.pending {
-            Err(Error::State)
-        } else {
-            Ok(!self.ready_hold)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if self.pending {
+                Err(Error::State)
+            } else {
+                Ok(!self.ready_hold)
+            }
         }
     }
-    fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
-        if !self.mailbox_ready()? {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if !self.mailbox_ready().await? {
+                return Err(Error::State);
+            }
+            if words != [1, 0, 0, 0, 0, 0, 0, 0] {
+                self.station_allowed()?;
+            }
+            self.pending = true;
+            self.commands.push(words);
+            self.slots.push(self.cursor);
+            Ok(())
         }
-        if words != [1, 0, 0, 0, 0, 0, 0, 0] {
-            self.station_allowed()?;
-        }
-        self.pending = true;
-        self.commands.push(words);
-        self.slots.push(self.cursor);
-        Ok(())
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        if !self.pending {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.pending {
+                return Err(Error::State);
+            }
+            if self.consumed_hold {
+                return Ok(false);
+            }
+            self.pending = false;
+            self.cursor = (self.cursor + 1) % 4;
+            Ok(true)
         }
-        if self.consumed_hold {
-            return Ok(false);
-        }
-        self.pending = false;
-        self.cursor = (self.cursor + 1) % 4;
-        Ok(true)
     }
     async fn delay_us(&mut self, _: u64) {
         if let Some(close) = self.close.take() {

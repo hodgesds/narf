@@ -871,7 +871,7 @@ pub(super) async fn prepare(
     }
     let thermal_after = convert_temperature(io, envelope).await?;
     verify_channel(io, swing, matches!(phy.rfe, 2 | 4)).await?;
-    io.park_radio()?;
+    io.park_radio().await?;
     io.finish_calibration8821c()?;
     Ok(Info {
         channel: 1,
@@ -969,14 +969,29 @@ where
         self.envelope
             .invoke(&self.policy, || self.io.begin_commands())
     }
-    fn submit_h2c(&mut self, p: &[u8; 32]) -> Result<(), Error> {
-        self.envelope.invoke(&self.policy, || self.io.submit_h2c(p))
+    fn submit_h2c(
+        &mut self,
+        p: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.submit_h2c(p),
+        )
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
-        self.envelope.invoke(&self.policy, || self.io.poll_h2c())
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.poll_h2c(),
+        )
     }
-    fn park_radio(&mut self) -> Result<(), Error> {
-        self.envelope.invoke(&self.policy, || self.io.park_radio())
+    fn park_radio(&mut self) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.park_radio(),
+        )
     }
     fn finish_calibration8821c(&mut self) -> Result<(), Error> {
         self.envelope

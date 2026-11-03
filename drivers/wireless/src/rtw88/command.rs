@@ -118,9 +118,9 @@ pub(super) fn descriptor() -> [u8; 48] {
     bytes
 }
 pub(super) async fn send(io: &mut impl Io, packet: &[u8; BYTES]) -> Result<(), Error> {
-    io.submit_h2c(packet)?;
+    io.submit_h2c(packet).await?;
     for _ in 0..1000 {
-        if io.poll_h2c()? {
+        if io.poll_h2c().await? {
             return Ok(());
         }
         io.delay_us(10).await;

@@ -94,14 +94,24 @@ async fn send<I: Io>(
     expect: Option<Peer>,
 ) -> Result<(), Error> {
     for i in 0..=30 {
-        if admission.run(|| source.invoke(|| io.mailbox_ready()))? {
+        if crate::rtw88::firmware_transport::enclosed(
+            |op| admission.run(|| source.invoke(op)),
+            io.mailbox_ready(),
+        )
+        .await?
+        {
             let mut scope = |op: &mut dyn FnMut() -> Result<bool, NativeError>| {
                 admission.run(|| source.invoke(op))
             };
-            match io.ps_mailbox_submit(command, &mut scope)? {
+            match io.ps_mailbox_submit(command, &mut scope).await? {
                 PsSubmit::Issued => {
                     for j in 0..=30 {
-                        if admission.run(|| source.invoke(|| io.mailbox_consumed()))? {
+                        if crate::rtw88::firmware_transport::enclosed(
+                            |op| admission.run(|| source.invoke(op)),
+                            io.mailbox_consumed(),
+                        )
+                        .await?
+                        {
                             return Ok(());
                         }
                         if j < 30 {
@@ -144,10 +154,10 @@ impl<I: Io> Owner<I> {
         self.station_check().map_err(|_| Error::Busy)?;
         let station = self.station.as_mut().ok_or(Error::Busy)?;
         let (own, peer, aid) = station.lps_peer().ok_or(Error::Busy)?;
-        if !self.io.station_ht_program_quiet()? {
+        if !self.io.station_ht_program_quiet().await? {
             return Err(Error::Busy);
         }
-        self.io.station_profile_readback()?;
+        self.io.station_profile_readback().await?;
         let info = self.info.ok_or(Error::Busy)?;
         let profile = Profile::from_firmware(self.did, info).ok_or(Error::Unsupported)?;
         let pages = Pages::station(own, peer, aid, false).ok_or(Error::Busy)?;
@@ -269,15 +279,17 @@ impl<I: Io> Owner<I> {
         if !awake {
             return Err(NativeError::Timeout.into());
         }
-        admission.run(|| {
-            source.invoke(|| {
+        crate::rtw88::firmware_transport::enclosed(
+            |op| admission.run(|| source.invoke(op)),
+            async {
                 if station.peer() != Some(peer) {
                     return Err(NativeError::State);
                 }
-                self.io.station_profile_readback()?;
+                self.io.station_profile_readback().await?;
                 self.io.station_allowed()
-            })
-        })?;
+            },
+        )
+        .await?;
         attempt.armed = false;
         Ok(())
     }

@@ -101,7 +101,7 @@ pub(super) async fn commit(
     // The chip-specific N21L/N22L grant already encloses these publications.
     // The native gains are unchanged; read them through the same retained
     // backend before opening a descriptor/rate mode that depends on them.
-    io.station_profile_readback()?;
+    io.station_profile_readback().await?;
     if let Some(p) = p {
         let words = words(p, short, profile.band5)?;
         // Canonical ACI BE/BK/VI/VO maps to source BE/BK/VI/VO registers.
@@ -126,7 +126,7 @@ pub(super) async fn commit(
         if io.read32(0x440).await? != mask {
             return Err(Error::Prerequisite);
         }
-        io.station_profile_readback()?;
+        io.station_profile_readback().await?;
         io.packet_profile(profile)
     })
     .await

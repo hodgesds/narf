@@ -21,7 +21,7 @@ pub(super) enum PsSubmit {
 /// Encloses the final native publication check/write in the caller's
 /// original PS source; it must invoke the operation at most once.
 pub(super) type PsScope<'a> =
-    dyn FnMut(&mut dyn FnMut() -> Result<bool, Error>) -> Result<bool, Error> + 'a;
+    dyn FnMut(&mut dyn FnMut() -> Result<bool, Error>) -> Result<bool, Error> + Send + 'a;
 const HEADER: usize = 64;
 const CHECKSUM: usize = 8;
 const MAX_IMAGE: usize = 1024 * 1024;
@@ -413,16 +413,22 @@ pub(super) unsafe trait Io: Send {
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
-    fn submit_h2c(&mut self, _: &[u8; 32]) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        _: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     /// Drain the command producer and park bus mastering without granting
     /// ordinary packets or reclaiming the retained firmware bounce buffers.
-    fn park_radio(&mut self) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn park_radio(&mut self) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn finish_radio(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
         Err(Error::Unsupported)
@@ -450,8 +456,11 @@ pub(super) unsafe trait Io: Send {
     fn packet_profile(&mut self, _: super::packet_format::DataProfile) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
-    fn station_profile_readback(&mut self) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_profile_readback(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn station_ht_facts(&self) -> Option<super::ht::Facts> {
         None
@@ -466,8 +475,11 @@ pub(super) unsafe trait Io: Send {
         Err(Error::Unsupported)
     }
     /// Actual retained packet/command owner is idle before changing TX paths.
-    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_ht_program_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         Err(Error::Unsupported)
@@ -531,8 +543,11 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
-    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
@@ -651,14 +666,22 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<alloc::vec::Vec<u64>, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
-    fn mailbox_submit(&mut self, _: [u8; 8]) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        _: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn mailbox_pending(&self) -> bool {
         false
@@ -668,8 +691,13 @@ pub(super) unsafe trait Io: Send {
     /// and the HMEBOX low-word write that actually publishes the command.
     /// `Unissued` (and any error before that write) means firmware never saw
     /// a command; the extended-only staging is overwritten by a retry.
-    fn ps_mailbox_submit(&mut self, _: [u8; 8], _: &mut PsScope<'_>) -> Result<PsSubmit, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn ps_mailbox_submit(
+        &mut self,
+        _: [u8; 8],
+        _: &mut PsScope<'_>,
+    ) -> impl core::future::Future<Output = Result<PsSubmit, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn packet_prepare(&mut self, _: [u8; 6], _: u8) -> Result<(), super::packet_core::Error> {
         Err(super::packet_core::Error::State)

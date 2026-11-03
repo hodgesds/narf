@@ -588,8 +588,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> Result<bool, Error> {
         self.io.station_power_tracking_begin(g, restore)
     }
-    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
-        self.io.station_power_tracking_quiet()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_power_tracking_quiet() }
     }
     fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
         self.io.station_power_tracking_iqk()
@@ -731,8 +734,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> Result<(), Error> {
         self.io.station_bind_host(host)
     }
-    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
-        self.io.station_ht_program_quiet()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_ht_program_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_ht_program_quiet() }
     }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         self.io.station_ht_request()
@@ -754,8 +760,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
         self.io.packet_profile(profile)
     }
-    fn station_profile_readback(&mut self) -> Result<(), Error> {
-        self.io.station_profile_readback()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_profile_readback(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_profile_readback() }
     }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         if self.state != PageState::Unclaimed {
@@ -961,16 +970,24 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn begin_commands(&mut self) -> Result<(), Error> {
         self.io.begin_commands()
     }
-    fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
-        self.io.submit_h2c(packet)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        packet: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.submit_h2c(packet) }
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
-        self.io.poll_h2c()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.poll_h2c() }
     }
-    fn park_radio(&mut self) -> Result<(), Error> {
-        // The calibration-only continuation retains the completed beacon
-        // mappings unchanged and never admits ordinary packet producers.
-        self.io.park_radio()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn park_radio(&mut self) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            // The calibration-only continuation retains the completed beacon
+            // mappings unchanged and never admits ordinary packet producers.
+            self.io.park_radio()
+        }
     }
     fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
         if self.state != PageState::Continued || !self.completed {
@@ -1011,21 +1028,31 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.io.station_own()
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        self.io.mailbox_ready()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.mailbox_ready() }
     }
-    fn mailbox_submit(&mut self, p: [u8; 8]) -> Result<(), Error> {
-        self.io.mailbox_submit(p)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        p: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.mailbox_submit(p) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn ps_mailbox_submit(
         &mut self,
         p: [u8; 8],
         scope: &mut firmware_transport::PsScope<'_>,
-    ) -> Result<firmware_transport::PsSubmit, Error> {
-        self.io.ps_mailbox_submit(p, scope)
+    ) -> impl core::future::Future<Output = Result<firmware_transport::PsSubmit, Error>> + Send
+    {
+        async move { self.io.ps_mailbox_submit(p, scope) }
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        self.io.mailbox_consumed()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.mailbox_consumed() }
     }
     fn mailbox_pending(&self) -> bool {
         self.io.mailbox_pending()

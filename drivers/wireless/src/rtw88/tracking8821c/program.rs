@@ -298,7 +298,12 @@ impl Tracker {
             })
             .await?;
             if idle {
-                if !a.run(|| g.authority(|| io.station_power_tracking_quiet()))? {
+                if !crate::rtw88::firmware_transport::enclosed(
+                    |op| a.run(|| g.authority(op)),
+                    io.station_power_tracking_quiet(),
+                )
+                .await?
+                {
                     return Err(Error::Prerequisite);
                 }
                 return Ok(());
@@ -321,7 +326,12 @@ impl Tracker {
         .await?;
         let mut consumed = false;
         for _ in 0..1000 {
-            if a.run(|| g.authority(|| io.poll_h2c()))? {
+            if crate::rtw88::firmware_transport::enclosed(
+                |op| a.run(|| g.authority(op)),
+                io.poll_h2c(),
+            )
+            .await?
+            {
                 consumed = true;
                 break;
             }
@@ -419,7 +429,13 @@ impl Tracker {
             }
             io.delay_us(10).await;
         }
-        if !idle || !a.run(|| base.invoke_base(|| io.station_power_tracking_quiet()))? {
+        if !idle
+            || !crate::rtw88::firmware_transport::enclosed(
+                |op| a.run(|| base.invoke_base(op)),
+                io.station_power_tracking_quiet(),
+            )
+            .await?
+        {
             return Err(Error::Timeout);
         }
         crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {

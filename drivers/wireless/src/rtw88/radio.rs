@@ -830,11 +830,17 @@ unsafe impl<I: Io, F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error
         self.check()?;
         self.io.begin_commands()
     }
-    fn submit_h2c(&mut self, p: &[u8; 32]) -> Result<(), Error> {
-        self.check()?;
-        self.io.submit_h2c(p)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        p: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.check()?;
+            self.io.submit_h2c(p).await
+        }
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
         self.io.poll_h2c()
     }
     fn finish_radio(&mut self, gate: power_policy::Gate) -> Result<(), Error> {

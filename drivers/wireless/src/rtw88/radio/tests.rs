@@ -419,14 +419,19 @@ unsafe impl Io for RadioIo {
         self.gate = Some(gate);
         Ok(())
     }
-    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
-        self.station_allowed()?;
-        if self.mailbox_pending {
-            return Ok(false);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_ht_program_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            self.station_allowed()?;
+            if self.mailbox_pending {
+                return Ok(false);
+            }
+            let core = self.core.as_ref().ok_or(Error::State)?;
+            core.transmit_quiet(|r| crate::rtw88::packet_core::Port::index(&mut self.packets, r))
+                .map_err(|_| Error::State)
         }
-        let core = self.core.as_ref().ok_or(Error::State)?;
-        core.transmit_quiet(|r| crate::rtw88::packet_core::Port::index(&mut self.packets, r))
-            .map_err(|_| Error::State)
     }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         self.base.claim_pristine()
@@ -604,25 +609,34 @@ unsafe impl Io for RadioIo {
         self.base.regs[0x100] = 0x33;
         Ok(())
     }
-    fn submit_h2c(&mut self, p: &[u8; 32]) -> Result<(), Error> {
-        if self.pending {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        p: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.pending {
+                return Err(Error::State);
+            }
+            self.commands.push(*p);
+            self.pending = true;
+            self.polls = 0;
+            Ok(())
         }
-        self.commands.push(*p);
-        self.pending = true;
-        self.polls = 0;
-        Ok(())
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
-        if !self.pending {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.pending {
+                return Err(Error::State);
+            }
+            self.polls += 1;
+            if self.hold_dma || self.polls == 1 {
+                return Ok(false);
+            }
+            self.pending = false;
+            Ok(true)
         }
-        self.polls += 1;
-        if self.hold_dma || self.polls == 1 {
-            return Ok(false);
-        }
-        self.pending = false;
-        Ok(true)
     }
     fn finish_radio(&mut self, gate: crate::rtw88::power_policy::Gate) -> Result<(), Error> {
         if self.pending || self.commands.len() != 3 || gate.own() != self.expected_own {
@@ -674,26 +688,31 @@ unsafe impl Io for RadioIo {
             .configure_data(p)
             .map_err(|_| Error::State)
     }
-    fn station_profile_readback(&mut self) -> Result<(), Error> {
-        self.station_allowed()?;
-        if let Some(g) = self
-            .gate
-            .as_ref()
-            .and_then(crate::rtw88::power_policy::Gate::ht_grant)
-        {
-            return crate::rtw88::firmware_transport::ready_now(
-                g.readback(crate::rtw88::firmware_transport::IoRead32(self)),
-            );
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_profile_readback(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.station_allowed()?;
+            if let Some(g) = self
+                .gate
+                .as_ref()
+                .and_then(crate::rtw88::power_policy::Gate::ht_grant)
+            {
+                return crate::rtw88::firmware_transport::ready_now(
+                    g.readback(crate::rtw88::firmware_transport::IoRead32(self)),
+                );
+            }
+            let gains = self
+                .gate
+                .as_ref()
+                .and_then(crate::rtw88::power_policy::Gate::cck_gains)
+                .ok_or(Error::State)?;
+            crate::rtw88::firmware_transport::ready_now(crate::rtw88::wmm::readback(
+                crate::rtw88::firmware_transport::IoRead32(self),
+                gains,
+            ))
         }
-        let gains = self
-            .gate
-            .as_ref()
-            .and_then(crate::rtw88::power_policy::Gate::cck_gains)
-            .ok_or(Error::State)?;
-        crate::rtw88::firmware_transport::ready_now(crate::rtw88::wmm::readback(
-            crate::rtw88::firmware_transport::IoRead32(self),
-            gains,
-        ))
     }
     fn station_allowed(&mut self) -> Result<(), Error> {
         if !self.finished || !self.packets.live || !self.packets.allowed {
@@ -713,33 +732,47 @@ unsafe impl Io for RadioIo {
         )
         .before_invoke(self.before_publication.clone()))
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        if !self.packets.live {
-            return Err(Error::Access);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.packets.live {
+                return Err(Error::Access);
+            }
+            Ok(!self.mailbox_pending && !self.mailbox_ready_hold.load(Ordering::Acquire))
         }
-        Ok(!self.mailbox_pending && !self.mailbox_ready_hold.load(Ordering::Acquire))
     }
-    fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
-        if !self.mailbox_ready()? {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if !self.mailbox_ready().await? {
+                return Err(Error::State);
+            }
+            self.mailbox_pending = true;
+            self.mailboxes.push(words);
+            Ok(())
         }
-        self.mailbox_pending = true;
-        self.mailboxes.push(words);
-        Ok(())
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        if !self.packets.live {
-            return Err(Error::Access);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.packets.live {
+                return Err(Error::Access);
+            }
+            if !self.mailbox_pending {
+                return Err(Error::State);
+            }
+            if self.mailbox_done_hold.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            self.mailbox_pending = false;
+            self.mailbox_cursor = (self.mailbox_cursor + 1) % 4;
+            Ok(true)
         }
-        if !self.mailbox_pending {
-            return Err(Error::State);
-        }
-        if self.mailbox_done_hold.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        self.mailbox_pending = false;
-        self.mailbox_cursor = (self.mailbox_cursor + 1) % 4;
-        Ok(true)
     }
     fn mailbox_pending(&self) -> bool {
         self.mailbox_pending

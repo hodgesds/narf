@@ -143,10 +143,10 @@ unsafe impl Registers for Port {
         Ok(())
     }
     fn submit_h2c(&mut self, p: &[u8; 32]) -> Result<(), Error> {
-        Io::submit_h2c(&mut self.radio, p)
+        crate::rtw88::firmware_transport::ready_now(Io::submit_h2c(&mut self.radio, p))
     }
     fn poll_h2c(&mut self) -> Result<bool, Error> {
-        Io::poll_h2c(&mut self.radio)
+        crate::rtw88::firmware_transport::ready_now(Io::poll_h2c(&mut self.radio))
     }
     fn park_radio(&mut self) -> Result<(), Error> {
         let mut seen = self.seen.lock();

@@ -1251,7 +1251,7 @@ impl State {
                             if let Some(r) = super::rx_ba::request(frame.bytes(), self.own, ap) {
                                 if let Some(maximum) = g.window(r.tid()) {
                                     g.check()?;
-                                    io.station_profile_readback()?;
+                                    io.station_profile_readback().await?;
                                     let c21 =
                                         self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2
                                             == 0xc821;

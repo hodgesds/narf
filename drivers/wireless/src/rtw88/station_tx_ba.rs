@@ -25,7 +25,7 @@ impl State {
                 if !self.tx_fifo_empty(io, c21).await? {
                     return Err(Error::Busy);
                 }
-                io.station_profile_readback()?;
+                io.station_profile_readback().await?;
                 g.set(value, self.data_profile.rates)?;
                 Ok(())
             }

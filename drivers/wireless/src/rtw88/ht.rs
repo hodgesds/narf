@@ -773,7 +773,7 @@ impl Grant {
             Some(
                 self.guarded(admission, async {
                     io.station_allowed()?;
-                    if !io.station_ht_program_quiet()? {
+                    if !io.station_ht_program_quiet().await? {
                         return Err(Error::State);
                     }
                     let pause = io.read8(0x522).await?;
