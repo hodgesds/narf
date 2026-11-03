@@ -616,6 +616,14 @@ Composition points and named omissions:
   (PLANE_SEL_FETCH_*) belong to lane 1's plane-programming
   surface; MAN_TRK is the SU discipline implemented here,
   and sel-fetch composition lands with the plane lane.
+  Selective fetch is not qualified on display 14 either:
+  the fixed MTL/Arrow KMS owner inhibits PSR for every
+  takeover, and PSR2 runs only in continuous full frame.
+- On display 14, `notify_scanout_dirty` takes a DC_off
+  reference (§12.1) before `EDP_RUNTIME` and releases it
+  after, so a PSR2 SU write never reaches a power-gated
+  transcoder; a failed DC exit refuses with
+  `PsrError::Unavailable` before any PSR write.
 - ADL-P stepping workaround Wa_22012278275 (scrambled
   early-transport map) is not applied: this driver has no
   stepping readout yet.
@@ -875,6 +883,80 @@ to the display pipeline); DC3CO/DC9 targets; ADL-P
 (display 13) pipe-DMC ranges; wiring park/unpark to GT
 activity (the runtime-PM lane consumes this interface).
 
+### 12.1 Display 14 DMC and DC states (`intel_gpu_dc_states`)
+
+Meteor Lake and Arrow Lake (display 14.00) have a production DC-state
+service; the Gen12 rules, tests and the inert §13 seam above are unchanged.
+Sources are the pinned Linux tree b90c984d615e8ce2af96f5b1411a962d83fed2ad:
+`intel_dmc.c`, `intel_dmc_regs.h`, `intel_display_power.c`,
+`intel_display_power_well.c`, `intel_display_power_map.c`, `intel_display.c`,
+`intel_cx0_phy.c`, `i915_reg.h` and `intel_backlight_regs.h`.
+
+Firmware: `DmcPlatform::Xelpdp` validates `i915/mtl_dmc.bin` with the
+`XELPDP_DMC_MAX_FW_SIZE` ceiling (0x7000), the main v3 MMIO table in
+`TGL_MAIN_MMIO` (0x8F000–0x8FFFF), no TGL/ADL-S event fixups, and pipe event
+handlers at 0x5F000 + 0x400·(id−1). This is stricter than the pinned tree in
+two ways. The main payload must lie in 0x80000–0x8EFFF, because the tree streams
+it to the firmware's own start address without a bound. Pipe programs are
+skipped and recorded in `skipped_mask`, because the tree bounds their MMIO
+tables (`ADLP_PIPE_MMIO`, 0x5F000–0x5FFFF) but not their program RAM. A skipped
+pipe DMC is never enabled; on ADL/MTL the main DMC saves and restores pipe A/B
+DMC state itself. Load follows `intel_dmc_load_program` for display 14:
+Wa_16015201720 (`GEN9_CLKGATE_DIS_0` 0x46530 gains bits 15 and 14), the handler
+sweep, payload, MMIO table and `DC_STATE_DEBUG` masks with a posting read,
+then `verify_loaded`. Disable is the same workaround plus the sweep. Stepping
+selection is wildcard because the driver has no display-stepping readout.
+
+The DC_off well: `DcCore` counts references per user (Init, Load, Modeset,
+Kms, Psr, Suspend). The first reference reads `DC_STATE_EN` (0x45504). If any
+DC field is set, it writes `DC_STATE_DISABLE` with `gen9_write_dc_state`'s
+discipline (rewrite until seven consecutive matching reads, at most 100
+rewrites) before the holder touches hardware. A write that never sticks
+refuses the holder with `DcError::DidNotStick` and is latched. The last release
+only schedules re-entry 17 ms later (`intel_display_power_put_async_delay`). A
+reference taken inside that window cancels it without a register write.
+Re-entry runs from a spawned task with no caller lock held, and requires all of
+the following:
+
+- no reference is held, and no `DC_STATE_EN` write failure is latched;
+- the program is loaded and its main program still verifies (a lost program
+  is reloaded first);
+- the sanitized target is nonzero (DC6 on display 14; DC3CO and DC9 are never
+  targeted);
+- the utility pin is not in PWM mode;
+- `MTL_PIPEDMC_CONTROL` (0x45250) shows no enabled pipe DMC;
+- no full-AUX backlight owner is installed (its AUX transport takes no DC_off
+  reference, and AUX_A is a DC_off domain);
+- no external route is live.
+
+`gen9_set_dc_state` is mirrored, including display 14's DC6-allowed residency
+from `DG1_DMC_DEBUG_DC5_COUNT` (0x134154) deltas and a counter for requests the
+DMC ignored.
+
+Production wiring, Meteor/Arrow Lake only. KMS install creates the service and
+holds Init, so DC states are exited. After each GT publication the card worker
+acquires the container through the trusted firmware-registry authority as a
+bounded (1 MiB), parse-validated copy. It then loads and verifies the program
+under a Load reference and drops Init and any Suspend reference. The following
+hold a reference for their whole hardware conversation: KMS sessions, legacy
+guards, display recovery, the MTL modeset (a failed DC exit is
+`ModesetError::PowerWellTimeout`) and PSR scanout notifications (a failed DC
+exit is `PsrError::Unavailable`). System suspend preparation takes the Suspend
+reference before the external, KMS and backlight quiesce. Once that succeeds it
+disables the program; a failed preparation drops the reference again. The first
+publication after resume reloads the retained container before release. Any
+acquisition, validation or verification failure keeps Init held: DC0, wells up.
+
+Not done here: PW_1, PW_A and AUX wells stay enabled by the modeset and are
+never released (only DC_off is reference-counted). The pinned tree powers
+display-14 AUX wells through `XELPDP_DP_AUX_CH_CTL` bit 19 (status bit 18); the
+existing modeset's `PWR_WELL_CTL_AUX2` request is a divergence left to the AUX
+owner. Suspend does not run display-core uninit (DBUF, CDCLK, PW_1 or the
+`HOLD_PHY` latches) or DC9. DC3CO, pipe DMC programs and flip queues, and
+display-stepping selection are not implemented. PCI runtime autosuspend with a
+lit panel stays refused, as Linux's display wakeref keeps the function in D0;
+DC5/DC6 is the lit-panel idle power path.
+
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 
 System power for the GPU: the device-PM quiesce/D3/restore
@@ -984,8 +1066,11 @@ DMC firmware sourcing: `register_dmc_firmware` is the
 seam (parse-validated at registration, wildcard stepping
 selection — probe's `ChipInfo` carries no stepping
 readout in this tree); no production caller fetches a
-blob yet, so the reload path is fixture-proven and inert
-until the probe-time fetch lands. RC6 enable-at-probe is
+Gen12 blob yet, so the Gen12 reload path is fixture-proven
+and inert until the probe-time fetch lands. Display 14 does
+not use this core: its container is acquired, loaded and
+restored across suspend by the DC service (§12.1), next to
+the GT runtime owner that handles its system PM. RC6 enable-at-probe is
 likewise a wiring step: the PM core owns the `Rc6`
 lifecycle (snapshotted posture, park, re-enable), and
 today nothing enables RC6 at probe, so in production the
@@ -2197,7 +2282,7 @@ production feature. Unsupported functionality remains unadvertised.
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; display/firmware dependencies |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC refused without a stolen-memory owner; color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -2245,7 +2330,7 @@ production feature. Unsupported functionality remains unadvertised.
 | BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; native fixtures pass |
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
-| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
+| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; a lit iGPU panel keeps PCI autosuspend refused (Linux display wakeref) and idles through MTL/Arrow DC5/DC6 (§12.1); D3cold, mapping revocation, flush consumers and media power remain |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
 The first four workstreams form the initial integration checkpoint. They do
@@ -3281,3 +3366,53 @@ new tests run in group 6, which now selects `drivers/gpu/intel_gpu_media_gt`.
 The release production boot and both btrfs postflights pass. The debug group
 pass is deferred to the end of the current integration wave. These are native
 register and CT models, not physical Intel evidence.
+
+### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6
+
+This slice gives Meteor Lake and Arrow Lake a production display power path
+(§12.1). The MTL DMC container is acquired from the firmware registry,
+validated under display-14 rules, loaded, verified and restored across system
+suspend. The `DC_off` well is reference-counted: KMS sessions, legacy guards,
+display recovery, the MTL modeset and PSR notifications exit DC5/DC6 before
+touching hardware. Re-entry happens 17 ms after the last release, from a
+lock-free service task. Every firmware, validation, verification or
+`DC_STATE_EN` write failure fails closed in DC0. PCI runtime autosuspend
+with a lit iGPU panel stays refused, matching Linux's display wakeref, so
+DC5/DC6 is the lit-panel idle power path. Gen12 DMC parsing, loading and the
+inert §13 seam are unchanged.
+
+Refused and remaining work:
+
+- **FBC is refused.** The pinned `intel_fbc.c` places the compressed
+  framebuffer and line-length buffer in stolen memory (`compressed_fb`,
+  `compressed_llb`, bounded by `intel_fbc_stolen_end`). NARF has no owner of
+  the DSM region: no base readout, no reservation against the physical
+  allocator, and no exclusion of the firmware framebuffer or reserved portions.
+  That contract lies outside `drivers/gpu`. Nothing enables FBC, and KMS
+  takeover keeps refusing an inherited `FBC_CTL` enable.
+- **PSR2 selective fetch and panel replay remain unqualified** (§10).
+- **Other remaining display power work:** per-well reference counts beyond
+  DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
+  at suspend, DC3CO, pipe DMC programs, and display stepping.
+
+Sixteen native fixtures are registered but were not executed in this
+slice. In `drivers/gpu/intel_gpu_dmc` there are four:
+`smoke_xelpdp_dmc_parse_skips_pipe_programs`,
+`smoke_xelpdp_dmc_parse_refusals`, `smoke_xelpdp_dmc_load_conversation` and
+`smoke_xelpdp_dmc_disable_and_geometry`. In
+`drivers/gpu/intel_gpu_dc_states` there are twelve:
+`smoke_dc_states_register_facts_pinned`,
+`smoke_dc_states_write_stick_discipline`,
+`smoke_dc_states_init_held_until_program_loaded`,
+`smoke_dc_states_bad_firmware_fails_closed`,
+`smoke_dc_states_exit_before_hardware_and_refcount`,
+`smoke_dc_states_flip_during_dc6_counts_residency`,
+`smoke_dc_states_stuck_write_latches_fault`,
+`smoke_dc_states_suspend_resume_restore`,
+`smoke_dc_states_program_loss_reloads_before_reentry`,
+`smoke_dc_states_arm_gates_refuse`,
+`smoke_dc_states_firmware_authority_refusal` and
+`smoke_dc_states_reference_inert_without_service`. These are register-model
+fixtures. The physical KMS, modeset, publication and suspend hooks are wired
+but are manually traced, not executed. MTL silicon DC residency and
+visible-pixel acceptance remain unrun.

@@ -2584,6 +2584,45 @@ watermarks before original linear SURF, then requires the baseline proof and a
 fresh console latch before release. Modifier discovery lists only the installed
 per-card qualified layouts; legacy Y remains absent on MTL.
 
+### Intel display-14 DC states and DMC
+
+`intel_gpu_dmc::DmcPlatform` selects the DMC rules that a container is
+validated, loaded and verified under. `DmcFirmware::platform` records it.
+`parse_dmc_firmware` keeps the Gen12 behaviour unchanged.
+`parse_dmc_firmware_xelpdp` validates `MTL_DMC_FIRMWARE`
+(`i915/mtl_dmc.bin`) with a 0x7000-byte payload ceiling and a main table in
+0x8F000–0x8FFFF. It refuses a main payload outside 0x80000–0x8EFFF and
+records every pipe program in `skipped_mask`. `load_program`,
+`disable_program` and `verify_loaded` dispatch on the firmware's platform; on
+display 14 the load and disable sweeps are preceded by Wa_16015201720.
+`DmcId::*_for`, `disable_event_handlers_for`, `load_mmiodata_for` and
+`mtl_pipedmc_clock_gating_wa` expose the per-platform geometry and
+transforms.
+
+`intel_gpu_dc_states::DcCore` is the display-14 `DC_off` well:
+
+- `get` returns only after DC states are exited. It fails with `Unavailable`
+  (all-ones; nothing counted) or `DidNotStick` (latched) and never grants a
+  reference it could not back.
+- `put` only schedules re-entry 17 ms later.
+- `arm_if_due` re-enters the sanitized target, or returns a typed `ArmBlock`.
+- `begin_load`, `finish_load`, `release_held` and the
+  `suspend_begin`/`commit`/`abort` methods manage the DMC lifecycle.
+
+`publication_step`, `arm_step`, `load_and_verify`, `open_firmware`,
+`write_dc_state_sticky` and `sanitize_target` are the composable steps that
+the production service uses. Crate-internal wiring (Meteor/Arrow Lake only;
+inert elsewhere):
+
+- `intel_gpu_kms::Platform::display_power` (default: inert) backs every KMS
+  session, legacy guard and recovery. A failed DC exit is an I/O error.
+- `XeLpgModeset::modeset` and `modeset_fixed` hold a reference; a failed DC
+  exit is `ModesetError::PowerWellTimeout`.
+- `intel_gpu_edp::notify_scanout_dirty` holds a reference; a failed DC exit
+  is `PsrError::Unavailable`.
+- KMS install creates the service. The GT publication hook acquires, loads
+  and releases. `quiesce_for_legacy` brackets system-suspend preparation.
+
 ### Legacy framebuffers and native mode timing
 
 DCN3.0 DIO scanout explicitly selects `OTG_OUT_MUX = OUT_MUX_DIO` before
