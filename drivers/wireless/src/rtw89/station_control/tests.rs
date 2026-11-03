@@ -959,3 +959,74 @@ kernel_test_in!(
 
 #[path = "monitor_tests.rs"]
 mod monitor_tests;
+
+fn word_at(bytes: &[u8], index: usize) -> u32 {
+    u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+}
+
+fn smoke_rtw89_link_codec_macid_port_keeps_station_bytes() -> TestResult {
+    // Station MACID0/port0 bytes are the parameterised forms at (0, 0).
+    for paused in [false, true] {
+        assert_eq!(codec::pause(paused), codec::pause_at(0, paused));
+    }
+    assert_eq!(codec::default_cctl(), codec::default_cctl_at(0, false));
+    for ghz5 in [false, true] {
+        assert_eq!(
+            codec::fixed_cctl(ghz5),
+            codec::fixed_cctl_at(ghz5, 0, 0, None)
+        );
+    }
+    assert_eq!(
+        codec::ba_cam(true, 1, 5, 64, 0x123),
+        codec::ba_cam_at(0, true, 1, 5, 64, 0x123)
+    );
+    // mac.c rtw89_mac_set_macid_pause: grp = macid >> 5, sh = macid & 31.
+    let pause = codec::pause_at(37, true);
+    assert_eq!(word_at(&pause, 1), 1 << 5);
+    assert_eq!(word_at(&pause, 5), 1 << 5);
+    assert_eq!(word_at(&pause, 0) | word_at(&pause, 4), 0);
+    assert_eq!(word_at(&codec::pause_at(37, false), 1), 0);
+    assert_eq!(codec::pause_register(37), (0x9eb4, 1 << 5));
+    // fw.c rtw89_fw_h2c_assoc_cmac_tbl for an AP peer on port 2.
+    let peer = codec::fixed_cctl_at(false, 3, 2, Some(true));
+    assert_eq!(word_at(&peer, 0), 3 | 1 << 7);
+    assert_eq!(word_at(&peer, 5) & 7, 2);
+    assert_eq!(word_at(&peer, 7) & (1 << 17), 0); // ULDL 0
+    assert_ne!(word_at(&peer, 15) & (1 << 17), 0);
+    assert_ne!(word_at(&peer, 13) & (1 << 12), 0); // DATA_DCM mask
+    assert_ne!(word_at(&peer, 14) & (1 << 13), 0); // BSR format mask
+    let vif = codec::fixed_cctl_at(false, 0, 0, Some(false));
+    assert_eq!(word_at(&vif, 14) & (1 << 13), 0);
+    assert_ne!(word_at(&codec::default_cctl_at(9, true), 13) & (1 << 12), 0);
+    assert_eq!(word_at(&codec::default_cctl_at(9, true), 0), 9 | 1 << 7);
+    // cam.c AX v0 address CAM: idx/len, net type, W8 MACID/port, AID.
+    let cam = codec::cam_entry(&codec::Cam {
+        macid: 4,
+        port: 1,
+        addr_idx: 2,
+        bssid_idx: 0,
+        net_type: 3,
+        valid: true,
+        bssid_valid: true,
+        sma: OWN,
+        tma: AP,
+        bssid: OWN,
+        aid: 0x1234,
+    });
+    assert_eq!(word_at(&cam, 1), 2 | 0x40 << 16);
+    assert_eq!(word_at(&cam, 2) & 7, 1 | 3 << 1);
+    assert_eq!(word_at(&cam, 8), 4 | 1 << 8 | 1 << 11);
+    assert_eq!(word_at(&cam, 9), 2 << 16 | 0x234);
+    assert_eq!(
+        word_at(&cam, 13) >> 16,
+        u32::from(OWN[0]) | u32::from(OWN[1]) << 8
+    );
+    let (dmac, cmac, _) = codec::table_init(3);
+    assert_eq!(dmac, [0x1880_0030, 0x1880_0034, 0x1880_0038, 0x1880_003c]);
+    assert_eq!(cmac, 0x1884_0060);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/uapsd",
+    smoke_rtw89_link_codec_macid_port_keeps_station_bytes
+);

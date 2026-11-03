@@ -816,18 +816,21 @@ fn crypto_off(io: &mut impl Io) -> Result<(), Error> {
     modify(io, 0x9d04, 3, 0) // retain original MPDU: no appended MIC/ICV
 }
 fn tables(io: &mut impl Io) -> Result<(), Error> {
-    for index in 0..4 {
-        io.write32(0xc04, 0x1880_0000 + index * 4)?;
+    tables_at(io, 0)
+}
+/// Nonsecure AX `rtw89_mac_dmac_tbl_init` + `rtw89_mac_cmac_tbl_init` for
+/// one MACID, each indirect word read back.
+pub(super) fn tables_at(io: &mut impl Io, macid: u8) -> Result<(), Error> {
+    let (dmac, cmac, words) = codec::table_init(macid);
+    for address in dmac {
+        io.write32(0xc04, address)?;
         io.write32(0x40000, 0)?;
         if read(io, 0x40000)? != 0 {
             return Err(Error::Terminal);
         }
     }
-    io.write32(0xc04, 0x1884_0000)?;
-    for (index, value) in [4, 0x400a_0004, 0, 0, 0, 0x0e43_000b, 0, 0x000b_8109]
-        .into_iter()
-        .enumerate()
-    {
+    io.write32(0xc04, cmac)?;
+    for (index, value) in words.into_iter().enumerate() {
         io.write32(0x40000 + index as u32 * 4, value)?;
         if read(io, 0x40000 + index as u32 * 4)? != value {
             return Err(Error::Terminal);
@@ -858,13 +861,22 @@ async fn pause_applied(
     paused: bool,
     admission: Option<&Admission>,
 ) -> Result<(), Error> {
+    pause_applied_at(io, 0, paused, admission).await
+}
+pub(super) async fn pause_applied_at(
+    io: &mut impl Interface,
+    macid: u8,
+    paused: bool,
+    admission: Option<&Admission>,
+) -> Result<(), Error> {
+    let (register, bit) = codec::pause_register(macid);
     // Linux reg.h R_AX_SS_MACID_PAUSE_0 / mac.c band1_enable_ax read
     // the actual scheduler pause bitmap. MACID_PAUSE requests RECV_ACK,
     // not DONE_ACK; neither CH12 retirement nor reception proves this bit.
     // The extra bounded applied-state fence is required by this one-shot STA.
     let start = io.now_us();
     loop {
-        if checked(io, admission, |io| read(io, 0x9eb0))? & 1 == u32::from(paused) {
+        if (checked(io, admission, |io| read(io, register))? & bit != 0) == paused {
             return Ok(());
         }
         if io.now_us().saturating_sub(start) >= 10_000 {

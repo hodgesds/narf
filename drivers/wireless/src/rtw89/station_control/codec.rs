@@ -15,10 +15,22 @@ pub(super) fn join(connected: bool) -> [u8; 4] {
     ((1u32 << 26) | if connected { 2 << 24 } else { 1 << 8 }).to_le_bytes()
 }
 pub(super) fn pause(paused: bool) -> [u8; 32] {
+    pause_at(0, paused)
+}
+/// `rtw89_fw_h2c_macid_pause` (`struct rtw89_fw_macid_pause_grp`): pause
+/// group `macid >> 5`, bit `macid & 31`, with only that bit in the mask
+/// (mac.c `rtw89_mac_set_macid_pause`).
+pub(super) fn pause_at(macid: u8, paused: bool) -> [u8; 32] {
     let mut bytes = [0; 32];
-    word(&mut bytes, 0, u32::from(paused));
-    word(&mut bytes, 4, 1);
+    let group = usize::from(macid >> 5);
+    let bit = 1u32 << (macid & 31);
+    word(&mut bytes, group, if paused { bit } else { 0 });
+    word(&mut bytes, 4 + group, bit);
     bytes
+}
+/// `R_AX_SS_MACID_PAUSE_0 + 4 * group` and the bit of `macid`.
+pub(super) fn pause_register(macid: u8) -> (u32, u32) {
+    (0x9eb0 + 4 * u32::from(macid >> 5), 1 << (macid & 31))
 }
 pub(super) fn cam(
     own: [u8; 6],
@@ -27,49 +39,99 @@ pub(super) fn cam(
     associated: bool,
     valid: bool,
 ) -> [u8; 60] {
+    cam_entry(&Cam {
+        macid: 0,
+        port: 0,
+        addr_idx: 0,
+        bssid_idx: 0,
+        net_type: if associated { NET_TYPE_INFRA } else { 0 },
+        valid,
+        bssid_valid: valid,
+        sma: own,
+        tma: peer,
+        bssid: peer,
+        aid: if associated { aid } else { 0 },
+    })
+}
+/// `RTW89_NET_TYPE_INFRA`.
+pub(in crate::rtw89) const NET_TYPE_INFRA: u8 = 2;
+/// One AX v0 address-CAM + BSSID-CAM H2C (`struct rtw89_h2c_addr_cam_v0`),
+/// cam.c `rtw89_cam_fill_addr_cam_info` / `rtw89_cam_fill_bssid_cam_info`
+/// with `addr_mask` 0, `hit_rule`/`bcn_hit_cond` 0 (mac80211.c
+/// `rtw89_vif_link_init`), PHY0, no trigger/LSIG/target indication,
+/// `RTW89_ADDR_CAM_SEC_NORMAL` with every security entry/key index 0
+/// (host crypto), BSS colour 0 and `RTW89_BSSID_MATCH_ALL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct Cam {
+    /// `rtwsta_link ? sta mac_id : vif mac_id` (W8 `MACID`).
+    pub(in crate::rtw89) macid: u8,
+    /// `rtwvif_link->port` (W8 `PORT_INT` and `TSF_SYNC`).
+    pub(in crate::rtw89) port: u8,
+    /// `addr_cam_idx` (W1, entry size 0x40).
+    pub(in crate::rtw89) addr_idx: u8,
+    /// `bssid_cam_idx` (W3 and W12, entry size 8).
+    pub(in crate::rtw89) bssid_idx: u8,
+    /// `rtwvif_link->net_type` (W2 `NET_TYPE`).
+    pub(in crate::rtw89) net_type: u8,
+    /// Address-CAM entry valid (`rtw89_cam_deinit_addr_cam` clears it
+    /// before the AP-client disconnect H2C).
+    pub(in crate::rtw89) valid: bool,
+    /// BSSID-CAM entry valid (the vif's entry outlives its AP clients).
+    pub(in crate::rtw89) bssid_valid: bool,
+    /// Own (or scan) address.
+    pub(in crate::rtw89) sma: [u8; 6],
+    /// `link_sta->addr` for a peer, else `rtwvif_link->bssid`.
+    pub(in crate::rtw89) tma: [u8; 6],
+    pub(in crate::rtw89) bssid: [u8; 6],
+    /// W9 `AID12` (INFRA: own AID, AP_MODE: peer AID or 0).
+    pub(in crate::rtw89) aid: u16,
+}
+pub(in crate::rtw89) fn cam_entry(c: &Cam) -> [u8; 60] {
     let mut bytes = [0; 60];
-    let own_hash = own.into_iter().fold(0u8, |a, b| a ^ b);
-    let peer_hash = peer.into_iter().fold(0u8, |a, b| a ^ b);
-    word(&mut bytes, 1, 0x40 << 16);
+    let sma_hash = c.sma.into_iter().fold(0u8, |a, b| a ^ b);
+    let tma_hash = c.tma.into_iter().fold(0u8, |a, b| a ^ b);
+    word(&mut bytes, 1, u32::from(c.addr_idx) | 0x40 << 16);
     word(
         &mut bytes,
         2,
-        u32::from(valid)
-            | ((u32::from(associated) * 2) << 1)
-            | u32::from(own_hash) << 16
-            | u32::from(peer_hash) << 24,
+        u32::from(c.valid)
+            | u32::from(c.net_type & 3) << 1
+            | u32::from(sma_hash) << 16
+            | u32::from(tma_hash) << 24,
     );
+    word(&mut bytes, 3, u32::from(c.bssid_idx & 0x3f));
     word(
         &mut bytes,
         4,
-        u32::from_le_bytes(own[..4].try_into().unwrap()),
+        u32::from_le_bytes(c.sma[..4].try_into().unwrap()),
     );
     word(
         &mut bytes,
         5,
-        u32::from_le_bytes([own[4], own[5], peer[0], peer[1]]),
+        u32::from_le_bytes([c.sma[4], c.sma[5], c.tma[0], c.tma[1]]),
     );
     word(
         &mut bytes,
         6,
-        u32::from_le_bytes(peer[2..].try_into().unwrap()),
+        u32::from_le_bytes(c.tma[2..].try_into().unwrap()),
     );
+    let port = u32::from(c.port & 7);
+    word(&mut bytes, 8, u32::from(c.macid) | port << 8 | port << 11);
     // Source SEC_NORMAL mode, with every security-entry valid bit/key index0.
-    word(
-        &mut bytes,
-        9,
-        2 << 16 | if associated { u32::from(aid) } else { 0 },
-    );
-    word(&mut bytes, 12, 8 << 16);
+    word(&mut bytes, 9, 2 << 16 | u32::from(c.aid & 0xfff));
+    word(&mut bytes, 12, u32::from(c.bssid_idx) | 8 << 16);
     word(
         &mut bytes,
         13,
-        u32::from(valid) | (0x3f << 2) | u32::from(peer[0]) << 16 | u32::from(peer[1]) << 24,
+        u32::from(c.bssid_valid)
+            | (0x3f << 2)
+            | u32::from(c.bssid[0]) << 16
+            | u32::from(c.bssid[1]) << 24,
     );
     word(
         &mut bytes,
         14,
-        u32::from_le_bytes(peer[2..].try_into().unwrap()),
+        u32::from_le_bytes(c.bssid[2..].try_into().unwrap()),
     );
     bytes
 }
@@ -86,8 +148,13 @@ fn field(bytes: &mut [u8; 68], index: usize, mask: u32, value: u32) {
     word(bytes, index + 8, old | mask);
 }
 pub(super) fn default_cctl() -> [u8; 68] {
+    default_cctl_at(0, false)
+}
+/// fw.c `rtw89_fw_h2c_default_cmac_tbl` for `macid`; `ap` adds the
+/// `NET_TYPE_AP_MODE` `DATA_DCM` 0 setter.
+pub(super) fn default_cctl_at(macid: u8, ap: bool) -> [u8; 68] {
     let mut bytes = [0; 68];
-    word(&mut bytes, 0, 1 << 7); // operation1, MACID0
+    word(&mut bytes, 0, u32::from(macid & 0x7f) | 1 << 7); // MACID, operation1
     field(&mut bytes, 5, 0x0000_0e00, 0); // source TX power mode
     field(&mut bytes, 6, 0x000f_0000, 1); // source explicit TX-A
     for mask in [
@@ -105,22 +172,33 @@ pub(super) fn default_cctl() -> [u8; 68] {
     field(&mut bytes, 1, 1 << 21, 0); // no optional firmware MGQ report
     field(&mut bytes, 7, 0x000c_0000, 0);
     field(&mut bytes, 7, 0x0f00_0000, 0);
+    if ap {
+        field(&mut bytes, 5, 1 << 12, 0); // AP_MODE DATA_DCM
+    }
     bytes
 }
 /// `ghz5`: fw.c `rtw89_fw_h2c_assoc_cmac_tbl` lowest rate is OFDM6 off
 /// 2.4GHz (`RTS_RTY_LOWEST_RATE`), and the fixed legacy DATARATE follows
 /// core.c `rtw89_core_get_mgmt_rate` (OFDM6 on 5GHz).
 pub(super) fn fixed_cctl(ghz5: bool) -> [u8; 68] {
+    fixed_cctl_at(ghz5, 0, 0, None)
+}
+/// `rtw89_fw_h2c_assoc_cmac_tbl` for `macid` on vif `port`. `ap` is
+/// `Some(peer)` for an AP link: `ULDL` 0 (not `NL80211_IFTYPE_STATION`),
+/// `DATA_DCM` 0 (`NET_TYPE_AP_MODE`) and, for a peer (`Some(true)`), the
+/// non-HE `BSR_QUEUE_SIZE_FORMAT` 0 (`Some(false)` is the AP vif itself,
+/// `rtwsta_link == NULL`).
+pub(super) fn fixed_cctl_at(ghz5: bool, macid: u8, port: u8, ap: Option<bool>) -> [u8; 68] {
     let lowest = if ghz5 { 4 } else { 0 }; // RTW89_HW_RATE_OFDM6 / CCK1
     let mut bytes = [0; 68];
-    word(&mut bytes, 0, 1 << 7);
+    word(&mut bytes, 0, u32::from(macid & 0x7f) | 1 << 7);
     field(&mut bytes, 1, 1 << 25, 1); // source disable RTS fallback
     field(&mut bytes, 1, 1 << 26, 1); // source disable data fallback
     field(&mut bytes, 2, 0xf000_0000, lowest); // source RTS retry lowest CCK1/OFDM6
     field(&mut bytes, 2, 1 << 11, 0); // source retry-limit select
     field(&mut bytes, 3, 1 << 6, 0);
-    field(&mut bytes, 7, 1 << 17, 1); // source STA ULDL
-    field(&mut bytes, 5, 7, 0); // source port0
+    field(&mut bytes, 7, 1 << 17, u32::from(ap.is_none())); // source STA ULDL
+    field(&mut bytes, 5, 7, u32::from(port)); // source MULTI_PORT_ID
     for mask in [3 << 20, 3 << 22, 3 << 30] {
         field(&mut bytes, 7, mask, 0);
     }
@@ -130,6 +208,12 @@ pub(super) fn fixed_cctl(ghz5: bool) -> [u8; 68] {
     field(&mut bytes, 1, 3 << 10, 0); //20MHz
     field(&mut bytes, 1, 1 << 27, 0); // no trial rate
     field(&mut bytes, 4, 0xf000_0000, 0); // no hardware security type
+    if let Some(peer) = ap {
+        if peer {
+            field(&mut bytes, 6, 1 << 13, 0); // non-HE BSR_QUEUE_SIZE_FORMAT
+        }
+        field(&mut bytes, 5, 1 << 12, 0); // AP_MODE DATA_DCM
+    }
     bytes
 }
 pub(super) fn edca(ac: u8, short: bool, ghz5: bool) -> [u8; 12] {
@@ -160,8 +244,11 @@ pub(super) fn edca(ac: u8, short: bool, ghz5: bool) -> [u8; 12] {
 /// (0 for <=64), SSN[31:20]; W1 unused. An invalidation carries only MACID
 /// and ENTRY_IDX.
 pub(super) fn ba_cam(valid: bool, entry: u8, tid: u8, buf: u16, ssn: u16) -> [u8; 8] {
+    ba_cam_at(0, valid, entry, tid, buf, ssn)
+}
+pub(super) fn ba_cam_at(macid: u8, valid: bool, entry: u8, tid: u8, buf: u16, ssn: u16) -> [u8; 8] {
     let mut bytes = [0; 8];
-    let mut w0 = u32::from(entry & 3) << 2; // MACID0
+    let mut w0 = u32::from(entry & 3) << 2 | u32::from(macid) << 8;
     if valid {
         w0 |= 1
             | 1 << 1
@@ -363,4 +450,15 @@ pub(super) fn wmm_edca(
         );
     }
     Some(commands)
+}
+/// mac.c `rtw89_mac_dmac_tbl_init` / `rtw89_mac_cmac_tbl_init` (AX,
+/// nonsecure): the indirect `R_AX_FILTER_MODEL_ADDR` window base and the
+/// words written through `R_AX_INDIR_ACCESS_ENTRY` for `macid`.
+pub(super) fn table_init(macid: u8) -> ([u32; 4], u32, [u32; 8]) {
+    let dmac = core::array::from_fn(|i| 0x1880_0000 + (u32::from(macid) << 4) + (i as u32) * 4);
+    (
+        dmac,
+        0x1884_0000 + u32::from(macid) * 32,
+        [4, 0x400a_0004, 0, 0, 0, 0x0e43_000b, 0, 0x000b_8109],
+    )
 }
