@@ -352,6 +352,25 @@ MFPC|MFPR, SPP) and `Security::pmf()` is then true when both sides set
 MFPC: the IGTK is required in M3, BIP and unicast robust-frame CCMP apply as
 for SAE. `Security::new_sae` refuses non-SAE AKMs.
 
+**Explicit CCK-only channel14 planning.** `channel::frequency_in(Ghz2,14)`
+and `from_frequency_band(2484)` represent the typed2484MHz channel. Bare
+`band(14)`, `frequency(14)`, `from_frequency(2484)` and the ordinary channel
+lists keep their full-rate legacy refusal. `association::observe_cck14` and
+`JoinPlan::prepare_cck14(..., JoinOptions)` are separate opt-ins for original
+typed2.4GHz14 BSS facts. They accept only genuine CCK rates1/2/5.5/11Mbps,
+reject OFDM (including optional rates), HT/VHT/HE/EHT/MLD IEs/membership aliases,
+and preserve original raw RA/TA/BSSID/channel/SSID/RSN/PMF/SAE validation.
+The response cannot add a PHY or rate not in that CCK-only profile; appended
+SME IEs and the SPP A-MSDU opt-in cannot add those modes either. Ordinary
+observe/JoinPlan constructors remain unchanged and reject14. The helpers
+store no key and grant no peer/native/controlled-port or RF authority. A native
+adapter must independently prove actual channel14 CCK-only MAC/BB/RF/filter,
+factory/calibration/firmware, full occupied-span/current host permission and
+physical/source ownership before advertisement or emission. Native1–13 work
+can use existing shared planning without opting into14. Two additional
+unexecuted source cases cover original observation/association/PMF, typed
+geometry/default refusals, and wrong-band/rate/PHY/SSID/security/raw negatives.
+
 **6 GHz band identity (`association::{channel, six_ghz}`, `reg`).**
 `channel::Band` gains `Ghz6`. `channel::band(u8)` still classifies only the
 2.4/5 GHz legacy numbering and never returns it.

@@ -1,5 +1,6 @@
 //! Shared legacy 20MHz channel geometry from Linux mt76/mac80211.c.
-//! Full-rate2.4GHz channels1–13 have regular5MHz spacing; channel14 is absent.
+//! Full-rate2.4GHz channels1–13 have regular5MHz spacing; bare channel14 is absent.
+//! Explicit typed2.4GHz geometry also represents CCK-only14 at2484MHz.
 //! Channel numbers with the CONNAC2 6 GHz flag never enter this profile.
 use alloc::vec::Vec;
 
@@ -32,11 +33,13 @@ pub fn frequency(channel: u8) -> Option<u32> {
 }
 
 /// cfg80211 `ieee80211_channel_to_freq_khz` (in MHz) for `band`. The 2.4/5
-/// GHz results are limited to this profile's channels (`band(channel)`);
+/// GHz results are limited to this profile's channels (`band(channel)`), plus
+/// explicitly typed CCK-only2.4GHz channel14 at2484MHz (no bare-channel alias);
 /// 6 GHz includes the source-supported UNII-9 tail through253 and channel2
 /// (5935MHz). This geometry grants no device/regulatory permission.
 pub fn frequency_in(band_id: Band, channel: u8) -> Option<u32> {
     match band_id {
+        Band::Ghz2 if channel == 14 => Some(2484),
         Band::Ghz2 | Band::Ghz5 if band(channel) != Some(band_id) => None,
         Band::Ghz2 => Some(2407 + 5 * u32::from(channel)),
         Band::Ghz5 => Some(5000 + 5 * u32::from(channel)),
@@ -56,6 +59,9 @@ pub fn valid_6ghz(channel: u8) -> bool {
 /// `ieee80211_freq_khz_to_channel` plus the band: 2.4/5 GHz in this profile
 /// (`from_frequency`) and 6 GHz5935MHz /5955..=7215MHz.
 pub fn from_frequency_band(mhz: u32) -> Option<(Band, u8)> {
+    if mhz == 2484 {
+        return Some((Band::Ghz2, 14));
+    }
     if let Some(channel) = from_frequency(mhz) {
         return band(channel).map(|band| (band, channel));
     }

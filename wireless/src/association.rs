@@ -121,6 +121,7 @@ pub struct JoinPlan {
     assoc: Vec<u8>,
     phase: Phase,
     phy_enabled: bool,
+    cck14: bool,
     offered_phy: Option<phy::Offer>,
     negotiated_phy: Option<phy::Negotiated>,
     spp_amsdu: bool,
@@ -141,6 +142,7 @@ struct PrepareProfile<'a> {
     phy: Option<phy::LocalPhy>,
     six: Option<&'a six_ghz::SixGhzLocal>,
     mld: Option<mlo::Local>,
+    cck14: bool,
 }
 
 /// Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4).
@@ -394,7 +396,7 @@ pub fn observe(
     own: [u8; 6],
     signal_dbm: Option<i8>,
 ) -> Result<ObservedBss, Error> {
-    observe_inner(frame, channel, own, signal_dbm, None)
+    observe_inner(frame, channel, own, signal_dbm, None, false)
 }
 /// Opt into factual HT/VHT admission from the actual retained raw BSS.
 /// The local profile does not confer channel, transmit or association rights.
@@ -405,7 +407,24 @@ pub fn observe_with_phy(
     signal_dbm: Option<i8>,
     local: &phy::LocalPhy,
 ) -> Result<ObservedBss, Error> {
-    observe_inner(frame, channel, own, signal_dbm, Some(local))
+    observe_inner(frame, channel, own, signal_dbm, Some(local), false)
+}
+/// Explicit CCK-only channel14 observer. Native callers must prove actual
+/// typed2.4GHz2484MHz/CCK-only RX/source/CRC permission; this parser grants none.
+/// Ordinary observe/observe_with_phy keep rejecting14.
+pub fn observe_cck14(
+    frame: &impl crate::station_security::RawFrame,
+    own: [u8; 6],
+    signal_dbm: Option<i8>,
+) -> Result<ObservedBss, Error> {
+    observe_inner(frame, 14, own, signal_dbm, None, true)
+}
+fn forbidden_cck14_phy(id: u8, body: &[u8]) -> bool {
+    matches!(id, 45 | 61 | 191 | 192)
+        || id == 255
+            && body
+                .first()
+                .is_some_and(|ext| matches!(*ext, 35 | 36 | 59 | 106 | 107 | 108))
 }
 fn observe_inner(
     frame: &impl crate::station_security::RawFrame,
@@ -413,10 +432,15 @@ fn observe_inner(
     own: [u8; 6],
     signal_dbm: Option<i8>,
     local: Option<&phy::LocalPhy>,
+    cck14: bool,
 ) -> Result<ObservedBss, Error> {
     let bytes = frame.bytes();
     if !frame.unmodified()
-        || channel::band(channel).is_none()
+        || if cck14 {
+            channel != 14 || local.is_some()
+        } else {
+            channel::band(channel).is_none()
+        }
         || !unicast(own)
         || !(36..=2084).contains(&bytes.len())
         || !matches!(bytes[0], 0x50 | 0x80)
@@ -444,6 +468,9 @@ fn observe_inner(
         ..Default::default()
     };
     ies(&bytes[36..], |id, body| {
+        if cck14 && forbidden_cck14_phy(id, body) {
+            return Err(Error::UnsupportedRates);
+        }
         match id {
             0 => {
                 if ssid.is_some() || body.len() > 32 {
@@ -474,7 +501,7 @@ fn observe_inner(
         }
         Ok(())
     })?;
-    if !rates.supported || rates.rates == 0 || rates.basic == 0 {
+    if !rates.supported || rates.rates == 0 || rates.basic == 0 || cck14 && rates.rates & !15 != 0 {
         return Err(Error::UnsupportedRates);
     }
     if let Some(local) = local {
@@ -485,7 +512,11 @@ fn observe_inner(
             bssid: bytes[10..16].try_into().map_err(|_| Error::InvalidBss)?,
             ssid: ssid.ok_or(Error::InvalidBss)?,
             channel,
-            band: channel::band(channel),
+            band: if cck14 {
+                Some(channel::Band::Ghz2)
+            } else {
+                channel::band(channel)
+            },
             signal_dbm,
             capability,
             beacon_interval,
@@ -557,6 +588,9 @@ impl JoinPlan {
     /// in the AAD (`station_security::Security` with this `rsn_body()`) may
     /// opt in; SPP is in force only if the AP RSNE also sets the bit.
     pub fn enable_spp_amsdu(&mut self) -> Result<(), Error> {
+        if self.cck14 {
+            return Err(Error::UnsupportedRates);
+        }
         if self.phase != Phase::Prepared {
             return Err(Error::Busy);
         }
@@ -591,6 +625,15 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         validate_sme_ies(bytes, self.security.is_wpa2())?;
+        if self.cck14 {
+            ies(bytes, |id, body| {
+                if forbidden_cck14_phy(id, body) {
+                    Err(Error::UnsupportedRates)
+                } else {
+                    Ok(())
+                }
+            })?;
+        }
         if self.mld.is_some() {
             ies(bytes, |id, body| {
                 if id == 242 || id == 255 && body.first() == Some(&mlo::EXT_MULTI_LINK) {
@@ -640,6 +683,29 @@ impl JoinPlan {
             security,
             JoinOptions::default(),
             PrepareProfile::default(),
+        )
+    }
+    /// Explicit CCK-only14 plan. Requires original typed2.4GHz14 BSS facts and
+    /// only CCK rates, with no HT/VHT/HE/EHT/MLD profile or PHY-membership alias.
+    /// This preserves ordinary constructors/refusals and supplies no RF grant;
+    /// the same SSID/RSN/PMF/SAE and response validation remains mandatory.
+    pub fn prepare_cck14(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        options: JoinOptions,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(
+            bss,
+            own,
+            ssid,
+            security,
+            options,
+            PrepareProfile {
+                cck14: true,
+                ..Default::default()
+            },
         )
     }
     /// Prepare using an implementation profile derived by the native owner.
@@ -752,6 +818,7 @@ impl JoinPlan {
                 phy: Some(phy),
                 six: None,
                 mld: Some(mld),
+                cck14: false,
             },
         )
     }
@@ -774,6 +841,7 @@ impl JoinPlan {
                 phy: None,
                 six: Some(six),
                 mld: Some(mld),
+                cck14: false,
             },
         )
     }
@@ -833,6 +901,12 @@ impl JoinPlan {
             .transpose()?
             .map(Box::new);
         let band = match six {
+            _ if profile.cck14 => (six.is_none()
+                && local.is_none()
+                && mld.is_none()
+                && bss.band == Some(channel::Band::Ghz2)
+                && bss.channel == 14)
+                .then_some(channel::Band::Ghz2),
             // A 6 GHz plan needs the explicit band and a 6 GHz channel.
             Some(_) if bss.band == Some(channel::Band::Ghz6) => {
                 channel::frequency_in(channel::Band::Ghz6, bss.channel).map(|_| channel::Band::Ghz6)
@@ -878,6 +952,9 @@ impl JoinPlan {
         let mut wpa = false;
         let mut seen_ssid = false;
         ies(&bss.information_elements, |id, body| {
+            if profile.cck14 && forbidden_cck14_phy(id, body) {
+                return Err(Error::UnsupportedRates);
+            }
             match id {
                 0 => {
                     if seen_ssid || body != bss.ssid {
@@ -907,6 +984,9 @@ impl JoinPlan {
         })?;
         let mut rates = rate_elements.rates;
         let basic = rate_elements.basic;
+        if profile.cck14 && rates & !15 != 0 {
+            return Err(Error::UnsupportedRates);
+        }
         // 5 and 6 GHz are OFDM-only (no DSSS/CCK rates).
         if band != Some(channel::Band::Ghz2) {
             if basic & 15 != 0 {
@@ -1062,6 +1142,7 @@ impl JoinPlan {
             assoc,
             phase: Phase::Prepared,
             phy_enabled: local.is_some(),
+            cck14: profile.cck14,
             offered_phy,
             negotiated_phy: None,
             spp_amsdu: false,
@@ -1179,7 +1260,12 @@ impl JoinPlan {
                 },
             ..Default::default()
         };
-        if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {
+        if let Err(error) = ies(&bytes[30..], |id, body| {
+            if self.cck14 && forbidden_cck14_phy(id, body) {
+                return Err(Error::UnsupportedRates);
+            }
+            response.observe(id, body)
+        }) {
             self.phase = Phase::Failed;
             return Err(if error == Error::InvalidBss {
                 Error::Protocol
@@ -1189,7 +1275,11 @@ impl JoinPlan {
         }
         let rates = self.rates & response.rates;
         let basic = self.basic | response.basic;
-        if !response.supported || rates == 0 || basic & !rates != 0 {
+        if !response.supported
+            || rates == 0
+            || basic & !rates != 0
+            || self.cck14 && response.rates & !15 != 0
+        {
             self.phase = Phase::Failed;
             return Err(Error::UnsupportedRates);
         }
@@ -1315,3 +1405,7 @@ mod epd_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "association/akm_tests.rs"]
 mod akm_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "association/cck14_tests.rs"]
+mod cck14_tests;
